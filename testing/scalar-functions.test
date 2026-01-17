@@ -64,6 +64,15 @@ do_execsql_test char-non-integer {
   select char('a')
 } {}
 
+# char() with unicode codepoints >= 256
+do_execsql_test char-unicode-256 {
+  select unicode(char(256))
+} {256}
+
+do_execsql_test char-unicode-emoji {
+  select unicode(char(128512))
+} {128512}
+
 do_execsql_test abs {
     select abs(1);
 } {1}
@@ -574,6 +583,11 @@ do_execsql_test min-null {
   select min(null,null)
 } {}
 
+# SQLite: multi-arg min/max returns NULL if ANY argument is NULL
+do_execsql_test min-with-null {
+  select min(1, null)
+} {}
+
 do_execsql_test max-number {
   select max(-10,2,3)
 } {3}
@@ -596,6 +610,10 @@ do_execsql_test min-float-int {
 
 do_execsql_test max-null {
   select max(null,null)
+} {}
+
+do_execsql_test max-with-null {
+  select max(1, null)
 } {}
 
 do_execsql_test nullif {

@@ -201,8 +201,10 @@ fn cmp_numeric_strings(num_str: &str, other: &str) -> bool {
     match (parse(num_str), parse(other)) {
         (Some(Either::Left(i1)), Some(Either::Left(i2))) => i1 == i2,
         (Some(Either::Right(f1)), Some(Either::Right(f2))) => f1 == f2,
-        (Some(Either::Left(i)), Some(Either::Right(f)))
-        | (Some(Either::Right(f)), Some(Either::Left(i))) => (i as f64) == f,
+        // Integer and Float are NOT equivalent even if values match,
+        // because result type of operations depends on operand types
+        (Some(Either::Left(_)), Some(Either::Right(_)))
+        | (Some(Either::Right(_)), Some(Either::Left(_))) => false,
         _ => num_str == other,
     }
 }
@@ -1681,17 +1683,31 @@ pub mod tests {
 
     #[test]
     fn test_addition_expressions_equivalent_normalized() {
+        // Same types: 123.0 + 243.0 == 243.0 + 123.0 (commutative)
         let expr1 = Expr::Binary(
             Box::new(Expr::Literal(Literal::Numeric("123.0".to_string()))),
             Add,
-            Box::new(Expr::Literal(Literal::Numeric("243".to_string()))),
+            Box::new(Expr::Literal(Literal::Numeric("243.0".to_string()))),
         );
         let expr2 = Expr::Binary(
             Box::new(Expr::Literal(Literal::Numeric("243.0".to_string()))),
             Add,
-            Box::new(Expr::Literal(Literal::Numeric("123".to_string()))),
+            Box::new(Expr::Literal(Literal::Numeric("123.0".to_string()))),
         );
         assert!(exprs_are_equivalent(&expr1, &expr2));
+
+        // Mixed types are NOT equivalent (different result types)
+        let expr3 = Expr::Binary(
+            Box::new(Expr::Literal(Literal::Numeric("123.0".to_string()))),
+            Add,
+            Box::new(Expr::Literal(Literal::Numeric("243".to_string()))),
+        );
+        let expr4 = Expr::Binary(
+            Box::new(Expr::Literal(Literal::Numeric("243.0".to_string()))),
+            Add,
+            Box::new(Expr::Literal(Literal::Numeric("123".to_string()))),
+        );
+        assert!(!exprs_are_equivalent(&expr3, &expr4));
     }
 
     #[test]
@@ -1711,17 +1727,31 @@ pub mod tests {
 
     #[test]
     fn test_subtraction_expressions_normalized() {
+        // Same types: 66.0 - 22.0 == 66.0 - 22.0
         let expr3 = Expr::Binary(
             Box::new(Expr::Literal(Literal::Numeric("66.0".to_string()))),
             Subtract,
-            Box::new(Expr::Literal(Literal::Numeric("22".to_string()))),
+            Box::new(Expr::Literal(Literal::Numeric("22.0".to_string()))),
         );
         let expr4 = Expr::Binary(
-            Box::new(Expr::Literal(Literal::Numeric("66".to_string()))),
+            Box::new(Expr::Literal(Literal::Numeric("66.0".to_string()))),
             Subtract,
             Box::new(Expr::Literal(Literal::Numeric("22.0".to_string()))),
         );
         assert!(exprs_are_equivalent(&expr3, &expr4));
+
+        // Mixed types are NOT equivalent
+        let expr5 = Expr::Binary(
+            Box::new(Expr::Literal(Literal::Numeric("66.0".to_string()))),
+            Subtract,
+            Box::new(Expr::Literal(Literal::Numeric("22".to_string()))),
+        );
+        let expr6 = Expr::Binary(
+            Box::new(Expr::Literal(Literal::Numeric("66".to_string()))),
+            Subtract,
+            Box::new(Expr::Literal(Literal::Numeric("22.0".to_string()))),
+        );
+        assert!(!exprs_are_equivalent(&expr5, &expr6));
     }
 
     #[test]
@@ -1788,25 +1818,27 @@ pub mod tests {
 
     #[test]
     fn test_expressions_equivalent_multiplication() {
+        // Same types: 42.0 * 38.0 == 38.0 * 42.0 (commutative)
         let expr1 = Expr::Binary(
             Box::new(Expr::Literal(Literal::Numeric("42.0".to_string()))),
             Multiply,
-            Box::new(Expr::Literal(Literal::Numeric("38".to_string()))),
+            Box::new(Expr::Literal(Literal::Numeric("38.0".to_string()))),
         );
         let expr2 = Expr::Binary(
             Box::new(Expr::Literal(Literal::Numeric("38.0".to_string()))),
             Multiply,
-            Box::new(Expr::Literal(Literal::Numeric("42".to_string()))),
+            Box::new(Expr::Literal(Literal::Numeric("42.0".to_string()))),
         );
         assert!(exprs_are_equivalent(&expr1, &expr2));
     }
 
     #[test]
     fn test_expressions_both_parenthesized_equivalent() {
+        // Same types: (683 + 799) == 799 + 683 (commutative, integers only)
         let expr1 = Expr::Parenthesized(vec![Expr::Binary(
             Box::new(Expr::Literal(Literal::Numeric("683".to_string()))),
             Add,
-            Box::new(Expr::Literal(Literal::Numeric("799.0".to_string()))),
+            Box::new(Expr::Literal(Literal::Numeric("799".to_string()))),
         )
         .into()]);
         let expr2 = Expr::Binary(

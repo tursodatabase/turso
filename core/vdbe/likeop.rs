@@ -4,20 +4,33 @@ use regex::{Regex, RegexBuilder};
 
 use crate::{types::Value, LimboError};
 
-pub fn construct_like_escape_arg(escape_value: &Value) -> Result<char, LimboError> {
+/// Returns Ok(Some(char)) for valid escape, Ok(None) for NULL, Err for invalid.
+/// SQLite coerces non-text values to text via sqlite3_value_text().
+pub fn construct_like_escape_arg(escape_value: &Value) -> Result<Option<char>, LimboError> {
     match escape_value {
-        Value::Text(text) => {
-            let mut escape_chars = text.as_str().chars();
-            match (escape_chars.next(), escape_chars.next()) {
-                (Some(escape), None) => Ok(escape),
+        Value::Null => Ok(None),
+        Value::Text(t) => {
+            let mut chars = t.as_str().chars();
+            match (chars.next(), chars.next()) {
+                (Some(escape), None) => Ok(Some(escape)),
                 _ => Err(LimboError::Constraint(
                     "ESCAPE expression must be a single character".to_string(),
                 )),
             }
         }
-        _ => {
-            unreachable!("Like on non-text registers");
+        Value::Integer(i) => {
+            // Single digit 0-9 is one char, otherwise error
+            if *i >= 0 && *i <= 9 {
+                Ok(Some(char::from_digit(*i as u32, 10).unwrap()))
+            } else {
+                Err(LimboError::Constraint(
+                    "ESCAPE expression must be a single character".to_string(),
+                ))
+            }
         }
+        Value::Float(_) | Value::Blob(_) => Err(LimboError::Constraint(
+            "ESCAPE expression must be a single character".to_string(),
+        )),
     }
 }
 
@@ -220,5 +233,35 @@ mod test {
         assert!(exec_glob(None, r#"a[[]"#, r#"a["#));
         assert!(exec_glob(None, r#"abc[^][*?]efg"#, r#"abcdefg"#));
         assert!(!exec_glob(None, r#"abc[^][*?]efg"#, r#"abc]efg"#));
+    }
+
+    #[test]
+    fn test_construct_like_escape_arg() {
+        use crate::types::Text;
+        // Text - single char OK
+        assert_eq!(
+            construct_like_escape_arg(&Value::Text(Text::from("X"))).unwrap(),
+            Some('X')
+        );
+        // Text - multi char error
+        assert!(construct_like_escape_arg(&Value::Text(Text::from("XY"))).is_err());
+        // Null returns None
+        assert_eq!(construct_like_escape_arg(&Value::Null).unwrap(), None);
+        // Integer 0-9 OK
+        assert_eq!(
+            construct_like_escape_arg(&Value::Integer(0)).unwrap(),
+            Some('0')
+        );
+        assert_eq!(
+            construct_like_escape_arg(&Value::Integer(9)).unwrap(),
+            Some('9')
+        );
+        // Integer multi-digit error
+        assert!(construct_like_escape_arg(&Value::Integer(10)).is_err());
+        assert!(construct_like_escape_arg(&Value::Integer(-1)).is_err());
+        // Float error
+        assert!(construct_like_escape_arg(&Value::Float(1.5)).is_err());
+        // Blob error
+        assert!(construct_like_escape_arg(&Value::Blob(vec![0x41])).is_err());
     }
 }

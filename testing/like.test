@@ -189,3 +189,20 @@ do_execsql_test like-complexity-2 {
 do_execsql_test like-trim-null {
     SELECT trim('abc', NULL);
 } {}
+
+# ESCAPE with non-text types (SQLite coerces via sqlite3_value_text)
+do_execsql_test like-escape-int-0 {
+    SELECT '' LIKE '' ESCAPE 0;
+} {1}
+do_execsql_test like-escape-int-5 {
+    SELECT 'a%bc' LIKE 'a5%%' ESCAPE 5;
+} {1}
+do_execsql_test like-escape-null {
+    SELECT '' LIKE '' ESCAPE NULL;
+} {}
+do_execsql_test_error like-escape-int-10 {
+    SELECT '' LIKE '' ESCAPE 10;
+} {ESCAPE expression must be a single character}
+do_execsql_test_error like-escape-float {
+    SELECT '' LIKE '' ESCAPE 1.5;
+} {ESCAPE expression must be a single character}

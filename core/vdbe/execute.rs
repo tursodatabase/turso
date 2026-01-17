@@ -4827,14 +4827,16 @@ pub fn op_function(
 
                 let result = match (pattern, match_expression) {
                     (Value::Text(pattern), Value::Text(match_expression)) if arg_count == 3 => {
-                        let escape =
-                            construct_like_escape_arg(state.registers[*start_reg + 2].get_value())?;
-
-                        Value::Integer(exec_like_with_escape(
-                            pattern.as_str(),
-                            match_expression.as_str(),
-                            escape,
-                        ) as i64)
+                        match construct_like_escape_arg(
+                            state.registers[*start_reg + 2].get_value(),
+                        )? {
+                            Some(escape) => Value::Integer(exec_like_with_escape(
+                                pattern.as_str(),
+                                match_expression.as_str(),
+                                escape,
+                            ) as i64),
+                            None => Value::Null,
+                        }
                     }
                     (Value::Text(pattern), Value::Text(match_expression)) => {
                         let cache = if *constant_mask > 0 {
@@ -4878,9 +4880,9 @@ pub fn op_function(
                     ScalarFunc::Unicode => Some(reg_value.exec_unicode()),
                     ScalarFunc::Quote => Some(reg_value.exec_quote()),
                     ScalarFunc::RandomBlob => {
-                        Some(reg_value.exec_randomblob(|dest| pager.io.fill_bytes(dest)))
+                        Some(reg_value.exec_randomblob(|dest| pager.io.fill_bytes(dest))?)
                     }
-                    ScalarFunc::ZeroBlob => Some(reg_value.exec_zeroblob()),
+                    ScalarFunc::ZeroBlob => Some(reg_value.exec_zeroblob()?),
                     ScalarFunc::Soundex => Some(reg_value.exec_soundex()),
                     _ => unreachable!(),
                 };

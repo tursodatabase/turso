@@ -816,6 +816,18 @@ impl JsonbHeader {
                         Err(e) => return Err(e),
                     },
 
+                    // 15 = 8-byte payload size (for future expansion per SQLite spec)
+                    15 => match Self::get_size_bytes(slice, cursor + 1, 8) {
+                        Ok(bytes) => {
+                            offset = 9;
+                            u64::from_be_bytes([
+                                bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5],
+                                bytes[6], bytes[7],
+                            ]) as usize
+                        }
+                        Err(e) => return Err(e),
+                    },
+
                     _ => unreachable!(),
                 };
 
@@ -974,6 +986,9 @@ impl Jsonb {
 
         if payload_end != end {
             bail_parse_error!("Size mismatch");
+        }
+        if payload_end > self.data.len() {
+            bail_parse_error!("Payload extends beyond data");
         }
 
         match header.element_type() {
@@ -1216,6 +1231,9 @@ impl Jsonb {
         kind: &ElementType,
         quote: bool,
     ) -> Result<usize> {
+        if cursor + len > self.data.len() {
+            bail_parse_error!("Invalid JSONB: string extends beyond data");
+        }
         let word_slice = &self.data[cursor..cursor + len];
         if quote {
             string.push('"');
@@ -1389,6 +1407,9 @@ impl Jsonb {
         kind: &ElementType,
     ) -> Result<usize> {
         let current_cursor = cursor + len;
+        if current_cursor > self.data.len() {
+            bail_parse_error!("Invalid JSONB: number extends beyond data");
+        }
         let num_slice = from_utf8(&self.data[cursor..current_cursor])
             .map_err(|_| LimboError::ParseError("Failed to parse integer".to_string()))?;
 
@@ -1606,6 +1627,12 @@ impl Jsonb {
                 b',' if !first => {
                     pos += 1; // consume ','
                     pos = skip_whitespace(input, pos);
+                    if pos >= input.len() {
+                        return Err(PError::Message {
+                            msg: "Unexpected end of input after comma in object".to_string(),
+                            location: Some(pos),
+                        });
+                    }
                     if input[pos] == b',' || input[pos] == b'{' {
                         return Err(PError::Message {
                             msg: "Two commas in a row".to_string(),
@@ -1687,6 +1714,12 @@ impl Jsonb {
                 b',' if !first => {
                     pos += 1; // consume ','
                     pos = skip_whitespace(input, pos);
+                    if pos >= input.len() {
+                        return Err(PError::Message {
+                            msg: "Unexpected end of input after comma".to_string(),
+                            location: Some(pos),
+                        });
+                    }
                     if input[pos] == b',' {
                         return Err(PError::Message {
                             msg: "Two commas in a row".to_string(),

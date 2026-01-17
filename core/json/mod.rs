@@ -145,7 +145,12 @@ pub fn convert_ref_dbtype_to_jsonb(val: ValueRef<'_>, strict: Conv) -> crate::Re
                 _ => match JsonbHeader::from_slice(0, slice) {
                     Ok((header, header_offset)) => {
                         let payload_size = header.payload_size();
-                        let total_expected = header_offset + payload_size;
+                        let total_expected = match header_offset.checked_add(payload_size) {
+                            Some(t) => t,
+                            None => {
+                                return Err(LimboError::ParseError("malformed JSON".to_string()))
+                            }
+                        };
 
                         if total_expected != slice.len() {
                             parse_as_json_text(slice, strict)?
@@ -557,17 +562,20 @@ pub fn json_string_to_db_type(
             }
         }
         ElementType::FLOAT5 | ElementType::FLOAT => {
-            let float_val: f64 = json_string.parse().expect("Should be valid f64");
-            if float_val.is_infinite() && matches!(flag, OutputVariant::ElementType) {
-                // For json() function, SQLite returns bare infinity as "9e999" not "9.0e+999"
-                let simplified = if float_val.is_sign_negative() {
-                    "-9e999"
-                } else {
-                    "9e999"
-                };
-                Ok(Value::Text(Text::json(simplified.to_string())))
-            } else {
-                Ok(Value::Float(float_val))
+            match json_string.parse::<f64>() {
+                Ok(float_val)
+                    if float_val.is_infinite() && matches!(flag, OutputVariant::ElementType) =>
+                {
+                    // For json() function, SQLite returns bare infinity as "9e999" not "9.0e+999"
+                    let simplified = if float_val.is_sign_negative() {
+                        "-9e999"
+                    } else {
+                        "9e999"
+                    };
+                    Ok(Value::Text(Text::json(simplified.to_string())))
+                }
+                Ok(float_val) => Ok(Value::Float(float_val)),
+                Err(_) => Ok(Value::Null),
             }
         }
         ElementType::INT | ElementType::INT5 => {
