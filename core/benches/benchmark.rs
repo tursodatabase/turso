@@ -898,9 +898,9 @@ fn generate_batch_insert(start: i64, num: usize) -> String {
 fn bench_concurrent_writes(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("Concurrent writes");
 
-    let num_connections = 10;
-    let num_batch_inserts = 100;
-    let num_inserts_per_batch = 200_usize;
+    let num_connections = 4;
+    let num_batch_inserts = 50;
+    let num_inserts_per_batch = 50_usize;
 
     group.bench_function("limbo_wal_concurrent_writes", |b| {
         b.iter(|| {
