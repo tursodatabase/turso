@@ -148,7 +148,8 @@ impl JsDatabaseInstance {
             .spawn()
             .map_err(|e| BackendError::Execute(format!("failed to spawn node: {e}")))?;
 
-        // Prepend MVCC pragma if enabled (skip for readonly databases)
+        // Prepend MVCC pragma if enabled (skip for readonly databases).
+        // FIXME: readonly default DB tests do not exercise MVCC code paths.
         let sql_to_execute = if self.mvcc && !self.readonly {
             format!("PRAGMA journal_mode = 'experimental_mvcc';\n{sql}")
         } else {
