@@ -562,7 +562,10 @@ fn parse_modifier(p: &mut DateTime, z: &str, idx: usize) -> Result<()> {
             }
             Ok(())
         }
-        'w' if z.len() >= 8 && z[..8].eq_ignore_ascii_case("weekday ") => {
+        'w' if z
+            .get(..8)
+            .is_some_and(|s| s.eq_ignore_ascii_case("weekday ")) =>
+        {
             if let Ok(val) = z[8..].trim().parse::<f64>() {
                 if (0.0..7.0).contains(&val) && (val as i64 as f64) == val {
                     let n = val as i64;
@@ -584,7 +587,10 @@ fn parse_modifier(p: &mut DateTime, z: &str, idx: usize) -> Result<()> {
             if z.eq_ignore_ascii_case("subsec") || z.eq_ignore_ascii_case("subsecond") {
                 p.use_subsec = true;
                 Ok(())
-            } else if z.len() >= 9 && z[..9].eq_ignore_ascii_case("start of ") {
+            } else if z
+                .get(..9)
+                .is_some_and(|s| s.eq_ignore_ascii_case("start of "))
+            {
                 if !p.valid_jd && !p.valid_ymd && !p.valid_hms {
                     return Err(InvalidModifier(format!("Invalid start of: {z}")));
                 }
@@ -2997,5 +3003,31 @@ mod tests {
             exec_datetime_general(dt_args, "time").to_text().unwrap(),
             "10:30:45.120"
         );
+    }
+
+    // Regression test for fuzzing crash: strftime with non-char-boundary UTF-8 modifiers
+    // The modifier "swww\0\u{1}\t\0\u{fffd}\u{fffd}\u{f}W" has multi-byte chars where
+    // byte index 9 is not a valid char boundary, causing panic on slice.
+    #[test]
+    fn test_strftime_invalid_utf8_boundary_modifier() {
+        // This modifier starts with 's' so it matches the 's' => branch,
+        // but byte 9 falls inside a multi-byte character
+        let modifier_with_multibyte = "swww\0\u{1}\t\0\u{fffd}\u{fffd}\u{f}W";
+        let args = &[
+            Value::build_text("".to_string()),
+            Value::Float(-1.8041807844761696e230),
+            Value::build_text(modifier_with_multibyte.to_string()),
+        ];
+        // Should not panic, just return an error or null
+        let _ = exec_strftime(args.iter());
+
+        // Also test the 'w' => weekday branch with similar input
+        let weekday_modifier = "weekda\u{fffd}\u{fffd}";
+        let args2 = &[
+            Value::build_text("".to_string()),
+            Value::Float(0.0),
+            Value::build_text(weekday_modifier.to_string()),
+        ];
+        let _ = exec_strftime(args2.iter());
     }
 }
