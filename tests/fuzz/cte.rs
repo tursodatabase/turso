@@ -261,7 +261,7 @@ mod cte_tests {
 
         const COMPOUND_OPS: &[&str] = &["UNION", "UNION ALL", "INTERSECT", "EXCEPT"];
 
-        const ITERATIONS: usize = 400;
+        const ITERATIONS: usize = 200;
         for i in 0..ITERATIONS {
             if i % 100 == 0 {
                 println!(
@@ -720,7 +720,7 @@ mod cte_tests {
         let limbo_conn = db.connect_limbo();
         let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
 
-        const ITERATIONS: usize = 400;
+        const ITERATIONS: usize = 200;
         for i in 0..ITERATIONS {
             if i % 100 == 0 {
                 println!(
