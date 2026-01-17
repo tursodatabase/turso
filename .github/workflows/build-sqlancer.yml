@@ -27,7 +27,6 @@ env:
   AWS_REGION: ${{ secrets.LIMBO_SIM_AWS_REGION }}
   IAM_ROLE: ${{ secrets.SQLANCER_DEPLOYER_IAM_ROLE }}
   ECR_URL: ${{ secrets.SQLANCER_ECR_URL }}
-  ECR_IMAGE_NAME: sqlancer-runner
   GIT_HASH: ${{ github.sha }}
 
 jobs:
@@ -49,5 +48,5 @@ jobs:
 
       - name: Build and push sqlancer-runner docker image
         run: |
-          docker build -f Dockerfile.sqlancer -t ${{ env.ECR_URL }}/${{ env.ECR_IMAGE_NAME }}:latest --build-arg GIT_HASH=${{ env.GIT_HASH }} .
-          docker push ${{ env.ECR_URL }}/${{ env.ECR_IMAGE_NAME }}:latest
+          docker build -f Dockerfile.sqlancer -t ${{ env.ECR_URL }}:latest --build-arg GIT_HASH=${{ env.GIT_HASH }} .
+          docker push ${{ env.ECR_URL }}:latest
