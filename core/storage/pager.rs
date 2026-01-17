@@ -39,7 +39,9 @@ use super::btree::{
 };
 use super::page_cache::{CacheError, CacheResizeResult, PageCache, PageCacheKey, SpillResult};
 use super::sqlite3_ondisk::read_varint;
-use super::sqlite3_ondisk::{begin_write_btree_page, read_btree_cell, read_u32, BTreeCell};
+use super::sqlite3_ondisk::{
+    begin_write_btree_page, read_btree_cell, read_payload, read_u32, BTreeCell,
+};
 use super::wal::CheckpointMode;
 use crate::storage::encryption::{CipherMode, EncryptionContext, EncryptionKey};
 
@@ -405,6 +407,113 @@ impl PageInner {
             buf[cell_pointer + 2],
             buf[cell_pointer + 3],
         ])
+    }
+
+    #[inline]
+    pub fn cell_index_interior_read_payload_fast(
+        &self,
+        idx: usize,
+        usable_size: usize,
+        max_local: usize,
+        min_local: usize,
+    ) -> crate::Result<(u32, &'static [u8], u64, Option<u32>)> {
+        debug_assert!(matches!(self.page_type(), Ok(PageType::IndexInterior)));
+        let buf = self.as_ptr();
+        let cell_pointer_array_start = self.header_size();
+        let cell_pointer = cell_pointer_array_start + (idx * CELL_PTR_SIZE_BYTES);
+        let cell_pointer = self.read_u16(cell_pointer) as usize;
+
+        let left_child_page = u32::from_be_bytes([
+            buf[cell_pointer],
+            buf[cell_pointer + 1],
+            buf[cell_pointer + 2],
+            buf[cell_pointer + 3],
+        ]);
+        let mut pos = cell_pointer + 4;
+        let (payload_size, nr) = read_varint(&buf[pos..])?;
+        pos += nr;
+
+        let (overflows, to_read) = sqlite3_ondisk::payload_overflows(
+            payload_size as usize,
+            max_local,
+            min_local,
+            usable_size,
+        );
+        let to_read = if overflows { to_read } else { buf.len() - pos };
+
+        let static_buf: &'static [u8] = unsafe { std::mem::transmute::<&[u8], &'static [u8]>(buf) };
+        let (payload, first_overflow_page) =
+            read_payload(&static_buf[pos..pos + to_read], payload_size as usize);
+
+        Ok((left_child_page, payload, payload_size, first_overflow_page))
+    }
+
+    #[inline]
+    pub fn cell_index_leaf_read_payload_fast(
+        &self,
+        idx: usize,
+        usable_size: usize,
+        max_local: usize,
+        min_local: usize,
+    ) -> crate::Result<(&'static [u8], u64, Option<u32>)> {
+        debug_assert!(matches!(self.page_type(), Ok(PageType::IndexLeaf)));
+        let buf = self.as_ptr();
+        let cell_pointer_array_start = self.header_size();
+        let cell_pointer = cell_pointer_array_start + (idx * CELL_PTR_SIZE_BYTES);
+        let cell_pointer = self.read_u16(cell_pointer) as usize;
+
+        let mut pos = cell_pointer;
+        let (payload_size, nr) = read_varint(&buf[pos..])?;
+        pos += nr;
+
+        let (overflows, to_read) = sqlite3_ondisk::payload_overflows(
+            payload_size as usize,
+            max_local,
+            min_local,
+            usable_size,
+        );
+        let to_read = if overflows { to_read } else { buf.len() - pos };
+
+        let static_buf: &'static [u8] = unsafe { std::mem::transmute::<&[u8], &'static [u8]>(buf) };
+        let (payload, first_overflow_page) =
+            read_payload(&static_buf[pos..pos + to_read], payload_size as usize);
+
+        Ok((payload, payload_size, first_overflow_page))
+    }
+
+    #[inline]
+    pub fn cell_table_leaf_read_payload_fast(
+        &self,
+        idx: usize,
+        usable_size: usize,
+        max_local: usize,
+        min_local: usize,
+    ) -> crate::Result<(i64, &'static [u8], u64, Option<u32>)> {
+        debug_assert!(matches!(self.page_type(), Ok(PageType::TableLeaf)));
+        let buf = self.as_ptr();
+        let cell_pointer_array_start = self.header_size();
+        let cell_pointer = cell_pointer_array_start + (idx * CELL_PTR_SIZE_BYTES);
+        let cell_pointer = self.read_u16(cell_pointer) as usize;
+
+        let mut pos = cell_pointer;
+        let (payload_size, n_payload) = read_varint(&buf[pos..])?;
+        pos += n_payload;
+        let (rowid, n_rowid) = read_varint(&buf[pos..])?;
+        pos += n_rowid;
+
+        let (overflows, to_read) = sqlite3_ondisk::payload_overflows(
+            payload_size as usize,
+            max_local,
+            min_local,
+            usable_size,
+        );
+        let to_read = if overflows { to_read } else { buf.len() - pos };
+
+        let static_buf: &'static [u8] = unsafe { std::mem::transmute::<&[u8], &'static [u8]>(buf) };
+        let (payload, first_overflow_page) =
+            read_payload(&static_buf[pos..pos + to_read], payload_size as usize);
+
+        Ok((rowid as i64, payload, payload_size, first_overflow_page))
     }
 
     #[inline(always)]

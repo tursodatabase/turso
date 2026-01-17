@@ -10,7 +10,7 @@ use crate::{
         pager::{BtreePageAllocMode, Pager},
         sqlite3_ondisk::{
             payload_overflows, read_u32, read_varint, write_varint, BTreeCell, DatabaseHeader,
-            PageContent, PageSize, PageType, TableInteriorCell, TableLeafCell, CELL_PTR_SIZE_BYTES,
+            PageContent, PageSize, PageType, TableInteriorCell, CELL_PTR_SIZE_BYTES,
             INTERIOR_PAGE_HEADER_SIZE_BYTES, LEAF_PAGE_HEADER_SIZE_BYTES,
             LEFT_CHILD_PTR_SIZE_BYTES,
         },
@@ -37,9 +37,7 @@ use crate::{
 
 use super::{
     pager::PageRef,
-    sqlite3_ondisk::{
-        write_varint_to_vec, IndexInteriorCell, IndexLeafCell, OverflowCell, MINIMUM_CELL_SIZE,
-    },
+    sqlite3_ondisk::{write_varint_to_vec, IndexInteriorCell, OverflowCell, MINIMUM_CELL_SIZE},
 };
 use std::{
     any::Any,
@@ -788,7 +786,7 @@ impl BTreeCursor {
         let mut inner = || {
             loop {
                 let (old_top_idx, page_type, is_index, is_leaf, cell_count) = {
-                    let page = self.stack.top_ref();
+                    let page = self.stack.top_ref().clone();
                     let contents = page.get_contents();
                     (
                         self.stack.current(),
@@ -1471,11 +1469,11 @@ impl BTreeCursor {
                     }
                 }
             };
-            let matching_cell = self
+            let matching_cell_left_child = self
                 .stack
                 .get_page_contents_at_level(old_top_idx)
                 .unwrap()
-                .cell_get(leftmost_matching_cell, self.usable_space())?;
+                .cell_interior_read_left_child_page(leftmost_matching_cell);
             self.stack.set_cell_index(leftmost_matching_cell as i32);
             // we don't advance in case of forward iteration and index tree internal nodes because we will visit this node going up.
             // in backwards iteration, we must retreat because otherwise we would unnecessarily visit this node again.
@@ -1486,24 +1484,17 @@ impl BTreeCursor {
             if iter_dir == IterationDirection::Backwards {
                 self.stack.retreat();
             }
-            let BTreeCell::IndexInteriorCell(IndexInteriorCell {
-                left_child_page, ..
-            }) = &matching_cell
-            else {
-                unreachable!("unexpected cell type: {:?}", matching_cell);
-            };
-
             {
                 let page = self.stack.get_page_at_level(old_top_idx).unwrap();
                 turso_assert!(
-                    page.get().id != *left_child_page as usize,
+                    page.get().id != matching_cell_left_child as usize,
                     "corrupt: current page and left child page of cell {} are both {}",
                     leftmost_matching_cell,
                     page.get().id
                 );
             }
 
-            let (mem_page, c) = self.read_page(*left_child_page as i64)?;
+            let (mem_page, c) = self.read_page(matching_cell_left_child as i64)?;
             self.stack.push(mem_page);
             self.seek_state = CursorSeekState::MovingBetweenPages {
                 eq_seen: state.eq_seen,
@@ -1516,23 +1507,21 @@ impl BTreeCursor {
 
         let cur_cell_idx = (min + max) >> 1; // rustc generates extra insns for (min+max)/2 due to them being isize. we know min&max are >=0 here.
         self.stack.set_cell_index(cur_cell_idx as i32);
-        let cell = self
-            .stack
-            .get_page_contents_at_level(old_top_idx)
-            .unwrap()
-            .cell_get(cur_cell_idx as usize, self.usable_space())?;
-        let BTreeCell::IndexInteriorCell(IndexInteriorCell {
-            payload,
-            payload_size,
-            first_overflow_page,
-            ..
-        }) = &cell
-        else {
-            unreachable!("unexpected cell type: {:?}", cell);
-        };
+        let page_contents = self.stack.get_page_contents_at_level(old_top_idx).unwrap();
+        let max_local =
+            payload_overflow_threshold_max(PageType::IndexInterior, self.usable_space());
+        let min_local =
+            payload_overflow_threshold_min(PageType::IndexInterior, self.usable_space());
+        let (_, payload, payload_size, first_overflow_page) = page_contents
+            .cell_index_interior_read_payload_fast(
+                cur_cell_idx as usize,
+                self.usable_space(),
+                max_local,
+                min_local,
+            )?;
 
         if let Some(next_page) = first_overflow_page {
-            let res = self.process_overflow_read(payload, *next_page, *payload_size)?;
+            let res = self.process_overflow_read(payload, next_page, payload_size)?;
             if res.is_io() {
                 return Ok(ControlFlow::Break(res));
             }
@@ -1921,22 +1910,19 @@ impl BTreeCursor {
         let cur_cell_idx = (min + max) >> 1; // rustc generates extra insns for (min+max)/2 due to them being isize. we know min&max are >=0 here.
         self.stack.set_cell_index(cur_cell_idx as i32);
 
-        let cell = self
-            .stack
-            .get_page_contents_at_level(old_top_idx)
-            .unwrap()
-            .cell_get(cur_cell_idx as usize, self.usable_space())?;
-        let BTreeCell::IndexLeafCell(IndexLeafCell {
-            payload,
-            first_overflow_page,
-            payload_size,
-        }) = &cell
-        else {
-            unreachable!("unexpected cell type: {:?}", cell);
-        };
+        let page_contents = self.stack.get_page_contents_at_level(old_top_idx).unwrap();
+        let max_local = payload_overflow_threshold_max(PageType::IndexLeaf, self.usable_space());
+        let min_local = payload_overflow_threshold_min(PageType::IndexLeaf, self.usable_space());
+        let (payload, payload_size, first_overflow_page) = page_contents
+            .cell_index_leaf_read_payload_fast(
+                cur_cell_idx as usize,
+                self.usable_space(),
+                max_local,
+                min_local,
+            )?;
 
         if let Some(next_page) = first_overflow_page {
-            let res = self.process_overflow_read(payload, *next_page, *payload_size)?;
+            let res = self.process_overflow_read(payload, next_page, payload_size)?;
             if let IOResult::IO(io) = res {
                 return Ok(ControlFlow::Break(IOResult::IO(io)));
             }
@@ -2096,7 +2082,7 @@ impl BTreeCursor {
             };
             match write_state {
                 WriteState::Start => {
-                    let page = self.stack.top();
+                    let page = self.stack.top_ref().clone();
 
                     // get page and find cell
                     let cell_idx = {
@@ -2120,7 +2106,7 @@ impl BTreeCursor {
                                     tracing::debug!("TableLeafCell: found exact match with cell_idx={cell_idx}, overwriting");
                                     self.has_record = true;
                                     *write_state = WriteState::Overwrite {
-                                        page,
+                                        page: page.clone(),
                                         cell_idx,
                                         state: Some(OverwriteCellState::AllocatePayload),
                                     };
@@ -2144,7 +2130,7 @@ impl BTreeCursor {
                                         panic!("expected write state");
                                     };
                                     *write_state = WriteState::Overwrite {
-                                        page,
+                                        page: page.clone(),
                                         cell_idx,
                                         state: Some(OverwriteCellState::AllocatePayload),
                                     };
@@ -2172,7 +2158,7 @@ impl BTreeCursor {
                         payload.reserve(needed_capacity - payload.capacity());
                     }
                     *write_state = WriteState::Insert {
-                        page,
+                        page: page.clone(),
                         cell_idx,
                         new_payload: payload,
                         fill_cell_payload_state: FillCellPayloadState::Start,
@@ -2711,22 +2697,8 @@ impl BTreeCursor {
                             } else {
                                 next_cell_divider
                             };
-                            pgno = match parent_contents.cell_get(actual_cell_idx, usable_space)? {
-                                BTreeCell::TableInteriorCell(TableInteriorCell {
-                                    left_child_page,
-                                    ..
-                                })
-                                | BTreeCell::IndexInteriorCell(IndexInteriorCell {
-                                    left_child_page,
-                                    ..
-                                }) => left_child_page,
-                                other => {
-                                    crate::bail_corrupt_error!(
-                                        "expected interior cell, got {:?}",
-                                        other
-                                    )
-                                }
-                            };
+                            pgno =
+                                parent_contents.cell_interior_read_left_child_page(actual_cell_idx);
                         }
                     }
 
@@ -4262,7 +4234,7 @@ impl BTreeCursor {
         // Since we are going to change the btree structure, let's forget our cached knowledge of the rightmost page.
         let _ = self.move_to_right_state.1.take();
 
-        let root = self.stack.top();
+        let root = self.stack.top_ref();
         let root_contents = root.get_contents();
         let child = return_if_io!(self.pager.do_allocate_page(
             root_contents.page_type()?,
@@ -4328,6 +4300,7 @@ impl BTreeCursor {
         root_contents.write_fragmented_bytes_count(0);
         root_contents.overflow_cells.clear();
         self.root_page = root.get().id as i64;
+        let root = root.clone();
         self.stack.clear();
         self.stack.push(root);
         self.stack.set_cell_index(0); // leave parent pointing at the rightmost pointer (in this case 0, as there are no cells), since we will be balancing the rightmost child page.
@@ -4598,7 +4571,7 @@ impl BTreeCursor {
                     }
                 }
                 DestroyState::FreePage => {
-                    let page = self.stack.top();
+                    let page = self.stack.top_ref().clone();
                     let page_id = page.get().id;
 
                     if self.stack.has_parent() {
@@ -4928,26 +4901,50 @@ impl CursorTrait for BTreeCursor {
         let page = self.stack.top_ref();
         let contents = page.get_contents();
         let cell_idx = self.stack.current_cell_index();
-        let cell = contents.cell_get(cell_idx as usize, self.usable_space())?;
-        let (payload, payload_size, first_overflow_page) = match cell {
-            BTreeCell::TableLeafCell(TableLeafCell {
-                payload,
-                payload_size,
-                first_overflow_page,
-                ..
-            }) => (payload, payload_size, first_overflow_page),
-            BTreeCell::IndexInteriorCell(IndexInteriorCell {
-                payload,
-                payload_size,
-                first_overflow_page,
-                ..
-            }) => (payload, payload_size, first_overflow_page),
-            BTreeCell::IndexLeafCell(IndexLeafCell {
-                payload,
-                first_overflow_page,
-                payload_size,
-            }) => (payload, payload_size, first_overflow_page),
-            _ => unreachable!("unexpected page_type"),
+        let (payload, payload_size, first_overflow_page) = match contents.page_type()? {
+            PageType::TableLeaf => {
+                let max_local =
+                    payload_overflow_threshold_max(PageType::TableLeaf, self.usable_space());
+                let min_local =
+                    payload_overflow_threshold_min(PageType::TableLeaf, self.usable_space());
+                let (_rowid, payload, payload_size, first_overflow_page) = contents
+                    .cell_table_leaf_read_payload_fast(
+                        cell_idx as usize,
+                        self.usable_space(),
+                        max_local,
+                        min_local,
+                    )?;
+                (payload, payload_size, first_overflow_page)
+            }
+            PageType::IndexInterior => {
+                let max_local =
+                    payload_overflow_threshold_max(PageType::IndexInterior, self.usable_space());
+                let min_local =
+                    payload_overflow_threshold_min(PageType::IndexInterior, self.usable_space());
+                let (_, payload, payload_size, first_overflow_page) = contents
+                    .cell_index_interior_read_payload_fast(
+                        cell_idx as usize,
+                        self.usable_space(),
+                        max_local,
+                        min_local,
+                    )?;
+                (payload, payload_size, first_overflow_page)
+            }
+            PageType::IndexLeaf => {
+                let max_local =
+                    payload_overflow_threshold_max(PageType::IndexLeaf, self.usable_space());
+                let min_local =
+                    payload_overflow_threshold_min(PageType::IndexLeaf, self.usable_space());
+                let (payload, payload_size, first_overflow_page) = contents
+                    .cell_index_leaf_read_payload_fast(
+                        cell_idx as usize,
+                        self.usable_space(),
+                        max_local,
+                        min_local,
+                    )?;
+                (payload, payload_size, first_overflow_page)
+            }
+            other => unreachable!("unexpected page_type: {:?}", other),
         };
         if let Some(next_page) = first_overflow_page {
             return_if_io!(self.process_overflow_read(payload, next_page, payload_size))
@@ -6362,15 +6359,6 @@ impl PageStack {
         self.node_states[current] = BTreeNodeState::default();
         self.stack[current] = None;
         self.current_page -= 1;
-    }
-
-    /// Get the top page on the stack.
-    /// This is the page that is currently being traversed.
-    fn top(&self) -> PageRef {
-        let current = self.current();
-        let page = self.stack[current].clone().unwrap();
-        turso_assert!(page.is_loaded(), "page should be loaded");
-        page
     }
 
     fn top_ref(&self) -> &PageRef {
@@ -7816,7 +7804,7 @@ mod tests {
     use crate::{
         storage::{
             btree::{compute_free_space, fill_cell_payload, payload_overflow_threshold_max},
-            sqlite3_ondisk::{BTreeCell, PageContent, PageType},
+            sqlite3_ondisk::{BTreeCell, PageContent, PageType, TableLeafCell},
         },
         types::Value,
         Database, Page, Pager, PlatformIO,

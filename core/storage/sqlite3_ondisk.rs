@@ -863,7 +863,7 @@ pub fn read_btree_cell(
 /// read_payload takes in the unread bytearray with the payload size
 /// and returns the payload on the page, and optionally the first overflow page number.
 #[allow(clippy::readonly_write_lock)]
-fn read_payload(unread: &'static [u8], payload_size: usize) -> (&'static [u8], Option<u32>) {
+pub fn read_payload(unread: &'static [u8], payload_size: usize) -> (&'static [u8], Option<u32>) {
     let cell_len = unread.len();
     // We will let overflow be constructed back if needed or requested.
     if payload_size <= cell_len {
