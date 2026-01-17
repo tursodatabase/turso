@@ -114,7 +114,7 @@ aegis = "0.9.5"
 
 [build-dependencies]
 chrono = { workspace = true, default-features = false }
-built = { version = "0.7.5", features = ["git2", "chrono"] }
+built = { version = "0.7.5", features = ["chrono"] }
 
 [target.'cfg(not(target_family = "windows"))'.dev-dependencies]
 pprof = { version = "0.14.0", features = ["criterion", "flamegraph"] }
