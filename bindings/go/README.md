@@ -21,8 +21,8 @@
 - **SQLite compatible:** SQLite query language and file format support ([status](https://github.com/tursodatabase/turso/blob/main/COMPAT.md)).
 - **In-process**: No network overhead, runs directly in your Go process
 - **Cross-platform**: Supports Linux, macOS, Windows
-- **No CGO**: This driver uses the awesome [purego](https://github.com/ebitengine/purego) library to call C (in this case Rust with C ABI) functions from Go.
 - **Remote partial sync**: Bootstrap from a remote database, pull remote changes, and push local changes when online &mdash; all while enjoying a fully operational database offline.
+- **No CGO**: This driver uses the awesome [purego](https://github.com/ebitengine/purego) library to call C (in this case Rust with C ABI) functions from Go.
 
 ## Installation
 
@@ -64,6 +64,78 @@ func main() {
 		_ = rows.Scan(&a, &b)
 		fmt.Printf("%d, %s\n", a, b) // 42, turso
 	}
+}
+```
+
+## Sync Driver
+Use a remote Turso database while working locally. You can bootstrap local state from the remote, pull remote changes, and push local commits.
+
+Note: You need a Turso remote URL. See the Turso docs for provisioning and authentication.
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"os"
+
+	turso "turso.tech/database/tursogo"
+)
+
+func main() {
+	ctx := context.Background()
+
+	// Connect a local database to a remote Turso database
+	db, err := turso.NewTursoSyncDb(ctx, turso.TursoSyncDbConfig{
+		Path:      ":memory:", // local db path (or a file path)
+		RemoteUrl: "https://<db>.<region>.turso.io",
+		AuthToken: "<authToken>",
+	})
+	if err != nil {
+		fmt.Printf("Error: %v\n", err)
+		os.Exit(1)
+	}
+
+	conn, err := db.Connect(ctx)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer conn.Close()
+
+	sql := "CREATE table go_turso (foo INTEGER, bar TEXT)"
+	_, _ = conn.ExecContext(ctx, sql)
+
+	sql = "INSERT INTO go_turso (foo, bar) values (?, ?)"
+	stmt, _ := conn.PrepareContext(ctx, sql)
+	defer stmt.Close()
+	_, _ = stmt.ExecContext(ctx, 42, "turso")
+
+	// Push local commits to remote
+	_ = db.Push(ctx)
+
+	// Pull new changes from remote into local
+	_, _ = db.Pull(ctx)
+
+	rows, _ := conn.QueryContext(ctx, "SELECT * from go_turso")
+	defer rows.Close()
+	for rows.Next() {
+		var a int
+		var b string
+		_ = rows.Scan(&a, &b)
+		fmt.Printf("%d, %s\n", a, b) // 42, turso
+	}
+
+	// Optional: inspect and manage sync state
+	stats, err := db.Stats(ctx)
+	if err != nil {
+		log.Println("Stats unavailable:", err)
+	} else {
+		log.Println("Current revision:", stats.NetworkReceivedBytes)
+	}
+
+	_ = db.Checkpoint(ctx) // compact local WAL after many writes
 }
 
 ```
