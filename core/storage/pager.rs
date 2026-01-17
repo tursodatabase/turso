@@ -1268,6 +1268,7 @@ enum AllocatePageState {
 enum AllocatePage1State {
     Start,
     Writing { page: PageRef },
+    Syncing { page: PageRef, completion: Completion },
     Done,
 }
 
@@ -1428,6 +1429,11 @@ impl Pager {
 
     pub fn init_page_1(&self) -> Arc<ArcSwapOption<Page>> {
         self.init_page_1.clone()
+    }
+
+    /// Sync main database file to disk after writing page 1.
+    pub fn sync_db_file(&self) -> Result<Completion> {
+        sqlite3_ondisk::begin_sync(self.db_file.as_ref(), self.syncing.clone())
     }
 
     /// Read page 1 (the database header page) using the header_ref_state state machine.
@@ -4035,7 +4041,19 @@ impl Pager {
             }
             AllocatePage1State::Writing { page } => {
                 turso_assert!(page.is_loaded(), "page should be loaded");
-                tracing::trace!("allocate_page1(Writing done)");
+                tracing::trace!("allocate_page1(Writing done, starting sync)");
+                let c = self.sync_db_file()?;
+                *self.allocate_page1_state.write() =
+                    AllocatePage1State::Syncing { page, completion: c.clone() };
+                io_yield_one!(c);
+            }
+            AllocatePage1State::Syncing { page, completion } => {
+                if let Some(err) = completion.get_error() {
+                    page.unpin();
+                    *self.allocate_page1_state.write() = AllocatePage1State::Done;
+                    return Err(err.into());
+                }
+                tracing::trace!("allocate_page1(Syncing done)");
                 let page_key = PageCacheKey::new(page.get().id);
                 let mut cache = self.page_cache.write();
                 cache.insert(page_key, page.clone()).map_err(|e| {
@@ -4054,7 +4072,7 @@ impl Pager {
     pub fn allocating_page1(&self) -> bool {
         matches!(
             *self.allocate_page1_state.read(),
-            AllocatePage1State::Writing { .. }
+            AllocatePage1State::Writing { .. } | AllocatePage1State::Syncing { .. }
         )
     }
 
