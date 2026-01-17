@@ -40,3 +40,31 @@ test concat-blob {
 expect {
     0102
 }
+
+test concat-function-blob {
+    SELECT CONCAT(X'41', X'42');
+}
+expect {
+    AB
+}
+
+test concat-function-blob-mixed {
+    SELECT CONCAT('hello', X'20', 'world');
+}
+expect {
+    hello world
+}
+
+test concat-ws-blob-values {
+    SELECT CONCAT_WS(',', X'41', X'42');
+}
+expect {
+    A,B
+}
+
+test concat-ws-blob-separator {
+    SELECT CONCAT_WS(X'2C', 'a', 'b');
+}
+expect {
+    a,b
+}
