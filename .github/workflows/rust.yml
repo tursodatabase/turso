@@ -29,7 +29,7 @@ jobs:
         run: cd fuzz && cargo fmt --check
 
   build-native:
-    timeout-minutes: 30
+    timeout-minutes: ${{ matrix.os == 'windows-latest' && 120 || 30 }}
     strategy:
       matrix:
         os: [blacksmith-4vcpu-ubuntu-2404, macos-latest, windows-latest]
