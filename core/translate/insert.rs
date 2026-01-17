@@ -1300,29 +1300,15 @@ fn bind_insert(
             upsert = upsert_opt.take();
         }
     }
-    match on_conflict {
-        ResolveType::Ignore => {
-            program.set_resolve_type(ResolveType::Ignore);
-            upsert.replace(Box::new(ast::Upsert {
-                do_clause: UpsertDo::Nothing,
-                index: None,
-                next: None,
-            }));
-        }
-        ResolveType::Abort | ResolveType::Replace => {
-            // Abort is the default conflict resolution strategy for INSERT in SQLite,
-            // and we implement Replace.
-        }
-        ResolveType::Fail => {
-            // FAIL: Abort statement with error but do NOT rollback changes made
-            // by the current statement. Prior changes persist.
-            program.set_resolve_type(ResolveType::Fail);
-        }
-        ResolveType::Rollback => {
-            // ROLLBACK: Abort statement with error AND rollback the entire
-            // transaction, not just the statement.
-            program.set_resolve_type(ResolveType::Rollback);
-        }
+    if let ResolveType::Ignore = on_conflict {
+        program.set_resolve_type(ResolveType::Ignore);
+        upsert.replace(Box::new(ast::Upsert {
+            do_clause: UpsertDo::Nothing,
+            index: None,
+            next: None,
+        }));
+    } else {
+        program.set_resolve_type(on_conflict);
     }
     while let Some(mut upsert_opt) = upsert.take() {
         if let UpsertDo::Set {

@@ -1924,29 +1924,7 @@ fn emit_program_for_update(
     mut plan: UpdatePlan,
     after: impl FnOnce(&mut ProgramBuilder),
 ) -> Result<()> {
-    // Handle conflict resolution strategy
-    let or_conflict = plan.or_conflict.unwrap_or(ResolveType::Abort);
-    match or_conflict {
-        ResolveType::Ignore => {
-            program.set_resolve_type(ResolveType::Ignore);
-        }
-        ResolveType::Replace => {
-            program.set_resolve_type(ResolveType::Replace);
-        }
-        ResolveType::Abort => {
-            // Default behavior
-        }
-        ResolveType::Fail => {
-            // FAIL: Abort statement with error but do NOT rollback changes made
-            // by the current statement. Prior changes persist.
-            program.set_resolve_type(ResolveType::Fail);
-        }
-        ResolveType::Rollback => {
-            // ROLLBACK: Abort statement with error AND rollback the entire
-            // transaction, not just the statement.
-            program.set_resolve_type(ResolveType::Rollback);
-        }
-    }
+    program.set_resolve_type(plan.or_conflict.unwrap_or(ResolveType::Abort));
 
     let mut t_ctx = TranslateCtx::new(
         program,
@@ -2111,7 +2089,7 @@ fn emit_program_for_update(
     // conflicting row, we must delete from all indexes, not just those being updated.
     // We construct this AFTER open_loop so we can determine which index is used for
     // iteration and reuse that cursor instead of opening a new one.
-    let all_index_cursors = if matches!(or_conflict, ResolveType::Replace) {
+    let all_index_cursors = if matches!(program.resolve_type, ResolveType::Replace) {
         let table_name = target_table.table.get_name();
         let all_indexes = resolver.schema.get_indices(table_name);
         let source_table = plan
@@ -2182,7 +2160,6 @@ fn emit_program_for_update(
         iteration_cursor_id,
         target_table_cursor_id,
         target_table,
-        or_conflict,
     )?;
 
     // Close the main loop
@@ -2225,9 +2202,9 @@ fn emit_update_column_values<'a>(
     cdc_updates_register: Option<usize>,
     t_ctx: &mut TranslateCtx<'a>,
     skip_set_clauses: bool,
-    or_conflict: ResolveType,
     skip_row_label: BranchOffset,
 ) -> crate::Result<()> {
+    let or_conflict = program.resolve_type;
     if has_direct_rowid_update {
         if let Some((_, expr)) = set_clauses.iter().find(|(i, _)| *i == ROWID_SENTINEL) {
             if !skip_set_clauses {
@@ -2446,8 +2423,8 @@ fn emit_update_insns<'a>(
     iteration_cursor_id: usize,
     target_table_cursor_id: usize,
     target_table: Arc<JoinedTable>,
-    or_conflict: ResolveType,
 ) -> crate::Result<()> {
+    let or_conflict = program.resolve_type;
     let internal_id = target_table.internal_id;
     // Copy loop labels early to avoid borrow conflicts with mutable t_ctx borrow later
     let loop_labels = *t_ctx
@@ -2599,7 +2576,6 @@ fn emit_update_insns<'a>(
         cdc_updates_register,
         t_ctx,
         skip_set_clauses,
-        or_conflict,
         skip_row_label,
     )?;
 
@@ -2747,7 +2723,6 @@ fn emit_update_insns<'a>(
                 cdc_updates_register,
                 t_ctx,
                 skip_set_clauses,
-                or_conflict,
                 skip_row_label,
             )?;
         }
@@ -2951,7 +2926,7 @@ fn emit_update_insns<'a>(
                                 .table
                                 .columns()
                                 .get(idx)
-                                .unwrap()
+                                .expect("column to exist")
                                 .name
                                 .as_ref()
                                 .map_or("", |v| v)
