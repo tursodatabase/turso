@@ -38,14 +38,12 @@ for target in "${TARGETS[@]}"; do
     cargo build -p turso_sync_sdk_kit --release --target "$target"
 done
 
-# Create output directory for universal library
+# Create output directory
 OUTPUT_DIR="$PROJECT_DIR/libs/ios"
 mkdir -p "$OUTPUT_DIR"
 
-# Create universal (fat) library using lipo
-echo "Creating universal library..."
-
-# For simulator: combine x86_64 and aarch64-sim
+# For simulator: combine x86_64 and aarch64-sim into fat library
+echo "Creating simulator fat library..."
 lipo -create \
     "$REPO_ROOT/target/aarch64-apple-ios-sim/release/libturso_sync_sdk_kit.a" \
     "$REPO_ROOT/target/x86_64-apple-ios/release/libturso_sync_sdk_kit.a" \
@@ -55,21 +53,20 @@ lipo -create \
 # For device: just copy aarch64
 cp "$REPO_ROOT/target/aarch64-apple-ios/release/libturso_sync_sdk_kit.a" "$OUTPUT_DIR/libturso_sync_sdk_kit_device.a"
 
-# Create combined universal library
-# Note: This may fail if the architectures conflict - in that case we'll use XCFramework instead
-echo "Creating combined universal library..."
-lipo -create \
-    "$OUTPUT_DIR/libturso_sync_sdk_kit_device.a" \
-    "$OUTPUT_DIR/libturso_sync_sdk_kit_sim.a" \
-    -output "$OUTPUT_DIR/libturso_sync_sdk_kit.a" 2>/dev/null || \
-    cp "$OUTPUT_DIR/libturso_sync_sdk_kit_device.a" "$OUTPUT_DIR/libturso_sync_sdk_kit.a"
+# Create XCFramework (the proper way to bundle device + simulator)
+echo "Creating XCFramework..."
+rm -rf "$OUTPUT_DIR/TursoSyncSdkKit.xcframework"
+xcodebuild -create-xcframework \
+    -library "$OUTPUT_DIR/libturso_sync_sdk_kit_device.a" \
+    -library "$OUTPUT_DIR/libturso_sync_sdk_kit_sim.a" \
+    -output "$OUTPUT_DIR/TursoSyncSdkKit.xcframework"
 
 # Copy header files
 cp "$SDK_KIT_DIR/turso.h" "$OUTPUT_DIR/"
 cp "$SYNC_SDK_KIT_DIR/turso_sync.h" "$OUTPUT_DIR/"
 
 echo "iOS build complete!"
-echo "Universal library: $OUTPUT_DIR/libturso_sync_sdk_kit.a"
+echo "XCFramework: $OUTPUT_DIR/TursoSyncSdkKit.xcframework"
 echo "Headers:"
 echo "  - $OUTPUT_DIR/turso.h"
 echo "  - $OUTPUT_DIR/turso_sync.h"

@@ -18,11 +18,8 @@ Pod::Spec.new do |s|
     "cpp/**/*.{h,hpp,cpp}"
   ]
 
-  # Keep the libraries available
-  s.preserve_paths = [
-    "libs/ios/libturso_sync_sdk_kit_device.a",
-    "libs/ios/libturso_sync_sdk_kit_sim.a"
-  ]
+  # Vendored Rust XCFramework (handles device + simulator automatically)
+  s.vendored_frameworks = "libs/ios/TursoSyncSdkKit.xcframework"
 
   # Header search paths
   s.pod_target_xcconfig = {
@@ -36,19 +33,15 @@ Pod::Spec.new do |s|
     "GCC_PRECOMPILE_PREFIX_HEADER" => "NO"
   }
 
-  # Link the correct Rust library based on SDK (applied to the app target)
+  # User header search paths for consumers
   s.user_target_xcconfig = {
-    "HEADER_SEARCH_PATHS" => "$(PODS_ROOT)/turso-react-native/cpp $(PODS_ROOT)/turso-react-native/libs/ios",
-    "LIBRARY_SEARCH_PATHS[sdk=iphoneos*]" => "$(PODS_ROOT)/turso-react-native/libs/ios",
-    "LIBRARY_SEARCH_PATHS[sdk=iphonesimulator*]" => "$(PODS_ROOT)/turso-react-native/libs/ios",
-    "OTHER_LDFLAGS[sdk=iphoneos*]" => "-force_load $(PODS_ROOT)/turso-react-native/libs/ios/libturso_sync_sdk_kit_device.a",
-    "OTHER_LDFLAGS[sdk=iphonesimulator*]" => "-force_load $(PODS_ROOT)/turso-react-native/libs/ios/libturso_sync_sdk_kit_sim.a"
+    "HEADER_SEARCH_PATHS" => "$(PODS_ROOT)/turso-react-native/cpp $(PODS_ROOT)/turso-react-native/libs/ios"
   }
 
   # Build script to compile Rust
   s.script_phase = {
     :name => "Build Turso Rust Library",
-    :script => 'set -e; cd "${PODS_TARGET_SRCROOT}"; if [ ! -f "libs/ios/libturso_sync_sdk_kit_sim.a" ] || [ ! -f "libs/ios/libturso_sync_sdk_kit_device.a" ]; then echo "Building Rust library for iOS..."; ./scripts/build-rust-ios.sh; fi',
+    :script => 'set -e; cd "${PODS_TARGET_SRCROOT}"; if [ ! -d "libs/ios/TursoSyncSdkKit.xcframework" ]; then echo "Building Rust library for iOS..."; ./scripts/build-rust-ios.sh; fi',
     :execution_position => :before_compile,
     :shell_path => "/bin/bash"
   }
