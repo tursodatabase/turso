@@ -1,5 +1,5 @@
 import { chance } from './utils';
-import { connect } from '@tursodatabase/react-native';
+import { createLocalDatabase } from '@tursodatabase/react-native';
 import {
   expect,
   afterEach,
@@ -12,7 +12,7 @@ describe('Basic Queries', () => {
   let db: any;
 
   beforeEach(async () => {
-    db = await connect(':memory:');
+    db = createLocalDatabase(':memory:');
   });
 
   afterEach(() => {
@@ -53,7 +53,7 @@ describe('Table Operations', () => {
   let db: any;
 
   beforeEach(async () => {
-    db = await connect(':memory:');
+    db = createLocalDatabase(':memory:');
   });
 
   afterEach(() => {

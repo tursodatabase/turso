@@ -6,7 +6,7 @@ import './tests'; // import all tests to register them
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 import { performanceTest } from './performance_test';
 import { StyleSheet, Text, View } from 'react-native';
-import { connect, setup } from '@tursodatabase/react-native';
+import { openDatabase, setup } from '@tursodatabase/react-native';
 
 export default function App() {
   const [results, setResults] = useState<any>(null);
@@ -25,7 +25,7 @@ export default function App() {
       }
 
       let start = performance.now();
-      await connect('dummyDb.sqlite');
+      await openDatabase('dummyDb.sqlite');
       setOpenTime(performance.now() - start);
 
       try {

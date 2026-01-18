@@ -1,87 +1,303 @@
-import type { NativeStatement, Row, RunResult, SQLiteValue } from './types';
+/**
+ * Statement
+ *
+ * High-level wrapper around NativeStatement providing a clean API.
+ * Handles parameter binding, row conversion, and result collection.
+ */
+
+import {
+  NativeStatement,
+  SQLiteValue,
+  BindParams,
+  Row,
+  RunResult,
+  TursoStatus,
+  TursoType,
+} from './types';
 
 /**
- * Statement represents a prepared SQL statement that can be executed multiple times.
+ * Prepared SQL statement
  */
 export class Statement {
-  private _stmt: NativeStatement;
+  private _statement: NativeStatement;
   private _finalized = false;
 
-  constructor(stmt: NativeStatement) {
-    this._stmt = stmt;
+  constructor(statement: NativeStatement) {
+    this._statement = statement;
   }
 
   /**
-   * Binds parameters to the statement.
+   * Bind parameters to the statement
    *
-   * @param params - Parameters to bind (positional or named)
-   * @returns This statement for chaining
+   * @param params - Parameters to bind (array, object, or single value)
+   * @returns this for chaining
    */
-  bind(...params: SQLiteValue[]): this {
-    this._checkFinalized();
-    this._stmt.bind(...params);
+  bind(...params: BindParams[]): this {
+    if (this._finalized) {
+      throw new Error('Statement has been finalized');
+    }
+
+    // Flatten parameters if single array passed
+    let flatParams: SQLiteValue[];
+    if (params.length === 1 && Array.isArray(params[0])) {
+      flatParams = params[0];
+    } else if (params.length === 1 && typeof params[0] === 'object' && params[0] !== null) {
+      // Named parameters
+      const namedParams = params[0] as Record<string, SQLiteValue>;
+      this.bindNamed(namedParams);
+      return this;
+    } else {
+      flatParams = params as SQLiteValue[];
+    }
+
+    // Bind positional parameters
+    this.bindPositional(flatParams);
     return this;
   }
 
   /**
-   * Executes the statement and returns run result info.
-   * Use for INSERT, UPDATE, DELETE statements.
+   * Bind positional parameters (1-indexed)
    *
-   * @param params - Optional parameters to bind before execution
-   * @returns Object with changes and lastInsertRowid
+   * @param params - Array of values to bind
    */
-  run(...params: SQLiteValue[]): RunResult {
-    this._checkFinalized();
-    return this._stmt.run(...params);
+  private bindPositional(params: SQLiteValue[]): void {
+    for (let i = 0; i < params.length; i++) {
+      const position = i + 1; // 1-indexed
+      const value = params[i];
+
+      this.bindValue(position, value);
+    }
   }
 
   /**
-   * Executes the statement and returns the first row.
+   * Bind named parameters
    *
-   * @param params - Optional parameters to bind before execution
-   * @returns The first row or undefined if no results
+   * @param params - Object with named parameters
    */
-  get(...params: SQLiteValue[]): Row | undefined {
-    this._checkFinalized();
-    return this._stmt.get(...params);
+  private bindNamed(params: Record<string, SQLiteValue>): void {
+    for (const [name, value] of Object.entries(params)) {
+      // Get position for named parameter
+      const position = this._statement.namedPosition(name);
+      if (position < 0) {
+        throw new Error(`Unknown parameter name: ${name}`);
+      }
+
+      this.bindValue(position, value);
+    }
   }
 
   /**
-   * Executes the statement and returns all rows.
+   * Bind a single value at a position
    *
-   * @param params - Optional parameters to bind before execution
-   * @returns Array of all matching rows
+   * @param position - 1-indexed position
+   * @param value - Value to bind
    */
-  all(...params: SQLiteValue[]): Row[] {
-    this._checkFinalized();
-    return this._stmt.all(...params);
+  private bindValue(position: number, value: SQLiteValue): void {
+    if (value === null || value === undefined) {
+      this._statement.bindPositionalNull(position);
+    } else if (typeof value === 'number') {
+      // Check if integer or float
+      if (Number.isInteger(value)) {
+        this._statement.bindPositionalInt(position, value);
+      } else {
+        this._statement.bindPositionalDouble(position, value);
+      }
+    } else if (typeof value === 'string') {
+      this._statement.bindPositionalText(position, value);
+    } else if (value instanceof ArrayBuffer || ArrayBuffer.isView(value)) {
+      const buffer = value instanceof ArrayBuffer ? value : value.buffer;
+      this._statement.bindPositionalBlob(position, buffer);
+    } else {
+      throw new Error(`Unsupported parameter type: ${typeof value}`);
+    }
   }
 
   /**
-   * Resets the statement so it can be executed again.
+   * Execute statement without returning rows (for INSERT, UPDATE, DELETE)
    *
-   * @returns This statement for chaining
+   * @param params - Optional parameters to bind
+   * @returns Result with changes and lastInsertRowid
+   */
+  run(...params: BindParams[]): RunResult {
+    if (this._finalized) {
+      throw new Error('Statement has been finalized');
+    }
+
+    // Bind parameters if provided
+    if (params.length > 0) {
+      this.bind(...params);
+    }
+
+    // Execute statement
+    const result = this._statement.execute();
+
+    if (result.status !== TursoStatus.DONE) {
+      throw new Error(`Statement execution failed with status: ${result.status}`);
+    }
+
+    // Reset for next execution
+    this._statement.reset();
+
+    return {
+      changes: result.rowsChanged,
+      lastInsertRowid: 0, // Not available from execute, would need connection
+    };
+  }
+
+  /**
+   * Execute statement and return first row
+   *
+   * @param params - Optional parameters to bind
+   * @returns First row or undefined
+   */
+  get(...params: BindParams[]): Row | undefined {
+    if (this._finalized) {
+      throw new Error('Statement has been finalized');
+    }
+
+    // Bind parameters if provided
+    if (params.length > 0) {
+      this.bind(...params);
+    }
+
+    // Step once
+    const status = this._statement.step();
+
+    if (status === TursoStatus.ROW) {
+      const row = this.readRow();
+      this._statement.reset();
+      return row;
+    }
+
+    if (status === TursoStatus.DONE) {
+      this._statement.reset();
+      return undefined;
+    }
+
+    throw new Error(`Statement step failed with status: ${status}`);
+  }
+
+  /**
+   * Execute statement and return all rows
+   *
+   * @param params - Optional parameters to bind
+   * @returns Array of rows
+   */
+  all(...params: BindParams[]): Row[] {
+    if (this._finalized) {
+      throw new Error('Statement has been finalized');
+    }
+
+    // Bind parameters if provided
+    if (params.length > 0) {
+      this.bind(...params);
+    }
+
+    const rows: Row[] = [];
+
+    // Step through all rows
+    while (true) {
+      const status = this._statement.step();
+
+      if (status === TursoStatus.ROW) {
+        rows.push(this.readRow());
+      } else if (status === TursoStatus.DONE) {
+        break;
+      } else {
+        throw new Error(`Statement step failed with status: ${status}`);
+      }
+    }
+
+    this._statement.reset();
+    return rows;
+  }
+
+  /**
+   * Read current row into an object
+   *
+   * @returns Row object with column name keys
+   */
+  private readRow(): Row {
+    const row: Row = {};
+    const columnCount = this._statement.columnCount();
+
+    for (let i = 0; i < columnCount; i++) {
+      const name = this._statement.columnName(i);
+      if (!name) {
+        throw new Error(`Failed to get column name at index ${i}`);
+      }
+
+      const value = this.readColumnValue(i);
+      row[name] = value;
+    }
+
+    return row;
+  }
+
+  /**
+   * Read value at column index
+   *
+   * @param index - Column index
+   * @returns Column value
+   */
+  private readColumnValue(index: number): SQLiteValue {
+    const kind = this._statement.rowValueKind(index);
+
+    switch (kind) {
+      case TursoType.NULL:
+        return null;
+
+      case TursoType.INTEGER:
+        return this._statement.rowValueInt(index);
+
+      case TursoType.REAL:
+        return this._statement.rowValueDouble(index);
+
+      case TursoType.TEXT:
+        const bytes = this._statement.rowValueBytesPtr(index);
+        if (!bytes) return '';
+        // Convert ArrayBuffer to string
+        const decoder = new TextDecoder('utf-8');
+        return decoder.decode(bytes);
+
+      case TursoType.BLOB:
+        return this._statement.rowValueBytesPtr(index) || new ArrayBuffer(0);
+
+      default:
+        throw new Error(`Unknown column type: ${kind}`);
+    }
+  }
+
+  /**
+   * Reset statement for re-execution
+   *
+   * @returns this for chaining
    */
   reset(): this {
-    this._checkFinalized();
-    this._stmt.reset();
+    if (this._finalized) {
+      throw new Error('Statement has been finalized');
+    }
+
+    this._statement.reset();
     return this;
   }
 
   /**
-   * Finalizes the statement, releasing resources.
-   * After calling finalize(), the statement cannot be used.
+   * Finalize and release statement resources
    */
   finalize(): void {
-    if (!this._finalized) {
-      this._stmt.finalize();
-      this._finalized = true;
+    if (this._finalized) {
+      return;
     }
+
+    this._statement.finalize();
+    this._finalized = true;
   }
 
-  private _checkFinalized(): void {
-    if (this._finalized) {
-      throw new Error('Statement is finalized');
-    }
+  /**
+   * Check if statement has been finalized
+   */
+  get finalized(): boolean {
+    return this._finalized;
   }
 }

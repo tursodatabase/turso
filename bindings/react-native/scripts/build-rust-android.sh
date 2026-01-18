@@ -4,9 +4,9 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 REPO_ROOT="$(cd "$PROJECT_DIR/../.." && pwd)"
-SDK_KIT_DIR="$REPO_ROOT/sdk-kit"
+SYNC_SDK_KIT_DIR="$REPO_ROOT/sync/sdk-kit"
 
-echo "Building Turso sdk-kit for Android..."
+echo "Building Turso sync-sdk-kit for Android (React Native)..."
 
 # Check for required tools
 if ! command -v cargo &> /dev/null; then
@@ -61,26 +61,29 @@ mkdir -p "$OUTPUT_DIR"
 # Build for each target
 for target in "${!TARGETS[@]}"; do
     abi="${TARGETS[$target]}"
-    echo "Building sdk-kit for $target ($abi)..."
+    echo "Building sync-sdk-kit for $target ($abi)..."
 
     # Create ABI-specific output directory
     ABI_OUTPUT_DIR="$OUTPUT_DIR/$abi"
     mkdir -p "$ABI_OUTPUT_DIR"
 
-    # Build using cargo-ndk
-    cargo ndk -t "$target" build -p turso_sdk_kit --release
+    # Build sync-sdk-kit using cargo-ndk
+    cargo ndk -t "$target" build -p turso-sync-sdk-kit --release
 
     # Copy to ABI-named directory
-    cp "$REPO_ROOT/target/$target/release/libturso_sdk_kit.a" "$ABI_OUTPUT_DIR/"
+    cp "$REPO_ROOT/target/$target/release/libturso_sync_sdk_kit.a" "$ABI_OUTPUT_DIR/"
 done
 
-# Copy header file
-cp "$SDK_KIT_DIR/turso.h" "$OUTPUT_DIR/"
+# Copy header files
+cp "$SYNC_SDK_KIT_DIR/turso.h" "$OUTPUT_DIR/"
+cp "$SYNC_SDK_KIT_DIR/turso_sync.h" "$OUTPUT_DIR/"
 
 echo "Android build complete!"
 echo "Libraries built:"
 for target in "${!TARGETS[@]}"; do
     abi="${TARGETS[$target]}"
-    echo "  - $OUTPUT_DIR/$abi/libturso_sdk_kit.a"
+    echo "  - $OUTPUT_DIR/$abi/libturso_sync_sdk_kit.a"
 done
-echo "Header: $OUTPUT_DIR/turso.h"
+echo "Headers:"
+echo "  - $OUTPUT_DIR/turso.h"
+echo "  - $OUTPUT_DIR/turso_sync.h"

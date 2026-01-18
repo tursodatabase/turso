@@ -19,7 +19,7 @@ Pod::Spec.new do |s|
   ]
 
   # Vendored Rust static library
-  s.vendored_libraries = "libs/ios/libturso_sdk_kit.a"
+  s.vendored_libraries = "libs/ios/libturso_sync_sdk_kit.a"
 
   # Header search paths
   s.pod_target_xcconfig = {
@@ -43,7 +43,7 @@ Pod::Spec.new do |s|
     :script => <<-SCRIPT
       set -e
       cd "${PODS_TARGET_SRCROOT}"
-      if [ ! -f "libs/ios/libturso_sdk_kit.a" ]; then
+      if [ ! -f "libs/ios/libturso_sync_sdk_kit.a" ]; then
         echo "Building Rust library for iOS..."
         ./scripts/build-rust-ios.sh
       fi

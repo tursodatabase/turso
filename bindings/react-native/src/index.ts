@@ -1,24 +1,43 @@
-import { NativeModules, Platform } from 'react-native';
-import { Database } from './Database';
-import type {
-  OpenDatabaseOptions,
-  TursoNativeModule,
-  TursoProxy as TursoProxyType,
-} from './types';
+/**
+ * Turso React Native SDK
+ *
+ * Main entry point for the SDK. Supports both local-only and sync databases.
+ */
 
-// Re-export types
+import { NativeModules, Platform } from 'react-native';
+import { Database, DatabaseConfig } from './Database';
+import type { TursoNativeModule, TursoProxy as TursoProxyType } from './types';
+import { setFileSystemImpl } from './internal/ioProcessor';
+
+// Re-export all public types
 export type {
+  // Core types
+  SQLiteValue,
   BindParams,
-  OpenDatabaseOptions,
   Row,
   RunResult,
-  SQLiteValue,
-  SetupOptions,
+
+  // Database config
+  LocalDatabaseConfig,
+  SyncDatabaseConfig,
+
+  // Sync types
+  SyncStats,
+
+  // Enums
+  TursoStatus,
+  TursoType,
 } from './types';
 
 // Re-export classes
 export { Database } from './Database';
 export { Statement } from './Statement';
+
+// Export DatabaseConfig type
+export type { DatabaseConfig } from './Database';
+
+// Export file system configuration function
+export { setFileSystemImpl } from './internal/ioProcessor';
 
 // Get the native module
 const TursoNative: TursoNativeModule | undefined = NativeModules.Turso;
@@ -53,9 +72,84 @@ if (!TursoProxy) {
   );
 }
 
-export async function connect(options: OpenDatabaseOptions | string): Promise<Database> {
-  const nativeDb = TursoProxy.open(options);
-  return new Database(nativeDb);
+/**
+ * Open a database (local or sync)
+ *
+ * For local databases, pass a string path.
+ * For sync databases, pass a config object with remoteUrl.
+ *
+ * @param config - Path string (local) or config object (local/sync)
+ * @returns Database instance
+ *
+ * @example Local database
+ * ```ts
+ * const db = await openDatabase('./local.db');
+ * db.exec('CREATE TABLE users (id INTEGER, name TEXT)');
+ * ```
+ *
+ * @example Sync database
+ * ```ts
+ * const db = await openDatabase({
+ *   path: './replica.db',
+ *   remoteUrl: 'libsql://mydb.turso.io',
+ *   authToken: 'token-here',
+ *   bootstrapIfEmpty: true,
+ * });
+ * await db.create(); // Open or create
+ * const users = db.all('SELECT * FROM users');
+ * await db.push(); // Sync local changes
+ * await db.pull(); // Fetch remote changes
+ * ```
+ */
+export async function openDatabase(config: DatabaseConfig): Promise<Database> {
+  const db = new Database(config);
+
+  // For sync databases, automatically call create()
+  if (db.isSync) {
+    await db.create();
+  }
+
+  return db;
+}
+
+/**
+ * Create a local-only database (synchronous)
+ *
+ * @param path - Database file path
+ * @returns Database instance (already open)
+ *
+ * @example
+ * ```ts
+ * const db = createLocalDatabase('./local.db');
+ * db.exec('CREATE TABLE users (id INTEGER, name TEXT)');
+ * ```
+ */
+export function createLocalDatabase(path: string): Database {
+  return new Database(path);
+}
+
+/**
+ * Create a sync database (async - requires network for bootstrap)
+ *
+ * @param config - Sync database configuration
+ * @returns Database instance (call create() or open() to initialize)
+ *
+ * @example
+ * ```ts
+ * const db = await createSyncDatabase({
+ *   path: './replica.db',
+ *   remoteUrl: 'libsql://mydb.turso.io',
+ *   authToken: 'token-here',
+ * });
+ * await db.create(); // Bootstrap if needed
+ * ```
+ */
+export async function createSyncDatabase(
+  config: import('./types').SyncDatabaseConfig
+): Promise<Database> {
+  const db = new Database(config);
+  await db.create();
+  return db;
 }
 
 /**
@@ -91,8 +185,6 @@ export const paths = {
    * - Android: App's files directory
    */
   get documents(): string {
-    // This is handled by the native code - databases opened with relative paths
-    // will be stored in the appropriate directory for each platform
     return Platform.select({
       ios: 'Documents',
       android: 'files',
@@ -103,9 +195,12 @@ export const paths = {
 
 // Default export
 export default {
-  connect,
+  openDatabase,
+  createLocalDatabase,
+  createSyncDatabase,
   version,
   setup,
+  setFileSystemImpl,
   paths,
   Database,
 };

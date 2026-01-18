@@ -4,9 +4,9 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 REPO_ROOT="$(cd "$PROJECT_DIR/../.." && pwd)"
-SDK_KIT_DIR="$REPO_ROOT/sdk-kit"
+SYNC_SDK_KIT_DIR="$REPO_ROOT/sync/sdk-kit"
 
-echo "Building Turso sdk-kit for iOS..."
+echo "Building Turso sync-sdk-kit for iOS (React Native)..."
 
 # Check for required tools
 if ! command -v cargo &> /dev/null; then
@@ -33,8 +33,8 @@ cd "$REPO_ROOT"
 
 # Build for each target
 for target in "${TARGETS[@]}"; do
-    echo "Building sdk-kit for $target..."
-    cargo build -p turso_sdk_kit --release --target "$target"
+    echo "Building sync-sdk-kit for $target..."
+    cargo build -p turso-sync-sdk-kit --release --target "$target"
 done
 
 # Create output directory for universal library
@@ -46,26 +46,29 @@ echo "Creating universal library..."
 
 # For simulator: combine x86_64 and aarch64-sim
 lipo -create \
-    "$REPO_ROOT/target/aarch64-apple-ios-sim/release/libturso_sdk_kit.a" \
-    "$REPO_ROOT/target/x86_64-apple-ios/release/libturso_sdk_kit.a" \
-    -output "$OUTPUT_DIR/libturso_sdk_kit_sim.a" 2>/dev/null || \
-    cp "$REPO_ROOT/target/aarch64-apple-ios-sim/release/libturso_sdk_kit.a" "$OUTPUT_DIR/libturso_sdk_kit_sim.a"
+    "$REPO_ROOT/target/aarch64-apple-ios-sim/release/libturso_sync_sdk_kit.a" \
+    "$REPO_ROOT/target/x86_64-apple-ios/release/libturso_sync_sdk_kit.a" \
+    -output "$OUTPUT_DIR/libturso_sync_sdk_kit_sim.a" 2>/dev/null || \
+    cp "$REPO_ROOT/target/aarch64-apple-ios-sim/release/libturso_sync_sdk_kit.a" "$OUTPUT_DIR/libturso_sync_sdk_kit_sim.a"
 
 # For device: just copy aarch64
-cp "$REPO_ROOT/target/aarch64-apple-ios/release/libturso_sdk_kit.a" "$OUTPUT_DIR/libturso_sdk_kit_device.a"
+cp "$REPO_ROOT/target/aarch64-apple-ios/release/libturso_sync_sdk_kit.a" "$OUTPUT_DIR/libturso_sync_sdk_kit_device.a"
 
 # Create combined universal library
 # Note: This may fail if the architectures conflict - in that case we'll use XCFramework instead
 echo "Creating combined universal library..."
 lipo -create \
-    "$OUTPUT_DIR/libturso_sdk_kit_device.a" \
-    "$OUTPUT_DIR/libturso_sdk_kit_sim.a" \
-    -output "$OUTPUT_DIR/libturso_sdk_kit.a" 2>/dev/null || \
-    cp "$OUTPUT_DIR/libturso_sdk_kit_device.a" "$OUTPUT_DIR/libturso_sdk_kit.a"
+    "$OUTPUT_DIR/libturso_sync_sdk_kit_device.a" \
+    "$OUTPUT_DIR/libturso_sync_sdk_kit_sim.a" \
+    -output "$OUTPUT_DIR/libturso_sync_sdk_kit.a" 2>/dev/null || \
+    cp "$OUTPUT_DIR/libturso_sync_sdk_kit_device.a" "$OUTPUT_DIR/libturso_sync_sdk_kit.a"
 
-# Copy header file
-cp "$SDK_KIT_DIR/turso.h" "$OUTPUT_DIR/"
+# Copy header files
+cp "$SYNC_SDK_KIT_DIR/turso.h" "$OUTPUT_DIR/"
+cp "$SYNC_SDK_KIT_DIR/turso_sync.h" "$OUTPUT_DIR/"
 
 echo "iOS build complete!"
-echo "Universal library: $OUTPUT_DIR/libturso_sdk_kit.a"
-echo "Header: $OUTPUT_DIR/turso.h"
+echo "Universal library: $OUTPUT_DIR/libturso_sync_sdk_kit.a"
+echo "Headers:"
+echo "  - $OUTPUT_DIR/turso.h"
+echo "  - $OUTPUT_DIR/turso_sync.h"

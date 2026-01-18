@@ -1,30 +1,30 @@
 // import performance from 'react-native-performance';
 import Chance from 'chance';
-import {open} from '@tursodatabase/react-native';
+import {createLocalDatabase} from '@tursodatabase/react-native';
 
 const chance = new Chance();
 
 const ROWS = 300000;
-const DB_NAME = 'largeDB';
-const DB_CONFIG = {
-  name: DB_NAME,
-};
+const DB_NAME = 'largeDB.sqlite';
 
 export async function createLargeDB() {
-  let largeDb = open(DB_CONFIG);
+  let largeDb = createLocalDatabase(DB_NAME);
 
-  largeDb.execute('DROP TABLE IF EXISTS Test;');
-  largeDb.execute(
+  largeDb.exec('DROP TABLE IF EXISTS Test;');
+  largeDb.exec(
     'CREATE TABLE Test ( id INT PRIMARY KEY, v1 TEXT, v2 TEXT, v3 TEXT, v4 TEXT, v5 TEXT, v6 INT, v7 INT, v8 INT, v9 INT, v10 INT, v11 REAL, v12 REAL, v13 REAL, v14 REAL) STRICT;',
   );
 
-  largeDb.execute('PRAGMA mmap_size=268435456');
+  largeDb.exec('PRAGMA mmap_size=268435456');
 
-  let insertions: [string, any[]][] = [];
-  for (let i = 0; i < ROWS; i++) {
-    insertions.push([
-      'INSERT INTO "Test" (id, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-      [
+  // Use transaction for batch insertions
+  largeDb.transaction(() => {
+    const stmt = largeDb.prepare(
+      'INSERT INTO "Test" (id, v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+    );
+
+    for (let i = 0; i < ROWS; i++) {
+      stmt.run(
         i,
         chance.name(),
         chance.name(),
@@ -40,11 +40,11 @@ export async function createLargeDB() {
         chance.floating(),
         chance.floating(),
         chance.floating(),
-      ],
-    ]);
-  }
+      );
+    }
 
-  await largeDb.executeBatch(insertions);
+    stmt.finalize();
+  });
 
   largeDb.close();
 
@@ -52,9 +52,9 @@ export async function createLargeDB() {
 }
 
 export async function querySingleRecordOnLargeDB() {
-  let largeDb = open(DB_CONFIG);
+  let largeDb = createLocalDatabase(DB_NAME);
 
-  await largeDb.execute('SELECT * FROM "Test" LIMIT 1;');
+  largeDb.get('SELECT * FROM "Test" LIMIT 1;');
 }
 
 export async function queryLargeDB() {

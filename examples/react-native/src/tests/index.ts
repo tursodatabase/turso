@@ -1,1 +1,2 @@
 import './queries';
+import './sync';

@@ -12,8 +12,13 @@ find_package(fbjni REQUIRED CONFIG)
 set(TURSO_SOURCES
     cpp-adapter.cpp
     ../cpp/TursoHostObject.cpp
-    ../cpp/DBHostObject.cpp
-    ../cpp/StatementHostObject.cpp
+    ../cpp/TursoDatabaseHostObject.cpp
+    ../cpp/TursoConnectionHostObject.cpp
+    ../cpp/TursoStatementHostObject.cpp
+    ../cpp/TursoSyncDatabaseHostObject.cpp
+    ../cpp/TursoSyncOperationHostObject.cpp
+    ../cpp/TursoSyncIoItemHostObject.cpp
+    ../cpp/TursoSyncChangesHostObject.cpp
 )
 
 # Create shared library
@@ -27,9 +32,9 @@ target_include_directories(${PROJECT_NAME} PRIVATE
 
 # Pre-built Rust static library
 set(RUST_LIB_DIR ${CMAKE_SOURCE_DIR}/../libs/android/${ANDROID_ABI})
-add_library(turso_sdk_kit STATIC IMPORTED)
-set_target_properties(turso_sdk_kit PROPERTIES
-    IMPORTED_LOCATION ${RUST_LIB_DIR}/libturso_sdk_kit.a
+add_library(turso_sync_sdk_kit STATIC IMPORTED)
+set_target_properties(turso_sync_sdk_kit PROPERTIES
+    IMPORTED_LOCATION ${RUST_LIB_DIR}/libturso_sync_sdk_kit.a
 )
 
 # Link libraries
@@ -37,7 +42,7 @@ target_link_libraries(${PROJECT_NAME}
     ReactAndroid::jsi
     ReactAndroid::reactnative
     fbjni::fbjni
-    turso_sdk_kit
+    turso_sync_sdk_kit
     android
     log
 )
