@@ -6,6 +6,7 @@ plugins {
 
 react {
     autolinkLibrariesWithApp()
+    hermesEnabled = true
 }
 
 def enableProguardInReleaseBuilds = false
@@ -13,6 +14,7 @@ def enableProguardInReleaseBuilds = false
 android {
     namespace "com.tursoexample"
     compileSdk 34
+    ndkVersion "26.1.10909125"
 
     defaultConfig {
         applicationId "com.tursoexample"
@@ -55,7 +57,13 @@ android {
 
 dependencies {
     implementation("com.facebook.react:react-android")
-    implementation("com.facebook.react:hermes-android")
+
+    // Hermes engine
+    if (hermesEnabled.toBoolean()) {
+        implementation("com.facebook.react:hermes-android")
+    } else {
+        implementation("org.webkit:android-jsc:+")
+    }
 
     // Turso React Native
     implementation project(':turso-react-native')
