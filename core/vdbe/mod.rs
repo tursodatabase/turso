@@ -57,7 +57,7 @@ use smallvec::SmallVec;
 use crate::{
     storage::pager::Pager,
     translate::plan::ResultSetColumn,
-    types::{AggContext, Cursor, ImmutableRecord, Value},
+    types::{AggContext, Cursor, Extendable, ImmutableRecord, Text, Value},
     vdbe::{builder::CursorType, insn::Insn},
 };
 
@@ -65,7 +65,6 @@ use crate::{
 use crate::json::JsonCacheCell;
 use crate::sync::RwLock;
 use crate::{Connection, MvStore, Result, TransactionState};
-use branches::{mark_unlikely, unlikely};
 use builder::{CursorKey, QueryMode};
 use execute::{
     InsnFunction, InsnFunctionStepResult, OpIdxDeleteState, OpIntegrityCheckState,
@@ -250,6 +249,48 @@ impl Register {
             }
             _ => {
                 *self = Register::Value(Value::Integer(val));
+            }
+        }
+    }
+
+    #[inline(always)]
+    /// Sets the value of the register to a float,
+    /// reusing the existing Register::Value(Value::Float(_)) if possible.
+    pub fn set_float(&mut self, val: f64) {
+        match self {
+            Register::Value(Value::Float(existing)) => {
+                *existing = val;
+            }
+            _ => {
+                *self = Register::Value(Value::Float(val));
+            }
+        }
+    }
+
+    #[inline(always)]
+    /// Sets the value of the register to a blob,
+    /// reusing the existing allocation if possible via do_extend.
+    pub fn set_blob(&mut self, data: &[u8]) {
+        match self {
+            Register::Value(Value::Blob(existing)) => {
+                existing.do_extend(&data);
+            }
+            _ => {
+                *self = Register::Value(Value::Blob(data.to_vec()));
+            }
+        }
+    }
+
+    #[inline(always)]
+    /// Sets the value of the register to a text value,
+    /// reusing the existing allocation if possible via do_extend.
+    pub fn set_text(&mut self, s: &str) {
+        match self {
+            Register::Value(Value::Text(existing)) => {
+                existing.do_extend(&s);
+            }
+            _ => {
+                *self = Register::Value(Value::Text(Text::new(s.to_string())));
             }
         }
     }
@@ -1584,227 +1625,6 @@ impl Row {
 
     pub fn is_empty(&self) -> bool {
         self.count == 0
-    }
-}
-
-/// Extension trait for `ValueIterator` that allows writing directly to a `Register`
-/// without allocating intermediate `ValueRef` values.
-pub trait ValueIteratorExt {
-    /// Skips `n` elements and writes the value directly to the register.
-    /// Returns `Some(Ok(()))` on success, `Some(Err(...))` on parse error,
-    /// or `None` if there are fewer than `n+1` elements.
-    fn nth_into_register(&mut self, n: usize, dest: &mut Register) -> Option<Result<()>>;
-}
-
-impl<'a> ValueIteratorExt for crate::types::ValueIterator<'a> {
-    #[inline(always)]
-    fn nth_into_register(&mut self, n: usize, dest: &mut Register) -> Option<Result<()>> {
-        use crate::storage::sqlite3_ondisk::read_varint;
-        use crate::types::{get_serial_type_size, Extendable, Text};
-
-        let mut header = self.header_section_ref();
-        let mut data = self.data_section_ref();
-
-        // Skip n elements
-        let mut data_sum = 0;
-        for _ in 0..n {
-            if header.is_empty() {
-                return None;
-            }
-
-            let (serial_type, bytes_read) = match read_varint(header) {
-                Ok(v) => v,
-                Err(e) => return Some(Err(e)),
-            };
-            header = &header[bytes_read..];
-
-            data_sum += match get_serial_type_size(serial_type) {
-                Ok(size) => size,
-                Err(e) => return Some(Err(e)),
-            };
-        }
-
-        if data_sum > data.len() {
-            return Some(Err(LimboError::Corrupt(
-                "Data section too small for indicated serial type size".into(),
-            )));
-        }
-        data = &data[data_sum..];
-
-        // Read the serial type for the target element
-        if header.is_empty() {
-            return None;
-        }
-
-        let (serial_type, bytes_read) = match read_varint(header) {
-            Ok(v) => v,
-            Err(e) => return Some(Err(e)),
-        };
-
-        // Update iterator state
-        self.set_header_section(&header[bytes_read..]);
-
-        // Decode directly into register based on serial type
-        match serial_type {
-            // NULL
-            0 => {
-                self.set_data_section(data);
-                *dest = Register::Value(Value::Null);
-            }
-            // I8
-            1 => {
-                if unlikely(data.is_empty()) {
-                    return Some(Err(LimboError::Corrupt("Invalid 1-byte int".into())));
-                }
-                self.set_data_section(&data[1..]);
-                dest.set_int(data[0] as i8 as i64);
-            }
-            // I16
-            2 => {
-                if unlikely(data.len() < 2) {
-                    return Some(Err(LimboError::Corrupt("Invalid 2-byte int".into())));
-                }
-                self.set_data_section(&data[2..]);
-                dest.set_int(i16::from_be_bytes([data[0], data[1]]) as i64);
-            }
-            // I24
-            3 => {
-                if unlikely(data.len() < 3) {
-                    return Some(Err(LimboError::Corrupt("Invalid 3-byte int".into())));
-                }
-                self.set_data_section(&data[3..]);
-                let sign_extension = if data[0] <= 0x7F { 0 } else { 0xFF };
-                dest.set_int(
-                    i32::from_be_bytes([sign_extension, data[0], data[1], data[2]]) as i64,
-                );
-            }
-            // I32
-            4 => {
-                if unlikely(data.len() < 4) {
-                    return Some(Err(LimboError::Corrupt("Invalid 4-byte int".into())));
-                }
-                self.set_data_section(&data[4..]);
-                dest.set_int(i32::from_be_bytes([data[0], data[1], data[2], data[3]]) as i64);
-            }
-            // I48
-            5 => {
-                if unlikely(data.len() < 6) {
-                    return Some(Err(LimboError::Corrupt("Invalid 6-byte int".into())));
-                }
-                self.set_data_section(&data[6..]);
-                let sign_extension = if data[0] <= 0x7F { 0 } else { 0xFF };
-                dest.set_int(i64::from_be_bytes([
-                    sign_extension,
-                    sign_extension,
-                    data[0],
-                    data[1],
-                    data[2],
-                    data[3],
-                    data[4],
-                    data[5],
-                ]));
-            }
-            // I64
-            6 => {
-                if unlikely(data.len() < 8) {
-                    return Some(Err(LimboError::Corrupt("Invalid 8-byte int".into())));
-                }
-                self.set_data_section(&data[8..]);
-                dest.set_int(i64::from_be_bytes([
-                    data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
-                ]));
-            }
-            // F64
-            7 => {
-                if unlikely(data.len() < 8) {
-                    return Some(Err(LimboError::Corrupt("Invalid 8-byte float".into())));
-                }
-                self.set_data_section(&data[8..]);
-                let val = f64::from_be_bytes([
-                    data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
-                ]);
-                match dest {
-                    Register::Value(Value::Float(existing)) => {
-                        *existing = val;
-                    }
-                    _ => {
-                        *dest = Register::Value(Value::Float(val));
-                    }
-                }
-            }
-            // CONST_INT0
-            8 => {
-                self.set_data_section(data);
-                dest.set_int(0);
-            }
-            // CONST_INT1
-            9 => {
-                self.set_data_section(data);
-                dest.set_int(1);
-            }
-            // Reserved
-            10 | 11 => {
-                mark_unlikely();
-                return Some(Err(LimboError::Corrupt(format!(
-                    "Reserved serial type: {serial_type}"
-                ))));
-            }
-            // BLOB (n >= 12 && n & 1 == 0)
-            n if n >= 12 && n & 1 == 0 => {
-                let content_size = ((n - 12) / 2) as usize;
-                if unlikely(data.len() < content_size) {
-                    return Some(Err(LimboError::Corrupt("Invalid Blob value".into())));
-                }
-                self.set_data_section(&data[content_size..]);
-                let blob_data = &data[..content_size];
-                match dest {
-                    Register::Value(Value::Blob(existing_blob)) => {
-                        existing_blob.do_extend(&blob_data);
-                    }
-                    _ => {
-                        *dest = Register::Value(Value::Blob(blob_data.to_vec()));
-                    }
-                }
-            }
-            // TEXT (n >= 13 && n & 1 == 1)
-            n if n >= 13 && n & 1 == 1 => {
-                let content_size = ((n - 13) / 2) as usize;
-                if unlikely(data.len() < content_size) {
-                    return Some(Err(LimboError::Corrupt("Invalid Text value".into())));
-                }
-                self.set_data_section(&data[content_size..]);
-                let text_data = &data[..content_size];
-                // SAFETY: TEXT serial type contains valid UTF-8
-                let text_str = if cfg!(debug_assertions) {
-                    match std::str::from_utf8(text_data) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            return Some(Err(LimboError::InternalError(format!(
-                                "Invalid UTF-8 in TEXT serial type: {e}"
-                            ))));
-                        }
-                    }
-                } else {
-                    unsafe { std::str::from_utf8_unchecked(text_data) }
-                };
-                match dest {
-                    Register::Value(Value::Text(existing_text)) => {
-                        existing_text.do_extend(&text_str);
-                    }
-                    _ => {
-                        *dest = Register::Value(Value::Text(Text::new(text_str.to_string())));
-                    }
-                }
-            }
-            _ => {
-                mark_unlikely();
-                return Some(Err(LimboError::Corrupt(format!(
-                    "Invalid serial type: {serial_type}"
-                ))));
-            }
-        }
-
-        Some(Ok(()))
     }
 }
 

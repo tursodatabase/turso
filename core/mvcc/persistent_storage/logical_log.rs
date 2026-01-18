@@ -804,7 +804,9 @@ mod tests {
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
         let num_transactions = rng.next_u64() % 128;
         let mut txns = vec![];
+        #[allow(clippy::mutable_key_type)]
         let mut present_rowids = BTreeSet::new();
+        #[allow(clippy::mutable_key_type)]
         let mut non_present_rowids = BTreeSet::new();
         for _ in 0..num_transactions {
             let num_operations = rng.next_u64() % 8;
