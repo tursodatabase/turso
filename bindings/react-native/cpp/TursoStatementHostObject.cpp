@@ -146,28 +146,28 @@ void TursoStatementHostObject::set(jsi::Runtime &rt, const jsi::PropNameID &name
 }
 
 std::vector<jsi::PropNameID> TursoStatementHostObject::getPropertyNames(jsi::Runtime &rt) {
-    return {
-        jsi::PropNameID::forAscii(rt, "bindPositionalNull"),
-        jsi::PropNameID::forAscii(rt, "bindPositionalInt"),
-        jsi::PropNameID::forAscii(rt, "bindPositionalDouble"),
-        jsi::PropNameID::forAscii(rt, "bindPositionalBlob"),
-        jsi::PropNameID::forAscii(rt, "bindPositionalText"),
-        jsi::PropNameID::forAscii(rt, "execute"),
-        jsi::PropNameID::forAscii(rt, "step"),
-        jsi::PropNameID::forAscii(rt, "runIo"),
-        jsi::PropNameID::forAscii(rt, "reset"),
-        jsi::PropNameID::forAscii(rt, "finalize"),
-        jsi::PropNameID::forAscii(rt, "nChange"),
-        jsi::PropNameID::forAscii(rt, "columnCount"),
-        jsi::PropNameID::forAscii(rt, "columnName"),
-        jsi::PropNameID::forAscii(rt, "rowValueKind"),
-        jsi::PropNameID::forAscii(rt, "rowValueBytesCount"),
-        jsi::PropNameID::forAscii(rt, "rowValueBytesPtr"),
-        jsi::PropNameID::forAscii(rt, "rowValueInt"),
-        jsi::PropNameID::forAscii(rt, "rowValueDouble"),
-        jsi::PropNameID::forAscii(rt, "namedPosition"),
-        jsi::PropNameID::forAscii(rt, "parametersCount")
-    };
+    std::vector<jsi::PropNameID> props;
+    props.emplace_back(jsi::PropNameID::forAscii(rt, "bindPositionalNull"));
+    props.emplace_back(jsi::PropNameID::forAscii(rt, "bindPositionalInt"));
+    props.emplace_back(jsi::PropNameID::forAscii(rt, "bindPositionalDouble"));
+    props.emplace_back(jsi::PropNameID::forAscii(rt, "bindPositionalBlob"));
+    props.emplace_back(jsi::PropNameID::forAscii(rt, "bindPositionalText"));
+    props.emplace_back(jsi::PropNameID::forAscii(rt, "execute"));
+    props.emplace_back(jsi::PropNameID::forAscii(rt, "step"));
+    props.emplace_back(jsi::PropNameID::forAscii(rt, "runIo"));
+    props.emplace_back(jsi::PropNameID::forAscii(rt, "reset"));
+    props.emplace_back(jsi::PropNameID::forAscii(rt, "finalize"));
+    props.emplace_back(jsi::PropNameID::forAscii(rt, "nChange"));
+    props.emplace_back(jsi::PropNameID::forAscii(rt, "columnCount"));
+    props.emplace_back(jsi::PropNameID::forAscii(rt, "columnName"));
+    props.emplace_back(jsi::PropNameID::forAscii(rt, "rowValueKind"));
+    props.emplace_back(jsi::PropNameID::forAscii(rt, "rowValueBytesCount"));
+    props.emplace_back(jsi::PropNameID::forAscii(rt, "rowValueBytesPtr"));
+    props.emplace_back(jsi::PropNameID::forAscii(rt, "rowValueInt"));
+    props.emplace_back(jsi::PropNameID::forAscii(rt, "rowValueDouble"));
+    props.emplace_back(jsi::PropNameID::forAscii(rt, "namedPosition"));
+    props.emplace_back(jsi::PropNameID::forAscii(rt, "parametersCount"));
+    return props;
 }
 
 // 1:1 C API mapping - NO logic, just calls through to C API

@@ -614,17 +614,17 @@ void DBHostObject::set(jsi::Runtime &rt, const jsi::PropNameID &name, const jsi:
 
 std::vector<jsi::PropNameID> DBHostObject::getPropertyNames(jsi::Runtime &rt) {
     std::vector<jsi::PropNameID> props;
-    props.push_back(jsi::PropNameID::forAscii(rt, "open"));
-    props.push_back(jsi::PropNameID::forAscii(rt, "inTransaction"));
-    props.push_back(jsi::PropNameID::forAscii(rt, "lastInsertRowid"));
-    props.push_back(jsi::PropNameID::forAscii(rt, "path"));
-    props.push_back(jsi::PropNameID::forAscii(rt, "memory"));
-    props.push_back(jsi::PropNameID::forAscii(rt, "prepare"));
-    props.push_back(jsi::PropNameID::forAscii(rt, "exec"));
-    props.push_back(jsi::PropNameID::forAscii(rt, "run"));
-    props.push_back(jsi::PropNameID::forAscii(rt, "get"));
-    props.push_back(jsi::PropNameID::forAscii(rt, "all"));
-    props.push_back(jsi::PropNameID::forAscii(rt, "close"));
+    props.emplace_back(jsi::PropNameID::forAscii(rt, "open"));
+    props.emplace_back(jsi::PropNameID::forAscii(rt, "inTransaction"));
+    props.emplace_back(jsi::PropNameID::forAscii(rt, "lastInsertRowid"));
+    props.emplace_back(jsi::PropNameID::forAscii(rt, "path"));
+    props.emplace_back(jsi::PropNameID::forAscii(rt, "memory"));
+    props.emplace_back(jsi::PropNameID::forAscii(rt, "prepare"));
+    props.emplace_back(jsi::PropNameID::forAscii(rt, "exec"));
+    props.emplace_back(jsi::PropNameID::forAscii(rt, "run"));
+    props.emplace_back(jsi::PropNameID::forAscii(rt, "get"));
+    props.emplace_back(jsi::PropNameID::forAscii(rt, "all"));
+    props.emplace_back(jsi::PropNameID::forAscii(rt, "close"));
     return props;
 }
 

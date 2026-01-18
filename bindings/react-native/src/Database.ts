@@ -14,8 +14,7 @@ import {
   RunResult,
   SQLiteValue,
   BindParams,
-  SyncDatabaseConfig,
-  LocalDatabaseConfig,
+  DatabaseOpts,
   SyncStats,
 } from './types';
 import {
@@ -24,70 +23,77 @@ import {
   driveChangesOperation,
   driveStatsOperation,
 } from './internal/asyncOperation';
+import { drainSyncIo } from './internal/ioProcessor';
 
 /**
- * Database constructor config - either string path (local) or object (sync)
+ * Check if config has sync properties (url field)
  */
-export type DatabaseConfig = string | LocalDatabaseConfig | SyncDatabaseConfig;
-
-/**
- * Check if config has sync properties
- */
-function isSyncConfig(config: any): config is SyncDatabaseConfig {
-  return (
-    typeof config === 'object' &&
-    config !== null &&
-    ('remoteUrl' in config || 'authToken' in config)
-  );
+function isSyncConfig(opts: DatabaseOpts): boolean {
+  return opts.url !== undefined && opts.url !== null;
 }
 
 /**
  * Database class - works for both local-only and sync databases
+ *
+ * All database operations are async to properly handle IO requirements:
+ * - For local databases: async allows yielding to JS event loop
+ * - For sync databases: async required for network operations
+ * - For partial sync: async required to load missing pages on-demand
  */
 export class Database {
+  private _opts: DatabaseOpts;
   private _nativeDb: NativeDatabase | null = null;
   private _nativeSyncDb: NativeSyncDatabase | null = null;
   private _connection: NativeConnection | null = null;
   private _isSync = false;
-  private _path: string;
+  private _connected = false;
   private _closed = false;
+  private _extraIo?: () => Promise<void>;
 
   /**
-   * Create a new database
+   * Create a new database (doesn't connect yet - call connect())
    *
-   * @param config - Path string (local) or config object (local/sync)
+   * @param opts - Database options
    */
-  constructor(config: DatabaseConfig) {
-    // Determine if sync or local
-    const isSync = typeof config === 'object' && isSyncConfig(config);
-    this._isSync = isSync;
+  constructor(opts: DatabaseOpts) {
+    this._opts = opts;
+    this._isSync = isSyncConfig(opts);
+  }
 
-    if (isSync) {
-      // Sync database
-      this._path = config.path;
-      this.initSyncDatabase(config);
-    } else {
-      // Local database
-      this._path = typeof config === 'string' ? config : config.path;
-      this.initLocalDatabase(typeof config === 'string' ? config : config);
+  /**
+   * Connect to the database (matches JavaScript bindings)
+   * For local databases: opens immediately
+   * For sync databases: bootstraps if needed
+   */
+  async connect(): Promise<void> {
+    if (this._connected) {
+      return;
     }
+
+    if (this._isSync) {
+      await this.initSyncDatabase();
+    } else {
+      this.initLocalDatabase();
+    }
+
+    this._connected = true;
   }
 
   /**
    * Initialize local-only database
    */
-  private initLocalDatabase(config: string | LocalDatabaseConfig): void {
-    const path = typeof config === 'string' ? config : config.path;
-
-    // Create database through __TursoProxy
+  private initLocalDatabase(): void {
     if (typeof __TursoProxy === 'undefined') {
       throw new Error('Turso native module not loaded');
     }
 
-    const dbConfig = typeof config === 'object' ? config : { path };
+    const dbConfig = {
+      path: this._opts.path,
+      async_io: true, // Always use async IO in React Native
+    };
 
     // Create native database
-    this._nativeDb = __TursoProxy.newDatabase(path, dbConfig);
+    this._nativeDb = __TursoProxy.newDatabase(this._opts.path, dbConfig);
 
     // Open database
     this._nativeDb.open();
@@ -97,79 +103,64 @@ export class Database {
   }
 
   /**
-   * Initialize sync database (async initialization handled by open/create)
+   * Initialize sync database
    */
-  private initSyncDatabase(config: SyncDatabaseConfig): void {
-    // Create database through __TursoProxy
+  private async initSyncDatabase(): Promise<void> {
     if (typeof __TursoProxy === 'undefined') {
       throw new Error('Turso native module not loaded');
     }
 
+    // Get URL (can be string or function)
+    let url: string | null = null;
+    if (typeof this._opts.url === 'function') {
+      url = this._opts.url();
+    } else if (typeof this._opts.url === 'string') {
+      url = this._opts.url;
+    }
+
+    if (!url) {
+      throw new Error('Sync database requires a URL');
+    }
+
     // Build dbConfig
     const dbConfig = {
-      path: config.path,
+      path: this._opts.path,
+      async_io: true, // Always use async IO in React Native
     };
 
     // Build syncConfig with all options
     const syncConfig: any = {
-      remoteUrl: config.remoteUrl,
-      clientName: config.clientName,
-      longPollTimeoutMs: config.longPollTimeoutMs,
-      bootstrapIfEmpty: config.bootstrapIfEmpty,
-      reservedBytes: config.reservedBytes,
+      remoteUrl: url,
+      clientName: this._opts.clientName,
+      longPollTimeoutMs: this._opts.longPollTimeoutMs,
+      bootstrapIfEmpty: this._opts.bootstrapIfEmpty ?? true,
+      reservedBytes: this._opts.reservedBytes,
     };
 
     // Add partial sync options if present
-    if (config.partialSync) {
-      syncConfig.partialBootstrapStrategyPrefix = config.partialSync.bootstrapStrategyPrefix;
-      syncConfig.partialBootstrapStrategyQuery = config.partialSync.bootstrapStrategyQuery;
-      syncConfig.partialBootstrapSegmentSize = config.partialSync.segmentSize;
-      syncConfig.partialBootstrapPrefetch = config.partialSync.prefetch;
+    if (this._opts.partialSyncExperimental) {
+      const partial = this._opts.partialSyncExperimental;
+      if (partial.bootstrapStrategy.kind === 'prefix') {
+        syncConfig.partialBootstrapStrategyPrefix = partial.bootstrapStrategy.length;
+      } else if (partial.bootstrapStrategy.kind === 'query') {
+        syncConfig.partialBootstrapStrategyQuery = partial.bootstrapStrategy.query;
+      }
+      syncConfig.partialBootstrapSegmentSize = partial.segmentSize;
+      syncConfig.partialBootstrapPrefetch = partial.prefetch;
     }
 
     // Create native sync database
     this._nativeSyncDb = __TursoProxy.newSyncDatabase(dbConfig, syncConfig);
 
-    // Note: Database is not open yet - user must call open() or create()
-    // This is async and will be handled by the open() method
-  }
+    // Create extraIo callback for partial sync support
+    // This callback drains the sync engine's IO queue during statement execution
+    this._extraIo = async () => {
+      if (this._nativeSyncDb) {
+        await drainSyncIo(this._nativeSyncDb);
+      }
+    };
 
-  /**
-   * Open sync database (async)
-   * Only needed for sync databases - local databases auto-open in constructor
-   */
-  async open(): Promise<void> {
-    if (!this._isSync) {
-      throw new Error('open() is only for sync databases. Local databases open automatically.');
-    }
-
-    if (!this._nativeSyncDb) {
-      throw new Error('Sync database not initialized');
-    }
-
-    // Drive open operation
-    const operation = this._nativeSyncDb.open();
-    await driveVoidOperation(operation, this._nativeSyncDb);
-
-    // Get connection
-    const connOperation = this._nativeSyncDb.connect();
-    this._connection = await driveConnectionOperation(connOperation, this._nativeSyncDb);
-  }
-
-  /**
-   * Create or open sync database (async)
-   * Only for sync databases
-   */
-  async create(): Promise<void> {
-    if (!this._isSync) {
-      throw new Error('create() is only for sync databases.');
-    }
-
-    if (!this._nativeSyncDb) {
-      throw new Error('Sync database not initialized');
-    }
-
-    // Drive create operation
+    // Bootstrap/open database
     const operation = this._nativeSyncDb.create();
     await driveVoidOperation(operation, this._nativeSyncDb);
 
@@ -192,7 +183,8 @@ export class Database {
     }
 
     const nativeStmt = this._connection.prepareSingle(sql);
-    return new Statement(nativeStmt);
+    // Pass extraIo callback for partial sync support
+    return new Statement(nativeStmt, this._extraIo);
   }
 
   /**
@@ -200,7 +192,7 @@ export class Database {
    *
    * @param sql - SQL to execute
    */
-  exec(sql: string): void {
+  async exec(sql: string): Promise<void> {
     this.checkOpen();
 
     if (!this._connection) {
@@ -217,10 +209,13 @@ export class Database {
         break; // No more statements
       }
 
-      // Execute statement
-      const execResult = result.statement.execute();
-      if (execResult.status !== 1 /* TURSO_DONE */) {
-        throw new Error(`Execution failed with status: ${execResult.status}`);
+      // Wrap in Statement to get IO handling
+      const stmt = new Statement(result.statement, this._extraIo);
+      try {
+        // Execute - will handle IO if needed
+        await stmt.run();
+      } finally {
+        stmt.finalize();
       }
 
       // Move to next statement
@@ -235,10 +230,10 @@ export class Database {
    * @param params - Bind parameters
    * @returns Run result with changes and lastInsertRowid
    */
-  run(sql: string, ...params: BindParams[]): RunResult {
+  async run(sql: string, ...params: BindParams[]): Promise<RunResult> {
     const stmt = this.prepare(sql);
     try {
-      return stmt.run(...params);
+      return await stmt.run(...params);
     } finally {
       stmt.finalize();
     }
@@ -251,10 +246,10 @@ export class Database {
    * @param params - Bind parameters
    * @returns First row or undefined
    */
-  get(sql: string, ...params: BindParams[]): Row | undefined {
+  async get(sql: string, ...params: BindParams[]): Promise<Row | undefined> {
     const stmt = this.prepare(sql);
     try {
-      return stmt.get(...params);
+      return await stmt.get(...params);
     } finally {
       stmt.finalize();
     }
@@ -267,10 +262,10 @@ export class Database {
    * @param params - Bind parameters
    * @returns All rows
    */
-  all(sql: string, ...params: BindParams[]): Row[] {
+  async all(sql: string, ...params: BindParams[]): Promise<Row[]> {
     const stmt = this.prepare(sql);
     try {
-      return stmt.all(...params);
+      return await stmt.all(...params);
     } finally {
       stmt.finalize();
     }
@@ -282,15 +277,15 @@ export class Database {
    * @param fn - Function to execute
    * @returns Function result
    */
-  transaction<T>(fn: () => T): T {
+  async transaction<T>(fn: () => T | Promise<T>): Promise<T> {
     this.checkOpen();
-    this.exec('BEGIN');
+    await this.exec('BEGIN');
     try {
-      const result = fn();
-      this.exec('COMMIT');
+      const result = await fn();
+      await this.exec('COMMIT');
       return result;
     } catch (error) {
-      this.exec('ROLLBACK');
+      await this.exec('ROLLBACK');
       throw error;
     }
   }
@@ -382,6 +377,7 @@ export class Database {
       this._nativeSyncDb = null;
     }
 
+    this._connected = false;
     this._closed = true;
   }
 
@@ -389,7 +385,7 @@ export class Database {
    * Get database path
    */
   get path(): string {
-    return this._path;
+    return this._opts.path;
   }
 
   /**
@@ -433,8 +429,8 @@ export class Database {
     if (this._closed) {
       throw new Error('Database is closed');
     }
-    if (!this._connection) {
-      throw new Error('Database not connected. For sync databases, call open() or create() first.');
+    if (!this._connected || !this._connection) {
+      throw new Error('Database not connected. Call connect() first.');
     }
   }
 }

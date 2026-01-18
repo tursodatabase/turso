@@ -407,12 +407,12 @@ void StatementHostObject::set(jsi::Runtime &rt, const jsi::PropNameID &name, con
 
 std::vector<jsi::PropNameID> StatementHostObject::getPropertyNames(jsi::Runtime &rt) {
     std::vector<jsi::PropNameID> props;
-    props.push_back(jsi::PropNameID::forAscii(rt, "bind"));
-    props.push_back(jsi::PropNameID::forAscii(rt, "run"));
-    props.push_back(jsi::PropNameID::forAscii(rt, "get"));
-    props.push_back(jsi::PropNameID::forAscii(rt, "all"));
-    props.push_back(jsi::PropNameID::forAscii(rt, "finalize"));
-    props.push_back(jsi::PropNameID::forAscii(rt, "reset"));
+    props.emplace_back(jsi::PropNameID::forAscii(rt, "bind"));
+    props.emplace_back(jsi::PropNameID::forAscii(rt, "run"));
+    props.emplace_back(jsi::PropNameID::forAscii(rt, "get"));
+    props.emplace_back(jsi::PropNameID::forAscii(rt, "all"));
+    props.emplace_back(jsi::PropNameID::forAscii(rt, "finalize"));
+    props.emplace_back(jsi::PropNameID::forAscii(rt, "reset"));
     return props;
 }
 

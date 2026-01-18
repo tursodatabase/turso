@@ -4,6 +4,7 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 REPO_ROOT="$(cd "$PROJECT_DIR/../.." && pwd)"
+SDK_KIT_DIR="$REPO_ROOT/sdk-kit"
 SYNC_SDK_KIT_DIR="$REPO_ROOT/sync/sdk-kit"
 
 echo "Building Turso sync-sdk-kit for Android (React Native)..."
@@ -68,14 +69,14 @@ for target in "${!TARGETS[@]}"; do
     mkdir -p "$ABI_OUTPUT_DIR"
 
     # Build sync-sdk-kit using cargo-ndk
-    cargo ndk -t "$target" build -p turso-sync-sdk-kit --release
+    cargo ndk -t "$target" build -p turso_sync_sdk_kit --release
 
     # Copy to ABI-named directory
     cp "$REPO_ROOT/target/$target/release/libturso_sync_sdk_kit.a" "$ABI_OUTPUT_DIR/"
 done
 
 # Copy header files
-cp "$SYNC_SDK_KIT_DIR/turso.h" "$OUTPUT_DIR/"
+cp "$SDK_KIT_DIR/turso.h" "$OUTPUT_DIR/"
 cp "$SYNC_SDK_KIT_DIR/turso_sync.h" "$OUTPUT_DIR/"
 
 echo "Android build complete!"

@@ -211,36 +211,103 @@ export interface RunResult {
 export type Row = Record<string, SQLiteValue>;
 
 /**
- * Configuration for local database
+ * Encryption options (matches JavaScript bindings)
  */
-export interface LocalDatabaseConfig {
-  path: string;
-  vfs?: string;
-  experimentalFeatures?: string;
-  encryptionCipher?: string;
-  encryptionHexkey?: string;
+export interface EncryptionOpts {
+  /** base64 encoded encryption key (must be either 16 or 32 bytes depending on cipher) */
+  key: string;
+  /** encryption cipher algorithm */
+  cipher: 'aes256gcm' | 'aes128gcm' | 'chacha20poly1305' | 'aegis256';
 }
 
 /**
- * Configuration for sync database (embedded replica)
+ * Database options (matches JavaScript bindings)
+ * Single unified config for both local and sync databases
  */
-export interface SyncDatabaseConfig {
+export interface DatabaseOpts {
+  /**
+   * Local path where to store database file (e.g. local.db)
+   * Sync database will write several files with that prefix
+   * (e.g. local.db-info, local.db-wal, etc)
+   */
   path: string;
-  remoteUrl?: string;
-  authToken?: string;  // Will be added to HTTP headers
+
+  /**
+   * Optional URL of the remote database (e.g. libsql://db-org.turso.io)
+   * If omitted - local-only database will be created
+   *
+   * You can also provide function which will return URL or null
+   * In this case local database will be created and sync will be "switched-on"
+   * whenever the url returns non-empty value
+   */
+  url?: string | (() => string | null);
+
+  /**
+   * Auth token for the remote database
+   * (can be either static string or function which will provide short-lived credentials)
+   */
+  authToken?: string | (() => Promise<string>);
+
+  /**
+   * Arbitrary client name which can be used to distinguish clients internally
+   * The library will guarantee uniqueness of the clientId by appending unique suffix
+   */
   clientName?: string;
+
+  /**
+   * Optional remote encryption parameters if cloud database was encrypted
+   */
+  remoteEncryption?: EncryptionOpts;
+
+  /**
+   * Optional long-polling timeout for pull operation
+   * If not set - no timeout is applied
+   */
   longPollTimeoutMs?: number;
+
+  /**
+   * Optional parameter to enable internal logging for the database
+   */
+  tracing?: 'error' | 'warn' | 'info' | 'debug' | 'trace';
+
+  /**
+   * Bootstrap database if empty; if set - client will be able to connect
+   * to fresh db only when network is online
+   */
   bootstrapIfEmpty?: boolean;
+
+  /**
+   * Reserved bytes which must be set for the database - necessary if
+   * remote encryption is set for the db in cloud
+   */
   reservedBytes?: number;
 
-  // Partial sync options
-  partialSync?: {
-    bootstrapStrategyPrefix?: number;
-    bootstrapStrategyQuery?: string;
+  /**
+   * Optional parameter to enable partial sync for the database
+   * WARNING: This feature is EXPERIMENTAL
+   */
+  partialSyncExperimental?: {
+    /**
+     * Bootstrap strategy configuration
+     * - prefix strategy loads first N bytes locally at startup
+     * - query strategy loads pages touched by the provided SQL statement
+     */
+    bootstrapStrategy:
+      | { kind: 'prefix'; length: number }
+      | { kind: 'query'; query: string };
+    /**
+     * Optional segment size which makes sync engine load pages in batches
+     * (so, if loading page 1 with segment_size=128kb then 32 pages [1..32] will be loaded)
+     */
     segmentSize?: number;
+    /**
+     * Optional parameter which makes sync engine prefetch pages which probably
+     * will be accessed soon
+     */
     prefetch?: boolean;
   };
 }
+
 
 /**
  * Sync stats returned by stats() operation

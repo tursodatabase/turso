@@ -12,7 +12,7 @@
  * - Uses platform-native networking (not C++ HTTP libraries)
  */
 
-import { NativeSyncIoItem } from '../types';
+import { NativeSyncIoItem, NativeSyncDatabase } from '../types';
 
 // React Native file system APIs (if available)
 // Users can provide their own implementation or use react-native-fs
@@ -187,4 +187,32 @@ function isFileNotFoundError(error: unknown): boolean {
     );
   }
   return false;
+}
+
+/**
+ * Drain all pending IO items from sync engine queue and process them.
+ * This is called during statement execution when partial sync needs to load missing pages.
+ *
+ * @param database - The native sync database
+ */
+export async function drainSyncIo(database: NativeSyncDatabase): Promise<void> {
+  const promises: Promise<void>[] = [];
+
+  // Take all available IO items from the queue
+  while (true) {
+    const ioItem = database.ioTakeItem();
+    if (!ioItem) {
+      break; // No more items
+    }
+
+    // Process each item
+    promises.push(processIoItem(ioItem));
+  }
+
+  // Wait for all IO operations to complete
+  await Promise.all(promises);
+
+  // Step callbacks after IO processing
+  // This allows the sync engine to run any post-IO callbacks
+  database.ioStepCallbacks();
 }

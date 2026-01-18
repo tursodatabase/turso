@@ -4,6 +4,7 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 REPO_ROOT="$(cd "$PROJECT_DIR/../.." && pwd)"
+SDK_KIT_DIR="$REPO_ROOT/sdk-kit"
 SYNC_SDK_KIT_DIR="$REPO_ROOT/sync/sdk-kit"
 
 echo "Building Turso sync-sdk-kit for iOS (React Native)..."
@@ -33,8 +34,8 @@ cd "$REPO_ROOT"
 
 # Build for each target
 for target in "${TARGETS[@]}"; do
-    echo "Building sync-sdk-kit for $target..."
-    cargo build -p turso-sync-sdk-kit --release --target "$target"
+    echo "Building turso_sync_sdk_kit for $target..."
+    cargo build -p turso_sync_sdk_kit --release --target "$target"
 done
 
 # Create output directory for universal library
@@ -64,7 +65,7 @@ lipo -create \
     cp "$OUTPUT_DIR/libturso_sync_sdk_kit_device.a" "$OUTPUT_DIR/libturso_sync_sdk_kit.a"
 
 # Copy header files
-cp "$SYNC_SDK_KIT_DIR/turso.h" "$OUTPUT_DIR/"
+cp "$SDK_KIT_DIR/turso.h" "$OUTPUT_DIR/"
 cp "$SYNC_SDK_KIT_DIR/turso_sync.h" "$OUTPUT_DIR/"
 
 echo "iOS build complete!"

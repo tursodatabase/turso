@@ -5,8 +5,12 @@
  */
 
 import { NativeModules, Platform } from 'react-native';
-import { Database, DatabaseConfig } from './Database';
-import type { TursoNativeModule, TursoProxy as TursoProxyType } from './types';
+import { Database } from './Database';
+import type {
+  DatabaseOpts,
+  TursoNativeModule,
+  TursoProxy as TursoProxyType,
+} from './types';
 import { setFileSystemImpl } from './internal/ioProcessor';
 
 // Re-export all public types
@@ -18,8 +22,8 @@ export type {
   RunResult,
 
   // Database config
-  LocalDatabaseConfig,
-  SyncDatabaseConfig,
+  DatabaseOpts,
+  EncryptionOpts,
 
   // Sync types
   SyncStats,
@@ -32,9 +36,6 @@ export type {
 // Re-export classes
 export { Database } from './Database';
 export { Statement } from './Statement';
-
-// Export DatabaseConfig type
-export type { DatabaseConfig } from './Database';
 
 // Export file system configuration function
 export { setFileSystemImpl } from './internal/ioProcessor';
@@ -73,82 +74,35 @@ if (!TursoProxy) {
 }
 
 /**
- * Open a database (local or sync)
+ * Connect to a database asynchronously (matches JavaScript bindings API)
  *
- * For local databases, pass a string path.
- * For sync databases, pass a config object with remoteUrl.
+ * This is the main entry point for the SDK, matching the API from
+ * @tursodatabase/sync-native and @tursodatabase/database-native.
  *
- * @param config - Path string (local) or config object (local/sync)
- * @returns Database instance
+ * @param opts - Database options
+ * @returns Promise resolving to Database instance
  *
  * @example Local database
  * ```ts
- * const db = await openDatabase('./local.db');
- * db.exec('CREATE TABLE users (id INTEGER, name TEXT)');
+ * const db = await connect({ path: './local.db' });
+ * await db.exec('CREATE TABLE users (id INTEGER, name TEXT)');
  * ```
  *
  * @example Sync database
  * ```ts
- * const db = await openDatabase({
+ * const db = await connect({
  *   path: './replica.db',
- *   remoteUrl: 'libsql://mydb.turso.io',
- *   authToken: 'token-here',
- *   bootstrapIfEmpty: true,
- * });
- * await db.create(); // Open or create
- * const users = db.all('SELECT * FROM users');
- * await db.push(); // Sync local changes
- * await db.pull(); // Fetch remote changes
- * ```
- */
-export async function openDatabase(config: DatabaseConfig): Promise<Database> {
-  const db = new Database(config);
-
-  // For sync databases, automatically call create()
-  if (db.isSync) {
-    await db.create();
-  }
-
-  return db;
-}
-
-/**
- * Create a local-only database (synchronous)
- *
- * @param path - Database file path
- * @returns Database instance (already open)
- *
- * @example
- * ```ts
- * const db = createLocalDatabase('./local.db');
- * db.exec('CREATE TABLE users (id INTEGER, name TEXT)');
- * ```
- */
-export function createLocalDatabase(path: string): Database {
-  return new Database(path);
-}
-
-/**
- * Create a sync database (async - requires network for bootstrap)
- *
- * @param config - Sync database configuration
- * @returns Database instance (call create() or open() to initialize)
- *
- * @example
- * ```ts
- * const db = await createSyncDatabase({
- *   path: './replica.db',
- *   remoteUrl: 'libsql://mydb.turso.io',
+ *   url: 'libsql://mydb.turso.io',
  *   authToken: 'token-here',
  * });
- * await db.create(); // Bootstrap if needed
+ * const users = await db.all('SELECT * FROM users');
+ * await db.push();
+ * await db.pull();
  * ```
  */
-export async function createSyncDatabase(
-  config: import('./types').SyncDatabaseConfig
-): Promise<Database> {
-  const db = new Database(config);
-  await db.create();
+export async function connect(opts: DatabaseOpts): Promise<Database> {
+  const db = new Database(opts);
+  await db.connect();
   return db;
 }
 
@@ -195,9 +149,7 @@ export const paths = {
 
 // Default export
 export default {
-  openDatabase,
-  createLocalDatabase,
-  createSyncDatabase,
+  connect,
   version,
   setup,
   setFileSystemImpl,

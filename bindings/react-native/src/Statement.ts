@@ -21,9 +21,11 @@ import {
 export class Statement {
   private _statement: NativeStatement;
   private _finalized = false;
+  private _extraIo?: () => Promise<void>;
 
-  constructor(statement: NativeStatement) {
+  constructor(statement: NativeStatement, extraIo?: () => Promise<void>) {
     this._statement = statement;
+    this._extraIo = extraIo;
   }
 
   /**
@@ -118,7 +120,7 @@ export class Statement {
    * @param params - Optional parameters to bind
    * @returns Result with changes and lastInsertRowid
    */
-  run(...params: BindParams[]): RunResult {
+  async run(...params: BindParams[]): Promise<RunResult> {
     if (this._finalized) {
       throw new Error('Statement has been finalized');
     }
@@ -128,12 +130,8 @@ export class Statement {
       this.bind(...params);
     }
 
-    // Execute statement
-    const result = this._statement.execute();
-
-    if (result.status !== TursoStatus.DONE) {
-      throw new Error(`Statement execution failed with status: ${result.status}`);
-    }
+    // Execute statement with IO handling
+    const result = await this.executeWithIo();
 
     // Reset for next execution
     this._statement.reset();
@@ -145,12 +143,68 @@ export class Statement {
   }
 
   /**
+   * Execute statement handling potential IO (for partial sync)
+   * Matches Python's _run_execute_with_io pattern
+   *
+   * @returns Execution result
+   */
+  private async executeWithIo(): Promise<{ status: number; rowsChanged: number }> {
+    while (true) {
+      const result = this._statement.execute();
+
+      if (result.status === TursoStatus.IO) {
+        // Statement needs IO (e.g., loading missing pages with partial sync)
+        this._statement.runIo();
+
+        // Drain sync engine IO queue
+        if (this._extraIo) {
+          await this._extraIo();
+        }
+
+        continue;
+      }
+
+      if (result.status !== TursoStatus.DONE) {
+        throw new Error(`Statement execution failed with status: ${result.status}`);
+      }
+
+      return result;
+    }
+  }
+
+  /**
+   * Step statement once handling potential IO (for partial sync)
+   * Matches Python's _step_once_with_io pattern
+   *
+   * @returns Status code
+   */
+  private async stepWithIo(): Promise<number> {
+    while (true) {
+      const status = this._statement.step();
+
+      if (status === TursoStatus.IO) {
+        // Statement needs IO (e.g., loading missing pages with partial sync)
+        this._statement.runIo();
+
+        // Drain sync engine IO queue
+        if (this._extraIo) {
+          await this._extraIo();
+        }
+
+        continue;
+      }
+
+      return status;
+    }
+  }
+
+  /**
    * Execute statement and return first row
    *
    * @param params - Optional parameters to bind
    * @returns First row or undefined
    */
-  get(...params: BindParams[]): Row | undefined {
+  async get(...params: BindParams[]): Promise<Row | undefined> {
     if (this._finalized) {
       throw new Error('Statement has been finalized');
     }
@@ -160,8 +214,8 @@ export class Statement {
       this.bind(...params);
     }
 
-    // Step once
-    const status = this._statement.step();
+    // Step once with async IO handling
+    const status = await this.stepWithIo();
 
     if (status === TursoStatus.ROW) {
       const row = this.readRow();
@@ -183,7 +237,7 @@ export class Statement {
    * @param params - Optional parameters to bind
    * @returns Array of rows
    */
-  all(...params: BindParams[]): Row[] {
+  async all(...params: BindParams[]): Promise<Row[]> {
     if (this._finalized) {
       throw new Error('Statement has been finalized');
     }
@@ -195,9 +249,9 @@ export class Statement {
 
     const rows: Row[] = [];
 
-    // Step through all rows
+    // Step through all rows with async IO handling
     while (true) {
-      const status = this._statement.step();
+      const status = await this.stepWithIo();
 
       if (status === TursoStatus.ROW) {
         rows.push(this.readRow());

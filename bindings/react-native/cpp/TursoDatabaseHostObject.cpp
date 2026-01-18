@@ -53,11 +53,11 @@ void TursoDatabaseHostObject::set(jsi::Runtime &rt, const jsi::PropNameID &name,
 }
 
 std::vector<jsi::PropNameID> TursoDatabaseHostObject::getPropertyNames(jsi::Runtime &rt) {
-    return {
-        jsi::PropNameID::forAscii(rt, "open"),
-        jsi::PropNameID::forAscii(rt, "connect"),
-        jsi::PropNameID::forAscii(rt, "close")
-    };
+    std::vector<jsi::PropNameID> props;
+    props.emplace_back(jsi::PropNameID::forAscii(rt, "open"));
+    props.emplace_back(jsi::PropNameID::forAscii(rt, "connect"));
+    props.emplace_back(jsi::PropNameID::forAscii(rt, "close"));
+    return props;
 }
 
 // 1:1 C API mapping - NO logic, just calls through to C API

@@ -80,14 +80,14 @@ void TursoConnectionHostObject::set(jsi::Runtime &rt, const jsi::PropNameID &nam
 }
 
 std::vector<jsi::PropNameID> TursoConnectionHostObject::getPropertyNames(jsi::Runtime &rt) {
-    return {
-        jsi::PropNameID::forAscii(rt, "prepareSingle"),
-        jsi::PropNameID::forAscii(rt, "prepareFirst"),
-        jsi::PropNameID::forAscii(rt, "lastInsertRowid"),
-        jsi::PropNameID::forAscii(rt, "getAutocommit"),
-        jsi::PropNameID::forAscii(rt, "setBusyTimeout"),
-        jsi::PropNameID::forAscii(rt, "close")
-    };
+    std::vector<jsi::PropNameID> props;
+    props.emplace_back(jsi::PropNameID::forAscii(rt, "prepareSingle"));
+    props.emplace_back(jsi::PropNameID::forAscii(rt, "prepareFirst"));
+    props.emplace_back(jsi::PropNameID::forAscii(rt, "lastInsertRowid"));
+    props.emplace_back(jsi::PropNameID::forAscii(rt, "getAutocommit"));
+    props.emplace_back(jsi::PropNameID::forAscii(rt, "setBusyTimeout"));
+    props.emplace_back(jsi::PropNameID::forAscii(rt, "close"));
+    return props;
 }
 
 // 1:1 C API mapping - NO logic, just calls through to C API

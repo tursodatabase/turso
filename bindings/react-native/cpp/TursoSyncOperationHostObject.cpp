@@ -72,13 +72,13 @@ void TursoSyncOperationHostObject::set(jsi::Runtime &rt, const jsi::PropNameID &
 }
 
 std::vector<jsi::PropNameID> TursoSyncOperationHostObject::getPropertyNames(jsi::Runtime &rt) {
-    return {
-        jsi::PropNameID::forAscii(rt, "resume"),
-        jsi::PropNameID::forAscii(rt, "resultKind"),
-        jsi::PropNameID::forAscii(rt, "extractConnection"),
-        jsi::PropNameID::forAscii(rt, "extractChanges"),
-        jsi::PropNameID::forAscii(rt, "extractStats")
-    };
+    std::vector<jsi::PropNameID> props;
+    props.emplace_back(jsi::PropNameID::forAscii(rt, "resume"));
+    props.emplace_back(jsi::PropNameID::forAscii(rt, "resultKind"));
+    props.emplace_back(jsi::PropNameID::forAscii(rt, "extractConnection"));
+    props.emplace_back(jsi::PropNameID::forAscii(rt, "extractChanges"));
+    props.emplace_back(jsi::PropNameID::forAscii(rt, "extractStats"));
+    return props;
 }
 
 // 1:1 C API mapping - NO logic, just calls through to C API

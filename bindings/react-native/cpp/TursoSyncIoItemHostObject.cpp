@@ -97,16 +97,16 @@ void TursoSyncIoItemHostObject::set(jsi::Runtime &rt, const jsi::PropNameID &nam
 }
 
 std::vector<jsi::PropNameID> TursoSyncIoItemHostObject::getPropertyNames(jsi::Runtime &rt) {
-    return {
-        jsi::PropNameID::forAscii(rt, "getKind"),
-        jsi::PropNameID::forAscii(rt, "getHttpRequest"),
-        jsi::PropNameID::forAscii(rt, "getFullReadPath"),
-        jsi::PropNameID::forAscii(rt, "getFullWriteRequest"),
-        jsi::PropNameID::forAscii(rt, "poison"),
-        jsi::PropNameID::forAscii(rt, "setStatus"),
-        jsi::PropNameID::forAscii(rt, "pushBuffer"),
-        jsi::PropNameID::forAscii(rt, "done")
-    };
+    std::vector<jsi::PropNameID> props;
+    props.emplace_back(jsi::PropNameID::forAscii(rt, "getKind"));
+    props.emplace_back(jsi::PropNameID::forAscii(rt, "getHttpRequest"));
+    props.emplace_back(jsi::PropNameID::forAscii(rt, "getFullReadPath"));
+    props.emplace_back(jsi::PropNameID::forAscii(rt, "getFullWriteRequest"));
+    props.emplace_back(jsi::PropNameID::forAscii(rt, "poison"));
+    props.emplace_back(jsi::PropNameID::forAscii(rt, "setStatus"));
+    props.emplace_back(jsi::PropNameID::forAscii(rt, "pushBuffer"));
+    props.emplace_back(jsi::PropNameID::forAscii(rt, "done"));
+    return props;
 }
 
 // 1:1 C API mapping - NO logic, just calls through to C API

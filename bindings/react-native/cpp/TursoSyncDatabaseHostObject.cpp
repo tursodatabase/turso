@@ -127,19 +127,19 @@ void TursoSyncDatabaseHostObject::set(jsi::Runtime &rt, const jsi::PropNameID &n
 }
 
 std::vector<jsi::PropNameID> TursoSyncDatabaseHostObject::getPropertyNames(jsi::Runtime &rt) {
-    return {
-        jsi::PropNameID::forAscii(rt, "open"),
-        jsi::PropNameID::forAscii(rt, "create"),
-        jsi::PropNameID::forAscii(rt, "connect"),
-        jsi::PropNameID::forAscii(rt, "stats"),
-        jsi::PropNameID::forAscii(rt, "checkpoint"),
-        jsi::PropNameID::forAscii(rt, "pushChanges"),
-        jsi::PropNameID::forAscii(rt, "waitChanges"),
-        jsi::PropNameID::forAscii(rt, "applyChanges"),
-        jsi::PropNameID::forAscii(rt, "ioTakeItem"),
-        jsi::PropNameID::forAscii(rt, "ioStepCallbacks"),
-        jsi::PropNameID::forAscii(rt, "close")
-    };
+    std::vector<jsi::PropNameID> props;
+    props.emplace_back(jsi::PropNameID::forAscii(rt, "open"));
+    props.emplace_back(jsi::PropNameID::forAscii(rt, "create"));
+    props.emplace_back(jsi::PropNameID::forAscii(rt, "connect"));
+    props.emplace_back(jsi::PropNameID::forAscii(rt, "stats"));
+    props.emplace_back(jsi::PropNameID::forAscii(rt, "checkpoint"));
+    props.emplace_back(jsi::PropNameID::forAscii(rt, "pushChanges"));
+    props.emplace_back(jsi::PropNameID::forAscii(rt, "waitChanges"));
+    props.emplace_back(jsi::PropNameID::forAscii(rt, "applyChanges"));
+    props.emplace_back(jsi::PropNameID::forAscii(rt, "ioTakeItem"));
+    props.emplace_back(jsi::PropNameID::forAscii(rt, "ioStepCallbacks"));
+    props.emplace_back(jsi::PropNameID::forAscii(rt, "close"));
+    return props;
 }
 
 // 1:1 C API mapping - NO logic, just calls through to C API
