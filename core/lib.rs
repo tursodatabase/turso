@@ -821,8 +821,7 @@ impl Database {
 
         let default_cache_size = pager
             .io
-            .block(|| pager.with_header(|header| header.default_page_cache_size))
-            .unwrap_or_default()
+            .block(|| pager.with_header(|header| header.default_page_cache_size))?
             .get();
 
         // Copy encryption key and cipher from Database to Connection.

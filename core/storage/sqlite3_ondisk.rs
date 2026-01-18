@@ -644,8 +644,9 @@ pub fn begin_read_page(
     let buf = Arc::new(buf);
     let complete = Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
         let Ok((buf, bytes_read)) = res else {
+            let err = res.unwrap_err();
             page.clear_locked();
-            return None; // IO error already captured in completion
+            return Some(err); // Propagate the error
         };
         let buf_len = buf.len();
         // Handle truncated database files: if we read fewer bytes than expected
