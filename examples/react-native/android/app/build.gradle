@@ -65,6 +65,5 @@ dependencies {
         implementation("org.webkit:android-jsc:+")
     }
 
-    // Turso React Native
-    implementation project(':turso-react-native')
+    // Turso React Native - added via autolinking
 }

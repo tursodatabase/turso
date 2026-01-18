@@ -11,8 +11,7 @@
   },
   "dependencies": {
     "react": "18.3.1",
-    "react-native": "0.76.0",
-    "turso-react-native": "file:../../bindings/react-native"
+    "react-native": "0.76.0"
   },
   "devDependencies": {
     "@babel/core": "^7.25.0",
