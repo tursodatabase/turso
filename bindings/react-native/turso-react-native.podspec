@@ -18,22 +18,15 @@ Pod::Spec.new do |s|
     "cpp/**/*.{h,hpp,cpp}"
   ]
 
-  # Vendored Rust static libraries (separate for device and simulator)
-  s.vendored_libraries = [
-    "libs/ios/libturso_sync_sdk_kit_device.a",
-    "libs/ios/libturso_sync_sdk_kit_sim.a"
-  ]
-
-  # Header search paths and conditional linking
+  # Header search paths and conditional linking for Rust library
   s.pod_target_xcconfig = {
     "CLANG_CXX_LANGUAGE_STANDARD" => "c++20",
     "HEADER_SEARCH_PATHS" => [
       "$(PODS_TARGET_SRCROOT)/cpp",
       "$(PODS_TARGET_SRCROOT)/libs/ios"
     ].join(" "),
-    "OTHER_LDFLAGS[sdk=iphoneos*]" => "-lc++ -lturso_sync_sdk_kit_device",
-    "OTHER_LDFLAGS[sdk=iphonesimulator*]" => "-lc++ -lturso_sync_sdk_kit_sim",
-    "LIBRARY_SEARCH_PATHS" => "$(PODS_TARGET_SRCROOT)/libs/ios",
+    "OTHER_LDFLAGS[sdk=iphoneos*]" => "-lc++ -force_load $(PODS_TARGET_SRCROOT)/libs/ios/libturso_sync_sdk_kit_device.a",
+    "OTHER_LDFLAGS[sdk=iphonesimulator*]" => "-lc++ -force_load $(PODS_TARGET_SRCROOT)/libs/ios/libturso_sync_sdk_kit_sim.a",
     "DEFINES_MODULE" => "YES",
     "GCC_PRECOMPILE_PREFIX_HEADER" => "NO"
   }
