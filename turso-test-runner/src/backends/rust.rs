@@ -83,6 +83,7 @@ impl SqlBackend for RustBackend {
 
         // Create the database using the Turso builder
         let db = Builder::new_local(&db_path)
+            .experimental_triggers(true)
             .build()
             .await
             .map_err(|e| BackendError::CreateDatabase(e.to_string()))?;
@@ -282,7 +283,7 @@ fn format_with_significant_digits(f: f64, sig_digits: usize) -> String {
     let formatted = format!("{:.prec$}", f, prec = decimal_places);
 
     // Remove trailing zeros after decimal point, but keep at least one digit after decimal
-    let formatted = if formatted.contains('.') {
+    if formatted.contains('.') {
         let trimmed = formatted.trim_end_matches('0');
         if trimmed.ends_with('.') {
             format!("{}0", trimmed)
@@ -291,9 +292,7 @@ fn format_with_significant_digits(f: f64, sig_digits: usize) -> String {
         }
     } else {
         formatted
-    };
-
-    formatted
+    }
 }
 
 /// Clean up exponential notation to match SQLite's format
@@ -337,7 +336,7 @@ mod tests {
 
     #[test]
     fn test_value_to_string_real() {
-        assert_eq!(value_to_string(&Value::Real(3.14)), "3.14");
+        assert_eq!(value_to_string(&Value::Real(3.15)), "3.15");
         assert_eq!(value_to_string(&Value::Real(1.0)), "1.0");
         assert_eq!(value_to_string(&Value::Real(-2.5)), "-2.5");
     }
