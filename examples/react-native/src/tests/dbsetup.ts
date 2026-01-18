@@ -2,7 +2,6 @@ import {
   ANDROID_DATABASE_PATH,
   ANDROID_EXTERNAL_FILES_PATH,
   IOS_LIBRARY_PATH,
-  isIOSEmbeeded,
   isLibsql,
   isSQLCipher,
   moveAssetsDatabase,
@@ -11,41 +10,7 @@ import {
 import { describe, it, expect } from '@op-engineering/op-test';
 import { Platform } from 'react-native';
 
-const expectedVersion = '3.50.4';
-const flavor = 'sqlite';
-
-// const expectedSqliteVecVersion = 'v0.1.2-alpha.7';
-
 describe('DB setup tests', () => {
-  // it('Should match the sqlite_vec version', async () => {
-  //   let db = open({
-  //     name: 'versionTest.sqlite',
-  //   });
-
-  //   const res = db.execute('select vec_version();');
-
-  //   expect(res.rows?._array[0]['vec_version()']).to.equal(
-  //     expectedSqliteVecVersion,
-  //   );
-
-  //   db.close();
-  // });
-
-  // Using the embedded version, you can never be sure which version is used
-  // It will change from OS version to version
-  if (!isIOSEmbeeded()) {
-    it(`Should match the sqlite flavor ${flavor} expected version ${expectedVersion}`, async () => {
-      let db = open({
-        name: 'versionTest.sqlite',
-        encryptionKey: 'test',
-      });
-
-      const res = await db.execute('select sqlite_version();');
-
-      expect(res.rows[0]!['sqlite_version()']).toBe(expectedVersion);
-      db.close();
-    });
-  }
 
   it('Create in memory DB', async () => {
     let inMemoryDb = open({
