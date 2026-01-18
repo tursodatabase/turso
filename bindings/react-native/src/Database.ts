@@ -1,8 +1,6 @@
 import { Statement } from './Statement';
 import type {
-  BindParams,
   NativeDatabase,
-  OpenDatabaseOptions,
   Row,
   RunResult,
   SQLiteValue,

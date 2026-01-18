@@ -3,7 +3,7 @@ import { Database } from './Database';
 import type {
   OpenDatabaseOptions,
   TursoNativeModule,
-  TursoProxy,
+  TursoProxy as TursoProxyType,
 } from './types';
 
 // Re-export types
@@ -41,10 +41,10 @@ if (!installed) {
 
 // Get the proxy that was installed on the global object
 declare const global: {
-  __TursoProxy?: TursoProxy;
+  __TursoProxy?: TursoProxyType;
 };
 
-const TursoProxy = global.__TursoProxy;
+const TursoProxy: TursoProxyType = global.__TursoProxy!;
 
 if (!TursoProxy) {
   throw new Error(
