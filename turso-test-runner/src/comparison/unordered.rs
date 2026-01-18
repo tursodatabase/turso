@@ -22,14 +22,14 @@ pub fn compare(actual: &[Vec<String>], expected_lines: &[String]) -> ComparisonR
     if !missing.is_empty() {
         reason.push_str("Missing rows:\n");
         for row in &missing {
-            reason.push_str(&format!("  - {}\n", row));
+            reason.push_str(&format!("  - {row}\n"));
         }
     }
 
     if !extra.is_empty() {
         reason.push_str("Extra rows:\n");
         for row in &extra {
-            reason.push_str(&format!("  + {}\n", row));
+            reason.push_str(&format!("  + {row}\n"));
         }
     }
 

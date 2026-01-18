@@ -435,7 +435,7 @@ pub fn parse_tcl_file(content: &str, source_file: &str) -> ConversionResult {
                     let mut final_name = base_name.clone();
                     let mut counter = 2;
                     while used_names.contains(&final_name) {
-                        final_name = format!("{}-{}", base_name, counter);
+                        final_name = format!("{base_name}-{counter}");
                         counter += 1;
                     }
                     test.name = final_name.clone();

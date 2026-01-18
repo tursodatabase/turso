@@ -26,7 +26,7 @@ pub fn compare(actual: &[Vec<String>], expected_lines: &[String]) -> ComparisonR
             ChangeTag::Insert => "+",
             ChangeTag::Equal => " ",
         };
-        diff_output.push_str(&format!("{}{}", sign, change));
+        diff_output.push_str(&format!("{sign}{change}"));
     }
 
     ComparisonResult::mismatch(diff_output)

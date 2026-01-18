@@ -69,7 +69,7 @@ fn get_db_declaration(db_key: &str, has_ddl: bool) -> String {
             }
             other => {
                 // For unknown databases, try to construct a path
-                return format!("@database database/{}.db readonly", other);
+                format!("@database database/{other}.db readonly")
             }
         }
     }
@@ -134,7 +134,7 @@ fn generate_tests_output(tests: &[&TclTest], db_key: &str, has_ddl: bool) -> Str
 fn write_test(output: &mut String, test: &TclTest) {
     // Write comments before the test
     for comment in &test.comments {
-        writeln!(output, "{}", comment).unwrap();
+        writeln!(output, "{comment}").unwrap();
     }
 
     // Write test header
@@ -165,14 +165,14 @@ fn write_test(output: &mut String, test: &TclTest) {
                 writeln!(output, "expect raw {{").unwrap();
                 for line in expected.lines() {
                     if !line.is_empty() {
-                        writeln!(output, "{}", line).unwrap();
+                        writeln!(output, "{line}").unwrap();
                     }
                 }
             } else {
                 writeln!(output, "expect {{").unwrap();
                 for line in expected.lines() {
                     if !line.is_empty() {
-                        writeln!(output, "    {}", line).unwrap();
+                        writeln!(output, "    {line}").unwrap();
                     }
                 }
             }

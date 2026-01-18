@@ -32,7 +32,7 @@ impl std::str::FromStr for Format {
         match s.to_lowercase().as_str() {
             "pretty" => Ok(Format::Pretty),
             "json" => Ok(Format::Json),
-            _ => Err(format!("unknown output format: {}", s)),
+            _ => Err(format!("unknown output format: {s}")),
         }
     }
 }

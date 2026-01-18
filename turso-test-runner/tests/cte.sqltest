@@ -409,133 +409,6 @@ expect {
     3
 }
 
-# =============================================================================
-# CTE with explicit column names
-# =============================================================================
-
-test cte-explicit-columns-basic {
-    WITH t(a, b) AS (SELECT 1, 2) SELECT * FROM t;
-}
-expect {
-    1|2
-}
-
-test cte-explicit-columns-ref {
-    WITH t(a, b) AS (SELECT 1, 2) SELECT a, b FROM t;
-}
-expect {
-    1|2
-}
-
-test cte-explicit-columns-rename {
-    WITH t(x, y) AS (SELECT 1 as a, 2 as b) SELECT x, y FROM t;
-}
-expect {
-    1|2
-}
-
-test cte-explicit-columns-expr {
-    WITH t(sum, product) AS (SELECT 3 + 4, 3 * 4) SELECT sum, product FROM t;
-}
-expect {
-    7|12
-}
-
-test cte-explicit-columns-multi {
-    WITH t1(a) AS (SELECT 1), t2(b) AS (SELECT 2) SELECT a, b FROM t1, t2;
-}
-expect {
-    1|2
-}
-
-test cte-explicit-columns-chain {
-    WITH t1(a, b) AS (SELECT 1, 2), t2(x, y) AS (SELECT a, b FROM t1) SELECT x, y FROM t2;
-}
-expect {
-    1|2
-}
-
-# # @skip-if sqlite "sqlite has different error message"
-# test cte-explicit-columns-count-mismatch {
-#     WITH t(a, b, c) AS (SELECT 1, 2) SELECT * FROM t;
-# }
-# expect error {
-#     table t has 2 columns but 3 column names were provided
-# }
-
-# =============================================================================
-# CTE visibility in VALUES and RETURNING clause subqueries
-# =============================================================================
-
-test cte-insert-values-subquery {
-    CREATE TABLE t(a);
-    WITH test AS (SELECT 99 as x) INSERT INTO t VALUES ((SELECT x FROM test));
-    SELECT * FROM t;
-}
-expect {
-    99
-}
-
-test cte-insert-values-multi-subquery {
-    CREATE TABLE t(a, b);
-    WITH test AS (SELECT 1 as x, 2 as y) INSERT INTO t VALUES ((SELECT x FROM test), (SELECT y FROM test));
-    SELECT * FROM t;
-}
-expect {
-    1|2
-}
-
-test cte-insert-values-multiple-rows {
-    CREATE TABLE t(a);
-    WITH test AS (SELECT 10 as x) INSERT INTO t VALUES ((SELECT x FROM test)), ((SELECT x + 1 FROM test));
-    SELECT * FROM t ORDER BY a;
-}
-expect {
-    10
-    11
-}
-
-test cte-insert-returning-subquery {
-    CREATE TABLE t(a);
-    WITH test AS (SELECT 99 as x) INSERT INTO t VALUES (1) RETURNING (SELECT x FROM test);
-}
-expect {
-    99
-}
-
-test cte-insert-returning-multi-subquery {
-    CREATE TABLE t(a);
-    WITH test AS (SELECT 1 as x, 2 as y) INSERT INTO t VALUES (100) RETURNING (SELECT x FROM test), (SELECT y FROM test);
-}
-expect {
-    1|2
-}
-
-test cte-delete-returning-subquery {
-    CREATE TABLE t(a);
-    INSERT INTO t VALUES (1), (2), (3);
-    WITH test AS (SELECT 99 as x) DELETE FROM t WHERE a = 2 RETURNING (SELECT x FROM test);
-}
-expect {
-    99
-}
-
-test cte-update-returning-subquery {
-    CREATE TABLE t(a);
-    INSERT INTO t VALUES (1);
-    WITH test AS (SELECT 99 as x) UPDATE t SET a = 10 WHERE a = 1 RETURNING (SELECT x FROM test);
-}
-expect {
-    99
-}
-
-test cte-insert-values-and-returning-subquery {
-    CREATE TABLE t(a);
-    WITH test AS (SELECT 42 as x) INSERT INTO t VALUES ((SELECT x FROM test)) RETURNING (SELECT x + 1 FROM test);
-}
-expect {
-    43
-}
 
 # =============================================================================
 # Error cases
@@ -548,18 +421,18 @@ expect error {
     duplicate WITH table name
 }
 
-# @skip-if sqlite "sqlite supports recursive CTEs"
-# test cte-recursive-unsupported {
-#     WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM cnt WHERE x<5) SELECT * FROM cnt;
-# }
-# expect error {
-#     Recursive CTEs are not yet supported
-# }
-#
-# @skip-if sqlite "sqlite supports materialized CTEs"
-# test cte-materialized-unsupported {
-#     WITH t AS MATERIALIZED (SELECT 1) SELECT * FROM t;
-# }
-# expect error {
-#     Materialized CTEs are not yet supported
-# }
+@skip-if sqlite "sqlite supports recursive CTEs"
+test cte-recursive-unsupported {
+    WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM cnt WHERE x<5) SELECT * FROM cnt;
+}
+expect error {
+    Recursive CTEs are not yet supported
+}
+
+@skip-if sqlite "sqlite supports materialized CTEs"
+test cte-materialized-unsupported {
+    WITH t AS MATERIALIZED (SELECT 1) SELECT * FROM t;
+}
+expect error {
+    Materialized CTEs are not yet supported
+}

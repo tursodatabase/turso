@@ -15,12 +15,11 @@ pub fn compare_error(actual: &str, pattern: &str) -> ComparisonResult {
                 ComparisonResult::Match
             } else {
                 ComparisonResult::mismatch(format!(
-                    "error message '{}' does not contain expected pattern '{}'",
-                    actual, pattern
+                    "error message '{actual}' does not contain expected pattern '{pattern}'"
                 ))
             }
         }
-        Err(e) => ComparisonResult::mismatch(format!("invalid regex pattern: {}", e)),
+        Err(e) => ComparisonResult::mismatch(format!("invalid regex pattern: {e}")),
     }
 }
 
@@ -34,12 +33,11 @@ pub fn compare(actual: &[Vec<String>], pattern: &str) -> ComparisonResult {
                 ComparisonResult::Match
             } else {
                 ComparisonResult::mismatch(format!(
-                    "output does not match pattern\nPattern: {}\nActual:\n{}",
-                    pattern, actual_str
+                    "output does not match pattern\nPattern: {pattern}\nActual:\n{actual_str}"
                 ))
             }
         }
-        Err(e) => ComparisonResult::mismatch(format!("invalid regex pattern: {}", e)),
+        Err(e) => ComparisonResult::mismatch(format!("invalid regex pattern: {e}")),
     }
 }
 

@@ -191,7 +191,7 @@ async fn create_tables(conn: &Connection, no_rowid_alias: bool) -> Result<()> {
         .with_context(|| format!("failed to create users table: {}", users_sql.trim()))?;
 
     if !no_rowid_alias {
-        let index_sql = format!("CREATE INDEX age_idx ON users (age);");
+        let index_sql = "CREATE INDEX age_idx ON users (age);".to_string();
 
         conn.execute(&index_sql, ())
             .await

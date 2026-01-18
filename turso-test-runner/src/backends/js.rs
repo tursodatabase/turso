@@ -58,8 +58,8 @@ impl JsBackend {
 
 #[async_trait]
 impl SqlBackend for JsBackend {
-    fn name(&self) -> &str {
-        "js"
+    fn name(&self) -> String {
+        "js".into()
     }
 
     fn backend_type(&self) -> Backend {

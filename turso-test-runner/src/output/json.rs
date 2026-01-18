@@ -112,8 +112,8 @@ impl OutputFormat for JsonOutput {
 
         // Output the JSON
         match serde_json::to_string_pretty(&report) {
-            Ok(json) => println!("{}", json),
-            Err(e) => eprintln!("Error serializing JSON: {}", e),
+            Ok(json) => println!("{json}"),
+            Err(e) => eprintln!("Error serializing JSON: {e}"),
         }
     }
 
