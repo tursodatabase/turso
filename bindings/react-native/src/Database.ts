@@ -49,6 +49,7 @@ export class Database {
   private _connected = false;
   private _closed = false;
   private _extraIo?: () => Promise<void>;
+  private _ioContext?: { authToken?: string | (() => string | null); baseUrl?: string };
 
   /**
    * Create a new database (doesn't connect yet - call connect())
@@ -92,7 +93,7 @@ export class Database {
       async_io: true, // Always use async IO in React Native
     };
 
-    // Create native database
+    // Create native database (path normalization happens in C++ JSI layer)
     this._nativeDb = __TursoProxy.newDatabase(this._opts.path, dbConfig);
 
     // Open database
@@ -122,7 +123,7 @@ export class Database {
       throw new Error('Sync database requires a URL');
     }
 
-    // Build dbConfig
+    // Build dbConfig (path normalization happens in C++ JSI layer)
     const dbConfig = {
       path: this._opts.path,
       async_io: true, // Always use async IO in React Native
@@ -131,7 +132,7 @@ export class Database {
     // Build syncConfig with all options
     const syncConfig: any = {
       remoteUrl: url,
-      clientName: this._opts.clientName,
+      clientName: this._opts.clientName || 'turso-sync-react-native',
       longPollTimeoutMs: this._opts.longPollTimeoutMs,
       bootstrapIfEmpty: this._opts.bootstrapIfEmpty ?? true,
       reservedBytes: this._opts.reservedBytes,
@@ -152,21 +153,27 @@ export class Database {
     // Create native sync database
     this._nativeSyncDb = __TursoProxy.newSyncDatabase(dbConfig, syncConfig);
 
+    // Create IO context with auth token and base URL
+    this._ioContext = {
+      authToken: this._opts.authToken,
+      baseUrl: url,
+    };
+
     // Create extraIo callback for partial sync support
     // This callback drains the sync engine's IO queue during statement execution
     this._extraIo = async () => {
-      if (this._nativeSyncDb) {
-        await drainSyncIo(this._nativeSyncDb);
+      if (this._nativeSyncDb && this._ioContext) {
+        await drainSyncIo(this._nativeSyncDb, this._ioContext);
       }
     };
 
     // Bootstrap/open database
     const operation = this._nativeSyncDb.create();
-    await driveVoidOperation(operation, this._nativeSyncDb);
+    await driveVoidOperation(operation, this._nativeSyncDb, this._ioContext);
 
     // Get connection
     const connOperation = this._nativeSyncDb.connect();
-    this._connection = await driveConnectionOperation(connOperation, this._nativeSyncDb);
+    this._connection = await driveConnectionOperation(connOperation, this._nativeSyncDb, this._ioContext);
   }
 
   /**
@@ -294,12 +301,12 @@ export class Database {
    * Push local changes to remote (sync databases only)
    */
   async push(): Promise<void> {
-    if (!this._isSync || !this._nativeSyncDb) {
+    if (!this._isSync || !this._nativeSyncDb || !this._ioContext) {
       throw new Error('push() is only available for sync databases');
     }
 
     const operation = this._nativeSyncDb.pushChanges();
-    await driveVoidOperation(operation, this._nativeSyncDb);
+    await driveVoidOperation(operation, this._nativeSyncDb, this._ioContext);
   }
 
   /**
@@ -308,13 +315,13 @@ export class Database {
    * @returns true if changes were applied, false if no changes
    */
   async pull(): Promise<boolean> {
-    if (!this._isSync || !this._nativeSyncDb) {
+    if (!this._isSync || !this._nativeSyncDb || !this._ioContext) {
       throw new Error('pull() is only available for sync databases');
     }
 
     // Wait for changes
     const waitOperation = this._nativeSyncDb.waitChanges();
-    const changes = await driveChangesOperation(waitOperation, this._nativeSyncDb);
+    const changes = await driveChangesOperation(waitOperation, this._nativeSyncDb, this._ioContext);
 
     // If no changes, return false
     if (!changes) {
@@ -323,7 +330,7 @@ export class Database {
 
     // Apply changes
     const applyOperation = this._nativeSyncDb.applyChanges(changes);
-    await driveVoidOperation(applyOperation, this._nativeSyncDb);
+    await driveVoidOperation(applyOperation, this._nativeSyncDb, this._ioContext);
 
     return true;
   }
@@ -334,24 +341,24 @@ export class Database {
    * @returns Sync stats
    */
   async stats(): Promise<SyncStats> {
-    if (!this._isSync || !this._nativeSyncDb) {
+    if (!this._isSync || !this._nativeSyncDb || !this._ioContext) {
       throw new Error('stats() is only available for sync databases');
     }
 
     const operation = this._nativeSyncDb.stats();
-    return driveStatsOperation(operation, this._nativeSyncDb);
+    return driveStatsOperation(operation, this._nativeSyncDb, this._ioContext);
   }
 
   /**
    * Checkpoint database (sync databases only)
    */
   async checkpoint(): Promise<void> {
-    if (!this._isSync || !this._nativeSyncDb) {
+    if (!this._isSync || !this._nativeSyncDb || !this._ioContext) {
       throw new Error('checkpoint() is only available for sync databases');
     }
 
     const operation = this._nativeSyncDb.checkpoint();
-    await driveVoidOperation(operation, this._nativeSyncDb);
+    await driveVoidOperation(operation, this._nativeSyncDb, this._ioContext);
   }
 
   /**

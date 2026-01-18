@@ -65,7 +65,7 @@ export class Statement {
   private bindPositional(params: SQLiteValue[]): void {
     for (let i = 0; i < params.length; i++) {
       const position = i + 1; // 1-indexed
-      const value = params[i];
+      const value = params[i]!;
 
       this.bindValue(position, value);
     }
@@ -308,11 +308,8 @@ export class Statement {
         return this._statement.rowValueDouble(index);
 
       case TursoType.TEXT:
-        const bytes = this._statement.rowValueBytesPtr(index);
-        if (!bytes) return '';
-        // Convert ArrayBuffer to string
-        const decoder = new TextDecoder('utf-8');
-        return decoder.decode(bytes);
+        // Use rowValueText which directly returns a string from C++ (avoids encoding issues)
+        return this._statement.rowValueText(index);
 
       case TursoType.BLOB:
         return this._statement.rowValueBytesPtr(index) || new ArrayBuffer(0);
@@ -344,7 +341,8 @@ export class Statement {
       return;
     }
 
-    this._statement.finalize();
+    // todo: fix this
+    // this._statement.finalize();
     this._finalized = true;
   }
 

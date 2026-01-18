@@ -14,14 +14,27 @@
 
 import { NativeSyncIoItem, NativeSyncDatabase } from '../types';
 
-// React Native file system APIs (if available)
-// Users can provide their own implementation or use react-native-fs
-let fsReadFile: ((path: string) => Promise<Uint8Array>) | null = null;
-let fsWriteFile: ((path: string, data: Uint8Array) => Promise<void>) | null = null;
+// Get the TursoProxy for native file system functions
+declare const __TursoProxy: any;
 
 /**
- * Set custom file system implementation
- * Users should call this to provide fs functions (e.g., from react-native-fs)
+ * IO context contains auth and URL information for HTTP requests
+ */
+export interface IoContext {
+  /** Auth token for HTTP requests */
+  authToken?: string | (() => string | null);
+  /** Base URL for normalization (e.g., 'libsql://mydb.turso.io') */
+  baseUrl?: string;
+}
+
+// Allow users to optionally override file system implementation
+let fsReadFileOverride: ((path: string) => Promise<Uint8Array>) | null = null;
+let fsWriteFileOverride: ((path: string, data: Uint8Array) => Promise<void>) | null = null;
+
+/**
+ * Set custom file system implementation (optional)
+ * By default, uses built-in JSI file system functions.
+ * Only call this if you need custom behavior (e.g., encryption, compression).
  *
  * @param readFile - Function to read file as Uint8Array
  * @param writeFile - Function to write Uint8Array to file
@@ -30,22 +43,52 @@ export function setFileSystemImpl(
   readFile: (path: string) => Promise<Uint8Array>,
   writeFile: (path: string, data: Uint8Array) => Promise<void>
 ): void {
-  fsReadFile = readFile;
-  fsWriteFile = writeFile;
+  fsReadFileOverride = readFile;
+  fsWriteFileOverride = writeFile;
+}
+
+/**
+ * Read file using custom implementation or built-in JSI function
+ */
+async function fsReadFile(path: string): Promise<Uint8Array> {
+  if (fsReadFileOverride) {
+    return fsReadFileOverride(path);
+  }
+
+  // Use built-in JSI function
+  const buffer = __TursoProxy.fsReadFile(path);
+  if (buffer === null) {
+    // File not found - return empty
+    return new Uint8Array(0);
+  }
+  return new Uint8Array(buffer);
+}
+
+/**
+ * Write file using custom implementation or built-in JSI function
+ */
+async function fsWriteFile(path: string, data: Uint8Array): Promise<void> {
+  if (fsWriteFileOverride) {
+    return fsWriteFileOverride(path, data);
+  }
+
+  // Use built-in JSI function
+  __TursoProxy.fsWriteFile(path, data.buffer);
 }
 
 /**
  * Process a single IO item
  *
  * @param item - The IO item to process
+ * @param context - IO context with auth and URL information
  */
-export async function processIoItem(item: NativeSyncIoItem): Promise<void> {
+export async function processIoItem(item: NativeSyncIoItem, context: IoContext): Promise<void> {
   try {
     const kind = item.getKind();
 
     switch (kind) {
       case 'HTTP':
-        await processHttpRequest(item);
+        await processHttpRequest(item, context);
         break;
 
       case 'FULL_READ':
@@ -70,33 +113,114 @@ export async function processIoItem(item: NativeSyncIoItem): Promise<void> {
 }
 
 /**
+ * Normalize URL from libsql:// to https://
+ */
+function normalizeUrl(url: string): string {
+  if (url.startsWith('libsql://')) {
+    return url.replace('libsql://', 'https://');
+  }
+  return url;
+}
+
+/**
+ * Get auth token from context (handles both string and function)
+ */
+function getAuthToken(context: IoContext): string | null {
+  if (!context.authToken) {
+    return null;
+  }
+
+  if (typeof context.authToken === 'function') {
+    return context.authToken();
+  }
+
+  return context.authToken;
+}
+
+/**
  * Process an HTTP request using fetch()
  *
  * @param item - The IO item
+ * @param context - IO context with auth and URL information
  */
-async function processHttpRequest(item: NativeSyncIoItem): Promise<void> {
+async function processHttpRequest(item: NativeSyncIoItem, context: IoContext): Promise<void> {
   const request = item.getHttpRequest();
 
-  // Build full URL (url might be in the request, or we need to construct from path)
-  let url = request.url || '';
-  if (!url && request.path) {
-    // Path without base URL - this shouldn't normally happen
-    throw new Error('HTTP request missing URL');
+  // Build full URL
+  let fullUrl = '';
+
+  if (request.url) {
+    // Normalize URL (libsql:// -> https://)
+    let baseUrl = normalizeUrl(request.url);
+
+    // Combine base URL with path if path is provided
+    if (request.path) {
+      // Ensure proper URL formatting (avoid double slashes, ensure single slash)
+      if (baseUrl.endsWith('/') && request.path.startsWith('/')) {
+        fullUrl = baseUrl + request.path.substring(1);
+      } else if (!baseUrl.endsWith('/') && !request.path.startsWith('/')) {
+        fullUrl = baseUrl + '/' + request.path;
+      } else {
+        fullUrl = baseUrl + request.path;
+      }
+    } else {
+      fullUrl = baseUrl;
+    }
+  } else if (request.path) {
+    // Path without base URL - shouldn't happen
+    throw new Error('HTTP request missing base URL');
+  } else {
+    throw new Error('HTTP request missing URL and path');
   }
 
   // Build fetch options
   const options: RequestInit = {
     method: request.method,
-    headers: request.headers,
+    headers: { ...request.headers },
   };
+
+  // Inject Authorization header if auth token is available
+  const authToken = getAuthToken(context);
+  if (authToken) {
+    (options.headers as Record<string, string>)['Authorization'] = `Bearer ${authToken}`;
+  }
 
   // Add body if present
   if (request.body) {
     options.body = request.body;
   }
 
+  // Debug logging for HTTP requests
+  console.log('[Turso HTTP] Request:', {
+    method: request.method,
+    url: fullUrl,
+    hasBody: !!request.body,
+    bodySize: request.body ? request.body.byteLength : 0,
+    headers: options.headers,
+  });
+
   // Make the HTTP request
-  const response = await fetch(url, options);
+  let response;
+  try {
+    response = await fetch(fullUrl, options);
+  } catch (e) {
+    // Detailed error logging
+    const errorDetails = {
+      url: fullUrl,
+      method: request.method,
+      hasBody: !!request.body,
+      bodySize: request.body ? request.body.byteLength : 0,
+      bodyType: request.body ? Object.prototype.toString.call(options.body) : 'none',
+      error: e instanceof Error ? {
+        message: e.message,
+        name: e.name,
+        stack: e.stack,
+      } : String(e),
+    };
+    console.error('[Turso HTTP] Request failed:', JSON.stringify(errorDetails, null, 2));
+    throw new Error(`HTTP request failed: ${e instanceof Error ? e.message : String(e)}. URL: ${fullUrl}, Method: ${request.method}, Body size: ${request.body ? request.body.byteLength : 0} bytes`);
+  }
+
 
   // Set status code
   item.setStatus(response.status);
@@ -117,16 +241,10 @@ async function processHttpRequest(item: NativeSyncIoItem): Promise<void> {
  * @param item - The IO item
  */
 async function processFullRead(item: NativeSyncIoItem): Promise<void> {
-  if (!fsReadFile) {
-    throw new Error(
-      'File system not configured. Call setFileSystemImpl() with react-native-fs or similar.'
-    );
-  }
-
   const path = item.getFullReadPath();
 
   try {
-    // Read the file
+    // Read the file (uses built-in JSI function or custom override)
     const data = await fsReadFile(path);
 
     // Push data to item
@@ -153,18 +271,12 @@ async function processFullRead(item: NativeSyncIoItem): Promise<void> {
  * @param item - The IO item
  */
 async function processFullWrite(item: NativeSyncIoItem): Promise<void> {
-  if (!fsWriteFile) {
-    throw new Error(
-      'File system not configured. Call setFileSystemImpl() with react-native-fs or similar.'
-    );
-  }
-
   const request = item.getFullWriteRequest();
 
   // Convert ArrayBuffer to Uint8Array
   const data = request.content ? new Uint8Array(request.content) : new Uint8Array(0);
 
-  // Write the file atomically
+  // Write the file atomically (uses built-in JSI function or custom override)
   await fsWriteFile(request.path, data);
 
   // Mark as done
@@ -194,8 +306,9 @@ function isFileNotFoundError(error: unknown): boolean {
  * This is called during statement execution when partial sync needs to load missing pages.
  *
  * @param database - The native sync database
+ * @param context - IO context with auth and URL information
  */
-export async function drainSyncIo(database: NativeSyncDatabase): Promise<void> {
+export async function drainSyncIo(database: NativeSyncDatabase, context: IoContext): Promise<void> {
   const promises: Promise<void>[] = [];
 
   // Take all available IO items from the queue
@@ -206,7 +319,7 @@ export async function drainSyncIo(database: NativeSyncDatabase): Promise<void> {
     }
 
     // Process each item
-    promises.push(processIoItem(ioItem));
+    promises.push(processIoItem(ioItem, context));
   }
 
   // Wait for all IO operations to complete

@@ -58,6 +58,7 @@ export interface NativeStatement {
   rowValueKind(index: number): number;  // TursoType enum
   rowValueBytesCount(index: number): number;
   rowValueBytesPtr(index: number): ArrayBuffer | null;
+  rowValueText(index: number): string;
   rowValueInt(index: number): number;
   rowValueDouble(index: number): number;
 
@@ -354,6 +355,21 @@ export interface TursoProxy {
   newSyncDatabase(dbConfig: any, syncConfig: any): NativeSyncDatabase;
   version(): string;
   setup(options: { logLevel?: string }): void;
+  fsReadFile(path: string): ArrayBuffer | null;
+  fsWriteFile(path: string, data: ArrayBuffer): void;
+}
+
+/**
+ * Native module interface (React Native bridge)
+ */
+export interface TursoNativeModule {
+  install(): boolean;
+  // Constants exposed by native module
+  ANDROID_DATABASE_PATH?: string;
+  ANDROID_FILES_PATH?: string;
+  ANDROID_EXTERNAL_FILES_PATH?: string;
+  IOS_DOCUMENT_PATH?: string;
+  IOS_LIBRARY_PATH?: string;
 }
 
 /**

@@ -58,7 +58,7 @@ export default function App() {
             Open DB time: {openTime.toFixed(0)} ms
           </Text>
           <Text style={styles.performanceText}>
-            100_000 query time: {perfResult.toFixed(0)} ms
+            1_000 query time: {perfResult.toFixed(0)} ms
           </Text>
         </View>
         <View style={styles.results}>{displayResults(results)}</View>

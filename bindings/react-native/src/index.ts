@@ -4,7 +4,7 @@
  * Main entry point for the SDK. Supports both local-only and sync databases.
  */
 
-import { NativeModules, Platform } from 'react-native';
+import { NativeModules } from 'react-native';
 import { Database } from './Database';
 import type {
   DatabaseOpts,
@@ -74,30 +74,78 @@ if (!TursoProxy) {
 }
 
 /**
+ * Helper function to construct a database path in a writable directory.
+ * On mobile platforms, you must use writable directories (not relative paths).
+ *
+ * @param filename - Database filename (e.g., 'mydb.db')
+ * @param directory - Directory to use ('documents', 'database', or 'library')
+ * @returns Absolute path to the database file
+ *
+ * @example
+ * ```ts
+ * import { getDbPath, connect } from '@tursodatabase/react-native';
+ *
+ * const dbPath = getDbPath('mydb.db');
+ * const db = await connect({ path: dbPath });
+ * ```
+ */
+export function getDbPath(filename: string, directory: 'documents' | 'database' | 'library' = 'documents'): string {
+  const basePath = paths[directory];
+  if (!basePath || basePath === '.') {
+    throw new Error(
+      `Unable to get ${directory} path for this platform. ` +
+      'Make sure the native module is properly loaded.'
+    );
+  }
+  return `${basePath}/${filename}`;
+}
+
+/**
  * Connect to a database asynchronously (matches JavaScript bindings API)
  *
  * This is the main entry point for the SDK, matching the API from
  * @tursodatabase/sync-native and @tursodatabase/database-native.
  *
+ * **Path handling**: Relative paths are automatically placed in writable directories:
+ * - Android: app's database directory (`/data/data/com.app/databases/`)
+ * - iOS: app's documents directory
+ *
+ * Absolute paths and `:memory:` are used as-is.
+ *
  * @param opts - Database options
  * @returns Promise resolving to Database instance
  *
- * @example Local database
+ * @example Local database (relative path)
  * ```ts
- * const db = await connect({ path: './local.db' });
+ * import { connect } from '@tursodatabase/react-native';
+ *
+ * // Relative path automatically placed in writable directory
+ * const db = await connect({ path: 'local.db' });
  * await db.exec('CREATE TABLE users (id INTEGER, name TEXT)');
+ * ```
+ *
+ * @example Using :memory: for in-memory database
+ * ```ts
+ * const db = await connect({ path: ':memory:' });
  * ```
  *
  * @example Sync database
  * ```ts
  * const db = await connect({
- *   path: './replica.db',
+ *   path: 'replica.db',
  *   url: 'libsql://mydb.turso.io',
  *   authToken: 'token-here',
  * });
  * const users = await db.all('SELECT * FROM users');
  * await db.push();
  * await db.pull();
+ * ```
+ *
+ * @example Using absolute path (advanced)
+ * ```ts
+ * import { connect, paths } from '@tursodatabase/react-native';
+ *
+ * const db = await connect({ path: `${paths.documents}/mydb.db` });
  * ```
  */
 export async function connect(opts: DatabaseOpts): Promise<Database> {
@@ -130,20 +178,56 @@ export function setup(options: {logLevel?: string}): void {
 }
 
 /**
- * Platform-specific paths
+ * Platform-specific writable directory paths.
+ * Use these to construct absolute paths for database files.
+ *
+ * NOTE: With automatic path normalization, you typically don't need this.
+ * Just pass relative paths like 'mydb.db' and they'll be placed in the correct directory.
+ *
+ * @example
+ * ```ts
+ * import { paths, connect } from '@tursodatabase/react-native';
+ *
+ * // Create database in app's documents/files directory
+ * const dbPath = `${paths.documents}/mydb.db`;
+ * const db = await connect({ path: dbPath });
+ * ```
  */
 export const paths = {
   /**
-   * The default database directory for the current platform.
-   * - iOS: App's Documents directory
-   * - Android: App's files directory
+   * Primary documents/database directory (writable)
+   * - iOS: App's Documents directory (absolute path)
+   * - Android: App's database directory (absolute path) - preferred for databases
    */
   get documents(): string {
-    return Platform.select({
-      ios: 'Documents',
-      android: 'files',
-      default: '.',
-    }) as string;
+    return TursoNative?.IOS_DOCUMENT_PATH || TursoNative?.ANDROID_DATABASE_PATH || '.';
+  },
+
+  /**
+   * Database-specific directory (writable)
+   * - iOS: Same as documents
+   * - Android: Database directory (absolute path)
+   */
+  get database(): string {
+    return TursoNative?.IOS_DOCUMENT_PATH || TursoNative?.ANDROID_DATABASE_PATH || '.';
+  },
+
+  /**
+   * Files directory (writable)
+   * - iOS: Same as documents
+   * - Android: App's files directory (absolute path)
+   */
+  get files(): string {
+    return TursoNative?.IOS_DOCUMENT_PATH || TursoNative?.ANDROID_FILES_PATH || '.';
+  },
+
+  /**
+   * Library directory (iOS only, writable)
+   * - iOS: App's Library directory (absolute path)
+   * - Android: Same as files
+   */
+  get library(): string {
+    return TursoNative?.IOS_LIBRARY_PATH || TursoNative?.ANDROID_FILES_PATH || '.';
   },
 };
 
@@ -153,6 +237,7 @@ export default {
   version,
   setup,
   setFileSystemImpl,
+  getDbPath,
   paths,
   Database,
 };

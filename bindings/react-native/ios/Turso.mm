@@ -17,6 +17,33 @@ RCT_EXPORT_MODULE()
     return YES;
 }
 
+- (NSDictionary *)constantsToExport {
+    // Get documents directory
+    NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+    NSString *documentsPath = [paths firstObject];
+
+    // Get library directory
+    NSArray *libraryPaths = NSSearchPathForDirectoriesInDomains(NSLibraryDirectory, NSUserDomainMask, YES);
+    NSString *libraryPath = [libraryPaths firstObject];
+
+    // Check for app group (for sharing data between app and extensions)
+    NSString *appGroup = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"Turso_AppGroup"];
+    if (appGroup) {
+        NSURL *containerURL = [[NSFileManager defaultManager] containerURLForSecurityApplicationGroupIdentifier:appGroup];
+        if (containerURL) {
+            documentsPath = [containerURL path];
+        }
+    }
+
+    return @{
+        @"IOS_DOCUMENT_PATH": documentsPath ?: [NSNull null],
+        @"IOS_LIBRARY_PATH": libraryPath ?: [NSNull null],
+        @"ANDROID_DATABASE_PATH": [NSNull null],
+        @"ANDROID_FILES_PATH": [NSNull null],
+        @"ANDROID_EXTERNAL_FILES_PATH": [NSNull null]
+    };
+}
+
 - (void)setBridge:(RCTBridge *)bridge {
     _bridge = bridge;
 

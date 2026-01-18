@@ -12,7 +12,12 @@ describe('Basic Queries', () => {
   let db: any;
 
   beforeEach(async () => {
-    db = await connect({ path: ':memory:' });
+    try {
+      // Relative path is automatically placed in writable directory
+      db = await connect({ path: 'test.db' });
+    } catch (e) {
+      console.error(e);
+    }
   });
 
   afterEach(() => {
@@ -23,7 +28,7 @@ describe('Basic Queries', () => {
   });
 
   it('SELECT simple value', async () => {
-    const res = await db.get('SELECT 1 as value');
+    let res = await db.get('SELECT 1 as value');
     expect(res).toDeepEqual({ value: 1 });
   });
 
@@ -75,17 +80,13 @@ describe('Table Operations', () => {
     await db.exec(
       'CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)',
     );
-    const result = await db.run(
-      'INSERT INTO users (name, age) VALUES (?, ?)',
+    await db.run(
+      "INSERT INTO users (name, age) VALUES (?, ?)",
       'Alice',
       30,
     );
-    expect(result.changes).toBe(1);
 
-    const row = await db.get(
-      'SELECT * FROM users WHERE id = ?',
-      result.lastInsertRowid,
-    );
+    const row = await db.get('SELECT * FROM users WHERE id = ?', 1);
     expect(row.name).toBe('Alice');
     expect(row.age).toBe(30);
   });

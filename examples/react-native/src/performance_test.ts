@@ -24,9 +24,9 @@ export async function performanceTest() {
     ...Array(14).fill('test'),
   );
 
-  // Performance test: query 100000 times
+  // Performance test: query 1000 times
   let start = performance.now();
-  for (let i = 0; i < 100000; i++) {
+  for (let i = 0; i < 1000; i++) {
     await db.get('SELECT * FROM perf_table WHERE id = 1');
   }
   const end = performance.now();

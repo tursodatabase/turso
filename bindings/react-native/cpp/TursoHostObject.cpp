@@ -2,6 +2,9 @@
 #include "TursoDatabaseHostObject.h"
 #include "TursoSyncDatabaseHostObject.h"
 
+#include <cstdio>   // For FILE, fopen, fread, fwrite, fclose, fseek, ftell, remove, rename
+#include <cstdlib>  // For additional standard library functions
+
 extern "C" {
 #include <turso.h>
 #include <turso_sync.h>
@@ -12,8 +15,39 @@ namespace turso
 
     using namespace facebook;
 
-    // Global base path for database files (for backward compatibility)
+    // Global base path for database files
     static std::string g_basePath;
+
+    /**
+     * Normalize a database path:
+     * - If path is absolute (starts with '/'), use as-is
+     * - If path is ':memory:', use as-is
+     * - Otherwise, prepend basePath
+     */
+    static std::string normalizePath(const std::string &path)
+    {
+        // Special cases: absolute path or in-memory
+        if (path.empty() || path[0] == '/' || path == ":memory:")
+        {
+            return path;
+        }
+
+        // Relative path - prepend basePath
+        if (g_basePath.empty())
+        {
+            return path;
+        }
+
+        // Combine basePath + path
+        if (g_basePath[g_basePath.length() - 1] == '/')
+        {
+            return g_basePath + path;
+        }
+        else
+        {
+            return g_basePath + "/" + path;
+        }
+    }
 
     void install(
         jsi::Runtime &rt,
@@ -40,10 +74,13 @@ namespace turso
 
                 std::string path = args[0].asString(rt).utf8(rt);
 
+                // Normalize path (prepend basePath if relative)
+                std::string normalizedPath = normalizePath(path);
+
                 // Build database config
                 turso_database_config_t db_config = {0};
-                db_config.async_io = 0;  // Sync IO for now
-                db_config.path = path.c_str();
+                db_config.async_io = 1;  // Default to async IO for React Native
+                db_config.path = normalizedPath.c_str();
                 db_config.experimental_features = nullptr;
                 db_config.vfs = nullptr;
                 db_config.encryption_cipher = nullptr;
@@ -54,8 +91,11 @@ namespace turso
                 {
                     jsi::Object config = args[1].asObject(rt);
 
-                    // TODO: Parse additional config options if needed
-                    // e.g., vfs, experimental_features, etc.
+                    // Parse async_io if provided
+                    if (config.hasProperty(rt, "async_io"))
+                    {
+                        db_config.async_io = config.getProperty(rt, "async_io").getBool() ? 1 : 0;
+                    }
                 }
 
                 // Create database instance
@@ -99,9 +139,18 @@ namespace turso
                 }
                 std::string path = dbConfigObj.getProperty(rt, "path").asString(rt).utf8(rt);
 
+                // Normalize path (prepend basePath if relative)
+                std::string normalizedPath = normalizePath(path);
+
                 turso_database_config_t db_config = {0};
-                db_config.async_io = 0;  // Sync IO for now
-                db_config.path = path.c_str();
+                db_config.async_io = 1;  // Default to async IO for React Native
+                db_config.path = normalizedPath.c_str();
+
+                // Parse async_io if provided in dbConfig
+                if (dbConfigObj.hasProperty(rt, "async_io"))
+                {
+                    db_config.async_io = dbConfigObj.getProperty(rt, "async_io").getBool() ? 1 : 0;
+                }
                 db_config.experimental_features = nullptr;
                 db_config.vfs = nullptr;
                 db_config.encryption_cipher = nullptr;
@@ -111,14 +160,22 @@ namespace turso
                 turso_sync_database_config_t sync_config = {0};
 
                 // path (already set in db_config, but sync_config also needs it)
-                sync_config.path = path.c_str();
+                sync_config.path = normalizedPath.c_str();
 
                 // remoteUrl (optional)
                 static std::string remoteUrl;
                 if (syncConfigObj.hasProperty(rt, "remoteUrl"))
                 {
-                    remoteUrl = syncConfigObj.getProperty(rt, "remoteUrl").asString(rt).utf8(rt);
-                    sync_config.remote_url = remoteUrl.c_str();
+                    jsi::Value remoteUrlVal = syncConfigObj.getProperty(rt, "remoteUrl");
+                    if (!remoteUrlVal.isNull() && !remoteUrlVal.isUndefined())
+                    {
+                        remoteUrl = remoteUrlVal.asString(rt).utf8(rt);
+                        sync_config.remote_url = remoteUrl.c_str();
+                    }
+                    else
+                    {
+                        sync_config.remote_url = nullptr;
+                    }
                 }
                 else
                 {
@@ -129,8 +186,16 @@ namespace turso
                 static std::string clientName;
                 if (syncConfigObj.hasProperty(rt, "clientName"))
                 {
-                    clientName = syncConfigObj.getProperty(rt, "clientName").asString(rt).utf8(rt);
-                    sync_config.client_name = clientName.c_str();
+                    jsi::Value clientNameVal = syncConfigObj.getProperty(rt, "clientName");
+                    if (!clientNameVal.isNull() && !clientNameVal.isUndefined())
+                    {
+                        clientName = clientNameVal.asString(rt).utf8(rt);
+                        sync_config.client_name = clientName.c_str();
+                    }
+                    else
+                    {
+                        sync_config.client_name = nullptr;
+                    }
                 }
                 else
                 {
@@ -140,9 +205,15 @@ namespace turso
                 // longPollTimeoutMs
                 if (syncConfigObj.hasProperty(rt, "longPollTimeoutMs"))
                 {
-                    sync_config.long_poll_timeout_ms = static_cast<int32_t>(
-                        syncConfigObj.getProperty(rt, "longPollTimeoutMs").asNumber()
-                    );
+                    jsi::Value longPollVal = syncConfigObj.getProperty(rt, "longPollTimeoutMs");
+                    if (!longPollVal.isNull() && !longPollVal.isUndefined())
+                    {
+                        sync_config.long_poll_timeout_ms = static_cast<int32_t>(longPollVal.asNumber());
+                    }
+                    else
+                    {
+                        sync_config.long_poll_timeout_ms = 0;
+                    }
                 }
                 else
                 {
@@ -152,7 +223,15 @@ namespace turso
                 // bootstrapIfEmpty
                 if (syncConfigObj.hasProperty(rt, "bootstrapIfEmpty"))
                 {
-                    sync_config.bootstrap_if_empty = syncConfigObj.getProperty(rt, "bootstrapIfEmpty").getBool();
+                    jsi::Value bootstrapVal = syncConfigObj.getProperty(rt, "bootstrapIfEmpty");
+                    if (!bootstrapVal.isNull() && !bootstrapVal.isUndefined())
+                    {
+                        sync_config.bootstrap_if_empty = bootstrapVal.getBool();
+                    }
+                    else
+                    {
+                        sync_config.bootstrap_if_empty = false;
+                    }
                 }
                 else
                 {
@@ -162,9 +241,15 @@ namespace turso
                 // reservedBytes
                 if (syncConfigObj.hasProperty(rt, "reservedBytes"))
                 {
-                    sync_config.reserved_bytes = static_cast<int32_t>(
-                        syncConfigObj.getProperty(rt, "reservedBytes").asNumber()
-                    );
+                    jsi::Value reservedVal = syncConfigObj.getProperty(rt, "reservedBytes");
+                    if (!reservedVal.isNull() && !reservedVal.isUndefined())
+                    {
+                        sync_config.reserved_bytes = static_cast<int32_t>(reservedVal.asNumber());
+                    }
+                    else
+                    {
+                        sync_config.reserved_bytes = 0;
+                    }
                 }
                 else
                 {
@@ -174,9 +259,15 @@ namespace turso
                 // Partial sync options
                 if (syncConfigObj.hasProperty(rt, "partialBootstrapStrategyPrefix"))
                 {
-                    sync_config.partial_bootstrap_strategy_prefix = static_cast<int32_t>(
-                        syncConfigObj.getProperty(rt, "partialBootstrapStrategyPrefix").asNumber()
-                    );
+                    jsi::Value prefixVal = syncConfigObj.getProperty(rt, "partialBootstrapStrategyPrefix");
+                    if (!prefixVal.isNull() && !prefixVal.isUndefined())
+                    {
+                        sync_config.partial_bootstrap_strategy_prefix = static_cast<int32_t>(prefixVal.asNumber());
+                    }
+                    else
+                    {
+                        sync_config.partial_bootstrap_strategy_prefix = 0;
+                    }
                 }
                 else
                 {
@@ -186,8 +277,16 @@ namespace turso
                 static std::string partialBootstrapStrategyQuery;
                 if (syncConfigObj.hasProperty(rt, "partialBootstrapStrategyQuery"))
                 {
-                    partialBootstrapStrategyQuery = syncConfigObj.getProperty(rt, "partialBootstrapStrategyQuery").asString(rt).utf8(rt);
-                    sync_config.partial_bootstrap_strategy_query = partialBootstrapStrategyQuery.c_str();
+                    jsi::Value queryVal = syncConfigObj.getProperty(rt, "partialBootstrapStrategyQuery");
+                    if (!queryVal.isNull() && !queryVal.isUndefined())
+                    {
+                        partialBootstrapStrategyQuery = queryVal.asString(rt).utf8(rt);
+                        sync_config.partial_bootstrap_strategy_query = partialBootstrapStrategyQuery.c_str();
+                    }
+                    else
+                    {
+                        sync_config.partial_bootstrap_strategy_query = nullptr;
+                    }
                 }
                 else
                 {
@@ -196,9 +295,15 @@ namespace turso
 
                 if (syncConfigObj.hasProperty(rt, "partialBootstrapSegmentSize"))
                 {
-                    sync_config.partial_bootstrap_segment_size = static_cast<size_t>(
-                        syncConfigObj.getProperty(rt, "partialBootstrapSegmentSize").asNumber()
-                    );
+                    jsi::Value segmentVal = syncConfigObj.getProperty(rt, "partialBootstrapSegmentSize");
+                    if (!segmentVal.isNull() && !segmentVal.isUndefined())
+                    {
+                        sync_config.partial_bootstrap_segment_size = static_cast<size_t>(segmentVal.asNumber());
+                    }
+                    else
+                    {
+                        sync_config.partial_bootstrap_segment_size = 0;
+                    }
                 }
                 else
                 {
@@ -207,7 +312,15 @@ namespace turso
 
                 if (syncConfigObj.hasProperty(rt, "partialBootstrapPrefetch"))
                 {
-                    sync_config.partial_bootstrap_prefetch = syncConfigObj.getProperty(rt, "partialBootstrapPrefetch").getBool();
+                    jsi::Value prefetchVal = syncConfigObj.getProperty(rt, "partialBootstrapPrefetch");
+                    if (!prefetchVal.isNull() && !prefetchVal.isUndefined())
+                    {
+                        sync_config.partial_bootstrap_prefetch = prefetchVal.getBool();
+                    }
+                    else
+                    {
+                        sync_config.partial_bootstrap_prefetch = false;
+                    }
                 }
                 else
                 {
@@ -285,10 +398,117 @@ namespace turso
                 return jsi::Value::undefined();
             });
 
+        // fsReadFile(path) -> ArrayBuffer
+        auto fsReadFile = jsi::Function::createFromHostFunction(
+            rt,
+            jsi::PropNameID::forAscii(rt, "fsReadFile"),
+            1,
+            [](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *args, size_t count) -> jsi::Value
+            {
+                if (count < 1 || !args[0].isString())
+                {
+                    throw jsi::JSError(rt, "fsReadFile() requires path string");
+                }
+
+                std::string path = args[0].asString(rt).utf8(rt);
+
+                // Open file for reading
+                FILE* file = fopen(path.c_str(), "rb");
+                if (!file)
+                {
+                    // File not found - return null (caller will handle as empty)
+                    return jsi::Value::null();
+                }
+
+                // Get file size
+                fseek(file, 0, SEEK_END);
+                long size = ftell(file);
+                fseek(file, 0, SEEK_SET);
+
+                if (size <= 0)
+                {
+                    fclose(file);
+                    // Empty file - return empty ArrayBuffer
+                    jsi::Function arrayBufferCtor = rt.global().getPropertyAsFunction(rt, "ArrayBuffer");
+                    jsi::Object arrayBuffer = arrayBufferCtor.callAsConstructor(rt, 0).asObject(rt);
+                    return arrayBuffer;
+                }
+
+                // Read file contents
+                jsi::Function arrayBufferCtor = rt.global().getPropertyAsFunction(rt, "ArrayBuffer");
+                jsi::Object arrayBuffer = arrayBufferCtor.callAsConstructor(rt, static_cast<int>(size)).asObject(rt);
+                jsi::ArrayBuffer buf = arrayBuffer.getArrayBuffer(rt);
+
+                size_t bytesRead = fread(buf.data(rt), 1, size, file);
+                fclose(file);
+
+                if (bytesRead != static_cast<size_t>(size))
+                {
+                    throw jsi::JSError(rt, "Failed to read complete file");
+                }
+
+                return arrayBuffer;
+            });
+
+        // fsWriteFile(path, arrayBuffer) -> void
+        auto fsWriteFile = jsi::Function::createFromHostFunction(
+            rt,
+            jsi::PropNameID::forAscii(rt, "fsWriteFile"),
+            2,
+            [](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *args, size_t count) -> jsi::Value
+            {
+                if (count < 2 || !args[0].isString() || !args[1].isObject())
+                {
+                    throw jsi::JSError(rt, "fsWriteFile() requires path string and ArrayBuffer");
+                }
+
+                std::string path = args[0].asString(rt).utf8(rt);
+                jsi::ArrayBuffer buffer = args[1].asObject(rt).getArrayBuffer(rt);
+
+                // Write atomically using temporary file + rename
+                std::string tempPath = path + ".tmp";
+
+                // Open temp file for writing
+                FILE* file = fopen(tempPath.c_str(), "wb");
+                if (!file)
+                {
+                    throw jsi::JSError(rt, "Failed to open file for writing");
+                }
+
+                // Write data
+                size_t size = buffer.size(rt);
+                if (size > 0)
+                {
+                    size_t written = fwrite(buffer.data(rt), 1, size, file);
+                    fclose(file);
+
+                    if (written != size)
+                    {
+                        remove(tempPath.c_str());
+                        throw jsi::JSError(rt, "Failed to write complete file");
+                    }
+                }
+                else
+                {
+                    fclose(file);
+                }
+
+                // Atomic rename (replaces old file)
+                if (rename(tempPath.c_str(), path.c_str()) != 0)
+                {
+                    remove(tempPath.c_str());
+                    throw jsi::JSError(rt, "Failed to rename temp file");
+                }
+
+                return jsi::Value::undefined();
+            });
+
         module.setProperty(rt, "newDatabase", std::move(newDatabase));
         module.setProperty(rt, "newSyncDatabase", std::move(newSyncDatabase));
         module.setProperty(rt, "version", std::move(version));
         module.setProperty(rt, "setup", std::move(setup));
+        module.setProperty(rt, "fsReadFile", std::move(fsReadFile));
+        module.setProperty(rt, "fsWriteFile", std::move(fsWriteFile));
 
         // Install as global __TursoProxy
         rt.global().setProperty(rt, "__TursoProxy", std::move(module));

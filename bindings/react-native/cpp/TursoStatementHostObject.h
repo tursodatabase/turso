@@ -55,6 +55,7 @@ private:
     jsi::Value rowValueKind(jsi::Runtime &rt, const jsi::Value *args, size_t count);
     jsi::Value rowValueBytesCount(jsi::Runtime &rt, const jsi::Value *args, size_t count);
     jsi::Value rowValueBytesPtr(jsi::Runtime &rt, const jsi::Value *args, size_t count);
+    jsi::Value rowValueText(jsi::Runtime &rt, const jsi::Value *args, size_t count);
     jsi::Value rowValueInt(jsi::Runtime &rt, const jsi::Value *args, size_t count);
     jsi::Value rowValueDouble(jsi::Runtime &rt, const jsi::Value *args, size_t count);
     jsi::Value namedPosition(jsi::Runtime &rt, const jsi::Value *args, size_t count);

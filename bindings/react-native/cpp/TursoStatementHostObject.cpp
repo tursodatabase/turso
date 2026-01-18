@@ -116,6 +116,12 @@ jsi::Value TursoStatementHostObject::get(jsi::Runtime &rt, const jsi::PropNameID
                 return this->rowValueBytesPtr(rt, args, count);
             });
     }
+    if (propName == "rowValueText") {
+        return jsi::Function::createFromHostFunction(rt, name, 1,
+            [this](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *args, size_t count) -> jsi::Value {
+                return this->rowValueText(rt, args, count);
+            });
+    }
     if (propName == "rowValueInt") {
         return jsi::Function::createFromHostFunction(rt, name, 1,
             [this](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *args, size_t count) -> jsi::Value {
@@ -166,6 +172,7 @@ std::vector<jsi::PropNameID> TursoStatementHostObject::getPropertyNames(jsi::Run
     props.emplace_back(jsi::PropNameID::forAscii(rt, "rowValueKind"));
     props.emplace_back(jsi::PropNameID::forAscii(rt, "rowValueBytesCount"));
     props.emplace_back(jsi::PropNameID::forAscii(rt, "rowValueBytesPtr"));
+    props.emplace_back(jsi::PropNameID::forAscii(rt, "rowValueText"));
     props.emplace_back(jsi::PropNameID::forAscii(rt, "rowValueInt"));
     props.emplace_back(jsi::PropNameID::forAscii(rt, "rowValueDouble"));
     props.emplace_back(jsi::PropNameID::forAscii(rt, "namedPosition"));
@@ -353,6 +360,23 @@ jsi::Value TursoStatementHostObject::rowValueBytesPtr(jsi::Runtime &rt, const js
     memcpy(buf.data(rt), ptr, bytes);
 
     return arrayBuffer;
+}
+
+jsi::Value TursoStatementHostObject::rowValueText(jsi::Runtime &rt, const jsi::Value *args, size_t count) {
+    if (count < 1 || !args[0].isNumber()) {
+        throw jsi::JSError(rt, "rowValueText: expected number argument (index)");
+    }
+    size_t index = static_cast<size_t>(args[0].asNumber());
+    const char* ptr = turso_statement_row_value_bytes_ptr(stmt_, index);
+    int64_t bytes = turso_statement_row_value_bytes_count(stmt_, index);
+
+    if (!ptr || bytes < 0) {
+        return jsi::String::createFromUtf8(rt, "");
+    }
+
+    // Create jsi::String directly from UTF-8 bytes
+    // This avoids the round-trip through ArrayBuffer and decoding in JS
+    return jsi::String::createFromUtf8(rt, reinterpret_cast<const uint8_t*>(ptr), static_cast<size_t>(bytes));
 }
 
 jsi::Value TursoStatementHostObject::rowValueInt(jsi::Runtime &rt, const jsi::Value *args, size_t count) {
