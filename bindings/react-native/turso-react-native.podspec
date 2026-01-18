@@ -49,5 +49,4 @@ Pod::Spec.new do |s|
   # Dependencies
   s.dependency "React-Core"
   s.dependency "React-callinvoker"
-  s.dependency "ReactCommon/turbomodule/core"
 end

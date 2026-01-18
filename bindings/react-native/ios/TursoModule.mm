@@ -2,7 +2,6 @@
 
 #import <React/RCTBridge+Private.h>
 #import <React/RCTUtils.h>
-#import <ReactCommon/RCTTurboModule.h>
 #import <jsi/jsi.h>
 
 #import "TursoHostObject.h"
