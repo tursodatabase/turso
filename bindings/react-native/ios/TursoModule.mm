@@ -1,4 +1,4 @@
-#import "Turso.h"
+#import "TursoModule.h"
 
 #import <React/RCTBridge+Private.h>
 #import <React/RCTUtils.h>
