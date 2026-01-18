@@ -51,14 +51,13 @@ android {
         }
     }
 
-    sourceSets {
-        main {
-            jniLibs.srcDirs = ["src/main/jniLibs"]
-        }
-    }
-
     packaging {
-        pickFirst "**/libc++_shared.so"
+        excludes += [
+            "**/libjsi.so",
+            "**/libfbjni.so",
+            "**/libc++_shared.so",
+            "**/libreactnative.so"
+        ]
     }
 }
 
