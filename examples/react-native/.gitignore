@@ -1,0 +1,40 @@
+# Node
+node_modules/
+
+# React Native
+.metro-health-check*
+
+# Android
+android/.gradle/
+android/app/build/
+android/build/
+android/.idea/
+*.iml
+local.properties
+
+# iOS
+ios/Pods/
+ios/build/
+*.xcworkspace
+*.xcuserdata
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Build artifacts
+*.apk
+*.aab
+*.ipa
