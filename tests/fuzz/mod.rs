@@ -1089,6 +1089,29 @@ mod fuzz_tests {
                  -- Also create a deferred child referencing the same parent
                  INSERT INTO child_deferred VALUES (NEW.id + 30000, NEW.pid, NEW.y);
                 END",
+                // BEFORE UPDATE on child_deferred using UPDATE OR IGNORE - tests OR IGNORE propagation from UPDATE
+                "CREATE TRIGGER trig_child_deferred_before_update_or_ignore BEFORE UPDATE ON child_deferred BEGIN
+                 INSERT INTO trigger_log VALUES ('BEFORE_UPDATE', 'child_deferred', NEW.id, NEW.pid);
+                 INSERT INTO trigger_stats VALUES ('child_deferred_update', 1) ON CONFLICT(op_type) DO UPDATE SET count=count+1;
+                 -- Try to insert a parent that might already exist (OR IGNORE should propagate)
+                 INSERT INTO parent VALUES (NEW.pid, NEW.x, NEW.x * 2);
+                 -- Update another child_deferred row (might conflict on unique constraint)
+                 UPDATE OR IGNORE child_deferred SET x = NEW.x WHERE id = NEW.id + 1;
+                END",
+                // AFTER INSERT on parent using UPDATE OR REPLACE in trigger - tests OR REPLACE propagation
+                "CREATE TRIGGER trig_parent_after_insert_or_replace AFTER INSERT ON parent BEGIN
+                 INSERT INTO trigger_log VALUES ('AFTER_INSERT', 'parent', NEW.id, NEW.a);
+                 INSERT INTO trigger_stats VALUES ('parent_after_insert', 1) ON CONFLICT(op_type) DO UPDATE SET count=count+1;
+                 -- Use UPDATE OR REPLACE which might delete conflicting rows
+                 UPDATE OR REPLACE parent SET a = NEW.a + 1 WHERE id = NEW.id + 1;
+                END",
+                // BEFORE DELETE on child_immediate using UPDATE OR IGNORE - tests cascading with OR IGNORE
+                "CREATE TRIGGER trig_child_immediate_before_delete BEFORE DELETE ON child_immediate BEGIN
+                 INSERT INTO trigger_log VALUES ('BEFORE_DELETE', 'child_immediate', OLD.id, OLD.pid);
+                 INSERT INTO trigger_stats VALUES ('child_immediate_delete', 1) ON CONFLICT(op_type) DO UPDATE SET count=count+1;
+                 -- Try to update parent, ignoring if it would cause constraint violation
+                 UPDATE OR IGNORE parent SET id = OLD.pid + 50000 WHERE id = OLD.pid;
+                END",
             ];
 
             // Randomly select up to 2 triggers from the list
