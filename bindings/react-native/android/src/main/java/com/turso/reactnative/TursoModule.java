@@ -1,5 +1,7 @@
 package com.turso.reactnative;
 
+import java.io.File;
+import java.lang.Exception;
 import java.util.HashMap;
 import java.util.Map;
 
@@ -35,7 +37,8 @@ public class TursoModule extends ReactContextBaseJavaModule {
         final Map<String, Object> constants = new HashMap<>();
         ReactApplicationContext context = getReactApplicationContext();
 
-        // getDatabasePath(...) returns file path - so we pass dummy value and remove it after to get directory path
+        // getDatabasePath(...) returns file path - so we pass dummy value and remove it
+        // after to get directory path
         String dbPath = context.getDatabasePath("tursoDatabaseFile").getAbsolutePath().replace("tursoDatabaseFile", "");
         constants.put("ANDROID_DATABASE_PATH", dbPath);
 
@@ -43,9 +46,11 @@ public class TursoModule extends ReactContextBaseJavaModule {
         constants.put("ANDROID_FILES_PATH", filesPath);
 
         File externalFilesDir = context.getExternalFilesDir(null);
-        constants.put("ANDROID_EXTERNAL_FILES_PATH", externalFilesDir != null ? externalFilesDir.getAbsolutePath() : null);
+        constants.put("ANDROID_EXTERNAL_FILES_PATH",
+                externalFilesDir != null ? externalFilesDir.getAbsolutePath() : null);
 
-        // populate Android and IOS constants to simplify JS code (e.g. IOS_DOCUMENT_PATH ?? OPSQLite.ANDROID_DATABASE_PATH)
+        // populate Android and IOS constants to simplify JS code (e.g.
+        // IOS_DOCUMENT_PATH ?? OPSQLite.ANDROID_DATABASE_PATH)
         constants.put("IOS_DOCUMENT_PATH", null);
         constants.put("IOS_LIBRARY_PATH", null);
 
@@ -57,19 +62,20 @@ public class TursoModule extends ReactContextBaseJavaModule {
         try {
             ReactApplicationContext context = getReactApplicationContext();
             // Install native module
-            TursoBridge.instance.install(context);
+            TursoBridge.getInstance().install(context);
             return true;
         } catch (Exception e) {
             return false;
         }
     }
-    
+
     @Override
     public void invalidate() {
         super.invalidate();
-        TursoBridge.instance.invalidate();
+        TursoBridge.getInstance().invalidate();
     }
 
     private native void installNativeJsi(long jsiRuntimePtr, Object callInvokerHolder, String dbPath);
+
     private native void clearStateNativeJsi();
 }

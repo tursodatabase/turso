@@ -26,8 +26,8 @@ const TursoNative: TursoNativeModule | undefined = NativeModules.Turso;
 if (!TursoNative) {
   throw new Error(
     `turso-react-native: Native module not found. Make sure you have properly linked the library.\n` +
-      `- iOS: Run 'pod install' in your ios directory\n` +
-      `- Android: Make sure the package is properly included in your MainApplication.java`
+    `- iOS: Run 'pod install' in your ios directory\n` +
+    `- Android: Make sure the package is properly included in your MainApplication.java`
   );
 }
 
@@ -52,25 +52,7 @@ if (!TursoProxy) {
   );
 }
 
-/**
- * Opens a SQLite database.
- *
- * @param options - Database name/path or options object
- * @returns A Database instance
- *
- * @example
- * ```typescript
- * // Open an in-memory database
- * const db = openDatabase(':memory:');
- *
- * // Open a file database
- * const db = openDatabase('myapp.db');
- *
- * // Open with options
- * const db = openDatabase({ name: 'myapp.db', readonly: false });
- * ```
- */
-export function openDatabase(options: OpenDatabaseOptions | string): Database {
+export function connect(options: OpenDatabaseOptions | string): Database {
   const nativeDb = TursoProxy.open(options);
   return new Database(nativeDb);
 }
@@ -104,7 +86,7 @@ export const paths = {
 
 // Default export
 export default {
-  openDatabase,
+  connect,
   version,
   paths,
   Database,

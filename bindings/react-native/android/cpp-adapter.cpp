@@ -1,5 +1,4 @@
 #include "TursoHostObject.h"
-#include "logs.h"
 #include <ReactCommon/CallInvokerHolder.h>
 #include <fbjni/fbjni.h>
 #include <jni.h>

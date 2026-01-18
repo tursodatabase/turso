@@ -19,4 +19,6 @@ void install(
     const char *basePath
 );
 
+void invalidate();
+
 } // namespace turso
