@@ -2,6 +2,10 @@ require "json"
 
 package = JSON.parse(File.read(File.join(__dir__, "package.json")))
 
+# Load React Native podspec helpers
+require Pod::Executable.execute_command('node', ['-p',
+  'require.resolve("react-native/scripts/react_native_pods.rb", {paths: [process.argv[1]]})', __dir__]).strip
+
 Pod::Spec.new do |s|
   s.name         = "turso-react-native"
   s.version      = package["version"]
@@ -46,7 +50,6 @@ Pod::Spec.new do |s|
     :shell_path => "/bin/bash"
   }
 
-  # Dependencies
-  s.dependency "React-Core"
-  s.dependency "React-callinvoker"
+  # Install React Native module dependencies (includes React-Core, turbomodule, etc.)
+  install_modules_dependencies(s)
 end

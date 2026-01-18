@@ -2,6 +2,7 @@
 
 #import <React/RCTBridge+Private.h>
 #import <React/RCTUtils.h>
+#import <ReactCommon/RCTTurboModule.h>
 #import <jsi/jsi.h>
 
 #import "TursoHostObject.h"
@@ -79,7 +80,7 @@ RCT_EXPORT_MODULE()
     }
 
     // Get the call invoker
-    std::shared_ptr<facebook::react::CallInvoker> callInvoker = cxxBridge.jsCallInvoker;
+    auto callInvoker = _bridge.jsCallInvoker;
 
     // Install the Turso module
     turso::install(*runtime, callInvoker, [documentsPath UTF8String]);
