@@ -1,19 +1,15 @@
-const {getDefaultConfig, mergeConfig} = require('@react-native/metro-config');
 const path = require('path');
+const { getDefaultConfig, mergeConfig } = require('@react-native/metro-config');
 
-const defaultConfig = getDefaultConfig(__dirname);
-
-// Watch the turso-react-native package
-const tursoPath = path.resolve(__dirname, '../../bindings/react-native');
+const bindingsPath = path.resolve(__dirname, '../../bindings/react-native');
 
 const config = {
-  watchFolders: [tursoPath],
+  watchFolders: [bindingsPath],
   resolver: {
-    nodeModulesPaths: [
-      path.resolve(__dirname, 'node_modules'),
-      path.resolve(tursoPath, 'node_modules'),
-    ],
+    extraNodeModules: {
+      '@tursodatabase/react-native': bindingsPath,
+    },
   },
 };
 
-module.exports = mergeConfig(defaultConfig, config);
+module.exports = mergeConfig(getDefaultConfig(__dirname), config);

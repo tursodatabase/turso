@@ -1,7 +1,7 @@
 {
-  "name": "turso-react-native",
+  "name": "@tursodatabase/react-native",
   "version": "0.5.0-pre.1",
-  "description": "React Native bindings for TursoDB - the fastest SQLite implementation",
+  "description": "React Native bindings for TursoDB",
   "main": "lib/commonjs/index.js",
   "module": "lib/module/index.js",
   "types": "lib/typescript/index.d.ts",

@@ -1,31 +1,44 @@
 {
-  "name": "turso-react-native-example",
+  "name": "turso_example",
   "version": "0.0.1",
   "private": true,
   "scripts": {
     "android": "react-native run-android",
-    "ios": "react-native run-ios",
+    "ios": "react-native run-ios --scheme='debug' --simulator='iPhone 16 Pro'",
+    "run:ios:unused": "xcodebuild -workspace ios/TursoExample.xcworkspace -scheme release -configuration Release -sdk iphonesimulator -destination 'platform=iOS Simulator,name=iPhone 16 Pro' clean build",
+    "run:ios:release": "react-native run-ios --scheme='release' --no-packager",
     "start": "react-native start",
-    "clean": "cd android && ./gradlew clean && cd ..",
-    "build:android": "cd android && ./gradlew assembleRelease"
+    "pods": "cd ios && bundle exec pod install && rm -f .xcode.env.local",
+    "pods:nuke": "cd ios && rm -rf Pods && rm -rf Podfile.lock && bundle exec pod install",
+    "run:android:release": "cd android && ./gradlew assembleRelease && adb install -r app/build/outputs/apk/release/app-release.apk && adb shell am start -n com.op.sqlite.example/.MainActivity",
+    "build:android": "cd android && ./gradlew assembleDebug --no-daemon --console=plain -PreactNativeArchitectures=arm64-v8a",
+    "build:ios": "cd ios && xcodebuild -workspace TursoExample.xcworkspace -scheme debug -configuration Debug -sdk iphonesimulator CC=clang CPLUSPLUS=clang++ LD=clang LDPLUSPLUS=clang++ GCC_OPTIMIZATION_LEVEL=0 GCC_PRECOMPILE_PREFIX_HEADER=YES ASSETCATALOG_COMPILER_OPTIMIZATION=time DEBUG_INFORMATION_FORMAT=dwarf COMPILER_INDEX_STORE_ENABLE=NO"
   },
   "dependencies": {
-    "react": "18.3.1",
-    "react-native": "0.76.0"
+    "@op-engineering/op-server": "^0.1.5",
+    "@op-engineering/op-test": "^0.2.5",
+    "chance": "^1.1.9",
+    "clsx": "^2.0.0",
+    "events": "^3.3.0",
+    "react": "19.1.1",
+    "react-native": "0.82.1",
+    "react-native-safe-area-context": "^5.6.2"
   },
   "devDependencies": {
-    "@babel/core": "^7.25.0",
-    "@babel/preset-env": "^7.25.0",
+    "@babel/core": "^7.25.2",
+    "@babel/preset-env": "^7.25.3",
     "@babel/runtime": "^7.25.0",
-    "@react-native-community/cli": "15.0.0",
-    "@react-native-community/cli-platform-android": "15.0.0",
-    "@react-native-community/cli-platform-ios": "15.0.0",
-    "@react-native/babel-preset": "0.76.0",
-    "@react-native/gradle-plugin": "0.76.0",
-    "@react-native/metro-config": "0.76.0",
-    "@react-native/typescript-config": "0.76.0",
-    "@types/react": "^18.3.0",
-    "typescript": "^5.3.0"
+    "@react-native-community/cli": "^18.0.0",
+    "@react-native-community/cli-platform-android": "18.0.0",
+    "@react-native-community/cli-platform-ios": "18.0.0",
+    "@react-native/babel-preset": "0.82.1",
+    "@react-native/metro-config": "0.82.1",
+    "@react-native/typescript-config": "0.81.5",
+    "@types/chance": "^1.1.7",
+    "@types/react": "^19.1.1",
+    "react-native-builder-bob": "^0.40.13",
+    "react-native-restart": "^0.0.27",
+    "tailwindcss": "3.3.2"
   },
   "engines": {
     "node": ">=18"
