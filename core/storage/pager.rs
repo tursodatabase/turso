@@ -44,6 +44,7 @@ use super::sqlite3_ondisk::{
 };
 use super::wal::CheckpointMode;
 use crate::storage::encryption::{CipherMode, EncryptionContext, EncryptionKey};
+use branches::unlikely;
 
 /// SQLite's default maximum page count
 const DEFAULT_MAX_PAGE_COUNT: u32 = 0xfffffffe;
@@ -420,9 +421,25 @@ impl PageInner {
         debug_assert!(matches!(self.page_type(), Ok(PageType::IndexInterior)));
         let buf = self.as_ptr();
         let cell_pointer_array_start = self.header_size();
+        let offset = self.offset();
+        let ptr_offset = offset + cell_pointer_array_start + (idx * CELL_PTR_SIZE_BYTES);
+        if unlikely(ptr_offset + 1 >= buf.len()) {
+            crate::bail_corrupt_error!(
+                "cell pointer out of bounds: ptr_offset={} len={}",
+                ptr_offset,
+                buf.len()
+            );
+        }
         let cell_pointer = cell_pointer_array_start + (idx * CELL_PTR_SIZE_BYTES);
         let cell_pointer = self.read_u16(cell_pointer) as usize;
 
+        if unlikely(cell_pointer + 3 >= buf.len()) {
+            crate::bail_corrupt_error!(
+                "cell payload out of bounds: cell_pointer={} len={}",
+                cell_pointer,
+                buf.len()
+            );
+        }
         let left_child_page = u32::from_be_bytes([
             buf[cell_pointer],
             buf[cell_pointer + 1],
@@ -430,8 +447,14 @@ impl PageInner {
             buf[cell_pointer + 3],
         ]);
         let mut pos = cell_pointer + 4;
+        if unlikely(pos >= buf.len()) {
+            crate::bail_corrupt_error!("cell payload out of bounds: pos={} len={}", pos, buf.len());
+        }
         let (payload_size, nr) = read_varint(&buf[pos..])?;
         pos += nr;
+        if unlikely(pos >= buf.len()) {
+            crate::bail_corrupt_error!("cell payload out of bounds: pos={} len={}", pos, buf.len());
+        }
 
         let (overflows, to_read) = sqlite3_ondisk::payload_overflows(
             payload_size as usize,
@@ -440,6 +463,14 @@ impl PageInner {
             usable_size,
         );
         let to_read = if overflows { to_read } else { buf.len() - pos };
+        if unlikely(pos + to_read > buf.len()) {
+            crate::bail_corrupt_error!(
+                "cell payload out of bounds: pos={} to_read={} len={}",
+                pos,
+                to_read,
+                buf.len()
+            );
+        }
 
         let static_buf: &'static [u8] = unsafe { std::mem::transmute::<&[u8], &'static [u8]>(buf) };
         let (payload, first_overflow_page) =
@@ -459,12 +490,27 @@ impl PageInner {
         debug_assert!(matches!(self.page_type(), Ok(PageType::IndexLeaf)));
         let buf = self.as_ptr();
         let cell_pointer_array_start = self.header_size();
+        let offset = self.offset();
+        let ptr_offset = offset + cell_pointer_array_start + (idx * CELL_PTR_SIZE_BYTES);
+        if unlikely(ptr_offset + 1 >= buf.len()) {
+            crate::bail_corrupt_error!(
+                "cell pointer out of bounds: ptr_offset={} len={}",
+                ptr_offset,
+                buf.len()
+            );
+        }
         let cell_pointer = cell_pointer_array_start + (idx * CELL_PTR_SIZE_BYTES);
         let cell_pointer = self.read_u16(cell_pointer) as usize;
 
         let mut pos = cell_pointer;
+        if unlikely(pos >= buf.len()) {
+            crate::bail_corrupt_error!("cell payload out of bounds: pos={} len={}", pos, buf.len());
+        }
         let (payload_size, nr) = read_varint(&buf[pos..])?;
         pos += nr;
+        if unlikely(pos >= buf.len()) {
+            crate::bail_corrupt_error!("cell payload out of bounds: pos={} len={}", pos, buf.len());
+        }
 
         let (overflows, to_read) = sqlite3_ondisk::payload_overflows(
             payload_size as usize,
@@ -473,6 +519,14 @@ impl PageInner {
             usable_size,
         );
         let to_read = if overflows { to_read } else { buf.len() - pos };
+        if unlikely(pos + to_read > buf.len()) {
+            crate::bail_corrupt_error!(
+                "cell payload out of bounds: pos={} to_read={} len={}",
+                pos,
+                to_read,
+                buf.len()
+            );
+        }
 
         let static_buf: &'static [u8] = unsafe { std::mem::transmute::<&[u8], &'static [u8]>(buf) };
         let (payload, first_overflow_page) =
@@ -492,14 +546,32 @@ impl PageInner {
         debug_assert!(matches!(self.page_type(), Ok(PageType::TableLeaf)));
         let buf = self.as_ptr();
         let cell_pointer_array_start = self.header_size();
+        let offset = self.offset();
+        let ptr_offset = offset + cell_pointer_array_start + (idx * CELL_PTR_SIZE_BYTES);
+        if unlikely(ptr_offset + 1 >= buf.len()) {
+            crate::bail_corrupt_error!(
+                "cell pointer out of bounds: ptr_offset={} len={}",
+                ptr_offset,
+                buf.len()
+            );
+        }
         let cell_pointer = cell_pointer_array_start + (idx * CELL_PTR_SIZE_BYTES);
         let cell_pointer = self.read_u16(cell_pointer) as usize;
 
         let mut pos = cell_pointer;
+        if unlikely(pos >= buf.len()) {
+            crate::bail_corrupt_error!("cell payload out of bounds: pos={} len={}", pos, buf.len());
+        }
         let (payload_size, n_payload) = read_varint(&buf[pos..])?;
         pos += n_payload;
+        if unlikely(pos >= buf.len()) {
+            crate::bail_corrupt_error!("cell payload out of bounds: pos={} len={}", pos, buf.len());
+        }
         let (rowid, n_rowid) = read_varint(&buf[pos..])?;
         pos += n_rowid;
+        if unlikely(pos >= buf.len()) {
+            crate::bail_corrupt_error!("cell payload out of bounds: pos={} len={}", pos, buf.len());
+        }
 
         let (overflows, to_read) = sqlite3_ondisk::payload_overflows(
             payload_size as usize,
@@ -508,6 +580,14 @@ impl PageInner {
             usable_size,
         );
         let to_read = if overflows { to_read } else { buf.len() - pos };
+        if unlikely(pos + to_read > buf.len()) {
+            crate::bail_corrupt_error!(
+                "cell payload out of bounds: pos={} to_read={} len={}",
+                pos,
+                to_read,
+                buf.len()
+            );
+        }
 
         let static_buf: &'static [u8] = unsafe { std::mem::transmute::<&[u8], &'static [u8]>(buf) };
         let (payload, first_overflow_page) =
