@@ -1837,11 +1837,21 @@ fn emit_delete_insns_when_triggers_present(
                 .map(|i| columns_start_reg + i)
                 .chain(std::iter::once(rowid_reg))
                 .collect::<Vec<_>>();
-            let trigger_ctx = TriggerContext::new(
-                btree_table.clone(),
-                None, // No NEW for DELETE
-                Some(old_registers),
-            );
+            // If the program has a trigger_conflict_override, propagate it to the trigger context.
+            let trigger_ctx = if let Some(override_conflict) = program.trigger_conflict_override {
+                TriggerContext::new_with_override_conflict(
+                    btree_table.clone(),
+                    None, // No NEW for DELETE
+                    Some(old_registers),
+                    override_conflict,
+                )
+            } else {
+                TriggerContext::new(
+                    btree_table.clone(),
+                    None, // No NEW for DELETE
+                    Some(old_registers),
+                )
+            };
 
             for trigger in relevant_triggers {
                 fire_trigger(
@@ -1893,11 +1903,22 @@ fn emit_delete_insns_when_triggers_present(
                 .map(|i| columns_start_reg + i)
                 .chain(std::iter::once(rowid_reg))
                 .collect::<Vec<_>>();
-            let trigger_ctx_after = TriggerContext::new(
-                btree_table.clone(),
-                None, // No NEW for DELETE
-                Some(old_registers),
-            );
+            // If the program has a trigger_conflict_override, propagate it to the trigger context.
+            let trigger_ctx_after =
+                if let Some(override_conflict) = program.trigger_conflict_override {
+                    TriggerContext::new_with_override_conflict(
+                        btree_table.clone(),
+                        None, // No NEW for DELETE
+                        Some(old_registers),
+                        override_conflict,
+                    )
+                } else {
+                    TriggerContext::new(
+                        btree_table.clone(),
+                        None, // No NEW for DELETE
+                        Some(old_registers),
+                    )
+                };
 
             for trigger in relevant_triggers {
                 fire_trigger(
@@ -2600,54 +2621,65 @@ fn emit_update_insns<'a>(
     }
 
     // Fire BEFORE UPDATE triggers and preserve old_registers for AFTER triggers
-    let preserved_old_registers: Option<Vec<usize>> =
-        if let Some(btree_table) = target_table.table.btree() {
-            let updated_column_indices: std::collections::HashSet<usize> =
-                set_clauses.iter().map(|(col_idx, _)| *col_idx).collect();
-            let relevant_before_update_triggers = get_relevant_triggers_type_and_time(
-                t_ctx.resolver.schema,
-                TriggerEvent::Update,
-                TriggerTime::Before,
-                Some(updated_column_indices.clone()),
-                &btree_table,
-            );
-            // Read OLD row values for trigger context
-            let old_registers: Vec<usize> = (0..col_len)
-                .map(|i| {
-                    let reg = program.alloc_register();
-                    program.emit_column_or_rowid(target_table_cursor_id, i, reg);
-                    reg
-                })
+    let preserved_old_registers: Option<Vec<usize>> = if let Some(btree_table) =
+        target_table.table.btree()
+    {
+        let updated_column_indices: std::collections::HashSet<usize> =
+            set_clauses.iter().map(|(col_idx, _)| *col_idx).collect();
+        let relevant_before_update_triggers = get_relevant_triggers_type_and_time(
+            t_ctx.resolver.schema,
+            TriggerEvent::Update,
+            TriggerTime::Before,
+            Some(updated_column_indices.clone()),
+            &btree_table,
+        );
+        // Read OLD row values for trigger context
+        let old_registers: Vec<usize> = (0..col_len)
+            .map(|i| {
+                let reg = program.alloc_register();
+                program.emit_column_or_rowid(target_table_cursor_id, i, reg);
+                reg
+            })
+            .chain(std::iter::once(beg))
+            .collect();
+        let has_relevant_triggers = relevant_before_update_triggers.clone().count() > 0;
+        if !has_relevant_triggers {
+            Some(old_registers)
+        } else {
+            // NEW row values are already in 'start' registers
+            let new_registers = (0..col_len)
+                .map(|i| start + i)
                 .chain(std::iter::once(beg))
                 .collect();
-            let has_relevant_triggers = relevant_before_update_triggers.clone().count() > 0;
-            if !has_relevant_triggers {
-                Some(old_registers)
-            } else {
-                // NEW row values are already in 'start' registers
-                let new_registers = (0..col_len)
-                    .map(|i| start + i)
-                    .chain(std::iter::once(beg))
-                    .collect();
 
-                let trigger_ctx = TriggerContext::new(
+            // If the program has a trigger_conflict_override, propagate it to the trigger context.
+            let trigger_ctx = if let Some(override_conflict) = program.trigger_conflict_override {
+                TriggerContext::new_with_override_conflict(
                     btree_table.clone(),
                     Some(new_registers),
                     Some(old_registers.clone()), // Clone for AFTER trigger
-                );
+                    override_conflict,
+                )
+            } else {
+                TriggerContext::new(
+                    btree_table.clone(),
+                    Some(new_registers),
+                    Some(old_registers.clone()), // Clone for AFTER trigger
+                )
+            };
 
-                for trigger in relevant_before_update_triggers {
-                    fire_trigger(
-                        program,
-                        &mut t_ctx.resolver,
-                        trigger,
-                        &trigger_ctx,
-                        connection,
-                    )?;
-                }
+            for trigger in relevant_before_update_triggers {
+                fire_trigger(
+                    program,
+                    &mut t_ctx.resolver,
+                    trigger,
+                    &trigger_ctx,
+                    connection,
+                )?;
+            }
 
-                // BEFORE UPDATE Triggers may have altered the btree so we need to seek again.
-                program.emit_insn(Insn::NotExists {
+            // BEFORE UPDATE Triggers may have altered the btree so we need to seek again.
+            program.emit_insn(Insn::NotExists {
                 cursor: target_table_cursor_id,
                 rowid_reg: beg,
                 target_pc: check_rowid_not_exists_label.expect(
@@ -2655,39 +2687,39 @@ fn emit_update_insns<'a>(
                 ),
             });
 
-                let has_relevant_after_triggers = get_relevant_triggers_type_and_time(
-                    t_ctx.resolver.schema,
-                    TriggerEvent::Update,
-                    TriggerTime::After,
-                    Some(updated_column_indices),
-                    &btree_table,
-                )
-                .clone()
-                .count()
-                    > 0;
-                if has_relevant_after_triggers {
-                    // Preserve pseudo-row 'OLD' for AFTER triggers by copying to new registers
-                    // (since registers might be overwritten during trigger execution)
-                    let preserved: Vec<usize> = old_registers
-                        .iter()
-                        .map(|old_reg| {
-                            let preserved_reg = program.alloc_register();
-                            program.emit_insn(Insn::Copy {
-                                src_reg: *old_reg,
-                                dst_reg: preserved_reg,
-                                extra_amount: 0,
-                            });
-                            preserved_reg
-                        })
-                        .collect();
-                    Some(preserved)
-                } else {
-                    Some(old_registers)
-                }
+            let has_relevant_after_triggers = get_relevant_triggers_type_and_time(
+                t_ctx.resolver.schema,
+                TriggerEvent::Update,
+                TriggerTime::After,
+                Some(updated_column_indices),
+                &btree_table,
+            )
+            .clone()
+            .count()
+                > 0;
+            if has_relevant_after_triggers {
+                // Preserve pseudo-row 'OLD' for AFTER triggers by copying to new registers
+                // (since registers might be overwritten during trigger execution)
+                let preserved: Vec<usize> = old_registers
+                    .iter()
+                    .map(|old_reg| {
+                        let preserved_reg = program.alloc_register();
+                        program.emit_insn(Insn::Copy {
+                            src_reg: *old_reg,
+                            dst_reg: preserved_reg,
+                            extra_amount: 0,
+                        });
+                        preserved_reg
+                    })
+                    .collect();
+                Some(preserved)
+            } else {
+                Some(old_registers)
             }
-        } else {
-            None
-        };
+        }
+    } else {
+        None
+    };
 
     // If BEFORE UPDATE triggers fired, they may have modified the row being updated.
     // According to the SQLite documentation, the behavior in these cases is undefined:
@@ -3499,11 +3531,22 @@ fn emit_update_insns<'a>(
                 // Use preserved OLD registers from BEFORE trigger
                 let old_registers_after = preserved_old_registers;
 
-                let trigger_ctx_after = TriggerContext::new(
-                    btree_table.clone(),
-                    Some(new_registers_after),
-                    old_registers_after, // OLD values preserved from BEFORE trigger
-                );
+                // If the program has a trigger_conflict_override, propagate it to the trigger context.
+                let trigger_ctx_after =
+                    if let Some(override_conflict) = program.trigger_conflict_override {
+                        TriggerContext::new_with_override_conflict(
+                            btree_table.clone(),
+                            Some(new_registers_after),
+                            old_registers_after, // OLD values preserved from BEFORE trigger
+                            override_conflict,
+                        )
+                    } else {
+                        TriggerContext::new(
+                            btree_table.clone(),
+                            Some(new_registers_after),
+                            old_registers_after, // OLD values preserved from BEFORE trigger
+                        )
+                    };
 
                 for trigger in relevant_triggers {
                     fire_trigger(
