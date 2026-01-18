@@ -15,7 +15,6 @@
     "build:ios": "cd ios && xcodebuild -workspace TursoExample.xcworkspace -scheme debug -configuration Debug -sdk iphonesimulator CC=clang CPLUSPLUS=clang++ LD=clang LDPLUSPLUS=clang++ GCC_OPTIMIZATION_LEVEL=0 GCC_PRECOMPILE_PREFIX_HEADER=YES ASSETCATALOG_COMPILER_OPTIMIZATION=time DEBUG_INFORMATION_FORMAT=dwarf COMPILER_INDEX_STORE_ENABLE=NO"
   },
   "dependencies": {
-    "@op-engineering/op-server": "^0.1.5",
     "@op-engineering/op-test": "^0.2.5",
     "chance": "^1.1.9",
     "clsx": "^2.0.0",

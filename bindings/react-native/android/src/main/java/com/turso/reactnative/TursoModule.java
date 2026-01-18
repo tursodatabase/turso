@@ -1,5 +1,8 @@
 package com.turso.reactnative;
 
+import java.util.HashMap;
+import java.util.Map;
+
 import androidx.annotation.NonNull;
 
 import com.facebook.react.bridge.ReactApplicationContext;
@@ -8,6 +11,7 @@ import com.facebook.react.bridge.ReactMethod;
 import com.facebook.react.module.annotations.ReactModule;
 import com.facebook.react.turbomodule.core.CallInvokerHolderImpl;
 
+// The React Native bridge - exposes methods to JavaScript
 @ReactModule(name = TursoModule.NAME)
 public class TursoModule extends ReactContextBaseJavaModule {
     public static final String NAME = "Turso";
@@ -26,32 +30,46 @@ public class TursoModule extends ReactContextBaseJavaModule {
         return NAME;
     }
 
+    @Override
+    public Map<String, Object> getConstants() {
+        final Map<String, Object> constants = new HashMap<>();
+        ReactApplicationContext context = getReactApplicationContext();
+
+        // getDatabasePath(...) returns file path - so we pass dummy value and remove it after to get directory path
+        String dbPath = context.getDatabasePath("tursoDatabaseFile").getAbsolutePath().replace("tursoDatabaseFile", "");
+        constants.put("ANDROID_DATABASE_PATH", dbPath);
+
+        String filesPath = context.getFilesDir().getAbsolutePath();
+        constants.put("ANDROID_FILES_PATH", filesPath);
+
+        File externalFilesDir = context.getExternalFilesDir(null);
+        constants.put("ANDROID_EXTERNAL_FILES_PATH", externalFilesDir != null ? externalFilesDir.getAbsolutePath() : null);
+
+        // populate Android and IOS constants to simplify JS code (e.g. IOS_DOCUMENT_PATH ?? OPSQLite.ANDROID_DATABASE_PATH)
+        constants.put("IOS_DOCUMENT_PATH", null);
+        constants.put("IOS_LIBRARY_PATH", null);
+
+        return constants;
+    }
+
     @ReactMethod(isBlockingSynchronousMethod = true)
     public boolean install() {
         try {
             ReactApplicationContext context = getReactApplicationContext();
-
-            // Get JSI runtime pointer
-            long jsiRuntimePtr = context.getJavaScriptContextHolder().get();
-            if (jsiRuntimePtr == 0) {
-                return false;
-            }
-
-            // Get call invoker
-            CallInvokerHolderImpl callInvokerHolder =
-                (CallInvokerHolderImpl) context.getCatalystInstance().getJSCallInvokerHolder();
-
-            // Get database path (app's files directory)
-            String dbPath = context.getFilesDir().getAbsolutePath();
-
             // Install native module
-            nativeInstall(jsiRuntimePtr, callInvokerHolder, dbPath);
-
+            TursoBridge.instance.install(context);
             return true;
         } catch (Exception e) {
             return false;
         }
     }
+    
+    @Override
+    public void invalidate() {
+        super.invalidate();
+        TursoBridge.instance.invalidate();
+    }
 
-    private native void nativeInstall(long jsiRuntimePtr, Object callInvokerHolder, String dbPath);
+    private native void installNativeJsi(long jsiRuntimePtr, Object callInvokerHolder, String dbPath);
+    private native void clearStateNativeJsi();
 }

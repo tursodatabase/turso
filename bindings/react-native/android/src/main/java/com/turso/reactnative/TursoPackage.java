@@ -11,6 +11,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 
+// Entry point for React Native's module registration system
 public class TursoPackage implements ReactPackage {
     @NonNull
     @Override

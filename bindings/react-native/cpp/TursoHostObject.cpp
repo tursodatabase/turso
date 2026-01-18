@@ -2,76 +2,88 @@
 #include "DBHostObject.h"
 
 // Include the Turso C API header
-extern "C" {
+extern "C"
+{
 #include "turso.h"
 }
 
-namespace turso {
+namespace turso
+{
 
-using namespace facebook;
+    using namespace facebook;
 
-// Global base path for database files
-static std::string g_basePath;
+    // Global base path for database files
+    static std::string g_basePath;
 
-void install(
-    jsi::Runtime &rt,
-    const std::shared_ptr<react::CallInvoker> &invoker,
-    const char *basePath
-) {
-    g_basePath = basePath ? basePath : "";
+    void install(
+        jsi::Runtime &rt,
+        const std::shared_ptr<react::CallInvoker> &invoker,
+        const char *basePath)
+    {
+        g_basePath = basePath ? basePath : "";
 
-    // Create the module object
-    jsi::Object module(rt);
+        // Create the module object
+        jsi::Object module(rt);
 
-    // open(options) -> Database
-    auto open = jsi::Function::createFromHostFunction(
-        rt,
-        jsi::PropNameID::forAscii(rt, "open"),
-        1, // min args
-        [](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
-            if (count < 1) {
-                throw jsi::JSError(rt, "open() requires an options object or path string");
-            }
-
-            std::string path;
-
-            // Accept either a string path or an options object
-            if (args[0].isString()) {
-                path = args[0].asString(rt).utf8(rt);
-            } else if (args[0].isObject()) {
-                jsi::Object options = args[0].asObject(rt);
-
-                if (!options.hasProperty(rt, "name")) {
-                    throw jsi::JSError(rt, "open() options must have a 'name' property");
+        // open(options) -> Database
+        auto open = jsi::Function::createFromHostFunction(
+            rt,
+            jsi::PropNameID::forAscii(rt, "open"),
+            1, // min args
+            [](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value
+            {
+                if (count < 1)
+                {
+                    throw jsi::JSError(rt, "open() requires an options object or path string");
                 }
 
-                path = options.getProperty(rt, "name").asString(rt).utf8(rt);
-            } else {
-                throw jsi::JSError(rt, "open() requires an options object or path string");
-            }
+                std::string path;
 
-            // Create the database host object
-            auto db = std::make_shared<DBHostObject>(path, g_basePath);
-            return jsi::Object::createFromHostObject(rt, db);
-        }
-    );
+                // Accept either a string path or an options object
+                if (args[0].isString())
+                {
+                    path = args[0].asString(rt).utf8(rt);
+                }
+                else if (args[0].isObject())
+                {
+                    jsi::Object options = args[0].asObject(rt);
 
-    // version() -> string
-    auto version = jsi::Function::createFromHostFunction(
-        rt,
-        jsi::PropNameID::forAscii(rt, "version"),
-        0,
-        [](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
-            const char *ver = turso_version();
-            return jsi::String::createFromUtf8(rt, ver);
-        }
-    );
+                    if (!options.hasProperty(rt, "name"))
+                    {
+                        throw jsi::JSError(rt, "open() options must have a 'name' property");
+                    }
 
-    module.setProperty(rt, "open", std::move(open));
-    module.setProperty(rt, "version", std::move(version));
+                    path = options.getProperty(rt, "name").asString(rt).utf8(rt);
+                }
+                else
+                {
+                    throw jsi::JSError(rt, "open() requires an options object or path string");
+                }
 
-    // Install as global __TursoProxy
-    rt.global().setProperty(rt, "__TursoProxy", std::move(module));
-}
+                // Create the database host object
+                auto db = std::make_shared<DBHostObject>(path, g_basePath);
+                return jsi::Object::createFromHostObject(rt, db);
+            });
+
+        // version() -> string
+        auto version = jsi::Function::createFromHostFunction(
+            rt,
+            jsi::PropNameID::forAscii(rt, "version"),
+            0,
+            [](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value
+            {
+                const char *ver = turso_version();
+                return jsi::String::createFromUtf8(rt, ver);
+            });
+
+        module.setProperty(rt, "open", std::move(open));
+        module.setProperty(rt, "version", std::move(version));
+
+        // Install as global __TursoProxy
+        rt.global().setProperty(rt, "__TursoProxy", std::move(module));
+    }
+
+    // TODO: implement invalidation logic
+    void invalidate() {}
 
 } // namespace turso

@@ -1,42 +1,50 @@
-#include <jni.h>
-#include <jsi/jsi.h>
+#include "TursoHostObject.h"
+#include "logs.h"
 #include <ReactCommon/CallInvokerHolder.h>
 #include <fbjni/fbjni.h>
+#include <jni.h>
+#include <jsi/jsi.h>
+#include <typeinfo>
 
-#include "TursoHostObject.h"
+namespace jsi = facebook::jsi;
+namespace react = facebook::react;
+namespace jni = facebook::jni;
 
-using namespace facebook;
+// This file is not using raw jni but rather fbjni, do not change how the native
+// functions are registered
+// https://github.com/facebookincubator/fbjni/blob/main/docs/quickref.md
+struct TursoBridge : jni::JavaClass<TursoBridge>
+{
+    static constexpr auto kJavaDescriptor = "Lcom/turso/reactnative/TursoBridge;";
 
-extern "C" JNIEXPORT void JNICALL
-Java_com_turso_reactnative_TursoModule_nativeInstall(
-    JNIEnv *env,
-    jobject thiz,
-    jlong jsiRuntimePtr,
-    jobject jsCallInvokerHolder,
-    jstring dbPath
-) {
-    auto *runtime = reinterpret_cast<jsi::Runtime *>(jsiRuntimePtr);
-    if (runtime == nullptr) {
-        return;
+    static void registerNatives()
+    {
+        javaClassStatic()->registerNatives(
+            {makeNativeMethod("installNativeJsi", TursoBridge::installNativeJsi),
+             makeNativeMethod("clearStateNativeJsi", TursoBridge::clearStateNativeJsi)});
     }
 
-    // Get the call invoker
-    auto callInvokerHolder = jni::make_local(
-        reinterpret_cast<react::CallInvokerHolder::javaobject>(jsCallInvokerHolder)
-    );
-    auto callInvoker = callInvokerHolder->cthis()->getCallInvoker();
+private:
+    static void installNativeJsi(
+        jni::alias_ref<jni::JObject> thiz, jlong jsiRuntimePtr,
+        jni::alias_ref<react::CallInvokerHolder::javaobject> jsCallInvokerHolder,
+        jni::alias_ref<jni::JString> dbPath)
+    {
+        auto jsiRuntime = reinterpret_cast<jsi::Runtime *>(jsiRuntimePtr);
+        auto jsCallInvoker = jsCallInvokerHolder->cthis()->getCallInvoker();
+        std::string dbPathStr = dbPath->toStdString();
 
-    // Get the database path
-    const char *pathCStr = env->GetStringUTFChars(dbPath, nullptr);
-    std::string path(pathCStr);
-    env->ReleaseStringUTFChars(dbPath, pathCStr);
+        turso::install(*jsiRuntime, jsCallInvoker, dbPathStr.c_str());
+    }
 
-    // Install the Turso module
-    turso::install(*runtime, callInvoker, path.c_str());
-}
+    static void clearStateNativeJsi(jni::alias_ref<jni::JObject> thiz)
+    {
+        turso::invalidate();
+    }
+};
 
-extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *reserved) {
-    return jni::initialize(vm, [] {
-        // Register native methods if needed
-    });
+JNIEXPORT jint JNI_OnLoad(JavaVM *vm, void *)
+{
+    return jni::initialize(vm, []
+                           { TursoBridge::registerNatives(); });
 }
