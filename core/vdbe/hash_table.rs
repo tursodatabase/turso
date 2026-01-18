@@ -8,7 +8,7 @@ use crate::{
     error::LimboError,
     io::{Buffer, Completion, TempFile, IO},
     io_yield_one,
-    storage::sqlite3_ondisk::{read_varint, write_varint},
+    storage::sqlite3_ondisk::{read_varint, varint_len, write_varint},
     translate::collate::CollationSeq,
     turso_assert,
     types::{IOCompletions, IOResult, Value, ValueRef},
@@ -21,6 +21,14 @@ use std::{cell::RefCell, collections::VecDeque};
 use turso_macros::AtomicEnum;
 
 const DEFAULT_SEED: u64 = 1337;
+
+// Memory overhead constants for accurate size accounting
+/// Vec<T> header: pointer (8) + len (8) + capacity (8)
+const VEC_HEADER_BYTES: usize = 24;
+/// Text struct: Cow<str> (16) + TextSubtype (1) + padding (~15 for alignment)
+const TEXT_STRUCT_BYTES: usize = 32;
+/// HashEntry base: hash (8) + rowid (8) + 2×Vec headers (48) + padding (8)
+const HASH_ENTRY_BASE_BYTES: usize = 72;
 
 // set to a *very* small 32KB, intentionally to trigger frequent spilling during tests
 #[cfg(debug_assertions)]
@@ -40,6 +48,15 @@ const INT_HASH: u8 = 1;
 const FLOAT_HASH: u8 = 2;
 const TEXT_HASH: u8 = 3;
 const BLOB_HASH: u8 = 4;
+
+#[inline]
+/// Hash text case-insensitively without allocation (ASCII-only for SQLite NOCASE).
+/// SQLite's NOCASE collation only considers ASCII case, so to_ascii_lowercase() is correct.
+fn hash_text_nocase(hasher: &mut impl Hasher, text: &str) {
+    for byte in text.bytes() {
+        hasher.write_u8(byte.to_ascii_lowercase());
+    }
+}
 
 /// Hash function for join keys using rapidhash
 /// Takes collation into account when hashing text values
@@ -74,8 +91,7 @@ fn hash_join_key(key_values: &[ValueRef], collations: &[CollationSeq]) -> u64 {
                 hasher.write_u8(TEXT_HASH);
                 match collation {
                     CollationSeq::NoCase => {
-                        let lowercase = text.as_str().to_lowercase();
-                        hasher.write(lowercase.as_bytes());
+                        hash_text_nocase(&mut hasher, text.as_str());
                     }
                     CollationSeq::Rtrim => {
                         let trimmed = text.as_str().trim_end();
@@ -229,6 +245,7 @@ impl HashEntry {
     }
 
     /// Get the size of this entry in bytes (approximate).
+    /// Accounts for Vec headers, Text struct overhead, and alignment padding.
     fn size_bytes(&self) -> usize {
         Self::size_from_values(&self.key_values, &self.payload_values)
     }
@@ -238,12 +255,101 @@ impl HashEntry {
             Value::Null => 1,
             Value::Integer(_) => 8,
             Value::Float(_) => 8,
-            Value::Text(t) => t.as_str().len(),
-            Value::Blob(b) => b.len(),
+            Value::Text(t) => TEXT_STRUCT_BYTES + t.as_str().len(),
+            Value::Blob(b) => VEC_HEADER_BYTES + b.len(),
         };
-        let key_size: usize = key_values.iter().map(value_size).sum();
-        let payload_size: usize = payload_values.iter().map(value_size).sum();
-        key_size + payload_size + 8 + 8 // +8 for hash, +8 for rowid
+        let key_size: usize = self.key_values.iter().map(value_size).sum();
+        let payload_size: usize = self.payload_values.iter().map(value_size).sum();
+        HASH_ENTRY_BASE_BYTES + key_size + payload_size
+    }
+
+    /// Calculate the serialized size of a single Value.
+    #[inline]
+    fn value_serialized_size(v: &Value) -> usize {
+        1 + match v {
+            Value::Null => 0,
+            Value::Integer(_) | Value::Float(_) => 8,
+            Value::Text(t) => {
+                let len = t.as_str().len();
+                varint_len(len as u64) + len
+            }
+            Value::Blob(b) => varint_len(b.len() as u64) + b.len(),
+        }
+    }
+
+    /// Calculate the exact serialized size of this entry.
+    fn serialized_size(&self) -> usize {
+        8 + 8 // hash + rowid
+            + varint_len(self.key_values.len() as u64)
+            + self.key_values.iter().map(Self::value_serialized_size).sum::<usize>()
+            + varint_len(self.payload_values.len() as u64)
+            + self.payload_values.iter().map(Self::value_serialized_size).sum::<usize>()
+    }
+
+    /// Serialize this entry directly to a slice, returns bytes written.
+    /// The caller must ensure the slice is large enough (use serialized_size()).
+    fn serialize_to_slice(&self, buf: &mut [u8]) -> usize {
+        let mut offset = 0;
+
+        // Write hash and rowid
+        buf[offset..offset + 8].copy_from_slice(&self.hash.to_le_bytes());
+        offset += 8;
+        buf[offset..offset + 8].copy_from_slice(&self.rowid.to_le_bytes());
+        offset += 8;
+
+        // Write number of keys and key values
+        offset += write_varint(&mut buf[offset..], self.key_values.len() as u64);
+        for value in &self.key_values {
+            offset += Self::serialize_value_to_slice(value, &mut buf[offset..]);
+        }
+
+        // Write number of payload values and payload values
+        offset += write_varint(&mut buf[offset..], self.payload_values.len() as u64);
+        for value in &self.payload_values {
+            offset += Self::serialize_value_to_slice(value, &mut buf[offset..]);
+        }
+
+        offset
+    }
+
+    /// Helper to serialize a single Value directly to a slice. Returns bytes written.
+    #[inline]
+    fn serialize_value_to_slice(value: &Value, buf: &mut [u8]) -> usize {
+        let mut offset = 0;
+        match value {
+            Value::Null => {
+                buf[offset] = NULL_HASH;
+                offset += 1;
+            }
+            Value::Integer(i) => {
+                buf[offset] = INT_HASH;
+                offset += 1;
+                buf[offset..offset + 8].copy_from_slice(&i.to_le_bytes());
+                offset += 8;
+            }
+            Value::Float(f) => {
+                buf[offset] = FLOAT_HASH;
+                offset += 1;
+                buf[offset..offset + 8].copy_from_slice(&f.to_le_bytes());
+                offset += 8;
+            }
+            Value::Text(t) => {
+                buf[offset] = TEXT_HASH;
+                offset += 1;
+                let bytes = t.as_str().as_bytes();
+                offset += write_varint(&mut buf[offset..], bytes.len() as u64);
+                buf[offset..offset + bytes.len()].copy_from_slice(bytes);
+                offset += bytes.len();
+            }
+            Value::Blob(b) => {
+                buf[offset] = BLOB_HASH;
+                offset += 1;
+                offset += write_varint(&mut buf[offset..], b.len() as u64);
+                buf[offset..offset + b.len()].copy_from_slice(b);
+                offset += b.len();
+            }
+        }
+        offset
     }
 
     /// Serialize this entry to bytes for disk storage.
@@ -1140,6 +1246,7 @@ impl HashTable {
     }
 
     /// Spill the given partition buffer to disk and return the pending completion.
+    /// Uses single-pass serialization directly into the I/O buffer to avoid intermediate copies.
     fn spill_partition(&mut self, partition_idx: usize) -> Result<Option<Completion>> {
         let spill_state = self.spill_state.as_mut().expect("Spill state must exist");
         let partition = &spill_state.partition_buffers[partition_idx];
@@ -1147,22 +1254,28 @@ impl HashTable {
             return Ok(None);
         }
 
-        // Serialize entries from partition buffer
-        let estimated_size: usize = partition.entries.iter().map(|e| e.size_bytes() + 9).sum();
-        let mut serialized_data = Vec::with_capacity(estimated_size);
-        let mut len_buf = [0u8; 9];
-        let mut entry_buf = Vec::new();
-
+        // Calculate exact total size needed
+        let mut total_size = 0usize;
         for entry in &partition.entries {
-            entry.serialize(&mut entry_buf);
-            let len_varint_size = write_varint(&mut len_buf, entry_buf.len() as u64);
-            serialized_data.extend_from_slice(&len_buf[..len_varint_size]);
-            serialized_data.extend_from_slice(&entry_buf);
-            entry_buf.clear();
+            let entry_size = entry.serialized_size();
+            total_size += varint_len(entry_size as u64) + entry_size;
         }
 
+        // Allocate I/O buffer directly and serialize into it
+        let buffer = Buffer::new_temporary(total_size);
+        let buf = buffer.as_mut_slice();
+        let mut offset = 0;
+
+        for entry in &partition.entries {
+            let entry_size = entry.serialized_size();
+            offset += write_varint(&mut buf[offset..], entry_size as u64);
+            offset += entry.serialize_to_slice(&mut buf[offset..]);
+        }
+
+        turso_assert!(offset == total_size, "serialized size mismatch");
+
         let file_offset = spill_state.next_spill_offset;
-        let data_size = serialized_data.len();
+        let data_size = total_size;
         let num_entries = spill_state.partition_buffers[partition_idx].entries.len();
         let mem_freed = spill_state.partition_buffers[partition_idx].mem_used;
 
@@ -1182,8 +1295,6 @@ impl HashTable {
 
         io_state.set(SpillIOState::WaitingForWrite);
 
-        let buffer = Buffer::new_temporary(data_size);
-        buffer.as_mut_slice().copy_from_slice(&serialized_data);
         let buffer_ref = Arc::new(buffer);
         let _buffer_ref_clone = buffer_ref.clone();
         let write_complete = Box::new(move |res: Result<i32, crate::CompletionError>| match res {
@@ -2043,6 +2154,55 @@ mod hashtests {
     }
 
     #[test]
+    fn test_serialize_to_slice_matches_serialize() {
+        // Test that serialize_to_slice produces identical output to serialize
+        let entry = HashEntry::new_with_payload(
+            12345,
+            vec![
+                Value::Integer(42),
+                Value::Text("hello world".to_string().into()),
+                Value::Null,
+                Value::Float(std::f64::consts::PI),
+            ],
+            100,
+            vec![Value::Blob(vec![1, 2, 3, 4, 5]), Value::Integer(-999)],
+        );
+
+        // Serialize using the Vec-based method
+        let mut vec_buf = Vec::new();
+        entry.serialize(&mut vec_buf);
+
+        // Serialize using the slice-based method
+        let size = entry.serialized_size();
+        assert_eq!(
+            size,
+            vec_buf.len(),
+            "serialized_size must match actual size"
+        );
+
+        let mut slice_buf = vec![0u8; size];
+        let written = entry.serialize_to_slice(&mut slice_buf);
+        assert_eq!(written, size, "bytes written must match serialized_size");
+
+        // Both methods must produce identical output
+        assert_eq!(
+            vec_buf, slice_buf,
+            "serialize and serialize_to_slice must produce identical output"
+        );
+
+        // Verify the output is valid by deserializing
+        let (deserialized, consumed) = HashEntry::deserialize(&slice_buf).unwrap();
+        assert_eq!(consumed, size);
+        assert_eq!(deserialized.hash, entry.hash);
+        assert_eq!(deserialized.rowid, entry.rowid);
+        assert_eq!(deserialized.key_values.len(), entry.key_values.len());
+        assert_eq!(
+            deserialized.payload_values.len(),
+            entry.payload_values.len()
+        );
+    }
+
+    #[test]
     fn test_partition_from_hash() {
         // Test partition distribution
         let mut counts = [0usize; NUM_PARTITIONS];
@@ -2105,6 +2265,30 @@ mod hashtests {
         let h1_nc = hash_join_key(&keys1, &nocase_coll);
         let h2_nc = hash_join_key(&keys2, &nocase_coll);
         assert_eq!(h1_nc, h2_nc);
+    }
+
+    #[test]
+    fn test_hash_nocase_preserves_non_ascii() {
+        use crate::types::{TextRef, TextSubtype};
+
+        // SQLite NOCASE only affects ASCII a-z/A-Z.
+        // Non-ASCII characters like ü should hash identically regardless of case conversion.
+        let keys1 = vec![ValueRef::Text(TextRef::new("über", TextSubtype::Text))];
+        let keys2 = vec![ValueRef::Text(TextRef::new("ÜBER", TextSubtype::Text))];
+
+        // Under NOCASE: ASCII portion differs (b/B), so hashes should differ
+        // (because SQLite NOCASE doesn't handle Unicode case folding)
+        let nocase_coll = vec![CollationSeq::NoCase];
+        let h1 = hash_join_key(&keys1, &nocase_coll);
+        let h2 = hash_join_key(&keys2, &nocase_coll);
+
+        // The 'b' and 'B' will be lowercased to 'b', but the 'ü' and 'Ü' are not
+        // ASCII so they remain as-is. Since ü != Ü at byte level, hashes will differ.
+        // This is correct SQLite NOCASE behavior (ASCII-only case folding).
+        assert_ne!(
+            h1, h2,
+            "non-ASCII chars should not be case-folded by NOCASE"
+        );
     }
 
     #[test]
