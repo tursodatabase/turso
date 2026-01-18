@@ -1,5 +1,10 @@
 pluginManagement {
     includeBuild('../node_modules/@react-native/gradle-plugin')
+    repositories {
+        google()
+        mavenCentral()
+        gradlePluginPortal()
+    }
 }
 
 plugins {
@@ -8,6 +13,14 @@ plugins {
 
 extensions.configure(com.facebook.react.ReactSettingsExtension) { ex ->
     ex.autolinkLibrariesFromCommand()
+}
+
+dependencyResolutionManagement {
+    repositoriesMode.set(RepositoriesMode.PREFER_SETTINGS)
+    repositories {
+        google()
+        mavenCentral()
+    }
 }
 
 rootProject.name = 'TursoExample'

@@ -1,19 +1,6 @@
-buildscript {
-    ext {
-        buildToolsVersion = "34.0.0"
-        minSdkVersion = 24
-        compileSdkVersion = 34
-        targetSdkVersion = 34
-        ndkVersion = "26.1.10909125"
-        kotlinVersion = "1.9.22"
-        hermesEnabled = true
-    }
-    repositories {
-        google()
-        mavenCentral()
-    }
-    dependencies {
-        classpath("com.android.tools.build:gradle:8.2.1")
-        classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:$kotlinVersion")
-    }
+plugins {
+    id "com.android.application" version "8.2.1" apply false
+    id "com.android.library" version "8.2.1" apply false
+    id "org.jetbrains.kotlin.android" version "1.9.22" apply false
+    id "com.facebook.react" version "0.76.0" apply false
 }
