@@ -164,3 +164,8 @@ harness = false
 name = "sql_functions"
 harness = false
 required-features = ["bench"]
+
+[[bench]]
+name = "hash_spill_benchmark"
+harness = false
+required-features = ["bench"]
