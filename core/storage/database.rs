@@ -121,10 +121,8 @@ impl DatabaseStorage for DatabaseFile {
                 let decrypt_complete =
                     Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
                         let Ok((buf, bytes_read)) = res else {
-                            let err = res.unwrap_err();
-                            tracing::error!(err = ?err);
-                            original_c.error(err);
-                            return Some(err);
+                            tracing::error!(err = ?res.unwrap_err());
+                            return None;
                         };
                         assert!(
                             bytes_read > 0,
@@ -161,10 +159,7 @@ impl DatabaseStorage for DatabaseFile {
                 let verify_complete =
                     Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
                         let Ok((buf, bytes_read)) = res else {
-                            let err = res.unwrap_err();
-                            tracing::error!(err = ?err);
-                            original_c.error(err);
-                            return Some(err);
+                            return None;
                         };
                         if bytes_read <= 0 {
                             tracing::trace!("Read page {page_idx} with {} bytes", bytes_read);

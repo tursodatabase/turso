@@ -378,117 +378,6 @@ impl Default for DatabaseHeader {
     }
 }
 
-/// Raw database header parsed from bytes without decryption.
-/// This is used to read header fields (which are NOT encrypted) before
-/// setting up encryption context.
-///
-/// For encrypted databases:
-/// - Bytes 0-15: Turso header ("Turso" + version + cipher_id + unused)
-/// - Bytes 16-100: NOT encrypted (same as unencrypted DBs)
-///
-/// For unencrypted databases:
-/// - Bytes 0-15: SQLite magic ("SQLite format 3\0")
-/// - Bytes 16-100: Standard header fields
-#[derive(Debug, Clone)]
-pub struct RawDatabaseHeader {
-    /// Whether the database is encrypted (has Turso header)
-    pub is_encrypted: bool,
-    /// Cipher ID from Turso header (only valid if is_encrypted)
-    pub cipher_id: u8,
-    /// Page size from bytes 16-17
-    pub page_size: PageSize,
-    /// Read version from byte 18
-    pub read_version: RawVersion,
-    /// Write version from byte 19
-    pub write_version: RawVersion,
-    /// Reserved space bytes from byte 20
-    pub reserved_space: u8,
-    /// Autovacuum largest root page from bytes 52-55
-    pub vacuum_mode_largest_root_page: u32,
-    /// Incremental vacuum enabled from bytes 64-67
-    pub incremental_vacuum_enabled: u32,
-}
-
-const TURSO_MAGIC: &[u8; 5] = b"Turso";
-const SQLITE_MAGIC: &[u8; 16] = b"SQLite format 3\0";
-
-impl RawDatabaseHeader {
-    /// Parse a raw database header from bytes.
-    /// The buffer must be at least 100 bytes (DatabaseHeader::SIZE).
-    /// If `expect_encrypted` is true, we assume the database is encrypted even if magic bytes
-    /// are corrupted. This allows decryption to properly fail with authentication errors.
-    pub fn from_bytes(buf: &[u8]) -> Result<Self> {
-        Self::from_bytes_with_encryption_hint(buf, false)
-    }
-
-    pub fn from_bytes_with_encryption_hint(buf: &[u8], expect_encrypted: bool) -> Result<Self> {
-        if buf.len() < DatabaseHeader::SIZE {
-            return Err(LimboError::Corrupt(format!(
-                "Header buffer too small: {} bytes, need at least {}",
-                buf.len(),
-                DatabaseHeader::SIZE
-            )));
-        }
-
-        // Check for Turso magic (encrypted) vs SQLite magic (unencrypted)
-        let turso_magic_matches = buf[0..5] == *TURSO_MAGIC;
-        let sqlite_magic_matches = buf[0..16] == *SQLITE_MAGIC;
-
-        // Determine if encrypted based on magic bytes or hint
-        let is_encrypted = if turso_magic_matches {
-            true
-        } else if sqlite_magic_matches {
-            false
-        } else if expect_encrypted {
-            // Magic bytes corrupted, but caller expects encryption - assume encrypted
-            // and let decryption fail with proper authentication error
-            true
-        } else {
-            // Not a database file
-            return Err(LimboError::NotADB);
-        };
-
-        let cipher_id = if is_encrypted { buf[6] } else { 0 };
-
-        // Parse page size from bytes 16-17 (big-endian u16)
-        let page_size_raw = u16::from_be_bytes([buf[16], buf[17]]);
-        let page_size = PageSize::new_from_header_u16(page_size_raw)?;
-
-        // Parse versions from bytes 18-19
-        let read_version = RawVersion(buf[18]);
-        let write_version = RawVersion(buf[19]);
-
-        // Parse reserved space from byte 20
-        let reserved_space = buf[20];
-
-        // Parse autovacuum fields (bytes 52-55 and 64-67, big-endian u32)
-        let vacuum_mode_largest_root_page =
-            u32::from_be_bytes([buf[52], buf[53], buf[54], buf[55]]);
-        let incremental_vacuum_enabled = u32::from_be_bytes([buf[64], buf[65], buf[66], buf[67]]);
-
-        Ok(Self {
-            is_encrypted,
-            cipher_id,
-            page_size,
-            read_version,
-            write_version,
-            reserved_space,
-            vacuum_mode_largest_root_page,
-            incremental_vacuum_enabled,
-        })
-    }
-
-    /// Check if the database has autovacuum enabled
-    pub fn is_autovacuumed(&self) -> bool {
-        self.vacuum_mode_largest_root_page > 0 || self.incremental_vacuum_enabled > 0
-    }
-
-    /// Check if incremental vacuum is enabled
-    pub fn is_incremental_vacuum(&self) -> bool {
-        self.incremental_vacuum_enabled > 0
-    }
-}
-
 pub const WAL_HEADER_SIZE: usize = 32;
 pub const WAL_FRAME_HEADER_SIZE: usize = 24;
 // magic is a single number represented as WAL_MAGIC_LE but the big endian
@@ -644,9 +533,8 @@ pub fn begin_read_page(
     let buf = Arc::new(buf);
     let complete = Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
         let Ok((buf, bytes_read)) = res else {
-            let err = res.unwrap_err();
             page.clear_locked();
-            return Some(err); // Propagate the error
+            return None; // IO error already captured in completion
         };
         let buf_len = buf.len();
         // Handle truncated database files: if we read fewer bytes than expected

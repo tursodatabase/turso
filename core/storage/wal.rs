@@ -1294,11 +1294,10 @@ impl Wal for WalFile {
         let shared_file = self.shared.clone();
         let complete = Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
             let Ok((buf, bytes_read)) = res else {
-                let err = res.unwrap_err();
-                tracing::error!(err = ?err);
+                tracing::error!(err = ?res.unwrap_err());
                 page.clear_locked();
                 page.clear_wal_tag();
-                return Some(err); // Return the error so it can be propagated
+                return None; // IO error already captured in completion
             };
             let buf_len = buf.len();
             if bytes_read != buf_len as i32 {
