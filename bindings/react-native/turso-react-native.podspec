@@ -29,7 +29,8 @@ Pod::Spec.new do |s|
       "$(PODS_TARGET_SRCROOT)/libs/ios"
     ].join(" "),
     "OTHER_LDFLAGS" => "-lc++",
-    "DEFINES_MODULE" => "YES"
+    "DEFINES_MODULE" => "YES",
+    "GCC_PRECOMPILE_PREFIX_HEADER" => "NO"
   }
 
   # User header search paths for consumers
