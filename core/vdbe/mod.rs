@@ -390,6 +390,8 @@ pub struct ProgramState {
     pub(crate) bloom_filters: HashMap<usize, BloomFilter>,
     op_hash_build_state: Option<OpHashBuildState>,
     op_hash_probe_state: Option<OpHashProbeState>,
+    /// Scratch buffer for [Insn::HashDistinct] to avoid per-row allocations.
+    distinct_key_values: Vec<Value>,
     hash_tables: HashMap<usize, HashTable>,
     uses_subjournal: bool,
     pub n_change: AtomicI64,
@@ -456,6 +458,7 @@ impl ProgramState {
             op_no_conflict_state: OpNoConflictState::Start,
             op_hash_build_state: None,
             op_hash_probe_state: None,
+            distinct_key_values: Vec::new(),
             seek_state: OpSeekState::Start,
             current_collation: None,
             op_column_state: OpColumnState::Start,
@@ -572,6 +575,7 @@ impl ProgramState {
         self.hash_tables.clear();
         self.op_hash_build_state = None;
         self.op_hash_probe_state = None;
+        self.distinct_key_values.clear();
         self.n_change.store(0, Ordering::SeqCst);
         *self.explain_state.write() = ExplainState::default();
     }

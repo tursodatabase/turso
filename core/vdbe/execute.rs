@@ -25,7 +25,7 @@ use crate::util::{
     trim_ascii_whitespace,
 };
 use crate::vdbe::affinity::{apply_numeric_affinity, try_for_float, Affinity, ParsedNumber};
-use crate::vdbe::hash_table::{HashEntry, HashTable, HashTableConfig};
+use crate::vdbe::hash_table::{HashEntry, HashTable, HashTableConfig, DEFAULT_MEM_BUDGET};
 use crate::vdbe::insn::InsertFlags;
 use crate::vdbe::value::ComparisonOp;
 use crate::vdbe::{
@@ -53,6 +53,7 @@ use crate::{
 };
 use crate::{get_cursor, CheckpointMode, Completion, Connection, DatabaseStorage, IOExt, MvCursor};
 use either::Either;
+use smallvec::SmallVec;
 use std::any::Any;
 use std::env::temp_dir;
 use std::str::FromStr;
@@ -10475,6 +10476,49 @@ pub fn op_hash_build(
     Ok(InsnFunctionStepResult::Step)
 }
 
+pub fn op_hash_distinct(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(HashDistinct { data }, insn);
+
+    let hash_table = state
+        .hash_tables
+        .entry(data.hash_table_id)
+        .or_insert_with(|| {
+            let config = HashTableConfig {
+                initial_buckets: 1024,
+                mem_budget: DEFAULT_MEM_BUDGET,
+                num_keys: data.num_keys,
+                collations: data.collations.clone(),
+            };
+            HashTable::new(config, pager.io.clone())
+        });
+
+    let key_values = &mut state.distinct_key_values;
+    key_values.clear();
+    for i in 0..data.num_keys {
+        let reg = &state.registers[data.key_start_reg + i];
+        key_values.push(reg.get_value().clone());
+    }
+
+    let mut key_refs: SmallVec<[ValueRef; 2]> = SmallVec::with_capacity(data.num_keys);
+    key_refs.extend(key_values.iter().map(|v| v.as_ref()));
+    match hash_table.insert_distinct(key_values, &key_refs)? {
+        IOResult::Done(inserted) => {
+            state.pc = if inserted {
+                state.pc + 1
+            } else {
+                data.target_pc.as_offset_int()
+            };
+            Ok(InsnFunctionStepResult::Step)
+        }
+        IOResult::IO(io) => Ok(InsnFunctionStepResult::IO(io)),
+    }
+}
+
 pub fn op_hash_build_finalize(
     _program: &Program,
     state: &mut ProgramState,
@@ -10675,6 +10719,20 @@ pub fn op_hash_close(
     load_insn!(HashClose { hash_table_id }, insn);
     if let Some(mut hash_table) = state.hash_tables.remove(hash_table_id) {
         hash_table.close();
+    }
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+pub fn op_hash_clear(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(HashClear { hash_table_id }, insn);
+    if let Some(hash_table) = state.hash_tables.get_mut(hash_table_id) {
+        hash_table.clear();
     }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)

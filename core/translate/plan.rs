@@ -7,7 +7,7 @@ use crate::{
     function::AggFunc,
     schema::{BTreeTable, ColDef, Column, FromClauseSubquery, Index, Schema, Table},
     translate::{
-        collate::get_collseq_from_expr,
+        collate::{get_collseq_from_expr, CollationSeq},
         emitter::UpdateRowSource,
         expr::as_binary_components,
         expression_index::{normalize_expr_for_index_matching, single_table_column_usage},
@@ -17,7 +17,7 @@ use crate::{
     vdbe::{
         affinity::Affinity,
         builder::{CursorKey, CursorType, ProgramBuilder},
-        insn::{to_u16, IdxInsertFlags, Insn},
+        insn::{HashDistinctData, Insn},
         BranchOffset, CursorID,
     },
     Result, VirtualTable,
@@ -393,10 +393,10 @@ impl Distinctness {
 /// Translation context for handling DISTINCT columns.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DistinctCtx {
-    /// The cursor ID for the ephemeral index opened for the purpose of deduplicating results.
-    pub cursor_id: usize,
-    /// The index name for the ephemeral index, needed to lookup the cursor ID.
-    pub ephemeral_index_name: String,
+    /// Hash table id used to deduplicate results.
+    pub hash_table_id: usize,
+    /// Collations for each distinct key column.
+    pub collations: Vec<CollationSeq>,
     /// The label for the on conflict branch.
     /// When a duplicate is found, the program will jump to the offset this label points to.
     pub label_on_conflict: BranchOffset,
@@ -409,26 +409,14 @@ impl DistinctCtx {
         num_regs: usize,
         start_reg: usize,
     ) {
-        program.emit_insn(Insn::Found {
-            cursor_id: self.cursor_id,
-            target_pc: self.label_on_conflict,
-            record_reg: start_reg,
-            num_regs,
-        });
-        let record_reg = program.alloc_register();
-        program.emit_insn(Insn::MakeRecord {
-            start_reg: to_u16(start_reg),
-            count: to_u16(num_regs),
-            dest_reg: to_u16(record_reg),
-            index_name: Some(self.ephemeral_index_name.to_string()),
-            affinity_str: None,
-        });
-        program.emit_insn(Insn::IdxInsert {
-            cursor_id: self.cursor_id,
-            record_reg,
-            unpacked_start: None,
-            unpacked_count: None,
-            flags: IdxInsertFlags::new(),
+        program.emit_insn(Insn::HashDistinct {
+            data: Box::new(HashDistinctData {
+                hash_table_id: self.hash_table_id,
+                key_start_reg: start_reg,
+                num_keys: num_regs,
+                collations: self.collations.clone(),
+                target_pc: self.label_on_conflict,
+            }),
         });
     }
 }
