@@ -40,14 +40,7 @@ Pod::Spec.new do |s|
   # Build script to compile Rust
   s.script_phase = {
     :name => "Build Turso Rust Library",
-    :script => <<-SCRIPT
-      set -e
-      cd "${PODS_TARGET_SRCROOT}"
-      if [ ! -f "libs/ios/libturso_sync_sdk_kit.a" ]; then
-        echo "Building Rust library for iOS..."
-        ./scripts/build-rust-ios.sh
-      fi
-    SCRIPT,
+    :script => 'set -e; cd "${PODS_TARGET_SRCROOT}"; if [ ! -f "libs/ios/libturso_sync_sdk_kit.a" ]; then echo "Building Rust library for iOS..."; ./scripts/build-rust-ios.sh; fi',
     :execution_position => :before_compile,
     :shell_path => "/bin/bash"
   }
