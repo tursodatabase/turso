@@ -50,8 +50,6 @@ android {
 
     packagingOptions {
         pickFirst '**/libc++_shared.so'
-        pickFirst '**/libjsi.so'
-        pickFirst '**/libfbjni.so'
     }
 }
 

@@ -59,8 +59,6 @@ android {
 
     packaging {
         pickFirst "**/libc++_shared.so"
-        pickFirst "**/libjsi.so"
-        pickFirst "**/libfbjni.so"
     }
 }
 
@@ -70,7 +68,7 @@ repositories {
 }
 
 dependencies {
-    implementation "com.facebook.react:react-android"
+    compileOnly "com.facebook.react:react-android"
 }
 
 // Task to build Rust library for Android
