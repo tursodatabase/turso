@@ -388,8 +388,12 @@ impl HashEntry {
                         "HashEntry: buffer too small for text".to_string(),
                     ));
                 }
-                let s = String::from_utf8(buf[offset..offset + str_len as usize].to_vec())
-                    .map_err(|_| LimboError::Corrupt("Invalid UTF-8 in text".to_string()))?;
+                // SAFETY: We serialized this data ourselves, so it should be valid UTF-8.
+                // Skipping validation here for performance in the spill/reload path.
+                // Doing checked utf8 construction here is a massive performance hit.
+                let s = unsafe {
+                    String::from_utf8_unchecked(buf[offset..offset + str_len as usize].to_vec())
+                };
                 offset += str_len as usize;
                 Value::Text(s.into())
             }
