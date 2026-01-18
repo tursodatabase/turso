@@ -35,6 +35,7 @@ set_target_properties(turso_sdk_kit PROPERTIES
 # Link libraries
 target_link_libraries(${PROJECT_NAME}
     ReactAndroid::jsi
+    ReactAndroid::reactnative
     fbjni::fbjni
     turso_sdk_kit
     android
