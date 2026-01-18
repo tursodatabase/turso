@@ -1,0 +1,36 @@
+# Node
+node_modules/
+lib/
+
+# Built Rust libraries
+libs/
+
+# iOS
+ios/Pods/
+*.xcworkspace
+*.xcuserdata
+
+# Android
+android/build/
+android/.gradle/
+android/.cxx/
+*.apk
+*.aab
+*.dex
+*.class
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*

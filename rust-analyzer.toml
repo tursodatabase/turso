@@ -1,0 +1,67 @@
+# rust-analyzer configuration for optimal performance in this large workspace
+# See https://rust-analyzer.github.io/manual.html#configuration
+
+[cargo]
+# Use a separate target directory to avoid conflicts with manual builds
+# and allow rust-analyzer to cache independently
+targetDir = "target/rust-analyzer"
+
+# Only check the workspace, not dependencies (much faster)
+buildScripts.invocationStrategy = "once"
+
+# Limit features to reduce analysis scope
+allTargets = false
+
+[check]
+# Use cargo check instead of clippy for faster feedback
+command = "check"
+
+# Only check the library target, not tests/benches/examples by default
+allTargets = false
+
+# Limit to workspace members only
+workspace = true
+
+[procMacro]
+# Enable proc macros but with optimized settings
+enable = true
+
+# Proc macro server attributes - limit memory
+attributes.enable = true
+
+[diagnostics]
+# Disable some expensive diagnostics
+experimental.enable = false
+
+[completion]
+# Limit completion candidates for faster response
+limit = 100
+
+[hover]
+# Simplify hover info
+actions.references.enable = false
+
+[inlayHints]
+# Disable inlay hints for performance (they require full analysis)
+# Enable selectively if needed
+closureReturnTypeHints.enable = "never"
+lifetimeElisionHints.enable = "never"
+reborrowHints.enable = "never"
+closureCaptureHints.enable = false
+discriminantHints.enable = "never"
+expressionAdjustmentHints.enable = "never"
+implicitDrops.enable = false
+rangeExclusiveHints.enable = false
+
+[lens]
+# Disable code lenses (run/debug buttons) - expensive to compute
+enable = false
+
+[semanticHighlighting]
+# Punctuation highlighting is expensive
+punctuation.enable = false
+punctuation.specialization.enable = false
+
+[workspace]
+# Ignore heavy directories that don't need analysis
+symbol.search.scope = "workspace"
