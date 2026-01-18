@@ -249,7 +249,7 @@ impl Parser {
             if let Some(backend) = backend_qualifier {
                 if overrides.contains_key(&backend) {
                     return Err(
-                        self.error(format!("duplicate expect block for backend '{}'", backend))
+                        self.error(format!("duplicate expect block for backend '{backend}'"))
                     );
                 }
                 overrides.insert(backend, expectation);
@@ -529,7 +529,7 @@ impl Parser {
                     message: format!("duplicate test name: {}", test.name),
                     span: Some(SourceSpan::new(
                         test.name_span.start.into(),
-                        test.name_span.len().into(),
+                        test.name_span.len(),
                     )),
                     help: Some(format!("First defined at offset {}", first_span.start)),
                 });

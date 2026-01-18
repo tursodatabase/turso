@@ -79,7 +79,7 @@ impl OutputFormat for PrettyOutput {
                     self.outcome_colored(&result.outcome),
                     result.name,
                     duration_str.dimmed(),
-                    format!("({})", reason).dimmed()
+                    format!("({reason})").dimmed()
                 );
             }
         }
@@ -116,7 +116,7 @@ impl OutputFormat for PrettyOutput {
                 match &result.outcome {
                     TestOutcome::Failed { reason } => {
                         for line in reason.lines() {
-                            println!("   {}", line);
+                            println!("   {line}");
                         }
                     }
                     TestOutcome::Error { message } => {

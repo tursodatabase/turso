@@ -38,14 +38,14 @@ pub async fn load_test_files(paths: &[PathBuf]) -> Result<LoadedTests, BackendEr
             let pattern_str = pattern.to_string_lossy();
 
             for entry in glob::glob(&pattern_str)
-                .map_err(|e| BackendError::Execute(format!("invalid glob pattern: {}", e)))?
+                .map_err(|e| BackendError::Execute(format!("invalid glob pattern: {e}")))?
             {
                 match entry {
                     Ok(file_path) => {
                         load_single_file(&file_path, &mut files, &mut errors).await;
                     }
                     Err(e) => {
-                        return Err(BackendError::Execute(format!("glob error: {}", e)));
+                        return Err(BackendError::Execute(format!("glob error: {e}")));
                     }
                 }
             }
@@ -78,7 +78,7 @@ async fn load_single_file(
                             readonly: false,
                         },
                         outcome: TestOutcome::Error {
-                            message: format!("parse error: {}", e),
+                            message: format!("parse error: {e}"),
                         },
                         duration: Duration::ZERO,
                     }],
@@ -97,7 +97,7 @@ async fn load_single_file(
                         readonly: false,
                     },
                     outcome: TestOutcome::Error {
-                        message: format!("read error: {}", e),
+                        message: format!("read error: {e}"),
                     },
                     duration: Duration::ZERO,
                 }],
@@ -337,7 +337,7 @@ impl<B: SqlBackend + 'static> TestRunner<B> {
                             readonly: false,
                         },
                         outcome: TestOutcome::Error {
-                            message: format!("task panicked: {}", e),
+                            message: format!("task panicked: {e}"),
                         },
                         duration: Duration::ZERO,
                     });
@@ -417,7 +417,7 @@ impl<B: SqlBackend + 'static> TestRunner<B> {
                         readonly: false,
                     },
                     outcome: TestOutcome::Error {
-                        message: format!("task panicked: {}", e),
+                        message: format!("task panicked: {e}"),
                     },
                     duration: Duration::ZERO,
                 },
@@ -486,7 +486,7 @@ async fn run_single_test<B: SqlBackend>(
                 file: file_path,
                 database: db_config,
                 outcome: TestOutcome::Error {
-                    message: format!("failed to create database: {}", e),
+                    message: format!("failed to create database: {e}"),
                 },
                 duration: start.elapsed(),
             };
@@ -532,7 +532,7 @@ async fn run_single_test<B: SqlBackend>(
                 file: file_path,
                 database: db_config,
                 outcome: TestOutcome::Error {
-                    message: format!("execution failed: {}", e),
+                    message: format!("execution failed: {e}"),
                 },
                 duration: start.elapsed(),
             };
