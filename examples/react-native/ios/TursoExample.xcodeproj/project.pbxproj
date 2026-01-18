@@ -7,13 +7,11 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
-		022AA638EE144393ADDCAEC0 /* sample.sqlite in Resources */ = {isa = PBXBuildFile; fileRef = 96FD9FD0FC4F4540AC7A9CE6 /* sample.sqlite */; };
 		13B07FBF1A68108700A75B9A /* Images.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 13B07FB51A68108700A75B9A /* Images.xcassets */; };
 		55C40F8AA9DF83E899E3CDAC /* libPods-TursoExample.a in Frameworks */ = {isa = PBXBuildFile; fileRef = D9241EC58491DCDC9B61B00F /* libPods-TursoExample.a */; };
 		701A4E312E5B08E700AC0D29 /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 701A4E302E5B08E500AC0D29 /* AppDelegate.swift */; };
 		81AB9BB82411601600AC10FF /* LaunchScreen.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = 81AB9BB72411601600AC10FF /* LaunchScreen.storyboard */; };
 		92B54B8E74B0B43081C567EF /* PrivacyInfo.xcprivacy in Resources */ = {isa = PBXBuildFile; fileRef = 2C08DBE2BF8FD676ED5D600B /* PrivacyInfo.xcprivacy */; };
-		AC1DF06E9759460CAA51B7B1 /* sample2.sqlite in Resources */ = {isa = PBXBuildFile; fileRef = 9218E48CFB1F478CAC374D68 /* sample2.sqlite */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -26,8 +24,6 @@
 		701A4E302E5B08E500AC0D29 /* AppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppDelegate.swift; sourceTree = "<group>"; };
 		701A4E322E5B08EA00AC0D29 /* TursoExample-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "TursoExample-Bridging-Header.h"; sourceTree = "<group>"; };
 		81AB9BB72411601600AC10FF /* LaunchScreen.storyboard */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = file.storyboard; name = LaunchScreen.storyboard; path = TursoExample/LaunchScreen.storyboard; sourceTree = "<group>"; };
-		9218E48CFB1F478CAC374D68 /* sample2.sqlite */ = {isa = PBXFileReference; explicitFileType = undefined; fileEncoding = 9; includeInIndex = 0; lastKnownFileType = unknown; name = sample2.sqlite; path = ../assets/sqlite/sample2.sqlite; sourceTree = "<group>"; };
-		96FD9FD0FC4F4540AC7A9CE6 /* sample.sqlite */ = {isa = PBXFileReference; explicitFileType = undefined; fileEncoding = 9; includeInIndex = 0; lastKnownFileType = unknown; name = sample.sqlite; path = ../assets/sample.sqlite; sourceTree = "<group>"; };
 		D9241EC58491DCDC9B61B00F /* libPods-TursoExample.a */ = {isa = PBXFileReference; explicitFileType = archive.ar; includeInIndex = 0; path = "libPods-TursoExample.a"; sourceTree = BUILT_PRODUCTS_DIR; };
 		ED297162215061F000B7C4FE /* JavaScriptCore.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = JavaScriptCore.framework; path = System/Library/Frameworks/JavaScriptCore.framework; sourceTree = SDKROOT; };
 /* End PBXFileReference section */
@@ -94,15 +90,6 @@
 				13B07F961A680F5B00A75B9A /* TursoExample.app */,
 			);
 			name = Products;
-			sourceTree = "<group>";
-		};
-		A9BA4AF2CBC44B9BB28B8ABA /* Resources */ = {
-			isa = PBXGroup;
-			children = (
-				96FD9FD0FC4F4540AC7A9CE6 /* sample.sqlite */,
-				9218E48CFB1F478CAC374D68 /* sample2.sqlite */,
-			);
-			name = Resources;
 			sourceTree = "<group>";
 		};
 		BBD78D7AC51CEA395F1C20DB /* Pods */ = {
@@ -177,8 +164,6 @@
 			files = (
 				81AB9BB82411601600AC10FF /* LaunchScreen.storyboard in Resources */,
 				13B07FBF1A68108700A75B9A /* Images.xcassets in Resources */,
-				022AA638EE144393ADDCAEC0 /* sample.sqlite in Resources */,
-				AC1DF06E9759460CAA51B7B1 /* sample2.sqlite in Resources */,
 				92B54B8E74B0B43081C567EF /* PrivacyInfo.xcprivacy in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
