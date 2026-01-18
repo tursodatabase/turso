@@ -18,17 +18,22 @@ Pod::Spec.new do |s|
     "cpp/**/*.{h,hpp,cpp}"
   ]
 
-  # Vendored Rust static library
-  s.vendored_libraries = "libs/ios/libturso_sync_sdk_kit.a"
+  # Vendored Rust static libraries (separate for device and simulator)
+  s.vendored_libraries = [
+    "libs/ios/libturso_sync_sdk_kit_device.a",
+    "libs/ios/libturso_sync_sdk_kit_sim.a"
+  ]
 
-  # Header search paths
+  # Header search paths and conditional linking
   s.pod_target_xcconfig = {
     "CLANG_CXX_LANGUAGE_STANDARD" => "c++20",
     "HEADER_SEARCH_PATHS" => [
       "$(PODS_TARGET_SRCROOT)/cpp",
       "$(PODS_TARGET_SRCROOT)/libs/ios"
     ].join(" "),
-    "OTHER_LDFLAGS" => "-lc++",
+    "OTHER_LDFLAGS[sdk=iphoneos*]" => "-lc++ -lturso_sync_sdk_kit_device",
+    "OTHER_LDFLAGS[sdk=iphonesimulator*]" => "-lc++ -lturso_sync_sdk_kit_sim",
+    "LIBRARY_SEARCH_PATHS" => "$(PODS_TARGET_SRCROOT)/libs/ios",
     "DEFINES_MODULE" => "YES",
     "GCC_PRECOMPILE_PREFIX_HEADER" => "NO"
   }
@@ -41,7 +46,7 @@ Pod::Spec.new do |s|
   # Build script to compile Rust
   s.script_phase = {
     :name => "Build Turso Rust Library",
-    :script => 'set -e; cd "${PODS_TARGET_SRCROOT}"; if [ ! -f "libs/ios/libturso_sync_sdk_kit.a" ]; then echo "Building Rust library for iOS..."; ./scripts/build-rust-ios.sh; fi',
+    :script => 'set -e; cd "${PODS_TARGET_SRCROOT}"; if [ ! -f "libs/ios/libturso_sync_sdk_kit_sim.a" ] || [ ! -f "libs/ios/libturso_sync_sdk_kit_device.a" ]; then echo "Building Rust library for iOS..."; ./scripts/build-rust-ios.sh; fi',
     :execution_position => :before_compile,
     :shell_path => "/bin/bash"
   }
