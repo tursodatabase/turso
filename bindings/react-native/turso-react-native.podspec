@@ -18,22 +18,31 @@ Pod::Spec.new do |s|
     "cpp/**/*.{h,hpp,cpp}"
   ]
 
-  # Header search paths and conditional linking for Rust library
+  # Keep the libraries available
+  s.preserve_paths = [
+    "libs/ios/libturso_sync_sdk_kit_device.a",
+    "libs/ios/libturso_sync_sdk_kit_sim.a"
+  ]
+
+  # Header search paths
   s.pod_target_xcconfig = {
     "CLANG_CXX_LANGUAGE_STANDARD" => "c++20",
     "HEADER_SEARCH_PATHS" => [
       "$(PODS_TARGET_SRCROOT)/cpp",
       "$(PODS_TARGET_SRCROOT)/libs/ios"
     ].join(" "),
-    "OTHER_LDFLAGS[sdk=iphoneos*]" => "-lc++ -force_load $(PODS_TARGET_SRCROOT)/libs/ios/libturso_sync_sdk_kit_device.a",
-    "OTHER_LDFLAGS[sdk=iphonesimulator*]" => "-lc++ -force_load $(PODS_TARGET_SRCROOT)/libs/ios/libturso_sync_sdk_kit_sim.a",
+    "OTHER_LDFLAGS" => "-lc++",
     "DEFINES_MODULE" => "YES",
     "GCC_PRECOMPILE_PREFIX_HEADER" => "NO"
   }
 
-  # User header search paths for consumers
+  # Link the correct Rust library based on SDK (applied to the app target)
   s.user_target_xcconfig = {
-    "HEADER_SEARCH_PATHS" => "$(PODS_ROOT)/turso-react-native/cpp $(PODS_ROOT)/turso-react-native/libs/ios"
+    "HEADER_SEARCH_PATHS" => "$(PODS_ROOT)/turso-react-native/cpp $(PODS_ROOT)/turso-react-native/libs/ios",
+    "LIBRARY_SEARCH_PATHS[sdk=iphoneos*]" => "$(PODS_ROOT)/turso-react-native/libs/ios",
+    "LIBRARY_SEARCH_PATHS[sdk=iphonesimulator*]" => "$(PODS_ROOT)/turso-react-native/libs/ios",
+    "OTHER_LDFLAGS[sdk=iphoneos*]" => "-force_load $(PODS_ROOT)/turso-react-native/libs/ios/libturso_sync_sdk_kit_device.a",
+    "OTHER_LDFLAGS[sdk=iphonesimulator*]" => "-force_load $(PODS_ROOT)/turso-react-native/libs/ios/libturso_sync_sdk_kit_sim.a"
   }
 
   # Build script to compile Rust
