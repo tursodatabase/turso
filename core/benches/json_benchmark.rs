@@ -14,7 +14,7 @@ use turso_core::{Database, PlatformIO};
 // Title: JSONB Function Benchmarking
 
 fn rusqlite_open() -> rusqlite::Connection {
-    let sqlite_conn = rusqlite::Connection::open("../testing/testing.db").unwrap();
+    let sqlite_conn = rusqlite::Connection::open("../testing/system/testing.db").unwrap();
     sqlite_conn
         .pragma_update(None, "locking_mode", "EXCLUSIVE")
         .unwrap();
@@ -27,7 +27,7 @@ fn bench(criterion: &mut Criterion) {
 
     #[allow(clippy::arc_with_non_send_sync)]
     let io = Arc::new(PlatformIO::new().unwrap());
-    let db = Database::open_file(io.clone(), "../testing/testing.db").unwrap();
+    let db = Database::open_file(io.clone(), "../testing/system/testing.db").unwrap();
     let limbo_conn = db.connect().unwrap();
 
     // Benchmark JSONB with different payload sizes
@@ -495,7 +495,7 @@ fn bench_sequential_jsonb(criterion: &mut Criterion) {
 
     #[allow(clippy::arc_with_non_send_sync)]
     let io = Arc::new(PlatformIO::new().unwrap());
-    let db = Database::open_file(io.clone(), "../testing/testing.db").unwrap();
+    let db = Database::open_file(io.clone(), "../testing/system/testing.db").unwrap();
     let limbo_conn = db.connect().unwrap();
 
     // Select a subset of JSON payloads to use in the sequential test
@@ -651,7 +651,7 @@ fn bench_json_patch(criterion: &mut Criterion) {
 
     #[allow(clippy::arc_with_non_send_sync)]
     let io = Arc::new(PlatformIO::new().unwrap());
-    let db = Database::open_file(io.clone(), "../testing/testing.db").unwrap();
+    let db = Database::open_file(io.clone(), "../testing/system/testing.db").unwrap();
     let limbo_conn = db.connect().unwrap();
 
     let json_patch_cases = [
