@@ -14,7 +14,7 @@ from cli_tests.console import error, info, test
 from cli_tests.test_turso_cli import TestTursoShell
 
 LIMBO_BIN = Path("./target/release/tursodb")
-DB_FILE = Path("testing/temp.db")
+DB_FILE = Path("testing/system/temp.db")
 vfs_list = ["syscall"]
 if platform.system() == "Linux":
     vfs_list.append("io_uring")
@@ -51,7 +51,7 @@ def setup_temp_db() -> None:
     # make sure we start fresh, otherwise we could end up with
     # one having to checkpoint the others from the previous run
     cleanup_temp_db()
-    cmd = ["sqlite3", "testing/testing.db", ".clone testing/temp.db"]
+    cmd = ["sqlite3", "testing/system/testing.db", ".clone testing/system/temp.db"]
     proc = subprocess.run(cmd, check=True)
     proc.check_returncode()
     sleep(0.3)  # make sure it's finished
