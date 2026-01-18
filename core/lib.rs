@@ -61,7 +61,7 @@ use crate::stats::refresh_analyze_stats;
 use crate::storage::checksum::CHECKSUM_REQUIRED_RESERVED_BYTES;
 use crate::storage::encryption::AtomicCipherMode;
 use crate::storage::journal_mode;
-use crate::storage::pager::{self, AutoVacuumMode, HeaderRef, HeaderRefMut};
+use crate::storage::pager::{self, AutoVacuumMode, HeaderRefMut};
 use crate::storage::sqlite3_ondisk::{RawVersion, Version};
 use crate::sync::{
     atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU16, AtomicUsize, Ordering},
@@ -100,7 +100,7 @@ use storage::database::DatabaseFile;
 pub use storage::database::IOContext;
 pub use storage::encryption::{CipherMode, EncryptionContext, EncryptionKey};
 use storage::page_cache::PageCache;
-use storage::sqlite3_ondisk::PageSize;
+use storage::sqlite3_ondisk::{PageSize, RawDatabaseHeader};
 pub use storage::{
     buffer_pool::BufferPool,
     database::DatabaseStorage,
@@ -273,7 +273,12 @@ pub struct Database {
     /// In Memory Page 1 for Empty Dbs
     init_page_1: Arc<ArcSwapOption<Page>>,
 
-    // Encryption
+    /// Whether this database is encrypted (has Turso header).
+    /// Used for cache bypass check - we don't cache encrypted databases.
+    is_encrypted: AtomicBool,
+
+    // Encryption key and cipher mode for setting up encryption on new pagers.
+    // These are used by init_pager() to create encrypted pagers for subsequent connections.
     encryption_key: RwLock<Option<EncryptionKey>>,
     encryption_cipher_mode: AtomicCipherMode,
 }
@@ -343,7 +348,7 @@ impl Database {
         wal_path: impl Into<String>,
         io: &Arc<dyn IO>,
         db_file: Arc<dyn DatabaseStorage>,
-        encryption_opts: Option<EncryptionOpts>,
+        encryption_opts: Option<&EncryptionOpts>,
     ) -> Result<Self> {
         let shared_wal = WalFileShared::new_noop();
         let mv_store = ArcSwapOption::empty();
@@ -358,14 +363,16 @@ impl Database {
             BufferPool::DEFAULT_ARENA_SIZE
         };
 
-        let (encryption_key, encryption_cipher_mode) =
-            if let Some(encryption_opts) = encryption_opts {
-                let key = EncryptionKey::from_hex_string(&encryption_opts.hexkey)?;
-                let cipher = CipherMode::try_from(encryption_opts.cipher.as_str())?;
-                (Some(key), Some(cipher))
-            } else {
-                (None, None)
-            };
+        // Determine if encryption is requested and extract key/cipher if provided.
+        // These will be used by init_pager() to set up encryption on new pagers.
+        let is_encrypted = encryption_opts.is_some();
+        let (encryption_key, encryption_cipher_mode) = if let Some(enc_opts) = encryption_opts {
+            let key = EncryptionKey::from_hex_string(&enc_opts.hexkey)?;
+            let cipher = CipherMode::try_from(enc_opts.cipher.as_str())?;
+            (Some(key), Some(cipher))
+        } else {
+            (None, None)
+        };
 
         let init_page_1 = if db_size == 0 {
             let default_page_1 = pager::default_page1(encryption_cipher_mode.as_ref());
@@ -393,6 +400,8 @@ impl Database {
             n_connections: AtomicUsize::new(0),
 
             init_page_1: Arc::new(ArcSwapOption::new(init_page_1)),
+
+            is_encrypted: AtomicBool::new(is_encrypted),
 
             encryption_key: RwLock::new(encryption_key),
             encryption_cipher_mode: AtomicCipherMode::new(
@@ -470,8 +479,19 @@ impl Database {
             .unwrap_or_else(|| path.to_string());
 
         if let Some(db) = registry.get(&canonical_path).and_then(Weak::upgrade) {
-            tracing::debug!("took database {canonical_path:?} from the registry");
-            return Ok(db);
+            // When encryption is involved, we cannot safely reuse the cached database
+            // because the encryption key might be different. The encryption context is
+            // set during initial open and cannot be changed afterwards.
+            if encryption_opts.is_some() || db.is_encrypted.load(Ordering::SeqCst) {
+                tracing::debug!(
+                    "database {canonical_path:?} found in registry but encryption involved, creating new instance"
+                );
+                // Remove from registry since we're creating a new instance
+                registry.remove(&canonical_path);
+            } else {
+                tracing::debug!("took database {canonical_path:?} from the registry");
+                return Ok(db);
+            }
         }
         let db = Self::open_with_flags_bypass_registry_internal(
             io,
@@ -525,10 +545,29 @@ impl Database {
             wal_path,
             &io,
             db_file,
-            encryption_opts.clone(),
+            encryption_opts.as_ref(),
         )?;
 
+        // header_validation() reads headers using raw bytes (no decryption needed)
+        // and creates a pager WITHOUT encryption set up
         let pager = db.header_validation()?;
+
+        // Now set up encryption on the pager if encryption_opts was provided.
+        // This must happen AFTER header_validation but BEFORE schema parsing.
+        if let Some(ref enc_opts) = encryption_opts {
+            let key = EncryptionKey::from_hex_string(&enc_opts.hexkey)?;
+            let cipher = CipherMode::try_from(enc_opts.cipher.as_str())?;
+
+            // For new databases, set the reserved bytes based on cipher's metadata size
+            // (for existing databases, this was already read from the header)
+            if pager.get_reserved_space().is_none() {
+                pager.set_reserved_space_bytes(cipher.metadata_size() as u8);
+            }
+
+            pager.enable_encryption(true);
+            pager.set_encryption_context(cipher, &key)?;
+        }
+
         #[cfg(debug_assertions)]
         {
             let wal_enabled = db.shared_wal.read().enabled.load(Ordering::SeqCst);
@@ -543,7 +582,7 @@ impl Database {
 
         // Check: https://github.com/tursodatabase/turso/pull/1761#discussion_r2154013123
 
-        // parse schema
+        // parse schema - pager now has encryption set up if needed
         let conn = db._connect(false, Some(pager.clone()))?;
         let syms = conn.syms.read();
         let pager = conn.pager.load();
@@ -578,38 +617,34 @@ impl Database {
         Ok(db)
     }
 
-    /// Necessary Pager initialization, so that we are prepared to read from Page 1
+    /// Necessary Pager initialization, so that we are prepared to read from Page 1.
+    /// NOTE: This creates a pager WITHOUT encryption context set up. Encryption context
+    /// should be set up separately after header validation by the caller.
+    /// However, the pager's `enable_encryption` flag IS set from opts.enable_encryption
+    /// to allow PRAGMA hexkey/cipher to work.
     fn _init(&self) -> Result<Pager> {
-        let pager = self.init_pager(None)?;
-        pager.enable_encryption(self.opts.enable_encryption);
-
-        // Start read transaction before reading page 1 to acquire a read lock
-        // that prevents concurrent checkpoints from truncating the WAL
-        pager.begin_read_tx()?;
-
-        // Read header within the read transaction, ensuring cleanup on error
-        let result = (|| -> Result<AutoVacuumMode> {
-            let header_ref = pager.io.block(|| HeaderRef::from_pager(&pager))?;
-            let header = header_ref.borrow();
-
-            let mode = if header.vacuum_mode_largest_root_page.get() > 0 {
-                if header.incremental_vacuum_enabled.get() > 0 {
+        // Read autovacuum mode from raw header (no decryption needed - header bytes 16-100 are not encrypted)
+        let mode = if self.initialized() {
+            let raw_header = self.read_raw_header()?;
+            if raw_header.is_autovacuumed() {
+                if raw_header.is_incremental_vacuum() {
                     AutoVacuumMode::Incremental
                 } else {
                     AutoVacuumMode::Full
                 }
             } else {
                 AutoVacuumMode::None
-            };
+            }
+        } else {
+            // New database, no autovacuum
+            AutoVacuumMode::None
+        };
 
-            Ok(mode)
-        })();
-
-        // Always end read transaction, even on error
-        pager.end_read_tx();
-
-        let mode = result?;
-
+        let pager = self.init_pager(None)?;
+        // Enable encryption feature flag from database options.
+        // This allows PRAGMA hexkey/cipher to work. The actual encryption context
+        // is set separately when encryption_opts is provided to open, or via PRAGMA.
+        pager.enable_encryption(self.opts.enable_encryption);
         pager.set_auto_vacuum_mode(mode);
 
         Ok(pager)
@@ -617,64 +652,83 @@ impl Database {
 
     /// Checks the Version numbers in the DatabaseHeader, and changes it according to the required options
     ///
-    /// Will also open MVStore and WAL if needed
+    /// Will also open MVStore and WAL if needed.
+    /// NOTE: This creates a pager WITHOUT encryption. Encryption should be set up
+    /// by the caller after this function returns.
     fn header_validation(&mut self) -> Result<Arc<Pager>> {
         let wal_exists = journal_mode::wal_exists(std::path::Path::new(&self.wal_path));
         let log_exists = journal_mode::logical_log_exists(std::path::Path::new(&self.path));
         let is_readonly = self.open_flags.contains(OpenFlags::ReadOnly);
 
+        // For initialized databases, read header info from raw bytes.
+        // Header fields at bytes 16-100 are NOT encrypted, so this works for both
+        // encrypted and unencrypted databases.
+        let (raw_header, read_version, open_mv_store) = if self.initialized() {
+            let raw_header = self.read_raw_header()?;
+
+            // Validate versions match
+            if raw_header.read_version != raw_header.write_version {
+                return Err(LimboError::Corrupt(format!(
+                    "Read version `{:?}` is not equal to Write version `{:?}` in database header",
+                    raw_header.read_version, raw_header.write_version
+                )));
+            }
+
+            let read_version = raw_header
+                .read_version
+                .to_version()
+                .map_err(|val| LimboError::Corrupt(format!("Invalid read_version: {val}")))?;
+
+            // Determine if we should open in MVCC mode based on the database header version
+            let open_mv_store = matches!(read_version, Version::Mvcc);
+
+            // Check autovacuum
+            if raw_header.is_autovacuumed() && !self.opts.enable_autovacuum {
+                tracing::warn!(
+                    "Database has autovacuum enabled but --experimental-autovacuum flag is not set. Opening in readonly mode."
+                );
+                self.open_flags |= OpenFlags::ReadOnly;
+            }
+
+            // Update is_encrypted based on what we read from the file
+            // (in case it wasn't set during Database::new for reopened DBs)
+            if raw_header.is_encrypted {
+                self.is_encrypted.store(true, Ordering::SeqCst);
+            }
+
+            (Some(raw_header), read_version, open_mv_store)
+        } else {
+            // New database - no header to read
+            (None, Version::Wal, false)
+        };
+
         let mut pager = self._init()?;
         assert!(pager.wal.is_none(), "Pager should have no WAL yet");
 
-        let is_autovacuumed_db = self.io.block(|| {
-            pager.with_header(|header| {
-                header.vacuum_mode_largest_root_page.get() > 0
-                    || header.incremental_vacuum_enabled.get() > 0
-            })
-        })?;
-
-        if is_autovacuumed_db && !self.opts.enable_autovacuum {
-            tracing::warn!(
-                        "Database has autovacuum enabled but --experimental-autovacuum flag is not set. Opening in readonly mode."
-                    );
-            self.open_flags |= OpenFlags::ReadOnly;
-        }
-
-        let header: HeaderRefMut = self.io.block(|| HeaderRefMut::from_pager(&pager))?;
-        let header_mut = header.borrow_mut();
-        let (read_version, write_version) = { (header_mut.read_version, header_mut.write_version) };
-        // TODO: right now we don't support READ ONLY and no READ or WRITE in the Version header
-        // https://www.sqlite.org/fileformat.html#file_format_version_numbers
-        if read_version != write_version {
-            return Err(LimboError::Corrupt(format!(
-                "Read version `{read_version:?}` is not equal to Write version `{write_version:?} in database header`"
-            )));
-        }
-
-        let (read_version, _write_version) = (
-            read_version
-                .to_version()
-                .map_err(|val| LimboError::Corrupt(format!("Invalid read_version: {val}")))?,
-            write_version
-                .to_version()
-                .map_err(|val| LimboError::Corrupt(format!("Invalid write_version: {val}")))?,
-        );
-
-        // Determine if we should open in MVCC mode based on the database header version
-        // MVCC is controlled only by the database header (set via PRAGMA journal_mode)
-        let open_mv_store = matches!(read_version, Version::Mvcc);
-
-        // Now check the Header Version to see which mode the DB file really is on
-        // Track if header was modified so we can write it to disk
+        // Handle Legacy to WAL conversion (only for unencrypted databases)
+        // Encrypted databases are always WAL mode.
         let header_modified = match read_version {
             Version::Legacy => {
                 if is_readonly {
                     tracing::warn!("Database {} is opened in readonly mode, cannot convert Legacy mode to WAL. Running in Legacy mode.", self.path);
                     false
+                } else if raw_header.as_ref().is_some_and(|h| h.is_encrypted) {
+                    // Encrypted databases should never be in Legacy mode
+                    return Err(LimboError::Corrupt(
+                        "Encrypted database has Legacy version, which is invalid".to_string(),
+                    ));
                 } else {
-                    // Convert Legacy to WAL mode
+                    // Convert Legacy to WAL mode - need to use pager to modify header
+                    let header: HeaderRefMut =
+                        self.io.block(|| HeaderRefMut::from_pager(&pager))?;
+                    let header_mut = header.borrow_mut();
                     header_mut.read_version = RawVersion::from(Version::Wal);
                     header_mut.write_version = RawVersion::from(Version::Wal);
+
+                    // Write modified header back
+                    let completion =
+                        storage::sqlite3_ondisk::begin_write_btree_page(&pager, header.page())?;
+                    self.io.wait_for_completion(completion)?;
                     true
                 }
             }
@@ -710,15 +764,10 @@ impl Database {
             (false, false) => {}
         };
 
-        // If header was modified, write it directly to disk before we clear the cache
-        // This must happen before WAL is attached since we need to write directly to the DB file
+        // Clear page cache if header was modified
         if header_modified {
-            let completion =
-                storage::sqlite3_ondisk::begin_write_btree_page(&pager, header.page())?;
-            self.io.wait_for_completion(completion)?;
+            pager.clear_page_cache(true);
         }
-
-        drop(header);
 
         let flags = self.open_flags;
 
@@ -776,8 +825,11 @@ impl Database {
             .unwrap_or_default()
             .get();
 
+        // Copy encryption key and cipher from Database to Connection.
+        // This allows connections to use PRAGMA to modify their own encryption settings
+        // while inheriting the default from the Database.
         let encryption_key = self.encryption_key.read().clone();
-        let encrytion_cipher = self.encryption_cipher_mode.get();
+        let encryption_cipher = self.encryption_cipher_mode.get();
 
         let conn = Arc::new(Connection {
             db: self.clone(),
@@ -804,8 +856,8 @@ impl Database {
             nestedness: AtomicI32::new(0),
             compiling_triggers: RwLock::new(Vec::new()),
             executing_triggers: RwLock::new(Vec::new()),
-            encryption_key: RwLock::new(encryption_key.clone()),
-            encryption_cipher_mode: AtomicCipherMode::new(encrytion_cipher),
+            encryption_key: RwLock::new(encryption_key),
+            encryption_cipher_mode: AtomicCipherMode::new(encryption_cipher),
             sync_mode: AtomicSyncMode::new(SyncMode::Full),
             data_sync_retry: AtomicBool::new(false),
             busy_handler: RwLock::new(BusyHandler::None),
@@ -864,6 +916,31 @@ impl Database {
         Ok(reserved_bytes)
     }
 
+    /// Read the raw database header without decryption.
+    /// This reads the first 100 bytes of the database file and parses them.
+    /// The header fields (bytes 16-100) are NOT encrypted, so this works
+    /// for both encrypted and unencrypted databases.
+    fn read_raw_header(&self) -> Result<RawDatabaseHeader> {
+        turso_assert!(
+            self.initialized(),
+            "read_raw_header called on uninitialized database"
+        );
+        turso_assert!(
+            PageSize::MIN % 512 == 0,
+            "header read must be a multiple of 512 for O_DIRECT"
+        );
+        let buf = Arc::new(Buffer::new_temporary(PageSize::MIN as usize));
+        let c = new_header_read_completion(buf.clone());
+        let c = self.db_file.read_header(c)?;
+        self.io.wait_for_completion(c)?;
+
+        // If encryption_opts were provided during open, use that as a hint.
+        // This allows corrupted magic bytes to be handled by decryption (which will fail
+        // with proper authentication error) rather than returning "not a database".
+        let expect_encrypted = self.encryption_key.read().is_some();
+        RawDatabaseHeader::from_bytes_with_encryption_hint(buf.as_slice(), expect_encrypted)
+    }
+
     /// Read the page size in order of preference:
     /// 1. From the WAL header if it exists and is initialized
     /// 2. From the database header if the database is initialized
@@ -908,19 +985,13 @@ impl Database {
         }
     }
 
+    /// Creates a pager WITHOUT encryption set up.
+    /// Encryption should be configured separately by the caller after this function returns.
     fn init_pager(&self, requested_page_size: Option<usize>) -> Result<Pager> {
-        let cipher = self.encryption_cipher_mode.get();
-        let encryption_key = self.encryption_key.read();
-        let reserved_bytes = self.maybe_get_reserved_space_bytes()?.or_else(|| {
-            if !matches!(cipher, CipherMode::None) {
-                // For encryption, use the cipher's metadata size
-                Some(cipher.metadata_size() as u8)
-            } else {
-                // For non-encrypted databases, don't set reserved_bytes here.
-                // This allows checksums to be enabled by default (disable_checksums will be false).
-                None
-            }
-        });
+        // For initialized databases, read reserved_bytes from header.
+        // For new databases, reserved_bytes will be set later when encryption is configured.
+        let reserved_bytes = self.maybe_get_reserved_space_bytes()?;
+
         let disable_checksums = if let Some(reserved_bytes) = reserved_bytes {
             // if the required reserved bytes for checksums is not present, disable checksums
             reserved_bytes != CHECKSUM_REQUIRED_RESERVED_BYTES
@@ -964,7 +1035,11 @@ impl Database {
         if disable_checksums {
             pager.reset_checksum_context();
         }
-        // Set encryption later after `disable_checksums` as it may reset the `pager.io_ctx`
+
+        // Set up encryption if key is stored (set during Database::new or via PRAGMA)
+        // This must happen AFTER disable_checksums as it may reset the pager.io_ctx
+        let cipher = self.encryption_cipher_mode.get();
+        let encryption_key = self.encryption_key.read();
         if let Some(encryption_key) = encryption_key.as_ref() {
             pager.enable_encryption(true);
             pager.set_encryption_context(cipher, encryption_key)?;

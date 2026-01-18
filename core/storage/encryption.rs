@@ -728,6 +728,20 @@ impl EncryptionContext {
         new_header.extend_from_slice(&turso_header);
         new_header.extend_from_slice(&page[TURSO_HEADER_SIZE..DatabaseHeader::SIZE]);
 
+        tracing::debug!(
+            "encrypt_page_1 new_header bytes 0-16: {:02x?}",
+            &new_header[..16]
+        );
+        tracing::debug!(
+            "encrypt_page_1 new_header bytes 16-32: {:02x?}",
+            &new_header[16..32]
+        );
+        tracing::debug!(
+            "encrypt_page_1 page_size={}, cipher_mode={:?}",
+            self.page_size,
+            self.cipher_mode
+        );
+
         let payload = &page[DatabaseHeader::SIZE..self.page_size - metadata_size];
         let (encrypted, nonce) = self.encrypt_raw_with_ad(payload, &new_header)?;
 
@@ -761,7 +775,19 @@ impl EncryptionContext {
     fn decrypt_page_1(&self, encrypted_page: &[u8]) -> Result<Vec<u8>> {
         use crate::storage::sqlite3_ondisk::DatabaseHeader;
 
-        tracing::debug!("decrypting page 1");
+        tracing::debug!(
+            "decrypting page 1, page_size={}, cipher_mode={:?}",
+            self.page_size,
+            self.cipher_mode
+        );
+        tracing::debug!(
+            "decrypt_page_1 header bytes 0-16: {:02x?}",
+            &encrypted_page[..16]
+        );
+        tracing::debug!(
+            "decrypt_page_1 header bytes 16-32: {:02x?}",
+            &encrypted_page[16..32]
+        );
         assert_eq!(
             encrypted_page.len(),
             self.page_size,

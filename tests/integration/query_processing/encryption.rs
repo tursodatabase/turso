@@ -92,18 +92,18 @@ fn test_per_page_encryption(tmp_db: TempDatabase) -> anyhow::Result<()> {
         do_flush(&conn, &tmp_db)?;
     }
     {
-        // test connecting to encrypted db using wrong key(key is ending with 77.The correct key is ending with 27).This should panic.
+        // test connecting to encrypted db using wrong key(key is ending with 77.The correct key is ending with 27).
+        // With schema parsing during open, the wrong key causes decryption failure when reading page 1.
         let uri = format!(
             "file:{}?cipher=aegis256&hexkey=b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76377",
             db_path.to_str().unwrap()
         );
-        let (_io, conn) = turso_core::Connection::from_uri(&uri, opts)?;
-        let should_panic = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-            run_query_on_row(&tmp_db, &conn, "SELECT * FROM test", |_row: &Row| {}).unwrap();
+        let should_fail = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+            turso_core::Connection::from_uri(&uri, opts).unwrap();
         }));
         assert!(
-            should_panic.is_err(),
-            "should panic when accessing encrypted DB with wrong key"
+            should_fail.is_err(),
+            "should fail when opening encrypted DB with wrong key"
         );
     }
     {
@@ -242,24 +242,27 @@ fn test_corruption_turso_magic_bytes(tmp_db: TempDatabase) -> anyhow::Result<()>
     }
 
     // try to connect to the corrupted database - this should return a decryption error
+    // With schema parsing during open, the decryption failure happens when opening the database
     {
         let uri = format!(
             "file:{}?cipher=aegis256&hexkey=b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327",
             db_path.to_str().unwrap()
         );
 
-        let (_io, conn) = turso_core::Connection::from_uri(&uri, opts)?;
-        let result = run_query_on_row(&tmp_db, &conn, "SELECT * FROM test", |_row: &Row| {});
+        let result = turso_core::Connection::from_uri(&uri, opts);
 
-        assert!(
-            result.is_err(),
-            "should return error when accessing encrypted DB with corrupted Turso magic bytes"
-        );
-        let err_msg = result.unwrap_err().to_string();
-        assert!(
-            err_msg.contains("Decryption failed"),
-            "error should indicate decryption failure, got: {err_msg}"
-        );
+        match result {
+            Ok(_) => panic!(
+                "should return error when opening encrypted DB with corrupted Turso magic bytes"
+            ),
+            Err(e) => {
+                let err_msg = e.to_string();
+                assert!(
+                    err_msg.contains("Decryption failed"),
+                    "error should indicate decryption failure, got: {err_msg}"
+                );
+            }
+        }
     }
 
     Ok(())
@@ -461,5 +464,149 @@ fn test_turso_header_structure(db: TempDatabase) -> anyhow::Result<()> {
 
         verify_header(db_path.to_str().unwrap(), expected_id, description)?;
     }
+    Ok(())
+}
+
+/// Regression test for database registry caching bug with encryption.
+///
+/// Previously, the DATABASE_MANAGER would cache Database instances by path and return
+/// them on subsequent opens without validating encryption options. This meant:
+/// 1. Open database with correct key -> Database cached with correct encryption_key
+/// 2. Open database with WRONG key -> Cached Database returned, wrong key ignored!
+/// 3. Decryption succeeds because cached Database has correct key
+///
+/// This test ensures that opening with wrong encryption key fails even after
+/// the database has been opened with the correct key (which populates the cache).
+///
+/// Note: This test uses Database::open_file_with_flags directly (like JS bindings do)
+/// rather than Connection::from_uri (which sets encryption via PRAGMA after connect,
+/// accidentally working around the bug).
+#[turso_macros::test]
+fn test_encryption_key_validation_with_cached_database(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    use turso_core::{Database, EncryptionOpts, OpenFlags, PlatformIO};
+
+    let _ = env_logger::try_init();
+    let db_path = tmp_db.path.clone();
+    let db_path_str = db_path.to_str().unwrap();
+
+    let correct_key = "b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327";
+    let wrong_key = "aaaaaaa4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327";
+
+    let io = std::sync::Arc::new(PlatformIO::new()?);
+    let opts = turso_core::DatabaseOpts::new().with_encryption(ENABLE_ENCRYPTION);
+
+    // Step 1: Create encrypted database with correct key
+    {
+        let encryption_opts = Some(EncryptionOpts {
+            cipher: "aegis256".to_string(),
+            hexkey: correct_key.to_string(),
+        });
+
+        let db = Database::open_file_with_flags(
+            io.clone(),
+            db_path_str,
+            OpenFlags::Create,
+            opts,
+            encryption_opts,
+        )?;
+
+        let conn = db.connect()?;
+        conn.execute("CREATE TABLE secret_data (id INTEGER PRIMARY KEY, value TEXT)")?;
+        conn.execute("INSERT INTO secret_data (value) VALUES ('top secret')")?;
+        conn.query("PRAGMA wal_checkpoint(TRUNCATE)")?;
+        do_flush(&conn, &tmp_db)?;
+    }
+
+    // Step 2: Re-open with correct key (this populates the DATABASE_MANAGER cache)
+    {
+        let encryption_opts = Some(EncryptionOpts {
+            cipher: "aegis256".to_string(),
+            hexkey: correct_key.to_string(),
+        });
+
+        let db = Database::open_file_with_flags(
+            io.clone(),
+            db_path_str,
+            OpenFlags::default(),
+            opts,
+            encryption_opts,
+        )?;
+
+        let conn = db.connect()?;
+        let mut row_count = 0;
+        run_query_on_row(&tmp_db, &conn, "SELECT * FROM secret_data", |row: &Row| {
+            assert_eq!(row.get::<String>(1).unwrap(), "top secret");
+            row_count += 1;
+        })?;
+        assert_eq!(row_count, 1, "Should read data with correct key");
+    }
+
+    // Step 3: Try to open with WRONG key - this MUST fail
+    // Before the fix, this would succeed because the cached Database had the correct key
+    {
+        let encryption_opts = Some(EncryptionOpts {
+            cipher: "aegis256".to_string(),
+            hexkey: wrong_key.to_string(),
+        });
+
+        let result = Database::open_file_with_flags(
+            io.clone(),
+            db_path_str,
+            OpenFlags::default(),
+            opts,
+            encryption_opts,
+        );
+
+        match result {
+            Ok(db) => {
+                // Database opened, but query should fail with wrong key
+                let conn = db.connect()?;
+                let query_result =
+                    run_query_on_row(&tmp_db, &conn, "SELECT * FROM secret_data", |_| {});
+
+                assert!(
+                    query_result.is_err(),
+                    "Query should fail with wrong encryption key, but succeeded! \
+                     This indicates the DATABASE_MANAGER cache bypass for encryption is broken."
+                );
+            }
+            Err(e) => {
+                // Database open failed - this is also acceptable
+                let err_msg = e.to_string();
+                assert!(
+                    err_msg.contains("Decryption failed") || err_msg.contains("encryption"),
+                    "Expected decryption error, got: {err_msg}"
+                );
+            }
+        }
+    }
+
+    // Step 4: Verify correct key still works after wrong key attempt
+    {
+        let encryption_opts = Some(EncryptionOpts {
+            cipher: "aegis256".to_string(),
+            hexkey: correct_key.to_string(),
+        });
+
+        let db = Database::open_file_with_flags(
+            io.clone(),
+            db_path_str,
+            OpenFlags::default(),
+            opts,
+            encryption_opts,
+        )?;
+
+        let conn = db.connect()?;
+        let mut row_count = 0;
+        run_query_on_row(&tmp_db, &conn, "SELECT * FROM secret_data", |row: &Row| {
+            assert_eq!(row.get::<String>(1).unwrap(), "top secret");
+            row_count += 1;
+        })?;
+        assert_eq!(
+            row_count, 1,
+            "Should still read data with correct key after wrong key attempt"
+        );
+    }
+
     Ok(())
 }
