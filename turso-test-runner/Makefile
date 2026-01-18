@@ -107,7 +107,7 @@ test-sqlite: build-runner install-sqlite
 # Usage: make convert                    - convert all .test files in ../testing to ./converted
 #        make convert INPUT=path/to/file - convert specific file(s)
 #        make convert OUTPUT=./out       - convert to custom output directory
-INPUT ?= $(ROOT_DIR)/testing
+INPUT ?= $(ROOT_DIR)/testing/system
 OUTPUT ?= ./converted
 convert: build-runner
 	$(TEST_RUNNER) convert -o $(OUTPUT) $(INPUT)

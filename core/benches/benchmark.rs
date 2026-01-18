@@ -20,7 +20,7 @@ use turso_core::{Database, LimboError, PlatformIO, StepResult};
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 fn rusqlite_open() -> rusqlite::Connection {
-    let sqlite_conn = rusqlite::Connection::open("../testing/testing.db").unwrap();
+    let sqlite_conn = rusqlite::Connection::open("../testing/system/testing.db").unwrap();
     sqlite_conn
         .pragma_update(None, "locking_mode", "EXCLUSIVE")
         .unwrap();
@@ -62,10 +62,10 @@ fn bench_open(criterion: &mut Criterion) {
     // The rusqlite benchmark crashes on Mac M1 when using the flamegraph features
     let enable_rusqlite = std::env::var("DISABLE_RUSQLITE_BENCHMARK").is_err();
 
-    if !std::fs::exists("../testing/schema_5k.db").unwrap() {
+    if !std::fs::exists("../testing/system/schema_5k.db").unwrap() {
         #[allow(clippy::arc_with_non_send_sync)]
         let io = Arc::new(PlatformIO::new().unwrap());
-        let db = Database::open_file(io.clone(), "../testing/schema_5k.db").unwrap();
+        let db = Database::open_file(io.clone(), "../testing/system/schema_5k.db").unwrap();
         let conn = db.connect().unwrap();
 
         for i in 0..5000 {
@@ -81,7 +81,7 @@ fn bench_open(criterion: &mut Criterion) {
         b.iter(|| {
             #[allow(clippy::arc_with_non_send_sync)]
             let io = Arc::new(PlatformIO::new().unwrap());
-            let db = Database::open_file(io.clone(), "../testing/schema_5k.db").unwrap();
+            let db = Database::open_file(io.clone(), "../testing/system/schema_5k.db").unwrap();
             let conn = db.connect().unwrap();
             conn.execute("SELECT * FROM table_0").unwrap();
         });
@@ -90,7 +90,7 @@ fn bench_open(criterion: &mut Criterion) {
     if enable_rusqlite {
         group.bench_function(BenchmarkId::new("sqlite_schema", ""), |b| {
             b.iter(|| {
-                let conn = rusqlite::Connection::open("../testing/schema_5k.db").unwrap();
+                let conn = rusqlite::Connection::open("../testing/system/schema_5k.db").unwrap();
                 conn.execute("SELECT * FROM table_0", ()).unwrap();
             });
         });
@@ -104,10 +104,10 @@ fn bench_alter(criterion: &mut Criterion) {
     // The rusqlite benchmark crashes on Mac M1 when using the flamegraph features
     let enable_rusqlite = std::env::var("DISABLE_RUSQLITE_BENCHMARK").is_err();
 
-    if !std::fs::exists("../testing/schema_5k.db").unwrap() {
+    if !std::fs::exists("../testing/system/schema_5k.db").unwrap() {
         #[allow(clippy::arc_with_non_send_sync)]
         let io = Arc::new(PlatformIO::new().unwrap());
-        let db = Database::open_file(io.clone(), "../testing/schema_5k.db").unwrap();
+        let db = Database::open_file(io.clone(), "../testing/system/schema_5k.db").unwrap();
         let conn = db.connect().unwrap();
 
         for i in 0..5000 {
@@ -122,7 +122,7 @@ fn bench_alter(criterion: &mut Criterion) {
     group.bench_function(BenchmarkId::new("limbo_rename_table", ""), |b| {
         #[allow(clippy::arc_with_non_send_sync)]
         let io = Arc::new(PlatformIO::new().unwrap());
-        let db = Database::open_file(io.clone(), "../testing/schema_5k.db").unwrap();
+        let db = Database::open_file(io.clone(), "../testing/system/schema_5k.db").unwrap();
         let conn = db.connect().unwrap();
         b.iter_custom(|iters| {
             (0..iters)
@@ -142,7 +142,7 @@ fn bench_alter(criterion: &mut Criterion) {
 
     if enable_rusqlite {
         group.bench_function(BenchmarkId::new("sqlite_rename_table", ""), |b| {
-            let conn = rusqlite::Connection::open("../testing/schema_5k.db").unwrap();
+            let conn = rusqlite::Connection::open("../testing/system/schema_5k.db").unwrap();
             b.iter_custom(|iters| {
                 (0..iters)
                     .map(|_| {
@@ -167,7 +167,7 @@ fn bench_alter(criterion: &mut Criterion) {
     group.bench_function(BenchmarkId::new("limbo_rename_column", ""), |b| {
         #[allow(clippy::arc_with_non_send_sync)]
         let io = Arc::new(PlatformIO::new().unwrap());
-        let db = Database::open_file(io.clone(), "../testing/schema_5k.db").unwrap();
+        let db = Database::open_file(io.clone(), "../testing/system/schema_5k.db").unwrap();
         let conn = db.connect().unwrap();
         b.iter_custom(|iters| {
             (0..iters)
@@ -187,7 +187,7 @@ fn bench_alter(criterion: &mut Criterion) {
 
     if enable_rusqlite {
         group.bench_function(BenchmarkId::new("sqlite_rename_column", ""), |b| {
-            let conn = rusqlite::Connection::open("../testing/schema_5k.db").unwrap();
+            let conn = rusqlite::Connection::open("../testing/system/schema_5k.db").unwrap();
             b.iter_custom(|iters| {
                 (0..iters)
                     .map(|_| {
@@ -213,7 +213,7 @@ fn bench_alter(criterion: &mut Criterion) {
     group.bench_function(BenchmarkId::new("limbo_add_column", ""), |b| {
         #[allow(clippy::arc_with_non_send_sync)]
         let io = Arc::new(PlatformIO::new().unwrap());
-        let db = Database::open_file(io.clone(), "../testing/schema_5k.db").unwrap();
+        let db = Database::open_file(io.clone(), "../testing/system/schema_5k.db").unwrap();
         let conn = db.connect().unwrap();
         b.iter_custom(|iters| {
             (0..iters)
@@ -233,7 +233,7 @@ fn bench_alter(criterion: &mut Criterion) {
 
     if enable_rusqlite {
         group.bench_function(BenchmarkId::new("sqlite_add_column", ""), |b| {
-            let conn = rusqlite::Connection::open("../testing/schema_5k.db").unwrap();
+            let conn = rusqlite::Connection::open("../testing/system/schema_5k.db").unwrap();
             b.iter_custom(|iters| {
                 (0..iters)
                     .map(|_| {
@@ -258,7 +258,7 @@ fn bench_alter(criterion: &mut Criterion) {
     group.bench_function(BenchmarkId::new("limbo_drop_column", ""), |b| {
         #[allow(clippy::arc_with_non_send_sync)]
         let io = Arc::new(PlatformIO::new().unwrap());
-        let db = Database::open_file(io.clone(), "../testing/schema_5k.db").unwrap();
+        let db = Database::open_file(io.clone(), "../testing/system/schema_5k.db").unwrap();
         let conn = db.connect().unwrap();
         b.iter_custom(|iters| {
             (0..iters)
@@ -278,7 +278,7 @@ fn bench_alter(criterion: &mut Criterion) {
 
     if enable_rusqlite {
         group.bench_function(BenchmarkId::new("sqlite_drop_column", ""), |b| {
-            let conn = rusqlite::Connection::open("../testing/schema_5k.db").unwrap();
+            let conn = rusqlite::Connection::open("../testing/system/schema_5k.db").unwrap();
             b.iter_custom(|iters| {
                 (0..iters)
                     .map(|_| {
@@ -306,7 +306,7 @@ fn bench_prepare_query(criterion: &mut Criterion) {
 
     #[allow(clippy::arc_with_non_send_sync)]
     let io = Arc::new(PlatformIO::new().unwrap());
-    let db = Database::open_file(io.clone(), "../testing/testing.db").unwrap();
+    let db = Database::open_file(io.clone(), "../testing/system/testing.db").unwrap();
     let limbo_conn = db.connect().unwrap();
 
     let queries = [
@@ -388,7 +388,7 @@ fn bench_execute_select_rows(criterion: &mut Criterion) {
 
     #[allow(clippy::arc_with_non_send_sync)]
     let io = Arc::new(PlatformIO::new().unwrap());
-    let db = Database::open_file(io.clone(), "../testing/testing.db").unwrap();
+    let db = Database::open_file(io.clone(), "../testing/system/testing.db").unwrap();
     let limbo_conn = db.connect().unwrap();
 
     let mut group = criterion.benchmark_group("Execute `SELECT * FROM users LIMIT ?`");
@@ -456,7 +456,7 @@ fn bench_execute_select_1(criterion: &mut Criterion) {
 
     #[allow(clippy::arc_with_non_send_sync)]
     let io = Arc::new(PlatformIO::new().unwrap());
-    let db = Database::open_file(io.clone(), "../testing/testing.db").unwrap();
+    let db = Database::open_file(io.clone(), "../testing/system/testing.db").unwrap();
     let limbo_conn = db.connect().unwrap();
 
     let mut group = criterion.benchmark_group("Execute `SELECT 1`");
@@ -508,7 +508,7 @@ fn bench_execute_select_count(criterion: &mut Criterion) {
 
     #[allow(clippy::arc_with_non_send_sync)]
     let io = Arc::new(PlatformIO::new().unwrap());
-    let db = Database::open_file(io.clone(), "../testing/testing.db").unwrap();
+    let db = Database::open_file(io.clone(), "../testing/system/testing.db").unwrap();
     let limbo_conn = db.connect().unwrap();
 
     let mut group = criterion.benchmark_group("Execute `SELECT count() FROM users`");
