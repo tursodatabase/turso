@@ -25,6 +25,7 @@ pub enum turso_status_code_t {
     TURSO_IO = 3,
     TURSO_BUSY = 4,
     TURSO_INTERRUPT = 5,
+    TURSO_BUSY_SNAPSHOT = 6,
     TURSO_ERROR = 127,
     TURSO_MISUSE = 128,
     TURSO_CONSTRAINT = 129,
