@@ -1,0 +1,186 @@
+@database :memory:
+
+test distinct-select-null {
+    CREATE TABLE distinct_test (x);
+    INSERT INTO distinct_test VALUES (1), (1), (NULL), (NULL), (2);
+    SELECT CASE WHEN x IS NULL then 'NULL' ELSE x END FROM (SELECT DISTINCT x FROM distinct_test ORDER BY x IS NULL, x);
+}
+expect {
+    1
+    2
+    NULL
+}
+
+test distinct-count-null {
+    CREATE TABLE distinct_test (x);
+    INSERT INTO distinct_test VALUES (1), (1), (NULL), (NULL), (2);
+    SELECT count(DISTINCT x) FROM distinct_test;
+}
+expect {
+    2
+}
+
+test distinct-multi-column {
+    CREATE TABLE distinct_pairs (a, b);
+    INSERT INTO distinct_pairs VALUES (1, 1), (1, 1), (1, 2), (2, NULL), (2, NULL);
+    SELECT a, CASE WHEN b IS NULL THEN 'NULL' ELSE b END
+    FROM (SELECT DISTINCT a, b FROM distinct_pairs)
+    ORDER BY a, b IS NULL, b;
+}
+expect {
+    1|1
+    1|2
+    2|NULL
+}
+
+test distinct-order-by {
+    CREATE TABLE distinct_order (a);
+    INSERT INTO distinct_order VALUES (3), (2), (2), (1);
+    SELECT DISTINCT a FROM distinct_order ORDER BY a DESC;
+}
+expect {
+    3
+    2
+    1
+}
+
+test distinct-collate-count {
+    CREATE TABLE distinct_collate (x TEXT);
+    INSERT INTO distinct_collate VALUES ('a'), ('A'), ('b');
+    SELECT count(DISTINCT x COLLATE NOCASE) FROM distinct_collate;
+}
+expect {
+    2
+}
+
+test distinct-agg-group-by {
+    CREATE TABLE distinct_group (a, b);
+    INSERT INTO distinct_group VALUES (1, 10), (1, 10), (1, 20), (2, NULL), (2, NULL);
+    SELECT a, count(DISTINCT b) FROM distinct_group GROUP BY a ORDER BY a;
+}
+expect {
+    1|2
+    2|0
+}
+
+test distinct-expression {
+    CREATE TABLE distinct_expr (x);
+    INSERT INTO distinct_expr VALUES (1), (2), (3), (4);
+    SELECT DISTINCT (x % 2) FROM distinct_expr ORDER BY 1;
+}
+expect {
+    0
+    1
+}
+
+test distinct-text-nocase {
+    CREATE TABLE distinct_text (x TEXT);
+    INSERT INTO distinct_text VALUES ('a'), ('A'), ('b'), ('B'), ('b');
+    SELECT DISTINCT x COLLATE NOCASE FROM distinct_text ORDER BY x COLLATE NOCASE;
+}
+expect {
+    a
+    b
+}
+
+test distinct-text-binary {
+    CREATE TABLE distinct_text_bin (x TEXT);
+    INSERT INTO distinct_text_bin VALUES ('a'), ('A'), ('a');
+    SELECT DISTINCT x FROM distinct_text_bin ORDER BY x;
+}
+expect {
+    A
+    a
+}
+
+test distinct-order-by-nonselect {
+    CREATE TABLE distinct_order_by (a, b);
+    INSERT INTO distinct_order_by VALUES (1, 3), (1, 2), (2, 1), (2, 1);
+    SELECT DISTINCT a FROM distinct_order_by ORDER BY b DESC, a;
+}
+expect {
+    1
+    2
+}
+
+test distinct-limit-offset {
+    CREATE TABLE distinct_limit (x);
+    INSERT INTO distinct_limit VALUES (1), (1), (2), (3), (3), (4);
+    SELECT DISTINCT x FROM distinct_limit ORDER BY x LIMIT 2 OFFSET 1;
+}
+expect {
+    2
+    3
+}
+
+test distinct-where {
+    CREATE TABLE distinct_where (x);
+    INSERT INTO distinct_where VALUES (NULL), (1), (2), (2), (3);
+    SELECT DISTINCT x FROM distinct_where WHERE x >= 2 ORDER BY x;
+}
+expect {
+    2
+    3
+}
+
+test distinct-agg-with-having {
+    CREATE TABLE distinct_having (a, b);
+    INSERT INTO distinct_having VALUES (1, 1), (1, 2), (1, 2), (2, 2), (2, 2);
+    SELECT a, count(DISTINCT b) FROM distinct_having GROUP BY a HAVING count(DISTINCT b) > 1 ORDER BY a;
+}
+expect {
+    1|2
+}
+
+test distinct-multi-null-keys {
+    CREATE TABLE distinct_multi_null (a, b);
+    INSERT INTO distinct_multi_null VALUES (1, NULL), (1, NULL), (1, 2), (NULL, 2), (NULL, 2);
+    SELECT CASE WHEN a IS NULL THEN 'NULL' ELSE a END,
+           CASE WHEN b IS NULL THEN 'NULL' ELSE b END
+    FROM (SELECT DISTINCT a, b FROM distinct_multi_null)
+    ORDER BY a IS NULL, a, b IS NULL, b;
+}
+expect {
+    1|2
+    1|NULL
+    NULL|2
+}
+
+test distinct-empty {
+    CREATE TABLE distinct_empty (x);
+    SELECT DISTINCT x FROM distinct_empty;
+}
+expect {
+}
+
+test distinct-order-by-expression {
+    CREATE TABLE distinct_order_expr (x);
+    INSERT INTO distinct_order_expr VALUES (1), (2), (2), (3), (4);
+    SELECT DISTINCT x FROM distinct_order_expr ORDER BY (x % 2), x DESC;
+}
+expect {
+    4
+    2
+    3
+    1
+}
+
+test distinct-subquery {
+    CREATE TABLE distinct_subq (x);
+    INSERT INTO distinct_subq VALUES (1), (1), (2), (3), (3);
+    SELECT DISTINCT x FROM (SELECT x FROM distinct_subq) ORDER BY x;
+}
+expect {
+    1
+    2
+    3
+}
+
+test distinct-agg-simple-count {
+    CREATE TABLE distinct_count (x);
+    INSERT INTO distinct_count VALUES (1), (1), (2), (2), (3);
+    SELECT count(DISTINCT x) FROM distinct_count;
+}
+expect {
+    3
+}

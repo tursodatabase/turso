@@ -3929,6 +3929,105 @@ mod fuzz_tests {
         }
     }
 
+    #[turso_macros::test(mvcc)]
+    pub fn distinct_fuzz(db: TempDatabase) {
+        let _ = env_logger::try_init();
+        let (mut rng, seed) = rng_from_time_or_env();
+        log::info!("distinct_fuzz seed: {seed}");
+
+        const NUM_ROWS: usize = 200;
+        const NUM_ITERS: usize = 1000;
+        const COLS: [&str; 3] = ["a", "b", "c"];
+
+        let limbo_conn = db.connect_limbo();
+        let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let create_sql = "CREATE TABLE t (a INTEGER, b REAL, c TEXT)";
+        limbo_exec_rows(&limbo_conn, create_sql);
+        sqlite_exec_rows(&sqlite_conn, create_sql);
+
+        for _ in 0..NUM_ROWS {
+            let vals: Vec<String> = COLS
+                .iter()
+                .map(|col| match *col {
+                    "a" => {
+                        if rng.random_bool(0.2) {
+                            "NULL".to_string()
+                        } else {
+                            rng.random_range(-10..=10).to_string()
+                        }
+                    }
+                    "b" => {
+                        if rng.random_bool(0.2) {
+                            "NULL".to_string()
+                        } else {
+                            let v: f64 = rng.random_range(-10.0..=10.0);
+                            format!("{v}")
+                        }
+                    }
+                    "c" => {
+                        if rng.random_bool(0.2) {
+                            "NULL".to_string()
+                        } else {
+                            let len = rng.random_range(0..=4);
+                            let s = (0..len)
+                                .map(|_| rng.random_range(b'a'..=b'z') as char)
+                                .collect::<String>();
+                            format!("'{s}'")
+                        }
+                    }
+                    _ => "NULL".to_string(),
+                })
+                .collect();
+            let insert_sql = format!("INSERT INTO t VALUES ({})", vals.join(", "));
+            limbo_exec_rows(&limbo_conn, &insert_sql);
+            sqlite_exec_rows(&sqlite_conn, &insert_sql);
+        }
+
+        for iter in 0..NUM_ITERS {
+            let num_cols = rng.random_range(1..=COLS.len());
+            let cols = COLS
+                .choose_multiple(&mut rng, num_cols)
+                .cloned()
+                .collect::<Vec<_>>();
+            let select_list = cols.join(", ");
+            let order_by = cols
+                .iter()
+                .map(|c| format!("{c} IS NULL, {c}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!("SELECT DISTINCT {select_list} FROM t ORDER BY {order_by}");
+
+            let sqlite_rows = sqlite_exec_rows(&sqlite_conn, &query);
+            let limbo_rows = limbo_exec_rows(&limbo_conn, &query);
+
+            assert_eq!(
+                limbo_rows, sqlite_rows,
+                "distinct_fuzz mismatch (iter {iter}, seed {seed}) query: {query}"
+            );
+
+            if iter % 5 == 0 {
+                let agg_query =
+                    "SELECT count(DISTINCT a), count(DISTINCT b), count(DISTINCT c) FROM t";
+                let sqlite_agg = sqlite_exec_rows(&sqlite_conn, agg_query);
+                let limbo_agg = limbo_exec_rows(&limbo_conn, agg_query);
+                assert_eq!(
+                    limbo_agg, sqlite_agg,
+                    "distinct_fuzz agg mismatch (iter {iter}, seed {seed}) query: {agg_query}"
+                );
+
+                let group_query =
+                    "SELECT a, count(DISTINCT b) FROM t GROUP BY a ORDER BY a IS NULL, a";
+                let sqlite_group = sqlite_exec_rows(&sqlite_conn, group_query);
+                let limbo_group = limbo_exec_rows(&limbo_conn, group_query);
+                assert_eq!(
+                    limbo_group, sqlite_group,
+                    "distinct_fuzz group mismatch (iter {iter}, seed {seed}) query: {group_query}"
+                );
+            }
+        }
+    }
+
     // TODO: indexes
     #[turso_macros::test()]
     pub fn ddl_compatibility_fuzz(db: TempDatabase) {

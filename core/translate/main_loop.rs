@@ -1,10 +1,9 @@
-use turso_parser::ast::{fmt::ToTokens, Expr, SortOrder};
+use turso_parser::ast::{Expr, SortOrder};
 
 use std::{borrow::Cow, collections::HashSet, sync::Arc};
 
 use super::{
     aggregation::{translate_aggregation_step, AggArgumentSource},
-    display::PlanContext,
     emitter::{
         MaterializedBuildInputMode, MaterializedColumnRef, OperationMode, TranslateCtx,
         UpdateRowSource,
@@ -17,13 +16,13 @@ use super::{
     optimizer::Optimizable,
     order_by::{order_by_sorter_insert, sorter_insert},
     plan::{
-        Aggregate, DistinctCtx, Distinctness, EvalAt, GroupBy, HashJoinOp, IterationDirection,
+        Aggregate, DistinctCtx, Distinctness, EvalAt, HashJoinOp, IterationDirection,
         JoinOrderMember, NonFromClauseSubquery, Operation, QueryDestination, Scan, Search, SeekDef,
         SeekKeyComponent, SelectPlan, TableReferences, WhereTerm,
     },
 };
 use crate::{
-    schema::{Index, IndexColumn, Table},
+    schema::{Index, Table},
     translate::{
         collate::{get_collseq_from_expr, CollationSeq},
         emitter::{prepare_cdc_if_necessary, HashCtx},
@@ -80,49 +79,20 @@ impl LoopLabels {
 }
 
 pub fn init_distinct(program: &mut ProgramBuilder, plan: &SelectPlan) -> Result<DistinctCtx> {
-    let index_name = format!("distinct_{}", program.offset().as_offset_int()); // we don't really care about the name that much, just enough that we don't get name collisions
-    let mut columns = plan
+    let collations = plan
         .result_columns
         .iter()
-        .enumerate()
-        .map(|(i, col)| IndexColumn {
-            name: col
-                .expr
-                .displayer(&PlanContext(&[&plan.table_references]))
-                .to_string(),
-            order: SortOrder::Asc,
-            pos_in_table: i,
-            collation: None,
-            default: None,
-            expr: None,
+        .map(|col| {
+            get_collseq_from_expr(&col.expr, &plan.table_references)
+                .map(|c| c.unwrap_or(CollationSeq::Binary))
         })
-        .collect::<Vec<_>>();
-    for (i, column) in columns.iter_mut().enumerate() {
-        column.collation =
-            get_collseq_from_expr(&plan.result_columns[i].expr, &plan.table_references)?;
-    }
-    let index = Arc::new(Index {
-        name: index_name.clone(),
-        table_name: String::new(),
-        ephemeral: true,
-        root_page: 0,
-        columns,
-        unique: false,
-        has_rowid: false,
-        where_clause: None,
-        index_method: None,
-    });
-    let cursor_id = program.alloc_cursor_id(CursorType::BTreeIndex(index.clone()));
+        .collect::<Result<Vec<_>>>()?;
+    let hash_table_id = program.alloc_hash_table_id();
     let ctx = DistinctCtx {
-        cursor_id,
-        ephemeral_index_name: index_name,
+        hash_table_id,
+        collations,
         label_on_conflict: program.allocate_label(),
     };
-
-    program.emit_insn(Insn::OpenEphemeral {
-        cursor_id,
-        is_table: false,
-    });
 
     Ok(ctx)
 }
@@ -134,7 +104,6 @@ pub fn init_loop(
     t_ctx: &mut TranslateCtx,
     tables: &TableReferences,
     aggregates: &mut [Aggregate],
-    group_by: Option<&GroupBy>,
     mode: OperationMode,
     where_clause: &[WhereTerm],
     join_order: &[JoinOrderMember],
@@ -158,52 +127,20 @@ pub fn init_loop(
         }
     }
 
-    // Initialize ephemeral indexes for distinct aggregates
-    for (i, agg) in aggregates
-        .iter_mut()
-        .enumerate()
-        .filter(|(_, agg)| agg.is_distinct())
-    {
+    // Initialize distinct aggregates using hash tables
+    for agg in aggregates.iter_mut().filter(|agg| agg.is_distinct()) {
         assert!(
             agg.args.len() == 1,
             "DISTINCT aggregate functions must have exactly one argument"
         );
-        let index_name = format!(
-            "distinct_agg_{}_{}",
-            i,
-            agg.args[0].displayer(&PlanContext(&[tables]))
-        );
-        let index = Arc::new(Index {
-            name: index_name.clone(),
-            table_name: String::new(),
-            ephemeral: true,
-            root_page: 0,
-            columns: vec![IndexColumn {
-                name: agg.args[0].displayer(&PlanContext(&[tables])).to_string(),
-                order: SortOrder::Asc,
-                pos_in_table: 0,
-                collation: get_collseq_from_expr(&agg.original_expr, tables)?,
-                default: None, // FIXME: this should be inferred from the expression
-                expr: None,
-            }],
-            has_rowid: false,
-            unique: false,
-            where_clause: None,
-            index_method: None,
-        });
-        let cursor_id = program.alloc_cursor_id(CursorType::BTreeIndex(index.clone()));
-        if group_by.is_none() {
-            // In GROUP BY, the ephemeral index is reinitialized for every group
-            // in the clear accumulator subroutine, so we only do it here if there is no GROUP BY.
-            program.emit_insn(Insn::OpenEphemeral {
-                cursor_id,
-                is_table: false,
-            });
-        }
+        let collations = vec![
+            get_collseq_from_expr(&agg.original_expr, tables)?.unwrap_or(CollationSeq::Binary)
+        ];
+        let hash_table_id = program.alloc_hash_table_id();
         agg.distinctness = Distinctness::Distinct {
             ctx: Some(DistinctCtx {
-                cursor_id,
-                ephemeral_index_name: index_name,
+                hash_table_id,
+                collations,
                 label_on_conflict: program.allocate_label(),
             }),
         };
