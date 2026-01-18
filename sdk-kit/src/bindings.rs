@@ -7,15 +7,6 @@ pub struct turso_slice_ref_t {
     pub ptr: *const ::std::os::raw::c_void,
     pub len: usize,
 }
-#[allow(clippy::unnecessary_operation, clippy::identity_op)]
-const _: () = {
-    ["Size of turso_slice_ref_t"][::std::mem::size_of::<turso_slice_ref_t>() - 16usize];
-    ["Alignment of turso_slice_ref_t"][::std::mem::align_of::<turso_slice_ref_t>() - 8usize];
-    ["Offset of field: turso_slice_ref_t::ptr"]
-        [::std::mem::offset_of!(turso_slice_ref_t, ptr) - 0usize];
-    ["Offset of field: turso_slice_ref_t::len"]
-        [::std::mem::offset_of!(turso_slice_ref_t, len) - 8usize];
-};
 impl Default for turso_slice_ref_t {
     fn default() -> Self {
         let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
@@ -34,7 +25,6 @@ pub enum turso_status_code_t {
     TURSO_IO = 3,
     TURSO_BUSY = 4,
     TURSO_INTERRUPT = 5,
-    TURSO_BUSY_SNAPSHOT = 6,
     TURSO_ERROR = 127,
     TURSO_MISUSE = 128,
     TURSO_CONSTRAINT = 129,
@@ -97,19 +87,6 @@ pub struct turso_log_t {
     pub line: usize,
     pub level: turso_tracing_level_t,
 }
-#[allow(clippy::unnecessary_operation, clippy::identity_op)]
-const _: () = {
-    ["Size of turso_log_t"][::std::mem::size_of::<turso_log_t>() - 48usize];
-    ["Alignment of turso_log_t"][::std::mem::align_of::<turso_log_t>() - 8usize];
-    ["Offset of field: turso_log_t::message"]
-        [::std::mem::offset_of!(turso_log_t, message) - 0usize];
-    ["Offset of field: turso_log_t::target"][::std::mem::offset_of!(turso_log_t, target) - 8usize];
-    ["Offset of field: turso_log_t::file"][::std::mem::offset_of!(turso_log_t, file) - 16usize];
-    ["Offset of field: turso_log_t::timestamp"]
-        [::std::mem::offset_of!(turso_log_t, timestamp) - 24usize];
-    ["Offset of field: turso_log_t::line"][::std::mem::offset_of!(turso_log_t, line) - 32usize];
-    ["Offset of field: turso_log_t::level"][::std::mem::offset_of!(turso_log_t, level) - 40usize];
-};
 impl Default for turso_log_t {
     fn default() -> Self {
         let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
@@ -126,15 +103,6 @@ pub struct turso_config_t {
     pub logger: ::std::option::Option<unsafe extern "C" fn(log: *const turso_log_t)>,
     pub log_level: *const ::std::os::raw::c_char,
 }
-#[allow(clippy::unnecessary_operation, clippy::identity_op)]
-const _: () = {
-    ["Size of turso_config_t"][::std::mem::size_of::<turso_config_t>() - 16usize];
-    ["Alignment of turso_config_t"][::std::mem::align_of::<turso_config_t>() - 8usize];
-    ["Offset of field: turso_config_t::logger"]
-        [::std::mem::offset_of!(turso_config_t, logger) - 0usize];
-    ["Offset of field: turso_config_t::log_level"]
-        [::std::mem::offset_of!(turso_config_t, log_level) - 8usize];
-};
 impl Default for turso_config_t {
     fn default() -> Self {
         let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
@@ -161,24 +129,6 @@ pub struct turso_database_config_t {
     #[doc = " optional encryption hexkey\n as encryption is experimental - experimental_features must have \"encryption\" in the list"]
     pub encryption_hexkey: *const ::std::os::raw::c_char,
 }
-#[allow(clippy::unnecessary_operation, clippy::identity_op)]
-const _: () = {
-    ["Size of turso_database_config_t"][::std::mem::size_of::<turso_database_config_t>() - 48usize];
-    ["Alignment of turso_database_config_t"]
-        [::std::mem::align_of::<turso_database_config_t>() - 8usize];
-    ["Offset of field: turso_database_config_t::async_io"]
-        [::std::mem::offset_of!(turso_database_config_t, async_io) - 0usize];
-    ["Offset of field: turso_database_config_t::path"]
-        [::std::mem::offset_of!(turso_database_config_t, path) - 8usize];
-    ["Offset of field: turso_database_config_t::experimental_features"]
-        [::std::mem::offset_of!(turso_database_config_t, experimental_features) - 16usize];
-    ["Offset of field: turso_database_config_t::vfs"]
-        [::std::mem::offset_of!(turso_database_config_t, vfs) - 24usize];
-    ["Offset of field: turso_database_config_t::encryption_cipher"]
-        [::std::mem::offset_of!(turso_database_config_t, encryption_cipher) - 32usize];
-    ["Offset of field: turso_database_config_t::encryption_hexkey"]
-        [::std::mem::offset_of!(turso_database_config_t, encryption_hexkey) - 40usize];
-};
 impl Default for turso_database_config_t {
     fn default() -> Self {
         let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
