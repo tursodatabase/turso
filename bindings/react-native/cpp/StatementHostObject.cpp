@@ -36,7 +36,8 @@ void StatementHostObject::bindValue(jsi::Runtime &rt, size_t index, const jsi::V
             turso_statement_bind_positional_double(statement_, index, val);
         }
     } else if (value.isString()) {
-        std::string str = value.asString(rt).utf8(rt);
+        boundStrings_.push_back(value.asString(rt).utf8(rt));
+        const std::string& str = boundStrings_.back();
         turso_statement_bind_positional_text(statement_, index, str.c_str(), str.length());
     } else if (value.isBool()) {
         turso_statement_bind_positional_int(statement_, index, value.getBool() ? 1 : 0);
@@ -143,6 +144,7 @@ jsi::Value StatementHostObject::run(jsi::Runtime &rt, const jsi::Value *args, si
 
     // Reset and bind parameters
     turso_statement_reset(statement_, nullptr);
+    boundStrings_.clear(); // Clear previous bound strings
     bindParams(rt, args, count);
 
     // Execute
@@ -237,6 +239,7 @@ jsi::Value StatementHostObject::getOne(jsi::Runtime &rt, const jsi::Value *args,
 
     // Reset and bind parameters
     turso_statement_reset(statement_, nullptr);
+    boundStrings_.clear(); // Clear previous bound strings
     bindParams(rt, args, count);
 
     // Step to get a row
@@ -282,6 +285,7 @@ jsi::Value StatementHostObject::getAll(jsi::Runtime &rt, const jsi::Value *args,
 
     // Reset and bind parameters
     turso_statement_reset(statement_, nullptr);
+    boundStrings_.clear(); // Clear previous bound strings
     bindParams(rt, args, count);
 
     // Collect all rows
@@ -338,6 +342,7 @@ jsi::Value StatementHostObject::reset(jsi::Runtime &rt, const jsi::Value *args, 
     }
 
     turso_statement_reset(statement_, nullptr);
+    boundStrings_.clear(); // Clear bound strings on reset
     return jsi::Value::undefined();
 }
 

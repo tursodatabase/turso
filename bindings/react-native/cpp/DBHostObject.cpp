@@ -203,8 +203,9 @@ jsi::Value DBHostObject::run(jsi::Runtime &rt, const jsi::Value *args, size_t co
     }
 
     // Bind parameters if provided
+    // Keep string parameters alive until after execution
+    std::vector<std::string> stringParams;
     if (count > 1) {
-        auto stmtObj = std::make_shared<StatementHostObject>(statement, connection_);
         // Bind parameters starting from index 1
         for (size_t i = 1; i < count; i++) {
             const jsi::Value &param = args[i];
@@ -220,7 +221,8 @@ jsi::Value DBHostObject::run(jsi::Runtime &rt, const jsi::Value *args, size_t co
                     turso_statement_bind_positional_double(statement, bindIndex, val);
                 }
             } else if (param.isString()) {
-                std::string str = param.asString(rt).utf8(rt);
+                stringParams.push_back(param.asString(rt).utf8(rt));
+                const std::string& str = stringParams.back();
                 turso_statement_bind_positional_text(statement, bindIndex, str.c_str(), str.length());
             } else if (param.isBool()) {
                 turso_statement_bind_positional_int(statement, bindIndex, param.getBool() ? 1 : 0);
@@ -278,6 +280,8 @@ jsi::Value DBHostObject::getOne(jsi::Runtime &rt, const jsi::Value *args, size_t
     }
 
     // Bind parameters if provided
+    // Keep string parameters alive until after execution
+    std::vector<std::string> stringParams;
     for (size_t i = 1; i < count; i++) {
         const jsi::Value &param = args[i];
         size_t bindIndex = i;
@@ -292,7 +296,8 @@ jsi::Value DBHostObject::getOne(jsi::Runtime &rt, const jsi::Value *args, size_t
                 turso_statement_bind_positional_double(statement, bindIndex, val);
             }
         } else if (param.isString()) {
-            std::string str = param.asString(rt).utf8(rt);
+            stringParams.push_back(param.asString(rt).utf8(rt));
+            const std::string& str = stringParams.back();
             turso_statement_bind_positional_text(statement, bindIndex, str.c_str(), str.length());
         } else if (param.isBool()) {
             turso_statement_bind_positional_int(statement, bindIndex, param.getBool() ? 1 : 0);
@@ -410,6 +415,8 @@ jsi::Value DBHostObject::getAll(jsi::Runtime &rt, const jsi::Value *args, size_t
     }
 
     // Bind parameters if provided
+    // Keep string parameters alive until after execution
+    std::vector<std::string> stringParams;
     for (size_t i = 1; i < count; i++) {
         const jsi::Value &param = args[i];
         size_t bindIndex = i;
@@ -424,7 +431,8 @@ jsi::Value DBHostObject::getAll(jsi::Runtime &rt, const jsi::Value *args, size_t
                 turso_statement_bind_positional_double(statement, bindIndex, val);
             }
         } else if (param.isString()) {
-            std::string str = param.asString(rt).utf8(rt);
+            stringParams.push_back(param.asString(rt).utf8(rt));
+            const std::string& str = stringParams.back();
             turso_statement_bind_positional_text(statement, bindIndex, str.c_str(), str.length());
         } else if (param.isBool()) {
             turso_statement_bind_positional_int(statement, bindIndex, param.getBool() ? 1 : 0);

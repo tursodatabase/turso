@@ -37,6 +37,17 @@ export interface OpenDatabaseOptions {
 }
 
 /**
+ * Setup options for configuring Turso behavior
+ */
+export interface SetupOptions {
+  /**
+   * Log level for Turso operations.
+   * Valid values: "trace", "debug", "info", "warn", "error"
+   */
+  logLevel?: string;
+}
+
+/**
  * Native module interface (internal)
  */
 export interface TursoNativeModule {
@@ -49,6 +60,7 @@ export interface TursoNativeModule {
 export interface TursoProxy {
   open(options: OpenDatabaseOptions | string): NativeDatabase;
   version(): string;
+  setup(options: {logLevel?: string}): void;
 }
 
 /**

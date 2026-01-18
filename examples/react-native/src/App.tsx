@@ -6,7 +6,7 @@ import './tests'; // import all tests to register them
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 import { performanceTest } from './performance_test';
 import { StyleSheet, Text, View } from 'react-native';
-import { connect } from '@tursodatabase/react-native';
+import { connect, setup } from '@tursodatabase/react-native';
 
 export default function App() {
   const [results, setResults] = useState<any>(null);
@@ -16,6 +16,14 @@ export default function App() {
   useEffect(() => {
     console.log("App has started 🟢")
     const work = async () => {
+      // Configure Turso logging
+      try {
+        setup({ logLevel: 'debug' });
+        console.log("Turso logging configured ✅")
+      } catch (e) {
+        console.log(`Failed to configure Turso logging: ${e}`)
+      }
+
       let start = performance.now();
       await connect('dummyDb.sqlite');
       setOpenTime(performance.now() - start);

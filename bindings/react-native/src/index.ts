@@ -13,6 +13,7 @@ export type {
   Row,
   RunResult,
   SQLiteValue,
+  SetupOptions,
 } from './types';
 
 // Re-export classes
@@ -52,7 +53,7 @@ if (!TursoProxy) {
   );
 }
 
-export function connect(options: OpenDatabaseOptions | string): Database {
+export async function connect(options: OpenDatabaseOptions | string): Promise<Database> {
   const nativeDb = TursoProxy.open(options);
   return new Database(nativeDb);
 }
@@ -62,6 +63,22 @@ export function connect(options: OpenDatabaseOptions | string): Database {
  */
 export function version(): string {
   return TursoProxy.version();
+}
+
+/**
+ * Configure Turso settings such as logging.
+ * Should be called before any database operations.
+ *
+ * @param options - Configuration options
+ * @example
+ * ```ts
+ * import { setup } from '@tursodatabase/react-native';
+ *
+ * setup({ logLevel: 'debug' });
+ * ```
+ */
+export function setup(options: {logLevel?: string}): void {
+  TursoProxy.setup(options);
 }
 
 /**
@@ -88,6 +105,7 @@ export const paths = {
 export default {
   connect,
   version,
+  setup,
   paths,
   Database,
 };

@@ -37,6 +37,8 @@ private:
     turso_statement_t *statement_ = nullptr;
     turso_connection_t *connection_ = nullptr;
     bool finalized_ = false;
+    // Keep bound string parameters alive until execution
+    std::vector<std::string> boundStrings_;
 
     // Helper to throw JS errors
     void throwError(jsi::Runtime &rt, const char *error);
