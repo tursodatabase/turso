@@ -5,7 +5,10 @@ use std::process::ExitCode;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
-use std::{path::PathBuf, time::Instant};
+use std::{
+    path::{Path, PathBuf},
+    time::Instant,
+};
 use turso_test_runner::{
     DefaultDatabases, Format, OutputFormat, ParseError, RunnerConfig, TestRunner,
     backends::cli::CliBackend, backends::js::JsBackend, backends::rust::RustBackend, create_output,
@@ -129,6 +132,7 @@ const DEFAULT_SEED: u64 = 42;
 /// Default number of users to generate
 const DEFAULT_USER_COUNT: usize = 10000;
 
+#[allow(clippy::too_many_arguments)]
 async fn run_tests(
     paths: Vec<PathBuf>,
     backend_type: String,
@@ -173,7 +177,7 @@ async fn run_tests(
     let format: Format = match output_format.parse() {
         Ok(f) => f,
         Err(e) => {
-            eprintln!("Error: {}", e);
+            eprintln!("Error: {e}");
             return ExitCode::from(2);
         }
     };
@@ -182,7 +186,7 @@ async fn run_tests(
     let loaded = match load_test_files(&paths).await {
         Ok(loaded) => loaded,
         Err(e) => {
-            eprintln!("Error loading test files: {}", e);
+            eprintln!("Error loading test files: {e}");
             return ExitCode::from(1);
         }
     };
@@ -196,7 +200,7 @@ async fn run_tests(
         match DefaultDatabases::generate(needs, DEFAULT_SEED, DEFAULT_USER_COUNT, mvcc).await {
             Ok(dbs) => dbs,
             Err(e) => {
-                eprintln!("Error generating default databases: {}", e);
+                eprintln!("Error generating default databases: {e}");
                 return ExitCode::from(1);
             }
         }
@@ -205,14 +209,12 @@ async fn run_tests(
     };
 
     // Create backend with resolver if we have generated databases
-    let resolver = if let Some(ref dbs) = default_dbs {
-        Some(Arc::new(DefaultDatabasesResolver(
+    let resolver = default_dbs.as_ref().map(|dbs| {
+        Arc::new(DefaultDatabasesResolver(
             dbs.default_path.clone(),
             dbs.no_rowid_alias_path.clone(),
-        )))
-    } else {
-        None
-    };
+        ))
+    });
 
     // Create runner config
     let mut config = RunnerConfig::default().with_max_jobs(jobs).with_mvcc(mvcc);
@@ -311,10 +313,7 @@ async fn run_tests(
                 .await
         }
         other => {
-            eprintln!(
-                "Error: unknown backend '{}'. Use 'rust', 'cli', or 'js'",
-                other
-            );
+            eprintln!("Error: unknown backend '{other}'. Use 'rust', 'cli', or 'js'");
             return ExitCode::from(2);
         }
     };
@@ -322,7 +321,7 @@ async fn run_tests(
     let results = match results {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("Error running tests: {}", e);
+            eprintln!("Error running tests: {e}");
             return ExitCode::from(1);
         }
     };
@@ -372,14 +371,14 @@ fn check_files(paths: Vec<PathBuf>) -> ExitCode {
                                 }
                             }
                             Err(e) => {
-                                eprintln!("Error: {}", e);
+                                eprintln!("Error: {e}");
                                 has_errors = true;
                             }
                         }
                     }
                 }
                 Err(e) => {
-                    eprintln!("Error: invalid glob pattern: {}", e);
+                    eprintln!("Error: invalid glob pattern: {e}");
                     has_errors = true;
                 }
             }
@@ -425,13 +424,13 @@ fn check_single_file(path: &PathBuf) -> bool {
     }
 }
 
-fn print_parse_error(path: &PathBuf, content: &str, error: ParseError) {
+fn print_parse_error(path: &Path, content: &str, error: ParseError) {
     // Use miette for nice error display with source context
     let report = Report::from(error).with_source_code(NamedSource::new(
         path.display().to_string(),
         content.to_string(),
     ));
-    eprintln!("{:?}", report);
+    eprintln!("{report:?}");
 }
 
 fn convert_files(
@@ -543,7 +542,7 @@ fn convert_single_file(
     for warning in &result.warnings {
         let report = warning.to_report(&path_display, content.clone());
         // Use debug format {:?} to get full miette diagnostic with source snippets
-        eprintln!("{:?}", report);
+        eprintln!("{report:?}");
     }
 
     if test_count == 0 {
@@ -558,7 +557,7 @@ fn convert_single_file(
         for (key, file) in &generated.files {
             println!(
                 "\n{} ({} tests)",
-                format!("--- {} tests ---", key).green().bold(),
+                format!("--- {key} tests ---").green().bold(),
                 file.test_count
             );
             println!("{}", file.content);
@@ -610,10 +609,10 @@ fn convert_single_file(
         for (key, file) in &generated.files {
             let output_path = if use_subdir {
                 // In subdirectory: use key as filename
-                output_base.join(format!("{}.sqltest", key))
+                output_base.join(format!("{key}.sqltest"))
             } else {
                 // Single file: use original name
-                output_base.join(format!("{}.sqltest", file_stem))
+                output_base.join(format!("{file_stem}.sqltest"))
             };
 
             match std::fs::write(&output_path, &file.content) {
