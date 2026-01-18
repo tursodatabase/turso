@@ -10,7 +10,7 @@
     "start": "react-native start",
     "pods": "cd ios && bundle exec pod install && rm -f .xcode.env.local",
     "pods:nuke": "cd ios && rm -rf Pods && rm -rf Podfile.lock && bundle exec pod install",
-    "run:android:release": "cd android && ./gradlew assembleRelease && adb install -r app/build/outputs/apk/release/app-release.apk && adb shell am start -n com.op.sqlite.example/.MainActivity",
+    "run:android:release": "cd android && ./gradlew assembleRelease && adb install -r app/build/outputs/apk/release/app-release.apk && adb shell am start -n com.turso.example/.MainActivity",
     "build:android": "cd android && ./gradlew assembleDebug --no-daemon --console=plain -PreactNativeArchitectures=arm64-v8a",
     "build:ios": "cd ios && xcodebuild -workspace TursoExample.xcworkspace -scheme debug -configuration Debug -sdk iphonesimulator CC=clang CPLUSPLUS=clang++ LD=clang LDPLUSPLUS=clang++ GCC_OPTIMIZATION_LEVEL=0 GCC_PRECOMPILE_PREFIX_HEADER=YES ASSETCATALOG_COMPILER_OPTIMIZATION=time DEBUG_INFORMATION_FORMAT=dwarf COMPILER_INDEX_STORE_ENABLE=NO"
   },

@@ -50,7 +50,7 @@ public class TursoModule extends ReactContextBaseJavaModule {
                 externalFilesDir != null ? externalFilesDir.getAbsolutePath() : null);
 
         // populate Android and IOS constants to simplify JS code (e.g.
-        // IOS_DOCUMENT_PATH ?? OPSQLite.ANDROID_DATABASE_PATH)
+        // IOS_DOCUMENT_PATH ?? ANDROID_DATABASE_PATH)
         constants.put("IOS_DOCUMENT_PATH", null);
         constants.put("IOS_LIBRARY_PATH", null);
 
