@@ -1,14 +1,12 @@
-use crate::return_if_io;
-use crate::sync::RwLock;
-use crate::sync::{
-    atomic::{self, AtomicUsize},
-    Arc,
-};
 use crate::{
     error::LimboError,
     io::{Buffer, Completion, TempFile, IO},
-    io_yield_one,
+    io_yield_one, return_if_io,
     storage::sqlite3_ondisk::{read_varint, varint_len, write_varint},
+    sync::{
+        atomic::{self, AtomicUsize, RwLock},
+        Arc,
+    },
     translate::collate::CollationSeq,
     turso_assert,
     types::{IOCompletions, IOResult, Value, ValueRef},
@@ -21,14 +19,6 @@ use std::{cell::RefCell, collections::VecDeque};
 use turso_macros::AtomicEnum;
 
 const DEFAULT_SEED: u64 = 1337;
-
-// Memory overhead constants for accurate size accounting
-/// Vec<T> header: pointer (8) + len (8) + capacity (8)
-const VEC_HEADER_BYTES: usize = 24;
-/// Text struct: Cow<str> (16) + TextSubtype (1) + padding (~15 for alignment)
-const TEXT_STRUCT_BYTES: usize = 32;
-/// HashEntry base: hash (8) + rowid (8) + 2×Vec headers (48) + padding (8)
-const HASH_ENTRY_BASE_BYTES: usize = 72;
 
 // set to a *very* small 32KB, intentionally to trigger frequent spilling during tests
 #[cfg(debug_assertions)]
@@ -245,22 +235,18 @@ impl HashEntry {
     }
 
     /// Get the size of this entry in bytes (approximate).
-    /// Accounts for Vec headers, Text struct overhead, and alignment padding.
+    /// This is a lightweight estimate for memory budgeting, not a precise measurement.
     fn size_bytes(&self) -> usize {
-        Self::size_from_values(&self.key_values, &self.payload_values)
-    }
-
-    fn size_from_values(key_values: &[Value], payload_values: &[Value]) -> usize {
         let value_size = |v: &Value| match v {
             Value::Null => 1,
             Value::Integer(_) => 8,
             Value::Float(_) => 8,
-            Value::Text(t) => TEXT_STRUCT_BYTES + t.as_str().len(),
-            Value::Blob(b) => VEC_HEADER_BYTES + b.len(),
+            Value::Text(t) => t.as_str().len(),
+            Value::Blob(b) => b.len(),
         };
         let key_size: usize = self.key_values.iter().map(value_size).sum();
         let payload_size: usize = self.payload_values.iter().map(value_size).sum();
-        HASH_ENTRY_BASE_BYTES + key_size + payload_size
+        key_size + payload_size + 8 + 8 // +8 for hash, +8 for rowid
     }
 
     /// Calculate the serialized size of a single Value.
@@ -1254,25 +1240,27 @@ impl HashTable {
             return Ok(None);
         }
 
-        // Calculate exact total size needed
+        // Phase 1: Calculate sizes and cache them to avoid recomputation
+        let num_entries = partition.entries.len();
+        let mut entry_sizes = Vec::with_capacity(num_entries);
         let mut total_size = 0usize;
         for entry in &partition.entries {
             let entry_size = entry.serialized_size();
+            entry_sizes.push(entry_size);
             total_size += varint_len(entry_size as u64) + entry_size;
         }
 
-        // Allocate I/O buffer directly and serialize into it
+        // Phase 2: Allocate I/O buffer and serialize using cached sizes
         let buffer = Buffer::new_temporary(total_size);
         let buf = buffer.as_mut_slice();
         let mut offset = 0;
 
-        for entry in &partition.entries {
-            let entry_size = entry.serialized_size();
+        for (entry, &entry_size) in partition.entries.iter().zip(entry_sizes.iter()) {
             offset += write_varint(&mut buf[offset..], entry_size as u64);
             offset += entry.serialize_to_slice(&mut buf[offset..]);
         }
 
-        turso_assert!(offset == total_size, "serialized size mismatch");
+        debug_assert_eq!(offset, total_size, "serialized size mismatch");
 
         let file_offset = spill_state.next_spill_offset;
         let data_size = total_size;
