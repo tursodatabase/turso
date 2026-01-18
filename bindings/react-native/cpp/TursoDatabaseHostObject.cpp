@@ -1,6 +1,9 @@
 #include "TursoDatabaseHostObject.h"
 #include "TursoConnectionHostObject.h"
+
+extern "C" {
 #include <turso.h>
+}
 
 namespace turso {
 

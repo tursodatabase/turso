@@ -2,7 +2,10 @@
 #include "TursoSyncOperationHostObject.h"
 #include "TursoSyncIoItemHostObject.h"
 #include "TursoSyncChangesHostObject.h"
+
+extern "C" {
 #include <turso_sync.h>
+}
 
 namespace turso {
 

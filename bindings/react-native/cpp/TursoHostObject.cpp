@@ -1,8 +1,11 @@
 #include "TursoHostObject.h"
 #include "TursoDatabaseHostObject.h"
 #include "TursoSyncDatabaseHostObject.h"
+
+extern "C" {
 #include <turso.h>
 #include <turso_sync.h>
+}
 
 namespace turso
 {

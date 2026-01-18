@@ -1,5 +1,8 @@
 #include "TursoSyncIoItemHostObject.h"
+
+extern "C" {
 #include <turso_sync.h>
+}
 
 namespace turso {
 
