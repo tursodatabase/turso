@@ -84,5 +84,13 @@
         }
       ]
     ]
+  },
+  "codegenConfig": {
+    "name": "TursoSpec",
+    "type": "modules",
+    "jsSrcsDir": "src",
+    "android": {
+      "javaPackageName": "com.turso"
+    }
   }
 }
