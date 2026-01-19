@@ -42,6 +42,9 @@ export default function App() {
       return;
     }
 
+    // cleanup db state
+    await db.exec("DROP TABLE users");
+
     // Test: Simple SELECT
     try {
       const res = await db.get('SELECT 1 as value');
