@@ -284,3 +284,87 @@ fn test_pragma_fullfsync(db: TempDatabase) {
         "fullfsync pragma should not be available on non-Apple platforms"
     );
 }
+
+#[turso_macros::test(mvcc)]
+fn test_pragma_synchronous_normal(db: TempDatabase) {
+    let conn = db.connect_limbo();
+
+    // Create a test table
+    conn.execute("CREATE TABLE test (id INTEGER PRIMARY KEY, value TEXT)")
+        .unwrap();
+
+    // Set synchronous=NORMAL (1)
+    conn.execute("PRAGMA synchronous=NORMAL").unwrap();
+
+    // Do inserts with synchronous=NORMAL (should skip WAL commit fsync)
+    conn.execute("INSERT INTO test (id, value) VALUES (1, 'first')")
+        .unwrap();
+    conn.execute("INSERT INTO test (id, value) VALUES (2, 'second')")
+        .unwrap();
+
+    // Verify data is there
+    let mut rows = conn.query("SELECT COUNT(*) FROM test").unwrap().unwrap();
+    let StepResult::Row = rows.step().unwrap() else {
+        panic!("expected row");
+    };
+    let row = rows.row().unwrap();
+    let Value::Integer(count) = row.get_value(0) else {
+        panic!("expected integer value");
+    };
+    assert_eq!(*count, 2, "both inserts should have succeeded");
+    drop(rows);
+
+    // Set synchronous=FULL (2) and do another insert
+    conn.execute("PRAGMA synchronous=FULL").unwrap();
+    conn.execute("INSERT INTO test (id, value) VALUES (3, 'third')")
+        .unwrap();
+
+    // Verify all data is there
+    let mut rows = conn.query("SELECT COUNT(*) FROM test").unwrap().unwrap();
+    let StepResult::Row = rows.step().unwrap() else {
+        panic!("expected row");
+    };
+    let row = rows.row().unwrap();
+    let Value::Integer(count) = row.get_value(0) else {
+        panic!("expected integer value");
+    };
+    assert_eq!(*count, 3, "all inserts should have succeeded");
+    drop(rows);
+
+    // Set synchronous=OFF (0) and do another insert
+    conn.execute("PRAGMA synchronous=OFF").unwrap();
+    conn.execute("INSERT INTO test (id, value) VALUES (4, 'fourth')")
+        .unwrap();
+
+    // Verify all data is there
+    let mut rows = conn.query("SELECT COUNT(*) FROM test").unwrap().unwrap();
+    let StepResult::Row = rows.step().unwrap() else {
+        panic!("expected row");
+    };
+    let row = rows.row().unwrap();
+    let Value::Integer(count) = row.get_value(0) else {
+        panic!("expected integer value");
+    };
+    assert_eq!(*count, 4, "all inserts should have succeeded");
+
+    // Also test numeric values: 0, 1, 2
+    conn.execute("PRAGMA synchronous=0").unwrap(); // OFF
+    conn.execute("INSERT INTO test (id, value) VALUES (5, 'fifth')")
+        .unwrap();
+    conn.execute("PRAGMA synchronous=1").unwrap(); // NORMAL
+    conn.execute("INSERT INTO test (id, value) VALUES (6, 'sixth')")
+        .unwrap();
+    conn.execute("PRAGMA synchronous=2").unwrap(); // FULL
+    conn.execute("INSERT INTO test (id, value) VALUES (7, 'seventh')")
+        .unwrap();
+
+    let mut rows = conn.query("SELECT COUNT(*) FROM test").unwrap().unwrap();
+    let StepResult::Row = rows.step().unwrap() else {
+        panic!("expected row");
+    };
+    let row = rows.row().unwrap();
+    let Value::Integer(count) = row.get_value(0) else {
+        panic!("expected integer value");
+    };
+    assert_eq!(*count, 7, "all inserts should have succeeded");
+}
