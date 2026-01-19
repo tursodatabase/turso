@@ -490,22 +490,22 @@ fn test_encryption_key_validation_with_cached_database(_db: TempDatabase) -> any
     let io = Arc::new(PlatformIO::new()?);
     let opts = DatabaseOpts::new().with_encryption(ENABLE_ENCRYPTION);
 
+    let correct_encryption_opts = Some(EncryptionOpts {
+        cipher: "aegis256".to_string(),
+        hexkey: correct_key.to_string(),
+    });
+
+    let main_db = Database::open_file_with_flags(
+        io.clone(),
+        db_path_str,
+        OpenFlags::Create,
+        opts,
+        correct_encryption_opts.clone(),
+    )?;
+
     // step 1: Create encrypted database with correct key
     {
-        let encryption_opts = Some(EncryptionOpts {
-            cipher: "aegis256".to_string(),
-            hexkey: correct_key.to_string(),
-        });
-
-        let db = Database::open_file_with_flags(
-            io.clone(),
-            db_path_str,
-            OpenFlags::Create,
-            opts,
-            encryption_opts,
-        )?;
-
-        let conn = db.connect()?;
+        let conn = main_db.connect()?;
         conn.execute("CREATE TABLE secret_data (id INTEGER PRIMARY KEY, value TEXT)")?;
         conn.execute("INSERT INTO secret_data (value) VALUES ('top secret')")?;
         conn.query("PRAGMA wal_checkpoint(TRUNCATE)")?;
@@ -516,17 +516,12 @@ fn test_encryption_key_validation_with_cached_database(_db: TempDatabase) -> any
 
     // Step 2: re-open with correct key (this uses the DATABASE_MANAGER cache)
     {
-        let encryption_opts = Some(EncryptionOpts {
-            cipher: "aegis256".to_string(),
-            hexkey: correct_key.to_string(),
-        });
-
         let db = Database::open_file_with_flags(
             io.clone(),
             db_path_str,
             OpenFlags::default(),
             opts,
-            encryption_opts,
+            correct_encryption_opts.clone(),
         )?;
 
         let conn = db.connect()?;
@@ -588,17 +583,12 @@ fn test_encryption_key_validation_with_cached_database(_db: TempDatabase) -> any
 
     // Step 4: verify correct key still works after wrong key attempt
     {
-        let encryption_opts = Some(EncryptionOpts {
-            cipher: "aegis256".to_string(),
-            hexkey: correct_key.to_string(),
-        });
-
         let db = Database::open_file_with_flags(
             io.clone(),
             db_path_str,
             OpenFlags::default(),
             opts,
-            encryption_opts,
+            correct_encryption_opts.clone(),
         )?;
 
         let conn = db.connect()?;
