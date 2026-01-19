@@ -4,8 +4,8 @@ use crate::{
     io_yield_one, return_if_io,
     storage::sqlite3_ondisk::{read_varint, varint_len, write_varint},
     sync::{
-        atomic::{self, AtomicUsize, RwLock},
-        Arc,
+        atomic::{self, AtomicUsize},
+        Arc, RwLock,
     },
     translate::collate::CollationSeq,
     turso_assert,
@@ -237,6 +237,10 @@ impl HashEntry {
     /// Get the size of this entry in bytes (approximate).
     /// This is a lightweight estimate for memory budgeting, not a precise measurement.
     fn size_bytes(&self) -> usize {
+        Self::size_from_values(&self.key_values, &self.payload_values)
+    }
+
+    fn size_from_values(key_values: &[Value], payload_values: &[Value]) -> usize {
         let value_size = |v: &Value| match v {
             Value::Null => 1,
             Value::Integer(_) => 8,
@@ -244,8 +248,8 @@ impl HashEntry {
             Value::Text(t) => t.as_str().len(),
             Value::Blob(b) => b.len(),
         };
-        let key_size: usize = self.key_values.iter().map(value_size).sum();
-        let payload_size: usize = self.payload_values.iter().map(value_size).sum();
+        let key_size: usize = key_values.iter().map(value_size).sum();
+        let payload_size: usize = payload_values.iter().map(value_size).sum();
         key_size + payload_size + 8 + 8 // +8 for hash, +8 for rowid
     }
 
@@ -1250,7 +1254,7 @@ impl HashTable {
             total_size += varint_len(entry_size as u64) + entry_size;
         }
 
-        // Phase 2: Allocate I/O buffer and serialize using cached sizes
+        // Allocate I/O buffer and serialize using cached sizes
         let buffer = Buffer::new_temporary(total_size);
         let buf = buffer.as_mut_slice();
         let mut offset = 0;
@@ -1260,7 +1264,7 @@ impl HashTable {
             offset += entry.serialize_to_slice(&mut buf[offset..]);
         }
 
-        debug_assert_eq!(offset, total_size, "serialized size mismatch");
+        turso_assert!(offset == total_size, "serialized size mismatch");
 
         let file_offset = spill_state.next_spill_offset;
         let data_size = total_size;
@@ -1308,25 +1312,178 @@ impl HashTable {
         Ok(Some(completion))
     }
 
-    /// Spill as many whole partitions as needed to keep the incoming entry within budget.
-    fn spill_partitions_for_entry(&mut self, entry_size: usize) -> Result<Option<Completion>> {
-        loop {
-            if self.mem_used + entry_size <= self.mem_budget {
-                return Ok(None);
+    /// Spill multiple partitions in a single I/O operation.
+    /// This batches the work to reduce syscall overhead when freeing large amounts of memory.
+    fn spill_multiple_partitions(
+        &mut self,
+        partition_indices: &[usize],
+    ) -> Result<Option<Completion>> {
+        if partition_indices.is_empty() {
+            return Ok(None);
+        }
+
+        // If only one partition, use the simpler single-partition path
+        if partition_indices.len() == 1 {
+            return self.spill_partition(partition_indices[0]);
+        }
+
+        let spill_state = self.spill_state.as_mut().expect("Spill state must exist");
+
+        // Phase 1: Calculate total size and per-partition metadata
+        struct PartitionMeta {
+            idx: usize,
+            num_entries: usize,
+            data_size: usize,
+            mem_freed: usize,
+            entry_sizes: Vec<usize>,
+        }
+
+        let mut metas = Vec::with_capacity(partition_indices.len());
+        let mut total_size = 0usize;
+
+        for &partition_idx in partition_indices {
+            let partition = &spill_state.partition_buffers[partition_idx];
+            if partition.is_empty() {
+                continue;
             }
 
-            let required_free = self.mem_used + entry_size - self.mem_budget;
-            let Some(partition_idx) = self.next_partition_to_spill(required_free) else {
-                return Ok(None);
-            };
+            let mut entry_sizes = Vec::with_capacity(partition.entries.len());
+            let mut partition_size = 0usize;
+            for entry in &partition.entries {
+                let entry_size = entry.serialized_size();
+                entry_sizes.push(entry_size);
+                partition_size += varint_len(entry_size as u64) + entry_size;
+            }
 
-            if let Some(c) = self.spill_partition(partition_idx)? {
-                // Wait for caller to re-enter after the I/O completes.
-                if !c.finished() {
-                    return Ok(Some(c));
-                }
+            metas.push(PartitionMeta {
+                idx: partition_idx,
+                num_entries: partition.entries.len(),
+                data_size: partition_size,
+                mem_freed: partition.mem_used,
+                entry_sizes,
+            });
+            total_size += partition_size;
+        }
+
+        if metas.is_empty() {
+            return Ok(None);
+        }
+
+        // Allocate single I/O buffer and serialize all partitions
+        let buffer = Buffer::new_temporary(total_size);
+        let buf = buffer.as_mut_slice();
+        let mut offset = 0;
+        let base_file_offset = spill_state.next_spill_offset;
+
+        // Track where each partition's data starts in the buffer
+        let mut partition_offsets = Vec::with_capacity(metas.len());
+
+        for meta in &metas {
+            partition_offsets.push(offset);
+            let partition = &spill_state.partition_buffers[meta.idx];
+
+            for (entry, &entry_size) in partition.entries.iter().zip(meta.entry_sizes.iter()) {
+                offset += write_varint(&mut buf[offset..], entry_size as u64);
+                offset += entry.serialize_to_slice(&mut buf[offset..]);
             }
         }
+
+        turso_assert!(offset == total_size, "serialized size mismatch");
+
+        // Update partition metadata and clear buffers
+        let mut total_mem_freed = 0usize;
+        let mut io_states = Vec::with_capacity(metas.len());
+
+        for (meta, &partition_offset) in metas.iter().zip(partition_offsets.iter()) {
+            let file_offset = base_file_offset + partition_offset as u64;
+
+            spill_state.partition_buffers[meta.idx].clear();
+            total_mem_freed += meta.mem_freed;
+
+            // Find existing partition or create new one
+            let io_state = if let Some(existing) = spill_state.find_partition_mut(meta.idx) {
+                existing.add_chunk(file_offset, meta.data_size, meta.num_entries);
+                existing.io_state.clone()
+            } else {
+                let mut new_partition = SpilledPartition::new(meta.idx);
+                new_partition.add_chunk(file_offset, meta.data_size, meta.num_entries);
+                let io_state = new_partition.io_state.clone();
+                spill_state.partitions.push(new_partition);
+                io_state
+            };
+
+            io_state.set(SpillIOState::WaitingForWrite);
+            io_states.push(io_state);
+        }
+
+        // Submit single I/O write
+        let buffer_ref = Arc::new(buffer);
+        let _buffer_ref_clone = buffer_ref.clone();
+        let write_complete = Box::new(move |res: Result<i32, crate::CompletionError>| match res {
+            Ok(_) => {
+                let _buf = _buffer_ref_clone.clone();
+                tracing::trace!(
+                    "Successfully wrote {} batched partitions to disk",
+                    io_states.len()
+                );
+                for io_state in &io_states {
+                    io_state.set(SpillIOState::WriteComplete);
+                }
+            }
+            Err(e) => {
+                tracing::error!("Error writing batched partitions to disk: {e:?}");
+                for io_state in &io_states {
+                    io_state.set(SpillIOState::Error);
+                }
+            }
+        });
+
+        let completion = Completion::new_write(write_complete);
+        let file = spill_state.temp_file.file.clone();
+        let completion = file.pwrite(base_file_offset, buffer_ref, completion)?;
+
+        // Update state
+        self.mem_used -= total_mem_freed;
+        spill_state.next_spill_offset += total_size as u64;
+        Ok(Some(completion))
+    }
+
+    /// Spill as many whole partitions as needed to keep the incoming entry within budget.
+    /// Uses batch spilling to combine multiple partitions into a single I/O operation.
+    fn spill_partitions_for_entry(&mut self, entry_size: usize) -> Result<Option<Completion>> {
+        if self.mem_used + entry_size <= self.mem_budget {
+            return Ok(None);
+        }
+
+        // Collect all partitions that need to be spilled
+        let mut partitions_to_spill = Vec::new();
+        let mut projected_mem_used = self.mem_used;
+
+        let spill_state = self.spill_state.as_ref().expect("spill state must exist");
+
+        // Sort partitions by size (largest first) to minimize number of spills
+        let mut candidates: Vec<(usize, usize)> = spill_state
+            .partition_buffers
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| !p.is_empty())
+            .map(|(idx, p)| (idx, p.mem_used))
+            .collect();
+        candidates.sort_by(|a, b| b.1.cmp(&a.1)); // Sort descending by mem_used
+
+        for (partition_idx, mem_used) in candidates {
+            if projected_mem_used + entry_size <= self.mem_budget {
+                break;
+            }
+            partitions_to_spill.push(partition_idx);
+            projected_mem_used -= mem_used;
+        }
+
+        if partitions_to_spill.is_empty() {
+            return Ok(None);
+        }
+
+        self.spill_multiple_partitions(&partitions_to_spill)
     }
 
     /// Convert a never-spilled partition buffer into in-memory buckets for probing.
