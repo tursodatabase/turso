@@ -99,7 +99,7 @@ impl SqlBackend for RustBackend {
                 .query("PRAGMA journal_mode = 'experimental_mvcc'", ())
                 .await
                 .map_err(|e| {
-                    BackendError::CreateDatabase(format!("failed to enable MVCC mode: {}", e))
+                    BackendError::CreateDatabase(format!("failed to enable MVCC mode: {e}"))
                 })?;
             // Consume the result row
             let _ = rows.next().await;
@@ -164,7 +164,7 @@ impl RustDatabaseInstance {
                     remaining = &remaining[offset..];
                 }
                 Some(Err(e)) => {
-                    return Err(turso::Error::Error(format!("Parse error: {}", e)));
+                    return Err(turso::Error::Error(format!("Parse error: {e}")));
                 }
                 None => {
                     // No more statements
@@ -240,9 +240,9 @@ fn format_real(f: f64) -> String {
 
     // Use exponential notation for very large or very small numbers (like SQLite's %g)
     let abs_f = f.abs();
-    if abs_f != 0.0 && (abs_f >= 1e15 || abs_f < 1e-4) {
+    if abs_f != 0.0 && !(1e-4..1e15).contains(&abs_f) {
         // Use exponential notation with up to 15 significant digits
-        let formatted = format!("{:.14e}", f);
+        let formatted = format!("{f:.14e}");
         // Clean up: remove trailing zeros in mantissa and unnecessary + in exponent
         let formatted = clean_exponential(&formatted);
         return formatted;
@@ -273,20 +273,16 @@ fn format_with_significant_digits(f: f64, sig_digits: usize) -> String {
     };
 
     // Calculate decimal places needed for the desired significant digits
-    let decimal_places = if digits_before_decimal >= sig_digits {
-        0
-    } else {
-        sig_digits - digits_before_decimal
-    };
+    let decimal_places = sig_digits.saturating_sub(digits_before_decimal);
 
     // Format with calculated decimal places
-    let formatted = format!("{:.prec$}", f, prec = decimal_places);
+    let formatted = format!("{f:.decimal_places$}");
 
     // Remove trailing zeros after decimal point, but keep at least one digit after decimal
     if formatted.contains('.') {
         let trimmed = formatted.trim_end_matches('0');
         if trimmed.ends_with('.') {
-            format!("{}0", trimmed)
+            format!("{trimmed}0")
         } else {
             trimmed.to_string()
         }
@@ -305,14 +301,14 @@ fn clean_exponential(s: &str) -> String {
         // Remove trailing zeros from mantissa (but keep at least one digit after decimal)
         let mantissa = mantissa.trim_end_matches('0');
         let mantissa = if mantissa.ends_with('.') {
-            format!("{}0", mantissa)
+            format!("{mantissa}0")
         } else {
             mantissa.to_string()
         };
 
         // Parse and format exponent (remove leading zeros and +)
         let exp_num: i32 = exponent.parse().unwrap_or(0);
-        format!("{}e{:+}", mantissa, exp_num)
+        format!("{mantissa}e{exp_num:+}")
     } else {
         s.to_string()
     }

@@ -223,9 +223,7 @@ pub fn tokenize(input: &str) -> Result<Vec<SpannedToken>, LexerError> {
 /// Suggest a fix for an invalid token
 fn suggest_fix(slice: &str) -> Option<String> {
     if slice.starts_with('@') {
-        Some(format!(
-            "Valid directives are: @database, @setup, @skip, @skip-if, @backend. Did you mean one of these?"
-        ))
+        Some("Valid directives are: @database, @setup, @skip, @skip-if, @backend. Did you mean one of these?".to_string())
     } else if slice.starts_with(':') {
         Some(
             "Database specifiers are :memory:, :temp:, :default:, or :default-no-rowidalias:"
