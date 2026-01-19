@@ -1,3 +1,4 @@
+use crate::return_if_io;
 use crate::sync::RwLock;
 use crate::sync::{
     atomic::{self, AtomicUsize},
@@ -149,6 +150,28 @@ fn values_equal(v1: ValueRef, v2: ValueRef, collation: CollationSeq) -> bool {
     }
 }
 
+/// DISTINCT equality: NULLs compare equal to NULL.
+fn values_equal_distinct(v1: ValueRef, v2: ValueRef, collation: CollationSeq) -> bool {
+    match (v1, v2) {
+        (ValueRef::Null, ValueRef::Null) => true,
+        (ValueRef::Null, _) | (_, ValueRef::Null) => false,
+        _ => values_equal(v1, v2, collation),
+    }
+}
+
+fn keys_equal_distinct(key1: &[Value], key2: &[ValueRef], collations: &[CollationSeq]) -> bool {
+    if key1.len() != key2.len() {
+        return false;
+    }
+    for (idx, (v1, v2)) in key1.iter().zip(key2.iter()).enumerate() {
+        let collation = collations.get(idx).copied().unwrap_or(CollationSeq::Binary);
+        if !values_equal_distinct(v1.as_ref(), *v2, collation) {
+            return false;
+        }
+    }
+    true
+}
+
 /// State machine states for hash table operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HashTableState {
@@ -207,6 +230,10 @@ impl HashEntry {
 
     /// Get the size of this entry in bytes (approximate).
     fn size_bytes(&self) -> usize {
+        Self::size_from_values(&self.key_values, &self.payload_values)
+    }
+
+    fn size_from_values(key_values: &[Value], payload_values: &[Value]) -> usize {
         let value_size = |v: &Value| match v {
             Value::Null => 1,
             Value::Integer(_) => 8,
@@ -214,8 +241,8 @@ impl HashEntry {
             Value::Text(t) => t.as_str().len(),
             Value::Blob(b) => b.len(),
         };
-        let key_size: usize = self.key_values.iter().map(value_size).sum();
-        let payload_size: usize = self.payload_values.iter().map(value_size).sum();
+        let key_size: usize = key_values.iter().map(value_size).sum();
+        let payload_size: usize = payload_values.iter().map(value_size).sum();
         key_size + payload_size + 8 + 8 // +8 for hash, +8 for rowid
     }
 
@@ -361,8 +388,12 @@ impl HashEntry {
                         "HashEntry: buffer too small for text".to_string(),
                     ));
                 }
-                let s = String::from_utf8(buf[offset..offset + str_len as usize].to_vec())
-                    .map_err(|_| LimboError::Corrupt("Invalid UTF-8 in text".to_string()))?;
+                // SAFETY: We serialized this data ourselves, so it should be valid UTF-8.
+                // Skipping validation here for performance in the spill/reload path.
+                // Doing checked utf8 construction here is a massive performance hit.
+                let s = unsafe {
+                    String::from_utf8_unchecked(buf[offset..offset + str_len as usize].to_vec())
+                };
                 offset += str_len as usize;
                 Value::Text(s.into())
             }
@@ -643,7 +674,7 @@ impl SpillState {
     }
 }
 
-/// HashTable is the build-side data structure used for hash joins. It behaves like a
+/// HashTable is the build-side data structure used for hash joins and DISTINCT. It behaves like a
 /// standard in-memory hash table until a configurable memory budget is exceeded, at
 /// which point it transparently switches to a grace-hash-join style layout and spills
 /// partitions to disk.
@@ -664,7 +695,7 @@ impl SpillState {
 ///
 /// - Construction:
 ///   - `mem_budget` is an approximate upper bound on memory consumed by the
-///     build side for this join. It applies to:
+///     build side for this join or DISTINCT set. It applies to:
 ///       * `mem_used`: the base in-memory structures (buckets in non-spilled
 ///         mode, plus any never-spilled partitions).
 ///       * `loaded_partitions_mem`: additional resident memory for partitions
@@ -768,6 +799,8 @@ impl SpillState {
 ///     simply updates their position in the LRU without changing the memory
 ///     accounting.
 pub struct HashTable {
+    /// Initial bucket count used to reinitialize after spills.
+    initial_buckets: usize,
     /// The hash buckets (used when not spilled).
     buckets: Vec<HashBucket>,
     /// Number of entries in the table.
@@ -795,6 +828,8 @@ pub struct HashTable {
     spill_state: Option<SpillState>,
     /// Index of current spilled partition being probed
     current_spill_partition_idx: usize,
+    /// Track non-empty buckets for fast clear in distinct/group-by usage.
+    non_empty_buckets: Vec<usize>,
     /// LRU of loaded partitions to cap probe-time memory
     loaded_partitions_lru: RefCell<VecDeque<usize>>,
     /// Memory used by resident (loaded or in-memory) partitions
@@ -826,6 +861,7 @@ impl HashTable {
             .map(|_| HashBucket::new())
             .collect();
         Self {
+            initial_buckets: config.initial_buckets,
             buckets,
             num_entries: 0,
             mem_used: 0,
@@ -842,6 +878,7 @@ impl HashTable {
             current_spill_partition_idx: 0,
             loaded_partitions_lru: VecDeque::new().into(),
             loaded_partitions_mem: 0,
+            non_empty_buckets: Vec::new(),
         }
     }
 
@@ -853,6 +890,7 @@ impl HashTable {
     /// Insert a row into the hash table, returns IOResult because this may spill to disk.
     /// When memory budget is exceeded, triggers grace hash join by partitioning and spilling.
     /// Rows with NULL join keys are skipped since NULL != NULL in SQL.
+    /// (This is specific to hash join semantics, not DISTINCT.)
     pub fn insert(
         &mut self,
         key_values: Vec<Value>,
@@ -912,6 +950,9 @@ impl HashTable {
         } else {
             // Normal mode, insert into hash bucket
             let bucket_idx = (hash as usize) % self.buckets.len();
+            if self.buckets[bucket_idx].entries.is_empty() {
+                self.non_empty_buckets.push(bucket_idx);
+            }
             self.buckets[bucket_idx].insert(entry);
         }
 
@@ -919,6 +960,156 @@ impl HashTable {
         self.mem_used += entry_size;
 
         Ok(IOResult::Done(()))
+    }
+
+    /// Insert keys into the hash table if not already present.
+    /// Returns true if inserted, false if duplicate found.
+    /// Unlike hash join inserts, DISTINCT keeps NULLs and treats NULL==NULL.
+    pub fn insert_distinct(
+        &mut self,
+        key_values: &[Value],
+        key_refs: &[ValueRef],
+    ) -> Result<IOResult<bool>> {
+        turso_assert!(
+            self.state == HashTableState::Building || self.state == HashTableState::Spilled,
+            "Cannot insert into hash table in state {:?}",
+            self.state
+        );
+
+        let hash = hash_join_key(key_refs, &self.collations);
+
+        if self.spill_state.is_some() {
+            let partition_idx = partition_from_hash(hash);
+            // Check partition buffer for duplicates
+            let has_buffer_dup = {
+                let spill_state = self.spill_state.as_ref().expect("spill state exists");
+                let buffer = &spill_state.partition_buffers[partition_idx];
+                buffer.entries.iter().any(|entry| {
+                    entry.hash == hash
+                        && keys_equal_distinct(&entry.key_values, key_refs, &self.collations)
+                })
+            };
+            if has_buffer_dup {
+                return Ok(IOResult::Done(false));
+            }
+
+            // Ensure spilled partition is loaded before checking
+            let has_partition = {
+                let spill_state = self.spill_state.as_ref().expect("spill state exists");
+                spill_state.find_partition(partition_idx).is_some()
+            };
+            if has_partition && !self.is_partition_loaded(partition_idx) {
+                return_if_io!(self.load_spilled_partition(partition_idx));
+            }
+
+            // Check loaded partition for duplicates
+            let has_spilled_dup = 'has_spilled_dup: {
+                let spill_state = self.spill_state.as_ref().expect("spill state exists");
+                let Some(partition) = spill_state.find_partition(partition_idx) else {
+                    break 'has_spilled_dup false;
+                };
+                if partition.buckets.is_empty() {
+                    break 'has_spilled_dup false;
+                }
+                let bucket_idx = (hash as usize) % partition.buckets.len();
+                let bucket = &partition.buckets[bucket_idx];
+                bucket.entries.iter().any(|entry| {
+                    entry.hash == hash
+                        && keys_equal_distinct(&entry.key_values, key_refs, &self.collations)
+                })
+            };
+            if has_spilled_dup {
+                return Ok(IOResult::Done(false));
+            }
+
+            let entry_size = HashEntry::size_from_values(key_values, &[]);
+            if let Some(c) = self.spill_partitions_for_entry(entry_size)? {
+                if !c.succeeded() {
+                    return Ok(IOResult::IO(IOCompletions::Single(c)));
+                }
+            }
+
+            {
+                let spill_state = self.spill_state.as_mut().expect("spill state exists");
+                spill_state.partition_buffers[partition_idx].insert(HashEntry::new(
+                    hash,
+                    key_values.to_vec(),
+                    0,
+                ));
+            }
+            self.num_entries += 1;
+            self.mem_used += entry_size;
+            return Ok(IOResult::Done(true));
+        }
+
+        // Non-spilled mode: check main buckets
+        let bucket_idx = (hash as usize) % self.buckets.len();
+        let bucket = &self.buckets[bucket_idx];
+        for entry in &bucket.entries {
+            if entry.hash == hash
+                && keys_equal_distinct(&entry.key_values, key_refs, &self.collations)
+            {
+                return Ok(IOResult::Done(false));
+            }
+        }
+
+        let entry_size = HashEntry::size_from_values(key_values, &[]);
+        if self.mem_used + entry_size > self.mem_budget {
+            if self.spill_state.is_none() {
+                self.spill_state = Some(SpillState::new(&self.io)?);
+                self.redistribute_to_partitions();
+                self.state = HashTableState::Spilled;
+            }
+            return self.insert_distinct(key_values, key_refs);
+        }
+
+        if self.buckets[bucket_idx].entries.is_empty() {
+            self.non_empty_buckets.push(bucket_idx);
+        }
+        self.buckets[bucket_idx].insert(HashEntry::new(hash, key_values.to_vec(), 0));
+        self.num_entries += 1;
+        self.mem_used += entry_size;
+        Ok(IOResult::Done(true))
+    }
+
+    /// Clear all entries and reset spill state.
+    pub fn clear(&mut self) {
+        if self.num_entries == 0 && self.spill_state.is_none() {
+            self.state = HashTableState::Building;
+            self.current_probe_keys = None;
+            self.current_probe_hash = None;
+            self.probe_bucket_idx = 0;
+            self.probe_entry_idx = 0;
+            self.current_spill_partition_idx = 0;
+            self.loaded_partitions_lru.borrow_mut().clear();
+            self.loaded_partitions_mem = 0;
+            self.non_empty_buckets.clear();
+            return;
+        }
+
+        if self.spill_state.is_some() {
+            // Drop spilled partitions and reset buckets.
+            self.spill_state = None;
+            let bucket_count = self.initial_buckets.max(1);
+            self.buckets = (0..bucket_count).map(|_| HashBucket::new()).collect();
+            self.non_empty_buckets.clear();
+        } else {
+            for &idx in &self.non_empty_buckets {
+                self.buckets[idx].entries.clear();
+            }
+            self.non_empty_buckets.clear();
+        }
+
+        self.num_entries = 0;
+        self.mem_used = 0;
+        self.state = HashTableState::Building;
+        self.current_probe_keys = None;
+        self.current_probe_hash = None;
+        self.probe_bucket_idx = 0;
+        self.probe_entry_idx = 0;
+        self.current_spill_partition_idx = 0;
+        self.loaded_partitions_lru.borrow_mut().clear();
+        self.loaded_partitions_mem = 0;
     }
 
     /// Redistribute existing bucket entries into partition buffers for grace hash join.

@@ -19,6 +19,9 @@ use crate::{
     CaptureDataChangesMode, Connection, Value, VirtualTable,
 };
 
+// Keep distinct hash-table ids far from table internal ids to avoid collisions.
+const HASH_TABLE_ID_BASE: usize = 1 << 30;
+
 #[derive(Default)]
 pub struct TableRefIdCounter {
     next_free: ast::TableInternalId,
@@ -106,6 +109,7 @@ pub struct ProgramBuilder {
     pub table_reference_counter: TableRefIdCounter,
     next_free_register: usize,
     next_free_cursor_id: usize,
+    next_hash_table_id: usize,
     /// Instruction, the function to execute it with, and its original index in the vector.
     pub insns: Vec<(Insn, usize)>,
     /// A span of instructions from (offset_start_inclusive, offset_end_exclusive),
@@ -343,6 +347,7 @@ impl ProgramBuilder {
             table_reference_counter: TableRefIdCounter::new(),
             next_free_register: 1,
             next_free_cursor_id: 0,
+            next_hash_table_id: HASH_TABLE_ID_BASE,
             insns: Vec::with_capacity(opts.approx_num_insns),
             cursor_ref: Vec::with_capacity(opts.num_cursors),
             constant_spans: Vec::new(),
@@ -373,6 +378,15 @@ impl ProgramBuilder {
             hash_tables_to_keep_open: HashSet::new(),
             subquery_result_regs: HashMap::new(),
         }
+    }
+
+    pub fn alloc_hash_table_id(&mut self) -> usize {
+        let id = self.next_hash_table_id;
+        self.next_hash_table_id = self
+            .next_hash_table_id
+            .checked_add(1)
+            .expect("hash table id overflow");
+        id
     }
 
     pub fn set_resolve_type(&mut self, resolve_type: ResolveType) {
@@ -1040,6 +1054,7 @@ impl ProgramBuilder {
                 Insn::Filter { target_pc, .. } => resolve(target_pc, "Filter")?,
                 Insn::HashProbe { target_pc, .. } => resolve(target_pc, "HashProbe")?,
                 Insn::HashNext { target_pc, .. } => resolve(target_pc, "HashNext")?,
+                Insn::HashDistinct { data } => resolve(&mut data.target_pc, "HashDistinct")?,
                 _ => {}
             }
         }

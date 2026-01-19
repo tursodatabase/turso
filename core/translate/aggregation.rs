@@ -5,7 +5,7 @@ use crate::{
     translate::collate::CollationSeq,
     vdbe::{
         builder::ProgramBuilder,
-        insn::{to_u16, IdxInsertFlags, Insn},
+        insn::{HashDistinctData, Insn},
     },
     LimboError, Result,
 };
@@ -155,26 +155,14 @@ pub fn handle_distinct(
         .as_ref()
         .expect("distinct aggregate context not populated");
     let num_regs = 1;
-    program.emit_insn(Insn::Found {
-        cursor_id: distinct_ctx.cursor_id,
-        target_pc: distinct_ctx.label_on_conflict,
-        record_reg: agg_arg_reg,
-        num_regs,
-    });
-    let record_reg = program.alloc_register();
-    program.emit_insn(Insn::MakeRecord {
-        start_reg: to_u16(agg_arg_reg),
-        count: to_u16(num_regs),
-        dest_reg: to_u16(record_reg),
-        index_name: Some(distinct_ctx.ephemeral_index_name.to_string()),
-        affinity_str: None,
-    });
-    program.emit_insn(Insn::IdxInsert {
-        cursor_id: distinct_ctx.cursor_id,
-        record_reg,
-        unpacked_start: None,
-        unpacked_count: None,
-        flags: IdxInsertFlags::new(),
+    program.emit_insn(Insn::HashDistinct {
+        data: Box::new(HashDistinctData {
+            hash_table_id: distinct_ctx.hash_table_id,
+            key_start_reg: agg_arg_reg,
+            num_keys: num_regs,
+            collations: distinct_ctx.collations.clone(),
+            target_pc: distinct_ctx.label_on_conflict,
+        }),
     });
 }
 
