@@ -883,11 +883,23 @@ fn update_auto_vacuum_mode(
     largest_root_page_number: u32,
     pager: Arc<Pager>,
 ) -> crate::Result<()> {
-    pager.io.block(|| {
-        pager.with_header_mut(|header| {
-            header.vacuum_mode_largest_root_page = largest_root_page_number.into()
-        })
+    // Get the header page reference and modify it
+    let header_ref = pager.io.block(|| {
+        crate::storage::pager::HeaderRefMut::from_pager(&pager)
     })?;
+    
+    // Modify the header in a tight scope
+    {
+        let header = header_ref.borrow_mut();
+        header.vacuum_mode_largest_root_page = largest_root_page_number.into();
+    }
+    
+    // Write the header page to disk to ensure the file is created
+    // This is necessary because SQLite's behavior is to create a DB file
+    // when any write transaction modifies an empty database
+    let completion = crate::storage::sqlite3_ondisk::begin_write_btree_page(&pager, header_ref.page())?;
+    pager.io.wait_for_completion(completion)?;
+    
     pager.set_auto_vacuum_mode(auto_vacuum_mode);
     Ok(())
 }
@@ -1022,18 +1034,30 @@ fn update_page_size(connection: Arc<crate::Connection>, page_size: u32) -> crate
 }
 
 fn is_database_empty(schema: &Schema, pager: &Arc<Pager>) -> crate::Result<bool> {
-    if schema.tables.len() > 1 {
+    // Count only non-virtual tables (B-Tree tables)
+    let non_virtual_table_count = schema.tables.values().filter(|table| {
+        matches!(table.as_ref(), crate::schema::Table::BTree(_))
+    }).count();
+    
+    if non_virtual_table_count > 1 {
         return Ok(false);
     }
-    if let Some(table_arc) = schema.tables.values().next() {
-        let table_name = match table_arc.as_ref() {
-            crate::schema::Table::BTree(tbl) => &tbl.name,
-            crate::schema::Table::Virtual(tbl) => &tbl.name,
-            crate::schema::Table::FromClauseSubquery(tbl) => &tbl.name,
-        };
+    
+    // Check if the only table is sqlite_schema
+    if non_virtual_table_count == 1 {
+        let first_btree_table = schema.tables.values().find(|table| {
+            matches!(table.as_ref(), crate::schema::Table::BTree(_))
+        });
+        
+        if let Some(table_arc) = first_btree_table {
+            let table_name = match table_arc.as_ref() {
+                crate::schema::Table::BTree(tbl) => &tbl.name,
+                _ => unreachable!(),
+            };
 
-        if table_name != "sqlite_schema" {
-            return Ok(false);
+            if table_name != "sqlite_schema" {
+                return Ok(false);
+            }
         }
     }
 
@@ -1043,7 +1067,8 @@ fn is_database_empty(schema: &Schema, pager: &Arc<Pager>) -> crate::Result<bool>
 
     match db_size_result {
         Err(_) => Ok(true),
-        Ok(0 | 1) => Ok(true),
-        Ok(_) => Ok(false),
+        // Size 0 means no pages allocated yet, size 1 means only page 1 (header) exists
+        // Both indicate an empty database with no user data
+        Ok(size) => Ok(size == 0 || size == 1),
     }
 }
