@@ -12,7 +12,7 @@
  * - Uses platform-native networking (not C++ HTTP libraries)
  */
 
-import { NativeSyncIoItem, NativeSyncDatabase } from '../types';
+import type { NativeSyncIoItem, NativeSyncDatabase } from '../types';
 
 // Get the TursoProxy for native file system functions
 declare const __TursoProxy: any;
@@ -22,7 +22,7 @@ declare const __TursoProxy: any;
  */
 export interface IoContext {
   /** Auth token for HTTP requests */
-  authToken?: string | (() => string | null);
+  authToken?: string | (() => string | Promise<string> | null);
   /** Base URL for normalization (e.g., 'libsql://mydb.turso.io') */
   baseUrl?: string;
 }
@@ -131,7 +131,7 @@ function getAuthToken(context: IoContext): string | null {
   }
 
   if (typeof context.authToken === 'function') {
-    return context.authToken();
+    return context.authToken() as unknown as string | null;
   }
 
   return context.authToken;
@@ -249,7 +249,7 @@ async function processFullRead(item: NativeSyncIoItem): Promise<void> {
 
     // Push data to item
     if (data.byteLength > 0) {
-      item.pushBuffer(data.buffer);
+      item.pushBuffer(data.buffer as ArrayBuffer);
     }
 
     // Mark as done

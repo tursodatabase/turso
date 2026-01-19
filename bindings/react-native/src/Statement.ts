@@ -5,15 +5,14 @@
  * Handles parameter binding, row conversion, and result collection.
  */
 
-import {
+import type {
   NativeStatement,
   SQLiteValue,
   BindParams,
   Row,
   RunResult,
-  TursoStatus,
-  TursoType,
 } from './types';
+import { TursoStatus, TursoType } from './types';
 
 /**
  * Prepared SQL statement
@@ -107,7 +106,7 @@ export class Statement {
     } else if (typeof value === 'string') {
       this._statement.bindPositionalText(position, value);
     } else if (value instanceof ArrayBuffer || ArrayBuffer.isView(value)) {
-      const buffer = value instanceof ArrayBuffer ? value : value.buffer;
+      const buffer = value as unknown as ArrayBuffer;
       this._statement.bindPositionalBlob(position, buffer);
     } else {
       throw new Error(`Unsupported parameter type: ${typeof value}`);

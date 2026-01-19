@@ -10,16 +10,16 @@
  * - Extract and return the final result
  */
 
-import {
+import type {
   NativeSyncOperation,
   NativeSyncDatabase,
-  TursoStatus,
-  SyncOperationResultType,
   NativeConnection,
   NativeSyncChanges,
   SyncStats,
 } from '../types';
-import { processIoItem, IoContext } from './ioProcessor';
+import { TursoStatus, SyncOperationResultType } from '../types';
+import { processIoItem } from './ioProcessor';
+import type { IoContext } from './ioProcessor';
 
 /**
  * Drive an async operation to completion

@@ -6,13 +6,13 @@
  */
 
 import { Statement } from './Statement';
-import {
+import type {
   NativeDatabase,
   NativeSyncDatabase,
   NativeConnection,
   Row,
   RunResult,
-  SQLiteValue,
+
   BindParams,
   DatabaseOpts,
   SyncStats,
@@ -49,7 +49,10 @@ export class Database {
   private _connected = false;
   private _closed = false;
   private _extraIo?: () => Promise<void>;
-  private _ioContext?: { authToken?: string | (() => string | null); baseUrl?: string };
+  private _ioContext?: {
+    authToken?: string | (() => string | Promise<string> | null);
+    baseUrl: string;
+  };
 
   /**
    * Create a new database (doesn't connect yet - call connect())
