@@ -2,7 +2,7 @@
 
 set testdir [file dirname $argv0]
 source $testdir/tester.tcl
-source $testdir/sqlite3/tester.tcl
+source $testdir/../sqlite3/tester.tcl
 
 do_execsql_test_on_specific_db {:memory:} fk-basic-ok {
     PRAGMA foreign_keys=ON;

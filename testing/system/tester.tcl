@@ -1,6 +1,6 @@
 set sqlite_exec [expr {[info exists env(SQLITE_EXEC)] ? $env(SQLITE_EXEC) : "sqlite3"}]
-set test_dbs [list "testing/testing.db" "testing/testing_norowidalias.db"]
-set test_small_dbs [list "testing/testing_small.db" ]
+set test_dbs [list "testing/system/testing.db" "testing/system/testing_norowidalias.db"]
+set test_small_dbs [list "testing/system/testing_small.db" ]
 
 # Array storing loaded extensions
 array set extensions {}

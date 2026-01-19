@@ -4,7 +4,7 @@ import sqlite3
 
 from faker import Faker
 
-conn = sqlite3.connect("testing/testing-bigass.db")
+conn = sqlite3.connect("testing/system/testing-bigass.db")
 cursor = conn.cursor()
 
 fake = Faker()
