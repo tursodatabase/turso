@@ -14,7 +14,6 @@
     "ios",
     "android",
     "turso-react-native.podspec",
-    "react-native.config.js",
     "!**/__tests__",
     "!**/__fixtures__",
     "!**/__mocks__",
@@ -84,13 +83,5 @@
         }
       ]
     ]
-  },
-  "codegenConfig": {
-    "name": "TursoSpec",
-    "type": "modules",
-    "jsSrcsDir": "src",
-    "android": {
-      "javaPackageName": "com.turso.reactnative"
-    }
   }
 }
