@@ -33,7 +33,7 @@ COPY packages ./packages/
 COPY testing/sqlite_test_ext ./testing/sqlite_test_ext
 COPY testing/simulator ./testing/simulator/
 COPY sql_generation ./sql_generation/
-COPY whopper ./whopper
+COPY testing/concurrent-simulator ./testing/concurrent-simulator
 COPY perf/encryption ./perf/encryption
 COPY perf/throughput/rusqlite ./perf/throughput/rusqlite
 COPY perf/throughput/turso ./perf/throughput/turso
@@ -65,7 +65,7 @@ COPY --from=planner /app/packages ./packages/
 COPY --from=planner /app/testing/sqlite_test_ext ./testing/sqlite_test_ext
 COPY --from=planner /app/testing/simulator ./testing/simulator/
 COPY --from=planner /app/sql_generation ./sql_generation/
-COPY --from=planner /app/whopper ./whopper
+COPY --from=planner /app/testing/concurrent-simulator ./testing/concurrent-simulator
 COPY --from=planner /app/perf/encryption ./perf/encryption
 COPY --from=planner /app/perf/throughput/rusqlite ./perf/throughput/rusqlite
 COPY --from=planner /app/perf/throughput/turso ./perf/throughput/turso
