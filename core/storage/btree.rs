@@ -20,7 +20,7 @@ use crate::{
         },
     },
     translate::plan::IterationDirection,
-    turso_assert, turso_assert_reachable, turso_assert_sometimes,
+    turso_assert, turso_assert_reachable, turso_assert_sometimes, turso_assert_unreachable,
     types::{
         find_compare, get_tie_breaker_from_seek_op, IOCompletions, IndexInfo, RecordCompare,
         SeekResult,
@@ -751,8 +751,8 @@ impl BTreeCursor {
         }
         let rowid = match self.get_immutable_record().as_ref().unwrap().last_value() {
             Some(Ok(ValueRef::Integer(rowid))) => rowid,
-            _ => unreachable!(
-                "index where has_rowid() is true should have an integer rowid as the last value"
+            _ => turso_assert_unreachable!(
+                "btree: index where has_rowid() is true should have an integer rowid as the last value"
             ),
         };
         Some(rowid)
@@ -1170,7 +1170,7 @@ impl BTreeCursor {
                             }
                         }
                         None => {
-                            unreachable!("interior page should have a rightmost pointer");
+                            turso_assert_unreachable!("btree: interior page should have a rightmost pointer");
                         }
                     }
                 }
@@ -1220,7 +1220,7 @@ impl BTreeCursor {
             }
 
             let CursorSeekState::InteriorPageBinarySearch { state } = &self.seek_state else {
-                unreachable!("we must be in an interior binary search state");
+                turso_assert_unreachable!("btree: we must be in an interior binary search state");
             };
 
             let mut state = *state;
@@ -1290,7 +1290,7 @@ impl BTreeCursor {
                     return Ok(ControlFlow::Continue(()));
                 }
                 None => {
-                    unreachable!("we shall not go back up! The only way is down the slope");
+                    turso_assert_unreachable!("btree: we shall not go back up! The only way is down the slope");
                 }
             }
         }
@@ -1399,10 +1399,7 @@ impl BTreeCursor {
             }
 
             let CursorSeekState::InteriorPageBinarySearch { state } = &self.seek_state else {
-                unreachable!(
-                    "we must be in an interior binary search state, got {:?}",
-                    self.seek_state
-                );
+                turso_assert_unreachable!("btree: we must be in an interior binary search state");
             };
 
             let mut state = *state;
@@ -1467,7 +1464,7 @@ impl BTreeCursor {
                         return Ok(ControlFlow::Continue(()));
                     }
                     None => {
-                        unreachable!("we shall not go back up! The only way is down the slope");
+                        turso_assert_unreachable!("btree: we shall not go back up! The only way is down the slope");
                     }
                 }
             };
@@ -1490,7 +1487,7 @@ impl BTreeCursor {
                 left_child_page, ..
             }) = &matching_cell
             else {
-                unreachable!("unexpected cell type: {:?}", matching_cell);
+                turso_assert_unreachable!("btree: unexpected cell type in interior page");
             };
 
             {
@@ -1528,7 +1525,7 @@ impl BTreeCursor {
             ..
         }) = &cell
         else {
-            unreachable!("unexpected cell type: {:?}", cell);
+            turso_assert_unreachable!("btree: unexpected cell type in index interior");
         };
 
         if let Some(next_page) = first_overflow_page {
@@ -1662,7 +1659,7 @@ impl BTreeCursor {
         }
 
         let CursorSeekState::LeafPageBinarySearch { state } = &self.seek_state else {
-            unreachable!("we must be in a leaf binary search state");
+            turso_assert_unreachable!("btree: we must be in a leaf binary search state");
         };
 
         let page = self.stack.top_ref().clone();
@@ -1807,10 +1804,7 @@ impl BTreeCursor {
             // No need for another move_to_root. Move_to already moves to root
             return_if_io!(self.move_to(SeekKey::IndexKey(key), seek_op));
             let CursorSeekState::FoundLeaf { eq_seen } = &self.seek_state else {
-                unreachable!(
-                    "We must still be in FoundLeaf state after move_to, got: {:?}",
-                    self.seek_state
-                );
+                turso_assert_unreachable!("btree: We must still be in FoundLeaf state after move_to");
             };
             let eq_seen = *eq_seen;
             let page = self.stack.top_ref();
@@ -1843,10 +1837,7 @@ impl BTreeCursor {
         }
 
         let CursorSeekState::LeafPageBinarySearch { state } = &self.seek_state else {
-            unreachable!(
-                "we must be in a leaf binary search state, got: {:?}",
-                self.seek_state
-            );
+            turso_assert_unreachable!("btree: we must be in a leaf binary search state");
         };
 
         let old_top_idx = self.stack.current();
@@ -1932,7 +1923,7 @@ impl BTreeCursor {
             payload_size,
         }) = &cell
         else {
-            unreachable!("unexpected cell type: {:?}", cell);
+            turso_assert_unreachable!("btree: unexpected cell type in index leaf seek");
         };
 
         if let Some(next_page) = first_overflow_page {
@@ -2021,6 +2012,7 @@ impl BTreeCursor {
 
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
     pub fn move_to(&mut self, key: SeekKey<'_>, cmp: SeekOp) -> Result<IOResult<()>> {
+        turso_assert_reachable!("btree: move_to executed");
         tracing::trace!(?key, ?cmp);
         // For a table with N rows, we can find any row by row id in O(log(N)) time by starting at the root page and following the B-tree pointers.
         // B-trees consist of interior pages and leaf pages. Interior pages contain pointers to other pages, while leaf pages contain the actual row data.
@@ -2082,6 +2074,7 @@ impl BTreeCursor {
     /// If the insert operation overflows the page, it will be split and the btree will be balanced.
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
     fn insert_into_page(&mut self, bkey: &BTreeKey) -> Result<IOResult<()>> {
+        turso_assert_reachable!("btree: insert_into_page executed");
         let record = bkey
             .get_record()
             .expect("expected record present on insert");
@@ -2302,6 +2295,7 @@ impl BTreeCursor {
     /// If `Some(depth)`, the page on the stack at depth `depth` will be rebalanced after balancing the current page.
     #[cfg_attr(debug_assertions, instrument(skip(self), level = Level::DEBUG))]
     fn balance(&mut self, balance_ancestor_at_depth: Option<usize>) -> Result<IOResult<()>> {
+        turso_assert_reachable!("btree: balance executed");
         loop {
             let usable_space = self.usable_space();
             let BalanceState {
@@ -2377,12 +2371,8 @@ impl BTreeCursor {
                             let parent_contents = parent.get_contents();
 
                             turso_assert_sometimes!(
-                                parent_contents.rightmost_pointer().is_none(),
-                                "Parent page is a leaf page! This is the issue from https://github.com/tursodatabase/turso/issues/4603",
-                                {
-                                    "cur_page_contents": format!("{:?}", cur_page_contents),
-                                    "parent_page_contents": format!("{:?}", parent_contents)
-                                }
+                                parent_contents.rightmost_pointer().ok().flatten().is_none(),
+                                "btree: parent page is a leaf page during balance"
                             );
 
                             if parent.get().id != 1
@@ -2430,7 +2420,7 @@ impl BTreeCursor {
     /// 4. Continue balance from the parent page (inserting the new divider cell may have overflowed the parent)
     #[cfg_attr(debug_assertions, instrument(skip(self), level = Level::DEBUG))]
     fn balance_quick(&mut self) -> Result<IOResult<()>> {
-        turso_assert_reachable!("balance_quick path executed");
+        turso_assert_reachable!("btree: balance_quick executed");
         // Since we are going to change the btree structure, let's forget our cached knowledge of the rightmost page.
         let _ = self.move_to_right_state.1.take();
 
@@ -2509,6 +2499,7 @@ impl BTreeCursor {
     /// Balance a non root page by trying to balance cells between a maximum of 3 siblings that should be neighboring the page that overflowed/underflowed.
     #[cfg_attr(debug_assertions, instrument(skip(self), level = Level::DEBUG))]
     fn balance_non_root(&mut self) -> Result<IOResult<()>> {
+        turso_assert_reachable!("btree: balance_non_root executed");
         loop {
             let usable_space = self.usable_space();
             let BalanceState {
@@ -3566,8 +3557,7 @@ impl BTreeCursor {
                             overflow_cell_count_after > overflow_cell_count_before;
                         turso_assert_sometimes!(
                             divider_cell_is_overflow_cell,
-                            "parent overflowed during divider cell insertion",
-                            { "parent_page_id": parent_page.get().id, "sibling_page_idx": sibling_page_idx }
+                            "btree: parent overflowed during divider cell insertion"
                         );
                         #[cfg(debug_assertions)]
                         {
@@ -4157,13 +4147,13 @@ impl BTreeCursor {
                         .unwrap();
                     let rowid = match cell {
                         BTreeCell::TableLeafCell(table_leaf_cell) => table_leaf_cell.rowid,
-                        _ => unreachable!(),
+                        _ => turso_assert_unreachable!("btree: expected table leaf cell"),
                     };
                     let rowid_parent = match parent_cell {
                         BTreeCell::TableInteriorCell(table_interior_cell) => {
                             table_interior_cell.rowid
                         }
-                        _ => unreachable!(),
+                        _ => turso_assert_unreachable!("btree: expected table interior cell"),
                     };
                     if rowid_parent != rowid {
                         tracing::error!("balance_non_root(cell_divider_rowid, page_id={}, cell_divider_idx={}, rowid_parent={}, rowid={})",
@@ -4241,7 +4231,7 @@ impl BTreeCursor {
                             }
                         }
                         _ => {
-                            unreachable!()
+                            turso_assert_unreachable!("btree: unexpected page type")
                         }
                     }
                     current_index_cell += 1;
@@ -4270,6 +4260,7 @@ impl BTreeCursor {
     /// This is done when the root page overflows, and we need to create a new root page.
     /// See e.g. https://en.wikipedia.org/wiki/B-tree
     fn balance_root(&mut self) -> Result<IOResult<()>> {
+        turso_assert_reachable!("btree: balance_root executed");
         /* todo: balance deeper, create child and copy contents of root there. Then split root */
         /* if we are in root page then we just need to create a new root and push key there */
 
@@ -4361,6 +4352,7 @@ impl BTreeCursor {
     /// resumed from last point after IO interruption
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
     fn clear_overflow_pages(&mut self, cell: &BTreeCell) -> Result<IOResult<()>> {
+        turso_assert_reachable!("btree: clear_overflow_pages executed");
         loop {
             match self.overflow_state.clone() {
                 OverflowState::Start => {
@@ -4535,7 +4527,7 @@ impl BTreeCursor {
                                 destroy_info.state = DestroyState::FreePage;
                                 continue;
                             }
-                            _ => unreachable!("Invalid cell idx state"),
+                            _ => turso_assert_unreachable!("btree: Invalid cell idx state"),
                         }
                     }
 
@@ -4910,6 +4902,7 @@ impl CursorTrait for BTreeCursor {
 
     #[cfg_attr(debug_assertions, instrument(skip(self, key), level = Level::DEBUG))]
     fn seek(&mut self, key: SeekKey<'_>, op: SeekOp) -> Result<IOResult<SeekResult>> {
+        turso_assert_reachable!("btree: seek executed");
         self.skip_advance = false;
         // Empty trace to capture the span information
         tracing::trace!("");
@@ -4961,7 +4954,7 @@ impl CursorTrait for BTreeCursor {
                 first_overflow_page,
                 payload_size,
             }) => (payload, payload_size, first_overflow_page),
-            _ => unreachable!("unexpected page_type"),
+            _ => turso_assert_unreachable!("btree: unexpected page_type"),
         };
         if let Some(next_page) = first_overflow_page {
             return_if_io!(self.process_overflow_read(payload, next_page, payload_size))
@@ -4981,6 +4974,7 @@ impl CursorTrait for BTreeCursor {
 
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
     fn insert(&mut self, key: &BTreeKey) -> Result<IOResult<()>> {
+        turso_assert_reachable!("btree: insert executed");
         tracing::debug!(valid_state = ?self.valid_state, cursor_state = ?self.state, is_write_in_progress = self.is_write_in_progress());
         return_if_io!(self.insert_into_page(key));
         if key.maybe_rowid().is_some() {
@@ -5003,6 +4997,7 @@ impl CursorTrait for BTreeCursor {
     /// 9. SeekAfterBalancing -> adjust the cursor to a node that is closer to the deleted value. go to Finish
     /// 10. Finish -> Delete operation is done. Return CursorResult(Ok())
     fn delete(&mut self) -> Result<IOResult<()>> {
+        turso_assert_reachable!("btree: delete executed");
         if let CursorState::None = &self.state {
             self.state = CursorState::Delete(DeleteState::Start);
         }
@@ -5011,7 +5006,7 @@ impl CursorTrait for BTreeCursor {
             let usable_space = self.usable_space();
             let delete_state = match &mut self.state {
                 CursorState::Delete(x) => x,
-                _ => unreachable!("expected delete state"),
+                _ => turso_assert_unreachable!("btree: expected delete state"),
             };
             tracing::debug!(?delete_state);
 
@@ -5043,7 +5038,7 @@ impl CursorTrait for BTreeCursor {
                     let target_key = if page.is_index()? {
                         let record = match return_if_io!(self.record()) {
                             Some(record) => record.clone(),
-                            None => unreachable!("there should've been a record"),
+                            None => turso_assert_unreachable!("btree: there should've been a record"),
                         };
                         CursorContext {
                             key: CursorContextKey::IndexKeyRowId(record),
@@ -5119,7 +5114,7 @@ impl CursorTrait for BTreeCursor {
                         ..
                     }) = self.state
                     else {
-                        unreachable!("expected clear overflow pages state");
+                        turso_assert_unreachable!("btree: expected clear overflow pages state");
                     };
 
                     let page = self.stack.top_ref();
@@ -5166,7 +5161,7 @@ impl CursorTrait for BTreeCursor {
                         ..
                     }) = self.state
                     else {
-                        unreachable!("expected interior node replacement state");
+                        turso_assert_unreachable!("btree: expected interior node replacement state");
                     };
 
                     // Ensure we keep the parent page at the same position as before the replacement.
@@ -5208,7 +5203,7 @@ impl CursorTrait for BTreeCursor {
                                         .extend_from_slice(&first_overflow_page.to_be_bytes());
                                 }
                             }
-                            _ => unreachable!("Expected table leaf cell"),
+                            _ => turso_assert_unreachable!("btree: Expected table leaf cell"),
                         }
                         (cell_payload, leaf_cell_idx)
                     };
@@ -5289,7 +5284,7 @@ impl CursorTrait for BTreeCursor {
                         ..
                     }) = self.state
                     else {
-                        unreachable!("expected check needs balancing state");
+                        turso_assert_unreachable!("btree: expected check needs balancing state");
                     };
 
                     if needs_balancing {
@@ -5378,7 +5373,7 @@ impl CursorTrait for BTreeCursor {
     fn exists(&mut self, key: &Value) -> Result<IOResult<bool>> {
         let int_key = match key {
             Value::Integer(i) => i,
-            _ => unreachable!("btree tables are indexed by integers!"),
+            _ => turso_assert_unreachable!("btree: btree tables are indexed by integers!"),
         };
         let seek_result =
             return_if_io!(self.seek(SeekKey::TableRowId(*int_key), SeekOp::GE { eq_only: true }));
@@ -5503,7 +5498,7 @@ impl CursorTrait for BTreeCursor {
                                     io_yield_one!(c);
                                 }
                             }
-                            _ => unreachable!(),
+                            _ => turso_assert_unreachable!("btree: unexpected cell type in count"),
                         }
                     }
                 }
@@ -5619,7 +5614,7 @@ impl CursorTrait for BTreeCursor {
                                 io_yield_one!(c);
                             }
                         }
-                        None => unreachable!("interior page must have rightmost pointer"),
+                        None => turso_assert_unreachable!("btree: interior page must have rightmost pointer"),
                     }
                 }
             }
@@ -7704,7 +7699,7 @@ fn fill_cell_payload(
                         if let Some(prev_page) = current_overflow_page {
                             turso_assert_sometimes!(
                                 true,
-                                "allocated second overflow page for a single cell"
+                                "btree: allocated second overflow page for a single cell"
                             );
                             turso_assert!(
                                 prev_page.is_loaded(),
@@ -9738,7 +9733,7 @@ mod tests {
                     }
                     assert_eq!(page_contents.cell_count(), cells.len());
                 }
-                _ => unreachable!(),
+                _ => turso_assert_unreachable!("btree: unexpected random test action"),
             }
             let free = compute_free_space(page_contents, usable_space);
             assert_eq!(free, 4096 - total_size - header_size);
@@ -9818,7 +9813,7 @@ mod tests {
                     2 => {
                         defragment_page(page_contents, usable_space, 4).unwrap();
                     }
-                    _ => unreachable!(),
+                    _ => turso_assert_unreachable!("btree: unexpected random test action"),
                 }
                 let free = compute_free_space(page_contents, usable_space);
                 assert_eq!(free, 4096 - total_size - header_size);
