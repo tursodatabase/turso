@@ -169,3 +169,7 @@ required-features = ["bench"]
 name = "hash_spill_benchmark"
 harness = false
 required-features = ["bench"]
+
+[[bench]]
+name = "write_perf_benchmark"
+harness = false
