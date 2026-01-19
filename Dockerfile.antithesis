@@ -27,7 +27,7 @@ COPY ./parser ./parser/
 COPY ./perf/encryption ./perf/encryption
 COPY ./perf/throughput/rusqlite ./perf/throughput/rusqlite/
 COPY ./perf/throughput/turso ./perf/throughput/turso/
-COPY ./simulator ./simulator/
+COPY ./testing/simulator ./testing/simulator/
 COPY ./sql_generation ./sql_generation
 COPY ./sqlite3 ./sqlite3/
 COPY ./testing/stress ./testing/stress/
@@ -72,7 +72,7 @@ COPY --from=planner /app/parser ./parser/
 COPY --from=planner /app/perf/encryption ./perf/encryption
 COPY --from=planner /app/perf/throughput/rusqlite ./perf/throughput/rusqlite/
 COPY --from=planner /app/perf/throughput/turso ./perf/throughput/turso/
-COPY --from=planner /app/simulator ./simulator/
+COPY --from=planner /app/testing/simulator ./testing/simulator/
 COPY --from=planner /app/sql_generation ./sql_generation
 COPY --from=planner /app/sqlite3 ./sqlite3/
 COPY --from=planner /app/testing/stress ./testing/stress/

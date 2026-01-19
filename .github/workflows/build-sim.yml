@@ -42,5 +42,5 @@ jobs:
 
       - name: Build and push limbo-sim docker image
         run: |
-          docker build -f simulator-docker-runner/Dockerfile.simulator -t ${{ env.ECR_URL }}/${{ env.ECR_IMAGE_NAME }} --build-arg GIT_HASH=${{ env.GIT_HASH }} .
+          docker build -f testing/simulator/simulator-docker-runner/Dockerfile.simulator -t ${{ env.ECR_URL }}/${{ env.ECR_IMAGE_NAME }} --build-arg GIT_HASH=${{ env.GIT_HASH }} .
           docker push ${{ env.ECR_URL }}/${{ env.ECR_IMAGE_NAME }}
