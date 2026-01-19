@@ -563,6 +563,11 @@ fn test_encryption_key_validation_with_cached_database(_db: TempDatabase) -> any
             result.is_err(),
             "Opening with wrong key should fail, but succeeded!"
         );
+        assert!(result
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("Encryption key does not match existing database encryption key"));
     }
 
     // Step 4: lets open without key - this MUST fail
@@ -579,6 +584,11 @@ fn test_encryption_key_validation_with_cached_database(_db: TempDatabase) -> any
             result.is_err(),
             "Opening without key should fail, but succeeded!"
         );
+        assert!(result
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("Database is encrypted but no encryption options provided"));
     }
 
     // Step 4: verify correct key still works after wrong key attempt
