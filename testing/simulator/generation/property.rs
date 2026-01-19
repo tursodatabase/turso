@@ -238,7 +238,8 @@ impl Property {
             | Property::UnionAllPreservesCardinality { .. }
             | Property::ReadYourUpdatesBack { .. }
             | Property::TableHasExpectedContent { .. }
-            | Property::AllTableHaveExpectedContent { .. } => {
+            | Property::AllTableHaveExpectedContent { .. }
+            | Property::StatementAtomicity { .. } => {
                 unreachable!("No extensional queries")
             }
         }
@@ -325,12 +326,15 @@ impl Property {
                 let table_dependency = table.clone();
                 let assumption = InteractionType::Assumption(Assertion::new(
                     format!("table {} exists", table.clone()),
-                    move |_: &Vec<ResultSet>, env: &mut SimulatorEnv| {
-                        let conn_tables = env.get_conn_tables(connection_index);
-                        if conn_tables.iter().any(|t| t.name == table.clone()) {
-                            Ok(Ok(()))
-                        } else {
-                            Ok(Err(format!("table {} does not exist", table.clone())))
+                    {
+                        let table = table.clone();
+                        move |_: &Vec<ResultSet>, env: &mut SimulatorEnv| {
+                            let conn_tables = env.get_conn_tables(connection_index);
+                            if conn_tables.iter().any(|t| t.name == table) {
+                                Ok(Ok(()))
+                            } else {
+                                Ok(Err(format!("table {} does not exist", table)))
+                            }
                         }
                     },
                     vec![table_dependency.clone()],
@@ -353,12 +357,14 @@ impl Property {
                         match rows {
                             Ok(rows) => {
                                 for row in rows {
-                                    for (i, (col, val)) in update.set_values.iter().enumerate() {
+                                    for (i, (col, set_val)) in update.set_values.iter().enumerate()
+                                    {
+                                        let val = set_val.value();
                                         if &row[i] != val {
                                             let update_rows = update
                                                 .set_values
                                                 .iter()
-                                                .map(|(_, val)| val.clone())
+                                                .map(|(_, set_value)| set_value.value().clone())
                                                 .collect::<Vec<_>>();
                                             print_diff(
                                                 &[row.to_vec()],
@@ -1117,6 +1123,178 @@ impl Property {
                 .into_iter()
                 .map(|query| InteractionBuilder::with_interaction(InteractionType::Query(query)))
                 .collect(),
+            Property::StatementAtomicity { table, statement } => {
+                let table_name = table.clone();
+                let table_dependency = table.clone();
+
+                let assumption = InteractionType::Assumption(Assertion::new(
+                    format!("table {} exists", table),
+                    {
+                        let table_name = table.clone();
+                        move |_: &Vec<ResultSet>, env: &mut SimulatorEnv| {
+                            let conn_tables = env.get_conn_tables(connection_index);
+                            if conn_tables.iter().any(|t| t.name == table_name) {
+                                Ok(Ok(()))
+                            } else {
+                                let available_tables: Vec<String> =
+                                    conn_tables.iter().map(|t| t.name.clone()).collect();
+                                Ok(Err(format!(
+                                    "table '{}' not found. available tables: {:?}",
+                                    table_name, available_tables
+                                )))
+                            }
+                        }
+                    },
+                    vec![table_dependency.clone()],
+                ));
+
+                let snapshot_before = InteractionBuilder::with_interaction(InteractionType::Query(
+                    Query::Select(Select::simple(table.clone(), Predicate::true_())),
+                ));
+
+                let begin_tx = InteractionBuilder::with_interaction(InteractionType::Query(
+                    Query::Begin(Begin::Immediate),
+                ));
+
+                let dml_interaction = {
+                    let mut builder = InteractionBuilder::with_interaction(InteractionType::Query(
+                        statement.clone(),
+                    ));
+                    builder.ignore_error(true);
+                    builder
+                };
+
+                let snapshot_after_dml =
+                    InteractionBuilder::with_interaction(InteractionType::Query(Query::Select(
+                        Select::simple(table.clone(), Predicate::true_()),
+                    )));
+
+                let commit_tx = InteractionBuilder::with_interaction(InteractionType::Query(
+                    Query::Commit(Commit),
+                ));
+
+                // Snapshot after commit for verification
+                let final_select = InteractionBuilder::with_interaction(InteractionType::Query(
+                    Query::Select(Select::simple(table.clone(), Predicate::true_())),
+                ));
+
+                let assertion = InteractionType::Assertion(Assertion::new(
+                    format!("{} should be unchanged after failed statement", table_name),
+                    move |stack: &Vec<ResultSet>, _env| {
+                        // Stack layout:
+                        // [0] = snapshot before (outside tx)
+                        // [1] = BEGIN result
+                        // [2] = DML result (may be Ok or Err)
+                        // [3] = snapshot after DML (inside tx)
+                        // [4] = COMMIT result
+                        // [5] = final SELECT (after commit)
+
+                        let before = &stack[0];
+                        let dml_result = &stack[2];
+                        let after_dml = &stack[3];
+                        let final_result = &stack[5];
+
+                        if dml_result.is_ok() {
+                            tracing::trace!(
+                                "StatementAtomicity: DML succeeded, skipping atomicity check"
+                            );
+                            return Ok(Ok(()));
+                        }
+
+                        tracing::debug!("StatementAtomicity: DML failed, verifying atomicity");
+
+                        let before_rows = match before {
+                            Ok(rows) => rows,
+                            Err(e) => {
+                                return Err(LimboError::InternalError(format!(
+                                    "snapshot before SELECT failed: {}",
+                                    e
+                                )));
+                            }
+                        };
+
+                        let after_dml_rows = match after_dml {
+                            Ok(rows) => rows,
+                            Err(e) => {
+                                return Err(LimboError::InternalError(format!(
+                                    "snapshot after DML SELECT failed: {}",
+                                    e
+                                )));
+                            }
+                        };
+
+                        let final_rows = match final_result {
+                            Ok(rows) => rows,
+                            Err(e) => {
+                                return Err(LimboError::InternalError(format!(
+                                    "final SELECT failed: {}",
+                                    e
+                                )));
+                            }
+                        };
+
+                        // Check in-transaction snapshot matches before
+                        if before_rows.len() != after_dml_rows.len() {
+                            return Ok(Err(format!(
+                                "row count changed from {} to {} after failed statement (in-tx)",
+                                before_rows.len(),
+                                after_dml_rows.len()
+                            )));
+                        }
+
+                        for row in before_rows {
+                            if !after_dml_rows.contains(row) {
+                                return Ok(Err(format!(
+                                    "row {:?} was modified by failed statement (in-tx)",
+                                    row
+                                )));
+                            }
+                        }
+
+                        // Check final snapshot after commit matches before
+                        if before_rows.len() != final_rows.len() {
+                            return Ok(Err(format!(
+                                "row count changed from {} to {} after commit",
+                                before_rows.len(),
+                                final_rows.len()
+                            )));
+                        }
+
+                        for row in before_rows {
+                            if !final_rows.contains(row) {
+                                return Ok(Err(format!(
+                                    "row {:?} missing after commit",
+                                    row
+                                )));
+                            }
+                        }
+
+                        for row in final_rows {
+                            if !before_rows.contains(row) {
+                                return Ok(Err(format!(
+                                    "unexpected row {:?} appeared after commit",
+                                    row
+                                )));
+                            }
+                        }
+
+                        tracing::trace!("StatementAtomicity: PASSED");
+                        Ok(Ok(()))
+                    },
+                    vec![table_dependency],
+                ));
+
+                vec![
+                    InteractionBuilder::with_interaction(assumption),
+                    snapshot_before,
+                    begin_tx,
+                    dml_interaction,
+                    snapshot_after_dml,
+                    commit_tx,
+                    final_select,
+                    InteractionBuilder::with_interaction(assertion),
+                ]
+            }
         };
 
         assert!(!interactions.is_empty());
@@ -1165,7 +1343,6 @@ fn assert_all_table_values(
                                 !table.rows.contains(v)
                             });
 
-
                             if let Some(model_contains_db) = model_contains_db {
                                 tracing::debug!(
                                     "table {} does not contain the expected values, the simulator model has more rows than the database: {:?}",
@@ -1203,9 +1380,19 @@ fn property_insert_values_select<R: rand::Rng + ?Sized>(
     mvcc: bool,
 ) -> Property {
     assert!(!ctx.tables().is_empty());
-    // Get a random table
-    let table = pick(ctx.tables(), rng);
-    // Generate rows to insert
+
+    let non_unique_tables: Vec<_> = ctx
+        .tables()
+        .iter()
+        .filter(|t| !t.has_any_unique_column())
+        .collect();
+
+    let table = if non_unique_tables.is_empty() {
+        pick(ctx.tables(), rng)
+    } else {
+        *pick(&non_unique_tables, rng)
+    };
+
     let rows = (0..rng.random_range(1..=5))
         .map(|_| Vec::<SimValue>::arbitrary_from(rng, ctx, table))
         .collect::<Vec<_>>();
@@ -1500,6 +1687,27 @@ fn property_faulty_query<R: rand::Rng + ?Sized>(
     }
 }
 
+/// Generate a property that tests statement atomicity.
+///
+/// Verifies that if a DML statement fails, the table state remains unchanged.
+fn property_statement_atomicity<R: rand::Rng + ?Sized>(
+    rng: &mut R,
+    _query_distr: &QueryDistribution,
+    ctx: &impl GenerationContext,
+    _mvcc: bool,
+) -> Property {
+    assert!(!ctx.tables().is_empty());
+
+    let update = Update::arbitrary(rng, ctx);
+    let table_name = update.table.clone();
+    let statement = Query::Update(update);
+
+    Property::StatementAtomicity {
+        table: table_name,
+        statement,
+    }
+}
+
 type PropertyGenFunc<R, G> = fn(&mut R, &QueryDistribution, &G, bool) -> Property;
 
 impl PropertyDiscriminants {
@@ -1529,6 +1737,7 @@ impl PropertyDiscriminants {
             PropertyDiscriminants::Queries => {
                 unreachable!("should not try to generate queries property")
             }
+            PropertyDiscriminants::StatementAtomicity => property_statement_atomicity,
         }
     }
 
@@ -1541,11 +1750,18 @@ impl PropertyDiscriminants {
         match self {
             PropertyDiscriminants::InsertValuesSelect => {
                 if !env.opts.disable_insert_values_select && !ctx.tables().is_empty() {
-                    u32::min(remaining.select, remaining.insert).max(1)
+                    let has_non_unique_table =
+                        ctx.tables().iter().any(|t| !t.has_any_unique_column());
+                    if has_non_unique_table {
+                        u32::min(remaining.select, remaining.insert).max(1)
+                    } else {
+                        0 // all tables have UNIQUE columns, skip this property
+                    }
                 } else {
                     0
                 }
             }
+
             PropertyDiscriminants::ReadYourUpdatesBack => {
                 u32::min(remaining.select, remaining.insert).max(1)
             }
@@ -1627,6 +1843,13 @@ impl PropertyDiscriminants {
             PropertyDiscriminants::Queries => {
                 unreachable!("queries property should not be generated")
             }
+            PropertyDiscriminants::StatementAtomicity => {
+                if !ctx.tables().is_empty() {
+                    (remaining.insert + remaining.update + remaining.delete).max(1) / 3
+                } else {
+                    0
+                }
+            }
         }
     }
 
@@ -1665,6 +1888,12 @@ impl PropertyDiscriminants {
             PropertyDiscriminants::FsyncNoWait => QueryCapabilities::all(),
             PropertyDiscriminants::FaultyQuery => QueryCapabilities::all(),
             PropertyDiscriminants::Queries => panic!("queries property should not be generated"),
+            PropertyDiscriminants::StatementAtomicity => {
+                QueryCapabilities::SELECT
+                    .union(QueryCapabilities::INSERT)
+                    .union(QueryCapabilities::UPDATE)
+                    .union(QueryCapabilities::DELETE)
+            }
         }
     }
 }

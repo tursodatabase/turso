@@ -5,13 +5,19 @@ use sql_generation::model::table::SimValue;
 use tracing::instrument;
 use turso_core::{Connection, LimboError, Result, Value};
 
-/// Checks if an error is a recoverable error should not fail the simulation.
-/// These errors indicate expected transaction-related behavior, not bugs.
+/// Checks if an error is a recoverable error that should not fail the simulation.
+/// These errors indicate expected behavior, not bugs.
 ///
 /// - WriteWriteConflict: MVCC conflict, the DB rolled back the transaction
 /// - TxError: Transaction state error (e.g., BEGIN twice, COMMIT with no transaction)
+/// - Constraint: Constraint violation (e.g., UNIQUE, NOT NULL). The simulator may generate
+///   queries that violate constraints (e.g., UPDATE setting a unique column to the same value
+///   across multiple rows). The DB correctly rejects these with statement-level rollback.
 fn is_recoverable_tx_error(err: &LimboError) -> bool {
-    matches!(err, LimboError::WriteWriteConflict | LimboError::TxError(_))
+    matches!(
+        err,
+        LimboError::WriteWriteConflict | LimboError::TxError(_) | LimboError::Constraint(_)
+    )
 }
 
 /// Returns true if the error indicates the transaction was rolled back by the database.
@@ -215,21 +221,23 @@ pub fn execute_interaction_turso(
                     .inspect_err(|err| tracing::error!(?err))
             };
 
-            // Handle errors: recoverable tx errors continue simulation, others fail it
-            let skip_shadow = if let Err(err) = &results
-                && !interaction.ignore_error
-            {
-                if is_recoverable_tx_error(err) {
+            // Handle errors: skip shadow on any failed query
+            // - Without ignore_error: recoverable errors skip property, others fail simulation
+            // - With ignore_error: skip shadow but continue executing the property
+            let (skip_shadow, skip_property) = if let Err(err) = &results {
+                if interaction.ignore_error {
+                    (true, false) // query failed but ignore_error is set: skip shadow, continue property
+                } else if is_recoverable_tx_error(err) {
                     // Only rollback shadow state if the DB actually rolled back
                     if error_causes_rollback(err) && env.conn_in_transaction(connection_index) {
                         env.rollback_conn(connection_index);
                     }
-                    true // skip shadowing this failed query
+                    (true, true) // skip shadow and skip rest of property
                 } else {
                     return Err(err.clone());
                 }
             } else {
-                false // success or ignore_error set, shadow normally
+                (false, false) // success shadow normally, continue property
             };
 
             stack.push(results);
@@ -244,7 +252,12 @@ pub fn execute_interaction_turso(
             env.update_conn_last_interaction(connection_index, Some(query));
 
             if skip_shadow {
-                return Ok(ExecutionContinuation::NextInteractionOutsideThisProperty);
+                if skip_property {
+                    return Ok(ExecutionContinuation::NextInteractionOutsideThisProperty);
+                } else {
+                    // Skip shadow but continue to next interaction in this property
+                    return Ok(ExecutionContinuation::NextInteraction);
+                }
             }
         }
         InteractionType::FsyncQuery(query) => {
@@ -353,11 +366,19 @@ fn execute_interaction_rusqlite(
             let results = execute_query_rusqlite(conn, query).map_err(|e| {
                 turso_core::LimboError::InternalError(format!("error executing query: {e}"))
             });
-            if let Err(err) = &results
-                && !interaction.ignore_error
-            {
-                return Err(err.clone());
+
+            // Skip shadow on any failed query, if ignore_error is set, continue property
+            if let Err(err) = &results {
+                let err_clone = err.clone();
+                stack.push(results);
+                if interaction.ignore_error {
+                    // Skip shadow but continue property
+                    return Ok(ExecutionContinuation::NextInteraction);
+                } else {
+                    return Err(err_clone);
+                }
             }
+
             tracing::debug!("{:?}", results);
             stack.push(results);
             env.update_conn_last_interaction(interaction.connection_index, Some(query));

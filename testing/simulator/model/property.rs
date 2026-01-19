@@ -184,6 +184,12 @@ pub enum Property {
     Queries {
         queries: Vec<Query>,
     },
+    /// StatementAtomicity is sued to see if failed statements has any effect
+    StatementAtomicity {
+        table: String,
+        /// The DML statement to execute (may or may not fail)
+        statement: Query,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -226,7 +232,8 @@ impl Property {
             | Property::UnionAllPreservesCardinality { .. }
             | Property::ReadYourUpdatesBack { .. }
             | Property::TableHasExpectedContent { .. }
-            | Property::AllTableHaveExpectedContent { .. } => None,
+            | Property::AllTableHaveExpectedContent { .. }
+            | Property::StatementAtomicity { .. } => None,
         }
     }
 }
