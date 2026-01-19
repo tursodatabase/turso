@@ -478,8 +478,6 @@ fn prepare_one_select_plan(
             }
             plan.order_by = key;
             if let Some(group_by) = &mut plan.group_by {
-                // now that we have resolved the ORDER BY expressions and aggregates, we can
-                // compute the necessary sort order for the GROUP BY clause
                 group_by.sort_order = Some(compute_group_by_sort_order(
                     &group_by.exprs,
                     &plan.order_by,

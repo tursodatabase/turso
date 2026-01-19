@@ -268,6 +268,15 @@ pub fn compute_group_by_sort_order(
     if groupby_len == 0 || order_by.is_empty() {
         return vec![SortOrder::Asc; groupby_len];
     }
+
+    // SQLite compatibility: when GROUP BY and ORDER BY have the same number
+    // of expressions, SQLite copies the sort directions from ORDER BY to
+    // GROUP BY position-by-position (see sqlite3CopySortOrder in select.c).
+    // This ensures the GROUP BY traversal order matches ORDER BY semantics.
+    if groupby_len == order_by.len() {
+        return order_by.iter().map(|(_, dir)| *dir).collect();
+    }
+
     let only_agg_or_const = order_by
         .iter()
         .all(|(e, _)| is_orderby_agg_or_const(resolver, e, aggs));
