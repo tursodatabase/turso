@@ -1,45 +1,41 @@
 {
-  "name": "turso_example",
+  "name": "TursoExample",
   "version": "0.0.1",
   "private": true,
   "scripts": {
     "android": "react-native run-android",
-    "ios": "react-native run-ios --scheme='debug' --simulator='iPhone 16 Pro'",
-    "run:ios:unused": "xcodebuild -workspace ios/TursoExample.xcworkspace -scheme release -configuration Release -sdk iphonesimulator -destination 'platform=iOS Simulator,name=iPhone 16 Pro' clean build",
-    "run:ios:release": "react-native run-ios --scheme='release' --no-packager",
+    "ios": "react-native run-ios",
+    "lint": "eslint .",
     "start": "react-native start",
-    "pods": "cd ios && bundle exec pod install && rm -f .xcode.env.local",
-    "pods:nuke": "cd ios && rm -rf Pods && rm -rf Podfile.lock && bundle exec pod install",
-    "run:android:release": "cd android && ./gradlew assembleRelease && adb install -r app/build/outputs/apk/release/app-release.apk && adb shell am start -n com.turso.example/.MainActivity",
-    "build:android": "cd android && ./gradlew assembleDebug --no-daemon --console=plain -PreactNativeArchitectures=arm64-v8a",
-    "build:ios": "cd ios && xcodebuild -workspace TursoExample.xcworkspace -scheme debug -configuration Debug -sdk iphonesimulator CC=clang CPLUSPLUS=clang++ LD=clang LDPLUSPLUS=clang++ GCC_OPTIMIZATION_LEVEL=0 GCC_PRECOMPILE_PREFIX_HEADER=YES ASSETCATALOG_COMPILER_OPTIMIZATION=time DEBUG_INFORMATION_FORMAT=dwarf COMPILER_INDEX_STORE_ENABLE=NO"
+    "test": "jest"
   },
   "dependencies": {
-    "@op-engineering/op-test": "^0.2.5",
-    "chance": "^1.1.9",
-    "clsx": "^2.0.0",
-    "events": "^3.3.0",
-    "react": "19.1.1",
-    "react-native": "0.82.1",
-    "react-native-safe-area-context": "^5.6.2"
+    "react": "19.2.0",
+    "react-native": "0.83.1",
+    "@react-native/new-app-screen": "0.83.1",
+    "react-native-safe-area-context": "^5.5.2"
   },
   "devDependencies": {
     "@babel/core": "^7.25.2",
     "@babel/preset-env": "^7.25.3",
     "@babel/runtime": "^7.25.0",
-    "@react-native-community/cli": "^18.0.0",
-    "@react-native-community/cli-platform-android": "18.0.0",
-    "@react-native-community/cli-platform-ios": "18.0.0",
-    "@react-native/babel-preset": "0.82.1",
-    "@react-native/metro-config": "0.82.1",
-    "@react-native/typescript-config": "0.81.5",
-    "@types/chance": "^1.1.7",
-    "@types/react": "^19.1.1",
-    "react-native-builder-bob": "^0.40.13",
-    "react-native-restart": "^0.0.27",
-    "tailwindcss": "3.3.2"
+    "@react-native-community/cli": "20.0.0",
+    "@react-native-community/cli-platform-android": "20.0.0",
+    "@react-native-community/cli-platform-ios": "20.0.0",
+    "@react-native/babel-preset": "0.83.1",
+    "@react-native/eslint-config": "0.83.1",
+    "@react-native/metro-config": "0.83.1",
+    "@react-native/typescript-config": "0.83.1",
+    "@types/jest": "^29.5.13",
+    "@types/react": "^19.2.0",
+    "@types/react-test-renderer": "^19.1.0",
+    "eslint": "^8.19.0",
+    "jest": "^29.6.3",
+    "prettier": "2.8.8",
+    "react-test-renderer": "19.2.0",
+    "typescript": "^5.8.3"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=20"
   }
 }

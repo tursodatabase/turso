@@ -1,4 +1,4 @@
-package com.turso.example;
+package com.tursoexample
 
 import com.facebook.react.ReactActivity
 import com.facebook.react.ReactActivityDelegate
