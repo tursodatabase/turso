@@ -15,6 +15,7 @@ use crate::storage::btree::CursorTrait;
 use crate::storage::sqlite3_ondisk::{read_integer, read_value, read_varint, write_varint};
 use crate::translate::collate::CollationSeq;
 use crate::translate::plan::IterationDirection;
+use crate::turso_assert_unreachable;
 use crate::vdbe::sorter::Sorter;
 use crate::vdbe::Register;
 use crate::vtab::VirtualTableCursor;
@@ -466,7 +467,7 @@ impl Value {
                     SerialTypeKind::I32 => out.extend_from_slice(&(*i as i32).to_be_bytes()),
                     SerialTypeKind::I48 => out.extend_from_slice(&i.to_be_bytes()[2..]), // remove 2 most significant bytes
                     SerialTypeKind::I64 => out.extend_from_slice(&i.to_be_bytes()),
-                    _ => unreachable!(),
+                    _ => turso_assert_unreachable!("types: unexpected serial type for integer"),
                 }
             }
             Value::Float(f) => out.extend_from_slice(&f.to_be_bytes()),
@@ -596,7 +597,7 @@ macro_rules! impl_int_from_value {
                 match val {
                     Value::Null => Err(LimboError::NullValue),
                     Value::Integer(i) => Ok($cast(i)),
-                    _ => unreachable!("invalid value type"),
+                    _ => turso_assert_unreachable!("types: invalid integer value type"),
                 }
             }
         }
@@ -615,7 +616,7 @@ impl FromValue for f64 {
         match val {
             Value::Null => Err(LimboError::NullValue),
             Value::Float(f) => Ok(f),
-            _ => unreachable!("invalid value type"),
+            _ => turso_assert_unreachable!("types: invalid float value type"),
         }
     }
 }
@@ -626,7 +627,7 @@ impl FromValue for Vec<u8> {
         match val {
             Value::Null => Err(LimboError::NullValue),
             Value::Blob(blob) => Ok(blob),
-            _ => unreachable!("invalid value type"),
+            _ => turso_assert_unreachable!("types: invalid blob value type"),
         }
     }
 }
@@ -637,7 +638,7 @@ impl<const N: usize> FromValue for [u8; N] {
         match val {
             Value::Null => Err(LimboError::NullValue),
             Value::Blob(blob) => blob.try_into().map_err(|_| LimboError::InvalidBlobSize(N)),
-            _ => unreachable!("invalid value type"),
+            _ => turso_assert_unreachable!("types: invalid blob array value type"),
         }
     }
 }
@@ -648,7 +649,7 @@ impl FromValue for String {
         match val {
             Value::Null => Err(LimboError::NullValue),
             Value::Text(s) => Ok(s.to_string()),
-            _ => unreachable!("invalid value type"),
+            _ => turso_assert_unreachable!("types: invalid string value type"),
         }
     }
 }
@@ -663,7 +664,7 @@ impl FromValue for bool {
                 1 => Ok(true),
                 _ => Err(LimboError::InvalidColumnType),
             },
-            _ => unreachable!("invalid value type"),
+            _ => turso_assert_unreachable!("types: invalid bool value type"),
         }
     }
 }
@@ -835,7 +836,7 @@ impl std::ops::AddAssign<i64> for Value {
         match self {
             Self::Integer(int_left) => *int_left += rhs,
             Self::Float(float_left) => *float_left += rhs as f64,
-            _ => unreachable!(),
+            _ => turso_assert_unreachable!("types: add assign i64 to non-numeric value"),
         }
     }
 }
@@ -845,7 +846,7 @@ impl std::ops::AddAssign<f64> for Value {
         match self {
             Self::Integer(int_left) => *self = Self::Float(*int_left as f64 + rhs),
             Self::Float(float_left) => *float_left += rhs,
-            _ => unreachable!(),
+            _ => turso_assert_unreachable!("types: add assign f64 to non-numeric value"),
         }
     }
 }
@@ -2447,9 +2448,9 @@ impl SerialType {
             n if n >= 12 => match n % 2 {
                 0 => SerialTypeKind::Blob,
                 1 => SerialTypeKind::Text,
-                _ => unreachable!(),
+                _ => turso_assert_unreachable!("types: modulo 2 cannot produce other values"),
             },
-            _ => unreachable!(),
+            _ => turso_assert_unreachable!("types: invalid serial type kind value"),
         }
     }
 
@@ -2484,7 +2485,7 @@ pub fn get_serial_type_size(serial: u64) -> Result<usize> {
         n if n >= 12 => match n % 2 {
             0 => Ok(((n - 12) / 2) as usize), // Blob
             1 => Ok(((n - 13) / 2) as usize), // Text
-            _ => unreachable!(),
+            _ => turso_assert_unreachable!("types: modulo 2 cannot produce other values"),
         },
         _ => Err(LimboError::Corrupt(format!(
             "Invalid serial type: {serial}"
@@ -2597,7 +2598,7 @@ impl Record {
                         SerialTypeKind::I32 => buf.extend_from_slice(&(*i as i32).to_be_bytes()),
                         SerialTypeKind::I48 => buf.extend_from_slice(&i.to_be_bytes()[2..]), // remove 2 most significant bytes
                         SerialTypeKind::I64 => buf.extend_from_slice(&i.to_be_bytes()),
-                        _ => unreachable!(),
+                        _ => turso_assert_unreachable!("types: unexpected serial type for integer serialization"),
                     }
                 }
                 Value::Float(f) => buf.extend_from_slice(&f.to_be_bytes()),
