@@ -43,7 +43,7 @@ export default function App() {
     }
 
     // cleanup db state
-    await db.exec("DROP TABLE users");
+    await db.exec("DROP TABLE IF EXISTS users");
 
     // Test: Simple SELECT
     try {
