@@ -1,5 +1,5 @@
 [package]
-name = "sim_redo"
+name = "differential-fuzzer"
 version.workspace = true
 authors.workspace = true
 edition = "2024"
@@ -7,7 +7,7 @@ license.workspace = true
 repository.workspace = true
 
 [[bin]]
-name = "sim_redo"
+name = "differential_fuzzer"
 path = "main.rs"
 
 [lib]

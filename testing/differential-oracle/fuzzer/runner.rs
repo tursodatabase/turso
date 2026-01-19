@@ -297,36 +297,17 @@ impl Simulator {
 
             // Execute on both databases and check oracle
             match check_differential(&self.turso_conn, &self.sqlite_conn, &stmt) {
-                Ok(OracleResult::Pass) => {
+                OracleResult::Pass => {
                     stats.statements_executed += 1;
                     executed_sql.push(sql.clone());
-
-                    // After DDL statements, re-introspect both databases and verify schemas match
-                    if is_ddl {
-                        schema = self.introspect_and_verify_schemas().map_err(|e| {
-                            anyhow::anyhow!("Schema mismatch after DDL statement {i} ({sql}): {e}")
-                        })?;
-                        tracing::debug!(
-                            "Schema updated after DDL: {} tables, {} indexes",
-                            schema.tables.len(),
-                            schema.indexes.len()
-                        );
-                    }
                 }
-                Ok(OracleResult::Warning(reason)) => {
+                OracleResult::Warning(reason) => {
                     stats.statements_executed += 1;
                     stats.warnings += 1;
                     executed_sql.push(sql.clone());
                     tracing::warn!("Oracle warning at statement {i}: {reason}");
-
-                    // Still process DDL after warnings
-                    if is_ddl {
-                        schema = self.introspect_and_verify_schemas().map_err(|e| {
-                            anyhow::anyhow!("Schema mismatch after DDL statement {i} ({sql}): {e}")
-                        })?;
-                    }
                 }
-                Ok(OracleResult::Fail(reason)) => {
+                OracleResult::Fail(reason) => {
                     stats.oracle_failures += 1;
                     executed_sql.push(format!("-- FAILED: {sql}"));
                     tracing::error!("Oracle failure at statement {i}: {reason}");
@@ -335,11 +316,17 @@ impl Simulator {
                     }
                     return Err(anyhow::anyhow!("Oracle failure: {reason}"));
                 }
-                Err(e) => {
-                    stats.errors += 1;
-                    executed_sql.push(format!("-- ERROR: {sql}"));
-                    tracing::warn!("Error executing statement {i}: {e}");
-                }
+            }
+
+            if is_ddl {
+                schema = self.introspect_and_verify_schemas().map_err(|e| {
+                    anyhow::anyhow!("Schema mismatch after DDL statement {i} ({sql}): {e}")
+                })?;
+                tracing::debug!(
+                    "Schema updated after DDL: {} tables, {} indexes",
+                    schema.tables.len(),
+                    schema.indexes.len()
+                );
             }
         }
 

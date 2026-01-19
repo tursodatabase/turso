@@ -37,8 +37,8 @@ members = [
     "perf/encryption",
     "sdk-kit",
     "sdk-kit-macros", 
-    "sql_gen_prop", 
-    "simulator_redo",
+    "testing/differential-oracle/sql_gen_prop", 
+    "testing/differential-oracle/fuzzer",
 ]
 exclude = ["perf/latency/limbo", "turso-test-runner"]
 

@@ -136,10 +136,7 @@ mod tests {
         };
 
         let sql = stmt.to_string();
-        assert_eq!(
-            sql,
-            "INSERT INTO \"users\" (\"id\", \"name\") VALUES (1, 'Alice')"
-        );
+        assert_eq!(sql, "INSERT INTO users (id, name) VALUES (1, 'Alice')");
     }
 
     #[test]

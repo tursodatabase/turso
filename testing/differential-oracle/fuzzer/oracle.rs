@@ -249,13 +249,13 @@ pub fn check_differential(
     turso_conn: &Arc<turso_core::Connection>,
     sqlite_conn: &rusqlite::Connection,
     stmt: &SqlStatement,
-) -> Result<OracleResult> {
+) -> OracleResult {
     let sql = stmt.to_string();
     let turso_result = DifferentialOracle::execute_turso(turso_conn, &sql);
     let sqlite_result = DifferentialOracle::execute_sqlite(sqlite_conn, &sql);
 
     let oracle = DifferentialOracle;
-    Ok(oracle.check(stmt, &turso_result, &sqlite_result))
+    oracle.check(stmt, &turso_result, &sqlite_result)
 }
 
 #[cfg(test)]

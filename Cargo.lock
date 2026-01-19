@@ -1540,6 +1540,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "differential-fuzzer"
+version = "0.5.0-pre.1"
+dependencies = [
+ "anyhow",
+ "clap",
+ "comfy-table",
+ "indexmap 2.11.1",
+ "parking_lot",
+ "proptest",
+ "rand 0.9.2",
+ "rand_chacha 0.9.0",
+ "rusqlite",
+ "serde_json",
+ "sql_gen_prop",
+ "tracing",
+ "tracing-subscriber",
+ "turso_core",
+]
+
+[[package]]
 name = "difflib"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4953,26 +4973,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a9e9e0b4211b72e7b8b6e85c807d36c212bdb33ea8587f7569562a84df5465b1"
 dependencies = [
  "libc",
-]
-
-[[package]]
-name = "sim_redo"
-version = "0.5.0-pre.1"
-dependencies = [
- "anyhow",
- "clap",
- "comfy-table",
- "indexmap 2.11.1",
- "parking_lot",
- "proptest",
- "rand 0.9.2",
- "rand_chacha 0.9.0",
- "rusqlite",
- "serde_json",
- "sql_gen_prop",
- "tracing",
- "tracing-subscriber",
- "turso_core",
 ]
 
 [[package]]
