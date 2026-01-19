@@ -41,9 +41,6 @@ package-dylibs:
 	rm -rf libs/ios/turso*.xcframework
 	cp -r templates/turso*.xcframework libs/ios
 
-	cp "$(SDK_KIT_DIR)/turso.h" libs/ios/
-	cp "$(SYNC_SDK_KIT_DIR)/turso_sync.h" libs/ios/
-
 # Pack device dylibs
 	cp ../../target/aarch64-apple-ios/release/$(IOS_LIB_FILE) libs/ios/$(IOS_FINAL_LIB_FILE)
 
