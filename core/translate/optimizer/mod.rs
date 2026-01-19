@@ -3,7 +3,6 @@ use crate::{
     index_method::IndexMethodCostEstimate,
     schema::{BTreeTable, Index, IndexColumn, Schema, Table, ROWID_SENTINEL},
     translate::{
-        expr::{walk_expr_mut, WalkControl},
         insert::ROWID_COLUMN,
         optimizer::{
             access_method::AccessMethodParams,
@@ -42,7 +41,7 @@ use std::{
     sync::Arc,
 };
 use turso_ext::{ConstraintInfo, ConstraintUsage};
-use turso_parser::ast::{self, Expr, FunctionTail, LikeOperator, Name, SortOrder, TriggerEvent};
+use turso_parser::ast::{self, Expr, SortOrder, TriggerEvent};
 
 use super::{
     emitter::Resolver,
@@ -432,6 +431,9 @@ pub fn optimize_plan(program: &mut ProgramBuilder, plan: &mut Plan, schema: &Sch
 #[cfg(all(feature = "fts", not(target_family = "wasm")))]
 /// Transform MATCH expressions to fts_match() function calls.
 fn transform_match_to_fts_match(where_clause: &mut [WhereTerm]) {
+    use super::ast::{FunctionTail, LikeOperator, Name};
+    use super::expr::{walk_expr_mut, WalkControl};
+
     for term in where_clause.iter_mut() {
         let _ = walk_expr_mut(&mut term.expr, &mut |e: &mut Expr| -> Result<WalkControl> {
             match e {
