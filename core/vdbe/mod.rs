@@ -30,7 +30,8 @@ pub mod metrics;
 pub mod rowset;
 pub mod sorter;
 pub mod value;
-
+// for benchmarks
+pub use crate::translate::collate::CollationSeq;
 use crate::{
     error::LimboError,
     function::{AggFunc, FuncCtx},
@@ -38,7 +39,7 @@ use crate::{
     return_if_io,
     schema::Trigger,
     state_machine::StateMachine,
-    translate::{collate::CollationSeq, plan::TableReferences},
+    translate::plan::TableReferences,
     types::{IOCompletions, IOResult},
     vdbe::{
         execute::{
