@@ -51,7 +51,7 @@ fn insert_entries_with_text_payload(ht: &mut HashTable, count: usize, text_size:
 /// Insert entries with text keys (for NOCASE hash testing)
 fn insert_text_key_entries(ht: &mut HashTable, count: usize) {
     for i in 0..count {
-        let key = vec![Value::Text(format!("key_{}", i).into())];
+        let key = vec![Value::Text(format!("key_{i}").into())];
         let _ = ht.insert(key, i as i64, vec![]);
     }
 }
