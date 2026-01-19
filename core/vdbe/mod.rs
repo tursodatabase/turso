@@ -596,15 +596,23 @@ impl ProgramState {
         write: bool,
     ) -> Result<IOResult<()>> {
         if write {
-            let db_size = return_if_io!(pager.with_header(|header| header.database_size.get()));
-            pager.open_subjournal()?;
-            pager.try_use_subjournal()?;
-            let result = pager.open_savepoint(db_size);
-            if result.is_err() {
-                pager.stop_use_subjournal();
+            // Check if MVCC is active - if so, use MVCC savepoints instead of pager savepoints
+            if let Some(mv_store) = connection.mv_store().as_ref() {
+                if let Some(tx_id) = connection.get_mv_tx_id() {
+                    mv_store.begin_savepoint(tx_id);
+                }
+            } else {
+                // Non-MVCC mode: use pager savepoints
+                let db_size = return_if_io!(pager.with_header(|header| header.database_size.get()));
+                pager.open_subjournal()?;
+                pager.try_use_subjournal()?;
+                let result = pager.open_savepoint(db_size);
+                if result.is_err() {
+                    pager.stop_use_subjournal();
+                }
+                result?;
+                self.uses_subjournal = true;
             }
-            result?;
-            self.uses_subjournal = true;
         }
 
         // Store the deferred foreign key violations counter at the start of the statement.
@@ -629,14 +637,32 @@ impl ProgramState {
     ) -> Result<()> {
         let result = 'outer: {
             match end_statement {
-                EndStatement::ReleaseSavepoint => pager.release_savepoint(),
+                EndStatement::ReleaseSavepoint => {
+                    if let Some(mv_store) = connection.mv_store().as_ref() {
+                        if let Some(tx_id) = connection.get_mv_tx_id() {
+                            mv_store.release_savepoint(tx_id);
+                        }
+                        Ok(()) // MVCC mode: no pager savepoint to release
+                    } else {
+                        pager.release_savepoint()
+                    }
+                }
                 EndStatement::RollbackSavepoint => {
-                    match pager.rollback_to_newest_savepoint() {
-                        // We sometimes call end_statement() on errors without explicitly knowing whether a stmt transaction
-                        // caused the error or not. If it didn't, don't reset any FK violation counters.
-                        Ok(false) => break 'outer Ok(()),
-                        Err(err) => break 'outer Err(err),
-                        _ => {}
+                    if let Some(mv_store) = connection.mv_store().as_ref() {
+                        if let Some(tx_id) = connection.get_mv_tx_id() {
+                            // Returns false if no savepoint was active - don't reset FK counters
+                            if !mv_store.rollback_first_savepoint(tx_id)? {
+                                break 'outer Ok(());
+                            }
+                        }
+                    } else {
+                        match pager.rollback_to_newest_savepoint() {
+                            // We sometimes call end_statement() on errors without explicitly knowing whether a stmt transaction
+                            // caused the error or not. If it didn't, don't reset any FK violation counters.
+                            Ok(false) => break 'outer Ok(()),
+                            Err(err) => break 'outer Err(err),
+                            _ => {}
+                        }
                     }
                     // Reset the deferred foreign key violations counter to the value it had at the start of the statement.
                     // This is used to ensure that if an interactive transaction had deferred FK violations, they are not lost.
