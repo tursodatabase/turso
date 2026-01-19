@@ -19,7 +19,7 @@ Pod::Spec.new do |s|
   ]
 
   # Vendored Rust XCFramework (handles device + simulator automatically)
-  s.vendored_frameworks = "libs/ios/TursoSyncSdkKit.xcframework"
+  s.vendored_frameworks = "libs/ios/turso_sync_sdk_kit.xcframework"
 
   # Header search paths
   s.pod_target_xcconfig = {
@@ -41,7 +41,7 @@ Pod::Spec.new do |s|
   # Build script to compile Rust
   s.script_phase = {
     :name => "Build Turso Rust Library",
-    :script => 'set -e; cd "${PODS_TARGET_SRCROOT}"; if [ ! -d "libs/ios/TursoSyncSdkKit.xcframework" ]; then echo "Building Rust library for iOS..."; make ios; fi',
+    :script => 'set -e; cd "${PODS_TARGET_SRCROOT}"; if [ ! -d "libs/ios/turso_sync_sdk_kit.xcframework" ]; then echo "Building Rust library for iOS..."; make ios; fi',
     :execution_position => :before_compile,
     :shell_path => "/bin/bash"
   }

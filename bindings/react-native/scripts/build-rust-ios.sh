@@ -57,18 +57,18 @@ cp "$REPO_ROOT/target/aarch64-apple-ios/release/libturso_sync_sdk_kit.dylib" "$O
 
 # Create XCFramework (the proper way to bundle device + simulator)
 echo "Creating XCFramework..."
-rm -rf "$OUTPUT_DIR/TursoSyncSdkKit.xcframework"
+rm -rf "$OUTPUT_DIR/turso_sync_sdk_kit.xcframework"
 xcodebuild -create-xcframework \
     -library "$OUTPUT_DIR/device/libturso_sync_sdk_kit.dylib" \
     -library "$OUTPUT_DIR/simulator/libturso_sync_sdk_kit.dylib" \
-    -output "$OUTPUT_DIR/TursoSyncSdkKit.xcframework"
+    -output "$OUTPUT_DIR/turso_sync_sdk_kit.xcframework"
 
 # Copy header files
 cp "$SDK_KIT_DIR/turso.h" "$OUTPUT_DIR/"
 cp "$SYNC_SDK_KIT_DIR/turso_sync.h" "$OUTPUT_DIR/"
 
 echo "iOS build complete!"
-echo "XCFramework: $OUTPUT_DIR/TursoSyncSdkKit.xcframework"
+echo "XCFramework: $OUTPUT_DIR/turso_sync_sdk_kit.xcframework"
 echo "Headers:"
 echo "  - $OUTPUT_DIR/turso.h"
 echo "  - $OUTPUT_DIR/turso_sync.h"
