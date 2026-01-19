@@ -15,7 +15,9 @@ use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Through
 use pprof::criterion::{Output, PProfProfiler};
 
 #[cfg(feature = "codspeed")]
-use codspeed_criterion_compat::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use codspeed_criterion_compat::{
+    criterion_group, criterion_main, BenchmarkId, Criterion, Throughput,
+};
 
 use std::sync::Arc;
 use tempfile::TempDir;
@@ -60,7 +62,10 @@ fn setup_limbo_with_sync(temp_dir: &TempDir, schema: &str, sync_on: bool) -> Arc
 
     // Set synchronous mode
     let sync_mode = if sync_on { "FULL" } else { "OFF" };
-    let mut stmt = conn.query(&format!("PRAGMA synchronous = {}", sync_mode)).unwrap().unwrap();
+    let mut stmt = conn
+        .query(format!("PRAGMA synchronous = {sync_mode}"))
+        .unwrap()
+        .unwrap();
     run_to_completion(&mut stmt, &db).unwrap();
 
     // Execute schema
@@ -203,15 +208,18 @@ fn bench_transaction_size(criterion: &mut Criterion) {
             if i > 0 {
                 values.push(',');
             }
-            values.push_str(&format!("({}, 'data_{}')", i, i));
+            values.push_str(&format!("({i}, 'data_{i}')"));
         }
 
         // Limbo benchmark
         let temp_dir = tempfile::tempdir().unwrap();
-        let db = setup_limbo(&temp_dir, "CREATE TABLE test (id INTEGER PRIMARY KEY, data TEXT)");
+        let db = setup_limbo(
+            &temp_dir,
+            "CREATE TABLE test (id INTEGER PRIMARY KEY, data TEXT)",
+        );
         let conn = db.connect().unwrap();
 
-        group.bench_function(BenchmarkId::new("limbo", format!("{}_rows", tx_size)), |b| {
+        group.bench_function(BenchmarkId::new("limbo", format!("{tx_size}_rows")), |b| {
             let mut begin = conn.query("BEGIN").unwrap().unwrap();
             let mut commit = conn.query("COMMIT").unwrap().unwrap();
             let mut insert_stmt = conn.prepare(&values).unwrap();
@@ -239,9 +247,12 @@ fn bench_transaction_size(criterion: &mut Criterion) {
         // SQLite benchmark
         if enable_rusqlite {
             let temp_dir = tempfile::tempdir().unwrap();
-            let sqlite_conn = setup_rusqlite(&temp_dir, "CREATE TABLE test (id INTEGER PRIMARY KEY, data TEXT)");
+            let sqlite_conn = setup_rusqlite(
+                &temp_dir,
+                "CREATE TABLE test (id INTEGER PRIMARY KEY, data TEXT)",
+            );
 
-            group.bench_function(BenchmarkId::new("sqlite", format!("{}_rows", tx_size)), |b| {
+            group.bench_function(BenchmarkId::new("sqlite", format!("{tx_size}_rows")), |b| {
                 b.iter_custom(|iters| {
                     let mut total = std::time::Duration::ZERO;
                     for _ in 0..iters {
@@ -291,7 +302,7 @@ fn bench_key_pattern(criterion: &mut Criterion) {
         if i > 0 {
             seq_values.push(',');
         }
-        seq_values.push_str(&format!("({}, 'data_{}')", i, i));
+        seq_values.push_str(&format!("({i}, 'data_{i}')"));
     }
 
     // Random insert
@@ -300,12 +311,15 @@ fn bench_key_pattern(criterion: &mut Criterion) {
         if i > 0 {
             rand_values.push(',');
         }
-        rand_values.push_str(&format!("({}, 'data_{}')", key, i));
+        rand_values.push_str(&format!("({key}, 'data_{i}')"));
     }
 
     // Limbo sequential
     let temp_dir = tempfile::tempdir().unwrap();
-    let db = setup_limbo(&temp_dir, "CREATE TABLE test (id INTEGER PRIMARY KEY, data TEXT)");
+    let db = setup_limbo(
+        &temp_dir,
+        "CREATE TABLE test (id INTEGER PRIMARY KEY, data TEXT)",
+    );
     let conn = db.connect().unwrap();
 
     group.bench_function(BenchmarkId::new("limbo", "sequential_keys"), |b| {
@@ -327,7 +341,10 @@ fn bench_key_pattern(criterion: &mut Criterion) {
 
     // Limbo random
     let temp_dir = tempfile::tempdir().unwrap();
-    let db = setup_limbo(&temp_dir, "CREATE TABLE test (id INTEGER PRIMARY KEY, data TEXT)");
+    let db = setup_limbo(
+        &temp_dir,
+        "CREATE TABLE test (id INTEGER PRIMARY KEY, data TEXT)",
+    );
     let conn = db.connect().unwrap();
 
     group.bench_function(BenchmarkId::new("limbo", "random_keys"), |b| {
@@ -350,7 +367,10 @@ fn bench_key_pattern(criterion: &mut Criterion) {
     if enable_rusqlite {
         // SQLite sequential
         let temp_dir = tempfile::tempdir().unwrap();
-        let sqlite_conn = setup_rusqlite(&temp_dir, "CREATE TABLE test (id INTEGER PRIMARY KEY, data TEXT)");
+        let sqlite_conn = setup_rusqlite(
+            &temp_dir,
+            "CREATE TABLE test (id INTEGER PRIMARY KEY, data TEXT)",
+        );
 
         group.bench_function(BenchmarkId::new("sqlite", "sequential_keys"), |b| {
             let mut stmt = sqlite_conn.prepare(&seq_values).unwrap();
@@ -368,7 +388,10 @@ fn bench_key_pattern(criterion: &mut Criterion) {
 
         // SQLite random
         let temp_dir = tempfile::tempdir().unwrap();
-        let sqlite_conn = setup_rusqlite(&temp_dir, "CREATE TABLE test (id INTEGER PRIMARY KEY, data TEXT)");
+        let sqlite_conn = setup_rusqlite(
+            &temp_dir,
+            "CREATE TABLE test (id INTEGER PRIMARY KEY, data TEXT)",
+        );
 
         group.bench_function(BenchmarkId::new("sqlite", "random_keys"), |b| {
             let mut stmt = sqlite_conn.prepare(&rand_values).unwrap();
@@ -411,7 +434,7 @@ fn bench_update_performance(criterion: &mut Criterion) {
         if i > 0 {
             initial_insert.push(',');
         }
-        initial_insert.push_str(&format!("({}, 'initial_{}')", i, i));
+        initial_insert.push_str(&format!("({i}, 'initial_{i}')"));
     }
 
     // Build batch update (updates middle rows)
@@ -430,7 +453,10 @@ fn bench_update_performance(criterion: &mut Criterion) {
 
     // Limbo benchmark
     let temp_dir = tempfile::tempdir().unwrap();
-    let db = setup_limbo(&temp_dir, "CREATE TABLE test (id INTEGER PRIMARY KEY, data TEXT)");
+    let db = setup_limbo(
+        &temp_dir,
+        "CREATE TABLE test (id INTEGER PRIMARY KEY, data TEXT)",
+    );
     let conn = db.connect().unwrap();
 
     // Insert initial data
@@ -448,7 +474,10 @@ fn bench_update_performance(criterion: &mut Criterion) {
     // SQLite benchmark
     if enable_rusqlite {
         let temp_dir = tempfile::tempdir().unwrap();
-        let sqlite_conn = setup_rusqlite(&temp_dir, "CREATE TABLE test (id INTEGER PRIMARY KEY, data TEXT)");
+        let sqlite_conn = setup_rusqlite(
+            &temp_dir,
+            "CREATE TABLE test (id INTEGER PRIMARY KEY, data TEXT)",
+        );
         sqlite_conn.execute(&initial_insert, []).unwrap();
 
         group.bench_function(BenchmarkId::new("sqlite", "batch_update"), |b| {
@@ -480,17 +509,20 @@ fn bench_delete_performance(criterion: &mut Criterion) {
         if i > 0 {
             initial_insert.push(',');
         }
-        initial_insert.push_str(&format!("({}, 'data_{}')", i, i));
+        initial_insert.push_str(&format!("({i}, 'data_{i}')"));
     }
 
     // Build range delete
     let start = row_count / 2 - delete_count / 2;
     let end = start + delete_count;
-    let range_delete = format!("DELETE FROM test WHERE id >= {} AND id < {}", start, end);
+    let range_delete = format!("DELETE FROM test WHERE id >= {start} AND id < {end}");
 
     // Limbo benchmark
     let temp_dir = tempfile::tempdir().unwrap();
-    let db = setup_limbo(&temp_dir, "CREATE TABLE test (id INTEGER PRIMARY KEY, data TEXT)");
+    let db = setup_limbo(
+        &temp_dir,
+        "CREATE TABLE test (id INTEGER PRIMARY KEY, data TEXT)",
+    );
     let conn = db.connect().unwrap();
 
     group.bench_function(BenchmarkId::new("limbo", "range_delete"), |b| {
@@ -518,7 +550,10 @@ fn bench_delete_performance(criterion: &mut Criterion) {
     // SQLite benchmark
     if enable_rusqlite {
         let temp_dir = tempfile::tempdir().unwrap();
-        let sqlite_conn = setup_rusqlite(&temp_dir, "CREATE TABLE test (id INTEGER PRIMARY KEY, data TEXT)");
+        let sqlite_conn = setup_rusqlite(
+            &temp_dir,
+            "CREATE TABLE test (id INTEGER PRIMARY KEY, data TEXT)",
+        );
 
         group.bench_function(BenchmarkId::new("sqlite", "range_delete"), |b| {
             b.iter_custom(|iters| {
@@ -580,31 +615,34 @@ fn bench_large_transaction_commit(criterion: &mut Criterion) {
         );
         let conn = db.connect().unwrap();
 
-        group.bench_function(BenchmarkId::new("limbo", format!("{}_rows", row_count)), |b| {
-            b.iter_custom(|iters| {
-                let mut total = std::time::Duration::ZERO;
-                for _ in 0..iters {
-                    // BEGIN
-                    let mut stmt = conn.query("BEGIN").unwrap().unwrap();
-                    run_to_completion(&mut stmt, &db).unwrap();
+        group.bench_function(
+            BenchmarkId::new("limbo", format!("{row_count}_rows")),
+            |b| {
+                b.iter_custom(|iters| {
+                    let mut total = std::time::Duration::ZERO;
+                    for _ in 0..iters {
+                        // BEGIN
+                        let mut stmt = conn.query("BEGIN").unwrap().unwrap();
+                        run_to_completion(&mut stmt, &db).unwrap();
 
-                    // INSERT (not timed separately - we want full transaction)
-                    let start = std::time::Instant::now();
-                    let mut stmt = conn.prepare(&values).unwrap();
-                    run_to_completion(&mut stmt, &db).unwrap();
+                        // INSERT (not timed separately - we want full transaction)
+                        let start = std::time::Instant::now();
+                        let mut stmt = conn.prepare(&values).unwrap();
+                        run_to_completion(&mut stmt, &db).unwrap();
 
-                    // COMMIT
-                    let mut stmt = conn.query("COMMIT").unwrap().unwrap();
-                    run_to_completion(&mut stmt, &db).unwrap();
-                    total += start.elapsed();
+                        // COMMIT
+                        let mut stmt = conn.query("COMMIT").unwrap().unwrap();
+                        run_to_completion(&mut stmt, &db).unwrap();
+                        total += start.elapsed();
 
-                    // Clean up
-                    let mut stmt = conn.query("DELETE FROM test").unwrap().unwrap();
-                    run_to_completion(&mut stmt, &db).unwrap();
-                }
-                total
-            });
-        });
+                        // Clean up
+                        let mut stmt = conn.query("DELETE FROM test").unwrap().unwrap();
+                        run_to_completion(&mut stmt, &db).unwrap();
+                    }
+                    total
+                });
+            },
+        );
 
         // SQLite benchmark
         if enable_rusqlite {
@@ -614,22 +652,25 @@ fn bench_large_transaction_commit(criterion: &mut Criterion) {
                 "CREATE TABLE test (id INTEGER PRIMARY KEY, data TEXT, val INTEGER)",
             );
 
-            group.bench_function(BenchmarkId::new("sqlite", format!("{}_rows", row_count)), |b| {
-                b.iter_custom(|iters| {
-                    let mut total = std::time::Duration::ZERO;
-                    for _ in 0..iters {
-                        sqlite_conn.execute("BEGIN", []).unwrap();
+            group.bench_function(
+                BenchmarkId::new("sqlite", format!("{row_count}_rows")),
+                |b| {
+                    b.iter_custom(|iters| {
+                        let mut total = std::time::Duration::ZERO;
+                        for _ in 0..iters {
+                            sqlite_conn.execute("BEGIN", []).unwrap();
 
-                        let start = std::time::Instant::now();
-                        sqlite_conn.execute(&values, []).unwrap();
-                        sqlite_conn.execute("COMMIT", []).unwrap();
-                        total += start.elapsed();
+                            let start = std::time::Instant::now();
+                            sqlite_conn.execute(&values, []).unwrap();
+                            sqlite_conn.execute("COMMIT", []).unwrap();
+                            total += start.elapsed();
 
-                        sqlite_conn.execute("DELETE FROM test", []).unwrap();
-                    }
-                    total
-                });
-            });
+                            sqlite_conn.execute("DELETE FROM test", []).unwrap();
+                        }
+                        total
+                    });
+                },
+            );
         }
     }
 
@@ -652,12 +693,16 @@ fn bench_fsync_overhead(criterion: &mut Criterion) {
         if i > 0 {
             values.push(',');
         }
-        values.push_str(&format!("({}, 'data_{}')", i, i));
+        values.push_str(&format!("({i}, 'data_{i}')"));
     }
 
     // Limbo with sync=FULL
     let temp_dir = tempfile::tempdir().unwrap();
-    let db = setup_limbo_with_sync(&temp_dir, "CREATE TABLE test (id INTEGER PRIMARY KEY, data TEXT)", true);
+    let db = setup_limbo_with_sync(
+        &temp_dir,
+        "CREATE TABLE test (id INTEGER PRIMARY KEY, data TEXT)",
+        true,
+    );
     let conn = db.connect().unwrap();
 
     group.bench_function(BenchmarkId::new("limbo", "sync_FULL"), |b| {
@@ -679,7 +724,11 @@ fn bench_fsync_overhead(criterion: &mut Criterion) {
 
     // Limbo with sync=OFF
     let temp_dir = tempfile::tempdir().unwrap();
-    let db = setup_limbo_with_sync(&temp_dir, "CREATE TABLE test (id INTEGER PRIMARY KEY, data TEXT)", false);
+    let db = setup_limbo_with_sync(
+        &temp_dir,
+        "CREATE TABLE test (id INTEGER PRIMARY KEY, data TEXT)",
+        false,
+    );
     let conn = db.connect().unwrap();
 
     group.bench_function(BenchmarkId::new("limbo", "sync_OFF"), |b| {
@@ -702,7 +751,10 @@ fn bench_fsync_overhead(criterion: &mut Criterion) {
     if enable_rusqlite {
         // SQLite with sync=FULL
         let temp_dir = tempfile::tempdir().unwrap();
-        let sqlite_conn = setup_rusqlite(&temp_dir, "CREATE TABLE test (id INTEGER PRIMARY KEY, data TEXT)");
+        let sqlite_conn = setup_rusqlite(
+            &temp_dir,
+            "CREATE TABLE test (id INTEGER PRIMARY KEY, data TEXT)",
+        );
 
         group.bench_function(BenchmarkId::new("sqlite", "sync_FULL"), |b| {
             let mut stmt = sqlite_conn.prepare(&values).unwrap();
@@ -722,10 +774,18 @@ fn bench_fsync_overhead(criterion: &mut Criterion) {
         let temp_dir = tempfile::tempdir().unwrap();
         let db_path = temp_dir.path().join("bench.db");
         let sqlite_conn = rusqlite::Connection::open(db_path).unwrap();
-        sqlite_conn.pragma_update(None, "synchronous", "OFF").unwrap();
-        sqlite_conn.pragma_update(None, "journal_mode", "WAL").unwrap();
-        sqlite_conn.pragma_update(None, "locking_mode", "EXCLUSIVE").unwrap();
-        sqlite_conn.execute("CREATE TABLE test (id INTEGER PRIMARY KEY, data TEXT)", []).unwrap();
+        sqlite_conn
+            .pragma_update(None, "synchronous", "OFF")
+            .unwrap();
+        sqlite_conn
+            .pragma_update(None, "journal_mode", "WAL")
+            .unwrap();
+        sqlite_conn
+            .pragma_update(None, "locking_mode", "EXCLUSIVE")
+            .unwrap();
+        sqlite_conn
+            .execute("CREATE TABLE test (id INTEGER PRIMARY KEY, data TEXT)", [])
+            .unwrap();
 
         group.bench_function(BenchmarkId::new("sqlite", "sync_OFF"), |b| {
             let mut stmt = sqlite_conn.prepare(&values).unwrap();
