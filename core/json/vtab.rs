@@ -370,7 +370,8 @@ impl InternalVirtualTableCursor for JsonEachCursor {
                     IteratorState::Object(new_state),
                     self.path_to_current_value.cursor(),
                 );
-                self.path_to_current_value.push_object_key(&key.to_string());
+                self.path_to_current_value
+                    .push_object_key(&key.to_string()?)?;
                 let recursing = matches!(self.traversal_mode, JsonTraversalMode::Tree)
                     && self
                         .json
@@ -578,9 +579,13 @@ mod columns {
                 | jsonb::ElementType::TEXTJ
                 | jsonb::ElementType::TEXT5
                 | jsonb::ElementType::TEXTRAW => {
-                    let s = value.to_string();
-                    let s = (s[1..s.len() - 1]).to_string();
-                    Ok(Value::Text(Text::new(s)))
+                    let s = value.to_string()?;
+                    // Text values must be properly quoted
+                    let unquoted = s
+                        .strip_prefix('"')
+                        .and_then(|s| s.strip_suffix('"'))
+                        .ok_or_else(|| LimboError::ParseError("malformed JSON".to_string()))?;
+                    Ok(Value::Text(Text::new(unquoted.to_string())))
                 }
                 jsonb::ElementType::ARRAY => Ok(Value::Null),
                 jsonb::ElementType::OBJECT => Ok(Value::Null),
@@ -593,14 +598,14 @@ mod columns {
         }
 
         fn jsonb_to_integer(value: &Jsonb) -> Result<Value, LimboError> {
-            let string = value.to_string();
+            let string = value.to_string()?;
             let int = string.parse::<i64>()?;
 
             Ok(Value::Integer(int))
         }
 
         fn jsonb_to_float(value: &Jsonb) -> Result<Value, LimboError> {
-            let string = value.to_string();
+            let string = value.to_string()?;
             let float = string.parse::<f64>()?;
 
             Ok(Value::Float(float))
@@ -675,20 +680,26 @@ impl InPlaceJsonPath {
         self.push(format!("[{idx}]"));
     }
 
-    fn push_object_key(&mut self, key: &str) {
+    fn push_object_key(&mut self, key: &str) -> crate::Result<()> {
         // This follows SQLite's current quoting scheme, but it is not part of the stable API.
         // See https://sqlite.org/forum/forumpost?udc=1&name=be212a295ed8df4c
-        let unquoted_if_necessary = if (key[1..key.len() - 1])
+        // Keys must be properly quoted strings
+        let inner = key
+            .strip_prefix('"')
+            .and_then(|s| s.strip_suffix('"'))
+            .ok_or_else(|| crate::LimboError::ParseError("malformed JSON".to_string()))?;
+
+        let unquoted_if_necessary = if inner
             .chars()
             .any(|c| c == '.' || c == ' ' || c == '"' || c == '_')
         {
             key
         } else {
-            &key[1..key.len() - 1]
+            inner
         };
-        let always_unquoted = &key[1..key.len() - 1];
-        self.last_element = Key::String(always_unquoted.to_owned());
+        self.last_element = Key::String(inner.to_owned());
         self.push(format!(".{unquoted_if_necessary}"));
+        Ok(())
     }
 
     fn push(&mut self, element: String) {

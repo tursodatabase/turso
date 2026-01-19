@@ -1827,10 +1827,68 @@ do_execsql_test_error json_tree_3_arguments {
 # TODO add key and path columns back when 
 # https://www.sqlite.org/forum/forumpost/48f5763d8c is addressed.
 do_execsql_test json-tree-nested-object {
-  select fullkey, j.value from generate_series(0,2) s 
+  select fullkey, j.value from generate_series(0,2) s
   join json_tree('{"a": [1,2,3]}', '$.a[' || s.value || ']') j;
 } {
 {$.a[0]|1}
 {$.a[1]|2}
 {$.a[2]|3}
 }
+
+# Malformed JSON edge cases - must error like SQLite
+do_execsql_test_in_memory_any_error json-malformed-empty-string {
+  SELECT json('');
+}
+
+do_execsql_test_in_memory_any_error json-malformed-plus-only {
+  SELECT json('+');
+}
+
+do_execsql_test_in_memory_any_error json-malformed-minus-only {
+  SELECT json('-');
+}
+
+do_execsql_test_in_memory_any_error json-malformed-double-minus {
+  SELECT json('--1');
+}
+
+do_execsql_test_in_memory_any_error json-malformed-double-plus {
+  SELECT json('++1');
+}
+
+do_execsql_test_in_memory_any_error json-malformed-incomplete-exponent {
+  SELECT json('1e');
+}
+
+do_execsql_test_in_memory_any_error json-malformed-incomplete-exponent-plus {
+  SELECT json('1e+');
+}
+
+do_execsql_test_in_memory_any_error json-malformed-incomplete-exponent-minus {
+  SELECT json('1e-');
+}
+
+do_execsql_test_in_memory_any_error json-malformed-hex-no-digits {
+  SELECT json('0x');
+}
+
+do_execsql_test_in_memory_any_error json-malformed-leading-zeros {
+  SELECT json('00');
+}
+
+do_execsql_test_in_memory_any_error json-malformed-leading-zero-digit {
+  SELECT json('01');
+}
+
+# NaN should be converted to null (JSON5 extension, SQLite behavior)
+do_execsql_test json-nan-to-null-upper {
+  SELECT json('NaN');
+} {null}
+
+do_execsql_test json-nan-to-null-lower {
+  SELECT json('nan');
+} {null}
+
+do_execsql_test json-nan-to-null-mixed {
+  SELECT json('nAn');
+} {null}
