@@ -138,9 +138,9 @@ COPY scripts/corruption-debug-tools /app/corruption-debug-tools
 ENV CORRUPTION_TOOLS_DIR=/app/corruption-debug-tools
 
 # Copy SQLancer runner
-COPY sqlancer-runner/package.json sqlancer-runner/bun.lock* sqlancer-runner/tsconfig.json ./
+COPY testing/sqlancer/sqlancer-runner/package.json testing/sqlancer/sqlancer-runner/bun.lock* testing/sqlancer/sqlancer-runner/tsconfig.json ./
 RUN bun install || true
-COPY sqlancer-runner/* ./
+COPY testing/sqlancer/sqlancer-runner/* ./
 
 # Make entrypoint executable
 RUN chmod +x /app/docker-entrypoint.sqlancer.ts
