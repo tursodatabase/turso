@@ -86,7 +86,7 @@ pub fn translate(
 
     let mut program = ProgramBuilder::new(
         query_mode,
-        connection.get_capture_data_changes().clone(),
+        connection.get_capture_data_changes_info()?,
         // These options will be extended whithin each translate program
         ProgramBuilderOpts {
             num_cursors: 1,
@@ -100,9 +100,14 @@ pub fn translate(
 
     program = match stmt {
         // There can be no nesting with pragma, so lift it up here
-        ast::Stmt::Pragma { name, body } => {
-            pragma::translate_pragma(&resolver, &name, body, pager, connection.clone(), program)?
-        }
+        ast::Stmt::Pragma { name, body } => pragma::translate_pragma(
+            &mut resolver,
+            &name,
+            body,
+            pager,
+            connection.clone(),
+            program,
+        )?,
         stmt => translate_inner(stmt, &mut resolver, program, &connection, input)?,
     };
 

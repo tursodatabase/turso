@@ -554,7 +554,7 @@ fn execute_trigger_commands(
     };
     let mut subprogram_builder = ProgramBuilder::new_for_trigger(
         QueryMode::Normal,
-        program.capture_data_changes_mode().clone(),
+        program.capture_data_changes_info().clone(),
         ProgramBuilderOpts {
             num_cursors: 1,
             approx_num_insns: 32,

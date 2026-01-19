@@ -1,9 +1,5 @@
 #[cfg(target_family = "windows")]
 use crate::error::CompletionError;
-use crate::sync::{
-    atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU16, Ordering},
-    Arc, RwLock,
-};
 #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
 use crate::types::{WalFrameInfo, WalState};
 #[cfg(feature = "fs")]
@@ -13,14 +9,24 @@ use crate::Page;
 use crate::{
     ast, function,
     io::{MemoryIO, PlatformIO, IO},
-    match_ignore_ascii_case, parse_schema_rows, refresh_analyze_stats, translate, turso_assert,
+    match_ignore_ascii_case, parse_schema_rows, refresh_analyze_stats,
+    translate::{self, pragma::TURSO_CDC_METADATA_TABLE_NAME},
+    turso_assert,
     util::IOExt,
     vdbe, AllViewsTxState, AtomicCipherMode, AtomicSyncMode, AtomicTransactionState, BusyHandler,
     BusyHandlerCallback, CaptureDataChangesMode, CheckpointMode, CheckpointResult, CipherMode, Cmd,
     Completion, ConnectionMetrics, Database, DatabaseCatalog, DatabaseOpts, Duration,
     EncryptionKey, EncryptionOpts, IndexMethod, LimboError, MvStore, OpenFlags, PageSize, Pager,
     Parser, QueryMode, QueryRunner, Result, Schema, Statement, SyncMode, TransactionMode,
-    TransactionState, Trigger, Value, VirtualTable,
+    TransactionState, Trigger, Value, VirtualTable, CAPTURE_DATA_CHANGES_LATEST,
+    CAPTURE_DATA_CHANGES_V1,
+};
+use crate::{
+    sync::{
+        atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU16, Ordering},
+        Arc, RwLock,
+    },
+    CaptureDataChangesInfo,
 };
 use arc_swap::ArcSwap;
 use rustc_hash::FxHashMap;
@@ -918,10 +924,51 @@ impl Connection {
         self.cache_size.store(size, Ordering::SeqCst);
     }
 
-    pub fn get_capture_data_changes(
-        &self,
-    ) -> crate::sync::RwLockReadGuard<'_, CaptureDataChangesMode> {
-        self.capture_data_changes.read()
+    pub fn get_capture_data_changes_mode(&self) -> CaptureDataChangesMode {
+        self.capture_data_changes.read().clone()
+    }
+
+    pub fn get_capture_data_changes_info(&self) -> Result<CaptureDataChangesInfo> {
+        let mode = self.capture_data_changes.read().clone();
+        let Some(table) = mode.table() else {
+            assert!(mode == CaptureDataChangesMode::Off);
+            return Ok(CaptureDataChangesInfo {
+                mode,
+                version: CAPTURE_DATA_CHANGES_LATEST,
+            });
+        };
+
+        let schema = self.schema.read();
+        // Check if metadata table exists
+        let has_metadata_table = schema.get_table(TURSO_CDC_METADATA_TABLE_NAME).is_some();
+
+        // Check if CDC table exists
+        let has_cdc_table = schema.get_table(table).is_some();
+        drop(schema);
+
+        if !has_cdc_table {
+            // CDC table doesn't exist yet
+            return Ok(CaptureDataChangesInfo {
+                mode,
+                version: CAPTURE_DATA_CHANGES_LATEST,
+            });
+        }
+
+        // If metadata table exists, assume version is LATEST (as inserted by pragma)
+        // If metadata table doesn't exist, this is an old database with V1
+        let version = if has_metadata_table {
+            CAPTURE_DATA_CHANGES_LATEST
+        } else {
+            CAPTURE_DATA_CHANGES_V1
+        };
+
+        tracing::debug!(
+            "get_capture_data_changes_info: CDC version = {} (metadata_table_exists={})",
+            version,
+            has_metadata_table
+        );
+
+        Ok(CaptureDataChangesInfo { mode, version })
     }
     pub fn set_capture_data_changes(&self, opts: CaptureDataChangesMode) {
         *self.capture_data_changes.write() = opts;

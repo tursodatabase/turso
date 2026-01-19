@@ -866,7 +866,7 @@ pub fn translate_drop_index(
     program.resolve_label(label_once_end, program.offset());
 
     if let Some((cdc_cursor_id, _)) = cdc_table {
-        let before_record_reg = if program.capture_data_changes_mode().has_before() {
+        let before_record_reg = if program.capture_data_changes_info().mode.has_before() {
             Some(emit_cdc_full_record(
                 &mut program,
                 &sqlite_table.columns,

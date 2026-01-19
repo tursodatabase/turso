@@ -11,7 +11,7 @@ use crate::types::Text;
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
 use crate::vdbe::insn::Insn;
 use crate::vdbe::{Program, ProgramState, Register};
-use crate::SymbolTable;
+use crate::{CaptureDataChangesInfo, SymbolTable, CAPTURE_DATA_CHANGES_LATEST};
 use crate::{CaptureDataChangesMode, Connection, QueryMode, Result, Value};
 use turso_parser::ast::{Expr, Literal, Operator};
 
@@ -356,7 +356,10 @@ impl CompiledExpression {
         // Create a minimal program builder for expression compilation
         let mut builder = ProgramBuilder::new(
             QueryMode::Normal,
-            CaptureDataChangesMode::Off,
+            CaptureDataChangesInfo {
+                mode: CaptureDataChangesMode::Off,
+                version: CAPTURE_DATA_CHANGES_LATEST,
+            },
             ProgramBuilderOpts {
                 num_cursors: 0,
                 approx_num_insns: 5,  // Most expressions are simple

@@ -2783,6 +2783,7 @@ mod tests {
             is_strict: false,
             unique_sets: vec![],
             foreign_keys: vec![],
+            check_constraints: vec![],
         })
     }
 
