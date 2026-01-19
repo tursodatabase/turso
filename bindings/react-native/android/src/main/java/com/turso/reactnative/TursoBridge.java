@@ -5,6 +5,7 @@ import com.facebook.react.turbomodule.core.CallInvokerHolderImpl;
 
 import java.lang.Exception;
 
+// bridge layer, installNativeJsi/clearStateNativeJsi methods are set through cpp-adapter.cpp
 public class TursoBridge {
   private static final TursoBridge instance = new TursoBridge();
 
