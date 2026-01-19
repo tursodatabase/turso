@@ -18,7 +18,7 @@ path = "lib.rs"
 
 [features]
 default = ["fs", "uuid", "time", "json", "series", "encryption"]
-antithesis = ["dep:antithesis_sdk", "antithesis_sdk?/full"]
+antithesis = ["dep:antithesis_sdk", "antithesis_sdk?/full", "dep:serde_json"]
 tracing_release = ["tracing/release_max_level_info"]
 conn_raw_api = []
 fs = ["turso_ext/vfs"]
@@ -77,6 +77,7 @@ uncased = "0.9.10"
 strum_macros = { workspace = true }
 bitflags = { workspace = true }
 serde = { workspace = true, optional = true, features = ["derive"] }
+serde_json = { workspace = true, optional = true }
 paste = "1.0.15"
 uuid = { version = "1.11.0", features = ["v4", "v5", "v7"], optional = true }
 tempfile = { workspace = true }

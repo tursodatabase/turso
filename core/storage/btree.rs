@@ -20,7 +20,7 @@ use crate::{
         },
     },
     translate::plan::IterationDirection,
-    turso_assert,
+    turso_assert, turso_assert_reachable, turso_assert_sometimes,
     types::{
         find_compare, get_tie_breaker_from_seek_op, IOCompletions, IndexInfo, RecordCompare,
         SeekResult,
@@ -2375,6 +2375,16 @@ impl BTreeCursor {
                                 .get_page_at_level(self.stack.current() - 1)
                                 .expect("parent page should be on the stack");
                             let parent_contents = parent.get_contents();
+
+                            turso_assert_sometimes!(
+                                parent_contents.rightmost_pointer().is_none(),
+                                "Parent page is a leaf page! This is the issue from https://github.com/tursodatabase/turso/issues/4603",
+                                {
+                                    "cur_page_contents": format!("{:?}", cur_page_contents),
+                                    "parent_page_contents": format!("{:?}", parent_contents)
+                                }
+                            );
+
                             if parent.get().id != 1
                                 && parent_contents.rightmost_pointer()?.unwrap()
                                     == cur_page.get().id as u32
@@ -2420,6 +2430,7 @@ impl BTreeCursor {
     /// 4. Continue balance from the parent page (inserting the new divider cell may have overflowed the parent)
     #[cfg_attr(debug_assertions, instrument(skip(self), level = Level::DEBUG))]
     fn balance_quick(&mut self) -> Result<IOResult<()>> {
+        turso_assert_reachable!("balance_quick path executed");
         // Since we are going to change the btree structure, let's forget our cached knowledge of the rightmost page.
         let _ = self.move_to_right_state.1.take();
 
@@ -3543,7 +3554,6 @@ impl BTreeCursor {
                         );
                         let divider_cell_insert_idx_in_parent =
                             first_divider_cell_cached + sibling_page_idx;
-                        #[cfg(debug_assertions)]
                         let overflow_cell_count_before = parent_contents.overflow_cells.len();
                         insert_into_cell(
                             parent_contents,
@@ -3551,12 +3561,16 @@ impl BTreeCursor {
                             divider_cell_insert_idx_in_parent,
                             usable_space,
                         )?;
+                        let overflow_cell_count_after = parent_contents.overflow_cells.len();
+                        let divider_cell_is_overflow_cell =
+                            overflow_cell_count_after > overflow_cell_count_before;
+                        turso_assert_sometimes!(
+                            divider_cell_is_overflow_cell,
+                            "parent overflowed during divider cell insertion",
+                            { "parent_page_id": parent_page.get().id, "sibling_page_idx": sibling_page_idx }
+                        );
                         #[cfg(debug_assertions)]
                         {
-                            let overflow_cell_count_after = parent_contents.overflow_cells.len();
-                            let divider_cell_is_overflow_cell =
-                                overflow_cell_count_after > overflow_cell_count_before;
-
                             BTreeCursor::validate_balance_non_root_divider_cell_insertion(
                                 balance_info,
                                 parent_contents,
@@ -7688,11 +7702,15 @@ fn fill_cell_payload(
                         let new_overflow_page_id = new_overflow_page.get().id as u32;
 
                         if let Some(prev_page) = current_overflow_page {
-                            // Update the previous overflow page's "next overflow page" pointer to point to the new overflow page.
+                            turso_assert_sometimes!(
+                                true,
+                                "allocated second overflow page for a single cell"
+                            );
                             turso_assert!(
                                 prev_page.is_loaded(),
                                 "previous overflow page is not loaded"
                             );
+                            // Update the previous overflow page's "next overflow page" pointer to point to the new overflow page.
                             let contents = prev_page.get_contents();
                             let buf = &mut contents.as_ptr()[..overflow_page_pointer_size];
                             buf.copy_from_slice(&new_overflow_page_id.to_be_bytes());

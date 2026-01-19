@@ -18,6 +18,7 @@ use crate::sync::{Mutex, RwLock};
 use crate::translate::emitter::TransactionMode;
 use crate::translate::plan::IterationDirection;
 use crate::turso_assert;
+use crate::turso_assert_greater_than;
 use crate::types::compare_immutable;
 use crate::types::IOCompletions;
 use crate::types::IOResult;
@@ -1385,7 +1386,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             };
             // Map all existing checkpointed root pages to table ids so that if root_page=R, table_id=-R
             for root_page in sqlite_schema_root_pages {
-                turso_assert!(root_page > 0, "root_page={root_page} must be positive");
+                turso_assert_greater_than!(root_page, 0, "root_page must be positive");
                 let root_page_as_table_id = MVTableId::from(-(root_page));
                 self.insert_table_id_to_rootpage(root_page_as_table_id, Some(root_page as u64));
             }

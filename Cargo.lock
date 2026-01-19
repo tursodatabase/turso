@@ -6068,6 +6068,7 @@ dependencies = [
  "rustix 1.0.7",
  "ryu",
  "serde",
+ "serde_json",
  "shuttle",
  "simsimd",
  "smallvec",
