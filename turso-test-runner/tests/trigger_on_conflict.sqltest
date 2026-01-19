@@ -1,0 +1,279 @@
+@database :memory:
+# for now only run these on rust so we don't have to deal with adding triggers to JS
+
+
+# =============================================================================
+# Trigger ON CONFLICT interaction tests
+# Tests the interaction between triggers and ON CONFLICT clauses
+# =============================================================================
+
+# =============================================================================
+# INSERT OR IGNORE and BEFORE triggers
+# In SQLite, BEFORE triggers ALWAYS fire for INSERT, even when INSERT OR IGNORE
+# will be ignored due to a conflict. The trigger's side effects persist.
+# However, OR IGNORE semantics propagate to nested statements in the trigger.
+# =============================================================================
+
+# Test: INSERT OR IGNORE with PRIMARY KEY conflict still fires BEFORE trigger
+@backend rust
+test insert-or-ignore-pk-fires-before-trigger {
+    CREATE TABLE parent(id INTEGER PRIMARY KEY, val TEXT);
+    CREATE TABLE log(msg TEXT);
+    CREATE TRIGGER trg_before_insert BEFORE INSERT ON parent BEGIN
+        INSERT INTO log VALUES ('trigger fired for id=' || NEW.id);
+    END;
+    INSERT INTO parent VALUES (1, 'first');
+    INSERT OR IGNORE INTO parent VALUES (1, 'duplicate');
+    SELECT * FROM log;
+}
+expect {
+    trigger fired for id=1
+    trigger fired for id=1
+}
+
+# Test: INSERT OR IGNORE with UNIQUE constraint conflict still fires BEFORE trigger
+@backend rust
+test insert-or-ignore-unique-fires-before-trigger {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, name TEXT UNIQUE);
+    CREATE TABLE log(msg TEXT);
+    CREATE TRIGGER trg_before_insert BEFORE INSERT ON t1 BEGIN
+        INSERT INTO log VALUES ('trigger fired for name=' || NEW.name);
+    END;
+    INSERT INTO t1 VALUES (1, 'alice');
+    INSERT OR IGNORE INTO t1 VALUES (2, 'alice');
+    SELECT * FROM log;
+}
+expect {
+    trigger fired for name=alice
+    trigger fired for name=alice
+}
+
+# Test: Nested INSERT OR IGNORE in trigger - OR IGNORE propagates to nested triggers
+# When trigger does INSERT OR IGNORE and the row exists, the BEFORE trigger fires
+# but the nested trigger's effects are silently ignored due to OR IGNORE propagation
+@backend rust
+test nested-insert-or-ignore-pk-in-trigger {
+    CREATE TABLE parent(id INTEGER PRIMARY KEY, a INT, b INT);
+    CREATE TABLE child(id INTEGER PRIMARY KEY, pid INT);
+    CREATE TABLE grandchild(id INTEGER PRIMARY KEY, parent_id INT);
+
+    CREATE TRIGGER trg_child_insert BEFORE INSERT ON child BEGIN
+        INSERT OR IGNORE INTO parent VALUES (NEW.pid, 0, 0);
+    END;
+    CREATE TRIGGER trg_parent_insert BEFORE INSERT ON parent BEGIN
+        INSERT INTO grandchild VALUES (NEW.id + 1000, NEW.id);
+    END;
+
+    INSERT INTO parent VALUES (100, 1, 1);
+    INSERT INTO child VALUES (1, 100);
+    SELECT * FROM parent ORDER BY id;
+    SELECT * FROM grandchild ORDER BY id;
+}
+expect {
+    100|1|1
+    1100|100
+}
+
+# Test: Nested INSERT OR IGNORE in trigger - OR IGNORE propagates (UNIQUE constraint)
+@backend rust
+test nested-insert-or-ignore-unique-in-trigger {
+    CREATE TABLE parent(id UNIQUE, a INT, b INT);
+    CREATE TABLE child(id INTEGER PRIMARY KEY, pid INT);
+    CREATE TABLE grandchild(id INTEGER PRIMARY KEY, parent_id INT);
+
+    CREATE TRIGGER trg_child_insert BEFORE INSERT ON child BEGIN
+        INSERT OR IGNORE INTO parent VALUES (NEW.pid, 0, 0);
+    END;
+    CREATE TRIGGER trg_parent_insert BEFORE INSERT ON parent BEGIN
+        INSERT INTO grandchild VALUES (NEW.id + 1000, NEW.id);
+    END;
+
+    INSERT INTO parent VALUES (100, 1, 1);
+    INSERT INTO child VALUES (1, 100);
+    SELECT * FROM parent ORDER BY id;
+    SELECT * FROM grandchild ORDER BY id;
+}
+expect {
+    100|1|1
+    1100|100
+}
+
+# Test: INSERT OR IGNORE with no conflict should fire BEFORE trigger normally
+@backend rust
+test insert-or-ignore-no-conflict-fires-trigger {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val TEXT);
+    CREATE TABLE log(msg TEXT);
+    CREATE TRIGGER trg_before_insert BEFORE INSERT ON t1 BEGIN
+        INSERT INTO log VALUES ('trigger fired');
+    END;
+    INSERT OR IGNORE INTO t1 VALUES (1, 'first');
+    INSERT OR IGNORE INTO t1 VALUES (2, 'second');
+    SELECT * FROM log;
+}
+expect {
+    trigger fired
+    trigger fired
+}
+
+# =============================================================================
+# UPSERT DO UPDATE triggers should not allow OR IGNORE to suppress errors
+# When a trigger fires from UPSERT DO UPDATE context, nested INSERT OR IGNORE
+# statements should behave like INSERT OR ABORT (errors are not suppressed).
+# =============================================================================
+
+# Test: UPSERT DO UPDATE trigger with nested INSERT OR IGNORE should error on conflict
+@backend rust
+test upsert-do-update-trigger-insert-or-ignore-errors {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val INT);
+    CREATE TABLE t2(id INTEGER PRIMARY KEY, ref_id INT);
+    CREATE TRIGGER trg_update BEFORE UPDATE ON t1 BEGIN
+        INSERT OR IGNORE INTO t2 VALUES (NEW.id, NEW.val);
+    END;
+    INSERT INTO t1 VALUES (1, 10);
+    INSERT INTO t2 VALUES (1, 999);
+    INSERT INTO t1 VALUES (1, 20) ON CONFLICT(id) DO UPDATE SET val = excluded.val;
+}
+expect error {
+}
+
+# Test: UPSERT DO UPDATE trigger with nested INSERT that doesn't conflict succeeds
+@backend rust
+test upsert-do-update-trigger-insert-no-conflict {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val INT);
+    CREATE TABLE t2(id INTEGER PRIMARY KEY, ref_id INT);
+    CREATE TRIGGER trg_update BEFORE UPDATE ON t1 BEGIN
+        INSERT INTO t2 VALUES (NEW.id + 100, NEW.val);
+    END;
+    INSERT INTO t1 VALUES (1, 10);
+    INSERT INTO t1 VALUES (1, 20) ON CONFLICT(id) DO UPDATE SET val = excluded.val;
+    SELECT * FROM t1;
+    SELECT * FROM t2;
+}
+expect {
+    1|20
+    101|20
+}
+
+# Test: Plain UPDATE trigger (not from UPSERT) allows INSERT OR IGNORE
+@backend rust
+test plain-update-trigger-insert-or-ignore-works {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val INT);
+    CREATE TABLE t2(id INTEGER PRIMARY KEY, ref_id INT);
+    CREATE TRIGGER trg_update BEFORE UPDATE ON t1 BEGIN
+        INSERT OR IGNORE INTO t2 VALUES (NEW.id, NEW.val);
+    END;
+    INSERT INTO t1 VALUES (1, 10);
+    INSERT INTO t2 VALUES (1, 999);
+    UPDATE t1 SET val = 20 WHERE id = 1;
+    SELECT * FROM t1;
+    SELECT * FROM t2;
+}
+expect {
+    1|20
+    1|999
+}
+
+# =============================================================================
+# Complex nested trigger scenarios
+# =============================================================================
+
+# Test: Multiple levels of triggers with INSERT OR IGNORE
+# The nested INSERT OR IGNORE fires the BEFORE trigger on table 'a' even though
+# the row already exists and will be ignored
+@backend rust
+test multi-level-triggers-insert-or-ignore {
+    CREATE TABLE a(id INTEGER PRIMARY KEY, val INT);
+    CREATE TABLE b(id INTEGER PRIMARY KEY, a_id INT);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, b_id INT);
+    CREATE TABLE log(msg TEXT);
+
+    CREATE TRIGGER trg_a BEFORE INSERT ON a BEGIN
+        INSERT INTO log VALUES ('a trigger fired');
+    END;
+    CREATE TRIGGER trg_b BEFORE INSERT ON b BEGIN
+        INSERT OR IGNORE INTO a VALUES (NEW.a_id, 0);
+        INSERT INTO log VALUES ('b trigger fired');
+    END;
+
+    INSERT INTO a VALUES (1, 100);
+    INSERT INTO b VALUES (1, 1);
+    SELECT * FROM log ORDER BY rowid;
+    SELECT * FROM a;
+}
+expect {
+    a trigger fired
+    a trigger fired
+    b trigger fired
+    1|100
+}
+
+# Test: Trigger chain where inner INSERT OR IGNORE is properly skipped
+@backend rust
+test trigger-chain-insert-or-ignore-skipped {
+    CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT);
+    CREATE TABLE orders(id INTEGER PRIMARY KEY, user_id INT);
+    CREATE TABLE audit(id INTEGER PRIMARY KEY, action TEXT);
+
+    CREATE TRIGGER trg_order BEFORE INSERT ON orders BEGIN
+        INSERT OR IGNORE INTO users VALUES (NEW.user_id, 'auto-created');
+    END;
+    CREATE TRIGGER trg_user BEFORE INSERT ON users BEGIN
+        INSERT INTO audit VALUES (NEW.id + 1000, 'user created');
+    END;
+
+    INSERT INTO users VALUES (1, 'existing');
+    INSERT INTO orders VALUES (100, 1);
+    SELECT * FROM users ORDER BY id;
+    SELECT * FROM audit ORDER BY id;
+}
+expect {
+    1|existing
+    1001|user created
+}
+
+# =============================================================================
+# AFTER triggers should also respect OR IGNORE skipping
+# =============================================================================
+
+@backend rust
+test insert-or-ignore-pk-skips-after-trigger {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val TEXT);
+    CREATE TABLE log(msg TEXT);
+    CREATE TRIGGER trg_after_insert AFTER INSERT ON t1 BEGIN
+        INSERT INTO log VALUES ('after trigger fired');
+    END;
+    INSERT INTO t1 VALUES (1, 'first');
+    INSERT OR IGNORE INTO t1 VALUES (1, 'duplicate');
+    SELECT * FROM log;
+}
+expect {
+    after trigger fired
+}
+
+# =============================================================================
+# INSERT OR REPLACE behavior with triggers
+# Per SQLite docs: "When the REPLACE conflict resolution strategy deletes rows
+# in order to satisfy a constraint, delete triggers fire if and only if
+# recursive triggers are enabled."
+# By default recursive_triggers is OFF, so DELETE triggers should NOT fire.
+# =============================================================================
+
+# Test: INSERT OR REPLACE should fire INSERT trigger but NOT DELETE trigger (by default)
+@backend rust
+test insert-or-replace-no-delete-trigger-by-default {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val TEXT);
+    CREATE TABLE log(msg TEXT);
+    CREATE TRIGGER trg_before_delete BEFORE DELETE ON t1 BEGIN
+        INSERT INTO log VALUES ('delete trigger: ' || OLD.val);
+    END;
+    CREATE TRIGGER trg_before_insert BEFORE INSERT ON t1 BEGIN
+        INSERT INTO log VALUES ('insert trigger: ' || NEW.val);
+    END;
+    INSERT INTO t1 VALUES (1, 'original');
+    INSERT OR REPLACE INTO t1 VALUES (1, 'replaced');
+    SELECT * FROM log ORDER BY rowid;
+}
+expect {
+    insert trigger: original
+    insert trigger: replaced
+}

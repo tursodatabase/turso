@@ -150,6 +150,10 @@ pub struct ProgramBuilder {
     /// Whether this is a subprogram (trigger or FK action). Subprograms skip Transaction instructions.
     pub is_subprogram: bool,
     pub resolve_type: ResolveType,
+    /// When set, all triggers fired from this program should use this conflict resolution.
+    /// This is used in UPSERT DO UPDATE context to ensure nested trigger's OR IGNORE/REPLACE
+    /// clauses don't suppress errors.
+    pub trigger_conflict_override: Option<ResolveType>,
     /// Temporary cursor overrides maps table internal IDs to cursor IDs that should be used instead of the normal resolution.
     /// This allows for things like hash build to use a separate cursor for iterating the same table.
     cursor_overrides: HashMap<usize, CursorID>,
@@ -363,6 +367,7 @@ impl ProgramBuilder {
             trigger,
             is_subprogram,
             resolve_type: ResolveType::Abort,
+            trigger_conflict_override: None,
             cursor_overrides: HashMap::new(),
             hash_build_signatures: HashMap::new(),
             hash_tables_to_keep_open: HashSet::new(),
@@ -372,6 +377,12 @@ impl ProgramBuilder {
 
     pub fn set_resolve_type(&mut self, resolve_type: ResolveType) {
         self.resolve_type = resolve_type;
+    }
+
+    /// Set the trigger conflict override. When set, all triggers fired from this program
+    /// should use this conflict resolution instead of their own OR clauses.
+    pub fn set_trigger_conflict_override(&mut self, resolve_type: ResolveType) {
+        self.trigger_conflict_override = Some(resolve_type);
     }
 
     /// Returns true if the given hash table id should be kept open across subplans.

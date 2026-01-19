@@ -411,6 +411,7 @@ pub fn translate_insert(
         &btree_table,
     );
     let has_relevant_before_triggers = relevant_before_triggers.clone().count() > 0;
+
     if has_relevant_before_triggers {
         // Build NEW registers: for rowid alias columns, use the rowid register; otherwise use column register
         let new_registers: Vec<usize> = insertion
@@ -425,11 +426,33 @@ pub fn translate_insert(
             })
             .chain(std::iter::once(insertion.key_register()))
             .collect();
-        let trigger_ctx = TriggerContext::new(
-            btree_table.clone(),
-            Some(new_registers),
-            None, // No OLD for INSERT
-        );
+        // Determine the conflict resolution to propagate to triggers:
+        // 1. If there's already an override from UPSERT DO UPDATE context, use it (forces ABORT)
+        // 2. If the INSERT uses OR IGNORE, propagate IGNORE to trigger statements
+        //    (per SQLite semantics, OR IGNORE should apply to all statements in the trigger)
+        // 3. Otherwise, don't override (use statement's own conflict resolution)
+        let trigger_ctx = if let Some(override_conflict) = program.trigger_conflict_override {
+            TriggerContext::new_with_override_conflict(
+                btree_table.clone(),
+                Some(new_registers),
+                None, // No OLD for INSERT
+                override_conflict,
+            )
+        } else if matches!(ctx.on_conflict, ResolveType::Ignore) {
+            // Propagate OR IGNORE to trigger statements
+            TriggerContext::new_with_override_conflict(
+                btree_table.clone(),
+                Some(new_registers),
+                None, // No OLD for INSERT
+                ResolveType::Ignore,
+            )
+        } else {
+            TriggerContext::new(
+                btree_table.clone(),
+                Some(new_registers),
+                None, // No OLD for INSERT
+            )
+        };
         for trigger in relevant_before_triggers {
             fire_trigger(&mut program, resolver, trigger, &trigger_ctx, connection)?;
         }
@@ -596,8 +619,24 @@ pub fn translate_insert(
             })
             .chain(std::iter::once(insertion.key_register()))
             .collect();
-        let trigger_ctx_after =
-            TriggerContext::new(btree_table.clone(), Some(new_registers_after), None);
+        // Determine the conflict resolution to propagate to AFTER triggers (same logic as BEFORE)
+        let trigger_ctx_after = if let Some(override_conflict) = program.trigger_conflict_override {
+            TriggerContext::new_with_override_conflict(
+                btree_table.clone(),
+                Some(new_registers_after),
+                None,
+                override_conflict,
+            )
+        } else if matches!(ctx.on_conflict, ResolveType::Ignore) {
+            TriggerContext::new_with_override_conflict(
+                btree_table.clone(),
+                Some(new_registers_after),
+                None,
+                ResolveType::Ignore,
+            )
+        } else {
+            TriggerContext::new(btree_table.clone(), Some(new_registers_after), None)
+        };
         for trigger in relevant_after_triggers {
             fire_trigger(
                 &mut program,

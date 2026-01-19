@@ -528,10 +528,13 @@ pub fn emit_upsert(
                 .chain(std::iter::once(new_rowid_for_trigger))
                 .collect();
 
-            let trigger_ctx = TriggerContext::new(
+            // In UPSERT DO UPDATE context, trigger's INSERT/UPDATE OR IGNORE/REPLACE
+            // clauses should not suppress errors. Override conflict resolution to Abort.
+            let trigger_ctx = TriggerContext::new_with_override_conflict(
                 btree_table.clone(),
                 Some(new_registers),
                 Some(old_registers.clone()),
+                ast::ResolveType::Abort,
             );
 
             for trigger in relevant_before_update_triggers {
@@ -1039,10 +1042,13 @@ pub fn emit_upsert(
                 .chain(std::iter::once(new_rowid_for_trigger))
                 .collect();
 
-            let trigger_ctx_after = TriggerContext::new(
+            // In UPSERT DO UPDATE context, trigger's INSERT/UPDATE OR IGNORE/REPLACE
+            // clauses should not suppress errors. Override conflict resolution to Abort.
+            let trigger_ctx_after = TriggerContext::new_with_override_conflict(
                 btree_table.clone(),
                 Some(new_registers_after),
                 Some(old_regs),
+                ast::ResolveType::Abort,
             );
 
             for trigger in relevant_triggers {
