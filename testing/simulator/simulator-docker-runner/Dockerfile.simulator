@@ -13,7 +13,7 @@ FROM chef AS planner
 # cargo-chef requires all this crap to be present in the workspace
 COPY Cargo.toml Cargo.lock ./
 COPY core ./core/
-COPY simulator ./simulator/
+COPY testing/simulator ./testing/simulator/
 COPY bindings ./bindings/
 COPY extensions ./extensions/
 COPY macros ./macros/
@@ -49,7 +49,7 @@ COPY --from=planner /app/parser ./parser/
 COPY --from=planner /app/perf/encryption ./perf/encryption
 COPY --from=planner /app/perf/throughput/rusqlite ./perf/throughput/rusqlite
 COPY --from=planner /app/perf/throughput/turso ./perf/throughput/turso
-COPY --from=planner /app/simulator ./simulator/
+COPY --from=planner /app/testing/simulator ./testing/simulator/
 COPY --from=planner /app/packages ./packages/
 COPY --from=planner /app/sql_generation ./sql_generation/
 COPY --from=planner /app/Cargo.toml /app/Cargo.lock ./
@@ -78,9 +78,9 @@ ENV GIT_HASH=${GIT_HASH:-unknown}
 
 WORKDIR /app
 COPY --from=builder /app/target/release/limbo_sim /app/limbo_sim
-COPY simulator-docker-runner/package.json simulator-docker-runner/bun.lock simulator-docker-runner/tsconfig.json ./
+COPY testing/simulator/simulator-docker-runner/package.json testing/simulator/simulator-docker-runner/bun.lock testing/simulator/simulator-docker-runner/tsconfig.json ./
 RUN bun install
-COPY simulator-docker-runner/* ./
+COPY testing/simulator/simulator-docker-runner/* ./
 
 RUN chmod +x /app/docker-entrypoint.simulator.ts
 RUN chmod +x /app/limbo_sim

@@ -1,6 +1,6 @@
 simulator:
   - changed-files:
-      - any-glob-to-any-file: "simulator/**/*"
+      - any-glob-to-any-file: "testing/simulator/**/*"
 docs:
   - changed-files:
       - any-glob-to-any-file: "docs/**/*"
