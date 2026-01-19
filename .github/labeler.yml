@@ -107,7 +107,7 @@ turso-sync:
 antithesis:
   - changed-files:
       - any-glob-to-any-file:
-          ["antithesis-tests/**/*", "scripts/antithesis/*", "stress/**/*"]
+          ["testing/antithesis/**/*", "scripts/antithesis/*", "stress/**/*"]
 
 ci-actions:
   - changed-files:
