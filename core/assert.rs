@@ -87,17 +87,17 @@ macro_rules! turso_assert_reachable {
 #[macro_export]
 macro_rules! turso_assert_unreachable {
     ($msg:literal) => {
-        unreachable!($msg);
+        unreachable!($msg)
     };
 }
 
 #[cfg(feature = "antithesis")]
 #[macro_export]
 macro_rules! turso_assert_unreachable {
-    ($msg:literal) => {
+    ($msg:literal) => {{
         antithesis_sdk::assert_unreachable!($msg);
-        unreachable!($msg);
-    };
+        unreachable!($msg)
+    }};
 }
 
 /// Assert that left > right with more visibility for Antithesis.
