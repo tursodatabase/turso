@@ -33,8 +33,8 @@
     "lint": "eslint \"src/**/*.{ts,tsx}\"",
     "clean": "del-cli lib",
     "build": "bob build",
-    "build:rust:ios": "./scripts/build-rust-ios.sh",
-    "build:rust:android": "./scripts/build-rust-android.sh",
+    "build:rust:ios": "make ios",
+    "build:rust:android": "make android",
     "prepare": "bob build"
   },
   "keywords": [

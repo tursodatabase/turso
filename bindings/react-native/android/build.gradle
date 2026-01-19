@@ -78,7 +78,7 @@ dependencies {
 // Task to build Rust library for Android
 task buildRustLibrary(type: Exec) {
     workingDir "${projectDir}/.."
-    commandLine "bash", "scripts/build-rust-android.sh"
+    commandLine "make", "android"
 }
 
 preBuild.dependsOn buildRustLibrary
