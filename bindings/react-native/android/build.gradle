@@ -12,6 +12,8 @@ plugins {
     id "com.android.library"
 }
 
+apply plugin: "com.facebook.react"
+
 def reactNativeArchitectures() {
     def value = project.getProperties().get("reactNativeArchitectures")
     return value ? value.split(",") : ["armeabi-v7a", "arm64-v8a", "x86", "x86_64"]
