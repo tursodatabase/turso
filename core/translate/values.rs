@@ -2,6 +2,7 @@ use crate::translate::emitter::TranslateCtx;
 use crate::translate::expr::{translate_expr_no_constant_opt, NoConstantOptReason};
 use crate::translate::plan::{QueryDestination, SelectPlan};
 use crate::translate::result_row::emit_offset;
+use crate::turso_assert_unreachable;
 use crate::vdbe::builder::ProgramBuilder;
 use crate::vdbe::insn::{to_u16, IdxInsertFlags, Insn};
 use crate::vdbe::BranchOffset;
@@ -23,7 +24,7 @@ pub fn emit_values(
             emit_values_in_subquery(program, plan, t_ctx, yield_reg)?
         }
         QueryDestination::EphemeralIndex { .. } => emit_toplevel_values(program, plan, t_ctx)?,
-        QueryDestination::EphemeralTable { .. } => unreachable!(),
+        QueryDestination::EphemeralTable { .. } => turso_assert_unreachable!("translate: ephemeral table in values"),
         QueryDestination::ExistsSubqueryResult { result_reg } => {
             program.emit_insn(Insn::Integer {
                 value: 1,
@@ -35,9 +36,9 @@ pub fn emit_values(
             emit_toplevel_values(program, plan, t_ctx)?
         }
         QueryDestination::RowSet { .. } => {
-            unreachable!("RowSet query destination should not be used in values emission")
+            turso_assert_unreachable!("translate: rowset in values emission")
         }
-        QueryDestination::Unset => unreachable!("Unset query destination should not be reached"),
+        QueryDestination::Unset => turso_assert_unreachable!("translate: unset query destination"),
     };
     Ok(reg_result_cols_start)
 }
@@ -197,7 +198,7 @@ fn emit_values_to_destination(
         QueryDestination::EphemeralIndex { .. } => {
             emit_values_to_index(program, plan, start_reg, row_len);
         }
-        QueryDestination::EphemeralTable { .. } => unreachable!(),
+        QueryDestination::EphemeralTable { .. } => turso_assert_unreachable!("translate: ephemeral table in values"),
         QueryDestination::ExistsSubqueryResult { result_reg } => {
             program.emit_insn(Insn::Integer {
                 value: 1,
@@ -216,9 +217,9 @@ fn emit_values_to_destination(
             });
         }
         QueryDestination::RowSet { .. } => {
-            unreachable!("RowSet query destination should not be used in values emission")
+            turso_assert_unreachable!("translate: rowset in values emission")
         }
-        QueryDestination::Unset => unreachable!("Unset query destination should not be reached"),
+        QueryDestination::Unset => turso_assert_unreachable!("translate: unset query destination"),
     }
 }
 
@@ -234,7 +235,7 @@ fn emit_values_to_index(
             index,
             is_delete,
         } => (cursor_id, index, is_delete),
-        _ => unreachable!(),
+        _ => turso_assert_unreachable!("translate: expected ephemeral index destination"),
     };
     if *is_delete {
         program.emit_insn(Insn::IdxDelete {

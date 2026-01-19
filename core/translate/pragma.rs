@@ -22,7 +22,7 @@ use crate::translate::schema::translate_create_table;
 use crate::util::{normalize_ident, parse_signed_number, parse_string, IOExt as _};
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
 use crate::vdbe::insn::{Cookie, Insn};
-use crate::{bail_parse_error, CaptureDataChangesMode, LimboError, Value};
+use crate::{bail_parse_error, turso_assert_unreachable, CaptureDataChangesMode, LimboError, Value};
 use std::str::FromStr;
 use strum::IntoEnumIterator;
 
@@ -208,7 +208,7 @@ fn update_pragma(
             let max_page_count_value = match data {
                 Value::Integer(i) => i as usize,
                 Value::Float(f) => f as usize,
-                _ => unreachable!(),
+                _ => turso_assert_unreachable!("translate: unexpected max page count type"),
             };
 
             let result_reg = program.alloc_register();
@@ -226,7 +226,7 @@ fn update_pragma(
             let version_value = match data {
                 Value::Integer(i) => i as i32,
                 Value::Float(f) => f as i32,
-                _ => unreachable!(),
+                _ => turso_assert_unreachable!("translate: unexpected user version type"),
             };
 
             program.emit_insn(Insn::SetCookie {
@@ -247,13 +247,13 @@ fn update_pragma(
             // because we need control over the write parameter for the transaction,
             // this should be unreachable. We have to force-call query_pragma before
             // getting here
-            unreachable!();
+            turso_assert_unreachable!("translate: table_info should use query_pragma");
         }
         PragmaName::TableXinfo => {
             // because we need control over the write parameter for the transaction,
             // this should be unreachable. We have to force-call query_pragma before
             // getting here
-            unreachable!();
+            turso_assert_unreachable!("translate: table_xinfo should use query_pragma");
         }
         PragmaName::PageSize => {
             let page_size = match parse_signed_number(&value)? {
@@ -340,8 +340,8 @@ fn update_pragma(
             });
             Ok((program, TransactionMode::None))
         }
-        PragmaName::IntegrityCheck => unreachable!("integrity_check cannot be set"),
-        PragmaName::QuickCheck => unreachable!("quick_check cannot be set"),
+        PragmaName::IntegrityCheck => turso_assert_unreachable!("translate: integrity_check cannot be set"),
+        PragmaName::QuickCheck => turso_assert_unreachable!("translate: quick_check cannot be set"),
         PragmaName::UnstableCaptureDataChangesConn => {
             let value = parse_string(&value)?;
             // todo(sivukhin): ideally, we should consistently update capture_data_changes connection flag only after successfull execution of schema change statement
@@ -371,7 +371,7 @@ fn update_pragma(
             connection.set_capture_data_changes(opts);
             Ok((program, TransactionMode::Write))
         }
-        PragmaName::DatabaseList => unreachable!("database_list cannot be set"),
+        PragmaName::DatabaseList => turso_assert_unreachable!("translate: database_list cannot be set"),
         PragmaName::QueryOnly => query_pragma(
             PragmaName::QueryOnly,
             resolver,
@@ -719,7 +719,7 @@ fn query_pragma(
                         let s = match &value_expr {
                             ast::Expr::Literal(Literal::String(s)) => s.as_bytes(),
                             ast::Expr::Name(n) => n.as_str().as_bytes(),
-                            _ => unreachable!(),
+                            _ => turso_assert_unreachable!("translate: unexpected query_only value type"),
                         };
                         match_ignore_ascii_case!(match s {
                             b"1" | b"on" | b"true" => true,
