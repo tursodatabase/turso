@@ -13,8 +13,6 @@ FROM chef AS planner
 # cargo-chef requires all this crap to be present in the workspace
 COPY Cargo.toml Cargo.lock ./
 COPY core ./core/
-COPY simulator ./simulator/
-COPY simulator_redo ./simulator_redo/
 COPY bindings ./bindings/
 COPY extensions ./extensions/
 COPY macros ./macros/
@@ -25,16 +23,13 @@ COPY perf/throughput/rusqlite ./perf/throughput/rusqlite
 COPY perf/throughput/turso ./perf/throughput/turso
 COPY cli ./cli/
 COPY sqlite3 ./sqlite3/
-COPY stress ./stress/
 COPY tests ./tests/
 COPY packages ./packages/
-COPY testing/sqlite_test_ext ./testing/sqlite_test_ext
+COPY testing ./testing/
 COPY sql_generation ./sql_generation/
-COPY sql_gen_prop ./sql_gen_prop/
-COPY whopper ./whopper
 COPY sdk-kit ./sdk-kit/
 COPY sdk-kit-macros ./sdk-kit-macros/
-RUN cargo chef prepare --bin sim_redo --recipe-path recipe.json
+RUN cargo chef prepare --bin differential_fuzzer --recipe-path recipe.json
 
 #
 # Build the project.
@@ -43,7 +38,7 @@ RUN cargo chef prepare --bin sim_redo --recipe-path recipe.json
 FROM chef AS builder
 
 COPY --from=planner /app/recipe.json recipe.json
-RUN cargo chef cook --bin sim_redo --recipe-path recipe.json
+RUN cargo chef cook --bin differential_fuzzer --recipe-path recipe.json
 COPY --from=planner /app/core ./core/
 COPY --from=planner /app/extensions ./extensions/
 COPY --from=planner /app/macros ./macros/
@@ -51,14 +46,12 @@ COPY --from=planner /app/parser ./parser/
 COPY --from=planner /app/perf/encryption ./perf/encryption
 COPY --from=planner /app/perf/throughput/rusqlite ./perf/throughput/rusqlite
 COPY --from=planner /app/perf/throughput/turso ./perf/throughput/turso
-COPY --from=planner /app/simulator ./simulator/
-COPY --from=planner /app/simulator_redo ./simulator_redo/
 COPY --from=planner /app/packages ./packages/
 COPY --from=planner /app/sql_generation ./sql_generation/
-COPY --from=planner /app/sql_gen_prop ./sql_gen_prop/
+COPY --from=planner /app/testing ./testing/
 COPY --from=planner /app/Cargo.toml /app/Cargo.lock ./
 
-RUN cargo build --bin sim_redo
+RUN cargo build --bin differential_fuzzer
 
 #
 # The final image.
@@ -81,14 +74,14 @@ ARG GIT_HASH
 ENV GIT_HASH=${GIT_HASH:-unknown}
 
 WORKDIR /app
-COPY --from=builder /app/target/debug/sim_redo /app/sim_redo
-COPY simulator_redo/docker-runner/package.json simulator_redo/docker-runner/tsconfig.json ./
+COPY --from=builder /app/target/debug/differential_fuzzer /app/differential_fuzzer
+COPY testing/differential-oracle/fuzzer/docker-runner/package.json testing/differential-oracle/fuzzer/docker-runner/tsconfig.json ./
 RUN bun install
-COPY simulator_redo/docker-runner/*.ts ./
+COPY testing/differential-oracle/fuzzer/docker-runner/*.ts ./
 
-RUN chmod +x /app/docker-entrypoint.simulator.ts
-RUN chmod +x /app/sim_redo
+RUN chmod +x /app/docker-entrypoint.fuzzer.ts
+RUN chmod +x /app/differential_fuzzer
 
-ENTRYPOINT ["bun", "/app/docker-entrypoint.simulator.ts"]
+ENTRYPOINT ["bun", "/app/docker-entrypoint.fuzzer.ts"]
 # Arguments can be passed at runtime
 CMD []

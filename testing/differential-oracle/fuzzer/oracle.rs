@@ -75,7 +75,7 @@ impl QueryResult {
 /// Differential oracle that compares Turso results with SQLite.
 ///
 /// This oracle verifies that Turso produces the same results as SQLite
-/// for all queries. It's the primary correctness check for the simulator.
+/// for all queries. It's the primary correctness check for the fuzzer.
 pub struct DifferentialOracle;
 
 impl Oracle for DifferentialOracle {

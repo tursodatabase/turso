@@ -1,5 +1,5 @@
 /**
- * Slack client for posting sim_redo run summaries.
+ * Slack client for posting differential_fuzzer run summaries.
  * Posts to configured Slack channel when runs complete.
  */
 export class SlackClient {
@@ -9,16 +9,16 @@ export class SlackClient {
 
   constructor() {
     this.botToken = process.env.SLACK_BOT_TOKEN || "";
-    this.channel = process.env.SLACK_CHANNEL || "#sim-redo-results-fake";
+    this.channel = process.env.SLACK_CHANNEL || "#differential-fuzzer-results-fake";
     this.mode = this.botToken ? 'real' : 'dry-run';
 
     if (this.mode === 'real') {
-      if (this.channel === "#sim-redo-results-fake") {
+      if (this.channel === "#differential-fuzzer-results-fake") {
         throw new Error("SLACK_CHANNEL must be set to a real channel when running in real mode");
       }
     } else {
-      if (this.channel !== "#sim-redo-results-fake") {
-        throw new Error("SLACK_CHANNEL must be set to #sim-redo-results-fake when running in dry-run mode");
+      if (this.channel !== "#differential-fuzzer-results-fake") {
+        throw new Error("SLACK_CHANNEL must be set to #differential-fuzzer-results-fake when running in dry-run mode");
       }
     }
   }
@@ -81,7 +81,7 @@ export class SlackClient {
     const timeString = `${hours}h ${minutes}m ${seconds}s`;
     const gitShortHash = gitHash.substring(0, 7);
 
-    return `sim_redo Run Complete - ${totalRuns} runs, ${issuesPosted} issues, ${timeString} elapsed (${gitShortHash})`;
+    return `differential_fuzzer Run Complete - ${totalRuns} runs, ${issuesPosted} issues, ${timeString} elapsed (${gitShortHash})`;
   }
 
   private createSummaryBlocks(stats: {
@@ -106,7 +106,7 @@ export class SlackClient {
         "type": "header",
         "text": {
           "type": "plain_text",
-          "text": "sim_redo Run Complete"
+          "text": "Fuzzer Weekly Run Complete"
         }
       },
       {
@@ -151,7 +151,7 @@ export class SlackClient {
         "type": "section",
         "text": {
           "type": "mrkdwn",
-          "text": `*See open issues:*\n<https://github.com/tursodatabase/limbo/issues?q=is%3Aissue%20state%3Aopen%20label%3Asimulator_redo|Open simulator_redo issues>`
+          "text": `*See open issues:*\n<https://github.com/tursodatabase/limbo/issues?q=is%3Aissue%20state%3Aopen%20label%3Adifferential_fuzzer|Open differential_fuzzer issues>`
         }
       },
       {

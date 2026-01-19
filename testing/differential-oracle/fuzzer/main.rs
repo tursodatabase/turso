@@ -1,22 +1,21 @@
-//! SQLancer-style simulator for Turso.
+//! Diferential Fuzzer for Turso.
 //!
-//! This binary runs a differential testing simulator that compares Turso
+//! This binary runs a differential testing fuzzer that compares Turso
 //! results against SQLite for generated SQL statements.
 
 use std::{
     io::{IsTerminal, stdin},
     panic::{self},
-    process::Stdio,
     sync::Arc,
 };
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use differential_fuzzer::{Fuzzer, SimConfig};
 use parking_lot::Mutex;
 use rand::RngCore;
-use sim_redo::{SimConfig, Simulator};
 
-/// SQLancer-style differential testing simulator for Turso.
+/// SQLancer-style differential testing fuzzer for Turso.
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
@@ -50,7 +49,7 @@ struct Args {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// Run the simulator in a loop with random seeds.
+    /// Run the fuzzer in a loop with random seeds.
     Loop {
         /// Number of iterations to run (0 for infinite).
         #[arg(default_value_t = 0)]
@@ -102,9 +101,9 @@ fn run_single(args: &Args) -> Result<()> {
         keep_files: args.keep_files,
     };
 
-    tracing::info!("Starting sim_redo with config: {:?}", config);
+    tracing::info!("Starting differential_fuzzer with config: {:?}", config);
 
-    let simulator = Simulator::new(config)?;
+    let fuzzer = Fuzzer::new(config)?;
 
     let panic_info = Arc::new(Mutex::new(None::<String>));
     let info_clone = Arc::clone(&panic_info);
@@ -115,7 +114,7 @@ fn run_single(args: &Args) -> Result<()> {
         *info_clone.lock() = Some(info.to_string());
     }));
 
-    let stats = std::panic::catch_unwind(|| simulator.run()).map_err(|err| {
+    let stats = std::panic::catch_unwind(|| fuzzer.run()).map_err(|err| {
         let msg = if let Some(s) = err.downcast_ref::<&str>() {
             s.to_string()
         } else if let Some(s) = err.downcast_ref::<String>() {
@@ -139,14 +138,14 @@ fn run_single(args: &Args) -> Result<()> {
 
     if args.keep_files {
         tracing::info!("Persisting database files to disk...");
-        simulator.persist_files()?;
+        fuzzer.persist_files()?;
     }
 
     // Write schema to JSON file
-    match simulator.get_schema() {
+    match fuzzer.get_schema() {
         Ok(schema) => {
             let json = serde_json::to_string_pretty(&schema)?;
-            std::fs::write(simulator.out_dir.join("schema.json"), &json)?;
+            std::fs::write(fuzzer.out_dir.join("schema.json"), &json)?;
             tracing::info!("Wrote schema to schema.json");
         }
         Err(e) => {

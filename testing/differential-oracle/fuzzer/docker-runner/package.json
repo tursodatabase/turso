@@ -1,7 +1,7 @@
 {
-  "name": "sim-redo-runner",
-  "description": "A script to run sim_redo in a docker container in a loop and post issues to github when it fails",
-  "module": "docker-entrypoint.simulator.ts",
+  "name": "differential-fuzzer-runner",
+  "description": "A script to run a differential fuzzer in a docker container in a loop and post issues to github when it fails",
+  "module": "docker-entrypoint.fuzzer.ts",
   "type": "module",
   "dependencies": {
     "octokit": "4.1.2"

@@ -18,7 +18,7 @@ const slack = new SlackClient();
 
 process.env.RUST_BACKTRACE = "1";
 
-console.log("Starting sim_redo in a loop...");
+console.log("Starting fuzzer in a loop...");
 console.log(`Git hash: ${github.GIT_HASH}`);
 console.log(`GitHub issues enabled: ${github.mode === 'real'}`);
 console.log(`Slack notifications enabled: ${slack.mode === 'real'}`);
@@ -175,8 +175,8 @@ while (new Date().getTime() - startTime.getTime() < TIME_LIMIT_MINUTES * 60 * 10
     '--seed', seed
   ];
 
-  console.log(`[${timestamp}]: Running "sim_redo ${args.join(" ")}" - (seed ${seed}, run number ${runNumber})`);
-  const issuePosted = await run(seed, "sim_redo", args);
+  console.log(`[${timestamp}]: Running "fuzzer ${args.join(" ")}" - (seed ${seed}, run number ${runNumber})`);
+  const issuePosted = await run(seed, "differential_fuzzer", args);
 
   if (issuePosted) {
     totalIssuesPosted++;

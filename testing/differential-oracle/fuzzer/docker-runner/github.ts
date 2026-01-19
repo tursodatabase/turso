@@ -67,7 +67,7 @@ export class GithubClient {
       owner: this.GITHUB_ORG,
       repo: this.GITHUB_REPO_NAME,
       state: 'open',
-      labels: 'simulator_redo',
+      labels: 'differential_fuzzer',
       creator: 'app/turso-github-handyman',
     });
     return issues.data.map((issue) => ({ title: issue.title, number: issue.number }));
@@ -90,12 +90,12 @@ export class GithubClient {
 
     let title = ((f: Fault) => {
       if (f.type === "panic") {
-        return `sim_redo panic: "${f.stackTrace.mainError}"`;
+        return `differential_fuzzer panic: "${f.stackTrace.mainError}"`;
       } else
       if (f.type === "assertion") {
-        return `sim_redo assertion failure: "${f.failureInfo.mainError}"`;
+        return `differential_fuzzer assertion failure: "${f.failureInfo.mainError}"`;
       }
-      return `sim_redo timeout using git hash ${this.GIT_HASH}`;
+      return `differential_fuzzer timeout using git hash ${this.GIT_HASH}`;
     })(fault);
     title = title.slice(0, GITHUB_ISSUE_TITLE_MAX_LENGTH);
     for (const existingIssue of this.openIssues) {
@@ -130,7 +130,7 @@ export class GithubClient {
       repo,
       title,
       body,
-      labels: ['bug', 'simulator_redo', 'automated']
+      labels: ['bug', 'differential_fuzzer', 'automated']
     });
 
     console.log(`Successfully created GitHub issue: ${response.data.html_url}`);
@@ -161,23 +161,21 @@ export class GithubClient {
     const gitShortHash = this.GIT_HASH.substring(0, 7);
     return `- **Seed**: ${fault.seed}
 - **Git Hash**: ${this.GIT_HASH}
-- **Command**: \`sim_redo ${fault.command}\`
+- **Command**: \`differential_fuzzer ${fault.command}\`
 - **Timestamp**: ${new Date().toISOString()}
 
 ### Run locally with Docker
 
 \`\`\`
-gh pr checkout 4642
-docker buildx build -t sim-redo:${gitShortHash} -f simulator_redo/docker-runner/Dockerfile . --build-arg GIT_HASH=$(git rev-parse HEAD)
-docker run --network host sim-redo:${gitShortHash} ${fault.command}
+docker buildx build -t differential-fuzzer:${gitShortHash} -f testing/differential-oracle/fuzzer/docker-runner/Dockerfile . --build-arg GIT_HASH=$(git rev-parse HEAD)
+docker run --network host differential-fuzzer:${gitShortHash} ${fault.command}
 \`\`\`
 
 ### Run locally with Cargo
 
 \`\`\`
-gh pr checkout 4642
-cargo build -p sim_redo
-./target/debug/sim_redo ${fault.command}
+cargo build -p differential-fuzzer
+./target/debug/differential_fuzzer ${fault.command}
 \`\`\``;
   }
 
@@ -190,7 +188,7 @@ ${this.createFaultDetails(fault)}
 
   private createIssueBody(fault: Fault): string {
     const output = fault.type === "panic" ? fault.stackTrace.trace : fault.type === "assertion" ? fault.failureInfo.output : fault.output;
-    return `## sim_redo failure type: ${fault.type}
+    return `## differential_fuzzer failure type: ${fault.type}
 
 ${this.createFaultDetails(fault)}
 

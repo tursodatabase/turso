@@ -152,7 +152,7 @@ impl SimStats {
 }
 
 /// The main simulator.
-pub struct Simulator {
+pub struct Fuzzer {
     config: SimConfig,
     rng: RefCell<ChaCha8Rng>,
     turso_conn: Arc<turso_core::Connection>,
@@ -165,9 +165,9 @@ pub struct Simulator {
     pub out_dir: PathBuf,
 }
 
-impl RefUnwindSafe for Simulator {}
+impl RefUnwindSafe for Fuzzer {}
 
-impl Simulator {
+impl Fuzzer {
     /// Create a new simulator with in-memory databases.
     ///
     /// Uses `MemorySimIO` for deterministic in-memory storage.
@@ -407,7 +407,7 @@ mod tests {
             verbose: false,
             keep_files: false,
         };
-        let sim = Simulator::new(config);
+        let sim = Fuzzer::new(config);
         assert!(sim.is_ok());
     }
 }
