@@ -5235,6 +5235,7 @@ pub fn op_function(
                                 json::path::PathElement::Root(),
                                 json::path::PathElement::ArrayLocator(Some(i as i32)),
                             ],
+                            trail_error: None,
                         };
 
                         columns_json_array.operate_on_path(&path, &mut op)?;

@@ -2419,6 +2419,10 @@ impl Jsonb {
             stack.push(result);
         }
 
+        if let Some(err) = &path.trail_error {
+            return Err(err.clone());
+        }
+
         Ok(stack)
     }
 
@@ -2540,9 +2544,9 @@ impl Jsonb {
                                 ));
                             }
 
-                            bail_parse_error!("Not found!");
+                            return Err(crate::LimboError::PathNotFound);
                         }
-                        Some(idx) if *idx < 0 => {
+                        Some(idx) => {
                             let mut idx_map: HashMap<i32, usize> = HashMap::with_capacity(100);
                             let mut element_idx = 0;
                             let mut arr_pos = pos + root_header_size;
@@ -2563,10 +2567,28 @@ impl Jsonb {
                                     *index,
                                 ));
                             } else {
-                                bail_parse_error!("Element with negative index not found")
+                                return Err(crate::LimboError::PathNotFound);
                             }
                         }
-                        _ => unreachable!(),
+                        None => {
+                            if mode.allows_insert() {
+                                let arr_pos = end_pos;
+                                let placeholder =
+                                    JsonbHeader::new(ElementType::OBJECT, 0).into_bytes();
+                                let placeholder_bytes = placeholder.as_bytes();
+
+                                self.data
+                                    .splice(arr_pos..arr_pos, placeholder_bytes.iter().copied());
+
+                                return Ok(JsonTraversalResult::with_array_index(
+                                    pos,
+                                    JsonLocationKind::ArrayEntry,
+                                    placeholder_bytes.len() as isize,
+                                    arr_pos,
+                                ));
+                            }
+                            return Err(crate::LimboError::PathNotFound);
+                        }
                     }
                 } else {
                     if root_type == ElementType::OBJECT
@@ -2667,10 +2689,10 @@ impl Jsonb {
                             delta as isize,
                         ));
                     } else {
-                        bail_parse_error!("Mode does not allow insert cannot create new key!")
+                        return Err(crate::LimboError::PathNotFound);
                     }
                 } else {
-                    bail_parse_error!("Looks like this is noop");
+                    return Err(crate::LimboError::PathNotFound);
                 }
             }
             SegmentVariant::KeyWithArrayIndex(
@@ -2719,9 +2741,9 @@ impl Jsonb {
                                 ));
                             }
 
-                            bail_parse_error!("Not found!");
+                            return Err(crate::LimboError::PathNotFound);
                         }
-                        Some(idx) if *idx < 0 => {
+                        Some(idx) => {
                             let mut idx_map: HashMap<i32, usize> = HashMap::with_capacity(100);
                             let mut element_idx = 0;
                             let mut arr_pos = pos + root_header_size;
@@ -2742,10 +2764,28 @@ impl Jsonb {
                                     *index,
                                 ));
                             } else {
-                                bail_parse_error!("Element with negative index not found")
+                                return Err(crate::LimboError::PathNotFound);
                             }
                         }
-                        _ => unreachable!(),
+                        None => {
+                            if mode.allows_insert() {
+                                let arr_pos = end_pos;
+                                let placeholder =
+                                    JsonbHeader::new(ElementType::OBJECT, 0).into_bytes();
+                                let placeholder_bytes = placeholder.as_bytes();
+
+                                self.data
+                                    .splice(arr_pos..arr_pos, placeholder_bytes.iter().copied());
+
+                                return Ok(JsonTraversalResult::with_array_index(
+                                    pos,
+                                    JsonLocationKind::DocumentRoot,
+                                    placeholder_bytes.len() as isize,
+                                    arr_pos,
+                                ));
+                            }
+                            return Err(crate::LimboError::PathNotFound);
+                        }
                     }
                 } else {
                     bail_parse_error!("Root is not an array");
@@ -2834,7 +2874,7 @@ impl Jsonb {
                     ));
                 }
 
-                if current_pos != end_pos && mode.allows_replace() {
+                if current_pos != end_pos && (mode.allows_replace() || mode.allows_insert()) {
                     let key_idx = current_pos;
 
                     current_pos = self.skip_element(current_pos)?;
@@ -2881,7 +2921,8 @@ impl Jsonb {
                                 ));
                             }
 
-                            if arr_pos != end_pos && mode.allows_replace() {
+                            if arr_pos != end_pos && (mode.allows_replace() || mode.allows_insert())
+                            {
                                 return Ok(JsonTraversalResult::with_array_index(
                                     value_idx,
                                     JsonLocationKind::ObjectProperty(key_idx),
@@ -2890,7 +2931,7 @@ impl Jsonb {
                                 ));
                             }
 
-                            bail_parse_error!("Not found!");
+                            return Err(crate::LimboError::PathNotFound);
                         }
                         Some(idx) if *idx < 0 => {
                             let mut idx_map: HashMap<i32, usize> = HashMap::with_capacity(100);
@@ -2913,10 +2954,7 @@ impl Jsonb {
                                     *index,
                                 ));
                             } else {
-                                bail_parse_error!(
-                                    "ERROR: Element at negative index {} not found",
-                                    idx
-                                );
+                                return Err(crate::LimboError::PathNotFound);
                             }
                         }
                         Some(_) => unreachable!(),
@@ -2927,7 +2965,22 @@ impl Jsonb {
                                 let placeholder_bytes = placeholder.as_bytes();
                                 let insertion_point = value_idx + value_size + value_header_size;
 
-                                self.data.insert(insertion_point, placeholder_bytes[0]);
+                                self.data.splice(
+                                    insertion_point..insertion_point,
+                                    placeholder_bytes.iter().copied(),
+                                );
+                                self.write_element_header(
+                                    value_idx,
+                                    ElementType::ARRAY,
+                                    value_size + placeholder_bytes.len(),
+                                    true,
+                                )?;
+                                return Ok(JsonTraversalResult::with_array_index(
+                                    value_idx,
+                                    JsonLocationKind::ObjectProperty(key_idx),
+                                    placeholder_bytes.len() as isize,
+                                    insertion_point,
+                                ));
                             } else {
                                 bail_parse_error!("Cant insert")
                             }
@@ -2965,6 +3018,7 @@ impl Jsonb {
         work_stack.push_back((
             JsonPath {
                 elements: vec![PathElement::Root()],
+                trail_error: None,
             },
             0,
         ));
@@ -3983,7 +4037,10 @@ mod path_operations_tests {
 
     // Helper function to create a simple JsonPath
     fn create_path(elements: Vec<PathElement>) -> JsonPath {
-        JsonPath { elements }
+        JsonPath {
+            elements,
+            trail_error: None,
+        }
     }
 
     #[test]

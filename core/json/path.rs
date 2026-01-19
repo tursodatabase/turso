@@ -15,13 +15,14 @@ enum ArrayIndexState {
     Start,
     AfterHash,
     CollectingNumbers,
-    IsMax,
+    CollectingNegativeNumbers,
 }
 
 /// Describes a JSON path, which is a sequence of keys and/or array locators.
 #[derive(Clone, Debug)]
 pub struct JsonPath<'a> {
     pub elements: Vec<PathElement<'a>>,
+    pub trail_error: Option<crate::LimboError>,
 }
 
 type RawString = bool;
@@ -37,19 +38,9 @@ pub enum PathElement<'a> {
     ArrayLocator(Option<i32>),
 }
 
-type IsMaxNumber = bool;
-
-fn collect_num(current: i128, adding: i128, negative: bool) -> (i128, IsMaxNumber) {
-    let ten = 10i128;
-
-    let result = if negative {
-        current.saturating_mul(ten).saturating_sub(adding)
-    } else {
-        current.saturating_mul(ten).saturating_add(adding)
-    };
-
-    let is_max = result == i128::MAX || result == i128::MIN;
-    (result, is_max)
+fn collect_num(current: u32, adding: u32) -> u32 {
+    let ten = 10u32;
+    current.wrapping_mul(ten).wrapping_add(adding)
 }
 
 fn estimate_path_capacity(input: &str) -> usize {
@@ -70,6 +61,7 @@ pub fn json_path(path: &str) -> crate::Result<JsonPath<'_>> {
     let mut index_buffer: i128 = 0;
     let mut path_components = Vec::with_capacity(estimate_path_capacity(path));
     let mut path_iter = path.char_indices();
+    let mut trail_error = None;
 
     while let Some(ch) = path_iter.next() {
         match parser_state {
@@ -77,17 +69,23 @@ pub fn json_path(path: &str) -> crate::Result<JsonPath<'_>> {
                 handle_start(ch, &mut parser_state, &mut path_components, path)?;
             }
             PPState::AfterRoot => {
-                handle_after_root(
+                match handle_after_root(
                     ch,
                     &mut parser_state,
                     &mut index_state,
                     &mut key_start,
                     &mut index_buffer,
                     path,
-                )?;
+                ) {
+                    Ok(_) => {}
+                    Err(e) => {
+                        trail_error = Some(e);
+                        break;
+                    }
+                }
             }
             PPState::InKey => {
-                handle_in_key(
+                match handle_in_key(
                     ch,
                     &mut parser_state,
                     &mut index_state,
@@ -96,10 +94,16 @@ pub fn json_path(path: &str) -> crate::Result<JsonPath<'_>> {
                     &mut path_components,
                     &mut path_iter,
                     path,
-                )?;
+                ) {
+                    Ok(_) => {}
+                    Err(e) => {
+                        trail_error = Some(e);
+                        break;
+                    }
+                }
             }
             PPState::InArrayIndex => {
-                handle_array_index(
+                match handle_array_index(
                     ch,
                     &mut parser_state,
                     &mut index_state,
@@ -107,24 +111,45 @@ pub fn json_path(path: &str) -> crate::Result<JsonPath<'_>> {
                     &mut path_components,
                     &mut path_iter,
                     path,
-                )?;
+                ) {
+                    Ok(_) => {}
+                    Err(e) => {
+                        trail_error = Some(e);
+                        break;
+                    }
+                }
             }
             PPState::ExpectDotOrBracket => {
-                handle_expect_dot_or_bracket(
+                match handle_expect_dot_or_bracket(
                     ch,
                     &mut parser_state,
                     &mut index_state,
                     &mut key_start,
                     &mut index_buffer,
                     path,
-                )?;
+                ) {
+                    Ok(_) => {}
+                    Err(e) => {
+                        trail_error = Some(e);
+                        break;
+                    }
+                }
             }
         }
     }
 
-    finalize_path(parser_state, key_start, path, &mut path_components)?;
+    if trail_error.is_none() {
+        if let Err(e) = finalize_path(parser_state, key_start, path, &mut path_components) {
+            trail_error = Some(e);
+        }
+    }
+
     Ok(JsonPath {
         elements: path_components,
+        trail_error: trail_error.map(|e| match e {
+            crate::LimboError::ParseError(msg) => crate::LimboError::ParseError(msg),
+            _ => e,
+        }),
     })
 }
 
@@ -257,22 +282,34 @@ fn handle_array_index(
             path_components.push(PathElement::ArrayLocator(None));
         }
         (ArrayIndexState::CollectingNumbers, '0'..='9') => {
-            let (new_num, is_max) = collect_num(
-                *index_buffer,
+            let new_num = collect_num(
+                *index_buffer as u32,
                 ch.1.to_digit(10).ok_or_else(|| {
                     crate::LimboError::ParseError(format!("failed to parse digit: {ch}", ch = ch.1))
-                })? as i128,
-                *index_buffer < 0,
+                })?,
             );
-            if is_max {
-                *index_state = ArrayIndexState::IsMax;
-            }
-            *index_buffer = new_num;
+            *index_buffer = new_num as i128;
         }
-        (ArrayIndexState::IsMax, '0'..='9') => (),
-        (ArrayIndexState::CollectingNumbers | ArrayIndexState::IsMax, ']') => {
+        (ArrayIndexState::CollectingNegativeNumbers, '0'..='9') => {
+            let new_num = collect_num(
+                *index_buffer as u32,
+                ch.1.to_digit(10).ok_or_else(|| {
+                    crate::LimboError::ParseError(format!("failed to parse digit: {ch}", ch = ch.1))
+                })?,
+            );
+            *index_buffer = new_num as i128;
+        }
+        (ArrayIndexState::CollectingNumbers, ']') => {
             *parser_state = PPState::ExpectDotOrBracket;
             path_components.push(PathElement::ArrayLocator(Some(*index_buffer as i32)));
+        }
+        (ArrayIndexState::CollectingNegativeNumbers, ']') => {
+            *parser_state = PPState::ExpectDotOrBracket;
+            if *index_buffer == 0 {
+                path_components.push(PathElement::ArrayLocator(None));
+            } else {
+                path_components.push(PathElement::ArrayLocator(Some(-((*index_buffer) as i32))));
+            }
         }
         (_, _) => bail_parse_error!("Bad json path: {}", path),
     }
@@ -287,10 +324,10 @@ fn handle_negative_index(
 ) -> crate::Result<()> {
     if let Some((_, next_c)) = path_iter.next() {
         if next_c.is_ascii_digit() {
-            *index_buffer = -(next_c.to_digit(10).ok_or_else(|| {
+            *index_buffer = next_c.to_digit(10).ok_or_else(|| {
                 crate::LimboError::ParseError(format!("failed to parse digit: {next_c}"))
-            })? as i128);
-            *index_state = ArrayIndexState::CollectingNumbers;
+            })? as i128;
+            *index_state = ArrayIndexState::CollectingNegativeNumbers;
             Ok(())
         } else {
             bail_parse_error!("Bad json path: {}", path)
@@ -391,17 +428,23 @@ mod tests {
     #[test]
     fn test_json_path_invalid() {
         let invalid_values = vec![
-            "", "$$$", "$.", "$ ", "$[", "$]", "$[-1]", "x", "[]", "$[0", "$[0x]", "$\"",
+            "$$$", "$.", "$ ", "$[", "$]", "$[-1]", "x", "[]", "$[0", "$[0x]", "$\"",
         ];
 
-        for value in invalid_values {
-            let path = json_path(value);
+        // Empty string is a special case that returns immediate error
+        assert!(json_path("").is_err());
 
-            match path {
-                Err(crate::error::LimboError::ParseError(_)) => {
-                    // happy path
+        for value in invalid_values {
+            let path_res = json_path(value);
+            match path_res {
+                Err(crate::LimboError::ParseError(_)) => {}
+                Ok(path) => {
+                    assert!(
+                        path.trail_error.is_some(),
+                        "Expected trail_error for: {value:?}, got: {path:?}"
+                    );
                 }
-                _ => panic!("Expected error for: {value:?}, got: {path:?}"),
+                _ => panic!("Expected error for: {value:?}, got: {path_res:?}"),
             }
         }
     }
@@ -453,17 +496,17 @@ mod tests {
     #[test]
     fn test_edge_cases() {
         // Empty key
-        assert!(json_path("$.").is_err());
+        assert!(json_path("$.").unwrap().trail_error.is_some());
 
         // Multiple dots
-        assert!(json_path("$..key").is_err());
+        assert!(json_path("$..key").unwrap().trail_error.is_some());
 
         // Unclosed brackets
-        assert!(json_path("$[0").is_err());
-        assert!(json_path("$[").is_err());
+        assert!(json_path("$[0").unwrap().trail_error.is_some());
+        assert!(json_path("$[").unwrap().trail_error.is_some());
 
         // Invalid negative index format
-        assert!(json_path("$[-1]").is_err()); // should be $[#-1]
+        assert!(json_path("$[-1]").unwrap().trail_error.is_some()); // should be $[#-1]
     }
 
     #[test]

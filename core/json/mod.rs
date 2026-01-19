@@ -497,37 +497,43 @@ where
                 Err(_) => return Ok((null, ElementType::NULL)),
                 Ok(el) => el,
             };
-            if res.is_ok() {
-                return Ok((extracted, element_type));
+            match res {
+                Ok(_) => Ok((extracted, element_type)),
+                Err(crate::LimboError::PathNotFound) => Ok((null, ElementType::NULL)),
+                Err(e) => Err(e),
+            }
+        } else {
+            Ok((null, ElementType::NULL))
+        }
+    } else {
+        let mut json = value;
+        let mut result = Jsonb::make_empty_array(json.len());
+
+        // TODO: make an op to avoid creating new json for every path element
+        for path in paths {
+            let path = json_path_from_db_value(&path, true);
+            if let Some(path) = path? {
+                let mut op = SearchOperation::new(json.len());
+                let res = json.operate_on_path(&path, &mut op);
+                let extracted = op.result();
+                match res {
+                    Ok(_) => {
+                        result.append_to_array_unsafe(&extracted.data());
+                    }
+                    Err(crate::LimboError::PathNotFound) => {
+                        result.append_to_array_unsafe(
+                            JsonbHeader::make_null().into_bytes().as_bytes(),
+                        );
+                    }
+                    Err(e) => return Err(e),
+                }
             } else {
                 return Ok((null, ElementType::NULL));
             }
-        } else {
-            return Ok((null, ElementType::NULL));
         }
+        result.finalize_unsafe(ElementType::ARRAY)?;
+        Ok((result, ElementType::ARRAY))
     }
-
-    let mut json = value;
-    let mut result = Jsonb::make_empty_array(json.len());
-
-    // TODO: make an op to avoid creating new json for every path element
-    for path in paths {
-        let path = json_path_from_db_value(&path, true);
-        if let Some(path) = path? {
-            let mut op = SearchOperation::new(json.len());
-            let res = json.operate_on_path(&path, &mut op);
-            let extracted = op.result();
-            if res.is_ok() {
-                result.append_to_array_unsafe(&extracted.data());
-            } else {
-                result.append_to_array_unsafe(JsonbHeader::make_null().into_bytes().as_bytes());
-            }
-        } else {
-            return Ok((null, ElementType::NULL));
-        }
-    }
-    result.finalize_unsafe(ElementType::ARRAY)?;
-    Ok((result, ElementType::ARRAY))
 }
 
 /// converts a `Jsonb` value to a db Value
@@ -652,6 +658,7 @@ fn json_path_from_db_value<'a>(
                             PathElement::Root(),
                             PathElement::Key(Cow::Borrowed(t.as_str()), false),
                         ],
+                        trail_error: None,
                     }
                 }
             }
@@ -661,12 +668,14 @@ fn json_path_from_db_value<'a>(
                     PathElement::Root(),
                     PathElement::ArrayLocator(Some(i as i32)),
                 ],
+                trail_error: None,
             },
             ValueRef::Float(f) => JsonPath {
                 elements: vec![
                     PathElement::Root(),
                     PathElement::Key(Cow::Owned(f.to_string()), false),
                 ],
+                trail_error: None,
             },
             _ => crate::bail_constraint_error!("JSON path error near: {:?}", path.to_string()),
         }
