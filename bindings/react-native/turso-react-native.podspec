@@ -21,6 +21,11 @@ Pod::Spec.new do |s|
   # Vendored Rust XCFramework (handles device + simulator automatically)
   s.vendored_frameworks = "libs/ios/turso_sync_sdk_kit.xcframework"
 
+  # Explicitly export C headers from the vendored xcframework
+  s.static_framework = true
+  s.public_header_files = "libs/ios/turso_sync_sdk_kit.xcframework/**/Headers/*.h"
+  s.header_mappings_dir = "libs/ios/turso_sync_sdk_kit.xcframework"
+
   # Header search paths
   s.pod_target_xcconfig = {
     "CLANG_CXX_LANGUAGE_STANDARD" => "c++20",
