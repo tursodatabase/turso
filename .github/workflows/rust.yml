@@ -122,6 +122,30 @@ jobs:
   simulator:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 35
+    strategy:
+      matrix:
+        profile:
+          - name: default
+            iterations: 10
+            args: "--maximum-tests 1000 --min-tick 10 --max-tick 50 --io-backend=memory"
+          - name: InsertHeavy
+            iterations: 5
+            args: "--maximum-tests 1000 --min-tick 10 --max-tick 50 --profile write_heavy --io-backend=memory"
+          - name: InsertHeavySpill
+            iterations: 5
+            args: "--maximum-tests 1000 --min-tick 10 --max-tick 50 --profile write_heavy_spill --io-backend=memory"
+          - name: Faultless
+            iterations: 10
+            args: "--maximum-tests 1000 --min-tick 10 --max-tick 50 --profile faultless --io-backend=memory"
+          - name: IOUring InsertHeavySpill
+            iterations: 5
+            args: "--io-backend=io-uring --maximum-tests 1000 --profile=write_heavy_spill"
+          - name: IOUring Differential
+            iterations: 10
+            args: "--io-backend=io-uring --maximum-tests 1000 --differential"
+          - name: Differential
+            iterations: 10
+            args: "--maximum-tests 1000 --differential --io-backend=memory"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -135,61 +159,13 @@ jobs:
         uses: mozilla-actions/sccache-action@v0.0.9
       # Run these with for loops (instead of --loop flag in sim) so that each iteration gets a separate seed -- this produces much easier-to-debug traces when there's a failure since we don't have to potentially
       # run 10 iterations of the same seed to get to the failure
-      - name: Simulator default
+      - name: Simulator ${{ matrix.profile.name }}
         env:
           SCCACHE_GHA_ENABLED: "true"
           RUSTC_WRAPPER: "sccache"
         run: |
-          for i in {1..10}; do
-            ./scripts/run-sim --maximum-tests 1000 --min-tick 10 --max-tick 50 --io-backend=memory || exit 1
-          done
-      - name: Simulator InsertHeavy
-        env:
-          SCCACHE_GHA_ENABLED: "true"
-          RUSTC_WRAPPER: "sccache"
-        run: |
-          for i in {1..5}; do
-            ./scripts/run-sim --maximum-tests 1000 --min-tick 10 --max-tick 50 --profile write_heavy --io-backend=memory || exit 1
-          done
-      - name: Simulator InsertHeavySpill
-        env:
-          SCCACHE_GHA_ENABLED: "true"
-          RUSTC_WRAPPER: "sccache"
-        run: |
-          for i in {1..5}; do
-            ./scripts/run-sim --maximum-tests 1000 --min-tick 10 --max-tick 50 --profile write_heavy_spill --io-backend=memory || exit 1
-          done
-      - name: Simulator Faultless
-        env:
-          SCCACHE_GHA_ENABLED: "true"
-          RUSTC_WRAPPER: "sccache"
-        run: |
-          for i in {1..10}; do
-            ./scripts/run-sim --maximum-tests 1000 --min-tick 10 --max-tick 50 --profile faultless --io-backend=memory || exit 1
-          done
-      - name: Simulator IOUring InsertHeavySpill
-        env:
-          SCCACHE_GHA_ENABLED: "true"
-          RUSTC_WRAPPER: "sccache"
-        run: |
-          for i in {1..5}; do
-            ./scripts/run-sim --io-backend=io-uring --maximum-tests 1000 --profile=write_heavy_spill || exit 1
-          done
-      - name: Simulator IOUring Differential
-        env:
-          SCCACHE_GHA_ENABLED: "true"
-          RUSTC_WRAPPER: "sccache"
-        run: |
-          for i in {1..10}; do
-            ./scripts/run-sim --io-backend=io-uring --maximum-tests 1000 --differential || exit 1
-          done
-      - name: Simulator Differential
-        env:
-          SCCACHE_GHA_ENABLED: "true"
-          RUSTC_WRAPPER: "sccache"
-        run: |
-          for i in {1..10}; do
-            ./scripts/run-sim --maximum-tests 1000 --differential --io-backend=memory || exit 1
+          for i in $(seq 1 ${{ matrix.profile.iterations }}); do
+            ./scripts/run-sim ${{ matrix.profile.args }} || exit 1
           done
 
   test-limbo:
