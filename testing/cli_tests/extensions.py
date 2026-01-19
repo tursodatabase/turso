@@ -785,7 +785,7 @@ def test_csv():
     test_module_list(turso, "target/debug/liblimbo_csv", "csv")
 
     turso.run_test_fn(
-        "CREATE VIRTUAL TABLE temp.csv USING csv(filename=./testing/test_files/test.csv);",
+        "CREATE VIRTUAL TABLE temp.csv USING csv(filename=./testing/cli_tests/test_files/test.csv);",
         null,
         "Create virtual table from CSV file",
     )
