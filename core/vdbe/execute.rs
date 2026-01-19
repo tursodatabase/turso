@@ -78,7 +78,7 @@ use crate::{
     },
 };
 
-use crate::{connection::Row, info, turso_assert, OpenFlags, TransactionState, ValueRef};
+use crate::{connection::Row, info, turso_assert, turso_assert_reachable, turso_assert_unreachable, OpenFlags, TransactionState, ValueRef};
 
 use super::{
     insn::{Cookie, RegisterOrLiteral},
@@ -180,6 +180,7 @@ pub fn op_init(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_init executed");
     load_insn!(Init { target_pc }, insn);
     if !target_pc.is_offset() {
         crate::bail_corrupt_error!("Unresolved label: {target_pc:?}");
@@ -194,6 +195,7 @@ pub fn op_add(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_add executed");
     load_insn!(Add { lhs, rhs, dest }, insn);
     state.registers[*dest] = Register::Value(
         state.registers[*lhs]
@@ -210,6 +212,7 @@ pub fn op_subtract(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_subtract executed");
     load_insn!(Subtract { lhs, rhs, dest }, insn);
     state.registers[*dest] = Register::Value(
         state.registers[*lhs]
@@ -226,6 +229,7 @@ pub fn op_multiply(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_multiply executed");
     load_insn!(Multiply { lhs, rhs, dest }, insn);
     state.registers[*dest] = Register::Value(
         state.registers[*lhs]
@@ -242,6 +246,7 @@ pub fn op_divide(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_divide executed");
     load_insn!(Divide { lhs, rhs, dest }, insn);
     state.registers[*dest] = Register::Value(
         state.registers[*lhs]
@@ -258,6 +263,7 @@ pub fn op_drop_index(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_drop_index executed");
     load_insn!(DropIndex { index, db: _ }, insn);
     program
         .connection
@@ -272,6 +278,7 @@ pub fn op_remainder(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_remainder executed");
     load_insn!(Remainder { lhs, rhs, dest }, insn);
     state.registers[*dest] = Register::Value(
         state.registers[*lhs]
@@ -288,6 +295,7 @@ pub fn op_bit_and(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_bit_and executed");
     load_insn!(BitAnd { lhs, rhs, dest }, insn);
     state.registers[*dest] = Register::Value(
         state.registers[*lhs]
@@ -304,6 +312,7 @@ pub fn op_bit_or(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_bit_or executed");
     load_insn!(BitOr { lhs, rhs, dest }, insn);
     state.registers[*dest] = Register::Value(
         state.registers[*lhs]
@@ -320,6 +329,7 @@ pub fn op_bit_not(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_bit_not executed");
     load_insn!(BitNot { reg, dest }, insn);
     state.registers[*dest] = Register::Value(state.registers[*reg].get_value().exec_bit_not());
     state.pc += 1;
@@ -332,6 +342,7 @@ pub fn op_checkpoint(
     insn: &Insn,
     pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_checkpoint executed");
     load_insn!(
         Checkpoint {
             database: _,
@@ -419,6 +430,7 @@ pub fn op_null(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_null executed");
     match insn {
         Insn::Null { dest, dest_end } | Insn::BeginSubrtn { dest, dest_end } => {
             if let Some(dest_end) = dest_end {
@@ -429,7 +441,7 @@ pub fn op_null(
                 state.registers[*dest] = Register::Value(Value::Null);
             }
         }
-        _ => unreachable!("unexpected Insn {:?}", insn),
+        _ => turso_assert_unreachable!("vdbe: unexpected instruction in op_column"),
     }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -441,6 +453,7 @@ pub fn op_null_row(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_null_row executed");
     load_insn!(NullRow { cursor_id }, insn);
     {
         let cursor = must_be_btree_cursor!(*cursor_id, program.cursor_ref, state, "NullRow");
@@ -457,6 +470,7 @@ pub fn op_compare(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_compare executed");
     load_insn!(
         Compare {
             start_reg_a,
@@ -495,6 +509,7 @@ pub fn op_jump(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_jump executed");
     load_insn!(
         Jump {
             target_pc_lt,
@@ -527,6 +542,7 @@ pub fn op_move(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_move executed");
     load_insn!(
         Move {
             source_reg,
@@ -554,6 +570,7 @@ pub fn op_if_pos(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_if_pos executed");
     load_insn!(
         IfPos {
             reg,
@@ -590,6 +607,7 @@ pub fn op_not_null(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_not_null executed");
     load_insn!(NotNull { reg, target_pc }, insn);
     if !target_pc.is_offset() {
         crate::bail_corrupt_error!("Unresolved label: {target_pc:?}");
@@ -613,6 +631,7 @@ pub fn op_comparison(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_comparison executed");
     let (lhs, rhs, target_pc, flags, collation, op) = match insn {
         Insn::Eq {
             lhs,
@@ -698,7 +717,7 @@ pub fn op_comparison(
             collation.unwrap_or_default(),
             ComparisonOp::Ge,
         ),
-        _ => unreachable!("unexpected Insn {:?}", insn),
+        _ => turso_assert_unreachable!("vdbe: unexpected instruction in comparison op"),
     };
 
     if !target_pc.is_offset() {
@@ -785,6 +804,7 @@ pub fn op_if(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_if executed");
     load_insn!(
         If {
             reg,
@@ -813,6 +833,7 @@ pub fn op_if_not(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_if_not executed");
     load_insn!(
         IfNot {
             reg,
@@ -841,6 +862,7 @@ pub fn op_open_read(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_open_read executed");
     load_insn!(
         OpenRead {
             cursor_id,
@@ -884,7 +906,7 @@ pub fn op_open_read(
         CursorType::BTreeTable(table_rc) => table_rc.columns.len(),
         CursorType::BTreeIndex(index_arc) => index_arc.columns.len(),
         CursorType::MaterializedView(table_rc, _) => table_rc.columns.len(),
-        _ => unreachable!("This should not have happened"),
+        _ => turso_assert_unreachable!("vdbe: unexpected cursor type in op_open_read"),
     };
 
     let maybe_promote_to_mvcc_cursor = |btree_cursor: Box<dyn CursorTrait>,
@@ -974,7 +996,7 @@ pub fn op_open_read(
             panic!("OpenRead on sorter cursor");
         }
         CursorType::IndexMethod(..) => {
-            unreachable!("IndexMethod handled above")
+            turso_assert_unreachable!("vdbe: IndexMethod should be handled above")
         }
         CursorType::VirtualTable(_) => {
             panic!("OpenRead on virtual table cursor, use Insn:VOpen instead");
@@ -990,6 +1012,7 @@ pub fn op_vopen(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_vopen executed");
     load_insn!(VOpen { cursor_id }, insn);
     let (_, cursor_type) = program
         .cursor_ref
@@ -1014,6 +1037,7 @@ pub fn op_vcreate(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_vcreate executed");
     load_insn!(
         VCreate {
             module_name,
@@ -1053,6 +1077,7 @@ pub fn op_vfilter(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_vfilter executed");
     load_insn!(
         VFilter {
             cursor_id,
@@ -1096,6 +1121,7 @@ pub fn op_vcolumn(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_vcolumn executed");
     load_insn!(
         VColumn {
             cursor_id,
@@ -1120,6 +1146,7 @@ pub fn op_vupdate(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_vupdate executed");
     load_insn!(
         VUpdate {
             cursor_id,
@@ -1186,6 +1213,7 @@ pub fn op_vnext(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_vnext executed");
     load_insn!(
         VNext {
             cursor_id,
@@ -1214,6 +1242,7 @@ pub fn op_vdestroy(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_vdestroy executed");
     load_insn!(VDestroy { db: _, table_name }, insn);
     let conn = program.connection.clone();
     {
@@ -1235,6 +1264,7 @@ pub fn op_vbegin(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_vbegin executed");
     load_insn!(VBegin { cursor_id }, insn);
     let cursor = state.get_cursor(*cursor_id);
     let cursor = cursor.as_virtual_mut();
@@ -1261,6 +1291,7 @@ pub fn op_vrename(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_vrename executed");
     load_insn!(
         VRename {
             cursor_id,
@@ -1291,6 +1322,7 @@ pub fn op_open_pseudo(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_open_pseudo executed");
     load_insn!(
         OpenPseudo {
             cursor_id,
@@ -1317,6 +1349,7 @@ pub fn op_rewind(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_rewind executed");
     load_insn!(
         Rewind {
             cursor_id,
@@ -1355,6 +1388,7 @@ pub fn op_last(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_last executed");
     load_insn!(
         Last {
             cursor_id,
@@ -1399,6 +1433,7 @@ pub fn op_column(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_column executed");
     load_insn!(
         Column {
             cursor_id,
@@ -1605,6 +1640,7 @@ pub fn op_type_check(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_type_check executed");
     load_insn!(
         TypeCheck {
             start_reg,
@@ -1665,6 +1701,7 @@ pub fn op_make_record(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_make_record executed");
     load_insn!(
         MakeRecord {
             start_reg,
@@ -1707,6 +1744,7 @@ pub fn op_mem_max(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_mem_max executed");
     load_insn!(MemMax { dest_reg, src_reg }, insn);
 
     let dest_val = state.registers[*dest_reg].get_value();
@@ -1729,6 +1767,7 @@ pub fn op_result_row(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_result_row executed");
     load_insn!(ResultRow { start_reg, count }, insn);
     let row = Row {
         values: &state.registers[*start_reg] as *const Register,
@@ -1745,6 +1784,7 @@ pub fn op_next(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_next executed");
     load_insn!(
         Next {
             cursor_id,
@@ -1798,6 +1838,7 @@ pub fn op_prev(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_prev executed");
     load_insn!(
         Prev {
             cursor_id,
@@ -2028,6 +2069,7 @@ pub fn op_halt(
     insn: &Insn,
     pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_halt executed");
     load_insn!(
         Halt {
             err_code,
@@ -2044,6 +2086,7 @@ pub fn op_halt_if_null(
     insn: &Insn,
     pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_halt_if_null executed");
     load_insn!(
         HaltIfNull {
             target_reg,
@@ -2073,6 +2116,7 @@ pub fn op_transaction(
     insn: &Insn,
     pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_transaction executed");
     match op_transaction_inner(program, state, insn, pager) {
         Ok(result) => Ok(result),
         Err(err) => {
@@ -2088,6 +2132,7 @@ pub fn op_transaction_inner(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_transaction_inner executed");
     load_insn!(
         Transaction {
             db,
@@ -2300,6 +2345,7 @@ pub fn op_auto_commit(
     insn: &Insn,
     pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_auto_commit executed");
     load_insn!(
         AutoCommit {
             auto_commit,
@@ -2440,6 +2486,7 @@ pub fn op_goto(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_goto executed");
     load_insn!(Goto { target_pc }, insn);
     if !target_pc.is_offset() {
         crate::bail_corrupt_error!("Unresolved label: {target_pc:?}");
@@ -2454,6 +2501,7 @@ pub fn op_gosub(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_gosub executed");
     load_insn!(
         Gosub {
             target_pc,
@@ -2475,6 +2523,7 @@ pub fn op_return(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_return executed");
     load_insn!(
         Return {
             return_reg,
@@ -2504,6 +2553,7 @@ pub fn op_integer(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_integer executed");
     load_insn!(Integer { value, dest }, insn);
     state.registers[*dest] = Register::Value(Value::Integer(*value));
     state.pc += 1;
@@ -2526,6 +2576,7 @@ pub fn op_program(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_program executed");
     load_insn!(
         Program {
             params,
@@ -2623,6 +2674,7 @@ pub fn op_real(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_real executed");
     load_insn!(Real { value, dest }, insn);
     state.registers[*dest] = Register::Value(Value::Float(*value));
     state.pc += 1;
@@ -2635,6 +2687,7 @@ pub fn op_real_affinity(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_real_affinity executed");
     load_insn!(RealAffinity { register }, insn);
     if let Value::Integer(i) = &state.registers[*register].get_value() {
         state.registers[*register] = Register::Value(Value::Float(*i as f64));
@@ -2649,6 +2702,7 @@ pub fn op_string8(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_string8 executed");
     load_insn!(String8 { value, dest }, insn);
     state.registers[*dest] = Register::Value(Value::build_text(value.clone()));
     state.pc += 1;
@@ -2661,6 +2715,7 @@ pub fn op_blob(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_blob executed");
     load_insn!(Blob { value, dest }, insn);
     state.registers[*dest] = Register::Value(Value::Blob(value.clone()));
     state.pc += 1;
@@ -2673,6 +2728,7 @@ pub fn op_row_data(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_row_data executed");
     load_insn!(RowData { cursor_id, dest }, insn);
 
     let record = {
@@ -2714,6 +2770,7 @@ pub fn op_row_id(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_row_id executed");
     load_insn!(RowId { cursor_id, dest }, insn);
     loop {
         match state.op_row_id_state {
@@ -2745,7 +2802,7 @@ pub fn op_row_id(
                                 .expect("record should have a last value");
                             match rowid {
                                 Ok(ValueRef::Integer(rowid)) => rowid,
-                                _ => unreachable!(),
+                                _ => turso_assert_unreachable!("vdbe: expected integer rowid"),
                             }
                         }
                         Cursor::IndexMethod(index_cursor) => {
@@ -2834,6 +2891,7 @@ pub fn op_idx_row_id(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_idx_row_id executed");
     load_insn!(IdxRowId { cursor_id, dest }, insn);
     let cursors = &mut state.cursors;
     let cursor = cursors
@@ -2861,6 +2919,7 @@ pub fn op_seek_rowid(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_seek_rowid executed");
     load_insn!(
         SeekRowid {
             cursor_id,
@@ -2950,6 +3009,7 @@ pub fn op_deferred_seek(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_deferred_seek executed");
     load_insn!(
         DeferredSeek {
             index_cursor_id,
@@ -2992,6 +3052,7 @@ pub fn op_seek(
     insn: &Insn,
     pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_seek executed");
     let (cursor_id, is_index, record_source, target_pc) = match insn {
         Insn::SeekGE {
             cursor_id,
@@ -3033,7 +3094,7 @@ pub fn op_seek(
             },
             target_pc,
         ),
-        _ => unreachable!("unexpected Insn {:?}", insn),
+        _ => turso_assert_unreachable!("vdbe: unexpected instruction in op_seek"),
     };
     assert!(
         target_pc.is_offset(),
@@ -3044,7 +3105,7 @@ pub fn op_seek(
         Insn::SeekGT { .. } => SeekOp::GT,
         Insn::SeekLE { eq_only, .. } => SeekOp::LE { eq_only: *eq_only },
         Insn::SeekLT { .. } => SeekOp::LT,
-        _ => unreachable!("unexpected Insn {:?}", insn),
+        _ => turso_assert_unreachable!("vdbe: unexpected instruction for SeekOp"),
     };
     match seek_internal(
         program,
@@ -3141,7 +3202,7 @@ pub fn seek_internal(
                         num_regs,
                     } = record_source
                     else {
-                        unreachable!("op_seek: record_source should be Unpacked for table-btree");
+                        turso_assert_unreachable!("vdbe: op_seek record_source should be Unpacked for table-btree")
                     };
                     assert_eq!(num_regs, 1, "op_seek: num_regs should be 1 for table-btree");
                     let original_value = state.registers[start_reg].get_value();
@@ -3233,7 +3294,7 @@ pub fn seek_internal(
                         OpSeekKey::IndexKeyOwned(record) => SeekKey::IndexKey(record),
                         OpSeekKey::IndexKeyFromRegister(record_reg) => match &state.registers[*record_reg] {
                             Register::Record(ref record) => SeekKey::IndexKey(record),
-                            _ => unreachable!("op_seek: record_reg should be a Record register when OpSeekKey::IndexKeyFromRegister is used"),
+                            _ => turso_assert_unreachable!("vdbe: op_seek record_reg should be a Record register"),
                         }
                     };
                         match cursor.seek(seek_key, *op)? {
@@ -3379,6 +3440,7 @@ pub fn op_idx_ge(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_idx_ge executed");
     load_insn!(
         IdxGE {
             cursor_id,
@@ -3432,6 +3494,7 @@ pub fn op_seek_end(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_seek_end executed");
     load_insn!(SeekEnd { cursor_id }, *insn);
     {
         let cursor = state.get_cursor(cursor_id);
@@ -3449,6 +3512,7 @@ pub fn op_idx_le(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_idx_le executed");
     load_insn!(
         IdxLE {
             cursor_id,
@@ -3496,6 +3560,7 @@ pub fn op_idx_gt(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_idx_gt executed");
     load_insn!(
         IdxGT {
             cursor_id,
@@ -3543,6 +3608,7 @@ pub fn op_idx_lt(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_idx_lt executed");
     load_insn!(
         IdxLT {
             cursor_id,
@@ -3590,6 +3656,7 @@ pub fn op_decr_jump_zero(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_decr_jump_zero executed");
     load_insn!(DecrJumpZero { reg, target_pc }, insn);
     if !target_pc.is_offset() {
         crate::bail_corrupt_error!("Unresolved label: {target_pc:?}");
@@ -3604,7 +3671,7 @@ pub fn op_decr_jump_zero(
                 state.pc += 1;
             }
         }
-        _ => unreachable!("DecrJumpZero on non-integer register"),
+        _ => turso_assert_unreachable!("vdbe: DecrJumpZero on non-integer register"),
     }
     Ok(InsnFunctionStepResult::Step)
 }
@@ -3642,6 +3709,7 @@ pub fn op_agg_step(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_agg_step executed");
     load_insn!(
         AggStep {
             acc_reg,
@@ -3693,7 +3761,7 @@ pub fn op_agg_step(
                     step_fn: *step,
                     finalize_fn: *finalize,
                 })),
-                _ => unreachable!("scalar function called in aggregate context"),
+                _ => turso_assert_unreachable!("vdbe: scalar function called in aggregate context"),
             },
         };
     }
@@ -3710,7 +3778,7 @@ pub fn op_agg_step(
                     );
                 };
                 let AggContext::Avg(acc, count) = agg.borrow_mut() else {
-                    unreachable!();
+                    turso_assert_unreachable!("vdbe: expected Avg aggregate context")
                 };
                 *acc = acc.exec_add(col.get_value());
                 *count += 1;
@@ -3725,7 +3793,7 @@ pub fn op_agg_step(
                 );
             };
             let AggContext::Sum(acc, sum_state) = agg.borrow_mut() else {
-                unreachable!();
+                turso_assert_unreachable!("vdbe: expected Sum aggregate context")
             };
             match col {
                 Register::Value(value) => {
@@ -3759,7 +3827,7 @@ pub fn op_agg_step(
                             Value::Float(_) => {
                                 apply_kbn_step_int(acc, i, sum_state);
                             }
-                            _ => unreachable!(),
+                            _ => turso_assert_unreachable!("vdbe: unexpected accumulator type for integer sum"),
                         },
 
                         Value::Float(f) => match acc {
@@ -3777,7 +3845,7 @@ pub fn op_agg_step(
                                 sum_state.approx = true;
                                 apply_kbn_step(acc, f, sum_state);
                             }
-                            _ => unreachable!(),
+                            _ => turso_assert_unreachable!("vdbe: unexpected accumulator type for float sum"),
                         },
                         Value::Text(t) => {
                             let s = t.as_str();
@@ -3794,7 +3862,7 @@ pub fn op_agg_step(
                         }
                     }
                 }
-                _ => unreachable!(),
+                _ => turso_assert_unreachable!("vdbe: expected Value register in sum aggregate"),
             }
         }
         AggFunc::Count | AggFunc::Count0 => {
@@ -3811,7 +3879,7 @@ pub fn op_agg_step(
                 );
             };
             let AggContext::Count(count) = agg else {
-                unreachable!();
+                turso_assert_unreachable!("vdbe: expected Count aggregate context")
             };
             if !skip {
                 *count += 1;
@@ -3826,7 +3894,7 @@ pub fn op_agg_step(
                 );
             };
             let AggContext::Max(acc) = agg.borrow_mut() else {
-                unreachable!();
+                turso_assert_unreachable!("vdbe: expected Max aggregate context")
             };
 
             let new_value = col.get_value();
@@ -3849,7 +3917,7 @@ pub fn op_agg_step(
                 );
             };
             let AggContext::Min(acc) = agg.borrow_mut() else {
-                unreachable!();
+                turso_assert_unreachable!("vdbe: expected Min aggregate context")
             };
 
             let new_value = col.get_value();
@@ -3868,10 +3936,10 @@ pub fn op_agg_step(
             let col = state.registers[*col].get_value().clone();
             let delimiter = state.registers[*delimiter].clone();
             let Register::Aggregate(agg) = state.registers[*acc_reg].borrow_mut() else {
-                unreachable!();
+                turso_assert_unreachable!("vdbe: expected Aggregate register for GroupConcat")
             };
             let AggContext::GroupConcat(acc) = agg.borrow_mut() else {
-                unreachable!();
+                turso_assert_unreachable!("vdbe: expected GroupConcat aggregate context")
             };
             if acc.to_string().is_empty() {
                 *acc = col;
@@ -3883,7 +3951,7 @@ pub fn op_agg_step(
                             Register::Value(value) => {
                                 *acc += value;
                             }
-                            _ => unreachable!(),
+                            _ => turso_assert_unreachable!("vdbe: expected Value register for delimiter"),
                         }
                         *acc += col;
                     }
@@ -3895,10 +3963,10 @@ pub fn op_agg_step(
             let key = state.registers[*col].clone();
             let value = state.registers[*delimiter].clone();
             let Register::Aggregate(agg) = state.registers[*acc_reg].borrow_mut() else {
-                unreachable!();
+                turso_assert_unreachable!("vdbe: expected Aggregate register for JsonGroupObject")
             };
             let AggContext::GroupConcat(acc) = agg.borrow_mut() else {
-                unreachable!();
+                turso_assert_unreachable!("vdbe: expected GroupConcat aggregate context for JsonGroupObject")
             };
 
             let mut key_vec = convert_dbtype_to_raw_jsonb(key.get_value())?;
@@ -3916,17 +3984,17 @@ pub fn op_agg_step(
                         vec.append(&mut val_vec);
                     }
                 }
-                _ => unreachable!(),
+                _ => turso_assert_unreachable!("vdbe: expected Blob value for JsonGroupObject"),
             };
         }
         #[cfg(feature = "json")]
         AggFunc::JsonGroupArray | AggFunc::JsonbGroupArray => {
             let col = state.registers[*col].clone();
             let Register::Aggregate(agg) = state.registers[*acc_reg].borrow_mut() else {
-                unreachable!();
+                turso_assert_unreachable!("vdbe: expected Aggregate register for JsonGroupArray")
             };
             let AggContext::GroupConcat(acc) = agg.borrow_mut() else {
-                unreachable!();
+                turso_assert_unreachable!("vdbe: expected GroupConcat aggregate context for JsonGroupArray")
             };
 
             let mut data = convert_dbtype_to_raw_jsonb(col.get_value())?;
@@ -3939,16 +4007,16 @@ pub fn op_agg_step(
                         vec.append(&mut data);
                     }
                 }
-                _ => unreachable!(),
+                _ => turso_assert_unreachable!("vdbe: expected Blob value for JsonGroupArray"),
             };
         }
         AggFunc::External(_) => {
             let (step_fn, state_ptr, argc) = {
                 let Register::Aggregate(agg) = &state.registers[*acc_reg] else {
-                    unreachable!();
+                    turso_assert_unreachable!("vdbe: expected Aggregate register for External")
                 };
                 let AggContext::External(agg_state) = agg else {
-                    unreachable!();
+                    turso_assert_unreachable!("vdbe: expected External aggregate context")
                 };
                 (agg_state.step_fn, agg_state.state, agg_state.argc)
             };
@@ -3978,6 +4046,7 @@ pub fn op_agg_final(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_agg_final executed");
     let (acc_reg, dest_reg, func) = match insn {
         Insn::AggFinal { register, func } => (*register, *register, func),
         Insn::AggValue {
@@ -3985,13 +4054,13 @@ pub fn op_agg_final(
             dest_reg,
             func,
         } => (*acc_reg, *dest_reg, func),
-        _ => unreachable!("unexpected Insn {:?}", insn),
+        _ => turso_assert_unreachable!("vdbe: unexpected instruction in agg_final"),
     };
     match &state.registers[acc_reg] {
         Register::Aggregate(agg) => match func {
             AggFunc::Avg => {
                 let AggContext::Avg(acc, count) = agg else {
-                    unreachable!();
+                    turso_assert_unreachable!("vdbe: expected Avg aggregate context in agg_final")
                 };
                 let acc = if count.as_int() == Some(0) {
                     Value::Null
@@ -4002,7 +4071,7 @@ pub fn op_agg_final(
             }
             AggFunc::Sum => {
                 let AggContext::Sum(acc, sum_state) = agg else {
-                    unreachable!();
+                    turso_assert_unreachable!("vdbe: expected Sum aggregate context in agg_final")
                 };
                 let value = match acc {
                     Value::Null => match sum_state.approx {
@@ -4018,25 +4087,25 @@ pub fn op_agg_final(
             }
             AggFunc::Total => {
                 let AggContext::Sum(acc, _) = agg else {
-                    unreachable!();
+                    turso_assert_unreachable!("vdbe: expected Sum aggregate context in agg_final for Total")
                 };
                 let value = match acc {
                     Value::Null => Value::Float(0.0),
                     Value::Integer(i) => Value::Float(*i as f64),
                     Value::Float(f) => Value::Float(*f),
-                    _ => unreachable!(),
+                    _ => turso_assert_unreachable!("vdbe: unexpected value type in Total aggregate"),
                 };
                 state.registers[dest_reg] = Register::Value(value);
             }
             AggFunc::Count | AggFunc::Count0 => {
                 let AggContext::Count(count) = agg else {
-                    unreachable!();
+                    turso_assert_unreachable!("vdbe: expected Count aggregate context in agg_final")
                 };
                 state.registers[dest_reg] = Register::Value(count.clone());
             }
             AggFunc::Max => {
                 let AggContext::Max(acc) = agg else {
-                    unreachable!();
+                    turso_assert_unreachable!("vdbe: expected Max aggregate context in agg_final")
                 };
                 match acc {
                     Some(value) => state.registers[dest_reg] = Register::Value(value.clone()),
@@ -4045,7 +4114,7 @@ pub fn op_agg_final(
             }
             AggFunc::Min => {
                 let AggContext::Min(acc) = agg else {
-                    unreachable!();
+                    turso_assert_unreachable!("vdbe: expected Min aggregate context in agg_final")
                 };
                 match acc {
                     Some(value) => state.registers[dest_reg] = Register::Value(value.clone()),
@@ -4054,14 +4123,14 @@ pub fn op_agg_final(
             }
             AggFunc::GroupConcat | AggFunc::StringAgg => {
                 let AggContext::GroupConcat(acc) = agg else {
-                    unreachable!();
+                    turso_assert_unreachable!("vdbe: expected GroupConcat aggregate context in agg_final")
                 };
                 state.registers[dest_reg] = Register::Value(acc.clone());
             }
             #[cfg(feature = "json")]
             AggFunc::JsonGroupObject => {
                 let AggContext::GroupConcat(acc) = agg else {
-                    unreachable!();
+                    turso_assert_unreachable!("vdbe: expected GroupConcat aggregate context for JsonGroupObject in agg_final")
                 };
                 let data = acc.to_blob().expect("Should be blob");
                 state.registers[dest_reg] = Register::Value(json_from_raw_bytes_agg(data, false)?);
@@ -4069,7 +4138,7 @@ pub fn op_agg_final(
             #[cfg(feature = "json")]
             AggFunc::JsonbGroupObject => {
                 let AggContext::GroupConcat(acc) = agg else {
-                    unreachable!();
+                    turso_assert_unreachable!("vdbe: expected GroupConcat aggregate context for JsonbGroupObject in agg_final")
                 };
                 let data = acc.to_blob().expect("Should be blob");
                 state.registers[dest_reg] = Register::Value(json_from_raw_bytes_agg(data, true)?);
@@ -4077,7 +4146,7 @@ pub fn op_agg_final(
             #[cfg(feature = "json")]
             AggFunc::JsonGroupArray => {
                 let AggContext::GroupConcat(acc) = agg else {
-                    unreachable!();
+                    turso_assert_unreachable!("vdbe: expected GroupConcat aggregate context for JsonGroupArray in agg_final")
                 };
                 let data = acc.to_blob().expect("Should be blob");
                 state.registers[dest_reg] = Register::Value(json_from_raw_bytes_agg(data, false)?);
@@ -4085,14 +4154,14 @@ pub fn op_agg_final(
             #[cfg(feature = "json")]
             AggFunc::JsonbGroupArray => {
                 let AggContext::GroupConcat(acc) = agg else {
-                    unreachable!();
+                    turso_assert_unreachable!("vdbe: expected GroupConcat aggregate context for JsonbGroupArray in agg_final")
                 };
                 let data = acc.to_blob().expect("Should be blob");
                 state.registers[dest_reg] = Register::Value(json_from_raw_bytes_agg(data, true)?);
             }
             AggFunc::External(_) => {
                 let AggContext::External(_) = agg else {
-                    unreachable!();
+                    turso_assert_unreachable!("vdbe: expected External aggregate context in agg_final")
                 };
                 let value = agg.compute_external()?;
                 state.registers[dest_reg] = Register::Value(value)
@@ -4124,6 +4193,7 @@ pub fn op_sorter_open(
     insn: &Insn,
     pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_sorter_open executed");
     load_insn!(
         SorterOpen {
             cursor_id,
@@ -4174,6 +4244,7 @@ pub fn op_sorter_data(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_sorter_data executed");
     load_insn!(
         SorterData {
             cursor_id,
@@ -4209,6 +4280,7 @@ pub fn op_sorter_insert(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_sorter_insert executed");
     load_insn!(
         SorterInsert {
             cursor_id,
@@ -4221,7 +4293,7 @@ pub fn op_sorter_insert(
         let cursor = cursor.as_sorter_mut();
         let record = match &state.registers[*record_reg] {
             Register::Record(record) => record,
-            _ => unreachable!("SorterInsert on non-record register"),
+            _ => turso_assert_unreachable!("vdbe: SorterInsert on non-record register"),
         };
         return_if_io!(cursor.insert(record));
     }
@@ -4235,6 +4307,7 @@ pub fn op_sorter_sort(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_sorter_sort executed");
     load_insn!(
         SorterSort {
             cursor_id,
@@ -4269,6 +4342,7 @@ pub fn op_sorter_next(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_sorter_next executed");
     load_insn!(
         SorterNext {
             cursor_id,
@@ -4297,6 +4371,7 @@ pub fn op_sorter_compare(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_sorter_compare executed");
     load_insn!(
         SorterCompare {
             cursor_id,
@@ -4359,6 +4434,7 @@ pub fn op_rowset_add(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_rowset_add executed");
     load_insn!(
         RowSetAdd {
             rowset_reg,
@@ -4393,6 +4469,7 @@ pub fn op_rowset_read(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_rowset_read executed");
     load_insn!(
         RowSetRead {
             rowset_reg,
@@ -4444,6 +4521,7 @@ pub fn op_rowset_test(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_rowset_test executed");
     load_insn!(
         RowSetTest {
             rowset_reg,
@@ -4494,6 +4572,7 @@ pub fn op_function(
     insn: &Insn,
     pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_function executed");
     load_insn!(
         Function {
             constant_mask,
@@ -4538,7 +4617,7 @@ pub fn op_function(
                     JsonFunc::JsonObject => json_object,
                     JsonFunc::JsonbArray => jsonb_array,
                     JsonFunc::JsonbObject => jsonb_object,
-                    _ => unreachable!(),
+                    _ => turso_assert_unreachable!("vdbe: unexpected json function type"),
                 };
                 let json_result = json_func(reg_values);
 
@@ -4591,7 +4670,7 @@ pub fn op_function(
                 let json_func = match json_func {
                     JsonFunc::JsonArrowExtract => json_arrow_extract,
                     JsonFunc::JsonArrowShiftExtract => json_arrow_shift_extract,
-                    _ => unreachable!(),
+                    _ => turso_assert_unreachable!("vdbe: unexpected json arrow extract function type"),
                 };
                 let json_str = json_func(json.get_value(), path.get_value(), &state.json_cache);
                 match json_str {
@@ -4615,7 +4694,7 @@ pub fn op_function(
                     JsonFunc::JsonType => {
                         json_type(json_value.get_value(), path_value.map(|x| x.get_value()))
                     }
-                    _ => unreachable!(),
+                    _ => turso_assert_unreachable!("vdbe: unexpected json length/type function"),
                 };
 
                 match func_result {
@@ -4788,7 +4867,7 @@ pub fn op_function(
                 let Value::Text(reg_value_type) =
                     state.registers[*start_reg + 1].get_value().clone()
                 else {
-                    unreachable!("Cast with non-text type");
+                    turso_assert_unreachable!("vdbe: Cast with non-text type")
                 };
                 let result = reg_value_argument
                     .get_value()
@@ -4895,7 +4974,7 @@ pub fn op_function(
                     }
                     (Value::Null, _) | (_, Value::Null) => Value::Null,
                     _ => {
-                        unreachable!("Like failed");
+                        turso_assert_unreachable!("vdbe: Like failed")
                     }
                 };
 
@@ -4929,7 +5008,7 @@ pub fn op_function(
                     }
                     ScalarFunc::ZeroBlob => Some(reg_value.exec_zeroblob()?),
                     ScalarFunc::Soundex => Some(reg_value.exec_soundex()),
-                    _ => unreachable!(),
+                    _ => turso_assert_unreachable!("vdbe: unexpected scalar function type"),
                 };
                 state.registers[*dest] = Register::Value(result.unwrap_or(Value::Null));
             }
@@ -5451,7 +5530,7 @@ pub fn op_function(
                     }
                 }
             }
-            _ => unreachable!("aggregate called in scalar context"),
+            _ => turso_assert_unreachable!("vdbe: aggregate called in scalar context"),
         },
         crate::function::Func::Math(math_func) => match math_func.arity() {
             MathFuncArity::Nullary => match math_func {
@@ -5459,7 +5538,7 @@ pub fn op_function(
                     state.registers[*dest] = Register::Value(Value::Float(std::f64::consts::PI));
                 }
                 _ => {
-                    unreachable!("Unexpected mathematical Nullary function {:?}", math_func);
+                    turso_assert_unreachable!("vdbe: unexpected mathematical nullary function")
                 }
             },
 
@@ -5488,17 +5567,11 @@ pub fn op_function(
                             let arg = &state.registers[*start_reg + 1];
                             arg.get_value().exec_math_log(Some(base.get_value()))
                         }
-                        _ => unreachable!(
-                            "{:?} function with unexpected number of arguments",
-                            math_func
-                        ),
+                        _ => turso_assert_unreachable!("vdbe: log function with unexpected number of arguments"),
                     };
                     state.registers[*dest] = Register::Value(result);
                 }
-                _ => unreachable!(
-                    "Unexpected mathematical UnaryOrBinary function {:?}",
-                    math_func
-                ),
+                _ => turso_assert_unreachable!("vdbe: unexpected mathematical unary_or_binary function"),
             },
         },
         crate::function::Func::AlterTable(alter_func) => {
@@ -5819,7 +5892,7 @@ pub fn op_function(
                                         AlterTableFunc::RenameColumn => {
                                             column.col_name = column_def.col_name.clone()
                                         }
-                                        _ => unreachable!(),
+                                        _ => turso_assert_unreachable!("vdbe: unexpected AlterTableFunc type"),
                                     }
 
                                     // Update table-level constraints (PRIMARY KEY, UNIQUE, FOREIGN KEY)
@@ -6079,7 +6152,7 @@ pub fn op_function(
             }
         }
         crate::function::Func::Agg(_) => {
-            unreachable!("Aggregate functions should not be handled here")
+            turso_assert_unreachable!("vdbe: aggregate functions should not be handled here")
         }
     }
     state.pc += 1;
@@ -6092,6 +6165,7 @@ pub fn op_sequence(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_sequence executed");
     load_insn!(
         Sequence {
             cursor_id,
@@ -6116,6 +6190,7 @@ pub fn op_sequence_test(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_sequence_test executed");
     load_insn!(
         SequenceTest {
             cursor_id,
@@ -6144,6 +6219,7 @@ pub fn op_init_coroutine(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_init_coroutine executed");
     load_insn!(
         InitCoroutine {
             yield_reg,
@@ -6171,6 +6247,7 @@ pub fn op_end_coroutine(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_end_coroutine executed");
     load_insn!(EndCoroutine { yield_reg }, insn);
 
     if let Value::Integer(pc) = state.registers[*yield_reg].get_value() {
@@ -6180,7 +6257,7 @@ pub fn op_end_coroutine(
             .unwrap_or_else(|_| panic!("EndCoroutine: pc overflow: {pc}"));
         state.pc = pc - 1; // yield jump is always next to yield. Here we subtract 1 to go back to yield instruction
     } else {
-        unreachable!();
+        turso_assert_unreachable!("vdbe: EndCoroutine yield_reg contains non-integer value")
     }
     Ok(InsnFunctionStepResult::Step)
 }
@@ -6191,6 +6268,7 @@ pub fn op_yield(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_yield executed");
     load_insn!(
         Yield {
             yield_reg,
@@ -6211,10 +6289,7 @@ pub fn op_yield(
                 (pc, Register::Value(Value::Integer((state.pc + 1) as i64)));
         }
     } else {
-        unreachable!(
-            "yield_reg {} contains non-integer value: {:?}",
-            *yield_reg, state.registers[*yield_reg]
-        );
+        turso_assert_unreachable!("vdbe: Yield yield_reg contains non-integer value")
     }
     Ok(InsnFunctionStepResult::Step)
 }
@@ -6249,6 +6324,7 @@ pub fn op_insert(
     insn: &Insn,
     pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_insert executed");
     load_insn!(
         Insert {
             cursor: cursor_id,
@@ -6357,7 +6433,7 @@ pub fn op_insert(
             OpInsertSubState::Insert => {
                 let key = match &state.registers[*key_reg].get_value() {
                     Value::Integer(i) => *i,
-                    _ => unreachable!("expected integer key"),
+                    _ => turso_assert_unreachable!("vdbe: expected integer key in Insert"),
                 };
                 let record = match &state.registers[*record_reg] {
                     Register::Record(r) => std::borrow::Cow::Borrowed(r),
@@ -6366,7 +6442,7 @@ pub fn op_insert(
                         let record = ImmutableRecord::from_values(values, values.len());
                         std::borrow::Cow::Owned(record)
                     }
-                    Register::Aggregate(..) => unreachable!("Cannot insert an aggregate value."),
+                    Register::Aggregate(..) => turso_assert_unreachable!("vdbe: cannot insert an aggregate value"),
                 };
 
                 {
@@ -6427,7 +6503,7 @@ pub fn op_insert(
                 let (key, values) = {
                     let key = match &state.registers[*key_reg].get_value() {
                         Value::Integer(i) => *i,
-                        _ => unreachable!("expected integer key"),
+                        _ => turso_assert_unreachable!("vdbe: expected integer key in insert"),
                     };
 
                     let record = match &state.registers[*record_reg] {
@@ -6438,7 +6514,7 @@ pub fn op_insert(
                             std::borrow::Cow::Owned(record)
                         }
                         Register::Aggregate(..) => {
-                            unreachable!("Cannot insert an aggregate value.")
+                            turso_assert_unreachable!("vdbe: cannot insert an aggregate value in ApplyViewChange")
                         }
                     };
 
@@ -6492,6 +6568,7 @@ pub fn op_int_64(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_int_64 executed");
     load_insn!(
         Int64 {
             _p1,
@@ -6526,6 +6603,7 @@ pub fn op_delete(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_delete executed");
     load_insn!(
         Delete {
             cursor_id,
@@ -6634,6 +6712,7 @@ pub fn op_idx_delete(
     insn: &Insn,
     pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_idx_delete executed");
     load_insn!(
         IdxDelete {
             cursor_id,
@@ -6749,6 +6828,7 @@ pub fn op_idx_insert(
     insn: &Insn,
     pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_idx_insert executed");
     load_insn!(
         IdxInsert {
             cursor_id,
@@ -6916,6 +6996,7 @@ pub fn op_new_rowid(
     insn: &Insn,
     pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_new_rowid executed");
     new_rowid_inner(program, state, insn, pager).inspect_err(|_| {
         // In case of error we need to unlock rowid lock from mvcc cursor
         load_insn!(
@@ -7158,6 +7239,7 @@ pub fn op_must_be_int(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_must_be_int executed");
     load_insn!(MustBeInt { reg }, insn);
     match &state.registers[*reg].get_value() {
         Value::Integer(_) => {}
@@ -7187,6 +7269,7 @@ pub fn op_soft_null(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_soft_null executed");
     load_insn!(SoftNull { reg }, insn);
     state.registers[*reg] = Register::Value(Value::Null);
     state.pc += 1;
@@ -7207,6 +7290,7 @@ pub fn op_no_conflict(
     insn: &Insn,
     pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_no_conflict executed");
     load_insn!(
         NoConflict {
             cursor_id,
@@ -7293,6 +7377,7 @@ pub fn op_not_exists(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_not_exists executed");
     load_insn!(
         NotExists {
             cursor,
@@ -7319,6 +7404,7 @@ pub fn op_offset_limit(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_offset_limit executed");
     load_insn!(
         OffsetLimit {
             limit_reg,
@@ -7363,6 +7449,7 @@ pub fn op_open_write(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_open_write executed");
     load_insn!(
         OpenWrite {
             cursor_id,
@@ -7479,9 +7566,7 @@ pub fn op_open_write(
             let num_columns = match cursor_type {
                 CursorType::BTreeTable(table_rc) => table_rc.columns.len(),
                 CursorType::MaterializedView(table_rc, _) => table_rc.columns.len(),
-                _ => unreachable!(
-                    "Expected BTreeTable or MaterializedView. This should not have happened."
-                ),
+                _ => turso_assert_unreachable!("vdbe: expected BTreeTable or MaterializedView cursor type"),
             };
 
             let btree_cursor = Box::new(BTreeCursor::new_table(
@@ -7506,6 +7591,7 @@ pub fn op_copy(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_copy executed");
     load_insn!(
         Copy {
             src_reg,
@@ -7527,6 +7613,7 @@ pub fn op_create_btree(
     insn: &Insn,
     pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_create_btree executed");
     load_insn!(CreateBtree { db, root, flags }, insn);
 
     assert_eq!(*db, 0);
@@ -7559,6 +7646,7 @@ pub fn op_index_method_create(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_index_method_create executed");
     load_insn!(IndexMethodCreate { db, cursor_id }, insn);
     assert_eq!(*db, 0);
     if program.connection.is_readonly(*db) {
@@ -7591,6 +7679,7 @@ pub fn op_index_method_destroy(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_index_method_destroy executed");
     load_insn!(IndexMethodDestroy { db, cursor_id }, insn);
     assert_eq!(*db, 0);
     if program.connection.is_readonly(*db) {
@@ -7623,6 +7712,7 @@ pub fn op_index_method_optimize(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_index_method_optimize executed");
     load_insn!(IndexMethodOptimize { db, cursor_id }, insn);
     assert_eq!(*db, 0);
     if program.connection.is_readonly(*db) {
@@ -7655,6 +7745,7 @@ pub fn op_index_method_query(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_index_method_query executed");
     load_insn!(
         IndexMethodQuery {
             db,
@@ -7695,6 +7786,7 @@ pub fn op_destroy(
     insn: &Insn,
     pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_destroy executed");
     load_insn!(
         Destroy {
             root,
@@ -7740,6 +7832,7 @@ pub fn op_reset_sorter(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_reset_sorter executed");
     load_insn!(ResetSorter { cursor_id }, insn);
 
     let (_, cursor_type) = program
@@ -7769,6 +7862,7 @@ pub fn op_drop_table(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_drop_table executed");
     load_insn!(DropTable { db, table_name, .. }, insn);
     if *db > 0 {
         todo!("temp databases not implemented yet");
@@ -7791,6 +7885,7 @@ pub fn op_drop_view(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_drop_view executed");
     load_insn!(DropView { db, view_name }, insn);
     if *db > 0 {
         todo!("temp databases not implemented yet");
@@ -7810,6 +7905,7 @@ pub fn op_drop_trigger(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_drop_trigger executed");
     load_insn!(
         DropTrigger {
             db: _,
@@ -7833,6 +7929,7 @@ pub fn op_close(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_close executed");
     load_insn!(Close { cursor_id }, insn);
     let cursors = &mut state.cursors;
     cursors
@@ -7852,6 +7949,7 @@ pub fn op_is_null(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_is_null executed");
     load_insn!(IsNull { reg, target_pc }, insn);
     if matches!(state.registers[*reg], Register::Value(Value::Null)) {
         state.pc = target_pc.as_offset_int();
@@ -7867,8 +7965,9 @@ pub fn op_coll_seq(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_coll_seq executed");
     let Insn::CollSeq { reg, collation } = insn else {
-        unreachable!("unexpected Insn {:?}", insn)
+        turso_assert_unreachable!("vdbe: unexpected instruction in op_coll_seq")
     };
 
     // Set the current collation sequence for use by subsequent functions
@@ -7889,6 +7988,7 @@ pub fn op_page_count(
     insn: &Insn,
     pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_page_count executed");
     load_insn!(PageCount { db, dest }, insn);
     if *db > 0 {
         // TODO: implement temp databases
@@ -7913,6 +8013,7 @@ pub fn op_parse_schema(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_parse_schema executed");
     load_insn!(
         ParseSchema {
             db: _,
@@ -7976,6 +8077,7 @@ pub fn op_populate_materialized_views(
     insn: &Insn,
     pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_populate_materialized_views executed");
     load_insn!(PopulateMaterializedViews { cursors }, insn);
 
     let conn = program.connection.clone();
@@ -8052,6 +8154,7 @@ pub fn op_read_cookie(
     insn: &Insn,
     pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_read_cookie executed");
     load_insn!(ReadCookie { db, dest, cookie }, insn);
     if *db > 0 {
         // TODO: implement temp databases
@@ -8082,6 +8185,7 @@ pub fn op_set_cookie(
     insn: &Insn,
     pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_set_cookie executed");
     load_insn!(
         SetCookie {
             db,
@@ -8116,9 +8220,9 @@ pub fn op_set_cookie(
                     TransactionState::Write { .. } => {
                         program.connection.set_tx_state(TransactionState::Write { schema_did_change: true });
                     },
-                    TransactionState::Read => unreachable!("invalid transaction state for SetCookie: TransactionState::Read, should be write"),
-                    TransactionState::None => unreachable!("invalid transaction state for SetCookie: TransactionState::None, should be write"),
-                    TransactionState::PendingUpgrade => unreachable!("invalid transaction state for SetCookie: TransactionState::PendingUpgrade, should be write"),
+                    TransactionState::Read => turso_assert_unreachable!("vdbe: invalid transaction state for SetCookie: Read"),
+                    TransactionState::None => turso_assert_unreachable!("vdbe: invalid transaction state for SetCookie: None"),
+                    TransactionState::PendingUpgrade => turso_assert_unreachable!("vdbe: invalid transaction state for SetCookie: PendingUpgrade"),
                 }
                     program
                         .connection
@@ -8140,6 +8244,7 @@ pub fn op_shift_right(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_shift_right executed");
     load_insn!(ShiftRight { lhs, rhs, dest }, insn);
     state.registers[*dest] = Register::Value(
         state.registers[*lhs]
@@ -8156,6 +8261,7 @@ pub fn op_shift_left(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_shift_left executed");
     load_insn!(ShiftLeft { lhs, rhs, dest }, insn);
     state.registers[*dest] = Register::Value(
         state.registers[*lhs]
@@ -8172,6 +8278,7 @@ pub fn op_add_imm(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_add_imm executed");
     load_insn!(AddImm { register, value }, insn);
 
     let current = &state.registers[*register];
@@ -8200,6 +8307,7 @@ pub fn op_variable(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_variable executed");
     load_insn!(Variable { index, dest }, insn);
     state.registers[*dest] = Register::Value(state.get_parameter(*index));
     state.pc += 1;
@@ -8212,6 +8320,7 @@ pub fn op_zero_or_null(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_zero_or_null executed");
     load_insn!(ZeroOrNull { rg1, rg2, dest }, insn);
     if state.registers[*rg1].is_null() || state.registers[*rg2].is_null() {
         state.registers[*dest] = Register::Value(Value::Null)
@@ -8228,6 +8337,7 @@ pub fn op_not(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_not executed");
     load_insn!(Not { reg, dest }, insn);
     state.registers[*dest] = Register::Value(state.registers[*reg].get_value().exec_boolean_not());
     state.pc += 1;
@@ -8244,6 +8354,7 @@ pub fn op_is_true(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_is_true executed");
     load_insn!(
         IsTrue {
             reg,
@@ -8285,6 +8396,7 @@ pub fn op_concat(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_concat executed");
     load_insn!(Concat { lhs, rhs, dest }, insn);
     state.registers[*dest] = Register::Value(
         state.registers[*lhs]
@@ -8301,6 +8413,7 @@ pub fn op_and(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_and executed");
     load_insn!(And { lhs, rhs, dest }, insn);
     state.registers[*dest] = Register::Value(
         state.registers[*lhs]
@@ -8317,6 +8430,7 @@ pub fn op_or(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_or executed");
     load_insn!(Or { lhs, rhs, dest }, insn);
     state.registers[*dest] = Register::Value(
         state.registers[*lhs]
@@ -8333,6 +8447,7 @@ pub fn op_noop(
     _insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_noop executed");
     // Do nothing
     // Advance the program counter for the next opcode
     state.pc += 1;
@@ -8365,13 +8480,14 @@ pub fn op_open_ephemeral(
     insn: &Insn,
     pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_open_ephemeral executed");
     let (cursor_id, is_table) = match insn {
         Insn::OpenEphemeral {
             cursor_id,
             is_table,
         } => (*cursor_id, *is_table),
         Insn::OpenAutoindex { cursor_id } => (*cursor_id, false),
-        _ => unreachable!("unexpected Insn {:?}", insn),
+        _ => turso_assert_unreachable!("vdbe: unexpected instruction in op_open_ephemeral"),
     };
     let mv_store = program.connection.mv_store();
     match &mut state.op_open_ephemeral_state {
@@ -8497,7 +8613,7 @@ pub fn op_open_ephemeral(
             let num_columns = match cursor_type {
                 CursorType::BTreeTable(table_rc) => table_rc.columns.len(),
                 CursorType::BTreeIndex(index_arc) => index_arc.columns.len(),
-                _ => unreachable!("This should not have happened"),
+                _ => turso_assert_unreachable!("vdbe: unexpected cursor type in OpenEphemeral"),
             };
 
             let cursor = if let CursorType::BTreeIndex(index) = cursor_type {
@@ -8522,7 +8638,7 @@ pub fn op_open_ephemeral(
             let OpOpenEphemeralState::Rewind { cursor } =
                 std::mem::take(&mut state.op_open_ephemeral_state)
             else {
-                unreachable!()
+                turso_assert_unreachable!("vdbe: expected Rewind state in OpenEphemeral")
             };
 
             // Table content is erased if the cursor already exists
@@ -8570,6 +8686,7 @@ pub fn op_open_dup(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_open_dup executed");
     load_insn!(
         OpenDup {
             new_cursor_id,
@@ -8652,6 +8769,7 @@ pub fn op_once(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_once executed");
     load_insn!(
         Once {
             target_pc_when_reentered,
@@ -8675,6 +8793,7 @@ pub fn op_found(
     insn: &Insn,
     pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_found executed");
     let (cursor_id, target_pc, record_reg, num_regs) = match insn {
         Insn::NotFound {
             cursor_id,
@@ -8688,7 +8807,7 @@ pub fn op_found(
             record_reg,
             num_regs,
         } => (cursor_id, target_pc, record_reg, num_regs),
-        _ => unreachable!("unexpected Insn {:?}", insn),
+        _ => turso_assert_unreachable!("vdbe: unexpected instruction in op_found"),
     };
 
     let not = matches!(insn, Insn::NotFound { .. });
@@ -8735,6 +8854,7 @@ pub fn op_affinity(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_affinity executed");
     load_insn!(
         Affinity {
             start_reg,
@@ -8768,6 +8888,7 @@ pub fn op_count(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_count executed");
     load_insn!(
         Count {
             cursor_id,
@@ -8966,6 +9087,7 @@ pub fn op_integrity_check(
     insn: &Insn,
     pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_integrity_check executed");
     load_insn!(
         IntegrityCk {
             max_errors,
@@ -9854,6 +9976,7 @@ pub fn op_cast(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_cast executed");
     load_insn!(Cast { reg, affinity }, insn);
 
     let value = state.registers[*reg].get_value().clone();
@@ -9876,6 +9999,7 @@ pub fn op_rename_table(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_rename_table executed");
     load_insn!(RenameTable { from, to }, insn);
 
     let normalized_from = normalize_ident(from.as_str());
@@ -9945,6 +10069,7 @@ pub fn op_drop_column(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_drop_column executed");
     load_insn!(
         DropColumn {
             table,
@@ -10043,6 +10168,7 @@ pub fn op_add_column(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_add_column executed");
     load_insn!(AddColumn { table, column }, insn);
 
     let conn = program.connection.clone();
@@ -10073,6 +10199,7 @@ pub fn op_alter_column(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_alter_column executed");
     load_insn!(
         AlterColumn {
             table: table_name,
@@ -10223,6 +10350,7 @@ pub fn op_if_neg(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_if_neg executed");
     load_insn!(IfNeg { reg, target_pc }, insn);
 
     match &state.registers[*reg] {
@@ -10262,7 +10390,7 @@ fn handle_text_sum(acc: &mut Value, sum_state: &mut SumAggState, parsed_number: 
             Value::Float(_) => {
                 apply_kbn_step_int(acc, i, sum_state);
             }
-            _ => unreachable!(),
+            _ => turso_assert_unreachable!("vdbe: unexpected accumulator type in handle_text_sum"),
         },
         ParsedNumber::Float(f) => {
             if !sum_state.approx {
@@ -10294,6 +10422,7 @@ pub fn op_fk_counter(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_fk_counter executed");
     load_insn!(
         FkCounter {
             increment_value,
@@ -10323,6 +10452,7 @@ pub fn op_fk_if_zero(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_fk_if_zero executed");
     load_insn!(
         FkIfZero {
             deferred,
@@ -10362,6 +10492,7 @@ pub fn op_hash_build(
     insn: &Insn,
     pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_hash_build executed");
     load_insn!(HashBuild { data }, insn);
 
     let mut op_state = state
@@ -10482,6 +10613,7 @@ pub fn op_hash_distinct(
     insn: &Insn,
     pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_hash_distinct executed");
     load_insn!(HashDistinct { data }, insn);
 
     let hash_table = state
@@ -10525,6 +10657,7 @@ pub fn op_hash_build_finalize(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_hash_build_finalize executed");
     load_insn!(HashBuildFinalize { hash_table_id }, insn);
     if let Some(ht) = state.hash_tables.get_mut(hash_table_id) {
         // Finalize the build phase, may flush remaining partitions to disk if spilled
@@ -10562,6 +10695,7 @@ pub fn op_hash_probe(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_hash_probe executed");
     load_insn!(
         HashProbe {
             hash_table_id,
@@ -10677,6 +10811,7 @@ pub fn op_hash_next(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_hash_next executed");
     load_insn!(
         HashNext {
             hash_table_id,
@@ -10716,6 +10851,7 @@ pub fn op_hash_close(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_hash_close executed");
     load_insn!(HashClose { hash_table_id }, insn);
     if let Some(mut hash_table) = state.hash_tables.remove(hash_table_id) {
         hash_table.close();
@@ -10730,6 +10866,7 @@ pub fn op_hash_clear(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_hash_clear executed");
     load_insn!(HashClear { hash_table_id }, insn);
     if let Some(hash_table) = state.hash_tables.get_mut(hash_table_id) {
         hash_table.clear();
@@ -10902,6 +11039,7 @@ pub fn op_max_pgcnt(
     insn: &Insn,
     pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_max_pgcnt executed");
     load_insn!(MaxPgcnt { db, dest, new_max }, insn);
 
     if *db > 0 {
@@ -10959,6 +11097,7 @@ pub fn op_journal_mode(
     insn: &Insn,
     pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_journal_mode executed");
     match op_journal_mode_inner(program, state, insn, pager) {
         Ok(result) => {
             if !matches!(result, InsnFunctionStepResult::IO(_)) {
@@ -11165,6 +11304,7 @@ pub fn op_filter(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_filter executed");
     load_insn!(
         Filter {
             cursor_id,
@@ -11215,6 +11355,7 @@ pub fn op_filter_add(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    turso_assert_reachable!("vdbe: op_filter_add executed");
     load_insn!(
         FilterAdd {
             cursor_id,
