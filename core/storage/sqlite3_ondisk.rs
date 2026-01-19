@@ -52,7 +52,7 @@ pub use super::pager::{PageContent, PageInner};
 use super::wal::TursoRwLock;
 use crate::error::LimboError;
 use crate::fast_lock::SpinLock;
-use crate::io::{Buffer, Completion, ReadComplete};
+use crate::io::{Buffer, Completion, FileSyncType, ReadComplete};
 use crate::storage::btree::{payload_overflow_threshold_max, payload_overflow_threshold_min};
 use crate::storage::buffer_pool::BufferPool;
 use crate::storage::database::{DatabaseStorage, EncryptionOrChecksum};
@@ -724,14 +724,18 @@ pub fn write_pages_vectored(
 }
 
 #[instrument(skip_all, level = Level::DEBUG)]
-pub fn begin_sync(db_file: &dyn DatabaseStorage, syncing: Arc<AtomicBool>) -> Result<Completion> {
+pub fn begin_sync(
+    db_file: &dyn DatabaseStorage,
+    syncing: Arc<AtomicBool>,
+    sync_type: FileSyncType,
+) -> Result<Completion> {
     assert!(!syncing.load(Ordering::SeqCst));
     syncing.store(true, Ordering::SeqCst);
     let completion = Completion::new_sync(move |_| {
         syncing.store(false, Ordering::SeqCst);
     });
     #[allow(clippy::arc_with_non_send_sync)]
-    db_file.sync(completion)
+    db_file.sync(completion, sync_type)
 }
 
 #[allow(clippy::enum_variant_names)]

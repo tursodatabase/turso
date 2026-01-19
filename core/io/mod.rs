@@ -9,6 +9,7 @@ use std::cell::RefCell;
 use std::fmt;
 use std::ptr::NonNull;
 use std::{fmt::Debug, pin::Pin};
+use turso_macros::AtomicEnum;
 
 cfg_block! {
     #[cfg(all(target_os = "linux", feature = "io_uring", not(miri)))] {
@@ -42,12 +43,25 @@ mod completions;
 pub use clock::Clock;
 pub use completions::*;
 
+/// Controls which sync mechanism to use for durability.
+/// `FullFsync` only has effect on Apple platforms (uses F_FULLFSYNC fcntl).
+/// On other platforms, both variants behave the same (regular fsync).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, AtomicEnum)]
+pub enum FileSyncType {
+    /// Regular fsync - flushes to disk but may not flush disk write cache on macOS.
+    Fsync,
+    /// Full fsync - on macOS uses F_FULLFSYNC to flush disk write cache.
+    /// On other platforms, behaves the same as Fsync.
+    FullFsync,
+}
+
 pub trait File: Send + Sync {
     fn lock_file(&self, exclusive: bool) -> Result<()>;
     fn unlock_file(&self) -> Result<()>;
     fn pread(&self, pos: u64, c: Completion) -> Result<Completion>;
     fn pwrite(&self, pos: u64, buffer: Arc<Buffer>, c: Completion) -> Result<Completion>;
-    fn sync(&self, c: Completion) -> Result<Completion>;
+    /// Sync file data&metadata to disk.
+    fn sync(&self, c: Completion, sync_type: FileSyncType) -> Result<Completion>;
     fn pwritev(&self, pos: u64, buffers: Vec<Arc<Buffer>>, c: Completion) -> Result<Completion> {
         use crate::sync::atomic::{AtomicUsize, Ordering};
         if buffers.is_empty() {
@@ -1095,7 +1109,7 @@ mod shuttle_tests {
             let io = io.clone();
             handles.push(thread::spawn(move || {
                 let c = Completion::new_sync(|_| {});
-                let c = file.sync(c).unwrap();
+                let c = file.sync(c, FileSyncType::Fsync).unwrap();
                 wait_completion_ok(io.as_ref(), &c);
             }));
         }

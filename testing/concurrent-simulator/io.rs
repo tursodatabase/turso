@@ -303,7 +303,7 @@ impl File for SimulatorFile {
         Ok(c)
     }
 
-    fn sync(&self, c: Completion) -> Result<Completion> {
+    fn sync(&self, c: Completion, _sync_type: turso_core::io::FileSyncType) -> Result<Completion> {
         // No-op for memory files
         c.complete(0);
         Ok(c)

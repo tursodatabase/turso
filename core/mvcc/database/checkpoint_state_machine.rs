@@ -485,7 +485,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
 
     /// Fsync the logical log file
     fn fsync_logical_log(&self) -> Result<Completion> {
-        self.mvstore.storage.sync()
+        self.mvstore.storage.sync(self.pager.get_sync_type())
     }
 
     /// Truncate the logical log file
@@ -1114,7 +1114,10 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 }
 
                 tracing::debug!("Fsyncing database file before WAL truncation");
-                let c = self.pager.db_file.sync(Completion::new_sync(|_| {}))?;
+                let c = self
+                    .pager
+                    .db_file
+                    .sync(Completion::new_sync(|_| {}), self.pager.get_sync_type())?;
                 checkpoint_result.db_sync_sent = true;
                 Ok(TransitionResult::Io(IOCompletions::Single(c)))
             }
@@ -1130,7 +1133,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                     .checkpoint_result
                     .as_mut()
                     .expect("checkpoint_result should be set");
-                match wal.truncate_wal(checkpoint_result)? {
+                match wal.truncate_wal(checkpoint_result, self.pager.get_sync_type())? {
                     IOResult::Done(()) => {
                         self.state = CheckpointState::Finalize;
                         Ok(TransitionResult::Continue)

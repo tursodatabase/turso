@@ -2,6 +2,7 @@ use super::{Completion, File, OpenFlags, IO};
 use crate::error::LimboError;
 use crate::io::clock::{Clock, DefaultClock, MonotonicInstant, WallClockInstant};
 use crate::io::common;
+use crate::io::FileSyncType;
 use crate::Result;
 use crate::sync::Mutex;
 use rustix::{
@@ -309,18 +310,22 @@ impl File for UnixFile {
     }
 
     #[instrument(err, skip_all, level = Level::TRACE)]
-    fn sync(&self, c: Completion) -> Result<Completion> {
+    fn sync(&self, c: Completion, sync_type: FileSyncType) -> Result<Completion> {
         let file = self.file.lock();
 
         let result = unsafe {
-            #[cfg(not(target_vendor = "apple"))]
-            {
-                libc::fsync(file.as_raw_fd())
-            }
-
             #[cfg(target_vendor = "apple")]
             {
-                libc::fcntl(file.as_raw_fd(), libc::F_FULLFSYNC)
+                match sync_type {
+                    FileSyncType::Fsync => libc::fsync(file.as_raw_fd()),
+                    FileSyncType::FullFsync => libc::fcntl(file.as_raw_fd(), libc::F_FULLFSYNC),
+                }
+            }
+            #[cfg(not(target_vendor = "apple"))]
+            {
+                // FullFsync has no effect on non-Apple platforms
+                let _ = sync_type;
+                libc::fsync(file.as_raw_fd())
             }
         };
 
@@ -328,11 +333,13 @@ impl File for UnixFile {
             let e = std::io::Error::last_os_error();
             Err(e.into())
         } else {
+            #[cfg(target_vendor = "apple")]
+            match sync_type {
+                FileSyncType::FullFsync => trace!("fcntl(F_FULLFSYNC)"),
+                FileSyncType::Fsync => trace!("fsync"),
+            }
             #[cfg(not(target_vendor = "apple"))]
             trace!("fsync");
-
-            #[cfg(target_vendor = "apple")]
-            trace!("fcntl(F_FULLSYNC)");
 
             c.complete(0);
             Ok(c)
