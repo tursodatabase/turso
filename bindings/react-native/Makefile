@@ -53,7 +53,8 @@ package-dylibs:
 	codesign -f -s - --identifier com.turso.turso_sync_sdk_kit generated/turso_sync_sdk_kit.xcframework/ios-arm64/turso_sync_sdk_kit.framework/$(IOS_FINAL_LIB_FILE)
 
 	mkdir -p generated/turso_sync_sdk_kit.xcframework/ios-arm64/turso_sync_sdk_kit.framework/Headers
-	cp $(addprefix include/,$(HEADERS)) generated/turso_sync_sdk_kit.xcframework/ios-arm64/turso_sync_sdk_kit.framework/Headers/
+	cp "$(SDK_KIT_DIR)/turso.h" generated/turso_sync_sdk_kit.xcframework/ios-arm64/turso_sync_sdk_kit.framework/Headers/
+	cp "$(SYNC_SDK_KIT_DIR)/turso_sync.h" generated/turso_sync_sdk_kit.xcframework/ios-arm64/turso_sync_sdk_kit.framework/Headers/
 
 # Pack simulator dylibs
 	cp ../../target/aarch64-apple-ios-sim/release/$(IOS_LIB_FILE) generated/$(IOS_FINAL_LIB_FILE)
@@ -63,7 +64,8 @@ package-dylibs:
 	codesign -f -s - --identifier com.turso.turso_sync_sdk_kit generated/turso_sync_sdk_kit.xcframework/ios-arm64-simulator/turso_sync_sdk_kit.framework/$(IOS_FINAL_LIB_FILE)
 
 	mkdir -p generated/turso_sync_sdk_kit.xcframework/ios-arm64-simulator/turso_sync_sdk_kit.framework/Headers
-	cp $(addprefix include/,$(HEADERS)) generated/turso_sync_sdk_kit.xcframework/ios-arm64-simulator/turso_sync_sdk_kit.framework/Headers/
+	cp "$(SDK_KIT_DIR)/turso.h" generated/turso_sync_sdk_kit.xcframework/ios-arm64-simulator/turso_sync_sdk_kit.framework/Headers/
+	cp "$(SYNC_SDK_KIT_DIR)/turso_sync.h" generated/turso_sync_sdk_kit.xcframework/ios-arm64-simulator/turso_sync_sdk_kit.framework/Headers/
 
 ios-build:
 	cargo build --release --target aarch64-apple-ios --package turso_sync_sdk_kit
