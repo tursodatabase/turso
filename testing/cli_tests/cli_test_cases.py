@@ -188,7 +188,7 @@ def test_import_csv():
     shell.run_test("create-csv-table", "CREATE TABLE csv_table (c1 INT, c2 REAL, c3 String);", "")
     shell.run_test(
         "import-csv-no-options",
-        ".import --csv ./testing/test_files/test.csv csv_table",
+        ".import --csv ./testing/cli_tests/test_files/test.csv csv_table",
         "",
     )
     shell.run_test(
@@ -205,7 +205,7 @@ def test_import_csv_verbose():
     shell.run_test("create-csv-table", "CREATE TABLE csv_table (c1 INT, c2 REAL, c3 String);", "")
     shell.run_test(
         "import-csv-verbose",
-        ".import --csv -v ./testing/test_files/test.csv csv_table",
+        ".import --csv -v ./testing/cli_tests/test_files/test.csv csv_table",
         "Added 2 rows with 0 errors using 2 lines of input",
     )
     shell.run_test(
@@ -222,7 +222,7 @@ def test_import_csv_skip():
     shell.run_test("create-csv-table", "CREATE TABLE csv_table (c1 INT, c2 REAL, c3 String);", "")
     shell.run_test(
         "import-csv-skip",
-        ".import --csv --skip 1 ./testing/test_files/test.csv csv_table",
+        ".import --csv --skip 1 ./testing/cli_tests/test_files/test.csv csv_table",
         "",
     )
     shell.run_test("verify-csv-skip", "select * from csv_table;", "3|4.0|String2")
@@ -235,7 +235,7 @@ def test_import_csv_create_table_from_header():
     # Import CSV with header - should create table automatically
     shell.run_test(
         "import-csv-create-table",
-        ".import --csv ./testing/test_files/test_w_header.csv auto_table",
+        ".import --csv ./testing/cli_tests/test_files/test_w_header.csv auto_table",
         "",
     )
     # Verify table was created with correct column names
