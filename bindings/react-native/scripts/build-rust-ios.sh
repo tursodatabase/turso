@@ -47,20 +47,20 @@ mkdir -p "$OUTPUT_DIR/simulator"
 # For simulator: combine x86_64 and aarch64-sim into fat library
 echo "Creating simulator fat library..."
 lipo -create \
-    "$REPO_ROOT/target/aarch64-apple-ios-sim/release/libturso_sync_sdk_kit.a" \
-    "$REPO_ROOT/target/x86_64-apple-ios/release/libturso_sync_sdk_kit.a" \
-    -output "$OUTPUT_DIR/simulator/libturso_sync_sdk_kit.a" 2>/dev/null || \
-    cp "$REPO_ROOT/target/aarch64-apple-ios-sim/release/libturso_sync_sdk_kit.a" "$OUTPUT_DIR/simulator/libturso_sync_sdk_kit.a"
+    "$REPO_ROOT/target/aarch64-apple-ios-sim/release/libturso_sync_sdk_kit.so" \
+    "$REPO_ROOT/target/x86_64-apple-ios/release/libturso_sync_sdk_kit.so" \
+    -output "$OUTPUT_DIR/simulator/libturso_sync_sdk_kit.so" 2>/dev/null || \
+    cp "$REPO_ROOT/target/aarch64-apple-ios-sim/release/libturso_sync_sdk_kit.so" "$OUTPUT_DIR/simulator/libturso_sync_sdk_kit.so"
 
 # For device: just copy aarch64
-cp "$REPO_ROOT/target/aarch64-apple-ios/release/libturso_sync_sdk_kit.a" "$OUTPUT_DIR/device/libturso_sync_sdk_kit.a"
+cp "$REPO_ROOT/target/aarch64-apple-ios/release/libturso_sync_sdk_kit.so" "$OUTPUT_DIR/device/libturso_sync_sdk_kit.so"
 
 # Create XCFramework (the proper way to bundle device + simulator)
 echo "Creating XCFramework..."
 rm -rf "$OUTPUT_DIR/TursoSyncSdkKit.xcframework"
 xcodebuild -create-xcframework \
-    -library "$OUTPUT_DIR/device/libturso_sync_sdk_kit.a" \
-    -library "$OUTPUT_DIR/simulator/libturso_sync_sdk_kit.a" \
+    -library "$OUTPUT_DIR/device/libturso_sync_sdk_kit.so" \
+    -library "$OUTPUT_DIR/simulator/libturso_sync_sdk_kit.so" \
     -output "$OUTPUT_DIR/TursoSyncSdkKit.xcframework"
 
 # Copy header files

@@ -59,6 +59,11 @@ android {
             "**/libreactnative.so"
         ]
     }
+    sourceSets {
+        main {
+            jniLibs.srcDirs = ["../libs/android"]
+        }
+    }
 }
 
 repositories {

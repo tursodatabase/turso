@@ -71,8 +71,8 @@ for target in "${!TARGETS[@]}"; do
     # Build sync-sdk-kit using cargo-ndk
     cargo ndk -t "$target" build -p turso_sync_sdk_kit --release
 
-    # Copy to ABI-named directory
-    cp "$REPO_ROOT/target/$target/release/libturso_sync_sdk_kit.a" "$ABI_OUTPUT_DIR/"
+    # Copy only sync SDK
+    cp "$REPO_ROOT/target/$target/release/libturso_sync_sdk_kit.so" "$ABI_OUTPUT_DIR/"
 done
 
 # Copy header files
@@ -83,7 +83,7 @@ echo "Android build complete!"
 echo "Libraries built:"
 for target in "${!TARGETS[@]}"; do
     abi="${TARGETS[$target]}"
-    echo "  - $OUTPUT_DIR/$abi/libturso_sync_sdk_kit.a"
+    echo "  - $OUTPUT_DIR/$abi/libturso_sync_sdk_kit.so"
 done
 echo "Headers:"
 echo "  - $OUTPUT_DIR/turso.h"

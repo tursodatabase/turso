@@ -30,14 +30,16 @@ target_include_directories(${PROJECT_NAME} PRIVATE
     ../libs/android
 )
 
-# Pre-built Rust static library
-set(RUST_LIB_DIR ${CMAKE_SOURCE_DIR}/../libs/android/${ANDROID_ABI})
-add_library(turso_sync_sdk_kit STATIC IMPORTED)
+# Pre-built Rust shared library (.so) loaded at runtime
+add_library(turso_sync_sdk_kit SHARED IMPORTED)
+
+# IMPORTED_NO_SONAME is important to properly adjust import paths for runtime by linker (so they will not be reused from build time)
 set_target_properties(turso_sync_sdk_kit PROPERTIES
-    IMPORTED_LOCATION ${RUST_LIB_DIR}/libturso_sync_sdk_kit.a
+    IMPORTED_LOCATION ${CMAKE_SOURCE_DIR}/../libs/android/${ANDROID_ABI}/libturso_sync_sdk_kit.so
+    IMPORTED_NO_SONAME TRUE
 )
 
-# Link libraries
+# Link libraries (record runtime dependency on Rust .so)
 target_link_libraries(${PROJECT_NAME}
     ReactAndroid::jsi
     ReactAndroid::reactnative

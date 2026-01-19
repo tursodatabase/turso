@@ -19,6 +19,7 @@ public class TursoModule extends ReactContextBaseJavaModule {
     public static final String NAME = "Turso";
 
     static {
+        System.loadLibrary("turso_sync_sdk_kit");
         System.loadLibrary("turso-react-native");
     }
 

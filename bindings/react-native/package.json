@@ -9,15 +9,24 @@
   "source": "src/index.ts",
   "files": [
     "src",
-    "lib",
+    "libs",
     "cpp",
     "ios",
     "android",
-    "turso-react-native.podspec",
+    "node/dist",
+    "node/package.json",
+    "*.podspec",
+    "*.rb",
+    "!ios/build",
+    "!android/build",
+    "!android/gradle",
+    "!android/gradlew",
+    "!android/gradlew.bat",
+    "!android/local.properties",
     "!**/__tests__",
     "!**/__fixtures__",
     "!**/__mocks__",
-    "!lib/typescript/example"
+    "!**/.*"
   ],
   "scripts": {
     "typescript": "tsc --noEmit",
