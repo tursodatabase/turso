@@ -29,7 +29,7 @@ pub fn arg<'a>() -> text_parser!('a, String) {
     choice((braced(), word()))
 }
 
-/// Parser for comment lines
+/// Parser for comment lines (excludes shebangs like #!/...)
 pub fn comment<'a>() -> text_parser!('a, &'a str) {
     just('#').then(none_of('\n').repeated()).to_slice()
 }
