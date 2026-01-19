@@ -26,11 +26,6 @@ use turso::Builder;
 static RNG: std::sync::OnceLock<StdMutex<StdRng>> = std::sync::OnceLock::new();
 
 #[cfg(not(feature = "antithesis"))]
-fn init_rng(seed: u64) {
-    RNG.get_or_init(|| StdMutex::new(StdRng::seed_from_u64(seed)));
-}
-
-#[cfg(not(feature = "antithesis"))]
 fn get_random() -> u64 {
     RNG.get()
         .expect("RNG not initialized")
@@ -667,37 +662,30 @@ fn sqlite_integrity_check(
 }
 
 #[cfg(not(shuttle))]
-fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?;
-
-    rt.block_on(async_main())
-}
+compile_error!("The stress test binary requires the `shuttle` cfg to be enabled. Run with: cargo run -p turso-stress --config 'build.rustflags = [\"--cfg\", \"shuttle\"]'");
 
 #[cfg(shuttle)]
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use shuttle::scheduler::RandomScheduler;
+    let opts = Opts::parse();
+
+    let (_guard, reload_handle) = init_tracing()?;
+    spawn_log_level_watcher(reload_handle);
+
+    init_rng(&opts);
 
     let mut config = shuttle::Config::default();
     config.stack_size *= 10;
     config.max_steps = shuttle::MaxSteps::FailAfter(10_000_000);
 
-    // let scheduler = DfsScheduler::new(None, false);
-    let scheduler = RandomScheduler::new(5);
+    let scheduler = RandomScheduler::new_from_seed(opts.seed.unwrap_or_else(|| get_random()), 5);
     let runner = shuttle::Runner::new(scheduler, config);
-    runner.run(|| shuttle::future::block_on(Box::pin(async_main())).unwrap());
+    runner.run(move || shuttle::future::block_on(Box::pin(async_main(opts.clone()))).unwrap());
 
     Ok(())
 }
 
-async fn async_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let (_guard, reload_handle) = init_tracing()?;
-
-    spawn_log_level_watcher(reload_handle);
-
-    let opts = Opts::parse();
-
+fn init_rng(opts: &Opts) {
     // Initialize RNG
     #[cfg(feature = "antithesis")]
     {
@@ -710,13 +698,15 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     #[cfg(not(feature = "antithesis"))]
     {
         let seed = opts.seed.unwrap_or_else(rand::random);
-        init_rng(seed);
+        RNG.get_or_init(|| StdMutex::new(StdRng::seed_from_u64(seed)));
         println!("Using seed: {seed}");
     }
     if opts.nr_threads > 1 {
         println!("WARNING: Multi-threaded data access is not yet supported: https://github.com/tursodatabase/turso/issues/1552");
     }
+}
 
+async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let plan = if opts.load_log {
         println!("Loading plan from log file...");
         read_plan_from_log_file(&opts)?

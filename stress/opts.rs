@@ -22,7 +22,7 @@ impl fmt::Display for TxMode {
     }
 }
 
-#[derive(Parser)]
+#[derive(Parser, Clone)]
 #[command(name = "turso_stress")]
 #[command(author, version, about, long_about = None)]
 pub struct Opts {
