@@ -24,7 +24,7 @@ COPY perf/throughput/rusqlite ./perf/throughput/rusqlite
 COPY perf/throughput/turso ./perf/throughput/turso
 COPY cli ./cli/
 COPY sqlite3 ./sqlite3/
-COPY stress ./stress/
+COPY testing/stress ./testing/stress/
 COPY tests ./tests/
 COPY packages ./packages/
 COPY testing/sqlite_test_ext ./testing/sqlite_test_ext
