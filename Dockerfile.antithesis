@@ -119,11 +119,11 @@ COPY --from=builder /app/target/wheels/* /tmp
 RUN pip install /tmp/*.whl
 
 WORKDIR /app
-COPY ./antithesis-tests/bank-test/*.py /opt/antithesis/test/v1/bank-test/
-COPY ./antithesis-tests/stress-composer/*.py /opt/antithesis/test/v1/stress-composer/
-COPY ./antithesis-tests/stress /opt/antithesis/test/v1/stress
-COPY ./antithesis-tests/stress-io_uring /opt/antithesis/test/v1/stress-io_uring
-COPY ./antithesis-tests/stress-unreliable /opt/antithesis/test/v1/stress-unreliable
+COPY ./testing/antithesis/bank-test/*.py /opt/antithesis/test/v1/bank-test/
+COPY ./testing/antithesis/stress-composer/*.py /opt/antithesis/test/v1/stress-composer/
+COPY ./testing/antithesis/stress /opt/antithesis/test/v1/stress
+COPY ./testing/antithesis/stress-io_uring /opt/antithesis/test/v1/stress-io_uring
+COPY ./testing/antithesis/stress-unreliable /opt/antithesis/test/v1/stress-unreliable
 RUN chmod 777 -R /opt/antithesis/test/v1
 
 RUN mkdir /opt/antithesis/catalog
