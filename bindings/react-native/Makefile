@@ -82,4 +82,5 @@ android: $(ARCHS_ANDROID)
 	cp "$(SYNC_SDK_KIT_DIR)/turso_sync.h" libs/android
 
 $(ARCHS_ANDROID): %:
+	rustup target add $@
 	cargo ndk --target $@ --platform 31 build --package turso_sync_sdk_kit --release
