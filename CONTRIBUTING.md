@@ -284,7 +284,7 @@ Whopper is a DST that, unlike `simulator`, performs concurrent query execution.
 To run Whopper for your local changes, run:
 
 ```console
-./whopper/bin/run
+./testing/concurrent-simulator/bin/run
 ```
 
 The output of the simulation run looks as follows:
@@ -321,19 +321,19 @@ This will do a short sanity check run in using the `fast` mode.
 If you need to reproduce a run, just defined the `SEED` environment variable as follows:
 
 ```console
-SEED=1234 ./whopper/bin/run
+SEED=1234 ./testing/concurrent-simulator/bin/run
 ```
 
 You can also run Whopper in exploration mode to find more serious bugs:
 
 ```console
-./whopper/bin/explore
+./testing/concurrent-simulator/bin/explore
 ```
 
 Note that exploration uses the `chaos` mode so if you need to reproduce a run, use:
 
 ```console
-SEED=1234 ./whopper/bin/run --mode chaos
+SEED=1234 ./testing/concurrent-simulator/bin/run --mode chaos
 ```
 
 Both `explore` and `run` accept the `--enable-checksums` and `--enable-encryption` flags for per page checksums and encryption respectively.

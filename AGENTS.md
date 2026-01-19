@@ -24,8 +24,8 @@ make -C turso-test-runner run-cli  # sqltest runner (preferred for new tests)
 | `cli/` | `tursodb` CLI |
 | `bindings/*` | Language bindings (Python, JS, Java, Rust, Dart, .NET) |
 | `extensions/*` | SQL extensions (crypto, regexp, csv, etc.) |
-| `simulator/` | Deterministic simulation testing |
-| `whopper/` | Concurrent query execution DST |
+| `testing/simulator/` | Deterministic simulation testing |
+| `testing/concurrent-simulator/` | Concurrent query execution DST |
 
 ## Guides
 

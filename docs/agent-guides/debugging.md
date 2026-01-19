@@ -63,7 +63,7 @@ Reproduce bugs with seed. Note: simulator uses legacy "limbo" naming.
 RUST_LOG=limbo_sim=debug cargo run --bin limbo_sim -- -s <seed>
 
 # Whopper (concurrent DST)
-SEED=1234 ./whopper/bin/run
+SEED=1234 ./testing/concurrent-simulator/bin/run
 ```
 
 ## Architecture Reference

@@ -201,8 +201,8 @@ Key files:
 ## Testing Async Code
 
 Re-entrancy bugs often only manifest under specific IO timing. Use:
-- Deterministic simulation (`simulator/`)
-- Whopper concurrent DST (`whopper/`)
+- Deterministic simulation (`testing/simulator/`)
+- Whopper concurrent DST (`testing/concurrent-simulator/`)
 - Fault injection to force yields at different points
 
 ## References
