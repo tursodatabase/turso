@@ -24,7 +24,7 @@ members = [
     "macros",
     "simulator",
     "sqlite3",
-    "stress",
+    "testing/stress",
     "testing/sqlite_test_ext",
     "tests",
     "parser",
