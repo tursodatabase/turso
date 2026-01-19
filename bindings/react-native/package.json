@@ -90,7 +90,7 @@
     "type": "modules",
     "jsSrcsDir": "src",
     "android": {
-      "javaPackageName": "com.turso"
+      "javaPackageName": "com.turso.reactnative"
     }
   }
 }
