@@ -471,6 +471,36 @@ impl Database {
 
         if let Some(db) = registry.get(&canonical_path).and_then(Weak::upgrade) {
             tracing::debug!("took database {canonical_path:?} from the registry");
+
+            // if we have encryption opts, let's ensure they match
+            {
+                let db_key_guard = db.encryption_key.read();
+                let db_key = db_key_guard.deref();
+
+                match (&encryption_opts, db_key) {
+                    (Some(enc_opts), Some(key)) => {
+                        let expected_key = EncryptionKey::from_hex_string(&enc_opts.hexkey)?;
+                        if expected_key.as_slice() != key.as_slice() {
+                            return Err(LimboError::InvalidArgument(
+                                "Encryption key does not match existing database encryption key"
+                                    .to_string(),
+                            ));
+                        }
+                    }
+                    // user provided encryption opts but cached database doesn't have encryption_key set.
+                    // This can happen when encryption was set via PRAGMA (which doesn't update db.encryption_key).
+                    (Some(_), None) => {}
+                    // database is encrypted but user didn't provide encryption opts
+                    (None, Some(_)) => {
+                        return Err(LimboError::InvalidArgument(
+                            "Database is encrypted but no encryption options provided".to_string(),
+                        ));
+                    }
+                    // neither has encryption - OK
+                    (None, None) => {}
+                }
+            }
+
             return Ok(db);
         }
         let db = Self::open_with_flags_bypass_registry_internal(
