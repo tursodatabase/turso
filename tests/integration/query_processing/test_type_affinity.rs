@@ -14,7 +14,9 @@ use rusqlite::types::Value;
 ///
 /// This test reproduces the fuzz failure from issue #4745.
 #[turso_macros::test(init_sql = "CREATE TABLE t (c TEXT);")]
-fn test_text_column_with_numeric_literal_float(tmp_db: crate::common::TempDatabase) -> anyhow::Result<()> {
+fn test_text_column_with_numeric_literal_float(
+    tmp_db: crate::common::TempDatabase,
+) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
 
     let sqlite_conn = rusqlite::Connection::open(&tmp_db.path)?;
@@ -29,7 +31,8 @@ fn test_text_column_with_numeric_literal_float(tmp_db: crate::common::TempDataba
     let limbo_rows = limbo_exec_rows(&limbo_conn, "SELECT c FROM t WHERE c = 0.0");
 
     assert_eq!(
-        sqlite_rows, limbo_rows,
+        sqlite_rows,
+        limbo_rows,
         "Mismatch when comparing TEXT column with float literal. \
          SQLite returned {} rows, Limbo returned {} rows.",
         sqlite_rows.len(),
@@ -42,7 +45,9 @@ fn test_text_column_with_numeric_literal_float(tmp_db: crate::common::TempDataba
 
 /// Test that TEXT columns can be compared with integer literals.
 #[turso_macros::test(init_sql = "CREATE TABLE t (c TEXT);")]
-fn test_text_column_with_numeric_literal_int(tmp_db: crate::common::TempDatabase) -> anyhow::Result<()> {
+fn test_text_column_with_numeric_literal_int(
+    tmp_db: crate::common::TempDatabase,
+) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
 
     let sqlite_conn = rusqlite::Connection::open(&tmp_db.path)?;
@@ -67,7 +72,9 @@ fn test_text_column_with_numeric_literal_int(tmp_db: crate::common::TempDatabase
 
 /// Test comparison with negative numeric literals.
 #[turso_macros::test(init_sql = "CREATE TABLE t (c TEXT);")]
-fn test_text_column_with_negative_numeric(tmp_db: crate::common::TempDatabase) -> anyhow::Result<()> {
+fn test_text_column_with_negative_numeric(
+    tmp_db: crate::common::TempDatabase,
+) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
 
     let sqlite_conn = rusqlite::Connection::open(&tmp_db.path)?;
@@ -87,7 +94,9 @@ fn test_text_column_with_negative_numeric(tmp_db: crate::common::TempDatabase) -
 
 /// Test that NUMERIC affinity columns work correctly with text comparisons.
 #[turso_macros::test(init_sql = "CREATE TABLE t (c NUMERIC);")]
-fn test_numeric_column_with_text_literal(tmp_db: crate::common::TempDatabase) -> anyhow::Result<()> {
+fn test_numeric_column_with_text_literal(
+    tmp_db: crate::common::TempDatabase,
+) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
 
     let sqlite_conn = rusqlite::Connection::open(&tmp_db.path)?;
@@ -107,7 +116,9 @@ fn test_numeric_column_with_text_literal(tmp_db: crate::common::TempDatabase) ->
 
 /// Test with ORDER BY on a TEXT column using numeric comparison.
 #[turso_macros::test(init_sql = "CREATE TABLE t (id INTEGER, c TEXT);")]
-fn test_text_column_order_by_with_numeric_filter(tmp_db: crate::common::TempDatabase) -> anyhow::Result<()> {
+fn test_text_column_order_by_with_numeric_filter(
+    tmp_db: crate::common::TempDatabase,
+) -> anyhow::Result<()> {
     let _ = env_logger::try_init();
 
     let sqlite_conn = rusqlite::Connection::open(&tmp_db.path)?;
@@ -134,8 +145,7 @@ fn test_text_column_order_by_with_numeric_filter(tmp_db: crate::common::TempData
 
     assert_eq!(
         sqlite_rows, limbo_rows,
-        "Mismatch on query with ORDER BY. SQLite: {:?}, Limbo: {:?}",
-        sqlite_rows, limbo_rows
+        "Mismatch on query with ORDER BY. SQLite: {sqlite_rows:?}, Limbo: {limbo_rows:?}"
     );
     Ok(())
 }
