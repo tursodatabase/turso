@@ -32,6 +32,7 @@ turso_core = { workspace = true, default-features = true, features = [
     "cli_only",
     "conn_raw_api",
     "fs",
+	"fts",
 ] }
 turso_sync_engine = { workspace = true }
 limbo_completion = { workspace = true, features = ["static"] }
@@ -68,6 +69,7 @@ default = ["io_uring", "mimalloc"]
 io_uring = ["turso_core/io_uring"]
 tracing_release = ["turso_core/tracing_release"]
 mimalloc = ["dep:mimalloc"]
+fts = ["turso_core/fts"]
 
 [build-dependencies]
 syntect = { git = "https://github.com/trishume/syntect.git", rev = "64644ffe064457265cbcee12a0c1baf9485ba6ee" }
