@@ -156,8 +156,7 @@ pub unsafe extern "C" fn db_open_with_encryption(
             Ok(s) => s,
             Err(err) => {
                 unsafe {
-                    *error_ptr =
-                        allocate_string(format!("Invalid cipher encoding: {err}").as_str())
+                    *error_ptr = allocate_string(format!("Invalid cipher encoding: {err}").as_str())
                 }
                 return null();
             }
@@ -166,8 +165,7 @@ pub unsafe extern "C" fn db_open_with_encryption(
             Ok(s) => s,
             Err(err) => {
                 unsafe {
-                    *error_ptr =
-                        allocate_string(format!("Invalid hexkey encoding: {err}").as_str())
+                    *error_ptr = allocate_string(format!("Invalid hexkey encoding: {err}").as_str())
                 }
                 return null();
             }
