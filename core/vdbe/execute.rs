@@ -25,7 +25,9 @@ use crate::util::{
     trim_ascii_whitespace,
 };
 use crate::vdbe::affinity::{apply_numeric_affinity, try_for_float, Affinity, ParsedNumber};
-use crate::vdbe::hash_table::{HashEntry, HashTable, HashTableConfig, DEFAULT_MEM_BUDGET};
+use crate::vdbe::hash_table::{
+    hash_join_key, HashEntry, HashTable, HashTableConfig, DEFAULT_MEM_BUDGET, NUM_PARTITIONS,
+};
 use crate::vdbe::insn::InsertFlags;
 use crate::vdbe::value::ComparisonOp;
 use crate::vdbe::{
@@ -84,6 +86,7 @@ use super::{
     insn::{Cookie, RegisterOrLiteral},
     CommitState,
 };
+use super::{HashAggEmitState, OpHashAggStepState};
 use crate::sync::{Mutex, RwLock};
 use turso_parser::ast::{self, ForeignKeyClause, Name, ResolveType};
 use turso_parser::parser::Parser;
@@ -10624,31 +10627,640 @@ pub fn op_hash_distinct(
     }
 }
 
+/// Returns the number of Value slots needed in the hash aggregation payload for a given aggregate function.
+/// This must match the layout expected by init_agg_payload, update_agg_payload, and finalize_agg_payload.
+pub(crate) fn hash_agg_payload_len(func: &AggFunc) -> usize {
+    match func {
+        AggFunc::Count | AggFunc::Count0 => 1,
+        AggFunc::Sum | AggFunc::Total => 4,
+        AggFunc::Avg => 3,
+        AggFunc::Min | AggFunc::Max => 1,
+        AggFunc::GroupConcat | AggFunc::StringAgg => 1,
+        AggFunc::External(_) => 0, // External uses FFI state, not flat payload
+        #[cfg(feature = "json")]
+        AggFunc::JsonGroupObject
+        | AggFunc::JsonbGroupObject
+        | AggFunc::JsonGroupArray
+        | AggFunc::JsonbGroupArray => 1,
+    }
+}
+
+/// Append values from consecutive registers to a Vec.
+fn extend_from_registers(
+    registers: &[Register],
+    start_reg: usize,
+    count: usize,
+    target: &mut Vec<Value>,
+) {
+    for i in 0..count {
+        target.push(registers[start_reg + i].get_value().clone());
+    }
+}
+
+/// Load aggregate arguments from registers and apply one step of aggregation.
+/// This is common logic shared between updating existing entries and creating new ones.
+fn step_aggregate(
+    registers: &[Register],
+    agg: &AggFunc,
+    arg_start: usize,
+    arg_count: usize,
+    collation: CollationSeq,
+    payload_slice: &mut [Value],
+) -> Result<()> {
+    turso_assert!(
+        arg_count <= 2,
+        "aggregates should only take 1 or 2 arguments, got {arg_count} for {agg:?}"
+    );
+    turso_assert!(
+        arg_count > 0 || matches!(agg, AggFunc::Count0),
+        "aggregates should take at least 1 argument, got {arg_count} for {agg:?}"
+    );
+    let arg = registers[arg_start].get_value().clone();
+    let maybe_arg2 = if arg_count == 2 {
+        Some(registers[arg_start + 1].get_value().clone())
+    } else {
+        None
+    };
+    update_agg_payload(agg, arg, maybe_arg2, payload_slice, collation)
+}
+
+/// Merge two aggregate states into one.
+///
+/// Used during spill recovery in hash aggregation. When the hash table exceeds its
+/// memory budget, partition buffers are spilled to disk as "chunks". The same partition
+/// may be spilled multiple times, creating multiple chunks. Since keys always hash to
+/// the same partition deterministically, the same GROUP BY keys can appear in different
+/// chunks of the same partition. When loading a partition, all its chunks are parsed
+/// into buckets, and duplicate keys must be merged. This function combines those
+/// partial aggregate states.
+///
+/// # Merge semantics by aggregate type:
+/// - **Count/Count0**: Add the counts together
+/// - **Avg**: Merge sums using KBN compensation, add r_err terms and counts
+/// - **Sum/Total**: Merge accumulators, combining Kahan compensation terms and
+///   overflow/approximation flags from both sides
+/// - **Min/Max**: Keep the more extreme value using collation-aware comparison
+/// - **GroupConcat/StringAgg**: Not supported (delimiter not stored in payload)
+/// - **External**: Not supported (FFI state cannot be serialized)
+/// - **JsonGroup***: Not supported (merging JSONB blobs requires header parsing)
+///
+/// The unsupported aggregates are excluded from hash aggregation in `group_by.rs`,
+/// so their branches are unreachable.
+fn merge_agg_payload(
+    func: &AggFunc,
+    dest: &mut [Value],
+    src: &[Value],
+    collation: CollationSeq,
+) -> Result<()> {
+    match func {
+        AggFunc::Count | AggFunc::Count0 => {
+            // invariant: both are integers
+            let Value::Integer(d) = &mut dest[0] else {
+                return Err(LimboError::InternalError(
+                    "Count merge: dest is not an integer".to_string(),
+                ));
+            };
+            let Value::Integer(s) = &src[0] else {
+                return Err(LimboError::InternalError(
+                    "Count merge: src is not an integer".to_string(),
+                ));
+            };
+            *d = d.checked_add(*s).ok_or(LimboError::IntegerOverflow)?;
+        }
+        AggFunc::Avg => {
+            // invariant: dest[0] is Float (sum), dest[1] is Float (r_err), dest[2] is Integer (count)
+            let [sum_dest, r_err_dest, count_dest, ..] = dest else {
+                return Err(LimboError::InternalError(
+                    "Avg merge: dest too short".to_string(),
+                ));
+            };
+            let Value::Float(sum_d) = sum_dest else {
+                return Err(LimboError::InternalError(
+                    "Avg merge: dest[0] is not a float".to_string(),
+                ));
+            };
+            let Value::Float(r_err_d) = r_err_dest else {
+                return Err(LimboError::InternalError(
+                    "Avg merge: dest[1] is not a float".to_string(),
+                ));
+            };
+            let Value::Integer(count_d) = count_dest else {
+                return Err(LimboError::InternalError(
+                    "Avg merge: dest[2] is not an integer".to_string(),
+                ));
+            };
+            let Value::Float(sum_s) = &src[0] else {
+                return Err(LimboError::InternalError(
+                    "Avg merge: src[0] is not a float".to_string(),
+                ));
+            };
+            let Value::Float(r_err_s) = &src[1] else {
+                return Err(LimboError::InternalError(
+                    "Avg merge: src[1] is not a float".to_string(),
+                ));
+            };
+            let Value::Integer(count_s) = &src[2] else {
+                return Err(LimboError::InternalError(
+                    "Avg merge: src[2] is not an integer".to_string(),
+                ));
+            };
+            // Use KBN to merge the sums
+            let t = *sum_d + *sum_s;
+            let correction = if sum_d.abs() > sum_s.abs() {
+                (*sum_d - t) + *sum_s
+            } else {
+                (*sum_s - t) + *sum_d
+            };
+            *sum_d = t;
+            *r_err_d += correction + *r_err_s;
+            *count_d = count_d
+                .checked_add(*count_s)
+                .ok_or(LimboError::IntegerOverflow)?;
+        }
+        AggFunc::Sum | AggFunc::Total => {
+            // invariant: payload[0] is acc, [1] is r_err (Float), [2] is approx (Int), [3] is ovrfl (Int)
+            let [acc, r_err_val, approx_val, ovrfl_val, ..] = dest else {
+                return Err(LimboError::InternalError(
+                    "Sum/Total merge: dest too short".to_string(),
+                ));
+            };
+            let Value::Float(r_err) = r_err_val else {
+                return Err(LimboError::InternalError(
+                    "Sum/Total merge: dest[1] is not a float".to_string(),
+                ));
+            };
+            let Value::Integer(approx_i) = approx_val else {
+                return Err(LimboError::InternalError(
+                    "Sum/Total merge: dest[2] is not an integer".to_string(),
+                ));
+            };
+            let Value::Integer(ovrfl_i) = ovrfl_val else {
+                return Err(LimboError::InternalError(
+                    "Sum/Total merge: dest[3] is not an integer".to_string(),
+                ));
+            };
+            let mut sum_state = SumAggState {
+                r_err: *r_err,
+                approx: *approx_i != 0,
+                ovrfl: *ovrfl_i != 0,
+            };
+            let src_r_err = src[1].as_float();
+            let src_approx = src[2].as_int().unwrap_or(0) != 0;
+            let src_ovrfl = src[3].as_int().unwrap_or(0) != 0;
+
+            match &src[0] {
+                Value::Null => {}
+                Value::Integer(i) => match acc {
+                    Value::Null => {
+                        *acc = Value::Integer(*i);
+                    }
+                    Value::Integer(acc_i) => match acc_i.checked_add(*i) {
+                        Some(sum) => *acc_i = sum,
+                        None => {
+                            if matches!(func, AggFunc::Total) {
+                                let acc_f = *acc_i as f64;
+                                *acc = Value::Float(acc_f);
+                                sum_state.approx = true;
+                                sum_state.ovrfl = true;
+                                apply_kbn_step_int(acc, *i, &mut sum_state);
+                            } else {
+                                return Err(LimboError::IntegerOverflow);
+                            }
+                        }
+                    },
+                    Value::Float(_) => {
+                        apply_kbn_step_int(acc, *i, &mut sum_state);
+                    }
+                    _ => unreachable!("Sum/Total accumulator initialized to Null/Integer/Float"),
+                },
+                Value::Float(f) => match acc {
+                    Value::Null => {
+                        *acc = Value::Float(*f);
+                        sum_state.approx = true;
+                    }
+                    Value::Integer(i) => {
+                        *acc = Value::Float(*i as f64);
+                        sum_state.approx = true;
+                        apply_kbn_step(acc, *f, &mut sum_state);
+                    }
+                    Value::Float(_) => {
+                        sum_state.approx = true;
+                        apply_kbn_step(acc, *f, &mut sum_state);
+                    }
+                    _ => unreachable!("Sum/Total accumulator initialized to Null/Integer/Float"),
+                },
+                Value::Text(t) => {
+                    let (_, parsed_number) = try_for_float(t.as_str());
+                    handle_text_sum(acc, &mut sum_state, parsed_number);
+                }
+                Value::Blob(b) => {
+                    if let Ok(s) = std::str::from_utf8(b) {
+                        let (_, parsed_number) = try_for_float(s);
+                        handle_text_sum(acc, &mut sum_state, parsed_number);
+                    } else {
+                        handle_text_sum(acc, &mut sum_state, ParsedNumber::None);
+                    }
+                }
+            }
+            if src_r_err != 0.0 {
+                apply_kbn_step(acc, src_r_err, &mut sum_state);
+            }
+            sum_state.approx |= src_approx;
+            sum_state.ovrfl |= src_ovrfl;
+            *r_err = sum_state.r_err;
+            *approx_i = sum_state.approx as i64;
+            *ovrfl_i = sum_state.ovrfl as i64;
+        }
+        AggFunc::Min | AggFunc::Max => {
+            if matches!(src[0], Value::Null) {
+                return Ok(());
+            }
+            if matches!(dest[0], Value::Null) {
+                dest[0] = src[0].clone();
+                return Ok(());
+            }
+            use std::cmp::Ordering;
+            let cmp = compare_with_collation(&src[0], &dest[0], Some(collation));
+            let should_update = match func {
+                AggFunc::Max => cmp == Ordering::Greater,
+                AggFunc::Min => cmp == Ordering::Less,
+                _ => false,
+            };
+            if should_update {
+                dest[0] = src[0].clone();
+            }
+        }
+        AggFunc::GroupConcat | AggFunc::StringAgg => {
+            // Unreachable: hash agg is disabled for GroupConcat/StringAgg in group_by.rs
+            // because merging requires the delimiter which isn't stored in the payload.
+            unreachable!("GroupConcat/StringAgg should not use hash aggregation")
+        }
+        AggFunc::External(_) => {
+            // Unreachable: hash agg is disabled for External in group_by.rs
+            // because FFI state cannot be serialized or merged.
+            unreachable!("External aggregates should not use hash aggregation")
+        }
+        #[cfg(feature = "json")]
+        AggFunc::JsonGroupObject
+        | AggFunc::JsonbGroupObject
+        | AggFunc::JsonGroupArray
+        | AggFunc::JsonbGroupArray => {
+            // Unreachable: hash agg is disabled for JSON aggregates in group_by.rs
+            // because merging raw JSONB blobs requires parsing header bytes.
+            unreachable!("JSON aggregates should not use hash aggregation")
+        }
+    }
+    Ok(())
+}
+
 pub fn op_hash_agg_step(
     _program: &Program,
-    _state: &mut ProgramState,
-    _insn: &Insn,
-    _pager: &Arc<Pager>,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
-    todo!("HashAggStep execution to be implemented")
+    load_insn!(HashAggStep { data }, insn);
+
+    state
+        .hash_tables
+        .entry(data.hash_table_id)
+        .or_insert_with(|| {
+            let config = HashTableConfig {
+                initial_buckets: 1024,
+                mem_budget: DEFAULT_MEM_BUDGET,
+                num_keys: data.num_keys,
+                collations: data.collations.clone(),
+            };
+            HashTable::new(config, pager.io.clone())
+        });
+
+    // Read key values from registers
+    let key_values = &mut state.distinct_key_values;
+    key_values.clear();
+    extend_from_registers(
+        &state.registers,
+        data.key_start_reg,
+        data.num_keys,
+        key_values,
+    );
+
+    let mut key_refs: SmallVec<[ValueRef; 2]> = SmallVec::with_capacity(data.num_keys);
+    key_refs.extend(key_values.iter().map(|v| v.as_ref()));
+    let hash = hash_join_key(&key_refs, &data.collations);
+
+    // Distinct aggregates: we need to check if the row already exists in the DISTINCT hash table.
+    // Determine starting point for DISTINCT checks based on re-entrant state.
+    // This is critical for correctness: if we yield mid-loop, we must resume
+    // from where we left off (not restart), otherwise already-inserted values
+    // would return "already exists" and we'd incorrectly skip their updates.
+    let start_agg_idx = match &state.op_hash_agg_step_state {
+        OpHashAggStepState::DistinctChecksDone {
+            hash_table_id,
+            key_values: cached_keys,
+        } if *hash_table_id == data.hash_table_id && *cached_keys == *key_values => {
+            // All DISTINCT checks done, skip to aggregation
+            usize::MAX
+        }
+        OpHashAggStepState::DistinctChecksInProgress {
+            hash_table_id,
+            key_values: cached_keys,
+            next_agg_idx,
+        } if *hash_table_id == data.hash_table_id && *cached_keys == *key_values => {
+            // Resume from where we yielded
+            *next_agg_idx
+        }
+        _ => {
+            // Start state or different row - initialize should_update buffer
+            state.hash_agg_should_update.clear();
+            state.hash_agg_should_update.resize(data.aggs.len(), true);
+            0
+        }
+    };
+
+    // Perform DISTINCT checks starting from start_agg_idx
+    if start_agg_idx < data.aggs.len() {
+        for agg_idx in start_agg_idx..data.aggs.len() {
+            if let Some(distinct_hash_table_id) = data.agg_distinct_hash_table_ids[agg_idx] {
+                let arg_start = data.agg_arg_start_regs[agg_idx];
+                let arg_count = data.agg_arg_counts[agg_idx];
+                let distinct_table = state
+                    .hash_tables
+                    .entry(distinct_hash_table_id)
+                    .or_insert_with(|| {
+                        let config = HashTableConfig {
+                            initial_buckets: 1024,
+                            mem_budget: DEFAULT_MEM_BUDGET,
+                            num_keys: data.num_keys + arg_count,
+                            collations: data.agg_distinct_collations[agg_idx].clone(),
+                        };
+                        HashTable::new(config, pager.io.clone())
+                    });
+
+                // Reuse scratch buffer for distinct key building: group keys + agg args
+                let distinct_key_values = &mut state.hash_agg_distinct_keys;
+                distinct_key_values.clear();
+                distinct_key_values.extend_from_slice(key_values.as_slice());
+                extend_from_registers(&state.registers, arg_start, arg_count, distinct_key_values);
+                let dist_key_refs: Vec<ValueRef> =
+                    distinct_key_values.iter().map(|v| v.as_ref()).collect();
+
+                match distinct_table.insert_distinct(distinct_key_values, &dist_key_refs)? {
+                    IOResult::Done(inserted) => {
+                        if !inserted {
+                            state.hash_agg_should_update[agg_idx] = false;
+                        }
+                    }
+                    IOResult::IO(io) => {
+                        // Yield mid-loop - save progress to resume later
+                        state.op_hash_agg_step_state =
+                            OpHashAggStepState::DistinctChecksInProgress {
+                                hash_table_id: data.hash_table_id,
+                                key_values: key_values.clone(),
+                                next_agg_idx: agg_idx,
+                            };
+                        return Ok(InsnFunctionStepResult::IO(io));
+                    }
+                }
+            }
+        }
+
+        // All DISTINCT checks completed
+        state.op_hash_agg_step_state = OpHashAggStepState::DistinctChecksDone {
+            hash_table_id: data.hash_table_id,
+            key_values: key_values.clone(),
+        };
+    }
+
+    let should_update = &state.hash_agg_should_update;
+
+    let hash_table = state
+        .hash_tables
+        .get_mut(&data.hash_table_id)
+        .expect("hash table must exist");
+
+    if let Some(entry) = hash_table.find_entry_mut(hash, &key_refs) {
+        let mut payload_offset = 0;
+        for (agg_idx, agg) in data.aggs.iter().enumerate() {
+            let len = hash_agg_payload_len(agg);
+            turso_assert!(
+                len > 0,
+                "aggregate {agg:?} should not use hash aggregation (len=0)"
+            );
+            if should_update[agg_idx] {
+                step_aggregate(
+                    &state.registers,
+                    agg,
+                    data.agg_arg_start_regs[agg_idx],
+                    data.agg_arg_counts[agg_idx],
+                    data.agg_collations[agg_idx],
+                    &mut entry.payload_values[payload_offset..payload_offset + len],
+                )?;
+            }
+            payload_offset += len;
+        }
+        // Success - reset state for next row
+        state.op_hash_agg_step_state = OpHashAggStepState::Start;
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    }
+
+    // Entry doesn't exist - create new one
+    let mut payload = Vec::new();
+    for (agg_idx, agg) in data.aggs.iter().enumerate() {
+        init_agg_payload(agg, &mut payload)?;
+        let len = hash_agg_payload_len(agg);
+        turso_assert!(
+            len > 0,
+            "aggregate {agg:?} should not use hash aggregation (len=0)"
+        );
+        if should_update[agg_idx] {
+            let start = payload.len() - len;
+            step_aggregate(
+                &state.registers,
+                agg,
+                data.agg_arg_start_regs[agg_idx],
+                data.agg_arg_counts[agg_idx],
+                data.agg_collations[agg_idx],
+                &mut payload[start..],
+            )?;
+        }
+    }
+
+    match hash_table.insert_group_entry(hash, key_values.clone(), payload)? {
+        IOResult::Done(()) => {
+            // Success - reset state for next row
+            state.op_hash_agg_step_state = OpHashAggStepState::Start;
+            state.pc += 1;
+            Ok(InsnFunctionStepResult::Step)
+        }
+        IOResult::IO(io) => {
+            // IO yield - state is already cached (DistinctChecksDone)
+            Ok(InsnFunctionStepResult::IO(io))
+        }
+    }
 }
 
 pub fn op_hash_agg_init(
     _program: &Program,
-    _state: &mut ProgramState,
-    _insn: &Insn,
+    state: &mut ProgramState,
+    insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
-    todo!("HashAggInit execution to be implemented")
+    load_insn!(HashAggInit { hash_table_id }, insn);
+    if let Some(table) = state.hash_tables.get_mut(hash_table_id) {
+        table.reset_agg_iter();
+    }
+    state.hash_agg_emit_state = None;
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
 }
 
 pub fn op_hash_agg_next(
     _program: &Program,
-    _state: &mut ProgramState,
-    _insn: &Insn,
-    _pager: &Arc<Pager>,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
-    todo!("HashAggNext execution to be implemented")
+    load_insn!(HashAggNext { data }, insn);
+    let Some(table) = state.hash_tables.get_mut(&data.hash_table_id) else {
+        state.pc = data.target_pc.as_offset_int();
+        return Ok(InsnFunctionStepResult::Step);
+    };
+
+    if table.is_spilled() {
+        let mut emit_state = state.hash_agg_emit_state.take().unwrap_or_default();
+        if emit_state.hash_table_id != data.hash_table_id {
+            emit_state = HashAggEmitState {
+                hash_table_id: data.hash_table_id,
+                partition_idx: 0,
+                entries: Vec::new(),
+                entry_idx: 0,
+            };
+        }
+
+        loop {
+            if emit_state.entry_idx < emit_state.entries.len() {
+                let entry = emit_state.entries[emit_state.entry_idx].clone();
+                emit_state.entry_idx += 1;
+                state.hash_agg_emit_state = Some(emit_state);
+
+                for i in 0..data.num_keys {
+                    state.registers[data.key_dest_reg + i] =
+                        Register::Value(entry.key_values[i].clone());
+                }
+                let mut payload_offset = 0;
+                for (agg_idx, agg) in data.aggs.iter().enumerate() {
+                    let len = data.agg_payload_values_count[agg_idx];
+                    if len == 0 {
+                        state.registers[data.agg_dest_reg + agg_idx] = Register::Value(Value::Null);
+                        continue;
+                    }
+                    let value = finalize_agg_payload(
+                        agg,
+                        &entry.payload_values[payload_offset..payload_offset + len],
+                    )?;
+                    state.registers[data.agg_dest_reg + agg_idx] = Register::Value(value);
+                    payload_offset += len;
+                }
+                state.pc += 1;
+                return Ok(InsnFunctionStepResult::Step);
+            }
+
+            if emit_state.partition_idx >= NUM_PARTITIONS {
+                state.hash_agg_emit_state = None;
+                state.pc = data.target_pc.as_offset_int();
+                return Ok(InsnFunctionStepResult::Step);
+            }
+
+            let partition_idx = emit_state.partition_idx;
+            match table.load_partition_entries(partition_idx)? {
+                IOResult::IO(io) => {
+                    state.hash_agg_emit_state = Some(emit_state);
+                    return Ok(InsnFunctionStepResult::IO(io));
+                }
+                IOResult::Done(entries) => {
+                    emit_state.partition_idx += 1;
+                    if entries.is_empty() {
+                        continue;
+                    }
+                    // Temporary hash table for merging partial aggregates from a single spilled
+                    // partition. Use effectively unlimited budget since we're already processing
+                    // spilled data and can't recursively spill during merge.
+                    let mut agg_table = HashTable::new(
+                        HashTableConfig {
+                            initial_buckets: 1024,
+                            mem_budget: usize::MAX / 4,
+                            num_keys: data.num_keys,
+                            collations: data.key_collations.clone(),
+                        },
+                        pager.io.clone(),
+                    );
+                    for entry in entries {
+                        let key_refs: Vec<ValueRef> =
+                            entry.key_values.iter().map(|v| v.as_ref()).collect();
+                        if let Some(existing) = agg_table.find_entry_mut(entry.hash, &key_refs) {
+                            let mut payload_offset = 0;
+                            for (agg_idx, agg) in data.aggs.iter().enumerate() {
+                                let len = data.agg_payload_values_count[agg_idx];
+                                if len == 0 {
+                                    continue;
+                                }
+                                merge_agg_payload(
+                                    agg,
+                                    &mut existing.payload_values
+                                        [payload_offset..payload_offset + len],
+                                    &entry.payload_values[payload_offset..payload_offset + len],
+                                    data.agg_collations[agg_idx],
+                                )?;
+                                payload_offset += len;
+                            }
+                        } else {
+                            match agg_table.insert_group_entry(
+                                entry.hash,
+                                entry.key_values.clone(),
+                                entry.payload_values.clone(),
+                            )? {
+                                IOResult::Done(()) => {}
+                                IOResult::IO(_) => unreachable!("merge table has unlimited budget"),
+                            }
+                        }
+                    }
+                    emit_state.entries = agg_table.drain_entries();
+                    emit_state.entry_idx = 0;
+                }
+            }
+        }
+    }
+
+    match table.next_agg_entry()? {
+        IOResult::IO(io) => Ok(InsnFunctionStepResult::IO(io)),
+        IOResult::Done(None) => {
+            state.pc = data.target_pc.as_offset_int();
+            Ok(InsnFunctionStepResult::Step)
+        }
+        IOResult::Done(Some(entry)) => {
+            for i in 0..data.num_keys {
+                state.registers[data.key_dest_reg + i] =
+                    Register::Value(entry.key_values[i].clone());
+            }
+            let mut payload_offset = 0;
+            for (agg_idx, agg) in data.aggs.iter().enumerate() {
+                let len = data.agg_payload_values_count[agg_idx];
+                if len == 0 {
+                    state.registers[data.agg_dest_reg + agg_idx] = Register::Value(Value::Null);
+                    continue;
+                }
+                let value = finalize_agg_payload(
+                    agg,
+                    &entry.payload_values[payload_offset..payload_offset + len],
+                )?;
+                state.registers[data.agg_dest_reg + agg_idx] = Register::Value(value);
+                payload_offset += len;
+            }
+            state.pc += 1;
+            Ok(InsnFunctionStepResult::Step)
+        }
+    }
 }
 
 pub fn op_hash_build_finalize(
@@ -11698,5 +12310,47 @@ mod tests {
         let payload = vec![Value::Float(0.0), Value::Float(0.0), Value::Integer(0)];
         let result = finalize_agg_payload(&AggFunc::Avg, &payload).unwrap();
         assert_eq!(result, Value::Null);
+    }
+    #[test]
+    fn test_merge_count() {
+        let mut dest = vec![Value::Integer(5)];
+        let src = vec![Value::Integer(3)];
+        merge_agg_payload(&AggFunc::Count, &mut dest, &src, CollationSeq::Binary).unwrap();
+        assert_eq!(dest[0], Value::Integer(8));
+    }
+
+    #[test]
+    fn test_merge_min() {
+        // dest has smaller value - should keep it
+        let mut dest = vec![Value::Integer(3)];
+        let src = vec![Value::Integer(5)];
+        merge_agg_payload(&AggFunc::Min, &mut dest, &src, CollationSeq::Binary).unwrap();
+        assert_eq!(dest[0], Value::Integer(3));
+
+        // src has smaller value - should update
+        let mut dest = vec![Value::Integer(5)];
+        let src = vec![Value::Integer(3)];
+        merge_agg_payload(&AggFunc::Min, &mut dest, &src, CollationSeq::Binary).unwrap();
+        assert_eq!(dest[0], Value::Integer(3));
+    }
+
+    #[test]
+    fn test_merge_max() {
+        // src has larger value - should update
+        let mut dest = vec![Value::Integer(3)];
+        let src = vec![Value::Integer(5)];
+        merge_agg_payload(&AggFunc::Max, &mut dest, &src, CollationSeq::Binary).unwrap();
+        assert_eq!(dest[0], Value::Integer(5));
+    }
+
+    #[test]
+    fn test_merge_avg() {
+        // Merge two partial averages: (sum=10, r_err=0, count=2) and (sum=20, r_err=0, count=3)
+        // Result should be (sum=30, r_err=0, count=5)
+        let mut dest = vec![Value::Float(10.0), Value::Float(0.0), Value::Integer(2)];
+        let src = vec![Value::Float(20.0), Value::Float(0.0), Value::Integer(3)];
+        merge_agg_payload(&AggFunc::Avg, &mut dest, &src, CollationSeq::Binary).unwrap();
+        assert_eq!(dest[0], Value::Float(30.0));
+        assert_eq!(dest[2], Value::Integer(5));
     }
 }
