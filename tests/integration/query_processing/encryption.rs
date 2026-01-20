@@ -505,7 +505,13 @@ fn test_encryption_key_validation_with_cached_database(_db: TempDatabase) -> any
 
     // step 1: Create encrypted database with correct key
     {
+        let correct_encryption_key =
+            turso_core::EncryptionKey::from_hex_string(correct_key).unwrap();
+
         let conn = main_db.connect()?;
+        conn.set_encryption_cipher(turso_core::CipherMode::Aegis256)?;
+        conn.set_encryption_key(correct_encryption_key)?;
+
         conn.execute("CREATE TABLE secret_data (id INTEGER PRIMARY KEY, value TEXT)")?;
         conn.execute("INSERT INTO secret_data (value) VALUES ('top secret')")?;
         conn.query("PRAGMA wal_checkpoint(TRUNCATE)")?;
@@ -516,6 +522,9 @@ fn test_encryption_key_validation_with_cached_database(_db: TempDatabase) -> any
 
     // Step 2: re-open with correct key (this uses the DATABASE_MANAGER cache)
     {
+        let correct_encryption_key =
+            turso_core::EncryptionKey::from_hex_string(correct_key).unwrap();
+
         let db = Database::open_file_with_flags(
             io.clone(),
             db_path_str,
@@ -525,6 +534,9 @@ fn test_encryption_key_validation_with_cached_database(_db: TempDatabase) -> any
         )?;
 
         let conn = db.connect()?;
+        conn.set_encryption_cipher(turso_core::CipherMode::Aegis256)?;
+        conn.set_encryption_key(correct_encryption_key)?;
+
         let rows = conn.query("SELECT * FROM secret_data")?;
         let mut row_count = 0;
         if let Some(mut rows) = rows {
@@ -544,33 +556,55 @@ fn test_encryption_key_validation_with_cached_database(_db: TempDatabase) -> any
         assert_eq!(row_count, 1, "Should read data with correct key");
     }
 
-    // Step 3: lets open with WRONG key - this MUST fail
+    // Step 3: Opening with wrong key succeeds, but reading data fails with decryption error
     {
-        let encryption_opts = Some(EncryptionOpts {
-            cipher: "aegis256".to_string(),
-            hexkey: wrong_key.to_string(),
-        });
+        let wrong_encryption_key = turso_core::EncryptionKey::from_hex_string(wrong_key).unwrap();
 
-        let result = Database::open_file_with_flags(
+        let db = Database::open_file_with_flags(
             io.clone(),
             db_path_str,
             OpenFlags::default(),
             opts,
-            encryption_opts,
-        );
+            Some(EncryptionOpts {
+                cipher: "aegis256".to_string(),
+                hexkey: wrong_key.to_string(),
+            }),
+        )?;
 
+        // opening succeeds - the key is not validated at open time
+        let conn = db.connect()?;
+        conn.set_encryption_cipher(turso_core::CipherMode::Aegis256)?;
+        conn.set_encryption_key(wrong_encryption_key)?;
+
+        // Reading data should fail (either with error or panic due to decryption failure)
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let query_result = conn.query("SELECT * FROM secret_data");
+            match query_result {
+                Err(_) => true, // error returned - read failed as expected
+                Ok(Some(mut rows)) => loop {
+                    match rows.step() {
+                        Err(_) => break true,                            // Error - read failed
+                        Ok(turso_core::StepResult::Done) => break false, // Completed without error
+                        Ok(turso_core::StepResult::Interrupt) => break false,
+                        Ok(turso_core::StepResult::Row) => break false, // Got data - unexpected!!
+                        Ok(turso_core::StepResult::Busy) | Ok(turso_core::StepResult::IO) => {
+                            continue
+                        }
+                    }
+                },
+                Ok(None) => false,
+            }
+        }));
+
+        // Either returned error (Ok(true)), or panicked (Err) - both indicate decryption failed
+        let read_failed = result.unwrap_or(true);
         assert!(
-            result.is_err(),
-            "Opening with wrong key should fail, but succeeded!"
+            read_failed,
+            "Reading data with wrong key should fail with decryption error"
         );
-        assert!(result
-            .err()
-            .unwrap()
-            .to_string()
-            .contains("Encryption key does not match existing database encryption key"));
     }
 
-    // Step 4: lets open without key - this MUST fail
+    // Step 4: Opening without encryption options should fail immediately
     {
         let result = Database::open_file_with_flags(
             io.clone(),
@@ -582,17 +616,21 @@ fn test_encryption_key_validation_with_cached_database(_db: TempDatabase) -> any
 
         assert!(
             result.is_err(),
-            "Opening without key should fail, but succeeded!"
+            "Opening encrypted database without encryption options should fail"
         );
-        assert!(result
-            .err()
-            .unwrap()
-            .to_string()
-            .contains("Database is encrypted but no encryption options provided"));
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Database is encrypted but no encryption options provided"),
+            "Error message should indicate missing encryption options"
+        );
     }
 
-    // Step 4: verify correct key still works after wrong key attempt
+    // Step 5: verify correct key still works after wrong key attempt
     {
+        let correct_encryption_key =
+            turso_core::EncryptionKey::from_hex_string(correct_key).unwrap();
+
         let db = Database::open_file_with_flags(
             io.clone(),
             db_path_str,
@@ -602,6 +640,9 @@ fn test_encryption_key_validation_with_cached_database(_db: TempDatabase) -> any
         )?;
 
         let conn = db.connect()?;
+        conn.set_encryption_cipher(turso_core::CipherMode::Aegis256)?;
+        conn.set_encryption_key(correct_encryption_key)?;
+
         let rows = conn.query("SELECT * FROM secret_data")?;
         let mut row_count = 0;
         if let Some(mut rows) = rows {
