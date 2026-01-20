@@ -175,6 +175,10 @@ test autoinc-keyword-in-pk-clause {
 expect {
     3|345.0
 }
+# JS omits .0 for whole numbers
+expect @js {
+    3|345
+}
 
 # Test: AUTOINCREMENT fails if the primary key is not an INTEGER.
 test autoinc-fail-on-non-integer-pk {
