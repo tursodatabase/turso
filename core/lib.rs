@@ -250,6 +250,9 @@ static DATABASE_MANAGER: LazyLock<parking_lot::Mutex<HashMap<String, Weak<Databa
 
 /// The `Database` object contains per database file state that is shared
 /// between multiple connections.
+///
+/// Do that `Database` object is cached and can be long lived. DO NOT store anything sensitive like
+/// encryption key here.
 pub struct Database {
     mv_store: ArcSwapOption<MvStore>,
     schema: Mutex<Arc<Schema>>,
@@ -274,7 +277,6 @@ pub struct Database {
     init_page_1: Arc<ArcSwapOption<Page>>,
 
     // Encryption
-    encryption_key: RwLock<Option<EncryptionKey>>,
     encryption_cipher_mode: AtomicCipherMode,
 }
 
@@ -358,14 +360,11 @@ impl Database {
             BufferPool::DEFAULT_ARENA_SIZE
         };
 
-        let (encryption_key, encryption_cipher_mode) =
-            if let Some(encryption_opts) = encryption_opts {
-                let key = EncryptionKey::from_hex_string(&encryption_opts.hexkey)?;
-                let cipher = CipherMode::try_from(encryption_opts.cipher.as_str())?;
-                (Some(key), Some(cipher))
-            } else {
-                (None, None)
-            };
+        let encryption_cipher_mode = if let Some(encryption_opts) = encryption_opts {
+            Some(CipherMode::try_from(encryption_opts.cipher.as_str())?)
+        } else {
+            None
+        };
 
         let init_page_1 = if db_size == 0 {
             let default_page_1 = pager::default_page1(encryption_cipher_mode.as_ref());
@@ -394,7 +393,6 @@ impl Database {
 
             init_page_1: Arc::new(ArcSwapOption::new(init_page_1)),
 
-            encryption_key: RwLock::new(encryption_key),
             encryption_cipher_mode: AtomicCipherMode::new(
                 encryption_cipher_mode.unwrap_or(CipherMode::None),
             ),
@@ -472,33 +470,13 @@ impl Database {
         if let Some(db) = registry.get(&canonical_path).and_then(Weak::upgrade) {
             tracing::debug!("took database {canonical_path:?} from the registry");
 
-            // if we have encryption opts, let's ensure they match
-            {
-                let db_key_guard = db.encryption_key.read();
-                let db_key = db_key_guard.deref();
+            // Check encryption compatibility using cipher mode (key is not stored in Database for security)
+            let db_is_encrypted = !matches!(db.encryption_cipher_mode.get(), CipherMode::None);
 
-                match (&encryption_opts, db_key) {
-                    (Some(enc_opts), Some(key)) => {
-                        let expected_key = EncryptionKey::from_hex_string(&enc_opts.hexkey)?;
-                        if expected_key.as_slice() != key.as_slice() {
-                            return Err(LimboError::InvalidArgument(
-                                "Encryption key does not match existing database encryption key"
-                                    .to_string(),
-                            ));
-                        }
-                    }
-                    // user provided encryption opts but cached database doesn't have encryption_key set.
-                    // This can happen when encryption was set via PRAGMA (which doesn't update db.encryption_key).
-                    (Some(_), None) => {}
-                    // database is encrypted but user didn't provide encryption opts
-                    (None, Some(_)) => {
-                        return Err(LimboError::InvalidArgument(
-                            "Database is encrypted but no encryption options provided".to_string(),
-                        ));
-                    }
-                    // neither has encryption - OK
-                    (None, None) => {}
-                }
+            if db_is_encrypted && encryption_opts.is_none() {
+                return Err(LimboError::InvalidArgument(
+                    "Database is encrypted but no encryption options provided".to_string(),
+                ));
             }
 
             return Ok(db);
@@ -548,6 +526,13 @@ impl Database {
         opts: DatabaseOpts,
         encryption_opts: Option<EncryptionOpts>,
     ) -> Result<Arc<Database>> {
+        // Parse encryption key from encryption_opts if provided
+        let encryption_key = if let Some(ref enc_opts) = encryption_opts {
+            Some(EncryptionKey::from_hex_string(&enc_opts.hexkey)?)
+        } else {
+            None
+        };
+
         let mut db = Self::new(
             opts,
             flags,
@@ -574,7 +559,7 @@ impl Database {
         // Check: https://github.com/tursodatabase/turso/pull/1761#discussion_r2154013123
 
         // parse schema
-        let conn = db._connect(false, Some(pager.clone()))?;
+        let conn = db._connect(false, Some(pager.clone()), encryption_key.clone())?;
         let syms = conn.syms.read();
         let pager = conn.pager.load();
 
@@ -601,7 +586,7 @@ impl Database {
         })?;
 
         if let Some(mv_store) = db.get_mv_store().as_ref() {
-            let mvcc_bootstrap_conn = db._connect(true, Some(pager.clone()))?;
+            let mvcc_bootstrap_conn = db._connect(true, Some(pager.clone()), encryption_key)?;
             mv_store.bootstrap(mvcc_bootstrap_conn)?;
         }
 
@@ -784,7 +769,17 @@ impl Database {
 
     #[instrument(skip_all, level = Level::INFO)]
     pub fn connect(self: &Arc<Database>) -> Result<Arc<Connection>> {
-        self._connect(false, None)
+        self._connect(false, None, None)
+    }
+
+    /// Connect with an encryption key.
+    /// Use this when opening an encrypted database where the key is known at connect time.
+    #[instrument(skip_all, level = Level::INFO)]
+    pub fn connect_with_encryption(
+        self: &Arc<Database>,
+        encryption_key: Option<EncryptionKey>,
+    ) -> Result<Arc<Connection>> {
+        self._connect(false, None, encryption_key)
     }
 
     #[instrument(skip_all, level = Level::INFO)]
@@ -792,6 +787,7 @@ impl Database {
         self: &Arc<Database>,
         is_mvcc_bootstrap_connection: bool,
         pager: Option<Arc<Pager>>,
+        encryption_key: Option<EncryptionKey>,
     ) -> Result<Arc<Connection>> {
         let pager = if let Some(pager) = pager {
             pager
@@ -806,8 +802,13 @@ impl Database {
             .unwrap_or_default()
             .get();
 
-        let encryption_key = self.encryption_key.read().clone();
-        let encrytion_cipher = self.encryption_cipher_mode.get();
+        let encryption_cipher = self.encryption_cipher_mode.get();
+
+        // Set up encryption on the pager if encryption key is provided
+        // Header is not encrypted, so this is only needed before reading data pages
+        if let Some(ref key) = encryption_key {
+            pager.set_encryption_context(encryption_cipher, key)?;
+        }
 
         let conn = Arc::new(Connection {
             db: self.clone(),
@@ -834,8 +835,8 @@ impl Database {
             nestedness: AtomicI32::new(0),
             compiling_triggers: RwLock::new(Vec::new()),
             executing_triggers: RwLock::new(Vec::new()),
-            encryption_key: RwLock::new(encryption_key.clone()),
-            encryption_cipher_mode: AtomicCipherMode::new(encrytion_cipher),
+            encryption_key: RwLock::new(encryption_key),
+            encryption_cipher_mode: AtomicCipherMode::new(encryption_cipher),
             sync_mode: AtomicSyncMode::new(SyncMode::Full),
             data_sync_retry: AtomicBool::new(false),
             busy_handler: RwLock::new(BusyHandler::None),
@@ -940,7 +941,6 @@ impl Database {
 
     fn init_pager(&self, requested_page_size: Option<usize>) -> Result<Pager> {
         let cipher = self.encryption_cipher_mode.get();
-        let encryption_key = self.encryption_key.read();
         let reserved_bytes = self.maybe_get_reserved_space_bytes()?.or_else(|| {
             if !matches!(cipher, CipherMode::None) {
                 // For encryption, use the cipher's metadata size
@@ -993,11 +993,6 @@ impl Database {
         }
         if disable_checksums {
             pager.reset_checksum_context();
-        }
-        // Set encryption later after `disable_checksums` as it may reset the `pager.io_ctx`
-        if let Some(encryption_key) = encryption_key.as_ref() {
-            pager.enable_encryption(true);
-            pager.set_encryption_context(cipher, encryption_key)?;
         }
 
         Ok(pager)
