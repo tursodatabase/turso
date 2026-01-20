@@ -2111,6 +2111,7 @@ impl Pager {
 
     /// Set the schema cookie cache.
     pub fn set_schema_cookie(&self, cookie: Option<u32>) {
+        tracing::debug!("set_schema_cookie: cookie={:?}", cookie);
         let value = cookie.map_or(Self::SCHEMA_COOKIE_NOT_SET, |v| v as u64);
         self.schema_cookie.store(value, Ordering::SeqCst);
     }
@@ -2119,6 +2120,7 @@ impl Pager {
     pub fn get_schema_cookie(&self) -> Result<IOResult<u32>> {
         // Try to use cached value first
         if let Some(cookie) = self.get_schema_cookie_cached() {
+            tracing::debug!("get_schema_cookie: cached={cookie}");
             return Ok(IOResult::Done(cookie));
         }
         // If not cached, read from header and cache it
@@ -4246,6 +4248,11 @@ impl Pager {
         let header_ref = return_if_io!(HeaderRef::from_pager(self));
         let header = header_ref.borrow();
         // Update cached schema cookie when reading header
+        tracing::debug!(
+            "with_header: cookie={}, trace={:?}",
+            header.schema_cookie.get(),
+            std::backtrace::Backtrace::capture()
+        );
         self.set_schema_cookie(Some(header.schema_cookie.get()));
         Ok(IOResult::Done(f(header)))
     }
@@ -4255,6 +4262,11 @@ impl Pager {
         let header = header_ref.borrow_mut();
         let result = f(header);
         // Update cached schema cookie after modification
+        tracing::debug!(
+            "with_header_mut: cookie={}, trace={:?}",
+            header.schema_cookie.get(),
+            std::backtrace::Backtrace::capture()
+        );
         self.set_schema_cookie(Some(header.schema_cookie.get()));
         Ok(IOResult::Done(result))
     }

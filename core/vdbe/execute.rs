@@ -8124,6 +8124,11 @@ pub fn op_set_cookie(
                     program
                         .connection
                         .with_schema_mut(|schema| schema.schema_version = *value as u32);
+                    tracing::debug!(
+                        "op_set_cookie: before={}, after={}",
+                        header.schema_cookie,
+                        value
+                    );
                     header.schema_cookie = (*value as u32).into();
                 }
                 cookie => todo!("{cookie:?} is not yet implement for SetCookie"),
