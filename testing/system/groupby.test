@@ -4,7 +4,7 @@ set testdir [file dirname $argv0]
 source $testdir/tester.tcl
 
 do_execsql_test group_by {
-  select u.first_name, sum(u.age) from users u group by u.first_name limit 10;
+  select u.first_name, sum(u.age) from users u group by u.first_name order by u.first_name limit 10;
 } {Aaron|2271
 Abigail|890
 Adam|1642
@@ -17,7 +17,7 @@ Albert|369
 Alec|247}
 
 do_execsql_test group_by_without_aggs {
-  select u.first_name from users u group by u.first_name limit 10;
+  select u.first_name from users u group by u.first_name order by u.first_name limit 10;
 } {Aaron
 Abigail
 Adam
@@ -30,7 +30,7 @@ Albert
 Alec}
 
 do_execsql_test group_by_two_joined_columns {
-  select u.first_name, p.name, sum(u.age) from users u join products p on u.id = p.id group by u.first_name, p.name limit 10;
+  select u.first_name, p.name, sum(u.age) from users u join products p on u.id = p.id group by u.first_name, p.name order by u.first_name, p.name limit 10;
 } {Aimee|jeans|24
 Cindy|cap|37
 Daniel|coat|13
@@ -69,7 +69,7 @@ Matthew|boots|77
 Nicholas|shorts|89}
 
 do_execsql_test group_by_multiple_aggregates {
-  select u.first_name, sum(u.age), count(u.age) from users u group by u.first_name order by sum(u.age) limit 10;
+  select u.first_name, sum(u.age), count(u.age) from users u group by u.first_name order by sum(u.age), u.first_name limit 10;
 } {Jaclyn|1|1
 Mia|1|1
 Kirsten|7|1
@@ -112,7 +112,7 @@ Brian|5059
 William|5047}
 
 do_execsql_test group_by_and_binary_expression_that_depends_on_two_aggregates {
-  select u.first_name, sum(u.age) + count(1) from users u group by u.first_name limit 5;
+  select u.first_name, sum(u.age) + count(1) from users u group by u.first_name order by u.first_name limit 5;
 } {Aaron|2312
 Abigail|906
 Adam|1675
@@ -142,7 +142,7 @@ do_execsql_test group_by_function_expression_ridiculous {
 (31|35}
 
 do_execsql_test group_by_count_star {
-  select u.first_name, count(*) from users u group by u.first_name limit 1;
+  select u.first_name, count(*) from users u group by u.first_name order by u.first_name limit 1;
 } {Aaron|41}
 
 do_execsql_test group_by_count_star_in_expression {
@@ -168,7 +168,7 @@ do_execsql_test having_with_binary_cond {
 } {Robert|8109}
 
 do_execsql_test having_with_scalar_fn_over_aggregate {
-  select u.first_name, concat(count(1), ' people with this name') from users u group by u.first_name having count(1) > 50 order by count(1) asc limit 5;
+  select u.first_name, concat(count(1), ' people with this name') from users u group by u.first_name having count(1) > 50 order by count(1) asc, u.first_name limit 5;
 } {"Angela|51 people with this name
 Justin|51 people with this name
 Rachel|52 people with this name
@@ -195,7 +195,7 @@ do_execsql_test column_alias_in_group_by_order_by_having {
 William|111}
 
 do_execsql_test group_by_column_number {
-  select u.first_name, count(1) from users u group by 1 limit 1;
+  select u.first_name, count(1) from users u group by 1 order by 1 limit 1;
 } {Aaron|41}
 
 # There was a regression where we incorrectly removed SOME order by terms and left others in place, which is invalid and results in wrong rows being returned.
@@ -206,7 +206,7 @@ do_execsql_test groupby_orderby_removal_regression_test {
 3|Perry|1}
 
 do_execsql_test group_by_no_sorting_required {
-  select age, count(1) from users group by age limit 3;
+  select age, count(1) from users group by age order by age limit 3;
 } {1|112
 2|113
 3|97}
@@ -214,7 +214,7 @@ do_execsql_test group_by_no_sorting_required {
 # Compile-time constants are moved to the end of the program.
 # Verify that the jump to AggStep works correctly even when the location of the ',' constant has changed.
 do_execsql_test group_by_no_sorting_required_and_const_agg_arg {
-  select group_concat(state, ',') from users group by age limit 2;
+  select group_concat(state, ',') from users group by age order by age limit 2;
 } {CA,PW,ME,AS,LA,OH,AL,UT,WA,MO,WA,SC,AR,CO,OK,ME,FM,AR,CT,MT,TN,FL,MA,ND,LA,NE,KS,IN,RI,NH,IL,FM,WA,MH,RI,SC,AS,IL,VA,MI,ID,ME,WY,TN,IN,IN,UT,WA,AZ,VA,NM,IA,MP,WY,RI,OR,OR,FM,WA,DC,RI,GU,TX,HI,IL,TX,WY,OH,TX,CT,KY,NE,MH,AR,MN,IL,NH,HI,NV,UT,FL,MS,NM,NJ,CA,MS,GA,MT,GA,AL,IN,SC,PA,FL,CT,PA,GA,RI,HI,WV,VT,IA,PR,FM,MA,TX,MS,LA,MD,PA,TX,WY
 OR,SD,KS,MP,WA,VI,SC,SD,SD,MP,WA,MT,FM,IN,ME,OH,KY,RI,DC,MS,OK,VI,KY,MD,SC,OK,NY,WY,AK,MN,UT,NE,VA,MD,AZ,VI,SC,NV,IN,VA,HI,VI,MS,NE,WY,NY,GU,MT,AL,IA,VA,ND,MN,FM,IA,ID,IL,FL,PR,WA,AS,HI,NH,WI,FL,HI,AL,ID,DC,CT,IL,VT,AZ,VI,AK,PW,NC,SD,NV,WA,MO,MS,WY,VA,FM,MN,NH,MN,MT,TX,MS,FM,OH,GU,IN,WA,IA,PA,ID,MI,LA,GU,ND,AR,ND,WV,DC,NY,CO,CT,FM,CT,ND}
 
@@ -237,6 +237,7 @@ do_execsql_test distinct_agg_functions {
 select first_name, sum(distinct age), count(distinct age), avg(distinct age)
 from users
 group by 1
+order by 1
 limit 3;
 } {Aaron|1769|33|53.6060606060606
 Abigail|833|15|55.5333333333333
@@ -333,18 +334,18 @@ do_execsql_test proper-sort-order {
 	FROM users u
 	JOIN products p ON p.id = u.id
 	GROUP BY u.first_name
-	ORDER BY c DESC;
-} {Travis|1
-Tommy|1
-Rachel|1
-Nicholas|1
-Matthew|1
-Jennifer|1
-Jamie|1
-Edward|1
-Daniel|1
+	ORDER BY c DESC, u.first_name;
+} {Aimee|1
 Cindy|1
-Aimee|1}
+Daniel|1
+Edward|1
+Jamie|1
+Jennifer|1
+Matthew|1
+Nicholas|1
+Rachel|1
+Tommy|1
+Travis|1}
 
 # In GROUP BY clauses, column aliases take precedence when resolving identifiers to columns.
 do_execsql_test_on_specific_db {:memory:} group_by_alias_precedence {
