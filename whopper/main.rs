@@ -424,8 +424,20 @@ fn perform_work(
     let done = {
         let mut stmt_borrow = context.fibers[fiber_idx].statement.borrow_mut();
         if let Some(stmt) = stmt_borrow.as_mut() {
-            match stmt.step() {
-                Ok(result) => matches!(result, turso_core::StepResult::Done),
+            let step_result = {
+                let span = tracing::debug_span!(
+                    "fiber",
+                    fiber_idx = fiber_idx,
+                    state = format!("{:?}", context.fibers[fiber_idx].state)
+                );
+                let _enter = span.enter();
+                stmt.step()
+            };
+            match step_result {
+                Ok(result) => {
+                    tracing::debug!("fiber: {} {:?}", fiber_idx, result);
+                    matches!(result, turso_core::StepResult::Done)
+                }
                 Err(e) => {
                     match e {
                         turso_core::LimboError::SchemaUpdated => {
@@ -516,7 +528,7 @@ fn perform_work(
                 if let Ok(stmt) = context.fibers[fiber_idx].connection.prepare(begin_cmd) {
                     context.fibers[fiber_idx].statement.replace(Some(stmt));
                     context.fibers[fiber_idx].state = FiberState::InTx;
-                    trace!("{} {}", fiber_idx, begin_cmd);
+                    trace!("fiber: {} {}", fiber_idx, begin_cmd);
                 }
             } else if action == 30 {
                 // Integrity check
@@ -526,7 +538,7 @@ fn perform_work(
                 {
                     context.fibers[fiber_idx].statement.replace(Some(stmt));
                     context.stats.integrity_checks += 1;
-                    trace!("{} PRAGMA integrity_check", fiber_idx);
+                    trace!("fiber: {} PRAGMA integrity_check", fiber_idx);
                 }
             }
         }
@@ -542,7 +554,7 @@ fn perform_work(
                     {
                         context.fibers[fiber_idx].statement.replace(Some(stmt));
                     }
-                    trace!("{} SELECT: {}", fiber_idx, select.to_string());
+                    trace!("fiber: {} SELECT: {}", fiber_idx, select.to_string());
                 }
                 10..=39 => {
                     // INSERT (30%)
@@ -554,7 +566,7 @@ fn perform_work(
                         context.fibers[fiber_idx].statement.replace(Some(stmt));
                         context.stats.inserts += 1;
                     }
-                    trace!("{} INSERT: {}", fiber_idx, insert.to_string());
+                    trace!("fiber: {} INSERT: {}", fiber_idx, insert.to_string());
                 }
                 40..=59 => {
                     // UPDATE (20%)
@@ -566,7 +578,7 @@ fn perform_work(
                         context.fibers[fiber_idx].statement.replace(Some(stmt));
                         context.stats.updates += 1;
                     }
-                    trace!("{} UPDATE: {}", fiber_idx, update.to_string());
+                    trace!("fiber: {} UPDATE: {}", fiber_idx, update.to_string());
                 }
                 60..=69 => {
                     // DELETE (10%)
@@ -578,7 +590,7 @@ fn perform_work(
                         context.fibers[fiber_idx].statement.replace(Some(stmt));
                         context.stats.deletes += 1;
                     }
-                    trace!("{} DELETE: {}", fiber_idx, delete.to_string());
+                    trace!("fiber: {} DELETE: {}", fiber_idx, delete.to_string());
                 }
                 70..=71 => {
                     // CREATE INDEX (2%)
@@ -592,7 +604,7 @@ fn perform_work(
                                 create_index.index_name.clone(),
                             ));
                         }
-                        trace!("{} CREATE INDEX: {}", fiber_idx, sql);
+                        trace!("fiber: {} CREATE INDEX: {}", fiber_idx, sql);
                     }
                 }
                 72..=73 => {
@@ -608,7 +620,7 @@ fn perform_work(
                         if let Ok(stmt) = context.fibers[fiber_idx].connection.prepare(&sql) {
                             context.fibers[fiber_idx].statement.replace(Some(stmt));
                         }
-                        trace!("{} DROP INDEX: {}", fiber_idx, sql);
+                        trace!("fiber: {} DROP INDEX: {}", fiber_idx, sql);
                     }
                 }
                 74..=86 => {
@@ -617,7 +629,7 @@ fn perform_work(
                         context.fibers[fiber_idx].statement.replace(Some(stmt));
                         context.fibers[fiber_idx].state = FiberState::Idle;
                     }
-                    trace!("{} COMMIT", fiber_idx);
+                    trace!("fiber: {} COMMIT", fiber_idx);
                 }
                 87..=99 => {
                     // ROLLBACK (13%)
@@ -625,7 +637,7 @@ fn perform_work(
                         context.fibers[fiber_idx].statement.replace(Some(stmt));
                         context.fibers[fiber_idx].state = FiberState::Idle;
                     }
-                    trace!("{} ROLLBACK", fiber_idx);
+                    trace!("fiber: {} ROLLBACK", fiber_idx);
                 }
                 _ => {}
             }
