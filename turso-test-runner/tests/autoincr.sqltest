@@ -1,93 +1,121 @@
-#!/usr/bin/env tclsh
-
-set testdir [file dirname $argv0]
-source $testdir/tester.tcl
-
+@database :memory:
 
 # Test: Create an AUTOINCREMENT table and verify sqlite_sequence is also created.
-do_execsql_test_on_specific_db {:memory:} autoinc-create-sequence-table {
+test autoinc-create-sequence-table {
     CREATE TABLE t1(x INTEGER PRIMARY KEY AUTOINCREMENT, y);
     SELECT name FROM sqlite_master WHERE type='table' ORDER BY name;
-} {sqlite_sequence t1}
+}
+expect {
+    sqlite_sequence
+    t1
+}
 
 # Test: The sqlite_sequence table is initially empty after table creation.
-do_execsql_test_on_specific_db {:memory:} autoinc-sequence-table-is-initially-empty {
+test autoinc-sequence-table-is-initially-empty {
     CREATE TABLE t1(x INTEGER PRIMARY KEY AUTOINCREMENT, y);
     SELECT * FROM sqlite_sequence;
-} {}
+}
+expect {
+}
 
 # Test: You cannot drop the sqlite_sequence table.
-do_execsql_test_in_memory_any_error autoinc-fail-drop-sequence-table {
+test autoinc-fail-drop-sequence-table {
     CREATE TABLE t1(x INTEGER PRIMARY KEY AUTOINCREMENT, y);
     DROP TABLE sqlite_sequence;
 }
+expect error {
+}
 
 # Test: You cannot create an index on the sqlite_sequence table.
-do_execsql_test_in_memory_any_error autoinc-fail-index-sequence-table {
+test autoinc-fail-index-sequence-table {
     CREATE TABLE t1(x INTEGER PRIMARY KEY AUTOINCREMENT, y);
     CREATE INDEX seqidx ON sqlite_sequence(name);
 }
+expect error {
+}
 
 # Test: First insert populates sqlite_sequence.
-do_execsql_test_on_specific_db {:memory:} autoinc-first-insert-populates-sequence {
+test autoinc-first-insert-populates-sequence {
     CREATE TABLE t1(x INTEGER PRIMARY KEY AUTOINCREMENT, y);
     INSERT INTO t1 VALUES(12,34);
     SELECT * FROM sqlite_sequence;
-} {t1|12}
+}
+expect {
+    t1|12
+}
 
 # Test: Inserting a value larger than the current sequence updates the sequence.
-do_execsql_test_on_specific_db {:memory:} autoinc-larger-insert-updates-sequence {
+test autoinc-larger-insert-updates-sequence {
     CREATE TABLE t1(x INTEGER PRIMARY KEY AUTOINCREMENT, y);
     INSERT INTO t1 VALUES(12,34);
     INSERT INTO t1 VALUES(123,456);
     SELECT * FROM sqlite_sequence;
-} {t1|123}
+}
+expect {
+    t1|123
+}
 
 # Test: Inserting NULL generates a key one greater than the max.
-do_execsql_test_on_specific_db {:memory:} autoinc-null-insert-increments-sequence {
+test autoinc-null-insert-increments-sequence {
     CREATE TABLE t1(x INTEGER PRIMARY KEY AUTOINCREMENT, y);
     INSERT INTO t1 VALUES(123,456);
     INSERT INTO t1 VALUES(NULL,567);
     SELECT * FROM sqlite_sequence;
-} {t1|124}
+}
+expect {
+    t1|124
+}
 
 # Test: Sequence value is not decreased after a DELETE.
-do_execsql_test_on_specific_db {:memory:} autoinc-sequence-not-decremented-by-delete {
+test autoinc-sequence-not-decremented-by-delete {
     CREATE TABLE t1(x INTEGER PRIMARY KEY AUTOINCREMENT, y);
     INSERT INTO t1 VALUES(123,456);
     INSERT INTO t1 VALUES(NULL,567);
     DELETE FROM t1 WHERE y=567;
     SELECT * FROM sqlite_sequence;
-} {t1|124}
+}
+expect {
+    t1|124
+}
 
 # Test: A NULL insert after a DELETE continues from the previous high-water mark.
-do_execsql_test_on_specific_db {:memory:} autoinc-insert-after-delete-uses-high-water-mark {
+test autoinc-insert-after-delete-uses-high-water-mark {
     CREATE TABLE t1(x INTEGER PRIMARY KEY AUTOINCREMENT, y);
     INSERT INTO t1 VALUES(125, 1);
     DELETE FROM t1;
     INSERT INTO t1 VALUES(NULL, 2);
     SELECT x FROM t1;
-} {126}
+}
+expect {
+    126
+}
 
 # Test: Clearing a table does not reset the sequence.
-do_execsql_test_on_specific_db {:memory:} autoinc-delete-all-does-not-reset-sequence {
+test autoinc-delete-all-does-not-reset-sequence {
     CREATE TABLE t1(x INTEGER PRIMARY KEY AUTOINCREMENT, y);
     INSERT INTO t1 VALUES(125, 456);
     DELETE FROM t1;
     SELECT * FROM sqlite_sequence;
-} {t1|125}
+}
+expect {
+    t1|125
+}
 
 # Test: Manually updating the sequence table affects the next generated key.
-do_execsql_test_on_specific_db {:memory:} autoinc-manual-update-to-sequence-table {
+test autoinc-manual-update-to-sequence-table {
     CREATE TABLE t1(x INTEGER PRIMARY KEY AUTOINCREMENT, y);
     INSERT INTO t1 VALUES(1, 1);
     UPDATE sqlite_sequence SET seq=1234 WHERE name='t1';
     INSERT INTO t1 VALUES(NULL, 2);
     SELECT * FROM t1 ORDER BY x;
-} {1|1 1235|2}
+}
+expect {
+    1|1 
+    1235|2
+}
 
 # Test: AUTOINCREMENT works for multiple tables independently.
-do_execsql_test_on_specific_db {:memory:} autoinc-multiple-tables {
+test autoinc-multiple-tables {
     CREATE TABLE t1(x INTEGER PRIMARY KEY AUTOINCREMENT, y);
     CREATE TABLE t2(d, e INTEGER PRIMARY KEY AUTOINCREMENT, f);
     CREATE TABLE t3(g INTEGER PRIMARY KEY AUTOINCREMENT, h);
@@ -97,89 +125,119 @@ do_execsql_test_on_specific_db {:memory:} autoinc-multiple-tables {
     INSERT INTO t3(h) VALUES('d');
     INSERT INTO t1(x) VALUES(100);
     SELECT name, seq FROM sqlite_sequence ORDER BY name;
-} {t1|100 t2|2 t3|1}
+}
+expect {
+    t1|100 
+    t2|2 
+    t3|1
+}
 
 # Test: Dropping an AUTOINCREMENT table removes its entry from sqlite_sequence.
-do_execsql_test_on_specific_db {:memory:} autoinc-drop-table-removes-sequence-entry {
+test autoinc-drop-table-removes-sequence-entry {
     CREATE TABLE t1(x INTEGER PRIMARY KEY AUTOINCREMENT, y);
     CREATE TABLE t2(d, e INTEGER PRIMARY KEY AUTOINCREMENT, f);
     INSERT INTO t1(y) VALUES('a');
     INSERT INTO t2(d) VALUES('b');
     DROP TABLE t1;
     SELECT name FROM sqlite_sequence;
-} {t2}
+}
+expect {
+    t2
+}
 
 # Test: When the last AUTOINCREMENT table is dropped, the sequence table remains but is empty.
-do_execsql_test_on_specific_db {:memory:} autoinc-drop-last-table-empties-sequence {
+test autoinc-drop-last-table-empties-sequence {
     CREATE TABLE t1(x INTEGER PRIMARY KEY AUTOINCREMENT, y);
     DROP TABLE t1;
     SELECT * FROM sqlite_sequence;
-} {}
+}
+expect {
+}
 
 # Test: AUTOINCREMENT fails if the maximum rowid is reached. (Assumes 64-bit rowid)
-do_execsql_test_in_memory_any_error autoinc-fail-on-max-rowid {
+test autoinc-fail-on-max-rowid {
     CREATE TABLE t6(v INTEGER PRIMARY KEY AUTOINCREMENT, w);
     INSERT INTO t6 VALUES(9223372036854775807, 1);
     INSERT INTO t6 VALUES(NULL, 2);
 }
+expect error {
+}
 
 # Test: AUTOINCREMENT keyword is allowed in a separate PRIMARY KEY clause.
-do_execsql_test_on_specific_db {:memory:} autoinc-keyword-in-pk-clause {
+test autoinc-keyword-in-pk-clause {
     CREATE TABLE t7(x INTEGER, y REAL, PRIMARY KEY(x AUTOINCREMENT));
     INSERT INTO t7(y) VALUES(123);
     INSERT INTO t7(y) VALUES(234);
     DELETE FROM t7;
     INSERT INTO t7(y) VALUES(345);
     SELECT * FROM t7;
-} {3|345.0}
+}
+expect {
+    3|345.0
+}
 
 # Test: AUTOINCREMENT fails if the primary key is not an INTEGER.
-do_execsql_test_in_memory_any_error autoinc-fail-on-non-integer-pk {
+test autoinc-fail-on-non-integer-pk {
     CREATE TABLE t8(x TEXT PRIMARY KEY AUTOINCREMENT);
+}
+expect error {
 }
 
 # Test: An empty INSERT...SELECT does not damage the sequence table. (Ticket #3148)
-do_execsql_test_on_specific_db {:memory:} autoinc-empty-insert-select-is-safe {
+test autoinc-empty-insert-select-is-safe {
     CREATE TABLE t2(x INTEGER PRIMARY KEY AUTOINCREMENT, y);
     INSERT INTO t2 VALUES(NULL, 1);
     CREATE TABLE t3(a INTEGER PRIMARY KEY AUTOINCREMENT, b);
     INSERT INTO t3 SELECT * FROM t2 WHERE y > 1;
     SELECT * FROM sqlite_sequence WHERE name='t3';
-} {t3|0}
+}
+expect {
+    t3|0
+}
 
 # Test: AUTOINCREMENT with the xfer optimization. (Ticket 7b3328086a5c1)
-do_execsql_test_on_specific_db {:memory:} autoinc-with-xfer-optimization {
+test autoinc-with-xfer-optimization {
     CREATE TABLE t10a(a INTEGER PRIMARY KEY AUTOINCREMENT, b UNIQUE);
     INSERT INTO t10a VALUES(888,9999);
     CREATE TABLE t10b(x INTEGER PRIMARY KEY AUTOINCREMENT, y UNIQUE);
     INSERT INTO t10b SELECT * FROM t10a;
     SELECT * FROM sqlite_sequence ORDER BY name;
-} {t10a|888 t10b|888}
+}
+expect {
+    t10a|888 
+    t10b|888
+}
 
 # Test: AUTOINCREMENT works correctly with UPSERT.
-do_execsql_test_on_specific_db {:memory:} autoinc-with-upsert {
+test autoinc-with-upsert {
     CREATE TABLE t11(a INTEGER PRIMARY KEY AUTOINCREMENT, b UNIQUE);
     INSERT INTO t11(a,b) VALUES(2,3),(5,6),(4,3),(1,2)
-        ON CONFLICT(b) DO UPDATE SET a=a+1000;
+    ON CONFLICT(b) DO UPDATE SET a=a+1000;
     SELECT seq FROM sqlite_sequence WHERE name='t11';
-} {5}
-
+}
+expect {
+    5
+}
 
 # refer https://github.com/tursodatabase/turso/pull/2983#issuecomment-3322404270 was discovered while adding autoincr to fuzz tests
-if {![is_turso_mvcc]} {
-    do_execsql_test_on_specific_db {:memory:} autoinc-conflict-on-nothing {
-        CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, k TEXT);
-        CREATE UNIQUE INDEX idx_k_partial ON t(k) WHERE id > 1;
-        INSERT INTO t (k) VALUES ('a');
-        INSERT INTO t (k) VALUES ('a');
-        INSERT INTO t (k) VALUES ('a') ON CONFLICT DO NOTHING;
-        INSERT INTO t (k) VALUES ('b');
-        SELECT * FROM t ORDER BY id;
-    } {1|a 2|a 4|b}
+@skip-if mvcc "not supported in MVCC mode"
+test autoinc-conflict-on-nothing {
+    CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, k TEXT);
+    CREATE UNIQUE INDEX idx_k_partial ON t(k) WHERE id > 1;
+    INSERT INTO t (k) VALUES ('a');
+    INSERT INTO t (k) VALUES ('a');
+    INSERT INTO t (k) VALUES ('a') ON CONFLICT DO NOTHING;
+    INSERT INTO t (k) VALUES ('b');
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    1|a 
+    2|a 
+    4|b
 }
 
 # https://github.com/tursodatabase/turso/issues/3664
-do_execsql_test_on_specific_db {:memory:} autoinc-skips-manually-updated-pk {
+test autoinc-skips-manually-updated-pk {
     CREATE TABLE t(a INTEGER PRIMARY KEY AUTOINCREMENT);
     INSERT INTO t DEFAULT VALUES;
     select * from sqlite_sequence;
@@ -187,6 +245,10 @@ do_execsql_test_on_specific_db {:memory:} autoinc-skips-manually-updated-pk {
     SELECT * FROM sqlite_sequence;
     INSERT INTO t DEFAULT VALUES;
     SELECT * FROM sqlite_sequence;
-} {t|1
-t|1
-t|3}
+}
+expect {
+    t|1
+    t|1
+    t|3
+}
+

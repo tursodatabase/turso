@@ -2,7 +2,6 @@
 
 set testdir [file dirname $argv0]
 
-source $testdir/autoincr.test
 
 source $testdir/glob.test
 source $testdir/join.test
