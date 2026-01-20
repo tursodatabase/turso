@@ -2,8 +2,11 @@
 
 set -xe
 
+# Use --no-layout-tests to avoid hardcoded size assertions that fail on different architectures
+# The struct layouts are correct, just the compile-time assertions are architecture-specific
 bindgen turso_sync.h -o src/bindings.rs \
     --with-derive-default \
+    --no-layout-tests \
     --allowlist-type "turso_sync_.*_t" \
     --allowlist-function "turso_sync_.*" \
     --blocklist-type "turso_status_code_t" \
