@@ -9,6 +9,7 @@
   "source": "src/index.ts",
   "files": [
     "src",
+    "lib",
     "libs",
     "cpp",
     "ios",
