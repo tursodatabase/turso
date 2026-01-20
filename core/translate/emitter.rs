@@ -13,7 +13,8 @@ use turso_parser::ast::{
 use super::aggregation::emit_ungrouped_aggregation;
 use super::expr::translate_expr;
 use super::group_by::{
-    group_by_agg_phase, group_by_emit_row_phase, init_group_by, GroupByMetadata, GroupByRowSource,
+    group_by_agg_phase, group_by_emit_hash_agg_phase, group_by_emit_row_phase, init_group_by,
+    GroupByMetadata, GroupByRowSource,
 };
 use super::main_loop::{
     close_loop, emit_loop, init_distinct, init_loop, open_loop, LeftJoinMetadata, LoopLabels,
@@ -1103,8 +1104,12 @@ pub fn emit_query<'a>(
             .row_source;
         if matches!(row_source, GroupByRowSource::Sorter { .. }) {
             group_by_agg_phase(program, t_ctx, plan)?;
+            group_by_emit_row_phase(program, t_ctx, plan)?;
+        } else if matches!(row_source, GroupByRowSource::HashAgg { .. }) {
+            group_by_emit_hash_agg_phase(program, t_ctx, plan)?;
+        } else {
+            group_by_emit_row_phase(program, t_ctx, plan)?;
         }
-        group_by_emit_row_phase(program, t_ctx, plan)?;
     } else if !plan.aggregates.is_empty() {
         // Handle aggregation without GROUP BY (or HAVING without GROUP BY)
         emit_ungrouped_aggregation(program, t_ctx, plan)?;

@@ -1,4 +1,3 @@
-use smallvec::SmallVec;
 use std::{cmp::Ordering, collections::HashMap, marker::PhantomData, sync::Arc};
 use turso_parser::ast::{
     self, FrameBound, FrameClause, FrameExclude, FrameMode, ResolveType, SortOrder, SubqueryType,
@@ -397,7 +396,7 @@ pub struct DistinctCtx {
     /// Hash table id used to deduplicate results.
     pub hash_table_id: usize,
     /// Collations for each distinct key column.
-    pub collations: SmallVec<[CollationSeq; 2]>,
+    pub collations: Vec<CollationSeq>,
     /// The label for the on conflict branch.
     /// When a duplicate is found, the program will jump to the offset this label points to.
     pub label_on_conflict: BranchOffset,
