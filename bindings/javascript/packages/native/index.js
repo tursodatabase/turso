@@ -508,7 +508,8 @@ if (!nativeBinding) {
   throw new Error(`Failed to load native binding`)
 }
 
-const { BatchExecutor, Database, Statement } = nativeBinding
+const { BatchExecutor, Database, Statement, EncryptionCipher } = nativeBinding
 export { BatchExecutor }
 export { Database }
 export { Statement }
+export { EncryptionCipher }
