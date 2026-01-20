@@ -1,6 +1,5 @@
 @database :memory:
-# for now only run these on rust so we don't have to deal with adding triggers to JS
-
+@requires-file trigger "trigger tests require trigger support"
 
 # =============================================================================
 # Trigger ON CONFLICT interaction tests
@@ -15,7 +14,6 @@
 # =============================================================================
 
 # Test: INSERT OR IGNORE with PRIMARY KEY conflict still fires BEFORE trigger
-@backend rust
 test insert-or-ignore-pk-fires-before-trigger {
     CREATE TABLE parent(id INTEGER PRIMARY KEY, val TEXT);
     CREATE TABLE log(msg TEXT);
@@ -32,7 +30,6 @@ expect {
 }
 
 # Test: INSERT OR IGNORE with UNIQUE constraint conflict still fires BEFORE trigger
-@backend rust
 test insert-or-ignore-unique-fires-before-trigger {
     CREATE TABLE t1(id INTEGER PRIMARY KEY, name TEXT UNIQUE);
     CREATE TABLE log(msg TEXT);
@@ -51,7 +48,6 @@ expect {
 # Test: Nested INSERT OR IGNORE in trigger - OR IGNORE propagates to nested triggers
 # When trigger does INSERT OR IGNORE and the row exists, the BEFORE trigger fires
 # but the nested trigger's effects are silently ignored due to OR IGNORE propagation
-@backend rust
 test nested-insert-or-ignore-pk-in-trigger {
     CREATE TABLE parent(id INTEGER PRIMARY KEY, a INT, b INT);
     CREATE TABLE child(id INTEGER PRIMARY KEY, pid INT);
@@ -75,7 +71,6 @@ expect {
 }
 
 # Test: Nested INSERT OR IGNORE in trigger - OR IGNORE propagates (UNIQUE constraint)
-@backend rust
 test nested-insert-or-ignore-unique-in-trigger {
     CREATE TABLE parent(id UNIQUE, a INT, b INT);
     CREATE TABLE child(id INTEGER PRIMARY KEY, pid INT);
@@ -99,7 +94,6 @@ expect {
 }
 
 # Test: INSERT OR IGNORE with no conflict should fire BEFORE trigger normally
-@backend rust
 test insert-or-ignore-no-conflict-fires-trigger {
     CREATE TABLE t1(id INTEGER PRIMARY KEY, val TEXT);
     CREATE TABLE log(msg TEXT);
@@ -122,7 +116,6 @@ expect {
 # =============================================================================
 
 # Test: UPSERT DO UPDATE trigger with nested INSERT OR IGNORE should error on conflict
-@backend rust
 test upsert-do-update-trigger-insert-or-ignore-errors {
     CREATE TABLE t1(id INTEGER PRIMARY KEY, val INT);
     CREATE TABLE t2(id INTEGER PRIMARY KEY, ref_id INT);
@@ -137,7 +130,6 @@ expect error {
 }
 
 # Test: UPSERT DO UPDATE trigger with nested INSERT that doesn't conflict succeeds
-@backend rust
 test upsert-do-update-trigger-insert-no-conflict {
     CREATE TABLE t1(id INTEGER PRIMARY KEY, val INT);
     CREATE TABLE t2(id INTEGER PRIMARY KEY, ref_id INT);
@@ -155,7 +147,6 @@ expect {
 }
 
 # Test: Plain UPDATE trigger (not from UPSERT) allows INSERT OR IGNORE
-@backend rust
 test plain-update-trigger-insert-or-ignore-works {
     CREATE TABLE t1(id INTEGER PRIMARY KEY, val INT);
     CREATE TABLE t2(id INTEGER PRIMARY KEY, ref_id INT);
@@ -180,7 +171,6 @@ expect {
 # Test: Multiple levels of triggers with INSERT OR IGNORE
 # The nested INSERT OR IGNORE fires the BEFORE trigger on table 'a' even though
 # the row already exists and will be ignored
-@backend rust
 test multi-level-triggers-insert-or-ignore {
     CREATE TABLE a(id INTEGER PRIMARY KEY, val INT);
     CREATE TABLE b(id INTEGER PRIMARY KEY, a_id INT);
@@ -208,7 +198,6 @@ expect {
 }
 
 # Test: Trigger chain where inner INSERT OR IGNORE is properly skipped
-@backend rust
 test trigger-chain-insert-or-ignore-skipped {
     CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT);
     CREATE TABLE orders(id INTEGER PRIMARY KEY, user_id INT);
@@ -235,7 +224,6 @@ expect {
 # AFTER triggers should also respect OR IGNORE skipping
 # =============================================================================
 
-@backend rust
 test insert-or-ignore-pk-skips-after-trigger {
     CREATE TABLE t1(id INTEGER PRIMARY KEY, val TEXT);
     CREATE TABLE log(msg TEXT);
@@ -259,7 +247,6 @@ expect {
 # =============================================================================
 
 # Test: INSERT OR REPLACE should fire INSERT trigger but NOT DELETE trigger (by default)
-@backend rust
 test insert-or-replace-no-delete-trigger-by-default {
     CREATE TABLE t1(id INTEGER PRIMARY KEY, val TEXT);
     CREATE TABLE log(msg TEXT);

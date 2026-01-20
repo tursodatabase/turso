@@ -1,4 +1,5 @@
 @database :memory:
+@requires-file trigger "trigger tests require trigger support"
 
 # Basic CREATE TRIGGER
 test trigger-create-basic {
