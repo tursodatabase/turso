@@ -9,6 +9,7 @@ import java.io.InputStream;
 import java.sql.SQLException;
 import tech.turso.TursoErrorCode;
 import tech.turso.annotations.NativeInvocation;
+import tech.turso.annotations.Nullable;
 import tech.turso.annotations.VisibleForTesting;
 import tech.turso.utils.Logger;
 import tech.turso.utils.LoggerFactory;
@@ -181,15 +182,28 @@ public final class TursoDB implements AutoCloseable {
    * @param filePath e.g. path to file
    */
   public static TursoDB create(String url, String filePath) throws SQLException {
-    return new TursoDB(url, filePath);
+    return new TursoDB(url, filePath, null, null);
+  }
+
+  /**
+   * Creates a TursoDB instance with encryption support.
+   *
+   * @param url e.g. "jdbc:turso:fileName"
+   * @param filePath e.g. path to file
+   * @param cipher the encryption cipher to use
+   * @param hexkey the hex-encoded encryption key
+   */
+  public static TursoDB createWithEncryption(
+      String url, String filePath, TursoEncryptionCipher cipher, String hexkey) throws SQLException {
+    return new TursoDB(url, filePath, cipher, hexkey);
   }
 
   // TODO: receive config as argument
-  private TursoDB(String url, String filePath) throws SQLException {
+  private TursoDB(String url, String filePath, @Nullable TursoEncryptionCipher cipher, @Nullable String hexkey) throws SQLException {
     this.url = url;
     this.filePath = filePath;
     load();
-    open(0);
+    open(0, cipher != null ? cipher.getValue() : null, hexkey);
   }
 
   // TODO: add support for JNI
@@ -203,11 +217,12 @@ public final class TursoDB implements AutoCloseable {
     return this.isOpen;
   }
 
-  private void open(int openFlags) throws SQLException {
-    open0(filePath, openFlags);
+  private void open(int openFlags, @Nullable String cipher, @Nullable String hexkey) throws SQLException {
+    open0(filePath, openFlags, cipher, hexkey);
   }
 
-  private void open0(String filePath, int openFlags) throws SQLException {
+  private void open0(String filePath, int openFlags, @Nullable String cipher, @Nullable String hexkey)
+      throws SQLException {
     byte[] filePathBytes = stringToUtf8ByteArray(filePath);
     if (filePathBytes == null) {
       throw TursoExceptionUtils.buildTursoException(
@@ -215,11 +230,18 @@ public final class TursoDB implements AutoCloseable {
           "File path cannot be converted to byteArray. File name: " + filePath);
     }
 
-    dbPointer = openUtf8(filePathBytes, openFlags);
+    if (cipher != null && hexkey != null) {
+      dbPointer = openWithEncryptionUtf8(filePathBytes, openFlags, cipher, hexkey);
+    } else {
+      dbPointer = openUtf8(filePathBytes, openFlags);
+    }
     isOpen = true;
   }
 
   private native long openUtf8(byte[] file, int openFlags) throws SQLException;
+
+  private native long openWithEncryptionUtf8(byte[] file, int openFlags, String cipher, String hexkey)
+      throws SQLException;
 
   public long connect() throws SQLException {
     return connect0(dbPointer);
