@@ -47,7 +47,8 @@ function formatValue(value) {
         if (Number.isInteger(value)) {
             return value.toString();
         }
-        // For floats, limit to 15 significant digits to match SQLite default
+        // SQLite uses %.15g format (15 significant digits, trailing zeros removed)
+        // toPrecision gives significant digits, parseFloat removes trailing zeros
         return parseFloat(value.toPrecision(15)).toString();
     }
     if (value instanceof Uint8Array || Buffer.isBuffer(value)) {
