@@ -194,12 +194,15 @@ public final class TursoDB implements AutoCloseable {
    * @param hexkey the hex-encoded encryption key
    */
   public static TursoDB createWithEncryption(
-      String url, String filePath, TursoEncryptionCipher cipher, String hexkey) throws SQLException {
+      String url, String filePath, TursoEncryptionCipher cipher, String hexkey)
+      throws SQLException {
     return new TursoDB(url, filePath, cipher, hexkey);
   }
 
   // TODO: receive config as argument
-  private TursoDB(String url, String filePath, @Nullable TursoEncryptionCipher cipher, @Nullable String hexkey) throws SQLException {
+  private TursoDB(
+      String url, String filePath, @Nullable TursoEncryptionCipher cipher, @Nullable String hexkey)
+      throws SQLException {
     this.url = url;
     this.filePath = filePath;
     load();
@@ -217,11 +220,13 @@ public final class TursoDB implements AutoCloseable {
     return this.isOpen;
   }
 
-  private void open(int openFlags, @Nullable String cipher, @Nullable String hexkey) throws SQLException {
+  private void open(int openFlags, @Nullable String cipher, @Nullable String hexkey)
+      throws SQLException {
     open0(filePath, openFlags, cipher, hexkey);
   }
 
-  private void open0(String filePath, int openFlags, @Nullable String cipher, @Nullable String hexkey)
+  private void open0(
+      String filePath, int openFlags, @Nullable String cipher, @Nullable String hexkey)
       throws SQLException {
     byte[] filePathBytes = stringToUtf8ByteArray(filePath);
     if (filePathBytes == null) {
@@ -240,8 +245,8 @@ public final class TursoDB implements AutoCloseable {
 
   private native long openUtf8(byte[] file, int openFlags) throws SQLException;
 
-  private native long openWithEncryptionUtf8(byte[] file, int openFlags, String cipher, String hexkey)
-      throws SQLException;
+  private native long openWithEncryptionUtf8(
+      byte[] file, int openFlags, String cipher, String hexkey) throws SQLException;
 
   public long connect() throws SQLException {
     return connect0(dbPointer);

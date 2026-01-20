@@ -43,8 +43,8 @@ public final class TursoConnection {
   }
 
   /**
-   * Creates a connection using an existing TursoDB instance.
-   * This is useful for encrypted databases created with TursoDB.createWithEncryption().
+   * Creates a connection using an existing TursoDB instance. This is useful for encrypted databases
+   * created with TursoDB.createWithEncryption().
    *
    * @param url e.g. "jdbc:turso:fileName"
    * @param database an existing TursoDB instance
