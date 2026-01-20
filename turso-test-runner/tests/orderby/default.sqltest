@@ -1,0 +1,303 @@
+@database :default:
+@database :default-no-rowidalias:
+
+test basic-order-by {
+    select * from products order by price;
+}
+expect {
+    10|coat|8.85709624556419
+    3|shirt|22.7209470048471
+    5|sweatshirt|23.8100541984648
+    2|cap|32.2475410444338
+    8|sneakers|36.1006791183673
+    11|accessories|47.5875632652657
+    7|jeans|47.9379799632405
+    6|shorts|50.0363795824125
+    9|boots|59.7782771700224
+    4|sweater|68.9227440029754
+    1|hat|82.9389679823547
+}
+
+test basic-order-by-2 {
+    select * from products order by price desc;
+}
+expect {
+    1|hat|82.9389679823547
+    4|sweater|68.9227440029754
+    9|boots|59.7782771700224
+    6|shorts|50.0363795824125
+    7|jeans|47.9379799632405
+    11|accessories|47.5875632652657
+    8|sneakers|36.1006791183673
+    2|cap|32.2475410444338
+    5|sweatshirt|23.8100541984648
+    3|shirt|22.7209470048471
+    10|coat|8.85709624556419
+}
+
+test basic-order-by-and-limit {
+    select * from products order by name limit 5;
+}
+expect {
+    11|accessories|47.5875632652657
+    9|boots|59.7782771700224
+    2|cap|32.2475410444338
+    10|coat|8.85709624556419
+    1|hat|82.9389679823547
+}
+
+test basic-order-by-and-limit-2 {
+    select * from products order by name desc limit 5;
+}
+expect {
+    5|sweatshirt|23.8100541984648
+    4|sweater|68.9227440029754
+    8|sneakers|36.1006791183673
+    6|shorts|50.0363795824125
+    3|shirt|22.7209470048471
+}
+
+test basic-order-by-and-limit-2-2 {
+    select id, name from products order by name limit 5;
+}
+expect {
+    11|accessories
+    9|boots
+    2|cap
+    10|coat
+    1|hat
+}
+
+test basic-order-by-and-limit-2-3 {
+    select id, name from products order by name desc limit 5;
+}
+expect {
+    5|sweatshirt
+    4|sweater
+    8|sneakers
+    6|shorts
+    3|shirt
+}
+
+test basic-order-by-and-limit-3 {
+    select price, name from products where price > 70 order by name;
+}
+expect {
+    82.9389679823547|hat
+}
+
+test basic-order-by-and-limit-3-2 {
+    select price, name from products where price > 70 order by name desc;
+}
+expect {
+    82.9389679823547|hat
+}
+
+test order-by-qualified {
+    select u.first_name from users u order by u.first_name limit 1;
+}
+expect {
+    Aaliyah
+}
+
+test order-by-qualified-2 {
+    select u.first_name from users u order by u.first_name desc limit 1;
+}
+expect {
+    Zula
+}
+
+test order-by-column-number {
+    select first_name, last_name, age from users order by 3,2 limit 2;
+}
+expect {
+    Pamela|Aufderhar|1
+    Vernice|Blick|1
+}
+
+test order-by-column-number-2 {
+    select first_name, last_name, age from users order by 3 desc, 2 asc limit 2;
+}
+expect {
+    Carroll|Beatty|100
+    Morton|Bechtelar|100
+}
+
+test order-by-column-number-3 {
+    select first_name, last_name, age from users order by 3 asc, 2 desc limit 2;
+}
+expect {
+    Elouise|Zboncak|1
+    Kale|Wolff|1
+}
+
+test order-by-column-number-4 {
+    select first_name, last_name, age from users order by 3 asc, 2 desc limit 10;
+}
+expect {
+    Elouise|Zboncak|1
+    Kale|Wolff|1
+    Donna|Willms|1
+    Corine|Wilderman|1
+    Murl|Wiegand|1
+    Ron|West|1
+    Elyse|Weimann|1
+    Ettie|Weimann|1
+    Reanna|Ward|1
+    Greta|Walter|1
+}
+
+test order-by-case-insensitive-aggregate {
+    select u.first_name, sum(u.age) from users u group by u.first_name order by SUM(u.aGe) desc limit 10;
+}
+expect {
+    Rocky|616
+    Amely|616
+    Daren|597
+    Rosemary|591
+    America|575
+    Trystan|549
+    Morton|547
+    Sheldon|535
+    Neha|515
+    Garnett|515
+}
+
+test order-by-agg-not-mentioned-in-select {
+    select u.first_name, length(group_concat(u.last_name)) from users u group by u.first_name order by max(u.email) desc limit 5;
+}
+expect {
+    Karley|19
+    Lonnie|36
+    Kristofer|39
+    Koby|26
+    Kailyn|47
+}
+
+test case-insensitive-alias {
+    select u.first_name as fF, count(1) > 0 as cC from users u where fF = 'Jamie' group by fF order by cC;
+}
+expect {
+    Jamie|1
+}
+
+test age_idx_order_desc {
+    select first_name from users order by age desc, first_name asc limit 3;
+}
+expect {
+    Adolfo
+    Aisha
+    Althea
+}
+
+test rowid_or_integer_pk_desc {
+    select first_name from users order by id desc limit 3;
+}
+expect {
+    Mazie
+    Allie
+    Nathaniel
+}
+
+# These two following tests may seem dumb but they verify that index scanning by age_idx doesn't drop any rows due to BTree bugs
+test orderby_asc_verify_rows {
+    select count(1) from (select * from users order by age desc)
+}
+expect {
+    10000
+}
+
+test orderby_desc_verify_rows {
+    select count(1) from (select * from users order by age desc)
+}
+expect {
+    10000
+}
+
+test orderby_desc_with_offset {
+    select first_name, age from users order by age desc, first_name asc limit 3 offset 666;
+}
+expect {
+    Osborne|94
+    Quinton|94
+    Rosalee|94
+}
+
+test orderby_desc_with_filter {
+    select first_name, age from users where age <= 50 order by age desc, first_name asc limit 5;
+}
+expect {
+    Abelardo|50
+    Adolf|50
+    Aiden|50
+    Antonette|50
+    Ariel|50
+}
+
+test orderby_asc_with_filter_range {
+    select first_name, age from users where age <= 50 and age >= 49 order by age asc limit 5;
+}
+expect {
+    Major|49
+    Maud|49
+    Randi|49
+    Hector|49
+    Edison|49
+}
+
+test orderby_desc_with_filter_id_lt {
+    select id from users where id < 6666 order by id desc limit 5;
+}
+expect {
+    6665
+    6664
+    6663
+    6662
+    6661
+}
+
+test orderby_desc_with_filter_id_le {
+    select id from users where id <= 6666 order by id desc limit 5;
+}
+expect {
+    6666
+    6665
+    6664
+    6663
+    6662
+}
+
+# regression test where backwards iteration used to hang indefinitely
+test orderby_desc_regression {
+    select count(1) from (select * from users where id < 100 order by id desc)
+}
+expect {
+    99
+}
+
+test orderby_desc_regression_verify_order {
+    select id from users where id < 100 order by id desc limit 3;
+}
+expect {
+    99
+    98
+    97
+}
+
+test order_by_column_deduplication {
+    select name, name, price from products order by name;
+}
+expect {
+    accessories|accessories|47.5875632652657
+    boots|boots|59.7782771700224
+    cap|cap|32.2475410444338
+    coat|coat|8.85709624556419
+    hat|hat|82.9389679823547
+    jeans|jeans|47.9379799632405
+    shirt|shirt|22.7209470048471
+    shorts|shorts|50.0363795824125
+    sneakers|sneakers|36.1006791183673
+    sweater|sweater|68.9227440029754
+    sweatshirt|sweatshirt|23.8100541984648
+}
+
