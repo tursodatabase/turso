@@ -76,6 +76,9 @@ pub struct GroupBy {
     pub exprs: Vec<ast::Expr>,
     /// sort order, if a sorter is required (= the columns aren't already in the correct order)
     pub sort_order: Option<Vec<SortOrder>>,
+    /// True when ORDER BY was eliminated because GROUP BY sorting provides the required order.
+    /// Hash aggregation cannot be used when this is true (even if sort_order is Some).
+    pub order_by_eliminated: bool,
     /// having clause split into a vec at 'AND' boundaries.
     pub having: Option<Vec<ast::Expr>>,
 }
@@ -414,7 +417,7 @@ impl DistinctCtx {
                 hash_table_id: self.hash_table_id,
                 key_start_reg: start_reg,
                 num_keys: num_regs,
-                collations: self.collations.clone(),
+                collations: self.collations.clone().into(),
                 target_pc: self.label_on_conflict,
             }),
         });

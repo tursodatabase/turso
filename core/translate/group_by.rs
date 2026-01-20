@@ -140,9 +140,10 @@ pub fn init_group_by<'a>(
         if std::env::var("TURSO_DISABLE_HASH_AGG").is_ok() {
             break 'hash_agg false;
         }
-        // If rows are already in GROUP BY order (no sort required), sort-stream is preferred
-        // (efficiency: no hash table overhead, streaming output, no spilling).
-        if group_by.sort_order.is_none() {
+        // If ORDER BY was eliminated because GROUP BY sorting provides the order, hash agg
+        // cannot be used (correctness). If rows are already in GROUP BY order, sort-stream
+        // is preferred anyway (efficiency: no hash table overhead, streaming output, no spilling).
+        if group_by.order_by_eliminated || group_by.sort_order.is_none() {
             break 'hash_agg false;
         }
         if plan.aggregates.is_empty() {

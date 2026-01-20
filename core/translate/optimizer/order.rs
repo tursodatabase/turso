@@ -138,6 +138,7 @@ pub fn compute_order_target(
             }
             // Now we can remove the ORDER BY from the query.
             order_by.clear();
+            group_by.order_by_eliminated = true;
 
             OrderTarget::maybe_from_iterator(
                 group_by
