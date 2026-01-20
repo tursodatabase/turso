@@ -1,7 +1,7 @@
 use either::Either;
 use turso_parser::ast::{Expr, Literal};
 
-use crate::{types::AsValueRef, Value, ValueRef};
+use crate::{numeric::format_float, types::AsValueRef, Value, ValueRef};
 
 /// # SQLite Column Type Affinities
 ///
@@ -185,7 +185,7 @@ impl Affinity {
                 // TEXT affinity: Convert numeric values to their text representation
                 match val {
                     ValueRef::Integer(i) => Some(Either::Right(Value::Text(i.to_string().into()))),
-                    ValueRef::Float(f) => Some(Either::Right(Value::Text(f.to_string().into()))),
+                    ValueRef::Float(f) => Some(Either::Right(Value::Text(format_float(f).into()))),
                     ValueRef::Text(_) => {
                         // If it's already text but looks numeric, ensure it's in canonical text form
                         if is_numeric_value(val) {
