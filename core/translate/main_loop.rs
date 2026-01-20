@@ -1,3 +1,4 @@
+use smallvec::smallvec;
 use turso_parser::ast::{Expr, SortOrder};
 
 use std::{borrow::Cow, collections::HashSet, sync::Arc};
@@ -90,7 +91,7 @@ pub fn init_distinct(program: &mut ProgramBuilder, plan: &SelectPlan) -> Result<
     let hash_table_id = program.alloc_hash_table_id();
     let ctx = DistinctCtx {
         hash_table_id,
-        collations,
+        collations: collations.into(),
         label_on_conflict: program.allocate_label(),
     };
 
@@ -133,7 +134,7 @@ pub fn init_loop(
             agg.args.len() == 1,
             "DISTINCT aggregate functions must have exactly one argument"
         );
-        let collations = vec![
+        let collations = smallvec![
             get_collseq_from_expr(&agg.original_expr, tables)?.unwrap_or(CollationSeq::Binary)
         ];
         let hash_table_id = program.alloc_hash_table_id();
@@ -740,7 +741,7 @@ fn emit_hash_build_phase(
             num_keys,
             hash_table_id,
             mem_budget: hash_join_op.mem_budget,
-            collations,
+            collations: collations.into(),
             payload_start_reg,
             num_payload,
         }),

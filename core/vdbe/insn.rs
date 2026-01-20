@@ -1,3 +1,4 @@
+use smallvec::SmallVec;
 use std::{
     num::{NonZero, NonZeroUsize},
     sync::Arc,
@@ -212,7 +213,7 @@ pub struct HashBuildData {
     pub num_keys: usize,
     pub hash_table_id: usize,
     pub mem_budget: usize,
-    pub collations: Vec<CollationSeq>,
+    pub collations: SmallVec<[CollationSeq; 2]>,
     /// Starting register for payload columns to store in the hash entry.
     /// When Some: payload_start_reg..payload_start_reg+num_payload-1 contain values to cache.
     pub payload_start_reg: Option<usize>,
@@ -226,7 +227,7 @@ pub struct HashDistinctData {
     pub hash_table_id: usize,
     pub key_start_reg: usize,
     pub num_keys: usize,
-    pub collations: Vec<CollationSeq>,
+    pub collations: SmallVec<[CollationSeq; 2]>,
     pub target_pc: BranchOffset,
 }
 

@@ -15,6 +15,7 @@ use crate::{
     CompletionError, Result,
 };
 use rapidhash::fast::RapidHasher;
+use smallvec::{smallvec, SmallVec};
 use std::cmp::{Eq, Ordering};
 use std::hash::Hasher;
 use std::{cell::RefCell, collections::VecDeque};
@@ -623,7 +624,7 @@ pub struct HashTableConfig {
     /// Number of keys in the join condition.
     pub num_keys: usize,
     /// Collation sequences for each join key.
-    pub collations: Vec<CollationSeq>,
+    pub collations: SmallVec<[CollationSeq; 2]>,
 }
 
 impl Default for HashTableConfig {
@@ -632,7 +633,7 @@ impl Default for HashTableConfig {
             initial_buckets: DEFAULT_BUCKETS,
             mem_budget: DEFAULT_MEM_BUDGET,
             num_keys: 1,
-            collations: vec![CollationSeq::Binary],
+            collations: smallvec![CollationSeq::Binary],
         }
     }
 }
@@ -812,7 +813,7 @@ pub struct HashTable {
     /// Number of join keys.
     num_keys: usize,
     /// Collation sequences for each join key.
-    collations: Vec<CollationSeq>,
+    collations: SmallVec<[CollationSeq; 2]>,
     /// Current state of the hash table.
     state: HashTableState,
     /// IO object for disk operations.
@@ -1909,7 +1910,7 @@ mod hashtests {
             initial_buckets: 4,
             mem_budget: 1024 * 1024,
             num_keys: 1,
-            collations: vec![CollationSeq::Binary],
+            collations: smallvec![CollationSeq::Binary],
         };
         let mut ht = HashTable::new(config, io);
 
@@ -1948,7 +1949,7 @@ mod hashtests {
             initial_buckets: 2, // Small number to force collisions
             mem_budget: 1024 * 1024,
             num_keys: 1,
-            collations: vec![CollationSeq::Binary],
+            collations: smallvec![CollationSeq::Binary],
         };
         let mut ht = HashTable::new(config, io);
 
@@ -1977,7 +1978,7 @@ mod hashtests {
             initial_buckets: 4,
             mem_budget: 1024 * 1024,
             num_keys: 1,
-            collations: vec![CollationSeq::Binary],
+            collations: smallvec![CollationSeq::Binary],
         };
         let mut ht = HashTable::new(config, io);
 
@@ -2194,7 +2195,7 @@ mod hashtests {
             // very small budget to force spill
             mem_budget: 1024,
             num_keys: 1,
-            collations: vec![CollationSeq::Binary],
+            collations: smallvec![CollationSeq::Binary],
         };
         let mut ht = HashTable::new(config, io);
 
@@ -2233,7 +2234,7 @@ mod hashtests {
             initial_buckets: 4,
             mem_budget: 8 * 1024,
             num_keys: 1,
-            collations: vec![CollationSeq::Binary],
+            collations: smallvec![CollationSeq::Binary],
         };
         let mut ht = HashTable::new(config, io);
 
@@ -2274,7 +2275,7 @@ mod hashtests {
             initial_buckets: 4,
             mem_budget: 8 * 1024,
             num_keys: 1,
-            collations: vec![CollationSeq::Binary],
+            collations: smallvec![CollationSeq::Binary],
         };
         let mut ht = HashTable::new(config, io);
 
@@ -2318,7 +2319,7 @@ mod hashtests {
             initial_buckets: 4,
             mem_budget: 1024 * 1024,
             num_keys: 1,
-            collations: vec![CollationSeq::Binary],
+            collations: smallvec![CollationSeq::Binary],
         };
         let mut ht = HashTable::new(config, io);
 
@@ -2369,7 +2370,7 @@ mod hashtests {
             initial_buckets: 4,
             mem_budget: 1024 * 1024,
             num_keys: 1,
-            collations: vec![CollationSeq::Binary],
+            collations: smallvec![CollationSeq::Binary],
         };
         let mut ht = HashTable::new(config, io);
 
@@ -2398,7 +2399,7 @@ mod hashtests {
             initial_buckets: 4,
             mem_budget: 1024 * 1024,
             num_keys: 2,
-            collations: vec![CollationSeq::Binary, CollationSeq::Binary],
+            collations: smallvec![CollationSeq::Binary, CollationSeq::Binary],
         };
         let mut ht = HashTable::new(config, io);
 
@@ -2440,7 +2441,7 @@ mod hashtests {
             initial_buckets: 4,
             mem_budget: 1024 * 1024,
             num_keys: 1,
-            collations: vec![CollationSeq::Binary],
+            collations: smallvec![CollationSeq::Binary],
         };
         let mut ht = HashTable::new(config, io);
 
@@ -2467,7 +2468,7 @@ mod hashtests {
             initial_buckets: 4,
             mem_budget: 1024 * 1024,
             num_keys: 1,
-            collations: vec![CollationSeq::Binary],
+            collations: smallvec![CollationSeq::Binary],
         };
         let mut ht = HashTable::new(config, io);
 
