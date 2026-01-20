@@ -1,6 +1,6 @@
 ---
 name: debugging
-description: How to debug tursodb using Bytecode comparison, logging, ThreadSanitizer, deterministic simulation
+description: How to debug tursodb using Bytecode comparison, logging, ThreadSanitizer, deterministic simulation, and corruption analysis tools
 ---
 # Debugging Guide
 
@@ -72,3 +72,9 @@ SEED=1234 ./testing/concurrent-simulator/bin/run
 - **Code generator** → bytecode from AST
 - **Virtual machine** → executes SQLite-compatible bytecode
 - **Storage layer** → B-tree operations, paging
+
+## Corruption Debugging
+
+For WAL corruption and database integrity issues, use the corruption debug tools in [scripts](./scripts).
+
+See [references/CORRUPTION-TOOLS.md](./references/CORRUPTION-TOOLS.md) for detailed usage.
