@@ -2967,19 +2967,12 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 Ok(index_info)
             }
         };
-        let mut last_was_schema_insert = false;
         loop {
             let next_rec = reader.next_record(&pager.io, &mut get_index_info)?;
 
+            tracing::trace!("next_rec {next_rec:?}");
             // Check if we need to reparse schema before processing this operation
             // This happens when transitioning from schema inserts to any other operation
-            let needs_reparse = last_was_schema_insert
-                && !matches!(&next_rec, StreamingResult::InsertTableRow { rowid, .. } if rowid.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID);
-            if needs_reparse {
-                connection.reparse_schema()?;
-                *connection.db.schema.lock() = connection.schema.read().clone();
-                last_was_schema_insert = false;
-            }
 
             match next_rec {
                 StreamingResult::InsertTableRow { row, rowid } => {
@@ -3024,7 +3017,10 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                         assert!(self.table_id_to_rootpage.get(&rowid.table_id).is_some(), "Logical log contains a row version insert with a table id {} that does not exist in the table_id_to_rootpage map: {:?}", rowid.table_id, self.table_id_to_rootpage.iter().collect::<Vec<_>>());
                     }
                     self.insert(tx_id, row)?;
-                    last_was_schema_insert = is_schema_row;
+                    if is_schema_row {
+                        connection.reparse_schema()?;
+                        *connection.db.schema.lock() = connection.schema.read().clone();
+                    }
                 }
                 StreamingResult::DeleteTableRow { row, rowid } => {
                     assert!(self.table_id_to_rootpage.get(&rowid.table_id).is_some(), "Logical log contains a row version delete with a table id that does not exist in the table_id_to_rootpage map: {}", rowid.table_id);
@@ -3043,12 +3039,6 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                     break;
                 }
             }
-        }
-
-        // Do a final reparse if the last operation was a schema insert
-        if last_was_schema_insert {
-            connection.reparse_schema()?;
-            *connection.db.schema.lock() = connection.schema.read().clone();
         }
 
         self.commit_load_tx(tx_id, &connection);
