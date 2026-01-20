@@ -872,6 +872,31 @@ fn test_mvcc_delete_then_reopen_no_checkpoint() {
     drop(conn);
     drop(tmp_db);
 
+    tracing::info!("Reopening database");
+    let tmp_db = TempDatabase::new_with_existent(&path);
+    let conn = tmp_db.connect_limbo();
+
+    verify_table_contents(&conn, vec![1, 3]);
+}
+
+#[test]
+fn test_mvcc_delete_then_reopen_no_checkpoint_2() {
+    let tmp_db = TempDatabase::new_with_mvcc("test_mvcc_delete_then_reopen_no_checkpoint.db");
+    let conn = tmp_db.connect_limbo();
+
+    execute_and_log(&conn, "CREATE TABLE t (x unique, y unique)").unwrap();
+    execute_and_log(
+        &conn,
+        "INSERT INTO t SELECT value, value * 10 FROM generate_series(1,3)",
+    )
+    .unwrap();
+    execute_and_log(&conn, "DELETE FROM t WHERE x = 2").unwrap();
+
+    let path = tmp_db.path.clone();
+    drop(conn);
+    drop(tmp_db);
+
+    tracing::info!("Reopening database");
     let tmp_db = TempDatabase::new_with_existent(&path);
     let conn = tmp_db.connect_limbo();
 
