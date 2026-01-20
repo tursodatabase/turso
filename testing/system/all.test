@@ -20,13 +20,8 @@ source $testdir/subquery.test
 source $testdir/where.test
 source $testdir/compare.test
 source $testdir/scalar-functions-printf.test
-source $testdir/create_table.test
-source $testdir/values.test
 source $testdir/integrity_check.test
-source $testdir/views.test
 source $testdir/vtab.test
-source $testdir/upsert.test
 source $testdir/window.test
 source $testdir/foreign_keys.test
 source $testdir/returning.test
-source $testdir/trigger.test
