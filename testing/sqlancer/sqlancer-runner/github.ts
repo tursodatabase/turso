@@ -263,7 +263,7 @@ git checkout ${this.GIT_HASH}
 
 \`\`\`bash
 git checkout ${this.GIT_HASH}
-docker build -f Dockerfile.sqlancer -t sqlancer-runner:${gitShortHash} --build-arg GIT_HASH=${this.GIT_HASH} .
+docker build -f testing/sqlancer/sqlancer-runner/Dockerfile.sqlancer -t sqlancer-runner:${gitShortHash} --build-arg GIT_HASH=${this.GIT_HASH} .
 docker run -e TIME_LIMIT_MINUTES=10 -e LOG_TO_STDOUT=true sqlancer-runner:${gitShortHash}
 \`\`\``;
 	}

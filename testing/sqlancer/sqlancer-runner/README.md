@@ -35,7 +35,7 @@ TIME_LIMIT_MINUTES=5 LOG_TO_STDOUT=true bun docker-entrypoint.sqlancer.ts
 
 ```bash
 # Build the image
-docker build -f Dockerfile.sqlancer -t sqlancer-runner:test --build-arg GIT_HASH=$(git rev-parse HEAD) .
+docker build -f testing/sqlancer/sqlancer-runner/Dockerfile.sqlancer -t sqlancer-runner:test --build-arg GIT_HASH=$(git rev-parse HEAD) .
 
 # Run with dry-run mode
 docker run -e TIME_LIMIT_MINUTES=5 -e LOG_TO_STDOUT=true sqlancer-runner:test
