@@ -12,7 +12,8 @@ use sql_generation::{
     },
 };
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::ops::Bound;
 use std::sync::Arc;
 use tracing::{debug, trace};
 use turso_core::{
@@ -74,6 +75,111 @@ impl<T> SamplesContainer<T> {
     }
 }
 
+/// A map backed by BTree that supports merge operations with tombstones.
+/// Tombstones mark deleted keys and are propagated during merge.
+#[derive(Debug, Clone)]
+pub struct MergableMap<K: Ord + Clone, V: Clone> {
+    /// None value represents a tombstone (deleted key)
+    data: BTreeMap<K, Option<V>>,
+}
+
+impl<K: Ord + Clone, V: Clone> Default for MergableMap<K, V> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<K: Ord + Clone, V: Clone> MergableMap<K, V> {
+    pub fn new() -> Self {
+        Self {
+            data: BTreeMap::new(),
+        }
+    }
+
+    /// Get a value by key. Returns None if key doesn't exist or is tombstoned.
+    pub fn get(&self, key: &K) -> Option<&V> {
+        self.data.get(key).and_then(|v| v.as_ref())
+    }
+
+    /// Insert a value. Removes any existing tombstone.
+    pub fn insert(&mut self, key: K, value: V) {
+        self.data.insert(key, Some(value));
+    }
+
+    /// Remove a key by inserting a tombstone.
+    pub fn remove(&mut self, key: &K) {
+        self.data.insert(key.clone(), None);
+    }
+
+    /// Check if a key exists (not tombstoned).
+    pub fn contains_key(&self, key: &K) -> bool {
+        self.data.get(key).is_some_and(|v| v.is_some())
+    }
+
+    /// Pick a random key-value pair within the given bounds.
+    /// Returns None if no live entries exist in the range.
+    pub fn pick_range(
+        &self,
+        lower: Bound<&K>,
+        upper: Bound<&K>,
+        rng: &mut ChaCha8Rng,
+    ) -> Option<(&K, &V)> {
+        let live_entries: Vec<_> = self
+            .data
+            .range((lower, upper))
+            .filter_map(|(k, v)| v.as_ref().map(|val| (k, val)))
+            .collect();
+
+        if live_entries.is_empty() {
+            None
+        } else {
+            let idx = rng.random_range(0..live_entries.len());
+            Some(live_entries[idx])
+        }
+    }
+
+    /// Pick a random key-value pair from the entire map.
+    pub fn pick(&self, rng: &mut ChaCha8Rng) -> Option<(&K, &V)> {
+        self.pick_range(Bound::Unbounded, Bound::Unbounded, rng)
+    }
+
+    /// Merge another map into this one.
+    /// Values from `other` overwrite values in `self`.
+    /// Tombstones from `other` are copied to `self`.
+    pub fn merge(&mut self, other: &Self) {
+        for (key, value) in &other.data {
+            self.data.insert(key.clone(), value.clone());
+        }
+    }
+
+    /// Get the number of live (non-tombstoned) entries.
+    pub fn len(&self) -> usize {
+        self.data.values().filter(|v| v.is_some()).count()
+    }
+
+    /// Check if the map has no live entries.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Iterate over live entries.
+    pub fn iter(&self) -> impl Iterator<Item = (&K, &V)> {
+        self.data
+            .iter()
+            .filter_map(|(k, v)| v.as_ref().map(|val| (k, val)))
+    }
+
+    /// Get all live keys.
+    pub fn keys(&self) -> impl Iterator<Item = &K> {
+        self.iter().map(|(k, _)| k)
+    }
+
+    /// Compact the map by removing tombstones.
+    pub fn compact(&mut self) {
+        self.data.retain(|_, v| v.is_some());
+    }
+}
+
 /// State of a simulator fiber.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FiberState {
@@ -86,21 +192,19 @@ pub enum FiberState {
 /// when calling `Arbitrary::arbitrary(rng, ctx)` which needs both `&mut rng` and `&ctx`.
 pub struct WorkloadContext<'a> {
     pub connection: &'a Arc<Connection>,
-    pub state: &'a mut FiberState,
+    pub fiber_state: &'a mut FiberState,
     pub statement: &'a RefCell<Option<Statement>>,
-    pub tables: &'a Vec<Table>,
-    pub indexes: &'a mut Vec<(String, String)>,
-    pub simple_tables: &'a mut Vec<String>,
-    /// Sample of inserted keys per table for use in selects
-    pub simple_tables_keys: &'a mut HashMap<String, SamplesContainer<String>>,
+    pub sim_state: &'a mut SimulatorState,
     pub stats: &'a mut Stats,
     pub opts: &'a Opts,
     pub enable_mvcc: bool,
+    /// Tables vec built from sim_state.tables for GenerationContext
+    tables_vec: Vec<Table>,
 }
 
 impl GenerationContext for WorkloadContext<'_> {
     fn tables(&self) -> &Vec<Table> {
-        self.tables
+        &self.tables_vec
     }
 
     fn opts(&self) -> &Opts {
@@ -151,7 +255,7 @@ pub struct BeginWorkload;
 
 impl Workload for BeginWorkload {
     fn init(&self, ctx: &mut WorkloadContext, rng: &mut ChaCha8Rng) -> anyhow::Result<bool> {
-        if *ctx.state != FiberState::Idle {
+        if *ctx.fiber_state != FiberState::Idle {
             return Ok(false);
         }
         let cmd = if ctx.enable_mvcc {
@@ -164,7 +268,7 @@ impl Workload for BeginWorkload {
             "BEGIN"
         };
         ctx.prepare(cmd);
-        *ctx.state = FiberState::InTx;
+        *ctx.fiber_state = FiberState::InTx;
         debug!("BEGIN: {}", cmd);
         Ok(true)
     }
@@ -175,7 +279,7 @@ pub struct IntegrityCheckWorkload;
 
 impl Workload for IntegrityCheckWorkload {
     fn init(&self, ctx: &mut WorkloadContext, _rng: &mut ChaCha8Rng) -> anyhow::Result<bool> {
-        if *ctx.state != FiberState::Idle {
+        if *ctx.fiber_state != FiberState::Idle {
             return Ok(false);
         }
         ctx.prepare("PRAGMA integrity_check");
@@ -191,14 +295,14 @@ pub struct CreateSimpleTableWorkload;
 impl Workload for CreateSimpleTableWorkload {
     fn init(&self, ctx: &mut WorkloadContext, rng: &mut ChaCha8Rng) -> anyhow::Result<bool> {
         // Only create tables outside of transactions
-        if *ctx.state != FiberState::Idle {
+        if *ctx.fiber_state != FiberState::Idle {
             return Ok(false);
         }
         let table_name = format!("simple_kv_{}", rng.random_range(0..100000));
         let sql =
             format!("CREATE TABLE IF NOT EXISTS {table_name} (key TEXT PRIMARY KEY, value BLOB)");
         ctx.prepare(&sql);
-        ctx.simple_tables.push(table_name.clone());
+        ctx.sim_state.simple_tables.insert(table_name.clone(), ());
         debug!("CREATE SIMPLE TABLE: {}", table_name);
         Ok(true)
     }
@@ -209,15 +313,18 @@ pub struct SimpleSelectWorkload;
 
 impl Workload for SimpleSelectWorkload {
     fn init(&self, ctx: &mut WorkloadContext, rng: &mut ChaCha8Rng) -> anyhow::Result<bool> {
-        if ctx.simple_tables.is_empty() {
+        if ctx.sim_state.simple_tables.is_empty() {
             return Ok(false);
         }
-        let table_idx = rng.random_range(0..ctx.simple_tables.len());
-        let table_name = ctx.simple_tables[table_idx].clone();
+        let table_name = match ctx.sim_state.simple_tables.pick(rng) {
+            Some((name, _)) => name.clone(),
+            None => return Ok(false),
+        };
 
         // 70% chance to use a known inserted key if available
         let key = if rng.random_bool(0.7) {
-            ctx.simple_tables_keys
+            ctx.sim_state
+                .simple_tables_keys
                 .get(&table_name)
                 .and_then(|keys| keys.pick(rng).cloned())
                 .unwrap_or_else(|| format!("key_{}", rng.random_range(0..10000)))
@@ -242,11 +349,13 @@ const MAX_SAMPLE_KEYS_PER_TABLE: usize = 1000;
 
 impl Workload for SimpleInsertWorkload {
     fn init(&self, ctx: &mut WorkloadContext, rng: &mut ChaCha8Rng) -> anyhow::Result<bool> {
-        if ctx.simple_tables.is_empty() {
+        if ctx.sim_state.simple_tables.is_empty() {
             return Ok(false);
         }
-        let table_idx = rng.random_range(0..ctx.simple_tables.len());
-        let table_name = ctx.simple_tables[table_idx].clone();
+        let table_name = match ctx.sim_state.simple_tables.pick(rng) {
+            Some((name, _)) => name.clone(),
+            None => return Ok(false),
+        };
         let key = format!("key_{}", rng.random_range(0..10000));
         let value_len = rng.random_range(10..100);
         let value: String = (0..value_len)
@@ -262,7 +371,8 @@ impl Workload for SimpleInsertWorkload {
         ctx.stats.inserts += 1;
 
         // Remember the key for later selects
-        ctx.simple_tables_keys
+        ctx.sim_state
+            .simple_tables_keys
             .entry(table_name.clone())
             .or_insert_with(|| SamplesContainer::new(MAX_SAMPLE_KEYS_PER_TABLE))
             .add(key.clone(), rng);
@@ -335,10 +445,10 @@ impl Workload for CreateIndexWorkload {
         let create_index = CreateIndex::arbitrary(rng, ctx);
         let sql = create_index.to_string();
         ctx.prepare(&sql);
-        ctx.indexes.push((
-            create_index.index.table_name.clone(),
+        ctx.sim_state.indexes.insert(
             create_index.index_name.clone(),
-        ));
+            create_index.index.table_name.clone(),
+        );
         debug!("CREATE INDEX: {}", sql);
         Ok(true)
     }
@@ -349,11 +459,15 @@ pub struct DropIndexWorkload;
 
 impl Workload for DropIndexWorkload {
     fn init(&self, ctx: &mut WorkloadContext, rng: &mut ChaCha8Rng) -> anyhow::Result<bool> {
-        if ctx.indexes.is_empty() {
+        if ctx.sim_state.indexes.is_empty() {
             return Ok(false);
         }
-        let index_idx = rng.random_range(0..ctx.indexes.len());
-        let (table_name, index_name) = ctx.indexes.remove(index_idx);
+        let (index_name, table_name) = match ctx.sim_state.indexes.pick(rng) {
+            Some((idx_name, tbl_name)) => (idx_name.clone(), tbl_name.clone()),
+            None => return Ok(false),
+        };
+        // Mark index as removed (tombstone)
+        ctx.sim_state.indexes.remove(&index_name);
         let drop_index = DropIndex {
             table_name,
             index_name,
@@ -371,7 +485,7 @@ pub struct WalCheckpointWorkload;
 impl Workload for WalCheckpointWorkload {
     fn init(&self, ctx: &mut WorkloadContext, rng: &mut ChaCha8Rng) -> anyhow::Result<bool> {
         // Checkpoint should only run when not in a transaction
-        if *ctx.state != FiberState::Idle {
+        if *ctx.fiber_state != FiberState::Idle {
             return Ok(false);
         }
         let mode = match rng.random_range(0..4) {
@@ -392,11 +506,11 @@ pub struct CommitWorkload;
 
 impl Workload for CommitWorkload {
     fn init(&self, ctx: &mut WorkloadContext, _rng: &mut ChaCha8Rng) -> anyhow::Result<bool> {
-        if *ctx.state != FiberState::InTx {
+        if *ctx.fiber_state != FiberState::InTx {
             return Ok(false);
         }
         ctx.prepare("COMMIT");
-        *ctx.state = FiberState::Idle;
+        *ctx.fiber_state = FiberState::Idle;
         debug!("COMMIT");
         Ok(true)
     }
@@ -407,11 +521,11 @@ pub struct RollbackWorkload;
 
 impl Workload for RollbackWorkload {
     fn init(&self, ctx: &mut WorkloadContext, _rng: &mut ChaCha8Rng) -> anyhow::Result<bool> {
-        if *ctx.state != FiberState::InTx {
+        if *ctx.fiber_state != FiberState::InTx {
             return Ok(false);
         }
         ctx.prepare("ROLLBACK");
-        *ctx.state = FiberState::Idle;
+        *ctx.fiber_state = FiberState::Idle;
         debug!("ROLLBACK");
         Ok(true)
     }
@@ -569,13 +683,41 @@ struct SimulatorFiber {
     execution_id: Option<u64>,
 }
 
+/// Shared state for simulator that can be accessed by workloads.
+#[derive(Debug, Clone)]
+pub struct SimulatorState {
+    /// Schema tables
+    pub tables: MergableMap<String, Table>,
+    /// Active indexes: index_name -> table_name
+    pub indexes: MergableMap<String, String>,
+    /// Simple key-value tables for SimpleSelectWorkload/SimpleInsertWorkload
+    pub simple_tables: MergableMap<String, ()>,
+    /// Sample of inserted keys per table for use in selects
+    pub simple_tables_keys: HashMap<String, SamplesContainer<String>>,
+}
+
+impl SimulatorState {
+    pub fn new(tables: Vec<Table>, indexes: Vec<(String, String)>) -> Self {
+        let mut table_map = MergableMap::new();
+        for table in &tables {
+            table_map.insert(table.name.clone(), table.clone());
+        }
+        let mut index_map = MergableMap::new();
+        for (table_name, index_name) in indexes {
+            index_map.insert(index_name, table_name);
+        }
+        Self {
+            tables: table_map,
+            indexes: index_map,
+            simple_tables: MergableMap::new(),
+            simple_tables_keys: HashMap::new(),
+        }
+    }
+}
+
 struct SimulatorContext {
     fibers: Vec<SimulatorFiber>,
-    tables: Vec<Table>,
-    indexes: Vec<(String, String)>,
-    simple_tables: Vec<String>,
-    /// Sample of inserted keys per table for use in selects
-    simple_tables_keys: HashMap<String, SamplesContainer<String>>,
+    state: SimulatorState,
     enable_mvcc: bool,
 }
 
@@ -676,15 +818,14 @@ impl Whopper {
 
         bootstrap_conn.close()?;
 
+        let indexes_vec: Vec<(String, String)> = indexes
+            .iter()
+            .map(|idx| (idx.table_name.clone(), idx.index_name.clone()))
+            .collect();
+
         let context = SimulatorContext {
             fibers: vec![],
-            tables,
-            indexes: indexes
-                .iter()
-                .map(|idx| (idx.table_name.clone(), idx.index_name.clone()))
-                .collect(),
-            simple_tables: vec![],
-            simple_tables_keys: HashMap::new(),
+            state: SimulatorState::new(tables, indexes_vec),
             enable_mvcc: opts.enable_mvcc,
         };
 
@@ -877,22 +1018,27 @@ impl Whopper {
                 self.next_execution_id += 1;
 
                 let fiber = &mut self.context.fibers[fiber_idx];
-                let state = format!("{:?}", &fiber.state);
+                let state_str = format!("{:?}", &fiber.state);
                 let span =
-                    tracing::debug_span!("init", fiber = fiber_idx, exec = exec_id, state = state);
+                    tracing::debug_span!("init", fiber = fiber_idx, exec = exec_id, state = state_str);
                 let _enter = span.enter();
 
+                let tables_vec: Vec<Table> = self
+                    .context
+                    .state
+                    .tables
+                    .iter()
+                    .map(|(_, t)| t.clone())
+                    .collect();
                 let mut ctx = WorkloadContext {
                     connection: &fiber.connection,
-                    state: &mut fiber.state,
+                    fiber_state: &mut fiber.state,
                     statement: &fiber.statement,
-                    tables: &self.context.tables,
-                    indexes: &mut self.context.indexes,
-                    simple_tables: &mut self.context.simple_tables,
-                    simple_tables_keys: &mut self.context.simple_tables_keys,
+                    sim_state: &mut self.context.state,
                     stats: &mut self.stats,
                     opts: &self.opts,
                     enable_mvcc: self.context.enable_mvcc,
+                    tables_vec,
                 };
                 if workload.init(&mut ctx, &mut self.rng)? {
                     // Statement was successfully prepared, store execution_id
