@@ -104,7 +104,7 @@ async function main() {
             // Note: WITH (CTEs) can contain either SELECT or DML statements.
             // We include WITH here because even CTE-wrapped DML returns empty
             // from .all() (unless RETURNING is used), which is fine.
-            const isQuery = /^\s*(SELECT|PRAGMA|EXPLAIN|WITH)/i.test(trimmed) ||
+            const isQuery = /^\s*(SELECT|PRAGMA|EXPLAIN|WITH|VALUES)/i.test(trimmed) ||
                            /\bRETURNING\b/i.test(trimmed);
 
             if (isQuery) {
