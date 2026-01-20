@@ -534,7 +534,10 @@ pub struct Whopper {
     rng: ChaCha8Rng,
     io: Arc<dyn IO>,
     file_sizes: Arc<std::sync::Mutex<HashMap<String, u64>>>,
+    db_path: String,
     wal_path: String,
+    encryption_opts: Option<EncryptionOpts>,
+    max_connections: usize,
     workloads: Vec<(u32, Box<dyn Workload>)>,
     total_weight: u32,
     opts: Opts,
@@ -620,28 +623,8 @@ impl Whopper {
 
         bootstrap_conn.close()?;
 
-        let mut fibers = Vec::new();
-        for i in 0..opts.max_connections {
-            let conn = match db.connect() {
-                Ok(conn) => may_be_set_encryption(conn, &encryption_opts)?,
-                Err(e) => {
-                    return Err(anyhow::anyhow!(
-                        "Failed to create fiber connection {}: {}",
-                        i,
-                        e
-                    ));
-                }
-            };
-            fibers.push(SimulatorFiber {
-                connection: conn,
-                state: FiberState::Idle,
-                statement: RefCell::new(None),
-                rows_fetched: vec![],
-            });
-        }
-
         let context = SimulatorContext {
-            fibers,
+            fibers: vec![],
             tables,
             indexes: indexes
                 .iter()
@@ -653,12 +636,15 @@ impl Whopper {
 
         let total_weight: u32 = opts.workloads.iter().map(|(w, _)| w).sum();
 
-        Ok(Self {
+        let mut whopper = Self {
             context,
             rng,
             io,
             file_sizes,
+            db_path,
             wal_path,
+            encryption_opts,
+            max_connections: opts.max_connections,
             workloads: opts.workloads,
             total_weight,
             opts: Opts::default(),
@@ -666,7 +652,11 @@ impl Whopper {
             max_steps: opts.max_steps,
             seed,
             stats: Stats::default(),
-        })
+        };
+
+        whopper.open_connections()?;
+
+        Ok(whopper)
     }
 
     /// Check if the simulation is complete (reached max steps or WAL limit).
@@ -866,6 +856,108 @@ impl Whopper {
                 StepResult::WalSizeLimitExceeded => break,
             }
         }
+        Ok(())
+    }
+
+    /// Restart the database by closing all connections and reopening them.
+    /// This simulates a database restart/reopen scenario.
+    /// Active statements are run to completion before closing.
+    pub fn restart(&mut self) -> anyhow::Result<()> {
+        debug!(
+            "Restarting database, completing active statements for {} fibers",
+            self.context.fibers.len()
+        );
+
+        // Run all active statements to completion
+        for (fiber_idx, fiber) in self.context.fibers.iter_mut().enumerate() {
+            while fiber.statement.borrow().is_some() {
+                let done = {
+                    let mut stmt_borrow = fiber.statement.borrow_mut();
+                    if let Some(stmt) = stmt_borrow.as_mut() {
+                        match stmt.step() {
+                            Ok(result) => {
+                                match result {
+                                    turso_core::StepResult::Row => {
+                                        if let Some(row) = stmt.row() {
+                                            let values: Vec<Value> =
+                                                row.get_values().cloned().collect();
+                                            fiber.rows_fetched.push(values);
+                                        }
+                                        false
+                                    }
+                                    turso_core::StepResult::Done => true,
+                                    _ => false,
+                                }
+                            }
+                            Err(_) => true, // On error, consider statement done
+                        }
+                    } else {
+                        true
+                    }
+                };
+                if done {
+                    debug!(
+                        "fiber {}: completed with {} rows before restart",
+                        fiber_idx,
+                        fiber.rows_fetched.len()
+                    );
+                    fiber.statement.replace(None);
+                    fiber.rows_fetched.clear();
+                    break;
+                }
+            }
+        }
+
+        // Close and drop all fiber connections to release database Arc references
+        {
+            let fibers = self.context.fibers.drain(..).collect::<Vec<_>>();
+            for fiber in fibers {
+                // Drop statement first
+                drop(fiber.statement.into_inner());
+                // Close and drop connection
+                if let Err(e) = fiber.connection.close() {
+                    debug!("Error closing connection during restart: {}", e);
+                }
+                drop(fiber.connection);
+            }
+            // All fibers are now dropped, database Arc should be released
+        }
+
+        // Reopen connections (creates new Database instance)
+        self.open_connections()?;
+
+        debug!(
+            "Database restarted with {} fibers",
+            self.context.fibers.len()
+        );
+        Ok(())
+    }
+
+    /// Open database connections for all fibers.
+    fn open_connections(&mut self) -> anyhow::Result<()> {
+        let db_opts = DatabaseOpts::new().with_encryption(self.encryption_opts.is_some());
+        let db = Database::open_file_with_flags(
+            self.io.clone(),
+            &self.db_path,
+            OpenFlags::default(),
+            db_opts,
+            self.encryption_opts.clone(),
+        )
+        .map_err(|e| anyhow::anyhow!("Database open failed: {}", e))?;
+
+        for i in 0..self.max_connections {
+            let conn = db
+                .connect()
+                .map_err(|e| anyhow::anyhow!("Failed to create fiber connection {}: {}", i, e))?;
+            let conn = may_be_set_encryption(conn, &self.encryption_opts)?;
+            self.context.fibers.push(SimulatorFiber {
+                connection: conn,
+                state: FiberState::Idle,
+                statement: RefCell::new(None),
+                rows_fetched: vec![],
+            });
+        }
+
         Ok(())
     }
 }
