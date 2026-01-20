@@ -126,6 +126,14 @@ class Database extends DatabasePromise {
         if (this.connected) {
             return;
         } else if (this.#engine == null) {
+            if (!this.memory) {
+                const worker = await init();
+                await Promise.all([
+                    registerFileAtWorker(worker, this.name),
+                    registerFileAtWorker(worker, `${this.name}-wal`)
+                ]);
+                this.#worker = worker;
+            }
             await super.connect();
         } else {
             if (!this.memory) {
