@@ -8,8 +8,7 @@ use rand::rngs::StdRng;
 #[cfg(not(feature = "antithesis"))]
 use rand::{Rng, SeedableRng};
 use std::collections::HashSet;
-use std::fs::File;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
 #[cfg(not(feature = "antithesis"))]
@@ -20,7 +19,7 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::reload;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
-use turso::Builder;
+use turso::{Builder, Connection, Error};
 
 #[cfg(not(feature = "antithesis"))]
 static RNG: std::sync::OnceLock<StdMutex<StdRng>> = std::sync::OnceLock::new();
@@ -39,12 +38,12 @@ fn get_random() -> u64 {
     antithesis_sdk::random::get_random()
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct Plan {
     pub ddl_statements: Vec<String>,
-    pub queries_per_thread: Vec<Vec<String>>,
     pub nr_iterations: usize,
     pub nr_threads: usize,
+    pub schema: ArbitrarySchema,
 }
 
 /// Represents a column in a SQLite table
@@ -82,7 +81,7 @@ pub struct Table {
 }
 
 /// Represents a complete SQLite schema
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ArbitrarySchema {
     pub tables: Vec<Table>,
 }
@@ -461,111 +460,21 @@ pub fn load_schema(
     Ok(ArbitrarySchema { tables })
 }
 
-fn generate_plan(opts: &Opts) -> Result<Plan, Box<dyn std::error::Error + Send + Sync>> {
-    let mut log_file = File::create(&opts.log_file)?;
-    if !opts.skip_log {
-        writeln!(log_file, "{}", opts.nr_threads)?;
-        writeln!(log_file, "{}", opts.nr_iterations)?;
-    }
+fn generate_plan_ddl(opts: &Opts) -> Result<Plan, Box<dyn std::error::Error + Send + Sync>> {
     let mut plan = Plan {
-        ddl_statements: vec![],
-        queries_per_thread: vec![],
-        nr_iterations: opts.nr_iterations,
         nr_threads: opts.nr_threads,
+        nr_iterations: opts.nr_iterations,
+        ..Default::default()
     };
     let schema = if let Some(db_ref) = &opts.db_ref {
-        writeln!(log_file, "{}", 0)?;
         load_schema(db_ref)?
     } else {
         let schema = gen_schema(opts.tables);
         let ddl_statements = schema.to_sql();
-        if !opts.skip_log {
-            writeln!(log_file, "{}", ddl_statements.len())?;
-            for stmt in &ddl_statements {
-                writeln!(log_file, "{stmt}")?;
-            }
-        }
         plan.ddl_statements = ddl_statements;
         schema
     };
-    // Write DDL statements to log file
-    for id in 0..opts.nr_threads {
-        writeln!(log_file, "{id}",)?;
-        let mut queries = vec![];
-        let mut push = |sql: &str| {
-            queries.push(sql.to_string());
-            if !opts.skip_log {
-                writeln!(log_file, "{sql}").unwrap();
-            }
-        };
-        for i in 0..opts.nr_iterations {
-            if !opts.silent && !opts.verbose && i % 100 == 0 {
-                print!(
-                    "\r{} %",
-                    (i as f64 / opts.nr_iterations as f64 * 100.0) as usize
-                );
-                std::io::stdout().flush()?;
-            }
-            let tx = if get_random() % 2 == 0 {
-                match opts.tx_mode {
-                    TxMode::SQLite => Some("BEGIN;"),
-                    TxMode::Concurrent => Some("BEGIN CONCURRENT;"),
-                }
-            } else {
-                None
-            };
-            if let Some(tx) = tx {
-                push(tx);
-            }
-            let sql = generate_random_statement(&schema);
-            push(&sql);
-            if tx.is_some() {
-                if get_random() % 2 == 0 {
-                    push("COMMIT;");
-                } else {
-                    push("ROLLBACK;");
-                }
-            }
-        }
-        plan.queries_per_thread.push(queries);
-    }
-    Ok(plan)
-}
-
-fn read_plan_from_log_file(opts: &Opts) -> Result<Plan, Box<dyn std::error::Error + Send + Sync>> {
-    let mut file = File::open(&opts.log_file)?;
-    let mut buf = String::new();
-    let mut plan = Plan {
-        ddl_statements: vec![],
-        queries_per_thread: vec![],
-        nr_iterations: 0,
-        nr_threads: 0,
-    };
-    file.read_to_string(&mut buf)?;
-    let mut lines = buf.lines();
-    plan.nr_threads = lines.next().expect("missing threads").parse()?;
-    plan.nr_iterations = lines
-        .next()
-        .expect("missing nr_iterations")
-        .parse()?;
-    let nr_ddl = lines
-        .next()
-        .expect("number of ddl statements")
-        .parse()?;
-    for _ in 0..nr_ddl {
-        plan.ddl_statements
-            .push(lines.next().expect("expected ddl statement").to_string());
-    }
-    for line in lines {
-        if line.parse::<i64>().is_ok() {
-            plan.queries_per_thread.push(Vec::new());
-        } else {
-            plan.queries_per_thread
-                .last_mut()
-                .unwrap()
-                .push(line.to_string());
-        }
-    }
+    plan.schema = schema;
     Ok(plan)
 }
 
@@ -638,9 +547,7 @@ pub fn spawn_log_level_watcher(reload_handle: LogLevelReloadHandle) {
     });
 }
 
-fn sqlite_integrity_check(
-    db_path: &Path,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+fn sqlite_integrity_check(db_path: &Path) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     assert!(db_path.exists());
     let conn = rusqlite::Connection::open(db_path)?;
     let mut stmt = conn.prepare("SELECT * FROM pragma_integrity_check;")?;
@@ -676,7 +583,8 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     config.stack_size *= 10;
     config.max_steps = shuttle::MaxSteps::FailAfter(10_000_000);
 
-    let scheduler = RandomScheduler::new_from_seed(opts.seed.unwrap_or_else(|| get_random()), 5);
+    let scheduler =
+        RandomScheduler::new_from_seed(opts.seed.unwrap_or_else(|| get_random()), 1);
     let runner = shuttle::Runner::new(scheduler, config);
     runner.run(move || shuttle::future::block_on(Box::pin(async_main(opts.clone()))).unwrap());
 
@@ -705,13 +613,8 @@ fn init_rng(opts: &Opts) {
 }
 
 async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let plan = if opts.load_log {
-        println!("Loading plan from log file...");
-        read_plan_from_log_file(&opts)?
-    } else {
-        println!("Generating plan...");
-        generate_plan(&opts)?
-    };
+    println!("Generating plan...");
+    let plan = generate_plan_ddl(&opts)?;
 
     let mut handles = Vec::with_capacity(opts.nr_threads);
     let plan = Arc::new(plan);
@@ -767,25 +670,25 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
             while retry_counter < 10 {
                 match conn.execute(stmt, ()).await {
                     Ok(_) => break,
-                    Err(turso::Error::Busy(e)) => {
+                    Err(Error::Busy(e)) => {
                         println!("Error (busy) creating table: {e}");
                         retry_counter += 1;
                     }
-                    Err(turso::Error::DatabaseFull(e)) => {
+                    Err(Error::DatabaseFull(e)) => {
                         eprintln!("Database full, stopping: {e}");
                         stop = true;
                         break;
                     }
-                    Err(turso::Error::IoError(std::io::ErrorKind::StorageFull)) => {
+                    Err(Error::IoError(std::io::ErrorKind::StorageFull)) => {
                         eprintln!("No storage space, stopping");
                         stop = true;
                         break;
                     }
-                    Err(turso::Error::BusySnapshot(e)) => {
+                    Err(Error::BusySnapshot(e)) => {
                         println!("Error (busy snapshot): {e}");
                         retry_counter += 1;
                     }
-                    Err(turso::Error::IoError(kind)) => {
+                    Err(Error::IoError(kind)) => {
                         eprintln!("I/O error ({kind:?}), stopping");
                         stop = true;
                         break;
@@ -803,7 +706,7 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
             }
         }
 
-        let nr_queries = plan.queries_per_thread[thread].len();
+        let nr_queries = plan.nr_iterations;
         let db = db.clone();
         let vfs_for_task = vfs_option.clone();
 
@@ -840,54 +743,52 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
                     conn = db_guard.connect()?;
                     conn.busy_timeout(std::time::Duration::from_millis(opts.busy_timeout))?;
                 }
-                let sql = &plan.queries_per_thread[thread][query_index];
+
+                if !opts.silent && !opts.verbose && query_index % 100 == 0 {
+                    print!(
+                        "\r{} %",
+                        (query_index as f64 / opts.nr_iterations as f64 * 100.0) as usize
+                    );
+                    std::io::stdout().flush()?;
+                }
+                let begin_tx = (get_random() % 2 == 0).then(|| match opts.tx_mode {
+                    TxMode::SQLite => "BEGIN;",
+                    TxMode::Concurrent => "BEGIN CONCURRENT;",
+                });
+
+                if let Some(begin) = begin_tx {
+                    execute_query(&mut conn, begin, thread, opts.verbose).await;
+                }
+
+                let sql = generate_random_statement(&plan.schema);
+
                 if !opts.silent {
                     if opts.verbose {
                         println!("thread#{thread} executing query {sql}");
                     } else if query_index % 100 == 0 {
-                        print!(
-                            "\r{:.2} %",
-                            query_index as f64 / nr_queries as f64 * 100.0
-                        );
+                        print!("\r{:.2} %", query_index as f64 / nr_queries as f64 * 100.0);
                         std::io::stdout().flush().unwrap();
                     }
                 }
                 if opts.verbose {
                     eprintln!("thread#{thread}(start): {sql}");
                 }
-                if let Err(e) = conn.execute(sql, ()).await {
-                    match e {
-                        turso::Error::Corrupt(e) => {
-                            panic!("thread#{thread} Error[FATAL] executing query: {}", e);
-                        }
-                        turso::Error::Constraint(e) => {
-                            if opts.verbose {
-                                println!("thread#{thread} Error[WARNING] executing query: {e}");
-                            }
-                        }
-                        turso::Error::Busy(e) => {
-                            println!("thread#{thread} Error[WARNING] executing query: {e}");
-                        }
-                        turso::Error::BusySnapshot(e) => {
-                            println!("thread#{thread} Error[WARNING] busy snapshot: {e}");
-                        }
-                        turso::Error::Error(e) => {
-                            if opts.verbose {
-                                println!("thread#{thread} Error executing query: {e}");
-                            }
-                        }
-                        turso::Error::DatabaseFull(e) => {
-                            eprintln!("thread#{thread} Database full: {e}");
-                        }
-                        turso::Error::IoError(kind) => {
-                            eprintln!("thread#{thread} I/O error ({kind:?}), continuing...");
-                        }
-                        _ => panic!("thread#{thread} Error[FATAL] executing query: {}", e),
-                    }
-                }
+                execute_query(&mut conn, &sql, thread, opts.verbose).await;
                 if opts.verbose {
                     eprintln!("thread#{thread}(end): {sql}");
                 }
+
+                let end_tx = begin_tx.map(|_| {
+                    if get_random() % 2 == 0 {
+                        "COMMIT;"
+                    } else {
+                        "ROLLBACK;"
+                    }
+                });
+                if let Some(end) = end_tx {
+                execute_query(&mut conn, &end, thread, opts.verbose).await;
+                }
+
                 const INTEGRITY_CHECK_INTERVAL: usize = 100;
                 if query_index % INTEGRITY_CHECK_INTERVAL == 0 {
                     if opts.verbose {
@@ -930,8 +831,7 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
     for handle in handles {
         handle.await??;
     }
-    println!("Done. SQL statements written to {}", opts.log_file);
-    println!("Database file: {db_file}");
+    println!("Done. Database file: {db_file}");
 
     // Switch back to WAL mode before SQLite integrity check if we were in MVCC mode.
     // SQLite/rusqlite doesn't understand MVCC journal mode.
@@ -953,4 +853,37 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
     }
 
     Ok(())
+}
+
+async fn execute_query(conn: &mut Connection, sql: impl AsRef<str>, thread: usize, verbose: bool) {
+    if let Err(err) = conn.execute(sql, ()).await.map(|_| ()) {
+        match err {
+            Error::Corrupt(e) => {
+                panic!("thread#{thread} Error[FATAL] executing query: {}", e);
+            }
+            Error::Constraint(e) => {
+                if verbose {
+                    println!("thread#{thread} Error[WARNING] executing query: {e}");
+                }
+            }
+            Error::Busy(e) => {
+                println!("thread#{thread} Error[WARNING] executing query: {e}");
+            }
+            Error::BusySnapshot(e) => {
+                println!("thread#{thread} Error[WARNING] busy snapshot: {e}");
+            }
+            Error::Error(e) => {
+                if verbose {
+                    println!("thread#{thread} Error executing query: {e}");
+                }
+            }
+            Error::DatabaseFull(e) => {
+                eprintln!("thread#{thread} Database full: {e}");
+            }
+            Error::IoError(kind) => {
+                eprintln!("thread#{thread} I/O error ({kind:?}), continuing...");
+            }
+            _ => panic!("thread#{thread} Error[FATAL] executing query: {}", err),
+        }
+    }
 }
