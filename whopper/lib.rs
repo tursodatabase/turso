@@ -16,14 +16,63 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, trace};
 use turso_core::{
-    CipherMode, Connection, Database, DatabaseOpts, EncryptionOpts, IO, OpenFlags, Statement,
-    Value,
+    CipherMode, Connection, Database, DatabaseOpts, EncryptionOpts, IO, OpenFlags, Statement, Value,
 };
 use turso_parser::ast::{ColumnConstraint, SortOrder};
 
 mod io;
 use crate::io::FILE_SIZE_SOFT_LIMIT;
 pub use io::{IOFaultConfig, SimulatorIO};
+
+/// A bounded container for sampling values with reservoir sampling.
+#[derive(Debug, Clone)]
+pub struct SamplesContainer<T> {
+    samples: Vec<T>,
+    capacity: usize,
+    /// Counter for reservoir sampling
+    total_added: usize,
+}
+
+impl<T> SamplesContainer<T> {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            samples: Vec::with_capacity(capacity),
+            capacity,
+            total_added: 0,
+        }
+    }
+
+    /// Add a sample. Uses reservoir sampling to maintain bounded memory.
+    pub fn add(&mut self, value: T, rng: &mut ChaCha8Rng) {
+        self.total_added += 1;
+        if self.samples.len() < self.capacity {
+            self.samples.push(value);
+        } else {
+            // Reservoir sampling: replace with probability capacity/total_added
+            let idx = rng.random_range(0..self.total_added);
+            if idx < self.capacity {
+                self.samples[idx] = value;
+            }
+        }
+    }
+
+    /// Pick a random sample, if any exist.
+    pub fn pick(&self, rng: &mut ChaCha8Rng) -> Option<&T> {
+        if self.samples.is_empty() {
+            None
+        } else {
+            Some(&self.samples[rng.random_range(0..self.samples.len())])
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.samples.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.samples.is_empty()
+    }
+}
 
 /// State of a simulator fiber.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,6 +91,8 @@ pub struct WorkloadContext<'a> {
     pub tables: &'a Vec<Table>,
     pub indexes: &'a mut Vec<(String, String)>,
     pub simple_tables: &'a mut Vec<String>,
+    /// Sample of inserted keys per table for use in selects
+    pub simple_tables_keys: &'a mut HashMap<String, SamplesContainer<String>>,
     pub stats: &'a mut Stats,
     pub opts: &'a Opts,
     pub enable_mvcc: bool,
@@ -58,14 +109,15 @@ impl GenerationContext for WorkloadContext<'_> {
 }
 
 impl WorkloadContext<'_> {
-    /// Prepare a statement on this fiber. Returns true if successful.
-    pub fn prepare(&self, sql: &str) -> bool {
+    /// Prepare a statement on this fiber. Panics if preparation fails.
+    pub fn prepare(&self, sql: &str) {
         match self.connection.prepare(sql) {
             Ok(stmt) => {
                 self.statement.replace(Some(stmt));
-                true
             }
-            Err(_) => false,
+            Err(e) => {
+                panic!("Failed to prepare statement: {}\nSQL: {}", e, sql);
+            }
         }
     }
 }
@@ -98,13 +150,10 @@ impl Workload for BeginWorkload {
         } else {
             "BEGIN"
         };
-        if ctx.prepare(cmd) {
-            *ctx.state = FiberState::InTx;
-            debug!("BEGIN: {}", cmd);
-            Ok(true)
-        } else {
-            Ok(false)
-        }
+        ctx.prepare(cmd);
+        *ctx.state = FiberState::InTx;
+        debug!("BEGIN: {}", cmd);
+        Ok(true)
     }
 }
 
@@ -116,13 +165,10 @@ impl Workload for IntegrityCheckWorkload {
         if *ctx.state != FiberState::Idle {
             return Ok(false);
         }
-        if ctx.prepare("PRAGMA integrity_check") {
-            ctx.stats.integrity_checks += 1;
-            debug!("PRAGMA integrity_check");
-            Ok(true)
-        } else {
-            Ok(false)
-        }
+        ctx.prepare("PRAGMA integrity_check");
+        ctx.stats.integrity_checks += 1;
+        debug!("PRAGMA integrity_check");
+        Ok(true)
     }
 }
 
@@ -138,13 +184,10 @@ impl Workload for CreateSimpleTableWorkload {
         let table_name = format!("simple_kv_{}", rng.random_range(0..100000));
         let sql =
             format!("CREATE TABLE IF NOT EXISTS {table_name} (key TEXT PRIMARY KEY, value BLOB)");
-        if ctx.prepare(&sql) {
-            ctx.simple_tables.push(table_name.clone());
-            debug!("CREATE SIMPLE TABLE: {}", table_name);
-            Ok(true)
-        } else {
-            Ok(false)
-        }
+        ctx.prepare(&sql);
+        ctx.simple_tables.push(table_name.clone());
+        debug!("CREATE SIMPLE TABLE: {}", table_name);
+        Ok(true)
     }
 }
 
@@ -157,20 +200,30 @@ impl Workload for SimpleSelectWorkload {
             return Ok(false);
         }
         let table_idx = rng.random_range(0..ctx.simple_tables.len());
-        let table_name = &ctx.simple_tables[table_idx];
-        let key = format!("key_{}", rng.random_range(0..10000));
-        let sql = format!("SELECT value FROM {table_name} WHERE key = '{key}'");
-        if ctx.prepare(&sql) {
-            debug!("SIMPLE SELECT: {}", sql);
-            Ok(true)
+        let table_name = ctx.simple_tables[table_idx].clone();
+
+        // 70% chance to use a known inserted key if available
+        let key = if rng.random_bool(0.7) {
+            ctx.simple_tables_keys
+                .get(&table_name)
+                .and_then(|keys| keys.pick(rng).cloned())
+                .unwrap_or_else(|| format!("key_{}", rng.random_range(0..10000)))
         } else {
-            Ok(false)
-        }
+            format!("key_{}", rng.random_range(0..10000))
+        };
+
+        let sql = format!("SELECT value FROM {table_name} WHERE key = '{key}'");
+        ctx.prepare(&sql);
+        debug!("SIMPLE SELECT: {}", sql);
+        Ok(true)
     }
 }
 
 /// Execute a simple INSERT into a random simple table.
 pub struct SimpleInsertWorkload;
+
+/// Maximum number of keys to remember per table
+const MAX_SAMPLE_KEYS_PER_TABLE: usize = 1000;
 
 impl Workload for SimpleInsertWorkload {
     fn init(&self, ctx: &mut WorkloadContext, rng: &mut ChaCha8Rng) -> anyhow::Result<bool> {
@@ -178,7 +231,7 @@ impl Workload for SimpleInsertWorkload {
             return Ok(false);
         }
         let table_idx = rng.random_range(0..ctx.simple_tables.len());
-        let table_name = &ctx.simple_tables[table_idx];
+        let table_name = ctx.simple_tables[table_idx].clone();
         let key = format!("key_{}", rng.random_range(0..10000));
         let value_len = rng.random_range(10..100);
         let value: String = (0..value_len)
@@ -188,13 +241,17 @@ impl Workload for SimpleInsertWorkload {
         let sql = format!(
             "INSERT OR REPLACE INTO {table_name} (key, value) VALUES ('{key}', X'{value_hex}')"
         );
-        if ctx.prepare(&sql) {
-            ctx.stats.inserts += 1;
-            debug!("SIMPLE INSERT: table={}, key={}", table_name, key);
-            Ok(true)
-        } else {
-            Ok(false)
-        }
+        ctx.prepare(&sql);
+        ctx.stats.inserts += 1;
+
+        // Remember the key for later selects
+        ctx.simple_tables_keys
+            .entry(table_name.clone())
+            .or_insert_with(|| SamplesContainer::new(MAX_SAMPLE_KEYS_PER_TABLE))
+            .add(key.clone(), rng);
+
+        debug!("SIMPLE INSERT: table={}, key={}", table_name, key);
+        Ok(true)
     }
 }
 
@@ -205,12 +262,9 @@ impl Workload for SelectWorkload {
     fn init(&self, ctx: &mut WorkloadContext, rng: &mut ChaCha8Rng) -> anyhow::Result<bool> {
         let select = Select::arbitrary(rng, ctx);
         let sql = select.to_string();
-        if ctx.prepare(&sql) {
-            debug!("SELECT: {}", sql);
-            Ok(true)
-        } else {
-            Ok(false)
-        }
+        ctx.prepare(&sql);
+        debug!("SELECT: {}", sql);
+        Ok(true)
     }
 }
 
@@ -221,13 +275,10 @@ impl Workload for InsertWorkload {
     fn init(&self, ctx: &mut WorkloadContext, rng: &mut ChaCha8Rng) -> anyhow::Result<bool> {
         let insert = Insert::arbitrary(rng, ctx);
         let sql = insert.to_string();
-        if ctx.prepare(&sql) {
-            ctx.stats.inserts += 1;
-            debug!("INSERT: {}", sql);
-            Ok(true)
-        } else {
-            Ok(false)
-        }
+        ctx.prepare(&sql);
+        ctx.stats.inserts += 1;
+        debug!("INSERT: {}", sql);
+        Ok(true)
     }
 }
 
@@ -238,13 +289,10 @@ impl Workload for UpdateWorkload {
     fn init(&self, ctx: &mut WorkloadContext, rng: &mut ChaCha8Rng) -> anyhow::Result<bool> {
         let update = Update::arbitrary(rng, ctx);
         let sql = update.to_string();
-        if ctx.prepare(&sql) {
-            ctx.stats.updates += 1;
-            debug!("UPDATE: {}", sql);
-            Ok(true)
-        } else {
-            Ok(false)
-        }
+        ctx.prepare(&sql);
+        ctx.stats.updates += 1;
+        debug!("UPDATE: {}", sql);
+        Ok(true)
     }
 }
 
@@ -255,13 +303,10 @@ impl Workload for DeleteWorkload {
     fn init(&self, ctx: &mut WorkloadContext, rng: &mut ChaCha8Rng) -> anyhow::Result<bool> {
         let delete = Delete::arbitrary(rng, ctx);
         let sql = delete.to_string();
-        if ctx.prepare(&sql) {
-            ctx.stats.deletes += 1;
-            debug!("DELETE: {}", sql);
-            Ok(true)
-        } else {
-            Ok(false)
-        }
+        ctx.prepare(&sql);
+        ctx.stats.deletes += 1;
+        debug!("DELETE: {}", sql);
+        Ok(true)
     }
 }
 
@@ -272,16 +317,13 @@ impl Workload for CreateIndexWorkload {
     fn init(&self, ctx: &mut WorkloadContext, rng: &mut ChaCha8Rng) -> anyhow::Result<bool> {
         let create_index = CreateIndex::arbitrary(rng, ctx);
         let sql = create_index.to_string();
-        if ctx.prepare(&sql) {
-            ctx.indexes.push((
-                create_index.index.table_name.clone(),
-                create_index.index_name.clone(),
-            ));
-            debug!("CREATE INDEX: {}", sql);
-            Ok(true)
-        } else {
-            Ok(false)
-        }
+        ctx.prepare(&sql);
+        ctx.indexes.push((
+            create_index.index.table_name.clone(),
+            create_index.index_name.clone(),
+        ));
+        debug!("CREATE INDEX: {}", sql);
+        Ok(true)
     }
 }
 
@@ -300,12 +342,9 @@ impl Workload for DropIndexWorkload {
             index_name,
         };
         let sql = drop_index.to_string();
-        if ctx.prepare(&sql) {
-            debug!("DROP INDEX: {}", sql);
-            Ok(true)
-        } else {
-            Ok(false)
-        }
+        ctx.prepare(&sql);
+        debug!("DROP INDEX: {}", sql);
+        Ok(true)
     }
 }
 
@@ -325,12 +364,9 @@ impl Workload for WalCheckpointWorkload {
             _ => "TRUNCATE",
         };
         let sql = format!("PRAGMA wal_checkpoint({mode})");
-        if ctx.prepare(&sql) {
-            debug!("WAL CHECKPOINT: {}", mode);
-            Ok(true)
-        } else {
-            Ok(false)
-        }
+        ctx.prepare(&sql);
+        debug!("WAL CHECKPOINT: {}", mode);
+        Ok(true)
     }
 }
 
@@ -342,13 +378,10 @@ impl Workload for CommitWorkload {
         if *ctx.state != FiberState::InTx {
             return Ok(false);
         }
-        if ctx.prepare("COMMIT") {
-            *ctx.state = FiberState::Idle;
-            debug!("COMMIT");
-            Ok(true)
-        } else {
-            Ok(false)
-        }
+        ctx.prepare("COMMIT");
+        *ctx.state = FiberState::Idle;
+        debug!("COMMIT");
+        Ok(true)
     }
 }
 
@@ -360,13 +393,10 @@ impl Workload for RollbackWorkload {
         if *ctx.state != FiberState::InTx {
             return Ok(false);
         }
-        if ctx.prepare("ROLLBACK") {
-            *ctx.state = FiberState::Idle;
-            debug!("ROLLBACK");
-            Ok(true)
-        } else {
-            Ok(false)
-        }
+        ctx.prepare("ROLLBACK");
+        *ctx.state = FiberState::Idle;
+        debug!("ROLLBACK");
+        Ok(true)
     }
 }
 
@@ -525,6 +555,8 @@ struct SimulatorContext {
     tables: Vec<Table>,
     indexes: Vec<(String, String)>,
     simple_tables: Vec<String>,
+    /// Sample of inserted keys per table for use in selects
+    simple_tables_keys: HashMap<String, SamplesContainer<String>>,
     enable_mvcc: bool,
 }
 
@@ -631,6 +663,7 @@ impl Whopper {
                 .map(|idx| (idx.table_name.clone(), idx.index_name.clone()))
                 .collect(),
             simple_tables: vec![],
+            simple_tables_keys: HashMap::new(),
             enable_mvcc: opts.enable_mvcc,
         };
 
@@ -704,8 +737,7 @@ impl Whopper {
                         match result {
                             turso_core::StepResult::Row => {
                                 if let Some(row) = stmt.row() {
-                                    let values: Vec<Value> =
-                                        row.get_values().cloned().collect();
+                                    let values: Vec<Value> = row.get_values().cloned().collect();
                                     drop(stmt_borrow);
                                     self.context.fibers[fiber_idx].rows_fetched.push(values);
                                 } else {
@@ -833,6 +865,7 @@ impl Whopper {
                     tables: &self.context.tables,
                     indexes: &mut self.context.indexes,
                     simple_tables: &mut self.context.simple_tables,
+                    simple_tables_keys: &mut self.context.simple_tables_keys,
                     stats: &mut self.stats,
                     opts: &self.opts,
                     enable_mvcc: self.context.enable_mvcc,
@@ -875,20 +908,18 @@ impl Whopper {
                     let mut stmt_borrow = fiber.statement.borrow_mut();
                     if let Some(stmt) = stmt_borrow.as_mut() {
                         match stmt.step() {
-                            Ok(result) => {
-                                match result {
-                                    turso_core::StepResult::Row => {
-                                        if let Some(row) = stmt.row() {
-                                            let values: Vec<Value> =
-                                                row.get_values().cloned().collect();
-                                            fiber.rows_fetched.push(values);
-                                        }
-                                        false
+                            Ok(result) => match result {
+                                turso_core::StepResult::Row => {
+                                    if let Some(row) = stmt.row() {
+                                        let values: Vec<Value> =
+                                            row.get_values().cloned().collect();
+                                        fiber.rows_fetched.push(values);
                                     }
-                                    turso_core::StepResult::Done => true,
-                                    _ => false,
+                                    false
                                 }
-                            }
+                                turso_core::StepResult::Done => true,
+                                _ => false,
+                            },
                             Err(_) => true, // On error, consider statement done
                         }
                     } else {
