@@ -15,8 +15,9 @@ use tracing_subscriber::{
     EnvFilter, Layer,
 };
 use turso_core::{
-    storage::database::DatabaseFile, types::AsValueRef, Connection, Database, DatabaseOpts,
-    DatabaseStorage, LimboError, OpenFlags, Pager, QueryMode, Statement, StepResult, IO,
+    storage::database::DatabaseFile, types::AsValueRef, CipherMode, Connection, Database,
+    DatabaseOpts, DatabaseStorage, EncryptionKey, LimboError, OpenFlags, Pager, QueryMode,
+    Statement, StepResult, IO,
 };
 
 use crate::{
@@ -601,6 +602,16 @@ impl TursoDatabase {
             ));
         };
         let connection = db.connect()?;
+
+        // Set up encryption on the connection if configured
+        // Encryption key is not cached in Database for security, so we set it per connection
+        if let Some(ref encryption_opts) = self.config.encryption {
+            let cipher_mode = CipherMode::try_from(encryption_opts.cipher.as_str())?;
+            let encryption_key = EncryptionKey::from_hex_string(&encryption_opts.hexkey)?;
+            connection.set_encryption_cipher(cipher_mode)?;
+            connection.set_encryption_key(encryption_key)?;
+        }
+
         Ok(TursoConnection::new(&self.config, connection))
     }
 
