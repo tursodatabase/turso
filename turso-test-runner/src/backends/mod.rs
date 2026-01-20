@@ -2,8 +2,9 @@ pub mod cli;
 pub mod js;
 pub mod rust;
 
-use crate::parser::ast::{Backend, DatabaseConfig, DatabaseLocation};
+use crate::parser::ast::{Backend, Capability, DatabaseConfig, DatabaseLocation};
 use async_trait::async_trait;
+use std::collections::HashSet;
 use std::{path::PathBuf, time::Duration};
 
 /// Provides resolved paths for default databases
@@ -75,6 +76,9 @@ pub trait SqlBackend: Send + Sync {
 
     /// Backend type enum variant
     fn backend_type(&self) -> Backend;
+
+    /// Return the set of capabilities this backend supports
+    fn capabilities(&self) -> HashSet<Capability>;
 
     /// Create a new isolated database instance
     async fn create_database(

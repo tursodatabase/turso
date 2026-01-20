@@ -1,7 +1,8 @@
 use super::{BackendError, DatabaseInstance, QueryResult, SqlBackend, parse_list_output};
 use crate::backends::DefaultDatabaseResolver;
-use crate::parser::ast::{Backend, DatabaseConfig, DatabaseLocation};
+use crate::parser::ast::{Backend, Capability, DatabaseConfig, DatabaseLocation};
 use async_trait::async_trait;
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -75,6 +76,10 @@ impl SqlBackend for CliBackend {
 
     fn backend_type(&self) -> Backend {
         Backend::Cli
+    }
+
+    fn capabilities(&self) -> HashSet<Capability> {
+        Capability::all_set()
     }
 
     async fn create_database(
