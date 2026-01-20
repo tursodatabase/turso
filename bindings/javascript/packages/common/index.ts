@@ -3,6 +3,7 @@ import { Database as DatabaseCompat, Statement as StatementCompat } from "./comp
 import { Database as DatabasePromise, Statement as StatementPromise } from "./promise.js";
 import { SqliteError } from "./sqlite-error.js";
 import { AsyncLock } from "./async-lock.js";
+import { sql, SqlQuery, isSqlQuery } from "./sql-template.js";
 
 export {
     DatabaseOpts,
@@ -10,5 +11,6 @@ export {
     DatabasePromise, StatementPromise,
     NativeDatabase, NativeStatement,
     SqliteError,
-    AsyncLock
+    AsyncLock,
+    sql, SqlQuery, isSqlQuery
 }
