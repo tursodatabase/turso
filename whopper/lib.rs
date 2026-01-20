@@ -40,6 +40,7 @@ pub struct WorkloadContext<'a> {
     pub statement: &'a RefCell<Option<Statement>>,
     pub tables: &'a Vec<Table>,
     pub indexes: &'a mut Vec<(String, String)>,
+    pub simple_tables: &'a mut Vec<String>,
     pub stats: &'a mut Stats,
     pub opts: &'a Opts,
     pub enable_mvcc: bool,
@@ -124,14 +125,82 @@ impl Workload for IntegrityCheckWorkload {
     }
 }
 
-/// Execute a SELECT query.
+/// Create a new simple key-value table and record its name in state.
+pub struct CreateSimpleTableWorkload;
+
+impl Workload for CreateSimpleTableWorkload {
+    fn init(&self, ctx: &mut WorkloadContext, rng: &mut ChaCha8Rng) -> anyhow::Result<bool> {
+        // Only create tables outside of transactions
+        if *ctx.state != FiberState::Idle {
+            return Ok(false);
+        }
+        let table_name = format!("simple_kv_{}", rng.random_range(0..100000));
+        let sql = format!("CREATE TABLE IF NOT EXISTS {table_name} (key TEXT PRIMARY KEY, value BLOB)");
+        if ctx.prepare(&sql) {
+            ctx.simple_tables.push(table_name.clone());
+            trace!("CREATE SIMPLE TABLE: {}", table_name);
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+}
+
+/// Execute a simple SELECT by key on a random simple table (point lookup).
+pub struct SimpleSelectWorkload;
+
+impl Workload for SimpleSelectWorkload {
+    fn init(&self, ctx: &mut WorkloadContext, rng: &mut ChaCha8Rng) -> anyhow::Result<bool> {
+        if ctx.simple_tables.is_empty() {
+            return Ok(false);
+        }
+        let table_idx = rng.random_range(0..ctx.simple_tables.len());
+        let table_name = &ctx.simple_tables[table_idx];
+        let key = format!("key_{}", rng.random_range(0..10000));
+        let sql = format!("SELECT value FROM {table_name} WHERE key = '{key}'");
+        if ctx.prepare(&sql) {
+            trace!("SIMPLE SELECT: {}", sql);
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+}
+
+/// Execute a simple INSERT into a random simple table.
+pub struct SimpleInsertWorkload;
+
+impl Workload for SimpleInsertWorkload {
+    fn init(&self, ctx: &mut WorkloadContext, rng: &mut ChaCha8Rng) -> anyhow::Result<bool> {
+        if ctx.simple_tables.is_empty() {
+            return Ok(false);
+        }
+        let table_idx = rng.random_range(0..ctx.simple_tables.len());
+        let table_name = &ctx.simple_tables[table_idx];
+        let key = format!("key_{}", rng.random_range(0..10000));
+        let value_len = rng.random_range(10..100);
+        let value: String = (0..value_len)
+            .map(|_| rng.random_range(b'a'..=b'z') as char)
+            .collect();
+        let value_hex = hex::encode(value.as_bytes());
+        let sql = format!(
+            "INSERT OR REPLACE INTO {table_name} (key, value) VALUES ('{key}', X'{value_hex}')"
+        );
+        if ctx.prepare(&sql) {
+            ctx.stats.inserts += 1;
+            trace!("SIMPLE INSERT: table={}, key={}", table_name, key);
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+}
+
+/// Execute a SELECT query (works in both Idle and InTx states).
 pub struct SelectWorkload;
 
 impl Workload for SelectWorkload {
     fn init(&self, ctx: &mut WorkloadContext, rng: &mut ChaCha8Rng) -> anyhow::Result<bool> {
-        if *ctx.state != FiberState::InTx {
-            return Ok(false);
-        }
         let select = Select::arbitrary(rng, ctx);
         let sql = select.to_string();
         if ctx.prepare(&sql) {
@@ -143,14 +212,11 @@ impl Workload for SelectWorkload {
     }
 }
 
-/// Execute an INSERT statement.
+/// Execute an INSERT statement (works in both Idle and InTx states).
 pub struct InsertWorkload;
 
 impl Workload for InsertWorkload {
     fn init(&self, ctx: &mut WorkloadContext, rng: &mut ChaCha8Rng) -> anyhow::Result<bool> {
-        if *ctx.state != FiberState::InTx {
-            return Ok(false);
-        }
         let insert = Insert::arbitrary(rng, ctx);
         let sql = insert.to_string();
         if ctx.prepare(&sql) {
@@ -163,14 +229,11 @@ impl Workload for InsertWorkload {
     }
 }
 
-/// Execute an UPDATE statement.
+/// Execute an UPDATE statement (works in both Idle and InTx states).
 pub struct UpdateWorkload;
 
 impl Workload for UpdateWorkload {
     fn init(&self, ctx: &mut WorkloadContext, rng: &mut ChaCha8Rng) -> anyhow::Result<bool> {
-        if *ctx.state != FiberState::InTx {
-            return Ok(false);
-        }
         let update = Update::arbitrary(rng, ctx);
         let sql = update.to_string();
         if ctx.prepare(&sql) {
@@ -183,14 +246,11 @@ impl Workload for UpdateWorkload {
     }
 }
 
-/// Execute a DELETE statement.
+/// Execute a DELETE statement (works in both Idle and InTx states).
 pub struct DeleteWorkload;
 
 impl Workload for DeleteWorkload {
     fn init(&self, ctx: &mut WorkloadContext, rng: &mut ChaCha8Rng) -> anyhow::Result<bool> {
-        if *ctx.state != FiberState::InTx {
-            return Ok(false);
-        }
         let delete = Delete::arbitrary(rng, ctx);
         let sql = delete.to_string();
         if ctx.prepare(&sql) {
@@ -203,14 +263,11 @@ impl Workload for DeleteWorkload {
     }
 }
 
-/// Create a new index.
+/// Create a new index (works in both Idle and InTx states).
 pub struct CreateIndexWorkload;
 
 impl Workload for CreateIndexWorkload {
     fn init(&self, ctx: &mut WorkloadContext, rng: &mut ChaCha8Rng) -> anyhow::Result<bool> {
-        if *ctx.state != FiberState::InTx {
-            return Ok(false);
-        }
         let create_index = CreateIndex::arbitrary(rng, ctx);
         let sql = create_index.to_string();
         if ctx.prepare(&sql) {
@@ -226,12 +283,12 @@ impl Workload for CreateIndexWorkload {
     }
 }
 
-/// Drop an existing index.
+/// Drop an existing index (works in both Idle and InTx states).
 pub struct DropIndexWorkload;
 
 impl Workload for DropIndexWorkload {
     fn init(&self, ctx: &mut WorkloadContext, rng: &mut ChaCha8Rng) -> anyhow::Result<bool> {
-        if *ctx.state != FiberState::InTx || ctx.indexes.is_empty() {
+        if ctx.indexes.is_empty() {
             return Ok(false);
         }
         let index_idx = rng.random_range(0..ctx.indexes.len());
@@ -243,6 +300,31 @@ impl Workload for DropIndexWorkload {
         let sql = drop_index.to_string();
         if ctx.prepare(&sql) {
             trace!("DROP INDEX: {}", sql);
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+}
+
+/// Run WAL checkpoint with a randomly selected mode.
+pub struct WalCheckpointWorkload;
+
+impl Workload for WalCheckpointWorkload {
+    fn init(&self, ctx: &mut WorkloadContext, rng: &mut ChaCha8Rng) -> anyhow::Result<bool> {
+        // Checkpoint should only run when not in a transaction
+        if *ctx.state != FiberState::Idle {
+            return Ok(false);
+        }
+        let mode = match rng.random_range(0..4) {
+            0 => "PASSIVE",
+            1 => "FULL",
+            2 => "RESTART",
+            _ => "TRUNCATE",
+        };
+        let sql = format!("PRAGMA wal_checkpoint({mode})");
+        if ctx.prepare(&sql) {
+            trace!("WAL CHECKPOINT: {}", mode);
             Ok(true)
         } else {
             Ok(false)
@@ -289,16 +371,22 @@ impl Workload for RollbackWorkload {
 /// Returns the default workload configuration matching the original probabilities.
 pub fn default_workloads() -> Vec<(u32, Box<dyn Workload>)> {
     vec![
-        // Idle state workloads
+        // Idle-only workloads
         (30, Box::new(BeginWorkload)),
         (1, Box::new(IntegrityCheckWorkload)),
-        // InTx state workloads
+        (1, Box::new(WalCheckpointWorkload)),
+        (5, Box::new(CreateSimpleTableWorkload)),
+        // Simple KV workloads (fast point operations)
+        (20, Box::new(SimpleSelectWorkload)),
+        (20, Box::new(SimpleInsertWorkload)),
+        // DML workloads (work in both Idle and InTx)
         (10, Box::new(SelectWorkload)),
         (30, Box::new(InsertWorkload)),
         (20, Box::new(UpdateWorkload)),
         (10, Box::new(DeleteWorkload)),
         (2, Box::new(CreateIndexWorkload)),
         (2, Box::new(DropIndexWorkload)),
+        // InTx-only workloads
         (13, Box::new(CommitWorkload)),
         (13, Box::new(RollbackWorkload)),
     ]
@@ -434,6 +522,7 @@ struct SimulatorContext {
     fibers: Vec<SimulatorFiber>,
     tables: Vec<Table>,
     indexes: Vec<(String, String)>,
+    simple_tables: Vec<String>,
     enable_mvcc: bool,
 }
 
@@ -555,6 +644,7 @@ impl Whopper {
                 .iter()
                 .map(|idx| (idx.table_name.clone(), idx.index_name.clone()))
                 .collect(),
+            simple_tables: vec![],
             enable_mvcc: opts.enable_mvcc,
         };
 
@@ -711,6 +801,7 @@ impl Whopper {
                     statement: &fiber.statement,
                     tables: &self.context.tables,
                     indexes: &mut self.context.indexes,
+                    simple_tables: &mut self.context.simple_tables,
                     stats: &mut self.stats,
                     opts: &self.opts,
                     enable_mvcc: self.context.enable_mvcc,
