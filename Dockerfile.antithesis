@@ -30,7 +30,7 @@ COPY ./perf/throughput/turso ./perf/throughput/turso/
 COPY ./simulator ./simulator/
 COPY ./sql_generation ./sql_generation
 COPY ./sqlite3 ./sqlite3/
-COPY ./stress ./stress/
+COPY ./testing/stress ./testing/stress/
 COPY ./sync ./sync/
 COPY ./testing/sqlite_test_ext ./testing/sqlite_test_ext/
 COPY ./testing/unreliable-libc ./testing/unreliable-libc/
@@ -52,7 +52,7 @@ RUN apt-get update && apt-get install -y pip && rm -rf /var/lib/apt/lists/*
 RUN pip install maturin
 
 # Source: https://antithesis.com/assets/instrumentation/libvoidstar.so
-COPY stress/libvoidstar.so /opt/antithesis/libvoidstar.so
+COPY testing/stress/libvoidstar.so /opt/antithesis/libvoidstar.so
 
 COPY --from=planner /app/recipe.json recipe.json
 RUN cargo chef cook --bin turso_stress --release --recipe-path recipe.json
@@ -75,7 +75,7 @@ COPY --from=planner /app/perf/throughput/turso ./perf/throughput/turso/
 COPY --from=planner /app/simulator ./simulator/
 COPY --from=planner /app/sql_generation ./sql_generation
 COPY --from=planner /app/sqlite3 ./sqlite3/
-COPY --from=planner /app/stress ./stress/
+COPY --from=planner /app/testing/stress ./testing/stress/
 COPY --from=planner /app/sync ./sync/
 COPY --from=planner /app/testing/sqlite_test_ext ./testing/sqlite_test_ext/
 COPY --from=planner /app/testing/unreliable-libc ./testing/unreliable-libc/
@@ -112,7 +112,7 @@ COPY --from=builder /usr/lib/libvoidstar.so* /usr/lib/
 COPY --from=builder /app/testing/unreliable-libc/unreliable-libc.so /usr/lib/
 COPY --from=builder /app/target/antithesis/turso_stress /bin/turso_stress
 COPY --from=builder /app/target/antithesis/turso_stress /symbols
-COPY stress/docker-entrypoint.sh /bin
+COPY testing/stress/docker-entrypoint.sh /bin
 RUN chmod +x /bin/docker-entrypoint.sh
 
 COPY --from=builder /app/target/wheels/* /tmp

@@ -27,7 +27,7 @@ COPY sync ./sync
 COPY parser ./parser/
 COPY cli ./cli/
 COPY sqlite3 ./sqlite3/
-COPY stress ./stress/
+COPY testing/stress ./testing/stress/
 COPY tests ./tests/
 COPY packages ./packages/
 COPY testing/sqlite_test_ext ./testing/sqlite_test_ext
@@ -59,7 +59,7 @@ COPY --from=planner /app/sync ./sync
 COPY --from=planner /app/parser ./parser/
 COPY --from=planner /app/cli ./cli/
 COPY --from=planner /app/sqlite3 ./sqlite3/
-COPY --from=planner /app/stress ./stress/
+COPY --from=planner /app/testing/stress ./testing/stress/
 COPY --from=planner /app/tests ./tests/
 COPY --from=planner /app/packages ./packages/
 COPY --from=planner /app/testing/sqlite_test_ext ./testing/sqlite_test_ext
