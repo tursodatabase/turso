@@ -34,7 +34,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install bindgen
-        run: cargo install bindgen-cli
+        run: cargo install --version 0.71.1 bindgen-cli
       - name: Regenerate sdk-kit bindings
         run: cd sdk-kit && ./bindgen.sh
       - name: Regenerate sync/sdk-kit bindings
