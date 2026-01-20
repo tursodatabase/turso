@@ -517,7 +517,8 @@ pub extern "C" fn turso_statement_bind_positional_text(
         Ok(text) => text,
         Err(err) => return unsafe { err.to_capi(std::ptr::null_mut()) },
     };
-    match statement.bind_positional(position, turso_core::Value::Text(Text::new(text))) {
+    // we can't guarantee lifetime for the provided text - so we explicitly copy it to the owned string
+    match statement.bind_positional(position, turso_core::Value::Text(Text::new(text.to_string()))) {
         Ok(()) => c::turso_status_code_t::TURSO_OK,
         Err(err) => unsafe { err.to_capi(std::ptr::null_mut()) },
     }
