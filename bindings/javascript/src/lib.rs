@@ -114,6 +114,43 @@ impl Task for DbTask {
     }
 }
 
+/// Supported encryption ciphers for local database encryption.
+#[napi]
+#[derive(Clone, Copy)]
+pub enum EncryptionCipher {
+    Aes128Gcm,
+    Aes256Gcm,
+    Aegis256,
+    Aegis256x2,
+    Aegis128l,
+    Aegis128x2,
+    Aegis128x4,
+}
+
+impl EncryptionCipher {
+    fn as_str(&self) -> &'static str {
+        match self {
+            EncryptionCipher::Aes128Gcm => "aes128gcm",
+            EncryptionCipher::Aes256Gcm => "aes256gcm",
+            EncryptionCipher::Aegis256 => "aegis256",
+            EncryptionCipher::Aegis256x2 => "aegis256x2",
+            EncryptionCipher::Aegis128l => "aegis128l",
+            EncryptionCipher::Aegis128x2 => "aegis128x2",
+            EncryptionCipher::Aegis128x4 => "aegis128x4",
+        }
+    }
+}
+
+/// Encryption configuration for local database encryption.
+#[napi(object)]
+#[derive(Clone)]
+pub struct EncryptionOpts {
+    /// The cipher to use for encryption
+    pub cipher: EncryptionCipher,
+    /// The hex-encoded encryption key
+    pub hexkey: String,
+}
+
 /// Most of the options are aligned with better-sqlite API
 /// (see https://github.com/WiseLibs/better-sqlite3/blob/master/docs/api.md#new-databasepath-options)
 #[napi(object)]
@@ -123,6 +160,8 @@ pub struct DatabaseOpts {
     pub timeout: Option<u32>,
     pub file_must_exist: Option<bool>,
     pub tracing: Option<String>,
+    /// Optional encryption configuration for local database encryption
+    pub encryption: Option<EncryptionOpts>,
 }
 
 fn step_sync(stmt: &Arc<RefCell<turso_core::Statement>>) -> napi::Result<u32> {
@@ -162,6 +201,7 @@ fn connect_sync(db: &DatabaseInner) -> napi::Result<()> {
 
     let mut flags = turso_core::OpenFlags::Create;
     let mut busy_timeout = None;
+    let mut encryption_opts = None;
     if let Some(opts) = &db.opts {
         if opts.readonly == Some(true) {
             flags.set(turso_core::OpenFlags::ReadOnly, true);
@@ -173,14 +213,25 @@ fn connect_sync(db: &DatabaseInner) -> napi::Result<()> {
         if let Some(timeout) = opts.timeout {
             busy_timeout = Some(std::time::Duration::from_millis(timeout as u64));
         }
+        if let Some(encryption) = &opts.encryption {
+            encryption_opts = Some(turso_core::EncryptionOpts {
+                cipher: encryption.cipher.as_str().to_string(),
+                hexkey: encryption.hexkey.clone(),
+            });
+        }
     }
     let io = &db.io;
+    let db_opts = if encryption_opts.is_some() {
+        turso_core::DatabaseOpts::new().with_encryption(true)
+    } else {
+        turso_core::DatabaseOpts::new()
+    };
     let db_core = turso_core::Database::open_file_with_flags(
         io.clone(),
         &db.path,
         flags,
-        turso_core::DatabaseOpts::new(),
-        None,
+        db_opts,
+        encryption_opts,
     )
     .map_err(|e| to_generic_error(&format!("failed to open database {}", db.path), e))?;
 
