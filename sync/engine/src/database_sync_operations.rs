@@ -1424,7 +1424,12 @@ async fn sql_execute_http<IO: SyncEngineIo, Ctx>(
     let body = serde_json::to_vec(&request)?;
 
     ctx.io.network_stats.write(body.len());
-    let completion = ctx.http("POST", "/v2/pipeline", Some(body), &[("content-type", "application/json")])?;
+    let completion = ctx.http(
+        "POST",
+        "/v2/pipeline",
+        Some(body),
+        &[("content-type", "application/json")],
+    )?;
 
     wait_ok_status(ctx.coro, &completion, "sql_execute_http").await?;
 
