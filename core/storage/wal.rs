@@ -1168,6 +1168,7 @@ impl Wal for WalFile {
                 "must have a read transaction to begin a write transaction"
             );
             if !shared.write_lock.write() {
+                tracing::debug!("begin_write_tx: write_lock acquired by another transaction");
                 return Err(LimboError::Busy);
             }
             let db_changed = self.db_changed(shared);
@@ -1195,6 +1196,7 @@ impl Wal for WalFile {
             shared.write_lock.unlock();
         });
 
+        tracing::debug!("begin_write_tx: write_lock acquired");
         Err(result.expect_err("Ok case handled above"))
     }
 

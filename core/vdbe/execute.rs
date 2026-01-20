@@ -2104,6 +2104,7 @@ pub fn op_transaction_inner(
     let pager = program.get_pager_from_database_index(db);
     let mv_store = program.connection.mv_store();
     loop {
+        tracing::debug!("op_transaction: state={:?}", state.op_transaction_state);
         match state.op_transaction_state {
             OpTransactionState::Start => {
                 let conn = program.connection.clone();
