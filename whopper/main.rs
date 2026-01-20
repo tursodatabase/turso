@@ -14,9 +14,6 @@ struct Args {
     /// Keep mmap I/O files on disk after run
     #[arg(long)]
     keep: bool,
-    /// Disable creation and manipulation of indexes
-    #[arg(long)]
-    disable_indexes: bool,
     /// Enable MVCC (Multi-Version Concurrency Control)
     #[arg(long)]
     enable_mvcc: bool,
@@ -106,7 +103,6 @@ fn build_opts(args: &Args, seed: u64) -> anyhow::Result<WhopperOpts> {
         .with_seed(seed)
         .with_max_connections(max_connections)
         .with_keep_files(args.keep)
-        .with_disable_indexes(args.disable_indexes)
         .with_enable_mvcc(args.enable_mvcc)
         .with_enable_encryption(args.enable_encryption))
 }

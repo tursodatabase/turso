@@ -24,8 +24,287 @@ mod io;
 use crate::io::FILE_SIZE_SOFT_LIMIT;
 pub use io::{IOFaultConfig, SimulatorIO};
 
+/// State of a simulator fiber.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FiberState {
+    Idle,
+    InTx,
+}
+
+/// Context passed to workloads for initialization.
+/// Note: `rng` is passed separately to `Workload::init` to avoid borrow conflicts
+/// when calling `Arbitrary::arbitrary(rng, ctx)` which needs both `&mut rng` and `&ctx`.
+pub struct WorkloadContext<'a> {
+    pub connection: &'a Arc<Connection>,
+    pub state: &'a mut FiberState,
+    pub statement: &'a RefCell<Option<Statement>>,
+    pub tables: &'a Vec<Table>,
+    pub indexes: &'a mut Vec<(String, String)>,
+    pub stats: &'a mut Stats,
+    pub opts: &'a Opts,
+    pub enable_mvcc: bool,
+}
+
+impl GenerationContext for WorkloadContext<'_> {
+    fn tables(&self) -> &Vec<Table> {
+        self.tables
+    }
+
+    fn opts(&self) -> &Opts {
+        self.opts
+    }
+}
+
+impl WorkloadContext<'_> {
+    /// Prepare a statement on this fiber. Returns true if successful.
+    pub fn prepare(&self, sql: &str) -> bool {
+        match self.connection.prepare(sql) {
+            Ok(stmt) => {
+                self.statement.replace(Some(stmt));
+                true
+            }
+            Err(_) => false,
+        }
+    }
+}
+
+/// A workload is a unit of work that can be executed on a fiber.
+/// Returns Ok(true) if the fiber was initialized, Ok(false) if this
+/// workload couldn't be applied and another should be tried.
+pub trait Workload: Send + Sync {
+    fn init(&self, ctx: &mut WorkloadContext, rng: &mut ChaCha8Rng) -> anyhow::Result<bool>;
+}
+
+// ============================================================================
+// Default Workload Implementations
+// ============================================================================
+
+/// Begin a new transaction.
+pub struct BeginWorkload;
+
+impl Workload for BeginWorkload {
+    fn init(&self, ctx: &mut WorkloadContext, rng: &mut ChaCha8Rng) -> anyhow::Result<bool> {
+        if *ctx.state != FiberState::Idle {
+            return Ok(false);
+        }
+        let cmd = if ctx.enable_mvcc {
+            match rng.random_range(0..3) {
+                0 => "BEGIN DEFERRED",
+                1 => "BEGIN IMMEDIATE",
+                _ => "BEGIN CONCURRENT",
+            }
+        } else {
+            "BEGIN"
+        };
+        if ctx.prepare(cmd) {
+            *ctx.state = FiberState::InTx;
+            trace!("BEGIN: {}", cmd);
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+}
+
+/// Run PRAGMA integrity_check.
+pub struct IntegrityCheckWorkload;
+
+impl Workload for IntegrityCheckWorkload {
+    fn init(&self, ctx: &mut WorkloadContext, _rng: &mut ChaCha8Rng) -> anyhow::Result<bool> {
+        if *ctx.state != FiberState::Idle {
+            return Ok(false);
+        }
+        if ctx.prepare("PRAGMA integrity_check") {
+            ctx.stats.integrity_checks += 1;
+            trace!("PRAGMA integrity_check");
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+}
+
+/// Execute a SELECT query.
+pub struct SelectWorkload;
+
+impl Workload for SelectWorkload {
+    fn init(&self, ctx: &mut WorkloadContext, rng: &mut ChaCha8Rng) -> anyhow::Result<bool> {
+        if *ctx.state != FiberState::InTx {
+            return Ok(false);
+        }
+        let select = Select::arbitrary(rng, ctx);
+        let sql = select.to_string();
+        if ctx.prepare(&sql) {
+            trace!("SELECT: {}", sql);
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+}
+
+/// Execute an INSERT statement.
+pub struct InsertWorkload;
+
+impl Workload for InsertWorkload {
+    fn init(&self, ctx: &mut WorkloadContext, rng: &mut ChaCha8Rng) -> anyhow::Result<bool> {
+        if *ctx.state != FiberState::InTx {
+            return Ok(false);
+        }
+        let insert = Insert::arbitrary(rng, ctx);
+        let sql = insert.to_string();
+        if ctx.prepare(&sql) {
+            ctx.stats.inserts += 1;
+            trace!("INSERT: {}", sql);
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+}
+
+/// Execute an UPDATE statement.
+pub struct UpdateWorkload;
+
+impl Workload for UpdateWorkload {
+    fn init(&self, ctx: &mut WorkloadContext, rng: &mut ChaCha8Rng) -> anyhow::Result<bool> {
+        if *ctx.state != FiberState::InTx {
+            return Ok(false);
+        }
+        let update = Update::arbitrary(rng, ctx);
+        let sql = update.to_string();
+        if ctx.prepare(&sql) {
+            ctx.stats.updates += 1;
+            trace!("UPDATE: {}", sql);
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+}
+
+/// Execute a DELETE statement.
+pub struct DeleteWorkload;
+
+impl Workload for DeleteWorkload {
+    fn init(&self, ctx: &mut WorkloadContext, rng: &mut ChaCha8Rng) -> anyhow::Result<bool> {
+        if *ctx.state != FiberState::InTx {
+            return Ok(false);
+        }
+        let delete = Delete::arbitrary(rng, ctx);
+        let sql = delete.to_string();
+        if ctx.prepare(&sql) {
+            ctx.stats.deletes += 1;
+            trace!("DELETE: {}", sql);
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+}
+
+/// Create a new index.
+pub struct CreateIndexWorkload;
+
+impl Workload for CreateIndexWorkload {
+    fn init(&self, ctx: &mut WorkloadContext, rng: &mut ChaCha8Rng) -> anyhow::Result<bool> {
+        if *ctx.state != FiberState::InTx {
+            return Ok(false);
+        }
+        let create_index = CreateIndex::arbitrary(rng, ctx);
+        let sql = create_index.to_string();
+        if ctx.prepare(&sql) {
+            ctx.indexes.push((
+                create_index.index.table_name.clone(),
+                create_index.index_name.clone(),
+            ));
+            trace!("CREATE INDEX: {}", sql);
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+}
+
+/// Drop an existing index.
+pub struct DropIndexWorkload;
+
+impl Workload for DropIndexWorkload {
+    fn init(&self, ctx: &mut WorkloadContext, rng: &mut ChaCha8Rng) -> anyhow::Result<bool> {
+        if *ctx.state != FiberState::InTx || ctx.indexes.is_empty() {
+            return Ok(false);
+        }
+        let index_idx = rng.random_range(0..ctx.indexes.len());
+        let (table_name, index_name) = ctx.indexes.remove(index_idx);
+        let drop_index = DropIndex {
+            table_name,
+            index_name,
+        };
+        let sql = drop_index.to_string();
+        if ctx.prepare(&sql) {
+            trace!("DROP INDEX: {}", sql);
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+}
+
+/// Commit the current transaction.
+pub struct CommitWorkload;
+
+impl Workload for CommitWorkload {
+    fn init(&self, ctx: &mut WorkloadContext, _rng: &mut ChaCha8Rng) -> anyhow::Result<bool> {
+        if *ctx.state != FiberState::InTx {
+            return Ok(false);
+        }
+        if ctx.prepare("COMMIT") {
+            *ctx.state = FiberState::Idle;
+            trace!("COMMIT");
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+}
+
+/// Rollback the current transaction.
+pub struct RollbackWorkload;
+
+impl Workload for RollbackWorkload {
+    fn init(&self, ctx: &mut WorkloadContext, _rng: &mut ChaCha8Rng) -> anyhow::Result<bool> {
+        if *ctx.state != FiberState::InTx {
+            return Ok(false);
+        }
+        if ctx.prepare("ROLLBACK") {
+            *ctx.state = FiberState::Idle;
+            trace!("ROLLBACK");
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+}
+
+/// Returns the default workload configuration matching the original probabilities.
+pub fn default_workloads() -> Vec<(u32, Box<dyn Workload>)> {
+    vec![
+        // Idle state workloads
+        (30, Box::new(BeginWorkload)),
+        (1, Box::new(IntegrityCheckWorkload)),
+        // InTx state workloads
+        (10, Box::new(SelectWorkload)),
+        (30, Box::new(InsertWorkload)),
+        (20, Box::new(UpdateWorkload)),
+        (10, Box::new(DeleteWorkload)),
+        (2, Box::new(CreateIndexWorkload)),
+        (2, Box::new(DropIndexWorkload)),
+        (13, Box::new(CommitWorkload)),
+        (13, Box::new(RollbackWorkload)),
+    ]
+}
+
 /// Configuration options for the Whopper simulator.
-#[derive(Debug, Clone)]
 pub struct WhopperOpts {
     /// Random seed for deterministic simulation. If None, a random seed is generated.
     pub seed: Option<u64>,
@@ -37,12 +316,12 @@ pub struct WhopperOpts {
     pub cosmic_ray_probability: f64,
     /// Keep mmap I/O files on disk after run.
     pub keep_files: bool,
-    /// Disable creation and manipulation of indexes.
-    pub disable_indexes: bool,
     /// Enable MVCC (Multi-Version Concurrency Control).
     pub enable_mvcc: bool,
     /// Enable database encryption with random cipher.
     pub enable_encryption: bool,
+    /// Workloads with weights: (weight, workload). Higher weight = more likely.
+    pub workloads: Vec<(u32, Box<dyn Workload>)>,
 }
 
 impl Default for WhopperOpts {
@@ -53,9 +332,9 @@ impl Default for WhopperOpts {
             max_steps: 100_000,
             cosmic_ray_probability: 0.0,
             keep_files: false,
-            disable_indexes: false,
             enable_mvcc: false,
             enable_encryption: false,
+            workloads: default_workloads(),
         }
     }
 }
@@ -111,11 +390,6 @@ impl WhopperOpts {
         self
     }
 
-    pub fn with_disable_indexes(mut self, disable: bool) -> Self {
-        self.disable_indexes = disable;
-        self
-    }
-
     pub fn with_enable_mvcc(mut self, enable: bool) -> Self {
         self.enable_mvcc = enable;
         self
@@ -123,6 +397,11 @@ impl WhopperOpts {
 
     pub fn with_enable_encryption(mut self, enable: bool) -> Self {
         self.enable_encryption = enable;
+        self
+    }
+
+    pub fn with_workloads(mut self, workloads: Vec<(u32, Box<dyn Workload>)>) -> Self {
+        self.workloads = workloads;
         self
     }
 }
@@ -145,12 +424,6 @@ pub enum StepResult {
     WalSizeLimitExceeded,
 }
 
-#[derive(Debug)]
-enum FiberState {
-    Idle,
-    InTx,
-}
-
 struct SimulatorFiber {
     connection: Arc<Connection>,
     state: FiberState,
@@ -161,19 +434,7 @@ struct SimulatorContext {
     fibers: Vec<SimulatorFiber>,
     tables: Vec<Table>,
     indexes: Vec<(String, String)>,
-    opts: Opts,
-    disable_indexes: bool,
     enable_mvcc: bool,
-}
-
-impl GenerationContext for SimulatorContext {
-    fn tables(&self) -> &Vec<Table> {
-        &self.tables
-    }
-
-    fn opts(&self) -> &Opts {
-        &self.opts
-    }
 }
 
 /// The Whopper deterministic simulator.
@@ -183,6 +444,9 @@ pub struct Whopper {
     io: Arc<dyn IO>,
     file_sizes: Arc<std::sync::Mutex<HashMap<String, u64>>>,
     wal_path: String,
+    workloads: Vec<(u32, Box<dyn Workload>)>,
+    total_weight: u32,
+    opts: Opts,
     pub current_step: usize,
     pub max_steps: usize,
     pub seed: u64,
@@ -256,11 +520,7 @@ impl Whopper {
             bootstrap_conn.execute(&sql)?;
         }
 
-        let indexes = if opts.disable_indexes {
-            Vec::new()
-        } else {
-            create_initial_indexes(&mut rng, &tables)
-        };
+        let indexes = create_initial_indexes(&mut rng, &tables);
         for create_index in &indexes {
             let sql = create_index.to_string();
             trace!("{}", sql);
@@ -295,10 +555,10 @@ impl Whopper {
                 .iter()
                 .map(|idx| (idx.table_name.clone(), idx.index_name.clone()))
                 .collect(),
-            opts: Opts::default(),
-            disable_indexes: opts.disable_indexes,
             enable_mvcc: opts.enable_mvcc,
         };
+
+        let total_weight: u32 = opts.workloads.iter().map(|(w, _)| w).sum();
 
         Ok(Self {
             context,
@@ -306,6 +566,9 @@ impl Whopper {
             io,
             file_sizes,
             wal_path,
+            workloads: opts.workloads,
+            total_weight,
+            opts: Opts::default(),
             current_step: 0,
             max_steps: opts.max_steps,
             seed,
@@ -327,7 +590,7 @@ impl Whopper {
         }
 
         let fiber_idx = self.current_step % self.context.fibers.len();
-        perform_work(fiber_idx, &mut self.rng, &mut self.context, &mut self.stats)?;
+        self.perform_work(fiber_idx)?;
         self.io.step()?;
         self.current_step += 1;
 
@@ -336,6 +599,131 @@ impl Whopper {
         }
 
         Ok(StepResult::Ok)
+    }
+
+    fn perform_work(&mut self, fiber_idx: usize) -> anyhow::Result<()> {
+        // If we have a statement, step it.
+        let done = {
+            let mut stmt_borrow = self.context.fibers[fiber_idx].statement.borrow_mut();
+            if let Some(stmt) = stmt_borrow.as_mut() {
+                let step_result = {
+                    let span = tracing::debug_span!(
+                        "fiber",
+                        fiber_idx = fiber_idx,
+                        state = format!("{:?}", self.context.fibers[fiber_idx].state)
+                    );
+                    let _enter = span.enter();
+                    stmt.step()
+                };
+                match step_result {
+                    Ok(result) => {
+                        tracing::debug!("fiber: {} {:?}", fiber_idx, result);
+                        matches!(result, turso_core::StepResult::Done)
+                    }
+                    Err(e) => match e {
+                        turso_core::LimboError::SchemaUpdated => {
+                            trace!("{} Schema changed, rolling back transaction", fiber_idx);
+                            drop(stmt_borrow);
+                            self.context.fibers[fiber_idx].statement.replace(None);
+                            if matches!(self.context.fibers[fiber_idx].state, FiberState::InTx)
+                                && let Ok(rollback_stmt) = self.context.fibers[fiber_idx]
+                                    .connection
+                                    .prepare("ROLLBACK")
+                            {
+                                self.context.fibers[fiber_idx]
+                                    .statement
+                                    .replace(Some(rollback_stmt));
+                                self.context.fibers[fiber_idx].state = FiberState::Idle;
+                            }
+                            return Ok(());
+                        }
+                        turso_core::LimboError::Busy => {
+                            trace!("{} Database busy, rolling back transaction", fiber_idx);
+                            drop(stmt_borrow);
+                            self.context.fibers[fiber_idx].statement.replace(None);
+                            if matches!(self.context.fibers[fiber_idx].state, FiberState::InTx)
+                                && let Ok(rollback_stmt) = self.context.fibers[fiber_idx]
+                                    .connection
+                                    .prepare("ROLLBACK")
+                            {
+                                self.context.fibers[fiber_idx]
+                                    .statement
+                                    .replace(Some(rollback_stmt));
+                                self.context.fibers[fiber_idx].state = FiberState::Idle;
+                            }
+                            return Ok(());
+                        }
+                        turso_core::LimboError::WriteWriteConflict => {
+                            trace!(
+                                "{} Write-write conflict, transaction automatically rolled back",
+                                fiber_idx
+                            );
+                            drop(stmt_borrow);
+                            self.context.fibers[fiber_idx].statement.replace(None);
+                            self.context.fibers[fiber_idx].state = FiberState::Idle;
+                            return Ok(());
+                        }
+                        turso_core::LimboError::BusySnapshot => {
+                            trace!("{} Stale snapshot, rolling back transaction", fiber_idx);
+                            drop(stmt_borrow);
+                            self.context.fibers[fiber_idx].statement.replace(None);
+                            if matches!(self.context.fibers[fiber_idx].state, FiberState::InTx)
+                                && let Ok(rollback_stmt) = self.context.fibers[fiber_idx]
+                                    .connection
+                                    .prepare("ROLLBACK")
+                            {
+                                self.context.fibers[fiber_idx]
+                                    .statement
+                                    .replace(Some(rollback_stmt));
+                                self.context.fibers[fiber_idx].state = FiberState::Idle;
+                            }
+                            return Ok(());
+                        }
+                        _ => {
+                            return Err(e.into());
+                        }
+                    },
+                }
+            } else {
+                true
+            }
+        };
+
+        // If the statement has more work, we're done for this simulation step
+        if !done {
+            return Ok(());
+        }
+
+        self.context.fibers[fiber_idx].statement.replace(None);
+
+        // Select a workload using weighted random selection
+        if self.total_weight == 0 {
+            return Ok(());
+        }
+
+        let mut roll = self.rng.random_range(0..self.total_weight);
+        for (weight, workload) in &self.workloads {
+            if roll < *weight {
+                let fiber = &mut self.context.fibers[fiber_idx];
+                let mut ctx = WorkloadContext {
+                    connection: &fiber.connection,
+                    state: &mut fiber.state,
+                    statement: &fiber.statement,
+                    tables: &self.context.tables,
+                    indexes: &mut self.context.indexes,
+                    stats: &mut self.stats,
+                    opts: &self.opts,
+                    enable_mvcc: self.context.enable_mvcc,
+                };
+                if workload.init(&mut ctx, &mut self.rng)? {
+                    return Ok(());
+                }
+                // If workload returned false, continue to try next
+            }
+            roll = roll.saturating_sub(*weight);
+        }
+
+        Ok(())
     }
 
     /// Run the simulation to completion (up to max_steps or WAL limit).
@@ -484,238 +872,6 @@ fn random_encryption_config(rng: &mut ChaCha8Rng) -> EncryptionOpts {
         cipher: cipher_mode.to_string(),
         hexkey: hex::encode(&key),
     }
-}
-
-fn perform_work(
-    fiber_idx: usize,
-    rng: &mut ChaCha8Rng,
-    context: &mut SimulatorContext,
-    stats: &mut Stats,
-) -> anyhow::Result<()> {
-    // If we have a statement, step it.
-    let done = {
-        let mut stmt_borrow = context.fibers[fiber_idx].statement.borrow_mut();
-        if let Some(stmt) = stmt_borrow.as_mut() {
-            let step_result = {
-                let span = tracing::debug_span!(
-                    "fiber",
-                    fiber_idx = fiber_idx,
-                    state = format!("{:?}", context.fibers[fiber_idx].state)
-                );
-                let _enter = span.enter();
-                stmt.step()
-            };
-            match step_result {
-                Ok(result) => {
-                    tracing::debug!("fiber: {} {:?}", fiber_idx, result);
-                    matches!(result, turso_core::StepResult::Done)
-                }
-                Err(e) => {
-                    match e {
-                        turso_core::LimboError::SchemaUpdated => {
-                            trace!("{} Schema changed, rolling back transaction", fiber_idx);
-                            drop(stmt_borrow);
-                            context.fibers[fiber_idx].statement.replace(None);
-                            // Rollback the transaction if we're in one
-                            if matches!(context.fibers[fiber_idx].state, FiberState::InTx)
-                                && let Ok(rollback_stmt) =
-                                    context.fibers[fiber_idx].connection.prepare("ROLLBACK")
-                            {
-                                context.fibers[fiber_idx]
-                                    .statement
-                                    .replace(Some(rollback_stmt));
-                                context.fibers[fiber_idx].state = FiberState::Idle;
-                            }
-                            return Ok(());
-                        }
-                        turso_core::LimboError::Busy => {
-                            trace!("{} Database busy, rolling back transaction", fiber_idx);
-                            drop(stmt_borrow);
-                            context.fibers[fiber_idx].statement.replace(None);
-                            // Rollback the transaction if we're in one
-                            if matches!(context.fibers[fiber_idx].state, FiberState::InTx)
-                                && let Ok(rollback_stmt) =
-                                    context.fibers[fiber_idx].connection.prepare("ROLLBACK")
-                            {
-                                context.fibers[fiber_idx]
-                                    .statement
-                                    .replace(Some(rollback_stmt));
-                                context.fibers[fiber_idx].state = FiberState::Idle;
-                            }
-                            return Ok(());
-                        }
-                        turso_core::LimboError::WriteWriteConflict => {
-                            trace!(
-                                "{} Write-write conflict, transaction automatically rolled back",
-                                fiber_idx
-                            );
-                            drop(stmt_borrow);
-                            context.fibers[fiber_idx].statement.replace(None);
-                            context.fibers[fiber_idx].state = FiberState::Idle;
-                            return Ok(());
-                        }
-                        turso_core::LimboError::BusySnapshot => {
-                            trace!("{} Stale snapshot, rolling back transaction", fiber_idx);
-                            drop(stmt_borrow);
-                            context.fibers[fiber_idx].statement.replace(None);
-                            if matches!(context.fibers[fiber_idx].state, FiberState::InTx)
-                                && let Ok(rollback_stmt) =
-                                    context.fibers[fiber_idx].connection.prepare("ROLLBACK")
-                            {
-                                context.fibers[fiber_idx]
-                                    .statement
-                                    .replace(Some(rollback_stmt));
-                                context.fibers[fiber_idx].state = FiberState::Idle;
-                            }
-                            return Ok(());
-                        }
-                        _ => {
-                            return Err(e.into());
-                        }
-                    }
-                }
-            }
-        } else {
-            true
-        }
-    };
-    // If the statement has more work, we're done for this simulation step
-    if !done {
-        return Ok(());
-    }
-    context.fibers[fiber_idx].statement.replace(None);
-    match context.fibers[fiber_idx].state {
-        FiberState::Idle => {
-            let action = rng.random_range(0..100);
-            if action <= 29 {
-                let begin_cmd = if context.enable_mvcc {
-                    match rng.random_range(0..3) {
-                        0 => "BEGIN DEFERRED",
-                        1 => "BEGIN IMMEDIATE",
-                        _ => "BEGIN CONCURRENT",
-                    }
-                } else {
-                    "BEGIN"
-                };
-                if let Ok(stmt) = context.fibers[fiber_idx].connection.prepare(begin_cmd) {
-                    context.fibers[fiber_idx].statement.replace(Some(stmt));
-                    context.fibers[fiber_idx].state = FiberState::InTx;
-                    trace!("fiber: {} {}", fiber_idx, begin_cmd);
-                }
-            } else if action == 30 {
-                // Integrity check
-                if let Ok(stmt) = context.fibers[fiber_idx]
-                    .connection
-                    .prepare("PRAGMA integrity_check")
-                {
-                    context.fibers[fiber_idx].statement.replace(Some(stmt));
-                    stats.integrity_checks += 1;
-                    trace!("fiber: {} PRAGMA integrity_check", fiber_idx);
-                }
-            }
-        }
-        FiberState::InTx => {
-            let action = rng.random_range(0..100);
-            match action {
-                0..=9 => {
-                    // SELECT (10%)
-                    let select = Select::arbitrary(rng, context);
-                    if let Ok(stmt) = context.fibers[fiber_idx]
-                        .connection
-                        .prepare(select.to_string())
-                    {
-                        context.fibers[fiber_idx].statement.replace(Some(stmt));
-                    }
-                    trace!("fiber: {} SELECT: {}", fiber_idx, select.to_string());
-                }
-                10..=39 => {
-                    // INSERT (30%)
-                    let insert = Insert::arbitrary(rng, context);
-                    if let Ok(stmt) = context.fibers[fiber_idx]
-                        .connection
-                        .prepare(insert.to_string())
-                    {
-                        context.fibers[fiber_idx].statement.replace(Some(stmt));
-                        stats.inserts += 1;
-                    }
-                    trace!("fiber: {} INSERT: {}", fiber_idx, insert.to_string());
-                }
-                40..=59 => {
-                    // UPDATE (20%)
-                    let update = Update::arbitrary(rng, context);
-                    if let Ok(stmt) = context.fibers[fiber_idx]
-                        .connection
-                        .prepare(update.to_string())
-                    {
-                        context.fibers[fiber_idx].statement.replace(Some(stmt));
-                        stats.updates += 1;
-                    }
-                    trace!("fiber: {} UPDATE: {}", fiber_idx, update.to_string());
-                }
-                60..=69 => {
-                    // DELETE (10%)
-                    let delete = Delete::arbitrary(rng, context);
-                    if let Ok(stmt) = context.fibers[fiber_idx]
-                        .connection
-                        .prepare(delete.to_string())
-                    {
-                        context.fibers[fiber_idx].statement.replace(Some(stmt));
-                        stats.deletes += 1;
-                    }
-                    trace!("fiber: {} DELETE: {}", fiber_idx, delete.to_string());
-                }
-                70..=71 => {
-                    // CREATE INDEX (2%)
-                    if !context.disable_indexes {
-                        let create_index = CreateIndex::arbitrary(rng, context);
-                        let sql = create_index.to_string();
-                        if let Ok(stmt) = context.fibers[fiber_idx].connection.prepare(&sql) {
-                            context.fibers[fiber_idx].statement.replace(Some(stmt));
-                            context.indexes.push((
-                                create_index.index.table_name.clone(),
-                                create_index.index_name.clone(),
-                            ));
-                        }
-                        trace!("fiber: {} CREATE INDEX: {}", fiber_idx, sql);
-                    }
-                }
-                72..=73 => {
-                    // DROP INDEX (2%)
-                    if !context.disable_indexes && !context.indexes.is_empty() {
-                        let index_idx = rng.random_range(0..context.indexes.len());
-                        let (table_name, index_name) = context.indexes.remove(index_idx);
-                        let drop_index = DropIndex {
-                            table_name,
-                            index_name,
-                        };
-                        let sql = drop_index.to_string();
-                        if let Ok(stmt) = context.fibers[fiber_idx].connection.prepare(&sql) {
-                            context.fibers[fiber_idx].statement.replace(Some(stmt));
-                        }
-                        trace!("fiber: {} DROP INDEX: {}", fiber_idx, sql);
-                    }
-                }
-                74..=86 => {
-                    // COMMIT (13%)
-                    if let Ok(stmt) = context.fibers[fiber_idx].connection.prepare("COMMIT") {
-                        context.fibers[fiber_idx].statement.replace(Some(stmt));
-                        context.fibers[fiber_idx].state = FiberState::Idle;
-                    }
-                    trace!("fiber: {} COMMIT", fiber_idx);
-                }
-                87..=99 => {
-                    // ROLLBACK (13%)
-                    if let Ok(stmt) = context.fibers[fiber_idx].connection.prepare("ROLLBACK") {
-                        context.fibers[fiber_idx].statement.replace(Some(stmt));
-                        context.fibers[fiber_idx].state = FiberState::Idle;
-                    }
-                    trace!("fiber: {} ROLLBACK", fiber_idx);
-                }
-                _ => {}
-            }
-        }
-    }
-    Ok(())
 }
 
 fn file_size_soft_limit_exceeded(
