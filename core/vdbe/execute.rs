@@ -10624,6 +10624,33 @@ pub fn op_hash_distinct(
     }
 }
 
+pub fn op_hash_agg_step(
+    _program: &Program,
+    _state: &mut ProgramState,
+    _insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    todo!("HashAggStep execution to be implemented")
+}
+
+pub fn op_hash_agg_init(
+    _program: &Program,
+    _state: &mut ProgramState,
+    _insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    todo!("HashAggInit execution to be implemented")
+}
+
+pub fn op_hash_agg_next(
+    _program: &Program,
+    _state: &mut ProgramState,
+    _insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    todo!("HashAggNext execution to be implemented")
+}
+
 pub fn op_hash_build_finalize(
     _program: &Program,
     state: &mut ProgramState,
