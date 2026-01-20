@@ -1,7 +1,8 @@
 use crate::backends::{BackendError, SqlBackend};
 use crate::comparison::{ComparisonResult, compare};
-use crate::parser::ast::{DatabaseConfig, TestCase, TestFile};
+use crate::parser::ast::{Capability, DatabaseConfig, Requirement, TestCase, TestFile};
 use futures::stream::{FuturesUnordered, StreamExt};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -267,6 +268,7 @@ impl<B: SqlBackend + 'static> TestRunner<B> {
     ) -> FuturesUnordered<tokio::task::JoinHandle<TestResult>> {
         let futures = FuturesUnordered::new();
         let backend_type = self.backend.backend_type();
+        let backend_capabilities = self.backend.capabilities();
 
         // For each database configuration
         for db_config in &test_file.databases {
@@ -294,6 +296,8 @@ impl<B: SqlBackend + 'static> TestRunner<B> {
                 let file_path = path.to_path_buf();
                 let mvcc = self.config.mvcc;
                 let global_skip = test_file.global_skip.clone();
+                let global_requires = test_file.global_requires.clone();
+                let capabilities = backend_capabilities.clone();
 
                 futures.push(tokio::spawn(async move {
                     let _permit = semaphore.acquire_owned().await.unwrap();
@@ -305,6 +309,8 @@ impl<B: SqlBackend + 'static> TestRunner<B> {
                         setups,
                         mvcc,
                         global_skip,
+                        global_requires,
+                        capabilities,
                     )
                     .await
                 }));
@@ -446,6 +452,7 @@ impl<B: SqlBackend + 'static> TestRunner<B> {
 }
 
 /// Run a single test
+#[allow(clippy::too_many_arguments)]
 async fn run_single_test<B: SqlBackend>(
     backend: Arc<B>,
     file_path: PathBuf,
@@ -454,6 +461,8 @@ async fn run_single_test<B: SqlBackend>(
     setups: std::collections::HashMap<String, String>,
     mvcc: bool,
     global_skip: Option<crate::parser::ast::Skip>,
+    global_requires: Vec<Requirement>,
+    backend_capabilities: HashSet<Capability>,
 ) -> TestResult {
     let start = Instant::now();
 
@@ -471,6 +480,21 @@ async fn run_single_test<B: SqlBackend>(
                 database: db_config,
                 outcome: TestOutcome::Skipped {
                     reason: skip.reason.clone(),
+                },
+                duration: start.elapsed(),
+            };
+        }
+    }
+
+    // Check required capabilities (global + per-test)
+    for req in global_requires.iter().chain(test.requires.iter()) {
+        if !backend_capabilities.contains(&req.capability) {
+            return TestResult {
+                name: test.name,
+                file: file_path,
+                database: db_config,
+                outcome: TestOutcome::Skipped {
+                    reason: format!("requires {}: {}", req.capability, req.reason),
                 },
                 duration: start.elapsed(),
             };

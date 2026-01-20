@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
 use std::ops::Range;
 use std::path::PathBuf;
@@ -45,6 +45,57 @@ impl FromStr for Backend {
     }
 }
 
+/// Backend capabilities that tests can require
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Capability {
+    /// Support for CREATE TRIGGER
+    Trigger,
+    /// Support for STRICT tables
+    Strict,
+}
+
+impl Capability {
+    /// All known capability variants
+    pub const ALL: &'static [Capability] = &[Capability::Trigger, Capability::Strict];
+
+    /// Get all capabilities as a HashSet (convenience for backends that support everything)
+    pub fn all_set() -> HashSet<Capability> {
+        Self::ALL.iter().copied().collect()
+    }
+}
+
+impl Display for Capability {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Capability::Trigger => write!(f, "trigger"),
+            Capability::Strict => write!(f, "strict"),
+        }
+    }
+}
+
+impl FromStr for Capability {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "trigger" => Ok(Capability::Trigger),
+            "strict" => Ok(Capability::Strict),
+            _ => Err(format!(
+                "unknown capability '{s}', valid capabilities are: trigger, strict"
+            )),
+        }
+    }
+}
+
+/// A capability requirement with a reason
+#[derive(Debug, Clone, PartialEq)]
+pub struct Requirement {
+    /// The required capability
+    pub capability: Capability,
+    /// Reason why this capability is required
+    pub reason: String,
+}
+
 /// A complete test file parsed from `.sqltest` format
 #[derive(Debug, Clone, PartialEq)]
 pub struct TestFile {
@@ -56,6 +107,8 @@ pub struct TestFile {
     pub tests: Vec<TestCase>,
     /// Global skip directive that applies to all tests in the file
     pub global_skip: Option<Skip>,
+    /// Global capability requirements that apply to all tests in the file
+    pub global_requires: Vec<Requirement>,
 }
 
 /// A setup reference with its span in the source
@@ -84,6 +137,8 @@ pub struct TestCase {
     pub skip: Option<Skip>,
     /// If set, only run this test on the specified backend
     pub backend: Option<Backend>,
+    /// Required capabilities for this test
+    pub requires: Vec<Requirement>,
 }
 
 /// Skip configuration for a test
