@@ -28,6 +28,24 @@ jobs:
       - name: Check formatting (fuzz)
         run: cd fuzz && cargo fmt --check
 
+  check-bindings:
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install bindgen
+        run: cargo install --version 0.71.1 bindgen-cli
+      - name: Regenerate sdk-kit bindings
+        run: cd sdk-kit && ./bindgen.sh
+      - name: Regenerate sync/sdk-kit bindings
+        run: cd sync/sdk-kit && ./bindgen.sh
+      - name: Check bindings are up to date
+        run: |
+          if ! git diff --exit-code sdk-kit/src/bindings.rs sync/sdk-kit/src/bindings.rs; then
+            echo "Bindings are out of date. Run ./bindgen.sh in sdk-kit/ and sync/sdk-kit/ and commit the changes."
+            exit 1
+          fi
+
   build-native:
     timeout-minutes: ${{ matrix.os == 'windows-latest' && 120 || 30 }}
     strategy:

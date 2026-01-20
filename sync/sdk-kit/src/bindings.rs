@@ -19,23 +19,6 @@ pub struct turso_sync_io_http_request_t {
     pub body: turso_slice_ref_t,
     pub headers: i32,
 }
-#[allow(clippy::unnecessary_operation, clippy::identity_op)]
-const _: () = {
-    ["Size of turso_sync_io_http_request_t"]
-        [::std::mem::size_of::<turso_sync_io_http_request_t>() - 72usize];
-    ["Alignment of turso_sync_io_http_request_t"]
-        [::std::mem::align_of::<turso_sync_io_http_request_t>() - 8usize];
-    ["Offset of field: turso_sync_io_http_request_t::url"]
-        [::std::mem::offset_of!(turso_sync_io_http_request_t, url) - 0usize];
-    ["Offset of field: turso_sync_io_http_request_t::method"]
-        [::std::mem::offset_of!(turso_sync_io_http_request_t, method) - 16usize];
-    ["Offset of field: turso_sync_io_http_request_t::path"]
-        [::std::mem::offset_of!(turso_sync_io_http_request_t, path) - 32usize];
-    ["Offset of field: turso_sync_io_http_request_t::body"]
-        [::std::mem::offset_of!(turso_sync_io_http_request_t, body) - 48usize];
-    ["Offset of field: turso_sync_io_http_request_t::headers"]
-        [::std::mem::offset_of!(turso_sync_io_http_request_t, headers) - 64usize];
-};
 impl Default for turso_sync_io_http_request_t {
     fn default() -> Self {
         let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
@@ -50,17 +33,6 @@ pub struct turso_sync_io_http_header_t {
     pub key: turso_slice_ref_t,
     pub value: turso_slice_ref_t,
 }
-#[allow(clippy::unnecessary_operation, clippy::identity_op)]
-const _: () = {
-    ["Size of turso_sync_io_http_header_t"]
-        [::std::mem::size_of::<turso_sync_io_http_header_t>() - 32usize];
-    ["Alignment of turso_sync_io_http_header_t"]
-        [::std::mem::align_of::<turso_sync_io_http_header_t>() - 8usize];
-    ["Offset of field: turso_sync_io_http_header_t::key"]
-        [::std::mem::offset_of!(turso_sync_io_http_header_t, key) - 0usize];
-    ["Offset of field: turso_sync_io_http_header_t::value"]
-        [::std::mem::offset_of!(turso_sync_io_http_header_t, value) - 16usize];
-};
 impl Default for turso_sync_io_http_header_t {
     fn default() -> Self {
         let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
@@ -74,15 +46,6 @@ impl Default for turso_sync_io_http_header_t {
 pub struct turso_sync_io_full_read_request_t {
     pub path: turso_slice_ref_t,
 }
-#[allow(clippy::unnecessary_operation, clippy::identity_op)]
-const _: () = {
-    ["Size of turso_sync_io_full_read_request_t"]
-        [::std::mem::size_of::<turso_sync_io_full_read_request_t>() - 16usize];
-    ["Alignment of turso_sync_io_full_read_request_t"]
-        [::std::mem::align_of::<turso_sync_io_full_read_request_t>() - 8usize];
-    ["Offset of field: turso_sync_io_full_read_request_t::path"]
-        [::std::mem::offset_of!(turso_sync_io_full_read_request_t, path) - 0usize];
-};
 impl Default for turso_sync_io_full_read_request_t {
     fn default() -> Self {
         let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
@@ -97,17 +60,6 @@ pub struct turso_sync_io_full_write_request_t {
     pub path: turso_slice_ref_t,
     pub content: turso_slice_ref_t,
 }
-#[allow(clippy::unnecessary_operation, clippy::identity_op)]
-const _: () = {
-    ["Size of turso_sync_io_full_write_request_t"]
-        [::std::mem::size_of::<turso_sync_io_full_write_request_t>() - 32usize];
-    ["Alignment of turso_sync_io_full_write_request_t"]
-        [::std::mem::align_of::<turso_sync_io_full_write_request_t>() - 8usize];
-    ["Offset of field: turso_sync_io_full_write_request_t::path"]
-        [::std::mem::offset_of!(turso_sync_io_full_write_request_t, path) - 0usize];
-    ["Offset of field: turso_sync_io_full_write_request_t::content"]
-        [::std::mem::offset_of!(turso_sync_io_full_write_request_t, content) - 16usize];
-};
 impl Default for turso_sync_io_full_write_request_t {
     fn default() -> Self {
         let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
@@ -145,27 +97,6 @@ pub struct turso_sync_stats_t {
     pub network_received_bytes: i64,
     pub revision: turso_slice_ref_t,
 }
-#[allow(clippy::unnecessary_operation, clippy::identity_op)]
-const _: () = {
-    ["Size of turso_sync_stats_t"][::std::mem::size_of::<turso_sync_stats_t>() - 72usize];
-    ["Alignment of turso_sync_stats_t"][::std::mem::align_of::<turso_sync_stats_t>() - 8usize];
-    ["Offset of field: turso_sync_stats_t::cdc_operations"]
-        [::std::mem::offset_of!(turso_sync_stats_t, cdc_operations) - 0usize];
-    ["Offset of field: turso_sync_stats_t::main_wal_size"]
-        [::std::mem::offset_of!(turso_sync_stats_t, main_wal_size) - 8usize];
-    ["Offset of field: turso_sync_stats_t::revert_wal_size"]
-        [::std::mem::offset_of!(turso_sync_stats_t, revert_wal_size) - 16usize];
-    ["Offset of field: turso_sync_stats_t::last_pull_unix_time"]
-        [::std::mem::offset_of!(turso_sync_stats_t, last_pull_unix_time) - 24usize];
-    ["Offset of field: turso_sync_stats_t::last_push_unix_time"]
-        [::std::mem::offset_of!(turso_sync_stats_t, last_push_unix_time) - 32usize];
-    ["Offset of field: turso_sync_stats_t::network_sent_bytes"]
-        [::std::mem::offset_of!(turso_sync_stats_t, network_sent_bytes) - 40usize];
-    ["Offset of field: turso_sync_stats_t::network_received_bytes"]
-        [::std::mem::offset_of!(turso_sync_stats_t, network_received_bytes) - 48usize];
-    ["Offset of field: turso_sync_stats_t::revision"]
-        [::std::mem::offset_of!(turso_sync_stats_t, revision) - 56usize];
-};
 impl Default for turso_sync_stats_t {
     fn default() -> Self {
         let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
@@ -190,43 +121,6 @@ pub struct turso_sync_database_config_t {
     pub partial_bootstrap_segment_size: usize,
     pub partial_bootstrap_prefetch: bool,
 }
-#[allow(clippy::unnecessary_operation, clippy::identity_op)]
-const _: () = {
-    ["Size of turso_sync_database_config_t"]
-        [::std::mem::size_of::<turso_sync_database_config_t>() - 64usize];
-    ["Alignment of turso_sync_database_config_t"]
-        [::std::mem::align_of::<turso_sync_database_config_t>() - 8usize];
-    ["Offset of field: turso_sync_database_config_t::path"]
-        [::std::mem::offset_of!(turso_sync_database_config_t, path) - 0usize];
-    ["Offset of field: turso_sync_database_config_t::remote_url"]
-        [::std::mem::offset_of!(turso_sync_database_config_t, remote_url) - 8usize];
-    ["Offset of field: turso_sync_database_config_t::client_name"]
-        [::std::mem::offset_of!(turso_sync_database_config_t, client_name) - 16usize];
-    ["Offset of field: turso_sync_database_config_t::long_poll_timeout_ms"]
-        [::std::mem::offset_of!(turso_sync_database_config_t, long_poll_timeout_ms) - 24usize];
-    ["Offset of field: turso_sync_database_config_t::bootstrap_if_empty"]
-        [::std::mem::offset_of!(turso_sync_database_config_t, bootstrap_if_empty) - 28usize];
-    ["Offset of field: turso_sync_database_config_t::reserved_bytes"]
-        [::std::mem::offset_of!(turso_sync_database_config_t, reserved_bytes) - 32usize];
-    ["Offset of field: turso_sync_database_config_t::partial_bootstrap_strategy_prefix"][::std::mem::offset_of!(
-        turso_sync_database_config_t,
-        partial_bootstrap_strategy_prefix
-    )
-        - 36usize];
-    ["Offset of field: turso_sync_database_config_t::partial_bootstrap_strategy_query"][::std::mem::offset_of!(
-        turso_sync_database_config_t,
-        partial_bootstrap_strategy_query
-    )
-        - 40usize];
-    ["Offset of field: turso_sync_database_config_t::partial_bootstrap_segment_size"][::std::mem::offset_of!(
-        turso_sync_database_config_t,
-        partial_bootstrap_segment_size
-    ) - 48usize];
-    ["Offset of field: turso_sync_database_config_t::partial_bootstrap_prefetch"][::std::mem::offset_of!(
-        turso_sync_database_config_t,
-        partial_bootstrap_prefetch
-    ) - 56usize];
-};
 impl Default for turso_sync_database_config_t {
     fn default() -> Self {
         let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
