@@ -1,5 +1,6 @@
 pub mod cte;
 pub mod grammar_generator;
+pub mod groupby;
 pub mod journal_mode;
 pub mod orderby_collation;
 pub mod rowid_alias;
@@ -6561,12 +6562,14 @@ mod fuzz_tests {
                             [rng.random_range(0..3)],
                         _ => ("COUNT", "*"),
                     };
-                    let mut q;
-                    if agg_col == "*" {
-                        q = format!("SELECT {group_expr} AS g, COUNT(*) AS c FROM {main_table}");
+                    let (mut q, agg_alias) = if agg_col == "*" {
+                        (
+                            format!("SELECT {group_expr} AS g, COUNT(*) AS c FROM {main_table}"),
+                            "c",
+                        )
                     } else {
-                        q = format!("SELECT {group_expr} AS g, {agg_func}({agg_col}) AS a FROM {main_table}");
-                    }
+                        (format!("SELECT {group_expr} AS g, {agg_func}({agg_col}) AS a FROM {main_table}"), "a")
+                    };
                     if rng.random_bool(0.5) {
                         q.push_str(&format!(
                             " WHERE {}",
@@ -6580,20 +6583,22 @@ mod fuzz_tests {
                             gen_having_condition(&mut rng, main_table)
                         ));
                     }
+                    // ORDER BY all columns for deterministic results with hash aggregation
+                    q.push_str(&format!(" ORDER BY g, {agg_alias}"));
                     q
                 }
                 7 => {
                     // Simple GROUP BY without HAVING (baseline support); may use subquery in GROUP BY
                     let group_expr = gen_group_by_expr(&mut rng, main_table);
-                    let select_expr = if rng.random_bool(0.5) {
+                    let (select_expr, agg_alias) = if rng.random_bool(0.5) {
                         // Use aggregate
                         match main_table {
-                            "t1" => "SUM(value1) AS s".to_string(),
-                            "t2" => "SUM(data) AS s".to_string(),
-                            _ => "SUM(amount) AS s".to_string(),
+                            "t1" => ("SUM(value1) AS s".to_string(), "s"),
+                            "t2" => ("SUM(data) AS s".to_string(), "s"),
+                            _ => ("SUM(amount) AS s".to_string(), "s"),
                         }
                     } else {
-                        "COUNT(*) AS c".to_string()
+                        ("COUNT(*) AS c".to_string(), "c")
                     };
                     let mut q =
                         format!("SELECT {group_expr} AS g, {select_expr} FROM {main_table}");
@@ -6604,6 +6609,8 @@ mod fuzz_tests {
                         ));
                     }
                     q.push_str(&format!(" GROUP BY {group_expr}"));
+                    // ORDER BY all columns for deterministic results with hash aggregation
+                    q.push_str(&format!(" ORDER BY g, {agg_alias}"));
                     q
                 }
                 _ => unreachable!(),
