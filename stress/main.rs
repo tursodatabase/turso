@@ -504,7 +504,7 @@ fn generate_plan(opts: &Opts) -> Result<Plan, Box<dyn std::error::Error + Send +
                     "\r{} %",
                     (i as f64 / opts.nr_iterations as f64 * 100.0) as usize
                 );
-                std::io::stdout().flush().unwrap();
+                std::io::stdout().flush()?;
             }
             let tx = if get_random() % 2 == 0 {
                 match opts.tx_mode {
@@ -541,19 +541,17 @@ fn read_plan_from_log_file(opts: &Opts) -> Result<Plan, Box<dyn std::error::Erro
         nr_iterations: 0,
         nr_threads: 0,
     };
-    file.read_to_string(&mut buf).unwrap();
+    file.read_to_string(&mut buf)?;
     let mut lines = buf.lines();
-    plan.nr_threads = lines.next().expect("missing threads").parse().unwrap();
+    plan.nr_threads = lines.next().expect("missing threads").parse()?;
     plan.nr_iterations = lines
         .next()
         .expect("missing nr_iterations")
-        .parse()
-        .unwrap();
+        .parse()?;
     let nr_ddl = lines
         .next()
         .expect("number of ddl statements")
-        .parse()
-        .unwrap();
+        .parse()?;
     for _ in 0..nr_ddl {
         plan.ddl_statements
             .push(lines.next().expect("expected ddl statement").to_string());
@@ -641,7 +639,7 @@ pub fn spawn_log_level_watcher(reload_handle: LogLevelReloadHandle) {
 }
 
 fn sqlite_integrity_check(
-    db_path: &std::path::Path,
+    db_path: &Path,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     assert!(db_path.exists());
     let conn = rusqlite::Connection::open(db_path)?;
@@ -720,7 +718,7 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
     let mut stop = false;
 
     let tempfile = tempfile::NamedTempFile::new()?;
-    let (_, path) = tempfile.keep().unwrap();
+    let (_, path) = tempfile.keep()?;
     let db_file = if let Some(db_file) = opts.db_file {
         db_file
     } else {
@@ -849,7 +847,7 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
                     } else if query_index % 100 == 0 {
                         print!(
                             "\r{:.2} %",
-                            (query_index as f64 / nr_queries as f64 * 100.0)
+                            query_index as f64 / nr_queries as f64 * 100.0
                         );
                         std::io::stdout().flush().unwrap();
                     }
@@ -951,7 +949,7 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
     #[cfg(not(miri))]
     {
         println!("Running SQLite Integrity check");
-        sqlite_integrity_check(std::path::Path::new(&db_file))?;
+        sqlite_integrity_check(Path::new(&db_file))?;
     }
 
     Ok(())
