@@ -43,7 +43,12 @@ function formatValue(value) {
         if (Number.isNaN(value)) {
             return '';  // SQLite returns NULL for NaN
         }
-        return value.toString();
+        // For integers, use toString() directly
+        if (Number.isInteger(value)) {
+            return value.toString();
+        }
+        // For floats, limit to 15 significant digits to match SQLite default
+        return parseFloat(value.toPrecision(15)).toString();
     }
     if (value instanceof Uint8Array || Buffer.isBuffer(value)) {
         // Output blob as raw bytes (matches SQLite/Rust backend behavior)
