@@ -44,7 +44,7 @@ const BLOB_HASH: u8 = 4;
 
 /// Hash function for join keys using rapidhash
 /// Takes collation into account when hashing text values
-fn hash_join_key(key_values: &[ValueRef], collations: &[CollationSeq]) -> u64 {
+pub(crate) fn hash_join_key(key_values: &[ValueRef], collations: &[CollationSeq]) -> u64 {
     let mut hasher = RapidHasher::new(DEFAULT_SEED);
 
     for (idx, value) in key_values.iter().enumerate() {
@@ -835,6 +835,10 @@ pub struct HashTable {
     loaded_partitions_lru: RefCell<VecDeque<usize>>,
     /// Memory used by resident (loaded or in-memory) partitions
     loaded_partitions_mem: usize,
+    /// Hash aggregation iteration state.
+    agg_iter_partition_idx: usize,
+    agg_iter_bucket_idx: usize,
+    agg_iter_entry_idx: usize,
 }
 
 crate::assert::assert_send!(HashTable);
@@ -880,12 +884,19 @@ impl HashTable {
             loaded_partitions_lru: VecDeque::new().into(),
             loaded_partitions_mem: 0,
             non_empty_buckets: Vec::new(),
+            agg_iter_partition_idx: 0,
+            agg_iter_bucket_idx: 0,
+            agg_iter_entry_idx: 0,
         }
     }
 
     /// Get the current state of the hash table.
     pub fn get_state(&self) -> &HashTableState {
         &self.state
+    }
+
+    pub fn is_spilled(&self) -> bool {
+        self.spill_state.is_some()
     }
 
     /// Insert a row into the hash table, returns IOResult because this may spill to disk.
@@ -938,7 +949,7 @@ impl HashTable {
             // Spill whole partitions until the new entry fits
             if let Some(c) = self.spill_partitions_for_entry(entry_size)? {
                 // I/O pending, caller will re-enter after completion and retry the insert.
-                if !c.finished() {
+                if !c.succeeded() {
                     return Ok(IOResult::IO(IOCompletions::Single(c)));
                 }
             }
@@ -1113,6 +1124,181 @@ impl HashTable {
         self.loaded_partitions_mem = 0;
     }
 
+    /// Reset aggregation iterator to the beginning. Must be called before
+    /// `next_agg_entry()` to start a fresh iteration during the emit phase.
+    pub fn reset_agg_iter(&mut self) {
+        self.agg_iter_partition_idx = 0;
+        self.agg_iter_bucket_idx = 0;
+        self.agg_iter_entry_idx = 0;
+    }
+
+    /// Return the next entry during hash aggregation emit phase (= outputting finished aggregations)
+    ///
+    /// In spilled mode, this loads partitions from disk on demand and may yield
+    /// for I/O.
+    pub fn next_agg_entry(&mut self) -> Result<IOResult<Option<HashEntry>>> {
+        turso_assert!(
+            self.state == HashTableState::Probing,
+            "next_agg_entry requires Probing state, got {:?}",
+            self.state
+        );
+        if self.is_spilled() {
+            loop {
+                if self.agg_iter_partition_idx >= NUM_PARTITIONS {
+                    return Ok(IOResult::Done(None));
+                }
+                let partition_idx = self.agg_iter_partition_idx;
+                let partition_has_data = {
+                    let spill_state = self.spill_state.as_ref().expect("spill state exists");
+                    spill_state.find_partition(partition_idx).is_some()
+                        || !spill_state.partition_buffers[partition_idx].is_empty()
+                };
+                if !partition_has_data {
+                    self.agg_iter_partition_idx += 1;
+                    self.agg_iter_bucket_idx = 0;
+                    self.agg_iter_entry_idx = 0;
+                    continue;
+                }
+
+                return_if_io!(self.load_spilled_partition(partition_idx));
+                let (bucket_len, entry_opt) = {
+                    let spill_state = self.spill_state.as_ref().expect("spill state exists");
+                    let Some(partition) = spill_state.find_partition(partition_idx) else {
+                        // Partition buffer was non-empty but not spilled - skip to next
+                        self.agg_iter_partition_idx += 1;
+                        self.agg_iter_bucket_idx = 0;
+                        self.agg_iter_entry_idx = 0;
+                        continue;
+                    };
+                    if self.agg_iter_bucket_idx >= partition.buckets.len() {
+                        (partition.buckets.len(), None)
+                    } else {
+                        let bucket = &partition.buckets[self.agg_iter_bucket_idx];
+                        if self.agg_iter_entry_idx < bucket.entries.len() {
+                            (
+                                partition.buckets.len(),
+                                Some(bucket.entries[self.agg_iter_entry_idx].clone()),
+                            )
+                        } else {
+                            (partition.buckets.len(), None)
+                        }
+                    }
+                };
+
+                if let Some(entry) = entry_opt {
+                    self.agg_iter_entry_idx += 1;
+                    return Ok(IOResult::Done(Some(entry)));
+                }
+                if self.agg_iter_bucket_idx >= bucket_len {
+                    self.agg_iter_partition_idx += 1;
+                    self.agg_iter_bucket_idx = 0;
+                    self.agg_iter_entry_idx = 0;
+                    continue;
+                }
+                self.agg_iter_bucket_idx += 1;
+                self.agg_iter_entry_idx = 0;
+            }
+        }
+
+        while self.agg_iter_bucket_idx < self.buckets.len() {
+            let bucket = &self.buckets[self.agg_iter_bucket_idx];
+            if self.agg_iter_entry_idx < bucket.entries.len() {
+                let entry = bucket.entries[self.agg_iter_entry_idx].clone();
+                self.agg_iter_entry_idx += 1;
+                return Ok(IOResult::Done(Some(entry)));
+            }
+            self.agg_iter_bucket_idx += 1;
+            self.agg_iter_entry_idx = 0;
+        }
+
+        Ok(IOResult::Done(None))
+    }
+
+    /// Find an existing entry by key and return a mutable reference to it.
+    ///
+    /// Used during hash aggregation build phase to update aggregate payloads in-place
+    /// when a row's GROUP BY keys match an existing entry. Returns None in spilled
+    /// mode because entries on disk cannot be mutated directly.
+    pub fn find_entry_mut(&mut self, hash: u64, key_refs: &[ValueRef]) -> Option<&mut HashEntry> {
+        if self.is_spilled() {
+            return None;
+        }
+        let bucket_idx = (hash as usize) % self.buckets.len();
+        let bucket = &mut self.buckets[bucket_idx];
+        bucket.entries.iter_mut().find(|entry| {
+            entry.hash == hash && keys_equal_distinct(&entry.key_values, key_refs, &self.collations)
+        })
+    }
+
+    /// Insert a new GROUP BY key with its initial aggregate payload.
+    ///
+    /// Used during hash aggregation build phase when encountering a key not yet
+    /// in the table. If memory budget is exceeded, triggers spilling: existing
+    /// entries are redistributed to partition buffers, and new entries go into
+    /// the appropriate partition. May yield for I/O during spill writes.
+    ///
+    /// # Re-entrancy
+    /// If this function yields, the entry is dropped and must be recreated by the
+    /// caller on re-entry. The hash table's spill state persists (partitions cleared,
+    /// `mem_used` reduced), so `spill_partitions_for_entry` will find room on retry.
+    pub fn insert_group_entry(
+        &mut self,
+        hash: u64,
+        key_values: Vec<Value>,
+        payload_values: Vec<Value>,
+    ) -> Result<IOResult<()>> {
+        turso_assert!(
+            self.state == HashTableState::Building || self.state == HashTableState::Spilled,
+            "Cannot insert into hash table in state {:?}",
+            self.state
+        );
+
+        let entry = HashEntry::new_with_payload(hash, key_values, 0, payload_values);
+        let entry_size = entry.size_bytes();
+
+        if self.mem_used + entry_size > self.mem_budget && !self.is_spilled() {
+            self.spill_state = Some(SpillState::new(&self.io)?);
+            self.redistribute_to_partitions();
+            self.state = HashTableState::Spilled;
+        }
+
+        if self.is_spilled() {
+            let partition_idx = partition_from_hash(hash);
+            if let Some(c) = self.spill_partitions_for_entry(entry_size)? {
+                if !c.succeeded() {
+                    return Ok(IOResult::IO(IOCompletions::Single(c)));
+                }
+            }
+            let spill_state = self.spill_state.as_mut().expect("spill state exists");
+            spill_state.partition_buffers[partition_idx].insert(entry);
+            self.num_entries += 1;
+            // Partition buffers are in-memory until spilled to disk, so track their usage.
+            self.mem_used += entry_size;
+            return Ok(IOResult::Done(()));
+        }
+
+        let bucket_idx = (hash as usize) % self.buckets.len();
+        let bucket = &mut self.buckets[bucket_idx];
+        if bucket.entries.is_empty() {
+            self.non_empty_buckets.push(bucket_idx);
+        }
+        bucket.entries.push(entry);
+        self.num_entries += 1;
+        self.mem_used += entry_size;
+        Ok(IOResult::Done(()))
+    }
+
+    pub fn drain_entries(&mut self) -> Vec<HashEntry> {
+        let mut out = Vec::with_capacity(self.num_entries);
+        for bucket_idx in self.non_empty_buckets.drain(..) {
+            let bucket = &mut self.buckets[bucket_idx];
+            out.append(&mut bucket.entries);
+        }
+        self.num_entries = 0;
+        self.mem_used = 0;
+        out
+    }
+
     /// Redistribute existing bucket entries into partition buffers for grace hash join.
     fn redistribute_to_partitions(&mut self) {
         for bucket in self.buckets.drain(..) {
@@ -1127,9 +1313,9 @@ impl HashTable {
         }
     }
 
-    /// Return the next partition which should be spilled to disk, for simplicity,
-    /// we always select the largest non-empty partition buffer.
-    fn next_partition_to_spill(&self, _required_free: usize) -> Option<usize> {
+    /// Return the next partition which should be spilled to disk.
+    /// For simplicity, we always select the largest non-empty partition buffer.
+    fn next_partition_to_spill(&self) -> Option<usize> {
         let spill_state = self.spill_state.as_ref()?;
         spill_state
             .partition_buffers
@@ -1147,6 +1333,12 @@ impl HashTable {
         if partition.is_empty() {
             return Ok(None);
         }
+        tracing::debug!(
+            "Spilling partition {} to disk ({} entries, {} bytes)",
+            partition_idx,
+            partition.entries.len(),
+            partition.mem_used
+        );
 
         // Serialize entries from partition buffer
         let estimated_size: usize = partition.entries.iter().map(|e| e.size_bytes() + 9).sum();
@@ -1217,8 +1409,7 @@ impl HashTable {
                 return Ok(None);
             }
 
-            let required_free = self.mem_used + entry_size - self.mem_budget;
-            let Some(partition_idx) = self.next_partition_to_spill(required_free) else {
+            let Some(partition_idx) = self.next_partition_to_spill() else {
                 return Ok(None);
             };
 
@@ -1278,8 +1469,16 @@ impl HashTable {
                 // Check for pending writes from previous call
                 let spill_state = self.spill_state.as_ref().expect("spill state must exist");
                 for spilled in &spill_state.partitions {
-                    if matches!(spilled.io_state.get(), SpillIOState::WaitingForWrite) {
-                        io_yield_one!(Completion::new_yield());
+                    match spilled.io_state.get() {
+                        SpillIOState::WaitingForWrite => {
+                            io_yield_one!(Completion::new_yield());
+                        }
+                        SpillIOState::Error => {
+                            return Err(LimboError::InternalError(
+                                "Spill write failed".to_string(),
+                            ));
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -1609,6 +1808,39 @@ impl HashTable {
                 }
             }
         }
+    }
+
+    /// Load all entries from a spilled partition into a Vec.
+    ///
+    /// Used during hash aggregation emit phase to collect entries that need
+    /// merging. When a partition was spilled multiple times, it may contain
+    /// duplicate GROUP BY keys from different spill chunks that must be merged
+    /// via `merge_agg_payload` before emitting results.
+    pub fn load_partition_entries(
+        &mut self,
+        partition_idx: usize,
+    ) -> Result<IOResult<Vec<HashEntry>>> {
+        turso_assert!(
+            self.state == HashTableState::Probing,
+            "load_partition_entries requires Probing state, got {:?}",
+            self.state
+        );
+        let Some(spill_state) = self.spill_state.as_ref() else {
+            return Ok(IOResult::Done(Vec::new()));
+        };
+        if spill_state.find_partition(partition_idx).is_none() {
+            return Ok(IOResult::Done(Vec::new()));
+        }
+        return_if_io!(self.load_spilled_partition(partition_idx));
+        let spill_state = self.spill_state.as_ref().expect("spill state exists");
+        let Some(partition) = spill_state.find_partition(partition_idx) else {
+            return Ok(IOResult::Done(Vec::new()));
+        };
+        let mut entries = Vec::new();
+        for bucket in &partition.buckets {
+            entries.extend(bucket.entries.iter().cloned());
+        }
+        Ok(IOResult::Done(entries))
     }
 
     /// Parse entries from the read buffer into buckets for a partition.
