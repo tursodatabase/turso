@@ -119,10 +119,13 @@ impl WorkloadContext<'_> {
                 true
             }
             Err(e) => {
-                let err_str = e.to_string();
+                let err_str = e.to_string().to_lowercase();
                 // Allow "no such table" errors - return false to skip this workload
-                if err_str.contains("no such table") {
-                    debug!("Table not found, skipping: {}", err_str);
+                if err_str.contains("no such table") || err_str.contains("no such index") {
+                    debug!("table/index not found, skipping: {}", err_str);
+                    false
+                } else if err_str.contains("already exists") {
+                    debug!("table/index already exists, skipping: {}", err_str);
                     false
                 } else {
                     panic!("Failed to prepare statement: {}\nSQL: {}", e, sql);
@@ -424,12 +427,12 @@ pub fn default_workloads() -> Vec<(u32, Box<dyn Workload>)> {
         (20, Box::new(SimpleSelectWorkload)),
         (20, Box::new(SimpleInsertWorkload)),
         // DML workloads (work in both Idle and InTx)
-        // (10, Box::new(SelectWorkload)),
-        // (30, Box::new(InsertWorkload)),
-        // (20, Box::new(UpdateWorkload)),
-        // (10, Box::new(DeleteWorkload)),
-        // (2, Box::new(CreateIndexWorkload)),
-        // (2, Box::new(DropIndexWorkload)),
+        (1, Box::new(SelectWorkload)),
+        (30, Box::new(InsertWorkload)),
+        (20, Box::new(UpdateWorkload)),
+        (10, Box::new(DeleteWorkload)),
+        (2, Box::new(CreateIndexWorkload)),
+        (2, Box::new(DropIndexWorkload)),
         // InTx-only workloads
         (30, Box::new(BeginWorkload)),
         (10, Box::new(CommitWorkload)),
@@ -562,6 +565,8 @@ struct SimulatorFiber {
     state: FiberState,
     statement: RefCell<Option<Statement>>,
     rows_fetched: Vec<Vec<Value>>,
+    /// Current execution ID for tracing statement lifecycle
+    execution_id: Option<u64>,
 }
 
 struct SimulatorContext {
@@ -591,6 +596,8 @@ pub struct Whopper {
     pub max_steps: usize,
     pub seed: u64,
     pub stats: Stats,
+    /// Counter for generating unique execution IDs
+    next_execution_id: u64,
 }
 
 impl Whopper {
@@ -699,6 +706,7 @@ impl Whopper {
             max_steps: opts.max_steps,
             seed,
             stats: Stats::default(),
+            next_execution_id: 0,
         };
 
         whopper.open_connections()?;
@@ -733,21 +741,17 @@ impl Whopper {
 
     fn perform_work(&mut self, fiber_idx: usize) -> anyhow::Result<()> {
         // If we have a statement, step it.
+        let execution_id = self.context.fibers[fiber_idx].execution_id;
         let done = {
             let mut stmt_borrow = self.context.fibers[fiber_idx].statement.borrow_mut();
             if let Some(stmt) = stmt_borrow.as_mut() {
-                let step_result = {
-                    let span = tracing::debug_span!(
-                        "fiber",
-                        fiber_idx = fiber_idx,
-                        state = format!("{:?}", self.context.fibers[fiber_idx].state)
-                    );
-                    let _enter = span.enter();
-                    stmt.step()
-                };
+                let span = tracing::debug_span!("step", fiber = fiber_idx, exec = execution_id);
+                let _enter = span.enter();
+
+                let step_result = stmt.step();
                 match step_result {
                     Ok(result) => {
-                        trace!("fiber: {} {:?}", fiber_idx, result);
+                        trace!("{:?}", result);
                         match result {
                             turso_core::StepResult::Row => {
                                 if let Some(row) = stmt.row() {
@@ -766,13 +770,11 @@ impl Whopper {
                     Err(e) => match e {
                         turso_core::LimboError::SchemaUpdated => {
                             drop(stmt_borrow);
-                            debug!(
-                                "fiber {}: error SchemaUpdated, discarding {} rows",
-                                fiber_idx,
-                                self.context.fibers[fiber_idx].rows_fetched.len()
-                            );
+                            let rows_discarded = self.context.fibers[fiber_idx].rows_fetched.len();
+                            debug!(rows_discarded, "error SchemaUpdated");
                             self.context.fibers[fiber_idx].statement.replace(None);
                             self.context.fibers[fiber_idx].rows_fetched.clear();
+                            self.context.fibers[fiber_idx].execution_id = None;
                             if matches!(self.context.fibers[fiber_idx].state, FiberState::InTx)
                                 && let Ok(rollback_stmt) = self.context.fibers[fiber_idx]
                                     .connection
@@ -787,13 +789,11 @@ impl Whopper {
                         }
                         turso_core::LimboError::Busy => {
                             drop(stmt_borrow);
-                            debug!(
-                                "fiber {}: error Busy, discarding {} rows",
-                                fiber_idx,
-                                self.context.fibers[fiber_idx].rows_fetched.len()
-                            );
+                            let rows_discarded = self.context.fibers[fiber_idx].rows_fetched.len();
+                            debug!(rows_discarded, "error Busy");
                             self.context.fibers[fiber_idx].statement.replace(None);
                             self.context.fibers[fiber_idx].rows_fetched.clear();
+                            self.context.fibers[fiber_idx].execution_id = None;
                             if matches!(self.context.fibers[fiber_idx].state, FiberState::InTx)
                                 && let Ok(rollback_stmt) = self.context.fibers[fiber_idx]
                                     .connection
@@ -808,25 +808,21 @@ impl Whopper {
                         }
                         turso_core::LimboError::WriteWriteConflict => {
                             drop(stmt_borrow);
-                            debug!(
-                                "fiber {}: error WriteWriteConflict, discarding {} rows",
-                                fiber_idx,
-                                self.context.fibers[fiber_idx].rows_fetched.len()
-                            );
+                            let rows_discarded = self.context.fibers[fiber_idx].rows_fetched.len();
+                            debug!(rows_discarded, "error WriteWriteConflict");
                             self.context.fibers[fiber_idx].statement.replace(None);
                             self.context.fibers[fiber_idx].rows_fetched.clear();
+                            self.context.fibers[fiber_idx].execution_id = None;
                             self.context.fibers[fiber_idx].state = FiberState::Idle;
                             return Ok(());
                         }
                         turso_core::LimboError::BusySnapshot => {
                             drop(stmt_borrow);
-                            debug!(
-                                "fiber {}: error BusySnapshot, discarding {} rows",
-                                fiber_idx,
-                                self.context.fibers[fiber_idx].rows_fetched.len()
-                            );
+                            let rows_discarded = self.context.fibers[fiber_idx].rows_fetched.len();
+                            debug!(rows_discarded, "error BusySnapshot");
                             self.context.fibers[fiber_idx].statement.replace(None);
                             self.context.fibers[fiber_idx].rows_fetched.clear();
+                            self.context.fibers[fiber_idx].execution_id = None;
                             if matches!(self.context.fibers[fiber_idx].state, FiberState::InTx)
                                 && let Ok(rollback_stmt) = self.context.fibers[fiber_idx]
                                     .connection
@@ -854,14 +850,19 @@ impl Whopper {
             return Ok(());
         }
 
+        // Statement completed - log with span
+        {
+            let span = tracing::debug_span!("done", fiber = fiber_idx, exec = execution_id);
+            let _enter = span.enter();
+            let rows = self.context.fibers[fiber_idx].rows_fetched.len();
+            debug!(
+                rows,
+                "completed: {:?}", self.context.fibers[fiber_idx].rows_fetched
+            );
+        }
         self.context.fibers[fiber_idx].statement.replace(None);
-        debug!(
-            "fiber {}: completed with {} rows: {:?}",
-            fiber_idx,
-            self.context.fibers[fiber_idx].rows_fetched.len(),
-            self.context.fibers[fiber_idx].rows_fetched
-        );
         self.context.fibers[fiber_idx].rows_fetched.clear();
+        self.context.fibers[fiber_idx].execution_id = None;
 
         // Select a workload using weighted random selection
         if self.total_weight == 0 {
@@ -871,27 +872,32 @@ impl Whopper {
         let mut roll = self.rng.random_range(0..self.total_weight);
         for (weight, workload) in &self.workloads {
             if roll < *weight {
-                let fiber = &mut self.context.fibers[fiber_idx];
-                {
-                    let state = format!("{:?}", &fiber.state);
-                    let span = tracing::debug_span!("fiber", fiber_idx = fiber_idx, state = state);
-                    let _enter = span.enter();
+                // Assign new execution_id for this statement
+                let exec_id = self.next_execution_id;
+                self.next_execution_id += 1;
 
-                    let mut ctx = WorkloadContext {
-                        connection: &fiber.connection,
-                        state: &mut fiber.state,
-                        statement: &fiber.statement,
-                        tables: &self.context.tables,
-                        indexes: &mut self.context.indexes,
-                        simple_tables: &mut self.context.simple_tables,
-                        simple_tables_keys: &mut self.context.simple_tables_keys,
-                        stats: &mut self.stats,
-                        opts: &self.opts,
-                        enable_mvcc: self.context.enable_mvcc,
-                    };
-                    if workload.init(&mut ctx, &mut self.rng)? {
-                        return Ok(());
-                    }
+                let fiber = &mut self.context.fibers[fiber_idx];
+                let state = format!("{:?}", &fiber.state);
+                let span =
+                    tracing::debug_span!("init", fiber = fiber_idx, exec = exec_id, state = state);
+                let _enter = span.enter();
+
+                let mut ctx = WorkloadContext {
+                    connection: &fiber.connection,
+                    state: &mut fiber.state,
+                    statement: &fiber.statement,
+                    tables: &self.context.tables,
+                    indexes: &mut self.context.indexes,
+                    simple_tables: &mut self.context.simple_tables,
+                    simple_tables_keys: &mut self.context.simple_tables_keys,
+                    stats: &mut self.stats,
+                    opts: &self.opts,
+                    enable_mvcc: self.context.enable_mvcc,
+                };
+                if workload.init(&mut ctx, &mut self.rng)? {
+                    // Statement was successfully prepared, store execution_id
+                    self.context.fibers[fiber_idx].execution_id = Some(exec_id);
+                    return Ok(());
                 }
                 // If workload returned false, continue to try next
             }
@@ -1006,6 +1012,7 @@ impl Whopper {
                 state: FiberState::Idle,
                 statement: RefCell::new(None),
                 rows_fetched: vec![],
+                execution_id: None,
             });
         }
 
