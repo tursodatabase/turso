@@ -96,7 +96,8 @@ fn setup_rusqlite(temp_dir: &TempDir, schema: &str) -> rusqlite::Connection {
 /// 2. Additional B-tree insertions
 /// 3. Page splits on index pages
 fn bench_index_impact(criterion: &mut Criterion) {
-    let enable_rusqlite = std::env::var("DISABLE_RUSQLITE_BENCHMARK").is_err();
+    let enable_rusqlite =
+        std::env::var("DISABLE_RUSQLITE_BENCHMARK").is_err() && !cfg!(feature = "codspeed");
     let batch_size = 100;
 
     let mut group = criterion.benchmark_group("Index Impact on INSERT");
@@ -192,7 +193,8 @@ fn bench_index_impact(criterion: &mut Criterion) {
 /// Measures how the number of rows per transaction affects throughput.
 /// Larger transactions amortize commit overhead but increase memory pressure.
 fn bench_transaction_size(criterion: &mut Criterion) {
-    let enable_rusqlite = std::env::var("DISABLE_RUSQLITE_BENCHMARK").is_err();
+    let enable_rusqlite =
+        std::env::var("DISABLE_RUSQLITE_BENCHMARK").is_err() && !cfg!(feature = "codspeed");
 
     let mut group = criterion.benchmark_group("Transaction Size Impact");
 
@@ -280,7 +282,8 @@ fn bench_transaction_size(criterion: &mut Criterion) {
 /// 2. Better cache locality
 /// 3. Fewer page splits
 fn bench_key_pattern(criterion: &mut Criterion) {
-    let enable_rusqlite = std::env::var("DISABLE_RUSQLITE_BENCHMARK").is_err();
+    let enable_rusqlite =
+        std::env::var("DISABLE_RUSQLITE_BENCHMARK").is_err() && !cfg!(feature = "codspeed");
     let batch_size = 100;
 
     let mut group = criterion.benchmark_group("Key Pattern Impact");
@@ -418,7 +421,8 @@ fn bench_key_pattern(criterion: &mut Criterion) {
 /// 2. Potential in-place update vs delete+insert
 /// 3. Index maintenance on modified columns
 fn bench_update_performance(criterion: &mut Criterion) {
-    let enable_rusqlite = std::env::var("DISABLE_RUSQLITE_BENCHMARK").is_err();
+    let enable_rusqlite =
+        std::env::var("DISABLE_RUSQLITE_BENCHMARK").is_err() && !cfg!(feature = "codspeed");
 
     let mut group = criterion.benchmark_group("UPDATE Performance");
 
@@ -494,7 +498,8 @@ fn bench_update_performance(criterion: &mut Criterion) {
 ///
 /// Measures DELETE throughput with different patterns
 fn bench_delete_performance(criterion: &mut Criterion) {
-    let enable_rusqlite = std::env::var("DISABLE_RUSQLITE_BENCHMARK").is_err();
+    let enable_rusqlite =
+        std::env::var("DISABLE_RUSQLITE_BENCHMARK").is_err() && !cfg!(feature = "codspeed");
 
     let mut group = criterion.benchmark_group("DELETE Performance");
 
@@ -582,7 +587,8 @@ fn bench_delete_performance(criterion: &mut Criterion) {
 ///
 /// Specifically targets the commit_dirty_pages path with many pages
 fn bench_large_transaction_commit(criterion: &mut Criterion) {
-    let enable_rusqlite = std::env::var("DISABLE_RUSQLITE_BENCHMARK").is_err();
+    let enable_rusqlite =
+        std::env::var("DISABLE_RUSQLITE_BENCHMARK").is_err() && !cfg!(feature = "codspeed");
 
     let mut group = criterion.benchmark_group("Large Transaction Commit");
 
@@ -681,7 +687,8 @@ fn bench_large_transaction_commit(criterion: &mut Criterion) {
 ///
 /// Compares INSERT performance with sync=FULL vs sync=OFF to isolate fsync cost
 fn bench_fsync_overhead(criterion: &mut Criterion) {
-    let enable_rusqlite = std::env::var("DISABLE_RUSQLITE_BENCHMARK").is_err();
+    let enable_rusqlite =
+        std::env::var("DISABLE_RUSQLITE_BENCHMARK").is_err() && !cfg!(feature = "codspeed");
     let batch_size = 100;
 
     let mut group = criterion.benchmark_group("Fsync Overhead");
