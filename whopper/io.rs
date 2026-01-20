@@ -88,6 +88,13 @@ impl Clock for SimulatorIO {
 
 impl IO for SimulatorIO {
     fn open_file(&self, path: &str, _flags: OpenFlags, _create_new: bool) -> Result<Arc<dyn File>> {
+        {
+            let files = self.files.lock().unwrap();
+            if let Some((_, file)) = files.iter().find(|f| f.0 == path) {
+                return Ok(file.upgrade().unwrap());
+            }
+        }
+
         let file = Arc::new(SimulatorFile::new(path, self.file_sizes.clone()));
 
         // Store weak reference to avoid keeping files open forever
