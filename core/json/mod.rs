@@ -44,7 +44,7 @@ pub fn get_json(json_value: &Value, indent: Option<&str>) -> crate::Result<Value
             let json_val = convert_dbtype_to_jsonb(json_value, Conv::Strict)?;
             let mut json = match indent {
                 Some(indent) => json_val.to_string_pretty(Some(indent))?,
-                None => json_val.to_string(),
+                None => json_val.to_string()?,
             };
 
             // Simplify infinity format to match SQLite (#4196)
@@ -55,7 +55,7 @@ pub fn get_json(json_value: &Value, indent: Option<&str>) -> crate::Result<Value
         Value::Blob(b) => {
             let jsonbin = Jsonb::new(b.len(), Some(b));
             jsonbin.element_type()?;
-            Ok(Value::Text(Text::json(jsonbin.to_string())))
+            Ok(Value::Text(Text::json(jsonbin.to_string()?)))
         }
         Value::Null => Ok(Value::Null),
         _ => {
@@ -374,7 +374,7 @@ pub fn json_arrow_extract(
         let res = json.operate_on_path(&path, &mut op);
         let extracted = op.result();
         if res.is_ok() {
-            Ok(Value::Text(Text::json(extracted.to_string())))
+            Ok(Value::Text(Text::json(extracted.to_string()?)))
         } else {
             Ok(Value::Null)
         }
@@ -546,10 +546,10 @@ pub fn json_string_to_db_type(
     element_type: ElementType,
     flag: OutputVariant,
 ) -> crate::Result<Value> {
-    let mut json_string = json.to_string();
     if matches!(flag, OutputVariant::Binary) {
         return Ok(Value::Blob(json.data()));
     }
+    let mut json_string = json.to_string()?;
     match element_type {
         ElementType::ARRAY | ElementType::OBJECT => Ok(Value::Text(Text::json(json_string))),
         ElementType::TEXT | ElementType::TEXT5 | ElementType::TEXTJ | ElementType::TEXTRAW => {

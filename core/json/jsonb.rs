@@ -1059,13 +1059,10 @@ impl Jsonb {
         }
     }
 
-    #[expect(clippy::inherent_to_string)]
-    pub fn to_string(&self) -> String {
+    pub fn to_string(&self) -> Result<String> {
         let mut result = String::with_capacity(self.data.len() * 2);
-
-        self.write_to_string(&mut result, JsonIndentation::None);
-
-        result
+        self.serialize_value(&mut result, 0, 0, &JsonIndentation::None)?;
+        Ok(result)
     }
 
     pub fn to_string_pretty(&self, indentation: Option<&str>) -> Result<String> {
@@ -1075,15 +1072,8 @@ impl Jsonb {
         } else {
             JsonIndentation::Indentation(Cow::Borrowed("    "))
         };
-        self.write_to_string(&mut result, ind);
-
+        self.serialize_value(&mut result, 0, 0, &ind)?;
         Ok(result)
-    }
-
-    fn write_to_string(&self, string: &mut String, indentation: JsonIndentation) {
-        let cursor = 0;
-        let ind = indentation;
-        let _ = self.serialize_value(string, cursor, 0, &ind);
     }
 
     fn serialize_value(
@@ -1429,15 +1419,23 @@ impl Jsonb {
     }
 
     fn serialize_int5(&self, string: &mut String, hex_str: &str) -> Result<()> {
-        // Check if number is hex
-        if hex_str.len() > 2
-            && (hex_str[..2].eq_ignore_ascii_case("0x")
-                || (hex_str.starts_with("-") || hex_str.starts_with("+"))
-                    && hex_str[1..3].eq_ignore_ascii_case("0x"))
-        {
-            let (sign, hex_part) = if hex_str.starts_with("-0x") || hex_str.starts_with("-0X") {
+        // Check if number is hex using byte-level operations to handle non-ASCII safely
+        let bytes = hex_str.as_bytes();
+        let starts_with_0x = bytes
+            .get(..2)
+            .is_some_and(|b| b.eq_ignore_ascii_case(b"0x"));
+        let has_sign_prefix = matches!(bytes.first(), Some(b'-' | b'+'));
+        let starts_with_sign_0x = has_sign_prefix
+            && bytes
+                .get(1..3)
+                .is_some_and(|b| b.eq_ignore_ascii_case(b"0x"));
+        let is_hex = bytes.len() > 2 && (starts_with_0x || starts_with_sign_0x);
+
+        if is_hex {
+            // The prefix is ASCII, so these byte indices are valid char boundaries
+            let (sign, hex_part) = if bytes.starts_with(b"-0x") || bytes.starts_with(b"-0X") {
                 ("-", &hex_str[3..])
-            } else if hex_str.starts_with("+0x") || hex_str.starts_with("+0X") {
+            } else if bytes.starts_with(b"+0x") || bytes.starts_with(b"+0X") {
                 ("", &hex_str[3..])
             } else {
                 ("", &hex_str[2..])
@@ -1462,8 +1460,17 @@ impl Jsonb {
             }
             write!(string, "{value}")
                 .map_err(|_| LimboError::ParseError("Error writing string to json!".to_string()))?;
-        } else {
+        } else if !hex_str.is_empty() && hex_str.bytes().all(|b| b.is_ascii_digit()) {
+            // Plain unsigned integer - output as-is
             string.push_str(hex_str);
+        } else if hex_str.len() > 1
+            && hex_str.starts_with(['+', '-'])
+            && hex_str.bytes().skip(1).all(|b| b.is_ascii_digit())
+        {
+            // Signed integer with at least one digit after sign - output as-is
+            string.push_str(hex_str);
+        } else {
+            bail_parse_error!("malformed JSON");
         }
 
         Ok(())
@@ -1995,6 +2002,7 @@ impl Jsonb {
         let mut len = 0;
         let mut is_float = false;
         let mut is_json5 = false;
+        let mut has_digit = false;
 
         // Write placeholder header
         self.write_element_header(num_start, ElementType::INT, 0, false)
@@ -2026,6 +2034,7 @@ impl Jsonb {
             self.data.push(input[pos]);
             pos += 1;
             len += 1;
+            has_digit = true;
 
             if pos < input.len() && (input[pos] == b'x' || input[pos] == b'X') {
                 // Hexadecimal number
@@ -2111,6 +2120,7 @@ impl Jsonb {
                     self.data.push(input[pos]);
                     pos += 1;
                     len += 1;
+                    has_digit = true;
                 }
                 b'.' => {
                     is_float = true;
@@ -2135,15 +2145,23 @@ impl Jsonb {
                         pos += 1;
                         len += 1;
                     }
+
+                    // Exponent must have at least one digit
+                    if pos >= input.len() || !input[pos].is_ascii_digit() {
+                        return Err(PError::Message {
+                            msg: "malformed JSON".to_string(),
+                            location: Some(pos),
+                        });
+                    }
                 }
                 _ => break,
             }
         }
 
-        // No digits found
-        if len == 0 && (!is_json5 || !is_float) {
+        // Must have at least one digit
+        if !has_digit && (!is_json5 || !is_float) {
             return Err(PError::Message {
-                msg: "Not a digigt".to_string(),
+                msg: "Not a digit".to_string(),
                 location: Some(pos),
             });
         }
@@ -2205,8 +2223,8 @@ impl Jsonb {
     }
 
     pub fn deserialize_null_or_nan(&mut self, input: &[u8], mut pos: usize) -> PResult<usize> {
-        // First check if we have enough bytes remaining
-        if pos + 3 >= input.len() {
+        // First check if we have enough bytes remaining for "nan" (minimum 3 bytes)
+        if pos + 3 > input.len() {
             return Err(PError::Message {
                 msg: "Unexpected end of input".to_string(),
                 location: Some(pos),
@@ -3462,7 +3480,7 @@ mod tests {
         jsonb.data.push(ElementType::NULL as u8);
 
         // Test serialization
-        let json_str = jsonb.to_string();
+        let json_str = jsonb.to_string().unwrap();
         assert_eq!(json_str, "null");
 
         // Test round-trip
@@ -3475,12 +3493,12 @@ mod tests {
         // True
         let mut jsonb_true = Jsonb::new(10, None);
         jsonb_true.data.push(ElementType::TRUE as u8);
-        assert_eq!(jsonb_true.to_string(), "true");
+        assert_eq!(jsonb_true.to_string().unwrap(), "true");
 
         // False
         let mut jsonb_false = Jsonb::new(10, None);
         jsonb_false.data.push(ElementType::FALSE as u8);
-        assert_eq!(jsonb_false.to_string(), "false");
+        assert_eq!(jsonb_false.to_string().unwrap(), "false");
 
         // Round-trip
         let true_parsed = Jsonb::from_str("true").unwrap();
@@ -3494,15 +3512,15 @@ mod tests {
     fn test_integer_serialization() {
         // Standard integer
         let parsed = Jsonb::from_str("42").unwrap();
-        assert_eq!(parsed.to_string(), "42");
+        assert_eq!(parsed.to_string().unwrap(), "42");
 
         // Negative integer
         let parsed = Jsonb::from_str("-123").unwrap();
-        assert_eq!(parsed.to_string(), "-123");
+        assert_eq!(parsed.to_string().unwrap(), "-123");
 
         // Zero
         let parsed = Jsonb::from_str("0").unwrap();
-        assert_eq!(parsed.to_string(), "0");
+        assert_eq!(parsed.to_string().unwrap(), "0");
 
         // Verify correct type
         let header = JsonbHeader::from_slice(0, &parsed.data).unwrap().0;
@@ -3513,15 +3531,15 @@ mod tests {
     fn test_json5_integer_serialization() {
         // Hexadecimal notation
         let parsed = Jsonb::from_str("0x1A").unwrap();
-        assert_eq!(parsed.to_string(), "26"); // Should convert to decimal
+        assert_eq!(parsed.to_string().unwrap(), "26"); // Should convert to decimal
 
         // Positive sign (JSON5)
         let parsed = Jsonb::from_str("+42").unwrap();
-        assert_eq!(parsed.to_string(), "42");
+        assert_eq!(parsed.to_string().unwrap(), "42");
 
         // Negative hexadecimal
         let parsed = Jsonb::from_str("-0xFF").unwrap();
-        assert_eq!(parsed.to_string(), "-255");
+        assert_eq!(parsed.to_string().unwrap(), "-255");
 
         // Verify correct type
         let header = JsonbHeader::from_slice(0, &parsed.data).unwrap().0;
@@ -3529,18 +3547,85 @@ mod tests {
     }
 
     #[test]
+    fn test_int5_with_multibyte_utf8_does_not_panic() {
+        // Regression test for fuzzer crash: serialize_int5 would panic on string
+        // slicing when the payload contained multi-byte UTF-8 characters.
+        // The fix uses byte-level checks for hex prefix detection.
+
+        // Construct malformed JSONB: INT5 header followed by UTF-8 with multi-byte chars
+        // Header: (6 << 4) | 4 = 0x64 (INT5 element, 6 bytes payload)
+        // Payload: "T" + U+F5D3 (3-byte UTF-8) + "?]"
+        let data: Vec<u8> = vec![
+            0x64, // INT5 header, 6 bytes payload
+            84,   // 'T'
+            239, 151, 147, // U+F5D3 (3-byte UTF-8 char)
+            63,  // '?'
+            93,  // ']'
+        ];
+
+        let jsonb = Jsonb::from_raw_data(&data);
+        // This should not panic - the fix uses byte-level checks that handle
+        // non-ASCII safely. The malformed data is rejected as invalid INT5,
+        // matching SQLite's "malformed JSON" behavior.
+        let err = jsonb.to_string().unwrap_err();
+        assert!(err.to_string().contains("malformed JSON"));
+    }
+
+    #[test]
+    fn test_to_string_propagates_errors() {
+        // Valid JSONB should succeed
+        let valid = Jsonb::from_str(r#"{"key": "value"}"#).unwrap();
+        assert!(valid.to_string().is_ok());
+
+        // Malformed JSONB with invalid element type should error
+        let malformed = Jsonb::from_raw_data(&[0xFF]);
+        let err = malformed.to_string().unwrap_err();
+        assert!(err.to_string().contains("Invalid element type"));
+
+        // Malformed INT5 with non-numeric content should error
+        let bad_int5 = Jsonb::from_raw_data(&[
+            0x34, // INT5 header, 3 bytes payload
+            b'a', b'b', b'c', // not a valid number
+        ]);
+        let err = bad_int5.to_string().unwrap_err();
+        assert!(err.to_string().contains("malformed JSON"));
+
+        // Empty INT5 payload should error
+        let empty_int5 = Jsonb::from_raw_data(&[
+            0x04, // INT5 header, 0 bytes payload
+        ]);
+        let err = empty_int5.to_string().unwrap_err();
+        assert!(err.to_string().contains("malformed JSON"));
+
+        // Sign-only INT5 payload should error
+        let sign_only_int5 = Jsonb::from_raw_data(&[
+            0x14, // INT5 header, 1 byte payload
+            b'+',
+        ]);
+        let err = sign_only_int5.to_string().unwrap_err();
+        assert!(err.to_string().contains("malformed JSON"));
+
+        let minus_only_int5 = Jsonb::from_raw_data(&[
+            0x14, // INT5 header, 1 byte payload
+            b'-',
+        ]);
+        let err = minus_only_int5.to_string().unwrap_err();
+        assert!(err.to_string().contains("malformed JSON"));
+    }
+
+    #[test]
     fn test_float_serialization() {
         // Standard float
         let parsed = Jsonb::from_str("3.14159").unwrap();
-        assert_eq!(parsed.to_string(), "3.14159");
+        assert_eq!(parsed.to_string().unwrap(), "3.14159");
 
         // Negative float
         let parsed = Jsonb::from_str("-2.718").unwrap();
-        assert_eq!(parsed.to_string(), "-2.718");
+        assert_eq!(parsed.to_string().unwrap(), "-2.718");
 
         // Scientific notation
         let parsed = Jsonb::from_str("6.022e23").unwrap();
-        assert_eq!(parsed.to_string(), "6.022e23");
+        assert_eq!(parsed.to_string().unwrap(), "6.022e23");
 
         // Verify correct type
         let header = JsonbHeader::from_slice(0, &parsed.data).unwrap().0;
@@ -3551,23 +3636,23 @@ mod tests {
     fn test_json5_float_serialization() {
         // Leading decimal point
         let parsed = Jsonb::from_str(".123").unwrap();
-        assert_eq!(parsed.to_string(), "0.123");
+        assert_eq!(parsed.to_string().unwrap(), "0.123");
 
         // Trailing decimal point
         let parsed = Jsonb::from_str("42.").unwrap();
-        assert_eq!(parsed.to_string(), "42.0");
+        assert_eq!(parsed.to_string().unwrap(), "42.0");
 
         // Plus sign in exponent
         let parsed = Jsonb::from_str("1.5e+10").unwrap();
-        assert_eq!(parsed.to_string(), "1.5e+10");
+        assert_eq!(parsed.to_string().unwrap(), "1.5e+10");
 
         // Infinity
         let parsed = Jsonb::from_str("Infinity").unwrap();
-        assert_eq!(parsed.to_string(), "9.0e+999");
+        assert_eq!(parsed.to_string().unwrap(), "9.0e+999");
 
         // Negative Infinity
         let parsed = Jsonb::from_str("-Infinity").unwrap();
-        assert_eq!(parsed.to_string(), "-9.0e+999");
+        assert_eq!(parsed.to_string().unwrap(), "-9.0e+999");
 
         // Verify correct type
         let header = JsonbHeader::from_slice(0, &parsed.data).unwrap().0;
@@ -3578,15 +3663,15 @@ mod tests {
     fn test_string_serialization() {
         // Simple string
         let parsed = Jsonb::from_str(r#""hello world""#).unwrap();
-        assert_eq!(parsed.to_string(), r#""hello world""#);
+        assert_eq!(parsed.to_string().unwrap(), r#""hello world""#);
 
         // String with escaped characters
         let parsed = Jsonb::from_str(r#""hello\nworld""#).unwrap();
-        assert_eq!(parsed.to_string(), r#""hello\nworld""#);
+        assert_eq!(parsed.to_string().unwrap(), r#""hello\nworld""#);
 
         // Unicode escape
         let parsed = Jsonb::from_str(r#""hello\u0020world""#).unwrap();
-        assert_eq!(parsed.to_string(), r#""hello\u0020world""#);
+        assert_eq!(parsed.to_string().unwrap(), r#""hello\u0020world""#);
 
         // Verify correct type
         let header = JsonbHeader::from_slice(0, &parsed.data).unwrap().0;
@@ -3597,11 +3682,11 @@ mod tests {
     fn test_json5_string_serialization() {
         // Single quotes
         let parsed = Jsonb::from_str("'hello world'").unwrap();
-        assert_eq!(parsed.to_string(), r#""hello world""#);
+        assert_eq!(parsed.to_string().unwrap(), r#""hello world""#);
 
         // Hex escape
         let parsed = Jsonb::from_str(r#"'\x41\x42\x43'"#).unwrap();
-        assert_eq!(parsed.to_string(), r#""\u0041\u0042\u0043""#);
+        assert_eq!(parsed.to_string().unwrap(), r#""\u0041\u0042\u0043""#);
 
         // Multiline string with line continuation
         let parsed = Jsonb::from_str(
@@ -3609,11 +3694,11 @@ mod tests {
 world""#,
         )
         .unwrap();
-        assert_eq!(parsed.to_string(), r#""hello world""#);
+        assert_eq!(parsed.to_string().unwrap(), r#""hello world""#);
 
         // Escaped single quote
         let parsed = Jsonb::from_str(r#"'Don\'t worry'"#).unwrap();
-        assert_eq!(parsed.to_string(), r#""Don't worry""#);
+        assert_eq!(parsed.to_string().unwrap(), r#""Don't worry""#);
 
         // Verify correct type
         let header = JsonbHeader::from_slice(0, &parsed.data).unwrap().0;
@@ -3624,20 +3709,20 @@ world""#,
     fn test_array_serialization() {
         // Empty array
         let parsed = Jsonb::from_str("[]").unwrap();
-        assert_eq!(parsed.to_string(), "[]");
+        assert_eq!(parsed.to_string().unwrap(), "[]");
 
         // Simple array
         let parsed = Jsonb::from_str("[1,2,3]").unwrap();
-        assert_eq!(parsed.to_string(), "[1,2,3]");
+        assert_eq!(parsed.to_string().unwrap(), "[1,2,3]");
 
         // Nested array
         let parsed = Jsonb::from_str("[[1,2],[3,4]]").unwrap();
-        assert_eq!(parsed.to_string(), "[[1,2],[3,4]]");
+        assert_eq!(parsed.to_string().unwrap(), "[[1,2],[3,4]]");
 
         // Mixed types array
         let parsed = Jsonb::from_str(r#"[1,"text",true,null,{"key":"value"}]"#).unwrap();
         assert_eq!(
-            parsed.to_string(),
+            parsed.to_string().unwrap(),
             r#"[1,"text",true,null,{"key":"value"}]"#
         );
 
@@ -3650,41 +3735,44 @@ world""#,
     fn test_json5_array_serialization() {
         // Trailing comma
         let parsed = Jsonb::from_str("[1,2,3,]").unwrap();
-        assert_eq!(parsed.to_string(), "[1,2,3]");
+        assert_eq!(parsed.to_string().unwrap(), "[1,2,3]");
 
         // Comments in array
         let parsed = Jsonb::from_str("[1,/* comment */2,3]").unwrap();
-        assert_eq!(parsed.to_string(), "[1,2,3]");
+        assert_eq!(parsed.to_string().unwrap(), "[1,2,3]");
 
         // Line comment in array
         let parsed = Jsonb::from_str("[1,// line comment\n2,3]").unwrap();
-        assert_eq!(parsed.to_string(), "[1,2,3]");
+        assert_eq!(parsed.to_string().unwrap(), "[1,2,3]");
     }
 
     #[test]
     fn test_object_serialization() {
         // Empty object
         let parsed = Jsonb::from_str("{}").unwrap();
-        assert_eq!(parsed.to_string(), "{}");
+        assert_eq!(parsed.to_string().unwrap(), "{}");
 
         // Simple object
         let parsed = Jsonb::from_str(r#"{"key":"value"}"#).unwrap();
-        assert_eq!(parsed.to_string(), r#"{"key":"value"}"#);
+        assert_eq!(parsed.to_string().unwrap(), r#"{"key":"value"}"#);
 
         // Multiple properties
         let parsed = Jsonb::from_str(r#"{"a":1,"b":2,"c":3}"#).unwrap();
-        assert_eq!(parsed.to_string(), r#"{"a":1,"b":2,"c":3}"#);
+        assert_eq!(parsed.to_string().unwrap(), r#"{"a":1,"b":2,"c":3}"#);
 
         // Nested object
         let parsed = Jsonb::from_str(r#"{"outer":{"inner":"value"}}"#).unwrap();
-        assert_eq!(parsed.to_string(), r#"{"outer":{"inner":"value"}}"#);
+        assert_eq!(
+            parsed.to_string().unwrap(),
+            r#"{"outer":{"inner":"value"}}"#
+        );
 
         // Mixed values
         let parsed =
             Jsonb::from_str(r#"{"str":"text","num":42,"bool":true,"null":null,"arr":[1,2]}"#)
                 .unwrap();
         assert_eq!(
-            parsed.to_string(),
+            parsed.to_string().unwrap(),
             r#"{"str":"text","num":42,"bool":true,"null":null,"arr":[1,2]}"#
         );
 
@@ -3697,19 +3785,19 @@ world""#,
     fn test_json5_object_serialization() {
         // Unquoted keys
         let parsed = Jsonb::from_str("{key:\"value\"}").unwrap();
-        assert_eq!(parsed.to_string(), r#"{"key":"value"}"#);
+        assert_eq!(parsed.to_string().unwrap(), r#"{"key":"value"}"#);
 
         // Trailing comma
         let parsed = Jsonb::from_str(r#"{"a":1,"b":2,}"#).unwrap();
-        assert_eq!(parsed.to_string(), r#"{"a":1,"b":2}"#);
+        assert_eq!(parsed.to_string().unwrap(), r#"{"a":1,"b":2}"#);
 
         // Comments in object
         let parsed = Jsonb::from_str(r#"{"a":1,/*comment*/"b":2}"#).unwrap();
-        assert_eq!(parsed.to_string(), r#"{"a":1,"b":2}"#);
+        assert_eq!(parsed.to_string().unwrap(), r#"{"a":1,"b":2}"#);
 
         // Single quotes for keys and values
         let parsed = Jsonb::from_str("{'a':'value'}").unwrap();
-        assert_eq!(parsed.to_string(), r#"{"a":"value"}"#);
+        assert_eq!(parsed.to_string().unwrap(), r#"{"a":"value"}"#);
     }
 
     #[test]
@@ -3732,8 +3820,8 @@ world""#,
 
         let parsed = Jsonb::from_str(complex_json).unwrap();
         // Round-trip test
-        let reparsed = Jsonb::from_str(&parsed.to_string()).unwrap();
-        assert_eq!(parsed.to_string(), reparsed.to_string());
+        let reparsed = Jsonb::from_str(&parsed.to_string().unwrap()).unwrap();
+        assert_eq!(parsed.to_string().unwrap(), reparsed.to_string().unwrap());
     }
 
     #[test]
@@ -3852,11 +3940,11 @@ world""#,
     fn test_unicode_escapes() {
         // Basic unicode escape
         let parsed = Jsonb::from_str(r#""\u00A9""#).unwrap(); // Copyright symbol
-        assert_eq!(parsed.to_string(), r#""\u00A9""#);
+        assert_eq!(parsed.to_string().unwrap(), r#""\u00A9""#);
 
         // Non-BMP character (surrogate pair)
         let parsed = Jsonb::from_str(r#""\uD83D\uDE00""#).unwrap(); // Smiley emoji
-        assert_eq!(parsed.to_string(), r#""\uD83D\uDE00""#);
+        assert_eq!(parsed.to_string().unwrap(), r#""\uD83D\uDE00""#);
     }
 
     #[test]
@@ -3869,7 +3957,7 @@ world""#,
         }"#,
         )
         .unwrap();
-        assert_eq!(parsed.to_string(), r#"{"key":"value"}"#);
+        assert_eq!(parsed.to_string().unwrap(), r#"{"key":"value"}"#);
 
         // Block comments
         let parsed = Jsonb::from_str(
@@ -3880,7 +3968,7 @@ world""#,
         }"#,
         )
         .unwrap();
-        assert_eq!(parsed.to_string(), r#"{"key":"value"}"#);
+        assert_eq!(parsed.to_string().unwrap(), r#"{"key":"value"}"#);
 
         // Comments inside array
         let parsed = Jsonb::from_str(
@@ -3888,7 +3976,7 @@ world""#,
                                        2, /* Another comment */ 3]"#,
         )
         .unwrap();
-        assert_eq!(parsed.to_string(), "[1,2,3]");
+        assert_eq!(parsed.to_string().unwrap(), "[1,2,3]");
     }
 
     #[test]
@@ -3906,7 +3994,7 @@ world""#,
 
         let parsed = Jsonb::from_str(json_with_whitespace).unwrap();
         assert_eq!(
-            parsed.to_string(),
+            parsed.to_string().unwrap(),
             r#"{"key1":"value1","key2":[1,2,3],"key3":{"nested":true}}"#
         );
     }
@@ -3920,7 +4008,7 @@ world""#,
 
         // Create a new Jsonb from the binary data
         let from_binary = Jsonb::new(0, Some(&binary_data));
-        assert_eq!(from_binary.to_string(), original);
+        assert_eq!(from_binary.to_string().unwrap(), original);
     }
 
     #[test]
@@ -3936,8 +4024,8 @@ world""#,
         large_array.push(']');
 
         let parsed = Jsonb::from_str(&large_array).unwrap();
-        assert!(parsed.to_string().starts_with("[0,1,2,"));
-        assert!(parsed.to_string().ends_with("998,999]"));
+        assert!(parsed.to_string().unwrap().starts_with("[0,1,2,"));
+        assert!(parsed.to_string().unwrap().ends_with("998,999]"));
     }
 
     #[test]
@@ -3966,7 +4054,7 @@ world""#,
         }"#;
 
         let parsed = Jsonb::from_str(json).unwrap();
-        let result = parsed.to_string();
+        let result = parsed.to_string().unwrap();
 
         assert!(result.contains(r#""escaped_quotes":"He said \"Hello\"""#));
         assert!(result.contains(r#""backslashes":"C:\\Windows\\System32""#));
@@ -4133,7 +4221,7 @@ mod path_operations_tests {
         assert!(result.is_ok());
 
         // Verify the value was updated
-        let updated_json = jsonb.to_string();
+        let updated_json = jsonb.to_string().unwrap();
         assert_eq!(updated_json, r#"{"name":"Jane","age":30}"#);
     }
 
@@ -4157,7 +4245,7 @@ mod path_operations_tests {
         assert!(result.is_ok());
 
         // Verify the value was inserted
-        let updated_json = jsonb.to_string();
+        let updated_json = jsonb.to_string().unwrap();
         assert_eq!(updated_json, r#"{"name":"John","age":30}"#);
     }
 
@@ -4180,7 +4268,7 @@ mod path_operations_tests {
         assert!(result.is_ok());
 
         // Verify the property was deleted
-        let updated_json = jsonb.to_string();
+        let updated_json = jsonb.to_string().unwrap();
         assert_eq!(updated_json, r#"{"name":"John"}"#);
     }
 
@@ -4205,7 +4293,7 @@ mod path_operations_tests {
         assert!(result.is_ok());
 
         // Verify the value was replaced
-        let updated_json = jsonb.to_string();
+        let updated_json = jsonb.to_string().unwrap();
         assert_eq!(updated_json, r#"{"items":[10,50,30]}"#);
     }
 
@@ -4229,7 +4317,7 @@ mod path_operations_tests {
 
         // Get the search result
         let search_result = operation.result();
-        let result_str = search_result.to_string();
+        let result_str = search_result.to_string().unwrap();
 
         // Verify the search found the correct value
         assert_eq!(result_str, r#"{"name":"John","age":30}"#);
@@ -4278,7 +4366,7 @@ mod path_operations_tests {
         assert!(result.is_ok());
 
         // Verify the deep value was updated
-        let updated_json = jsonb.to_string();
+        let updated_json = jsonb.to_string().unwrap();
         assert_eq!(
             updated_json,
             r#"{"level1":{"level2":{"level3":{"value":100}}}}"#
@@ -4319,7 +4407,7 @@ mod path_operations_tests {
         let result = jsonb.operate_on_path(&path, &mut operation);
         assert!(result.is_ok());
 
-        let updated_json = jsonb.to_string();
+        let updated_json = jsonb.to_string().unwrap();
         assert_eq!(updated_json, r#"{"name":"John","age":30}"#);
 
         // 3. InsertNew mode - should fail when path already exists
@@ -4357,7 +4445,7 @@ mod path_operations_tests {
         let result = jsonb.operate_on_path(&path, &mut operation);
         assert!(result.is_ok());
 
-        let updated_json = jsonb.to_string();
+        let updated_json = jsonb.to_string().unwrap();
         assert_eq!(updated_json, r#"{"name":"John","age":31,"surname":"Doe"}"#);
     }
 }
