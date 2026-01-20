@@ -14,9 +14,10 @@ use sql_generation::{
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::trace;
+use tracing::{debug, trace};
 use turso_core::{
     CipherMode, Connection, Database, DatabaseOpts, EncryptionOpts, IO, OpenFlags, Statement,
+    Value,
 };
 use turso_parser::ast::{ColumnConstraint, SortOrder};
 
@@ -99,7 +100,7 @@ impl Workload for BeginWorkload {
         };
         if ctx.prepare(cmd) {
             *ctx.state = FiberState::InTx;
-            trace!("BEGIN: {}", cmd);
+            debug!("BEGIN: {}", cmd);
             Ok(true)
         } else {
             Ok(false)
@@ -117,7 +118,7 @@ impl Workload for IntegrityCheckWorkload {
         }
         if ctx.prepare("PRAGMA integrity_check") {
             ctx.stats.integrity_checks += 1;
-            trace!("PRAGMA integrity_check");
+            debug!("PRAGMA integrity_check");
             Ok(true)
         } else {
             Ok(false)
@@ -135,10 +136,11 @@ impl Workload for CreateSimpleTableWorkload {
             return Ok(false);
         }
         let table_name = format!("simple_kv_{}", rng.random_range(0..100000));
-        let sql = format!("CREATE TABLE IF NOT EXISTS {table_name} (key TEXT PRIMARY KEY, value BLOB)");
+        let sql =
+            format!("CREATE TABLE IF NOT EXISTS {table_name} (key TEXT PRIMARY KEY, value BLOB)");
         if ctx.prepare(&sql) {
             ctx.simple_tables.push(table_name.clone());
-            trace!("CREATE SIMPLE TABLE: {}", table_name);
+            debug!("CREATE SIMPLE TABLE: {}", table_name);
             Ok(true)
         } else {
             Ok(false)
@@ -159,7 +161,7 @@ impl Workload for SimpleSelectWorkload {
         let key = format!("key_{}", rng.random_range(0..10000));
         let sql = format!("SELECT value FROM {table_name} WHERE key = '{key}'");
         if ctx.prepare(&sql) {
-            trace!("SIMPLE SELECT: {}", sql);
+            debug!("SIMPLE SELECT: {}", sql);
             Ok(true)
         } else {
             Ok(false)
@@ -188,7 +190,7 @@ impl Workload for SimpleInsertWorkload {
         );
         if ctx.prepare(&sql) {
             ctx.stats.inserts += 1;
-            trace!("SIMPLE INSERT: table={}, key={}", table_name, key);
+            debug!("SIMPLE INSERT: table={}, key={}", table_name, key);
             Ok(true)
         } else {
             Ok(false)
@@ -204,7 +206,7 @@ impl Workload for SelectWorkload {
         let select = Select::arbitrary(rng, ctx);
         let sql = select.to_string();
         if ctx.prepare(&sql) {
-            trace!("SELECT: {}", sql);
+            debug!("SELECT: {}", sql);
             Ok(true)
         } else {
             Ok(false)
@@ -221,7 +223,7 @@ impl Workload for InsertWorkload {
         let sql = insert.to_string();
         if ctx.prepare(&sql) {
             ctx.stats.inserts += 1;
-            trace!("INSERT: {}", sql);
+            debug!("INSERT: {}", sql);
             Ok(true)
         } else {
             Ok(false)
@@ -238,7 +240,7 @@ impl Workload for UpdateWorkload {
         let sql = update.to_string();
         if ctx.prepare(&sql) {
             ctx.stats.updates += 1;
-            trace!("UPDATE: {}", sql);
+            debug!("UPDATE: {}", sql);
             Ok(true)
         } else {
             Ok(false)
@@ -255,7 +257,7 @@ impl Workload for DeleteWorkload {
         let sql = delete.to_string();
         if ctx.prepare(&sql) {
             ctx.stats.deletes += 1;
-            trace!("DELETE: {}", sql);
+            debug!("DELETE: {}", sql);
             Ok(true)
         } else {
             Ok(false)
@@ -275,7 +277,7 @@ impl Workload for CreateIndexWorkload {
                 create_index.index.table_name.clone(),
                 create_index.index_name.clone(),
             ));
-            trace!("CREATE INDEX: {}", sql);
+            debug!("CREATE INDEX: {}", sql);
             Ok(true)
         } else {
             Ok(false)
@@ -299,7 +301,7 @@ impl Workload for DropIndexWorkload {
         };
         let sql = drop_index.to_string();
         if ctx.prepare(&sql) {
-            trace!("DROP INDEX: {}", sql);
+            debug!("DROP INDEX: {}", sql);
             Ok(true)
         } else {
             Ok(false)
@@ -324,7 +326,7 @@ impl Workload for WalCheckpointWorkload {
         };
         let sql = format!("PRAGMA wal_checkpoint({mode})");
         if ctx.prepare(&sql) {
-            trace!("WAL CHECKPOINT: {}", mode);
+            debug!("WAL CHECKPOINT: {}", mode);
             Ok(true)
         } else {
             Ok(false)
@@ -342,7 +344,7 @@ impl Workload for CommitWorkload {
         }
         if ctx.prepare("COMMIT") {
             *ctx.state = FiberState::Idle;
-            trace!("COMMIT");
+            debug!("COMMIT");
             Ok(true)
         } else {
             Ok(false)
@@ -360,7 +362,7 @@ impl Workload for RollbackWorkload {
         }
         if ctx.prepare("ROLLBACK") {
             *ctx.state = FiberState::Idle;
-            trace!("ROLLBACK");
+            debug!("ROLLBACK");
             Ok(true)
         } else {
             Ok(false)
@@ -372,23 +374,22 @@ impl Workload for RollbackWorkload {
 pub fn default_workloads() -> Vec<(u32, Box<dyn Workload>)> {
     vec![
         // Idle-only workloads
-        (30, Box::new(BeginWorkload)),
-        (1, Box::new(IntegrityCheckWorkload)),
-        (1, Box::new(WalCheckpointWorkload)),
-        (5, Box::new(CreateSimpleTableWorkload)),
-        // Simple KV workloads (fast point operations)
+        (10, Box::new(IntegrityCheckWorkload)),
+        (5, Box::new(WalCheckpointWorkload)),
+        (10, Box::new(CreateSimpleTableWorkload)),
         (20, Box::new(SimpleSelectWorkload)),
         (20, Box::new(SimpleInsertWorkload)),
         // DML workloads (work in both Idle and InTx)
-        (10, Box::new(SelectWorkload)),
-        (30, Box::new(InsertWorkload)),
-        (20, Box::new(UpdateWorkload)),
-        (10, Box::new(DeleteWorkload)),
-        (2, Box::new(CreateIndexWorkload)),
-        (2, Box::new(DropIndexWorkload)),
+        // (10, Box::new(SelectWorkload)),
+        // (30, Box::new(InsertWorkload)),
+        // (20, Box::new(UpdateWorkload)),
+        // (10, Box::new(DeleteWorkload)),
+        // (2, Box::new(CreateIndexWorkload)),
+        // (2, Box::new(DropIndexWorkload)),
         // InTx-only workloads
-        (13, Box::new(CommitWorkload)),
-        (13, Box::new(RollbackWorkload)),
+        (30, Box::new(BeginWorkload)),
+        (10, Box::new(CommitWorkload)),
+        (10, Box::new(RollbackWorkload)),
     ]
 }
 
@@ -516,6 +517,7 @@ struct SimulatorFiber {
     connection: Arc<Connection>,
     state: FiberState,
     statement: RefCell<Option<Statement>>,
+    rows_fetched: Vec<Vec<Value>>,
 }
 
 struct SimulatorContext {
@@ -605,14 +607,14 @@ impl Whopper {
         let tables = schema.iter().map(|t| t.table.clone()).collect::<Vec<_>>();
         for create_table in &schema {
             let sql = create_table.to_string();
-            trace!("{}", sql);
+            debug!("{}", sql);
             bootstrap_conn.execute(&sql)?;
         }
 
         let indexes = create_initial_indexes(&mut rng, &tables);
         for create_index in &indexes {
             let sql = create_index.to_string();
-            trace!("{}", sql);
+            debug!("{}", sql);
             bootstrap_conn.execute(&sql)?;
         }
 
@@ -634,6 +636,7 @@ impl Whopper {
                 connection: conn,
                 state: FiberState::Idle,
                 statement: RefCell::new(None),
+                rows_fetched: vec![],
             });
         }
 
@@ -707,14 +710,33 @@ impl Whopper {
                 };
                 match step_result {
                     Ok(result) => {
-                        tracing::debug!("fiber: {} {:?}", fiber_idx, result);
-                        matches!(result, turso_core::StepResult::Done)
+                        trace!("fiber: {} {:?}", fiber_idx, result);
+                        match result {
+                            turso_core::StepResult::Row => {
+                                if let Some(row) = stmt.row() {
+                                    let values: Vec<Value> =
+                                        row.get_values().cloned().collect();
+                                    drop(stmt_borrow);
+                                    self.context.fibers[fiber_idx].rows_fetched.push(values);
+                                } else {
+                                    drop(stmt_borrow);
+                                }
+                                false
+                            }
+                            turso_core::StepResult::Done => true,
+                            _ => false,
+                        }
                     }
                     Err(e) => match e {
                         turso_core::LimboError::SchemaUpdated => {
-                            trace!("{} Schema changed, rolling back transaction", fiber_idx);
                             drop(stmt_borrow);
+                            debug!(
+                                "fiber {}: error SchemaUpdated, discarding {} rows",
+                                fiber_idx,
+                                self.context.fibers[fiber_idx].rows_fetched.len()
+                            );
                             self.context.fibers[fiber_idx].statement.replace(None);
+                            self.context.fibers[fiber_idx].rows_fetched.clear();
                             if matches!(self.context.fibers[fiber_idx].state, FiberState::InTx)
                                 && let Ok(rollback_stmt) = self.context.fibers[fiber_idx]
                                     .connection
@@ -728,9 +750,14 @@ impl Whopper {
                             return Ok(());
                         }
                         turso_core::LimboError::Busy => {
-                            trace!("{} Database busy, rolling back transaction", fiber_idx);
                             drop(stmt_borrow);
+                            debug!(
+                                "fiber {}: error Busy, discarding {} rows",
+                                fiber_idx,
+                                self.context.fibers[fiber_idx].rows_fetched.len()
+                            );
                             self.context.fibers[fiber_idx].statement.replace(None);
+                            self.context.fibers[fiber_idx].rows_fetched.clear();
                             if matches!(self.context.fibers[fiber_idx].state, FiberState::InTx)
                                 && let Ok(rollback_stmt) = self.context.fibers[fiber_idx]
                                     .connection
@@ -744,19 +771,26 @@ impl Whopper {
                             return Ok(());
                         }
                         turso_core::LimboError::WriteWriteConflict => {
-                            trace!(
-                                "{} Write-write conflict, transaction automatically rolled back",
-                                fiber_idx
-                            );
                             drop(stmt_borrow);
+                            debug!(
+                                "fiber {}: error WriteWriteConflict, discarding {} rows",
+                                fiber_idx,
+                                self.context.fibers[fiber_idx].rows_fetched.len()
+                            );
                             self.context.fibers[fiber_idx].statement.replace(None);
+                            self.context.fibers[fiber_idx].rows_fetched.clear();
                             self.context.fibers[fiber_idx].state = FiberState::Idle;
                             return Ok(());
                         }
                         turso_core::LimboError::BusySnapshot => {
-                            trace!("{} Stale snapshot, rolling back transaction", fiber_idx);
                             drop(stmt_borrow);
+                            debug!(
+                                "fiber {}: error BusySnapshot, discarding {} rows",
+                                fiber_idx,
+                                self.context.fibers[fiber_idx].rows_fetched.len()
+                            );
                             self.context.fibers[fiber_idx].statement.replace(None);
+                            self.context.fibers[fiber_idx].rows_fetched.clear();
                             if matches!(self.context.fibers[fiber_idx].state, FiberState::InTx)
                                 && let Ok(rollback_stmt) = self.context.fibers[fiber_idx]
                                     .connection
@@ -785,6 +819,13 @@ impl Whopper {
         }
 
         self.context.fibers[fiber_idx].statement.replace(None);
+        debug!(
+            "fiber {}: completed with {} rows: {:?}",
+            fiber_idx,
+            self.context.fibers[fiber_idx].rows_fetched.len(),
+            self.context.fibers[fiber_idx].rows_fetched
+        );
+        self.context.fibers[fiber_idx].rows_fetched.clear();
 
         // Select a workload using weighted random selection
         if self.total_weight == 0 {
