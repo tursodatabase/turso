@@ -162,7 +162,6 @@ struct SimulatorContext {
     tables: Vec<Table>,
     indexes: Vec<(String, String)>,
     opts: Opts,
-    stats: Stats,
     disable_indexes: bool,
     enable_mvcc: bool,
 }
@@ -184,9 +183,10 @@ pub struct Whopper {
     io: Arc<dyn IO>,
     file_sizes: Arc<std::sync::Mutex<HashMap<String, u64>>>,
     wal_path: String,
-    current_step: usize,
-    max_steps: usize,
-    seed: u64,
+    pub current_step: usize,
+    pub max_steps: usize,
+    pub seed: u64,
+    pub stats: Stats,
 }
 
 impl Whopper {
@@ -296,7 +296,6 @@ impl Whopper {
                 .map(|idx| (idx.table_name.clone(), idx.index_name.clone()))
                 .collect(),
             opts: Opts::default(),
-            stats: Stats::default(),
             disable_indexes: opts.disable_indexes,
             enable_mvcc: opts.enable_mvcc,
         };
@@ -310,27 +309,8 @@ impl Whopper {
             current_step: 0,
             max_steps: opts.max_steps,
             seed,
+            stats: Stats::default(),
         })
-    }
-
-    /// Get the seed used for this simulation.
-    pub fn seed(&self) -> u64 {
-        self.seed
-    }
-
-    /// Get the current step number.
-    pub fn current_step(&self) -> usize {
-        self.current_step
-    }
-
-    /// Get the maximum number of steps.
-    pub fn max_steps(&self) -> usize {
-        self.max_steps
-    }
-
-    /// Get a reference to the current statistics.
-    pub fn stats(&self) -> &Stats {
-        &self.context.stats
     }
 
     /// Check if the simulation is complete (reached max steps or WAL limit).
@@ -347,7 +327,7 @@ impl Whopper {
         }
 
         let fiber_idx = self.current_step % self.context.fibers.len();
-        perform_work(fiber_idx, &mut self.rng, &mut self.context)?;
+        perform_work(fiber_idx, &mut self.rng, &mut self.context, &mut self.stats)?;
         self.io.step()?;
         self.current_step += 1;
 
@@ -510,6 +490,7 @@ fn perform_work(
     fiber_idx: usize,
     rng: &mut ChaCha8Rng,
     context: &mut SimulatorContext,
+    stats: &mut Stats,
 ) -> anyhow::Result<()> {
     // If we have a statement, step it.
     let done = {
@@ -628,7 +609,7 @@ fn perform_work(
                     .prepare("PRAGMA integrity_check")
                 {
                     context.fibers[fiber_idx].statement.replace(Some(stmt));
-                    context.stats.integrity_checks += 1;
+                    stats.integrity_checks += 1;
                     trace!("fiber: {} PRAGMA integrity_check", fiber_idx);
                 }
             }
@@ -655,7 +636,7 @@ fn perform_work(
                         .prepare(insert.to_string())
                     {
                         context.fibers[fiber_idx].statement.replace(Some(stmt));
-                        context.stats.inserts += 1;
+                        stats.inserts += 1;
                     }
                     trace!("fiber: {} INSERT: {}", fiber_idx, insert.to_string());
                 }
@@ -667,7 +648,7 @@ fn perform_work(
                         .prepare(update.to_string())
                     {
                         context.fibers[fiber_idx].statement.replace(Some(stmt));
-                        context.stats.updates += 1;
+                        stats.updates += 1;
                     }
                     trace!("fiber: {} UPDATE: {}", fiber_idx, update.to_string());
                 }
@@ -679,7 +660,7 @@ fn perform_work(
                         .prepare(delete.to_string())
                     {
                         context.fibers[fiber_idx].statement.replace(Some(stmt));
-                        context.stats.deletes += 1;
+                        stats.deletes += 1;
                     }
                     trace!("fiber: {} DELETE: {}", fiber_idx, delete.to_string());
                 }

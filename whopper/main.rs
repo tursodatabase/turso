@@ -49,7 +49,7 @@ fn main() -> anyhow::Result<()> {
 
     let mut whopper = Whopper::new(opts)?;
 
-    let max_steps = whopper.max_steps();
+    let max_steps = whopper.max_steps;
     let progress_interval = max_steps / 10;
     let progress_stages = [
         "       .             I/U/D/C",
@@ -74,9 +74,8 @@ fn main() -> anyhow::Result<()> {
             StepResult::WalSizeLimitExceeded => break,
         }
 
-        let current_step = whopper.current_step();
-        if progress_interval > 0 && current_step % progress_interval == 0 {
-            let stats = whopper.stats();
+        if progress_interval > 0 && whopper.current_step % progress_interval == 0 {
+            let stats = &whopper.stats;
             println!(
                 "{}{}/{}/{}/{}",
                 progress_stages[progress_index],
