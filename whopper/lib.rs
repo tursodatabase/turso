@@ -109,14 +109,24 @@ impl GenerationContext for WorkloadContext<'_> {
 }
 
 impl WorkloadContext<'_> {
-    /// Prepare a statement on this fiber. Panics if preparation fails.
-    pub fn prepare(&self, sql: &str) {
+    /// Prepare a statement on this fiber.
+    /// Returns true if successful, false if table doesn't exist.
+    /// Panics on other errors.
+    pub fn prepare(&self, sql: &str) -> bool {
         match self.connection.prepare(sql) {
             Ok(stmt) => {
                 self.statement.replace(Some(stmt));
+                true
             }
             Err(e) => {
-                panic!("Failed to prepare statement: {}\nSQL: {}", e, sql);
+                let err_str = e.to_string();
+                // Allow "no such table" errors - return false to skip this workload
+                if err_str.contains("no such table") {
+                    debug!("Table not found, skipping: {}", err_str);
+                    false
+                } else {
+                    panic!("Failed to prepare statement: {}\nSQL: {}", e, sql);
+                }
             }
         }
     }
@@ -213,7 +223,9 @@ impl Workload for SimpleSelectWorkload {
         };
 
         let sql = format!("SELECT value FROM {table_name} WHERE key = '{key}'");
-        ctx.prepare(&sql);
+        if !ctx.prepare(&sql) {
+            return Ok(false);
+        }
         debug!("SIMPLE SELECT: {}", sql);
         Ok(true)
     }
@@ -241,7 +253,9 @@ impl Workload for SimpleInsertWorkload {
         let sql = format!(
             "INSERT OR REPLACE INTO {table_name} (key, value) VALUES ('{key}', X'{value_hex}')"
         );
-        ctx.prepare(&sql);
+        if !ctx.prepare(&sql) {
+            return Ok(false);
+        }
         ctx.stats.inserts += 1;
 
         // Remember the key for later selects
@@ -858,20 +872,26 @@ impl Whopper {
         for (weight, workload) in &self.workloads {
             if roll < *weight {
                 let fiber = &mut self.context.fibers[fiber_idx];
-                let mut ctx = WorkloadContext {
-                    connection: &fiber.connection,
-                    state: &mut fiber.state,
-                    statement: &fiber.statement,
-                    tables: &self.context.tables,
-                    indexes: &mut self.context.indexes,
-                    simple_tables: &mut self.context.simple_tables,
-                    simple_tables_keys: &mut self.context.simple_tables_keys,
-                    stats: &mut self.stats,
-                    opts: &self.opts,
-                    enable_mvcc: self.context.enable_mvcc,
-                };
-                if workload.init(&mut ctx, &mut self.rng)? {
-                    return Ok(());
+                {
+                    let state = format!("{:?}", &fiber.state);
+                    let span = tracing::debug_span!("fiber", fiber_idx = fiber_idx, state = state);
+                    let _enter = span.enter();
+
+                    let mut ctx = WorkloadContext {
+                        connection: &fiber.connection,
+                        state: &mut fiber.state,
+                        statement: &fiber.statement,
+                        tables: &self.context.tables,
+                        indexes: &mut self.context.indexes,
+                        simple_tables: &mut self.context.simple_tables,
+                        simple_tables_keys: &mut self.context.simple_tables_keys,
+                        stats: &mut self.stats,
+                        opts: &self.opts,
+                        enable_mvcc: self.context.enable_mvcc,
+                    };
+                    if workload.init(&mut ctx, &mut self.rng)? {
+                        return Ok(());
+                    }
                 }
                 // If workload returned false, continue to try next
             }
