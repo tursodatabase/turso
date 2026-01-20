@@ -25,7 +25,9 @@ use crate::util::{
     trim_ascii_whitespace,
 };
 use crate::vdbe::affinity::{apply_numeric_affinity, try_for_float, Affinity, ParsedNumber};
-use crate::vdbe::hash_table::{HashEntry, HashTable, HashTableConfig, DEFAULT_MEM_BUDGET};
+use crate::vdbe::hash_table::{
+    hash_join_key, HashEntry, HashTable, HashTableConfig, DEFAULT_MEM_BUDGET, NUM_PARTITIONS,
+};
 use crate::vdbe::insn::InsertFlags;
 use crate::vdbe::value::ComparisonOp;
 use crate::vdbe::{
@@ -84,6 +86,7 @@ use super::{
     insn::{Cookie, RegisterOrLiteral},
     CommitState,
 };
+use super::{HashAggEmitState, OpHashAggStepState};
 use crate::sync::{Mutex, RwLock};
 use turso_parser::ast::{self, ForeignKeyClause, Name, ResolveType};
 use turso_parser::parser::Parser;
@@ -3651,37 +3654,11 @@ pub fn op_agg_step(
         },
         insn
     );
+
+    // Initialize aggregate state if not already done
     if let Register::Value(Value::Null) = state.registers[*acc_reg] {
         state.registers[*acc_reg] = match func {
-            AggFunc::Avg => {
-                Register::Aggregate(AggContext::Avg(Value::Float(0.0), Value::Integer(0)))
-            }
-            AggFunc::Sum => {
-                Register::Aggregate(AggContext::Sum(Value::Null, SumAggState::default()))
-            }
-            AggFunc::Total => {
-                // The result of total() is always a floating point value.
-                // No overflow error is ever raised if any prior input was a floating point value.
-                // Total() never throws an integer overflow.
-                Register::Aggregate(AggContext::Sum(Value::Float(0.0), SumAggState::default()))
-            }
-            AggFunc::Count | AggFunc::Count0 => {
-                Register::Aggregate(AggContext::Count(Value::Integer(0)))
-            }
-            AggFunc::Max => Register::Aggregate(AggContext::Max(None)),
-            AggFunc::Min => Register::Aggregate(AggContext::Min(None)),
-            AggFunc::GroupConcat | AggFunc::StringAgg => {
-                Register::Aggregate(AggContext::GroupConcat(Value::build_text("")))
-            }
-            #[cfg(feature = "json")]
-            AggFunc::JsonGroupArray | AggFunc::JsonbGroupArray => {
-                Register::Aggregate(AggContext::GroupConcat(Value::Blob(vec![])))
-            }
-            #[cfg(feature = "json")]
-            AggFunc::JsonGroupObject | AggFunc::JsonbGroupObject => {
-                Register::Aggregate(AggContext::GroupConcat(Value::Blob(vec![])))
-            }
-            AggFunc::External(func) => match func.as_ref() {
+            AggFunc::External(ext_func) => match ext_func.as_ref() {
                 ExtFunc::Aggregate {
                     init,
                     step,
@@ -3695,254 +3672,19 @@ pub fn op_agg_step(
                 })),
                 _ => unreachable!("scalar function called in aggregate context"),
             },
+            _ => {
+                // Built-in aggregates use flat payload
+                let mut payload = Vec::new();
+                init_agg_payload(func, &mut payload);
+                Register::Aggregate(AggContext::Builtin(payload))
+            }
         };
     }
+
+    // Step the aggregate
     match func {
-        AggFunc::Avg => {
-            let col = state.registers[*col].clone();
-            // > The avg() function returns the average value of all non-NULL X within a group
-            // https://sqlite.org/lang_aggfunc.html#avg
-            if !col.is_null() {
-                let Register::Aggregate(agg) = state.registers[*acc_reg].borrow_mut() else {
-                    panic!(
-                        "Unexpected value {:?} in AggStep at register {}",
-                        state.registers[*acc_reg], *acc_reg
-                    );
-                };
-                let AggContext::Avg(acc, count) = agg.borrow_mut() else {
-                    unreachable!();
-                };
-                *acc = acc.exec_add(col.get_value());
-                *count += 1;
-            }
-        }
-        AggFunc::Sum | AggFunc::Total => {
-            let col = state.registers[*col].clone();
-            let Register::Aggregate(agg) = state.registers[*acc_reg].borrow_mut() else {
-                panic!(
-                    "Unexpected value {:?} at register {:?} in AggStep",
-                    state.registers[*acc_reg], *acc_reg
-                );
-            };
-            let AggContext::Sum(acc, sum_state) = agg.borrow_mut() else {
-                unreachable!();
-            };
-            match col {
-                Register::Value(value) => {
-                    match value {
-                        Value::Null => {
-                            // Ignore NULLs
-                        }
-
-                        Value::Integer(i) => match acc {
-                            Value::Null => {
-                                *acc = Value::Integer(i);
-                            }
-                            Value::Integer(acc_i) => {
-                                match acc_i.checked_add(i) {
-                                    Some(sum) => *acc = Value::Integer(sum),
-                                    None => {
-                                        if matches!(func, AggFunc::Total) {
-                                            // Total() never throw an integer overflow -> switch to float with KBN summation
-                                            let acc_f = *acc_i as f64;
-                                            *acc = Value::Float(acc_f);
-                                            sum_state.approx = true;
-                                            sum_state.ovrfl = true;
-
-                                            apply_kbn_step_int(acc, i, sum_state);
-                                        } else {
-                                            return Err(LimboError::IntegerOverflow);
-                                        }
-                                    }
-                                }
-                            }
-                            Value::Float(_) => {
-                                apply_kbn_step_int(acc, i, sum_state);
-                            }
-                            _ => unreachable!(),
-                        },
-
-                        Value::Float(f) => match acc {
-                            Value::Null => {
-                                *acc = Value::Float(f);
-                                sum_state.approx = true;
-                            }
-                            Value::Integer(i) => {
-                                let i_f = *i as f64;
-                                *acc = Value::Float(i_f);
-                                sum_state.approx = true;
-                                apply_kbn_step(acc, f, sum_state);
-                            }
-                            Value::Float(_) => {
-                                sum_state.approx = true;
-                                apply_kbn_step(acc, f, sum_state);
-                            }
-                            _ => unreachable!(),
-                        },
-                        Value::Text(t) => {
-                            let s = t.as_str();
-                            let (_, parsed_number) = try_for_float(s);
-                            handle_text_sum(acc, sum_state, parsed_number);
-                        }
-                        Value::Blob(b) => {
-                            if let Ok(s) = std::str::from_utf8(&b) {
-                                let (_, parsed_number) = try_for_float(s);
-                                handle_text_sum(acc, sum_state, parsed_number);
-                            } else {
-                                handle_text_sum(acc, sum_state, ParsedNumber::None);
-                            }
-                        }
-                    }
-                }
-                _ => unreachable!(),
-            }
-        }
-        AggFunc::Count | AggFunc::Count0 => {
-            let skip = (matches!(func, AggFunc::Count)
-                && matches!(state.registers[*col].get_value(), Value::Null));
-            if matches!(&state.registers[*acc_reg], Register::Value(Value::Null)) {
-                state.registers[*acc_reg] =
-                    Register::Aggregate(AggContext::Count(Value::Integer(0)));
-            }
-            let Register::Aggregate(agg) = &mut state.registers[*acc_reg] else {
-                panic!(
-                    "Unexpected value {:?} in AggStep at register {}",
-                    state.registers[*acc_reg], *acc_reg
-                );
-            };
-            let AggContext::Count(count) = agg else {
-                unreachable!();
-            };
-            if !skip {
-                *count += 1;
-            };
-        }
-        AggFunc::Max => {
-            let col = state.registers[*col].clone();
-            let Register::Aggregate(agg) = state.registers[*acc_reg].borrow_mut() else {
-                panic!(
-                    "Unexpected value {:?} in AggStep at register {}",
-                    state.registers[*acc_reg], *acc_reg
-                );
-            };
-            let AggContext::Max(acc) = agg.borrow_mut() else {
-                unreachable!();
-            };
-
-            let new_value = col.get_value();
-            if *new_value != Value::Null
-                && acc.as_ref().is_none_or(|acc| {
-                    use std::cmp::Ordering;
-                    compare_with_collation(new_value, acc, state.current_collation)
-                        == Ordering::Greater
-                })
-            {
-                *acc = Some(new_value.clone());
-            }
-        }
-        AggFunc::Min => {
-            let col = state.registers[*col].clone();
-            let Register::Aggregate(agg) = state.registers[*acc_reg].borrow_mut() else {
-                panic!(
-                    "Unexpected value {:?} in AggStep",
-                    state.registers[*acc_reg]
-                );
-            };
-            let AggContext::Min(acc) = agg.borrow_mut() else {
-                unreachable!();
-            };
-
-            let new_value = col.get_value();
-
-            if *new_value != Value::Null
-                && acc.as_ref().is_none_or(|acc| {
-                    use std::cmp::Ordering;
-                    compare_with_collation(new_value, acc, state.current_collation)
-                        == Ordering::Less
-                })
-            {
-                *acc = Some(new_value.clone());
-            }
-        }
-        AggFunc::GroupConcat | AggFunc::StringAgg => {
-            let col = state.registers[*col].get_value().clone();
-            let delimiter = state.registers[*delimiter].clone();
-            let Register::Aggregate(agg) = state.registers[*acc_reg].borrow_mut() else {
-                unreachable!();
-            };
-            let AggContext::GroupConcat(acc) = agg.borrow_mut() else {
-                unreachable!();
-            };
-            if acc.to_string().is_empty() {
-                *acc = col;
-            } else {
-                match col {
-                    Value::Null => {}
-                    _ => {
-                        match delimiter {
-                            Register::Value(value) => {
-                                *acc += value;
-                            }
-                            _ => unreachable!(),
-                        }
-                        *acc += col;
-                    }
-                }
-            }
-        }
-        #[cfg(feature = "json")]
-        AggFunc::JsonGroupObject | AggFunc::JsonbGroupObject => {
-            let key = state.registers[*col].clone();
-            let value = state.registers[*delimiter].clone();
-            let Register::Aggregate(agg) = state.registers[*acc_reg].borrow_mut() else {
-                unreachable!();
-            };
-            let AggContext::GroupConcat(acc) = agg.borrow_mut() else {
-                unreachable!();
-            };
-
-            let mut key_vec = convert_dbtype_to_raw_jsonb(key.get_value())?;
-            let mut val_vec = convert_dbtype_to_raw_jsonb(value.get_value())?;
-
-            match acc {
-                Value::Blob(vec) => {
-                    if vec.is_empty() {
-                        // bits for obj header
-                        vec.push(12);
-                        vec.append(&mut key_vec);
-                        vec.append(&mut val_vec);
-                    } else {
-                        vec.append(&mut key_vec);
-                        vec.append(&mut val_vec);
-                    }
-                }
-                _ => unreachable!(),
-            };
-        }
-        #[cfg(feature = "json")]
-        AggFunc::JsonGroupArray | AggFunc::JsonbGroupArray => {
-            let col = state.registers[*col].clone();
-            let Register::Aggregate(agg) = state.registers[*acc_reg].borrow_mut() else {
-                unreachable!();
-            };
-            let AggContext::GroupConcat(acc) = agg.borrow_mut() else {
-                unreachable!();
-            };
-
-            let mut data = convert_dbtype_to_raw_jsonb(col.get_value())?;
-            match acc {
-                Value::Blob(vec) => {
-                    if vec.is_empty() {
-                        vec.push(11);
-                        vec.append(&mut data)
-                    } else {
-                        vec.append(&mut data);
-                    }
-                }
-                _ => unreachable!(),
-            };
-        }
         AggFunc::External(_) => {
+            // External aggregates use FFI and need special handling
             let (step_fn, state_ptr, argc) = {
                 let Register::Aggregate(agg) = &state.registers[*acc_reg] else {
                     unreachable!();
@@ -3967,7 +3709,43 @@ pub fn op_agg_step(
                 }
             }
         }
+        _ => {
+            // Build args slice first (before borrowing payload mutably)
+            let args: Vec<Value> = match func {
+                AggFunc::GroupConcat | AggFunc::StringAgg => {
+                    // args[0] = col, args[1] = delimiter
+                    vec![
+                        state.registers[*col].get_value().clone(),
+                        state.registers[*delimiter].get_value().clone(),
+                    ]
+                }
+                #[cfg(feature = "json")]
+                AggFunc::JsonGroupObject | AggFunc::JsonbGroupObject => {
+                    // args[0] = key (col), args[1] = value (delimiter register)
+                    vec![
+                        state.registers[*col].get_value().clone(),
+                        state.registers[*delimiter].get_value().clone(),
+                    ]
+                }
+                _ => {
+                    // Most aggregates just take the column value
+                    vec![state.registers[*col].get_value().clone()]
+                }
+            };
+            let collation = state.current_collation.unwrap_or(CollationSeq::Binary);
+
+            // Now get mutable borrow on payload
+            let Register::Aggregate(agg) = &mut state.registers[*acc_reg] else {
+                panic!(
+                    "Unexpected value {:?} in AggStep at register {}",
+                    state.registers[*acc_reg], *acc_reg
+                );
+            };
+            let payload = agg.payload_mut();
+            update_agg_payload(func, &args, payload, collation)?;
+        }
     };
+
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -3987,119 +3765,23 @@ pub fn op_agg_final(
         } => (*acc_reg, *dest_reg, func),
         _ => unreachable!("unexpected Insn {:?}", insn),
     };
+
     match &state.registers[acc_reg] {
-        Register::Aggregate(agg) => match func {
-            AggFunc::Avg => {
-                let AggContext::Avg(acc, count) = agg else {
-                    unreachable!();
-                };
-                let acc = if count.as_int() == Some(0) {
-                    Value::Null
-                } else {
-                    acc.clone() / count.clone()
-                };
-                state.registers[dest_reg] = Register::Value(acc);
-            }
-            AggFunc::Sum => {
-                let AggContext::Sum(acc, sum_state) = agg else {
-                    unreachable!();
-                };
-                let value = match acc {
-                    Value::Null => match sum_state.approx {
-                        true => Value::Float(0.0),
-                        false => Value::Null,
-                    },
-                    Value::Integer(i) if !sum_state.approx && !sum_state.ovrfl => {
-                        Value::Integer(*i)
-                    }
-                    _ => Value::Float(acc.as_float() + sum_state.r_err),
-                };
-                state.registers[dest_reg] = Register::Value(value);
-            }
-            AggFunc::Total => {
-                let AggContext::Sum(acc, _) = agg else {
-                    unreachable!();
-                };
-                let value = match acc {
-                    Value::Null => Value::Float(0.0),
-                    Value::Integer(i) => Value::Float(*i as f64),
-                    Value::Float(f) => Value::Float(*f),
-                    _ => unreachable!(),
-                };
-                state.registers[dest_reg] = Register::Value(value);
-            }
-            AggFunc::Count | AggFunc::Count0 => {
-                let AggContext::Count(count) = agg else {
-                    unreachable!();
-                };
-                state.registers[dest_reg] = Register::Value(count.clone());
-            }
-            AggFunc::Max => {
-                let AggContext::Max(acc) = agg else {
-                    unreachable!();
-                };
-                match acc {
-                    Some(value) => state.registers[dest_reg] = Register::Value(value.clone()),
-                    None => state.registers[dest_reg] = Register::Value(Value::Null),
+        Register::Aggregate(agg) => {
+            let value = match agg {
+                AggContext::External(_) => {
+                    // External aggregates use FFI finalization
+                    agg.compute_external()?
                 }
-            }
-            AggFunc::Min => {
-                let AggContext::Min(acc) = agg else {
-                    unreachable!();
-                };
-                match acc {
-                    Some(value) => state.registers[dest_reg] = Register::Value(value.clone()),
-                    None => state.registers[dest_reg] = Register::Value(Value::Null),
+                AggContext::Builtin(payload) => {
+                    // Built-in aggregates use shared finalization
+                    finalize_agg_payload(func, payload)?
                 }
-            }
-            AggFunc::GroupConcat | AggFunc::StringAgg => {
-                let AggContext::GroupConcat(acc) = agg else {
-                    unreachable!();
-                };
-                state.registers[dest_reg] = Register::Value(acc.clone());
-            }
-            #[cfg(feature = "json")]
-            AggFunc::JsonGroupObject => {
-                let AggContext::GroupConcat(acc) = agg else {
-                    unreachable!();
-                };
-                let data = acc.to_blob().expect("Should be blob");
-                state.registers[dest_reg] = Register::Value(json_from_raw_bytes_agg(data, false)?);
-            }
-            #[cfg(feature = "json")]
-            AggFunc::JsonbGroupObject => {
-                let AggContext::GroupConcat(acc) = agg else {
-                    unreachable!();
-                };
-                let data = acc.to_blob().expect("Should be blob");
-                state.registers[dest_reg] = Register::Value(json_from_raw_bytes_agg(data, true)?);
-            }
-            #[cfg(feature = "json")]
-            AggFunc::JsonGroupArray => {
-                let AggContext::GroupConcat(acc) = agg else {
-                    unreachable!();
-                };
-                let data = acc.to_blob().expect("Should be blob");
-                state.registers[dest_reg] = Register::Value(json_from_raw_bytes_agg(data, false)?);
-            }
-            #[cfg(feature = "json")]
-            AggFunc::JsonbGroupArray => {
-                let AggContext::GroupConcat(acc) = agg else {
-                    unreachable!();
-                };
-                let data = acc.to_blob().expect("Should be blob");
-                state.registers[dest_reg] = Register::Value(json_from_raw_bytes_agg(data, true)?);
-            }
-            AggFunc::External(_) => {
-                let AggContext::External(_) = agg else {
-                    unreachable!();
-                };
-                let value = agg.compute_external()?;
-                state.registers[dest_reg] = Register::Value(value)
-            }
-        },
+            };
+            state.registers[dest_reg] = Register::Value(value);
+        }
         Register::Value(Value::Null) => {
-            // when the set is empty
+            // When the set is empty, return appropriate default
             match func {
                 AggFunc::Total => {
                     state.registers[dest_reg] = Register::Value(Value::Float(0.0));
@@ -4114,6 +3796,7 @@ pub fn op_agg_final(
             panic!("Unexpected value {other:?} in AggFinal");
         }
     };
+
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -10519,6 +10202,1043 @@ pub fn op_hash_distinct(
     }
 }
 
+/// Returns the number of Value slots needed in the hash aggregation payload for a given aggregate function.
+/// This must match the layout expected by init_agg_payload, update_agg_payload, and finalize_agg_payload.
+pub(crate) fn hash_agg_payload_len(func: &AggFunc) -> usize {
+    match func {
+        AggFunc::Count | AggFunc::Count0 => 1,
+        AggFunc::Sum | AggFunc::Total => 4,
+        AggFunc::Avg => 3,
+        AggFunc::Min | AggFunc::Max => 1,
+        AggFunc::GroupConcat | AggFunc::StringAgg => 1,
+        AggFunc::External(_) => 0, // External uses FFI state, not flat payload
+        #[cfg(feature = "json")]
+        AggFunc::JsonGroupObject
+        | AggFunc::JsonbGroupObject
+        | AggFunc::JsonGroupArray
+        | AggFunc::JsonbGroupArray => 1,
+    }
+}
+
+/// Initialize aggregate payload with default values.
+/// Payload layout by aggregate type:
+/// - Count/Count0: [Integer(0)]
+/// - Sum: [Null, Float(0.0), Integer(0), Integer(0)]  // acc, r_err, approx, ovrfl
+/// - Total: [Float(0.0), Float(0.0), Integer(0), Integer(0)]  // same but starts at 0.0
+/// - Avg: [Float(0.0), Float(0.0), Integer(0)]  // sum, r_err, count - uses KBN like SUM
+/// - Min/Max: [Null]
+/// - GroupConcat/StringAgg: [Text("")]
+/// - JsonGroupObject/JsonbGroupObject: [Blob([])]
+/// - JsonGroupArray/JsonbGroupArray: [Blob([])]
+fn init_agg_payload(func: &AggFunc, payload: &mut Vec<Value>) {
+    match func {
+        AggFunc::Count | AggFunc::Count0 => payload.push(Value::Integer(0)),
+        AggFunc::Sum | AggFunc::Total => {
+            let acc = if matches!(func, AggFunc::Total) {
+                Value::Float(0.0)
+            } else {
+                Value::Null
+            };
+            payload.push(acc);
+            payload.push(Value::Float(0.0));
+            payload.push(Value::Integer(0));
+            payload.push(Value::Integer(0));
+        }
+        AggFunc::Avg => {
+            payload.push(Value::Float(0.0));
+            payload.push(Value::Float(0.0));
+            payload.push(Value::Integer(0));
+        }
+        AggFunc::Min | AggFunc::Max => payload.push(Value::Null),
+        AggFunc::GroupConcat | AggFunc::StringAgg => {
+            payload.push(Value::build_text(""));
+        }
+        AggFunc::External(_) => {
+            // External aggregates use ExternalAggState, not flat payload
+        }
+        #[cfg(feature = "json")]
+        AggFunc::JsonGroupObject | AggFunc::JsonbGroupObject => {
+            payload.push(Value::Blob(vec![]));
+        }
+        #[cfg(feature = "json")]
+        AggFunc::JsonGroupArray | AggFunc::JsonbGroupArray => {
+            payload.push(Value::Blob(vec![]));
+        }
+    }
+}
+
+/// Process a single input row and update the aggregate state in the payload.
+///
+/// This is the core aggregation logic shared between both aggregation strategies:
+/// - **Register-based (sort-stream)**: Called from `op_agg_step` (AggStep instruction).
+///   The payload lives in `AggContext::Builtin` stored in a register.
+/// - **Hash-based**: Called from `step_aggregate` during HashAggStep. The payload lives
+///   in hash table entries keyed by GROUP BY values.
+///
+/// The payload slice contains the intermediate aggregate state (initialized by
+/// `init_agg_payload`), and this function incorporates the new row's values.
+///
+/// # Payload layouts (see `init_agg_payload` for initial values):
+/// - **Count**: `[count: Integer]` - increments if arg is not NULL
+/// - **Count0**: `[count: Integer]` - always increments (COUNT(*))
+/// - **Avg**: `[sum: Float, r_err: Float, count: Integer]` - uses KBN compensation like SUM
+/// - **Sum/Total**: `[acc, r_err: Float, approx: Integer, ovrfl: Integer]`
+///   - `acc`: running sum (Null/Integer/Float depending on inputs)
+///   - `r_err`: Kahan-Babuška-Neumaier compensation term for floating-point precision
+///   - `approx`: 1 if result is approximate (float arithmetic used)
+///   - `ovrfl`: 1 if integer overflow occurred (Total promotes to float, Sum errors)
+/// - **Min/Max**: `[current_extreme: Value]` - tracks min/max seen so far
+/// - **GroupConcat/StringAgg**: `[accumulated: Text]` - concatenated string
+/// - **JsonGroup***: `[raw_jsonb: Blob]` - accumulated raw JSONB bytes
+fn update_agg_payload(
+    func: &AggFunc,
+    args: &[Value],
+    payload: &mut [Value],
+    collation: CollationSeq,
+) -> Result<()> {
+    match func {
+        AggFunc::Count => {
+            // COUNT(column) increments only when arg is not NULL. Empty args treated as non-NULL
+            // (would indicate a bug in query translation, but matches SQLite behavior of counting).
+            if !matches!(args.first(), Some(Value::Null)) {
+                // invariant as per init_agg_payload: payload[0] is always an integer
+                let Value::Integer(i) = &mut payload[0] else {
+                    return Err(LimboError::InternalError(
+                        "Count: payload is not an integer".to_string(),
+                    ));
+                };
+                *i = i.checked_add(1).ok_or(LimboError::IntegerOverflow)?;
+            }
+        }
+        AggFunc::Count0 => {
+            // invariant as per init_agg_payload: payload[0] is always an integer
+            let Value::Integer(i) = &mut payload[0] else {
+                return Err(LimboError::InternalError(
+                    "Count0: payload is not an integer".to_string(),
+                ));
+            };
+            *i = i.checked_add(1).ok_or(LimboError::IntegerOverflow)?;
+        }
+        AggFunc::Avg => {
+            let Some(arg) = args.first() else {
+                return Ok(());
+            };
+            if matches!(arg, Value::Null) {
+                return Ok(());
+            }
+            // invariant as per init_agg_payload: payload[0] is Float (sum), payload[1] is Float (r_err), payload[2] is Integer (count)
+            let [sum_val, r_err_val, count_val, ..] = payload else {
+                return Err(LimboError::InternalError(
+                    "Avg: payload too short".to_string(),
+                ));
+            };
+            let Value::Float(r_err) = r_err_val else {
+                return Err(LimboError::InternalError(
+                    "Avg: payload[1] is not a float".to_string(),
+                ));
+            };
+            let Value::Integer(count) = count_val else {
+                return Err(LimboError::InternalError(
+                    "Avg: payload[2] is not an integer".to_string(),
+                ));
+            };
+            let val = match arg {
+                Value::Integer(i) => *i as f64,
+                Value::Float(f) => *f,
+                Value::Text(t) => match try_for_float(t.as_str()).1 {
+                    ParsedNumber::Integer(i) => i as f64,
+                    ParsedNumber::Float(f) => f,
+                    ParsedNumber::None => 0.0,
+                },
+                Value::Blob(b) => match std::str::from_utf8(b) {
+                    Ok(s) => match try_for_float(s).1 {
+                        ParsedNumber::Integer(i) => i as f64,
+                        ParsedNumber::Float(f) => f,
+                        ParsedNumber::None => 0.0,
+                    },
+                    Err(_) => 0.0,
+                },
+                Value::Null => unreachable!(),
+            };
+            // Use Kahan-Babuška-Neumaier compensation for better floating-point precision
+            let s = sum_val.as_float();
+            let t = s + val;
+            let correction = if s.abs() > val.abs() {
+                (s - t) + val
+            } else {
+                (val - t) + s
+            };
+            *r_err += correction;
+            *sum_val = Value::Float(t);
+            *count = count.checked_add(1).ok_or(LimboError::IntegerOverflow)?;
+        }
+        AggFunc::Sum | AggFunc::Total => {
+            let arg = args.first().cloned().unwrap_or(Value::Null);
+            // invariant as per init_agg_payload: payload[0] is acc (Null/Integer/Float),
+            // payload[1] is Float (r_err), payload[2] is Integer (approx), payload[3] is Integer (ovrfl)
+            let [acc, r_err_val, approx_val, ovrfl_val, ..] = payload else {
+                return Err(LimboError::InternalError(
+                    "Sum/Total: payload too short".to_string(),
+                ));
+            };
+            let Value::Float(r_err) = r_err_val else {
+                return Err(LimboError::InternalError(
+                    "Sum/Total: payload[1] is not a float".to_string(),
+                ));
+            };
+            let Value::Integer(approx_i) = approx_val else {
+                return Err(LimboError::InternalError(
+                    "Sum/Total: payload[2] is not an integer".to_string(),
+                ));
+            };
+            let Value::Integer(ovrfl_i) = ovrfl_val else {
+                return Err(LimboError::InternalError(
+                    "Sum/Total: payload[3] is not an integer".to_string(),
+                ));
+            };
+            let mut sum_state = SumAggState {
+                r_err: *r_err,
+                approx: *approx_i != 0,
+                ovrfl: *ovrfl_i != 0,
+            };
+            match arg {
+                Value::Null => {}
+                Value::Integer(i) => match acc {
+                    Value::Null => {
+                        *acc = Value::Integer(i);
+                    }
+                    Value::Integer(acc_i) => match acc_i.checked_add(i) {
+                        Some(sum) => *acc_i = sum,
+                        None => {
+                            if matches!(func, AggFunc::Total) {
+                                let acc_f = *acc_i as f64;
+                                *acc = Value::Float(acc_f);
+                                sum_state.approx = true;
+                                sum_state.ovrfl = true;
+                                apply_kbn_step_int(acc, i, &mut sum_state);
+                            } else {
+                                return Err(LimboError::IntegerOverflow);
+                            }
+                        }
+                    },
+                    Value::Float(_) => {
+                        apply_kbn_step_int(acc, i, &mut sum_state);
+                    }
+                    _ => unreachable!("Sum/Total accumulator initialized to Null/Integer/Float"),
+                },
+                Value::Float(f) => match acc {
+                    Value::Null => {
+                        *acc = Value::Float(f);
+                        sum_state.approx = true;
+                    }
+                    Value::Integer(i) => {
+                        *acc = Value::Float(*i as f64);
+                        sum_state.approx = true;
+                        apply_kbn_step(acc, f, &mut sum_state);
+                    }
+                    Value::Float(_) => {
+                        sum_state.approx = true;
+                        apply_kbn_step(acc, f, &mut sum_state);
+                    }
+                    _ => unreachable!("Sum/Total accumulator initialized to Null/Integer/Float"),
+                },
+                Value::Text(t) => {
+                    let (_, parsed_number) = try_for_float(t.as_str());
+                    handle_text_sum(acc, &mut sum_state, parsed_number);
+                }
+                Value::Blob(b) => {
+                    if let Ok(s) = std::str::from_utf8(&b) {
+                        let (_, parsed_number) = try_for_float(s);
+                        handle_text_sum(acc, &mut sum_state, parsed_number);
+                    } else {
+                        handle_text_sum(acc, &mut sum_state, ParsedNumber::None);
+                    }
+                }
+            }
+            *r_err = sum_state.r_err;
+            *approx_i = sum_state.approx as i64;
+            *ovrfl_i = sum_state.ovrfl as i64;
+        }
+        AggFunc::Min | AggFunc::Max => {
+            let arg = args.first().cloned().unwrap_or(Value::Null);
+            if matches!(arg, Value::Null) {
+                return Ok(());
+            }
+            if matches!(payload[0], Value::Null) {
+                payload[0] = arg;
+                return Ok(());
+            }
+            use std::cmp::Ordering;
+            // Borrow payload[0] only for comparison, then drop before assignment
+            let cmp = compare_with_collation(&arg, &payload[0], Some(collation));
+            let should_update = match func {
+                AggFunc::Max => cmp == Ordering::Greater,
+                AggFunc::Min => cmp == Ordering::Less,
+                _ => false,
+            };
+            if should_update {
+                payload[0] = arg;
+            }
+        }
+        AggFunc::GroupConcat | AggFunc::StringAgg => {
+            // args[0] = col value, args[1] = delimiter
+            let col = args.first().cloned().unwrap_or(Value::Null);
+            let delimiter = args
+                .get(1)
+                .cloned()
+                .unwrap_or_else(|| Value::build_text(","));
+            let acc = &mut payload[0];
+            if acc.to_string().is_empty() {
+                *acc = col;
+            } else if !matches!(col, Value::Null) {
+                *acc += delimiter;
+                *acc += col;
+            }
+        }
+        AggFunc::External(_) => {
+            // External aggregates use ExternalAggState, not flat payload
+        }
+        #[cfg(feature = "json")]
+        AggFunc::JsonGroupObject | AggFunc::JsonbGroupObject => {
+            // args[0] = key, args[1] = value
+            let key = args.first().cloned().unwrap_or(Value::Null);
+            let value = args.get(1).cloned().unwrap_or(Value::Null);
+            let mut key_vec = convert_dbtype_to_raw_jsonb(&key)?;
+            let mut val_vec = convert_dbtype_to_raw_jsonb(&value)?;
+            let Value::Blob(vec) = &mut payload[0] else {
+                return Err(LimboError::InternalError(
+                    "JsonGroupObject: payload[0] is not a blob".to_string(),
+                ));
+            };
+            if vec.is_empty() {
+                // bits for obj header
+                vec.push(12);
+            }
+            vec.append(&mut key_vec);
+            vec.append(&mut val_vec);
+        }
+        #[cfg(feature = "json")]
+        AggFunc::JsonGroupArray | AggFunc::JsonbGroupArray => {
+            // args[0] = value
+            let col = args.first().cloned().unwrap_or(Value::Null);
+            let mut data = convert_dbtype_to_raw_jsonb(&col)?;
+            let Value::Blob(vec) = &mut payload[0] else {
+                return Err(LimboError::InternalError(
+                    "JsonGroupArray: payload[0] is not a blob".to_string(),
+                ));
+            };
+            if vec.is_empty() {
+                vec.push(11); // bits for array header
+            }
+            vec.append(&mut data);
+        }
+    }
+    Ok(())
+}
+
+/// Convert the intermediate aggregate state in `payload` into the final result value.
+///
+/// This finalization logic is shared between both aggregation strategies:
+/// - **Register-based (sort-stream)**: Called from `op_agg_final` (AggFinal/AggValue
+///   instructions) when a group boundary is crossed.
+/// - **Hash-based**: Called during the emit phase of HashAggNext after all rows have
+///   been processed. The payload may have been merged via `merge_agg_payload` if
+///   spilling occurred.
+///
+/// # Finalization logic by aggregate type:
+/// - **Count/Count0**: Returns the count directly
+/// - **Avg**: Computes `sum / count`, returns NULL if count is 0
+/// - **Sum**: Returns the accumulated value, applying Kahan compensation if approximate.
+///   Returns NULL if no non-NULL values were seen (unless float arithmetic was used).
+/// - **Total**: Like Sum but always returns Float, defaulting to 0.0 for empty groups
+/// - **Min/Max**: Returns the tracked extreme value directly
+/// - **GroupConcat/StringAgg**: Returns the accumulated string
+/// - **JsonGroup***: Parses accumulated raw JSONB bytes into proper JSON output
+fn finalize_agg_payload(func: &AggFunc, payload: &[Value]) -> Result<Value> {
+    let val = match func {
+        AggFunc::Count | AggFunc::Count0 => payload[0].clone(),
+        AggFunc::Avg => {
+            // Payload: [sum, r_err, count]
+            let sum = payload[0].as_float();
+            let r_err = payload[1].as_float();
+            let count = payload[2].as_int().unwrap_or(0);
+            if count == 0 {
+                Value::Null
+            } else {
+                // Apply KBN compensation before dividing
+                Value::Float((sum + r_err) / count as f64)
+            }
+        }
+        AggFunc::Sum => {
+            let acc = &payload[0];
+            let approx = payload[2].as_int().unwrap_or(0) != 0;
+            let ovrfl = payload[3].as_int().unwrap_or(0) != 0;
+            let r_err = payload[1].as_float();
+            match acc {
+                Value::Null => {
+                    if approx {
+                        Value::Float(0.0)
+                    } else {
+                        Value::Null
+                    }
+                }
+                Value::Integer(i) if !approx && !ovrfl => Value::Integer(*i),
+                _ => Value::Float(acc.as_float() + r_err),
+            }
+        }
+        AggFunc::Total => {
+            // Payload: [acc, r_err, approx, ovrfl]
+            let acc = &payload[0];
+            let r_err = payload[1].as_float();
+            match acc {
+                Value::Null => Value::Float(0.0),
+                Value::Integer(i) => Value::Float(*i as f64 + r_err),
+                Value::Float(f) => Value::Float(*f + r_err),
+                _ => unreachable!("Total accumulator initialized to Null/Integer/Float"),
+            }
+        }
+        AggFunc::Min | AggFunc::Max => payload[0].clone(),
+        AggFunc::GroupConcat | AggFunc::StringAgg => payload[0].clone(),
+        AggFunc::External(_) => {
+            // External aggregates are finalized via AggContext::compute_external()
+            return Err(LimboError::InternalError(
+                "finalize_agg_payload called for External aggregate".to_string(),
+            ));
+        }
+        #[cfg(feature = "json")]
+        AggFunc::JsonGroupObject => {
+            let data = payload[0].to_blob().expect("Should be blob");
+            json_from_raw_bytes_agg(data, false)?
+        }
+        #[cfg(feature = "json")]
+        AggFunc::JsonbGroupObject => {
+            let data = payload[0].to_blob().expect("Should be blob");
+            json_from_raw_bytes_agg(data, true)?
+        }
+        #[cfg(feature = "json")]
+        AggFunc::JsonGroupArray => {
+            let data = payload[0].to_blob().expect("Should be blob");
+            json_from_raw_bytes_agg(data, false)?
+        }
+        #[cfg(feature = "json")]
+        AggFunc::JsonbGroupArray => {
+            let data = payload[0].to_blob().expect("Should be blob");
+            json_from_raw_bytes_agg(data, true)?
+        }
+    };
+
+    Ok(val)
+}
+
+/// Append values from consecutive registers to a Vec.
+fn extend_from_registers(
+    registers: &[Register],
+    start_reg: usize,
+    count: usize,
+    target: &mut Vec<Value>,
+) {
+    for i in 0..count {
+        target.push(registers[start_reg + i].get_value().clone());
+    }
+}
+
+/// Load aggregate arguments from registers and apply one step of aggregation.
+/// This is common logic shared between updating existing entries and creating new ones.
+fn step_aggregate(
+    registers: &[Register],
+    agg: &AggFunc,
+    arg_start: usize,
+    arg_count: usize,
+    collation: CollationSeq,
+    payload_slice: &mut [Value],
+    args_buf: &mut Vec<Value>,
+) -> Result<()> {
+    args_buf.clear();
+    extend_from_registers(registers, arg_start, arg_count, args_buf);
+    update_agg_payload(agg, args_buf, payload_slice, collation)
+}
+
+/// Merge two aggregate states into one.
+///
+/// Used during spill recovery in hash aggregation. When the hash table exceeds its
+/// memory budget, partition buffers are spilled to disk as "chunks". The same partition
+/// may be spilled multiple times, creating multiple chunks. Since keys always hash to
+/// the same partition deterministically, the same GROUP BY keys can appear in different
+/// chunks of the same partition. When loading a partition, all its chunks are parsed
+/// into buckets, and duplicate keys must be merged. This function combines those
+/// partial aggregate states.
+///
+/// # Merge semantics by aggregate type:
+/// - **Count/Count0**: Add the counts together
+/// - **Avg**: Merge sums using KBN compensation, add r_err terms and counts
+/// - **Sum/Total**: Merge accumulators, combining Kahan compensation terms and
+///   overflow/approximation flags from both sides
+/// - **Min/Max**: Keep the more extreme value using collation-aware comparison
+/// - **GroupConcat/StringAgg**: Not supported (delimiter not stored in payload)
+/// - **External**: Not supported (FFI state cannot be serialized)
+/// - **JsonGroup***: Not supported (merging JSONB blobs requires header parsing)
+///
+/// The unsupported aggregates are excluded from hash aggregation in `group_by.rs`,
+/// so their branches are unreachable.
+fn merge_agg_payload(
+    func: &AggFunc,
+    dest: &mut [Value],
+    src: &[Value],
+    collation: CollationSeq,
+) -> Result<()> {
+    match func {
+        AggFunc::Count | AggFunc::Count0 => {
+            // invariant: both are integers
+            let Value::Integer(d) = &mut dest[0] else {
+                return Err(LimboError::InternalError(
+                    "Count merge: dest is not an integer".to_string(),
+                ));
+            };
+            let Value::Integer(s) = &src[0] else {
+                return Err(LimboError::InternalError(
+                    "Count merge: src is not an integer".to_string(),
+                ));
+            };
+            *d = d.checked_add(*s).ok_or(LimboError::IntegerOverflow)?;
+        }
+        AggFunc::Avg => {
+            // invariant: dest[0] is Float (sum), dest[1] is Float (r_err), dest[2] is Integer (count)
+            let [sum_dest, r_err_dest, count_dest, ..] = dest else {
+                return Err(LimboError::InternalError(
+                    "Avg merge: dest too short".to_string(),
+                ));
+            };
+            let Value::Float(sum_d) = sum_dest else {
+                return Err(LimboError::InternalError(
+                    "Avg merge: dest[0] is not a float".to_string(),
+                ));
+            };
+            let Value::Float(r_err_d) = r_err_dest else {
+                return Err(LimboError::InternalError(
+                    "Avg merge: dest[1] is not a float".to_string(),
+                ));
+            };
+            let Value::Integer(count_d) = count_dest else {
+                return Err(LimboError::InternalError(
+                    "Avg merge: dest[2] is not an integer".to_string(),
+                ));
+            };
+            let Value::Float(sum_s) = &src[0] else {
+                return Err(LimboError::InternalError(
+                    "Avg merge: src[0] is not a float".to_string(),
+                ));
+            };
+            let Value::Float(r_err_s) = &src[1] else {
+                return Err(LimboError::InternalError(
+                    "Avg merge: src[1] is not a float".to_string(),
+                ));
+            };
+            let Value::Integer(count_s) = &src[2] else {
+                return Err(LimboError::InternalError(
+                    "Avg merge: src[2] is not an integer".to_string(),
+                ));
+            };
+            // Use KBN to merge the sums
+            let t = *sum_d + *sum_s;
+            let correction = if sum_d.abs() > sum_s.abs() {
+                (*sum_d - t) + *sum_s
+            } else {
+                (*sum_s - t) + *sum_d
+            };
+            *sum_d = t;
+            *r_err_d += correction + *r_err_s;
+            *count_d = count_d
+                .checked_add(*count_s)
+                .ok_or(LimboError::IntegerOverflow)?;
+        }
+        AggFunc::Sum | AggFunc::Total => {
+            // invariant: payload[0] is acc, [1] is r_err (Float), [2] is approx (Int), [3] is ovrfl (Int)
+            let [acc, r_err_val, approx_val, ovrfl_val, ..] = dest else {
+                return Err(LimboError::InternalError(
+                    "Sum/Total merge: dest too short".to_string(),
+                ));
+            };
+            let Value::Float(r_err) = r_err_val else {
+                return Err(LimboError::InternalError(
+                    "Sum/Total merge: dest[1] is not a float".to_string(),
+                ));
+            };
+            let Value::Integer(approx_i) = approx_val else {
+                return Err(LimboError::InternalError(
+                    "Sum/Total merge: dest[2] is not an integer".to_string(),
+                ));
+            };
+            let Value::Integer(ovrfl_i) = ovrfl_val else {
+                return Err(LimboError::InternalError(
+                    "Sum/Total merge: dest[3] is not an integer".to_string(),
+                ));
+            };
+            let mut sum_state = SumAggState {
+                r_err: *r_err,
+                approx: *approx_i != 0,
+                ovrfl: *ovrfl_i != 0,
+            };
+            let src_r_err = src[1].as_float();
+            let src_approx = src[2].as_int().unwrap_or(0) != 0;
+            let src_ovrfl = src[3].as_int().unwrap_or(0) != 0;
+
+            match &src[0] {
+                Value::Null => {}
+                Value::Integer(i) => match acc {
+                    Value::Null => {
+                        *acc = Value::Integer(*i);
+                    }
+                    Value::Integer(acc_i) => match acc_i.checked_add(*i) {
+                        Some(sum) => *acc_i = sum,
+                        None => {
+                            if matches!(func, AggFunc::Total) {
+                                let acc_f = *acc_i as f64;
+                                *acc = Value::Float(acc_f);
+                                sum_state.approx = true;
+                                sum_state.ovrfl = true;
+                                apply_kbn_step_int(acc, *i, &mut sum_state);
+                            } else {
+                                return Err(LimboError::IntegerOverflow);
+                            }
+                        }
+                    },
+                    Value::Float(_) => {
+                        apply_kbn_step_int(acc, *i, &mut sum_state);
+                    }
+                    _ => unreachable!("Sum/Total accumulator initialized to Null/Integer/Float"),
+                },
+                Value::Float(f) => match acc {
+                    Value::Null => {
+                        *acc = Value::Float(*f);
+                        sum_state.approx = true;
+                    }
+                    Value::Integer(i) => {
+                        *acc = Value::Float(*i as f64);
+                        sum_state.approx = true;
+                        apply_kbn_step(acc, *f, &mut sum_state);
+                    }
+                    Value::Float(_) => {
+                        sum_state.approx = true;
+                        apply_kbn_step(acc, *f, &mut sum_state);
+                    }
+                    _ => unreachable!("Sum/Total accumulator initialized to Null/Integer/Float"),
+                },
+                Value::Text(t) => {
+                    let (_, parsed_number) = try_for_float(t.as_str());
+                    handle_text_sum(acc, &mut sum_state, parsed_number);
+                }
+                Value::Blob(b) => {
+                    if let Ok(s) = std::str::from_utf8(b) {
+                        let (_, parsed_number) = try_for_float(s);
+                        handle_text_sum(acc, &mut sum_state, parsed_number);
+                    } else {
+                        handle_text_sum(acc, &mut sum_state, ParsedNumber::None);
+                    }
+                }
+            }
+            if src_r_err != 0.0 {
+                apply_kbn_step(acc, src_r_err, &mut sum_state);
+            }
+            sum_state.approx |= src_approx;
+            sum_state.ovrfl |= src_ovrfl;
+            *r_err = sum_state.r_err;
+            *approx_i = sum_state.approx as i64;
+            *ovrfl_i = sum_state.ovrfl as i64;
+        }
+        AggFunc::Min | AggFunc::Max => {
+            if matches!(src[0], Value::Null) {
+                return Ok(());
+            }
+            if matches!(dest[0], Value::Null) {
+                dest[0] = src[0].clone();
+                return Ok(());
+            }
+            use std::cmp::Ordering;
+            let cmp = compare_with_collation(&src[0], &dest[0], Some(collation));
+            let should_update = match func {
+                AggFunc::Max => cmp == Ordering::Greater,
+                AggFunc::Min => cmp == Ordering::Less,
+                _ => false,
+            };
+            if should_update {
+                dest[0] = src[0].clone();
+            }
+        }
+        AggFunc::GroupConcat | AggFunc::StringAgg => {
+            // Unreachable: hash agg is disabled for GroupConcat/StringAgg in group_by.rs
+            // because merging requires the delimiter which isn't stored in the payload.
+            unreachable!("GroupConcat/StringAgg should not use hash aggregation")
+        }
+        AggFunc::External(_) => {
+            // Unreachable: hash agg is disabled for External in group_by.rs
+            // because FFI state cannot be serialized or merged.
+            unreachable!("External aggregates should not use hash aggregation")
+        }
+        #[cfg(feature = "json")]
+        AggFunc::JsonGroupObject
+        | AggFunc::JsonbGroupObject
+        | AggFunc::JsonGroupArray
+        | AggFunc::JsonbGroupArray => {
+            // Unreachable: hash agg is disabled for JSON aggregates in group_by.rs
+            // because merging raw JSONB blobs requires parsing header bytes.
+            unreachable!("JSON aggregates should not use hash aggregation")
+        }
+    }
+    Ok(())
+}
+
+pub fn op_hash_agg_step(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(HashAggStep { data }, insn);
+
+    state
+        .hash_tables
+        .entry(data.hash_table_id)
+        .or_insert_with(|| {
+            let config = HashTableConfig {
+                initial_buckets: 1024,
+                mem_budget: DEFAULT_MEM_BUDGET,
+                num_keys: data.num_keys,
+                collations: data.collations.clone(),
+            };
+            HashTable::new(config, pager.io.clone())
+        });
+
+    // Read key values from registers
+    let key_values = &mut state.distinct_key_values;
+    key_values.clear();
+    extend_from_registers(
+        &state.registers,
+        data.key_start_reg,
+        data.num_keys,
+        key_values,
+    );
+
+    let mut key_refs: SmallVec<[ValueRef; 2]> = SmallVec::with_capacity(data.num_keys);
+    key_refs.extend(key_values.iter().map(|v| v.as_ref()));
+    let hash = hash_join_key(&key_refs, &data.collations);
+
+    // Distinct aggregates: we need to check if the row already exists in the DISTINCT hash table.
+    // Determine starting point for DISTINCT checks based on re-entrant state.
+    // This is critical for correctness: if we yield mid-loop, we must resume
+    // from where we left off (not restart), otherwise already-inserted values
+    // would return "already exists" and we'd incorrectly skip their updates.
+    let start_agg_idx = match &state.op_hash_agg_step_state {
+        OpHashAggStepState::DistinctChecksDone {
+            hash_table_id,
+            key_values: cached_keys,
+        } if *hash_table_id == data.hash_table_id && *cached_keys == *key_values => {
+            // All DISTINCT checks done, skip to aggregation
+            usize::MAX
+        }
+        OpHashAggStepState::DistinctChecksInProgress {
+            hash_table_id,
+            key_values: cached_keys,
+            next_agg_idx,
+        } if *hash_table_id == data.hash_table_id && *cached_keys == *key_values => {
+            // Resume from where we yielded
+            *next_agg_idx
+        }
+        _ => {
+            // Start state or different row - initialize should_update buffer
+            state.hash_agg_should_update.clear();
+            state.hash_agg_should_update.resize(data.aggs.len(), true);
+            0
+        }
+    };
+
+    // Perform DISTINCT checks starting from start_agg_idx
+    if start_agg_idx < data.aggs.len() {
+        for agg_idx in start_agg_idx..data.aggs.len() {
+            if let Some(distinct_hash_table_id) = data.agg_distinct_hash_table_ids[agg_idx] {
+                let arg_start = data.agg_arg_start_regs[agg_idx];
+                let arg_count = data.agg_arg_counts[agg_idx];
+                let distinct_table = state
+                    .hash_tables
+                    .entry(distinct_hash_table_id)
+                    .or_insert_with(|| {
+                        let config = HashTableConfig {
+                            initial_buckets: 1024,
+                            mem_budget: DEFAULT_MEM_BUDGET,
+                            num_keys: data.num_keys + arg_count,
+                            collations: data.agg_distinct_collations[agg_idx].clone(),
+                        };
+                        HashTable::new(config, pager.io.clone())
+                    });
+
+                // Reuse scratch buffer for distinct key building: group keys + agg args
+                let distinct_key_values = &mut state.hash_agg_distinct_keys;
+                distinct_key_values.clear();
+                distinct_key_values.extend_from_slice(key_values.as_slice());
+                extend_from_registers(&state.registers, arg_start, arg_count, distinct_key_values);
+                let dist_key_refs: Vec<ValueRef> =
+                    distinct_key_values.iter().map(|v| v.as_ref()).collect();
+
+                match distinct_table.insert_distinct(distinct_key_values, &dist_key_refs)? {
+                    IOResult::Done(inserted) => {
+                        if !inserted {
+                            state.hash_agg_should_update[agg_idx] = false;
+                        }
+                    }
+                    IOResult::IO(io) => {
+                        // Yield mid-loop - save progress to resume later
+                        state.op_hash_agg_step_state =
+                            OpHashAggStepState::DistinctChecksInProgress {
+                                hash_table_id: data.hash_table_id,
+                                key_values: key_values.clone(),
+                                next_agg_idx: agg_idx,
+                            };
+                        return Ok(InsnFunctionStepResult::IO(io));
+                    }
+                }
+            }
+        }
+
+        // All DISTINCT checks completed
+        state.op_hash_agg_step_state = OpHashAggStepState::DistinctChecksDone {
+            hash_table_id: data.hash_table_id,
+            key_values: key_values.clone(),
+        };
+    }
+
+    let should_update = &state.hash_agg_should_update;
+
+    let hash_table = state
+        .hash_tables
+        .get_mut(&data.hash_table_id)
+        .expect("hash table must exist");
+
+    if let Some(entry) = hash_table.find_entry_mut(hash, &key_refs) {
+        let mut payload_offset = 0;
+        for (agg_idx, agg) in data.aggs.iter().enumerate() {
+            let len = hash_agg_payload_len(agg);
+            turso_assert!(
+                len > 0,
+                "aggregate {agg:?} should not use hash aggregation (len=0)"
+            );
+            if should_update[agg_idx] {
+                step_aggregate(
+                    &state.registers,
+                    agg,
+                    data.agg_arg_start_regs[agg_idx],
+                    data.agg_arg_counts[agg_idx],
+                    data.agg_collations[agg_idx],
+                    &mut entry.payload_values[payload_offset..payload_offset + len],
+                    &mut state.hash_agg_args,
+                )?;
+            }
+            payload_offset += len;
+        }
+        // Success - reset state for next row
+        state.op_hash_agg_step_state = OpHashAggStepState::Start;
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    }
+
+    // Entry doesn't exist - create new one
+    let mut payload = Vec::new();
+    for (agg_idx, agg) in data.aggs.iter().enumerate() {
+        init_agg_payload(agg, &mut payload);
+        let len = hash_agg_payload_len(agg);
+        turso_assert!(
+            len > 0,
+            "aggregate {agg:?} should not use hash aggregation (len=0)"
+        );
+        if should_update[agg_idx] {
+            let start = payload.len() - len;
+            step_aggregate(
+                &state.registers,
+                agg,
+                data.agg_arg_start_regs[agg_idx],
+                data.agg_arg_counts[agg_idx],
+                data.agg_collations[agg_idx],
+                &mut payload[start..],
+                &mut state.hash_agg_args,
+            )?;
+        }
+    }
+
+    match hash_table.insert_group_entry(hash, key_values.clone(), payload)? {
+        IOResult::Done(()) => {
+            // Success - reset state for next row
+            state.op_hash_agg_step_state = OpHashAggStepState::Start;
+            state.pc += 1;
+            Ok(InsnFunctionStepResult::Step)
+        }
+        IOResult::IO(io) => {
+            // IO yield - state is already cached (DistinctChecksDone)
+            Ok(InsnFunctionStepResult::IO(io))
+        }
+    }
+}
+
+pub fn op_hash_agg_init(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(HashAggInit { hash_table_id }, insn);
+    if let Some(table) = state.hash_tables.get_mut(hash_table_id) {
+        table.reset_agg_iter();
+    }
+    state.hash_agg_emit_state = None;
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+pub fn op_hash_agg_next(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(HashAggNext { data }, insn);
+    let Some(table) = state.hash_tables.get_mut(&data.hash_table_id) else {
+        state.pc = data.target_pc.as_offset_int();
+        return Ok(InsnFunctionStepResult::Step);
+    };
+
+    if table.is_spilled() {
+        let mut emit_state = state.hash_agg_emit_state.take().unwrap_or_default();
+        if emit_state.hash_table_id != data.hash_table_id {
+            emit_state = HashAggEmitState {
+                hash_table_id: data.hash_table_id,
+                partition_idx: 0,
+                entries: Vec::new(),
+                entry_idx: 0,
+            };
+        }
+
+        loop {
+            if emit_state.entry_idx < emit_state.entries.len() {
+                let entry = emit_state.entries[emit_state.entry_idx].clone();
+                emit_state.entry_idx += 1;
+                state.hash_agg_emit_state = Some(emit_state);
+
+                for i in 0..data.num_keys {
+                    state.registers[data.key_dest_reg + i] =
+                        Register::Value(entry.key_values[i].clone());
+                }
+                let mut payload_offset = 0;
+                for (agg_idx, agg) in data.aggs.iter().enumerate() {
+                    let len = data.agg_payload_values_count[agg_idx];
+                    if len == 0 {
+                        state.registers[data.agg_dest_reg + agg_idx] = Register::Value(Value::Null);
+                        continue;
+                    }
+                    let value = finalize_agg_payload(
+                        agg,
+                        &entry.payload_values[payload_offset..payload_offset + len],
+                    )?;
+                    state.registers[data.agg_dest_reg + agg_idx] = Register::Value(value);
+                    payload_offset += len;
+                }
+                state.pc += 1;
+                return Ok(InsnFunctionStepResult::Step);
+            }
+
+            if emit_state.partition_idx >= NUM_PARTITIONS {
+                state.hash_agg_emit_state = None;
+                state.pc = data.target_pc.as_offset_int();
+                return Ok(InsnFunctionStepResult::Step);
+            }
+
+            let partition_idx = emit_state.partition_idx;
+            match table.load_partition_entries(partition_idx)? {
+                IOResult::IO(io) => {
+                    state.hash_agg_emit_state = Some(emit_state);
+                    return Ok(InsnFunctionStepResult::IO(io));
+                }
+                IOResult::Done(entries) => {
+                    emit_state.partition_idx += 1;
+                    if entries.is_empty() {
+                        continue;
+                    }
+                    // Temporary hash table for merging partial aggregates from a single spilled
+                    // partition. Use effectively unlimited budget since we're already processing
+                    // spilled data and can't recursively spill during merge.
+                    let mut agg_table = HashTable::new(
+                        HashTableConfig {
+                            initial_buckets: 1024,
+                            mem_budget: usize::MAX / 4,
+                            num_keys: data.num_keys,
+                            collations: data.key_collations.clone(),
+                        },
+                        pager.io.clone(),
+                    );
+                    for entry in entries {
+                        let key_refs: Vec<ValueRef> =
+                            entry.key_values.iter().map(|v| v.as_ref()).collect();
+                        if let Some(existing) = agg_table.find_entry_mut(entry.hash, &key_refs) {
+                            let mut payload_offset = 0;
+                            for (agg_idx, agg) in data.aggs.iter().enumerate() {
+                                let len = data.agg_payload_values_count[agg_idx];
+                                if len == 0 {
+                                    continue;
+                                }
+                                merge_agg_payload(
+                                    agg,
+                                    &mut existing.payload_values
+                                        [payload_offset..payload_offset + len],
+                                    &entry.payload_values[payload_offset..payload_offset + len],
+                                    data.agg_collations[agg_idx],
+                                )?;
+                                payload_offset += len;
+                            }
+                        } else {
+                            match agg_table.insert_group_entry(
+                                entry.hash,
+                                entry.key_values.clone(),
+                                entry.payload_values.clone(),
+                            )? {
+                                IOResult::Done(()) => {}
+                                IOResult::IO(_) => unreachable!("merge table has unlimited budget"),
+                            }
+                        }
+                    }
+                    emit_state.entries = agg_table.drain_entries();
+                    emit_state.entry_idx = 0;
+                }
+            }
+        }
+    }
+
+    match table.next_agg_entry()? {
+        IOResult::IO(io) => Ok(InsnFunctionStepResult::IO(io)),
+        IOResult::Done(None) => {
+            state.pc = data.target_pc.as_offset_int();
+            Ok(InsnFunctionStepResult::Step)
+        }
+        IOResult::Done(Some(entry)) => {
+            for i in 0..data.num_keys {
+                state.registers[data.key_dest_reg + i] =
+                    Register::Value(entry.key_values[i].clone());
+            }
+            let mut payload_offset = 0;
+            for (agg_idx, agg) in data.aggs.iter().enumerate() {
+                let len = data.agg_payload_values_count[agg_idx];
+                if len == 0 {
+                    state.registers[data.agg_dest_reg + agg_idx] = Register::Value(Value::Null);
+                    continue;
+                }
+                let value = finalize_agg_payload(
+                    agg,
+                    &entry.payload_values[payload_offset..payload_offset + len],
+                )?;
+                state.registers[data.agg_dest_reg + agg_idx] = Register::Value(value);
+                payload_offset += len;
+            }
+            state.pc += 1;
+            Ok(InsnFunctionStepResult::Step)
+        }
+    }
+}
+
 pub fn op_hash_build_finalize(
     _program: &Program,
     state: &mut ProgramState,
@@ -11374,5 +12094,228 @@ mod tests {
                 other => panic!("Unexpected value type: {other:?}"),
             }
         }
+    }
+
+    // Tests for hash aggregation payload functions
+
+    #[test]
+    fn test_init_agg_payload_count() {
+        let mut payload = Vec::new();
+        init_agg_payload(&AggFunc::Count, &mut payload);
+        assert_eq!(payload.len(), 1);
+        assert_eq!(payload[0], Value::Integer(0));
+    }
+
+    #[test]
+    fn test_init_agg_payload_sum() {
+        let mut payload = Vec::new();
+        init_agg_payload(&AggFunc::Sum, &mut payload);
+        assert_eq!(payload.len(), 4);
+        assert_eq!(payload[0], Value::Null); // acc
+        assert_eq!(payload[1], Value::Float(0.0)); // r_err
+        assert_eq!(payload[2], Value::Integer(0)); // approx
+        assert_eq!(payload[3], Value::Integer(0)); // ovrfl
+    }
+
+    #[test]
+    fn test_init_agg_payload_avg() {
+        let mut payload = Vec::new();
+        init_agg_payload(&AggFunc::Avg, &mut payload);
+        assert_eq!(payload.len(), 2);
+        assert_eq!(payload[0], Value::Float(0.0)); // sum
+        assert_eq!(payload[1], Value::Integer(0)); // count
+    }
+
+    #[test]
+    fn test_update_count_skips_null() {
+        let mut payload = vec![Value::Integer(5)];
+        update_agg_payload(
+            &AggFunc::Count,
+            &[Value::Null],
+            &mut payload,
+            CollationSeq::Binary,
+        )
+        .unwrap();
+        assert_eq!(payload[0], Value::Integer(5)); // unchanged
+    }
+
+    #[test]
+    fn test_update_count_increments() {
+        let mut payload = vec![Value::Integer(5)];
+        update_agg_payload(
+            &AggFunc::Count,
+            &[Value::Integer(42)],
+            &mut payload,
+            CollationSeq::Binary,
+        )
+        .unwrap();
+        assert_eq!(payload[0], Value::Integer(6));
+    }
+
+    #[test]
+    fn test_update_sum_integers() {
+        let mut payload = vec![
+            Value::Null,
+            Value::Float(0.0),
+            Value::Integer(0),
+            Value::Integer(0),
+        ];
+        update_agg_payload(
+            &AggFunc::Sum,
+            &[Value::Integer(10)],
+            &mut payload,
+            CollationSeq::Binary,
+        )
+        .unwrap();
+        assert_eq!(payload[0], Value::Integer(10));
+
+        update_agg_payload(
+            &AggFunc::Sum,
+            &[Value::Integer(5)],
+            &mut payload,
+            CollationSeq::Binary,
+        )
+        .unwrap();
+        assert_eq!(payload[0], Value::Integer(15));
+    }
+
+    #[test]
+    fn test_update_sum_null_is_skipped() {
+        let mut payload = vec![
+            Value::Integer(10),
+            Value::Float(0.0),
+            Value::Integer(0),
+            Value::Integer(0),
+        ];
+        update_agg_payload(
+            &AggFunc::Sum,
+            &[Value::Null],
+            &mut payload,
+            CollationSeq::Binary,
+        )
+        .unwrap();
+        assert_eq!(payload[0], Value::Integer(10)); // unchanged
+    }
+
+    #[test]
+    fn test_update_min_max() {
+        let mut payload = vec![Value::Null];
+        // First value sets the min/max
+        update_agg_payload(
+            &AggFunc::Min,
+            &[Value::Integer(5)],
+            &mut payload,
+            CollationSeq::Binary,
+        )
+        .unwrap();
+        assert_eq!(payload[0], Value::Integer(5));
+
+        // Smaller value updates min
+        update_agg_payload(
+            &AggFunc::Min,
+            &[Value::Integer(3)],
+            &mut payload,
+            CollationSeq::Binary,
+        )
+        .unwrap();
+        assert_eq!(payload[0], Value::Integer(3));
+
+        // Larger value doesn't update min
+        update_agg_payload(
+            &AggFunc::Min,
+            &[Value::Integer(10)],
+            &mut payload,
+            CollationSeq::Binary,
+        )
+        .unwrap();
+        assert_eq!(payload[0], Value::Integer(3));
+    }
+
+    #[test]
+    fn test_update_avg() {
+        let mut payload = vec![Value::Float(0.0), Value::Integer(0)];
+        update_agg_payload(
+            &AggFunc::Avg,
+            &[Value::Integer(10)],
+            &mut payload,
+            CollationSeq::Binary,
+        )
+        .unwrap();
+        assert_eq!(payload[0], Value::Float(10.0));
+        assert_eq!(payload[1], Value::Integer(1));
+
+        update_agg_payload(
+            &AggFunc::Avg,
+            &[Value::Integer(20)],
+            &mut payload,
+            CollationSeq::Binary,
+        )
+        .unwrap();
+        assert_eq!(payload[0], Value::Float(30.0));
+        assert_eq!(payload[1], Value::Integer(2));
+    }
+
+    #[test]
+    fn test_finalize_count() {
+        let payload = vec![Value::Integer(42)];
+        let result = finalize_agg_payload(&AggFunc::Count, &payload).unwrap();
+        assert_eq!(result, Value::Integer(42));
+    }
+
+    #[test]
+    fn test_finalize_avg() {
+        let payload = vec![Value::Float(30.0), Value::Integer(3)];
+        let result = finalize_agg_payload(&AggFunc::Avg, &payload).unwrap();
+        assert_eq!(result, Value::Float(10.0));
+    }
+
+    #[test]
+    fn test_finalize_avg_empty() {
+        let payload = vec![Value::Float(0.0), Value::Integer(0)];
+        let result = finalize_agg_payload(&AggFunc::Avg, &payload).unwrap();
+        assert_eq!(result, Value::Null);
+    }
+
+    #[test]
+    fn test_merge_count() {
+        let mut dest = vec![Value::Integer(5)];
+        let src = vec![Value::Integer(3)];
+        merge_agg_payload(&AggFunc::Count, &mut dest, &src, CollationSeq::Binary).unwrap();
+        assert_eq!(dest[0], Value::Integer(8));
+    }
+
+    #[test]
+    fn test_merge_min() {
+        // dest has smaller value - should keep it
+        let mut dest = vec![Value::Integer(3)];
+        let src = vec![Value::Integer(5)];
+        merge_agg_payload(&AggFunc::Min, &mut dest, &src, CollationSeq::Binary).unwrap();
+        assert_eq!(dest[0], Value::Integer(3));
+
+        // src has smaller value - should update
+        let mut dest = vec![Value::Integer(5)];
+        let src = vec![Value::Integer(3)];
+        merge_agg_payload(&AggFunc::Min, &mut dest, &src, CollationSeq::Binary).unwrap();
+        assert_eq!(dest[0], Value::Integer(3));
+    }
+
+    #[test]
+    fn test_merge_max() {
+        // src has larger value - should update
+        let mut dest = vec![Value::Integer(3)];
+        let src = vec![Value::Integer(5)];
+        merge_agg_payload(&AggFunc::Max, &mut dest, &src, CollationSeq::Binary).unwrap();
+        assert_eq!(dest[0], Value::Integer(5));
+    }
+
+    #[test]
+    fn test_merge_avg() {
+        // Merge two partial averages: (sum=10, count=2) and (sum=20, count=3)
+        // Result should be (sum=30, count=5)
+        let mut dest = vec![Value::Float(10.0), Value::Integer(2)];
+        let src = vec![Value::Float(20.0), Value::Integer(3)];
+        merge_agg_payload(&AggFunc::Avg, &mut dest, &src, CollationSeq::Binary).unwrap();
+        assert_eq!(dest[0], Value::Float(30.0));
+        assert_eq!(dest[1], Value::Integer(5));
     }
 }

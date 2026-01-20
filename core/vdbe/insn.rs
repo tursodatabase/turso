@@ -1,3 +1,4 @@
+use smallvec::SmallVec;
 use std::{
     num::{NonZero, NonZeroUsize},
     sync::Arc,
@@ -212,7 +213,7 @@ pub struct HashBuildData {
     pub num_keys: usize,
     pub hash_table_id: usize,
     pub mem_budget: usize,
-    pub collations: Vec<CollationSeq>,
+    pub collations: SmallVec<[CollationSeq; 2]>,
     /// Starting register for payload columns to store in the hash entry.
     /// When Some: payload_start_reg..payload_start_reg+num_payload-1 contain values to cache.
     pub payload_start_reg: Option<usize>,
@@ -226,8 +227,48 @@ pub struct HashDistinctData {
     pub hash_table_id: usize,
     pub key_start_reg: usize,
     pub num_keys: usize,
-    pub collations: Vec<CollationSeq>,
+    pub collations: SmallVec<[CollationSeq; 2]>,
     pub target_pc: BranchOffset,
+}
+
+/// Data for HashAggNext instruction (boxed to keep Insn small).
+#[derive(Debug, Clone)]
+pub struct HashAggNextData {
+    /// Hash table ID to emit next aggregation result from.
+    pub hash_table_id: usize,
+    /// Starting register for destination keys.
+    pub key_dest_reg: usize,
+    /// Number of keys to emit.
+    pub num_keys: usize,
+    /// Collations for keys.
+    pub key_collations: SmallVec<[CollationSeq; 2]>,
+    /// Starting register to emit aggregate results to.
+    pub agg_dest_reg: usize,
+    pub agg_payload_values_count: SmallVec<[usize; 2]>,
+    pub aggs: SmallVec<[AggFunc; 2]>,
+    pub agg_collations: SmallVec<[CollationSeq; 2]>,
+    pub target_pc: BranchOffset,
+}
+/// Data for HashAggStep instruction (boxed to keep Insn small).
+#[derive(Debug, Clone)]
+pub struct HashAggStepData {
+    /// Hash table ID to compute intermediate aggregation in.
+    pub hash_table_id: usize,
+    pub key_start_reg: usize,
+    pub num_keys: usize,
+    pub collations: SmallVec<[CollationSeq; 2]>,
+    /// Aggregate descriptor for each aggregate in the GROUP BY.
+    pub aggs: SmallVec<[AggFunc; 2]>,
+    /// Aggregate argument register start per aggregate.
+    pub agg_arg_start_regs: SmallVec<[usize; 2]>,
+    /// Number of arguments for each aggregate.
+    pub agg_arg_counts: SmallVec<[usize; 2]>,
+    /// Collation to use for MIN/MAX comparisons per aggregate.
+    pub agg_collations: SmallVec<[CollationSeq; 2]>,
+    /// Optional hash table per DISTINCT aggregate.
+    pub agg_distinct_hash_table_ids: SmallVec<[Option<usize>; 2]>,
+    /// Collations for DISTINCT aggregate keys (group keys + distinct args).
+    pub agg_distinct_collations: SmallVec<[SmallVec<[CollationSeq; 2]>; 2]>,
 }
 
 // There are currently 190 opcodes in sqlite
@@ -1399,6 +1440,35 @@ pub enum Insn {
         data: Box<HashDistinctData>,
     },
 
+    /// Update hash aggregation state for a single input row.
+    ///
+    /// **Build phase**: For each input row, looks up the GROUP BY keys in the hash table.
+    /// If found, updates the existing aggregate payload in-place. If not found, inserts
+    /// a new entry with initialized aggregate state. May trigger spilling if memory
+    /// budget is exceeded.
+    HashAggStep {
+        data: Box<HashAggStepData>,
+    },
+
+    /// Initialize hash aggregation iteration.
+    ///
+    /// **Transition**: Called after all input rows are processed (build phase complete).
+    /// Resets the hash table iterator to prepare for the emit phase which outputs completed
+    /// aggregations. Must be called before the first HashAggNext.
+    HashAggInit {
+        hash_table_id: usize,
+    },
+
+    /// Output the next completed aggregation result (group keys + finalized aggregates).
+    ///
+    /// **Emit phase**: Iterates through hash table entries, computing final aggregate
+    /// values (e.g. sum/count → avg) and outputting one result row per group. In spilled
+    /// mode, loads partitions from disk on demand and merges duplicate keys from different
+    /// spill chunks. Jumps to target_pc when all groups have been output.
+    HashAggNext {
+        data: Box<HashAggNextData>,
+    },
+
     /// Finalize the hash table build phase. Transitions the hash table from Building to Probing state.
     /// Should be called after the HashBuild loop completes.
     HashBuildFinalize {
@@ -1634,6 +1704,9 @@ impl InsnVariants {
             InsnVariants::Filter => execute::op_filter,
             InsnVariants::HashBuild => execute::op_hash_build,
             InsnVariants::HashDistinct => execute::op_hash_distinct,
+            InsnVariants::HashAggStep => execute::op_hash_agg_step,
+            InsnVariants::HashAggInit => execute::op_hash_agg_init,
+            InsnVariants::HashAggNext => execute::op_hash_agg_next,
             InsnVariants::HashBuildFinalize => execute::op_hash_build_finalize,
             InsnVariants::HashProbe => execute::op_hash_probe,
             InsnVariants::HashNext => execute::op_hash_next,
