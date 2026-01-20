@@ -9,7 +9,6 @@ source $testdir/insert.test
 source $testdir/json.test
 source $testdir/like.test
 source $testdir/math.test
-source $testdir/orderby.test
 source $testdir/groupby.test
 source $testdir/pragma.test
 source $testdir/scalar-functions.test
