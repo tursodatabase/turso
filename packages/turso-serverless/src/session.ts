@@ -24,6 +24,11 @@ export interface SessionConfig {
   url: string;
   /** Authentication token */
   authToken: string;
+  /**
+   * Encryption key for the remote database (base64 encoded)
+   * to enable access to encrypted Turso Cloud databases.
+   */
+  remoteEncryptionKey?: string;
 }
 
 function normalizeUrl(url: string): string {
@@ -65,8 +70,8 @@ export class Session {
       } as DescribeRequest]
     };
 
-    const response = await executePipeline(this.baseUrl, this.config.authToken, request);
-    
+    const response = await executePipeline(this.baseUrl, this.config.authToken, request, this.config.remoteEncryptionKey);
+
     this.baton = response.baton;
     if (response.base_url) {
       this.baseUrl = response.base_url;
@@ -78,7 +83,7 @@ export class Session {
       if (result.type === "error") {
         throw new DatabaseError(result.error?.message || 'Describe execution failed');
       }
-      
+
       if (result.response?.type === "describe" && result.response.result) {
         return result.response.result as DescribeResult;
       }
@@ -161,8 +166,8 @@ export class Session {
       }
     };
 
-    const { response, entries } = await executeCursor(this.baseUrl, this.config.authToken, request);
-    
+    const { response, entries } = await executeCursor(this.baseUrl, this.config.authToken, request, this.config.remoteEncryptionKey);
+
     this.baton = response.baton;
     if (response.base_url) {
       this.baseUrl = response.base_url;
@@ -173,7 +178,7 @@ export class Session {
 
   /**
    * Process cursor entries into a structured result.
-   * 
+   *
    * @param entries - Async generator of cursor entries
    * @returns Promise resolving to the processed result
    */
@@ -269,8 +274,8 @@ export class Session {
       }
     };
 
-    const { response, entries } = await executeCursor(this.baseUrl, this.config.authToken, request);
-    
+    const { response, entries } = await executeCursor(this.baseUrl, this.config.authToken, request, this.config.remoteEncryptionKey);
+
     this.baton = response.baton;
     if (response.base_url) {
       this.baseUrl = response.base_url;
@@ -316,8 +321,8 @@ export class Session {
       } as SequenceRequest]
     };
 
-    const response = await executePipeline(this.baseUrl, this.config.authToken, request);
-    
+    const response = await executePipeline(this.baseUrl, this.config.authToken, request, this.config.remoteEncryptionKey);
+
     this.baton = response.baton;
     if (response.base_url) {
       this.baseUrl = response.base_url;
@@ -334,7 +339,7 @@ export class Session {
 
   /**
    * Close the session.
-   * 
+   *
    * This sends a close request to the server to properly clean up the stream
    * before resetting the local state.
    */
@@ -349,7 +354,7 @@ export class Session {
           } as CloseRequest]
         };
 
-        await executePipeline(this.baseUrl, this.config.authToken, request);
+        await executePipeline(this.baseUrl, this.config.authToken, request, this.config.remoteEncryptionKey);
       } catch (error) {
         // Ignore errors during close, as the connection might already be closed
         console.error('Error closing session:', error);

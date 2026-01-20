@@ -138,7 +138,11 @@ pub struct SyncEngineOpts {
     pub use_transform: bool,
     pub protocol_version: Option<SyncEngineProtocolVersion>,
     pub bootstrap_if_empty: bool,
-    pub remote_encryption: Option<String>,
+    /// Encryption cipher for the Turso Cloud database.
+    pub remote_encryption_cipher: Option<String>,
+    /// Base64-encoded encryption key for the Turso Cloud database.
+    /// Must match the key used when creating the encrypted database.
+    pub remote_encryption_key: Option<String>,
     pub partial_sync_opts: Option<JsPartialSyncOpts>,
 }
 
@@ -152,36 +156,33 @@ struct SyncEngineOptsFilled {
     pub use_transform: bool,
     pub protocol_version: DatabaseSyncEngineProtocolVersion,
     pub bootstrap_if_empty: bool,
-    pub remote_encryption: Option<CipherMode>,
+    pub remote_encryption_cipher: Option<CipherMode>,
+    pub remote_encryption_key: Option<String>,
     pub partial_sync_opts: Option<PartialSyncOpts>,
 }
 
 #[derive(Debug, Clone, Copy)]
 enum CipherMode {
-    Aes256Gcm = 1,
-    Aes128Gcm = 2,
-    ChaCha20Poly1305 = 3,
-    Aegis256 = 4,
+    Aes256Gcm,
+    Aes128Gcm,
+    ChaCha20Poly1305,
+    Aegis128L,
+    Aegis128X2,
+    Aegis128X4,
+    Aegis256,
+    Aegis256X2,
+    Aegis256X4,
 }
 
 impl CipherMode {
-    /// Returns the nonce size for this cipher mode.
-    pub fn required_nonce_size(&self) -> usize {
-        match self {
-            CipherMode::Aes256Gcm | CipherMode::Aes128Gcm | CipherMode::ChaCha20Poly1305 => 12,
-            CipherMode::Aegis256 => 32,
-        }
-    }
-
-    /// Returns the tag size for this cipher mode.
-    pub fn required_tag_size(&self) -> usize {
-        // All supported ciphers use 16-byte tags
-        16
-    }
-
     /// Returns the total metadata size (nonce + tag) for this cipher mode.
+    /// These values match the Turso Cloud encryption settings.
     fn required_metadata_size(&self) -> usize {
-        self.required_nonce_size() + self.required_tag_size()
+        match self {
+            CipherMode::Aes256Gcm | CipherMode::Aes128Gcm | CipherMode::ChaCha20Poly1305 => 28,
+            CipherMode::Aegis128L | CipherMode::Aegis128X2 | CipherMode::Aegis128X4 => 32,
+            CipherMode::Aegis256 | CipherMode::Aegis256X2 | CipherMode::Aegis256X4 => 48,
+        }
     }
 }
 
@@ -257,16 +258,25 @@ impl SyncEngine {
                 _ => DatabaseSyncEngineProtocolVersion::V1,
             },
             bootstrap_if_empty: opts.bootstrap_if_empty,
-            remote_encryption: match opts.remote_encryption.as_deref() {
-                Some("aes256gcm") => Some(CipherMode::Aes256Gcm),
-                Some("aes128gcm") => Some(CipherMode::Aes128Gcm),
-                Some("chacha20poly1305") => Some(CipherMode::ChaCha20Poly1305),
-                Some("aegis256") => Some(CipherMode::Aegis256),
+            remote_encryption_cipher: match opts.remote_encryption_cipher.as_deref() {
+                Some("aes256gcm") | Some("aes-256-gcm") => Some(CipherMode::Aes256Gcm),
+                Some("aes128gcm") | Some("aes-128-gcm") => Some(CipherMode::Aes128Gcm),
+                Some("chacha20poly1305") | Some("chacha20-poly1305") => {
+                    Some(CipherMode::ChaCha20Poly1305)
+                }
+                Some("aegis128l") | Some("aegis-128l") => Some(CipherMode::Aegis128L),
+                Some("aegis128x2") | Some("aegis-128x2") => Some(CipherMode::Aegis128X2),
+                Some("aegis128x4") | Some("aegis-128x4") => Some(CipherMode::Aegis128X4),
+                Some("aegis256") | Some("aegis-256") => Some(CipherMode::Aegis256),
+                Some("aegis256x2") | Some("aegis-256x2") => Some(CipherMode::Aegis256X2),
+                Some("aegis256x4") | Some("aegis-256x4") => Some(CipherMode::Aegis256X4),
                 None => None,
                 _ => {
                     return Err(napi::Error::new(
                         napi::Status::GenericFailure,
-                        "unsupported remote cipher",
+                        "unsupported remote cipher. Supported: aes256gcm, aes128gcm, \
+                         chacha20poly1305, aegis128l, aegis128x2, aegis128x4, aegis256, \
+                         aegis256x2, aegis256x4",
                     ))
                 }
             },
@@ -287,6 +297,7 @@ impl SyncEngine {
                 },
                 None => None,
             },
+            remote_encryption_key: opts.remote_encryption_key.clone(),
         };
         Ok(SyncEngine {
             opts: opts_filled,
@@ -312,10 +323,11 @@ impl SyncEngine {
             bootstrap_if_empty: self.opts.bootstrap_if_empty,
             reserved_bytes: self
                 .opts
-                .remote_encryption
+                .remote_encryption_cipher
                 .map(|x| x.required_metadata_size())
                 .unwrap_or(0),
             partial_sync_opts: self.opts.partial_sync_opts.clone(),
+            remote_encryption_key: self.opts.remote_encryption_key.clone(),
         };
 
         let io = self.io()?;

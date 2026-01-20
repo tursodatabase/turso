@@ -24,6 +24,8 @@ pub struct TursoDatabaseSyncConfig {
     pub bootstrap_if_empty: bool,
     pub reserved_bytes: Option<usize>,
     pub partial_sync_opts: Option<turso_sync_engine::types::PartialSyncOpts>,
+    /// Base64-encoded encryption key for the Turso Cloud encrypted database.
+    pub remote_encryption_key: Option<String>,
 }
 
 pub type PartialSyncOpts = turso_sync_engine::types::PartialSyncOpts;
@@ -90,6 +92,8 @@ impl TursoDatabaseSyncConfig {
             } else {
                 None
             },
+            // TODO: Add remote_encryption_key support in C API
+            remote_encryption_key: None,
         })
     }
 }
@@ -160,6 +164,7 @@ fn persistent_io(partial: bool) -> Result<Arc<dyn IO>, turso_sync_engine::errors
     }
     #[cfg(not(target_os = "linux"))]
     {
+        let _ = partial;
         Ok(Arc::new(turso_core::PlatformIO::new().map_err(|e| {
             turso_sync_engine::errors::Error::DatabaseSyncEngineError(format!(
                 "Failed to create platform IO: {e}"
@@ -188,6 +193,7 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
             bootstrap_if_empty: sync_config.bootstrap_if_empty,
             reserved_bytes: sync_config.reserved_bytes.unwrap_or(0),
             partial_sync_opts: sync_config.partial_sync_opts.clone(),
+            remote_encryption_key: sync_config.remote_encryption_key.clone(),
         };
         let is_memory = db_config.path == ":memory:";
         let db_io: Option<Arc<dyn IO>> = if is_memory {
@@ -237,6 +243,7 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
                     sync_engine_io.clone(),
                     &metadata,
                     &main_db_path,
+                    sync_engine_opts.remote_encryption_key.as_deref(),
                 )?;
                 let main_db = turso_sdk_kit::rsapi::TursoDatabase::new(
                     turso_sdk_kit::rsapi::TursoDatabaseConfig {
@@ -307,6 +314,7 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
                     sync_engine_io.clone(),
                     &metadata,
                     &main_db_path,
+                    sync_engine_opts.remote_encryption_key.as_deref(),
                 )?;
                 let main_db = turso_sdk_kit::rsapi::TursoDatabase::new(
                     turso_sdk_kit::rsapi::TursoDatabaseConfig {

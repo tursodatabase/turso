@@ -180,17 +180,26 @@ export interface CursorEntry {
   };
 }
 
+/** HTTP header key for the encryption key */
+export const ENCRYPTION_KEY_HEADER = 'x-turso-encryption-key';
+
 export async function executeCursor(
   url: string,
   authToken: string,
-  request: CursorRequest
+  request: CursorRequest,
+  remoteEncryptionKey?: string
 ): Promise<{ response: CursorResponse; entries: AsyncGenerator<CursorEntry> }> {
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    'Authorization': `Bearer ${authToken}`,
+  };
+  if (remoteEncryptionKey) {
+    headers[ENCRYPTION_KEY_HEADER] = remoteEncryptionKey;
+  }
+
   const response = await fetch(`${url}/v3/cursor`, {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${authToken}`,
-    },
+    headers,
     body: JSON.stringify(request),
   });
 
@@ -285,14 +294,20 @@ export async function executeCursor(
 export async function executePipeline(
   url: string,
   authToken: string,
-  request: PipelineRequest
+  request: PipelineRequest,
+  remoteEncryptionKey?: string
 ): Promise<PipelineResponse> {
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    'Authorization': `Bearer ${authToken}`,
+  };
+  if (remoteEncryptionKey) {
+    headers[ENCRYPTION_KEY_HEADER] = remoteEncryptionKey;
+  }
+
   const response = await fetch(`${url}/v3/pipeline`, {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${authToken}`,
-    },
+    headers,
     body: JSON.stringify(request),
   });
 

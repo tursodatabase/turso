@@ -47,6 +47,8 @@ pub struct DatabaseSyncEngineOpts {
     pub bootstrap_if_empty: bool,
     pub reserved_bytes: usize,
     pub partial_sync_opts: Option<PartialSyncOpts>,
+    /// Base64-encoded encryption key for the Turso Cloud database
+    pub remote_encryption_key: Option<String>,
 }
 
 pub struct DataStats {
@@ -244,7 +246,12 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             None if opts.bootstrap_if_empty => {
                 let client_unique_id = format!("{}-{}", opts.client_name, uuid::Uuid::new_v4());
                 let revision = bootstrap_db_file(
-                    &SyncOperationCtx::new(coro, &sync_engine_io, opts.remote_url.clone()),
+                    &SyncOperationCtx::new(
+                        coro,
+                        &sync_engine_io,
+                        opts.remote_url.clone(),
+                        opts.remote_encryption_key.as_deref(),
+                    ),
                     &io,
                     main_db_path,
                     opts.protocol_version_hint,
@@ -345,6 +352,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         sync_engine_io: SyncEngineIoStats<IO>,
         meta: &DatabaseMetadata,
         main_db_path: &str,
+        remote_encryption_key: Option<&str>,
     ) -> Result<Arc<dyn DatabaseStorage>> {
         let db_file = io.open_file(main_db_path, turso_core::OpenFlags::Create, false)?;
         let db_file: Arc<dyn DatabaseStorage> = if let Some(partial_sync_opts) =
@@ -362,6 +370,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                 ));
             };
             tracing::info!("create LazyDatabaseStorage database storage");
+            let encoded_key = remote_encryption_key.map(|k| k.to_string());
             Arc::new(LazyDatabaseStorage::new(
                 db_file,
                 None, // todo(sivukhin): allocate dirty file for FS IO
@@ -372,6 +381,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                     .as_ref()
                     .and_then(|x| x.remote_url.as_ref())
                     .cloned(),
+                encoded_key,
             )?)
         } else {
             Arc::new(turso_core::storage::database::DatabaseFile::new(db_file))
@@ -477,8 +487,13 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             meta,
         )
         .await?;
-        let main_db_storage =
-            Self::init_db_storage(io.clone(), sync_engine_io.clone(), &meta, main_db_path)?;
+        let main_db_storage = Self::init_db_storage(
+            io.clone(),
+            sync_engine_io.clone(),
+            &meta,
+            main_db_path,
+            opts.remote_encryption_key.as_deref(),
+        )?;
         let main_db = turso_core::Database::open_with_flags(
             io.clone(),
             main_db_path,
@@ -717,7 +732,12 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
 
         let now = self.io.current_time_wall_clock();
         let revision = self.meta().synced_revision.clone();
-        let ctx = &SyncOperationCtx::new(coro, &self.sync_engine_io, self.meta().remote_url());
+        let ctx = &SyncOperationCtx::new(
+            coro,
+            &self.sync_engine_io,
+            self.meta().remote_url(),
+            self.opts.remote_encryption_key.as_deref(),
+        );
         let next_revision = wal_pull_to_file(
             ctx,
             &file.value,
@@ -967,8 +987,12 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             };
 
             let mut transformed = if self.opts.use_transform {
-                let ctx =
-                    &SyncOperationCtx::new(coro, &self.sync_engine_io, self.meta().remote_url());
+                let ctx = &SyncOperationCtx::new(
+                    coro,
+                    &self.sync_engine_io,
+                    self.meta().remote_url(),
+                    self.opts.remote_encryption_key.as_deref(),
+                );
                 Some(apply_transformation(ctx, &local_changes, &replay.generator).await?)
             } else {
                 None
@@ -1008,7 +1032,12 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
     pub async fn push_changes_to_remote<Ctx>(&self, coro: &Coro<Ctx>) -> Result<()> {
         tracing::info!("push_changes(path={})", self.main_db_path);
 
-        let ctx = &SyncOperationCtx::new(coro, &self.sync_engine_io, self.meta().remote_url());
+        let ctx = &SyncOperationCtx::new(
+            coro,
+            &self.sync_engine_io,
+            self.meta().remote_url(),
+            self.opts.remote_encryption_key.as_deref(),
+        );
         let (_, change_id) =
             push_logical_changes(ctx, &self.main_tape, &self.client_unique_id, &self.opts).await?;
 
