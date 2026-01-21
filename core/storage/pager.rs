@@ -784,6 +784,12 @@ impl Page {
     /// If inputs are invalid, stores TAG_UNSET, which will prevent
     /// the cached page from being used during checkpoint.
     pub fn set_wal_tag(&self, frame: u64, epoch: u32) {
+        tracing::debug!(
+            "set_wal_tag: page={}, frame={}, epoch={}",
+            self.get().id,
+            frame,
+            epoch
+        );
         // use only first 20 bits for seq (max: 1048576)
         let e = epoch & EPOCH_MAX;
         self.get()
@@ -799,6 +805,7 @@ impl Page {
 
     #[inline]
     pub fn clear_wal_tag(&self) {
+        tracing::debug!("clear_wal_tag: page={}", self.get().id);
         self.get().wal_tag.store(TAG_UNSET, Ordering::Release)
     }
 
@@ -2331,7 +2338,11 @@ impl Pager {
     #[tracing::instrument(skip_all, level = Level::TRACE)]
     pub fn read_page(&self, page_idx: i64) -> Result<(PageRef, Option<Completion>)> {
         assert!(page_idx >= 0, "pages in pager should be positive, negative might indicate unallocated pages from mvcc or any other nasty bug");
-        tracing::debug!("read_page(page_idx = {})", page_idx);
+        tracing::debug!(
+            "read_page(page_idx = {}, {:?})",
+            page_idx,
+            std::ptr::from_ref(self)
+        );
 
         // First check if page is in cache
         {
@@ -2438,7 +2449,8 @@ impl Pager {
         let page = page_cache.get(&page_key)?.and_then(|page| {
             if page.is_valid_for_checkpoint(target_frame, seq) {
                 tracing::debug!(
-                    "cache_get_for_checkpoint: page {page_idx} frame {target_frame} is valid",
+                    "cache_get_for_checkpoint: page {page_idx} frame {target_frame} is valid (seq={seq}, wal_tag_pair={:?})",
+                    page.wal_tag_pair()
                 );
                 Some(page)
             } else {
@@ -3164,6 +3176,11 @@ impl Pager {
                     let wal_file = wal.wal_file()?;
                     let mut batch = WriteBatch::new(wal_file);
                     for prepared in &commit_info.prepared_frames {
+                        tracing::debug!(
+                            "wal_write: offset={}, bufs.len()={}",
+                            prepared.offset,
+                            prepared.bufs.len()
+                        );
                         batch.writev(prepared.offset, &prepared.bufs);
                     }
                     commit_info.completions = batch.submit()?;
@@ -3614,6 +3631,7 @@ impl Pager {
     /// of a rollback or in case we want to invalidate page cache after starting a read transaction
     /// right after new writes happened which would invalidate current page cache.
     pub fn clear_page_cache(&self, clear_dirty: bool) {
+        tracing::debug!("clear_page_cache: clear_dirty={clear_dirty}");
         let dirty_pages = self.dirty_pages.write();
         let mut cache = self.page_cache.write();
         for page_id in dirty_pages.iter() {

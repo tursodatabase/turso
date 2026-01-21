@@ -549,7 +549,8 @@ impl Whopper {
         let exec_id = self.context.fibers[fiber_idx].execution_id;
         let txn_id = self.context.fibers[fiber_idx].txn_id;
         trace!(
-            "perform_work: fiber_idx={}/{} exec_id={:?} txn_id={:?}",
+            "perform_work: step={}, fiber_idx={}/{} exec_id={:?} txn_id={:?}",
+            self.current_step,
             fiber_idx,
             self.context.fibers.len(),
             exec_id,
@@ -562,6 +563,7 @@ impl Whopper {
             if let Some(stmt) = stmt_borrow.as_mut() {
                 let span = tracing::debug_span!(
                     "step",
+                    step = self.current_step,
                     fiber = fiber_idx,
                     exec_id = exec_id,
                     txn_id = txn_id
@@ -582,6 +584,7 @@ impl Whopper {
                                 Ok(None)
                             }
                             turso_core::StepResult::Done => Ok(Some(())),
+                            turso_core::StepResult::Busy => Err(turso_core::LimboError::Busy),
                             _ => Ok(None),
                         }
                     }
@@ -598,7 +601,9 @@ impl Whopper {
         }
 
         // drop statement - we finished its execution
-        self.context.fibers[fiber_idx].statement.replace(None);
+        if let Some(mut stmt) = self.context.fibers[fiber_idx].statement.replace(None) {
+            stmt.reset();
+        }
         self.context.fibers[fiber_idx].execution_id = None;
 
         // get current completed operation
@@ -615,6 +620,7 @@ impl Whopper {
             // handle operation result
             let span = tracing::debug_span!(
                 "complete",
+                step = self.current_step,
                 fiber = fiber_idx,
                 exec_id = exec_id,
                 current_exec_id = current_exec_id,
@@ -716,6 +722,7 @@ impl Whopper {
             let state_str = format!("{:?}", &fiber.state);
             let span = tracing::debug_span!(
                 "init",
+                step = self.current_step,
                 fiber = fiber_idx,
                 exec_id = exec_id,
                 txn_id = fiber.txn_id,
@@ -772,42 +779,53 @@ impl Whopper {
             self.context.fibers.len()
         );
 
+        let fibers = &mut self.context.fibers;
         // Run all active statements to completion
-        for (fiber_idx, fiber) in self.context.fibers.iter_mut().enumerate() {
-            while fiber.statement.borrow().is_some() {
-                let done = {
-                    let mut stmt_borrow = fiber.statement.borrow_mut();
-                    if let Some(stmt) = stmt_borrow.as_mut() {
-                        match stmt.step() {
-                            Ok(result) => match result {
-                                turso_core::StepResult::Row => {
-                                    if let Some(row) = stmt.row() {
-                                        let values: Vec<Value> =
-                                            row.get_values().cloned().collect();
-                                        fiber.rows.push(values);
+        while fibers.iter().any(|f| f.statement.borrow().is_some()) {
+            for (fiber_idx, fiber) in fibers.iter_mut().enumerate() {
+                if fiber.statement.borrow().is_some() {
+                    let done = {
+                        let span = tracing::debug_span!(
+                            "step",
+                            step = self.current_step,
+                            fiber = fiber_idx
+                        );
+                        let _enter = span.enter();
+
+                        let mut stmt_borrow = fiber.statement.borrow_mut();
+                        if let Some(stmt) = stmt_borrow.as_mut() {
+                            match stmt.step() {
+                                Ok(result) => match result {
+                                    turso_core::StepResult::Row => {
+                                        if let Some(row) = stmt.row() {
+                                            let values: Vec<Value> =
+                                                row.get_values().cloned().collect();
+                                            fiber.rows.push(values);
+                                        }
+                                        false
                                     }
-                                    false
-                                }
-                                turso_core::StepResult::Done => true,
-                                _ => false,
-                            },
-                            Err(_) => true, // On error, consider statement done
+                                    turso_core::StepResult::Done => true,
+                                    turso_core::StepResult::Busy => true,
+                                    _ => false,
+                                },
+                                Err(_) => true, // On error, consider statement done
+                            }
+                        } else {
+                            true
                         }
-                    } else {
-                        true
+                    };
+                    if done {
+                        debug!(
+                            "fiber {}: completed with {} rows before restart",
+                            fiber_idx,
+                            fiber.rows.len()
+                        );
+                        fiber.statement.replace(None).unwrap().reset();
+                        fiber.rows.clear();
                     }
-                };
-                if done {
-                    debug!(
-                        "fiber {}: completed with {} rows before restart",
-                        fiber_idx,
-                        fiber.rows.len()
-                    );
-                    fiber.statement.replace(None);
-                    fiber.rows.clear();
-                    break;
                 }
             }
+            self.io.step().unwrap();
         }
 
         // Close and drop all fiber connections to release database Arc references

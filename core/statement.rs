@@ -173,6 +173,7 @@ impl Statement {
         if matches!(res, Ok(StepResult::Busy)) {
             let now = self.pager.io.current_time_monotonic();
             let handler = self.program.connection.get_busy_handler();
+            tracing::debug!("busy: handler={:?}, now={:?}", handler, now);
 
             // Initialize or get existing busy handler state
             let busy_state = self

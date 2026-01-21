@@ -158,6 +158,7 @@ fn compare_with_collation(
     }
 }
 
+#[derive(Debug)]
 pub enum InsnFunctionStepResult {
     Done,
     IO(IOCompletions),
@@ -2075,7 +2076,8 @@ pub fn op_transaction(
 ) -> Result<InsnFunctionStepResult> {
     let result = op_transaction_inner(program, state, insn, pager);
     tracing::debug!(
-        "op_transaction: end: state={:?}, tx_state={:?}",
+        "op_transaction: end: result={:?}, state={:?}, tx_state={:?}",
+        result,
         state.op_transaction_state,
         program.connection.get_tx_state()
     );

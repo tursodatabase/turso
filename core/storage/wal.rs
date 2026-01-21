@@ -2342,7 +2342,11 @@ impl WalFile {
                                 let (_, wal_page) = sqlite3_ondisk::parse_wal_frame_header(&raw);
                                 let cached = buffer.as_slice();
                                 if wal_page != cached {
-                                    tracing::error!("whoooops");
+                                    tracing::error!(
+                                        "page diff\nwal={:?}\ncache={:?}",
+                                        wal_page,
+                                        cached
+                                    );
                                 }
                                 turso_assert!(wal_page == cached, "cached page content differs from WAL read for page_id={page_id}, frame_id={target_frame}");
                             }
@@ -2806,17 +2810,33 @@ impl WalFile {
 
     /// Check if database changed since this connection's last read transaction.
     fn db_changed(&self, shared: &WalFileShared) -> bool {
-        let shared_max = shared.max_frame.load(Ordering::Acquire);
-        let nbackfills = shared.nbackfills.load(Ordering::Acquire);
-        let last_checksum = shared.last_checksum;
-        let checkpoint_seq = shared.wal_header.lock().checkpoint_seq;
-        let transaction_count = shared.transaction_count.load(Ordering::Acquire);
+        let shared_max_frame = shared.max_frame.load(Ordering::Acquire);
+        let shared_min_frame = shared.nbackfills.load(Ordering::Acquire) + 1;
+        let shared_last_checksum = shared.last_checksum;
+        let shared_checkpoint_seq = shared.wal_header.lock().checkpoint_seq;
+        let shared_transaction_count = shared.transaction_count.load(Ordering::Acquire);
 
-        shared_max != self.max_frame.load(Ordering::Acquire)
-            || last_checksum != *self.last_checksum.read()
-            || checkpoint_seq != self.checkpoint_seq.load(Ordering::Acquire)
-            || transaction_count != self.transaction_count.load(Ordering::Acquire)
-            || nbackfills + 1 != self.min_frame.load(Ordering::Acquire)
+        let max_frame = self.max_frame.load(Ordering::Acquire);
+        let min_frame = self.min_frame.load(Ordering::Acquire);
+        let last_checksum = *self.last_checksum.read();
+        let checkpoint_seq = self.checkpoint_seq.load(Ordering::Acquire);
+        let transaction_count = self.transaction_count.load(Ordering::Acquire);
+
+        let db_changed = shared_max_frame != max_frame
+            || shared_min_frame != min_frame
+            || shared_last_checksum != last_checksum
+            || shared_checkpoint_seq != checkpoint_seq
+            || shared_transaction_count != transaction_count;
+
+        tracing::debug!("db_changed({}): max_frame({} vs {}), min_frame({} vs {}), last_checksum({:?} vs {:?}), checkpoint_seq({} vs {}), transaction_count({} vs {})",
+            db_changed,
+            shared_max_frame, max_frame,
+            shared_min_frame, min_frame,
+            shared_last_checksum, last_checksum,
+            shared_checkpoint_seq, checkpoint_seq,
+            shared_transaction_count, transaction_count
+        );
+        db_changed
     }
 }
 
