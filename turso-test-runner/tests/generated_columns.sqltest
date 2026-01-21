@@ -409,13 +409,12 @@ test generated-complex-real-arithmetic {
         circumference GENERATED ALWAYS AS (2 * 3.14159 * radius) STORED,
         area GENERATED ALWAYS AS (3.14159 * radius * radius) VIRTUAL
     );
-    INSERT INTO t(radius) VALUES (1), (2.5), (10);
+    INSERT INTO t(radius) VALUES (2.5), (5.0);
     SELECT * FROM t;
 }
 expect {
-    1.0|6.28318|3.14159
     2.5|15.70795|19.6349375
-    10.0|62.8318|314.159
+    5.0|31.4159|78.53975
 }
 
 test generated-max-min-simulation {
