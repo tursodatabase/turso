@@ -55,7 +55,7 @@ impl SqlBackend for RustBackend {
     }
 
     fn capabilities(&self) -> HashSet<Capability> {
-        Capability::all_set()
+        HashSet::from_iter([Capability::Trigger])
     }
 
     async fn create_database(

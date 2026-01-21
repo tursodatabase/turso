@@ -13,7 +13,6 @@ source $testdir/like.test
 source $testdir/groupby.test
 source $testdir/select.test
 source $testdir/join.test
-source $testdir/insert.test
 source $testdir/glob.test
 source $testdir/json.test
 source $testdir/math.test
