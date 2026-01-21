@@ -197,9 +197,16 @@ pub type Result<T, E = LimboError> = std::result::Result<T, E>;
 
 #[derive(Clone, AtomicEnum, Copy, PartialEq, Eq, Debug)]
 enum TransactionState {
-    Write { schema_did_change: bool },
+    Write {
+        schema_did_change: bool,
+    },
     Read,
-    PendingUpgrade,
+    /// PendingUpgrade remembers what transaction state was before upgrade to write
+    /// This is important, because if we failed to initialize write transaction immediatley - we need to end implicitly started Read txn (e.g. for simiple INSERT INTO operation)
+    /// But for late upgrade of transaction we should keep read transaction active (e.g. BEGIN; SELECT ...; INSERT INTO ...)
+    PendingUpgrade {
+        before_was_read: bool,
+    },
     None,
 }
 
@@ -503,6 +510,7 @@ impl Database {
 
             return Ok(db);
         }
+        tracing::debug!("initialize database {canonical_path:?} and put in the registry");
         let db = Self::open_with_flags_bypass_registry_internal(
             io,
             path,
