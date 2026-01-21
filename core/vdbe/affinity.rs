@@ -1,7 +1,11 @@
 use either::Either;
 use turso_parser::ast::{Expr, Literal};
 
-use crate::{numeric::format_float, types::AsValueRef, Value, ValueRef};
+use crate::{
+    numeric::{format_float, DoubleDouble},
+    types::AsValueRef,
+    Value, ValueRef,
+};
 
 /// # SQLite Column Type Affinities
 ///
@@ -453,47 +457,49 @@ fn create_result_from_significand(
         return (parse_result, ParsedNumber::Integer(signed_val));
     }
 
-    // Convert to float
-    let mut result = significand as f64;
+    // Convert to float using Dekker double-double arithmetic for precision
+    // This matches SQLite's sqlite3AtoF implementation
+    let mut result = DoubleDouble::from(significand);
 
     let mut exp = exponent;
     match exp.cmp(&0) {
         std::cmp::Ordering::Greater => {
             while exp >= 100 {
-                result *= 1e100;
+                result *= DoubleDouble::E100;
                 exp -= 100;
             }
             while exp >= 10 {
-                result *= 1e10;
+                result *= DoubleDouble::E10;
                 exp -= 10;
             }
             while exp >= 1 {
-                result *= 10.0;
+                result *= DoubleDouble::E1;
                 exp -= 1;
             }
         }
         std::cmp::Ordering::Less => {
             while exp <= -100 {
-                result *= 1e-100;
+                result *= DoubleDouble::NEG_E100;
                 exp += 100;
             }
             while exp <= -10 {
-                result *= 1e-10;
+                result *= DoubleDouble::NEG_E10;
                 exp += 10;
             }
             while exp <= -1 {
-                result *= 0.1;
+                result *= DoubleDouble::NEG_E1;
                 exp += 1;
             }
         }
         std::cmp::Ordering::Equal => {}
     }
 
+    let mut final_result: f64 = result.into();
     if sign < 0 {
-        result = -result;
+        final_result = -final_result;
     }
 
-    (parse_result, ParsedNumber::Float(result))
+    (parse_result, ParsedNumber::Float(final_result))
 }
 
 pub fn is_space(byte: u8) -> bool {
@@ -620,5 +626,20 @@ mod tests {
         let val = Value::Text("0".into());
         let res = apply_numeric_affinity(val.as_value_ref(), false);
         assert_eq!(res, Some(ValueRef::Integer(0)));
+    }
+
+    #[test]
+    fn test_try_for_float_precision() {
+        // This test verifies that try_for_float uses high-precision arithmetic
+        // to avoid rounding errors when computing significand * 10^exponent.
+        // Naive f64 multiplication accumulates errors; Dekker double-double fixes this.
+        let (_, parsed) = try_for_float("12345678901234567e-5");
+        let expected: f64 = "12345678901234567e-5".parse().unwrap();
+        assert_eq!(
+            parsed.as_float().unwrap().to_bits(),
+            expected.to_bits(),
+            "try_for_float precision mismatch: got {}, expected {expected}",
+            parsed.as_float().unwrap(),
+        );
     }
 }

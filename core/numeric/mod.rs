@@ -390,7 +390,7 @@ const VERTICAL_TAB: char = '\u{b}';
 /// Encapsulates Dekker's arithmetic for higher precision. This is spiritually the same as using a
 /// f128 for arithmetic, but cross platform and compatible with sqlite.
 #[derive(Debug, Clone, Copy)]
-struct DoubleDouble(f64, f64);
+pub struct DoubleDouble(pub f64, pub f64);
 
 impl DoubleDouble {
     pub const E100: Self = DoubleDouble(1.0e+100, -1.590_289_110_975_991_8e83);
