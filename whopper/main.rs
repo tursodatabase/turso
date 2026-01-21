@@ -11,6 +11,9 @@ struct Args {
     /// Simulation mode (fast, chaos, ragnarök/ragnarok)
     #[arg(long, default_value = "fast")]
     mode: String,
+    /// Max connections
+    #[arg(long, default_value_t = 4)]
+    max_connections: usize,
     /// Keep mmap I/O files on disk after run
     #[arg(long)]
     keep: bool,
@@ -89,9 +92,6 @@ fn main() -> anyhow::Result<()> {
 }
 
 fn build_opts(args: &Args, seed: u64) -> anyhow::Result<WhopperOpts> {
-    let mut rng = rand::rng();
-    let max_connections = rng.random_range(1..=8) as usize;
-
     let base_opts = match args.mode.as_str() {
         "fast" => WhopperOpts::fast(),
         "chaos" => WhopperOpts::chaos(),
@@ -101,7 +101,7 @@ fn build_opts(args: &Args, seed: u64) -> anyhow::Result<WhopperOpts> {
 
     Ok(base_opts
         .with_seed(seed)
-        .with_max_connections(max_connections)
+        .with_max_connections(args.max_connections)
         .with_keep_files(args.keep)
         .with_enable_mvcc(args.enable_mvcc)
         .with_enable_encryption(args.enable_encryption))

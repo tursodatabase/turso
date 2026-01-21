@@ -1,7 +1,20 @@
 //! Operations that can be executed on the database.
 
+use rand_chacha::ChaCha8Rng;
 use std::sync::Arc;
-use turso_core::{Connection, Statement, Value};
+use turso_core::{Connection, LimboError, Statement, Value};
+
+use crate::{SamplesContainer, SimulatorFiber, SimulatorState, Stats};
+
+/// Maximum number of keys to remember per table
+const MAX_SAMPLE_KEYS_PER_TABLE: usize = 1000;
+
+/// State of a simulator fiber.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FiberState {
+    Idle,
+    InTx,
+}
 
 /// An operation that can be executed on the database.
 /// Operations are produced by workloads and contain all data needed for execution.
@@ -42,10 +55,15 @@ pub enum Operation {
         table_name: String,
     },
     /// Drop an index
-    DropIndex {
-        sql: String,
-        index_name: String,
-    },
+    DropIndex { sql: String, index_name: String },
+}
+
+/// Context passed to Operation::start_op and Operation::finish_op.
+pub struct OpContext<'a> {
+    pub fiber: &'a mut SimulatorFiber,
+    pub sim_state: &'a mut SimulatorState,
+    pub stats: &'a mut Stats,
+    pub rng: &'a mut ChaCha8Rng,
 }
 
 impl Operation {
@@ -85,11 +103,56 @@ impl Operation {
 
     /// Prepare this operation on a connection.
     /// Returns Ok(Statement) on success, or an error.
-    pub fn prepare(
-        &self,
-        connection: &Arc<Connection>,
-    ) -> Result<Statement, turso_core::LimboError> {
-        connection.prepare(self.sql())
+    pub fn init_op(&self, ctx: &mut OpContext) -> Result<(), turso_core::LimboError> {
+        let stmt = ctx.fiber.connection.prepare(self.sql())?;
+        ctx.fiber.statement.replace(Some(stmt));
+        Ok(())
+    }
+
+    /// Called when an operation finishes execution.
+    /// Applies state changes based on operation type and result.
+    pub fn finish_op(&self, ctx: &mut OpContext, result: &OpResult) {
+        // Only apply state changes on success
+        if let OpResult::Error { .. } = result {
+            return;
+        }
+
+        match self {
+            Operation::Begin { .. } => {
+                ctx.fiber.state = FiberState::InTx;
+                ctx.fiber.txn_id = Some(ctx.sim_state.gen_txn_id());
+            }
+            Operation::Commit | Operation::Rollback => {
+                ctx.fiber.state = FiberState::Idle;
+                ctx.fiber.txn_id = None;
+            }
+            Operation::CreateSimpleTable { table_name } => {
+                ctx.sim_state.simple_tables.insert(table_name.clone(), ());
+            }
+            Operation::SimpleInsert {
+                table_name, key, ..
+            } => {
+                let table_name = table_name.clone();
+                let keys = &mut ctx.sim_state.simple_tables_keys;
+                let container = keys
+                    .entry(table_name)
+                    .or_insert_with(|| SamplesContainer::new(MAX_SAMPLE_KEYS_PER_TABLE));
+                container.add(key.clone(), ctx.rng);
+            }
+            Operation::CreateIndex {
+                index_name,
+                table_name,
+                ..
+            } => {
+                let index_name = index_name.clone();
+                let table_name = table_name.clone();
+                ctx.sim_state.indexes.insert(index_name, table_name);
+            }
+            Operation::DropIndex { index_name, .. } => {
+                ctx.sim_state.indexes.remove(index_name);
+            }
+            _ => {}
+        }
     }
 }
 
@@ -99,5 +162,5 @@ pub enum OpResult {
     /// Operation completed successfully with fetched rows
     Success { rows: Vec<Vec<Value>> },
     /// Operation failed with an error
-    Error { error: String },
+    Error { error: LimboError },
 }

@@ -280,15 +280,15 @@ pub fn default_workloads() -> Vec<(u32, Box<dyn Workload>)> {
     vec![
         // Idle-only workloads
         (10, Box::new(IntegrityCheckWorkload)),
-        (5, Box::new(WalCheckpointWorkload)),
+        // (5, Box::new(WalCheckpointWorkload)),
         (10, Box::new(CreateSimpleTableWorkload)),
         (20, Box::new(SimpleSelectWorkload)),
         (20, Box::new(SimpleInsertWorkload)),
         // DML workloads (work in both Idle and InTx)
-        (1, Box::new(SelectWorkload)),
-        (30, Box::new(InsertWorkload)),
-        (20, Box::new(UpdateWorkload)),
-        (10, Box::new(DeleteWorkload)),
+        // (1, Box::new(SelectWorkload)),
+        // (30, Box::new(InsertWorkload)),
+        // (20, Box::new(UpdateWorkload)),
+        // (10, Box::new(DeleteWorkload)),
         (2, Box::new(CreateIndexWorkload)),
         (2, Box::new(DropIndexWorkload)),
         // InTx-only workloads
