@@ -2240,9 +2240,7 @@ pub fn op_transaction_inner(
                                     state.auto_txn_cleanup = TxnCleanup::None;
                                 }
                                 TransactionState::Read
-                                | TransactionState::PendingUpgrade {
-                                    has_read_txn: true,
-                                } => {
+                                | TransactionState::PendingUpgrade { has_read_txn: true } => {
                                     conn.set_tx_state(TransactionState::Read);
                                 }
                                 TransactionState::Write { .. } => {
