@@ -548,8 +548,8 @@ impl Whopper {
     fn perform_work(&mut self, fiber_idx: usize) -> anyhow::Result<()> {
         let exec_id = self.context.fibers[fiber_idx].execution_id;
         let txn_id = self.context.fibers[fiber_idx].txn_id;
-        debug!(
-            "fiber: {}/{} {:?} {:?}",
+        trace!(
+            "perform_work: fiber_idx={}/{} exec_id={:?} txn_id={:?}",
             fiber_idx,
             self.context.fibers.len(),
             exec_id,
