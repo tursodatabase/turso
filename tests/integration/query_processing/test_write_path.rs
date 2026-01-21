@@ -5,7 +5,8 @@ use crate::common::{compare_string, do_flush, TempDatabase};
 use log::debug;
 use std::io::{Read, Seek, Write};
 use std::sync::Arc;
-use turso_core::{CheckpointMode, Connection, LimboError, Row, Statement, StepResult, Value};
+use turso_core::vdbe::StepResult;
+use turso_core::{CheckpointMode, Connection, LimboError, Row, Statement, Value};
 
 const WAL_HEADER_SIZE: usize = 32;
 const WAL_FRAME_HEADER_SIZE: usize = 24;
@@ -1305,4 +1306,89 @@ pub fn test_reopen_database_wal_restart() {
         let conn2 = tmp_db.connect_limbo();
         println!("rows: {:?}", limbo_exec_rows(&conn2, "SELECT * FROM q"));
     }
+}
+
+#[test]
+/// Test for a bug found by whopper
+/// It is slightly fragile and can be removed if it will be unclear how to maintain it
+///
+/// Here, we simulate BusySnapshot condition when during IO in between of begin_read_tx and begin_write_tx, another connection commited some change
+pub fn test_busy_snapshot_immediate() {
+    let _ = env_logger::try_init();
+    let db_path = tempfile::NamedTempFile::new().unwrap();
+    let (_file, db_path) = db_path.keep().unwrap();
+    tracing::info!("path: {:?}", db_path);
+    let tmp_db = TempDatabase::builder().with_db_path(&db_path).build();
+    let conn1 = tmp_db.connect_limbo();
+    let conn2 = tmp_db.connect_limbo();
+    let mut stmt1 = conn1.prepare("CREATE TABLE t1(x)").unwrap();
+    let mut stmt2 = conn2.prepare("CREATE TABLE t2(x)").unwrap();
+
+    // stmt1 will yield with IO as it needs to allocate first page
+    let result = stmt1.step();
+    assert!(matches!(result, Ok(StepResult::IO)));
+
+    // run stmt2 to completion and commit changes
+    loop {
+        let result = stmt2.step();
+        match result {
+            Ok(StepResult::IO) => continue,
+            Ok(StepResult::Done) => break,
+            result => panic!("unexpected result: {result:?}"),
+        }
+    }
+    drop(stmt2);
+
+    // stmt1 WAL view is stale - so it is return Busy error
+    // (as we didn't have any transaction started before - turso return Busy result so top-level executor will retry statement implicitly)
+    let result = stmt1.step();
+    assert!(matches!(result, Ok(StepResult::Busy)));
+    drop(stmt1);
+
+    conn1.execute("CREATE TABLE t1(x)").unwrap();
+
+    let rows = limbo_exec_rows(&conn1, "SELECT name FROM sqlite_master");
+    assert_eq!(
+        rows,
+        vec![
+            vec![rusqlite::types::Value::Text("t2".to_string())],
+            vec![rusqlite::types::Value::Text("t1".to_string())],
+        ]
+    );
+}
+
+#[test]
+/// Test for a bug found by whopper
+/// It is slightly fragile and can be removed if it will be unclear how to maintain it
+///
+/// Here, we simulate BusySnapshot condition when transaction upgraded in the middle, but since its started another connection commited changes
+pub fn test_busy_snapshot_txn_upgrade() {
+    let _ = env_logger::try_init();
+    let db_path = tempfile::NamedTempFile::new().unwrap();
+    let (_file, db_path) = db_path.keep().unwrap();
+    tracing::info!("path: {:?}", db_path);
+    let tmp_db = TempDatabase::builder().with_db_path(&db_path).build();
+    let conn1 = tmp_db.connect_limbo();
+    let conn2 = tmp_db.connect_limbo();
+    conn1.execute("CREATE TABLE t(x)").unwrap();
+    conn1.execute("BEGIN").unwrap();
+    conn1.execute("SELECT * FROM t").unwrap();
+    let mut stmt1 = conn1.prepare("INSERT INTO t VALUES (1)").unwrap();
+    let mut stmt2 = conn2.prepare("INSERT INTO t VALUES (2)").unwrap();
+
+    loop {
+        let result = stmt2.step();
+        match result {
+            Ok(StepResult::IO) => continue,
+            Ok(StepResult::Done) => break,
+            result => panic!("unexpected result: {result:?}"),
+        }
+    }
+    drop(stmt2);
+
+    // stmt1 WAL view is stale - so it is return Busy error
+    let result = stmt1.step();
+    println!("result: {:?}", result);
+    assert!(matches!(result, Err(LimboError::BusySnapshot)));
+    drop(stmt1);
 }
