@@ -2144,6 +2144,13 @@ impl WalFile {
         func(&shared)
     }
 
+    fn increment_checkpoint_epoch(&self) {
+        self.with_shared(|shared| {
+            let prev = shared.epoch.fetch_add(1, Ordering::Release);
+            tracing::debug!("increment checkpoint epoch: prev={}", prev);
+        });
+    }
+
     fn complete_append_frame(&self, page_id: u64, frame_id: u64, checksums: (u32, u32)) {
         *self.last_checksum.write() = checksums;
         self.max_frame.store(frame_id, Ordering::Release);
@@ -2498,7 +2505,7 @@ impl WalFile {
                         checkpoint_result.take().unwrap()
                     };
                     // increment wal epoch to ensure no stale pages are used for backfilling
-                    self.with_shared(|shared| shared.epoch.fetch_add(1, Ordering::Release));
+                    self.increment_checkpoint_epoch();
 
                     // store a copy of the checkpoint result to return in the future if pragma
                     // wal_checkpoint is called and we haven't backfilled again since.
@@ -2631,6 +2638,7 @@ impl WalFile {
         }
         let result = self.restart_log();
         if result.is_ok() {
+            self.increment_checkpoint_epoch();
             let shared = self.shared.clone();
             Self::unlock_after_restart(&shared, result.as_ref().err());
         }
