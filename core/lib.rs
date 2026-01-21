@@ -201,11 +201,11 @@ enum TransactionState {
         schema_did_change: bool,
     },
     Read,
-    /// PendingUpgrade remembers what transaction state was before upgrade to write
-    /// This is important, because if we failed to initialize write transaction immediatley - we need to end implicitly started Read txn (e.g. for simiple INSERT INTO operation)
+    /// PendingUpgrade remembers what transaction state was before upgrade to write (has_read_txn is true if before transaction were in Read state)
+    /// This is important, because if we failed to initialize write transaction immediatley - we need to end implicitly started read txn (e.g. for simiple INSERT INTO operation)
     /// But for late upgrade of transaction we should keep read transaction active (e.g. BEGIN; SELECT ...; INSERT INTO ...)
     PendingUpgrade {
-        before_was_read: bool,
+        has_read_txn: bool,
     },
     None,
 }

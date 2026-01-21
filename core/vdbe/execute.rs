@@ -2233,7 +2233,7 @@ pub fn op_transaction_inner(
                             match current_state {
                                 TransactionState::None
                                 | TransactionState::PendingUpgrade {
-                                    before_was_read: false,
+                                    has_read_txn: false,
                                 } => {
                                     pager.end_read_tx();
                                     conn.set_tx_state(TransactionState::None);
@@ -2241,7 +2241,7 @@ pub fn op_transaction_inner(
                                 }
                                 TransactionState::Read
                                 | TransactionState::PendingUpgrade {
-                                    before_was_read: true,
+                                    has_read_txn: true,
                                 } => {
                                     conn.set_tx_state(TransactionState::Read);
                                 }
@@ -2255,7 +2255,7 @@ pub fn op_transaction_inner(
                             // set the transaction state to pending so we don't have to
                             // end the read transaction.
                             conn.set_tx_state(TransactionState::PendingUpgrade {
-                                before_was_read: matches!(current_state, TransactionState::Read),
+                                has_read_txn: matches!(current_state, TransactionState::Read),
                             });
                             return Ok(InsnFunctionStepResult::IO(io));
                         }
