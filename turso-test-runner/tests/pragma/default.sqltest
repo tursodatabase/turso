@@ -1,0 +1,224 @@
+@database :default:
+@database :default-no-rowidalias:
+
+test pragma-table-info-equal-syntax {
+    PRAGMA table_info=sqlite_schema
+}
+expect {
+    0|type|TEXT|0||0
+    1|name|TEXT|0||0
+    2|tbl_name|TEXT|0||0
+    3|rootpage|INT|0||0
+    4|sql|TEXT|0||0
+}
+
+test pragma-table-info-call-syntax {
+    PRAGMA table_info(sqlite_schema)
+}
+expect {
+    0|type|TEXT|0||0
+    1|name|TEXT|0||0
+    2|tbl_name|TEXT|0||0
+    3|rootpage|INT|0||0
+    4|sql|TEXT|0||0
+}
+
+test pragma-table-xinfo-call-syntax {
+    PRAGMA table_xinfo(sqlite_schema)
+}
+expect {
+    0|type|TEXT|0||0|0
+    1|name|TEXT|0||0|0
+    2|tbl_name|TEXT|0||0|0
+    3|rootpage|INT|0||0|0
+    4|sql|TEXT|0||0|0
+}
+
+test pragma-table-xinfo-vtable {
+    SELECT name, hidden FROM pragma_table_xinfo('generate_series')
+}
+expect {
+    value|0
+    start|1
+    stop|1
+    step|1
+}
+
+test pragma-table-info-alt-name-equal-syntax {
+    PRAGMA table_info=sqlite_master
+}
+expect {
+    0|type|TEXT|0||0
+    1|name|TEXT|0||0
+    2|tbl_name|TEXT|0||0
+    3|rootpage|INT|0||0
+    4|sql|TEXT|0||0
+}
+
+test pragma-table-info-alt-name-call-syntax {
+    PRAGMA table_info(sqlite_master)
+}
+expect {
+    0|type|TEXT|0||0
+    1|name|TEXT|0||0
+    2|tbl_name|TEXT|0||0
+    3|rootpage|INT|0||0
+    4|sql|TEXT|0||0
+}
+
+test pragma-function-table-info-alt-name {
+    SELECT * FROM pragma_table_info('sqlite_master')
+}
+expect {
+    0|type|TEXT|0||0
+    1|name|TEXT|0||0
+    2|tbl_name|TEXT|0||0
+    3|rootpage|INT|0||0
+    4|sql|TEXT|0||0
+}
+
+test pragma-function-table-info {
+    SELECT * FROM pragma_table_info('sqlite_schema')
+}
+expect {
+    0|type|TEXT|0||0
+    1|name|TEXT|0||0
+    2|tbl_name|TEXT|0||0
+    3|rootpage|INT|0||0
+    4|sql|TEXT|0||0
+}
+
+test pragma-vtab-table-info {
+    SELECT * FROM pragma_table_info WHERE arg = 'sqlite_schema'
+}
+expect {
+    0|type|TEXT|0||0
+    1|name|TEXT|0||0
+    2|tbl_name|TEXT|0||0
+    3|rootpage|INT|0||0
+    4|sql|TEXT|0||0
+}
+
+test pragma-table-info-invalid-table {
+    PRAGMA table_info=pekka
+}
+expect {
+}
+
+test pragma-function-table-info-invalid-table {
+    SELECT * FROM pragma_table_info('pekka')
+}
+expect {
+}
+
+test pragma-vtab-table-info-invalid-table {
+    SELECT * FROM pragma_table_info WHERE arg = 'pekka'
+}
+expect {
+}
+
+test pragma-legacy-file-format {
+    PRAGMA legacy_file_format
+}
+expect {
+}
+
+test pragma-function-legacy-file-format {
+    SELECT * FROM pragma_legacy_file_format()
+}
+expect error {
+    (no such table|Table.*not found)
+}
+
+test pragma-function-too-many-arguments {
+    SELECT * FROM pragma_table_info('sqlite_schema', 'main', 'arg3')
+}
+expect error {
+    Too many arguments
+}
+
+test pragma-function-update {
+    SELECT * FROM pragma_wal_checkpoint()
+}
+expect error {
+    (no such table|Table.*not found)
+}
+
+test pragma-function-nontext-argument {
+    SELECT * FROM pragma_table_info('sqlite_schema', NULL);
+}
+expect {
+    0|type|TEXT|0||0
+    1|name|TEXT|0||0
+    2|tbl_name|TEXT|0||0
+    3|rootpage|INT|0||0
+    4|sql|TEXT|0||0
+}
+
+test pragma-vtab-nontext-argument {
+    SELECT * FROM pragma_table_info WHERE arg ='sqlite_schema' AND schema IS NULL;
+}
+expect {
+    0|type|TEXT|0||0
+    1|name|TEXT|0||0
+    2|tbl_name|TEXT|0||0
+    3|rootpage|INT|0||0
+    4|sql|TEXT|0||0
+}
+
+test pragma-function-no-arguments {
+    SELECT * FROM pragma_table_info();
+}
+expect {
+}
+
+test pragma-vtab-no-arguments {
+    SELECT * FROM pragma_table_info;
+}
+expect {
+}
+
+test pragma-vtab-join {
+    SELECT s.name, ti.name FROM sqlite_schema AS s, pragma_table_info(s.name) AS ti;
+}
+expect {
+    users|id
+    users|first_name
+    users|last_name
+    users|email
+    users|phone_number
+    users|address
+    users|city
+    users|state
+    users|zipcode
+    users|age
+    products|id
+    products|name
+    products|price
+}
+
+test pragma-vtab-reversed-join-order {
+    SELECT s.name, ti.name FROM pragma_table_info(s.name) AS ti, sqlite_schema AS s;
+}
+expect {
+    users|id
+    users|first_name
+    users|last_name
+    users|email
+    users|phone_number
+    users|address
+    users|city
+    users|state
+    users|zipcode
+    users|age
+    products|id
+    products|name
+    products|price
+}
+
+test pragma-module-list-nonempty {
+    SELECT * FROM pragma_module_list;
+}
+expect pattern {
+    \ngenerate_series\n|^generate_series\n|\ngenerate_series$|^generate_series$
+}
