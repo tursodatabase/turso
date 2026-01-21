@@ -1,0 +1,766 @@
+@database :default:
+@database :default-no-rowidalias:
+
+test window-partition-by {
+    SELECT
+    first_name,
+    sum(age) OVER (PARTITION BY zipcode)
+    FROM users u
+    LIMIT 10;
+}
+expect {
+    Britney|97
+    Kaci|97
+    Selena|97
+    Isaac|68
+    Odessa|76
+    Charles|93
+    Lew|26
+    Neil|329
+    Onie|329
+    Hannah|329
+}
+
+test window-partition-by-duplicate-column {
+    SELECT
+    first_name,
+    sum(age) OVER (PARTITION BY zipcode, zipcode)
+    FROM users u
+    LIMIT 10;
+}
+expect {
+    Britney|41
+    Kaci|51
+    Selena|5
+    Isaac|68
+    Odessa|76
+    Charles|93
+    Lew|26
+    Neil|76
+    Onie|64
+    Hannah|89
+}
+
+test window-partition-by-multiple-columns {
+    SELECT
+    first_name,
+    max(age) OVER (PARTITION BY first_name, state),
+    min(age) OVER (PARTITION BY first_name, state),
+    last_name
+    FROM users u
+    LIMIT 10;
+}
+expect {
+    Aaliyah|85|85|Ledner
+    Aaliyah|93|93|Strosin
+    Aaliyah|92|92|Friesen
+    Aaliyah|44|44|Eichmann
+    Aaliyah|48|48|Quigley
+    Aaron|1|1|Feil
+    Aaron|82|82|Torphy
+    Aaron|89|89|Bauch
+    Abagail|23|23|Keeling
+    Abagail|37|37|Yundt
+}
+
+test window-order-by {
+    SELECT
+    name,
+    max(price) OVER (ORDER BY id) AS rolling_max
+    FROM products
+    ORDER BY rolling_max, name;
+}
+expect {
+    accessories|82.9389679823547
+    boots|82.9389679823547
+    cap|82.9389679823547
+    coat|82.9389679823547
+    hat|82.9389679823547
+    jeans|82.9389679823547
+    shirt|82.9389679823547
+    shorts|82.9389679823547
+    sneakers|82.9389679823547
+    sweater|82.9389679823547
+    sweatshirt|82.9389679823547
+}
+
+test window-order-by-duplicate-column {
+    SELECT
+    name,
+    max(price) OVER (ORDER BY id, id) AS rolling_max
+    FROM products
+    ORDER BY rolling_max, name;
+}
+expect {
+    accessories|82.9389679823547
+    boots|82.9389679823547
+    cap|82.9389679823547
+    coat|82.9389679823547
+    hat|82.9389679823547
+    jeans|82.9389679823547
+    shirt|82.9389679823547
+    shorts|82.9389679823547
+    sneakers|82.9389679823547
+    sweater|82.9389679823547
+    sweatshirt|82.9389679823547
+}
+
+test window-order-by-multiple-columns {
+    SELECT
+    name,
+    max(price) OVER (ORDER BY name, id) AS rolling_max
+    FROM products
+    ORDER BY rolling_max, name;
+}
+expect {
+    accessories|47.5875632652657
+    boots|59.7782771700224
+    cap|59.7782771700224
+    coat|59.7782771700224
+    hat|82.9389679823547
+    jeans|82.9389679823547
+    shirt|82.9389679823547
+    shorts|82.9389679823547
+    sneakers|82.9389679823547
+    sweater|82.9389679823547
+    sweatshirt|82.9389679823547
+}
+
+test window-partition-by-and-order-by {
+    SELECT
+    u.first_name,
+    count(*) OVER (PARTITION BY u.city ORDER BY u.first_name)
+    FROM users u
+    LIMIT 10;
+}
+expect {
+    Calista|1
+    Adelia|1
+    Dedrick|1
+    Nels|1
+    Dexter|1
+    Makenzie|1
+    Bernardo|1
+    Emilio|2
+    Joanie|1
+    Rashawn|2
+}
+
+test window-without-partition-by-or-order-by {
+    SELECT count() OVER () FROM products;
+}
+expect {
+    11
+    11
+    11
+    11
+    11
+    11
+    11
+    11
+    11
+    11
+    11
+}
+
+test window-in-subquery {
+    SELECT
+    first_name,
+    zmax
+    FROM (
+    SELECT
+    u.first_name,
+    max(age) OVER (PARTITION BY zipcode) AS zmax
+    FROM users u
+    )
+    WHERE zmax > 20
+    LIMIT 5;
+}
+expect {
+    Britney|51
+    Kaci|51
+    Selena|51
+    Isaac|68
+    Odessa|76
+}
+
+test window-nested-in-expression {
+    SELECT
+    first_name,
+    (age + max(age) OVER (PARTITION BY zipcode))
+    FROM users
+    ORDER BY zipcode, first_name
+    LIMIT 5;
+}
+expect {
+    Britney|92
+    Kaci|102
+    Selena|56
+    Isaac|136
+    Odessa|152
+}
+
+test window-multiple-functions {
+    SELECT
+    first_name,
+    last_name,
+    max(age) OVER (PARTITION BY zipcode),
+    max(age) OVER (PARTITION BY city),
+    min(age) OVER (PARTITION BY state, city ORDER BY last_name),
+    count(*) OVER (PARTITION BY state, city ORDER BY last_name),
+    sum(age) OVER (ORDER BY city),
+    min(age) OVER (ORDER BY city),
+    age
+    FROM users
+    ORDER BY first_name
+    LIMIT 10;
+}
+expect {
+    Aaliyah|Eichmann|44|90|44|1|383157|1|44
+    Aaliyah|Strosin|93|93|93|1|477223|1|93
+    Aaliyah|Quigley|74|48|48|1|66940|1|48
+    Aaliyah|Ledner|85|85|85|1|190346|1|85
+    Aaliyah|Friesen|92|92|92|1|181509|1|92
+    Aaron|Bauch|89|89|89|1|185695|1|89
+    Aaron|Torphy|82|82|82|1|391553|1|82
+    Aaron|Feil|1|86|1|1|317020|1|1
+    Abagail|Rath|84|31|31|1|181984|1|31
+    Abagail|Huels|86|86|86|1|395216|1|86
+}
+
+test window-with-aggregate {
+    SELECT
+    max(age),
+    count(*) OVER ()
+    FROM users;
+}
+expect {
+    100|1
+}
+
+test window-with-group-by {
+    SELECT
+    first_name,
+    max(age) OVER (PARTITION BY last_name)
+    FROM users
+    GROUP BY first_name
+    ORDER BY zipcode
+    LIMIT 10;
+}
+expect {
+    Hannah|99
+    Neil|94
+    Onie|94
+    Tatum|94
+    Kobe|98
+    Emanuel|96
+    Orin|96
+    Caroline|94
+    Brennan|89
+    Ali|89
+}
+
+test window-group-by-with-aggregate {
+    SELECT
+    first_name,
+    count(*),
+    max(age) OVER (PARTITION BY first_name)
+    FROM users
+    GROUP BY first_name, age
+    ORDER BY first_name
+    LIMIT 10;
+}
+expect {
+    Aaliyah|1|93
+    Aaliyah|1|93
+    Aaliyah|1|93
+    Aaliyah|1|93
+    Aaliyah|1|93
+    Aaron|1|89
+    Aaron|1|89
+    Aaron|1|89
+    Abagail|1|86
+    Abagail|1|86
+}
+
+test window-group-by-having {
+    SELECT
+    first_name,
+    count(*),
+    max(age) OVER (PARTITION BY first_name)
+    FROM users
+    GROUP BY first_name, age
+    HAVING count(*) > 1
+    ORDER BY first_name
+    LIMIT 10;
+}
+expect {
+    Abdul|2|63
+    Abraham|2|46
+    Adan|2|58
+    Adella|2|9
+    Adrain|2|64
+    Adriel|2|85
+    Ahmad|2|27
+    Ahmed|2|78
+    Alba|2|7
+    Alvah|2|72
+}
+
+test window-duplicate-name {
+    SELECT
+    name,
+    sum(price) OVER win1,
+    max(price) OVER win1
+    FROM products
+    WINDOW win1 AS (PARTITION BY id),
+    win1 AS (PARTITION BY price)
+    ORDER BY name;
+}
+expect {
+    accessories|47.5875632652657|47.5875632652657
+    boots|59.7782771700224|59.7782771700224
+    cap|32.2475410444338|32.2475410444338
+    coat|8.85709624556419|8.85709624556419
+    hat|82.9389679823547|82.9389679823547
+    jeans|47.9379799632405|47.9379799632405
+    shirt|22.7209470048471|22.7209470048471
+    shorts|50.0363795824125|50.0363795824125
+    sneakers|36.1006791183673|36.1006791183673
+    sweater|68.9227440029754|68.9227440029754
+    sweatshirt|23.8100541984648|23.8100541984648
+}
+
+test window-name-with-space {
+    SELECT
+    name,
+    sum(price) OVER "foo bar"
+    FROM products
+    WINDOW "foo bar" AS (PARTITION BY id)
+    ORDER BY name;
+}
+expect {
+    accessories|47.5875632652657
+    boots|59.7782771700224
+    cap|32.2475410444338
+    coat|8.85709624556419
+    hat|82.9389679823547
+    jeans|47.9379799632405
+    shirt|22.7209470048471
+    shorts|50.0363795824125
+    sneakers|36.1006791183673
+    sweater|68.9227440029754
+    sweatshirt|23.8100541984648
+}
+
+test window-nonexistent-name {
+    SELECT
+    sum(price) OVER nonexistent
+    FROM products;
+}
+expect error {
+    no such window: nonexistent
+}
+
+test window-function-in-having {
+    SELECT
+    name
+    FROM products
+    GROUP BY name
+    HAVING sum(price) OVER (PARTITION BY price) > 40;
+}
+expect error {
+    misuse of window function
+}
+
+test window-function-in-group-by {
+    SELECT
+    name
+    FROM products
+    GROUP BY sum(price) OVER (PARTITION BY price);
+}
+expect error {
+    misuse of window function
+}
+
+test window-nested-function {
+    SELECT
+    sum(sum(price) OVER (PARTITION BY name)) OVER (PARTITION BY price)
+    FROM products;
+}
+expect error {
+    misuse of window function
+}
+
+test window-scalar-function {
+    SELECT
+    lower(name) OVER (PARTITION BY price)
+    FROM products;
+}
+expect error {
+    may not be used as a window function
+}
+
+test window-nonexistent-function {
+    SELECT
+    non_existent_func(name) OVER (PARTITION BY price)
+    FROM products;
+}
+expect error {
+    no such function
+}
+
+test window-scalar-function-star {
+    SELECT
+    lower(*) OVER (PARTITION BY price)
+    FROM products;
+}
+expect error {
+    may not be used as a window function
+}
+
+test window-nonexistent-function-star {
+    SELECT
+    non_existent_func(*) OVER (PARTITION BY price)
+    FROM products;
+}
+expect error {
+    no such function
+}
+
+test window-aggregate-in-partition-by {
+    SELECT
+    max(price) OVER (PARTITION BY count(*))
+    FROM products;
+}
+expect {
+    82.9389679823547
+}
+
+test window-aggregate-in-order-by {
+    SELECT
+    max(price) OVER (ORDER BY count(*))
+    FROM products;
+}
+expect {
+    82.9389679823547
+}
+
+test window-aggregate-as-argument {
+    SELECT
+    max(sum(price)) OVER (ORDER BY name)
+    FROM products;
+}
+expect {
+    480.938229577948
+}
+
+test window-aggregate-with-group-by-as-argument {
+    SELECT
+    max(sum(price)) OVER (ORDER BY name)
+    FROM products
+    GROUP BY price;
+}
+expect {
+    47.5875632652657
+    59.7782771700224
+    59.7782771700224
+    59.7782771700224
+    82.9389679823547
+    82.9389679823547
+    82.9389679823547
+    82.9389679823547
+    82.9389679823547
+    82.9389679823547
+    82.9389679823547
+}
+
+test window-function-as-aggregate-argument {
+    SELECT
+    sum(max(price) OVER (ORDER BY name))
+    FROM products
+    GROUP BY price;
+}
+expect error {
+    misuse of window function
+}
+
+test window-function-nested-in-partition-by {
+    SELECT
+    max(price) OVER (PARTITION BY count(*) OVER())
+    FROM products;
+}
+expect error {
+    misuse of window function
+}
+
+test window-function-nested-in-order-by {
+    SELECT
+    max(price) OVER (ORDER BY count(*) OVER())
+    FROM products;
+}
+expect error {
+    misuse of window function
+}
+
+test window-rowid-in-result {
+    SELECT
+    rowid,
+    max(price) OVER (PARTITION BY price)
+    FROM products
+    ORDER BY name;
+}
+expect {
+    11|47.5875632652657
+    9|59.7782771700224
+    2|32.2475410444338
+    10|8.85709624556419
+    1|82.9389679823547
+    7|47.9379799632405
+    3|22.7209470048471
+    6|50.0363795824125
+    8|36.1006791183673
+    4|68.9227440029754
+    5|23.8100541984648
+}
+
+test window-rowid-in-order-by {
+    SELECT
+    name,
+    max(price) OVER (PARTITION BY price)
+    FROM products
+    ORDER BY rowid;
+}
+expect {
+    hat|82.9389679823547
+    cap|32.2475410444338
+    shirt|22.7209470048471
+    sweater|68.9227440029754
+    sweatshirt|23.8100541984648
+    shorts|50.0363795824125
+    jeans|47.9379799632405
+    sneakers|36.1006791183673
+    boots|59.7782771700224
+    coat|8.85709624556419
+    accessories|47.5875632652657
+}
+
+test window-rowid-as-argument {
+    SELECT
+    name,
+    max(rowid) OVER (PARTITION BY price)
+    FROM products
+    ORDER BY name;
+}
+expect {
+    accessories|11
+    boots|9
+    cap|2
+    coat|10
+    hat|1
+    jeans|7
+    shirt|3
+    shorts|6
+    sneakers|8
+    sweater|4
+    sweatshirt|5
+}
+
+test window-distinct {
+    SELECT
+    distinct max(price) OVER (PARTITION BY price)
+    FROM products;
+}
+expect {
+    8.85709624556419
+    22.7209470048471
+    23.8100541984648
+    32.2475410444338
+    36.1006791183673
+    47.5875632652657
+    47.9379799632405
+    50.0363795824125
+    59.7782771700224
+    68.9227440029754
+    82.9389679823547
+}
+
+test window-distinct-as-argument {
+    SELECT
+    first_name,
+    sum(distinct age) OVER (PARTITION BY first_name)
+    FROM users;
+}
+expect error {
+    DISTINCT is not supported for window functions
+}
+
+test window-distinct-as-argument-2 {
+    SELECT
+    first_name,
+    count(distinct) OVER (PARTITION BY first_name)
+    FROM users;
+}
+expect error {
+    DISTINCT is not supported for window functions
+}
+
+test window-limit-offset {
+    SELECT
+    first_name,
+    age,
+    max(age) OVER (PARTITION BY zipcode ORDER BY id)
+    FROM users
+    LIMIT 3
+    OFFSET 2;
+}
+expect {
+    Selena|5|51
+    Isaac|68|68
+    Odessa|76|76
+}
+
+test window-order-by-limit-offset {
+    SELECT
+    first_name,
+    age,
+    max(age) OVER (PARTITION BY zipcode ORDER BY id)
+    FROM users
+    ORDER BY zipcode, id
+    LIMIT 3
+    OFFSET 2;
+}
+expect {
+    Selena|5|51
+    Isaac|68|68
+    Odessa|76|76
+}
+
+test window-in-cte {
+    WITH w AS (
+    SELECT
+    u.*,
+    max(age) OVER (PARTITION BY zipcode) AS zmax
+    FROM users u
+    )
+    SELECT
+    first_name,
+    last_name,
+    zmax
+    FROM w
+    ORDER BY first_name, last_name
+    LIMIT 5;
+}
+expect {
+    Aaliyah|Eichmann|44
+    Aaliyah|Friesen|92
+    Aaliyah|Ledner|85
+    Aaliyah|Quigley|74
+    Aaliyah|Strosin|93
+}
+
+test window-named-in-cte {
+    WITH w AS (
+    SELECT
+    u.*,
+    max(age) OVER win1 AS zmax
+    FROM users u
+    WINDOW win1 AS (PARTITION BY zipcode)
+    )
+    SELECT
+    first_name,
+    last_name,
+    zmax
+    FROM w
+    ORDER BY first_name, last_name
+    LIMIT 5;
+}
+expect {
+    Aaliyah|Eichmann|44
+    Aaliyah|Friesen|92
+    Aaliyah|Ledner|85
+    Aaliyah|Quigley|74
+    Aaliyah|Strosin|93
+}
+
+test window-empty-partition {
+    SELECT
+    sum(age) OVER (PARTITION by zipcode)
+    FROM users
+    WHERE 0;
+}
+expect {
+}
+
+test window-single-row-partition {
+    SELECT
+    first_name,
+    sum(age) OVER (PARTITION BY zipcode)
+    FROM users
+    WHERE zipcode = '00523';
+}
+expect {
+}
+
+test window-column-in-order-by {
+    SELECT
+    first_name,
+    age,
+    sum(age) OVER (PARTITION BY zipcode) AS total_age
+    FROM users
+    ORDER BY total_age DESC, first_name
+    LIMIT 10;
+}
+expect {
+    Bridgette|38|607
+    Bruce|56|607
+    Chase|74|607
+    Elinor|95|607
+    Ewald|64|607
+    Jayda|83|607
+    Joannie|29|607
+    Keyon|10|607
+    Lucinda|29|607
+    Marta|34|607
+}
+
+test window-function-in-order-by {
+    SELECT
+    first_name,
+    age
+    FROM users
+    ORDER BY sum(age) OVER (PARTITION BY zipcode) DESC, first_name
+    LIMIT 10;
+}
+expect {
+    Bridgette|38
+    Bruce|56
+    Chase|74
+    Elinor|95
+    Ewald|64
+    Jayda|83
+    Joannie|29
+    Keyon|10
+    Lucinda|29
+    Marta|34
+}
+
+test window-complex-argument {
+    SELECT
+    sum(price between 1 and 50) OVER ()
+    FROM products;
+}
+expect {
+    7
+    7
+    7
+    7
+    7
+    7
+    7
+    7
+    7
+    7
+    7
+}
+

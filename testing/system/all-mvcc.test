@@ -5,7 +5,6 @@ set testdir [file dirname $argv0]
 # failing:
 # source $testdir/pragma.test
 # source $testdir/views.test
-# source $testdir/window.test
 # source $testdir/partial_idx.test
 # source $testdir/foreign_keys.test
 
