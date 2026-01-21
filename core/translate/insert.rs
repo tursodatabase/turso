@@ -1321,10 +1321,11 @@ fn bind_insert(
     match body {
         InsertBody::DefaultValues => {
             // Generate default values for the table
+            // Skip generated columns - they will be computed later
             values = table
                 .columns()
                 .iter()
-                .filter(|c| !c.hidden())
+                .filter(|c| !c.hidden() && !c.is_generated())
                 .map(|c| {
                     c.default
                         .clone()
@@ -1660,12 +1661,14 @@ fn init_source_emission<'a>(
             }
         }
         InsertBody::DefaultValues => {
-            let num_values = table.columns().len();
-            values.extend(table.columns().iter().map(|c| {
-                c.default
-                    .clone()
-                    .unwrap_or_else(|| Box::new(ast::Expr::Literal(ast::Literal::Null)))
-            }));
+            // Count only non-hidden, non-generated columns
+            let num_values = table
+                .columns()
+                .iter()
+                .filter(|c| !c.hidden() && !c.is_generated())
+                .count();
+            // Note: values are already populated by bind_insert_values,
+            // excluding generated columns. Don't extend here.
             (
                 num_values,
                 program.alloc_cursor_id_keyed(
