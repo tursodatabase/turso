@@ -29,8 +29,8 @@ use crate::vdbe::hash_table::{HashEntry, HashTable, HashTableConfig, DEFAULT_MEM
 use crate::vdbe::insn::InsertFlags;
 use crate::vdbe::value::ComparisonOp;
 use crate::vdbe::{
-    registers_to_ref_values, EndStatement, OpHashBuildState, OpHashProbeState, StepResult,
-    TxnCleanup,
+    registers_to_ref_values, DeferredSeekState, EndStatement, OpHashBuildState, OpHashProbeState,
+    StepResult, TxnCleanup,
 };
 use crate::vector::{
     vector32, vector32_sparse, vector64, vector_concat, vector_distance_cos, vector_distance_dot,
@@ -1411,12 +1411,10 @@ pub fn op_column(
     'outer: loop {
         match state.op_column_state {
             OpColumnState::Start => {
-                if let Some((index_cursor_id, table_cursor_id)) =
-                    state.deferred_seeks[*cursor_id].take()
-                {
+                if let Some(deferred) = state.deferred_seeks[*cursor_id].take() {
                     state.op_column_state = OpColumnState::Rowid {
-                        index_cursor_id,
-                        table_cursor_id,
+                        index_cursor_id: deferred.index_cursor_id,
+                        table_cursor_id: deferred.table_cursor_id,
                     };
                 } else {
                     state.op_column_state = OpColumnState::GetColumn;
@@ -1467,12 +1465,13 @@ pub fn op_column(
                 state.op_column_state = OpColumnState::GetColumn;
             }
             OpColumnState::GetColumn => {
+                let (active_cursor_id, active_column) = (*cursor_id, *column);
                 // First check if this is a MaterializedViewCursor
                 {
-                    let cursor = state.get_cursor(*cursor_id);
+                    let cursor = state.get_cursor(active_cursor_id);
                     if let Cursor::MaterializedView(mv_cursor) = cursor {
                         // Handle materialized view column access
-                        let value = return_if_io!(mv_cursor.column(*column));
+                        let value = return_if_io!(mv_cursor.column(active_column));
                         state.registers[*dest] = Register::Value(value);
                         break 'outer;
                     }
@@ -1481,7 +1480,7 @@ pub fn op_column(
 
                 let (_, cursor_type) = program
                     .cursor_ref
-                    .get(*cursor_id)
+                    .get(active_cursor_id)
                     .expect("cursor_id should exist in cursor_ref");
                 match cursor_type {
                     CursorType::BTreeTable(_)
@@ -1489,7 +1488,7 @@ pub fn op_column(
                     | CursorType::MaterializedView(_, _) => {
                         'ifnull: {
                             let cursor_ref = must_be_btree_cursor!(
-                                *cursor_id,
+                                active_cursor_id,
                                 program.cursor_ref,
                                 state,
                                 "Column"
@@ -2718,12 +2717,10 @@ pub fn op_row_id(
     loop {
         match state.op_row_id_state {
             OpRowIdState::Start => {
-                if let Some((index_cursor_id, table_cursor_id)) =
-                    state.deferred_seeks[*cursor_id].take()
-                {
+                if let Some(deferred) = state.deferred_seeks[*cursor_id].take() {
                     state.op_row_id_state = OpRowIdState::Record {
-                        index_cursor_id,
-                        table_cursor_id,
+                        index_cursor_id: deferred.index_cursor_id,
+                        table_cursor_id: deferred.table_cursor_id,
                     };
                 } else {
                     state.op_row_id_state = OpRowIdState::GetRowid;
@@ -2957,7 +2954,10 @@ pub fn op_deferred_seek(
         },
         insn
     );
-    state.deferred_seeks[*table_cursor_id] = Some((*index_cursor_id, *table_cursor_id));
+    state.deferred_seeks[*table_cursor_id] = Some(DeferredSeekState {
+        index_cursor_id: *index_cursor_id,
+        table_cursor_id: *table_cursor_id,
+    });
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -2971,6 +2971,11 @@ pub enum OpSeekKey {
     TableRowId(i64),
     IndexKeyOwned(ImmutableRecord),
     IndexKeyFromRegister(usize),
+    IndexKeyUnpacked {
+        cursor_id: usize,
+        start_reg: usize,
+        num_regs: usize,
+    },
 }
 
 #[derive(Debug)]
@@ -3120,10 +3125,12 @@ pub fn seek_internal(
                                 start_reg,
                                 num_regs,
                             } => {
-                                let record_from_regs =
-                                    make_record(&state.registers, &start_reg, &num_regs);
                                 state.seek_state = OpSeekState::Seek {
-                                    key: OpSeekKey::IndexKeyOwned(record_from_regs),
+                                    key: OpSeekKey::IndexKeyUnpacked {
+                                        cursor_id,
+                                        start_reg,
+                                        num_regs,
+                                    },
                                     op,
                                 };
                             }
@@ -3225,20 +3232,53 @@ pub fn seek_internal(
                     continue;
                 }
                 OpSeekState::Seek { key, op } => {
-                    let seek_result = {
-                        let cursor = get_cursor!(state, cursor_id);
-                        let cursor = cursor.as_btree_mut();
-                        let seek_key = match key {
-                        OpSeekKey::TableRowId(rowid) => SeekKey::TableRowId(*rowid),
-                        OpSeekKey::IndexKeyOwned(record) => SeekKey::IndexKey(record),
-                        OpSeekKey::IndexKeyFromRegister(record_reg) => match &state.registers[*record_reg] {
-                            Register::Record(ref record) => SeekKey::IndexKey(record),
-                            _ => unreachable!("op_seek: record_reg should be a Record register when OpSeekKey::IndexKeyFromRegister is used"),
+                    let seek_result = match key {
+                        OpSeekKey::TableRowId(rowid) => {
+                            let cursor = get_cursor!(state, cursor_id).as_btree_mut();
+                            match cursor.seek(SeekKey::TableRowId(*rowid), *op)? {
+                                IOResult::Done(seek_result) => seek_result,
+                                IOResult::IO(io) => return Ok(SeekInternalResult::IO(io)),
+                            }
                         }
-                    };
-                        match cursor.seek(seek_key, *op)? {
-                            IOResult::Done(seek_result) => seek_result,
-                            IOResult::IO(io) => return Ok(SeekInternalResult::IO(io)),
+                        OpSeekKey::IndexKeyOwned(record) => {
+                            let cursor = get_cursor!(state, cursor_id).as_btree_mut();
+                            match cursor.seek(SeekKey::IndexKey(record), *op)? {
+                                IOResult::Done(seek_result) => seek_result,
+                                IOResult::IO(io) => return Ok(SeekInternalResult::IO(io)),
+                            }
+                        }
+                        OpSeekKey::IndexKeyFromRegister(record_reg) => {
+                            let (cursor, record) = {
+                                let (cursors, registers) = (&mut state.cursors, &state.registers);
+                                let cursor = cursors
+                                    .get_mut(cursor_id)
+                                    .and_then(|c| c.as_mut())
+                                    .expect("op_seek: cursor should be allocated")
+                                    .as_btree_mut();
+                                let record = match &registers[*record_reg] {
+                                    Register::Record(ref record) => record,
+                                    _ => unreachable!("op_seek: record_reg should be a Record register when OpSeekKey::IndexKeyFromRegister is used"),
+                                };
+                                (cursor, record)
+                            };
+                            match cursor.seek(SeekKey::IndexKey(record), *op)? {
+                                IOResult::Done(seek_result) => seek_result,
+                                IOResult::IO(io) => return Ok(SeekInternalResult::IO(io)),
+                            }
+                        }
+                        OpSeekKey::IndexKeyUnpacked {
+                            cursor_id: _,
+                            start_reg,
+                            num_regs,
+                        } => {
+                            let start_reg = *start_reg;
+                            let num_regs = *num_regs;
+                            let cursor = get_cursor!(state, cursor_id).as_btree_mut();
+                            let registers = &state.registers[start_reg..start_reg + num_regs];
+                            match cursor.seek_unpacked(registers, *op)? {
+                                IOResult::Done(seek_result) => seek_result,
+                                IOResult::IO(io) => return Ok(SeekInternalResult::IO(io)),
+                            }
                         }
                     };
                     // Increment btree_seeks metric after seek operation and cursor is dropped
@@ -8529,10 +8569,10 @@ pub fn op_open_ephemeral(
             return_if_io!(btree_cursor.clear_btree());
             // iterate over existing deferred seeks and clear them as well,
             // as any deferred seek on this cursor is now invalid.
-            for state in &mut state.deferred_seeks {
-                if let Some((id, other)) = state {
-                    if *id == cursor_id || *other == cursor_id {
-                        *state = None;
+            for deferred_seek in &mut state.deferred_seeks {
+                if let Some(ds) = deferred_seek {
+                    if ds.index_cursor_id == cursor_id || ds.table_cursor_id == cursor_id {
+                        *deferred_seek = None;
                     }
                 }
             }

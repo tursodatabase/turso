@@ -2438,15 +2438,24 @@ pub fn translate_expr(
                                 unreachable!("Either index or table cursor must be opened");
                             }
                         } else {
+                            let is_btree_index = index_cursor_id.is_some_and(|cid| {
+                                program.get_cursor_type(cid).is_some_and(|ct| ct.is_index())
+                            });
                             let read_from_index = if is_from_outer_query_scope {
-                                index_cursor_id.is_some()
+                                is_btree_index
+                            } else if is_btree_index {
+                                index.as_ref().is_some_and(|idx| {
+                                    idx.column_table_pos_to_index_pos(*column).is_some()
+                                })
                             } else {
-                                use_covering_index
+                                false
                             };
                             let read_cursor = if read_from_index {
                                 index_cursor_id.expect("index cursor should be opened")
                             } else {
-                                table_cursor_id.expect("table cursor should be opened")
+                                table_cursor_id
+                                    .or(index_cursor_id)
+                                    .expect("cursor should be opened")
                             };
                             let column = if read_from_index {
                                 let index = program.resolve_index_for_cursor_id(

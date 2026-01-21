@@ -114,7 +114,14 @@ pub fn find_best_access_method_for_join_order(
             base_row_count,
         ),
         Table::FromClauseSubquery(_) => Ok(Some(AccessMethod {
-            cost: estimate_cost_for_scan_or_seek(None, &[], &[], input_cardinality, base_row_count),
+            cost: estimate_cost_for_scan_or_seek(
+                None,
+                &[],
+                &[],
+                input_cardinality,
+                base_row_count,
+                false,
+            ),
             params: AccessMethodParams::Subquery,
         })),
     }
@@ -130,7 +137,7 @@ fn find_best_access_method_for_btree(
 ) -> Result<Option<AccessMethod>> {
     let table_no = join_order.last().unwrap().table_id;
     let mut best_cost =
-        estimate_cost_for_scan_or_seek(None, &[], &[], input_cardinality, base_row_count);
+        estimate_cost_for_scan_or_seek(None, &[], &[], input_cardinality, base_row_count, false);
     let mut best_params = AccessMethodParams::BTreeTable {
         iter_dir: IterationDirection::Forwards,
         index: None,
@@ -159,16 +166,9 @@ fn find_best_access_method_for_btree(
                 column_count: 1,
             },
         };
-        let cost = estimate_cost_for_scan_or_seek(
-            Some(index_info),
-            &rhs_constraints.constraints,
-            &usable_constraint_refs,
-            input_cardinality,
-            base_row_count,
-        );
 
-        // All other things being equal, prefer an access method that satisfies the order target.
-        let (iter_dir, order_satisfiability_bonus) = if let Some(order_target) = maybe_order_target
+        let (iter_dir, is_index_ordered, order_satisfiability_bonus) = if let Some(order_target) =
+            maybe_order_target
         {
             // If the index delivers rows in the same direction (or the exact reverse direction) as the order target, then it
             // satisfies the order target.
@@ -211,21 +211,34 @@ fn find_best_access_method_for_btree(
                     all_same_direction = false;
                 }
             }
-            if all_same_direction || all_opposite_direction {
+
+            let satisfies_order =
+                (all_same_direction || all_opposite_direction) && !order_target.0.is_empty();
+            if satisfies_order {
                 (
                     if all_same_direction {
                         IterationDirection::Forwards
                     } else {
                         IterationDirection::Backwards
                     },
+                    true,
                     Cost(1.0),
                 )
             } else {
-                (IterationDirection::Forwards, Cost(0.0))
+                (IterationDirection::Forwards, false, Cost(0.0))
             }
         } else {
-            (IterationDirection::Forwards, Cost(0.0))
+            (IterationDirection::Forwards, false, Cost(0.0))
         };
+
+        let cost = estimate_cost_for_scan_or_seek(
+            Some(index_info),
+            &rhs_constraints.constraints,
+            &usable_constraint_refs,
+            input_cardinality,
+            base_row_count,
+            is_index_ordered,
+        );
         if cost < best_cost + order_satisfiability_bonus {
             best_cost = cost;
             best_params = AccessMethodParams::BTreeTable {
@@ -265,6 +278,7 @@ fn find_best_access_method_for_vtab(
                     &[],
                     input_cardinality,
                     base_row_count,
+                    false,
                 ),
                 params: AccessMethodParams::VirtualTable {
                     idx_num: index_info.idx_num,
