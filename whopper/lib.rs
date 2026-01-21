@@ -12,7 +12,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::ops::Bound;
 use std::sync::Arc;
-use tracing::{debug, trace};
+use tracing::{debug, error, trace};
 use turso_core::{
     CipherMode, Connection, Database, DatabaseOpts, EncryptionOpts, IO, OpenFlags, Statement, Value,
 };
@@ -20,19 +20,16 @@ use turso_parser::ast::{ColumnConstraint, SortOrder};
 
 mod io;
 mod operations;
-mod properties;
-mod workloads;
+pub mod properties;
+pub mod workloads;
 
-use crate::io::FILE_SIZE_SOFT_LIMIT;
-pub use io::{IOFaultConfig, SimulatorIO};
-pub use operations::{FiberState, OpContext, OpResult, Operation};
-pub use properties::{IntegrityCheckProperty, Property};
-pub use workloads::{
-    BeginWorkload, CommitWorkload, CreateIndexWorkload, CreateSimpleTableWorkload, DeleteWorkload,
-    DropIndexWorkload, InsertWorkload, IntegrityCheckWorkload, RollbackWorkload, SelectWorkload,
-    SimpleInsertWorkload, SimpleSelectWorkload, UpdateWorkload, WalCheckpointWorkload, Workload,
-    WorkloadContext, default_workloads,
+use crate::{
+    io::FILE_SIZE_SOFT_LIMIT,
+    properties::Property,
+    workloads::{Workload, WorkloadContext},
 };
+pub use io::{IOFaultConfig, SimulatorIO};
+pub use operations::{FiberState, OpContext, Operation};
 
 /// A bounded container for sampling values with reservoir sampling.
 #[derive(Debug, Clone)]
@@ -221,7 +218,7 @@ impl Default for WhopperOpts {
             keep_files: false,
             enable_mvcc: false,
             enable_encryption: false,
-            workloads: default_workloads(),
+            workloads: vec![],
             properties: vec![],
         }
     }
@@ -290,6 +287,11 @@ impl WhopperOpts {
 
     pub fn with_workloads(mut self, workloads: Vec<(u32, Box<dyn Workload>)>) -> Self {
         self.workloads = workloads;
+        self
+    }
+
+    pub fn with_properties(mut self, properties: Vec<Box<dyn Property>>) -> Self {
+        self.properties = properties;
         self
     }
 }
@@ -603,6 +605,7 @@ impl Whopper {
         let completed_op = self.context.fibers[fiber_idx].current_op.take();
         if let Some(completed_op) = completed_op {
             let rows = std::mem::take(&mut self.context.fibers[fiber_idx].rows);
+            let current_exec_id = self.context.state.execution_id;
             let mut ctx = OpContext {
                 fiber: &mut self.context.fibers[fiber_idx],
                 sim_state: &mut self.context.state,
@@ -614,34 +617,50 @@ impl Whopper {
                 "complete",
                 fiber = fiber_idx,
                 exec_id = exec_id,
+                current_exec_id = current_exec_id,
                 txn_id = txn_id
             );
             let _enter = span.enter();
             debug!("result={step_result:?}, rows.len()={}", rows.len());
 
-            let op_result = match step_result {
-                Ok(_) => OpResult::Success { rows },
-                Err(err) => OpResult::Error { error: err.clone() },
-            };
-            completed_op.finish_op(&mut ctx, &op_result);
-            for property in &self.properties {
-                let mut property = property.lock().unwrap();
-                property.finish_op(
-                    self.current_step,
-                    fiber_idx,
-                    txn_id,
-                    &completed_op,
-                    &op_result,
-                )?;
+            if let Operation::Begin { .. } = &completed_op {
+                ctx.fiber.state = FiberState::InTx;
+                ctx.fiber.txn_id = Some(ctx.sim_state.gen_txn_id());
             }
 
-            if let OpResult::Error { error } = op_result {
+            let txn_id = ctx.fiber.txn_id;
+
+            let op_result = step_result.map(|_| rows);
+            completed_op.finish_op(&mut ctx, &op_result);
+
+            for property in &self.properties {
+                let mut property = property.lock().unwrap();
+                property
+                    .finish_op(
+                        self.current_step,
+                        fiber_idx,
+                        txn_id,
+                        exec_id.unwrap(),
+                        current_exec_id,
+                        &completed_op,
+                        &op_result,
+                    )
+                    .inspect_err(|e| error!("property failed: {e}"))?;
+            }
+
+            if let Operation::Rollback | Operation::Commit = &completed_op {
+                ctx.fiber.state = FiberState::Idle;
+                ctx.fiber.txn_id = None;
+            }
+
+            if let Err(error) = op_result {
                 match error {
                     // initiate rollback in case of some errors for fiber within transaction
                     turso_core::LimboError::SchemaUpdated
                     | turso_core::LimboError::Busy
                     | turso_core::LimboError::BusySnapshot
-                    | turso_core::LimboError::WriteWriteConflict => {
+                    | turso_core::LimboError::WriteWriteConflict
+                    | turso_core::LimboError::InvalidArgument(..) => {
                         if matches!(self.context.fibers[fiber_idx].state, FiberState::InTx) {
                             self.context.fibers[fiber_idx].current_op = Some(Operation::Rollback);
                         }
@@ -711,10 +730,14 @@ impl Whopper {
                 stats: &mut self.stats,
                 rng: &mut self.rng,
             };
+            debug!("prepare operation: op={:?}", op);
             if let Err(e) = op.init_op(&mut ctx) {
                 let err = e.to_string().to_lowercase();
                 // Allow "no such table/index" and "already exists" errors
-                if err.contains("no such") || err.contains("already exists") {
+                if err.contains("no such")
+                    || err.contains("already exists")
+                    || err.contains("not exist")
+                {
                     debug!("init operation skipped: {}", err);
                     return Ok(());
                 } else {

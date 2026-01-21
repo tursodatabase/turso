@@ -2,7 +2,7 @@
 use clap::Parser;
 use rand::RngCore;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
-use turso_whopper::{StepResult, Whopper, WhopperOpts};
+use turso_whopper::{StepResult, Whopper, WhopperOpts, properties::*, workloads::*};
 
 #[derive(Parser)]
 #[command(name = "turso_whopper")]
@@ -69,6 +69,9 @@ fn main() -> anyhow::Result<()> {
     progress_index += 1;
 
     while !whopper.is_done() {
+        if whopper.current_step % 1000 == 0 {
+            whopper.restart().unwrap();
+        }
         match whopper.step()? {
             StepResult::Ok => {}
             StepResult::WalSizeLimitExceeded => break,
@@ -104,7 +107,30 @@ fn build_opts(args: &Args, seed: u64) -> anyhow::Result<WhopperOpts> {
         .with_max_connections(args.max_connections)
         .with_keep_files(args.keep)
         .with_enable_mvcc(args.enable_mvcc)
-        .with_enable_encryption(args.enable_encryption))
+        .with_enable_encryption(args.enable_encryption)
+        .with_workloads(vec![
+            // Idle-only workloads
+            (10, Box::new(IntegrityCheckWorkload)),
+            (5, Box::new(WalCheckpointWorkload)),
+            (10, Box::new(CreateSimpleTableWorkload)),
+            (20, Box::new(SimpleSelectWorkload)),
+            (20, Box::new(SimpleInsertWorkload)),
+            // DML workloads (work in both Idle and InTx)
+            // (1, Box::new(SelectWorkload)),
+            // (30, Box::new(InsertWorkload)),
+            // (20, Box::new(UpdateWorkload)),
+            // (10, Box::new(DeleteWorkload)),
+            (2, Box::new(CreateIndexWorkload)),
+            (2, Box::new(DropIndexWorkload)),
+            // InTx-only workloads
+            (30, Box::new(BeginWorkload)),
+            (10, Box::new(CommitWorkload)),
+            (10, Box::new(RollbackWorkload)),
+        ])
+        .with_properties(vec![
+            Box::new(IntegrityCheckProperty),
+            Box::new(SimpleKeysDoNotDisappear::new()),
+        ]))
 }
 
 fn init_logger() {

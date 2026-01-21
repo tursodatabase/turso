@@ -57,6 +57,7 @@ pub enum Operation {
     DropIndex { sql: String, index_name: String },
 }
 
+pub type OpResult = Result<Vec<Vec<Value>>, LimboError>;
 /// Context passed to Operation::start_op and Operation::finish_op.
 pub struct OpContext<'a> {
     pub fiber: &'a mut SimulatorFiber,
@@ -112,19 +113,11 @@ impl Operation {
     /// Applies state changes based on operation type and result.
     pub fn finish_op(&self, ctx: &mut OpContext, result: &OpResult) {
         // Only apply state changes on success
-        if let OpResult::Error { .. } = result {
+        if result.is_err() {
             return;
         }
 
         match self {
-            Operation::Begin { .. } => {
-                ctx.fiber.state = FiberState::InTx;
-                ctx.fiber.txn_id = Some(ctx.sim_state.gen_txn_id());
-            }
-            Operation::Commit | Operation::Rollback => {
-                ctx.fiber.state = FiberState::Idle;
-                ctx.fiber.txn_id = None;
-            }
             Operation::CreateSimpleTable { table_name } => {
                 ctx.sim_state.simple_tables.insert(table_name.clone(), ());
             }
@@ -137,6 +130,19 @@ impl Operation {
                     .entry(table_name)
                     .or_insert_with(|| SamplesContainer::new(MAX_SAMPLE_KEYS_PER_TABLE));
                 container.add(key.clone(), ctx.rng);
+                ctx.stats.inserts += 1;
+            }
+            Operation::Insert { .. } => {
+                ctx.stats.inserts += 1;
+            }
+            Operation::Delete { .. } => {
+                ctx.stats.deletes += 1;
+            }
+            Operation::Update { .. } => {
+                ctx.stats.updates += 1;
+            }
+            Operation::IntegrityCheck { .. } => {
+                ctx.stats.integrity_checks += 1;
             }
             Operation::CreateIndex {
                 index_name,
@@ -153,13 +159,4 @@ impl Operation {
             _ => {}
         }
     }
-}
-
-/// Result of an operation execution
-#[derive(Debug, Clone)]
-pub enum OpResult {
-    /// Operation completed successfully with fetched rows
-    Success { rows: Vec<Vec<Value>> },
-    /// Operation failed with an error
-    Error { error: LimboError },
 }

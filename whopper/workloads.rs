@@ -5,7 +5,10 @@ use rand_chacha::ChaCha8Rng;
 use sql_generation::{
     generation::{Arbitrary, GenerationContext, Opts},
     model::{
-        query::{create_index::CreateIndex, delete::Delete, drop_index::DropIndex, insert::Insert, select::Select, update::Update},
+        query::{
+            create_index::CreateIndex, delete::Delete, drop_index::DropIndex, insert::Insert,
+            select::Select, update::Update,
+        },
         table::Table,
     },
 };
@@ -273,27 +276,4 @@ impl Workload for RollbackWorkload {
         }
         Some(Operation::Rollback)
     }
-}
-
-/// Returns the default workload configuration matching the original probabilities.
-pub fn default_workloads() -> Vec<(u32, Box<dyn Workload>)> {
-    vec![
-        // Idle-only workloads
-        (10, Box::new(IntegrityCheckWorkload)),
-        // (5, Box::new(WalCheckpointWorkload)),
-        (10, Box::new(CreateSimpleTableWorkload)),
-        (20, Box::new(SimpleSelectWorkload)),
-        (20, Box::new(SimpleInsertWorkload)),
-        // DML workloads (work in both Idle and InTx)
-        // (1, Box::new(SelectWorkload)),
-        // (30, Box::new(InsertWorkload)),
-        // (20, Box::new(UpdateWorkload)),
-        // (10, Box::new(DeleteWorkload)),
-        (2, Box::new(CreateIndexWorkload)),
-        (2, Box::new(DropIndexWorkload)),
-        // InTx-only workloads
-        (30, Box::new(BeginWorkload)),
-        (10, Box::new(CommitWorkload)),
-        (10, Box::new(RollbackWorkload)),
-    ]
 }
