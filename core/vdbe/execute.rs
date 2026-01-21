@@ -2072,7 +2072,13 @@ pub fn op_transaction(
     insn: &Insn,
     pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
-    match op_transaction_inner(program, state, insn, pager) {
+    let result = op_transaction_inner(program, state, insn, pager);
+    tracing::debug!(
+        "op_transaction: end: state={:?}, tx_state={:?}",
+        state.op_transaction_state,
+        program.connection.get_tx_state()
+    );
+    match result {
         Ok(result) => Ok(result),
         Err(err) => {
             state.op_transaction_state = OpTransactionState::Start;
@@ -2119,7 +2125,7 @@ pub fn op_transaction_inner(
                     match (current_state, write) {
                         // pending state means that we tried beginning a tx and the method returned IO.
                         // instead of ending the read tx, just update the state to pending.
-                        (TransactionState::PendingUpgrade, write) => {
+                        (TransactionState::PendingUpgrade { .. }, write) => {
                             turso_assert!(
                                 write,
                                 "pending upgrade should only be set for write transactions"
@@ -2224,20 +2230,31 @@ pub fn op_transaction_inner(
                             // We failed to upgrade to write transaction so put the transaction into its original state.
                             // That is, if the transaction had not started, end the read transaction so that next time we
                             // start a new one.
-                            if matches!(current_state, TransactionState::None) {
-                                pager.end_read_tx();
-                                conn.set_tx_state(TransactionState::None);
-                                state.auto_txn_cleanup = TxnCleanup::None;
+                            match current_state {
+                                TransactionState::None
+                                | TransactionState::PendingUpgrade {
+                                    has_read_txn: false,
+                                } => {
+                                    pager.end_read_tx();
+                                    conn.set_tx_state(TransactionState::None);
+                                    state.auto_txn_cleanup = TxnCleanup::None;
+                                }
+                                TransactionState::Read
+                                | TransactionState::PendingUpgrade { has_read_txn: true } => {
+                                    conn.set_tx_state(TransactionState::Read);
+                                }
+                                TransactionState::Write { .. } => {
+                                    panic!("impossible state: {current_state:?}")
+                                }
                             }
-                            assert_eq!(conn.get_tx_state(), current_state);
                             return Err(begin_w_tx_res.unwrap_err());
                         }
                         if let IOResult::IO(io) = begin_w_tx_res? {
                             // set the transaction state to pending so we don't have to
                             // end the read transaction.
-                            program
-                                .connection
-                                .set_tx_state(TransactionState::PendingUpgrade);
+                            conn.set_tx_state(TransactionState::PendingUpgrade {
+                                has_read_txn: matches!(current_state, TransactionState::Read),
+                            });
                             return Ok(InsnFunctionStepResult::IO(io));
                         }
                     }
@@ -8223,7 +8240,7 @@ pub fn op_set_cookie(
                     },
                     TransactionState::Read => unreachable!("invalid transaction state for SetCookie: TransactionState::Read, should be write"),
                     TransactionState::None => unreachable!("invalid transaction state for SetCookie: TransactionState::None, should be write"),
-                    TransactionState::PendingUpgrade => unreachable!("invalid transaction state for SetCookie: TransactionState::PendingUpgrade, should be write"),
+                    TransactionState::PendingUpgrade { .. } => unreachable!("invalid transaction state for SetCookie: TransactionState::PendingUpgrade, should be write"),
                 }
                     program
                         .connection
