@@ -703,14 +703,15 @@ impl Default for SumAggState {
     }
 }
 
+/// Aggregate context for accumulating values during GROUP BY.
+/// Built-in aggregates use a flat payload representation for efficiency and
+/// to share code between register-based and hash-based aggregation (future enhancement).
 #[derive(Debug, Clone, PartialEq)]
 pub enum AggContext {
-    Avg(Value, Value), // acc and count
-    Sum(Value, SumAggState),
-    Count(Value),
-    Max(Option<Value>),
-    Min(Option<Value>),
-    GroupConcat(Value),
+    /// Built-in aggregates store state as a flat Vec<Value> payload.
+    /// The layout depends on the aggregate function (see init_agg_payload).
+    Builtin(Vec<Value>),
+    /// External (extension) aggregates need FFI state that can't be serialized.
     External(ExternalAggState),
 }
 
@@ -721,6 +722,22 @@ impl AggContext {
             Value::from_ffi(final_value)
         } else {
             panic!("AggContext::compute_external() expected External, found {self:?}");
+        }
+    }
+
+    /// Get a mutable reference to the builtin payload
+    pub fn payload_mut(&mut self) -> &mut [Value] {
+        match self {
+            Self::Builtin(payload) => payload,
+            Self::External(_) => panic!("payload_mut() called on External aggregate"),
+        }
+    }
+
+    /// Get an immutable reference to the builtin payload
+    pub fn payload(&self) -> &[Value] {
+        match self {
+            Self::Builtin(payload) => payload,
+            Self::External(_) => panic!("payload() called on External aggregate"),
         }
     }
 }
@@ -741,12 +758,13 @@ impl PartialOrd<Value> for Value {
 impl PartialOrd<AggContext> for AggContext {
     fn partial_cmp(&self, other: &AggContext) -> Option<std::cmp::Ordering> {
         match (self, other) {
-            (Self::Avg(a, _), Self::Avg(b, _)) => a.partial_cmp(b),
-            (Self::Sum(a, _), Self::Sum(b, _)) => a.partial_cmp(b),
-            (Self::Count(a), Self::Count(b)) => a.partial_cmp(b),
-            (Self::Max(a), Self::Max(b)) => a.partial_cmp(b),
-            (Self::Min(a), Self::Min(b)) => a.partial_cmp(b),
-            (Self::GroupConcat(a), Self::GroupConcat(b)) => a.partial_cmp(b),
+            (Self::Builtin(a), Self::Builtin(b)) => {
+                // Compare by first element (the accumulator) if present
+                match (a.first(), b.first()) {
+                    (Some(a), Some(b)) => a.partial_cmp(b),
+                    _ => None,
+                }
+            }
             _ => None,
         }
     }
