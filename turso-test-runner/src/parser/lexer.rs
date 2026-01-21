@@ -60,6 +60,22 @@ pub enum Token {
     #[token("mvcc")]
     Mvcc,
 
+    /// `@requires`
+    #[token("@requires")]
+    AtRequires,
+
+    /// `@requires-file`
+    #[token("@requires-file")]
+    AtRequiresFile,
+
+    /// `trigger` capability keyword
+    #[token("trigger")]
+    Trigger,
+
+    /// `strict` capability keyword
+    #[token("strict")]
+    Strict,
+
     /// `@backend`
     #[token("@backend")]
     AtBackend,
@@ -160,6 +176,10 @@ impl fmt::Display for Token {
             Token::AtSkipFile => write!(f, "@skip-file"),
             Token::AtSkipFileIf => write!(f, "@skip-file-if"),
             Token::Mvcc => write!(f, "mvcc"),
+            Token::AtRequires => write!(f, "@requires"),
+            Token::AtRequiresFile => write!(f, "@requires-file"),
+            Token::Trigger => write!(f, "trigger"),
+            Token::Strict => write!(f, "strict"),
             Token::AtBackend => write!(f, "@backend"),
             Token::AtIdentifier(s) => write!(f, "@{s}"),
             Token::Setup => write!(f, "setup"),
@@ -223,7 +243,7 @@ pub fn tokenize(input: &str) -> Result<Vec<SpannedToken>, LexerError> {
 /// Suggest a fix for an invalid token
 fn suggest_fix(slice: &str) -> Option<String> {
     if slice.starts_with('@') {
-        Some("Valid directives are: @database, @setup, @skip, @skip-if, @backend. Did you mean one of these?".to_string())
+        Some("Valid directives are: @database, @setup, @skip, @skip-if, @skip-file, @skip-file-if, @requires, @requires-file, @backend. Did you mean one of these?".to_string())
     } else if slice.starts_with(':') {
         Some(
             "Database specifiers are :memory:, :temp:, :default:, or :default-no-rowidalias:"

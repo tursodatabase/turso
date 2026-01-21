@@ -2,8 +2,9 @@ pub mod cli;
 pub mod js;
 pub mod rust;
 
-use crate::parser::ast::{Backend, DatabaseConfig, DatabaseLocation};
+use crate::parser::ast::{Backend, Capability, DatabaseConfig, DatabaseLocation};
 use async_trait::async_trait;
+use std::collections::HashSet;
 use std::{path::PathBuf, time::Duration};
 
 /// Provides resolved paths for default databases
@@ -12,6 +13,13 @@ pub trait DefaultDatabaseResolver: Send + Sync {
     /// Returns Some(path) for Default/DefaultNoRowidAlias, None otherwise
     fn resolve(&self, location: &DatabaseLocation) -> Option<PathBuf>;
 }
+
+/// Marker used to separate setup output from query output
+/// This marker is inserted between setup SQL and query SQL, then filtered out
+pub const SETUP_END_MARKER: &str = "__SETUP_END_MARKER_7f3a9b2c__";
+
+/// SQL to output the setup end marker
+pub const SETUP_END_MARKER_SQL: &str = "SELECT '__SETUP_END_MARKER_7f3a9b2c__';";
 
 /// Result from executing SQL
 #[derive(Debug, Clone)]
@@ -40,6 +48,24 @@ impl QueryResult {
     pub fn is_error(&self) -> bool {
         self.error.is_some()
     }
+
+    /// Filter out setup output by removing all rows up to and including the marker row.
+    /// If no marker is found, returns self unchanged (for backward compatibility).
+    pub fn filter_setup_output(mut self) -> Self {
+        if self.is_error() {
+            return self;
+        }
+
+        // Find the marker row (single column containing the marker)
+        if let Some(marker_idx) = self.rows.iter().position(|row| {
+            row.len() == 1 && row[0] == SETUP_END_MARKER
+        }) {
+            // Remove all rows up to and including the marker
+            self.rows = self.rows.split_off(marker_idx + 1);
+        }
+
+        self
+    }
 }
 
 /// Backend trait for executing SQL against a target
@@ -50,6 +76,9 @@ pub trait SqlBackend: Send + Sync {
 
     /// Backend type enum variant
     fn backend_type(&self) -> Backend;
+
+    /// Return the set of capabilities this backend supports
+    fn capabilities(&self) -> HashSet<Capability>;
 
     /// Create a new isolated database instance
     async fn create_database(

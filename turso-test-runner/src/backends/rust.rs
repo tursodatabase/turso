@@ -1,9 +1,10 @@
 use super::{BackendError, DatabaseInstance, QueryResult, SqlBackend};
 use crate::{
     backends::DefaultDatabaseResolver,
-    parser::ast::{Backend, DatabaseConfig, DatabaseLocation},
+    parser::ast::{Backend, Capability, DatabaseConfig, DatabaseLocation},
 };
 use async_trait::async_trait;
+use std::collections::HashSet;
 use std::sync::Arc;
 use tempfile::NamedTempFile;
 use turso::{Builder, Connection, Database, Value};
@@ -51,6 +52,10 @@ impl SqlBackend for RustBackend {
 
     fn backend_type(&self) -> Backend {
         Backend::Rust
+    }
+
+    fn capabilities(&self) -> HashSet<Capability> {
+        Capability::all_set()
     }
 
     async fn create_database(

@@ -1,8 +1,7 @@
-#!/usr/bin/env tclsh
+@database :memory:
+@skip-file-if mvcc "views not supported in MVCC mode"
 
-set testdir [file dirname $argv0]
-source $testdir/tester.tcl
-do_execsql_test_on_specific_db {:memory:} view-basic-filtering {
+test view-basic-filtering {
     CREATE TABLE products(id INTEGER, name TEXT, price INTEGER, category TEXT);
     INSERT INTO products VALUES
         (1, 'Laptop', 1200, 'Electronics'),
@@ -16,12 +15,14 @@ do_execsql_test_on_specific_db {:memory:} view-basic-filtering {
         SELECT id, name, price
         FROM products
         WHERE category = 'Electronics' AND price > 100;
-
     SELECT * FROM expensive_electronics ORDER BY price;
-} {5|Monitor|400
-1|Laptop|1200}
+}
+expect {
+    5|Monitor|400
+    1|Laptop|1200
+}
 
-do_execsql_test_on_specific_db {:memory:} view-aggregation-groupby {
+test view-aggregation-groupby {
     CREATE TABLE sales(product_id INTEGER, quantity INTEGER, day INTEGER);
     INSERT INTO sales VALUES
         (1, 2, 1),
@@ -30,23 +31,25 @@ do_execsql_test_on_specific_db {:memory:} view-aggregation-groupby {
         (3, 1, 2),
         (2, 3, 3),
         (1, 1, 3);
-
     CREATE VIEW daily_sales AS
         SELECT day,
-               COUNT(*) as transactions,
-               SUM(quantity) as total_items
+            COUNT(*) as transactions,
+            SUM(quantity) as total_items
         FROM sales
         GROUP BY day;
 
     SELECT * FROM daily_sales ORDER BY day;
-} {1|2|7
-2|2|2
-3|2|4}
+}
+expect {
+    1|2|7
+    2|2|2
+    3|2|4
+}
 
-do_execsql_test_on_specific_db {:memory:} view-with-join {
+test view-with-join {
     CREATE TABLE employees(id INTEGER, name TEXT, dept_id INTEGER);
     CREATE TABLE departments(id INTEGER, name TEXT, budget INTEGER);
-
+    
     INSERT INTO employees VALUES
         (1, 'Alice', 1),
         (2, 'Bob', 2),
@@ -58,25 +61,27 @@ do_execsql_test_on_specific_db {:memory:} view-with-join {
         (1, 'Engineering', 500000),
         (2, 'Sales', 300000),
         (3, 'HR', 150000);
-
     CREATE VIEW employee_dept AS
         SELECT e.id,
-               e.name as emp_name,
-               d.name as dept_name,
-               d.budget
+            e.name as emp_name,
+            d.name as dept_name,
+            d.budget
         FROM employees e
         JOIN departments d ON e.dept_id = d.id;
 
     SELECT emp_name, dept_name FROM employee_dept WHERE budget > 200000 ORDER BY emp_name;
-} {Alice|Engineering
-Bob|Sales
-Charlie|Engineering
-Eve|Sales}
+}
+expect {
+    Alice|Engineering
+    Bob|Sales
+    Charlie|Engineering
+    Eve|Sales
+}
 
-do_execsql_test_on_specific_db {:memory:} view-composition-with-functions {
+test view-composition-with-functions {
     CREATE TABLE numbers(value INTEGER);
     INSERT INTO numbers VALUES (10), (20), (30), (40), (50);
-
+    
     CREATE VIEW stats AS
         SELECT
             SUM(value) as total,
@@ -84,16 +89,19 @@ do_execsql_test_on_specific_db {:memory:} view-composition-with-functions {
             AVG(value) as average
         FROM numbers
         WHERE value > 15;
-
+    
     SELECT
         total,
         total * 2 as doubled,
         cnt,
         LENGTH(CAST(total AS TEXT)) as total_digits
     FROM stats;
-} {140|280|4|3}
+}
+expect {
+    140|280|4|3
+}
 
-do_execsql_test_on_specific_db {:memory:} view-referencing-view {
+test view-referencing-view {
     CREATE TABLE orders(
         order_id INTEGER,
         customer_id INTEGER,
@@ -108,7 +116,7 @@ do_execsql_test_on_specific_db {:memory:} view-referencing-view {
         (4, 103, 1, 50),
         (5, 102, 2, 25),
         (6, 101, 1, 75);
-
+    
     CREATE VIEW order_totals AS
         SELECT
             order_id,
@@ -123,7 +131,7 @@ do_execsql_test_on_specific_db {:memory:} view-referencing-view {
             SUM(total_amount) as total_spent
         FROM order_totals
         GROUP BY customer_id;
-
+    
     SELECT
         customer_id,
         num_orders,
@@ -131,10 +139,13 @@ do_execsql_test_on_specific_db {:memory:} view-referencing-view {
     FROM customer_summary
     WHERE total_spent > 100
     ORDER BY customer_id;
-} {101|3|250
-102|2|125}
+}
+expect {
+    101|3|250
+    102|2|125
+}
 
-do_execsql_test_on_specific_db {:memory:} view-case-expression {
+test view-case-expression {
     CREATE TABLE transactions(
         id INTEGER,
         account_id INTEGER,
@@ -153,13 +164,13 @@ do_execsql_test_on_specific_db {:memory:} view-case-expression {
         (8, 1003, 'W', 250);
 
     CREATE VIEW account_balance AS
-        SELECT
-            account_id,
-            SUM(CASE WHEN type = 'D' THEN amount ELSE -amount END) as balance,
-            COUNT(CASE WHEN type = 'D' THEN 1 END) as deposits,
-            COUNT(CASE WHEN type = 'W' THEN 1 END) as withdrawals
-        FROM transactions
-        GROUP BY account_id;
+    SELECT
+        account_id,
+        SUM(CASE WHEN type = 'D' THEN amount ELSE -amount END) as balance,
+        COUNT(CASE WHEN type = 'D' THEN 1 END) as deposits,
+        COUNT(CASE WHEN type = 'W' THEN 1 END) as withdrawals
+    FROM transactions
+    GROUP BY account_id;
 
     SELECT
         account_id,
@@ -168,39 +179,47 @@ do_execsql_test_on_specific_db {:memory:} view-case-expression {
     FROM account_balance
     WHERE balance > 500
     ORDER BY account_id;
-} {1001|1100|3
-1002|600|3}
+}
+expect {
+    1001|1100|3
+    1002|600|3
+}
 
-do_execsql_test_on_specific_db {:memory:} view-drop-and-recreate {
+test view-drop-and-recreate {
     CREATE TABLE data(x INTEGER, y INTEGER);
     INSERT INTO data VALUES (1, 10), (2, 20), (3, 30);
-
+    
     CREATE VIEW simple AS SELECT x, y * 2 as doubled FROM data;
     SELECT * FROM simple WHERE x > 1 ORDER BY x;
-} {2|40
-3|60}
+}
+expect {
+    2|40
+    3|60
+}
 
-do_execsql_test_on_specific_db {:memory:} view-recreate-after-drop {
+test view-recreate-after-drop {
     CREATE TABLE data(x INTEGER, y INTEGER);
+    
     INSERT INTO data VALUES (1, 10), (2, 20), (3, 30);
-
     CREATE VIEW simple AS SELECT x, y * 2 as doubled FROM data;
     DROP VIEW simple;
-
+    
     CREATE VIEW simple AS SELECT x + 1 as modified_x, y FROM data WHERE x > 1;
     SELECT * FROM simple ORDER BY modified_x;
-} {3|20
-4|30}
+}
+expect {
+    3|20
+    4|30
+}
 
-
-do_execsql_test_on_specific_db {:memory:} view-arithmetic-expression {
+test view-arithmetic-expression {
     CREATE TABLE nums(a INTEGER, b INTEGER);
     INSERT INTO nums VALUES (10, 5), (20, 8), (30, 12);
-
+    
     CREATE VIEW sums AS
         SELECT SUM(a) as sum_a, SUM(b) as sum_b
         FROM nums;
-
+    
     SELECT
         sum_a,
         sum_b,
@@ -208,9 +227,12 @@ do_execsql_test_on_specific_db {:memory:} view-arithmetic-expression {
         sum_a - sum_b as diff,
         (sum_a * 100) / (sum_a + sum_b) as percentage_a
     FROM sums;
-} {60|25|85|35|70}
+}
+expect {
+    60|25|85|35|70
+}
 
-do_execsql_test_on_specific_db {:memory:} view-with-having {
+test view-with-having {
     CREATE TABLE product_sales(product TEXT, region TEXT, units INTEGER);
     INSERT INTO product_sales VALUES
         ('A', 'North', 100),
@@ -227,17 +249,26 @@ do_execsql_test_on_specific_db {:memory:} view-with-having {
         HAVING SUM(units) > 200;
 
     SELECT * FROM high_volume_products ORDER BY total_units DESC;
-} {C|380
-A|250}
+}
+expect {
+    C|380
+    A|250
+}
 
-do_execsql_test_in_memory_error_content view-self-circle-detection {
+test view-self-circle-detection {
     CREATE VIEW v AS SELECT * FROM v;
     SELECT * FROM v;
-} {view v is circularly defined}
+}
+expect error {
+    view v is circularly defined
+}
 
-
-do_execsql_test_in_memory_error_content view-mutual-circle-detection {
+test view-mutual-circle-detection {
     CREATE VIEW v AS SELECT * FROM vv;
     CREATE VIEW vv AS SELECT * FROM v;
     SELECT * FROM v;
-} {view v is circularly defined}
+}
+expect error {
+    view v is circularly defined
+}
+

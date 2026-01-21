@@ -30,6 +30,7 @@ impl Parser {
         let mut setups = HashMap::new();
         let mut tests = Vec::new();
         let mut global_skip = None;
+        let mut global_requires = Vec::new();
 
         while !self.is_at_end() {
             self.skip_newlines_and_comments();
@@ -49,6 +50,10 @@ impl Parser {
                 Some(Token::AtSkipFileIf) => {
                     global_skip = Some(self.parse_global_skip_if()?);
                 }
+                // Global @requires-file: applies to all tests in the file
+                Some(Token::AtRequiresFile) => {
+                    global_requires.push(self.parse_global_requires()?);
+                }
                 Some(Token::Setup) => {
                     let (name, sql) = self.parse_setup()?;
                     if setups.contains_key(&name) {
@@ -60,6 +65,7 @@ impl Parser {
                     Token::AtSetup
                     | Token::AtSkip
                     | Token::AtSkipIf
+                    | Token::AtRequires
                     | Token::AtBackend
                     | Token::Test,
                 ) => {
@@ -77,6 +83,7 @@ impl Parser {
             setups,
             tests,
             global_skip,
+            global_requires,
         };
 
         self.validate(&test_file)?;
@@ -158,6 +165,13 @@ impl Parser {
         })
     }
 
+    fn parse_global_requires(&mut self) -> Result<ast::Requirement, ParseError> {
+        self.expect_token(Token::AtRequiresFile)?;
+        let capability = self.parse_capability()?;
+        let reason = self.expect_string()?;
+        Ok(ast::Requirement { capability, reason })
+    }
+
     fn parse_setup(&mut self) -> Result<(String, String), ParseError> {
         self.expect_token(Token::Setup)?;
 
@@ -171,6 +185,7 @@ impl Parser {
         let mut test_setups = Vec::new();
         let mut skip = None;
         let mut backend = None;
+        let mut requires = Vec::new();
 
         // Parse decorators
         loop {
@@ -202,6 +217,13 @@ impl Parser {
                         reason,
                         condition: Some(condition),
                     });
+                    self.skip_newlines_and_comments();
+                }
+                Some(Token::AtRequires) => {
+                    self.advance();
+                    let capability = self.parse_capability()?;
+                    let reason = self.expect_string()?;
+                    requires.push(ast::Requirement { capability, reason });
                     self.skip_newlines_and_comments();
                 }
                 Some(Token::AtBackend) => {
@@ -281,6 +303,7 @@ impl Parser {
             setups: test_setups,
             skip,
             backend,
+            requires,
         })
     }
 
@@ -349,6 +372,23 @@ impl Parser {
             }
             Some(token) => Err(self.error(format!("expected skip condition (mvcc), got {token}"))),
             None => Err(self.error("expected skip condition, got EOF".to_string())),
+        }
+    }
+
+    fn parse_capability(&mut self) -> Result<ast::Capability, ParseError> {
+        match self.peek() {
+            Some(Token::Trigger) => {
+                self.advance();
+                Ok(ast::Capability::Trigger)
+            }
+            Some(Token::Strict) => {
+                self.advance();
+                Ok(ast::Capability::Strict)
+            }
+            Some(token) => Err(self.error(format!(
+                "expected capability (trigger, strict), got {token}"
+            ))),
+            None => Err(self.error("expected capability, got EOF".to_string())),
         }
     }
 
@@ -1068,6 +1108,151 @@ expect {
                 reason: "per-test skip".to_string(),
                 condition: None,
             })
+        );
+    }
+
+    #[test]
+    fn test_parse_requires() {
+        let input = r#"
+@database :memory:
+
+@requires trigger "test needs trigger support"
+test trigger-test {
+    CREATE TRIGGER test_trigger AFTER INSERT ON foo BEGIN SELECT 1; END;
+}
+expect {
+    1
+}
+"#;
+
+        let file = parse(input).unwrap();
+        assert_eq!(file.tests[0].requires.len(), 1);
+        assert_eq!(
+            file.tests[0].requires[0].capability,
+            ast::Capability::Trigger
+        );
+        assert_eq!(
+            file.tests[0].requires[0].reason,
+            "test needs trigger support"
+        );
+    }
+
+    #[test]
+    fn test_parse_requires_strict() {
+        let input = r#"
+@database :memory:
+
+@requires strict "test needs strict tables"
+test strict-test {
+    CREATE TABLE foo (id INT) STRICT;
+}
+expect {
+}
+"#;
+
+        let file = parse(input).unwrap();
+        assert_eq!(file.tests[0].requires.len(), 1);
+        assert_eq!(
+            file.tests[0].requires[0].capability,
+            ast::Capability::Strict
+        );
+        assert_eq!(file.tests[0].requires[0].reason, "test needs strict tables");
+    }
+
+    #[test]
+    fn test_parse_requires_file() {
+        let input = r#"
+@database :memory:
+@requires-file trigger "all tests need triggers"
+
+test trigger-test-1 {
+    SELECT 1;
+}
+expect {
+    1
+}
+
+test trigger-test-2 {
+    SELECT 2;
+}
+expect {
+    2
+}
+"#;
+
+        let file = parse(input).unwrap();
+        assert_eq!(file.global_requires.len(), 1);
+        assert_eq!(file.global_requires[0].capability, ast::Capability::Trigger);
+        assert_eq!(file.global_requires[0].reason, "all tests need triggers");
+        // Per-test requires should be empty
+        assert!(file.tests[0].requires.is_empty());
+        assert!(file.tests[1].requires.is_empty());
+    }
+
+    #[test]
+    fn test_parse_multiple_requires() {
+        let input = r#"
+@database :memory:
+
+@requires trigger "needs triggers"
+@requires strict "needs strict tables"
+test multi-require {
+    SELECT 1;
+}
+expect {
+    1
+}
+"#;
+
+        let file = parse(input).unwrap();
+        assert_eq!(file.tests[0].requires.len(), 2);
+        assert!(
+            file.tests[0]
+                .requires
+                .iter()
+                .any(|r| r.capability == ast::Capability::Trigger)
+        );
+        assert!(
+            file.tests[0]
+                .requires
+                .iter()
+                .any(|r| r.capability == ast::Capability::Strict)
+        );
+    }
+
+    #[test]
+    fn test_parse_requires_file_and_per_test() {
+        let input = r#"
+@database :memory:
+@requires-file trigger "file needs triggers"
+
+test basic {
+    SELECT 1;
+}
+expect {
+    1
+}
+
+@requires strict "this test also needs strict"
+test strict-test {
+    SELECT 2;
+}
+expect {
+    2
+}
+"#;
+
+        let file = parse(input).unwrap();
+        // Global requires
+        assert_eq!(file.global_requires.len(), 1);
+        assert_eq!(file.global_requires[0].capability, ast::Capability::Trigger);
+        // First test has no per-test requires
+        assert!(file.tests[0].requires.is_empty());
+        // Second test has per-test requires for strict
+        assert_eq!(file.tests[1].requires.len(), 1);
+        assert_eq!(
+            file.tests[1].requires[0].capability,
+            ast::Capability::Strict
         );
     }
 }

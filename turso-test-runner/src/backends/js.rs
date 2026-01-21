@@ -1,7 +1,8 @@
 use super::{BackendError, DatabaseInstance, QueryResult, SqlBackend, parse_list_output};
 use crate::backends::DefaultDatabaseResolver;
-use crate::parser::ast::{Backend, DatabaseConfig, DatabaseLocation};
+use crate::parser::ast::{Backend, Capability, DatabaseConfig, DatabaseLocation};
 use async_trait::async_trait;
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -64,6 +65,11 @@ impl SqlBackend for JsBackend {
 
     fn backend_type(&self) -> Backend {
         Backend::Js
+    }
+
+    fn capabilities(&self) -> HashSet<Capability> {
+        // JS backend does not support triggers or strict tables
+        HashSet::new()
     }
 
     async fn create_database(
@@ -235,11 +241,16 @@ impl DatabaseInstance for JsDatabaseInstance {
 
     async fn execute(&mut self, sql: &str) -> Result<QueryResult, BackendError> {
         if self.is_memory && !self.setup_buffer.is_empty() {
-            // Combine buffered setup SQL with the query
+            // Combine buffered setup SQL with the query, using a marker to separate them
             let mut combined = self.setup_buffer.join("\n");
             combined.push('\n');
+            // Add marker to identify where setup ends and query begins
+            combined.push_str(super::SETUP_END_MARKER_SQL);
+            combined.push('\n');
             combined.push_str(sql);
-            self.run_sql(&combined).await
+            let result = self.run_sql(&combined).await?;
+            // Filter out setup output (everything before and including the marker)
+            Ok(result.filter_setup_output())
         } else {
             // Execute directly
             self.run_sql(sql).await

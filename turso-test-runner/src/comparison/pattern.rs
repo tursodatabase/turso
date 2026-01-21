@@ -1,12 +1,9 @@
 use super::{ComparisonResult, format_rows};
 use regex::RegexBuilder;
 
-/// Compare error string against a pattern (case-insensitive)
-/// The pattern is escaped to treat it as a literal substring match
+/// Compare error string against a regex pattern (case-insensitive)
 pub fn compare_error(actual: &str, pattern: &str) -> ComparisonResult {
-    // Escape the pattern to treat it as a literal string for substring matching
-    let escaped_pattern = regex::escape(pattern);
-    match RegexBuilder::new(&escaped_pattern)
+    match RegexBuilder::new(pattern)
         .case_insensitive(true)
         .build()
     {

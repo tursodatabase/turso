@@ -11,16 +11,12 @@ set testdir [file dirname $argv0]
 
 # works
 source $testdir/like.test
-source $testdir/orderby.test
 source $testdir/groupby.test
-source $testdir/subquery.test
 source $testdir/where.test
-source $testdir/create_table.test
 source $testdir/select.test
 source $testdir/join.test
 source $testdir/insert.test
 source $testdir/glob.test
-source $testdir/autoincr.test
 source $testdir/json.test
 source $testdir/math.test
 source $testdir/scalar-functions.test
@@ -28,8 +24,6 @@ source $testdir/scalar-functions-datetime.test
 source $testdir/compare.test
 
 source $testdir/scalar-functions-printf.test
-source $testdir/values.test
 source $testdir/integrity_check.test
 source $testdir/vtab.test
-source $testdir/upsert.test
 source $testdir/returning.test
