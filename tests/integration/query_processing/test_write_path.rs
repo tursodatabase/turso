@@ -1392,3 +1392,50 @@ pub fn test_busy_snapshot_txn_upgrade() {
     assert!(matches!(result, Err(LimboError::BusySnapshot)));
     drop(stmt1);
 }
+
+#[test]
+/// Test for a bug found by whopper
+/// It is slightly fragile and can be removed if it will be unclear how to maintain it
+///
+/// Here, we check that page cache will not be reused for last checkpoint because it is stale (insert happened since last statement over connection)
+/// The tricky part is that auto-checkpoint happens in between which can result in reuse of a page if checkpoint epoch do not properly incremented during auto-checkpoint
+pub fn test_auto_checkpoint_restart() {
+    let _ = env_logger::try_init();
+    let db_path = tempfile::NamedTempFile::new().unwrap();
+    let (_file, db_path) = db_path.keep().unwrap();
+    tracing::info!("path: {:?}", db_path);
+    let tmp_db = TempDatabase::builder().with_db_path(&db_path).build();
+    let conn1 = tmp_db.connect_limbo();
+    let conn2 = tmp_db.connect_limbo();
+
+    tracing::info!("conn: 1: create_new_table_1");
+    conn1.execute("CREATE TABLE t1(x)").unwrap();
+
+    tracing::info!("conn: 1: insert");
+    conn1.execute("INSERT INTO t1 VALUES (1)").unwrap();
+
+    tracing::info!("conn: 2: select_sqlite_master");
+    let mut stmt = conn2.prepare("SELECT * FROM sqlite_master").unwrap();
+    loop {
+        match stmt.step() {
+            Ok(StepResult::Row) => break,
+            _ => continue,
+        }
+    }
+
+    tracing::info!("conn: 1: checkpoint");
+    conn1.execute("PRAGMA wal_checkpoint(RESTART)").unwrap();
+
+    loop {
+        match stmt.step() {
+            Ok(StepResult::Done) => break,
+            _ => continue,
+        }
+    }
+
+    tracing::info!("conn: 1: insert");
+    conn1.execute("CREATE TABLE t2(x)").unwrap();
+
+    tracing::info!("conn: 2: checkpoint");
+    conn2.execute("PRAGMA wal_checkpoint(RESTART)").unwrap();
+}
