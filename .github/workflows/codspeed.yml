@@ -38,6 +38,27 @@ jobs:
     timeout-minutes: 60
     # Allow this job to fail without failing the entire CI run
     continue-on-error: true
+    strategy:
+      matrix:
+        include:
+          - bench: benchmark
+            package: core
+            features: codspeed
+          - bench: mvcc_benchmark
+            package: core
+            features: codspeed
+          - bench: json_benchmark
+            package: core
+            features: codspeed
+          - bench: hash_spill_benchmark
+            package: core
+            features: codspeed,bench
+          - bench: sql_functions
+            package: core
+            features: codspeed,bench
+          - bench: parser_benchmark
+            package: parser
+            features: codspeed
     steps:
       - uses: actions/checkout@v4
 
@@ -49,7 +70,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          prefix-key: "v1-rust-codspeed"
+          prefix-key: "v1-rust-codspeed-${{ matrix.bench }}"
           cache-on-failure: true
 
       - name: Setup sccache
@@ -60,13 +81,13 @@ jobs:
         with:
           tool: cargo-codspeed
 
-      - name: Build benchmarks (excluding TPC-H)
+      - name: Build benchmark (${{ matrix.bench }})
         env:
           SCCACHE_GHA_ENABLED: "true"
           RUSTC_WRAPPER: "sccache"
-        run: make codspeed-build-bench-exclude-tpc-h
+        run: cargo codspeed build -p turso_${{ matrix.package }} --bench ${{ matrix.bench }} --features ${{ matrix.features }}
 
-      - name: Run benchmarks (excluding TPC-H)
+      - name: Run benchmark (${{ matrix.bench }})
         uses: CodSpeedHQ/action@v4.7.0
         with:
           mode: walltime
