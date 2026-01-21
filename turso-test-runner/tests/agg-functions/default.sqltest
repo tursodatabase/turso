@@ -91,6 +91,13 @@ expect {
     0
 }
 
+test select-count-in-condition {
+    SELECT count(*) FROM users WHERE state IN ('X', 'Y');
+}
+expect {
+    0
+}
+
 test select-max {
     SELECT max(age) FROM users;
 }
