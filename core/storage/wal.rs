@@ -1558,7 +1558,11 @@ impl Wal for WalFile {
         mode: CheckpointMode,
     ) -> Result<IOResult<CheckpointResult>> {
         self.checkpoint_inner(pager, mode).inspect_err(|e| {
-            tracing::error!("Wal Checkpoint failed: {e}");
+            if let LimboError::Busy | LimboError::BusySnapshot = e {
+                tracing::debug!("Wal Checkpoint failed: {e}");
+            } else {
+                tracing::error!("Wal Checkpoint failed: {e}");
+            }
             let _ = self.checkpoint_guard.write().take();
             self.ongoing_checkpoint.write().state = CheckpointState::Start;
         })
