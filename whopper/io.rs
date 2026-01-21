@@ -87,6 +87,7 @@ impl Clock for SimulatorIO {
 }
 
 impl IO for SimulatorIO {
+    fn sleep(&self, _duration: std::time::Duration) {}
     fn open_file(&self, path: &str, _flags: OpenFlags, _create_new: bool) -> Result<Arc<dyn File>> {
         {
             let mut files = self.files.lock().unwrap();
