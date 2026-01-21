@@ -1,2 +1,0 @@
-import './queries';
-import './sync';
