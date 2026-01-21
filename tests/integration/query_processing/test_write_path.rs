@@ -1388,7 +1388,7 @@ pub fn test_busy_snapshot_txn_upgrade() {
 
     // stmt1 WAL view is stale - so it is return Busy error
     let result = stmt1.step();
-    println!("result: {:?}", result);
+    println!("result: {result:?}");
     assert!(matches!(result, Err(LimboError::BusySnapshot)));
     drop(stmt1);
 }
