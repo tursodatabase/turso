@@ -29,7 +29,7 @@
     "vitest": "^3.2.4"
   },
   "scripts": {
-    "napi-build": "napi build --platform --release --esm --manifest-path ../../Cargo.toml --output-dir .",
+    "napi-build": "napi build --platform --profile release-official --esm --manifest-path ../../Cargo.toml --output-dir .",
     "napi-dirs": "napi create-npm-dirs",
     "napi-artifacts": "napi artifacts --output-dir .",
     "tsc-build": "npm exec tsc",
