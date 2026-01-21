@@ -7,14 +7,30 @@ import 'package:turso_dart/src/statement.dart';
 
 import 'rust/api/connect.dart' as c;
 
+// Re-export encryption types for public API
+export 'rust/api/connect.dart' show EncryptionCipher, EncryptionOpts;
+
 class TursoClient {
-  TursoClient(this.url);
+  TursoClient(this.url, {this.encryption});
 
-  TursoClient.memory() : url = ':memory:';
+  TursoClient.memory() : url = ':memory:', encryption = null;
 
-  TursoClient.local(this.url);
+  TursoClient.local(this.url, {this.encryption});
+
+  /// Create an encrypted local database client
+  ///
+  /// # Args
+  /// * `url` - Path to the database file
+  /// * `cipher` - Encryption cipher to use
+  /// * `hexkey` - Hex-encoded encryption key
+  TursoClient.encrypted(
+    this.url, {
+    required c.EncryptionCipher cipher,
+    required String hexkey,
+  }) : encryption = c.EncryptionOpts(cipher: cipher, hexkey: hexkey);
 
   final String url;
+  final c.EncryptionOpts? encryption;
 
   RustConnection? _connection;
 
@@ -23,7 +39,9 @@ class TursoClient {
     if (!RustLib.instance.initialized) {
       await RustLib.init();
     }
-    _connection = await c.connect(args: c.ConnectArgs(url: url));
+    _connection = await c.connect(
+      args: c.ConnectArgs(url: url, encryption: encryption),
+    );
   }
 
   /// Query the database, you can provide either named or positional parameters
