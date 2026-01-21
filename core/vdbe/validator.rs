@@ -702,7 +702,13 @@ fn get_successors(insn: &Insn, pc: usize) -> Vec<usize> {
         // Coroutine operations
         Insn::InitCoroutine {
             jump_on_definition, ..
-        } => branch(pc, jump_on_definition),
+        } => {
+            if offset_to_usize(jump_on_definition) == Some(0) {
+                vec![pc + 1]
+            } else {
+                branch(pc, jump_on_definition)
+            }
+        }
 
         Insn::Yield { end_offset, .. } => branch(pc, end_offset),
 
@@ -887,12 +893,136 @@ pub fn validate_register_initialization(
     }
 }
 
+/// Check if an instruction makes "progress" in a loop.
+/// Progress means the instruction advances iteration state, ensuring eventual termination.
+fn is_progress_instruction(insn: &Insn) -> bool {
+    matches!(
+        insn,
+        // Cursor advancement
+        Insn::Next { .. }
+            | Insn::Prev { .. }
+            | Insn::SorterNext { .. }
+            | Insn::VNext { .. }
+            // Counter-based termination
+            | Insn::DecrJumpZero { .. }
+            // These terminate execution
+            | Insn::Halt { .. }
+            | Insn::Return { .. }
+            // RowSet iteration
+            | Insn::RowSetRead { .. }
+            // Hash iteration
+            | Insn::HashNext { .. }
+            // yield consumes underlying coroutine
+            | Insn::Yield { .. }
+    )
+}
+
+/// Error indicating a potential infinite loop.
+#[derive(Debug, Clone)]
+pub struct InfiniteLoopError {
+    /// The back edge that creates the loop (from_pc -> to_pc where to_pc < from_pc).
+    pub back_edge_from: usize,
+    pub back_edge_to: usize,
+}
+
+impl std::fmt::Display for InfiniteLoopError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Potential infinite loop: back edge from pc={} to pc={} has path without progress",
+            self.back_edge_from, self.back_edge_to
+        )
+    }
+}
+
+/// Validates that all loops in the bytecode make progress.
+///
+/// A loop makes progress if every path through it contains at least one
+/// "progress" instruction (cursor advancement, counter decrement, etc.).
+/// Loops without progress will run forever.
+pub fn validate_no_infinite_loops(insns: &[(Insn, usize)]) -> Result<(), Vec<InfiniteLoopError>> {
+    if insns.is_empty() {
+        return Ok(());
+    }
+
+    let num_insns = insns.len();
+    let mut errors = Vec::new();
+
+    // Find all back edges (edges where target <= source)
+    // These indicate loops in the control flow
+    let mut back_edges: Vec<(usize, usize)> = Vec::new();
+
+    for (pc, (insn, _)) in insns.iter().enumerate() {
+        for target in get_successors(insn, pc) {
+            if target < num_insns && target <= pc {
+                back_edges.push((pc, target));
+            }
+        }
+    }
+
+    // For each back edge, check if there's a path from target back to source
+    // that doesn't contain any progress instruction
+    for (back_from, back_to) in back_edges {
+        // DFS from back_to to back_from, tracking whether we've seen progress
+        // We want to find if there EXISTS a path without progress (which is bad)
+
+        // visited[pc] = true if we can reach pc from back_to without progress
+        let mut can_reach_without_progress: HashSet<usize> = HashSet::new();
+        let mut worklist: VecDeque<usize> = VecDeque::new();
+
+        // Start from the back edge target
+        worklist.push_back(back_to);
+        can_reach_without_progress.insert(back_to);
+
+        while let Some(pc) = worklist.pop_front() {
+            if pc > back_from {
+                // Don't explore beyond the back edge source
+                continue;
+            }
+
+            let (insn, _) = &insns[pc];
+
+            // If this instruction makes progress, don't propagate "without progress" state
+            if is_progress_instruction(insn) {
+                continue;
+            }
+
+            // Propagate to successors
+            for target in get_successors(insn, pc) {
+                if target < num_insns && !can_reach_without_progress.contains(&target) {
+                    can_reach_without_progress.insert(target);
+                    worklist.push_back(target);
+                }
+            }
+        }
+
+        // If we can reach the back edge source without progress, AND the back edge source
+        // itself is not a progress instruction, it's an infinite loop.
+        // (If back_from is a progress instruction like Next, the loop makes progress)
+        if can_reach_without_progress.contains(&back_from)
+            && !is_progress_instruction(&insns[back_from].0)
+        {
+            errors.push(InfiniteLoopError {
+                back_edge_from: back_from,
+                back_edge_to: back_to,
+            });
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
 /// Debug assertion that validates register initialization.
 /// Only performs validation in debug builds.
 /// Panics with a detailed error message if validation fails.
 #[cfg(debug_assertions)]
 pub fn debug_assert_valid_program(insns: &[(Insn, usize)], sql: &str) {
-    if sql.contains("LIMIT") {
+    // Check for uninitialized registers
+    if !sql.contains("LIMIT") {
         if let Err(errors) = validate_register_initialization(insns) {
             let mut msg = format!(
                 "Bytecode validation failed for SQL: {}\n\nUninitialized register errors:\n",
@@ -901,15 +1031,28 @@ pub fn debug_assert_valid_program(insns: &[(Insn, usize)], sql: &str) {
             for err in &errors {
                 msg.push_str(&format!("  - {}\n", err));
             }
-
-            // Also print the bytecode for debugging
             msg.push_str("\nBytecode:\n");
             for (i, (insn, _)) in insns.iter().enumerate() {
                 msg.push_str(&format!("  {:4}: {:?}\n", i, insn));
             }
-
             panic!("{}", msg);
         }
+    }
+
+    // Check for infinite loops
+    if let Err(errors) = validate_no_infinite_loops(insns) {
+        let mut msg = format!(
+            "Bytecode validation failed for SQL: {}\n\nInfinite loop errors:\n",
+            sql
+        );
+        for err in &errors {
+            msg.push_str(&format!("  - {}\n", err));
+        }
+        msg.push_str("\nBytecode:\n");
+        for (i, (insn, _)) in insns.iter().enumerate() {
+            msg.push_str(&format!("  {:4}: {:?}\n", i, insn));
+        }
+        panic!("{}", msg);
     }
 }
 
@@ -1210,5 +1353,199 @@ mod tests {
 
         // Move writes to both source (as NULL) and dest, so this should be valid
         assert!(validate_register_initialization(&insns).is_ok());
+    }
+
+    // Infinite loop detection tests
+
+    #[test]
+    fn test_valid_cursor_loop() {
+        // A proper cursor loop with Next advancing the cursor
+        // 0: Rewind -> if empty, jump to 4
+        // 1: Column (loop body)
+        // 2: ResultRow
+        // 3: Next -> if has more, jump to 1
+        // 4: Halt
+        let insns = vec![
+            (
+                Insn::Rewind {
+                    cursor_id: 0,
+                    pc_if_empty: BranchOffset::Offset(4),
+                },
+                0,
+            ),
+            (
+                Insn::Column {
+                    cursor_id: 0,
+                    column: 0,
+                    dest: 0,
+                    default: None,
+                },
+                1,
+            ),
+            (
+                Insn::ResultRow {
+                    start_reg: 0,
+                    count: 1,
+                },
+                2,
+            ),
+            (
+                Insn::Next {
+                    cursor_id: 0,
+                    pc_if_next: BranchOffset::Offset(1),
+                },
+                3,
+            ),
+            (
+                Insn::Halt {
+                    err_code: 0,
+                    description: String::new(),
+                },
+                4,
+            ),
+        ];
+
+        assert!(validate_no_infinite_loops(&insns).is_ok());
+    }
+
+    #[test]
+    fn test_infinite_loop_no_progress() {
+        // A loop that never makes progress
+        // 0: Integer 1 -> r0
+        // 1: Add r0, r0 -> r0
+        // 2: Goto 1  (infinite loop!)
+        let insns = vec![
+            (Insn::Integer { value: 1, dest: 0 }, 0),
+            (
+                Insn::Add {
+                    lhs: 0,
+                    rhs: 0,
+                    dest: 0,
+                },
+                1,
+            ),
+            (
+                Insn::Goto {
+                    target_pc: BranchOffset::Offset(1),
+                },
+                2,
+            ),
+        ];
+
+        let result = validate_no_infinite_loops(&insns);
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].back_edge_from, 2);
+        assert_eq!(errors[0].back_edge_to, 1);
+    }
+
+    #[test]
+    fn test_valid_counter_loop() {
+        // A loop with DecrJumpZero providing termination
+        // 0: Integer 10 -> r0
+        // 1: ... loop body ...
+        // 2: DecrJumpZero r0 -> jump to 1 if not zero
+        // 3: Halt
+        let insns = vec![
+            (Insn::Integer { value: 10, dest: 0 }, 0),
+            (Insn::Noop, 1),
+            (
+                Insn::DecrJumpZero {
+                    reg: 0,
+                    target_pc: BranchOffset::Offset(1),
+                },
+                2,
+            ),
+            (
+                Insn::Halt {
+                    err_code: 0,
+                    description: String::new(),
+                },
+                3,
+            ),
+        ];
+
+        assert!(validate_no_infinite_loops(&insns).is_ok());
+    }
+
+    #[test]
+    fn test_infinite_loop_bypassing_next() {
+        // Simulates the buggy IN query pattern:
+        // A conditional jump that bypasses Next and goes back to before Rewind
+        // 0: Null r2
+        // 1: Rewind -> if empty, jump to 6
+        // 2: Column
+        // 3: Eq -> if match, jump to 7 (bypasses Next!)
+        // 4: ... more comparisons ...
+        // 5: Next -> if has more, jump to 2
+        // 6: Halt
+        // 7: Integer (some init code)
+        // 8: Goto 0 (goes back before Rewind - infinite loop!)
+        let insns = vec![
+            (
+                Insn::Null {
+                    dest: 2,
+                    dest_end: None,
+                },
+                0,
+            ),
+            (
+                Insn::Rewind {
+                    cursor_id: 0,
+                    pc_if_empty: BranchOffset::Offset(6),
+                },
+                1,
+            ),
+            (
+                Insn::Column {
+                    cursor_id: 0,
+                    column: 0,
+                    dest: 3,
+                    default: None,
+                },
+                2,
+            ),
+            (
+                Insn::Eq {
+                    lhs: 3,
+                    rhs: 4,
+                    target_pc: BranchOffset::Offset(7),
+                    flags: super::super::insn::CmpInsFlags::default(),
+                    collation: None,
+                },
+                3,
+            ),
+            (Insn::Noop, 4), // placeholder for more comparisons
+            (
+                Insn::Next {
+                    cursor_id: 0,
+                    pc_if_next: BranchOffset::Offset(2),
+                },
+                5,
+            ),
+            (
+                Insn::Halt {
+                    err_code: 0,
+                    description: String::new(),
+                },
+                6,
+            ),
+            (Insn::Integer { value: 1, dest: 6 }, 7),
+            (
+                Insn::Goto {
+                    target_pc: BranchOffset::Offset(0),
+                },
+                8,
+            ),
+        ];
+
+        let result = validate_no_infinite_loops(&insns);
+        assert!(result.is_err());
+        // The back edge 8 -> 0 creates a loop without progress
+        let errors = result.unwrap_err();
+        assert!(errors
+            .iter()
+            .any(|e| e.back_edge_from == 8 && e.back_edge_to == 0));
     }
 }
