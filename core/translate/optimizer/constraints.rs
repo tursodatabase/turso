@@ -227,7 +227,10 @@ fn estimate_selectivity(
                             // Only use stats if column is first in index (idx_col_pos == 0)
                             // because that's when the distinct count is most useful
                             if idx_col_pos == 0 {
-                                if index.unique {
+                                // Only use unique selectivity for single-column unique indexes.
+                                // For composite unique indexes like tpc-h (l_orderkey, l_linenumber),
+                                // the first column alone is NOT unique.
+                                if index.unique && index.columns.len() == 1 {
                                     return selectivity_when_unique;
                                 }
                                 if let Some(stats) = table_stats {
