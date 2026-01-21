@@ -2969,13 +2969,8 @@ pub fn op_deferred_seek(
 #[derive(Debug)]
 pub enum OpSeekKey {
     TableRowId(i64),
-    IndexKeyOwned(ImmutableRecord),
     IndexKeyFromRegister(usize),
-    IndexKeyUnpacked {
-        cursor_id: usize,
-        start_reg: usize,
-        num_regs: usize,
-    },
+    IndexKeyUnpacked { start_reg: usize, num_regs: usize },
 }
 
 #[derive(Debug)]
@@ -3127,7 +3122,6 @@ pub fn seek_internal(
                             } => {
                                 state.seek_state = OpSeekState::Seek {
                                     key: OpSeekKey::IndexKeyUnpacked {
-                                        cursor_id,
                                         start_reg,
                                         num_regs,
                                     },
@@ -3240,13 +3234,6 @@ pub fn seek_internal(
                                 IOResult::IO(io) => return Ok(SeekInternalResult::IO(io)),
                             }
                         }
-                        OpSeekKey::IndexKeyOwned(record) => {
-                            let cursor = get_cursor!(state, cursor_id).as_btree_mut();
-                            match cursor.seek(SeekKey::IndexKey(record), *op)? {
-                                IOResult::Done(seek_result) => seek_result,
-                                IOResult::IO(io) => return Ok(SeekInternalResult::IO(io)),
-                            }
-                        }
                         OpSeekKey::IndexKeyFromRegister(record_reg) => {
                             let (cursor, record) = {
                                 let (cursors, registers) = (&mut state.cursors, &state.registers);
@@ -3267,7 +3254,6 @@ pub fn seek_internal(
                             }
                         }
                         OpSeekKey::IndexKeyUnpacked {
-                            cursor_id: _,
                             start_reg,
                             num_regs,
                         } => {
