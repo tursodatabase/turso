@@ -1306,20 +1306,20 @@ impl Program {
         } else {
             let connection = self.connection.clone();
             let auto_commit = connection.auto_commit.load(Ordering::SeqCst);
+            let tx_state = connection.get_tx_state();
             tracing::debug!(
-                "Halt auto_commit {}, state={:?}",
+                "Halt auto_commit {}, commit_state={:?}, tx_state={:?}",
                 auto_commit,
-                program_state.commit_state
+                program_state.commit_state,
+                tx_state,
             );
             if matches!(program_state.commit_state, CommitState::Committing) {
-                let TransactionState::Write { .. } = connection.get_tx_state() else {
+                let TransactionState::Write { .. } = tx_state else {
                     unreachable!("invalid state for write commit step")
                 };
                 self.step_end_write_txn(&pager, &connection, program_state, rollback)
             } else if auto_commit {
-                let current_state = connection.get_tx_state();
-                tracing::trace!("Auto-commit state: {:?}", current_state);
-                match current_state {
+                match tx_state {
                     TransactionState::Write { .. } => {
                         self.step_end_write_txn(&pager, &connection, program_state, rollback)
                     }
@@ -1329,8 +1329,8 @@ impl Program {
                         Ok(IOResult::Done(()))
                     }
                     TransactionState::None => Ok(IOResult::Done(())),
-                    TransactionState::PendingUpgrade => {
-                        panic!("Unexpected transaction state: {current_state:?} during auto-commit",)
+                    TransactionState::PendingUpgrade { .. } => {
+                        panic!("Unexpected transaction state: {tx_state:?} during auto-commit",)
                     }
                 }
             } else {

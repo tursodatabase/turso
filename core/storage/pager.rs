@@ -4248,11 +4248,7 @@ impl Pager {
         let header_ref = return_if_io!(HeaderRef::from_pager(self));
         let header = header_ref.borrow();
         // Update cached schema cookie when reading header
-        tracing::debug!(
-            "with_header: cookie={}, trace={:?}",
-            header.schema_cookie.get(),
-            std::backtrace::Backtrace::capture()
-        );
+        tracing::debug!("with_header: cookie={}", header.schema_cookie.get());
         self.set_schema_cookie(Some(header.schema_cookie.get()));
         Ok(IOResult::Done(f(header)))
     }
@@ -4262,11 +4258,7 @@ impl Pager {
         let header = header_ref.borrow_mut();
         let result = f(header);
         // Update cached schema cookie after modification
-        tracing::debug!(
-            "with_header_mut: cookie={}, trace={:?}",
-            header.schema_cookie.get(),
-            std::backtrace::Backtrace::capture()
-        );
+        tracing::debug!("with_header_mut: cookie={}", header.schema_cookie.get());
         self.set_schema_cookie(Some(header.schema_cookie.get()));
         Ok(IOResult::Done(result))
     }
