@@ -588,6 +588,107 @@ pub enum IterationDirection {
     Backwards,
 }
 
+/// Rewrites column name references in a generated column expression to use the actual
+/// table internal_id and column indices for the current query context.
+pub fn bind_generated_expr_to_table(expr: &ast::Expr, table: &JoinedTable) -> ast::Expr {
+    use crate::util::normalize_ident;
+
+    match expr {
+        ast::Expr::Id(name) | ast::Expr::Name(name) => {
+            let normalized = normalize_ident(name.as_str());
+            // Find the column in the table
+            if let Some((idx, col)) = table.columns().iter().enumerate().find(|(_, col)| {
+                col.name.as_ref().map(|n| normalize_ident(n)) == Some(normalized.clone())
+            }) {
+                ast::Expr::Column {
+                    database: None,
+                    table: table.internal_id,
+                    column: idx,
+                    is_rowid_alias: col.is_rowid_alias(),
+                }
+            } else {
+                // Column not found - leave as-is, will error during translation
+                expr.clone()
+            }
+        }
+        ast::Expr::Qualified(tbl, col) => {
+            // For qualified references like table.column, check if the table matches
+            let table_matches = normalize_ident(tbl.as_str()) == normalize_ident(&table.identifier);
+            if table_matches {
+                let col_normalized = normalize_ident(col.as_str());
+                if let Some((idx, column)) = table.columns().iter().enumerate().find(|(_, c)| {
+                    c.name.as_ref().map(|n| normalize_ident(n)) == Some(col_normalized.clone())
+                }) {
+                    ast::Expr::Column {
+                        database: None,
+                        table: table.internal_id,
+                        column: idx,
+                        is_rowid_alias: column.is_rowid_alias(),
+                    }
+                } else {
+                    expr.clone()
+                }
+            } else {
+                expr.clone()
+            }
+        }
+        // For other expression types, recursively rewrite their sub-expressions
+        ast::Expr::Binary(left, op, right) => ast::Expr::Binary(
+            Box::new(bind_generated_expr_to_table(left, table)),
+            *op,
+            Box::new(bind_generated_expr_to_table(right, table)),
+        ),
+        ast::Expr::Unary(op, operand) => {
+            ast::Expr::Unary(*op, Box::new(bind_generated_expr_to_table(operand, table)))
+        }
+        ast::Expr::Parenthesized(exprs) => ast::Expr::Parenthesized(
+            exprs
+                .iter()
+                .map(|e| Box::new(bind_generated_expr_to_table(e, table)))
+                .collect(),
+        ),
+        ast::Expr::FunctionCall {
+            name,
+            distinctness,
+            args,
+            filter_over,
+            order_by,
+        } => ast::Expr::FunctionCall {
+            name: name.clone(),
+            distinctness: *distinctness,
+            args: args
+                .iter()
+                .map(|e| Box::new(bind_generated_expr_to_table(e, table)))
+                .collect(),
+            filter_over: filter_over.clone(),
+            order_by: order_by.clone(),
+        },
+        ast::Expr::Case {
+            base,
+            when_then_pairs,
+            else_expr,
+        } => ast::Expr::Case {
+            base: base
+                .as_ref()
+                .map(|b| Box::new(bind_generated_expr_to_table(b, table))),
+            when_then_pairs: when_then_pairs
+                .iter()
+                .map(|(w, t)| {
+                    (
+                        Box::new(bind_generated_expr_to_table(w, table)),
+                        Box::new(bind_generated_expr_to_table(t, table)),
+                    )
+                })
+                .collect(),
+            else_expr: else_expr
+                .as_ref()
+                .map(|e| Box::new(bind_generated_expr_to_table(e, table))),
+        },
+        // For literal values and other expressions that don't contain column references, return as-is
+        _ => expr.clone(),
+    }
+}
+
 pub fn select_star(tables: &[JoinedTable], out_columns: &mut Vec<ResultSetColumn>) {
     for table in tables.iter() {
         out_columns.extend(
@@ -609,15 +710,28 @@ pub fn select_star(tables: &[JoinedTable], out_columns: &mut Vec<ResultSetColumn
                         true
                     }
                 })
-                .map(|(i, col)| ResultSetColumn {
-                    alias: None,
-                    expr: ast::Expr::Column {
-                        database: None,
-                        table: table.internal_id,
-                        column: i,
-                        is_rowid_alias: col.is_rowid_alias(),
-                    },
-                    contains_aggregates: false,
+                .map(|(i, col)| {
+                    let expr = if col.is_generated() && !col.is_generated_stored() {
+                        // For VIRTUAL generated columns, bind and use the generated expression
+                        let generated_expr = col
+                            .generated
+                            .as_ref()
+                            .expect("Generated column must have expression");
+                        bind_generated_expr_to_table(generated_expr, table)
+                    } else {
+                        // For regular columns and STORED generated columns, use column reference
+                        ast::Expr::Column {
+                            database: None,
+                            table: table.internal_id,
+                            column: i,
+                            is_rowid_alias: col.is_rowid_alias(),
+                        }
+                    };
+                    ResultSetColumn {
+                        alias: None,
+                        expr,
+                        contains_aggregates: false,
+                    }
                 }),
         );
     }

@@ -3400,6 +3400,38 @@ fn emit_update_insns<'a>(
             program.preassign_label_to_next_insn(record_label);
         }
 
+        // Compute generated column values for STORED columns
+        // This must happen after all SET clauses are evaluated and after affinity is applied,
+        // but before MakeRecord packages the row data
+        if let Some(btree_table) = target_table.table.btree() {
+            for (i, column) in btree_table.columns.iter().enumerate() {
+                if !column.is_generated_stored() {
+                    continue;
+                }
+
+                let generated_expr = column
+                    .generated
+                    .as_ref()
+                    .expect("Generated column must have expression");
+
+                let col_register = start + i;
+
+                // Rewrite the expression to use the registers with NEW values
+                let mut expr_for_eval = generated_expr.as_ref().clone();
+                rewrite_update_expr_for_generated(&mut expr_for_eval, &btree_table, start)?;
+
+                // Evaluate the generated expression into the column register
+                translate_expr_no_constant_opt(
+                    program,
+                    Some(&TableReferences::new_empty()),
+                    &expr_for_eval,
+                    col_register,
+                    &t_ctx.resolver,
+                    NoConstantOptReason::RegisterReuse,
+                )?;
+            }
+        }
+
         let record_reg = program.alloc_register();
 
         let affinity_str = target_table
@@ -4104,5 +4136,57 @@ fn emit_index_column_value_new_image(
             extra_amount: 0,
         });
     }
+    Ok(())
+}
+
+/// Rewrite column references in a generated column expression to use registers
+/// containing the NEW values during UPDATE.
+fn rewrite_update_expr_for_generated(
+    expr: &mut ast::Expr,
+    table: &crate::schema::BTreeTable,
+    registers_start: usize,
+) -> Result<()> {
+    use crate::translate::expr::walk_expr_mut;
+    use crate::util::normalize_ident;
+
+    let mut missing_column = None;
+    walk_expr_mut(expr, &mut |e: &mut ast::Expr| -> Result<WalkControl> {
+        match e {
+            ast::Expr::Id(name) | ast::Expr::Name(name) => {
+                let normalized = normalize_ident(name.as_str());
+                if let Some((idx, _)) = table.columns.iter().enumerate().find(|(_, col)| {
+                    col.name.as_ref().map(|n| normalize_ident(n)) == Some(normalized.clone())
+                }) {
+                    *e = ast::Expr::Register(registers_start + idx);
+                } else {
+                    missing_column = Some(normalized);
+                }
+            }
+            ast::Expr::Qualified(_, col) | ast::Expr::DoublyQualified(_, _, col) => {
+                let normalized = normalize_ident(col.as_str());
+                if let Some((idx, _)) = table.columns.iter().enumerate().find(|(_, col)| {
+                    col.name.as_ref().map(|n| normalize_ident(n)) == Some(normalized.clone())
+                }) {
+                    *e = ast::Expr::Register(registers_start + idx);
+                } else {
+                    missing_column = Some(normalized);
+                }
+            }
+            _ => {}
+        }
+        Ok(if missing_column.is_some() {
+            WalkControl::SkipChildren
+        } else {
+            WalkControl::Continue
+        })
+    })?;
+
+    if let Some(col) = missing_column {
+        return Err(crate::LimboError::ParseError(format!(
+            "column '{}' not found in table",
+            col
+        )));
+    }
+
     Ok(())
 }

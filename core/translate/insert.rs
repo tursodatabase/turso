@@ -547,6 +547,10 @@ pub fn translate_insert(
 
     let notnull_resume_label = emit_notnulls(&mut program, &ctx, &insertion, resolver)?;
 
+    // Compute generated column values (STORED columns only)
+    let generated_resume_label =
+        emit_generated_columns(&mut program, &insertion, resolver, notnull_resume_label)?;
+
     // Create and insert the record
     let affinity_str = insertion
         .col_mappings
@@ -554,7 +558,7 @@ pub fn translate_insert(
         .map(|col_mapping| col_mapping.column.affinity().aff_mask())
         .collect::<String>();
 
-    if let Some(lbl) = notnull_resume_label {
+    if let Some(lbl) = generated_resume_label {
         program.preassign_label_to_next_insn(lbl);
     }
     program.emit_insn(Insn::MakeRecord {
@@ -1231,6 +1235,51 @@ fn emit_notnulls(
     Ok(pending_resume_label)
 }
 
+/// Compute generated column values for STORED columns.
+/// VIRTUAL columns are computed on-the-fly during SELECT, not stored.
+fn emit_generated_columns(
+    program: &mut ProgramBuilder,
+    insertion: &Insertion,
+    resolver: &Resolver,
+    previous_resume_label: Option<BranchOffset>,
+) -> Result<Option<BranchOffset>> {
+    // Resolve the previous resume label if it exists
+    if let Some(lbl) = previous_resume_label {
+        program.preassign_label_to_next_insn(lbl);
+    }
+
+    // Compute all STORED generated column values
+    for column_mapping in insertion.col_mappings.iter() {
+        // Only process STORED generated columns
+        if !column_mapping.column.is_generated_stored() {
+            continue;
+        }
+
+        let generated_expr = column_mapping
+            .column
+            .generated
+            .as_ref()
+            .expect("Generated column must have expression");
+
+        // Rewrite the expression to use registers instead of column names
+        let mut expr_for_eval = generated_expr.as_ref().clone();
+        rewrite_index_expr_for_insertion(&mut expr_for_eval, insertion)?;
+
+        // Evaluate the generated expression into the column register
+        translate_expr_no_constant_opt(
+            program,
+            Some(&TableReferences::new_empty()),
+            &expr_for_eval,
+            column_mapping.register,
+            resolver,
+            NoConstantOptReason::RegisterReuse,
+        )?;
+    }
+
+    // No resume label needed - generated columns are computed unconditionally
+    Ok(None)
+}
+
 struct BoundInsertResult {
     #[allow(clippy::vec_box)]
     values: Vec<Box<Expr>>,
@@ -1417,7 +1466,12 @@ fn init_source_emission<'a>(
     table_references: &TableReferences,
 ) -> Result<ProgramBuilder> {
     let required_column_count = if columns.is_empty() {
-        table.columns().len()
+        // When no columns are specified, count only non-hidden, non-generated columns
+        table
+            .columns()
+            .iter()
+            .filter(|c| !c.hidden() && !c.is_generated())
+            .count()
     } else {
         columns.len()
     };
@@ -1646,6 +1700,7 @@ pub const ROWID_COLUMN: Column = Column::new(
         notnull: true,
         hidden: false,
         unique: false,
+        generated_stored: false,
     },
 );
 
@@ -1788,18 +1843,23 @@ fn build_insertion<'a>(
 
     if columns.is_empty() {
         // Case 1: No columns specified - map values to columns in order
-        if num_values != table_columns.iter().filter(|c| !c.hidden()).count() {
+        // Count non-hidden, non-generated columns
+        let insertable_column_count = table_columns
+            .iter()
+            .filter(|c| !c.hidden() && !c.is_generated())
+            .count();
+        if num_values != insertable_column_count {
             crate::bail_parse_error!(
                 "table {} has {} columns but {} values were supplied",
                 &table.get_name(),
-                table_columns.len(),
+                insertable_column_count,
                 num_values
             );
         }
         let mut value_idx = 0;
         for (i, col) in table_columns.iter().enumerate() {
-            if col.hidden() {
-                // Hidden columns are not taken into account.
+            if col.hidden() || col.is_generated() {
+                // Hidden columns and generated columns are not taken into account.
                 continue;
             }
             if col.is_rowid_alias() {
@@ -1820,6 +1880,13 @@ fn build_insertion<'a>(
             let column_name = normalize_ident(column_name.as_str());
             if let Some((idx_in_table, col_in_table)) = table.get_column_by_name(&column_name) {
                 // Named column
+                // Check if user is trying to insert into a generated column
+                if col_in_table.is_generated() {
+                    crate::bail_parse_error!(
+                        "cannot insert into generated column \"{}\"",
+                        column_name
+                    );
+                }
                 if col_in_table.is_rowid_alias() {
                     insertion_key = InsertionKey::RowidAlias(ColMapping {
                         column: col_in_table,
@@ -1992,6 +2059,13 @@ fn translate_column(
 ) -> Result<()> {
     if let Some(value_index) = value_index {
         translate_value_fn(program, value_index, column_register)?;
+    } else if column.is_generated() {
+        // Skip generated columns - they will be computed later
+        // For now, just emit NULL as a placeholder
+        program.emit_insn(Insn::Null {
+            dest: column_register,
+            dest_end: None,
+        });
     } else if column.is_rowid_alias() {
         // Although a non-NULL integer key is used for the insertion key,
         // the rowid alias column is emitted as NULL.
