@@ -1461,7 +1461,7 @@ fn init_source_emission<'a>(
     connection: &Arc<Connection>,
     ctx: &mut InsertEmitCtx<'a>,
     resolver: &Resolver,
-    values: &mut Vec<Box<Expr>>,
+    values: &mut [Box<Expr>],
     body: InsertBody,
     columns: &'a [ast::Name],
     table_references: &TableReferences,
