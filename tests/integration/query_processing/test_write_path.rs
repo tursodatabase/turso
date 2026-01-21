@@ -5,7 +5,8 @@ use crate::common::{compare_string, do_flush, TempDatabase};
 use log::debug;
 use std::io::{Read, Seek, Write};
 use std::sync::Arc;
-use turso_core::{CheckpointMode, Connection, LimboError, Row, Statement, StepResult, Value};
+use turso_core::vdbe::StepResult;
+use turso_core::{CheckpointMode, Connection, LimboError, Row, Statement, Value};
 
 const WAL_HEADER_SIZE: usize = 32;
 const WAL_FRAME_HEADER_SIZE: usize = 24;
