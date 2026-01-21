@@ -26,12 +26,15 @@ use crate::{
         SeekResult,
     },
     util::IOExt,
+    vdbe::Register,
     Completion, MvStore,
 };
 
 use crate::{
     return_corrupt, return_if_io,
-    types::{compare_immutable, IOResult, ImmutableRecord, SeekKey, SeekOp, Value, ValueRef},
+    types::{
+        compare_immutable, AsValueRef, IOResult, ImmutableRecord, SeekKey, SeekOp, Value, ValueRef,
+    },
     LimboError, Result,
 };
 
@@ -565,6 +568,8 @@ pub trait CursorTrait: Any + Send + Sync {
     fn record(&mut self) -> Result<IOResult<Option<&ImmutableRecord>>>;
     /// Move the cursor based on the key and the type of operation (op).
     fn seek(&mut self, key: SeekKey<'_>, op: SeekOp) -> Result<IOResult<SeekResult>>;
+    fn seek_unpacked(&mut self, registers: &[Register], op: SeekOp)
+        -> Result<IOResult<SeekResult>>;
     /// Insert a record in the position the cursor is at.
     fn insert(&mut self, key: &BTreeKey) -> Result<IOResult<()>>;
     /// Delete a record in the position the cursor is at.
@@ -1106,6 +1111,16 @@ impl BTreeCursor {
         Ok(IOResult::Done(ret))
     }
 
+    fn do_seek_unpacked(
+        &mut self,
+        registers: &[Register],
+        op: SeekOp,
+    ) -> Result<IOResult<SeekResult>> {
+        let ret = return_if_io!(self.indexbtree_seek_unpacked(registers, op));
+        self.valid_state = CursorValidState::Valid;
+        Ok(IOResult::Done(ret))
+    }
+
     /// Move the cursor to the root page of the btree.
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
     fn move_to_root(&mut self) -> Result<Option<Completion>> {
@@ -1353,6 +1368,64 @@ impl BTreeCursor {
                 .expect("indexbtree_move_to without index_info");
             find_compare(key_values.iter().peekable(), index_info)
         };
+        self.indexbtree_move_to_internal(cmp, record_comparer, &key_values)
+    }
+
+    #[instrument(skip(self, registers), level = Level::DEBUG)]
+    fn indexbtree_move_to_unpacked(
+        &mut self,
+        registers: &[Register],
+        cmp: SeekOp,
+    ) -> Result<IOResult<()>> {
+        if matches!(
+            self.seek_state,
+            CursorSeekState::LeafPageBinarySearch { .. } | CursorSeekState::FoundLeaf { .. }
+        ) {
+            self.seek_state = CursorSeekState::Start;
+        }
+
+        if matches!(self.seek_state, CursorSeekState::Start) {
+            if let Some(c) = self.move_to_root()? {
+                return Ok(IOResult::IO(IOCompletions::Single(c)));
+            }
+        }
+
+        if registers.len() <= 16 {
+            let mut kv_buf = [ValueRef::Null; 16];
+            for (i, r) in registers.iter().enumerate() {
+                kv_buf[i] = r.get_value().as_value_ref();
+            }
+            let key_values = &kv_buf[..registers.len()];
+            let record_comparer = {
+                let index_info = self
+                    .index_info
+                    .as_ref()
+                    .expect("indexbtree_move_to_unpacked without index_info");
+                find_compare(key_values.iter().peekable(), index_info)
+            };
+            self.indexbtree_move_to_internal(cmp, record_comparer, key_values)
+        } else {
+            let key_values: Vec<ValueRef<'_>> = registers
+                .iter()
+                .map(|r| r.get_value().as_value_ref())
+                .collect();
+            let record_comparer = {
+                let index_info = self
+                    .index_info
+                    .as_ref()
+                    .expect("indexbtree_move_to_unpacked without index_info");
+                find_compare(key_values.iter().peekable(), index_info)
+            };
+            self.indexbtree_move_to_internal(cmp, record_comparer, &key_values)
+        }
+    }
+
+    fn indexbtree_move_to_internal(
+        &mut self,
+        cmp: SeekOp,
+        record_comparer: RecordCompare,
+        key_values: &[ValueRef<'_>],
+    ) -> Result<IOResult<()>> {
         tracing::debug!("Using record comparison strategy: {:?}", record_comparer);
         let tie_breaker = get_tie_breaker_from_seek_op(cmp);
 
@@ -1412,7 +1485,7 @@ impl BTreeCursor {
                 old_top_idx,
                 cell_count,
                 record_comparer,
-                &key_values,
+                key_values,
                 tie_breaker,
                 &mut state,
             )?;
@@ -1516,23 +1589,15 @@ impl BTreeCursor {
 
         let cur_cell_idx = (min + max) >> 1; // rustc generates extra insns for (min+max)/2 due to them being isize. we know min&max are >=0 here.
         self.stack.set_cell_index(cur_cell_idx as i32);
-        let cell = self
+
+        let (payload, payload_size, first_overflow_page) = self
             .stack
             .get_page_contents_at_level(old_top_idx)
             .unwrap()
-            .cell_get(cur_cell_idx as usize, self.usable_space())?;
-        let BTreeCell::IndexInteriorCell(IndexInteriorCell {
-            payload,
-            payload_size,
-            first_overflow_page,
-            ..
-        }) = &cell
-        else {
-            unreachable!("unexpected cell type: {:?}", cell);
-        };
+            .cell_index_read_payload_ptr(cur_cell_idx as usize, self.usable_space())?;
 
         if let Some(next_page) = first_overflow_page {
-            let res = self.process_overflow_read(payload, *next_page, *payload_size)?;
+            let res = self.process_overflow_read(payload, next_page, payload_size)?;
             if res.is_io() {
                 return Ok(ControlFlow::Break(res));
             }
@@ -1546,6 +1611,7 @@ impl BTreeCursor {
                 .unwrap()
                 .start_serialization(payload);
         };
+
         let (target_leaf_page_is_in_left_subtree, is_eq) = {
             let record = self.get_immutable_record();
             let record = record.as_ref().unwrap();
@@ -1798,17 +1864,78 @@ impl BTreeCursor {
             record_comparer
         );
 
+        self.indexbtree_seek_internal(seek_op, record_comparer, &key_values)
+    }
+
+    #[instrument(skip_all, level = Level::DEBUG)]
+    fn indexbtree_seek_unpacked(
+        &mut self,
+        registers: &[Register],
+        seek_op: SeekOp,
+    ) -> Result<IOResult<SeekResult>> {
+        if registers.len() <= 16 {
+            let mut kv_buf = [ValueRef::Null; 16];
+            for (i, r) in registers.iter().enumerate() {
+                kv_buf[i] = r.get_value().as_value_ref();
+            }
+            let key_values = &kv_buf[..registers.len()];
+            let record_comparer = {
+                let index_info = self
+                    .index_info
+                    .as_ref()
+                    .expect("indexbtree_seek_unpacked without index_info");
+                find_compare(key_values.iter().peekable(), index_info)
+            };
+
+            tracing::debug!(
+                "Using record comparison strategy for seek: {:?}",
+                record_comparer
+            );
+
+            self.indexbtree_seek_internal(seek_op, record_comparer, key_values)
+        } else {
+            let key_values: Vec<ValueRef<'_>> = registers
+                .iter()
+                .map(|r| r.get_value().as_value_ref())
+                .collect();
+            let record_comparer = {
+                let index_info = self
+                    .index_info
+                    .as_ref()
+                    .expect("indexbtree_seek_unpacked without index_info");
+                find_compare(key_values.iter().peekable(), index_info)
+            };
+
+            tracing::debug!(
+                "Using record comparison strategy for seek: {:?}",
+                record_comparer
+            );
+
+            self.indexbtree_seek_internal(seek_op, record_comparer, &key_values)
+        }
+    }
+
+    fn indexbtree_seek_internal(
+        &mut self,
+        seek_op: SeekOp,
+        record_comparer: RecordCompare,
+        key_values: &[ValueRef<'_>],
+    ) -> Result<IOResult<SeekResult>> {
         if matches!(
             self.seek_state,
             CursorSeekState::Start
                 | CursorSeekState::MovingBetweenPages { .. }
                 | CursorSeekState::InteriorPageBinarySearch { .. }
         ) {
-            // No need for another move_to_root. Move_to already moves to root
-            return_if_io!(self.move_to(SeekKey::IndexKey(key), seek_op));
+            if matches!(self.seek_state, CursorSeekState::Start) {
+                if let Some(c) = self.move_to_root()? {
+                    return Ok(IOResult::IO(IOCompletions::Single(c)));
+                }
+            }
+            return_if_io!(self.indexbtree_move_to_internal(seek_op, record_comparer, key_values));
             let CursorSeekState::FoundLeaf { eq_seen } = &self.seek_state else {
                 unreachable!(
-                    "We must still be in FoundLeaf state after move_to, got: {:?}",
+                    "We must still be in FoundLeaf state after indexbtree_move_to_internal, got: {:?}",
                     self.seek_state
                 );
             };
@@ -1857,7 +1984,7 @@ impl BTreeCursor {
             let control = self.indexbtree_seek_inner(
                 seek_op,
                 old_top_idx,
-                &key_values,
+                key_values,
                 record_comparer,
                 &mut state,
             )?;
@@ -1921,22 +2048,14 @@ impl BTreeCursor {
         let cur_cell_idx = (min + max) >> 1; // rustc generates extra insns for (min+max)/2 due to them being isize. we know min&max are >=0 here.
         self.stack.set_cell_index(cur_cell_idx as i32);
 
-        let cell = self
+        let (payload, payload_size, first_overflow_page) = self
             .stack
             .get_page_contents_at_level(old_top_idx)
             .unwrap()
-            .cell_get(cur_cell_idx as usize, self.usable_space())?;
-        let BTreeCell::IndexLeafCell(IndexLeafCell {
-            payload,
-            first_overflow_page,
-            payload_size,
-        }) = &cell
-        else {
-            unreachable!("unexpected cell type: {:?}", cell);
-        };
+            .cell_index_read_payload_ptr(cur_cell_idx as usize, self.usable_space())?;
 
         if let Some(next_page) = first_overflow_page {
-            let res = self.process_overflow_read(payload, *next_page, *payload_size)?;
+            let res = self.process_overflow_read(payload, next_page, payload_size)?;
             if let IOResult::IO(io) = res {
                 return Ok(ControlFlow::Break(IOResult::IO(io)));
             }
@@ -1950,6 +2069,7 @@ impl BTreeCursor {
                 .unwrap()
                 .start_serialization(payload);
         };
+
         let (cmp, found) = self.compare_with_current_record(
             key_values,
             seek_op,
@@ -4909,6 +5029,27 @@ impl CursorTrait for BTreeCursor {
         self.seek_state = CursorSeekState::Start;
         self.valid_state = CursorValidState::Valid;
         self.read_overflow_state = None;
+        Ok(IOResult::Done(seek_result))
+    }
+
+    #[cfg_attr(debug_assertions, instrument(skip(self, registers), level = Level::DEBUG))]
+    fn seek_unpacked(
+        &mut self,
+        registers: &[Register],
+        op: SeekOp,
+    ) -> Result<IOResult<SeekResult>> {
+        self.skip_advance = false;
+        // Empty trace to capture the span information
+        tracing::trace!("");
+        // We need to clear the null flag for the table cursor before seeking,
+        // because it might have been set to false by an unmatched left-join row during the previous iteration
+        // on the outer loop.
+        self.set_null_flag(false);
+        let seek_result = return_if_io!(self.do_seek_unpacked(registers, op));
+        self.invalidate_record();
+        // Reset seek state
+        self.seek_state = CursorSeekState::Start;
+        self.valid_state = CursorValidState::Valid;
         Ok(IOResult::Done(seek_result))
     }
 

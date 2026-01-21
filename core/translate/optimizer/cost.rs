@@ -70,12 +70,12 @@ pub fn estimate_cost_for_scan_or_seek(
     usable_constraint_refs: &[RangeConstraintRef],
     input_cardinality: f64,
     base_row_count: RowCountEstimate,
+    is_index_ordered: bool,
 ) -> Cost {
     let has_real_stats = matches!(base_row_count, RowCountEstimate::AnalyzeStats(_));
     let base_row_count = *base_row_count;
 
     let Some(index_info) = index_info else {
-        // Full table scan
         if has_real_stats {
             // With real stats, account for caching on small tables
             let table_pages = (base_row_count / ESTIMATED_HARDCODED_ROWS_PER_PAGE as f64).max(1.0);
@@ -92,8 +92,9 @@ pub fn estimate_cost_for_scan_or_seek(
             let io_cost = uncached_io.0.min(cached_io.0);
             return Cost(io_cost + cpu_cost);
         } else {
-            // Without real stats, use simple IO-based model
-            return estimate_page_io_cost(input_cardinality * base_row_count);
+            // Without real stats, use simple IO-based model.
+            // The 3x multiplier penalizes full scans to encourage index usage.
+            return Cost(estimate_page_io_cost(input_cardinality * base_row_count).0 * 3.0);
         }
     };
 
@@ -174,9 +175,18 @@ pub fn estimate_cost_for_scan_or_seek(
         })
         .product();
 
-    // little cheeky bonus for covering indexes
-    let covering_multiplier = if index_info.covering { 0.9 } else { 1.0 };
-    estimate_page_io_cost(
-        selectivity_multiplier * base_row_count * input_cardinality * covering_multiplier,
-    )
+    let rows_visited = selectivity_multiplier * base_row_count * input_cardinality;
+    let base_cost = estimate_page_io_cost(rows_visited);
+
+    let is_full_scan = usable_constraint_refs.is_empty();
+    // Penalize non-covering indexes doing full scans when not ordered by the index.
+    // Without ordering benefit, a full scan on a non-covering index requires random
+    // table lookups for each row, which is expensive. The 3x penalty discourages this.
+    let table_seek_penalty = if !index_info.covering && is_full_scan && !is_index_ordered {
+        estimate_page_io_cost(rows_visited * 3.0)
+    } else {
+        Cost(0.0)
+    };
+
+    base_cost + table_seek_penalty
 }
