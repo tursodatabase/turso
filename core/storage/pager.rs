@@ -421,6 +421,75 @@ impl PageInner {
         Ok(rowid as i64)
     }
 
+    /// Fast path for index cells: returns payload slice and overflow info without constructing BTreeCell.
+    ///
+    /// This bypasses the full `cell_get()` to `read_btree_cell()` path for binary search hot loops.
+    /// The returned slice is valid as long as the page is alive.
+    ///
+    /// Returns: (payload_slice, payload_size, first_overflow_page)
+    #[inline(always)]
+    pub fn cell_index_read_payload_ptr(
+        &self,
+        idx: usize,
+        usable_size: usize,
+    ) -> crate::Result<(&'static [u8], u64, Option<u32>)> {
+        let buf = self.as_ptr();
+        let cell_pointer_array_start = self.header_size();
+        let cell_pointer = cell_pointer_array_start + (idx * CELL_PTR_SIZE_BYTES);
+        let cell_offset = self.read_u16(cell_pointer) as usize;
+
+        let page_type = self.page_type()?;
+        let (payload_size, varint_len, header_skip) = match page_type {
+            PageType::IndexInterior => {
+                let (size, len) = read_varint(&buf[cell_offset + 4..])?;
+                (size, len, 4usize)
+            }
+            PageType::IndexLeaf => {
+                let (size, len) = read_varint(&buf[cell_offset..])?;
+                (size, len, 0usize)
+            }
+            _ => unreachable!("cell_index_read_payload_ptr called on non-index page"),
+        };
+
+        let payload_start = cell_offset + header_skip + varint_len;
+
+        let max_local = payload_overflow_threshold_max(page_type, usable_size);
+        let min_local = payload_overflow_threshold_min(page_type, usable_size);
+        let (overflows, local_size) = sqlite3_ondisk::payload_overflows(
+            payload_size as usize,
+            max_local,
+            min_local,
+            usable_size,
+        );
+
+        let (payload_slice, first_overflow) = if overflows {
+            let overflow_ptr_offset = payload_start + local_size - 4;
+            let first_overflow_page = u32::from_be_bytes([
+                buf[overflow_ptr_offset],
+                buf[overflow_ptr_offset + 1],
+                buf[overflow_ptr_offset + 2],
+                buf[overflow_ptr_offset + 3],
+            ]);
+            // SAFETY: valid as long as page is alive
+            let slice = unsafe {
+                std::mem::transmute::<&[u8], &'static [u8]>(
+                    &buf[payload_start..payload_start + local_size - 4],
+                )
+            };
+            (slice, Some(first_overflow_page))
+        } else {
+            // SAFETY: valid as long as page is alive
+            let slice = unsafe {
+                std::mem::transmute::<&[u8], &'static [u8]>(
+                    &buf[payload_start..payload_start + payload_size as usize],
+                )
+            };
+            (slice, None)
+        };
+
+        Ok((payload_slice, payload_size, first_overflow))
+    }
+
     #[inline]
     pub fn cell_pointer_array_offset_and_size(&self) -> (usize, usize) {
         (

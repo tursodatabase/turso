@@ -140,10 +140,23 @@ pub fn join_lhs_and_rhs<'a>(
     let lhs_mask = lhs.map_or_else(TableMask::new, |l| {
         TableMask::from_table_number_iter(l.table_numbers())
     });
+
+    // Self-constraints are conditions comparing columns within the same table
+    // (e.g., t.col1 < t.col2). Include them in selectivity since they filter rows.
+    let rhs_self_mask = {
+        let mut m = TableMask::new();
+        m.add_table(rhs_table_number);
+        m
+    };
+
     let output_cardinality_multiplier = rhs_constraints
         .constraints
         .iter()
-        .filter(|c| lhs_mask.contains_all(&c.lhs_mask))
+        .filter(|c| {
+            lhs_mask.contains_all(&c.lhs_mask)
+                || c.lhs_mask == rhs_self_mask // self-constraints
+                || c.lhs_mask.is_empty() // literal constraints
+        })
         .map(|c| c.selectivity)
         .product::<f64>();
     let rhs_internal_id = rhs_table_reference.internal_id;
@@ -1291,10 +1304,19 @@ fn find_best_starting_table(
         }
 
         let base_rows = *base_table_rows[t];
+
+        // Self-constraints compare columns within the same table (e.g., t.col1 < t.col2).
+        let self_mask = {
+            let mut m = TableMask::new();
+            m.add_table(t);
+            m
+        };
+
+        // Include literal constraints (lhs_mask empty) and self-constraints in selectivity
         let selectivity: f64 = constraints[t]
             .constraints
             .iter()
-            .filter(|c| c.lhs_mask.is_empty())
+            .filter(|c| c.lhs_mask.is_empty() || c.lhs_mask == self_mask)
             .map(|c| c.selectivity)
             .product();
 
