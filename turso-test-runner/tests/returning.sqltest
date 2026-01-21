@@ -1,735 +1,1023 @@
-#!/usr/bin/env tclsh
-set testdir [file dirname $argv0]
-source $testdir/tester.tcl
-source $testdir/../sqlite3/tester.tcl
+@database :memory:
 
 # ============================================================================
 # INSERT RETURNING tests
 # ============================================================================
-
 # Basic column references
-do_execsql_test_on_specific_db {:memory:} insert-returning-single-column {
+test insert-returning-single-column {
     CREATE TABLE t (id INTEGER, name TEXT, value REAL);
     INSERT INTO t VALUES (1, 'test', 10.5) RETURNING id;
-} {1}
+}
+expect {
+    1
+}
 
-do_execsql_test_on_specific_db {:memory:} insert-returning-multiple-columns {
+test insert-returning-multiple-columns {
     CREATE TABLE t (id INTEGER, name TEXT, value REAL);
     INSERT INTO t VALUES (1, 'test', 10.5) RETURNING id, name;
-} {1|test}
+}
+expect {
+    1|test
+}
 
-do_execsql_test_on_specific_db {:memory:} insert-returning-all-columns {
+test insert-returning-all-columns {
     CREATE TABLE t (id INTEGER, name TEXT, value REAL);
     INSERT INTO t VALUES (1, 'test', 10.5) RETURNING *;
-} {1|test|10.5}
+}
+expect {
+    1|test|10.5
+}
 
 # Table-qualified column references
-do_execsql_test_on_specific_db {:memory:} insert-returning-table-qualified {
+test insert-returning-table-qualified {
     CREATE TABLE t (id INTEGER, name TEXT);
     INSERT INTO t VALUES (1, 'test') RETURNING t.id, t.name;
-} {1|test}
+}
+expect {
+    1|test
+}
 
 # Arbitrary expressions not referencing columns
-do_execsql_test_on_specific_db {:memory:} insert-returning-literal {
+test insert-returning-literal {
     CREATE TABLE t (id INTEGER);
     INSERT INTO t VALUES (1) RETURNING 42;
-} {42}
+}
+expect {
+    42
+}
 
-do_execsql_test_on_specific_db {:memory:} insert-returning-constant-expression {
+test insert-returning-constant-expression {
     CREATE TABLE t (id INTEGER);
     INSERT INTO t VALUES (1) RETURNING 2 + 3 * 4;
-} {14}
+}
+expect {
+    14
+}
 
-do_execsql_test_on_specific_db {:memory:} insert-returning-string-literal {
+test insert-returning-string-literal {
     CREATE TABLE t (id INTEGER);
     INSERT INTO t VALUES (1) RETURNING 'hello world';
-} {"hello world"}
+}
+expect {
+    hello world
+}
 
 # Expressions referencing result columns
-do_execsql_test_on_specific_db {:memory:} insert-returning-column-arithmetic {
+test insert-returning-column-arithmetic {
     CREATE TABLE t (id INTEGER, value INTEGER);
     INSERT INTO t VALUES (1, 10) RETURNING 2 * value;
-} {20}
+}
+expect {
+    20
+}
 
-do_execsql_test_on_specific_db {:memory:} insert-returning-complex-expression {
+test insert-returning-complex-expression {
     CREATE TABLE t (id INTEGER, x INTEGER, y INTEGER);
     INSERT INTO t VALUES (1, 5, 3) RETURNING x + y * 2;
-} {11}
+}
+expect {
+    11
+}
 
-do_execsql_test_on_specific_db {:memory:} insert-returning-multiple-column-expression {
+test insert-returning-multiple-column-expression {
     CREATE TABLE t (id INTEGER, a INTEGER, b INTEGER, c INTEGER);
     INSERT INTO t VALUES (1, 2, 3, 4) RETURNING a * b + c;
-} {10}
+}
+expect {
+    10
+}
 
 # Function calls
-do_execsql_test_on_specific_db {:memory:} insert-returning-function-call {
+test insert-returning-function-call {
     CREATE TABLE t (id INTEGER, name TEXT);
     INSERT INTO t VALUES (1, 'hello') RETURNING upper(name);
-} {HELLO}
+}
+expect {
+    HELLO
+}
 
-do_execsql_test_on_specific_db {:memory:} insert-returning-function-multiple-columns {
+test insert-returning-function-multiple-columns {
     CREATE TABLE t (id INTEGER, first TEXT, last TEXT);
     INSERT INTO t VALUES (1, 'john', 'doe') RETURNING upper(first) || ' ' || upper(last);
-} {"JOHN DOE"}
+}
+expect {
+    JOHN DOE
+}
 
-do_execsql_test_on_specific_db {:memory:} insert-returning-function-with-expression {
+test insert-returning-function-with-expression {
     CREATE TABLE t (id INTEGER, x INTEGER, y INTEGER);
     INSERT INTO t VALUES (1, 5, 3) RETURNING abs(x - y);
-} {2}
+}
+expect {
+    2
+}
 
 # Mixed expressions
-do_execsql_test_on_specific_db {:memory:} insert-returning-mixed-expressions {
+test insert-returning-mixed-expressions {
     CREATE TABLE t (id INTEGER, name TEXT, value INTEGER);
     INSERT INTO t VALUES (1, 'test', 10) RETURNING id, upper(name), value * 3, 42;
-} {1|TEST|30|42}
+}
+expect {
+    1|TEST|30|42
+}
 
 # Multiple rows
-do_execsql_test_on_specific_db {:memory:} insert-returning-multiple-rows {
+test insert-returning-multiple-rows {
     CREATE TABLE t (id INTEGER, name TEXT);
     INSERT INTO t VALUES (1, 'first'), (2, 'second'), (3, 'third') RETURNING id, name;
-} {1|first
-2|second
-3|third}
+}
+expect {
+    1|first
+    2|second
+    3|third
+}
 
-do_execsql_test_on_specific_db {:memory:} insert-returning-multiple-rows-expressions {
+test insert-returning-multiple-rows-expressions {
     CREATE TABLE t (id INTEGER, value INTEGER);
     INSERT INTO t VALUES (1, 10), (2, 20), (3, 30) RETURNING id, value * 2;
-} {1|20
-2|40
-3|60}
+}
+expect {
+    1|20
+    2|40
+    3|60
+}
 
 # NULL handling
-do_execsql_test_on_specific_db {:memory:} insert-returning-null-values {
+test insert-returning-null-values {
     CREATE TABLE t (id INTEGER, name TEXT, value INTEGER);
     INSERT INTO t VALUES (1, NULL, NULL) RETURNING id, name, value;
-} {1||}
+}
+expect {
+    1||
+}
 
-do_execsql_test_on_specific_db {:memory:} insert-returning-null-expression {
+test insert-returning-null-expression {
     CREATE TABLE t (id INTEGER, name TEXT);
     INSERT INTO t VALUES (1, NULL) RETURNING coalesce(name, 'default');
-} {default}
+}
+expect {
+    default
+}
 
 # Rowid
-do_execsql_test_on_specific_db {:memory:} insert-returning-rowid {
+test insert-returning-rowid {
     CREATE TABLE t (name TEXT);
     INSERT INTO t VALUES ('test') RETURNING rowid, name;
-} {1|test}
+}
+expect {
+    1|test
+}
 
-do_execsql_test_on_specific_db {:memory:} insert-returning-rowid-expression {
+test insert-returning-rowid-expression {
     CREATE TABLE t (name TEXT);
     INSERT INTO t VALUES ('test') RETURNING rowid * 2;
-} {2}
+}
+expect {
+    2
+}
 
 # Auto-increment
-do_execsql_test_on_specific_db {:memory:} insert-returning-autoincrement {
+test insert-returning-autoincrement {
     CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT);
     INSERT INTO t (name) VALUES ('test') RETURNING id, name;
-} {1|test}
+}
+expect {
+    1|test
+}
 
 # Complex nested expressions
-do_execsql_test_on_specific_db {:memory:} insert-returning-nested-expressions {
+test insert-returning-nested-expressions {
     CREATE TABLE t (id INTEGER, x INTEGER, y INTEGER, z INTEGER);
     INSERT INTO t VALUES (1, 2, 3, 4) RETURNING (x + y) * (z - 1);
-} {15}
+}
+expect {
+    15
+}
 
-do_execsql_test_on_specific_db {:memory:} insert-returning-case-expression {
+test insert-returning-case-expression {
     CREATE TABLE t (id INTEGER, value INTEGER);
     INSERT INTO t VALUES (1, 5) RETURNING CASE WHEN value > 10 THEN 'high' WHEN value > 0 THEN 'low' ELSE 'zero' END;
-} {low}
+}
+expect {
+    low
+}
 
 # String operations
-do_execsql_test_on_specific_db {:memory:} insert-returning-string-concat {
+test insert-returning-string-concat {
     CREATE TABLE t (id INTEGER, first TEXT, last TEXT);
     INSERT INTO t VALUES (1, 'John', 'Doe') RETURNING first || ' ' || last;
-} {"John Doe"}
+}
+expect {
+    John Doe
+}
 
-do_execsql_test_on_specific_db {:memory:} insert-returning-substring {
+test insert-returning-substring {
     CREATE TABLE t (id INTEGER, name TEXT);
     INSERT INTO t VALUES (1, 'hello world') RETURNING substr(name, 1, 5);
-} {hello}
+}
+expect {
+    hello
+}
 
 # ============================================================================
 # INSERT ON CONFLICT RETURNING tests
 # ============================================================================
-
 # RETURNING on INSERT path (no conflict)
-do_execsql_test_on_specific_db {:memory:} upsert-returning-insert-path {
+test upsert-returning-insert-path {
     CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT);
     INSERT INTO t VALUES (1, 'new')
-      ON CONFLICT DO UPDATE SET name = excluded.name
-      RETURNING id, name;
-} {1|new}
+    ON CONFLICT DO UPDATE SET name = excluded.name
+    RETURNING id, name;
+}
+expect {
+    1|new
+}
 
 # RETURNING on UPDATE path (conflict occurs)
-do_execsql_test_on_specific_db {:memory:} upsert-returning-update-path {
+test upsert-returning-update-path {
     CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT);
     INSERT INTO t VALUES (1, 'old');
     INSERT INTO t VALUES (1, 'new')
-      ON CONFLICT DO UPDATE SET name = excluded.name
-      RETURNING id, name;
-} {1|new}
+    ON CONFLICT DO UPDATE SET name = excluded.name
+    RETURNING id, name;
+}
+expect {
+    1|new
+}
 
 # RETURNING on DO NOTHING (should return empty)
-do_execsql_test_on_specific_db {:memory:} upsert-returning-do-nothing {
+test upsert-returning-do-nothing {
     CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT);
     INSERT INTO t VALUES (1, 'old');
     INSERT INTO t VALUES (1, 'ignored')
-      ON CONFLICT DO NOTHING
-      RETURNING id, name;
-} {}
+    ON CONFLICT DO NOTHING
+    RETURNING id, name;
+}
+expect {
+}
 
 # RETURNING with table-qualified columns
-do_execsql_test_on_specific_db {:memory:} upsert-returning-table-qualified {
+test upsert-returning-table-qualified {
     CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT);
     INSERT INTO t VALUES (1, 'old');
     INSERT INTO t VALUES (1, 'new')
-      ON CONFLICT DO UPDATE SET name = excluded.name
-      RETURNING t.id, t.name;
-} {1|new}
+    ON CONFLICT DO UPDATE SET name = excluded.name
+    RETURNING t.id, t.name;
+}
+expect {
+    1|new
+}
 
 # RETURNING with expressions on INSERT path
-do_execsql_test_on_specific_db {:memory:} upsert-returning-expression-insert {
+test upsert-returning-expression-insert {
     CREATE TABLE t (id INTEGER PRIMARY KEY, value INTEGER);
     INSERT INTO t VALUES (1, 10)
-      ON CONFLICT DO UPDATE SET value = excluded.value
-      RETURNING id, value * 2;
-} {1|20}
+    ON CONFLICT DO UPDATE SET value = excluded.value
+    RETURNING id, value * 2;
+}
+expect {
+    1|20
+}
 
 # RETURNING with expressions on UPDATE path
-do_execsql_test_on_specific_db {:memory:} upsert-returning-expression-update {
+test upsert-returning-expression-update {
     CREATE TABLE t (id INTEGER PRIMARY KEY, value INTEGER);
     INSERT INTO t VALUES (1, 5);
     INSERT INTO t VALUES (1, 10)
-      ON CONFLICT DO UPDATE SET value = excluded.value
-      RETURNING id, value * 3;
-} {1|30}
+    ON CONFLICT DO UPDATE SET value = excluded.value
+    RETURNING id, value * 3;
+}
+expect {
+    1|30
+}
 
 # RETURNING with complex expressions
-do_execsql_test_on_specific_db {:memory:} upsert-returning-complex-expression {
+test upsert-returning-complex-expression {
     CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER, y INTEGER);
     INSERT INTO t VALUES (1, 2, 3);
     INSERT INTO t VALUES (1, 5, 7)
-      ON CONFLICT DO UPDATE SET x = excluded.x, y = excluded.y
-      RETURNING id, x + y * 2;
-} {1|19}
+    ON CONFLICT DO UPDATE SET x = excluded.x, y = excluded.y
+    RETURNING id, x + y * 2;
+}
+expect {
+    1|19
+}
 
 # RETURNING with function calls
-do_execsql_test_on_specific_db {:memory:} upsert-returning-function {
+test upsert-returning-function {
     CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT);
     INSERT INTO t VALUES (1, 'hello');
     INSERT INTO t VALUES (1, 'world')
-      ON CONFLICT DO UPDATE SET name = excluded.name
-      RETURNING id, upper(name);
-} {1|WORLD}
+    ON CONFLICT DO UPDATE SET name = excluded.name
+    RETURNING id, upper(name);
+}
+expect {
+    1|WORLD
+}
 
 # RETURNING with multiple rows (mixed insert/update)
-do_execsql_test_on_specific_db {:memory:} upsert-returning-multiple-rows {
+test upsert-returning-multiple-rows {
     CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT);
     INSERT INTO t VALUES (1, 'old1'), (2, 'old2');
     INSERT INTO t VALUES (1, 'new1'), (2, 'new2'), (3, 'new3')
-      ON CONFLICT DO UPDATE SET name = excluded.name
-      RETURNING id, name;
-} {1|new1
-2|new2
-3|new3}
+    ON CONFLICT DO UPDATE SET name = excluded.name
+    RETURNING id, name;
+}
+expect {
+    1|new1
+    2|new2
+    3|new3
+}
 
 # RETURNING with WHERE clause in DO UPDATE
-do_execsql_test_on_specific_db {:memory:} upsert-returning-where-update {
+test upsert-returning-where-update {
     CREATE TABLE t (id INTEGER PRIMARY KEY, value INTEGER);
     INSERT INTO t VALUES (1, 5);
     INSERT INTO t VALUES (1, 10)
-      ON CONFLICT DO UPDATE SET value = excluded.value WHERE excluded.value > t.value
-      RETURNING id, value;
-} {1|10}
+    ON CONFLICT DO UPDATE SET value = excluded.value WHERE excluded.value > t.value
+    RETURNING id, value;
+}
+expect {
+    1|10
+}
 
-do_execsql_test_on_specific_db {:memory:} upsert-returning-where-no-update {
+test upsert-returning-where-no-update {
     CREATE TABLE t (id INTEGER PRIMARY KEY, value INTEGER);
     INSERT INTO t VALUES (1, 10);
     INSERT INTO t VALUES (1, 5)
-      ON CONFLICT DO UPDATE SET value = excluded.value WHERE excluded.value > t.value
-      RETURNING id, value;
-} {}
+    ON CONFLICT DO UPDATE SET value = excluded.value WHERE excluded.value > t.value
+    RETURNING id, value;
+}
+expect {
+}
 
 # RETURNING with arbitrary expressions not referencing columns
-do_execsql_test_on_specific_db {:memory:} upsert-returning-literal {
+test upsert-returning-literal {
     CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT);
     INSERT INTO t VALUES (1, 'test')
-      ON CONFLICT DO UPDATE SET name = excluded.name
-      RETURNING 42;
-} {42}
+    ON CONFLICT DO UPDATE SET name = excluded.name
+    RETURNING 42;
+}
+expect {
+    42
+}
 
 # RETURNING with mixed insert/update in single statement (first one doesn't conflict, second one does)
-do_execsql_test_on_specific_db {:memory:} upsert-returning-mixed-operations {
+test upsert-returning-mixed-operations {
     CREATE TABLE t (id INTEGER PRIMARY KEY, value INTEGER);
     INSERT INTO t VALUES (1, 5);
     INSERT INTO t VALUES (1, 10), (2, 20)
-      ON CONFLICT DO UPDATE SET value = excluded.value + t.value
-      RETURNING id, value;
-} {1|15
-2|20}
+    ON CONFLICT DO UPDATE SET value = excluded.value + t.value
+    RETURNING id, value;
+}
+expect {
+    1|15
+    2|20
+}
 
 # ============================================================================
 # INSERT ... SELECT ... RETURNING tests
 # ============================================================================
-
 # Basic INSERT ... SELECT with RETURNING
-do_execsql_test_on_specific_db {:memory:} insert-select-returning-basic {
+test insert-select-returning-basic {
     CREATE TABLE u (a INTEGER, b INTEGER PRIMARY KEY, c TEXT);
     CREATE TABLE t (a TEXT, b INTEGER, c INTEGER PRIMARY KEY);
     INSERT INTO u VALUES (1, 2, 'test'), (2, 4, 'data'), (3, 6, 'more');
     INSERT INTO t SELECT c, b, b * 2 FROM u RETURNING *;
-} {test|2|4
-data|4|8
-more|6|12}
+}
+expect {
+    test|2|4
+    data|4|8
+    more|6|12
+}
 
 # INSERT ... SELECT with WHERE clause and RETURNING
-do_execsql_test_on_specific_db {:memory:} insert-select-returning-where {
+test insert-select-returning-where {
     CREATE TABLE u (a INTEGER, b INTEGER PRIMARY KEY, c TEXT);
     CREATE TABLE t (a TEXT, b INTEGER, c INTEGER PRIMARY KEY);
     INSERT INTO u SELECT value, value * 2, 'kekkers' FROM generate_series(1, 10);
     INSERT INTO t SELECT concat(c, '-lollers') as lul, b, b * 2 FROM u WHERE a > 5 RETURNING *;
-} {kekkers-lollers|12|24
-kekkers-lollers|14|28
-kekkers-lollers|16|32
-kekkers-lollers|18|36
-kekkers-lollers|20|40}
+}
+expect {
+    kekkers-lollers|12|24
+    kekkers-lollers|14|28
+    kekkers-lollers|16|32
+    kekkers-lollers|18|36
+    kekkers-lollers|20|40
+}
 
 # INSERT ... SELECT with RETURNING specific columns
-do_execsql_test_on_specific_db {:memory:} insert-select-returning-columns {
+test insert-select-returning-columns {
     CREATE TABLE u (a INTEGER, b INTEGER, c TEXT);
     CREATE TABLE t (a TEXT, b INTEGER, c INTEGER);
     INSERT INTO u VALUES (1, 10, 'x'), (2, 20, 'y'), (3, 30, 'z');
     INSERT INTO t SELECT c, b, a FROM u RETURNING a, c;
-} {x|1
-y|2
-z|3}
+}
+expect {
+    x|1
+    y|2
+    z|3
+}
 
 # INSERT ... SELECT with RETURNING expressions
-do_execsql_test_on_specific_db {:memory:} insert-select-returning-expressions {
+test insert-select-returning-expressions {
     CREATE TABLE u (a INTEGER, b INTEGER);
     CREATE TABLE t (x INTEGER, y INTEGER);
     INSERT INTO u VALUES (5, 10), (15, 20);
     INSERT INTO t SELECT a, b FROM u RETURNING x + y, x * y;
-} {15|50
-35|300}
+}
+expect {
+    15|50
+    35|300
+}
 
 # INSERT ... SELECT with RETURNING and function calls
-do_execsql_test_on_specific_db {:memory:} insert-select-returning-functions {
+test insert-select-returning-functions {
     CREATE TABLE u (name TEXT, value INTEGER);
     CREATE TABLE t (name TEXT, value INTEGER);
     INSERT INTO u VALUES ('hello', 100), ('world', 200);
     INSERT INTO t SELECT name, value FROM u RETURNING upper(name), value / 10;
-} {HELLO|10
-WORLD|20}
+}
+expect {
+    HELLO|10
+    WORLD|20
+}
 
 # INSERT ... SELECT with RETURNING and aggregates in source
-do_execsql_test_on_specific_db {:memory:} insert-select-returning-aggregate-source {
+test insert-select-returning-aggregate-source {
     CREATE TABLE u (category TEXT, amount INTEGER);
     CREATE TABLE t (category TEXT, total INTEGER);
     INSERT INTO u VALUES ('A', 10), ('A', 20), ('B', 30), ('B', 40);
     INSERT INTO t SELECT category, SUM(amount) FROM u GROUP BY category RETURNING *;
-} {A|30
-B|70}
+}
+expect {
+    A|30
+    B|70
+}
 
 # INSERT ... SELECT with RETURNING literal values
-do_execsql_test_on_specific_db {:memory:} insert-select-returning-literals {
+test insert-select-returning-literals {
     CREATE TABLE u (id INTEGER);
     CREATE TABLE t (id INTEGER, constant INTEGER);
     INSERT INTO u VALUES (1), (2), (3);
     INSERT INTO t SELECT id, 42 FROM u RETURNING constant;
-} {42
-42
-42}
+}
+expect {
+    42
+    42
+    42
+}
 
 # INSERT ... SELECT with RETURNING and ORDER BY in source
-do_execsql_test_on_specific_db {:memory:} insert-select-returning-ordered {
+test insert-select-returning-ordered {
     CREATE TABLE u (value INTEGER);
     CREATE TABLE t (value INTEGER);
     INSERT INTO u VALUES (30), (10), (20);
     INSERT INTO t SELECT value FROM u ORDER BY value RETURNING value;
-} {10
-20
-30}
+}
+expect {
+    10
+    20
+    30
+}
 
 # ============================================================================
 # UPDATE RETURNING tests
 # ============================================================================
-
 # Basic column references
-do_execsql_test_on_specific_db {:memory:} update-returning-single-column {
+test update-returning-single-column {
     CREATE TABLE t (id INTEGER, name TEXT, value REAL);
     INSERT INTO t VALUES (1, 'test', 10.5);
     UPDATE t SET value = 20.5 WHERE id = 1 RETURNING id;
-} {1}
+}
+expect {
+    1
+}
 
-do_execsql_test_on_specific_db {:memory:} update-returning-multiple-columns {
+test update-returning-multiple-columns {
     CREATE TABLE t (id INTEGER, name TEXT, value REAL);
     INSERT INTO t VALUES (1, 'test', 10.5);
     UPDATE t SET value = 20.5 WHERE id = 1 RETURNING id, name, value;
-} {1|test|20.5}
+}
+expect {
+    1|test|20.5
+}
 
-do_execsql_test_on_specific_db {:memory:} update-returning-all-columns {
+test update-returning-all-columns {
     CREATE TABLE t (id INTEGER, name TEXT, value REAL);
     INSERT INTO t VALUES (1, 'test', 10.5);
     UPDATE t SET value = 20.5 WHERE id = 1 RETURNING *;
-} {1|test|20.5}
+}
+expect {
+    1|test|20.5
+}
 
 # Table-qualified column references
-do_execsql_test_on_specific_db {:memory:} update-returning-table-qualified {
+test update-returning-table-qualified {
     CREATE TABLE t (id INTEGER, name TEXT);
     INSERT INTO t VALUES (1, 'old');
     UPDATE t SET name = 'new' WHERE id = 1 RETURNING t.id, t.name;
-} {1|new}
+}
+expect {
+    1|new
+}
 
 # Arbitrary expressions not referencing columns
-do_execsql_test_on_specific_db {:memory:} update-returning-literal {
+test update-returning-literal {
     CREATE TABLE t (id INTEGER, value INTEGER);
     INSERT INTO t VALUES (1, 10);
     UPDATE t SET value = 20 WHERE id = 1 RETURNING 42;
-} {42}
+}
+expect {
+    42
+}
 
-do_execsql_test_on_specific_db {:memory:} update-returning-constant-expression {
+test update-returning-constant-expression {
     CREATE TABLE t (id INTEGER);
     INSERT INTO t VALUES (1);
     UPDATE t SET id = 2 RETURNING 2 + 3 * 4;
-} {14}
+}
+expect {
+    14
+}
 
 # Expressions referencing updated columns
-do_execsql_test_on_specific_db {:memory:} update-returning-column-arithmetic {
+test update-returning-column-arithmetic {
     CREATE TABLE t (id INTEGER, value INTEGER);
     INSERT INTO t VALUES (1, 10);
     UPDATE t SET value = 20 WHERE id = 1 RETURNING 2 * value;
-} {40}
+}
+expect {
+    40
+}
 
-do_execsql_test_on_specific_db {:memory:} update-returning-complex-expression {
+test update-returning-complex-expression {
     CREATE TABLE t (id INTEGER, x INTEGER, y INTEGER);
     INSERT INTO t VALUES (1, 5, 3);
     UPDATE t SET x = 8 WHERE id = 1 RETURNING x + y * 2;
-} {14}
+}
+expect {
+    14
+}
 
-do_execsql_test_on_specific_db {:memory:} update-returning-multiple-column-expression {
+test update-returning-multiple-column-expression {
     CREATE TABLE t (id INTEGER, a INTEGER, b INTEGER, c INTEGER);
     INSERT INTO t VALUES (1, 2, 3, 4);
     UPDATE t SET a = 5, b = 6 WHERE id = 1 RETURNING a * b + c;
-} {34}
+}
+expect {
+    34
+}
 
 # Function calls
-do_execsql_test_on_specific_db {:memory:} update-returning-function-call {
+test update-returning-function-call {
     CREATE TABLE t (id INTEGER, name TEXT);
     INSERT INTO t VALUES (1, 'hello');
     UPDATE t SET name = 'world' WHERE id = 1 RETURNING upper(name);
-} {WORLD}
+}
+expect {
+    WORLD
+}
 
-do_execsql_test_on_specific_db {:memory:} update-returning-function-multiple-columns {
+test update-returning-function-multiple-columns {
     CREATE TABLE t (id INTEGER, first TEXT, last TEXT);
     INSERT INTO t VALUES (1, 'john', 'doe');
     UPDATE t SET first = 'jane', last = 'smith' WHERE id = 1 RETURNING upper(first) || ' ' || upper(last);
-} {"JANE SMITH"}
+}
+expect {
+    JANE SMITH
+}
 
 # Mixed expressions
-do_execsql_test_on_specific_db {:memory:} update-returning-mixed-expressions {
+test update-returning-mixed-expressions {
     CREATE TABLE t (id INTEGER, name TEXT, value INTEGER);
     INSERT INTO t VALUES (1, 'test', 10);
     UPDATE t SET name = 'updated', value = 30 WHERE id = 1 RETURNING id, upper(name), value * 2, 42;
-} {1|UPDATED|60|42}
+}
+expect {
+    1|UPDATED|60|42
+}
 
 # Multiple rows
-do_execsql_test_on_specific_db {:memory:} update-returning-multiple-rows {
+test update-returning-multiple-rows {
     CREATE TABLE t (id INTEGER, name TEXT);
     INSERT INTO t VALUES (1, 'first'), (2, 'second'), (3, 'third');
     UPDATE t SET name = 'updated' RETURNING id, name;
-} {1|updated
-2|updated
-3|updated}
+}
+expect {
+    1|updated
+    2|updated
+    3|updated
+}
 
-do_execsql_test_on_specific_db {:memory:} update-returning-multiple-rows-expressions {
+test update-returning-multiple-rows-expressions {
     CREATE TABLE t (id INTEGER, value INTEGER);
     INSERT INTO t VALUES (1, 10), (2, 20), (3, 30);
     UPDATE t SET value = value * 2 RETURNING id, value;
-} {1|20
-2|40
-3|60}
+}
+expect {
+    1|20
+    2|40
+    3|60
+}
 
 # WHERE clause filtering
-do_execsql_test_on_specific_db {:memory:} update-returning-with-where {
+test update-returning-with-where {
     CREATE TABLE t (id INTEGER, name TEXT, active INTEGER);
     INSERT INTO t VALUES (1, 'first', 1), (2, 'second', 0), (3, 'third', 1);
     UPDATE t SET name = 'updated' WHERE active = 1 RETURNING id, name;
-} {1|updated
-3|updated}
+}
+expect {
+    1|updated
+    3|updated
+}
 
 # Old vs new values
-do_execsql_test_on_specific_db {:memory:} update-returning-old-vs-new-values {
+test update-returning-old-vs-new-values {
     CREATE TABLE t (id INTEGER, counter INTEGER);
     INSERT INTO t VALUES (1, 5);
     UPDATE t SET counter = counter + 10 WHERE id = 1 RETURNING id, counter;
-} {1|15}
+}
+expect {
+    1|15
+}
 
 # NULL handling
-do_execsql_test_on_specific_db {:memory:} update-returning-null-values {
+test update-returning-null-values {
     CREATE TABLE t (id INTEGER, name TEXT, value INTEGER);
     INSERT INTO t VALUES (1, 'test', 10);
     UPDATE t SET name = NULL, value = NULL WHERE id = 1 RETURNING id, name, value;
-} {1||}
+}
+expect {
+    1||
+}
 
-do_execsql_test_on_specific_db {:memory:} update-returning-null-expression {
+test update-returning-null-expression {
     CREATE TABLE t (id INTEGER, name TEXT);
     INSERT INTO t VALUES (1, 'test');
     UPDATE t SET name = NULL WHERE id = 1 RETURNING coalesce(name, 'default');
-} {default}
+}
+expect {
+    default
+}
 
 # Rowid
-do_execsql_test_on_specific_db {:memory:} update-returning-rowid {
+test update-returning-rowid {
     CREATE TABLE t (name TEXT);
     INSERT INTO t VALUES ('test');
     UPDATE t SET name = 'updated' RETURNING rowid, name;
-} {1|updated}
+}
+expect {
+    1|updated
+}
 
-do_execsql_test_on_specific_db {:memory:} update-returning-rowid-expression {
+test update-returning-rowid-expression {
     CREATE TABLE t (name TEXT);
     INSERT INTO t VALUES ('test');
     UPDATE t SET name = 'updated' RETURNING rowid * 2;
-} {2}
+}
+expect {
+    2
+}
 
 # Complex nested expressions
-do_execsql_test_on_specific_db {:memory:} update-returning-nested-expressions {
+test update-returning-nested-expressions {
     CREATE TABLE t (id INTEGER, x INTEGER, y INTEGER, z INTEGER);
     INSERT INTO t VALUES (1, 2, 3, 4);
     UPDATE t SET x = 5, y = 6 WHERE id = 1 RETURNING (x + y) * (z - 1);
-} {33}
+}
+expect {
+    33
+}
 
-do_execsql_test_on_specific_db {:memory:} update-returning-case-expression {
+test update-returning-case-expression {
     CREATE TABLE t (id INTEGER, value INTEGER);
     INSERT INTO t VALUES (1, 5);
     UPDATE t SET value = 15 WHERE id = 1 RETURNING CASE WHEN value > 10 THEN 'high' WHEN value > 0 THEN 'low' ELSE 'zero' END;
-} {high}
+}
+expect {
+    high
+}
 
 # String operations
-do_execsql_test_on_specific_db {:memory:} update-returning-string-concat {
+test update-returning-string-concat {
     CREATE TABLE t (id INTEGER, first TEXT, last TEXT);
     INSERT INTO t VALUES (1, 'John', 'Doe');
     UPDATE t SET first = 'Jane', last = 'Smith' WHERE id = 1 RETURNING first || ' ' || last;
-} {"Jane Smith"}
+}
+expect {
+    Jane Smith
+}
 
-do_execsql_test_on_specific_db {:memory:} update-returning-substring {
+test update-returning-substring {
     CREATE TABLE t (id INTEGER, name TEXT);
     INSERT INTO t VALUES (1, 'hello world');
     UPDATE t SET name = 'goodbye world' WHERE id = 1 RETURNING substr(name, 1, 7);
-} {goodbye}
+}
+expect {
+    goodbye
+}
 
 # Row value updates
-do_execsql_test_on_specific_db {:memory:} update-returning-row-values {
+test update-returning-row-values {
     CREATE TABLE t (id INTEGER, name TEXT);
     INSERT INTO t VALUES (1, 'test');
     UPDATE t SET (id, name) = (2, 'mordor') RETURNING id, name;
-} {2|mordor}
+}
+expect {
+    2|mordor
+}
 
 # ============================================================================
 # DELETE RETURNING tests
 # ============================================================================
-
 # Basic column references
-do_execsql_test_on_specific_db {:memory:} delete-returning-single-column {
+test delete-returning-single-column {
     CREATE TABLE t (id INTEGER, name TEXT, value REAL);
     INSERT INTO t VALUES (1, 'test', 10.5);
     DELETE FROM t WHERE id = 1 RETURNING id;
-} {1}
+}
+expect {
+    1
+}
 
-do_execsql_test_on_specific_db {:memory:} delete-returning-multiple-columns {
+test delete-returning-multiple-columns {
     CREATE TABLE t (id INTEGER, name TEXT, value REAL);
     INSERT INTO t VALUES (1, 'test', 10.5);
     DELETE FROM t WHERE id = 1 RETURNING id, name;
-} {1|test}
+}
+expect {
+    1|test
+}
 
-do_execsql_test_on_specific_db {:memory:} delete-returning-all-columns {
+test delete-returning-all-columns {
     CREATE TABLE t (id INTEGER, name TEXT, value REAL);
     INSERT INTO t VALUES (1, 'test', 10.5);
     DELETE FROM t WHERE id = 1 RETURNING *;
-} {1|test|10.5}
+}
+expect {
+    1|test|10.5
+}
 
 # Table-qualified column references
-do_execsql_test_on_specific_db {:memory:} delete-returning-table-qualified {
+test delete-returning-table-qualified {
     CREATE TABLE t (id INTEGER, name TEXT);
     INSERT INTO t VALUES (1, 'test');
     DELETE FROM t WHERE id = 1 RETURNING t.id, t.name;
-} {1|test}
+}
+expect {
+    1|test
+}
 
 # Arbitrary expressions not referencing columns
-do_execsql_test_on_specific_db {:memory:} delete-returning-literal {
+test delete-returning-literal {
     CREATE TABLE t (id INTEGER);
     INSERT INTO t VALUES (1);
     DELETE FROM t WHERE id = 1 RETURNING 42;
-} {42}
+}
+expect {
+    42
+}
 
-do_execsql_test_on_specific_db {:memory:} delete-returning-constant-expression {
+test delete-returning-constant-expression {
     CREATE TABLE t (id INTEGER);
     INSERT INTO t VALUES (1);
     DELETE FROM t WHERE id = 1 RETURNING 2 + 3 * 4;
-} {14}
+}
+expect {
+    14
+}
 
 # Expressions referencing deleted columns
-do_execsql_test_on_specific_db {:memory:} delete-returning-column-arithmetic {
+test delete-returning-column-arithmetic {
     CREATE TABLE t (id INTEGER, value INTEGER);
     INSERT INTO t VALUES (1, 10);
     DELETE FROM t WHERE id = 1 RETURNING 2 * value;
-} {20}
+}
+expect {
+    20
+}
 
-do_execsql_test_on_specific_db {:memory:} delete-returning-complex-expression {
+test delete-returning-complex-expression {
     CREATE TABLE t (id INTEGER, x INTEGER, y INTEGER);
     INSERT INTO t VALUES (1, 5, 3);
     DELETE FROM t WHERE id = 1 RETURNING x + y * 2;
-} {11}
+}
+expect {
+    11
+}
 
-do_execsql_test_on_specific_db {:memory:} delete-returning-function-call {
+test delete-returning-function-call {
     CREATE TABLE t (id INTEGER, name TEXT);
     INSERT INTO t VALUES (1, 'hello');
     DELETE FROM t WHERE id = 1 RETURNING upper(name);
-} {HELLO}
+}
+expect {
+    HELLO
+}
 
-do_execsql_test_on_specific_db {:memory:} delete-returning-mixed-expressions {
+test delete-returning-mixed-expressions {
     CREATE TABLE t (id INTEGER, name TEXT, value INTEGER);
     INSERT INTO t VALUES (1, 'test', 10);
     DELETE FROM t WHERE id = 1 RETURNING id, upper(name), value * 3;
-} {1|TEST|30}
+}
+expect {
+    1|TEST|30
+}
 
 # Multiple rows deleted
-do_execsql_test_on_specific_db {:memory:} delete-returning-multiple-rows {
+test delete-returning-multiple-rows {
     CREATE TABLE t (id INTEGER, name TEXT);
     INSERT INTO t VALUES (1, 'first'), (2, 'second'), (3, 'third');
     DELETE FROM t RETURNING id, name;
-} {1|first
-2|second
-3|third}
+}
+expect {
+    1|first
+    2|second
+    3|third
+}
 
-do_execsql_test_on_specific_db {:memory:} delete-returning-multiple-rows-expressions {
+test delete-returning-multiple-rows-expressions {
     CREATE TABLE t (id INTEGER, value INTEGER);
     INSERT INTO t VALUES (1, 10), (2, 20), (3, 30);
     DELETE FROM t RETURNING id, value * 2;
-} {1|20
-2|40
-3|60}
+}
+expect {
+    1|20
+    2|40
+    3|60
+}
 
 # NULL handling
-do_execsql_test_on_specific_db {:memory:} delete-returning-null-values {
+test delete-returning-null-values {
     CREATE TABLE t (id INTEGER, name TEXT, value INTEGER);
     INSERT INTO t VALUES (1, NULL, NULL);
     DELETE FROM t WHERE id = 1 RETURNING id, name, value;
-} {1||}
+}
+expect {
+    1||
+}
 
-do_execsql_test_on_specific_db {:memory:} delete-returning-null-expression {
+test delete-returning-null-expression {
     CREATE TABLE t (id INTEGER, name TEXT);
     INSERT INTO t VALUES (1, NULL);
     DELETE FROM t WHERE id = 1 RETURNING coalesce(name, 'default');
-} {default}
+}
+expect {
+    default
+}
 
 # Rowid
-do_execsql_test_on_specific_db {:memory:} delete-returning-rowid {
+test delete-returning-rowid {
     CREATE TABLE t (name TEXT);
     INSERT INTO t VALUES ('test');
     DELETE FROM t RETURNING rowid, name;
-} {1|test}
+}
+expect {
+    1|test
+}
 
-do_execsql_test_on_specific_db {:memory:} delete-returning-rowid-expression {
+test delete-returning-rowid-expression {
     CREATE TABLE t (name TEXT);
     INSERT INTO t VALUES ('test');
     DELETE FROM t RETURNING rowid * 2;
-} {2}
+}
+expect {
+    2
+}
 
 # WHERE clause filtering
-do_execsql_test_on_specific_db {:memory:} delete-returning-with-where {
+test delete-returning-with-where {
     CREATE TABLE t (id INTEGER, name TEXT);
     INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c');
     DELETE FROM t WHERE id > 1 RETURNING id, name;
-} {2|b
-3|c}
+}
+expect {
+    2|b
+    3|c
+}
 
-do_execsql_test_on_specific_db {:memory:} delete-returning-no-matches {
+test delete-returning-no-matches {
     CREATE TABLE t (id INTEGER, name TEXT);
     INSERT INTO t VALUES (1, 'test');
     DELETE FROM t WHERE id = 999 RETURNING *;
-} {}
+}
+expect {
+}
 
 # Expressions with string operations
-do_execsql_test_on_specific_db {:memory:} delete-returning-string-concat {
+test delete-returning-string-concat {
     CREATE TABLE t (id INTEGER, first TEXT, last TEXT);
     INSERT INTO t VALUES (1, 'John', 'Doe');
     DELETE FROM t WHERE id = 1 RETURNING first || ' ' || last;
-} {"John Doe"}
+}
+expect {
+    John Doe
+}
 
-do_execsql_test_on_specific_db {:memory:} delete-returning-substring {
+test delete-returning-substring {
     CREATE TABLE t (id INTEGER, name TEXT);
     INSERT INTO t VALUES (1, 'hello world');
     DELETE FROM t WHERE id = 1 RETURNING substr(name, 1, 5);
-} {hello}
+}
+expect {
+    hello
+}
 
 # Case expressions
-do_execsql_test_on_specific_db {:memory:} delete-returning-case-expression {
+test delete-returning-case-expression {
     CREATE TABLE t (id INTEGER, value INTEGER);
     INSERT INTO t VALUES (1, 5);
     DELETE FROM t WHERE id = 1 RETURNING CASE WHEN value > 10 THEN 'high' WHEN value > 0 THEN 'low' ELSE 'zero' END;
-} {low}
+}
+expect {
+    low
+}
 
 # Nested expressions
-do_execsql_test_on_specific_db {:memory:} delete-returning-nested-expressions {
+test delete-returning-nested-expressions {
     CREATE TABLE t (id INTEGER, x INTEGER, y INTEGER, z INTEGER);
     INSERT INTO t VALUES (1, 2, 3, 4);
     DELETE FROM t WHERE id = 1 RETURNING (x + y) * (z - 1);
-} {15}
+}
+expect {
+    15
+}
 
 # ============================================================================
 # DELETE RETURNING NASTY EDGE CASES
 # ============================================================================
-
 # Multiple references to same column in RETURNING
-do_execsql_test_on_specific_db {:memory:} delete-returning-multiple-column-references {
+test delete-returning-multiple-column-references {
     CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER);
     INSERT INTO t VALUES (1, 10), (2, 20), (3, 30);
     DELETE FROM t WHERE id = 2 RETURNING x, x * 2, x + x;
-} {20|40|40}
+}
+expect {
+    20|40|40
+}
 
 # Column aliases in RETURNING
-do_execsql_test_on_specific_db {:memory:} delete-returning-column-aliases {
+test delete-returning-column-aliases {
     CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER, y INTEGER);
     INSERT INTO t VALUES (1, 1, 2), (2, 3, 4);
     DELETE FROM t WHERE x = 1 RETURNING x AS deleted_x, y AS deleted_y, x + y AS sum;
-} {1|2|3}
+}
+expect {
+    1|2|3
+}
 
 # Complex WHERE clauses with IN
-do_execsql_test_on_specific_db {:memory:} delete-returning-where-in {
+test delete-returning-where-in {
     CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER);
     INSERT INTO t VALUES (1, 1), (2, 2), (3, 3);
     DELETE FROM t WHERE val IN (1, 3) RETURNING *;
-} {1|1
-3|3}
+}
+expect {
+    1|1
+    3|3
+}
 
 # Complex WHERE clauses with BETWEEN
-do_execsql_test_on_specific_db {:memory:} delete-returning-where-between {
+test delete-returning-where-between {
     CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER, y INTEGER);
     INSERT INTO t VALUES (1, 1, 10), (2, 2, 20), (3, 3, 30);
     DELETE FROM t WHERE x BETWEEN 1 AND 2 RETURNING id, x, y, x + y;
-} {1|1|10|11
-2|2|20|22}
+}
+expect {
+    1|1|10|11
+    2|2|20|22
+}
 
 # Complex WHERE clauses with LIKE
-do_execsql_test_on_specific_db {:memory:} delete-returning-where-like {
+test delete-returning-where-like {
     CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT);
     INSERT INTO t VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Charlie');
     DELETE FROM t WHERE name LIKE 'B%' RETURNING *;
-} {2|Bob}
+}
+expect {
+    2|Bob
+}
 
 # Complex WHERE clauses with AND/OR
-do_execsql_test_on_specific_db {:memory:} delete-returning-where-complex {
+test delete-returning-where-complex {
     CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER);
     INSERT INTO t VALUES (1, 5), (2, 10), (3, 15);
     DELETE FROM t WHERE x > 5 AND x < 15 RETURNING id, x, x * x, x + x + x;
-} {2|10|100|30}
+}
+expect {
+    2|10|100|30
+}
 
 # WHERE clause with modulo operator
-do_execsql_test_on_specific_db {:memory:} delete-returning-where-modulo {
+test delete-returning-where-modulo {
     CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, val INTEGER);
     INSERT INTO t VALUES (1, 'a', 1), (2, 'b', 2), (3, 'c', 3);
     DELETE FROM t WHERE val % 2 = 0 RETURNING id, name, val, length(name), abs(val);
-} {2|b|2|1|2}
+}
+expect {
+    2|b|2|1|2
+}
 
 # WHERE clause with subquery (correlated) - NOT SUPPORTED YET
 # do_execsql_test_on_specific_db {:memory:} delete-returning-where-subquery {
@@ -737,659 +1025,966 @@ do_execsql_test_on_specific_db {:memory:} delete-returning-where-modulo {
 #     INSERT INTO t VALUES (1, 1), (2, 2), (3, 3);
 #     DELETE FROM t WHERE x = (SELECT MAX(x) FROM t) RETURNING *;
 # } {3|3}
-
 # WHERE clause with IN subquery - NOT SUPPORTED YET
 # do_execsql_test_on_specific_db {:memory:} delete-returning-where-in-subquery {
 #     CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER);
 #     INSERT INTO t VALUES (1, 1, 2), (2, 3, 4), (3, 5, 6);
 #     DELETE FROM t WHERE a IN (SELECT a FROM t WHERE a > 3) RETURNING *;
 # } {3|5|6}
-
 # WHERE clause that matches nothing
-do_execsql_test_on_specific_db {:memory:} delete-returning-where-false {
+test delete-returning-where-false {
     CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT);
     INSERT INTO t VALUES (1, 'test');
     DELETE FROM t WHERE 1=0 RETURNING *;
-} {}
+}
+expect {
+}
 
 # Rowid and INTEGER PRIMARY KEY together
-do_execsql_test_on_specific_db {:memory:} delete-returning-rowid-and-pk {
+test delete-returning-rowid-and-pk {
     CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT);
     INSERT INTO t VALUES (1, 'a'), (2, 'b');
     DELETE FROM t RETURNING rowid, id, name;
-} {1|1|a
-2|2|b}
+}
+expect {
+    1|1|a
+    2|2|b
+}
 
 # AUTOINCREMENT with RETURNING
-do_execsql_test_on_specific_db {:memory:} delete-returning-autoincrement {
+test delete-returning-autoincrement {
     CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT);
     INSERT INTO t VALUES (NULL, 'a'), (NULL, 'b');
     DELETE FROM t RETURNING id, name;
-} {1|a
-2|b}
+}
+expect {
+    1|a
+    2|b
+}
 
 # Type functions in RETURNING
-do_execsql_test_on_specific_db {:memory:} delete-returning-typeof {
+test delete-returning-typeof {
     CREATE TABLE t (id INTEGER PRIMARY KEY, x REAL, y TEXT);
     INSERT INTO t VALUES (1, 1.5, 'test'), (2, 2.5, 'foo');
     DELETE FROM t RETURNING id, x, y, typeof(x), typeof(y);
-} {1|1.5|test|real|text
-2|2.5|foo|real|text}
+}
+expect {
+    1|1.5|test|real|text
+    2|2.5|foo|real|text
+}
 
 # NULL handling with coalesce
-do_execsql_test_on_specific_db {:memory:} delete-returning-null-coalesce {
+test delete-returning-null-coalesce {
     CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER);
     INSERT INTO t VALUES (1, NULL), (2, 42), (3, NULL);
     DELETE FROM t WHERE val IS NULL RETURNING id, val, coalesce(val, 999);
-} {1||999
-3||999}
+}
+expect {
+    1||999
+    3||999
+}
 
 # BLOB handling
-do_execsql_test_on_specific_db {:memory:} delete-returning-blob {
+test delete-returning-blob {
     CREATE TABLE t (id INTEGER PRIMARY KEY, val BLOB);
     INSERT INTO t VALUES (1, zeroblob(10)), (2, x'0102');
     DELETE FROM t RETURNING id, length(val), typeof(val);
-} {1|10|blob
-2|2|blob}
+}
+expect {
+    1|10|blob
+    2|2|blob
+}
 
 # printf function in RETURNING
-do_execsql_test_on_specific_db {:memory:} delete-returning-printf {
+test delete-returning-printf {
     CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT);
     INSERT INTO t VALUES (1, 'hello'), (2, 'world');
     DELETE FROM t WHERE name = 'hello' RETURNING printf('Deleted: %s', name);
-} {"Deleted: hello"}
+}
+expect {
+    Deleted: hello
+}
 
 # Additional edge cases
-do_execsql_test_on_specific_db {:memory:} delete-returning-empty-string-null {
+test delete-returning-empty-string-null {
     CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT);
     INSERT INTO t VALUES (1, 'hello'), (2, ''), (3, NULL);
     DELETE FROM t RETURNING id, name, length(name), name IS NULL;
-} {1|hello|5|0
-2||0|0
-3|||1}
+}
+expect {
+    1|hello|5|0
+    2||0|0
+    3|||1
+}
 
-do_execsql_test_on_specific_db {:memory:} delete-returning-string-concat-numbers {
+test delete-returning-string-concat-numbers {
     CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER, y INTEGER);
     INSERT INTO t VALUES (1, 1, 2), (2, 3, 4);
     DELETE FROM t WHERE x = 1 RETURNING x, y, x + y, x * y, x || y;
-} {1|2|3|2|12}
+}
+expect {
+    1|2|3|2|12
+}
 
-do_execsql_test_on_specific_db {:memory:} delete-returning-round-precision {
+test delete-returning-round-precision {
     CREATE TABLE t (id INTEGER PRIMARY KEY, val REAL);
     INSERT INTO t VALUES (1, 1.23456789), (2, 9.999999);
     DELETE FROM t RETURNING id, val, round(val, 2);
-} {1|1.23456789|1.23
-2|9.999999|10.0}
+}
+expect {
+    1|1.23456789|1.23
+    2|9.999999|10.0
+}
+expect @js {
+    1|1.23456789|1.23
+    2|9.999999|10
+}
 
-do_execsql_test_on_specific_db {:memory:} delete-returning-glob-pattern {
+test delete-returning-glob-pattern {
     CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT);
     INSERT INTO t VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Charlie');
     DELETE FROM t WHERE name GLOB '[BC]*' RETURNING *;
-} {2|Bob
-3|Charlie}
+}
+expect {
+    2|Bob
+    3|Charlie
+}
 
-do_execsql_test_on_specific_db {:memory:} delete-returning-operator-precedence {
+test delete-returning-operator-precedence {
     CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c INTEGER);
     INSERT INTO t VALUES (1, 1, 2, 3), (2, 4, 5, 6);
     DELETE FROM t RETURNING a, b, c, a + b * c, (a + b) * c;
-} {1|2|3|7|9
-4|5|6|34|54}
+}
+expect {
+    1|2|3|7|9
+    4|5|6|34|54
+}
 
-do_execsql_test_on_specific_db {:memory:} delete-returning-large-numbers {
+test delete-returning-large-numbers {
     CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER);
     INSERT INTO t VALUES (1, 999999999), (2, -999999999), (3, 0);
     DELETE FROM t RETURNING id, val, val + 1, val * 2;
-} {1|999999999|1000000000|1999999998
-2|-999999999|-999999998|-1999999998
-3|0|1|0}
+}
+expect {
+    1|999999999|1000000000|1999999998
+    2|-999999999|-999999998|-1999999998
+    3|0|1|0
+}
 
-do_execsql_test_on_specific_db {:memory:} delete-returning-nullif-coalesce {
+test delete-returning-nullif-coalesce {
     CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT);
     INSERT INTO t VALUES (1, 'test'), (2, 'test'), (3, 'other');
     DELETE FROM t WHERE name = 'test' RETURNING id, name, NULLIF(name, 'test'), COALESCE(NULLIF(name, 'test'), 'was_test');
-} {1|test||was_test
-2|test||was_test}
+}
+expect {
+    1|test||was_test
+    2|test||was_test
+}
 
-do_execsql_test_on_specific_db {:memory:} delete-returning-iif-null-handling {
+test delete-returning-iif-null-handling {
     CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER, y INTEGER);
     INSERT INTO t VALUES (1, 5, 10), (2, NULL, 20), (3, 15, NULL);
     DELETE FROM t RETURNING id, x, y, IIF(x IS NULL OR y IS NULL, 'has_null', x + y);
-} {1|5|10|15
-2||20|has_null
-3|15||has_null}
+}
+expect {
+    1|5|10|15
+    2||20|has_null
+    3|15||has_null
+}
 
-do_execsql_test_on_specific_db {:memory:} delete-returning-string-functions {
+test delete-returning-string-functions {
     CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT);
     INSERT INTO t VALUES (1, 'hello'), (2, 'world');
     DELETE FROM t RETURNING id, name, upper(name), lower(name), length(name);
-} {1|hello|HELLO|hello|5
-2|world|WORLD|world|5}
+}
+expect {
+    1|hello|HELLO|hello|5
+    2|world|WORLD|world|5
+}
 
-do_execsql_test_on_specific_db {:memory:} delete-returning-replace-function {
+test delete-returning-replace-function {
     CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT);
     INSERT INTO t VALUES (1, 'hello world'), (2, 'foo bar');
     DELETE FROM t RETURNING id, name, replace(name, ' ', '_') AS replaced;
-} {"1|hello world|hello_world
-2|foo bar|foo_bar"}
+}
+expect {
+    1|hello world|hello_world
+    2|foo bar|foo_bar
+}
 
-do_execsql_test_on_specific_db {:memory:} delete-returning-abs-sign {
+test delete-returning-abs-sign {
     CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER);
     INSERT INTO t VALUES (1, 42), (2, -10), (3, 0);
     DELETE FROM t RETURNING id, val, abs(val), sign(val);
-} {1|42|42|1
-2|-10|10|-1
-3|0|0|0}
+}
+expect {
+    1|42|42|1
+    2|-10|10|-1
+    3|0|0|0
+}
 
-do_execsql_test_on_specific_db {:memory:} delete-returning-coalesce-arithmetic {
+test delete-returning-coalesce-arithmetic {
     CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER, y INTEGER);
     INSERT INTO t VALUES (1, 5, NULL), (2, NULL, 10), (3, NULL, NULL);
     DELETE FROM t RETURNING id, x, y, coalesce(x, 0) + coalesce(y, 0);
-} {1|5||5
-2||10|10
-3|||0}
+}
+expect {
+    1|5||5
+    2||10|10
+    3|||0
+}
 
-do_execsql_test_on_specific_db {:memory:} delete-returning-case-expression {
+test delete-returning-case-expression-2 {
     CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, val INTEGER);
     INSERT INTO t VALUES (1, 'test', 10), (2, 'test', 20);
     DELETE FROM t WHERE val = 10 RETURNING id, name, val, CASE WHEN val > 15 THEN 'high' ELSE 'low' END;
-} {1|test|10|low}
+}
+expect {
+    1|test|10|low
+}
 
-do_execsql_test_on_specific_db {:memory:} delete-returning-type-cast {
+test delete-returning-type-cast {
     CREATE TABLE t (id INTEGER PRIMARY KEY, x REAL, y INTEGER);
     INSERT INTO t VALUES (1, 1.5, 2), (2, 3.7, 4);
     DELETE FROM t RETURNING id, x, y, round(x), cast(x AS INTEGER);
-} {1|1.5|2|2.0|1
-2|3.7|4|4.0|3}
+}
+expect {
+    1|1.5|2|2.0|1
+    2|3.7|4|4.0|3
+}
+expect @js {
+    1|1.5|2|2|1
+    2|3.7|4|4|3
+}
 
 # ============================================================================
 # Edge cases and complex scenarios
 # ============================================================================
-
 # RETURNING expressions that don't reference any columns
-do_execsql_test_on_specific_db {:memory:} insert-returning-no-column-reference {
+test insert-returning-no-column-reference {
     CREATE TABLE t (id INTEGER);
     INSERT INTO t VALUES (1) RETURNING 1 + 1, 'constant', NULL;
-} {2|constant|}
+}
+expect {
+    2|constant|
+}
 
-do_execsql_test_on_specific_db {:memory:} update-returning-no-column-reference {
+test update-returning-no-column-reference {
     CREATE TABLE t (id INTEGER);
     INSERT INTO t VALUES (1);
     UPDATE t SET id = 2 RETURNING 1 + 1, 'constant', NULL;
-} {2|constant|}
+}
+expect {
+    2|constant|
+}
 
-do_execsql_test_on_specific_db {:memory:} delete-returning-no-column-reference {
+test delete-returning-no-column-reference {
     CREATE TABLE t (id INTEGER);
     INSERT INTO t VALUES (1);
     DELETE FROM t WHERE id = 1 RETURNING 1 + 1, 'constant', NULL;
-} {2|constant|}
+}
+expect {
+    2|constant|
+}
 
 # RETURNING with aggregate-like expressions (should work per-row)
-do_execsql_test_on_specific_db {:memory:} insert-returning-sum-expression {
+test insert-returning-sum-expression {
     CREATE TABLE t (id INTEGER, a INTEGER, b INTEGER);
     INSERT INTO t VALUES (1, 2, 3) RETURNING a + b;
-} {5}
+}
+expect {
+    5
+}
 
-do_execsql_test_on_specific_db {:memory:} update-returning-sum-expression {
+test update-returning-sum-expression {
     CREATE TABLE t (id INTEGER, a INTEGER, b INTEGER);
     INSERT INTO t VALUES (1, 2, 3);
     UPDATE t SET a = 5, b = 7 WHERE id = 1 RETURNING a + b;
-} {12}
+}
+expect {
+    12
+}
 
 # ============================================================================
 # NASTY EDGE CASES - Things that should work but might break
 # ============================================================================
-
 # Column name same as table name - ambiguity resolution
-do_execsql_test_on_specific_db {:memory:} insert-returning-column-same-as-table-name {
+test insert-returning-column-same-as-table-name {
     CREATE TABLE t (t INTEGER, name TEXT);
     INSERT INTO t VALUES (1, 'test') RETURNING t.t, t.name;
-} {1|test}
+}
+expect {
+    1|test
+}
 
-do_execsql_test_on_specific_db {:memory:} insert-returning-column-same-as-table-name-unqualified {
+test insert-returning-column-same-as-table-name-unqualified {
     CREATE TABLE t (t INTEGER, name TEXT);
     INSERT INTO t VALUES (1, 'test') RETURNING t, name;
-} {1|test}
+}
+expect {
+    1|test
+}
 
 # RETURNING with rowid when INTEGER PRIMARY KEY exists - can reference both
-do_execsql_test_on_specific_db {:memory:} insert-returning-rowid-and-pk-alias {
+test insert-returning-rowid-and-pk-alias {
     CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT);
     INSERT INTO t VALUES (1, 'test') RETURNING rowid, id, name;
-} {1|1|test}
+}
+expect {
+    1|1|test
+}
 
-do_execsql_test_on_specific_db {:memory:} update-returning-rowid-and-pk-alias {
+test update-returning-rowid-and-pk-alias {
     CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT);
     INSERT INTO t VALUES (1, 'old');
     UPDATE t SET name = 'new' WHERE id = 1 RETURNING rowid, id, name;
-} {1|1|new}
+}
+expect {
+    1|1|new
+}
 
 # RETURNING with expressions referencing updated columns in UPDATE
-do_execsql_test_on_specific_db {:memory:} update-returning-reference-updated-column {
+test update-returning-reference-updated-column {
     CREATE TABLE t (id INTEGER, x INTEGER, y INTEGER);
     INSERT INTO t VALUES (1, 5, 10);
     UPDATE t SET x = 20 WHERE id = 1 RETURNING x, x * 2, x + y;
-} {20|40|30}
+}
+expect {
+    20|40|30
+}
 
-do_execsql_test_on_specific_db {:memory:} update-returning-reference-multiple-updated-columns {
+test update-returning-reference-multiple-updated-columns {
     CREATE TABLE t (id INTEGER, a INTEGER, b INTEGER, c INTEGER);
     INSERT INTO t VALUES (1, 1, 2, 3);
     UPDATE t SET a = 10, b = 20 WHERE id = 1 RETURNING a, b, a + b, a * b + c;
-} {10|20|30|203}
+}
+expect {
+    10|20|30|203
+}
 
 # RETURNING with NULLIF edge cases
-do_execsql_test_on_specific_db {:memory:} insert-returning-nullif {
+test insert-returning-nullif {
     CREATE TABLE t (id INTEGER, value INTEGER);
     INSERT INTO t VALUES (1, 5) RETURNING NULLIF(value, 5);
-} {}
+}
+expect {
+}
 
-do_execsql_test_on_specific_db {:memory:} insert-returning-nullif-no-match {
+test insert-returning-nullif-no-match {
     CREATE TABLE t (id INTEGER, value INTEGER);
     INSERT INTO t VALUES (1, 5) RETURNING NULLIF(value, 10);
-} {5}
+}
+expect {
+    5
+}
 
-do_execsql_test_on_specific_db {:memory:} update-returning-nullif {
+test update-returning-nullif {
     CREATE TABLE t (id INTEGER, value INTEGER);
     INSERT INTO t VALUES (1, 5);
     UPDATE t SET value = 10 WHERE id = 1 RETURNING NULLIF(value, 5);
-} {10}
+}
+expect {
+    10
+}
 
 # RETURNING with COALESCE multiple arguments
-do_execsql_test_on_specific_db {:memory:} insert-returning-coalesce-multiple {
+test insert-returning-coalesce-multiple {
     CREATE TABLE t (id INTEGER, a INTEGER, b INTEGER, c INTEGER);
     INSERT INTO t VALUES (1, NULL, NULL, 42) RETURNING COALESCE(a, b, c);
-} {42}
+}
+expect {
+    42
+}
 
-do_execsql_test_on_specific_db {:memory:} insert-returning-coalesce-all-null {
+test insert-returning-coalesce-all-null {
     CREATE TABLE t (id INTEGER, a INTEGER, b INTEGER);
     INSERT INTO t VALUES (1, NULL, NULL) RETURNING COALESCE(a, b, 'default');
-} {default}
+}
+expect {
+    default
+}
 
 # RETURNING with arithmetic on NULL
-do_execsql_test_on_specific_db {:memory:} insert-returning-null-arithmetic {
+test insert-returning-null-arithmetic {
     CREATE TABLE t (id INTEGER, x INTEGER, y INTEGER);
     INSERT INTO t VALUES (1, NULL, 5) RETURNING x + y, x * y, x - y;
-} {||}
+}
+expect {
+    ||
+}
 
-do_execsql_test_on_specific_db {:memory:} update-returning-null-arithmetic {
+test update-returning-null-arithmetic {
     CREATE TABLE t (id INTEGER, x INTEGER, y INTEGER);
     INSERT INTO t VALUES (1, 10, 5);
     UPDATE t SET x = NULL WHERE id = 1 RETURNING x + y, x * y;
-} {|}
+}
+expect {
+    |
+}
 
 # RETURNING with string functions on NULL
-do_execsql_test_on_specific_db {:memory:} insert-returning-string-func-null {
+test insert-returning-string-func-null {
     CREATE TABLE t (id INTEGER, name TEXT);
     INSERT INTO t VALUES (1, NULL) RETURNING upper(name), length(name), substr(name, 1, 5);
-} {||}
+}
+expect {
+    ||
+}
 
-do_execsql_test_on_specific_db {:memory:} update-returning-string-func-null {
+test update-returning-string-func-null {
     CREATE TABLE t (id INTEGER, name TEXT);
     INSERT INTO t VALUES (1, 'test');
     UPDATE t SET name = NULL WHERE id = 1 RETURNING upper(name), length(name);
-} {|}
+}
+expect {
+    |
+}
 
 # RETURNING with CASE expressions having NULL branches
-do_execsql_test_on_specific_db {:memory:} insert-returning-case-with-null {
+test insert-returning-case-with-null {
     CREATE TABLE t (id INTEGER, value INTEGER);
     INSERT INTO t VALUES (1, 5) RETURNING CASE WHEN value > 10 THEN 'high' WHEN value > 0 THEN NULL ELSE 'zero' END;
-} {}
+}
+expect {
+}
 
-do_execsql_test_on_specific_db {:memory:} insert-returning-case-nested {
+test insert-returning-case-nested {
     CREATE TABLE t (id INTEGER, a INTEGER, b INTEGER);
     INSERT INTO t VALUES (1, 5, 10) RETURNING CASE WHEN a > b THEN a WHEN a < b THEN b ELSE NULL END;
-} {10}
+}
+expect {
+    10
+}
 
 # RETURNING with type conversions
-do_execsql_test_on_specific_db {:memory:} insert-returning-type-conversion {
+test insert-returning-type-conversion {
     CREATE TABLE t (id INTEGER, value INTEGER);
     INSERT INTO t VALUES (1, 42) RETURNING CAST(value AS TEXT), CAST(value AS REAL);
-} {42|42.0}
+}
+expect {
+    42|42.0
+}
+expect @js {
+    42|42
+}
 
-do_execsql_test_on_specific_db {:memory:} update-returning-type-conversion {
+test update-returning-type-conversion {
     CREATE TABLE t (id INTEGER, value INTEGER);
     INSERT INTO t VALUES (1, 42);
     UPDATE t SET value = 100 WHERE id = 1 RETURNING CAST(value AS TEXT);
-} {100}
+}
+expect {
+    100
+}
 
 # RETURNING when updating rowid directly (if supported)
-do_execsql_test_on_specific_db {:memory:} update-rowid-returning {
+test update-rowid-returning {
     CREATE TABLE t (name TEXT);
     INSERT INTO t VALUES ('test');
     UPDATE t SET rowid = 999 WHERE rowid = 1 RETURNING rowid, name;
-} {999|test}
+}
+expect {
+    999|test
+}
 
 # RETURNING with expressions referencing columns not in result set
-do_execsql_test_on_specific_db {:memory:} insert-returning-reference-hidden-column {
+test insert-returning-reference-hidden-column {
     CREATE TABLE t (id INTEGER, secret INTEGER, public INTEGER);
     INSERT INTO t VALUES (1, 100, 50) RETURNING public, secret * 2;
-} {50|200}
+}
+expect {
+    50|200
+}
 
-do_execsql_test_on_specific_db {:memory:} update-returning-reference-hidden-column {
+test update-returning-reference-hidden-column {
     CREATE TABLE t (id INTEGER, secret INTEGER, public INTEGER);
     INSERT INTO t VALUES (1, 100, 50);
     UPDATE t SET public = 75 WHERE id = 1 RETURNING public, secret + public;
-} {75|175}
+}
+expect {
+    75|175
+}
 
 # RETURNING with duplicate column names in result (should work)
-do_execsql_test_on_specific_db {:memory:} insert-returning-duplicate-column-names {
+test insert-returning-duplicate-column-names {
     CREATE TABLE t (id INTEGER, name TEXT);
     INSERT INTO t VALUES (1, 'test') RETURNING id, id, name, name;
-} {1|1|test|test}
+}
+expect {
+    1|1|test|test
+}
 
-do_execsql_test_on_specific_db {:memory:} update-returning-duplicate-column-names {
+test update-returning-duplicate-column-names {
     CREATE TABLE t (id INTEGER, value INTEGER);
     INSERT INTO t VALUES (1, 10);
     UPDATE t SET value = 20 WHERE id = 1 RETURNING value, value * 2, value;
-} {20|40|20}
+}
+expect {
+    20|40|20
+}
 
 # RETURNING with expressions using column names as strings (should not work, but test anyway)
-do_execsql_test_on_specific_db {:memory:} insert-returning-column-name-as-string {
+test insert-returning-column-name-as-string {
     CREATE TABLE t (id INTEGER, name TEXT);
     INSERT INTO t VALUES (1, 'test') RETURNING 'id', 'name';
-} {id|name}
+}
+expect {
+    id|name
+}
 
 # RETURNING with excluded in regular INSERT (should error)
-do_execsql_test_in_memory_any_error insert-returning-excluded-not-upsert {
+test insert-returning-excluded-not-upsert {
     CREATE TABLE t (id INTEGER, name TEXT);
     INSERT INTO t VALUES (1, 'test') RETURNING excluded.name;
 }
+expect error {
+}
 
 # RETURNING with expressions referencing columns that were updated to NULL
-do_execsql_test_on_specific_db {:memory:} update-returning-updated-to-null {
+test update-returning-updated-to-null {
     CREATE TABLE t (id INTEGER, value INTEGER);
     INSERT INTO t VALUES (1, 42);
     UPDATE t SET value = NULL WHERE id = 1 RETURNING value, COALESCE(value, 0);
-} {|0}
+}
+expect {
+    |0
+}
 
 # RETURNING with expressions referencing columns that were updated from NULL
-do_execsql_test_on_specific_db {:memory:} update-returning-updated-from-null {
+test update-returning-updated-from-null {
     CREATE TABLE t (id INTEGER, value INTEGER);
     INSERT INTO t VALUES (1, NULL);
     UPDATE t SET value = 42 WHERE id = 1 RETURNING value, COALESCE(value, 0);
-} {42|42}
+}
+expect {
+    42|42
+}
 
 # RETURNING with expressions that use backticks
-do_execsql_test_on_specific_db {:memory:} insert-returning-backtick-columns {
+test insert-returning-backtick-columns {
     CREATE TABLE t (`id` INTEGER, `name` TEXT);
     INSERT INTO t VALUES (1, 'test') RETURNING `id`, `name`;
-} {1|test}
+}
+expect {
+    1|test
+}
+
+setup dqs_dml {
+    .dbconfig dqs_dml on
+}
 
 # RETURNING with expressions that use double quotes (if DQS enabled)
-do_execsql_test_skip_lines_on_specific_db 1 {:memory:} insert-returning-double-quote-columns {
-    .dbconfig dqs_dml on
+@backend cli
+@setup dqs_dml
+test insert-returning-double-quote-columns {
     CREATE TABLE t ("id" INTEGER, "name" TEXT);
     INSERT INTO t VALUES (1, 'test') RETURNING "id", "name";
-} {1|test}
+} 
+expect {
+    1|test
+}
 
 # RETURNING with expressions referencing columns in different cases (case sensitivity)
-do_execsql_test_on_specific_db {:memory:} insert-returning-case-insensitive {
+test insert-returning-case-insensitive {
     CREATE TABLE t (ID INTEGER, Name TEXT);
     INSERT INTO t VALUES (1, 'test') RETURNING id, name, ID, Name;
-} {1|test|1|test}
+}
+expect {
+    1|test|1|test
+}
 
 # RETURNING with expressions that reference columns that don't exist (should error)
-do_execsql_test_in_memory_any_error insert-returning-nonexistent-column {
+test insert-returning-nonexistent-column {
     CREATE TABLE t (id INTEGER);
     INSERT INTO t VALUES (1) RETURNING nonexistent;
 }
+expect error {
+}
 
-do_execsql_test_in_memory_any_error update-returning-nonexistent-column {
+test update-returning-nonexistent-column {
     CREATE TABLE t (id INTEGER);
     INSERT INTO t VALUES (1);
     UPDATE t SET id = 2 RETURNING nonexistent;
 }
+expect error {
+}
 
 # RETURNING with expressions that reference wrong table (should error)
-do_execsql_test_in_memory_any_error insert-returning-wrong-table {
+test insert-returning-wrong-table {
     CREATE TABLE t1 (id INTEGER);
     CREATE TABLE t2 (id INTEGER);
     INSERT INTO t1 VALUES (1) RETURNING t2.id;
 }
+expect error {
+}
 
 # RETURNING with expressions that mix table-qualified and unqualified
-do_execsql_test_on_specific_db {:memory:} insert-returning-mixed-qualification {
+test insert-returning-mixed-qualification {
     CREATE TABLE t (id INTEGER, name TEXT);
     INSERT INTO t VALUES (1, 'test') RETURNING t.id, name, t.name, id;
-} {1|test|test|1}
+}
+expect {
+    1|test|test|1
+}
 
 # RETURNING with expressions that reference columns updated in SET clause
-do_execsql_test_on_specific_db {:memory:} update-returning-set-clause-reference {
+test update-returning-set-clause-reference {
     CREATE TABLE t (id INTEGER, x INTEGER, y INTEGER);
     INSERT INTO t VALUES (1, 5, 10);
     UPDATE t SET x = 20, y = x + 10 WHERE id = 1 RETURNING x, y;
-} {20|15}
+}
+expect {
+    20|15
+}
 
 # RETURNING with expressions that reference columns in order of update
-do_execsql_test_on_specific_db {:memory:} update-returning-order-dependent {
+test update-returning-order-dependent {
     CREATE TABLE t (id INTEGER, a INTEGER, b INTEGER);
     INSERT INTO t VALUES (1, 1, 2);
     UPDATE t SET a = b, b = a WHERE id = 1 RETURNING a, b;
-} {2|1}
+}
+expect {
+    2|1
+}
 
 # RETURNING with empty result set (no rows affected)
-do_execsql_test_on_specific_db {:memory:} update-returning-no-rows {
+test update-returning-no-rows {
     CREATE TABLE t (id INTEGER, name TEXT);
     INSERT INTO t VALUES (1, 'test');
     UPDATE t SET name = 'updated' WHERE id = 999 RETURNING id, name;
-} {}
+}
+expect {
+}
 
 # RETURNING with expressions using || operator on NULL
-do_execsql_test_on_specific_db {:memory:} insert-returning-concat-null {
+test insert-returning-concat-null {
     CREATE TABLE t (id INTEGER, first TEXT, last TEXT);
     INSERT INTO t VALUES (1, NULL, 'Doe') RETURNING first || ' ' || last;
-} {}
+}
+expect {
+}
 
-do_execsql_test_on_specific_db {:memory:} insert-returning-concat-both-null {
+test insert-returning-concat-both-null {
     CREATE TABLE t (id INTEGER, first TEXT, last TEXT);
     INSERT INTO t VALUES (1, NULL, NULL) RETURNING first || ' ' || last;
-} {}
+}
+expect {
+}
 
 # RETURNING with expressions using IN operator
-do_execsql_test_on_specific_db {:memory:} insert-returning-in-operator {
+test insert-returning-in-operator {
     CREATE TABLE t (id INTEGER, value INTEGER);
     INSERT INTO t VALUES (1, 5) RETURNING value IN (1, 2, 3, 4, 5);
-} {1}
+}
+expect {
+    1
+}
 
-do_execsql_test_on_specific_db {:memory:} insert-returning-in-operator-false {
+test insert-returning-in-operator-false {
     CREATE TABLE t (id INTEGER, value INTEGER);
     INSERT INTO t VALUES (1, 10) RETURNING value IN (1, 2, 3, 4, 5);
-} {0}
+}
+expect {
+    0
+}
 
 # RETURNING with expressions using LIKE operator
-do_execsql_test_on_specific_db {:memory:} insert-returning-like-operator {
+test insert-returning-like-operator {
     CREATE TABLE t (id INTEGER, name TEXT);
     INSERT INTO t VALUES (1, 'hello world') RETURNING name LIKE 'hello%';
-} {1}
+}
+expect {
+    1
+}
 
-do_execsql_test_on_specific_db {:memory:} insert-returning-like-operator-false {
+test insert-returning-like-operator-false {
     CREATE TABLE t (id INTEGER, name TEXT);
     INSERT INTO t VALUES (1, 'hello world') RETURNING name LIKE 'goodbye%';
-} {0}
+}
+expect {
+    0
+}
 
 # RETURNING with expressions using IS NULL
-do_execsql_test_on_specific_db {:memory:} insert-returning-is-null {
+test insert-returning-is-null {
     CREATE TABLE t (id INTEGER, value INTEGER);
     INSERT INTO t VALUES (1, NULL) RETURNING value IS NULL;
-} {1}
+}
+expect {
+    1
+}
 
-do_execsql_test_on_specific_db {:memory:} insert-returning-is-not-null {
+test insert-returning-is-not-null {
     CREATE TABLE t (id INTEGER, value INTEGER);
     INSERT INTO t VALUES (1, 42) RETURNING value IS NOT NULL;
-} {1}
+}
+expect {
+    1
+}
 
 # RETURNING with expressions using BETWEEN
-do_execsql_test_on_specific_db {:memory:} insert-returning-between {
+test insert-returning-between {
     CREATE TABLE t (id INTEGER, value INTEGER);
     INSERT INTO t VALUES (1, 5) RETURNING value BETWEEN 1 AND 10;
-} {1}
+}
+expect {
+    1
+}
 
-do_execsql_test_on_specific_db {:memory:} insert-returning-between-false {
+test insert-returning-between-false {
     CREATE TABLE t (id INTEGER, value INTEGER);
     INSERT INTO t VALUES (1, 15) RETURNING value BETWEEN 1 AND 10;
-} {0}
+}
+expect {
+    0
+}
 
 # RETURNING with expressions using GLOB (if supported)
-do_execsql_test_on_specific_db {:memory:} insert-returning-glob {
+test insert-returning-glob {
     CREATE TABLE t (id INTEGER, name TEXT);
     INSERT INTO t VALUES (1, 'hello.txt') RETURNING name GLOB '*.txt';
-} {1}
+}
+expect {
+    1
+}
 
 # RETURNING with expressions that overflow (large numbers)
-do_execsql_test_on_specific_db {:memory:} insert-returning-large-number {
+test insert-returning-large-number {
     CREATE TABLE t (id INTEGER, value INTEGER);
     INSERT INTO t VALUES (1, 9223372036854775807) RETURNING value;
-} {9223372036854775807}
+}
+expect {
+    9223372036854775807
+}
 
 # RETURNING with expressions using ABS on negative
-do_execsql_test_on_specific_db {:memory:} insert-returning-abs-negative {
+test insert-returning-abs-negative {
     CREATE TABLE t (id INTEGER, value INTEGER);
     INSERT INTO t VALUES (1, -42) RETURNING ABS(value);
-} {42}
+}
+expect {
+    42
+}
 
 # RETURNING with expressions using MAX/MIN (should work per-row, not aggregate)
-do_execsql_test_on_specific_db {:memory:} insert-returning-max-min-per-row {
+test insert-returning-max-min-per-row {
     CREATE TABLE t (id INTEGER, a INTEGER, b INTEGER);
     INSERT INTO t VALUES (1, 5, 10) RETURNING MAX(a, b), MIN(a, b);
-} {10|5}
+}
+expect {
+    10|5
+}
 
 # RETURNING with expressions using ROUND
-do_execsql_test_on_specific_db {:memory:} insert-returning-round {
+test insert-returning-round {
     CREATE TABLE t (id INTEGER, value REAL);
     INSERT INTO t VALUES (1, 3.14159) RETURNING ROUND(value, 2);
-} {3.14}
+}
+expect {
+    3.14
+}
 
 # RETURNING with expressions using LENGTH on empty string
-do_execsql_test_on_specific_db {:memory:} insert-returning-length-empty {
+test insert-returning-length-empty {
     CREATE TABLE t (id INTEGER, name TEXT);
     INSERT INTO t VALUES (1, '') RETURNING LENGTH(name);
-} {0}
+}
+expect {
+    0
+}
 
 # RETURNING with expressions using TRIM
-do_execsql_test_on_specific_db {:memory:} insert-returning-trim {
+test insert-returning-trim {
     CREATE TABLE t (id INTEGER, name TEXT);
     INSERT INTO t VALUES (1, '  hello  ') RETURNING TRIM(name);
-} {hello}
+}
+expect {
+    hello
+}
 
 # RETURNING with expressions using REPLACE
-do_execsql_test_on_specific_db {:memory:} insert-returning-replace {
+test insert-returning-replace {
     CREATE TABLE t (id INTEGER, name TEXT);
     INSERT INTO t VALUES (1, 'hello world') RETURNING REPLACE(name, 'world', 'universe');
-} {"hello universe"}
+}
+expect {
+    hello universe
+}
 
 # RETURNING with expressions using LOWER/UPPER on mixed case
-do_execsql_test_on_specific_db {:memory:} insert-returning-lower-upper {
+test insert-returning-lower-upper {
     CREATE TABLE t (id INTEGER, name TEXT);
     INSERT INTO t VALUES (1, 'HeLLo WoRLd') RETURNING LOWER(name), UPPER(name);
-} {"hello world|HELLO WORLD"}
+}
+expect {
+    hello world|HELLO WORLD
+}
 
 # RETURNING with expressions using SUBSTR with negative start
-do_execsql_test_on_specific_db {:memory:} insert-returning-substr-negative {
+test insert-returning-substr-negative {
     CREATE TABLE t (id INTEGER, name TEXT);
     INSERT INTO t VALUES (1, 'hello') RETURNING SUBSTR(name, -3);
-} {llo}
+}
+expect {
+    llo
+}
 
 # RETURNING with expressions using CHAR (if supported)
-do_execsql_test_on_specific_db {:memory:} insert-returning-char {
+test insert-returning-char {
     CREATE TABLE t (id INTEGER, value INTEGER);
     INSERT INTO t VALUES (1, 65) RETURNING CHAR(value);
-} {A}
+}
+expect {
+    A
+}
 
 # RETURNING with expressions using UNICODE (if supported)
-do_execsql_test_on_specific_db {:memory:} insert-returning-unicode {
+test insert-returning-unicode {
     CREATE TABLE t (id INTEGER, name TEXT);
     INSERT INTO t VALUES (1, 'A') RETURNING UNICODE(name);
-} {65}
+}
+expect {
+    65
+}
 
 # RETURNING with expressions using DATE functions (if supported)
-do_execsql_test_on_specific_db {:memory:} insert-returning-date {
+test insert-returning-date {
     CREATE TABLE t (id INTEGER, date_text TEXT);
     INSERT INTO t VALUES (1, '2023-01-01') RETURNING DATE(date_text);
-} {2023-01-01}
+}
+expect {
+    2023-01-01
+}
 
 # RETURNING with expressions using JULIANDAY (if supported)
-do_execsql_test_on_specific_db {:memory:} insert-returning-julianday {
+test insert-returning-julianday {
     CREATE TABLE t (id INTEGER);
     INSERT INTO t VALUES (1) RETURNING JULIANDAY('2023-01-01');
-} {2459945.5}
+}
+expect {
+    2459945.5
+}
 
 # RETURNING with expressions using STRFTIME (if supported)
-do_execsql_test_on_specific_db {:memory:} insert-returning-strftime {
+test insert-returning-strftime {
     CREATE TABLE t (id INTEGER);
     INSERT INTO t VALUES (1) RETURNING STRFTIME('%Y-%m-%d', '2023-01-01');
-} {2023-01-01}
+}
+expect {
+    2023-01-01
+}
 
 # RETURNING with expressions using JSON functions (if supported)
-do_execsql_test_on_specific_db {:memory:} insert-returning-json {
+test insert-returning-json {
     CREATE TABLE t (id INTEGER, data TEXT);
     INSERT INTO t VALUES (1, '{"key": "value"}') RETURNING JSON_EXTRACT(data, '$.key');
-} {"value"}
+}
+expect {
+    value
+}
 
 # RETURNING with expressions using typeof
-do_execsql_test_on_specific_db {:memory:} insert-returning-typeof {
+test insert-returning-typeof {
     CREATE TABLE t (id INTEGER, name TEXT, value REAL);
     INSERT INTO t VALUES (1, 'test', 10.5) RETURNING typeof(id), typeof(name), typeof(value);
-} {integer|text|real}
+}
+expect {
+    integer|text|real
+}
 
 # RETURNING with expressions using typeof on NULL
-do_execsql_test_on_specific_db {:memory:} insert-returning-typeof-null {
+test insert-returning-typeof-null {
     CREATE TABLE t (id INTEGER, value INTEGER);
     INSERT INTO t VALUES (1, NULL) RETURNING typeof(value);
-} {null}
+}
+expect {
+    null
+}
 
 # RETURNING with expressions using printf (if supported)
-do_execsql_test_on_specific_db {:memory:} insert-returning-printf {
+test insert-returning-printf {
     CREATE TABLE t (id INTEGER, name TEXT, value INTEGER);
     INSERT INTO t VALUES (1, 'test', 42) RETURNING printf('id=%d name=%s value=%d', id, name, value);
-} {"id=1 name=test value=42"}
+}
+expect {
+    id=1 name=test value=42
+}
 
 # RETURNING with expressions using randomblob/zeroblob (if supported)
-do_execsql_test_on_specific_db {:memory:} insert-returning-zeroblob {
+test insert-returning-zeroblob {
     CREATE TABLE t (id INTEGER);
     INSERT INTO t VALUES (1) RETURNING LENGTH(zeroblob(100));
-} {100}
+}
+expect {
+    100
+}
 
 # RETURNING with expressions using changes (if supported)
-do_execsql_test_on_specific_db {:memory:} insert-returning-changes {
+test insert-returning-changes {
     CREATE TABLE t (id INTEGER);
     INSERT INTO t VALUES (1) RETURNING changes();
-} {0}
+}
+expect {
+    0
+}
 
 # RETURNING with expressions using last_insert_rowid (if supported)
-do_execsql_test_on_specific_db {:memory:} insert-returning-last-insert-rowid {
+test insert-returning-last-insert-rowid {
     CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT);
     INSERT INTO t (name) VALUES ('test') RETURNING last_insert_rowid();
-} {1}
+}
+expect {
+    1
+}
 
 # RETURNING with expressions using total_changes (if supported)
-do_execsql_test_on_specific_db {:memory:} insert-returning-total-changes {
+test insert-returning-total-changes {
     CREATE TABLE t (id INTEGER);
     INSERT INTO t VALUES (1) RETURNING total_changes();
-} {0}
+}
+expect {
+    0
+}
 
 # RETURNING with expressions using likely/unlikely (optimization hints)
-do_execsql_test_on_specific_db {:memory:} insert-returning-likely {
+test insert-returning-likely {
     CREATE TABLE t (id INTEGER, value INTEGER);
     INSERT INTO t VALUES (1, 5) RETURNING likely(value > 0);
-} {1}
+}
+expect {
+    1
+}
 
 # RETURNING with expressions using iif (if supported)
-do_execsql_test_on_specific_db {:memory:} insert-returning-iif {
+test insert-returning-iif {
     CREATE TABLE t (id INTEGER, value INTEGER);
     INSERT INTO t VALUES (1, 5) RETURNING IIF(value > 0, 'positive', 'negative');
-} {positive}
+}
+expect {
+    positive
+}
 
 # RETURNING with expressions using json_array/json_object (if supported)
-do_execsql_test_on_specific_db {:memory:} insert-returning-json-array {
+test insert-returning-json-array {
     CREATE TABLE t (id INTEGER, a INTEGER, b INTEGER);
     INSERT INTO t VALUES (1, 2, 3) RETURNING JSON_ARRAY(a, b);
-} {[2,3]}
+}
+expect {
+    [2,3]
+}
 
 # RETURNING with expressions using aggregate functions (should error)
-do_execsql_test_in_memory_any_error insert-returning-aggregate {
+test insert-returning-aggregate {
     CREATE TABLE t (id INTEGER, value INTEGER);
     INSERT INTO t VALUES (1, 42) RETURNING SUM(value);
 }
+expect error {
+}
 
-do_execsql_test_in_memory_any_error insert-returning-aggregate-count {
+test insert-returning-aggregate-count {
     CREATE TABLE t (id INTEGER);
     INSERT INTO t VALUES (1) RETURNING COUNT(*);
 }
+expect error {
+}
+

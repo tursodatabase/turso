@@ -18,4 +18,3 @@ source $testdir/scalar-functions-printf.test
 source $testdir/integrity_check.test
 source $testdir/vtab.test
 source $testdir/foreign_keys.test
-source $testdir/returning.test
