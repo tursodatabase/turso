@@ -1,6 +1,6 @@
 /// Whopper CLI - The Turso deterministic simulator
 use clap::Parser;
-use rand::{Rng, RngCore};
+use rand::RngCore;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 use turso_whopper::{StepResult, Whopper, WhopperOpts};
 

@@ -23,9 +23,10 @@ mod operations;
 mod properties;
 mod workloads;
 
-use crate::{io::FILE_SIZE_SOFT_LIMIT, properties::Property};
+use crate::io::FILE_SIZE_SOFT_LIMIT;
 pub use io::{IOFaultConfig, SimulatorIO};
 pub use operations::{FiberState, OpContext, OpResult, Operation};
+pub use properties::{IntegrityCheckProperty, Property};
 pub use workloads::{
     BeginWorkload, CommitWorkload, CreateIndexWorkload, CreateSimpleTableWorkload, DeleteWorkload,
     DropIndexWorkload, InsertWorkload, IntegrityCheckWorkload, RollbackWorkload, SelectWorkload,
@@ -501,7 +502,7 @@ impl Whopper {
             properties: opts
                 .properties
                 .into_iter()
-                .map(|p| std::sync::Mutex::new(p))
+                .map(std::sync::Mutex::new)
                 .collect(),
             total_weight,
             opts: Opts::default(),

@@ -1,8 +1,7 @@
 //! Operations that can be executed on the database.
 
 use rand_chacha::ChaCha8Rng;
-use std::sync::Arc;
-use turso_core::{Connection, LimboError, Statement, Value};
+use turso_core::{LimboError, Value};
 
 use crate::{SamplesContainer, SimulatorFiber, SimulatorState, Stats};
 
