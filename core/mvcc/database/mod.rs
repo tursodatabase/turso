@@ -3017,6 +3017,9 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                         assert!(self.table_id_to_rootpage.get(&rowid.table_id).is_some(), "Logical log contains a row version insert with a table id {} that does not exist in the table_id_to_rootpage map: {:?}", rowid.table_id, self.table_id_to_rootpage.iter().collect::<Vec<_>>());
                     }
                     self.insert(tx_id, row)?;
+                    // Make sure the newly parsed schema change record gets populated into the in-memory schema object.
+                    // It's a bit inefficient this way (we could just deserialize the logical log row as well), but schema
+                    // changes in the logical log are special cases that don't happen that often.
                     if is_schema_row {
                         connection.reparse_schema()?;
                         *connection.db.schema.lock() = connection.schema.read().clone();
