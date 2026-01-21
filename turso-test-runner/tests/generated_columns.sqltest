@@ -1,0 +1,189 @@
+@database :memory:
+
+# ============================================
+# STORED Generated Columns - Basic Tests
+# ============================================
+
+test generated-stored-insert {
+    CREATE TABLE t(a INTEGER, b GENERATED ALWAYS AS (a * 2) STORED);
+    INSERT INTO t(a) VALUES (5);
+    SELECT * FROM t;
+}
+expect {
+    5|10
+}
+
+test generated-stored-multiple-rows {
+    CREATE TABLE t(x INTEGER, y GENERATED ALWAYS AS (x * x) STORED);
+    INSERT INTO t(x) VALUES (2), (3), (4);
+    SELECT * FROM t;
+}
+expect {
+    2|4
+    3|9
+    4|16
+}
+
+test generated-stored-update {
+    CREATE TABLE t(a INTEGER, b GENERATED ALWAYS AS (a * 3.1415) STORED);
+    INSERT INTO t(a) VALUES (1);
+    UPDATE t SET a = 2;
+    SELECT * FROM t;
+}
+expect {
+    2|6.283
+}
+
+test generated-stored-update-multiple-columns {
+    CREATE TABLE t(a INTEGER, b INTEGER, c GENERATED ALWAYS AS (a + b) STORED);
+    INSERT INTO t(a, b) VALUES (1, 2);
+    UPDATE t SET a = 10;
+    SELECT * FROM t;
+}
+expect {
+    10|2|12
+}
+
+test generated-stored-update-both-source-columns {
+    CREATE TABLE t(a INTEGER, b INTEGER, c GENERATED ALWAYS AS (a + b) STORED);
+    INSERT INTO t(a, b) VALUES (1, 2);
+    UPDATE t SET a = 5, b = 15;
+    SELECT * FROM t;
+}
+expect {
+    5|15|20
+}
+
+# ============================================
+# VIRTUAL Generated Columns - Basic Tests
+# ============================================
+
+test generated-virtual-select {
+    CREATE TABLE t(a INTEGER, b GENERATED ALWAYS AS (a * 2) VIRTUAL);
+    INSERT INTO t(a) VALUES (5);
+    SELECT * FROM t;
+}
+expect {
+    5|10
+}
+
+test generated-virtual-multiple-rows {
+    CREATE TABLE t(x INTEGER, y GENERATED ALWAYS AS (x + 10) VIRTUAL);
+    INSERT INTO t(x) VALUES (2), (3), (4);
+    SELECT * FROM t;
+}
+expect {
+    2|12
+    3|13
+    4|14
+}
+
+test generated-virtual-after-update {
+    CREATE TABLE t(a INTEGER, b GENERATED ALWAYS AS (a * 3.1415) VIRTUAL);
+    INSERT INTO t(a) VALUES (1);
+    UPDATE t SET a = 2;
+    SELECT * FROM t;
+}
+expect {
+    2|6.283
+}
+
+# ============================================
+# Mixed STORED and VIRTUAL
+# ============================================
+
+test generated-mixed-stored-virtual {
+    CREATE TABLE t(
+        a INTEGER,
+        b GENERATED ALWAYS AS (a * 2) STORED,
+        c GENERATED ALWAYS AS (a + 10) VIRTUAL,
+        d GENERATED ALWAYS AS (b + a) VIRTUAL
+    );
+    INSERT INTO t(a) VALUES (5);
+    SELECT * FROM t;
+}
+expect {
+    5|10|15|15
+}
+
+test generated-mixed-after-update {
+    CREATE TABLE t(
+        a INTEGER,
+        b GENERATED ALWAYS AS (a * 2) STORED,
+        c GENERATED ALWAYS AS (a + 10) VIRTUAL
+    );
+    INSERT INTO t(a) VALUES (5);
+    UPDATE t SET a = 10;
+    SELECT * FROM t;
+}
+expect {
+    10|20|20
+}
+
+# ============================================
+# Validation Tests
+# ============================================
+
+test generated-cannot-insert-error {
+    CREATE TABLE t(a INTEGER, b GENERATED ALWAYS AS (a + 1) STORED);
+    INSERT INTO t(a, b) VALUES (1, 2);
+}
+expect error {
+}
+
+test generated-cannot-have-default-error {
+    CREATE TABLE t(a INTEGER, b GENERATED ALWAYS AS (a + 1) STORED DEFAULT 5);
+}
+expect error {
+}
+
+test generated-cannot-be-primary-key-error {
+    CREATE TABLE t(a INTEGER, b GENERATED ALWAYS AS (a + 1) STORED PRIMARY KEY);
+}
+expect error {
+}
+
+# ============================================
+# Expression Tests
+# ============================================
+
+test generated-expression-arithmetic {
+    CREATE TABLE t(
+        a INTEGER,
+        add_col GENERATED ALWAYS AS (a + 5) STORED,
+        sub_col GENERATED ALWAYS AS (a - 3) STORED,
+        mul_col GENERATED ALWAYS AS (a * 2) STORED,
+        div_col GENERATED ALWAYS AS (a / 2) STORED
+    );
+    INSERT INTO t(a) VALUES (10);
+    SELECT * FROM t;
+}
+expect {
+    10|15|7|20|5
+}
+
+test generated-expression-abs {
+    CREATE TABLE t(a INTEGER, b GENERATED ALWAYS AS (abs(a)) STORED);
+    INSERT INTO t(a) VALUES (-5), (5);
+    SELECT * FROM t;
+}
+expect {
+    -5|5
+    5|5
+}
+
+# ============================================
+# Default value for non-generated columns
+# ============================================
+
+test generated-with-default-on-regular-column {
+    CREATE TABLE t(
+        a INTEGER DEFAULT 100,
+        b GENERATED ALWAYS AS (a * 2) STORED
+    );
+    INSERT INTO t DEFAULT VALUES;
+    SELECT * FROM t;
+}
+expect {
+    100|200
+}
