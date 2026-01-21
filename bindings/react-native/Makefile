@@ -46,24 +46,24 @@ package-dylibs:
 # Pack device dylibs
 	cp ../../target/aarch64-apple-ios/release/$(IOS_LIB_FILE) libs/ios/$(IOS_FINAL_LIB_FILE)
 
-	cp libs/ios/$(IOS_FINAL_LIB_FILE) libs/ios/turso_sync_sdk_kit.xcframework/ios-arm64/turso_sync_sdk_kit.framework/
-	install_name_tool -id @rpath/turso_sync_sdk_kit.framework/$(IOS_FINAL_LIB_FILE) libs/ios/turso_sync_sdk_kit.xcframework/ios-arm64/turso_sync_sdk_kit.framework/$(IOS_FINAL_LIB_FILE)
-	codesign -f -s - --identifier com.turso.turso_sync_sdk_kit libs/ios/turso_sync_sdk_kit.xcframework/ios-arm64/turso_sync_sdk_kit.framework/$(IOS_FINAL_LIB_FILE)
+	cp libs/ios/$(IOS_FINAL_LIB_FILE) libs/ios/turso-sync-sdk-kit.xcframework/ios-arm64/turso-sync-sdk-kit.framework/
+	install_name_tool -id @rpath/turso-sync-sdk-kit.framework/$(IOS_FINAL_LIB_FILE) libs/ios/turso-sync-sdk-kit.xcframework/ios-arm64/turso-sync-sdk-kit.framework/$(IOS_FINAL_LIB_FILE)
+	codesign -f -s - --identifier com.turso.turso_sync_sdk_kit libs/ios/turso-sync-sdk-kit.xcframework/ios-arm64/turso-sync-sdk-kit.framework/$(IOS_FINAL_LIB_FILE)
 
-	mkdir -p libs/ios/turso_sync_sdk_kit.xcframework/ios-arm64/turso_sync_sdk_kit.framework/Headers
-	cp "$(SDK_KIT_DIR)/turso.h" libs/ios/turso_sync_sdk_kit.xcframework/ios-arm64/turso_sync_sdk_kit.framework/Headers/
-	cp "$(SYNC_SDK_KIT_DIR)/turso_sync.h" libs/ios/turso_sync_sdk_kit.xcframework/ios-arm64/turso_sync_sdk_kit.framework/Headers/
+	mkdir -p libs/ios/turso-sync-sdk-kit.xcframework/ios-arm64/turso-sync-sdk-kit.framework/Headers
+	cp "$(SDK_KIT_DIR)/turso.h" libs/ios/turso-sync-sdk-kit.xcframework/ios-arm64/turso-sync-sdk-kit.framework/Headers/
+	cp "$(SYNC_SDK_KIT_DIR)/turso_sync.h" libs/ios/turso-sync-sdk-kit.xcframework/ios-arm64/turso-sync-sdk-kit.framework/Headers/
 
 # Pack simulator dylibs
 	cp ../../target/aarch64-apple-ios-sim/release/$(IOS_LIB_FILE) libs/ios/$(IOS_FINAL_LIB_FILE)
 
-	cp libs/ios/$(IOS_FINAL_LIB_FILE) libs/ios/turso_sync_sdk_kit.xcframework/ios-arm64-simulator/turso_sync_sdk_kit.framework/
-	install_name_tool -id @rpath/turso_sync_sdk_kit.framework/$(IOS_FINAL_LIB_FILE) libs/ios/turso_sync_sdk_kit.xcframework/ios-arm64-simulator/turso_sync_sdk_kit.framework/$(IOS_FINAL_LIB_FILE)
-	codesign -f -s - --identifier com.turso.turso_sync_sdk_kit libs/ios/turso_sync_sdk_kit.xcframework/ios-arm64-simulator/turso_sync_sdk_kit.framework/$(IOS_FINAL_LIB_FILE)
+	cp libs/ios/$(IOS_FINAL_LIB_FILE) libs/ios/turso-sync-sdk-kit.xcframework/ios-arm64-simulator/turso-sync-sdk-kit.framework/
+	install_name_tool -id @rpath/turso-sync-sdk-kit.framework/$(IOS_FINAL_LIB_FILE) libs/ios/turso-sync-sdk-kit.xcframework/ios-arm64-simulator/turso-sync-sdk-kit.framework/$(IOS_FINAL_LIB_FILE)
+	codesign -f -s - --identifier com.turso.turso_sync_sdk_kit libs/ios/turso-sync-sdk-kit.xcframework/ios-arm64-simulator/turso-sync-sdk-kit.framework/$(IOS_FINAL_LIB_FILE)
 
-	mkdir -p libs/ios/turso_sync_sdk_kit.xcframework/ios-arm64-simulator/turso_sync_sdk_kit.framework/Headers
-	cp "$(SDK_KIT_DIR)/turso.h" libs/ios/turso_sync_sdk_kit.xcframework/ios-arm64-simulator/turso_sync_sdk_kit.framework/Headers/
-	cp "$(SYNC_SDK_KIT_DIR)/turso_sync.h" libs/ios/turso_sync_sdk_kit.xcframework/ios-arm64-simulator/turso_sync_sdk_kit.framework/Headers/
+	mkdir -p libs/ios/turso-sync-sdk-kit.xcframework/ios-arm64-simulator/turso-sync-sdk-kit.framework/Headers
+	cp "$(SDK_KIT_DIR)/turso.h" libs/ios/turso-sync-sdk-kit.xcframework/ios-arm64-simulator/turso-sync-sdk-kit.framework/Headers/
+	cp "$(SYNC_SDK_KIT_DIR)/turso_sync.h" libs/ios/turso-sync-sdk-kit.xcframework/ios-arm64-simulator/turso-sync-sdk-kit.framework/Headers/
 
 ios-build:
 	cargo build --release --target aarch64-apple-ios --package turso_sync_sdk_kit

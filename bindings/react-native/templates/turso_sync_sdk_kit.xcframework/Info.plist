@@ -8,7 +8,7 @@
 			<key>LibraryIdentifier</key>
 			<string>ios-arm64</string>
 			<key>LibraryPath</key>
-			<string>turso_sync_sdk_kit.framework</string>
+			<string>turso-sync-sdk-kit.framework</string>
 			<key>SupportedArchitectures</key>
 			<array>
 				<string>arm64</string>
@@ -20,7 +20,7 @@
 			<key>LibraryIdentifier</key>
 			<string>ios-arm64-simulator</string>
 			<key>LibraryPath</key>
-			<string>turso_sync_sdk_kit.framework</string>
+			<string>turso-sync-sdk-kit.framework</string>
 			<key>SupportedArchitectures</key>
 			<array>
 				<string>arm64</string>

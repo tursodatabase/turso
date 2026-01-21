@@ -19,12 +19,12 @@ Pod::Spec.new do |s|
   ]
 
   # Vendored Rust XCFramework (handles device + simulator automatically)
-  s.vendored_frameworks = "libs/ios/turso_sync_sdk_kit.xcframework"
+  s.vendored_frameworks = "libs/ios/turso-sync-sdk-kit.xcframework"
 
   # Explicitly export C headers from the vendored xcframework
   s.static_framework = true
-  s.public_header_files = "libs/ios/turso_sync_sdk_kit.xcframework/**/Headers/*.h"
-  s.header_mappings_dir = "libs/ios/turso_sync_sdk_kit.xcframework"
+  s.public_header_files = "libs/ios/turso-sync-sdk-kit.xcframework/**/Headers/*.h"
+  s.header_mappings_dir = "libs/ios/turso-sync-sdk-kit.xcframework"
 
   # Header search paths
   s.pod_target_xcconfig = {
@@ -46,7 +46,7 @@ Pod::Spec.new do |s|
   # Build script to compile Rust
   s.script_phase = {
     :name => "Build Turso Rust Library",
-    :script => 'set -e; cd "${PODS_TARGET_SRCROOT}"; if [ ! -d "libs/ios/turso_sync_sdk_kit.xcframework" ]; then echo "Building Rust library for iOS..."; make ios; fi',
+    :script => 'set -e; cd "${PODS_TARGET_SRCROOT}"; if [ ! -d "libs/ios/turso-sync-sdk-kit.xcframework" ]; then echo "Building Rust library for iOS..."; make ios; fi',
     :execution_position => :before_compile,
     :shell_path => "/bin/bash"
   }
