@@ -2334,6 +2334,9 @@ impl WalFile {
                                 )?;
                                 let (_, wal_page) = sqlite3_ondisk::parse_wal_frame_header(&raw);
                                 let cached = buffer.as_slice();
+                                if wal_page != cached {
+                                    tracing::error!("whoooops");
+                                }
                                 turso_assert!(wal_page == cached, "cached page content differs from WAL read for page_id={page_id}, frame_id={target_frame}");
                             }
                             {
