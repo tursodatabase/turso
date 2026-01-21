@@ -696,6 +696,8 @@ impl SseDecode for crate::api::connect::ConnectArgs {
         let mut var_readYourWrites = <Option<bool>>::sse_decode(deserializer);
         let mut var_openFlags = <Option<crate::api::connect::OpenFlags>>::sse_decode(deserializer);
         let mut var_offline = <Option<bool>>::sse_decode(deserializer);
+        let mut var_encryption =
+            <Option<crate::api::connect::EncryptionOpts>>::sse_decode(deserializer);
         return crate::api::connect::ConnectArgs {
             url: var_url,
             auth_token: var_authToken,
@@ -705,6 +707,7 @@ impl SseDecode for crate::api::connect::ConnectArgs {
             read_your_writes: var_readYourWrites,
             open_flags: var_openFlags,
             offline: var_offline,
+            encryption: var_encryption,
         };
     }
 }
@@ -831,6 +834,48 @@ impl SseDecode for crate::api::connect::OpenFlags {
             2 => crate::api::connect::OpenFlags::Create,
             _ => unreachable!("Invalid variant for OpenFlags: {}", inner),
         };
+    }
+}
+
+impl SseDecode for crate::api::connect::EncryptionCipher {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        let mut inner = <i32>::sse_decode(deserializer);
+        return match inner {
+            0 => crate::api::connect::EncryptionCipher::Aes128Gcm,
+            1 => crate::api::connect::EncryptionCipher::Aes256Gcm,
+            2 => crate::api::connect::EncryptionCipher::Aegis256,
+            3 => crate::api::connect::EncryptionCipher::Aegis256x2,
+            4 => crate::api::connect::EncryptionCipher::Aegis128l,
+            5 => crate::api::connect::EncryptionCipher::Aegis128x2,
+            6 => crate::api::connect::EncryptionCipher::Aegis128x4,
+            _ => unreachable!("Invalid variant for EncryptionCipher: {}", inner),
+        };
+    }
+}
+
+impl SseDecode for crate::api::connect::EncryptionOpts {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        let mut var_cipher = <crate::api::connect::EncryptionCipher>::sse_decode(deserializer);
+        let mut var_hexkey = <String>::sse_decode(deserializer);
+        return crate::api::connect::EncryptionOpts {
+            cipher: var_cipher,
+            hexkey: var_hexkey,
+        };
+    }
+}
+
+impl SseDecode for Option<crate::api::connect::EncryptionOpts> {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        if (<bool>::sse_decode(deserializer)) {
+            return Some(<crate::api::connect::EncryptionOpts>::sse_decode(
+                deserializer,
+            ));
+        } else {
+            return None;
+        }
     }
 }
 
@@ -1224,6 +1269,53 @@ impl flutter_rust_bridge::IntoIntoDart<crate::api::connect::OpenFlags>
     }
 }
 // Codec=Dco (DartCObject based), see doc to use other codecs
+impl flutter_rust_bridge::IntoDart for crate::api::connect::EncryptionCipher {
+    fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
+        match self {
+            Self::Aes128Gcm => 0.into_dart(),
+            Self::Aes256Gcm => 1.into_dart(),
+            Self::Aegis256 => 2.into_dart(),
+            Self::Aegis256x2 => 3.into_dart(),
+            Self::Aegis128l => 4.into_dart(),
+            Self::Aegis128x2 => 5.into_dart(),
+            Self::Aegis128x4 => 6.into_dart(),
+            _ => unreachable!(),
+        }
+    }
+}
+impl flutter_rust_bridge::for_generated::IntoDartExceptPrimitive
+    for crate::api::connect::EncryptionCipher
+{
+}
+impl flutter_rust_bridge::IntoIntoDart<crate::api::connect::EncryptionCipher>
+    for crate::api::connect::EncryptionCipher
+{
+    fn into_into_dart(self) -> crate::api::connect::EncryptionCipher {
+        self
+    }
+}
+// Codec=Dco (DartCObject based), see doc to use other codecs
+impl flutter_rust_bridge::IntoDart for crate::api::connect::EncryptionOpts {
+    fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
+        [
+            self.cipher.into_into_dart().into_dart(),
+            self.hexkey.into_into_dart().into_dart(),
+        ]
+        .into_dart()
+    }
+}
+impl flutter_rust_bridge::for_generated::IntoDartExceptPrimitive
+    for crate::api::connect::EncryptionOpts
+{
+}
+impl flutter_rust_bridge::IntoIntoDart<crate::api::connect::EncryptionOpts>
+    for crate::api::connect::EncryptionOpts
+{
+    fn into_into_dart(self) -> crate::api::connect::EncryptionOpts {
+        self
+    }
+}
+// Codec=Dco (DartCObject based), see doc to use other codecs
 impl flutter_rust_bridge::IntoDart for crate::helpers::params::Params {
     fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
         match self {
@@ -1454,6 +1546,7 @@ impl SseEncode for crate::api::connect::ConnectArgs {
         <Option<bool>>::sse_encode(self.read_your_writes, serializer);
         <Option<crate::api::connect::OpenFlags>>::sse_encode(self.open_flags, serializer);
         <Option<bool>>::sse_encode(self.offline, serializer);
+        <Option<crate::api::connect::EncryptionOpts>>::sse_encode(self.encryption, serializer);
     }
 }
 
@@ -1561,6 +1654,45 @@ impl SseEncode for crate::api::connect::OpenFlags {
             },
             serializer,
         );
+    }
+}
+
+impl SseEncode for crate::api::connect::EncryptionCipher {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <i32>::sse_encode(
+            match self {
+                crate::api::connect::EncryptionCipher::Aes128Gcm => 0,
+                crate::api::connect::EncryptionCipher::Aes256Gcm => 1,
+                crate::api::connect::EncryptionCipher::Aegis256 => 2,
+                crate::api::connect::EncryptionCipher::Aegis256x2 => 3,
+                crate::api::connect::EncryptionCipher::Aegis128l => 4,
+                crate::api::connect::EncryptionCipher::Aegis128x2 => 5,
+                crate::api::connect::EncryptionCipher::Aegis128x4 => 6,
+                _ => {
+                    unimplemented!("");
+                }
+            },
+            serializer,
+        );
+    }
+}
+
+impl SseEncode for crate::api::connect::EncryptionOpts {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <crate::api::connect::EncryptionCipher>::sse_encode(self.cipher, serializer);
+        <String>::sse_encode(self.hexkey, serializer);
+    }
+}
+
+impl SseEncode for Option<crate::api::connect::EncryptionOpts> {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <bool>::sse_encode(self.is_some(), serializer);
+        if let Some(value) = self {
+            <crate::api::connect::EncryptionOpts>::sse_encode(value, serializer);
+        }
     }
 }
 

@@ -10,6 +10,42 @@ import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 Future<RustConnection> connect({required ConnectArgs args}) =>
     RustLib.instance.api.crateApiConnectConnect(args: args);
 
+/// Supported encryption ciphers for local database encryption.
+enum EncryptionCipher {
+  aes128Gcm,
+  aes256Gcm,
+  aegis256,
+  aegis256x2,
+  aegis128l,
+  aegis128x2,
+  aegis128x4,
+}
+
+/// Encryption options for local database encryption.
+class EncryptionOpts {
+  /// The cipher to use for encryption
+  final EncryptionCipher cipher;
+
+  /// The hex-encoded encryption key
+  final String hexkey;
+
+  const EncryptionOpts({
+    required this.cipher,
+    required this.hexkey,
+  });
+
+  @override
+  int get hashCode => cipher.hashCode ^ hexkey.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is EncryptionOpts &&
+          runtimeType == other.runtimeType &&
+          cipher == other.cipher &&
+          hexkey == other.hexkey;
+}
+
 class ConnectArgs {
   final String url;
   final String? authToken;
@@ -20,6 +56,9 @@ class ConnectArgs {
   final OpenFlags? openFlags;
   final bool? offline;
 
+  /// Optional encryption options for local database encryption
+  final EncryptionOpts? encryption;
+
   const ConnectArgs({
     required this.url,
     this.authToken,
@@ -29,6 +68,7 @@ class ConnectArgs {
     this.readYourWrites,
     this.openFlags,
     this.offline,
+    this.encryption,
   });
 
   @override
@@ -40,7 +80,8 @@ class ConnectArgs {
       encryptionKey.hashCode ^
       readYourWrites.hashCode ^
       openFlags.hashCode ^
-      offline.hashCode;
+      offline.hashCode ^
+      encryption.hashCode;
 
   @override
   bool operator ==(Object other) =>
@@ -54,7 +95,8 @@ class ConnectArgs {
           encryptionKey == other.encryptionKey &&
           readYourWrites == other.readYourWrites &&
           openFlags == other.openFlags &&
-          offline == other.offline;
+          offline == other.offline &&
+          encryption == other.encryption;
 }
 
 enum OpenFlags { readOnly, readWrite, create }
