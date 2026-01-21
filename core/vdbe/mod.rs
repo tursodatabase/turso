@@ -29,6 +29,7 @@ pub mod likeop;
 pub mod metrics;
 pub mod rowset;
 pub mod sorter;
+pub mod validator;
 pub mod value;
 // for benchmarks
 pub use crate::translate::collate::CollationSeq;
