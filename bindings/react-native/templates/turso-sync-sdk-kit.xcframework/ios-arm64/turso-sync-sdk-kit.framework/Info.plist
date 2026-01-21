@@ -5,7 +5,7 @@
   <key>CFBundleDevelopmentRegion</key>
   <string>en</string>
   <key>CFBundleExecutable</key>
-  <string>turso_sync_sdk_kit</string>
+  <string>turso-sync-sdk-kit</string>
   <key>CFBundleIdentifier</key>
   <string>com.turso.turso-sync-sdk-kit</string>
   <key>CFBundleInfoDictionaryVersion</key>
