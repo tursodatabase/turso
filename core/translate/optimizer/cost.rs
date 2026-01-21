@@ -132,21 +132,37 @@ pub fn estimate_cost_for_scan_or_seek(
         let pages_per_lookup = tree_depth + if index_info.covering { 0.0 } else { 1.0 };
 
         if has_real_stats {
-            // With real stats, account for page caching on small tables
+            // With real stats, account for page caching on small tables.
             let table_pages = (base_row_count / ESTIMATED_HARDCODED_ROWS_PER_PAGE as f64).max(1.0);
 
-            // For small tables that fit in cache, the total IO is bounded by:
-            // - All unique pages touched (at most table_pages for covering, 2*table_pages otherwise)
-            // - Plus a small per-lookup CPU cost
-            //
-            // With caching, repeated lookups into the same small table
-            // are very cheap after the first few reads. So the cost is dominated by
-            // the number of distinct pages, not the number of lookups.
+            // For tables that fit in cache, total IO is bounded by the number of distinct
+            // pages in the table (at most table_pages for covering index, 2*table_pages
+            // for non-covering since we need both index and table pages).
             let distinct_pages = table_pages * (if index_info.covering { 1.0 } else { 2.0 });
+
+            // Cost model uses minimum of two approaches:
+            //
+            // 1. Per-lookup cost: input_cardinality * pages_per_lookup
+            //    Each lookup traverses tree_depth pages. For few lookups (e.g., 25 rowid
+            //    seeks), this is cheaper than reading the whole table.
+            //
+            // 2. Cache-bounded cost: distinct_pages
+            //    With caching, repeated lookups into the same table are cheap after the
+            //    first read. For many lookups, total IO is bounded by distinct pages.
+            //
+            // Example: 25 lookups into 150K row table (3000 pages, tree_depth=4)
+            //   - per_lookup: 25 * 4 = 100 pages (better!)
+            //   - cache_bounded: 3000 pages
+            //
+            // Example: 10000 lookups into same table
+            //   - per_lookup: 10000 * 4 = 40000 pages
+            //   - cache_bounded: 3000 pages (better!)
+            let per_lookup_cost = input_cardinality * pages_per_lookup;
+            let cache_bounded_cost = distinct_pages;
 
             // Still add a small per-lookup cost to differentiate from scan due to overhead for key comparison
             let lookup_overhead = input_cardinality * 0.001;
-            let io_cost = distinct_pages + lookup_overhead;
+            let io_cost = per_lookup_cost.min(cache_bounded_cost) + lookup_overhead;
             let cpu_cost = input_cardinality * 0.001;
 
             // Give a bonus for using direct lookup vs. scan.
