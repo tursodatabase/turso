@@ -187,15 +187,129 @@ pub enum FiberState {
     InTx,
 }
 
-/// Context passed to workloads for initialization.
-/// Note: `rng` is passed separately to `Workload::init` to avoid borrow conflicts
+/// An operation that can be executed on the database.
+/// Operations are produced by workloads and contain all data needed for execution.
+#[derive(Debug, Clone)]
+pub enum Operation {
+    /// Begin a transaction
+    Begin { mode: String },
+    /// Commit current transaction
+    Commit,
+    /// Rollback current transaction
+    Rollback,
+    /// Run PRAGMA integrity_check
+    IntegrityCheck,
+    /// Run WAL checkpoint with specified mode
+    WalCheckpoint { mode: String },
+    /// Create a simple key-value table
+    CreateSimpleTable { table_name: String },
+    /// Select from a simple table by key
+    SimpleSelect { table_name: String, key: String },
+    /// Insert into a simple table
+    SimpleInsert {
+        table_name: String,
+        key: String,
+        value_hex: String,
+    },
+    /// Generic SELECT query
+    Select { sql: String },
+    /// Generic INSERT query
+    Insert { sql: String },
+    /// Generic UPDATE query
+    Update { sql: String },
+    /// Generic DELETE query
+    Delete { sql: String },
+    /// Create an index
+    CreateIndex {
+        sql: String,
+        index_name: String,
+        table_name: String,
+    },
+    /// Drop an index
+    DropIndex {
+        sql: String,
+        index_name: String,
+    },
+}
+
+impl Operation {
+    /// Get the SQL string for this operation
+    pub fn sql(&self) -> String {
+        match self {
+            Operation::Begin { mode } => mode.clone(),
+            Operation::Commit => "COMMIT".to_string(),
+            Operation::Rollback => "ROLLBACK".to_string(),
+            Operation::IntegrityCheck => "PRAGMA integrity_check".to_string(),
+            Operation::WalCheckpoint { mode } => format!("PRAGMA wal_checkpoint({mode})"),
+            Operation::CreateSimpleTable { table_name } => {
+                format!("CREATE TABLE IF NOT EXISTS {table_name} (key TEXT PRIMARY KEY, value BLOB)")
+            }
+            Operation::SimpleSelect { table_name, key } => {
+                format!("SELECT value FROM {table_name} WHERE key = '{key}'")
+            }
+            Operation::SimpleInsert {
+                table_name,
+                key,
+                value_hex,
+            } => {
+                format!(
+                    "INSERT OR REPLACE INTO {table_name} (key, value) VALUES ('{key}', X'{value_hex}')"
+                )
+            }
+            Operation::Select { sql } => sql.clone(),
+            Operation::Insert { sql } => sql.clone(),
+            Operation::Update { sql } => sql.clone(),
+            Operation::Delete { sql } => sql.clone(),
+            Operation::CreateIndex { sql, .. } => sql.clone(),
+            Operation::DropIndex { sql, .. } => sql.clone(),
+        }
+    }
+
+    /// Prepare this operation on a connection.
+    /// Returns Ok(Statement) on success, or an error.
+    pub fn prepare(
+        &self,
+        connection: &Arc<Connection>,
+    ) -> Result<Statement, turso_core::LimboError> {
+        connection.prepare(&self.sql())
+    }
+}
+
+/// Result of an operation execution
+#[derive(Debug, Clone)]
+pub enum OpResult {
+    /// Operation completed successfully with fetched rows
+    Success { rows: Vec<Vec<Value>> },
+    /// Operation failed with an error
+    Error { error: String },
+}
+
+/// A property that can be validated during simulation.
+/// Properties observe operations and can validate invariants.
+pub trait Property: Send + Sync {
+    /// Called when an operation starts execution
+    fn start_op(&mut self, tick: usize, fiber_id: usize, op: &Operation);
+
+    /// Called when an operation finishes execution.
+    /// Can perform validation and return an error if invariant is violated.
+    fn finish_op(
+        &mut self,
+        tick: usize,
+        fiber_id: usize,
+        op: &Operation,
+        result: &OpResult,
+    ) -> anyhow::Result<()>;
+
+    /// Final validation after simulation completes.
+    fn validate(&self) -> anyhow::Result<()>;
+}
+
+/// Context passed to workloads for generating operations.
+/// Note: `rng` is passed separately to `Workload::generate` to avoid borrow conflicts
 /// when calling `Arbitrary::arbitrary(rng, ctx)` which needs both `&mut rng` and `&ctx`.
 pub struct WorkloadContext<'a> {
-    pub connection: &'a Arc<Connection>,
-    pub fiber_state: &'a mut FiberState,
-    pub statement: &'a RefCell<Option<Statement>>,
-    pub sim_state: &'a mut SimulatorState,
-    pub stats: &'a mut Stats,
+    pub fiber_state: &'a FiberState,
+    pub sim_state: &'a SimulatorState,
     pub opts: &'a Opts,
     pub enable_mvcc: bool,
     /// Tables vec built from sim_state.tables for GenerationContext
@@ -212,38 +326,11 @@ impl GenerationContext for WorkloadContext<'_> {
     }
 }
 
-impl WorkloadContext<'_> {
-    /// Prepare a statement on this fiber.
-    /// Returns true if successful, false if table doesn't exist.
-    /// Panics on other errors.
-    pub fn prepare(&self, sql: &str) -> bool {
-        match self.connection.prepare(sql) {
-            Ok(stmt) => {
-                self.statement.replace(Some(stmt));
-                true
-            }
-            Err(e) => {
-                let err_str = e.to_string().to_lowercase();
-                // Allow "no such table" errors - return false to skip this workload
-                if err_str.contains("no such table") || err_str.contains("no such index") {
-                    debug!("table/index not found, skipping: {}", err_str);
-                    false
-                } else if err_str.contains("already exists") {
-                    debug!("table/index already exists, skipping: {}", err_str);
-                    false
-                } else {
-                    panic!("Failed to prepare statement: {}\nSQL: {}", e, sql);
-                }
-            }
-        }
-    }
-}
-
-/// A workload is a unit of work that can be executed on a fiber.
-/// Returns Ok(true) if the fiber was initialized, Ok(false) if this
+/// A workload generates operations to be executed on a fiber.
+/// Returns Some(Operation) if an operation was generated, None if this
 /// workload couldn't be applied and another should be tried.
 pub trait Workload: Send + Sync {
-    fn init(&self, ctx: &mut WorkloadContext, rng: &mut ChaCha8Rng) -> anyhow::Result<bool>;
+    fn generate(&self, ctx: &WorkloadContext, rng: &mut ChaCha8Rng) -> Option<Operation>;
 }
 
 // ============================================================================
@@ -254,11 +341,11 @@ pub trait Workload: Send + Sync {
 pub struct BeginWorkload;
 
 impl Workload for BeginWorkload {
-    fn init(&self, ctx: &mut WorkloadContext, rng: &mut ChaCha8Rng) -> anyhow::Result<bool> {
+    fn generate(&self, ctx: &WorkloadContext, rng: &mut ChaCha8Rng) -> Option<Operation> {
         if *ctx.fiber_state != FiberState::Idle {
-            return Ok(false);
+            return None;
         }
-        let cmd = if ctx.enable_mvcc {
+        let mode = if ctx.enable_mvcc {
             match rng.random_range(0..3) {
                 0 => "BEGIN DEFERRED",
                 1 => "BEGIN IMMEDIATE",
@@ -267,10 +354,9 @@ impl Workload for BeginWorkload {
         } else {
             "BEGIN"
         };
-        ctx.prepare(cmd);
-        *ctx.fiber_state = FiberState::InTx;
-        debug!("BEGIN: {}", cmd);
-        Ok(true)
+        Some(Operation::Begin {
+            mode: mode.to_string(),
+        })
     }
 }
 
@@ -278,14 +364,11 @@ impl Workload for BeginWorkload {
 pub struct IntegrityCheckWorkload;
 
 impl Workload for IntegrityCheckWorkload {
-    fn init(&self, ctx: &mut WorkloadContext, _rng: &mut ChaCha8Rng) -> anyhow::Result<bool> {
+    fn generate(&self, ctx: &WorkloadContext, _rng: &mut ChaCha8Rng) -> Option<Operation> {
         if *ctx.fiber_state != FiberState::Idle {
-            return Ok(false);
+            return None;
         }
-        ctx.prepare("PRAGMA integrity_check");
-        ctx.stats.integrity_checks += 1;
-        debug!("PRAGMA integrity_check");
-        Ok(true)
+        Some(Operation::IntegrityCheck)
     }
 }
 
@@ -293,18 +376,13 @@ impl Workload for IntegrityCheckWorkload {
 pub struct CreateSimpleTableWorkload;
 
 impl Workload for CreateSimpleTableWorkload {
-    fn init(&self, ctx: &mut WorkloadContext, rng: &mut ChaCha8Rng) -> anyhow::Result<bool> {
+    fn generate(&self, ctx: &WorkloadContext, rng: &mut ChaCha8Rng) -> Option<Operation> {
         // Only create tables outside of transactions
         if *ctx.fiber_state != FiberState::Idle {
-            return Ok(false);
+            return None;
         }
         let table_name = format!("simple_kv_{}", rng.random_range(0..100000));
-        let sql =
-            format!("CREATE TABLE IF NOT EXISTS {table_name} (key TEXT PRIMARY KEY, value BLOB)");
-        ctx.prepare(&sql);
-        ctx.sim_state.simple_tables.insert(table_name.clone(), ());
-        debug!("CREATE SIMPLE TABLE: {}", table_name);
-        Ok(true)
+        Some(Operation::CreateSimpleTable { table_name })
     }
 }
 
@@ -312,13 +390,13 @@ impl Workload for CreateSimpleTableWorkload {
 pub struct SimpleSelectWorkload;
 
 impl Workload for SimpleSelectWorkload {
-    fn init(&self, ctx: &mut WorkloadContext, rng: &mut ChaCha8Rng) -> anyhow::Result<bool> {
+    fn generate(&self, ctx: &WorkloadContext, rng: &mut ChaCha8Rng) -> Option<Operation> {
         if ctx.sim_state.simple_tables.is_empty() {
-            return Ok(false);
+            return None;
         }
         let table_name = match ctx.sim_state.simple_tables.pick(rng) {
             Some((name, _)) => name.clone(),
-            None => return Ok(false),
+            None => return None,
         };
 
         // 70% chance to use a known inserted key if available
@@ -332,12 +410,7 @@ impl Workload for SimpleSelectWorkload {
             format!("key_{}", rng.random_range(0..10000))
         };
 
-        let sql = format!("SELECT value FROM {table_name} WHERE key = '{key}'");
-        if !ctx.prepare(&sql) {
-            return Ok(false);
-        }
-        debug!("SIMPLE SELECT: {}", sql);
-        Ok(true)
+        Some(Operation::SimpleSelect { table_name, key })
     }
 }
 
@@ -348,13 +421,13 @@ pub struct SimpleInsertWorkload;
 const MAX_SAMPLE_KEYS_PER_TABLE: usize = 1000;
 
 impl Workload for SimpleInsertWorkload {
-    fn init(&self, ctx: &mut WorkloadContext, rng: &mut ChaCha8Rng) -> anyhow::Result<bool> {
+    fn generate(&self, ctx: &WorkloadContext, rng: &mut ChaCha8Rng) -> Option<Operation> {
         if ctx.sim_state.simple_tables.is_empty() {
-            return Ok(false);
+            return None;
         }
         let table_name = match ctx.sim_state.simple_tables.pick(rng) {
             Some((name, _)) => name.clone(),
-            None => return Ok(false),
+            None => return None,
         };
         let key = format!("key_{}", rng.random_range(0..10000));
         let value_len = rng.random_range(10..100);
@@ -362,23 +435,12 @@ impl Workload for SimpleInsertWorkload {
             .map(|_| rng.random_range(b'a'..=b'z') as char)
             .collect();
         let value_hex = hex::encode(value.as_bytes());
-        let sql = format!(
-            "INSERT OR REPLACE INTO {table_name} (key, value) VALUES ('{key}', X'{value_hex}')"
-        );
-        if !ctx.prepare(&sql) {
-            return Ok(false);
-        }
-        ctx.stats.inserts += 1;
 
-        // Remember the key for later selects
-        ctx.sim_state
-            .simple_tables_keys
-            .entry(table_name.clone())
-            .or_insert_with(|| SamplesContainer::new(MAX_SAMPLE_KEYS_PER_TABLE))
-            .add(key.clone(), rng);
-
-        debug!("SIMPLE INSERT: table={}, key={}", table_name, key);
-        Ok(true)
+        Some(Operation::SimpleInsert {
+            table_name,
+            key,
+            value_hex,
+        })
     }
 }
 
@@ -386,12 +448,10 @@ impl Workload for SimpleInsertWorkload {
 pub struct SelectWorkload;
 
 impl Workload for SelectWorkload {
-    fn init(&self, ctx: &mut WorkloadContext, rng: &mut ChaCha8Rng) -> anyhow::Result<bool> {
+    fn generate(&self, ctx: &WorkloadContext, rng: &mut ChaCha8Rng) -> Option<Operation> {
         let select = Select::arbitrary(rng, ctx);
         let sql = select.to_string();
-        ctx.prepare(&sql);
-        debug!("SELECT: {}", sql);
-        Ok(true)
+        Some(Operation::Select { sql })
     }
 }
 
@@ -399,13 +459,10 @@ impl Workload for SelectWorkload {
 pub struct InsertWorkload;
 
 impl Workload for InsertWorkload {
-    fn init(&self, ctx: &mut WorkloadContext, rng: &mut ChaCha8Rng) -> anyhow::Result<bool> {
+    fn generate(&self, ctx: &WorkloadContext, rng: &mut ChaCha8Rng) -> Option<Operation> {
         let insert = Insert::arbitrary(rng, ctx);
         let sql = insert.to_string();
-        ctx.prepare(&sql);
-        ctx.stats.inserts += 1;
-        debug!("INSERT: {}", sql);
-        Ok(true)
+        Some(Operation::Insert { sql })
     }
 }
 
@@ -413,13 +470,10 @@ impl Workload for InsertWorkload {
 pub struct UpdateWorkload;
 
 impl Workload for UpdateWorkload {
-    fn init(&self, ctx: &mut WorkloadContext, rng: &mut ChaCha8Rng) -> anyhow::Result<bool> {
+    fn generate(&self, ctx: &WorkloadContext, rng: &mut ChaCha8Rng) -> Option<Operation> {
         let update = Update::arbitrary(rng, ctx);
         let sql = update.to_string();
-        ctx.prepare(&sql);
-        ctx.stats.updates += 1;
-        debug!("UPDATE: {}", sql);
-        Ok(true)
+        Some(Operation::Update { sql })
     }
 }
 
@@ -427,13 +481,10 @@ impl Workload for UpdateWorkload {
 pub struct DeleteWorkload;
 
 impl Workload for DeleteWorkload {
-    fn init(&self, ctx: &mut WorkloadContext, rng: &mut ChaCha8Rng) -> anyhow::Result<bool> {
+    fn generate(&self, ctx: &WorkloadContext, rng: &mut ChaCha8Rng) -> Option<Operation> {
         let delete = Delete::arbitrary(rng, ctx);
         let sql = delete.to_string();
-        ctx.prepare(&sql);
-        ctx.stats.deletes += 1;
-        debug!("DELETE: {}", sql);
-        Ok(true)
+        Some(Operation::Delete { sql })
     }
 }
 
@@ -441,16 +492,14 @@ impl Workload for DeleteWorkload {
 pub struct CreateIndexWorkload;
 
 impl Workload for CreateIndexWorkload {
-    fn init(&self, ctx: &mut WorkloadContext, rng: &mut ChaCha8Rng) -> anyhow::Result<bool> {
+    fn generate(&self, ctx: &WorkloadContext, rng: &mut ChaCha8Rng) -> Option<Operation> {
         let create_index = CreateIndex::arbitrary(rng, ctx);
         let sql = create_index.to_string();
-        ctx.prepare(&sql);
-        ctx.sim_state.indexes.insert(
-            create_index.index_name.clone(),
-            create_index.index.table_name.clone(),
-        );
-        debug!("CREATE INDEX: {}", sql);
-        Ok(true)
+        Some(Operation::CreateIndex {
+            sql,
+            index_name: create_index.index_name.clone(),
+            table_name: create_index.index.table_name.clone(),
+        })
     }
 }
 
@@ -458,24 +507,20 @@ impl Workload for CreateIndexWorkload {
 pub struct DropIndexWorkload;
 
 impl Workload for DropIndexWorkload {
-    fn init(&self, ctx: &mut WorkloadContext, rng: &mut ChaCha8Rng) -> anyhow::Result<bool> {
+    fn generate(&self, ctx: &WorkloadContext, rng: &mut ChaCha8Rng) -> Option<Operation> {
         if ctx.sim_state.indexes.is_empty() {
-            return Ok(false);
+            return None;
         }
         let (index_name, table_name) = match ctx.sim_state.indexes.pick(rng) {
             Some((idx_name, tbl_name)) => (idx_name.clone(), tbl_name.clone()),
-            None => return Ok(false),
+            None => return None,
         };
-        // Mark index as removed (tombstone)
-        ctx.sim_state.indexes.remove(&index_name);
         let drop_index = DropIndex {
             table_name,
-            index_name,
+            index_name: index_name.clone(),
         };
         let sql = drop_index.to_string();
-        ctx.prepare(&sql);
-        debug!("DROP INDEX: {}", sql);
-        Ok(true)
+        Some(Operation::DropIndex { sql, index_name })
     }
 }
 
@@ -483,10 +528,10 @@ impl Workload for DropIndexWorkload {
 pub struct WalCheckpointWorkload;
 
 impl Workload for WalCheckpointWorkload {
-    fn init(&self, ctx: &mut WorkloadContext, rng: &mut ChaCha8Rng) -> anyhow::Result<bool> {
+    fn generate(&self, ctx: &WorkloadContext, rng: &mut ChaCha8Rng) -> Option<Operation> {
         // Checkpoint should only run when not in a transaction
         if *ctx.fiber_state != FiberState::Idle {
-            return Ok(false);
+            return None;
         }
         let mode = match rng.random_range(0..4) {
             0 => "PASSIVE",
@@ -494,10 +539,9 @@ impl Workload for WalCheckpointWorkload {
             2 => "RESTART",
             _ => "TRUNCATE",
         };
-        let sql = format!("PRAGMA wal_checkpoint({mode})");
-        ctx.prepare(&sql);
-        debug!("WAL CHECKPOINT: {}", mode);
-        Ok(true)
+        Some(Operation::WalCheckpoint {
+            mode: mode.to_string(),
+        })
     }
 }
 
@@ -505,14 +549,11 @@ impl Workload for WalCheckpointWorkload {
 pub struct CommitWorkload;
 
 impl Workload for CommitWorkload {
-    fn init(&self, ctx: &mut WorkloadContext, _rng: &mut ChaCha8Rng) -> anyhow::Result<bool> {
+    fn generate(&self, ctx: &WorkloadContext, _rng: &mut ChaCha8Rng) -> Option<Operation> {
         if *ctx.fiber_state != FiberState::InTx {
-            return Ok(false);
+            return None;
         }
-        ctx.prepare("COMMIT");
-        *ctx.fiber_state = FiberState::Idle;
-        debug!("COMMIT");
-        Ok(true)
+        Some(Operation::Commit)
     }
 }
 
@@ -520,14 +561,11 @@ impl Workload for CommitWorkload {
 pub struct RollbackWorkload;
 
 impl Workload for RollbackWorkload {
-    fn init(&self, ctx: &mut WorkloadContext, _rng: &mut ChaCha8Rng) -> anyhow::Result<bool> {
+    fn generate(&self, ctx: &WorkloadContext, _rng: &mut ChaCha8Rng) -> Option<Operation> {
         if *ctx.fiber_state != FiberState::InTx {
-            return Ok(false);
+            return None;
         }
-        ctx.prepare("ROLLBACK");
-        *ctx.fiber_state = FiberState::Idle;
-        debug!("ROLLBACK");
-        Ok(true)
+        Some(Operation::Rollback)
     }
 }
 
@@ -681,6 +719,8 @@ struct SimulatorFiber {
     rows_fetched: Vec<Vec<Value>>,
     /// Current execution ID for tracing statement lifecycle
     execution_id: Option<u64>,
+    /// Current operation being executed
+    current_op: Option<Operation>,
 }
 
 /// Shared state for simulator that can be accessed by workloads.
@@ -916,6 +956,7 @@ impl Whopper {
                             self.context.fibers[fiber_idx].statement.replace(None);
                             self.context.fibers[fiber_idx].rows_fetched.clear();
                             self.context.fibers[fiber_idx].execution_id = None;
+                            self.context.fibers[fiber_idx].current_op = None;
                             if matches!(self.context.fibers[fiber_idx].state, FiberState::InTx)
                                 && let Ok(rollback_stmt) = self.context.fibers[fiber_idx]
                                     .connection
@@ -935,6 +976,7 @@ impl Whopper {
                             self.context.fibers[fiber_idx].statement.replace(None);
                             self.context.fibers[fiber_idx].rows_fetched.clear();
                             self.context.fibers[fiber_idx].execution_id = None;
+                            self.context.fibers[fiber_idx].current_op = None;
                             if matches!(self.context.fibers[fiber_idx].state, FiberState::InTx)
                                 && let Ok(rollback_stmt) = self.context.fibers[fiber_idx]
                                     .connection
@@ -954,6 +996,7 @@ impl Whopper {
                             self.context.fibers[fiber_idx].statement.replace(None);
                             self.context.fibers[fiber_idx].rows_fetched.clear();
                             self.context.fibers[fiber_idx].execution_id = None;
+                            self.context.fibers[fiber_idx].current_op = None;
                             self.context.fibers[fiber_idx].state = FiberState::Idle;
                             return Ok(());
                         }
@@ -964,6 +1007,7 @@ impl Whopper {
                             self.context.fibers[fiber_idx].statement.replace(None);
                             self.context.fibers[fiber_idx].rows_fetched.clear();
                             self.context.fibers[fiber_idx].execution_id = None;
+                            self.context.fibers[fiber_idx].current_op = None;
                             if matches!(self.context.fibers[fiber_idx].state, FiberState::InTx)
                                 && let Ok(rollback_stmt) = self.context.fibers[fiber_idx]
                                     .connection
@@ -1004,6 +1048,7 @@ impl Whopper {
         self.context.fibers[fiber_idx].statement.replace(None);
         self.context.fibers[fiber_idx].rows_fetched.clear();
         self.context.fibers[fiber_idx].execution_id = None;
+        self.context.fibers[fiber_idx].current_op = None;
 
         // Select a workload using weighted random selection
         if self.total_weight == 0 {
@@ -1017,7 +1062,7 @@ impl Whopper {
                 let exec_id = self.next_execution_id;
                 self.next_execution_id += 1;
 
-                let fiber = &mut self.context.fibers[fiber_idx];
+                let fiber = &self.context.fibers[fiber_idx];
                 let state_str = format!("{:?}", &fiber.state);
                 let span =
                     tracing::debug_span!("init", fiber = fiber_idx, exec = exec_id, state = state_str);
@@ -1030,27 +1075,119 @@ impl Whopper {
                     .iter()
                     .map(|(_, t)| t.clone())
                     .collect();
-                let mut ctx = WorkloadContext {
-                    connection: &fiber.connection,
-                    fiber_state: &mut fiber.state,
-                    statement: &fiber.statement,
-                    sim_state: &mut self.context.state,
-                    stats: &mut self.stats,
+                let ctx = WorkloadContext {
+                    fiber_state: &fiber.state,
+                    sim_state: &self.context.state,
                     opts: &self.opts,
                     enable_mvcc: self.context.enable_mvcc,
                     tables_vec,
                 };
-                if workload.init(&mut ctx, &mut self.rng)? {
-                    // Statement was successfully prepared, store execution_id
-                    self.context.fibers[fiber_idx].execution_id = Some(exec_id);
-                    return Ok(());
+
+                // Generate operation from workload
+                let op = match workload.generate(&ctx, &mut self.rng) {
+                    Some(op) => op,
+                    None => {
+                        // Workload couldn't generate an operation, try next
+                        roll = roll.saturating_sub(*weight);
+                        continue;
+                    }
+                };
+
+                debug!("OP: {:?}", op);
+
+                // Prepare the operation
+                let fiber = &self.context.fibers[fiber_idx];
+                match op.prepare(&fiber.connection) {
+                    Ok(stmt) => {
+                        fiber.statement.replace(Some(stmt));
+                    }
+                    Err(e) => {
+                        let err_str = e.to_string().to_lowercase();
+                        // Allow "no such table/index" and "already exists" errors
+                        if err_str.contains("no such table")
+                            || err_str.contains("no such index")
+                            || err_str.contains("already exists")
+                        {
+                            debug!("prepare skipped: {}", err_str);
+                            roll = roll.saturating_sub(*weight);
+                            continue;
+                        } else {
+                            panic!(
+                                "Failed to prepare statement: {}\nSQL: {}",
+                                e,
+                                op.sql()
+                            );
+                        }
+                    }
                 }
-                // If workload returned false, continue to try next
+
+                // Apply state changes based on operation type
+                self.apply_operation_start(fiber_idx, &op);
+
+                // Store operation and execution_id
+                self.context.fibers[fiber_idx].current_op = Some(op);
+                self.context.fibers[fiber_idx].execution_id = Some(exec_id);
+                return Ok(());
             }
             roll = roll.saturating_sub(*weight);
         }
 
         Ok(())
+    }
+
+    /// Apply state changes when an operation starts
+    fn apply_operation_start(&mut self, fiber_idx: usize, op: &Operation) {
+        match op {
+            Operation::Begin { .. } => {
+                self.context.fibers[fiber_idx].state = FiberState::InTx;
+            }
+            Operation::Commit | Operation::Rollback => {
+                self.context.fibers[fiber_idx].state = FiberState::Idle;
+            }
+            Operation::IntegrityCheck => {
+                self.stats.integrity_checks += 1;
+            }
+            Operation::CreateSimpleTable { table_name } => {
+                self.context
+                    .state
+                    .simple_tables
+                    .insert(table_name.clone(), ());
+            }
+            Operation::SimpleInsert {
+                table_name, key, ..
+            } => {
+                self.stats.inserts += 1;
+                self.context
+                    .state
+                    .simple_tables_keys
+                    .entry(table_name.clone())
+                    .or_insert_with(|| SamplesContainer::new(MAX_SAMPLE_KEYS_PER_TABLE))
+                    .add(key.clone(), &mut self.rng);
+            }
+            Operation::Insert { .. } => {
+                self.stats.inserts += 1;
+            }
+            Operation::Update { .. } => {
+                self.stats.updates += 1;
+            }
+            Operation::Delete { .. } => {
+                self.stats.deletes += 1;
+            }
+            Operation::CreateIndex {
+                index_name,
+                table_name,
+                ..
+            } => {
+                self.context
+                    .state
+                    .indexes
+                    .insert(index_name.clone(), table_name.clone());
+            }
+            Operation::DropIndex { index_name, .. } => {
+                self.context.state.indexes.remove(index_name);
+            }
+            _ => {}
+        }
     }
 
     /// Run the simulation to completion (up to max_steps or WAL limit).
@@ -1159,6 +1296,7 @@ impl Whopper {
                 statement: RefCell::new(None),
                 rows_fetched: vec![],
                 execution_id: None,
+                current_op: None,
             });
         }
 
