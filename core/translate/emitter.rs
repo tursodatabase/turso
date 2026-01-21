@@ -4183,8 +4183,7 @@ fn rewrite_update_expr_for_generated(
 
     if let Some(col) = missing_column {
         return Err(crate::LimboError::ParseError(format!(
-            "column '{}' not found in table",
-            col
+            "column '{col}' not found in table",
         )));
     }
 
