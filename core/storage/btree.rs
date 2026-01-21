@@ -54,6 +54,11 @@ use std::{
     sync::Arc,
 };
 
+/// Maximum number of key values to store on the stack when converting registers to ValueRefs
+/// during seeking. Since we use a SmallVec it'll gracefully fall back to heap allocating beyond
+/// this threshold.
+const STACK_ALLOC_KEY_VALS_MAX: usize = 16;
+
 /// The B-Tree page header is 12 bytes for interior pages and 8 bytes for leaf pages.
 ///
 /// +--------+-----------------+-----------------+-----------------+--------+----- ..... ----+
@@ -568,6 +573,8 @@ pub trait CursorTrait: Any + Send + Sync {
     fn record(&mut self) -> Result<IOResult<Option<&ImmutableRecord>>>;
     /// Move the cursor based on the key and the type of operation (op).
     fn seek(&mut self, key: SeekKey<'_>, op: SeekOp) -> Result<IOResult<SeekResult>>;
+    /// Seek using registers directly without serializing them into an ImmutableRecord first.
+    /// This avoids heap allocation and serialization overhead in hot paths like index lookups.
     fn seek_unpacked(&mut self, registers: &[Register], op: SeekOp)
         -> Result<IOResult<SeekResult>>;
     /// Insert a record in the position the cursor is at.
@@ -1365,12 +1372,14 @@ impl BTreeCursor {
             let index_info = self
                 .index_info
                 .as_ref()
-                .expect("indexbtree_move_to without index_info");
+                .expect("indexbtree_move_to: index_info required");
             find_compare(key_values.iter().peekable(), index_info)
         };
         self.indexbtree_move_to_internal(cmp, record_comparer, &key_values)
     }
 
+    /// Move cursor to position using registers directly, avoiding record serialization.
+    /// See `seek_unpacked` for rationale.
     #[instrument(skip(self, registers), level = Level::DEBUG)]
     fn indexbtree_move_to_unpacked(
         &mut self,
@@ -1390,34 +1399,17 @@ impl BTreeCursor {
             }
         }
 
-        if registers.len() <= 16 {
-            let mut kv_buf = [ValueRef::Null; 16];
-            for (i, r) in registers.iter().enumerate() {
-                kv_buf[i] = r.get_value().as_value_ref();
-            }
-            let key_values = &kv_buf[..registers.len()];
-            let record_comparer = {
-                let index_info = self
-                    .index_info
-                    .as_ref()
-                    .expect("indexbtree_move_to_unpacked without index_info");
-                find_compare(key_values.iter().peekable(), index_info)
-            };
-            self.indexbtree_move_to_internal(cmp, record_comparer, key_values)
-        } else {
-            let key_values: Vec<ValueRef<'_>> = registers
-                .iter()
-                .map(|r| r.get_value().as_value_ref())
-                .collect();
-            let record_comparer = {
-                let index_info = self
-                    .index_info
-                    .as_ref()
-                    .expect("indexbtree_move_to_unpacked without index_info");
-                find_compare(key_values.iter().peekable(), index_info)
-            };
-            self.indexbtree_move_to_internal(cmp, record_comparer, &key_values)
-        }
+        let index_info = self
+            .index_info
+            .as_ref()
+            .expect("indexbtree_move_to_unpacked: index_info required");
+
+        let key_values: SmallVec<[ValueRef<'_>; STACK_ALLOC_KEY_VALS_MAX]> = registers
+            .iter()
+            .map(|r| r.get_value().as_value_ref())
+            .collect();
+        let record_comparer = find_compare(key_values.iter().peekable(), index_info);
+        self.indexbtree_move_to_internal(cmp, record_comparer, &key_values)
     }
 
     fn indexbtree_move_to_internal(
@@ -1622,7 +1614,7 @@ impl BTreeCursor {
                     key_values,
                     self.index_info
                         .as_ref()
-                        .expect("indexbtree_move_to without index_info"),
+                        .expect("indexbtree_move_to: index_info required"),
                     0,
                     tie_breaker,
                 )
@@ -1855,7 +1847,7 @@ impl BTreeCursor {
             let index_info = self
                 .index_info
                 .as_ref()
-                .expect("indexbtree_seek without index_info");
+                .expect("indexbtree_seek: index_info required");
             find_compare(key_values.iter().peekable(), index_info)
         };
 
@@ -1867,52 +1859,30 @@ impl BTreeCursor {
         self.indexbtree_seek_internal(seek_op, record_comparer, &key_values)
     }
 
+    /// Seek using registers directly, avoiding record serialization overhead.
+    /// See `seek_unpacked` trait method for rationale.
     #[instrument(skip_all, level = Level::DEBUG)]
     fn indexbtree_seek_unpacked(
         &mut self,
         registers: &[Register],
         seek_op: SeekOp,
     ) -> Result<IOResult<SeekResult>> {
-        if registers.len() <= 16 {
-            let mut kv_buf = [ValueRef::Null; 16];
-            for (i, r) in registers.iter().enumerate() {
-                kv_buf[i] = r.get_value().as_value_ref();
-            }
-            let key_values = &kv_buf[..registers.len()];
-            let record_comparer = {
-                let index_info = self
-                    .index_info
-                    .as_ref()
-                    .expect("indexbtree_seek_unpacked without index_info");
-                find_compare(key_values.iter().peekable(), index_info)
-            };
+        let index_info = self
+            .index_info
+            .as_ref()
+            .expect("indexbtree_seek_unpacked: index_info required");
 
-            tracing::debug!(
-                "Using record comparison strategy for seek: {:?}",
-                record_comparer
-            );
-
-            self.indexbtree_seek_internal(seek_op, record_comparer, key_values)
-        } else {
-            let key_values: Vec<ValueRef<'_>> = registers
-                .iter()
-                .map(|r| r.get_value().as_value_ref())
-                .collect();
-            let record_comparer = {
-                let index_info = self
-                    .index_info
-                    .as_ref()
-                    .expect("indexbtree_seek_unpacked without index_info");
-                find_compare(key_values.iter().peekable(), index_info)
-            };
-
-            tracing::debug!(
-                "Using record comparison strategy for seek: {:?}",
-                record_comparer
-            );
-
-            self.indexbtree_seek_internal(seek_op, record_comparer, &key_values)
-        }
+        // SmallVec stores up to MAX_STACK_KEY_VALUES on the stack, spilling to heap only if exceeded
+        let key_values: SmallVec<[ValueRef<'_>; STACK_ALLOC_KEY_VALS_MAX]> = registers
+            .iter()
+            .map(|r| r.get_value().as_value_ref())
+            .collect();
+        let record_comparer = find_compare(key_values.iter().peekable(), index_info);
+        tracing::debug!(
+            "Using record comparison strategy for seek: {:?}",
+            record_comparer
+        );
+        self.indexbtree_seek_internal(seek_op, record_comparer, &key_values)
     }
 
     fn indexbtree_seek_internal(
@@ -2076,7 +2046,7 @@ impl BTreeCursor {
             &record_comparer,
             self.index_info
                 .as_ref()
-                .expect("indexbtree_seek without index_info"),
+                .expect("indexbtree_seek: index_info required"),
         );
         if found {
             state.nearest_matching_cell.replace(cur_cell_idx as usize);

@@ -35,6 +35,9 @@ pub fn emit_select_result(
 
     let start_reg = reg_result_cols_start;
 
+    // For EXISTS subqueries, we only need to determine whether any row exists, not its
+    // column values. The result is simply writing `1` to the result register. Evaluating
+    // the actual result columns would be wasted CPU cycles.
     let skip_column_eval = matches!(
         plan.query_destination,
         QueryDestination::ExistsSubqueryResult { .. }

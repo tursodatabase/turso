@@ -3273,36 +3273,9 @@ pub fn seek_internal(
                         } => {
                             let start_reg = *start_reg;
                             let num_regs = *num_regs;
-                            #[cfg(debug_assertions)]
-                            let snapshot: Vec<crate::Value> = state.registers
-                                [start_reg..start_reg + num_regs]
-                                .iter()
-                                .map(|r| r.get_value().to_owned())
-                                .collect();
-
                             let cursor = get_cursor!(state, cursor_id).as_btree_mut();
                             let registers = &state.registers[start_reg..start_reg + num_regs];
-
-                            let res = cursor.seek_unpacked(registers, *op);
-
-                            #[cfg(debug_assertions)] // better todo and should this be in prod?
-                            {
-                                for (i, (current, original)) in state.registers
-                                    [start_reg..start_reg + num_regs]
-                                    .iter()
-                                    .zip(snapshot.iter())
-                                    .enumerate()
-                                {
-                                    debug_assert_eq!(
-                                        &current.get_value().to_owned(),
-                                        original,
-                                        "No shouldn'tt happen {}",
-                                        start_reg + i
-                                    );
-                                }
-                            }
-
-                            match res? {
+                            match cursor.seek_unpacked(registers, *op)? {
                                 IOResult::Done(seek_result) => seek_result,
                                 IOResult::IO(io) => return Ok(SeekInternalResult::IO(io)),
                             }
