@@ -33,14 +33,95 @@ pub struct IndexInfo {
 
 pub const ESTIMATED_HARDCODED_ROWS_PER_TABLE: usize = 1000000;
 pub const ESTIMATED_HARDCODED_ROWS_PER_PAGE: usize = 50; // roughly 80 bytes per 4096 byte page
-                                                         // Fraction of IO cost paid for each additional scan when cache reuse kicks in.
-const SCAN_CACHE_REUSE_FACTOR: f64 = 0.2;
-// FIXME: Magic constant. The cost model should derive this from actual IO vs seek cost ratios
-// based on workload characteristics rather than using a hardcoded multiplier.
-const FULL_SCAN_PENALTY_FACTOR: f64 = 3.0;
 
-pub fn estimate_page_io_cost(rowcount: f64) -> Cost {
-    Cost((rowcount / ESTIMATED_HARDCODED_ROWS_PER_PAGE as f64).ceil())
+/// Estimate IO and CPU cost for a full table scan.
+///
+/// # Arguments
+/// * `base_row_count` - Total rows in the table
+/// * `num_scans` - Number of times we scan the table (e.g., from outer loop in nested loop join)
+fn estimate_scan_cost(base_row_count: f64, num_scans: f64) -> Cost {
+    let table_pages = (base_row_count / ESTIMATED_HARDCODED_ROWS_PER_PAGE as f64).max(1.0);
+
+    // First scan reads all pages; subsequent scans benefit from caching
+    let cache_reuse_factor = 0.2;
+    let io_cost = if num_scans <= 1.0 {
+        table_pages
+    } else {
+        // First scan + discounted cost for subsequent scans
+        table_pages + (num_scans - 1.0) * table_pages * cache_reuse_factor
+    };
+
+    // CPU cost for processing all rows on each scan
+    let cpu_cost = num_scans * base_row_count * 0.001;
+
+    Cost(io_cost + cpu_cost)
+}
+
+/// Estimate IO and CPU cost for index-based access.
+///
+/// This properly separates the number of B-tree seeks from the number of rows
+/// returned per seek. A range scan does ONE seek followed by sequential leaf
+/// page reads, not one seek per row.
+///
+/// # Arguments
+/// * `base_row_count` - Total rows in the table (for estimating tree depth and page counts)
+/// * `tree_depth` - B-tree depth (number of pages to traverse per seek)
+/// * `index_info` - Index properties (covering, unique, etc.)
+/// * `num_seeks` - Number of B-tree traversals (typically = outer cardinality for joins)
+/// * `rows_per_seek` - Expected rows returned per seek (1 for point lookup, more for range)
+fn estimate_index_cost(
+    base_row_count: f64,
+    tree_depth: f64,
+    index_info: IndexInfo,
+    num_seeks: f64,
+    rows_per_seek: f64,
+) -> Cost {
+    // Detect full index scan: when rows_per_seek equals base_row_count, we're scanning
+    // the entire index, not seeking to specific positions.
+    let is_full_scan = (rows_per_seek - base_row_count).abs() < 1.0;
+
+    // Cost of B-tree traversals: each seek traverses tree_depth pages.
+    // For a full scan, we only do one initial seek to the start of the index.
+    let seek_cost = if is_full_scan {
+        tree_depth // Single seek to start
+    } else {
+        num_seeks * tree_depth
+    };
+
+    // Cost of reading leaf pages after seeking.
+    // For covering indexes, entries are smaller (only indexed columns), so more rows fit per page.
+    // Use a 2x density factor for covering indexes.
+    let rows_per_page = if index_info.covering {
+        ESTIMATED_HARDCODED_ROWS_PER_PAGE as f64 * 2.0
+    } else {
+        ESTIMATED_HARDCODED_ROWS_PER_PAGE as f64
+    };
+    let leaf_pages = (rows_per_seek / rows_per_page).max(1.0);
+    let leaf_scan_cost = if is_full_scan {
+        leaf_pages // Sequential scan of all leaf pages
+    } else {
+        num_seeks * leaf_pages
+    };
+
+    // For non-covering indexes, we need to fetch from the table for each row.
+    let table_lookup_cost = if index_info.covering {
+        0.0
+    } else {
+        let table_pages = (base_row_count / ESTIMATED_HARDCODED_ROWS_PER_PAGE as f64).max(1.0);
+        let selectivity = rows_per_seek / base_row_count.max(1.0);
+        num_seeks * selectivity * table_pages
+    };
+
+    let io_cost = seek_cost + leaf_scan_cost + table_lookup_cost;
+
+    // CPU cost: key comparisons during seeks + row processing
+    let total_rows = num_seeks * rows_per_seek;
+    let cpu_cost = num_seeks * 0.01 + total_rows * 0.001;
+
+    // Small bonus for using an existing index
+    let index_bonus = 0.5;
+
+    Cost((io_cost + cpu_cost - index_bonus).max(0.001))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -75,34 +156,19 @@ pub fn estimate_cost_for_scan_or_seek(
     base_row_count: RowCountEstimate,
     is_index_ordered: bool,
 ) -> Cost {
-    let has_real_stats = matches!(base_row_count, RowCountEstimate::AnalyzeStats(_));
     let base_row_count = *base_row_count;
+
+    let tree_depth = if base_row_count <= 1.0 {
+        1.0
+    } else {
+        (base_row_count.ln() / (ESTIMATED_HARDCODED_ROWS_PER_PAGE as f64).ln())
+            .ceil()
+            .max(1.0)
+    };
 
     let Some(index_info) = index_info else {
         // Full table scan (no index)
-        if has_real_stats {
-            // With real stats, account for caching on small tables
-            let table_pages = (base_row_count / ESTIMATED_HARDCODED_ROWS_PER_PAGE as f64).max(1.0);
-
-            // Without caching: input_cardinality * base_row_count rows = many page reads
-            let uncached_io = estimate_page_io_cost(input_cardinality * base_row_count);
-
-            // With caching: pages are reused, but repeated scans still incur IO.
-            let scans = input_cardinality.max(1.0);
-            let cached_io = Cost(table_pages * (2.0 + (scans - 1.0) * SCAN_CACHE_REUSE_FACTOR));
-
-            // CPU cost for processing rows: key differentiator for scans
-            let cpu_cost = input_cardinality * base_row_count * 0.001;
-            let io_cost = uncached_io.0.min(cached_io.0);
-            return Cost(io_cost + cpu_cost);
-        } else {
-            // Without real stats, use simple IO-based model.
-            // Penalize full scans to encourage index usage.
-            return Cost(
-                estimate_page_io_cost(input_cardinality * base_row_count).0
-                    * FULL_SCAN_PENALTY_FACTOR,
-            );
-        }
+        return estimate_scan_cost(base_row_count, input_cardinality);
     };
 
     // Check if this is a unique index with full equality constraints on all columns.
@@ -118,66 +184,17 @@ pub fn estimate_cost_for_scan_or_seek(
     };
 
     if is_unique_point_lookup {
-        // Unique point lookup: at most 1 row returned per input row
-        // Tree depth is log(rows) / log(fanout)
-        let tree_depth = if base_row_count <= 1.0 {
-            1.0
-        } else {
-            (base_row_count.ln() / (ESTIMATED_HARDCODED_ROWS_PER_PAGE as f64).ln())
-                .ceil()
-                .max(1.0)
-        };
-
-        // Cost per lookup: tree traversal + optional table lookup for non-covering
-        let pages_per_lookup = tree_depth + if index_info.covering { 0.0 } else { 1.0 };
-
-        if has_real_stats {
-            // With real stats, account for page caching on small tables.
-            let table_pages = (base_row_count / ESTIMATED_HARDCODED_ROWS_PER_PAGE as f64).max(1.0);
-
-            // For tables that fit in cache, total IO is bounded by the number of distinct
-            // pages in the table (at most table_pages for covering index, 2*table_pages
-            // for non-covering since we need both index and table pages).
-            let distinct_pages = table_pages * (if index_info.covering { 1.0 } else { 2.0 });
-
-            // Cost model uses minimum of two approaches:
-            //
-            // 1. Per-lookup cost: input_cardinality * pages_per_lookup
-            //    Each lookup traverses tree_depth pages. For few lookups (e.g., 25 rowid
-            //    seeks), this is cheaper than reading the whole table.
-            //
-            // 2. Cache-bounded cost: distinct_pages
-            //    With caching, repeated lookups into the same table are cheap after the
-            //    first read. For many lookups, total IO is bounded by distinct pages.
-            //
-            // Example: 25 lookups into 150K row table (3000 pages, tree_depth=4)
-            //   - per_lookup: 25 * 4 = 100 pages (better!)
-            //   - cache_bounded: 3000 pages
-            //
-            // Example: 10000 lookups into same table
-            //   - per_lookup: 10000 * 4 = 40000 pages
-            //   - cache_bounded: 3000 pages (better!)
-            let per_lookup_cost = input_cardinality * pages_per_lookup;
-            let cache_bounded_cost = distinct_pages;
-
-            // Still add a small per-lookup cost to differentiate from scan due to overhead for key comparison
-            let lookup_overhead = input_cardinality * 0.001;
-            let io_cost = per_lookup_cost.min(cache_bounded_cost) + lookup_overhead;
-            let cpu_cost = input_cardinality * 0.001;
-
-            // Give a bonus for using direct lookup vs. scan.
-            // This accounts for the fact that scans in join contexts often trigger
-            // auto-creation of ephemeral indexes, which is more expensive than
-            // using an existing index directly.
-            let direct_lookup_bonus = 0.5;
-
-            return Cost((io_cost + cpu_cost - direct_lookup_bonus).max(0.001));
-        } else {
-            // Without real stats, use simple per-lookup cost
-            return Cost(input_cardinality * pages_per_lookup);
-        }
+        // Unique point lookup: 1 seek per input row, 1 row returned per seek
+        return estimate_index_cost(
+            base_row_count,
+            tree_depth,
+            index_info,
+            input_cardinality, // num_seeks = outer cardinality
+            1.0,               // rows_per_seek = 1 for unique point lookup
+        );
     }
 
+    // Calculate selectivity to estimate rows returned per seek
     let selectivity_multiplier: f64 = usable_constraint_refs
         .iter()
         .map(|cref| {
@@ -198,18 +215,25 @@ pub fn estimate_cost_for_scan_or_seek(
         })
         .product();
 
-    let rows_visited = selectivity_multiplier * base_row_count * input_cardinality;
-    let base_cost = estimate_page_io_cost(rows_visited);
+    // rows_per_seek: how many rows we expect to get from each index seek
+    let rows_per_seek = (selectivity_multiplier * base_row_count).max(1.0);
+
+    let base_cost = estimate_index_cost(
+        base_row_count,
+        tree_depth,
+        index_info,
+        input_cardinality, // num_seeks = outer cardinality
+        rows_per_seek,
+    );
 
     let is_full_scan = usable_constraint_refs.is_empty();
     // Penalize non-covering indexes doing full scans when not ordered by the index.
     // Without ordering benefit, a full scan on a non-covering index requires random
     // table lookups for each row, which is expensive.
-    let table_seek_penalty = if !index_info.covering && is_full_scan && !is_index_ordered {
-        estimate_page_io_cost(rows_visited * FULL_SCAN_PENALTY_FACTOR)
+    if !index_info.covering && is_full_scan && !is_index_ordered {
+        // Full index scan without ordering benefit - prefer table scan instead
+        Cost(base_cost.0 * 2.0)
     } else {
-        Cost(0.0)
-    };
-
-    base_cost + table_seek_penalty
+        base_cost
+    }
 }
