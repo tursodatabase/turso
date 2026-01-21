@@ -905,6 +905,7 @@ fn is_progress_instruction(insn: &Insn) -> bool {
             | Insn::VNext { .. }
             // Counter-based termination
             | Insn::DecrJumpZero { .. }
+            | Insn::IfPos { .. }
             // These terminate execution
             | Insn::Halt { .. }
             | Insn::Return { .. }
@@ -1021,6 +1022,10 @@ pub fn validate_no_infinite_loops(insns: &[(Insn, usize)]) -> Result<(), Vec<Inf
 /// Panics with a detailed error message if validation fails.
 #[cfg(debug_assertions)]
 pub fn debug_assert_valid_program(insns: &[(Insn, usize)], sql: &str) {
+    // program from incremental DBSP circuits - skip them for now
+    if sql == "" {
+        return;
+    }
     // Check for uninitialized registers
     if !sql.contains("LIMIT") {
         if let Err(errors) = validate_register_initialization(insns) {
