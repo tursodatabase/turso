@@ -178,6 +178,7 @@ test pragma-vtab-no-arguments {
 expect {
 }
 
+@skip-if mvcc "panic: transaction should exist in txs map"
 test pragma-vtab-join {
     SELECT s.name, ti.name FROM sqlite_schema AS s, pragma_table_info(s.name) AS ti;
 }
@@ -197,6 +198,7 @@ expect {
     products|price
 }
 
+@skip-if mvcc "panic: transaction should exist in txs map"
 test pragma-vtab-reversed-join-order {
     SELECT s.name, ti.name FROM pragma_table_info(s.name) AS ti, sqlite_schema AS s;
 }

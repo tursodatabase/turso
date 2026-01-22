@@ -38,6 +38,7 @@ expect {
     wal
 }
 
+@skip-if mvcc "should return something different for mvcc"
 test pragma-function-update-journal-mode {
     SELECT * FROM pragma_journal_mode()
 }
@@ -52,6 +53,7 @@ expect {
     value
 }
 
+@skip-if mvcc "page_count not implemented for mvcc"
 test pragma-page-count-table {
     CREATE TABLE foo (bar);
     PRAGMA page_count
@@ -92,6 +94,7 @@ expect {
     4096
 }
 
+@skip-if mvcc "max_page_count and page_count not implemented for mvcc"
 test pragma-max-page-count-clamping-with-data {
     CREATE TABLE test (id INTEGER);
     PRAGMA page_count;
@@ -102,6 +105,7 @@ expect {
     2
 }
 
+@skip-if mvcc "max_page_count not implemented for mvcc"
 test pragma-max-page-count-enforcement-error {
     PRAGMA max_page_count = 1;
     CREATE TABLE test (id INTEGER)
@@ -116,6 +120,7 @@ expect {
     0
 }
 
+@skip-if mvcc "page_count not implemented for mvcc"
 test pragma-page-count-empty-2 {
     PRAGMA user_version=1;
     PRAGMA page_count
@@ -131,6 +136,7 @@ expect {
     0
 }
 
+@skip-if mvcc "user_version not implemented for mvcc"
 test pragma-user-version-update {
     PRAGMA user_version = 42;
     PRAGMA user_version;
@@ -139,6 +145,7 @@ expect {
     42
 }
 
+@skip-if mvcc "user_version not implemented for mvcc"
 test pragma-user-version-negative-value {
     PRAGMA user_version = -10;
     PRAGMA user_version;
@@ -147,6 +154,7 @@ expect {
     -10
 }
 
+@skip-if mvcc "user_version not implemented for mvcc"
 test pragma-user-version-float-value {
     PRAGMA user_version = 10.9;
     PRAGMA user_version;
@@ -162,6 +170,7 @@ expect {
     0
 }
 
+@skip-if mvcc "application_id not implemented for mvcc"
 test pragma-application-id-update {
     PRAGMA application_id = 12345;
     PRAGMA application_id;
@@ -170,6 +179,7 @@ expect {
     12345
 }
 
+@skip-if mvcc "application_id not implemented for mvcc"
 test pragma-application-id-float-value {
     PRAGMA application_id = 10.9;
     PRAGMA application_id;
@@ -178,6 +188,7 @@ expect {
     10
 }
 
+@skip-if mvcc "application_id not implemented for mvcc"
 test pragma-application-id-large-value {
     PRAGMA application_id = 2147483647;
     PRAGMA application_id;
@@ -186,6 +197,7 @@ expect {
     2147483647
 }
 
+@skip-if mvcc "application_id not implemented for mvcc"
 test pragma-application-id-negative-value {
     PRAGMA application_id = -23;
     PRAGMA application_id;
