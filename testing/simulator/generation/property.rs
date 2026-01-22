@@ -32,7 +32,7 @@ use crate::{
         Assertion, Interaction, InteractionBuilder, InteractionType, PropertyMetadata,
     },
         metrics::Remaining,
-        property::{InteractiveQueryInfo, Property, PropertyDiscriminants},
+        property::{Property, PropertyDiscriminants},
     },
     runner::env::SimulatorEnv,
 };
@@ -168,10 +168,7 @@ impl Property {
                             // A row that holds for the predicate will not be inserted.
                             None
                         }
-                        Query::Insert(Insert::Select {
-                            table: t,
-                            select: _,
-                        }) if t == &table.name => {
+                        Query::Insert(Insert::Select { table: t, .. }) if t == &table.name => {
                             // A row that holds for the predicate will not be inserted.
                             None
                         }
@@ -467,14 +464,8 @@ impl Property {
                 row_index,
                 queries,
                 select,
-                interactive,
             } => {
-                let (table, values) = if let Insert::Values {
-                    table,
-                    values,
-                    on_conflict: None,
-                } = insert
-                {
+                let (table, values) = if let Insert::Values { table, values, .. } = insert {
                     (table, values)
                 } else {
                     unreachable!(
@@ -509,18 +500,9 @@ impl Property {
 
                 let assertion = InteractionType::Assertion(Assertion::new(
                     format!(
-                        "row [{:?}] should be found in table {}, interactive={} commit={}, rollback={}",
+                        "row [{:?}] should be found in table {}",
                         row.iter().map(|v| v.to_string()).collect::<Vec<String>>(),
                         insert.table(),
-                        interactive.is_some(),
-                        interactive
-                            .as_ref()
-                            .map(|i| i.end_with_commit)
-                            .unwrap_or(false),
-                        interactive
-                            .as_ref()
-                            .map(|i| !i.end_with_commit)
-                            .unwrap_or(false),
                     ),
                     move |stack: &Vec<ResultSet>, _| {
                         let rows = stack.last().unwrap();
@@ -1568,39 +1550,13 @@ fn property_insert_values_select<R: rand::Rng + ?Sized>(
         table: table.name.clone(),
         values: rows,
         on_conflict: None,
+        conflict: None,
     });
 
-    // Choose if we want queries to be executed in an interactive transaction
-    let interactive = if !mvcc && rng.random_bool(0.5) {
-        Some(InteractiveQueryInfo {
-            start_with_immediate: rng.random_bool(0.5),
-            end_with_commit: rng.random_bool(0.5),
-        })
-    } else {
-        None
-    };
-
+    // Generate 0-2 placeholder queries between INSERT and SELECT
+    // Transaction boundaries are now managed at the plan level, not here
     let amount = rng.random_range(0..3);
-
-    let mut queries = Vec::with_capacity(amount + 2);
-
-    if let Some(ref interactive) = interactive {
-        queries.push(Query::Begin(if interactive.start_with_immediate {
-            Begin::Immediate
-        } else {
-            Begin::Deferred
-        }));
-    }
-
-    queries.extend(std::iter::repeat_n(Query::Placeholder, amount));
-
-    if let Some(ref interactive) = interactive {
-        queries.push(if interactive.end_with_commit {
-            Query::Commit(Commit)
-        } else {
-            Query::Rollback(Rollback)
-        });
-    }
+    let queries = vec![Query::Placeholder; amount];
 
     // Select the row
     let select_query = Select::simple(
@@ -1613,7 +1569,6 @@ fn property_insert_values_select<R: rand::Rng + ?Sized>(
         row_index,
         queries,
         select: select_query,
-        interactive,
     }
 }
 
