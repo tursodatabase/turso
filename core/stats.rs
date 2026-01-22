@@ -86,6 +86,38 @@ impl AnalyzeStats {
     }
 }
 
+/// Per-connection statistics captured opportunistically during query execution.
+#[derive(Clone, Debug, Default)]
+pub struct AutoAnalyzeStats {
+    /// Per-table row counts keyed by normalized table name.
+    tables: HashMap<String, u64>,
+}
+
+impl AutoAnalyzeStats {
+    /// Returns the row count for a table, if present.
+    pub fn row_count(&self, table_name: &str) -> Option<u64> {
+        let table_name = normalize_ident(table_name);
+        self.tables.get(&table_name).copied()
+    }
+
+    /// Set the row count for a table.
+    pub fn set_row_count(&mut self, table_name: &str, row_count: u64) {
+        let table_name = normalize_ident(table_name);
+        self.tables.insert(table_name, row_count);
+    }
+
+    /// Remove any cached stats for a table.
+    pub fn remove_table(&mut self, table_name: &str) {
+        let table_name = normalize_ident(table_name);
+        self.tables.remove(&table_name);
+    }
+
+    /// Remove all cached stats.
+    pub fn clear(&mut self) {
+        self.tables.clear();
+    }
+}
+
 /// Read sqlite_stat1 contents into an AnalyzeStats map without mutating schema.
 ///
 /// Only regular B-tree tables and indexes are considered. Virtual and ephemeral
