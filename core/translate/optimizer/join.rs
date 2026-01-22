@@ -1,5 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
+use smallvec::SmallVec;
+
 use turso_parser::ast::{Expr, Operator, TableInternalId};
 
 use crate::{
@@ -149,16 +151,55 @@ pub fn join_lhs_and_rhs<'a>(
         m
     };
 
-    let output_cardinality_multiplier = rhs_constraints
-        .constraints
-        .iter()
-        .filter(|c| {
+    let output_cardinality_multiplier = {
+        let mut multiplier = 1.0;
+        // (column_pos, has_lower, has_upper) - SmallVec avoids heap for typical 1-3 range columns
+        let mut column_bounds: SmallVec<[(Option<usize>, bool, bool); 4]> = SmallVec::new();
+
+        for c in rhs_constraints.constraints.iter().filter(|c| {
             lhs_mask.contains_all(&c.lhs_mask)
                 || c.lhs_mask == rhs_self_mask // self-constraints
                 || c.lhs_mask.is_empty() // literal constraints
-        })
-        .map(|c| c.selectivity)
-        .product::<f64>();
+        }) {
+            multiplier *= c.selectivity;
+
+            // Track range bounds per column for closed-range detection
+            let dominated_col = c.table_col_pos;
+            let dominated_col_is_lower = matches!(
+                c.operator.as_ast_operator(),
+                Some(Operator::Greater | Operator::GreaterEquals)
+            );
+            let dominated_col_is_upper = matches!(
+                c.operator.as_ast_operator(),
+                Some(Operator::Less | Operator::LessEquals)
+            );
+            if dominated_col_is_lower || dominated_col_is_upper {
+                if let Some(entry) = column_bounds
+                    .iter_mut()
+                    .find(|(col, _, _)| *col == dominated_col)
+                {
+                    entry.1 |= dominated_col_is_lower;
+                    entry.2 |= dominated_col_is_upper;
+                } else {
+                    column_bounds.push((
+                        dominated_col,
+                        dominated_col_is_lower,
+                        dominated_col_is_upper,
+                    ));
+                }
+            }
+        }
+
+        // Apply closed-range bonus for columns with both lower and upper bounds
+        const CLOSED_RANGE_SELECTIVITY_HEURISTIC_FACTOR: f64 = 0.2;
+        for (_, has_lower, has_upper) in &column_bounds {
+            if *has_lower && *has_upper {
+                multiplier *= CLOSED_RANGE_SELECTIVITY_HEURISTIC_FACTOR;
+            }
+        }
+
+        multiplier
+    };
     let rhs_internal_id = rhs_table_reference.internal_id;
     let lhs_internal_ids: HashSet<TableInternalId> = lhs
         .map(|l| {
