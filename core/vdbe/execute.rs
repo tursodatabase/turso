@@ -1313,7 +1313,7 @@ pub fn op_open_pseudo(
 }
 
 pub fn op_rewind(
-    _program: &Program,
+    program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
@@ -1340,6 +1340,16 @@ pub fn op_rewind(
             _ => panic!("Rewind on non-btree/materialized-view cursor"),
         }
     };
+    if program.connection.auto_analyze_enabled()
+        && program
+            .auto_analyze_full_scans
+            .get(*cursor_id)
+            .copied()
+            .unwrap_or(false)
+    {
+        state.auto_analyze.note_scan_start(*cursor_id, is_empty);
+    }
+
     if is_empty {
         state.pc = pc_if_empty.as_offset_int();
     } else {
@@ -1370,6 +1380,15 @@ pub fn op_last(
         return_if_io!(cursor.last());
         cursor.is_empty()
     };
+    if program.connection.auto_analyze_enabled()
+        && program
+            .auto_analyze_full_scans
+            .get(*cursor_id)
+            .copied()
+            .unwrap_or(false)
+    {
+        state.auto_analyze.note_scan_start(*cursor_id, is_empty);
+    }
     if is_empty {
         state.pc = pc_if_empty.as_offset_int();
     } else {
@@ -1785,8 +1804,26 @@ pub fn op_next(
                 state.metrics.fullscan_steps = state.metrics.fullscan_steps.saturating_add(1);
             }
         }
+        if program.connection.auto_analyze_enabled()
+            && program
+                .auto_analyze_full_scans
+                .get(*cursor_id)
+                .copied()
+                .unwrap_or(false)
+        {
+            state.auto_analyze.note_scan_step(*cursor_id);
+        }
         state.pc = pc_if_next.as_offset_int();
     } else {
+        if program.connection.auto_analyze_enabled()
+            && program
+                .auto_analyze_full_scans
+                .get(*cursor_id)
+                .copied()
+                .unwrap_or(false)
+        {
+            state.auto_analyze.note_scan_end(*cursor_id);
+        }
         state.pc += 1;
     }
     Ok(InsnFunctionStepResult::Step)
@@ -1826,8 +1863,26 @@ pub fn op_prev(
                 state.metrics.fullscan_steps = state.metrics.fullscan_steps.saturating_add(1);
             }
         }
+        if program.connection.auto_analyze_enabled()
+            && program
+                .auto_analyze_full_scans
+                .get(*cursor_id)
+                .copied()
+                .unwrap_or(false)
+        {
+            state.auto_analyze.note_scan_step(*cursor_id);
+        }
         state.pc = pc_if_prev.as_offset_int();
     } else {
+        if program.connection.auto_analyze_enabled()
+            && program
+                .auto_analyze_full_scans
+                .get(*cursor_id)
+                .copied()
+                .unwrap_or(false)
+        {
+            state.auto_analyze.note_scan_end(*cursor_id);
+        }
         state.pc += 1;
     }
     Ok(InsnFunctionStepResult::Step)
@@ -6500,6 +6555,11 @@ pub fn op_insert(
 
                     return_if_io!(cursor.insert(&BTreeKey::new_table_rowid(key, Some(&record))));
                 }
+                if program.connection.auto_analyze_enabled()
+                    && !flag.has(InsertFlags::EPHEMERAL_TABLE_INSERT)
+                {
+                    state.auto_analyze.mark_table_written(table_name);
+                }
                 // Increment metrics for row write
                 state.metrics.rows_written = state.metrics.rows_written.saturating_add(1);
 
@@ -6705,6 +6765,9 @@ pub fn op_delete(
                     let cursor = state.get_cursor(*cursor_id);
                     let cursor = cursor.as_btree_mut();
                     return_if_io!(cursor.delete());
+                }
+                if program.connection.auto_analyze_enabled() {
+                    state.auto_analyze.mark_table_written(table_name);
                 }
                 // Increment metrics for row write (DELETE is a write operation)
                 state.metrics.rows_written = state.metrics.rows_written.saturating_add(1);
@@ -8927,6 +8990,13 @@ pub fn op_count(
     // For optimized COUNT(*) queries, the count represents rows that would be read
     // SQLite tracks this differently (as pages read), but for consistency we track as rows
     if *exact {
+        if program.connection.auto_analyze_enabled() {
+            if let Some((_, CursorType::BTreeTable(table))) = program.cursor_ref.get(*cursor_id) {
+                state
+                    .auto_analyze
+                    .record_exact_count(&table.name, count as u64);
+            }
+        }
         state.metrics.rows_read = state.metrics.rows_read.saturating_add(count as u64);
     }
 

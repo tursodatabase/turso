@@ -1,4 +1,4 @@
-use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use rustc_hash::{FxBuildHasher, FxHashMap as HashMap, FxHashSet as HashSet};
 use tracing::{instrument, Level};
 use turso_parser::ast::{self, ResolveType, SortOrder, TableInternalId};
 
@@ -120,6 +120,8 @@ pub struct ProgramBuilder {
     /// because they never need to use [ProgramBuilder::resolve_cursor_id] to find it
     /// again. Hence, the key is optional.
     pub cursor_ref: Vec<(Option<CursorKey>, CursorType)>,
+    /// Cursors that represent full table scans eligible for auto-analyze.
+    auto_analyze_full_scans: HashSet<CursorID>,
     /// A vector where index=label number, value=resolved offset. Resolved in build().
     label_to_resolved_offset: Vec<Option<(InsnReference, JumpTarget)>>,
     // Bitmask of cursors that have emitted a SeekRowid instruction.
@@ -349,6 +351,7 @@ impl ProgramBuilder {
             next_hash_table_id: HASH_TABLE_ID_BASE,
             insns: Vec::with_capacity(opts.approx_num_insns),
             cursor_ref: Vec::with_capacity(opts.num_cursors),
+            auto_analyze_full_scans: HashSet::with_capacity_and_hasher(5, FxBuildHasher::default()),
             constant_spans: Vec::new(),
             label_to_resolved_offset: Vec::with_capacity(opts.approx_num_labels),
             seekrowid_emitted_bitmask: 0,
@@ -591,6 +594,10 @@ impl ProgramBuilder {
 
     pub fn alloc_cursor_id(&mut self, cursor_type: CursorType) -> usize {
         self._alloc_cursor_id(None, cursor_type)
+    }
+
+    pub fn mark_auto_analyze_full_scan(&mut self, cursor_id: CursorID) {
+        self.auto_analyze_full_scans.insert(cursor_id);
     }
 
     fn _alloc_cursor_id(&mut self, key: Option<CursorKey>, cursor_type: CursorType) -> usize {
@@ -1377,11 +1384,17 @@ impl ProgramBuilder {
             .insns
             .iter()
             .any(|(insn, _)| matches!(insn, Insn::Program { .. }));
-
+        let mut auto_analyze_full_scans = vec![false; self.cursor_ref.len()];
+        for cursor_id in self.auto_analyze_full_scans.drain() {
+            if let Some(slot) = auto_analyze_full_scans.get_mut(cursor_id) {
+                *slot = true;
+            }
+        }
         let prepared = PreparedProgram {
             max_registers: self.next_free_register,
             insns: self.insns,
             cursor_ref: self.cursor_ref,
+            auto_analyze_full_scans,
             comments: self.comments,
             parameters: self.parameters,
             change_cnt_on,
