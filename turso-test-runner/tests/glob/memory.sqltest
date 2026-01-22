@@ -1,0 +1,194 @@
+@database :memory:
+
+test glob-null-other-types {
+    DROP TABLE IF EXISTS t0;
+    CREATE TABLE IF NOT EXISTS t0 (c0 REAL);
+    UPDATE t0 SET c0='C2IS*24', c0=0Xffffffffbfc4330f, c0=0.6463854797956918 WHERE ((((((((t0.c0)AND(t0.c0)))AND(0.23913649834358142)))OR(CASE t0.c0  WHEN t0.c0 THEN 'j2' WHEN t0.c0 THEN t0.c0 WHEN t0.c0 THEN t0.c0 END)))OR(((((((((t0.c0)AND(t0.c0)))AND(t0.c0)))OR(t0.c0)))AND(t0.c0))));
+    INSERT INTO t0 VALUES (NULL);
+    INSERT INTO t0 VALUES ('0&');
+    UPDATE t0 SET c0=2352448 WHERE ((((t0.c0)GLOB(t0.c0))) NOT NULL);
+    SELECT * from t0;
+}
+expect raw {
+
+2352448.0
+}
+
+# Pattern matching tests (unrolled from foreach loop)
+test glob-1 { SELECT glob('abcdefg', 'abcdefg'); }
+expect { 1 }
+
+test glob-2 { SELECT glob('abcdefG', 'abcdefg'); }
+expect { 0 }
+
+test glob-3 { SELECT glob('abcdef', 'abcdefg'); }
+expect { 0 }
+
+test glob-4 { SELECT glob('abcdefgh', 'abcdefg'); }
+expect { 0 }
+
+test glob-5 { SELECT glob('abcdef?', 'abcdefg'); }
+expect { 1 }
+
+test glob-6 { SELECT glob('abcdef?', 'abcdef'); }
+expect { 0 }
+
+test glob-7 { SELECT glob('abcdef?', 'abcdefgh'); }
+expect { 0 }
+
+test glob-8 { SELECT glob('abcdefg', 'abcdef?'); }
+expect { 0 }
+
+test glob-9 { SELECT glob('abcdef?', 'abcdef?'); }
+expect { 1 }
+
+test glob-10 { SELECT glob('abc/def', 'abc/def'); }
+expect { 1 }
+
+test glob-11 { SELECT glob('abc//def', 'abc/def'); }
+expect { 0 }
+
+test glob-12 { SELECT glob('*/abc/*', 'x/abc/y'); }
+expect { 1 }
+
+test glob-13 { SELECT glob('*/abc/*', '/abc/'); }
+expect { 1 }
+
+test glob-16 { SELECT glob('*/abc/*', 'x///a/ab/abc'); }
+expect { 0 }
+
+test glob-17 { SELECT glob('*/abc/*', 'x//a/ab/abc/'); }
+expect { 1 }
+
+test glob-18 { SELECT glob('**/abc/**', 'x//a/ab/abc/'); }
+expect { 1 }
+
+test glob-19 { SELECT glob('*?/abc/*?', 'x//a/ab/abc/y'); }
+expect { 1 }
+
+test glob-20 { SELECT glob('?*/abc/?*', 'x//a/ab/abc/y'); }
+expect { 1 }
+
+test glob-21 { SELECT glob('abc[cde]efg', 'abcbefg'); }
+expect { 0 }
+
+test glob-22 { SELECT glob('abc[cde]efg', 'abccefg'); }
+expect { 1 }
+
+test glob-23 { SELECT glob('abc[cde]efg', 'abcdefg'); }
+expect { 1 }
+
+test glob-24 { SELECT glob('abc[cde]efg', 'abceefg'); }
+expect { 1 }
+
+test glob-25 { SELECT glob('abc[cde]efg', 'abcfefg'); }
+expect { 0 }
+
+test glob-26 { SELECT glob('abc[^cde]efg', 'abcbefg'); }
+expect { 1 }
+
+test glob-27 { SELECT glob('abc[^cde]efg', 'abccefg'); }
+expect { 0 }
+
+test glob-28 { SELECT glob('abc[^cde]efg', 'abcdefg'); }
+expect { 0 }
+
+test glob-29 { SELECT glob('abc[^cde]efg', 'abceefg'); }
+expect { 0 }
+
+test glob-30 { SELECT glob('abc[^cde]efg', 'abcfefg'); }
+expect { 1 }
+
+test glob-31 { SELECT glob('abc[c-e]efg', 'abcbefg'); }
+expect { 0 }
+
+test glob-32 { SELECT glob('abc[c-e]efg', 'abccefg'); }
+expect { 1 }
+
+test glob-33 { SELECT glob('abc[c-e]efg', 'abcdefg'); }
+expect { 1 }
+
+test glob-34 { SELECT glob('abc[c-e]efg', 'abceefg'); }
+expect { 1 }
+
+test glob-35 { SELECT glob('abc[c-e]efg', 'abcfefg'); }
+expect { 0 }
+
+test glob-36 { SELECT glob('abc[^c-e]efg', 'abcbefg'); }
+expect { 1 }
+
+test glob-37 { SELECT glob('abc[^c-e]efg', 'abccefg'); }
+expect { 0 }
+
+test glob-38 { SELECT glob('abc[^c-e]efg', 'abcdefg'); }
+expect { 0 }
+
+test glob-39 { SELECT glob('abc[^c-e]efg', 'abceefg'); }
+expect { 0 }
+
+test glob-40 { SELECT glob('abc[^c-e]efg', 'abcfefg'); }
+expect { 1 }
+
+test glob-41 { SELECT glob('abc[c-e]efg', 'abc-efg'); }
+expect { 0 }
+
+test glob-42 { SELECT glob('abc[-ce]efg', 'abc-efg'); }
+expect { 1 }
+
+test glob-43 { SELECT glob('abc[ce-]efg', 'abc-efg'); }
+expect { 1 }
+
+test glob-44 { SELECT glob('abc[][*?]efg', 'abc]efg'); }
+expect { 1 }
+
+test glob-45 { SELECT glob('abc[][*?]efg', 'abc*efg'); }
+expect { 1 }
+
+test glob-46 { SELECT glob('abc[][*?]efg', 'abc?efg'); }
+expect { 1 }
+
+test glob-47 { SELECT glob('abc[][*?]efg', 'abc[efg'); }
+expect { 1 }
+
+test glob-48 { SELECT glob('abc[^][*?]efg', 'abc]efg'); }
+expect { 0 }
+
+test glob-49 { SELECT glob('abc[^][*?]efg', 'abc*efg'); }
+expect { 0 }
+
+test glob-50 { SELECT glob('abc[^][*?]efg', 'abc?efg'); }
+expect { 0 }
+
+test glob-51 { SELECT glob('abc[^][*?]efg', 'abc[efg'); }
+expect { 0 }
+
+test glob-52 { SELECT glob('abc[^][*?]efg', 'abcdefg'); }
+expect { 1 }
+
+test glob-53 { SELECT glob('*[xyz]efg', 'abcxefg'); }
+expect { 1 }
+
+test glob-54 { SELECT glob('*[xyz]efg', 'abcwefg'); }
+expect { 0 }
+
+test glob-55 { SELECT glob('[-c]', 'c'); }
+expect { 1 }
+
+test glob-56 { SELECT glob('[-c]', '-'); }
+expect { 1 }
+
+test glob-57 { SELECT glob('[-c]', 'x'); }
+expect { 0 }
+
+# Unenclosed bracket tests (unrolled from foreach loop)
+test glob-unenclosed-1 { SELECT glob('abc[', 'abc['); }
+expect { 0 }
+
+test glob-unenclosed-2 { SELECT glob('abc[', 'abc'); }
+expect { 0 }
+
+test glob-unenclosed-3 { SELECT glob('a]b', 'a]b'); }
+expect { 1 }
+
+test glob-unenclosed-4 { SELECT glob('a]b', 'a[b'); }
+expect { 0 }

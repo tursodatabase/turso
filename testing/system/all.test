@@ -3,7 +3,6 @@
 set testdir [file dirname $argv0]
 
 
-source $testdir/glob.test
 source $testdir/join.test
 source $testdir/json.test
 source $testdir/math.test

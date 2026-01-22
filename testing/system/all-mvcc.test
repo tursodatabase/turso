@@ -11,7 +11,6 @@ set testdir [file dirname $argv0]
 source $testdir/groupby.test
 source $testdir/select.test
 source $testdir/join.test
-source $testdir/glob.test
 source $testdir/json.test
 source $testdir/math.test
 source $testdir/scalar-functions.test
