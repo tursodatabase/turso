@@ -1,4 +1,5 @@
 use crate::sync::Arc;
+use crate::translate::optimizer::constraints::ConstraintOperator;
 
 use tracing::{instrument, Level};
 use turso_parser::ast::{self, Expr, SubqueryType, UnaryOperator};
@@ -3669,7 +3670,7 @@ pub fn sanitize_string(input: &str) -> String {
 /// e.g. t.x = 5 -> Some((t.x, =, 5))
 pub fn as_binary_components(
     expr: &ast::Expr,
-) -> Result<Option<(&ast::Expr, ast::Operator, &ast::Expr)>> {
+) -> Result<Option<(&ast::Expr, ConstraintOperator, &ast::Expr)>> {
     match unwrap_parens(expr)? {
         ast::Expr::Binary(lhs, operator, rhs)
             if matches!(
@@ -3684,8 +3685,13 @@ pub fn as_binary_components(
                     | ast::Operator::IsNot
             ) =>
         {
-            Ok(Some((lhs.as_ref(), *operator, rhs.as_ref())))
+            Ok(Some((lhs.as_ref(), (*operator).into(), rhs.as_ref())))
         }
+        ast::Expr::Like { lhs, not, rhs, .. } => Ok(Some((
+            lhs.as_ref(),
+            ConstraintOperator::Like { not: *not },
+            rhs.as_ref(),
+        ))),
         _ => Ok(None),
     }
 }

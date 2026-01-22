@@ -343,7 +343,7 @@ pub fn find_equijoin_conditions(
         let Ok(Some((lhs, op, rhs))) = as_binary_components(&where_term.expr) else {
             continue;
         };
-        if !matches!(op, ast::Operator::Equals) {
+        if !matches!(op.as_ast_operator(), Some(ast::Operator::Equals)) {
             continue;
         }
 
