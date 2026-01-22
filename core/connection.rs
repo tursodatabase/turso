@@ -1498,11 +1498,7 @@ impl Connection {
             auto_state
                 .written_tables
                 .iter()
-                .flat_map(|table| {
-                    schema
-                        .get_indices(table)
-                        .map(|index| index.name.clone())
-                })
+                .flat_map(|table| schema.get_indices(table).map(|index| index.name.clone()))
                 .collect::<Vec<_>>()
         };
 

@@ -926,8 +926,8 @@ pub struct ExplainState {
     subprogram_start_pc: Option<usize>,
 }
 
-pub(crate) const AUTO_ANALYZE_FULL_SCAN: i64 = 1 << 0;
-pub(crate) const AUTO_ANALYZE_INDEX_RANGE_SCAN: i64 = 1 << 1;
+pub(crate) const AUTO_ANALYZE_FULL_SCAN: u8 = 1 << 0;
+pub(crate) const AUTO_ANALYZE_INDEX_RANGE_SCAN: u8 = 1 << 1;
 
 #[derive(Clone)]
 pub struct PreparedProgram {
@@ -936,7 +936,7 @@ pub struct PreparedProgram {
     // ProgramBuilder
     pub insns: Vec<(Insn, usize)>,
     pub cursor_ref: Vec<(Option<CursorKey>, CursorType)>,
-    pub auto_analyze_scan_flags: Vec<i64>,
+    pub auto_analyze_scan_flags: Vec<u8>,
     pub comments: Vec<(InsnReference, &'static str)>,
     pub parameters: crate::parameters::Parameters,
     pub change_cnt_on: bool,
@@ -1057,14 +1057,14 @@ impl Program {
 }
 
 impl Program {
-    pub(crate) fn auto_analyze_flags(&self, cursor_id: usize) -> i64 {
+    pub(crate) fn auto_analyze_flags(&self, cursor_id: usize) -> u8 {
         self.auto_analyze_scan_flags
             .get(cursor_id)
             .copied()
             .unwrap_or(0)
     }
 
-    pub(crate) fn auto_analyze_has_flag(&self, cursor_id: usize, flag: i64) -> bool {
+    pub(crate) fn auto_analyze_has_flag(&self, cursor_id: usize, flag: u8) -> bool {
         self.auto_analyze_flags(cursor_id) & flag != 0
     }
 

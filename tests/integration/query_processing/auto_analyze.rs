@@ -54,17 +54,23 @@ fn auto_analyze_is_per_connection() -> anyhow::Result<()> {
     let rows1: Vec<(i64,)> = conn1.exec_rows("SELECT count(*) FROM t");
     assert_eq!(rows1, vec![(3,)]);
 
-    let stats1 = conn1.auto_analyze_stats_snapshot().expect("autoanalyze enabled");
+    let stats1 = conn1
+        .auto_analyze_stats_snapshot()
+        .expect("autoanalyze enabled");
     assert_eq!(stats1.row_count("t"), Some(3));
     assert!(conn2.auto_analyze_stats_snapshot().is_none());
 
     conn2.execute("PRAGMA autoanalyze = 1")?;
-    let stats2 = conn2.auto_analyze_stats_snapshot().expect("autoanalyze enabled");
+    let stats2 = conn2
+        .auto_analyze_stats_snapshot()
+        .expect("autoanalyze enabled");
     assert_eq!(stats2.row_count("t"), None);
 
     let rows2: Vec<(i64,)> = conn2.exec_rows("SELECT count(*) FROM t");
     assert_eq!(rows2, vec![(3,)]);
-    let stats2 = conn2.auto_analyze_stats_snapshot().expect("autoanalyze enabled");
+    let stats2 = conn2
+        .auto_analyze_stats_snapshot()
+        .expect("autoanalyze enabled");
     assert_eq!(stats2.row_count("t"), Some(3));
 
     Ok(())
@@ -81,14 +87,18 @@ fn auto_analyze_disable_clears_stats() -> anyhow::Result<()> {
 
     let rows: Vec<(i64,)> = conn.exec_rows("SELECT count(*) FROM t");
     assert_eq!(rows, vec![(3,)]);
-    let stats = conn.auto_analyze_stats_snapshot().expect("autoanalyze enabled");
+    let stats = conn
+        .auto_analyze_stats_snapshot()
+        .expect("autoanalyze enabled");
     assert_eq!(stats.row_count("t"), Some(3));
 
     conn.execute("PRAGMA autoanalyze = 0")?;
     assert!(conn.auto_analyze_stats_snapshot().is_none());
 
     conn.execute("PRAGMA autoanalyze = 1")?;
-    let stats = conn.auto_analyze_stats_snapshot().expect("autoanalyze enabled");
+    let stats = conn
+        .auto_analyze_stats_snapshot()
+        .expect("autoanalyze enabled");
     assert_eq!(stats.row_count("t"), None);
 
     Ok(())
@@ -116,7 +126,9 @@ fn auto_analyze_index_full_scan_updates_row_count() -> anyhow::Result<()> {
     assert_eq!(rows.first().copied(), Some((1,)));
     assert_eq!(rows.last().copied(), Some((2000,)));
 
-    let stats = conn.auto_analyze_stats_snapshot().expect("autoanalyze enabled");
+    let stats = conn
+        .auto_analyze_stats_snapshot()
+        .expect("autoanalyze enabled");
     assert_eq!(stats.row_count("t"), Some(2000));
 
     Ok(())
@@ -142,7 +154,9 @@ fn auto_analyze_index_range_scan_tracks_rows() -> anyhow::Result<()> {
     let rows: Vec<(i64,)> = conn.exec_rows(query);
     assert_eq!(rows, vec![(300,)]);
 
-    let stats = conn.auto_analyze_stats_snapshot().expect("autoanalyze enabled");
+    let stats = conn
+        .auto_analyze_stats_snapshot()
+        .expect("autoanalyze enabled");
     assert_eq!(stats.row_count("t"), None);
     let range_count = stats
         .index_range_row_count("idx_t_a")
@@ -169,11 +183,15 @@ fn auto_analyze_row_count_invalidated_on_write() -> anyhow::Result<()> {
     let rows: Vec<(i64,)> = conn.exec_rows("SELECT count(*) FROM t");
     assert_eq!(rows, vec![(3,)]);
 
-    let stats = conn.auto_analyze_stats_snapshot().expect("autoanalyze enabled");
+    let stats = conn
+        .auto_analyze_stats_snapshot()
+        .expect("autoanalyze enabled");
     assert_eq!(stats.row_count("t"), Some(3));
 
     conn.execute("INSERT INTO t VALUES (4)")?;
-    let stats = conn.auto_analyze_stats_snapshot().expect("autoanalyze enabled");
+    let stats = conn
+        .auto_analyze_stats_snapshot()
+        .expect("autoanalyze enabled");
     assert_eq!(stats.row_count("t"), None);
 
     Ok(())
@@ -204,7 +222,9 @@ fn auto_analyze_reorders_join_after_stats() -> anyhow::Result<()> {
     let small_count: Vec<(i64,)> = conn.exec_rows("SELECT count(*) FROM t_small");
     assert_eq!(small_count, vec![(3,)]);
 
-    let stats = conn.auto_analyze_stats_snapshot().expect("autoanalyze enabled");
+    let stats = conn
+        .auto_analyze_stats_snapshot()
+        .expect("autoanalyze enabled");
     assert_eq!(stats.row_count("t_big"), Some(2000));
     assert_eq!(stats.row_count("t_small"), Some(3));
 

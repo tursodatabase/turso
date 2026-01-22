@@ -121,7 +121,7 @@ pub struct ProgramBuilder {
     /// again. Hence, the key is optional.
     pub cursor_ref: Vec<(Option<CursorKey>, CursorType)>,
     /// Auto-analyze scan flags keyed by cursor id.
-    auto_analyze_scan_flags: HashMap<CursorID, i64>,
+    auto_analyze_scan_flags: HashMap<CursorID, u8>,
     /// A vector where index=label number, value=resolved offset. Resolved in build().
     label_to_resolved_offset: Vec<Option<(InsnReference, JumpTarget)>>,
     // Bitmask of cursors that have emitted a SeekRowid instruction.
@@ -1391,7 +1391,7 @@ impl ProgramBuilder {
             .iter()
             .any(|(insn, _)| matches!(insn, Insn::Program { .. }));
 
-        let mut auto_analyze_scan_flags = vec![0; self.cursor_ref.len()];
+        let mut auto_analyze_scan_flags = vec![0u8; self.cursor_ref.len()];
         for (cursor_id, flags) in self.auto_analyze_scan_flags.drain() {
             if let Some(slot) = auto_analyze_scan_flags.get_mut(cursor_id) {
                 *slot |= flags;
