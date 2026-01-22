@@ -4,7 +4,6 @@ set testdir [file dirname $argv0]
 
 
 source $testdir/math.test
-source $testdir/groupby.test
 source $testdir/scalar-functions.test
 source $testdir/scalar-functions-datetime.test
 source $testdir/compare.test

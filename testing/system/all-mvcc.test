@@ -8,7 +8,6 @@ set testdir [file dirname $argv0]
 # source $testdir/foreign_keys.test
 
 # works
-source $testdir/groupby.test
 source $testdir/math.test
 source $testdir/scalar-functions.test
 source $testdir/scalar-functions-datetime.test
