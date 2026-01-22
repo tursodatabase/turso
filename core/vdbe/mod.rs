@@ -342,10 +342,21 @@ pub(crate) struct DeferredSeekState {
 }
 
 #[derive(Debug, Default, Clone)]
+/// Tracks a single cursor's table scan for auto-analyze row counts.
+///
+/// A scan is considered valid only when the cursor is rewound once and then
+/// advanced monotonically until EOF. We count the first row on Rewind/Last
+/// (note_scan_start) and each successful Next/Prev step (note_scan_step).
+/// If the same cursor is rewound more than once during a statement, the scan
+/// is invalidated to avoid double-counting from repeated or partial scans.
 pub(crate) struct AutoAnalyzeScanState {
+    /// Number of rows observed so far in this scan.
     pub(crate) row_count: u64,
+    /// True once the scan reached EOF or the table was empty.
     pub(crate) completed: bool,
+    /// Number of Rewind/Last calls observed for this cursor in the statement.
     pub(crate) rewind_count: u32,
+    /// True once the scan becomes unreliable (e.g., multiple rewinds).
     pub(crate) invalidated: bool,
 }
 
@@ -359,11 +370,15 @@ impl AutoAnalyzeScanState {
 }
 
 #[derive(Debug, Default)]
-/// State for auto-analyze feature during program execution.
+/// Per-statement auto-analyze tracking during program execution.
 pub(crate) struct AutoAnalyzeRuntime {
+    /// Scan state indexed by cursor id.
     pub(crate) scan_states: Vec<AutoAnalyzeScanState>,
+    /// Exact row counts from OP_Count, keyed by normalized table name.
     pub(crate) exact_counts: HashMap<String, u64>,
+    /// Tables written during the statement; recorded stats for these are discarded.
     pub(crate) written_tables: HashSet<String>,
+    /// Raw table names for cheap de-dup before normalization.
     written_tables_raw: HashSet<String>,
 }
 
@@ -391,7 +406,8 @@ impl AutoAnalyzeRuntime {
         self.written_tables_raw.clear();
     }
 
-    /// Record that a table scan has started.
+    /// Record that a table scan has started (Rewind/Last).
+    /// Counts the first row immediately, and marks completion for empty tables.
     pub(crate) fn note_scan_start(&mut self, cursor_id: CursorID, is_empty: bool) {
         let Some(scan_state) = self.scan_states.get_mut(cursor_id) else {
             return;
@@ -413,7 +429,7 @@ impl AutoAnalyzeRuntime {
         }
     }
 
-    /// Mark that a step has occurred in ongoing scan.
+    /// Mark that a step has occurred in ongoing scan (Next/Prev).
     pub(crate) fn note_scan_step(&mut self, cursor_id: CursorID) {
         let Some(scan_state) = self.scan_states.get_mut(cursor_id) else {
             return;
@@ -424,7 +440,7 @@ impl AutoAnalyzeRuntime {
         scan_state.row_count = scan_state.row_count.saturating_add(1);
     }
 
-    /// Record that an ongoing scan has ended.
+    /// Record that an ongoing scan has ended (EOF reached).
     pub(crate) fn note_scan_end(&mut self, cursor_id: CursorID) {
         let Some(scan_state) = self.scan_states.get_mut(cursor_id) else {
             return;
@@ -441,7 +457,7 @@ impl AutoAnalyzeRuntime {
         self.exact_counts.insert(table_name, row_count);
     }
 
-    /// Record that a table was written to.
+    /// Record that a table was written to so we don't keep stale stats.
     pub(crate) fn mark_table_written(&mut self, table_name: &str) {
         if self.written_tables_raw.contains(table_name) {
             return;
