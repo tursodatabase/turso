@@ -1439,3 +1439,55 @@ pub fn test_auto_checkpoint_restart() {
     tracing::info!("conn: 2: checkpoint");
     conn2.execute("PRAGMA wal_checkpoint(RESTART)").unwrap();
 }
+
+#[test]
+pub fn test_wal_truncate_checkpoint() {
+    let mut stop = false;
+    for interrupt_at in 1.. {
+        tracing::info!("interrupt_at: {}", interrupt_at);
+        if stop {
+            break;
+        }
+        let _ = env_logger::try_init();
+        let db_path = tempfile::NamedTempFile::new().unwrap();
+        let (_file, db_path) = db_path.keep().unwrap();
+        tracing::info!("path: {:?}", db_path);
+        let tmp_db = TempDatabase::builder().with_db_path(&db_path).build();
+        let conn1 = tmp_db.connect_limbo();
+        let conn2 = tmp_db.connect_limbo();
+
+        tracing::info!("conn: 1: create_new_table_1");
+        conn1.execute("CREATE TABLE t1(x)").unwrap();
+
+        tracing::info!("conn: 1: insert");
+        conn1.execute("INSERT INTO t1 VALUES (1)").unwrap();
+        conn1.execute("INSERT INTO t1 VALUES (2)").unwrap();
+        conn1.execute("INSERT INTO t1 VALUES (3)").unwrap();
+
+        tracing::info!("conn: 1: wal truncate: start");
+        let mut stmt = conn1.prepare("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        for _ in 0..interrupt_at {
+            let result = stmt.step().unwrap();
+            if matches!(result, StepResult::Done) {
+                stop = true;
+                break;
+            }
+        }
+
+        tracing::info!("conn: 2: insert");
+        let _ = conn2.execute("INSERT INTO t1 VALUES (4)");
+        let _ = conn2.execute("INSERT INTO t1 VALUES (5)");
+        let _ = conn2.execute("INSERT INTO t1 VALUES (6)");
+
+        tracing::info!("conn: 1: wal truncate: finish");
+        loop {
+            match stmt.step() {
+                Ok(StepResult::Done) | Err(_) => break,
+                _ => continue,
+            }
+        }
+
+        tracing::info!("conn: 1: integrity check");
+        conn1.execute("PRAGMA integrity_check").unwrap();
+    }
+}
