@@ -1,18 +1,11 @@
 name: CodSpeed
 
 on:
+  schedule:
+      - cron: '24 4 * * *'
   push:
     branches:
       - "main"
-    paths:
-      - "core/**/*.rs"
-      - "parser/**/*.rs"
-      - "extensions/**/*.rs"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "rust-toolchain.toml"
-      - ".github/workflows/codspeed.yml"
-  pull_request:
     paths:
       - "core/**/*.rs"
       - "parser/**/*.rs"
@@ -36,8 +29,6 @@ jobs:
     # Codspeed hosted bare metal runners, which they advertise as having more stable performance
     runs-on: codspeed-macro
     timeout-minutes: 60
-    # Allow this job to fail without failing the entire CI run
-    continue-on-error: true
     strategy:
       matrix:
         include:
@@ -90,7 +81,7 @@ jobs:
       - name: Run benchmark (${{ matrix.bench }})
         uses: CodSpeedHQ/action@v4.7.0
         with:
-          mode: simulation
+          mode: walltime
           run: cargo codspeed run
 
   # tpc-h:
