@@ -66,6 +66,7 @@ use crate::connection::AttachedDatabasesFingerprint;
 #[cfg(feature = "json")]
 use crate::json::JsonCacheCell;
 use crate::sync::RwLock;
+use crate::util::normalize_ident;
 use crate::{
     AtomicBool, CaptureDataChangesMode, Connection, MvStore, Result, SyncMode, TransactionState,
 };
@@ -82,7 +83,7 @@ use crate::vdbe::rowset::RowSet;
 use explain::{insn_to_row_with_comment, EXPLAIN_COLUMNS, EXPLAIN_QUERY_PLAN_COLUMNS};
 use regex::Regex;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     num::NonZero,
     ops::Deref,
     sync::{
@@ -340,6 +341,117 @@ pub(crate) struct DeferredSeekState {
     pub table_cursor_id: CursorID,
 }
 
+#[derive(Debug, Default, Clone)]
+pub(crate) struct AutoAnalyzeScanState {
+    pub(crate) row_count: u64,
+    pub(crate) completed: bool,
+    pub(crate) rewind_count: u32,
+    pub(crate) invalidated: bool,
+}
+
+impl AutoAnalyzeScanState {
+    fn reset(&mut self) {
+        self.row_count = 0;
+        self.completed = false;
+        self.rewind_count = 0;
+        self.invalidated = false;
+    }
+}
+
+#[derive(Debug, Default)]
+/// State for auto-analyze feature during program execution.
+pub(crate) struct AutoAnalyzeRuntime {
+    pub(crate) scan_states: Vec<AutoAnalyzeScanState>,
+    pub(crate) exact_counts: HashMap<String, u64>,
+    pub(crate) written_tables: HashSet<String>,
+    written_tables_raw: HashSet<String>,
+}
+
+impl AutoAnalyzeRuntime {
+    pub(crate) fn new(max_cursors: usize) -> Self {
+        Self {
+            scan_states: vec![AutoAnalyzeScanState::default(); max_cursors],
+            exact_counts: HashMap::new(),
+            written_tables: HashSet::new(),
+            written_tables_raw: HashSet::new(),
+        }
+    }
+
+    /// Reset the auto-analyze runtime state.
+    pub(crate) fn reset(&mut self, max_cursors: Option<usize>) {
+        if let Some(max_cursors) = max_cursors {
+            self.scan_states
+                .resize(max_cursors, AutoAnalyzeScanState::default());
+        }
+        for state in &mut self.scan_states {
+            state.reset();
+        }
+        self.exact_counts.clear();
+        self.written_tables.clear();
+        self.written_tables_raw.clear();
+    }
+
+    /// Record that a table scan has started.
+    pub(crate) fn note_scan_start(&mut self, cursor_id: CursorID, is_empty: bool) {
+        let Some(scan_state) = self.scan_states.get_mut(cursor_id) else {
+            return;
+        };
+        scan_state.rewind_count = scan_state.rewind_count.saturating_add(1);
+        if scan_state.rewind_count > 1 {
+            scan_state.invalidated = true;
+            scan_state.completed = false;
+            scan_state.row_count = 0;
+            return;
+        }
+        if scan_state.invalidated || scan_state.completed {
+            return;
+        }
+        if is_empty {
+            scan_state.completed = true;
+        } else {
+            scan_state.row_count = scan_state.row_count.saturating_add(1);
+        }
+    }
+
+    /// Mark that a step has occurred in ongoing scan.
+    pub(crate) fn note_scan_step(&mut self, cursor_id: CursorID) {
+        let Some(scan_state) = self.scan_states.get_mut(cursor_id) else {
+            return;
+        };
+        if scan_state.invalidated || scan_state.completed {
+            return;
+        }
+        scan_state.row_count = scan_state.row_count.saturating_add(1);
+    }
+
+    /// Record that an ongoing scan has ended.
+    pub(crate) fn note_scan_end(&mut self, cursor_id: CursorID) {
+        let Some(scan_state) = self.scan_states.get_mut(cursor_id) else {
+            return;
+        };
+        if scan_state.invalidated {
+            return;
+        }
+        scan_state.completed = true;
+    }
+
+    /// Record the exact row count for a table.
+    pub(crate) fn record_exact_count(&mut self, table_name: &str, row_count: u64) {
+        let table_name = normalize_ident(table_name);
+        self.exact_counts.insert(table_name, row_count);
+    }
+
+    /// Record that a table was written to.
+    pub(crate) fn mark_table_written(&mut self, table_name: &str) {
+        if self.written_tables_raw.contains(table_name) {
+            return;
+        }
+        self.written_tables_raw.insert(table_name.to_string());
+        let table_name = normalize_ident(table_name);
+        self.written_tables.insert(table_name);
+    }
+}
+
 /// The program state describes the environment in which the program executes.
 pub struct ProgramState {
     pub io_completions: Option<IOCompletions>,
@@ -367,6 +479,7 @@ pub struct ProgramState {
     op_integrity_check_state: OpIntegrityCheckState,
     /// Metrics collected during statement execution
     pub metrics: StatementMetrics,
+    pub(crate) auto_analyze: AutoAnalyzeRuntime,
     op_open_ephemeral_state: OpOpenEphemeralState,
     op_program_state: OpProgramState,
     op_new_rowid_state: OpNewRowidState,
@@ -457,6 +570,7 @@ impl ProgramState {
             op_idx_delete_state: None,
             op_integrity_check_state: OpIntegrityCheckState::Start,
             metrics: StatementMetrics::new(),
+            auto_analyze: AutoAnalyzeRuntime::new(max_cursors),
             op_open_ephemeral_state: OpOpenEphemeralState::Start,
             op_program_state: OpProgramState::Start,
             op_new_rowid_state: OpNewRowidState::Start,
@@ -562,6 +676,7 @@ impl ProgramState {
         self.op_idx_delete_state = None;
         self.op_integrity_check_state = OpIntegrityCheckState::Start;
         self.metrics = StatementMetrics::new();
+        self.auto_analyze.reset(max_cursors);
         self.op_open_ephemeral_state = OpOpenEphemeralState::Start;
         self.op_new_rowid_state = OpNewRowidState::Start;
         self.op_idx_insert_state = OpIdxInsertState::MaybeSeek;
@@ -802,6 +917,7 @@ pub struct PreparedProgram {
     // ProgramBuilder
     pub insns: Vec<(Insn, usize)>,
     pub cursor_ref: Vec<(Option<CursorKey>, CursorType)>,
+    pub auto_analyze_full_scans: Vec<bool>,
     pub comments: Vec<(InsnReference, &'static str)>,
     pub parameters: crate::parameters::Parameters,
     pub change_cnt_on: bool,
