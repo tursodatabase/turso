@@ -86,6 +86,9 @@ impl CheckpointResult {
     pub const fn everything_backfilled(&self) -> bool {
         self.wal_max_frame == self.wal_total_backfilled
     }
+    pub fn should_truncate(&self) -> bool {
+        self.everything_backfilled() && self.wal_max_frame > 0
+    }
     pub fn release_guard(&mut self) {
         let _ = self.maybe_guard.take();
     }
@@ -2464,11 +2467,8 @@ impl WalFile {
                     // mut borrow of pager.wal, and accessing the header will attempt a borrow
                     // during 'read_page', so the caller will use the result to determine if:
                     // a. the max frame == num wal frames (everything backfilled)
-                    // b. the physical db file size differs from the expected pages * page_size
-                    // and truncate + sync the db file if necessary.
-                    if checkpoint_result.everything_backfilled()
-                        && checkpoint_result.wal_total_backfilled > 0
-                    {
+                    // b. the max frame > 0 (we have something to truncate)
+                    if checkpoint_result.should_truncate() {
                         checkpoint_result.maybe_guard = self.checkpoint_guard.write().take();
                     } else {
                         let _ = self.checkpoint_guard.write().take();
