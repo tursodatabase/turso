@@ -437,6 +437,7 @@ impl Shadow for Query {
             Query::Rollback(rollback) => Ok(rollback.shadow(env)),
             Query::Placeholder => Ok(vec![]),
             Query::Pragma(Pragma::AutoVacuumMode(_)) => Ok(vec![]),
+            Query::Pragma(Pragma::CaptureDataChanges(_)) => Ok(vec![]),
         }
     }
 }

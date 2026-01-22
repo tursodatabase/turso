@@ -83,15 +83,20 @@ fn random_create_index<R: rand::Rng + ?Sized>(
 }
 
 fn random_pragma<R: rand::Rng + ?Sized>(rng: &mut R, _conn_ctx: &impl GenerationContext) -> Query {
-    const ALL_MODES: [VacuumMode; 2] = [
-        VacuumMode::None,
-        // VacuumMode::Incremental, not implemented yet
-        VacuumMode::Full,
-    ];
+    use sql_generation::model::query::pragma::CdcMode;
 
-    let mode = ALL_MODES.choose(rng).unwrap();
-
-    Query::Pragma(Pragma::AutoVacuumMode(mode.clone()))
+    // 50% chance of generating a CDC pragma, 50% chance of vacuum pragma
+    if rng.random_bool(0.5) {
+        Query::Pragma(Pragma::CaptureDataChanges(CdcMode::Full))
+    } else {
+        const ALL_MODES: [VacuumMode; 2] = [
+            VacuumMode::None,
+            // VacuumMode::Incremental, not implemented yet
+            VacuumMode::Full,
+        ];
+        let mode = ALL_MODES.choose(rng).unwrap();
+        Query::Pragma(Pragma::AutoVacuumMode(mode.clone()))
+    }
 }
 
 fn random_create_materialized_view<R: rand::Rng + ?Sized>(
