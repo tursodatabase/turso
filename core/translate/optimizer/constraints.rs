@@ -69,6 +69,7 @@ pub struct Constraint {
 pub enum ConstraintOperator {
     AstNativeOperator(ast::Operator),
     Like { not: bool },
+    In { not: bool, estimated_values: f64 },
 }
 
 impl ConstraintOperator {
@@ -222,6 +223,19 @@ const SELECTIVITY_OTHER: f64 = 0.9;
 const SELECTIVITY_LIKE: f64 = 0.2;
 /// In lieu of statistics, we estimate that a NOT LIKE filter will reduce the output set to 20% of its size.
 const SELECTIVITY_NOT_LIKE: f64 = 0.2;
+/// SQLite estimates IN subqueries return 25 rows (where.c line 3230).
+/// Used when we don't have the actual list length.
+const ESTIMATED_IN_SUBQUERY_ROWS: f64 = 25.0;
+
+/// Estimate selectivity for IN expressions given the number of values and table row count.
+fn estimate_in_selectivity(in_list_len: f64, row_count: f64, not: bool) -> f64 {
+    let selectivity = (in_list_len / row_count).min(1.0);
+    if not {
+        1.0 - selectivity
+    } else {
+        selectivity
+    }
+}
 
 /// Estimate the selectivity of a constraint based on the operator, column type, and ANALYZE stats.
 ///
@@ -312,6 +326,10 @@ fn estimate_selectivity(
         ConstraintOperator::AstNativeOperator(ast::Operator::IsNot) => SELECTIVITY_IS_NOT_NULL,
         ConstraintOperator::Like { not: false } => SELECTIVITY_LIKE,
         ConstraintOperator::Like { not: true } => SELECTIVITY_NOT_LIKE,
+        ConstraintOperator::In {
+            not,
+            estimated_values,
+        } => estimate_in_selectivity(estimated_values, row_count as f64, not),
         _ => SELECTIVITY_OTHER,
     }
 }
@@ -655,10 +673,6 @@ pub fn constraints_from_where_clause(
         });
 
         for (i, term) in where_clause.iter().enumerate() {
-            let Some((lhs, operator, rhs)) = as_binary_components(&term.expr)? else {
-                continue;
-            };
-
             // Constraints originating from a LEFT JOIN must always be evaluated in that join's RHS table's loop,
             // regardless of which tables the constraint references.
             if let Some(outer_join_tbl) = term.from_outer_join {
@@ -667,186 +681,308 @@ pub fn constraints_from_where_clause(
                 }
             }
 
-            // If either the LHS or RHS of the constraint is a column from the table, add the constraint.
-            match lhs {
-                ast::Expr::Column { table, column, .. } => {
-                    if *table == table_reference.internal_id {
-                        let table_column = &table_reference.table.columns()[*column];
-                        cs.constraints.push(Constraint {
-                            where_clause_pos: (i, BinaryExprSide::Rhs),
-                            operator,
-                            table_col_pos: Some(*column),
-                            expr: None,
-                            lhs_mask: table_mask_from_expr(rhs, table_references, subqueries)?,
-                            selectivity: estimate_constraint_selectivity(
-                                schema,
-                                table_reference,
-                                Some(table_column),
-                                Some(*column),
+            // Try to extract as binary expression first
+            if let Some((lhs, operator, rhs)) = as_binary_components(&term.expr)? {
+                // If either the LHS or RHS of the constraint is a column from the table, add the constraint.
+                match lhs {
+                    ast::Expr::Column { table, column, .. } => {
+                        if *table == table_reference.internal_id {
+                            let table_column = &table_reference.table.columns()[*column];
+                            cs.constraints.push(Constraint {
+                                where_clause_pos: (i, BinaryExprSide::Rhs),
                                 operator,
-                                rhs,
-                                available_indexes,
-                                table_references,
-                                subqueries,
-                            ),
-                            usable: true,
-                        });
+                                table_col_pos: Some(*column),
+                                expr: None,
+                                lhs_mask: table_mask_from_expr(rhs, table_references, subqueries)?,
+                                selectivity: estimate_constraint_selectivity(
+                                    schema,
+                                    table_reference,
+                                    Some(table_column),
+                                    Some(*column),
+                                    operator,
+                                    rhs,
+                                    available_indexes,
+                                    table_references,
+                                    subqueries,
+                                ),
+                                usable: true,
+                            });
+                        }
                     }
-                }
-                ast::Expr::RowId { table, .. } => {
-                    // A rowid alias column must exist for the 'rowid' keyword to be considered a valid reference.
-                    // This should be a parse error at an earlier stage of the query compilation, but nevertheless,
-                    // we check it here.
-                    if *table == table_reference.internal_id && rowid_alias_column.is_some() {
-                        let table_column =
-                            &table_reference.table.columns()[rowid_alias_column.unwrap()];
-                        cs.constraints.push(Constraint {
-                            where_clause_pos: (i, BinaryExprSide::Rhs),
-                            operator,
-                            table_col_pos: rowid_alias_column,
-                            expr: None,
-                            lhs_mask: table_mask_from_expr(rhs, table_references, subqueries)?,
-                            selectivity: estimate_constraint_selectivity(
-                                schema,
-                                table_reference,
-                                Some(table_column),
-                                rowid_alias_column,
+                    ast::Expr::RowId { table, .. } => {
+                        // A rowid alias column must exist for the 'rowid' keyword to be considered a valid reference.
+                        // This should be a parse error at an earlier stage of the query compilation, but nevertheless,
+                        // we check it here.
+                        if *table == table_reference.internal_id && rowid_alias_column.is_some() {
+                            let table_column =
+                                &table_reference.table.columns()[rowid_alias_column.unwrap()];
+                            cs.constraints.push(Constraint {
+                                where_clause_pos: (i, BinaryExprSide::Rhs),
                                 operator,
-                                rhs,
-                                available_indexes,
-                                table_references,
-                                subqueries,
-                            ),
-                            usable: true,
-                        });
+                                table_col_pos: rowid_alias_column,
+                                expr: None,
+                                lhs_mask: table_mask_from_expr(rhs, table_references, subqueries)?,
+                                selectivity: estimate_constraint_selectivity(
+                                    schema,
+                                    table_reference,
+                                    Some(table_column),
+                                    rowid_alias_column,
+                                    operator,
+                                    rhs,
+                                    available_indexes,
+                                    table_references,
+                                    subqueries,
+                                ),
+                                usable: true,
+                            });
+                        }
                     }
-                }
-                _ if expression_matches_table(
-                    lhs,
-                    table_reference,
-                    table_references,
-                    subqueries,
-                ) =>
-                {
-                    let selectivity = estimate_constraint_selectivity(
-                        schema,
-                        table_reference,
-                        None,
-                        None,
-                        operator,
-                        rhs,
-                        available_indexes,
-                        table_references,
-                        subqueries,
-                    );
-                    tracing::debug!(
-                        table = table_reference.table.get_name(),
-                        where_clause_pos = i,
-                        operator = ?operator,
-                        lhs_mask = ?table_mask_from_expr(rhs, table_references, subqueries)?,
-                        selectivity,
-                        "expr constraint (lhs matches table)"
-                    );
-                    cs.constraints.push(Constraint {
-                        where_clause_pos: (i, BinaryExprSide::Rhs),
-                        operator,
-                        table_col_pos: None,
-                        expr: Some(lhs.clone()),
-                        lhs_mask: table_mask_from_expr(rhs, table_references, subqueries)?,
-                        selectivity,
-                        usable: true,
-                    });
-                }
-                _ => {}
-            };
-            match rhs {
-                ast::Expr::Column { table, column, .. } => {
-                    if *table == table_reference.internal_id {
-                        let table_column = &table_reference.table.columns()[*column];
-                        cs.constraints.push(Constraint {
-                            where_clause_pos: (i, BinaryExprSide::Lhs),
-                            operator: opposite_cmp_op(operator),
-                            table_col_pos: Some(*column),
-                            expr: None,
-                            lhs_mask: table_mask_from_expr(lhs, table_references, subqueries)?,
-                            selectivity: estimate_constraint_selectivity(
-                                schema,
-                                table_reference,
-                                Some(table_column),
-                                Some(*column),
-                                operator,
-                                lhs,
-                                available_indexes,
-                                table_references,
-                                subqueries,
-                            ),
-                            usable: true,
-                        });
-                    }
-                }
-                ast::Expr::RowId { table, .. } => {
-                    if *table == table_reference.internal_id && rowid_alias_column.is_some() {
-                        let table_column =
-                            &table_reference.table.columns()[rowid_alias_column.unwrap()];
-                        cs.constraints.push(Constraint {
-                            where_clause_pos: (i, BinaryExprSide::Lhs),
-                            operator: opposite_cmp_op(operator),
-                            table_col_pos: rowid_alias_column,
-                            expr: None,
-                            lhs_mask: table_mask_from_expr(lhs, table_references, subqueries)?,
-                            selectivity: estimate_constraint_selectivity(
-                                schema,
-                                table_reference,
-                                Some(table_column),
-                                rowid_alias_column,
-                                operator,
-                                lhs,
-                                available_indexes,
-                                table_references,
-                                subqueries,
-                            ),
-                            usable: true,
-                        });
-                    }
-                }
-                _ if expression_matches_table(
-                    rhs,
-                    table_reference,
-                    table_references,
-                    subqueries,
-                ) =>
-                {
-                    let selectivity = estimate_constraint_selectivity(
-                        schema,
-                        table_reference,
-                        None,
-                        None,
-                        operator,
+                    _ if expression_matches_table(
                         lhs,
-                        available_indexes,
+                        table_reference,
                         table_references,
                         subqueries,
-                    );
-                    tracing::debug!(
-                        table = table_reference.table.get_name(),
-                        where_clause_pos = i,
-                        operator = ?operator,
-                        lhs_mask = ?table_mask_from_expr(lhs, table_references, subqueries)?,
-                        selectivity,
-                        "expr constraint (rhs matches table)"
-                    );
-                    cs.constraints.push(Constraint {
-                        where_clause_pos: (i, BinaryExprSide::Lhs),
-                        operator: opposite_cmp_op(operator),
-                        table_col_pos: None,
-                        expr: Some(rhs.clone()),
-                        lhs_mask: table_mask_from_expr(lhs, table_references, subqueries)?,
-                        selectivity,
-                        usable: true,
-                    });
+                    ) =>
+                    {
+                        let selectivity = estimate_constraint_selectivity(
+                            schema,
+                            table_reference,
+                            None,
+                            None,
+                            operator,
+                            rhs,
+                            available_indexes,
+                            table_references,
+                            subqueries,
+                        );
+                        tracing::debug!(
+                            table = table_reference.table.get_name(),
+                            where_clause_pos = i,
+                            operator = ?operator,
+                            lhs_mask = ?table_mask_from_expr(rhs, table_references, subqueries)?,
+                            selectivity,
+                            "expr constraint (lhs matches table)"
+                        );
+                        cs.constraints.push(Constraint {
+                            where_clause_pos: (i, BinaryExprSide::Rhs),
+                            operator,
+                            table_col_pos: None,
+                            expr: Some(lhs.clone()),
+                            lhs_mask: table_mask_from_expr(rhs, table_references, subqueries)?,
+                            selectivity,
+                            usable: true,
+                        });
+                    }
+                    _ => {}
+                };
+                match rhs {
+                    ast::Expr::Column { table, column, .. } => {
+                        if *table == table_reference.internal_id {
+                            let table_column = &table_reference.table.columns()[*column];
+                            cs.constraints.push(Constraint {
+                                where_clause_pos: (i, BinaryExprSide::Lhs),
+                                operator: opposite_cmp_op(operator),
+                                table_col_pos: Some(*column),
+                                expr: None,
+                                lhs_mask: table_mask_from_expr(lhs, table_references, subqueries)?,
+                                selectivity: estimate_constraint_selectivity(
+                                    schema,
+                                    table_reference,
+                                    Some(table_column),
+                                    Some(*column),
+                                    operator,
+                                    lhs,
+                                    available_indexes,
+                                    table_references,
+                                    subqueries,
+                                ),
+                                usable: true,
+                            });
+                        }
+                    }
+                    ast::Expr::RowId { table, .. } => {
+                        if *table == table_reference.internal_id && rowid_alias_column.is_some() {
+                            let table_column =
+                                &table_reference.table.columns()[rowid_alias_column.unwrap()];
+                            cs.constraints.push(Constraint {
+                                where_clause_pos: (i, BinaryExprSide::Lhs),
+                                operator: opposite_cmp_op(operator),
+                                table_col_pos: rowid_alias_column,
+                                expr: None,
+                                lhs_mask: table_mask_from_expr(lhs, table_references, subqueries)?,
+                                selectivity: estimate_constraint_selectivity(
+                                    schema,
+                                    table_reference,
+                                    Some(table_column),
+                                    rowid_alias_column,
+                                    operator,
+                                    lhs,
+                                    available_indexes,
+                                    table_references,
+                                    subqueries,
+                                ),
+                                usable: true,
+                            });
+                        }
+                    }
+                    _ if expression_matches_table(
+                        rhs,
+                        table_reference,
+                        table_references,
+                        subqueries,
+                    ) =>
+                    {
+                        let selectivity = estimate_constraint_selectivity(
+                            schema,
+                            table_reference,
+                            None,
+                            None,
+                            operator,
+                            lhs,
+                            available_indexes,
+                            table_references,
+                            subqueries,
+                        );
+                        tracing::debug!(
+                            table = table_reference.table.get_name(),
+                            where_clause_pos = i,
+                            operator = ?operator,
+                            lhs_mask = ?table_mask_from_expr(lhs, table_references, subqueries)?,
+                            selectivity,
+                            "expr constraint (rhs matches table)"
+                        );
+                        cs.constraints.push(Constraint {
+                            where_clause_pos: (i, BinaryExprSide::Lhs),
+                            operator: opposite_cmp_op(operator),
+                            table_col_pos: None,
+                            expr: Some(rhs.clone()),
+                            lhs_mask: table_mask_from_expr(lhs, table_references, subqueries)?,
+                            selectivity,
+                            usable: true,
+                        });
+                    }
+                    _ => {}
+                };
+            }
+
+            // IN expressions are handled separately from binary expressions above because:
+            // - as_binary_components returns (&Expr, ConstraintOperator, &Expr) - a single RHS
+            // - InList has Vec<Expr> as RHS, SubqueryResult has a different structure entirely
+            // - They don't fit the binary expression abstraction without a more complex return type
+
+            // Handle IN list: col IN (val1, val2, ...)
+            if let ast::Expr::InList { lhs, not, rhs } = &term.expr {
+                let estimated_values = rhs.len() as f64;
+                let table_stats = schema
+                    .analyze_stats
+                    .table_stats(table_reference.table.get_name());
+                let row_count = table_stats
+                    .and_then(|s| s.row_count)
+                    .unwrap_or(ESTIMATED_HARDCODED_ROWS_PER_TABLE as u64)
+                    as f64;
+                let selectivity = estimate_in_selectivity(estimated_values, row_count, *not);
+
+                match lhs.as_ref() {
+                    ast::Expr::Column { table, column, .. }
+                        if *table == table_reference.internal_id =>
+                    {
+                        cs.constraints.push(Constraint {
+                            where_clause_pos: (i, BinaryExprSide::Rhs),
+                            operator: ConstraintOperator::In {
+                                not: *not,
+                                estimated_values,
+                            },
+                            table_col_pos: Some(*column),
+                            expr: None,
+                            lhs_mask: TableMask::new(), // IN list values are constants
+                            selectivity,
+                            usable: false, // Cannot be used for index seeks (for now- no reason why it couldn't be, but it's not a good idea to index on IN lists)
+                        });
+                    }
+                    ast::Expr::RowId { table, .. }
+                        if *table == table_reference.internal_id
+                            && rowid_alias_column.is_some() =>
+                    {
+                        cs.constraints.push(Constraint {
+                            where_clause_pos: (i, BinaryExprSide::Rhs),
+                            operator: ConstraintOperator::In {
+                                not: *not,
+                                estimated_values,
+                            },
+                            table_col_pos: rowid_alias_column,
+                            expr: None,
+                            lhs_mask: TableMask::new(),
+                            selectivity,
+                            usable: false,
+                        });
+                    }
+                    _ => {}
                 }
-                _ => {}
-            };
+            }
+
+            // Handle IN subquery: col IN (SELECT ...)
+            if let ast::Expr::SubqueryResult {
+                subquery_id,
+                lhs: Some(lhs_expr),
+                not_in,
+                query_type: ast::SubqueryType::In { .. },
+            } = &term.expr
+            {
+                // Find the subquery to check if it's correlated
+                let subquery = subqueries
+                    .iter()
+                    .find(|s| s.internal_id == *subquery_id)
+                    .expect("subquery not found");
+                // Only use as constraint if NOT correlated
+                if !subquery.correlated {
+                    let estimated_values = ESTIMATED_IN_SUBQUERY_ROWS;
+                    let table_stats = schema
+                        .analyze_stats
+                        .table_stats(table_reference.table.get_name());
+                    let row_count = table_stats
+                        .and_then(|s| s.row_count)
+                        .unwrap_or(ESTIMATED_HARDCODED_ROWS_PER_TABLE as u64)
+                        as f64;
+                    let selectivity = estimate_in_selectivity(estimated_values, row_count, *not_in);
+
+                    match lhs_expr.as_ref() {
+                        ast::Expr::Column { table, column, .. }
+                            if *table == table_reference.internal_id =>
+                        {
+                            cs.constraints.push(Constraint {
+                                where_clause_pos: (i, BinaryExprSide::Rhs),
+                                operator: ConstraintOperator::In {
+                                    not: *not_in,
+                                    estimated_values,
+                                },
+                                table_col_pos: Some(*column),
+                                expr: None,
+                                lhs_mask: TableMask::new(), // non-correlated = no dependencies
+                                selectivity,
+                                usable: false, // Cannot be used for index seeks
+                            });
+                        }
+                        ast::Expr::RowId { table, .. }
+                            if *table == table_reference.internal_id
+                                && rowid_alias_column.is_some() =>
+                        {
+                            cs.constraints.push(Constraint {
+                                where_clause_pos: (i, BinaryExprSide::Rhs),
+                                operator: ConstraintOperator::In {
+                                    not: *not_in,
+                                    estimated_values,
+                                },
+                                table_col_pos: rowid_alias_column,
+                                expr: None,
+                                lhs_mask: TableMask::new(),
+                                selectivity,
+                                usable: false,
+                            });
+                        }
+                        _ => {}
+                    }
+                }
+            }
         }
         // sort equalities first so that index keys will be properly constructed.
         // see e.g.: https://www.solarwinds.com/blog/the-left-prefix-index-rule
@@ -862,6 +998,11 @@ pub fn constraints_from_where_clause(
 
         // For each constraint we found, add a reference to it for each index that may be able to use it.
         for (i, constraint) in cs.constraints.iter_mut().enumerate() {
+            // Skip constraints already marked unusable (e.g., IN expressions which can't be index seeks)
+            if !constraint.usable {
+                continue;
+            }
+
             let constrained_column = constraint
                 .table_col_pos
                 .and_then(|pos| table_reference.table.columns().get(pos));
