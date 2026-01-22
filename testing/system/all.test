@@ -3,5 +3,4 @@
 set testdir [file dirname $argv0]
 
 
-source $testdir/math.test
 source $testdir/vtab.test
