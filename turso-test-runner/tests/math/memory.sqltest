@@ -984,6 +984,9 @@ test radians-int {
 expect {
     0.017453292519943
 }
+expect @cli {
+    0.0174532925199433
+}
 
 test radians-float {
     SELECT radians(-0.5)
@@ -991,12 +994,18 @@ test radians-float {
 expect {
     -0.008726646259972
 }
+expect @cli {
+    -0.00872664625997165
+}
 
 test radians-str {
     SELECT radians('-0.5')
 }
 expect {
     -0.008726646259972
+}
+expect @cli {
+    -0.00872664625997165
 }
 
 test radians-null {
@@ -1267,12 +1276,18 @@ test pow-int-float {
 expect {
     0.089442719099992
 }
+expect @cli {
+    0.0894427190999916
+}
 
 test pow-int-str {
     SELECT pow(5, '-1.5')
 }
 expect {
     0.089442719099992
+}
+expect @cli {
+    0.0894427190999916
 }
 
 test pow-float-int {
@@ -1328,12 +1343,18 @@ test power-int-float {
 expect {
     0.089442719099992
 }
+expect @cli {
+    0.0894427190999916
+}
 
 test power-int-str {
     SELECT power(5, '-1.5')
 }
 expect {
     0.089442719099992
+}
+expect @cli {
+    0.0894427190999916
 }
 
 test power-float-int {
