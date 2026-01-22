@@ -175,10 +175,14 @@ pub fn init_loop(
             table.open_cursors(program, mode.clone(), t_ctx.resolver.schema)?;
         match &table.op {
             Operation::Scan(Scan::BTreeTable { index, .. }) => {
-                if index.is_none() {
-                    if let Some(cursor_id) = table_cursor_id {
-                        program.mark_auto_analyze_full_scan(cursor_id);
+                if let Some(index) = index {
+                    if index.where_clause.is_none() {
+                        if let Some(cursor_id) = index_cursor_id {
+                            program.mark_auto_analyze_full_scan(cursor_id);
+                        }
                     }
+                } else if let Some(cursor_id) = table_cursor_id {
+                    program.mark_auto_analyze_full_scan(cursor_id);
                 }
                 match (&mode, &table.table) {
                     (OperationMode::SELECT, Table::BTree(btree)) => {
@@ -342,6 +346,9 @@ pub fn init_loop(
                 {
                     // Ephemeral index cursor are opened ad-hoc when needed.
                     if !index.ephemeral {
+                        if let Some(cursor_id) = index_cursor_id {
+                            program.mark_auto_analyze_index_range_scan(cursor_id);
+                        }
                         match mode {
                             OperationMode::SELECT => {
                                 program.emit_insn(Insn::OpenRead {
