@@ -1,0 +1,445 @@
+@database :memory:
+
+# Basic string formatting
+test printf-basic-string {
+    SELECT printf('Hello World!');
+}
+expect {
+    Hello World!
+}
+
+test printf-string-replacement {
+    SELECT printf('Hello, %s', 'Alice');
+}
+expect {
+    Hello, Alice
+}
+
+test printf-string-substitution {
+    SELECT printf('Hello, %s!', 'World');
+}
+expect {
+    Hello, World!
+}
+
+test printf-multiple-strings {
+    SELECT printf('%s %s!', 'Hello', 'World');
+}
+expect {
+    Hello World!
+}
+
+test printf-null-string {
+    SELECT printf('Hello, %s!', NULL);
+}
+expect {
+    Hello, !
+}
+
+test printf-integer-as-string {
+    SELECT printf('Value: %s', 42);
+}
+expect {
+    Value: 42
+}
+
+test printf-percent-escape {
+    SELECT printf('100%% complete');
+}
+expect {
+    100% complete
+}
+
+# Integer formatting
+test printf-integer-replacement {
+    SELECT printf('Number: %d', 42);
+}
+expect {
+    Number: 42
+}
+
+test printf-integer-negative {
+    SELECT printf('Number: %d', -42);
+}
+expect {
+    Number: -42
+}
+
+test printf-integer-arithmetic-expression {
+    SELECT printf('%d + %d = %d', 2, 3, 5);
+}
+expect {
+    2 + 3 = 5
+}
+
+test printf-text-as-integer {
+    SELECT printf('Number: %d', 'not a number');
+}
+expect {
+    Number: 0
+}
+
+# Unsigned integer formatting
+test printf-unsigned-basic {
+    SELECT printf('Number: %u', 42);
+}
+expect {
+    Number: 42
+}
+
+test printf-unsigned-arithmetic-expression {
+    SELECT printf('%u + %u = %u', 2, 3, 5);
+}
+expect {
+    2 + 3 = 5
+}
+
+test printf-unsigned-negative {
+    SELECT printf('Negative: %u', -1);
+}
+expect {
+    Negative: 18446744073709551615
+}
+
+test printf-text-as-unsigned {
+    SELECT printf('NaN: %u', 'not a number');
+}
+expect {
+    NaN: 0
+}
+
+# Float formatting
+test printf-float-basic {
+    SELECT printf('Number: %f', 42.5);
+}
+expect {
+    Number: 42.500000
+}
+
+test printf-float-negative {
+    SELECT printf('Number: %f', -42.5);
+}
+expect {
+    Number: -42.500000
+}
+
+test printf-integer-as-float {
+    SELECT printf('Number: %f', 42);
+}
+expect {
+    Number: 42.000000
+}
+
+test printf-float-arithmetic {
+    SELECT printf('%f + %f = %f', 2.5, 3.5, 6.0);
+}
+expect {
+    2.500000 + 3.500000 = 6.000000
+}
+
+test printf-text-as-float {
+    SELECT printf('Number: %f', 'not a number');
+}
+expect {
+    Number: 0.000000
+}
+
+# Character formatting
+test printf-char-single {
+    SELECT printf('character: %c', 'a');
+}
+expect {
+    character: a
+}
+
+test printf-char-first-from-string {
+    SELECT printf('character: %c', 'this is a test');
+}
+expect {
+    character: t
+}
+
+test printf-char-empty-string {
+    SELECT printf('character: %c', '');
+}
+expect raw {
+character: 
+}
+
+test printf-char-from-integer {
+    SELECT printf('character: %c', 123);
+}
+expect {
+    character: 1
+}
+
+test printf-char-from-float {
+    SELECT printf('character: %c', 42.5);
+}
+expect {
+    character: 4
+}
+
+# Exponential notation formatting
+test printf-exp-large-number {
+    SELECT printf('Exp: %e', 23000000.0);
+}
+expect {
+    Exp: 2.300000e+07
+}
+
+test printf-exp-negative-large {
+    SELECT printf('Exp: %e', -23000000.0);
+}
+expect {
+    Exp: -2.300000e+07
+}
+
+test printf-exp-decimal-float {
+    SELECT printf('Exp: %e', 250.375);
+}
+expect {
+    Exp: 2.503750e+02
+}
+
+test printf-exp-small-positive {
+    SELECT printf('Exp: %e', 0.0003235);
+}
+expect {
+    Exp: 3.235000e-04
+}
+
+test printf-exp-zero {
+    SELECT printf('Exp: %e', 0.0);
+}
+expect {
+    Exp: 0.000000e+00
+}
+
+test printf-exp-small-positive-duplicate {
+    SELECT printf('Exp: %e', 0.0003235);
+}
+expect {
+    Exp: 3.235000e-04
+}
+
+test printf-exp-string-integer {
+    SELECT printf('Exp: %e', '123');
+}
+expect {
+    Exp: 1.230000e+02
+}
+
+test printf-exp-string-float {
+    SELECT printf('Exp: %e', '123.45');
+}
+expect {
+    Exp: 1.234500e+02
+}
+
+test printf-exp-string-leading-zeros {
+    SELECT printf('Exp: %e', '00123');
+}
+expect {
+    Exp: 1.230000e+02
+}
+
+test printf-exp-string-text {
+    SELECT printf('Exp: %e', 'test');
+}
+expect {
+    Exp: 0.000000e+00
+}
+
+test printf-exp-string-number-suffix {
+    SELECT printf('Exp: %e', '123ab');
+}
+expect {
+    Exp: 1.230000e+02
+}
+
+test printf-exp-string-text-prefix {
+    SELECT printf('Exp: %e', 'ab123');
+}
+expect {
+    Exp: 0.000000e+00
+}
+
+test printf-exp-string-exponential {
+    SELECT printf('Exp: %e', '1.230000e+02');
+}
+expect {
+    Exp: 1.230000e+02
+}
+
+# hexadecimal formatting
+test printf-hex-simple {
+    SELECT printf('hex: %x', 4);
+}
+expect {
+    hex: 4
+}
+
+test printf-hex-large-number {
+    SELECT printf('hex: %x', 15565303546);
+}
+expect {
+    hex: 39fc3aefa
+}
+
+test printf-hex-uppercase {
+    SELECT printf('hex: %X', 15565303546);
+}
+expect {
+    hex: 39FC3AEFA
+}
+
+test printf-hex-negative {
+    SELECT printf('hex: %x', -15565303546);
+}
+expect {
+    hex: fffffffc603c5106
+}
+
+test printf-hex-float {
+    SELECT printf('hex: %x', 42.5);
+}
+expect {
+    hex: 2a
+}
+
+test printf-hex-negative-float {
+    SELECT printf('hex: %x', -42.5);
+}
+expect {
+    hex: ffffffffffffffd6
+}
+
+test printf-hex-text {
+    SELECT printf('hex: %x', '42');
+}
+expect {
+    hex: 2a
+}
+
+test printf-hex-empty-text {
+    SELECT printf('hex: %x', '');
+}
+expect {
+    hex: 0
+}
+
+# octal formatting
+test printf-octal-simple {
+    SELECT printf('octal: %o', 4);
+}
+expect {
+    octal: 4
+}
+
+test printf-octal-large-number {
+    SELECT printf('octal: %o', 15565303546);
+}
+expect {
+    octal: 163760727372
+}
+
+test printf-octal-negative {
+    SELECT printf('octal: %o', -15565303546);
+}
+expect {
+    octal: 1777777777614017050406
+}
+
+test printf-octal-float {
+    SELECT printf('octal: %o', 42.5);
+}
+expect {
+    octal: 52
+}
+
+test printf-octal-negative-float {
+    SELECT printf('octal: %o', -42.5);
+}
+expect {
+    octal: 1777777777777777777726
+}
+
+test printf-octal-text {
+    SELECT printf('octal: %o', '42');
+}
+expect {
+    octal: 52
+}
+
+test printf-octal-empty-text {
+    SELECT printf('octal: %o', '');
+}
+expect {
+    octal: 0
+}
+
+# mixed formatting
+test printf-mixed-string-integer {
+    SELECT printf('%s: %d', 'Count', 42);
+}
+expect {
+    Count: 42
+}
+
+test printf-mixed-all-types {
+    SELECT printf('%s: %d (%f%%)', 'Progress', 75, 75.5);
+}
+expect {
+    Progress: 75 (75.500000%)
+}
+
+test printf-mixed-complex-format {
+    SELECT printf('Name: %s, ID: %d, Score: %f', 'John', 123, 95.5);
+}
+expect {
+    Name: John, ID: 123, Score: 95.500000
+}
+
+test printf-mixed-string-exponential {
+    SELECT printf('Scientific: %s = %e', 'Large number', 123000.0);
+}
+expect {
+    Scientific: Large number = 1.230000e+05
+}
+
+test printf-mixed-integer-octal {
+    SELECT printf('Decimal %d is octal %o', 64, 64);
+}
+expect {
+    Decimal 64 is octal 100
+}
+
+test printf-mixed-exponential-float {
+    SELECT printf('Scientific %e equals %f', 0.00123, 0.00123);
+}
+expect {
+    Scientific 1.230000e-03 equals 0.001230
+}
+
+test printf-mixed-string-octal {
+    SELECT printf('Permission %s: %o', 'rwx', 755);
+}
+expect {
+    Permission rwx: 1363
+}
+
+test printf-mixed-exponential-integer {
+    SELECT printf('Value %e as integer %d', 42.7, 42);
+}
+expect {
+    Value 4.270000e+01 as integer 42
+}
+
+test printf-mixed-octal-hex {
+    SELECT printf('Octal %o is hex %x', 255, 255);
+}
+expect {
+    Octal 377 is hex ff
+}
+

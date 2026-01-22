@@ -9,5 +9,4 @@ set testdir [file dirname $argv0]
 # works
 source $testdir/math.test
 source $testdir/scalar-functions.test
-source $testdir/scalar-functions-printf.test
 source $testdir/vtab.test
