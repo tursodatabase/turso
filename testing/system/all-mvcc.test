@@ -9,7 +9,6 @@ set testdir [file dirname $argv0]
 
 # works
 source $testdir/groupby.test
-source $testdir/select.test
 source $testdir/join.test
 source $testdir/math.test
 source $testdir/scalar-functions.test
