@@ -6,7 +6,7 @@ pub use delete::Delete;
 pub use drop::Drop;
 pub use drop_index::DropIndex;
 pub use drop_view::{DropMaterializedView, DropView};
-pub use insert::Insert;
+pub use insert::{ConflictAction, Insert};
 pub use select::{Cte, Select, WithClause};
 
 pub mod alter_table;
