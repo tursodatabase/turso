@@ -2442,4 +2442,3 @@ fn test_mvcc_dual_cursor_delete_all_btree_reinsert() {
     assert_eq!(rows[0][1].to_string(), "new1");
     assert_eq!(rows[1][1].to_string(), "new2");
 }
-
