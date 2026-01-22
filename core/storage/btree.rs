@@ -1,3 +1,4 @@
+use branches::mark_unlikely;
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 use tracing::{instrument, Level};
@@ -6796,44 +6797,51 @@ fn edit_page(
         debug_validate_cells!(page, usable_space);
     }
     // TODO: make page_free_array defragment, for now I'm lazy so this will work for now.
-    let guard = defragment_page(page, usable_space, 0)?;
+    let mut defragmented_page = defragment_page_for_insert(page, usable_space, 0)?;
     // TODO: add to start
     if start_new_cells < start_old_cells {
         let count = number_new_cells.min(start_old_cells - start_new_cells);
-        page_insert_array(page, start_new_cells, count, cell_array, 0, guard)?;
+        page_insert_array(
+            &mut defragmented_page,
+            start_new_cells,
+            count,
+            cell_array,
+            0,
+            usable_space,
+        )?;
         count_cells += count;
     }
     // TODO: overflow cells
-    debug_validate_cells!(page, usable_space);
-    for i in 0..page.overflow_cells.len() {
-        let overflow_cell = &page.overflow_cells[i];
+    debug_validate_cells!(defragmented_page.0, usable_space);
+    for i in 0..defragmented_page.0.overflow_cells.len() {
+        let overflow_cell = &defragmented_page.0.overflow_cells[i];
         // cell index in context of new list of cells that should be in the page
         if start_old_cells + overflow_cell.index >= start_new_cells {
             let cell_idx = start_old_cells + overflow_cell.index - start_new_cells;
             if cell_idx < number_new_cells {
                 count_cells += 1;
                 page_insert_array(
-                    page,
+                    &mut defragmented_page,
                     start_new_cells + cell_idx,
                     1,
                     cell_array,
                     cell_idx,
-                    guard,
+                    usable_space,
                 )?;
             }
         }
     }
-    debug_validate_cells!(page, usable_space);
+    debug_validate_cells!(defragmented_page.0, usable_space);
     // TODO: append cells to end
     page_insert_array(
-        page,
+        &mut defragmented_page,
         start_new_cells + count_cells,
         number_new_cells - count_cells,
         cell_array,
         count_cells,
-        guard,
+        usable_space,
     )?;
-    debug_validate_cells!(page, usable_space);
+    debug_validate_cells!(defragmented_page.0, usable_space);
     // TODO: noverflow
     page.write_cell_count(number_new_cells as u16);
     Ok(())
@@ -6940,6 +6948,30 @@ fn page_free_array(
     Ok(number_of_cells_removed)
 }
 
+/// A proof type that guarantees a page has been defragmented.
+///
+/// This type can only be constructed by calling [`defragment_page_for_insert`],
+/// which ensures the page has been defragmented before any insert operations.
+/// Functions like [`page_insert_array`] require this type to enforce at compile-time
+/// that defragmentation has occurred.
+pub struct DefragmentedPage<'a>(&'a mut PageContent);
+
+impl std::ops::Deref for DefragmentedPage<'_> {
+    type Target = PageContent;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        self.0
+    }
+}
+
+impl std::ops::DerefMut for DefragmentedPage<'_> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.0
+    }
+}
+
 /// Insert multiple cells into a page in a single batch operation.
 ///
 /// This is an optimized version that avoids O(N²) complexity by:
@@ -6949,16 +6981,13 @@ fn page_free_array(
 /// 4. Shifting existing cell pointers once
 /// 5. Writing all new cell pointers in one pass
 /// 6. Updating cell count once
-///
-/// IMPORTANT: This function assumes the page has been defragmented before calling,
-/// We accept a `[DefragmentGuard]` as a parameter to ensure the caller has done so.
 fn page_insert_array(
-    page: &mut PageContent,
+    page: &mut DefragmentedPage,
     first: usize,
     count: usize,
     cell_array: &CellArray,
     start_insert: usize,
-    _guard: DefragmentGuard,
+    _usable_space: usize,
 ) -> Result<()> {
     if count == 0 {
         return Ok(());
@@ -6973,6 +7002,11 @@ fn page_insert_array(
         page.page_type().ok()
     );
 
+    turso_assert!(first <= cell_array.cell_payloads.len(), "first OOB");
+    turso_assert!(
+        count <= cell_array.cell_payloads.len().saturating_sub(first),
+        "first+count OOB"
+    );
     // Calculate total space needed for all cell payloads
     // We read from cell_array at indices [first, first+count)
     let mut total_payload_size: usize = 0;
@@ -6983,21 +7017,41 @@ fn page_insert_array(
     }
 
     // Total space needed includes cell pointers
-    let total_ptr_space = count * CELL_PTR_SIZE_BYTES;
+    let total_ptr_space = count.checked_mul(CELL_PTR_SIZE_BYTES).ok_or_else(|| {
+        mark_unlikely();
+        LimboError::Corrupt("page_insert_array: ptr space overflow".into())
+    })?;
 
     // After defragmentation, all free space is in the unallocated region
     // between the cell pointer array and the cell content area.
     let current_cell_count = page.cell_count();
     let mut cell_content_area = page.cell_content_area() as usize;
     let unallocated_start = page.unallocated_region_start();
-
+    turso_assert!(
+        start_insert <= current_cell_count,
+        "start_insert beyond cell_count"
+    );
+    turso_assert!(
+        // we cast to u16 later so assert no overflow
+        current_cell_count + count <= u16::MAX as usize,
+        "cell_count overflow"
+    );
     // Verify we have enough space
     // The new cell pointers will extend the cell pointer array by `total_ptr_space`
     // The new cell content will reduce cell_content_area by `total_payload_size`
-    let new_unallocated_start = unallocated_start + total_ptr_space;
+    let new_unallocated_start =
+        unallocated_start
+            .checked_add(total_ptr_space)
+            .ok_or_else(|| {
+                mark_unlikely();
+                LimboError::Corrupt("page_insert_array: unalloc start overflow".into())
+            })?;
     let new_cell_content_area = cell_content_area
         .checked_sub(total_payload_size)
-        .ok_or_else(|| LimboError::Corrupt("page_insert_array: payload underflow".to_string()))?;
+        .ok_or_else(|| {
+            mark_unlikely();
+            LimboError::Corrupt("page_insert_array: payload underflow".to_string())
+        })?;
 
     turso_assert!(
         new_unallocated_start <= new_cell_content_area,
@@ -7036,6 +7090,7 @@ fn page_insert_array(
 
         // Allocate space for this cell (grow content area downward)
         cell_content_area = cell_content_area.checked_sub(cell_size).ok_or_else(|| {
+            mark_unlikely();
             LimboError::Corrupt("page_insert_array: cell allocation underflow".to_string())
         })?;
 
@@ -7051,7 +7106,7 @@ fn page_insert_array(
     page.write_cell_content_area(cell_content_area);
     page.write_cell_count((current_cell_count + count) as u16);
 
-    debug_validate_cells!(page, usable_space);
+    debug_validate_cells!(page, _usable_space);
     Ok(())
 }
 
@@ -7244,7 +7299,7 @@ fn defragment_page_fast(
     usable_space: usize,
     freeblock_1st: usize,
     freeblock_2nd: usize,
-) -> Result<DefragmentGuard> {
+) -> Result<()> {
     turso_assert!(freeblock_1st != 0, "no free blocks");
     if freeblock_2nd > 0 {
         turso_assert!(freeblock_1st < freeblock_2nd, "1st freeblock is not before 2nd freeblock: freeblock_1st={freeblock_1st} freeblock_2nd={freeblock_2nd}");
@@ -7329,29 +7384,34 @@ fn defragment_page_fast(
 
     debug_validate_cells!(page, usable_space);
 
-    Ok(DefragmentGuard {})
+    Ok(())
 }
 
 /// Defragment a page, and never use the fast-path algorithm.
-fn defragment_page_full(page: &PageContent, usable_space: usize) -> Result<DefragmentGuard> {
+fn defragment_page_full(page: &PageContent, usable_space: usize) -> Result<()> {
     defragment_page(page, usable_space, -1)
 }
 
-/// For `[page_insert_array]` we must call defragment_page prior to ensure
-/// that there is enough contiguous space for the insert.
+/// Defragment a page and return a proof that can be used with [`page_insert_array`].
 ///
-/// In order to assert this, we return a simple ZST "guard" from `defragment_page` that allows
-/// us to call `page_insert_array` only if the guard is held. Will be optimized away by the
-/// compile by the compiler.
-#[derive(Clone, Copy)]
-struct DefragmentGuard;
-
-/// Defragment a page. This means packing all the cells to the end of the page.
-fn defragment_page(
-    page: &PageContent,
+/// This is the entry point for defragmentation when you need to perform insert
+/// operations afterward. The returned [`DefragmentedPage`] proves at compile-time
+/// that defragmentation has occurred.
+///
+/// For defragmentation without the type-state proof (e.g., in `allocate_cell_space`),
+/// use [`defragment_page`] directly.
+#[inline]
+fn defragment_page_for_insert(
+    page: &mut PageContent,
     usable_space: usize,
     max_frag_bytes: isize,
-) -> Result<DefragmentGuard> {
+) -> Result<DefragmentedPage<'_>> {
+    defragment_page(page, usable_space, max_frag_bytes)?;
+    Ok(DefragmentedPage(page))
+}
+
+/// Defragment a page. This means packing all the cells to the end of the page.
+fn defragment_page(page: &PageContent, usable_space: usize, max_frag_bytes: isize) -> Result<()> {
     debug_validate_cells!(page, usable_space);
     tracing::debug!("defragment_page (optimized in-place)");
 
@@ -7361,7 +7421,7 @@ fn defragment_page(
         page.write_first_freeblock(0);
         page.write_fragmented_bytes_count(0);
         debug_validate_cells!(page, usable_space);
-        return Ok(DefragmentGuard {});
+        return Ok(());
     }
 
     // Use fast algorithm if there are at most 2 freeblocks and the total fragmented free space is less than max_frag_bytes.
@@ -7369,7 +7429,7 @@ fn defragment_page(
         let freeblock_1st = page.first_freeblock() as usize;
         if freeblock_1st == 0 {
             // No freeblocks and very little if any fragmented free bytes -> no need to defragment.
-            return Ok(DefragmentGuard {});
+            return Ok(());
         }
         let freeblock_2nd = page.read_u16_no_offset(freeblock_1st) as usize;
         if freeblock_2nd == 0 {
@@ -7490,7 +7550,7 @@ fn defragment_page(
 
     process_cells(page, usable_space, &mut cells, is_physically_sorted)?;
     debug_validate_cells!(page, usable_space);
-    Ok(DefragmentGuard {})
+    Ok(())
 }
 
 #[cfg(debug_assertions)]
