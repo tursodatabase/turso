@@ -1046,6 +1046,31 @@ pub fn parse_where(
                 BindingBehavior::TryCanonicalColumnsFirst,
             )?;
         }
+        // BETWEEN is rewritten to (lhs >= start) AND (lhs <= end) by bind_and_rewrite_expr.
+        // Re-break any ANDs that were created so they become separate WhereTerms for
+        // constraint extraction.
+        let mut i = start_idx;
+        while i < out_where_clause.len() {
+            if matches!(
+                &out_where_clause[i].expr,
+                Expr::Binary(_, ast::Operator::And, _)
+            ) {
+                let term = out_where_clause.remove(i);
+                let mut new_terms: Vec<WhereTerm> = Vec::new();
+                break_predicate_at_and_boundaries(&term.expr, &mut new_terms);
+                // Preserve from_outer_join from the original term
+                for new_term in new_terms.iter_mut() {
+                    new_term.from_outer_join = term.from_outer_join;
+                }
+                let count = new_terms.len();
+                for (j, new_term) in new_terms.into_iter().enumerate() {
+                    out_where_clause.insert(i + j, new_term);
+                }
+                i += count;
+            } else {
+                i += 1;
+            }
+        }
         Ok(())
     } else {
         Ok(())

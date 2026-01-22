@@ -1083,11 +1083,16 @@ fn optimize_table_access(
                 .is_some_and(|join_info| join_info.outer)
         })
     {
-        if constraints_per_table[i]
-            .constraints
-            .iter()
-            .any(|c| where_clause[c.where_clause_pos.0].from_outer_join.is_none())
-        {
+        // Check if there's a constraint that would filter out NULL rows,
+        // allowing us to convert the LEFT JOIN into an INNER JOIN for join reordering purposes.
+        // Most binary ops like x = foo filter out NULL rows, but
+        // IS NULL constraints do NOT - they specifically KEEP them.
+        // So we should not convert LEFT JOIN to INNER JOIN based on IS NULL constraints.
+        if constraints_per_table[i].constraints.iter().any(|c| {
+            let is_from_where = where_clause[c.where_clause_pos.0].from_outer_join.is_none();
+            let is_is_null = c.operator == ast::Operator::Is.into();
+            is_from_where && !is_is_null
+        }) {
             t.join_info.as_mut().unwrap().outer = false;
             for term in where_clause.iter_mut() {
                 if let Some(from_outer_join) = term.from_outer_join {

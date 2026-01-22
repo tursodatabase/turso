@@ -2157,6 +2157,22 @@ fn emit_seek_termination(
                 &t_ctx.resolver,
                 NoConstantOptReason::RegisterReuse,
             )?;
+            // Apply affinity to the end key (same as we do for start key).
+            // Without this, e.g. BETWEEN '15' AND '35' on a numeric column would
+            // compare '35' as a string against numeric values, causing incorrect results.
+            if is_index {
+                let affinities: String = seek_def
+                    .iter_affinity(&seek_def.end)
+                    .map(|affinity| affinity.aff_mask())
+                    .collect();
+                if affinities.chars().any(|c| c != affinity::SQLITE_AFF_NONE) {
+                    program.emit_insn(Insn::Affinity {
+                        start_reg,
+                        count: std::num::NonZeroUsize::new(num_regs).unwrap(),
+                        affinities,
+                    });
+                }
+            }
             // If the seek termination key expression is not verifiably non-NULL, we need to check whether it is NULL,
             // and if so, jump to the loop end.
             // This is to avoid returning rows for e.g. SELECT * FROM t WHERE t.x > NULL,

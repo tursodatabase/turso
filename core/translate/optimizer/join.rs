@@ -1,5 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
+use smallvec::SmallVec;
+
 use turso_parser::ast::{Expr, Operator, TableInternalId};
 
 use crate::{
@@ -149,16 +151,55 @@ pub fn join_lhs_and_rhs<'a>(
         m
     };
 
-    let output_cardinality_multiplier = rhs_constraints
-        .constraints
-        .iter()
-        .filter(|c| {
+    let output_cardinality_multiplier = {
+        let mut multiplier = 1.0;
+        // (column_pos, has_lower, has_upper) - SmallVec avoids heap for typical 1-3 range columns
+        let mut column_bounds: SmallVec<[(Option<usize>, bool, bool); 4]> = SmallVec::new();
+
+        for c in rhs_constraints.constraints.iter().filter(|c| {
             lhs_mask.contains_all(&c.lhs_mask)
                 || c.lhs_mask == rhs_self_mask // self-constraints
                 || c.lhs_mask.is_empty() // literal constraints
-        })
-        .map(|c| c.selectivity)
-        .product::<f64>();
+        }) {
+            multiplier *= c.selectivity;
+
+            // Track range bounds per column for closed-range detection
+            let dominated_col = c.table_col_pos;
+            let dominated_col_is_lower = matches!(
+                c.operator.as_ast_operator(),
+                Some(Operator::Greater | Operator::GreaterEquals)
+            );
+            let dominated_col_is_upper = matches!(
+                c.operator.as_ast_operator(),
+                Some(Operator::Less | Operator::LessEquals)
+            );
+            if dominated_col_is_lower || dominated_col_is_upper {
+                if let Some(entry) = column_bounds
+                    .iter_mut()
+                    .find(|(col, _, _)| *col == dominated_col)
+                {
+                    entry.1 |= dominated_col_is_lower;
+                    entry.2 |= dominated_col_is_upper;
+                } else {
+                    column_bounds.push((
+                        dominated_col,
+                        dominated_col_is_lower,
+                        dominated_col_is_upper,
+                    ));
+                }
+            }
+        }
+
+        // Apply closed-range bonus for columns with both lower and upper bounds
+        const CLOSED_RANGE_SELECTIVITY_HEURISTIC_FACTOR: f64 = 0.2;
+        for (_, has_lower, has_upper) in &column_bounds {
+            if *has_lower && *has_upper {
+                multiplier *= CLOSED_RANGE_SELECTIVITY_HEURISTIC_FACTOR;
+            }
+        }
+
+        multiplier
+    };
     let rhs_internal_id = rhs_table_reference.internal_id;
     let lhs_internal_ids: HashSet<TableInternalId> = lhs
         .map(|l| {
@@ -659,7 +700,7 @@ fn build_has_uncovered_prior_constraints(
         if join_key_indices.contains(&constraint.where_clause_pos.0) {
             return false;
         }
-        if constraint.operator != Operator::Equals {
+        if constraint.operator != Operator::Equals.into() {
             return true;
         }
         if !constraint.lhs_mask.intersects(prior_hash_build_mask) {
@@ -684,7 +725,9 @@ fn build_prior_constraint_selectivity(
     let mut selectivity = 1.0;
     let mut saw_constraint = false;
     for constraint in build_constraints.constraints.iter() {
-        if constraint.operator == Operator::Equals && constraint.lhs_mask.intersects(prior_mask) {
+        if constraint.operator == Operator::Equals.into()
+            && constraint.lhs_mask.intersects(prior_mask)
+        {
             tracing::debug!(
                 where_clause_pos = ?constraint.where_clause_pos,
                 lhs_mask = ?constraint.lhs_mask,
@@ -2272,7 +2315,7 @@ mod tests {
             let constraint =
                 &table_constraints[*table_number].constraints[constraint_refs[0].eq.unwrap()];
             assert!(constraint.lhs_mask.contains_table(FACT_TABLE_IDX));
-            assert!(constraint.operator == ast::Operator::Equals);
+            assert!(constraint.operator.as_ast_operator() == Some(ast::Operator::Equals));
         }
     }
 
@@ -2374,7 +2417,7 @@ mod tests {
             assert!(constraint_refs.len() == 1);
             let constraint = &table_constraints.constraints[constraint_refs[0].eq.unwrap()];
             assert!(constraint.lhs_mask.contains_table(i - 1));
-            assert!(constraint.operator == ast::Operator::Equals);
+            assert!(constraint.operator.as_ast_operator() == Some(ast::Operator::Equals));
         }
     }
 
@@ -2605,7 +2648,7 @@ mod tests {
         assert!(index.as_ref().is_some_and(|i| i.name == "idx1"));
         assert!(constraint_refs.len() == 1);
         let constraint = &table_constraints[0].constraints[constraint_refs[0].eq.unwrap()];
-        assert!(constraint.operator == ast::Operator::Equals);
+        assert!(constraint.operator.as_ast_operator() == Some(ast::Operator::Equals));
         assert!(constraint.table_col_pos == Some(0)); // c1
     }
 
@@ -2748,10 +2791,10 @@ mod tests {
         assert!(index.as_ref().is_some_and(|i| i.name == "idx1"));
         assert!(constraint_refs.len() == 2);
         let constraint = &table_constraints[0].constraints[constraint_refs[0].eq.unwrap()];
-        assert!(constraint.operator == ast::Operator::Equals);
+        assert!(constraint.operator.as_ast_operator() == Some(ast::Operator::Equals));
         assert!(constraint.table_col_pos == Some(0)); // c1
         let constraint = &table_constraints[0].constraints[constraint_refs[1].lower_bound.unwrap()];
-        assert!(constraint.operator == ast::Operator::Greater);
+        assert!(constraint.operator.as_ast_operator() == Some(ast::Operator::Greater));
         assert!(constraint.table_col_pos == Some(1)); // c2
     }
 

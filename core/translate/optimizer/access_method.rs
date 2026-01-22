@@ -215,6 +215,10 @@ fn find_best_access_method_for_btree(
             let satisfies_order =
                 (all_same_direction || all_opposite_direction) && !order_target.0.is_empty();
             if satisfies_order {
+                // Bonus = estimated sort cost saved. Sorting is O(n log n).
+                const SORT_CPU_COST_PER_ROW: f64 = 0.002;
+                let n = *base_row_count;
+                let sort_cost_saved = Cost(n * (n.max(1.0).log2()) * SORT_CPU_COST_PER_ROW);
                 (
                     if all_same_direction {
                         IterationDirection::Forwards
@@ -222,7 +226,7 @@ fn find_best_access_method_for_btree(
                         IterationDirection::Backwards
                     },
                     true,
-                    Cost(1.0),
+                    sort_cost_saved,
                 )
             } else {
                 (IterationDirection::Forwards, false, Cost(0.0))
@@ -339,7 +343,7 @@ pub fn find_equijoin_conditions(
         let Ok(Some((lhs, op, rhs))) = as_binary_components(&where_term.expr) else {
             continue;
         };
-        if !matches!(op, ast::Operator::Equals) {
+        if !matches!(op.as_ast_operator(), Some(ast::Operator::Equals)) {
             continue;
         }
 
