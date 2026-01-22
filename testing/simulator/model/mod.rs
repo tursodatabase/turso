@@ -491,6 +491,7 @@ impl Shadow for Query {
             Query::ReleaseSavepoint(release) => release.shadow(env),
             Query::Placeholder => Ok(vec![]),
             Query::Pragma(Pragma::AutoVacuumMode(_) | Pragma::ForeignKeyList(_)) => Ok(vec![]),
+            Query::Pragma(Pragma::CaptureDataChanges(_)) => Ok(vec![]),
         }
     }
 }

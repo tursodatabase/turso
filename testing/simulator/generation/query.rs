@@ -83,20 +83,25 @@ fn random_create_index<R: rand::Rng + ?Sized>(
 }
 
 fn random_pragma<R: rand::Rng + ?Sized>(rng: &mut R, conn_ctx: &impl GenerationContext) -> Query {
-    if !conn_ctx.tables().is_empty() && rng.random_bool(0.5) {
-        let table = conn_ctx.tables().choose(rng).unwrap();
-        return Query::Pragma(Pragma::ForeignKeyList(table.name.clone()));
+    use sql_generation::model::query::pragma::CdcMode;
+
+    // 50% chance of generating a CDC pragma, 50% chance of vacuum pragma
+    if rng.random_bool(0.5) {
+        Query::Pragma(Pragma::CaptureDataChanges(CdcMode::Full))
+    } else {
+        if !conn_ctx.tables().is_empty() && rng.random_bool(0.5) {
+            let table = conn_ctx.tables().choose(rng).unwrap();
+            return Query::Pragma(Pragma::ForeignKeyList(table.name.clone()));
+        }
+    
+        const ALL_MODES: [VacuumMode; 2] = [
+            VacuumMode::None,
+            // VacuumMode::Incremental, not implemented yet
+            VacuumMode::Full,
+        ];
+        let mode = ALL_MODES.choose(rng).unwrap();
+        Query::Pragma(Pragma::AutoVacuumMode(mode.clone()))
     }
-
-    const ALL_MODES: [VacuumMode; 2] = [
-        VacuumMode::None,
-        // VacuumMode::Incremental, not implemented yet
-        VacuumMode::Full,
-    ];
-
-    let mode = ALL_MODES.choose(rng).unwrap();
-
-    Query::Pragma(Pragma::AutoVacuumMode(mode.clone()))
 }
 
 fn random_create_materialized_view<R: rand::Rng + ?Sized>(
