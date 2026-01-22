@@ -2,7 +2,9 @@ use crate::backends::{BackendError, SqlBackend};
 use crate::comparison::{ComparisonResult, compare};
 use crate::parser::ast::{Capability, DatabaseConfig, Requirement, TestCase, TestFile};
 use futures::stream::{FuturesUnordered, StreamExt};
+use futures::FutureExt;
 use std::collections::HashSet;
+use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -466,120 +468,151 @@ async fn run_single_test<B: SqlBackend>(
 ) -> TestResult {
     let start = Instant::now();
 
-    // Check if skipped (per-test skip overrides global skip)
-    let effective_skip = test.skip.as_ref().or(global_skip.as_ref());
-    if let Some(skip) = effective_skip {
-        let should_skip = match &skip.condition {
-            None => true, // Unconditional skip
-            Some(crate::parser::ast::SkipCondition::Mvcc) => mvcc,
+    // Capture test name and other info for panic recovery
+    let test_name = test.name.clone();
+    let file_path_for_panic = file_path.clone();
+    let db_config_for_panic = db_config.clone();
+
+    let test_future = async move {
+        // Check if skipped (per-test skip overrides global skip)
+        let effective_skip = test.skip.as_ref().or(global_skip.as_ref());
+        if let Some(skip) = effective_skip {
+            let should_skip = match &skip.condition {
+                None => true, // Unconditional skip
+                Some(crate::parser::ast::SkipCondition::Mvcc) => mvcc,
+            };
+            if should_skip {
+                return TestResult {
+                    name: test.name,
+                    file: file_path,
+                    database: db_config,
+                    outcome: TestOutcome::Skipped {
+                        reason: skip.reason.clone(),
+                    },
+                    duration: start.elapsed(),
+                };
+            }
+        }
+
+        // Check required capabilities (global + per-test)
+        for req in global_requires.iter().chain(test.requires.iter()) {
+            if !backend_capabilities.contains(&req.capability) {
+                return TestResult {
+                    name: test.name,
+                    file: file_path,
+                    database: db_config,
+                    outcome: TestOutcome::Skipped {
+                        reason: format!("requires {}: {}", req.capability, req.reason),
+                    },
+                    duration: start.elapsed(),
+                };
+            }
+        }
+
+        // Create database instance
+        let mut db = match backend.create_database(&db_config).await {
+            Ok(db) => db,
+            Err(e) => {
+                return TestResult {
+                    name: test.name,
+                    file: file_path,
+                    database: db_config,
+                    outcome: TestOutcome::Error {
+                        message: format!("failed to create database: {e}"),
+                    },
+                    duration: start.elapsed(),
+                };
+            }
         };
-        if should_skip {
-            return TestResult {
-                name: test.name,
-                file: file_path,
-                database: db_config,
-                outcome: TestOutcome::Skipped {
-                    reason: skip.reason.clone(),
-                },
-                duration: start.elapsed(),
-            };
-        }
-    }
 
-    // Check required capabilities (global + per-test)
-    for req in global_requires.iter().chain(test.requires.iter()) {
-        if !backend_capabilities.contains(&req.capability) {
-            return TestResult {
-                name: test.name,
-                file: file_path,
-                database: db_config,
-                outcome: TestOutcome::Skipped {
-                    reason: format!("requires {}: {}", req.capability, req.reason),
-                },
-                duration: start.elapsed(),
-            };
-        }
-    }
-
-    // Create database instance
-    let mut db = match backend.create_database(&db_config).await {
-        Ok(db) => db,
-        Err(e) => {
-            return TestResult {
-                name: test.name,
-                file: file_path,
-                database: db_config,
-                outcome: TestOutcome::Error {
-                    message: format!("failed to create database: {e}"),
-                },
-                duration: start.elapsed(),
-            };
-        }
-    };
-
-    // Run setups (using execute_setup which buffers for memory databases)
-    for setup_ref in &test.setups {
-        if let Some(setup_sql) = setups.get(&setup_ref.name) {
-            if let Err(e) = db.execute_setup(setup_sql).await {
+        // Run setups (using execute_setup which buffers for memory databases)
+        for setup_ref in &test.setups {
+            if let Some(setup_sql) = setups.get(&setup_ref.name) {
+                if let Err(e) = db.execute_setup(setup_sql).await {
+                    let _ = db.close().await;
+                    return TestResult {
+                        name: test.name,
+                        file: file_path,
+                        database: db_config,
+                        outcome: TestOutcome::Error {
+                            message: format!("setup '{}' failed: {}", setup_ref.name, e),
+                        },
+                        duration: start.elapsed(),
+                    };
+                }
+            } else {
                 let _ = db.close().await;
                 return TestResult {
                     name: test.name,
                     file: file_path,
                     database: db_config,
                     outcome: TestOutcome::Error {
-                        message: format!("setup '{}' failed: {}", setup_ref.name, e),
+                        message: format!("setup '{}' not found", setup_ref.name),
                     },
                     duration: start.elapsed(),
                 };
             }
-        } else {
-            let _ = db.close().await;
-            return TestResult {
-                name: test.name,
-                file: file_path,
-                database: db_config,
-                outcome: TestOutcome::Error {
-                    message: format!("setup '{}' not found", setup_ref.name),
-                },
-                duration: start.elapsed(),
-            };
         }
-    }
 
-    // Execute test SQL
-    let result = match db.execute(&test.sql).await {
-        Ok(r) => r,
-        Err(e) => {
-            let _ = db.close().await;
-            return TestResult {
-                name: test.name,
-                file: file_path,
-                database: db_config,
-                outcome: TestOutcome::Error {
-                    message: format!("execution failed: {e}"),
-                },
-                duration: start.elapsed(),
-            };
+        // Execute test SQL
+        let result = match db.execute(&test.sql).await {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = db.close().await;
+                return TestResult {
+                    name: test.name,
+                    file: file_path,
+                    database: db_config,
+                    outcome: TestOutcome::Error {
+                        message: format!("execution failed: {e}"),
+                    },
+                    duration: start.elapsed(),
+                };
+            }
+        };
+
+        // Close database
+        let _ = db.close().await;
+
+        // Compare result (select expectation based on backend)
+        let expectation = test.expectations.for_backend(backend.backend_type());
+        let comparison = compare(&result, expectation);
+        let outcome = match comparison {
+            ComparisonResult::Match => TestOutcome::Passed,
+            ComparisonResult::Mismatch { reason } => TestOutcome::Failed { reason },
+        };
+
+        TestResult {
+            name: test.name,
+            file: file_path,
+            database: db_config,
+            outcome,
+            duration: start.elapsed(),
         }
     };
 
-    // Close database
-    let _ = db.close().await;
+    match AssertUnwindSafe(test_future).catch_unwind().await {
+        Ok(result) => result,
+        Err(panic_info) => {
+            // Extract panic message
+            let panic_message = if let Some(s) = panic_info.downcast_ref::<&str>() {
+                (*s).to_string()
+            } else if let Some(s) = panic_info.downcast_ref::<String>() {
+                s.clone()
+            } else {
+                "unknown panic".to_string()
+            };
 
-    // Compare result (select expectation based on backend)
-    let expectation = test.expectations.for_backend(backend.backend_type());
-    let comparison = compare(&result, expectation);
-    let outcome = match comparison {
-        ComparisonResult::Match => TestOutcome::Passed,
-        ComparisonResult::Mismatch { reason } => TestOutcome::Failed { reason },
-    };
-
-    TestResult {
-        name: test.name,
-        file: file_path,
-        database: db_config,
-        outcome,
-        duration: start.elapsed(),
+            TestResult {
+                name: test_name,
+                file: file_path_for_panic,
+                database: db_config_for_panic,
+                outcome: TestOutcome::Error {
+                    message: format!("panic: {}", panic_message),
+                },
+                duration: start.elapsed(),
+            }
+        }
     }
 }
 
