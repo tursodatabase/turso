@@ -22,7 +22,6 @@ pub struct Remaining {
     pub drop_index: u32,
     pub pragma_count: u32,
     pub create_matview: u32,
-    pub drop_matview: u32,
     pub enable_cdc: u32,
 }
 
@@ -192,7 +191,7 @@ impl Display for InteractionStats {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "Read: {}, Insert: {}, Delete: {}, Update: {}, Create: {}, CreateIndex: {}, Drop: {}, Begin: {}, Commit: {}, Rollback: {}, Alter Table: {}, Drop Index: {}, CreateMatview: {}, DropMatview: {}",
+            "Read: {}, Insert: {}, Delete: {}, Update: {}, Create: {}, CreateIndex: {}, Drop: {}, Begin: {}, Commit: {}, Rollback: {}, Alter Table: {}, Drop Index: {}, CreateMatview: {}, DropMatview: {}, EnableCDC: {}",
             self.select_count,
             self.insert_count,
             self.delete_count,
@@ -207,6 +206,7 @@ impl Display for InteractionStats {
             self.drop_index_count,
             self.create_matview_count,
             self.drop_matview_count,
+            self.enable_cdc_count,
         )
     }
 }
