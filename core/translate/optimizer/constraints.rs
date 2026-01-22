@@ -178,6 +178,10 @@ const SELECTIVITY_EQ_FALLBACK_UNINDEXED: f64 = 0.1;
 const SELECTIVITY_EQ_FALLBACK_INDEXED: f64 = 0.01;
 /// In lieu of statistics, we estimate that a range filter will reduce the output set to 40% of its size.
 const SELECTIVITY_RANGE_FALLBACK: f64 = 0.4;
+/// IS NULL - null values are typically rare.
+const SELECTIVITY_IS_NULL: f64 = 0.1;
+/// IS NOT NULL - most values are typically not null.
+const SELECTIVITY_IS_NOT_NULL: f64 = 0.9;
 /// In lieu of statistics, we estimate that other filters will reduce the output set to 90% of its size.
 const SELECTIVITY_OTHER: f64 = 0.9;
 
@@ -264,6 +268,8 @@ fn estimate_selectivity(
         | ast::Operator::GreaterEquals
         | ast::Operator::Less
         | ast::Operator::LessEquals => SELECTIVITY_RANGE_FALLBACK,
+        ast::Operator::Is => SELECTIVITY_IS_NULL,
+        ast::Operator::IsNot => SELECTIVITY_IS_NOT_NULL,
         _ => SELECTIVITY_OTHER,
     }
 }
@@ -1168,6 +1174,9 @@ fn opposite_cmp_op(op: ast::Operator) -> ast::Operator {
         ast::Operator::GreaterEquals => ast::Operator::LessEquals,
         ast::Operator::Less => ast::Operator::Greater,
         ast::Operator::LessEquals => ast::Operator::GreaterEquals,
+        ast::Operator::NotEquals => ast::Operator::NotEquals,
+        ast::Operator::Is => ast::Operator::Is,
+        ast::Operator::IsNot => ast::Operator::IsNot,
         _ => panic!("unexpected operator: {op:?}"),
     }
 }

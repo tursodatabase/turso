@@ -3675,10 +3675,13 @@ pub fn as_binary_components(
             if matches!(
                 operator,
                 ast::Operator::Equals
+                    | ast::Operator::NotEquals
                     | ast::Operator::Greater
                     | ast::Operator::Less
                     | ast::Operator::GreaterEquals
                     | ast::Operator::LessEquals
+                    | ast::Operator::Is
+                    | ast::Operator::IsNot
             ) =>
         {
             Ok(Some((lhs.as_ref(), *operator, rhs.as_ref())))
