@@ -27,9 +27,10 @@ cfg_block! {
         pub use PlatformIO as SyscallIO;
     }
 
-    #[cfg(all(target_os  = "windows", not(miri)))] {
+    #[cfg(all(target_os = "windows", not(miri)))] {
         mod win_iocp;
         #[cfg(feature = "fs")]
+        pub use win_iocp::WindowsIOCP;
         pub use win_iocp::WindowsIOCP as PlatformIO;
         pub use PlatformIO as SyscallIO;
     }
