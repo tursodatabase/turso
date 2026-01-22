@@ -1918,10 +1918,10 @@ pub unsafe extern "C" fn sqlite3_wal_checkpoint_v2(
     match db.conn.checkpoint(chkptmode) {
         Ok(res) => {
             if !log_size.is_null() {
-                (*log_size) = res.num_attempted as ffi::c_int;
+                (*log_size) = res.wal_max_frame as ffi::c_int;
             }
             if !checkpoint_count.is_null() {
-                (*checkpoint_count) = res.num_backfilled as ffi::c_int;
+                (*checkpoint_count) = res.wal_checkpoint_backfilled as ffi::c_int;
             }
             SQLITE_OK
         }

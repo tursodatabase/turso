@@ -3433,16 +3433,17 @@ impl Pager {
                     let res = return_if_io!(wal.checkpoint(self, mode));
                     let mut state = self.checkpoint_state.write();
                     if matches!(mode, CheckpointMode::Truncate { .. })
-                        // `everything_backfilled` will be true for successful truncate checkpoint
-                        // as it will be all zeros, and we need to fsync+possibly trunc the db file
-                        && res.everything_backfilled()
+                        // `should_truncate` will be true for successful truncate checkpoint
+                        && res.should_truncate()
                     {
                         state.phase = CheckpointPhase::TruncateDbFile {
                             sync_mode,
                             clear_page_cache,
                             page1_invalidated: false,
                         };
-                    } else if res.num_backfilled == 0 || sync_mode == crate::SyncMode::Off {
+                    } else if res.wal_checkpoint_backfilled == 0
+                        || sync_mode == crate::SyncMode::Off
+                    {
                         state.phase = CheckpointPhase::Finalize { clear_page_cache };
                     } else {
                         state.phase = CheckpointPhase::SyncDbFile { clear_page_cache };
