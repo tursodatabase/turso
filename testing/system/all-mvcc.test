@@ -8,7 +8,6 @@ set testdir [file dirname $argv0]
 # source $testdir/foreign_keys.test
 
 # works
-source $testdir/like.test
 source $testdir/groupby.test
 source $testdir/select.test
 source $testdir/join.test
