@@ -377,8 +377,12 @@ impl Parser {
                 self.advance();
                 Ok(ast::Capability::Strict)
             }
+            Some(Token::MaterializedViews) => {
+                self.advance();
+                Ok(ast::Capability::MaterializedViews)
+            }
             Some(token) => Err(self.error(format!(
-                "expected capability (trigger, strict), got {token}"
+                "expected capability (trigger, strict, materialized_views), got {token}"
             ))),
             None => Err(self.error("expected capability, got EOF".to_string())),
         }

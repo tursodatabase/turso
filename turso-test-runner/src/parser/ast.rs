@@ -52,11 +52,17 @@ pub enum Capability {
     Trigger,
     /// Support for STRICT tables
     Strict,
+    /// Support for MATERIALIZED VIEW (experimental)
+    MaterializedViews,
 }
 
 impl Capability {
     /// All known capability variants
-    pub const ALL: &'static [Capability] = &[Capability::Trigger, Capability::Strict];
+    pub const ALL: &'static [Capability] = &[
+        Capability::Trigger,
+        Capability::Strict,
+        Capability::MaterializedViews,
+    ];
 
     /// Get all capabilities as a HashSet (convenience for backends that support everything)
     pub fn all_set() -> HashSet<Capability> {
@@ -69,6 +75,7 @@ impl Display for Capability {
         match self {
             Capability::Trigger => write!(f, "trigger"),
             Capability::Strict => write!(f, "strict"),
+            Capability::MaterializedViews => write!(f, "materialized_views"),
         }
     }
 }
@@ -80,8 +87,9 @@ impl FromStr for Capability {
         match s {
             "trigger" => Ok(Capability::Trigger),
             "strict" => Ok(Capability::Strict),
+            "materialized_views" => Ok(Capability::MaterializedViews),
             _ => Err(format!(
-                "unknown capability '{s}', valid capabilities are: trigger, strict"
+                "unknown capability '{s}', valid capabilities are: trigger, strict, materialized_views"
             )),
         }
     }

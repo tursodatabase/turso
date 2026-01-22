@@ -110,6 +110,10 @@ pub enum Token {
     #[token("strict")]
     Strict,
 
+    /// `materialized_views` capability keyword
+    #[token("materialized_views")]
+    MaterializedViews,
+
     /// `@backend`
     #[token("@backend")]
     AtBackend,
@@ -214,6 +218,7 @@ impl fmt::Display for Token {
             Token::AtRequiresFile => write!(f, "@requires-file"),
             Token::Trigger => write!(f, "trigger"),
             Token::Strict => write!(f, "strict"),
+            Token::MaterializedViews => write!(f, "materialized_views"),
             Token::AtBackend => write!(f, "@backend"),
             Token::AtIdentifier(s) => write!(f, "@{s}"),
             Token::Setup => write!(f, "setup"),
