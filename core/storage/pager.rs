@@ -3458,7 +3458,9 @@ impl Pager {
                             clear_page_cache,
                             page1_invalidated: false,
                         };
-                    } else if res.num_backfilled == 0 || sync_mode == crate::SyncMode::Off {
+                    } else if res.wal_checkpoint_backfilled == 0
+                        || sync_mode == crate::SyncMode::Off
+                    {
                         state.phase = CheckpointPhase::Finalize { clear_page_cache };
                     } else {
                         state.phase = CheckpointPhase::SyncDbFile { clear_page_cache };

@@ -366,17 +366,17 @@ pub fn op_checkpoint(
             program.connection.get_sync_mode(),
         ));
         let CheckpointResult {
-            num_attempted,
-            num_backfilled,
+            wal_max_frame,
+            wal_total_backfilled,
             ..
         } = pager.io.block(|| ckpt_sm.step(&()))?;
         // https://sqlite.org/pragma.html#pragma_wal_checkpoint
         // 1st col: 1 (checkpoint SQLITE_BUSY) or 0 (not busy).
         state.registers[*dest] = Register::Value(Value::Integer(0));
         // 2nd col: # modified pages written to wal file
-        state.registers[*dest + 1] = Register::Value(Value::Integer(num_attempted as i64));
+        state.registers[*dest + 1] = Register::Value(Value::Integer(wal_max_frame as i64));
         // 3rd col: # pages moved to db after checkpoint
-        state.registers[*dest + 2] = Register::Value(Value::Integer(num_backfilled as i64));
+        state.registers[*dest + 2] = Register::Value(Value::Integer(wal_total_backfilled as i64));
 
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
@@ -388,17 +388,18 @@ pub fn op_checkpoint(
     );
     match step_result {
         Ok(IOResult::Done(CheckpointResult {
-            num_attempted,
-            num_backfilled,
+            wal_max_frame,
+            wal_total_backfilled,
             ..
         })) => {
             // https://sqlite.org/pragma.html#pragma_wal_checkpoint
             // 1st col: 1 (checkpoint SQLITE_BUSY) or 0 (not busy).
             state.registers[*dest] = Register::Value(Value::Integer(0));
             // 2nd col: # modified pages written to wal file
-            state.registers[*dest + 1] = Register::Value(Value::Integer(num_attempted as i64));
+            state.registers[*dest + 1] = Register::Value(Value::Integer(wal_max_frame as i64));
             // 3rd col: # pages moved to db after checkpoint
-            state.registers[*dest + 2] = Register::Value(Value::Integer(num_backfilled as i64));
+            state.registers[*dest + 2] =
+                Register::Value(Value::Integer(wal_total_backfilled as i64));
 
             state.pc += 1;
             Ok(InsnFunctionStepResult::Step)

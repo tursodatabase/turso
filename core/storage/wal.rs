@@ -41,11 +41,13 @@ pub struct RollbackTo {
 
 #[derive(Debug, Clone, Default)]
 pub struct CheckpointResult {
-    /// number of frames in WAL that could have been backfilled
-    pub num_attempted: u64,
-    /// number of frames moved successfully from WAL to db file after checkpoint
-    pub num_backfilled: u64,
-    pub max_frame: u64,
+    /// max frame in the WAL after checkpoint
+    /// note, that as we TRUNCATE wal outside of the main checkpoint routine - this field will be set to non-zero number even for TRUNCATE mode
+    pub wal_max_frame: u64,
+    /// total amount of frames backfilled to the DB file after checkpoint
+    pub wal_total_backfilled: u64,
+    /// amount of new frames backfilled to the DB file during this checkpoint procedure
+    pub wal_checkpoint_backfilled: u64,
     /// In the case of everything backfilled, we need to hold the locks until the db
     /// file is truncated.
     maybe_guard: Option<CheckpointLocks>,
@@ -64,11 +66,15 @@ impl Drop for CheckpointResult {
 }
 
 impl CheckpointResult {
-    pub fn new(n_frames: u64, n_ckpt: u64, max_frame: u64) -> Self {
+    pub fn new(
+        wal_max_frame: u64,
+        wal_total_backfilled: u64,
+        wal_checkpoint_backfilled: u64,
+    ) -> Self {
         Self {
-            num_attempted: n_frames,
-            num_backfilled: n_ckpt,
-            max_frame,
+            wal_max_frame,
+            wal_total_backfilled,
+            wal_checkpoint_backfilled,
             maybe_guard: None,
             db_sync_sent: false,
             db_truncate_sent: false,
@@ -78,7 +84,7 @@ impl CheckpointResult {
     }
 
     pub const fn everything_backfilled(&self) -> bool {
-        self.num_attempted == self.num_backfilled
+        self.wal_max_frame == self.wal_total_backfilled
     }
     pub fn release_guard(&mut self) {
         let _ = self.maybe_guard.take();
@@ -685,9 +691,6 @@ pub struct WalFile {
     last_checksum: RwLock<(u32, u32)>,
     checkpoint_seq: AtomicU32,
     transaction_count: AtomicU64,
-
-    /// Count of possible pages to checkpoint, and number of backfilled
-    prev_checkpoint: RwLock<CheckpointResult>,
 
     /// Manages locks needed for checkpointing
     checkpoint_guard: RwLock<Option<CheckpointLocks>>,
@@ -2068,7 +2071,6 @@ impl WalFile {
             transaction_count: AtomicU64::new(0),
             max_frame_read_lock_index: AtomicUsize::new(NO_LOCK_HELD),
             last_checksum: RwLock::new(last_checksum),
-            prev_checkpoint: RwLock::new(CheckpointResult::default()),
             checkpoint_guard: RwLock::new(None),
             io_ctx: RwLock::new(IOContext::default()),
         }
@@ -2204,21 +2206,14 @@ impl WalFile {
                         let n_backfills = shared.nbackfills.load(Ordering::Acquire);
                         (max_frame, n_backfills)
                     });
+                    tracing::debug!("shared_wal: max_frame={max_frame}, nbackfills={nbackfills}");
                     let needs_backfill = max_frame > nbackfills;
                     if !needs_backfill && !mode.should_restart_log() {
                         // there are no frames to copy over and we don't need to reset
                         // the log so we can return early success.
-                        let prev = self.prev_checkpoint.read();
-                        return Ok(IOResult::Done(CheckpointResult {
-                            num_attempted: prev.num_attempted,
-                            num_backfilled: prev.num_backfilled,
-                            max_frame: nbackfills,
-                            maybe_guard: None,
-                            db_sync_sent: false,
-                            db_truncate_sent: false,
-                            wal_truncate_sent: false,
-                            wal_sync_sent: false,
-                        }));
+                        return Ok(IOResult::Done(CheckpointResult::new(
+                            max_frame, nbackfills, 0,
+                        )));
                     }
                     // acquire the appropriate exclusive locks depending on the checkpoint mode
                     self.acquire_proper_checkpoint_guard(mode)?;
@@ -2411,56 +2406,22 @@ impl WalFile {
                         "checkpoint pending flush must have finished"
                     );
                     let checkpoint_result = self.with_shared(|shared| {
-                        let current_mx = shared.max_frame.load(Ordering::Acquire);
-                        let nbackfills = shared.nbackfills.load(Ordering::Acquire);
+                        let wal_max_frame = shared.max_frame.load(Ordering::Acquire);
+                        let wal_total_backfilled = ongoing_chkpt.max_frame;
                         // Record two num pages fields to return as checkpoint result to caller.
                         // Ref: pnLog, pnCkpt on https://www.sqlite.org/c3ref/wal_checkpoint_v2.html
 
-                        // the total # of frames we could have possibly backfilled
-                        let frames_possible = current_mx.saturating_sub(nbackfills);
-
                         // the total # of frames we actually backfilled
-                        let checkpoint_max_frame = ongoing_chkpt.max_frame;
-                        let frames_checkpointed =
-                            checkpoint_max_frame.saturating_sub(ongoing_chkpt.min_frame - 1);
+                        let wal_checkpoint_backfilled =
+                            wal_total_backfilled.saturating_sub(ongoing_chkpt.min_frame - 1);
 
-                        tracing::debug!("checkpoint: frames_checkpointed={frames_checkpointed}");
+                        tracing::debug!(
+                            "checkpoint: wal_max_frame={wal_max_frame}, wal_total_backfilled={wal_total_backfilled}, wal_checkpoint_backfilled={wal_checkpoint_backfilled}"
+                        );
 
-                        if matches!(mode, CheckpointMode::Truncate { .. }) {
-                            // SQLite returns zeros for TRUNCATE mode on success, but we must
-                            // first verify we actually checkpointed everything. If not, we need
-                            // to return a result that will fail the everything_backfilled() check.
-                            // This prevents truncating the WAL when active readers prevented us
-                            // from checkpointing all frames.
-                            if checkpoint_max_frame < current_mx {
-                                // We didn't checkpoint everything - return actual counts so the
-                                // require_all_backfilled check will fail and return SQLITE_BUSY
-                                CheckpointResult::new(
-                                    frames_possible,
-                                    frames_checkpointed,
-                                    checkpoint_max_frame,
-                                )
-                            } else {
-                                // Success - return zeros per SQLite spec
-                                CheckpointResult::default()
-                            }
-                        } else if frames_checkpointed == 0
-                            && matches!(mode, CheckpointMode::Restart)
-                        // if we restarted the log but didn't backfill pages we still have to
-                        // return the last checkpoint result.
-                        {
-                            self.prev_checkpoint.read().clone()
-                        } else {
-                            // otherwise return the normal result of the total # of possible frames
-                            // we could have backfilled, and the number we actually did.
-                            CheckpointResult::new(
-                                frames_possible,
-                                frames_checkpointed,
-                                checkpoint_max_frame,
-                            )
-                        }
+                        CheckpointResult::new(wal_max_frame, wal_total_backfilled, wal_checkpoint_backfilled)
                     });
-                    tracing::debug!("checkpoint_result={:?}", checkpoint_result);
+                    tracing::debug!("checkpoint_result={:?}, mode={:?}", checkpoint_result, mode);
 
                     // store the max frame we were able to successfully checkpoint.
                     // NOTE: we don't have a .shm file yet, so it's safe to update nbackfills here
@@ -2511,10 +2472,7 @@ impl WalFile {
                     // increment wal epoch to ensure no stale pages are used for backfilling
                     self.increment_checkpoint_epoch();
 
-                    // store a copy of the checkpoint result to return in the future if pragma
-                    // wal_checkpoint is called and we haven't backfilled again since.
-                    *self.prev_checkpoint.write() = checkpoint_result.clone();
-
+                    tracing::debug!("checkpoint_result={:?}", checkpoint_result);
                     // we cannot truncate the db file here because we are currently inside a
                     // mut borrow of pager.wal, and accessing the header will attempt a borrow
                     // during 'read_page', so the caller will use the result to determine if:
@@ -2522,7 +2480,7 @@ impl WalFile {
                     // b. the physical db file size differs from the expected pages * page_size
                     // and truncate + sync the db file if necessary.
                     if checkpoint_result.everything_backfilled()
-                        && checkpoint_result.num_backfilled > 0
+                        && checkpoint_result.wal_total_backfilled > 0
                     {
                         checkpoint_result.maybe_guard = self.checkpoint_guard.write().take();
                     } else {
@@ -2704,6 +2662,9 @@ impl WalFile {
             });
             let c = file.truncate(0, c)?;
             result.wal_truncate_sent = true;
+            // after truncation - there will be nothing in the WAL
+            result.wal_max_frame = 0;
+            result.wal_total_backfilled = 0;
             io_yield_one!(c);
         } else if !result.wal_sync_sent {
             let c = file.sync(Completion::new_sync(move |res| {
