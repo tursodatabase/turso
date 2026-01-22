@@ -6926,10 +6926,7 @@ pub fn op_idx_insert(
             // HOWEVER: If the record contains NULLs, NoConflict skips the seek entirely
             // (since NULLs can't conflict), so we must fall back to seeking here.
             if flags.has(IdxInsertFlags::USE_SEEK) {
-                let contains_nulls = record_to_insert
-                    .iter()?
-                    .any(|val| matches!(val, Ok(ValueRef::Null)));
-                if !contains_nulls {
+                if !record_to_insert.contains_null()? {
                     state.op_idx_insert_state = OpIdxInsertState::Insert;
                     return Ok(InsnFunctionStepResult::Step);
                 }
