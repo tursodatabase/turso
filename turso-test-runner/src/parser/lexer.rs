@@ -4,14 +4,23 @@ use std::fmt;
 
 /// Extract block content between braces, handling nested braces and escape sequences
 /// Use `\}` to include a literal `}` that doesn't close the block
-/// Note: Does NOT trim content - trimming is handled by the parser based on context
+/// Strips structural newlines: first newline after `{` and last newline before `}`
 fn extract_block_content(lexer: &mut Lexer<'_, Token>) -> Option<String> {
     let remainder = lexer.remainder();
     let mut depth = 1;
     let mut chars = remainder.char_indices().peekable();
     let mut content = String::new();
+    let mut is_first_char = true;
 
     while let Some((idx, ch)) = chars.next() {
+        // Skip first character if it's a newline (structural, after `{`)
+        if is_first_char {
+            is_first_char = false;
+            if ch == '\n' {
+                continue;
+            }
+        }
+
         match ch {
             '\\' => {
                 // Escape sequence: check next character
@@ -35,6 +44,10 @@ fn extract_block_content(lexer: &mut Lexer<'_, Token>) -> Option<String> {
                 if depth == 0 {
                     // Bump past the content and the closing brace
                     lexer.bump(idx + 1);
+                    // Strip trailing newline if present (structural, before `}`)
+                    if content.ends_with('\n') {
+                        content.pop();
+                    }
                     return Some(content);
                 }
                 content.push(ch);

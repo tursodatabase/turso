@@ -339,22 +339,14 @@ impl Parser {
             Some(Token::Raw) => {
                 self.advance();
                 let content = self.expect_block_content()?;
-                // Raw mode: preserve whitespace exactly, only split on newlines
-                // We still strip the leading/trailing newlines from the block itself
-                let content = content.strip_prefix('\n').unwrap_or(&content);
-                let content = content.strip_suffix('\n').unwrap_or(content);
-                let rows = content.lines().map(|s| s.to_string()).collect();
+                // Raw mode: preserve whitespace exactly
+                let rows = content.split('\n').map(|s| s.to_string()).collect();
                 Ok(Expectation::Exact(rows))
             }
             Some(Token::BlockContent(_)) => {
                 let content = self.expect_block_content()?;
-                // Trim each line to handle indentation in expect blocks
-                let rows = content
-                    .trim()
-                    .lines()
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect();
+                // Trim each line for indentation, but preserve empty lines (for NULL values)
+                let rows = content.split('\n').map(|s| s.trim().to_string()).collect();
                 Ok(Expectation::Exact(rows))
             }
             Some(token) => {
