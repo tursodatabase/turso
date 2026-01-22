@@ -19,6 +19,13 @@ fn extract_table_order(eqp_rows: &[Vec<Value>]) -> Vec<String> {
     tables
 }
 
+fn plan_has_detail(eqp_rows: &[Vec<Value>], needle: &str) -> bool {
+    eqp_rows.iter().any(|row| match &row[3] {
+        Value::Text(detail) => detail.contains(needle),
+        _ => false,
+    })
+}
+
 #[test]
 fn auto_analyze_disabled_by_default() -> anyhow::Result<()> {
     let tmp_db = TempDatabase::new_empty();
@@ -83,6 +90,69 @@ fn auto_analyze_disable_clears_stats() -> anyhow::Result<()> {
     conn.execute("PRAGMA autoanalyze = 1")?;
     let stats = conn.auto_analyze_stats_snapshot().expect("autoanalyze enabled");
     assert_eq!(stats.row_count("t"), None);
+
+    Ok(())
+}
+
+#[test]
+fn auto_analyze_index_full_scan_updates_row_count() -> anyhow::Result<()> {
+    let tmp_db = TempDatabase::new_empty();
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("PRAGMA autoanalyze = 1")?;
+    conn.execute("CREATE TABLE t (a INTEGER, b INTEGER)")?;
+    conn.execute("CREATE INDEX idx_t_a ON t(a)")?;
+    conn.execute("INSERT INTO t SELECT value, value * 10 FROM generate_series(1, 2000)")?;
+
+    let query = "SELECT a FROM t ORDER BY a";
+    let eqp_rows = limbo_exec_rows(&conn, &format!("EXPLAIN QUERY PLAN {query}"));
+    assert!(
+        plan_has_detail(&eqp_rows, "USING COVERING INDEX idx_t_a"),
+        "expected covering index scan, got {eqp_rows:?}"
+    );
+
+    let rows: Vec<(i64,)> = conn.exec_rows(query);
+    assert_eq!(rows.len(), 2000);
+    assert_eq!(rows.first().copied(), Some((1,)));
+    assert_eq!(rows.last().copied(), Some((2000,)));
+
+    let stats = conn.auto_analyze_stats_snapshot().expect("autoanalyze enabled");
+    assert_eq!(stats.row_count("t"), Some(2000));
+
+    Ok(())
+}
+
+#[test]
+fn auto_analyze_index_range_scan_tracks_rows() -> anyhow::Result<()> {
+    let tmp_db = TempDatabase::new_empty();
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("PRAGMA autoanalyze = 1")?;
+    conn.execute("CREATE TABLE t (a INTEGER)")?;
+    conn.execute("CREATE INDEX idx_t_a ON t(a)")?;
+    conn.execute("INSERT INTO t SELECT value FROM generate_series(1, 2000)")?;
+
+    let query = "SELECT a FROM t WHERE a = 300";
+    let eqp_rows = limbo_exec_rows(&conn, &format!("EXPLAIN QUERY PLAN {query}"));
+    assert!(
+        plan_has_detail(&eqp_rows, "SEARCH t USING INDEX idx_t_a"),
+        "expected index range scan, got {eqp_rows:?}"
+    );
+
+    let rows: Vec<(i64,)> = conn.exec_rows(query);
+    assert_eq!(rows, vec![(300,)]);
+
+    let stats = conn.auto_analyze_stats_snapshot().expect("autoanalyze enabled");
+    assert_eq!(stats.row_count("t"), None);
+    let range_count = stats
+        .index_range_row_count("idx_t_a")
+        .expect("expected range scan count");
+    let expected_min = rows.len() as u64;
+    let expected_max = expected_min.saturating_add(1);
+    assert!(
+        range_count >= expected_min && range_count <= expected_max,
+        "expected range scan count between {expected_min} and {expected_max}, got {range_count}"
+    );
 
     Ok(())
 }
