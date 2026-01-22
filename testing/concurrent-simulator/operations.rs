@@ -141,7 +141,7 @@ impl Operation {
             Operation::Update { .. } => {
                 ctx.stats.updates += 1;
             }
-            Operation::IntegrityCheck { .. } => {
+            Operation::IntegrityCheck => {
                 ctx.stats.integrity_checks += 1;
             }
             Operation::CreateIndex {

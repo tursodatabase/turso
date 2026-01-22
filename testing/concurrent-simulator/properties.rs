@@ -12,6 +12,7 @@ use crate::operations::{OpResult, Operation};
 pub trait Property: Send + Sync {
     /// Called when an operation finishes execution.
     /// Can perform validation and return an error if invariant is violated.
+    #[allow(clippy::too_many_arguments)]
     fn finish_op(
         &mut self,
         _step: usize,
@@ -27,6 +28,12 @@ pub trait Property: Send + Sync {
 pub struct SimpleKeysDoNotDisappear {
     pub txn: HashMap<Option<u64>, u64>,
     pub simple_keys: HashMap<Option<u64>, HashMap<(String, String), u64>>,
+}
+
+impl Default for SimpleKeysDoNotDisappear {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SimpleKeysDoNotDisappear {
