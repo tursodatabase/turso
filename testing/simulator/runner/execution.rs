@@ -28,6 +28,7 @@ use crate::{
         },
     },
 };
+use sql_generation::model::query::pragma::Pragma;
 
 use super::env::{SimConnection, SimulatorEnv};
 
@@ -41,6 +42,10 @@ fn translate_query_for_rusqlite(query: &Query) -> Option<Query> {
         }
         Query::DropMaterializedView(drop_matview) => {
             Some(Query::DropView(drop_matview.to_regular_drop_view()))
+        }
+        Query::Pragma(Pragma::CaptureDataChanges(_)) => {
+            // CDC pragma not supported in rusqlite, skip it
+            None
         }
         other => Some(other.clone()),
     }
