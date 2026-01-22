@@ -136,8 +136,14 @@ pub enum BackendError {
 pub fn parse_list_output(output: &str) -> Vec<Vec<String>> {
     output
         .lines()
-        .filter(|line| !line.is_empty())
-        .map(|line| line.split('|').map(|s| s.to_string()).collect())
+        .map(|line| {
+            if line.is_empty() {
+                // Empty line represents a row with a single empty cell (NULL)
+                vec!["".to_string()]
+            } else {
+                line.split('|').map(|s| s.to_string()).collect()
+            }
+        })
         .collect()
 }
 
