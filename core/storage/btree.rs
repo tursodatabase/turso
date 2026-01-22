@@ -6995,7 +6995,9 @@ fn page_insert_array(
     // The new cell pointers will extend the cell pointer array by `total_ptr_space`
     // The new cell content will reduce cell_content_area by `total_payload_size`
     let new_unallocated_start = unallocated_start + total_ptr_space;
-    let new_cell_content_area = cell_content_area - total_payload_size;
+    let new_cell_content_area = cell_content_area
+        .checked_sub(total_payload_size)
+        .ok_or_else(|| LimboError::Corrupt("page_insert_array: payload underflow".to_string()))?;
 
     turso_assert!(
         new_unallocated_start <= new_cell_content_area,
@@ -7033,7 +7035,9 @@ fn page_insert_array(
         let cell_size = payload.len().max(MINIMUM_CELL_SIZE);
 
         // Allocate space for this cell (grow content area downward)
-        cell_content_area -= cell_size;
+        cell_content_area = cell_content_area.checked_sub(cell_size).ok_or_else(|| {
+            LimboError::Corrupt("page_insert_array: cell allocation underflow".to_string())
+        })?;
 
         // Copy cell payload
         buf[cell_content_area..cell_content_area + payload.len()].copy_from_slice(payload);
