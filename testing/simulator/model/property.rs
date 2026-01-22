@@ -33,8 +33,6 @@ pub enum Property {
         queries: Vec<Query>,
         /// The select query
         select: Select,
-        /// Interactive query information if any
-        interactive: Option<InteractiveQueryInfo>,
     },
     /// ReadYourUpdatesBack verifies UPDATE behavior for both success and failure cases.
     ///
@@ -186,12 +184,6 @@ pub enum Property {
     Queries {
         queries: Vec<Query>,
     },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct InteractiveQueryInfo {
-    pub start_with_immediate: bool,
-    pub end_with_commit: bool,
 }
 
 impl Property {

@@ -3,6 +3,7 @@ use crate::generation::{
     ArbitrarySized, GenerationContext, InsertOpts,
 };
 use crate::model::query::alter_table::{AlterTable, AlterTableType, AlterTableTypeDiscriminants};
+use crate::model::query::insert::ConflictAction;
 use crate::model::query::predicate::Predicate;
 use crate::model::query::select::{
     CompoundOperator, CompoundSelect, Distinctness, FromClause, OrderBy, ResultColumn, SelectBody,
@@ -243,6 +244,21 @@ impl Arbitrary for Select {
     }
 }
 
+/// Generate an optional conflict action with ~20% probability.
+/// Only generates REPLACE or IGNORE as these are the most commonly used.
+fn maybe_conflict_action<R: Rng + ?Sized>(rng: &mut R) -> Option<ConflictAction> {
+    if rng.random_bool(0.2) {
+        // Prefer REPLACE (for IVM bug testing) but also generate IGNORE
+        Some(if rng.random_bool(0.7) {
+            ConflictAction::Replace
+        } else {
+            ConflictAction::Ignore
+        })
+    } else {
+        None
+    }
+}
+
 impl Arbitrary for Insert {
     fn arbitrary<R: Rng + ?Sized, C: GenerationContext>(rng: &mut R, env: &C) -> Self {
         let insert_opts = &env.opts().query.insert;
@@ -294,6 +310,7 @@ impl Arbitrary for Insert {
             Some(Insert::Select {
                 table: table.name.clone(),
                 select: Box::new(select),
+                conflict: maybe_conflict_action(rng),
             })
         };
 
@@ -311,6 +328,7 @@ impl Arbitrary for Insert {
             Some(Insert::Select {
                 table: select_table.name.clone(),
                 select: Box::new(select),
+                conflict: maybe_conflict_action(rng),
             })
         };
 
@@ -382,6 +400,7 @@ fn gen_insert_values<R: Rng + ?Sized, C: GenerationContext>(
         table: table.name.clone(),
         values,
         on_conflict: None,
+        conflict: None,
     })
 }
 
@@ -553,6 +572,7 @@ fn gen_insert_upsert_values<R: Rng + ?Sized, C: GenerationContext>(
             target_column: target_col.name.clone(),
             assignments,
         }),
+        conflict: None,
     })
 }
 

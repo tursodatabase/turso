@@ -622,7 +622,7 @@ impl Shadow for Insert {
     //FIXME this doesn't handle type affinity
     fn shadow(&self, tables: &mut ShadowTablesMut) -> Self::Result {
         match self {
-            Insert::Select { table, select } => {
+            Insert::Select { table, select, .. } => {
                 let table_name = table.clone();
                 let raw_rows = select.shadow(tables)?;
 
@@ -645,6 +645,7 @@ impl Shadow for Insert {
                 table,
                 values,
                 on_conflict,
+                ..
             } => {
                 let table_name = table.clone();
 
