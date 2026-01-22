@@ -1,3 +1,4 @@
+use branches::{likely, mark_unlikely, unlikely};
 use crate::error::SQLITE_CONSTRAINT_UNIQUE;
 use crate::function::AlterTableFunc;
 use crate::mvcc::cursor::{MvccCursorType, NextRowidResult};
@@ -714,7 +715,7 @@ pub fn op_comparison(
     let rhs_value = state.registers[rhs].get_value();
 
     // Fast path for integers
-    if matches!(lhs_value, Value::Integer(_)) && matches!(rhs_value, Value::Integer(_)) {
+    if likely(matches!(lhs_value, Value::Integer(_)) && matches!(rhs_value, Value::Integer(_))) {
         if op.compare(lhs_value, rhs_value, collation) {
             state.pc = target_pc.as_offset_int();
         } else {
@@ -724,7 +725,8 @@ pub fn op_comparison(
     }
 
     // Handle NULL values
-    if matches!(lhs_value, Value::Null) || matches!(rhs_value, Value::Null) {
+    // NULLs are rare in well-populated tables but common in outer joins
+    if unlikely(matches!(lhs_value, Value::Null) || matches!(rhs_value, Value::Null)) {
         let cmp_res = op.compare_nulls(lhs_value, rhs_value, null_eq);
         let jump = match op {
             ComparisonOp::Eq => cmp_res || (!null_eq && jump_if_null),
@@ -1172,6 +1174,7 @@ pub fn op_vupdate(
             state.pc += 1;
         }
         Err(e) => {
+            mark_unlikely();
             // virtual table update failed
             return Err(LimboError::ExtensionError(format!(
                 "Virtual table update failed: {e}"
@@ -1496,7 +1499,7 @@ pub fn op_column(
                             );
                             let cursor = cursor_ref.as_btree_mut();
 
-                            if cursor.get_null_flag() {
+                            if unlikely(cursor.get_null_flag()) {
                                 tracing::trace!("op_column(null_flag)");
                                 state.registers[*dest] = Register::Value(Value::Null);
                                 break 'outer;

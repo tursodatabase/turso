@@ -1,5 +1,6 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
+use branches::mark_unlikely;
 use crate::sync::Mutex;
 use crate::sync::OnceLock;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -1123,6 +1124,7 @@ impl Wal for WalFile {
                 TryBeginReadResult::Retry => {
                     cnt += 1;
                     if cnt > 100 {
+                        mark_unlikely();
                         return Err(LimboError::Busy);
                     }
                     // Progressive backoff: first 5 retries are immediate, then we

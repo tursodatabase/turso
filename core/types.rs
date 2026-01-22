@@ -1,4 +1,4 @@
-use branches::{mark_unlikely, unlikely};
+use branches::{likely, mark_unlikely, unlikely};
 use either::Either;
 #[cfg(feature = "serde")]
 use serde::Deserialize;
@@ -2078,7 +2078,8 @@ where
     let (first_serial_type, _) = read_varint(&payload[offset_1st_serialtype..])?;
 
     let serialtype_is_integer = matches!(first_serial_type, 1..=6 | 8 | 9);
-    if !serialtype_is_integer {
+    if unlikely(!serialtype_is_integer) {
+        mark_unlikely();
         return compare_records_generic(serialized, unpacked, index_info, 0, tie_breaker);
     }
 
@@ -2173,7 +2174,8 @@ where
     let (first_serial_type, _) = read_varint(&payload[offset_1st_serialtype..])?;
 
     let serialtype_is_string = first_serial_type >= 13 && (first_serial_type & 1) == 1;
-    if !serialtype_is_string {
+    if unlikely(!serialtype_is_string) {
+        mark_unlikely();
         return compare_records_generic(serialized, unpacked, index_info, 0, tie_breaker);
     }
 
@@ -2341,7 +2343,7 @@ where
             SortOrder::Desc => comparison.reverse(),
         };
 
-        if final_comparison != std::cmp::Ordering::Equal {
+        if likely(final_comparison != std::cmp::Ordering::Equal) {
             return Ok(final_comparison);
         }
 

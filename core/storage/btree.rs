@@ -1,3 +1,4 @@
+use branches::{likely, unlikely};
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 use tracing::{instrument, Level};
@@ -1005,7 +1006,7 @@ impl BTreeCursor {
                 let cell_idx = self.stack.current_cell_index();
                 let cell_count = contents.cell_count();
                 let is_leaf = contents.is_leaf();
-                if cell_idx != -1 && is_leaf && cell_idx as usize + 1 < cell_count {
+                if likely(cell_idx != -1 && is_leaf && cell_idx as usize + 1 < cell_count) {
                     self.stack.advance();
                     return Ok(IOResult::Done(true));
                 }
@@ -1756,7 +1757,7 @@ impl BTreeCursor {
         let min = state.min_cell_idx;
         let max = state.max_cell_idx;
         let target_cell_when_not_found = state.target_cell_when_not_found;
-        if min > max {
+        if unlikely(min > max) {
             if let Some(nearest_matching_cell) = state.nearest_matching_cell {
                 self.stack.set_cell_index(nearest_matching_cell as i32);
                 self.set_has_record(true);
@@ -1795,7 +1796,7 @@ impl BTreeCursor {
         };
 
         // rowids are unique, so we can return the rowid immediately
-        if found && seek_op.eq_only() {
+        if unlikely(found && seek_op.eq_only()) {
             self.stack.set_cell_index(cur_cell_idx as i32);
             self.set_has_record(true);
             return Ok(ControlFlow::Break(IOResult::Done(SeekResult::Found)));
@@ -1986,7 +1987,7 @@ impl BTreeCursor {
         let min = state.min_cell_idx;
         let max = state.max_cell_idx;
         let eq_seen = state.eq_seen;
-        if min > max {
+        if unlikely(min > max) {
             if let Some(nearest_matching_cell) = state.nearest_matching_cell {
                 self.stack.set_cell_index(nearest_matching_cell as i32);
                 self.set_has_record(true);
@@ -2024,7 +2025,8 @@ impl BTreeCursor {
             .unwrap()
             .cell_index_read_payload_ptr(cur_cell_idx as usize, self.usable_space())?;
 
-        if let Some(next_page) = first_overflow_page {
+        if unlikely(first_overflow_page.is_some()) {
+            let next_page = first_overflow_page.unwrap();
             let res = self.process_overflow_read(payload, next_page, payload_size)?;
             if let IOResult::IO(io) = res {
                 return Ok(ControlFlow::Break(IOResult::IO(io)));

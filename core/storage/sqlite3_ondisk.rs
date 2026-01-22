@@ -1184,6 +1184,8 @@ pub fn read_varint(buf: &[u8]) -> Result<(u64, usize)> {
             }
         }
     }
+    // 9-byte varints are extremely rare - only needed for values >= 1<<56
+    branches::mark_unlikely();
     match buf.get(8) {
         Some(&c) => {
             // Values requiring 9 bytes must have non-zero in the top 8 bits (value >= 1<<56).
