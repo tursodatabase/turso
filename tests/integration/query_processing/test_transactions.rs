@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use turso_core::{Connection, LimboError, Result, Statement, StepResult, Value};
 
-use crate::common::TempDatabase;
+use crate::common::{assert_checkpoint_preserves_content, TempDatabase};
 
 // Test a scenario where there are two concurrent deferred transactions:
 //
@@ -220,8 +220,8 @@ fn test_deferred_fk_violation_rollback_in_autocommit(tmp_db: TempDatabase) {
     let result = conn.execute("INSERT INTO child VALUES(1,1)");
     assert!(matches!(result, Err(LimboError::ForeignKeyConstraint(_))));
 
-    // Do a truncating checkpoint
-    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    // Do a truncating checkpoint with dbhash verification
+    assert_checkpoint_preserves_content(&conn, &tmp_db);
 
     // Verify that the child table is empty (the insert was rolled back)
     let stmt = conn.query("SELECT COUNT(*) FROM child").unwrap().unwrap();

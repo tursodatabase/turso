@@ -464,6 +464,46 @@ pub fn rusqlite_integrity_check(db_path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Compute dbhash of the test database.
+pub fn compute_dbhash(tmp_db: &TempDatabase) -> turso_dbhash::DbHashResult {
+    let path = tmp_db.path.to_str().unwrap();
+    turso_dbhash::hash_database(
+        path,
+        &turso_dbhash::DbHashOptions {
+            ..Default::default()
+        },
+    )
+    .expect("dbhash failed")
+}
+
+/// Compute dbhash with custom options.
+#[allow(dead_code)]
+pub fn compute_dbhash_with_options(
+    tmp_db: &TempDatabase,
+    options: &turso_dbhash::DbHashOptions,
+) -> turso_dbhash::DbHashResult {
+    let path = tmp_db.path.to_str().unwrap();
+    turso_dbhash::hash_database(path, options).expect("dbhash failed")
+}
+
+/// Assert that checkpoint does not change database content.
+/// Computes hash before and after checkpoint, asserts they match.
+pub fn assert_checkpoint_preserves_content(conn: &Arc<Connection>, tmp_db: &TempDatabase) {
+    do_flush(conn, tmp_db).unwrap();
+    let hash_before = compute_dbhash(tmp_db);
+
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    do_flush(conn, tmp_db).unwrap();
+    let hash_after = compute_dbhash(tmp_db);
+
+    assert_eq!(
+        hash_before.hash, hash_after.hash,
+        "Checkpoint changed database content! before={}, after={}",
+        hash_before.hash, hash_after.hash
+    );
+}
+
 pub trait ExecRows<T> {
     #[allow(dead_code)]
     fn exec_rows(&self, query: &str) -> Vec<T>;

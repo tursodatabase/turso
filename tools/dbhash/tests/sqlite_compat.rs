@@ -31,7 +31,9 @@ fn sqlite_dbhash(path: &str, args: &[&str]) -> String {
     let mut cmd = Command::new("dbhash");
     cmd.args(args).arg(path);
 
-    let output = cmd.output().expect("dbhash command failed - is it installed?");
+    let output = cmd
+        .output()
+        .expect("dbhash command failed - is it installed?");
     assert!(output.status.success(), "dbhash returned non-zero status");
 
     let stdout = String::from_utf8_lossy(&output.stdout);

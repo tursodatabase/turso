@@ -1091,6 +1091,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "turso",
+ "turso-dbhash",
  "turso_core",
  "turso_macros",
  "turso_parser",
