@@ -160,7 +160,7 @@ pub fn handle_distinct(
             hash_table_id: distinct_ctx.hash_table_id,
             key_start_reg: agg_arg_reg,
             num_keys: num_regs,
-            collations: distinct_ctx.collations.clone(),
+            collations: distinct_ctx.collations.clone().into(),
             target_pc: distinct_ctx.label_on_conflict,
         }),
     });

@@ -22,6 +22,7 @@ use crate::vdbe::insn::Insn;
 use crate::Connection;
 use crate::{vdbe::builder::ProgramBuilder, Result};
 use turso_parser::ast::ResultColumn;
+use turso_parser::ast::SortOrder;
 use turso_parser::ast::{self, CompoundSelect, Expr};
 
 pub struct TranslateSelectResult {
@@ -429,6 +430,7 @@ fn prepare_one_select_plan(
 
                     plan.group_by = Some(GroupBy {
                         sort_order: None,
+                        order_by_eliminated: false,
                         exprs: group_by.exprs.iter().map(|expr| *expr.clone()).collect(),
                         having: having_predicates,
                     });
@@ -436,6 +438,7 @@ fn prepare_one_select_plan(
                     // HAVING without GROUP BY: treat as ungrouped aggregation with filter
                     plan.group_by = Some(GroupBy {
                         sort_order: None,
+                        order_by_eliminated: false,
                         exprs: vec![],
                         having: having_predicates,
                     });
@@ -486,6 +489,11 @@ fn prepare_one_select_plan(
                     &plan.aggregates,
                     resolver,
                 ));
+            }
+            if let Some(group_by) = &mut plan.group_by {
+                if group_by.sort_order.is_none() && !group_by.exprs.is_empty() {
+                    group_by.sort_order = Some(vec![SortOrder::Asc; group_by.exprs.len()]);
+                }
             }
 
             // Parse the LIMIT/OFFSET clause

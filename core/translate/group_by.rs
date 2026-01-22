@@ -1,3 +1,4 @@
+use smallvec::SmallVec;
 use turso_parser::ast::{self, SortOrder};
 
 use super::{
@@ -8,26 +9,30 @@ use super::{
     result_row::emit_select_result,
 };
 use crate::translate::{
-    aggregation::{translate_aggregation_step, AggArgumentSource},
-    plan::Aggregate,
-};
-use crate::translate::{
     emitter::Resolver,
     expr::{walk_expr, WalkControl},
     optimizer::Optimizable,
 };
+use crate::{function::AggFunc, translate::plan::ResultSetColumn, types::KeyInfo};
 use crate::{
     schema::PseudoCursorType,
     translate::collate::{get_collseq_from_expr, CollationSeq},
     util::exprs_are_equivalent,
     vdbe::{
         builder::{CursorType, ProgramBuilder},
-        insn::Insn,
+        execute::hash_agg_payload_len,
+        insn::{HashAggNextData, Insn},
         BranchOffset,
     },
     Result,
 };
-use crate::{translate::plan::ResultSetColumn, types::KeyInfo};
+use crate::{
+    translate::{
+        aggregation::{translate_aggregation_step, AggArgumentSource},
+        plan::Aggregate,
+    },
+    LimboError,
+};
 
 /// Labels needed for various jumps in GROUP BY handling.
 #[derive(Debug)]
@@ -131,7 +136,169 @@ pub fn init_group_by<'a>(
     let column_count = plan.agg_args_count() + t_ctx.non_aggregate_expressions.len();
     let reg_group_by_source_cols_start = program.alloc_registers(column_count);
 
-    let row_source = if let Some(sort_order) = group_by.sort_order.as_ref() {
+    let can_use_hash_aggregation = 'hash_agg: {
+        if std::env::var("TURSO_DISABLE_HASH_AGG").is_ok() {
+            break 'hash_agg false;
+        }
+        // If ORDER BY was eliminated because GROUP BY sorting provides the order, hash agg
+        // cannot be used (correctness). If rows are already in GROUP BY order, sort-stream
+        // is preferred anyway (efficiency: no hash table overhead, streaming output, no spilling).
+        if group_by.order_by_eliminated || group_by.sort_order.is_none() {
+            break 'hash_agg false;
+        }
+        if plan.aggregates.is_empty() {
+            break 'hash_agg false;
+        }
+        // Hash aggregation requires non-agg expressions == GROUP BY keys (bidirectional).
+        // This ensures the register layout works: GROUP BY keys occupy [key_start_reg, key_start_reg + key_count).
+        let all_non_aggs_in_group_by = t_ctx
+            .non_aggregate_expressions
+            .iter()
+            .all(|(expr, _)| group_by.exprs.iter().any(|g| exprs_are_equivalent(expr, g)));
+        let all_group_by_in_non_aggs = group_by.exprs.iter().all(|g| {
+            t_ctx
+                .non_aggregate_expressions
+                .iter()
+                .any(|(expr, _)| exprs_are_equivalent(expr, g))
+        });
+        if !all_non_aggs_in_group_by || !all_group_by_in_non_aggs {
+            break 'hash_agg false;
+        }
+
+        // Some aggregate functions are currently not supported by hash aggregation, reasons below.
+        if plan.aggregates.iter().any(|agg| match agg.func {
+            //GroupConcat/StringAgg: merging requires the delimiter (e.g. ',') but the
+            // payload only stores the accumulated string, not the delimiter. To merge
+            // "a,b" and "c" we'd need to know the delimiter was ',' to produce "a,b,c".
+            AggFunc::GroupConcat | AggFunc::StringAgg => true,
+            // External aggregates: FFI state from extensions cannot be serialized to disk
+            // or merged across processes - there's no way to access the internal state.
+            AggFunc::External(_) => true,
+            // JSON aggregates: payload stores raw JSONB bytes that represent partial arrays/objects.
+            // Merging two JSONB blobs (e.g. [1,2] and [3]) requires parsing the header bytes
+            // to understand element counts/offsets, then concatenating correctly. Not implemented.
+            #[cfg(feature = "json")]
+            AggFunc::JsonGroupObject
+            | AggFunc::JsonbGroupObject
+            | AggFunc::JsonGroupArray
+            | AggFunc::JsonbGroupArray => true,
+            _ => false,
+        }) {
+            break 'hash_agg false;
+        }
+
+        true
+    };
+
+    let row_source = if can_use_hash_aggregation {
+        // Main hash table for GROUP BY key -> Aggregate payload values.
+        let hash_table_id = program.alloc_hash_table_id();
+        // Starting register where GROUP BY key values are stored during the build phase.
+        let key_start_reg = reg_group_by_source_cols_start;
+        // Number of GROUP BY key expressions.
+        let key_count = group_by.exprs.len();
+        // Collation sequence for each GROUP BY key, used for hashing and equality comparison.
+        let key_collations: SmallVec<[CollationSeq; 2]> = group_by
+            .exprs
+            .iter()
+            .map(|expr| {
+                get_collseq_from_expr(expr, &plan.table_references).map(|c| c.unwrap_or_default())
+            })
+            .collect::<Result<_>>()?;
+        // Starting register for arguments of each aggregate function (parallel to `agg_funcs`).
+        let agg_args_start = reg_group_by_source_cols_start + t_ctx.non_aggregate_expressions.len();
+        // Starting register for arguments of each aggregate function (parallel to `agg_funcs`).
+        let mut agg_arg_start_regs = SmallVec::with_capacity(plan.aggregates.len());
+        // Number of arguments for each aggregate function (parallel to `agg_funcs`).
+        let mut agg_arg_counts = SmallVec::with_capacity(plan.aggregates.len());
+        // Collation sequence for each aggregate, used for MIN/MAX comparisons.
+        let mut agg_collations = SmallVec::with_capacity(plan.aggregates.len());
+        // Number of values stored in the hash table payload for each aggregate.
+        // Different aggregates need different payload sizes (e.g., AVG needs 2 for sum+count).
+        let mut agg_payload_values_count = SmallVec::with_capacity(plan.aggregates.len());
+        // Hash table IDs for DISTINCT aggregates (e.g., COUNT(DISTINCT x)).
+        // `None` for non-distinct aggregates; `Some(id)` for distinct ones to track seen values.
+        // Capacity is for all aggregates since we push an entry for each (None or Some).
+        let mut agg_distinct_hash_table_ids = SmallVec::with_capacity(plan.aggregates.len());
+        // Collation sequences for DISTINCT aggregate deduplication.
+        // Each inner Vec contains collations for (group keys + distinct args).
+        // Capacity is for all aggregates since we push an entry for each (empty or populated).
+        let mut agg_distinct_collations = SmallVec::with_capacity(plan.aggregates.len());
+        let mut cur_reg = agg_args_start;
+        for agg in &plan.aggregates {
+            agg_arg_start_regs.push(cur_reg);
+            agg_arg_counts.push(agg.args.len());
+            cur_reg += agg.args.len();
+            let collation = if matches!(agg.func, AggFunc::Min | AggFunc::Max) {
+                if let Some(expr) = agg.args.first() {
+                    get_collseq_from_expr(expr, &plan.table_references)?.unwrap_or_default()
+                } else {
+                    CollationSeq::default()
+                }
+            } else {
+                CollationSeq::default()
+            };
+            agg_collations.push(collation);
+            agg_payload_values_count.push(hash_agg_payload_len(&agg.func));
+            match &agg.distinctness {
+                Distinctness::NonDistinct => {
+                    agg_distinct_hash_table_ids.push(None);
+                    agg_distinct_collations.push(SmallVec::new());
+                }
+                Distinctness::Distinct { .. } => {
+                    let hash_table_id = program.alloc_hash_table_id();
+                    agg_distinct_hash_table_ids.push(Some(hash_table_id));
+                    let mut collations = SmallVec::with_capacity(key_count + agg.args.len());
+                    collations.extend(key_collations.iter().copied());
+                    for expr in &agg.args {
+                        collations.push(
+                            get_collseq_from_expr(expr, &plan.table_references)?
+                                .unwrap_or_default(),
+                        );
+                    }
+                    agg_distinct_collations.push(collations);
+                }
+            }
+        }
+
+        let mut result_key_indices = SmallVec::new();
+        for (expr, in_result) in t_ctx.non_aggregate_expressions.iter() {
+            if *in_result {
+                // can_use_hash_agg guarantees all non-aggregate expressions are in GROUP BY keys
+                let idx = group_by
+                    .exprs
+                    .iter()
+                    .position(|g| exprs_are_equivalent(expr, g))
+                    .ok_or_else(|| {
+                        LimboError::InternalError(
+                            "non-aggregate expression must be in GROUP BY keys (checked in can_use_hash_aggregation)"
+                                .to_string(),
+                        )
+                    })?;
+                result_key_indices.push(idx);
+            }
+        }
+
+        GroupByRowSource::HashAgg(Box::new(HashAggData {
+            hash_table_id,
+            key_start_reg,
+            key_count,
+            key_collations,
+            agg_arg_start_regs,
+            agg_arg_counts,
+            agg_funcs: plan.aggregates.iter().map(|agg| agg.func.clone()).collect(),
+            agg_collations,
+            agg_payload_values_count,
+            agg_distinct_hash_table_ids,
+            agg_distinct_collations,
+            result_key_indices,
+            non_agg_start_reg: reg_non_aggregate_exprs_acc,
+            agg_start_reg: t_ctx
+                .reg_agg_start
+                .expect("aggregate registers must be initialized"),
+        }))
+    } else if let Some(sort_order) = group_by.sort_order.as_ref() {
+        // Standard SQLite sort+stream based GROUP BY aggregation.
         let sort_cursor = program.alloc_cursor_id(CursorType::Sorter);
         // Should work the same way as Order By
         /*
@@ -165,6 +332,7 @@ pub fn init_group_by<'a>(
             start_reg_dest: reg_non_aggregate_exprs_acc,
         }
     } else {
+        // Rows already sorted in GROUP BY order naturally by the cursor used.
         GroupByRowSource::MainLoop {
             start_reg_src: reg_group_by_source_cols_start,
             start_reg_dest: reg_non_aggregate_exprs_acc,
@@ -190,13 +358,14 @@ pub fn init_group_by<'a>(
         },
     });
 
-    program.add_comment(program.offset(), "go to clear accumulator subroutine");
-
     let reg_subrtn_acc_clear_return_offset = program.alloc_register();
-    program.emit_insn(Insn::Gosub {
-        target_pc: label_subrtn_acc_clear,
-        return_reg: reg_subrtn_acc_clear_return_offset,
-    });
+    if !matches!(row_source, GroupByRowSource::HashAgg { .. }) {
+        program.add_comment(program.offset(), "go to clear accumulator subroutine");
+        program.emit_insn(Insn::Gosub {
+            target_pc: label_subrtn_acc_clear,
+            return_reg: reg_subrtn_acc_clear_return_offset,
+        });
+    }
 
     t_ctx.meta_group_by = Some(GroupByMetadata {
         row_source,
@@ -473,6 +642,48 @@ pub enum GroupByRowSource {
         /// is processed.
         start_reg_dest: usize,
     },
+    HashAgg(Box<HashAggData>),
+}
+
+/// Metadata for hash-based GROUP BY aggregation.
+///
+/// Hash aggregation builds a hash table keyed by GROUP BY expressions,
+/// with aggregate state stored in the payload. After all rows are processed,
+/// we iterate through the hash table to emit one result per group.
+#[derive(Debug)]
+pub struct HashAggData {
+    /// Identifier for the hash table used for hash-based aggregation of the GROUP BY keys.
+    pub hash_table_id: usize,
+    /// Starting register where GROUP BY key values are stored during the build phase.
+    pub key_start_reg: usize,
+    /// Number of GROUP BY key expressions.
+    pub key_count: usize,
+    /// Collation sequence for each GROUP BY key, used for hashing and equality comparison.
+    pub key_collations: SmallVec<[CollationSeq; 2]>,
+    /// Starting register for arguments of each aggregate function (parallel to `agg_funcs`).
+    pub agg_arg_start_regs: SmallVec<[usize; 2]>,
+    /// Number of arguments for each aggregate function (parallel to `agg_funcs`).
+    pub agg_arg_counts: SmallVec<[usize; 2]>,
+    /// The aggregate functions to compute (e.g., COUNT, SUM, AVG).
+    pub agg_funcs: SmallVec<[AggFunc; 2]>,
+    /// Collation sequence for each aggregate, used for MIN/MAX comparisons.
+    pub agg_collations: SmallVec<[CollationSeq; 2]>,
+    /// Number of values stored in the hash table payload for each aggregate.
+    /// Different aggregates need different payload sizes (e.g., AVG needs 2 for sum+count).
+    pub agg_payload_values_count: SmallVec<[usize; 2]>,
+    /// Hash table IDs for DISTINCT aggregates (e.g., COUNT(DISTINCT x)).
+    /// `None` for non-distinct aggregates; `Some(id)` for distinct ones to track seen values.
+    pub agg_distinct_hash_table_ids: SmallVec<[Option<usize>; 2]>,
+    /// Collation sequences for DISTINCT aggregate deduplication.
+    /// Each inner Vec contains collations for (group keys + distinct args).
+    pub agg_distinct_collations: SmallVec<[SmallVec<[CollationSeq; 2]>; 2]>,
+    /// Maps each non-aggregate result column to its index in the GROUP BY keys.
+    /// Used during emit phase to copy key values to result registers.
+    pub result_key_indices: SmallVec<[usize; 2]>,
+    /// Starting register for non-aggregate result column values during emit phase.
+    pub non_agg_start_reg: usize,
+    /// Starting register for finalized aggregate result values during emit phase.
+    pub agg_start_reg: usize,
 }
 
 /// Emits bytecode for processing a single GROUP BY group.
@@ -516,6 +727,9 @@ pub fn group_by_process_single_group(
         }
 
         GroupByRowSource::MainLoop { start_reg_src, .. } => *start_reg_src,
+        GroupByRowSource::HashAgg(_) => {
+            unreachable!("hash aggregation does not use group_by_process_single_group");
+        }
     };
 
     let mut compare_key_info = group_by
@@ -606,6 +820,9 @@ pub fn group_by_process_single_group(
                 let start_reg_aggs = start_reg_src + t_ctx.non_aggregate_expressions.len();
                 AggArgumentSource::new_from_registers(start_reg_aggs + offset, agg)
             }
+            GroupByRowSource::HashAgg(_) => {
+                unreachable!("hash aggregation does not use group_by_agg_phase");
+            }
         };
         translate_aggregation_step(
             program,
@@ -680,6 +897,9 @@ pub fn group_by_process_single_group(
                     .expr_to_reg_cache
                     .push((std::borrow::Cow::Borrowed(expr), dest_reg));
             }
+        }
+        GroupByRowSource::HashAgg(_) => {
+            unreachable!("hash aggregation does not use group_by_agg_phase");
         }
     }
 
@@ -894,5 +1114,145 @@ pub fn group_by_emit_row_phase<'a>(
         can_fallthrough: false,
     });
     program.preassign_label_to_next_insn(labels.label_group_by_end);
+    Ok(())
+}
+
+pub fn group_by_emit_hash_agg_phase<'a>(
+    program: &mut ProgramBuilder,
+    t_ctx: &mut TranslateCtx<'a>,
+    plan: &'a SelectPlan,
+) -> Result<()> {
+    let group_by = plan.group_by.as_ref().expect("group by not found");
+    let GroupByMetadata { row_source, .. } = t_ctx
+        .meta_group_by
+        .as_ref()
+        .expect("group by metadata not found");
+    let GroupByRowSource::HashAgg(data) = row_source else {
+        unreachable!("hash agg row source not set");
+    };
+    let HashAggData {
+        hash_table_id,
+        key_start_reg,
+        key_count,
+        key_collations,
+        agg_payload_values_count,
+        agg_funcs,
+        agg_collations,
+        agg_distinct_hash_table_ids,
+        result_key_indices,
+        non_agg_start_reg,
+        agg_start_reg,
+        ..
+    } = data.as_ref();
+
+    program.emit_insn(Insn::HashBuildFinalize {
+        hash_table_id: *hash_table_id,
+    });
+    for hash_table_id in agg_distinct_hash_table_ids.iter().flatten() {
+        program.emit_insn(Insn::HashClose {
+            hash_table_id: *hash_table_id,
+        });
+    }
+    program.emit_insn(Insn::HashAggInit {
+        hash_table_id: *hash_table_id,
+    });
+
+    let label_loop_start = program.allocate_label();
+    let label_loop_end = program.allocate_label();
+    program.resolve_label(label_loop_start, program.offset());
+
+    program.emit_insn(Insn::HashAggNext {
+        data: Box::new(HashAggNextData {
+            hash_table_id: *hash_table_id,
+            key_dest_reg: *key_start_reg,
+            num_keys: *key_count,
+            key_collations: key_collations.clone(),
+            agg_dest_reg: *agg_start_reg,
+            agg_payload_values_count: agg_payload_values_count.clone(),
+            aggs: agg_funcs.clone(),
+            agg_collations: agg_collations.clone(),
+            target_pc: label_loop_end,
+        }),
+    });
+
+    let mut result_reg_idx = 0;
+    for (expr, in_result) in t_ctx.non_aggregate_expressions.iter() {
+        if !*in_result {
+            continue;
+        }
+        let key_idx = result_key_indices[result_reg_idx];
+        program.emit_insn(Insn::Copy {
+            src_reg: *key_start_reg + key_idx,
+            dst_reg: *non_agg_start_reg + result_reg_idx,
+            extra_amount: 0,
+        });
+        t_ctx.resolver.expr_to_reg_cache.push((
+            std::borrow::Cow::Borrowed(expr),
+            *non_agg_start_reg + result_reg_idx,
+        ));
+        result_reg_idx += 1;
+    }
+
+    for (i, agg) in plan.aggregates.iter().enumerate() {
+        t_ctx.resolver.expr_to_reg_cache.push((
+            std::borrow::Cow::Borrowed(&agg.original_expr),
+            *agg_start_reg + i,
+        ));
+    }
+    t_ctx.resolver.enable_expr_to_reg_cache();
+
+    if let Some(having) = &group_by.having {
+        for expr in having.iter() {
+            let if_true_target = program.allocate_label();
+            translate_condition_expr(
+                program,
+                &plan.table_references,
+                expr,
+                ConditionMetadata {
+                    jump_if_condition_is_true: false,
+                    jump_target_when_false: label_loop_start,
+                    jump_target_when_true: if_true_target,
+                    jump_target_when_null: label_loop_start,
+                },
+                &t_ctx.resolver,
+            )?;
+            program.preassign_label_to_next_insn(if_true_target);
+        }
+    }
+
+    match plan.order_by.is_empty() {
+        true => {
+            // offset_jump_to = label_loop_start: when OFFSET is active, skip emitting this row
+            // and jump back to get the next group from the hash table.
+            emit_select_result(
+                program,
+                &t_ctx.resolver,
+                plan,
+                Some(label_loop_end),
+                Some(label_loop_start),
+                t_ctx.reg_nonagg_emit_once_flag,
+                t_ctx.reg_offset,
+                t_ctx
+                    .reg_result_cols_start
+                    .expect("result column registers must be initialized"),
+                t_ctx.limit_ctx,
+            )?;
+            program.emit_insn(Insn::Goto {
+                target_pc: label_loop_start,
+            });
+        }
+        false => {
+            order_by_sorter_insert(program, t_ctx, plan)?;
+            program.emit_insn(Insn::Goto {
+                target_pc: label_loop_start,
+            });
+        }
+    }
+
+    program.resolve_label(label_loop_end, program.offset());
+    program.emit_insn(Insn::HashClose {
+        hash_table_id: *hash_table_id,
+    });
+
     Ok(())
 }

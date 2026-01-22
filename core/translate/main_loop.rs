@@ -27,6 +27,7 @@ use crate::{
         collate::{get_collseq_from_expr, CollationSeq},
         emitter::{prepare_cdc_if_necessary, HashCtx},
         expr::comparison_affinity,
+        group_by::HashAggData,
         planner::{table_mask_from_expr, TableMask},
         result_row::emit_select_result,
         subquery::emit_non_from_clause_subquery,
@@ -40,7 +41,7 @@ use crate::{
             CursorKey, CursorType, HashBuildSignature, MaterializedBuildInputModeTag,
             ProgramBuilder,
         },
-        insn::{to_u16, CmpInsFlags, HashBuildData, IdxInsertFlags, Insn},
+        insn::{to_u16, CmpInsFlags, HashAggStepData, HashBuildData, IdxInsertFlags, Insn},
         BranchOffset, CursorID,
     },
     Result,
@@ -740,7 +741,7 @@ fn emit_hash_build_phase(
             num_keys,
             hash_table_id,
             mem_budget: hash_join_op.mem_budget,
-            collations,
+            collations: collations.into(),
             payload_start_reg,
             num_payload,
         }),
@@ -1554,6 +1555,35 @@ fn emit_loop_source(
                     );
                 }
                 GroupByRowSource::MainLoop { .. } => group_by_agg_phase(program, t_ctx, plan)?,
+                GroupByRowSource::HashAgg(data) => {
+                    let HashAggData {
+                        hash_table_id,
+                        key_start_reg,
+                        key_count,
+                        key_collations,
+                        agg_funcs,
+                        agg_arg_start_regs,
+                        agg_arg_counts,
+                        agg_collations,
+                        agg_distinct_hash_table_ids,
+                        agg_distinct_collations,
+                        ..
+                    } = data.as_ref();
+                    program.emit_insn(Insn::HashAggStep {
+                        data: Box::new(HashAggStepData {
+                            hash_table_id: *hash_table_id,
+                            key_start_reg: *key_start_reg,
+                            num_keys: *key_count,
+                            collations: key_collations.clone(),
+                            aggs: agg_funcs.clone(),
+                            agg_arg_start_regs: agg_arg_start_regs.clone(),
+                            agg_arg_counts: agg_arg_counts.clone(),
+                            agg_collations: agg_collations.clone(),
+                            agg_distinct_hash_table_ids: agg_distinct_hash_table_ids.clone(),
+                            agg_distinct_collations: agg_distinct_collations.clone(),
+                        }),
+                    });
+                }
             }
 
             Ok(())

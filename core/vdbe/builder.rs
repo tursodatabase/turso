@@ -1055,6 +1055,7 @@ impl ProgramBuilder {
                 Insn::HashProbe { target_pc, .. } => resolve(target_pc, "HashProbe")?,
                 Insn::HashNext { target_pc, .. } => resolve(target_pc, "HashNext")?,
                 Insn::HashDistinct { data } => resolve(&mut data.target_pc, "HashDistinct")?,
+                Insn::HashAggNext { data } => resolve(&mut data.target_pc, "HashAggNext")?,
                 _ => {}
             }
         }

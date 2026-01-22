@@ -8,6 +8,7 @@ use codspeed_criterion_compat::{
     black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput,
 };
 
+use smallvec::smallvec;
 use std::sync::Arc;
 use turso_core::types::Value;
 use turso_core::vdbe::hash_table::{HashTable, HashTableConfig};
@@ -25,7 +26,7 @@ fn create_hash_table(mem_budget: usize) -> HashTable {
         initial_buckets: 64,
         mem_budget,
         num_keys: 1,
-        collations: vec![CollationSeq::Binary],
+        collations: smallvec![CollationSeq::Binary],
     };
     HashTable::new(config, io)
 }
@@ -222,7 +223,7 @@ fn bench_text_key_hashing(c: &mut Criterion) {
                         initial_buckets: 64,
                         mem_budget: 64 * 1024,
                         num_keys: 1,
-                        collations: vec![CollationSeq::Binary],
+                        collations: smallvec![CollationSeq::Binary],
                     };
                     let mut ht = HashTable::new(config, io);
                     insert_text_key_entries(&mut ht, count);
@@ -243,7 +244,7 @@ fn bench_text_key_hashing(c: &mut Criterion) {
                         initial_buckets: 64,
                         mem_budget: 64 * 1024,
                         num_keys: 1,
-                        collations: vec![CollationSeq::NoCase],
+                        collations: smallvec![CollationSeq::NoCase],
                     };
                     let mut ht = HashTable::new(config, io);
                     insert_text_key_entries(&mut ht, count);

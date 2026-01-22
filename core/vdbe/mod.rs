@@ -47,7 +47,7 @@ use crate::{
             OpInsertState, OpInsertSubState, OpJournalModeState, OpNewRowidState,
             OpNoConflictState, OpProgramState, OpRowIdState, OpSeekState, OpTransactionState,
         },
-        hash_table::HashTable,
+        hash_table::{HashEntry, HashTable},
         metrics::StatementMetrics,
     },
     ValueRef,
@@ -336,6 +336,34 @@ pub(crate) struct DeferredSeekState {
     pub table_cursor_id: CursorID,
 }
 
+#[derive(Debug, Default)]
+struct HashAggEmitState {
+    hash_table_id: usize,
+    partition_idx: usize,
+    entries: Vec<HashEntry>,
+    entry_idx: usize,
+}
+
+/// Re-entrant state for [Insn::HashAggStep].
+/// Tracks DISTINCT insert results across IO yields to prevent double-counting.
+#[derive(Debug, Default)]
+pub(crate) enum OpHashAggStepState {
+    /// Initial state - no cached data
+    #[default]
+    Start,
+    /// DISTINCT checks in progress - yielded mid-loop
+    DistinctChecksInProgress {
+        hash_table_id: usize,
+        key_values: Vec<Value>,
+        next_agg_idx: usize,
+    },
+    /// DISTINCT checks completed - cached results for this row
+    DistinctChecksDone {
+        hash_table_id: usize,
+        key_values: Vec<Value>,
+    },
+}
+
 /// The program state describes the environment in which the program executes.
 pub struct ProgramState {
     pub io_completions: Option<IOCompletions>,
@@ -398,6 +426,13 @@ pub struct ProgramState {
     op_hash_probe_state: Option<OpHashProbeState>,
     /// Scratch buffer for [Insn::HashDistinct] to avoid per-row allocations.
     distinct_key_values: Vec<Value>,
+    /// Scratch buffer for [Insn::HashAggStep] should_update flags.
+    hash_agg_should_update: Vec<bool>,
+    /// Scratch buffer for [Insn::HashAggStep] DISTINCT key building.
+    hash_agg_distinct_keys: Vec<Value>,
+    /// Re-entrant state for [Insn::HashAggStep] to handle IO yields correctly.
+    op_hash_agg_step_state: OpHashAggStepState,
+    hash_agg_emit_state: Option<HashAggEmitState>,
     hash_tables: HashMap<usize, HashTable>,
     uses_subjournal: bool,
     pub n_change: AtomicI64,
@@ -465,6 +500,10 @@ impl ProgramState {
             op_hash_build_state: None,
             op_hash_probe_state: None,
             distinct_key_values: Vec::new(),
+            hash_agg_should_update: Vec::new(),
+            hash_agg_distinct_keys: Vec::new(),
+            op_hash_agg_step_state: OpHashAggStepState::Start,
+            hash_agg_emit_state: None,
             seek_state: OpSeekState::Start,
             current_collation: None,
             op_column_state: OpColumnState::Start,
@@ -526,6 +565,7 @@ impl ProgramState {
             self.deferred_seeks.resize(max_cursors, None);
         }
         self.result_row = None;
+        self.hash_agg_emit_state = None;
         if let Some(max_registers) = max_registers {
             // into_vec and into_boxed_slice do not allocate
             let mut registers = std::mem::take(&mut self.registers).into_vec();
@@ -581,7 +621,10 @@ impl ProgramState {
         self.hash_tables.clear();
         self.op_hash_build_state = None;
         self.op_hash_probe_state = None;
+        self.op_hash_agg_step_state = OpHashAggStepState::Start;
         self.distinct_key_values.clear();
+        self.hash_agg_should_update.clear();
+        self.hash_agg_distinct_keys.clear();
         self.n_change.store(0, Ordering::SeqCst);
         *self.explain_state.write() = ExplainState::default();
     }
