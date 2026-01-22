@@ -3088,8 +3088,9 @@ pub mod test {
         {
             let pager = conn.pager.load();
             let res = run_checkpoint_until_done(&pager, CheckpointMode::Restart);
-            assert_eq!(res.num_attempted, mx_before);
-            assert_eq!(res.num_backfilled, mx_before);
+            assert_eq!(res.wal_max_frame, mx_before);
+            assert_eq!(res.wal_total_backfilled, mx_before);
+            assert_eq!(res.wal_checkpoint_backfilled, mx_before);
         }
 
         // Validate post‑RESTART header & counters.
@@ -3189,15 +3190,15 @@ pub mod test {
             let maxf = db.shared_wal.read().max_frame.load(Ordering::SeqCst);
             (res, maxf)
         };
-        assert_eq!(res1.num_attempted, max_before);
+        assert_eq!(res1.wal_max_frame, max_before);
         assert!(
-            res1.num_backfilled < res1.num_attempted,
+            res1.wal_total_backfilled < res1.wal_max_frame,
             "Partial backfill expected, {} : {}",
-            res1.num_backfilled,
-            res1.num_attempted
+            res1.wal_total_backfilled,
+            res1.wal_max_frame
         );
         assert_eq!(
-            res1.num_backfilled, readmark,
+            res1.wal_total_backfilled, readmark,
             "Checkpointed frames should match read mark"
         );
         // Release reader
@@ -3216,7 +3217,7 @@ pub mod test {
             },
         );
         assert_eq!(
-            res2.num_backfilled, res2.num_attempted,
+            res2.wal_total_backfilled, res2.wal_max_frame,
             "Second checkpoint completes remaining frames"
         );
     }
@@ -3366,11 +3367,11 @@ pub mod test {
         };
 
         assert!(
-            checkpoint_result.num_backfilled < checkpoint_result.num_attempted,
+            checkpoint_result.wal_total_backfilled < checkpoint_result.wal_max_frame,
             "Should not checkpoint all frames when readers are active"
         );
         assert_eq!(
-            checkpoint_result.num_backfilled, r1_max_frame,
+            checkpoint_result.wal_total_backfilled, r1_max_frame,
             "Should have checkpointed up to R1's max frame"
         );
 
@@ -3532,7 +3533,7 @@ pub mod test {
                 },
             )
         };
-        assert_eq!(result1.num_backfilled, r1_frame);
+        assert_eq!(result1.wal_total_backfilled, r1_frame);
 
         // finish reader‑1
         conn1.execute("COMMIT").unwrap();
@@ -3547,7 +3548,10 @@ pub mod test {
                 },
             )
         };
-        assert_eq!(result1.num_backfilled + result2.num_backfilled, r2_frame);
+        assert_eq!(
+            result1.wal_checkpoint_backfilled + result2.wal_checkpoint_backfilled,
+            r2_frame
+        );
 
         // verify visible rows
         let r2_cnt = count_test_table(&conn_r2);
@@ -3844,8 +3848,8 @@ pub mod test {
             run_checkpoint_until_done(&pager, CheckpointMode::Full)
         };
 
-        assert_eq!(result.num_attempted, mx_before);
-        assert_eq!(result.num_backfilled, mx_before);
+        assert_eq!(result.wal_checkpoint_backfilled, mx_before);
+        assert_eq!(result.wal_total_backfilled, mx_before);
     }
 
     #[test]
@@ -3920,7 +3924,7 @@ pub mod test {
             run_checkpoint_until_done(&pager, CheckpointMode::Full)
         };
 
-        assert_eq!(result.num_attempted, mx_now - r_snapshot);
+        assert_eq!(result.wal_checkpoint_backfilled, mx_now - r_snapshot);
         assert!(result.everything_backfilled());
     }
 }
