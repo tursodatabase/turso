@@ -1480,21 +1480,39 @@ impl Connection {
         }
 
         let auto_state = &state.auto_analyze;
-        let has_completed_scan = auto_state
+        let has_scan_signal = auto_state
             .scan_states
             .iter()
-            .any(|scan| scan.completed && !scan.invalidated);
-        if !has_completed_scan
+            .any(|scan| !scan.invalidated && (scan.completed || scan.row_count > 0));
+        if !has_scan_signal
             && auto_state.exact_counts.is_empty()
             && auto_state.written_tables.is_empty()
         {
             return;
         }
 
+        let index_ranges_to_clear = if auto_state.written_tables.is_empty() {
+            Vec::new()
+        } else {
+            let schema = self.schema.read();
+            auto_state
+                .written_tables
+                .iter()
+                .flat_map(|table| {
+                    schema
+                        .get_indices(table)
+                        .map(|index| index.name.clone())
+                })
+                .collect::<Vec<_>>()
+        };
+
         let mut stats = self.auto_analyze_stats.write();
 
         for table in &auto_state.written_tables {
             stats.remove_table(table);
+        }
+        for index_name in index_ranges_to_clear {
+            stats.remove_index_range(&index_name);
         }
 
         for (table, row_count) in &auto_state.exact_counts {
@@ -1505,28 +1523,63 @@ impl Connection {
         }
 
         for (cursor_id, scan_state) in auto_state.scan_states.iter().enumerate() {
-            if !scan_state.completed || scan_state.invalidated {
-                continue;
-            }
-            if !program
-                .auto_analyze_full_scans
-                .get(cursor_id)
-                .copied()
-                .unwrap_or(false)
-            {
+            if scan_state.invalidated {
                 continue;
             }
             let Some((_, cursor_type)) = program.cursor_ref.get(cursor_id) else {
                 continue;
             };
-            let CursorType::BTreeTable(table) = cursor_type else {
+            let scan_flags = program.auto_analyze_flags(cursor_id);
+            let is_full_scan = scan_flags & crate::vdbe::AUTO_ANALYZE_FULL_SCAN != 0;
+            if is_full_scan {
+                if !scan_state.completed {
+                    continue;
+                }
+                match cursor_type {
+                    CursorType::BTreeTable(table) => {
+                        let table_name = normalize_ident(&table.name);
+                        if is_system_table(&table_name)
+                            || auto_state.written_tables.contains(&table_name)
+                        {
+                            continue;
+                        }
+                        stats.set_row_count(&table_name, scan_state.row_count);
+                    }
+                    CursorType::BTreeIndex(index) => {
+                        if index.ephemeral || index.where_clause.is_some() {
+                            continue;
+                        }
+                        let table_name = normalize_ident(&index.table_name);
+                        if is_system_table(&table_name)
+                            || auto_state.written_tables.contains(&table_name)
+                        {
+                            continue;
+                        }
+                        stats.set_row_count(&table_name, scan_state.row_count);
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+
+            if scan_flags & crate::vdbe::AUTO_ANALYZE_INDEX_RANGE_SCAN == 0 {
+                continue;
+            }
+            // Range scans can exit before EOF (e.g., point lookups), so keep any observed rows.
+            if !scan_state.completed && scan_state.row_count == 0 {
+                continue;
+            }
+            let CursorType::BTreeIndex(index) = cursor_type else {
                 continue;
             };
-            let table_name = normalize_ident(&table.name);
+            if index.ephemeral {
+                continue;
+            }
+            let table_name = normalize_ident(&index.table_name);
             if is_system_table(&table_name) || auto_state.written_tables.contains(&table_name) {
                 continue;
             }
-            stats.set_row_count(&table_name, scan_state.row_count);
+            stats.set_index_range_row_count(&index.name, scan_state.row_count);
         }
     }
 
