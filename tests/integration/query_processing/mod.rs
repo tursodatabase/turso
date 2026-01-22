@@ -4,6 +4,7 @@ mod test_hash_join_materialization;
 mod test_read_path;
 mod test_write_path;
 
+mod auto_analyze;
 mod encryption;
 mod test_expr_index;
 mod test_multi_thread;
