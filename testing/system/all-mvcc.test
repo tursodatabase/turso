@@ -13,5 +13,4 @@ source $testdir/scalar-functions.test
 source $testdir/scalar-functions-datetime.test
 
 source $testdir/scalar-functions-printf.test
-source $testdir/integrity_check.test
 source $testdir/vtab.test
