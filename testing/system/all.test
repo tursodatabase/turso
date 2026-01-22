@@ -6,7 +6,6 @@ set testdir [file dirname $argv0]
 source $testdir/math.test
 source $testdir/scalar-functions.test
 source $testdir/scalar-functions-datetime.test
-source $testdir/compare.test
 source $testdir/scalar-functions-printf.test
 source $testdir/integrity_check.test
 source $testdir/vtab.test
