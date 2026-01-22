@@ -93,18 +93,60 @@ impl InteractionPlan {
         }
 
         if self.len_properties() < num_interactions {
-            let conn_index = env.choose_conn(rng);
-            let interactions = if self.mvcc && !env.conn_in_transaction(conn_index) {
-                let query = Query::Begin(Begin::Concurrent);
-                Interactions::new(conn_index, InteractionsType::Query(query))
-            } else if self.mvcc
-                && env.conn_in_transaction(conn_index)
-                && env.has_conn_executed_query_after_transaction(conn_index)
-                && rng.random_bool(0.4)
-            {
-                let query = Query::Commit(Commit);
-                Interactions::new(conn_index, InteractionsType::Query(query))
+            // For non-MVCC mode, if any connection has an exclusive lock (BEGIN IMMEDIATE),
+            // we must use that connection to avoid "Database is busy" errors.
+            // Check both executed transactions (env) and pending generated transactions (plan).
+            let conn_index = if !self.mvcc {
+                if let Some(txn_conn) = self.pending_txn_conn() {
+                    // Use the connection with pending generated transaction
+                    txn_conn
+                } else if let Some(txn_conn) =
+                    (0..env.connections.len()).find(|idx| env.conn_in_transaction(*idx))
+                {
+                    // Use the connection that has an executed transaction
+                    txn_conn
+                } else {
+                    env.choose_conn(rng)
+                }
             } else {
+                env.choose_conn(rng)
+            };
+
+            // Check both executed and pending transaction state
+            let in_txn =
+                env.conn_in_transaction(conn_index) || self.pending_txn_conn() == Some(conn_index);
+            let batch_enabled = env.profile.query.enable_transaction_batching;
+
+            // For non-MVCC mode, check if ANY connection is in a transaction (executed or pending)
+            // (BEGIN IMMEDIATE takes exclusive write lock, so only one txn at a time)
+            let any_conn_in_txn = !self.mvcc
+                && (self.pending_txn_conn().is_some()
+                    || (0..env.connections.len()).any(|idx| env.conn_in_transaction(idx)));
+
+            // Plan-level transaction batching (both MVCC and non-MVCC modes)
+            let interactions = if !in_txn
+                && batch_enabled
+                && !any_conn_in_txn  // Don't start new txn if another conn has exclusive lock
+                && rng.random_bool(env.profile.query.transaction_batch_start_probability)
+            {
+                // Start a batch transaction (CONCURRENT for MVCC, IMMEDIATE for non-MVCC)
+                let begin = if self.mvcc {
+                    Begin::Concurrent
+                } else {
+                    Begin::Immediate
+                };
+                // Track the pending transaction
+                self.set_pending_txn_conn(Some(conn_index));
+                Interactions::new(conn_index, InteractionsType::Query(Query::Begin(begin)))
+            } else if in_txn
+                && env.has_conn_executed_query_after_transaction(conn_index)
+                && rng.random_bool(env.profile.query.transaction_batch_commit_probability)
+            {
+                // Randomly commit the batch - clear pending transaction state
+                self.set_pending_txn_conn(None);
+                Interactions::new(conn_index, InteractionsType::Query(Query::Commit(Commit)))
+            } else {
+                // Generate property/query
                 let conn_ctx = &env.connection_context(conn_index);
                 let mut interactions =
                     Interactions::arbitrary_from(rng, conn_ctx, (env, self.stats(), conn_index));
@@ -131,9 +173,21 @@ impl InteractionPlan {
             Some(interactions)
         } else {
             // after we generated all interactions if some connection is still in a transaction, commit
+            // For non-MVCC mode, also check pending_txn_conn to handle the case where
+            // a DISCONNECT was generated (clearing pending state) but not yet executed
             (0..env.connections.len())
-                .find(|idx| env.conn_in_transaction(*idx))
+                .find(|idx| {
+                    let executed_txn = env.conn_in_transaction(*idx);
+                    if self.mvcc {
+                        executed_txn
+                    } else {
+                        // For non-MVCC, also require pending_txn_conn to be set
+                        // This prevents generating COMMIT after a DISCONNECT was generated
+                        executed_txn && self.pending_txn_conn() == Some(*idx)
+                    }
+                })
                 .map(|conn_index| {
+                    self.set_pending_txn_conn(None);
                     Interactions::new(conn_index, InteractionsType::Query(Query::Commit(Commit)))
                 })
         }
@@ -237,6 +291,9 @@ impl<'a, R: rand::Rng> InteractionPlanIterator for PlanGenerator<'a, R> {
     /// try to generate the next [Interactions] and store it
     fn next(&mut self, env: &mut SimulatorEnv) -> Option<Interaction> {
         let mvcc = self.plan.mvcc;
+        // Extract pending_txn_conn before the closure to avoid borrow conflicts
+        let pending_txn_conn = self.plan.pending_txn_conn();
+
         let mut next_interaction = || match self.peek(env) {
             Some(peek_interaction) => {
                 if mvcc && peek_interaction.is_ddl() {
@@ -253,6 +310,28 @@ impl<'a, R: rand::Rng> InteractionPlanIterator for PlanGenerator<'a, R> {
                                 .build()
                                 .unwrap(),
                         );
+                    }
+                }
+
+                // For non-MVCC mode: if any connection has an exclusive lock (BEGIN IMMEDIATE),
+                // and the peeked interaction is for a different connection, commit first
+                // to avoid "Database is busy" errors
+                if !mvcc {
+                    // Check both pending and executed transactions
+                    let txn_conn = pending_txn_conn.or_else(|| {
+                        (0..env.connections.len()).find(|idx| env.conn_in_transaction(*idx))
+                    });
+                    if let Some(txn_conn) = txn_conn {
+                        if peek_interaction.connection_index != txn_conn {
+                            // Interaction is for a different connection - commit the transaction first
+                            return Some(
+                                InteractionBuilder::from_interaction(peek_interaction)
+                                    .interaction(InteractionType::Query(Query::Commit(Commit)))
+                                    .connection_index(txn_conn)
+                                    .build()
+                                    .unwrap(),
+                            );
+                        }
                     }
                 }
 
@@ -289,6 +368,24 @@ impl<'a, R: rand::Rng> InteractionPlanIterator for PlanGenerator<'a, R> {
             }
         };
         let next_interaction = next_interaction();
+
+        // Clear pending transaction state when we commit or disconnect
+        if let Some(ref interaction) = next_interaction {
+            if !mvcc {
+                match &interaction.interaction {
+                    InteractionType::Query(Query::Commit(_)) => {
+                        // COMMIT ends the transaction
+                        self.plan.set_pending_txn_conn(None);
+                    }
+                    InteractionType::Fault(Fault::Disconnect | Fault::ReopenDatabase) => {
+                        // Disconnect/reopen causes implicit rollback
+                        self.plan.set_pending_txn_conn(None);
+                    }
+                    _ => {}
+                }
+            }
+        }
+
         // intercept interaction to update metrics
         if let Some(next_interaction) = next_interaction.as_ref() {
             // Skip counting queries that come from Properties that only exist to check tables
@@ -366,25 +463,27 @@ impl ArbitraryFrom<(&SimulatorEnv, &InteractionStats, usize)> for Interactions {
         let query_distr = QueryDistribution::new(queries, &remaining_);
 
         #[expect(clippy::type_complexity)]
-        let mut choices: Vec<(u32, Box<dyn Fn(&mut R) -> Interactions>)> = vec![
-            (
-                query_distr.weights().total_weight(),
-                Box::new(|rng: &mut R| {
-                    Interactions::new(
-                        conn_index,
-                        InteractionsType::Query(Query::arbitrary_from(rng, conn_ctx, &query_distr)),
-                    )
-                }),
-            ),
-            (
+        let mut choices: Vec<(u32, Box<dyn Fn(&mut R) -> Interactions>)> = vec![(
+            query_distr.weights().total_weight(),
+            Box::new(|rng: &mut R| {
+                Interactions::new(
+                    conn_index,
+                    InteractionsType::Query(Query::arbitrary_from(rng, conn_ctx, &query_distr)),
+                )
+            }),
+        )];
+
+        // Only include faults if enabled in profile
+        if env.profile.io.fault.enable {
+            choices.push((
                 remaining_
                     .select
                     .min(remaining_.insert)
                     .min(remaining_.create)
                     .max(1),
                 Box::new(|rng: &mut R| random_fault(rng, env, conn_index)),
-            ),
-        ];
+            ));
+        }
 
         if let Ok(property_distr) =
             PropertyDistribution::new(env, &remaining_, &query_distr, conn_ctx)

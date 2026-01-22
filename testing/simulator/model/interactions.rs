@@ -36,6 +36,10 @@ pub(crate) struct InteractionPlan {
     /// This field is only necessary and valid when generating interactions. For static iteration, we do not care about this field
     len_properties: usize,
     next_interaction_id: NonZeroUsize,
+
+    /// Tracks which connection has a pending (generated but not executed) transaction.
+    /// Used in non-MVCC mode to prevent generating nested transactions.
+    pending_txn_conn: Option<usize>,
 }
 
 impl InteractionPlan {
@@ -47,7 +51,18 @@ impl InteractionPlan {
             mvcc,
             len_properties: 0,
             next_interaction_id: NonZeroUsize::new(1).unwrap(),
+            pending_txn_conn: None,
         }
+    }
+
+    /// Returns the connection index that has a pending (generated but not executed) transaction
+    pub fn pending_txn_conn(&self) -> Option<usize> {
+        self.pending_txn_conn
+    }
+
+    /// Sets the pending transaction connection
+    pub fn set_pending_txn_conn(&mut self, conn: Option<usize>) {
+        self.pending_txn_conn = conn;
     }
 
     /// Count of interactions
