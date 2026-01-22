@@ -6939,32 +6939,114 @@ fn page_free_array(
     page.write_cell_count(page.cell_count() as u16 - number_of_cells_removed as u16);
     Ok(number_of_cells_removed)
 }
+
+/// Insert multiple cells into a page in a single batch operation.
+///
+/// This is an optimized version that avoids O(N²) complexity by:
+/// 1. Computing total space needed upfront
+/// 2. Allocating all space at once
+/// 3. Copying all cell payloads sequentially
+/// 4. Shifting existing cell pointers once
+/// 5. Writing all new cell pointers in one pass
+/// 6. Updating cell count once
+///
+/// IMPORTANT: This function assumes the page has been defragmented before calling,
+/// which is the case in `edit_page()` where this is called from.
 fn page_insert_array(
     page: &mut PageContent,
     first: usize,
     count: usize,
     cell_array: &CellArray,
-    mut start_insert: usize,
+    start_insert: usize,
     usable_space: usize,
 ) -> Result<()> {
-    // TODO: implement faster algorithm, this is doing extra work that's not needed.
-    // See pageInsertArray to understand faster way.
+    if count == 0 {
+        return Ok(());
+    }
+
     tracing::debug!(
-        "page_insert_array(cell_array.cells={}..{}, cell_count={}, page_type={:?})",
+        "page_insert_array(first={}, count={}, start_insert={}, cell_count={}, page_type={:?})",
         first,
-        first + count,
+        count,
+        start_insert,
         page.cell_count(),
         page.page_type().ok()
     );
-    for i in first..first + count {
-        insert_into_cell_during_balance(
-            page,
-            cell_array.cell_payloads[i],
-            start_insert,
-            usable_space,
-        )?;
-        start_insert += 1;
+
+    // Calculate total space needed for all cell payloads
+    // We read from cell_array at indices [first, first+count)
+    let mut total_payload_size: usize = 0;
+    for i in 0..count {
+        let payload = &cell_array.cell_payloads[first + i];
+        let cell_size = payload.len().max(MINIMUM_CELL_SIZE);
+        total_payload_size += cell_size;
     }
+
+    // Total space needed includes cell pointers
+    let total_ptr_space = count * CELL_PTR_SIZE_BYTES;
+
+    // After defragmentation, all free space is in the unallocated region
+    // between the cell pointer array and the cell content area.
+    let current_cell_count = page.cell_count();
+    let mut cell_content_area = page.cell_content_area() as usize;
+    let unallocated_start = page.unallocated_region_start();
+
+    // Verify we have enough space
+    // The new cell pointers will extend the cell pointer array by `total_ptr_space`
+    // The new cell content will reduce cell_content_area by `total_payload_size`
+    let new_unallocated_start = unallocated_start + total_ptr_space;
+    let new_cell_content_area = cell_content_area - total_payload_size;
+
+    turso_assert!(
+        new_unallocated_start <= new_cell_content_area,
+        "page_insert_array: not enough space: need {} bytes for pointers + {} bytes for payloads, \
+         unallocated region is {}..{} ({} bytes)",
+        total_ptr_space,
+        total_payload_size,
+        unallocated_start,
+        cell_content_area,
+        cell_content_area - unallocated_start
+    );
+
+    let buf = page.as_ptr();
+    let (cell_pointer_array_start, _) = page.cell_pointer_array_offset_and_size();
+
+    // Shift existing cell pointers to make room for new ones
+    // We're inserting `count` cells at position `start_insert`, so we need to shift
+    // all cell pointers from position `start_insert` onwards to the right by `count * 2` bytes
+    if start_insert < current_cell_count {
+        let cells_to_shift = current_cell_count - start_insert;
+        let shift_src_start = cell_pointer_array_start + (start_insert * CELL_PTR_SIZE_BYTES);
+        let shift_dst_start = shift_src_start + total_ptr_space;
+        let shift_size = cells_to_shift * CELL_PTR_SIZE_BYTES;
+        buf.copy_within(
+            shift_src_start..shift_src_start + shift_size,
+            shift_dst_start,
+        );
+    }
+
+    // Allocate space for all cells and write payloads + pointers
+    // We allocate space from the content area (which grows downward)
+    // Read from cell_array[first..first+count], insert at page positions [start_insert..start_insert+count]
+    for i in 0..count {
+        let payload = &cell_array.cell_payloads[first + i];
+        let cell_size = payload.len().max(MINIMUM_CELL_SIZE);
+
+        // Allocate space for this cell (grow content area downward)
+        cell_content_area -= cell_size;
+
+        // Copy cell payload
+        buf[cell_content_area..cell_content_area + payload.len()].copy_from_slice(payload);
+
+        // Write cell pointer at position (start_insert + i)
+        let ptr_offset = cell_pointer_array_start + ((start_insert + i) * CELL_PTR_SIZE_BYTES);
+        page.write_u16_no_offset(ptr_offset, cell_content_area as u16);
+    }
+
+    // Update page header
+    page.write_cell_content_area(cell_content_area);
+    page.write_cell_count((current_cell_count + count) as u16);
+
     debug_validate_cells!(page, usable_space);
     Ok(())
 }
@@ -7427,7 +7509,7 @@ fn _insert_into_cell(
     payload: &[u8],
     cell_idx: usize,
     usable_space: usize,
-    allow_regular_insert_despite_overflow: bool, // see [insert_into_cell_during_balance()]
+    allow_regular_insert_despite_overflow: bool, // used during balancing to allow regular insert despite overflow cells
 ) -> Result<()> {
     assert!(
         cell_idx <= page.cell_count() + page.overflow_cells.len(),
@@ -7509,23 +7591,6 @@ fn insert_into_cell(
 
 /// Normally in [insert_into_cell()], if a page already has overflow cells, all
 /// new insertions are also added to the overflow cells vector.
-/// SQLite doesn't use regular [insert_into_cell()] during balancing,
-/// so we have a specialized function for use during balancing that allows regular cell insertion
-/// despite the presence of existing overflow cells (overflow cells are one of the reasons we are balancing in the first place).
-/// During balancing cells are first repositioned with [edit_page()]
-/// and then inserted via [page_insert_array()] which calls [insert_into_cell_during_balance()],
-/// and finally the existing overflow cells are cleared.
-/// If we would not allow the cell insert to proceed normally despite overflow cells being present,
-/// the new insertions would also be added as overflow cells which defeats the point of balancing.
-fn insert_into_cell_during_balance(
-    page: &mut PageContent,
-    payload: &[u8],
-    cell_idx: usize,
-    usable_space: usize,
-) -> Result<()> {
-    _insert_into_cell(page, payload, cell_idx, usable_space, true)
-}
-
 /// The amount of free space is the sum of:
 ///  #1. The size of the unallocated region
 ///  #2. Fragments (isolated 1-3 byte chunks of free space within the cell content area)
