@@ -926,6 +926,9 @@ pub struct ExplainState {
     subprogram_start_pc: Option<usize>,
 }
 
+pub(crate) const AUTO_ANALYZE_FULL_SCAN: i64 = 1 << 0;
+pub(crate) const AUTO_ANALYZE_INDEX_RANGE_SCAN: i64 = 1 << 1;
+
 #[derive(Clone)]
 pub struct PreparedProgram {
     pub max_registers: usize,
@@ -933,7 +936,7 @@ pub struct PreparedProgram {
     // ProgramBuilder
     pub insns: Vec<(Insn, usize)>,
     pub cursor_ref: Vec<(Option<CursorKey>, CursorType)>,
-    pub auto_analyze_full_scans: Vec<bool>,
+    pub auto_analyze_scan_flags: Vec<i64>,
     pub comments: Vec<(InsnReference, &'static str)>,
     pub parameters: crate::parameters::Parameters,
     pub change_cnt_on: bool,
@@ -1054,6 +1057,17 @@ impl Program {
 }
 
 impl Program {
+    pub(crate) fn auto_analyze_flags(&self, cursor_id: usize) -> i64 {
+        self.auto_analyze_scan_flags
+            .get(cursor_id)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    pub(crate) fn auto_analyze_has_flag(&self, cursor_id: usize, flag: i64) -> bool {
+        self.auto_analyze_flags(cursor_id) & flag != 0
+    }
+
     fn get_pager_from_database_index(&self, idx: &usize) -> Arc<Pager> {
         self.connection.get_pager_from_database_index(idx)
     }

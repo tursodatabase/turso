@@ -30,7 +30,7 @@ use crate::vdbe::insn::InsertFlags;
 use crate::vdbe::value::ComparisonOp;
 use crate::vdbe::{
     registers_to_ref_values, DeferredSeekState, EndStatement, OpHashBuildState, OpHashProbeState,
-    StepResult, TxnCleanup,
+    StepResult, TxnCleanup, AUTO_ANALYZE_FULL_SCAN, AUTO_ANALYZE_INDEX_RANGE_SCAN,
 };
 use crate::vector::{
     vector32, vector32_sparse, vector64, vector_concat, vector_distance_cos, vector_distance_dot,
@@ -1341,11 +1341,7 @@ pub fn op_rewind(
         }
     };
     if program.connection.auto_analyze_enabled()
-        && program
-            .auto_analyze_full_scans
-            .get(*cursor_id)
-            .copied()
-            .unwrap_or(false)
+        && program.auto_analyze_has_flag(*cursor_id, AUTO_ANALYZE_FULL_SCAN)
     {
         state.auto_analyze.note_scan_start(*cursor_id, is_empty);
     }
@@ -1381,11 +1377,7 @@ pub fn op_last(
         cursor.is_empty()
     };
     if program.connection.auto_analyze_enabled()
-        && program
-            .auto_analyze_full_scans
-            .get(*cursor_id)
-            .copied()
-            .unwrap_or(false)
+        && program.auto_analyze_has_flag(*cursor_id, AUTO_ANALYZE_FULL_SCAN)
     {
         state.auto_analyze.note_scan_start(*cursor_id, is_empty);
     }
@@ -1804,24 +1796,16 @@ pub fn op_next(
                 state.metrics.fullscan_steps = state.metrics.fullscan_steps.saturating_add(1);
             }
         }
-        if program.connection.auto_analyze_enabled()
-            && program
-                .auto_analyze_full_scans
-                .get(*cursor_id)
-                .copied()
-                .unwrap_or(false)
-        {
+        let track_scan = program.connection.auto_analyze_enabled()
+            && program.auto_analyze_flags(*cursor_id) != 0;
+        if track_scan {
             state.auto_analyze.note_scan_step(*cursor_id);
         }
         state.pc = pc_if_next.as_offset_int();
     } else {
-        if program.connection.auto_analyze_enabled()
-            && program
-                .auto_analyze_full_scans
-                .get(*cursor_id)
-                .copied()
-                .unwrap_or(false)
-        {
+        let track_scan = program.connection.auto_analyze_enabled()
+            && program.auto_analyze_flags(*cursor_id) != 0;
+        if track_scan {
             state.auto_analyze.note_scan_end(*cursor_id);
         }
         state.pc += 1;
@@ -1863,24 +1847,16 @@ pub fn op_prev(
                 state.metrics.fullscan_steps = state.metrics.fullscan_steps.saturating_add(1);
             }
         }
-        if program.connection.auto_analyze_enabled()
-            && program
-                .auto_analyze_full_scans
-                .get(*cursor_id)
-                .copied()
-                .unwrap_or(false)
-        {
+        let track_scan = program.connection.auto_analyze_enabled()
+            && program.auto_analyze_flags(*cursor_id) != 0;
+        if track_scan {
             state.auto_analyze.note_scan_step(*cursor_id);
         }
         state.pc = pc_if_prev.as_offset_int();
     } else {
-        if program.connection.auto_analyze_enabled()
-            && program
-                .auto_analyze_full_scans
-                .get(*cursor_id)
-                .copied()
-                .unwrap_or(false)
-        {
+        let track_scan = program.connection.auto_analyze_enabled()
+            && program.auto_analyze_flags(*cursor_id) != 0;
+        if track_scan {
             state.auto_analyze.note_scan_end(*cursor_id);
         }
         state.pc += 1;
@@ -3119,6 +3095,10 @@ pub fn op_seek(
         Insn::SeekLT { .. } => SeekOp::LT,
         _ => unreachable!("unexpected Insn {:?}", insn),
     };
+    let track_range_scan = is_index
+        && program.connection.auto_analyze_enabled()
+        && program.auto_analyze_has_flag(*cursor_id, AUTO_ANALYZE_INDEX_RANGE_SCAN);
+
     match seek_internal(
         program,
         state,
@@ -3129,10 +3109,16 @@ pub fn op_seek(
         op,
     ) {
         Ok(SeekInternalResult::Found) => {
+            if track_range_scan {
+                state.auto_analyze.note_scan_start(*cursor_id, false);
+            }
             state.pc += 1;
             Ok(InsnFunctionStepResult::Step)
         }
         Ok(SeekInternalResult::NotFound) => {
+            if track_range_scan {
+                state.auto_analyze.note_scan_start(*cursor_id, true);
+            }
             state.pc = target_pc.as_offset_int();
             Ok(InsnFunctionStepResult::Step)
         }
@@ -8991,10 +8977,22 @@ pub fn op_count(
     // SQLite tracks this differently (as pages read), but for consistency we track as rows
     if *exact {
         if program.connection.auto_analyze_enabled() {
-            if let Some((_, CursorType::BTreeTable(table))) = program.cursor_ref.get(*cursor_id) {
-                state
-                    .auto_analyze
-                    .record_exact_count(&table.name, count as u64);
+            if let Some((_, cursor_type)) = program.cursor_ref.get(*cursor_id) {
+                match cursor_type {
+                    CursorType::BTreeTable(table) => {
+                        state
+                            .auto_analyze
+                            .record_exact_count(&table.name, count as u64);
+                    }
+                    CursorType::BTreeIndex(index) => {
+                        if !index.ephemeral && index.where_clause.is_none() {
+                            state
+                                .auto_analyze
+                                .record_exact_count(&index.table_name, count as u64);
+                        }
+                    }
+                    _ => {}
+                }
             }
         }
         state.metrics.rows_read = state.metrics.rows_read.saturating_add(count as u64);
