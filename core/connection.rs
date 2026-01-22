@@ -8,13 +8,16 @@ use crate::sync::{
 use crate::types::{WalFrameInfo, WalState};
 #[cfg(feature = "fs")]
 use crate::util::{OpenMode, OpenOptions};
+use crate::vdbe::builder::CursorType;
 #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
 use crate::Page;
 use crate::{
     ast, function,
     io::{MemoryIO, PlatformIO, IO},
-    match_ignore_ascii_case, parse_schema_rows, refresh_analyze_stats, translate, turso_assert,
-    util::IOExt,
+    match_ignore_ascii_case, parse_schema_rows, refresh_analyze_stats,
+    stats::AutoAnalyzeStats,
+    translate, turso_assert,
+    util::{normalize_ident, IOExt},
     vdbe, AllViewsTxState, AtomicCipherMode, AtomicSyncMode, AtomicTempStore,
     AtomicTransactionState, BusyHandler, BusyHandlerCallback, CaptureDataChangesMode,
     CheckpointMode, CheckpointResult, CipherMode, Cmd, Completion, ConnectionMetrics, Database,
@@ -78,6 +81,8 @@ pub struct Connection {
     /// Client still can manually execute PRAGMA wal_checkpoint(...) commands
     pub(super) wal_auto_checkpoint_disabled: AtomicBool,
     pub(super) capture_data_changes: RwLock<CaptureDataChangesMode>,
+    pub(super) auto_analyze_enabled: AtomicBool,
+    pub(super) auto_analyze_stats: RwLock<AutoAnalyzeStats>,
     pub(super) closed: AtomicBool,
     /// Attached databases
     pub(super) attached_databases: RwLock<DatabaseCatalog>,
@@ -1445,6 +1450,81 @@ impl Connection {
 
     pub fn set_query_only(&self, value: bool) {
         self.query_only.store(value, Ordering::SeqCst);
+    }
+
+    pub fn auto_analyze_enabled(&self) -> bool {
+        self.auto_analyze_enabled.load(Ordering::Acquire)
+    }
+
+    pub fn set_auto_analyze_enabled(&self, enabled: bool) {
+        self.auto_analyze_enabled.store(enabled, Ordering::Release);
+        if !enabled {
+            self.auto_analyze_stats.write().clear();
+        }
+    }
+
+    pub fn auto_analyze_stats_snapshot(&self) -> Option<AutoAnalyzeStats> {
+        if !self.auto_analyze_enabled() {
+            return None;
+        }
+        Some(self.auto_analyze_stats.read().clone())
+    }
+
+    /// Record information from the relevant Program into the auto-analyze stats, if enabled
+    pub(crate) fn record_auto_analyze(&self, program: &vdbe::Program, state: &vdbe::ProgramState) {
+        if !self.auto_analyze_enabled() {
+            return;
+        }
+
+        let auto_state = &state.auto_analyze;
+        let has_completed_scan = auto_state
+            .scan_states
+            .iter()
+            .any(|scan| scan.completed && !scan.invalidated);
+        if !has_completed_scan
+            && auto_state.exact_counts.is_empty()
+            && auto_state.written_tables.is_empty()
+        {
+            return;
+        }
+
+        let mut stats = self.auto_analyze_stats.write();
+
+        for table in &auto_state.written_tables {
+            stats.remove_table(table);
+        }
+
+        for (table, row_count) in &auto_state.exact_counts {
+            if auto_state.written_tables.contains(table) || is_system_table(table) {
+                continue;
+            }
+            stats.set_row_count(table, *row_count);
+        }
+
+        for (cursor_id, scan_state) in auto_state.scan_states.iter().enumerate() {
+            if !scan_state.completed || scan_state.invalidated {
+                continue;
+            }
+            if !program
+                .auto_analyze_full_scans
+                .get(cursor_id)
+                .copied()
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            let Some((_, cursor_type)) = program.cursor_ref.get(cursor_id) else {
+                continue;
+            };
+            let CursorType::BTreeTable(table) = cursor_type else {
+                continue;
+            };
+            let table_name = normalize_ident(&table.name);
+            if is_system_table(&table_name) || auto_state.written_tables.contains(&table_name) {
+                continue;
+            }
+            stats.set_row_count(&table_name, scan_state.row_count);
+        }
     }
 
     pub fn get_sync_mode(&self) -> SyncMode {
