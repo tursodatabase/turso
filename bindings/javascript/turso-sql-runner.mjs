@@ -54,7 +54,7 @@ function formatValue(value) {
     if (value instanceof Uint8Array || Buffer.isBuffer(value)) {
         // Output blob as raw bytes (matches SQLite/Rust backend behavior)
         // This will display as text if the bytes are printable ASCII
-        return Buffer.from(value).toString('binary');
+        return Buffer.from(value).toString('utf-8');
     }
     return String(value);
 }
