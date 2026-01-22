@@ -1102,7 +1102,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                     .expect("checkpoint_result should be set");
 
                 // Only sync if we actually backfilled any frames
-                if checkpoint_result.num_backfilled == 0 {
+                if checkpoint_result.wal_checkpoint_backfilled == 0 {
                     self.state = CheckpointState::TruncateWal;
                     return Ok(TransitionResult::Continue);
                 }
