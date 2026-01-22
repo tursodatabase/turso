@@ -659,7 +659,7 @@ fn build_has_uncovered_prior_constraints(
         if join_key_indices.contains(&constraint.where_clause_pos.0) {
             return false;
         }
-        if constraint.operator != Operator::Equals {
+        if constraint.operator != Operator::Equals.into() {
             return true;
         }
         if !constraint.lhs_mask.intersects(prior_hash_build_mask) {
@@ -684,7 +684,9 @@ fn build_prior_constraint_selectivity(
     let mut selectivity = 1.0;
     let mut saw_constraint = false;
     for constraint in build_constraints.constraints.iter() {
-        if constraint.operator == Operator::Equals && constraint.lhs_mask.intersects(prior_mask) {
+        if constraint.operator == Operator::Equals.into()
+            && constraint.lhs_mask.intersects(prior_mask)
+        {
             tracing::debug!(
                 where_clause_pos = ?constraint.where_clause_pos,
                 lhs_mask = ?constraint.lhs_mask,
@@ -2272,7 +2274,7 @@ mod tests {
             let constraint =
                 &table_constraints[*table_number].constraints[constraint_refs[0].eq.unwrap()];
             assert!(constraint.lhs_mask.contains_table(FACT_TABLE_IDX));
-            assert!(constraint.operator == ast::Operator::Equals);
+            assert!(constraint.operator.as_ast_operator() == Some(ast::Operator::Equals));
         }
     }
 
@@ -2374,7 +2376,7 @@ mod tests {
             assert!(constraint_refs.len() == 1);
             let constraint = &table_constraints.constraints[constraint_refs[0].eq.unwrap()];
             assert!(constraint.lhs_mask.contains_table(i - 1));
-            assert!(constraint.operator == ast::Operator::Equals);
+            assert!(constraint.operator.as_ast_operator() == Some(ast::Operator::Equals));
         }
     }
 
@@ -2605,7 +2607,7 @@ mod tests {
         assert!(index.as_ref().is_some_and(|i| i.name == "idx1"));
         assert!(constraint_refs.len() == 1);
         let constraint = &table_constraints[0].constraints[constraint_refs[0].eq.unwrap()];
-        assert!(constraint.operator == ast::Operator::Equals);
+        assert!(constraint.operator.as_ast_operator() == Some(ast::Operator::Equals));
         assert!(constraint.table_col_pos == Some(0)); // c1
     }
 
@@ -2748,10 +2750,10 @@ mod tests {
         assert!(index.as_ref().is_some_and(|i| i.name == "idx1"));
         assert!(constraint_refs.len() == 2);
         let constraint = &table_constraints[0].constraints[constraint_refs[0].eq.unwrap()];
-        assert!(constraint.operator == ast::Operator::Equals);
+        assert!(constraint.operator.as_ast_operator() == Some(ast::Operator::Equals));
         assert!(constraint.table_col_pos == Some(0)); // c1
         let constraint = &table_constraints[0].constraints[constraint_refs[1].lower_bound.unwrap()];
-        assert!(constraint.operator == ast::Operator::Greater);
+        assert!(constraint.operator.as_ast_operator() == Some(ast::Operator::Greater));
         assert!(constraint.table_col_pos == Some(1)); // c2
     }
 

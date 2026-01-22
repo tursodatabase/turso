@@ -46,7 +46,7 @@ pub struct Constraint {
     /// 2. Remove the relevant binary expression from the WHERE clause, if used as an index seek key.
     pub where_clause_pos: (usize, BinaryExprSide),
     /// The comparison operator (e.g., `=`, `>`, `<`) used in the constraint.
-    pub operator: ast::Operator,
+    pub operator: ConstraintOperator,
     /// The zero-based index of the constrained column within the table's schema.
     /// None for expression-index constraints.
     pub table_col_pos: Option<usize>,
@@ -63,6 +63,27 @@ pub struct Constraint {
     /// Whether the constraint is usable for an index seek.
     /// This is explicitly set to false if the constraint has a different collation than the constrained column.
     pub usable: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ConstraintOperator {
+    AstNativeOperator(ast::Operator),
+    Like { not: bool },
+}
+
+impl ConstraintOperator {
+    pub fn as_ast_operator(&self) -> Option<ast::Operator> {
+        let ConstraintOperator::AstNativeOperator(op) = self else {
+            return None;
+        };
+        Some(*op)
+    }
+}
+
+impl From<ast::Operator> for ConstraintOperator {
+    fn from(op: ast::Operator) -> Self {
+        ConstraintOperator::AstNativeOperator(op)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -84,7 +105,8 @@ impl Constraint {
             panic!("Expected a valid binary expression");
         };
         let mut affinity = Affinity::Blob;
-        if op.is_comparison() && self.table_col_pos.is_some() {
+        if op.as_ast_operator().is_some_and(|op| op.is_comparison()) && self.table_col_pos.is_some()
+        {
             affinity = comparison_affinity(lhs, rhs, referenced_tables);
         }
 
@@ -92,12 +114,24 @@ impl Constraint {
             if affinity.expr_needs_no_affinity_change(lhs) {
                 affinity = Affinity::Blob;
             }
-            (self.operator, lhs.clone(), affinity)
+            (
+                self.operator
+                    .as_ast_operator()
+                    .expect("expected an ast operator because as_binary_components returned Some"),
+                lhs.clone(),
+                affinity,
+            )
         } else {
             if affinity.expr_needs_no_affinity_change(rhs) {
                 affinity = Affinity::Blob;
             }
-            (self.operator, rhs.clone(), affinity)
+            (
+                self.operator
+                    .as_ast_operator()
+                    .expect("expected an ast operator because as_binary_components returned Some"),
+                rhs.clone(),
+                affinity,
+            )
         }
     }
 
@@ -184,6 +218,10 @@ const SELECTIVITY_IS_NULL: f64 = 0.1;
 const SELECTIVITY_IS_NOT_NULL: f64 = 0.9;
 /// In lieu of statistics, we estimate that other filters will reduce the output set to 90% of its size.
 const SELECTIVITY_OTHER: f64 = 0.9;
+/// In lieu of statistics, we estimate that a LIKE filter will reduce the output set to 20% of its size.
+const SELECTIVITY_LIKE: f64 = 0.2;
+/// In lieu of statistics, we estimate that a NOT LIKE filter will reduce the output set to 20% of its size.
+const SELECTIVITY_NOT_LIKE: f64 = 0.2;
 
 /// Estimate the selectivity of a constraint based on the operator, column type, and ANALYZE stats.
 ///
@@ -201,14 +239,14 @@ fn estimate_selectivity(
     column: Option<&Column>,
     column_pos: Option<usize>,
     available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
-    op: ast::Operator,
+    op: ConstraintOperator,
 ) -> f64 {
     // Get ANALYZE stats for this table if available
     let table_stats = schema.analyze_stats.table_stats(table_name);
     let row_count = table_stats.and_then(|s| s.row_count).unwrap_or(0);
 
     match op {
-        ast::Operator::Equals => {
+        ConstraintOperator::AstNativeOperator(ast::Operator::Equals) => {
             let is_pk_or_rowid_alias =
                 column.is_some_and(|c| c.is_rowid_alias() || c.primary_key());
 
@@ -264,12 +302,16 @@ fn estimate_selectivity(
                 SELECTIVITY_EQ_FALLBACK_UNINDEXED
             }
         }
-        ast::Operator::Greater
-        | ast::Operator::GreaterEquals
-        | ast::Operator::Less
-        | ast::Operator::LessEquals => SELECTIVITY_RANGE_FALLBACK,
-        ast::Operator::Is => SELECTIVITY_IS_NULL,
-        ast::Operator::IsNot => SELECTIVITY_IS_NOT_NULL,
+        ConstraintOperator::AstNativeOperator(ast::Operator::Greater)
+        | ConstraintOperator::AstNativeOperator(ast::Operator::GreaterEquals)
+        | ConstraintOperator::AstNativeOperator(ast::Operator::Less)
+        | ConstraintOperator::AstNativeOperator(ast::Operator::LessEquals) => {
+            SELECTIVITY_RANGE_FALLBACK
+        }
+        ConstraintOperator::AstNativeOperator(ast::Operator::Is) => SELECTIVITY_IS_NULL,
+        ConstraintOperator::AstNativeOperator(ast::Operator::IsNot) => SELECTIVITY_IS_NOT_NULL,
+        ConstraintOperator::Like { not: false } => SELECTIVITY_LIKE,
+        ConstraintOperator::Like { not: true } => SELECTIVITY_NOT_LIKE,
         _ => SELECTIVITY_OTHER,
     }
 }
@@ -495,14 +537,14 @@ fn estimate_constraint_selectivity(
     table_reference: &JoinedTable,
     column: Option<&Column>,
     column_pos: Option<usize>,
-    operator: ast::Operator,
+    operator: ConstraintOperator,
     constraining_expr: &ast::Expr,
     available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
     table_references: &TableReferences,
     subqueries: &[NonFromClauseSubquery],
 ) -> f64 {
     // Special-case: equality to another table's column is likely an equi-join.
-    if operator == ast::Operator::Equals {
+    if operator.as_ast_operator() == Some(ast::Operator::Equals) {
         if let Some(other_ref) = simple_column_ref(constraining_expr) {
             let other_table_id = match other_ref {
                 SimpleColumnRef::Column { table_id, .. } => table_id,
@@ -809,9 +851,9 @@ pub fn constraints_from_where_clause(
         // sort equalities first so that index keys will be properly constructed.
         // see e.g.: https://www.solarwinds.com/blog/the-left-prefix-index-rule
         cs.constraints.sort_by(|a, b| {
-            if a.operator == ast::Operator::Equals {
+            if a.operator == ast::Operator::Equals.into() {
                 Ordering::Less
-            } else if b.operator == ast::Operator::Equals {
+            } else if b.operator == ast::Operator::Equals.into() {
                 Ordering::Greater
             } else {
                 Ordering::Equal
@@ -1046,11 +1088,14 @@ pub fn usable_constraints_for_join_order<'a>(
             if usable.last().unwrap().eq.is_some() {
                 continue;
             }
-            match constraints[cref.constraint_vec_pos].operator {
-                ast::Operator::Greater | ast::Operator::GreaterEquals => {
+            match constraints[cref.constraint_vec_pos]
+                .operator
+                .as_ast_operator()
+            {
+                Some(ast::Operator::Greater) | Some(ast::Operator::GreaterEquals) => {
                     usable.last_mut().unwrap().lower_bound = Some(cref.constraint_vec_pos);
                 }
-                ast::Operator::Less | ast::Operator::LessEquals => {
+                Some(ast::Operator::Less) | Some(ast::Operator::LessEquals) => {
                     usable.last_mut().unwrap().upper_bound = Some(cref.constraint_vec_pos);
                 }
                 _ => {}
@@ -1068,7 +1113,7 @@ pub fn usable_constraints_for_join_order<'a>(
         }
         let operator = constraints[cref.constraint_vec_pos].operator;
         let table_col_pos = constraints[cref.constraint_vec_pos].table_col_pos;
-        if operator == ast::Operator::Equals
+        if operator == ast::Operator::Equals.into()
             && usable
                 .last()
                 .is_some_and(|x| x.table_col_pos == table_col_pos)
@@ -1076,8 +1121,8 @@ pub fn usable_constraints_for_join_order<'a>(
             // If we already have an equality constraint for this column, we can't use it again
             continue;
         }
-        let constraint_group = match operator {
-            ast::Operator::Equals => RangeConstraintRef {
+        let constraint_group = match operator.as_ast_operator() {
+            Some(ast::Operator::Equals) => RangeConstraintRef {
                 table_col_pos,
                 index_col_pos: cref.index_col_pos,
                 sort_order: cref.sort_order,
@@ -1085,15 +1130,17 @@ pub fn usable_constraints_for_join_order<'a>(
                 lower_bound: None,
                 upper_bound: None,
             },
-            ast::Operator::Greater | ast::Operator::GreaterEquals => RangeConstraintRef {
-                table_col_pos,
-                index_col_pos: cref.index_col_pos,
-                sort_order: cref.sort_order,
-                eq: None,
-                lower_bound: Some(cref.constraint_vec_pos),
-                upper_bound: None,
-            },
-            ast::Operator::Less | ast::Operator::LessEquals => RangeConstraintRef {
+            Some(ast::Operator::Greater) | Some(ast::Operator::GreaterEquals) => {
+                RangeConstraintRef {
+                    table_col_pos,
+                    index_col_pos: cref.index_col_pos,
+                    sort_order: cref.sort_order,
+                    eq: None,
+                    lower_bound: Some(cref.constraint_vec_pos),
+                    upper_bound: None,
+                }
+            }
+            Some(ast::Operator::Less) | Some(ast::Operator::LessEquals) => RangeConstraintRef {
                 table_col_pos,
                 index_col_pos: cref.index_col_pos,
                 sort_order: cref.sort_order,
@@ -1155,7 +1202,10 @@ pub fn convert_to_vtab_constraint(
         .collect()
 }
 
-fn to_ext_constraint_op(op: &ast::Operator) -> Option<ConstraintOp> {
+fn to_ext_constraint_op(op: &ConstraintOperator) -> Option<ConstraintOp> {
+    let ConstraintOperator::AstNativeOperator(op) = op else {
+        return None;
+    };
     match op {
         ast::Operator::Equals => Some(ConstraintOp::Eq),
         ast::Operator::Less => Some(ConstraintOp::Lt),
@@ -1167,8 +1217,11 @@ fn to_ext_constraint_op(op: &ast::Operator) -> Option<ConstraintOp> {
     }
 }
 
-fn opposite_cmp_op(op: ast::Operator) -> ast::Operator {
-    match op {
+fn opposite_cmp_op(op: ConstraintOperator) -> ConstraintOperator {
+    let ConstraintOperator::AstNativeOperator(op_inner) = &op else {
+        return op;
+    };
+    match op_inner {
         ast::Operator::Equals => ast::Operator::Equals,
         ast::Operator::Greater => ast::Operator::Less,
         ast::Operator::GreaterEquals => ast::Operator::LessEquals,
@@ -1179,4 +1232,5 @@ fn opposite_cmp_op(op: ast::Operator) -> ast::Operator {
         ast::Operator::IsNot => ast::Operator::IsNot,
         _ => panic!("unexpected operator: {op:?}"),
     }
+    .into()
 }

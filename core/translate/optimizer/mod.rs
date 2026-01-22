@@ -1090,7 +1090,7 @@ fn optimize_table_access(
         // So we should not convert LEFT JOIN to INNER JOIN based on IS NULL constraints.
         if constraints_per_table[i].constraints.iter().any(|c| {
             let is_from_where = where_clause[c.where_clause_pos.0].from_outer_join.is_none();
-            let is_is_null = c.operator == ast::Operator::Is;
+            let is_is_null = c.operator == ast::Operator::Is.into();
             is_from_where && !is_is_null
         }) {
             t.join_info.as_mut().unwrap().outer = false;
