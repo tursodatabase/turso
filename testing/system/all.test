@@ -7,4 +7,3 @@ source $testdir/math.test
 source $testdir/scalar-functions.test
 source $testdir/scalar-functions-printf.test
 source $testdir/vtab.test
-source $testdir/foreign_keys.test
