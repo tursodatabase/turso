@@ -91,6 +91,9 @@ impl AnalyzeStats {
 pub struct AutoAnalyzeStats {
     /// Per-table row counts keyed by normalized table name.
     tables: HashMap<String, u64>,
+    /// Per-index range scan row counts keyed by normalized index name.
+    /// These counts reflect rows visited and may be partial if a scan stops early.
+    index_range_rows: HashMap<String, u64>,
 }
 
 impl AutoAnalyzeStats {
@@ -106,6 +109,24 @@ impl AutoAnalyzeStats {
         self.tables.insert(table_name, row_count);
     }
 
+    /// Returns the observed row count for an index range scan, if present.
+    pub fn index_range_row_count(&self, index_name: &str) -> Option<u64> {
+        let index_name = normalize_ident(index_name);
+        self.index_range_rows.get(&index_name).copied()
+    }
+
+    /// Set the observed row count for an index range scan.
+    pub fn set_index_range_row_count(&mut self, index_name: &str, row_count: u64) {
+        let index_name = normalize_ident(index_name);
+        self.index_range_rows.insert(index_name, row_count);
+    }
+
+    /// Remove any cached stats for an index range scan.
+    pub fn remove_index_range(&mut self, index_name: &str) {
+        let index_name = normalize_ident(index_name);
+        self.index_range_rows.remove(&index_name);
+    }
+
     /// Remove any cached stats for a table.
     pub fn remove_table(&mut self, table_name: &str) {
         let table_name = normalize_ident(table_name);
@@ -115,6 +136,7 @@ impl AutoAnalyzeStats {
     /// Remove all cached stats.
     pub fn clear(&mut self) {
         self.tables.clear();
+        self.index_range_rows.clear();
     }
 }
 
