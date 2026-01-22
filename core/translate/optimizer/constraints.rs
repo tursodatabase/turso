@@ -1,6 +1,6 @@
 use crate::{
     schema::{Column, Index, Schema},
-    stats::TableStat,
+    stats::AutoAnalyzeStats,
     translate::{
         collate::get_collseq_from_expr,
         expr::{as_binary_components, comparison_affinity},
@@ -226,6 +226,7 @@ fn estimate_in_selectivity(in_list_len: f64, row_count: f64, not: bool) -> f64 {
 /// Falls back to hardcoded estimates when stats are unavailable.
 fn estimate_selectivity(
     schema: &Schema,
+    auto_stats: Option<&AutoAnalyzeStats>,
     table_name: &str,
     column: Option<&Column>,
     column_pos: Option<usize>,
@@ -235,7 +236,7 @@ fn estimate_selectivity(
 ) -> f64 {
     // Get ANALYZE stats for this table if available
     let table_stats = schema.analyze_stats.table_stats(table_name);
-    let row_count = table_stats.and_then(|s| s.row_count).unwrap_or(0);
+    let row_count = table_row_count(schema, auto_stats, params, table_name);
 
     match op {
         ConstraintOperator::AstNativeOperator(ast::Operator::Equals) => {
@@ -309,6 +310,22 @@ fn estimate_selectivity(
     }
 }
 
+/// Prefer TableStat row count, falling back to AutoAnalyzeStats if present,
+/// else default to CostModelParam fallback.
+fn table_row_count(
+    schema: &Schema,
+    auto_stats: Option<&AutoAnalyzeStats>,
+    params: &CostModelParams,
+    table_name: &str,
+) -> u64 {
+    schema
+        .analyze_stats
+        .table_stats(table_name)
+        .and_then(|stats| stats.row_count)
+        .or_else(|| auto_stats.and_then(|stats| stats.row_count(table_name)))
+        .unwrap_or(params.rows_per_table_fallback as u64)
+}
+
 #[derive(Clone, Copy, Debug)]
 /// A simplified reference to a single column-like value in an expression.
 /// Used for estimating join selectivity, cheaper than ast::Expr
@@ -346,6 +363,7 @@ fn simple_column_ref(expr: &ast::Expr) -> Option<SimpleColumnRef> {
 ///   are intentionally conservative.
 fn estimate_column_ndv(
     schema: &Schema,
+    auto_stats: Option<&AutoAnalyzeStats>,
     table_reference: &JoinedTable,
     column_pos: Option<usize>,
     is_rowid_expr: bool,
@@ -354,9 +372,7 @@ fn estimate_column_ndv(
 ) -> Option<f64> {
     let table_name = table_reference.table.get_name();
     let table_stats = schema.analyze_stats.table_stats(table_name);
-    let row_count = table_stats
-        .and_then(|s| s.row_count)
-        .unwrap_or(params.rows_per_table_fallback as u64) as f64;
+    let row_count = table_row_count(schema, auto_stats, params, table_name) as f64;
 
     if is_rowid_expr {
         return Some(row_count.max(1.0));
@@ -416,6 +432,7 @@ fn estimate_column_ndv(
 
 fn estimate_join_eq_selectivity(
     schema: &Schema,
+    auto_stats: Option<&AutoAnalyzeStats>,
     table_reference: &JoinedTable,
     column_pos: Option<usize>,
     other_ref: SimpleColumnRef,
@@ -438,6 +455,7 @@ fn estimate_join_eq_selectivity(
 
     let left_ndv = estimate_column_ndv(
         schema,
+        auto_stats,
         table_reference,
         column_pos,
         false,
@@ -446,6 +464,7 @@ fn estimate_join_eq_selectivity(
     );
     let right_ndv = estimate_column_ndv(
         schema,
+        auto_stats,
         other_table,
         other_col_pos,
         other_is_rowid,
@@ -459,8 +478,18 @@ fn estimate_join_eq_selectivity(
     let right_stats = schema
         .analyze_stats
         .table_stats(other_table.table.get_name());
-    let left_ndv = join_ndv_with_fallback(left_stats, left_ndv, params);
-    let right_ndv = join_ndv_with_fallback(right_stats, right_ndv, params);
+
+    let left_row_count =
+        table_row_count(schema, auto_stats, params, table_reference.table.get_name());
+    let right_row_count = table_row_count(schema, auto_stats, params, other_table.table.get_name());
+
+    let left_has_stats = left_stats.is_some()
+        || auto_stats.is_some_and(|s| s.row_count(table_reference.table.get_name()).is_some());
+    let right_has_stats = right_stats.is_some()
+        || auto_stats.is_some_and(|s| s.row_count(other_table.table.get_name()).is_some());
+
+    let left_ndv = join_ndv_with_fallback(left_row_count, left_has_stats, left_ndv);
+    let right_ndv = join_ndv_with_fallback(right_row_count, right_has_stats, right_ndv);
 
     let max_ndv = match (left_ndv, right_ndv) {
         (Some(left), Some(right)) => left.max(right),
@@ -481,6 +510,7 @@ fn estimate_join_eq_selectivity(
 /// back to sqrt(rows) when ANALYZE data is missing.
 fn estimate_generic_eq_join_selectivity(
     schema: &Schema,
+    auto_stats: Option<&AutoAnalyzeStats>,
     left_table: &JoinedTable,
     right_table: &JoinedTable,
     params: &CostModelParams,
@@ -491,8 +521,15 @@ fn estimate_generic_eq_join_selectivity(
     let right_stats = schema
         .analyze_stats
         .table_stats(right_table.table.get_name());
-    let left_ndv = join_ndv_with_fallback(left_stats, None, params).unwrap_or(0.0);
-    let right_ndv = join_ndv_with_fallback(right_stats, None, params).unwrap_or(0.0);
+    let left_row_count = table_row_count(schema, auto_stats, params, left_table.table.get_name());
+    let right_row_count = table_row_count(schema, auto_stats, params, right_table.table.get_name());
+    let left_has_stats = left_stats.is_some()
+        || auto_stats.is_some_and(|s| s.row_count(left_table.table.get_name()).is_some());
+    let right_has_stats = right_stats.is_some()
+        || auto_stats.is_some_and(|s| s.row_count(right_table.table.get_name()).is_some());
+
+    let left_ndv = join_ndv_with_fallback(left_row_count, left_has_stats, None).unwrap_or(0.0);
+    let right_ndv = join_ndv_with_fallback(right_row_count, right_has_stats, None).unwrap_or(0.0);
 
     let max_ndv = left_ndv.max(right_ndv);
     if max_ndv <= 0.0 {
@@ -505,15 +542,8 @@ fn estimate_generic_eq_join_selectivity(
 ///
 /// If ANALYZE stats are missing, we fall back to sqrt(row_count). When we already
 /// have a column NDV, we clamp it to at least the fallback to avoid underestimates.
-fn join_ndv_with_fallback(
-    stats: Option<&TableStat>,
-    column_ndv: Option<f64>,
-    params: &CostModelParams,
-) -> Option<f64> {
-    let row_count = stats
-        .and_then(|s| s.row_count)
-        .unwrap_or(params.rows_per_table_fallback as u64) as f64;
-    let has_stats = stats.is_some() && stats.and_then(|s| s.row_count).is_some();
+fn join_ndv_with_fallback(row_count: u64, has_stats: bool, column_ndv: Option<f64>) -> Option<f64> {
+    let row_count = row_count as f64;
     let fallback_ndv = row_count.sqrt().max(1.0);
     if has_stats {
         Some(column_ndv.unwrap_or_else(|| row_count.max(1.0)))
@@ -537,6 +567,7 @@ fn join_ndv_with_fallback(
 ///   non-equality operators, and general column constraints (possibly using index stats).
 fn estimate_constraint_selectivity(
     schema: &Schema,
+    auto_stats: Option<&AutoAnalyzeStats>,
     table_reference: &JoinedTable,
     column: Option<&Column>,
     column_pos: Option<usize>,
@@ -558,6 +589,7 @@ fn estimate_constraint_selectivity(
                 // Only treat as a join if it references a different table than the constrained one.
                 if let Some(selectivity) = estimate_join_eq_selectivity(
                     schema,
+                    auto_stats,
                     table_reference,
                     column_pos,
                     other_ref,
@@ -576,6 +608,7 @@ fn estimate_constraint_selectivity(
                     if other_table.internal_id != table_reference.internal_id {
                         if let Some(selectivity) = estimate_generic_eq_join_selectivity(
                             schema,
+                            auto_stats,
                             table_reference,
                             other_table,
                             params,
@@ -591,6 +624,7 @@ fn estimate_constraint_selectivity(
     // Generic constraint selectivity (constants, non-equality, same-table refs, etc).
     estimate_selectivity(
         schema,
+        auto_stats,
         table_reference.table.get_name(),
         column,
         column_pos,
@@ -628,6 +662,7 @@ pub fn constraints_from_where_clause(
     subqueries: &[NonFromClauseSubquery],
     schema: &Schema,
     params: &CostModelParams,
+    auto_stats: Option<&AutoAnalyzeStats>,
 ) -> Result<Vec<TableConstraints>> {
     let mut constraints = Vec::new();
 
@@ -686,6 +721,7 @@ pub fn constraints_from_where_clause(
                                 lhs_mask: table_mask_from_expr(rhs, table_references, subqueries)?,
                                 selectivity: estimate_constraint_selectivity(
                                     schema,
+                                    auto_stats,
                                     table_reference,
                                     Some(table_column),
                                     Some(*column),
@@ -715,6 +751,7 @@ pub fn constraints_from_where_clause(
                                 lhs_mask: table_mask_from_expr(rhs, table_references, subqueries)?,
                                 selectivity: estimate_constraint_selectivity(
                                     schema,
+                                    auto_stats,
                                     table_reference,
                                     Some(table_column),
                                     rowid_alias_column,
@@ -738,6 +775,7 @@ pub fn constraints_from_where_clause(
                     {
                         let selectivity = estimate_constraint_selectivity(
                             schema,
+                            auto_stats,
                             table_reference,
                             None,
                             None,
@@ -780,6 +818,7 @@ pub fn constraints_from_where_clause(
                                 lhs_mask: table_mask_from_expr(lhs, table_references, subqueries)?,
                                 selectivity: estimate_constraint_selectivity(
                                     schema,
+                                    auto_stats,
                                     table_reference,
                                     Some(table_column),
                                     Some(*column),
@@ -806,6 +845,7 @@ pub fn constraints_from_where_clause(
                                 lhs_mask: table_mask_from_expr(lhs, table_references, subqueries)?,
                                 selectivity: estimate_constraint_selectivity(
                                     schema,
+                                    auto_stats,
                                     table_reference,
                                     Some(table_column),
                                     rowid_alias_column,
@@ -829,6 +869,7 @@ pub fn constraints_from_where_clause(
                     {
                         let selectivity = estimate_constraint_selectivity(
                             schema,
+                            auto_stats,
                             table_reference,
                             None,
                             None,

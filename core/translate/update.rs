@@ -81,7 +81,13 @@ pub fn translate_update(
         }
     }
 
-    optimize_plan(&mut program, &mut plan, resolver.schema)?;
+    let auto_stats = connection.auto_analyze_stats_snapshot();
+    optimize_plan(
+        &mut program,
+        &mut plan,
+        resolver.schema,
+        auto_stats.as_ref(),
+    )?;
     let opts = ProgramBuilderOpts {
         num_cursors: 1,
         approx_num_insns: 20,
@@ -122,7 +128,13 @@ pub fn translate_update_for_schema_change(
         }
     }
 
-    optimize_plan(&mut program, &mut plan, resolver.schema)?;
+    let auto_stats = connection.auto_analyze_stats_snapshot();
+    optimize_plan(
+        &mut program,
+        &mut plan,
+        resolver.schema,
+        auto_stats.as_ref(),
+    )?;
     let opts = ProgramBuilderOpts {
         num_cursors: 1,
         approx_num_insns: 20,

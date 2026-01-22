@@ -2,6 +2,7 @@ use crate::{
     function::Deterministic,
     index_method::IndexMethodCostEstimate,
     schema::{BTreeTable, Index, IndexColumn, Schema, Table, ROWID_SENTINEL},
+    stats::AutoAnalyzeStats,
     translate::{
         insert::ROWID_COLUMN,
         optimizer::{
@@ -408,17 +409,22 @@ fn collect_index_method_candidates(
 }
 
 #[tracing::instrument(skip_all, level = tracing::Level::DEBUG)]
-pub fn optimize_plan(program: &mut ProgramBuilder, plan: &mut Plan, schema: &Schema) -> Result<()> {
+pub fn optimize_plan(
+    program: &mut ProgramBuilder,
+    plan: &mut Plan,
+    schema: &Schema,
+    auto_stats: Option<&AutoAnalyzeStats>,
+) -> Result<()> {
     match plan {
-        Plan::Select(plan) => optimize_select_plan(plan, schema)?,
-        Plan::Delete(plan) => optimize_delete_plan(plan, schema)?,
-        Plan::Update(plan) => optimize_update_plan(program, plan, schema)?,
+        Plan::Select(plan) => optimize_select_plan(plan, schema, auto_stats)?,
+        Plan::Delete(plan) => optimize_delete_plan(plan, schema, auto_stats)?,
+        Plan::Update(plan) => optimize_update_plan(program, plan, schema, auto_stats)?,
         Plan::CompoundSelect {
             left, right_most, ..
         } => {
-            optimize_select_plan(right_most, schema)?;
+            optimize_select_plan(right_most, schema, auto_stats)?;
             for (plan, _) in left {
-                optimize_select_plan(plan, schema)?;
+                optimize_select_plan(plan, schema, auto_stats)?;
             }
         }
     }
@@ -481,12 +487,16 @@ fn transform_match_to_fts_match(where_clause: &mut [WhereTerm]) {
  * TODO: these could probably be done in less passes,
  * but having them separate makes them easier to understand
  */
-pub fn optimize_select_plan(plan: &mut SelectPlan, schema: &Schema) -> Result<()> {
+pub fn optimize_select_plan(
+    plan: &mut SelectPlan,
+    schema: &Schema,
+    auto_stats: Option<&AutoAnalyzeStats>,
+) -> Result<()> {
     // Transform MATCH expressions to fts_match() for FTS optimizer recognition
     #[cfg(all(feature = "fts", not(target_family = "wasm")))]
     transform_match_to_fts_match(&mut plan.where_clause);
 
-    optimize_subqueries(plan, schema)?;
+    optimize_subqueries(plan, schema, auto_stats)?;
     lift_common_subexpressions_from_binary_or_terms(&mut plan.where_clause)?;
     if let ConstantConditionEliminationResult::ImpossibleCondition =
         eliminate_constant_conditions(&mut plan.where_clause)?
@@ -497,6 +507,7 @@ pub fn optimize_select_plan(plan: &mut SelectPlan, schema: &Schema) -> Result<()
 
     let best_join_order = optimize_table_access(
         schema,
+        auto_stats,
         &mut plan.result_columns,
         &mut plan.table_references,
         &schema.indexes,
@@ -515,7 +526,11 @@ pub fn optimize_select_plan(plan: &mut SelectPlan, schema: &Schema) -> Result<()
     Ok(())
 }
 
-fn optimize_delete_plan(plan: &mut DeletePlan, schema: &Schema) -> Result<()> {
+fn optimize_delete_plan(
+    plan: &mut DeletePlan,
+    schema: &Schema,
+    auto_stats: Option<&AutoAnalyzeStats>,
+) -> Result<()> {
     #[cfg(all(feature = "fts", not(target_family = "wasm")))]
     transform_match_to_fts_match(&mut plan.where_clause);
 
@@ -528,11 +543,12 @@ fn optimize_delete_plan(plan: &mut DeletePlan, schema: &Schema) -> Result<()> {
     }
 
     if let Some(rowset_plan) = plan.rowset_plan.as_mut() {
-        optimize_select_plan(rowset_plan, schema)?;
+        optimize_select_plan(rowset_plan, schema, auto_stats)?;
     }
 
     let _ = optimize_table_access(
         schema,
+        auto_stats,
         &mut plan.result_columns,
         &mut plan.table_references,
         &schema.indexes,
@@ -551,6 +567,7 @@ fn optimize_update_plan(
     program: &mut ProgramBuilder,
     plan: &mut UpdatePlan,
     schema: &Schema,
+    auto_stats: Option<&AutoAnalyzeStats>,
 ) -> Result<()> {
     #[cfg(all(feature = "fts", not(target_family = "wasm")))]
     transform_match_to_fts_match(&mut plan.where_clause);
@@ -563,6 +580,7 @@ fn optimize_update_plan(
     }
     let _ = optimize_table_access(
         schema,
+        auto_stats,
         &mut [],
         &mut plan.table_references,
         &schema.indexes,
@@ -763,18 +781,22 @@ fn add_ephemeral_table_to_update_plan(
     Ok(())
 }
 
-fn optimize_subqueries(plan: &mut SelectPlan, schema: &Schema) -> Result<()> {
+fn optimize_subqueries(
+    plan: &mut SelectPlan,
+    schema: &Schema,
+    auto_stats: Option<&AutoAnalyzeStats>,
+) -> Result<()> {
     for table in plan.table_references.joined_tables_mut() {
         if let Table::FromClauseSubquery(from_clause_subquery) = &mut table.table {
             // Use match to handle both SelectPlan and CompoundSelect variants
             match from_clause_subquery.plan.as_mut() {
-                Plan::Select(select_plan) => optimize_select_plan(select_plan, schema)?,
+                Plan::Select(select_plan) => optimize_select_plan(select_plan, schema, auto_stats)?,
                 Plan::CompoundSelect {
                     left, right_most, ..
                 } => {
-                    optimize_select_plan(right_most, schema)?;
+                    optimize_select_plan(right_most, schema, auto_stats)?;
                     for (select_plan, _) in left {
-                        optimize_select_plan(select_plan, schema)?;
+                        optimize_select_plan(select_plan, schema, auto_stats)?;
                     }
                 }
                 Plan::Delete(_) | Plan::Update(_) => {
@@ -944,6 +966,7 @@ fn base_row_estimate(
     schema: &Schema,
     table: &JoinedTable,
     params: &cost_params::CostModelParams,
+    auto_stats: Option<&AutoAnalyzeStats>,
 ) -> RowCountEstimate {
     match &table.table {
         Table::BTree(btree) => {
@@ -956,6 +979,9 @@ fn base_row_estimate(
                 }) {
                     return RowCountEstimate::AnalyzeStats(rows as f64);
                 }
+            }
+            if let Some(rows) = auto_stats.and_then(|stats| stats.row_count(&btree.name)) {
+                return RowCountEstimate::AnalyzeStats(rows as f64);
             }
             RowCountEstimate::hardcoded_fallback(params)
         }
@@ -977,6 +1003,7 @@ fn base_row_estimate(
 #[allow(clippy::too_many_arguments)]
 fn optimize_table_access(
     schema: &Schema,
+    auto_stats: Option<&AutoAnalyzeStats>,
     result_columns: &mut [ResultSetColumn],
     table_references: &mut TableReferences,
     available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
@@ -1045,7 +1072,7 @@ fn optimize_table_access(
     let base_table_rows_for_candidates = table_references
         .joined_tables()
         .iter()
-        .map(|t| base_row_estimate(schema, t, params))
+        .map(|t| base_row_estimate(schema, t, params, auto_stats))
         .collect::<Vec<_>>();
 
     let index_method_candidates = if !is_single_table {
@@ -1071,12 +1098,13 @@ fn optimize_table_access(
         subqueries,
         schema,
         params,
+        auto_stats,
     )?;
 
     let base_table_rows = table_references
         .joined_tables()
         .iter()
-        .map(|t| base_row_estimate(schema, t, params))
+        .map(|t| base_row_estimate(schema, t, params, auto_stats))
         .collect::<Vec<_>>();
 
     // Currently the expressions we evaluate as constraints are binary comparisons that (except for IS/IS NOT)

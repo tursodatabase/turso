@@ -318,7 +318,8 @@ fn get_subquery_parser<'a>(
                         "compound SELECT queries not supported yet in WHERE clause subqueries"
                     );
                 };
-                optimize_select_plan(&mut plan, resolver.schema)?;
+                let auto_stats = connection.auto_analyze_stats_snapshot();
+                optimize_select_plan(&mut plan, resolver.schema, auto_stats.as_ref())?;
                 // EXISTS subqueries are satisfied after at most 1 row has been returned.
                 plan.limit = Some(Box::new(ast::Expr::Literal(ast::Literal::Numeric(
                     "1".to_string(),
@@ -366,7 +367,8 @@ fn get_subquery_parser<'a>(
                         "compound SELECT queries not supported yet in WHERE clause subqueries"
                     );
                 };
-                optimize_select_plan(&mut plan, resolver.schema)?;
+                let auto_stats = connection.auto_analyze_stats_snapshot();
+                optimize_select_plan(&mut plan, resolver.schema, auto_stats.as_ref())?;
                 let reg_count = plan.result_columns.len();
                 let reg_start = program.alloc_registers(reg_count);
 
@@ -434,7 +436,8 @@ fn get_subquery_parser<'a>(
                         "compound SELECT queries not supported yet in WHERE clause subqueries"
                     );
                 };
-                optimize_select_plan(&mut plan, resolver.schema)?;
+                let auto_stats = connection.auto_analyze_stats_snapshot();
+                optimize_select_plan(&mut plan, resolver.schema, auto_stats.as_ref())?;
                 // e.g. (x,y) IN (SELECT ...)
                 // or x IN (SELECT ...)
                 let lhs_column_count = match unwrap_parens(lhs.as_ref())? {

@@ -1,9 +1,5 @@
 #[cfg(target_family = "windows")]
 use crate::error::CompletionError;
-use crate::sync::{
-    atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU16, AtomicU64, Ordering},
-    Arc, RwLock,
-};
 #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
 use crate::types::{WalFrameInfo, WalState};
 #[cfg(feature = "fs")]
@@ -24,6 +20,13 @@ use crate::{
     DatabaseCatalog, DatabaseOpts, Duration, EncryptionKey, EncryptionOpts, IndexMethod,
     LimboError, MvStore, OpenFlags, PageSize, Pager, Parser, QueryMode, QueryRunner, Result,
     Schema, Statement, SyncMode, TransactionMode, TransactionState, Trigger, Value, VirtualTable,
+};
+use crate::{
+    schema::is_system_table,
+    sync::{
+        atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU16, AtomicU64, Ordering},
+        Arc, RwLock,
+    },
 };
 use arc_swap::ArcSwap;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
