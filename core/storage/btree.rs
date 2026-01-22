@@ -6796,11 +6796,11 @@ fn edit_page(
         debug_validate_cells!(page, usable_space);
     }
     // TODO: make page_free_array defragment, for now I'm lazy so this will work for now.
-    defragment_page(page, usable_space, 0)?;
+    let guard = defragment_page(page, usable_space, 0)?;
     // TODO: add to start
     if start_new_cells < start_old_cells {
         let count = number_new_cells.min(start_old_cells - start_new_cells);
-        page_insert_array(page, start_new_cells, count, cell_array, 0, usable_space)?;
+        page_insert_array(page, start_new_cells, count, cell_array, 0, guard)?;
         count_cells += count;
     }
     // TODO: overflow cells
@@ -6818,7 +6818,7 @@ fn edit_page(
                     1,
                     cell_array,
                     cell_idx,
-                    usable_space,
+                    guard,
                 )?;
             }
         }
@@ -6831,7 +6831,7 @@ fn edit_page(
         number_new_cells - count_cells,
         cell_array,
         count_cells,
-        usable_space,
+        guard,
     )?;
     debug_validate_cells!(page, usable_space);
     // TODO: noverflow
@@ -6951,14 +6951,14 @@ fn page_free_array(
 /// 6. Updating cell count once
 ///
 /// IMPORTANT: This function assumes the page has been defragmented before calling,
-/// which is the case in `edit_page()` where this is called from.
+/// We accept a `[DefragmentGuard]` as a parameter to ensure the caller has done so.
 fn page_insert_array(
     page: &mut PageContent,
     first: usize,
     count: usize,
     cell_array: &CellArray,
     start_insert: usize,
-    usable_space: usize,
+    _guard: DefragmentGuard,
 ) -> Result<()> {
     if count == 0 {
         return Ok(());
@@ -7244,7 +7244,7 @@ fn defragment_page_fast(
     usable_space: usize,
     freeblock_1st: usize,
     freeblock_2nd: usize,
-) -> Result<()> {
+) -> Result<DefragmentGuard> {
     turso_assert!(freeblock_1st != 0, "no free blocks");
     if freeblock_2nd > 0 {
         turso_assert!(freeblock_1st < freeblock_2nd, "1st freeblock is not before 2nd freeblock: freeblock_1st={freeblock_1st} freeblock_2nd={freeblock_2nd}");
@@ -7329,16 +7329,29 @@ fn defragment_page_fast(
 
     debug_validate_cells!(page, usable_space);
 
-    Ok(())
+    Ok(DefragmentGuard {})
 }
 
 /// Defragment a page, and never use the fast-path algorithm.
-fn defragment_page_full(page: &PageContent, usable_space: usize) -> Result<()> {
+fn defragment_page_full(page: &PageContent, usable_space: usize) -> Result<DefragmentGuard> {
     defragment_page(page, usable_space, -1)
 }
 
+/// For `[page_insert_array]` we must call defragment_page prior to ensure
+/// that there is enough contiguous space for the insert.
+///
+/// In order to assert this, we return a simple ZST "guard" from `defragment_page` that allows
+/// us to call `page_insert_array` only if the guard is held. Will be optimized away by the
+/// compile by the compiler.
+#[derive(Clone, Copy)]
+struct DefragmentGuard;
+
 /// Defragment a page. This means packing all the cells to the end of the page.
-fn defragment_page(page: &PageContent, usable_space: usize, max_frag_bytes: isize) -> Result<()> {
+fn defragment_page(
+    page: &PageContent,
+    usable_space: usize,
+    max_frag_bytes: isize,
+) -> Result<DefragmentGuard> {
     debug_validate_cells!(page, usable_space);
     tracing::debug!("defragment_page (optimized in-place)");
 
@@ -7348,7 +7361,7 @@ fn defragment_page(page: &PageContent, usable_space: usize, max_frag_bytes: isiz
         page.write_first_freeblock(0);
         page.write_fragmented_bytes_count(0);
         debug_validate_cells!(page, usable_space);
-        return Ok(());
+        return Ok(DefragmentGuard {});
     }
 
     // Use fast algorithm if there are at most 2 freeblocks and the total fragmented free space is less than max_frag_bytes.
@@ -7356,7 +7369,7 @@ fn defragment_page(page: &PageContent, usable_space: usize, max_frag_bytes: isiz
         let freeblock_1st = page.first_freeblock() as usize;
         if freeblock_1st == 0 {
             // No freeblocks and very little if any fragmented free bytes -> no need to defragment.
-            return Ok(());
+            return Ok(DefragmentGuard {});
         }
         let freeblock_2nd = page.read_u16_no_offset(freeblock_1st) as usize;
         if freeblock_2nd == 0 {
@@ -7477,7 +7490,7 @@ fn defragment_page(page: &PageContent, usable_space: usize, max_frag_bytes: isiz
 
     process_cells(page, usable_space, &mut cells, is_physically_sorted)?;
     debug_validate_cells!(page, usable_space);
-    Ok(())
+    Ok(DefragmentGuard {})
 }
 
 #[cfg(debug_assertions)]
