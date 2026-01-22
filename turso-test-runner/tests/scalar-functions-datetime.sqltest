@@ -210,6 +210,9 @@ test julianday-string-with-modifier {
 expect {
     2460084.0
 }
+expect @js {
+    2460084
+}
 
 test julianday-string-with-start-of-month {
     SELECT julianday('2023-05-18', 'start of month');
@@ -1352,6 +1355,9 @@ test julianday-noon {
 expect {
     2460083.0
 }
+expect @js {
+    2460083
+}
 
 test julianday-fractional-zero {
     SELECT julianday('2023-05-18 00:00:00.000');
@@ -2314,6 +2320,9 @@ test julianday-auto {
 }
 expect {
     0.0
+}
+expect @js {
+    0
 }
 
 test unixepoch-auto {

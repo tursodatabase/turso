@@ -138,6 +138,9 @@ test abs-char {
 expect {
     0.0
 }
+expect @js {
+    0
+}
 
 test abs-null {
     select abs(null);
@@ -787,6 +790,9 @@ test round-float-no-precision {
 expect {
     123.0
 }
+expect @js {
+    123
+}
 
 test round-float-with-precision {
     SELECT round(123.456, 2);
@@ -815,12 +821,18 @@ test round-text-non-parsable {
 expect {
     0.0
 }
+expect @js {
+    0
+}
 
 test round-integer-with-precision {
     SELECT round(123, 1);
 }
 expect {
     123.0
+}
+expect @js {
+    123
 }
 
 test round-float-negative-precision {
@@ -829,12 +841,18 @@ test round-float-negative-precision {
 expect {
     123.0
 }
+expect @js {
+    123
+}
 
 test round-float-zero-precision {
     SELECT round(123.456, 0);
 }
 expect {
     123.0
+}
+expect @js {
+    123
 }
 
 test round-null-precision {
@@ -1013,6 +1031,9 @@ test max-int-float {
 }
 expect {
     5.0
+}
+expect @js {
+    5
 }
 
 test min-float-int {
@@ -1615,6 +1636,9 @@ test cast-invalid-text-to-real {
 expect {
     0.0
 }
+expect @js {
+    0
+}
 
 test cast-text-prefix-to-real {
     SELECT CAST('123.45abc' AS REAL);
@@ -1628,6 +1652,9 @@ test cast-integer-to-real {
 }
 expect {
     123.0
+}
+expect @js {
+    123
 }
 
 # CAST tests - TEXT affinity
@@ -1724,6 +1751,9 @@ test cast-large-text-to-numeric {
 expect {
     real|9.22337203685478e+18
 }
+expect @js {
+    real|9223372036854780000
+}
 
 test cast-max-i64-text-to-numeric {
     SELECT CAST('9223372036854775807' AS NUMERIC);
@@ -1737,6 +1767,9 @@ test cast-negative-large-text-to-numeric {
 }
 expect {
     -9.22337203685478e+18
+}
+expect @js {
+    -9223372036854780000
 }
 
 test cast-null-to-any {

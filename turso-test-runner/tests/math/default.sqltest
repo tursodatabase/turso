@@ -91,6 +91,9 @@ test subtract-agg-float-agg-float {
 expect {
     0.0
 }
+expect @js {
+    0
+}
 
 test subtract-agg-int-agg-float-2 {
     SELECT sum(id) - sum(price) from products
@@ -182,12 +185,18 @@ test divide-agg-float {
 expect {
     44.0
 }
+expect @js {
+    44
+}
 
 test divide-float-agg {
     SELECT 66.0 / sum(id) from products
 }
 expect {
     1.0
+}
+expect @js {
+    1
 }
 
 test divide-agg-int-agg-int-2 {
@@ -202,6 +211,9 @@ test divide-agg-float-agg-float {
 }
 expect {
     1.0
+}
+expect @js {
+    1
 }
 
 test divide-agg-int-agg-float-2 {
@@ -274,6 +286,13 @@ expect {
     1.0
     2.0
 }
+expect @js {
+    1
+    2
+    0
+    1
+    2
+}
 
 test mod-products-price-id {
     SELECT mod(products.price, products.id) from products limit 5
@@ -291,6 +310,9 @@ test remainder-float-agg {
 }
 expect {
     23.0
+}
+expect @js {
+    23
 }
 
 test remainder-int-agg {
@@ -312,5 +334,8 @@ test remainder-agg-float {
 }
 expect {
     0.0
+}
+expect @js {
+    0
 }
 

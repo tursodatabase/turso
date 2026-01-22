@@ -13,6 +13,10 @@ expect raw {
 
 2352448.0
 }
+expect @js {
+
+    2352448
+}
 
 # Pattern matching tests (unrolled from foreach loop)
 test glob-1 { SELECT glob('abcdefg', 'abcdefg'); }

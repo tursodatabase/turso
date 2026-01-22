@@ -206,6 +206,13 @@ expect {
     Geo|100.0
     Casimer|100.0
 }
+expect @js {
+    Stefanie|100
+    Sallie|100
+    Jennifer|100
+    Geo|100
+    Casimer|100
+}
 
 test having_with_binary_cond {
     select u.first_name, sum(u.age) from users u group by u.first_name having sum(u.age) + 400 = 1016;
@@ -240,6 +247,13 @@ expect {
     Rosemary|10|59.0
     Trystan|10|55.0
     Neha|10|52.0
+}
+expect @js {
+    America|11|52
+    Amely|10|62
+    Rosemary|10|59
+    Trystan|10|55
+    Neha|10|52
 }
 
 # Trystan = 10, America = 11, Jaida = 11

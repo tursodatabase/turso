@@ -264,6 +264,10 @@ expect {
     1|||
     2|10|1|10.0
 }
+expect @js {
+    1|||
+    2|10|1|10
+}
 
 test left-join-real-integer {
     CREATE TABLE IF NOT EXISTS t3 (a INTEGER, b REAL);
@@ -275,6 +279,10 @@ test left-join-real-integer {
 expect {
     1|||
     2|10.0|1|10
+}
+expect @js {
+    1|||
+    2|10|1|10
 }
 
 test inner-join-integer-real {
@@ -288,6 +296,10 @@ expect {
     1|5|3|5.0
     2|10|1|10.0
 }
+expect @js {
+    1|5|3|5
+    2|10|1|10
+}
 
 test left-join-integer-real-zero {
     CREATE TABLE IF NOT EXISTS t7 (a INTEGER, b INTEGER);
@@ -299,6 +311,9 @@ test left-join-integer-real-zero {
 expect {
     1|0|1|0.0
 }
+expect @js {
+    1|0|1|0
+}
 
 test left-join-integer-real-negative {
     CREATE TABLE IF NOT EXISTS t9 (a INTEGER, b INTEGER);
@@ -309,6 +324,9 @@ test left-join-integer-real-negative {
 }
 expect {
     1|-10|1|-10.0
+}
+expect @js {
+    1|-10|1|-10
 }
 
 test left-join-integer-real-no-match {
@@ -331,6 +349,9 @@ test left-join-integer-real-multi-key {
 }
 expect {
     1|10|20|1|10.0|20.0
+}
+expect @js {
+    1|10|20|1|10|20
 }
 
 test affinity-hash-join {

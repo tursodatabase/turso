@@ -33,6 +33,10 @@ expect {
     Michael|2|37.5
     Sarah|1|65.0
 }
+expect @js {
+    Michael|2|37.5
+    Sarah|1|65
+}
 
 # In GROUP BY clauses, column aliases take precedence when resolving identifiers to columns.
 test group_by_alias_precedence {
@@ -88,6 +92,9 @@ test having_without_group_by_complex_condition {
 }
 expect {
     15|3.0
+}
+expect @js {
+    15|3
 }
 
 test having_without_group_by_count {

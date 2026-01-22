@@ -167,6 +167,9 @@ test multiply-agg-int-agg-float {
 expect {
     7.0
 }
+expect @js {
+    7
+}
 
 test multiply-agg-float-agg-int {
     SELECT sum(2.5) * sum(3)
@@ -247,12 +250,18 @@ test divide-agg-int-agg-float {
 expect {
     2.0
 }
+expect @js {
+    2
+}
 
 test divide-agg-float-agg-int {
     SELECT sum(4.0) / sum(2)
 }
 expect {
     2.0
+}
+expect @js {
+    2
 }
 
 test add-float-text-edgecase {
@@ -474,6 +483,9 @@ test acos-int {
 expect {
     0.0
 }
+expect @js {
+    0
+}
 
 test acos-float {
     SELECT acos(-0.5)
@@ -500,6 +512,9 @@ test acosh-int {
 }
 expect {
     0.0
+}
+expect @js {
+    0
 }
 
 test acosh-float {
@@ -669,6 +684,9 @@ test atanh-int {
 expect {
     0.0
 }
+expect @js {
+    0
+}
 
 test atanh-float {
     SELECT atanh(-0.5)
@@ -703,12 +721,18 @@ test ceil-float {
 expect {
     -1.0
 }
+expect @js {
+    -1
+}
 
 test ceil-str {
     SELECT ceil('1.5')
 }
 expect {
     2.0
+}
+expect @js {
+    2
 }
 
 test ceil-null {
@@ -730,12 +754,18 @@ test ceiling-float {
 expect {
     -1.0
 }
+expect @js {
+    -1
+}
 
 test ceiling-str {
     SELECT ceiling('1.5')
 }
 expect {
     2.0
+}
+expect @js {
+    2
 }
 
 test ceiling-null {
@@ -865,12 +895,18 @@ test floor-float {
 expect {
     -2.0
 }
+expect @js {
+    -2
+}
 
 test floor-str {
     SELECT floor('1.5')
 }
 expect {
     1.0
+}
+expect @js {
+    1
 }
 
 test floor-null {
@@ -884,6 +920,9 @@ test ln-int {
 }
 expect {
     0.0
+}
+expect @js {
+    0
 }
 
 test ln-float {
@@ -918,6 +957,9 @@ test log10-int {
 expect {
     0.0
 }
+expect @js {
+    0
+}
 
 test log10-float {
     SELECT log10(0.5)
@@ -951,6 +993,9 @@ test log2-int {
 expect {
     0.0
 }
+expect @js {
+    0
+}
 
 test log2-float {
     SELECT log2(0.5)
@@ -958,12 +1003,18 @@ test log2-float {
 expect {
     -1.0
 }
+expect @js {
+    -1
+}
 
 test log2-str {
     SELECT log2('0.5')
 }
 expect {
     -1.0
+}
+expect @js {
+    -1
 }
 
 test log2-negative {
@@ -987,6 +1038,9 @@ expect {
 expect @cli {
     0.0174532925199433
 }
+expect @js {
+    0.0174532925199433
+}
 
 test radians-float {
     SELECT radians(-0.5)
@@ -997,6 +1051,9 @@ expect {
 expect @cli {
     -0.00872664625997165
 }
+expect @js {
+    -0.00872664625997165
+}
 
 test radians-str {
     SELECT radians('-0.5')
@@ -1005,6 +1062,9 @@ expect {
     -0.008726646259972
 }
 expect @cli {
+    -0.00872664625997165
+}
+expect @js {
     -0.00872664625997165
 }
 
@@ -1046,6 +1106,9 @@ test sqrt-int {
 }
 expect {
     1.0
+}
+expect @js {
+    1
 }
 
 test sqrt-float {
@@ -1114,6 +1177,9 @@ test trunc-float {
 expect {
     2.0
 }
+expect @js {
+    2
+}
 
 test trunc-float-negative {
     SELECT trunc(-2.5)
@@ -1121,12 +1187,18 @@ test trunc-float-negative {
 expect {
     -2.0
 }
+expect @js {
+    -2
+}
 
 test trunc-str {
     SELECT trunc('2.5')
 }
 expect {
     2.0
+}
+expect @js {
+    2
 }
 
 test trunc-null {
@@ -1202,6 +1274,9 @@ test mod-int-int {
 expect {
     1.0
 }
+expect @js {
+    1
+}
 
 test mod-int-float {
     SELECT mod(5, -1.5)
@@ -1230,6 +1305,9 @@ test mod-float-float {
 expect {
     1.0
 }
+expect @js {
+    1
+}
 
 test mod-float-str {
     SELECT mod(5.5, '-1.5')
@@ -1237,12 +1315,18 @@ test mod-float-str {
 expect {
     1.0
 }
+expect @js {
+    1
+}
 
 test mod-str-str {
     SELECT mod('5.5', '-1.5')
 }
 expect {
     1.0
+}
+expect @js {
+    1
 }
 
 test mod-null-int {
@@ -1279,6 +1363,9 @@ expect {
 expect @cli {
     0.0894427190999916
 }
+expect @js {
+    0.0894427190999916
+}
 
 test pow-int-str {
     SELECT pow(5, '-1.5')
@@ -1287,6 +1374,9 @@ expect {
     0.089442719099992
 }
 expect @cli {
+    0.0894427190999916
+}
+expect @js {
     0.0894427190999916
 }
 
@@ -1346,6 +1436,9 @@ expect {
 expect @cli {
     0.0894427190999916
 }
+expect @js {
+    0.0894427190999916
+}
 
 test power-int-str {
     SELECT power(5, '-1.5')
@@ -1354,6 +1447,9 @@ expect {
     0.089442719099992
 }
 expect @cli {
+    0.0894427190999916
+}
+expect @js {
     0.0894427190999916
 }
 
@@ -1403,6 +1499,9 @@ test log-int {
 expect {
     0.0
 }
+expect @js {
+    0
+}
 
 test log-float {
     SELECT log(1.5)
@@ -1435,6 +1534,9 @@ test log-int-int {
 }
 expect {
     0.0
+}
+expect @js {
+    0
 }
 
 test log-int-float {
@@ -1528,6 +1630,9 @@ test remainder-int-float {
 expect {
     8.0
 }
+expect @js {
+    8
+}
 
 test remainder-float-int {
     SELECT 38.43 % 13
@@ -1535,12 +1640,18 @@ test remainder-float-int {
 expect {
     12.0
 }
+expect @js {
+    12
+}
 
 test remainder-0-float {
     SELECT 0 % 12.0
 }
 expect {
     0.0
+}
+expect @js {
+    0
 }
 
 test remainder-float-0 {
@@ -1554,6 +1665,9 @@ test remainder-float-float {
 }
 expect {
     11.0
+}
+expect @js {
+    11
 }
 
 test comp-float-float {
@@ -1656,12 +1770,18 @@ test add-text-4 {
 expect {
     11.0
 }
+expect @js {
+    11
+}
 
 test add-text-5 {
     SELECT 11.0 + 'a'
 }
 expect {
     11.0
+}
+expect @js {
+    11
 }
 
 test add-text-7 {
@@ -1677,12 +1797,18 @@ test add-text-8 {
 expect {
     3.0
 }
+expect @js {
+    3
+}
 
 test add-text-9 {
     SELECT '1.0' + '3.0'
 }
 expect {
     4.0
+}
+expect @js {
+    4
 }
 
 # add-overflow tests
@@ -1699,6 +1825,9 @@ test add-overflow-2 {
 expect {
     9.22337203685478e+18
 }
+expect @js {
+    9223372036854776000
+}
 
 test add-overflow-3 {
     SELECT 9223372036854775807 + 0
@@ -1712,6 +1841,9 @@ test add-overflow-4 {
 }
 expect {
     9.22337203685478e+18
+}
+expect @js {
+    9223372036854776000
 }
 
 test add-overflow-5 {
@@ -1727,6 +1859,9 @@ test add-overflow-6 {
 expect {
     -9.22337203685478e+18
 }
+expect @js {
+    -9223372036854776000
+}
 
 test add-overflow-7 {
     SELECT -9223372036854775808 + 0
@@ -1740,6 +1875,9 @@ test add-overflow-8 {
 }
 expect {
     -9.22337203685478e+18
+}
+expect @js {
+    -9223372036854776000
 }
 
 # subtract-text tests
@@ -1770,12 +1908,18 @@ test subtract-text-4 {
 expect {
     -11.0
 }
+expect @js {
+    -11
+}
 
 test subtract-text-5 {
     SELECT 11.0 - 'a'
 }
 expect {
     11.0
+}
+expect @js {
+    11
 }
 
 test subtract-text-7 {
@@ -1791,12 +1935,18 @@ test subtract-text-8 {
 expect {
     -1.0
 }
+expect @js {
+    -1
+}
 
 test subtract-text-9 {
     SELECT '1.0' - '3.0'
 }
 expect {
     -2.0
+}
+expect @js {
+    -2
 }
 
 # subtract-overflow tests
@@ -1813,6 +1963,9 @@ test subtract-overflow-2 {
 expect {
     9.22337203685478e+18
 }
+expect @js {
+    9223372036854776000
+}
 
 test subtract-overflow-3 {
     SELECT 9223372036854775807 - 0
@@ -1826,6 +1979,9 @@ test subtract-overflow-4 {
 }
 expect {
     9.22337203685478e+18
+}
+expect @js {
+    9223372036854776000
 }
 
 test subtract-overflow-5 {
@@ -1841,6 +1997,9 @@ test subtract-overflow-6 {
 expect {
     -9.22337203685478e+18
 }
+expect @js {
+    -9223372036854776000
+}
 
 test subtract-overflow-7 {
     SELECT -9223372036854775808 - 0
@@ -1854,6 +2013,9 @@ test subtract-overflow-8 {
 }
 expect {
     -9.22337203685478e+18
+}
+expect @js {
+    -9223372036854776000
 }
 
 # multiply-text tests
@@ -1884,12 +2046,18 @@ test multiply-text-4 {
 expect {
     0.0
 }
+expect @js {
+    0
+}
 
 test multiply-text-5 {
     SELECT 11.0 * 'a'
 }
 expect {
     0.0
+}
+expect @js {
+    0
 }
 
 test multiply-text-7 {
@@ -1905,12 +2073,18 @@ test multiply-text-8 {
 expect {
     2.0
 }
+expect @js {
+    2
+}
 
 test multiply-text-9 {
     SELECT '1.0' * '3.0'
 }
 expect {
     3.0
+}
+expect @js {
+    3
 }
 
 # multiply-overflow tests
@@ -1927,6 +2101,9 @@ test multiply-overflow-2 {
 expect {
     1.84467440737096e+19
 }
+expect @js {
+    18446744073709552000
+}
 
 test multiply-overflow-3 {
     SELECT 9223372036854775807 * 1
@@ -1940,6 +2117,9 @@ test multiply-overflow-4 {
 }
 expect {
     1.84467440737096e+19
+}
+expect @js {
+    18446744073709552000
 }
 
 test multiply-overflow-5 {
@@ -1955,6 +2135,9 @@ test multiply-overflow-6 {
 expect {
     -1.84467440737096e+19
 }
+expect @js {
+    -18446744073709552000
+}
 
 test multiply-overflow-7 {
     SELECT -9223372036854775808 * 1
@@ -1968,6 +2151,9 @@ test multiply-overflow-8 {
 }
 expect {
     -1.84467440737096e+19
+}
+expect @js {
+    -18446744073709552000
 }
 
 # divide-text tests
@@ -1995,6 +2181,9 @@ test divide-text-4 {
 }
 expect {
     0.0
+}
+expect @js {
+    0
 }
 
 test divide-text-5 {
@@ -2037,6 +2226,9 @@ test divide-overflow-6 {
 expect {
     9.22337203685478e+18
 }
+expect @js {
+    9223372036854776000
+}
 
 test divide-overflow-7 {
     SELECT -9223372036854775808 / 0
@@ -2049,6 +2241,9 @@ test divide-overflow-8 {
 }
 expect {
     9.22337203685478e+18
+}
+expect @js {
+    9223372036854776000
 }
 
 # bitwise-and-text tests
@@ -2731,6 +2926,9 @@ test remainder-text-4 {
 expect {
     0.0
 }
+expect @js {
+    0
+}
 
 test remainder-text-5 {
     SELECT 11.0 % 'a'
@@ -2751,12 +2949,18 @@ test remainder-text-8 {
 expect {
     1.0
 }
+expect @js {
+    1
+}
 
 test remainder-text-9 {
     SELECT '10.0' % -3
 }
 expect {
     1.0
+}
+expect @js {
+    1
 }
 
 # remainder-overflow tests
@@ -2779,6 +2983,9 @@ test remainder-overflow-3 {
 }
 expect {
     0.0
+}
+expect @js {
+    0
 }
 
 test is-nonnull-divide-by-zero {
