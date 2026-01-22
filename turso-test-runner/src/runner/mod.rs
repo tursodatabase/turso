@@ -1,8 +1,8 @@
 use crate::backends::{BackendError, SqlBackend};
 use crate::comparison::{ComparisonResult, compare};
 use crate::parser::ast::{Capability, DatabaseConfig, Requirement, TestCase, TestFile};
-use futures::stream::{FuturesUnordered, StreamExt};
 use futures::FutureExt;
+use futures::stream::{FuturesUnordered, StreamExt};
 use std::collections::HashSet;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};

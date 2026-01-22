@@ -2,25 +2,46 @@ use logos::{Lexer, Logos};
 use miette::{Diagnostic, SourceSpan};
 use std::fmt;
 
-/// Extract block content between braces, handling nested braces
+/// Extract block content between braces, handling nested braces and escape sequences
+/// Use `\}` to include a literal `}` that doesn't close the block
 /// Note: Does NOT trim content - trimming is handled by the parser based on context
 fn extract_block_content(lexer: &mut Lexer<'_, Token>) -> Option<String> {
     let remainder = lexer.remainder();
     let mut depth = 1;
+    let mut chars = remainder.char_indices().peekable();
+    let mut content = String::new();
 
-    for (idx, ch) in remainder.char_indices() {
+    while let Some((idx, ch)) = chars.next() {
         match ch {
-            '{' => depth += 1,
+            '\\' => {
+                // Escape sequence: check next character
+                if let Some(&(_, next_ch)) = chars.peek() {
+                    if next_ch == '}' || next_ch == '{' || next_ch == '\\' {
+                        // Consume the escaped character and add it literally
+                        chars.next();
+                        content.push(next_ch);
+                        continue;
+                    }
+                }
+                // Not a recognized escape sequence, keep the backslash
+                content.push(ch);
+            }
+            '{' => {
+                depth += 1;
+                content.push(ch);
+            }
             '}' => {
                 depth -= 1;
                 if depth == 0 {
-                    let content = remainder[..idx].to_string();
                     // Bump past the content and the closing brace
                     lexer.bump(idx + 1);
                     return Some(content);
                 }
+                content.push(ch);
             }
-            _ => {}
+            _ => {
+                content.push(ch);
+            }
         }
     }
 
@@ -394,6 +415,33 @@ mod tests {
             tokens[2].token,
             Token::BlockContent(" SELECT json_object('a', 1); ".to_string())
         );
+    }
+
+    #[test]
+    fn test_tokenize_escaped_braces() {
+        // Escaped closing brace should not end the block
+        let input = r#"expect raw { "\}" }"#;
+        let tokens = tokenize(input).unwrap();
+
+        assert_eq!(tokens[0].token, Token::Expect);
+        assert_eq!(tokens[1].token, Token::Raw);
+        // The \} is unescaped to just }
+        assert_eq!(tokens[2].token, Token::BlockContent(" \"}\" ".to_string()));
+
+        // Escaped opening brace
+        let input = r#"expect { \{ }"#;
+        let tokens = tokenize(input).unwrap();
+        assert_eq!(tokens[1].token, Token::BlockContent(" { ".to_string()));
+
+        // Escaped backslash
+        let input = r#"expect { \\ }"#;
+        let tokens = tokenize(input).unwrap();
+        assert_eq!(tokens[1].token, Token::BlockContent(r" \ ".to_string()));
+
+        // Backslash followed by other character is preserved
+        let input = r#"expect { \n }"#;
+        let tokens = tokenize(input).unwrap();
+        assert_eq!(tokens[1].token, Token::BlockContent(r" \n ".to_string()));
     }
 
     #[test]

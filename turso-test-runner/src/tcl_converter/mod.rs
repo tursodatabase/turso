@@ -65,7 +65,9 @@ fn get_db_declaration(db_key: &str, has_ddl: bool) -> String {
             "default" => "@database :default:\n@database :default-no-rowidalias:".to_string(),
             "norowidalias" => "@database :default-no-rowidalias:".to_string(),
             "small" => "@database database/testing_small.db readonly".to_string(),
-            "user_version_10" => "@database database/testing_user_version_10.db readonly".to_string(),
+            "user_version_10" => {
+                "@database database/testing_user_version_10.db readonly".to_string()
+            }
             other => {
                 // For unknown databases, try to construct a path
                 format!("@database database/{other}.db readonly")
