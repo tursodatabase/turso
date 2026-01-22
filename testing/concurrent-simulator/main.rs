@@ -1,6 +1,6 @@
 /// Whopper CLI - The Turso deterministic simulator
 use clap::Parser;
-use rand::RngCore;
+use rand::{Rng, RngCore};
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 use turso_whopper::{StepResult, Whopper, WhopperOpts, properties::*, workloads::*};
 
@@ -14,6 +14,8 @@ struct Args {
     /// Max connections
     #[arg(long, default_value_t = 4)]
     max_connections: usize,
+    #[arg(long, default_value_t = 0.0)]
+    restart_probability: f64,
     /// Max steps
     #[arg(long)]
     max_steps: Option<usize>,
@@ -72,7 +74,7 @@ fn main() -> anyhow::Result<()> {
     progress_index += 1;
 
     while !whopper.is_done() {
-        if whopper.current_step % 1000 == 0 {
+        if whopper.rng.random_bool(args.restart_probability) {
             whopper.restart().unwrap();
         }
         match whopper.step()? {

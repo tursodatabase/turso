@@ -385,7 +385,6 @@ struct SimulatorContext {
 /// The Whopper deterministic simulator.
 pub struct Whopper {
     context: SimulatorContext,
-    rng: ChaCha8Rng,
     io: Arc<dyn IO>,
     file_sizes: Arc<std::sync::Mutex<HashMap<String, u64>>>,
     db_path: String,
@@ -396,6 +395,7 @@ pub struct Whopper {
     properties: Vec<std::sync::Mutex<Box<dyn Property>>>,
     total_weight: u32,
     opts: Opts,
+    pub rng: ChaCha8Rng,
     pub current_step: usize,
     pub max_steps: usize,
     pub seed: u64,
@@ -629,7 +629,7 @@ impl Whopper {
             let _enter = span.enter();
             debug!("result={step_result:?}, rows.len()={}", rows.len());
 
-            if let Operation::Begin { .. } = &completed_op {
+            if matches!(completed_op, Operation::Begin { .. }) && step_result.is_ok() {
                 ctx.fiber.state = FiberState::InTx;
             }
 
@@ -662,6 +662,7 @@ impl Whopper {
                 match error {
                     // initiate rollback in case of some errors for fiber within transaction
                     turso_core::LimboError::SchemaUpdated
+                    | turso_core::LimboError::TableLocked
                     | turso_core::LimboError::Busy
                     | turso_core::LimboError::BusySnapshot
                     | turso_core::LimboError::WriteWriteConflict
