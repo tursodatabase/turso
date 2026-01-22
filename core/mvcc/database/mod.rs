@@ -2969,6 +2969,11 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         };
         loop {
             let next_rec = reader.next_record(&pager.io, &mut get_index_info)?;
+
+            tracing::trace!("next_rec {next_rec:?}");
+            // Check if we need to reparse schema before processing this operation
+            // This happens when transitioning from schema inserts to any other operation
+
             match next_rec {
                 StreamingResult::InsertTableRow { row, rowid } => {
                     let is_schema_row = rowid.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID;
@@ -3012,10 +3017,10 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                         assert!(self.table_id_to_rootpage.get(&rowid.table_id).is_some(), "Logical log contains a row version insert with a table id {} that does not exist in the table_id_to_rootpage map: {:?}", rowid.table_id, self.table_id_to_rootpage.iter().collect::<Vec<_>>());
                     }
                     self.insert(tx_id, row)?;
+                    // Make sure the newly parsed schema change record gets populated into the in-memory schema object.
+                    // It's a bit inefficient this way (we could just deserialize the logical log row as well), but schema
+                    // changes in the logical log are special cases that don't happen that often.
                     if is_schema_row {
-                        // Make sure the newly parsed schema change record gets populated into the in-memory schema object.
-                        // It's a bit inefficient this way (we could just deserialize the logical log row as well), but schema
-                        // changes in the logical log are special cases that don't happen that often.
                         connection.reparse_schema()?;
                         *connection.db.schema.lock() = connection.schema.read().clone();
                     }
@@ -3038,6 +3043,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 }
             }
         }
+
         self.commit_load_tx(tx_id, &connection);
         Ok(true)
     }

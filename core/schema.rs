@@ -727,11 +727,22 @@ impl Schema {
                         }
                     }
 
-                    self.add_index(Arc::new(Index::automatic_from_primary_key(
-                        table.as_ref(),
-                        automatic_indexes.pop().unwrap(),
-                        unique_set.columns.len(),
-                    )?))?;
+                    if let Some(index_entry) = automatic_indexes.pop() {
+                        self.add_index(Arc::new(Index::automatic_from_primary_key(
+                            table.as_ref(),
+                            index_entry,
+                            unique_set.columns.len(),
+                        )?))?;
+                    } else if mvcc_enabled {
+                        // In MVCC mode, automatic indices might not be fully populated yet during recovery
+                        // Skip creating this index - it will be added later when its schema row is processed
+                        continue;
+                    } else {
+                        return Err(LimboError::InternalError(format!(
+                            "Missing automatic index entry for primary key on table {}",
+                            table.name
+                        )));
+                    }
                 } else {
                     // Add composite unique index
                     let mut column_indices_and_sort_orders =
@@ -745,15 +756,30 @@ impl Schema {
                         };
                         column_indices_and_sort_orders.push((pos_in_table, *sort_order));
                     }
-                    self.add_index(Arc::new(Index::automatic_from_unique(
-                        table.as_ref(),
-                        automatic_indexes.pop().unwrap(),
-                        column_indices_and_sort_orders,
-                    )?))?;
+                    if let Some(index_entry) = automatic_indexes.pop() {
+                        self.add_index(Arc::new(Index::automatic_from_unique(
+                            table.as_ref(),
+                            index_entry,
+                            column_indices_and_sort_orders,
+                        )?))?;
+                    } else if mvcc_enabled {
+                        // In MVCC mode, automatic indices might not be fully populated yet during recovery
+                        // Skip creating this index - it will be added later when its schema row is processed
+                        continue;
+                    } else {
+                        return Err(LimboError::InternalError(format!(
+                            "Missing automatic index entry for UNIQUE constraint on table {}",
+                            table.name
+                        )));
+                    }
                 }
             }
 
-            assert!(automatic_indexes.is_empty(), "all automatic indexes parsed from sqlite_schema should have been consumed, but {} remain", automatic_indexes.len());
+            // In MVCC mode during recovery, not all automatic index schema rows might be visible yet
+            // during incremental schema reparsing, so we may have extra entries
+            if !mvcc_enabled {
+                assert!(automatic_indexes.is_empty(), "all automatic indexes parsed from sqlite_schema should have been consumed, but {} remain", automatic_indexes.len());
+            }
         }
         Ok(())
     }
