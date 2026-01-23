@@ -92,6 +92,13 @@ pub struct Connection {
     pub(crate) vtab_txn_states: RwLock<HashSet<u64>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AttachedDatabasesFingerprint {
+    pub(crate) count: usize,
+    pub(crate) hash1: u64,
+    pub(crate) hash2: u64,
+}
+
 // SAFETY: This needs to be audited for thread safety.
 // See: https://github.com/tursodatabase/turso/issues/1552
 crate::assert::assert_send_sync!(Connection);
@@ -1321,6 +1328,58 @@ impl Connection {
                 Ok(abs_path) => abs_path.to_string_lossy().to_string(),
                 Err(_) => db.path.to_string(),
             }
+        }
+    }
+
+    pub(crate) fn attached_databases_fingerprint(&self) -> AttachedDatabasesFingerprint {
+        const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+        const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+        fn hash_bytes(mut hash: u64, bytes: &[u8]) -> u64 {
+            for &byte in bytes {
+                hash ^= byte as u64;
+                hash = hash.wrapping_mul(FNV_PRIME);
+            }
+            hash
+        }
+
+        fn hash_u64(hash: u64, value: u64) -> u64 {
+            hash_bytes(hash, &value.to_le_bytes())
+        }
+
+        fn hash_entry(index: usize, alias: &str, db_ptr: usize) -> u64 {
+            let mut hash = FNV_OFFSET_BASIS;
+            hash = hash_u64(hash, index as u64);
+            hash = hash_bytes(hash, alias.as_bytes());
+            hash_u64(hash, db_ptr as u64)
+        }
+
+        let attached = self.attached_databases.read();
+        if attached.name_to_index.is_empty() {
+            return AttachedDatabasesFingerprint {
+                count: 0,
+                hash1: 0,
+                hash2: 0,
+            };
+        }
+
+        let mut hash1 = 0u64;
+        let mut hash2 = 0u64;
+        for (alias, &index) in attached.name_to_index.iter() {
+            let db_ptr = attached
+                .index_to_data
+                .get(&index)
+                .map(|(db, _pager)| Arc::as_ptr(db) as usize)
+                .unwrap_or(0);
+            let entry_hash = hash_entry(index, alias.as_str(), db_ptr);
+            hash1 = hash1.wrapping_add(entry_hash);
+            hash2 ^= entry_hash.rotate_left(17);
+        }
+
+        AttachedDatabasesFingerprint {
+            count: attached.name_to_index.len(),
+            hash1,
+            hash2,
         }
     }
 

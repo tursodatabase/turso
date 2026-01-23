@@ -50,7 +50,7 @@ use crate::{
         hash_table::HashTable,
         metrics::StatementMetrics,
     },
-    ValueRef,
+    CipherMode, ValueRef,
 };
 
 use smallvec::SmallVec;
@@ -62,6 +62,7 @@ use crate::{
     vdbe::{builder::CursorType, insn::Insn},
 };
 
+use crate::connection::AttachedDatabasesFingerprint;
 #[cfg(feature = "json")]
 use crate::json::JsonCacheCell;
 use crate::sync::RwLock;
@@ -834,7 +835,7 @@ pub struct PrepareContext {
     query_only: bool,
     capture_data_changes: CaptureDataChangesMode,
     syms_generation: u64,
-    databases: Vec<(usize, String, String)>,
+    attached_databases_fingerprint: AttachedDatabasesFingerprint,
     busy_timeout_ms: u64,
     cache_size: i32,
     spill_enabled: bool,
@@ -842,7 +843,7 @@ pub struct PrepareContext {
     sync_mode: SyncMode,
     data_sync_retry: bool,
     encryption_key_set: bool,
-    encryption_cipher: Option<String>,
+    encryption_cipher: CipherMode,
     mvcc_checkpoint_threshold: Option<i64>,
 }
 
@@ -855,7 +856,7 @@ impl PrepareContext {
             query_only: connection.get_query_only(),
             capture_data_changes: connection.get_capture_data_changes().clone(),
             syms_generation: connection.syms_generation(),
-            databases: connection.list_all_databases(),
+            attached_databases_fingerprint: connection.attached_databases_fingerprint(),
             busy_timeout_ms: connection.get_busy_timeout().as_millis() as u64,
             cache_size: connection.get_cache_size(),
             spill_enabled: pager.get_spill_enabled(),
@@ -863,9 +864,7 @@ impl PrepareContext {
             sync_mode: connection.get_sync_mode(),
             data_sync_retry: connection.get_data_sync_retry(),
             encryption_key_set: connection.encryption_key.read().is_some(),
-            encryption_cipher: connection
-                .get_encryption_cipher_mode()
-                .map(|cipher| cipher.to_string()),
+            encryption_cipher: connection.encryption_cipher_mode.get(),
             mvcc_checkpoint_threshold: connection
                 .db
                 .mvcc_enabled()
