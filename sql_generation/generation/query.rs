@@ -60,10 +60,17 @@ impl Arbitrary for FromClause {
                 }
 
                 let predicate = Predicate::arbitrary_from(rng, context, &table);
+                // Randomly select join type, with higher probability for INNER (most common)
+                let join_type = match rng.random_range(0..10u8) {
+                    0..=6 => JoinType::Inner, // 70%
+                    7..=8 => JoinType::Left,  // 20%
+                    9 => JoinType::Cross,     // 10%
+                    _ => JoinType::Inner,
+                };
                 Some(JoinedTable {
                     table: joined_table_name,
                     alias: None,
-                    join_type: JoinType::Inner,
+                    join_type,
                     on: predicate,
                 })
             })
