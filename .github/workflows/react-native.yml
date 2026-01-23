@@ -1,4 +1,4 @@
-name: Build & publish @tursodatabase/react-native
+name: Build & publish @tursodatabase/sync-react-native
 
 on:
   workflow_dispatch:

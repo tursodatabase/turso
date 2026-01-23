@@ -46,7 +46,7 @@ const TursoNative: TursoNativeModule | undefined = NativeModules.Turso;
 // Check if native module is available
 if (!TursoNative) {
   throw new Error(
-    `turso-react-native: Native module not found. Make sure you have properly linked the library.\n` +
+    `@tursodatabase/sync-react-native: Native module not found. Make sure you have properly linked the library.\n` +
     `- iOS: Run 'pod install' in your ios directory\n` +
     `- Android: Make sure the package is properly included in your MainApplication.java`
   );
@@ -56,7 +56,7 @@ if (!TursoNative) {
 const installed = TursoNative.install();
 if (!installed) {
   throw new Error(
-    'turso-react-native: Failed to install JSI bindings. Make sure the New Architecture is enabled.'
+    '@tursodatabase/sync-react-native: Failed to install JSI bindings. Make sure the New Architecture is enabled.'
   );
 }
 
@@ -66,7 +66,7 @@ const TursoProxy: TursoProxyType = __TursoProxy;
 
 if (!TursoProxy) {
   throw new Error(
-    'turso-react-native: JSI bindings not found on global object. This is a bug.'
+    '@tursodatabase/sync-react-native: JSI bindings not found on global object. This is a bug.'
   );
 }
 
@@ -80,7 +80,7 @@ if (!TursoProxy) {
  *
  * @example
  * ```ts
- * import { getDbPath, connect } from '@tursodatabase/react-native';
+ * import { getDbPath, connect } from '@tursodatabase/sync-react-native';
  *
  * const dbPath = getDbPath('mydb.db');
  * const db = await connect({ path: dbPath });
@@ -114,7 +114,7 @@ export function getDbPath(filename: string, directory: 'documents' | 'database' 
  *
  * @example Local database (relative path)
  * ```ts
- * import { connect } from '@tursodatabase/react-native';
+ * import { connect } from '@tursodatabase/sync-react-native';
  *
  * // Relative path automatically placed in writable directory
  * const db = await connect({ path: 'local.db' });
@@ -140,7 +140,7 @@ export function getDbPath(filename: string, directory: 'documents' | 'database' 
  *
  * @example Using absolute path (advanced)
  * ```ts
- * import { connect, paths } from '@tursodatabase/react-native';
+ * import { connect, paths } from '@tursodatabase/sync-react-native';
  *
  * const db = await connect({ path: `${paths.documents}/mydb.db` });
  * ```
@@ -165,7 +165,7 @@ export function version(): string {
  * @param options - Configuration options
  * @example
  * ```ts
- * import { setup } from '@tursodatabase/react-native';
+ * import { setup } from '@tursodatabase/sync-react-native';
  *
  * setup({ logLevel: 'debug' });
  * ```
@@ -183,7 +183,7 @@ export function setup(options: {logLevel?: string}): void {
  *
  * @example
  * ```ts
- * import { paths, connect } from '@tursodatabase/react-native';
+ * import { paths, connect } from '@tursodatabase/sync-react-native';
  *
  * // Create database in app's documents/files directory
  * const dbPath = `${paths.documents}/mydb.db`;

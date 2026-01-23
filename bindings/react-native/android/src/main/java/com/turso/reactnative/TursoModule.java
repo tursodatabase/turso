@@ -20,7 +20,7 @@ public class TursoModule extends ReactContextBaseJavaModule {
 
     static {
         System.loadLibrary("turso_sync_sdk_kit");
-        System.loadLibrary("turso-react-native");
+        System.loadLibrary("turso-sync-react-native");
     }
 
     public TursoModule(ReactApplicationContext reactContext) {

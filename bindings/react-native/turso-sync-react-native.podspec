@@ -3,7 +3,7 @@ require "json"
 package = JSON.parse(File.read(File.join(__dir__, "package.json")))
 
 Pod::Spec.new do |s|
-  s.name         = "turso-react-native"
+  s.name         = "turso-sync-react-native"
   s.version      = package["version"]
   s.summary      = package["description"]
   s.homepage     = package["homepage"]
@@ -40,7 +40,7 @@ Pod::Spec.new do |s|
 
   # User header search paths for consumers
   s.user_target_xcconfig = {
-    "HEADER_SEARCH_PATHS" => "$(PODS_ROOT)/turso-react-native/cpp $(PODS_ROOT)/turso-react-native/libs/ios"
+    "HEADER_SEARCH_PATHS" => "$(PODS_ROOT)/turso-sync-react-native/cpp $(PODS_ROOT)/turso-sync-react-native/libs/ios"
   }
 
   # Build script to compile Rust
