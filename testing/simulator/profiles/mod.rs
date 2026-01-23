@@ -44,6 +44,11 @@ pub struct Profile {
     #[garde(skip)]
     /// Require differential testing for this profile (verifies content correctness)
     pub differential_required: bool,
+    #[garde(skip)]
+    /// Probability (0.0-1.0) of running integrity check after each query.
+    /// Default is 0.1 (10%). Set to 0.0 to disable, 1.0 for every query.
+    /// Note: Integrity checks are skipped during write transactions and with MVCC.
+    pub integrity_check_probability: f64,
 }
 
 impl Default for Profile {
@@ -56,6 +61,7 @@ impl Default for Profile {
             query: Default::default(),
             cache_size_pages: Some(2000),
             differential_required: false,
+            integrity_check_probability: 0.1, // 10% by default
         }
     }
 }
@@ -175,6 +181,7 @@ impl Profile {
             max_connections: 2,
             cache_size_pages: Some(2000),
             differential_required: false,
+            integrity_check_probability: 0.0, // MVCC skips integrity checks anyway
         };
         profile.validate().unwrap();
         profile
@@ -220,6 +227,7 @@ impl Profile {
             max_connections: 1, // Single connection to avoid locking issues with BEGIN IMMEDIATE
             cache_size_pages: Some(2000),
             differential_required: true, // Verify matview content matches rusqlite view
+            integrity_check_probability: 0.1,
         };
         profile.validate().unwrap();
         profile
