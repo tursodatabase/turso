@@ -146,31 +146,30 @@ impl Oracle for DifferentialOracle {
 impl DifferentialOracle {
     /// Execute a query on Turso and return the result.
     pub fn execute_turso(conn: &Arc<turso_core::Connection>, sql: &str) -> QueryResult {
-        match conn.query(sql) {
-            Ok(Some(mut stmt)) => {
-                let mut rows = Vec::new();
-                let result = stmt.run_with_row_callback(|row| {
-                    let mut values = Vec::new();
-                    for i in 0..row.len() {
-                        let value = Self::convert_turso_value(row.get_value(i).clone());
-                        values.push(value);
-                    }
-                    rows.push(Row(values));
-                    Ok(())
-                });
+        let execute = || {
+            let mut stmt = conn.prepare(sql)?;
 
-                match result {
-                    Ok(()) => {
-                        if rows.is_empty() {
-                            QueryResult::Ok
-                        } else {
-                            QueryResult::Rows(rows)
-                        }
-                    }
-                    Err(e) => QueryResult::Error(e.to_string()),
+            let mut rows = Vec::new();
+            stmt.run_with_row_callback(|row| {
+                let mut values = Vec::new();
+                for i in 0..row.len() {
+                    let value = Self::convert_turso_value(row.get_value(i).clone());
+                    values.push(value);
                 }
-            }
-            Ok(None) => QueryResult::Ok,
+                rows.push(Row(values));
+                Ok(())
+            })?;
+
+            let res = if rows.is_empty() {
+                QueryResult::Ok
+            } else {
+                QueryResult::Rows(rows)
+            };
+            Ok(res)
+        };
+        let result: Result<QueryResult, turso_core::LimboError> = execute();
+        match result {
+            Ok(res) => res,
             Err(e) => QueryResult::Error(e.to_string()),
         }
     }
@@ -178,44 +177,35 @@ impl DifferentialOracle {
     /// Execute a query on SQLite and return the result.
     pub fn execute_sqlite(conn: &rusqlite::Connection, sql: &str) -> QueryResult {
         // First try as a query that returns rows
-        match conn.prepare(sql) {
-            Ok(mut stmt) => {
-                let column_count = stmt.column_count();
-                if column_count == 0 {
-                    // Statement doesn't return rows (INSERT, UPDATE, DELETE, etc.)
-                    match stmt.execute([]) {
-                        Ok(_) => QueryResult::Ok,
-                        Err(e) => QueryResult::Error(e.to_string()),
+        let execute = || {
+            let mut stmt = conn.prepare(sql)?;
+            let column_count = stmt.column_count();
+            let res = if column_count == 0 {
+                // Statement doesn't return rows (INSERT, UPDATE, DELETE, etc.)
+                stmt.execute([])?;
+                QueryResult::Ok
+            } else {
+                let mut query_rows = stmt.query([])?;
+                let mut rows = Vec::new();
+                while let Some(row) = query_rows.next()? {
+                    let mut values = Vec::new();
+                    for i in 0..column_count {
+                        let value = Self::convert_sqlite_value(row.get_ref(i).ok());
+                        values.push(value);
                     }
-                } else {
-                    match stmt.query([]) {
-                        Ok(mut query_rows) => {
-                            let mut rows = Vec::new();
-                            loop {
-                                match query_rows.next() {
-                                    Ok(Some(row)) => {
-                                        let mut values = Vec::new();
-                                        for i in 0..column_count {
-                                            let value =
-                                                Self::convert_sqlite_value(row.get_ref(i).ok());
-                                            values.push(value);
-                                        }
-                                        rows.push(Row(values));
-                                    }
-                                    Ok(None) => break,
-                                    Err(e) => return QueryResult::Error(e.to_string()),
-                                }
-                            }
-                            if rows.is_empty() {
-                                QueryResult::Ok
-                            } else {
-                                QueryResult::Rows(rows)
-                            }
-                        }
-                        Err(e) => QueryResult::Error(e.to_string()),
-                    }
+                    rows.push(Row(values));
                 }
-            }
+                if rows.is_empty() {
+                    QueryResult::Ok
+                } else {
+                    QueryResult::Rows(rows)
+                }
+            };
+            Ok(res)
+        };
+        let result: Result<QueryResult, rusqlite::Error> = execute();
+        match result {
+            Ok(res) => res,
             Err(e) => QueryResult::Error(e.to_string()),
         }
     }
