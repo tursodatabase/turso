@@ -194,10 +194,9 @@ impl Value {
 
     pub fn exec_octet_length(&self) -> Self {
         match self {
-            Value::Text(_) | Value::Integer(_) | Value::Float(_) => {
-                Value::Integer(self.to_string().into_bytes().len() as i64)
-            }
+            Value::Text(s) => Value::Integer(s.as_str().len() as i64),
             Value::Blob(blob) => Value::Integer(blob.len() as i64),
+            Value::Integer(_) | Value::Float(_) => Value::Integer(self.to_string().len() as i64),
             _ => self.to_owned(),
         }
     }
