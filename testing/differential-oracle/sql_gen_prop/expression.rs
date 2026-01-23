@@ -82,18 +82,6 @@ pub enum Expression {
         expr: Box<Expression>,
         subquery: Box<SelectStatement>,
     },
-    /// Comparison with ANY subquery (e.g., `expr op ANY (SELECT ...)`).
-    AnySubquery {
-        left: Box<Expression>,
-        op: BinaryOperator,
-        subquery: Box<SelectStatement>,
-    },
-    /// Comparison with ALL subquery (e.g., `expr op ALL (SELECT ...)`).
-    AllSubquery {
-        left: Box<Expression>,
-        op: BinaryOperator,
-        subquery: Box<SelectStatement>,
-    },
 }
 
 /// Binary operators for expressions.
@@ -283,12 +271,6 @@ impl fmt::Display for Expression {
             Expression::NotInSubquery { expr, subquery } => {
                 write!(f, "{expr} NOT IN ({subquery})")
             }
-            Expression::AnySubquery { left, op, subquery } => {
-                write!(f, "{left} {op} ANY ({subquery})")
-            }
-            Expression::AllSubquery { left, op, subquery } => {
-                write!(f, "{left} {op} ALL ({subquery})")
-            }
         }
     }
 }
@@ -390,24 +372,6 @@ impl Expression {
         }
     }
 
-    /// Create an ANY subquery expression.
-    pub fn any_subquery(left: Expression, op: BinaryOperator, subquery: SelectStatement) -> Self {
-        Expression::AnySubquery {
-            left: Box::new(left),
-            op,
-            subquery: Box::new(subquery),
-        }
-    }
-
-    /// Create an ALL subquery expression.
-    pub fn all_subquery(left: Expression, op: BinaryOperator, subquery: SelectStatement) -> Self {
-        Expression::AllSubquery {
-            left: Box::new(left),
-            op,
-            subquery: Box::new(subquery),
-        }
-    }
-
     /// Create a comparison expression using BinaryOp.
     pub fn comparison(left: Expression, op: BinaryOperator, right: Expression) -> Self {
         Expression::binary(left, op, right)
@@ -430,7 +394,6 @@ impl Expression {
     /// - IS NULL / IS NOT NULL
     /// - EXISTS / NOT EXISTS
     /// - IN / NOT IN subqueries
-    /// - ANY / ALL comparison subqueries
     /// - AND / OR combinations of the above
     pub fn is_condition(&self) -> bool {
         match self {
@@ -440,9 +403,7 @@ impl Expression {
             | Expression::Exists { .. }
             | Expression::NotExists { .. }
             | Expression::InSubquery { .. }
-            | Expression::NotInSubquery { .. }
-            | Expression::AnySubquery { .. }
-            | Expression::AllSubquery { .. } => true,
+            | Expression::NotInSubquery { .. } => true,
             _ => false,
         }
     }
@@ -490,10 +451,6 @@ pub struct ExpressionProfile {
     pub in_subquery_weight: u32,
     /// Weight for NOT IN subquery expressions.
     pub not_in_subquery_weight: u32,
-    /// Weight for ANY comparison subquery expressions.
-    pub any_subquery_weight: u32,
-    /// Weight for ALL comparison subquery expressions.
-    pub all_subquery_weight: u32,
 
     // =========================================================================
     // Generation settings
@@ -535,8 +492,6 @@ impl Default for ExpressionProfile {
             not_exists_weight: 3,
             in_subquery_weight: 8,
             not_in_subquery_weight: 4,
-            any_subquery_weight: 3,
-            all_subquery_weight: 3,
             // Generation settings
             condition_max_depth: 2,
             max_order_by_items: 3,
@@ -589,8 +544,6 @@ impl ExpressionProfile {
             not_exists_weight: 0,
             in_subquery_weight: 0,
             not_in_subquery_weight: 0,
-            any_subquery_weight: 0,
-            all_subquery_weight: 0,
             // Simple generation settings
             condition_max_depth: 0,
             max_order_by_items: 1,
@@ -610,7 +563,6 @@ impl ExpressionProfile {
     /// - IS NULL / IS NOT NULL
     /// - EXISTS / NOT EXISTS
     /// - IN / NOT IN subqueries
-    /// - ANY / ALL comparison subqueries
     ///
     /// Settings like `function_profile`, `order_by_allow_integer_positions`,
     /// and `subquery_limit_max` are inherited from `self`.
@@ -656,16 +608,6 @@ impl ExpressionProfile {
             } else {
                 weight_or(self.not_in_subquery_weight, 4)
             },
-            any_subquery_weight: if subqueries_disabled {
-                0
-            } else {
-                weight_or(self.any_subquery_weight, 3)
-            },
-            all_subquery_weight: if subqueries_disabled {
-                0
-            } else {
-                weight_or(self.all_subquery_weight, 3)
-            },
             // Inherit settings from self
             condition_max_depth: self.condition_max_depth,
             max_order_by_items: self.max_order_by_items,
@@ -684,8 +626,6 @@ impl ExpressionProfile {
             + self.not_exists_weight
             + self.in_subquery_weight
             + self.not_in_subquery_weight
-            + self.any_subquery_weight
-            + self.all_subquery_weight
     }
 
     /// Returns true if any subquery conditions are enabled.
@@ -711,8 +651,6 @@ impl ExpressionProfile {
             ExpressionKind::NotExists => self.not_exists_weight = weight,
             ExpressionKind::InSubquery => self.in_subquery_weight = weight,
             ExpressionKind::NotInSubquery => self.not_in_subquery_weight = weight,
-            ExpressionKind::AnySubquery => self.any_subquery_weight = weight,
-            ExpressionKind::AllSubquery => self.all_subquery_weight = weight,
         }
         self
     }
@@ -741,8 +679,6 @@ impl ExpressionProfile {
             ExpressionKind::NotExists => self.not_exists_weight,
             ExpressionKind::InSubquery => self.in_subquery_weight,
             ExpressionKind::NotInSubquery => self.not_in_subquery_weight,
-            ExpressionKind::AnySubquery => self.any_subquery_weight,
-            ExpressionKind::AllSubquery => self.all_subquery_weight,
         }
     }
 
@@ -833,8 +769,6 @@ impl ExpressionProfile {
         self.not_exists_weight = 0;
         self.in_subquery_weight = 0;
         self.not_in_subquery_weight = 0;
-        self.any_subquery_weight = 0;
-        self.all_subquery_weight = 0;
         self
     }
 }
@@ -1058,12 +992,6 @@ impl SqlGeneratorKind for ExpressionKind {
                     && !ctx.columns.is_empty()
                     && !ctx.schema.tables.is_empty()
             }
-            // ANY/ALL subqueries require columns, tables and subquery depth > 0
-            ExpressionKind::AnySubquery | ExpressionKind::AllSubquery => {
-                ctx.profile.subquery_max_depth > 0
-                    && !ctx.columns.is_empty()
-                    && !ctx.schema.tables.is_empty()
-            }
         }
     }
 
@@ -1093,12 +1021,6 @@ impl SqlGeneratorKind for ExpressionKind {
             ExpressionKind::NotExists => exists_expression_strategy(ctx, profile, true),
             ExpressionKind::InSubquery => in_subquery_expression_strategy(ctx, profile, false),
             ExpressionKind::NotInSubquery => in_subquery_expression_strategy(ctx, profile, true),
-            ExpressionKind::AnySubquery => {
-                comparison_subquery_expression_strategy(ctx, profile, false)
-            }
-            ExpressionKind::AllSubquery => {
-                comparison_subquery_expression_strategy(ctx, profile, true)
-            }
         }
     }
 }
@@ -1429,64 +1351,6 @@ fn in_subquery_expression_strategy(
             } else {
                 Expression::InSubquery {
                     expr: Box::new(expr),
-                    subquery: Box::new(select),
-                }
-            }
-        })
-        .boxed()
-}
-
-/// Generate an ANY or ALL comparison subquery expression.
-fn comparison_subquery_expression_strategy(
-    ctx: &ExpressionContext,
-    profile: &StatementProfile,
-    is_all: bool,
-) -> BoxedStrategy<Expression> {
-    let tables = ctx.schema.tables.clone();
-    let schema = ctx.schema.clone();
-    let col_names: Vec<String> = ctx.columns.iter().map(|c| c.name.clone()).collect();
-
-    // Decrement subquery depth for inner query to prevent infinite recursion
-    let mut inner_profile = profile.clone();
-    inner_profile.generation.expression.base = inner_profile
-        .generation
-        .expression
-        .base
-        .with_decremented_subquery_depth();
-
-    (
-        proptest::sample::select(col_names),
-        prop_oneof![
-            Just(BinaryOperator::Eq),
-            Just(BinaryOperator::Ne),
-            Just(BinaryOperator::Lt),
-            Just(BinaryOperator::Le),
-            Just(BinaryOperator::Gt),
-            Just(BinaryOperator::Ge),
-        ],
-        proptest::sample::select((*tables).clone()),
-    )
-        .prop_flat_map({
-            let profile = inner_profile;
-            let schema = schema.clone();
-            move |(col_name, op, table)| {
-                let schema = schema.clone();
-                crate::select::select_for_table(&table, &schema, &profile)
-                    .prop_map(move |select| (col_name.clone(), op, select))
-            }
-        })
-        .prop_map(move |(col_name, op, select)| {
-            let left = Expression::Column(col_name);
-            if is_all {
-                Expression::AllSubquery {
-                    left: Box::new(left),
-                    op,
-                    subquery: Box::new(select),
-                }
-            } else {
-                Expression::AnySubquery {
-                    left: Box::new(left),
-                    op,
                     subquery: Box::new(select),
                 }
             }
