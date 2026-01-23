@@ -87,7 +87,10 @@ impl Clock for SimulatorIO {
 }
 
 impl IO for SimulatorIO {
-    fn sleep(&self, _duration: std::time::Duration) {}
+    fn sleep(&self, duration: std::time::Duration) {
+        self.time
+            .fetch_add(duration.as_micros() as u64, Ordering::SeqCst);
+    }
     fn open_file(&self, path: &str, _flags: OpenFlags, _create_new: bool) -> Result<Arc<dyn File>> {
         {
             let files = self.files.lock().unwrap();
