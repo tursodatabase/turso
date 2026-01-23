@@ -926,7 +926,54 @@ impl Shadow for FromClause {
                     }
                     join_table.rows = new_rows;
                 }
-                _ => todo!(),
+                JoinType::Left => {
+                    let prev_rows = std::mem::take(&mut join_table.rows);
+                    let mut new_rows = Vec::new();
+                    let null_row: Vec<_> = joined_table
+                        .columns
+                        .iter()
+                        .map(|_| SimValue::NULL)
+                        .collect();
+
+                    for row1 in prev_rows.into_iter() {
+                        let mut has_match = false;
+                        for row2 in joined_table.rows.iter() {
+                            let combined_row =
+                                row1.iter().chain(row2.iter()).cloned().collect::<Vec<_>>();
+                            if join.on.test(&combined_row, &join_table) {
+                                new_rows.push(combined_row);
+                                has_match = true;
+                            }
+                        }
+                        if !has_match {
+                            let combined_row = row1
+                                .iter()
+                                .chain(null_row.iter())
+                                .cloned()
+                                .collect::<Vec<_>>();
+                            new_rows.push(combined_row);
+                        }
+                    }
+                    join_table.rows = new_rows;
+                }
+                JoinType::Cross => {
+                    let prev_rows = std::mem::take(&mut join_table.rows);
+                    let new_rows: Vec<_> = prev_rows
+                        .into_iter()
+                        .flat_map(|row1| {
+                            joined_table.rows.iter().map(move |row2| {
+                                row1.iter().chain(row2.iter()).cloned().collect::<Vec<_>>()
+                            })
+                        })
+                        .collect();
+                    join_table.rows = new_rows;
+                }
+                JoinType::Right | JoinType::Full => {
+                    panic!(
+                        "RIGHT and FULL joins are not implemented. \
+                         Generation should not produce these join types."
+                    );
+                }
             }
         }
         Ok(join_table)
