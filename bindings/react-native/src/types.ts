@@ -384,7 +384,8 @@ export interface TursoNativeModule {
  * Global __TursoProxy object injected by native code
  */
 declare global {
-  const __TursoProxy: TursoProxy;
+  // eslint-disable-next-line no-var
+  var __TursoProxy: TursoProxy;
 }
 
 export {};

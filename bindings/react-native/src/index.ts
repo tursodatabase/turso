@@ -61,11 +61,8 @@ if (!installed) {
 }
 
 // Get the proxy that was installed on the global object
-declare const global: {
-  __TursoProxy?: TursoProxyType;
-};
-
-const TursoProxy: TursoProxyType = global.__TursoProxy!;
+// __TursoProxy is declared globally in types.ts
+const TursoProxy: TursoProxyType = __TursoProxy;
 
 if (!TursoProxy) {
   throw new Error(

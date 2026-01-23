@@ -14,9 +14,6 @@
 
 import type { NativeSyncIoItem, NativeSyncDatabase } from '../types';
 
-// Get the TursoProxy for native file system functions
-declare const __TursoProxy: any;
-
 /**
  * IO context contains auth and URL information for HTTP requests
  */
@@ -73,7 +70,7 @@ async function fsWriteFile(path: string, data: Uint8Array): Promise<void> {
   }
 
   // Use built-in JSI function
-  __TursoProxy.fsWriteFile(path, data.buffer);
+  __TursoProxy.fsWriteFile(path, data.buffer as ArrayBuffer);
 }
 
 /**
