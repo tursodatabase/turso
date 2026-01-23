@@ -100,3 +100,14 @@ pub struct FileCoverage {
     pub percentage: f64,
     pub points: Vec<CoverageSnapshot>,
 }
+
+/// Coverage grouped by function.
+#[derive(Debug, Clone)]
+pub struct FunctionCoverage {
+    pub function: &'static str,
+    pub file: &'static str,
+    pub total: usize,
+    pub covered: usize,
+    pub percentage: f64,
+    pub points: Vec<CoverageSnapshot>,
+}

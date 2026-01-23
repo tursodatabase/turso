@@ -7,7 +7,8 @@ pub use linkme;
 use linkme::distributed_slice;
 
 use crate::common::{
-    CoveragePoint, CoverageSnapshot, CoverageSummary, FileCoverage, ModuleCoverage,
+    CoveragePoint, CoverageSnapshot, CoverageSummary, FileCoverage, FunctionCoverage,
+    ModuleCoverage,
 };
 
 /// The global catalog of coverage points (populated at link time).
@@ -194,6 +195,42 @@ pub fn coverage_by_file() -> Vec<FileCoverage> {
     result
 }
 
+/// Get coverage grouped by function.
+pub fn coverage_by_function() -> Vec<FunctionCoverage> {
+    let report = get_coverage_report();
+    let mut by_function: HashMap<&'static str, Vec<CoverageSnapshot>> = HashMap::new();
+
+    for point in report {
+        by_function.entry(point.function).or_default().push(point);
+    }
+
+    let mut result: Vec<FunctionCoverage> = by_function
+        .into_iter()
+        .map(|(function, mut points)| {
+            points.sort_by_key(|p| p.line);
+            let total = points.len();
+            let covered = points.iter().filter(|p| p.hit_count > 0).count();
+            // Get file from first point (all points in same function should be in same file)
+            let file = points.first().map(|p| p.file).unwrap_or("");
+            FunctionCoverage {
+                function,
+                file,
+                total,
+                covered,
+                percentage: if total == 0 {
+                    100.0
+                } else {
+                    (covered as f64 / total as f64) * 100.0
+                },
+                points,
+            }
+        })
+        .collect();
+
+    result.sort_by(|a, b| a.function.cmp(b.function));
+    result
+}
+
 /// Format a coverage report as a human-readable string.
 pub fn format_coverage_report() -> String {
     let summary = coverage_summary();
@@ -268,6 +305,44 @@ pub fn format_uncovered_report() -> String {
     output
 }
 
+/// Format a coverage report grouped by function.
+pub fn format_function_coverage_report() -> String {
+    let summary = coverage_summary();
+    let mut output = String::new();
+
+    output.push_str(&format!(
+        "Function Coverage: {}/{} points ({:.1}%)\n",
+        summary.covered_points, summary.total_points, summary.percentage
+    ));
+    output.push_str(&"=".repeat(60));
+    output.push('\n');
+
+    for func_cov in coverage_by_function() {
+        let status = if func_cov.percentage == 100.0 {
+            "+"
+        } else if func_cov.covered > 0 {
+            "~"
+        } else {
+            "-"
+        };
+        output.push_str(&format!(
+            "\n{} {} ({}/{} = {:.1}%)\n",
+            status, func_cov.function, func_cov.covered, func_cov.total, func_cov.percentage
+        ));
+        output.push_str(&format!("  {}\n", func_cov.file));
+
+        for point in &func_cov.points {
+            let point_status = if point.hit_count > 0 { "+" } else { "-" };
+            output.push_str(&format!(
+                "    {} L{}: {} (hits: {})\n",
+                point_status, point.line, point.name, point.hit_count
+            ));
+        }
+    }
+
+    output
+}
+
 /// Print the full coverage report to stdout.
 pub fn print_coverage_report() {
     print!("{}", format_coverage_report());
@@ -276,6 +351,11 @@ pub fn print_coverage_report() {
 /// Print only uncovered points to stdout.
 pub fn print_uncovered_report() {
     print!("{}", format_uncovered_report());
+}
+
+/// Print the function coverage report to stdout.
+pub fn print_function_coverage_report() {
+    print!("{}", format_function_coverage_report());
 }
 
 #[cfg(test)]
