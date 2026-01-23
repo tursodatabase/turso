@@ -66,6 +66,10 @@ type TursoSyncDatabaseConfig struct {
 	// optional parameter which defines if pages prefetch must be enabled
 	// one of valid PartialBootstrapStrategy* values MUST be set in order for this setting to have some effect
 	PartialBootstrapPrefetch bool
+	// optional base64-encoded encryption key for remote encrypted databases
+	RemoteEncryptionKey string
+	// optional encryption cipher name (e.g. "aes256gcm", "chacha20poly1305")
+	RemoteEncryptionCipher string
 }
 
 // TursoSyncStats holds sync engine stats.
@@ -119,6 +123,8 @@ type turso_sync_database_config_t struct {
 	partial_bootstrap_strategy_query  uintptr // const char*
 	partial_bootstrap_segment_size    uintptr
 	partial_bootstrap_prefetch        bool
+	remote_encryption_key             uintptr // const char*
+	remote_encryption_cipher          uintptr // const char*
 }
 
 type turso_sync_io_http_request_t struct {
@@ -387,6 +393,7 @@ func turso_sync_database_new(dbConfig TursoDatabaseConfig, syncConfig TursoSyncD
 	// Build C sync config
 	var csync turso_sync_database_config_t
 	var syncPathBytes, remoteUrlBytes, clientNameBytes, queryBytes []byte
+	var encryptionKeyBytes, encryptionCipherBytes []byte
 	syncPathBytes, csync.path = makeCStringBytes(syncConfig.Path)
 	remoteUrlBytes, csync.remote_url = makeCStringBytes(syncConfig.RemoteUrl)
 	clientNameBytes, csync.client_name = makeCStringBytes(syncConfig.ClientName)
@@ -398,6 +405,12 @@ func turso_sync_database_new(dbConfig TursoDatabaseConfig, syncConfig TursoSyncD
 	csync.partial_bootstrap_prefetch = syncConfig.PartialBootstrapPrefetch
 	if syncConfig.PartialBootstrapStrategyQuery != "" {
 		queryBytes, csync.partial_bootstrap_strategy_query = makeCStringBytes(syncConfig.PartialBootstrapStrategyQuery)
+	}
+	if syncConfig.RemoteEncryptionKey != "" {
+		encryptionKeyBytes, csync.remote_encryption_key = makeCStringBytes(syncConfig.RemoteEncryptionKey)
+	}
+	if syncConfig.RemoteEncryptionCipher != "" {
+		encryptionCipherBytes, csync.remote_encryption_cipher = makeCStringBytes(syncConfig.RemoteEncryptionCipher)
 	}
 
 	var db *turso_sync_database_t
@@ -411,6 +424,8 @@ func turso_sync_database_new(dbConfig TursoDatabaseConfig, syncConfig TursoSyncD
 	runtime.KeepAlive(syncPathBytes)
 	runtime.KeepAlive(clientNameBytes)
 	runtime.KeepAlive(queryBytes)
+	runtime.KeepAlive(encryptionKeyBytes)
+	runtime.KeepAlive(encryptionCipherBytes)
 
 	if status == int32(TURSO_OK) {
 		return TursoSyncDatabase(db), nil
