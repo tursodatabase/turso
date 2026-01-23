@@ -51,8 +51,8 @@ ARG antithesis=true
 RUN apt-get update && apt-get install -y pip && rm -rf /var/lib/apt/lists/*
 RUN pip install maturin
 
-# Source: https://antithesis.com/assets/instrumentation/libvoidstar.so
-COPY testing/stress/libvoidstar.so /opt/antithesis/libvoidstar.so
+# Antithesis instrumentation library
+ADD https://antithesis.com/assets/instrumentation/libvoidstar.so /opt/antithesis/libvoidstar.so
 
 COPY --from=planner /app/recipe.json recipe.json
 RUN cargo chef cook --bin turso_stress --release --recipe-path recipe.json
