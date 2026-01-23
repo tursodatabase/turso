@@ -651,7 +651,7 @@ impl Whopper {
                     .inspect_err(|e| error!("property failed: {e}"))?;
             }
 
-            if let Operation::Rollback | Operation::Commit = &completed_op {
+            if matches!(&completed_op, Operation::Rollback | Operation::Commit) && op_result.is_ok() {
                 ctx.fiber.state = FiberState::Idle;
                 ctx.fiber.txn_id = None;
             }
