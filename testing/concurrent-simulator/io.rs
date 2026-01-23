@@ -4,7 +4,7 @@ use rand_chacha::ChaCha8Rng;
 use std::collections::{HashMap, HashSet};
 use std::fs::{File as StdFile, OpenOptions};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex};
 use tracing::debug;
 use turso_core::{
     Clock, Completion, File, IO, MonotonicInstant, OpenFlags, Result, WallClockInstant,
@@ -25,7 +25,7 @@ impl Default for IOFaultConfig {
 }
 
 pub struct SimulatorIO {
-    files: Mutex<Vec<(String, Weak<SimulatorFile>)>>,
+    files: Mutex<Vec<(String, Arc<SimulatorFile>)>>,
     file_sizes: Arc<Mutex<HashMap<String, u64>>>,
     keep_files: bool,
     rng: Mutex<ChaCha8Rng>,
@@ -87,12 +87,22 @@ impl Clock for SimulatorIO {
 }
 
 impl IO for SimulatorIO {
+    fn sleep(&self, duration: std::time::Duration) {
+        self.time
+            .fetch_add(duration.as_micros() as u64, Ordering::SeqCst);
+    }
     fn open_file(&self, path: &str, _flags: OpenFlags, _create_new: bool) -> Result<Arc<dyn File>> {
+        {
+            let files = self.files.lock().unwrap();
+            if let Some((_, file)) = files.iter().find(|f| f.0 == path) {
+                return Ok(file.clone());
+            }
+        }
+
         let file = Arc::new(SimulatorFile::new(path, self.file_sizes.clone()));
 
-        // Store weak reference to avoid keeping files open forever
         let mut files = self.files.lock().unwrap();
-        files.push((path.to_string(), Arc::downgrade(&file)));
+        files.push((path.to_string(), file.clone()));
 
         Ok(file as Arc<dyn File>)
     }
@@ -115,15 +125,14 @@ impl IO for SimulatorIO {
         if self.fault_config.cosmic_ray_probability > 0.0 {
             let mut rng = self.rng.lock().unwrap();
             if rng.random::<f64>() < self.fault_config.cosmic_ray_probability {
-                // Clean up dead weak references and collect live files
-                let mut files = self.files.lock().unwrap();
-                files.retain(|(_, weak)| weak.strong_count() > 0);
-
                 // Collect files that are still alive
-                let open_files: Vec<_> = files
-                    .iter()
-                    .filter_map(|(path, weak)| weak.upgrade().map(|file| (path.clone(), file)))
-                    .collect();
+                let open_files: Vec<_> = {
+                    let files = self.files.lock().unwrap();
+                    files
+                        .iter()
+                        .map(|(path, file)| (path.clone(), file.clone()))
+                        .collect()
+                };
 
                 if !open_files.is_empty() {
                     let file_idx = rng.random_range(0..open_files.len());
