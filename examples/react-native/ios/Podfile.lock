@@ -1849,7 +1849,7 @@ PODS:
     - React-utils (= 0.83.1)
     - ReactNativeDependencies
   - ReactNativeDependencies (0.83.1)
-  - turso-react-native (0.5.0-pre.1):
+  - turso-sync-react-native (0.5.0-pre.1):
     - hermes-engine
     - RCTRequired
     - RCTTypeSafety
@@ -1948,7 +1948,7 @@ DEPENDENCIES:
   - ReactCodegen (from `build/generated/ios/ReactCodegen`)
   - ReactCommon/turbomodule/core (from `../node_modules/react-native/ReactCommon`)
   - ReactNativeDependencies (from `../node_modules/react-native/third-party-podspecs/ReactNativeDependencies.podspec`)
-  - turso-react-native (from `../../../bindings/react-native`)
+  - turso-sync-react-native (from `../../../bindings/react-native`)
   - Yoga (from `../node_modules/react-native/ReactCommon/yoga`)
 
 EXTERNAL SOURCES:
@@ -2099,14 +2099,14 @@ EXTERNAL SOURCES:
     :path: "../node_modules/react-native/ReactCommon"
   ReactNativeDependencies:
     :podspec: "../node_modules/react-native/third-party-podspecs/ReactNativeDependencies.podspec"
-  turso-react-native:
+  turso-sync-react-native:
     :path: "../../../bindings/react-native"
   Yoga:
     :path: "../node_modules/react-native/ReactCommon/yoga"
 
 SPEC CHECKSUMS:
   FBLazyVector: 3a7ea85f6009224ad89f7daeda516f189e6b5759
-  hermes-engine: 78472c35ec6e1aa9ccc36a967856c2493b162277
+  hermes-engine: 5a6e4f4916802ace08c968c9aae2882dc8361120
   RCTDeprecation: a93fe21ed2fd99e13bf3b011390d1e9769c83d23
   RCTRequired: 176145d35686c966863f268c0f938f58ae23dc78
   RCTSwiftUI: a6c7271c39098bf00dbdad8f8ed997a59bbfbe44
@@ -2115,7 +2115,7 @@ SPEC CHECKSUMS:
   React: 4bc1f928568ad4bcfd147260f907b4ea5873a03b
   React-callinvoker: 8dd44c31888a314694efd0ef5f19ab7e0e855ef8
   React-Core: f18c490c5fe062f23028121b3b8eb7896dfccf33
-  React-Core-prebuilt: e8c4273199a8c1d9be230de5f2659359d68f076f
+  React-Core-prebuilt: 8aa2fc5f6b84645bbf070972e7b6023aefb03e11
   React-CoreModules: b247f4542b65276ad0a79cf4215a67b615edcebd
   React-cxxreact: 10e54c76ab0b06c8c7af6ad548133320fa1f5fa8
   React-debug: 60be0767f5672afc81bfd6a50d996507430f7906
@@ -2177,8 +2177,8 @@ SPEC CHECKSUMS:
   ReactAppDependencyProvider: 0eb286cc274abb059ee601b862ebddac2e681d01
   ReactCodegen: fc927f8651c51b06a38dff2328ffe27e75f4e211
   ReactCommon: c24a308601d0bce5c9edf2f36afb0dbf7afaf6ef
-  ReactNativeDependencies: da2a1c55153aaf3ac176d6ff6d4db7a00b0225b8
-  turso-react-native: 12abf502feac202dd3801835163a9441162b3b41
+  ReactNativeDependencies: 551fd24a2ad4ad89817e6dca6a57ecc615c02c11
+  turso-sync-react-native: c033177472fe50c0aa44c846d1ff93859b851194
   Yoga: 35d573dff66536d48493acb65a519482f8219fe8
 
 PODFILE CHECKSUM: e6bd9e298e2f896bccf3db29e39bb42d539cd8bd
