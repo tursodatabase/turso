@@ -379,7 +379,7 @@ impl fmt::Display for CreateTableStatement {
             write!(f, "IF NOT EXISTS ")?;
         }
 
-        write!(f, "\"{}\" (", self.table_name)?;
+        write!(f, "{} (", self.table_name)?;
 
         let col_defs: Vec<String> = self.columns.iter().map(|c| c.to_string()).collect();
         write!(f, "{})", col_defs.join(", "))
@@ -643,7 +643,7 @@ mod tests {
 
         assert_eq!(
             stmt.to_string(),
-            "CREATE TABLE \"users\" (\"id\" INTEGER PRIMARY KEY, \"name\" TEXT NOT NULL, \"email\" TEXT UNIQUE)"
+            "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, email TEXT UNIQUE)"
         );
     }
 
@@ -664,7 +664,7 @@ mod tests {
 
         assert_eq!(
             stmt.to_string(),
-            "CREATE TABLE IF NOT EXISTS \"test\" (\"id\" INTEGER PRIMARY KEY)"
+            "CREATE TABLE IF NOT EXISTS test (id INTEGER PRIMARY KEY)"
         );
     }
 

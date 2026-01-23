@@ -333,7 +333,7 @@ impl fmt::Display for CreateTriggerStatement {
         }
         write!(
             f,
-            "\"{}\" {} {} ON \"{}\" BEGIN ",
+            "{} {} {} ON {} BEGIN ",
             self.name, self.timing, self.event, self.table_name
         )?;
         for stmt in &self.body {
@@ -473,7 +473,7 @@ mod tests {
         fn create_trigger_generates_valid_sql(stmt in create_trigger_for_table(&test_table().into(), &test_schema(), &Default::default())) {
             let sql = stmt.to_string();
             prop_assert!(sql.starts_with("CREATE TRIGGER"));
-            prop_assert!(sql.contains("ON \"users\""));
+            prop_assert!(sql.contains("ON users"));
             prop_assert!(sql.contains("BEGIN") && sql.contains("END"));
         }
 

@@ -61,7 +61,7 @@ impl fmt::Display for RollbackStatement {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "ROLLBACK")?;
         if let Some(name) = &self.savepoint_name {
-            write!(f, " TO SAVEPOINT \"{name}\"")?;
+            write!(f, " TO SAVEPOINT {name}")?;
         }
         Ok(())
     }
@@ -76,7 +76,7 @@ pub struct SavepointStatement {
 
 impl fmt::Display for SavepointStatement {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "SAVEPOINT \"{}\"", self.name)
+        write!(f, "SAVEPOINT {}", self.name)
     }
 }
 
@@ -89,7 +89,7 @@ pub struct ReleaseStatement {
 
 impl fmt::Display for ReleaseStatement {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "RELEASE SAVEPOINT \"{}\"", self.name)
+        write!(f, "RELEASE SAVEPOINT {}", self.name)
     }
 }
 

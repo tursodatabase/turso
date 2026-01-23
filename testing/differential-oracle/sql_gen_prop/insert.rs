@@ -64,10 +64,10 @@ pub struct InsertStatement {
 
 impl fmt::Display for InsertStatement {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "INSERT INTO \"{}\"", self.table)?;
+        write!(f, "INSERT INTO {}", self.table)?;
 
         if !self.columns.is_empty() {
-            let cols: Vec<String> = self.columns.iter().map(|c| format!("\"{c}\"")).collect();
+            let cols: Vec<String> = self.columns.iter().map(|c| c.to_string()).collect();
             write!(f, " ({})", cols.join(", "))?;
         }
 
@@ -156,7 +156,7 @@ mod tests {
         let sql = stmt.to_string();
         assert_eq!(
             sql,
-            "INSERT INTO \"users\" (\"id\", \"name\") VALUES (1, UPPER('alice'))"
+            "INSERT INTO users (id, name) VALUES (1, UPPER('alice'))"
         );
     }
 
@@ -178,7 +178,7 @@ mod tests {
             }
         ) {
             let sql = stmt.to_string();
-            proptest::prop_assert!(sql.starts_with("INSERT INTO \"test\""));
+            proptest::prop_assert!(sql.starts_with("INSERT INTO test"));
             proptest::prop_assert!(sql.contains("VALUES"));
         }
     }

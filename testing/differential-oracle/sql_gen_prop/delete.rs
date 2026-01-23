@@ -35,7 +35,7 @@ pub struct DeleteStatement {
 
 impl fmt::Display for DeleteStatement {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "DELETE FROM \"{}\"", self.table)?;
+        write!(f, "DELETE FROM {}", self.table)?;
 
         if let Some(cond) = &self.where_clause {
             write!(f, " WHERE {cond}")?;
@@ -79,6 +79,6 @@ mod tests {
         };
 
         let sql = stmt.to_string();
-        assert_eq!(sql, "DELETE FROM \"users\" WHERE \"id\" = 1");
+        assert_eq!(sql, "DELETE FROM users WHERE id = 1");
     }
 }

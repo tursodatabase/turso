@@ -20,7 +20,7 @@ impl fmt::Display for DropIndexStatement {
             write!(f, "IF EXISTS ")?;
         }
 
-        write!(f, "\"{}\"", self.index_name)
+        write!(f, "{}", self.index_name)
     }
 }
 
@@ -57,7 +57,7 @@ mod tests {
             if_exists: false,
         };
 
-        assert_eq!(stmt.to_string(), "DROP INDEX \"idx_users_email\"");
+        assert_eq!(stmt.to_string(), "DROP INDEX idx_users_email");
     }
 
     #[test]
@@ -67,6 +67,6 @@ mod tests {
             if_exists: true,
         };
 
-        assert_eq!(stmt.to_string(), "DROP INDEX IF EXISTS \"idx_old\"");
+        assert_eq!(stmt.to_string(), "DROP INDEX IF EXISTS idx_old");
     }
 }

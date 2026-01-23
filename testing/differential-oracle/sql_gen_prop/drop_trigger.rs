@@ -21,7 +21,7 @@ impl fmt::Display for DropTriggerStatement {
         if self.if_exists {
             write!(f, "IF EXISTS ")?;
         }
-        write!(f, "\"{}\"", self.trigger_name)
+        write!(f, "{}", self.trigger_name)
     }
 }
 

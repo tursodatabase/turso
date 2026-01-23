@@ -223,7 +223,7 @@ impl fmt::Display for Expression {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Expression::Value(v) => write!(f, "{v}"),
-            Expression::Column(name) => write!(f, "\"{name}\""),
+            Expression::Column(name) => write!(f, "{name}"),
             Expression::FunctionCall { name, args } => {
                 write!(f, "{name}(")?;
                 for (i, arg) in args.iter().enumerate() {
@@ -1401,10 +1401,10 @@ mod tests {
         assert_eq!(expr.to_string(), "42");
 
         let expr = Expression::Column("name".to_string());
-        assert_eq!(expr.to_string(), "\"name\"");
+        assert_eq!(expr.to_string(), "name");
 
         let expr = Expression::function_call("UPPER", vec![Expression::Column("name".to_string())]);
-        assert_eq!(expr.to_string(), "UPPER(\"name\")");
+        assert_eq!(expr.to_string(), "UPPER(name)");
 
         let expr = Expression::function_call(
             "COALESCE",
@@ -1413,7 +1413,7 @@ mod tests {
                 Expression::Value(SqlValue::Text("default".to_string())),
             ],
         );
-        assert_eq!(expr.to_string(), "COALESCE(\"name\", 'default')");
+        assert_eq!(expr.to_string(), "COALESCE(name, 'default')");
     }
 
     #[test]
@@ -1430,7 +1430,7 @@ mod tests {
             BinaryOperator::Concat,
             Expression::Column("b".to_string()),
         );
-        assert_eq!(expr.to_string(), "\"a\" || \"b\"");
+        assert_eq!(expr.to_string(), "a || b");
     }
 
     #[test]
@@ -1455,7 +1455,7 @@ mod tests {
                 ],
             )],
         );
-        assert_eq!(expr.to_string(), "UPPER(SUBSTR(\"name\", 1, 3))");
+        assert_eq!(expr.to_string(), "UPPER(SUBSTR(name, 1, 3))");
     }
 
     #[test]
@@ -1476,14 +1476,14 @@ mod tests {
         };
         assert_eq!(
             expr.to_string(),
-            "CASE WHEN \"age\" < 18 THEN 'minor' ELSE 'adult' END"
+            "CASE WHEN age < 18 THEN 'minor' ELSE 'adult' END"
         );
     }
 
     #[test]
     fn test_cast_expression_display() {
         let expr = Expression::cast(Expression::Column("value".to_string()), DataType::Integer);
-        assert_eq!(expr.to_string(), "CAST(\"value\" AS INTEGER)");
+        assert_eq!(expr.to_string(), "CAST(value AS INTEGER)");
     }
 
     #[test]

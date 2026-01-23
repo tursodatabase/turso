@@ -85,7 +85,7 @@ impl ColumnDef {
 
 impl fmt::Display for ColumnDef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "\"{}\" {}", self.name, self.data_type)?;
+        write!(f, "{} {}", self.name, self.data_type)?;
 
         if self.primary_key {
             write!(f, " PRIMARY KEY")?;

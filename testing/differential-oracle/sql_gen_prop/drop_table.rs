@@ -21,7 +21,7 @@ impl fmt::Display for DropTableStatement {
             write!(f, "IF EXISTS ")?;
         }
 
-        write!(f, "\"{}\"", self.table_name)
+        write!(f, "{}", self.table_name)
     }
 }
 
@@ -75,7 +75,7 @@ mod tests {
             if_exists: false,
         };
 
-        assert_eq!(stmt.to_string(), "DROP TABLE \"users\"");
+        assert_eq!(stmt.to_string(), "DROP TABLE users");
     }
 
     #[test]
@@ -85,6 +85,6 @@ mod tests {
             if_exists: true,
         };
 
-        assert_eq!(stmt.to_string(), "DROP TABLE IF EXISTS \"old_data\"");
+        assert_eq!(stmt.to_string(), "DROP TABLE IF EXISTS old_data");
     }
 }

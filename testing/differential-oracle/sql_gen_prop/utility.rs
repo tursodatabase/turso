@@ -28,7 +28,7 @@ impl fmt::Display for AnalyzeStatement {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "ANALYZE")?;
         if let Some(target) = &self.target {
-            write!(f, " \"{target}\"")?;
+            write!(f, " {target}")?;
         }
         Ok(())
     }
@@ -45,7 +45,7 @@ impl fmt::Display for ReindexStatement {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "REINDEX")?;
         if let Some(target) = &self.target {
-            write!(f, " \"{target}\"")?;
+            write!(f, " {target}")?;
         }
         Ok(())
     }

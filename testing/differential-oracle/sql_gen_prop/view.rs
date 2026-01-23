@@ -29,9 +29,9 @@ impl fmt::Display for CreateViewStatement {
         if self.if_not_exists {
             write!(f, " IF NOT EXISTS")?;
         }
-        write!(f, " \"{}\"", self.view_name)?;
+        write!(f, " {}", self.view_name)?;
         if !self.columns.is_empty() {
-            let cols: Vec<String> = self.columns.iter().map(|c| format!("\"{c}\"")).collect();
+            let cols: Vec<String> = self.columns.iter().map(|c| c.to_string()).collect();
             write!(f, " ({})", cols.join(", "))?;
         }
         write!(f, " AS {}", self.select_sql)
@@ -53,7 +53,7 @@ impl fmt::Display for DropViewStatement {
         if self.if_exists {
             write!(f, " IF EXISTS")?;
         }
-        write!(f, " \"{}\"", self.view_name)
+        write!(f, " {}", self.view_name)
     }
 }
 
@@ -80,7 +80,7 @@ pub fn create_view(schema: &Schema) -> BoxedStrategy<CreateViewStatement> {
     )
         .prop_map(|(if_not_exists, view_name, table)| {
             // Generate a simple SELECT * FROM table
-            let select_sql = format!("SELECT * FROM \"{}\"", table.name);
+            let select_sql = format!("SELECT * FROM {}", table.name);
             CreateViewStatement {
                 if_not_exists,
                 view_name,
@@ -149,7 +149,7 @@ mod tests {
         fn drop_view_generates_valid_sql(stmt in drop_view("my_view".to_string())) {
             let sql = stmt.to_string();
             prop_assert!(sql.starts_with("DROP VIEW"));
-            prop_assert!(sql.contains("\"my_view\""));
+            prop_assert!(sql.contains("my_view"));
         }
     }
 }

@@ -68,12 +68,12 @@ pub struct UpdateStatement {
 
 impl fmt::Display for UpdateStatement {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "UPDATE \"{}\" SET ", self.table)?;
+        write!(f, "UPDATE {} SET ", self.table)?;
 
         let sets: Vec<String> = self
             .assignments
             .iter()
-            .map(|(col, val)| format!("\"{col}\" = {val}"))
+            .map(|(col, val)| format!("{col} = {val}"))
             .collect();
         write!(f, "{}", sets.join(", "))?;
 
@@ -189,10 +189,7 @@ mod tests {
         };
 
         let sql = stmt.to_string();
-        assert_eq!(
-            sql,
-            "UPDATE \"users\" SET \"name\" = 'Bob', \"age\" = 30 WHERE \"id\" = 1"
-        );
+        assert_eq!(sql, "UPDATE users SET name = 'Bob', age = 30 WHERE id = 1");
     }
 
     #[test]
@@ -207,7 +204,7 @@ mod tests {
         };
 
         let sql = stmt.to_string();
-        assert_eq!(sql, "UPDATE \"users\" SET \"name\" = UPPER(\"name\")");
+        assert_eq!(sql, "UPDATE users SET name = UPPER(name)");
     }
 
     proptest::proptest! {
@@ -228,7 +225,7 @@ mod tests {
             }
         ) {
             let sql = stmt.to_string();
-            proptest::prop_assert!(sql.starts_with("UPDATE \"test\" SET"));
+            proptest::prop_assert!(sql.starts_with("UPDATE test SET"));
         }
     }
 }

@@ -223,7 +223,7 @@ impl fmt::Display for SelectStatement {
             write!(f, "{}", cols.join(", "))?;
         }
 
-        write!(f, " FROM \"{}\"", self.table)?;
+        write!(f, " FROM {}", self.table)?;
 
         if let Some(cond) = &self.where_clause {
             write!(f, " WHERE {cond}")?;
@@ -532,7 +532,7 @@ mod tests {
         let sql = stmt.to_string();
         assert_eq!(
             sql,
-            "SELECT \"id\", \"name\" FROM \"users\" WHERE \"age\" >= 21 ORDER BY \"name\" ASC LIMIT 10 OFFSET 5"
+            "SELECT id, name FROM users WHERE age >= 21 ORDER BY name ASC LIMIT 10 OFFSET 5"
         );
     }
 
@@ -551,7 +551,7 @@ mod tests {
         };
 
         let sql = stmt.to_string();
-        assert_eq!(sql, "SELECT \"id\", UPPER(\"name\") FROM \"users\"");
+        assert_eq!(sql, "SELECT id, UPPER(name) FROM users");
     }
 
     proptest::proptest! {
@@ -573,7 +573,7 @@ mod tests {
         ) {
             let sql = stmt.to_string();
             proptest::prop_assert!(sql.starts_with("SELECT"));
-            proptest::prop_assert!(sql.contains("FROM \"test\""));
+            proptest::prop_assert!(sql.contains("FROM test"));
         }
     }
 

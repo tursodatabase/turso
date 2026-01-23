@@ -42,7 +42,7 @@ pub struct IndexColumn {
 
 impl fmt::Display for IndexColumn {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "\"{}\"", self.name)?;
+        write!(f, "{}", self.name)?;
         if let Some(dir) = &self.direction {
             write!(f, " {dir}")?;
         }
@@ -74,7 +74,7 @@ impl fmt::Display for CreateIndexStatement {
             write!(f, "IF NOT EXISTS ")?;
         }
 
-        write!(f, "\"{}\" ON \"{}\" (", self.index_name, self.table_name)?;
+        write!(f, "{} ON {} (", self.index_name, self.table_name)?;
 
         let cols: Vec<String> = self.columns.iter().map(|c| c.to_string()).collect();
         write!(f, "{})", cols.join(", "))
@@ -228,7 +228,7 @@ mod tests {
 
         assert_eq!(
             stmt.to_string(),
-            "CREATE UNIQUE INDEX \"idx_users_email\" ON \"users\" (\"email\" ASC)"
+            "CREATE UNIQUE INDEX idx_users_email ON users (email ASC)"
         );
     }
 
@@ -253,7 +253,7 @@ mod tests {
 
         assert_eq!(
             stmt.to_string(),
-            "CREATE INDEX IF NOT EXISTS \"idx_composite\" ON \"orders\" (\"user_id\", \"created_at\" DESC)"
+            "CREATE INDEX IF NOT EXISTS idx_composite ON orders (user_id, created_at DESC)"
         );
     }
 }

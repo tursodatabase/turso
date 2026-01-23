@@ -181,7 +181,7 @@ mod tests {
         }) {
             let sql = stmt.to_string();
             prop_assert!(sql.starts_with("SELECT"));
-            prop_assert!(sql.contains("FROM \"users\""));
+            prop_assert!(sql.contains("FROM users"));
         }
 
         #[test]
@@ -190,7 +190,7 @@ mod tests {
             strategies::insert_for_table(&schema.tables[0], &schema, &StatementProfile::default())
         }) {
             let sql = stmt.to_string();
-            prop_assert!(sql.starts_with("INSERT INTO \"users\""));
+            prop_assert!(sql.starts_with("INSERT INTO users"));
             prop_assert!(sql.contains("VALUES"));
         }
 
@@ -200,7 +200,7 @@ mod tests {
             strategies::update_for_table(&schema.tables[0], &schema, &StatementProfile::default())
         }) {
             let sql = stmt.to_string();
-            prop_assert!(sql.starts_with("UPDATE \"users\""));
+            prop_assert!(sql.starts_with("UPDATE users"));
         }
 
         #[test]
@@ -209,7 +209,7 @@ mod tests {
             strategies::delete_for_table(&schema.tables[0], &schema, &StatementProfile::default())
         }) {
             let sql = stmt.to_string();
-            prop_assert!(sql.starts_with("DELETE FROM \"users\""));
+            prop_assert!(sql.starts_with("DELETE FROM users"));
         }
 
         #[test]
@@ -224,7 +224,7 @@ mod tests {
         fn generated_create_index_is_valid_sql(stmt in strategies::create_index_for_table(&test_schema().tables[0], &test_schema(), &StatementProfile::default())) {
             let sql = stmt.to_string();
             prop_assert!(sql.contains("INDEX"));
-            prop_assert!(sql.contains("ON \"users\""));
+            prop_assert!(sql.contains("ON users"));
         }
 
         #[test]
@@ -232,14 +232,14 @@ mod tests {
             let sql = stmt.to_string();
             prop_assert!(sql.contains("INDEX"));
             // Should be on one of the existing tables
-            prop_assert!(sql.contains("ON \"users\"") || sql.contains("ON \"posts\""));
+            prop_assert!(sql.contains("ON users") || sql.contains("ON posts"));
         }
 
         #[test]
         fn generated_drop_table_is_valid_sql(stmt in strategies::drop_table_for_table(&test_schema().tables[0])) {
             let sql = stmt.to_string();
             prop_assert!(sql.starts_with("DROP TABLE"));
-            prop_assert!(sql.contains("\"users\""));
+            prop_assert!(sql.contains("users"));
         }
 
         #[test]

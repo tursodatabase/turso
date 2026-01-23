@@ -182,12 +182,12 @@ pub enum AlterTableOp {
 impl fmt::Display for AlterTableOp {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            AlterTableOp::RenameTo(new_name) => write!(f, "RENAME TO \"{new_name}\""),
+            AlterTableOp::RenameTo(new_name) => write!(f, "RENAME TO {new_name}"),
             AlterTableOp::RenameColumn { old_name, new_name } => {
-                write!(f, "RENAME COLUMN \"{old_name}\" TO \"{new_name}\"")
+                write!(f, "RENAME COLUMN {old_name} TO {new_name}")
             }
             AlterTableOp::AddColumn(col_def) => write!(f, "ADD COLUMN {col_def}"),
-            AlterTableOp::DropColumn(col_name) => write!(f, "DROP COLUMN \"{col_name}\""),
+            AlterTableOp::DropColumn(col_name) => write!(f, "DROP COLUMN {col_name}"),
         }
     }
 }
@@ -203,7 +203,7 @@ pub struct AlterTableStatement {
 
 impl fmt::Display for AlterTableStatement {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "ALTER TABLE \"{}\" {}", self.table_name, self.operation)
+        write!(f, "ALTER TABLE {} {}", self.table_name, self.operation)
     }
 }
 
@@ -362,19 +362,19 @@ mod tests {
         #[test]
         fn alter_table_rename_generates_valid_sql(stmt in alter_table_rename_to(&test_table(), &test_schema())) {
             let sql = stmt.to_string();
-            prop_assert!(sql.starts_with("ALTER TABLE \"users\" RENAME TO"));
+            prop_assert!(sql.starts_with("ALTER TABLE users RENAME TO"));
         }
 
         #[test]
         fn alter_table_add_column_generates_valid_sql(stmt in alter_table_add_column(&test_table())) {
             let sql = stmt.to_string();
-            prop_assert!(sql.starts_with("ALTER TABLE \"users\" ADD COLUMN"));
+            prop_assert!(sql.starts_with("ALTER TABLE users ADD COLUMN"));
         }
 
         #[test]
         fn alter_table_for_schema_with_default_profile(stmt in alter_table_for_schema(&test_schema(), &Default::default(), &StatementProfile::default())) {
             let sql = stmt.to_string();
-            prop_assert!(sql.starts_with("ALTER TABLE \"users\""));
+            prop_assert!(sql.starts_with("ALTER TABLE users"));
         }
 
         #[test]
