@@ -34,10 +34,6 @@ pub struct Statement {
     pub(crate) program: vdbe::Program,
     state: vdbe::ProgramState,
     pager: Arc<Pager>,
-    /// Whether the statement accesses the database.
-    /// Used to determine whether we need to check for schema changes when
-    /// starting a transaction.
-    accesses_db: bool,
     /// indicates if the statement is a NORMAL/EXPLAIN/EXPLAIN QUERY PLAN
     query_mode: QueryMode,
     /// Flag to show if the statement was busy
@@ -62,7 +58,6 @@ impl Drop for Statement {
 
 impl Statement {
     pub fn new(program: vdbe::Program, pager: Arc<Pager>, query_mode: QueryMode) -> Self {
-        let accesses_db = program.accesses_db;
         let (max_registers, cursor_count) = match query_mode {
             QueryMode::Normal => (program.max_registers, program.cursor_ref.len()),
             QueryMode::Explain => (EXPLAIN_COLUMNS.len(), 0),
@@ -73,7 +68,6 @@ impl Statement {
             program,
             state,
             pager,
-            accesses_db,
             query_mode,
             busy: false,
             busy_handler_state: None,
@@ -130,27 +124,21 @@ impl Statement {
             }
         }
 
-        let mut res = if !self.accesses_db {
+        const MAX_SCHEMA_RETRY: usize = 50;
+        let mut res =
             self.program
-                .step(&mut self.state, self.pager.clone(), self.query_mode, waker)
-        } else {
-            const MAX_SCHEMA_RETRY: usize = 50;
-            let mut res =
-                self.program
-                    .step(&mut self.state, self.pager.clone(), self.query_mode, waker);
-            for attempt in 0..MAX_SCHEMA_RETRY {
-                // Only reprepare if we still need to update schema
-                if !matches!(res, Err(LimboError::SchemaUpdated)) {
-                    break;
-                }
-                tracing::debug!("reprepare: attempt={}", attempt);
-                self.reprepare()?;
-                res =
-                    self.program
-                        .step(&mut self.state, self.pager.clone(), self.query_mode, waker);
+                .step(&mut self.state, self.pager.clone(), self.query_mode, waker);
+        for attempt in 0..MAX_SCHEMA_RETRY {
+            // Only reprepare if we still need to update schema
+            if !matches!(res, Err(LimboError::SchemaUpdated)) {
+                break;
             }
-            res
-        };
+            tracing::debug!("reprepare: attempt={}", attempt);
+            self.reprepare()?;
+            res = self
+                .program
+                .step(&mut self.state, self.pager.clone(), self.query_mode, waker);
+        }
 
         // Aggregate metrics when statement completes
         if matches!(res, Ok(StepResult::Done)) {
