@@ -7,6 +7,7 @@ use bytes::BytesMut;
 use prost::Message;
 use roaring::RoaringBitmap;
 use turso_core::{
+    io::FileSyncType,
     types::{Text, WalFrameInfo},
     Buffer, Completion, LimboError, OpenFlags, Value,
 };
@@ -200,7 +201,7 @@ pub async fn db_bootstrap<IO: SyncEngineIo, Ctx>(
     let c = Completion::new_sync(move |_| {
         // todo(sivukhin): we need to error out in case of failed sync
     });
-    let c = db.sync(c)?;
+    let c = db.sync(c, FileSyncType::Fsync)?;
     while !c.succeeded() {
         ctx.coro.yield_(SyncEngineIoResult::IO).await?;
     }
@@ -381,7 +382,7 @@ pub async fn wal_pull_to_file_v1<IO: SyncEngineIo, Ctx>(
     let c = Completion::new_sync(move |_| {
         // todo(sivukhin): we need to error out in case of failed sync
     });
-    let c = frames_file.sync(c)?;
+    let c = frames_file.sync(c, FileSyncType::Fsync)?;
     while !c.succeeded() {
         ctx.coro.yield_(SyncEngineIoResult::IO).await?;
     }
@@ -600,7 +601,7 @@ pub async fn wal_pull_to_file_legacy<IO: SyncEngineIo, Ctx>(
     let c = Completion::new_sync(move |_| {
         // todo(sivukhin): we need to error out in case of failed sync
     });
-    let c = frames_file.sync(c)?;
+    let c = frames_file.sync(c, FileSyncType::Fsync)?;
     while !c.succeeded() {
         ctx.coro.yield_(SyncEngineIoResult::IO).await?;
     }

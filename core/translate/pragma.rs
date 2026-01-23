@@ -430,6 +430,17 @@ fn update_pragma(
             connection.set_foreign_keys_enabled(enabled);
             Ok((program, TransactionMode::None))
         }
+        #[cfg(target_vendor = "apple")]
+        PragmaName::Fullfsync => {
+            let enabled = parse_pragma_enabled(&value);
+            let sync_type = if enabled {
+                crate::io::FileSyncType::FullFsync
+            } else {
+                crate::io::FileSyncType::Fsync
+            };
+            connection.set_sync_type(sync_type);
+            Ok((program, TransactionMode::None))
+        }
     }
 }
 
@@ -801,6 +812,15 @@ fn query_pragma(
         }
         PragmaName::ForeignKeys => {
             let enabled = connection.foreign_keys_enabled();
+            let register = program.alloc_register();
+            program.emit_int(enabled as i64, register);
+            program.emit_result_row(register, 1);
+            program.add_pragma_result_column(pragma.to_string());
+            Ok((program, TransactionMode::None))
+        }
+        #[cfg(target_vendor = "apple")]
+        PragmaName::Fullfsync => {
+            let enabled = connection.get_sync_type() == crate::io::FileSyncType::FullFsync;
             let register = program.alloc_register();
             program.emit_int(enabled as i64, register);
             program.emit_result_row(register, 1);

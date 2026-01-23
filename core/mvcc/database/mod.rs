@@ -933,7 +933,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     self.state = CommitState::EndCommitLogicalLog { end_ts: *end_ts };
                     return Ok(TransitionResult::Continue);
                 }
-                let c = mvcc_store.storage.sync()?;
+                let c = mvcc_store.storage.sync(self.pager.get_sync_type())?;
                 self.state = CommitState::EndCommitLogicalLog { end_ts: *end_ts };
                 // if Completion Completed without errors we can continue
                 if c.succeeded() {

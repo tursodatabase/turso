@@ -1483,6 +1483,9 @@ pub enum PragmaName {
     FreelistCount,
     /// Enable or disable foreign key constraint enforcement
     ForeignKeys,
+    /// Use F_FULLFSYNC instead of fsync on macOS (only supported on macOS)
+    #[cfg(target_vendor = "apple")]
+    Fullfsync,
     /// Run integrity check on the database file
     IntegrityCheck,
     /// `journal_mode` pragma

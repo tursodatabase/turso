@@ -1,5 +1,6 @@
 use super::{Buffer, Clock, Completion, File, OpenFlags, IO};
 use crate::io::clock::{DefaultClock, MonotonicInstant, WallClockInstant};
+use crate::io::FileSyncType;
 use crate::sync::Mutex;
 use crate::turso_assert;
 use crate::Result;
@@ -176,7 +177,7 @@ impl File for MemoryFile {
         Ok(c)
     }
 
-    fn sync(&self, c: Completion) -> Result<Completion> {
+    fn sync(&self, c: Completion, _sync_type: FileSyncType) -> Result<Completion> {
         tracing::debug!("sync(path={})", self.path);
         // no-op
         c.complete(0);

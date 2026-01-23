@@ -1,4 +1,7 @@
 use crate::assert::assert_send_sync;
+#[cfg(target_vendor = "apple")]
+use crate::io::AtomicFileSyncType;
+use crate::io::FileSyncType;
 use crate::io::WriteBatch;
 use crate::storage::btree::PinGuard;
 use crate::storage::subjournal::Subjournal;
@@ -1209,6 +1212,10 @@ pub struct Pager {
     enable_encryption: AtomicBool,
     /// In Memory Page 1 for Empty Dbs
     init_page_1: Arc<ArcSwapOption<Page>>,
+    /// Sync type for durability. FullFsync uses F_FULLFSYNC on macOS (PRAGMA fullfsync).
+    /// Only stored on Apple platforms; on others, always returns Fsync.
+    #[cfg(target_vendor = "apple")]
+    sync_type: AtomicFileSyncType,
 }
 
 assert_send_sync!(Pager);
@@ -1375,7 +1382,37 @@ impl Pager {
             io_ctx: RwLock::new(IOContext::default()),
             enable_encryption: AtomicBool::new(false),
             init_page_1,
+            #[cfg(target_vendor = "apple")]
+            sync_type: AtomicFileSyncType::new(FileSyncType::Fsync),
         })
+    }
+
+    /// Get the sync type setting.
+    /// On non-Apple platforms, always returns Fsync (compile-time constant).
+    #[cfg(target_vendor = "apple")]
+    #[inline]
+    pub fn get_sync_type(&self) -> FileSyncType {
+        self.sync_type.get()
+    }
+
+    /// Get the sync type setting.
+    /// On non-Apple platforms, always returns Fsync (compile-time constant).
+    #[cfg(not(target_vendor = "apple"))]
+    #[inline]
+    pub fn get_sync_type(&self) -> FileSyncType {
+        FileSyncType::Fsync
+    }
+
+    /// Set the sync type (for PRAGMA fullfsync). Only effective on Apple platforms.
+    #[cfg(target_vendor = "apple")]
+    pub fn set_sync_type(&self, value: FileSyncType) {
+        self.sync_type.set(value);
+    }
+
+    /// Set the sync type. No-op on non-Apple platforms.
+    #[cfg(not(target_vendor = "apple"))]
+    pub fn set_sync_type(&self, _value: FileSyncType) {
+        // No-op: FullFsync only has effect on Apple platforms
     }
 
     pub fn init_page_1(&self) -> Arc<ArcSwapOption<Page>> {
@@ -2289,7 +2326,7 @@ impl Pager {
                     return_if_io!(self.commit_dirty_pages(
                         connection.is_wal_auto_checkpoint_disabled(),
                         connection.get_sync_mode(),
-                        connection.get_data_sync_retry()
+                        connection.get_data_sync_retry(),
                     ));
 
                     let schema_did_change = match connection.get_tx_state() {
@@ -2629,7 +2666,7 @@ impl Pager {
             )),
             None => {
                 // No async prep needed, go straight to finish
-                let completion = wal.prepare_wal_finish()?;
+                let completion = wal.prepare_wal_finish(self.get_sync_type())?;
                 Ok(CacheFlushStep::Yield(
                     CacheFlushState::WalPrepareFinish {
                         dirty_ids,
@@ -2659,7 +2696,7 @@ impl Pager {
             ));
         }
 
-        let finish_completion = wal.prepare_wal_finish()?;
+        let finish_completion = wal.prepare_wal_finish(self.get_sync_type())?;
         Ok(CacheFlushStep::Yield(
             CacheFlushState::WalPrepareFinish {
                 dirty_ids,
@@ -2859,7 +2896,7 @@ impl Pager {
                             let prepare = wal.prepare_wal_start(page_sz)?;
                             if let Some(c) = prepare {
                                 self.io.wait_for_completion(c)?;
-                                let c = wal.prepare_wal_finish()?;
+                                let c = wal.prepare_wal_finish(self.get_sync_type())?;
                                 self.io.wait_for_completion(c)?;
                             }
 
@@ -3110,7 +3147,7 @@ impl Pager {
                     }
                 }
                 CommitState::PrepareWalSync => {
-                    let c = wal.prepare_wal_finish()?;
+                    let c = wal.prepare_wal_finish(self.get_sync_type())?;
                     self.commit_info.write().state = CommitState::GetDbSize;
                     if !c.succeeded() {
                         io_yield_one!(c);
@@ -3270,7 +3307,7 @@ impl Pager {
                     if sync_mode == SyncMode::Off {
                         commit_info.state = CommitState::WalCommitDone;
                     } else {
-                        let sync_c = wal.sync()?;
+                        let sync_c = wal.sync(self.get_sync_type())?;
                         // Reuse the existing Vec instead of allocating a new one
                         commit_info.completions.push(sync_c);
                         commit_info.state = CommitState::WaitSync;
@@ -3391,6 +3428,7 @@ impl Pager {
             header.page_number as u64,
             header.db_size as u64,
             raw_page,
+            self.get_sync_type(),
         )?;
         if let Some(page) = self.cache_get(header.page_number as usize)? {
             let content = page.get_contents();
@@ -3617,8 +3655,11 @@ impl Pager {
                         continue;
                     }
 
-                    let c =
-                        sqlite3_ondisk::begin_sync(self.db_file.as_ref(), self.syncing.clone())?;
+                    let c = sqlite3_ondisk::begin_sync(
+                        self.db_file.as_ref(),
+                        self.syncing.clone(),
+                        self.get_sync_type(),
+                    )?;
                     self.checkpoint_state
                         .write()
                         .result
@@ -3652,7 +3693,8 @@ impl Pager {
                             .write()
                             .result
                             .as_mut()
-                            .expect("result should be set")
+                            .expect("result should be set"),
+                        self.get_sync_type(),
                     ));
                 }
                 CheckpointPhase::Finalize { clear_page_cache } => {
@@ -3722,7 +3764,7 @@ impl Pager {
                 ));
             };
             // fsync the wal syncronously before beginning checkpoint
-            let c = wal.sync()?;
+            let c = wal.sync(self.get_sync_type())?;
             self.io.wait_for_completion(c)?;
         }
         if !wal_auto_checkpoint_disabled {

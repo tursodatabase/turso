@@ -1,5 +1,6 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
+use crate::io::FileSyncType;
 use crate::sync::Mutex;
 use crate::sync::OnceLock;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -338,13 +339,14 @@ pub trait Wal: Debug + Send + Sync {
         page_id: u64,
         db_size: u64,
         page: &[u8],
+        sync_type: FileSyncType,
     ) -> Result<()>;
 
     /// Prepare WAL header for the future append
     /// Most of the time this method will return Ok(None)
     fn prepare_wal_start(&self, page_sz: PageSize) -> Result<Option<Completion>>;
 
-    fn prepare_wal_finish(&self) -> Result<Completion>;
+    fn prepare_wal_finish(&self, sync_type: FileSyncType) -> Result<Completion>;
 
     /// Prepare a batch of WAL frames for durable commit/append to the log.
     fn prepare_frames(
@@ -378,7 +380,7 @@ pub trait Wal: Debug + Send + Sync {
     fn should_checkpoint(&self) -> bool;
     fn checkpoint(&self, pager: &Pager, mode: CheckpointMode)
         -> Result<IOResult<CheckpointResult>>;
-    fn sync(&self) -> Result<Completion>;
+    fn sync(&self, sync_type: FileSyncType) -> Result<Completion>;
     fn is_syncing(&self) -> bool;
     fn get_max_frame_in_wal(&self) -> u64;
     fn get_checkpoint_seq(&self) -> u32;
@@ -401,7 +403,11 @@ pub trait Wal: Debug + Send + Sync {
     /// Truncate WAL file to zero and sync it. This is called AFTER the DB file has been
     /// synced during TRUNCATE checkpoint mode, ensuring data durability.
     /// The result parameter is used to track I/O progress (wal_truncate_sent, wal_sync_sent).
-    fn truncate_wal(&self, result: &mut CheckpointResult) -> Result<IOResult<()>>;
+    fn truncate_wal(
+        &self,
+        result: &mut CheckpointResult,
+        sync_type: FileSyncType,
+    ) -> Result<IOResult<()>>;
 
     #[cfg(debug_assertions)]
     fn as_any(&self) -> &dyn std::any::Any;
@@ -1434,11 +1440,12 @@ impl Wal for WalFile {
         page_id: u64,
         db_size: u64,
         page: &[u8],
+        sync_type: FileSyncType,
     ) -> Result<()> {
         let Some(page_size) = PageSize::new(page.len() as u32) else {
             bail_corrupt_error!("invalid page size: {}", page.len());
         };
-        self.ensure_header_if_needed(page_size)?;
+        self.ensure_header_if_needed(page_size, sync_type)?;
         tracing::debug!("write_raw_frame({})", frame_id);
         // if page_size wasn't initialized before - we will initialize it during that raw write
         if self.page_size() != 0 && page.len() != self.page_size() as usize {
@@ -1569,7 +1576,7 @@ impl Wal for WalFile {
     }
 
     #[instrument(err, skip_all, level = Level::DEBUG)]
-    fn sync(&self) -> Result<Completion> {
+    fn sync(&self, sync_type: FileSyncType) -> Result<Completion> {
         tracing::debug!("wal_sync");
         let syncing = self.syncing.clone();
         let completion = Completion::new_sync(move |result| {
@@ -1587,7 +1594,7 @@ impl Wal for WalFile {
             shared.file.as_ref().unwrap().clone()
         });
         self.syncing.store(true, Ordering::Release);
-        let c = file.sync(completion)?;
+        let c = file.sync(completion, sync_type)?;
         Ok(c)
     }
 
@@ -1736,7 +1743,7 @@ impl Wal for WalFile {
         Ok(Some(c))
     }
 
-    fn prepare_wal_finish(&self) -> Result<Completion> {
+    fn prepare_wal_finish(&self, sync_type: FileSyncType) -> Result<Completion> {
         let file = self.with_shared(|shared| {
             turso_assert!(
                 shared.enabled.load(Ordering::Relaxed),
@@ -1745,9 +1752,12 @@ impl Wal for WalFile {
             shared.file.as_ref().unwrap().clone()
         });
         let shared = self.shared.clone();
-        let c = file.sync(Completion::new_sync(move |_| {
-            shared.read().initialized.store(true, Ordering::Release);
-        }))?;
+        let c = file.sync(
+            Completion::new_sync(move |_| {
+                shared.read().initialized.store(true, Ordering::Release);
+            }),
+            sync_type,
+        )?;
         Ok(c)
     }
 
@@ -2031,8 +2041,12 @@ impl Wal for WalFile {
         })
     }
 
-    fn truncate_wal(&self, result: &mut CheckpointResult) -> Result<IOResult<()>> {
-        self.truncate_log(result)
+    fn truncate_wal(
+        &self,
+        result: &mut CheckpointResult,
+        sync_type: FileSyncType,
+    ) -> Result<IOResult<()>> {
+        self.truncate_log(result, sync_type)
     }
 }
 
@@ -2175,12 +2189,12 @@ impl WalFile {
 
     /// the WAL file has been truncated and we are writing the first
     /// frame since then. We need to ensure that the header is initialized.
-    fn ensure_header_if_needed(&self, page_size: PageSize) -> Result<()> {
+    fn ensure_header_if_needed(&self, page_size: PageSize, sync_type: FileSyncType) -> Result<()> {
         let Some(c) = self.prepare_wal_start(page_size)? else {
             return Ok(());
         };
         self.io.wait_for_completion(c)?;
-        let c = self.prepare_wal_finish()?;
+        let c = self.prepare_wal_finish(sync_type)?;
         self.io.wait_for_completion(c)?;
         Ok(())
     }
@@ -2627,7 +2641,11 @@ impl WalFile {
     }
 
     /// Truncate WAL file to zero and sync it. Called by pager AFTER DB file is synced.
-    fn truncate_log(&self, result: &mut CheckpointResult) -> Result<IOResult<()>> {
+    fn truncate_log(
+        &self,
+        result: &mut CheckpointResult,
+        sync_type: FileSyncType,
+    ) -> Result<IOResult<()>> {
         let file = self.with_shared(|shared| {
             turso_assert!(
                 shared.enabled.load(Ordering::Relaxed),
@@ -2654,13 +2672,16 @@ impl WalFile {
             result.wal_total_backfilled = 0;
             io_yield_one!(c);
         } else if !result.wal_sync_sent {
-            let c = file.sync(Completion::new_sync(move |res| {
-                if let Err(err) = res {
-                    tracing::info!("WAL sync failed: {err}")
-                } else {
-                    tracing::trace!("WAL file synced after truncation");
-                }
-            }))?;
+            let c = file.sync(
+                Completion::new_sync(move |res| {
+                    if let Err(err) = res {
+                        tracing::info!("WAL sync failed: {err}")
+                    } else {
+                        tracing::trace!("WAL file synced after truncation");
+                    }
+                }),
+                sync_type,
+            )?;
             result.wal_sync_sent = true;
             io_yield_one!(c);
         }

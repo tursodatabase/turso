@@ -1379,6 +1379,16 @@ impl Connection {
             .store(value, crate::sync::atomic::Ordering::SeqCst);
     }
 
+    /// Get the sync type setting.
+    pub fn get_sync_type(&self) -> crate::io::FileSyncType {
+        self.pager.load().get_sync_type()
+    }
+
+    /// Set the sync type (for PRAGMA fullfsync).
+    pub fn set_sync_type(&self, value: crate::io::FileSyncType) {
+        self.pager.load().set_sync_type(value);
+    }
+
     /// Creates a HashSet of modules that have been loaded
     pub fn get_syms_vtab_mods(&self) -> std::collections::HashSet<String> {
         self.syms.read().vtab_modules.keys().cloned().collect()

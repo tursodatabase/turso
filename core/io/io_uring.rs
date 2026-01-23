@@ -781,7 +781,7 @@ impl File for UringFile {
         Ok(c)
     }
 
-    fn sync(&self, c: Completion) -> Result<Completion> {
+    fn sync(&self, c: Completion, _sync_type: crate::io::FileSyncType) -> Result<Completion> {
         trace!("sync()");
         let sync = with_fd!(self, |fd| {
             io_uring::opcode::Fsync::new(fd)

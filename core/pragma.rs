@@ -155,6 +155,11 @@ pub fn pragma_for(pragma: &PragmaName) -> Pragma {
             PragmaFlags::NoColumns1 | PragmaFlags::Result0,
             &["cache_spill"],
         ),
+        #[cfg(target_vendor = "apple")]
+        PragmaName::Fullfsync => Pragma::new(
+            PragmaFlags::NoColumns1 | PragmaFlags::Result0,
+            &["fullfsync"],
+        ),
     }
 }
 
