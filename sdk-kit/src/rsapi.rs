@@ -1090,4 +1090,84 @@ mod tests {
             .unwrap();
         assert_eq!(stmt.execute(None).unwrap().status, TursoStatusCode::Done);
     }
+
+    #[test]
+    pub fn test_prepare_cached_concurrent_use_errors() {
+        use std::sync::{Arc, Barrier};
+
+        let db = TursoDatabase::new(TursoDatabaseConfig {
+            path: ":memory:".to_string(),
+            experimental_features: None,
+            async_io: false,
+            encryption: None,
+            vfs: None,
+            io: None,
+            db_file: None,
+        });
+        db.open().unwrap();
+        let conn = db.connect().unwrap();
+
+        let mut create = conn
+            .prepare_single(
+                "CREATE TABLE hosts (
+                    name TEXT PRIMARY KEY,
+                    app TEXT,
+                    address TEXT,
+                    namespace TEXT,
+                    cloud_cluster_name TEXT,
+                    allowed_ips TEXT,
+                    updated_at INTEGER
+                )",
+            )
+            .unwrap();
+        create.execute(None).unwrap();
+
+        let insert_sql = "WITH RECURSIVE cnt(x) AS (
+                SELECT 1
+                UNION ALL
+                SELECT x + 1 FROM cnt WHERE x < 50000
+            )
+            INSERT INTO hosts (
+                name, app, address, namespace, cloud_cluster_name, allowed_ips, updated_at
+            )
+            SELECT
+                'host-' || x,
+                'app',
+                'addr',
+                'ns',
+                'cluster',
+                'ip',
+                x
+            FROM cnt";
+
+        let stmt1 = conn.prepare_cached(insert_sql).unwrap();
+        let stmt2 = conn.prepare_cached(insert_sql).unwrap();
+
+        let barrier = Arc::new(Barrier::new(2));
+        let mut handles = Vec::new();
+        for mut stmt in [stmt1, stmt2] {
+            let barrier = barrier.clone();
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                stmt.execute(None)
+            }));
+        }
+
+        let mut results = Vec::new();
+        for handle in handles {
+            results.push(handle.join().unwrap());
+        }
+
+        assert!(
+            results.iter().any(|r| matches!(r, Err(TursoError::Misuse(_)))),
+            "expected at least one concurrent-use error, got: {results:?}"
+        );
+        assert!(
+            results
+                .iter()
+                .filter_map(|r| r.as_ref().err())
+                .all(|e| matches!(e, TursoError::Misuse(_))),
+            "expected only misuse errors, got: {results:?}"
+        );
+    }
 }

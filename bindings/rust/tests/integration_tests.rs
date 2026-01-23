@@ -813,6 +813,176 @@ async fn test_prepare_cached_basic() {
 }
 
 #[tokio::test]
+async fn test_prepare_cached_reprepare_on_query_only_change() {
+    let db = Builder::new_local(":memory:").build().await.unwrap();
+    let conn = db.connect().unwrap();
+
+    conn.execute("CREATE TABLE t (id INTEGER)", ())
+        .await
+        .unwrap();
+
+    let mut stmt = conn
+        .prepare_cached("INSERT INTO t VALUES (?)")
+        .await
+        .unwrap();
+
+    conn.execute("PRAGMA query_only=1", ()).await.unwrap();
+
+    let err = stmt.execute(vec![Value::Integer(1)]).await.unwrap_err();
+    assert!(err.to_string().to_ascii_lowercase().contains("query_only"));
+
+    let mut rows = conn.query("SELECT COUNT(*) FROM t", ()).await.unwrap();
+    let count: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+    assert_eq!(count, 0);
+}
+
+#[tokio::test]
+async fn test_prepare_cached_batch_insert_delete_pattern() {
+    #[derive(Clone)]
+    struct Host {
+        name: String,
+        app: String,
+        address: String,
+        namespace: String,
+        cloud_cluster_name: String,
+        allowed_ips: Vec<String>,
+        updated_at: std::time::SystemTime,
+        deleted: bool,
+    }
+
+    fn serialize_allowed_ips(allowed_ips: &[String]) -> String {
+        allowed_ips.join(",")
+    }
+
+    fn system_time_to_unix_seconds(ts: std::time::SystemTime) -> i64 {
+        let duration = ts
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time should be after unix epoch");
+        duration.as_secs() as i64
+    }
+
+    async fn insert_hosts(conn: &turso::Connection, hosts: &[Host]) -> Result<(), Error> {
+        if hosts.is_empty() {
+            return Ok(());
+        }
+
+        conn.execute("BEGIN", ()).await?;
+
+        let mut insert_stmt = conn
+            .prepare_cached(
+                "INSERT INTO hosts (name, app, address, namespace, cloud_cluster_name, allowed_ips, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(name) DO UPDATE SET
+                 app = excluded.app,
+                 address = excluded.address,
+                 namespace = excluded.namespace,
+                 cloud_cluster_name = excluded.cloud_cluster_name,
+                 allowed_ips = excluded.allowed_ips,
+                 updated_at = excluded.updated_at",
+            )
+            .await?;
+        let mut delete_stmt = conn
+            .prepare_cached("DELETE FROM hosts WHERE name = ?1")
+            .await?;
+
+        let result = async {
+            for host in hosts {
+                if host.deleted {
+                    delete_stmt.execute([host.name.as_str()]).await?;
+                    continue;
+                }
+
+                let allowed_ips = serialize_allowed_ips(&host.allowed_ips);
+                let updated_at = system_time_to_unix_seconds(host.updated_at);
+                insert_stmt
+                    .execute((
+                        host.name.as_str(),
+                        host.app.as_str(),
+                        host.address.as_str(),
+                        host.namespace.as_str(),
+                        host.cloud_cluster_name.as_str(),
+                        allowed_ips,
+                        updated_at,
+                    ))
+                    .await?;
+            }
+            Ok(())
+        }
+        .await;
+
+        match result {
+            Ok(()) => {
+                conn.execute("COMMIT", ()).await?;
+                Ok(())
+            }
+            Err(err) => {
+                let _ = conn.execute("ROLLBACK", ()).await;
+                Err(err)
+            }
+        }
+    }
+
+    let db = Builder::new_local(":memory:").build().await.unwrap();
+    let conn = db.connect().unwrap();
+
+    conn.execute(
+        "CREATE TABLE hosts (
+            name TEXT PRIMARY KEY,
+            app TEXT,
+            address TEXT,
+            namespace TEXT,
+            cloud_cluster_name TEXT,
+            allowed_ips TEXT,
+            updated_at INTEGER
+        )",
+        (),
+    )
+    .await
+    .unwrap();
+
+    let base_time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+    let hosts = vec![
+        Host {
+            name: "a".to_string(),
+            app: "app_a".to_string(),
+            address: "10.0.0.1".to_string(),
+            namespace: "ns".to_string(),
+            cloud_cluster_name: "cluster".to_string(),
+            allowed_ips: vec!["10.0.0.0/24".to_string()],
+            updated_at: base_time,
+            deleted: false,
+        },
+        Host {
+            name: "b".to_string(),
+            app: "app_b".to_string(),
+            address: "10.0.0.2".to_string(),
+            namespace: "ns".to_string(),
+            cloud_cluster_name: "cluster".to_string(),
+            allowed_ips: vec!["10.0.1.0/24".to_string()],
+            updated_at: base_time,
+            deleted: false,
+        },
+        Host {
+            name: "a".to_string(),
+            app: "app_a".to_string(),
+            address: "10.0.0.1".to_string(),
+            namespace: "ns".to_string(),
+            cloud_cluster_name: "cluster".to_string(),
+            allowed_ips: vec!["10.0.0.0/24".to_string()],
+            updated_at: base_time,
+            deleted: true,
+        },
+    ];
+
+    insert_hosts(&conn, &hosts).await.unwrap();
+
+    let mut rows = conn.query("SELECT name FROM hosts ORDER BY name", ()).await.unwrap();
+    let first = rows.next().await.unwrap().unwrap().get::<String>(0).unwrap();
+    assert_eq!(first, "b");
+    assert!(rows.next().await.unwrap().is_none());
+}
+
+#[tokio::test]
 async fn test_prepare_cached_multiple_statements() {
     let db = Builder::new_local(":memory:").build().await.unwrap();
     let conn = db.connect().unwrap();
