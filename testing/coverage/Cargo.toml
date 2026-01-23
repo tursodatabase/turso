@@ -1,0 +1,13 @@
+[package]
+name = "turso-coverage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+linkme = { version = "0.3", optional = true }
+
+[features]
+default = []
+enabled = ["dep:linkme"]
