@@ -16,8 +16,8 @@ use tracing_subscriber::{
 };
 use turso_core::{
     storage::database::DatabaseFile, types::AsValueRef, CipherMode, Connection, Database,
-    DatabaseOpts, DatabaseStorage, EncryptionKey, LimboError, OpenFlags, Pager, QueryMode,
-    Statement, StepResult, IO,
+    DatabaseOpts, DatabaseStorage, EncryptionKey, LimboError, OpenFlags, QueryMode, Statement,
+    StepResult, IO,
 };
 
 use crate::{
@@ -647,8 +647,7 @@ impl TursoDatabase {
 }
 
 struct CachedStatement {
-    program: turso_core::Program,
-    pager: Arc<Pager>,
+    program: Arc<turso_core::PreparedProgram>,
     query_mode: QueryMode,
 }
 
@@ -696,17 +695,19 @@ impl TursoConnection {
 
         // Check if we have a cached version
         if let Some(cached) = self.cached_statements.lock().unwrap().get(sql_str) {
-            // Clone the cached program and create a new Statement with fresh state
-            let statement = Statement::new(
-                cached.program.clone(),
-                cached.pager.clone(),
-                cached.query_mode,
-            );
-            return Ok(Box::new(TursoStatement {
-                concurrent_guard: self.concurrent_guard.clone(),
-                async_io: self.async_io,
-                statement,
-            }));
+            if cached.program.is_compatible_with(&self.connection) {
+                let program = turso_core::Program::from_prepared(
+                    cached.program.clone(),
+                    self.connection.clone(),
+                );
+                let statement =
+                    Statement::new(program, self.connection.get_pager(), cached.query_mode);
+                return Ok(Box::new(TursoStatement {
+                    concurrent_guard: self.concurrent_guard.clone(),
+                    async_io: self.async_io,
+                    statement,
+                }));
+            }
         }
 
         // Not cached, prepare it fresh
@@ -714,8 +715,7 @@ impl TursoConnection {
 
         // Cache it for future use
         let cached = Arc::new(CachedStatement {
-            program: statement.get_program().clone(),
-            pager: statement.get_pager().clone(),
+            program: statement.get_program().prepared().clone(),
             query_mode: statement.get_query_mode(),
         });
         self.cached_statements

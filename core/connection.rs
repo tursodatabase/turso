@@ -1,7 +1,7 @@
 #[cfg(target_family = "windows")]
 use crate::error::CompletionError;
 use crate::sync::{
-    atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU16, Ordering},
+    atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU16, AtomicU64, Ordering},
     Arc, RwLock,
 };
 #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
@@ -42,6 +42,7 @@ pub struct Connection {
     pub(crate) last_change: AtomicI64,
     pub(crate) total_changes: AtomicI64,
     pub(crate) syms: parking_lot::RwLock<SymbolTable>,
+    pub(crate) syms_generation: AtomicU64,
     pub(super) _shared_cache: bool,
     pub(super) cache_size: AtomicI32,
     /// page size used for an uninitialized database or the next vacuum command.
@@ -1400,6 +1401,14 @@ impl Connection {
     /// Creates a HashSet of modules that have been loaded
     pub fn get_syms_vtab_mods(&self) -> HashSet<String> {
         self.syms.read().vtab_modules.keys().cloned().collect()
+    }
+
+    pub(crate) fn syms_generation(&self) -> u64 {
+        self.syms_generation.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn database_ptr(&self) -> usize {
+        Arc::as_ptr(&self.db) as usize
     }
 
     pub fn set_encryption_key(&self, key: EncryptionKey) -> Result<()> {

@@ -65,7 +65,7 @@ use crate::{
 #[cfg(feature = "json")]
 use crate::json::JsonCacheCell;
 use crate::sync::RwLock;
-use crate::{Connection, MvStore, Result, TransactionState};
+use crate::{AtomicBool, CaptureDataChangesMode, Connection, MvStore, Result, TransactionState};
 use branches::{mark_unlikely, unlikely};
 use builder::{CursorKey, QueryMode};
 use execute::{
@@ -81,6 +81,7 @@ use regex::Regex;
 use std::{
     collections::HashMap,
     num::NonZero,
+    ops::Deref,
     sync::{
         atomic::{AtomicI64, AtomicIsize, Ordering},
         Arc,
@@ -792,7 +793,7 @@ pub struct ExplainState {
 }
 
 #[derive(Clone)]
-pub struct Program {
+pub struct PreparedProgram {
     pub max_registers: usize,
     // we store original indices because we don't want to create new vec from
     // ProgramBuilder
@@ -800,7 +801,6 @@ pub struct Program {
     pub cursor_ref: Vec<(Option<CursorKey>, CursorType)>,
     pub comments: Vec<(InsnReference, &'static str)>,
     pub parameters: crate::parameters::Parameters,
-    pub connection: Arc<Connection>,
     pub change_cnt_on: bool,
     pub result_columns: Vec<ResultSetColumn>,
     pub table_references: TableReferences,
@@ -808,7 +808,7 @@ pub struct Program {
     /// In SQLite, whether statement subtransactions will be used for executing a program (`usesStmtJournal`)
     /// is determined by the parser flags "mayAbort" and "isMultiWrite". Essentially this means that the individual
     /// statement may need to be aborted due to a constraint conflict, etc. instead of the entire transaction.
-    pub needs_stmt_subtransactions: bool,
+    pub needs_stmt_subtransactions: Arc<AtomicBool>,
     /// If this Program is a trigger subprogram, a ref to the trigger is stored here.
     pub trigger: Option<Arc<Trigger>>,
     /// Whether this program is a subprogram (trigger or FK action) that runs within a parent statement.
@@ -816,6 +816,66 @@ pub struct Program {
     /// Whether the program contains any trigger subprograms.
     pub contains_trigger_subprograms: bool,
     pub resolve_type: ResolveType,
+    pub prepare_context: PrepareContext,
+}
+
+#[derive(Clone)]
+pub struct Program {
+    pub(crate) prepared: Arc<PreparedProgram>,
+    pub connection: Arc<Connection>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrepareContext {
+    database_ptr: usize,
+    foreign_keys: bool,
+    query_only: bool,
+    capture_data_changes: CaptureDataChangesMode,
+    syms_generation: u64,
+    databases: Vec<(usize, String, String)>,
+}
+
+impl PrepareContext {
+    pub fn from_connection(connection: &Connection) -> Self {
+        Self {
+            database_ptr: connection.database_ptr(),
+            foreign_keys: connection.foreign_keys_enabled(),
+            query_only: connection.get_query_only(),
+            capture_data_changes: connection.get_capture_data_changes().clone(),
+            syms_generation: connection.syms_generation(),
+            databases: connection.list_all_databases(),
+        }
+    }
+
+    pub fn matches_connection(&self, connection: &Connection) -> bool {
+        self == &Self::from_connection(connection)
+    }
+}
+
+impl PreparedProgram {
+    pub fn bind(self: Arc<Self>, connection: Arc<Connection>) -> Program {
+        Program {
+            prepared: self,
+            connection,
+        }
+    }
+
+    pub fn is_compatible_with(&self, connection: &Connection) -> bool {
+        self.prepare_context.matches_connection(connection)
+    }
+}
+
+impl Program {
+    pub fn prepared(&self) -> &Arc<PreparedProgram> {
+        &self.prepared
+    }
+
+    pub fn from_prepared(prepared: Arc<PreparedProgram>, connection: Arc<Connection>) -> Self {
+        Self {
+            prepared,
+            connection,
+        }
+    }
 }
 
 impl Program {
@@ -1493,6 +1553,14 @@ impl Program {
 
     pub fn is_trigger_subprogram(&self) -> bool {
         self.trigger.is_some() || self.is_subprogram
+    }
+}
+
+impl Deref for Program {
+    type Target = PreparedProgram;
+
+    fn deref(&self) -> &PreparedProgram {
+        &self.prepared
     }
 }
 

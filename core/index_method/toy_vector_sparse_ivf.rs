@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeSet, HashSet, VecDeque},
-    sync::Arc,
+    sync::atomic::Ordering,
 };
 
 use turso_parser::ast::{self, SortOrder};
@@ -13,6 +13,7 @@ use crate::{
     },
     return_if_io,
     storage::btree::{BTreeCursor, BTreeKey, CursorTrait},
+    sync::Arc,
     translate::collate::CollationSeq,
     types::{IOResult, ImmutableRecord, KeyInfo, SeekKey, SeekOp, SeekResult},
     vdbe::Register,
@@ -423,7 +424,10 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
             //
             // as we run nested statement - we actually don't need subjournal as it already started before in the parent statement
             // so, this is hacky way to fix the situation for toy index for now, but we need to implement proper helpers in order to avoid similar errors in other code later
-            stmt.program.needs_stmt_subtransactions = false;
+            stmt.program
+                .prepared
+                .needs_stmt_subtransactions
+                .store(false, Ordering::Relaxed);
             connection.start_nested();
             let result = stmt.run_ignore_rows();
             connection.end_nested();

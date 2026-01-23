@@ -64,7 +64,10 @@ use crate::storage::journal_mode;
 use crate::storage::pager::{self, AutoVacuumMode, HeaderRef, HeaderRefMut};
 use crate::storage::sqlite3_ondisk::{RawVersion, Version};
 use crate::sync::{
-    atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU16, AtomicUsize, Ordering},
+    atomic::{
+        AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU16, AtomicU64, AtomicUsize,
+        Ordering,
+    },
     Arc, LazyLock, Weak,
 };
 use crate::sync::{Mutex, RwLock};
@@ -116,7 +119,7 @@ use util::parse_schema_rows;
 pub use util::IOExt;
 pub use vdbe::{
     builder::QueryMode, explain::EXPLAIN_COLUMNS, explain::EXPLAIN_QUERY_PLAN_COLUMNS,
-    FromValueRow, Program, Register,
+    FromValueRow, PrepareContext, PreparedProgram, Program, Register,
 };
 
 #[cfg(feature = "cli_only")]
@@ -840,6 +843,7 @@ impl Database {
             last_change: AtomicI64::new(0),
             total_changes: AtomicI64::new(0),
             syms: parking_lot::RwLock::new(SymbolTable::new()),
+            syms_generation: AtomicU64::new(0),
             _shared_cache: false,
             cache_size: AtomicI32::new(default_cache_size),
             page_size: AtomicU16::new(page_size.get_raw()),
