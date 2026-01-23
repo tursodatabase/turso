@@ -9,6 +9,7 @@ mod encoder;
 use std::sync::Arc;
 
 use sha1::{Digest, Sha1};
+use std::num::NonZero;
 use turso_core::{Database, LimboError, PlatformIO, StepResult, Value, IO};
 
 pub use encoder::encode_value;
@@ -43,6 +44,11 @@ pub struct DbHashResult {
 ///
 /// System tables (sqlite_%), virtual tables, and statistics tables are excluded.
 pub fn hash_database(path: &str, options: &DbHashOptions) -> Result<DbHashResult, LimboError> {
+    assert_eq!(
+        !(options.schema_only && options.without_schema),
+        false,
+        "`schema_only` and `without_schema` cannot both be true"
+    );
     let io: Arc<dyn IO> = Arc::new(PlatformIO::new()?);
     let db = Database::open_file(io.clone(), path)?;
     let conn = db.connect()?;
@@ -82,27 +88,26 @@ fn get_table_names(
     io: &Arc<dyn IO>,
     like_pattern: &str,
 ) -> Result<Vec<String>, LimboError> {
-    let sql = format!(
-        r#"SELECT name FROM sqlite_schema
+    let sql = r#"SELECT name FROM sqlite_schema
            WHERE type = 'table'
-             AND sql NOT LIKE 'CREATE VIRTUAL%%'
-             AND name NOT LIKE 'sqlite_%%'
-             AND name LIKE '{}'
-           ORDER BY name COLLATE nocase"#,
-        escape_sql_string(like_pattern)
-    );
+             AND sql NOT LIKE 'CREATE VIRTUAL%'
+             AND name NOT LIKE 'sqlite_%'
+             AND name LIKE ?1
+           ORDER BY name COLLATE nocase"#;
 
-    let mut stmt = conn.prepare(&sql)?;
+    let mut stmt = conn.prepare(sql)?;
+    stmt.bind_at(
+        NonZero::new(1).unwrap(),
+        Value::from_text(like_pattern.to_string()),
+    );
     let mut names = Vec::new();
 
     loop {
         match stmt.step()? {
             StepResult::Row => {
-                if let Some(row) = stmt.row() {
-                    if let Value::Text(t) = row.get_value(0) {
-                        names.push(t.as_str().to_string());
-                    }
-                }
+                let row = stmt.row().unwrap();
+                let name = row.get_value(0).to_text().expect("table name must be text");
+                names.push(name.to_string());
             }
             StepResult::IO => io.step()?,
             StepResult::Done => break,
@@ -133,15 +138,14 @@ fn hash_table(
         match stmt.step()? {
             StepResult::Row => {
                 row_count += 1;
-                if let Some(row) = stmt.row() {
-                    for value in row.get_values() {
-                        buf.clear();
-                        encode_value(value, &mut buf);
-                        if debug {
-                            eprintln!("{value:?}");
-                        }
-                        hasher.update(&buf);
+                let row = stmt.row().unwrap();
+                for value in row.get_values() {
+                    buf.clear();
+                    encode_value(value, &mut buf);
+                    if debug {
+                        eprintln!("{value:?}");
                     }
+                    hasher.update(&buf);
                 }
             }
             StepResult::IO => io.step()?,
@@ -163,28 +167,28 @@ fn hash_schema(
     hasher: &mut Sha1,
     debug: bool,
 ) -> Result<(), LimboError> {
-    let sql = format!(
-        r#"SELECT type, name, tbl_name, sql FROM sqlite_schema
-           WHERE tbl_name LIKE '{}'
-           ORDER BY name COLLATE nocase"#,
-        escape_sql_string(like_pattern)
-    );
+    let sql = r#"SELECT type, name, tbl_name, sql FROM sqlite_schema
+           WHERE tbl_name LIKE ?1
+           ORDER BY name COLLATE nocase"#;
 
-    let mut stmt = conn.prepare(&sql)?;
+    let mut stmt = conn.prepare(sql)?;
+    stmt.bind_at(
+        NonZero::new(1).unwrap(),
+        Value::from_text(like_pattern.to_string()),
+    );
     let mut buf = Vec::new();
 
     loop {
         match stmt.step()? {
             StepResult::Row => {
-                if let Some(row) = stmt.row() {
-                    for value in row.get_values() {
-                        buf.clear();
-                        encode_value(value, &mut buf);
-                        if debug {
-                            eprintln!("{value:?}");
-                        }
-                        hasher.update(&buf);
+                let row = stmt.row().unwrap();
+                for value in row.get_values() {
+                    buf.clear();
+                    encode_value(value, &mut buf);
+                    if debug {
+                        eprintln!("{value:?}");
                     }
+                    hasher.update(&buf);
                 }
             }
             StepResult::IO => io.step()?,
@@ -196,21 +200,4 @@ fn hash_schema(
     }
 
     Ok(())
-}
-
-/// Escape single quotes in SQL string literals.
-fn escape_sql_string(s: &str) -> String {
-    s.replace('\'', "''")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_escape_sql_string() {
-        assert_eq!(escape_sql_string("test"), "test");
-        assert_eq!(escape_sql_string("it's"), "it''s");
-        assert_eq!(escape_sql_string("a'b'c"), "a''b''c");
-    }
 }

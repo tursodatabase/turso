@@ -5,7 +5,7 @@
 //! All tests are marked with `#[ignore]` by default because they require SQLite's dbhash
 //! binary to be installed. See tests/README.md for setup instructions.
 //!
-//! Run with: cargo test -p turso-dbhash --ignored
+//! Run with: cargo test -p turso-dbhash -- --include-ignored
 
 use std::process::Command;
 use tempfile::NamedTempFile;

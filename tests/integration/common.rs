@@ -467,13 +467,8 @@ pub fn rusqlite_integrity_check(db_path: &Path) -> anyhow::Result<()> {
 /// Compute dbhash of the test database.
 pub fn compute_dbhash(tmp_db: &TempDatabase) -> turso_dbhash::DbHashResult {
     let path = tmp_db.path.to_str().unwrap();
-    turso_dbhash::hash_database(
-        path,
-        &turso_dbhash::DbHashOptions {
-            ..Default::default()
-        },
-    )
-    .expect("dbhash failed")
+    turso_dbhash::hash_database(path, &turso_dbhash::DbHashOptions::default())
+        .expect("dbhash failed")
 }
 
 /// Compute dbhash with custom options.
