@@ -65,8 +65,7 @@ use crate::storage::pager::{self, AutoVacuumMode, HeaderRef, HeaderRefMut};
 use crate::storage::sqlite3_ondisk::{RawVersion, Version};
 use crate::sync::{
     atomic::{
-        AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU16, AtomicU64, AtomicUsize,
-        Ordering,
+        AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU16, AtomicU64, AtomicUsize, Ordering,
     },
     Arc, LazyLock, Weak,
 };

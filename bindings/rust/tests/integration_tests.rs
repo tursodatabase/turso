@@ -976,8 +976,17 @@ async fn test_prepare_cached_batch_insert_delete_pattern() {
 
     insert_hosts(&conn, &hosts).await.unwrap();
 
-    let mut rows = conn.query("SELECT name FROM hosts ORDER BY name", ()).await.unwrap();
-    let first = rows.next().await.unwrap().unwrap().get::<String>(0).unwrap();
+    let mut rows = conn
+        .query("SELECT name FROM hosts ORDER BY name", ())
+        .await
+        .unwrap();
+    let first = rows
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get::<String>(0)
+        .unwrap();
     assert_eq!(first, "b");
     assert!(rows.next().await.unwrap().is_none());
 }

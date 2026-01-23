@@ -1159,7 +1159,9 @@ mod tests {
         }
 
         assert!(
-            results.iter().any(|r| matches!(r, Err(TursoError::Misuse(_)))),
+            results
+                .iter()
+                .any(|r| matches!(r, Err(TursoError::Misuse(_)))),
             "expected at least one concurrent-use error, got: {results:?}"
         );
         assert!(

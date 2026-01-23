@@ -65,7 +65,9 @@ use crate::{
 #[cfg(feature = "json")]
 use crate::json::JsonCacheCell;
 use crate::sync::RwLock;
-use crate::{AtomicBool, CaptureDataChangesMode, Connection, MvStore, Result, TransactionState};
+use crate::{
+    AtomicBool, CaptureDataChangesMode, Connection, MvStore, Result, SyncMode, TransactionState,
+};
 use branches::{mark_unlikely, unlikely};
 use builder::{CursorKey, QueryMode};
 use execute::{
@@ -833,10 +835,20 @@ pub struct PrepareContext {
     capture_data_changes: CaptureDataChangesMode,
     syms_generation: u64,
     databases: Vec<(usize, String, String)>,
+    busy_timeout_ms: u64,
+    cache_size: i32,
+    spill_enabled: bool,
+    page_size: u32,
+    sync_mode: SyncMode,
+    data_sync_retry: bool,
+    encryption_key_set: bool,
+    encryption_cipher: Option<String>,
+    mvcc_checkpoint_threshold: Option<i64>,
 }
 
 impl PrepareContext {
     pub fn from_connection(connection: &Connection) -> Self {
+        let pager = connection.get_pager();
         Self {
             database_ptr: connection.database_ptr(),
             foreign_keys: connection.foreign_keys_enabled(),
@@ -844,6 +856,21 @@ impl PrepareContext {
             capture_data_changes: connection.get_capture_data_changes().clone(),
             syms_generation: connection.syms_generation(),
             databases: connection.list_all_databases(),
+            busy_timeout_ms: connection.get_busy_timeout().as_millis() as u64,
+            cache_size: connection.get_cache_size(),
+            spill_enabled: pager.get_spill_enabled(),
+            page_size: connection.get_page_size().get(),
+            sync_mode: connection.get_sync_mode(),
+            data_sync_retry: connection.get_data_sync_retry(),
+            encryption_key_set: connection.encryption_key.read().is_some(),
+            encryption_cipher: connection
+                .get_encryption_cipher_mode()
+                .map(|cipher| cipher.to_string()),
+            mvcc_checkpoint_threshold: connection
+                .db
+                .mvcc_enabled()
+                .then(|| connection.mvcc_checkpoint_threshold())
+                .and_then(|res| res.ok()),
         }
     }
 
