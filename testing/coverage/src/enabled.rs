@@ -6,7 +6,9 @@ use std::sync::atomic::Ordering;
 pub use linkme;
 use linkme::distributed_slice;
 
-use crate::common::{CoveragePoint, CoverageSnapshot, CoverageSummary, FileCoverage, ModuleCoverage};
+use crate::common::{
+    CoveragePoint, CoverageSnapshot, CoverageSummary, FileCoverage, ModuleCoverage,
+};
 
 /// The global catalog of coverage points (populated at link time).
 #[distributed_slice]
@@ -26,6 +28,8 @@ macro_rules! coverage_point {
     ($name:literal) => {{
         use std::sync::atomic::{AtomicU64, Ordering};
 
+        $crate::function!(FUNCTION);
+
         static HIT_COUNT: AtomicU64 = AtomicU64::new(0);
 
         #[$crate::enabled::linkme::distributed_slice($crate::enabled::COVERAGE_CATALOG)]
@@ -36,8 +40,12 @@ macro_rules! coverage_point {
             line: ::std::line!(),
             column: ::std::column!(),
             module: ::std::module_path!(),
+            function: &FUNCTION,
             hit_count: &HIT_COUNT,
         };
+
+        // Force initialization of function name
+        let _ = *FUNCTION;
 
         HIT_COUNT.fetch_add(1, Ordering::Relaxed);
     }};
@@ -53,6 +61,7 @@ pub fn get_coverage_report() -> Vec<CoverageSnapshot> {
             line: point.line,
             column: point.column,
             module: point.module,
+            function: **point.function,
             hit_count: point.hit_count.load(Ordering::Relaxed),
         })
         .collect()
@@ -287,6 +296,14 @@ mod tests {
         assert!(point.file.ends_with("enabled.rs"));
         assert!(point.line > 0);
         assert!(!point.module.is_empty());
+        // Verify function name is captured
+        assert!(
+            point
+                .function
+                .contains("test_coverage_point_exists_in_catalog"),
+            "Expected function name to contain 'test_coverage_point_exists_in_catalog', got: {}",
+            point.function
+        );
     }
 
     #[test]
