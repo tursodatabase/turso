@@ -139,16 +139,12 @@ impl Workload for SimpleInsertWorkload {
             None => return None,
         };
         let key = format!("key_{}", rng.random_range(0..10000));
-        let value_len = rng.random_range(10..100);
-        let value: String = (0..value_len)
-            .map(|_| rng.random_range(b'a'..=b'z') as char)
-            .collect();
-        let value_hex = hex::encode(value.as_bytes());
+        let value_length = rng.random_range(10..16 * 1024);
 
         Some(Operation::SimpleInsert {
             table_name,
             key,
-            value_hex,
+            value_length,
         })
     }
 }

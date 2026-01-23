@@ -37,7 +37,7 @@ pub enum Operation {
     SimpleInsert {
         table_name: String,
         key: String,
-        value_hex: String,
+        value_length: usize,
     },
     /// Generic SELECT query
     Select { sql: String },
@@ -81,15 +81,15 @@ impl Operation {
                 )
             }
             Operation::SimpleSelect { table_name, key } => {
-                format!("SELECT value FROM {table_name} WHERE key = '{key}'")
+                format!("SELECT key, length(value) FROM {table_name} WHERE key = '{key}'")
             }
             Operation::SimpleInsert {
                 table_name,
                 key,
-                value_hex,
+                value_length,
             } => {
                 format!(
-                    "INSERT OR REPLACE INTO {table_name} (key, value) VALUES ('{key}', X'{value_hex}')"
+                    "INSERT OR REPLACE INTO {table_name} (key, value) VALUES ('{key}', zeroblob({value_length}))"
                 )
             }
             Operation::Select { sql } => sql.clone(),

@@ -528,7 +528,7 @@ impl Whopper {
     /// Returns `StepResult::Ok` if the step completed normally,
     /// or `StepResult::WalSizeLimitExceeded` if the WAL file exceeded the soft limit.
     pub fn step(&mut self) -> anyhow::Result<StepResult> {
-        debug!("step={}", self.current_step);
+        trace!("step={}", self.current_step);
         if self.current_step >= self.max_steps {
             return Ok(StepResult::Ok);
         }
@@ -683,7 +683,6 @@ impl Whopper {
             }
 
             let mut roll = self.rng.random_range(0..self.total_weight);
-            debug!("roll: {}", roll);
             for (weight, workload) in &self.workloads {
                 if roll >= *weight {
                     roll = roll.saturating_sub(*weight);
