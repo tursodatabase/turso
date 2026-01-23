@@ -66,7 +66,9 @@ package-dylibs:
 	cp "$(SYNC_SDK_KIT_DIR)/turso_sync.h" libs/ios/turso-sync-sdk-kit.xcframework/ios-arm64-simulator/turso-sync-sdk-kit.framework/Headers/
 
 ios-build:
+	rustup target add aarch64-apple-ios
 	cargo build --release --target aarch64-apple-ios --package turso_sync_sdk_kit
+	rustup target add aarch64-apple-ios-sim
 	cargo build --release --target aarch64-apple-ios-sim --package turso_sync_sdk_kit
 
 android: $(ARCHS_ANDROID)
