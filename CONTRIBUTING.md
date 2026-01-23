@@ -25,6 +25,7 @@ This document is a quick helper to get you going.
   - [Fault injection with unreliable libc](#fault-injection-with-unreliable-libc)
   - [Antithesis](#antithesis)
   - [Adding Third Party Dependencies](#adding-third-party-dependencies)
+    - [License Check](#license-check)
 <!--toc:end-->
 
 ## Getting Started
@@ -416,6 +417,25 @@ When you want to add third party dependencies, please follow these steps:
    that each license is in a separate file and named appropriately.
 2. Update NOTICE.md: Specify the licenses for the third-party dependencies in the NOTICE.md file. Include the name of
    the dependency, the license file path, and the homepage of the dependency.
+3. Run the license check to ensure the dependency's license is allowed (see below).
 
 By following these steps, you ensure that all third-party dependencies are properly documented and their licenses are
 included in the project.
+
+### License Check
+
+We use [cargo-deny](https://github.com/EmbarkStudios/cargo-deny) to verify that all dependencies have compatible licenses.
+
+To install cargo-deny:
+
+```console
+cargo install cargo-deny
+```
+
+To run the license check:
+
+```console
+cargo deny check licenses
+```
+
+If a new dependency has a license not in the allow list, you may need to update `deny.toml` to add it (if the license is acceptable) or choose an alternative dependency.

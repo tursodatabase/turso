@@ -1,0 +1,36 @@
+[licenses]
+version = 2
+# List of explicitly allowed licenses
+# See https://spdx.org/licenses/ for list of possible licenses
+# [possible values: any SPDX 3.11 short identifier (+ optional exception)].
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "Unlicense",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "ISC",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Zlib",
+]
+unused-allowed-license = "warn"
+# The confidence threshold for detecting a license from license text.
+# The higher the value, the more closely the license text must be to the
+# canonical license text of a valid SPDX license file.
+# [possible values: any between 0.0 and 1.0].
+confidence-threshold = 0.8
+
+# External crates without license field in Cargo.toml
+[[licenses.clarify]]
+name = "allo-isolate"
+expression = "Apache-2.0"
+license-files = [{ path = "LICENSE", hash = 0xa0e75fc2 }]
+
+[[licenses.clarify]]
+name = "cfg_block"
+expression = "Apache-2.0"
+license-files = []
