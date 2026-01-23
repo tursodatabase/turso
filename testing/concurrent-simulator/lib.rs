@@ -773,10 +773,10 @@ impl Whopper {
         Ok(())
     }
 
-    /// Restart the database by closing all connections and reopening them.
+    /// Reopen the database by closing all connections and recreating them.
     /// This simulates a database restart/reopen scenario.
     /// Active statements are run to completion before closing.
-    pub fn restart(&mut self) -> anyhow::Result<()> {
+    pub fn reopen(&mut self) -> anyhow::Result<()> {
         debug!(
             "Restarting database, completing active statements for {} fibers",
             self.context.fibers.len()

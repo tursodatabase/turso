@@ -15,7 +15,7 @@ struct Args {
     #[arg(long, default_value_t = 4)]
     max_connections: usize,
     #[arg(long, default_value_t = 0.0)]
-    restart_probability: f64,
+    reopen_probability: f64,
     /// Max steps
     #[arg(long)]
     max_steps: Option<usize>,
@@ -74,8 +74,8 @@ fn main() -> anyhow::Result<()> {
     progress_index += 1;
 
     while !whopper.is_done() {
-        if whopper.rng.random_bool(args.restart_probability) {
-            whopper.restart().unwrap();
+        if whopper.rng.random_bool(args.reopen_probability) {
+            whopper.reopen().unwrap();
         }
         match whopper.step()? {
             StepResult::Ok => {}
