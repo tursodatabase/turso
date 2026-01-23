@@ -1,6 +1,7 @@
 use crate::translate::optimizer::constraints::RangeConstraintRef;
 
 use super::constraints::Constraint;
+use super::cost_params::CostModelParams;
 
 /// A simple newtype wrapper over a f64 that represents the cost of an operation.
 ///
@@ -31,28 +32,25 @@ pub struct IndexInfo {
     pub covering: bool,
 }
 
-pub const ESTIMATED_HARDCODED_ROWS_PER_TABLE: usize = 1000000;
-pub const ESTIMATED_HARDCODED_ROWS_PER_PAGE: usize = 50; // roughly 80 bytes per 4096 byte page
-
 /// Estimate IO and CPU cost for a full table scan.
 ///
 /// # Arguments
 /// * `base_row_count` - Total rows in the table
 /// * `num_scans` - Number of times we scan the table (e.g., from outer loop in nested loop join)
-fn estimate_scan_cost(base_row_count: f64, num_scans: f64) -> Cost {
-    let table_pages = (base_row_count / ESTIMATED_HARDCODED_ROWS_PER_PAGE as f64).max(1.0);
+/// * `params` - Cost model parameters
+fn estimate_scan_cost(base_row_count: f64, num_scans: f64, params: &CostModelParams) -> Cost {
+    let table_pages = (base_row_count / params.rows_per_page).max(1.0);
 
     // First scan reads all pages; subsequent scans benefit from caching
-    let cache_reuse_factor = 0.2;
     let io_cost = if num_scans <= 1.0 {
         table_pages
     } else {
         // First scan + discounted cost for subsequent scans
-        table_pages + (num_scans - 1.0) * table_pages * cache_reuse_factor
+        table_pages + (num_scans - 1.0) * table_pages * params.cache_reuse_factor
     };
 
     // CPU cost for processing all rows on each scan
-    let cpu_cost = num_scans * base_row_count * 0.001;
+    let cpu_cost = num_scans * base_row_count * params.cpu_cost_per_row;
 
     Cost(io_cost + cpu_cost)
 }
@@ -69,12 +67,14 @@ fn estimate_scan_cost(base_row_count: f64, num_scans: f64) -> Cost {
 /// * `index_info` - Index properties (covering, unique, etc.)
 /// * `num_seeks` - Number of B-tree traversals (typically = outer cardinality for joins)
 /// * `rows_per_seek` - Expected rows returned per seek (1 for point lookup, more for range)
+/// * `params` - Cost model parameters
 fn estimate_index_cost(
     base_row_count: f64,
     tree_depth: f64,
     index_info: IndexInfo,
     num_seeks: f64,
     rows_per_seek: f64,
+    params: &CostModelParams,
 ) -> Cost {
     // Detect full index scan: when rows_per_seek equals base_row_count, we're scanning
     // the entire index, not seeking to specific positions.
@@ -90,11 +90,10 @@ fn estimate_index_cost(
 
     // Cost of reading leaf pages after seeking.
     // For covering indexes, entries are smaller (only indexed columns), so more rows fit per page.
-    // Use a 2x density factor for covering indexes.
     let rows_per_page = if index_info.covering {
-        ESTIMATED_HARDCODED_ROWS_PER_PAGE as f64 * 2.0
+        params.rows_per_page * params.covering_index_density
     } else {
-        ESTIMATED_HARDCODED_ROWS_PER_PAGE as f64
+        params.rows_per_page
     };
     let leaf_pages = (rows_per_seek / rows_per_page).max(1.0);
     let leaf_scan_cost = if is_full_scan {
@@ -107,7 +106,7 @@ fn estimate_index_cost(
     let table_lookup_cost = if index_info.covering {
         0.0
     } else {
-        let table_pages = (base_row_count / ESTIMATED_HARDCODED_ROWS_PER_PAGE as f64).max(1.0);
+        let table_pages = (base_row_count / params.rows_per_page).max(1.0);
         let selectivity = rows_per_seek / base_row_count.max(1.0);
         num_seeks * selectivity * table_pages
     };
@@ -116,12 +115,9 @@ fn estimate_index_cost(
 
     // CPU cost: key comparisons during seeks + row processing
     let total_rows = num_seeks * rows_per_seek;
-    let cpu_cost = num_seeks * 0.01 + total_rows * 0.001;
+    let cpu_cost = num_seeks * params.cpu_cost_per_seek + total_rows * params.cpu_cost_per_row;
 
-    // Small bonus for using an existing index
-    let index_bonus = 0.5;
-
-    Cost((io_cost + cpu_cost - index_bonus).max(0.001))
+    Cost((io_cost + cpu_cost - params.index_bonus).max(0.001))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -130,9 +126,10 @@ pub enum RowCountEstimate {
     AnalyzeStats(f64),
 }
 
-impl Default for RowCountEstimate {
-    fn default() -> Self {
-        RowCountEstimate::HardcodedFallback(ESTIMATED_HARDCODED_ROWS_PER_TABLE as f64)
+impl RowCountEstimate {
+    /// Create a hardcoded fallback using the given params.
+    pub fn hardcoded_fallback(params: &CostModelParams) -> Self {
+        RowCountEstimate::HardcodedFallback(params.rows_per_table_fallback)
     }
 }
 
@@ -155,20 +152,21 @@ pub fn estimate_cost_for_scan_or_seek(
     input_cardinality: f64,
     base_row_count: RowCountEstimate,
     is_index_ordered: bool,
+    params: &CostModelParams,
 ) -> Cost {
     let base_row_count = *base_row_count;
 
     let tree_depth = if base_row_count <= 1.0 {
         1.0
     } else {
-        (base_row_count.ln() / (ESTIMATED_HARDCODED_ROWS_PER_PAGE as f64).ln())
+        (base_row_count.ln() / params.rows_per_page.ln())
             .ceil()
             .max(1.0)
     };
 
     let Some(index_info) = index_info else {
         // Full table scan (no index)
-        return estimate_scan_cost(base_row_count, input_cardinality);
+        return estimate_scan_cost(base_row_count, input_cardinality, params);
     };
 
     // Check if this is a unique index with full equality constraints on all columns.
@@ -191,6 +189,7 @@ pub fn estimate_cost_for_scan_or_seek(
             index_info,
             input_cardinality, // num_seeks = outer cardinality
             1.0,               // rows_per_seek = 1 for unique point lookup
+            params,
         );
     }
 
@@ -224,6 +223,7 @@ pub fn estimate_cost_for_scan_or_seek(
         index_info,
         input_cardinality, // num_seeks = outer cardinality
         rows_per_seek,
+        params,
     );
 
     let is_full_scan = usable_constraint_refs.is_empty();

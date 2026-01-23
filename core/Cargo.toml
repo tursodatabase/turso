@@ -38,6 +38,7 @@ test_helper = []
 bench = []
 fts = ["dep:tantivy"]
 codspeed = ["bench"]
+optimizer_params = ["serde", "dep:serde_json"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = { version = "0.7.5", optional = true }
@@ -77,6 +78,7 @@ uncased = "0.9.10"
 strum_macros = { workspace = true }
 bitflags = { workspace = true }
 serde = { workspace = true, optional = true, features = ["derive"] }
+serde_json = { workspace = true, optional = true }
 paste = "1.0.15"
 uuid = { version = "1.11.0", features = ["v4", "v5", "v7"], optional = true }
 tempfile = { workspace = true }
