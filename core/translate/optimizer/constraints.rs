@@ -291,10 +291,9 @@ fn estimate_selectivity(
                                 }
                                 if let Some(stats) = table_stats {
                                     if let Some(idx_stat) = stats.index_stats.get(&index.name) {
-                                        // distinct_per_prefix[0] = avg rows per distinct value for first column
                                         if let (Some(total), Some(&avg_rows)) = (
                                             idx_stat.total_rows,
-                                            idx_stat.distinct_per_prefix.first(),
+                                            idx_stat.avg_rows_per_distinct_prefix.first(),
                                         ) {
                                             if total > 0 && avg_rows > 0 {
                                                 // selectivity = avg_rows_per_key / total_rows
@@ -403,9 +402,10 @@ fn estimate_column_ndv(
                 }
                 if let Some(stats) = table_stats {
                     if let Some(idx_stat) = stats.index_stats.get(&index.name) {
-                        if let (Some(total), Some(&avg_rows)) =
-                            (idx_stat.total_rows, idx_stat.distinct_per_prefix.first())
-                        {
+                        if let (Some(total), Some(&avg_rows)) = (
+                            idx_stat.total_rows,
+                            idx_stat.avg_rows_per_distinct_prefix.first(),
+                        ) {
                             if total > 0 && avg_rows > 0 {
                                 let ndv = total as f64 / avg_rows as f64;
                                 if ndv > 0.0 {
