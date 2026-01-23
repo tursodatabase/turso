@@ -335,13 +335,31 @@ export class Statement {
   /**
    * Finalize and release statement resources
    */
-  finalize(): void {
+  async finalize(): Promise<void> {
     if (this._finalized) {
       return;
     }
 
-    // todo: fix this
-    // this._statement.finalize();
+    while (true) {
+      const status = this._statement.finalize();
+
+      if (status === TursoStatus.IO) {
+        // Statement needs IO (e.g., loading missing pages with partial sync)
+        this._statement.runIo();
+
+        // Drain sync engine IO queue
+        if (this._extraIo) {
+          await this._extraIo();
+        }
+
+        continue;
+      }
+
+      if (status !== TursoStatus.DONE) {
+        throw new Error(`Statement finalization failed with status: ${status}`);
+      }
+      break;
+    }
     this._finalized = true;
   }
 

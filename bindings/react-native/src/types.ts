@@ -49,7 +49,7 @@ export interface NativeStatement {
   step(): number;  // Returns status code
   runIo(): number;
   reset(): void;
-  finalize(): void;
+  finalize(): number;
 
   // Query methods
   nChange(): number;

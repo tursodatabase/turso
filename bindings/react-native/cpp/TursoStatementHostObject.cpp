@@ -289,11 +289,11 @@ jsi::Value TursoStatementHostObject::finalize(jsi::Runtime &rt) {
     const char* error = nullptr;
     turso_status_code_t status = turso_statement_finalize(stmt_, &error);
 
-    if (status != TURSO_OK) {
+    if (status != TURSO_DONE && status != TURSO_IO) {
         throwError(rt, error);
     }
 
-    return jsi::Value::undefined();
+    return jsi::Value(static_cast<int>(status));
 }
 
 jsi::Value TursoStatementHostObject::nChange(jsi::Runtime &rt) {
