@@ -601,9 +601,7 @@ impl Whopper {
         }
 
         // drop statement - we finished its execution
-        if let Some(mut stmt) = self.context.fibers[fiber_idx].statement.replace(None) {
-            stmt.reset();
-        }
+        self.context.fibers[fiber_idx].statement.replace(None);
         self.context.fibers[fiber_idx].execution_id = None;
 
         // get current completed operation
