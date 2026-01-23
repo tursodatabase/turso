@@ -243,8 +243,8 @@ jobs:
           RUSTC_WRAPPER: "sccache"
         run: |
           cargo build -p turso_whopper
-          for i in $(seq 1 10); do
-            ./target/debug/turso_whopper || exit 1
+          for i in $(seq 1 100); do
+            ./target/debug/turso_whopper --reopen-probability 0.001 || exit 1
           done
 
   test-sqlite:
