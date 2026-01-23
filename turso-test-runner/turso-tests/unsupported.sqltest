@@ -1,0 +1,31 @@
+@database :memory:
+
+# Test that unsupported features return errors instead of panicking
+
+# CREATE TABLE AS SELECT is not supported
+test fail-create-table-as-select {
+    CREATE TABLE t AS SELECT 1;
+}
+expect error {
+}
+
+# Parenthesized FROM clause subqueries (Sub variant) are not supported
+test fail-parenthesized-from-clause {
+    SELECT * FROM ((SELECT 1));
+}
+expect error {
+}
+
+# Scalar subquery in VALUES clause is not supported
+test fail-scalar-subquery-in-values {
+    VALUES ((SELECT 1));
+}
+expect error {
+}
+
+# EXISTS subquery in VALUES clause is not supported
+test fail-exists-subquery-in-values {
+    VALUES (EXISTS(SELECT 1));
+}
+expect error {
+}

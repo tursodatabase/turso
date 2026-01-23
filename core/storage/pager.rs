@@ -2037,7 +2037,9 @@ impl Pager {
                     }
                 }
                 AutoVacuumMode::Incremental => {
-                    unimplemented!()
+                    return Err(LimboError::InternalError(
+                        "Incremental auto-vacuum is not supported".to_string(),
+                    ));
                 }
             }
         }
