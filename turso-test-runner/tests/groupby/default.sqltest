@@ -238,7 +238,7 @@ test having_with_multiple_conditions {
     from users u
     group by u.first_name
     having count(*) >= 9 and avg(u.age) > 50
-    order by count(*) desc, avg(u.age) desc
+    order by count(*) desc, avg(u.age) desc, first_name
     limit 5;
 }
 expect {
@@ -246,14 +246,14 @@ expect {
     Amely|10|62.0
     Rosemary|10|59.0
     Trystan|10|55.0
-    Neha|10|52.0
+    Garnett|10|52.0
 }
 expect @js {
     America|11|52
     Amely|10|62
     Rosemary|10|59
     Trystan|10|55
-    Neha|10|52
+    Garnett|10|52
 }
 
 # Trystan = 10, America = 11, Jaida = 11

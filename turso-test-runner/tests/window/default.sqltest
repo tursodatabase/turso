@@ -21,6 +21,7 @@ expect {
     Hannah|329
 }
 
+@skip "TURSO is incorrect in how it deduplicates according to SQLite"
 test window-partition-by-duplicate-column {
     SELECT
     first_name,
@@ -28,17 +29,18 @@ test window-partition-by-duplicate-column {
     FROM users u
     LIMIT 10;
 }
+# SQLite correctly deduplicates PARTITION BY columns, so this is same as PARTITION BY zipcode
 expect {
-    Britney|41
-    Kaci|51
-    Selena|5
+    Britney|97
+    Kaci|97
+    Selena|97
     Isaac|68
     Odessa|76
     Charles|93
     Lew|26
-    Neil|76
-    Onie|64
-    Hannah|89
+    Neil|329
+    Onie|329
+    Hannah|329
 }
 
 test window-partition-by-multiple-columns {

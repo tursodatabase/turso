@@ -31,16 +31,20 @@ expect {
     -2000
 }
 
-test pragma-update-journal-mode-wal {
-    PRAGMA journal_mode=WAL
+# SQLite has memory mode, but we only report wal or mvcc
+@backend rust
+@skip-if mvcc "should return something different for mvcc"
+test pragma-function-update-journal-mode {
+    SELECT * FROM pragma_journal_mode()
 }
 expect {
     wal
 }
 
-@skip-if mvcc "should return something different for mvcc"
-test pragma-function-update-journal-mode {
-    SELECT * FROM pragma_journal_mode()
+# SQLite only allows memory mode when in memory, but we allow wal or mvcc for in-mem dbs
+@backend rust
+test pragma-update-journal-mode-wal {
+    PRAGMA journal_mode=WAL
 }
 expect {
     wal
