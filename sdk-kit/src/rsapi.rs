@@ -1122,23 +1122,16 @@ mod tests {
             .unwrap();
         create.execute(None).unwrap();
 
-        let insert_sql = "WITH RECURSIVE cnt(x) AS (
-                SELECT 1
-                UNION ALL
-                SELECT x + 1 FROM cnt WHERE x < 50000
-            )
-            INSERT INTO hosts (
+        let insert_sql = "INSERT INTO hosts (
                 name, app, address, namespace, cloud_cluster_name, allowed_ips, updated_at
-            )
-            SELECT
-                'host-' || x,
-                'app',
-                'addr',
-                'ns',
-                'cluster',
-                'ip',
-                x
-            FROM cnt";
+            ) SELECT
+                'host-' || uuid4_str(),
+                'app' || uuid4_str(),
+                'addr' || uuid4_str(),
+                'ns' || uuid4_str(),
+                'cluster' || uuid4_str(),
+                'ip' || uuid4_str(),
+                 datetime('now') FROM generate_series(1,100)";
 
         let stmt1 = conn.prepare_cached(insert_sql).unwrap();
         let stmt2 = conn.prepare_cached(insert_sql).unwrap();
