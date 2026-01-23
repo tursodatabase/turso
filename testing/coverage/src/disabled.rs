@@ -3,7 +3,9 @@
 //! When the "enabled" feature is off, all functions return empty/default values
 //! and the macro compiles to nothing.
 
-use crate::common::{CoverageSnapshot, CoverageSummary, FileCoverage, ModuleCoverage};
+use crate::common::{
+    CoverageSnapshot, CoverageSummary, FileCoverage, FunctionCoverage, ModuleCoverage,
+};
 
 /// Track that this code path was reached.
 ///
@@ -66,6 +68,11 @@ pub fn coverage_by_file() -> Vec<FileCoverage> {
     vec![]
 }
 
+/// Get coverage grouped by function (returns empty when disabled).
+pub fn coverage_by_function() -> Vec<FunctionCoverage> {
+    vec![]
+}
+
 /// Format a coverage report as a human-readable string.
 pub fn format_coverage_report() -> String {
     String::from("Coverage instrumentation not enabled.\n")
@@ -84,6 +91,16 @@ pub fn print_coverage_report() {
 /// Print only uncovered points to stdout.
 pub fn print_uncovered_report() {
     print!("{}", format_uncovered_report());
+}
+
+/// Format a coverage report grouped by function.
+pub fn format_function_coverage_report() -> String {
+    String::from("Coverage instrumentation not enabled.\n")
+}
+
+/// Print the function coverage report to stdout.
+pub fn print_function_coverage_report() {
+    print!("{}", format_function_coverage_report());
 }
 
 #[cfg(test)]
@@ -114,6 +131,9 @@ mod tests {
 
         let by_file = coverage_by_file();
         assert!(by_file.is_empty());
+
+        let by_function = coverage_by_function();
+        assert!(by_function.is_empty());
 
         let report_str = format_coverage_report();
         assert!(report_str.contains("not enabled"));
