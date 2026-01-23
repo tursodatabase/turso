@@ -16,6 +16,7 @@ import type {
   BindParams,
   DatabaseOpts,
   SyncStats,
+  EncryptionOpts,
 } from './types';
 import {
   driveVoidOperation,
@@ -30,6 +31,33 @@ import { drainSyncIo } from './internal/ioProcessor';
  */
 function isSyncConfig(opts: DatabaseOpts): boolean {
   return opts.url !== undefined && opts.url !== null;
+}
+
+/**
+ * Calculate reserved bytes based on encryption cipher.
+ * These values match the Turso Cloud encryption settings.
+ */
+function getReservedBytesForCipher(encryption: EncryptionOpts | undefined): number {
+  if (!encryption) {
+    return 0;
+  }
+
+  switch (encryption.cipher) {
+    case 'aes256gcm':
+    case 'aes128gcm':
+    case 'chacha20poly1305':
+      return 28;
+    case 'aegis128l':
+    case 'aegis128x2':
+    case 'aegis128x4':
+      return 32;
+    case 'aegis256':
+    case 'aegis256x2':
+    case 'aegis256x4':
+      return 48;
+    default:
+      return 0;
+  }
 }
 
 /**
@@ -132,13 +160,19 @@ export class Database {
       async_io: true, // Always use async IO in React Native
     };
 
+    // Calculate reserved bytes from cipher
+    const reservedBytes = getReservedBytesForCipher(this._opts.remoteEncryption);
+
     // Build syncConfig with all options
     const syncConfig: any = {
       remoteUrl: url,
       clientName: this._opts.clientName || 'turso-sync-react-native',
       longPollTimeoutMs: this._opts.longPollTimeoutMs,
       bootstrapIfEmpty: this._opts.bootstrapIfEmpty ?? true,
-      reservedBytes: this._opts.reservedBytes,
+      reservedBytes: reservedBytes,
+      // Remote encryption options (key is passed to sync engine for HTTP headers)
+      remoteEncryptionKey: this._opts.remoteEncryption?.key,
+      remoteEncryptionCipher: this._opts.remoteEncryption?.cipher,
     };
 
     // Add partial sync options if present

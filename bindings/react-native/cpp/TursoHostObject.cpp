@@ -327,6 +327,45 @@ namespace turso
                     sync_config.partial_bootstrap_prefetch = false;
                 }
 
+                // Remote encryption options
+                static std::string remoteEncryptionKey;
+                if (syncConfigObj.hasProperty(rt, "remoteEncryptionKey"))
+                {
+                    jsi::Value keyVal = syncConfigObj.getProperty(rt, "remoteEncryptionKey");
+                    if (!keyVal.isNull() && !keyVal.isUndefined())
+                    {
+                        remoteEncryptionKey = keyVal.asString(rt).utf8(rt);
+                        sync_config.remote_encryption_key = remoteEncryptionKey.c_str();
+                    }
+                    else
+                    {
+                        sync_config.remote_encryption_key = nullptr;
+                    }
+                }
+                else
+                {
+                    sync_config.remote_encryption_key = nullptr;
+                }
+
+                static std::string remoteEncryptionCipher;
+                if (syncConfigObj.hasProperty(rt, "remoteEncryptionCipher"))
+                {
+                    jsi::Value cipherVal = syncConfigObj.getProperty(rt, "remoteEncryptionCipher");
+                    if (!cipherVal.isNull() && !cipherVal.isUndefined())
+                    {
+                        remoteEncryptionCipher = cipherVal.asString(rt).utf8(rt);
+                        sync_config.remote_encryption_cipher = remoteEncryptionCipher.c_str();
+                    }
+                    else
+                    {
+                        sync_config.remote_encryption_cipher = nullptr;
+                    }
+                }
+                else
+                {
+                    sync_config.remote_encryption_cipher = nullptr;
+                }
+
                 // Create sync database instance
                 const turso_sync_database_t* database = nullptr;
                 const char* error = nullptr;

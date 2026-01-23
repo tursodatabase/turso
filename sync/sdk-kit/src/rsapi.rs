@@ -92,8 +92,11 @@ impl TursoDatabaseSyncConfig {
             } else {
                 None
             },
-            // TODO: Add remote_encryption_key support in C API
-            remote_encryption_key: None,
+            remote_encryption_key: if config.remote_encryption_key.is_null() {
+                None
+            } else {
+                Some(str_from_c_str(config.remote_encryption_key)?.to_string())
+            },
         })
     }
 }
