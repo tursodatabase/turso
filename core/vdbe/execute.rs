@@ -6919,11 +6919,16 @@ pub fn op_idx_insert(
                 panic!("IdxInsert: not a BTreeIndex cursor");
             };
 
-            // TODO: currently we never pass USE_SEEK, so this other check is a bit redundant and we always seek,
-            // but I guess it's FutureProofed™®
-            if !index_meta.unique && flags.has(IdxInsertFlags::USE_SEEK) {
+            // USE_SEEK: cursor was already positioned by a preceding NoConflict operation.
+            // Skip the redundant seek and go directly to insert.
+            // For unique indexes, this also skips UniqueConstraintCheck since NoConflict already verified uniqueness.
+            //
+            // HOWEVER: If the record contains NULLs, NoConflict skips the seek entirely
+            // (since NULLs can't conflict), so we must fall back to seeking here.
+            if flags.has(IdxInsertFlags::USE_SEEK) && !record_to_insert.contains_null()? {
                 state.op_idx_insert_state = OpIdxInsertState::Insert;
                 return Ok(InsnFunctionStepResult::Step);
+                // Fall through to do the seek since NoConflict skipped it due to NULLs
             }
 
             match seek_internal(

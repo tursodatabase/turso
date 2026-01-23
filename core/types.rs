@@ -1328,6 +1328,34 @@ impl ImmutableRecord {
     }
 
     #[inline]
+    /// Returns true if the record contains any NULL values.
+    /// This is an optimization that only examines the header (serial types)
+    /// without deserializing the data section.
+    pub fn contains_null(&self) -> Result<bool> {
+        let payload = self.get_payload();
+        let (header_size, header_varint_len) = read_varint(payload)?;
+        let header_size = header_size as usize;
+
+        if header_size > payload.len() || header_varint_len > payload.len() {
+            return Err(LimboError::Corrupt(
+                "Payload too small for indicated header size".into(),
+            ));
+        }
+
+        let mut header = &payload[header_varint_len..header_size];
+
+        while !header.is_empty() {
+            let (serial_type, bytes_read) = read_varint(header)?;
+            if serial_type == 0 {
+                return Ok(true);
+            }
+            header = &header[bytes_read..];
+        }
+
+        Ok(false)
+    }
+
+    #[inline]
     pub fn last_value(&self) -> Option<Result<ValueRef<'_>>> {
         if unlikely(self.is_invalidated()) {
             return Some(Err(LimboError::InternalError(

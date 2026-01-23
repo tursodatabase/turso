@@ -1,3 +1,4 @@
+use branches::mark_unlikely;
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 use tracing::{instrument, Level};
@@ -6796,24 +6797,31 @@ fn edit_page(
         debug_validate_cells!(page, usable_space);
     }
     // TODO: make page_free_array defragment, for now I'm lazy so this will work for now.
-    defragment_page(page, usable_space, 0)?;
+    let mut defragmented_page = defragment_page_for_insert(page, usable_space, 0)?;
     // TODO: add to start
     if start_new_cells < start_old_cells {
         let count = number_new_cells.min(start_old_cells - start_new_cells);
-        page_insert_array(page, start_new_cells, count, cell_array, 0, usable_space)?;
+        page_insert_array(
+            &mut defragmented_page,
+            start_new_cells,
+            count,
+            cell_array,
+            0,
+            usable_space,
+        )?;
         count_cells += count;
     }
     // TODO: overflow cells
-    debug_validate_cells!(page, usable_space);
-    for i in 0..page.overflow_cells.len() {
-        let overflow_cell = &page.overflow_cells[i];
+    debug_validate_cells!(defragmented_page.0, usable_space);
+    for i in 0..defragmented_page.0.overflow_cells.len() {
+        let overflow_cell = &defragmented_page.0.overflow_cells[i];
         // cell index in context of new list of cells that should be in the page
         if start_old_cells + overflow_cell.index >= start_new_cells {
             let cell_idx = start_old_cells + overflow_cell.index - start_new_cells;
             if cell_idx < number_new_cells {
                 count_cells += 1;
                 page_insert_array(
-                    page,
+                    &mut defragmented_page,
                     start_new_cells + cell_idx,
                     1,
                     cell_array,
@@ -6823,17 +6831,17 @@ fn edit_page(
             }
         }
     }
-    debug_validate_cells!(page, usable_space);
+    debug_validate_cells!(defragmented_page.0, usable_space);
     // TODO: append cells to end
     page_insert_array(
-        page,
+        &mut defragmented_page,
         start_new_cells + count_cells,
         number_new_cells - count_cells,
         cell_array,
         count_cells,
         usable_space,
     )?;
-    debug_validate_cells!(page, usable_space);
+    debug_validate_cells!(defragmented_page.0, usable_space);
     // TODO: noverflow
     page.write_cell_count(number_new_cells as u16);
     Ok(())
@@ -6939,33 +6947,166 @@ fn page_free_array(
     page.write_cell_count(page.cell_count() as u16 - number_of_cells_removed as u16);
     Ok(number_of_cells_removed)
 }
+
+/// A proof type that guarantees a page has been defragmented.
+///
+/// This type can only be constructed by calling [`defragment_page_for_insert`],
+/// which ensures the page has been defragmented before any insert operations.
+/// Functions like [`page_insert_array`] require this type to enforce at compile-time
+/// that defragmentation has occurred.
+pub struct DefragmentedPage<'a>(&'a mut PageContent);
+
+impl std::ops::Deref for DefragmentedPage<'_> {
+    type Target = PageContent;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        self.0
+    }
+}
+
+impl std::ops::DerefMut for DefragmentedPage<'_> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.0
+    }
+}
+
+/// Insert multiple cells into a page in a single batch operation.
+///
+/// This is an optimized version that avoids O(N²) complexity by:
+/// 1. Computing total space needed upfront
+/// 2. Allocating all space at once
+/// 3. Copying all cell payloads sequentially
+/// 4. Shifting existing cell pointers once
+/// 5. Writing all new cell pointers in one pass
+/// 6. Updating cell count once
 fn page_insert_array(
-    page: &mut PageContent,
+    page: &mut DefragmentedPage,
     first: usize,
     count: usize,
     cell_array: &CellArray,
-    mut start_insert: usize,
-    usable_space: usize,
+    start_insert: usize,
+    _usable_space: usize,
 ) -> Result<()> {
-    // TODO: implement faster algorithm, this is doing extra work that's not needed.
-    // See pageInsertArray to understand faster way.
+    if count == 0 {
+        return Ok(());
+    }
+
     tracing::debug!(
-        "page_insert_array(cell_array.cells={}..{}, cell_count={}, page_type={:?})",
+        "page_insert_array(first={}, count={}, start_insert={}, cell_count={}, page_type={:?})",
         first,
-        first + count,
+        count,
+        start_insert,
         page.cell_count(),
         page.page_type().ok()
     );
-    for i in first..first + count {
-        insert_into_cell_during_balance(
-            page,
-            cell_array.cell_payloads[i],
-            start_insert,
-            usable_space,
-        )?;
-        start_insert += 1;
+
+    turso_assert!(first <= cell_array.cell_payloads.len(), "first OOB");
+    turso_assert!(
+        count <= cell_array.cell_payloads.len().saturating_sub(first),
+        "first+count OOB"
+    );
+    // Calculate total space needed for all cell payloads
+    // We read from cell_array at indices [first, first+count)
+    let mut total_payload_size: usize = 0;
+    for i in 0..count {
+        let payload = &cell_array.cell_payloads[first + i];
+        let cell_size = payload.len().max(MINIMUM_CELL_SIZE);
+        total_payload_size += cell_size;
     }
-    debug_validate_cells!(page, usable_space);
+
+    // Total space needed includes cell pointers
+    let total_ptr_space = count.checked_mul(CELL_PTR_SIZE_BYTES).ok_or_else(|| {
+        mark_unlikely();
+        LimboError::Corrupt("page_insert_array: ptr space overflow".into())
+    })?;
+
+    // After defragmentation, all free space is in the unallocated region
+    // between the cell pointer array and the cell content area.
+    let current_cell_count = page.cell_count();
+    let mut cell_content_area = page.cell_content_area() as usize;
+    let unallocated_start = page.unallocated_region_start();
+    turso_assert!(
+        start_insert <= current_cell_count,
+        "start_insert beyond cell_count"
+    );
+    turso_assert!(
+        // we cast to u16 later so assert no overflow
+        current_cell_count + count <= u16::MAX as usize,
+        "cell_count overflow"
+    );
+    // Verify we have enough space
+    // The new cell pointers will extend the cell pointer array by `total_ptr_space`
+    // The new cell content will reduce cell_content_area by `total_payload_size`
+    let new_unallocated_start =
+        unallocated_start
+            .checked_add(total_ptr_space)
+            .ok_or_else(|| {
+                mark_unlikely();
+                LimboError::Corrupt("page_insert_array: unalloc start overflow".into())
+            })?;
+    let new_cell_content_area = cell_content_area
+        .checked_sub(total_payload_size)
+        .ok_or_else(|| {
+            mark_unlikely();
+            LimboError::Corrupt("page_insert_array: payload underflow".to_string())
+        })?;
+
+    turso_assert!(
+        new_unallocated_start <= new_cell_content_area,
+        "page_insert_array: not enough space: need {} bytes for pointers + {} bytes for payloads, \
+         unallocated region is {}..{} ({} bytes)",
+        total_ptr_space,
+        total_payload_size,
+        unallocated_start,
+        cell_content_area,
+        cell_content_area - unallocated_start
+    );
+
+    let buf = page.as_ptr();
+    let (cell_pointer_array_start, _) = page.cell_pointer_array_offset_and_size();
+
+    // Shift existing cell pointers to make room for new ones
+    // We're inserting `count` cells at position `start_insert`, so we need to shift
+    // all cell pointers from position `start_insert` onwards to the right by `count * 2` bytes
+    if start_insert < current_cell_count {
+        let cells_to_shift = current_cell_count - start_insert;
+        let shift_src_start = cell_pointer_array_start + (start_insert * CELL_PTR_SIZE_BYTES);
+        let shift_dst_start = shift_src_start + total_ptr_space;
+        let shift_size = cells_to_shift * CELL_PTR_SIZE_BYTES;
+        buf.copy_within(
+            shift_src_start..shift_src_start + shift_size,
+            shift_dst_start,
+        );
+    }
+
+    // Allocate space for all cells and write payloads + pointers
+    // We allocate space from the content area (which grows downward)
+    // Read from cell_array[first..first+count], insert at page positions [start_insert..start_insert+count]
+    for i in 0..count {
+        let payload = &cell_array.cell_payloads[first + i];
+        let cell_size = payload.len().max(MINIMUM_CELL_SIZE);
+
+        // Allocate space for this cell (grow content area downward)
+        cell_content_area = cell_content_area.checked_sub(cell_size).ok_or_else(|| {
+            mark_unlikely();
+            LimboError::Corrupt("page_insert_array: cell allocation underflow".to_string())
+        })?;
+
+        // Copy cell payload
+        buf[cell_content_area..cell_content_area + payload.len()].copy_from_slice(payload);
+
+        // Write cell pointer at position (start_insert + i)
+        let ptr_offset = cell_pointer_array_start + ((start_insert + i) * CELL_PTR_SIZE_BYTES);
+        page.write_u16_no_offset(ptr_offset, cell_content_area as u16);
+    }
+
+    // Update page header
+    page.write_cell_content_area(cell_content_area);
+    page.write_cell_count((current_cell_count + count) as u16);
+
+    debug_validate_cells!(page, _usable_space);
     Ok(())
 }
 
@@ -7251,6 +7392,24 @@ fn defragment_page_full(page: &PageContent, usable_space: usize) -> Result<()> {
     defragment_page(page, usable_space, -1)
 }
 
+/// Defragment a page and return a proof that can be used with [`page_insert_array`].
+///
+/// This is the entry point for defragmentation when you need to perform insert
+/// operations afterward. The returned [`DefragmentedPage`] proves at compile-time
+/// that defragmentation has occurred.
+///
+/// For defragmentation without the type-state proof (e.g., in `allocate_cell_space`),
+/// use [`defragment_page`] directly.
+#[inline]
+fn defragment_page_for_insert(
+    page: &mut PageContent,
+    usable_space: usize,
+    max_frag_bytes: isize,
+) -> Result<DefragmentedPage<'_>> {
+    defragment_page(page, usable_space, max_frag_bytes)?;
+    Ok(DefragmentedPage(page))
+}
+
 /// Defragment a page. This means packing all the cells to the end of the page.
 fn defragment_page(page: &PageContent, usable_space: usize, max_frag_bytes: isize) -> Result<()> {
     debug_validate_cells!(page, usable_space);
@@ -7427,7 +7586,7 @@ fn _insert_into_cell(
     payload: &[u8],
     cell_idx: usize,
     usable_space: usize,
-    allow_regular_insert_despite_overflow: bool, // see [insert_into_cell_during_balance()]
+    allow_regular_insert_despite_overflow: bool, // used during balancing to allow regular insert despite overflow cells
 ) -> Result<()> {
     assert!(
         cell_idx <= page.cell_count() + page.overflow_cells.len(),
@@ -7509,23 +7668,6 @@ fn insert_into_cell(
 
 /// Normally in [insert_into_cell()], if a page already has overflow cells, all
 /// new insertions are also added to the overflow cells vector.
-/// SQLite doesn't use regular [insert_into_cell()] during balancing,
-/// so we have a specialized function for use during balancing that allows regular cell insertion
-/// despite the presence of existing overflow cells (overflow cells are one of the reasons we are balancing in the first place).
-/// During balancing cells are first repositioned with [edit_page()]
-/// and then inserted via [page_insert_array()] which calls [insert_into_cell_during_balance()],
-/// and finally the existing overflow cells are cleared.
-/// If we would not allow the cell insert to proceed normally despite overflow cells being present,
-/// the new insertions would also be added as overflow cells which defeats the point of balancing.
-fn insert_into_cell_during_balance(
-    page: &mut PageContent,
-    payload: &[u8],
-    cell_idx: usize,
-    usable_space: usize,
-) -> Result<()> {
-    _insert_into_cell(page, payload, cell_idx, usable_space, true)
-}
-
 /// The amount of free space is the sum of:
 ///  #1. The size of the unallocated region
 ///  #2. Fragments (isolated 1-3 byte chunks of free space within the cell content area)
