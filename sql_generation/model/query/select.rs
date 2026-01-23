@@ -10,7 +10,7 @@ use turso_parser::ast::{
     SortOrder,
 };
 
-use crate::model::table::{JoinTable, JoinType, JoinedTable, Table};
+use crate::model::table::{JoinTable, JoinType, JoinedTable, SimValue, Table};
 
 use super::predicate::Predicate;
 
@@ -503,7 +503,59 @@ impl FromClause {
                     }
                     join_table.rows = new_rows;
                 }
-                _ => todo!(),
+                JoinType::Left => {
+                    // Left join: all rows from left table, matching rows from right or NULLs
+                    let mut new_rows = Vec::new();
+                    let null_row: Vec<_> = joined_table
+                        .columns
+                        .iter()
+                        .map(|_| SimValue::NULL)
+                        .collect();
+
+                    for row1 in join_table.rows.iter() {
+                        let mut has_match = false;
+                        for row2 in joined_table.rows.iter() {
+                            let row = row1.iter().chain(row2.iter()).cloned().collect::<Vec<_>>();
+                            if join.on.test(&row, &join_table) {
+                                new_rows.push(row);
+                                has_match = true;
+                            }
+                        }
+                        // If no match, include left row with NULLs for right columns
+                        if !has_match {
+                            let row = row1
+                                .iter()
+                                .chain(null_row.iter())
+                                .cloned()
+                                .collect::<Vec<_>>();
+                            new_rows.push(row);
+                        }
+                    }
+                    join_table.rows = new_rows;
+                }
+                JoinType::Cross => {
+                    // Cross join: cartesian product without filtering
+                    let all_row_pairs = join_table
+                        .rows
+                        .clone()
+                        .into_iter()
+                        .cartesian_product(joined_table.rows.iter());
+
+                    let new_rows: Vec<_> = all_row_pairs
+                        .map(|(row1, row2)| {
+                            row1.iter().chain(row2.iter()).cloned().collect::<Vec<_>>()
+                        })
+                        .collect();
+                    join_table.rows = new_rows;
+                }
+                JoinType::Right | JoinType::Full => {
+                    // These join types are not generated, but if encountered, panic
+                    // to make it obvious that generation and shadow are out of sync
+                    panic!(
+                        "RIGHT and FULL joins are not implemented in shadow model. \
+                         Generation should not produce these join types."
+                    );
+                }
             }
         }
         join_table
