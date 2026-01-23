@@ -6039,7 +6039,7 @@ dependencies = [
 
 [[package]]
 name = "turso-coverage"
-version = "0.5.0-pre.1"
+version = "0.1.0"
 dependencies = [
  "linkme",
 ]

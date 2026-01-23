@@ -3,6 +3,34 @@
 use std::sync::LazyLock;
 use std::sync::atomic::AtomicU64;
 
+/// Captures the name of the enclosing function as a lazily initialized static.
+///
+/// This macro defines a nested function `_f()` within the caller's context,
+/// then uses `type_name` to get its full path (e.g., `crate::module::function::_f`).
+/// After trimming the `::_f` suffix, what remains is the enclosing function's path.
+///
+/// # Usage
+///
+/// ```ignore
+/// fn my_function() {
+///     function!(FUNC_NAME);
+///     println!("In function: {}", *FUNC_NAME);
+/// }
+/// ```
+#[macro_export]
+macro_rules! function {
+    ($static:ident) => {
+        fn _f() {}
+        fn type_name_of<T>(_: T) -> &'static str {
+            ::std::any::type_name::<T>()
+        }
+        static $static: ::std::sync::LazyLock<&'static str> = ::std::sync::LazyLock::new(|| {
+            let name = type_name_of(_f);
+            &name[..name.len() - 4]
+        });
+    };
+}
+
 /// Information about an instrumentation point.
 pub struct CoveragePoint {
     /// User-provided name/description
@@ -15,6 +43,8 @@ pub struct CoveragePoint {
     pub column: u32,
     /// Module path
     pub module: &'static str,
+    /// Function name (initialized lazily)
+    pub function: &'static LazyLock<&'static str>,
     /// How many times this point was hit
     pub hit_count: &'static AtomicU64,
 }
@@ -36,6 +66,8 @@ pub struct CoverageSnapshot {
     pub column: u32,
     /// Module path
     pub module: &'static str,
+    /// Function name
+    pub function: &'static str,
     /// How many times this point was hit
     pub hit_count: u64,
 }
