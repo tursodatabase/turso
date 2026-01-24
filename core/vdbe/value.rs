@@ -490,6 +490,11 @@ impl Value {
         let start_value = start_value.exec_cast("INT");
         let length_value = length_value.map(|value| value.exec_cast("INT"));
 
+        // If length is explicitly NULL, return NULL (SQLite behavior)
+        if matches!(length_value, Some(Value::Null)) {
+            return Value::Null;
+        }
+
         match (value, start_value) {
             (Value::Blob(b), Value::Integer(start)) => {
                 let (start, end) = calculate_postions(start, b.len(), length_value.as_ref());
