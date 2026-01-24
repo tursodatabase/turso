@@ -757,7 +757,8 @@ fn add_ephemeral_table_to_update_plan(
         distinctness: super::plan::Distinctness::NonDistinct,
         values: vec![],
         window: None,
-        non_from_clause_subqueries: vec![],
+        // Move subqueries from the main plan to the ephemeral plan since the WHERE clause was moved
+        non_from_clause_subqueries: plan.non_from_clause_subqueries.drain(..).collect(),
     };
 
     plan.ephemeral_plan = Some(ephemeral_plan);
