@@ -187,19 +187,32 @@ impl TursoRwLock {
     #[inline]
     /// Try to acquire a shared read lock.
     pub fn read(&self) -> bool {
-        let cur = self.0.load(Ordering::Acquire);
-        // If a writer is present we cannot proceed.
-        if Self::has_writer(cur) {
-            return false;
+        let mut count = 0;
+        // Bounded loop to avoid infinite loops
+        // Retry on Reader contention (should hopefully be spurious)
+        while count < 1_000_000 {
+            let cur = self.0.load(Ordering::Acquire);
+            // If a writer is present we cannot proceed.
+            if Self::has_writer(cur) {
+                return false;
+            }
+            // 2 billion readers is a high enough number where we will skip the branch
+            // and assume that we are not overflowing :)
+            let desired = cur.wrapping_add(Self::READER_INC);
+            // for success, Acquire establishes happens-before relationship with the previous Release from unlock
+            // for failure we only care about reading it for the next iteration so we can use Relaxed.
+            let res = self
+                .0
+                .compare_exchange(cur, desired, Ordering::Acquire, Ordering::Relaxed);
+            if res.is_err() {
+                count += 1;
+                crate::thread::spin_loop();
+                continue;
+            }
+            return true;
         }
-        // 2 billion readers is a high enough number where we will skip the branch
-        // and assume that we are not overflowing :)
-        let desired = cur.wrapping_add(Self::READER_INC);
-        // for success, Acquire establishes happens-before relationship with the previous Release from unlock
-        // for failure we only care about reading it for the next iteration so we can use Relaxed.
-        self.0
-            .compare_exchange(cur, desired, Ordering::Acquire, Ordering::Relaxed)
-            .is_ok()
+        // Too much reader contention return Busy
+        false
     }
 
     /// Try to take an exclusive lock. Succeeds if no readers and no writer.
