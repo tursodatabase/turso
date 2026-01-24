@@ -107,3 +107,26 @@ expect {
     2
 }
 
+# SQLite truncates ORDER BY after a rowid/INTEGER PRIMARY KEY column since the table is
+# stored in rowid order and a unique column means no ties. This skips validation of
+# subsequent clauses, so even invalid constructs like multi-column IN subqueries pass.
+test orderby_rowid_truncation {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT);
+    INSERT INTO t VALUES (1, 'x'), (2, 'y');
+    SELECT a FROM t ORDER BY a DESC, b NOT IN (SELECT a, b FROM t);
+}
+expect {
+    2
+    1
+}
+
+test orderby_rowid_truncation_explicit_rowid {
+    CREATE TABLE t(a INTEGER, b TEXT);
+    INSERT INTO t VALUES (1, 'x'), (2, 'y');
+    SELECT a FROM t ORDER BY rowid DESC, b NOT IN (SELECT a, b FROM t);
+}
+expect {
+    2
+    1
+}
+
