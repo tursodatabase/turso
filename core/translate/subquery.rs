@@ -27,7 +27,8 @@ use crate::{
 use super::{
     emitter::{emit_query, Resolver, TranslateCtx},
     main_loop::LoopLabels,
-    plan::{Operation, QueryDestination, Scan, Search, SelectPlan},
+    plan::{Aggregate, Operation, QueryDestination, Scan, Search, SelectPlan},
+    planner::resolve_window_and_aggregate_functions,
 };
 
 // Compute query plans for subqueries occurring in any position other than the FROM clause.
@@ -121,6 +122,18 @@ pub fn plan_subqueries_from_select_plan(
         if let Some(offset) = &mut plan.offset {
             walk_expr_mut(offset, &mut subquery_parser)?;
         }
+    }
+
+    // Recollect aggregates after all subquery planning.
+    // This is necessary because:
+    // 1. Aggregates are collected with cloned expressions before subquery planning modifies them
+    //    (e.g., EXISTS -> SubqueryResult), causing stale args in aggregates.
+    // 2. ORDER BY may be cleared for single-row aggregates AFTER aggregates were collected from it,
+    //    leaving orphaned aggregates with unprocessed subqueries in their args.
+    // Recollecting from the current state of result_columns, HAVING, and ORDER BY ensures
+    // aggregates have updated expressions and excludes aggregates from cleared ORDER BY.
+    if !plan.aggregates.is_empty() {
+        recollect_aggregates(plan, resolver)?;
     }
 
     update_column_used_masks(
@@ -512,6 +525,40 @@ fn get_subquery_parser<'a>(
             _ => Ok(WalkControl::Continue),
         }
     }
+}
+
+/// Recollect all aggregates after subquery planning.
+///
+/// Aggregates are collected during parsing with cloned expressions. When subquery planning
+/// modifies expressions in place (e.g. replacing EXISTS with SubqueryResult), the aggregate's
+/// cloned original_expr and args become stale. This causes cache misses during translation.
+///
+/// Instead of trying to sync stale clones, this function recollects all aggregates fresh
+/// from the updated expressions in result_columns, HAVING, and ORDER BY.
+fn recollect_aggregates(plan: &mut SelectPlan, resolver: &Resolver) -> Result<()> {
+    let mut new_aggregates: Vec<Aggregate> = Vec::new();
+
+    // Collect from result columns (same order as original collection)
+    for rc in &plan.result_columns {
+        resolve_window_and_aggregate_functions(&rc.expr, resolver, &mut new_aggregates, None)?;
+    }
+
+    // Collect from HAVING
+    if let Some(group_by) = &plan.group_by {
+        if let Some(having) = &group_by.having {
+            for expr in having {
+                resolve_window_and_aggregate_functions(expr, resolver, &mut new_aggregates, None)?;
+            }
+        }
+    }
+
+    // Collect from ORDER BY
+    for (expr, _) in &plan.order_by {
+        resolve_window_and_aggregate_functions(expr, resolver, &mut new_aggregates, None)?;
+    }
+
+    plan.aggregates = new_aggregates;
+    Ok(())
 }
 
 /// We make decisions about when to evaluate expressions or whether to use covering indexes based on
