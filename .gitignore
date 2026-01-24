@@ -57,3 +57,7 @@ settings.local.json
 
 # Track empty wals for read only databases
 !turso-test-runner/database/*
+
+
+# For simulator redo
+test.sql
