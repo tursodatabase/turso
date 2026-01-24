@@ -4940,7 +4940,7 @@ pub fn expr_vector_size(expr: &Expr) -> Result<usize> {
             1
         }
         Expr::DoublyQualified(..) => 1,
-        Expr::Exists(_) => todo!(),
+        Expr::Exists(_) => 1, // EXISTS returns a single boolean value (0 or 1)
         Expr::FunctionCall { name, args, .. } => {
             for (pos, arg) in args.iter().enumerate() {
                 let evs_arg = expr_vector_size(arg)?;
