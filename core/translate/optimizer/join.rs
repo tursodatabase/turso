@@ -23,17 +23,14 @@ use crate::{
 use super::{
     access_method::{find_best_access_method_for_join_order, AccessMethod},
     constraints::TableConstraints,
-    cost::ESTIMATED_HARDCODED_ROWS_PER_TABLE,
+    cost_params::CostModelParams,
     order::OrderTarget,
     IndexMethodCandidate,
 };
 
 // Upper bound on rowids to materialize for a hash build input.
+// This is a safety limit, not a cost tuning parameter.
 const MAX_MATERIALIZED_BUILD_ROWS: f64 = 200_000.0;
-// Minimum selectivity to consider materializing build-side filters.
-const MATERIALIZE_SELECTIVITY_THRESHOLD: f64 = 0.5;
-// Stricter selectivity when the hash join probe is nested under outer loops.
-const NESTED_PROBE_SELECTIVITY_THRESHOLD: f64 = 0.15;
 
 /// Represents an n-ary join, anywhere from 1 table to N tables.
 #[derive(Debug, Clone)]
@@ -84,6 +81,7 @@ pub fn join_lhs_and_rhs<'a>(
     where_term_table_ids: &[HashSet<TableInternalId>],
     subqueries: &[NonFromClauseSubquery],
     index_method_candidates: &[IndexMethodCandidate],
+    params: &CostModelParams,
 ) -> Result<Option<JoinN>> {
     // The input cardinality for this join is the output cardinality of the previous join.
     // For example, in a 2-way join, if the left table has 1000 rows, and the right table will return 2 rows for each of the left table's rows,
@@ -91,9 +89,10 @@ pub fn join_lhs_and_rhs<'a>(
     let input_cardinality = lhs.map_or(1, |l| l.output_cardinality);
 
     let rhs_table_number = join_order.last().unwrap().original_idx;
-    let rhs_base_rows = base_table_rows.get(rhs_table_number).copied().unwrap_or({
-        RowCountEstimate::HardcodedFallback(ESTIMATED_HARDCODED_ROWS_PER_TABLE as f64)
-    });
+    let rhs_base_rows = base_table_rows
+        .get(rhs_table_number)
+        .copied()
+        .unwrap_or_else(|| RowCountEstimate::hardcoded_fallback(params));
 
     let Some(mut method) = find_best_access_method_for_join_order(
         rhs_table_reference,
@@ -102,6 +101,7 @@ pub fn join_lhs_and_rhs<'a>(
         maybe_order_target,
         input_cardinality as f64,
         rhs_base_rows,
+        params,
     )?
     else {
         return Ok(None);
@@ -191,10 +191,9 @@ pub fn join_lhs_and_rhs<'a>(
         }
 
         // Apply closed-range bonus for columns with both lower and upper bounds
-        const CLOSED_RANGE_SELECTIVITY_HEURISTIC_FACTOR: f64 = 0.2;
         for (_, has_lower, has_upper) in &column_bounds {
             if *has_lower && *has_upper {
-                multiplier *= CLOSED_RANGE_SELECTIVITY_HEURISTIC_FACTOR;
+                multiplier *= params.closed_range_selectivity_factor;
             }
         }
 
@@ -293,9 +292,10 @@ pub fn join_lhs_and_rhs<'a>(
                 .unwrap_or(false);
 
             let build_constraints = &all_constraints[build_table_idx];
-            let build_base_rows = base_table_rows.get(build_table_idx).copied().unwrap_or({
-                RowCountEstimate::HardcodedFallback(ESTIMATED_HARDCODED_ROWS_PER_TABLE as f64)
-            });
+            let build_base_rows = base_table_rows
+                .get(build_table_idx)
+                .copied()
+                .unwrap_or_else(|| RowCountEstimate::hardcoded_fallback(params));
             let build_self_selectivity =
                 build_self_constraint_selectivity(build_constraints, build_table_idx);
             let build_cardinality = (*build_base_rows) * build_self_selectivity;
@@ -465,6 +465,7 @@ pub fn join_lhs_and_rhs<'a>(
                     probe_cardinality,
                     probe_multiplier,
                     subqueries,
+                    params,
                 ) {
                     let mut hash_join_method = hash_join_method;
                     let mut hash_join_allowed = true;
@@ -496,9 +497,9 @@ pub fn join_lhs_and_rhs<'a>(
                         let can_materialize =
                             build_has_indexable_prior_constraints(lhs_constraints, &prior_mask);
                         let selectivity_threshold = if probe_multiplier > 1.0 {
-                            NESTED_PROBE_SELECTIVITY_THRESHOLD
+                            params.hash_nested_probe_selectivity_threshold
                         } else {
-                            MATERIALIZE_SELECTIVITY_THRESHOLD
+                            params.hash_materialize_selectivity_threshold
                         };
                         // When probe is nested under prior loops, require stricter selectivity
                         // to justify materialization.
@@ -567,6 +568,7 @@ pub fn join_lhs_and_rhs<'a>(
                                     probe_cardinality,
                                     mem_budget,
                                     hash_probe_multiplier,
+                                    params,
                                 );
                             }
                             if should_materialize {
@@ -800,6 +802,7 @@ pub fn compute_best_join_order<'a>(
     where_clause: &mut [WhereTerm],
     subqueries: &[NonFromClauseSubquery],
     index_method_candidates: &[IndexMethodCandidate],
+    params: &CostModelParams,
 ) -> Result<Option<BestJoinOrderResult>> {
     // Skip work if we have no tables to consider.
     if joined_tables.is_empty() {
@@ -824,6 +827,7 @@ pub fn compute_best_join_order<'a>(
             &where_term_table_ids,
             subqueries,
             index_method_candidates,
+            params,
         );
     }
 
@@ -838,6 +842,7 @@ pub fn compute_best_join_order<'a>(
         &where_term_table_ids,
         subqueries,
         index_method_candidates,
+        params,
     )?;
 
     // Keep track of both 1. the best plan overall (not considering sorting), and 2. the best ordered plan (which might not be the same).
@@ -917,6 +922,7 @@ pub fn compute_best_join_order<'a>(
             &where_term_table_ids,
             subqueries,
             index_method_candidates,
+            params,
         )?;
         if let Some(rel) = rel {
             best_plan_memo.entry(mask).or_default().insert(i, rel);
@@ -1040,6 +1046,7 @@ pub fn compute_best_join_order<'a>(
                         &where_term_table_ids,
                         subqueries,
                         index_method_candidates,
+                        params,
                     )?;
                     join_order.clear();
 
@@ -1152,6 +1159,7 @@ pub fn compute_greedy_join_order<'a>(
     where_term_table_ids: &[HashSet<TableInternalId>],
     subqueries: &[NonFromClauseSubquery],
     index_method_candidates: &[IndexMethodCandidate],
+    params: &CostModelParams,
 ) -> Result<Option<BestJoinOrderResult>> {
     let num_tables = joined_tables.len();
     if num_tables == 0 {
@@ -1201,6 +1209,7 @@ pub fn compute_greedy_join_order<'a>(
         where_term_table_ids,
         subqueries,
         index_method_candidates,
+        params,
     )?;
 
     if current_plan.is_none() {
@@ -1283,6 +1292,7 @@ pub fn compute_greedy_join_order<'a>(
                 where_term_table_ids,
                 subqueries,
                 index_method_candidates,
+                params,
             )? {
                 if best.as_ref().is_none_or(|(_, b)| plan.cost < b.cost) {
                     best = Some((idx, plan));
@@ -1388,6 +1398,7 @@ pub fn compute_naive_left_deep_plan<'a>(
     where_term_table_ids: &[HashSet<TableInternalId>],
     subqueries: &[NonFromClauseSubquery],
     index_method_candidates: &[IndexMethodCandidate],
+    params: &CostModelParams,
 ) -> Result<Option<JoinN>> {
     let n = joined_tables.len();
     assert!(n > 0);
@@ -1418,6 +1429,7 @@ pub fn compute_naive_left_deep_plan<'a>(
         where_term_table_ids,
         subqueries,
         index_method_candidates,
+        params,
     )?;
     if best_plan.is_none() {
         return Ok(None);
@@ -1440,6 +1452,7 @@ pub fn compute_naive_left_deep_plan<'a>(
             where_term_table_ids,
             subqueries,
             index_method_candidates,
+            params,
         )?;
         if best_plan.is_none() {
             return Ok(None);
@@ -1542,6 +1555,7 @@ mod tests {
             optimizer::{
                 access_method::AccessMethodParams,
                 constraints::{constraints_from_where_clause, BinaryExprSide, RangeConstraintRef},
+                cost_params::DEFAULT_PARAMS,
             },
             plan::{
                 ColumnUsedMask, IterationDirection, JoinInfo, Operation, TableReferences, WhereTerm,
@@ -1552,7 +1566,7 @@ mod tests {
     };
 
     fn default_base_rows(n: usize) -> Vec<RowCountEstimate> {
-        vec![RowCountEstimate::HardcodedFallback(ESTIMATED_HARDCODED_ROWS_PER_TABLE as f64); n]
+        vec![RowCountEstimate::hardcoded_fallback(&DEFAULT_PARAMS); n]
     }
 
     fn empty_schema() -> Schema {
@@ -1584,6 +1598,7 @@ mod tests {
             &available_indexes,
             &[],
             &empty_schema(),
+            &DEFAULT_PARAMS,
         )
         .unwrap();
 
@@ -1597,6 +1612,7 @@ mod tests {
             &mut where_clause,
             &[],
             &[],
+            &DEFAULT_PARAMS,
         )
         .unwrap();
         assert!(result.is_none());
@@ -1623,6 +1639,7 @@ mod tests {
             &available_indexes,
             &[],
             &empty_schema(),
+            &DEFAULT_PARAMS,
         )
         .unwrap();
 
@@ -1638,6 +1655,7 @@ mod tests {
             &mut where_clause,
             &[],
             &[],
+            &DEFAULT_PARAMS,
         )
         .unwrap()
         .unwrap();
@@ -1674,6 +1692,7 @@ mod tests {
             &available_indexes,
             &[],
             &empty_schema(),
+            &DEFAULT_PARAMS,
         )
         .unwrap();
 
@@ -1689,6 +1708,7 @@ mod tests {
             &mut where_clause,
             &[],
             &[],
+            &DEFAULT_PARAMS,
         )
         .unwrap();
         assert!(result.is_some());
@@ -1754,6 +1774,7 @@ mod tests {
             &available_indexes,
             &[],
             &empty_schema(),
+            &DEFAULT_PARAMS,
         )
         .unwrap();
         // SELECT * FROM test_table WHERE id = 42
@@ -1768,6 +1789,7 @@ mod tests {
             &mut where_clause,
             &[],
             &[],
+            &DEFAULT_PARAMS,
         )
         .unwrap();
         assert!(result.is_some());
@@ -1845,6 +1867,7 @@ mod tests {
             &available_indexes,
             &[],
             &empty_schema(),
+            &DEFAULT_PARAMS,
         )
         .unwrap();
 
@@ -1858,6 +1881,7 @@ mod tests {
             &mut where_clause,
             &[],
             &[],
+            &DEFAULT_PARAMS,
         )
         .unwrap();
         assert!(result.is_some());
@@ -2036,6 +2060,7 @@ mod tests {
             &available_indexes,
             &[],
             &empty_schema(),
+            &DEFAULT_PARAMS,
         )
         .unwrap();
 
@@ -2049,6 +2074,7 @@ mod tests {
             &mut where_clause,
             &[],
             &[],
+            &DEFAULT_PARAMS,
         )
         .unwrap();
         assert!(result.is_some());
@@ -2155,6 +2181,7 @@ mod tests {
             &available_indexes,
             &[],
             &empty_schema(),
+            &DEFAULT_PARAMS,
         )
         .unwrap();
 
@@ -2168,6 +2195,7 @@ mod tests {
             &mut where_clause,
             &[],
             &[],
+            &DEFAULT_PARAMS,
         )
         .unwrap()
         .unwrap();
@@ -2271,6 +2299,7 @@ mod tests {
             &available_indexes,
             &[],
             &empty_schema(),
+            &DEFAULT_PARAMS,
         )
         .unwrap();
 
@@ -2284,6 +2313,7 @@ mod tests {
             &mut where_clause,
             &[],
             &[],
+            &DEFAULT_PARAMS,
         )
         .unwrap();
         assert!(result.is_some());
@@ -2365,6 +2395,7 @@ mod tests {
             &available_indexes,
             &[],
             &empty_schema(),
+            &DEFAULT_PARAMS,
         )
         .unwrap();
 
@@ -2379,6 +2410,7 @@ mod tests {
             &mut where_clause,
             &[],
             &[],
+            &DEFAULT_PARAMS,
         )
         .unwrap()
         .unwrap();
@@ -2501,6 +2533,7 @@ mod tests {
             &available_indexes,
             &[],
             &empty_schema(),
+            &DEFAULT_PARAMS,
         )
         .unwrap();
 
@@ -2514,6 +2547,7 @@ mod tests {
             &mut where_clause,
             &[],
             &[],
+            &DEFAULT_PARAMS,
         )
         .unwrap()
         .unwrap();
@@ -2625,6 +2659,7 @@ mod tests {
             &available_indexes,
             &[],
             &empty_schema(),
+            &DEFAULT_PARAMS,
         )
         .unwrap();
 
@@ -2638,6 +2673,7 @@ mod tests {
             &mut where_clause,
             &[],
             &[],
+            &DEFAULT_PARAMS,
         )
         .unwrap()
         .unwrap();
@@ -2767,6 +2803,7 @@ mod tests {
             &available_indexes,
             &[],
             &empty_schema(),
+            &DEFAULT_PARAMS,
         )
         .unwrap();
 
@@ -2780,6 +2817,7 @@ mod tests {
             &mut where_clause,
             &[],
             &[],
+            &DEFAULT_PARAMS,
         )
         .unwrap()
         .unwrap();
@@ -2980,6 +3018,7 @@ mod tests {
             &available_indexes,
             &[],
             &empty_schema(),
+            &DEFAULT_PARAMS,
         )
         .unwrap();
 
@@ -2993,6 +3032,7 @@ mod tests {
             &mut where_clause,
             &[],
             &[],
+            &DEFAULT_PARAMS,
         )
         .unwrap();
         assert!(result.is_some());
