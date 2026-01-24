@@ -2028,6 +2028,34 @@ mod tests {
     }
 
     #[test]
+    fn test_regexp_no_cache() {
+        assert!(Value::exec_regexp(None, "abc", "abc").unwrap());
+        assert!(Value::exec_regexp(None, "abc", "xabcy").unwrap());
+        assert!(!Value::exec_regexp(None, "abc", "ab").unwrap());
+        assert!(Value::exec_regexp(None, "^abc", "abc").unwrap());
+        assert!(!Value::exec_regexp(None, "^abc", "xabc").unwrap());
+        assert!(Value::exec_regexp(None, "abc$", "abc").unwrap());
+        assert!(!Value::exec_regexp(None, "abc$", "abcx").unwrap());
+        assert!(Value::exec_regexp(None, "^[0-9]+$", "12345").unwrap());
+        assert!(!Value::exec_regexp(None, "^[0-9]+$", "123a").unwrap());
+        assert!(Value::exec_regexp(None, "a{2,}", "aaaa").unwrap());
+        assert!(!Value::exec_regexp(None, "ABC", "abc").unwrap());
+        assert!(Value::exec_regexp(None, "[", "abc").is_err());
+        assert!(Value::exec_regexp(None, "*", "abc").is_err());
+    }
+
+    #[test]
+    fn test_regexp_with_cache() {
+        let mut cache = HashMap::new();
+        assert!(Value::exec_regexp(Some(&mut cache), "abc", "abc").unwrap());
+        assert!(Value::exec_regexp(Some(&mut cache), "^\\d+$", "100").unwrap());
+        assert!(Value::exec_regexp(Some(&mut cache), "abc", "zzabczz").unwrap());
+        assert!(Value::exec_regexp(Some(&mut cache), "^\\d+$", "999").unwrap());
+        assert!(!Value::exec_regexp(Some(&mut cache), "^\\d+$", "10a").unwrap());
+        assert!(Value::exec_regexp(Some(&mut cache), "(unclosed", "text").is_err());
+    }
+
+    #[test]
     fn test_random() {
         match Value::exec_random(|| rand::rng().random()) {
             Value::Integer(value) => {
