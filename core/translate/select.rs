@@ -477,6 +477,18 @@ fn prepare_one_select_plan(
                 key.push((o.expr, o.order.unwrap_or(ast::SortOrder::Asc)));
             }
             plan.order_by = key;
+
+            // Single-row aggregate queries (aggregates without GROUP BY and without window functions)
+            // produce exactly one row, so ORDER BY is meaningless. Clearing it here also avoids
+            // eagerly validating subqueries in ORDER BY that SQLite would skip due to optimization.
+            // Note: HAVING without GROUP BY sets group_by to Some with empty exprs, still single-row.
+            let is_single_row_aggregate = !plan.aggregates.is_empty()
+                && plan.group_by.as_ref().is_none_or(|gb| gb.exprs.is_empty())
+                && windows.is_empty();
+            if is_single_row_aggregate {
+                plan.order_by.clear();
+            }
+
             if let Some(group_by) = &mut plan.group_by {
                 // now that we have resolved the ORDER BY expressions and aggregates, we can
                 // compute the necessary sort order for the GROUP BY clause

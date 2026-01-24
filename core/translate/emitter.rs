@@ -1090,8 +1090,7 @@ pub fn emit_query<'a>(
 
     program.preassign_label_to_next_insn(after_main_loop_label);
 
-    let mut order_by_necessary =
-        !plan.order_by.is_empty() && !plan.contains_constant_false_condition;
+    let order_by_necessary = !plan.order_by.is_empty() && !plan.contains_constant_false_condition;
     let order_by = &plan.order_by;
 
     // Handle GROUP BY and aggregation processing
@@ -1108,8 +1107,6 @@ pub fn emit_query<'a>(
     } else if !plan.aggregates.is_empty() {
         // Handle aggregation without GROUP BY (or HAVING without GROUP BY)
         emit_ungrouped_aggregation(program, t_ctx, plan)?;
-        // Single row result for aggregates without GROUP BY, so ORDER BY not needed
-        order_by_necessary = false;
     } else if plan.window.is_some() {
         emit_window_results(program, t_ctx, plan)?;
     }
