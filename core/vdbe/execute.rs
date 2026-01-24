@@ -8537,17 +8537,26 @@ pub fn op_open_ephemeral(
             }
             #[cfg(not(target_family = "wasm"))]
             {
-                let temp_dir = temp_dir();
-                let rand_path =
-                    std::path::Path::new(&temp_dir).join(format!("tursodb-ephemeral-{rand_num}"));
-                let Some(rand_path_str) = rand_path.to_str() else {
-                    return Err(LimboError::InternalError(
-                        "Failed to convert path to string".to_string(),
-                    ));
-                };
-                let file = io.open_file(rand_path_str, OpenFlags::Create, false)?;
-                db_file = Arc::new(DatabaseFile::new(file));
-                db_file_io = io;
+                let temp_store = conn.get_temp_store();
+                if matches!(temp_store, crate::TempStore::Memory) {
+                    // When temp_store=memory, use in-memory storage for ephemeral tables
+                    use crate::MemoryIO;
+                    db_file_io = Arc::new(MemoryIO::new());
+                    let file = db_file_io.open_file("temp-file", OpenFlags::Create, false)?;
+                    db_file = Arc::new(DatabaseFile::new(file));
+                } else {
+                    let temp_dir = temp_dir();
+                    let rand_path = std::path::Path::new(&temp_dir)
+                        .join(format!("tursodb-ephemeral-{rand_num}"));
+                    let Some(rand_path_str) = rand_path.to_str() else {
+                        return Err(LimboError::InternalError(
+                            "Failed to convert path to string".to_string(),
+                        ));
+                    };
+                    let file = io.open_file(rand_path_str, OpenFlags::Create, false)?;
+                    db_file = Arc::new(DatabaseFile::new(file));
+                    db_file_io = io;
+                }
             }
 
             let buffer_pool = program.connection.db.buffer_pool.clone();
