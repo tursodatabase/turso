@@ -44,9 +44,8 @@ pub struct DbHashResult {
 ///
 /// System tables (sqlite_%), virtual tables, and statistics tables are excluded.
 pub fn hash_database(path: &str, options: &DbHashOptions) -> Result<DbHashResult, LimboError> {
-    assert_eq!(
+    assert!(
         !(options.schema_only && options.without_schema),
-        false,
         "`schema_only` and `without_schema` cannot both be true"
     );
     let io: Arc<dyn IO> = Arc::new(PlatformIO::new()?);
@@ -120,17 +119,13 @@ fn get_table_names(
     Ok(names)
 }
 
-/// Hash all rows in a table.
-fn hash_table(
-    conn: &Arc<turso_core::Connection>,
+/// Hash all rows from a prepared statement.
+fn hash_rows(
+    stmt: &mut turso_core::Statement,
     io: &Arc<dyn IO>,
-    table_name: &str,
     hasher: &mut Sha1,
     debug: bool,
 ) -> Result<usize, LimboError> {
-    // Quote table name for safety (escape internal double quotes)
-    let sql = format!("SELECT * FROM \"{}\"", table_name.replace('"', "\"\""));
-    let mut stmt = conn.prepare(&sql)?;
     let mut row_count = 0;
     let mut buf = Vec::new();
 
@@ -159,6 +154,20 @@ fn hash_table(
     Ok(row_count)
 }
 
+/// Hash all rows in a table.
+fn hash_table(
+    conn: &Arc<turso_core::Connection>,
+    io: &Arc<dyn IO>,
+    table_name: &str,
+    hasher: &mut Sha1,
+    debug: bool,
+) -> Result<usize, LimboError> {
+    // Quote table name for safety (escape internal double quotes)
+    let sql = format!("SELECT * FROM \"{}\"", table_name.replace('"', "\"\""));
+    let mut stmt = conn.prepare(&sql)?;
+    hash_rows(&mut stmt, io, hasher, debug)
+}
+
 /// Hash schema entries.
 fn hash_schema(
     conn: &Arc<turso_core::Connection>,
@@ -176,28 +185,6 @@ fn hash_schema(
         NonZero::new(1).unwrap(),
         Value::from_text(like_pattern.to_string()),
     );
-    let mut buf = Vec::new();
-
-    loop {
-        match stmt.step()? {
-            StepResult::Row => {
-                let row = stmt.row().unwrap();
-                for value in row.get_values() {
-                    buf.clear();
-                    encode_value(value, &mut buf);
-                    if debug {
-                        eprintln!("{value:?}");
-                    }
-                    hasher.update(&buf);
-                }
-            }
-            StepResult::IO => io.step()?,
-            StepResult::Done => break,
-            StepResult::Busy | StepResult::Interrupt => {
-                return Err(LimboError::Busy);
-            }
-        }
-    }
-
+    hash_rows(&mut stmt, io, hasher, debug)?;
     Ok(())
 }
