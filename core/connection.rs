@@ -15,12 +15,12 @@ use crate::{
     io::{MemoryIO, PlatformIO, IO},
     match_ignore_ascii_case, parse_schema_rows, refresh_analyze_stats, translate, turso_assert,
     util::IOExt,
-    vdbe, AllViewsTxState, AtomicCipherMode, AtomicSyncMode, AtomicTransactionState, BusyHandler,
-    BusyHandlerCallback, CaptureDataChangesMode, CheckpointMode, CheckpointResult, CipherMode, Cmd,
-    Completion, ConnectionMetrics, Database, DatabaseCatalog, DatabaseOpts, Duration,
-    EncryptionKey, EncryptionOpts, IndexMethod, LimboError, MvStore, OpenFlags, PageSize, Pager,
-    Parser, QueryMode, QueryRunner, Result, Schema, Statement, SyncMode, TransactionMode,
-    TransactionState, Trigger, Value, VirtualTable,
+    vdbe, AllViewsTxState, AtomicCipherMode, AtomicSyncMode, AtomicTempStore,
+    AtomicTransactionState, BusyHandler, BusyHandlerCallback, CaptureDataChangesMode,
+    CheckpointMode, CheckpointResult, CipherMode, Cmd, Completion, ConnectionMetrics, Database,
+    DatabaseCatalog, DatabaseOpts, Duration, EncryptionKey, EncryptionOpts, IndexMethod,
+    LimboError, MvStore, OpenFlags, PageSize, Pager, Parser, QueryMode, QueryRunner, Result,
+    Schema, Statement, SyncMode, TransactionMode, TransactionState, Trigger, Value, VirtualTable,
 };
 use arc_swap::ArcSwap;
 use rustc_hash::FxHashMap;
@@ -78,6 +78,7 @@ pub struct Connection {
     pub(crate) encryption_key: RwLock<Option<EncryptionKey>>,
     pub(super) encryption_cipher_mode: AtomicCipherMode,
     pub(super) sync_mode: AtomicSyncMode,
+    pub(super) temp_store: AtomicTempStore,
     pub(super) data_sync_retry: AtomicBool,
     /// Busy handler for lock contention
     /// Default is BusyHandler::None (return SQLITE_BUSY immediately)
@@ -1367,6 +1368,14 @@ impl Connection {
 
     pub fn set_sync_mode(&self, mode: SyncMode) {
         self.sync_mode.set(mode);
+    }
+
+    pub fn get_temp_store(&self) -> crate::TempStore {
+        self.temp_store.get()
+    }
+
+    pub fn set_temp_store(&self, value: crate::TempStore) {
+        self.temp_store.set(value);
     }
 
     pub fn get_data_sync_retry(&self) -> bool {
