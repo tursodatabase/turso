@@ -489,6 +489,30 @@ fn prepare_one_select_plan(
                 plan.order_by.clear();
             }
 
+            // SQLite optimizes away ORDER BY clauses after a rowid/INTEGER PRIMARY KEY column
+            // when it's FIRST in the ORDER BY, since the table is stored in rowid order.
+            // This means we truncate the ORDER BY to just the rowid column.
+            // We do this for SQLite compatibility - SQLite truncates before validating, so
+            // even invalid constructions like ORDER BY rowid, a IN (SELECT a, b FROM t) pass.
+            if plan.order_by.len() > 1 && plan.table_references.joined_tables().len() == 1 {
+                let joined = &plan.table_references.joined_tables()[0];
+                let table_id = joined.internal_id;
+                let rowid_alias_col = joined
+                    .btree()
+                    .and_then(|t| t.get_rowid_alias_column().map(|(idx, _)| idx));
+
+                let first_is_rowid = match plan.order_by[0].0.as_ref() {
+                    ast::Expr::Column { table, column, .. } => {
+                        *table == table_id && rowid_alias_col == Some(*column)
+                    }
+                    ast::Expr::RowId { table, .. } => *table == table_id,
+                    _ => false,
+                };
+                if first_is_rowid {
+                    plan.order_by.truncate(1);
+                }
+            }
+
             if let Some(group_by) = &mut plan.group_by {
                 // now that we have resolved the ORDER BY expressions and aggregates, we can
                 // compute the necessary sort order for the GROUP BY clause
