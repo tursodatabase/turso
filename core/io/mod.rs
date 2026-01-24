@@ -160,6 +160,32 @@ impl TempFile {
             })
         }
     }
+
+    /// Creates a TempFile respecting the temp_store setting.
+    /// When temp_store is Memory, uses in-memory storage.
+    /// When temp_store is Default or File, uses file-based storage.
+    pub fn with_temp_store(io: &Arc<dyn IO>, temp_store: crate::TempStore) -> Result<Self> {
+        #[cfg(not(target_family = "wasm"))]
+        {
+            if matches!(temp_store, crate::TempStore::Memory) {
+                let memory_io = Arc::new(MemoryIO::new());
+                let memory_file =
+                    memory_io.open_file("tursodb_temp_file", OpenFlags::Create, false)?;
+                return Ok(TempFile {
+                    _temp_dir: None,
+                    file: memory_file,
+                });
+            }
+            // Fall through to file-based for Default and File modes
+            Self::new(io)
+        }
+        #[cfg(target_family = "wasm")]
+        {
+            // WASM always uses memory, ignore temp_store setting
+            let _ = temp_store;
+            Self::new(io)
+        }
+    }
 }
 
 impl core::ops::Deref for TempFile {
