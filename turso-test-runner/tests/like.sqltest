@@ -336,6 +336,13 @@ expect {
     1
 }
 
+test like-escape-trailing-char {
+    SELECT 'abc' LIKE 'abc\' ESCAPE '\';
+}
+expect {
+    0
+}
+
 test like-escape-int-5 {
     SELECT 'a%bc' LIKE 'a5%%' ESCAPE 5;
 }
