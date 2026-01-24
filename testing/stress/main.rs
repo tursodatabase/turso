@@ -1,19 +1,15 @@
 mod opts;
 
 use clap::Parser;
-use core::panic;
 use opts::{Opts, TxMode};
 #[cfg(not(feature = "antithesis"))]
 use rand::rngs::StdRng;
 #[cfg(not(feature = "antithesis"))]
 use rand::{Rng, SeedableRng};
 use std::collections::HashSet;
-use std::fs::File;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
-#[cfg(not(feature = "antithesis"))]
-use std::sync::Mutex as StdMutex;
 use tokio::sync::Mutex;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::layer::SubscriberExt;
@@ -21,36 +17,6 @@ use tracing_subscriber::reload;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
 use turso::Builder;
-
-#[cfg(not(feature = "antithesis"))]
-static RNG: std::sync::OnceLock<StdMutex<StdRng>> = std::sync::OnceLock::new();
-
-#[cfg(not(feature = "antithesis"))]
-fn init_rng(seed: u64) {
-    RNG.get_or_init(|| StdMutex::new(StdRng::seed_from_u64(seed)));
-}
-
-#[cfg(not(feature = "antithesis"))]
-fn get_random() -> u64 {
-    RNG.get()
-        .expect("RNG not initialized")
-        .lock()
-        .unwrap()
-        .random()
-}
-
-#[cfg(feature = "antithesis")]
-fn get_random() -> u64 {
-    antithesis_sdk::random::get_random()
-}
-
-#[derive(Debug)]
-pub struct Plan {
-    pub ddl_statements: Vec<String>,
-    pub queries_per_thread: Vec<Vec<String>>,
-    pub nr_iterations: usize,
-    pub nr_threads: usize,
-}
 
 /// Represents a column in a SQLite table
 #[derive(Debug, Clone)]
@@ -105,16 +71,50 @@ const NOUNS: &[&str] = &[
     "leaf", "root", "seed", "fruit", "flower", "grass", "stone", "sand", "wave", "wind", "rain",
 ];
 
+/// RNG wrapper that works with both Shuttle and Antithesis
+#[cfg(not(feature = "antithesis"))]
+struct ThreadRng {
+    rng: StdRng,
+}
+
+#[cfg(not(feature = "antithesis"))]
+impl ThreadRng {
+    fn new(seed: u64) -> Self {
+        Self {
+            rng: StdRng::seed_from_u64(seed),
+        }
+    }
+
+    fn get_random(&mut self) -> u64 {
+        self.rng.random()
+    }
+}
+
+#[cfg(feature = "antithesis")]
+struct ThreadRng;
+
+#[cfg(feature = "antithesis")]
+impl ThreadRng {
+    fn new(_seed: u64) -> Self {
+        // Antithesis uses its own RNG, seed is ignored
+        Self
+    }
+
+    fn get_random(&mut self) -> u64 {
+        antithesis_sdk::random::get_random()
+    }
+}
+
 // Helper functions for generating random data
-fn generate_random_identifier() -> String {
-    let adj = ADJECTIVES[get_random() as usize % ADJECTIVES.len()];
-    let noun = NOUNS[get_random() as usize % NOUNS.len()];
-    let num = get_random() % 1000;
+fn generate_random_identifier(rng: &mut ThreadRng) -> String {
+    let adj = ADJECTIVES[rng.get_random() as usize % ADJECTIVES.len()];
+    let noun = NOUNS[rng.get_random() as usize % NOUNS.len()];
+    let num = rng.get_random() % 1000;
     format!("{adj}_{noun}_{num}")
 }
 
-fn generate_random_data_type() -> DataType {
-    match get_random() % 5 {
+fn generate_random_data_type(rng: &mut ThreadRng) -> DataType {
+    match rng.get_random() % 5 {
         0 => DataType::Integer,
         1 => DataType::Real,
         2 => DataType::Text,
@@ -123,22 +123,22 @@ fn generate_random_data_type() -> DataType {
     }
 }
 
-fn generate_random_constraint() -> Constraint {
-    match get_random() % 2 {
+fn generate_random_constraint(rng: &mut ThreadRng) -> Constraint {
+    match rng.get_random() % 2 {
         0 => Constraint::NotNull,
         _ => Constraint::Unique,
     }
 }
 
-fn generate_random_column() -> Column {
-    let name = generate_random_identifier();
-    let data_type = generate_random_data_type();
+fn generate_random_column(rng: &mut ThreadRng) -> Column {
+    let name = generate_random_identifier(rng);
+    let data_type = generate_random_data_type(rng);
 
-    let constraint_count = (get_random() % 2) as usize;
+    let constraint_count = (rng.get_random() % 2) as usize;
     let mut constraints = Vec::with_capacity(constraint_count);
 
     for _ in 0..constraint_count {
-        constraints.push(generate_random_constraint());
+        constraints.push(generate_random_constraint(rng));
     }
 
     Column {
@@ -148,19 +148,19 @@ fn generate_random_column() -> Column {
     }
 }
 
-fn generate_random_table() -> Table {
-    let name = generate_random_identifier();
-    let column_count = (get_random() % 10 + 1) as usize;
+fn generate_random_table(rng: &mut ThreadRng) -> Table {
+    let name = generate_random_identifier(rng);
+    let column_count = (rng.get_random() % 10 + 1) as usize;
     let mut columns = Vec::with_capacity(column_count);
     let mut column_names = HashSet::new();
 
     // First, generate all columns without primary keys
     for _ in 0..column_count {
-        let mut column = generate_random_column();
+        let mut column = generate_random_column(rng);
 
         // Ensure column names are unique within the table
         while column_names.contains(&column.name) {
-            column.name = generate_random_identifier();
+            column.name = generate_random_identifier(rng);
         }
 
         column_names.insert(column.name.clone());
@@ -168,7 +168,7 @@ fn generate_random_table() -> Table {
     }
 
     // Then, randomly select one column to be the primary key
-    let pk_index = (get_random() % column_count as u64) as usize;
+    let pk_index = (rng.get_random() % column_count as u64) as usize;
     columns[pk_index].constraints.push(Constraint::PrimaryKey);
     Table {
         name,
@@ -177,21 +177,21 @@ fn generate_random_table() -> Table {
     }
 }
 
-pub fn gen_bool(probability_true: f64) -> bool {
-    (get_random() as f64 / u64::MAX as f64) < probability_true
+fn gen_bool(rng: &mut ThreadRng, probability_true: f64) -> bool {
+    (rng.get_random() as f64 / u64::MAX as f64) < probability_true
 }
 
-pub fn gen_schema(table_count: Option<usize>) -> ArbitrarySchema {
-    let table_count = table_count.unwrap_or_else(|| (get_random() % 10 + 1) as usize);
+fn gen_schema(rng: &mut ThreadRng, table_count: Option<usize>) -> ArbitrarySchema {
+    let table_count = table_count.unwrap_or_else(|| (rng.get_random() % 10 + 1) as usize);
     let mut tables = Vec::with_capacity(table_count);
     let mut table_names = HashSet::new();
 
     for _ in 0..table_count {
-        let mut table = generate_random_table();
+        let mut table = generate_random_table(rng);
 
         // Ensure table names are unique
         while table_names.contains(&table.name) {
-            table.name = generate_random_identifier();
+            table.name = generate_random_identifier(rng);
         }
 
         table_names.insert(table.name.clone());
@@ -247,18 +247,18 @@ fn constraint_to_sql(constraint: &Constraint) -> String {
 }
 
 /// Generate a random value for a given data type
-fn generate_random_value(data_type: &DataType) -> String {
+fn generate_random_value(rng: &mut ThreadRng, data_type: &DataType) -> String {
     match data_type {
-        DataType::Integer => (get_random() % 1000).to_string(),
-        DataType::Real => format!("{:.2}", (get_random() % 1000) as f64 / 100.0),
-        DataType::Text => format!("'{}'", generate_random_identifier()),
-        DataType::Blob => format!("x'{}'", hex::encode(generate_random_identifier())),
-        DataType::Numeric => (get_random() % 1000).to_string(),
+        DataType::Integer => (rng.get_random() % 1000).to_string(),
+        DataType::Real => format!("{:.2}", (rng.get_random() % 1000) as f64 / 100.0),
+        DataType::Text => format!("'{}'", generate_random_identifier(rng)),
+        DataType::Blob => format!("x'{}'", hex::encode(generate_random_identifier(rng))),
+        DataType::Numeric => (rng.get_random() % 1000).to_string(),
     }
 }
 
 /// Generate a random INSERT statement for a table
-fn generate_insert(table: &Table) -> String {
+fn generate_insert(rng: &mut ThreadRng, table: &Table) -> String {
     let columns = table
         .columns
         .iter()
@@ -272,11 +272,11 @@ fn generate_insert(table: &Table) -> String {
         .map(|col| {
             if !table.pk_values.is_empty()
                 && col.constraints.contains(&Constraint::PrimaryKey)
-                && get_random() % 100 < 50
+                && rng.get_random() % 100 < 50
             {
-                table.pk_values[get_random() as usize % table.pk_values.len()].clone()
+                table.pk_values[rng.get_random() as usize % table.pk_values.len()].clone()
             } else {
-                generate_random_value(&col.data_type)
+                generate_random_value(rng, &col.data_type)
             }
         })
         .collect::<Vec<_>>()
@@ -289,7 +289,7 @@ fn generate_insert(table: &Table) -> String {
 }
 
 /// Generate a random UPDATE statement for a table
-fn generate_update(table: &Table) -> String {
+fn generate_update(rng: &mut ThreadRng, table: &Table) -> String {
     // Find the primary key column
     let pk_column = table
         .columns
@@ -309,27 +309,27 @@ fn generate_update(table: &Table) -> String {
         format!(
             "{} = {}",
             pk_column.name,
-            generate_random_value(&pk_column.data_type)
+            generate_random_value(rng, &pk_column.data_type)
         )
     } else {
         non_pk_columns
             .iter()
-            .map(|col| format!("{} = {}", col.name, generate_random_value(&col.data_type)))
+            .map(|col| format!("{} = {}", col.name, generate_random_value(rng, &col.data_type)))
             .collect::<Vec<_>>()
             .join(", ")
     };
 
-    let where_clause = if !table.pk_values.is_empty() && get_random() % 100 < 50 {
+    let where_clause = if !table.pk_values.is_empty() && rng.get_random() % 100 < 50 {
         format!(
             "{} = {}",
             pk_column.name,
-            table.pk_values[get_random() as usize % table.pk_values.len()]
+            table.pk_values[rng.get_random() as usize % table.pk_values.len()]
         )
     } else {
         format!(
             "{} = {}",
             pk_column.name,
-            generate_random_value(&pk_column.data_type)
+            generate_random_value(rng, &pk_column.data_type)
         )
     };
 
@@ -340,7 +340,7 @@ fn generate_update(table: &Table) -> String {
 }
 
 /// Generate a random DELETE statement for a table
-fn generate_delete(table: &Table) -> String {
+fn generate_delete(rng: &mut ThreadRng, table: &Table) -> String {
     // Find the primary key column
     let pk_column = table
         .columns
@@ -348,17 +348,17 @@ fn generate_delete(table: &Table) -> String {
         .find(|col| col.constraints.contains(&Constraint::PrimaryKey))
         .expect("Table should have a primary key");
 
-    let where_clause = if !table.pk_values.is_empty() && get_random() % 100 < 50 {
+    let where_clause = if !table.pk_values.is_empty() && rng.get_random() % 100 < 50 {
         format!(
             "{} = {}",
             pk_column.name,
-            table.pk_values[get_random() as usize % table.pk_values.len()]
+            table.pk_values[rng.get_random() as usize % table.pk_values.len()]
         )
     } else {
         format!(
             "{} = {}",
             pk_column.name,
-            generate_random_value(&pk_column.data_type)
+            generate_random_value(rng, &pk_column.data_type)
         )
     };
 
@@ -366,12 +366,12 @@ fn generate_delete(table: &Table) -> String {
 }
 
 /// Generate a random SQL statement for a schema
-fn generate_random_statement(schema: &ArbitrarySchema) -> String {
-    let table = &schema.tables[get_random() as usize % schema.tables.len()];
-    match get_random() % 3 {
-        0 => generate_insert(table),
-        1 => generate_update(table),
-        _ => generate_delete(table),
+fn generate_random_statement(rng: &mut ThreadRng, schema: &ArbitrarySchema) -> String {
+    let table = &schema.tables[rng.get_random() as usize % schema.tables.len()];
+    match rng.get_random() % 3 {
+        0 => generate_insert(rng, table),
+        1 => generate_update(rng, table),
+        _ => generate_delete(rng, table),
     }
 }
 
@@ -466,116 +466,6 @@ pub fn load_schema(
     Ok(ArbitrarySchema { tables })
 }
 
-fn generate_plan(opts: &Opts) -> Result<Plan, Box<dyn std::error::Error + Send + Sync>> {
-    let mut log_file = File::create(&opts.log_file)?;
-    if !opts.skip_log {
-        writeln!(log_file, "{}", opts.nr_threads)?;
-        writeln!(log_file, "{}", opts.nr_iterations)?;
-    }
-    let mut plan = Plan {
-        ddl_statements: vec![],
-        queries_per_thread: vec![],
-        nr_iterations: opts.nr_iterations,
-        nr_threads: opts.nr_threads,
-    };
-    let schema = if let Some(db_ref) = &opts.db_ref {
-        writeln!(log_file, "{}", 0)?;
-        load_schema(db_ref)?
-    } else {
-        let schema = gen_schema(opts.tables);
-        let ddl_statements = schema.to_sql();
-        if !opts.skip_log {
-            writeln!(log_file, "{}", ddl_statements.len())?;
-            for stmt in &ddl_statements {
-                writeln!(log_file, "{stmt}")?;
-            }
-        }
-        plan.ddl_statements = ddl_statements;
-        schema
-    };
-    // Write DDL statements to log file
-    for id in 0..opts.nr_threads {
-        writeln!(log_file, "{id}",)?;
-        let mut queries = vec![];
-        let mut push = |sql: &str| {
-            queries.push(sql.to_string());
-            if !opts.skip_log {
-                writeln!(log_file, "{sql}").unwrap();
-            }
-        };
-        for i in 0..opts.nr_iterations {
-            if !opts.silent && !opts.verbose && i % 100 == 0 {
-                print!(
-                    "\r{} %",
-                    (i as f64 / opts.nr_iterations as f64 * 100.0) as usize
-                );
-                std::io::stdout().flush().unwrap();
-            }
-            let tx = if get_random() % 2 == 0 {
-                match opts.tx_mode {
-                    TxMode::SQLite => Some("BEGIN;"),
-                    TxMode::Concurrent => Some("BEGIN CONCURRENT;"),
-                }
-            } else {
-                None
-            };
-            if let Some(tx) = tx {
-                push(tx);
-            }
-            let sql = generate_random_statement(&schema);
-            push(&sql);
-            if tx.is_some() {
-                if get_random() % 2 == 0 {
-                    push("COMMIT;");
-                } else {
-                    push("ROLLBACK;");
-                }
-            }
-        }
-        plan.queries_per_thread.push(queries);
-    }
-    Ok(plan)
-}
-
-fn read_plan_from_log_file(opts: &Opts) -> Result<Plan, Box<dyn std::error::Error + Send + Sync>> {
-    let mut file = File::open(&opts.log_file)?;
-    let mut buf = String::new();
-    let mut plan = Plan {
-        ddl_statements: vec![],
-        queries_per_thread: vec![],
-        nr_iterations: 0,
-        nr_threads: 0,
-    };
-    file.read_to_string(&mut buf).unwrap();
-    let mut lines = buf.lines();
-    plan.nr_threads = lines.next().expect("missing threads").parse().unwrap();
-    plan.nr_iterations = lines
-        .next()
-        .expect("missing nr_iterations")
-        .parse()
-        .unwrap();
-    let nr_ddl = lines
-        .next()
-        .expect("number of ddl statements")
-        .parse()
-        .unwrap();
-    for _ in 0..nr_ddl {
-        plan.ddl_statements
-            .push(lines.next().expect("expected ddl statement").to_string());
-    }
-    for line in lines {
-        if line.parse::<i64>().is_ok() {
-            plan.queries_per_thread.push(Vec::new());
-        } else {
-            plan.queries_per_thread
-                .last_mut()
-                .unwrap()
-                .push(line.to_string());
-        }
-    }
-    Ok(plan)
-}
-
 pub type LogLevelReloadHandle = reload::Handle<EnvFilter, tracing_subscriber::Registry>;
 
 pub fn init_tracing() -> Result<(WorkerGuard, LogLevelReloadHandle), std::io::Error> {
@@ -606,10 +496,6 @@ const LOG_LEVEL_FILE: &str = "RUST_LOG";
 
 /// Spawns a background thread that watches for a RUST_LOG file and dynamically
 /// updates the log level when the file contents change.
-///
-/// The file should contain a valid tracing filter string (e.g., "debug", "info",
-/// "limbo_core=trace,warn"). If the file is removed or contains an invalid filter,
-/// the current log level is preserved.
 pub fn spawn_log_level_watcher(reload_handle: LogLevelReloadHandle) {
     std::thread::spawn(move || {
         let mut last_content: Option<String> = None;
@@ -683,58 +569,73 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     config.stack_size *= 10;
     config.max_steps = shuttle::MaxSteps::FailAfter(10_000_000);
 
-    // let scheduler = DfsScheduler::new(None, false);
-    let scheduler = RandomScheduler::new(5);
+    // Parse opts before runner to get seed for scheduler
+    let mut opts = Opts::parse();
+    let seed = opts.seed.unwrap_or_else(rand::random);
+    opts.seed = Some(seed); // Store the resolved seed back into opts
+    eprintln!("Using seed: {seed}");
+
+    let scheduler = RandomScheduler::new_from_seed(seed, 1);
     let runner = shuttle::Runner::new(scheduler, config);
-    runner.run(|| shuttle::future::block_on(Box::pin(async_main())).unwrap());
+    runner.run(move || shuttle::future::block_on(Box::pin(async_main_with_opts(opts.clone()))).unwrap());
 
     Ok(())
 }
 
 async fn async_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let opts = Opts::parse();
+    async_main_with_opts(opts).await
+}
+
+async fn async_main_with_opts(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (_guard, reload_handle) = init_tracing()?;
 
     spawn_log_level_watcher(reload_handle);
 
-    let opts = Opts::parse();
-
-    // Initialize RNG
+    // Initialize seed
     #[cfg(feature = "antithesis")]
-    {
+    let global_seed: u64 = {
         if opts.seed.is_some() {
             eprintln!("Error: --seed is not supported under Antithesis");
             std::process::exit(1);
         }
         println!("Using randomness from Antithesis");
-    }
+        0 // Antithesis doesn't use seed-based RNG
+    };
+
     #[cfg(not(feature = "antithesis"))]
-    {
+    let global_seed: u64 = {
+        // Under shuttle, opts.seed is already resolved in main()
         let seed = opts.seed.unwrap_or_else(rand::random);
-        init_rng(seed);
+        #[cfg(not(shuttle))]
         println!("Using seed: {seed}");
-    }
+        seed
+    };
+
     if opts.nr_threads > 1 {
         println!("WARNING: Multi-threaded data access is not yet supported: https://github.com/tursodatabase/turso/issues/1552");
     }
 
-    let plan = if opts.load_log {
-        println!("Loading plan from log file...");
-        read_plan_from_log_file(&opts)?
+    // Generate schema upfront on main thread with seed
+    let mut main_rng = ThreadRng::new(global_seed);
+    let schema = if let Some(ref db_ref) = opts.db_ref {
+        load_schema(db_ref)?
     } else {
-        println!("Generating plan...");
-        generate_plan(&opts)?
+        gen_schema(&mut main_rng, opts.tables)
     };
 
+    let ddl_statements = schema.to_sql();
+    let schema = Arc::new(schema);
+
     let mut handles = Vec::with_capacity(opts.nr_threads);
-    let plan = Arc::new(plan);
     let mut stop = false;
 
     let tempfile = tempfile::NamedTempFile::new()?;
     let (_, path) = tempfile.keep().unwrap();
-    let db_file = if let Some(db_file) = opts.db_file {
+    let db_file = if let Some(db_file) = opts.db_file.clone() {
         db_file
     } else {
-        if let Some(db_ref) = opts.db_ref {
+        if let Some(ref db_ref) = opts.db_ref {
             std::fs::copy(db_ref, &path)?;
         }
         path.to_string_lossy().to_string()
@@ -744,7 +645,8 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let vfs_option = opts.vfs.clone();
 
-    for thread in 0..plan.nr_threads {
+    // Create all connections on main thread and execute DDL
+    for thread in 0..opts.nr_threads {
         if stop {
             break;
         }
@@ -754,7 +656,6 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             builder = builder.with_io(vfs.clone());
         }
         let db = Arc::new(Mutex::new(builder.build().await?));
-        let plan = plan.clone();
         let conn = db.lock().await.connect()?;
 
         match opts.tx_mode {
@@ -771,7 +672,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         conn.execute("PRAGMA data_sync_retry = 1", ()).await?;
 
         // Apply each DDL statement individually
-        for stmt in &plan.ddl_statements {
+        for stmt in &ddl_statements {
             if opts.verbose {
                 println!("executing ddl {stmt}");
             }
@@ -815,22 +716,34 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
         }
 
-        let nr_queries = plan.queries_per_thread[thread].len();
+        let nr_iterations = opts.nr_iterations;
         let db = db.clone();
         let vfs_for_task = vfs_option.clone();
+        let schema_for_task = schema.clone();
+        let verbose = opts.verbose;
+        let silent = opts.silent;
+        let busy_timeout = opts.busy_timeout;
+        let tx_mode = opts.tx_mode;
+
+        // Each thread gets its own RNG seeded deterministically
+        let thread_seed = global_seed.wrapping_add(thread as u64);
 
         let handle = turso_stress::future::spawn(async move {
             let mut conn = db.lock().await.connect()?;
 
-            conn.busy_timeout(std::time::Duration::from_millis(opts.busy_timeout))?;
+            conn.busy_timeout(std::time::Duration::from_millis(busy_timeout))?;
 
             conn.execute("PRAGMA data_sync_retry = 1", ()).await?;
 
-            println!("\rExecuting queries...");
-            for query_index in 0..nr_queries {
-                if gen_bool(0.0) {
+            println!("\rthread#{thread} Executing queries...");
+
+            // Thread-local RNG for JIT query generation
+            let mut rng = ThreadRng::new(thread_seed);
+
+            for i in 0..nr_iterations {
+                if gen_bool(&mut rng, 0.0) {
                     // disabled
-                    if opts.verbose {
+                    if verbose {
                         println!("Reopening database");
                     }
                     // Reopen the database
@@ -841,39 +754,63 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     }
                     *db_guard = builder.build().await?;
                     conn = db_guard.connect()?;
-                    conn.busy_timeout(std::time::Duration::from_millis(opts.busy_timeout))?;
-                } else if gen_bool(0.0) {
+                    conn.busy_timeout(std::time::Duration::from_millis(busy_timeout))?;
+                } else if gen_bool(&mut rng, 0.0) {
                     // disabled
                     // Reconnect to the database
-                    if opts.verbose {
+                    if verbose {
                         println!("Reconnecting to database");
                     }
                     let db_guard = db.lock().await;
                     conn = db_guard.connect()?;
-                    conn.busy_timeout(std::time::Duration::from_millis(opts.busy_timeout))?;
+                    conn.busy_timeout(std::time::Duration::from_millis(busy_timeout))?;
                 }
-                let sql = &plan.queries_per_thread[thread][query_index];
-                if !opts.silent {
-                    if opts.verbose {
+
+                // JIT: Generate transaction wrapper
+                let tx = if rng.get_random() % 2 == 0 {
+                    match tx_mode {
+                        TxMode::SQLite => Some("BEGIN;"),
+                        TxMode::Concurrent => Some("BEGIN CONCURRENT;"),
+                    }
+                } else {
+                    None
+                };
+
+                if let Some(tx_stmt) = tx {
+                    if verbose {
+                        eprintln!("thread#{thread}(start): {tx_stmt}");
+                    }
+                    if let Err(e) = conn.execute(tx_stmt, ()).await {
+                        if verbose {
+                            println!("thread#{thread} Error executing tx: {e}");
+                        }
+                    }
+                }
+
+                // JIT: Generate random statement
+                let sql = generate_random_statement(&mut rng, &schema_for_task);
+
+                if !silent {
+                    if verbose {
                         println!("thread#{thread} executing query {sql}");
-                    } else if query_index % 100 == 0 {
+                    } else if i % 100 == 0 {
                         print!(
-                            "\r{:.2} %",
-                            (query_index as f64 / nr_queries as f64 * 100.0)
+                            "\rthread#{thread}: {:.2} %",
+                            (i as f64 / nr_iterations as f64 * 100.0)
                         );
                         std::io::stdout().flush().unwrap();
                     }
                 }
-                if opts.verbose {
+                if verbose {
                     eprintln!("thread#{thread}(start): {sql}");
                 }
-                if let Err(e) = conn.execute(sql, ()).await {
+                if let Err(e) = conn.execute(&sql, ()).await {
                     match e {
                         turso::Error::Corrupt(e) => {
                             panic!("thread#{thread} Error[FATAL] executing query: {}", e);
                         }
                         turso::Error::Constraint(e) => {
-                            if opts.verbose {
+                            if verbose {
                                 println!("thread#{thread} Error[WARNING] executing query: {e}");
                             }
                         }
@@ -884,7 +821,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                             println!("thread#{thread} Error[WARNING] busy snapshot: {e}");
                         }
                         turso::Error::Error(e) => {
-                            if opts.verbose {
+                            if verbose {
                                 println!("thread#{thread} Error executing query: {e}");
                             }
                         }
@@ -897,12 +834,30 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         _ => panic!("thread#{thread} Error[FATAL] executing query: {}", e),
                     }
                 }
-                if opts.verbose {
+                if verbose {
                     eprintln!("thread#{thread}(end): {sql}");
                 }
+
+                // Commit or rollback transaction
+                if tx.is_some() {
+                    let end_tx = if rng.get_random() % 2 == 0 {
+                        "COMMIT;"
+                    } else {
+                        "ROLLBACK;"
+                    };
+                    if verbose {
+                        eprintln!("thread#{thread}(start): {end_tx}");
+                    }
+                    if let Err(e) = conn.execute(end_tx, ()).await {
+                        if verbose {
+                            println!("thread#{thread} Error executing {end_tx}: {e}");
+                        }
+                    }
+                }
+
                 const INTEGRITY_CHECK_INTERVAL: usize = 100;
-                if query_index % INTEGRITY_CHECK_INTERVAL == 0 {
-                    if opts.verbose {
+                if i % INTEGRITY_CHECK_INTERVAL == 0 {
+                    if verbose {
                         eprintln!("thread#{thread}(start): PRAGMA integrity_check");
                     }
                     let mut res = conn.query("PRAGMA integrity_check", ()).await.unwrap();
@@ -927,7 +882,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         Err(e) => println!("thread#{thread} Error performing integrity check: {e}"),
                         _ => {}
                     }
-                    if opts.verbose {
+                    if verbose {
                         eprintln!("thread#{thread}(end): PRAGMA integrity_check");
                     }
                 }
@@ -942,7 +897,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     for handle in handles {
         handle.await??;
     }
-    println!("Done. SQL statements written to {}", opts.log_file);
+    println!("Done.");
     println!("Database file: {db_file}");
 
     // Switch back to WAL mode before SQLite integrity check if we were in MVCC mode.

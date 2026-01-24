@@ -22,7 +22,7 @@ impl fmt::Display for TxMode {
     }
 }
 
-#[derive(Parser)]
+#[derive(Parser, Clone)]
 #[command(name = "turso_stress")]
 #[command(author, version, about, long_about = None)]
 pub struct Opts {
@@ -50,33 +50,6 @@ pub struct Opts {
         default_value_t = normal_or_constrained(100_000, 1000)
     )]
     pub nr_iterations: usize,
-
-    /// Log file for SQL statements
-    #[clap(
-        short = 'l',
-        long,
-        help = "log file for SQL statements",
-        default_value = "limbostress.log"
-    )]
-    pub log_file: String,
-
-    /// Load log file instead of creating a new one
-    #[clap(
-        short = 'L',
-        long = "load-log",
-        help = "load log file instead of creating a new one",
-        default_value_t = false
-    )]
-    pub load_log: bool,
-
-    /// Skip writing to log file
-    #[clap(
-        short = 's',
-        long = "skip-log",
-        help = "load log file instead of creating a new one",
-        default_value_t = false
-    )]
-    pub skip_log: bool,
 
     /// Database file
     #[clap(short = 'd', long, help = "database file")]
