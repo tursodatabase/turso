@@ -470,6 +470,43 @@ pub fn translate_condition_expr(
             translate_expr(program, Some(referenced_tables), expr, reg, resolver)?;
             emit_cond_jump(program, condition_metadata, reg);
         }
+        // Handle IS NULL/IS NOT NULL in conditions using IsNull/NotNull opcodes.
+        // "a IS NULL" is parsed as Binary(a, Is, Null), but we need to use the IsNull opcode
+        // (not Eq/Ne with null_eq flag) for correct NULL handling in WHERE clauses.
+        ast::Expr::Binary(e1, ast::Operator::Is, e2)
+            if matches!(e2.as_ref(), ast::Expr::Literal(ast::Literal::Null)) =>
+        {
+            let cur_reg = program.alloc_register();
+            translate_expr(program, Some(referenced_tables), e1, cur_reg, resolver)?;
+            if condition_metadata.jump_if_condition_is_true {
+                program.emit_insn(Insn::IsNull {
+                    reg: cur_reg,
+                    target_pc: condition_metadata.jump_target_when_true,
+                });
+            } else {
+                program.emit_insn(Insn::NotNull {
+                    reg: cur_reg,
+                    target_pc: condition_metadata.jump_target_when_false,
+                });
+            }
+        }
+        ast::Expr::Binary(e1, ast::Operator::IsNot, e2)
+            if matches!(e2.as_ref(), ast::Expr::Literal(ast::Literal::Null)) =>
+        {
+            let cur_reg = program.alloc_register();
+            translate_expr(program, Some(referenced_tables), e1, cur_reg, resolver)?;
+            if condition_metadata.jump_if_condition_is_true {
+                program.emit_insn(Insn::NotNull {
+                    reg: cur_reg,
+                    target_pc: condition_metadata.jump_target_when_true,
+                });
+            } else {
+                program.emit_insn(Insn::IsNull {
+                    reg: cur_reg,
+                    target_pc: condition_metadata.jump_target_when_false,
+                });
+            }
+        }
         ast::Expr::Binary(e1, op, e2) => {
             let result_reg = program.alloc_register();
             binary_expr_shared(

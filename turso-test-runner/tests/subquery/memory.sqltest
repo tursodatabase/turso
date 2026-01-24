@@ -877,3 +877,61 @@ expect {
     b|7
 }
 
+
+# EXISTS in SELECT list with aggregates on empty table
+# When the source table is empty, the aggregate loop never runs, but EXISTS
+# should still return 0 (not NULL) because the subquery result is evaluated.
+test subquery-exists-in-select-with-aggregate-empty-table {
+    create table t5(x);
+    select exists (select 1 from t5), count(*) from t5;
+}
+expect {
+    0|0
+}
+
+# Correlated EXISTS in SELECT list with aggregates on empty table
+test subquery-correlated-exists-in-select-with-aggregate-empty-table {
+    create table t6(id);
+    select exists (select 1 where t6.id = 1), count(*) from t6;
+}
+expect {
+    0|0
+}
+
+# Scalar subquery in SELECT list with aggregates on empty table
+# Scalar subquery returns a constant, should work even when main table is empty
+test subquery-scalar-in-select-with-aggregate-empty-table {
+    create table t7(x);
+    select (select 42), count(*) from t7;
+}
+expect {
+    42|0
+}
+
+# Scalar subquery returning NULL in SELECT list with aggregates on empty table
+test subquery-scalar-null-in-select-with-aggregate-empty-table {
+    create table t8(x);
+    create table t8_empty(y);
+    select (select y from t8_empty), count(*) from t8;
+}
+expect {
+    |0
+}
+
+# IN subquery in SELECT list with aggregates on empty table
+test subquery-in-in-select-with-aggregate-empty-table {
+    create table t9(x);
+    select 1 in (select x from t9), count(*) from t9;
+}
+expect {
+    0|0
+}
+
+# Column IS NULL in ungrouped aggregate on empty table
+test column-is-null-in-aggregate-empty-table {
+    create table t10(x);
+    select x IS NULL, count(*) from t10;
+}
+expect {
+    1|0
+}
