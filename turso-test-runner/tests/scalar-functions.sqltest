@@ -622,6 +622,12 @@ test trim-pattern-null {
 expect {
 }
 
+test trim-pattern-null-2 {
+    SELECT trim('abc', NULL);
+}
+expect {
+}
+
 test trim-no-match-pattern {
     SELECT trim('Limbo', 'xyz');
 }
