@@ -99,6 +99,7 @@ antithesis_sdk = { version = "0.2", default-features = false }
 cfg-if = "1.0.0"
 tracing-appender = "0.2.3"
 env_logger = { version = "0.11.6", default-features = false }
+crossbeam-channel = "0.5.15"
 regex = "1.11.1"
 regex-syntax = { version = "0.8.5", default-features = false }
 similar = { version = "2.7.0" }
