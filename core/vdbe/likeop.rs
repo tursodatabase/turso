@@ -54,6 +54,8 @@ fn construct_like_regex_with_escape(pattern: &str, escape: char) -> Regex {
                         regex_pattern.push('\\');
                     }
                     regex_pattern.push(escaped_char);
+                } else {
+                    regex_pattern.push_str("\\z.");
                 }
             }
             '%' => regex_pattern.push_str(".*"),
