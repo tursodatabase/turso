@@ -1237,6 +1237,13 @@ expect {
     😁ã😅
 }
 
+test substr-null-length-returns-null {
+    SELECT substr('hello', 2, NULL), typeof(substr('hello', 2, NULL));
+}
+expect {
+    |null
+}
+
 test typeof-null {
     SELECT typeof(null);
 }

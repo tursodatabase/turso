@@ -490,6 +490,11 @@ impl Value {
         let start_value = start_value.exec_cast("INT");
         let length_value = length_value.map(|value| value.exec_cast("INT"));
 
+        // If length is explicitly NULL, return NULL (SQLite behavior)
+        if matches!(length_value, Some(Value::Null)) {
+            return Value::Null;
+        }
+
         match (value, start_value) {
             (Value::Blob(b), Value::Integer(start)) => {
                 let (start, end) = calculate_postions(start, b.len(), length_value.as_ref());
@@ -2204,7 +2209,7 @@ mod tests {
         let str_value = Value::build_text("limbo");
         let start_value = Value::Integer(3);
         let length_value = Value::Null;
-        let expected_val = Value::build_text("mbo");
+        let expected_val = Value::Null;
         assert_eq!(
             Value::exec_substring(&str_value, &start_value, Some(&length_value)),
             expected_val
@@ -2213,7 +2218,7 @@ mod tests {
         let str_value = Value::build_text("limbo");
         let start_value = Value::Integer(10);
         let length_value = Value::Null;
-        let expected_val = Value::build_text("");
+        let expected_val = Value::Null;
         assert_eq!(
             Value::exec_substring(&str_value, &start_value, Some(&length_value)),
             expected_val
