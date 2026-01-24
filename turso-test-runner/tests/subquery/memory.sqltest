@@ -825,6 +825,106 @@ test subquery-vector-in-function-call {
 expect error {
 }
 
+# EXISTS inside aggregate function arguments
+test subquery-exists-in-aggregate-group-concat {
+    select group_concat(exists (select 1));
+}
+expect {
+    1
+}
+
+test subquery-exists-in-aggregate-sum {
+    select sum(exists (select 1));
+}
+expect {
+    1
+}
+
+test subquery-exists-in-aggregate-count {
+    select count(exists (select 1));
+}
+expect {
+    1
+}
+
+test subquery-exists-in-aggregate-with-table {
+    create table t1(x);
+    insert into t1 values (1), (2), (3);
+    select group_concat(exists (select 1)) from t1;
+}
+expect {
+    1,1,1
+}
+
+test subquery-exists-false-in-aggregate {
+    select sum(exists (select 1 where false));
+}
+expect {
+    0
+}
+
+test subquery-exists-in-aggregate-expression {
+    select sum(1 + exists (select 1));
+}
+expect {
+    2
+}
+
+# Scalar subquery inside aggregate function arguments
+test subquery-scalar-in-aggregate-sum {
+    select sum((select 5));
+}
+expect {
+    5
+}
+
+test subquery-scalar-in-aggregate-group-concat {
+    create table t2(x);
+    insert into t2 values (1), (2);
+    select group_concat((select 'a')) from t2;
+}
+expect {
+    a,a
+}
+
+test subquery-scalar-in-aggregate-with-table-ref {
+    create table t3(x);
+    insert into t3 values (10), (20), (30);
+    select sum((select max(x) from t3)) from t3;
+}
+expect {
+    90
+}
+
+# Subqueries in ORDER BY aggregates
+# When ORDER BY has a single-row aggregate (no GROUP BY), the ORDER BY is optimized away.
+# The aggregate shouldn't be translated with stale subquery expressions.
+test subquery-exists-in-order-by-aggregate {
+    select 1 order by sum(exists (select 1));
+}
+expect {
+    1
+}
+
+test subquery-scalar-in-order-by-aggregate {
+    select 1 order by sum((select 42));
+}
+expect {
+    1
+}
+
+# With actual ORDER BY effect (GROUP BY present, so ORDER BY is not cleared)
+# Uses uncorrelated subquery since correlated subqueries in ORDER BY are not yet supported
+test subquery-exists-in-order-by-aggregate-with-group {
+    create table t4(x, g);
+    insert into t4 values (1, 'a'), (2, 'a'), (3, 'b'), (4, 'b');
+    select g, sum(x) as s from t4 group by g order by sum(exists (select 1));
+}
+expect {
+    a|3
+    b|7
+}
+
 # Subquery column affinity inheritance
 # When a subquery selects from a table column, the result column should inherit
 # the affinity of the source column. This affects comparison behavior:
