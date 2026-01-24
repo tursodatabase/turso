@@ -28,7 +28,7 @@ use crate::vdbe::{
     insn::{CmpInsFlags, Insn},
     BranchOffset,
 };
-use crate::{turso_assert, Result, Value};
+use crate::{turso_assert, turso_assert_unreachable, Result, Value};
 
 use super::collate::CollationSeq;
 
@@ -1131,8 +1131,8 @@ pub fn translate_expr(
                         func_ctx,
                     ),
                     JsonFunc::JsonArrowExtract | JsonFunc::JsonArrowShiftExtract => {
-                        unreachable!(
-                            "These two functions are only reachable via the -> and ->> operators"
+                        turso_assert_unreachable!(
+                            "translate: json arrow functions only reachable via operators"
                         )
                     }
                     JsonFunc::JsonArrayLength | JsonFunc::JsonType => {
@@ -1331,7 +1331,7 @@ pub fn translate_expr(
                 Func::Scalar(srf) => {
                     match srf {
                         ScalarFunc::Cast => {
-                            unreachable!("this is always ast::Expr::Cast")
+                            turso_assert_unreachable!("translate: cast is always ast::Expr::Cast")
                         }
                         ScalarFunc::Changes => {
                             if !args.is_empty() {
@@ -2229,7 +2229,7 @@ pub fn translate_expr(
                         func_ctx,
                     )
                 }
-                Func::AlterTable(_) => unreachable!(),
+                Func::AlterTable(_) => turso_assert_unreachable!("translate: alter table function"),
             }
         }
         ast::Expr::FunctionCallStar { name, filter_over } => {
@@ -2392,10 +2392,7 @@ pub fn translate_expr(
                 .unwrap()
                 .find_table_by_internal_id(*table_ref_id)
                 .unwrap_or_else(|| {
-                    unreachable!(
-                        "table reference should be found: {} (referenced_tables: {:?})",
-                        table_ref_id, referenced_tables
-                    )
+                    turso_assert_unreachable!("translate: table reference not found")
                 });
 
             if use_index_method.is_none() {
@@ -2458,7 +2455,7 @@ pub fn translate_expr(
                                     dest: target_register,
                                 });
                             } else {
-                                unreachable!("Either index or table cursor must be opened");
+                                turso_assert_unreachable!("translate: neither index nor table cursor opened");
                             }
                         } else {
                             let is_btree_index = index_cursor_id.is_some_and(|cid| {
@@ -2762,7 +2759,7 @@ pub fn translate_expr(
             Ok(target_register)
         }
         ast::Expr::Qualified(_, _) => {
-            unreachable!("Qualified should be resolved to a Column before translation")
+            turso_assert_unreachable!("translate: qualified should be resolved to column")
         }
         ast::Expr::Raise(_, _) => crate::bail_parse_error!("RAISE is not supported"),
         ast::Expr::Subquery(_) => {
@@ -2787,7 +2784,7 @@ pub fn translate_expr(
                             dest: target_register,
                         });
                     }
-                    _ => unreachable!(),
+                    _ => turso_assert_unreachable!("translate: unexpected numeric literal type"),
                 }
                 Ok(target_register)
             }
@@ -2823,7 +2820,7 @@ pub fn translate_expr(
                             dest: target_register,
                         });
                     }
-                    _ => unreachable!(),
+                    _ => turso_assert_unreachable!("translate: unexpected numeric literal type"),
                 }
                 Ok(target_register)
             }
@@ -3207,7 +3204,7 @@ fn emit_binary_insn(
             let json_func = match op {
                 ast::Operator::ArrowRight => JsonFunc::JsonArrowExtract,
                 ast::Operator::ArrowRightShift => JsonFunc::JsonArrowShiftExtract,
-                _ => unreachable!(),
+                _ => turso_assert_unreachable!("translate: unexpected json operator"),
             };
 
             program.emit_insn(Insn::Function {
@@ -3476,7 +3473,7 @@ fn emit_binary_condition_insn(
             let json_func = match op {
                 ast::Operator::ArrowRight => JsonFunc::JsonArrowExtract,
                 ast::Operator::ArrowRightShift => JsonFunc::JsonArrowShiftExtract,
-                _ => unreachable!(),
+                _ => turso_assert_unreachable!("translate: unexpected json operator"),
             };
 
             program.emit_insn(Insn::Function {
@@ -3544,7 +3541,7 @@ fn translate_like_base(
             let func = match op {
                 ast::LikeOperator::Like => ScalarFunc::Like,
                 ast::LikeOperator::Glob => ScalarFunc::Glob,
-                _ => unreachable!(),
+                _ => turso_assert_unreachable!("translate: unexpected like operator"),
             };
             program.emit_insn(Insn::Function {
                 constant_mask,
@@ -4638,7 +4635,7 @@ pub fn emit_literal(
                         dest: target_register,
                     });
                 }
-                _ => unreachable!(),
+                _ => turso_assert_unreachable!("translate: unexpected numeric literal type"),
             }
             Ok(target_register)
         }

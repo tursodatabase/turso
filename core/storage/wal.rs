@@ -29,8 +29,8 @@ use crate::storage::sqlite3_ondisk::{
 };
 use crate::types::{IOCompletions, IOResult};
 use crate::{
-    bail_corrupt_error, io_yield_one, turso_assert, Buffer, Completion, CompletionError, IOContext,
-    LimboError, Result,
+    bail_corrupt_error, io_yield_one, turso_assert, turso_assert_reachable, Buffer, Completion,
+    CompletionError, IOContext, LimboError, Result,
 };
 
 /// this contains the frame to rollback to and its associated checksum.
@@ -859,6 +859,7 @@ impl CheckpointLocks {
             }
             match mode {
                 CheckpointMode::Passive { .. } => {
+                    turso_assert_reachable!("wal: checkpoint passive mode executed");
                     if !shared.read_locks[0].write() {
                         shared.checkpoint_lock.unlock();
                         tracing::trace!("CheckpointGuard: read0 lock failed, returning Busy");
@@ -866,6 +867,7 @@ impl CheckpointLocks {
                     }
                 }
                 CheckpointMode::Full => {
+                    turso_assert_reachable!("wal: checkpoint full mode executed");
                     if !shared.read_locks[0].write() {
                         shared.checkpoint_lock.unlock();
                         tracing::trace!("CheckpointGuard: read0 lock failed (Full), Busy");
@@ -878,7 +880,22 @@ impl CheckpointLocks {
                         return Err(LimboError::Busy);
                     }
                 }
-                CheckpointMode::Restart | CheckpointMode::Truncate { .. } => {
+                CheckpointMode::Restart => {
+                    turso_assert_reachable!("wal: checkpoint restart mode executed");
+                    if !shared.read_locks[0].write() {
+                        shared.checkpoint_lock.unlock();
+                        tracing::trace!("CheckpointGuard: read0 lock failed, returning Busy");
+                        return Err(LimboError::Busy);
+                    }
+                    if !shared.write_lock.write() {
+                        shared.checkpoint_lock.unlock();
+                        shared.read_locks[0].unlock();
+                        tracing::trace!("CheckpointGuard: write lock failed, returning Busy");
+                        return Err(LimboError::Busy);
+                    }
+                }
+                CheckpointMode::Truncate { .. } => {
+                    turso_assert_reachable!("wal: checkpoint truncate mode executed");
                     if !shared.read_locks[0].write() {
                         shared.checkpoint_lock.unlock();
                         tracing::trace!("CheckpointGuard: read0 lock failed, returning Busy");

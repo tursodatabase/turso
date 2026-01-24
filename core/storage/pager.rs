@@ -24,8 +24,8 @@ use crate::sync::{Mutex, RwLock};
 use crate::types::{IOCompletions, WalState};
 use crate::util::IOExt as _;
 use crate::{
-    io::CompletionGroup, return_if_io, turso_assert, types::WalFrameInfo, Completion, Connection,
-    IOResult, LimboError, Result, TransactionState,
+    io::CompletionGroup, return_if_io, turso_assert, turso_assert_unreachable,
+    types::WalFrameInfo, Completion, Connection, IOResult, LimboError, Result, TransactionState,
 };
 use crate::{io_yield_one, Buffer, CompletionError, IOContext, OpenFlags, SyncMode, IO};
 use arc_swap::ArcSwapOption;
@@ -1072,7 +1072,7 @@ impl From<u8> for AutoVacuumMode {
             0 => AutoVacuumMode::None,
             1 => AutoVacuumMode::Full,
             2 => AutoVacuumMode::Incremental,
-            _ => unreachable!("Invalid AutoVacuumMode value: {}", value),
+            _ => turso_assert_unreachable!("pager: invalid AutoVacuumMode value"),
         }
     }
 }
@@ -1982,7 +1982,7 @@ impl Pager {
         let page_type = match flags {
             _ if flags.is_table() => PageType::TableLeaf,
             _ if flags.is_index() => PageType::IndexLeaf,
-            _ => unreachable!("Invalid flags state"),
+            _ => turso_assert_unreachable!("pager: invalid btree flags state"),
         };
         #[cfg(feature = "omit_autovacuum")]
         {
@@ -2498,7 +2498,7 @@ impl Pager {
             match page_cache.insert(page_key, page.clone()) {
                 Ok(_) => return Ok(IOResult::Done(())),
                 Err(CacheError::KeyExists) => {
-                    unreachable!("Page should not exist in cache after get() miss");
+                    turso_assert_unreachable!("pager: page should not exist in cache after get miss");
                 }
                 Err(CacheError::Full) => {
                     // Fall through to spilling
@@ -4009,7 +4009,7 @@ impl Pager {
                 *self.allocate_page1_state.write() = AllocatePage1State::Done;
                 Ok(IOResult::Done(page))
             }
-            AllocatePage1State::Done => unreachable!("cannot try to allocate page 1 again"),
+            AllocatePage1State::Done => turso_assert_unreachable!("pager: cannot allocate page 1 again"),
         }
     }
 

@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use smallvec::SmallVec;
 
@@ -1588,7 +1588,7 @@ mod tests {
     /// Test that [compute_best_join_order] returns None when there are no table references.
     fn test_compute_best_join_order_empty() {
         let table_references = TableReferences::new(vec![], vec![]);
-        let available_indexes = HashMap::new();
+        let available_indexes = BTreeMap::new();
         let mut where_clause = vec![];
 
         let mut access_methods_arena = Vec::new();
@@ -1629,7 +1629,7 @@ mod tests {
             table_id_counter.next(),
         )];
         let table_references = TableReferences::new(joined_tables, vec![]);
-        let available_indexes = HashMap::new();
+        let available_indexes = BTreeMap::new();
         let mut where_clause = vec![];
 
         let mut access_methods_arena = Vec::new();
@@ -1685,7 +1685,7 @@ mod tests {
 
         let table_references = TableReferences::new(joined_tables, vec![]);
         let mut access_methods_arena = Vec::new();
-        let available_indexes = HashMap::new();
+        let available_indexes = BTreeMap::new();
         let table_constraints = constraints_from_where_clause(
             &where_clause,
             &table_references,
@@ -1747,7 +1747,7 @@ mod tests {
 
         let table_references = TableReferences::new(joined_tables, vec![]);
         let mut access_methods_arena = Vec::new();
-        let mut available_indexes = HashMap::new();
+        let mut available_indexes = BTreeMap::new();
         let index = Arc::new(Index {
             name: "sqlite_autoindex_test_table_1".to_string(),
             table_name: "test_table".to_string(),
@@ -1829,7 +1829,7 @@ mod tests {
         const TABLE1: usize = 0;
         const TABLE2: usize = 1;
 
-        let mut available_indexes = HashMap::new();
+        let mut available_indexes = BTreeMap::new();
         // Index on the outer table (table1)
         let index1 = Arc::new(Index {
             name: "index1".to_string(),
@@ -1956,7 +1956,7 @@ mod tests {
         const TABLE_NO_CUSTOMERS: usize = 1;
         const TABLE_NO_ORDER_ITEMS: usize = 2;
 
-        let mut available_indexes = HashMap::new();
+        let mut available_indexes = BTreeMap::new();
         ["orders", "customers", "order_items"]
             .iter()
             .for_each(|table_name| {
@@ -2173,7 +2173,7 @@ mod tests {
         ];
 
         let table_references = TableReferences::new(joined_tables, vec![]);
-        let available_indexes = HashMap::new();
+        let available_indexes = BTreeMap::new();
         let mut access_methods_arena = Vec::new();
         let table_constraints = constraints_from_where_clause(
             &where_clause,
@@ -2292,7 +2292,7 @@ mod tests {
 
         let table_references = TableReferences::new(joined_tables, vec![]);
         let mut access_methods_arena = Vec::new();
-        let available_indexes = HashMap::new();
+        let available_indexes = BTreeMap::new();
         let table_constraints = constraints_from_where_clause(
             &where_clause,
             &table_references,
@@ -2366,7 +2366,7 @@ mod tests {
             tables.push(_create_btree_table(&format!("t{}", i + 1), columns));
         }
 
-        let available_indexes = HashMap::new();
+        let available_indexes = BTreeMap::new();
 
         let mut table_id_counter = TableRefIdCounter::new();
         // Create table references
@@ -2493,7 +2493,7 @@ mod tests {
             index_method: None,
         });
 
-        let mut available_indexes = HashMap::new();
+        let mut available_indexes = BTreeMap::new();
         available_indexes.insert("t1".to_string(), VecDeque::from([index]));
 
         let table = Table::BTree(table);
@@ -2564,7 +2564,7 @@ mod tests {
     fn test_index_skips_middle_column() {
         let mut table_id_counter = TableRefIdCounter::new();
         let mut joined_tables = Vec::new();
-        let mut available_indexes = HashMap::new();
+        let mut available_indexes = BTreeMap::new();
 
         let columns = _create_column_list(&["c1", "c2", "c3"], Type::Integer);
         let table = _create_btree_table("t1", columns);
@@ -2694,7 +2694,7 @@ mod tests {
     fn test_index_stops_at_range_operator() {
         let mut table_id_counter = TableRefIdCounter::new();
         let mut joined_tables = Vec::new();
-        let mut available_indexes = HashMap::new();
+        let mut available_indexes = BTreeMap::new();
 
         let columns = _create_column_list(&["c1", "c2", "c3"], Type::Integer);
         let table = _create_btree_table("t1", columns);
@@ -2982,7 +2982,7 @@ mod tests {
         const TABLE2: usize = 1;
 
         // Index on t2.a
-        let mut available_indexes = HashMap::new();
+        let mut available_indexes = BTreeMap::new();
         let index_t2_a = Arc::new(Index {
             name: "idx_t2_a".to_string(),
             table_name: "t2".to_string(),

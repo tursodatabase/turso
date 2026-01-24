@@ -59,7 +59,7 @@ use crate::vdbe::insn::{
 };
 use crate::vdbe::{insn::Insn, BranchOffset, CursorID};
 use crate::{bail_parse_error, emit_explain, Result, SymbolTable};
-use crate::{turso_assert, Connection, QueryMode};
+use crate::{turso_assert, turso_assert_unreachable, Connection, QueryMode};
 
 pub struct Resolver<'a> {
     pub schema: &'a Schema,
@@ -1490,7 +1490,7 @@ fn emit_delete_insns<'a>(
             panic!("access through IndexMethod is not supported for delete statements")
         }
         Operation::HashJoin(_) => {
-            unreachable!("access through HashJoin is not supported for delete statements")
+            turso_assert_unreachable!("translate: hash join not supported for delete")
         }
     };
     let btree_table = unsafe { &*table_reference }.btree();
@@ -1964,7 +1964,7 @@ fn emit_program_for_update(
     let ephemeral_plan = plan.ephemeral_plan.take();
     let temp_cursor_id = ephemeral_plan.as_ref().map(|plan| {
         let QueryDestination::EphemeralTable { cursor_id, .. } = &plan.query_destination else {
-            unreachable!()
+            turso_assert_unreachable!("translate: expected ephemeral table destination")
         };
         *cursor_id
     });
@@ -2479,7 +2479,7 @@ fn emit_update_insns<'a>(
             panic!("access through IndexMethod is not supported for update operations")
         }
         Operation::HashJoin(_) => {
-            unreachable!("access through HashJoin is not supported for update operations")
+            turso_assert_unreachable!("translate: hash join not supported for update")
         }
     };
 
@@ -2908,7 +2908,7 @@ fn emit_update_insns<'a>(
                         description: column_names,
                     });
                 }
-                _ => unreachable!("Only IGNORE, FAIL, and ROLLBACK should reach preflight check"),
+                _ => turso_assert_unreachable!("translate: unexpected conflict resolution in preflight"),
             }
 
             program.preassign_label_to_next_insn(no_conflict_label);
@@ -2964,7 +2964,7 @@ fn emit_update_insns<'a>(
                         description,
                     });
                 }
-                _ => unreachable!("Only IGNORE, FAIL, and ROLLBACK should reach preflight check"),
+                _ => turso_assert_unreachable!("translate: unexpected conflict resolution in preflight"),
             }
 
             program.preassign_label_to_next_insn(no_rowid_conflict_label);
@@ -3911,7 +3911,7 @@ fn init_limit(
                             reg: limit_ctx.reg_limit,
                         });
                     }
-                    _ => unreachable!("parse_numeric_literal only returns Integer or Float"),
+                    _ => turso_assert_unreachable!("translate: unexpected numeric literal type"),
                 },
                 _ => {
                     let r = limit_ctx.reg_limit;
@@ -3942,7 +3942,7 @@ fn init_limit(
                         });
                         program.emit_insn(Insn::MustBeInt { reg: offset_reg });
                     }
-                    _ => unreachable!("parse_numeric_literal only returns Integer or Float"),
+                    _ => turso_assert_unreachable!("translate: unexpected numeric literal type"),
                 },
                 _ => {
                     _ = translate_expr(program, None, expr, offset_reg, &t_ctx.resolver)?;

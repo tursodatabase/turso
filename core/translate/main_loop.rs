@@ -32,7 +32,7 @@ use crate::{
         subquery::emit_non_from_clause_subquery,
         window::emit_window_loop_source,
     },
-    turso_assert,
+    turso_assert, turso_assert_unreachable,
     types::SeekOp,
     vdbe::{
         affinity::{self, Affinity},
@@ -392,7 +392,7 @@ pub fn init_loop(
                             });
                         }
                     }
-                    _ => unreachable!("Hash joins should only occur in SELECT operations"),
+                    _ => turso_assert_unreachable!("translate: hash joins only in SELECT"),
                 }
             }
         }
@@ -890,7 +890,7 @@ pub fn open_loop(
                                     yield_reg,
                                     coroutine_implementation_start,
                                 }) => (*yield_reg, *coroutine_implementation_start),
-                                _ => unreachable!("Subquery table with non-subquery query type"),
+                                _ => turso_assert_unreachable!("translate: subquery with non-subquery destination"),
                             };
                         // In case the subquery is an inner loop, it needs to be reinitialized on each iteration of the outer loop.
                         program.emit_insn(Insn::InitCoroutine {
@@ -908,10 +908,7 @@ pub fn open_loop(
                             end_offset: loop_end,
                         });
                     }
-                    _ => unreachable!(
-                        "{:?} scan cannot be used with {:?} table",
-                        scan, table.table
-                    ),
+                    _ => turso_assert_unreachable!("translate: incompatible scan and table type"),
                 }
                 if let Some(table_cursor_id) = table_cursor_id {
                     if let Some(index_cursor_id) = index_cursor_id {
@@ -1771,7 +1768,7 @@ pub fn close_loop(
                 if !matches!(search, Search::RowidEq { .. }) {
                     let iter_dir = match search {
                         Search::Seek { seek_def, .. } => seek_def.iter_dir,
-                        Search::RowidEq { .. } => unreachable!(),
+                        Search::RowidEq { .. } => turso_assert_unreachable!("translate: rowid eq in iteration direction"),
                     };
 
                     if iter_dir == IterationDirection::Backwards {
@@ -2019,7 +2016,7 @@ fn emit_seek(
                     });
                 }
             }
-            SeekKeyComponent::None => unreachable!("None component is not possible in iterator"),
+            SeekKeyComponent::None => turso_assert_unreachable!("translate: none component in iterator"),
         }
     }
     let num_regs = seek_def.size(&seek_def.start);
