@@ -1127,7 +1127,7 @@ impl Value {
                 Some(re) => Ok(re.is_match(text)),
                 None => {
                     let re = RegexBuilder::new(pattern).build().map_err(|e| {
-                        LimboError::Constraint(format!("Invalid REGEXP pattern: {}", e))
+                        LimboError::Constraint(format!("Invalid REGEXP pattern: {e}"))
                     })?;
 
                     let is_match = re.is_match(text);
@@ -1138,7 +1138,7 @@ impl Value {
         } else {
             let re = RegexBuilder::new(pattern)
                 .build()
-                .map_err(|e| LimboError::Constraint(format!("Invalid REGEXP pattern: {}", e)))?;
+                .map_err(|e| LimboError::Constraint(format!("Invalid REGEXP pattern: {e}")))?;
             Ok(re.is_match(text))
         }
     }
