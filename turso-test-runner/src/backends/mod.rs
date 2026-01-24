@@ -57,9 +57,11 @@ impl QueryResult {
         }
 
         // Find the marker row (single column containing the marker)
-        if let Some(marker_idx) = self.rows.iter().position(|row| {
-            row.len() == 1 && row[0] == SETUP_END_MARKER
-        }) {
+        if let Some(marker_idx) = self
+            .rows
+            .iter()
+            .position(|row| row.len() == 1 && row[0] == SETUP_END_MARKER)
+        {
             // Remove all rows up to and including the marker
             self.rows = self.rows.split_off(marker_idx + 1);
         }
@@ -136,8 +138,14 @@ pub enum BackendError {
 pub fn parse_list_output(output: &str) -> Vec<Vec<String>> {
     output
         .lines()
-        .filter(|line| !line.is_empty())
-        .map(|line| line.split('|').map(|s| s.to_string()).collect())
+        .map(|line| {
+            if line.is_empty() {
+                // Empty line represents a row with a single empty cell (NULL)
+                vec!["".to_string()]
+            } else {
+                line.split('|').map(|s| s.to_string()).collect()
+            }
+        })
         .collect()
 }
 

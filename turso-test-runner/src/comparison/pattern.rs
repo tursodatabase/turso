@@ -3,10 +3,7 @@ use regex::RegexBuilder;
 
 /// Compare error string against a regex pattern (case-insensitive)
 pub fn compare_error(actual: &str, pattern: &str) -> ComparisonResult {
-    match RegexBuilder::new(pattern)
-        .case_insensitive(true)
-        .build()
-    {
+    match RegexBuilder::new(pattern).case_insensitive(true).build() {
         Ok(re) => {
             if re.is_match(actual) {
                 ComparisonResult::Match

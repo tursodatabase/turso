@@ -10,9 +10,9 @@ use std::{
     time::Instant,
 };
 use turso_test_runner::{
-    DefaultDatabases, Format, OutputFormat, ParseError, RunnerConfig, TestRunner,
+    DefaultDatabases, Format, GeneratorConfig, OutputFormat, ParseError, RunnerConfig, TestRunner,
     backends::cli::CliBackend, backends::js::JsBackend, backends::rust::RustBackend, create_output,
-    load_test_files, summarize, tcl_converter,
+    generate_database, load_test_files, summarize, tcl_converter,
 };
 
 #[derive(Parser)]
@@ -93,6 +93,27 @@ enum Commands {
         #[arg(short, long)]
         verbose: bool,
     },
+
+    /// [DEBUG ONLY] Generate test databases and save them to a directory.
+    /// This is intended for debugging purposes only - to inspect the database
+    /// files that the test runner generates for tests using :default: databases.
+    GenerateDb {
+        /// Output directory to save the generated databases
+        #[arg(required = true)]
+        output_dir: PathBuf,
+
+        /// Number of users to generate (default: 10000)
+        #[arg(long, default_value_t = 10000)]
+        user_count: usize,
+
+        /// Seed for reproducible random generation (default: 42)
+        #[arg(long, default_value_t = 42)]
+        seed: u64,
+
+        /// Enable MVCC mode (experimental journal mode)
+        #[arg(long)]
+        mvcc: bool,
+    },
 }
 
 #[tokio::main]
@@ -124,6 +145,12 @@ async fn main() -> ExitCode {
             stdout,
             verbose,
         } => convert_files(paths, output_dir, stdout, verbose),
+        Commands::GenerateDb {
+            output_dir,
+            user_count,
+            seed,
+            mvcc,
+        } => generate_debug_databases(output_dir, user_count, seed, mvcc).await,
     }
 }
 
@@ -636,4 +663,110 @@ fn convert_single_file(
     }
 
     (test_count, warning_count)
+}
+
+/// Generate test databases for debugging purposes.
+///
+/// This command creates the same databases that the test runner generates
+/// for tests using `:default:` and `:default-no-rowidalias:` database locations,
+/// but saves them to a specified directory instead of a temporary location.
+///
+/// **DEBUG ONLY**: This is intended for inspecting generated databases during
+/// debugging, not for normal test execution.
+async fn generate_debug_databases(
+    output_dir: PathBuf,
+    user_count: usize,
+    seed: u64,
+    mvcc: bool,
+) -> ExitCode {
+    eprintln!(
+        "{}",
+        "WARNING: This command is for debugging only!"
+            .yellow()
+            .bold()
+    );
+    eprintln!();
+
+    // Create output directory if it doesn't exist
+    if !output_dir.exists() {
+        if let Err(e) = std::fs::create_dir_all(&output_dir) {
+            eprintln!(
+                "{}: Failed to create output directory {}: {}",
+                "Error".red().bold(),
+                output_dir.display(),
+                e
+            );
+            return ExitCode::from(1);
+        }
+    }
+
+    // Generate default database (INTEGER PRIMARY KEY - has rowid alias)
+    let default_db_path = output_dir.join("database.db");
+    eprintln!(
+        "Generating default database (INTEGER PRIMARY KEY) at {}...",
+        default_db_path.display()
+    );
+
+    let config = GeneratorConfig {
+        db_path: default_db_path.to_string_lossy().to_string(),
+        user_count,
+        seed,
+        no_rowid_alias: false,
+        mvcc,
+    };
+
+    if let Err(e) = generate_database(&config).await {
+        eprintln!(
+            "{}: Failed to generate default database: {}",
+            "Error".red().bold(),
+            e
+        );
+        return ExitCode::from(1);
+    }
+
+    eprintln!("  {} {}", "OK".green().bold(), default_db_path.display());
+
+    // Generate no-rowid-alias database (INT PRIMARY KEY - no rowid alias)
+    let no_rowid_db_path = output_dir.join("database-no-rowidalias.db");
+    eprintln!(
+        "Generating no-rowid-alias database (INT PRIMARY KEY) at {}...",
+        no_rowid_db_path.display()
+    );
+
+    let config = GeneratorConfig {
+        db_path: no_rowid_db_path.to_string_lossy().to_string(),
+        user_count,
+        seed,
+        no_rowid_alias: true,
+        mvcc,
+    };
+
+    if let Err(e) = generate_database(&config).await {
+        eprintln!(
+            "{}: Failed to generate no-rowid-alias database: {}",
+            "Error".red().bold(),
+            e
+        );
+        return ExitCode::from(1);
+    }
+
+    eprintln!("  {} {}", "OK".green().bold(), no_rowid_db_path.display());
+
+    // Print summary
+    eprintln!();
+    eprintln!(
+        "{}: Generated {} databases in {}",
+        "Done".green().bold(),
+        2,
+        output_dir.display()
+    );
+    eprintln!("  - database.db (INTEGER PRIMARY KEY, rowid alias enabled)");
+    eprintln!("  - database-no-rowidalias.db (INT PRIMARY KEY, no rowid alias)");
+    eprintln!();
+    eprintln!(
+        "Configuration: seed={}, user_count={}, mvcc={}",
+        seed, user_count, mvcc
+    );
+
+    ExitCode::SUCCESS
 }

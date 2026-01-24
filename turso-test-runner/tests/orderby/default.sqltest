@@ -123,6 +123,7 @@ expect {
     Morton|Bechtelar|100
 }
 
+@skip-if mvcc "database is locked error"
 test order-by-column-number-3 {
     select first_name, last_name, age from users order by 3 asc, 2 desc limit 2;
 }

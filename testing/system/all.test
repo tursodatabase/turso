@@ -3,22 +3,4 @@
 set testdir [file dirname $argv0]
 
 
-source $testdir/glob.test
-source $testdir/join.test
-source $testdir/insert.test
-source $testdir/json.test
-source $testdir/like.test
-source $testdir/math.test
-source $testdir/groupby.test
-source $testdir/pragma.test
-source $testdir/scalar-functions.test
-source $testdir/scalar-functions-datetime.test
-source $testdir/select.test
-source $testdir/where.test
-source $testdir/compare.test
-source $testdir/scalar-functions-printf.test
-source $testdir/integrity_check.test
 source $testdir/vtab.test
-source $testdir/window.test
-source $testdir/foreign_keys.test
-source $testdir/returning.test
