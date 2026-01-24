@@ -2209,7 +2209,7 @@ mod tests {
         let str_value = Value::build_text("limbo");
         let start_value = Value::Integer(3);
         let length_value = Value::Null;
-        let expected_val = Value::build_text("mbo");
+        let expected_val = Value::Null;
         assert_eq!(
             Value::exec_substring(&str_value, &start_value, Some(&length_value)),
             expected_val
@@ -2218,7 +2218,7 @@ mod tests {
         let str_value = Value::build_text("limbo");
         let start_value = Value::Integer(10);
         let length_value = Value::Null;
-        let expected_val = Value::build_text("");
+        let expected_val = Value::Null;
         assert_eq!(
             Value::exec_substring(&str_value, &start_value, Some(&length_value)),
             expected_val
