@@ -442,7 +442,8 @@ fn get_subquery_parser<'a>(
                 };
                 if lhs_column_count != plan.result_columns.len() {
                     crate::bail_parse_error!(
-                        "lhs of IN subquery must have the same number of columns as the subquery"
+                        "sub-select returns {} columns - expected {lhs_column_count}",
+                        plan.result_columns.len()
                     );
                 }
 

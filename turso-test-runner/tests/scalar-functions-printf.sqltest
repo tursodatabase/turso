@@ -443,3 +443,74 @@ expect {
     Octal 377 is hex ff
 }
 
+# Non-string format argument - should be converted to string
+test printf-format-integer {
+    SELECT printf(123);
+}
+expect {
+    123
+}
+
+test printf-format-integer-with-args {
+    SELECT printf(1, 'extra', 'args');
+}
+expect {
+    1
+}
+
+test printf-format-zero {
+    SELECT printf(0);
+}
+expect {
+    0
+}
+
+test printf-format-negative-integer {
+    SELECT printf(-42);
+}
+expect {
+    -42
+}
+
+test printf-format-float {
+    SELECT printf(3.14);
+}
+expect {
+    3.14
+}
+
+test printf-format-null {
+    SELECT printf(NULL) IS NULL;
+}
+expect {
+    1
+}
+
+test printf-format-null-with-args {
+    SELECT printf(NULL, 'a', 'b') IS NULL;
+}
+expect {
+    1
+}
+
+test printf-format-boolean-true {
+    SELECT printf(1 = 1);
+}
+expect {
+    1
+}
+
+test printf-format-boolean-false {
+    SELECT printf(1 = 0);
+}
+expect {
+    0
+}
+
+test printf-format-blob {
+    SELECT printf(X'414243');
+}
+expect {
+    ABC
+}
+

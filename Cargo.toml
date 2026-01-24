@@ -36,7 +36,9 @@ members = [
     "perf/throughput/rusqlite",
     "perf/encryption",
     "sdk-kit",
-    "sdk-kit-macros",
+    "sdk-kit-macros", 
+    "testing/differential-oracle/sql_gen_prop", 
+    "testing/differential-oracle/fuzzer",
 ]
 exclude = ["perf/latency/limbo", "turso-test-runner"]
 

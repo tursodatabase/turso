@@ -31,7 +31,7 @@ use crate::{
 use constraints::{
     constraints_from_where_clause, usable_constraints_for_join_order, Constraint, ConstraintRef,
 };
-use cost::{Cost, ESTIMATED_HARDCODED_ROWS_PER_TABLE};
+use cost::Cost;
 use join::{compute_best_join_order, BestJoinOrderResult};
 use lift_common_subexpressions::lift_common_subexpressions_from_binary_or_terms;
 use order::{compute_order_target, plan_satisfies_order_target, EliminatesSortBy};
@@ -55,6 +55,7 @@ use super::{
 pub(crate) mod access_method;
 pub(crate) mod constraints;
 pub(crate) mod cost;
+mod cost_params;
 pub(crate) mod join;
 pub(crate) mod lift_common_subexpressions;
 pub(crate) mod order;
@@ -333,6 +334,7 @@ fn collect_index_method_candidates(
     limit: &Option<Box<Expr>>,
     offset: &Option<Box<Expr>>,
     base_table_rows: &[RowCountEstimate],
+    params: &cost_params::CostModelParams,
 ) -> Result<Vec<IndexMethodCandidate>> {
     let mut candidates = Vec::new();
 
@@ -382,7 +384,7 @@ fn collect_index_method_candidates(
                     let base_rows = base_table_rows
                         .get(table_idx)
                         .map(|r| **r)
-                        .unwrap_or(ESTIMATED_HARDCODED_ROWS_PER_TABLE as f64);
+                        .unwrap_or(params.rows_per_table_fallback);
                     cursor.estimate_cost(pattern_match.pattern_idx, base_rows)
                 });
 
@@ -755,7 +757,8 @@ fn add_ephemeral_table_to_update_plan(
         distinctness: super::plan::Distinctness::NonDistinct,
         values: vec![],
         window: None,
-        non_from_clause_subqueries: vec![],
+        // Move subqueries from the main plan to the ephemeral plan since the WHERE clause was moved
+        non_from_clause_subqueries: plan.non_from_clause_subqueries.drain(..).collect(),
     };
 
     plan.ephemeral_plan = Some(ephemeral_plan);
@@ -940,7 +943,11 @@ fn register_expression_index_usages_for_plan(
 }
 
 /// Derive a base row-count estimate for a table, preferring ANALYZE stats.
-fn base_row_estimate(schema: &Schema, table: &JoinedTable) -> RowCountEstimate {
+fn base_row_estimate(
+    schema: &Schema,
+    table: &JoinedTable,
+    params: &cost_params::CostModelParams,
+) -> RowCountEstimate {
     match &table.table {
         Table::BTree(btree) => {
             if let Some(stats) = schema.analyze_stats.table_stats(&btree.name) {
@@ -953,9 +960,9 @@ fn base_row_estimate(schema: &Schema, table: &JoinedTable) -> RowCountEstimate {
                     return RowCountEstimate::AnalyzeStats(rows as f64);
                 }
             }
-            RowCountEstimate::HardcodedFallback(ESTIMATED_HARDCODED_ROWS_PER_TABLE as f64)
+            RowCountEstimate::hardcoded_fallback(params)
         }
-        _ => RowCountEstimate::HardcodedFallback(ESTIMATED_HARDCODED_ROWS_PER_TABLE as f64),
+        _ => RowCountEstimate::hardcoded_fallback(params),
     }
 }
 
@@ -983,6 +990,13 @@ fn optimize_table_access(
     limit: &mut Option<Box<Expr>>,
     offset: &mut Option<Box<Expr>>,
 ) -> Result<Option<Vec<JoinOrderMember>>> {
+    // When optimizer_params feature is enabled, use lazily-loaded params (cached process-wide).
+    // Otherwise, use the compile-time static for zero overhead.
+    #[cfg(feature = "optimizer_params")]
+    let params: &cost_params::CostModelParams = &cost_params::LOADED_PARAMS;
+    #[cfg(not(feature = "optimizer_params"))]
+    let params: &cost_params::CostModelParams = &cost_params::DEFAULT_PARAMS;
+
     if table_references.joined_tables().is_empty() {
         return Ok(None);
     }
@@ -1034,7 +1048,7 @@ fn optimize_table_access(
     let base_table_rows_for_candidates = table_references
         .joined_tables()
         .iter()
-        .map(|t| base_row_estimate(schema, t))
+        .map(|t| base_row_estimate(schema, t, params))
         .collect::<Vec<_>>();
 
     let index_method_candidates = if !is_single_table {
@@ -1047,6 +1061,7 @@ fn optimize_table_access(
             limit,
             offset,
             &base_table_rows_for_candidates,
+            params,
         )?
     } else {
         Vec::new()
@@ -1058,12 +1073,13 @@ fn optimize_table_access(
         available_indexes,
         subqueries,
         schema,
+        params,
     )?;
 
     let base_table_rows = table_references
         .joined_tables()
         .iter()
-        .map(|t| base_row_estimate(schema, t))
+        .map(|t| base_row_estimate(schema, t, params))
         .collect::<Vec<_>>();
 
     // Currently the expressions we evaluate as constraints are binary expressions that will never be true for a NULL operand.
@@ -1114,6 +1130,7 @@ fn optimize_table_access(
         where_clause,
         subqueries,
         &index_method_candidates,
+        params,
     )?
     else {
         return Ok(None);

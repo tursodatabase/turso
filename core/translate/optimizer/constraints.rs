@@ -20,7 +20,7 @@ use std::{
 use turso_ext::{ConstraintInfo, ConstraintOp};
 use turso_parser::ast::{self, SortOrder, TableInternalId};
 
-use super::cost::ESTIMATED_HARDCODED_ROWS_PER_TABLE;
+use super::cost_params::CostModelParams;
 
 /// Represents a single condition derived from a `WHERE` clause term
 /// that constrains a specific column of a table.
@@ -207,26 +207,6 @@ pub struct TableConstraints {
     pub candidates: Vec<ConstraintUseCandidate>,
 }
 
-/// In lieu of statistics, we estimate that an equality filter on an unindexed column will reduce the output set to 10% of its size.
-const SELECTIVITY_EQ_FALLBACK_UNINDEXED: f64 = 0.1;
-/// In lieu of statistics, we estimate that an equality filter on an indexed column will reduce the output set to 1% of its size (users are likely to create indexes on columns that are very selective).
-const SELECTIVITY_EQ_FALLBACK_INDEXED: f64 = 0.01;
-/// In lieu of statistics, we estimate that a range filter will reduce the output set to 40% of its size.
-const SELECTIVITY_RANGE_FALLBACK: f64 = 0.4;
-/// IS NULL - null values are typically rare.
-const SELECTIVITY_IS_NULL: f64 = 0.1;
-/// IS NOT NULL - most values are typically not null.
-const SELECTIVITY_IS_NOT_NULL: f64 = 0.9;
-/// In lieu of statistics, we estimate that other filters will reduce the output set to 90% of its size.
-const SELECTIVITY_OTHER: f64 = 0.9;
-/// In lieu of statistics, we estimate that a LIKE filter will reduce the output set to 20% of its size.
-const SELECTIVITY_LIKE: f64 = 0.2;
-/// In lieu of statistics, we estimate that a NOT LIKE filter will reduce the output set to 20% of its size.
-const SELECTIVITY_NOT_LIKE: f64 = 0.2;
-/// SQLite estimates IN subqueries return 25 rows (where.c line 3230).
-/// Used when we don't have the actual list length.
-const ESTIMATED_IN_SUBQUERY_ROWS: f64 = 25.0;
-
 /// Estimate selectivity for IN expressions given the number of values and table row count.
 fn estimate_in_selectivity(in_list_len: f64, row_count: f64, not: bool) -> f64 {
     let selectivity = (in_list_len / row_count).min(1.0);
@@ -254,6 +234,7 @@ fn estimate_selectivity(
     column_pos: Option<usize>,
     available_indexes: &BTreeMap<String, VecDeque<Arc<Index>>>,
     op: ConstraintOperator,
+    params: &CostModelParams,
 ) -> f64 {
     // Get ANALYZE stats for this table if available
     let table_stats = schema.analyze_stats.table_stats(table_name);
@@ -268,7 +249,7 @@ fn estimate_selectivity(
                 1.0 / row_count as f64
             } else {
                 // Fallback: use hardcoded estimate based on expected table size
-                1.0 / ESTIMATED_HARDCODED_ROWS_PER_TABLE as f64
+                1.0 / params.rows_per_table_fallback
             };
 
             if is_pk_or_rowid_alias {
@@ -291,10 +272,9 @@ fn estimate_selectivity(
                                 }
                                 if let Some(stats) = table_stats {
                                     if let Some(idx_stat) = stats.index_stats.get(&index.name) {
-                                        // distinct_per_prefix[0] = avg rows per distinct value for first column
                                         if let (Some(total), Some(&avg_rows)) = (
                                             idx_stat.total_rows,
-                                            idx_stat.distinct_per_prefix.first(),
+                                            idx_stat.avg_rows_per_distinct_prefix.first(),
                                         ) {
                                             if total > 0 && avg_rows > 0 {
                                                 // selectivity = avg_rows_per_key / total_rows
@@ -303,7 +283,7 @@ fn estimate_selectivity(
                                         }
                                     }
                                 } else {
-                                    return SELECTIVITY_EQ_FALLBACK_INDEXED;
+                                    return params.sel_eq_indexed;
                                 }
                             }
                         }
@@ -311,26 +291,24 @@ fn estimate_selectivity(
                 }
                 // Fallback: use hardcoded selectivity for non-indexed columns
                 // Don't scale by row_count - keep it distinct from PK selectivity
-                SELECTIVITY_EQ_FALLBACK_UNINDEXED
+                params.sel_eq_unindexed
             } else {
-                SELECTIVITY_EQ_FALLBACK_UNINDEXED
+                params.sel_eq_unindexed
             }
         }
         ConstraintOperator::AstNativeOperator(ast::Operator::Greater)
         | ConstraintOperator::AstNativeOperator(ast::Operator::GreaterEquals)
         | ConstraintOperator::AstNativeOperator(ast::Operator::Less)
-        | ConstraintOperator::AstNativeOperator(ast::Operator::LessEquals) => {
-            SELECTIVITY_RANGE_FALLBACK
-        }
-        ConstraintOperator::AstNativeOperator(ast::Operator::Is) => SELECTIVITY_IS_NULL,
-        ConstraintOperator::AstNativeOperator(ast::Operator::IsNot) => SELECTIVITY_IS_NOT_NULL,
-        ConstraintOperator::Like { not: false } => SELECTIVITY_LIKE,
-        ConstraintOperator::Like { not: true } => SELECTIVITY_NOT_LIKE,
+        | ConstraintOperator::AstNativeOperator(ast::Operator::LessEquals) => params.sel_range,
+        ConstraintOperator::AstNativeOperator(ast::Operator::Is) => params.sel_is_null,
+        ConstraintOperator::AstNativeOperator(ast::Operator::IsNot) => params.sel_is_not_null,
+        ConstraintOperator::Like { not: false } => params.sel_like,
+        ConstraintOperator::Like { not: true } => params.sel_not_like,
         ConstraintOperator::In {
             not,
             estimated_values,
         } => estimate_in_selectivity(estimated_values, row_count as f64, not),
-        _ => SELECTIVITY_OTHER,
+        _ => params.sel_other,
     }
 }
 
@@ -375,12 +353,13 @@ fn estimate_column_ndv(
     column_pos: Option<usize>,
     is_rowid_expr: bool,
     available_indexes: &BTreeMap<String, VecDeque<Arc<Index>>>,
+    params: &CostModelParams,
 ) -> Option<f64> {
     let table_name = table_reference.table.get_name();
     let table_stats = schema.analyze_stats.table_stats(table_name);
     let row_count = table_stats
         .and_then(|s| s.row_count)
-        .unwrap_or(ESTIMATED_HARDCODED_ROWS_PER_TABLE as u64) as f64;
+        .unwrap_or(params.rows_per_table_fallback as u64) as f64;
 
     if is_rowid_expr {
         return Some(row_count.max(1.0));
@@ -403,9 +382,10 @@ fn estimate_column_ndv(
                 }
                 if let Some(stats) = table_stats {
                     if let Some(idx_stat) = stats.index_stats.get(&index.name) {
-                        if let (Some(total), Some(&avg_rows)) =
-                            (idx_stat.total_rows, idx_stat.distinct_per_prefix.first())
-                        {
+                        if let (Some(total), Some(&avg_rows)) = (
+                            idx_stat.total_rows,
+                            idx_stat.avg_rows_per_distinct_prefix.first(),
+                        ) {
                             if total > 0 && avg_rows > 0 {
                                 let ndv = total as f64 / avg_rows as f64;
                                 if ndv > 0.0 {
@@ -426,9 +406,9 @@ fn estimate_column_ndv(
             .any(|index| index.column_table_pos_to_index_pos(column_pos).is_some())
     });
     let fallback_selectivity = if has_index {
-        SELECTIVITY_EQ_FALLBACK_INDEXED
+        params.sel_eq_indexed
     } else {
-        SELECTIVITY_EQ_FALLBACK_UNINDEXED
+        params.sel_eq_unindexed
     };
     let mut ndv = (1.0 / fallback_selectivity).max(1.0);
     if row_count > 0.0 {
@@ -444,6 +424,7 @@ fn estimate_join_eq_selectivity(
     other_ref: SimpleColumnRef,
     available_indexes: &BTreeMap<String, VecDeque<Arc<Index>>>,
     table_references: &TableReferences,
+    params: &CostModelParams,
 ) -> Option<f64> {
     column_pos?;
     let other_table = table_references.joined_tables().iter().find(|t| {
@@ -464,6 +445,7 @@ fn estimate_join_eq_selectivity(
         column_pos,
         false,
         available_indexes,
+        params,
     );
     let right_ndv = estimate_column_ndv(
         schema,
@@ -471,6 +453,7 @@ fn estimate_join_eq_selectivity(
         other_col_pos,
         other_is_rowid,
         available_indexes,
+        params,
     );
 
     let left_stats = schema
@@ -479,8 +462,8 @@ fn estimate_join_eq_selectivity(
     let right_stats = schema
         .analyze_stats
         .table_stats(other_table.table.get_name());
-    let left_ndv = join_ndv_with_fallback(left_stats, left_ndv);
-    let right_ndv = join_ndv_with_fallback(right_stats, right_ndv);
+    let left_ndv = join_ndv_with_fallback(left_stats, left_ndv, params);
+    let right_ndv = join_ndv_with_fallback(right_stats, right_ndv, params);
 
     let max_ndv = match (left_ndv, right_ndv) {
         (Some(left), Some(right)) => left.max(right),
@@ -503,6 +486,7 @@ fn estimate_generic_eq_join_selectivity(
     schema: &Schema,
     left_table: &JoinedTable,
     right_table: &JoinedTable,
+    params: &CostModelParams,
 ) -> Option<f64> {
     let left_stats = schema
         .analyze_stats
@@ -510,8 +494,8 @@ fn estimate_generic_eq_join_selectivity(
     let right_stats = schema
         .analyze_stats
         .table_stats(right_table.table.get_name());
-    let left_ndv = join_ndv_with_fallback(left_stats, None).unwrap_or(0.0);
-    let right_ndv = join_ndv_with_fallback(right_stats, None).unwrap_or(0.0);
+    let left_ndv = join_ndv_with_fallback(left_stats, None, params).unwrap_or(0.0);
+    let right_ndv = join_ndv_with_fallback(right_stats, None, params).unwrap_or(0.0);
 
     let max_ndv = left_ndv.max(right_ndv);
     if max_ndv <= 0.0 {
@@ -524,10 +508,14 @@ fn estimate_generic_eq_join_selectivity(
 ///
 /// If ANALYZE stats are missing, we fall back to sqrt(row_count). When we already
 /// have a column NDV, we clamp it to at least the fallback to avoid underestimates.
-fn join_ndv_with_fallback(stats: Option<&TableStat>, column_ndv: Option<f64>) -> Option<f64> {
+fn join_ndv_with_fallback(
+    stats: Option<&TableStat>,
+    column_ndv: Option<f64>,
+    params: &CostModelParams,
+) -> Option<f64> {
     let row_count = stats
         .and_then(|s| s.row_count)
-        .unwrap_or(ESTIMATED_HARDCODED_ROWS_PER_TABLE as u64) as f64;
+        .unwrap_or(params.rows_per_table_fallback as u64) as f64;
     let has_stats = stats.is_some() && stats.and_then(|s| s.row_count).is_some();
     let fallback_ndv = row_count.sqrt().max(1.0);
     if has_stats {
@@ -560,6 +548,7 @@ fn estimate_constraint_selectivity(
     available_indexes: &BTreeMap<String, VecDeque<Arc<Index>>>,
     table_references: &TableReferences,
     subqueries: &[NonFromClauseSubquery],
+    params: &CostModelParams,
 ) -> f64 {
     // Special-case: equality to another table's column is likely an equi-join.
     if operator.as_ast_operator() == Some(ast::Operator::Equals) {
@@ -577,6 +566,7 @@ fn estimate_constraint_selectivity(
                     other_ref,
                     available_indexes,
                     table_references,
+                    params,
                 ) {
                     return selectivity;
                 }
@@ -591,6 +581,7 @@ fn estimate_constraint_selectivity(
                             schema,
                             table_reference,
                             other_table,
+                            params,
                         ) {
                             return selectivity;
                         }
@@ -608,6 +599,7 @@ fn estimate_constraint_selectivity(
         column_pos,
         available_indexes,
         operator,
+        params,
     )
 }
 
@@ -638,6 +630,7 @@ pub fn constraints_from_where_clause(
     available_indexes: &BTreeMap<String, VecDeque<Arc<Index>>>,
     subqueries: &[NonFromClauseSubquery],
     schema: &Schema,
+    params: &CostModelParams,
 ) -> Result<Vec<TableConstraints>> {
     let mut constraints = Vec::new();
 
@@ -704,6 +697,7 @@ pub fn constraints_from_where_clause(
                                     available_indexes,
                                     table_references,
                                     subqueries,
+                                    params,
                                 ),
                                 usable: true,
                             });
@@ -732,6 +726,7 @@ pub fn constraints_from_where_clause(
                                     available_indexes,
                                     table_references,
                                     subqueries,
+                                    params,
                                 ),
                                 usable: true,
                             });
@@ -754,6 +749,7 @@ pub fn constraints_from_where_clause(
                             available_indexes,
                             table_references,
                             subqueries,
+                            params,
                         );
                         tracing::debug!(
                             table = table_reference.table.get_name(),
@@ -795,6 +791,7 @@ pub fn constraints_from_where_clause(
                                     available_indexes,
                                     table_references,
                                     subqueries,
+                                    params,
                                 ),
                                 usable: true,
                             });
@@ -820,6 +817,7 @@ pub fn constraints_from_where_clause(
                                     available_indexes,
                                     table_references,
                                     subqueries,
+                                    params,
                                 ),
                                 usable: true,
                             });
@@ -842,6 +840,7 @@ pub fn constraints_from_where_clause(
                             available_indexes,
                             table_references,
                             subqueries,
+                            params,
                         );
                         tracing::debug!(
                             table = table_reference.table.get_name(),
@@ -878,7 +877,7 @@ pub fn constraints_from_where_clause(
                     .table_stats(table_reference.table.get_name());
                 let row_count = table_stats
                     .and_then(|s| s.row_count)
-                    .unwrap_or(ESTIMATED_HARDCODED_ROWS_PER_TABLE as u64)
+                    .unwrap_or(params.rows_per_table_fallback as u64)
                     as f64;
                 let selectivity = estimate_in_selectivity(estimated_values, row_count, *not);
 
@@ -935,13 +934,13 @@ pub fn constraints_from_where_clause(
                     .expect("subquery not found");
                 // Only use as constraint if NOT correlated
                 if !subquery.correlated {
-                    let estimated_values = ESTIMATED_IN_SUBQUERY_ROWS;
+                    let estimated_values = params.in_subquery_rows;
                     let table_stats = schema
                         .analyze_stats
                         .table_stats(table_reference.table.get_name());
                     let row_count = table_stats
                         .and_then(|s| s.row_count)
-                        .unwrap_or(ESTIMATED_HARDCODED_ROWS_PER_TABLE as u64)
+                        .unwrap_or(params.rows_per_table_fallback as u64)
                         as f64;
                     let selectivity = estimate_in_selectivity(estimated_values, row_count, *not_in);
 

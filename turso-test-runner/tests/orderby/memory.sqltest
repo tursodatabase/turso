@@ -85,3 +85,48 @@ expect {
     2
 }
 
+# Single-row aggregate queries (aggregates without GROUP BY) produce exactly one row,
+# so sqlite removes ORDER BY entirely because it's meaningless - this also means validation
+# of the ORDER BY is skipped. In these examples, the ORDER BY contains an invalid subquery
+# where the column counts don't match: a IN (SELECT a, b, c FROM t). This would normally fail
+# validation but doesn't since the ORDER BY is removed.
+test orderby_single_row_aggregate_optimization {
+    CREATE TABLE t(a, b, c);
+    SELECT COUNT(a) FROM t ORDER BY COALESCE(a IN (SELECT a, b, c FROM t), b);
+}
+expect {
+    0
+}
+
+test orderby_single_row_aggregate_with_data {
+    CREATE TABLE t(a, b, c);
+    INSERT INTO t VALUES (1, 2, 3), (4, 5, 6);
+    SELECT COUNT(a) FROM t ORDER BY COALESCE(a IN (SELECT a, b, c FROM t), b);
+}
+expect {
+    2
+}
+
+# SQLite truncates ORDER BY after a rowid/INTEGER PRIMARY KEY column since the table is
+# stored in rowid order and a unique column means no ties. This skips validation of
+# subsequent clauses, so even invalid constructs like multi-column IN subqueries pass.
+test orderby_rowid_truncation {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT);
+    INSERT INTO t VALUES (1, 'x'), (2, 'y');
+    SELECT a FROM t ORDER BY a DESC, b NOT IN (SELECT a, b FROM t);
+}
+expect {
+    2
+    1
+}
+
+test orderby_rowid_truncation_explicit_rowid {
+    CREATE TABLE t(a INTEGER, b TEXT);
+    INSERT INTO t VALUES (1, 'x'), (2, 'y');
+    SELECT a FROM t ORDER BY rowid DESC, b NOT IN (SELECT a, b FROM t);
+}
+expect {
+    2
+    1
+}
+
