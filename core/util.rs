@@ -15,7 +15,7 @@ use crate::{
 };
 use either::Either;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashSet},
     sync::Arc,
 };
 use tracing::{instrument, Level};
@@ -127,7 +127,7 @@ pub fn parse_schema_rows(
     schema: &mut Schema,
     syms: &SymbolTable,
     mv_tx: Option<(u64, TransactionMode)>,
-    _existing_views: HashMap<String, Arc<Mutex<IncrementalView>>>,
+    _existing_views: BTreeMap<String, Arc<Mutex<IncrementalView>>>,
     enable_triggers: bool,
 ) -> Result<()> {
     rows.set_mv_tx(mv_tx);
@@ -135,17 +135,17 @@ pub fn parse_schema_rows(
     // TODO: if we IO, this unparsed indexes is lost. Will probably need some state between
     // IO runs
     let mut from_sql_indexes = Vec::with_capacity(10);
-    let mut automatic_indices = std::collections::HashMap::with_capacity(10);
+    let mut automatic_indices = std::collections::BTreeMap::new();
 
     // Store DBSP state table root pages: view_name -> dbsp_state_root_page
-    let mut dbsp_state_roots: std::collections::HashMap<String, i64> =
-        std::collections::HashMap::new();
+    let mut dbsp_state_roots: std::collections::BTreeMap<String, i64> =
+        std::collections::BTreeMap::new();
     // Store DBSP state table index root pages: view_name -> dbsp_state_index_root_page
-    let mut dbsp_state_index_roots: std::collections::HashMap<String, i64> =
-        std::collections::HashMap::new();
+    let mut dbsp_state_index_roots: std::collections::BTreeMap<String, i64> =
+        std::collections::BTreeMap::new();
     // Store materialized view info (SQL and root page) for later creation
-    let mut materialized_view_info: std::collections::HashMap<String, (String, i64)> =
-        std::collections::HashMap::new();
+    let mut materialized_view_info: std::collections::BTreeMap<String, (String, i64)> =
+        std::collections::BTreeMap::new();
 
     // TODO: How do we ensure that the I/O we submitted to
     // read the schema is actually complete?
@@ -382,7 +382,7 @@ pub fn simple_bind_expr(
 
 pub fn try_substitute_parameters(
     pattern: &Expr,
-    parameters: &HashMap<i32, Expr>,
+    parameters: &BTreeMap<i32, Expr>,
 ) -> Option<Box<Expr>> {
     match pattern {
         Expr::FunctionCall {
@@ -414,8 +414,8 @@ pub fn try_substitute_parameters(
     }
 }
 
-pub fn try_capture_parameters(pattern: &Expr, query: &Expr) -> Option<HashMap<i32, Expr>> {
-    let mut captured = HashMap::new();
+pub fn try_capture_parameters(pattern: &Expr, query: &Expr) -> Option<BTreeMap<i32, Expr>> {
+    let mut captured = BTreeMap::new();
     match (pattern, query) {
         (
             Expr::FunctionCall {
@@ -509,7 +509,7 @@ pub fn try_capture_parameters_column_agnostic(
     pattern: &Expr,         // pattern expression from index definition
     query: &Expr,           // the actual query expression
     num_column_args: usize, // number of leading column arguments
-) -> Option<HashMap<i32, Expr>> {
+) -> Option<BTreeMap<i32, Expr>> {
     // If not a function call or no column args, fall back to standard matching
     if num_column_args == 0 {
         return try_capture_parameters(pattern, query);
@@ -563,7 +563,7 @@ pub fn try_capture_parameters_column_agnostic(
         return None;
     }
 
-    let mut captured = HashMap::new();
+    let mut captured = BTreeMap::new();
 
     // Split args into column args (reorderable) and remaining args (positional)
     let pattern_col_args = &pattern_args[..num_column_args];
@@ -1368,7 +1368,7 @@ pub fn extract_view_columns(
 ) -> Result<ViewColumnSchema> {
     let mut tables = Vec::new();
     let mut columns = Vec::new();
-    let mut column_name_counts: HashMap<String, usize> = HashMap::new();
+    let mut column_name_counts: BTreeMap<String, usize> = BTreeMap::new();
 
     // Navigate to the first SELECT in the statement
     if let ast::OneSelect::Select {

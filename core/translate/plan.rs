@@ -1,4 +1,4 @@
-use std::{cmp::Ordering, collections::HashMap, marker::PhantomData, sync::Arc};
+use std::{cmp::Ordering, collections::BTreeMap, marker::PhantomData, sync::Arc};
 use turso_parser::ast::{
     self, FrameBound, FrameClause, FrameExclude, FrameMode, ResolveType, SortOrder, SubqueryType,
 };
@@ -1799,7 +1799,7 @@ pub struct IndexMethodQuery {
     /// captured arguments for the pattern chosen by the planner
     pub arguments: Vec<Expr>,
     /// mapping from index of [ast::Expr::Column] to the column index of IndexMethod response
-    pub covered_columns: HashMap<usize, usize>,
+    pub covered_columns: BTreeMap<usize, usize>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

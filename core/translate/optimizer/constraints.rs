@@ -14,7 +14,7 @@ use crate::{
 };
 use std::{
     cmp::Ordering,
-    collections::{HashMap, VecDeque},
+    collections::{BTreeMap, VecDeque},
     sync::Arc,
 };
 use turso_ext::{ConstraintInfo, ConstraintOp};
@@ -252,7 +252,7 @@ fn estimate_selectivity(
     table_name: &str,
     column: Option<&Column>,
     column_pos: Option<usize>,
-    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    available_indexes: &BTreeMap<String, VecDeque<Arc<Index>>>,
     op: ConstraintOperator,
 ) -> f64 {
     // Get ANALYZE stats for this table if available
@@ -374,7 +374,7 @@ fn estimate_column_ndv(
     table_reference: &JoinedTable,
     column_pos: Option<usize>,
     is_rowid_expr: bool,
-    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    available_indexes: &BTreeMap<String, VecDeque<Arc<Index>>>,
 ) -> Option<f64> {
     let table_name = table_reference.table.get_name();
     let table_stats = schema.analyze_stats.table_stats(table_name);
@@ -442,7 +442,7 @@ fn estimate_join_eq_selectivity(
     table_reference: &JoinedTable,
     column_pos: Option<usize>,
     other_ref: SimpleColumnRef,
-    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    available_indexes: &BTreeMap<String, VecDeque<Arc<Index>>>,
     table_references: &TableReferences,
 ) -> Option<f64> {
     column_pos?;
@@ -557,7 +557,7 @@ fn estimate_constraint_selectivity(
     column_pos: Option<usize>,
     operator: ConstraintOperator,
     constraining_expr: &ast::Expr,
-    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    available_indexes: &BTreeMap<String, VecDeque<Arc<Index>>>,
     table_references: &TableReferences,
     subqueries: &[NonFromClauseSubquery],
 ) -> f64 {
@@ -635,7 +635,7 @@ fn expression_matches_table(
 pub fn constraints_from_where_clause(
     where_clause: &[WhereTerm],
     table_references: &TableReferences,
-    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    available_indexes: &BTreeMap<String, VecDeque<Arc<Index>>>,
     subqueries: &[NonFromClauseSubquery],
     schema: &Schema,
 ) -> Result<Vec<TableConstraints>> {

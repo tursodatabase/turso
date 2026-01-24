@@ -37,7 +37,7 @@ use lift_common_subexpressions::lift_common_subexpressions_from_binary_or_terms;
 use order::{compute_order_target, plan_satisfies_order_target, EliminatesSortBy};
 use std::{
     cmp::Ordering,
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, HashSet, VecDeque},
     sync::Arc,
 };
 use turso_ext::{ConstraintInfo, ConstraintUsage};
@@ -74,7 +74,7 @@ pub struct IndexMethodCandidate {
     /// Arguments captured from pattern matching
     pub arguments: Vec<ast::Expr>,
     /// Mapping from synthetic column IDs to pattern column IDs for covered columns
-    pub covered_columns: HashMap<usize, usize>,
+    pub covered_columns: BTreeMap<usize, usize>,
     /// Index in WHERE clause that was covered by this pattern (if any)
     pub where_covered: Option<usize>,
     /// Cost estimate from the index method
@@ -101,7 +101,7 @@ struct IndexMethodPatternMatch {
     /// Pattern index from the index method definition that matched
     pattern_idx: usize,
     /// Parameters captured from pattern matching (positional placeholders)
-    parameters: HashMap<i32, ast::Expr>,
+    parameters: BTreeMap<i32, ast::Expr>,
     /// Index in WHERE clause that was covered by this pattern (if any)
     where_covered: Option<usize>,
     /// Whether the pattern explicitly handles ORDER BY
@@ -199,7 +199,7 @@ fn try_match_index_method_pattern(
     }
 
     let mut where_query_covered: Option<usize> = None;
-    let mut parameters = HashMap::new();
+    let mut parameters = BTreeMap::new();
 
     // Match ORDER BY if pattern has it
     if pattern_has_order_by {
@@ -293,13 +293,13 @@ fn try_match_index_method_pattern(
 }
 
 /// Build covered columns mapping from pattern columns.
-/// Returns a HashMap mapping synthetic column IDs to pattern column IDs.
+/// Returns a BTreeMap mapping synthetic column IDs to pattern column IDs.
 fn build_covered_columns_mapping(
     pattern_columns: &[ast::ResultColumn],
-    parameters: &HashMap<i32, ast::Expr>,
-) -> HashMap<usize, usize> {
+    parameters: &BTreeMap<i32, ast::Expr>,
+) -> BTreeMap<usize, usize> {
     let mut covered_column_id = 1_000_000;
-    let mut covered_columns = HashMap::new();
+    let mut covered_columns = BTreeMap::new();
     for (pattern_column_id, pattern_column) in pattern_columns.iter().enumerate() {
         let ast::ResultColumn::Expr(pattern_expr, _) = pattern_column else {
             continue;
@@ -314,7 +314,7 @@ fn build_covered_columns_mapping(
 }
 
 /// Sort parameters by key and extract just the expressions as a Vec.
-fn sorted_arguments_from_parameters(parameters: &HashMap<i32, ast::Expr>) -> Vec<ast::Expr> {
+fn sorted_arguments_from_parameters(parameters: &BTreeMap<i32, ast::Expr>) -> Vec<ast::Expr> {
     let mut arguments: Vec<_> = parameters.iter().collect();
     arguments.sort_by_key(|(&i, _)| i);
     arguments.iter().map(|(_, e)| (*e).clone()).collect()
@@ -326,7 +326,7 @@ fn sorted_arguments_from_parameters(parameters: &HashMap<i32, ast::Expr>) -> Vec
 #[allow(clippy::too_many_arguments)]
 fn collect_index_method_candidates(
     table_references: &TableReferences,
-    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    available_indexes: &BTreeMap<String, VecDeque<Arc<Index>>>,
     where_clause: &[WhereTerm],
     order_by: &[(Box<ast::Expr>, SortOrder)],
     group_by: &Option<GroupBy>,
@@ -794,7 +794,7 @@ fn optimize_subqueries(plan: &mut SelectPlan, schema: &Schema) -> Result<()> {
 fn optimize_table_access_with_custom_modules(
     result_columns: &mut [ResultSetColumn],
     table_references: &mut TableReferences,
-    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    available_indexes: &BTreeMap<String, VecDeque<Arc<Index>>>,
     where_query: &mut [WhereTerm],
     order_by: &mut Vec<(Box<ast::Expr>, SortOrder)>,
     group_by: &mut Option<GroupBy>,
@@ -848,7 +848,7 @@ fn optimize_table_access_with_custom_modules(
             // This differs from collect_index_method_candidates: we modify result_columns
             // and increment covered_column_id per matching query column, not per pattern column.
             let mut covered_column_id = 1_000_000;
-            let mut covered_columns = HashMap::new();
+            let mut covered_columns = BTreeMap::new();
             for (pattern_column_id, pattern_column) in
                 pattern_match.pattern_columns.iter().enumerate()
             {
@@ -975,7 +975,7 @@ fn optimize_table_access(
     schema: &Schema,
     result_columns: &mut [ResultSetColumn],
     table_references: &mut TableReferences,
-    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    available_indexes: &BTreeMap<String, VecDeque<Arc<Index>>>,
     where_clause: &mut [WhereTerm],
     order_by: &mut Vec<(Box<ast::Expr>, SortOrder)>,
     group_by: &mut Option<GroupBy>,
@@ -1198,7 +1198,7 @@ fn optimize_table_access(
     #[cfg(debug_assertions)]
     {
         let mut probe_tables: HashSet<usize> = HashSet::new();
-        let mut build_tables: HashMap<usize, bool> = HashMap::new();
+        let mut build_tables: BTreeMap<usize, bool> = BTreeMap::new();
         let mut pos_by_table: Vec<Option<usize>> =
             vec![None; table_references.joined_tables().len()];
         for (pos, table_idx) in best_table_numbers.iter().enumerate() {

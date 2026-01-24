@@ -77,7 +77,7 @@ impl Clone for View {
 }
 
 /// Type alias for regular views collection
-pub type ViewsMap = HashMap<String, Arc<View>>;
+pub type ViewsMap = BTreeMap<String, Arc<View>>;
 
 /// Trigger structure
 #[derive(Debug, Clone)]
@@ -134,7 +134,7 @@ use crate::{
     Connection, LimboError, MvCursor, MvStore, Pager, SymbolTable, ValueRef, VirtualTable,
 };
 use core::fmt;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::ops::Deref;
 use tracing::trace;
 use turso_parser::ast::{
@@ -184,29 +184,29 @@ pub enum SchemaObjectType {
 
 #[derive(Debug)]
 pub struct Schema {
-    pub tables: HashMap<String, Arc<Table>>,
+    pub tables: BTreeMap<String, Arc<Table>>,
 
     /// Track which tables are actually materialized views
     pub materialized_view_names: HashSet<String>,
     /// Store original SQL for materialized views (for .schema command)
-    pub materialized_view_sql: HashMap<String, String>,
+    pub materialized_view_sql: BTreeMap<String, String>,
     /// The incremental view objects (DBSP circuits)
-    pub incremental_views: HashMap<String, Arc<Mutex<IncrementalView>>>,
+    pub incremental_views: BTreeMap<String, Arc<Mutex<IncrementalView>>>,
 
     pub views: ViewsMap,
 
     /// table_name to list of triggers
-    pub triggers: HashMap<String, VecDeque<Arc<Trigger>>>,
+    pub triggers: BTreeMap<String, VecDeque<Arc<Trigger>>>,
 
     /// table_name to list of indexes for the table
-    pub indexes: HashMap<String, VecDeque<Arc<Index>>>,
+    pub indexes: BTreeMap<String, VecDeque<Arc<Index>>>,
     pub has_indexes: std::collections::HashSet<String>,
     pub schema_version: u32,
     /// Statistics collected via ANALYZE for regular B-tree tables and indexes.
     pub analyze_stats: AnalyzeStats,
 
     /// Mapping from table names to the materialized views that depend on them
-    pub table_to_materialized_views: HashMap<String, Vec<String>>,
+    pub table_to_materialized_views: BTreeMap<String, Vec<String>>,
 
     /// Track views that exist but have incompatible versions
     pub incompatible_views: HashSet<String>,
@@ -220,9 +220,9 @@ impl Default for Schema {
 
 impl Schema {
     pub fn new() -> Self {
-        let mut tables: HashMap<String, Arc<Table>> = HashMap::new();
+        let mut tables: BTreeMap<String, Arc<Table>> = BTreeMap::new();
         let has_indexes = std::collections::HashSet::new();
-        let indexes: HashMap<String, VecDeque<Arc<Index>>> = HashMap::new();
+        let indexes: BTreeMap<String, VecDeque<Arc<Index>>> = BTreeMap::new();
         #[allow(clippy::arc_with_non_send_sync)]
         tables.insert(
             SCHEMA_TABLE_NAME.to_string(),
@@ -235,11 +235,11 @@ impl Schema {
             );
         }
         let materialized_view_names = HashSet::new();
-        let materialized_view_sql = HashMap::new();
-        let incremental_views = HashMap::new();
-        let views: ViewsMap = HashMap::new();
-        let triggers = HashMap::new();
-        let table_to_materialized_views: HashMap<String, Vec<String>> = HashMap::new();
+        let materialized_view_sql = BTreeMap::new();
+        let incremental_views = BTreeMap::new();
+        let views: ViewsMap = BTreeMap::new();
+        let triggers = BTreeMap::new();
+        let table_to_materialized_views: BTreeMap<String, Vec<String>> = BTreeMap::new();
         let incompatible_views = HashSet::new();
         Self {
             tables,
@@ -573,14 +573,14 @@ impl Schema {
         let mut cursor = BTreeCursor::new_table(Arc::clone(&pager), 1, 10);
 
         let mut from_sql_indexes = Vec::with_capacity(10);
-        let mut automatic_indices: HashMap<String, Vec<(String, i64)>> = HashMap::with_capacity(10);
+        let mut automatic_indices: BTreeMap<String, Vec<(String, i64)>> = BTreeMap::new();
 
         // Store DBSP state table root pages: view_name -> dbsp_state_root_page
-        let mut dbsp_state_roots: HashMap<String, i64> = HashMap::new();
+        let mut dbsp_state_roots: BTreeMap<String, i64> = BTreeMap::new();
         // Store DBSP state table index root pages: view_name -> dbsp_state_index_root_page
-        let mut dbsp_state_index_roots: HashMap<String, i64> = HashMap::new();
+        let mut dbsp_state_index_roots: BTreeMap<String, i64> = BTreeMap::new();
         // Store materialized view info (SQL and root page) for later creation
-        let mut materialized_view_info: HashMap<String, (String, i64)> = HashMap::new();
+        let mut materialized_view_info: BTreeMap<String, (String, i64)> = BTreeMap::new();
 
         pager.begin_read_tx()?;
 
@@ -664,7 +664,7 @@ impl Schema {
         &mut self,
         syms: &SymbolTable,
         from_sql_indexes: Vec<UnparsedFromSqlIndex>,
-        automatic_indices: std::collections::HashMap<String, Vec<(String, i64)>>,
+        automatic_indices: std::collections::BTreeMap<String, Vec<(String, i64)>>,
         mvcc_enabled: bool,
     ) -> Result<()> {
         for unparsed_sql_from_index in from_sql_indexes {
@@ -787,9 +787,9 @@ impl Schema {
     /// Populate materialized views parsed from the schema.
     pub fn populate_materialized_views(
         &mut self,
-        materialized_view_info: std::collections::HashMap<String, (String, i64)>,
-        dbsp_state_roots: std::collections::HashMap<String, i64>,
-        dbsp_state_index_roots: std::collections::HashMap<String, i64>,
+        materialized_view_info: std::collections::BTreeMap<String, (String, i64)>,
+        dbsp_state_roots: std::collections::BTreeMap<String, i64>,
+        dbsp_state_index_roots: std::collections::BTreeMap<String, i64>,
     ) -> Result<()> {
         for (view_name, (sql, main_root)) in materialized_view_info {
             // Look up the DBSP state root for this view
@@ -858,10 +858,10 @@ impl Schema {
         maybe_sql: Option<&str>,
         syms: &SymbolTable,
         from_sql_indexes: &mut Vec<UnparsedFromSqlIndex>,
-        automatic_indices: &mut std::collections::HashMap<String, Vec<(String, i64)>>,
-        dbsp_state_roots: &mut std::collections::HashMap<String, i64>,
-        dbsp_state_index_roots: &mut std::collections::HashMap<String, i64>,
-        materialized_view_info: &mut std::collections::HashMap<String, (String, i64)>,
+        automatic_indices: &mut std::collections::BTreeMap<String, Vec<(String, i64)>>,
+        dbsp_state_roots: &mut std::collections::BTreeMap<String, i64>,
+        dbsp_state_index_roots: &mut std::collections::BTreeMap<String, i64>,
+        materialized_view_info: &mut std::collections::BTreeMap<String, (String, i64)>,
         mv_store: Option<&Arc<MvStore>>,
         enable_triggers: bool,
     ) -> Result<()> {
@@ -958,10 +958,10 @@ impl Schema {
                             }
                         } else {
                             match automatic_indices.entry(table_name) {
-                                std::collections::hash_map::Entry::Vacant(e) => {
+                                std::collections::btree_map::Entry::Vacant(e) => {
                                     e.insert(vec![(index_name, root_page)]);
                                 }
-                                std::collections::hash_map::Entry::Occupied(mut e) => {
+                                std::collections::btree_map::Entry::Occupied(mut e) => {
                                     e.get_mut().push((index_name, root_page));
                                 }
                             }
