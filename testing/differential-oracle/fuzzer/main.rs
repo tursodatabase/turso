@@ -145,8 +145,9 @@ fn run_single(args: &Args) -> Result<()> {
     match fuzzer.get_schema() {
         Ok(schema) => {
             let json = serde_json::to_string_pretty(&schema)?;
-            std::fs::write(fuzzer.out_dir.join("schema.json"), &json)?;
-            tracing::info!("Wrote schema to schema.json");
+            let full_path = fuzzer.out_dir.join("schema.json");
+            std::fs::write(full_path.clone(), &json)?;
+            tracing::info!("Wrote schema to {}", full_path.display());
         }
         Err(e) => {
             tracing::warn!("Failed to get schema for JSON dump: {e}");

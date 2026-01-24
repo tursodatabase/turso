@@ -239,11 +239,16 @@ impl Fuzzer {
 
     /// Write all executed SQL statements to test.sql
     fn write_sql_file(&self, statements: &[String]) -> Result<()> {
-        let mut file = std::fs::File::create(self.out_dir.join("test.sql"))?;
+        let full_path = self.out_dir.join("test.sql");
+        let mut file = std::fs::File::create(full_path.clone())?;
         for sql in statements {
             writeln!(file, "{sql};")?;
         }
-        tracing::info!("Wrote {} statements to test.sql", statements.len());
+        tracing::info!(
+            "Wrote {} statements to {}",
+            statements.len(),
+            full_path.display()
+        );
         Ok(())
     }
 
