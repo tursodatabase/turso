@@ -249,6 +249,121 @@ expect {
     3|Charlie|25
 }
 
+# NULL HANDLING IN IN/NOT IN SUBQUERIES
+# When value is found in subquery, result is 1 (regardless of NULLs)
+test subquery-in-null-value-found {
+    create table t(x);
+    insert into t values (5), (NULL);
+    select 5 in (select * from t);
+}
+expect {
+    1
+}
+
+# When value not found and subquery has NULLs, result is NULL (unknown)
+test subquery-in-null-value-not-found {
+    create table t(x);
+    insert into t values (5), (NULL);
+    select 6 in (select * from t);
+}
+expect {
+
+}
+
+# When LHS is NULL and subquery is non-empty, result is NULL
+test subquery-in-null-lhs-nonempty {
+    create table t(x);
+    insert into t values (5), (NULL);
+    select null in (select * from t);
+}
+expect {
+
+}
+
+# When LHS is NULL and subquery is empty, result is 0 (FALSE)
+test subquery-in-null-lhs-empty {
+    create table t(x);
+    select null in (select * from t);
+}
+expect {
+    0
+}
+
+# NOT IN: when value found, result is 0 (regardless of NULLs)
+test subquery-not-in-null-value-found {
+    create table t(x);
+    insert into t values (5), (NULL);
+    select 5 not in (select * from t);
+}
+expect {
+    0
+}
+
+# NOT IN: when value not found and subquery has NULLs, result is NULL
+test subquery-not-in-null-value-not-found {
+    create table t(x);
+    insert into t values (5), (NULL);
+    select 6 not in (select * from t);
+}
+expect {
+
+}
+
+# NOT IN: when LHS is NULL and subquery is non-empty, result is NULL
+test subquery-not-in-null-lhs-nonempty {
+    create table t(x);
+    insert into t values (5), (NULL);
+    select null not in (select * from t);
+}
+expect {
+
+}
+
+# NOT IN: when LHS is NULL and subquery is empty, result is 1 (TRUE)
+test subquery-not-in-null-lhs-empty {
+    create table t(x);
+    select null not in (select * from t);
+}
+expect {
+    1
+}
+
+# IN subquery in result column with NULL handling
+test subquery-in-result-column-null-handling {
+    create table t(x);
+    insert into t values (5), (NULL);
+    select x, x in (select * from t) from t;
+}
+expect {
+    5|1
+    |
+}
+
+# NOT IN subquery in result column with NULL handling
+test subquery-not-in-result-column-null-handling {
+    create table t(x);
+    insert into t values (5), (NULL);
+    select x, x not in (select * from t) from t;
+}
+expect {
+    5|0
+    |
+}
+
+# IN subquery with NULL in both LHS column and subquery result
+test subquery-in-null-handling-multiple-rows {
+    create table t(x);
+    create table t2(y);
+    insert into t values (5), (NULL);
+    insert into t2 values (5), (6), (NULL);
+    select y, y in (select x from t) from t2;
+}
+expect {
+    5|1
+    6|
+    |
+}
+
 # SUBQUERIES IN OTHER POSITIONS (result columns, GROUP BY, ORDER BY, HAVING, LIMIT, OFFSET)
 # Uncorrelated subquery in result column
 test subquery-uncorrelated-in-result-column {

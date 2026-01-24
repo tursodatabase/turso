@@ -717,11 +717,13 @@ pub fn translate_expr(
                     Ok(target_register)
                 }
                 SubqueryType::In { cursor_id } => {
-                    // jump here when we can definitely skip the row
+                    // jump here when we can definitely skip the row (result = 0/false)
                     let label_skip_row = program.allocate_label();
-                    // jump here when we can definitely include the row
+                    // jump here when we can definitely include the row (result = 1/true)
                     let label_include_row = program.allocate_label();
-                    // jump here when we need to make extra null-related checks, because sql null is the greatest thing ever
+                    // jump here when the result should be NULL (unknown)
+                    let label_null_result = program.allocate_label();
+                    // jump here when we need to make extra null-related checks
                     let label_null_rewind = program.allocate_label();
                     let label_null_checks_loop_start = program.allocate_label();
                     let label_null_checks_next = program.allocate_label();
@@ -746,13 +748,13 @@ pub fn translate_expr(
                             resolver,
                         )?;
                         if !lhs_column.is_nonnull(referenced_tables.as_ref().unwrap()) {
+                            // If LHS is NULL, we need to check if ephemeral is empty first.
+                            // - If empty: IN returns FALSE, NOT IN returns TRUE
+                            // - If not empty: result is NULL (unknown)
+                            // Jump to label_null_rewind which does Rewind and handles empty case.
                             program.emit_insn(Insn::IsNull {
                                 reg: lhs_column_regs_start + i,
-                                target_pc: if *not_in {
-                                    label_null_rewind
-                                } else {
-                                    label_skip_row
-                                },
+                                target_pc: label_null_rewind,
                             });
                         }
                     }
@@ -777,80 +779,100 @@ pub fn translate_expr(
                         }
                     }
 
+                    // For NOT IN: empty ephemeral or no all-NULL row means TRUE (include)
+                    // For IN: empty ephemeral or no all-NULL row means FALSE (skip)
+                    let label_on_no_null = if *not_in {
+                        label_include_row
+                    } else {
+                        label_skip_row
+                    };
+
                     if *not_in {
-                        // WHERE ... NOT IN (SELECT ...)
-                        // We must skip the row if we find a match.
+                        // NOT IN: skip row if value is found
                         program.emit_insn(Insn::Found {
                             cursor_id: *cursor_id,
                             target_pc: label_skip_row,
                             record_reg: lhs_column_regs_start,
                             num_regs: lhs_column_count,
                         });
-                        // Ok, so Found didn't return a match.
-                        // Because SQL NULL, we need do extra checks to see if we can include the row.
-                        // Consider:
-                        // 1. SELECT * FROM T WHERE 1 NOT IN (SELECT NULL),
-                        // 2. SELECT * FROM T WHERE 1 IN (SELECT NULL) -- or anything else where the subquery evaluates to NULL.
-                        // _Both_ of these queries should return nothing, because... SQL NULL.
-                        // The same goes for e.g. SELECT * FROM T WHERE (1,1) NOT IN (SELECT NULL, NULL).
-                        // However, it does _NOT_ apply for SELECT * FROM T WHERE (1,1) NOT IN (SELECT NULL, 1).
-                        // BUT: it DOES apply for SELECT * FROM T WHERE (2,2) NOT IN ((1,1), (NULL, NULL))!!!
-                        // Ergo: if the subquery result has _ANY_ tuples with all NULLs, we need to NOT include the row.
-                        //
-                        // So, if we didn't found a match (and hence, so far, our 'NOT IN' condition still applies),
-                        // we must still rewind the subquery's ephemeral index cursor and go through ALL rows and compare each LHS column (with !=) to the corresponding column in the ephemeral index.
-                        // Comparison instructions have the default behavior that if either operand is NULL, the comparison is completely skipped.
-                        // That means: if we, for ANY row in the ephemeral index, get through all the != comparisons without jumping,
-                        // it means our subquery result has a tuple that is exactly NULL (or (NULL, NULL) etc.),
-                        // in which case we need to NOT include the row.
-                        // If ALL the rows jump at one of the != comparisons, it means our subquery result has no tuples with all NULLs -> we can include the row.
-                        program.preassign_label_to_next_insn(label_null_rewind);
-                        program.emit_insn(Insn::Rewind {
-                            cursor_id: *cursor_id,
-                            pc_if_empty: label_include_row,
-                        });
-                        program.preassign_label_to_next_insn(label_null_checks_loop_start);
-                        let column_check_reg = program.alloc_register();
-                        for (i, affinity) in affinity.enumerate().take(lhs_column_count) {
-                            program.emit_insn(Insn::Column {
-                                cursor_id: *cursor_id,
-                                column: i,
-                                dest: column_check_reg,
-                                default: None,
-                            });
-                            // Apply affinity to the comparison for proper type coercion
-                            program.emit_insn(Insn::Ne {
-                                lhs: lhs_column_regs_start + i,
-                                rhs: column_check_reg,
-                                target_pc: label_null_checks_next,
-                                flags: CmpInsFlags::default().with_affinity(affinity),
-                                collation: program.curr_collation(),
-                            });
-                        }
-                        program.emit_insn(Insn::Goto {
-                            target_pc: label_skip_row,
-                        });
-                        program.preassign_label_to_next_insn(label_null_checks_next);
-                        program.emit_insn(Insn::Next {
-                            cursor_id: *cursor_id,
-                            pc_if_next: label_null_checks_loop_start,
-                        })
                     } else {
-                        // WHERE ... IN (SELECT ...)
-                        // We can skip the row if we don't find a match
+                        // IN: if value found, include row; otherwise check for NULLs
                         program.emit_insn(Insn::NotFound {
                             cursor_id: *cursor_id,
-                            target_pc: label_skip_row,
+                            target_pc: label_null_rewind,
                             record_reg: lhs_column_regs_start,
                             num_regs: lhs_column_count,
                         });
+                        program.emit_insn(Insn::Goto {
+                            target_pc: label_include_row,
+                        });
                     }
+
+                    // Null checking loop: scan ephemeral for any all-NULL tuples.
+                    // If found, result is NULL (unknown). If not found, result depends on IN vs NOT IN.
+                    program.preassign_label_to_next_insn(label_null_rewind);
+                    program.emit_insn(Insn::Rewind {
+                        cursor_id: *cursor_id,
+                        pc_if_empty: label_on_no_null,
+                    });
+                    program.preassign_label_to_next_insn(label_null_checks_loop_start);
+                    let column_check_reg = program.alloc_register();
+                    for (i, affinity) in affinity.enumerate().take(lhs_column_count) {
+                        program.emit_insn(Insn::Column {
+                            cursor_id: *cursor_id,
+                            column: i,
+                            dest: column_check_reg,
+                            default: None,
+                        });
+                        // Ne with NULL operand does NOT jump (comparison is NULL/unknown)
+                        program.emit_insn(Insn::Ne {
+                            lhs: lhs_column_regs_start + i,
+                            rhs: column_check_reg,
+                            target_pc: label_null_checks_next,
+                            flags: CmpInsFlags::default().with_affinity(affinity),
+                            collation: program.curr_collation(),
+                        });
+                    }
+                    // All Ne comparisons fell through -> this row has all NULLs -> result is NULL
+                    program.emit_insn(Insn::Goto {
+                        target_pc: label_null_result,
+                    });
+                    program.preassign_label_to_next_insn(label_null_checks_next);
+                    program.emit_insn(Insn::Next {
+                        cursor_id: *cursor_id,
+                        pc_if_next: label_null_checks_loop_start,
+                    });
+                    // Loop exhausted without finding all-NULL row
+                    program.emit_insn(Insn::Goto {
+                        target_pc: label_on_no_null,
+                    });
+                    // Final result handling:
+                    // label_include_row: result = 1 (TRUE)
+                    // label_skip_row: result = 0 (FALSE)
+                    // label_null_result: result = NULL (unknown)
+                    let label_done = program.allocate_label();
                     program.preassign_label_to_next_insn(label_include_row);
                     program.emit_insn(Insn::Integer {
                         value: 1,
                         dest: target_register,
                     });
+                    program.emit_insn(Insn::Goto {
+                        target_pc: label_done,
+                    });
                     program.preassign_label_to_next_insn(label_skip_row);
+                    program.emit_insn(Insn::Integer {
+                        value: 0,
+                        dest: target_register,
+                    });
+                    program.emit_insn(Insn::Goto {
+                        target_pc: label_done,
+                    });
+                    program.preassign_label_to_next_insn(label_null_result);
+                    program.emit_insn(Insn::Null {
+                        dest: target_register,
+                        dest_end: None,
+                    });
+                    program.preassign_label_to_next_insn(label_done);
                     Ok(target_register)
                 }
                 SubqueryType::RowValue {
