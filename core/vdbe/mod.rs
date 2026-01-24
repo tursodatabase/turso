@@ -199,6 +199,7 @@ pub enum StepResult {
 
 struct RegexCache {
     like: HashMap<String, Regex>,
+    regexp: HashMap<String, Regex>,
     glob: HashMap<String, Regex>,
 }
 
@@ -206,6 +207,7 @@ impl RegexCache {
     fn new() -> Self {
         Self {
             like: HashMap::new(),
+            regexp: HashMap::new(),
             glob: HashMap::new(),
         }
     }

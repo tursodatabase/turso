@@ -1548,7 +1548,7 @@ pub fn translate_expr(
                             Ok(target_register)
                         }
 
-                        ScalarFunc::Glob | ScalarFunc::Like => {
+                        ScalarFunc::Glob | ScalarFunc::Like | ScalarFunc::Regexp => {
                             if args.len() < 2 {
                                 crate::bail_parse_error!(
                                     "{} function with less than 2 arguments",
@@ -3526,7 +3526,7 @@ fn translate_like_base(
         crate::bail_parse_error!("expected Like expression");
     };
     match op {
-        ast::LikeOperator::Like | ast::LikeOperator::Glob => {
+        ast::LikeOperator::Like | ast::LikeOperator::Glob | ast::LikeOperator::Regexp => {
             let arg_count = if escape.is_some() { 3 } else { 2 };
             let start_reg = program.alloc_registers(arg_count);
             let mut constant_mask = 0;
@@ -3544,6 +3544,7 @@ fn translate_like_base(
             let func = match op {
                 ast::LikeOperator::Like => ScalarFunc::Like,
                 ast::LikeOperator::Glob => ScalarFunc::Glob,
+                ast::LikeOperator::Regexp => ScalarFunc::Regexp,
                 _ => unreachable!(),
             };
             program.emit_insn(Insn::Function {
@@ -3593,7 +3594,6 @@ fn translate_like_base(
         ast::LikeOperator::Match => {
             crate::bail_parse_error!("MATCH requires the 'fts' feature to be enabled")
         }
-        ast::LikeOperator::Regexp => crate::bail_parse_error!("REGEXP in LIKE is not supported"),
     }
 
     Ok(target_register)

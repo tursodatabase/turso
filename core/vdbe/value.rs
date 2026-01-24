@@ -1117,6 +1117,32 @@ impl Value {
         }
     }
 
+    pub fn exec_regexp(
+        regex_cache: Option<&mut HashMap<String, Regex>>,
+        pattern: &str,
+        text: &str,
+    ) -> Result<bool, LimboError> {
+        if let Some(cache) = regex_cache {
+            match cache.get(pattern) {
+                Some(re) => Ok(re.is_match(text)),
+                None => {
+                    let re = RegexBuilder::new(pattern).build().map_err(|e| {
+                        LimboError::Constraint(format!("Invalid REGEXP pattern: {}", e))
+                    })?;
+
+                    let is_match = re.is_match(text);
+                    cache.insert(pattern.to_string(), re);
+                    Ok(is_match)
+                }
+            }
+        } else {
+            let re = RegexBuilder::new(pattern)
+                .build()
+                .map_err(|e| LimboError::Constraint(format!("Invalid REGEXP pattern: {}", e)))?;
+            Ok(re.is_match(text))
+        }
+    }
+
     pub fn exec_min<'a, T: Iterator<Item = &'a Value>>(regs: T) -> Value {
         // SQLite: multi-arg min() returns NULL if ANY argument is NULL
         let mut result: Option<&Value> = None;

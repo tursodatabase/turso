@@ -5024,6 +5024,37 @@ pub fn op_function(
 
                 state.registers[*dest] = Register::Value(result);
             }
+            ScalarFunc::Regexp => {
+                let pattern_reg = &state.registers[*start_reg];
+                let text_reg = &state.registers[*start_reg + 1];
+
+                let result = match (pattern_reg.get_value(), text_reg.get_value()) {
+                    (Value::Null, _) | (_, Value::Null) => Value::Null,
+                    (pattern_val, text_val) => {
+                        let pattern_str = match pattern_val {
+                            Value::Text(s) => s.as_str(),
+                            _ => &pattern_val.to_string(),
+                        };
+
+                        let text_str = match text_val {
+                            Value::Text(s) => s.as_str(),
+                            _ => &text_val.to_string(),
+                        };
+
+                        let cache = if *constant_mask > 0 {
+                            Some(&mut state.regex_cache.regexp)
+                        } else {
+                            None
+                        };
+
+                        match Value::exec_regexp(cache, pattern_str, text_str) {
+                            Ok(is_match) => Value::Integer(if is_match { 1 } else { 0 }),
+                            Err(e) => return Err(e),
+                        }
+                    }
+                };
+                state.registers[*dest] = Register::Value(result);
+            }
             ScalarFunc::Abs
             | ScalarFunc::Lower
             | ScalarFunc::Upper
