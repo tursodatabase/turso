@@ -50,6 +50,9 @@ func TestMain(m *testing.M) {
 }
 
 func TestEncryption(t *testing.T) {
+	hexkey := "b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327"
+	wrongKey := "aaaaaaa4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327"
+
 	t.Run("encryption=disabled", func(t *testing.T) {
 		tmp := t.TempDir()
 		dbPath := path.Join(tmp, "local.db")
@@ -66,10 +69,12 @@ func TestEncryption(t *testing.T) {
 		require.Nil(t, err)
 		require.True(t, bytes.Contains(content, []byte("secret")))
 	})
+
 	t.Run("encryption=enabled", func(t *testing.T) {
 		tmp := t.TempDir()
 		dbPath := path.Join(tmp, "local.db")
-		conn, err := sql.Open("turso", fmt.Sprintf("%v?experimental=encryption&encryption_cipher=aegis256&encryption_hexkey=b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327", dbPath))
+		dsn := fmt.Sprintf("%v?experimental=encryption&encryption_cipher=aegis256&encryption_hexkey=%s", dbPath, hexkey)
+		conn, err := sql.Open("turso", dsn)
 		require.Nil(t, err)
 		require.Nil(t, conn.Ping())
 		_, err = conn.Exec("CREATE TABLE t(x)")
@@ -81,6 +86,53 @@ func TestEncryption(t *testing.T) {
 		content, err := os.ReadFile(dbPath)
 		require.Nil(t, err)
 		require.False(t, bytes.Contains(content, []byte("secret")))
+		conn.Close()
+	})
+
+	t.Run("encryption=full_test", func(t *testing.T) {
+		tmp := t.TempDir()
+		dbPath := path.Join(tmp, "encrypted.db")
+
+		dsn := fmt.Sprintf("%v?experimental=encryption&encryption_cipher=aegis256&encryption_hexkey=%s", dbPath, hexkey)
+		conn, err := sql.Open("turso", dsn)
+		require.Nil(t, err)
+		require.Nil(t, conn.Ping())
+		_, err = conn.Exec("CREATE TABLE t(x)")
+		require.Nil(t, err)
+		_, err = conn.Exec("INSERT INTO t SELECT 'secret' FROM generate_series(1, 1024)")
+		require.Nil(t, err)
+		_, err = conn.Exec("PRAGMA wal_checkpoint(TRUNCATE)")
+		require.Nil(t, err)
+		conn.Close()
+
+		content, err := os.ReadFile(dbPath)
+		require.Nil(t, err)
+		require.Greater(t, len(content), 16*1024)
+		require.False(t, bytes.Contains(content, []byte("secret")))
+
+		// verify we can re-open with the same key
+		conn2, err := sql.Open("turso", dsn)
+		require.Nil(t, err)
+		var count int
+		err = conn2.QueryRow("SELECT count(*) FROM t").Scan(&count)
+		require.Nil(t, err)
+		require.Equal(t, 1024, count)
+		conn2.Close()
+
+		// verify opening with wrong key fails
+		wrongDsn := fmt.Sprintf("%v?experimental=encryption&encryption_cipher=aegis256&encryption_hexkey=%s", dbPath, wrongKey)
+		conn3, err := sql.Open("turso", wrongDsn)
+		require.Nil(t, err) // open succeeds but query should fail
+		_, err = conn3.Exec("SELECT * FROM t")
+		require.NotNil(t, err)
+		conn3.Close()
+
+		// verify opening without encryption fails
+		conn4, err := sql.Open("turso", dbPath)
+		require.Nil(t, err) // Open succeeds but query should fail
+		_, err = conn4.Exec("SELECT * FROM t")
+		require.NotNil(t, err)
+		conn4.Close()
 	})
 }
 
