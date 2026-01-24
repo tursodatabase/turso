@@ -1,5 +1,5 @@
 use crate::common::{
-    self, limbo_exec_rows, maybe_setup_tracing, rusqlite_integrity_check, ExecRows,
+    self, compute_dbhash, limbo_exec_rows, maybe_setup_tracing, rusqlite_integrity_check, ExecRows,
 };
 use crate::common::{compare_string, do_flush, TempDatabase};
 use log::debug;
@@ -226,13 +226,18 @@ fn test_wal_checkpoint(tmp_db: TempDatabase) -> anyhow::Result<()> {
         log::info!("iteration #{i}");
         let insert_query = format!("INSERT INTO test VALUES ({i})");
         do_flush(&conn, &tmp_db)?;
+        let hash_before = compute_dbhash(&tmp_db);
         conn.checkpoint(CheckpointMode::Passive {
             upper_bound_inclusive: None,
         })?;
+        let hash_after = compute_dbhash(&tmp_db);
+        assert_eq!(
+            hash_before.hash, hash_after.hash,
+            "checkpoint changed database content!!!!!!"
+        );
         common::run_query(&tmp_db, &conn, &insert_query)?;
     }
 
-    do_flush(&conn, &tmp_db)?;
     let list_query = "SELECT * FROM test LIMIT 1";
     let mut current_index = 0;
     common::run_query_on_row(&tmp_db, &conn, list_query, |row: &Row| {

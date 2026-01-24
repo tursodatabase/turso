@@ -1120,6 +1120,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "turso",
+ "turso-dbhash",
  "turso_core",
  "turso_macros",
  "turso_parser",
@@ -4909,6 +4910,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "sha1"
+version = "0.10.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e3bf829a2d51ab4a5ddf1352d8470c140cadc8301b2ae1789db023f01cedd6ba"
+dependencies = [
+ "cfg-if",
+ "cpufeatures",
+ "digest",
+]
+
+[[package]]
 name = "sha1_smol"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6011,6 +6023,17 @@ dependencies = [
  "tracing-subscriber",
  "turso_sdk_kit",
  "turso_sync_sdk_kit",
+]
+
+[[package]]
+name = "turso-dbhash"
+version = "0.5.0-pre.1"
+dependencies = [
+ "clap",
+ "hex",
+ "sha1",
+ "tempfile",
+ "turso_core",
 ]
 
 [[package]]

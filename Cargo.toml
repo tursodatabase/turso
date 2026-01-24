@@ -35,6 +35,7 @@ members = [
     "perf/throughput/turso",
     "perf/throughput/rusqlite",
     "perf/encryption",
+    "tools/dbhash",
     "sdk-kit",
     "sdk-kit-macros", 
     "testing/differential-oracle/sql_gen_prop", 
@@ -62,6 +63,7 @@ turso_ext = { path = "extensions/core", version = "0.5.0-pre.1" }
 turso_macros = { path = "macros", version = "0.5.0-pre.1" }
 turso_parser = { path = "parser", version = "0.5.0-pre.1" }
 sql_generation = { path = "sql_generation" }
+turso-dbhash = { path = "tools/dbhash" }
 strum = { version = "0.26", features = ["derive"] }
 strum_macros = "0.26"
 serde = "1.0"
