@@ -1244,7 +1244,8 @@ fn subquery_expression_strategy(
             let schema = schema.clone();
             move |table| {
                 let schema = schema.clone();
-                crate::select::select_for_table(&table, &schema, &profile)
+                // Scalar subqueries must return exactly 1 column
+                crate::select::select_single_column_for_table(&table, &schema, &profile)
                     .prop_map(|select| Expression::Subquery(Box::new(select)))
             }
         })
@@ -1337,7 +1338,9 @@ fn in_subquery_expression_strategy(
             let schema = schema.clone();
             move |(col_name, table)| {
                 let schema = schema.clone();
-                crate::select::select_for_table(&table, &schema, &profile)
+                // FIXME: SQL supports row-value IN like (a,b) IN (SELECT x,y ...) but Turso
+                // doesn't yet. For now, generate only single-column subqueries.
+                crate::select::select_single_column_for_table(&table, &schema, &profile)
                     .prop_map(move |select| (col_name.clone(), select))
             }
         })

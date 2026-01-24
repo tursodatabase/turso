@@ -246,6 +246,45 @@ impl fmt::Display for SelectStatement {
     }
 }
 
+/// Generate a SELECT statement that returns exactly one column.
+/// Used for IN subqueries. SQL supports row-value IN like (a,b) IN (SELECT x,y ...)
+/// but Turso doesn't yet, so we generate single-column subqueries for now.
+pub fn select_single_column_for_table(
+    table: &TableRef,
+    schema: &Schema,
+    profile: &StatementProfile,
+) -> BoxedStrategy<SelectStatement> {
+    let table_name = table.name.clone();
+    let col_names: Vec<String> = table.columns.iter().map(|c| c.name.clone()).collect();
+
+    let select_profile = profile.select_profile();
+    let limit_range = select_profile.limit_range.clone();
+    let offset_range = select_profile.offset_range.clone();
+
+    // Generate exactly one column
+    let columns_strategy =
+        proptest::sample::select(col_names).prop_map(|col| vec![Expression::Column(col)]);
+
+    (
+        columns_strategy,
+        optional_where_clause(table, schema, profile),
+        order_by_for_table(table, schema, profile),
+        proptest::option::of(limit_range),
+        proptest::option::of(offset_range),
+    )
+        .prop_map(
+            move |(columns, where_clause, order_by, limit, offset)| SelectStatement {
+                table: table_name.clone(),
+                columns,
+                where_clause,
+                order_by,
+                limit,
+                offset: if limit.is_some() { offset } else { None },
+            },
+        )
+        .boxed()
+}
+
 /// Generate a SELECT statement for a table with profile.
 pub fn select_for_table(
     table: &TableRef,
