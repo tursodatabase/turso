@@ -224,3 +224,26 @@ test pragma-module-list-nonempty {
 expect pattern {
     \ngenerate_series\n|^generate_series\n|\ngenerate_series$|^generate_series$
 }
+
+test pragma-temp-store {
+		PRAGMA temp_store;
+}
+expect {
+		0
+}
+
+test pragma-temp-store-set-memory {
+		PRAGMA temp_store=MEMORY;
+	    PRAGMA temp_store;
+}
+expect {
+		2
+}
+
+test pragma-temp-store-set-file {
+		PRAGMA temp_store=FILE;
+	    PRAGMA temp_store;
+}
+expect {
+		1
+}

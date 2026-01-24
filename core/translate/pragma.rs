@@ -441,6 +441,35 @@ fn update_pragma(
             connection.set_sync_type(sync_type);
             Ok((program, TransactionMode::None))
         }
+        PragmaName::TempStore => {
+            use crate::TempStore;
+            // Try to parse as a string first (default, file, memory)
+            let temp_store = if let Expr::Literal(Literal::Numeric(n)) = &value {
+                // Numeric value: 0, 1, or 2
+                match n.as_str() {
+                    "0" => TempStore::Default,
+                    "1" => TempStore::File,
+                    "2" => TempStore::Memory,
+                    _ => bail_parse_error!("temp_store must be 0, 1, 2, DEFAULT, FILE, or MEMORY"),
+                }
+            } else {
+                // Try as keyword/identifier: DEFAULT, FILE, MEMORY
+                let name_bytes = match &value {
+                    Expr::Literal(Literal::Keyword(name)) => name.as_bytes(),
+                    Expr::Name(name) | Expr::Id(name) => name.as_str().as_bytes(),
+                    Expr::Literal(Literal::String(s)) => s.as_bytes(),
+                    _ => bail_parse_error!("temp_store must be 0, 1, 2, DEFAULT, FILE, or MEMORY"),
+                };
+                match_ignore_ascii_case!(match name_bytes {
+                    b"DEFAULT" | b"0" => TempStore::Default,
+                    b"FILE" | b"1" => TempStore::File,
+                    b"MEMORY" | b"2" => TempStore::Memory,
+                    _ => bail_parse_error!("temp_store must be 0, 1, 2, DEFAULT, FILE, or MEMORY"),
+                })
+            };
+            connection.set_temp_store(temp_store);
+            Ok((program, TransactionMode::None))
+        }
     }
 }
 
@@ -823,6 +852,14 @@ fn query_pragma(
             let enabled = connection.get_sync_type() == crate::io::FileSyncType::FullFsync;
             let register = program.alloc_register();
             program.emit_int(enabled as i64, register);
+            program.emit_result_row(register, 1);
+            program.add_pragma_result_column(pragma.to_string());
+            Ok((program, TransactionMode::None))
+        }
+        PragmaName::TempStore => {
+            let temp_store = connection.get_temp_store();
+            let register = program.alloc_register();
+            program.emit_int(temp_store as i64, register);
             program.emit_result_row(register, 1);
             program.add_pragma_result_column(pragma.to_string());
             Ok((program, TransactionMode::None))

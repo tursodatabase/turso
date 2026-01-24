@@ -216,6 +216,19 @@ pub enum SyncMode {
     Full = 2,
 }
 
+/// Control where temporary tables and indices are stored.
+/// Matches SQLite's PRAGMA temp_store values:
+/// - 0 = DEFAULT (use compile-time default, which is FILE)
+/// - 1 = FILE (always use temp files on disk)
+/// - 2 = MEMORY (always use in-memory storage)
+#[derive(Debug, AtomicEnum, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TempStore {
+    #[default]
+    Default = 0,
+    File = 1,
+    Memory = 2,
+}
+
 pub(crate) type MvStore = mvcc::MvStore<mvcc::LocalClock>;
 
 pub(crate) type MvCursor = mvcc::cursor::MvccLazyCursor<mvcc::LocalClock>;
@@ -846,6 +859,7 @@ impl Database {
             encryption_key: RwLock::new(encryption_key),
             encryption_cipher_mode: AtomicCipherMode::new(encryption_cipher),
             sync_mode: AtomicSyncMode::new(SyncMode::Full),
+            temp_store: AtomicTempStore::new(TempStore::Default),
             data_sync_retry: AtomicBool::new(false),
             busy_handler: RwLock::new(BusyHandler::None),
             is_mvcc_bootstrap_connection: AtomicBool::new(is_mvcc_bootstrap_connection),
