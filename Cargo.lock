@@ -5100,6 +5100,7 @@ checksum = "d372029cb5195f9ab4e4b9aef550787dce78b124fcaee8d82519925defcd6f0d"
 name = "sql_gen_prop"
 version = "0.5.0-pre.1"
 dependencies = [
+ "anarchist-readable-name-generator-lib",
  "proptest",
  "serde",
  "strum",
