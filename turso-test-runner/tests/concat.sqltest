@@ -40,3 +40,19 @@ test concat-blob {
 expect {
     0102
 }
+
+# Issue #4860: Concat operator always returns text, even for blob+blob
+# This matches SQLite behavior per https://sqlite.org/lang_expr.html
+test concat-blob-typeof {
+    SELECT typeof(X'ABCD' || X'1234');
+}
+expect {
+    text
+}
+
+test concat-blob-hex-typeof {
+    SELECT hex(X'ABCD' || X'1234'), typeof(X'ABCD' || X'1234');
+}
+expect {
+    ABCD1234|text
+}

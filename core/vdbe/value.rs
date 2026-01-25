@@ -1015,10 +1015,8 @@ impl Value {
     }
 
     pub fn exec_concat(&self, rhs: &Value) -> Value {
-        if let (Value::Blob(lhs), Value::Blob(rhs)) = (self, rhs) {
-            return Value::Blob([lhs.as_slice(), rhs.as_slice()].concat().to_vec());
-        }
-
+        // SQLite's || operator always returns TEXT, even for Blob+Blob.
+        // See: https://www.sqlite.org/lang_expr.html
         let Some(lhs) = self.cast_text() else {
             return Value::Null;
         };
