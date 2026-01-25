@@ -19,8 +19,6 @@ pub struct SnapshotMetadata {
     pub source: String,
     /// The SQL expression being snapshotted
     pub expression: String,
-    /// Name of this snapshot
-    pub snapshot_name: String,
     /// Structured info section
     pub info: SnapshotInfo,
 }
@@ -241,7 +239,7 @@ impl SnapshotManager {
             fs::create_dir_all(parent).await?;
         }
 
-        let snapshot = create_snapshot(&self.test_file_path, name, sql, content, info);
+        let snapshot = create_snapshot(&self.test_file_path, sql, content, info);
         let formatted = snapshot.to_string()?;
 
         fs::write(&path, formatted).await?;
@@ -263,7 +261,7 @@ impl SnapshotManager {
             fs::create_dir_all(parent).await?;
         }
 
-        let snapshot = create_snapshot(&self.test_file_path, name, sql, content, info);
+        let snapshot = create_snapshot(&self.test_file_path, sql, content, info);
         let formatted = snapshot.to_string()?;
 
         fs::write(&path, formatted).await?;
@@ -338,14 +336,8 @@ impl SnapshotManager {
     }
 }
 
-/// Create a ParsedSnapshot from components
-fn create_snapshot(
-    source_path: &Path,
-    snapshot_name: &str,
-    sql: &str,
-    content: &str,
-    info: &SnapshotInfo,
-) -> Snapshot {
+/// Create a Snapshot from components
+fn create_snapshot(source_path: &Path, sql: &str, content: &str, info: &SnapshotInfo) -> Snapshot {
     let source = source_path
         .file_name()
         .and_then(|s| s.to_str())
@@ -361,7 +353,6 @@ fn create_snapshot(
     let metadata = SnapshotMetadata {
         source,
         expression: sql.to_string(),
-        snapshot_name: snapshot_name.to_string(),
         info: SnapshotInfo {
             statement_type,
             tables,
@@ -546,7 +537,7 @@ mod tests {
             .with_setups(vec!["schema".to_string()])
             .with_database(":memory:".to_string());
 
-        let snapshot = create_snapshot(&path, "test-name", sql, content, &info);
+        let snapshot = create_snapshot(&path, sql, content, &info);
         let serialized = snapshot.to_string().unwrap();
 
         // Parse it back
@@ -554,7 +545,6 @@ mod tests {
 
         assert_eq!(parsed.metadata.source, "my-test.sqltest");
         assert_eq!(parsed.metadata.expression, "SELECT * FROM users");
-        assert_eq!(parsed.metadata.snapshot_name, "test-name");
         assert_eq!(parsed.metadata.info.statement_type, "SELECT");
         assert!(parsed.metadata.info.tables.contains(&"users".to_string()));
         assert_eq!(parsed.metadata.info.setup_blocks, vec!["schema"]);
