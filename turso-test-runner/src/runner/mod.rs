@@ -4,7 +4,7 @@ use crate::parser::ast::{
     Backend, Capability, DatabaseConfig, Requirement, SetupRef, Skip, SkipCondition, SnapshotCase,
     TestCase, TestFile,
 };
-use crate::snapshot::{SnapshotInfo, SnapshotManager, SnapshotResult};
+use crate::snapshot::{SnapshotInfo, SnapshotManager, SnapshotResult, SnapshotUpdateMode};
 use async_trait::async_trait;
 use futures::FutureExt;
 use futures::stream::{FuturesUnordered, StreamExt};
@@ -38,8 +38,8 @@ pub struct RunOptions {
     pub backend_capabilities: HashSet<Capability>,
     /// Backend type (used by tests)
     pub backend_type: Backend,
-    /// Whether to update snapshots (used by snapshots)
-    pub update_snapshots: bool,
+    /// Snapshot update mode (used by snapshots)
+    pub snapshot_update_mode: SnapshotUpdateMode,
 }
 
 /// Trait for runnable test items (tests and snapshots)
@@ -146,7 +146,8 @@ impl Runnable for SnapshotCase {
             .with_database(db_location_str);
 
         // Compare with snapshot
-        let snapshot_manager = SnapshotManager::new(&options.file_path, options.update_snapshots);
+        let snapshot_manager =
+            SnapshotManager::new(&options.file_path, options.snapshot_update_mode);
         let snapshot_result = snapshot_manager
             .compare(&self.name, &self.sql, &actual_output, &snapshot_info)
             .await;
@@ -562,8 +563,8 @@ pub struct RunnerConfig {
     pub filter: Option<String>,
     /// Whether MVCC mode is enabled
     pub mvcc: bool,
-    /// Whether to automatically update snapshots
-    pub update_snapshots: bool,
+    /// Snapshot update mode (Auto, New, Always, No)
+    pub snapshot_update_mode: SnapshotUpdateMode,
     /// Snapshot name filter (glob pattern)
     pub snapshot_filter: Option<String>,
 }
@@ -574,7 +575,7 @@ impl Default for RunnerConfig {
             max_jobs: num_cpus::get(),
             filter: None,
             mvcc: false,
-            update_snapshots: false,
+            snapshot_update_mode: SnapshotUpdateMode::Auto,
             snapshot_filter: None,
         }
     }
@@ -596,8 +597,8 @@ impl RunnerConfig {
         self
     }
 
-    pub fn with_update_snapshots(mut self, update: bool) -> Self {
-        self.update_snapshots = update;
+    pub fn with_snapshot_update_mode(mut self, mode: SnapshotUpdateMode) -> Self {
+        self.snapshot_update_mode = mode;
         self
     }
 
@@ -672,7 +673,8 @@ impl<B: SqlBackend + 'static> TestRunner<B> {
                     global_requires: test_file.global_requires.clone(),
                     backend_capabilities: backend_capabilities.clone(),
                     backend_type,
-                    update_snapshots: false,
+                    // Tests don't use snapshots, but we still need the field
+                    snapshot_update_mode: SnapshotUpdateMode::No,
                 };
 
                 futures.push(tokio::spawn(async move {
@@ -725,7 +727,7 @@ impl<B: SqlBackend + 'static> TestRunner<B> {
                     global_requires: Vec::new(),
                     backend_capabilities: HashSet::new(),
                     backend_type,
-                    update_snapshots: self.config.update_snapshots,
+                    snapshot_update_mode: self.config.snapshot_update_mode,
                 };
 
                 futures.push(tokio::spawn(async move {

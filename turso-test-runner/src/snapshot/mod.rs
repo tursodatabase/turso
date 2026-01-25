@@ -4,13 +4,101 @@
 //! for verifying SQL EXPLAIN output remains consistent.
 //!
 //! Uses serde_yaml for serialization.
+//!
+//! ## Snapshot Update Modes
+//!
+//! Similar to cargo-insta, this module supports multiple update modes:
+//!
+//! - `Auto`: Default mode. Behaves like `No` in CI environments (no files written),
+//!   or `New` otherwise (writes `.snap.new` files for review).
+//! - `New`: Writes new/changed snapshots to `.snap.new` files for review.
+//! - `Always`: Writes snapshots directly to `.snap` files (like `--update-snapshots`).
+//! - `No`: Never writes snapshot files; just reports pass/fail.
+//!
+//! ## CI Detection
+//!
+//! CI environments are detected by checking for common environment variables:
+//! `CI`, `GITHUB_ACTIONS`, `TRAVIS`, `CIRCLECI`, `GITLAB_CI`, `JENKINS_URL`, etc.
 
+use clap::ValueEnum;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use tokio::fs;
+
+/// Snapshot update mode, similar to cargo-insta's INSTA_UPDATE values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
+pub enum SnapshotUpdateMode {
+    /// Default mode: `No` in CI, `New` otherwise.
+    #[default]
+    Auto,
+    /// Write new/changed snapshots to `.snap.new` files for review.
+    New,
+    /// Write snapshots directly to `.snap` files (always update).
+    Always,
+    /// Never write snapshot files; just report pass/fail.
+    No,
+}
+
+impl SnapshotUpdateMode {
+    /// Resolve the effective mode, taking CI detection into account.
+    pub fn resolve(self) -> SnapshotUpdateMode {
+        match self {
+            SnapshotUpdateMode::Auto => {
+                if is_ci() {
+                    SnapshotUpdateMode::No
+                } else {
+                    SnapshotUpdateMode::New
+                }
+            }
+            other => other,
+        }
+    }
+}
+
+impl std::fmt::Display for SnapshotUpdateMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            SnapshotUpdateMode::Auto => "auto",
+            SnapshotUpdateMode::New => "new",
+            SnapshotUpdateMode::Always => "always",
+            SnapshotUpdateMode::No => "no",
+        };
+        write!(f, "{s}")
+    }
+}
+
+impl std::str::FromStr for SnapshotUpdateMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "auto" => Ok(SnapshotUpdateMode::Auto),
+            "new" => Ok(SnapshotUpdateMode::New),
+            "always" => Ok(SnapshotUpdateMode::Always),
+            "no" => Ok(SnapshotUpdateMode::No),
+            _ => Err(format!(
+                "Invalid snapshot update mode: '{s}'. Valid options: auto, new, always, no"
+            )),
+        }
+    }
+}
+
+/// Check if we're running in a CI environment.
+pub fn is_ci() -> bool {
+    // Check common CI environment variables
+    std::env::var("CI").is_ok()
+        || std::env::var("GITHUB_ACTIONS").is_ok()
+        || std::env::var("TRAVIS").is_ok()
+        || std::env::var("CIRCLECI").is_ok()
+        || std::env::var("GITLAB_CI").is_ok()
+        || std::env::var("JENKINS_URL").is_ok()
+        || std::env::var("BUILDKITE").is_ok()
+        || std::env::var("TF_BUILD").is_ok() // Azure Pipelines
+        || std::env::var("CODEBUILD_BUILD_ID").is_ok() // AWS CodeBuild
+}
 
 /// Snapshot file metadata (YAML frontmatter)
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -169,16 +257,18 @@ pub enum SnapshotResult {
 pub struct SnapshotManager {
     /// Path to the test file (used to derive snapshot directory)
     test_file_path: PathBuf,
-    /// Whether to automatically update snapshots
-    update_mode: bool,
+    /// Snapshot update mode (resolved from Auto if needed)
+    update_mode: SnapshotUpdateMode,
 }
 
 impl SnapshotManager {
-    /// Create a new snapshot manager for a test file
-    pub fn new(test_file_path: &Path, update: bool) -> Self {
+    /// Create a new snapshot manager for a test file.
+    ///
+    /// The `mode` is automatically resolved: `Auto` becomes `No` in CI, `New` otherwise.
+    pub fn new(test_file_path: &Path, mode: SnapshotUpdateMode) -> Self {
         Self {
             test_file_path: test_file_path.to_path_buf(),
-            update_mode: update,
+            update_mode: mode.resolve(),
         }
     }
 
@@ -268,7 +358,22 @@ impl SnapshotManager {
         Ok(())
     }
 
-    /// Compare actual output against stored snapshot
+    /// Remove a pending snapshot file (.snap.new) if it exists.
+    /// Called when a snapshot is accepted (written to .snap).
+    pub async fn remove_pending(&self, name: &str) -> anyhow::Result<()> {
+        let path = self.pending_path(name);
+        if path.exists() {
+            fs::remove_file(&path).await?;
+        }
+        Ok(())
+    }
+
+    /// Compare actual output against stored snapshot.
+    ///
+    /// Behavior depends on the update mode:
+    /// - `Always`: Write directly to `.snap` files
+    /// - `New`: Write to `.snap.new` files for review
+    /// - `No`: Don't write any files, just report results
     pub async fn compare(
         &self,
         name: &str,
@@ -282,45 +387,78 @@ impl SnapshotManager {
                 let expected = &snapshot.content;
 
                 if expected.trim() == actual.trim() {
+                    // In Always mode, clean up any stale .snap.new file
+                    if self.update_mode == SnapshotUpdateMode::Always {
+                        let _ = self.remove_pending(name).await;
+                    }
                     SnapshotResult::Match
-                } else if self.update_mode {
-                    // Update the snapshot
-                    if let Err(e) = self.write_snapshot(name, sql, actual, info).await {
-                        return SnapshotResult::Error {
-                            msg: format!("Failed to update snapshot: {e}"),
-                        };
-                    }
-                    SnapshotResult::Updated {
-                        old: expected.clone(),
-                        new: actual.to_string(),
-                    }
                 } else {
-                    // Generate diff
-                    let diff = generate_diff(expected, actual);
-                    SnapshotResult::Mismatch {
-                        expected: expected.clone(),
-                        actual: actual.to_string(),
-                        diff,
+                    // Snapshot mismatch - behavior depends on mode
+                    match self.update_mode {
+                        SnapshotUpdateMode::Always => {
+                            // Update the snapshot directly
+                            if let Err(e) = self.write_snapshot(name, sql, actual, info).await {
+                                return SnapshotResult::Error {
+                                    msg: format!("Failed to update snapshot: {e}"),
+                                };
+                            }
+                            // Clean up any pending .snap.new file
+                            let _ = self.remove_pending(name).await;
+                            SnapshotResult::Updated {
+                                old: expected.clone(),
+                                new: actual.to_string(),
+                            }
+                        }
+                        SnapshotUpdateMode::New => {
+                            // Write to .snap.new for review, then report mismatch
+                            let _ = self.write_pending(name, sql, actual, info).await;
+                            let diff = generate_diff(expected, actual);
+                            SnapshotResult::Mismatch {
+                                expected: expected.clone(),
+                                actual: actual.to_string(),
+                                diff,
+                            }
+                        }
+                        SnapshotUpdateMode::No | SnapshotUpdateMode::Auto => {
+                            // Auto should already be resolved, but handle it as No
+                            let diff = generate_diff(expected, actual);
+                            SnapshotResult::Mismatch {
+                                expected: expected.clone(),
+                                actual: actual.to_string(),
+                                diff,
+                            }
+                        }
                     }
                 }
             }
             Ok(None) => {
-                // No existing snapshot
-                if self.update_mode {
-                    // Create the snapshot directly
-                    if let Err(e) = self.write_snapshot(name, sql, actual, info).await {
-                        return SnapshotResult::Error {
-                            msg: format!("Failed to create snapshot: {e}"),
-                        };
+                // No existing snapshot - behavior depends on mode
+                match self.update_mode {
+                    SnapshotUpdateMode::Always => {
+                        // Create the snapshot directly
+                        if let Err(e) = self.write_snapshot(name, sql, actual, info).await {
+                            return SnapshotResult::Error {
+                                msg: format!("Failed to create snapshot: {e}"),
+                            };
+                        }
+                        // Clean up any pending .snap.new file
+                        let _ = self.remove_pending(name).await;
+                        SnapshotResult::New {
+                            content: actual.to_string(),
+                        }
                     }
-                    SnapshotResult::New {
-                        content: actual.to_string(),
+                    SnapshotUpdateMode::New => {
+                        // Write to .snap.new for review
+                        let _ = self.write_pending(name, sql, actual, info).await;
+                        SnapshotResult::New {
+                            content: actual.to_string(),
+                        }
                     }
-                } else {
-                    // Write to .snap.new for review
-                    let _ = self.write_pending(name, sql, actual, info).await;
-                    SnapshotResult::New {
-                        content: actual.to_string(),
+                    SnapshotUpdateMode::No | SnapshotUpdateMode::Auto => {
+                        // Don't write anything, just report new
+                        SnapshotResult::New {
+                            content: actual.to_string(),
+                        }
                     }
                 }
             }
@@ -330,10 +468,81 @@ impl SnapshotManager {
         }
     }
 
-    /// Check if update mode is enabled
-    pub fn is_update_mode(&self) -> bool {
+    /// Get the current update mode
+    pub fn update_mode(&self) -> SnapshotUpdateMode {
         self.update_mode
     }
+
+    /// Check if we're in a mode that writes snapshots directly (Always mode)
+    pub fn is_update_mode(&self) -> bool {
+        self.update_mode == SnapshotUpdateMode::Always
+    }
+}
+
+/// Find all pending snapshot files (`.snap.new`) in a directory.
+///
+/// This is useful for `--check` mode to detect stale pending snapshots.
+pub async fn find_pending_snapshots(dir: &Path) -> Vec<PathBuf> {
+    let mut pending = Vec::new();
+    let snapshots_dir = dir.join("snapshots");
+
+    if !snapshots_dir.exists() {
+        return pending;
+    }
+
+    if let Ok(mut entries) = fs::read_dir(&snapshots_dir).await {
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let path = entry.path();
+            if path.extension().is_some_and(|ext| ext == "new") {
+                // Check if it's a .snap.new file
+                if let Some(stem) = path.file_stem() {
+                    if stem.to_string_lossy().ends_with(".snap") {
+                        pending.push(path);
+                    }
+                }
+            }
+        }
+    }
+
+    pending
+}
+
+/// Find all pending snapshot files recursively in a directory tree.
+pub async fn find_all_pending_snapshots(base_dir: &Path) -> Vec<PathBuf> {
+    let mut pending = Vec::new();
+
+    // Helper to recursively scan
+    async fn scan_dir(dir: &Path, pending: &mut Vec<PathBuf>) {
+        // Check for snapshots directory
+        let snapshots_dir = dir.join("snapshots");
+        if snapshots_dir.exists() {
+            if let Ok(mut entries) = fs::read_dir(&snapshots_dir).await {
+                while let Ok(Some(entry)) = entries.next_entry().await {
+                    let path = entry.path();
+                    if path.extension().is_some_and(|ext| ext == "new") {
+                        if let Some(stem) = path.file_stem() {
+                            if stem.to_string_lossy().ends_with(".snap") {
+                                pending.push(path);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Recurse into subdirectories
+        if let Ok(mut entries) = fs::read_dir(dir).await {
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                let path = entry.path();
+                if path.is_dir() && path.file_name().is_some_and(|n| n != "snapshots") {
+                    Box::pin(scan_dir(&path, pending)).await;
+                }
+            }
+        }
+    }
+
+    Box::pin(scan_dir(base_dir, &mut pending)).await;
+    pending
 }
 
 /// Create a Snapshot from components
@@ -508,7 +717,7 @@ mod tests {
     fn test_snapshot_path() {
         let temp = TempDir::new().unwrap();
         let test_file = temp.path().join("my-test.sqltest");
-        let manager = SnapshotManager::new(&test_file, false);
+        let manager = SnapshotManager::new(&test_file, SnapshotUpdateMode::No);
 
         assert_eq!(
             manager.snapshot_path("select-users"),
@@ -520,7 +729,7 @@ mod tests {
     fn test_pending_path() {
         let temp = TempDir::new().unwrap();
         let test_file = temp.path().join("my-test.sqltest");
-        let manager = SnapshotManager::new(&test_file, false);
+        let manager = SnapshotManager::new(&test_file, SnapshotUpdateMode::No);
 
         assert_eq!(
             manager.pending_path("select-users"),
@@ -605,15 +814,15 @@ mod tests {
         let test_file = temp.path().join("test.sqltest");
         let info = SnapshotInfo::new();
 
-        // Create snapshot
-        let manager = SnapshotManager::new(&test_file, true);
+        // Create snapshot using Always mode (writes directly)
+        let manager = SnapshotManager::new(&test_file, SnapshotUpdateMode::Always);
         manager
             .write_snapshot("snap1", "SELECT 1", "content here", &info)
             .await
             .unwrap();
 
-        // Compare
-        let manager2 = SnapshotManager::new(&test_file, false);
+        // Compare using No mode (doesn't write files)
+        let manager2 = SnapshotManager::new(&test_file, SnapshotUpdateMode::No);
         match manager2
             .compare("snap1", "SELECT 1", "content here", &info)
             .await
@@ -629,15 +838,15 @@ mod tests {
         let test_file = temp.path().join("test.sqltest");
         let info = SnapshotInfo::new();
 
-        // Create snapshot
-        let manager = SnapshotManager::new(&test_file, true);
+        // Create snapshot using Always mode
+        let manager = SnapshotManager::new(&test_file, SnapshotUpdateMode::Always);
         manager
             .write_snapshot("snap1", "SELECT 1", "original", &info)
             .await
             .unwrap();
 
-        // Compare with different content
-        let manager2 = SnapshotManager::new(&test_file, false);
+        // Compare with different content using No mode (won't write .snap.new)
+        let manager2 = SnapshotManager::new(&test_file, SnapshotUpdateMode::No);
         match manager2
             .compare("snap1", "SELECT 1", "modified", &info)
             .await
@@ -653,12 +862,45 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_compare_new() {
+    async fn test_compare_mismatch_writes_pending_in_new_mode() {
         let temp = TempDir::new().unwrap();
         let test_file = temp.path().join("test.sqltest");
         let info = SnapshotInfo::new();
 
-        let manager = SnapshotManager::new(&test_file, false);
+        // Create snapshot using Always mode
+        let manager = SnapshotManager::new(&test_file, SnapshotUpdateMode::Always);
+        manager
+            .write_snapshot("snap1", "SELECT 1", "original", &info)
+            .await
+            .unwrap();
+
+        // Compare with different content using New mode (writes .snap.new)
+        let manager2 = SnapshotManager::new(&test_file, SnapshotUpdateMode::New);
+        match manager2
+            .compare("snap1", "SELECT 1", "modified", &info)
+            .await
+        {
+            SnapshotResult::Mismatch {
+                expected, actual, ..
+            } => {
+                assert_eq!(expected, "original");
+                assert_eq!(actual, "modified");
+            }
+            other => panic!("Expected Mismatch, got {other:?}"),
+        }
+
+        // Check that .snap.new was created
+        assert!(manager2.pending_path("snap1").exists());
+    }
+
+    #[tokio::test]
+    async fn test_compare_new_in_new_mode() {
+        let temp = TempDir::new().unwrap();
+        let test_file = temp.path().join("test.sqltest");
+        let info = SnapshotInfo::new();
+
+        // Use New mode - should write .snap.new
+        let manager = SnapshotManager::new(&test_file, SnapshotUpdateMode::New);
         match manager
             .compare("new-snap", "SELECT 1", "new content", &info)
             .await
@@ -671,5 +913,53 @@ mod tests {
 
         // Check that .snap.new was created
         assert!(manager.pending_path("new-snap").exists());
+        // Check that .snap was NOT created
+        assert!(!manager.snapshot_path("new-snap").exists());
+    }
+
+    #[tokio::test]
+    async fn test_compare_new_in_no_mode() {
+        let temp = TempDir::new().unwrap();
+        let test_file = temp.path().join("test.sqltest");
+        let info = SnapshotInfo::new();
+
+        // Use No mode - should NOT write any files
+        let manager = SnapshotManager::new(&test_file, SnapshotUpdateMode::No);
+        match manager
+            .compare("new-snap", "SELECT 1", "new content", &info)
+            .await
+        {
+            SnapshotResult::New { content } => {
+                assert_eq!(content, "new content");
+            }
+            other => panic!("Expected New, got {other:?}"),
+        }
+
+        // Check that no files were created
+        assert!(!manager.pending_path("new-snap").exists());
+        assert!(!manager.snapshot_path("new-snap").exists());
+    }
+
+    #[tokio::test]
+    async fn test_compare_new_in_always_mode() {
+        let temp = TempDir::new().unwrap();
+        let test_file = temp.path().join("test.sqltest");
+        let info = SnapshotInfo::new();
+
+        // Use Always mode - should write .snap directly
+        let manager = SnapshotManager::new(&test_file, SnapshotUpdateMode::Always);
+        match manager
+            .compare("new-snap", "SELECT 1", "new content", &info)
+            .await
+        {
+            SnapshotResult::New { content } => {
+                assert_eq!(content, "new content");
+            }
+            other => panic!("Expected New, got {other:?}"),
+        }
+
+        // Check that .snap was created (not .snap.new)
+        assert!(manager.snapshot_path("new-snap").exists());
+        assert!(!manager.pending_path("new-snap").exists());
     }
 }

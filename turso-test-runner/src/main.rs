@@ -10,9 +10,10 @@ use std::{
     time::Instant,
 };
 use turso_test_runner::{
-    DefaultDatabases, Format, GeneratorConfig, OutputFormat, ParseError, RunnerConfig, TestRunner,
-    backends::cli::CliBackend, backends::js::JsBackend, backends::rust::RustBackend, create_output,
-    generate_database, load_test_files, summarize, tcl_converter,
+    DefaultDatabases, Format, GeneratorConfig, OutputFormat, ParseError, RunnerConfig,
+    SnapshotUpdateMode, TestRunner, backends::cli::CliBackend, backends::js::JsBackend,
+    backends::rust::RustBackend, create_output, find_all_pending_snapshots, generate_database,
+    load_test_files, summarize, tcl_converter,
 };
 
 #[derive(Parser)]
@@ -67,16 +68,20 @@ enum Commands {
         #[arg(long)]
         mvcc: bool,
 
-        /// Update snapshot files instead of comparing
-        #[arg(long)]
-        update_snapshots: bool,
+        /// Snapshot update mode:
+        /// - auto: 'no' in CI, 'new' otherwise (default)
+        /// - new: write .snap.new files for review
+        /// - always: write directly to .snap files
+        /// - no: don't write any snapshot files
+        #[arg(long, default_value_t = SnapshotUpdateMode::default())]
+        snapshot_mode: SnapshotUpdateMode,
 
         /// Filter snapshot tests by name pattern
         #[arg(long)]
         snapshot_filter: Option<String>,
     },
 
-    /// Validate test file syntax
+    /// Validate test file syntax and check for pending snapshots
     Check {
         /// Test files or directories
         #[arg(required = true)]
@@ -140,7 +145,7 @@ async fn main() -> ExitCode {
             output,
             timeout,
             mvcc,
-            update_snapshots,
+            snapshot_mode,
             snapshot_filter,
         } => {
             run_tests(
@@ -154,12 +159,12 @@ async fn main() -> ExitCode {
                 output,
                 timeout,
                 mvcc,
-                update_snapshots,
+                snapshot_mode,
                 snapshot_filter,
             )
             .await
         }
-        Commands::Check { paths } => check_files(paths),
+        Commands::Check { paths } => check_files(paths).await,
         Commands::Convert {
             paths,
             output_dir,
@@ -192,7 +197,7 @@ async fn run_tests(
     output_format: String,
     timeout: u64,
     mvcc: bool,
-    update_snapshots: bool,
+    snapshot_mode: SnapshotUpdateMode,
     snapshot_filter: Option<String>,
 ) -> ExitCode {
     // Resolve paths, trying to add .sqltest extension if missing
@@ -270,7 +275,7 @@ async fn run_tests(
     let mut config = RunnerConfig::default()
         .with_max_jobs(jobs)
         .with_mvcc(mvcc)
-        .with_update_snapshots(update_snapshots);
+        .with_snapshot_update_mode(snapshot_mode);
     if let Some(f) = filter {
         config = config.with_filter(f);
     }
@@ -408,9 +413,41 @@ impl turso_test_runner::DefaultDatabaseResolver for DefaultDatabasesResolver {
     }
 }
 
-fn check_files(paths: Vec<PathBuf>) -> ExitCode {
+async fn check_files(paths: Vec<PathBuf>) -> ExitCode {
     let mut has_errors = false;
 
+    // Check for pending snapshot files
+    let mut pending_files = Vec::new();
+    for path in &paths {
+        let search_dir = if path.is_file() {
+            path.parent().unwrap_or(Path::new("."))
+        } else {
+            path.as_path()
+        };
+        let found = find_all_pending_snapshots(search_dir).await;
+        pending_files.extend(found);
+    }
+
+    if !pending_files.is_empty() {
+        eprintln!(
+            "{}",
+            "Error: Found pending snapshot files (.snap.new)"
+                .red()
+                .bold()
+        );
+        eprintln!("These files indicate uncommitted snapshot changes:");
+        for file in &pending_files {
+            eprintln!("  - {}", file.display());
+        }
+        eprintln!();
+        eprintln!("To resolve:");
+        eprintln!("  - Accept with: --snapshot-mode=always");
+        eprintln!("  - Or review with cargo-insta: https://insta.rs/docs/cli/");
+        eprintln!("  - Or delete the .snap.new files");
+        has_errors = true;
+    }
+
+    // Check test file syntax
     for path in &paths {
         if path.is_dir() {
             // Glob for .sqltest files
