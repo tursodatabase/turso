@@ -3,26 +3,46 @@
 //! This module provides insta-compatible snapshot testing capabilities
 //! for verifying SQL EXPLAIN output remains consistent.
 //!
-//! Uses the `insta` crate for reading snapshots and the `similar` crate for diffs.
+//! Uses serde_yaml for serialization.
 
-use insta::Snapshot;
-use insta::internals::SnapshotContents;
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
-use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
+use tokio::fs;
 
-/// Additional metadata for a snapshot
-#[derive(Debug, Clone, Default)]
+/// Snapshot file metadata (YAML frontmatter)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnapshotMetadata {
+    /// Source test file name
+    pub source: String,
+    /// The SQL expression being snapshotted
+    pub expression: String,
+    /// Name of this snapshot
+    pub snapshot_name: String,
+    /// Structured info section
+    pub info: SnapshotInfo,
+}
+
+/// Structured info section in snapshot metadata
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SnapshotInfo {
-    /// Setup blocks that were executed before this snapshot
-    pub setups: Vec<String>,
-    /// Database type (e.g., ":memory:", "file.db")
+    /// Type of SQL statement (SELECT, INSERT, etc.)
+    pub statement_type: String,
+    /// Tables referenced in the query
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tables: Vec<String>,
+    /// Setup blocks that were used
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub setup_blocks: Vec<String>,
+    /// Database location
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub database: Option<String>,
-    /// Line number in the test file where this snapshot is defined
-    pub line_number: Option<u32>,
+    /// Line number in test file
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line: Option<u32>,
 }
 
 impl SnapshotInfo {
@@ -31,7 +51,7 @@ impl SnapshotInfo {
     }
 
     pub fn with_setups(mut self, setups: Vec<String>) -> Self {
-        self.setups = setups;
+        self.setup_blocks = setups;
         self
     }
 
@@ -41,9 +61,92 @@ impl SnapshotInfo {
     }
 
     pub fn with_line_number(mut self, line: u32) -> Self {
-        self.line_number = Some(line);
+        self.line = Some(line);
         self
     }
+
+    pub fn with_statement_type(mut self, stmt_type: String) -> Self {
+        self.statement_type = stmt_type;
+        self
+    }
+
+    pub fn with_tables(mut self, tables: Vec<String>) -> Self {
+        self.tables = tables;
+        self
+    }
+}
+
+/// A complete parsed snapshot with metadata and content
+#[derive(Debug, Clone)]
+pub struct Snapshot {
+    /// The YAML metadata
+    pub metadata: SnapshotMetadata,
+    /// The actual snapshot content (EXPLAIN output)
+    pub content: String,
+}
+
+impl Snapshot {
+    /// Parse a snapshot file from its contents
+    pub fn parse(file_contents: &str) -> Result<Self, SnapshotParseError> {
+        let (yaml_str, content) = split_frontmatter(file_contents)?;
+        let metadata: SnapshotMetadata =
+            serde_yaml::from_str(&yaml_str).map_err(SnapshotParseError::Yaml)?;
+
+        Ok(Snapshot {
+            metadata,
+            content: content.to_string(),
+        })
+    }
+
+    /// Serialize to the snapshot file format
+    pub fn to_string(&self) -> Result<String, SnapshotParseError> {
+        let yaml = serde_yaml::to_string(&self.metadata).map_err(SnapshotParseError::Yaml)?;
+        Ok(format!("---\n{}---\n{}\n", yaml, self.content))
+    }
+}
+
+/// Error type for snapshot parsing
+#[derive(Debug)]
+pub enum SnapshotParseError {
+    /// Invalid frontmatter format
+    InvalidFormat(String),
+    /// YAML parsing error
+    Yaml(serde_yaml::Error),
+}
+
+impl std::fmt::Display for SnapshotParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidFormat(msg) => write!(f, "Invalid snapshot format: {msg}"),
+            Self::Yaml(e) => write!(f, "YAML error: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for SnapshotParseError {}
+
+/// Split a snapshot file into YAML frontmatter and content
+fn split_frontmatter(contents: &str) -> Result<(String, String), SnapshotParseError> {
+    let contents = contents.trim_start();
+
+    if !contents.starts_with("---") {
+        return Err(SnapshotParseError::InvalidFormat(
+            "File must start with ---".to_string(),
+        ));
+    }
+
+    let after_first = &contents[3..];
+    let end_idx = after_first.find("\n---").ok_or_else(|| {
+        SnapshotParseError::InvalidFormat("Missing closing --- for frontmatter".to_string())
+    })?;
+
+    let yaml = after_first[..end_idx].trim().to_string();
+    let content = after_first[end_idx + 4..]
+        .trim_start_matches('\n')
+        .trim_end()
+        .to_string();
+
+    Ok((yaml, content))
 }
 
 /// Result of comparing a snapshot
@@ -58,17 +161,11 @@ pub enum SnapshotResult {
         diff: String,
     },
     /// No snapshot exists yet
-    New {
-        content: String,
-    },
+    New { content: String },
     /// Snapshot was updated (when in update mode)
-    Updated {
-        old: String,
-        new: String,
-    },
-    Error {
-        msg: String,
-    },
+    Updated { old: String, new: String },
+    /// Error occurred
+    Error { msg: String },
 }
 
 /// Manages snapshot files for a test file
@@ -120,19 +217,21 @@ impl SnapshotManager {
             .join(format!("{file_stem}__{name}.snap.new"))
     }
 
-    /// Read an existing snapshot file using insta's Snapshot type
-    pub fn read_snapshot(&self, name: &str) -> Option<String> {
-        let path = self.snapshot_path(name);
-
-        // Use insta's Snapshot::from_file to load the snapshot
-        Snapshot::from_file(&path).ok().map(|snapshot| {
-            // Extract text content from SnapshotContents
-            snapshot_contents_to_string(snapshot.contents())
-        })
+    /// Read an existing snapshot file and return its content
+    pub async fn read_snapshot(&self, name: &str) -> Option<String> {
+        let parsed = self.read_snapshot(name).await?;
+        Some(parsed.content)
     }
 
-    /// Write a snapshot file in insta-compatible format
-    pub fn write_snapshot(
+    /// Read and parse a snapshot file with full metadata
+    pub async fn read_snapshot(&self, name: &str) -> Option<Snapshot> {
+        let path = self.snapshot_path(name);
+        let contents = fs::read_to_string(&path).await.ok()?;
+        Snapshot::parse(&contents).ok()
+    }
+
+    /// Write a snapshot file
+    pub async fn write_snapshot(
         &self,
         name: &str,
         sql: &str,
@@ -143,15 +242,19 @@ impl SnapshotManager {
 
         // Ensure snapshots directory exists
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
+            fs::create_dir_all(parent).await?;
         }
 
-        let formatted = format_snapshot(&self.test_file_path, name, sql, content, info);
-        fs::write(&path, formatted)
+        let snapshot = create_snapshot(&self.test_file_path, name, sql, content, info);
+        let formatted = snapshot
+            .to_string()
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+
+        fs::write(&path, formatted).await
     }
 
-    /// Write a pending snapshot file (.snap.new) in insta-compatible format
-    pub fn write_pending(
+    /// Write a pending snapshot file (.snap.new)
+    pub async fn write_pending(
         &self,
         name: &str,
         sql: &str,
@@ -162,15 +265,19 @@ impl SnapshotManager {
 
         // Ensure snapshots directory exists
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
+            fs::create_dir_all(parent).await?;
         }
 
-        let formatted = format_snapshot(&self.test_file_path, name, sql, content, info);
-        fs::write(&path, formatted)
+        let snapshot = create_snapshot(&self.test_file_path, name, sql, content, info);
+        let formatted = snapshot
+            .to_string()
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+
+        fs::write(&path, formatted).await
     }
 
     /// Compare actual output against stored snapshot
-    pub fn compare(
+    pub async fn compare(
         &self,
         name: &str,
         sql: &str,
@@ -179,39 +286,44 @@ impl SnapshotManager {
     ) -> SnapshotResult {
         let path = self.snapshot_path(name);
 
-        // Try to load existing snapshot using insta
-        match Snapshot::from_file(&path) {
-            Ok(snapshot) => {
-                let expected = snapshot_contents_to_string(snapshot.contents());
+        // Try to read existing snapshot
+        match fs::read_to_string(&path).await {
+            Ok(contents) => match Snapshot::parse(&contents) {
+                Ok(snapshot) => {
+                    let expected = &snapshot.content;
 
-                if expected.trim() == actual.trim() {
-                    SnapshotResult::Match
-                } else if self.update_mode {
-                    // Update the snapshot
-                    if let Err(e) = self.write_snapshot(name, sql, actual, info) {
-                        return SnapshotResult::Error {
-                            msg: format!("Failed to update snapshot: {e}"),
-                        };
-                    }
-                    SnapshotResult::Updated {
-                        old: expected,
-                        new: actual.to_string(),
-                    }
-                } else {
-                    // Generate diff using similar
-                    let diff = generate_diff(&expected, actual);
-                    SnapshotResult::Mismatch {
-                        expected,
-                        actual: actual.to_string(),
-                        diff,
+                    if expected.trim() == actual.trim() {
+                        SnapshotResult::Match
+                    } else if self.update_mode {
+                        // Update the snapshot
+                        if let Err(e) = self.write_snapshot(name, sql, actual, info).await {
+                            return SnapshotResult::Error {
+                                msg: format!("Failed to update snapshot: {e}"),
+                            };
+                        }
+                        SnapshotResult::Updated {
+                            old: expected.clone(),
+                            new: actual.to_string(),
+                        }
+                    } else {
+                        // Generate diff
+                        let diff = generate_diff(expected, actual);
+                        SnapshotResult::Mismatch {
+                            expected: expected.clone(),
+                            actual: actual.to_string(),
+                            diff,
+                        }
                     }
                 }
-            }
+                Err(e) => SnapshotResult::Error {
+                    msg: format!("Failed to parse snapshot: {e}"),
+                },
+            },
             Err(_) => {
                 // No existing snapshot
                 if self.update_mode {
                     // Create the snapshot directly
-                    if let Err(e) = self.write_snapshot(name, sql, actual, info) {
+                    if let Err(e) = self.write_snapshot(name, sql, actual, info).await {
                         return SnapshotResult::Error {
                             msg: format!("Failed to create snapshot: {e}"),
                         };
@@ -221,7 +333,7 @@ impl SnapshotManager {
                     }
                 } else {
                     // Write to .snap.new for review
-                    let _ = self.write_pending(name, sql, actual, info);
+                    let _ = self.write_pending(name, sql, actual, info).await;
                     SnapshotResult::New {
                         content: actual.to_string(),
                     }
@@ -236,131 +348,65 @@ impl SnapshotManager {
     }
 }
 
-/// Extract string content from insta's SnapshotContents
-fn snapshot_contents_to_string(contents: &SnapshotContents) -> String {
-    match contents {
-        SnapshotContents::Text(text) => text.to_string(),
-        SnapshotContents::Binary(bytes) => {
-            // Convert binary to string (lossy) - binary snapshots are rare for EXPLAIN output
-            String::from_utf8_lossy(bytes).to_string()
-        }
-    }
-}
-
-/// Format snapshot content in insta-compatible format with YAML frontmatter
-fn format_snapshot(
+/// Create a ParsedSnapshot from components
+fn create_snapshot(
     source_path: &Path,
     snapshot_name: &str,
     sql: &str,
     content: &str,
     info: &SnapshotInfo,
-) -> String {
+) -> Snapshot {
     let source = source_path
         .file_name()
         .and_then(|s| s.to_str())
-        .unwrap_or("unknown");
+        .unwrap_or("unknown")
+        .to_string();
 
-    // Format SQL for YAML expression field
-    let expression_yaml = format_yaml_string(sql);
+    // Extract tables from SQL
+    let tables: Vec<String> = extract_tables(sql).into_iter().collect();
 
-    // Extract tables referenced in the SQL
-    let tables = extract_tables(sql);
+    // Detect statement type
+    let statement_type = detect_statement_type(sql).to_string();
 
-    // Determine the SQL statement type
-    let statement_type = detect_statement_type(sql);
+    let metadata = SnapshotMetadata {
+        source,
+        expression: sql.to_string(),
+        snapshot_name: snapshot_name.to_string(),
+        info: SnapshotInfo {
+            statement_type,
+            tables,
+            setup_blocks: info.setup_blocks.clone(),
+            database: info.database.clone(),
+            line: info.line,
+        },
+    };
 
-    // Build the info section
-    let info_yaml = format_info_section(&tables, &statement_type, info);
-
-    // Build the YAML frontmatter with insta-compatible fields
-    format!(
-        "---
-source: {source}
-expression: {expression_yaml}
-snapshot_name: {snapshot_name}
-{info_yaml}---
-{content}
-"
-    )
-}
-
-/// Format the info section as YAML
-fn format_info_section(
-    tables: &BTreeSet<String>,
-    statement_type: &str,
-    info: &SnapshotInfo,
-) -> String {
-    let mut lines = vec!["info:".to_string()];
-
-    // Statement type
-    lines.push(format!("  statement_type: {statement_type}"));
-
-    // Tables referenced
-    if !tables.is_empty() {
-        lines.push("  tables:".to_string());
-        for table in tables {
-            lines.push(format!("    - {table}"));
-        }
-    }
-
-    // Setup blocks used
-    if !info.setups.is_empty() {
-        lines.push("  setup_blocks:".to_string());
-        for setup in &info.setups {
-            lines.push(format!("    - {setup}"));
-        }
-    }
-
-    // Database configuration
-    if let Some(ref db) = info.database {
-        lines.push(format!("  database: \"{db}\""));
-    }
-
-    // Line number in test file
-    if let Some(line) = info.line_number {
-        lines.push(format!("  line: {line}"));
-    }
-
-    lines.push(String::new()); // trailing newline before ---
-    lines.join("\n")
-}
-
-/// Format a string for YAML, using block scalar for complex strings
-fn format_yaml_string(s: &str) -> String {
-    // Use YAML literal block scalar (|) for multi-line or strings with special chars
-    if s.contains('\n') || s.contains(':') || s.contains('"') || s.contains('\'') {
-        let indented = s
-            .lines()
-            .map(|line| format!("  {line}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        format!("|\n{indented}")
-    } else {
-        // Simple single-line strings can be quoted
-        format!("\"{s}\"")
+    Snapshot {
+        metadata,
+        content: content.to_string(),
     }
 }
 
 // Regex patterns for extracting table names from SQL
 static TABLE_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
     vec![
-        // FROM clause: FROM table, FROM schema.table
+        // FROM clause
         Regex::new(r"(?i)\bFROM\s+([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)?)").unwrap(),
-        // JOIN clause: JOIN table, LEFT JOIN table, etc.
+        // JOIN clause
         Regex::new(r"(?i)\bJOIN\s+([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)?)").unwrap(),
-        // INSERT INTO table
+        // INSERT INTO
         Regex::new(r"(?i)\bINSERT\s+INTO\s+([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)?)").unwrap(),
-        // UPDATE table
+        // UPDATE
         Regex::new(r"(?i)\bUPDATE\s+([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)?)").unwrap(),
-        // DELETE FROM table
+        // DELETE FROM
         Regex::new(r"(?i)\bDELETE\s+FROM\s+([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)?)").unwrap(),
-        // CREATE TABLE table
+        // CREATE TABLE
         Regex::new(r"(?i)\bCREATE\s+(?:TEMP\s+|TEMPORARY\s+)?TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)?)").unwrap(),
-        // DROP TABLE table
+        // DROP TABLE
         Regex::new(r"(?i)\bDROP\s+TABLE\s+(?:IF\s+EXISTS\s+)?([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)?)").unwrap(),
-        // ALTER TABLE table
+        // ALTER TABLE
         Regex::new(r"(?i)\bALTER\s+TABLE\s+([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)?)").unwrap(),
-        // CREATE INDEX ... ON table
+        // CREATE INDEX ... ON
         Regex::new(r"(?i)\bON\s+([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)?)").unwrap(),
     ]
 });
@@ -373,7 +419,6 @@ fn extract_tables(sql: &str) -> BTreeSet<String> {
         for cap in pattern.captures_iter(sql) {
             if let Some(table) = cap.get(1) {
                 let table_name = table.as_str().to_lowercase();
-                // Filter out SQL keywords that might be matched
                 if !is_sql_keyword(&table_name) {
                     tables.insert(table_name);
                 }
@@ -384,7 +429,7 @@ fn extract_tables(sql: &str) -> BTreeSet<String> {
     tables
 }
 
-/// Check if a string is a SQL keyword (to filter false positives)
+/// Check if a string is a SQL keyword
 fn is_sql_keyword(s: &str) -> bool {
     matches!(
         s.to_uppercase().as_str(),
@@ -450,7 +495,7 @@ fn detect_statement_type(sql: &str) -> &'static str {
     }
 }
 
-/// Generate a unified diff between expected and actual content using similar
+/// Generate a unified diff between expected and actual content
 fn generate_diff(expected: &str, actual: &str) -> String {
     use similar::{ChangeTag, TextDiff};
 
@@ -503,59 +548,28 @@ mod tests {
     }
 
     #[test]
-    fn test_format_snapshot() {
+    fn test_create_and_parse_snapshot() {
         let path = PathBuf::from("tests/my-test.sqltest");
         let sql = "SELECT * FROM users";
         let content = "addr  opcode\n0     Init";
-        let info = SnapshotInfo::new();
-        let formatted = format_snapshot(&path, "test-name", sql, content, &info);
-
-        assert!(formatted.contains("source: my-test.sqltest"));
-        assert!(formatted.contains("expression: \"SELECT * FROM users\""));
-        assert!(formatted.contains("snapshot_name: test-name"));
-        assert!(formatted.contains("statement_type: SELECT"));
-        assert!(formatted.contains("tables:"));
-        assert!(formatted.contains("- users"));
-        assert!(formatted.contains("addr  opcode"));
-    }
-
-    #[test]
-    fn test_format_snapshot_multiline_sql() {
-        let path = PathBuf::from("tests/my-test.sqltest");
-        let sql = "SELECT *\nFROM users\nWHERE id = 1";
-        let content = "0|Init";
-        let info = SnapshotInfo::new();
-        let formatted = format_snapshot(&path, "test-name", sql, content, &info);
-
-        // Multi-line SQL should use YAML block scalar in expression
-        assert!(formatted.contains("expression: |"));
-        assert!(formatted.contains("  SELECT *"));
-        assert!(formatted.contains("  FROM users"));
-        assert!(formatted.contains("snapshot_name: test-name"));
-    }
-
-    #[test]
-    fn test_format_snapshot_with_info() {
-        let path = PathBuf::from("tests/my-test.sqltest");
-        let sql = "SELECT * FROM users JOIN orders ON users.id = orders.user_id";
-        let content = "0|Init";
         let info = SnapshotInfo::new()
-            .with_setups(vec!["schema".to_string(), "data".to_string()])
-            .with_database(":memory:".to_string())
-            .with_line_number(42);
-        let formatted = format_snapshot(&path, "test-name", sql, content, &info);
+            .with_setups(vec!["schema".to_string()])
+            .with_database(":memory:".to_string());
 
-        // Check info section
-        assert!(formatted.contains("info:"));
-        assert!(formatted.contains("statement_type: SELECT"));
-        assert!(formatted.contains("tables:"));
-        assert!(formatted.contains("- users"));
-        assert!(formatted.contains("- orders"));
-        assert!(formatted.contains("setup_blocks:"));
-        assert!(formatted.contains("- schema"));
-        assert!(formatted.contains("- data"));
-        assert!(formatted.contains("database: \":memory:\""));
-        assert!(formatted.contains("line: 42"));
+        let snapshot = create_snapshot(&path, "test-name", sql, content, &info);
+        let serialized = snapshot.to_string().unwrap();
+
+        // Parse it back
+        let parsed = Snapshot::parse(&serialized).unwrap();
+
+        assert_eq!(parsed.metadata.source, "my-test.sqltest");
+        assert_eq!(parsed.metadata.expression, "SELECT * FROM users");
+        assert_eq!(parsed.metadata.snapshot_name, "test-name");
+        assert_eq!(parsed.metadata.info.statement_type, "SELECT");
+        assert!(parsed.metadata.info.tables.contains(&"users".to_string()));
+        assert_eq!(parsed.metadata.info.setup_blocks, vec!["schema"]);
+        assert_eq!(parsed.metadata.info.database, Some(":memory:".to_string()));
+        assert_eq!(parsed.content, content);
     }
 
     #[test]
@@ -606,8 +620,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_compare_match() {
+    #[tokio::test]
+    async fn test_compare_match() {
         let temp = TempDir::new().unwrap();
         let test_file = temp.path().join("test.sqltest");
         let info = SnapshotInfo::new();
@@ -616,18 +630,22 @@ mod tests {
         let manager = SnapshotManager::new(&test_file, true);
         manager
             .write_snapshot("snap1", "SELECT 1", "content here", &info)
+            .await
             .unwrap();
 
         // Compare
         let manager2 = SnapshotManager::new(&test_file, false);
-        match manager2.compare("snap1", "SELECT 1", "content here", &info) {
+        match manager2
+            .compare("snap1", "SELECT 1", "content here", &info)
+            .await
+        {
             SnapshotResult::Match => {}
             other => panic!("Expected Match, got {other:?}"),
         }
     }
 
-    #[test]
-    fn test_compare_mismatch() {
+    #[tokio::test]
+    async fn test_compare_mismatch() {
         let temp = TempDir::new().unwrap();
         let test_file = temp.path().join("test.sqltest");
         let info = SnapshotInfo::new();
@@ -636,11 +654,15 @@ mod tests {
         let manager = SnapshotManager::new(&test_file, true);
         manager
             .write_snapshot("snap1", "SELECT 1", "original", &info)
+            .await
             .unwrap();
 
         // Compare with different content
         let manager2 = SnapshotManager::new(&test_file, false);
-        match manager2.compare("snap1", "SELECT 1", "modified", &info) {
+        match manager2
+            .compare("snap1", "SELECT 1", "modified", &info)
+            .await
+        {
             SnapshotResult::Mismatch {
                 expected, actual, ..
             } => {
@@ -651,14 +673,17 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_compare_new() {
+    #[tokio::test]
+    async fn test_compare_new() {
         let temp = TempDir::new().unwrap();
         let test_file = temp.path().join("test.sqltest");
         let info = SnapshotInfo::new();
 
         let manager = SnapshotManager::new(&test_file, false);
-        match manager.compare("new-snap", "SELECT 1", "new content", &info) {
+        match manager
+            .compare("new-snap", "SELECT 1", "new content", &info)
+            .await
+        {
             SnapshotResult::New { content } => {
                 assert_eq!(content, "new content");
             }
