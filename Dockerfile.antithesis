@@ -39,6 +39,7 @@ COPY ./testing/concurrent-simulator ./testing/concurrent-simulator/
 COPY ./testing/differential-oracle ./testing/differential-oracle/
 COPY ./sdk-kit ./sdk-kit/
 COPY ./sdk-kit-macros ./sdk-kit-macros/
+COPY ./tools ./tools/
 RUN cargo chef prepare --bin turso_stress --recipe-path recipe.json
 
 #
@@ -85,6 +86,7 @@ COPY --from=planner /app/testing/concurrent-simulator ./testing/concurrent-simul
 COPY --from=planner /app/testing/differential-oracle ./testing/differential-oracle
 COPY --from=planner /app/sdk-kit ./sdk-kit/
 COPY --from=planner /app/sdk-kit-macros ./sdk-kit-macros/
+COPY --from=planner /app/tools ./tools/
 
 RUN if [ "$antithesis" = "true" ]; then \
         cp /opt/antithesis/libvoidstar.so /usr/lib/libvoidstar.so && \
