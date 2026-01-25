@@ -3,7 +3,7 @@ use crate::comparison::{ComparisonResult, compare};
 use crate::parser::ast::{
     Capability, DatabaseConfig, Requirement, SnapshotCase, TestCase, TestFile,
 };
-use crate::snapshot::{SnapshotManager, SnapshotResult};
+use crate::snapshot::{SnapshotInfo, SnapshotManager, SnapshotResult};
 use futures::FutureExt;
 use futures::stream::{FuturesUnordered, StreamExt};
 use std::collections::HashSet;
@@ -866,9 +866,24 @@ async fn run_single_snapshot_test<B: SqlBackend>(
             .collect::<Vec<_>>()
             .join("\n");
 
+        // Build snapshot info with metadata
+        let db_location_str = match &db_config.location {
+            crate::parser::ast::DatabaseLocation::Memory => ":memory:".to_string(),
+            crate::parser::ast::DatabaseLocation::TempFile => ":temp:".to_string(),
+            crate::parser::ast::DatabaseLocation::Path(p) => p.display().to_string(),
+            crate::parser::ast::DatabaseLocation::Default => ":default:".to_string(),
+            crate::parser::ast::DatabaseLocation::DefaultNoRowidAlias => {
+                ":default-no-rowidalias:".to_string()
+            }
+        };
+        let snapshot_info = SnapshotInfo::new()
+            .with_setups(snapshot.setups.iter().map(|s| s.name.clone()).collect())
+            .with_database(db_location_str);
+
         // Compare with snapshot
         let snapshot_manager = SnapshotManager::new(&file_path, update_snapshots);
-        let snapshot_result = snapshot_manager.compare(&snapshot.name, &actual_output);
+        let snapshot_result =
+            snapshot_manager.compare(&snapshot.name, &snapshot.sql, &actual_output, &snapshot_info);
 
         let outcome = match snapshot_result {
             SnapshotResult::Match => TestOutcome::Passed,
@@ -883,6 +898,7 @@ async fn run_single_snapshot_test<B: SqlBackend>(
             },
             SnapshotResult::New { content } => TestOutcome::SnapshotNew { content },
             SnapshotResult::Updated { old, new } => TestOutcome::SnapshotUpdated { old, new },
+            SnapshotResult::Error { msg } => TestOutcome::Error { message: msg },
         };
 
         TestResult {

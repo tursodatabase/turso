@@ -28,6 +28,7 @@ tempfile = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 similar = { workspace = true }
+insta = { version = "1.41", default-features = false, features = ["yaml"] }
 num_cpus = "1"
 
 # Serialization
