@@ -21,4 +21,7 @@ pub use runner::{
     FileResult, LoadedTests, RunSummary, RunnerConfig, TestOutcome, TestResult, TestRunner,
     load_test_files, summarize,
 };
-pub use snapshot::{SnapshotManager, SnapshotResult};
+pub use snapshot::{
+    SnapshotManager, SnapshotResult, SnapshotUpdateMode, find_all_pending_snapshots,
+    find_pending_snapshots, is_ci,
+};
