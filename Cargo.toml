@@ -90,8 +90,8 @@ bitflags = "2.9.4"
 fallible-iterator = "0.3.0"
 
 criterion = "0.5.0"
-codspeed-criterion-compat = "4.2.1"
-divan = { package = "codspeed-divan-compat", version = "4.2.1" }
+codspeed-criterion-compat = "4.3.0"
+divan = { package = "codspeed-divan-compat", version = "4.3.0" }
 
 chrono = { version = "0.4.42", default-features = false }
 hex = "0.4"
