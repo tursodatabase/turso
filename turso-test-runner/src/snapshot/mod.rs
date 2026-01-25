@@ -8,7 +8,6 @@
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
-use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use tokio::fs;
@@ -220,10 +219,12 @@ impl SnapshotManager {
     /// Read and parse a snapshot file with full metadata
     pub async fn read_snapshot(&self, name: &str) -> anyhow::Result<Option<Snapshot>> {
         let path = self.snapshot_path(name);
-        let contents = fs::read_to_string(&path).await?;
-        Ok(Snapshot::parse(&contents)?)
+        match fs::read_to_string(&path).await {
+            Ok(contents) => Ok(Some(Snapshot::parse(&contents)?)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
     }
-    
 
     /// Write a snapshot file
     pub async fn write_snapshot(
@@ -243,7 +244,8 @@ impl SnapshotManager {
         let snapshot = create_snapshot(&self.test_file_path, name, sql, content, info);
         let formatted = snapshot.to_string()?;
 
-        fs::write(&path, formatted).await
+        fs::write(&path, formatted).await?;
+        Ok(())
     }
 
     /// Write a pending snapshot file (.snap.new)
@@ -264,7 +266,8 @@ impl SnapshotManager {
         let snapshot = create_snapshot(&self.test_file_path, name, sql, content, info);
         let formatted = snapshot.to_string()?;
 
-        fs::write(&path, formatted).await
+        fs::write(&path, formatted).await?;
+        Ok(())
     }
 
     /// Compare actual output against stored snapshot
@@ -275,8 +278,6 @@ impl SnapshotManager {
         actual: &str,
         info: &SnapshotInfo,
     ) -> SnapshotResult {
-        let path = self.snapshot_path(name);
-
         // Try to read existing snapshot
         match self.read_snapshot(name).await {
             Ok(Some(snapshot)) => {

@@ -1,17 +1,324 @@
-use crate::backends::{BackendError, SqlBackend};
+use crate::backends::{BackendError, QueryResult, SqlBackend};
 use crate::comparison::{ComparisonResult, compare};
 use crate::parser::ast::{
-    Capability, DatabaseConfig, Requirement, SnapshotCase, TestCase, TestFile,
+    Backend, Capability, DatabaseConfig, Requirement, SetupRef, Skip, SkipCondition, SnapshotCase,
+    TestCase, TestFile,
 };
 use crate::snapshot::{SnapshotInfo, SnapshotManager, SnapshotResult};
+use async_trait::async_trait;
 use futures::FutureExt;
 use futures::stream::{FuturesUnordered, StreamExt};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
+
+// ============================================================================
+// Runnable trait and RunOptions
+// ============================================================================
+
+/// Options for running a test or snapshot
+#[derive(Clone)]
+pub struct RunOptions {
+    /// Path to the source file
+    pub file_path: PathBuf,
+    /// Database configuration
+    pub db_config: DatabaseConfig,
+    /// Available setup blocks (name -> SQL)
+    pub setups: HashMap<String, String>,
+    /// Whether MVCC mode is enabled
+    pub mvcc: bool,
+    /// Global skip directive
+    pub global_skip: Option<Skip>,
+    /// Global capability requirements (used by tests)
+    pub global_requires: Vec<Requirement>,
+    /// Backend capabilities (used by tests)
+    pub backend_capabilities: HashSet<Capability>,
+    /// Backend type (used by tests)
+    pub backend_type: Backend,
+    /// Whether to update snapshots (used by snapshots)
+    pub update_snapshots: bool,
+}
+
+/// Trait for runnable test items (tests and snapshots)
+#[async_trait]
+pub trait Runnable: Clone + Send + 'static {
+    /// Get the name of this test item
+    fn name(&self) -> &str;
+
+    /// Get the skip configuration, if any
+    fn skip(&self) -> Option<&Skip>;
+
+    /// Get setup references
+    fn setups(&self) -> &[SetupRef];
+
+    /// Check if this test should be skipped due to additional conditions (e.g., capabilities)
+    /// Returns Some(reason) if should skip, None if can proceed
+    fn check_skip_conditions(&self, options: &RunOptions) -> Option<String>;
+
+    /// Get the SQL to execute
+    fn sql_to_execute(&self) -> String;
+
+    /// Evaluate the execution result and return the outcome
+    async fn evaluate_result(&self, result: QueryResult, options: &RunOptions) -> TestOutcome;
+}
+
+// ============================================================================
+// Runnable implementations
+// ============================================================================
+
+#[async_trait]
+impl Runnable for TestCase {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn skip(&self) -> Option<&Skip> {
+        self.skip.as_ref()
+    }
+
+    fn setups(&self) -> &[SetupRef] {
+        &self.setups
+    }
+
+    fn check_skip_conditions(&self, options: &RunOptions) -> Option<String> {
+        // Check required capabilities (global + per-test)
+        for req in options.global_requires.iter().chain(self.requires.iter()) {
+            if !options.backend_capabilities.contains(&req.capability) {
+                return Some(format!("requires {}: {}", req.capability, req.reason));
+            }
+        }
+        None
+    }
+
+    fn sql_to_execute(&self) -> String {
+        self.sql.clone()
+    }
+
+    async fn evaluate_result(&self, result: QueryResult, options: &RunOptions) -> TestOutcome {
+        let expectation = self.expectations.for_backend(options.backend_type);
+        let comparison = compare(&result, expectation);
+        match comparison {
+            ComparisonResult::Match => TestOutcome::Passed,
+            ComparisonResult::Mismatch { reason } => TestOutcome::Failed { reason },
+        }
+    }
+}
+
+#[async_trait]
+impl Runnable for SnapshotCase {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn skip(&self) -> Option<&Skip> {
+        self.skip.as_ref()
+    }
+
+    fn setups(&self) -> &[SetupRef] {
+        &self.setups
+    }
+
+    fn check_skip_conditions(&self, _options: &RunOptions) -> Option<String> {
+        // Snapshots have no additional skip conditions
+        None
+    }
+
+    fn sql_to_execute(&self) -> String {
+        format!("EXPLAIN {}", self.sql)
+    }
+
+    async fn evaluate_result(&self, result: QueryResult, options: &RunOptions) -> TestOutcome {
+        // Format EXPLAIN output for snapshot
+        let actual_output = result
+            .rows
+            .iter()
+            .map(|row| row.join("|"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // Build snapshot info with metadata
+        let db_location_str = options.db_config.location.to_string();
+        let snapshot_info = SnapshotInfo::new()
+            .with_setups(self.setups.iter().map(|s| s.name.clone()).collect())
+            .with_database(db_location_str);
+
+        // Compare with snapshot
+        let snapshot_manager = SnapshotManager::new(&options.file_path, options.update_snapshots);
+        let snapshot_result = snapshot_manager
+            .compare(&self.name, &self.sql, &actual_output, &snapshot_info)
+            .await;
+
+        match snapshot_result {
+            SnapshotResult::Match => TestOutcome::Passed,
+            SnapshotResult::Mismatch {
+                expected,
+                actual,
+                diff,
+            } => TestOutcome::SnapshotMismatch {
+                expected,
+                actual,
+                diff,
+            },
+            SnapshotResult::New { content } => TestOutcome::SnapshotNew { content },
+            SnapshotResult::Updated { old, new } => TestOutcome::SnapshotUpdated { old, new },
+            SnapshotResult::Error { msg } => TestOutcome::Error { message: msg },
+        }
+    }
+}
+
+// ============================================================================
+// Generic test runner
+// ============================================================================
+
+/// Run a single test item (test or snapshot)
+async fn run_single<B: SqlBackend, R: Runnable>(
+    backend: Arc<B>,
+    test: R,
+    options: RunOptions,
+) -> TestResult {
+    let start = Instant::now();
+
+    // Capture info for panic recovery
+    let item_name = test.name().to_string();
+    let file_path_for_panic = options.file_path.clone();
+    let db_config_for_panic = options.db_config.clone();
+
+    let test_future = async move {
+        // Check if skipped (per-item skip overrides global skip)
+        let effective_skip = test.skip().or(options.global_skip.as_ref());
+        if let Some(skip) = effective_skip {
+            let should_skip = match &skip.condition {
+                None => true, // Unconditional skip
+                Some(SkipCondition::Mvcc) => options.mvcc,
+            };
+            if should_skip {
+                return TestResult {
+                    name: test.name().to_string(),
+                    file: options.file_path,
+                    database: options.db_config,
+                    outcome: TestOutcome::Skipped {
+                        reason: skip.reason.clone(),
+                    },
+                    duration: start.elapsed(),
+                };
+            }
+        }
+
+        // Check additional skip conditions (e.g., capabilities)
+        if let Some(reason) = test.check_skip_conditions(&options) {
+            return TestResult {
+                name: test.name().to_string(),
+                file: options.file_path,
+                database: options.db_config,
+                outcome: TestOutcome::Skipped { reason },
+                duration: start.elapsed(),
+            };
+        }
+
+        // Create database instance
+        let mut db = match backend.create_database(&options.db_config).await {
+            Ok(db) => db,
+            Err(e) => {
+                return TestResult {
+                    name: test.name().to_string(),
+                    file: options.file_path,
+                    database: options.db_config,
+                    outcome: TestOutcome::Error {
+                        message: format!("failed to create database: {e}"),
+                    },
+                    duration: start.elapsed(),
+                };
+            }
+        };
+
+        // Run setups
+        for setup_ref in test.setups() {
+            if let Some(setup_sql) = options.setups.get(&setup_ref.name) {
+                if let Err(e) = db.execute_setup(setup_sql).await {
+                    let _ = db.close().await;
+                    return TestResult {
+                        name: test.name().to_string(),
+                        file: options.file_path,
+                        database: options.db_config,
+                        outcome: TestOutcome::Error {
+                            message: format!("setup '{}' failed: {}", setup_ref.name, e),
+                        },
+                        duration: start.elapsed(),
+                    };
+                }
+            } else {
+                let _ = db.close().await;
+                return TestResult {
+                    name: test.name().to_string(),
+                    file: options.file_path,
+                    database: options.db_config,
+                    outcome: TestOutcome::Error {
+                        message: format!("setup '{}' not found", setup_ref.name),
+                    },
+                    duration: start.elapsed(),
+                };
+            }
+        }
+
+        // Execute SQL
+        let sql = test.sql_to_execute();
+        let result = match db.execute(&sql).await {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = db.close().await;
+                return TestResult {
+                    name: test.name().to_string(),
+                    file: options.file_path,
+                    database: options.db_config,
+                    outcome: TestOutcome::Error {
+                        message: format!("execution failed: {e}"),
+                    },
+                    duration: start.elapsed(),
+                };
+            }
+        };
+
+        // Close database
+        let _ = db.close().await;
+
+        // Evaluate result
+        let outcome = test.evaluate_result(result, &options).await;
+
+        TestResult {
+            name: test.name().to_string(),
+            file: options.file_path,
+            database: options.db_config,
+            outcome,
+            duration: start.elapsed(),
+        }
+    };
+
+    match AssertUnwindSafe(test_future).catch_unwind().await {
+        Ok(result) => result,
+        Err(panic_info) => {
+            let panic_message = if let Some(s) = panic_info.downcast_ref::<&str>() {
+                (*s).to_string()
+            } else if let Some(s) = panic_info.downcast_ref::<String>() {
+                s.clone()
+            } else {
+                "unknown panic".to_string()
+            };
+
+            TestResult {
+                name: item_name,
+                file: file_path_for_panic,
+                database: db_config_for_panic,
+                outcome: TestOutcome::Error {
+                    message: format!("panic: {panic_message}"),
+                },
+                duration: start.elapsed(),
+            }
+        }
+    }
+}
 
 /// Result of loading test files
 pub struct LoadedTests {
@@ -355,28 +662,22 @@ impl<B: SqlBackend + 'static> TestRunner<B> {
                 let backend = Arc::clone(&self.backend);
                 let semaphore = Arc::clone(&self.semaphore);
                 let test = test.clone();
-                let db_config = db_config.clone();
-                let setups = test_file.setups.clone();
-                let file_path = path.to_path_buf();
-                let mvcc = self.config.mvcc;
-                let global_skip = test_file.global_skip.clone();
-                let global_requires = test_file.global_requires.clone();
-                let capabilities = backend_capabilities.clone();
+
+                let options = RunOptions {
+                    file_path: path.to_path_buf(),
+                    db_config: db_config.clone(),
+                    setups: test_file.setups.clone(),
+                    mvcc: self.config.mvcc,
+                    global_skip: test_file.global_skip.clone(),
+                    global_requires: test_file.global_requires.clone(),
+                    backend_capabilities: backend_capabilities.clone(),
+                    backend_type,
+                    update_snapshots: false,
+                };
 
                 futures.push(tokio::spawn(async move {
                     let _permit = semaphore.acquire_owned().await.unwrap();
-                    run_single_test(
-                        backend,
-                        file_path,
-                        db_config,
-                        test,
-                        setups,
-                        mvcc,
-                        global_skip,
-                        global_requires,
-                        capabilities,
-                    )
-                    .await
+                    run_single(backend, test, options).await
                 }));
             }
         }
@@ -391,6 +692,7 @@ impl<B: SqlBackend + 'static> TestRunner<B> {
         test_file: &TestFile,
     ) -> FuturesUnordered<tokio::task::JoinHandle<TestResult>> {
         let futures = FuturesUnordered::new();
+        let backend_type = self.backend.backend_type();
 
         // For each database configuration (snapshots use the first one)
         if let Some(db_config) = test_file.databases.first() {
@@ -413,26 +715,22 @@ impl<B: SqlBackend + 'static> TestRunner<B> {
                 let backend = Arc::clone(&self.backend);
                 let semaphore = Arc::clone(&self.semaphore);
                 let snapshot = snapshot.clone();
-                let db_config = db_config.clone();
-                let setups = test_file.setups.clone();
-                let file_path = path.to_path_buf();
-                let mvcc = self.config.mvcc;
-                let global_skip = test_file.global_skip.clone();
-                let update_snapshots = self.config.update_snapshots;
+
+                let options = RunOptions {
+                    file_path: path.to_path_buf(),
+                    db_config: db_config.clone(),
+                    setups: test_file.setups.clone(),
+                    mvcc: self.config.mvcc,
+                    global_skip: test_file.global_skip.clone(),
+                    global_requires: Vec::new(),
+                    backend_capabilities: HashSet::new(),
+                    backend_type,
+                    update_snapshots: self.config.update_snapshots,
+                };
 
                 futures.push(tokio::spawn(async move {
                     let _permit = semaphore.acquire_owned().await.unwrap();
-                    run_single_snapshot_test(
-                        backend,
-                        file_path,
-                        db_config,
-                        snapshot,
-                        setups,
-                        mvcc,
-                        global_skip,
-                        update_snapshots,
-                    )
-                    .await
+                    run_single(backend, snapshot, options).await
                 }));
             }
         }
@@ -586,350 +884,6 @@ impl<B: SqlBackend + 'static> TestRunner<B> {
         }
 
         Ok(all_results)
-    }
-}
-
-/// Run a single test
-#[allow(clippy::too_many_arguments)]
-async fn run_single_test<B: SqlBackend>(
-    backend: Arc<B>,
-    file_path: PathBuf,
-    db_config: DatabaseConfig,
-    test: TestCase,
-    setups: std::collections::HashMap<String, String>,
-    mvcc: bool,
-    global_skip: Option<crate::parser::ast::Skip>,
-    global_requires: Vec<Requirement>,
-    backend_capabilities: HashSet<Capability>,
-) -> TestResult {
-    let start = Instant::now();
-
-    // Capture test name and other info for panic recovery
-    let test_name = test.name.clone();
-    let file_path_for_panic = file_path.clone();
-    let db_config_for_panic = db_config.clone();
-
-    let test_future = async move {
-        // Check if skipped (per-test skip overrides global skip)
-        let effective_skip = test.skip.as_ref().or(global_skip.as_ref());
-        if let Some(skip) = effective_skip {
-            let should_skip = match &skip.condition {
-                None => true, // Unconditional skip
-                Some(crate::parser::ast::SkipCondition::Mvcc) => mvcc,
-            };
-            if should_skip {
-                return TestResult {
-                    name: test.name,
-                    file: file_path,
-                    database: db_config,
-                    outcome: TestOutcome::Skipped {
-                        reason: skip.reason.clone(),
-                    },
-                    duration: start.elapsed(),
-                };
-            }
-        }
-
-        // Check required capabilities (global + per-test)
-        for req in global_requires.iter().chain(test.requires.iter()) {
-            if !backend_capabilities.contains(&req.capability) {
-                return TestResult {
-                    name: test.name,
-                    file: file_path,
-                    database: db_config,
-                    outcome: TestOutcome::Skipped {
-                        reason: format!("requires {}: {}", req.capability, req.reason),
-                    },
-                    duration: start.elapsed(),
-                };
-            }
-        }
-
-        // Create database instance
-        let mut db = match backend.create_database(&db_config).await {
-            Ok(db) => db,
-            Err(e) => {
-                return TestResult {
-                    name: test.name,
-                    file: file_path,
-                    database: db_config,
-                    outcome: TestOutcome::Error {
-                        message: format!("failed to create database: {e}"),
-                    },
-                    duration: start.elapsed(),
-                };
-            }
-        };
-
-        // Run setups (using execute_setup which buffers for memory databases)
-        for setup_ref in &test.setups {
-            if let Some(setup_sql) = setups.get(&setup_ref.name) {
-                if let Err(e) = db.execute_setup(setup_sql).await {
-                    let _ = db.close().await;
-                    return TestResult {
-                        name: test.name,
-                        file: file_path,
-                        database: db_config,
-                        outcome: TestOutcome::Error {
-                            message: format!("setup '{}' failed: {}", setup_ref.name, e),
-                        },
-                        duration: start.elapsed(),
-                    };
-                }
-            } else {
-                let _ = db.close().await;
-                return TestResult {
-                    name: test.name,
-                    file: file_path,
-                    database: db_config,
-                    outcome: TestOutcome::Error {
-                        message: format!("setup '{}' not found", setup_ref.name),
-                    },
-                    duration: start.elapsed(),
-                };
-            }
-        }
-
-        // Execute test SQL
-        let result = match db.execute(&test.sql).await {
-            Ok(r) => r,
-            Err(e) => {
-                let _ = db.close().await;
-                return TestResult {
-                    name: test.name,
-                    file: file_path,
-                    database: db_config,
-                    outcome: TestOutcome::Error {
-                        message: format!("execution failed: {e}"),
-                    },
-                    duration: start.elapsed(),
-                };
-            }
-        };
-
-        // Close database
-        let _ = db.close().await;
-
-        // Compare result (select expectation based on backend)
-        let expectation = test.expectations.for_backend(backend.backend_type());
-        let comparison = compare(&result, expectation);
-        let outcome = match comparison {
-            ComparisonResult::Match => TestOutcome::Passed,
-            ComparisonResult::Mismatch { reason } => TestOutcome::Failed { reason },
-        };
-
-        TestResult {
-            name: test.name,
-            file: file_path,
-            database: db_config,
-            outcome,
-            duration: start.elapsed(),
-        }
-    };
-
-    match AssertUnwindSafe(test_future).catch_unwind().await {
-        Ok(result) => result,
-        Err(panic_info) => {
-            // Extract panic message
-            let panic_message = if let Some(s) = panic_info.downcast_ref::<&str>() {
-                (*s).to_string()
-            } else if let Some(s) = panic_info.downcast_ref::<String>() {
-                s.clone()
-            } else {
-                "unknown panic".to_string()
-            };
-
-            TestResult {
-                name: test_name,
-                file: file_path_for_panic,
-                database: db_config_for_panic,
-                outcome: TestOutcome::Error {
-                    message: format!("panic: {panic_message}"),
-                },
-                duration: start.elapsed(),
-            }
-        }
-    }
-}
-
-/// Run a single snapshot test
-#[allow(clippy::too_many_arguments)]
-async fn run_single_snapshot_test<B: SqlBackend>(
-    backend: Arc<B>,
-    file_path: PathBuf,
-    db_config: DatabaseConfig,
-    snapshot: SnapshotCase,
-    setups: std::collections::HashMap<String, String>,
-    mvcc: bool,
-    global_skip: Option<crate::parser::ast::Skip>,
-    update_snapshots: bool,
-) -> TestResult {
-    let start = Instant::now();
-
-    // Capture test name and other info for panic recovery
-    let test_name = snapshot.name.clone();
-    let file_path_for_panic = file_path.clone();
-    let db_config_for_panic = db_config.clone();
-
-    let test_future = async move {
-        // Check if skipped (per-snapshot skip overrides global skip)
-        let effective_skip = snapshot.skip.as_ref().or(global_skip.as_ref());
-        if let Some(skip) = effective_skip {
-            let should_skip = match &skip.condition {
-                None => true, // Unconditional skip
-                Some(crate::parser::ast::SkipCondition::Mvcc) => mvcc,
-            };
-            if should_skip {
-                return TestResult {
-                    name: snapshot.name,
-                    file: file_path,
-                    database: db_config,
-                    outcome: TestOutcome::Skipped {
-                        reason: skip.reason.clone(),
-                    },
-                    duration: start.elapsed(),
-                };
-            }
-        }
-
-        // Create database instance
-        let mut db = match backend.create_database(&db_config).await {
-            Ok(db) => db,
-            Err(e) => {
-                return TestResult {
-                    name: snapshot.name,
-                    file: file_path,
-                    database: db_config,
-                    outcome: TestOutcome::Error {
-                        message: format!("failed to create database: {e}"),
-                    },
-                    duration: start.elapsed(),
-                };
-            }
-        };
-
-        // Run setups (using execute_setup which buffers for memory databases)
-        for setup_ref in &snapshot.setups {
-            if let Some(setup_sql) = setups.get(&setup_ref.name) {
-                if let Err(e) = db.execute_setup(setup_sql).await {
-                    let _ = db.close().await;
-                    return TestResult {
-                        name: snapshot.name,
-                        file: file_path,
-                        database: db_config,
-                        outcome: TestOutcome::Error {
-                            message: format!("setup '{}' failed: {}", setup_ref.name, e),
-                        },
-                        duration: start.elapsed(),
-                    };
-                }
-            } else {
-                let _ = db.close().await;
-                return TestResult {
-                    name: snapshot.name,
-                    file: file_path,
-                    database: db_config,
-                    outcome: TestOutcome::Error {
-                        message: format!("setup '{}' not found", setup_ref.name),
-                    },
-                    duration: start.elapsed(),
-                };
-            }
-        }
-
-        // Execute EXPLAIN <sql>
-        let explain_sql = format!("EXPLAIN {}", snapshot.sql);
-        let result = match db.execute(&explain_sql).await {
-            Ok(r) => r,
-            Err(e) => {
-                let _ = db.close().await;
-                return TestResult {
-                    name: snapshot.name,
-                    file: file_path,
-                    database: db_config,
-                    outcome: TestOutcome::Error {
-                        message: format!("EXPLAIN execution failed: {e}"),
-                    },
-                    duration: start.elapsed(),
-                };
-            }
-        };
-
-        // Close database
-        let _ = db.close().await;
-
-        // Format EXPLAIN output for snapshot
-        let actual_output = result
-            .rows
-            .iter()
-            .map(|row| row.join("|"))
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        // Build snapshot info with metadata
-        let db_location_str = db_config.location.to_string();
-        let snapshot_info = SnapshotInfo::new()
-            .with_setups(snapshot.setups.iter().map(|s| s.name.clone()).collect())
-            .with_database(db_location_str);
-
-        // Compare with snapshot
-        let snapshot_manager = SnapshotManager::new(&file_path, update_snapshots);
-        let snapshot_result = snapshot_manager
-            .compare(
-                &snapshot.name,
-                &snapshot.sql,
-                &actual_output,
-                &snapshot_info,
-            )
-            .await;
-
-        let outcome = match snapshot_result {
-            SnapshotResult::Match => TestOutcome::Passed,
-            SnapshotResult::Mismatch {
-                expected,
-                actual,
-                diff,
-            } => TestOutcome::SnapshotMismatch {
-                expected,
-                actual,
-                diff,
-            },
-            SnapshotResult::New { content } => TestOutcome::SnapshotNew { content },
-            SnapshotResult::Updated { old, new } => TestOutcome::SnapshotUpdated { old, new },
-            SnapshotResult::Error { msg } => TestOutcome::Error { message: msg },
-        };
-
-        TestResult {
-            name: snapshot.name,
-            file: file_path,
-            database: db_config,
-            outcome,
-            duration: start.elapsed(),
-        }
-    };
-
-    match AssertUnwindSafe(test_future).catch_unwind().await {
-        Ok(result) => result,
-        Err(panic_info) => {
-            // Extract panic message
-            let panic_message = if let Some(s) = panic_info.downcast_ref::<&str>() {
-                (*s).to_string()
-            } else if let Some(s) = panic_info.downcast_ref::<String>() {
-                s.clone()
-            } else {
-                "unknown panic".to_string()
-            };
-
-            TestResult {
-                name: test_name,
-                file: file_path_for_panic,
-                database: db_config_for_panic,
-                outcome: TestOutcome::Error {
-                    message: format!("panic: {panic_message}"),
-                },
-                duration: start.elapsed(),
-            }
-        }
     }
 }
 
