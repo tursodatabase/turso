@@ -368,7 +368,7 @@ impl Value {
         use std::fmt::Write;
         match self {
             Value::Null => Value::build_text("NULL"),
-            Value::Integer(_) | Value::Float(_) => self.to_owned(),
+            Value::Integer(_) | Value::Float(_) => Value::build_text(self.to_string()),
             Value::Blob(b) => {
                 // SQLite returns X'hexdigits' for blobs
                 let mut quoted = String::with_capacity(3 + b.len() * 2);
@@ -1634,7 +1634,11 @@ mod tests {
         assert_eq!(input.exec_quote(), expected);
 
         let input = Value::Integer(123);
-        let expected = Value::Integer(123);
+        let expected = Value::build_text("123");
+        assert_eq!(input.exec_quote(), expected);
+
+        let input = Value::Float(12.34);
+        let expected = Value::build_text("12.34");
         assert_eq!(input.exec_quote(), expected);
 
         let input = Value::build_text("hello''world");
