@@ -5,6 +5,7 @@ use smallvec::SmallVec;
 use turso_parser::ast::{Expr, Operator, TableInternalId};
 
 use crate::{
+    stats::AnalyzeStats,
     translate::{
         expr::{walk_expr, WalkControl},
         optimizer::{
@@ -82,6 +83,7 @@ pub fn join_lhs_and_rhs<'a>(
     subqueries: &[NonFromClauseSubquery],
     index_method_candidates: &[IndexMethodCandidate],
     params: &CostModelParams,
+    analyze_stats: &AnalyzeStats,
 ) -> Result<Option<JoinN>> {
     // The input cardinality for this join is the output cardinality of the previous join.
     // For example, in a 2-way join, if the left table has 1000 rows, and the right table will return 2 rows for each of the left table's rows,
@@ -151,17 +153,45 @@ pub fn join_lhs_and_rhs<'a>(
         m
     };
 
-    let output_cardinality_multiplier = {
-        let mut multiplier = 1.0;
-        // (column_pos, has_lower, has_upper) - SmallVec avoids heap for typical 1-3 range columns
+    // ============================================================================
+    // OUTPUT CARDINALITY ESTIMATION
+    // ============================================================================
+    //
+    // Estimate output rows to compare join orders in the DP algorithm.
+    //
+    // CONSTRAINT TYPES:
+    // 1. EQUI-JOIN: References LHS tables (e.g., t1.a = t2.b). Enables index seeks.
+    // 2. LITERAL: Column vs constant (e.g., t2.x > 5). No table references.
+    // 3. SELF: Compares columns within same table (e.g., t2.y = t2.z).
+    //
+    // TWO MULTIPLIERS:
+    // - all_multiplier: All constraints. Used for FULL SCANS.
+    // - local_filter_multiplier: Only literal + self-constraints. Used for INDEX/ROWID
+    //   SEEKS where equi-join selectivity is already accounted for by the fanout
+    //   of the seek itself.
+    //
+    let (output_cardinality_multiplier, local_filter_multiplier) = {
+        let mut all_multiplier = 1.0;
+        let mut local_multiplier = 1.0;
+        // Track range bounds to detect closed ranges like "x > 5 AND x < 10"
         let mut column_bounds: SmallVec<[(Option<usize>, bool, bool); 4]> = SmallVec::new();
 
         for c in rhs_constraints.constraints.iter().filter(|c| {
+            // Include constraint if:
+            // - All tables it references are in LHS (equi-join, can use for seek)
+            // - OR it's a self-constraint (compares columns within same table)
+            // - OR it's a literal constraint (e.g., col > 5, no table refs)
             lhs_mask.contains_all(&c.lhs_mask)
-                || c.lhs_mask == rhs_self_mask // self-constraints
-                || c.lhs_mask.is_empty() // literal constraints
+                || c.lhs_mask == rhs_self_mask
+                || c.lhs_mask.is_empty()
         }) {
-            multiplier *= c.selectivity;
+            all_multiplier *= c.selectivity;
+
+            // Local filters: only self-constraints and literals (NOT equi-joins)
+            let is_local_filter = c.lhs_mask == rhs_self_mask || c.lhs_mask.is_empty();
+            if is_local_filter {
+                local_multiplier *= c.selectivity;
+            }
 
             // Track range bounds per column for closed-range detection
             let dominated_col = c.table_col_pos;
@@ -193,11 +223,12 @@ pub fn join_lhs_and_rhs<'a>(
         // Apply closed-range bonus for columns with both lower and upper bounds
         for (_, has_lower, has_upper) in &column_bounds {
             if *has_lower && *has_upper {
-                multiplier *= params.closed_range_selectivity_factor;
+                all_multiplier *= params.closed_range_selectivity_factor;
+                local_multiplier *= params.closed_range_selectivity_factor;
             }
         }
 
-        multiplier
+        (all_multiplier, local_multiplier)
     };
     let rhs_internal_id = rhs_table_reference.internal_id;
     let lhs_internal_ids: HashSet<TableInternalId> = lhs
@@ -655,25 +686,106 @@ pub fn join_lhs_and_rhs<'a>(
     if cost > cost_upper_bound {
         return Ok(None);
     }
+    // ============================================================================
+    // OUTPUT CARDINALITY CALCULATION
+    // ============================================================================
+    //
+    // Formula: output_rows = input_rows × rows_per_lookup × filter_selectivity
+    //
+    // ACCESS METHOD TYPES:
+    //
+    // FULL SCAN (no constraints):
+    //   Cartesian product filtered by all constraints.
+    //   output = input × rhs_table_size × all_selectivities
+    //
+    // ROWID SEEK (no index, has constraints):
+    //   Primary key lookup returns 0 or 1 row.
+    //   output = input × 1 × local_filter_selectivity
+    //   (local_filter excludes equi-join selectivity since the seek handles that)
+    //
+    // INDEX SEEK (has index and constraints):
+    //   Secondary index lookup. Rows per lookup = "fanout".
+    //   output = input × fanout × local_filter_selectivity
+    //
+    // FANOUT ESTIMATION:
+    //   Fanout = expected rows per index lookup.
+    //   - With ANALYZE stats: use avg_rows_per_distinct_prefix[matched_cols - 1]
+    //   - Without stats: cost_params.fanout_index_seek_per_unmatched_column^(unmatched_columns) heuristic
+    //     Example: 3-column index, match 1 column → 4^2 = 16 rows per lookup
+    //   - Full key match: cost_params.fanout_index_seek_unique (unique index) or cost_params.fanout_index_seek_non_unique (non-unique)
+    //
+    let output_cardinality = if let Some(estimated_rows) = index_method_estimated_rows {
+        // Special index methods (e.g., FTS) provide their own row estimate
+        (input_cardinality as f64 * estimated_rows as f64).ceil() as usize
+    } else if let AccessMethodParams::BTreeTable {
+        index,
+        constraint_refs,
+        ..
+    } = &best_access_method.params
+    {
+        if constraint_refs.is_empty() {
+            // FULL SCAN: cartesian product filtered by all constraints
+            (input_cardinality as f64 * *rhs_base_rows * output_cardinality_multiplier).ceil()
+                as usize
+        } else if index.is_none() {
+            // ROWID SEEK: exactly 1 row per lookup (primary key is unique)
+            // Only apply local filters, not equi-join selectivity (that's the seek)
+            (input_cardinality as f64 * local_filter_multiplier * params.fanout_index_seek_unique)
+                .ceil() as usize
+        } else {
+            // INDEX SEEK: fanout depends on matched columns
+            let index = index.as_ref().unwrap();
+            let matched_cols = constraint_refs.len();
+            let total_cols = index.columns.len();
+            let unmatched = total_cols.saturating_sub(matched_cols);
+
+            // Try to get actual fanout from ANALYZE statistics (sqlite_stat1).
+            // Stats give us avg_rows_per_distinct_prefix[i] = avg rows sharing
+            // the same values in first i+1 columns.
+            let table_name = rhs_table_reference.table.get_name();
+            let stats_fanout = analyze_stats
+                .table_stats(table_name)
+                .and_then(|ts| ts.index_stats.get(&index.name))
+                .and_then(|is| {
+                    // matched_cols=1 means we use prefix of length 1, which is index 0
+                    if matched_cols > 0 && matched_cols <= is.avg_rows_per_distinct_prefix.len() {
+                        Some(is.avg_rows_per_distinct_prefix[matched_cols - 1] as f64)
+                    } else {
+                        None
+                    }
+                });
+
+            let fanout = if let Some(f) = stats_fanout {
+                // Use actual statistics from ANALYZE
+                f
+            } else if matched_cols >= total_cols {
+                // Full key match: very few rows per lookup
+                if index.unique {
+                    params.fanout_index_seek_unique // Unique index + full key = exactly 1 row
+                } else {
+                    params.fanout_index_seek_non_unique // Non-unique but full key = probably few duplicates
+                }
+            } else {
+                // Partial key match: use 4^unmatched heuristic
+                // Example: 2-column index, match 1 → 4^1 = 4 rows per lookup
+                params
+                    .fanout_index_seek_per_unmatched_column
+                    .powi(unmatched as i32)
+            };
+
+            // Final: input_rows × fanout × local_filters
+            (input_cardinality as f64 * fanout * local_filter_multiplier).ceil() as usize
+        }
+    } else {
+        // HashJoin, VirtualTable, Subquery: use full selectivity formula
+        (input_cardinality as f64 * *rhs_base_rows * output_cardinality_multiplier).ceil() as usize
+    };
+
     access_methods_arena.push(best_access_method);
 
     let mut best_access_methods = Vec::with_capacity(join_order.len());
     best_access_methods.extend(lhs.map_or(vec![], |l| l.data.clone()));
-
     best_access_methods.push((rhs_table_number, access_methods_arena.len() - 1));
-
-    // Produce a number of rows estimated to be returned when this table is filtered by the WHERE clause.
-    // If this table is the rightmost table in the join order, we multiply by the input cardinality,
-    // which is the output cardinality of the previous tables.
-    //
-    // If an index method was selected, use its estimated_rows instead of the base table estimate
-    let output_cardinality = if let Some(estimated_rows) = index_method_estimated_rows {
-        // When index_method is outer (input_cardinality=1), use the estimated_rows directly
-        // If it's inner, multiply by input_cardinality (each outer row triggers FTS)
-        (input_cardinality as f64 * estimated_rows as f64).ceil() as usize
-    } else {
-        (input_cardinality as f64 * *rhs_base_rows * output_cardinality_multiplier).ceil() as usize
-    };
 
     Ok(Some(JoinN {
         data: best_access_methods,
@@ -803,6 +915,7 @@ pub fn compute_best_join_order<'a>(
     subqueries: &[NonFromClauseSubquery],
     index_method_candidates: &[IndexMethodCandidate],
     params: &CostModelParams,
+    analyze_stats: &AnalyzeStats,
 ) -> Result<Option<BestJoinOrderResult>> {
     // Skip work if we have no tables to consider.
     if joined_tables.is_empty() {
@@ -828,6 +941,7 @@ pub fn compute_best_join_order<'a>(
             subqueries,
             index_method_candidates,
             params,
+            analyze_stats,
         );
     }
 
@@ -843,6 +957,7 @@ pub fn compute_best_join_order<'a>(
         subqueries,
         index_method_candidates,
         params,
+        analyze_stats,
     )?;
 
     // Keep track of both 1. the best plan overall (not considering sorting), and 2. the best ordered plan (which might not be the same).
@@ -923,6 +1038,7 @@ pub fn compute_best_join_order<'a>(
             subqueries,
             index_method_candidates,
             params,
+            analyze_stats,
         )?;
         if let Some(rel) = rel {
             best_plan_memo.entry(mask).or_default().insert(i, rel);
@@ -1047,6 +1163,7 @@ pub fn compute_best_join_order<'a>(
                         subqueries,
                         index_method_candidates,
                         params,
+                        analyze_stats,
                     )?;
                     join_order.clear();
 
@@ -1160,6 +1277,7 @@ pub fn compute_greedy_join_order<'a>(
     subqueries: &[NonFromClauseSubquery],
     index_method_candidates: &[IndexMethodCandidate],
     params: &CostModelParams,
+    analyze_stats: &AnalyzeStats,
 ) -> Result<Option<BestJoinOrderResult>> {
     let num_tables = joined_tables.len();
     if num_tables == 0 {
@@ -1210,6 +1328,7 @@ pub fn compute_greedy_join_order<'a>(
         subqueries,
         index_method_candidates,
         params,
+        analyze_stats,
     )?;
 
     if current_plan.is_none() {
@@ -1293,6 +1412,7 @@ pub fn compute_greedy_join_order<'a>(
                 subqueries,
                 index_method_candidates,
                 params,
+                analyze_stats,
             )? {
                 if best.as_ref().is_none_or(|(_, b)| plan.cost < b.cost) {
                     best = Some((idx, plan));
@@ -1399,6 +1519,7 @@ pub fn compute_naive_left_deep_plan<'a>(
     subqueries: &[NonFromClauseSubquery],
     index_method_candidates: &[IndexMethodCandidate],
     params: &CostModelParams,
+    analyze_stats: &AnalyzeStats,
 ) -> Result<Option<JoinN>> {
     let n = joined_tables.len();
     assert!(n > 0);
@@ -1430,6 +1551,7 @@ pub fn compute_naive_left_deep_plan<'a>(
         subqueries,
         index_method_candidates,
         params,
+        analyze_stats,
     )?;
     if best_plan.is_none() {
         return Ok(None);
@@ -1453,6 +1575,7 @@ pub fn compute_naive_left_deep_plan<'a>(
             subqueries,
             index_method_candidates,
             params,
+            analyze_stats,
         )?;
         if best_plan.is_none() {
             return Ok(None);
@@ -1551,6 +1674,7 @@ mod tests {
     use super::*;
     use crate::{
         schema::{BTreeTable, ColDef, Column, Index, IndexColumn, Schema, Table, Type},
+        stats::AnalyzeStats,
         translate::{
             optimizer::{
                 access_method::AccessMethodParams,
@@ -1613,6 +1737,7 @@ mod tests {
             &[],
             &[],
             &DEFAULT_PARAMS,
+            &AnalyzeStats::default(),
         )
         .unwrap();
         assert!(result.is_none());
@@ -1656,6 +1781,7 @@ mod tests {
             &[],
             &[],
             &DEFAULT_PARAMS,
+            &AnalyzeStats::default(),
         )
         .unwrap()
         .unwrap();
@@ -1709,6 +1835,7 @@ mod tests {
             &[],
             &[],
             &DEFAULT_PARAMS,
+            &AnalyzeStats::default(),
         )
         .unwrap();
         assert!(result.is_some());
@@ -1790,6 +1917,7 @@ mod tests {
             &[],
             &[],
             &DEFAULT_PARAMS,
+            &AnalyzeStats::default(),
         )
         .unwrap();
         assert!(result.is_some());
@@ -1882,6 +2010,7 @@ mod tests {
             &[],
             &[],
             &DEFAULT_PARAMS,
+            &AnalyzeStats::default(),
         )
         .unwrap();
         assert!(result.is_some());
@@ -2075,6 +2204,7 @@ mod tests {
             &[],
             &[],
             &DEFAULT_PARAMS,
+            &AnalyzeStats::default(),
         )
         .unwrap();
         assert!(result.is_some());
@@ -2196,6 +2326,7 @@ mod tests {
             &[],
             &[],
             &DEFAULT_PARAMS,
+            &AnalyzeStats::default(),
         )
         .unwrap()
         .unwrap();
@@ -2314,6 +2445,7 @@ mod tests {
             &[],
             &[],
             &DEFAULT_PARAMS,
+            &AnalyzeStats::default(),
         )
         .unwrap();
         assert!(result.is_some());
@@ -2411,6 +2543,7 @@ mod tests {
             &[],
             &[],
             &DEFAULT_PARAMS,
+            &AnalyzeStats::default(),
         )
         .unwrap()
         .unwrap();
@@ -2548,6 +2681,7 @@ mod tests {
             &[],
             &[],
             &DEFAULT_PARAMS,
+            &AnalyzeStats::default(),
         )
         .unwrap()
         .unwrap();
@@ -2674,6 +2808,7 @@ mod tests {
             &[],
             &[],
             &DEFAULT_PARAMS,
+            &AnalyzeStats::default(),
         )
         .unwrap()
         .unwrap();
@@ -2818,6 +2953,7 @@ mod tests {
             &[],
             &[],
             &DEFAULT_PARAMS,
+            &AnalyzeStats::default(),
         )
         .unwrap()
         .unwrap();
@@ -3033,6 +3169,7 @@ mod tests {
             &[],
             &[],
             &DEFAULT_PARAMS,
+            &AnalyzeStats::default(),
         )
         .unwrap();
         assert!(result.is_some());
