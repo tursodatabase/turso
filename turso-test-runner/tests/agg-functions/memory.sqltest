@@ -38,3 +38,57 @@ expect {
     4
 }
 
+# Tests for ungrouped aggregates with non-aggregate columns on empty tables.
+# When no rows match, literals should return their values, columns should return NULL,
+# and expressions like "col IS NOT NULL" should evaluate correctly.
+
+test ungrouped-agg-empty-table-literal {
+    CREATE TABLE t (a INT, b TEXT);
+    SELECT 42, COUNT(*), 'hello' FROM t;
+}
+expect {
+    42|0|hello
+}
+
+test ungrouped-agg-empty-table-column-is-null {
+    CREATE TABLE t (a INT);
+    SELECT a IS NULL, COUNT(*) FROM t;
+}
+expect {
+    1|0
+}
+
+test ungrouped-agg-empty-table-column-is-not-null {
+    CREATE TABLE t (a INT);
+    SELECT a IS NOT NULL, COUNT(*) FROM t;
+}
+expect {
+    0|0
+}
+
+test ungrouped-agg-filtered-rows-literal {
+    CREATE TABLE t (a INT);
+    INSERT INTO t VALUES (1), (2), (3);
+    SELECT 99, COUNT(*) FROM t WHERE a > 100;
+}
+expect {
+    99|0
+}
+
+test ungrouped-agg-filtered-rows-column {
+    CREATE TABLE t (a INT);
+    INSERT INTO t VALUES (1), (2), (3);
+    SELECT a, COUNT(*) FROM t WHERE a > 100;
+}
+expect {
+    |0
+}
+
+test ungrouped-agg-multiple-literals {
+    CREATE TABLE t (a INT);
+    SELECT NULL, 5267713247558720570, NULL, AVG(-1), 28513758867889096 FROM t;
+}
+expect {
+    |5267713247558720570|||28513758867889096
+}
+

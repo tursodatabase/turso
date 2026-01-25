@@ -7,7 +7,7 @@ use std::num::NonZeroUsize;
 
 use tracing::{instrument, Level};
 use turso_parser::ast::{
-    self, Expr, Literal, ResolveType, TableInternalId, TriggerEvent, TriggerTime,
+    self, Expr, Literal, ResolveType, SubqueryType, TableInternalId, TriggerEvent, TriggerTime,
 };
 
 use super::aggregation::emit_ungrouped_aggregation;
@@ -30,7 +30,7 @@ use crate::schema::{BTreeTable, Column, Index, IndexColumn, Schema, Table, ROWID
 use crate::translate::compound_select::emit_program_for_compound_select;
 use crate::translate::expr::{
     bind_and_rewrite_expr, emit_returning_results, rewrite_between_expr,
-    translate_expr_no_constant_opt, walk_expr_mut, BindingBehavior, NoConstantOptReason,
+    translate_expr_no_constant_opt, walk_expr, walk_expr_mut, BindingBehavior, NoConstantOptReason,
     WalkControl,
 };
 use crate::translate::fkeys::{
@@ -60,6 +60,25 @@ use crate::vdbe::insn::{
 use crate::vdbe::{insn::Insn, BranchOffset, CursorID};
 use crate::{bail_parse_error, emit_explain, Result, SymbolTable};
 use crate::{turso_assert, Connection, QueryMode};
+
+/// Initialize EXISTS subquery result registers to 0.
+/// This is needed because for correlated subqueries, the result_reg is only set inside
+/// the loop. If the loop never runs (empty table), we need a sensible default (0 = false).
+fn init_exists_result_regs(program: &mut ProgramBuilder, expr: &ast::Expr) {
+    let _ = walk_expr(expr, &mut |e| {
+        if let ast::Expr::SubqueryResult {
+            query_type: SubqueryType::Exists { result_reg },
+            ..
+        } = e
+        {
+            program.emit_insn(Insn::Integer {
+                value: 0,
+                dest: *result_reg,
+            });
+        }
+        Ok(WalkControl::Continue)
+    });
+}
 
 pub struct Resolver<'a> {
     pub schema: &'a Schema,
@@ -965,10 +984,11 @@ pub fn emit_query<'a>(
     // For non-grouped aggregation queries that also have non-aggregate columns,
     // we need to ensure non-aggregate columns are only emitted once.
     // This flag helps track whether we've already emitted these columns.
-    if !plan.aggregates.is_empty()
+    let has_ungrouped_nonagg_cols = !plan.aggregates.is_empty()
         && plan.group_by.is_none()
-        && plan.result_columns.iter().any(|c| !c.contains_aggregates)
-    {
+        && plan.result_columns.iter().any(|c| !c.contains_aggregates);
+
+    if has_ungrouped_nonagg_cols {
         let flag = program.alloc_register();
         program.emit_int(0, flag); // Initialize flag to 0 (not yet emitted)
         t_ctx.reg_nonagg_emit_once_flag = Some(flag);
@@ -978,6 +998,18 @@ pub fn emit_query<'a>(
     if t_ctx.reg_result_cols_start.is_none() {
         t_ctx.reg_result_cols_start = Some(program.alloc_registers(plan.result_columns.len()));
         program.reg_result_cols_start = t_ctx.reg_result_cols_start
+    }
+
+    // For ungrouped aggregates with non-aggregate columns, initialize EXISTS subquery
+    // result_regs to 0. EXISTS returns 0 (not NULL) when the subquery is never evaluated
+    // (correlated EXISTS in empty loop). Non-aggregate columns themselves are evaluated
+    // after the loop in emit_ungrouped_aggregation if the loop never ran.
+    if has_ungrouped_nonagg_cols {
+        for rc in plan.result_columns.iter() {
+            if !rc.contains_aggregates {
+                init_exists_result_regs(program, &rc.expr);
+            }
+        }
     }
 
     let has_group_by_exprs = plan
