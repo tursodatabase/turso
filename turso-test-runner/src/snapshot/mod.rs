@@ -592,8 +592,7 @@ mod tests {
         assert!(tables.contains("inventory"));
 
         // Subquery
-        let tables =
-            extract_tables("SELECT * FROM users WHERE id IN (SELECT user_id FROM orders)");
+        let tables = extract_tables("SELECT * FROM users WHERE id IN (SELECT user_id FROM orders)");
         assert!(tables.contains("users"));
         assert!(tables.contains("orders"));
     }
