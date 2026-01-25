@@ -68,16 +68,14 @@ impl Parser {
                     }
                     setups.insert(name, sql);
                 }
-                Some(Token::Snapshot) => {
-                    snapshots.push(self.parse_snapshot()?);
-                }
                 Some(
                     Token::AtSetup
                     | Token::AtSkip
                     | Token::AtSkipIf
                     | Token::AtRequires
                     | Token::AtBackend
-                    | Token::Test,
+                    | Token::Test
+                    | Token::Snapshot,
                 ) => {
                     // Could be test or snapshot with decorators, peek ahead
                     let item = self.parse_test_or_snapshot()?;
@@ -195,22 +193,6 @@ impl Parser {
         let content = self.expect_block_content()?.trim().to_string();
 
         Ok((name, content))
-    }
-
-    fn parse_snapshot(&mut self) -> Result<SnapshotCase, ParseError> {
-        self.expect_token(Token::Snapshot)?;
-        let (name, name_span) = self.expect_identifier_with_span()?;
-        let sql = self.expect_block_content()?.trim().to_string();
-
-        self.skip_newlines_and_comments();
-
-        Ok(SnapshotCase {
-            name,
-            name_span,
-            sql,
-            setups: Vec::new(),
-            skip: None,
-        })
     }
 
     fn parse_test_or_snapshot(&mut self) -> Result<TestOrSnapshot, ParseError> {
