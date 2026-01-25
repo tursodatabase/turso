@@ -217,18 +217,13 @@ impl SnapshotManager {
             .join(format!("{file_stem}__{name}.snap.new"))
     }
 
-    /// Read an existing snapshot file and return its content only
-    pub async fn read_snapshot_content(&self, name: &str) -> Option<String> {
-        let parsed = self.read_snapshot(name).await?;
-        Some(parsed.content)
-    }
-
     /// Read and parse a snapshot file with full metadata
-    pub async fn read_snapshot(&self, name: &str) -> Option<Snapshot> {
+    pub async fn read_snapshot(&self, name: &str) -> anyhow::Result<Option<Snapshot>> {
         let path = self.snapshot_path(name);
-        let contents = fs::read_to_string(&path).await.ok()?;
-        Snapshot::parse(&contents).ok()
+        let contents = fs::read_to_string(&path).await?;
+        Ok(Snapshot::parse(&contents)?)
     }
+    
 
     /// Write a snapshot file
     pub async fn write_snapshot(
@@ -237,7 +232,7 @@ impl SnapshotManager {
         sql: &str,
         content: &str,
         info: &SnapshotInfo,
-    ) -> io::Result<()> {
+    ) -> anyhow::Result<()> {
         let path = self.snapshot_path(name);
 
         // Ensure snapshots directory exists
@@ -246,9 +241,7 @@ impl SnapshotManager {
         }
 
         let snapshot = create_snapshot(&self.test_file_path, name, sql, content, info);
-        let formatted = snapshot
-            .to_string()
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        let formatted = snapshot.to_string()?;
 
         fs::write(&path, formatted).await
     }
@@ -260,7 +253,7 @@ impl SnapshotManager {
         sql: &str,
         content: &str,
         info: &SnapshotInfo,
-    ) -> io::Result<()> {
+    ) -> anyhow::Result<()> {
         let path = self.pending_path(name);
 
         // Ensure snapshots directory exists
@@ -269,9 +262,7 @@ impl SnapshotManager {
         }
 
         let snapshot = create_snapshot(&self.test_file_path, name, sql, content, info);
-        let formatted = snapshot
-            .to_string()
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        let formatted = snapshot.to_string()?;
 
         fs::write(&path, formatted).await
     }
@@ -287,39 +278,34 @@ impl SnapshotManager {
         let path = self.snapshot_path(name);
 
         // Try to read existing snapshot
-        match fs::read_to_string(&path).await {
-            Ok(contents) => match Snapshot::parse(&contents) {
-                Ok(snapshot) => {
-                    let expected = &snapshot.content;
+        match self.read_snapshot(name).await {
+            Ok(Some(snapshot)) => {
+                let expected = &snapshot.content;
 
-                    if expected.trim() == actual.trim() {
-                        SnapshotResult::Match
-                    } else if self.update_mode {
-                        // Update the snapshot
-                        if let Err(e) = self.write_snapshot(name, sql, actual, info).await {
-                            return SnapshotResult::Error {
-                                msg: format!("Failed to update snapshot: {e}"),
-                            };
-                        }
-                        SnapshotResult::Updated {
-                            old: expected.clone(),
-                            new: actual.to_string(),
-                        }
-                    } else {
-                        // Generate diff
-                        let diff = generate_diff(expected, actual);
-                        SnapshotResult::Mismatch {
-                            expected: expected.clone(),
-                            actual: actual.to_string(),
-                            diff,
-                        }
+                if expected.trim() == actual.trim() {
+                    SnapshotResult::Match
+                } else if self.update_mode {
+                    // Update the snapshot
+                    if let Err(e) = self.write_snapshot(name, sql, actual, info).await {
+                        return SnapshotResult::Error {
+                            msg: format!("Failed to update snapshot: {e}"),
+                        };
+                    }
+                    SnapshotResult::Updated {
+                        old: expected.clone(),
+                        new: actual.to_string(),
+                    }
+                } else {
+                    // Generate diff
+                    let diff = generate_diff(expected, actual);
+                    SnapshotResult::Mismatch {
+                        expected: expected.clone(),
+                        actual: actual.to_string(),
+                        diff,
                     }
                 }
-                Err(e) => SnapshotResult::Error {
-                    msg: format!("Failed to parse snapshot: {e}"),
-                },
-            },
-            Err(_) => {
+            }
+            Ok(None) => {
                 // No existing snapshot
                 if self.update_mode {
                     // Create the snapshot directly
@@ -339,6 +325,9 @@ impl SnapshotManager {
                     }
                 }
             }
+            Err(e) => SnapshotResult::Error {
+                msg: format!("Failed to parse snapshot: {e}"),
+            },
         }
     }
 
