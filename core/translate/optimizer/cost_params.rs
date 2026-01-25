@@ -97,6 +97,12 @@ pub struct CostModelParams {
     /// Selectivity heuristic factor for closed ranges (e.g., `x > 5 AND x < 10`).
     /// Applied when both lower and upper bounds exist on an index column.
     pub closed_range_selectivity_factor: f64,
+    /// Fanout (how many rows are produced per lookup) for index seeks with unique index.
+    pub fanout_index_seek_unique: f64,
+    /// Fanout for index seeks with non-unique index.
+    pub fanout_index_seek_non_unique: f64,
+    /// Fanout for index seeks with unmatched columns.
+    pub fanout_index_seek_per_unmatched_column: f64,
 }
 
 impl CostModelParams {
@@ -138,6 +144,9 @@ impl CostModelParams {
 
             // Join optimization
             closed_range_selectivity_factor: 0.2,
+            fanout_index_seek_unique: 1.0,
+            fanout_index_seek_non_unique: 2.0,
+            fanout_index_seek_per_unmatched_column: 4.0,
         }
     }
 }

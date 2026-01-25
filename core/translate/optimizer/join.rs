@@ -710,9 +710,9 @@ pub fn join_lhs_and_rhs<'a>(
     // FANOUT ESTIMATION:
     //   Fanout = expected rows per index lookup.
     //   - With ANALYZE stats: use avg_rows_per_distinct_prefix[matched_cols - 1]
-    //   - Without stats: 4^(unmatched_columns) heuristic
+    //   - Without stats: cost_params.fanout_index_seek_per_unmatched_column^(unmatched_columns) heuristic
     //     Example: 3-column index, match 1 column → 4^2 = 16 rows per lookup
-    //   - Full key match: 1 (unique index) or 2 (non-unique)
+    //   - Full key match: cost_params.fanout_index_seek_unique (unique index) or cost_params.fanout_index_seek_non_unique (non-unique)
     //
     let output_cardinality = if let Some(estimated_rows) = index_method_estimated_rows {
         // Special index methods (e.g., FTS) provide their own row estimate
@@ -730,7 +730,8 @@ pub fn join_lhs_and_rhs<'a>(
         } else if index.is_none() {
             // ROWID SEEK: exactly 1 row per lookup (primary key is unique)
             // Only apply local filters, not equi-join selectivity (that's the seek)
-            (input_cardinality as f64 * local_filter_multiplier).ceil() as usize
+            (input_cardinality as f64 * local_filter_multiplier * params.fanout_index_seek_unique)
+                .ceil() as usize
         } else {
             // INDEX SEEK: fanout depends on matched columns
             let index = index.as_ref().unwrap();
@@ -760,14 +761,16 @@ pub fn join_lhs_and_rhs<'a>(
             } else if matched_cols >= total_cols {
                 // Full key match: very few rows per lookup
                 if index.unique {
-                    1.0 // Unique index + full key = exactly 1 row
+                    params.fanout_index_seek_unique // Unique index + full key = exactly 1 row
                 } else {
-                    2.0 // Non-unique but full key = probably few duplicates
+                    params.fanout_index_seek_non_unique // Non-unique but full key = probably few duplicates
                 }
             } else {
                 // Partial key match: use 4^unmatched heuristic
                 // Example: 2-column index, match 1 → 4^1 = 4 rows per lookup
-                4.0_f64.powi(unmatched as i32)
+                params
+                    .fanout_index_seek_per_unmatched_column
+                    .powi(unmatched as i32)
             };
 
             // Final: input_rows × fanout × local_filters
