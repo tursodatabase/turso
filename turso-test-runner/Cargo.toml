@@ -28,12 +28,12 @@ tempfile = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 similar = { workspace = true }
-insta = { version = "1.41", default-features = false, features = ["yaml"] }
 num_cpus = "1"
 
 # Serialization
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
+serde_yaml = "0.9"
 
 # Output formatting
 owo-colors = "4.2.3"

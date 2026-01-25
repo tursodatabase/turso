@@ -882,8 +882,9 @@ async fn run_single_snapshot_test<B: SqlBackend>(
 
         // Compare with snapshot
         let snapshot_manager = SnapshotManager::new(&file_path, update_snapshots);
-        let snapshot_result =
-            snapshot_manager.compare(&snapshot.name, &snapshot.sql, &actual_output, &snapshot_info);
+        let snapshot_result = snapshot_manager
+            .compare(&snapshot.name, &snapshot.sql, &actual_output, &snapshot_info)
+            .await;
 
         let outcome = match snapshot_result {
             SnapshotResult::Match => TestOutcome::Passed,
