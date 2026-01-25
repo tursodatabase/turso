@@ -113,6 +113,8 @@ pub struct TestFile {
     pub setups: HashMap<String, String>,
     /// Test cases
     pub tests: Vec<TestCase>,
+    /// Snapshot test cases (for EXPLAIN output)
+    pub snapshots: Vec<SnapshotCase>,
     /// Global skip directive that applies to all tests in the file
     pub global_skip: Option<Skip>,
     /// Global capability requirements that apply to all tests in the file
@@ -126,6 +128,21 @@ pub struct SetupRef {
     pub name: String,
     /// Span of the @setup directive in the source (includes @setup and the name)
     pub span: Range<usize>,
+}
+
+/// A snapshot test case (for EXPLAIN output)
+#[derive(Debug, Clone, PartialEq)]
+pub struct SnapshotCase {
+    /// Unique name for this snapshot test
+    pub name: String,
+    /// Span of the snapshot name in the source
+    pub name_span: Range<usize>,
+    /// SQL to execute (EXPLAIN will be prepended)
+    pub sql: String,
+    /// Setup references with their spans
+    pub setups: Vec<SetupRef>,
+    /// If set, skip this snapshot test (unconditionally or conditionally)
+    pub skip: Option<Skip>,
 }
 
 /// A single test case

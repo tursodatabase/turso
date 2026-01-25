@@ -66,6 +66,14 @@ enum Commands {
         /// Enable MVCC mode (experimental journal mode)
         #[arg(long)]
         mvcc: bool,
+
+        /// Update snapshot files instead of comparing
+        #[arg(long)]
+        update_snapshots: bool,
+
+        /// Filter snapshot tests by name pattern
+        #[arg(long)]
+        snapshot_filter: Option<String>,
     },
 
     /// Validate test file syntax
@@ -132,9 +140,22 @@ async fn main() -> ExitCode {
             output,
             timeout,
             mvcc,
+            update_snapshots,
+            snapshot_filter,
         } => {
             run_tests(
-                paths, backend, binary, node, js_script, filter, jobs, output, timeout, mvcc,
+                paths,
+                backend,
+                binary,
+                node,
+                js_script,
+                filter,
+                jobs,
+                output,
+                timeout,
+                mvcc,
+                update_snapshots,
+                snapshot_filter,
             )
             .await
         }
@@ -171,6 +192,8 @@ async fn run_tests(
     output_format: String,
     timeout: u64,
     mvcc: bool,
+    update_snapshots: bool,
+    snapshot_filter: Option<String>,
 ) -> ExitCode {
     // Resolve paths, trying to add .sqltest extension if missing
     let mut resolved_paths = Vec::new();
@@ -244,9 +267,15 @@ async fn run_tests(
     });
 
     // Create runner config
-    let mut config = RunnerConfig::default().with_max_jobs(jobs).with_mvcc(mvcc);
+    let mut config = RunnerConfig::default()
+        .with_max_jobs(jobs)
+        .with_mvcc(mvcc)
+        .with_update_snapshots(update_snapshots);
     if let Some(f) = filter {
         config = config.with_filter(f);
+    }
+    if let Some(f) = snapshot_filter {
+        config = config.with_snapshot_filter(f);
     }
 
     // Create output formatter
@@ -430,12 +459,18 @@ fn check_single_file(path: &PathBuf) -> bool {
     match std::fs::read_to_string(path) {
         Ok(content) => match turso_test_runner::parse(&content) {
             Ok(file) => {
+                let snapshots_str = if file.snapshots.is_empty() {
+                    String::new()
+                } else {
+                    format!(", {} snapshots", file.snapshots.len())
+                };
                 println!(
-                    "{} - OK ({} databases, {} setups, {} tests)",
+                    "{} - OK ({} databases, {} setups, {} tests{})",
                     path.display(),
                     file.databases.len(),
                     file.setups.len(),
-                    file.tests.len()
+                    file.tests.len(),
+                    snapshots_str
                 );
                 true
             }

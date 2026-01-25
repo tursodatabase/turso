@@ -8,6 +8,12 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::path::PathBuf;
 
+/// Helper enum for parsing test or snapshot blocks with decorators
+enum TestOrSnapshot {
+    Test(TestCase),
+    Snapshot(SnapshotCase),
+}
+
 /// Parse a `.sqltest` file from source
 pub fn parse(input: &str) -> Result<TestFile, ParseError> {
     let tokens = tokenize(input)?;
@@ -29,6 +35,7 @@ impl Parser {
         let mut databases = Vec::new();
         let mut setups = HashMap::new();
         let mut tests = Vec::new();
+        let mut snapshots = Vec::new();
         let mut global_skip = None;
         let mut global_requires = Vec::new();
 
@@ -61,6 +68,9 @@ impl Parser {
                     }
                     setups.insert(name, sql);
                 }
+                Some(Token::Snapshot) => {
+                    snapshots.push(self.parse_snapshot()?);
+                }
                 Some(
                     Token::AtSetup
                     | Token::AtSkip
@@ -69,7 +79,12 @@ impl Parser {
                     | Token::AtBackend
                     | Token::Test,
                 ) => {
-                    tests.push(self.parse_test()?);
+                    // Could be test or snapshot with decorators, peek ahead
+                    let item = self.parse_test_or_snapshot()?;
+                    match item {
+                        TestOrSnapshot::Test(t) => tests.push(t),
+                        TestOrSnapshot::Snapshot(s) => snapshots.push(s),
+                    }
                 }
                 Some(token) => {
                     return Err(self.error(format!("unexpected token: {token}")));
@@ -82,6 +97,7 @@ impl Parser {
             databases,
             setups,
             tests,
+            snapshots,
             global_skip,
             global_requires,
         };
@@ -181,7 +197,23 @@ impl Parser {
         Ok((name, content))
     }
 
-    fn parse_test(&mut self) -> Result<TestCase, ParseError> {
+    fn parse_snapshot(&mut self) -> Result<SnapshotCase, ParseError> {
+        self.expect_token(Token::Snapshot)?;
+        let (name, name_span) = self.expect_identifier_with_span()?;
+        let sql = self.expect_block_content()?.trim().to_string();
+
+        self.skip_newlines_and_comments();
+
+        Ok(SnapshotCase {
+            name,
+            name_span,
+            sql,
+            setups: Vec::new(),
+            skip: None,
+        })
+    }
+
+    fn parse_test_or_snapshot(&mut self) -> Result<TestOrSnapshot, ParseError> {
         let mut test_setups = Vec::new();
         let mut skip = None;
         let mut backend = None;
@@ -240,71 +272,111 @@ impl Parser {
             }
         }
 
-        // Parse test
-        self.expect_token(Token::Test)?;
-        let (name, name_span) = self.expect_identifier_with_span()?;
-        let sql = self.expect_block_content()?.trim().to_string();
-
-        self.skip_newlines_and_comments();
-
-        // Parse expect blocks (at least one required, with optional backend-specific overrides)
-        let mut default_expectation: Option<Expectation> = None;
-        let mut overrides: HashMap<ast::Backend, Expectation> = HashMap::new();
-
-        while matches!(self.peek(), Some(Token::Expect)) {
-            self.expect_token(Token::Expect)?;
-
-            // Check for backend qualifier: expect @js { ... }
-            let backend_qualifier = if let Some(Token::AtIdentifier(backend_name)) = self.peek() {
-                let backend_name = backend_name.clone();
-                self.advance();
-                let backend = backend_name
-                    .parse::<ast::Backend>()
-                    .map_err(|e| self.error(e))?;
-                Some(backend)
-            } else {
-                None
-            };
-
-            let expectation = self.parse_expectation()?;
-
-            if let Some(backend) = backend_qualifier {
-                if overrides.contains_key(&backend) {
+        // Now check if it's a test or snapshot
+        match self.peek() {
+            Some(Token::Snapshot) => {
+                // Snapshot blocks don't support @backend or @requires
+                if backend.is_some() {
                     return Err(
-                        self.error(format!("duplicate expect block for backend '{backend}'"))
+                        self.error("@backend is not supported for snapshot blocks".to_string())
                     );
                 }
-                overrides.insert(backend, expectation);
-            } else {
-                if default_expectation.is_some() {
+                if !requires.is_empty() {
                     return Err(
-                        self.error("multiple default expect blocks (use @backend qualifier for backend-specific expectations)".to_string()),
+                        self.error("@requires is not supported for snapshot blocks".to_string())
                     );
                 }
-                default_expectation = Some(expectation);
+
+                self.expect_token(Token::Snapshot)?;
+                let (name, name_span) = self.expect_identifier_with_span()?;
+                let sql = self.expect_block_content()?.trim().to_string();
+
+                self.skip_newlines_and_comments();
+
+                Ok(TestOrSnapshot::Snapshot(SnapshotCase {
+                    name,
+                    name_span,
+                    sql,
+                    setups: test_setups,
+                    skip,
+                }))
             }
+            Some(Token::Test) => {
+                // Parse test as before
+                self.expect_token(Token::Test)?;
+                let (name, name_span) = self.expect_identifier_with_span()?;
+                let sql = self.expect_block_content()?.trim().to_string();
 
-            self.skip_newlines_and_comments();
+                self.skip_newlines_and_comments();
+
+                // Parse expect blocks (at least one required, with optional backend-specific overrides)
+                let mut default_expectation: Option<Expectation> = None;
+                let mut overrides: HashMap<ast::Backend, Expectation> = HashMap::new();
+
+                while matches!(self.peek(), Some(Token::Expect)) {
+                    self.expect_token(Token::Expect)?;
+
+                    // Check for backend qualifier: expect @js { ... }
+                    let backend_qualifier =
+                        if let Some(Token::AtIdentifier(backend_name)) = self.peek() {
+                            let backend_name = backend_name.clone();
+                            self.advance();
+                            let b = backend_name
+                                .parse::<ast::Backend>()
+                                .map_err(|e| self.error(e))?;
+                            Some(b)
+                        } else {
+                            None
+                        };
+
+                    let expectation = self.parse_expectation()?;
+
+                    if let Some(b) = backend_qualifier {
+                        if overrides.contains_key(&b) {
+                            return Err(
+                                self.error(format!("duplicate expect block for backend '{b}'"))
+                            );
+                        }
+                        overrides.insert(b, expectation);
+                    } else {
+                        if default_expectation.is_some() {
+                            return Err(
+                                self.error("multiple default expect blocks (use @backend qualifier for backend-specific expectations)".to_string()),
+                            );
+                        }
+                        default_expectation = Some(expectation);
+                    }
+
+                    self.skip_newlines_and_comments();
+                }
+
+                // Validate at least one default expectation
+                let default = default_expectation.ok_or_else(|| {
+                    self.error(
+                        "at least one default expect block (without @backend qualifier) is required"
+                            .to_string(),
+                    )
+                })?;
+
+                Ok(TestOrSnapshot::Test(TestCase {
+                    name,
+                    name_span,
+                    sql,
+                    expectations: Expectations { default, overrides },
+                    setups: test_setups,
+                    skip,
+                    backend,
+                    requires,
+                }))
+            }
+            Some(token) => Err(self.error(format!(
+                "expected 'test' or 'snapshot' after decorators, got {token}"
+            ))),
+            None => {
+                Err(self
+                    .error("expected 'test' or 'snapshot' after decorators, got EOF".to_string()))
+            }
         }
-
-        // Validate at least one default expectation
-        let default = default_expectation.ok_or_else(|| {
-            self.error(
-                "at least one default expect block (without @backend qualifier) is required"
-                    .to_string(),
-            )
-        })?;
-
-        Ok(TestCase {
-            name,
-            name_span,
-            sql,
-            expectations: Expectations { default, overrides },
-            setups: test_setups,
-            skip,
-            backend,
-            requires,
-        })
     }
 
     fn parse_expectation(&mut self) -> Result<Expectation, ParseError> {
@@ -524,7 +596,7 @@ impl Parser {
             });
         }
 
-        // Rule 4: All referenced setup names must exist
+        // Rule 4: All referenced setup names must exist (for tests and snapshots)
         for test in &file.tests {
             for setup_ref in &test.setups {
                 if !file.setups.contains_key(&setup_ref.name) {
@@ -556,6 +628,38 @@ impl Parser {
             }
         }
 
+        // Rule 4b: All referenced setup names must exist for snapshots
+        for snapshot in &file.snapshots {
+            for setup_ref in &snapshot.setups {
+                if !file.setups.contains_key(&setup_ref.name) {
+                    let available: Vec<_> = file.setups.keys().collect();
+                    let help = if available.is_empty() {
+                        "No setup blocks are defined in this file".to_string()
+                    } else {
+                        format!(
+                            "Available setups: {}",
+                            available
+                                .iter()
+                                .map(|s| s.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )
+                    };
+                    return Err(ParseError::ValidationError {
+                        message: format!(
+                            "snapshot '{}' references undefined setup '{}'",
+                            snapshot.name, setup_ref.name
+                        ),
+                        span: Some(SourceSpan::new(
+                            setup_ref.span.start.into(),
+                            setup_ref.span.len(),
+                        )),
+                        help: Some(help),
+                    });
+                }
+            }
+        }
+
         // Rule 5: Test names must be unique
         let mut seen_names: std::collections::HashMap<&str, Range<usize>> =
             std::collections::HashMap::new();
@@ -571,6 +675,23 @@ impl Parser {
                 });
             }
             seen_names.insert(&test.name, test.name_span.clone());
+        }
+
+        // Rule 6: Snapshot names must be unique
+        let mut seen_snapshot_names: std::collections::HashMap<&str, Range<usize>> =
+            std::collections::HashMap::new();
+        for snapshot in &file.snapshots {
+            if let Some(first_span) = seen_snapshot_names.get(snapshot.name.as_str()) {
+                return Err(ParseError::ValidationError {
+                    message: format!("duplicate snapshot name: {}", snapshot.name),
+                    span: Some(SourceSpan::new(
+                        snapshot.name_span.start.into(),
+                        snapshot.name_span.len(),
+                    )),
+                    help: Some(format!("First defined at offset {}", first_span.start)),
+                });
+            }
+            seen_snapshot_names.insert(&snapshot.name, snapshot.name_span.clone());
         }
 
         Ok(())
@@ -1250,5 +1371,139 @@ expect {
             file.tests[1].requires[0].capability,
             ast::Capability::Strict
         );
+    }
+
+    #[test]
+    fn test_parse_snapshot() {
+        let input = r#"
+@database :memory:
+
+snapshot query-plan {
+    SELECT * FROM users WHERE id = 1;
+}
+"#;
+
+        let file = parse(input).unwrap();
+        assert_eq!(file.snapshots.len(), 1);
+        assert_eq!(file.snapshots[0].name, "query-plan");
+        assert_eq!(file.snapshots[0].sql, "SELECT * FROM users WHERE id = 1;");
+        assert!(file.snapshots[0].setups.is_empty());
+        assert!(file.snapshots[0].skip.is_none());
+    }
+
+    #[test]
+    fn test_parse_snapshot_with_setup() {
+        let input = r#"
+@database :memory:
+
+setup schema {
+    CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);
+}
+
+@setup schema
+snapshot query-plan {
+    SELECT * FROM users WHERE id = 1;
+}
+"#;
+
+        let file = parse(input).unwrap();
+        assert_eq!(file.snapshots.len(), 1);
+        assert_eq!(file.snapshots[0].setups.len(), 1);
+        assert_eq!(file.snapshots[0].setups[0].name, "schema");
+    }
+
+    #[test]
+    fn test_parse_snapshot_with_skip() {
+        let input = r#"
+@database :memory:
+
+@skip "not ready"
+snapshot query-plan {
+    SELECT * FROM users;
+}
+"#;
+
+        let file = parse(input).unwrap();
+        assert_eq!(file.snapshots.len(), 1);
+        assert!(file.snapshots[0].skip.is_some());
+        assert_eq!(file.snapshots[0].skip.as_ref().unwrap().reason, "not ready");
+    }
+
+    #[test]
+    fn test_parse_mixed_tests_and_snapshots() {
+        let input = r#"
+@database :memory:
+
+setup schema {
+    CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);
+}
+
+@setup schema
+test select-user {
+    SELECT * FROM users WHERE id = 1;
+}
+expect {
+    1|Alice
+}
+
+@setup schema
+snapshot query-plan {
+    SELECT * FROM users WHERE id = 1;
+}
+"#;
+
+        let file = parse(input).unwrap();
+        assert_eq!(file.tests.len(), 1);
+        assert_eq!(file.snapshots.len(), 1);
+        assert_eq!(file.tests[0].name, "select-user");
+        assert_eq!(file.snapshots[0].name, "query-plan");
+    }
+
+    #[test]
+    fn test_snapshot_does_not_support_backend() {
+        let input = r#"
+@database :memory:
+
+@backend cli
+snapshot query-plan {
+    SELECT 1;
+}
+"#;
+
+        let result = parse(input);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_snapshot_does_not_support_requires() {
+        let input = r#"
+@database :memory:
+
+@requires trigger "test"
+snapshot query-plan {
+    SELECT 1;
+}
+"#;
+
+        let result = parse(input);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validation_duplicate_snapshot_name() {
+        let input = r#"
+@database :memory:
+
+snapshot same-name {
+    SELECT 1;
+}
+
+snapshot same-name {
+    SELECT 2;
+}
+"#;
+
+        let result = parse(input);
+        assert!(matches!(result, Err(ParseError::ValidationError { .. })));
     }
 }

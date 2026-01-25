@@ -134,6 +134,10 @@ pub enum Token {
     #[token("test")]
     Test,
 
+    /// `snapshot` keyword
+    #[token("snapshot")]
+    Snapshot,
+
     /// `expect` keyword
     #[token("expect")]
     Expect,
@@ -223,6 +227,7 @@ impl fmt::Display for Token {
             Token::AtIdentifier(s) => write!(f, "@{s}"),
             Token::Setup => write!(f, "setup"),
             Token::Test => write!(f, "test"),
+            Token::Snapshot => write!(f, "snapshot"),
             Token::Expect => write!(f, "expect"),
             Token::Error => write!(f, "error"),
             Token::Pattern => write!(f, "pattern"),
