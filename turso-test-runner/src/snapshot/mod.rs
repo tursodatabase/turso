@@ -217,8 +217,8 @@ impl SnapshotManager {
             .join(format!("{file_stem}__{name}.snap.new"))
     }
 
-    /// Read an existing snapshot file and return its content
-    pub async fn read_snapshot(&self, name: &str) -> Option<String> {
+    /// Read an existing snapshot file and return its content only
+    pub async fn read_snapshot_content(&self, name: &str) -> Option<String> {
         let parsed = self.read_snapshot(name).await?;
         Some(parsed.content)
     }
