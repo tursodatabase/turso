@@ -1,5 +1,6 @@
 //! CREATE TABLE statement type and generation strategy.
 
+use anarchist_readable_name_generator_lib::readable_name_custom;
 use proptest::prelude::*;
 use std::collections::HashSet;
 use std::fmt;
@@ -386,15 +387,55 @@ impl fmt::Display for CreateTableStatement {
     }
 }
 
+/// ReadableName strategy. Used to generate more readable identifiers
+#[derive(Debug, Clone, Copy)]
+struct ReadableName;
+
+#[derive(Debug, Clone)]
+struct ReadableNameTree(String);
+
+impl prop::strategy::ValueTree for ReadableNameTree {
+    type Value = String;
+
+    fn current(&self) -> Self::Value {
+        self.0.clone()
+    }
+
+    fn simplify(&mut self) -> bool {
+        false
+    }
+
+    fn complicate(&mut self) -> bool {
+        false
+    }
+}
+
+impl Strategy for ReadableName {
+    type Tree = ReadableNameTree;
+
+    type Value = String;
+
+    fn new_tree(
+        &self,
+        runner: &mut prop::test_runner::TestRunner,
+    ) -> prop::strategy::NewTree<Self> {
+        let name = readable_name_custom("_", runner.rng()).replace("-", "_");
+        Ok(ReadableNameTree(name))
+    }
+}
+
 /// Generate a valid SQL identifier.
 pub fn identifier() -> impl Strategy<Value = String> {
-    "[a-z][a-z0-9_]{0,30}".prop_filter("must not be empty", |s| !s.is_empty())
+    prop_oneof![
+        3 => "[a-z][a-z0-9_]{0,30}".prop_filter("must not be empty", |s| !s.is_empty()),
+        7 =>  ReadableName
+    ]
 }
 
 /// Generate a valid SQL identifier that is not in the excluded set.
 pub fn identifier_excluding(excluded: HashSet<String>) -> impl Strategy<Value = String> {
-    identifier().prop_filter_map("must not be in excluded set", move |s| {
-        if excluded.contains(&s) { None } else { Some(s) }
+    identifier().prop_filter("must not be in excluded set", move |s| {
+        !excluded.contains(s.as_str())
     })
 }
 
