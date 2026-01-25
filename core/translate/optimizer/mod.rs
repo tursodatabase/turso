@@ -1131,6 +1131,7 @@ fn optimize_table_access(
         subqueries,
         &index_method_candidates,
         params,
+        &schema.analyze_stats,
     )?
     else {
         return Ok(None);
