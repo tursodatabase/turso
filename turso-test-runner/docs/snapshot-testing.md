@@ -12,6 +12,8 @@ Snapshot tests capture the output of `EXPLAIN QUERY PLAN` and `EXPLAIN` (bytecod
 
 Unlike regular tests that compare query results, snapshot tests validate that the *way* a query executes remains consistent.
 
+> **Note:** Snapshot tests currently only run on the **Rust backend**. Other backends (CLI, JS) skip snapshot tests automatically. This is because EXPLAIN output format can differ between backends.
+
 ## Quick Start
 
 ### 1. Write a Snapshot Test
@@ -273,14 +275,10 @@ snapshot standard-plan {
 
 ### Backend-Specific Snapshots
 
-```sql
-# Only capture plan on CLI backend (e.g., comparing with SQLite)
-@backend cli
-snapshot sqlite-query-plan {
-    SELECT * FROM users WHERE id = 1;
-}
+Since snapshot tests only run on the Rust backend, the `@backend` decorator is typically not needed for snapshots. However, you can still use it to explicitly require the Rust backend:
 
-# Only capture plan on Rust backend
+```sql
+# Explicitly require Rust backend (optional, since it's the only backend that runs snapshots)
 @backend rust
 snapshot turso-query-plan {
     SELECT * FROM users WHERE id = 1;
@@ -307,7 +305,7 @@ Snapshots support all test decorators:
 | `@setup <name>` | Apply a setup block before the snapshot |
 | `@skip "reason"` | Skip this snapshot unconditionally |
 | `@skip-if <cond> "reason"` | Skip conditionally (e.g., `mvcc`) |
-| `@backend <name>` | Only run on specified backend (`rust`, `cli`, `js`) |
+| `@backend <name>` | Only run on specified backend (snapshots only run on `rust`) |
 | `@requires <cap> "reason"` | Only run if backend supports capability |
 
 File-level directives (`@skip-file`, `@skip-file-if`, `@requires-file`) also apply to snapshots.
