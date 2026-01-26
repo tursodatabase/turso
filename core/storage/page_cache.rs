@@ -379,7 +379,24 @@ impl PageCache {
     /// This indicates that dirty pages should be flushed to make room for new pages.
     #[inline]
     pub fn needs_spill(&self) -> bool {
-        self.spill_enabled && self.len() >= self.spill_threshold
+        let len = self.len();
+
+        if len < self.spill_threshold || !self.spill_enabled {
+            return false;
+        }
+        self.count_evictable_pages() < len.saturating_sub(self.spill_threshold)
+    }
+
+    #[inline]
+    /// Count pages that can be evicted without spilling.
+    fn count_evictable_pages(&self) -> usize {
+        self.map
+            .values()
+            .filter(|&&entry_ptr| {
+                let entry = unsafe { &*entry_ptr };
+                Self::evictable(&entry.page)
+            })
+            .count()
     }
 
     /// Check if spilling is enabled for this cache.
@@ -455,9 +472,6 @@ impl PageCache {
     pub fn check_spill(&self, max_pages: usize) -> SpillResult {
         if !self.needs_spill() {
             return SpillResult::NotNeeded;
-        }
-        if !self.spill_enabled {
-            return SpillResult::Disabled;
         }
 
         let pages = self.collect_spillable_pages(max_pages);
