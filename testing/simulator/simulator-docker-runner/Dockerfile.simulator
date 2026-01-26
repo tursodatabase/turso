@@ -33,6 +33,8 @@ COPY testing/concurrent-simulator ./testing/concurrent-simulator
 COPY testing/differential-oracle ./testing/differential-oracle/
 COPY sdk-kit ./sdk-kit/
 COPY sdk-kit-macros ./sdk-kit-macros/
+COPY tools/dbhash ./tools/dbhash
+
 RUN cargo chef prepare --bin limbo_sim --recipe-path recipe.json
 
 #
@@ -54,6 +56,7 @@ COPY --from=planner /app/testing/simulator ./testing/simulator/
 COPY --from=planner /app/packages ./packages/
 COPY --from=planner /app/sql_generation ./sql_generation/
 COPY --from=planner /app/testing/differential-oracle ./testing/differential-oracle/
+COPY --from=planner /app/tools/dbhash ./tools/dbhash
 COPY --from=planner /app/Cargo.toml /app/Cargo.lock ./
 
 RUN cargo build --bin limbo_sim --release
