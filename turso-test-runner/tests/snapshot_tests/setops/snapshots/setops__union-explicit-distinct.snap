@@ -1,0 +1,48 @@
+---
+source: setops.sqltest
+expression: |-
+  SELECT DISTINCT department FROM current_employees
+      UNION
+      SELECT DISTINCT department FROM former_employees;
+info:
+  statement_type: SELECT
+  tables:
+  - current_employees
+  - former_employees
+  setup_blocks:
+  - schema
+  database: ':memory:'
+---
+QUERY PLAN
+`--COMPOUND QUERY
+   |--LEFT-MOST SUBQUERY
+   |  `--SCAN current_employees USING COVERING INDEX idx_current_dept
+   `--UNION USING TEMP B-TREE
+      `--SCAN former_employees USING COVERING INDEX idx_former_dept
+
+BYTECODE
+addr  opcode                  p1  p2  p3  p4      p5  comment
+   0  Init                     0  22   0           0  Start at 22
+   1  OpenEphemeral            0   0   0           0  cursor=0 is_table=false
+   2  OpenRead                 1   5   0  k(2,B)   0  index=idx_current_dept, root=5, iDb=0
+   3  Rewind                   1   9   0           0  Rewind index idx_current_dept
+   4    Column                 1   0   1           0  r[1]=idx_current_dept.department
+   5    HashDistinct  1073741824   1   1  jmp=8    0
+   6    MakeRecord             1   1   2           0  r[2]=mkrec(r[1..1]); for compound_dedupe
+   7    IdxInsert              0   2   0           8  key=r[2]
+   8  Next                     1   4   0           0
+   9  OpenRead                 2   6   0  k(2,B)   0  index=idx_former_dept, root=6, iDb=0
+  10  Rewind                   2  16   0           0  Rewind index idx_former_dept
+  11    Column                 2   0   3           0  r[3]=idx_former_dept.department
+  12    HashDistinct  1073741825   3   1  jmp=15   0
+  13    MakeRecord             3   1   4           0  r[4]=mkrec(r[3..3]); for compound_dedupe
+  14    IdxInsert              0   4   0           8  key=r[4]
+  15  Next                     2  11   0           0
+  16  Rewind                   0  19   0           0  Rewind  compound_dedupe
+  17    Column                 0   0   5           0  r[5]=compound_dedupe.department
+  18    ResultRow              5   1   0           0  output=r[5]
+  19  Next                     0  17   0           0
+  20  Close                    0   0   0           0
+  21  Halt                     0   0   0           0
+  22  Transaction              0   1   6           0  iDb=0 tx_mode=Read
+  23  Goto                     0   1   0           0
