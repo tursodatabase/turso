@@ -859,6 +859,114 @@ pub fn format_explain_output(rows: &[Vec<String>]) -> String {
     output.trim_end().to_string()
 }
 
+/// Format EXPLAIN QUERY PLAN output as a tree structure.
+///
+/// EXPLAIN QUERY PLAN returns 4 columns: id, parent, notused, detail.
+/// We format it as a tree with indentation based on the parent-child relationships.
+///
+/// # Example Output
+/// ```text
+/// `--SEARCH users USING INDEX idx_users_name (name=?)
+/// ```
+pub fn format_explain_query_plan_output(rows: &[Vec<String>]) -> String {
+    if rows.is_empty() {
+        return String::new();
+    }
+
+    // EXPLAIN QUERY PLAN columns: id, parent, notused, detail
+    // We only need the detail column (index 3) for display
+    // and id/parent (indices 0,1) for tree structure
+
+    // Build a map of id -> (parent, detail)
+    let mut nodes: std::collections::HashMap<i64, (i64, String)> = std::collections::HashMap::new();
+    let mut root_ids: Vec<i64> = Vec::new();
+
+    for row in rows {
+        if row.len() >= 4 {
+            let id: i64 = row[0].parse().unwrap_or(0);
+            let parent: i64 = row[1].parse().unwrap_or(0);
+            let detail = row[3].clone();
+
+            nodes.insert(id, (parent, detail));
+
+            // Root nodes have parent = 0 or are the first node
+            if parent == 0 {
+                root_ids.push(id);
+            }
+        }
+    }
+
+    // If no explicit roots found, use all nodes (flat list)
+    if root_ids.is_empty() {
+        root_ids = nodes.keys().copied().collect();
+        root_ids.sort();
+    }
+
+    let mut output = String::new();
+
+    // Recursively format the tree
+    fn format_node(
+        id: i64,
+        nodes: &std::collections::HashMap<i64, (i64, String)>,
+        all_ids: &[i64],
+        output: &mut String,
+        prefix: &str,
+        is_last: bool,
+    ) {
+        if let Some((_, detail)) = nodes.get(&id) {
+            // Draw the tree branch
+            let branch = if is_last { "`--" } else { "|--" };
+            output.push_str(prefix);
+            output.push_str(branch);
+            output.push_str(detail);
+            output.push('\n');
+
+            // Find children of this node
+            let children: Vec<i64> = all_ids
+                .iter()
+                .filter(|&&child_id| {
+                    if let Some((parent, _)) = nodes.get(&child_id) {
+                        *parent == id
+                    } else {
+                        false
+                    }
+                })
+                .copied()
+                .collect();
+
+            // Format children with updated prefix
+            let child_prefix = if is_last {
+                format!("{prefix}   ")
+            } else {
+                format!("{prefix}|  ")
+            };
+
+            for (i, child_id) in children.iter().enumerate() {
+                let is_last_child = i == children.len() - 1;
+                format_node(
+                    *child_id,
+                    nodes,
+                    all_ids,
+                    output,
+                    &child_prefix,
+                    is_last_child,
+                );
+            }
+        }
+    }
+
+    // Collect all IDs for child lookup
+    let all_ids: Vec<i64> = nodes.keys().copied().collect();
+
+    // Format each root
+    for (i, root_id) in root_ids.iter().enumerate() {
+        let is_last = i == root_ids.len() - 1;
+        format_node(*root_id, &nodes, &all_ids, &mut output, "", is_last);
+    }
+
+    output.trim_end().to_string()
+}
+
 impl Clone for ExplainColumn {
     fn clone(&self) -> Self {
         ExplainColumn {

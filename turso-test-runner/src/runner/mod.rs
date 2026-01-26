@@ -4,9 +4,7 @@ use crate::parser::ast::{
     Backend, Capability, DatabaseConfig, Requirement, SetupRef, Skip, SkipCondition, SnapshotCase,
     TestCase, TestFile,
 };
-use crate::snapshot::{
-    SnapshotInfo, SnapshotManager, SnapshotResult, SnapshotUpdateMode, format_explain_output,
-};
+use crate::snapshot::{SnapshotInfo, SnapshotManager, SnapshotResult, SnapshotUpdateMode};
 use async_trait::async_trait;
 use futures::FutureExt;
 use futures::stream::{FuturesUnordered, StreamExt};
@@ -60,11 +58,23 @@ pub trait Runnable: Clone + Send + 'static {
     /// Returns Some(reason) if should skip, None if can proceed
     fn check_skip_conditions(&self, options: &RunOptions) -> Option<String>;
 
-    /// Get the SQL to execute
+    /// Get all SQL queries to execute.
+    /// Default implementation returns a single query from `sql_to_execute()`.
+    fn queries_to_execute(&self) -> Vec<String> {
+        vec![self.sql_to_execute()]
+    }
+
+    /// Get the primary SQL to execute (for backward compatibility).
+    /// Override `queries_to_execute()` for multiple queries.
     fn sql_to_execute(&self) -> String;
 
-    /// Evaluate the execution result and return the outcome
-    async fn evaluate_result(&self, result: QueryResult, options: &RunOptions) -> TestOutcome;
+    /// Evaluate the execution results and return the outcome.
+    /// The results correspond to the queries returned by `queries_to_execute()`.
+    async fn evaluate_results(
+        &self,
+        results: Vec<QueryResult>,
+        options: &RunOptions,
+    ) -> TestOutcome;
 }
 
 // ============================================================================
@@ -99,9 +109,16 @@ impl Runnable for TestCase {
         self.sql.clone()
     }
 
-    async fn evaluate_result(&self, result: QueryResult, options: &RunOptions) -> TestOutcome {
+    async fn evaluate_results(
+        &self,
+        results: Vec<QueryResult>,
+        options: &RunOptions,
+    ) -> TestOutcome {
+        // Tests use only the first (and only) result
+        assert!(results.len() == 1);
+        let result = results.first().unwrap();
         let expectation = self.expectations.for_backend(options.backend_type);
-        let comparison = compare(&result, expectation);
+        let comparison = compare(result, expectation);
         match comparison {
             ComparisonResult::Match => TestOutcome::Passed,
             ComparisonResult::Mismatch { reason } => TestOutcome::Failed { reason },
@@ -128,13 +145,31 @@ impl Runnable for SnapshotCase {
         None
     }
 
+    fn queries_to_execute(&self) -> Vec<String> {
+        // Run both EXPLAIN QUERY PLAN and EXPLAIN
+        vec![
+            format!("EXPLAIN QUERY PLAN {}", self.sql),
+            format!("EXPLAIN {}", self.sql),
+        ]
+    }
+
     fn sql_to_execute(&self) -> String {
+        // Primary query (for backward compatibility)
         format!("EXPLAIN {}", self.sql)
     }
 
-    async fn evaluate_result(&self, result: QueryResult, options: &RunOptions) -> TestOutcome {
-        // Format EXPLAIN output as a nicely aligned table
-        let actual_output = format_explain_output(&result.rows);
+    async fn evaluate_results(
+        &self,
+        results: Vec<QueryResult>,
+        options: &RunOptions,
+    ) -> TestOutcome {
+        // results[0] = EXPLAIN QUERY PLAN
+        // results[1] = EXPLAIN
+        let eqp_result = results.first().expect("should have two query results");
+        let explain_result = results.get(1).expect("should have two query results");
+
+        // Format both outputs
+        let actual_output = format_snapshot_content(&eqp_result.rows, &explain_result.rows);
 
         // Build snapshot info with metadata
         let db_location_str = options.db_config.location.to_string();
@@ -165,6 +200,24 @@ impl Runnable for SnapshotCase {
             SnapshotResult::Error { msg } => TestOutcome::Error { message: msg },
         }
     }
+}
+
+/// Format the combined snapshot content with both EXPLAIN QUERY PLAN and EXPLAIN output.
+fn format_snapshot_content(eqp_rows: &[Vec<String>], explain_rows: &[Vec<String>]) -> String {
+    use crate::snapshot::{format_explain_output, format_explain_query_plan_output};
+
+    let mut output = String::new();
+
+    // EXPLAIN QUERY PLAN section
+    output.push_str("QUERY PLAN\n");
+    output.push_str(&format_explain_query_plan_output(eqp_rows));
+    output.push_str("\n\n");
+
+    // EXPLAIN section
+    output.push_str("BYTECODE\n");
+    output.push_str(&format_explain_output(explain_rows));
+
+    output
 }
 
 // ============================================================================
@@ -261,29 +314,32 @@ async fn run_single<B: SqlBackend, R: Runnable>(
             }
         }
 
-        // Execute SQL
-        let sql = test.sql_to_execute();
-        let result = match db.execute(&sql).await {
-            Ok(r) => r,
-            Err(e) => {
-                let _ = db.close().await;
-                return TestResult {
-                    name: test.name().to_string(),
-                    file: options.file_path,
-                    database: options.db_config,
-                    outcome: TestOutcome::Error {
-                        message: format!("execution failed: {e}"),
-                    },
-                    duration: start.elapsed(),
-                };
+        // Execute all SQL queries
+        let queries = test.queries_to_execute();
+        let mut results = Vec::with_capacity(queries.len());
+        for sql in queries {
+            match db.execute(&sql).await {
+                Ok(r) => results.push(r),
+                Err(e) => {
+                    let _ = db.close().await;
+                    return TestResult {
+                        name: test.name().to_string(),
+                        file: options.file_path,
+                        database: options.db_config,
+                        outcome: TestOutcome::Error {
+                            message: format!("execution failed: {e}"),
+                        },
+                        duration: start.elapsed(),
+                    };
+                }
             }
-        };
+        }
 
         // Close database
         let _ = db.close().await;
 
-        // Evaluate result
-        let outcome = test.evaluate_result(result, &options).await;
+        // Evaluate results
+        let outcome = test.evaluate_results(results, &options).await;
 
         TestResult {
             name: test.name().to_string(),
