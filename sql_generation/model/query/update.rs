@@ -20,18 +20,6 @@ pub enum SetValue {
     },
 }
 
-impl SetValue {
-    /// Returns the simple value
-    pub fn simple_value(&self) -> &SimValue {
-        match self {
-            SetValue::Simple(v) => v,
-            SetValue::CaseWhen { .. } => {
-                panic!("simple_value() called on CaseWhen variant")
-            }
-        }
-    }
-}
-
 impl Display for SetValue {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -61,12 +49,6 @@ pub struct Update {
 impl Update {
     pub fn table(&self) -> &str {
         &self.table
-    }
-
-    pub fn has_case_when(&self) -> bool {
-        self.set_values
-            .iter()
-            .any(|(_, v)| matches!(v, SetValue::CaseWhen { .. }))
     }
 }
 

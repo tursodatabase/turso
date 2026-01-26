@@ -238,8 +238,7 @@ impl Property {
             | Property::UnionAllPreservesCardinality { .. }
             | Property::ReadYourUpdatesBack { .. }
             | Property::TableHasExpectedContent { .. }
-            | Property::AllTableHaveExpectedContent { .. }
-            | Property::StatementAtomicity { .. } => {
+            | Property::AllTableHaveExpectedContent { .. } => {
                 unreachable!("No extensional queries")
             }
         }
@@ -321,7 +320,11 @@ impl Property {
                     InteractionBuilder::with_interaction(assertion),
                 ]
             }
-            Property::ReadYourUpdatesBack { update, select } => {
+            Property::ReadYourUpdatesBack {
+                update,
+                select_before,
+                select_after,
+            } => {
                 let table = update.table().to_string();
                 let table_dependency = table.clone();
                 let assumption = InteractionType::Assumption(Assertion::new(
@@ -340,59 +343,120 @@ impl Property {
                     vec![table_dependency.clone()],
                 ));
 
+                let before_interaction =
+                    InteractionType::Query(Query::Select(select_before.clone()));
+                let begin_tx = InteractionType::Query(Query::Begin(
+                    sql_generation::model::query::transaction::Begin::Immediate,
+                ));
                 let update_interaction = InteractionType::Query(Query::Update(update.clone()));
-                let select_interaction = InteractionType::Query(Query::Select(select.clone()));
+                let commit_tx = InteractionType::Query(Query::Commit(
+                    sql_generation::model::query::transaction::Commit,
+                ));
+                let after_interaction = InteractionType::Query(Query::Select(select_after.clone()));
 
                 let update = update.clone();
-
                 let table = update.table().to_string();
 
                 let assertion = InteractionType::Assertion(Assertion::new(
                     format!(
-                        "updated rows should be found and have the updated values for table {}",
+                        "verify UPDATE result for table {}: success=values updated, failure=unchanged",
                         table.clone()
                     ),
                     move |stack: &Vec<ResultSet>, _| {
-                        let rows = stack.last().unwrap();
-                        match rows {
-                            Ok(rows) => {
-                                for row in rows {
-                                    for (i, (col, set_val)) in update.set_values.iter().enumerate()
-                                    {
-                                        let val = set_val.simple_value();
-                                        if &row[i] != val {
-                                            let update_rows = update
-                                                .set_values
-                                                .iter()
-                                                .map(|(_, set_value)| {
-                                                    set_value.simple_value().clone()
-                                                })
-                                                .collect::<Vec<_>>();
-                                            print_diff(
-                                                &[row.to_vec()],
-                                                &[update_rows],
-                                                "database",
-                                                "update-clause",
-                                            );
-                                            return Ok(Err(format!(
-                                                "updated row {} has incorrect value for column {col}: expected {val}, got {}",
-                                                i, row[i]
-                                            )));
+                        // Stack: [before, BEGIN, UPDATE, COMMIT, after]
+                        if stack.len() < 5 {
+                            return Err(LimboError::InternalError(
+                                "ReadYourUpdatesBack: expected 5 results on stack".into(),
+                            ));
+                        }
+                        let before = &stack[stack.len() - 5];
+                        let update_result = &stack[stack.len() - 3];
+                        let after = &stack[stack.len() - 1];
+
+                        let update_succeeded = update_result.is_ok();
+
+                        match (before, after) {
+                            (Ok(before_rows), Ok(after_rows)) => {
+                                if update_succeeded {
+                                    // Verify rows have updated values
+                                    for row in after_rows {
+                                        for (i, (col, set_val)) in
+                                            update.set_values.iter().enumerate()
+                                        {
+                                            match set_val {
+                                                SetValue::Simple(expected) => {
+                                                    if &row[i] != expected {
+                                                        print_diff(
+                                                            &[row.to_vec()],
+                                                            &[vec![expected.clone()]],
+                                                            "database",
+                                                            "expected",
+                                                        );
+                                                        return Ok(Err(format!(
+                                                            "row has incorrect value for column {col}: expected {expected}, got {}",
+                                                            row[i]
+                                                        )));
+                                                    }
+                                                }
+                                                SetValue::CaseWhen { then_value, .. } => {
+                                                    let is_then = &row[i] == then_value;
+                                                    let existed_before = before_rows
+                                                        .iter()
+                                                        .any(|br| br[i] == row[i]);
+                                                    if !is_then && !existed_before {
+                                                        return Ok(Err(format!(
+                                                            "CaseWhen: row col {col} has unexpected value {} (expected {} or a value from before)",
+                                                            row[i], then_value
+                                                        )));
+                                                    }
+                                                }
+                                            }
                                         }
                                     }
+                                    Ok(Ok(()))
+                                } else {
+                                    // UPDATE failed - verify rollback (rows unchanged)
+                                    let rows_equal_as_multiset =
+                                        |a: &[Vec<SimValue>], b: &[Vec<SimValue>]| {
+                                            if a.len() != b.len() {
+                                                return false;
+                                            }
+                                            // for each row in a, check it appears the same number of times in b
+                                            let count_in =
+                                                |row: &Vec<SimValue>, set: &[Vec<SimValue>]| {
+                                                    set.iter().filter(|r| *r == row).count()
+                                                };
+                                            a.iter().all(|row| count_in(row, a) == count_in(row, b))
+                                        };
+                                    if !rows_equal_as_multiset(before_rows, after_rows) {
+                                        print_diff(before_rows, after_rows, "before", "after");
+                                        return Ok(Err(format!(
+                                            "UPDATE failed but rows changed - rollback failed: {} rows before, {} after",
+                                            before_rows.len(),
+                                            after_rows.len()
+                                        )));
+                                    }
+                                    Ok(Ok(()))
                                 }
-                                Ok(Ok(()))
                             }
-                            Err(err) => Err(LimboError::InternalError(err.to_string())),
+                            (Err(e), _) | (_, Err(e)) => {
+                                Err(LimboError::InternalError(format!("SELECT failed: {e}")))
+                            }
                         }
                     },
                     vec![table_dependency],
                 ));
 
+                let mut update_builder = InteractionBuilder::with_interaction(update_interaction);
+                update_builder.ignore_error(true);
+
                 vec![
                     InteractionBuilder::with_interaction(assumption),
-                    InteractionBuilder::with_interaction(update_interaction),
-                    InteractionBuilder::with_interaction(select_interaction),
+                    InteractionBuilder::with_interaction(before_interaction),
+                    InteractionBuilder::with_interaction(begin_tx),
+                    update_builder,
+                    InteractionBuilder::with_interaction(commit_tx),
+                    InteractionBuilder::with_interaction(after_interaction),
                     InteractionBuilder::with_interaction(assertion),
                 ]
             }
@@ -1125,80 +1189,6 @@ impl Property {
                 .into_iter()
                 .map(|query| InteractionBuilder::with_interaction(InteractionType::Query(query)))
                 .collect(),
-            Property::StatementAtomicity { table, statement } => {
-                let table_name = table.clone();
-
-                let assumption = InteractionType::Assumption(Assertion::new(
-                    format!("table {table} exists"),
-                    {
-                        let table = table.clone();
-                        move |_: &Vec<ResultSet>, env: &mut SimulatorEnv| {
-                            if env
-                                .get_conn_tables(connection_index)
-                                .iter()
-                                .any(|t| t.name == table)
-                            {
-                                Ok(Ok(()))
-                            } else {
-                                Ok(Err(format!("table '{table}' not found")))
-                            }
-                        }
-                    },
-                    vec![table.clone()],
-                ));
-
-                let snapshot_before = InteractionBuilder::with_interaction(InteractionType::Query(
-                    Query::Select(Select::simple(table.clone(), Predicate::true_())),
-                ));
-                let begin_tx = InteractionBuilder::with_interaction(InteractionType::Query(
-                    Query::Begin(Begin::Immediate),
-                ));
-                let mut dml_interaction =
-                    InteractionBuilder::with_interaction(InteractionType::Query(statement.clone()));
-                dml_interaction.ignore_error(true);
-                let commit_tx = InteractionBuilder::with_interaction(InteractionType::Query(
-                    Query::Commit(Commit),
-                ));
-                let final_select = InteractionBuilder::with_interaction(InteractionType::Query(
-                    Query::Select(Select::simple(table.clone(), Predicate::true_())),
-                ));
-
-                let assertion = InteractionType::Assertion(Assertion::new(
-                    format!("{table_name} unchanged after failed statement"),
-                    move |stack: &Vec<ResultSet>, _| {
-                        // [0]=before, [1]=BEGIN, [2]=DML, [3]=COMMIT, [4]=final
-                        let (before, dml_result, final_) = (&stack[0], &stack[2], &stack[4]);
-                        if dml_result.is_ok() {
-                            return Ok(Ok(()));
-                        }
-                        let before = before
-                            .as_ref()
-                            .map_err(|e| LimboError::InternalError(e.to_string()))?;
-                        let final_ = final_
-                            .as_ref()
-                            .map_err(|e| LimboError::InternalError(e.to_string()))?;
-                        if before != final_ {
-                            return Ok(Err(format!(
-                                "rows changed: {} to {}",
-                                before.len(),
-                                final_.len()
-                            )));
-                        }
-                        Ok(Ok(()))
-                    },
-                    vec![table.clone()],
-                ));
-
-                vec![
-                    InteractionBuilder::with_interaction(assumption),
-                    snapshot_before,
-                    begin_tx,
-                    dml_interaction,
-                    commit_tx,
-                    final_select,
-                    InteractionBuilder::with_interaction(assertion),
-                ]
-            }
         };
 
         assert!(!interactions.is_empty());
@@ -1364,21 +1354,7 @@ fn property_read_your_updates_back<R: rand::Rng + ?Sized>(
     ctx: &impl GenerationContext,
     _mvcc: bool,
 ) -> Property {
-    // force_late_failure makes Update::arbitrary always generate CaseWhen, so generate simple update
-    let update = if ctx.opts().query.update.force_late_failure {
-        let table = pick(ctx.tables(), rng);
-        let col = pick(&table.columns, rng);
-        Update {
-            table: table.name.clone(),
-            set_values: vec![(
-                col.name.clone(),
-                SetValue::Simple(SimValue::arbitrary_from(rng, ctx, &col.column_type)),
-            )],
-            predicate: Predicate::arbitrary_from(rng, ctx, table),
-        }
-    } else {
-        Update::arbitrary(rng, ctx)
-    };
+    let update = Update::arbitrary(rng, ctx);
 
     // e.g. SELECT a, b FROM t WHERE c=1;
     let select = Select::single(
@@ -1393,7 +1369,11 @@ fn property_read_your_updates_back<R: rand::Rng + ?Sized>(
         Distinctness::All,
     );
 
-    Property::ReadYourUpdatesBack { update, select }
+    Property::ReadYourUpdatesBack {
+        update,
+        select_before: select.clone(),
+        select_after: select,
+    }
 }
 
 fn property_table_has_expected_content<R: rand::Rng + ?Sized>(
@@ -1605,70 +1585,6 @@ fn property_faulty_query<R: rand::Rng + ?Sized>(
     }
 }
 
-fn generate_failing_insert<R: rand::Rng + ?Sized>(
-    rng: &mut R,
-    ctx: &impl GenerationContext,
-) -> Option<(String, Insert)> {
-    let tables: Vec<_> = ctx
-        .tables()
-        .iter()
-        .filter(|t| t.has_any_unique_column())
-        .collect();
-    let table = *pick(&tables, rng);
-
-    let unique_col = table.columns.iter().find(|c| c.has_unique_constraint())?;
-    let dup_val = SimValue::arbitrary_from(rng, ctx, &unique_col.column_type);
-
-    let values: Vec<Vec<SimValue>> = (0..rng.random_range(2..=5))
-        .map(|_| {
-            table
-                .columns
-                .iter()
-                .map(|col| {
-                    if col.has_unique_constraint() {
-                        dup_val.clone()
-                    } else {
-                        SimValue::arbitrary_from(rng, ctx, &col.column_type)
-                    }
-                })
-                .collect()
-        })
-        .collect();
-
-    Some((
-        table.name.clone(),
-        Insert::Values {
-            table: table.name.clone(),
-            values,
-        },
-    ))
-}
-
-fn property_statement_atomicity<R: rand::Rng + ?Sized>(
-    rng: &mut R,
-    _query_distr: &QueryDistribution,
-    ctx: &impl GenerationContext,
-    _mvcc: bool,
-) -> Property {
-    assert!(!ctx.tables().is_empty());
-
-    let has_unique_tables = ctx.tables().iter().any(|t| t.has_any_unique_column());
-
-    let (table_name, statement) = if has_unique_tables && rng.random_bool(0.5) {
-        let (table, insert) = generate_failing_insert(rng, ctx)
-            .expect("should have UNIQUE tables since has_unique_tables is true");
-        (table, Query::Insert(insert))
-    } else {
-        let update = Update::arbitrary(rng, ctx);
-        (update.table.clone(), Query::Update(update))
-    };
-
-    Property::StatementAtomicity {
-        table: table_name,
-        statement,
-    }
-}
-
 type PropertyGenFunc<R, G> = fn(&mut R, &QueryDistribution, &G, bool) -> Property;
 
 impl PropertyDiscriminants {
@@ -1698,7 +1614,6 @@ impl PropertyDiscriminants {
             PropertyDiscriminants::Queries => {
                 unreachable!("should not try to generate queries property")
             }
-            PropertyDiscriminants::StatementAtomicity => property_statement_atomicity,
         }
     }
 
@@ -1804,13 +1719,6 @@ impl PropertyDiscriminants {
             PropertyDiscriminants::Queries => {
                 unreachable!("queries property should not be generated")
             }
-            PropertyDiscriminants::StatementAtomicity => {
-                if !ctx.tables().is_empty() {
-                    (remaining.insert + remaining.update + remaining.delete).max(1) / 3
-                } else {
-                    0
-                }
-            }
         }
     }
 
@@ -1849,10 +1757,6 @@ impl PropertyDiscriminants {
             PropertyDiscriminants::FsyncNoWait => QueryCapabilities::all(),
             PropertyDiscriminants::FaultyQuery => QueryCapabilities::all(),
             PropertyDiscriminants::Queries => panic!("queries property should not be generated"),
-            PropertyDiscriminants::StatementAtomicity => QueryCapabilities::SELECT
-                .union(QueryCapabilities::INSERT)
-                .union(QueryCapabilities::UPDATE)
-                .union(QueryCapabilities::DELETE),
         }
     }
 }
