@@ -721,6 +721,153 @@ fn generate_diff(expected: &str, actual: &str) -> String {
     result
 }
 
+/// Column definition for EXPLAIN output formatting
+struct ExplainColumn {
+    name: &'static str,
+    right_align: bool,
+}
+
+/// EXPLAIN output column definitions
+const EXPLAIN_COLUMNS: &[ExplainColumn] = &[
+    ExplainColumn {
+        name: "addr",
+        right_align: true,
+    },
+    ExplainColumn {
+        name: "opcode",
+        right_align: false,
+    },
+    ExplainColumn {
+        name: "p1",
+        right_align: true,
+    },
+    ExplainColumn {
+        name: "p2",
+        right_align: true,
+    },
+    ExplainColumn {
+        name: "p3",
+        right_align: true,
+    },
+    ExplainColumn {
+        name: "p4",
+        right_align: false,
+    },
+    ExplainColumn {
+        name: "p5",
+        right_align: true,
+    },
+    ExplainColumn {
+        name: "comment",
+        right_align: false,
+    },
+];
+
+/// Format EXPLAIN query results as a nicely formatted ASCII table.
+///
+/// Takes the raw rows from an EXPLAIN query and formats them with:
+/// - Column headers
+/// - Proper alignment (right for numeric columns, left for text)
+/// - Consistent column widths
+///
+/// # Example Output
+/// ```text
+/// addr  opcode       p1  p2  p3  p4             p5  comment
+///    0  Init          0  10   0                  0  Start at 10
+///    1  OpenRead      0   2   0  k(3,B,B)        0  table=t, root=2
+/// ```
+pub fn format_explain_output(rows: &[Vec<String>]) -> String {
+    if rows.is_empty() {
+        return String::new();
+    }
+
+    let num_cols = rows.first().map(|r| r.len()).unwrap_or(0);
+    if num_cols == 0 {
+        return String::new();
+    }
+
+    // Determine column count - use EXPLAIN_COLUMNS if it matches, otherwise use generic headers
+    let columns: Vec<ExplainColumn> = if num_cols <= EXPLAIN_COLUMNS.len() {
+        EXPLAIN_COLUMNS[..num_cols].to_vec()
+    } else {
+        // Fallback to generic column names for unexpected column counts
+        (0..num_cols)
+            .map(|i| {
+                if i < EXPLAIN_COLUMNS.len() {
+                    ExplainColumn {
+                        name: EXPLAIN_COLUMNS[i].name,
+                        right_align: EXPLAIN_COLUMNS[i].right_align,
+                    }
+                } else {
+                    ExplainColumn {
+                        name: "?",
+                        right_align: false,
+                    }
+                }
+            })
+            .collect()
+    };
+
+    // Calculate column widths (max of header and all values)
+    let mut widths: Vec<usize> = columns.iter().map(|c| c.name.len()).collect();
+    for row in rows {
+        for (i, cell) in row.iter().enumerate() {
+            if i < widths.len() {
+                widths[i] = widths[i].max(cell.len());
+            }
+        }
+    }
+
+    let mut output = String::new();
+
+    // Header row
+    let header: Vec<String> = columns
+        .iter()
+        .enumerate()
+        .map(|(i, col)| {
+            if col.right_align {
+                format!("{:>width$}", col.name, width = widths[i])
+            } else {
+                format!("{:<width$}", col.name, width = widths[i])
+            }
+        })
+        .collect();
+    output.push_str(header.join("  ").trim_end());
+    output.push('\n');
+
+    // Data rows
+    for row in rows {
+        let formatted: Vec<String> = row
+            .iter()
+            .enumerate()
+            .map(|(i, cell)| {
+                let width = widths.get(i).copied().unwrap_or(cell.len());
+                let right_align = columns.get(i).map(|c| c.right_align).unwrap_or(false);
+                if right_align {
+                    format!("{cell:>width$}")
+                } else {
+                    format!("{cell:<width$}")
+                }
+            })
+            .collect();
+        // Trim trailing whitespace from each line
+        output.push_str(formatted.join("  ").trim_end());
+        output.push('\n');
+    }
+
+    // Remove trailing newline for cleaner output
+    output.trim_end().to_string()
+}
+
+impl Clone for ExplainColumn {
+    fn clone(&self) -> Self {
+        ExplainColumn {
+            name: self.name,
+            right_align: self.right_align,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -974,5 +1121,56 @@ mod tests {
         // Check that .snap was created (not .snap.new)
         assert!(manager.snapshot_path("new-snap").exists());
         assert!(!manager.pending_path("new-snap").exists());
+    }
+
+    #[test]
+    fn test_format_explain_output() {
+        let rows = vec![
+            vec![
+                "0".to_string(),
+                "Init".to_string(),
+                "0".to_string(),
+                "8".to_string(),
+                "0".to_string(),
+                "".to_string(),
+                "0".to_string(),
+                "Start at 8".to_string(),
+            ],
+            vec![
+                "1".to_string(),
+                "OpenRead".to_string(),
+                "0".to_string(),
+                "2".to_string(),
+                "0".to_string(),
+                "k(3,B,B)".to_string(),
+                "0".to_string(),
+                "table=t".to_string(),
+            ],
+        ];
+
+        let output = format_explain_output(&rows);
+
+        // Check header is present
+        assert!(output.starts_with("addr"));
+        assert!(output.contains("opcode"));
+        assert!(output.contains("comment"));
+
+        // Check alignment - addr should be right-aligned (leading spaces for single digit)
+        let lines: Vec<&str> = output.lines().collect();
+        assert_eq!(lines.len(), 3); // header + 2 data rows
+
+        // Header should have no trailing whitespace
+        assert!(!lines[0].ends_with(' '));
+
+        // Data rows should have no trailing whitespace
+        assert!(!lines[1].ends_with(' '));
+        assert!(!lines[2].ends_with(' '));
+    }
+
+    #[test]
+    fn test_format_explain_output_empty() {
+        let rows: Vec<Vec<String>> = vec![];
+        let output = format_explain_output(&rows);
+        assert!(output.is_empty());
     }
 }
