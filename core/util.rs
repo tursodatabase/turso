@@ -1580,20 +1580,43 @@ pub fn rewrite_fk_parent_cols_if_self_ref(
     }
 }
 
-/// Update a column-level REFERENCES <tbl>(col,...) constraint
+/// Update a column-level REFERENCES <tbl>(col,...) constraint and generated column expressions
 pub fn rewrite_column_references_if_needed(
     col: &mut ast::ColumnDefinition,
     table: &str,
     from: &str,
     to: &str,
 ) {
+    let from_norm = normalize_ident(from);
+
     for cc in &mut col.constraints {
-        if let ast::NamedColumnConstraint {
-            constraint: ast::ColumnConstraint::ForeignKey { clause, .. },
-            ..
-        } = cc
-        {
-            rewrite_fk_parent_cols_if_self_ref(clause, table, from, to);
+        match &mut cc.constraint {
+            ast::ColumnConstraint::ForeignKey { clause, .. } => {
+                rewrite_fk_parent_cols_if_self_ref(clause, table, from, to);
+            }
+            ast::ColumnConstraint::Generated { expr, .. } => {
+                // Walk expression and rename column references.
+                // Only Id, Name, and Qualified can be unresolved column references in
+                // generated expressions. Column/RowId are resolved forms with indices.
+                let _ = walk_expr_mut(expr, &mut |e: &mut ast::Expr| {
+                    match e {
+                        ast::Expr::Id(name) if normalize_ident(name.as_str()) == from_norm => {
+                            *name = ast::Name::exact(to.to_owned());
+                        }
+                        ast::Expr::Name(name) if normalize_ident(name.as_str()) == from_norm => {
+                            *name = ast::Name::exact(to.to_owned());
+                        }
+                        ast::Expr::Qualified(_, col_name)
+                            if normalize_ident(col_name.as_str()) == from_norm =>
+                        {
+                            *col_name = ast::Name::exact(to.to_owned());
+                        }
+                        _ => {}
+                    }
+                    Ok(WalkControl::Continue)
+                });
+            }
+            _ => {}
         }
     }
 }

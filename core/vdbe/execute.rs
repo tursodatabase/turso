@@ -15,6 +15,7 @@ use crate::storage::page_cache::PageCache;
 use crate::storage::pager::{default_page1, CreateBTreeFlags, PageRef};
 use crate::storage::sqlite3_ondisk::{DatabaseHeader, PageSize, RawVersion};
 use crate::translate::collate::CollationSeq;
+use crate::translate::expr::{walk_expr_mut, WalkControl};
 use crate::types::{
     compare_immutable, compare_records_generic, AsValueRef, Extendable, IOCompletions, IOResult,
     ImmutableRecord, IndexInfo, SeekResult, Text,
@@ -6010,15 +6011,16 @@ pub fn op_function(
                                             }
                                             _ => {}
                                         }
+                                    }
 
-                                        for col in &mut columns {
-                                            rewrite_column_references_if_needed(
-                                                col,
-                                                &normalized_tbl_name,
-                                                &rename_from,
-                                                column_def.col_name.as_str(),
-                                            );
-                                        }
+                                    // Update column-level constraints (Generated, ForeignKey)
+                                    for col in &mut columns {
+                                        rewrite_column_references_if_needed(
+                                            col,
+                                            &normalized_tbl_name,
+                                            &rename_from,
+                                            column_def.col_name.as_str(),
+                                        );
                                     }
                                 } else {
                                     // This is a different table, check if it has FKs referencing the renamed column
@@ -9805,8 +9807,19 @@ pub fn op_integrity_check(
                             continue;
                         }
 
-                        // Open cursor for this index if not already open
                         let index = &table.indexes[*current_index_idx];
+
+                        // Skip validation for indexes containing VIRTUAL generated columns.
+                        // We can't compute the expected index key without evaluating the
+                        // generated expression, which requires a runtime expression evaluator.
+                        // TODO: Refactor integrity_check to use proper VDBE bytecode (like SQLite)
+                        // which would allow computing VIRTUAL column values via OP_Column.
+                        if index.has_virtual_columns {
+                            *current_index_idx += 1;
+                            continue;
+                        }
+
+                        // Open cursor for this index if not already open
                         if index_cursor.is_none() {
                             let mut cursor = BTreeCursor::new(pager.clone(), index.root_page, 0);
                             cursor.index_info = Some(index.index_info.clone());
@@ -9817,21 +9830,28 @@ pub fn op_integrity_check(
                         // Index key = (indexed_col_values..., rowid)
                         let mut key_values: Vec<Value> =
                             Vec::with_capacity(index.column_positions.len() + 1);
-                        for (col_idx, &pos) in index.column_positions.iter().enumerate() {
+                        for (col_idx, &logical_pos) in index.column_positions.iter().enumerate() {
                             // For INTEGER PRIMARY KEY columns, the value in the record is NULL
                             // but the actual value is the rowid
-                            let value = if table.rowid_alias_column_pos == Some(pos) {
+                            let value = if table.rowid_alias_column_pos == Some(logical_pos) {
                                 Value::Integer(*rowid)
-                            } else if pos >= row_values.len() {
-                                // Columns added via ALTER TABLE ADD COLUMN: existing rows
-                                // don't have values for these columns. Use the column's
-                                // DEFAULT value from the pre-evaluated register. This is
-                                // NULL if no DEFAULT value is defined for the column.
-                                state.registers[index.default_values_start_reg + col_idx]
-                                    .get_value()
-                                    .clone()
+                            } else if let Some(physical_pos) = index.physical_positions[col_idx] {
+                                // Use physical position to get value from stored record
+                                if physical_pos >= row_values.len() {
+                                    // Columns added via ALTER TABLE ADD COLUMN: existing rows
+                                    // don't have values for these columns. Use the column's
+                                    // DEFAULT value from the pre-evaluated register. This is
+                                    // NULL if no DEFAULT value is defined for the column.
+                                    state.registers[index.default_values_start_reg + col_idx]
+                                        .get_value()
+                                        .clone()
+                                } else {
+                                    row_values[physical_pos].clone()
+                                }
                             } else {
-                                row_values[pos].clone()
+                                // VIRTUAL column - shouldn't reach here since we skip
+                                // indexes with virtual columns above
+                                unreachable!("VIRTUAL columns should be skipped")
                             };
                             key_values.push(value);
                         }
@@ -10260,6 +10280,7 @@ pub fn op_alter_column(
 
         // Update indexes on THIS table that name the old column (you already had this)
         if let Some(idxs) = schema.indexes.get_mut(&normalized_table_name) {
+            let old_col_norm = normalize_ident(&old_column_name);
             for idx in idxs {
                 let idx = Arc::make_mut(idx);
                 for ic in &mut idx.columns {
@@ -10267,6 +10288,30 @@ pub fn op_alter_column(
                         col.name.as_ref().expect("btree column should be named"),
                     ) {
                         ic.name = new_name.clone();
+                    }
+                    // Also update references in the expression (for VIRTUAL column indexes)
+                    if let Some(ref mut expr) = ic.expr {
+                        let _ = walk_expr_mut(expr, &mut |e: &mut ast::Expr| {
+                            match e {
+                                ast::Expr::Id(name)
+                                    if normalize_ident(name.as_str()) == old_col_norm =>
+                                {
+                                    *name = ast::Name::exact(new_name.clone());
+                                }
+                                ast::Expr::Name(name)
+                                    if normalize_ident(name.as_str()) == old_col_norm =>
+                                {
+                                    *name = ast::Name::exact(new_name.clone());
+                                }
+                                ast::Expr::Qualified(_, col_name)
+                                    if normalize_ident(col_name.as_str()) == old_col_norm =>
+                                {
+                                    *col_name = ast::Name::exact(new_name.clone());
+                                }
+                                _ => {}
+                            }
+                            Ok(WalkControl::Continue)
+                        });
                     }
                 }
             }
@@ -10306,6 +10351,31 @@ pub fn op_alter_column(
                         *pc = new_name.clone();
                     }
                 }
+            }
+        }
+
+        // Update generated column expressions that reference the renamed column.
+        // Only Id, Name, and Qualified can be unresolved column references.
+        let old_col_norm = normalize_ident(&old_column_name);
+        for other_col in &mut btree.columns {
+            if let Some(ref mut gen_expr) = other_col.generated {
+                let _ = walk_expr_mut(gen_expr, &mut |e: &mut ast::Expr| {
+                    match e {
+                        ast::Expr::Id(name) if normalize_ident(name.as_str()) == old_col_norm => {
+                            *name = ast::Name::exact(new_name.clone());
+                        }
+                        ast::Expr::Name(name) if normalize_ident(name.as_str()) == old_col_norm => {
+                            *name = ast::Name::exact(new_name.clone());
+                        }
+                        ast::Expr::Qualified(_, col_name)
+                            if normalize_ident(col_name.as_str()) == old_col_norm =>
+                        {
+                            *col_name = ast::Name::exact(new_name.clone());
+                        }
+                        _ => {}
+                    }
+                    Ok(WalkControl::Continue)
+                });
             }
         }
 
@@ -10993,18 +11063,23 @@ fn apply_affinity_char(target: &mut Register, affinity: Affinity) -> bool {
 }
 
 fn try_float_to_integer_affinity(value: &mut Value, fl: f64) -> bool {
-    // Check if the float can be exactly represented as an integer
-    if let Ok(int_val) = cast_real_to_integer(fl) {
-        // Additional check: ensure round-trip conversion is exact
-        // and value is within safe bounds (similar to SQLite's checks)
-        if (int_val as f64) == fl && int_val > i64::MIN + 1 && int_val < i64::MAX - 1 {
-            *value = Value::Integer(int_val);
-            return true;
-        }
+    // Check if the float has no fractional part
+    if !fl.is_finite() || fl.trunc() != fl {
+        *value = Value::Float(fl);
+        return false;
     }
 
-    // If we can't convert to exact integer, keep as float for Numeric affinity
-    // but return false to indicate the conversion wasn't "complete"
+    // Convert float to i64 with saturation at limits (like SQLite's doubleToInt64)
+    let int_val = super::affinity::real_to_i64(fl);
+
+    // Check if round-trip conversion is exact
+    // This is the key check from SQLite's sqlite3VdbeIntegerAffinity
+    if (int_val as f64) == fl && int_val != i64::MIN {
+        *value = Value::Integer(int_val);
+        return true;
+    }
+
+    // If round-trip isn't exact, keep as float
     *value = Value::Float(fl);
     false
 }

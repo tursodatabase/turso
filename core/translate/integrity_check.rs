@@ -87,6 +87,31 @@ fn translate_integrity_check_impl(
                         let column_positions: Vec<usize> =
                             index.columns.iter().map(|c| c.pos_in_table).collect();
 
+                        // Compute physical positions for each indexed column.
+                        // VIRTUAL generated columns are not stored in the record, so we need
+                        // to map from logical positions to physical positions in the stored record.
+                        let mut has_virtual_columns = false;
+                        let physical_positions: Vec<Option<usize>> = column_positions
+                            .iter()
+                            .map(|&logical_pos| {
+                                let col = &btree_table.columns[logical_pos];
+                                if col.is_virtual_generated() {
+                                    has_virtual_columns = true;
+                                    None
+                                } else {
+                                    // Count non-VIRTUAL columns before this logical position
+                                    // to get the physical position in the stored record.
+                                    let physical_pos = btree_table
+                                        .columns
+                                        .iter()
+                                        .take(logical_pos)
+                                        .filter(|c| !c.is_virtual_generated())
+                                        .count();
+                                    Some(physical_pos)
+                                }
+                            })
+                            .collect();
+
                         // Allocate contiguous registers for default values of indexed columns.
                         // For columns added via ALTER TABLE ADD COLUMN with DEFAULT, old rows
                         // don't physically have these columns, so we need the defaults.
@@ -118,6 +143,8 @@ fn translate_integrity_check_impl(
                             root_page: index.root_page,
                             unique: index.unique,
                             column_positions,
+                            physical_positions,
+                            has_virtual_columns,
                             default_values_start_reg,
                             index_info: Arc::new(IndexInfo::new_from_index(index)),
                         });

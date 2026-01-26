@@ -1311,10 +1311,46 @@ impl ProgramBuilder {
 
         use crate::translate::expr::sanitize_string;
 
+        // Compute physical column index by skipping VIRTUAL generated columns
+        // (since they are not stored in the record)
+        let physical_column = match cursor_type {
+            CursorType::BTreeTable(btree) => {
+                let mut physical = 0;
+                for (i, col) in btree.columns.iter().enumerate() {
+                    if i == column {
+                        break;
+                    }
+                    if !col.is_virtual_generated() {
+                        physical += 1;
+                    }
+                }
+                physical
+            }
+            CursorType::MaterializedView(btree, _) => {
+                let mut physical = 0;
+                for (i, col) in btree.columns.iter().enumerate() {
+                    if i == column {
+                        break;
+                    }
+                    if !col.is_virtual_generated() {
+                        physical += 1;
+                    }
+                }
+                physical
+            }
+            _ => column, // For indexes and other cursor types, use logical column
+        };
+
         let default = 'value: {
             let default = match cursor_type {
                 CursorType::BTreeTable(btree) => &btree.columns[column].default,
-                CursorType::BTreeIndex(index) => &index.columns[column].default,
+                CursorType::BTreeIndex(index) => {
+                    // Find the IndexColumn with matching pos_in_table, or break with None
+                    match index.columns.iter().find(|ic| ic.pos_in_table == column) {
+                        Some(ic) => &ic.default,
+                        None => break 'value None,
+                    }
+                }
                 CursorType::MaterializedView(btree, _) => &btree.columns[column].default,
                 _ => break 'value None,
             };
@@ -1350,7 +1386,7 @@ impl ProgramBuilder {
 
         self.emit_insn(Insn::Column {
             cursor_id,
-            column,
+            column: physical_column,
             dest: out,
             default,
         });

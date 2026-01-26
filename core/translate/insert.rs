@@ -9,8 +9,9 @@ use crate::{
         },
         expr::{
             bind_and_rewrite_expr, emit_returning_results, process_returning_clause,
-            rewrite_between_expr, translate_expr, translate_expr_no_constant_opt, walk_expr_mut,
-            BindingBehavior, NoConstantOptReason, WalkControl,
+            rewrite_between_expr, translate_expr, translate_expr_no_constant_opt,
+            translate_expr_with_context, walk_expr_mut, BindingBehavior, ExprContext,
+            NoConstantOptReason, WalkControl,
         },
         fkeys::{
             build_index_affinity_string, emit_fk_violation, emit_guarded_fk_decrement,
@@ -548,18 +549,40 @@ pub fn translate_insert(
     let notnull_resume_label = emit_notnulls(&mut program, &ctx, &insertion, resolver)?;
 
     // Create and insert the record
-    let affinity_str = insertion
-        .col_mappings
-        .iter()
-        .map(|col_mapping| col_mapping.column.affinity().aff_mask())
-        .collect::<String>();
+    // VIRTUAL generated columns are not stored, so we need to exclude them from the record.
+    let (record_start_reg, record_col_count, affinity_str) = if insertion.has_virtual_columns() {
+        // Allocate contiguous registers for storable columns and copy values
+        let storable_count = insertion.storable_count();
+        let start_reg = program.alloc_registers(storable_count);
+        let mut affinity = String::with_capacity(storable_count);
+        for (i, col_mapping) in insertion.storable_columns().enumerate() {
+            program.emit_insn(Insn::Copy {
+                src_reg: col_mapping.register,
+                dst_reg: start_reg + i,
+                extra_amount: 0,
+            });
+            affinity.push(col_mapping.column.affinity().aff_mask());
+        }
+        (start_reg, storable_count, affinity)
+    } else {
+        let affinity_str = insertion
+            .col_mappings
+            .iter()
+            .map(|col_mapping| col_mapping.column.affinity().aff_mask())
+            .collect::<String>();
+        (
+            insertion.first_col_register(),
+            insertion.col_mappings.len(),
+            affinity_str,
+        )
+    };
 
     if let Some(lbl) = notnull_resume_label {
         program.preassign_label_to_next_insn(lbl);
     }
     program.emit_insn(Insn::MakeRecord {
-        start_reg: to_u16(insertion.first_col_register()),
-        count: to_u16(insertion.col_mappings.len()),
+        start_reg: to_u16(record_start_reg),
+        count: to_u16(record_col_count),
         dest_reg: to_u16(insertion.record_register()),
         index_name: None,
         affinity_str: Some(affinity_str),
@@ -1272,10 +1295,11 @@ fn bind_insert(
     match body {
         InsertBody::DefaultValues => {
             // Generate default values for the table
+            // Generated columns are excluded - they are computed from their expressions
             values = table
                 .columns()
                 .iter()
-                .filter(|c| !c.hidden())
+                .filter(|c| !c.hidden() && !c.is_generated())
                 .map(|c| {
                     c.default
                         .clone()
@@ -1417,7 +1441,9 @@ fn init_source_emission<'a>(
     table_references: &TableReferences,
 ) -> Result<ProgramBuilder> {
     let required_column_count = if columns.is_empty() {
-        table.columns().len()
+        // When no column list is specified, count only insertable columns
+        // (excludes generated columns which are computed, not inserted)
+        table.columns().iter().filter(|c| !c.is_generated()).count()
     } else {
         columns.len()
     };
@@ -1606,8 +1632,15 @@ fn init_source_emission<'a>(
             }
         }
         InsertBody::DefaultValues => {
-            let num_values = table.columns().len();
-            values.extend(table.columns().iter().map(|c| {
+            // Only count and process non-generated columns
+            // Generated columns are computed from their expressions, not default values
+            let insertable_columns: Vec<_> = table
+                .columns()
+                .iter()
+                .filter(|c| !c.is_generated())
+                .collect();
+            let num_values = insertable_columns.len();
+            values.extend(insertable_columns.iter().map(|c| {
                 c.default
                     .clone()
                     .unwrap_or_else(|| Box::new(ast::Expr::Literal(ast::Literal::Null)))
@@ -1646,6 +1679,7 @@ pub const ROWID_COLUMN: Column = Column::new(
         notnull: true,
         hidden: false,
         unique: false,
+        generated_stored: false,
     },
 );
 
@@ -1682,6 +1716,28 @@ impl<'a> Insertion<'a> {
         self.record_reg
     }
 
+    /// Returns true if any column is a VIRTUAL generated column.
+    pub fn has_virtual_columns(&self) -> bool {
+        self.col_mappings
+            .iter()
+            .any(|m| m.column.is_virtual_generated())
+    }
+
+    /// Returns an iterator over storable (non-virtual) column mappings.
+    pub fn storable_columns(&self) -> impl Iterator<Item = &ColMapping<'a>> {
+        self.col_mappings
+            .iter()
+            .filter(|m| !m.column.is_virtual_generated())
+    }
+
+    /// Returns the count of storable (non-virtual) columns.
+    pub fn storable_count(&self) -> usize {
+        self.col_mappings
+            .iter()
+            .filter(|m| !m.column.is_virtual_generated())
+            .count()
+    }
+
     /// Returns the column mapping for a given column name.
     pub fn get_col_mapping_by_name(&self, name: &str) -> Option<&ColMapping<'a>> {
         if let InsertionKey::RowidAlias(mapping) = &self.key {
@@ -1703,6 +1759,16 @@ impl<'a> Insertion<'a> {
                 .as_ref()
                 .is_some_and(|n| n.eq_ignore_ascii_case(name))
         })
+    }
+
+    /// Returns the rowid alias column mapping if the key is a RowidAlias.
+    /// Used by generated column expression translation to resolve references
+    /// to INTEGER PRIMARY KEY columns.
+    pub fn rowid_alias_mapping(&self) -> Option<&ColMapping<'a>> {
+        match &self.key {
+            InsertionKey::RowidAlias(mapping) => Some(mapping),
+            _ => None,
+        }
     }
 }
 
@@ -1788,18 +1854,23 @@ fn build_insertion<'a>(
 
     if columns.is_empty() {
         // Case 1: No columns specified - map values to columns in order
-        if num_values != table_columns.iter().filter(|c| !c.hidden()).count() {
+        // Generated and hidden columns are not taken into account for value count
+        let insertable_count = table_columns
+            .iter()
+            .filter(|c| !c.hidden() && !c.is_generated())
+            .count();
+        if num_values != insertable_count {
             crate::bail_parse_error!(
                 "table {} has {} columns but {} values were supplied",
                 &table.get_name(),
-                table_columns.len(),
+                insertable_count,
                 num_values
             );
         }
         let mut value_idx = 0;
         for (i, col) in table_columns.iter().enumerate() {
-            if col.hidden() {
-                // Hidden columns are not taken into account.
+            if col.hidden() || col.is_generated() {
+                // Hidden and generated columns are not taken into account.
                 continue;
             }
             if col.is_rowid_alias() {
@@ -1819,6 +1890,13 @@ fn build_insertion<'a>(
         for (value_index, column_name) in columns.iter().enumerate() {
             let column_name = normalize_ident(column_name.as_str());
             if let Some((idx_in_table, col_in_table)) = table.get_column_by_name(&column_name) {
+                // Generated columns cannot be written to directly
+                if col_in_table.is_generated() {
+                    crate::bail_parse_error!(
+                        "cannot INSERT into generated column \"{}\"",
+                        column_name
+                    );
+                }
                 // Named column
                 if col_in_table.is_rowid_alias() {
                     insertion_key = InsertionKey::RowidAlias(ColMapping {
@@ -1936,8 +2014,37 @@ fn translate_rows_base<'short, 'long: 'short>(
     mut translate_value_fn: impl FnMut(&mut ProgramBuilder, usize, usize) -> Result<()>,
     resolver: &Resolver,
 ) -> Result<()> {
-    translate_key(program, insertion, &mut translate_value_fn, resolver)?;
+    translate_key(
+        program,
+        insertion,
+        &mut translate_value_fn,
+        resolver,
+        &insertion.col_mappings,
+    )?;
+
+    // Get the rowid alias mapping if one exists, for generated column expression translation
+    let rowid_alias = insertion.rowid_alias_mapping();
+
+    // First, process all non-generated columns (they don't have dependencies)
     for col in insertion.col_mappings.iter() {
+        if !col.column.is_stored_generated() {
+            translate_column(
+                program,
+                col.column,
+                col.register,
+                col.value_index,
+                &mut translate_value_fn,
+                resolver,
+                &insertion.col_mappings,
+                rowid_alias,
+            )?;
+        }
+    }
+
+    // Then, process STORED generated columns in topologically sorted order
+    let sorted_gen_cols = topological_sort_generated_columns(&insertion.col_mappings)?;
+    for idx in sorted_gen_cols {
+        let col = &insertion.col_mappings[idx];
         translate_column(
             program,
             col.column,
@@ -1945,18 +2052,140 @@ fn translate_rows_base<'short, 'long: 'short>(
             col.value_index,
             &mut translate_value_fn,
             resolver,
+            &insertion.col_mappings,
+            rowid_alias,
         )?;
     }
 
     Ok(())
 }
 
+/// Topologically sort STORED generated columns based on their dependencies.
+/// Returns indices into col_mappings in the order they should be evaluated.
+fn topological_sort_generated_columns(col_mappings: &[ColMapping]) -> Result<Vec<usize>> {
+    use std::collections::{HashMap, HashSet, VecDeque};
+
+    // Build a map of column names to indices for quick lookup
+    let col_name_to_idx: HashMap<String, usize> = col_mappings
+        .iter()
+        .enumerate()
+        .filter_map(|(i, m)| m.column.name.as_ref().map(|name| (name.to_lowercase(), i)))
+        .collect();
+
+    // First, collect direct dependencies for ALL generated columns (both STORED and VIRTUAL)
+    // We need this to trace through VIRTUAL columns to find transitive STORED dependencies
+    let mut all_gen_direct_deps: HashMap<usize, HashSet<usize>> = HashMap::new();
+    for (idx, col) in col_mappings.iter().enumerate() {
+        if col.column.is_generated() {
+            if let Some(ref expr) = col.column.generated {
+                let refs = crate::translate::update::collect_column_refs_from_ast_expr(expr);
+                let mut deps = HashSet::new();
+                for ref_name in refs {
+                    if let Some(&dep_idx) = col_name_to_idx.get(&ref_name.to_lowercase()) {
+                        deps.insert(dep_idx);
+                    }
+                }
+                all_gen_direct_deps.insert(idx, deps);
+            }
+        }
+    }
+
+    // Helper function to find all transitive STORED dependencies by following through VIRTUAL columns
+    fn find_stored_deps(
+        idx: usize,
+        all_deps: &HashMap<usize, HashSet<usize>>,
+        col_mappings: &[ColMapping],
+        visited: &mut HashSet<usize>,
+    ) -> HashSet<usize> {
+        let mut stored_deps = HashSet::new();
+        if let Some(direct_deps) = all_deps.get(&idx) {
+            for &dep_idx in direct_deps {
+                if visited.contains(&dep_idx) {
+                    continue; // Avoid infinite loops on cycles
+                }
+                visited.insert(dep_idx);
+
+                if col_mappings[dep_idx].column.is_stored_generated() {
+                    // Direct dependency on STORED column
+                    stored_deps.insert(dep_idx);
+                } else if col_mappings[dep_idx].column.is_virtual_generated() {
+                    // Dependency on VIRTUAL column - recurse to find its STORED dependencies
+                    let transitive = find_stored_deps(dep_idx, all_deps, col_mappings, visited);
+                    stored_deps.extend(transitive);
+                }
+            }
+        }
+        stored_deps
+    }
+
+    // Identify which columns are STORED generated and collect their transitive dependencies
+    let mut gen_col_indices: Vec<usize> = Vec::new();
+    let mut dependencies: HashMap<usize, HashSet<usize>> = HashMap::new();
+
+    for (idx, col) in col_mappings.iter().enumerate() {
+        if col.column.is_stored_generated() {
+            gen_col_indices.push(idx);
+            let mut visited = HashSet::new();
+            visited.insert(idx); // Don't follow self-references
+            let deps = find_stored_deps(idx, &all_gen_direct_deps, col_mappings, &mut visited);
+            dependencies.insert(idx, deps);
+        }
+    }
+
+    // Kahn's algorithm for topological sort
+    let mut in_degree: HashMap<usize, usize> = HashMap::new();
+    for &idx in &gen_col_indices {
+        in_degree.insert(idx, 0);
+    }
+
+    // Count incoming edges (how many columns depend on this column)
+    for (&idx, deps) in &dependencies {
+        for &dep_idx in deps {
+            if gen_col_indices.contains(&dep_idx) {
+                *in_degree.entry(idx).or_insert(0) += 1;
+            }
+        }
+    }
+
+    // Start with columns that have no dependencies
+    let mut queue: VecDeque<usize> = gen_col_indices
+        .iter()
+        .filter(|&&idx| *in_degree.get(&idx).unwrap_or(&0) == 0)
+        .copied()
+        .collect();
+
+    let mut sorted: Vec<usize> = Vec::new();
+
+    while let Some(idx) = queue.pop_front() {
+        sorted.push(idx);
+
+        // For each column that depends on idx, decrease its in-degree
+        for (&other_idx, deps) in &dependencies {
+            if deps.contains(&idx) {
+                let degree = in_degree.get_mut(&other_idx).unwrap();
+                *degree -= 1;
+                if *degree == 0 {
+                    queue.push_back(other_idx);
+                }
+            }
+        }
+    }
+
+    // Check for cycles
+    if sorted.len() != gen_col_indices.len() {
+        crate::bail_parse_error!("circular dependency detected in generated columns");
+    }
+
+    Ok(sorted)
+}
+
 /// Translate the [InsertionKey].
-fn translate_key(
+fn translate_key<'a>(
     program: &mut ProgramBuilder,
     insertion: &Insertion,
     mut translate_value_fn: impl FnMut(&mut ProgramBuilder, usize, usize) -> Result<()>,
     resolver: &Resolver,
+    col_mappings: &[ColMapping<'a>],
 ) -> Result<()> {
     match &insertion.key {
         InsertionKey::RowidAlias(rowid_alias_column) => translate_column(
@@ -1966,6 +2195,8 @@ fn translate_key(
             rowid_alias_column.value_index,
             &mut translate_value_fn,
             resolver,
+            col_mappings,
+            None, // Key translation doesn't need rowid alias resolution
         ),
         InsertionKey::LiteralRowid {
             value_index,
@@ -1977,18 +2208,23 @@ fn translate_key(
             *value_index,
             &mut translate_value_fn,
             resolver,
+            col_mappings,
+            None, // Key translation doesn't need rowid alias resolution
         ),
         InsertionKey::Autogenerated { .. } => Ok(()), // will be populated later
     }
 }
 
-fn translate_column(
+#[allow(clippy::too_many_arguments)]
+fn translate_column<'a>(
     program: &mut ProgramBuilder,
     column: &Column,
     column_register: usize,
     value_index: Option<usize>,
     translate_value_fn: &mut impl FnMut(&mut ProgramBuilder, usize, usize) -> Result<()>,
     resolver: &Resolver,
+    col_mappings: &[ColMapping<'a>],
+    rowid_alias: Option<&ColMapping<'a>>,
 ) -> Result<()> {
     if let Some(value_index) = value_index {
         translate_value_fn(program, value_index, column_register)?;
@@ -2003,6 +2239,38 @@ fn translate_column(
         program.emit_insn(Insn::Null {
             dest: column_register,
             dest_end: None,
+        });
+    } else if column.is_virtual_generated() {
+        // VIRTUAL generated columns are computed on read, not stored.
+        // Emit NULL as a placeholder - this register will be excluded from MakeRecord.
+        program.emit_insn(Insn::Null {
+            dest: column_register,
+            dest_end: None,
+        });
+    } else if column.is_stored_generated() {
+        // Evaluate the generated expression using values from other column registers.
+        // is_stored_generated() guarantees that column.generated is Some.
+        let gen_expr = column
+            .generated
+            .as_ref()
+            .expect("is_stored_generated() guarantees generated expression exists");
+        translate_generated_expr(
+            program,
+            gen_expr,
+            column_register,
+            col_mappings,
+            rowid_alias,
+            resolver,
+        )?;
+        // Apply column affinity immediately after evaluating the generated expression.
+        // This is critical for chained STORED generated columns: when column B references
+        // column A (both STORED), B must see A's affinity-converted value, not the raw
+        // expression result. Without this, INTEGER->REAL->INTEGER chains preserve too
+        // much precision because the intermediate REAL conversion doesn't happen.
+        program.emit_insn(Insn::Affinity {
+            start_reg: column_register,
+            count: NonZeroUsize::new(1).unwrap(),
+            affinities: column.affinity().aff_mask().to_string(),
         });
     } else if let Some(default_expr) = column.default.as_ref() {
         translate_expr(program, None, default_expr, column_register, resolver)?;
@@ -2023,6 +2291,27 @@ fn translate_column(
             dest_end: None,
         });
     }
+    Ok(())
+}
+
+/// Translate a generated column expression during INSERT.
+/// Handles Expr::Id column references by looking up their registers in col_mappings.
+fn translate_generated_expr<'a>(
+    program: &mut ProgramBuilder,
+    expr: &ast::Expr,
+    target_register: usize,
+    col_mappings: &[ColMapping<'a>],
+    rowid_alias: Option<&ColMapping<'a>>,
+    resolver: &Resolver,
+) -> Result<()> {
+    use super::expr::{translate_expr_with_context, ExprContext};
+
+    // Use the unified evaluator with InsertGenerated context
+    let context = ExprContext::InsertGenerated {
+        col_mappings,
+        rowid_alias,
+    };
+    translate_expr_with_context(program, &context, expr, target_register, resolver)?;
     Ok(())
 }
 
@@ -2583,60 +2872,6 @@ pub fn rewrite_partial_index_where(
     )
 }
 
-/// For an index expression, rewrite column references to use the insertion registers.
-fn rewrite_index_expr_for_insertion(expr: &mut ast::Expr, insertion: &Insertion) -> Result<()> {
-    let mut missing_column = None;
-    let col_reg = |name: &str| -> Option<usize> {
-        if ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(name)) {
-            Some(insertion.key_register())
-        } else if let Some(c) = insertion.get_col_mapping_by_name(name) {
-            if c.column.is_rowid_alias() {
-                Some(insertion.key_register())
-            } else {
-                Some(c.register)
-            }
-        } else {
-            None
-        }
-    };
-    walk_expr_mut(
-        expr,
-        &mut |e: &mut ast::Expr| -> crate::Result<WalkControl> {
-            match e {
-                Expr::Id(name) | Expr::Name(name) => {
-                    let normalized = normalize_ident(name.as_str());
-                    if let Some(reg) = col_reg(&normalized) {
-                        *e = Expr::Register(reg);
-                    } else {
-                        missing_column = Some(normalized);
-                    }
-                }
-                Expr::Qualified(_, col) | Expr::DoublyQualified(_, _, col) => {
-                    let normalized = normalize_ident(col.as_str());
-                    if let Some(reg) = col_reg(&normalized) {
-                        *e = Expr::Register(reg);
-                    } else {
-                        missing_column = Some(normalized);
-                    }
-                }
-                _ => {}
-            }
-            Ok(if missing_column.is_some() {
-                WalkControl::SkipChildren
-            } else {
-                WalkControl::Continue
-            })
-        },
-    )?;
-
-    if let Some(col) = missing_column {
-        return Err(LimboError::PlanningError(format!(
-            "Column not found in INSERT: {col}"
-        )));
-    }
-    Ok(())
-}
-
 fn emit_index_column_value_for_insert(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
@@ -2645,16 +2880,24 @@ fn emit_index_column_value_for_insert(
     dest_reg: usize,
 ) -> Result<()> {
     if let Some(expr) = &idx_col.expr {
-        let mut expr = expr.as_ref().clone();
-        rewrite_index_expr_for_insertion(&mut expr, insertion)?;
-        translate_expr_no_constant_opt(
-            program,
-            Some(&TableReferences::new_empty()),
-            &expr,
-            dest_reg,
-            resolver,
-            NoConstantOptReason::RegisterReuse,
-        )?;
+        // Use InsertGenerated context which handles VIRTUAL column recursion.
+        // This properly evaluates VIRTUAL column expressions instead of just
+        // reading from registers (which would have NULL for VIRTUAL columns).
+        let rowid_alias = insertion.rowid_alias_mapping();
+        let context = ExprContext::InsertGenerated {
+            col_mappings: &insertion.col_mappings,
+            rowid_alias,
+        };
+        translate_expr_with_context(program, &context, expr.as_ref(), dest_reg, resolver)?;
+        // Apply column affinity for VIRTUAL columns. This ensures INTEGER→REAL
+        // conversions (and other affinity rules) happen per SQLite's documentation.
+        if let Some(affinity) = &idx_col.affinity {
+            program.emit_insn(Insn::Affinity {
+                start_reg: dest_reg,
+                count: NonZeroUsize::new(1).unwrap(),
+                affinities: affinity.aff_mask().to_string(),
+            });
+        }
     } else {
         let Some(cm) = insertion.get_col_mapping_by_name(&idx_col.name) else {
             return Err(LimboError::PlanningError(

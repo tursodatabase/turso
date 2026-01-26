@@ -520,13 +520,23 @@ pub fn resolve_sorted_columns(
         let unwrapped_expr = unwrap_parens(base_expr)?;
         if let Some((pos, column_name, column)) = resolve_index_column(unwrapped_expr, table) {
             let collation = explicit_collation.or_else(|| column.collation_opt());
+            // For VIRTUAL generated columns, store the expression so it can be computed
+            // during INSERT (since VIRTUAL columns are not stored in the table record).
+            // Also store the column's affinity so it can be applied during index population
+            // (INTEGER→REAL conversions, etc., per SQLite's affinity rules).
+            let (expr, affinity) = if column.is_virtual_generated() {
+                (column.generated.clone(), Some(column.affinity()))
+            } else {
+                (None, None)
+            };
             resolved.push(IndexColumn {
                 name: column_name,
                 order,
                 pos_in_table: pos,
                 collation,
                 default: column.default.clone(),
-                expr: None,
+                expr,
+                affinity,
             });
             continue;
         }
@@ -540,6 +550,7 @@ pub fn resolve_sorted_columns(
             collation: explicit_collation,
             default: None,
             expr: Some(sc.expr.clone()),
+            affinity: None,
         });
     }
     Ok(resolved)
@@ -702,6 +713,15 @@ fn emit_index_column_value_from_cursor(
             BindingBehavior::ResultColumnsNotAllowed,
         )?;
         translate_expr(program, Some(table_references), &expr, dest_reg, resolver)?;
+        // Apply column affinity for VIRTUAL columns. This ensures INTEGER→REAL
+        // conversions (and other affinity rules) happen per SQLite's documentation.
+        if let Some(affinity) = &idx_col.affinity {
+            program.emit_insn(Insn::Affinity {
+                start_reg: dest_reg,
+                count: std::num::NonZeroUsize::new(1).unwrap(),
+                affinities: affinity.aff_mask().to_string(),
+            });
+        }
     } else {
         program.emit_column_or_rowid(table_cursor_id, idx_col.pos_in_table, dest_reg);
     }
