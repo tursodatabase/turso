@@ -1997,8 +1997,6 @@ expect {
 
 # -----------------------------------------------------------------------------
 # UPSERT with Generated Columns
-# TODO: UPSERT DO UPDATE does not recompute STORED generated columns
-# The following tests document current behavior, which differs from SQLite
 # -----------------------------------------------------------------------------
 
 # ON CONFLICT DO UPDATE should recompute STORED columns
@@ -2958,19 +2956,63 @@ expect {
     10|11
 }
 
-# TODO: integrity_check has a separate bug with expression indexes on VIRTUAL columns
-# (panics with index out of bounds in integrity_check.rs:97)
-# The actual INSERT/UPDATE operations work correctly (see gencol_expression_index_on_virtual)
-# test gencol_expression_index_on_virtual_integrity {
-#     CREATE TABLE t1(a INTEGER, b AS (a + 1));
-#     CREATE INDEX idx_expr ON t1(b * 2);
-#     INSERT INTO t1(a) VALUES (5);
-#     UPDATE t1 SET a = 10;
-#     PRAGMA integrity_check;
-# }
-# expect {
-#     ok
-# }
+# Expression index on VIRTUAL column with integrity_check
+test gencol_expression_index_on_virtual_integrity {
+    CREATE TABLE t1(a INTEGER, b AS (a + 1));
+    CREATE INDEX idx_expr ON t1(b * 2);
+    INSERT INTO t1(a) VALUES (5);
+    UPDATE t1 SET a = 10;
+    PRAGMA integrity_check;
+}
+expect {
+    ok
+}
+
+# Expression index on VIRTUAL - basic integrity check
+test gencol_expression_index_on_virtual_basic_integrity {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2));
+    CREATE INDEX idx ON t1(b + 10);
+    INSERT INTO t1(a) VALUES (1), (2), (3);
+    PRAGMA integrity_check;
+}
+expect {
+    ok
+}
+
+# Multiple expression indexes on same VIRTUAL column
+test gencol_multiple_expr_indexes_virtual_integrity {
+    CREATE TABLE t1(a INTEGER, b AS (a + 1));
+    CREATE INDEX idx1 ON t1(b * 2);
+    CREATE INDEX idx2 ON t1(b - 1);
+    INSERT INTO t1(a) VALUES (10);
+    PRAGMA integrity_check;
+}
+expect {
+    ok
+}
+
+# Expression index referencing multiple VIRTUAL columns
+test gencol_expr_index_multi_virtual_integrity {
+    CREATE TABLE t1(a INTEGER, b AS (a + 1), c AS (a * 2));
+    CREATE INDEX idx ON t1(b + c);
+    INSERT INTO t1(a) VALUES (5);
+    PRAGMA integrity_check;
+}
+expect {
+    ok
+}
+
+# Mixed: expression index + regular index on VIRTUAL
+test gencol_mixed_indexes_virtual_integrity {
+    CREATE TABLE t1(a INTEGER, b AS (a + 1) STORED, c AS (a * 2));
+    CREATE INDEX idx_stored ON t1(b);
+    CREATE INDEX idx_expr ON t1(c * 3);
+    INSERT INTO t1(a) VALUES (5);
+    PRAGMA integrity_check;
+}
+expect {
+    ok
+}
 
 # -----------------------------------------------------------------------------
 # Fix: VIRTUAL column affinity applied when referenced by STORED columns

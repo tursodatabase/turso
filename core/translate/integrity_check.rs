@@ -1,5 +1,5 @@
 use crate::{
-    schema::Schema,
+    schema::{Schema, EXPR_INDEX_SENTINEL},
     types::IndexInfo,
     vdbe::{
         builder::ProgramBuilder,
@@ -90,10 +90,16 @@ fn translate_integrity_check_impl(
                         // Compute physical positions for each indexed column.
                         // VIRTUAL generated columns are not stored in the record, so we need
                         // to map from logical positions to physical positions in the stored record.
+                        // Expression indexes use EXPR_INDEX_SENTINEL - they have no single column.
                         let mut has_virtual_columns = false;
                         let physical_positions: Vec<Option<usize>> = column_positions
                             .iter()
                             .map(|&logical_pos| {
+                                // Expression indexes use EXPR_INDEX_SENTINEL - can't look up a column
+                                if logical_pos == EXPR_INDEX_SENTINEL {
+                                    has_virtual_columns = true; // reuse flag to skip validation
+                                    return None;
+                                }
                                 let col = &btree_table.columns[logical_pos];
                                 if col.is_virtual_generated() {
                                     has_virtual_columns = true;
@@ -123,6 +129,14 @@ fn translate_integrity_check_impl(
                             program.alloc_registers(column_positions.len());
                         for (i, &pos) in column_positions.iter().enumerate() {
                             let target_reg = default_values_start_reg + i;
+                            // Expression indexes have no column - use NULL
+                            if pos == EXPR_INDEX_SENTINEL {
+                                program.emit_insn(Insn::Null {
+                                    dest: target_reg,
+                                    dest_end: None,
+                                });
+                                continue;
+                            }
                             let col = &btree_table.columns[pos];
                             if let Some(default_expr) = col.default.as_ref() {
                                 // Evaluate the default expression to the register.
