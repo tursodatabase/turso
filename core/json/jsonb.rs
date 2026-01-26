@@ -1124,7 +1124,9 @@ impl Jsonb {
         mut depth: usize,
         indent: &JsonIndentation,
     ) -> Result<usize> {
-        let end_cursor = cursor + len;
+        let end_cursor = cursor
+            .checked_add(len)
+            .ok_or_else(|| LimboError::ParseError("Invalid JSONB: payload size overflow".into()))?;
         let mut current_cursor = cursor;
         depth += 1;
         string.push('{');
@@ -1182,7 +1184,9 @@ impl Jsonb {
         mut depth: usize,
         indent: &JsonIndentation,
     ) -> Result<usize> {
-        let end_cursor = cursor + len;
+        let end_cursor = cursor
+            .checked_add(len)
+            .ok_or_else(|| LimboError::ParseError("Invalid JSONB: payload size overflow".into()))?;
         let mut current_cursor = cursor;
         depth += 1;
         string.push('[');
@@ -1221,10 +1225,13 @@ impl Jsonb {
         kind: &ElementType,
         quote: bool,
     ) -> Result<usize> {
-        if cursor + len > self.data.len() {
+        let end_cursor = cursor
+            .checked_add(len)
+            .ok_or_else(|| LimboError::ParseError("Invalid JSONB: payload size overflow".into()))?;
+        if end_cursor > self.data.len() {
             bail_parse_error!("Invalid JSONB: string extends beyond data");
         }
-        let word_slice = &self.data[cursor..cursor + len];
+        let word_slice = &self.data[cursor..end_cursor];
         if quote {
             string.push('"');
         }
@@ -1386,7 +1393,7 @@ impl Jsonb {
             string.push('"');
         }
 
-        Ok(cursor + len)
+        Ok(end_cursor)
     }
 
     fn serialize_number(
@@ -1396,7 +1403,9 @@ impl Jsonb {
         len: usize,
         kind: &ElementType,
     ) -> Result<usize> {
-        let current_cursor = cursor + len;
+        let current_cursor = cursor
+            .checked_add(len)
+            .ok_or_else(|| LimboError::ParseError("Invalid JSONB: payload size overflow".into()))?;
         if current_cursor > self.data.len() {
             bail_parse_error!("Invalid JSONB: number extends beyond data");
         }
@@ -4060,6 +4069,64 @@ world""#,
         assert!(result.contains(r#""backslashes":"C:\\Windows\\System32""#));
         assert!(result.contains(r#""control_chars":"\b\f\n\r\t""#));
         assert!(result.contains(r#""unicode":"\u00A9 2023""#));
+    }
+
+    #[test]
+    fn test_malformed_jsonb_payload_size_overflow() {
+        // Test that malformed JSONB data with extremely large payload sizes
+        // does not cause a panic due to integer overflow.
+        // This creates JSONB data with a header indicating a payload size
+        // that would overflow when added to the cursor position.
+        //
+        // Header format: lower 4 bits = element type, upper 4 bits = size marker
+        // When upper 4 bits = 0xF (15), the payload size follows as 8 bytes
+
+        let expected_error = "Invalid JSONB: payload size overflow";
+
+        // Test TEXT type (0x7) with overflow payload size
+        // Header: 0xF7 = TEXT type (0x7) with 8-byte size marker (0xF)
+        let malformed_text: Vec<u8> = vec![
+            0xF7, // TEXT with 8-byte size (header_size=15)
+            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // u64::MAX as payload size
+            b'a', b'b', b'c', // some actual data (doesn't matter, cursor+len will overflow)
+        ];
+        let jsonb = Jsonb::new(0, Some(&malformed_text));
+        let result = jsonb.to_string();
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains(expected_error),
+            "TEXT overflow should report payload size overflow"
+        );
+
+        // Test ARRAY type (0xB = 11) with overflow payload size
+        // Header: 0xFB = ARRAY type (0xB) with 8-byte size marker (0xF)
+        let malformed_array: Vec<u8> = vec![
+            0xFB, // ARRAY with 8-byte size (header_size=15)
+            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // u64::MAX as payload size
+            0x01, // NULL element inside (doesn't matter, cursor+len will overflow)
+        ];
+        let jsonb = Jsonb::new(0, Some(&malformed_array));
+        let result = jsonb.to_string();
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains(expected_error),
+            "ARRAY overflow should report payload size overflow"
+        );
+
+        // Test OBJECT type (0xC = 12) with overflow payload size
+        // Header: 0xFC = OBJECT type (0xC) with 8-byte size marker (0xF)
+        let malformed_object: Vec<u8> = vec![
+            0xFC, // OBJECT with 8-byte size (header_size=15)
+            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // u64::MAX as payload size
+            0x17, b'k', // TEXT key "k" (doesn't matter, cursor+len will overflow)
+        ];
+        let jsonb = Jsonb::new(0, Some(&malformed_object));
+        let result = jsonb.to_string();
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains(expected_error),
+            "OBJECT overflow should report payload size overflow"
+        );
     }
 }
 
