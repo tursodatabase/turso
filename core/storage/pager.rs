@@ -2574,6 +2574,12 @@ impl Pager {
         self.subjournal_page_if_required(page)?;
         let mut dirty_pages = self.dirty_pages.write();
         dirty_pages.insert(page.get().id as u32);
+        // Notify cache before marking dirty (page was evictable, now it won't be)
+        // Only notify if page wasn't already dirty
+        if !page.is_dirty() {
+            let key = PageCacheKey::new(page.get().id);
+            self.page_cache.write().notify_page_dirty(key);
+        }
         page.set_dirty();
         Ok(())
     }
@@ -2913,9 +2919,14 @@ impl Pager {
 
                             if c.succeeded() {
                                 // Synchronous completion, WAL tags already set by callback.
-                                for page in &pages {
-                                    if page.has_wal_tag() {
-                                        page.set_spilled();
+                                {
+                                    let mut cache = self.page_cache.write();
+                                    for page in &pages {
+                                        if page.has_wal_tag() {
+                                            let key = PageCacheKey::new(page.get().id);
+                                            cache.notify_page_spilled(key);
+                                            page.set_spilled();
+                                        }
                                     }
                                 }
                                 *self.spill_state.write() = SpillState::Idle;
@@ -2959,16 +2970,21 @@ impl Pager {
                 // Mark spilled pages so they can be evicted while dirty.
                 // Only do so if page wasn't modified since write started (each page has valid wal_tag).
                 let mut spilled_count = 0;
-                for page in &pages {
-                    if page.has_wal_tag() {
-                        page.set_spilled();
-                        spilled_count += 1;
-                    } else {
-                        // Page was modified during write, it will need to be re-spilled
-                        tracing::debug!(
-                            "try_spill_dirty_pages: page {} modified during write, not marking as spilled",
-                            page.get().id
-                        );
+                {
+                    let mut cache = self.page_cache.write();
+                    for page in &pages {
+                        if page.has_wal_tag() {
+                            let key = PageCacheKey::new(page.get().id);
+                            cache.notify_page_spilled(key);
+                            page.set_spilled();
+                            spilled_count += 1;
+                        } else {
+                            // Page was modified during write, it will need to be re-spilled
+                            tracing::debug!(
+                                "try_spill_dirty_pages: page {} modified during write, not marking as spilled",
+                                page.get().id
+                            );
+                        }
                     }
                 }
                 if spilled_count == 0 && !pages.is_empty() {

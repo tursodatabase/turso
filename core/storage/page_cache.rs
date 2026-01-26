@@ -108,6 +108,8 @@ pub struct PageCache {
     /// Threshold number of pages at which we start spilling dirty pages.
     spill_threshold: usize,
     spill_enabled: bool,
+    /// Conservative estimation of pages that are evictable based on dirty/spilled state.
+    evictable_count: usize,
 }
 
 unsafe impl Send for PageCache {}
@@ -164,6 +166,7 @@ impl PageCache {
             clock_hand: std::ptr::null_mut(),
             spill_threshold: spill_threshold.max(1),
             spill_enabled,
+            evictable_count: 0,
         }
     }
 
@@ -228,6 +231,14 @@ impl PageCache {
             } else {
                 entry.bump_ref();
                 if update_in_place {
+                    // Track evictable count change if page state differs
+                    let old_evictable = Self::counted_as_evictable(&entry.page);
+                    let new_evictable = Self::counted_as_evictable(&value);
+                    if old_evictable && !new_evictable {
+                        self.evictable_count = self.evictable_count.saturating_sub(1);
+                    } else if !old_evictable && new_evictable {
+                        self.evictable_count += 1;
+                    }
                     entry.page = value;
                     return Ok(());
                 } else {
@@ -242,6 +253,9 @@ impl PageCache {
 
         // Key doesn't exist, proceed with new entry
         self.make_room_for(1)?;
+
+        // Track evictable count for the new page
+        let is_evictable = Self::counted_as_evictable(&value);
 
         let entry = PageCacheEntry::new(key, value);
 
@@ -263,6 +277,11 @@ impl PageCache {
                 })? as *const PageCacheEntry as *mut PageCacheEntry;
                 self.map.insert(key, entry_ptr);
             }
+        }
+
+        // Update evictable count after successful insertion
+        if is_evictable {
+            self.evictable_count += 1;
         }
 
         Ok(())
@@ -292,6 +311,9 @@ impl PageCache {
             });
         }
 
+        // Track evictable count before removing
+        let was_evictable = Self::counted_as_evictable(page);
+
         if clean_page {
             page.clear_loaded();
             let _ = page.get().buffer.take();
@@ -313,6 +335,11 @@ impl PageCache {
         unsafe {
             let mut cursor = self.queue.cursor_mut_from_ptr(entry_ptr);
             cursor.remove();
+        }
+
+        // Update evictable count after successful removal
+        if was_evictable {
+            self.evictable_count = self.evictable_count.saturating_sub(1);
         }
 
         Ok(())
@@ -384,7 +411,20 @@ impl PageCache {
         if len < self.spill_threshold || !self.spill_enabled {
             return false;
         }
-        self.count_evictable_pages() < len.saturating_sub(self.spill_threshold)
+
+        let needed_evictable = len.saturating_sub(self.spill_threshold);
+
+        // Fast path: use tracked evictable_count to avoid O(n) scan.
+        // evictable_count is a conservative upper bound on evictable pages
+        // (it doesn't account for locked/pinned/strong_count > 1).
+        // If we have enough pages counted as evictable, we definitely don't need to spill.
+        if self.evictable_count >= needed_evictable {
+            return false;
+        }
+
+        // Slow path: do the full count since our estimate suggests we might need to spill.
+        // The actual count may be lower than evictable_count due to locked/pinned pages.
+        self.count_evictable_pages() < needed_evictable
     }
 
     #[inline]
@@ -433,6 +473,56 @@ impl PageCache {
             && page.get().overflow_cells.is_empty()
     }
 
+    #[inline]
+    /// Check if a page should be counted as evictable for tracking purposes.
+    /// This is a conservative check that ignores locked/pinned/strong_count state
+    /// since those are typically short-lived. We track based on dirty/spilled state.
+    fn counted_as_evictable(page: &PageRef) -> bool {
+        // Page 1 is never evictable
+        if page.get().id == DatabaseHeader::PAGE_ID {
+            return false;
+        }
+        // A page is evictable if it's clean OR spilled
+        !page.is_dirty() || page.is_spilled()
+    }
+
+    /// Notify the cache that a page has become dirty.
+    /// This should be called when a page transitions from clean/spilled to dirty.
+    /// The page must already be in the cache.
+    pub fn notify_page_dirty(&mut self, key: PageCacheKey) {
+        if let Some(&entry_ptr) = self.map.get(&key) {
+            let entry = unsafe { &*entry_ptr };
+            let page = &entry.page;
+            // Page was evictable (clean or spilled) before becoming dirty,
+            // now it's dirty && !spilled, so not evictable
+            if page.get().id != DatabaseHeader::PAGE_ID {
+                // Only decrement if we were counting it as evictable
+                // (it was clean or spilled before this call)
+                self.evictable_count = self.evictable_count.saturating_sub(1);
+            }
+        }
+    }
+
+    /// Notify the cache that a page has been spilled.
+    /// This should be called when a page transitions from dirty to spilled.
+    /// The page must already be in the cache.
+    pub fn notify_page_spilled(&mut self, key: PageCacheKey) {
+        if let Some(&entry_ptr) = self.map.get(&key) {
+            let entry = unsafe { &*entry_ptr };
+            let page = &entry.page;
+            // Page was dirty && !spilled (not evictable), now it's spilled (evictable)
+            if page.get().id != DatabaseHeader::PAGE_ID {
+                self.evictable_count += 1;
+            }
+        }
+    }
+
+    /// Get the current evictable page count (for diagnostics/testing).
+    #[cfg(test)]
+    pub fn evictable_count(&self) -> usize {
+        self.evictable_count
+    }
+
     /// Collect dirty pages that can be spilled to make room in the cache.
     /// Pages that are locked or pinned are skipped.
     pub fn collect_spillable_pages(&self, max_pages: usize) -> Vec<PinGuard> {
@@ -440,20 +530,20 @@ impl PageCache {
             return Vec::new();
         }
         const EST_SPILL: usize = 128;
-        let mut spillable: Vec<(usize, PinGuard)> = Vec::with_capacity(EST_SPILL);
+        let mut spillable: Vec<PinGuard> = Vec::with_capacity(EST_SPILL);
 
-        for (&key, &entry_ptr) in self.map.iter() {
+        for (_, &entry_ptr) in self.map.iter() {
             let entry = unsafe { &*entry_ptr };
             let page = &entry.page;
             if Self::spillable(page) {
-                spillable.push((key.0, PinGuard::new(page.clone())));
+                spillable.push(PinGuard::new(page.clone()));
             }
             if spillable.len() >= max_pages {
                 break;
             }
         }
-        spillable.sort_by_key(|(pgno, _)| *pgno);
-        spillable.into_iter().map(|(_, page)| page).collect()
+        spillable.sort_by_key(|pg| pg.get().id);
+        spillable
     }
 
     /// Returns the number of dirty pages currently in the cache.
@@ -545,6 +635,9 @@ impl PageCache {
             let evictable = Self::evictable(page);
 
             if evictable && entry.ref_bit == CLEAR {
+                // Track evictable count before evicting
+                let was_counted = Self::counted_as_evictable(page);
+
                 // Evict this entry
                 self.advance_clock_hand();
                 // Check if clock hand wrapped back to the same entry (meaning this is the only/last entry)
@@ -561,6 +654,11 @@ impl PageCache {
                 unsafe {
                     let mut cursor = self.queue.cursor_mut_from_ptr(entry_ptr);
                     cursor.remove();
+                }
+
+                // Update evictable count after successful eviction
+                if was_counted {
+                    self.evictable_count = self.evictable_count.saturating_sub(1);
                 }
 
                 return Ok(());
@@ -600,6 +698,7 @@ impl PageCache {
         self.map.clear();
         self.queue.clear();
         self.clock_hand = std::ptr::null_mut();
+        self.evictable_count = 0;
         Ok(())
     }
 
@@ -1568,6 +1667,88 @@ mod tests {
         assert!(cache.contains_key(&key2));
         assert!(cache.contains_key(&key3));
         assert_eq!(cache.len(), 3);
+
+        cache.verify_cache_integrity();
+    }
+
+    #[test]
+    fn test_evictable_count_tracking() {
+        // Test that evictable_count is tracked correctly for fast-path spill check
+        // Note: page 1 is DatabaseHeader and is never evictable
+        let mut cache = PageCache::new_with_spill(10, true);
+
+        // Insert clean pages (all evictable except page 1)
+        let key1 = insert_page(&mut cache, 1); // page 1 is never evictable
+        let key2 = insert_page(&mut cache, 2);
+        let key3 = insert_page(&mut cache, 3);
+
+        // Page 1 is not counted, pages 2 and 3 are evictable
+        assert_eq!(cache.evictable_count(), 2);
+
+        // Make page 2 dirty - it becomes non-evictable
+        cache.notify_page_dirty(key2);
+        assert_eq!(cache.evictable_count(), 1);
+
+        // Make page 2 spilled - it becomes evictable again
+        cache.notify_page_spilled(key2);
+        assert_eq!(cache.evictable_count(), 2);
+
+        // Delete page 3 - evictable count decreases
+        assert!(cache.delete(key3).is_ok());
+        assert_eq!(cache.evictable_count(), 1);
+
+        // Delete page 1 (which wasn't counted) - no change
+        assert!(cache.delete(key1).is_ok());
+        assert_eq!(cache.evictable_count(), 1);
+
+        // Clear cache
+        assert!(cache.clear(true).is_ok());
+        assert_eq!(cache.evictable_count(), 0);
+
+        cache.verify_cache_integrity();
+    }
+
+    #[test]
+    fn test_needs_spill_fast_path() {
+        // Test that needs_spill uses the fast path when we have enough evictable pages
+        // Capacity 10, threshold 90% = 9, so when len > 9 we need some evictable pages
+        let mut cache = PageCache::new_with_spill(10, true);
+
+        // Insert 10 clean pages (all evictable except page 1)
+        for i in 1..=10 {
+            let _ = insert_page(&mut cache, i);
+        }
+
+        // len=10, threshold=9, needed_evictable = 10-9 = 1
+        // evictable_count = 9 (pages 2-10, page 1 not counted)
+        // Fast path: 9 >= 1, so no spill needed
+        assert!(!cache.needs_spill());
+        assert_eq!(cache.evictable_count(), 9);
+
+        // Make all pages dirty
+        for i in 2..=10 {
+            let key = create_key(i);
+            cache.notify_page_dirty(key);
+            cache.peek(&key, false).unwrap().set_dirty();
+        }
+
+        // Now evictable_count = 0 and pages are actually dirty
+        // needed_evictable = 1, but we have 0 evictable pages
+        assert_eq!(cache.evictable_count(), 0);
+        // needs_spill should return true because we need 1 evictable page but have 0
+        assert!(cache.needs_spill());
+
+        // Mark pages as spilled
+        for i in 2..=10 {
+            let key = create_key(i);
+            cache.notify_page_spilled(key);
+            cache.peek(&key, false).unwrap().set_spilled();
+        }
+
+        // Now evictable_count = 9 and pages are spilled (evictable)
+        assert_eq!(cache.evictable_count(), 9);
+        // Fast path: 9 >= 1, so no spill needed
+        assert!(!cache.needs_spill());
 
         cache.verify_cache_integrity();
     }
