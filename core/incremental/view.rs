@@ -1427,6 +1427,7 @@ mod tests {
                         notnull: true,
                         unique: false,
                         hidden: false,
+                        generated_stored: false,
                     },
                 ),
                 SchemaColumn::new_default_text(Some("name".to_string()), "TEXT".to_string(), None),
@@ -1457,6 +1458,7 @@ mod tests {
                         notnull: true,
                         unique: false,
                         hidden: false,
+                        generated_stored: false,
                     },
                 ),
                 SchemaColumn::new(
@@ -1500,6 +1502,7 @@ mod tests {
                         notnull: true,
                         unique: false,
                         hidden: false,
+                        generated_stored: false,
                     },
                 ),
                 SchemaColumn::new_default_text(Some("name".to_string()), "TEXT".to_string(), None),
