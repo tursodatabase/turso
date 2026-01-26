@@ -166,7 +166,10 @@ impl Property for IntegrityCheckProperty {
                 // Busy errors are acceptable
                 if matches!(
                     error,
-                    LimboError::Busy | LimboError::BusySnapshot | LimboError::SchemaUpdated
+                    LimboError::Busy
+                        | LimboError::BusySnapshot
+                        | LimboError::SchemaUpdated
+                        | LimboError::SchemaConflict
                 ) {
                     return Ok(());
                 }

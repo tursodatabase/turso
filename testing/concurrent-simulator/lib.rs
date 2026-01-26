@@ -660,6 +660,7 @@ impl Whopper {
                 match error {
                     // initiate rollback in case of some errors for fiber within transaction
                     turso_core::LimboError::SchemaUpdated
+                    | turso_core::LimboError::SchemaConflict
                     | turso_core::LimboError::TableLocked
                     | turso_core::LimboError::Busy
                     | turso_core::LimboError::BusySnapshot
