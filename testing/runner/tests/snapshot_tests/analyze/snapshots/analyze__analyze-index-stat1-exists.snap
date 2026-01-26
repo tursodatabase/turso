@@ -1,0 +1,63 @@
+---
+source: analyze.sqltest
+expression: ANALYZE idx_items_name;
+info:
+  statement_type: OTHER
+  setup_blocks:
+  - stat1_exists
+  database: ':memory:'
+---
+QUERY PLAN
+
+
+BYTECODE
+addr  opcode       p1  p2  p3  p4              p5  comment
+   0  Init          0  42   0                   0  Start at 42
+   1  Null          0   1   0                   0  r[1]=NULL
+   2  OpenWrite     0   5   0                   0  root=5; iDb=0
+   3  Rewind        0  12   0                   0  Rewind  sqlite_stat1
+   4      Column    0   0   2                   0  r[2]=sqlite_stat1.tbl
+   5      Ne        2   3  11                   0  if r[2]!=r[3] goto 11
+   6      Column    0   1   4                   0  r[4]=sqlite_stat1.idx
+   7      Ne        4   5  11                   0  if r[4]!=r[5] goto 11
+   8      RowId     0   6   0                   0  r[6]=sqlite_stat1.rowid
+   9      Delete    0   0   0  sqlite_stat1     0
+  10    Next        0   4   0                   0
+  11  Next          0   4   0                   0
+  12  OpenRead      1   2   0  k(3,B,B,B)       0  =items, root=2, iDb=0
+  13  Count         1  12   0                   0
+  14  IfNot        12  21   0                   0  if !r[12] goto 21
+  15  Null          0   9   0                   0  r[9]=NULL
+  16  Copy         12  10   0                   0  r[10]=r[12]
+  17  Cast         10   0   0                   0  affinity(r[10]=Text)
+  18  MakeRecord    8   3  11                   0  r[11]=mkrec(r[8..10])
+  19  NewRowid      0   7   0                   0  r[7]=rowid
+  20  Insert        0  11   7  sqlite_stat1     0  intkey=r[7] data=r[11]
+  21  OpenRead      2   3   0  k(2,B)           0  =idx_items_name, root=3, iDb=0
+  22  Integer       1  14   0                   0  r[14]=1
+  23  Function      0  14  13  stat_init        0  r[13]=func(r[14])
+  24  Rewind        2  41   0                   0  Rewind  idx_items_name
+  25  Integer       0  14   0                   0  r[14]=0
+  26  Goto          0  32   0                   0
+  27    Integer     0  14   0                   0  r[14]=0
+  28    Column      2   0  16                   0  r[16]=idx_items_name.name
+  29    Ne         16  15  32                   0  if r[16]!=r[15] goto 32
+  30    Integer     1  14   0                   0  r[14]=1
+  31    Goto        0  33   0                   0
+  32    Column      2   0  15                   0  r[15]=idx_items_name.name
+  33    Function    0  13  13  stat_push        0  r[13]=func(r[13..14])
+  34  Next          2  27   0                   0
+  35  Function      0  13  17  stat_get         0  r[17]=func(r[13])
+  36  IsNull       17  41   0                   0  if (r[17]==NULL) goto 41
+  37  Copy         17  20   0                   0  r[20]=r[17]
+  38  MakeRecord   18   3  21                   0  r[21]=mkrec(r[18..20])
+  39  NewRowid      0  22   0                   0  r[22]=rowid
+  40  Insert        0  21  22  sqlite_stat1     0  intkey=r[22] data=r[21]
+  41  Halt          0   0   0                   0
+  42  Transaction   0   2   4                   0  iDb=0 tx_mode=Write
+  43  String8       0   3   0  items            0  r[3]='items'
+  44  String8       0   5   0  idx_items_name   0  r[5]='idx_items_name'
+  45  String8       0   8   0  items            0  r[8]='items'
+  46  String8       0  18   0  items            0  r[18]='items'
+  47  String8       0  19   0  idx_items_name   0  r[19]='idx_items_name'
+  48  Goto          0   1   0                   0
