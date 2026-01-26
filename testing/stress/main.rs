@@ -6,6 +6,7 @@ use opts::{Opts, TxMode};
 use rand::rngs::StdRng;
 #[cfg(not(feature = "antithesis"))]
 use rand::{Rng, SeedableRng};
+use shuttle::scheduler::Scheduler;
 use std::collections::HashSet;
 use std::io::Write;
 use std::path::Path;
@@ -314,7 +315,13 @@ fn generate_update(rng: &mut ThreadRng, table: &Table) -> String {
     } else {
         non_pk_columns
             .iter()
-            .map(|col| format!("{} = {}", col.name, generate_random_value(rng, &col.data_type)))
+            .map(|col| {
+                format!(
+                    "{} = {}",
+                    col.name,
+                    generate_random_value(rng, &col.data_type)
+                )
+            })
             .collect::<Vec<_>>()
             .join(", ")
     };
@@ -563,7 +570,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
 #[cfg(shuttle)]
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    use shuttle::scheduler::RandomScheduler;
+    use shuttle::scheduler::{RandomScheduler, UncontrolledNondeterminismCheckScheduler};
 
     let mut config = shuttle::Config::default();
     config.stack_size *= 10;
@@ -575,10 +582,18 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     opts.seed = Some(seed); // Store the resolved seed back into opts
     eprintln!("Using seed: {seed}");
 
-    let scheduler = RandomScheduler::new_from_seed(seed, 1);
-    let runner = shuttle::Runner::new(scheduler, config);
-    runner.run(move || shuttle::future::block_on(Box::pin(async_main_with_opts(opts.clone()))).unwrap());
+    let scheduler: Box<dyn Scheduler + Send> = if opts.check_uncontrolled_nondeterminism {
+        opts.nr_threads = 5;
+        opts.nr_iterations = 10;
+        Box::new(UncontrolledNondeterminismCheckScheduler::new(RandomScheduler::new(1)))
+    } else {
+        Box::new(RandomScheduler::new_from_seed(seed, 1))
+    };
 
+    let runner = shuttle::Runner::new(scheduler, config);
+    runner.run(move || {
+        shuttle::future::block_on(Box::pin(async_main_with_opts(opts.clone().clone()))).unwrap()
+    });
     Ok(())
 }
 
