@@ -224,6 +224,7 @@ fn estimate_in_selectivity(in_list_len: f64, row_count: f64, not: bool) -> f64 {
 /// So selectivity = avg_rows_per_key / total_rows
 ///
 /// Falls back to hardcoded estimates when stats are unavailable.
+#[allow(clippy::too_many_arguments)]
 fn estimate_selectivity(
     schema: &Schema,
     auto_stats: Option<&AutoAnalyzeStats>,
@@ -430,6 +431,7 @@ fn estimate_column_ndv(
     Some(ndv)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn estimate_join_eq_selectivity(
     schema: &Schema,
     auto_stats: Option<&AutoAnalyzeStats>,
@@ -910,13 +912,9 @@ pub fn constraints_from_where_clause(
             // Handle IN list: col IN (val1, val2, ...)
             if let ast::Expr::InList { lhs, not, rhs } = &term.expr {
                 let estimated_values = rhs.len() as f64;
-                let table_stats = schema
-                    .analyze_stats
-                    .table_stats(table_reference.table.get_name());
-                let row_count = table_stats
-                    .and_then(|s| s.row_count)
-                    .unwrap_or(params.rows_per_table_fallback as u64)
-                    as f64;
+                let row_count =
+                    table_row_count(schema, auto_stats, params, table_reference.table.get_name())
+                        as f64;
                 let selectivity = estimate_in_selectivity(estimated_values, row_count, *not);
 
                 match lhs.as_ref() {
@@ -973,13 +971,12 @@ pub fn constraints_from_where_clause(
                 // Only use as constraint if NOT correlated
                 if !subquery.correlated {
                     let estimated_values = params.in_subquery_rows;
-                    let table_stats = schema
-                        .analyze_stats
-                        .table_stats(table_reference.table.get_name());
-                    let row_count = table_stats
-                        .and_then(|s| s.row_count)
-                        .unwrap_or(params.rows_per_table_fallback as u64)
-                        as f64;
+                    let row_count = table_row_count(
+                        schema,
+                        auto_stats,
+                        params,
+                        table_reference.table.get_name(),
+                    ) as f64;
                     let selectivity = estimate_in_selectivity(estimated_values, row_count, *not_in);
 
                     match lhs_expr.as_ref() {
