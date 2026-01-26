@@ -191,8 +191,6 @@ jobs:
             npm publish --dry-run
           fi
         working-directory: ${{ env.working-directory }}
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       - name: Publish (dry-run)
         if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
