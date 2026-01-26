@@ -88,10 +88,7 @@ use crate::sync::{Mutex, RwLock};
 use turso_parser::ast::{self, ForeignKeyClause, Name, ResolveType};
 use turso_parser::parser::Parser;
 
-use super::{
-    likeop::{construct_like_escape_arg, exec_glob, exec_like_with_escape},
-    sorter::Sorter,
-};
+use super::{likeop::exec_glob, sorter::Sorter};
 
 #[cfg(feature = "json")]
 use crate::{
