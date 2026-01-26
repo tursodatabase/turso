@@ -1,0 +1,562 @@
+# Join Strategy Snapshot Tests
+# These snapshots capture EXPLAIN QUERY PLAN output for various join patterns
+
+@database :memory:
+@skip-file-if mvcc "mvcc has slightly different cursor ids, so skipping it for now"
+
+setup schema {
+    -- Customers table
+    CREATE TABLE customers (
+        customer_id INTEGER PRIMARY KEY NOT NULL,
+        name TEXT NOT NULL,
+        email TEXT NOT NULL,
+        city TEXT NOT NULL,
+        created_at DATE NOT NULL
+    );
+
+    -- Products table
+    CREATE TABLE products (
+        product_id INTEGER PRIMARY KEY NOT NULL,
+        name TEXT NOT NULL,
+        category TEXT NOT NULL,
+        price INTEGER NOT NULL,
+        stock_quantity INTEGER NOT NULL
+    );
+
+    -- Orders table with FK to customers
+    CREATE TABLE orders (
+        order_id INTEGER PRIMARY KEY NOT NULL,
+        customer_id INTEGER NOT NULL,
+        order_date DATE NOT NULL,
+        status TEXT NOT NULL,
+        total_amount INTEGER NOT NULL,
+        FOREIGN KEY (customer_id) REFERENCES customers(customer_id)
+    );
+
+    -- Order items table with FKs to orders and products
+    CREATE TABLE order_items (
+        item_id INTEGER PRIMARY KEY NOT NULL,
+        order_id INTEGER NOT NULL,
+        product_id INTEGER NOT NULL,
+        quantity INTEGER NOT NULL,
+        unit_price INTEGER NOT NULL,
+        FOREIGN KEY (order_id) REFERENCES orders(order_id),
+        FOREIGN KEY (product_id) REFERENCES products(product_id)
+    );
+
+    -- Employees table for self-join tests
+    CREATE TABLE employees (
+        employee_id INTEGER PRIMARY KEY NOT NULL,
+        name TEXT NOT NULL,
+        manager_id INTEGER,
+        department TEXT NOT NULL,
+        salary INTEGER NOT NULL,
+        FOREIGN KEY (manager_id) REFERENCES employees(employee_id)
+    );
+
+    -- Categories table for additional join tests
+    CREATE TABLE categories (
+        category_id INTEGER PRIMARY KEY NOT NULL,
+        category_name TEXT NOT NULL,
+        parent_category_id INTEGER,
+        FOREIGN KEY (parent_category_id) REFERENCES categories(category_id)
+    );
+
+    -- Index on orders.customer_id for index-assisted join tests
+    CREATE INDEX idx_orders_customer_id ON orders(customer_id);
+
+    -- Index on order_items.order_id
+    CREATE INDEX idx_order_items_order_id ON order_items(order_id);
+
+    -- Index on order_items.product_id
+    CREATE INDEX idx_order_items_product_id ON order_items(product_id);
+
+    -- Index on employees.manager_id for self-join
+    CREATE INDEX idx_employees_manager_id ON employees(manager_id);
+}
+
+# =============================================================================
+# 1. Two-table inner join - basic nested loop
+# =============================================================================
+
+@setup schema
+snapshot two-table-inner-join-basic {
+    SELECT
+        c.customer_id,
+        c.name,
+        o.order_id,
+        o.order_date,
+        o.total_amount
+    FROM
+        customers c,
+        orders o
+    WHERE
+        c.customer_id = o.customer_id;
+}
+
+@setup schema
+snapshot two-table-inner-join-explicit {
+    SELECT
+        c.customer_id,
+        c.name,
+        o.order_id,
+        o.order_date,
+        o.total_amount
+    FROM
+        customers c
+    INNER JOIN orders o ON c.customer_id = o.customer_id;
+}
+
+@setup schema
+snapshot two-table-inner-join-with-filter {
+    SELECT
+        c.customer_id,
+        c.name,
+        o.order_id,
+        o.total_amount
+    FROM
+        customers c
+    INNER JOIN orders o ON c.customer_id = o.customer_id
+    WHERE
+        o.status = 'completed'
+        AND o.total_amount > 100;
+}
+
+# =============================================================================
+# 2. Multi-way joins (3+ tables) - join order optimization
+# =============================================================================
+
+@setup schema
+snapshot three-table-join {
+    SELECT
+        c.name AS customer_name,
+        o.order_id,
+        o.order_date,
+        p.name AS product_name,
+        oi.quantity,
+        oi.unit_price
+    FROM
+        customers c,
+        orders o,
+        order_items oi,
+        products p
+    WHERE
+        c.customer_id = o.customer_id
+        AND o.order_id = oi.order_id
+        AND oi.product_id = p.product_id;
+}
+
+@setup schema
+snapshot three-table-join-explicit {
+    SELECT
+        c.name AS customer_name,
+        o.order_id,
+        o.order_date,
+        p.name AS product_name,
+        oi.quantity,
+        oi.unit_price
+    FROM
+        customers c
+    INNER JOIN orders o ON c.customer_id = o.customer_id
+    INNER JOIN order_items oi ON o.order_id = oi.order_id
+    INNER JOIN products p ON oi.product_id = p.product_id;
+}
+
+@setup schema
+snapshot four-table-join-with-aggregation {
+    SELECT
+        c.name AS customer_name,
+        c.city,
+        COUNT(DISTINCT o.order_id) AS order_count,
+        SUM(oi.quantity * oi.unit_price) AS total_spent
+    FROM
+        customers c
+    INNER JOIN orders o ON c.customer_id = o.customer_id
+    INNER JOIN order_items oi ON o.order_id = oi.order_id
+    INNER JOIN products p ON oi.product_id = p.product_id
+    WHERE
+        p.category = 'Electronics'
+    GROUP BY
+        c.customer_id, c.name, c.city
+    ORDER BY
+        total_spent DESC;
+}
+
+@setup schema
+snapshot multi-table-join-complex-filter {
+    SELECT
+        c.name,
+        o.order_id,
+        o.order_date,
+        p.name AS product_name,
+        p.category
+    FROM
+        customers c,
+        orders o,
+        order_items oi,
+        products p
+    WHERE
+        c.customer_id = o.customer_id
+        AND o.order_id = oi.order_id
+        AND oi.product_id = p.product_id
+        AND c.city = 'New York'
+        AND o.order_date >= '2024-01-01'
+        AND p.price > 50
+    ORDER BY
+        o.order_date DESC,
+        p.name;
+}
+
+# =============================================================================
+# 3. Left outer join - null handling
+# =============================================================================
+
+@setup schema
+snapshot left-outer-join-basic {
+    SELECT
+        c.customer_id,
+        c.name,
+        o.order_id,
+        o.order_date
+    FROM
+        customers c
+    LEFT OUTER JOIN orders o ON c.customer_id = o.customer_id;
+}
+
+@setup schema
+snapshot left-outer-join-find-nulls {
+    SELECT
+        c.customer_id,
+        c.name,
+        c.email
+    FROM
+        customers c
+    LEFT OUTER JOIN orders o ON c.customer_id = o.customer_id
+    WHERE
+        o.order_id IS NULL;
+}
+
+@setup schema
+snapshot left-outer-join-with-aggregation {
+    SELECT
+        c.customer_id,
+        c.name,
+        COUNT(o.order_id) AS order_count,
+        COALESCE(SUM(o.total_amount), 0) AS total_spent
+    FROM
+        customers c
+    LEFT OUTER JOIN orders o ON c.customer_id = o.customer_id
+    GROUP BY
+        c.customer_id, c.name
+    ORDER BY
+        total_spent DESC;
+}
+
+@setup schema
+snapshot left-outer-join-chained {
+    SELECT
+        c.name AS customer_name,
+        o.order_id,
+        oi.item_id,
+        p.name AS product_name
+    FROM
+        customers c
+    LEFT OUTER JOIN orders o ON c.customer_id = o.customer_id
+    LEFT OUTER JOIN order_items oi ON o.order_id = oi.order_id
+    LEFT OUTER JOIN products p ON oi.product_id = p.product_id;
+}
+
+# =============================================================================
+# 4. Right outer join
+# =============================================================================
+
+@setup schema
+snapshot right-outer-join-basic {
+    SELECT
+        c.customer_id,
+        c.name,
+        o.order_id,
+        o.order_date,
+        o.total_amount
+    FROM
+        customers c
+    RIGHT OUTER JOIN orders o ON c.customer_id = o.customer_id;
+}
+
+@setup schema
+snapshot right-outer-join-find-orphans {
+    SELECT
+        o.order_id,
+        o.order_date,
+        o.customer_id
+    FROM
+        customers c
+    RIGHT OUTER JOIN orders o ON c.customer_id = o.customer_id
+    WHERE
+        c.customer_id IS NULL;
+}
+
+# =============================================================================
+# 5. Self-join - same table aliased differently
+# =============================================================================
+
+@setup schema
+snapshot self-join-employee-manager {
+    SELECT
+        e.employee_id,
+        e.name AS employee_name,
+        e.department,
+        m.name AS manager_name
+    FROM
+        employees e
+    LEFT OUTER JOIN employees m ON e.manager_id = m.employee_id;
+}
+
+@setup schema
+snapshot self-join-find-subordinates {
+    SELECT
+        m.name AS manager_name,
+        COUNT(e.employee_id) AS subordinate_count,
+        AVG(e.salary) AS avg_subordinate_salary
+    FROM
+        employees m
+    INNER JOIN employees e ON m.employee_id = e.manager_id
+    GROUP BY
+        m.employee_id, m.name
+    ORDER BY
+        subordinate_count DESC;
+}
+
+@setup schema
+snapshot self-join-category-hierarchy {
+    SELECT
+        c.category_id,
+        c.category_name,
+        p.category_name AS parent_category_name
+    FROM
+        categories c
+    LEFT OUTER JOIN categories p ON c.parent_category_id = p.category_id;
+}
+
+@setup schema
+snapshot self-join-same-department {
+    SELECT
+        e1.name AS employee1,
+        e2.name AS employee2,
+        e1.department
+    FROM
+        employees e1,
+        employees e2
+    WHERE
+        e1.department = e2.department
+        AND e1.employee_id < e2.employee_id;
+}
+
+# =============================================================================
+# 6. Cross join - cartesian product
+# =============================================================================
+
+@setup schema
+snapshot cross-join-explicit {
+    SELECT
+        c.name AS customer_name,
+        p.name AS product_name,
+        p.price
+    FROM
+        customers c
+    CROSS JOIN products p;
+}
+
+@setup schema
+snapshot cross-join-implicit {
+    SELECT
+        c.name AS customer_name,
+        p.name AS product_name,
+        p.price
+    FROM
+        customers c,
+        products p;
+}
+
+@setup schema
+snapshot cross-join-with-filter {
+    SELECT
+        c.name AS customer_name,
+        p.name AS product_name,
+        p.price
+    FROM
+        customers c
+    CROSS JOIN products p
+    WHERE
+        c.city = 'Boston'
+        AND p.category = 'Books';
+}
+
+@setup schema
+snapshot cross-join-limited {
+    SELECT
+        c.name AS customer_name,
+        p.name AS product_name
+    FROM
+        customers c
+    CROSS JOIN products p
+    LIMIT 10;
+}
+
+# =============================================================================
+# 7. Join with index on FK - index-assisted join
+# =============================================================================
+
+@setup schema
+snapshot index-assisted-join-single-customer {
+    SELECT
+        c.name,
+        o.order_id,
+        o.order_date,
+        o.total_amount
+    FROM
+        customers c
+    INNER JOIN orders o ON c.customer_id = o.customer_id
+    WHERE
+        c.customer_id = 42;
+}
+
+@setup schema
+snapshot index-assisted-join-order-items {
+    SELECT
+        o.order_id,
+        o.order_date,
+        oi.item_id,
+        oi.quantity,
+        p.name AS product_name
+    FROM
+        orders o
+    INNER JOIN order_items oi ON o.order_id = oi.order_id
+    INNER JOIN products p ON oi.product_id = p.product_id
+    WHERE
+        o.order_id = 100;
+}
+
+@setup schema
+snapshot index-assisted-join-product-lookup {
+    SELECT
+        p.name AS product_name,
+        p.category,
+        oi.quantity,
+        o.order_date,
+        c.name AS customer_name
+    FROM
+        products p
+    INNER JOIN order_items oi ON p.product_id = oi.product_id
+    INNER JOIN orders o ON oi.order_id = o.order_id
+    INNER JOIN customers c ON o.customer_id = c.customer_id
+    WHERE
+        p.product_id = 500;
+}
+
+@setup schema
+snapshot index-assisted-join-range-scan {
+    SELECT
+        c.name,
+        COUNT(o.order_id) AS order_count
+    FROM
+        customers c
+    INNER JOIN orders o ON c.customer_id = o.customer_id
+    WHERE
+        c.customer_id BETWEEN 10 AND 20
+    GROUP BY
+        c.customer_id, c.name;
+}
+
+# =============================================================================
+# Additional complex join patterns
+# =============================================================================
+
+@setup schema
+snapshot mixed-join-types {
+    SELECT
+        c.name AS customer_name,
+        o.order_id,
+        oi.quantity,
+        p.name AS product_name
+    FROM
+        customers c
+    LEFT OUTER JOIN orders o ON c.customer_id = o.customer_id
+    INNER JOIN order_items oi ON o.order_id = oi.order_id
+    INNER JOIN products p ON oi.product_id = p.product_id;
+}
+
+@setup schema
+snapshot join-with-subquery {
+    SELECT
+        c.name,
+        c.city,
+        recent_orders.order_count,
+        recent_orders.total_spent
+    FROM
+        customers c
+    INNER JOIN (
+        SELECT
+            customer_id,
+            COUNT(*) AS order_count,
+            SUM(total_amount) AS total_spent
+        FROM
+            orders
+        WHERE
+            order_date >= '2024-01-01'
+        GROUP BY
+            customer_id
+    ) AS recent_orders ON c.customer_id = recent_orders.customer_id
+    ORDER BY
+        recent_orders.total_spent DESC;
+}
+
+@setup schema
+snapshot join-with-exists {
+    SELECT
+        c.customer_id,
+        c.name,
+        c.city
+    FROM
+        customers c
+    WHERE
+        EXISTS (
+            SELECT 1
+            FROM orders o
+            WHERE o.customer_id = c.customer_id
+            AND o.total_amount > 1000
+        );
+}
+
+@setup schema
+snapshot join-multiple-conditions {
+    SELECT
+        e1.name AS employee1,
+        e2.name AS employee2,
+        e1.department,
+        e1.salary
+    FROM
+        employees e1
+    INNER JOIN employees e2 ON
+        e1.department = e2.department
+        AND e1.salary = e2.salary
+        AND e1.employee_id < e2.employee_id;
+}
+
+@setup schema
+snapshot natural-join {
+    SELECT *
+    FROM customers
+    NATURAL JOIN orders;
+}
+
+@setup schema
+snapshot using-clause-join {
+    SELECT
+        c.name,
+        o.order_id,
+        o.order_date
+    FROM
+        customers c
+    INNER JOIN orders o USING (customer_id);
+}

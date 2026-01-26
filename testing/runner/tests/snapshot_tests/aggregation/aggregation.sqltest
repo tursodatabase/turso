@@ -1,0 +1,221 @@
+# Aggregation Pattern Query Plan Snapshots
+# These snapshots capture EXPLAIN QUERY PLAN output for common aggregation patterns
+
+@database :memory:
+@skip-file-if mvcc "mvcc has slightly different cursor ids, so skipping it for now"
+
+setup schema {
+    -- Sales data table for demonstrating aggregation patterns
+    CREATE TABLE sales (
+        id INTEGER PRIMARY KEY,
+        category TEXT NOT NULL,
+        region TEXT NOT NULL,
+        sale_date DATE NOT NULL,
+        amount INTEGER NOT NULL,
+        quantity INTEGER NOT NULL,
+        salesperson_id INTEGER NOT NULL
+    );
+
+    -- Index on amount for MIN/MAX optimization
+    CREATE INDEX idx_sales_amount ON sales(amount);
+
+    -- Index on category for GROUP BY optimization
+    CREATE INDEX idx_sales_category ON sales(category);
+
+    -- Composite index for multi-column grouping
+    CREATE INDEX idx_sales_category_region ON sales(category, region);
+
+    -- Products table for additional aggregation scenarios
+    CREATE TABLE products (
+        product_id INTEGER PRIMARY KEY,
+        product_name TEXT NOT NULL,
+        category TEXT NOT NULL,
+        price INTEGER NOT NULL
+    );
+
+    -- Orders table for distinct counting scenarios
+    CREATE TABLE orders (
+        order_id INTEGER PRIMARY KEY,
+        customer_id INTEGER NOT NULL,
+        product_id INTEGER NOT NULL,
+        order_date DATE NOT NULL,
+        quantity INTEGER NOT NULL,
+        total_amount INTEGER NOT NULL
+    );
+
+    CREATE INDEX idx_orders_customer ON orders(customer_id);
+    CREATE INDEX idx_orders_product ON orders(product_id);
+}
+
+# Pattern 1: Simple GROUP BY - single grouping column
+@setup schema
+snapshot simple-group-by-single-column {
+    SELECT
+        category,
+        SUM(amount) as total_sales
+    FROM
+        sales
+    GROUP BY
+        category
+    ORDER BY
+        total_sales DESC;
+}
+
+# Pattern 2: Multi-column GROUP BY - composite grouping
+@setup schema
+snapshot multi-column-group-by {
+    SELECT
+        category,
+        region,
+        SUM(amount) as total_sales,
+        COUNT(*) as num_transactions
+    FROM
+        sales
+    GROUP BY
+        category,
+        region
+    ORDER BY
+        category,
+        region;
+}
+
+# Pattern 3: GROUP BY with HAVING - post-aggregation filter
+@setup schema
+snapshot group-by-with-having {
+    SELECT
+        category,
+        SUM(amount) as total_sales,
+        AVG(amount) as avg_sale
+    FROM
+        sales
+    GROUP BY
+        category
+    HAVING
+        SUM(amount) > 10000
+    ORDER BY
+        total_sales DESC;
+}
+
+# Pattern 4: COUNT DISTINCT - distinct counting
+@setup schema
+snapshot count-distinct {
+    SELECT
+        category,
+        COUNT(DISTINCT salesperson_id) as unique_salespeople,
+        COUNT(DISTINCT region) as unique_regions
+    FROM
+        sales
+    GROUP BY
+        category
+    ORDER BY
+        unique_salespeople DESC;
+}
+
+# Pattern 5: Multiple aggregates - SUM, AVG, COUNT together
+@setup schema
+snapshot multiple-aggregates {
+    SELECT
+        category,
+        COUNT(*) as transaction_count,
+        SUM(amount) as total_amount,
+        AVG(amount) as avg_amount,
+        SUM(quantity) as total_quantity,
+        AVG(quantity) as avg_quantity
+    FROM
+        sales
+    GROUP BY
+        category
+    ORDER BY
+        total_amount DESC;
+}
+
+# Pattern 6: Aggregation without GROUP BY - whole-table aggregates
+@setup schema
+snapshot whole-table-aggregates {
+    SELECT
+        COUNT(*) as total_transactions,
+        SUM(amount) as total_revenue,
+        AVG(amount) as avg_transaction,
+        MIN(amount) as min_transaction,
+        MAX(amount) as max_transaction,
+        SUM(quantity) as total_units_sold
+    FROM
+        sales;
+}
+
+# Pattern 7: MIN/MAX with index - index-optimized min/max
+@setup schema
+snapshot min-max-with-index {
+    SELECT
+        MIN(amount) as min_sale,
+        MAX(amount) as max_sale
+    FROM
+        sales;
+}
+
+# Additional Pattern: MIN/MAX per group with potential index use
+@setup schema
+snapshot min-max-per-group {
+    SELECT
+        category,
+        MIN(amount) as min_sale,
+        MAX(amount) as max_sale
+    FROM
+        sales
+    GROUP BY
+        category
+    ORDER BY
+        category;
+}
+
+# Additional Pattern: Nested aggregation with subquery
+@setup schema
+snapshot nested-aggregation {
+    SELECT
+        AVG(category_total) as avg_category_sales,
+        MAX(category_total) as max_category_sales,
+        MIN(category_total) as min_category_sales
+    FROM
+        (
+            SELECT
+                category,
+                SUM(amount) as category_total
+            FROM
+                sales
+            GROUP BY
+                category
+        ) as category_totals;
+}
+
+# Additional Pattern: Aggregation with JOIN
+@setup schema
+snapshot aggregation-with-join {
+    SELECT
+        p.category,
+        COUNT(o.order_id) as num_orders,
+        SUM(o.total_amount) as total_revenue,
+        AVG(o.quantity) as avg_quantity_per_order
+    FROM
+        products p
+        LEFT JOIN orders o ON p.product_id = o.product_id
+    GROUP BY
+        p.category
+    ORDER BY
+        total_revenue DESC;
+}
+
+# Additional Pattern: Distinct count across joined tables
+@setup schema
+snapshot distinct-count-with-join {
+    SELECT
+        p.category,
+        COUNT(DISTINCT o.customer_id) as unique_customers,
+        COUNT(DISTINCT o.order_id) as total_orders
+    FROM
+        products p
+        INNER JOIN orders o ON p.product_id = o.product_id
+    GROUP BY
+        p.category
+    ORDER BY
+        unique_customers DESC;
+}
