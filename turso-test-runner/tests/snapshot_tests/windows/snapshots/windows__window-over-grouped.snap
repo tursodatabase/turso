@@ -1,0 +1,15 @@
+---
+source: windows.sqltest
+expression: "SELECT\n        department,\n        COUNT(*) AS emp_count,\n        SUM(salary) AS total_salary,\n        ROW_NUMBER() OVER (ORDER BY SUM(salary) DESC) AS dept_salary_rank\n    FROM employees\n    GROUP BY department;"
+info:
+  statement_type: SELECT
+  tables:
+    - employees
+  setup_blocks:
+    - schema
+  database: ":memory:"
+---
+QUERY PLAN
+
+
+BYTECODE
