@@ -1,43 +1,42 @@
 use crate::error::SQLITE_CONSTRAINT_UNIQUE;
 use crate::function::AlterTableFunc;
-use crate::mvcc::LocalClock;
 use crate::mvcc::cursor::{MvccCursorType, NextRowidResult};
 use crate::mvcc::database::CheckpointStateMachine;
+use crate::mvcc::LocalClock;
 use crate::numeric::Numeric;
-use crate::schema::{SQLITE_SEQUENCE_TABLE_NAME, Table};
+use crate::schema::{Table, SQLITE_SEQUENCE_TABLE_NAME};
 use crate::state_machine::StateMachine;
 use crate::storage::btree::{
-    CursorTrait, IntegrityCheckError, IntegrityCheckState, PageCategory, integrity_check,
+    integrity_check, CursorTrait, IntegrityCheckError, IntegrityCheckState, PageCategory,
 };
 use crate::storage::database::DatabaseFile;
 use crate::storage::journal_mode;
 use crate::storage::page_cache::PageCache;
-use crate::storage::pager::{CreateBTreeFlags, PageRef, default_page1};
+use crate::storage::pager::{default_page1, CreateBTreeFlags, PageRef};
 use crate::storage::sqlite3_ondisk::{DatabaseHeader, PageSize, RawVersion};
 use crate::translate::collate::CollationSeq;
-use crate::translate::expr::{WalkControl, walk_expr_mut};
+use crate::translate::expr::{walk_expr_mut, WalkControl};
 use crate::types::{
-    AsValueRef, Extendable, IOCompletions, IOResult, ImmutableRecord, IndexInfo, SeekResult, Text,
-    compare_immutable, compare_records_generic,
+    compare_immutable, compare_records_generic, AsValueRef, Extendable, IOCompletions, IOResult,
+    ImmutableRecord, IndexInfo, SeekResult, Text,
 };
 use crate::util::{
     normalize_ident, rewrite_column_references_if_needed, rewrite_fk_parent_cols_if_self_ref,
     rewrite_fk_parent_table_if_needed, rewrite_inline_col_fk_target_if_needed,
     trim_ascii_whitespace,
 };
-use crate::vdbe::affinity::{Affinity, ParsedNumber, apply_numeric_affinity, try_for_float};
-use crate::vdbe::hash_table::{DEFAULT_MEM_BUDGET, HashEntry, HashTable, HashTableConfig};
+use crate::vdbe::affinity::{apply_numeric_affinity, try_for_float, Affinity, ParsedNumber};
+use crate::vdbe::hash_table::{HashEntry, HashTable, HashTableConfig, DEFAULT_MEM_BUDGET};
 use crate::vdbe::insn::InsertFlags;
 use crate::vdbe::value::ComparisonOp;
 use crate::vdbe::{
-    DeferredSeekState, EndStatement, OpHashBuildState, OpHashProbeState, StepResult, TxnCleanup,
-    registers_to_ref_values,
+    registers_to_ref_values, DeferredSeekState, EndStatement, OpHashBuildState, OpHashProbeState,
+    StepResult, TxnCleanup,
 };
 use crate::vector::{
-    vector_concat, vector_distance_cos, vector_distance_dot, vector_distance_jaccard,
-    vector_distance_l2, vector_extract, vector_slice, vector32, vector32_sparse, vector64,
+    vector32, vector32_sparse, vector64, vector_concat, vector_distance_cos, vector_distance_dot,
+    vector_distance_jaccard, vector_distance_l2, vector_extract, vector_slice,
 };
-use crate::{CheckpointMode, Completion, Connection, DatabaseStorage, IOExt, MvCursor, get_cursor};
 use crate::{
     error::{
         LimboError, SQLITE_CONSTRAINT, SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY,
@@ -53,6 +52,7 @@ use crate::{
     stats::StatAccum,
     translate::emitter::TransactionMode,
 };
+use crate::{get_cursor, CheckpointMode, Completion, Connection, DatabaseStorage, IOExt, MvCursor};
 use either::Either;
 use smallvec::SmallVec;
 use std::any::Any;
@@ -61,7 +61,7 @@ use std::str::FromStr;
 use std::{
     borrow::BorrowMut,
     num::NonZero,
-    sync::{Arc, atomic::Ordering},
+    sync::{atomic::Ordering, Arc},
 };
 use turso_macros::match_ignore_ascii_case;
 
@@ -79,11 +79,11 @@ use crate::{
     },
 };
 
-use crate::{OpenFlags, TransactionState, ValueRef, connection::Row, info, turso_assert};
+use crate::{connection::Row, info, turso_assert, OpenFlags, TransactionState, ValueRef};
 
 use super::{
-    CommitState,
     insn::{Cookie, RegisterOrLiteral},
+    CommitState,
 };
 use crate::sync::{Mutex, RwLock};
 use turso_parser::ast::{self, ForeignKeyClause, Name, ResolveType};
@@ -105,11 +105,11 @@ use crate::{
     json::jsonb_patch, json::jsonb_remove, json::jsonb_replace, json::jsonb_set,
 };
 
-use super::{Program, ProgramState, Register, make_record};
+use super::{make_record, Program, ProgramState, Register};
 
 #[cfg(feature = "fs")]
 use crate::connection::resolve_ext_path;
-use crate::{MvStore, Pager, Result, bail_constraint_error, must_be_btree_cursor};
+use crate::{bail_constraint_error, must_be_btree_cursor, MvStore, Pager, Result};
 
 /// Macro to destructure an Insn enum variant, only to be used when it
 /// is *impossible* to be another variant.
@@ -1453,18 +1453,14 @@ pub fn op_column(
                     match table_cursor {
                         Cursor::MaterializedView(mv_cursor) => {
                             // Seek to the rowid in the materialized view
-                            return_if_io!(
-                                mv_cursor
-                                    .seek(SeekKey::TableRowId(rowid), SeekOp::GE { eq_only: true })
-                            );
+                            return_if_io!(mv_cursor
+                                .seek(SeekKey::TableRowId(rowid), SeekOp::GE { eq_only: true }));
                         }
                         _ => {
                             // Regular btree cursor
                             let table_cursor = table_cursor.as_btree_mut();
-                            return_if_io!(
-                                table_cursor
-                                    .seek(SeekKey::TableRowId(rowid), SeekOp::GE { eq_only: true })
-                            );
+                            return_if_io!(table_cursor
+                                .seek(SeekKey::TableRowId(rowid), SeekOp::GE { eq_only: true }));
                         }
                     }
                 }
@@ -2906,10 +2902,8 @@ pub fn op_seek_rowid(
 
                 match rowid {
                     Some(rowid) => {
-                        let seek_result = return_if_io!(
-                            mv_cursor
-                                .seek(SeekKey::TableRowId(rowid), SeekOp::GE { eq_only: true })
-                        );
+                        let seek_result = return_if_io!(mv_cursor
+                            .seek(SeekKey::TableRowId(rowid), SeekOp::GE { eq_only: true }));
                         let pc = if !matches!(seek_result, SeekResult::Found) {
                             target_pc.as_offset_int()
                         } else {
@@ -2942,10 +2936,8 @@ pub fn op_seek_rowid(
 
                 match rowid {
                     Some(rowid) => {
-                        let seek_result = return_if_io!(
-                            btree_cursor
-                                .seek(SeekKey::TableRowId(rowid), SeekOp::GE { eq_only: true })
-                        );
+                        let seek_result = return_if_io!(btree_cursor
+                            .seek(SeekKey::TableRowId(rowid), SeekOp::GE { eq_only: true }));
                         let pc = if !matches!(seek_result, SeekResult::Found) {
                             target_pc.as_offset_int()
                         } else {
@@ -7246,9 +7238,9 @@ fn new_rowid_inner(
                 let exists = {
                     let cursor = state.get_cursor(*cursor);
                     let cursor = cursor.as_btree_mut();
-                    let seek_result = return_if_io!(
-                        cursor.seek(SeekKey::TableRowId(candidate), SeekOp::GE { eq_only: true })
-                    );
+                    let seek_result =
+                        return_if_io!(cursor
+                            .seek(SeekKey::TableRowId(candidate), SeekOp::GE { eq_only: true }));
                     matches!(seek_result, SeekResult::Found)
                 };
 
@@ -8420,7 +8412,11 @@ pub fn op_is_true(
         // For non-NULL, optionally invert the boolean result
         Some(is_truthy) => {
             let result = if is_truthy { 1 } else { 0 };
-            if *invert { 1 - result } else { result }
+            if *invert {
+                1 - result
+            } else {
+                result
+            }
         }
     };
     state.registers[*dest] = Register::Value(Value::Integer(final_result));

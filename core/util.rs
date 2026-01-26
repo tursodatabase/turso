@@ -1,22 +1,22 @@
-use crate::IO;
 use crate::incremental::view::IncrementalView;
 use crate::numeric::StrToF64;
 use crate::schema::ColDef;
 use crate::sync::Mutex;
 use crate::translate::emitter::TransactionMode;
-use crate::translate::expr::{WalkControl, walk_expr, walk_expr_mut};
+use crate::translate::expr::{walk_expr, walk_expr_mut, WalkControl};
 use crate::translate::plan::JoinedTable;
 use crate::translate::planner::parse_row_id;
 use crate::types::IOResult;
+use crate::IO;
 use crate::{
-    LimboError, OpenFlags, Result, Statement, SymbolTable,
     schema::{Column, Schema, Table, Type},
     types::{Value, ValueType},
+    LimboError, OpenFlags, Result, Statement, SymbolTable,
 };
 use either::Either;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::sync::Arc;
-use tracing::{Level, instrument};
+use tracing::{instrument, Level};
 use turso_macros::match_ignore_ascii_case;
 use turso_parser::ast::{self, CreateTableBody, Expr, Literal, UnaryOperator};
 
@@ -1096,7 +1096,11 @@ pub fn trim_ascii_whitespace(s: &str) -> &str {
         .rposition(|&b| !b.is_ascii_whitespace())
         .map(|i| i + 1)
         .unwrap_or(0);
-    if start <= end { &s[start..end] } else { "" }
+    if start <= end {
+        &s[start..end]
+    } else {
+        ""
+    }
 }
 
 /// NUMERIC Casting a TEXT or BLOB value into NUMERIC yields either an INTEGER or a REAL result.
@@ -1442,7 +1446,11 @@ pub fn extract_view_columns(
                         ast::Expr::Id(_col_name) => {
                             // Unqualified column - would need to resolve based on schema
                             // For now, assume it's from the first table if there is one
-                            if !tables.is_empty() { Some(0) } else { None }
+                            if !tables.is_empty() {
+                                Some(0)
+                            } else {
+                                None
+                            }
                         }
                         _ => None, // Expression, literal, etc.
                     };
@@ -1850,14 +1858,12 @@ pub mod tests {
     #[test]
     fn test_expressions_both_parenthesized_equivalent() {
         // Same types: (683 + 799) == 799 + 683 (commutative, integers only)
-        let expr1 = Expr::Parenthesized(vec![
-            Expr::Binary(
-                Box::new(Expr::Literal(Literal::Numeric("683".to_string()))),
-                Add,
-                Box::new(Expr::Literal(Literal::Numeric("799".to_string()))),
-            )
-            .into(),
-        ]);
+        let expr1 = Expr::Parenthesized(vec![Expr::Binary(
+            Box::new(Expr::Literal(Literal::Numeric("683".to_string()))),
+            Add,
+            Box::new(Expr::Literal(Literal::Numeric("799".to_string()))),
+        )
+        .into()]);
         let expr2 = Expr::Binary(
             Box::new(Expr::Literal(Literal::Numeric("799".to_string()))),
             Add,
@@ -1867,14 +1873,12 @@ pub mod tests {
     }
     #[test]
     fn test_expressions_parenthesized_equivalent() {
-        let expr7 = Expr::Parenthesized(vec![
-            Expr::Binary(
-                Box::new(Expr::Literal(Literal::Numeric("6".to_string()))),
-                Add,
-                Box::new(Expr::Literal(Literal::Numeric("7".to_string()))),
-            )
-            .into(),
-        ]);
+        let expr7 = Expr::Parenthesized(vec![Expr::Binary(
+            Box::new(Expr::Literal(Literal::Numeric("6".to_string()))),
+            Add,
+            Box::new(Expr::Literal(Literal::Numeric("7".to_string()))),
+        )
+        .into()]);
         let expr8 = Expr::Binary(
             Box::new(Expr::Literal(Literal::Numeric("6".to_string()))),
             Add,
