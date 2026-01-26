@@ -279,8 +279,12 @@ impl Parser {
                     name,
                     name_span,
                     sql,
-                    setups: test_setups,
-                    skip,
+                    modifiers: CaseModifiers {
+                        setups: test_setups,
+                        skip,
+                        backend,
+                        requires,
+                    },
                 }))
             }
             Some(Token::Test) => {
@@ -345,10 +349,12 @@ impl Parser {
                     name_span,
                     sql,
                     expectations: Expectations { default, overrides },
-                    setups: test_setups,
-                    skip,
-                    backend,
-                    requires,
+                    modifiers: CaseModifiers {
+                        setups: test_setups,
+                        skip,
+                        backend,
+                        requires,
+                    },
                 }))
             }
             Some(token) => Err(self.error(format!(
@@ -580,7 +586,7 @@ impl Parser {
 
         // Rule 4: All referenced setup names must exist (for tests and snapshots)
         for test in &file.tests {
-            for setup_ref in &test.setups {
+            for setup_ref in &test.modifiers.setups {
                 if !file.setups.contains_key(&setup_ref.name) {
                     let available: Vec<_> = file.setups.keys().collect();
                     let help = if available.is_empty() {
@@ -612,7 +618,7 @@ impl Parser {
 
         // Rule 4b: All referenced setup names must exist for snapshots
         for snapshot in &file.snapshots {
-            for setup_ref in &snapshot.setups {
+            for setup_ref in &snapshot.modifiers.setups {
                 if !file.setups.contains_key(&setup_ref.name) {
                     let available: Vec<_> = file.setups.keys().collect();
                     let help = if available.is_empty() {
@@ -751,8 +757,8 @@ expect {
         let file = parse(input).unwrap();
         assert_eq!(file.setups.len(), 1);
         assert!(file.setups.contains_key("users"));
-        assert_eq!(file.tests[0].setups.len(), 1);
-        assert_eq!(file.tests[0].setups[0].name, "users");
+        assert_eq!(file.tests[0].modifiers.setups.len(), 1);
+        assert_eq!(file.tests[0].modifiers.setups[0].name, "users");
     }
 
     #[test]
@@ -832,7 +838,7 @@ expect {
 
         let file = parse(input).unwrap();
         assert_eq!(
-            file.tests[0].skip,
+            file.tests[0].modifiers.skip,
             Some(ast::Skip {
                 reason: "known bug".to_string(),
                 condition: None,
@@ -856,7 +862,7 @@ expect {
 
         let file = parse(input).unwrap();
         assert_eq!(
-            file.tests[0].skip,
+            file.tests[0].modifiers.skip,
             Some(ast::Skip {
                 reason: "total_changes not supported in MVCC".to_string(),
                 condition: Some(ast::SkipCondition::Mvcc),
@@ -1001,7 +1007,7 @@ expect {
             })
         );
         // Per-test skip should be None since we're using global skip
-        assert!(file.tests[0].skip.is_none());
+        assert!(file.tests[0].modifiers.skip.is_none());
     }
 
     #[test]
@@ -1034,8 +1040,8 @@ expect {
             })
         );
         // All tests should have no per-test skip
-        assert!(file.tests[0].skip.is_none());
-        assert!(file.tests[1].skip.is_none());
+        assert!(file.tests[0].modifiers.skip.is_none());
+        assert!(file.tests[1].modifiers.skip.is_none());
     }
 
     #[test]
@@ -1199,10 +1205,10 @@ expect {
             })
         );
         // First test has no per-test skip (uses global)
-        assert!(file.tests[0].skip.is_none());
+        assert!(file.tests[0].modifiers.skip.is_none());
         // Second test has per-test skip (overrides global)
         assert_eq!(
-            file.tests[1].skip,
+            file.tests[1].modifiers.skip,
             Some(ast::Skip {
                 reason: "per-test skip".to_string(),
                 condition: None,
@@ -1225,13 +1231,13 @@ expect {
 "#;
 
         let file = parse(input).unwrap();
-        assert_eq!(file.tests[0].requires.len(), 1);
+        assert_eq!(file.tests[0].modifiers.requires.len(), 1);
         assert_eq!(
-            file.tests[0].requires[0].capability,
+            file.tests[0].modifiers.requires[0].capability,
             ast::Capability::Trigger
         );
         assert_eq!(
-            file.tests[0].requires[0].reason,
+            file.tests[0].modifiers.requires[0].reason,
             "test needs trigger support"
         );
     }
@@ -1250,12 +1256,15 @@ expect {
 "#;
 
         let file = parse(input).unwrap();
-        assert_eq!(file.tests[0].requires.len(), 1);
+        assert_eq!(file.tests[0].modifiers.requires.len(), 1);
         assert_eq!(
-            file.tests[0].requires[0].capability,
+            file.tests[0].modifiers.requires[0].capability,
             ast::Capability::Strict
         );
-        assert_eq!(file.tests[0].requires[0].reason, "test needs strict tables");
+        assert_eq!(
+            file.tests[0].modifiers.requires[0].reason,
+            "test needs strict tables"
+        );
     }
 
     #[test]
@@ -1284,8 +1293,8 @@ expect {
         assert_eq!(file.global_requires[0].capability, ast::Capability::Trigger);
         assert_eq!(file.global_requires[0].reason, "all tests need triggers");
         // Per-test requires should be empty
-        assert!(file.tests[0].requires.is_empty());
-        assert!(file.tests[1].requires.is_empty());
+        assert!(file.tests[0].modifiers.requires.is_empty());
+        assert!(file.tests[1].modifiers.requires.is_empty());
     }
 
     #[test]
@@ -1304,15 +1313,17 @@ expect {
 "#;
 
         let file = parse(input).unwrap();
-        assert_eq!(file.tests[0].requires.len(), 2);
+        assert_eq!(file.tests[0].modifiers.requires.len(), 2);
         assert!(
             file.tests[0]
+                .modifiers
                 .requires
                 .iter()
                 .any(|r| r.capability == ast::Capability::Trigger)
         );
         assert!(
             file.tests[0]
+                .modifiers
                 .requires
                 .iter()
                 .any(|r| r.capability == ast::Capability::Strict)
@@ -1346,11 +1357,11 @@ expect {
         assert_eq!(file.global_requires.len(), 1);
         assert_eq!(file.global_requires[0].capability, ast::Capability::Trigger);
         // First test has no per-test requires
-        assert!(file.tests[0].requires.is_empty());
+        assert!(file.tests[0].modifiers.requires.is_empty());
         // Second test has per-test requires for strict
-        assert_eq!(file.tests[1].requires.len(), 1);
+        assert_eq!(file.tests[1].modifiers.requires.len(), 1);
         assert_eq!(
-            file.tests[1].requires[0].capability,
+            file.tests[1].modifiers.requires[0].capability,
             ast::Capability::Strict
         );
     }
@@ -1369,8 +1380,8 @@ snapshot query-plan {
         assert_eq!(file.snapshots.len(), 1);
         assert_eq!(file.snapshots[0].name, "query-plan");
         assert_eq!(file.snapshots[0].sql, "SELECT * FROM users WHERE id = 1;");
-        assert!(file.snapshots[0].setups.is_empty());
-        assert!(file.snapshots[0].skip.is_none());
+        assert!(file.snapshots[0].modifiers.setups.is_empty());
+        assert!(file.snapshots[0].modifiers.skip.is_none());
     }
 
     #[test]
@@ -1390,8 +1401,8 @@ snapshot query-plan {
 
         let file = parse(input).unwrap();
         assert_eq!(file.snapshots.len(), 1);
-        assert_eq!(file.snapshots[0].setups.len(), 1);
-        assert_eq!(file.snapshots[0].setups[0].name, "schema");
+        assert_eq!(file.snapshots[0].modifiers.setups.len(), 1);
+        assert_eq!(file.snapshots[0].modifiers.setups[0].name, "schema");
     }
 
     #[test]
@@ -1407,8 +1418,11 @@ snapshot query-plan {
 
         let file = parse(input).unwrap();
         assert_eq!(file.snapshots.len(), 1);
-        assert!(file.snapshots[0].skip.is_some());
-        assert_eq!(file.snapshots[0].skip.as_ref().unwrap().reason, "not ready");
+        assert!(file.snapshots[0].modifiers.skip.is_some());
+        assert_eq!(
+            file.snapshots[0].modifiers.skip.as_ref().unwrap().reason,
+            "not ready"
+        );
     }
 
     #[test]
