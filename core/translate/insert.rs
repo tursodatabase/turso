@@ -414,6 +414,15 @@ pub fn translate_insert(
     let has_relevant_before_triggers = relevant_before_triggers.clone().count() > 0;
 
     if has_relevant_before_triggers {
+        // Compute VIRTUAL column values for trigger access
+        // VIRTUAL columns are normally NULL (computed on read), but triggers need actual values
+        compute_virtual_columns_for_triggers(
+            &mut program,
+            &insertion.col_mappings,
+            insertion.rowid_alias_mapping(),
+            resolver,
+        )?;
+
         // Build NEW registers: for rowid alias columns, use the rowid register; otherwise use column register
         let new_registers: Vec<usize> = insertion
             .col_mappings
@@ -629,6 +638,15 @@ pub fn translate_insert(
     );
     let has_relevant_after_triggers = relevant_after_triggers.clone().count() > 0;
     if has_relevant_after_triggers {
+        // Compute VIRTUAL column values for trigger access
+        // VIRTUAL columns are normally NULL (computed on read), but triggers need actual values
+        compute_virtual_columns_for_triggers(
+            &mut program,
+            &insertion.col_mappings,
+            insertion.rowid_alias_mapping(),
+            resolver,
+        )?;
+
         // Build NEW registers: for rowid alias columns, use the rowid register; otherwise use column register
         let new_registers_after: Vec<usize> = insertion
             .col_mappings
@@ -2290,6 +2308,41 @@ fn translate_column<'a>(
             dest: column_register,
             dest_end: None,
         });
+    }
+    Ok(())
+}
+
+/// Compute VIRTUAL generated column values into their registers for trigger access.
+/// This is needed because VIRTUAL columns normally store NULL (computed on read),
+/// but triggers need the actual computed values in NEW/OLD contexts.
+///
+/// This function iterates through column mappings, finds VIRTUAL generated columns,
+/// evaluates their expressions, and applies column affinity for consistency.
+pub fn compute_virtual_columns_for_triggers<'a>(
+    program: &mut ProgramBuilder,
+    col_mappings: &[ColMapping<'a>],
+    rowid_alias: Option<&ColMapping<'a>>,
+    resolver: &Resolver,
+) -> Result<()> {
+    for col_mapping in col_mappings {
+        if col_mapping.column.is_virtual_generated() {
+            if let Some(gen_expr) = &col_mapping.column.generated {
+                translate_generated_expr(
+                    program,
+                    gen_expr,
+                    col_mapping.register,
+                    col_mappings,
+                    rowid_alias,
+                    resolver,
+                )?;
+                // Apply affinity for consistency
+                program.emit_insn(Insn::Affinity {
+                    start_reg: col_mapping.register,
+                    count: NonZeroUsize::new(1).unwrap(),
+                    affinities: col_mapping.column.affinity().aff_mask().to_string(),
+                });
+            }
+        }
     }
     Ok(())
 }

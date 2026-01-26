@@ -2860,6 +2860,87 @@ pub(super) fn emit_generated_expr_from_registers(
     Ok(())
 }
 
+/// Compute VIRTUAL generated column values into their registers for trigger access during UPDATE.
+/// This is needed because VIRTUAL columns normally store NULL (computed on read),
+/// but triggers need the actual computed values in NEW contexts.
+///
+/// Similar to `compute_virtual_columns_for_triggers` in insert.rs, but adapted for UPDATE
+/// which uses a different register layout and doesn't have ColMapping structures.
+pub(super) fn compute_virtual_columns_for_update_triggers(
+    program: &mut ProgramBuilder,
+    columns: &[crate::schema::Column],
+    registers_start: usize,
+    column_lookup: &std::collections::HashMap<String, usize>,
+    resolver: &Resolver,
+    rowid_reg: Option<usize>,
+) -> crate::Result<()> {
+    for (idx, column) in columns.iter().enumerate() {
+        if column.is_virtual_generated() {
+            if let Some(gen_expr) = &column.generated {
+                let target_reg = registers_start + idx;
+                emit_generated_expr_from_registers(
+                    program,
+                    gen_expr,
+                    target_reg,
+                    registers_start,
+                    column_lookup,
+                    columns,
+                    resolver,
+                    rowid_reg,
+                )?;
+                // Apply affinity for consistency
+                program.emit_insn(Insn::Affinity {
+                    start_reg: target_reg,
+                    count: NonZeroUsize::new(1).unwrap(),
+                    affinities: column.affinity().aff_mask().to_string(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Compute VIRTUAL generated column values for OLD context in UPDATE triggers.
+/// This variant takes a slice of register indices instead of a contiguous start,
+/// since OLD registers are allocated individually rather than contiguously.
+pub(super) fn compute_virtual_columns_for_old_context(
+    program: &mut ProgramBuilder,
+    columns: &[crate::schema::Column],
+    old_registers: &[usize],
+    column_lookup: &std::collections::HashMap<String, usize>,
+    resolver: &Resolver,
+) -> crate::Result<()> {
+    use super::expr::{translate_expr_with_context, ExprContext};
+
+    // For OLD context, we need a custom approach since registers aren't contiguous.
+    // We'll evaluate each VIRTUAL column's expression using the OLD register values.
+    for (idx, column) in columns.iter().enumerate() {
+        if column.is_virtual_generated() {
+            if let Some(gen_expr) = &column.generated {
+                // The target register for this column in OLD context
+                let target_reg = old_registers[idx];
+
+                // Create a mapping from column index to OLD register
+                // Since OLD registers aren't contiguous, we need custom context
+                let context = ExprContext::OldGenerated {
+                    old_registers,
+                    column_lookup,
+                    columns,
+                };
+                translate_expr_with_context(program, &context, gen_expr, target_reg, resolver)?;
+
+                // Apply affinity for consistency
+                program.emit_insn(Insn::Affinity {
+                    start_reg: target_reg,
+                    count: NonZeroUsize::new(1).unwrap(),
+                    affinities: column.affinity().aff_mask().to_string(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 #[instrument(skip_all, level = Level::DEBUG)]
 #[allow(clippy::too_many_arguments)]
 /// Emits the instructions for the UPDATE loop.
@@ -3092,6 +3173,34 @@ fn emit_update_insns<'a>(
         if !has_relevant_triggers {
             Some(old_registers)
         } else {
+            // Compute VIRTUAL column values for trigger access
+            // VIRTUAL columns are normally NULL (computed on read), but triggers need actual values
+            let columns = target_table.table.columns();
+            let column_lookup: std::collections::HashMap<String, usize> = columns
+                .iter()
+                .enumerate()
+                .filter_map(|(i, col)| col.name.as_ref().map(|name| (name.to_lowercase(), i)))
+                .collect();
+
+            // Compute VIRTUAL columns for NEW values (contiguous registers at 'start')
+            compute_virtual_columns_for_update_triggers(
+                program,
+                columns,
+                start,
+                &column_lookup,
+                &t_ctx.resolver,
+                Some(beg),
+            )?;
+
+            // Compute VIRTUAL columns for OLD values (non-contiguous registers in old_registers slice)
+            compute_virtual_columns_for_old_context(
+                program,
+                columns,
+                &old_registers,
+                &column_lookup,
+                &t_ctx.resolver,
+            )?;
+
             // NEW row values are already in 'start' registers
             let new_registers = (0..col_len)
                 .map(|i| start + i)
@@ -3991,6 +4100,36 @@ fn emit_update_insns<'a>(
             );
             let has_relevant_triggers = relevant_triggers.clone().count() > 0;
             if has_relevant_triggers {
+                // Compute VIRTUAL column values for trigger access
+                // VIRTUAL columns are normally NULL (computed on read), but triggers need actual values
+                let columns = target_table.table.columns();
+                let column_lookup: std::collections::HashMap<String, usize> = columns
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, col)| col.name.as_ref().map(|name| (name.to_lowercase(), i)))
+                    .collect();
+
+                // Compute VIRTUAL columns for NEW values
+                compute_virtual_columns_for_update_triggers(
+                    program,
+                    columns,
+                    start,
+                    &column_lookup,
+                    &t_ctx.resolver,
+                    Some(beg),
+                )?;
+
+                // Compute VIRTUAL columns for OLD values if we have preserved OLD registers
+                if let Some(ref old_regs) = preserved_old_registers {
+                    compute_virtual_columns_for_old_context(
+                        program,
+                        columns,
+                        old_regs,
+                        &column_lookup,
+                        &t_ctx.resolver,
+                    )?;
+                }
+
                 let new_rowid_reg = rowid_set_clause_reg.unwrap_or(beg);
                 let new_registers_after = (0..col_len)
                     .map(|i| start + i)

@@ -107,6 +107,17 @@ pub enum ExprContext<'a> {
         columns: &'a [Column],
         column_lookup: &'a HashMap<String, usize>,
     },
+
+    /// OLD trigger context for UPDATE - VIRTUAL columns are recursively evaluated,
+    /// regular columns are read from pre-loaded OLD registers.
+    /// Unlike UpdateGenerated which uses contiguous registers (registers_start + idx),
+    /// this uses a slice where old_registers[idx] is the register for column idx.
+    /// Used for computing VIRTUAL column values in OLD context for UPDATE triggers.
+    OldGenerated {
+        old_registers: &'a [usize],
+        columns: &'a [Column],
+        column_lookup: &'a HashMap<String, usize>,
+    },
 }
 
 #[allow(dead_code)] // API methods for future use and debugging
@@ -128,7 +139,8 @@ impl<'a> ExprContext<'a> {
             } => *referenced_tables,
             ExprContext::InsertGenerated { .. }
             | ExprContext::UpdateGenerated { .. }
-            | ExprContext::OldImageGenerated { .. } => None,
+            | ExprContext::OldImageGenerated { .. }
+            | ExprContext::OldGenerated { .. } => None,
         }
     }
 
@@ -163,7 +175,8 @@ impl<'a> ExprContext<'a> {
                 }
             }),
             ExprContext::UpdateGenerated { columns, .. }
-            | ExprContext::OldImageGenerated { columns, .. } => columns.iter().find_map(|c| {
+            | ExprContext::OldImageGenerated { columns, .. }
+            | ExprContext::OldGenerated { columns, .. } => columns.iter().find_map(|c| {
                 let col_name = c.name.as_deref().unwrap_or("");
                 if crate::util::normalize_ident(col_name) == normalized && c.is_virtual_generated()
                 {
@@ -370,6 +383,46 @@ impl<'a> ExprContext<'a> {
                     crate::bail_parse_error!("unknown column: {}", name)
                 }
             }
+
+            ExprContext::OldGenerated {
+                old_registers,
+                columns,
+                column_lookup,
+            } => {
+                // Look up column by name in the HashMap
+                if let Some(&col_idx) = column_lookup.get(&col_name.to_lowercase()) {
+                    // Check if this is a virtual generated column
+                    if let Some(col) = columns.get(col_idx) {
+                        if col.is_virtual_generated() {
+                            let gen_expr = col
+                                .generated
+                                .as_ref()
+                                .expect("is_virtual_generated() guarantees generated expr exists");
+                            // Recursive call to translate the virtual column's expression
+                            translate_expr_with_context(
+                                program, self, gen_expr, target_reg, resolver,
+                            )?;
+                            // Apply the VIRTUAL column's affinity to the result.
+                            program.emit_insn(Insn::Affinity {
+                                start_reg: target_reg,
+                                count: std::num::NonZeroUsize::MIN, // 1 register
+                                affinities: col.affinity().aff_mask().to_string(),
+                            });
+                            return Ok(());
+                        }
+                    }
+                    // Regular column - copy from the OLD register for this column
+                    let src_reg = old_registers[col_idx];
+                    program.emit_insn(Insn::Copy {
+                        src_reg,
+                        dst_reg: target_reg,
+                        extra_amount: 0,
+                    });
+                    Ok(())
+                } else {
+                    crate::bail_parse_error!("unknown column: {}", name)
+                }
+            }
         }
     }
 
@@ -398,6 +451,11 @@ impl<'a> ExprContext<'a> {
                         ..
                     }
                     | ExprContext::OldImageGenerated {
+                        column_lookup,
+                        columns,
+                        ..
+                    }
+                    | ExprContext::OldGenerated {
                         column_lookup,
                         columns,
                         ..
@@ -537,7 +595,8 @@ pub fn translate_expr_with_context(
         // For generated column contexts, use the unified implementation
         ExprContext::InsertGenerated { .. }
         | ExprContext::UpdateGenerated { .. }
-        | ExprContext::OldImageGenerated { .. } => {
+        | ExprContext::OldImageGenerated { .. }
+        | ExprContext::OldGenerated { .. } => {
             translate_generated_expr_unified(program, context, expr, target_register, resolver)?;
             Ok(target_register)
         }

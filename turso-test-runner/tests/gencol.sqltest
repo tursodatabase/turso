@@ -1851,10 +1851,9 @@ expect {
 }
 
 # AFTER INSERT trigger accessing VIRTUAL column
-# TODO: Triggers currently don't see computed VIRTUAL column values correctly
-# This test uses STORED column instead to document the limitation
+# VIRTUAL columns are computed on-the-fly, but triggers should see the computed value
 test gencol_trigger_after_insert_virtual {
-    CREATE TABLE t1(a INTEGER, b AS (a * 2) STORED);
+    CREATE TABLE t1(a INTEGER, b AS (a * 2));
     CREATE TABLE log(val INTEGER);
     CREATE TRIGGER trg_insert AFTER INSERT ON t1 BEGIN INSERT INTO log VALUES(NEW.b); END;
     INSERT INTO t1(a) VALUES (5);
@@ -1955,10 +1954,9 @@ expect {
 }
 
 # Trigger with VIRTUAL column in expression
-# TODO: Triggers currently don't see computed VIRTUAL column values correctly
-# Using STORED column instead to document the limitation
+# VIRTUAL column should be accessible and usable in trigger expressions
 test gencol_trigger_virtual_expression {
-    CREATE TABLE t1(a INTEGER, b AS (a + 100) STORED);
+    CREATE TABLE t1(a INTEGER, b AS (a + 100));
     CREATE TABLE log(val INTEGER);
     CREATE TRIGGER trg_expr AFTER INSERT ON t1 BEGIN INSERT INTO log VALUES(NEW.b + 1); END;
     INSERT INTO t1(a) VALUES (5);
@@ -1984,6 +1982,98 @@ expect {
 # Trigger FOR EACH ROW with generated column
 test gencol_trigger_for_each_row {
     CREATE TABLE t1(a INTEGER, b AS (a * 2) STORED);
+    CREATE TABLE log(val INTEGER);
+    CREATE TRIGGER trg_row AFTER INSERT ON t1 FOR EACH ROW BEGIN INSERT INTO log VALUES(NEW.b); END;
+    INSERT INTO t1(a) VALUES (1), (2), (3);
+    SELECT val FROM log ORDER BY val;
+}
+expect {
+    2
+    4
+    6
+}
+
+# Additional VIRTUAL column trigger tests
+# These specifically test that VIRTUAL columns work correctly in triggers
+
+# BEFORE INSERT trigger with VIRTUAL column
+test gencol_trigger_before_insert_virtual {
+    CREATE TABLE t1(a INTEGER, b AS (a + 100));
+    CREATE TABLE log(val INTEGER);
+    CREATE TRIGGER trg_before BEFORE INSERT ON t1 BEGIN INSERT INTO log VALUES(NEW.b); END;
+    INSERT INTO t1(a) VALUES (5);
+    SELECT val FROM log;
+}
+expect {
+    105
+}
+
+# AFTER UPDATE trigger with VIRTUAL column (both OLD and NEW)
+test gencol_trigger_after_update_virtual_old_new {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2));
+    CREATE TABLE log(old_val INTEGER, new_val INTEGER);
+    CREATE TRIGGER trg_update AFTER UPDATE ON t1 BEGIN INSERT INTO log VALUES(OLD.b, NEW.b); END;
+    INSERT INTO t1(a) VALUES (5);
+    UPDATE t1 SET a = 10;
+    SELECT old_val, new_val FROM log;
+}
+expect {
+    10|20
+}
+
+# WHEN clause with VIRTUAL column
+test gencol_trigger_when_virtual {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2));
+    CREATE TABLE log(val INTEGER);
+    CREATE TRIGGER trg_when AFTER INSERT ON t1 WHEN NEW.b > 15 BEGIN INSERT INTO log VALUES(NEW.b); END;
+    INSERT INTO t1(a) VALUES (5);
+    INSERT INTO t1(a) VALUES (10);
+    SELECT val FROM log;
+}
+expect {
+    20
+}
+
+# Chained VIRTUAL columns in trigger
+test gencol_trigger_virtual_chain {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2), c AS (b + 1));
+    CREATE TABLE log(b_val INTEGER, c_val INTEGER);
+    CREATE TRIGGER trg_chain AFTER INSERT ON t1 BEGIN INSERT INTO log VALUES(NEW.b, NEW.c); END;
+    INSERT INTO t1(a) VALUES (5);
+    SELECT b_val, c_val FROM log;
+}
+expect {
+    10|11
+}
+
+# BEFORE UPDATE trigger with VIRTUAL column (tests NEW context)
+test gencol_trigger_before_update_virtual_new {
+    CREATE TABLE t1(a INTEGER, b AS (a * 3));
+    CREATE TABLE log(new_val INTEGER);
+    CREATE TRIGGER trg_before_upd BEFORE UPDATE ON t1 BEGIN INSERT INTO log VALUES(NEW.b); END;
+    INSERT INTO t1(a) VALUES (5);
+    UPDATE t1 SET a = 10;
+    SELECT new_val FROM log;
+}
+expect {
+    30
+}
+
+# Multiple VIRTUAL columns in single trigger
+test gencol_trigger_multiple_virtual {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2), c AS (a * 3), d AS (a * 4));
+    CREATE TABLE log(b_val INTEGER, c_val INTEGER, d_val INTEGER);
+    CREATE TRIGGER trg_multi AFTER INSERT ON t1 BEGIN INSERT INTO log VALUES(NEW.b, NEW.c, NEW.d); END;
+    INSERT INTO t1(a) VALUES (5);
+    SELECT b_val, c_val, d_val FROM log;
+}
+expect {
+    10|15|20
+}
+
+# FOR EACH ROW with VIRTUAL column
+test gencol_trigger_for_each_row_virtual {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2));
     CREATE TABLE log(val INTEGER);
     CREATE TRIGGER trg_row AFTER INSERT ON t1 FOR EACH ROW BEGIN INSERT INTO log VALUES(NEW.b); END;
     INSERT INTO t1(a) VALUES (1), (2), (3);
