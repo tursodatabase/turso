@@ -183,11 +183,20 @@ mod tests {
             .as_secs()
     }
 
+    /// Create a test context with generated columns disabled.
+    /// These tests create random values for all columns, which doesn't work correctly
+    /// with generated columns since their values should be computed from expressions.
+    fn test_context_no_gencol() -> TestContext {
+        let mut ctx = TestContext::default();
+        ctx.opts.table.generated_columns.enable = false;
+        ctx
+    }
+
     #[test]
     fn fuzz_arbitrary_table_true_simple_predicate() {
         let seed = get_seed();
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
-        let context = &TestContext::default();
+        let context = &test_context_no_gencol();
 
         for _ in 0..10000 {
             let table = Table::arbitrary(&mut rng, context);
@@ -216,7 +225,7 @@ mod tests {
     fn fuzz_arbitrary_table_false_simple_predicate() {
         let seed = get_seed();
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
-        let context = &TestContext::default();
+        let context = &test_context_no_gencol();
 
         for _ in 0..10000 {
             let table = Table::arbitrary(&mut rng, context);
@@ -245,7 +254,7 @@ mod tests {
     fn fuzz_arbitrary_row_table_predicate() {
         let seed = get_seed();
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
-        let context = &TestContext::default();
+        let context = &test_context_no_gencol();
 
         for _ in 0..10000 {
             let table = Table::arbitrary(&mut rng, context);
@@ -273,7 +282,7 @@ mod tests {
     fn fuzz_arbitrary_true_table_predicate() {
         let seed = get_seed();
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
-        let context = &TestContext::default();
+        let context = &test_context_no_gencol();
 
         for _ in 0..10000 {
             let mut table = Table::arbitrary(&mut rng, context);
@@ -302,7 +311,7 @@ mod tests {
     fn fuzz_arbitrary_false_table_predicate() {
         let seed = get_seed();
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
-        let context = &TestContext::default();
+        let context = &test_context_no_gencol();
 
         for _ in 0..10000 {
             let mut table = Table::arbitrary(&mut rng, context);

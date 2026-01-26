@@ -4,6 +4,7 @@ use anarchist_readable_name_generator_lib::readable_name_custom;
 use rand::{distr::uniform::SampleUniform, Rng};
 
 pub mod expr;
+pub mod generated_expr;
 pub mod opts;
 pub mod predicate;
 pub mod query;

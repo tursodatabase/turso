@@ -1,3 +1,4 @@
+use crate::generation::generated_expr::extract_column_refs;
 use crate::generation::{
     gen_random_text, pick_index, pick_n_unique, pick_unique, Arbitrary, ArbitraryFrom,
     ArbitrarySized, GenerationContext,
@@ -244,26 +245,58 @@ impl Arbitrary for Insert {
         let opts = &env.opts().query.insert;
         let gen_values = |rng: &mut R| {
             let table = pick(env.tables(), rng);
+
+            // Filter out generated columns
+            let non_generated_columns: Vec<_> =
+                table.columns.iter().filter(|c| !c.is_generated()).collect();
+
+            // If all columns are generated, skip this table
+            if non_generated_columns.is_empty() {
+                return None;
+            }
+
             let num_rows = rng.random_range(opts.min_rows.get()..opts.max_rows.get());
             let values: Vec<Vec<SimValue>> = (0..num_rows)
                 .map(|_| {
-                    table
-                        .columns
+                    non_generated_columns
                         .iter()
                         .map(|c| SimValue::arbitrary_from(rng, env, &c.column_type))
                         .collect()
                 })
                 .collect();
-            Some(Insert::Values {
-                table: table.name.clone(),
-                values,
-            })
+
+            // Check if the table has any generated columns
+            let has_generated = table.columns.iter().any(|c| c.is_generated());
+
+            if has_generated {
+                // Use explicit column list
+                Some(Insert::ValuesWithColumns {
+                    table: table.name.clone(),
+                    columns: non_generated_columns
+                        .iter()
+                        .map(|c| c.name.clone())
+                        .collect(),
+                    values,
+                })
+            } else {
+                // No generated columns, use simple Values variant
+                Some(Insert::Values {
+                    table: table.name.clone(),
+                    values,
+                })
+            }
         };
 
         // we keep this here for now, because gen_select does not generate subqueries, and they're
         // important for surfacing bugs.
         let gen_nested_self_insert = |rng: &mut R| {
             let table = pick(env.tables(), rng);
+
+            // Skip tables with generated columns - INSERT INTO ... SELECT * doesn't work
+            // because SELECT * includes generated columns which can't be inserted
+            if table.columns.iter().any(|c| c.is_generated()) {
+                return None;
+            }
 
             const MAX_SELF_INSERT_DEPTH: i32 = 5;
             let nesting_depth = rng.random_range(1..=MAX_SELF_INSERT_DEPTH);
@@ -299,8 +332,12 @@ impl Arbitrary for Insert {
         };
 
         let gen_select = |rng: &mut R| {
-            // Find a non-empty table
-            let select_table = env.tables().iter().find(|t| !t.rows.is_empty())?;
+            // Find a non-empty table without generated columns
+            // INSERT INTO ... SELECT * doesn't work with generated columns
+            let select_table = env
+                .tables()
+                .iter()
+                .find(|t| !t.rows.is_empty() && !t.columns.iter().any(|c| c.is_generated()))?;
             let row = pick(&select_table.rows, rng);
             let predicate = Predicate::arbitrary_from(rng, env, (select_table, row));
             // TODO change for arbitrary_sized and insert from arbitrary tables
@@ -403,8 +440,20 @@ impl Arbitrary for CreateIndex {
 impl Arbitrary for Update {
     fn arbitrary<R: Rng + ?Sized, C: GenerationContext>(rng: &mut R, env: &C) -> Self {
         let table = pick(env.tables(), rng);
-        let num_cols = rng.random_range(1..=table.columns.len());
-        let columns = pick_unique(&table.columns, num_cols, rng);
+
+        // Filter out generated columns - they cannot be directly updated
+        let updatable_columns: Vec<_> =
+            table.columns.iter().filter(|c| !c.is_generated()).collect();
+
+        // Tables must have at least one non-generated column per SQLite rules
+        assert!(
+            !updatable_columns.is_empty(),
+            "Table '{}' has no non-generated columns - this violates SQLite constraints",
+            table.name
+        );
+
+        let num_cols = rng.random_range(1..=updatable_columns.len());
+        let columns = pick_unique(&updatable_columns, num_cols, rng);
         let set_values: Vec<(String, SimValue)> = columns
             .map(|column| {
                 (
@@ -451,13 +500,37 @@ const ALTER_TABLE_NO_ALTER_COL_NO_DROP: &[AlterTableTypeDiscriminants] = &[
 // is only called for `DropColumn`
 fn get_column_diff(table: &Table) -> IndexSet<&str> {
     // Columns that are referenced in INDEXES cannot be dropped
-    let column_cannot_drop = table
+    let mut column_cannot_drop: IndexSet<&str> = table
         .indexes
         .iter()
         .flat_map(|index| index.columns.iter().map(|(col_name, _)| col_name.as_str()))
-        .collect::<IndexSet<_>>();
+        .collect();
+
+    // Columns that are referenced by GENERATED columns cannot be dropped
+    for col in &table.columns {
+        if let Some(expr) = col.generated_expr() {
+            let refs = extract_column_refs(expr);
+            for ref_name in refs {
+                if let Some(ref_col) = table.columns.iter().find(|c| c.name == ref_name) {
+                    column_cannot_drop.insert(ref_col.name.as_str());
+                }
+            }
+        }
+    }
+
+    // If dropping would leave only generated columns, protect all non-generated columns
+    let non_generated_count = table.columns.iter().filter(|c| !c.is_generated()).count();
+    if non_generated_count <= 1 {
+        // All non-generated columns are protected
+        for col in &table.columns {
+            if !col.is_generated() {
+                column_cannot_drop.insert(col.name.as_str());
+            }
+        }
+    }
+
     if column_cannot_drop.len() == table.columns.len() {
-        // Optimization: all columns are present in indexes so we do not need to but the table column set
+        // Optimization: all columns cannot be dropped
         return IndexSet::new();
     }
 

@@ -246,6 +246,22 @@ pub fn execute_interaction_turso(
             if skip_shadow {
                 return Ok(ExecutionContinuation::NextInteractionOutsideThisProperty);
             }
+
+            // Only propagate shadow errors if the query succeeded - if the query failed,
+            // the shadow might also fail for the same reason (e.g., table already exists)
+            // and that's expected behavior.
+            let query_succeeded = stack.last().is_some_and(|r| r.is_ok());
+            if query_succeeded {
+                interaction
+                    .shadow(&mut env.get_conn_tables_mut(connection_index))
+                    .map_err(|e| {
+                        LimboError::InternalError(format!("shadow operation failed: {e}"))
+                    })?;
+            } else {
+                // Query failed, ignore shadow errors
+                let _ = interaction.shadow(&mut env.get_conn_tables_mut(connection_index));
+            }
+            return Ok(ExecutionContinuation::NextInteraction);
         }
         InteractionType::FsyncQuery(query) => {
             let conn = {
@@ -303,9 +319,10 @@ pub fn execute_interaction_turso(
             if !env.profile.experimental_mvcc && env.rng.random_ratio(1, 10) {
                 limbo_integrity_check(&conn)?;
             }
+            // FaultyQuery doesn't need special shadow handling
+            let _ = interaction.shadow(&mut env.get_conn_tables_mut(connection_index));
         }
     }
-    let _ = interaction.shadow(&mut env.get_conn_tables_mut(connection_index));
     Ok(ExecutionContinuation::NextInteraction)
 }
 
@@ -359,8 +376,20 @@ fn execute_interaction_rusqlite(
                 return Err(err.clone());
             }
             tracing::debug!("{:?}", results);
-            stack.push(results);
+            stack.push(results.clone());
             env.update_conn_last_interaction(interaction.connection_index, Some(query));
+
+            // Only propagate shadow errors if the query succeeded
+            if results.is_ok() {
+                interaction
+                    .shadow(&mut env.get_conn_tables_mut(interaction.connection_index))
+                    .map_err(|e| {
+                        LimboError::InternalError(format!("shadow operation failed: {e}"))
+                    })?;
+            } else {
+                let _ =
+                    interaction.shadow(&mut env.get_conn_tables_mut(interaction.connection_index));
+            }
         }
         InteractionType::FsyncQuery(..) => {
             unimplemented!("cannot implement fsync query in rusqlite, as we do not control IO");
@@ -385,8 +414,6 @@ fn execute_interaction_rusqlite(
             unimplemented!("cannot implement faulty query in rusqlite, as we do not control IO");
         }
     }
-
-    let _ = interaction.shadow(&mut env.get_conn_tables_mut(interaction.connection_index));
     Ok(ExecutionContinuation::NextInteraction)
 }
 
