@@ -613,6 +613,24 @@ pub fn emit_upsert(
                     count: NonZeroUsize::new(1).unwrap(),
                     affinities: table_column.affinity().aff_mask().to_string(),
                 });
+
+                // Check NOT NULL constraint for recomputed STORED generated column
+                // In UPSERT DO UPDATE, constraint violations always abort (no IGNORE mode)
+                if table_column.notnull() {
+                    program.emit_insn(Insn::HaltIfNull {
+                        target_reg,
+                        err_code: SQLITE_CONSTRAINT_NOTNULL,
+                        description: format!(
+                            "{}.{}",
+                            table.get_name(),
+                            table_column
+                                .name
+                                .as_ref()
+                                .expect("Column name must be present")
+                        ),
+                    });
+                }
+
                 // Mark this column as recomputed so dependent columns will also be recomputed
                 updated_col_set.insert(idx);
             }

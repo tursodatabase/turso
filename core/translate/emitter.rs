@@ -2692,6 +2692,36 @@ fn emit_update_column_values<'a>(
                     count: NonZeroUsize::new(1).unwrap(),
                     affinities: table_column.affinity().aff_mask().to_string(),
                 });
+
+                // Check NOT NULL constraint for recomputed STORED generated column
+                if table_column.notnull() {
+                    match or_conflict {
+                        ResolveType::Ignore => {
+                            // For IGNORE, skip this row on NOT NULL violation
+                            program.emit_insn(Insn::IsNull {
+                                reg: target_reg,
+                                target_pc: skip_row_label,
+                            });
+                        }
+                        _ => {
+                            // Generated columns have no DEFAULT, always ABORT on NULL
+                            use crate::error::SQLITE_CONSTRAINT_NOTNULL;
+                            program.emit_insn(Insn::HaltIfNull {
+                                target_reg,
+                                err_code: SQLITE_CONSTRAINT_NOTNULL,
+                                description: format!(
+                                    "{}.{}",
+                                    table_name,
+                                    table_column
+                                        .name
+                                        .as_ref()
+                                        .expect("Column name must be present")
+                                ),
+                            });
+                        }
+                    }
+                }
+
                 // Mark this column as recomputed so dependent columns will also be recomputed
                 updated_col_set.insert(idx);
             }

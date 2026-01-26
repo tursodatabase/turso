@@ -1746,16 +1746,92 @@ expect error {
 # TODO: Add this test when CHECK is implemented
 
 # Constraint validation on UPDATE - NOT NULL
-# TODO: NOT NULL constraint validation on UPDATE for STORED generated columns
-# Currently, TursoDB does not enforce NOT NULL on UPDATE for generated columns
+# NOT NULL constraint should be enforced when STORED generated columns are recomputed
+
+# Basic NOT NULL violation on UPDATE (default ABORT behavior)
 test gencol_constraint_notnull_on_update {
     CREATE TABLE t1(a INTEGER, b AS (a * 2) STORED NOT NULL);
     INSERT INTO t1(a) VALUES (5);
     UPDATE t1 SET a = NULL;
+}
+expect error {
+    NOT NULL constraint failed: t1.b
+}
+
+# Verify row is unchanged after ABORT
+test gencol_constraint_notnull_on_update_verify_unchanged {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2) STORED NOT NULL);
+    INSERT INTO t1(a) VALUES (5);
+    UPDATE OR ABORT t1 SET a = NULL;
+    SELECT a, b FROM t1;
+}
+expect error {
+    NOT NULL constraint failed: t1.b
+}
+
+# UPDATE OR IGNORE should skip the row silently
+test gencol_constraint_notnull_on_update_or_ignore {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2) STORED NOT NULL);
+    INSERT INTO t1(a) VALUES (5);
+    UPDATE OR IGNORE t1 SET a = NULL;
     SELECT a, b FROM t1;
 }
 expect {
-    |
+    5|10
+}
+
+# UPDATE OR REPLACE - should abort since generated columns have no default
+test gencol_constraint_notnull_on_update_or_replace {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2) STORED NOT NULL);
+    INSERT INTO t1(a) VALUES (5);
+    UPDATE OR REPLACE t1 SET a = NULL;
+}
+expect error {
+    NOT NULL constraint failed: t1.b
+}
+
+# UPSERT DO UPDATE with NOT NULL violation on generated column
+test gencol_constraint_notnull_on_upsert_do_update {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, a INTEGER, b AS (a * 2) STORED NOT NULL);
+    INSERT INTO t1(id, a) VALUES (1, 5);
+    INSERT INTO t1(id, a) VALUES (1, NULL) ON CONFLICT(id) DO UPDATE SET a = excluded.a;
+}
+expect error {
+    NOT NULL constraint failed: t1.b
+}
+
+# Chained generated columns - NOT NULL on dependent column
+test gencol_constraint_notnull_on_update_chained {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2) STORED, c AS (b + 1) STORED NOT NULL);
+    INSERT INTO t1(a) VALUES (5);
+    UPDATE t1 SET a = NULL;
+}
+expect error {
+    NOT NULL constraint failed: t1.c
+}
+
+# Multiple rows - only row with NULL violation should be affected with IGNORE
+test gencol_constraint_notnull_on_update_multiple_rows_ignore {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, a INTEGER, b AS (a * 2) STORED NOT NULL);
+    INSERT INTO t1(id, a) VALUES (1, 5), (2, 10), (3, 15);
+    UPDATE OR IGNORE t1 SET a = CASE WHEN id = 2 THEN NULL ELSE a * 2 END;
+    SELECT id, a, b FROM t1 ORDER BY id;
+}
+expect {
+    1|10|20
+    2|10|20
+    3|30|60
+}
+
+# NOT NULL on generated column, regular column update that doesn't affect it
+test gencol_constraint_notnull_on_update_unrelated_column {
+    CREATE TABLE t1(a INTEGER, b INTEGER, c AS (a * 2) STORED NOT NULL);
+    INSERT INTO t1(a, b) VALUES (5, 100);
+    UPDATE t1 SET b = 200;
+    SELECT a, b, c FROM t1;
+}
+expect {
+    5|200|10
 }
 
 # -----------------------------------------------------------------------------
