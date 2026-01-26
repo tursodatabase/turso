@@ -25,9 +25,11 @@ expect {
 
 # Snapshot test for EXPLAIN output
 # This captures the query execution plan
+# Should fail as we have 2 statements
 @setup schema
 @setup data
 snapshot query-plan-by-id {
+    SELECT * FROM users WHERE id = 1;
     SELECT * FROM users WHERE id = 1;
 }
 
