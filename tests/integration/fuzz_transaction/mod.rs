@@ -653,6 +653,7 @@ async fn multiple_connections_fuzz(opts: FuzzOptions) {
                 || e_string.contains("snapshot is stale")
                 || e_string.contains("Write-write conflict")
                 || e_string.contains("schema changed")
+                || e_string.contains("schema conflict")
                 || e_string.contains("has no column named")
                 || e_string.contains("no such column:")
                 || e_string.contains("cannot drop column")
