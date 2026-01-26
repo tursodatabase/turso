@@ -608,7 +608,7 @@ async fn run_single_test<B: SqlBackend>(
                 file: file_path_for_panic,
                 database: db_config_for_panic,
                 outcome: TestOutcome::Error {
-                    message: format!("panic: {}", panic_message),
+                    message: format!("panic: {panic_message}"),
                 },
                 duration: start.elapsed(),
             }
