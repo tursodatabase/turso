@@ -1294,14 +1294,12 @@ impl Program {
                 match self.step_end_mvcc_txn(state_machine, mv_store)? {
                     IOResult::Done(_) => {
                         assert!(state_machine.is_finalized());
-                        *conn.mv_tx.write() = None;
+                        conn.set_mv_tx(None);
                         conn.set_tx_state(TransactionState::None);
                         program_state.commit_state = CommitState::Ready;
                         return Ok(IOResult::Done(()));
                     }
-                    IOResult::IO(io) => {
-                        return Ok(IOResult::IO(io));
-                    }
+                    IOResult::IO(io) => return Ok(IOResult::IO(io)),
                 }
             }
             Ok(IOResult::Done(()))
