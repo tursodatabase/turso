@@ -6,6 +6,7 @@ use opts::{Opts, TxMode};
 use rand::rngs::StdRng;
 #[cfg(not(feature = "antithesis"))]
 use rand::{Rng, SeedableRng};
+#[cfg(shuttle)]
 use shuttle::scheduler::Scheduler;
 use std::collections::HashSet;
 use std::io::Write;
@@ -565,7 +566,13 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .enable_all()
         .build()?;
 
-    rt.block_on(async_main())
+    let opts = Opts::parse();
+    if opts.seed.is_some() {
+        eprintln!("seed is only supporte when building with --cfg shuttle");
+        std::process::exit(1);
+    }
+
+    rt.block_on(Box::pin(async_main(opts.clone())))
 }
 
 #[cfg(shuttle)]
@@ -576,38 +583,31 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     config.stack_size *= 10;
     config.max_steps = shuttle::MaxSteps::FailAfter(10_000_000);
 
-    // Parse opts before runner to get seed for scheduler
     let mut opts = Opts::parse();
     let seed = opts.seed.unwrap_or_else(rand::random);
-    opts.seed = Some(seed); // Store the resolved seed back into opts
+    opts.seed = Some(seed);
     eprintln!("Using seed: {seed}");
 
     let scheduler: Box<dyn Scheduler + Send> = if opts.check_uncontrolled_nondeterminism {
         opts.nr_threads = 5;
         opts.nr_iterations = 10;
-        Box::new(UncontrolledNondeterminismCheckScheduler::new(RandomScheduler::new(1)))
+        Box::new(UncontrolledNondeterminismCheckScheduler::new(
+            RandomScheduler::new(1),
+        ))
     } else {
         Box::new(RandomScheduler::new_from_seed(seed, 1))
     };
 
     let runner = shuttle::Runner::new(scheduler, config);
-    runner.run(move || {
-        shuttle::future::block_on(Box::pin(async_main_with_opts(opts.clone().clone()))).unwrap()
-    });
+    runner.run(move || shuttle::future::block_on(Box::pin(async_main(opts.clone()))).unwrap());
     Ok(())
 }
 
-async fn async_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let opts = Opts::parse();
-    async_main_with_opts(opts).await
-}
-
-async fn async_main_with_opts(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (_guard, reload_handle) = init_tracing()?;
 
     spawn_log_level_watcher(reload_handle);
 
-    // Initialize seed
     #[cfg(feature = "antithesis")]
     let global_seed: u64 = {
         if opts.seed.is_some() {
@@ -660,7 +660,6 @@ async fn async_main_with_opts(opts: Opts) -> Result<(), Box<dyn std::error::Erro
 
     let vfs_option = opts.vfs.clone();
 
-    // Create all connections on main thread and execute DDL
     for thread in 0..opts.nr_threads {
         if stop {
             break;
@@ -686,7 +685,6 @@ async fn async_main_with_opts(opts: Opts) -> Result<(), Box<dyn std::error::Erro
 
         conn.execute("PRAGMA data_sync_retry = 1", ()).await?;
 
-        // Apply each DDL statement individually
         for stmt in &ddl_statements {
             if opts.verbose {
                 println!("executing ddl {stmt}");
@@ -740,9 +738,6 @@ async fn async_main_with_opts(opts: Opts) -> Result<(), Box<dyn std::error::Erro
         let busy_timeout = opts.busy_timeout;
         let tx_mode = opts.tx_mode;
 
-        // Each thread gets its own RNG seeded deterministically
-        let thread_seed = global_seed.wrapping_add(thread as u64);
-
         let handle = turso_stress::future::spawn(async move {
             let mut conn = db.lock().await.connect()?;
 
@@ -752,8 +747,7 @@ async fn async_main_with_opts(opts: Opts) -> Result<(), Box<dyn std::error::Erro
 
             println!("\rthread#{thread} Executing queries...");
 
-            // Thread-local RNG for JIT query generation
-            let mut rng = ThreadRng::new(thread_seed);
+            let mut rng = ThreadRng::new(global_seed.wrapping_add(thread as u64));
 
             for i in 0..nr_iterations {
                 if gen_bool(&mut rng, 0.0) {
@@ -781,7 +775,6 @@ async fn async_main_with_opts(opts: Opts) -> Result<(), Box<dyn std::error::Erro
                     conn.busy_timeout(std::time::Duration::from_millis(busy_timeout))?;
                 }
 
-                // JIT: Generate transaction wrapper
                 let tx = if rng.get_random() % 2 == 0 {
                     match tx_mode {
                         TxMode::SQLite => Some("BEGIN;"),
@@ -802,7 +795,6 @@ async fn async_main_with_opts(opts: Opts) -> Result<(), Box<dyn std::error::Erro
                     }
                 }
 
-                // JIT: Generate random statement
                 let sql = generate_random_statement(&mut rng, &schema_for_task);
 
                 if !silent {
@@ -822,7 +814,7 @@ async fn async_main_with_opts(opts: Opts) -> Result<(), Box<dyn std::error::Erro
                 if let Err(e) = conn.execute(&sql, ()).await {
                     match e {
                         turso::Error::Corrupt(e) => {
-                            panic!("thread#{thread} Error[FATAL] executing query: {}", e);
+                            panic!("thread#{thread} Error[FATAL] executing query: {e}");
                         }
                         turso::Error::Constraint(e) => {
                             if verbose {
@@ -846,14 +838,13 @@ async fn async_main_with_opts(opts: Opts) -> Result<(), Box<dyn std::error::Erro
                         turso::Error::IoError(kind) => {
                             eprintln!("thread#{thread} I/O error ({kind:?}), continuing...");
                         }
-                        _ => panic!("thread#{thread} Error[FATAL] executing query: {}", e),
+                        _ => panic!("thread#{thread} Error[FATAL] executing query: {e}"),
                     }
                 }
                 if verbose {
                     eprintln!("thread#{thread}(end): {sql}");
                 }
 
-                // Commit or rollback transaction
                 if tx.is_some() {
                     let end_tx = if rng.get_random() % 2 == 0 {
                         "COMMIT;"
@@ -880,7 +871,7 @@ async fn async_main_with_opts(opts: Opts) -> Result<(), Box<dyn std::error::Erro
                         Ok(Some(row)) => {
                             let value = row.get_value(0).unwrap();
                             if value != "ok".into() {
-                                panic!("thread#{thread} integrity check failed: {:?}", value);
+                                panic!("thread#{thread} integrity check failed: {value:?}");
                             }
                         }
                         Ok(None) => {
@@ -912,7 +903,6 @@ async fn async_main_with_opts(opts: Opts) -> Result<(), Box<dyn std::error::Erro
     for handle in handles {
         handle.await??;
     }
-    println!("Done.");
     println!("Database file: {db_file}");
 
     // Switch back to WAL mode before SQLite integrity check if we were in MVCC mode.
