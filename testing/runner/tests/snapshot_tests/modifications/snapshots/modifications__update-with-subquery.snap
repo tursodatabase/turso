@@ -1,0 +1,16 @@
+---
+source: modifications.sqltest
+expression: "UPDATE inventory\n    SET stock = (\n        SELECT SUM(quantity)\n        FROM orders\n        WHERE orders.product_id = inventory.product_id\n    )\n    WHERE warehouse = 'Main';"
+info:
+  statement_type: UPDATE
+  tables:
+    - inventory
+    - orders
+  setup_blocks:
+    - schema
+  database: ":memory:"
+---
+QUERY PLAN
+
+
+BYTECODE

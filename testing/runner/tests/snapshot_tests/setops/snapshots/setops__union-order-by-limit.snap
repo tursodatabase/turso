@@ -1,0 +1,16 @@
+---
+source: setops.sqltest
+expression: "SELECT name, department FROM current_employees\n    UNION\n    SELECT name, department FROM former_employees\n    ORDER BY name\n    LIMIT 5;"
+info:
+  statement_type: SELECT
+  tables:
+    - current_employees
+    - former_employees
+  setup_blocks:
+    - schema
+  database: ":memory:"
+---
+QUERY PLAN
+
+
+BYTECODE

@@ -1,0 +1,54 @@
+---
+source: subqueries.sqltest
+expression: "SELECT p.id, p.name, p.price\n    FROM products p\n    WHERE EXISTS (\n        SELECT 1\n        FROM order_items oi\n        JOIN orders o ON o.id = oi.order_id\n        WHERE oi.product_id = p.id\n            AND o.order_date >= '2024-01-01'\n    );"
+info:
+  statement_type: SELECT
+  tables:
+    - o.id
+    - order_items
+    - orders
+    - products
+  setup_blocks:
+    - schema
+  database: ":memory:"
+---
+QUERY PLAN
+|--SCAN products AS p
+|--SEARCH oi USING INDEX idx_order_items_product
+`--SEARCH o USING INTEGER PRIMARY KEY (rowid=?)
+
+BYTECODE
+addr  opcode              p1  p2  p3  p4              p5  comment
+   0    Init               0  30   0                   0  Start at 30
+   1    OpenRead           0   2   0  k(5,B,B,B,B,B)   0  table=products, root=2, iDb=0
+   2    Rewind             0  29   0                   0  Rewind table products
+   3      BeginSubrtn      5   0   0                   0  r[5]=NULL
+   4      Integer          0   1   0                   0  r[1]=0
+   5      Integer          1   7   0                   0  r[7]=1; LIMIT counter
+   6      IfNot            7  21   0                   0  if !r[7] goto 21
+   7      OpenRead         1   5   0  k(5,B,B,B,B,B)   0  table=order_items, root=5, iDb=0
+   8      OpenRead         2  11   0  k(2,B)           0  index=idx_order_items_product, root=11, iDb=0
+   9      OpenRead         3   4   0  k(4,B,B,B,B)     0  table=orders, root=4, iDb=0
+  10      RowId            0   8   0                   0  r[8]=products.rowid
+  11      SeekGE           2  21   8                   0  key=[8..8]
+  12        IdxGT          2  21   8                   0  key=[8..8]
+  13        DeferredSeek   2   1   0                   0
+  14        Column         1   1   9                   0  r[9]=order_items.order_id
+  15        SeekRowid      3   9  20                   0  if (r[9]!=cursor 3 for table orders.rowid) goto 20
+  16        Column         3   2  11                   0  r[11]=orders.order_date
+  17        Lt            11  12  20  Binary           0  if r[11]<r[12] goto 20
+  18        Integer        1   1   0                   0  r[1]=1
+  19        DecrJumpZero   7  21   0                   0  if (--r[7]==0) goto 21
+  20      Next             2  12   0                   0
+  21    Return             5   0   1                   0
+  22    IfNot              1  28   1                   0  if !r[1] goto 28
+  23    RowId              0   2   0                   0  r[2]=products.rowid
+  24    Column             0   1   3                   0  r[3]=products.name
+  25    Column             0   3   4                   0  r[4]=products.price
+  26    RealAffinity       4   0   0                   0
+  27    ResultRow          2   3   0                   0  output=r[2..4]
+  28  Next                 0   3   0                   0
+  29  Halt                 0   0   0                   0
+  30  Transaction          0   1  11                   0  iDb=0 tx_mode=Read
+  31  String8              0  12   0  2024-01-01       0  r[12]='2024-01-01'
+  32  Goto                 0   1   0                   0

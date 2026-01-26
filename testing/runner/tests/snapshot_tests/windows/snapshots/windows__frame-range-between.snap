@@ -1,0 +1,15 @@
+---
+source: windows.sqltest
+expression: "SELECT\n        emp_id,\n        name,\n        salary,\n        SUM(salary) OVER (\n            ORDER BY salary\n            RANGE BETWEEN 10000 PRECEDING AND 10000 FOLLOWING\n        ) AS similar_salary_sum\n    FROM employees;"
+info:
+  statement_type: SELECT
+  tables:
+    - employees
+  setup_blocks:
+    - schema
+  database: ":memory:"
+---
+QUERY PLAN
+
+
+BYTECODE

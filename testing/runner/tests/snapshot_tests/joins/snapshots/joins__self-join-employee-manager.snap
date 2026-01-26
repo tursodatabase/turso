@@ -1,0 +1,38 @@
+---
+source: joins.sqltest
+expression: "SELECT\n        e.employee_id,\n        e.name AS employee_name,\n        e.department,\n        m.name AS manager_name\n    FROM\n        employees e\n    LEFT OUTER JOIN employees m ON e.manager_id = m.employee_id;"
+info:
+  statement_type: SELECT
+  tables:
+    - e.manager_id
+    - employees
+  setup_blocks:
+    - schema
+  database: ":memory:"
+---
+QUERY PLAN
+|--SCAN employees AS e
+`--SEARCH m USING INTEGER PRIMARY KEY (rowid=?)
+
+BYTECODE
+addr  opcode       p1  p2  p3  p4              p5  comment
+   0  Init          0  18   0                   0  Start at 18
+   1  OpenRead      0   6   0  k(5,B,B,B,B,B)   0  table=employees, root=6, iDb=0
+   2  OpenRead      1   6   0  k(5,B,B,B,B,B)   0  table=employees, root=6, iDb=0
+   3  Rewind        0  17   0                   0  Rewind table employees
+   4    Integer     0   5   0                   0  r[5]=0
+   5    Column      0   2   6                   0  r[6]=employees.manager_id
+   6    SeekRowid   1   6  13                   0  if (r[6]!=cursor 1 for table employees.rowid) goto 13
+   7    Integer     1   5   0                   0  r[5]=1
+   8    RowId       0   1   0                   0  r[1]=employees.rowid
+   9    Column      0   1   2                   0  r[2]=employees.name
+  10    Column      0   3   3                   0  r[3]=employees.department
+  11    Column      1   1   4                   0  r[4]=employees.name
+  12    ResultRow   1   4   0                   0  output=r[1..4]
+  13    IfPos       5  16   0                   0  r[5]>0 -> r[5]-=0, goto 16
+  14    NullRow     1   0   0                   0  Set cursor 1 to a (pseudo) NULL row
+  15    Goto        0   7   0                   0
+  16  Next          0   4   0                   0
+  17  Halt          0   0   0                   0
+  18  Transaction   0   1  10                   0  iDb=0 tx_mode=Read
+  19  Goto          0   1   0                   0

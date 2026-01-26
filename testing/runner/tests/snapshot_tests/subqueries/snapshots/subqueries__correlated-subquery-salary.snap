@@ -1,0 +1,52 @@
+---
+source: subqueries.sqltest
+expression: "SELECT e.id, e.name, e.department, e.salary\n    FROM employees e\n    WHERE e.salary > (\n        SELECT avg(e2.salary)\n        FROM employees e2\n        WHERE e2.department = e.department\n    );"
+info:
+  statement_type: SELECT
+  tables:
+    - employees
+  setup_blocks:
+    - schema
+  database: ":memory:"
+---
+QUERY PLAN
+|--SCAN employees AS e
+`--SCAN employees AS e2
+
+BYTECODE
+addr  opcode              p1  p2  p3  p4              p5  comment
+   0    Init               0  33   0                   0  Start at 33
+   1    OpenRead           0   7   0  k(5,B,B,B,B,B)   0  table=employees, root=7, iDb=0
+   2    Rewind             0  32   0                   0  Rewind table employees
+   3      BeginSubrtn      6   0   0                   0  r[6]=NULL
+   4      Null             0   1   0                   0  r[1]=NULL
+   5      Null             0   8   0                   0  r[8]=NULL
+   6      Integer          1   9   0                   0  r[9]=1; LIMIT counter
+   7      IfNot            9  17   0                   0  if !r[9] goto 17
+   8      OpenRead         1   7   0  k(5,B,B,B,B,B)   0  table=employees, root=7, iDb=0
+   9      Rewind           1  17   0                   0  Rewind table employees
+  10        Column         1   3  11                   0  r[11]=employees.department
+  11        Column         0   3  12                   0  r[12]=employees.department
+  12        Ne            11  12  16  Binary           0  if r[11]!=r[12] goto 16
+  13        Column         1   4  13                   0  r[13]=employees.salary
+  14        RealAffinity  13   0   0                   0
+  15        AggStep        0  13   8  avg              0  accum=r[8] step(r[13])
+  16      Next             1  10   0                   0
+  17      AggFinal         0   8   0  avg              0  accum=r[8]
+  18      Copy             8   7   0                   0  r[7]=r[8]
+  19      Copy             7   1   0                   0  r[1]=r[7]
+  20    Return             6   0   1                   0
+  21    Column             0   4  15                   0  r[15]=employees.salary
+  22    RealAffinity      15   0   0                   0
+  23    Copy               1  16   0                   0  r[16]=r[1]
+  24    Le                15  16  31  Binary           0  if r[15]<=r[16] goto 31
+  25    RowId              0   2   0                   0  r[2]=employees.rowid
+  26    Column             0   1   3                   0  r[3]=employees.name
+  27    Column             0   3   4                   0  r[4]=employees.department
+  28    Column             0   4   5                   0  r[5]=employees.salary
+  29    RealAffinity       5   0   0                   0
+  30    ResultRow          2   4   0                   0  output=r[2..5]
+  31  Next                 0   3   0                   0
+  32  Halt                 0   0   0                   0
+  33  Transaction          0   1  11                   0  iDb=0 tx_mode=Read
+  34  Goto                 0   1   0                   0

@@ -1,0 +1,44 @@
+---
+source: joins.sqltest
+expression: "SELECT\n        c.customer_id,\n        c.name,\n        o.order_id,\n        o.order_date\n    FROM\n        customers c\n    LEFT OUTER JOIN orders o ON c.customer_id = o.customer_id;"
+info:
+  statement_type: SELECT
+  tables:
+    - c.customer_id
+    - customers
+    - orders
+  setup_blocks:
+    - schema
+  database: ":memory:"
+---
+QUERY PLAN
+|--SCAN customers AS c
+`--SEARCH o USING INDEX idx_orders_customer_id
+
+BYTECODE
+addr  opcode            p1  p2  p3  p4              p5  comment
+   0  Init               0  23   0                   0  Start at 23
+   1  OpenRead           0   2   0  k(5,B,B,B,B,B)   0  table=customers, root=2, iDb=0
+   2  OpenRead           1   4   0  k(5,B,B,B,B,B)   0  table=orders, root=4, iDb=0
+   3  OpenRead           2   8   0  k(2,B)           0  index=idx_orders_customer_id, root=8, iDb=0
+   4  Rewind             0  22   0                   0  Rewind table customers
+   5    Integer          0   5   0                   0  r[5]=0
+   6    RowId            0   6   0                   0  r[6]=customers.rowid
+   7    SeekGE           2  17   6                   0  key=[6..6]
+   8      IdxGT          2  17   6                   0  key=[6..6]
+   9      DeferredSeek   2   1   0                   0
+  10      Integer        1   5   0                   0  r[5]=1
+  11      RowId          0   1   0                   0  r[1]=customers.rowid
+  12      Column         0   1   2                   0  r[2]=customers.name
+  13      IdxRowId       2   3   0                   0  r[3]=cursor 2 for index idx_orders_customer_id.rowid
+  14      Column         1   2   4                   0  r[4]=orders.order_date
+  15      ResultRow      1   4   0                   0  output=r[1..4]
+  16    Next             2   8   0                   0
+  17    IfPos            5  21   0                   0  r[5]>0 -> r[5]-=0, goto 21
+  18    NullRow          1   0   0                   0  Set cursor 1 to a (pseudo) NULL row
+  19    NullRow          2   0   0                   0  Set cursor 2 to a (pseudo) NULL row
+  20    Goto             0  10   0                   0
+  21  Next               0   5   0                   0
+  22  Halt               0   0   0                   0
+  23  Transaction        0   1  10                   0  iDb=0 tx_mode=Read
+  24  Goto               0   1   0                   0

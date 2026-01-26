@@ -1,0 +1,33 @@
+---
+source: aggregation.sqltest
+expression: "SELECT\n        MIN(amount) as min_sale,\n        MAX(amount) as max_sale\n    FROM\n        sales;"
+info:
+  statement_type: SELECT
+  tables:
+    - sales
+  setup_blocks:
+    - schema
+  database: ":memory:"
+---
+QUERY PLAN
+`--SCAN sales USING COVERING INDEX idx_sales_amount
+
+BYTECODE
+addr  opcode       p1  p2  p3  p4      p5  comment
+   0  Init          0  15   0           0  Start at 15
+   1  Null          0   3   4           0  r[3..4]=NULL
+   2  OpenRead      0   3   0  k(2,B)   0  index=idx_sales_amount, root=3, iDb=0
+   3  Rewind        0   9   0           0  Rewind index idx_sales_amount
+   4    Column      0   0   5           0  r[5]=idx_sales_amount.amount
+   5    AggStep     0   5   3  min      0  accum=r[3] step(r[5])
+   6    Column      0   0   6           0  r[6]=idx_sales_amount.amount
+   7    AggStep     0   6   4  max      0  accum=r[4] step(r[6])
+   8  Next          0   4   0           0
+   9  AggFinal      0   3   0  min      0  accum=r[3]
+  10  AggFinal      0   4   0  max      0  accum=r[4]
+  11  Copy          3   1   0           0  r[1]=r[3]
+  12  Copy          4   2   0           0  r[2]=r[4]
+  13  ResultRow     1   2   0           0  output=r[1..2]
+  14  Halt          0   0   0           0
+  15  Transaction   0   1   8           0  iDb=0 tx_mode=Read
+  16  Goto          0   1   0           0
