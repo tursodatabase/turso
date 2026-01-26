@@ -878,7 +878,9 @@ pub fn format_explain_query_plan_output(rows: &[Vec<String>]) -> String {
     // and id/parent (indices 0,1) for tree structure
 
     // Build a map of id -> (parent, detail)
-    let mut nodes: std::collections::HashMap<i64, (i64, String)> = std::collections::HashMap::new();
+    // Use BTreeMap for deterministic iteration order
+    let mut nodes: std::collections::BTreeMap<i64, (i64, String)> =
+        std::collections::BTreeMap::new();
     let mut root_ids: Vec<i64> = Vec::new();
 
     for row in rows {
@@ -907,7 +909,7 @@ pub fn format_explain_query_plan_output(rows: &[Vec<String>]) -> String {
     // Recursively format the tree
     fn format_node(
         id: i64,
-        nodes: &std::collections::HashMap<i64, (i64, String)>,
+        nodes: &std::collections::BTreeMap<i64, (i64, String)>,
         all_ids: &[i64],
         output: &mut String,
         prefix: &str,
