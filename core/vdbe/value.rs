@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use regex::{Regex, RegexBuilder};
 
 use crate::{
