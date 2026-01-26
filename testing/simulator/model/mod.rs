@@ -674,45 +674,35 @@ impl Shadow for Update {
         };
 
         if let Some(table) = tables.iter().find(|t| t.name == self.table) {
+            let old_rows: Vec<_> = updates.iter().map(|(old, _)| old).collect();
             for (idx, col) in columns.iter().enumerate() {
-                if col.has_unique_constraint() {
-                    let new_values: Vec<_> = updates
-                        .iter()
-                        .map(|(_, new)| &new[idx])
-                        .filter(|v| v.0 != turso_core::Value::Null)
-                        .collect();
-                    for (i, v1) in new_values.iter().enumerate() {
-                        for v2 in new_values.iter().skip(i + 1) {
-                            if v1 == v2 {
-                                return Err(anyhow::anyhow!(
-                                    "UNIQUE constraint violation: column '{}' would have duplicate value {:?} in table '{}'",
-                                    col.name,
-                                    v1,
-                                    self.table
-                                ));
-                            }
-                        }
+                if !col.has_unique_constraint() {
+                    continue;
+                }
+                let new_values: Vec<_> = updates
+                    .iter()
+                    .map(|(_, new)| &new[idx])
+                    .filter(|v| v.0 != turso_core::Value::Null)
+                    .collect();
+                // check duplicates within batch
+                for (i, v) in new_values.iter().enumerate() {
+                    if new_values[..i].contains(v) {
+                        return Err(anyhow::anyhow!(
+                            "UNIQUE constraint: duplicate '{}' in table '{}'",
+                            col.name, self.table
+                        ));
                     }
-
-                    for (_, new_row) in &updates {
-                        let new_value = &new_row[idx];
-                        if new_value.0 == turso_core::Value::Null {
-                            continue;
-                        }
-                        for existing in &table.rows {
-                            let is_being_updated = updates.iter().any(|(old, _)| old == existing);
-                            if is_being_updated {
-                                continue;
-                            }
-                            if &existing[idx] == new_value {
-                                return Err(anyhow::anyhow!(
-                                    "UNIQUE constraint violation: column '{}' value {:?} already exists in table '{}'",
-                                    col.name,
-                                    new_value,
-                                    self.table
-                                ));
-                            }
-                        }
+                }
+                // check against existing rows not being updated
+                for v in &new_values {
+                    let conflicts = table.rows.iter()
+                        .filter(|r| !old_rows.contains(r))
+                        .any(|r| &r[idx] == *v);
+                    if conflicts {
+                        return Err(anyhow::anyhow!(
+                            "UNIQUE constraint: '{}' already exists in '{}'",
+                            col.name, self.table
+                        ));
                     }
                 }
             }

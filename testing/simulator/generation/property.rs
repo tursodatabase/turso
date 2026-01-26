@@ -17,9 +17,9 @@ use sql_generation::{
             predicate::Predicate,
             select::{CompoundOperator, CompoundSelect, ResultColumn, SelectBody, SelectInner},
             transaction::{Begin, Commit, Rollback},
-            update::Update,
+            update::{SetValue, Update},
         },
-        table::{SimValue, Table},
+        table::SimValue,
     },
 };
 use strum::IntoEnumIterator;
@@ -1127,85 +1127,54 @@ impl Property {
                 .collect(),
             Property::StatementAtomicity { table, statement } => {
                 let table_name = table.clone();
-                let table_dependency = table.clone();
 
                 let assumption = InteractionType::Assumption(Assertion::new(
                     format!("table {table} exists"),
                     {
-                        let table_name = table.clone();
+                        let table = table.clone();
                         move |_: &Vec<ResultSet>, env: &mut SimulatorEnv| {
-                            let conn_tables = env.get_conn_tables(connection_index);
-                            if conn_tables.iter().any(|t| t.name == table_name) {
+                            if env.get_conn_tables(connection_index).iter().any(|t| t.name == table) {
                                 Ok(Ok(()))
                             } else {
-                                let available_tables: Vec<String> =
-                                    conn_tables.iter().map(|t| t.name.clone()).collect();
-                                Ok(Err(format!(
-                                    "table '{table_name}' not found. available tables: {available_tables:?}"
-                                )))
+                                Ok(Err(format!("table '{table}' not found")))
                             }
                         }
                     },
-                    vec![table_dependency.clone()],
+                    vec![table.clone()],
                 ));
 
                 let snapshot_before = InteractionBuilder::with_interaction(InteractionType::Query(
                     Query::Select(Select::simple(table.clone(), Predicate::true_())),
                 ));
-
                 let begin_tx = InteractionBuilder::with_interaction(InteractionType::Query(
                     Query::Begin(Begin::Immediate),
                 ));
-
-                let dml_interaction = {
-                    let mut builder = InteractionBuilder::with_interaction(InteractionType::Query(
-                        statement.clone(),
-                    ));
-                    builder.ignore_error(true);
-                    builder
-                };
-
+                let mut dml_interaction = InteractionBuilder::with_interaction(
+                    InteractionType::Query(statement.clone()));
+                dml_interaction.ignore_error(true);
                 let commit_tx = InteractionBuilder::with_interaction(InteractionType::Query(
                     Query::Commit(Commit),
                 ));
-
-                // Snapshot after commit for verification
                 let final_select = InteractionBuilder::with_interaction(InteractionType::Query(
                     Query::Select(Select::simple(table.clone(), Predicate::true_())),
                 ));
 
                 let assertion = InteractionType::Assertion(Assertion::new(
                     format!("{table_name} unchanged after failed statement"),
-                    move |stack: &Vec<ResultSet>, _env| {
-                        // Stack: [0]=before, [1]=BEGIN, [2]=DML, [3]=COMMIT, [4]=final
-                        let (before, dml_result, final_result) = (&stack[0], &stack[2], &stack[4]);
-
-                        // Skip check if DML succeeded (no rollback to verify)
+                    move |stack: &Vec<ResultSet>, _| {
+                        // [0]=before, [1]=BEGIN, [2]=DML, [3]=COMMIT, [4]=final
+                        let (before, dml_result, final_) = (&stack[0], &stack[2], &stack[4]);
                         if dml_result.is_ok() {
                             return Ok(Ok(()));
                         }
-
-                        let before_rows = before.as_ref().map_err(|e| {
-                            LimboError::InternalError(format!("before SELECT failed: {e}"))
-                        })?;
-                        let final_rows = final_result.as_ref().map_err(|e| {
-                            LimboError::InternalError(format!("final SELECT failed: {e}"))
-                        })?;
-
-                        // Failed statement should leave table unchanged
-                        if before_rows.len() != final_rows.len() {
-                            return Ok(Err(format!(
-                                "row count changed: {} -> {}",
-                                before_rows.len(),
-                                final_rows.len()
-                            )));
-                        }
-                        if before_rows != final_rows {
-                            return Ok(Err("table content changed after failed statement".into()));
+                        let before = before.as_ref().map_err(|e| LimboError::InternalError(e.to_string()))?;
+                        let final_ = final_.as_ref().map_err(|e| LimboError::InternalError(e.to_string()))?;
+                        if before != final_ {
+                            return Ok(Err(format!("rows changed: {} to {}", before.len(), final_.len())));
                         }
                         Ok(Ok(()))
                     },
-                    vec![table_dependency],
+                    vec![table.clone()],
                 ));
 
                 vec![
@@ -1383,18 +1352,17 @@ fn property_read_your_updates_back<R: rand::Rng + ?Sized>(
     ctx: &impl GenerationContext,
     _mvcc: bool,
 ) -> Property {
-    let mut attempts = 0;
-    let update = loop {
-        if attempts > 10_000 {
-            panic!(
-                "property_read_your_updates_back: failed to generate non-CaseWhen update after {attempts} attempts"
-            );
+    // force_late_failure makes Update::arbitrary always generate CaseWhen, so generate simple update
+    let update = if ctx.opts().query.update.force_late_failure {
+        let table = pick(ctx.tables(), rng);
+        let col = pick(&table.columns, rng);
+        Update {
+            table: table.name.clone(),
+            set_values: vec![(col.name.clone(), SetValue::Simple(SimValue::arbitrary_from(rng, ctx, &col.column_type)))],
+            predicate: Predicate::arbitrary_from(rng, ctx, table),
         }
-        let candidate = Update::arbitrary(rng, ctx);
-        if !candidate.has_case_when() {
-            break candidate;
-        }
-        attempts += 1;
+    } else {
+        Update::arbitrary(rng, ctx)
     };
 
     // e.g. SELECT a, b FROM t WHERE c=1;
@@ -1626,51 +1594,25 @@ fn generate_failing_insert<R: rand::Rng + ?Sized>(
     rng: &mut R,
     ctx: &impl GenerationContext,
 ) -> Option<(String, Insert)> {
-    let tables_with_unique: Vec<&Table> = ctx
-        .tables()
-        .iter()
-        .filter(|t| t.has_any_unique_column())
-        .collect();
+    let tables: Vec<_> = ctx.tables().iter().filter(|t| t.has_any_unique_column()).collect();
+    let table = *pick(&tables, rng);
 
-    let table = *pick(&tables_with_unique, rng);
+    let unique_col = table.columns.iter().find(|c| c.has_unique_constraint())?;
+    let dup_val = SimValue::arbitrary_from(rng, ctx, &unique_col.column_type);
 
-    let unique_col_indices: Vec<usize> = table
-        .columns
-        .iter()
-        .enumerate()
-        .filter(|(_, c)| c.has_unique_constraint())
-        .map(|(i, _)| i)
-        .collect();
-
-    let first_unique_idx = unique_col_indices[0];
-    let unique_col = &table.columns[first_unique_idx];
-    let duplicate_value = SimValue::arbitrary_from(rng, ctx, &unique_col.column_type);
-
-    let num_rows = rng.random_range(2..=5);
-    let values: Vec<Vec<SimValue>> = (0..num_rows)
+    let values: Vec<Vec<SimValue>> = (0..rng.random_range(2..=5))
         .map(|_| {
-            table
-                .columns
-                .iter()
-                .enumerate()
-                .map(|(col_idx, col)| {
-                    if unique_col_indices.contains(&col_idx) {
-                        duplicate_value.clone()
-                    } else {
-                        SimValue::arbitrary_from(rng, ctx, &col.column_type)
-                    }
-                })
-                .collect()
+            table.columns.iter().map(|col| {
+                if col.has_unique_constraint() {
+                    dup_val.clone()
+                } else {
+                    SimValue::arbitrary_from(rng, ctx, &col.column_type)
+                }
+            }).collect()
         })
         .collect();
 
-    Some((
-        table.name.clone(),
-        Insert::Values {
-            table: table.name.clone(),
-            values,
-        },
-    ))
+    Some((table.name.clone(), Insert::Values { table: table.name.clone(), values }))
 }
 
 fn property_statement_atomicity<R: rand::Rng + ?Sized>(

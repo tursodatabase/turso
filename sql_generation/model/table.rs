@@ -211,6 +211,15 @@ impl SimValue {
         matches!(self.0, types::Value::Null)
     }
 
+    pub fn unique_for_type(column_type: &ColumnType, offset: i64) -> Self {
+        match column_type {
+            ColumnType::Integer => SimValue(types::Value::Integer(offset)),
+            ColumnType::Float => SimValue(types::Value::Float(offset as f64)),
+            ColumnType::Text => SimValue(types::Value::Text(format!("u{offset}").into())),
+            ColumnType::Blob => SimValue(types::Value::Blob(format!("u{offset}").into_bytes())),
+        }
+    }
+
     // The result of any binary operator is either a numeric value or NULL, except for the || concatenation operator, and the -> and ->> extract operators which can return values of any type.
     // All operators generally evaluate to NULL when any operand is NULL, with specific exceptions as stated below. This is in accordance with the SQL92 standard.
     // When paired with NULL:

@@ -256,24 +256,9 @@ impl Arbitrary for Insert {
                         .enumerate()
                         .map(|(col_idx, c)| {
                             if c.has_unique_constraint() {
-                                let unique_offset =
+                                let offset =
                                     base_offset + (col_idx as i64 * 10_000_000) + row_idx as i64;
-                                match c.column_type {
-                                    crate::model::table::ColumnType::Integer => {
-                                        SimValue(turso_core::Value::Integer(unique_offset))
-                                    }
-                                    crate::model::table::ColumnType::Float => {
-                                        SimValue(turso_core::Value::Float(unique_offset as f64))
-                                    }
-                                    crate::model::table::ColumnType::Text => {
-                                        let s = format!("u{unique_offset}");
-                                        SimValue(turso_core::Value::Text(s.into()))
-                                    }
-                                    crate::model::table::ColumnType::Blob => {
-                                        let s = format!("u{unique_offset}");
-                                        SimValue(turso_core::Value::Blob(s.into_bytes()))
-                                    }
-                                }
+                                SimValue::unique_for_type(&c.column_type, offset)
                             } else {
                                 SimValue::arbitrary_from(rng, env, &c.column_type)
                             }
@@ -480,60 +465,43 @@ impl Arbitrary for Update {
             && !non_unique_columns.is_empty();
 
         let (set_values, predicate) = if use_case_when {
-            let (unique_col_idx, unique_col) = *pick(&conflict_capable_columns, rng);
+            let (col_idx, unique_col) = *pick(&conflict_capable_columns, rng);
             let marker_col = *pick(&non_unique_columns, rng);
+            let first_val = table.rows[0][col_idx].clone();
+            let last_val = table.rows[last_row_idx][col_idx].clone();
 
-            // Get values from first and last rows for conflict
-            let first_row_unique = table.rows[0][unique_col_idx].clone();
-            let last_row_unique = table.rows[last_row_idx][unique_col_idx].clone();
-
-            let mut set_values: Vec<(String, SetValue)> = Vec::new();
-
-            let marker_value = if let Some(padding_size) = update_opts.padding_size {
-                let padding = "X".repeat(padding_size);
-                match marker_col.column_type {
-                    crate::model::table::ColumnType::Blob => {
-                        SimValue(turso_core::Value::Blob(padding.into_bytes()))
+            let marker_value = match update_opts.padding_size {
+                Some(size) => {
+                    let p = "X".repeat(size);
+                    if matches!(marker_col.column_type, crate::model::table::ColumnType::Blob) {
+                        SimValue(turso_core::Value::Blob(p.into_bytes()))
+                    } else {
+                        SimValue(turso_core::Value::Text(p.into()))
                     }
-                    _ => SimValue(turso_core::Value::Text(padding.into())),
                 }
-            } else {
-                SimValue::arbitrary_from(rng, env, &marker_col.column_type)
+                None => SimValue::arbitrary_from(rng, env, &marker_col.column_type),
             };
-            set_values.push((marker_col.name.clone(), SetValue::Simple(marker_value)));
 
-            set_values.push((
-                unique_col.name.clone(),
-                SetValue::CaseWhen {
-                    condition: Box::new(Predicate::eq(
-                        Predicate::column(unique_col.name.clone()),
-                        Predicate::value(last_row_unique),
-                    )),
-                    then_value: first_row_unique,
-                    else_column: unique_col.name.clone(),
-                },
-            ));
-
+            let set_values = vec![
+                (marker_col.name.clone(), SetValue::Simple(marker_value)),
+                (
+                    unique_col.name.clone(),
+                    SetValue::CaseWhen {
+                        condition: Box::new(Predicate::eq(
+                            Predicate::column(unique_col.name.clone()),
+                            Predicate::value(last_val),
+                        )),
+                        then_value: first_val,
+                        else_column: unique_col.name.clone(),
+                    },
+                ),
+            ];
             (set_values, Predicate::true_())
         } else if non_unique_columns.is_empty() {
             let column = pick(&table.columns, rng);
             let base_offset: i64 = rng.random_range(2_000_000_000i64..3_000_000_000i64);
 
-            let unique_value = match column.column_type {
-                crate::model::table::ColumnType::Integer => {
-                    SimValue(turso_core::Value::Integer(base_offset))
-                }
-                crate::model::table::ColumnType::Float => {
-                    SimValue(turso_core::Value::Float(base_offset as f64))
-                }
-                crate::model::table::ColumnType::Text => {
-                    SimValue(turso_core::Value::Text(format!("u{base_offset}").into()))
-                }
-                crate::model::table::ColumnType::Blob => SimValue(turso_core::Value::Blob(
-                    format!("u{base_offset}").into_bytes(),
-                )),
-            };
-
+            let unique_value = SimValue::unique_for_type(&column.column_type, base_offset);
             let set_values = vec![(column.name.clone(), SetValue::Simple(unique_value))];
 
             let predicate = if !table.rows.is_empty() {
