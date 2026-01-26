@@ -1,5 +1,3 @@
-use regex::{Regex, RegexBuilder};
-
 use crate::{
     function::MathFunc,
     numeric::{format_float, NullableInteger, Numeric},
@@ -1053,13 +1051,18 @@ impl Value {
             ));
         }
 
+        let has_escape = escape.map_or(false, |e| pattern.contains(e));
+
         // 1. Exact match (no wildcards)
-        if !pattern.contains(['%', '_']) {
+        if !has_escape && !pattern.contains(['%', '_']) {
             return Ok(pattern.eq_ignore_ascii_case(text));
         }
 
         // 2. Fast Path: 'abc%' (Prefix)
-        if pattern.ends_with('%') && !pattern[..pattern.len() - 1].contains(['%', '_']) {
+        if !has_escape
+            && pattern.ends_with('%')
+            && !pattern[..pattern.len() - 1].contains(['%', '_'])
+        {
             let prefix = &pattern[..pattern.len() - 1];
             if text.len() >= prefix.len() && text.is_char_boundary(prefix.len()) {
                 return Ok(text[..prefix.len()].eq_ignore_ascii_case(prefix));
@@ -1068,7 +1071,7 @@ impl Value {
         }
 
         // 3. Fast Path: '%abc' (Suffix)
-        if pattern.starts_with('%') && !pattern[1..].contains(['%', '_']) {
+        if !has_escape && pattern.starts_with('%') && !pattern[1..].contains(['%', '_']) {
             let suffix = &pattern[1..];
             let start = text.len().wrapping_sub(suffix.len());
             if text.len() >= suffix.len() && text.is_char_boundary(start) {
@@ -1078,13 +1081,14 @@ impl Value {
         }
 
         // 4. Fast Path: '%abc%' (Contains)
-        if pattern.len() > 1 && pattern.starts_with('%') && pattern.ends_with('%') {
+        if !has_escape && pattern.len() > 1 && pattern.starts_with('%') && pattern.ends_with('%') {
             let inner = &pattern[1..pattern.len() - 1];
             if !inner.contains(['%', '_']) {
                 return Ok(text
                     .to_ascii_lowercase()
                     .contains(&inner.to_ascii_lowercase()));
             }
+            // Fall through to regex if boundary check fails (multi-byte UTF-8)
         }
 
         Ok(pattern_compare(pattern, text, escape))
@@ -1247,41 +1251,6 @@ fn pattern_compare(mut pattern: &str, mut text: &str, escape: Option<char>) -> b
 
 fn eq_ignore_ascii_case(a: char, b: char) -> bool {
     a.eq_ignore_ascii_case(&b)
-}
-
-pub fn construct_like_regex(pattern: &str) -> Result<Regex, LimboError> {
-    let mut regex_pattern = String::with_capacity(pattern.len() * 2);
-
-    regex_pattern.push('^');
-
-    for c in pattern.chars() {
-        match c {
-            '\\' => regex_pattern.push_str("\\\\"),
-            '%' => regex_pattern.push_str(".*"),
-            '_' => regex_pattern.push('.'),
-            ch => {
-                if ch.is_ascii_alphabetic() {
-                    regex_pattern.push('[');
-                    regex_pattern.push(ch.to_ascii_lowercase());
-                    regex_pattern.push(ch.to_ascii_uppercase());
-                    regex_pattern.push(']');
-                } else {
-                    if regex_syntax::is_meta_character(c) {
-                        regex_pattern.push('\\');
-                    }
-                    regex_pattern.push(ch);
-                }
-            }
-        }
-    }
-
-    regex_pattern.push('$');
-
-    RegexBuilder::new(&regex_pattern)
-        .dot_matches_new_line(true)
-        .size_limit(10 * (1 << 20))
-        .build()
-        .map_err(|_| LimboError::Constraint("LIKE or GLOB pattern too complex".to_string()))
 }
 
 #[cfg(test)]
@@ -2040,6 +2009,26 @@ mod tests {
         assert!(!Value::exec_like("%a.a", "aaaa", None).unwrap());
         assert!(!Value::exec_like("a.a%", "aaaa", None).unwrap());
         assert!(!Value::exec_like("%a.ab", "aaaa", None).unwrap());
+    }
+
+    #[test]
+    fn test_exec_like_with_escape() {
+        assert!(Value::exec_like("abcX%", "abc%", Some('X')).unwrap());
+        assert!(!Value::exec_like("abcX%", "abc5", Some('X')).unwrap());
+        assert!(!Value::exec_like("abcX%", "abc", Some('X')).unwrap());
+        assert!(!Value::exec_like("abcX%", "abcX%", Some('X')).unwrap());
+        assert!(!Value::exec_like("abcX%", "abc%%", Some('X')).unwrap());
+
+        assert!(Value::exec_like("abcX_", "abc_", Some('X')).unwrap());
+        assert!(!Value::exec_like("abcX_", "abc5", Some('X')).unwrap());
+        assert!(!Value::exec_like("abcX_", "abc", Some('X')).unwrap());
+        assert!(!Value::exec_like("abcX_", "abcX_", Some('X')).unwrap());
+        assert!(!Value::exec_like("abcX_", "abc__", Some('X')).unwrap());
+
+        assert!(Value::exec_like("abcXX", "abcX", Some('X')).unwrap());
+        assert!(!Value::exec_like("abcXX", "abc5", Some('X')).unwrap());
+        assert!(!Value::exec_like("abcXX", "abc", Some('X')).unwrap());
+        assert!(!Value::exec_like("abcXX", "abcXX", Some('X')).unwrap());
     }
 
     #[test]
