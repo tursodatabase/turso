@@ -483,7 +483,7 @@ NEWLINE         = '\n'
 1. Snapshot names must be unique within a file
 2. Snapshot names must not conflict with test names
 3. Setup names in `@setup` decorators must reference defined setups
-4. SQL must end with semicolon
+4. SQL must contain exactly one statement (semicolons in strings and comments are ignored)
 
 ## Execution Model
 
