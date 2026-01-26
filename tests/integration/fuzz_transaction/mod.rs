@@ -660,7 +660,7 @@ async fn multiple_connections_fuzz(opts: FuzzOptions) {
         };
         let requires_rollback = |e: &turso::Error| -> bool {
             let e_string = e.to_string();
-            e_string.contains("Write-write conflict")
+            e_string.contains("Write-write conflict") || e_string.contains("schema conflict")
         };
 
         let handle_error = |e: &turso::Error,
