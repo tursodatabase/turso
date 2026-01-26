@@ -1741,13 +1741,6 @@ expect error {
     UNIQUE constraint failed
 }
 
-# CHECK constraints are not yet supported in TursoDB
-# TODO: Add CHECK constraint tests when CHECK is implemented
-# test gencol_constraint_check_stored_success
-# test gencol_constraint_check_stored_violation
-# test gencol_constraint_check_virtual_success
-# test gencol_constraint_check_virtual_violation
-
 # Combined constraints: NOT NULL + UNIQUE
 test gencol_constraint_combined_notnull_unique {
     CREATE TABLE t1(a INTEGER NOT NULL, b AS (a * 2) STORED NOT NULL UNIQUE);
@@ -1776,10 +1769,6 @@ test gencol_constraint_combined_unique_violation {
 expect error {
     UNIQUE constraint failed
 }
-
-# Constraint validation on UPDATE - CHECK
-# CHECK constraints are not yet supported in TursoDB
-# TODO: Add this test when CHECK is implemented
 
 # Constraint validation on UPDATE - NOT NULL
 # NOT NULL constraint should be enforced when STORED generated columns are recomputed
@@ -1869,6 +1858,13 @@ test gencol_constraint_notnull_on_update_unrelated_column {
 expect {
     5|200|10
 }
+
+# TODO: CHECK constraints are not yet supported in TursoDB. When implemented, add:
+# - gencol_constraint_check_stored_success
+# - gencol_constraint_check_stored_violation
+# - gencol_constraint_check_virtual_success
+# - gencol_constraint_check_virtual_violation
+# - gencol_constraint_check_on_update
 
 # -----------------------------------------------------------------------------
 # Triggers with NEW.generated_col
