@@ -1,0 +1,165 @@
+# Sorting and Limiting Query Plan Snapshots
+# These snapshots capture EXPLAIN QUERY PLAN output for ORDER BY and LIMIT patterns
+
+@database :memory:
+@skip-file-if mvcc "mvcc has slightly different cursor ids, so skipping it for now"
+
+setup schema {
+    -- Table for basic sorting tests
+    CREATE TABLE products (
+        id INTEGER PRIMARY KEY,
+        name TEXT NOT NULL,
+        price REAL NOT NULL,
+        category TEXT,
+        stock INTEGER,
+        created_at TEXT
+    );
+
+    -- Index on price for index-assisted sorting
+    CREATE INDEX idx_products_price ON products(price);
+
+    -- Compound index for multi-column sorting
+    CREATE INDEX idx_products_category_price ON products(category, price);
+
+    -- Index for descending order tests
+    CREATE INDEX idx_products_stock_desc ON products(stock DESC);
+
+    -- Table with nullable columns for NULL ordering tests
+    CREATE TABLE employees (
+        id INTEGER PRIMARY KEY,
+        name TEXT NOT NULL,
+        department TEXT,
+        salary REAL,
+        hire_date TEXT
+    );
+
+    -- Index on nullable column
+    CREATE INDEX idx_employees_salary ON employees(salary);
+    CREATE INDEX idx_employees_department ON employees(department);
+}
+
+# Test 1: ORDER BY single column - simple sort (no index on name)
+@setup schema
+snapshot order-by-single-column {
+    SELECT id, name, price
+    FROM products
+    ORDER BY name;
+}
+
+# Test 2: ORDER BY with index - index-assisted sort (should use index)
+@setup schema
+snapshot order-by-with-index {
+    SELECT id, name, price
+    FROM products
+    ORDER BY price;
+}
+
+# Test 3: ORDER BY multiple columns - compound sort
+@setup schema
+snapshot order-by-multiple-columns {
+    SELECT id, name, category, price
+    FROM products
+    ORDER BY category, price;
+}
+
+# Test 4: ORDER BY + LIMIT - top-N optimization
+@setup schema
+snapshot order-by-with-limit {
+    SELECT id, name, price
+    FROM products
+    ORDER BY price DESC
+    LIMIT 10;
+}
+
+# Test 5: LIMIT with OFFSET - pagination
+@setup schema
+snapshot limit-with-offset {
+    SELECT id, name, price
+    FROM products
+    ORDER BY id
+    LIMIT 10 OFFSET 20;
+}
+
+# Test 6: ORDER BY expression - computed sort key
+@setup schema
+snapshot order-by-expression {
+    SELECT id, name, price, stock, price * stock AS total_value
+    FROM products
+    ORDER BY price * stock DESC;
+}
+
+# Test 7: ORDER BY DESC - descending order
+@setup schema
+snapshot order-by-desc {
+    SELECT id, name, stock
+    FROM products
+    ORDER BY stock DESC;
+}
+
+# Test 8: ORDER BY with NULLS - null ordering (NULLs sort first/last)
+@setup schema
+snapshot order-by-with-nulls {
+    SELECT id, name, salary
+    FROM employees
+    ORDER BY salary;
+}
+
+# Test 9: ORDER BY nullable column DESC
+@setup schema
+snapshot order-by-nullable-desc {
+    SELECT id, name, department
+    FROM employees
+    ORDER BY department DESC;
+}
+
+# Test 10: Multiple ORDER BY with mixed ASC/DESC
+@setup schema
+snapshot order-by-mixed-direction {
+    SELECT id, name, category, price
+    FROM products
+    ORDER BY category ASC, price DESC;
+}
+
+# Test 11: ORDER BY with WHERE clause - filtered sort
+@setup schema
+snapshot order-by-with-where {
+    SELECT id, name, price
+    FROM products
+    WHERE category = 'Electronics'
+    ORDER BY price;
+}
+
+# Test 12: ORDER BY with LIMIT 1 - min/max optimization candidate
+@setup schema
+snapshot order-by-limit-one {
+    SELECT id, name, price
+    FROM products
+    ORDER BY price ASC
+    LIMIT 1;
+}
+
+# Test 13: LIMIT without ORDER BY - arbitrary rows
+@setup schema
+snapshot limit-without-order {
+    SELECT id, name, price
+    FROM products
+    LIMIT 5;
+}
+
+# Test 14: Large OFFSET with small LIMIT
+@setup schema
+snapshot large-offset-small-limit {
+    SELECT id, name, price
+    FROM products
+    ORDER BY price
+    LIMIT 5 OFFSET 1000;
+}
+
+# Test 15: ORDER BY on indexed column with range filter
+@setup schema
+snapshot order-by-index-with-range {
+    SELECT id, name, price
+    FROM products
+    WHERE price BETWEEN 10 AND 100
+    ORDER BY price;
+}
