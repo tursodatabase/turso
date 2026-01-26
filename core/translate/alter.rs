@@ -337,12 +337,12 @@ pub fn translate_alter_table(
 
                         // Iterate through OLD columns and copy storable ones
                         // Skip: 1) the dropped column, 2) VIRTUAL generated columns
-                        for i in 0..original_columns.len() {
+                        for (i, col) in original_columns.iter().enumerate() {
                             if i == dropped_index {
                                 continue;
                             }
                             // Skip VIRTUAL generated columns - they are not stored in records
-                            if original_columns[i].is_virtual_generated() {
+                            if col.is_virtual_generated() {
                                 continue;
                             }
 

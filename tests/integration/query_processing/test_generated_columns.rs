@@ -101,7 +101,7 @@ fn test_gencol_row_not_found_after_reopen() {
 
         eprintln!("Rows found after reopens and update: {}", rows.len());
         for (i, row) in rows.iter().enumerate() {
-            eprintln!("Row {}: {:?}", i, row);
+            eprintln!("Row {i}: {row:?}");
         }
 
         assert_eq!(rows.len(), 1, "Row with id=1 should be found after reopens");
@@ -217,7 +217,7 @@ fn test_gencol_complex_expressions_after_reopen() {
 
         eprintln!("Rows after multiple reopens:");
         for (i, row) in rows.iter().enumerate() {
-            eprintln!("Row {}: {:?}", i, row);
+            eprintln!("Row {i}: {row:?}");
         }
 
         assert_eq!(rows.len(), 2, "Both rows should be found");
@@ -306,7 +306,7 @@ fn test_stored_gencol_corruption_after_add_column_and_reopen() {
         // Print actual values for debugging
         eprintln!("After reopen and UPDATE:");
         for (i, val) in rows[0].iter().enumerate() {
-            eprintln!("  Column {}: {:?}", i, val);
+            eprintln!("  Column {i}: {val:?}");
         }
 
         // Assert expected values - these should pass but currently fail due to bug
@@ -410,17 +410,13 @@ fn test_stored_depends_on_virtual_depends_on_stored() {
         let expected_s1 = -a * a;
         assert!(
             (s1 - expected_s1).abs() < 1e10,
-            "s1 should be -a*a = {}, got {}",
-            expected_s1,
-            s1
+            "s1 should be -a*a = {expected_s1}, got {s1}"
         );
 
         // s2 should equal s1 (via v1)
         assert!(
             (s2 - s1).abs() < 1e10,
-            "s2 should equal s1 = {}, got {}",
-            s1,
-            s2
+            "s2 should equal s1 = {s1}, got {s2}"
         );
     }
 }
@@ -491,17 +487,13 @@ fn test_stored_chain_update_after_reopen() {
         let expected_s1 = -a * a;
         assert!(
             (s1 - expected_s1).abs() < 1e10,
-            "s1 should be -a*a = {}, got {}",
-            expected_s1,
-            s1
+            "s1 should be -a*a = {expected_s1}, got {s1}"
         );
 
         // s2 should equal s1 (via v1)
         assert!(
             (s2 - s1).abs() < 1e10,
-            "s2 should equal s1 = {}, got {}",
-            s1,
-            s2
+            "s2 should equal s1 = {s1}, got {s2}"
         );
     }
 }

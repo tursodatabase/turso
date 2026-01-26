@@ -3704,3 +3704,127 @@ test gencol_expr_index_nested_delete_no_stale {
 }
 expect {
 }
+
+# -----------------------------------------------------------------------------
+# Function tests for INSERT+UPDATE paths (issue: 6 functions work on INSERT but fail on UPDATE)
+# -----------------------------------------------------------------------------
+
+# concat function
+test gencol_func_concat_insert {
+    CREATE TABLE t1(a TEXT, b TEXT, c AS (concat(a, b)) STORED);
+    INSERT INTO t1(a, b) VALUES('hello', 'world');
+    SELECT c FROM t1;
+}
+expect {
+    helloworld
+}
+
+test gencol_func_concat_update {
+    CREATE TABLE t1(a TEXT, b TEXT, c AS (concat(a, b)) STORED);
+    INSERT INTO t1(a, b) VALUES('hello', 'world');
+    UPDATE t1 SET a = 'foo', b = 'bar';
+    SELECT c FROM t1;
+}
+expect {
+    foobar
+}
+
+# concat_ws function
+test gencol_func_concat_ws_insert {
+    CREATE TABLE t1(a TEXT, b TEXT, c AS (concat_ws('-', a, b)) STORED);
+    INSERT INTO t1(a, b) VALUES('hello', 'world');
+    SELECT c FROM t1;
+}
+expect {
+    hello-world
+}
+
+test gencol_func_concat_ws_update {
+    CREATE TABLE t1(a TEXT, b TEXT, c AS (concat_ws('-', a, b)) STORED);
+    INSERT INTO t1(a, b) VALUES('hello', 'world');
+    UPDATE t1 SET a = 'foo', b = 'bar';
+    SELECT c FROM t1;
+}
+expect {
+    foo-bar
+}
+
+# iif function
+test gencol_func_iif_insert {
+    CREATE TABLE t1(a INTEGER, b AS (iif(a > 0, 'positive', 'non-positive')) STORED);
+    INSERT INTO t1(a) VALUES(5);
+    SELECT b FROM t1;
+}
+expect {
+    positive
+}
+
+test gencol_func_iif_update {
+    CREATE TABLE t1(a INTEGER, b AS (iif(a > 0, 'positive', 'non-positive')) STORED);
+    INSERT INTO t1(a) VALUES(5);
+    UPDATE t1 SET a = -3;
+    SELECT b FROM t1;
+}
+expect {
+    non-positive
+}
+
+# octet_length function
+test gencol_func_octet_length_insert {
+    CREATE TABLE t1(a TEXT, b AS (octet_length(a)) STORED);
+    INSERT INTO t1(a) VALUES('hello');
+    SELECT b FROM t1;
+}
+expect {
+    5
+}
+
+test gencol_func_octet_length_update {
+    CREATE TABLE t1(a TEXT, b AS (octet_length(a)) STORED);
+    INSERT INTO t1(a) VALUES('hello');
+    UPDATE t1 SET a = 'goodbye';
+    SELECT b FROM t1;
+}
+expect {
+    7
+}
+
+# quote function
+test gencol_func_quote_insert {
+    CREATE TABLE t1(a TEXT, b AS (quote(a)) STORED);
+    INSERT INTO t1(a) VALUES('hello');
+    SELECT b FROM t1;
+}
+expect {
+    'hello'
+}
+
+test gencol_func_quote_update {
+    CREATE TABLE t1(a TEXT, b AS (quote(a)) STORED);
+    INSERT INTO t1(a) VALUES('hello');
+    UPDATE t1 SET a = 'world';
+    SELECT b FROM t1;
+}
+expect {
+    'world'
+}
+
+# unicode function
+test gencol_func_unicode_insert {
+    CREATE TABLE t1(a TEXT, b AS (unicode(a)) STORED);
+    INSERT INTO t1(a) VALUES('A');
+    SELECT b FROM t1;
+}
+expect {
+    65
+}
+
+test gencol_func_unicode_update {
+    CREATE TABLE t1(a TEXT, b AS (unicode(a)) STORED);
+    INSERT INTO t1(a) VALUES('A');
+    UPDATE t1 SET a = 'B';
+    SELECT b FROM t1;
+}
+expect {
+    66
+}

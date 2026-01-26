@@ -2584,7 +2584,7 @@ fn emit_update_column_values<'a>(
                     let any_dep_updated = deps.iter().any(|dep_name| {
                         column_lookup
                             .get(&dep_name.to_lowercase())
-                            .map_or(false, |&dep_idx| updated_col_set.contains(&dep_idx))
+                            .is_some_and(|&dep_idx| updated_col_set.contains(&dep_idx))
                     });
                     if any_dep_updated {
                         updated_col_set.insert(idx);

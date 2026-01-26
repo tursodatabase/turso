@@ -1053,6 +1053,69 @@ fn translate_function_call_unified(
     let func_name = normalize_ident(name);
     let arg_count = args.len();
 
+    // Handle iif specially - it requires lazy evaluation (short-circuit semantics)
+    // This must be done BEFORE evaluating all arguments to avoid evaluating unused branches
+    if func_name == "iif" {
+        if arg_count < 2 {
+            crate::bail_parse_error!("iif requires at least 2 arguments");
+        }
+        let iif_end_label = program.allocate_label();
+        let condition_reg = program.alloc_register();
+
+        // Process condition-value pairs: iif(cond1, val1, cond2, val2, ..., else_val)
+        for pair in args.chunks_exact(2) {
+            let condition_expr = &pair[0];
+            let value_expr = &pair[1];
+            let next_check_label = program.allocate_label();
+
+            translate_generated_expr_unified(
+                program,
+                context,
+                condition_expr.as_ref(),
+                condition_reg,
+                resolver,
+            )?;
+
+            program.emit_insn(Insn::IfNot {
+                reg: condition_reg,
+                target_pc: next_check_label,
+                jump_if_null: true,
+            });
+
+            translate_generated_expr_unified(
+                program,
+                context,
+                value_expr.as_ref(),
+                target_register,
+                resolver,
+            )?;
+            program.emit_insn(Insn::Goto {
+                target_pc: iif_end_label,
+            });
+
+            program.preassign_label_to_next_insn(next_check_label);
+        }
+
+        // Handle else value (odd number of args) or NULL
+        if arg_count % 2 != 0 {
+            translate_generated_expr_unified(
+                program,
+                context,
+                args.last().unwrap().as_ref(),
+                target_register,
+                resolver,
+            )?;
+        } else {
+            program.emit_insn(Insn::Null {
+                dest: target_register,
+                dest_end: None,
+            });
+        }
+
+        program.preassign_label_to_next_insn(iif_end_label);
+        return Ok(());
+    }
+
     // Evaluate all arguments first
     let args_start = program.alloc_registers(arg_count.max(1));
     for (i, arg) in args.iter().enumerate() {
@@ -1136,7 +1199,7 @@ fn translate_function_call_unified(
         "char" => ScalarFunc::Char,
         "unicode" => ScalarFunc::Unicode,
         "quote" => ScalarFunc::Quote,
-        "iif" => ScalarFunc::Iif,
+        // Note: "iif" is handled specially above with lazy evaluation
         "concat" => ScalarFunc::Concat,
         "concat_ws" => ScalarFunc::ConcatWs,
         _ => crate::bail_parse_error!("unsupported function in generated column: {}", func_name),
