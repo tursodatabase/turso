@@ -1,0 +1,205 @@
+name: Build & publish @tursodatabase/sync-react-native
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    tags:
+      - v*
+  pull_request:
+    branches:
+      - main
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_NET_RETRY: 10
+  working-directory: bindings/react-native
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-ios:
+    name: Build iOS libraries
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-rust-ios"
+          cache-on-failure: true
+
+      - name: Build iOS libraries
+        run: make ios-build
+        working-directory: ${{ env.working-directory }}
+
+      - name: Package iOS xcframework
+        run: make package-dylibs
+        working-directory: ${{ env.working-directory }}
+
+      - name: Upload iOS artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-libs
+          path: |
+            bindings/react-native/libs/ios/
+          if-no-files-found: error
+
+  build-android:
+    name: Build Android libraries
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android,i686-linux-android
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-rust-android"
+          cache-on-failure: true
+
+      - name: Set up Android NDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk
+
+      - name: Build Android libraries
+        run: make android
+        working-directory: ${{ env.working-directory }}
+
+      - name: Upload Android artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-libs
+          path: |
+            bindings/react-native/libs/android/
+          if-no-files-found: error
+
+  build-typescript:
+    name: Build TypeScript
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install dependencies
+        run: npm install
+        working-directory: ${{ env.working-directory }}
+
+      - name: Build TypeScript
+        run: npm run build
+        working-directory: ${{ env.working-directory }}
+
+      - name: Type check
+        run: npm run typescript
+        working-directory: ${{ env.working-directory }}
+
+      - name: Upload TypeScript build
+        uses: actions/upload-artifact@v4
+        with:
+          name: typescript-build
+          path: |
+            bindings/react-native/lib/
+          if-no-files-found: error
+
+  publish:
+    name: Publish to npm
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs:
+      - build-ios
+      - build-android
+      - build-typescript
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Download iOS artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: ios-libs
+          path: bindings/react-native/libs/ios/
+
+      - name: Download Android artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: android-libs
+          path: bindings/react-native/libs/android/
+
+      - name: Download TypeScript build
+        uses: actions/download-artifact@v4
+        with:
+          name: typescript-build
+          path: bindings/react-native/lib/
+
+      - name: Install dependencies
+        run: npm install
+        working-directory: ${{ env.working-directory }}
+
+      - name: List package contents
+        run: |
+          echo "=== Package contents ==="
+          ls -la
+          echo "=== libs/ios ==="
+          ls -laR libs/ios/ || echo "No iOS libs"
+          echo "=== libs/android ==="
+          ls -laR libs/android/ || echo "No Android libs"
+          echo "=== lib (TypeScript) ==="
+          ls -laR lib/ || echo "No lib"
+        working-directory: ${{ env.working-directory }}
+
+      - name: Publish
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          if git log -1 --pretty=%B | grep "^Turso [0-9]\+\.[0-9]\+\.[0-9]\+$";
+          then
+            npm publish --access public --provenance
+          elif git log -1 --pretty=%B | grep "^Turso [0-9]\+\.[0-9]\+\.[0-9]\+";
+          then
+            npm publish --access public --provenance --tag next
+          else
+            echo "git log structure is unexpected, skip publishing"
+            npm publish --dry-run
+          fi
+        working-directory: ${{ env.working-directory }}
+
+      - name: Publish (dry-run)
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+        run: npm pack
+        working-directory: ${{ env.working-directory }}
+
+      - name: Upload package tarball
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: npm-package
+          path: bindings/react-native/*.tgz

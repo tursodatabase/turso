@@ -34,11 +34,13 @@ COPY testing/sqlite_test_ext ./testing/sqlite_test_ext
 COPY testing/simulator ./testing/simulator/
 COPY sql_generation ./sql_generation/
 COPY testing/concurrent-simulator ./testing/concurrent-simulator
+COPY testing/differential-oracle ./testing/differential-oracle/
 COPY perf/encryption ./perf/encryption
 COPY perf/throughput/rusqlite ./perf/throughput/rusqlite
 COPY perf/throughput/turso ./perf/throughput/turso
 COPY sdk-kit ./sdk-kit/
 COPY sdk-kit-macros ./sdk-kit-macros/
+COPY tools ./tools/
 RUN cargo chef prepare --recipe-path recipe.json
 
 #
@@ -66,11 +68,14 @@ COPY --from=planner /app/testing/sqlite_test_ext ./testing/sqlite_test_ext
 COPY --from=planner /app/testing/simulator ./testing/simulator/
 COPY --from=planner /app/sql_generation ./sql_generation/
 COPY --from=planner /app/testing/concurrent-simulator ./testing/concurrent-simulator
+COPY --from=planner /app/testing/differential-oracle ./testing/differential-oracle/
 COPY --from=planner /app/perf/encryption ./perf/encryption
 COPY --from=planner /app/perf/throughput/rusqlite ./perf/throughput/rusqlite
 COPY --from=planner /app/perf/throughput/turso ./perf/throughput/turso
 COPY --from=planner /app/sdk-kit ./sdk-kit/
 COPY --from=planner /app/sdk-kit-macros ./sdk-kit-macros/
+COPY --from=planner /app/tools ./tools/
+
 
 # Build native library for Linux x86_64
 WORKDIR /app/bindings/java

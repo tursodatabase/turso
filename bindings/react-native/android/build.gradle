@@ -1,0 +1,84 @@
+buildscript {
+    repositories {
+        google()
+        mavenCentral()
+    }
+    dependencies {
+        classpath "com.android.tools.build:gradle:8.2.0"
+    }
+}
+
+plugins {
+    id "com.android.library"
+}
+
+def reactNativeArchitectures() {
+    def value = project.getProperties().get("reactNativeArchitectures")
+    return value ? value.split(",") : ["armeabi-v7a", "arm64-v8a", "x86", "x86_64"]
+}
+
+android {
+    namespace "com.turso.reactnative"
+    compileSdk 34
+
+    defaultConfig {
+        minSdk 24
+        targetSdk 34
+
+        externalNativeBuild {
+            cmake {
+                cppFlags "-O2 -frtti -fexceptions -Wall -fstack-protector-all"
+                abiFilters(*reactNativeArchitectures())
+                arguments "-DANDROID_STL=c++_shared"
+            }
+        }
+    }
+
+    buildFeatures {
+        prefab true
+        buildConfig true
+    }
+
+    externalNativeBuild {
+        cmake {
+            path "CMakeLists.txt"
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+        }
+    }
+
+    packaging {
+        excludes += [
+            "**/libjsi.so",
+            "**/libfbjni.so",
+            "**/libc++_shared.so",
+            "**/libreactnative.so"
+        ]
+    }
+    sourceSets {
+        main {
+            jniLibs.srcDirs = ["../libs/android"]
+        }
+    }
+}
+
+repositories {
+    google()
+    mavenCentral()
+}
+
+dependencies {
+    compileOnly "com.facebook.react:react-android"
+}
+
+// Task to build Rust library for Android
+task buildRustLibrary(type: Exec) {
+    workingDir "${projectDir}/.."
+    commandLine "make", "android"
+}
+
+preBuild.dependsOn buildRustLibrary
