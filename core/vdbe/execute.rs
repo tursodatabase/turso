@@ -4981,48 +4981,72 @@ pub fn op_function(
                     Register::Value(Value::Integer(program.connection.last_insert_rowid()));
             }
             ScalarFunc::Like => {
-                let pattern = &state.registers[*start_reg];
-                let match_expression = &state.registers[*start_reg + 1];
+                let pattern_reg = &state.registers[*start_reg];
+                let match_reg = &state.registers[*start_reg + 1];
 
-                let pattern = match pattern.get_value() {
-                    Value::Text(_) => pattern.get_value(),
-                    _ => &pattern.get_value().exec_cast("TEXT"),
-                };
-                let match_expression = match match_expression.get_value() {
-                    Value::Text(_) => match_expression.get_value(),
-                    _ => &match_expression.get_value().exec_cast("TEXT"),
-                };
+                let pattern_value = pattern_reg.get_value();
+                let match_value = match_reg.get_value();
 
-                let result = match (pattern, match_expression) {
-                    (Value::Text(pattern), Value::Text(match_expression)) if arg_count == 3 => {
-                        match construct_like_escape_arg(
-                            state.registers[*start_reg + 2].get_value(),
-                        )? {
-                            Some(escape) => Value::Integer(exec_like_with_escape(
-                                pattern.as_str(),
-                                match_expression.as_str(),
-                                escape,
-                            ) as i64),
-                            None => Value::Null,
+                // 1. Check for NULL inputs
+                if pattern_value == &Value::Null || match_value == &Value::Null {
+                    state.registers[*dest] = Register::Value(Value::Null);
+                } else {
+                    // 2. Resolve Escape Character (if 3rd arg exists)
+                    let mut escape_char = None;
+                    let mut is_null_result = false;
+
+                    if arg_count == 3 {
+                        let escape_value = state.registers[*start_reg + 2].get_value();
+                        match escape_value {
+                            Value::Null => {
+                                is_null_result = true;
+                            }
+                            _ => {
+                                let escape_cow = match escape_value {
+                                    Value::Text(s) => std::borrow::Cow::Borrowed(s.as_str()),
+                                    v => match v.exec_cast("TEXT") {
+                                        Value::Text(s) => std::borrow::Cow::Owned(s.to_string()),
+                                        _ => unreachable!("Cast to TEXT should yield Text"),
+                                    },
+                                };
+
+                                let mut chars = escape_cow.chars();
+                                let c = chars.next();
+                                if c.is_none() || chars.next().is_some() {
+                                    return Err(LimboError::Constraint(
+                                        "ESCAPE expression must be a single character".to_string(),
+                                    ));
+                                }
+                                escape_char = c;
+                            }
                         }
                     }
-                    (Value::Text(pattern), Value::Text(match_expression)) => {
-                        let cache = if *constant_mask > 0 {
-                            Some(&mut state.regex_cache.like)
-                        } else {
-                            None
-                        };
-                        let matches =
-                            Value::exec_like(cache, pattern.as_str(), match_expression.as_str())?;
-                        Value::Integer(matches as i64)
-                    }
-                    (Value::Null, _) | (_, Value::Null) => Value::Null,
-                    _ => {
-                        unreachable!("Like failed");
-                    }
-                };
 
-                state.registers[*dest] = Register::Value(result);
+                    if is_null_result {
+                        state.registers[*dest] = Register::Value(Value::Null);
+                    } else {
+                        // 3. Prepare Pattern and Text
+                        let pattern_cow = match pattern_value {
+                            Value::Text(s) => std::borrow::Cow::Borrowed(s.as_str()),
+                            v => match v.exec_cast("TEXT") {
+                                Value::Text(s) => std::borrow::Cow::Owned(s.to_string()),
+                                _ => unreachable!("Cast to TEXT should yield Text"),
+                            },
+                        };
+
+                        let match_cow = match match_value {
+                            Value::Text(s) => std::borrow::Cow::Borrowed(s.as_str()),
+                            v => match v.exec_cast("TEXT") {
+                                Value::Text(s) => std::borrow::Cow::Owned(s.to_string()),
+                                _ => unreachable!("Cast to TEXT should yield Text"),
+                            },
+                        };
+
+                        // 4. Execute Like
+                        let matches = Value::exec_like(&pattern_cow, &match_cow, escape_char)?;
+                        state.registers[*dest] = Register::Value(Value::Integer(matches as i64));
+                    }
+                }
             }
             ScalarFunc::Abs
             | ScalarFunc::Lower
