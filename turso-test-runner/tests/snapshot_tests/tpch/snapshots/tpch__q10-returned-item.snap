@@ -1,0 +1,166 @@
+---
+source: tpch.sqltest
+expression: |-
+  select
+          c_custkey,
+          c_name,
+          sum(l_extendedprice * (1 - l_discount)) as revenue,
+          c_acctbal,
+          n_name,
+          c_address,
+          c_phone,
+          c_comment
+      from
+          customer,
+          orders,
+          lineitem,
+          nation
+      where
+          c_custkey = o_custkey
+          and l_orderkey = o_orderkey
+          and o_orderdate >= '1994-01-01'
+          and o_orderdate < '1994-04-01'
+          and l_returnflag = 'R'
+          and c_nationkey = n_nationkey
+      group by
+          c_custkey,
+          c_name,
+          c_acctbal,
+          c_phone,
+          n_name,
+          c_address,
+          c_comment
+      order by
+          revenue desc
+      limit 20;
+info:
+  statement_type: SELECT
+  tables:
+  - customer
+  setup_blocks:
+  - schema
+  database: ':memory:'
+---
+QUERY PLAN
+|--SEARCH customer USING INTEGER PRIMARY KEY (rowid=?)
+|--SCAN orders
+|--SEARCH lineitem USING INDEX sqlite_autoindex_lineitem_1
+|--SEARCH nation USING INTEGER PRIMARY KEY (rowid=?)
+`--USE TEMP B-TREE FOR ORDER BY
+
+BYTECODE
+addr  opcode                    p1   p2  p3  p4                                                            p5  comment
+   0          Init               0  108   0                                                                 0  Start at 108
+   1          SorterOpen         0    1   0  k(1,-B)                                                        0  cursor=0
+   2          Null               0   27   0                                                                 0  r[27]=NULL
+   3          SorterOpen         1    8   0  k(7,-B,-B,-B,-B,-B,-B,-B)                                      0  cursor=1
+   4          Integer            0   12   0                                                                 0  r[12]=0; clear group by abort flag
+   5          Null               0   13  19                                                                 0  r[13..19]=NULL; initialize group by comparison registers to NULL
+   6          Gosub             37   90   0                                                                 0  ; go to clear accumulator subroutine
+   7          Integer           20   38   0                                                                 0  r[38]=20; LIMIT counter
+   8          IfNot             38   44   0                                                                 0  if !r[38] goto 44
+   9          OpenRead           3    8   0  k(8,B,B,B,B,B,B,B,B)                                           0  table=customer, root=8, iDb=0
+  10          OpenRead           4    9   0  k(9,B,B,B,B,B,B,B,B,B)                                         0  table=orders, root=9, iDb=0
+  11          OpenRead           5   10   0  k(17,B,B,B,B,B,B,B,B,B,B,B,B,B,B,B,B)                          0  table=lineitem, root=10, iDb=0
+  12          OpenRead           6   11   0  k(3,B,B)                                                       0  index=sqlite_autoindex_lineitem_1, root=11, iDb=0
+  13          OpenRead           7    2   0  k(4,B,B,B,B)                                                   0  table=nation, root=2, iDb=0
+  14          Rewind             4   44   0                                                                 0  Rewind table orders
+  15            Column           4    4  40                                                                 0  r[40]=orders.o_orderdate
+  16            Lt              40   41  43  Binary                                                         0  if r[40]<r[41] goto 43
+  17            Column           4    4  43                                                                 0  r[43]=orders.o_orderdate
+  18            Ge              43   44  43  Binary                                                         0  if r[43]>=r[44] goto 43
+  19            RowId            4   45   0                                                                 0  r[45]=orders.rowid
+  20            SeekGE           6   43  45                                                                 0  key=[45..45]
+  21              IdxGT          6   43  45                                                                 0  key=[45..45]
+  22              DeferredSeek   6    5   0                                                                 0
+  23              Column         5    8  47                                                                 0  r[47]=lineitem.l_returnflag
+  24              Ne            47   48  42  Binary                                                         0  if r[47]!=r[48] goto 42
+  25              Column         4    1  49                                                                 0  r[49]=orders.o_custkey
+  26              SeekRowid      3   49  42                                                                 0  if (r[49]!=cursor 3 for table customer.rowid) goto 42
+  27              Column         3    3  50                                                                 0  r[50]=customer.c_nationkey
+  28              SeekRowid      7   50  42                                                                 0  if (r[50]!=cursor 7 for table nation.rowid) goto 42
+  29              RowId          3   29   0                                                                 0  r[29]=customer.rowid
+  30              Column         3    1  30                                                                 0  r[30]=customer.c_name
+  31              Column         3    5  31                                                                 0  r[31]=customer.c_acctbal
+  32              Column         3    4  32                                                                 0  r[32]=customer.c_phone
+  33              Column         7    1  33                                                                 0  r[33]=nation.n_name
+  34              Column         3    2  34                                                                 0  r[34]=customer.c_address
+  35              Column         3    7  35                                                                 0  r[35]=customer.c_comment
+  36              Column         5    5  51                                                                 0  r[51]=lineitem.l_extendedprice
+  37              Column         5    6  54                                                                 0  r[54]=lineitem.l_discount
+  38              Subtract      53   54  52                                                                 0  r[52]=r[53]-r[54]
+  39              Multiply      51   52  36                                                                 0  r[36]=r[51]*r[52]
+  40              MakeRecord    29    8  28                                                                 0  r[28]=mkrec(r[29..36])
+  41              SorterInsert   1   28   0  0                                                              0  key=r[28]
+  42            Next             6   21   0                                                                 0
+  43          Next               4   15   0                                                                 0
+  44          OpenPseudo         2   28   8                                                                 0  8 columns in r[28]
+  45          SorterSort         1   72   0                                                                 0
+  46            SorterData       1   28   2                                                                 0  r[28]=data
+  47            Column           2    0  55                                                                 0  r[55]=pseudo.column 0
+  48            Column           2    1  56                                                                 0  r[56]=pseudo.column 1
+  49            Column           2    2  57                                                                 0  r[57]=pseudo.column 2
+  50            Column           2    3  58                                                                 0  r[58]=pseudo.column 3
+  51            Column           2    4  59                                                                 0  r[59]=pseudo.column 4
+  52            Column           2    5  60                                                                 0  r[60]=pseudo.column 5
+  53            Column           2    6  61                                                                 0  r[61]=pseudo.column 6
+  54            Compare         13   55   7  k(7, Binary, Binary, Binary, Binary, Binary, Binary, Binary)   0  r[13..19]==r[55..61]
+  55            Jump            56   60  56                                                                 0  ; start new group if comparison is not equal
+  56            Gosub           10   76   0                                                                 0  ; check if ended group had data, and output if so
+  57            Move            55   13   7                                                                 0  r[13..19]=r[55..61]
+  58            IfPos           12   93   0                                                                 0  r[12]>0 -> r[12]-=0, goto 93; check abort flag
+  59            Gosub           37   90   0                                                                 0  ; goto clear accumulator subroutine
+  60            Column           2    7  62                                                                 0  r[62]=pseudo.column 7
+  61            AggStep          0   62  27  sum                                                            0  accum=r[27] step(r[62])
+  62            If              11   70   0                                                                 0  if r[11] goto 70; don't emit group columns if continuing existing group
+  63            Column           2    0  20                                                                 0  r[20]=pseudo.column 0
+  64            Column           2    1  21                                                                 0  r[21]=pseudo.column 1
+  65            Column           2    2  22                                                                 0  r[22]=pseudo.column 2
+  66            Column           2    3  23                                                                 0  r[23]=pseudo.column 3
+  67            Column           2    4  24                                                                 0  r[24]=pseudo.column 4
+  68            Column           2    5  25                                                                 0  r[25]=pseudo.column 5
+  69            Column           2    6  26                                                                 0  r[26]=pseudo.column 6
+  70            Integer          1   11   0                                                                 0  r[11]=1; indicate data in accumulator
+  71          SorterNext         1   46   0                                                                 0
+  72          Gosub             10   76   0                                                                 0  ; emit row for final group
+  73          Goto               0   93   0                                                                 0  ; group by finished
+  74          Integer            1   12   0                                                                 0  r[12]=1
+  75        Return              10    0   0                                                                 0
+  76        IfPos               11   78   0                                                                 0  r[11]>0 -> r[11]-=0, goto 78; output group by row subroutine start
+  77      Return                10    0   0                                                                 0
+  78      AggFinal               0   27   0  sum                                                            0  accum=r[27]
+  79      Copy                  27   63   0                                                                 0  r[63]=r[27]
+  80      Copy                  20   64   0                                                                 0  r[64]=r[20]
+  81      Copy                  21   65   0                                                                 0  r[65]=r[21]
+  82      Copy                  22   66   0                                                                 0  r[66]=r[22]
+  83      Copy                  24   67   0                                                                 0  r[67]=r[24]
+  84      Copy                  25   68   0                                                                 0  r[68]=r[25]
+  85      Copy                  23   69   0                                                                 0  r[69]=r[23]
+  86      Copy                  26   70   0                                                                 0  r[70]=r[26]
+  87      MakeRecord            63    8   9                                                                 0  r[9]=mkrec(r[63..70])
+  88      SorterInsert           0    9   0  0                                                              0  key=r[9]
+  89    Return                  10    0   0                                                                 0
+  90    Null                     0   20  27                                                                 0  r[20..27]=NULL; clear accumulator subroutine start
+  91    Integer                  0   11   0                                                                 0  r[11]=0
+  92  Return                    37    0   0                                                                 0
+  93  OpenPseudo                 8    9   8                                                                 0  8 columns in r[9]
+  94  SorterSort                 0  107   0                                                                 0
+  95    SorterData               0    9   8                                                                 0  r[9]=data
+  96    Column                   8    1   1                                                                 0  r[1]=pseudo.column 1
+  97    Column                   8    2   2                                                                 0  r[2]=pseudo.column 2
+  98    Column                   8    0   3                                                                 0  r[3]=pseudo.column 0
+  99    Column                   8    3   4                                                                 0  r[4]=pseudo.column 3
+ 100    Column                   8    4   5                                                                 0  r[5]=pseudo.column 4
+ 101    Column                   8    5   6                                                                 0  r[6]=pseudo.column 5
+ 102    Column                   8    6   7                                                                 0  r[7]=pseudo.column 6
+ 103    Column                   8    7   8                                                                 0  r[8]=pseudo.column 7
+ 104    ResultRow                1    8   0                                                                 0  output=r[1..8]
+ 105    DecrJumpZero            38  107   0                                                                 0  if (--r[38]==0) goto 107
+ 106  SorterNext                 0   95   0                                                                 0
+ 107  Halt                       0    0   0                                                                 0
+ 108  Transaction                0    1   8                                                                 0  iDb=0 tx_mode=Read
+ 109  String8                    0   41   0  1994-01-01                                                     0  r[41]='1994-01-01'
+ 110  String8                    0   44   0  1994-04-01                                                     0  r[44]='1994-04-01'
+ 111  String8                    0   48   0  R                                                              0  r[48]='R'
+ 112  Integer                    1   53   0                                                                 0  r[53]=1
+ 113  Goto                       0    1   0                                                                 0
