@@ -1,6 +1,6 @@
 use crate::sync::{atomic::Ordering, Arc};
 use intrusive_collections::{intrusive_adapter, LinkedList, LinkedListLink};
-use rustc_hash::FxHashMap;
+use rustc_hash::FxHashMap as HashMap;
 use tracing::trace;
 
 use crate::{
@@ -100,7 +100,7 @@ pub struct PageCache {
     /// Capacity in pages
     capacity: usize,
     /// Map of Key -> pointer to entry in the queue
-    map: FxHashMap<PageCacheKey, *mut PageCacheEntry>,
+    map: HashMap<PageCacheKey, *mut PageCacheEntry>,
     /// The eviction queue (intrusive doubly-linked list)
     queue: LinkedList<EntryAdapter>,
     /// Clock hand cursor for SIEVE eviction (pointer to an entry in the queue, or null)
@@ -159,7 +159,7 @@ impl PageCache {
         let spill_threshold = (capacity * DEFAULT_SPILL_THRESHOLD_PERCENT) / 100;
         Self {
             capacity,
-            map: FxHashMap::default(),
+            map: HashMap::default(),
             queue: LinkedList::new(EntryAdapter::new()),
             clock_hand: std::ptr::null_mut(),
             spill_threshold: spill_threshold.max(1),
@@ -638,12 +638,14 @@ impl PageCache {
 
     #[cfg(test)]
     fn verify_cache_integrity(&self) {
+        use rustc_hash::FxHashSet as HashSet;
+
         let map_len = self.map.len();
 
         // Count entries in queue
         let mut queue_len = 0;
         let mut cursor = self.queue.front();
-        let mut seen_keys = std::collections::HashSet::new();
+        let mut seen_keys = HashSet::default();
 
         while let Some(entry) = cursor.get() {
             queue_len += 1;
@@ -1144,7 +1146,7 @@ mod tests {
 
         let max_pages = 10;
         let mut cache = PageCache::new_with_spill(10, true);
-        let mut reference_map = std::collections::HashMap::new();
+        let mut reference_map = HashMap::default();
 
         for _ in 0..10000 {
             cache.print();

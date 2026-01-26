@@ -85,13 +85,11 @@ pub use io::{
     Buffer, Completion, CompletionType, File, GroupCompletion, MemoryIO, OpenFlags, PlatformIO,
     SyscallIO, WriteCompletion, IO,
 };
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use schema::Schema;
 pub use statement::Statement;
-use std::collections::HashSet;
 use std::time::Duration;
 use std::{
-    collections::HashMap,
     fmt::{self},
     ops::Deref,
 };
@@ -266,7 +264,7 @@ fn new_header_read_completion(buf: Arc<Buffer>) -> Completion {
 /// Mutex here would cause panics when the second iteration tries to lock a
 /// mutex that belongs to a stale execution context.
 static DATABASE_MANAGER: LazyLock<parking_lot::Mutex<HashMap<String, Weak<Database>>>> =
-    LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
+    LazyLock::new(|| parking_lot::Mutex::new(HashMap::default()));
 
 /// The `Database` object contains per database file state that is shared
 /// between multiple connections.
@@ -835,7 +833,7 @@ impl Database {
             db: self.clone(),
             pager: ArcSwap::new(pager),
             schema: RwLock::new(self.schema.lock().clone()),
-            database_schemas: RwLock::new(FxHashMap::default()),
+            database_schemas: RwLock::new(HashMap::default()),
             auto_commit: AtomicBool::new(true),
             transaction_state: AtomicTransactionState::new(TransactionState::None),
             last_insert_rowid: AtomicI64::new(0),
@@ -865,7 +863,7 @@ impl Database {
             is_mvcc_bootstrap_connection: AtomicBool::new(is_mvcc_bootstrap_connection),
             fk_pragma: AtomicBool::new(false),
             fk_deferred_violations: AtomicIsize::new(0),
-            vtab_txn_states: RwLock::new(HashSet::new()),
+            vtab_txn_states: RwLock::new(HashSet::default()),
         });
         self.n_connections
             .fetch_add(1, crate::sync::atomic::Ordering::SeqCst);
@@ -1220,8 +1218,8 @@ struct DatabaseCatalog {
 impl DatabaseCatalog {
     fn new() -> Self {
         Self {
-            name_to_index: HashMap::new(),
-            index_to_data: HashMap::new(),
+            name_to_index: HashMap::default(),
+            index_to_data: HashMap::default(),
             allocated: vec![3], // 0 | 1, as those are reserved for main and temp
         }
     }

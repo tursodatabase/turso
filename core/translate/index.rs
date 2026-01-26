@@ -1,5 +1,5 @@
 use crate::sync::Arc;
-use std::collections::HashMap;
+use rustc_hash::FxHashMap as HashMap;
 
 use crate::error::SQLITE_CONSTRAINT_UNIQUE;
 use crate::function::{Deterministic, Func};
@@ -711,7 +711,7 @@ fn emit_index_column_value_from_cursor(
 pub fn resolve_index_method_parameters(
     parameters: Vec<(turso_parser::ast::Name, Box<Expr>)>,
 ) -> crate::Result<HashMap<String, crate::Value>> {
-    let mut resolved = HashMap::new();
+    let mut resolved = HashMap::default();
     for (key, value) in parameters {
         let value = match *value {
             Expr::Literal(literal) => match literal {

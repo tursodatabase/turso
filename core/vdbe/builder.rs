@@ -1,7 +1,5 @@
-use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
-};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use std::sync::Arc;
 
 use tracing::{instrument, Level};
 use turso_parser::ast::{self, ResolveType, SortOrder, TableInternalId};
@@ -373,10 +371,10 @@ impl ProgramBuilder {
             is_subprogram,
             resolve_type: ResolveType::Abort,
             trigger_conflict_override: None,
-            cursor_overrides: HashMap::new(),
-            hash_build_signatures: HashMap::new(),
-            hash_tables_to_keep_open: HashSet::new(),
-            subquery_result_regs: HashMap::new(),
+            cursor_overrides: HashMap::default(),
+            hash_build_signatures: HashMap::default(),
+            hash_tables_to_keep_open: HashSet::default(),
+            subquery_result_regs: HashMap::default(),
         }
     }
 

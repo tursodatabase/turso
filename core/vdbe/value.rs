@@ -1995,7 +1995,7 @@ mod tests {
 
     #[test]
     fn test_like_with_cache() {
-        let mut cache = HashMap::new();
+        let mut cache = HashMap::default();
         assert!(Value::exec_like(Some(&mut cache), "a%", "aaaa").unwrap());
         assert!(Value::exec_like(Some(&mut cache), "%a%a", "aaaa").unwrap());
         assert!(!Value::exec_like(Some(&mut cache), "%a.a", "aaaa").unwrap());

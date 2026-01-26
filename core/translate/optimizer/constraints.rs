@@ -12,11 +12,8 @@ use crate::{
     vdbe::affinity::Affinity,
     Result,
 };
-use std::{
-    cmp::Ordering,
-    collections::{HashMap, VecDeque},
-    sync::Arc,
-};
+use rustc_hash::FxHashMap as HashMap;
+use std::{cmp::Ordering, collections::VecDeque, sync::Arc};
 use turso_ext::{ConstraintInfo, ConstraintOp};
 use turso_parser::ast::{self, SortOrder, TableInternalId};
 
