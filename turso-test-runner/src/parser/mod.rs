@@ -1,9 +1,11 @@
 pub mod ast;
 pub mod lexer;
+mod sql_complete;
 
 use ast::*;
 use lexer::{SpannedToken, Token, tokenize};
 use miette::{Diagnostic, SourceSpan};
+use sql_complete::count_sql_statements;
 use std::collections::HashMap;
 use std::ops::Range;
 use std::path::PathBuf;
@@ -668,6 +670,37 @@ impl Parser {
                 });
             }
             seen_snapshot_names.insert(&snapshot.name, snapshot.name_span.clone());
+        }
+
+        // Rule 7: Snapshots must contain exactly one SQL statement
+        for snapshot in &file.snapshots {
+            let statement_count = count_sql_statements(&snapshot.sql);
+            if statement_count == 0 {
+                return Err(ParseError::ValidationError {
+                    message: format!("snapshot '{}' contains no SQL statements", snapshot.name),
+                    span: Some(SourceSpan::new(
+                        snapshot.name_span.start.into(),
+                        snapshot.name_span.len(),
+                    )),
+                    help: Some("Add a SQL statement to the snapshot block".to_string()),
+                });
+            }
+            if statement_count > 1 {
+                return Err(ParseError::ValidationError {
+                    message: format!(
+                        "snapshot '{}' contains {} SQL statements, but only 1 is allowed",
+                        snapshot.name, statement_count
+                    ),
+                    span: Some(SourceSpan::new(
+                        snapshot.name_span.start.into(),
+                        snapshot.name_span.len(),
+                    )),
+                    help: Some(
+                        "Snapshots can only contain a single SQL statement. Split into multiple snapshot blocks if needed."
+                            .to_string(),
+                    ),
+                });
+            }
         }
 
         Ok(())
@@ -1502,5 +1535,122 @@ snapshot same-name {
 
         let result = parse(input);
         assert!(matches!(result, Err(ParseError::ValidationError { .. })));
+    }
+
+    #[test]
+    fn test_snapshot_single_statement_valid() {
+        let input = r#"
+@database :memory:
+
+snapshot query-plan {
+    SELECT * FROM users WHERE id = 1;
+}
+"#;
+
+        let result = parse(input);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_snapshot_multiple_statements_invalid() {
+        let input = r#"
+@database :memory:
+
+snapshot query-plan {
+    CREATE TABLE t (id INTEGER);
+    SELECT * FROM t;
+}
+"#;
+
+        let result = parse(input);
+        assert!(matches!(result, Err(ParseError::ValidationError { .. })));
+        if let Err(ParseError::ValidationError { message, .. }) = result {
+            assert!(message.contains("2 SQL statements"));
+        }
+    }
+
+    #[test]
+    fn test_snapshot_string_with_semicolon_valid() {
+        // Semicolon inside a string should not count as statement separator
+        let input = r#"
+@database :memory:
+
+snapshot query-plan {
+    SELECT 'hello; world' FROM users;
+}
+"#;
+
+        let result = parse(input);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_snapshot_comment_with_semicolon_valid() {
+        // Semicolon inside a comment should not count as statement separator
+        let input = r#"
+@database :memory:
+
+snapshot query-plan {
+    SELECT * FROM users; -- this; is; a; comment
+}
+"#;
+
+        // This has a semicolon after SELECT and then a comment with semicolons
+        // The semicolon after users ends the statement, the comment ones don't count
+        let result = parse(input);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_snapshot_block_comment_with_semicolon_valid() {
+        let input = r#"
+@database :memory:
+
+snapshot query-plan {
+    SELECT /* ; ; ; */ * FROM users;
+}
+"#;
+
+        let result = parse(input);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_snapshot_trigger_single_statement_valid() {
+        // A CREATE TRIGGER with internal semicolons is still one statement
+        let input = r#"
+@database :memory:
+
+snapshot trigger-plan {
+    CREATE TRIGGER log_insert AFTER INSERT ON users BEGIN
+        INSERT INTO log VALUES('inserted');
+        UPDATE stats SET count = count + 1;
+    END;
+}
+"#;
+
+        let result = parse(input);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_snapshot_trigger_followed_by_select_invalid() {
+        // A CREATE TRIGGER followed by another statement is two statements
+        let input = r#"
+@database :memory:
+
+snapshot trigger-plan {
+    CREATE TRIGGER log_insert AFTER INSERT ON users BEGIN
+        INSERT INTO log VALUES('inserted');
+    END;
+    SELECT 1;
+}
+"#;
+
+        let result = parse(input);
+        assert!(matches!(result, Err(ParseError::ValidationError { .. })));
+        if let Err(ParseError::ValidationError { message, .. }) = result {
+            assert!(message.contains("2 SQL statements"));
+        }
     }
 }
