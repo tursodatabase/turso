@@ -1124,7 +1124,9 @@ impl Jsonb {
         mut depth: usize,
         indent: &JsonIndentation,
     ) -> Result<usize> {
-        let end_cursor = cursor + len;
+        let end_cursor = cursor
+            .checked_add(len)
+            .ok_or_else(|| LimboError::ParseError("Invalid JSONB: payload size overflow".into()))?;
         let mut current_cursor = cursor;
         depth += 1;
         string.push('{');
@@ -1182,7 +1184,9 @@ impl Jsonb {
         mut depth: usize,
         indent: &JsonIndentation,
     ) -> Result<usize> {
-        let end_cursor = cursor + len;
+        let end_cursor = cursor
+            .checked_add(len)
+            .ok_or_else(|| LimboError::ParseError("Invalid JSONB: payload size overflow".into()))?;
         let mut current_cursor = cursor;
         depth += 1;
         string.push('[');
@@ -1221,10 +1225,13 @@ impl Jsonb {
         kind: &ElementType,
         quote: bool,
     ) -> Result<usize> {
-        if cursor + len > self.data.len() {
+        let end_cursor = cursor
+            .checked_add(len)
+            .ok_or_else(|| LimboError::ParseError("Invalid JSONB: payload size overflow".into()))?;
+        if end_cursor > self.data.len() {
             bail_parse_error!("Invalid JSONB: string extends beyond data");
         }
-        let word_slice = &self.data[cursor..cursor + len];
+        let word_slice = &self.data[cursor..end_cursor];
         if quote {
             string.push('"');
         }
@@ -1386,7 +1393,7 @@ impl Jsonb {
             string.push('"');
         }
 
-        Ok(cursor + len)
+        Ok(end_cursor)
     }
 
     fn serialize_number(
@@ -1396,7 +1403,9 @@ impl Jsonb {
         len: usize,
         kind: &ElementType,
     ) -> Result<usize> {
-        let current_cursor = cursor + len;
+        let current_cursor = cursor
+            .checked_add(len)
+            .ok_or_else(|| LimboError::ParseError("Invalid JSONB: payload size overflow".into()))?;
         if current_cursor > self.data.len() {
             bail_parse_error!("Invalid JSONB: number extends beyond data");
         }
@@ -4060,6 +4069,28 @@ world""#,
         assert!(result.contains(r#""backslashes":"C:\\Windows\\System32""#));
         assert!(result.contains(r#""control_chars":"\b\f\n\r\t""#));
         assert!(result.contains(r#""unicode":"\u00A9 2023""#));
+    }
+
+    #[test]
+    fn test_malformed_jsonb_payload_size_overflow() {
+        // Test that malformed JSONB data with extremely large payload sizes
+        // does not cause a panic due to integer overflow.
+        // This creates JSONB data with a header indicating a payload size
+        // that would overflow when added to the cursor position.
+
+        // Create a JSONB string with an 8-byte size field indicating usize::MAX
+        // Header: 0xF7 = TEXT type (0x7) with 8-byte size marker (0xF)
+        // Followed by 8 bytes of 0xFF = u64::MAX payload size
+        let malformed_data: Vec<u8> = vec![
+            0xF7, // TEXT with 8-byte size (header_size=15)
+            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // u64::MAX as payload size
+            b'a', b'b', b'c', // some actual data (doesn't matter, cursor+len will overflow)
+        ];
+
+        let jsonb = Jsonb::new(0, Some(&malformed_data));
+        // Should return an error, not panic
+        let result = jsonb.to_string();
+        assert!(result.is_err());
     }
 }
 
