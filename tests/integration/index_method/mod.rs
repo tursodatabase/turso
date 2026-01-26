@@ -68,7 +68,7 @@ fn test_vector_sparse_ivf_create_destroy(tmp_db: TempDatabase) {
                 default: None,
                 expr: None,
             }],
-            parameters: HashMap::new(),
+            parameters: HashMap::default(),
         })
         .unwrap();
 
@@ -111,7 +111,7 @@ fn test_vector_sparse_ivf_insert_query(tmp_db: TempDatabase) {
                 default: None,
                 expr: None,
             }],
-            parameters: HashMap::new(),
+            parameters: HashMap::default(),
         })
         .unwrap();
 
@@ -201,7 +201,7 @@ fn test_vector_sparse_ivf_update(tmp_db: TempDatabase) {
                 default: None,
                 expr: None,
             }],
-            parameters: HashMap::new(),
+            parameters: HashMap::default(),
         })
         .unwrap();
 
@@ -429,7 +429,7 @@ fn test_fts_create_destroy(tmp_db: TempDatabase) {
                     expr: None,
                 },
             ],
-            parameters: HashMap::new(),
+            parameters: HashMap::default(),
         })
         .unwrap();
 
@@ -488,7 +488,7 @@ fn test_fts_insert_query(tmp_db: TempDatabase) {
                     expr: None,
                 },
             ],
-            parameters: HashMap::new(),
+            parameters: HashMap::default(),
         })
         .unwrap();
 

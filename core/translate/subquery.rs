@@ -1,5 +1,6 @@
-use std::{collections::HashSet, sync::Arc};
+use std::sync::Arc;
 
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use turso_parser::ast::{self, SortOrder, SubqueryType};
 
 use crate::{
@@ -737,8 +738,8 @@ pub fn emit_from_clause_subquery(
                 non_aggregate_expressions: Vec::new(),
                 cdc_cursor_id: None,
                 meta_window: None,
-                materialized_build_inputs: std::collections::HashMap::new(),
-                hash_table_contexts: std::collections::HashMap::new(),
+                materialized_build_inputs: HashMap::default(),
+                hash_table_contexts: HashMap::default(),
             };
             emit_query(program, select_plan, &mut metadata)?
         }

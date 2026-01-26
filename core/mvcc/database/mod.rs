@@ -33,7 +33,7 @@ use crate::ValueRef;
 use crate::{Connection, Pager, SyncMode};
 use crossbeam_skiplist::map::Entry;
 use crossbeam_skiplist::{SkipMap, SkipSet};
-use std::collections::HashMap;
+use rustc_hash::FxHashMap as HashMap;
 use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::ops::Bound;
@@ -1312,7 +1312,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             checkpointed_txid_max: AtomicU64::new(0),
             last_committed_schema_change_ts: AtomicU64::new(0),
             last_committed_tx_ts: AtomicU64::new(0),
-            table_id_to_last_rowid: RwLock::new(HashMap::new()),
+            table_id_to_last_rowid: RwLock::new(HashMap::default()),
         }
     }
 
@@ -2937,7 +2937,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         let tx_id = LOGICAL_LOG_RECOVERY_TRANSACTION_ID;
         self.begin_load_tx(connection.clone())?;
 
-        let mut index_infos: HashMap<MVTableId, Arc<IndexInfo>> = HashMap::new();
+        let mut index_infos: HashMap<MVTableId, Arc<IndexInfo>> = HashMap::default();
 
         // Helper to get an Arc<IndexInfo> to construct a SortableIndexKey
         let mut get_index_info = |index_id: MVTableId| -> Result<Arc<IndexInfo>> {

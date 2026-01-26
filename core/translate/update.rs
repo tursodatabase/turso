@@ -1,5 +1,5 @@
 use crate::sync::Arc;
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use crate::schema::ROWID_SENTINEL;
 use crate::translate::emitter::Resolver;
@@ -455,7 +455,7 @@ fn build_scan_op(table: &Table, iter_dir: IterationDirection) -> Operation {
 /// Returns a set of column indices used in the expression.
 /// *Must* be used on an Expr already processed by `bind_and_rewrite_expr`
 fn collect_cols_used_in_expr(expr: &Expr) -> HashSet<usize> {
-    let mut acc = HashSet::new();
+    let mut acc = HashSet::default();
     let _ = walk_expr(expr, &mut |expr| match expr {
         Expr::Column { column, .. } => {
             acc.insert(*column);
@@ -483,7 +483,7 @@ fn columns_used_by_index_expr(
     )
     .is_err()
     {
-        return HashSet::new();
+        return HashSet::default();
     }
     collect_cols_used_in_expr(&expr_copy)
 }

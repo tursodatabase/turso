@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use smallvec::SmallVec;
 
@@ -802,7 +802,7 @@ fn build_has_uncovered_prior_constraints(
     prior_mask: &TableMask,
     prior_hash_build_mask: &TableMask,
 ) -> bool {
-    let mut join_key_indices = HashSet::new();
+    let mut join_key_indices = HashSet::default();
     for join_key in join_keys {
         join_key_indices.insert(join_key.where_clause_idx);
     }
@@ -1008,7 +1008,7 @@ pub fn compute_best_join_order<'a>(
     // subset plan is not always the best foundation for the next join. Keeping variants
     // lets the planner choose a better join order later (e.g. for hash-join chaining).
     let mut best_plan_memo: HashMap<TableMask, HashMap<usize, JoinN>> =
-        HashMap::with_capacity(2usize.pow(num_tables as u32 - 1));
+        HashMap::with_capacity_and_hasher(2usize.pow(num_tables as u32 - 1), Default::default());
 
     // Dynamic programming base case: calculate the best way to access each single table, as if
     // there were no other tables.
@@ -1060,7 +1060,7 @@ pub fn compute_best_join_order<'a>(
         } else {
             // map from rhs table index to lhs table index
             let mut left_join_illegal_map: HashMap<usize, TableMask> =
-                HashMap::with_capacity(left_join_count);
+                HashMap::with_capacity_and_hasher(left_join_count, Default::default());
             for (i, _) in joined_tables.iter().enumerate() {
                 for (j, joined_table) in joined_tables.iter().enumerate().skip(i + 1) {
                     if joined_table.join_info.as_ref().is_some_and(|j| j.outer) {
@@ -1086,7 +1086,7 @@ pub fn compute_best_join_order<'a>(
             // Keep track of the best way to join this subset of tables per possible last table.
             // This preserves alternative join orders that may be more expensive for the subset
             // but enable cheaper joins when adding more tables.
-            let mut best_for_mask_by_last: HashMap<usize, JoinN> = HashMap::new();
+            let mut best_for_mask_by_last: HashMap<usize, JoinN> = HashMap::default();
             // Also keep track of the best plan for this subset that orders the rows in an
             // Interesting Way (tm), i.e. allows us to eliminate sort operations downstream.
             let mut best_ordered_for_mask: Option<JoinN> = None;
@@ -1603,7 +1603,7 @@ fn expr_table_ids_filtered(
     expr: &Expr,
     joined_ids: &HashSet<TableInternalId>,
 ) -> HashSet<TableInternalId> {
-    let mut tables = HashSet::new();
+    let mut tables = HashSet::default();
     let _ = walk_expr(expr, &mut |node| {
         match node {
             Expr::Column { table, .. } | Expr::RowId { table, .. } => {
@@ -1712,7 +1712,7 @@ mod tests {
     /// Test that [compute_best_join_order] returns None when there are no table references.
     fn test_compute_best_join_order_empty() {
         let table_references = TableReferences::new(vec![], vec![]);
-        let available_indexes = HashMap::new();
+        let available_indexes = HashMap::default();
         let mut where_clause = vec![];
 
         let mut access_methods_arena = Vec::new();
@@ -1754,7 +1754,7 @@ mod tests {
             table_id_counter.next(),
         )];
         let table_references = TableReferences::new(joined_tables, vec![]);
-        let available_indexes = HashMap::new();
+        let available_indexes = HashMap::default();
         let mut where_clause = vec![];
 
         let mut access_methods_arena = Vec::new();
@@ -1811,7 +1811,7 @@ mod tests {
 
         let table_references = TableReferences::new(joined_tables, vec![]);
         let mut access_methods_arena = Vec::new();
-        let available_indexes = HashMap::new();
+        let available_indexes = HashMap::default();
         let table_constraints = constraints_from_where_clause(
             &where_clause,
             &table_references,
@@ -1874,7 +1874,7 @@ mod tests {
 
         let table_references = TableReferences::new(joined_tables, vec![]);
         let mut access_methods_arena = Vec::new();
-        let mut available_indexes = HashMap::new();
+        let mut available_indexes = HashMap::default();
         let index = Arc::new(Index {
             name: "sqlite_autoindex_test_table_1".to_string(),
             table_name: "test_table".to_string(),
@@ -1957,7 +1957,7 @@ mod tests {
         const TABLE1: usize = 0;
         const TABLE2: usize = 1;
 
-        let mut available_indexes = HashMap::new();
+        let mut available_indexes = HashMap::default();
         // Index on the outer table (table1)
         let index1 = Arc::new(Index {
             name: "index1".to_string(),
@@ -2085,7 +2085,7 @@ mod tests {
         const TABLE_NO_CUSTOMERS: usize = 1;
         const TABLE_NO_ORDER_ITEMS: usize = 2;
 
-        let mut available_indexes = HashMap::new();
+        let mut available_indexes = HashMap::default();
         ["orders", "customers", "order_items"]
             .iter()
             .for_each(|table_name| {
@@ -2303,7 +2303,7 @@ mod tests {
         ];
 
         let table_references = TableReferences::new(joined_tables, vec![]);
-        let available_indexes = HashMap::new();
+        let available_indexes = HashMap::default();
         let mut access_methods_arena = Vec::new();
         let table_constraints = constraints_from_where_clause(
             &where_clause,
@@ -2423,7 +2423,7 @@ mod tests {
 
         let table_references = TableReferences::new(joined_tables, vec![]);
         let mut access_methods_arena = Vec::new();
-        let available_indexes = HashMap::new();
+        let available_indexes = HashMap::default();
         let table_constraints = constraints_from_where_clause(
             &where_clause,
             &table_references,
@@ -2498,7 +2498,7 @@ mod tests {
             tables.push(_create_btree_table(&format!("t{}", i + 1), columns));
         }
 
-        let available_indexes = HashMap::new();
+        let available_indexes = HashMap::default();
 
         let mut table_id_counter = TableRefIdCounter::new();
         // Create table references
@@ -2626,7 +2626,7 @@ mod tests {
             index_method: None,
         });
 
-        let mut available_indexes = HashMap::new();
+        let mut available_indexes = HashMap::default();
         available_indexes.insert("t1".to_string(), VecDeque::from([index]));
 
         let table = Table::BTree(table);
@@ -2698,7 +2698,7 @@ mod tests {
     fn test_index_skips_middle_column() {
         let mut table_id_counter = TableRefIdCounter::new();
         let mut joined_tables = Vec::new();
-        let mut available_indexes = HashMap::new();
+        let mut available_indexes = HashMap::default();
 
         let columns = _create_column_list(&["c1", "c2", "c3"], Type::Integer);
         let table = _create_btree_table("t1", columns);
@@ -2829,7 +2829,7 @@ mod tests {
     fn test_index_stops_at_range_operator() {
         let mut table_id_counter = TableRefIdCounter::new();
         let mut joined_tables = Vec::new();
-        let mut available_indexes = HashMap::new();
+        let mut available_indexes = HashMap::default();
 
         let columns = _create_column_list(&["c1", "c2", "c3"], Type::Integer);
         let table = _create_btree_table("t1", columns);
@@ -3118,7 +3118,7 @@ mod tests {
         const TABLE2: usize = 1;
 
         // Index on t2.a
-        let mut available_indexes = HashMap::new();
+        let mut available_indexes = HashMap::default();
         let index_t2_a = Arc::new(Index {
             name: "idx_t2_a".to_string(),
             table_name: "t2".to_string(),

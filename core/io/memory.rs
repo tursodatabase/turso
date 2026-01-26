@@ -24,7 +24,7 @@ impl MemoryIO {
     pub fn new() -> Self {
         debug!("Using IO backend 'memory'");
         Self {
-            files: Arc::new(Mutex::new(HashMap::new())),
+            files: Arc::new(Mutex::new(HashMap::default())),
         }
     }
 }

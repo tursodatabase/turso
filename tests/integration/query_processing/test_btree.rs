@@ -405,7 +405,7 @@ impl BTreeGenerator<'_> {
         let mut pages = Vec::new();
         list_pages(root, &mut pages);
         pages[1..].shuffle(&mut self.rng);
-        let mut page_numbers = HashMap::new();
+        let mut page_numbers = HashMap::default();
         for (page, page_no) in pages.iter().zip(start_page..) {
             page_numbers.insert(Rc::as_ptr(page), page_no);
         }

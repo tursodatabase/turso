@@ -1,4 +1,5 @@
-use std::{cmp::Ordering, collections::HashMap, marker::PhantomData, sync::Arc};
+use rustc_hash::FxHashMap as HashMap;
+use std::{cmp::Ordering, marker::PhantomData, sync::Arc};
 use turso_parser::ast::{
     self, FrameBound, FrameClause, FrameExclude, FrameMode, ResolveType, SortOrder, SubqueryType,
 };

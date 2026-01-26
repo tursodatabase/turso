@@ -23,8 +23,7 @@ use crate::{
     Schema, Statement, SyncMode, TransactionMode, TransactionState, Trigger, Value, VirtualTable,
 };
 use arc_swap::ArcSwap;
-use rustc_hash::FxHashMap;
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::fmt::Display;
 use std::ops::Deref;
 use tracing::{instrument, Level};
@@ -35,7 +34,7 @@ pub struct Connection {
     pub(crate) schema: RwLock<Arc<Schema>>,
     /// Per-database schema cache (database_index -> schema)
     /// Loaded lazily to avoid copying all schemas on connection open
-    pub(super) database_schemas: RwLock<FxHashMap<usize, Arc<Schema>>>,
+    pub(super) database_schemas: RwLock<HashMap<usize, Arc<Schema>>>,
     /// Whether to automatically commit transaction
     pub(crate) auto_commit: AtomicBool,
     pub(super) transaction_state: AtomicTransactionState,
@@ -1399,7 +1398,7 @@ impl Connection {
     }
 
     /// Creates a HashSet of modules that have been loaded
-    pub fn get_syms_vtab_mods(&self) -> std::collections::HashSet<String> {
+    pub fn get_syms_vtab_mods(&self) -> HashSet<String> {
         self.syms.read().vtab_modules.keys().cloned().collect()
     }
 
@@ -1574,10 +1573,10 @@ pub fn resolve_ext_path(extpath: &str) -> Result<std::path::PathBuf> {
 impl SymbolTable {
     pub fn new() -> Self {
         Self {
-            functions: HashMap::new(),
-            vtabs: HashMap::new(),
-            vtab_modules: HashMap::new(),
-            index_methods: HashMap::new(),
+            functions: HashMap::default(),
+            vtabs: HashMap::default(),
+            vtab_modules: HashMap::default(),
+            index_methods: HashMap::default(),
         }
     }
     pub fn resolve_function(

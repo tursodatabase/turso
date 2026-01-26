@@ -16,7 +16,7 @@ use crate::{
     CheckpointResult, Completion, Connection, IOExt, LimboError, Pager, Result, SyncMode,
     TransactionState, Value, ValueRef,
 };
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::num::NonZeroU64;
 
 #[derive(Debug)]
@@ -188,10 +188,10 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
             write_set: Vec::new(),
             write_row_state_machine: None,
             delete_row_state_machine: None,
-            cursors: HashMap::new(),
-            created_btrees: HashMap::new(),
-            destroyed_tables: HashSet::new(),
-            destroyed_indexes: HashSet::new(),
+            cursors: HashMap::default(),
+            created_btrees: HashMap::default(),
+            destroyed_tables: HashSet::default(),
+            destroyed_indexes: HashSet::default(),
             index_write_set: Vec::new(),
             index_id_to_index,
             checkpoint_result: None,

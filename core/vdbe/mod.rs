@@ -205,8 +205,8 @@ struct RegexCache {
 impl RegexCache {
     fn new() -> Self {
         Self {
-            like: HashMap::new(),
-            glob: HashMap::new(),
+            like: HashMap::default(),
+            glob: HashMap::default(),
         }
     }
 }
@@ -441,7 +441,7 @@ impl ProgramState {
             once: SmallVec::<[u32; 4]>::new(),
             regex_cache: RegexCache::new(),
             execution_state: ProgramExecutionState::Init,
-            parameters: HashMap::new(),
+            parameters: HashMap::default(),
             commit_state: CommitState::Ready,
             #[cfg(feature = "json")]
             json_cache: JsonCacheCell::new(),
@@ -475,9 +475,9 @@ impl ProgramState {
             auto_txn_cleanup: TxnCleanup::None,
             fk_deferred_violations_when_stmt_started: AtomicIsize::new(0),
             fk_immediate_violations_during_stmt: AtomicIsize::new(0),
-            rowsets: HashMap::new(),
-            bloom_filters: HashMap::new(),
-            hash_tables: HashMap::new(),
+            rowsets: HashMap::default(),
+            bloom_filters: HashMap::default(),
+            hash_tables: HashMap::default(),
             uses_subjournal: false,
             n_change: AtomicI64::new(0),
             explain_state: RwLock::new(ExplainState::default()),

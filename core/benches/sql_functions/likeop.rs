@@ -202,7 +202,7 @@ fn glob_many_star_wildcards(bencher: Bencher) {
 #[divan::bench]
 fn glob_with_cache_first_call(bencher: Bencher) {
     bencher.bench_local(|| {
-        let mut cache = HashMap::new();
+        let mut cache = HashMap::default();
         exec_glob(
             Some(&mut cache),
             black_box("hello*"),
@@ -213,7 +213,7 @@ fn glob_with_cache_first_call(bencher: Bencher) {
 
 #[divan::bench]
 fn glob_with_cache_cached_hit(bencher: Bencher) {
-    let mut cache = HashMap::new();
+    let mut cache = HashMap::default();
     // Warm up the cache
     exec_glob(Some(&mut cache), "hello*", "hello world");
 
@@ -228,7 +228,7 @@ fn glob_with_cache_cached_hit(bencher: Bencher) {
 
 #[divan::bench]
 fn glob_complex_pattern_cached(bencher: Bencher) {
-    let mut cache = HashMap::new();
+    let mut cache = HashMap::default();
     let pattern = "*quick*fox*lazy*";
     let text = "The quick brown fox jumps over the lazy dog";
     // Warm up the cache
