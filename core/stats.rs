@@ -1,5 +1,5 @@
 use crate::sync::Arc;
-use std::collections::HashMap;
+use rustc_hash::FxHashMap as HashMap;
 
 use crate::schema::Schema;
 use crate::translate::emitter::TransactionMode;

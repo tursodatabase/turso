@@ -26,6 +26,7 @@ fn create_hash_table(mem_budget: usize) -> HashTable {
         mem_budget,
         num_keys: 1,
         collations: vec![CollationSeq::Binary],
+        temp_store: turso_core::TempStore::Default,
     };
     HashTable::new(config, io)
 }
@@ -223,6 +224,7 @@ fn bench_text_key_hashing(c: &mut Criterion) {
                         mem_budget: 64 * 1024,
                         num_keys: 1,
                         collations: vec![CollationSeq::Binary],
+                        temp_store: turso_core::TempStore::Default,
                     };
                     let mut ht = HashTable::new(config, io);
                     insert_text_key_entries(&mut ht, count);
@@ -244,6 +246,7 @@ fn bench_text_key_hashing(c: &mut Criterion) {
                         mem_budget: 64 * 1024,
                         num_keys: 1,
                         collations: vec![CollationSeq::NoCase],
+                        temp_store: turso_core::TempStore::Default,
                     };
                     let mut ht = HashTable::new(config, io);
                     insert_text_key_entries(&mut ht, count);

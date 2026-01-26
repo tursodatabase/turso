@@ -234,6 +234,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ar_archive_writer"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7eb93bbb63b9c227414f6eb3a0adfddca591a8ce1e9b60661bb08969b87e340b"
+dependencies = [
+ "object 0.37.3",
+]
+
+[[package]]
 name = "arc-swap"
 version = "1.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -381,7 +390,7 @@ dependencies = [
  "cfg-if",
  "libc",
  "miniz_oxide",
- "object",
+ "object 0.36.7",
  "rustc-demangle",
  "windows-targets 0.52.6",
 ]
@@ -406,6 +415,12 @@ name = "base64"
 version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
+
+[[package]]
+name = "beef"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3a8241f3ebb85c056b509d4327ad0358fbbba6ffb340bf388f26350aeda225b1"
 
 [[package]]
 name = "bincode"
@@ -574,7 +589,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "531a9155a481e2ee699d4f98f43c0ca4ff8ee1bfd55c31e9e98fb29d2b176fe0"
 dependencies = [
  "memchr",
- "regex-automata",
+ "regex-automata 0.4.13",
  "serde",
 ]
 
@@ -709,6 +724,20 @@ dependencies = [
  "serde",
  "wasm-bindgen",
  "windows-link",
+]
+
+[[package]]
+name = "chumsky"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4ba4a05c9ce83b07de31b31c874e87c069881ac4355db9e752e3a55c11ec75a6"
+dependencies = [
+ "hashbrown 0.15.2",
+ "regex-automata 0.3.9",
+ "serde",
+ "stacker",
+ "unicode-ident",
+ "unicode-segmentation",
 ]
 
 [[package]]
@@ -999,6 +1028,7 @@ dependencies = [
  "encode_unicode",
  "libc",
  "once_cell",
+ "unicode-width 0.2.0",
  "windows-sys 0.59.0",
 ]
 
@@ -1102,7 +1132,7 @@ checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
 name = "core_tester"
-version = "0.5.0-pre.1"
+version = "0.5.0-pre.2"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -1120,6 +1150,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "turso",
+ "turso-dbhash",
  "turso_core",
  "turso_macros",
  "turso_parser",
@@ -1555,8 +1586,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "deunicode"
+version = "1.6.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "abd57806937c9cc163efc8ea3910e00a62e2aeb0b8119f1793a978088f8f6b04"
+
+[[package]]
+name = "diff"
+version = "0.1.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "56254986775e3233ffa9c4d7d3faaf6d36a2c09d30b20687e9f88bc8bafc16c8"
+
+[[package]]
 name = "differential-fuzzer"
-version = "0.5.0-pre.1"
+version = "0.5.0-pre.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -1706,6 +1749,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f678cf4a922c215c63e0de95eb1ff08a958a81d47e485cf9da1e27bf6305cfa5"
 
 [[package]]
+name = "dummy"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3bbcf21279103a67372982cb1156a2154a452451dff2b884cf897ccecce389e0"
+dependencies = [
+ "darling",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.100",
+]
+
+[[package]]
 name = "dyn-clone"
 version = "1.0.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1823,6 +1878,19 @@ name = "error-code"
 version = "3.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a5d9305ccc6942a704f4335694ecd3de2ea531b114ac2d51f5f843750787a92f"
+
+[[package]]
+name = "fake"
+version = "4.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f2b0902eb36fbab51c14eda1c186bda119fcff91e5e4e7fc2dd2077298197ce8"
+dependencies = [
+ "deunicode",
+ "dummy",
+ "either",
+ "rand 0.9.2",
+ "rand_core 0.9.3",
+]
 
 [[package]]
 name = "fallible-iterator"
@@ -2699,6 +2767,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "indicatif"
+version = "0.17.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "183b3088984b400f4cfac3620d5e076c84da5364016b4f49473de574b2586235"
+dependencies = [
+ "console",
+ "number_prefix",
+ "portable-atomic",
+ "unicode-width 0.2.0",
+ "web-time",
+]
+
+[[package]]
 name = "indoc"
 version = "2.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3018,7 +3099,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_completion"
-version = "0.5.0-pre.1"
+version = "0.5.0-pre.2"
 dependencies = [
  "mimalloc",
  "turso_ext",
@@ -3026,7 +3107,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_crypto"
-version = "0.5.0-pre.1"
+version = "0.5.0-pre.2"
 dependencies = [
  "blake3",
  "data-encoding",
@@ -3039,7 +3120,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_csv"
-version = "0.5.0-pre.1"
+version = "0.5.0-pre.2"
 dependencies = [
  "csv",
  "mimalloc",
@@ -3049,7 +3130,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_fuzzy"
-version = "0.5.0-pre.1"
+version = "0.5.0-pre.2"
 dependencies = [
  "mimalloc",
  "turso_ext",
@@ -3057,7 +3138,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_ipaddr"
-version = "0.5.0-pre.1"
+version = "0.5.0-pre.2"
 dependencies = [
  "ipnetwork",
  "mimalloc",
@@ -3066,7 +3147,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_percentile"
-version = "0.5.0-pre.1"
+version = "0.5.0-pre.2"
 dependencies = [
  "mimalloc",
  "turso_ext",
@@ -3074,7 +3155,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_regexp"
-version = "0.5.0-pre.1"
+version = "0.5.0-pre.2"
 dependencies = [
  "mimalloc",
  "regex",
@@ -3083,7 +3164,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_sim"
-version = "0.5.0-pre.1"
+version = "0.5.0-pre.2"
 dependencies = [
  "anyhow",
  "bitflags 2.9.4",
@@ -3103,7 +3184,7 @@ dependencies = [
  "rand 0.9.2",
  "rand_chacha 0.9.0",
  "regex",
- "regex-syntax",
+ "regex-syntax 0.8.5",
  "rusqlite",
  "schemars 1.0.4",
  "serde",
@@ -3120,7 +3201,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_sqlite_test_ext"
-version = "0.5.0-pre.1"
+version = "0.5.0-pre.2"
 dependencies = [
  "cc",
 ]
@@ -3192,6 +3273,40 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13dc2df351e3202783a1fe0d44375f7295ffb4049267b0f3018346dc122a1d94"
 
 [[package]]
+name = "logos"
+version = "0.16.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a790d11254054e5dc83902dba85d253ff06ceb0cfafb12be8773435cb9dfb4f4"
+dependencies = [
+ "logos-derive",
+]
+
+[[package]]
+name = "logos-codegen"
+version = "0.16.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f60337c43a38313b58871f8d5d76872b8e17aa9d51fad494b5e76092c0ce05f5"
+dependencies = [
+ "beef",
+ "fnv",
+ "proc-macro2",
+ "quote",
+ "regex-automata 0.4.13",
+ "regex-syntax 0.8.5",
+ "rustc_version",
+ "syn 2.0.100",
+]
+
+[[package]]
+name = "logos-derive"
+version = "0.16.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d151b2ae667f69e10b8738f5cac0c746faa22b2e15ea7e83b55476afec3767dc"
+dependencies = [
+ "logos-codegen",
+]
+
+[[package]]
 name = "loom"
 version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3225,7 +3340,7 @@ version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d1525a2a28c7f4fa0fc98bb91ae755d1e2d1505079e05539e35bc876b5d65ae9"
 dependencies = [
- "regex-automata",
+ "regex-automata 0.4.13",
 ]
 
 [[package]]
@@ -3303,7 +3418,7 @@ dependencies = [
  "backtrace-ext",
  "cfg-if",
  "miette-derive",
- "owo-colors 4.2.0",
+ "owo-colors 4.2.3",
  "supports-color",
  "supports-hyperlinks",
  "supports-unicode",
@@ -3585,10 +3700,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "number_prefix"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "830b246a0e5f20af87141b25c173cd1b609bd7779a4617d6ec582abaf90870f3"
+
+[[package]]
 name = "object"
 version = "0.36.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "62948e14d923ea95ea2c7c86c71013138b66525b86bdc08d2dcc262bdb497b87"
+dependencies = [
+ "memchr",
+]
+
+[[package]]
+name = "object"
+version = "0.37.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ff76201f031d8863c38aa7f905eca4f53abbfa15f609db4277d44cd8938f33fe"
 dependencies = [
  "memchr",
 ]
@@ -3695,9 +3825,9 @@ checksum = "c1b04fb49957986fdce4d6ee7a65027d55d4b6d2265e5848bbb507b58ccfdb6f"
 
 [[package]]
 name = "owo-colors"
-version = "4.2.0"
+version = "4.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1036865bb9422d3300cf723f657c2851d0e9ab12567854b1f4eba3d77decf564"
+checksum = "9c6901729fa79e91a0913333229e9ca5dc725089d1c363b2f4b4760709dc4a52"
 
 [[package]]
 name = "pack1"
@@ -3965,6 +4095,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "pretty_assertions"
+version = "1.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3ae130e2f271fbc2ac3a40fb1d07180839cdbbe443c7a27e1e3c13c5cac0116d"
+dependencies = [
+ "diff",
+ "yansi",
+]
+
+[[package]]
 name = "prettyplease"
 version = "0.2.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4027,7 +4167,7 @@ dependencies = [
  "rand 0.9.2",
  "rand_chacha 0.9.0",
  "rand_xorshift",
- "regex-syntax",
+ "regex-syntax 0.8.5",
  "rusty-fork",
  "tempfile",
  "unarray",
@@ -4089,8 +4229,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "psm"
+version = "0.1.29"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1fa96cb91275ed31d6da3e983447320c4eb219ac180fa1679a0889ff32861e2d"
+dependencies = [
+ "ar_archive_writer",
+ "cc",
+]
+
+[[package]]
 name = "py-turso"
-version = "0.5.0-pre.1"
+version = "0.5.0-pre.2"
 dependencies = [
  "anyhow",
  "pyo3",
@@ -4412,8 +4562,19 @@ checksum = "843bc0191f75f3e22651ae5f1e72939ab2f72a4bc30fa80a066bd66edefc24d4"
 dependencies = [
  "aho-corasick",
  "memchr",
- "regex-automata",
- "regex-syntax",
+ "regex-automata 0.4.13",
+ "regex-syntax 0.8.5",
+]
+
+[[package]]
+name = "regex-automata"
+version = "0.3.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "59b23e92ee4318893fa3fe3e6fb365258efbfe6ac6ab30f090cdcbb7aa37efa9"
+dependencies = [
+ "aho-corasick",
+ "memchr",
+ "regex-syntax 0.7.5",
 ]
 
 [[package]]
@@ -4424,7 +4585,7 @@ checksum = "5276caf25ac86c8d810222b3dbb938e512c55c6831a10f3e6ed1c93b84041f1c"
 dependencies = [
  "aho-corasick",
  "memchr",
- "regex-syntax",
+ "regex-syntax 0.8.5",
 ]
 
 [[package]]
@@ -4432,6 +4593,12 @@ name = "regex-lite"
 version = "0.1.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8d942b98df5e658f56f20d592c7f868833fe38115e65c33003d8cd224b0155da"
+
+[[package]]
+name = "regex-syntax"
+version = "0.7.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dbb5fb1acd8a1a18b3dd5be62d25485eb770e05afb408a9627d14d451bae12da"
 
 [[package]]
 name = "regex-syntax"
@@ -4909,6 +5076,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "sha1"
+version = "0.10.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e3bf829a2d51ab4a5ddf1352d8470c140cadc8301b2ae1789db023f01cedd6ba"
+dependencies = [
+ "cfg-if",
+ "cpufeatures",
+ "digest",
+]
+
+[[package]]
 name = "sha1_smol"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5086,8 +5264,9 @@ checksum = "d372029cb5195f9ab4e4b9aef550787dce78b124fcaee8d82519925defcd6f0d"
 
 [[package]]
 name = "sql_gen_prop"
-version = "0.5.0-pre.1"
+version = "0.5.0-pre.2"
 dependencies = [
+ "anarchist-readable-name-generator-lib",
  "proptest",
  "serde",
  "strum",
@@ -5095,7 +5274,7 @@ dependencies = [
 
 [[package]]
 name = "sql_generation"
-version = "0.5.0-pre.1"
+version = "0.5.0-pre.2"
 dependencies = [
  "anarchist-readable-name-generator-lib",
  "anyhow",
@@ -5118,6 +5297,19 @@ name = "stable_deref_trait"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a8f112729512f8e442d81f95a8a7ddf2b7c6b8a1a6f509a95864142b30cab2d3"
+
+[[package]]
+name = "stacker"
+version = "0.1.22"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e1f8b29fb42aafcea4edeeb6b2f2d7ecd0d969c48b4cf0d2e64aafc471dd6e59"
+dependencies = [
+ "cc",
+ "cfg-if",
+ "libc",
+ "psm",
+ "windows-sys 0.59.0",
+]
 
 [[package]]
 name = "static_assertions"
@@ -5279,7 +5471,7 @@ dependencies = [
  "fnv",
  "once_cell",
  "plist",
- "regex-syntax",
+ "regex-syntax 0.8.5",
  "serde",
  "serde_derive",
  "serde_json",
@@ -5406,7 +5598,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d60769b80ad7953d8a7b2c70cdfe722bbcdcac6bccc8ac934c40c034d866fc18"
 dependencies = [
  "byteorder",
- "regex-syntax",
+ "regex-syntax 0.8.5",
  "utf8-ranges",
 ]
 
@@ -5971,7 +6163,7 @@ dependencies = [
  "matchers",
  "nu-ansi-term",
  "once_cell",
- "regex-automata",
+ "regex-automata 0.4.13",
  "serde",
  "serde_json",
  "sharded-slab",
@@ -5991,7 +6183,7 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "turso"
-version = "0.5.0-pre.1"
+version = "0.5.0-pre.2"
 dependencies = [
  "anyhow",
  "bytes",
@@ -6014,15 +6206,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "turso-dbhash"
+version = "0.5.0-pre.2"
+dependencies = [
+ "clap",
+ "hex",
+ "sha1",
+ "tempfile",
+ "turso_core",
+]
+
+[[package]]
 name = "turso-dotnet"
-version = "0.5.0-pre.1"
+version = "0.5.0-pre.2"
 dependencies = [
  "turso_core",
 ]
 
 [[package]]
 name = "turso-java"
-version = "0.5.0-pre.1"
+version = "0.5.0-pre.2"
 dependencies = [
  "jni",
  "thiserror 2.0.16",
@@ -6030,8 +6233,39 @@ dependencies = [
 ]
 
 [[package]]
+name = "turso-test-runner"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chumsky",
+ "clap",
+ "fake",
+ "futures",
+ "glob",
+ "indicatif",
+ "itertools 0.14.0",
+ "logos",
+ "miette",
+ "num_cpus",
+ "owo-colors 4.2.3",
+ "pretty_assertions",
+ "rand 0.9.2",
+ "rand_chacha 0.9.0",
+ "regex",
+ "serde",
+ "serde_json",
+ "similar",
+ "tempfile",
+ "thiserror 2.0.16",
+ "tokio",
+ "turso",
+ "turso_parser",
+]
+
+[[package]]
 name = "turso_cli"
-version = "0.5.0-pre.1"
+version = "0.5.0-pre.2"
 dependencies = [
  "anyhow",
  "bytes",
@@ -6072,7 +6306,7 @@ dependencies = [
 
 [[package]]
 name = "turso_core"
-version = "0.5.0-pre.1"
+version = "0.5.0-pre.2"
 dependencies = [
  "aegis",
  "aes",
@@ -6115,7 +6349,7 @@ dependencies = [
  "rand_chacha 0.9.0",
  "rapidhash",
  "regex",
- "regex-syntax",
+ "regex-syntax 0.8.5",
  "roaring",
  "rstest",
  "rusqlite",
@@ -6146,7 +6380,7 @@ dependencies = [
 
 [[package]]
 name = "turso_dart"
-version = "0.5.0-pre.1"
+version = "0.5.0-pre.2"
 dependencies = [
  "flutter_rust_bridge",
  "turso_core",
@@ -6154,7 +6388,7 @@ dependencies = [
 
 [[package]]
 name = "turso_ext"
-version = "0.5.0-pre.1"
+version = "0.5.0-pre.2"
 dependencies = [
  "chrono",
  "getrandom 0.3.2",
@@ -6163,7 +6397,7 @@ dependencies = [
 
 [[package]]
 name = "turso_ext_tests"
-version = "0.5.0-pre.1"
+version = "0.5.0-pre.2"
 dependencies = [
  "env_logger 0.11.7",
  "lazy_static",
@@ -6174,7 +6408,7 @@ dependencies = [
 
 [[package]]
 name = "turso_macros"
-version = "0.5.0-pre.1"
+version = "0.5.0-pre.2"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -6183,7 +6417,7 @@ dependencies = [
 
 [[package]]
 name = "turso_node"
-version = "0.5.0-pre.1"
+version = "0.5.0-pre.2"
 dependencies = [
  "chrono",
  "napi",
@@ -6196,7 +6430,7 @@ dependencies = [
 
 [[package]]
 name = "turso_parser"
-version = "0.5.0-pre.1"
+version = "0.5.0-pre.2"
 dependencies = [
  "bitflags 2.9.4",
  "codspeed-criterion-compat",
@@ -6214,7 +6448,7 @@ dependencies = [
 
 [[package]]
 name = "turso_sdk_kit"
-version = "0.5.0-pre.1"
+version = "0.5.0-pre.2"
 dependencies = [
  "bindgen",
  "env_logger 0.11.7",
@@ -6227,7 +6461,7 @@ dependencies = [
 
 [[package]]
 name = "turso_sdk_kit_macros"
-version = "0.5.0-pre.1"
+version = "0.5.0-pre.2"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -6236,7 +6470,7 @@ dependencies = [
 
 [[package]]
 name = "turso_sqlite3"
-version = "0.5.0-pre.1"
+version = "0.5.0-pre.2"
 dependencies = [
  "env_logger 0.11.7",
  "libc",
@@ -6249,7 +6483,7 @@ dependencies = [
 
 [[package]]
 name = "turso_stress"
-version = "0.5.0-pre.1"
+version = "0.5.0-pre.2"
 dependencies = [
  "antithesis_sdk",
  "clap",
@@ -6266,7 +6500,7 @@ dependencies = [
 
 [[package]]
 name = "turso_sync_engine"
-version = "0.5.0-pre.1"
+version = "0.5.0-pre.2"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -6293,7 +6527,7 @@ dependencies = [
 
 [[package]]
 name = "turso_sync_js"
-version = "0.5.0-pre.1"
+version = "0.5.0-pre.2"
 dependencies = [
  "genawaiter",
  "napi",
@@ -6308,7 +6542,7 @@ dependencies = [
 
 [[package]]
 name = "turso_sync_sdk_kit"
-version = "0.5.0-pre.1"
+version = "0.5.0-pre.2"
 dependencies = [
  "bindgen",
  "env_logger 0.11.7",
@@ -6325,7 +6559,7 @@ dependencies = [
 
 [[package]]
 name = "turso_whopper"
-version = "0.5.0-pre.1"
+version = "0.5.0-pre.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -6637,6 +6871,16 @@ name = "web-sys"
 version = "0.3.85"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "312e32e551d92129218ea9a2452120f4aabc03529ef03e4d0d82fb2780608598"
+dependencies = [
+ "js-sys",
+ "wasm-bindgen",
+]
+
+[[package]]
+name = "web-time"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5a6580f308b1fad9207618087a65c04e7a10bc77e02c8e84e9b00dd4b12fa0bb"
 dependencies = [
  "js-sys",
  "wasm-bindgen",
@@ -7019,6 +7263,12 @@ checksum = "56c1936c4cc7a1c9ab21a1ebb602eb942ba868cbd44a99cb7cdc5892335e1c85"
 dependencies = [
  "linked-hash-map",
 ]
+
+[[package]]
+name = "yansi"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cfe53a6657fd280eaa890a3bc59152892ffa3e30101319d168b781ed6529b049"
 
 [[package]]
 name = "yoke"

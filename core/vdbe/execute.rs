@@ -4272,12 +4272,14 @@ pub fn op_sorter_open(
         .iter()
         .map(|(ord, coll)| (*ord, coll.unwrap_or_default()))
         .unzip();
+    let temp_store = program.connection.get_temp_store();
     let cursor = Sorter::new(
         &order,
         collations,
         max_buffer_size_bytes,
         page_size,
         pager.io.clone(),
+        temp_store,
     );
     let cursors = &mut state.cursors;
     cursors
@@ -8556,17 +8558,26 @@ pub fn op_open_ephemeral(
             }
             #[cfg(not(target_family = "wasm"))]
             {
-                let temp_dir = temp_dir();
-                let rand_path =
-                    std::path::Path::new(&temp_dir).join(format!("tursodb-ephemeral-{rand_num}"));
-                let Some(rand_path_str) = rand_path.to_str() else {
-                    return Err(LimboError::InternalError(
-                        "Failed to convert path to string".to_string(),
-                    ));
-                };
-                let file = io.open_file(rand_path_str, OpenFlags::Create, false)?;
-                db_file = Arc::new(DatabaseFile::new(file));
-                db_file_io = io;
+                let temp_store = conn.get_temp_store();
+                if matches!(temp_store, crate::TempStore::Memory) {
+                    // When temp_store=memory, use in-memory storage for ephemeral tables
+                    use crate::MemoryIO;
+                    db_file_io = Arc::new(MemoryIO::new());
+                    let file = db_file_io.open_file("temp-file", OpenFlags::Create, false)?;
+                    db_file = Arc::new(DatabaseFile::new(file));
+                } else {
+                    let temp_dir = temp_dir();
+                    let rand_path = std::path::Path::new(&temp_dir)
+                        .join(format!("tursodb-ephemeral-{rand_num}"));
+                    let Some(rand_path_str) = rand_path.to_str() else {
+                        return Err(LimboError::InternalError(
+                            "Failed to convert path to string".to_string(),
+                        ));
+                    };
+                    let file = io.open_file(rand_path_str, OpenFlags::Create, false)?;
+                    db_file = Arc::new(DatabaseFile::new(file));
+                    db_file_io = io;
+                }
             }
 
             let buffer_pool = program.connection.db.buffer_pool.clone();
@@ -10506,7 +10517,7 @@ pub fn op_fk_if_zero(
 }
 
 pub fn op_hash_build(
-    _program: &Program,
+    program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     pager: &Arc<Pager>,
@@ -10535,15 +10546,24 @@ pub fn op_hash_build(
         });
 
     // Create hash table if it doesn't exist yet
+    let temp_store = program.connection.get_temp_store();
+    // When temp_store=memory, disable the memory limit entirely to avoid spilling.
+    // Spilling to an in-memory file has serialization overhead - simpler to never spill.
+    let mem_budget = if matches!(temp_store, crate::TempStore::Memory) {
+        usize::MAX
+    } else {
+        data.mem_budget
+    };
     state
         .hash_tables
         .entry(data.hash_table_id)
         .or_insert_with(|| {
             let config = HashTableConfig {
                 initial_buckets: 1024,
-                mem_budget: data.mem_budget,
+                mem_budget,
                 num_keys: data.num_keys,
                 collations: data.collations.clone(),
+                temp_store,
             };
             HashTable::new(config, pager.io.clone())
         });
@@ -10626,22 +10646,30 @@ pub fn op_hash_build(
 }
 
 pub fn op_hash_distinct(
-    _program: &Program,
+    program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(HashDistinct { data }, insn);
 
+    let temp_store = program.connection.get_temp_store();
+    // When temp_store=memory, disable the memory limit entirely to avoid spilling.
+    let mem_budget = if matches!(temp_store, crate::TempStore::Memory) {
+        usize::MAX
+    } else {
+        DEFAULT_MEM_BUDGET
+    };
     let hash_table = state
         .hash_tables
         .entry(data.hash_table_id)
         .or_insert_with(|| {
             let config = HashTableConfig {
                 initial_buckets: 1024,
-                mem_budget: DEFAULT_MEM_BUDGET,
+                mem_budget,
                 num_keys: data.num_keys,
                 collations: data.collations.clone(),
+                temp_store,
             };
             HashTable::new(config, pager.io.clone())
         });

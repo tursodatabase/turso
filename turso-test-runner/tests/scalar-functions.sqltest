@@ -1243,6 +1243,13 @@ expect {
     😁ã😅
 }
 
+test substr-null-length-returns-null {
+    SELECT substr('hello', 2, NULL), typeof(substr('hello', 2, NULL));
+}
+expect {
+    |null
+}
+
 test typeof-null {
     SELECT typeof(null);
 }
@@ -1393,6 +1400,36 @@ test quote-integer {
 }
 expect {
     123
+}
+
+# Regression: QUOTE() should return TEXT type for integers, not INTEGER
+test quote-integer-typeof {
+    SELECT typeof(quote(123))
+}
+expect {
+    text
+}
+
+test quote-negative-integer {
+    SELECT quote(-4755622169394918639)
+}
+expect {
+    -4755622169394918639
+}
+
+test quote-float {
+    SELECT quote(12.34)
+}
+expect {
+    12.34
+}
+
+# Regression: QUOTE() should return TEXT type for floats, not REAL
+test quote-float-typeof {
+    SELECT typeof(quote(12.34))
+}
+expect {
+    text
 }
 
 test sign-positive-integer {

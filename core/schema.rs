@@ -134,7 +134,8 @@ use crate::{
     Connection, LimboError, MvCursor, MvStore, Pager, SymbolTable, ValueRef, VirtualTable,
 };
 use core::fmt;
-use std::collections::{HashMap, HashSet, VecDeque};
+use rustc_hash::{FxBuildHasher, FxHashMap as HashMap, FxHashSet as HashSet};
+use std::collections::VecDeque;
 use std::ops::Deref;
 use tracing::trace;
 use turso_parser::ast::{
@@ -200,7 +201,7 @@ pub struct Schema {
 
     /// table_name to list of indexes for the table
     pub indexes: HashMap<String, VecDeque<Arc<Index>>>,
-    pub has_indexes: std::collections::HashSet<String>,
+    pub has_indexes: HashSet<String>,
     pub schema_version: u32,
     /// Statistics collected via ANALYZE for regular B-tree tables and indexes.
     pub analyze_stats: AnalyzeStats,
@@ -220,9 +221,9 @@ impl Default for Schema {
 
 impl Schema {
     pub fn new() -> Self {
-        let mut tables: HashMap<String, Arc<Table>> = HashMap::new();
-        let has_indexes = std::collections::HashSet::new();
-        let indexes: HashMap<String, VecDeque<Arc<Index>>> = HashMap::new();
+        let mut tables: HashMap<String, Arc<Table>> = HashMap::default();
+        let has_indexes = HashSet::default();
+        let indexes: HashMap<String, VecDeque<Arc<Index>>> = HashMap::default();
         #[allow(clippy::arc_with_non_send_sync)]
         tables.insert(
             SCHEMA_TABLE_NAME.to_string(),
@@ -234,13 +235,13 @@ impl Schema {
                 Arc::new(Table::Virtual(Arc::new((*function).clone()))),
             );
         }
-        let materialized_view_names = HashSet::new();
-        let materialized_view_sql = HashMap::new();
-        let incremental_views = HashMap::new();
-        let views: ViewsMap = HashMap::new();
-        let triggers = HashMap::new();
-        let table_to_materialized_views: HashMap<String, Vec<String>> = HashMap::new();
-        let incompatible_views = HashSet::new();
+        let materialized_view_names = HashSet::default();
+        let materialized_view_sql = HashMap::default();
+        let incremental_views = HashMap::default();
+        let views: ViewsMap = HashMap::default();
+        let triggers = HashMap::default();
+        let table_to_materialized_views: HashMap<String, Vec<String>> = HashMap::default();
+        let incompatible_views = HashSet::default();
         Self {
             tables,
             materialized_view_names,
@@ -573,14 +574,15 @@ impl Schema {
         let mut cursor = BTreeCursor::new_table(Arc::clone(&pager), 1, 10);
 
         let mut from_sql_indexes = Vec::with_capacity(10);
-        let mut automatic_indices: HashMap<String, Vec<(String, i64)>> = HashMap::with_capacity(10);
+        let mut automatic_indices: HashMap<String, Vec<(String, i64)>> =
+            HashMap::with_capacity_and_hasher(10, FxBuildHasher);
 
         // Store DBSP state table root pages: view_name -> dbsp_state_root_page
-        let mut dbsp_state_roots: HashMap<String, i64> = HashMap::new();
+        let mut dbsp_state_roots: HashMap<String, i64> = HashMap::default();
         // Store DBSP state table index root pages: view_name -> dbsp_state_index_root_page
-        let mut dbsp_state_index_roots: HashMap<String, i64> = HashMap::new();
+        let mut dbsp_state_index_roots: HashMap<String, i64> = HashMap::default();
         // Store materialized view info (SQL and root page) for later creation
-        let mut materialized_view_info: HashMap<String, (String, i64)> = HashMap::new();
+        let mut materialized_view_info: HashMap<String, (String, i64)> = HashMap::default();
 
         pager.begin_read_tx()?;
 
@@ -664,7 +666,7 @@ impl Schema {
         &mut self,
         syms: &SymbolTable,
         from_sql_indexes: Vec<UnparsedFromSqlIndex>,
-        automatic_indices: std::collections::HashMap<String, Vec<(String, i64)>>,
+        automatic_indices: HashMap<String, Vec<(String, i64)>>,
         mvcc_enabled: bool,
     ) -> Result<()> {
         for unparsed_sql_from_index in from_sql_indexes {
@@ -787,9 +789,9 @@ impl Schema {
     /// Populate materialized views parsed from the schema.
     pub fn populate_materialized_views(
         &mut self,
-        materialized_view_info: std::collections::HashMap<String, (String, i64)>,
-        dbsp_state_roots: std::collections::HashMap<String, i64>,
-        dbsp_state_index_roots: std::collections::HashMap<String, i64>,
+        materialized_view_info: HashMap<String, (String, i64)>,
+        dbsp_state_roots: HashMap<String, i64>,
+        dbsp_state_index_roots: HashMap<String, i64>,
     ) -> Result<()> {
         for (view_name, (sql, main_root)) in materialized_view_info {
             // Look up the DBSP state root for this view
@@ -858,10 +860,10 @@ impl Schema {
         maybe_sql: Option<&str>,
         syms: &SymbolTable,
         from_sql_indexes: &mut Vec<UnparsedFromSqlIndex>,
-        automatic_indices: &mut std::collections::HashMap<String, Vec<(String, i64)>>,
-        dbsp_state_roots: &mut std::collections::HashMap<String, i64>,
-        dbsp_state_index_roots: &mut std::collections::HashMap<String, i64>,
-        materialized_view_info: &mut std::collections::HashMap<String, (String, i64)>,
+        automatic_indices: &mut HashMap<String, Vec<(String, i64)>>,
+        dbsp_state_roots: &mut HashMap<String, i64>,
+        dbsp_state_index_roots: &mut HashMap<String, i64>,
+        materialized_view_info: &mut HashMap<String, (String, i64)>,
         mv_store: Option<&Arc<MvStore>>,
         enable_triggers: bool,
     ) -> Result<()> {

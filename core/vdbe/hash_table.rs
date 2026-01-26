@@ -720,6 +720,8 @@ pub struct HashTableConfig {
     pub num_keys: usize,
     /// Collation sequences for each join key.
     pub collations: Vec<CollationSeq>,
+    /// Only spill to a file when != TempStore::Memory
+    pub temp_store: crate::TempStore,
 }
 
 impl Default for HashTableConfig {
@@ -729,6 +731,7 @@ impl Default for HashTableConfig {
             mem_budget: DEFAULT_MEM_BUDGET,
             num_keys: 1,
             collations: vec![CollationSeq::Binary],
+            temp_store: crate::TempStore::Default,
         }
     }
 }
@@ -746,14 +749,14 @@ struct SpillState {
 }
 
 impl SpillState {
-    fn new(io: &Arc<dyn IO>) -> Result<Self> {
+    fn new(io: &Arc<dyn IO>, temp_store: crate::TempStore) -> Result<Self> {
         Ok(SpillState {
             partition_buffers: (0..NUM_PARTITIONS)
                 .map(|_| PartitionBuffer::new())
                 .collect(),
             partitions: Vec::new(),
             next_spill_offset: 0,
-            temp_file: TempFile::new(io)?,
+            temp_file: TempFile::with_temp_store(io, temp_store)?,
         })
     }
 
@@ -930,6 +933,8 @@ pub struct HashTable {
     loaded_partitions_lru: RefCell<VecDeque<usize>>,
     /// Memory used by resident (loaded or in-memory) partitions
     loaded_partitions_mem: usize,
+    /// Temp storage mode (memory vs file) for spilled data
+    temp_store: crate::TempStore,
 }
 
 crate::assert::assert_send!(HashTable);
@@ -975,6 +980,7 @@ impl HashTable {
             loaded_partitions_lru: VecDeque::new().into(),
             loaded_partitions_mem: 0,
             non_empty_buckets: Vec::new(),
+            temp_store: config.temp_store,
         }
     }
 
@@ -1025,7 +1031,7 @@ impl HashTable {
                 );
                 // First time exceeding budget, trigger spill
                 // Move all existing bucket entries into partition buffers
-                self.spill_state = Some(SpillState::new(&self.io)?);
+                self.spill_state = Some(SpillState::new(&self.io, self.temp_store)?);
                 self.redistribute_to_partitions();
                 self.state = HashTableState::Spilled;
             };
@@ -1152,7 +1158,7 @@ impl HashTable {
         let entry_size = HashEntry::size_from_values(key_values, &[]);
         if self.mem_used + entry_size > self.mem_budget {
             if self.spill_state.is_none() {
-                self.spill_state = Some(SpillState::new(&self.io)?);
+                self.spill_state = Some(SpillState::new(&self.io, self.temp_store)?);
                 self.redistribute_to_partitions();
                 self.state = HashTableState::Spilled;
             }
@@ -2166,6 +2172,7 @@ mod hashtests {
             mem_budget: 1024 * 1024,
             num_keys: 1,
             collations: vec![CollationSeq::Binary],
+            temp_store: crate::TempStore::Default,
         };
         let mut ht = HashTable::new(config, io);
 
@@ -2205,6 +2212,7 @@ mod hashtests {
             mem_budget: 1024 * 1024,
             num_keys: 1,
             collations: vec![CollationSeq::Binary],
+            temp_store: crate::TempStore::Default,
         };
         let mut ht = HashTable::new(config, io);
 
@@ -2234,6 +2242,7 @@ mod hashtests {
             mem_budget: 1024 * 1024,
             num_keys: 1,
             collations: vec![CollationSeq::Binary],
+            temp_store: crate::TempStore::Default,
         };
         let mut ht = HashTable::new(config, io);
 
@@ -2524,6 +2533,7 @@ mod hashtests {
             mem_budget: 1024,
             num_keys: 1,
             collations: vec![CollationSeq::Binary],
+            temp_store: crate::TempStore::Default,
         };
         let mut ht = HashTable::new(config, io);
 
@@ -2563,6 +2573,7 @@ mod hashtests {
             mem_budget: 8 * 1024,
             num_keys: 1,
             collations: vec![CollationSeq::Binary],
+            temp_store: crate::TempStore::Default,
         };
         let mut ht = HashTable::new(config, io);
 
@@ -2604,6 +2615,7 @@ mod hashtests {
             mem_budget: 8 * 1024,
             num_keys: 1,
             collations: vec![CollationSeq::Binary],
+            temp_store: crate::TempStore::Default,
         };
         let mut ht = HashTable::new(config, io);
 
@@ -2648,6 +2660,7 @@ mod hashtests {
             mem_budget: 1024 * 1024,
             num_keys: 1,
             collations: vec![CollationSeq::Binary],
+            temp_store: crate::TempStore::Default,
         };
         let mut ht = HashTable::new(config, io);
 
@@ -2699,6 +2712,7 @@ mod hashtests {
             mem_budget: 1024 * 1024,
             num_keys: 1,
             collations: vec![CollationSeq::Binary],
+            temp_store: crate::TempStore::Default,
         };
         let mut ht = HashTable::new(config, io);
 
@@ -2728,6 +2742,7 @@ mod hashtests {
             mem_budget: 1024 * 1024,
             num_keys: 2,
             collations: vec![CollationSeq::Binary, CollationSeq::Binary],
+            temp_store: crate::TempStore::Default,
         };
         let mut ht = HashTable::new(config, io);
 
@@ -2770,6 +2785,7 @@ mod hashtests {
             mem_budget: 1024 * 1024,
             num_keys: 1,
             collations: vec![CollationSeq::Binary],
+            temp_store: crate::TempStore::Default,
         };
         let mut ht = HashTable::new(config, io);
 
@@ -2797,6 +2813,7 @@ mod hashtests {
             mem_budget: 1024 * 1024,
             num_keys: 1,
             collations: vec![CollationSeq::Binary],
+            temp_store: crate::TempStore::Default,
         };
         let mut ht = HashTable::new(config, io);
 

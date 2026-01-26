@@ -35,11 +35,8 @@ use cost::Cost;
 use join::{compute_best_join_order, BestJoinOrderResult};
 use lift_common_subexpressions::lift_common_subexpressions_from_binary_or_terms;
 use order::{compute_order_target, plan_satisfies_order_target, EliminatesSortBy};
-use std::{
-    cmp::Ordering,
-    collections::{HashMap, HashSet, VecDeque},
-    sync::Arc,
-};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use std::{cmp::Ordering, collections::VecDeque, sync::Arc};
 use turso_ext::{ConstraintInfo, ConstraintUsage};
 use turso_parser::ast::{self, Expr, SortOrder, TriggerEvent};
 
@@ -200,7 +197,7 @@ fn try_match_index_method_pattern(
     }
 
     let mut where_query_covered: Option<usize> = None;
-    let mut parameters = HashMap::new();
+    let mut parameters = HashMap::default();
 
     // Match ORDER BY if pattern has it
     if pattern_has_order_by {
@@ -300,7 +297,7 @@ fn build_covered_columns_mapping(
     parameters: &HashMap<i32, ast::Expr>,
 ) -> HashMap<usize, usize> {
     let mut covered_column_id = 1_000_000;
-    let mut covered_columns = HashMap::new();
+    let mut covered_columns = HashMap::default();
     for (pattern_column_id, pattern_column) in pattern_columns.iter().enumerate() {
         let ast::ResultColumn::Expr(pattern_expr, _) = pattern_column else {
             continue;
@@ -851,7 +848,7 @@ fn optimize_table_access_with_custom_modules(
             // This differs from collect_index_method_candidates: we modify result_columns
             // and increment covered_column_id per matching query column, not per pattern column.
             let mut covered_column_id = 1_000_000;
-            let mut covered_columns = HashMap::new();
+            let mut covered_columns = HashMap::default();
             for (pattern_column_id, pattern_column) in
                 pattern_match.pattern_columns.iter().enumerate()
             {
@@ -1131,6 +1128,7 @@ fn optimize_table_access(
         subqueries,
         &index_method_candidates,
         params,
+        &schema.analyze_stats,
     )?
     else {
         return Ok(None);
@@ -1214,8 +1212,8 @@ fn optimize_table_access(
             .unzip();
     #[cfg(debug_assertions)]
     {
-        let mut probe_tables: HashSet<usize> = HashSet::new();
-        let mut build_tables: HashMap<usize, bool> = HashMap::new();
+        let mut probe_tables: HashSet<usize> = HashSet::default();
+        let mut build_tables: HashMap<usize, bool> = HashMap::default();
         let mut pos_by_table: Vec<Option<usize>> =
             vec![None; table_references.joined_tables().len()];
         for (pos, table_idx) in best_table_numbers.iter().enumerate() {

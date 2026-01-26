@@ -389,8 +389,7 @@ fn extract_tests_from_block(content: &str) -> Vec<TclTest> {
             let mut brace_depth = 0;
             let mut found_open = false;
 
-            for j in i..lines.len() {
-                let l = lines[j];
+            for (j, l) in lines.iter().enumerate().skip(i) {
                 full_test.push_str(l);
                 full_test.push('\n');
 
@@ -1290,18 +1289,5 @@ do_execsql_test_on_specific_db {:memory:} test3 {
         println!("Tests: {:?}", result.tests);
         println!("Warnings: {:?}", result.warnings);
         assert_eq!(result.tests.len(), 2, "Expected 2 tests");
-    }
-
-    #[test]
-    fn test_full_select_file() {
-        let content = std::fs::read_to_string("../testing/select.test").unwrap();
-        let result = convert(&content, "select.test");
-        println!("Total tests: {}", result.tests.len());
-        println!("Warnings: {}", result.warnings.len());
-        for w in &result.warnings {
-            println!("  {:?}: {}", w.kind, w.message);
-        }
-        // 172 total - 2 commented - 1 in foreach = 169
-        assert!(result.tests.len() > 100, "Should have over 100 tests");
     }
 }

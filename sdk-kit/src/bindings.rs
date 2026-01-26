@@ -237,7 +237,7 @@ unsafe extern "C" {
     ) -> turso_status_code_t;
 }
 unsafe extern "C" {
-    #[doc = " Finalize a statement\n This method must be called in the end of statement execution (either successfull or not)"]
+    #[doc = " Finalize a statement\n finalize returns TURSO_DONE if finalization completed\n This method must be called in the end of statement execution (either successfull or not)"]
     pub fn turso_statement_finalize(
         self_: *const turso_statement_t,
         error_opt_out: *mut *const ::std::os::raw::c_char,

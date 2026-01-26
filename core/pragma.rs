@@ -89,6 +89,10 @@ pub fn pragma_for(pragma: &PragmaName) -> Pragma {
             PragmaFlags::NoColumns1 | PragmaFlags::Result0,
             &["synchronous"],
         ),
+        TempStore => Pragma::new(
+            PragmaFlags::NoColumns1 | PragmaFlags::Result0,
+            &["temp_store"],
+        ),
         TableInfo => Pragma::new(
             PragmaFlags::NeedSchema | PragmaFlags::Result1 | PragmaFlags::SchemaOpt,
             &["cid", "name", "type", "notnull", "dflt_value", "pk"],

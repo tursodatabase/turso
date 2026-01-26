@@ -99,7 +99,7 @@ impl GrammarGenerator {
     pub fn new() -> Self {
         GrammarGenerator(Rc::new(RefCell::new(GrammarGeneratorInner {
             last_symbol_id: 0,
-            symbols: HashMap::new(),
+            symbols: HashMap::default(),
         })))
     }
     pub fn create_handle(&self) -> (SymbolHandle, SymbolDefinitionBuilder) {
@@ -171,7 +171,7 @@ impl GrammarGenerator {
     ) -> String {
         let mut frontier = vec![GrammarFrontierNode::Handle(root)];
 
-        let mut is_recursive = HashMap::new();
+        let mut is_recursive = HashMap::default();
         self.is_recursive_from_root(root, &mut is_recursive);
 
         let symbols = &self.0.borrow().symbols;

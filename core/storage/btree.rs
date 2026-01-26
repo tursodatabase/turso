@@ -1,5 +1,5 @@
 use branches::mark_unlikely;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use smallvec::SmallVec;
 use tracing::{instrument, Level};
 
@@ -3493,7 +3493,7 @@ impl BTreeCursor {
                     // pages_pointed_to helps us debug we did in fact create divider cells to all the new pages and the rightmost pointer,
                     // also points to the last page.
                     #[cfg(debug_assertions)]
-                    let mut pages_pointed_to = std::collections::HashSet::new();
+                    let mut pages_pointed_to = HashSet::default();
 
                     // Write right pointer in parent page to point to new rightmost page. keep in mind
                     // we update rightmost pointer first because inserting cells could defragment parent page,
@@ -5870,7 +5870,7 @@ pub struct IntegrityCheckState {
     page_stack: Vec<IntegrityCheckPageEntry>,
     pub db_size: usize,
     first_leaf_level: Option<usize>,
-    pub page_reference: FxHashMap<i64, i64>,
+    pub page_reference: HashMap<i64, i64>,
     page: Option<PageRef>,
     pub freelist_count: CheckFreelist,
 }
@@ -5880,7 +5880,7 @@ impl IntegrityCheckState {
         Self {
             page_stack: Vec::new(),
             db_size,
-            page_reference: FxHashMap::default(),
+            page_reference: HashMap::default(),
             first_leaf_level: None,
             page: None,
             freelist_count: CheckFreelist {
@@ -8062,7 +8062,7 @@ mod tests {
         BufferPool, Completion, Connection, IOContext, StepResult, Wal, WalFile, WalFileShared,
     };
     use arc_swap::ArcSwapOption;
-    use std::{collections::HashSet, mem::transmute, ops::Deref, sync::Arc};
+    use std::{mem::transmute, ops::Deref, sync::Arc};
 
     use tempfile::TempDir;
 
@@ -8678,7 +8678,7 @@ mod tests {
         let do_validate_btree = std::env::var("VALIDATE_BTREE")
             .is_ok_and(|v| v.parse().expect("validate should be bool"));
         let (mut rng, seed) = rng_from_time_or_env();
-        let mut seen = HashSet::new();
+        let mut seen = HashSet::default();
         tracing::info!("super seed: {}", seed);
         let num_columns = 5;
 
@@ -8799,7 +8799,7 @@ mod tests {
         } else {
             rng_from_time_or_env()
         };
-        let mut seen = HashSet::new();
+        let mut seen = HashSet::default();
         tracing::info!("super seed: {}", seed);
         for _ in 0..attempts {
             let (pager, _, _db, conn) = empty_btree();
@@ -8971,7 +8971,7 @@ mod tests {
         } else {
             rng_from_time_or_env()
         };
-        let mut seen = HashSet::new();
+        let mut seen = HashSet::default();
         tracing::info!("super seed: {}", seed);
 
         for _ in 0..attempts {

@@ -5447,7 +5447,7 @@ mod fuzz_tests {
 
         // Keep track of current tables and their columns in memory
         let mut current_tables: std::collections::HashMap<String, Vec<String>> =
-            std::collections::HashMap::new();
+            std::collections::HashMap::default();
         let mut table_counter = 0;
 
         // Column types for random generation

@@ -364,7 +364,7 @@ impl Value {
         use std::fmt::Write;
         match self {
             Value::Null => Value::build_text("NULL"),
-            Value::Integer(_) | Value::Float(_) => self.to_owned(),
+            Value::Integer(_) | Value::Float(_) => Value::build_text(self.to_string()),
             Value::Blob(b) => {
                 // SQLite returns X'hexdigits' for blobs
                 let mut quoted = String::with_capacity(3 + b.len() * 2);
@@ -485,6 +485,11 @@ impl Value {
 
         let start_value = start_value.exec_cast("INT");
         let length_value = length_value.map(|value| value.exec_cast("INT"));
+
+        // If length is explicitly NULL, return NULL (SQLite behavior)
+        if matches!(length_value, Some(Value::Null)) {
+            return Value::Null;
+        }
 
         match (value, start_value) {
             (Value::Blob(b), Value::Integer(start)) => {
@@ -1640,7 +1645,11 @@ mod tests {
         assert_eq!(input.exec_quote(), expected);
 
         let input = Value::Integer(123);
-        let expected = Value::Integer(123);
+        let expected = Value::build_text("123");
+        assert_eq!(input.exec_quote(), expected);
+
+        let input = Value::Float(12.34);
+        let expected = Value::build_text("12.34");
         assert_eq!(input.exec_quote(), expected);
 
         let input = Value::build_text("hello''world");
@@ -1987,23 +1996,7 @@ mod tests {
     }
 
     #[test]
-    fn test_like_no_cache() {
-        assert!(Value::exec_like("a%", "aaaa", None).unwrap());
-        assert!(Value::exec_like("%a%a", "aaaa", None).unwrap());
-        assert!(!Value::exec_like("%a.a", "aaaa", None).unwrap());
-        assert!(!Value::exec_like("a.a%", "aaaa", None).unwrap());
-        assert!(!Value::exec_like("%a.ab", "aaaa", None).unwrap());
-    }
-
-    #[test]
-    fn test_like_with_cache() {
-        assert!(Value::exec_like("a%", "aaaa", None).unwrap());
-        assert!(Value::exec_like("%a%a", "aaaa", None).unwrap());
-        assert!(!Value::exec_like("%a.a", "aaaa", None).unwrap());
-        assert!(!Value::exec_like("a.a%", "aaaa", None).unwrap());
-        assert!(!Value::exec_like("%a.ab", "aaaa", None).unwrap());
-
-        // again after values have been cached
+    fn test_like_without_escape() {
         assert!(Value::exec_like("a%", "aaaa", None).unwrap());
         assert!(Value::exec_like("%a%a", "aaaa", None).unwrap());
         assert!(!Value::exec_like("%a.a", "aaaa", None).unwrap());
@@ -2234,7 +2227,7 @@ mod tests {
         let str_value = Value::build_text("limbo");
         let start_value = Value::Integer(3);
         let length_value = Value::Null;
-        let expected_val = Value::build_text("mbo");
+        let expected_val = Value::Null;
         assert_eq!(
             Value::exec_substring(&str_value, &start_value, Some(&length_value)),
             expected_val
@@ -2243,7 +2236,7 @@ mod tests {
         let str_value = Value::build_text("limbo");
         let start_value = Value::Integer(10);
         let length_value = Value::Null;
-        let expected_val = Value::build_text("");
+        let expected_val = Value::Null;
         assert_eq!(
             Value::exec_substring(&str_value, &start_value, Some(&length_value)),
             expected_val

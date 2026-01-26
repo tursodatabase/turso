@@ -2,7 +2,7 @@
 // It handles translating high-level SQL operations into low-level bytecode that can be executed by the virtual machine.
 
 use crate::sync::Arc;
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::num::NonZeroUsize;
 
 use tracing::{instrument, Level};
@@ -278,8 +278,8 @@ impl<'a> TranslateCtx<'a> {
             meta_group_by: None,
             meta_left_joins: (0..table_count).map(|_| None).collect(),
             meta_sort: None,
-            hash_table_contexts: HashMap::new(),
-            materialized_build_inputs: HashMap::new(),
+            hash_table_contexts: HashMap::default(),
+            materialized_build_inputs: HashMap::default(),
             resolver: Resolver::new(schema, syms),
             non_aggregate_expressions: Vec::new(),
             cdc_cursor_id: None,
@@ -410,9 +410,9 @@ fn emit_materialized_build_inputs(
     resolver: &Resolver,
     plan: &mut SelectPlan,
 ) -> Result<HashMap<usize, MaterializedBuildInput>> {
-    let mut build_inputs: HashMap<usize, MaterializedBuildInput> = HashMap::new();
+    let mut build_inputs: HashMap<usize, MaterializedBuildInput> = HashMap::default();
     let mut materializations: Vec<MaterializationSpec> = Vec::new();
-    let mut hash_tables_to_keep_open: HashSet<usize> = HashSet::new();
+    let mut hash_tables_to_keep_open: HashSet<usize> = HashSet::default();
 
     // Keep hash tables open while running materialization subplans so we can reuse them.
     // A build table may appear in multiple hash joins when chaining, so we do not
@@ -424,7 +424,7 @@ fn emit_materialized_build_inputs(
         }
     }
 
-    let mut seen_build_tables: HashSet<usize> = HashSet::new();
+    let mut seen_build_tables: HashSet<usize> = HashSet::default();
 
     // decide per-hash-join materialization mode (rowid-only vs key+payload).
     for member in plan.join_order.iter() {
@@ -619,7 +619,7 @@ fn prune_join_order_for_materialized_inputs(
         return Ok(());
     }
 
-    let mut build_tables_in_plan = HashSet::new();
+    let mut build_tables_in_plan = HashSet::default();
     for member in plan.join_order.iter() {
         let table = &plan.table_references.joined_tables()[member.original_idx];
         if let Operation::HashJoin(hash_join_op) = &table.op {
@@ -627,7 +627,7 @@ fn prune_join_order_for_materialized_inputs(
         }
     }
 
-    let mut tables_to_remove: HashSet<usize> = HashSet::new();
+    let mut tables_to_remove: HashSet<usize> = HashSet::default();
     for (build_table_idx, input) in build_inputs.iter() {
         if !build_tables_in_plan.contains(build_table_idx) {
             continue;
@@ -733,7 +733,7 @@ fn collect_materialized_payload_columns(
     included_tables: &[usize],
 ) -> Result<Vec<MaterializedColumnRef>> {
     let mut payload_columns: Vec<MaterializedColumnRef> = Vec::new();
-    let mut seen: HashSet<MaterializedColumnRef> = HashSet::new();
+    let mut seen: HashSet<MaterializedColumnRef> = HashSet::default();
     for table_idx in included_tables.iter().copied() {
         let table = &plan.table_references.joined_tables()[table_idx];
         for col_idx in table.col_used_mask.iter() {
@@ -2618,7 +2618,7 @@ fn emit_update_insns<'a>(
     let preserved_old_registers: Option<Vec<usize>> = if let Some(btree_table) =
         target_table.table.btree()
     {
-        let updated_column_indices: std::collections::HashSet<usize> =
+        let updated_column_indices: HashSet<usize> =
             set_clauses.iter().map(|(col_idx, _)| *col_idx).collect();
         let relevant_before_update_triggers = get_relevant_triggers_type_and_time(
             t_ctx.resolver.schema,
@@ -2776,10 +2776,7 @@ fn emit_update_insns<'a>(
                     target_table_cursor_id,
                     start,
                     rowid_new_reg,
-                    &set_clauses
-                        .iter()
-                        .map(|(i, _)| *i)
-                        .collect::<std::collections::HashSet<_>>(),
+                    &set_clauses.iter().map(|(i, _)| *i).collect::<HashSet<_>>(),
                 )?;
             }
             // Parent-side NO ACTION/RESTRICT checks must happen BEFORE the update.
@@ -3505,7 +3502,7 @@ fn emit_update_insns<'a>(
 
         // Fire AFTER UPDATE triggers
         if let Some(btree_table) = target_table.table.btree() {
-            let updated_column_indices: std::collections::HashSet<usize> =
+            let updated_column_indices: HashSet<usize> =
                 set_clauses.iter().map(|(col_idx, _)| *col_idx).collect();
             let relevant_triggers = get_relevant_triggers_type_and_time(
                 t_ctx.resolver.schema,

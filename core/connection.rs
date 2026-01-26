@@ -15,16 +15,15 @@ use crate::{
     io::{MemoryIO, PlatformIO, IO},
     match_ignore_ascii_case, parse_schema_rows, refresh_analyze_stats, translate, turso_assert,
     util::IOExt,
-    vdbe, AllViewsTxState, AtomicCipherMode, AtomicSyncMode, AtomicTransactionState, BusyHandler,
-    BusyHandlerCallback, CaptureDataChangesMode, CheckpointMode, CheckpointResult, CipherMode, Cmd,
-    Completion, ConnectionMetrics, Database, DatabaseCatalog, DatabaseOpts, Duration,
-    EncryptionKey, EncryptionOpts, IndexMethod, LimboError, MvStore, OpenFlags, PageSize, Pager,
-    Parser, QueryMode, QueryRunner, Result, Schema, Statement, SyncMode, TransactionMode,
-    TransactionState, Trigger, Value, VirtualTable,
+    vdbe, AllViewsTxState, AtomicCipherMode, AtomicSyncMode, AtomicTempStore,
+    AtomicTransactionState, BusyHandler, BusyHandlerCallback, CaptureDataChangesMode,
+    CheckpointMode, CheckpointResult, CipherMode, Cmd, Completion, ConnectionMetrics, Database,
+    DatabaseCatalog, DatabaseOpts, Duration, EncryptionKey, EncryptionOpts, IndexMethod,
+    LimboError, MvStore, OpenFlags, PageSize, Pager, Parser, QueryMode, QueryRunner, Result,
+    Schema, Statement, SyncMode, TransactionMode, TransactionState, Trigger, Value, VirtualTable,
 };
 use arc_swap::ArcSwap;
-use rustc_hash::FxHashMap;
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::fmt::Display;
 use std::ops::Deref;
 use tracing::{instrument, Level};
@@ -35,7 +34,7 @@ pub struct Connection {
     pub(crate) schema: RwLock<Arc<Schema>>,
     /// Per-database schema cache (database_index -> schema)
     /// Loaded lazily to avoid copying all schemas on connection open
-    pub(super) database_schemas: RwLock<FxHashMap<usize, Arc<Schema>>>,
+    pub(super) database_schemas: RwLock<HashMap<usize, Arc<Schema>>>,
     /// Whether to automatically commit transaction
     pub(crate) auto_commit: AtomicBool,
     pub(super) transaction_state: AtomicTransactionState,
@@ -78,6 +77,7 @@ pub struct Connection {
     pub(crate) encryption_key: RwLock<Option<EncryptionKey>>,
     pub(super) encryption_cipher_mode: AtomicCipherMode,
     pub(super) sync_mode: AtomicSyncMode,
+    pub(super) temp_store: AtomicTempStore,
     pub(super) data_sync_retry: AtomicBool,
     /// Busy handler for lock contention
     /// Default is BusyHandler::None (return SQLITE_BUSY immediately)
@@ -1369,6 +1369,14 @@ impl Connection {
         self.sync_mode.set(mode);
     }
 
+    pub fn get_temp_store(&self) -> crate::TempStore {
+        self.temp_store.get()
+    }
+
+    pub fn set_temp_store(&self, value: crate::TempStore) {
+        self.temp_store.set(value);
+    }
+
     pub fn get_data_sync_retry(&self) -> bool {
         self.data_sync_retry
             .load(crate::sync::atomic::Ordering::SeqCst)
@@ -1390,7 +1398,7 @@ impl Connection {
     }
 
     /// Creates a HashSet of modules that have been loaded
-    pub fn get_syms_vtab_mods(&self) -> std::collections::HashSet<String> {
+    pub fn get_syms_vtab_mods(&self) -> HashSet<String> {
         self.syms.read().vtab_modules.keys().cloned().collect()
     }
 
@@ -1565,10 +1573,10 @@ pub fn resolve_ext_path(extpath: &str) -> Result<std::path::PathBuf> {
 impl SymbolTable {
     pub fn new() -> Self {
         Self {
-            functions: HashMap::new(),
-            vtabs: HashMap::new(),
-            vtab_modules: HashMap::new(),
-            index_methods: HashMap::new(),
+            functions: HashMap::default(),
+            vtabs: HashMap::default(),
+            vtab_modules: HashMap::default(),
+            index_methods: HashMap::default(),
         }
     }
     pub fn resolve_function(

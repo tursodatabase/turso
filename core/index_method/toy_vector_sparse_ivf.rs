@@ -1093,7 +1093,7 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                         self.search_state = VectorSparseInvertedIndexSearchState::Seek {
                             sum: *sum,
                             components: Some(components.into()),
-                            collected: Some(HashSet::new()),
+                            collected: Some(HashSet::default()),
                             distances: Some(BTreeSet::new()),
                             limit: *limit,
                             key: None,
