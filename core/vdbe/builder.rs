@@ -1379,6 +1379,9 @@ impl ProgramBuilder {
             .iter()
             .any(|(insn, _)| matches!(insn, Insn::Program { .. }));
 
+        // Validate bytecode in debug builds
+        super::validator::debug_assert_valid_program(&self.insns, sql);
+
         Ok(Program {
             max_registers: self.next_free_register,
             insns: self.insns,
