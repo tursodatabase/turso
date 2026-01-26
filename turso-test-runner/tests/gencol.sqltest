@@ -1529,9 +1529,7 @@ expect {
     x|20
 }
 
-# Index update when base column changes
-# TODO: Index on generated column may not be updated correctly on UPDATE
-# Using table scan instead of index lookup to verify the value
+# Index update when base column changes - verify index is updated when base column changes
 test gencol_index_update_on_base_change {
     CREATE TABLE t1(a INTEGER, b AS (a * 2) STORED);
     CREATE INDEX idx_b ON t1(b);
@@ -2518,17 +2516,47 @@ expect {
 }
 
 # Case-insensitive column reference matching
-# TODO: This test fails due to a separate bug in ALTER TABLE RENAME COLUMN where
-# the column lookup is case-sensitive. Filed separately.
-# test gencol_rename_column_case_insensitive {
-#     CREATE TABLE t1(MyCol INTEGER, b AS (MYCOL * 2));
-#     ALTER TABLE t1 RENAME COLUMN mycol TO newcol;
-#     INSERT INTO t1(newcol) VALUES(5);
-#     SELECT newcol, b FROM t1;
-# }
-# expect {
-#     5|10
-# }
+test gencol_rename_column_case_insensitive {
+    CREATE TABLE t1(MyCol INTEGER, b AS (MYCOL * 2));
+    ALTER TABLE t1 RENAME COLUMN mycol TO newcol;
+    INSERT INTO t1(newcol) VALUES(5);
+    SELECT newcol, b FROM t1;
+}
+expect {
+    5|10
+}
+
+# Case variations in RENAME COLUMN
+test gencol_rename_column_uppercase_source {
+    CREATE TABLE t1(myval INTEGER, b AS (myval * 3));
+    ALTER TABLE t1 RENAME COLUMN MYVAL TO newval;
+    INSERT INTO t1(newval) VALUES(4);
+    SELECT newval, b FROM t1;
+}
+expect {
+    4|12
+}
+
+test gencol_rename_column_mixed_case {
+    CREATE TABLE t1(MixedCase INTEGER, b AS (MixedCase + 10) STORED);
+    ALTER TABLE t1 RENAME COLUMN mIxEdCaSe TO renamed;
+    INSERT INTO t1(renamed) VALUES(5);
+    SELECT renamed, b FROM t1;
+}
+expect {
+    5|15
+}
+
+test gencol_rename_column_case_insensitive_with_index {
+    CREATE TABLE t1(MyCol INTEGER, b AS (MyCol * 2) STORED);
+    CREATE INDEX idx ON t1(b);
+    ALTER TABLE t1 RENAME COLUMN mycol TO newcol;
+    INSERT INTO t1(newcol) VALUES(7);
+    SELECT newcol, b FROM t1;
+}
+expect {
+    7|14
+}
 
 # -----------------------------------------------------------------------------
 # INTEGER PRIMARY KEY Reference in Generated Columns (Fix 24)
