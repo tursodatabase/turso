@@ -257,18 +257,6 @@ impl Parser {
         // Now check if it's a test or snapshot
         match self.peek() {
             Some(Token::Snapshot) => {
-                // Snapshot blocks don't support @backend or @requires
-                if backend.is_some() {
-                    return Err(
-                        self.error("@backend is not supported for snapshot blocks".to_string())
-                    );
-                }
-                if !requires.is_empty() {
-                    return Err(
-                        self.error("@requires is not supported for snapshot blocks".to_string())
-                    );
-                }
-
                 self.expect_token(Token::Snapshot)?;
                 let (name, name_span) = self.expect_identifier_with_span()?;
                 let sql = self.expect_block_content()?.trim().to_string();
@@ -1456,7 +1444,7 @@ snapshot query-plan {
     }
 
     #[test]
-    fn test_snapshot_does_not_support_backend() {
+    fn test_snapshot_supports_backend() {
         let input = r#"
 @database :memory:
 
@@ -1466,23 +1454,36 @@ snapshot query-plan {
 }
 "#;
 
-        let result = parse(input);
-        assert!(result.is_err());
+        let result = parse(input).unwrap();
+        assert_eq!(result.snapshots.len(), 1);
+        assert_eq!(
+            result.snapshots[0].modifiers.backend,
+            Some(ast::Backend::Cli)
+        );
     }
 
     #[test]
-    fn test_snapshot_does_not_support_requires() {
+    fn test_snapshot_supports_requires() {
         let input = r#"
 @database :memory:
 
-@requires trigger "test"
+@requires trigger "test reason"
 snapshot query-plan {
     SELECT 1;
 }
 "#;
 
-        let result = parse(input);
-        assert!(result.is_err());
+        let result = parse(input).unwrap();
+        assert_eq!(result.snapshots.len(), 1);
+        assert_eq!(result.snapshots[0].modifiers.requires.len(), 1);
+        assert_eq!(
+            result.snapshots[0].modifiers.requires[0].capability,
+            ast::Capability::Trigger
+        );
+        assert_eq!(
+            result.snapshots[0].modifiers.requires[0].reason,
+            "test reason"
+        );
     }
 
     #[test]
