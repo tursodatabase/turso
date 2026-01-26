@@ -1,6 +1,5 @@
 use divan::{black_box, Bencher};
 use turso_core::types::Value;
-use turso_core::vdbe::value::construct_like_regex;
 
 // =============================================================================
 // String Case Functions
@@ -904,27 +903,30 @@ fn exec_if_not(bencher: Bencher) {
 }
 
 // =============================================================================
-// LIKE Pattern (construct_like_regex)
+// LIKE Pattern
 // =============================================================================
 
 #[divan::bench]
 fn construct_like_regex_simple(bencher: Bencher) {
-    bencher.bench_local(|| construct_like_regex(black_box("hello")));
+    bencher.bench_local(|| Value::exec_like(black_box("hello"), black_box("hello"), None).unwrap());
 }
 
 #[divan::bench]
 fn construct_like_regex_with_percent(bencher: Bencher) {
-    bencher.bench_local(|| construct_like_regex(black_box("%hello%")));
+    bencher
+        .bench_local(|| Value::exec_like(black_box("%hello%"), black_box("hello"), None).unwrap());
 }
 
 #[divan::bench]
 fn construct_like_regex_with_underscore(bencher: Bencher) {
-    bencher.bench_local(|| construct_like_regex(black_box("h_llo")));
+    bencher.bench_local(|| Value::exec_like(black_box("h_llo"), black_box("hello"), None).unwrap());
 }
 
 #[divan::bench]
 fn construct_like_regex_complex(bencher: Bencher) {
-    bencher.bench_local(|| construct_like_regex(black_box("%h_llo%w_rld%")));
+    bencher.bench_local(|| {
+        Value::exec_like(black_box("%h_llo%w_rld%"), black_box("hello world"), None).unwrap()
+    });
 }
 
 // =============================================================================

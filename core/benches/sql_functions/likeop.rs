@@ -1,6 +1,7 @@
 use divan::{black_box, Bencher};
 use std::collections::HashMap;
-use turso_core::vdbe::likeop::{exec_glob, exec_like_with_escape};
+use turso_core::types::Value;
+use turso_core::vdbe::likeop::exec_glob;
 
 // =============================================================================
 // LIKE Pattern Matching Benchmarks
@@ -8,88 +9,109 @@ use turso_core::vdbe::likeop::{exec_glob, exec_like_with_escape};
 
 #[divan::bench]
 fn like_simple_exact_match(bencher: Bencher) {
-    bencher.bench_local(|| exec_like_with_escape(black_box("hello"), black_box("hello"), '\\'));
+    bencher.bench_local(|| {
+        Value::exec_like(black_box("hello"), black_box("hello"), Some('\\')).unwrap()
+    });
 }
 
 #[divan::bench]
 fn like_simple_no_match(bencher: Bencher) {
-    bencher.bench_local(|| exec_like_with_escape(black_box("hello"), black_box("world"), '\\'));
+    bencher.bench_local(|| {
+        Value::exec_like(black_box("hello"), black_box("world"), Some('\\')).unwrap()
+    });
 }
 
 #[divan::bench]
 fn like_percent_prefix(bencher: Bencher) {
     // Pattern: %world - matches anything ending with "world"
-    bencher
-        .bench_local(|| exec_like_with_escape(black_box("%world"), black_box("hello world"), '\\'));
+    bencher.bench_local(|| {
+        Value::exec_like(black_box("%world"), black_box("hello world"), Some('\\')).unwrap()
+    });
 }
 
 #[divan::bench]
 fn like_percent_suffix(bencher: Bencher) {
     // Pattern: hello% - matches anything starting with "hello"
-    bencher
-        .bench_local(|| exec_like_with_escape(black_box("hello%"), black_box("hello world"), '\\'));
+    bencher.bench_local(|| {
+        Value::exec_like(black_box("hello%"), black_box("hello world"), Some('\\')).unwrap()
+    });
 }
 
 #[divan::bench]
 fn like_percent_both(bencher: Bencher) {
     // Pattern: %llo wor% - matches anything containing "llo wor"
     bencher.bench_local(|| {
-        exec_like_with_escape(black_box("%llo wor%"), black_box("hello world"), '\\')
+        Value::exec_like(black_box("%llo wor%"), black_box("hello world"), Some('\\')).unwrap()
     });
 }
 
 #[divan::bench]
 fn like_underscore_single(bencher: Bencher) {
     // Pattern: h_llo - matches "hello", "hallo", etc.
-    bencher.bench_local(|| exec_like_with_escape(black_box("h_llo"), black_box("hello"), '\\'));
+    bencher.bench_local(|| {
+        Value::exec_like(black_box("h_llo"), black_box("hello"), Some('\\')).unwrap()
+    });
 }
 
 #[divan::bench]
 fn like_underscore_multiple(bencher: Bencher) {
     // Pattern: h___o - matches 5 character words starting with h, ending with o
-    bencher.bench_local(|| exec_like_with_escape(black_box("h___o"), black_box("hello"), '\\'));
+    bencher.bench_local(|| {
+        Value::exec_like(black_box("h___o"), black_box("hello"), Some('\\')).unwrap()
+    });
 }
 
 #[divan::bench]
 fn like_mixed_wildcards(bencher: Bencher) {
     // Pattern: %h_llo% - complex pattern
     bencher.bench_local(|| {
-        exec_like_with_escape(black_box("%h_llo%"), black_box("say hello world"), '\\')
+        Value::exec_like(
+            black_box("%h_llo%"),
+            black_box("say hello world"),
+            Some('\\'),
+        )
+        .unwrap()
     });
 }
 
 #[divan::bench]
 fn like_escape_percent(bencher: Bencher) {
     // Testing escaped percent sign
-    bencher.bench_local(|| exec_like_with_escape(black_box("100\\%"), black_box("100%"), '\\'));
+    bencher.bench_local(|| {
+        Value::exec_like(black_box("100\\%"), black_box("100%"), Some('\\')).unwrap()
+    });
 }
 
 #[divan::bench]
 fn like_escape_underscore(bencher: Bencher) {
     // Testing escaped underscore
     bencher.bench_local(|| {
-        exec_like_with_escape(black_box("file\\_name"), black_box("file_name"), '\\')
+        Value::exec_like(black_box("file\\_name"), black_box("file_name"), Some('\\')).unwrap()
     });
 }
 
 #[divan::bench]
 fn like_case_insensitive(bencher: Bencher) {
     // LIKE is case-insensitive by default
-    bencher.bench_local(|| exec_like_with_escape(black_box("HELLO"), black_box("hello"), '\\'));
+    bencher.bench_local(|| {
+        Value::exec_like(black_box("HELLO"), black_box("hello"), Some('\\')).unwrap()
+    });
 }
 
 #[divan::bench]
 fn like_long_pattern(bencher: Bencher) {
     let pattern = "The quick brown fox %";
     let text = "The quick brown fox jumps over the lazy dog";
-    bencher.bench_local(|| exec_like_with_escape(black_box(pattern), black_box(text), '\\'));
+    bencher
+        .bench_local(|| Value::exec_like(black_box(pattern), black_box(text), Some('\\')).unwrap());
 }
 
 #[divan::bench]
 fn like_long_text_short_pattern(bencher: Bencher) {
     let pattern = "%dog";
     let text = "The quick brown fox jumps over the lazy dog";
-    bencher.bench_local(|| exec_like_with_escape(black_box(pattern), black_box(text), '\\'));
+    bencher
+        .bench_local(|| Value::exec_like(black_box(pattern), black_box(text), Some('\\')).unwrap());
 }
 
 #[divan::bench]
@@ -97,7 +119,8 @@ fn like_many_percent_wildcards(bencher: Bencher) {
     // Pattern with multiple % wildcards - can be expensive
     let pattern = "%quick%fox%lazy%";
     let text = "The quick brown fox jumps over the lazy dog";
-    bencher.bench_local(|| exec_like_with_escape(black_box(pattern), black_box(text), '\\'));
+    bencher
+        .bench_local(|| Value::exec_like(black_box(pattern), black_box(text), Some('\\')).unwrap());
 }
 
 // =============================================================================
@@ -249,14 +272,14 @@ fn glob_complex_pattern_cached(bencher: Bencher) {
 
 #[divan::bench]
 fn like_empty_pattern(bencher: Bencher) {
-    bencher.bench_local(|| exec_like_with_escape(black_box(""), black_box(""), '\\'));
+    bencher.bench_local(|| Value::exec_like(black_box(""), black_box(""), Some('\\')).unwrap());
 }
 
 #[divan::bench]
 fn like_only_percent(bencher: Bencher) {
     // % matches everything
     bencher.bench_local(|| {
-        exec_like_with_escape(black_box("%"), black_box("any string at all"), '\\')
+        Value::exec_like(black_box("%"), black_box("any string at all"), Some('\\')).unwrap()
     });
 }
 
@@ -268,9 +291,9 @@ fn glob_only_star(bencher: Bencher) {
 
 #[divan::bench]
 fn like_special_regex_chars(bencher: Bencher) {
-    // Pattern with characters that are special in regex
+    // Pattern with characters that are special in regex (checking for regression/bugs)
     bencher.bench_local(|| {
-        exec_like_with_escape(black_box("test.file"), black_box("test.file"), '\\')
+        Value::exec_like(black_box("test.file"), black_box("test.file"), Some('\\')).unwrap()
     });
 }
 
@@ -282,8 +305,9 @@ fn glob_bracket_special_cases(bencher: Bencher) {
 
 #[divan::bench]
 fn like_unicode_pattern(bencher: Bencher) {
-    bencher
-        .bench_local(|| exec_like_with_escape(black_box("héllo%"), black_box("héllo world"), '\\'));
+    bencher.bench_local(|| {
+        Value::exec_like(black_box("héllo%"), black_box("héllo world"), Some('\\')).unwrap()
+    });
 }
 
 #[divan::bench]
