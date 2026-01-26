@@ -6038,6 +6038,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "turso-coverage"
+version = "0.1.0"
+dependencies = [
+ "linkme",
+]
+
+[[package]]
 name = "turso-dotnet"
 version = "0.5.0-pre.2"
 dependencies = [
