@@ -4,7 +4,9 @@ use crate::parser::ast::{
     Backend, Capability, DatabaseConfig, Requirement, SetupRef, Skip, SkipCondition, SnapshotCase,
     TestCase, TestFile,
 };
-use crate::snapshot::{SnapshotInfo, SnapshotManager, SnapshotResult, SnapshotUpdateMode};
+use crate::snapshot::{
+    SnapshotInfo, SnapshotManager, SnapshotResult, SnapshotUpdateMode, format_explain_output,
+};
 use async_trait::async_trait;
 use futures::FutureExt;
 use futures::stream::{FuturesUnordered, StreamExt};
@@ -131,13 +133,8 @@ impl Runnable for SnapshotCase {
     }
 
     async fn evaluate_result(&self, result: QueryResult, options: &RunOptions) -> TestOutcome {
-        // Format EXPLAIN output for snapshot
-        let actual_output = result
-            .rows
-            .iter()
-            .map(|row| row.join("|"))
-            .collect::<Vec<_>>()
-            .join("\n");
+        // Format EXPLAIN output as a nicely aligned table
+        let actual_output = format_explain_output(&result.rows);
 
         // Build snapshot info with metadata
         let db_location_str = options.db_config.location.to_string();
