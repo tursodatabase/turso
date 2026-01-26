@@ -1122,6 +1122,32 @@ impl Value {
         }
     }
 
+    pub fn exec_regexp(
+        regex_cache: Option<&mut HashMap<String, Regex>>,
+        pattern: &str,
+        text: &str,
+    ) -> Result<bool, LimboError> {
+        if let Some(cache) = regex_cache {
+            match cache.get(pattern) {
+                Some(re) => Ok(re.is_match(text)),
+                None => {
+                    let re = RegexBuilder::new(pattern).build().map_err(|e| {
+                        LimboError::Constraint(format!("Invalid REGEXP pattern: {e}"))
+                    })?;
+
+                    let is_match = re.is_match(text);
+                    cache.insert(pattern.to_string(), re);
+                    Ok(is_match)
+                }
+            }
+        } else {
+            let re = RegexBuilder::new(pattern)
+                .build()
+                .map_err(|e| LimboError::Constraint(format!("Invalid REGEXP pattern: {e}")))?;
+            Ok(re.is_match(text))
+        }
+    }
+
     pub fn exec_min<'a, T: Iterator<Item = &'a Value>>(regs: T) -> Value {
         // SQLite: multi-arg min() returns NULL if ANY argument is NULL
         let mut result: Option<&Value> = None;
@@ -2008,6 +2034,34 @@ mod tests {
         assert!(!Value::exec_like(Some(&mut cache), "%a.a", "aaaa").unwrap());
         assert!(!Value::exec_like(Some(&mut cache), "a.a%", "aaaa").unwrap());
         assert!(!Value::exec_like(Some(&mut cache), "%a.ab", "aaaa").unwrap());
+    }
+
+    #[test]
+    fn test_regexp_no_cache() {
+        assert!(Value::exec_regexp(None, "abc", "abc").unwrap());
+        assert!(Value::exec_regexp(None, "abc", "xabcy").unwrap());
+        assert!(!Value::exec_regexp(None, "abc", "ab").unwrap());
+        assert!(Value::exec_regexp(None, "^abc", "abc").unwrap());
+        assert!(!Value::exec_regexp(None, "^abc", "xabc").unwrap());
+        assert!(Value::exec_regexp(None, "abc$", "abc").unwrap());
+        assert!(!Value::exec_regexp(None, "abc$", "abcx").unwrap());
+        assert!(Value::exec_regexp(None, "^[0-9]+$", "12345").unwrap());
+        assert!(!Value::exec_regexp(None, "^[0-9]+$", "123a").unwrap());
+        assert!(Value::exec_regexp(None, "a{2,}", "aaaa").unwrap());
+        assert!(!Value::exec_regexp(None, "ABC", "abc").unwrap());
+        assert!(Value::exec_regexp(None, "[", "abc").is_err());
+        assert!(Value::exec_regexp(None, "*", "abc").is_err());
+    }
+
+    #[test]
+    fn test_regexp_with_cache() {
+        let mut cache = HashMap::new();
+        assert!(Value::exec_regexp(Some(&mut cache), "abc", "abc").unwrap());
+        assert!(Value::exec_regexp(Some(&mut cache), "^\\d+$", "100").unwrap());
+        assert!(Value::exec_regexp(Some(&mut cache), "abc", "zzabczz").unwrap());
+        assert!(Value::exec_regexp(Some(&mut cache), "^\\d+$", "999").unwrap());
+        assert!(!Value::exec_regexp(Some(&mut cache), "^\\d+$", "10a").unwrap());
+        assert!(Value::exec_regexp(Some(&mut cache), "(unclosed", "text").is_err());
     }
 
     #[test]
