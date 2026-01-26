@@ -763,10 +763,7 @@ async fn generate_debug_databases(
     eprintln!("  - database.db (INTEGER PRIMARY KEY, rowid alias enabled)");
     eprintln!("  - database-no-rowidalias.db (INT PRIMARY KEY, no rowid alias)");
     eprintln!();
-    eprintln!(
-        "Configuration: seed={}, user_count={}, mvcc={}",
-        seed, user_count, mvcc
-    );
+    eprintln!("Configuration: seed={seed}, user_count={user_count}, mvcc={mvcc}");
 
     ExitCode::SUCCESS
 }
