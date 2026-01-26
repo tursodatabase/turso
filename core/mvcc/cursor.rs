@@ -1400,6 +1400,19 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
 
             // MVCC doesn't have it, but we need to check B-tree too
             if self.is_btree_allocated() {
+                let is_deleted = matches!(
+                    self.db.find_row_last_version_state(
+                        self.table_id,
+                        &RowKey::Int(*int_key),
+                        self.tx_id,
+                    ),
+                    RowVersionState::Deleted
+                );
+                // If we deleted the row we don't need to check B-tree.
+                if is_deleted {
+                    self.state = None;
+                    return Ok(IOResult::Done(false));
+                }
                 self.state
                     .replace(MvccLazyCursorState::Exists(ExistsState::ExistsBtree));
             } else {
