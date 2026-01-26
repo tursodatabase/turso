@@ -1,0 +1,97 @@
+{
+  "name": "@tursodatabase/sync-react-native",
+  "version": "0.5.0-pre.1",
+  "description": "React Native bindings for TursoDB",
+  "main": "lib/commonjs/index.js",
+  "module": "lib/module/index.js",
+  "types": "lib/typescript/index.d.ts",
+  "react-native": "src/index.ts",
+  "source": "src/index.ts",
+  "files": [
+    "src",
+    "lib",
+    "libs",
+    "cpp",
+    "ios",
+    "android",
+    "node/dist",
+    "node/package.json",
+    "*.podspec",
+    "*.rb",
+    "!ios/build",
+    "!android/build",
+    "!android/gradle",
+    "!android/gradlew",
+    "!android/gradlew.bat",
+    "!android/local.properties",
+    "!**/__tests__",
+    "!**/__fixtures__",
+    "!**/__mocks__",
+    "!**/.*"
+  ],
+  "scripts": {
+    "typescript": "tsc --noEmit",
+    "lint": "eslint \"src/**/*.{ts,tsx}\"",
+    "clean": "del-cli lib",
+    "build": "bob build",
+    "build:rust:ios": "make ios",
+    "build:rust:android": "make android",
+    "prepare": "bob build"
+  },
+  "keywords": [
+    "react-native",
+    "ios",
+    "android",
+    "sqlite",
+    "database",
+    "turso",
+    "tursodb"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tursodatabase/turso.git",
+    "directory": "bindings/react-native"
+  },
+  "author": "Turso <info@turso.tech> (https://turso.tech)",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/tursodatabase/turso/issues"
+  },
+  "homepage": "https://github.com/tursodatabase/turso#readme",
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/"
+  },
+  "devDependencies": {
+    "@types/react": "^18.2.0",
+    "del-cli": "^5.1.0",
+    "eslint": "^8.57.0",
+    "react": "^18.2.0",
+    "react-native": "^0.76.0",
+    "react-native-builder-bob": "^0.30.0",
+    "typescript": "^5.3.0"
+  },
+  "dependencies": {
+    "@babel/runtime": "^7.25.0"
+  },
+  "peerDependencies": {
+    "react": ">=18.0.0",
+    "react-native": ">=0.76.0"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "react-native-builder-bob": {
+    "source": "src",
+    "output": "lib",
+    "targets": [
+      "commonjs",
+      "module",
+      [
+        "typescript",
+        {
+          "project": "tsconfig.build.json"
+        }
+      ]
+    ]
+  }
+}

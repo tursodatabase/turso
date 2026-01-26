@@ -224,6 +224,7 @@ turso_status_code_t turso_statement_run_io(const turso_statement_t *self, const 
 turso_status_code_t turso_statement_reset(const turso_statement_t *self, const char **error_opt_out);
 
 /** Finalize a statement
+ * finalize returns TURSO_DONE if finalization completed
  * This method must be called in the end of statement execution (either successfull or not)
  */
 turso_status_code_t turso_statement_finalize(const turso_statement_t *self, const char **error_opt_out);
