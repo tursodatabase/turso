@@ -777,3 +777,27 @@ test subquery-vector-in-function-call {
 expect error {
 }
 
+# Subquery column affinity inheritance
+# When a subquery selects from a table column, the result column should inherit
+# the affinity of the source column. This affects comparison behavior:
+# - INTEGER affinity causes string operands to be coerced to numeric
+# - Without proper affinity inheritance, '9' would not be coerced and
+#   10 > '9' would be false (comparing int to text directly)
+test subquery-column-affinity-inheritance {
+    create table t11(x INTEGER);
+    insert into t11 values (10);
+    select y > '9' from (select x as y from t11);
+}
+expect {
+    1
+}
+
+# Same test with TEXT affinity - should preserve text comparison behavior
+test subquery-column-affinity-inheritance-text {
+    create table t12(x TEXT);
+    insert into t12 values ('10');
+    select y > '9' from (select x as y from t12);
+}
+expect {
+    0
+}

@@ -9,7 +9,7 @@ use crate::{
     translate::{
         collate::{get_collseq_from_expr, CollationSeq},
         emitter::UpdateRowSource,
-        expr::as_binary_components,
+        expr::{as_binary_components, get_expr_affinity},
         expression_index::{normalize_expr_for_index_matching, single_table_column_usage},
         optimizer::constraints::{BinaryExprSide, SeekRangeConstraint},
         planner::determine_where_to_eval_term,
@@ -27,6 +27,29 @@ use crate::{schema::Type, types::SeekOp};
 use turso_parser::ast::TableInternalId;
 
 use super::emitter::OperationMode;
+
+/// Infer the Type and type name from an expression's affinity.
+///
+/// Used for subquery result columns. SQLite derives column affinity from:
+/// - Column references: the declared column type
+/// - CAST expressions: the cast target type
+/// - Subqueries: recursively from the subquery's result expression
+/// - Literals: BLOB affinity (no affinity)
+///
+/// The affinity determines comparison behavior in IN expressions, etc.
+fn infer_type_from_expr(
+    expr: &ast::Expr,
+    tables: Option<&TableReferences>,
+) -> (Type, &'static str) {
+    let affinity = get_expr_affinity(expr, tables);
+    match affinity {
+        Affinity::Integer => (Type::Integer, "INTEGER"),
+        Affinity::Real => (Type::Real, "REAL"),
+        Affinity::Text => (Type::Text, "TEXT"),
+        Affinity::Numeric => (Type::Numeric, "NUMERIC"),
+        Affinity::Blob => (Type::Blob, "BLOB"),
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct ResultSetColumn {
@@ -1236,12 +1259,14 @@ impl JoinedTable {
             .result_columns
             .iter()
             .map(|rc| {
+                let (col_type, type_name) =
+                    infer_type_from_expr(&rc.expr, Some(&plan.table_references));
                 Column::new(
                     rc.name(&plan.table_references).map(String::from),
-                    "BLOB".to_string(),
+                    type_name.to_string(),
                     None,
                     None,
-                    Type::Blob, // FIXME: infer proper type
+                    col_type,
                     None,
                     ColDef::default(),
                 )
@@ -1324,12 +1349,13 @@ impl JoinedTable {
                 let col_name = explicit_columns
                     .and_then(|cols| cols.get(i).cloned())
                     .or_else(|| rc.name(table_references).map(String::from));
+                let (col_type, type_name) = infer_type_from_expr(&rc.expr, Some(table_references));
                 Column::new(
                     col_name,
-                    "BLOB".to_string(),
+                    type_name.to_string(),
                     None,
                     None,
-                    Type::Blob, // FIXME: infer proper type
+                    col_type,
                     None,
                     ColDef::default(),
                 )
