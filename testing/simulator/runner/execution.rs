@@ -215,33 +215,36 @@ pub fn execute_interaction_turso(
                     .inspect_err(|err| tracing::error!(?err))
             };
 
-            // Handle errors: skip shadow on any failed query
-            // - Without ignore_error: recoverable errors skip property, others fail simulation
-            // - With ignore_error: skip shadow but continue executing the property
-            let (skip_shadow, skip_property) = if let Err(err) = &results {
-                if interaction.ignore_error {
-                    (true, false) // query failed but ignore_error is set: skip shadow, continue property
-                } else if is_recoverable_tx_error(err) {
-                    // Only rollback shadow state if the DB actually rolled back
-                    if error_causes_rollback(err) && env.conn_in_transaction(connection_index) {
-                        env.rollback_conn(connection_index);
+            if let Err(err) = &results
+                && !interaction.ignore_error
+            {
+                let continuation = match err {
+                    err if is_recoverable_tx_error(err) => {
+                        if error_causes_rollback(err) && env.conn_in_transaction(connection_index) {
+                            env.rollback_conn(connection_index);
+                        }
+                        ExecutionContinuation::NextInteractionOutsideThisProperty
                     }
-                    (true, true) // skip shadow and skip rest of property
-                } else if matches!(err, LimboError::Constraint(_)) {
-                    let shadow_result =
-                        interaction.shadow(&mut env.get_conn_tables_mut(connection_index));
-                    if shadow_result.is_ok() {
-                        return Err(LimboError::InternalError(format!(
-                            "Turso rejected with constraint error but shadow would accept: {err:?}"
-                        )));
+                    LimboError::Constraint(_) => {
+                        let shadow_result =
+                            interaction.shadow(&mut env.get_conn_tables_mut(connection_index));
+                        if shadow_result.is_ok() {
+                            return Err(LimboError::InternalError(format!(
+                                "Turso rejected with constraint error but shadow would accept: {err:?}"
+                            )));
+                        }
+                        ExecutionContinuation::NextInteraction
                     }
-                    (true, true)
-                } else {
-                    return Err(err.clone());
-                }
-            } else {
-                (false, false) // success shadow normally, continue property
-            };
+                    _ => return Err(err.clone()),
+                };
+                stack.push(results);
+                return Ok(continuation);
+            }
+
+            if results.is_err() {
+                stack.push(results);
+                return Ok(ExecutionContinuation::NextInteraction);
+            }
 
             stack.push(results);
             // TODO: skip integrity check with mvcc
@@ -253,15 +256,6 @@ pub fn execute_interaction_turso(
                 limbo_integrity_check(conn)?;
             }
             env.update_conn_last_interaction(connection_index, Some(query));
-
-            if skip_shadow {
-                if skip_property {
-                    return Ok(ExecutionContinuation::NextInteractionOutsideThisProperty);
-                } else {
-                    // Skip shadow but continue to next interaction in this property
-                    return Ok(ExecutionContinuation::NextInteraction);
-                }
-            }
         }
         InteractionType::FsyncQuery(query) => {
             let conn = {
@@ -370,20 +364,39 @@ fn execute_interaction_rusqlite(
     match &interaction.interaction {
         InteractionType::Query(query) => {
             tracing::debug!("{}", interaction);
-            let results = execute_query_rusqlite(conn, query).map_err(|e| {
+            let raw_result = execute_query_rusqlite(conn, query);
+
+            let is_constraint_error = matches!(
+                &raw_result,
+                Err(rusqlite::Error::SqliteFailure(err, _))
+                    if err.code == rusqlite::ErrorCode::ConstraintViolation
+            );
+
+            let results = raw_result.map_err(|e| {
                 turso_core::LimboError::InternalError(format!("error executing query: {e}"))
             });
 
-            // Skip shadow on any failed query, if ignore_error is set, continue property
-            if let Err(err) = &results {
-                let err_clone = err.clone();
-                stack.push(results);
-                if interaction.ignore_error {
-                    // Skip shadow but continue property
-                    return Ok(ExecutionContinuation::NextInteraction);
+            if results.is_err() && !interaction.ignore_error {
+                let continuation = if is_constraint_error {
+                    let shadow_result = interaction
+                        .shadow(&mut env.get_conn_tables_mut(interaction.connection_index));
+                    if shadow_result.is_ok() {
+                        let err = results.unwrap_err();
+                        return Err(LimboError::InternalError(format!(
+                            "rusqlite rejected with constraint error but shadow would accept: {err:?}"
+                        )));
+                    }
+                    ExecutionContinuation::NextInteraction
                 } else {
-                    return Err(err_clone);
-                }
+                    return Err(results.unwrap_err());
+                };
+                stack.push(results);
+                return Ok(continuation);
+            }
+
+            if results.is_err() {
+                stack.push(results);
+                return Ok(ExecutionContinuation::NextInteraction);
             }
 
             tracing::debug!("{:?}", results);
