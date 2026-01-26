@@ -141,7 +141,9 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 20
-          registry-url: "https://registry.npmjs.org"
+
+      - name: Update npm
+        run: npm install -g npm@11
 
       - name: Download iOS artifacts
         uses: actions/download-artifact@v4
