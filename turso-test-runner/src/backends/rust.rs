@@ -58,6 +58,10 @@ impl SqlBackend for RustBackend {
         HashSet::from_iter([Capability::Trigger])
     }
 
+    fn supports_snapshots(&self) -> bool {
+        true
+    }
+
     async fn create_database(
         &self,
         config: &DatabaseConfig,

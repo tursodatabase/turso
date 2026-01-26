@@ -360,6 +360,8 @@ expect {
 
 Snapshot tests capture the `EXPLAIN QUERY PLAN` and `EXPLAIN` (bytecode) output of a SQL query. They are used to detect changes in query execution plans over time.
 
+> **Note:** Snapshot tests only run on the **Rust backend**. Other backends skip snapshot tests automatically.
+
 ### Basic Syntax
 
 ```
@@ -379,7 +381,7 @@ Snapshots support all the same decorators as tests:
 | `@setup <name>` | Apply a named setup before the snapshot (can be repeated) |
 | `@skip "reason"` | Skip this snapshot unconditionally |
 | `@skip-if <condition> "reason"` | Skip this snapshot conditionally |
-| `@backend <name>` | Only run this snapshot on the specified backend (`rust`, `cli`, `js`) |
+| `@backend <name>` | Only run this snapshot on the specified backend (snapshots only run on `rust`) |
 | `@requires <capability> "reason"` | Only run if the backend supports the capability |
 
 ### Snapshot File Location

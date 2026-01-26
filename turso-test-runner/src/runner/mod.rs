@@ -754,6 +754,12 @@ impl<B: SqlBackend + 'static> TestRunner<B> {
         test_file: &TestFile,
     ) -> FuturesUnordered<tokio::task::JoinHandle<TestResult>> {
         let futures = FuturesUnordered::new();
+
+        // Skip all snapshots if backend doesn't support them (e.g., sqlite3 CLI)
+        if !self.backend.supports_snapshots() {
+            return futures;
+        }
+
         let backend_type = self.backend.backend_type();
 
         let backend_capabilities = self.backend.capabilities();
