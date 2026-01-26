@@ -326,6 +326,26 @@ fn extract_refs_inner(expr: &ast::Expr, refs: &mut HashSet<String>) {
     }
 }
 
+/// Check if an expression contains the concat operator (||).
+///
+/// TODO: Remove this workaround once concat operator bug is fixed.
+/// https://github.com/tursodatabase/turso/issues/4860
+pub fn contains_concat_operator(expr: &ast::Expr) -> bool {
+    match expr {
+        Expr::Binary(lhs, op, rhs) => {
+            matches!(op, Operator::Concat)
+                || contains_concat_operator(lhs)
+                || contains_concat_operator(rhs)
+        }
+        Expr::Unary(_, inner) => contains_concat_operator(inner),
+        Expr::Parenthesized(exprs) => exprs.iter().any(|e| contains_concat_operator(e)),
+        Expr::Cast { expr, .. } => contains_concat_operator(expr),
+        Expr::IsNull(inner) | Expr::NotNull(inner) => contains_concat_operator(inner),
+        Expr::Collate(inner, _) => contains_concat_operator(inner),
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

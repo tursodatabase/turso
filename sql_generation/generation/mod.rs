@@ -4,6 +4,7 @@ use anarchist_readable_name_generator_lib::readable_name_custom;
 use rand::{distr::uniform::SampleUniform, Rng};
 
 pub mod expr;
+pub mod expr_utils;
 pub mod generated_expr;
 pub mod opts;
 pub mod predicate;
@@ -202,7 +203,7 @@ pub fn pick_unique<'a, T: PartialEq, R: Rng + ?Sized>(
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use crate::{
         generation::{GenerationContext, Opts},
         model::table::Table,
@@ -212,6 +213,17 @@ mod tests {
     pub struct TestContext {
         pub opts: Opts,
         pub tables: Vec<Table>,
+    }
+
+    impl TestContext {
+        /// Create a test context with generated columns disabled.
+        /// These tests create random values for all columns, which doesn't work correctly
+        /// with generated columns since their values should be computed from expressions.
+        pub fn no_gencol() -> Self {
+            let mut ctx = Self::default();
+            ctx.opts.table.generated_columns.enable = false;
+            ctx
+        }
     }
 
     impl GenerationContext for TestContext {
