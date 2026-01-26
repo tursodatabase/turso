@@ -130,6 +130,19 @@ pub struct SetupRef {
     pub span: Range<usize>,
 }
 
+/// Common modifiers shared by test and snapshot cases
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct CaseModifiers {
+    /// Setup references with their spans
+    pub setups: Vec<SetupRef>,
+    /// If set, skip this case (unconditionally or conditionally)
+    pub skip: Option<Skip>,
+    /// If set, only run this case on the specified backend
+    pub backend: Option<Backend>,
+    /// Required capabilities for this case
+    pub requires: Vec<Requirement>,
+}
+
 /// A snapshot test case (for EXPLAIN output)
 #[derive(Debug, Clone, PartialEq)]
 pub struct SnapshotCase {
@@ -139,10 +152,8 @@ pub struct SnapshotCase {
     pub name_span: Range<usize>,
     /// SQL to execute (EXPLAIN will be prepended)
     pub sql: String,
-    /// Setup references with their spans
-    pub setups: Vec<SetupRef>,
-    /// If set, skip this snapshot test (unconditionally or conditionally)
-    pub skip: Option<Skip>,
+    /// Common modifiers (setups, skip, backend, requires)
+    pub modifiers: CaseModifiers,
 }
 
 /// A single test case
@@ -156,14 +167,8 @@ pub struct TestCase {
     pub sql: String,
     /// Expected results (with optional backend-specific overrides)
     pub expectations: Expectations,
-    /// Setup references with their spans
-    pub setups: Vec<SetupRef>,
-    /// If set, skip this test (unconditionally or conditionally)
-    pub skip: Option<Skip>,
-    /// If set, only run this test on the specified backend
-    pub backend: Option<Backend>,
-    /// Required capabilities for this test
-    pub requires: Vec<Requirement>,
+    /// Common modifiers (setups, skip, backend, requires)
+    pub modifiers: CaseModifiers,
 }
 
 /// Skip configuration for a test

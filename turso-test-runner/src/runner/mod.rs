@@ -59,14 +59,7 @@ pub trait Runnable: Clone + Send + 'static {
     fn check_skip_conditions(&self, options: &RunOptions) -> Option<String>;
 
     /// Get all SQL queries to execute.
-    /// Default implementation returns a single query from `sql_to_execute()`.
-    fn queries_to_execute(&self) -> Vec<String> {
-        vec![self.sql_to_execute()]
-    }
-
-    /// Get the primary SQL to execute (for backward compatibility).
-    /// Override `queries_to_execute()` for multiple queries.
-    fn sql_to_execute(&self) -> String;
+    fn queries_to_execute(&self) -> Vec<String>;
 
     /// Evaluate the execution results and return the outcome.
     /// The results correspond to the queries returned by `queries_to_execute()`.
@@ -88,16 +81,20 @@ impl Runnable for TestCase {
     }
 
     fn skip(&self) -> Option<&Skip> {
-        self.skip.as_ref()
+        self.modifiers.skip.as_ref()
     }
 
     fn setups(&self) -> &[SetupRef] {
-        &self.setups
+        &self.modifiers.setups
     }
 
     fn check_skip_conditions(&self, options: &RunOptions) -> Option<String> {
         // Check required capabilities (global + per-test)
-        for req in options.global_requires.iter().chain(self.requires.iter()) {
+        for req in options
+            .global_requires
+            .iter()
+            .chain(self.modifiers.requires.iter())
+        {
             if !options.backend_capabilities.contains(&req.capability) {
                 return Some(format!("requires {}: {}", req.capability, req.reason));
             }
@@ -105,8 +102,8 @@ impl Runnable for TestCase {
         None
     }
 
-    fn sql_to_execute(&self) -> String {
-        self.sql.clone()
+    fn queries_to_execute(&self) -> Vec<String> {
+        vec![self.sql.clone()]
     }
 
     async fn evaluate_results(
@@ -133,15 +130,24 @@ impl Runnable for SnapshotCase {
     }
 
     fn skip(&self) -> Option<&Skip> {
-        self.skip.as_ref()
+        self.modifiers.skip.as_ref()
     }
 
     fn setups(&self) -> &[SetupRef] {
-        &self.setups
+        &self.modifiers.setups
     }
 
-    fn check_skip_conditions(&self, _options: &RunOptions) -> Option<String> {
-        // Snapshots have no additional skip conditions
+    fn check_skip_conditions(&self, options: &RunOptions) -> Option<String> {
+        // Check required capabilities (global + per-snapshot)
+        for req in options
+            .global_requires
+            .iter()
+            .chain(self.modifiers.requires.iter())
+        {
+            if !options.backend_capabilities.contains(&req.capability) {
+                return Some(format!("requires {}: {}", req.capability, req.reason));
+            }
+        }
         None
     }
 
@@ -151,11 +157,6 @@ impl Runnable for SnapshotCase {
             format!("EXPLAIN QUERY PLAN {}", self.sql),
             format!("EXPLAIN {}", self.sql),
         ]
-    }
-
-    fn sql_to_execute(&self) -> String {
-        // Primary query (for backward compatibility)
-        format!("EXPLAIN {}", self.sql)
     }
 
     async fn evaluate_results(
@@ -174,7 +175,13 @@ impl Runnable for SnapshotCase {
         // Build snapshot info with metadata
         let db_location_str = options.db_config.location.to_string();
         let snapshot_info = SnapshotInfo::new()
-            .with_setups(self.setups.iter().map(|s| s.name.clone()).collect())
+            .with_setups(
+                self.modifiers
+                    .setups
+                    .iter()
+                    .map(|s| s.name.clone())
+                    .collect(),
+            )
             .with_database(db_location_str);
 
         // Compare with snapshot
@@ -707,7 +714,7 @@ impl<B: SqlBackend + 'static> TestRunner<B> {
                 }
 
                 // Skip tests that don't match the current backend
-                if let Some(required_backend) = test.backend {
+                if let Some(required_backend) = test.modifiers.backend {
                     if required_backend != backend_type {
                         continue;
                     }
@@ -749,6 +756,8 @@ impl<B: SqlBackend + 'static> TestRunner<B> {
         let futures = FuturesUnordered::new();
         let backend_type = self.backend.backend_type();
 
+        let backend_capabilities = self.backend.capabilities();
+
         // For each database configuration (snapshots use the first one)
         if let Some(db_config) = test_file.databases.first() {
             // For each snapshot
@@ -767,6 +776,13 @@ impl<B: SqlBackend + 'static> TestRunner<B> {
                     }
                 }
 
+                // Skip snapshots that don't match the current backend
+                if let Some(required_backend) = snapshot.modifiers.backend {
+                    if required_backend != backend_type {
+                        continue;
+                    }
+                }
+
                 let backend = Arc::clone(&self.backend);
                 let semaphore = Arc::clone(&self.semaphore);
                 let snapshot = snapshot.clone();
@@ -777,8 +793,8 @@ impl<B: SqlBackend + 'static> TestRunner<B> {
                     setups: test_file.setups.clone(),
                     mvcc: self.config.mvcc,
                     global_skip: test_file.global_skip.clone(),
-                    global_requires: Vec::new(),
-                    backend_capabilities: HashSet::new(),
+                    global_requires: test_file.global_requires.clone(),
+                    backend_capabilities: backend_capabilities.clone(),
                     backend_type,
                     snapshot_update_mode: self.config.snapshot_update_mode,
                 };
