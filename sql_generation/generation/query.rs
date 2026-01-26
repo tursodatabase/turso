@@ -473,7 +473,10 @@ impl Arbitrary for Update {
             let marker_value = match update_opts.padding_size {
                 Some(size) => {
                     let p = "X".repeat(size);
-                    if matches!(marker_col.column_type, crate::model::table::ColumnType::Blob) {
+                    if matches!(
+                        marker_col.column_type,
+                        crate::model::table::ColumnType::Blob
+                    ) {
                         SimValue(turso_core::Value::Blob(p.into_bytes()))
                     } else {
                         SimValue(turso_core::Value::Text(p.into()))

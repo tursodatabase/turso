@@ -1133,7 +1133,11 @@ impl Property {
                     {
                         let table = table.clone();
                         move |_: &Vec<ResultSet>, env: &mut SimulatorEnv| {
-                            if env.get_conn_tables(connection_index).iter().any(|t| t.name == table) {
+                            if env
+                                .get_conn_tables(connection_index)
+                                .iter()
+                                .any(|t| t.name == table)
+                            {
                                 Ok(Ok(()))
                             } else {
                                 Ok(Err(format!("table '{table}' not found")))
@@ -1149,8 +1153,8 @@ impl Property {
                 let begin_tx = InteractionBuilder::with_interaction(InteractionType::Query(
                     Query::Begin(Begin::Immediate),
                 ));
-                let mut dml_interaction = InteractionBuilder::with_interaction(
-                    InteractionType::Query(statement.clone()));
+                let mut dml_interaction =
+                    InteractionBuilder::with_interaction(InteractionType::Query(statement.clone()));
                 dml_interaction.ignore_error(true);
                 let commit_tx = InteractionBuilder::with_interaction(InteractionType::Query(
                     Query::Commit(Commit),
@@ -1167,10 +1171,18 @@ impl Property {
                         if dml_result.is_ok() {
                             return Ok(Ok(()));
                         }
-                        let before = before.as_ref().map_err(|e| LimboError::InternalError(e.to_string()))?;
-                        let final_ = final_.as_ref().map_err(|e| LimboError::InternalError(e.to_string()))?;
+                        let before = before
+                            .as_ref()
+                            .map_err(|e| LimboError::InternalError(e.to_string()))?;
+                        let final_ = final_
+                            .as_ref()
+                            .map_err(|e| LimboError::InternalError(e.to_string()))?;
                         if before != final_ {
-                            return Ok(Err(format!("rows changed: {} to {}", before.len(), final_.len())));
+                            return Ok(Err(format!(
+                                "rows changed: {} to {}",
+                                before.len(),
+                                final_.len()
+                            )));
                         }
                         Ok(Ok(()))
                     },
@@ -1358,7 +1370,10 @@ fn property_read_your_updates_back<R: rand::Rng + ?Sized>(
         let col = pick(&table.columns, rng);
         Update {
             table: table.name.clone(),
-            set_values: vec![(col.name.clone(), SetValue::Simple(SimValue::arbitrary_from(rng, ctx, &col.column_type)))],
+            set_values: vec![(
+                col.name.clone(),
+                SetValue::Simple(SimValue::arbitrary_from(rng, ctx, &col.column_type)),
+            )],
             predicate: Predicate::arbitrary_from(rng, ctx, table),
         }
     } else {
@@ -1594,7 +1609,11 @@ fn generate_failing_insert<R: rand::Rng + ?Sized>(
     rng: &mut R,
     ctx: &impl GenerationContext,
 ) -> Option<(String, Insert)> {
-    let tables: Vec<_> = ctx.tables().iter().filter(|t| t.has_any_unique_column()).collect();
+    let tables: Vec<_> = ctx
+        .tables()
+        .iter()
+        .filter(|t| t.has_any_unique_column())
+        .collect();
     let table = *pick(&tables, rng);
 
     let unique_col = table.columns.iter().find(|c| c.has_unique_constraint())?;
@@ -1602,17 +1621,27 @@ fn generate_failing_insert<R: rand::Rng + ?Sized>(
 
     let values: Vec<Vec<SimValue>> = (0..rng.random_range(2..=5))
         .map(|_| {
-            table.columns.iter().map(|col| {
-                if col.has_unique_constraint() {
-                    dup_val.clone()
-                } else {
-                    SimValue::arbitrary_from(rng, ctx, &col.column_type)
-                }
-            }).collect()
+            table
+                .columns
+                .iter()
+                .map(|col| {
+                    if col.has_unique_constraint() {
+                        dup_val.clone()
+                    } else {
+                        SimValue::arbitrary_from(rng, ctx, &col.column_type)
+                    }
+                })
+                .collect()
         })
         .collect();
 
-    Some((table.name.clone(), Insert::Values { table: table.name.clone(), values }))
+    Some((
+        table.name.clone(),
+        Insert::Values {
+            table: table.name.clone(),
+            values,
+        },
+    ))
 }
 
 fn property_statement_atomicity<R: rand::Rng + ?Sized>(

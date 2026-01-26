@@ -689,19 +689,23 @@ impl Shadow for Update {
                     if new_values[..i].contains(v) {
                         return Err(anyhow::anyhow!(
                             "UNIQUE constraint: duplicate '{}' in table '{}'",
-                            col.name, self.table
+                            col.name,
+                            self.table
                         ));
                     }
                 }
                 // check against existing rows not being updated
                 for v in &new_values {
-                    let conflicts = table.rows.iter()
+                    let conflicts = table
+                        .rows
+                        .iter()
                         .filter(|r| !old_rows.contains(r))
                         .any(|r| &r[idx] == *v);
                     if conflicts {
                         return Err(anyhow::anyhow!(
                             "UNIQUE constraint: '{}' already exists in '{}'",
-                            col.name, self.table
+                            col.name,
+                            self.table
                         ));
                     }
                 }
