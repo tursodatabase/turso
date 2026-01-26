@@ -1,0 +1,30 @@
+---
+source: analyze.sqltest
+expression: SELECT MIN(price) FROM products;
+info:
+  statement_type: SELECT
+  tables:
+  - products
+  setup_blocks:
+  - populated_products
+  database: ':memory:'
+---
+QUERY PLAN
+`--SCAN products
+
+BYTECODE
+addr  opcode          p1  p2  p3  p4                p5  comment
+   0  Init             0  12   0                     0  Start at 12
+   1  Null             0   2   0                     0  r[2]=NULL
+   2  OpenRead         0   2   0  k(6,B,B,B,B,B,B)   0  table=products, root=2, iDb=0
+   3  Rewind           0   8   0                     0  Rewind table products
+   4    Column         0   4   3                     0  r[3]=products.price
+   5    RealAffinity   3   0   0                     0
+   6    AggStep        0   3   2  min                0  accum=r[2] step(r[3])
+   7  Next             0   4   0                     0
+   8  AggFinal         0   2   0  min                0  accum=r[2]
+   9  Copy             2   1   0                     0  r[1]=r[2]
+  10  ResultRow        1   1   0                     0  output=r[1]
+  11  Halt             0   0   0                     0
+  12  Transaction      0   1   5                     0  iDb=0 tx_mode=Read
+  13  Goto             0   1   0                     0
