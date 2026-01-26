@@ -828,7 +828,7 @@ impl Value {
         // If any of the casts failed, panic as text casting is not expected to fail.
         match (&source, &pattern, &replacement) {
             (Value::Text(source), Value::Text(pattern), Value::Text(replacement)) => {
-                if pattern.as_str().is_empty() {
+                if pattern.as_str().is_empty() || pattern.as_str().starts_with('\0') {
                     return Value::Text(source.clone());
                 }
 
