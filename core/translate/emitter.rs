@@ -2357,6 +2357,7 @@ fn emit_update_column_values<'a>(
     t_ctx: &mut TranslateCtx<'a>,
     skip_set_clauses: bool,
     skip_row_label: BranchOffset,
+    rowid_reg: Option<usize>,
 ) -> crate::Result<()> {
     let or_conflict = program.resolve_type;
     if has_direct_rowid_update {
@@ -2681,6 +2682,7 @@ fn emit_update_column_values<'a>(
                     &column_lookup,
                     columns,
                     &t_ctx.resolver,
+                    rowid_reg,
                 )?;
                 // Apply column affinity immediately after evaluating the generated expression.
                 // This is critical for chained STORED generated columns: when column B references
@@ -2701,7 +2703,7 @@ fn emit_update_column_values<'a>(
 
 /// Topologically sort STORED generated columns based on their dependencies.
 /// Returns indices in the order they should be evaluated.
-fn topological_sort_stored_generated_columns(
+pub(super) fn topological_sort_stored_generated_columns(
     columns: &[crate::schema::Column],
     column_lookup: &std::collections::HashMap<String, usize>,
 ) -> crate::Result<Vec<usize>> {
@@ -2804,7 +2806,8 @@ fn topological_sort_stored_generated_columns(
 /// Emit bytecode to evaluate a generated expression using register values.
 /// This is used for STORED generated columns in UPDATE, where the expression
 /// should use the NEW values of columns (from registers) rather than old values (from cursor).
-fn emit_generated_expr_from_registers(
+#[allow(clippy::too_many_arguments)]
+pub(super) fn emit_generated_expr_from_registers(
     program: &mut ProgramBuilder,
     expr: &turso_parser::ast::Expr,
     target_reg: usize,
@@ -2812,6 +2815,7 @@ fn emit_generated_expr_from_registers(
     column_lookup: &std::collections::HashMap<String, usize>,
     columns: &[crate::schema::Column],
     resolver: &Resolver,
+    rowid_reg: Option<usize>,
 ) -> crate::Result<()> {
     use super::expr::{translate_expr_with_context, ExprContext};
 
@@ -2820,7 +2824,7 @@ fn emit_generated_expr_from_registers(
         registers_start,
         column_lookup,
         columns,
-        rowid_reg: None,
+        rowid_reg,
     };
     translate_expr_with_context(program, &context, expr, target_reg, resolver)?;
     Ok(())
@@ -3009,6 +3013,7 @@ fn emit_update_insns<'a>(
         t_ctx,
         skip_set_clauses,
         skip_row_label,
+        Some(rowid_set_clause_reg.unwrap_or(beg)),
     )?;
 
     // For non-STRICT tables, apply column affinity to the NEW values early.
@@ -3167,6 +3172,7 @@ fn emit_update_insns<'a>(
                 t_ctx,
                 skip_set_clauses,
                 skip_row_label,
+                Some(rowid_set_clause_reg.unwrap_or(beg)),
             )?;
         }
     }
