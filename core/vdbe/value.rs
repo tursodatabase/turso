@@ -1051,7 +1051,7 @@ impl Value {
             ));
         }
 
-        let has_escape = escape.map_or(false, |e| pattern.contains(e));
+        let has_escape = escape.is_some_and(|e| pattern.contains(e));
 
         // 1. Exact match (no wildcards)
         if !has_escape && !pattern.contains(['%', '_']) {
