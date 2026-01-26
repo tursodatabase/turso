@@ -3215,3 +3215,492 @@ test virtual-column-three-deep-update {
 expect {
     2.0|12.0|112.0|1112.0
 }
+
+# -----------------------------------------------------------------------------
+# Expression Indexes on Generated Columns
+# -----------------------------------------------------------------------------
+
+# Expression index on STORED generated column - basic
+test gencol_expr_index_stored_basic {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2) STORED);
+    CREATE INDEX idx1 ON t1(b + 10);
+    INSERT INTO t1(a) VALUES(5), (10), (15);
+    SELECT * FROM t1 WHERE b + 10 = 30 ORDER BY a;
+}
+expect {
+    10|20
+}
+
+# Expression index on VIRTUAL generated column - basic
+test gencol_expr_index_virtual_basic {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2));
+    CREATE INDEX idx1 ON t1(b + 10);
+    INSERT INTO t1(a) VALUES(5), (10), (15);
+    SELECT * FROM t1 WHERE b + 10 = 30 ORDER BY a;
+}
+expect {
+    10|20
+}
+
+# Expression index mixing regular and generated columns
+test gencol_expr_index_mixed_cols {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2) STORED);
+    CREATE INDEX idx1 ON t1(a + b);
+    INSERT INTO t1(a) VALUES(5), (10);
+    SELECT * FROM t1 WHERE a + b = 15;
+}
+expect {
+    5|10
+}
+
+# Expression index on STORED - UPDATE base column (THE BUG TEST)
+test gencol_expr_index_stored_update {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2) STORED);
+    CREATE INDEX idx1 ON t1(b + 10);
+    INSERT INTO t1(a) VALUES(5);
+    UPDATE t1 SET a = 10;
+    SELECT * FROM t1 WHERE b + 10 = 30;
+}
+expect {
+    10|20
+}
+
+# Expression index on STORED - old value should not match after UPDATE (THE BUG TEST)
+test gencol_expr_index_stored_update_no_stale {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2) STORED);
+    CREATE INDEX idx1 ON t1(b + 10);
+    INSERT INTO t1(a) VALUES(5);
+    UPDATE t1 SET a = 10;
+    SELECT * FROM t1 WHERE b + 10 = 20;
+}
+expect {
+}
+
+# Expression index on VIRTUAL - UPDATE base column (THE BUG TEST)
+test gencol_expr_index_virtual_update {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2));
+    CREATE INDEX idx1 ON t1(b + 10);
+    INSERT INTO t1(a) VALUES(5);
+    UPDATE t1 SET a = 10;
+    SELECT * FROM t1 WHERE b + 10 = 30;
+}
+expect {
+    10|20
+}
+
+# Expression index on VIRTUAL - old value should not match after UPDATE (THE BUG TEST)
+test gencol_expr_index_virtual_update_no_stale {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2));
+    CREATE INDEX idx1 ON t1(b + 10);
+    INSERT INTO t1(a) VALUES(5);
+    UPDATE t1 SET a = 10;
+    SELECT * FROM t1 WHERE b + 10 = 20;
+}
+expect {
+}
+
+# Nested generated columns with expression index
+test gencol_expr_index_nested {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2), c AS (b + 100) STORED);
+    CREATE INDEX idx1 ON t1(c + 1000);
+    INSERT INTO t1(a) VALUES(1);
+    SELECT * FROM t1 WHERE c + 1000 = 1102;
+}
+expect {
+    1|2|102
+}
+
+# Nested generated columns with expression index - UPDATE (THE BUG TEST)
+test gencol_expr_index_nested_update {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2), c AS (b + 100) STORED);
+    CREATE INDEX idx1 ON t1(c + 1000);
+    INSERT INTO t1(a) VALUES(1);
+    UPDATE t1 SET a = 5;
+    SELECT * FROM t1 WHERE c + 1000 = 1110;
+}
+expect {
+    5|10|110
+}
+
+# Nested - old value should not match (THE BUG TEST)
+test gencol_expr_index_nested_update_no_stale {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2), c AS (b + 100) STORED);
+    CREATE INDEX idx1 ON t1(c + 1000);
+    INSERT INTO t1(a) VALUES(1);
+    UPDATE t1 SET a = 5;
+    SELECT * FROM t1 WHERE c + 1000 = 1102;
+}
+expect {
+}
+
+# UNIQUE expression index on generated column
+test gencol_expr_index_unique {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2) STORED);
+    CREATE UNIQUE INDEX idx1 ON t1(b + 10);
+    INSERT INTO t1(a) VALUES(5), (10);
+    SELECT * FROM t1 ORDER BY a;
+}
+expect {
+    5|10
+    10|20
+}
+
+# UNIQUE expression index violation
+test gencol_expr_index_unique_violation {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2) STORED);
+    CREATE UNIQUE INDEX idx1 ON t1(b + 10);
+    INSERT INTO t1(a) VALUES(5), (5);
+}
+expect error {
+    UNIQUE constraint failed
+}
+
+# Expression index with function on generated column
+test gencol_expr_index_func {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2) STORED);
+    CREATE INDEX idx1 ON t1(abs(b - 50));
+    INSERT INTO t1(a) VALUES(20), (30);
+    SELECT * FROM t1 WHERE abs(b - 50) = 10 ORDER BY a;
+}
+expect {
+    20|40
+    30|60
+}
+
+# Mixed expression with UPDATE (THE BUG TEST)
+test gencol_expr_index_mixed_update {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2) STORED);
+    CREATE INDEX idx1 ON t1(a + b);
+    INSERT INTO t1(a) VALUES(5);
+    UPDATE t1 SET a = 10;
+    SELECT * FROM t1 WHERE a + b = 30;
+}
+expect {
+    10|20
+}
+
+# Mixed expression - old value should not match (THE BUG TEST)
+test gencol_expr_index_mixed_update_no_stale {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2) STORED);
+    CREATE INDEX idx1 ON t1(a + b);
+    INSERT INTO t1(a) VALUES(5);
+    UPDATE t1 SET a = 10;
+    SELECT * FROM t1 WHERE a + b = 15;
+}
+expect {
+}
+
+# -----------------------------------------------------------------------------
+# Expression Indexes on Generated Columns - Extended Tests
+# -----------------------------------------------------------------------------
+
+# DELETE should properly remove from expression index
+test gencol_expr_index_delete {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2) STORED);
+    CREATE INDEX idx1 ON t1(b + 10);
+    INSERT INTO t1(a) VALUES(5), (10);
+    DELETE FROM t1 WHERE a = 5;
+    SELECT * FROM t1 WHERE b + 10 = 20;
+}
+expect {
+}
+
+# Verify remaining row is still indexed correctly after DELETE
+test gencol_expr_index_delete_remaining {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2) STORED);
+    CREATE INDEX idx1 ON t1(b + 10);
+    INSERT INTO t1(a) VALUES(5), (10);
+    DELETE FROM t1 WHERE a = 5;
+    SELECT * FROM t1 WHERE b + 10 = 30;
+}
+expect {
+    10|20
+}
+
+# REPLACE should update expression index
+test gencol_expr_index_replace {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b AS (a * 2) STORED);
+    CREATE INDEX idx1 ON t1(b + 10);
+    INSERT INTO t1(a) VALUES(5);
+    INSERT OR REPLACE INTO t1(a) VALUES(5);
+    SELECT * FROM t1 WHERE b + 10 = 20;
+}
+expect {
+    5|10
+}
+
+# REPLACE with different value
+test gencol_expr_index_replace_different {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b AS (a * 2) STORED);
+    CREATE INDEX idx1 ON t1(b + 10);
+    INSERT INTO t1(a) VALUES(5);
+    REPLACE INTO t1(a) VALUES(10);
+    SELECT * FROM t1 WHERE b + 10 = 30;
+}
+expect {
+    10|20
+}
+
+# UPDATE that doesn't change value should keep index intact
+test gencol_expr_index_update_same_value {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2) STORED);
+    CREATE INDEX idx1 ON t1(b + 10);
+    INSERT INTO t1(a) VALUES(5);
+    UPDATE t1 SET a = 5;
+    SELECT * FROM t1 WHERE b + 10 = 20;
+}
+expect {
+    5|10
+}
+
+# Multi-row UPDATE
+test gencol_expr_index_multirow_update {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2) STORED);
+    CREATE INDEX idx1 ON t1(b + 10);
+    INSERT INTO t1(a) VALUES(1), (2), (3);
+    UPDATE t1 SET a = a * 10;
+    SELECT * FROM t1 WHERE b + 10 >= 20 ORDER BY a;
+}
+expect {
+    10|20
+    20|40
+    30|60
+}
+
+# Multi-row UPDATE - verify old values not found
+test gencol_expr_index_multirow_update_no_stale {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2) STORED);
+    CREATE INDEX idx1 ON t1(b + 10);
+    INSERT INTO t1(a) VALUES(1), (2), (3);
+    UPDATE t1 SET a = a * 10;
+    SELECT * FROM t1 WHERE b + 10 = 12;
+}
+expect {
+}
+
+# Partial UPDATE - only some rows modified
+test gencol_expr_index_partial_update {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2) STORED);
+    CREATE INDEX idx1 ON t1(b + 10);
+    INSERT INTO t1(a) VALUES(5), (10), (15);
+    UPDATE t1 SET a = a + 100 WHERE a < 12;
+    SELECT * FROM t1 WHERE b + 10 = 220 ORDER BY a;
+}
+expect {
+    105|210
+}
+
+# Partial UPDATE - unmodified row should still be findable
+test gencol_expr_index_partial_update_unmodified {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2) STORED);
+    CREATE INDEX idx1 ON t1(b + 10);
+    INSERT INTO t1(a) VALUES(5), (10), (15);
+    UPDATE t1 SET a = a + 100 WHERE a < 12;
+    SELECT * FROM t1 WHERE b + 10 = 40;
+}
+expect {
+    15|30
+}
+
+# NULL in generated column with expression index
+test gencol_expr_index_null {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2) STORED);
+    CREATE INDEX idx1 ON t1(b + 10);
+    INSERT INTO t1(a) VALUES(NULL);
+    SELECT * FROM t1 WHERE b + 10 IS NULL;
+}
+expect {
+    |
+}
+
+# UPDATE from NULL to non-NULL
+test gencol_expr_index_null_to_value {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2) STORED);
+    CREATE INDEX idx1 ON t1(b + 10);
+    INSERT INTO t1(a) VALUES(NULL);
+    UPDATE t1 SET a = 5;
+    SELECT * FROM t1 WHERE b + 10 = 20;
+}
+expect {
+    5|10
+}
+
+# UPDATE from non-NULL to NULL
+test gencol_expr_index_value_to_null {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2) STORED);
+    CREATE INDEX idx1 ON t1(b + 10);
+    INSERT INTO t1(a) VALUES(5);
+    UPDATE t1 SET a = NULL;
+    SELECT * FROM t1 WHERE b + 10 IS NULL;
+}
+expect {
+    |
+}
+
+# Gencol depends on two columns, update first
+test gencol_expr_index_multi_dep_update_first {
+    CREATE TABLE t1(a INTEGER, b INTEGER, c AS (a + b) STORED);
+    CREATE INDEX idx1 ON t1(c * 2);
+    INSERT INTO t1(a, b) VALUES(3, 7);
+    UPDATE t1 SET a = 5;
+    SELECT * FROM t1 WHERE c * 2 = 24;
+}
+expect {
+    5|7|12
+}
+
+# Gencol depends on two columns, update second
+test gencol_expr_index_multi_dep_update_second {
+    CREATE TABLE t1(a INTEGER, b INTEGER, c AS (a + b) STORED);
+    CREATE INDEX idx1 ON t1(c * 2);
+    INSERT INTO t1(a, b) VALUES(3, 7);
+    UPDATE t1 SET b = 17;
+    SELECT * FROM t1 WHERE c * 2 = 40;
+}
+expect {
+    3|17|20
+}
+
+# Gencol depends on two columns, update both
+test gencol_expr_index_multi_dep_update_both {
+    CREATE TABLE t1(a INTEGER, b INTEGER, c AS (a + b) STORED);
+    CREATE INDEX idx1 ON t1(c * 2);
+    INSERT INTO t1(a, b) VALUES(3, 7);
+    UPDATE t1 SET a = 10, b = 20;
+    SELECT * FROM t1 WHERE c * 2 = 60;
+}
+expect {
+    10|20|30
+}
+
+# Partial index on expression with generated column
+test gencol_expr_partial_index_update {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2) STORED);
+    CREATE INDEX idx1 ON t1(b + 10) WHERE b > 10;
+    INSERT INTO t1(a) VALUES(3), (10);
+    UPDATE t1 SET a = 15 WHERE a = 10;
+    SELECT * FROM t1 WHERE b + 10 = 40 AND b > 10;
+}
+expect {
+    15|30
+}
+
+# Row moves into partial index range
+test gencol_expr_partial_index_into_range {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2) STORED);
+    CREATE INDEX idx1 ON t1(b + 10) WHERE b > 10;
+    INSERT INTO t1(a) VALUES(3);
+    UPDATE t1 SET a = 10;
+    SELECT * FROM t1 WHERE b + 10 = 30 AND b > 10;
+}
+expect {
+    10|20
+}
+
+# Row moves out of partial index range
+test gencol_expr_partial_index_out_of_range {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2) STORED);
+    CREATE INDEX idx1 ON t1(b + 10) WHERE b > 10;
+    INSERT INTO t1(a) VALUES(10);
+    UPDATE t1 SET a = 3;
+    SELECT * FROM t1 WHERE b + 10 = 30 AND b > 10;
+}
+expect {
+}
+
+# Multiple expression indexes, update affects both - check first
+test gencol_expr_index_multiple_first {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2) STORED);
+    CREATE INDEX idx1 ON t1(b + 10);
+    CREATE INDEX idx2 ON t1(b * 3);
+    INSERT INTO t1(a) VALUES(5);
+    UPDATE t1 SET a = 10;
+    SELECT * FROM t1 WHERE b + 10 = 30;
+}
+expect {
+    10|20
+}
+
+# Multiple expression indexes, update affects both - check second
+test gencol_expr_index_multiple_second {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2) STORED);
+    CREATE INDEX idx1 ON t1(b + 10);
+    CREATE INDEX idx2 ON t1(b * 3);
+    INSERT INTO t1(a) VALUES(5);
+    UPDATE t1 SET a = 10;
+    SELECT * FROM t1 WHERE b * 3 = 60;
+}
+expect {
+    10|20
+}
+
+# Expression index uses both gencol and its base column
+test gencol_expr_index_gencol_and_base {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2) STORED);
+    CREATE INDEX idx1 ON t1(a + b);
+    INSERT INTO t1(a) VALUES(5);
+    UPDATE t1 SET a = 10;
+    SELECT * FROM t1 WHERE a + b = 30;
+}
+expect {
+    10|20
+}
+
+# Expression index uses both gencol and base - old value not found
+test gencol_expr_index_gencol_and_base_no_stale {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2) STORED);
+    CREATE INDEX idx1 ON t1(a + b);
+    INSERT INTO t1(a) VALUES(5);
+    UPDATE t1 SET a = 10;
+    SELECT * FROM t1 WHERE a + b = 15;
+}
+expect {
+}
+
+# VIRTUAL generated column with DELETE
+test gencol_expr_index_virtual_delete {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2));
+    CREATE INDEX idx1 ON t1(b + 10);
+    INSERT INTO t1(a) VALUES(5), (10);
+    DELETE FROM t1 WHERE a = 5;
+    SELECT * FROM t1 WHERE b + 10 = 20;
+}
+expect {
+}
+
+# VIRTUAL generated column with multi-row UPDATE
+test gencol_expr_index_virtual_multirow_update {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2));
+    CREATE INDEX idx1 ON t1(b + 10);
+    INSERT INTO t1(a) VALUES(1), (2), (3);
+    UPDATE t1 SET a = a * 10;
+    SELECT * FROM t1 WHERE b + 10 >= 20 ORDER BY a;
+}
+expect {
+    10|20
+    20|40
+    30|60
+}
+
+# Deep nesting with DELETE
+test gencol_expr_index_nested_delete {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2), c AS (b + 100) STORED);
+    CREATE INDEX idx1 ON t1(c + 1000);
+    INSERT INTO t1(a) VALUES(1), (5);
+    DELETE FROM t1 WHERE a = 1;
+    SELECT * FROM t1 WHERE c + 1000 = 1110;
+}
+expect {
+    5|10|110
+}
+
+# Deep nesting - old value not found after DELETE
+test gencol_expr_index_nested_delete_no_stale {
+    CREATE TABLE t1(a INTEGER, b AS (a * 2), c AS (b + 100) STORED);
+    CREATE INDEX idx1 ON t1(c + 1000);
+    INSERT INTO t1(a) VALUES(1), (5);
+    DELETE FROM t1 WHERE a = 1;
+    SELECT * FROM t1 WHERE c + 1000 = 1102;
+}
+expect {
+}

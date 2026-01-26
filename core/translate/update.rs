@@ -427,7 +427,24 @@ pub fn prepare_update_plan(
                         |expr| {
                             columns_used_by_index_expr(expr, &table_references, connection)
                                 .iter()
-                                .any(|cidx| updated_cols.contains(cidx))
+                                .any(|cidx| {
+                                    // Check direct update
+                                    if updated_cols.contains(cidx) {
+                                        return true;
+                                    }
+                                    // If column in expression is a generated column, check transitive deps
+                                    if columns[*cidx].generated.is_some() {
+                                        let mut visited = HashSet::new();
+                                        return column_depends_on_updated(
+                                            *cidx,
+                                            columns,
+                                            &column_lookup,
+                                            &updated_cols,
+                                            &mut visited,
+                                        );
+                                    }
+                                    false
+                                })
                         },
                     )
                 });
