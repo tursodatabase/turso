@@ -28,6 +28,28 @@ use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use tokio::fs;
 
+const CI_ENV_NAMES: [&str; 9] = [
+    "CI",
+    "GITHUB_ACTIONS",
+    "TRAVIS",
+    "CIRCLECI",
+    "GITLAB_CI",
+    "JENKINS_URL",
+    "BUILDKITE",
+    "TF_BUILD",           // Azure Pipelines
+    "CODEBUILD_BUILD_ID", // AWS CodeBuild
+];
+
+static IS_CI: LazyLock<bool> = LazyLock::new(|| {
+    // Check common CI environment variables
+    CI_ENV_NAMES.iter().any(|env| {
+        std::env::var(env).is_ok_and(|val| {
+            let val = val.to_lowercase();
+            val.parse::<bool>().ok().unwrap_or_else(|| val == "1")
+        })
+    })
+});
+
 /// Snapshot update mode, similar to cargo-insta's INSTA_UPDATE values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
 pub enum SnapshotUpdateMode {
@@ -88,16 +110,7 @@ impl std::str::FromStr for SnapshotUpdateMode {
 
 /// Check if we're running in a CI environment.
 pub fn is_ci() -> bool {
-    // Check common CI environment variables
-    std::env::var("CI").is_ok()
-        || std::env::var("GITHUB_ACTIONS").is_ok()
-        || std::env::var("TRAVIS").is_ok()
-        || std::env::var("CIRCLECI").is_ok()
-        || std::env::var("GITLAB_CI").is_ok()
-        || std::env::var("JENKINS_URL").is_ok()
-        || std::env::var("BUILDKITE").is_ok()
-        || std::env::var("TF_BUILD").is_ok() // Azure Pipelines
-        || std::env::var("CODEBUILD_BUILD_ID").is_ok() // AWS CodeBuild
+    *IS_CI
 }
 
 /// Snapshot file metadata (YAML frontmatter)
