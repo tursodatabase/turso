@@ -555,6 +555,17 @@ pub fn translate_insert(
         &mut preflight_ctx,
     )?;
 
+    // Compute VIRTUAL column values before NOT NULL constraint checking.
+    // VIRTUAL columns normally store NULL (computed on read), but NOT NULL checks
+    // need the actual computed values to correctly validate constraints like:
+    //   b AS (COALESCE(a, 0)) NOT NULL  -- should pass even when a is NULL
+    compute_virtual_columns_for_triggers(
+        &mut program,
+        &insertion.col_mappings,
+        insertion.rowid_alias_mapping(),
+        resolver,
+    )?;
+
     let notnull_resume_label = emit_notnulls(&mut program, &ctx, &insertion, resolver)?;
 
     // Create and insert the record

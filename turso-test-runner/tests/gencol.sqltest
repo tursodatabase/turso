@@ -1665,8 +1665,6 @@ expect error {
 }
 
 # NOT NULL on VIRTUAL column - success
-# Note: NOT NULL on VIRTUAL columns is currently checked before value computation
-# TODO: Fix this behavior to match SQLite
 test gencol_constraint_notnull_virtual_success {
     CREATE TABLE t1(a INTEGER NOT NULL, b AS (a * 2));
     INSERT INTO t1(a) VALUES (5);
@@ -1683,6 +1681,46 @@ test gencol_constraint_notnull_virtual_violation {
 }
 expect error {
     NOT NULL constraint failed
+}
+
+# NOT NULL on VIRTUAL column - COALESCE returns non-null for null input
+test gencol_constraint_notnull_virtual_coalesce_success {
+    CREATE TABLE t1(a INTEGER, b AS (COALESCE(a, 0)) NOT NULL);
+    INSERT INTO t1(a) VALUES (NULL);
+    SELECT a, b FROM t1;
+}
+expect {
+    |0
+}
+
+# NOT NULL on VIRTUAL column - IFNULL returns non-null for null input
+test gencol_constraint_notnull_virtual_ifnull_success {
+    CREATE TABLE t1(a INTEGER, b AS (IFNULL(a, 99)) NOT NULL);
+    INSERT INTO t1(a) VALUES (NULL);
+    SELECT a, b FROM t1;
+}
+expect {
+    |99
+}
+
+# NOT NULL on VIRTUAL column - CASE expression returns non-null
+test gencol_constraint_notnull_virtual_case_success {
+    CREATE TABLE t1(a INTEGER, b AS (CASE WHEN a IS NULL THEN -1 ELSE a END) NOT NULL);
+    INSERT INTO t1(a) VALUES (NULL);
+    SELECT a, b FROM t1;
+}
+expect {
+    |-1
+}
+
+# Multiple VIRTUAL columns with NOT NULL
+test gencol_constraint_notnull_virtual_multiple {
+    CREATE TABLE t1(a INTEGER, b AS (COALESCE(a, 10)) NOT NULL, c AS (COALESCE(a, 20)) NOT NULL);
+    INSERT INTO t1(a) VALUES (NULL);
+    SELECT a, b, c FROM t1;
+}
+expect {
+    |10|20
 }
 
 # UNIQUE constraint inline on STORED column - success
