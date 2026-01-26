@@ -1,5 +1,4 @@
 use divan::{black_box, Bencher};
-use std::collections::HashMap;
 use turso_core::types::Value;
 use turso_core::vdbe::value::construct_like_regex;
 
@@ -929,78 +928,48 @@ fn construct_like_regex_complex(bencher: Bencher) {
 }
 
 // =============================================================================
-// exec_like with caching
+// exec_like
 // =============================================================================
 
 #[divan::bench]
 fn exec_like_no_cache(bencher: Bencher) {
     bencher.bench_local(|| {
-        Value::exec_like(None, black_box("hello%"), black_box("hello world")).unwrap()
+        Value::exec_like(black_box("hello%"), black_box("hello world"), None).unwrap()
     });
 }
 
 #[divan::bench]
 fn exec_like_with_cache_miss(bencher: Bencher) {
     bencher.bench_local(|| {
-        let mut cache = HashMap::new();
-        Value::exec_like(
-            Some(&mut cache),
-            black_box("hello%"),
-            black_box("hello world"),
-        )
-        .unwrap()
+        Value::exec_like(black_box("hello%"), black_box("hello world"), None).unwrap()
     });
 }
 
 #[divan::bench]
 fn exec_like_with_cache_hit(bencher: Bencher) {
-    let mut cache = HashMap::new();
-    // Warm up the cache
-    let _ = Value::exec_like(Some(&mut cache), "hello%", "hello world");
-
     bencher.bench_local(|| {
-        Value::exec_like(
-            Some(black_box(&mut cache)),
-            black_box("hello%"),
-            black_box("hello world"),
-        )
-        .unwrap()
+        Value::exec_like(black_box("hello%"), black_box("hello world"), None).unwrap()
     });
 }
 
 #[divan::bench]
 fn exec_like_fallback_no_cache(bencher: Bencher) {
     bencher.bench_local(|| {
-        Value::exec_like(None, black_box("hello_world"), black_box("hello world")).unwrap()
+        Value::exec_like(black_box("hello_world"), black_box("hello world"), None).unwrap()
     });
 }
 
 #[divan::bench]
 fn exec_like_fallback_with_cache_miss(bencher: Bencher) {
     bencher.bench_local(|| {
-        let mut cache = HashMap::new();
-        Value::exec_like(
-            Some(&mut cache),
-            black_box("hello_world"),
-            black_box("hello world"),
-        )
-        .unwrap()
+        Value::exec_like(black_box("hello_world"), black_box("hello world"), None).unwrap()
     });
 }
 
 #[divan::bench]
 fn exec_like_fallback_with_cache_hit(bencher: Bencher) {
-    let mut cache = HashMap::new();
-    // Warm up the cache with the regex pattern
-    let _ = Value::exec_like(Some(&mut cache), "hello_world", "hello world").unwrap();
-
     bencher.bench_local(|| {
-        Value::exec_like(
-            Some(black_box(&mut cache)),
-            black_box("hello_world"),
-            black_box("hello world"),
-        )
-        .unwrap()
+        Value::exec_like(black_box("hello_world"), black_box("hello world"), None).unwrap()
     });
 }
 
