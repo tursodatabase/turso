@@ -1053,10 +1053,38 @@ impl Value {
             ));
         }
 
-        // Fast path: If no wildcards and no escape
-        let wildcards = ['%', '_'];
-        if !pattern.contains(wildcards) && escape.map_or(true, |e| !pattern.contains(e)) {
+        // 1. Exact match (no wildcards)
+        if !pattern.contains(['%', '_']) {
             return Ok(pattern.eq_ignore_ascii_case(text));
+        }
+
+        // 2. Fast Path: 'abc%' (Prefix)
+        if pattern.ends_with('%') && !pattern[..pattern.len() - 1].contains(['%', '_']) {
+            let prefix = &pattern[..pattern.len() - 1];
+            if text.len() >= prefix.len() && text.is_char_boundary(prefix.len()) {
+                return Ok(text[..prefix.len()].eq_ignore_ascii_case(prefix));
+            }
+            // Fall through to regex if boundary check fails (multi-byte UTF-8)
+        }
+
+        // 3. Fast Path: '%abc' (Suffix)
+        if pattern.starts_with('%') && !pattern[1..].contains(['%', '_']) {
+            let suffix = &pattern[1..];
+            let start = text.len().wrapping_sub(suffix.len());
+            if text.len() >= suffix.len() && text.is_char_boundary(start) {
+                return Ok(text[start..].eq_ignore_ascii_case(suffix));
+            }
+            // Fall through to regex if boundary check fails (multi-byte UTF-8)
+        }
+
+        // 4. Fast Path: '%abc%' (Contains)
+        if pattern.len() > 1 && pattern.starts_with('%') && pattern.ends_with('%') {
+            let inner = &pattern[1..pattern.len() - 1];
+            if !inner.contains(['%', '_']) {
+                return Ok(text
+                    .to_ascii_lowercase()
+                    .contains(&inner.to_ascii_lowercase()));
+            }
         }
 
         Ok(pattern_compare(pattern, text, escape))
@@ -1150,6 +1178,7 @@ impl Value {
         Value::build_text(result)
     }
 }
+
 fn pattern_compare(mut pattern: &str, mut text: &str, escape: Option<char>) -> bool {
     let match_all = '%';
     let match_one = '_';
@@ -1183,22 +1212,12 @@ fn pattern_compare(mut pattern: &str, mut text: &str, escape: Option<char>) -> b
                 return true;
             }
 
-            let mut text_iter = text.char_indices();
-
             if pattern_compare(pattern, text, escape) {
                 return true;
             }
 
-            while let Some((idx, _)) = text_iter.next() {
-                let next_idx = idx
-                    + text[idx..]
-                        .chars()
-                        .next()
-                        .map(|c| c.len_utf8())
-                        .unwrap_or(1);
-                if next_idx > text.len() {
-                    break;
-                }
+            for (idx, c) in text.char_indices() {
+                let next_idx = idx + c.len_utf8();
 
                 if pattern_compare(pattern, &text[next_idx..], escape) {
                     return true;
@@ -1212,16 +1231,14 @@ fn pattern_compare(mut pattern: &str, mut text: &str, escape: Option<char>) -> b
             } else {
                 return false;
             }
-        } else {
-            if let Some(t_char) = text.chars().next() {
-                if !eq_ignore_ascii_case(p_char, t_char) {
-                    return false;
-                }
-                text = &text[t_char.len_utf8()..];
-                pattern = &pattern[p_char.len_utf8()..];
-            } else {
+        } else if let Some(t_char) = text.chars().next() {
+            if !eq_ignore_ascii_case(p_char, t_char) {
                 return false;
             }
+            text = &text[t_char.len_utf8()..];
+            pattern = &pattern[p_char.len_utf8()..];
+        } else {
+            return false;
         }
     }
 
@@ -1229,7 +1246,7 @@ fn pattern_compare(mut pattern: &str, mut text: &str, escape: Option<char>) -> b
 }
 
 fn eq_ignore_ascii_case(a: char, b: char) -> bool {
-    a.to_ascii_lowercase() == b.to_ascii_lowercase()
+    a.eq_ignore_ascii_case(&b)
 }
 
 pub fn construct_like_regex(pattern: &str) -> Result<Regex, LimboError> {
