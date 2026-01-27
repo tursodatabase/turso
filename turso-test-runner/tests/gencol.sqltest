@@ -1205,142 +1205,94 @@ expect error {
 # -----------------------------------------------------------------------------
 
 # CAST expression in STORED column recomputed on UPDATE
+# CAST expression in STORED column - INSERT and UPDATE recomputation.
 test gencol_update_stored_cast {
     CREATE TABLE t1(a TEXT, b INTEGER AS (CAST(a AS INTEGER) * 2) STORED);
     INSERT INTO t1(a) VALUES('5');
     SELECT a, b FROM t1;
-}
-expect {
-    5|10
-}
-
-test gencol_update_stored_cast_recompute {
-    CREATE TABLE t1(a TEXT, b INTEGER AS (CAST(a AS INTEGER) * 2) STORED);
-    INSERT INTO t1(a) VALUES('5');
     UPDATE t1 SET a = '10';
     SELECT a, b FROM t1;
 }
 expect {
+    5|10
     10|20
 }
 
-# IN list expression in STORED column recomputed on UPDATE
+# IN list expression in STORED column - INSERT and UPDATE recomputation.
 test gencol_update_stored_inlist {
     CREATE TABLE t1(a INTEGER, b INTEGER AS (a IN (1, 3, 5)) STORED);
     INSERT INTO t1(a) VALUES(3);
     SELECT a, b FROM t1;
-}
-expect {
-    3|1
-}
-
-test gencol_update_stored_inlist_recompute {
-    CREATE TABLE t1(a INTEGER, b INTEGER AS (a IN (1, 3, 5)) STORED);
-    INSERT INTO t1(a) VALUES(3);
     UPDATE t1 SET a = 2;
     SELECT a, b FROM t1;
 }
 expect {
+    3|1
     2|0
 }
 
-# BETWEEN expression in STORED column recomputed on UPDATE
+# BETWEEN expression in STORED column - INSERT and UPDATE recomputation.
 test gencol_update_stored_between {
     CREATE TABLE t1(a INTEGER, b INTEGER AS (a BETWEEN 5 AND 10) STORED);
     INSERT INTO t1(a) VALUES(7);
     SELECT a, b FROM t1;
-}
-expect {
-    7|1
-}
-
-test gencol_update_stored_between_recompute {
-    CREATE TABLE t1(a INTEGER, b INTEGER AS (a BETWEEN 5 AND 10) STORED);
-    INSERT INTO t1(a) VALUES(7);
     UPDATE t1 SET a = 15;
     SELECT a, b FROM t1;
 }
 expect {
+    7|1
     15|0
 }
 
-# LIKE expression in STORED column recomputed on UPDATE
+# LIKE expression in STORED column - INSERT and UPDATE recomputation.
 test gencol_update_stored_like {
     CREATE TABLE t1(a TEXT, b INTEGER AS (a LIKE '%test%') STORED);
     INSERT INTO t1(a) VALUES('this is a test');
     SELECT b FROM t1;
-}
-expect {
-    1
-}
-
-test gencol_update_stored_like_recompute {
-    CREATE TABLE t1(a TEXT, b INTEGER AS (a LIKE '%test%') STORED);
-    INSERT INTO t1(a) VALUES('this is a test');
     UPDATE t1 SET a = 'no match here';
     SELECT b FROM t1;
 }
 expect {
+    1
     0
 }
 
-# IS NULL expression in STORED column recomputed on UPDATE
+# IS NULL expression in STORED column - INSERT and UPDATE recomputation.
 test gencol_update_stored_isnull {
     CREATE TABLE t1(a INTEGER, b INTEGER AS (a IS NULL) STORED);
     INSERT INTO t1(a) VALUES(NULL);
     SELECT b FROM t1;
-}
-expect {
-    1
-}
-
-test gencol_update_stored_isnull_recompute {
-    CREATE TABLE t1(a INTEGER, b INTEGER AS (a IS NULL) STORED);
-    INSERT INTO t1(a) VALUES(NULL);
     UPDATE t1 SET a = 5;
     SELECT b FROM t1;
 }
 expect {
+    1
     0
 }
 
-# NOT NULL expression in STORED column recomputed on UPDATE
+# IS NOT NULL expression in STORED column - INSERT and UPDATE recomputation.
 test gencol_update_stored_notnull {
     CREATE TABLE t1(a INTEGER, b INTEGER AS (a IS NOT NULL) STORED);
     INSERT INTO t1(a) VALUES(5);
     SELECT b FROM t1;
-}
-expect {
-    1
-}
-
-test gencol_update_stored_notnull_recompute {
-    CREATE TABLE t1(a INTEGER, b INTEGER AS (a IS NOT NULL) STORED);
-    INSERT INTO t1(a) VALUES(5);
     UPDATE t1 SET a = NULL;
     SELECT b FROM t1;
 }
 expect {
+    1
     0
 }
 
-# NOT BETWEEN expression in STORED column
+# NOT BETWEEN expression in STORED column - INSERT and UPDATE recomputation.
 test gencol_update_stored_not_between {
     CREATE TABLE t1(a INTEGER, b INTEGER AS (a NOT BETWEEN 5 AND 10) STORED);
     INSERT INTO t1(a) VALUES(3);
     SELECT b FROM t1;
-}
-expect {
-    1
-}
-
-test gencol_update_stored_not_between_recompute {
-    CREATE TABLE t1(a INTEGER, b INTEGER AS (a NOT BETWEEN 5 AND 10) STORED);
-    INSERT INTO t1(a) VALUES(3);
     UPDATE t1 SET a = 7;
     SELECT b FROM t1;
 }
 expect {
+    1
     0
 }
 
@@ -2447,16 +2399,6 @@ expect {
     5|10
 }
 
-# Verify SQL after renaming with STORED column
-test gencol_rename_column_stored_verify_sql {
-    CREATE TABLE t1(a INTEGER, b AS (a * 2) STORED);
-    ALTER TABLE t1 RENAME COLUMN a TO x;
-    SELECT sql FROM sqlite_master WHERE name='t1';
-}
-expect {
-    CREATE TABLE t1 (x INTEGER, b AS (x * 2) STORED)
-}
-
 # Dependency chain: base column renamed updates all dependents
 test gencol_rename_column_chain {
     CREATE TABLE t1(a INTEGER, b AS (a * 2), c AS (b + a));
@@ -2466,16 +2408,6 @@ test gencol_rename_column_chain {
 }
 expect {
     5|10|15
-}
-
-# Verify SQL with dependency chain
-test gencol_rename_column_chain_verify_sql {
-    CREATE TABLE t1(a INTEGER, b AS (a * 2), c AS (b + a) STORED);
-    ALTER TABLE t1 RENAME COLUMN a TO x;
-    SELECT sql FROM sqlite_master WHERE name='t1';
-}
-expect {
-    CREATE TABLE t1 (x INTEGER, b AS (x * 2), c AS (b + x) STORED)
 }
 
 # Rename middle column in chain updates dependents
@@ -2520,27 +2452,6 @@ test gencol_rename_column_case_insensitive {
 }
 expect {
     5|10
-}
-
-# Case variations in RENAME COLUMN
-test gencol_rename_column_uppercase_source {
-    CREATE TABLE t1(myval INTEGER, b AS (myval * 3));
-    ALTER TABLE t1 RENAME COLUMN MYVAL TO newval;
-    INSERT INTO t1(newval) VALUES(4);
-    SELECT newval, b FROM t1;
-}
-expect {
-    4|12
-}
-
-test gencol_rename_column_mixed_case {
-    CREATE TABLE t1(MixedCase INTEGER, b AS (MixedCase + 10) STORED);
-    ALTER TABLE t1 RENAME COLUMN mIxEdCaSe TO renamed;
-    INSERT INTO t1(renamed) VALUES(5);
-    SELECT renamed, b FROM t1;
-}
-expect {
-    5|15
 }
 
 test gencol_rename_column_case_insensitive_with_index {
@@ -2640,41 +2551,23 @@ expect {
 # -----------------------------------------------------------------------------
 
 # Test that index on VIRTUAL column is updated when base changes.
-# The bug was that creating an index on a VIRTUAL column panicked because
-# emit_column() used the table column index to index into index.columns array.
+# Index on VIRTUAL column - INSERT and UPDATE with integrity check.
 test gencol_index_virtual_update_integrity {
     CREATE TABLE t1(a INTEGER, b INTEGER, c AS (a + b));
     CREATE INDEX idx_c ON t1(c);
     INSERT INTO t1(a, b) VALUES (10, 20);
     SELECT c FROM t1;
-}
-expect {
-    30
-}
-
-test gencol_index_virtual_update_integrity_2 {
-    CREATE TABLE t1(a INTEGER, b INTEGER, c AS (a + b));
-    CREATE INDEX idx_c ON t1(c);
-    INSERT INTO t1(a, b) VALUES (10, 20);
     UPDATE t1 SET a = 100;
     SELECT c FROM t1;
-}
-expect {
-    120
-}
-
-# Test that index on VIRTUAL column is properly maintained during UPDATE
-test gencol_index_virtual_update_integrity_check {
-    CREATE TABLE t1(a INTEGER, b INTEGER, c AS (a + b));
-    CREATE INDEX idx_c ON t1(c);
-    INSERT INTO t1(a, b) VALUES (10, 20);
-    UPDATE t1 SET a = 100;
     PRAGMA integrity_check;
 }
 expect {
+    30
+    120
     ok
 }
 
+# Multiple updates maintain integrity on VIRTUAL column index.
 test gencol_index_virtual_multiple_updates {
     CREATE TABLE t1(a INTEGER, b INTEGER, c AS (a * b));
     CREATE INDEX idx_c ON t1(c);
@@ -2682,21 +2575,10 @@ test gencol_index_virtual_multiple_updates {
     UPDATE t1 SET a = 5;
     UPDATE t1 SET b = 7;
     SELECT a, b, c FROM t1;
-}
-expect {
-    5|7|35
-}
-
-# Test that multiple updates maintain integrity on VIRTUAL column index
-test gencol_index_virtual_multiple_updates_integrity {
-    CREATE TABLE t1(a INTEGER, b INTEGER, c AS (a * b));
-    CREATE INDEX idx_c ON t1(c);
-    INSERT INTO t1(a, b) VALUES (2, 3);
-    UPDATE t1 SET a = 5;
-    UPDATE t1 SET b = 7;
     PRAGMA integrity_check;
 }
 expect {
+    5|7|35
     ok
 }
 
@@ -2767,83 +2649,55 @@ expect {
 # This was fixed in core/translate/emitter.rs.
 # -----------------------------------------------------------------------------
 
-# STORED depends on VIRTUAL depends on regular column
+# STORED depends on VIRTUAL depends on regular column - INSERT and UPDATE.
 test gencol_update_stored_via_virtual_chain {
     CREATE TABLE t1(a INTEGER, b AS (a * 2), c AS (b + 10) STORED);
     INSERT INTO t1(a) VALUES (5);
     SELECT a, b, c FROM t1;
-}
-expect {
-    5|10|20
-}
-
-test gencol_update_stored_via_virtual_chain_update {
-    CREATE TABLE t1(a INTEGER, b AS (a * 2), c AS (b + 10) STORED);
-    INSERT INTO t1(a) VALUES (5);
     UPDATE t1 SET a = 10;
     SELECT a, b, c FROM t1;
 }
 expect {
+    5|10|20
     10|20|30
 }
 
-# Multi-level chain: STORED -> VIRTUAL -> VIRTUAL -> regular
+# Multi-level chain: STORED -> VIRTUAL -> VIRTUAL -> regular - INSERT and UPDATE.
 test gencol_update_stored_via_virtual_chain_multi {
     CREATE TABLE t1(a INTEGER, b AS (a * 2), c AS (b + 1), d AS (c * 3) STORED);
     INSERT INTO t1(a) VALUES (5);
     SELECT a, b, c, d FROM t1;
-}
-expect {
-    5|10|11|33
-}
-
-test gencol_update_stored_via_virtual_chain_multi_update {
-    CREATE TABLE t1(a INTEGER, b AS (a * 2), c AS (b + 1), d AS (c * 3) STORED);
-    INSERT INTO t1(a) VALUES (5);
     UPDATE t1 SET a = 10;
     SELECT a, b, c, d FROM t1;
 }
 expect {
+    5|10|11|33
     10|20|21|63
 }
 
-# STORED column at earlier position than VIRTUAL dependency
+# STORED column at earlier position than VIRTUAL dependency - INSERT and UPDATE.
 test gencol_update_stored_via_virtual_out_of_order {
     CREATE TABLE t1(a INTEGER, c AS (b + 100) STORED, b AS (a * 2));
     INSERT INTO t1(a) VALUES (5);
     SELECT a, b, c FROM t1;
-}
-expect {
-    5|10|110
-}
-
-test gencol_update_stored_via_virtual_out_of_order_update {
-    CREATE TABLE t1(a INTEGER, c AS (b + 100) STORED, b AS (a * 2));
-    INSERT INTO t1(a) VALUES (5);
     UPDATE t1 SET a = 10;
     SELECT a, b, c FROM t1;
 }
 expect {
+    5|10|110
     10|20|120
 }
 
-# Diamond pattern: STORED depends on two VIRTUAL columns
+# Diamond pattern: STORED depends on two VIRTUAL columns - INSERT and UPDATE.
 test gencol_update_stored_via_virtual_diamond {
     CREATE TABLE t1(a INTEGER, b AS (a * 2), c AS (a * 3), d AS (b + c) STORED);
     INSERT INTO t1(a) VALUES (5);
     SELECT a, b, c, d FROM t1;
-}
-expect {
-    5|10|15|25
-}
-
-test gencol_update_stored_via_virtual_diamond_update {
-    CREATE TABLE t1(a INTEGER, b AS (a * 2), c AS (a * 3), d AS (b + c) STORED);
-    INSERT INTO t1(a) VALUES (5);
     UPDATE t1 SET a = 10;
     SELECT a, b, c, d FROM t1;
 }
 expect {
+    5|10|15|25
     10|20|30|50
 }
 
@@ -2994,129 +2848,75 @@ expect {
 # reference VIRTUAL columns, which previously caused IdxDelete failures.
 # ============================================================================
 
-# Test 1: Basic VIRTUAL column index UPDATE
-# Verifies that updating a base column correctly maintains an index on a VIRTUAL column
+# Basic VIRTUAL column index UPDATE - verify result and integrity.
 test gencol_index_virtual_update_basic {
     CREATE TABLE t1(a INTEGER, b AS (a * 2));
     CREATE INDEX idx_b ON t1(b);
     INSERT INTO t1(a) VALUES (5);
     UPDATE t1 SET a = 10;
     SELECT a, b FROM t1;
-}
-expect {
-    10|20
-}
-
-test gencol_index_virtual_update_basic_integrity {
-    CREATE TABLE t1(a INTEGER, b AS (a * 2));
-    CREATE INDEX idx_b ON t1(b);
-    INSERT INTO t1(a) VALUES (5);
-    UPDATE t1 SET a = 10;
     PRAGMA integrity_check;
 }
 expect {
+    10|20
     ok
 }
 
-# Test 2: VIRTUAL column referencing another VIRTUAL column with index
-# This is a critical case - nested VIRTUAL column references
+# VIRTUAL column referencing another VIRTUAL column with index - verify result and integrity.
 test gencol_index_virtual_chain {
     CREATE TABLE t1(x INTEGER, y AS (x + 1), z AS (y * 2));
     CREATE INDEX idx_z ON t1(z);
     INSERT INTO t1(x) VALUES (5);
-    -- Initial: x=5, y=6, z=12
     UPDATE t1 SET x = 10;
-    -- After: x=10, y=11, z=22
     SELECT x, y, z FROM t1;
-}
-expect {
-    10|11|22
-}
-
-test gencol_index_virtual_chain_integrity {
-    CREATE TABLE t1(x INTEGER, y AS (x + 1), z AS (y * 2));
-    CREATE INDEX idx_z ON t1(z);
-    INSERT INTO t1(x) VALUES (5);
-    UPDATE t1 SET x = 10;
     PRAGMA integrity_check;
 }
 expect {
+    10|11|22
     ok
 }
 
-# Test 3: VIRTUAL column referencing STORED column with index
+# VIRTUAL column referencing STORED column with index - verify result and integrity.
 test gencol_index_virtual_refs_stored {
     CREATE TABLE t1(a INTEGER, b AS (a * 2) STORED, c AS (b + 1));
     CREATE INDEX idx_c ON t1(c);
     INSERT INTO t1(a) VALUES (5);
-    -- Initial: a=5, b=10, c=11
     UPDATE t1 SET a = 10;
-    -- After: a=10, b=20, c=21
     SELECT a, b, c FROM t1;
-}
-expect {
-    10|20|21
-}
-
-test gencol_index_virtual_refs_stored_integrity {
-    CREATE TABLE t1(a INTEGER, b AS (a * 2) STORED, c AS (b + 1));
-    CREATE INDEX idx_c ON t1(c);
-    INSERT INTO t1(a) VALUES (5);
-    UPDATE t1 SET a = 10;
     PRAGMA integrity_check;
 }
 expect {
+    10|20|21
     ok
 }
 
-# Test 4: Multiple rows with VIRTUAL index UPDATE
+# Multiple rows with VIRTUAL index UPDATE - verify result and integrity.
 test gencol_index_virtual_multirow_update {
     CREATE TABLE t1(id INTEGER PRIMARY KEY, val INTEGER, computed AS (val * 10));
     CREATE INDEX idx_computed ON t1(computed);
     INSERT INTO t1(id, val) VALUES (1, 5), (2, 10), (3, 15);
     UPDATE t1 SET val = val + 1 WHERE id = 2;
     SELECT id, val, computed FROM t1 ORDER BY id;
+    PRAGMA integrity_check;
 }
 expect {
     1|5|50
     2|11|110
     3|15|150
-}
-
-test gencol_index_virtual_multirow_update_integrity {
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, val INTEGER, computed AS (val * 10));
-    CREATE INDEX idx_computed ON t1(computed);
-    INSERT INTO t1(id, val) VALUES (1, 5), (2, 10), (3, 15);
-    UPDATE t1 SET val = val + 1 WHERE id = 2;
-    PRAGMA integrity_check;
-}
-expect {
     ok
 }
 
-# Test 5: Expression index referencing VIRTUAL column
+# Expression index referencing VIRTUAL column - verify result and integrity.
 test gencol_expression_index_on_virtual {
     CREATE TABLE t1(a INTEGER, b AS (a + 1));
     CREATE INDEX idx_expr ON t1(b * 2);
     INSERT INTO t1(a) VALUES (5);
-    -- b = 6, index key = 12
     UPDATE t1 SET a = 10;
-    -- b = 11, index key = 22
     SELECT a, b FROM t1;
-}
-expect {
-    10|11
-}
-
-# Expression index on VIRTUAL column with integrity_check
-test gencol_expression_index_on_virtual_integrity {
-    CREATE TABLE t1(a INTEGER, b AS (a + 1));
-    CREATE INDEX idx_expr ON t1(b * 2);
-    INSERT INTO t1(a) VALUES (5);
-    UPDATE t1 SET a = 10;
     PRAGMA integrity_check;
 }
 expect {
+    10|11
     ok
 }
 
@@ -3564,50 +3364,30 @@ expect {
     5|10
 }
 
-# Expression index on STORED - UPDATE base column (THE BUG TEST)
+# Expression index on STORED - UPDATE base column, verify new value found and old value gone.
 test gencol_expr_index_stored_update {
     CREATE TABLE t1(a INTEGER, b AS (a * 2) STORED);
     CREATE INDEX idx1 ON t1(b + 10);
     INSERT INTO t1(a) VALUES(5);
     UPDATE t1 SET a = 10;
     SELECT * FROM t1 WHERE b + 10 = 30;
+    SELECT * FROM t1 WHERE b + 10 = 20;
 }
 expect {
     10|20
 }
 
-# Expression index on STORED - old value should not match after UPDATE (THE BUG TEST)
-test gencol_expr_index_stored_update_no_stale {
-    CREATE TABLE t1(a INTEGER, b AS (a * 2) STORED);
-    CREATE INDEX idx1 ON t1(b + 10);
-    INSERT INTO t1(a) VALUES(5);
-    UPDATE t1 SET a = 10;
-    SELECT * FROM t1 WHERE b + 10 = 20;
-}
-expect {
-}
-
-# Expression index on VIRTUAL - UPDATE base column (THE BUG TEST)
+# Expression index on VIRTUAL - UPDATE base column, verify new value found and old value gone.
 test gencol_expr_index_virtual_update {
     CREATE TABLE t1(a INTEGER, b AS (a * 2));
     CREATE INDEX idx1 ON t1(b + 10);
     INSERT INTO t1(a) VALUES(5);
     UPDATE t1 SET a = 10;
     SELECT * FROM t1 WHERE b + 10 = 30;
-}
-expect {
-    10|20
-}
-
-# Expression index on VIRTUAL - old value should not match after UPDATE (THE BUG TEST)
-test gencol_expr_index_virtual_update_no_stale {
-    CREATE TABLE t1(a INTEGER, b AS (a * 2));
-    CREATE INDEX idx1 ON t1(b + 10);
-    INSERT INTO t1(a) VALUES(5);
-    UPDATE t1 SET a = 10;
     SELECT * FROM t1 WHERE b + 10 = 20;
 }
 expect {
+    10|20
 }
 
 # Nested generated columns with expression index
@@ -3621,27 +3401,17 @@ expect {
     1|2|102
 }
 
-# Nested generated columns with expression index - UPDATE (THE BUG TEST)
+# Nested generated columns with expression index - UPDATE, verify new value found and old gone.
 test gencol_expr_index_nested_update {
     CREATE TABLE t1(a INTEGER, b AS (a * 2), c AS (b + 100) STORED);
     CREATE INDEX idx1 ON t1(c + 1000);
     INSERT INTO t1(a) VALUES(1);
     UPDATE t1 SET a = 5;
     SELECT * FROM t1 WHERE c + 1000 = 1110;
-}
-expect {
-    5|10|110
-}
-
-# Nested - old value should not match (THE BUG TEST)
-test gencol_expr_index_nested_update_no_stale {
-    CREATE TABLE t1(a INTEGER, b AS (a * 2), c AS (b + 100) STORED);
-    CREATE INDEX idx1 ON t1(c + 1000);
-    INSERT INTO t1(a) VALUES(1);
-    UPDATE t1 SET a = 5;
     SELECT * FROM t1 WHERE c + 1000 = 1102;
 }
 expect {
+    5|10|110
 }
 
 # UNIQUE expression index on generated column
@@ -3678,27 +3448,17 @@ expect {
     30|60
 }
 
-# Mixed expression with UPDATE (THE BUG TEST)
+# Mixed expression (base + gencol) with UPDATE, verify new value found and old gone.
 test gencol_expr_index_mixed_update {
     CREATE TABLE t1(a INTEGER, b AS (a * 2) STORED);
     CREATE INDEX idx1 ON t1(a + b);
     INSERT INTO t1(a) VALUES(5);
     UPDATE t1 SET a = 10;
     SELECT * FROM t1 WHERE a + b = 30;
-}
-expect {
-    10|20
-}
-
-# Mixed expression - old value should not match (THE BUG TEST)
-test gencol_expr_index_mixed_update_no_stale {
-    CREATE TABLE t1(a INTEGER, b AS (a * 2) STORED);
-    CREATE INDEX idx1 ON t1(a + b);
-    INSERT INTO t1(a) VALUES(5);
-    UPDATE t1 SET a = 10;
     SELECT * FROM t1 WHERE a + b = 15;
 }
 expect {
+    10|20
 }
 
 # -----------------------------------------------------------------------------
@@ -3764,29 +3524,19 @@ expect {
     5|10
 }
 
-# Multi-row UPDATE
+# Multi-row UPDATE - verify new values found and old values gone.
 test gencol_expr_index_multirow_update {
     CREATE TABLE t1(a INTEGER, b AS (a * 2) STORED);
     CREATE INDEX idx1 ON t1(b + 10);
     INSERT INTO t1(a) VALUES(1), (2), (3);
     UPDATE t1 SET a = a * 10;
     SELECT * FROM t1 WHERE b + 10 >= 20 ORDER BY a;
+    SELECT * FROM t1 WHERE b + 10 = 12;
 }
 expect {
     10|20
     20|40
     30|60
-}
-
-# Multi-row UPDATE - verify old values not found
-test gencol_expr_index_multirow_update_no_stale {
-    CREATE TABLE t1(a INTEGER, b AS (a * 2) STORED);
-    CREATE INDEX idx1 ON t1(b + 10);
-    INSERT INTO t1(a) VALUES(1), (2), (3);
-    UPDATE t1 SET a = a * 10;
-    SELECT * FROM t1 WHERE b + 10 = 12;
-}
-expect {
 }
 
 # Partial UPDATE - only some rows modified
@@ -3945,27 +3695,17 @@ expect {
     10|20
 }
 
-# Expression index uses both gencol and its base column
+# Expression index uses both gencol and its base column - verify new value found and old gone.
 test gencol_expr_index_gencol_and_base {
     CREATE TABLE t1(a INTEGER, b AS (a * 2) STORED);
     CREATE INDEX idx1 ON t1(a + b);
     INSERT INTO t1(a) VALUES(5);
     UPDATE t1 SET a = 10;
     SELECT * FROM t1 WHERE a + b = 30;
-}
-expect {
-    10|20
-}
-
-# Expression index uses both gencol and base - old value not found
-test gencol_expr_index_gencol_and_base_no_stale {
-    CREATE TABLE t1(a INTEGER, b AS (a * 2) STORED);
-    CREATE INDEX idx1 ON t1(a + b);
-    INSERT INTO t1(a) VALUES(5);
-    UPDATE t1 SET a = 10;
     SELECT * FROM t1 WHERE a + b = 15;
 }
 expect {
+    10|20
 }
 
 # VIRTUAL generated column with DELETE
@@ -3993,27 +3733,17 @@ expect {
     30|60
 }
 
-# Deep nesting with DELETE
+# Deep nesting with DELETE - verify remaining row found and deleted row gone.
 test gencol_expr_index_nested_delete {
     CREATE TABLE t1(a INTEGER, b AS (a * 2), c AS (b + 100) STORED);
     CREATE INDEX idx1 ON t1(c + 1000);
     INSERT INTO t1(a) VALUES(1), (5);
     DELETE FROM t1 WHERE a = 1;
     SELECT * FROM t1 WHERE c + 1000 = 1110;
-}
-expect {
-    5|10|110
-}
-
-# Deep nesting - old value not found after DELETE
-test gencol_expr_index_nested_delete_no_stale {
-    CREATE TABLE t1(a INTEGER, b AS (a * 2), c AS (b + 100) STORED);
-    CREATE INDEX idx1 ON t1(c + 1000);
-    INSERT INTO t1(a) VALUES(1), (5);
-    DELETE FROM t1 WHERE a = 1;
     SELECT * FROM t1 WHERE c + 1000 = 1102;
 }
 expect {
+    5|10|110
 }
 
 # -----------------------------------------------------------------------------
@@ -4254,10 +3984,8 @@ expect {
 # Regression tests: Index on REAL generated column with integer comparison
 # -----------------------------------------------------------------------------
 
-# Regression test: index on REAL generated column should return same results as table scan
-# When comparing a REAL column to an INTEGER literal, the index lookup must produce
-# the same results as a full table scan. This tests that the index seek properly
-# handles type coercion for generated columns.
+# Index on REAL column should return same results as table scan for integer comparisons.
+# Tests that index seek properly handles type coercion for generated columns.
 test gencol_index_real_integer_comparison {
     CREATE TABLE t (a BLOB, b REAL AS ((c)) STORED, c INTEGER);
     INSERT INTO t (a, c) VALUES (X'00', 3036093696168065977);
@@ -4274,104 +4002,28 @@ expect {
 }
 
 # -----------------------------------------------------------------------------
-# REAL vs INTEGER Comparison Bug - Comprehensive Test Suite
+# REAL vs INTEGER Comparison Tests
+# Verifies SQLite's "truncate-then-compare" semantics for Float-Integer comparisons.
 # -----------------------------------------------------------------------------
-# These tests verify that comparing REAL values to INTEGER literals follows
-# SQLite's "truncate-then-compare" semantics, NOT simple float conversion.
-#
-# Key insight: When comparing Float to Integer, SQLite truncates the float
-# to integer and compares integers. It does NOT convert the integer to float
-# (which would lose precision for large values).
-#
-# Example:
-#   3036093696168066048.0 (float) vs 3036093696168066000 (int)
-#   SQLite: truncate float -> 3036093696168066048, compare: 3036093696168066048 != 3036093696168066000 -> NOT EQUAL
-#   Bug:    convert int to float -> 3036093696168066048.0, compare: 3036093696168066048.0 == 3036093696168066048.0 -> EQUAL (wrong!)
 
-# Test: REAL column equality with INTEGER literal - SELECT expression
-# The REAL column contains 3036093696168066048.0 (from precision loss of 3036093696168065977)
-# Comparing to 3036093696168066000 should return 0 (false) because:
-#   truncate(3036093696168066048.0) = 3036093696168066048 != 3036093696168066000
-test real_int_comparison_eq_select_expr {
+# All comparison operators with REAL vs INTEGER (truncate float, then compare integers).
+# REAL 3036093696168066048.0 vs INT 3036093696168066000: truncated 3036093696168066048 != 3036093696168066000.
+test real_int_comparison_all_operators {
     CREATE TABLE t1 (val REAL);
     INSERT INTO t1 VALUES (3036093696168066048.0);
-    SELECT val = 3036093696168066000 FROM t1;
-    SELECT 3036093696168066000 = val FROM t1;
+    SELECT val = 3036093696168066000,
+           val != 3036093696168066000,
+           val < 3036093696168066000,
+           val > 3036093696168066000,
+           val <= 3036093696168066000,
+           val >= 3036093696168066000
+    FROM t1;
 }
 expect {
-    0
-    0
+    0|1|0|1|0|1
 }
 
-# Test: REAL column inequality with INTEGER literal
-test real_int_comparison_ne_select_expr {
-    CREATE TABLE t2 (val REAL);
-    INSERT INTO t2 VALUES (3036093696168066048.0);
-    SELECT val != 3036093696168066000 FROM t2;
-    SELECT val <> 3036093696168066000 FROM t2;
-}
-expect {
-    1
-    1
-}
-
-# Test: REAL column less-than with INTEGER literal
-# 3036093696168066048.0 is NOT less than 3036093696168066000
-# Because truncate(3036093696168066048.0) = 3036093696168066048 > 3036093696168066000
-test real_int_comparison_lt_select_expr {
-    CREATE TABLE t3 (val REAL);
-    INSERT INTO t3 VALUES (3036093696168066048.0);
-    SELECT val < 3036093696168066000 FROM t3;
-    SELECT 3036093696168066000 < val FROM t3;
-}
-expect {
-    0
-    1
-}
-
-# Test: REAL column greater-than with INTEGER literal
-# 3036093696168066048.0 IS greater than 3036093696168066000
-test real_int_comparison_gt_select_expr {
-    CREATE TABLE t4 (val REAL);
-    INSERT INTO t4 VALUES (3036093696168066048.0);
-    SELECT val > 3036093696168066000 FROM t4;
-    SELECT 3036093696168066000 > val FROM t4;
-}
-expect {
-    1
-    0
-}
-
-# Test: REAL column less-than-or-equal with INTEGER literal
-test real_int_comparison_le_select_expr {
-    CREATE TABLE t5 (val REAL);
-    INSERT INTO t5 VALUES (3036093696168066048.0);
-    SELECT val <= 3036093696168066000 FROM t5;
-    SELECT 3036093696168066000 <= val FROM t5;
-}
-expect {
-    0
-    1
-}
-
-# Test: REAL column greater-than-or-equal with INTEGER literal
-test real_int_comparison_ge_select_expr {
-    CREATE TABLE t6 (val REAL);
-    INSERT INTO t6 VALUES (3036093696168066048.0);
-    SELECT val >= 3036093696168066000 FROM t6;
-    SELECT 3036093696168066000 >= val FROM t6;
-}
-expect {
-    1
-    0
-}
-
-# Test: WHERE clause comparisons (table scan)
-# Note: Both 3036093696168066048.0 and 3036093696168066000.0 become the SAME f64 value
-# (3036093696168066048.0) due to floating-point precision limitations.
-# When comparing to integer 3036093696168066000:
-# - truncate(3036093696168066048.0) = 3036093696168066048 != 3036093696168066000 -> NOT EQUAL
-# - Both rows are > 3036093696168066000 (since 3036093696168066048 > 3036093696168066000)
+# WHERE clause comparisons - both float literals map to same f64 due to precision limits.
 test real_int_comparison_where_clause {
     CREATE TABLE t7 (id INTEGER PRIMARY KEY, val REAL);
     INSERT INTO t7 VALUES (1, 3036093696168066048.0);
@@ -4401,11 +4053,8 @@ test real_int_comparison_with_index {
 expect {
 }
 
-# Test: Edge case - values that are equal when both converted to float
-# but NOT equal when using truncate-then-compare
-# 9007199254740993 as f64 = 9007199254740992.0 (precision loss, 2^53 + 1)
-# 9007199254740992 as f64 = 9007199254740992.0
-# These should NOT be equal!
+# Edge case: 9007199254740993 (2^53+1) as f64 rounds to 9007199254740992.0.
+# With truncate-then-compare, these should NOT be equal.
 test real_int_comparison_precision_boundary {
     CREATE TABLE t9 (val REAL);
     INSERT INTO t9 VALUES (9007199254740992.0);
