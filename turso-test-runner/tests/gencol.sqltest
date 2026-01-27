@@ -4249,3 +4249,214 @@ expect {
     20.0
     20.0
 }
+
+# -----------------------------------------------------------------------------
+# Regression tests: Index on REAL generated column with integer comparison
+# -----------------------------------------------------------------------------
+
+# Regression test: index on REAL generated column should return same results as table scan
+# When comparing a REAL column to an INTEGER literal, the index lookup must produce
+# the same results as a full table scan. This tests that the index seek properly
+# handles type coercion for generated columns.
+test gencol_index_real_integer_comparison {
+    CREATE TABLE t (a BLOB, b REAL AS ((c)) STORED, c INTEGER);
+    INSERT INTO t (a, c) VALUES (X'00', 3036093696168065977);
+    -- Without index (table scan)
+    SELECT COUNT(*) FROM t WHERE b = 3036093696168066000;
+    -- Add index
+    CREATE INDEX idx ON t (b DESC);
+    -- With index (should return same result as table scan)
+    SELECT COUNT(*) FROM t WHERE b = 3036093696168066000;
+}
+expect {
+    0
+    0
+}
+
+# -----------------------------------------------------------------------------
+# REAL vs INTEGER Comparison Bug - Comprehensive Test Suite
+# -----------------------------------------------------------------------------
+# These tests verify that comparing REAL values to INTEGER literals follows
+# SQLite's "truncate-then-compare" semantics, NOT simple float conversion.
+#
+# Key insight: When comparing Float to Integer, SQLite truncates the float
+# to integer and compares integers. It does NOT convert the integer to float
+# (which would lose precision for large values).
+#
+# Example:
+#   3036093696168066048.0 (float) vs 3036093696168066000 (int)
+#   SQLite: truncate float -> 3036093696168066048, compare: 3036093696168066048 != 3036093696168066000 -> NOT EQUAL
+#   Bug:    convert int to float -> 3036093696168066048.0, compare: 3036093696168066048.0 == 3036093696168066048.0 -> EQUAL (wrong!)
+
+# Test: REAL column equality with INTEGER literal - SELECT expression
+# The REAL column contains 3036093696168066048.0 (from precision loss of 3036093696168065977)
+# Comparing to 3036093696168066000 should return 0 (false) because:
+#   truncate(3036093696168066048.0) = 3036093696168066048 != 3036093696168066000
+test real_int_comparison_eq_select_expr {
+    CREATE TABLE t1 (val REAL);
+    INSERT INTO t1 VALUES (3036093696168066048.0);
+    SELECT val = 3036093696168066000 FROM t1;
+    SELECT 3036093696168066000 = val FROM t1;
+}
+expect {
+    0
+    0
+}
+
+# Test: REAL column inequality with INTEGER literal
+test real_int_comparison_ne_select_expr {
+    CREATE TABLE t2 (val REAL);
+    INSERT INTO t2 VALUES (3036093696168066048.0);
+    SELECT val != 3036093696168066000 FROM t2;
+    SELECT val <> 3036093696168066000 FROM t2;
+}
+expect {
+    1
+    1
+}
+
+# Test: REAL column less-than with INTEGER literal
+# 3036093696168066048.0 is NOT less than 3036093696168066000
+# Because truncate(3036093696168066048.0) = 3036093696168066048 > 3036093696168066000
+test real_int_comparison_lt_select_expr {
+    CREATE TABLE t3 (val REAL);
+    INSERT INTO t3 VALUES (3036093696168066048.0);
+    SELECT val < 3036093696168066000 FROM t3;
+    SELECT 3036093696168066000 < val FROM t3;
+}
+expect {
+    0
+    1
+}
+
+# Test: REAL column greater-than with INTEGER literal
+# 3036093696168066048.0 IS greater than 3036093696168066000
+test real_int_comparison_gt_select_expr {
+    CREATE TABLE t4 (val REAL);
+    INSERT INTO t4 VALUES (3036093696168066048.0);
+    SELECT val > 3036093696168066000 FROM t4;
+    SELECT 3036093696168066000 > val FROM t4;
+}
+expect {
+    1
+    0
+}
+
+# Test: REAL column less-than-or-equal with INTEGER literal
+test real_int_comparison_le_select_expr {
+    CREATE TABLE t5 (val REAL);
+    INSERT INTO t5 VALUES (3036093696168066048.0);
+    SELECT val <= 3036093696168066000 FROM t5;
+    SELECT 3036093696168066000 <= val FROM t5;
+}
+expect {
+    0
+    1
+}
+
+# Test: REAL column greater-than-or-equal with INTEGER literal
+test real_int_comparison_ge_select_expr {
+    CREATE TABLE t6 (val REAL);
+    INSERT INTO t6 VALUES (3036093696168066048.0);
+    SELECT val >= 3036093696168066000 FROM t6;
+    SELECT 3036093696168066000 >= val FROM t6;
+}
+expect {
+    1
+    0
+}
+
+# Test: WHERE clause comparisons (table scan)
+# Note: Both 3036093696168066048.0 and 3036093696168066000.0 become the SAME f64 value
+# (3036093696168066048.0) due to floating-point precision limitations.
+# When comparing to integer 3036093696168066000:
+# - truncate(3036093696168066048.0) = 3036093696168066048 != 3036093696168066000 -> NOT EQUAL
+# - Both rows are > 3036093696168066000 (since 3036093696168066048 > 3036093696168066000)
+test real_int_comparison_where_clause {
+    CREATE TABLE t7 (id INTEGER PRIMARY KEY, val REAL);
+    INSERT INTO t7 VALUES (1, 3036093696168066048.0);
+    INSERT INTO t7 VALUES (2, 3036093696168066000.0);
+    SELECT id FROM t7 WHERE val = 3036093696168066000;
+    SELECT id FROM t7 WHERE val != 3036093696168066000 ORDER BY id;
+    SELECT id FROM t7 WHERE val > 3036093696168066000;
+}
+expect {
+    1
+    2
+    1
+    2
+}
+
+# Test: WHERE clause with index (index scan vs table scan consistency)
+test real_int_comparison_with_index {
+    CREATE TABLE t8 (id INTEGER PRIMARY KEY, val REAL);
+    INSERT INTO t8 VALUES (1, 3036093696168066048.0);
+    -- Table scan
+    SELECT id FROM t8 WHERE val = 3036093696168066000;
+    -- Create index
+    CREATE INDEX idx8 ON t8 (val);
+    -- Index scan (must match table scan result)
+    SELECT id FROM t8 WHERE val = 3036093696168066000;
+}
+expect {
+}
+
+# Test: Edge case - values that are equal when both converted to float
+# but NOT equal when using truncate-then-compare
+# 9007199254740993 as f64 = 9007199254740992.0 (precision loss, 2^53 + 1)
+# 9007199254740992 as f64 = 9007199254740992.0
+# These should NOT be equal!
+test real_int_comparison_precision_boundary {
+    CREATE TABLE t9 (val REAL);
+    INSERT INTO t9 VALUES (9007199254740992.0);
+    -- 9007199254740993 would round to same float, but truncate comparison should differ
+    SELECT val = 9007199254740993 FROM t9;
+    SELECT val = 9007199254740992 FROM t9;
+}
+expect {
+    0
+    1
+}
+
+# Test: Integer that equals the float exactly
+test real_int_comparison_exact_match {
+    CREATE TABLE t10 (val REAL);
+    INSERT INTO t10 VALUES (12345.0);
+    SELECT val = 12345 FROM t10;
+    SELECT val = 12346 FROM t10;
+}
+expect {
+    1
+    0
+}
+
+# Test: Negative values
+test real_int_comparison_negative {
+    CREATE TABLE t11 (val REAL);
+    INSERT INTO t11 VALUES (-3036093696168066048.0);
+    SELECT val = -3036093696168066000 FROM t11;
+    SELECT val < -3036093696168066000 FROM t11;
+    SELECT val > -3036093696168066000 FROM t11;
+}
+expect {
+    0
+    1
+    0
+}
+
+# Test: Generated column (the original bug case, more explicit)
+test real_int_comparison_generated_column {
+    CREATE TABLE t12 (c INTEGER, b REAL AS (c) STORED);
+    INSERT INTO t12 (c) VALUES (3036093696168065977);
+    -- b stores 3036093696168066048.0 due to precision loss when converting c to REAL
+    SELECT b FROM t12;
+    -- This comparison should be false
+    SELECT b = 3036093696168066000 FROM t12;
+    -- But b does NOT equal the original integer either (it was converted)
+    SELECT b = 3036093696168065977 FROM t12;
+}
+expect {
+    3.03609369616807e+18
+    0
+    0
+}

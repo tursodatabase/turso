@@ -742,7 +742,21 @@ pub fn op_comparison(
         return Ok(InsnFunctionStepResult::Step);
     }
 
-    let (new_lhs, new_rhs) = (affinity.convert(lhs_value), affinity.convert(rhs_value));
+    // Skip affinity conversion for Integer-Float pairs.
+    // The comparison logic (via ValueRef::partial_cmp -> sqlite_int_float_compare)
+    // correctly handles Integer-Float comparisons using a truncate-then-compare approach.
+    // Applying REAL affinity conversion here would convert Integer to Float first,
+    // causing precision loss (e.g., 3036093696168066000 -> 3036093696168066048.0).
+    let is_int_float_pair = matches!(
+        (lhs_value, rhs_value),
+        (Value::Integer(_), Value::Float(_)) | (Value::Float(_), Value::Integer(_))
+    );
+
+    let (new_lhs, new_rhs) = if is_int_float_pair {
+        (None, None)
+    } else {
+        (affinity.convert(lhs_value), affinity.convert(rhs_value))
+    };
 
     let should_jump = op.compare(
         new_lhs
