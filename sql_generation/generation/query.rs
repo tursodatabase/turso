@@ -1,7 +1,7 @@
-use crate::generation::generated_expr::extract_column_refs;
+use crate::generation::generated_expr::{extract_column_refs, has_transitive_concat};
 use crate::generation::{
-    gen_random_text, pick_index, pick_n_unique, pick_unique, Arbitrary, ArbitraryFrom,
-    ArbitrarySized, GenerationContext,
+    Arbitrary, ArbitraryFrom, ArbitrarySized, GenerationContext, gen_random_text, pick_index,
+    pick_unique,
 };
 use crate::model::query::alter_table::{AlterTable, AlterTableType, AlterTableTypeDiscriminants};
 use crate::model::query::predicate::Predicate;
@@ -15,8 +15,8 @@ use crate::model::table::{
     Column, Index, JoinType, JoinedTable, Name, SimValue, Table, TableContext,
 };
 use indexmap::IndexSet;
-use rand::seq::IndexedRandom;
 use rand::Rng;
+use rand::seq::IndexedRandom;
 use turso_parser::ast::{Expr, SortOrder};
 
 use super::{backtrack, pick};
@@ -403,11 +403,37 @@ impl Arbitrary for CreateIndex {
             );
         }
 
-        let num_columns_to_pick = rng.random_range(1..=table.columns.len());
-        let picked_column_indices = pick_n_unique(0..table.columns.len(), num_columns_to_pick, rng);
+        // TODO: Remove this workaround once concat operator bug is fixed.
+        // https://github.com/tursodatabase/turso/issues/4860
+        let indexable_column_indices: Vec<usize> = (0..table.columns.len())
+            .filter(|&i| {
+                let col = &table.columns[i];
+                // Skip generated columns with concat operator in their expression (direct or transitive)
+                if let Some(expr) = col.generated_expr() {
+                    if has_transitive_concat(expr, &table.columns) {
+                        return false;
+                    }
+                }
+                true
+            })
+            .collect();
+
+        if indexable_column_indices.is_empty() {
+            panic!(
+                "Cannot create an index on table '{}' as all columns are generated with concat operator.",
+                table.name
+            );
+        }
+
+        let num_columns_to_pick = rng.random_range(1..=indexable_column_indices.len());
+        let picked_column_indices: Vec<usize> = indexable_column_indices
+            .choose_multiple(rng, num_columns_to_pick)
+            .copied()
+            .collect();
 
         let columns = picked_column_indices
-            .map(|i| {
+            .iter()
+            .map(|&i| {
                 let column = &table.columns[i];
                 (
                     column.name.clone(),

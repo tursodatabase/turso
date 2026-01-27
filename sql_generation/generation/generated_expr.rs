@@ -346,11 +346,60 @@ pub fn contains_concat_operator(expr: &ast::Expr) -> bool {
     }
 }
 
+/// Check if an expression uses concat operator directly or transitively through column references.
+///
+/// This function recursively follows column references to detect cases where a generated column
+/// references another column that uses the concat operator. For example:
+/// - Column `c` defined as `a || b` uses concat directly
+/// - Column `d` defined as `c` (referencing column `c`) transitively uses concat
+///
+/// TODO: Remove this workaround once concat operator bug is fixed.
+/// https://github.com/tursodatabase/turso/issues/4860
+pub fn has_transitive_concat(expr: &ast::Expr, columns: &[Column]) -> bool {
+    match expr {
+        Expr::Binary(lhs, op, rhs) => {
+            matches!(op, Operator::Concat)
+                || has_transitive_concat(lhs, columns)
+                || has_transitive_concat(rhs, columns)
+        }
+        Expr::Id(name) => {
+            // Check if the referenced column has concat in its generated expression
+            if let Some(col) = columns
+                .iter()
+                .find(|c| c.name.eq_ignore_ascii_case(name.as_str()))
+            {
+                if let Some(gen_expr) = col.generated_expr() {
+                    return has_transitive_concat(gen_expr, columns);
+                }
+            }
+            false
+        }
+        Expr::Qualified(_, name) | Expr::DoublyQualified(_, _, name) => {
+            // Same as Expr::Id - check if referenced column has transitive concat
+            if let Some(col) = columns
+                .iter()
+                .find(|c| c.name.eq_ignore_ascii_case(name.as_str()))
+            {
+                if let Some(gen_expr) = col.generated_expr() {
+                    return has_transitive_concat(gen_expr, columns);
+                }
+            }
+            false
+        }
+        Expr::Unary(_, inner) => has_transitive_concat(inner, columns),
+        Expr::Parenthesized(exprs) => exprs.iter().any(|e| has_transitive_concat(e, columns)),
+        Expr::Cast { expr, .. } => has_transitive_concat(expr, columns),
+        Expr::IsNull(inner) | Expr::NotNull(inner) => has_transitive_concat(inner, columns),
+        Expr::Collate(inner, _) => has_transitive_concat(inner, columns),
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::rngs::StdRng;
     use rand::SeedableRng;
+    use rand::rngs::StdRng;
 
     #[test]
     fn test_extract_column_refs() {
@@ -401,5 +450,131 @@ mod tests {
 
         // Expression should be valid
         assert!(!matches!(expr, Expr::Id(name) if name.as_str() == "col_b"));
+    }
+
+    #[test]
+    fn test_contains_concat_operator() {
+        // Expression without concat: a + b
+        let no_concat = Expr::Binary(
+            Box::new(Expr::Id(Name::from_string("a"))),
+            Operator::Add,
+            Box::new(Expr::Id(Name::from_string("b"))),
+        );
+        assert!(!contains_concat_operator(&no_concat));
+
+        // Expression with concat: a || b
+        let with_concat = Expr::Binary(
+            Box::new(Expr::Id(Name::from_string("a"))),
+            Operator::Concat,
+            Box::new(Expr::Id(Name::from_string("b"))),
+        );
+        assert!(contains_concat_operator(&with_concat));
+
+        // Nested expression with concat: (a + b) || c
+        let nested_concat = Expr::Binary(
+            Box::new(Expr::Parenthesized(vec![Box::new(Expr::Binary(
+                Box::new(Expr::Id(Name::from_string("a"))),
+                Operator::Add,
+                Box::new(Expr::Id(Name::from_string("b"))),
+            ))])),
+            Operator::Concat,
+            Box::new(Expr::Id(Name::from_string("c"))),
+        );
+        assert!(contains_concat_operator(&nested_concat));
+
+        // Concat nested inside non-concat: (a || b) + c
+        let concat_inside = Expr::Binary(
+            Box::new(Expr::Parenthesized(vec![Box::new(Expr::Binary(
+                Box::new(Expr::Id(Name::from_string("a"))),
+                Operator::Concat,
+                Box::new(Expr::Id(Name::from_string("b"))),
+            ))])),
+            Operator::Add,
+            Box::new(Expr::Id(Name::from_string("c"))),
+        );
+        assert!(contains_concat_operator(&concat_inside));
+
+        // Literal - no concat
+        let literal = Expr::Literal(ast::Literal::Numeric("42".to_string()));
+        assert!(!contains_concat_operator(&literal));
+    }
+
+    #[test]
+    fn test_has_transitive_concat() {
+        use ast::ColumnConstraint;
+
+        // Test setup:
+        // - col_a: BLOB (non-generated)
+        // - col_b: BLOB (non-generated)
+        // - col_c: BLOB AS (col_a || col_b) -- direct concat
+        // - col_d: BLOB AS (col_c)          -- transitive concat (references col_c)
+        // - col_e: BLOB AS (col_a)          -- no concat (just references non-concat column)
+        let columns = vec![
+            Column {
+                name: "col_a".to_string(),
+                column_type: ColumnType::Blob,
+                constraints: vec![],
+            },
+            Column {
+                name: "col_b".to_string(),
+                column_type: ColumnType::Blob,
+                constraints: vec![],
+            },
+            Column {
+                name: "col_c".to_string(),
+                column_type: ColumnType::Blob,
+                constraints: vec![ColumnConstraint::Generated {
+                    expr: Box::new(Expr::Binary(
+                        Box::new(Expr::Id(Name::from_string("col_a"))),
+                        Operator::Concat,
+                        Box::new(Expr::Id(Name::from_string("col_b"))),
+                    )),
+                    typ: None,
+                }],
+            },
+            Column {
+                name: "col_d".to_string(),
+                column_type: ColumnType::Blob,
+                constraints: vec![ColumnConstraint::Generated {
+                    expr: Box::new(Expr::Id(Name::from_string("col_c"))),
+                    typ: None,
+                }],
+            },
+            Column {
+                name: "col_e".to_string(),
+                column_type: ColumnType::Blob,
+                constraints: vec![ColumnConstraint::Generated {
+                    expr: Box::new(Expr::Id(Name::from_string("col_a"))),
+                    typ: None,
+                }],
+            },
+        ];
+
+        // col_c's expression has direct concat
+        let col_c_expr = columns[2].generated_expr().unwrap();
+        assert!(has_transitive_concat(col_c_expr, &columns));
+
+        // col_d's expression transitively has concat (via col_c)
+        let col_d_expr = columns[3].generated_expr().unwrap();
+        assert!(has_transitive_concat(col_d_expr, &columns));
+
+        // col_e's expression has no concat (just references col_a which is non-generated)
+        let col_e_expr = columns[4].generated_expr().unwrap();
+        assert!(!has_transitive_concat(col_e_expr, &columns));
+
+        // Direct expressions without column references
+        let no_concat = Expr::Binary(
+            Box::new(Expr::Id(Name::from_string("col_a"))),
+            Operator::Add,
+            Box::new(Expr::Id(Name::from_string("col_b"))),
+        );
+        assert!(!has_transitive_concat(&no_concat, &columns));
+
+        let with_concat = Expr::Binary(
+            Box::new(Expr::Id(Name::from_string("col_a"))),
+            Operator::Concat,
+            Box::new(Expr::Id(Name::from_string("col_b"))),
+        );
+        assert!(has_transitive_concat(&with_concat, &columns));
     }
 }
