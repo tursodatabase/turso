@@ -14,6 +14,22 @@ expect {
     1
 }
 
+test subquery-correlated-from-clause-nested {
+    create table t1 (name text, region text);
+    insert into t1 values ('Alice', 'North'), ('Bob', 'South');
+    select name, (
+        select region
+          from (select distinct region from t1 t2 where t2.name = t1.name)
+         limit 1
+      )
+      from t1
+     order by name;
+}
+expect {
+    Alice|North
+    Bob|South
+}
+
 test subquery-cte-available-in-arbitrary-depth {
     with cte as (select 1 as one)
     select onehundredandeleven+1 as onehundredandtwelve
