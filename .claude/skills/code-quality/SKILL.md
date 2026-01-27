@@ -69,7 +69,7 @@ Use if-statements only when both branches are expected paths.
 
 ## Ensure understanding of IO model
 
-- [Async IO model](./async-io-model.md)
+- [Async IO model](../async-io-model/SKILL.md)
 
 ## Cleanup
 
