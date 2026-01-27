@@ -403,7 +403,7 @@ pub fn translate_alter_table(
                 )
             }) {
                 return Err(LimboError::ParseError(
-                    "Cannot add a STORED generated column".to_string(),
+                    "cannot add a STORED column".to_string(),
                 ));
             }
             let constraints = col_def.constraints.clone();

@@ -487,21 +487,11 @@ impl<'a> ExprContext<'a> {
 
     /// Calculate comparison affinity for binary expressions.
     ///
-    /// According to SQLite: when comparing TEXT/BLOB to a numeric literal,
-    /// if the text looks like a number, use numeric affinity.
+    /// Determine the comparison affinity for two expressions according to SQLite rules.
+    /// SQLite uses column affinities to determine how values are compared.
     pub fn comparison_affinity(&self, lhs: &ast::Expr, rhs: &ast::Expr) -> Affinity {
         let lhs_aff = self.get_expr_affinity(lhs);
         let rhs_aff = self.get_expr_affinity(rhs);
-
-        // If one side is a numeric literal, use numeric affinity for proper coercion
-        // This matches SQLite behavior where TEXT compared to INTEGER literal uses numeric comparison
-        let lhs_is_numeric_lit = is_numeric_literal_expr(lhs);
-        let rhs_is_numeric_lit = is_numeric_literal_expr(rhs);
-
-        if lhs_is_numeric_lit || rhs_is_numeric_lit {
-            // At least one side is a numeric literal - use numeric affinity
-            return Affinity::Numeric;
-        }
 
         // Combine affinities according to SQLite rules
         if lhs_aff.has_affinity() && rhs_aff.has_affinity() {
@@ -6121,22 +6111,6 @@ pub fn get_expr_affinity(
         // Literals have NO affinity in SQLite!
         ast::Expr::Literal(_) => Affinity::Blob, // No affinity!
         _ => Affinity::Blob,                     // This may need to change. For now this works.
-    }
-}
-
-/// Check if an expression is a numeric literal.
-/// Used to determine comparison affinity - numeric literals don't have affinity,
-/// but when compared to a column, numeric comparison should be used.
-pub fn is_numeric_literal_expr(expr: &ast::Expr) -> bool {
-    match expr {
-        ast::Expr::Literal(ast::Literal::Numeric(_)) => true,
-        ast::Expr::Unary(ast::UnaryOperator::Negative | ast::UnaryOperator::Positive, inner) => {
-            is_numeric_literal_expr(inner)
-        }
-        ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => {
-            is_numeric_literal_expr(exprs.first().unwrap())
-        }
-        _ => false,
     }
 }
 
