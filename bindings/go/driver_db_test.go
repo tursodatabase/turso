@@ -1331,3 +1331,91 @@ func TestMultiStatementExecution(t *testing.T) {
 		}
 	})
 }
+
+func TestTimeValueRoundtrip(t *testing.T) {
+	db := openMem(t)
+
+	_, err := db.Exec(`CREATE TABLE time_test (
+		id INTEGER PRIMARY KEY,
+		created_at DATETIME,
+		updated_at DATETIME,
+		deleted_at TIMESTAMP
+	)`)
+	require.NoError(t, err)
+
+	// Use a fixed time for deterministic testing
+	// time.Time values are stored as RFC3339Nano strings
+	originalTime := time.Date(2024, 6, 15, 14, 30, 45, 123456789, time.UTC)
+	laterTime := originalTime.Add(24 * time.Hour)
+
+	// Insert using time.Time values
+	_, err = db.Exec(
+		`INSERT INTO time_test (id, created_at, updated_at, deleted_at) VALUES (?, ?, ?, ?)`,
+		1, originalTime, laterTime, nil,
+	)
+	require.NoError(t, err)
+
+	t.Run("scan into time.Time", func(t *testing.T) {
+		var id int
+		var createdAt, updatedAt time.Time
+		var deletedAt sql.NullTime
+
+		err := db.QueryRow(`SELECT id, created_at, updated_at, deleted_at FROM time_test WHERE id = 1`).
+			Scan(&id, &createdAt, &updatedAt, &deletedAt)
+		require.NoError(t, err)
+
+		require.Equal(t, 1, id)
+		require.True(t, originalTime.Equal(createdAt), "createdAt mismatch: expected %v, got %v", originalTime, createdAt)
+		require.True(t, laterTime.Equal(updatedAt), "updatedAt mismatch: expected %v, got %v", laterTime, updatedAt)
+		require.False(t, deletedAt.Valid, "deletedAt should be NULL")
+	})
+
+	t.Run("scan into string then parse", func(t *testing.T) {
+		var createdAtStr string
+		err := db.QueryRow(`SELECT created_at FROM time_test WHERE id = 1`).Scan(&createdAtStr)
+		require.NoError(t, err)
+
+		// Verify the stored format is RFC3339Nano
+		parsed, err := time.Parse(time.RFC3339Nano, createdAtStr)
+		require.NoError(t, err)
+		require.True(t, originalTime.Equal(parsed), "parsed time mismatch")
+	})
+
+	t.Run("update with time.Time", func(t *testing.T) {
+		newTime := originalTime.Add(48 * time.Hour)
+		_, err := db.Exec(`UPDATE time_test SET updated_at = ? WHERE id = ?`, newTime, 1)
+		require.NoError(t, err)
+
+		var updatedAt time.Time
+		err = db.QueryRow(`SELECT updated_at FROM time_test WHERE id = 1`).Scan(&updatedAt)
+		require.NoError(t, err)
+		require.True(t, newTime.Equal(updatedAt), "updated time mismatch")
+	})
+
+	t.Run("query with time.Time parameter", func(t *testing.T) {
+		// Insert another row
+		anotherTime := originalTime.Add(72 * time.Hour)
+		_, err := db.Exec(`INSERT INTO time_test (id, created_at) VALUES (?, ?)`, 2, anotherTime)
+		require.NoError(t, err)
+
+		// Query using time as parameter
+		var id int
+		err = db.QueryRow(`SELECT id FROM time_test WHERE created_at = ?`, originalTime).Scan(&id)
+		require.NoError(t, err)
+		require.Equal(t, 1, id)
+	})
+
+	t.Run("prepared statement with time.Time", func(t *testing.T) {
+		stmt, err := db.Prepare(`SELECT id, created_at FROM time_test WHERE created_at < ?`)
+		require.NoError(t, err)
+		defer stmt.Close()
+
+		cutoff := originalTime.Add(1 * time.Hour)
+		var id int
+		var createdAt time.Time
+		err = stmt.QueryRow(cutoff).Scan(&id, &createdAt)
+		require.NoError(t, err)
+		require.Equal(t, 1, id)
+		require.True(t, originalTime.Equal(createdAt))
+	})
+}
