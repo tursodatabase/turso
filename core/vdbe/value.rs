@@ -1091,7 +1091,7 @@ impl Value {
             // Fall through to regex if boundary check fails (multi-byte UTF-8)
         }
 
-        Ok(pattern_compare(pattern, text, escape))
+        Ok(pattern_compare(pattern, text, escape) == CompareResult::Match)
     }
 
     pub fn exec_min<'a, T: Iterator<Item = &'a Value>>(regs: T) -> Value {
@@ -1183,70 +1183,125 @@ impl Value {
     }
 }
 
-fn pattern_compare(mut pattern: &str, mut text: &str, escape: Option<char>) -> bool {
+#[derive(PartialEq)]
+enum CompareResult {
+    Match,
+    NoMatch,
+    NoWildcardMatch,
+}
+
+fn pattern_compare(mut pattern: &str, mut text: &str, escape: Option<char>) -> CompareResult {
     let match_all = '%';
     let match_one = '_';
 
-    while let Some(p_char) = pattern.chars().next() {
-        if let Some(esc) = escape {
-            if p_char == esc {
-                pattern = &pattern[p_char.len_utf8()..];
+    while !pattern.is_empty() {
+        let p_char = pattern.chars().next().unwrap();
 
-                if let Some(next_p_char) = pattern.chars().next() {
-                    pattern = &pattern[next_p_char.len_utf8()..];
-
-                    if let Some(t_char) = text.chars().next() {
-                        if !eq_ignore_ascii_case(next_p_char, t_char) {
-                            return false;
-                        }
-                        text = &text[t_char.len_utf8()..];
-                        continue;
+        if p_char == match_all && Some(p_char) != escape {
+            // Consume consecutive wildcards
+            let mut p_rest = &pattern[p_char.len_utf8()..];
+            while let Some(c) = p_rest.chars().next() {
+                let is_ma = c == match_all && Some(c) != escape;
+                let is_mo = c == match_one && Some(c) != escape;
+                if !is_ma && !is_mo {
+                    break;
+                }
+                if is_mo {
+                    if let Some(t_c) = text.chars().next() {
+                        text = &text[t_c.len_utf8()..];
+                    } else {
+                        return CompareResult::NoWildcardMatch;
                     }
                 }
-                return false;
+                p_rest = &p_rest[c.len_utf8()..];
+            }
+            pattern = p_rest;
+
+            if pattern.is_empty() {
+                return CompareResult::Match;
+            }
+
+            let next_p_char = pattern.chars().next().unwrap();
+            let (literal, is_escaped) = if Some(next_p_char) == escape {
+                let after = &pattern[next_p_char.len_utf8()..];
+                if let Some(l) = after.chars().next() {
+                    (l, true)
+                } else {
+                    return CompareResult::NoMatch;
+                }
+            } else {
+                (next_p_char, false)
+            };
+
+            // Advance pattern past the literal we are looking for
+            let pattern_next = if is_escaped {
+                &pattern[next_p_char.len_utf8() + literal.len_utf8()..]
+            } else {
+                &pattern[next_p_char.len_utf8()..]
+            };
+
+            let mut search_text = text;
+            loop {
+                if let Some(idx) = search_text.find(|c: char| eq_ignore_ascii_case(c, literal)) {
+                    let (_, rest) = search_text.split_at(idx);
+                    // Skip the literal in text (mimicking SQLite's zString++ after strcspn)
+                    let c_len = rest.chars().next().unwrap().len_utf8();
+                    let text_next = &rest[c_len..];
+
+                    let match_result = pattern_compare(pattern_next, text_next, escape);
+                    if match_result != CompareResult::NoMatch {
+                        return match_result; // Propagate Match or NoWildcardMatch (Abort)
+                    }
+
+                    // Advance search_text to try next position
+                    search_text = text_next;
+                } else {
+                    // Literal not found in remaining text - Abort entire search
+                    return CompareResult::NoWildcardMatch;
+                }
             }
         }
 
-        if p_char == match_all {
-            while pattern.starts_with(match_all) {
-                pattern = &pattern[match_all.len_utf8()..];
-            }
-
-            if pattern.is_empty() {
-                return true;
-            }
-
-            if pattern_compare(pattern, text, escape) {
-                return true;
-            }
-
-            for (idx, c) in text.char_indices() {
-                let next_idx = idx + c.len_utf8();
-
-                if pattern_compare(pattern, &text[next_idx..], escape) {
-                    return true;
+        if Some(p_char) == escape {
+            pattern = &pattern[p_char.len_utf8()..];
+            if let Some(next_p_char) = pattern.chars().next() {
+                pattern = &pattern[next_p_char.len_utf8()..];
+                if let Some(t_char) = text.chars().next() {
+                    text = &text[t_char.len_utf8()..];
+                    if !eq_ignore_ascii_case(next_p_char, t_char) {
+                        return CompareResult::NoMatch;
+                    }
+                    continue;
                 }
             }
-            return false;
-        } else if p_char == match_one {
+            return CompareResult::NoMatch;
+        }
+
+        if p_char == match_one {
+            pattern = &pattern[p_char.len_utf8()..];
             if let Some(t_char) = text.chars().next() {
                 text = &text[t_char.len_utf8()..];
-                pattern = &pattern[p_char.len_utf8()..];
-            } else {
-                return false;
+                continue;
             }
-        } else if let Some(t_char) = text.chars().next() {
-            if !eq_ignore_ascii_case(p_char, t_char) {
-                return false;
-            }
+            return CompareResult::NoMatch;
+        }
+
+        pattern = &pattern[p_char.len_utf8()..];
+        if let Some(t_char) = text.chars().next() {
             text = &text[t_char.len_utf8()..];
-            pattern = &pattern[p_char.len_utf8()..];
+            if !eq_ignore_ascii_case(p_char, t_char) {
+                return CompareResult::NoMatch;
+            }
         } else {
-            return false;
+            return CompareResult::NoMatch;
         }
     }
 
-    text.is_empty()
+    if text.is_empty() {
+        CompareResult::Match
+    } else {
+        CompareResult::NoMatch
+    }
 }
 
 fn eq_ignore_ascii_case(a: char, b: char) -> bool {
