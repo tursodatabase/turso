@@ -351,7 +351,7 @@ impl ProgramBuilder {
             next_hash_table_id: HASH_TABLE_ID_BASE,
             insns: Vec::with_capacity(opts.approx_num_insns),
             cursor_ref: Vec::with_capacity(opts.num_cursors),
-            auto_analyze_scan_flags: HashMap::with_capacity_and_hasher(5, FxBuildHasher::default()),
+            auto_analyze_scan_flags: HashMap::with_capacity_and_hasher(5, FxBuildHasher),
             constant_spans: Vec::new(),
             label_to_resolved_offset: Vec::with_capacity(opts.approx_num_labels),
             seekrowid_emitted_bitmask: 0,
