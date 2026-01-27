@@ -1,145 +1,68 @@
-// TODO: Add more logs and tracing
+// Windows IOCP Cycle
+// ===================
+//
+//                                   pread/pwrite
+//                                        |
+//                                        |      Get Packet
+//                  Completion -----> IO Packet <-----------|
+//                                        |                 |
+//                         |<-- Track ----+                 |
+//                         |              |                 |
+//                    ==========      Issuing IO        ==========
+//                    [||||||||]        queue           ||||||||||
+//                    ==========          |             ==========
+//                     Tracked        ( Windows )     Free IO Packets
+//                     Packets            |                 |
+//                         |              |                 |
+//              Cancel     |   Untrack    |                 |
+//            ------------>|=============>|.................|
+//                         |              |                 |
+//                         |   Untrack    |      Reuse      |
+//                         |-----------> Step ------------->|
+//                                        |      Packet
+//                                        |
+//                                   To Completion
+//
+//
 use crate::io::clock::{DefaultClock, MonotonicInstant, WallClockInstant};
 use crate::sync::Arc;
 
 use crate::sync::{Mutex, RwLock};
-use crate::{Clock, Completion, CompletionError, File, LimboError, OpenFlags, Result, IO};
+use crate::{Clock, Completion, File, LimboError, OpenFlags, Result, IO};
 
 use smallvec::SmallVec;
 use std::collections::{HashMap, VecDeque};
 use std::ptr::NonNull;
 use windows_sys::core::BOOL;
 
-use std::{ptr, u32};
+use std::{io, ptr, u32};
 use tracing::{debug, instrument, trace, warn, Level};
 
 use windows_sys::Win32::Foundation::{
     CloseHandle, GetLastError, ERROR_IO_PENDING, ERROR_OPERATION_ABORTED, FALSE, GENERIC_READ,
-    GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE, MAX_PATH, TRUE, WAIT_TIMEOUT,
+    GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE, TRUE, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, FileEndOfFileInfo, FlushFileBuffers, GetFileSizeEx, LockFile, ReadFile,
-    SetFileInformationByHandle, UnlockFile, WriteFile, FILE_END_OF_FILE_INFO,
+    CreateFileW, FileEndOfFileInfo, FlushFileBuffers, GetFileSizeEx, LockFileEx, ReadFile,
+    SetFileInformationByHandle, UnlockFileEx, WriteFile, FILE_END_OF_FILE_INFO,
     FILE_FLAG_NO_BUFFERING, FILE_FLAG_OVERLAPPED, FILE_FLAG_WRITE_THROUGH, FILE_SHARE_DELETE,
     FILE_SHARE_READ, FILE_SHARE_WRITE, LOCKFILE_EXCLUSIVE_LOCK, OPEN_ALWAYS, OPEN_EXISTING,
 };
 use windows_sys::Win32::System::IO::{
-    CancelIo, CancelIoEx, CreateIoCompletionPort, GetQueuedCompletionStatus, OVERLAPPED,
-    OVERLAPPED_0, OVERLAPPED_0_0,
+    CancelIo, CancelIoEx, CreateIoCompletionPort, GetOverlappedResult, GetQueuedCompletionStatus,
+    OVERLAPPED, OVERLAPPED_0, OVERLAPPED_0_0,
 };
 
+// Constants
+
+const CACHING_CAPACITY: usize = 128;
+
+// Types
+
 #[derive(Clone)]
-struct IORequest {
-    handle: HANDLE,
-    ovl: Arc<IoOverlapped>,
-}
-
-fn get_key(c: &Completion) -> usize {
-    Arc::as_ptr(c.get_inner()) as usize
-}
-
-fn consume_and_get_ptr(c: Completion) -> usize {
-    Arc::into_raw(c.get_inner().clone()) as usize
-}
-
-fn restore_and_forget(key: usize) {
-    unsafe { Arc::from_raw(key as *const Completion) };
-}
-
-pub struct WindowsIOCP {
-    inner: Arc<InnerWindowsIOCP>,
-}
-
-#[repr(C)]
-struct IoOverlapped {
-    ov: OVERLAPPED,
-    completion: Option<Completion>,
-}
-
-pub struct InnerWindowsIOCP {
-    handle: HANDLE,
-    free_ovs: Mutex<VecDeque<Arc<IoOverlapped>>>,
-    tracked_ovs: RwLock<HashMap<usize, IORequest>>,
-}
-
-impl InnerWindowsIOCP {
-    fn new(handle: HANDLE) -> Arc<Self> {
-        let mut vecq = VecDeque::with_capacity(128);
-
-        for _ in 0..128 {
-            vecq.push_back(Arc::new(IoOverlapped {
-                ov: OVERLAPPED::default(),
-                completion: None,
-            }));
-        }
-
-        Arc::new(Self {
-            handle,
-            free_ovs: Mutex::new(vecq),
-            tracked_ovs: RwLock::new(HashMap::with_capacity(128)),
-        })
-    }
-
-    fn salvage_or_create_overlapped(&self, c: Completion, pos: u64) -> Arc<IoOverlapped> {
-        let low = pos as u32;
-        let high = (pos >> 32) as u32;
-
-        let mut ovl = self.free_ovs.lock().pop_front().unwrap_or_else(|| {
-            Arc::new(IoOverlapped {
-                ov: OVERLAPPED::default(),
-                completion: None,
-            })
-        });
-
-        let content =
-            Arc::get_mut(&mut ovl).expect("This object should have no references elsewhere");
-
-        *content = IoOverlapped {
-            completion: Some(c),
-            ov: OVERLAPPED {
-                Anonymous: OVERLAPPED_0 {
-                    Anonymous: OVERLAPPED_0_0 {
-                        Offset: low,
-                        OffsetHigh: high,
-                    },
-                },
-                ..Default::default()
-            },
-        };
-        ovl
-    }
-
-    fn track_overlapped(&self, handle: HANDLE, ovl: Arc<IoOverlapped>) -> Option<()> {
-        let completion = ovl.completion.as_ref()?.clone();
-        let key = consume_and_get_ptr(completion);
-
-        self.tracked_ovs
-            .write()
-            .insert(key, IORequest { handle, ovl });
-
-        Some(())
-    }
-
-    fn forget_overlapped(&self, mut ovl: Arc<IoOverlapped>) -> Option<Completion> {
-        let key = {
-            let ov = ovl.completion.as_ref()?;
-            get_key(ov)
-        };
-
-        if let Some((key, _val)) = self.tracked_ovs.write().remove_entry(&key) {
-            restore_and_forget(key);
-        }
-
-        let cmpl = Arc::get_mut(&mut ovl)?.completion.take()?;
-
-        self.free_ovs.lock().push_back(ovl);
-        Some(cmpl)
-    }
-
-    fn pop_io_request_from_completion(&self, c: &Completion) -> Option<IORequest> {
-        let key = get_key(c);
-        self.tracked_ovs.write().remove(&key)
-    }
+struct IoContext {
+    file_handle: HANDLE,
+    io_packet: IoPacket,
 }
 
 enum GetIOCPPacketError {
@@ -149,29 +72,66 @@ enum GetIOCPPacketError {
     InvalidIO,
 }
 
+#[repr(C)]
+struct IoOverlappedPacket {
+    overlapped: OVERLAPPED,
+    completion: Option<Completion>,
+}
+
+type IoPacket = Arc<IoOverlappedPacket>;
+type CompletionKey = usize;
+
+// Functions
+
+fn get_unique_key_from_completion(c: &Completion) -> CompletionKey {
+    Arc::as_ptr(c.get_inner()).addr()
+}
+
+fn add_ref_completion_pointer_and_get_key(c: Completion) -> CompletionKey {
+    Arc::into_raw(c.get_inner().clone()).addr()
+}
+
+fn restore_and_consume_completion_ptr(key: CompletionKey) {
+    let arc = unsafe { Arc::from_raw(key as *const Completion) };
+    drop(arc)
+}
+
+fn get_limboerror_from_os_err() -> LimboError {
+    let error_code = unsafe { GetLastError() } as i32;
+    let error = std::io::Error::from_raw_os_error(error_code);
+    error.into()
+}
+
+// Windows IOCP
+
+pub struct WindowsIOCP {
+    instance: Arc<InnerWindowsIOCP>,
+}
+
 impl WindowsIOCP {
     pub fn new() -> Result<Self> {
         debug!("Using IO backend 'win_iocp'");
 
-        let handle = unsafe { CreateIoCompletionPort(INVALID_HANDLE_VALUE, ptr::null_mut(), 0, 0) };
-        if handle == INVALID_HANDLE_VALUE {
+        let iocp_queue_handle =
+            unsafe { CreateIoCompletionPort(INVALID_HANDLE_VALUE, ptr::null_mut(), 0, 0) };
+        if iocp_queue_handle == INVALID_HANDLE_VALUE {
             return Err(LimboError::NullValue);
         }
         Ok(Self {
-            inner: InnerWindowsIOCP::new(handle),
+            instance: InnerWindowsIOCP::new(iocp_queue_handle),
         })
     }
 
     fn process_packet_from_iocp(&self) -> Result<(), GetIOCPPacketError> {
         let mut overlapped_ptr = ptr::null_mut();
-        let mut bytes = 0;
-        let mut key = 0;
+        let mut bytes_recieved = 0;
+        let mut iocp_key = 0;
 
         let result = unsafe {
             GetQueuedCompletionStatus(
-                self.inner.handle,
-                &raw mut bytes,
-                &raw mut key,
+                self.instance.iocp_queue_handle,
+                &raw mut bytes_recieved,
+                &raw mut iocp_key,
                 &raw mut overlapped_ptr,
                 0,
             )
@@ -188,24 +148,36 @@ impl WindowsIOCP {
             });
         };
 
-        let overlapped = unsafe { Arc::<IoOverlapped>::from_raw(overlapped_ptr.as_ptr().cast()) };
+        let io_packet = unsafe { IoPacket::from_raw(overlapped_ptr.as_ptr().cast()) };
+
         let completion = self
-            .inner
-            .forget_overlapped(overlapped)
+            .instance
+            .forget_io_packet(io_packet)
             .ok_or(GetIOCPPacketError::InvalidIO)?;
 
         match (result, error) {
             (TRUE, _) => {
-                let bytes = bytes as i32;
-                completion.complete(bytes);
+                trace!(
+                    "completion {} completed",
+                    get_unique_key_from_completion(&completion)
+                );
+                completion.complete(bytes_recieved as i32);
             }
             (FALSE, ERROR_OPERATION_ABORTED) => {
+                trace!(
+                    "completion {} cancelled",
+                    get_unique_key_from_completion(&completion)
+                );
                 completion.abort();
             }
-            (FALSE, error) => {
-                let error = error as i32;
-                let err = std::io::Error::from_raw_os_error(error);
-                completion.error(err.into());
+            (FALSE, error_code) => {
+                let error = io::Error::from_raw_os_error(error_code as i32);
+                trace!(
+                    "completion {} errored {error}",
+                    get_unique_key_from_completion(&completion)
+                );
+
+                completion.error(error.into());
             }
             (_, _) => unreachable!(),
         }
@@ -219,87 +191,94 @@ crate::assert::assert_send_sync!(WindowsIOCP);
 
 impl IO for WindowsIOCP {
     #[instrument(skip_all, level = Level::TRACE)]
-    fn open_file(&self, path: &str, flags: OpenFlags, direct: bool) -> Result<Arc<dyn File>> {
-        debug!("open_file(path = {})", path);
+    fn open_file(
+        &self,
+        file_path: &str,
+        open_flags: OpenFlags,
+        direct_access: bool,
+    ) -> Result<Arc<dyn File>> {
+        debug!("open_file(path = {})", file_path);
 
-        let vec: SmallVec<[u16; 1024]> = SmallVec::new();
+        let path_unicode: SmallVec<[u16; 1024]> = SmallVec::new();
 
-        let encoded_path = path
-            .encode_utf16()
-            .chain(std::iter::once(0))
-            .fold(vec, |mut acc, v| {
-                acc.push(v);
-                acc
-            });
+        let unicode_path =
+            file_path
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .fold(path_unicode, |mut acc, v| {
+                    acc.push(v);
+                    acc
+                });
 
         let mut desired_access = 0;
         let mut creation_disposition = 0;
-        desired_access |= if flags.contains(OpenFlags::ReadOnly) {
+
+        desired_access |= if open_flags.contains(OpenFlags::ReadOnly) {
             GENERIC_READ
         } else {
             GENERIC_WRITE | GENERIC_READ
         };
 
-        creation_disposition |= if flags.contains(OpenFlags::Create) {
+        creation_disposition |= if open_flags.contains(OpenFlags::Create) {
             OPEN_ALWAYS
         } else {
             OPEN_EXISTING
         };
 
-        let flags = if direct {
+        let flags_and_attributes = if direct_access {
             FILE_FLAG_OVERLAPPED | FILE_FLAG_NO_BUFFERING | FILE_FLAG_WRITE_THROUGH
         } else {
             FILE_FLAG_OVERLAPPED
         };
 
         unsafe {
-            let file = CreateFileW(
-                encoded_path.as_ptr(),
+            let file_handle = CreateFileW(
+                unicode_path.as_ptr(),
                 desired_access,
                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                 ptr::null(),
                 creation_disposition,
-                flags,
+                flags_and_attributes,
                 ptr::null_mut(),
             );
 
-            if file == INVALID_HANDLE_VALUE {
-                return Err(LimboError::InternalError(format!(
-                    "CreatFile failed: {}",
-                    GetLastError()
-                )));
+            if file_handle == INVALID_HANDLE_VALUE {
+                return Err(get_limboerror_from_os_err());
             };
 
             // Bind file to IOCP
-            let result = CreateIoCompletionPort(file, self.inner.handle, 0, 0);
+            let result = CreateIoCompletionPort(file_handle, self.instance.iocp_queue_handle, 0, 0);
 
             if result.is_null() {
-                return Err(LimboError::InternalError(format!(
-                    "CreatFile failed: {}",
-                    GetLastError()
-                )));
+                return Err(get_limboerror_from_os_err());
             };
 
             Ok(Arc::new(WindowsFile {
-                handle: file,
-                iocp: self.inner.clone(),
+                file_handle,
+                parent_io: self.instance.clone(),
             }))
         }
     }
 
     #[instrument(err, skip_all, level = Level::TRACE)]
-    fn remove_file(&self, path: &str) -> Result<()> {
-        trace!("remove_file(path = {})", path);
-        Ok(std::fs::remove_file(path)?)
+    fn remove_file(&self, file_path: &str) -> Result<()> {
+        trace!("remove_file(path = {})", file_path);
+        Ok(std::fs::remove_file(file_path)?)
     }
 
     #[instrument(err, skip_all, level = Level::TRACE)]
     fn cancel(&self, completions: &[Completion]) -> Result<()> {
         for c in completions {
-            if let Some(IORequest { handle, ovl }) = self.inner.pop_io_request_from_completion(c) {
+            trace!("cancelling {}", get_unique_key_from_completion(&c));
+            if let Some(IoContext {
+                file_handle,
+                io_packet,
+            }) = self.instance.pop_io_context_from_completion(c)
+            {
                 unsafe {
-                    if FALSE == CancelIoEx(handle, &ovl.ov as *const OVERLAPPED) {
-                        trace!("CancelIoEx failed:{:x}", GetLastError());
+                    if CancelIoEx(file_handle, &raw const io_packet.overlapped) == 0 {
+                        trace!("CancelIoEx failed:{}.. Ignored", GetLastError());
+                        c.abort();
                     };
                 }
             } else {
@@ -311,9 +290,19 @@ impl IO for WindowsIOCP {
 
     #[instrument(err, skip_all, level = Level::TRACE)]
     fn drain(&self) -> Result<()> {
+        trace!("I/O drainning..");
+
         loop {
-            if let Err(GetIOCPPacketError::Empty) = self.process_packet_from_iocp() {
-                break;
+            match self.process_packet_from_iocp() {
+                Err(GetIOCPPacketError::Empty | GetIOCPPacketError::Aborted) => {
+                    break;
+                }
+                Err(GetIOCPPacketError::SystemError(e)) => {
+                    let error = e as i32;
+                    let err = std::io::Error::from_raw_os_error(error);
+                    return Err(err.into());
+                }
+                Err(GetIOCPPacketError::InvalidIO) | Ok(()) => {}
             }
         }
         Ok(())
@@ -321,15 +310,14 @@ impl IO for WindowsIOCP {
 
     #[instrument(err, skip_all, level = Level::TRACE)]
     fn step(&self) -> Result<()> {
-        let _ = self.process_packet_from_iocp();
-        Ok(())
-    }
-}
+        trace!("I/O Step..");
 
-impl Drop for InnerWindowsIOCP {
-    fn drop(&mut self) {
-        unsafe {
-            CloseHandle(self.handle);
+        match self.process_packet_from_iocp() {
+            Err(GetIOCPPacketError::SystemError(_code)) => Err(get_limboerror_from_os_err()),
+            Err(GetIOCPPacketError::Aborted)
+            | Err(GetIOCPPacketError::Empty)
+            | Err(GetIOCPPacketError::InvalidIO)
+            | Ok(()) => Ok(()),
         }
     }
 }
@@ -344,43 +332,185 @@ impl Clock for WindowsIOCP {
     }
 }
 
+// Inner IOCP
+//
+pub struct InnerWindowsIOCP {
+    iocp_queue_handle: HANDLE,
+    free_io_packets: Mutex<VecDeque<IoPacket>>,
+    tracked_io_packets: Mutex<HashMap<CompletionKey, IoContext>>,
+}
+
+unsafe impl Send for InnerWindowsIOCP {}
+unsafe impl Sync for InnerWindowsIOCP {}
+crate::assert::assert_send_sync!(WindowsFile);
+
+impl InnerWindowsIOCP {
+    fn new(iocp_handle: HANDLE) -> Arc<Self> {
+        let mut free_packets = VecDeque::with_capacity(CACHING_CAPACITY);
+
+        for _ in 0..CACHING_CAPACITY {
+            free_packets.push_back(Arc::new(IoOverlappedPacket {
+                overlapped: OVERLAPPED::default(),
+                completion: None,
+            }));
+        }
+
+        Arc::new(Self {
+            iocp_queue_handle: iocp_handle,
+            free_io_packets: Mutex::new(free_packets),
+            tracked_io_packets: Mutex::new(HashMap::with_capacity(CACHING_CAPACITY)),
+        })
+    }
+
+    fn salvage_or_create_io_packet(&self) -> IoPacket {
+        self.free_io_packets.lock().pop_front().unwrap_or_else(|| {
+            Arc::new(IoOverlappedPacket {
+                overlapped: OVERLAPPED::default(),
+                completion: None,
+            })
+        })
+    }
+
+    fn salvage_or_create_io_packet_from_completion(
+        &self,
+        completion: Completion,
+        position: u64,
+    ) -> IoPacket {
+        trace!("new salvaged overlapped packet. ");
+
+        let mut packet = self.salvage_or_create_io_packet();
+
+        assert!(packet.completion.is_none());
+
+        let content =
+            Arc::get_mut(&mut packet).expect("This object should have no references elsewhere");
+
+        let low_part = position as u32;
+        let high_part = (position >> 32) as u32;
+
+        *content = IoOverlappedPacket {
+            completion: Some(completion),
+            overlapped: OVERLAPPED {
+                Anonymous: OVERLAPPED_0 {
+                    Anonymous: OVERLAPPED_0_0 {
+                        Offset: low_part,
+                        OffsetHigh: high_part,
+                    },
+                },
+                ..Default::default()
+            },
+        };
+        packet
+    }
+
+    fn map_completion_to_io_packet(&self, file_handle: HANDLE, io_packet: IoPacket) -> bool {
+        if let Some(completion) = io_packet.completion.as_ref().cloned() {
+            let completion_key = add_ref_completion_pointer_and_get_key(completion);
+            trace!("tracked completion for {completion_key}");
+            self.tracked_io_packets.lock().insert(
+                completion_key,
+                IoContext {
+                    file_handle,
+                    io_packet,
+                },
+            );
+            return true;
+        }
+
+        false
+    }
+
+    fn forget_io_packet(&self, mut io_packet: IoPacket) -> Option<Completion> {
+        trace!("forget packet and completion");
+
+        if let Some(packet) = io_packet.completion.as_ref() {
+            self.pop_io_context_from_completion(packet);
+        }
+
+        let completion = Arc::get_mut(&mut io_packet)?.completion.take();
+        assert_eq!(Arc::strong_count(&io_packet), 1);
+        self.free_io_packets.lock().push_back(io_packet);
+        completion
+    }
+
+    fn pop_io_context_from_completion(&self, completion: &Completion) -> Option<IoContext> {
+        let key = get_unique_key_from_completion(completion);
+        if let Some((key, context)) = self.tracked_io_packets.lock().remove_entry(&key) {
+            trace!("untrack completion for {key}");
+            restore_and_consume_completion_ptr(key);
+            return Some(context);
+        }
+        None
+    }
+}
+
+impl Drop for InnerWindowsIOCP {
+    fn drop(&mut self) {
+        trace!("Dropping Windows IOCP Queue..");
+
+        assert!(self.tracked_io_packets.lock().is_empty());
+
+        unsafe {
+            CloseHandle(self.iocp_queue_handle);
+        }
+    }
+}
+
+// Windows File
+
 pub struct WindowsFile {
-    handle: HANDLE,
-    iocp: Arc<InnerWindowsIOCP>,
+    file_handle: HANDLE,
+    parent_io: Arc<InnerWindowsIOCP>,
 }
 
 impl WindowsFile {
-    fn generate_overlapped(&self, pos: u64, c: Completion) -> Arc<IoOverlapped> {
-        self.iocp.salvage_or_create_overlapped(c, pos)
-    }
-
-    fn perform_iocp_operation(
-        &self,
-        pos: u64,
-        c: Completion,
-        io_func: impl Fn(*mut OVERLAPPED) -> BOOL,
-    ) -> () {
-        if c.finished() {
-            return;
-        }
-
-        let overlapped = self.generate_overlapped(pos, c.clone());
-        let overlapped_ptr = Arc::into_raw(overlapped.clone()).cast_mut() as *mut OVERLAPPED;
-        self.iocp.track_overlapped(self.handle, overlapped);
-
+    fn sync_iocp_operation(&self, io_function: impl Fn(*mut OVERLAPPED) -> BOOL) -> Result<()> {
+        let mut bytes = 0;
+        let packet_io = self.parent_io.salvage_or_create_io_packet();
+        let overlapped_ptr = Arc::into_raw(packet_io.clone()) as *mut OVERLAPPED;
         unsafe {
-            if io_func(overlapped_ptr) != FALSE || GetLastError() != ERROR_IO_PENDING {
-                let arc = Arc::from_raw(overlapped_ptr as *mut IoOverlapped);
-                let error = GetLastError() as i32;
-                let err = std::io::Error::from_raw_os_error(error);
-                let completion = self
-                    .iocp
-                    .forget_overlapped(arc)
-                    .expect("Completion should be single-referenced and tracked");
-                completion.error(err.into());
-                return;
+            if io_function(overlapped_ptr) != FALSE || GetLastError() != ERROR_IO_PENDING {
+                let io_packet = Arc::from_raw(overlapped_ptr as *mut IoOverlappedPacket);
+                let _ = self.parent_io.forget_io_packet(io_packet);
+                return Err(get_limboerror_from_os_err());
+            }
+
+            if GetOverlappedResult(self.file_handle, overlapped_ptr, &raw mut bytes, TRUE) == FALSE
+            {
+                return Err(get_limboerror_from_os_err());
             }
         }
+
+        Ok(())
+    }
+
+    fn async_iocp_operation(
+        &self,
+        position: u64,
+        completion: Completion,
+        io_function: impl Fn(*mut OVERLAPPED) -> BOOL,
+    ) -> Result<Completion> {
+        let packet_io = self
+            .parent_io
+            .salvage_or_create_io_packet_from_completion(completion.clone(), position);
+
+        let overlapped_ptr = Arc::into_raw(packet_io.clone()) as *mut OVERLAPPED;
+
+        if !self
+            .parent_io
+            .map_completion_to_io_packet(self.file_handle, packet_io)
+        {
+            return Err(LimboError::InvalidArgument("Invalid Completion".into()));
+        }
+
+        unsafe {
+            if io_function(overlapped_ptr) != FALSE || GetLastError() != ERROR_IO_PENDING {
+                let io_packet = Arc::from_raw(overlapped_ptr as *mut IoOverlappedPacket);
+                let _ = self.parent_io.forget_io_packet(io_packet);
+                return Err(get_limboerror_from_os_err());
+            }
+        }
+        Ok(completion)
     }
 }
 
@@ -390,221 +520,145 @@ crate::assert::assert_send_sync!(WindowsFile);
 
 impl File for WindowsFile {
     #[instrument(err, skip_all, level = Level::TRACE)]
-    fn lock_file(&self, exclusive: bool) -> Result<()> {
-        let flags = if exclusive {
+    fn lock_file(&self, exclusive_access: bool) -> Result<()> {
+        trace!(
+            "locking file {:08X} [ {}exclusively ]..",
+            self.file_handle.addr(),
+            if exclusive_access { "" } else { "non-" }
+        );
+
+        let locking_flags = if exclusive_access {
             LOCKFILE_EXCLUSIVE_LOCK
         } else {
             0
         };
 
-        unsafe {
-            if FALSE == LockFile(self.handle, flags, 0, u32::MAX, u32::MAX) {
-                return Err(LimboError::InternalError(format!(
-                    "UnlockFile failed:{:x}",
-                    GetLastError()
-                )));
-            }
-        }
-        Ok(())
+        self.sync_iocp_operation(|overlapped| unsafe {
+            LockFileEx(
+                self.file_handle,
+                locking_flags,
+                0,
+                u32::MAX,
+                u32::MAX,
+                overlapped,
+            )
+        })
     }
 
     #[instrument(err, skip_all, level = Level::TRACE)]
     fn unlock_file(&self) -> Result<()> {
-        unsafe {
-            if FALSE == UnlockFile(self.handle, 0, 0, u32::MAX, u32::MAX) {
-                return Err(LimboError::InternalError(format!(
-                    "UnlockFile failed:{:x}",
-                    GetLastError()
-                )));
-            }
-        }
-
-        Ok(())
+        trace!("Unlocking file {:08X}", self.file_handle.addr());
+        self.sync_iocp_operation(|overlapped| unsafe {
+            UnlockFileEx(self.file_handle, 0, u32::MAX, u32::MAX, overlapped)
+        })
     }
 
-    #[instrument(skip(self, c), level = Level::TRACE)]
-    fn pread(&self, pos: u64, c: Completion) -> Result<Completion> {
-        let read = c.as_read();
+    #[instrument(skip(self, completion), level = Level::TRACE)]
+    fn pread(&self, position: u64, completion: Completion) -> Result<Completion> {
+        trace!(
+            "pread for handle {:08X} with completion {}",
+            self.file_handle.addr(),
+            get_unique_key_from_completion(&completion)
+        );
+        let read = completion.as_read();
         let buf = read.buf();
         let ptr = buf.as_mut_ptr();
         let len = buf.len().try_into().map_err(|_| LimboError::TooBig)?;
 
-        self.perform_iocp_operation(pos, c.clone(), |ov| unsafe {
-            ReadFile(self.handle, ptr, len, ptr::null_mut(), ov)
-        });
-        Ok(c)
+        self.async_iocp_operation(position, completion.clone(), |overlapped| unsafe {
+            ReadFile(self.file_handle, ptr, len, ptr::null_mut(), overlapped)
+        })
     }
 
-    #[instrument(skip(self, c, buffer), level = Level::TRACE)]
-    fn pwrite(&self, pos: u64, buffer: Arc<crate::Buffer>, c: Completion) -> Result<Completion> {
-        let ptr = buffer.as_mut_ptr();
-        let len = buffer.len().try_into().map_err(|_| LimboError::TooBig)?;
+    #[instrument(skip(self, completion, buffer), level = Level::TRACE)]
+    fn pwrite(
+        &self,
+        position: u64,
+        buffer: Arc<crate::Buffer>,
+        completion: Completion,
+    ) -> Result<Completion> {
+        trace!(
+            "pwrite for handle {:08X} with completion {}",
+            self.file_handle.addr(),
+            get_unique_key_from_completion(&completion)
+        );
+        let buf_ptr = buffer.as_mut_ptr();
+        let buf_len = buffer.len().try_into().map_err(|_| LimboError::TooBig)?;
 
-        self.perform_iocp_operation(pos, c.clone(), |ov| unsafe {
-            WriteFile(self.handle, ptr, len, ptr::null_mut(), ov)
-        });
-        Ok(c)
+        self.async_iocp_operation(position, completion.clone(), |overlapped| unsafe {
+            WriteFile(
+                self.file_handle,
+                buf_ptr,
+                buf_len,
+                ptr::null_mut(),
+                overlapped,
+            )
+        })
     }
 
     #[instrument(err, skip_all, level = Level::TRACE)]
-    fn sync(&self, c: Completion) -> Result<Completion> {
-        if c.finished() {
-            return Err(LimboError::CompletionError(CompletionError::Aborted));
-        }
+    fn sync(&self, completion: Completion) -> Result<Completion> {
+        trace!(
+            "sync for handle {:08X} with completion {}",
+            self.file_handle.addr(),
+            get_unique_key_from_completion(&completion)
+        );
 
         unsafe {
-            if FALSE == FlushFileBuffers(self.handle) {
-                println!("FlushFileBuffers failed:{:x}", GetLastError());
-
-                return Err(LimboError::InternalError(format!(
-                    "FlushFileBuffers failed:{:x}",
-                    GetLastError()
-                )));
+            if FALSE == FlushFileBuffers(self.file_handle) {
+                return Err(get_limboerror_from_os_err());
             }
         };
-        c.complete(0);
-        Ok(c)
+        completion.complete(0);
+        Ok(completion)
     }
 
     #[instrument(err, skip_all, level = Level::TRACE)]
-    fn truncate(&self, len: u64, c: Completion) -> Result<Completion> {
-        if c.finished() {
-            return Err(LimboError::CompletionError(CompletionError::Aborted));
-        }
+    fn truncate(&self, length: u64, completion: Completion) -> Result<Completion> {
+        trace!(
+            "truncate for handle {:08X} with completion {}",
+            self.file_handle.addr(),
+            get_unique_key_from_completion(&completion)
+        );
 
         unsafe {
-            let len = len.try_into().map_err(|_| LimboError::TooBig)?;
+            let length = length.try_into().map_err(|_| LimboError::TooBig)?;
 
-            let data = FILE_END_OF_FILE_INFO { EndOfFile: len };
-            if FALSE
-                == SetFileInformationByHandle(
-                    self.handle,
-                    FileEndOfFileInfo,
-                    (&raw const data).cast(),
-                    size_of_val(&data) as u32,
-                )
+            let file_info = FILE_END_OF_FILE_INFO { EndOfFile: length };
+            if SetFileInformationByHandle(
+                self.file_handle,
+                FileEndOfFileInfo,
+                (&raw const file_info).cast(),
+                size_of_val(&file_info) as u32,
+            ) == FALSE
             {
-                println!("SetFileInformationByHandle failed:{:x}", GetLastError());
-                return Err(LimboError::InternalError(format!(
-                    "SetFileInformationByHandle failed:{:x}",
-                    GetLastError()
-                )));
+                return Err(get_limboerror_from_os_err());
             }
         }
-        c.complete(0);
-        Ok(c)
+        completion.complete(0);
+        Ok(completion)
     }
 
     fn size(&self) -> Result<u64> {
         let mut filesize = 0i64;
         unsafe {
-            if FALSE == GetFileSizeEx(self.handle, &raw mut filesize) {
-                println!("GetFileSizeEx failed:{:x}", GetLastError());
-
-                return Err(LimboError::InternalError(format!(
-                    "GetFileSizeEx failed:{:x}",
-                    GetLastError()
-                )));
+            if FALSE == GetFileSizeEx(self.file_handle, &raw mut filesize) {
+                return Err(get_limboerror_from_os_err());
             }
         }
+        trace!("size for handle {:08X} {filesize}", self.file_handle.addr());
 
-        let filesize = filesize.try_into().map_err(|_| LimboError::TooBig)?;
+        let filesize = filesize as u64;
         Ok(filesize)
     }
 }
 
 impl Drop for WindowsFile {
     fn drop(&mut self) {
+        trace!("dropping handle {:08X}", self.file_handle.addr());
         unsafe {
-            CancelIo(self.handle);
-            CloseHandle(self.handle);
+            CancelIo(self.file_handle);
+            CloseHandle(self.file_handle);
         }
-        self.handle = INVALID_HANDLE_VALUE;
-    }
-}
-
-#[cfg(test)]
-mod tests {
-
-    use super::*;
-    use crate::io::common;
-
-    #[test]
-    fn test_windows_iocp() {
-        let iocp = WindowsIOCP::new();
-        assert!(iocp.is_ok());
-        let iocp = iocp.unwrap();
-        let file = iocp.open_file("osama.txt", OpenFlags::ReadOnly, false);
-        assert!(file.is_ok());
-        let buffer = Arc::new(crate::Buffer::new_temporary(128));
-
-        let c = Completion::new_read(buffer, |x| {
-            let x = x.unwrap();
-            let y = x.0;
-            let y = y.as_slice();
-            println!(">>> {:?} {}", y, x.1);
-            None
-        });
-        let read = file.unwrap().pread(35, c.clone());
-        match read {
-            Ok(_) => {}
-            Err(ref err) => println!("{err}"),
-        };
-
-        assert!(read.is_ok());
-        let res = iocp.step();
-        assert!(res.is_ok());
-    }
-
-    #[test]
-    fn test_windows_iocp_write() {
-        let iocp = WindowsIOCP::new();
-        assert!(iocp.is_ok());
-        let iocp = iocp.unwrap();
-        let file = iocp.open_file("osama1.txt", OpenFlags::Create, false);
-        assert!(file.is_ok());
-        let buffer = Arc::new(crate::Buffer::new_temporary(5));
-        buffer.as_mut_slice().copy_from_slice(b"Osama");
-
-        let c = Completion::new_write(|x| {
-            //let x = x.unwrap();
-
-            println!(">>>  {:?}", x);
-        });
-        let write = file.unwrap().pwrite(0, buffer, c.clone());
-        match write {
-            Ok(_) => {}
-            Err(ref err) => println!("{err}"),
-        };
-
-        assert!(write.is_ok());
-        let res = iocp.step();
-        assert!(res.is_ok());
-    }
-
-    #[test]
-    fn test_windows_iocp_cancel() {
-        let iocp = WindowsIOCP::new();
-        assert!(iocp.is_ok());
-        let iocp = iocp.unwrap();
-        let file = iocp.open_file("osama.txt", OpenFlags::ReadOnly, false);
-        assert!(file.is_ok());
-        let buffer = Arc::new(crate::Buffer::new_temporary(128));
-
-        let c = Completion::new_read(buffer, |x| {
-            println!(">>> {:?} ", x);
-            None
-        });
-        let read = file.unwrap().pread(35, c.clone());
-        iocp.cancel(&[c]);
-
-        // match read {
-        //     Ok(_) => {}
-        //     Err(ref err) => println!("{err}"),
-        // };
-
-        assert!(read.is_ok());
-        let res = iocp.step();
-        assert!(res.is_ok());
     }
 }
