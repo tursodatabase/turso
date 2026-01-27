@@ -1506,7 +1506,9 @@ impl Connection {
         *self.mv_tx.read()
     }
 
+    #[inline(always)]
     pub(crate) fn set_mv_tx(&self, tx_id_and_mode: Option<(u64, TransactionMode)>) {
+        tracing::debug!("set_mv_tx: {:?}", tx_id_and_mode);
         *self.mv_tx.write() = tx_id_and_mode;
     }
 

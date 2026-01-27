@@ -97,7 +97,7 @@ impl Statement {
     }
 
     pub fn set_mv_tx(&mut self, mv_tx: Option<(u64, TransactionMode)>) {
-        *self.program.connection.mv_tx.write() = mv_tx;
+        self.program.connection.set_mv_tx(mv_tx);
     }
 
     pub fn interrupt(&mut self) {

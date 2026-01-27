@@ -2186,7 +2186,7 @@ pub fn op_transaction_inner(
                                 mv_store.begin_exclusive_tx(pager.clone(), None)?
                             }
                         };
-                        *program.connection.mv_tx.write() = Some((tx_id, *tx_mode));
+                        program.connection.set_mv_tx(Some((tx_id, *tx_mode)));
                     } else if updated {
                         // TODO: fix tx_mode in Insn::Transaction, now each statement overrides it even if there's already a CONCURRENT Tx in progress, for example
                         let (tx_id, mv_tx_mode) = current_mv_tx
