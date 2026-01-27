@@ -1500,7 +1500,6 @@ def test_pragma_integrity_check(provider):
 
     conn.close()
 
-
 def test_encryption_enabled(tmp_path):
     tmp_path = tmp_path / "local.db"
     conn = turso.connect(
@@ -1537,3 +1536,49 @@ def test_encryption_disabled(tmp_path):
     content = open(tmp_path, "rb").read()
     assert len(content) > 16 * 1024
     assert b"secret" in content
+
+
+def test_encryption(tmp_path):
+    tmp_path = tmp_path / "local.db"
+    hexkey = "b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327"
+    wrong_key = "aaaaaaa4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327"
+
+    conn = turso.connect(
+        str(tmp_path),
+        experimental_features="encryption",
+        encryption=turso.EncryptionOpts(cipher="aegis256", hexkey=hexkey),
+    )
+    cursor = conn.cursor()
+    cursor.execute("create table t(x)")
+    cursor.execute("insert into t select 'secret' from generate_series(1, 1024)")
+    conn.commit()
+    cursor.execute("pragma wal_checkpoint(truncate)").fetchall()
+    conn.commit()
+    conn.close()
+
+    # verify we can re-open with the same key
+    conn2 = turso.connect(
+        str(tmp_path),
+        experimental_features="encryption",
+        encryption=turso.EncryptionOpts(cipher="aegis256", hexkey=hexkey),
+    )
+    cursor2 = conn2.cursor()
+    cursor2.execute("select count(*) from t")
+    assert cursor2.fetchone()[0] == 1024
+    conn2.close()
+
+    # verify opening with wrong key fails
+    with pytest.raises(Exception):
+        conn3 = turso.connect(
+            str(tmp_path),
+            experimental_features="encryption",
+            encryption=turso.EncryptionOpts(cipher="aegis256", hexkey=wrong_key),
+        )
+        cursor3 = conn3.cursor()
+        cursor3.execute("select * from t")
+
+    # verify opening without encryption fails
+    with pytest.raises(Exception):
+        conn5 = turso.connect(str(tmp_path))
+        cursor5 = conn5.cursor()
+        cursor5.execute("select * from t")

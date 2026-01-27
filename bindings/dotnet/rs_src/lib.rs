@@ -6,7 +6,9 @@ use std::ptr::null;
 use std::slice;
 use std::sync::Arc;
 use turso_core::types::Text;
-use turso_core::{self, Connection, DatabaseOpts, LimboError, Statement, Value, IO};
+use turso_core::{
+    self, Connection, DatabaseOpts, EncryptionOpts, LimboError, OpenFlags, Statement, Value, IO,
+};
 
 type Error = *const std::ffi::c_char;
 
@@ -116,11 +118,116 @@ pub unsafe extern "C" fn db_open(
     }
 }
 
+/// Opens a database with encryption at the specified path.
+/// If cipher_ptr or hexkey_ptr is null, opens without encryption.
+/// If an error occurred, returns null and writes a pointer to a null-terminated string into `error_ptr`.
+///
+/// # Safety
+///
+/// - The returned database pointer must be freed with `db_close`.
+/// - Any error string written to `error_ptr` must be freed with `free_string`.
+/// - `path_ptr` must not be null and must point to a valid null-terminated UTF-8 string.
+/// - `cipher_ptr` and `hexkey_ptr` must either both be null or both point to valid null-terminated UTF-8 strings.
+/// - `error_ptr` must not be null and must point to a valid writable location.
+#[no_mangle]
+pub unsafe extern "C" fn db_open_with_encryption(
+    path_ptr: *const c_char,
+    cipher_ptr: *const c_char,
+    hexkey_ptr: *const c_char,
+    error_ptr: *mut Error,
+) -> *const Database {
+    let path_cstr: &CStr = unsafe { CStr::from_ptr(path_ptr) };
+    let path_str = match path_cstr.to_str() {
+        Ok(s) => s,
+        Err(err) => {
+            unsafe {
+                *error_ptr = allocate_string(format!("Invalid path encoding: {err}").as_str())
+            }
+            return null();
+        }
+    };
+
+    // Parse encryption options if both cipher and hexkey are provided
+    let encryption_opts = if !cipher_ptr.is_null() && !hexkey_ptr.is_null() {
+        let cipher_cstr: &CStr = unsafe { CStr::from_ptr(cipher_ptr) };
+        let hexkey_cstr: &CStr = unsafe { CStr::from_ptr(hexkey_ptr) };
+
+        let cipher_str = match cipher_cstr.to_str() {
+            Ok(s) => s,
+            Err(err) => {
+                unsafe {
+                    *error_ptr = allocate_string(format!("Invalid cipher encoding: {err}").as_str())
+                }
+                return null();
+            }
+        };
+        let hexkey_str = match hexkey_cstr.to_str() {
+            Ok(s) => s,
+            Err(err) => {
+                unsafe {
+                    *error_ptr = allocate_string(format!("Invalid hexkey encoding: {err}").as_str())
+                }
+                return null();
+            }
+        };
+
+        Some(EncryptionOpts {
+            cipher: cipher_str.to_string(),
+            hexkey: hexkey_str.to_string(),
+        })
+    } else {
+        None
+    };
+
+    let db_opts = if encryption_opts.is_some() {
+        DatabaseOpts::new().with_encryption(true)
+    } else {
+        DatabaseOpts::new()
+    };
+
+    let io: Arc<dyn IO> = match turso_core::PlatformIO::new() {
+        Ok(io) => Arc::new(io),
+        Err(err) => {
+            unsafe { *error_ptr = allocate_string(format!("Failed to create IO: {err}").as_str()) }
+            return null();
+        }
+    };
+
+    let db = match turso_core::Database::open_file_with_flags(
+        io.clone(),
+        path_str,
+        OpenFlags::Create,
+        db_opts,
+        encryption_opts,
+    ) {
+        Ok(db) => db,
+        Err(err) => {
+            unsafe {
+                *error_ptr =
+                    allocate_string(format!("Error while opening database: {err}").as_str())
+            }
+            return null();
+        }
+    };
+
+    let connection = match db.connect() {
+        Ok(conn) => conn,
+        Err(err) => {
+            unsafe {
+                *error_ptr = allocate_string(format!("Error while connecting: {err}").as_str())
+            }
+            return null();
+        }
+    };
+
+    allocate(Database { io, connection })
+}
+
 /// Disposes the database pointer.
 ///
 /// # Safety
 ///
-/// - `db_ptr` must be a pointer allocated by `db_open`.
+/// - `db_ptr` must be a pointer allocated by `db_open` or `db_open_with_encryption`.
 /// - Call `db_close` only once per `db_ptr`.
 #[no_mangle]
 pub unsafe extern "C" fn db_close(db_ptr: *mut Database) {
