@@ -57,6 +57,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
       - name: Setup mold linker
         if: runner.os == 'Linux'
         uses: rui314/setup-mold@v1
@@ -68,6 +70,9 @@ jobs:
         uses: mozilla-actions/sccache-action@v0.0.9
       - name: Install cargo-nextest
         uses: taiki-e/install-action@nextest
+      - name: Install cargo-llvm-cov
+        if: runner.os == 'Linux'
+        uses: taiki-e/install-action@cargo-llvm-cov
       - name: Set up Python 3.10
         uses: useblacksmith/setup-python@v6
         with:
@@ -77,7 +82,21 @@ jobs:
           SCCACHE_GHA_ENABLED: "true"
           RUSTC_WRAPPER: "sccache"
         run: cargo build --verbose --locked --all-features
+      - name: Test (nextest with coverage)
+        if: runner.os == 'Linux'
+        env:
+          RUST_LOG: ${{ runner.debug && 'turso_core::storage=trace' || '' }}
+          SCCACHE_GHA_ENABLED: "true"
+          RUSTC_WRAPPER: "sccache"
+          LOCAL_SYNC_SERVER: "../../target/debug/tursodb"
+        run: |
+          cargo llvm-cov nextest --workspace --all-features --locked --no-fail-fast -E 'not test(/^fuzz_tests::/)' --failure-output=final --html --output-dir coverage
+          echo "::group::Coverage Summary"
+          cargo llvm-cov report | tee coverage/summary.txt
+          echo "::endgroup::"
+        timeout-minutes: 20
       - name: Test (nextest)
+        if: runner.os != 'Linux'
         env:
           RUST_LOG: ${{ runner.debug && 'turso_core::storage=trace' || '' }}
           SCCACHE_GHA_ENABLED: "true"
@@ -97,6 +116,13 @@ jobs:
           RUSTC_WRAPPER: "sccache"
           LOCAL_SYNC_SERVER: "../../target/debug/tursodb"
         run: cargo test --workspace --all-features --doc --locked
+      - name: Upload coverage report
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage/
+          retention-days: 14
 
   shuttle-tests:
     runs-on: blacksmith-4vcpu-ubuntu-2404
