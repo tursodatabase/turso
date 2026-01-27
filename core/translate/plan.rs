@@ -496,6 +496,14 @@ impl SelectPlan {
             .iter()
             .any(|t| t.is_used())
             || self.non_from_clause_subqueries.iter().any(|s| s.correlated)
+            || self
+                .table_references
+                .joined_tables()
+                .iter()
+                .any(|t| match &t.table {
+                    Table::FromClauseSubquery(subquery) => plan_is_correlated(&subquery.plan),
+                    _ => false,
+                })
     }
 
     /// Reference: https://github.com/sqlite/sqlite/blob/5db695197b74580c777b37ab1b787531f15f7f9f/src/select.c#L8613
@@ -2043,31 +2051,13 @@ impl NonFromClauseSubquery {
         join_order: &[JoinOrderMember],
         table_references: Option<&TableReferences>,
     ) -> Result<EvalAt> {
-        let mut eval_at = EvalAt::BeforeLoop;
         let plan = match &self.state {
             SubqueryState::Unevaluated { plan } => plan.as_ref().unwrap(),
             SubqueryState::Evaluated { evaluated_at, .. } => {
                 return Ok(*evaluated_at);
             }
         };
-        let used_outer_refs = plan
-            .table_references
-            .outer_query_refs()
-            .iter()
-            .filter(|t| t.is_used());
-
-        for outer_ref in used_outer_refs {
-            if let Some(loop_idx) =
-                resolve_outer_ref_loop(outer_ref.internal_id, join_order, table_references)
-            {
-                eval_at = eval_at.max(EvalAt::Loop(loop_idx));
-            }
-        }
-        for subquery in plan.non_from_clause_subqueries.iter() {
-            let eval_at_inner = subquery.get_eval_at(join_order, table_references)?;
-            eval_at = eval_at.max(eval_at_inner);
-        }
-        Ok(eval_at)
+        eval_at_for_select_plan(plan, join_order, table_references)
     }
 
     /// Consumes the plan and returns it, and sets the subquery to the evaluated state.
@@ -2100,6 +2090,85 @@ impl NonFromClauseSubquery {
             }
         }
     }
+}
+
+/// Determine the earliest evaluation point for a nested plan by walking all SELECT components.
+fn eval_at_for_plan(
+    plan: &Plan,
+    join_order: &[JoinOrderMember],
+    table_references: Option<&TableReferences>,
+) -> Result<EvalAt> {
+    match plan {
+        Plan::Select(select_plan) => {
+            eval_at_for_select_plan(select_plan, join_order, table_references)
+        }
+        Plan::CompoundSelect {
+            left, right_most, ..
+        } => {
+            let mut eval_at = EvalAt::BeforeLoop;
+            for (select_plan, _) in left.iter() {
+                eval_at = eval_at.max(eval_at_for_select_plan(
+                    select_plan,
+                    join_order,
+                    table_references,
+                )?);
+            }
+            eval_at = eval_at.max(eval_at_for_select_plan(
+                right_most,
+                join_order,
+                table_references,
+            )?);
+            Ok(eval_at)
+        }
+        Plan::Delete(_) | Plan::Update(_) => Ok(EvalAt::BeforeLoop),
+    }
+}
+
+/// Returns true if a plan (including compound SELECTs) references outer-scope tables.
+fn plan_is_correlated(plan: &Plan) -> bool {
+    match plan {
+        Plan::Select(select_plan) => select_plan.is_correlated(),
+        Plan::CompoundSelect {
+            left, right_most, ..
+        } => left.iter().any(|(plan, _)| plan.is_correlated()) || right_most.is_correlated(),
+        Plan::Delete(_) | Plan::Update(_) => false,
+    }
+}
+
+/// Determine when a SELECT plan can be evaluated, including nested non-FROM and FROM-clause subqueries.
+fn eval_at_for_select_plan(
+    plan: &SelectPlan,
+    join_order: &[JoinOrderMember],
+    table_references: Option<&TableReferences>,
+) -> Result<EvalAt> {
+    let mut eval_at = EvalAt::BeforeLoop;
+    let used_outer_refs = plan
+        .table_references
+        .outer_query_refs()
+        .iter()
+        .filter(|t| t.is_used());
+
+    for outer_ref in used_outer_refs {
+        if let Some(loop_idx) =
+            resolve_outer_ref_loop(outer_ref.internal_id, join_order, table_references)
+        {
+            eval_at = eval_at.max(EvalAt::Loop(loop_idx));
+        }
+    }
+    for subquery in plan.non_from_clause_subqueries.iter() {
+        let eval_at_inner = subquery.get_eval_at(join_order, table_references)?;
+        eval_at = eval_at.max(eval_at_inner);
+    }
+    for joined_table in plan.table_references.joined_tables().iter() {
+        if let Table::FromClauseSubquery(from_clause_subquery) = &joined_table.table {
+            eval_at = eval_at.max(eval_at_for_plan(
+                from_clause_subquery.plan.as_ref(),
+                join_order,
+                table_references,
+            )?);
+        }
+    }
+    Ok(eval_at)
 }
 
 /// Resolves the loop index for an outer-table reference.

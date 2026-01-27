@@ -1175,6 +1175,11 @@ pub fn emit_query<'a>(
     if let Distinctness::Distinct { ctx } = &mut plan.distinctness {
         *ctx = distinct_ctx
     }
+    if let Distinctness::Distinct { ctx: Some(ctx) } = &plan.distinctness {
+        program.emit_insn(Insn::HashClear {
+            hash_table_id: ctx.hash_table_id,
+        });
+    }
 
     init_limit(program, t_ctx, &plan.limit, &plan.offset)?;
 
