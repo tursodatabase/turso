@@ -329,15 +329,12 @@ impl Property {
                 let table_dependency = table.clone();
                 let assumption = InteractionType::Assumption(Assertion::new(
                     format!("table {} exists", table.clone()),
-                    {
-                        let table = table.clone();
-                        move |_: &Vec<ResultSet>, env: &mut SimulatorEnv| {
-                            let conn_tables = env.get_conn_tables(connection_index);
-                            if conn_tables.iter().any(|t| t.name == table) {
-                                Ok(Ok(()))
-                            } else {
-                                Ok(Err(format!("table {table} does not exist")))
-                            }
+                    move |_: &Vec<ResultSet>, env: &mut SimulatorEnv| {
+                        let conn_tables = env.get_conn_tables(connection_index);
+                        if conn_tables.iter().any(|t| t.name == table) {
+                            Ok(Ok(()))
+                        } else {
+                            Ok(Err(format!("table {table} does not exist")))
                         }
                     },
                     vec![table_dependency.clone()],
