@@ -364,3 +364,10 @@ expect error {
     ESCAPE expression must be a single character
 }
 
+test like-perf {
+    SELECT 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' LIKE '%a%a%a%a%a%a%a%a%a%a%a%a%a%a%a%a%a%a%a%a%a%a%a%a%a%a%a%a%a%b';
+}
+expect error {
+   0
+}
+
