@@ -1201,117 +1201,125 @@ enum CompareResult {
 /// LIKE pattern matching based on SQLite's patternCompare algorithm (src/func.c).
 /// Uses recursive descent with early termination via `NoWildcardMatch` to avoid
 /// exponential backtracking on patterns like `%a%a%a%...%b`.
-fn pattern_compare(mut pattern: &str, mut text: &str, escape: Option<char>) -> CompareResult {
+fn pattern_compare(pattern: &str, text: &str, escape: Option<char>) -> CompareResult {
+    let mut p_indices = pattern.char_indices();
+    let mut t_indices = text.char_indices();
+
+    let mut p_curr = p_indices.next();
+    let mut t_curr = t_indices.next();
+
+    // Checkpoints for backtracking
+    let mut wildcard_p_iter: Option<std::str::CharIndices> = None;
+    let mut wildcard_t_iter: Option<std::str::CharIndices> = None;
+
     let match_all = '%';
     let match_one = '_';
 
-    while !pattern.is_empty() {
-        let p_char = pattern.chars().next().unwrap();
+    loop {
+        match (p_curr, t_curr) {
+            (Some((_, p_char)), Some((_, t_char))) => {
+                if p_char == match_all && Some(p_char) != escape {
+                    // Consume consecutive wildcards
+                    let mut next_p = p_indices.clone();
+                    while let Some((_, c)) = next_p.clone().next() {
+                        if c == match_all && Some(c) != escape {
+                            next_p.next(); // Consume valid %
+                        } else {
+                            break;
+                        }
+                    }
 
-        if p_char == match_all && Some(p_char) != escape {
-            // Consume consecutive wildcards
-            let mut p_rest = &pattern[p_char.len_utf8()..];
-            while let Some(c) = p_rest.chars().next() {
-                let is_ma = c == match_all && Some(c) != escape;
-                let is_mo = c == match_one && Some(c) != escape;
-                if !is_ma && !is_mo {
-                    break;
+                    let mut lookahead_p = next_p.clone();
+                    if let Some((_, next_char)) = lookahead_p.next() {
+                        let is_wildcard = next_char == match_all || next_char == match_one;
+                        let is_escaped = Some(next_char) == escape;
+
+                        if !is_wildcard && !is_escaped {
+                            let mut found = false;
+
+                            // Check the current text char
+                            if eq_ignore_ascii_case(next_char, t_char) {
+                                found = true;
+                            } else {
+                                // Scan the rest of the text
+                                let mut lookahead_t = t_indices.clone();
+                                while let Some((_, t_c)) = lookahead_t.next() {
+                                    if eq_ignore_ascii_case(next_char, t_c) {
+                                        found = true;
+                                        break;
+                                    }
+                                }
+                            }
+
+                            if !found {
+                                return CompareResult::NoWildcardMatch;
+                            }
+                        }
+                    }
+                    p_indices = next_p;
+                    p_curr = p_indices.next();
+
+                    if p_curr.is_none() {
+                        return CompareResult::Match;
+                    }
+
+                    // Save Checkpoint
+                    wildcard_p_iter = Some(p_indices.clone());
+                    wildcard_t_iter = Some(t_indices.clone());
+
+                    continue;
                 }
-                if is_mo {
-                    if let Some(t_c) = text.chars().next() {
-                        text = &text[t_c.len_utf8()..];
+
+                if p_char == match_one && Some(p_char) != escape {
+                    p_curr = p_indices.next();
+                    t_curr = t_indices.next();
+                    continue;
+                }
+
+                let (expected_char, next_p_iter) = if Some(p_char) == escape {
+                    if let Some((_, literal)) = p_indices.next() {
+                        (literal, p_indices.clone())
                     } else {
-                        return CompareResult::NoWildcardMatch;
-                    }
-                }
-                p_rest = &p_rest[c.len_utf8()..];
-            }
-            pattern = p_rest;
-
-            if pattern.is_empty() {
-                return CompareResult::Match;
-            }
-
-            let next_p_char = pattern.chars().next().unwrap();
-            let (literal, is_escaped) = if Some(next_p_char) == escape {
-                let after = &pattern[next_p_char.len_utf8()..];
-                if let Some(l) = after.chars().next() {
-                    (l, true)
-                } else {
-                    return CompareResult::NoMatch;
-                }
-            } else {
-                (next_p_char, false)
-            };
-
-            // Advance pattern past the literal we are looking for
-            let pattern_next = if is_escaped {
-                &pattern[next_p_char.len_utf8() + literal.len_utf8()..]
-            } else {
-                &pattern[next_p_char.len_utf8()..]
-            };
-
-            let mut search_text = text;
-            loop {
-                if let Some(idx) = search_text.find(|c: char| eq_ignore_ascii_case(c, literal)) {
-                    let (_, rest) = search_text.split_at(idx);
-                    // Skip the literal in text (mimicking SQLite's zString++ after strcspn)
-                    let c_len = rest.chars().next().unwrap().len_utf8();
-                    let text_next = &rest[c_len..];
-
-                    let match_result = pattern_compare(pattern_next, text_next, escape);
-                    if match_result != CompareResult::NoMatch {
-                        return match_result; // Propagate Match or NoWildcardMatch (Abort)
-                    }
-
-                    // Advance search_text to try next position
-                    search_text = text_next;
-                } else {
-                    // Literal not found in remaining text - Abort entire search
-                    return CompareResult::NoWildcardMatch;
-                }
-            }
-        }
-
-        if Some(p_char) == escape {
-            pattern = &pattern[p_char.len_utf8()..];
-            if let Some(next_p_char) = pattern.chars().next() {
-                pattern = &pattern[next_p_char.len_utf8()..];
-                if let Some(t_char) = text.chars().next() {
-                    text = &text[t_char.len_utf8()..];
-                    if !eq_ignore_ascii_case(next_p_char, t_char) {
                         return CompareResult::NoMatch;
                     }
+                } else {
+                    (p_char, p_indices.clone())
+                };
+
+                if eq_ignore_ascii_case(expected_char, t_char) {
+                    p_indices = next_p_iter;
+                    p_curr = p_indices.next();
+                    t_curr = t_indices.next();
                     continue;
                 }
             }
-            return CompareResult::NoMatch;
+            (None, None) => return CompareResult::Match,
+            (Some((_, p_char)), None) if p_char == match_all && Some(p_char) != escape => {
+                let mut temp = p_indices.clone();
+                loop {
+                    match temp.next() {
+                        Some((_, c)) if c == match_all && Some(c) != escape => continue,
+                        None => return CompareResult::Match,
+                        _ => break,
+                    }
+                }
+            }
+            _ => {}
         }
 
-        if p_char == match_one {
-            pattern = &pattern[p_char.len_utf8()..];
-            if let Some(t_char) = text.chars().next() {
-                text = &text[t_char.len_utf8()..];
+        if let (Some(wp), Some(mut wt)) = (wildcard_p_iter.clone(), wildcard_t_iter.clone()) {
+            p_indices = wp;
+            p_curr = p_indices.next();
+
+            if let Some(_) = wt.next() {
+                t_indices = wt.clone();
+                t_curr = t_indices.next();
+                wildcard_t_iter = Some(wt);
                 continue;
             }
-            return CompareResult::NoMatch;
         }
 
-        pattern = &pattern[p_char.len_utf8()..];
-        if let Some(t_char) = text.chars().next() {
-            text = &text[t_char.len_utf8()..];
-            if !eq_ignore_ascii_case(p_char, t_char) {
-                return CompareResult::NoMatch;
-            }
-        } else {
-            return CompareResult::NoMatch;
-        }
-    }
-
-    if text.is_empty() {
-        CompareResult::Match
-    } else {
-        CompareResult::NoMatch
+        return CompareResult::NoMatch;
     }
 }
 
