@@ -367,7 +367,7 @@ expect error {
 test like-perf {
     SELECT 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' LIKE '%a%a%a%a%a%a%a%a%a%a%a%a%a%a%a%a%a%a%a%a%a%a%a%a%a%a%a%a%a%b';
 }
-expect error {
+expect {
    0
 }
 
