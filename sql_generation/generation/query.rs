@@ -1,7 +1,7 @@
 use crate::generation::generated_expr::{extract_column_refs, has_transitive_concat};
 use crate::generation::{
-    Arbitrary, ArbitraryFrom, ArbitrarySized, GenerationContext, gen_random_text, pick_index,
-    pick_unique,
+    gen_random_text, pick_index, pick_unique, Arbitrary, ArbitraryFrom, ArbitrarySized,
+    GenerationContext,
 };
 use crate::model::query::alter_table::{AlterTable, AlterTableType, AlterTableTypeDiscriminants};
 use crate::model::query::predicate::Predicate;
@@ -15,8 +15,8 @@ use crate::model::table::{
     Column, Index, JoinType, JoinedTable, Name, SimValue, Table, TableContext,
 };
 use indexmap::IndexSet;
-use rand::Rng;
 use rand::seq::IndexedRandom;
+use rand::Rng;
 use turso_parser::ast::{Expr, SortOrder};
 
 use super::{backtrack, pick};

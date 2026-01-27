@@ -398,8 +398,8 @@ pub fn has_transitive_concat(expr: &ast::Expr, columns: &[Column]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::SeedableRng;
     use rand::rngs::StdRng;
+    use rand::SeedableRng;
 
     #[test]
     fn test_extract_column_refs() {
