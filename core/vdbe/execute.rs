@@ -15,15 +15,14 @@ use crate::storage::page_cache::PageCache;
 use crate::storage::pager::{default_page1, CreateBTreeFlags, PageRef};
 use crate::storage::sqlite3_ondisk::{DatabaseHeader, PageSize, RawVersion};
 use crate::translate::collate::CollationSeq;
-use crate::translate::expr::{walk_expr_mut, WalkControl};
 use crate::types::{
     compare_immutable, compare_records_generic, AsValueRef, Extendable, IOCompletions, IOResult,
     ImmutableRecord, IndexInfo, SeekResult, Text,
 };
 use crate::util::{
-    normalize_ident, rewrite_column_references_if_needed, rewrite_fk_parent_cols_if_self_ref,
-    rewrite_fk_parent_table_if_needed, rewrite_inline_col_fk_target_if_needed,
-    trim_ascii_whitespace,
+    normalize_ident, rename_column_refs_in_expr, rewrite_column_references_if_needed,
+    rewrite_fk_parent_cols_if_self_ref, rewrite_fk_parent_table_if_needed,
+    rewrite_inline_col_fk_target_if_needed, trim_ascii_whitespace,
 };
 use crate::vdbe::affinity::{apply_numeric_affinity, try_for_float, Affinity, ParsedNumber};
 use crate::vdbe::hash_table::{HashEntry, HashTable, HashTableConfig, DEFAULT_MEM_BUDGET};
@@ -10312,7 +10311,6 @@ pub fn op_alter_column(
 
         // Update indexes on THIS table that name the old column (you already had this)
         if let Some(idxs) = schema.indexes.get_mut(&normalized_table_name) {
-            let old_col_norm = normalize_ident(&old_column_name);
             for idx in idxs {
                 let idx = Arc::make_mut(idx);
                 for ic in &mut idx.columns {
@@ -10323,27 +10321,7 @@ pub fn op_alter_column(
                     }
                     // Also update references in the expression (for VIRTUAL column indexes)
                     if let Some(ref mut expr) = ic.expr {
-                        let _ = walk_expr_mut(expr, &mut |e: &mut ast::Expr| {
-                            match e {
-                                ast::Expr::Id(name)
-                                    if normalize_ident(name.as_str()) == old_col_norm =>
-                                {
-                                    *name = ast::Name::exact(new_name.clone());
-                                }
-                                ast::Expr::Name(name)
-                                    if normalize_ident(name.as_str()) == old_col_norm =>
-                                {
-                                    *name = ast::Name::exact(new_name.clone());
-                                }
-                                ast::Expr::Qualified(_, col_name)
-                                    if normalize_ident(col_name.as_str()) == old_col_norm =>
-                                {
-                                    *col_name = ast::Name::exact(new_name.clone());
-                                }
-                                _ => {}
-                            }
-                            Ok(WalkControl::Continue)
-                        });
+                        rename_column_refs_in_expr(expr, &old_column_name, &new_name);
                     }
                 }
             }
@@ -10387,27 +10365,9 @@ pub fn op_alter_column(
         }
 
         // Update generated column expressions that reference the renamed column.
-        // Only Id, Name, and Qualified can be unresolved column references.
-        let old_col_norm = normalize_ident(&old_column_name);
         for other_col in &mut btree.columns {
             if let Some(ref mut gen_expr) = other_col.generated {
-                let _ = walk_expr_mut(gen_expr, &mut |e: &mut ast::Expr| {
-                    match e {
-                        ast::Expr::Id(name) if normalize_ident(name.as_str()) == old_col_norm => {
-                            *name = ast::Name::exact(new_name.clone());
-                        }
-                        ast::Expr::Name(name) if normalize_ident(name.as_str()) == old_col_norm => {
-                            *name = ast::Name::exact(new_name.clone());
-                        }
-                        ast::Expr::Qualified(_, col_name)
-                            if normalize_ident(col_name.as_str()) == old_col_norm =>
-                        {
-                            *col_name = ast::Name::exact(new_name.clone());
-                        }
-                        _ => {}
-                    }
-                    Ok(WalkControl::Continue)
-                });
+                rename_column_refs_in_expr(gen_expr, &old_column_name, &new_name);
             }
         }
 

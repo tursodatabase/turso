@@ -2561,91 +2561,17 @@ fn emit_update_column_values<'a>(
     let mut updated_col_set: HashSet<usize> = set_clauses.iter().map(|(i, _)| *i).collect();
 
     // Build column lookup once
-    let column_lookup: HashMap<String, usize> = target_table
-        .table
-        .columns()
-        .iter()
-        .enumerate()
-        .filter_map(|(i, col)| col.name.as_ref().map(|name| (name.to_lowercase(), i)))
-        .collect();
+    let column_lookup = target_table.table.column_name_to_index_map();
 
-    // First pass: propagate "updated" status through VIRTUAL columns.
-    // If a VIRTUAL column's dependencies include any updated column, mark it as updated.
-    // This handles transitive dependencies: STORED A depends on VIRTUAL B depends on regular C,
-    // when C is updated, B should be considered updated so A gets recomputed.
+    // Propagate "updated" status through VIRTUAL columns for transitive dependencies
     let columns = target_table.table.columns();
-    loop {
-        let mut made_progress = false;
-        for (idx, col) in columns.iter().enumerate() {
-            // Only process virtual (non-stored) generated columns that aren't already in the set
-            if col.is_virtual_generated() && !updated_col_set.contains(&idx) {
-                if let Some(ref gen_expr) = col.generated {
-                    let deps = super::update::collect_column_refs_from_ast_expr(gen_expr);
-                    let any_dep_updated = deps.iter().any(|dep_name| {
-                        column_lookup
-                            .get(&dep_name.to_lowercase())
-                            .is_some_and(|&dep_idx| updated_col_set.contains(&dep_idx))
-                    });
-                    if any_dep_updated {
-                        updated_col_set.insert(idx);
-                        made_progress = true;
-                    }
-                }
-            }
-        }
-        if !made_progress {
-            break;
-        }
-    }
+    propagate_virtual_column_updates(columns, &column_lookup, &mut updated_col_set);
 
     // Process stored generated columns in topologically sorted order
     // This ensures that if column C depends on column B, B is processed first
     // even if C is declared before B in the schema.
     let sorted_gen_col_indices =
         topological_sort_stored_generated_columns(columns, &column_lookup)?;
-
-    // Helper: Check if a column (possibly VIRTUAL) transitively depends on any updated column.
-    // This follows through VIRTUAL columns to find if any underlying STORED/regular column is updated.
-    fn depends_on_updated(
-        col_idx: usize,
-        columns: &[crate::schema::Column],
-        column_lookup: &rustc_hash::FxHashMap<String, usize>,
-        updated_col_set: &rustc_hash::FxHashSet<usize>,
-        visited: &mut rustc_hash::FxHashSet<usize>,
-    ) -> bool {
-        if visited.contains(&col_idx) {
-            return false; // Cycle protection
-        }
-        visited.insert(col_idx);
-
-        // If this column is updated, return true
-        if updated_col_set.contains(&col_idx) {
-            return true;
-        }
-
-        // If this is a VIRTUAL column, check its dependencies recursively
-        let col = &columns[col_idx];
-        if col.is_virtual_generated() {
-            if let Some(ref gen_expr) = col.generated {
-                let deps = super::update::collect_column_refs_from_ast_expr(gen_expr);
-                for dep_name in deps {
-                    if let Some(&dep_idx) = column_lookup.get(&dep_name.to_lowercase()) {
-                        if depends_on_updated(
-                            dep_idx,
-                            columns,
-                            column_lookup,
-                            updated_col_set,
-                            visited,
-                        ) {
-                            return true;
-                        }
-                    }
-                }
-            }
-        }
-
-        false
-    }
 
     for idx in sorted_gen_col_indices {
         let table_column = &columns[idx];
@@ -2657,7 +2583,7 @@ fn emit_update_column_values<'a>(
             let needs_recompute = deps.iter().any(|dep_name| {
                 if let Some(&dep_idx) = column_lookup.get(&dep_name.to_lowercase()) {
                     let mut visited = HashSet::default();
-                    depends_on_updated(
+                    super::update::column_depends_on_updated(
                         dep_idx,
                         columns,
                         &column_lookup,
@@ -2830,6 +2756,60 @@ pub(super) fn topological_sort_stored_generated_columns(
     }
 
     Ok(sorted)
+}
+
+/// Propagate "updated" status through VIRTUAL columns.
+///
+/// When a base column is updated, any VIRTUAL column that depends on it should be
+/// considered "updated" for the purposes of recomputing STORED columns that depend
+/// on those VIRTUAL columns. This handles transitive dependencies:
+/// STORED A -> depends on -> VIRTUAL B -> depends on -> regular column C
+///
+/// When C is updated, B should be marked as updated so A gets recomputed.
+pub(super) fn propagate_virtual_column_updates(
+    columns: &[crate::schema::Column],
+    column_lookup: &HashMap<String, usize>,
+    updated_col_set: &mut HashSet<usize>,
+) {
+    // Maximum iterations = number of VIRTUAL columns + 1
+    // In a valid acyclic graph, we can add at most one column per iteration.
+    // If we exceed this, there's a cyclic dependency that slipped past validation.
+    let max_iterations = columns
+        .iter()
+        .filter(|c| c.is_virtual_generated())
+        .count()
+        + 1;
+    let mut iterations = 0;
+
+    loop {
+        iterations += 1;
+        assert!(
+            iterations <= max_iterations,
+            "Circular dependency detected in VIRTUAL generated columns - this should have been caught at CREATE TABLE time"
+        );
+
+        let mut made_progress = false;
+        for (idx, col) in columns.iter().enumerate() {
+            // Only process virtual (non-stored) generated columns that aren't already in the set
+            if col.is_virtual_generated() && !updated_col_set.contains(&idx) {
+                if let Some(ref gen_expr) = col.generated {
+                    let deps = super::update::collect_column_refs_from_ast_expr(gen_expr);
+                    let any_dep_updated = deps.iter().any(|dep_name| {
+                        column_lookup
+                            .get(&dep_name.to_lowercase())
+                            .is_some_and(|&dep_idx| updated_col_set.contains(&dep_idx))
+                    });
+                    if any_dep_updated {
+                        updated_col_set.insert(idx);
+                        made_progress = true;
+                    }
+                }
+            }
+        }
+        if !made_progress {
+            break;
+        }
+    }
 }
 
 /// Emit bytecode to evaluate a generated expression using register values.

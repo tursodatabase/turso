@@ -1530,6 +1530,16 @@ impl Table {
             _ => None,
         }
     }
+
+    /// Build a map from lowercased column names to their indices.
+    /// This is useful for looking up columns by name in generated column expressions.
+    pub fn column_name_to_index_map(&self) -> rustc_hash::FxHashMap<String, usize> {
+        self.columns()
+            .iter()
+            .enumerate()
+            .filter_map(|(i, col)| col.name.as_ref().map(|name| (name.to_lowercase(), i)))
+            .collect()
+    }
 }
 
 impl PartialEq for Table {
@@ -1716,6 +1726,32 @@ impl BTreeTable {
             .map(|column| column.collation())
             .collect()
     }
+
+    /// Build a map from lowercased column names to their indices.
+    /// This is useful for looking up columns by name in generated column expressions.
+    pub fn column_name_to_index_map(&self) -> rustc_hash::FxHashMap<String, usize> {
+        self.columns
+            .iter()
+            .enumerate()
+            .filter_map(|(i, col)| col.name.as_ref().map(|name| (name.to_lowercase(), i)))
+            .collect()
+    }
+
+    /// Convert a logical column index to a physical column index.
+    /// Physical indices skip VIRTUAL generated columns since they are not stored in the record.
+    #[inline]
+    pub fn logical_to_physical_column(&self, logical: usize) -> usize {
+        let mut physical = 0;
+        for (i, col) in self.columns.iter().enumerate() {
+            if i == logical {
+                break;
+            }
+            if !col.is_virtual_generated() {
+                physical += 1;
+            }
+        }
+        physical
+    }
 }
 
 fn identifier_contains_special_chars(name: &str) -> bool {
@@ -1752,6 +1788,14 @@ pub struct FromClauseSubquery {
     /// The start register for the result columns of the derived table;
     /// must be set before data is read from it.
     pub result_columns_start_reg: Option<usize>,
+}
+
+/// Check if a generated column type specifier indicates STORED.
+/// Returns true for "STORED", false for "VIRTUAL" or None (VIRTUAL is default).
+fn is_generated_stored(typ: &Option<ast::Name>) -> bool {
+    typ.as_ref()
+        .map(|n| n.as_str().eq_ignore_ascii_case("STORED"))
+        .unwrap_or(false)
 }
 
 /// Recursively extract all column name references from an expression.
@@ -1843,15 +1887,60 @@ fn extract_column_refs(expr: &ast::Expr, refs: &mut Vec<String>) {
     }
 }
 
-/// Validates generated column expression for prohibited constructs.
-/// SQLite prohibits: subqueries, aggregate functions, window functions,
-/// and non-deterministic functions for STORED columns.
-fn validate_generated_expr(expr: &ast::Expr, is_stored: bool) -> Result<()> {
-    validate_generated_expr_recursive(expr, is_stored)
+/// Check if there's a path from `start` to `target` in the generated column dependency graph.
+/// Uses DFS with cycle detection to find transitive dependencies.
+/// `columns` is the list of columns seen so far during parsing.
+/// Returns true if target is reachable from start through generated column dependencies.
+fn has_transitive_dependency(
+    start: &str,
+    target: &str,
+    columns: &[Column],
+    visited: &mut std::collections::HashSet<String>,
+) -> bool {
+    if !visited.insert(start.to_owned()) {
+        return false; // Already visited this node, no cycle through here
+    }
+
+    // Find the column with this name
+    let col = columns
+        .iter()
+        .find(|c| c.name.as_deref() == Some(start));
+
+    let Some(col) = col else {
+        return false; // Not a generated column or doesn't exist yet
+    };
+
+    let Some(ref gen_expr) = col.generated else {
+        return false; // Not a generated column
+    };
+
+    // Extract dependencies of this column
+    let mut deps = Vec::new();
+    extract_column_refs(gen_expr, &mut deps);
+
+    // Check if target is directly referenced
+    if deps.iter().any(|d| d == target) {
+        return true;
+    }
+
+    // Recursively check transitive dependencies
+    for dep in deps {
+        if has_transitive_dependency(&dep, target, columns, visited) {
+            return true;
+        }
+    }
+
+    false
 }
 
-#[allow(clippy::only_used_in_recursion)]
-fn validate_generated_expr_recursive(expr: &ast::Expr, is_stored: bool) -> Result<()> {
+/// Validates generated column expression for prohibited constructs.
+/// SQLite prohibits: subqueries, aggregate functions, window functions,
+/// and non-deterministic functions in generated columns.
+fn validate_generated_expr(expr: &ast::Expr) -> Result<()> {
+    validate_generated_expr_recursive(expr)
+}
+
+fn validate_generated_expr_recursive(expr: &ast::Expr) -> Result<()> {
     use ast::Expr;
     match expr {
         // Subqueries prohibited (including InTable which is a table-valued subquery)
@@ -1901,7 +1990,7 @@ fn validate_generated_expr_recursive(expr: &ast::Expr, is_stored: bool) -> Resul
 
             // Recurse into arguments
             for arg in args {
-                validate_generated_expr_recursive(arg, is_stored)?;
+                validate_generated_expr_recursive(arg)?;
             }
         }
 
@@ -1918,13 +2007,13 @@ fn validate_generated_expr_recursive(expr: &ast::Expr, is_stored: bool) -> Resul
 
         // Recurse into child expressions
         Expr::Binary(lhs, _, rhs) => {
-            validate_generated_expr_recursive(lhs, is_stored)?;
-            validate_generated_expr_recursive(rhs, is_stored)?;
+            validate_generated_expr_recursive(lhs)?;
+            validate_generated_expr_recursive(rhs)?;
         }
-        Expr::Unary(_, inner) => validate_generated_expr_recursive(inner, is_stored)?,
+        Expr::Unary(_, inner) => validate_generated_expr_recursive(inner)?,
         Expr::Parenthesized(exprs) => {
             for e in exprs {
-                validate_generated_expr_recursive(e, is_stored)?;
+                validate_generated_expr_recursive(e)?;
             }
         }
         Expr::Case {
@@ -1934,42 +2023,42 @@ fn validate_generated_expr_recursive(expr: &ast::Expr, is_stored: bool) -> Resul
             ..
         } => {
             if let Some(b) = base {
-                validate_generated_expr_recursive(b, is_stored)?;
+                validate_generated_expr_recursive(b)?;
             }
             for (w, t) in when_then_pairs {
-                validate_generated_expr_recursive(w, is_stored)?;
-                validate_generated_expr_recursive(t, is_stored)?;
+                validate_generated_expr_recursive(w)?;
+                validate_generated_expr_recursive(t)?;
             }
             if let Some(e) = else_expr {
-                validate_generated_expr_recursive(e, is_stored)?;
+                validate_generated_expr_recursive(e)?;
             }
         }
-        Expr::Cast { expr, .. } => validate_generated_expr_recursive(expr, is_stored)?,
+        Expr::Cast { expr, .. } => validate_generated_expr_recursive(expr)?,
         Expr::InList { lhs, rhs, .. } => {
-            validate_generated_expr_recursive(lhs, is_stored)?;
+            validate_generated_expr_recursive(lhs)?;
             for e in rhs {
-                validate_generated_expr_recursive(e, is_stored)?;
+                validate_generated_expr_recursive(e)?;
             }
         }
         Expr::Between {
             lhs, start, end, ..
         } => {
-            validate_generated_expr_recursive(lhs, is_stored)?;
-            validate_generated_expr_recursive(start, is_stored)?;
-            validate_generated_expr_recursive(end, is_stored)?;
+            validate_generated_expr_recursive(lhs)?;
+            validate_generated_expr_recursive(start)?;
+            validate_generated_expr_recursive(end)?;
         }
         Expr::Like {
             lhs, rhs, escape, ..
         } => {
-            validate_generated_expr_recursive(lhs, is_stored)?;
-            validate_generated_expr_recursive(rhs, is_stored)?;
+            validate_generated_expr_recursive(lhs)?;
+            validate_generated_expr_recursive(rhs)?;
             if let Some(e) = escape {
-                validate_generated_expr_recursive(e, is_stored)?;
+                validate_generated_expr_recursive(e)?;
             }
         }
-        Expr::Collate(inner, _) => validate_generated_expr_recursive(inner, is_stored)?,
+        Expr::Collate(inner, _) => validate_generated_expr_recursive(inner)?,
         Expr::IsNull(inner) | Expr::NotNull(inner) => {
-            validate_generated_expr_recursive(inner, is_stored)?;
+            validate_generated_expr_recursive(inner)?;
         }
         // Other expressions are allowed
         _ => {}
@@ -2183,13 +2272,8 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                             crate::bail_parse_error!("CHECK constraints are not yet supported");
                         }
                         ast::ColumnConstraint::Generated { expr, typ } => {
-                            // STORED if explicitly specified, otherwise VIRTUAL (default)
-                            generated_stored = typ
-                                .as_ref()
-                                .map(|n| n.as_str().eq_ignore_ascii_case("STORED"))
-                                .unwrap_or(false);
-                            // Validate the expression before accepting it
-                            validate_generated_expr(expr, generated_stored)?;
+                            generated_stored = is_generated_stored(typ);
+                            validate_generated_expr(expr)?;
                             generated = Some(expr.clone());
                         }
                         ast::ColumnConstraint::PrimaryKey {
@@ -2335,25 +2419,18 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                         );
                     }
 
-                    // Check for circular references
+                    // Check for circular references (including transitive cycles)
                     // For each referenced column that is also a generated column,
-                    // check if it references the current column (directly or indirectly)
+                    // check if it can transitively reach back to the current column
                     for ref_col in &referenced_cols {
-                        if let Some(col) = cols
-                            .iter()
-                            .find(|c| c.name.as_deref() == Some(ref_col.as_str()))
+                        let mut visited = std::collections::HashSet::new();
+                        if has_transitive_dependency(ref_col, &current_col_name, &cols, &mut visited)
                         {
-                            if let Some(ref other_gen_expr) = col.generated {
-                                let mut other_refs = Vec::new();
-                                extract_column_refs(other_gen_expr, &mut other_refs);
-                                if other_refs.iter().any(|c| c == &current_col_name) {
-                                    crate::bail_parse_error!(
-                                        "circular dependency in generated columns \"{}\" and \"{}\"",
-                                        name,
-                                        ref_col
-                                    );
-                                }
-                            }
+                            crate::bail_parse_error!(
+                                "circular dependency in generated columns \"{}\" and \"{}\"",
+                                name,
+                                ref_col
+                            );
                         }
                     }
                 }
@@ -2817,10 +2894,6 @@ impl Column {
     pub const fn set_hidden(&mut self, v: bool) {
         self.set_flag(F_HIDDEN, v);
     }
-    #[inline]
-    pub const fn set_generated_stored(&mut self, v: bool) {
-        self.set_flag(F_GENERATED_STORED, v);
-    }
 
     #[inline]
     const fn set_flag(&mut self, mask: u16, val: bool) {
@@ -2863,11 +2936,7 @@ impl From<&ColumnDefinition> for Column {
                 }
                 ast::ColumnConstraint::Generated { expr, typ } => {
                     generated = Some(expr.clone());
-                    // STORED if explicitly specified, otherwise VIRTUAL (default)
-                    generated_stored = typ
-                        .as_ref()
-                        .map(|n| n.as_str().eq_ignore_ascii_case("STORED"))
-                        .unwrap_or(false);
+                    generated_stored = is_generated_stored(typ);
                 }
                 _ => {}
             };

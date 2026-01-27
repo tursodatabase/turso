@@ -189,6 +189,36 @@ impl<'a> ExprContext<'a> {
         }
     }
 
+    /// Emit code to evaluate a virtual column's expression and apply affinity.
+    ///
+    /// Virtual columns don't store their values - they compute them on demand.
+    /// This helper recursively translates the virtual column's generating expression,
+    /// then applies the column's declared affinity to ensure type consistency.
+    fn emit_virtual_column(
+        &self,
+        program: &mut ProgramBuilder,
+        col: &Column,
+        target_reg: usize,
+        resolver: &Resolver,
+    ) -> Result<()> {
+        debug_assert!(col.is_virtual_generated());
+        let gen_expr = col
+            .generated
+            .as_ref()
+            .expect("is_virtual_generated() guarantees generated expr exists");
+        translate_expr_with_context(program, self, gen_expr, target_reg, resolver)?;
+        // Apply the VIRTUAL column's affinity to the result.
+        // This is critical for precision: e.g., if a VIRTUAL column has REAL
+        // affinity but its expression evaluates to INTEGER, we must convert
+        // to REAL so that any downstream expressions see the correct type.
+        program.emit_insn(Insn::Affinity {
+            start_reg: target_reg,
+            count: std::num::NonZeroUsize::MIN, // 1 register
+            affinities: col.affinity().aff_mask().to_string(),
+        });
+        Ok(())
+    }
+
     /// Resolve a column by name and emit code to load its value into target_reg.
     ///
     /// Each context resolves columns differently:
@@ -234,27 +264,8 @@ impl<'a> ExprContext<'a> {
                     });
 
                 if let Some(mapping) = mapping {
-                    // Check if this is a virtual generated column - if so, we need to
-                    // recursively evaluate its expression
                     if mapping.column.is_virtual_generated() {
-                        let gen_expr = mapping
-                            .column
-                            .generated
-                            .as_ref()
-                            .expect("is_virtual_generated() guarantees generated expr exists");
-                        // Recursive call to translate the virtual column's expression
-                        // This uses the same context so nested column references work
-                        translate_expr_with_context(program, self, gen_expr, target_reg, resolver)?;
-                        // Apply the VIRTUAL column's affinity to the result.
-                        // This is critical for precision: e.g., if a VIRTUAL column has REAL
-                        // affinity but its expression evaluates to INTEGER, we must convert
-                        // to REAL so that any downstream expressions see the correct type.
-                        // Without this, INTEGER→REAL→INTEGER chains preserve too much precision.
-                        program.emit_insn(Insn::Affinity {
-                            start_reg: target_reg,
-                            count: std::num::NonZeroUsize::MIN, // 1 register
-                            affinities: mapping.column.affinity().aff_mask().to_string(),
-                        });
+                        self.emit_virtual_column(program, mapping.column, target_reg, resolver)?;
                     } else {
                         // Regular column - copy from the pre-loaded register
                         program.emit_insn(Insn::Copy {
@@ -277,27 +288,9 @@ impl<'a> ExprContext<'a> {
             } => {
                 // Look up column by name in the HashMap
                 if let Some(&col_idx) = column_lookup.get(&col_name.to_lowercase()) {
-                    // Check if this is a virtual generated column
                     if let Some(col) = columns.get(col_idx) {
                         if col.is_virtual_generated() {
-                            let gen_expr = col
-                                .generated
-                                .as_ref()
-                                .expect("is_virtual_generated() guarantees generated expr exists");
-                            // Recursive call to translate the virtual column's expression
-                            translate_expr_with_context(
-                                program, self, gen_expr, target_reg, resolver,
-                            )?;
-                            // Apply the VIRTUAL column's affinity to the result.
-                            // This is critical for precision: e.g., if a VIRTUAL column has REAL
-                            // affinity but its expression evaluates to INTEGER, we must convert
-                            // to REAL so that any downstream expressions see the correct type.
-                            program.emit_insn(Insn::Affinity {
-                                start_reg: target_reg,
-                                count: std::num::NonZeroUsize::MIN, // 1 register
-                                affinities: col.affinity().aff_mask().to_string(),
-                            });
-                            return Ok(());
+                            return self.emit_virtual_column(program, col, target_reg, resolver);
                         }
                         // Check if this is a rowid alias column with a separate rowid register
                         if let Some(rowid_r) = rowid_reg {
@@ -356,24 +349,9 @@ impl<'a> ExprContext<'a> {
             } => {
                 // Look up column by name in the HashMap
                 if let Some(&col_idx) = column_lookup.get(&col_name.to_lowercase()) {
-                    // Check if this is a virtual generated column
                     if let Some(col) = columns.get(col_idx) {
                         if col.is_virtual_generated() {
-                            let gen_expr = col
-                                .generated
-                                .as_ref()
-                                .expect("is_virtual_generated() guarantees generated expr exists");
-                            // Recursive call to translate the virtual column's expression
-                            translate_expr_with_context(
-                                program, self, gen_expr, target_reg, resolver,
-                            )?;
-                            // Apply the VIRTUAL column's affinity to the result.
-                            program.emit_insn(Insn::Affinity {
-                                start_reg: target_reg,
-                                count: std::num::NonZeroUsize::MIN, // 1 register
-                                affinities: col.affinity().aff_mask().to_string(),
-                            });
-                            return Ok(());
+                            return self.emit_virtual_column(program, col, target_reg, resolver);
                         }
                     }
                     // Regular column - read from cursor
@@ -391,24 +369,9 @@ impl<'a> ExprContext<'a> {
             } => {
                 // Look up column by name in the HashMap
                 if let Some(&col_idx) = column_lookup.get(&col_name.to_lowercase()) {
-                    // Check if this is a virtual generated column
                     if let Some(col) = columns.get(col_idx) {
                         if col.is_virtual_generated() {
-                            let gen_expr = col
-                                .generated
-                                .as_ref()
-                                .expect("is_virtual_generated() guarantees generated expr exists");
-                            // Recursive call to translate the virtual column's expression
-                            translate_expr_with_context(
-                                program, self, gen_expr, target_reg, resolver,
-                            )?;
-                            // Apply the VIRTUAL column's affinity to the result.
-                            program.emit_insn(Insn::Affinity {
-                                start_reg: target_reg,
-                                count: std::num::NonZeroUsize::MIN, // 1 register
-                                affinities: col.affinity().aff_mask().to_string(),
-                            });
-                            return Ok(());
+                            return self.emit_virtual_column(program, col, target_reg, resolver);
                         }
                     }
                     // Regular column - copy from the OLD register for this column

@@ -415,6 +415,13 @@ test gencol_error_circular_reference {
 expect error {
 }
 
+# 3-hop transitive circular dependency: v1->v3->v2->v1
+test gencol_error_transitive_circular_reference {
+    CREATE TABLE t1(a INTEGER, v1 AS (v3+1) VIRTUAL, v2 AS (v1+1) VIRTUAL, v3 AS (v2+1) VIRTUAL);
+}
+expect error {
+}
+
 # -----------------------------------------------------------------------------
 # Error cases: Table with only generated columns
 # -----------------------------------------------------------------------------

@@ -1585,6 +1585,34 @@ pub fn rewrite_fk_parent_cols_if_self_ref(
     }
 }
 
+/// Rename column references in an expression from `from` to `to`.
+/// Renames Id, Name, Qualified, and DoublyQualified expressions that match the normalized `from` name.
+pub fn rename_column_refs_in_expr(expr: &mut ast::Expr, from: &str, to: &str) {
+    let from_norm = normalize_ident(from);
+    let _ = walk_expr_mut(expr, &mut |e: &mut ast::Expr| {
+        match e {
+            ast::Expr::Id(name) if normalize_ident(name.as_str()) == from_norm => {
+                *name = ast::Name::exact(to.to_owned());
+            }
+            ast::Expr::Name(name) if normalize_ident(name.as_str()) == from_norm => {
+                *name = ast::Name::exact(to.to_owned());
+            }
+            ast::Expr::Qualified(_, col_name)
+                if normalize_ident(col_name.as_str()) == from_norm =>
+            {
+                *col_name = ast::Name::exact(to.to_owned());
+            }
+            ast::Expr::DoublyQualified(_, _, col_name)
+                if normalize_ident(col_name.as_str()) == from_norm =>
+            {
+                *col_name = ast::Name::exact(to.to_owned());
+            }
+            _ => {}
+        }
+        Ok(WalkControl::Continue)
+    });
+}
+
 /// Update a column-level REFERENCES <tbl>(col,...) constraint and generated column expressions
 pub fn rewrite_column_references_if_needed(
     col: &mut ast::ColumnDefinition,
@@ -1592,7 +1620,6 @@ pub fn rewrite_column_references_if_needed(
     from: &str,
     to: &str,
 ) {
-    let from_norm = normalize_ident(from);
 
     for cc in &mut col.constraints {
         match &mut cc.constraint {
@@ -1600,26 +1627,7 @@ pub fn rewrite_column_references_if_needed(
                 rewrite_fk_parent_cols_if_self_ref(clause, table, from, to);
             }
             ast::ColumnConstraint::Generated { expr, .. } => {
-                // Walk expression and rename column references.
-                // Only Id, Name, and Qualified can be unresolved column references in
-                // generated expressions. Column/RowId are resolved forms with indices.
-                let _ = walk_expr_mut(expr, &mut |e: &mut ast::Expr| {
-                    match e {
-                        ast::Expr::Id(name) if normalize_ident(name.as_str()) == from_norm => {
-                            *name = ast::Name::exact(to.to_owned());
-                        }
-                        ast::Expr::Name(name) if normalize_ident(name.as_str()) == from_norm => {
-                            *name = ast::Name::exact(to.to_owned());
-                        }
-                        ast::Expr::Qualified(_, col_name)
-                            if normalize_ident(col_name.as_str()) == from_norm =>
-                        {
-                            *col_name = ast::Name::exact(to.to_owned());
-                        }
-                        _ => {}
-                    }
-                    Ok(WalkControl::Continue)
-                });
+                rename_column_refs_in_expr(expr, from, to);
             }
             _ => {}
         }

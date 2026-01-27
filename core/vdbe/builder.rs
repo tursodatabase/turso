@@ -1314,30 +1314,8 @@ impl ProgramBuilder {
         // Compute physical column index by skipping VIRTUAL generated columns
         // (since they are not stored in the record)
         let physical_column = match cursor_type {
-            CursorType::BTreeTable(btree) => {
-                let mut physical = 0;
-                for (i, col) in btree.columns.iter().enumerate() {
-                    if i == column {
-                        break;
-                    }
-                    if !col.is_virtual_generated() {
-                        physical += 1;
-                    }
-                }
-                physical
-            }
-            CursorType::MaterializedView(btree, _) => {
-                let mut physical = 0;
-                for (i, col) in btree.columns.iter().enumerate() {
-                    if i == column {
-                        break;
-                    }
-                    if !col.is_virtual_generated() {
-                        physical += 1;
-                    }
-                }
-                physical
-            }
+            CursorType::BTreeTable(btree) => btree.logical_to_physical_column(column),
+            CursorType::MaterializedView(btree, _) => btree.logical_to_physical_column(column),
             _ => column, // For indexes and other cursor types, use logical column
         };
 

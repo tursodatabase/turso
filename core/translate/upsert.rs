@@ -7,7 +7,8 @@ use turso_parser::ast::{self, TriggerEvent, TriggerTime, Upsert};
 use crate::error::SQLITE_CONSTRAINT_PRIMARYKEY;
 use crate::schema::{IndexColumn, ROWID_SENTINEL};
 use crate::translate::emitter::{
-    emit_generated_expr_from_registers, topological_sort_stored_generated_columns, UpdateRowSource,
+    emit_generated_expr_from_registers, propagate_virtual_column_updates,
+    topological_sort_stored_generated_columns, UpdateRowSource,
 };
 use crate::translate::expr::{rewrite_between_expr, walk_expr, WalkControl};
 use crate::translate::fkeys::{
@@ -485,88 +486,16 @@ pub fn emit_upsert(
     let mut updated_col_set: HashSet<usize> = set_pairs.iter().map(|(i, _)| *i).collect();
 
     // Build column lookup once
-    let column_lookup: HashMap<String, usize> = columns
-        .iter()
-        .enumerate()
-        .filter_map(|(i, col)| col.name.as_ref().map(|name| (name.to_lowercase(), i)))
-        .collect();
+    let column_lookup = ctx.table.column_name_to_index_map();
 
-    // First pass: propagate "updated" status through VIRTUAL columns.
-    // If a VIRTUAL column's dependencies include any updated column, mark it as updated.
-    // This handles transitive dependencies: STORED A depends on VIRTUAL B depends on regular C,
-    // when C is updated, B should be considered updated so A gets recomputed.
-    loop {
-        let mut made_progress = false;
-        for (idx, col) in columns.iter().enumerate() {
-            // Only process virtual (non-stored) generated columns that aren't already in the set
-            if col.is_virtual_generated() && !updated_col_set.contains(&idx) {
-                if let Some(ref gen_expr) = col.generated {
-                    let deps = collect_column_refs_from_ast_expr(gen_expr);
-                    let any_dep_updated = deps.iter().any(|dep_name| {
-                        column_lookup
-                            .get(&dep_name.to_lowercase())
-                            .is_some_and(|&dep_idx| updated_col_set.contains(&dep_idx))
-                    });
-                    if any_dep_updated {
-                        updated_col_set.insert(idx);
-                        made_progress = true;
-                    }
-                }
-            }
-        }
-        if !made_progress {
-            break;
-        }
-    }
+    // Propagate "updated" status through VIRTUAL columns for transitive dependencies
+    propagate_virtual_column_updates(columns, &column_lookup, &mut updated_col_set);
 
     // Process stored generated columns in topologically sorted order
     // This ensures that if column C depends on column B, B is processed first
     // even if C is declared before B in the schema.
     let sorted_gen_col_indices =
         topological_sort_stored_generated_columns(columns, &column_lookup)?;
-
-    // Helper: Check if a column (possibly VIRTUAL) transitively depends on any updated column.
-    // This follows through VIRTUAL columns to find if any underlying STORED/regular column is updated.
-    fn depends_on_updated(
-        col_idx: usize,
-        columns: &[crate::schema::Column],
-        column_lookup: &HashMap<String, usize>,
-        updated_col_set: &HashSet<usize>,
-        visited: &mut HashSet<usize>,
-    ) -> bool {
-        if visited.contains(&col_idx) {
-            return false; // Cycle protection
-        }
-        visited.insert(col_idx);
-
-        // If this column is updated, return true
-        if updated_col_set.contains(&col_idx) {
-            return true;
-        }
-
-        // If this is a VIRTUAL column, check its dependencies recursively
-        let col = &columns[col_idx];
-        if col.is_virtual_generated() {
-            if let Some(ref gen_expr) = col.generated {
-                let deps = collect_column_refs_from_ast_expr(gen_expr);
-                for dep_name in deps {
-                    if let Some(&dep_idx) = column_lookup.get(&dep_name.to_lowercase()) {
-                        if depends_on_updated(
-                            dep_idx,
-                            columns,
-                            column_lookup,
-                            updated_col_set,
-                            visited,
-                        ) {
-                            return true;
-                        }
-                    }
-                }
-            }
-        }
-
-        false
-    }
 
     let rowid_reg = Some(new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg));
     for idx in sorted_gen_col_indices {
@@ -579,7 +508,7 @@ pub fn emit_upsert(
             let needs_recompute = deps.iter().any(|dep_name| {
                 if let Some(&dep_idx) = column_lookup.get(&dep_name.to_lowercase()) {
                     let mut visited = HashSet::default();
-                    depends_on_updated(
+                    crate::translate::update::column_depends_on_updated(
                         dep_idx,
                         columns,
                         &column_lookup,
