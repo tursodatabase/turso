@@ -114,7 +114,7 @@ jobs:
         RUST_BACKTRACE: 1
         SCCACHE_GHA_ENABLED: "true"
         RUSTC_WRAPPER: "sccache"
-      run: cargo run -p turso_stress --locked -- -t 2 -i 10000 -s --tables 1
+      run: RUSTFLAGS="--cfg shuttle" cargo run -p turso_stress --locked -- --nr-threads 3 --nr-iterations 300
 
   shuttle-stress-test:
     runs-on: blacksmith-4vcpu-ubuntu-2404
