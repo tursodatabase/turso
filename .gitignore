@@ -1,4 +1,5 @@
 /target
+/target.noindex
 /.idea
 /.vscode
 /.sqlite3
