@@ -1192,8 +1192,8 @@ impl Value {
 
     pub fn exec_char<'a, T: Iterator<Item = &'a Self>>(values: T) -> Self {
         let result: String = values
-            .filter_map(|x| {
-                if let Value::Integer(i) = x {
+            .filter_map(|x| match x {
+                Value::Integer(i) => {
                     // Convert integer to Unicode codepoint.
                     // For invalid codepoints (negative, surrogates, or > U+10FFFF),
                     // output U+FFFD (replacement character) to match SQLite behavior.
@@ -1202,9 +1202,10 @@ impl Value {
                     } else {
                         Some('\u{FFFD}')
                     }
-                } else {
-                    None
                 }
+                // NULL arguments produce NUL characters to match SQLite behavior.
+                Value::Null => Some('\0'),
+                _ => None,
             })
             .collect();
         Value::build_text(result)
@@ -1966,7 +1967,7 @@ mod tests {
                     .iter()
                     .map(|reg| reg.get_value())
             ),
-            Value::build_text("")
+            Value::build_text("\0")
         );
         assert_eq!(
             Value::exec_char(
