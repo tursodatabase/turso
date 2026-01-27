@@ -1049,33 +1049,67 @@ pub fn compute_best_join_order<'a>(
     // As mentioned, inner joins are commutative. Outer joins are NOT.
     // Example:
     // "a LEFT JOIN b" can NOT be reordered as "b LEFT JOIN a".
+    // Additionally, "a LEFT JOIN b INNER JOIN c" cannot be reordered as "a INNER JOIN c LEFT JOIN b"
+    // if c's join predicates reference b, because c depends on b's presence.
     // If there are outer joins in the plan, ensure correct ordering.
-    let left_join_illegal_map = {
-        let left_join_count = joined_tables
-            .iter()
-            .filter(|t| t.join_info.as_ref().is_some_and(|j| j.outer))
-            .count();
-        if left_join_count == 0 {
-            None
+    //
+    // Two maps are used:
+    // - left_join_illegal_map: when table X is RHS, tables in this set CANNOT be in the LHS
+    // - left_join_required_map: when table X is RHS, tables in this set MUST be in the LHS
+    let (left_join_illegal_map, left_join_required_map) = {
+        // First, collect outer join RHS table indices
+        let mut outer_join_rhs_tables = TableMask::new();
+        for (j, joined_table) in joined_tables.iter().enumerate() {
+            if joined_table.join_info.as_ref().is_some_and(|j| j.outer) {
+                outer_join_rhs_tables.add_table(j);
+            }
+        }
+        if outer_join_rhs_tables.is_empty() {
+            (None, None)
         } else {
-            // map from rhs table index to lhs table index
-            let mut left_join_illegal_map: HashMap<usize, TableMask> =
-                HashMap::with_capacity_and_hasher(left_join_count, Default::default());
+            // map from table index to set of tables that CANNOT be in LHS when this table is RHS
+            let mut left_join_illegal_map: HashMap<usize, TableMask> = HashMap::default();
+            // map from table index to set of tables that MUST be in LHS when this table is RHS
+            let mut left_join_required_map: HashMap<usize, TableMask> = HashMap::default();
+
+            // Rule 1: outer join LHS tables cannot appear after their RHS
             for (i, _) in joined_tables.iter().enumerate() {
                 for (j, joined_table) in joined_tables.iter().enumerate().skip(i + 1) {
                     if joined_table.join_info.as_ref().is_some_and(|j| j.outer) {
-                        // bitwise OR the masks
-                        if let Some(illegal_lhs) = left_join_illegal_map.get_mut(&i) {
-                            illegal_lhs.add_table(j);
-                        } else {
-                            let mut mask = TableMask::new();
-                            mask.add_table(j);
-                            left_join_illegal_map.insert(i, mask);
+                        // Table i cannot have table j in its LHS (j must come after i)
+                        left_join_illegal_map
+                            .entry(i)
+                            .or_insert_with(TableMask::new)
+                            .add_table(j);
+                    }
+                }
+            }
+
+            // Rule 2: if table k's constraints reference outer join table j, then k cannot
+            // appear before j (j must be in k's LHS when k is the RHS being joined)
+            for (k, table_constraints) in constraints.iter().enumerate() {
+                for constraint in &table_constraints.constraints {
+                    // Check if constraint references any outer join RHS table
+                    for outer_j in outer_join_rhs_tables.tables_iter() {
+                        if constraint.lhs_mask.contains_table(outer_j) && outer_j != k {
+                            // Table k depends on outer join table outer_j, so outer_j must come first
+                            left_join_required_map
+                                .entry(k)
+                                .or_insert_with(TableMask::new)
+                                .add_table(outer_j);
                         }
                     }
                 }
             }
-            Some(left_join_illegal_map)
+
+            (
+                Some(left_join_illegal_map),
+                if left_join_required_map.is_empty() {
+                    None
+                } else {
+                    Some(left_join_required_map)
+                },
+            )
         }
     };
 
@@ -1113,6 +1147,17 @@ pub fn compute_best_join_order<'a>(
                     let legal = !lhs_mask.intersects(illegal_lhs);
                     if !legal {
                         continue; // Don't allow RHS before its LEFT in LEFT JOIN
+                    }
+                }
+
+                // If RHS requires certain tables (due to referencing outer join tables in predicates),
+                // ensure those tables are in the LHS.
+                if let Some(required_lhs) = left_join_required_map
+                    .as_ref()
+                    .and_then(|deps| deps.get(&rhs_idx))
+                {
+                    if !lhs_mask.contains_all(required_lhs) {
+                        continue; // RHS's predicates reference outer join tables not yet joined
                     }
                 }
 

@@ -436,3 +436,20 @@ expect {
     boots|aaliyah@example.org
     boots|alfredo@example.org
 }
+
+# Regression test for issue #4904: left_join_illegal_map logic
+# When we have "a LEFT JOIN b INNER JOIN c" and c's join predicate references b,
+# the join cannot be reordered as "a INNER JOIN c LEFT JOIN b" because c depends on b.
+test left-join-inner-join-with-dependency {
+    select u.first_name, p.name, u2.first_name
+    from users u
+    left join products p on u.id = p.id
+    join users u2 on u2.id = p.id
+    where u.id < 5;
+}
+expect {
+    Dan|hat|Dan
+    Chaz|cap|Chaz
+    Edmond|shirt|Edmond
+    Krystel|sweater|Krystel
+}
