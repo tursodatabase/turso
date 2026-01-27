@@ -113,6 +113,14 @@ impl Statement {
     }
 
     fn _step(&mut self, waker: Option<&Waker>) -> Result<StepResult> {
+        if matches!(self.state.execution_state, ProgramExecutionState::Init)
+            && !self
+                .program
+                .prepare_context
+                .matches_connection(&self.program.connection)
+        {
+            self.reprepare()?;
+        }
         // If we're waiting for a busy handler timeout, check if we can proceed
         if let Some(busy_state) = self.busy_handler_state.as_ref() {
             if self.pager.io.current_time_monotonic() < busy_state.timeout() {

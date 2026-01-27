@@ -319,7 +319,7 @@ define_aegis_cipher!(
     "AEGIS-128X4"
 );
 
-#[derive(Debug, AtomicEnum, Clone, Copy, PartialEq)]
+#[derive(Debug, AtomicEnum, Clone, Copy, PartialEq, Eq)]
 pub enum CipherMode {
     None,
     Aes128Gcm,

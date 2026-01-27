@@ -16,8 +16,8 @@ use tracing_subscriber::{
 };
 use turso_core::{
     storage::database::DatabaseFile, types::AsValueRef, CipherMode, Connection, Database,
-    DatabaseOpts, DatabaseStorage, EncryptionKey, LimboError, OpenFlags, Pager, QueryMode,
-    Statement, StepResult, IO,
+    DatabaseOpts, DatabaseStorage, EncryptionKey, LimboError, OpenFlags, QueryMode, Statement,
+    StepResult, IO,
 };
 
 use crate::{
@@ -647,8 +647,7 @@ impl TursoDatabase {
 }
 
 struct CachedStatement {
-    program: turso_core::Program,
-    pager: Arc<Pager>,
+    program: Arc<turso_core::PreparedProgram>,
     query_mode: QueryMode,
 }
 
@@ -696,17 +695,19 @@ impl TursoConnection {
 
         // Check if we have a cached version
         if let Some(cached) = self.cached_statements.lock().unwrap().get(sql_str) {
-            // Clone the cached program and create a new Statement with fresh state
-            let statement = Statement::new(
-                cached.program.clone(),
-                cached.pager.clone(),
-                cached.query_mode,
-            );
-            return Ok(Box::new(TursoStatement {
-                concurrent_guard: self.concurrent_guard.clone(),
-                async_io: self.async_io,
-                statement,
-            }));
+            if cached.program.is_compatible_with(&self.connection) {
+                let program = turso_core::Program::from_prepared(
+                    cached.program.clone(),
+                    self.connection.clone(),
+                );
+                let statement =
+                    Statement::new(program, self.connection.get_pager(), cached.query_mode);
+                return Ok(Box::new(TursoStatement {
+                    concurrent_guard: self.concurrent_guard.clone(),
+                    async_io: self.async_io,
+                    statement,
+                }));
+            }
         }
 
         // Not cached, prepare it fresh
@@ -714,8 +715,7 @@ impl TursoConnection {
 
         // Cache it for future use
         let cached = Arc::new(CachedStatement {
-            program: statement.get_program().clone(),
-            pager: statement.get_pager().clone(),
+            program: statement.get_program().prepared().clone(),
             query_mode: statement.get_query_mode(),
         });
         self.cached_statements
@@ -1089,5 +1089,80 @@ mod tests {
             .prepare_single("SELECT * FROM generate_series(1, 10000)")
             .unwrap();
         assert_eq!(stmt.execute(None).unwrap().status, TursoStatusCode::Done);
+    }
+
+    #[test]
+    pub fn test_prepare_cached_concurrent_use_errors() {
+        use std::sync::{Arc, Barrier};
+
+        let db = TursoDatabase::new(TursoDatabaseConfig {
+            path: ":memory:".to_string(),
+            experimental_features: None,
+            async_io: false,
+            encryption: None,
+            vfs: None,
+            io: None,
+            db_file: None,
+        });
+        db.open().unwrap();
+        let conn = db.connect().unwrap();
+
+        let mut create = conn
+            .prepare_single(
+                "CREATE TABLE hosts (
+                    name TEXT PRIMARY KEY,
+                    app TEXT,
+                    address TEXT,
+                    namespace TEXT,
+                    cloud_cluster_name TEXT,
+                    allowed_ips TEXT,
+                    updated_at INTEGER
+                )",
+            )
+            .unwrap();
+        create.execute(None).unwrap();
+
+        let insert_sql = "INSERT INTO hosts (
+                name, app, address, namespace, cloud_cluster_name, allowed_ips, updated_at
+            ) SELECT
+                'host-' || uuid4_str(),
+                'app' || uuid4_str(),
+                'addr' || uuid4_str(),
+                'ns' || uuid4_str(),
+                'cluster' || uuid4_str(),
+                'ip' || uuid4_str(),
+                 datetime('now') FROM generate_series(1,100)";
+
+        let stmt1 = conn.prepare_cached(insert_sql).unwrap();
+        let stmt2 = conn.prepare_cached(insert_sql).unwrap();
+
+        let barrier = Arc::new(Barrier::new(2));
+        let mut handles = Vec::new();
+        for mut stmt in [stmt1, stmt2] {
+            let barrier = barrier.clone();
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                stmt.execute(None)
+            }));
+        }
+
+        let mut results = Vec::new();
+        for handle in handles {
+            results.push(handle.join().unwrap());
+        }
+
+        assert!(
+            results
+                .iter()
+                .any(|r| matches!(r, Err(TursoError::Misuse(_)))),
+            "expected at least one concurrent-use error, got: {results:?}"
+        );
+        assert!(
+            results
+                .iter()
+                .filter_map(|r| r.as_ref().err())
+                .all(|e| matches!(e, TursoError::Misuse(_))),
+            "expected only misuse errors, got: {results:?}"
+        );
     }
 }

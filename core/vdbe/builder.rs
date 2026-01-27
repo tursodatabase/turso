@@ -1,6 +1,4 @@
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
-use std::sync::Arc;
-
 use tracing::{instrument, Level};
 use turso_parser::ast::{self, ResolveType, SortOrder, TableInternalId};
 
@@ -14,7 +12,7 @@ use crate::{
         emitter::{MaterializedColumnRef, TransactionMode},
         plan::{ResultSetColumn, TableReferences},
     },
-    CaptureDataChangesMode, Connection, Value, VirtualTable,
+    Arc, CaptureDataChangesMode, Connection, Value, VirtualTable,
 };
 
 // Keep distinct hash-table ids far from table internal ids to avoid collisions.
@@ -40,7 +38,10 @@ impl TableRefIdCounter {
     }
 }
 
-use super::{BranchOffset, CursorID, Insn, InsnReference, JumpTarget, Program};
+use super::{
+    BranchOffset, CursorID, Insn, InsnReference, JumpTarget, PrepareContext, PreparedProgram,
+    Program,
+};
 
 /// A key that uniquely identifies a cursor.
 /// The key is a pair of table reference id and index.
@@ -1377,22 +1378,25 @@ impl ProgramBuilder {
             .iter()
             .any(|(insn, _)| matches!(insn, Insn::Program { .. }));
 
-        Ok(Program {
+        let prepared = PreparedProgram {
             max_registers: self.next_free_register,
             insns: self.insns,
             cursor_ref: self.cursor_ref,
             comments: self.comments,
-            connection,
             parameters: self.parameters,
             change_cnt_on,
             result_columns: self.result_columns,
             table_references: self.table_references,
             sql: sql.to_string(),
-            needs_stmt_subtransactions: self.needs_stmt_subtransactions,
+            needs_stmt_subtransactions: crate::Arc::new(crate::AtomicBool::new(
+                self.needs_stmt_subtransactions,
+            )),
             trigger: self.trigger.take(),
             is_subprogram: self.is_subprogram,
             contains_trigger_subprograms,
             resolve_type: self.resolve_type,
-        })
+            prepare_context: PrepareContext::from_connection(&connection),
+        };
+        Ok(Program::from_prepared(Arc::new(prepared), connection))
     }
 }
