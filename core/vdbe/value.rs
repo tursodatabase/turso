@@ -1289,14 +1289,14 @@ fn pattern_compare(pattern: &str, text: &str, escape: Option<char>) -> CompareRe
             _ => {}
         }
 
-        if let (Some(wp), Some(mut wt)) = (wildcard_p_iter.clone(), wildcard_t_iter.clone()) {
+        if let (Some(wp), Some(wt)) = (wildcard_p_iter.clone(), wildcard_t_iter.clone()) {
             p_indices = wp;
             p_curr = p_indices.next();
+            t_indices = wt.clone();
+            t_curr = t_indices.next();
 
-            if wt.next().is_some() {
-                t_indices = wt.clone();
-                t_curr = t_indices.next();
-                wildcard_t_iter = Some(wt);
+            if t_curr.is_some() {
+                wildcard_t_iter = Some(t_indices.clone());
                 continue;
             }
         }
