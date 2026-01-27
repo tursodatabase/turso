@@ -1267,8 +1267,13 @@ enum AllocatePageState {
 #[derive(Clone)]
 enum AllocatePage1State {
     Start,
-    Writing { page: PageRef },
-    Syncing { page: PageRef, completion: Completion },
+    Writing {
+        page: PageRef,
+    },
+    Syncing {
+        page: PageRef,
+        completion: Completion,
+    },
     Done,
 }
 
@@ -1433,7 +1438,11 @@ impl Pager {
 
     /// Sync main database file to disk after writing page 1.
     pub fn sync_db_file(&self) -> Result<Completion> {
-        sqlite3_ondisk::begin_sync(self.db_file.as_ref(), self.syncing.clone())
+        sqlite3_ondisk::begin_sync(
+            self.db_file.as_ref(),
+            self.syncing.clone(),
+            self.get_sync_type(),
+        )
     }
 
     /// Read page 1 (the database header page) using the header_ref_state state machine.
@@ -4043,8 +4052,10 @@ impl Pager {
                 turso_assert!(page.is_loaded(), "page should be loaded");
                 tracing::trace!("allocate_page1(Writing done, starting sync)");
                 let c = self.sync_db_file()?;
-                *self.allocate_page1_state.write() =
-                    AllocatePage1State::Syncing { page, completion: c.clone() };
+                *self.allocate_page1_state.write() = AllocatePage1State::Syncing {
+                    page,
+                    completion: c.clone(),
+                };
                 io_yield_one!(c);
             }
             AllocatePage1State::Syncing { page, completion } => {

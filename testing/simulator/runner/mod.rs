@@ -22,7 +22,10 @@ pub enum DurableIOEvent {
         had_content: bool,
         durable_size: usize,
     },
-    TruncateSynced { file_path: String, new_len: usize },
+    TruncateSynced {
+        file_path: String,
+        new_len: usize,
+    },
 }
 
 pub const WAL_HEADER_SIZE: usize = 32;
