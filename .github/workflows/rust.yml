@@ -89,7 +89,11 @@ jobs:
           SCCACHE_GHA_ENABLED: "true"
           RUSTC_WRAPPER: "sccache"
           LOCAL_SYNC_SERVER: "../../target/debug/tursodb"
-        run: cargo llvm-cov nextest --workspace --all-features --locked --no-fail-fast -E 'not test(/^fuzz_tests::/)' --failure-output=final --html --output-dir coverage
+        run: |
+          cargo llvm-cov nextest --workspace --all-features --locked --no-fail-fast -E 'not test(/^fuzz_tests::/)' --failure-output=final --html --output-dir coverage
+          echo "::group::Coverage Summary"
+          cargo llvm-cov report | tee coverage/summary.txt
+          echo "::endgroup::"
         timeout-minutes: 20
       - name: Test (nextest)
         if: runner.os != 'Linux'
