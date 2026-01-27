@@ -4228,3 +4228,24 @@ test gencol_rowid_alias_update_concat {
 expect {
     42|Updated|42: Updated
 }
+
+# -----------------------------------------------------------------------------
+# Regression tests: ALTER TABLE RENAME COLUMN with generated columns
+# -----------------------------------------------------------------------------
+
+# Regression test: generated column expression should be updated after column rename
+# This tests that the generated column expression is properly updated when a
+# column it references is renamed via ALTER TABLE RENAME COLUMN.
+test gencol_rename_column_regression {
+    CREATE TABLE t_rename_gencol (a REAL, b REAL, c REAL AS (b - a));
+    INSERT INTO t_rename_gencol (a, b) VALUES (10.0, 30.0);
+    SELECT c FROM t_rename_gencol;
+    ALTER TABLE t_rename_gencol RENAME COLUMN a TO a_renamed;
+    INSERT INTO t_rename_gencol (a_renamed, b) VALUES (5.0, 25.0);
+    SELECT c FROM t_rename_gencol ORDER BY c;
+}
+expect {
+    20.0
+    20.0
+    20.0
+}

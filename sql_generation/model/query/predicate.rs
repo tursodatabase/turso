@@ -100,6 +100,7 @@ pub fn expr_to_value<T: TableContext>(
     match expr {
         ast::Expr::DoublyQualified(_, _, col_name)
         | ast::Expr::Qualified(_, col_name)
+        | ast::Expr::Name(col_name)
         | ast::Expr::Id(col_name) => {
             let columns = table.columns().collect::<Vec<_>>();
             let col_name = col_name.as_str();

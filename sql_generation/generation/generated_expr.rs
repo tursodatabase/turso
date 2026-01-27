@@ -232,7 +232,7 @@ pub fn extract_column_refs(expr: &ast::Expr) -> HashSet<String> {
 
 fn extract_refs_inner(expr: &ast::Expr, refs: &mut HashSet<String>) {
     match expr {
-        Expr::Id(name) => {
+        Expr::Id(name) | Expr::Name(name) => {
             refs.insert(name.as_str().to_string());
         }
         Expr::Qualified(_, name) => {
@@ -318,7 +318,7 @@ fn extract_refs_inner(expr: &ast::Expr, refs: &mut HashSet<String>) {
             extract_refs_inner(inner, refs);
         }
         // Literals and other leaf nodes don't have column refs
-        Expr::Literal(_) | Expr::Variable(_) | Expr::Raise(..) | Expr::Name(_) => {}
+        Expr::Literal(_) | Expr::Variable(_) | Expr::Raise(..) => {}
         // Subquery doesn't contribute to direct column refs in the expression context
         Expr::Subquery(_) | Expr::Exists(_) | Expr::FunctionCallStar { .. } => {}
         // Internal AST nodes (Register, Column, RowId, Glob) used after analysis
@@ -362,7 +362,7 @@ pub fn has_transitive_concat(expr: &ast::Expr, columns: &[Column]) -> bool {
                 || has_transitive_concat(lhs, columns)
                 || has_transitive_concat(rhs, columns)
         }
-        Expr::Id(name) => {
+        Expr::Id(name) | Expr::Name(name) => {
             // Check if the referenced column has concat in its generated expression
             if let Some(col) = columns
                 .iter()
@@ -408,6 +408,34 @@ mod tests {
             Box::new(Expr::Id(Name::from_string("a"))),
             Operator::Add,
             Box::new(Expr::Id(Name::from_string("b"))),
+        );
+        let refs = extract_column_refs(&expr);
+        assert!(refs.contains("a"));
+        assert!(refs.contains("b"));
+        assert_eq!(refs.len(), 2);
+    }
+
+    #[test]
+    fn test_extract_column_refs_expr_name() {
+        // Test that Expr::Name is also recognized as a column reference
+        let expr = Expr::Binary(
+            Box::new(Expr::Name(Name::from_string("a"))),
+            Operator::Subtract,
+            Box::new(Expr::Name(Name::from_string("b"))),
+        );
+        let refs = extract_column_refs(&expr);
+        assert!(refs.contains("a"), "Should find column 'a' in Expr::Name");
+        assert!(refs.contains("b"), "Should find column 'b' in Expr::Name");
+        assert_eq!(refs.len(), 2);
+    }
+
+    #[test]
+    fn test_extract_column_refs_mixed() {
+        // Test mixed Expr::Id and Expr::Name
+        let expr = Expr::Binary(
+            Box::new(Expr::Id(Name::from_string("a"))),
+            Operator::Add,
+            Box::new(Expr::Name(Name::from_string("b"))),
         );
         let refs = extract_column_refs(&expr);
         assert!(refs.contains("a"));
