@@ -2394,12 +2394,12 @@ expect {
 
 # Basic: rename base column updates VIRTUAL generated expression
 test gencol_rename_column_updates_expression {
-    CREATE TABLE t1(a TEXT, b TEXT AS (a));
+    CREATE TABLE t1 (a TEXT, b TEXT AS (a));
     ALTER TABLE t1 RENAME COLUMN a TO c;
     SELECT sql FROM sqlite_master WHERE name='t1';
 }
 expect {
-    CREATE TABLE t1(c TEXT, b TEXT AS (c))
+    CREATE TABLE t1 (c TEXT, b TEXT AS (c))
 }
 
 # STORED generated column expression updated on rename
