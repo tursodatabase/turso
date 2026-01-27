@@ -1418,4 +1418,16 @@ func TestTimeValueRoundtrip(t *testing.T) {
 		require.Equal(t, 1, id)
 		require.True(t, originalTime.Equal(createdAt))
 	})
+
+	// expected behaviour - similar to the sqlite3 go driver as it uses decltype
+	t.Run("transform datetime column", func(t *testing.T) {
+		stmt, err := db.Prepare(`SELECT concat(created_at || '') FROM time_test`)
+		require.NoError(t, err)
+		defer stmt.Close()
+
+		var createdAt string
+		err = stmt.QueryRow().Scan(&createdAt)
+		require.NoError(t, err)
+		require.Equal(t, createdAt, originalTime.Format(time.RFC3339Nano))
+	})
 }

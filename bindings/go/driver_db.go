@@ -386,9 +386,7 @@ func (r *tursoDbRows) Next(dest []driver.Value) error {
 		return io.EOF
 	}
 	// Ensure decltypes are populated
-	if r.decltypes == nil {
-		r.Columns()
-	}
+	_ = r.Columns()
 	for {
 		status, err := turso_statement_step(r.stmt)
 		if err != nil {
