@@ -5716,7 +5716,7 @@ mod fuzz_tests {
 
     // TODO: mvcc indexes
     #[turso_macros::test()]
-    /// Tests for correlated and uncorrelated subqueries occurring in the WHERE clause of a SELECT statement.
+    /// Tests for correlated and uncorrelated subqueries in SELECT statements (WHERE, SELECT-list, GROUP BY/HAVING).
     pub fn table_subquery_fuzz(db: TempDatabase) {
         let _ = env_logger::try_init();
         let (mut rng, seed) = rng_from_time_or_env();
@@ -6001,11 +6001,33 @@ mod fuzz_tests {
             // Sometimes add nesting - but use scalar subquery for nesting to avoid column count issues
             if depth < 1 && rng.random_bool(0.2) {
                 // Reduced probability and depth
-                let nested = gen_scalar_subquery(rng, 0, outer_table, allowed_outer_cols);
-                if final_query.contains("WHERE") {
-                    format!("{final_query} AND id IN ({nested})")
+                let nested = gen_scalar_subquery(rng, 0, outer_table, allowed_outer_cols, false);
+                // Brittle string heuristic: infer scope from SQL text to avoid ambiguous id refs.
+                let derived_select_col =
+                    if let Some(start) = final_query.find("FROM (SELECT DISTINCT ") {
+                        let tail = &final_query[start + "FROM (SELECT DISTINCT ".len()..];
+                        tail.split(" FROM ")
+                            .next()
+                            .map(|s| s.trim())
+                            .filter(|s| !s.is_empty() && !s.contains(' '))
+                    } else {
+                        None
+                    };
+                let id_expr = if final_query.contains("FROM (SELECT DISTINCT") {
+                    derived_select_col.unwrap_or("id")
+                } else if final_query.contains("FROM t1") {
+                    "t1.id"
+                } else if final_query.contains("FROM t2") {
+                    "t2.id"
+                } else if final_query.contains("FROM t3") {
+                    "t3.id"
                 } else {
-                    format!("{final_query} WHERE id IN ({nested})")
+                    "id"
+                };
+                if final_query.contains("WHERE") {
+                    format!("{final_query} AND {id_expr} IN ({nested})")
+                } else {
+                    format!("{final_query} WHERE {id_expr} IN ({nested})")
                 }
             } else {
                 final_query
@@ -6018,6 +6040,7 @@ mod fuzz_tests {
             depth: usize,
             outer_table: Option<&str>,
             allowed_outer_cols: Option<&[&str]>,
+            force_single_row: bool,
         ) -> String {
             if depth > MAX_SUBQUERY_DEPTH {
                 // Reduced nesting depth
@@ -6168,10 +6191,39 @@ mod fuzz_tests {
                     "SELECT ref_id FROM t2 WHERE {}",
                     gen_simple_where_inner(rng, "t2")
                 ),
+                {
+                    let inner_table = ["t1", "t2", "t3"][rng.random_range(0..3)];
+                    let select_column = match inner_table {
+                        "t1" => ["id", "value1", "value2"][rng.random_range(0..3)],
+                        "t2" => ["id", "ref_id", "data"][rng.random_range(0..3)],
+                        _ => ["id", "category", "amount"][rng.random_range(0..3)],
+                    };
+                    let can_correlate = match allowed_outer_cols {
+                        Some(cols) => !cols.is_empty(),
+                        None => true,
+                    };
+                    let where_clause = if let Some(outer_table) = outer_table {
+                        if can_correlate && rng.random_bool(0.4) {
+                            format!(
+                                " WHERE {}",
+                                gen_correlated_where(rng, inner_table, outer_table)
+                            )
+                        } else {
+                            String::new()
+                        }
+                    } else {
+                        String::new()
+                    };
+                    format!(
+                        "SELECT {select_column} FROM (SELECT DISTINCT {select_column} FROM {inner_table}{where_clause})"
+                    )
+                },
             ];
 
             let base_query =
                 &scalar_subquery_types[rng.random_range(0..scalar_subquery_types.len())];
+            // Brittle string heuristic: detects the derived-table shape emitted above.
+            let base_is_derived = base_query.contains("FROM (SELECT DISTINCT");
 
             // Add correlated conditions if outer_table is provided and sometimes
             let final_query = if let Some(outer_table) = outer_table {
@@ -6179,7 +6231,7 @@ mod fuzz_tests {
                     Some(cols) => !cols.is_empty(),
                     None => true,
                 };
-                if can_correlate && rng.random_bool(0.4) {
+                if can_correlate && !base_is_derived && rng.random_bool(0.4) {
                     // 40% chance for correlation
                     // Extract the inner table from the base query
                     let inner_table = if base_query.contains("FROM t1") {
@@ -6207,23 +6259,69 @@ mod fuzz_tests {
             };
 
             // Sometimes add nesting
-            if depth < 1 && rng.random_bool(0.2) {
+            let mut query = if depth < 1 && rng.random_bool(0.2) {
                 // Reduced probability and depth
-                let nested = gen_scalar_subquery(rng, depth + 1, outer_table, allowed_outer_cols);
-                if final_query.contains("WHERE") {
-                    format!("{final_query} AND id IN ({nested})")
+                let nested =
+                    gen_scalar_subquery(rng, depth + 1, outer_table, allowed_outer_cols, false);
+                // Brittle string heuristic: infer scope from SQL text to avoid ambiguous id refs.
+                let derived_select_col =
+                    if let Some(start) = final_query.find("FROM (SELECT DISTINCT ") {
+                        let tail = &final_query[start + "FROM (SELECT DISTINCT ".len()..];
+                        tail.split(" FROM ")
+                            .next()
+                            .map(|s| s.trim())
+                            .filter(|s| !s.is_empty() && !s.contains(' '))
+                    } else {
+                        None
+                    };
+                let id_expr = if final_query.contains("FROM (SELECT DISTINCT") {
+                    derived_select_col.unwrap_or("id")
+                } else if final_query.contains("FROM t1") {
+                    "t1.id"
+                } else if final_query.contains("FROM t2") {
+                    "t2.id"
+                } else if final_query.contains("FROM t3") {
+                    "t3.id"
                 } else {
-                    format!("{final_query} WHERE id IN ({nested})")
+                    "id"
+                };
+                // Brittle string heuristic: avoid attaching WHERE/AND to inner SELECT in derived-table shape.
+                let has_outer_where = if final_query.contains(" FROM (") {
+                    final_query.contains(") WHERE ")
+                } else {
+                    final_query.contains("WHERE")
+                };
+                if has_outer_where {
+                    format!("{final_query} AND {id_expr} IN ({nested})")
+                } else {
+                    format!("{final_query} WHERE {id_expr} IN ({nested})")
                 }
             } else {
                 final_query
+            };
+
+            // Brittle string heuristic: infer outer FROM table to choose a deterministic ORDER BY.
+            if force_single_row && !query.contains("LIMIT") {
+                let outer_from = query.find(" FROM ").and_then(|idx| {
+                    let rest = &query[idx + " FROM ".len()..];
+                    rest.split_whitespace().next()
+                });
+                let order_by = match outer_from {
+                    Some("t1") => "ORDER BY t1.id",
+                    Some("t2") => "ORDER BY t2.id",
+                    Some("t3") => "ORDER BY t3.id",
+                    _ => "ORDER BY 1",
+                };
+                query = format!("{query} {order_by} LIMIT 1");
             }
+
+            query
         }
 
         // Helper to generate a SELECT-list expression as a scalar subquery, optionally correlated
         fn gen_selectlist_scalar_expr(rng: &mut ChaCha8Rng, outer_table: &str) -> String {
             // Reuse scalar subquery generator; return the inner SELECT (without wrapping)
-            gen_scalar_subquery(rng, 0, Some(outer_table), None)
+            gen_scalar_subquery(rng, 0, Some(outer_table), None, true)
         }
 
         // Helper to generate a GROUP BY expression which may include a correlated scalar subquery
@@ -6243,7 +6341,7 @@ mod fuzz_tests {
                 // grouping expression itself, disallow correlation entirely here.
                 format!(
                     "({})",
-                    gen_scalar_subquery(rng, 0, Some(main_table), Some(&[]))
+                    gen_scalar_subquery(rng, 0, Some(main_table), Some(&[]), true)
                 )
             }
         }
@@ -6275,7 +6373,8 @@ mod fuzz_tests {
                 _ => ("COUNT", "*"),
             };
             let op = [">", "<", ">=", "<=", "=", "<>"][rng.random_range(0..6)];
-            let rhs = gen_scalar_subquery(rng, 0, Some(main_table), Some(&[]));
+            // HAVING does not support correlated subqueries; force uncorrelated here.
+            let rhs = gen_scalar_subquery(rng, 0, None, Some(&[]), true);
             if agg_col == "*" {
                 format!("COUNT(*) {op} ({rhs})")
             } else {
@@ -6329,7 +6428,7 @@ mod fuzz_tests {
                         _ => "id",
                     };
                     let op = [">", "<", ">=", "<=", "=", "<>"][rng.random_range(0..6)];
-                    let subquery = gen_scalar_subquery(&mut rng, 0, Some(main_table), None);
+                    let subquery = gen_scalar_subquery(&mut rng, 0, Some(main_table), None, true);
                     format!("SELECT * FROM {main_table} WHERE {column} {op} ({subquery})",)
                 }
                 1 => {
@@ -6347,7 +6446,7 @@ mod fuzz_tests {
                         "t3" => ["amount", "category", "id"][rng.random_range(0..3)],
                         _ => "id",
                     };
-                    let subquery = gen_scalar_subquery(&mut rng, 0, Some(main_table), None);
+                    let subquery = gen_scalar_subquery(&mut rng, 0, Some(main_table), None, false);
                     format!("SELECT * FROM {main_table} WHERE {column} {not_in}IN ({subquery})",)
                 }
                 3 => {
