@@ -1237,8 +1237,8 @@ fn pattern_compare(pattern: &str, text: &str, escape: Option<char>) -> CompareRe
                                 found = true;
                             } else {
                                 // Scan the rest of the text
-                                let mut lookahead_t = t_indices.clone();
-                                while let Some((_, t_c)) = lookahead_t.next() {
+                                let lookahead_t = t_indices.clone();
+                                for (_, t_c) in lookahead_t {
                                     if eq_ignore_ascii_case(next_char, t_c) {
                                         found = true;
                                         break;
@@ -1252,16 +1252,14 @@ fn pattern_compare(pattern: &str, text: &str, escape: Option<char>) -> CompareRe
                         }
                     }
                     p_indices = next_p;
+                    wildcard_p_iter = Some(p_indices.clone());
                     p_curr = p_indices.next();
 
                     if p_curr.is_none() {
                         return CompareResult::Match;
                     }
 
-                    // Save Checkpoint
-                    wildcard_p_iter = Some(p_indices.clone());
                     wildcard_t_iter = Some(t_indices.clone());
-
                     continue;
                 }
 
@@ -1306,7 +1304,7 @@ fn pattern_compare(pattern: &str, text: &str, escape: Option<char>) -> CompareRe
             p_indices = wp;
             p_curr = p_indices.next();
 
-            if let Some(_) = wt.next() {
+            if wt.next().is_some() {
                 t_indices = wt.clone();
                 t_curr = t_indices.next();
                 wildcard_t_iter = Some(wt);

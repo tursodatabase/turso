@@ -322,6 +322,13 @@ expect {
     0
 }
 
+test like-complexity-3 {
+    SELECT CAST(iif(NOT -0.5 AND -2.0, NOT NOT 1, like('%G_', 'F_G__EL__')) AS NUMERIC) AND 2.0;
+}
+expect {
+    0
+}
+
 # ESCAPE with non-text types (SQLite coerces via sqlite3_value_text)
 test like-escape-int-0 {
     SELECT '' LIKE '' ESCAPE 0;
