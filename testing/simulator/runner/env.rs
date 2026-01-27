@@ -99,7 +99,10 @@ impl DurabilityState {
                 if file_type == FileType::Wal && *new_len == 0 && !self.wal_durable.is_empty() {
                     let count = self.wal_durable.len();
                     self.db_durable = std::mem::take(&mut self.wal_durable);
-                    tracing::info!("DURABILITY: checkpoint complete - {} tables DB-durable", count);
+                    tracing::info!(
+                        "DURABILITY: checkpoint complete - {} tables DB-durable",
+                        count
+                    );
                 }
             }
         }
@@ -820,7 +823,11 @@ impl SimulatorEnv {
 
         let latency_prof = &self.profile.io.latency;
         let crash_config = (self.opts.crash_at_io_op > 0).then_some(self.opts.crash_at_io_op);
-        let latency = if crash_config.is_some() { 0 } else { latency_prof.latency_probability };
+        let latency = if crash_config.is_some() {
+            0
+        } else {
+            latency_prof.latency_probability
+        };
         let io: Arc<dyn SimIO> = match self.io_backend {
             IoBackend::Memory => Arc::new(MemorySimIO::new(
                 self.opts.seed,
@@ -831,7 +838,15 @@ impl SimulatorEnv {
                 crash_config,
             )),
             _ => Arc::new(
-                SimulatorIO::new(self.opts.seed, self.opts.page_size, latency, latency_prof.min_tick, latency_prof.max_tick, self.io_backend).unwrap(),
+                SimulatorIO::new(
+                    self.opts.seed,
+                    self.opts.page_size,
+                    latency,
+                    latency_prof.min_tick,
+                    latency_prof.max_tick,
+                    self.io_backend,
+                )
+                .unwrap(),
             ),
         };
 
@@ -981,7 +996,11 @@ impl SimulatorEnv {
         let latency_prof = &profile.io.latency;
         let io_backend = cli_opts.io_backend;
         let crash_config = (opts.crash_at_io_op > 0).then_some(opts.crash_at_io_op);
-        let latency = if crash_config.is_some() { 0 } else { latency_prof.latency_probability };
+        let latency = if crash_config.is_some() {
+            0
+        } else {
+            latency_prof.latency_probability
+        };
         let io: Arc<dyn SimIO> = match io_backend {
             IoBackend::Memory => Arc::new(MemorySimIO::new(
                 opts.seed,
@@ -992,7 +1011,15 @@ impl SimulatorEnv {
                 crash_config,
             )),
             _ => Arc::new(
-                SimulatorIO::new(opts.seed, opts.page_size, latency, latency_prof.min_tick, latency_prof.max_tick, io_backend).unwrap(),
+                SimulatorIO::new(
+                    opts.seed,
+                    opts.page_size,
+                    latency,
+                    latency_prof.min_tick,
+                    latency_prof.max_tick,
+                    io_backend,
+                )
+                .unwrap(),
             ),
         };
 
@@ -1193,8 +1220,8 @@ impl SimulatorEnv {
             .map_err(|e| format!("persist failed: {e}"))?;
 
         let db_path = self.get_db_path();
-        let sqlite_conn = rusqlite::Connection::open(&db_path)
-            .map_err(|e| format!("reopen failed: {e}"))?;
+        let sqlite_conn =
+            rusqlite::Connection::open(&db_path).map_err(|e| format!("reopen failed: {e}"))?;
 
         let integrity: String = sqlite_conn
             .query_row("PRAGMA integrity_check", [], |row| row.get(0))
@@ -1227,7 +1254,11 @@ impl SimulatorEnv {
             let actual: Vec<Vec<SimValue>> = stmt
                 .query_map([], |row| {
                     Ok((0..col_count)
-                        .map(|i| Self::rusqlite_to_simvalue(row.get::<_, rusqlite::types::Value>(i).unwrap()))
+                        .map(|i| {
+                            Self::rusqlite_to_simvalue(
+                                row.get::<_, rusqlite::types::Value>(i).unwrap(),
+                            )
+                        })
                         .collect())
                 })
                 .map_err(|e| format!("table '{}': {e}", table.name))?

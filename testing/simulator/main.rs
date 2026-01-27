@@ -216,7 +216,7 @@ fn run_simulator(
                     tracing::error!("Crash recovery failed: {}", e);
                     // Keep original panic result with recovery failure info
                     SandboxedResult::Panicked {
-                        error: format!("{e}"),
+                        error: e.to_string(),
                         last_execution: match &result {
                             SandboxedResult::Panicked { last_execution, .. } => *last_execution,
                             _ => unreachable!(),
