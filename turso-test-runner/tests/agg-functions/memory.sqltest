@@ -92,3 +92,13 @@ expect {
     |5267713247558720570|||28513758867889096
 }
 
+# Regression test: columns with DEFAULT values should return NULL (not the default)
+# when the table is empty and we're in an aggregate query context.
+test ungrouped-agg-empty-table-column-with-default {
+    CREATE TABLE t (x BLOB NOT NULL DEFAULT X'00');
+    SELECT x IS NULL, typeof(x), hex(x), AVG(1) FROM t;
+}
+expect {
+    1|null||
+}
+
