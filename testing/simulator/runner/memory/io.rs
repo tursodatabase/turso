@@ -197,7 +197,7 @@ impl Operation {
                         PendingWrite::Truncate { len } => Some(*len),
                         _ => None,
                     })
-                    .last();
+                    .next_back();
 
                 let had_content = !file.durable_buffer.borrow().is_empty()
                     || file
