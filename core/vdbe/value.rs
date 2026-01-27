@@ -1080,17 +1080,6 @@ impl Value {
             // Fall through to regex if boundary check fails (multi-byte UTF-8)
         }
 
-        // 4. Fast Path: '%abc%' (Contains)
-        if !has_escape && pattern.len() > 1 && pattern.starts_with('%') && pattern.ends_with('%') {
-            let inner = &pattern[1..pattern.len() - 1];
-            if !inner.contains(['%', '_']) {
-                return Ok(text
-                    .to_ascii_lowercase()
-                    .contains(&inner.to_ascii_lowercase()));
-            }
-            // Fall through to regex if boundary check fails (multi-byte UTF-8)
-        }
-
         Ok(pattern_compare(pattern, text, escape) == CompareResult::Match)
     }
 
