@@ -414,11 +414,13 @@ impl PageCache {
 
         let needed_evictable = len.saturating_sub(self.spill_threshold);
 
-        // Fast path: use tracked evictable_count to avoid O(n) scan.
-        // evictable_count is a conservative upper bound on evictable pages
-        // (it doesn't account for locked/pinned/strong_count > 1).
-        // If we have enough pages counted as evictable, we definitely don't need to spill.
-        if self.evictable_count >= needed_evictable {
+        // Fast path: use tracked evictable_count to avoid O(n) scan:
+        // evictable_count is a conservative upper bound on evictable pages,
+        // Empty slots also count as available room since make_room_for uses them first.
+        // Calculate if we have enough room (evictable + empty slots) and won't need to spill.
+        let empty_slots = self.capacity.saturating_sub(len);
+        let available_room = self.evictable_count.saturating_add(empty_slots);
+        if available_room >= needed_evictable {
             return false;
         }
 
@@ -635,8 +637,10 @@ impl PageCache {
             let evictable = Self::evictable(page);
 
             if evictable && entry.ref_bit == CLEAR {
-                // Track evictable count before evicting
-                let was_counted = Self::counted_as_evictable(page);
+                turso_assert!(
+                    Self::counted_as_evictable(page),
+                    "mismatched evictable count state"
+                );
 
                 // Evict this entry
                 self.advance_clock_hand();
@@ -657,9 +661,7 @@ impl PageCache {
                 }
 
                 // Update evictable count after successful eviction
-                if was_counted {
-                    self.evictable_count = self.evictable_count.saturating_sub(1);
-                }
+                self.evictable_count = self.evictable_count.saturating_sub(1);
 
                 return Ok(());
             } else if evictable {
