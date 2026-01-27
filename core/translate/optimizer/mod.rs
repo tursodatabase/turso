@@ -644,7 +644,7 @@ fn optimize_update_plan(
             }
             // Check if this is a generated column that depends on any updated column
             if btree_table.columns[c.pos_in_table].generated.is_some() {
-                let mut visited = HashSet::new();
+                let mut visited = HashSet::default();
                 return column_depends_on_updated(
                     c.pos_in_table,
                     &btree_table.columns,

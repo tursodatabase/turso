@@ -2558,11 +2558,10 @@ fn emit_update_column_values<'a>(
     // This must happen after all SET clause values are in registers
     // We track which columns have been updated/recomputed so that dependent
     // generated columns are also recomputed (chain dependencies).
-    let mut updated_col_set: std::collections::HashSet<usize> =
-        set_clauses.iter().map(|(i, _)| *i).collect();
+    let mut updated_col_set: HashSet<usize> = set_clauses.iter().map(|(i, _)| *i).collect();
 
     // Build column lookup once
-    let column_lookup: std::collections::HashMap<String, usize> = target_table
+    let column_lookup: HashMap<String, usize> = target_table
         .table
         .columns()
         .iter()
@@ -2610,9 +2609,9 @@ fn emit_update_column_values<'a>(
     fn depends_on_updated(
         col_idx: usize,
         columns: &[crate::schema::Column],
-        column_lookup: &std::collections::HashMap<String, usize>,
-        updated_col_set: &std::collections::HashSet<usize>,
-        visited: &mut std::collections::HashSet<usize>,
+        column_lookup: &rustc_hash::FxHashMap<String, usize>,
+        updated_col_set: &rustc_hash::FxHashSet<usize>,
+        visited: &mut rustc_hash::FxHashSet<usize>,
     ) -> bool {
         if visited.contains(&col_idx) {
             return false; // Cycle protection
@@ -2657,7 +2656,7 @@ fn emit_update_column_values<'a>(
 
             let needs_recompute = deps.iter().any(|dep_name| {
                 if let Some(&dep_idx) = column_lookup.get(&dep_name.to_lowercase()) {
-                    let mut visited = std::collections::HashSet::new();
+                    let mut visited = HashSet::default();
                     depends_on_updated(
                         dep_idx,
                         columns,
@@ -2735,7 +2734,7 @@ fn emit_update_column_values<'a>(
 /// Returns indices in the order they should be evaluated.
 pub(super) fn topological_sort_stored_generated_columns(
     columns: &[crate::schema::Column],
-    column_lookup: &std::collections::HashMap<String, usize>,
+    column_lookup: &HashMap<String, usize>,
 ) -> crate::Result<Vec<usize>> {
     use std::collections::{HashSet, VecDeque};
 
@@ -2744,7 +2743,7 @@ pub(super) fn topological_sort_stored_generated_columns(
     fn find_stored_dependencies(
         col_idx: usize,
         columns: &[crate::schema::Column],
-        column_lookup: &std::collections::HashMap<String, usize>,
+        column_lookup: &HashMap<String, usize>,
         visited: &mut HashSet<usize>,
         result: &mut HashSet<usize>,
     ) {
@@ -2842,7 +2841,7 @@ pub(super) fn emit_generated_expr_from_registers(
     expr: &turso_parser::ast::Expr,
     target_reg: usize,
     registers_start: usize,
-    column_lookup: &std::collections::HashMap<String, usize>,
+    column_lookup: &HashMap<String, usize>,
     columns: &[crate::schema::Column],
     resolver: &Resolver,
     rowid_reg: Option<usize>,
@@ -2870,7 +2869,7 @@ pub(super) fn compute_virtual_columns_for_update_triggers(
     program: &mut ProgramBuilder,
     columns: &[crate::schema::Column],
     registers_start: usize,
-    column_lookup: &std::collections::HashMap<String, usize>,
+    column_lookup: &HashMap<String, usize>,
     resolver: &Resolver,
     rowid_reg: Option<usize>,
 ) -> crate::Result<()> {
@@ -2907,7 +2906,7 @@ pub(super) fn compute_virtual_columns_for_old_context(
     program: &mut ProgramBuilder,
     columns: &[crate::schema::Column],
     old_registers: &[usize],
-    column_lookup: &std::collections::HashMap<String, usize>,
+    column_lookup: &HashMap<String, usize>,
     resolver: &Resolver,
 ) -> crate::Result<()> {
     use super::expr::{translate_expr_with_context, ExprContext};
@@ -3176,7 +3175,7 @@ fn emit_update_insns<'a>(
             // Compute VIRTUAL column values for trigger access
             // VIRTUAL columns are normally NULL (computed on read), but triggers need actual values
             let columns = target_table.table.columns();
-            let column_lookup: std::collections::HashMap<String, usize> = columns
+            let column_lookup: HashMap<String, usize> = columns
                 .iter()
                 .enumerate()
                 .filter_map(|(i, col)| col.name.as_ref().map(|name| (name.to_lowercase(), i)))
@@ -4103,7 +4102,7 @@ fn emit_update_insns<'a>(
                 // Compute VIRTUAL column values for trigger access
                 // VIRTUAL columns are normally NULL (computed on read), but triggers need actual values
                 let columns = target_table.table.columns();
-                let column_lookup: std::collections::HashMap<String, usize> = columns
+                let column_lookup: HashMap<String, usize> = columns
                     .iter()
                     .enumerate()
                     .filter_map(|(i, col)| col.name.as_ref().map(|name| (name.to_lowercase(), i)))

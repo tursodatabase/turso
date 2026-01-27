@@ -578,7 +578,7 @@ pub fn emit_upsert(
 
             let needs_recompute = deps.iter().any(|dep_name| {
                 if let Some(&dep_idx) = column_lookup.get(&dep_name.to_lowercase()) {
-                    let mut visited = HashSet::new();
+                    let mut visited = HashSet::default();
                     depends_on_updated(
                         dep_idx,
                         columns,

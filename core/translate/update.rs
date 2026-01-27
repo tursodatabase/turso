@@ -413,7 +413,7 @@ pub fn prepare_update_plan(
                             // When the regular column is updated, indexes on the STORED column
                             // that depends on the VIRTUAL column must also be updated.
                             if columns[c.pos_in_table].generated.is_some() {
-                                let mut visited = HashSet::new();
+                                let mut visited = HashSet::default();
                                 return column_depends_on_updated(
                                     c.pos_in_table,
                                     columns,
@@ -434,7 +434,7 @@ pub fn prepare_update_plan(
                                     }
                                     // If column in expression is a generated column, check transitive deps
                                     if columns[*cidx].generated.is_some() {
-                                        let mut visited = HashSet::new();
+                                        let mut visited = HashSet::default();
                                         return column_depends_on_updated(
                                             *cidx,
                                             columns,
@@ -548,7 +548,7 @@ fn columns_used_by_index_expr(
 /// Collects column name references from an AST expression (before binding).
 /// Used to determine dependencies for generated column expressions.
 pub fn collect_column_refs_from_ast_expr(expr: &Expr) -> HashSet<String> {
-    let mut refs = HashSet::new();
+    let mut refs = HashSet::default();
     collect_column_refs_recursive(expr, &mut refs);
     refs
 }

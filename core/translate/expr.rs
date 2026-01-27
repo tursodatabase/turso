@@ -1,5 +1,6 @@
 use crate::sync::Arc;
 use crate::translate::optimizer::constraints::ConstraintOperator;
+use rustc_hash::FxHashMap as HashMap;
 
 use tracing::{instrument, Level};
 use turso_parser::ast::{self, Expr, SubqueryType, UnaryOperator};
@@ -29,7 +30,6 @@ use crate::vdbe::{
     BranchOffset,
 };
 use crate::{turso_assert, Result, Value};
-use std::collections::HashMap;
 
 use super::collate::CollationSeq;
 
