@@ -13,6 +13,33 @@ use crate::runner::{
     memory::io::{CallbackQueue, Fd, Operation, OperationType},
 };
 
+/// A pending write operation that hasn't been synced yet.
+#[derive(Debug, Clone)]
+pub enum PendingWrite {
+    /// A write operation: offset and data
+    Write { offset: usize, data: Vec<u8> },
+    /// A truncate operation: new length
+    Truncate { len: usize },
+}
+
+impl PendingWrite {
+    /// used for reads and flush
+    pub fn apply_to(&self, buffer: &mut Vec<u8>) {
+        match self {
+            PendingWrite::Write { offset, data } => {
+                let end = offset + data.len();
+                if end > buffer.len() {
+                    buffer.resize(end, 0);
+                }
+                buffer[*offset..end].copy_from_slice(data);
+            }
+            PendingWrite::Truncate { len } => {
+                buffer.truncate(*len);
+            }
+        }
+    }
+}
+
 /// Tracks IO calls and faults for each type of I/O operation
 #[derive(Debug, Default)]
 struct IOTracker {
@@ -47,8 +74,10 @@ pub struct MemorySimFile {
     // and then we just do a mem swap the pending with the callback to minimize lock contention on callback queue
     pub callbacks: CallbackQueue,
     pub fd: Arc<Fd>,
-    pub buffer: RefCell<Vec<u8>>,
-    // TODO: add fault map later here
+    /// Durable buffer: data that has been fsynced (survives crash)
+    pub durable_buffer: RefCell<Vec<u8>>,
+    /// Pending writes: not yet fsynced (lost on crash/power-loss)
+    pub pending_writes: RefCell<Vec<PendingWrite>>,
     pub closed: Cell<bool>,
     io_tracker: RefCell<IOTracker>,
     pub rng: RefCell<ChaCha8Rng>,
@@ -71,7 +100,8 @@ impl MemorySimFile {
         Self {
             callbacks,
             fd: Arc::new(fd),
-            buffer: RefCell::new(Vec::new()),
+            durable_buffer: RefCell::new(Vec::new()),
+            pending_writes: RefCell::new(Vec::new()),
             closed: Cell::new(false),
             io_tracker: RefCell::new(IOTracker::default()),
             rng: RefCell::new(ChaCha8Rng::seed_from_u64(seed)),
@@ -88,8 +118,9 @@ impl MemorySimFile {
     pub fn stats_table(&self) -> String {
         let io_tracker = self.io_tracker.borrow();
         let sum_calls = io_tracker.total_calls();
+
         let stats_table = [
-            "op        calls    faults  ".to_string(),
+            "op        calls    faults".to_string(),
             "--------- -------- --------".to_string(),
             format!(
                 "pread     {:8} {:8}",
@@ -152,22 +183,24 @@ impl MemorySimFile {
         });
     }
 
-    pub fn write_buf(&self, buf: &[u8], offset: usize) -> usize {
-        let mut file_buf = self.buffer.borrow_mut();
-        let more_space = if file_buf.len() < offset {
-            (offset + buf.len()) - file_buf.len()
-        } else {
-            buf.len().saturating_sub(file_buf.len() - offset)
-        };
-        if more_space > 0 {
-            file_buf.reserve(more_space);
-            for _ in 0..more_space {
-                file_buf.push(0);
-            }
-        }
+    pub fn write_buf(&self, buf: &[u8], offset: usize) {
+        self.pending_writes.borrow_mut().push(PendingWrite::Write {
+            offset,
+            data: buf.to_vec(),
+        });
+    }
 
-        file_buf[offset..][0..buf.len()].copy_from_slice(buf);
-        buf.len()
+    /// Flush pending writes to durable buffer (called on fsync).
+    pub fn flush_pending(&self) {
+        let mut durable = self.durable_buffer.borrow_mut();
+        for write in self.pending_writes.borrow_mut().drain(..) {
+            write.apply_to(&mut durable);
+        }
+    }
+
+    /// Discard pending writes (called on crash).
+    pub fn discard_pending(&self) {
+        self.pending_writes.borrow_mut().clear();
     }
 }
 
@@ -238,7 +271,16 @@ impl File for MemorySimFile {
     fn size(&self) -> Result<u64> {
         // TODO: size operation should also be scheduled. But this requires a change in how we
         // Use this function internally in Turso
-        Ok(self.buffer.borrow().len() as u64)
+        // Compute effective size: start with durable, apply pending writes
+        let durable_len = self.durable_buffer.borrow().len();
+        let pending = self.pending_writes.borrow();
+
+        let effective_len = pending.iter().fold(durable_len, |len, write| match write {
+            PendingWrite::Write { offset, data } => len.max(offset + data.len()),
+            PendingWrite::Truncate { len: truncate_len } => *truncate_len,
+        });
+
+        Ok(effective_len as u64)
     }
 
     fn truncate(&self, len: u64, c: Completion) -> Result<Completion> {

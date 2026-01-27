@@ -105,6 +105,7 @@ pub(crate) fn execute_interactions(
         // Execute the interaction for the selected connection
         match execute_plan(&mut env, &interaction, conn_state) {
             Ok(ExecutionContinuation::NextInteraction) => {
+                env.update_durability();
                 state.interaction_pointer += 1;
                 let Some(new_interaction) = plan.next(&mut env) else {
                     break;
@@ -112,6 +113,7 @@ pub(crate) fn execute_interactions(
                 interaction = new_interaction;
             }
             Ok(ExecutionContinuation::NextInteractionOutsideThisProperty) => {
+                env.update_durability();
                 // Skip remaining interactions in this property by advancing until we
                 // find an interaction with a different id (i.e., a different property)
                 let current_property_id = interaction.id();
@@ -128,9 +130,12 @@ pub(crate) fn execute_interactions(
                 }
             }
             Err(err) => {
+                env.update_durability();
                 return ExecutionResult::new(history, Some(err));
             }
-            _ => {}
+            _ => {
+                env.update_durability();
+            }
         }
         // Check if the maximum time for the simulation has been reached
         if now.elapsed().as_secs() >= env.opts.max_time_simulation as u64 {

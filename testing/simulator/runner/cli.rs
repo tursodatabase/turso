@@ -177,6 +177,10 @@ pub struct SimulatorCLI {
     #[clap(long, default_value_t = ProfileType::Default)]
     /// Profile selector for Simulation run
     pub profile: ProfileType,
+
+    #[clap(long)]
+    #[serde(default)]
+    pub crash_fuzz: bool,
 }
 
 #[derive(Parser, Debug, Clone, Serialize, Deserialize, PartialEq, PartialOrd, Eq, Ord)]
