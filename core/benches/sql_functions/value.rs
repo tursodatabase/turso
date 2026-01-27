@@ -907,71 +907,25 @@ fn exec_if_not(bencher: Bencher) {
 // =============================================================================
 
 #[divan::bench]
-fn construct_like_regex_simple(bencher: Bencher) {
+fn construct_like_exact(bencher: Bencher) {
     bencher.bench_local(|| Value::exec_like(black_box("hello"), black_box("hello"), None).unwrap());
 }
 
 #[divan::bench]
-fn construct_like_regex_with_percent(bencher: Bencher) {
+fn construct_like_contains(bencher: Bencher) {
     bencher
         .bench_local(|| Value::exec_like(black_box("%hello%"), black_box("hello"), None).unwrap());
 }
 
 #[divan::bench]
-fn construct_like_regex_with_underscore(bencher: Bencher) {
+fn construct_like_with_single_wildcard(bencher: Bencher) {
     bencher.bench_local(|| Value::exec_like(black_box("h_llo"), black_box("hello"), None).unwrap());
 }
 
 #[divan::bench]
-fn construct_like_regex_complex(bencher: Bencher) {
+fn construct_like_complex(bencher: Bencher) {
     bencher.bench_local(|| {
         Value::exec_like(black_box("%h_llo%w_rld%"), black_box("hello world"), None).unwrap()
-    });
-}
-
-// =============================================================================
-// exec_like
-// =============================================================================
-
-#[divan::bench]
-fn exec_like_no_cache(bencher: Bencher) {
-    bencher.bench_local(|| {
-        Value::exec_like(black_box("hello%"), black_box("hello world"), None).unwrap()
-    });
-}
-
-#[divan::bench]
-fn exec_like_with_cache_miss(bencher: Bencher) {
-    bencher.bench_local(|| {
-        Value::exec_like(black_box("hello%"), black_box("hello world"), None).unwrap()
-    });
-}
-
-#[divan::bench]
-fn exec_like_with_cache_hit(bencher: Bencher) {
-    bencher.bench_local(|| {
-        Value::exec_like(black_box("hello%"), black_box("hello world"), None).unwrap()
-    });
-}
-
-#[divan::bench]
-fn exec_like_fallback_no_cache(bencher: Bencher) {
-    bencher.bench_local(|| {
-        Value::exec_like(black_box("hello_world"), black_box("hello world"), None).unwrap()
-    });
-}
-
-#[divan::bench]
-fn exec_like_fallback_with_cache_miss(bencher: Bencher) {
-    bencher.bench_local(|| {
-        Value::exec_like(black_box("hello_world"), black_box("hello world"), None).unwrap()
-    });
-}
-
-#[divan::bench]
-fn exec_like_fallback_with_cache_hit(bencher: Bencher) {
-    bencher.bench_local(|| {
-        Value::exec_like(black_box("hello_world"), black_box("hello world"), None).unwrap()
     });
 }
 
