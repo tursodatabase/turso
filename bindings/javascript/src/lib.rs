@@ -718,7 +718,7 @@ impl Statement {
         for i in 0..column_count {
             let mut js_obj = Object::new(env)?;
             let column_name = stmt.get_column_name(i);
-            let column_type = stmt.get_column_type(i);
+            let column_type = stmt.get_column_type_name(i);
 
             // Set the name property
             js_obj.set("name", column_name.as_ref())?;
