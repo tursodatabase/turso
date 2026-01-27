@@ -338,7 +338,7 @@ test alter-table-add-generated-column-error {
     ALTER TABLE t ADD COLUMN b AS (NULL) STORED;
 }
 expect error {
-    Cannot add a STORED generated column
+    cannot add a STORED column
 }
 
 test alter-column-only-to-generated-error {
