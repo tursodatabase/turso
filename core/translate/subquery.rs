@@ -528,15 +528,8 @@ fn update_column_used_masks(
     table_refs: &mut TableReferences,
     subqueries: &mut [NonFromClauseSubquery],
 ) {
-    for subquery in subqueries.iter_mut() {
-        let SubqueryState::Unevaluated { plan } = &mut subquery.state else {
-            panic!("subquery has already been evaluated");
-        };
-        let Some(child_plan) = plan.as_mut() else {
-            panic!("subquery has no plan");
-        };
-
-        for child_outer_query_ref in child_plan
+    fn propagate_outer_refs_from_select_plan(table_refs: &mut TableReferences, plan: &SelectPlan) {
+        for child_outer_query_ref in plan
             .table_references
             .outer_query_refs()
             .iter()
@@ -553,6 +546,57 @@ fn update_column_used_masks(
                 outer_query_ref.col_used_mask |= &child_outer_query_ref.col_used_mask;
             }
         }
+
+        for joined_table in plan.table_references.joined_tables().iter() {
+            if let Table::FromClauseSubquery(from_clause_subquery) = &joined_table.table {
+                propagate_outer_refs_from_plan(table_refs, from_clause_subquery.plan.as_ref());
+            }
+        }
+    }
+
+    fn propagate_outer_refs_from_plan(table_refs: &mut TableReferences, plan: &Plan) {
+        match plan {
+            Plan::Select(select_plan) => {
+                propagate_outer_refs_from_select_plan(table_refs, select_plan);
+            }
+            Plan::CompoundSelect {
+                left, right_most, ..
+            } => {
+                for (select_plan, _) in left.iter() {
+                    propagate_outer_refs_from_select_plan(table_refs, select_plan);
+                }
+                propagate_outer_refs_from_select_plan(table_refs, right_most);
+            }
+            Plan::Delete(_) | Plan::Update(_) => {}
+        }
+    }
+
+    for subquery in subqueries.iter_mut() {
+        let SubqueryState::Unevaluated { plan } = &mut subquery.state else {
+            panic!("subquery has already been evaluated");
+        };
+        let Some(child_plan) = plan.as_mut() else {
+            panic!("subquery has no plan");
+        };
+
+        propagate_outer_refs_from_select_plan(table_refs, child_plan);
+    }
+
+    // Collect raw plan pointers to avoid cloning while sidestepping borrow rules.
+    let from_clause_plans = table_refs
+        .joined_tables()
+        .iter()
+        .filter_map(|t| match &t.table {
+            Table::FromClauseSubquery(from_clause_subquery) => {
+                Some(from_clause_subquery.plan.as_ref() as *const Plan)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    for plan in from_clause_plans {
+        // SAFETY: plans live within table_refs for the duration of this function.
+        let plan = unsafe { &*plan };
+        propagate_outer_refs_from_plan(table_refs, plan);
     }
 }
 
