@@ -28,6 +28,32 @@ use std::fmt::Display;
 use std::ops::Deref;
 use tracing::{instrument, Level};
 
+/// Database connection handle.
+///
+/// # Compile-Affecting Fields
+///
+/// The following fields affect SQL statement compilation and are tracked by `PrepareContext`
+/// in `vdbe/mod.rs`. If you add a new field that affects how statements are compiled or
+/// executed, you MUST also update `PrepareContext::from_connection()` to include it
+/// in core/vdbe/mod.rs.
+/// Failure to do so will cause stale cached statements to be used incorrectly.
+///
+/// Currently tracked fields:
+/// - `db` (via database pointer identity)
+/// - `fk_pragma` (foreign_keys)
+/// - `query_only`
+/// - `capture_data_changes`
+/// - `syms` / `syms_generation` (registered functions, virtual tables, etc.)
+/// - `attached_databases` (via fingerprint)
+/// - `busy_handler` (timeout affects retry behavior)
+/// - `cache_size`
+/// - `page_size`
+/// - `sync_mode`
+/// - `data_sync_retry`
+/// - `encryption_key` (whether set)
+/// - `encryption_cipher_mode`
+/// - Pager's `spill_enabled` setting
+/// - MVCC checkpoint threshold (when MVCC enabled)
 pub struct Connection {
     pub(crate) db: Arc<Database>,
     pub(crate) pager: ArcSwap<Pager>,

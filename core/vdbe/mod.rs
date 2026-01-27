@@ -828,6 +828,23 @@ pub struct Program {
     pub connection: Arc<Connection>,
 }
 
+/// Captures connection settings at statement preparation time for cache invalidation.
+///
+/// This struct is used to detect when a cached prepared statement needs to be recompiled
+/// because relevant connection settings have changed. When `matches_connection()` returns
+/// false, the statement will be automatically reprepared before execution.
+///
+/// # Adding New Fields
+///
+/// If you add a new setting to `Connection` that affects statement compilation or execution,
+/// you MUST add a corresponding field here and update `from_connection()`. See the doc
+/// comment on `Connection` in `connection.rs` for the authoritative list of tracked fields.
+///
+/// Fields that affect compilation include (but are not limited to):
+/// - PRAGMA settings that change query semantics (foreign_keys, query_only, etc.)
+/// - Registered functions/virtual tables (tracked via syms_generation)
+/// - Attached databases (tracked via fingerprint)
+/// - Storage settings (page_size, cache_size, encryption, sync_mode, etc.)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrepareContext {
     database_ptr: usize,
