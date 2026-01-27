@@ -1188,6 +1188,9 @@ impl Value {
     }
 }
 
+/// Result of LIKE pattern comparison.
+/// `NoWildcardMatch` signals an early abort when a literal after `%` cannot be found,
+/// allowing the algorithm to skip unnecessary backtracking.
 #[derive(PartialEq)]
 enum CompareResult {
     Match,
@@ -1195,6 +1198,9 @@ enum CompareResult {
     NoWildcardMatch,
 }
 
+/// LIKE pattern matching based on SQLite's patternCompare algorithm (src/func.c).
+/// Uses recursive descent with early termination via `NoWildcardMatch` to avoid
+/// exponential backtracking on patterns like `%a%a%a%...%b`.
 fn pattern_compare(mut pattern: &str, mut text: &str, escape: Option<char>) -> CompareResult {
     let match_all = '%';
     let match_one = '_';
