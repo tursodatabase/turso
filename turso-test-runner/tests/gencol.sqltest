@@ -1424,6 +1424,7 @@ expect error {
 # -----------------------------------------------------------------------------
 
 # CREATE INDEX on STORED generated column
+@skip-if mvcc "Expression indexes are not supported with MVCC"
 test gencol_index_on_stored {
     CREATE TABLE t1(a INTEGER, b AS (a * 2) STORED);
     CREATE INDEX idx_b ON t1(b);
@@ -1436,6 +1437,7 @@ expect {
 }
 
 # CREATE INDEX on VIRTUAL generated column
+@skip-if mvcc "Expression indexes are not supported with MVCC"
 test gencol_index_on_virtual {
     CREATE TABLE t1(a INTEGER, b AS (a * 2));
     CREATE INDEX idx_b ON t1(b);
@@ -1448,6 +1450,7 @@ expect {
 }
 
 # UNIQUE INDEX on STORED column - success
+@skip-if mvcc "Expression indexes are not supported with MVCC"
 test gencol_unique_index_stored_success {
     CREATE TABLE t1(a INTEGER, b AS (a * 2) STORED);
     CREATE UNIQUE INDEX idx_b ON t1(b);
@@ -1460,6 +1463,7 @@ expect {
 }
 
 # UNIQUE INDEX on STORED column - violation
+@skip-if mvcc "Expression indexes are not supported with MVCC"
 test gencol_unique_index_stored_violation {
     CREATE TABLE t1(a INTEGER, b AS (a * 2) STORED);
     CREATE UNIQUE INDEX idx_b ON t1(b);
@@ -1470,6 +1474,7 @@ expect error {
 }
 
 # UNIQUE INDEX with NULL handling
+@skip-if mvcc "Expression indexes are not supported with MVCC"
 test gencol_unique_index_null {
     CREATE TABLE t1(a INTEGER, b AS (a * 2) STORED);
     CREATE UNIQUE INDEX idx_b ON t1(b);
@@ -1482,6 +1487,7 @@ expect {
 }
 
 # Composite index with generated column
+@skip-if mvcc "Expression indexes are not supported with MVCC"
 test gencol_composite_index {
     CREATE TABLE t1(a INTEGER, b TEXT, c AS (a * 2) STORED);
     CREATE INDEX idx_bc ON t1(b, c);
@@ -1494,6 +1500,7 @@ expect {
 }
 
 # Index update when base column changes - verify index is updated when base column changes
+@skip-if mvcc "Expression indexes are not supported with MVCC"
 test gencol_index_update_on_base_change {
     CREATE TABLE t1(a INTEGER, b AS (a * 2) STORED);
     CREATE INDEX idx_b ON t1(b);
@@ -1506,6 +1513,7 @@ expect {
 }
 
 # Index with multiple generated columns
+@skip-if mvcc "Expression indexes are not supported with MVCC"
 test gencol_index_multiple_gencols {
     CREATE TABLE t1(a INTEGER, b AS (a + 1) STORED, c AS (a + 2) STORED);
     CREATE INDEX idx_bc ON t1(b, c);
@@ -1517,6 +1525,7 @@ expect {
 }
 
 # Index scan on generated column with ORDER BY
+@skip-if mvcc "Expression indexes are not supported with MVCC"
 test gencol_index_order_by {
     CREATE TABLE t1(a INTEGER, b AS (a * 2) STORED);
     CREATE INDEX idx_b ON t1(b);
@@ -1532,6 +1541,7 @@ expect {
 }
 
 # Index range scan on generated column
+@skip-if mvcc "Expression indexes are not supported with MVCC"
 test gencol_index_range_scan {
     CREATE TABLE t1(a INTEGER, b AS (a * 10) STORED);
     CREATE INDEX idx_b ON t1(b);
@@ -1545,6 +1555,7 @@ expect {
 }
 
 # Index on generated column with expression in WHERE
+@skip-if mvcc "Expression indexes are not supported with MVCC"
 test gencol_index_expression_where {
     CREATE TABLE t1(a INTEGER, b AS (a * 2) STORED);
     CREATE INDEX idx_b ON t1(b);
@@ -1567,6 +1578,7 @@ expect {
 }
 
 # Non-covering index - needs table for column 'c'
+@skip-if mvcc "Expression indexes are not supported with MVCC"
 test gencol_virtual_non_covering_index {
     CREATE TABLE t1(a INTEGER, b AS (a * 2), c TEXT);
     CREATE INDEX idx_b ON t1(b);
@@ -1579,6 +1591,7 @@ expect {
 }
 
 # Covering index - can read VIRTUAL column directly from index
+@skip-if mvcc "Expression indexes are not supported with MVCC"
 test gencol_virtual_covering_index {
     CREATE TABLE t1(a INTEGER, b AS (a * 2));
     CREATE INDEX idx_b ON t1(b);
@@ -1591,6 +1604,7 @@ expect {
 }
 
 # Verify VIRTUAL column index is used for WHERE filtering with range queries
+@skip-if mvcc "Expression indexes are not supported with MVCC"
 test gencol_index_virtual_where_filter {
     CREATE TABLE t1(a INTEGER, b AS (a * 2));
     CREATE INDEX idx_b ON t1(b);
@@ -2468,6 +2482,7 @@ expect {
     5|10
 }
 
+@skip-if mvcc "Expression indexes are not supported with MVCC"
 test gencol_rename_column_case_insensitive_with_index {
     CREATE TABLE t1(MyCol INTEGER, b AS (MyCol * 2) STORED);
     CREATE INDEX idx ON t1(b);
@@ -2566,6 +2581,7 @@ expect {
 
 # Test that index on VIRTUAL column is updated when base changes.
 # Index on VIRTUAL column - INSERT and UPDATE with integrity check.
+@skip-if mvcc "Expression indexes are not supported with MVCC"
 test gencol_index_virtual_update_integrity {
     CREATE TABLE t1(a INTEGER, b INTEGER, c AS (a + b));
     CREATE INDEX idx_c ON t1(c);
@@ -2582,6 +2598,7 @@ expect {
 }
 
 # Multiple updates maintain integrity on VIRTUAL column index.
+@skip-if mvcc "Expression indexes are not supported with MVCC"
 test gencol_index_virtual_multiple_updates {
     CREATE TABLE t1(a INTEGER, b INTEGER, c AS (a * b));
     CREATE INDEX idx_c ON t1(c);
@@ -2597,6 +2614,7 @@ expect {
 }
 
 # Test that index on STORED column is updated when base changes
+@skip-if mvcc "Expression indexes are not supported with MVCC"
 test gencol_index_stored_update_integrity {
     CREATE TABLE t1(a INTEGER, b INTEGER, c AS (a + b) STORED);
     CREATE INDEX idx_c ON t1(c);
@@ -2608,6 +2626,7 @@ expect {
     30
 }
 
+@skip-if mvcc "Expression indexes are not supported with MVCC"
 test gencol_index_stored_update_integrity_2 {
     CREATE TABLE t1(a INTEGER, b INTEGER, c AS (a + b) STORED);
     CREATE INDEX idx_c ON t1(c);
@@ -2620,6 +2639,7 @@ expect {
     120
 }
 
+@skip-if mvcc "Expression indexes are not supported with MVCC"
 test gencol_index_stored_update_integrity_check {
     CREATE TABLE t1(a INTEGER, b INTEGER, c AS (a + b) STORED);
     CREATE INDEX idx_c ON t1(c);
@@ -2632,6 +2652,7 @@ expect {
 }
 
 # Multiple updates with indexed STORED column
+@skip-if mvcc "Expression indexes are not supported with MVCC"
 test gencol_index_stored_multiple_updates {
     CREATE TABLE t1(a INTEGER, b INTEGER, c AS (a * b) STORED);
     CREATE INDEX idx_c ON t1(c);
@@ -2644,6 +2665,7 @@ expect {
     5|7|35
 }
 
+@skip-if mvcc "Expression indexes are not supported with MVCC"
 test gencol_index_stored_multiple_updates_integrity {
     CREATE TABLE t1(a INTEGER, b INTEGER, c AS (a * b) STORED);
     CREATE INDEX idx_c ON t1(c);
@@ -2810,6 +2832,7 @@ expect {
 # -----------------------------------------------------------------------------
 
 # Basic integrity check with index on VIRTUAL column
+@skip-if mvcc "Expression indexes are not supported with MVCC"
 test gencol_integrity_virtual_index {
     CREATE TABLE t1(a INTEGER, b INTEGER, c AS (a + b));
     CREATE INDEX idx_c ON t1(c);
@@ -2823,6 +2846,7 @@ expect {
 
 # Integrity check with VIRTUAL column in the middle of the table
 # Tests that physical-to-logical column mapping works correctly
+@skip-if mvcc "Expression indexes are not supported with MVCC"
 test gencol_integrity_virtual_middle {
     CREATE TABLE t1(x INTEGER, v AS (x * 2), y INTEGER);
     CREATE INDEX idx_y ON t1(y);
@@ -2835,6 +2859,7 @@ expect {
 }
 
 # Multiple VIRTUAL columns before the indexed column
+@skip-if mvcc "Expression indexes are not supported with MVCC"
 test gencol_integrity_multiple_virtual_before {
     CREATE TABLE t1(a INTEGER, v1 AS (a), v2 AS (a * 2), b INTEGER);
     CREATE INDEX idx_b ON t1(b);
@@ -2863,6 +2888,7 @@ expect {
 # ============================================================================
 
 # Basic VIRTUAL column index UPDATE - verify result and integrity.
+@skip-if mvcc "Expression indexes are not supported with MVCC"
 test gencol_index_virtual_update_basic {
     CREATE TABLE t1(a INTEGER, b AS (a * 2));
     CREATE INDEX idx_b ON t1(b);
@@ -2877,6 +2903,7 @@ expect {
 }
 
 # VIRTUAL column referencing another VIRTUAL column with index - verify result and integrity.
+@skip-if mvcc "Expression indexes are not supported with MVCC"
 test gencol_index_virtual_chain {
     CREATE TABLE t1(x INTEGER, y AS (x + 1), z AS (y * 2));
     CREATE INDEX idx_z ON t1(z);
@@ -2891,6 +2918,7 @@ expect {
 }
 
 # VIRTUAL column referencing STORED column with index - verify result and integrity.
+@skip-if mvcc "Expression indexes are not supported with MVCC"
 test gencol_index_virtual_refs_stored {
     CREATE TABLE t1(a INTEGER, b AS (a * 2) STORED, c AS (b + 1));
     CREATE INDEX idx_c ON t1(c);
@@ -2905,6 +2933,7 @@ expect {
 }
 
 # Multiple rows with VIRTUAL index UPDATE - verify result and integrity.
+@skip-if mvcc "Expression indexes are not supported with MVCC"
 test gencol_index_virtual_multirow_update {
     CREATE TABLE t1(id INTEGER PRIMARY KEY, val INTEGER, computed AS (val * 10));
     CREATE INDEX idx_computed ON t1(computed);
@@ -2921,6 +2950,7 @@ expect {
 }
 
 # Expression index referencing VIRTUAL column - verify result and integrity.
+@skip-if mvcc "Expression indexes are not supported with MVCC"
 test gencol_expression_index_on_virtual {
     CREATE TABLE t1(a INTEGER, b AS (a + 1));
     CREATE INDEX idx_expr ON t1(b * 2);
@@ -2935,6 +2965,7 @@ expect {
 }
 
 # Expression index on VIRTUAL - basic integrity check
+@skip-if mvcc "Expression indexes are not supported with MVCC"
 test gencol_expression_index_on_virtual_basic_integrity {
     CREATE TABLE t1(a INTEGER, b AS (a * 2));
     CREATE INDEX idx ON t1(b + 10);
@@ -2946,6 +2977,7 @@ expect {
 }
 
 # Multiple expression indexes on same VIRTUAL column
+@skip-if mvcc "Expression indexes are not supported with MVCC"
 test gencol_multiple_expr_indexes_virtual_integrity {
     CREATE TABLE t1(a INTEGER, b AS (a + 1));
     CREATE INDEX idx1 ON t1(b * 2);
@@ -2958,6 +2990,7 @@ expect {
 }
 
 # Expression index referencing multiple VIRTUAL columns
+@skip-if mvcc "Expression indexes are not supported with MVCC"
 test gencol_expr_index_multi_virtual_integrity {
     CREATE TABLE t1(a INTEGER, b AS (a + 1), c AS (a * 2));
     CREATE INDEX idx ON t1(b + c);
@@ -2969,6 +3002,7 @@ expect {
 }
 
 # Mixed: expression index + regular index on VIRTUAL
+@skip-if mvcc "Expression indexes are not supported with MVCC"
 test gencol_mixed_indexes_virtual_integrity {
     CREATE TABLE t1(a INTEGER, b AS (a + 1) STORED, c AS (a * 2));
     CREATE INDEX idx_stored ON t1(b);
@@ -3060,6 +3094,7 @@ expect {
 # -----------------------------------------------------------------------------
 
 # Basic chain: a -> VIRTUAL b -> STORED c with index on c
+@skip-if mvcc "Expression indexes are not supported with MVCC"
 test gencol_update_index_stored_via_virtual {
     CREATE TABLE t1(a INTEGER, b AS (a * 2), c AS (b + 100) STORED, d TEXT);
     CREATE INDEX idx1 ON t1(c, d);
@@ -3072,6 +3107,7 @@ expect {
 }
 
 # Verify data correctness after UPDATE
+@skip-if mvcc "Expression indexes are not supported with MVCC"
 test gencol_update_index_stored_via_virtual_data {
     CREATE TABLE t1(a INTEGER, b AS (a * 2), c AS (b + 100) STORED, d TEXT);
     CREATE INDEX idx1 ON t1(c, d);
@@ -3086,6 +3122,7 @@ expect {
 }
 
 # Deeper chain: a -> VIRTUAL b -> VIRTUAL c -> STORED d with index
+@skip-if mvcc "Expression indexes are not supported with MVCC"
 test gencol_update_index_deep_chain {
     CREATE TABLE t1(a INTEGER, b AS (a + 1), c AS (b * 2), d AS (c + 10) STORED, e TEXT);
     CREATE INDEX idx1 ON t1(d);
@@ -3098,6 +3135,7 @@ expect {
 }
 
 # Multiple STORED columns depending on same VIRTUAL
+@skip-if mvcc "Expression indexes are not supported with MVCC"
 test gencol_update_index_multiple_stored {
     CREATE TABLE t1(a INTEGER, v AS (a * 10), s1 AS (v + 1) STORED, s2 AS (v + 2) STORED);
     CREATE INDEX idx_s1 ON t1(s1);
@@ -3119,6 +3157,7 @@ expect {
 # -----------------------------------------------------------------------------
 
 # Test: VIRTUAL column chain in index during UPDATE
+@skip-if mvcc "Expression indexes are not supported with MVCC"
 test gencol_update_virtual_chain_in_index {
     CREATE TABLE t_virt_chain (
         base INTEGER,
@@ -3135,6 +3174,7 @@ expect {
 }
 
 # Verify integrity after VIRTUAL chain UPDATE
+@skip-if mvcc "Expression indexes are not supported with MVCC"
 test gencol_update_virtual_chain_in_index_integrity {
     CREATE TABLE t_virt_chain2 (
         base INTEGER,
@@ -3153,6 +3193,7 @@ expect {
 # Deeper VIRTUAL chain: a -> v1 -> v2 -> v3 with index on v3
 # For a=10: v1=11, v2=22, v3=33
 # For a=20: v1=21, v2=42, v3=63
+@skip-if mvcc "Expression indexes are not supported with MVCC"
 test gencol_update_deep_virtual_chain_in_index {
     CREATE TABLE t_deep_virt (
         a INTEGER,
@@ -3172,6 +3213,7 @@ expect {
 # Multiple rows with VIRTUAL chain index
 # Row 1: v1=50, v2=51; Row 2: v1=100, v2=102; Row 3: v1=150, v2=153
 # After UPDATE: Row 2 becomes v1=110, v2=112
+@skip-if mvcc "Expression indexes are not supported with MVCC"
 test gencol_update_virtual_chain_multiple_rows {
     CREATE TABLE t_multi (
         id INTEGER PRIMARY KEY,
@@ -3197,6 +3239,7 @@ expect {
 # Index layout: [a=pos0, c=pos1, b=pos2]
 # Column c should read from index position 1, not position 2.
 
+@skip-if mvcc "Expression indexes are not supported with MVCC"
 test gencol_covering_index_virtual_column_dependency {
     CREATE TABLE t1 (a TEXT, b REAL AS (c), c INTEGER, d TEXT AS ('gen_46'));
     INSERT INTO t1 (a, c) VALUES ('test', 4658494526751244126);
@@ -3216,6 +3259,7 @@ expect {
 # 2. A separate index on just the STORED column
 # The issue is that certain rows are not updated even though they match the predicate.
 
+@skip-if mvcc "Expression indexes are not supported with MVCC"
 test gencol_update_stored_multi_index_predicate {
     CREATE TABLE t1 (
         a INTEGER AS (c) STORED,
@@ -3250,6 +3294,7 @@ expect {
 # the index's IndexColumn.expr was not updated, causing "unknown column"
 # errors during UPDATE operations.
 
+@skip-if mvcc "Expression indexes are not supported with MVCC"
 test gencol_rename_column_with_index_on_generated {
     CREATE TABLE t1 (
         a TEXT,
@@ -3346,6 +3391,7 @@ expect {
 # -----------------------------------------------------------------------------
 
 # Expression index on STORED generated column - basic
+@skip-if mvcc "Expression indexes are not supported with MVCC"
 test gencol_expr_index_stored_basic {
     CREATE TABLE t1(a INTEGER, b AS (a * 2) STORED);
     CREATE INDEX idx1 ON t1(b + 10);
@@ -3357,6 +3403,7 @@ expect {
 }
 
 # Expression index on VIRTUAL generated column - basic
+@skip-if mvcc "Expression indexes are not supported with MVCC"
 test gencol_expr_index_virtual_basic {
     CREATE TABLE t1(a INTEGER, b AS (a * 2));
     CREATE INDEX idx1 ON t1(b + 10);
@@ -3368,6 +3415,7 @@ expect {
 }
 
 # Expression index mixing regular and generated columns
+@skip-if mvcc "Expression indexes are not supported with MVCC"
 test gencol_expr_index_mixed_cols {
     CREATE TABLE t1(a INTEGER, b AS (a * 2) STORED);
     CREATE INDEX idx1 ON t1(a + b);
@@ -3379,6 +3427,7 @@ expect {
 }
 
 # Expression index on STORED - UPDATE base column, verify new value found and old value gone.
+@skip-if mvcc "Expression indexes are not supported with MVCC"
 test gencol_expr_index_stored_update {
     CREATE TABLE t1(a INTEGER, b AS (a * 2) STORED);
     CREATE INDEX idx1 ON t1(b + 10);
@@ -3392,6 +3441,7 @@ expect {
 }
 
 # Expression index on VIRTUAL - UPDATE base column, verify new value found and old value gone.
+@skip-if mvcc "Expression indexes are not supported with MVCC"
 test gencol_expr_index_virtual_update {
     CREATE TABLE t1(a INTEGER, b AS (a * 2));
     CREATE INDEX idx1 ON t1(b + 10);
@@ -3405,6 +3455,7 @@ expect {
 }
 
 # Nested generated columns with expression index
+@skip-if mvcc "Expression indexes are not supported with MVCC"
 test gencol_expr_index_nested {
     CREATE TABLE t1(a INTEGER, b AS (a * 2), c AS (b + 100) STORED);
     CREATE INDEX idx1 ON t1(c + 1000);
@@ -3416,6 +3467,7 @@ expect {
 }
 
 # Nested generated columns with expression index - UPDATE, verify new value found and old gone.
+@skip-if mvcc "Expression indexes are not supported with MVCC"
 test gencol_expr_index_nested_update {
     CREATE TABLE t1(a INTEGER, b AS (a * 2), c AS (b + 100) STORED);
     CREATE INDEX idx1 ON t1(c + 1000);
@@ -3429,6 +3481,7 @@ expect {
 }
 
 # UNIQUE expression index on generated column
+@skip-if mvcc "Expression indexes are not supported with MVCC"
 test gencol_expr_index_unique {
     CREATE TABLE t1(a INTEGER, b AS (a * 2) STORED);
     CREATE UNIQUE INDEX idx1 ON t1(b + 10);
@@ -3441,6 +3494,7 @@ expect {
 }
 
 # UNIQUE expression index violation
+@skip-if mvcc "Expression indexes are not supported with MVCC"
 test gencol_expr_index_unique_violation {
     CREATE TABLE t1(a INTEGER, b AS (a * 2) STORED);
     CREATE UNIQUE INDEX idx1 ON t1(b + 10);
@@ -3451,6 +3505,7 @@ expect error {
 }
 
 # Expression index with function on generated column
+@skip-if mvcc "Expression indexes are not supported with MVCC"
 test gencol_expr_index_func {
     CREATE TABLE t1(a INTEGER, b AS (a * 2) STORED);
     CREATE INDEX idx1 ON t1(abs(b - 50));
@@ -3463,6 +3518,7 @@ expect {
 }
 
 # Mixed expression (base + gencol) with UPDATE, verify new value found and old gone.
+@skip-if mvcc "Expression indexes are not supported with MVCC"
 test gencol_expr_index_mixed_update {
     CREATE TABLE t1(a INTEGER, b AS (a * 2) STORED);
     CREATE INDEX idx1 ON t1(a + b);
@@ -3480,6 +3536,7 @@ expect {
 # -----------------------------------------------------------------------------
 
 # DELETE should properly remove from expression index
+@skip-if mvcc "Expression indexes are not supported with MVCC"
 test gencol_expr_index_delete {
     CREATE TABLE t1(a INTEGER, b AS (a * 2) STORED);
     CREATE INDEX idx1 ON t1(b + 10);
@@ -3491,6 +3548,7 @@ expect {
 }
 
 # Verify remaining row is still indexed correctly after DELETE
+@skip-if mvcc "Expression indexes are not supported with MVCC"
 test gencol_expr_index_delete_remaining {
     CREATE TABLE t1(a INTEGER, b AS (a * 2) STORED);
     CREATE INDEX idx1 ON t1(b + 10);
@@ -3503,6 +3561,7 @@ expect {
 }
 
 # REPLACE should update expression index
+@skip-if mvcc "Expression indexes are not supported with MVCC"
 test gencol_expr_index_replace {
     CREATE TABLE t1(a INTEGER PRIMARY KEY, b AS (a * 2) STORED);
     CREATE INDEX idx1 ON t1(b + 10);
@@ -3515,6 +3574,7 @@ expect {
 }
 
 # REPLACE with different value
+@skip-if mvcc "Expression indexes are not supported with MVCC"
 test gencol_expr_index_replace_different {
     CREATE TABLE t1(a INTEGER PRIMARY KEY, b AS (a * 2) STORED);
     CREATE INDEX idx1 ON t1(b + 10);
@@ -3527,6 +3587,7 @@ expect {
 }
 
 # UPDATE that doesn't change value should keep index intact
+@skip-if mvcc "Expression indexes are not supported with MVCC"
 test gencol_expr_index_update_same_value {
     CREATE TABLE t1(a INTEGER, b AS (a * 2) STORED);
     CREATE INDEX idx1 ON t1(b + 10);
@@ -3539,6 +3600,7 @@ expect {
 }
 
 # Multi-row UPDATE - verify new values found and old values gone.
+@skip-if mvcc "Expression indexes are not supported with MVCC"
 test gencol_expr_index_multirow_update {
     CREATE TABLE t1(a INTEGER, b AS (a * 2) STORED);
     CREATE INDEX idx1 ON t1(b + 10);
@@ -3554,6 +3616,7 @@ expect {
 }
 
 # Partial UPDATE - only some rows modified
+@skip-if mvcc "Expression indexes are not supported with MVCC"
 test gencol_expr_index_partial_update {
     CREATE TABLE t1(a INTEGER, b AS (a * 2) STORED);
     CREATE INDEX idx1 ON t1(b + 10);
@@ -3566,6 +3629,7 @@ expect {
 }
 
 # Partial UPDATE - unmodified row should still be findable
+@skip-if mvcc "Expression indexes are not supported with MVCC"
 test gencol_expr_index_partial_update_unmodified {
     CREATE TABLE t1(a INTEGER, b AS (a * 2) STORED);
     CREATE INDEX idx1 ON t1(b + 10);
@@ -3578,6 +3642,7 @@ expect {
 }
 
 # NULL in generated column with expression index
+@skip-if mvcc "Expression indexes are not supported with MVCC"
 test gencol_expr_index_null {
     CREATE TABLE t1(a INTEGER, b AS (a * 2) STORED);
     CREATE INDEX idx1 ON t1(b + 10);
@@ -3589,6 +3654,7 @@ expect {
 }
 
 # UPDATE from NULL to non-NULL
+@skip-if mvcc "Expression indexes are not supported with MVCC"
 test gencol_expr_index_null_to_value {
     CREATE TABLE t1(a INTEGER, b AS (a * 2) STORED);
     CREATE INDEX idx1 ON t1(b + 10);
@@ -3601,6 +3667,7 @@ expect {
 }
 
 # UPDATE from non-NULL to NULL
+@skip-if mvcc "Expression indexes are not supported with MVCC"
 test gencol_expr_index_value_to_null {
     CREATE TABLE t1(a INTEGER, b AS (a * 2) STORED);
     CREATE INDEX idx1 ON t1(b + 10);
@@ -3613,6 +3680,7 @@ expect {
 }
 
 # Gencol depends on two columns, update first
+@skip-if mvcc "Expression indexes are not supported with MVCC"
 test gencol_expr_index_multi_dep_update_first {
     CREATE TABLE t1(a INTEGER, b INTEGER, c AS (a + b) STORED);
     CREATE INDEX idx1 ON t1(c * 2);
@@ -3625,6 +3693,7 @@ expect {
 }
 
 # Gencol depends on two columns, update second
+@skip-if mvcc "Expression indexes are not supported with MVCC"
 test gencol_expr_index_multi_dep_update_second {
     CREATE TABLE t1(a INTEGER, b INTEGER, c AS (a + b) STORED);
     CREATE INDEX idx1 ON t1(c * 2);
@@ -3637,6 +3706,7 @@ expect {
 }
 
 # Gencol depends on two columns, update both
+@skip-if mvcc "Expression indexes are not supported with MVCC"
 test gencol_expr_index_multi_dep_update_both {
     CREATE TABLE t1(a INTEGER, b INTEGER, c AS (a + b) STORED);
     CREATE INDEX idx1 ON t1(c * 2);
@@ -3649,6 +3719,7 @@ expect {
 }
 
 # Partial index on expression with generated column
+@skip-if mvcc "Expression indexes are not supported with MVCC"
 test gencol_expr_partial_index_update {
     CREATE TABLE t1(a INTEGER, b AS (a * 2) STORED);
     CREATE INDEX idx1 ON t1(b + 10) WHERE b > 10;
@@ -3661,6 +3732,7 @@ expect {
 }
 
 # Row moves into partial index range
+@skip-if mvcc "Expression indexes are not supported with MVCC"
 test gencol_expr_partial_index_into_range {
     CREATE TABLE t1(a INTEGER, b AS (a * 2) STORED);
     CREATE INDEX idx1 ON t1(b + 10) WHERE b > 10;
@@ -3673,6 +3745,7 @@ expect {
 }
 
 # Row moves out of partial index range
+@skip-if mvcc "Expression indexes are not supported with MVCC"
 test gencol_expr_partial_index_out_of_range {
     CREATE TABLE t1(a INTEGER, b AS (a * 2) STORED);
     CREATE INDEX idx1 ON t1(b + 10) WHERE b > 10;
@@ -3684,6 +3757,7 @@ expect {
 }
 
 # Multiple expression indexes, update affects both - check first
+@skip-if mvcc "Expression indexes are not supported with MVCC"
 test gencol_expr_index_multiple_first {
     CREATE TABLE t1(a INTEGER, b AS (a * 2) STORED);
     CREATE INDEX idx1 ON t1(b + 10);
@@ -3697,6 +3771,7 @@ expect {
 }
 
 # Multiple expression indexes, update affects both - check second
+@skip-if mvcc "Expression indexes are not supported with MVCC"
 test gencol_expr_index_multiple_second {
     CREATE TABLE t1(a INTEGER, b AS (a * 2) STORED);
     CREATE INDEX idx1 ON t1(b + 10);
@@ -3710,6 +3785,7 @@ expect {
 }
 
 # Expression index uses both gencol and its base column - verify new value found and old gone.
+@skip-if mvcc "Expression indexes are not supported with MVCC"
 test gencol_expr_index_gencol_and_base {
     CREATE TABLE t1(a INTEGER, b AS (a * 2) STORED);
     CREATE INDEX idx1 ON t1(a + b);
@@ -3723,6 +3799,7 @@ expect {
 }
 
 # VIRTUAL generated column with DELETE
+@skip-if mvcc "Expression indexes are not supported with MVCC"
 test gencol_expr_index_virtual_delete {
     CREATE TABLE t1(a INTEGER, b AS (a * 2));
     CREATE INDEX idx1 ON t1(b + 10);
@@ -3734,6 +3811,7 @@ expect {
 }
 
 # VIRTUAL generated column with multi-row UPDATE
+@skip-if mvcc "Expression indexes are not supported with MVCC"
 test gencol_expr_index_virtual_multirow_update {
     CREATE TABLE t1(a INTEGER, b AS (a * 2));
     CREATE INDEX idx1 ON t1(b + 10);
@@ -3748,6 +3826,7 @@ expect {
 }
 
 # Deep nesting with DELETE - verify remaining row found and deleted row gone.
+@skip-if mvcc "Expression indexes are not supported with MVCC"
 test gencol_expr_index_nested_delete {
     CREATE TABLE t1(a INTEGER, b AS (a * 2), c AS (b + 100) STORED);
     CREATE INDEX idx1 ON t1(c + 1000);
@@ -3938,6 +4017,7 @@ expect {
 }
 
 # UPDATE with index on STORED column that references id
+@skip-if mvcc "Expression indexes are not supported with MVCC"
 test gencol_rowid_alias_update_with_index {
     CREATE TABLE t1(id INTEGER PRIMARY KEY, other INTEGER, b AS (id + other) STORED);
     CREATE INDEX idx_b ON t1(b);
@@ -4002,6 +4082,7 @@ expect {
 
 # Index on REAL column should return same results as table scan for integer comparisons.
 # Tests that index seek properly handles type coercion for generated columns.
+@skip-if mvcc "Expression indexes are not supported with MVCC"
 test gencol_index_real_integer_comparison {
     CREATE TABLE t (a BLOB, b REAL AS ((c)) STORED, c INTEGER);
     INSERT INTO t (a, c) VALUES (X'00', 3036093696168065977);
