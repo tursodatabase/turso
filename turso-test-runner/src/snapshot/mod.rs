@@ -763,18 +763,29 @@ const EXPLAIN_COLUMNS: &[ExplainColumn] = &[
     },
 ];
 
+/// Instructions that indent their loop body (indent all opcodes between p2 target and themselves)
+const AZ_NEXT: &[&str] = &["Next", "Prev", "VPrev", "VNext", "SorterNext", "Return"];
+
+/// Valid targets for backward Goto jumps
+const AZ_YIELD: &[&str] = &["Yield", "SeekLT", "SeekGT", "RowSetRead", "Rewind"];
+
 /// Format EXPLAIN query results as a nicely formatted ASCII table.
 ///
 /// Takes the raw rows from an EXPLAIN query and formats them with:
 /// - Column headers
 /// - Proper alignment (right for numeric columns, left for text)
 /// - Consistent column widths
+/// - **Indentation for loop structures** (matching CLI behavior)
 ///
 /// # Example Output
 /// ```text
-/// addr  opcode       p1  p2  p3  p4             p5  comment
-///    0  Init          0  10   0                  0  Start at 10
-///    1  OpenRead      0   2   0  k(3,B,B)        0  table=t, root=2
+/// addr  opcode             p1  p2  p3  p4             p5  comment
+///    0  Init                0  10   0                  0  Start at 10
+///    1  OpenRead            0   2   0  k(3,B,B)        0  table=t, root=2
+///    2  Rewind              0   8   0                  0
+///    3    Column            0   1   1                  0  r[1]=users.name
+///    4    ResultRow         1   1   0                  0  output=r[1]
+///    5  Next                0   3   0                  0
 /// ```
 pub fn format_explain_output(rows: &[Vec<String>]) -> String {
     if rows.is_empty() {
@@ -808,12 +819,21 @@ pub fn format_explain_output(rows: &[Vec<String>]) -> String {
             .collect()
     };
 
-    // Calculate column widths (max of header and all values)
+    // Pre-calculate indentation for each row
+    let indents = calculate_row_indents(rows);
+
+    // Calculate column widths (max of header and all values, accounting for indentation on opcode)
     let mut widths: Vec<usize> = columns.iter().map(|c| c.name.len()).collect();
-    for row in rows {
-        for (i, cell) in row.iter().enumerate() {
-            if i < widths.len() {
-                widths[i] = widths[i].max(cell.len());
+    for (row_idx, row) in rows.iter().enumerate() {
+        for (col_idx, cell) in row.iter().enumerate() {
+            if col_idx < widths.len() {
+                let cell_width = if col_idx == 1 {
+                    // opcode column includes indentation
+                    cell.len() + indents[row_idx] * 2
+                } else {
+                    cell.len()
+                };
+                widths[col_idx] = widths[col_idx].max(cell_width);
             }
         }
     }
@@ -836,14 +856,20 @@ pub fn format_explain_output(rows: &[Vec<String>]) -> String {
     output.push('\n');
 
     // Data rows
-    for row in rows {
+    for (row_idx, row) in rows.iter().enumerate() {
+        let indent = indents[row_idx];
         let formatted: Vec<String> = row
             .iter()
             .enumerate()
-            .map(|(i, cell)| {
-                let width = widths.get(i).copied().unwrap_or(cell.len());
-                let right_align = columns.get(i).map(|c| c.right_align).unwrap_or(false);
-                if right_align {
+            .map(|(col_idx, cell)| {
+                let width = widths.get(col_idx).copied().unwrap_or(cell.len());
+                let right_align = columns.get(col_idx).map(|c| c.right_align).unwrap_or(false);
+
+                if col_idx == 1 {
+                    // opcode column - apply indentation
+                    let indented = format!("{}{}", "  ".repeat(indent), cell);
+                    format!("{indented:<width$}")
+                } else if right_align {
                     format!("{cell:>width$}")
                 } else {
                     format!("{cell:<width$}")
@@ -857,6 +883,68 @@ pub fn format_explain_output(rows: &[Vec<String>]) -> String {
 
     // Remove trailing newline for cleaner output
     output.trim_end().to_string()
+}
+
+/// Calculate indentation level for each row based on loop opcodes.
+///
+/// The indentation logic follows SQLite's EXPLAIN output:
+/// - `AZ_NEXT` instructions (`Next`, `Prev`, `VPrev`, `VNext`, `SorterNext`, `Return`)
+///   indent all opcodes between their p2 jump target and themselves.
+/// - `Goto` indents if it jumps backward (p2 < addr) AND either:
+///   - The target is one of the `AZ_YIELD` instructions, OR
+///   - p1 is non-zero
+fn calculate_row_indents(rows: &[Vec<String>]) -> Vec<usize> {
+    if rows.is_empty() {
+        return Vec::new();
+    }
+
+    // Build a list of (opcode, p1, p2) for each row
+    let opcodes: Vec<(&str, i64, i64)> = rows
+        .iter()
+        .map(|row| {
+            let opcode = row.get(1).map(|s| s.as_str()).unwrap_or("");
+            let p1: i64 = row.get(2).and_then(|s| s.parse().ok()).unwrap_or(0);
+            let p2: i64 = row.get(3).and_then(|s| s.parse().ok()).unwrap_or(0);
+            (opcode, p1, p2)
+        })
+        .collect();
+
+    // Collect all loop ranges: (start_addr, end_addr) where start < end
+    // Instructions in range (start, end) exclusive get indented
+    let mut loop_ranges: Vec<(i64, i64)> = Vec::new();
+
+    for (addr, (opcode, p1, p2)) in opcodes.iter().enumerate() {
+        let addr = addr as i64;
+
+        if AZ_NEXT.contains(opcode) {
+            // These indent all opcodes between p2 and themselves
+            if *p2 < addr {
+                loop_ranges.push((*p2, addr));
+            }
+        } else if *opcode == "Goto" && *p2 < addr {
+            // Goto indents if backward jump AND (target is AZ_YIELD OR p1 != 0)
+            let target_opcode = opcodes
+                .get(*p2 as usize)
+                .map(|(op, _, _)| *op)
+                .unwrap_or("");
+            if AZ_YIELD.contains(&target_opcode) || *p1 != 0 {
+                loop_ranges.push((*p2, addr));
+            }
+        }
+    }
+
+    // Calculate indent for each row: count how many loop ranges it's inside
+    // An instruction at addr is indented if start <= addr < end (inclusive start, exclusive end)
+    rows.iter()
+        .enumerate()
+        .map(|(addr, _)| {
+            let addr = addr as i64;
+            loop_ranges
+                .iter()
+                .filter(|(start, end)| *start <= addr && addr < *end)
+                .count()
+        })
+        .collect()
 }
 
 /// Format EXPLAIN QUERY PLAN output as a tree structure.
@@ -1275,6 +1363,307 @@ mod tests {
         // Data rows should have no trailing whitespace
         assert!(!lines[1].ends_with(' '));
         assert!(!lines[2].ends_with(' '));
+    }
+
+    /// Helper to extract the opcode column value (2nd column) from a formatted line.
+    /// The format is: "addr  opcode  p1  p2  ..." where addr is 4 chars right-aligned.
+    /// The opcode column starts at position 6 (after "addr" + 2-space separator).
+    fn extract_opcode(line: &str) -> &str {
+        // Skip the addr field (4 chars) and separator (2 chars)
+        if line.len() > 6 {
+            let opcode_col = &line[6..];
+            // Find the end by looking for two spaces after non-space content
+            // First skip leading spaces (indent), then find the word, then find next separator
+            let trimmed = opcode_col.trim_start();
+            let opcode_end = trimmed.find(' ').unwrap_or(trimmed.len());
+            let opcode_name = &trimmed[..opcode_end];
+
+            // Return the full column including indent by finding where opcode_name starts
+            if let Some(name_pos) = opcode_col.find(opcode_name) {
+                return &opcode_col[..name_pos + opcode_name.len()];
+            }
+            return opcode_col.trim();
+        }
+        ""
+    }
+
+    #[test]
+    fn test_format_explain_output_with_loop_indentation() {
+        // Simulate a simple loop: Init -> Rewind -> Column -> ResultRow -> Next -> Halt
+        let rows = vec![
+            vec![
+                "0".to_string(),
+                "Init".to_string(),
+                "0".to_string(),
+                "6".to_string(),
+                "0".to_string(),
+                "".to_string(),
+                "0".to_string(),
+                "Start at 6".to_string(),
+            ],
+            vec![
+                "1".to_string(),
+                "OpenRead".to_string(),
+                "0".to_string(),
+                "2".to_string(),
+                "0".to_string(),
+                "".to_string(),
+                "0".to_string(),
+                "".to_string(),
+            ],
+            vec![
+                "2".to_string(),
+                "Rewind".to_string(),
+                "0".to_string(),
+                "5".to_string(),
+                "0".to_string(),
+                "".to_string(),
+                "0".to_string(),
+                "".to_string(),
+            ],
+            vec![
+                "3".to_string(),
+                "Column".to_string(),
+                "0".to_string(),
+                "0".to_string(),
+                "1".to_string(),
+                "".to_string(),
+                "0".to_string(),
+                "".to_string(),
+            ],
+            vec![
+                "4".to_string(),
+                "ResultRow".to_string(),
+                "1".to_string(),
+                "1".to_string(),
+                "0".to_string(),
+                "".to_string(),
+                "0".to_string(),
+                "".to_string(),
+            ],
+            vec![
+                "5".to_string(),
+                "Next".to_string(),
+                "0".to_string(),
+                "3".to_string(),
+                "0".to_string(),
+                "".to_string(),
+                "1".to_string(),
+                "".to_string(),
+            ],
+            vec![
+                "6".to_string(),
+                "Halt".to_string(),
+                "0".to_string(),
+                "0".to_string(),
+                "0".to_string(),
+                "".to_string(),
+                "0".to_string(),
+                "".to_string(),
+            ],
+        ];
+
+        let output = format_explain_output(&rows);
+        let lines: Vec<&str> = output.lines().collect();
+
+        // Lines inside the Rewind..Next loop should be indented
+        // Init (0), OpenRead (1), Rewind (2) - no indent
+        // Column (3), ResultRow (4) - indented (after Rewind)
+        // Next (5) - no indent (decreases on loop end)
+        // Halt (6) - no indent
+
+        // Check opcode column values for indentation
+        let opcode_init = extract_opcode(lines[1]);
+        let opcode_rewind = extract_opcode(lines[3]);
+        let opcode_column = extract_opcode(lines[4]);
+        let opcode_resultrow = extract_opcode(lines[5]);
+        let opcode_next = extract_opcode(lines[6]);
+        let opcode_halt = extract_opcode(lines[7]);
+
+        // Init and Rewind should NOT start with spaces (no indent)
+        assert!(
+            !opcode_init.starts_with(' '),
+            "Init should not be indented: '{opcode_init}'"
+        );
+        assert!(
+            !opcode_rewind.starts_with(' '),
+            "Rewind should not be indented: '{opcode_rewind}'"
+        );
+
+        // Column and ResultRow should be indented (inside the loop)
+        assert!(
+            opcode_column.starts_with("  "),
+            "Column should be indented: '{opcode_column}'"
+        );
+        assert!(
+            opcode_resultrow.starts_with("  "),
+            "ResultRow should be indented: '{opcode_resultrow}'"
+        );
+
+        // Next should NOT be indented (loop end decreases indent)
+        assert!(
+            !opcode_next.starts_with(' '),
+            "Next should not be indented: '{opcode_next}'"
+        );
+
+        // Halt should NOT be indented
+        assert!(
+            !opcode_halt.starts_with(' '),
+            "Halt should not be indented: '{opcode_halt}'"
+        );
+    }
+
+    #[test]
+    fn test_format_explain_output_nested_loops() {
+        // Simulate nested loops with proper p2 jump targets:
+        // In a typical Rewind...Next loop, Next jumps to the instruction AFTER Rewind.
+        //
+        // addr 0: Init, p2=7 (jump forward)
+        // addr 1: Rewind (outer), p2=6 (exit if empty)
+        // addr 2: Rewind (inner), p2=5 (exit if empty)
+        // addr 3: Column
+        // addr 4: Next (inner), p2=3 (jump back to Column)
+        // addr 5: Next (outer), p2=2 (jump back to inner Rewind)
+        // addr 6: Halt
+        //
+        // Loop ranges based on Next instructions:
+        // - Inner Next at addr 4: p2=3, loop range [3, 4) → addr 3 indented
+        // - Outer Next at addr 5: p2=2, loop range [2, 5) → addr 2,3,4 indented
+        //
+        // Final indentation:
+        //   addr 0: Init - 0 indent
+        //   addr 1: Rewind - 0 indent (not in any loop range)
+        //   addr 2: Rewind - 1 indent (in [2,5))
+        //   addr 3: Column - 2 indent (in [2,5) and [3,4))
+        //   addr 4: Next - 1 indent (in [2,5) only)
+        //   addr 5: Next - 0 indent
+        //   addr 6: Halt - 0 indent
+        let rows = vec![
+            vec![
+                "0".to_string(),
+                "Init".to_string(),
+                "0".to_string(),
+                "7".to_string(),
+                "0".to_string(),
+                "".to_string(),
+                "0".to_string(),
+                "".to_string(),
+            ],
+            vec![
+                "1".to_string(),
+                "Rewind".to_string(),
+                "0".to_string(),
+                "6".to_string(),
+                "0".to_string(),
+                "".to_string(),
+                "0".to_string(),
+                "".to_string(),
+            ],
+            vec![
+                "2".to_string(),
+                "Rewind".to_string(),
+                "1".to_string(),
+                "5".to_string(),
+                "0".to_string(),
+                "".to_string(),
+                "0".to_string(),
+                "".to_string(),
+            ],
+            vec![
+                "3".to_string(),
+                "Column".to_string(),
+                "0".to_string(),
+                "0".to_string(),
+                "0".to_string(),
+                "".to_string(),
+                "0".to_string(),
+                "".to_string(),
+            ],
+            vec![
+                "4".to_string(),
+                "Next".to_string(),
+                "1".to_string(),
+                "3".to_string(),
+                "0".to_string(),
+                "".to_string(),
+                "0".to_string(),
+                "".to_string(),
+            ],
+            vec![
+                "5".to_string(),
+                "Next".to_string(),
+                "0".to_string(),
+                "2".to_string(),
+                "0".to_string(),
+                "".to_string(),
+                "0".to_string(),
+                "".to_string(),
+            ],
+            vec![
+                "6".to_string(),
+                "Halt".to_string(),
+                "0".to_string(),
+                "0".to_string(),
+                "0".to_string(),
+                "".to_string(),
+                "0".to_string(),
+                "".to_string(),
+            ],
+        ];
+
+        let output = format_explain_output(&rows);
+        let lines: Vec<&str> = output.lines().collect();
+
+        // Check indentation via opcode column
+        let opcode_init = extract_opcode(lines[1]);
+        let opcode_rewind_outer = extract_opcode(lines[2]);
+        let opcode_rewind_inner = extract_opcode(lines[3]);
+        let opcode_column = extract_opcode(lines[4]);
+        let opcode_next_inner = extract_opcode(lines[5]);
+        let opcode_next_outer = extract_opcode(lines[6]);
+        let opcode_halt = extract_opcode(lines[7]);
+
+        // Init and outer Rewind should NOT be indented
+        assert!(!opcode_init.starts_with(' '), "Init should not be indented");
+        assert!(
+            !opcode_rewind_outer.starts_with(' '),
+            "Outer Rewind should not be indented"
+        );
+
+        // Inner Rewind should be indented once (2 spaces)
+        assert!(
+            opcode_rewind_inner.starts_with("  "),
+            "Inner Rewind should be indented once: '{opcode_rewind_inner}'"
+        );
+        assert!(
+            !opcode_rewind_inner.starts_with("    "),
+            "Inner Rewind should not be double-indented"
+        );
+
+        // Column should be indented twice (4 spaces)
+        assert!(
+            opcode_column.starts_with("    "),
+            "Column should be double-indented: '{opcode_column}'"
+        );
+
+        // Inner Next should be indented once (in outer loop only)
+        assert!(
+            opcode_next_inner.starts_with("  "),
+            "Inner Next should be indented once: '{opcode_next_inner}'"
+        );
+        assert!(
+            !opcode_next_inner.starts_with("    "),
+            "Inner Next should not be double-indented"
+        );
+
+        // Outer Next should NOT be indented
+        assert!(
+            !opcode_next_outer.starts_with(' '),
+            "Outer Next should not be indented: '{opcode_next_outer}'"
+        );
+
+        // Halt should NOT be indented
+        assert!(!opcode_halt.starts_with(' '), "Halt should not be indented");
     }
 
     #[test]
