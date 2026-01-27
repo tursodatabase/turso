@@ -1256,7 +1256,7 @@ pub unsafe extern "C" fn sqlite3_column_decltype(
 ) -> *const ffi::c_char {
     let stmt = &mut *stmt;
 
-    if let Some(val) = stmt.stmt.get_column_type(idx as usize) {
+    if let Some(val) = stmt.stmt.get_column_decltype(idx as usize) {
         let c_string = CString::new(val).expect("CString::new failed");
         c_string.into_raw()
     } else {
