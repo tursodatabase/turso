@@ -8,6 +8,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -39,6 +40,9 @@ type TursoSyncDbConfig struct {
 	// remote url for the sync
 	// remote_url MUST be used in all sync engine operations: during bootstrap and all further operations
 	RemoteUrl string
+
+	// remote namespace for the sync client (optional)
+	Namespace string
 
 	// token for remote authentication
 	// auth token value WILL not have any prefix and must be used as "Authorization" header prepended with "Bearer " prefix
@@ -90,6 +94,7 @@ type TursoSyncDb struct {
 	db        TursoSyncDatabase
 	baseURL   string
 	authToken string
+	namespace string
 	client    *http.Client
 
 	mu sync.Mutex
@@ -120,6 +125,7 @@ func NewTursoSyncDb(ctx context.Context, config TursoSyncDbConfig) (*TursoSyncDb
 	syncCfg := TursoSyncDatabaseConfig{
 		Path:                           config.Path,
 		RemoteUrl:                      remoteUrl,
+		Namespace:                      config.Namespace,
 		ClientName:                     clientName,
 		LongPollTimeoutMs:              config.LongPollTimeoutMs,
 		BootstrapIfEmpty:               bootstrap,
@@ -374,6 +380,17 @@ func (d *TursoSyncDb) processIoQueue(ctx context.Context) error {
 	return turso_sync_database_io_step_callbacks(d.db)
 }
 
+func buildHostname(baseURL, namespace string) (string, error) {
+	if namespace == "" {
+		return baseURL, nil
+	}
+	u, err := url.Parse(baseURL)
+	if err != nil {
+		return "", err
+	}
+	return u.Scheme + namespace + "." + u.Host, nil
+}
+
 // handleIoItem performs execution of a single IO item.
 // It streams data in chunks for HTTP and file operations to avoid loading whole payloads in memory.
 func (d *TursoSyncDb) handleIoItem(ctx context.Context, item TursoSyncIoItem) error {
@@ -386,7 +403,7 @@ func (d *TursoSyncDb) handleIoItem(ctx context.Context, item TursoSyncIoItem) er
 			return err
 		}
 		// Build URL
-		url := joinUrl(d.baseURL, req.Path)
+		buildUrl := joinUrl(d.baseURL, req.Path)
 
 		// Build headers
 		hdr := make(http.Header, req.Headers+2)
@@ -414,12 +431,17 @@ func (d *TursoSyncDb) handleIoItem(ctx context.Context, item TursoSyncIoItem) er
 		if len(req.Body) > 0 {
 			body = bytes.NewReader(req.Body)
 		}
-		httpReq, err := http.NewRequestWithContext(ctx, req.Method, url, body)
+		httpReq, err := http.NewRequestWithContext(ctx, req.Method, buildUrl, body)
 		if err != nil {
 			_ = turso_sync_database_io_poison(item, err.Error())
 			_ = turso_sync_database_io_done(item)
 			return err
 		}
+		host, err := buildHostname(d.baseURL, d.namespace)
+		if err != nil {
+			return err
+		}
+		httpReq.Host = host
 		httpReq.Header = hdr
 
 		resp, err := d.client.Do(httpReq)
