@@ -242,7 +242,6 @@ pub fn check_differential(
     stmt: &SqlStatement,
 ) -> OracleResult {
     let sql = stmt.to_string();
-    tracing::info!(sql);
     let turso_result = DifferentialOracle::execute_turso(turso_conn, &sql);
     let sqlite_result = DifferentialOracle::execute_sqlite(sqlite_conn, &sql);
 
