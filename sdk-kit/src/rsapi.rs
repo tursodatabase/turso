@@ -15,9 +15,8 @@ use tracing_subscriber::{
     EnvFilter, Layer,
 };
 use turso_core::{
-    storage::database::DatabaseFile, types::AsValueRef, CipherMode, Connection, Database,
-    DatabaseOpts, DatabaseStorage, EncryptionKey, LimboError, OpenFlags, QueryMode, Statement,
-    StepResult, IO,
+    storage::database::DatabaseFile, types::AsValueRef, Connection, Database, DatabaseOpts,
+    DatabaseStorage, EncryptionKey, LimboError, OpenFlags, QueryMode, Statement, StepResult, IO,
 };
 
 use crate::{
@@ -601,16 +600,18 @@ impl TursoDatabase {
                 "database must be opened first".to_string(),
             ));
         };
-        let connection = db.connect()?;
 
-        // Set up encryption on the connection if configured
-        // Encryption key is not cached in Database for security, so we set it per connection
-        if let Some(ref encryption_opts) = self.config.encryption {
-            let cipher_mode = CipherMode::try_from(encryption_opts.cipher.as_str())?;
-            let encryption_key = EncryptionKey::from_hex_string(&encryption_opts.hexkey)?;
-            connection.set_encryption_cipher(cipher_mode)?;
-            connection.set_encryption_key(encryption_key)?;
-        }
+        // Parse encryption key if configured - needed for connect_with_encryption
+        // which sets up encryption context before reading pages
+        let encryption_key = if let Some(ref encryption_opts) = self.config.encryption {
+            Some(EncryptionKey::from_hex_string(&encryption_opts.hexkey)?)
+        } else {
+            None
+        };
+
+        // Use connect_with_encryption to properly set up encryption context
+        // before the pager reads page 1. This is required for encrypted databases.
+        let connection = db.connect_with_encryption(encryption_key)?;
 
         Ok(TursoConnection::new(&self.config, connection))
     }
@@ -1164,5 +1165,133 @@ mod tests {
                 .all(|e| matches!(e, TursoError::Misuse(_))),
             "expected only misuse errors, got: {results:?}"
         );
+    }
+
+    #[cfg(feature = "encryption")]
+    mod encryption_tests {
+        use super::*;
+        use crate::rsapi::ValueRef;
+        use tempfile::NamedTempFile;
+
+        const TEST_CIPHER: &str = "aes256gcm";
+        const TEST_HEXKEY: &str =
+            "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+        const WRONG_HEXKEY: &str =
+            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+
+        fn create_encryption_opts() -> crate::rsapi::EncryptionOpts {
+            crate::rsapi::EncryptionOpts {
+                cipher: TEST_CIPHER.to_string(),
+                hexkey: TEST_HEXKEY.to_string(),
+            }
+        }
+
+        fn assert_integer(value: ValueRef, expected: i64) {
+            match value {
+                ValueRef::Integer(i) => assert_eq!(i, expected),
+                _ => panic!("Expected integer {expected}, got {value:?}"),
+            }
+        }
+
+        #[test]
+        fn test_encryption() {
+            let temp_file = NamedTempFile::new().unwrap();
+            let db_path = temp_file.path().to_str().unwrap();
+
+            // 1. Create encrypted database and insert data
+            {
+                let db = TursoDatabase::new(TursoDatabaseConfig {
+                    path: db_path.to_string(),
+                    experimental_features: Some("encryption".to_string()),
+                    async_io: false,
+                    encryption: Some(create_encryption_opts()),
+                    vfs: None,
+                    io: None,
+                    db_file: None,
+                });
+                db.open().unwrap();
+                let conn = db.connect().unwrap();
+
+                let mut stmt = conn
+                    .prepare_single("CREATE TABLE test (id INTEGER PRIMARY KEY, value TEXT)")
+                    .unwrap();
+                stmt.execute(None).unwrap();
+
+                let mut stmt = conn
+                    .prepare_single("INSERT INTO test (id, value) VALUES (1, 'secret_data')")
+                    .unwrap();
+                stmt.execute(None).unwrap();
+
+                // Checkpoint to ensure data is written to main db file
+                let mut stmt = conn
+                    .prepare_single("PRAGMA wal_checkpoint(TRUNCATE)")
+                    .unwrap();
+                stmt.execute(None).unwrap();
+            }
+
+            // 2. Verify data is encrypted on disk
+            let content = std::fs::read(db_path).unwrap();
+            assert!(content.len() > 1024);
+            assert!(
+                !content.windows(11).any(|w| w == b"secret_data"),
+                "Plaintext should not appear in encrypted database file"
+            );
+
+            // 3. Reopen with correct key and verify data
+            {
+                let db = TursoDatabase::new(TursoDatabaseConfig {
+                    path: db_path.to_string(),
+                    experimental_features: Some("encryption".to_string()),
+                    async_io: false,
+                    encryption: Some(create_encryption_opts()),
+                    vfs: None,
+                    io: None,
+                    db_file: None,
+                });
+                db.open().unwrap();
+                let conn = db.connect().unwrap();
+
+                let mut stmt = conn
+                    .prepare_single("SELECT id, value FROM test WHERE id = 1")
+                    .unwrap();
+                assert_eq!(stmt.step(None).unwrap(), TursoStatusCode::Row);
+                assert_integer(stmt.row_value(0).unwrap(), 1);
+                assert_eq!(stmt.row_value(1).unwrap().to_text(), Some("secret_data"));
+            }
+
+            // 4. Verify opening with wrong key fails
+            {
+                let db = TursoDatabase::new(TursoDatabaseConfig {
+                    path: db_path.to_string(),
+                    experimental_features: Some("encryption".to_string()),
+                    async_io: false,
+                    encryption: Some(crate::rsapi::EncryptionOpts {
+                        cipher: TEST_CIPHER.to_string(),
+                        hexkey: WRONG_HEXKEY.to_string(),
+                    }),
+                    vfs: None,
+                    io: None,
+                    db_file: None,
+                });
+                assert!(db.open().is_err(), "Opening with wrong key should fail");
+            }
+
+            // 5. Verify opening without encryption fails
+            {
+                let db = TursoDatabase::new(TursoDatabaseConfig {
+                    path: db_path.to_string(),
+                    experimental_features: Some("encryption".to_string()),
+                    async_io: false,
+                    encryption: None,
+                    vfs: None,
+                    io: None,
+                    db_file: None,
+                });
+                assert!(
+                    db.open().is_err(),
+                    "Opening encrypted database without key should fail"
+                );
+            }
+        }
     }
 }
