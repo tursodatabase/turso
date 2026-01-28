@@ -17,7 +17,7 @@ use sql_generation::{
             predicate::Predicate,
             select::{CompoundOperator, CompoundSelect, ResultColumn, SelectBody, SelectInner},
             transaction::{Begin, Commit, Rollback},
-            update::Update,
+            update::{SetValue, Update},
         },
         table::SimValue,
     },
@@ -320,71 +320,140 @@ impl Property {
                     InteractionBuilder::with_interaction(assertion),
                 ]
             }
-            Property::ReadYourUpdatesBack { update, select } => {
+            Property::ReadYourUpdatesBack {
+                update,
+                select_before,
+                select_after,
+            } => {
                 let table = update.table().to_string();
                 let table_dependency = table.clone();
                 let assumption = InteractionType::Assumption(Assertion::new(
                     format!("table {} exists", table.clone()),
                     move |_: &Vec<ResultSet>, env: &mut SimulatorEnv| {
                         let conn_tables = env.get_conn_tables(connection_index);
-                        if conn_tables.iter().any(|t| t.name == table.clone()) {
+                        if conn_tables.iter().any(|t| t.name == table) {
                             Ok(Ok(()))
                         } else {
-                            Ok(Err(format!("table {} does not exist", table.clone())))
+                            Ok(Err(format!("table {table} does not exist")))
                         }
                     },
                     vec![table_dependency.clone()],
                 ));
 
+                let before_interaction =
+                    InteractionType::Query(Query::Select(select_before.clone()));
+                let begin_tx = InteractionType::Query(Query::Begin(
+                    sql_generation::model::query::transaction::Begin::Immediate,
+                ));
                 let update_interaction = InteractionType::Query(Query::Update(update.clone()));
-                let select_interaction = InteractionType::Query(Query::Select(select.clone()));
+                let commit_tx = InteractionType::Query(Query::Commit(
+                    sql_generation::model::query::transaction::Commit,
+                ));
+                let after_interaction = InteractionType::Query(Query::Select(select_after.clone()));
 
                 let update = update.clone();
-
                 let table = update.table().to_string();
 
                 let assertion = InteractionType::Assertion(Assertion::new(
                     format!(
-                        "updated rows should be found and have the updated values for table {}",
+                        "verify UPDATE result for table {}: success=values updated, failure=unchanged",
                         table.clone()
                     ),
                     move |stack: &Vec<ResultSet>, _| {
-                        let rows = stack.last().unwrap();
-                        match rows {
-                            Ok(rows) => {
-                                for row in rows {
-                                    for (i, (col, val)) in update.set_values.iter().enumerate() {
-                                        if &row[i] != val {
-                                            let update_rows = update
-                                                .set_values
-                                                .iter()
-                                                .map(|(_, val)| val.clone())
-                                                .collect::<Vec<_>>();
-                                            print_diff(
-                                                &[row.to_vec()],
-                                                &[update_rows],
-                                                "database",
-                                                "update-clause",
-                                            );
-                                            return Ok(Err(format!(
-                                                "updated row {} has incorrect value for column {col}: expected {val}, got {}",
-                                                i, row[i]
-                                            )));
+                        // Stack: [before, BEGIN, UPDATE, COMMIT, after]
+                        if stack.len() < 5 {
+                            return Err(LimboError::InternalError(
+                                "ReadYourUpdatesBack: expected 5 results on stack".into(),
+                            ));
+                        }
+                        let before = &stack[stack.len() - 5];
+                        let update_result = &stack[stack.len() - 3];
+                        let after = &stack[stack.len() - 1];
+
+                        let update_succeeded = update_result.is_ok();
+
+                        match (before, after) {
+                            (Ok(before_rows), Ok(after_rows)) => {
+                                if update_succeeded {
+                                    // Verify rows have updated values
+                                    for row in after_rows {
+                                        for (i, (col, set_val)) in
+                                            update.set_values.iter().enumerate()
+                                        {
+                                            match set_val {
+                                                SetValue::Simple(expected) => {
+                                                    if &row[i] != expected {
+                                                        print_diff(
+                                                            &[row.to_vec()],
+                                                            &[vec![expected.clone()]],
+                                                            "database",
+                                                            "expected",
+                                                        );
+                                                        return Ok(Err(format!(
+                                                            "row has incorrect value for column {col}: expected {expected}, got {}",
+                                                            row[i]
+                                                        )));
+                                                    }
+                                                }
+                                                SetValue::CaseWhen { then_value, .. } => {
+                                                    let is_then = &row[i] == then_value;
+                                                    let existed_before = before_rows
+                                                        .iter()
+                                                        .any(|br| br[i] == row[i]);
+                                                    if !is_then && !existed_before {
+                                                        return Ok(Err(format!(
+                                                            "CaseWhen: row col {col} has unexpected value {} (expected {} or a value from before)",
+                                                            row[i], then_value
+                                                        )));
+                                                    }
+                                                }
+                                            }
                                         }
                                     }
+                                    Ok(Ok(()))
+                                } else {
+                                    // UPDATE failed - verify rollback (rows unchanged)
+                                    let rows_equal_as_multiset =
+                                        |a: &[Vec<SimValue>], b: &[Vec<SimValue>]| {
+                                            if a.len() != b.len() {
+                                                return false;
+                                            }
+                                            // for each row in a, check it appears the same number of times in b
+                                            let count_in =
+                                                |row: &Vec<SimValue>, set: &[Vec<SimValue>]| {
+                                                    set.iter().filter(|r| *r == row).count()
+                                                };
+                                            a.iter().all(|row| count_in(row, a) == count_in(row, b))
+                                        };
+                                    if !rows_equal_as_multiset(before_rows, after_rows) {
+                                        print_diff(before_rows, after_rows, "before", "after");
+                                        return Ok(Err(format!(
+                                            "UPDATE failed but rows changed - rollback failed: {} rows before, {} after",
+                                            before_rows.len(),
+                                            after_rows.len()
+                                        )));
+                                    }
+                                    Ok(Ok(()))
                                 }
-                                Ok(Ok(()))
                             }
-                            Err(err) => Err(LimboError::InternalError(err.to_string())),
+                            (Err(e), _) | (_, Err(e)) => {
+                                Err(LimboError::InternalError(format!("SELECT failed: {e}")))
+                            }
                         }
                     },
                     vec![table_dependency],
                 ));
 
+                let mut update_builder = InteractionBuilder::with_interaction(update_interaction);
+                update_builder.ignore_error(true);
+
                 vec![
                     InteractionBuilder::with_interaction(assumption),
-                    InteractionBuilder::with_interaction(update_interaction),
-                    InteractionBuilder::with_interaction(select_interaction),
+                    InteractionBuilder::with_interaction(before_interaction),
+                    InteractionBuilder::with_interaction(begin_tx),
+                    update_builder,
+                    InteractionBuilder::with_interaction(commit_tx),
+                    InteractionBuilder::with_interaction(after_interaction),
                     InteractionBuilder::with_interaction(assertion),
                 ]
             }
@@ -1165,7 +1234,6 @@ fn assert_all_table_values(
                                 !table.rows.contains(v)
                             });
 
-
                             if let Some(model_contains_db) = model_contains_db {
                                 tracing::debug!(
                                     "table {} does not contain the expected values, the simulator model has more rows than the database: {:?}",
@@ -1203,9 +1271,19 @@ fn property_insert_values_select<R: rand::Rng + ?Sized>(
     mvcc: bool,
 ) -> Property {
     assert!(!ctx.tables().is_empty());
-    // Get a random table
-    let table = pick(ctx.tables(), rng);
-    // Generate rows to insert
+
+    let non_unique_tables: Vec<_> = ctx
+        .tables()
+        .iter()
+        .filter(|t| !t.has_any_unique_column())
+        .collect();
+
+    let table = if non_unique_tables.is_empty() {
+        pick(ctx.tables(), rng)
+    } else {
+        *pick(&non_unique_tables, rng)
+    };
+
     let rows = (0..rng.random_range(1..=5))
         .map(|_| Vec::<SimValue>::arbitrary_from(rng, ctx, table))
         .collect::<Vec<_>>();
@@ -1273,8 +1351,8 @@ fn property_read_your_updates_back<R: rand::Rng + ?Sized>(
     ctx: &impl GenerationContext,
     _mvcc: bool,
 ) -> Property {
-    // e.g. UPDATE t SET a=1, b=2 WHERE c=1;
     let update = Update::arbitrary(rng, ctx);
+
     // e.g. SELECT a, b FROM t WHERE c=1;
     let select = Select::single(
         update.table().to_string(),
@@ -1288,7 +1366,11 @@ fn property_read_your_updates_back<R: rand::Rng + ?Sized>(
         Distinctness::All,
     );
 
-    Property::ReadYourUpdatesBack { update, select }
+    Property::ReadYourUpdatesBack {
+        update,
+        select_before: select.clone(),
+        select_after: select,
+    }
 }
 
 fn property_table_has_expected_content<R: rand::Rng + ?Sized>(
@@ -1541,11 +1623,18 @@ impl PropertyDiscriminants {
         match self {
             PropertyDiscriminants::InsertValuesSelect => {
                 if !env.opts.disable_insert_values_select && !ctx.tables().is_empty() {
-                    u32::min(remaining.select, remaining.insert).max(1)
+                    let has_non_unique_table =
+                        ctx.tables().iter().any(|t| !t.has_any_unique_column());
+                    if has_non_unique_table {
+                        u32::min(remaining.select, remaining.insert).max(1)
+                    } else {
+                        0 // all tables have UNIQUE columns, skip this property
+                    }
                 } else {
                     0
                 }
             }
+
             PropertyDiscriminants::ReadYourUpdatesBack => {
                 u32::min(remaining.select, remaining.insert).max(1)
             }

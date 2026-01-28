@@ -85,6 +85,8 @@ pub struct QueryOpts {
     #[garde(dive)]
     pub insert: InsertOpts,
     #[garde(dive)]
+    pub update: UpdateOpts,
+    #[garde(dive)]
     pub alter_table: AlterTableOpts,
 }
 
@@ -189,6 +191,15 @@ impl Default for InsertOpts {
             max_rows: NonZero::new(10).unwrap(),
         }
     }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, Validate)]
+#[serde(deny_unknown_fields, default)]
+pub struct UpdateOpts {
+    #[garde(skip)]
+    pub padding_size: Option<usize>,
+    #[garde(skip)]
+    pub force_late_failure: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Validate)]

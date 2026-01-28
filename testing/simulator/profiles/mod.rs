@@ -10,7 +10,9 @@ use anyhow::Context;
 use garde::Validate;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use sql_generation::generation::{InsertOpts, LargeTableOpts, Opts, QueryOpts, TableOpts};
+use sql_generation::generation::{
+    InsertOpts, LargeTableOpts, Opts, QueryOpts, TableOpts, UpdateOpts,
+};
 use strum::EnumString;
 
 use crate::profiles::{
@@ -93,6 +95,39 @@ impl Profile {
         profile
     }
 
+    /// Profile for write-stress testing with cache pressure.
+    ///
+    /// this uses padding as without padding we need way too many rows and simulator is taking more than 15 minutes.
+    pub fn write_stress() -> Self {
+        let profile = Profile {
+            cache_size_pages: Some(200),
+            query: QueryProfile {
+                gen_opts: Opts {
+                    query: QueryOpts {
+                        insert: InsertOpts {
+                            min_rows: NonZeroU32::new(50).unwrap(),
+                            max_rows: NonZeroU32::new(200).unwrap(),
+                        },
+                        update: UpdateOpts {
+                            padding_size: Some(20_000),
+                            force_late_failure: true,
+                        },
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                update_weight: 40,
+                insert_weight: 40,
+                delete_weight: 5,
+                select_weight: 15,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        profile.validate().unwrap();
+        profile
+    }
+
     pub fn faultless() -> Self {
         let profile = Profile {
             io: IOProfile {
@@ -140,6 +175,7 @@ impl Profile {
             ProfileType::WriteHeavySpill => Self::write_heavy_spill(),
             ProfileType::Faultless => Self::faultless(),
             ProfileType::SimpleMvcc => Self::simple_mvcc(),
+            ProfileType::WriteStress => Self::write_stress(),
             ProfileType::Custom(path) => {
                 Self::parse(path).with_context(|| "failed to parse JSON profile")?
             }
@@ -180,6 +216,7 @@ pub enum ProfileType {
     WriteHeavySpill,
     Faultless,
     SimpleMvcc,
+    WriteStress,
     #[strum(disabled)]
     Custom(PathBuf),
 }
@@ -187,10 +224,11 @@ pub enum ProfileType {
 impl ProfileType {
     pub fn parse(s: &str) -> anyhow::Result<Self> {
         if let Ok(prof) = ProfileType::from_str(s) {
-            Ok(prof)
-        } else if let path = PathBuf::from(s)
-            && path.exists()
-        {
+            return Ok(prof);
+        }
+
+        let path = PathBuf::from(s);
+        if path.exists() {
             Ok(ProfileType::Custom(path))
         } else {
             Err(anyhow::anyhow!(
