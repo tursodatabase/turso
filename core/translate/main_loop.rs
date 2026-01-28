@@ -1626,6 +1626,20 @@ fn emit_loop_source(
                     &t_ctx.resolver,
                 )?;
             }
+
+            // Also capture column expressions that appear in aggregate-containing result columns
+            // but are outside of aggregate function calls. These will be added to expr_to_reg_cache
+            // later so they can be used when evaluating the full expressions after AggFinal.
+            for (col_expr, reg) in t_ctx.captured_columns_in_agg_exprs.iter() {
+                translate_expr(
+                    program,
+                    Some(&plan.table_references),
+                    col_expr,
+                    *reg,
+                    &t_ctx.resolver,
+                )?;
+            }
+
             if let Some(label) = label_emit_nonagg_only_once {
                 program.resolve_label(label, program.offset());
                 let flag = t_ctx.reg_nonagg_emit_once_flag.unwrap();

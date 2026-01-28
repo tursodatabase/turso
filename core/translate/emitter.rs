@@ -44,7 +44,9 @@ use crate::translate::plan::{
     Plan, QueryDestination, ResultSetColumn, Search,
 };
 use crate::translate::planner::ROWID_STRS;
-use crate::translate::planner::{table_mask_from_expr, TableMask};
+use crate::translate::planner::{
+    collect_columns_outside_aggregates, table_mask_from_expr, TableMask,
+};
 use crate::translate::subquery::emit_non_from_clause_subquery;
 use crate::translate::trigger_exec::{
     fire_trigger, get_relevant_triggers_type_and_time, has_relevant_triggers_type_only,
@@ -293,6 +295,13 @@ pub struct TranslateCtx<'a> {
     /// Cursor id for cdc table (if capture_data_changes PRAGMA is set and query can modify the data)
     pub cdc_cursor_id: Option<usize>,
     pub meta_window: Option<WindowMetadata<'a>>,
+    /// Column expressions that appear in aggregate-containing result columns but are NOT inside
+    /// aggregate function calls. These need to be captured during the loop and added to the
+    /// expr_to_reg_cache so they can be used when evaluating expressions like:
+    /// `CASE WHEN 0 THEN SUM(x) WHEN y THEN -NULL END`
+    /// where `y` is outside the aggregate and needs its value from the loop iteration.
+    /// Each entry is (column expression, register where it will be stored).
+    pub captured_columns_in_agg_exprs: Vec<(&'a Expr, usize)>,
 }
 
 impl<'a> TranslateCtx<'a> {
@@ -320,6 +329,7 @@ impl<'a> TranslateCtx<'a> {
             non_aggregate_expressions: Vec::new(),
             cdc_cursor_id: None,
             meta_window: None,
+            captured_columns_in_agg_exprs: Vec::new(),
         }
     }
 }
@@ -1156,6 +1166,41 @@ pub fn emit_query<'a>(
         let flag = program.alloc_register();
         program.emit_int(0, flag); // Initialize flag to 0 (not yet emitted)
         t_ctx.reg_nonagg_emit_once_flag = Some(flag);
+    }
+
+    // For ungrouped aggregates, collect column expressions that appear in aggregate-containing
+    // result columns but are NOT inside aggregate function calls. These need to be captured
+    // during the loop iteration because the cursor will be invalid after the loop.
+    // Example: `CASE WHEN 0 THEN SUM(x) WHEN y THEN -NULL END` - `y` needs to be captured.
+    if !plan.aggregates.is_empty() && plan.group_by.is_none() {
+        let mut columns_to_capture: Vec<&Expr> = Vec::new();
+        for rc in plan.result_columns.iter() {
+            if rc.contains_aggregates {
+                collect_columns_outside_aggregates(
+                    &rc.expr,
+                    &t_ctx.resolver,
+                    &mut columns_to_capture,
+                )?;
+            }
+        }
+        // Deduplicate columns (same column may appear multiple times)
+        columns_to_capture.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
+        columns_to_capture.dedup_by(|a, b| crate::util::exprs_are_equivalent(a, b));
+
+        // Allocate registers for each unique column and store in captured_columns_in_agg_exprs
+        for col_expr in columns_to_capture {
+            let reg = program.alloc_register();
+            t_ctx.captured_columns_in_agg_exprs.push((col_expr, reg));
+        }
+
+        // If we have columns to capture but no once-flag was set up, set one up now
+        if !t_ctx.captured_columns_in_agg_exprs.is_empty()
+            && t_ctx.reg_nonagg_emit_once_flag.is_none()
+        {
+            let flag = program.alloc_register();
+            program.emit_int(0, flag);
+            t_ctx.reg_nonagg_emit_once_flag = Some(flag);
+        }
     }
 
     // Allocate registers for result columns

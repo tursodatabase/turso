@@ -102,3 +102,92 @@ expect {
     1|null||
 }
 
+# Tests for aggregates inside CASE expressions.
+# When an aggregate appears in an untaken CASE branch, column references in other
+# branches should still be evaluated correctly (they must be captured during the
+# loop iteration, not after when the cursor is invalid).
+
+test case-with-aggregate-in-untaken-branch-sum {
+    CREATE TABLE t (x INTEGER);
+    INSERT INTO t VALUES (1);
+    SELECT CASE WHEN 0 THEN SUM(x) WHEN x THEN -NULL ELSE 'else' END FROM t;
+}
+expect {
+
+}
+
+test case-with-aggregate-in-untaken-branch-different-column {
+    CREATE TABLE t (x INTEGER, y INTEGER);
+    INSERT INTO t VALUES (1, 2);
+    SELECT CASE WHEN 0 THEN SUM(x) WHEN y THEN -NULL ELSE 'else' END FROM t;
+}
+expect {
+
+}
+
+test case-with-aggregate-column-y-outside {
+    CREATE TABLE t (y INTEGER);
+    INSERT INTO t VALUES (1);
+    SELECT CASE WHEN 0 THEN COUNT(*) WHEN y THEN -NULL ELSE 'else' END FROM t;
+}
+expect {
+
+}
+
+test case-with-aggregate-in-untaken-branch-count {
+    CREATE TABLE t (x INTEGER);
+    INSERT INTO t VALUES (1);
+    SELECT CASE WHEN 0 THEN COUNT(x) WHEN x > 0 THEN 'yes' ELSE 'no' END FROM t;
+}
+expect {
+    yes
+}
+
+test case-with-aggregate-in-untaken-branch-group-concat {
+    CREATE TABLE t (x INTEGER, y TEXT);
+    INSERT INTO t VALUES (1, 'a');
+    SELECT CASE WHEN 0 THEN GROUP_CONCAT(y) WHEN length(y) > 0 THEN y ELSE 'empty' END FROM t;
+}
+expect {
+    a
+}
+
+test case-with-aggregate-multiple-columns-outside {
+    CREATE TABLE t (x INTEGER, y TEXT);
+    INSERT INTO t VALUES (1, 'a');
+    SELECT CASE WHEN 0 THEN SUM(x) WHEN x > 0 AND y = 'a' THEN 'found' ELSE 'not' END FROM t;
+}
+expect {
+    found
+}
+
+test case-with-aggregate-in-taken-branch {
+    CREATE TABLE t (x INTEGER);
+    INSERT INTO t VALUES (1), (2), (3);
+    SELECT CASE WHEN 1 THEN SUM(x) ELSE 'never' END FROM t;
+}
+expect {
+    6
+}
+
+test case-with-multiple-aggregates-in-untaken-branches {
+    CREATE TABLE t (x INTEGER);
+    INSERT INTO t VALUES (1);
+    SELECT
+        CASE WHEN 0 THEN SUM(x) WHEN x THEN 'a' ELSE 'b' END,
+        CASE WHEN 0 THEN COUNT(*) WHEN x = 1 THEN 'first' ELSE 'other' END
+    FROM t;
+}
+expect {
+    a|first
+}
+
+test case-with-nested-case-and-aggregate {
+    CREATE TABLE t (x INTEGER);
+    INSERT INTO t VALUES (1);
+    SELECT CASE WHEN 0 THEN SUM(x) WHEN CASE WHEN x = 1 THEN 1 ELSE 0 END THEN 'nested' ELSE 'not' END FROM t;
+}
+expect {
+    nested
+}
+

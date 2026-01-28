@@ -283,6 +283,62 @@ pub fn resolve_window_and_aggregate_functions(
     Ok(contains_aggregates)
 }
 
+/// Collects column expressions that appear in an expression but are NOT inside
+/// aggregate function calls. This is used for ungrouped aggregates where we need
+/// to capture column values during the loop for later use in CASE expressions.
+///
+/// For example, in `CASE WHEN 0 THEN SUM(x) WHEN y THEN -NULL END`:
+/// - `y` is outside the aggregate and needs to be captured during the loop
+/// - `x` is inside `SUM()` and will be handled by the aggregate machinery
+pub fn collect_columns_outside_aggregates<'a>(
+    expr: &'a Expr,
+    resolver: &Resolver,
+    columns: &mut Vec<&'a Expr>,
+) -> Result<()> {
+    walk_expr(expr, &mut |e: &'a Expr| -> Result<WalkControl> {
+        match e {
+            Expr::FunctionCall {
+                name,
+                args,
+                filter_over,
+                ..
+            } => {
+                let args_count = args.len();
+                // Check if this is an aggregate function - if so, skip its children
+                match Func::resolve_function(name.as_str(), args_count) {
+                    Ok(Func::Agg(_)) => {
+                        // Skip walking into aggregate function arguments
+                        return Ok(WalkControl::SkipChildren);
+                    }
+                    Err(_) => {
+                        // Check for external aggregate functions
+                        if let Some(f) = resolver
+                            .symbol_table
+                            .resolve_function(name.as_str(), args_count)
+                        {
+                            if matches!(f.as_ref().func, ExtFunc::Aggregate { .. }) {
+                                return Ok(WalkControl::SkipChildren);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                // Also skip if it's a window function (has OVER clause)
+                if filter_over.over_clause.is_some() {
+                    return Ok(WalkControl::SkipChildren);
+                }
+            }
+            Expr::Column { .. } => {
+                // Found a column reference outside of aggregate functions
+                columns.push(e);
+            }
+            _ => {}
+        }
+        Ok(WalkControl::Continue)
+    })?;
+    Ok(())
+}
+
 fn link_with_window(
     windows: Option<&mut Vec<Window>>,
     expr: &Expr,
