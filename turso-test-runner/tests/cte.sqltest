@@ -18,6 +18,45 @@ expect {
     1|2
 }
 
+# Test WITH ... AS MATERIALIZED syntax - forces materialization even for single-ref CTEs
+test cte-as-materialized {
+    WITH t AS MATERIALIZED (SELECT 1 as x, 2 as y) SELECT x, y FROM t;
+}
+expect {
+    1|2
+}
+
+# Test AS NOT MATERIALIZED syntax (hint to avoid materialization)
+test cte-as-not-materialized {
+    WITH t AS NOT MATERIALIZED (SELECT 1 as x) SELECT * FROM t;
+}
+expect {
+    1
+}
+
+# Test multiple CTEs with mixed materialization hints
+test cte-mixed-materialization {
+    WITH
+      t1 AS MATERIALIZED (SELECT 1 as a),
+      t2 AS NOT MATERIALIZED (SELECT 2 as b),
+      t3 AS (SELECT 3 as c)
+    SELECT * FROM t1, t2, t3;
+}
+expect {
+    1|2|3
+}
+
+# Verify that AS MATERIALIZED actually materializes by using random().
+# A materialized CTE should compute random() once and return the same value
+# for multiple references, while non-materialized would re-evaluate.
+test cte-materialized-random-same-value {
+    WITH t AS MATERIALIZED (SELECT random() as r)
+    SELECT (SELECT r FROM t) = (SELECT r FROM t) as same;
+}
+expect {
+    1
+}
+
 test cte-chain {
     WITH a AS (SELECT 1 as x), b AS (SELECT x FROM a), c AS (SELECT x FROM b), d AS (SELECT x FROM c) SELECT * FROM d;
 }

@@ -55,6 +55,8 @@ struct CteDefinition {
     /// Only includes CTEs that appear in this CTE's FROM clause,
     /// avoiding exponential re-planning when CTEs have transitive dependencies.
     referenced_cte_indices: SmallVec<[usize; 2]>,
+    /// True if WITH ... AS MATERIALIZED was specified, forcing materialization
+    materialize_hint: bool,
 }
 
 /// Collect all table names referenced in a SELECT's FROM clause.
@@ -426,6 +428,7 @@ fn plan_cte(
             program.table_reference_counter.next(),
             explicit_cols,
             Some(cte_def.cte_id), // Pass the CTE identity for sharing materialized data
+            cte_def.materialize_hint,
         ),
         Plan::Delete(_) | Plan::Update(_) => {
             crate::bail_parse_error!("DELETE/UPDATE queries are not supported in CTEs")
@@ -452,10 +455,6 @@ pub fn plan_ctes_as_outer_refs(
     }
 
     for cte in with.ctes {
-        if cte.materialized == Materialized::Yes {
-            crate::bail_parse_error!("Materialized CTEs are not yet supported");
-        }
-
         // Normalize explicit column names
         let explicit_columns: Vec<String> = cte
             .columns
@@ -482,6 +481,9 @@ pub fn plan_ctes_as_outer_refs(
             );
         }
 
+        // AS MATERIALIZED forces materialization
+        let materialize_hint = cte.materialized == Materialized::Yes;
+
         // Plan the CTE SELECT
         let cte_plan = prepare_select_plan(
             cte.select,
@@ -506,6 +508,7 @@ pub fn plan_ctes_as_outer_refs(
                 program.table_reference_counter.next(),
                 explicit_cols,
                 None, // CTEs in DML don't share materialized data (TODO: implement if needed)
+                materialize_hint,
             )?,
             Plan::Delete(_) | Plan::Update(_) => {
                 crate::bail_parse_error!("Only SELECT queries are supported in CTEs")
@@ -611,8 +614,9 @@ fn parse_from_clause_table(
                 subplan,
                 None,
                 program.table_reference_counter.next(),
-                None, // No explicit columns for regular subqueries
-                None, // Regular inline subqueries don't have a CTE identity
+                None,  // No explicit columns for regular subqueries
+                None,  // Regular inline subqueries don't have a CTE identity
+                false, // No materialize hint for inline subqueries
             )?);
             Ok(())
         }
@@ -946,9 +950,6 @@ pub fn parse_from(
         }
 
         for (idx, cte) in with.ctes.into_iter().enumerate() {
-            if cte.materialized == Materialized::Yes {
-                crate::bail_parse_error!("Materialized CTEs are not yet supported");
-            }
             // Normalize explicit column names
             let explicit_columns: Vec<String> = cte
                 .columns
@@ -995,12 +996,16 @@ pub fn parse_from(
                 .filter(|&i| referenced_tables.contains(&cte_definitions[i].name))
                 .collect();
 
+            // AS MATERIALIZED forces materialization; AS NOT MATERIALIZED prevents it
+            let materialize_hint = cte.materialized == Materialized::Yes;
+
             cte_definitions.push(CteDefinition {
                 cte_id: program.alloc_cte_id(),
                 name: cte_name_normalized,
                 select: cte.select,
                 explicit_columns,
                 referenced_cte_indices,
+                materialize_hint,
             });
         }
 
