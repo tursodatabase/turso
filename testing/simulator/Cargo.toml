@@ -20,7 +20,7 @@ name = "plan_to_test"
 path = "plan_to_test.rs"
 
 [dependencies]
-turso_core = { workspace = true, features = ["simulator", "io_uring"]}
+turso_core = { workspace = true, features = ["simulator", "io_uring"] }
 rand = { workspace = true }
 rand_chacha = { workspace = true }
 regex = { workspace = true }
@@ -45,7 +45,7 @@ schemars = { workspace = true }
 garde = { workspace = true, features = ["derive", "serde"] }
 json5 = { version = "0.4.1" }
 strum = { workspace = true }
-parking_lot = { workspace = true }
+parking_lot = { workspace = true, features = ["arc_lock"] }
 indexmap = { workspace = true }
 either = "1.15.0"
 similar = { workspace = true }
