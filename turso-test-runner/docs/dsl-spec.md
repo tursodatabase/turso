@@ -16,6 +16,7 @@ A `.sqltest` file consists of:
 1. Database declarations (`@database`)
 2. Named setup blocks (`setup name { ... }`)
 3. Test cases (`test name { ... } expect { ... }`)
+4. Snapshot cases (`snapshot name { ... }`) - for capturing EXPLAIN output
 
 ```
 @database <db-spec>
@@ -33,6 +34,12 @@ test <name> {
 }
 expect [modifier] {
     <expected-output>
+}
+
+# Snapshot tests (for EXPLAIN output)
+@setup <name>
+snapshot <name> {
+    <sql>
 }
 ```
 
@@ -134,6 +141,41 @@ setup products {
 }
 ```
 
+## File-Level Directives
+
+These directives apply to all tests and snapshots in the file.
+
+### Syntax
+
+```
+@skip-file "reason"
+@skip-file-if <condition> "reason"
+@requires-file <capability> "reason"
+```
+
+### Directives
+
+| Directive | Description |
+|-----------|-------------|
+| `@skip-file "reason"` | Skip all tests in the file unconditionally |
+| `@skip-file-if <condition> "reason"` | Skip all tests conditionally (e.g., `mvcc`) |
+| `@requires-file <capability> "reason"` | Require capability for all tests (e.g., `trigger`) |
+
+### Example
+
+```sql
+@database :memory:
+@skip-file-if mvcc "MVCC not supported for this file"
+@requires-file trigger "all tests need trigger support"
+
+test example {
+    SELECT 1;
+}
+expect {
+    1
+}
+```
+
 ## Test Cases
 
 ### Basic Syntax
@@ -156,7 +198,8 @@ Decorators appear before the `test` keyword:
 | `@setup <name>` | Apply a named setup before the test (can be repeated) |
 | `@skip "reason"` | Skip this test unconditionally with the given reason |
 | `@skip-if <condition> "reason"` | Skip this test conditionally based on runtime configuration |
-| `@backend <name>` | Only run this test on the specified backend (e.g., `cli`, `rust`) |
+| `@backend <name>` | Only run this test on the specified backend (`rust`, `cli`, `js`) |
+| `@requires <capability> "reason"` | Only run if the backend supports the capability |
 
 #### Skip Conditions
 
@@ -165,6 +208,16 @@ The `@skip-if` decorator supports the following conditions:
 | Condition | Description |
 |-----------|-------------|
 | `mvcc` | Skip when MVCC mode is enabled (`--mvcc` flag) |
+
+#### Capabilities
+
+The `@requires` decorator supports the following capabilities:
+
+| Capability | Description |
+|------------|-------------|
+| `trigger` | Backend supports `CREATE TRIGGER` |
+| `strict` | Backend supports `STRICT` tables |
+| `materialized_views` | Backend supports materialized views (experimental) |
 
 ### Expect Modifiers
 
@@ -289,25 +342,116 @@ test rust-specific-feature {
 expect {
     rust-only
 }
+
+# Test requiring a specific capability
+@requires trigger "this test uses triggers"
+test trigger-test {
+    CREATE TABLE t (id INTEGER PRIMARY KEY);
+    CREATE TRIGGER tr AFTER INSERT ON t BEGIN SELECT 1; END;
+    INSERT INTO t VALUES (1);
+    SELECT 'triggered';
+}
+expect {
+    triggered
+}
 ```
+
+## Snapshot Cases
+
+Snapshot tests capture the `EXPLAIN QUERY PLAN` and `EXPLAIN` (bytecode) output of a SQL query. They are used to detect changes in query execution plans over time.
+
+> **Note:** Snapshot tests only run on the **Rust backend**. Other backends skip snapshot tests automatically.
+
+### Basic Syntax
+
+```
+snapshot <name> {
+    <sql>
+}
+```
+
+Unlike regular tests, snapshot cases do not have an `expect` block. Instead, the expected output is stored in a `.snap` file that is automatically managed.
+
+### Snapshot Decorators
+
+Snapshots support all the same decorators as tests:
+
+| Decorator | Description |
+|-----------|-------------|
+| `@setup <name>` | Apply a named setup before the snapshot (can be repeated) |
+| `@skip "reason"` | Skip this snapshot unconditionally |
+| `@skip-if <condition> "reason"` | Skip this snapshot conditionally |
+| `@backend <name>` | Only run this snapshot on the specified backend (snapshots only run on `rust`) |
+| `@requires <capability> "reason"` | Only run if the backend supports the capability |
+
+### Snapshot File Location
+
+Snapshot files are stored in a `snapshots/` directory adjacent to the test file:
+
+```
+tests/
+  my-tests.sqltest
+  snapshots/
+    my-tests__query-plan-name.snap
+```
+
+The naming convention is: `{test-file-stem}__{snapshot-name}.snap`
+
+### Example
+
+```sql
+@database :memory:
+
+setup schema {
+    CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);
+    CREATE INDEX idx_users_name ON users(name);
+}
+
+setup data {
+    INSERT INTO users VALUES (1, 'Alice'), (2, 'Bob');
+}
+
+# Snapshot captures EXPLAIN QUERY PLAN + EXPLAIN output
+@setup schema
+@setup data
+snapshot query-plan-by-id {
+    SELECT * FROM users WHERE id = 1;
+}
+
+@setup schema
+@setup data
+snapshot query-plan-by-name {
+    SELECT * FROM users WHERE name = 'Alice';
+}
+```
+
+For detailed information about working with snapshots (update modes, commands, CI integration), see [Snapshot Testing Guide](./snapshot-testing.md).
 
 ## Grammar (EBNF-like)
 
 ```ebnf
-file            = { database_decl | setup_block | test_case }
+file            = { file_directive | database_decl | setup_block | test_case | snapshot_case }
+
+file_directive  = "@skip-file" STRING NEWLINE
+                | "@skip-file-if" skip_condition STRING NEWLINE
+                | "@requires-file" capability STRING NEWLINE
 
 database_decl   = "@database" database_spec NEWLINE
 database_spec   = ":memory:" | ":temp:" | ":default:" | ":default-no-rowidalias:" | PATH ["readonly"]
 
 setup_block     = "setup" IDENTIFIER block
 test_case       = { decorator } "test" IDENTIFIER block expect_block
+snapshot_case   = { decorator } "snapshot" IDENTIFIER block
 
 decorator       = "@setup" IDENTIFIER NEWLINE
                 | "@skip" STRING NEWLINE
                 | "@skip-if" skip_condition STRING NEWLINE
+                | "@backend" IDENTIFIER NEWLINE
+                | "@requires" capability STRING NEWLINE
 
 skip_condition  = "mvcc"
-                | "@backend" IDENTIFIER NEWLINE
+
+capability      = "trigger" | "strict" | "materialized_views"
 
 expect_block    = "expect" [expect_modifier] block
 
@@ -335,6 +479,13 @@ NEWLINE         = '\n'
 1. Test names must be unique within a file
 2. Setup names in `@setup` decorators must reference defined setups
 3. SQL must end with semicolon
+
+### Snapshot-Level Validation
+
+1. Snapshot names must be unique within a file
+2. Snapshot names must not conflict with test names
+3. Setup names in `@setup` decorators must reference defined setups
+4. SQL must contain exactly one statement (semicolons in strings and comments are ignored)
 
 ## Execution Model
 
@@ -405,9 +556,10 @@ The lexer uses the [Logos](https://docs.rs/logos) crate (v0.16) for tokenization
 - **Block content extraction**: When `{` is encountered, a custom callback extracts all content until the matching `}`, handling nested braces. This allows arbitrary SQL and expected output without special escaping.
 
 - **Tokens**: The lexer produces these token types:
-  - Keywords: `@database`, `@setup`, `@skip`, `@skip-if`, `@backend`, `setup`, `test`, `expect`
+  - Keywords: `@database`, `@setup`, `@skip`, `@skip-if`, `@skip-file`, `@skip-file-if`, `@requires`, `@requires-file`, `@backend`, `setup`, `test`, `expect`, `snapshot`
   - Modifiers: `error`, `pattern`, `unordered`, `readonly`, `raw`
   - Skip conditions: `mvcc`
+  - Capabilities: `trigger`, `strict`, `materialized_views`
   - Database types: `:memory:`, `:temp:`, `:default:`, `:default-no-rowidalias:`
   - Block content: `{...}` (content between braces)
   - Identifiers, strings, paths, comments, newlines
@@ -428,15 +580,29 @@ pub struct TestFile {
     pub databases: Vec<DatabaseConfig>,
     pub setups: HashMap<String, String>,
     pub tests: Vec<TestCase>,
+    pub snapshots: Vec<SnapshotCase>,
+    pub global_skip: Option<Skip>,        // @skip-file / @skip-file-if
+    pub global_requires: Vec<Requirement>, // @requires-file
 }
 
 pub struct TestCase {
     pub name: String,
     pub sql: String,
-    pub expectation: Expectation,
-    pub backend: Option<String>,  // Only run on specified backend
+    pub expectations: Expectations,
+    pub modifiers: CaseModifiers,
+}
+
+pub struct SnapshotCase {
+    pub name: String,
+    pub sql: String,
+    pub modifiers: CaseModifiers,
+}
+
+pub struct CaseModifiers {
     pub setups: Vec<SetupRef>,
     pub skip: Option<Skip>,
+    pub backend: Option<Backend>,
+    pub requires: Vec<Requirement>,
 }
 
 pub struct Skip {
@@ -446,6 +612,23 @@ pub struct Skip {
 
 pub enum SkipCondition {
     Mvcc,  // Skip when MVCC mode is enabled
+}
+
+pub enum Capability {
+    Trigger,           // CREATE TRIGGER support
+    Strict,            // STRICT tables support
+    MaterializedViews, // Materialized views (experimental)
+}
+
+pub struct Requirement {
+    pub capability: Capability,
+    pub reason: String,
+}
+
+pub enum Backend {
+    Rust,
+    Cli,
+    Js,
 }
 
 pub enum Expectation {
