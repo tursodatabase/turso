@@ -1806,7 +1806,7 @@ pub enum Scan {
         /// The order of expressions matches the argument order expected by the virtual table.
         constraints: Vec<Expr>,
     },
-    /// A scan of a subquery in the `FROM` clause.
+    /// A scan of a subquery in the `FROM` clause (using coroutines).
     Subquery,
 }
 
@@ -2125,7 +2125,7 @@ fn eval_at_for_plan(
 }
 
 /// Returns true if a plan (including compound SELECTs) references outer-scope tables.
-fn plan_is_correlated(plan: &Plan) -> bool {
+pub fn plan_is_correlated(plan: &Plan) -> bool {
     match plan {
         Plan::Select(select_plan) => select_plan.is_correlated(),
         Plan::CompoundSelect {

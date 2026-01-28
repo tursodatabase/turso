@@ -30,6 +30,8 @@ use super::{
     main_loop::LoopLabels,
     plan::{Operation, QueryDestination, Scan, Search, SelectPlan},
 };
+use crate::vdbe::builder::CursorKey;
+use turso_parser::ast::TableInternalId;
 
 // Compute query plans for subqueries occurring in any position other than the FROM clause.
 // This includes the WHERE clause, HAVING clause, GROUP BY clause, ORDER BY clause, LIMIT clause, and OFFSET clause.
@@ -700,15 +702,36 @@ pub fn emit_from_clause_subqueries(
         );
 
         if let Table::FromClauseSubquery(from_clause_subquery) = &mut table_reference.table {
-            // Emit the subquery and get the start register of the result columns.
-            let result_columns_start =
-                emit_from_clause_subquery(program, from_clause_subquery.plan.as_mut(), t_ctx)?;
-            // Set the start register of the subquery's result columns.
-            // This is done so that translate_expr() can read the result columns of the subquery,
-            // as if it were reading from a regular table.
-            from_clause_subquery.result_columns_start_reg = Some(result_columns_start);
-            // Also store in program builder so nested subqueries can look it up by internal_id.
-            program.set_subquery_result_reg(table_reference.internal_id, result_columns_start);
+            // Check if this subquery should be materialized with an ephemeral index
+            // This happens when the optimizer assigned Search::Seek with an ephemeral index
+            if let Operation::Search(Search::Seek {
+                index: Some(index), ..
+            }) = &table_reference.op
+            {
+                if !index.ephemeral {
+                    panic!("subquery has non-ephemeral index: {}", index.name);
+                }
+                // Materialize the subquery into an ephemeral index for seeking
+                let result_columns_start = emit_indexed_materialized_subquery(
+                    program,
+                    from_clause_subquery.plan.as_mut(),
+                    t_ctx,
+                    index,
+                    table_reference.internal_id,
+                )?;
+                from_clause_subquery.result_columns_start_reg = Some(result_columns_start);
+                program.set_subquery_result_reg(table_reference.internal_id, result_columns_start);
+            } else {
+                // Emit the subquery as a coroutine and get the start register of the result columns.
+                let result_columns_start =
+                    emit_from_clause_subquery(program, from_clause_subquery.plan.as_mut(), t_ctx)?;
+                // Set the start register of the subquery's result columns.
+                // This is done so that translate_expr() can read the result columns of the subquery,
+                // as if it were reading from a regular table.
+                from_clause_subquery.result_columns_start_reg = Some(result_columns_start);
+                // Also store in program builder so nested subqueries can look it up by internal_id.
+                program.set_subquery_result_reg(table_reference.internal_id, result_columns_start);
+            }
         }
 
         program.pop_current_parent_explain();
@@ -804,6 +827,93 @@ pub fn emit_from_clause_subquery(
     program.emit_insn(Insn::EndCoroutine { yield_reg });
     program.preassign_label_to_next_insn(subquery_body_end_label);
     Ok(result_column_start_reg)
+}
+
+/// Emit a materialized FROM clause subquery with an ephemeral index for seeking.
+///
+/// Instead of using coroutines (which would re-execute the subquery for each outer loop iteration),
+/// this function materializes the subquery results into an ephemeral index. The index is keyed by
+/// columns used in join conditions, allowing efficient seeking instead of nested scans.
+///
+/// Returns the start register for reading result columns.
+fn emit_indexed_materialized_subquery(
+    program: &mut ProgramBuilder,
+    plan: &mut Plan,
+    t_ctx: &mut TranslateCtx,
+    index: &Arc<Index>,
+    table_internal_id: TableInternalId,
+) -> Result<usize> {
+    // Get number of result columns from the plan
+    let num_columns = match plan {
+        Plan::Select(select_plan) => select_plan.result_columns.len(),
+        Plan::CompoundSelect { right_most, .. } => right_most.result_columns.len(),
+        _ => unreachable!("DELETE/UPDATE plans cannot be FROM clause subqueries"),
+    };
+
+    // Allocate a cursor for the ephemeral index using a keyed allocation so it can be resolved later
+    let cursor_id = program.alloc_cursor_id_keyed(
+        CursorKey::index(table_internal_id, index.clone()),
+        CursorType::BTreeIndex(index.clone()),
+    );
+
+    // Allocate registers for reading result columns from the ephemeral index
+    let result_columns_start_reg = program.alloc_registers(num_columns);
+
+    // Update the query destination to use EphemeralIndex
+    if let Some(dest) = plan.select_query_destination_mut() {
+        *dest = QueryDestination::EphemeralIndex {
+            cursor_id,
+            index: index.clone(),
+            is_delete: false,
+        };
+    }
+
+    // Open the ephemeral index
+    program.emit_insn(Insn::OpenEphemeral {
+        cursor_id,
+        is_table: false, // It's an index, not a table
+    });
+
+    // Emit the subquery - it will insert rows into the ephemeral index
+    match plan {
+        Plan::Select(select_plan) => {
+            let mut metadata = TranslateCtx {
+                labels_main_loop: (0..select_plan.joined_tables().len())
+                    .map(|_| LoopLabels::new(program))
+                    .collect(),
+                label_main_loop_end: None,
+                meta_group_by: None,
+                meta_left_joins: (0..select_plan.joined_tables().len())
+                    .map(|_| None)
+                    .collect(),
+                meta_sort: None,
+                reg_agg_start: None,
+                reg_nonagg_emit_once_flag: None,
+                reg_result_cols_start: None,
+                limit_ctx: None,
+                reg_offset: None,
+                reg_limit_offset_sum: None,
+                resolver: Resolver::new(t_ctx.resolver.schema, t_ctx.resolver.symbol_table),
+                non_aggregate_expressions: Vec::new(),
+                cdc_cursor_id: None,
+                meta_window: None,
+                materialized_build_inputs: HashMap::default(),
+                hash_table_contexts: HashMap::default(),
+            };
+            emit_query(program, select_plan, &mut metadata)?;
+        }
+        Plan::CompoundSelect { .. } => {
+            // Clone the plan to pass to emit_program_for_compound_select (it takes ownership)
+            let plan_clone = plan.clone();
+            let resolver = Resolver::new(t_ctx.resolver.schema, t_ctx.resolver.symbol_table);
+            emit_program_for_compound_select(program, &resolver, plan_clone)?;
+        }
+        Plan::Delete(_) | Plan::Update(_) => {
+            unreachable!("DELETE/UPDATE plans cannot be FROM clause subqueries")
+        }
+    }
+
+    Ok(result_columns_start_reg)
 }
 
 /// Translate a subquery that is not part of the FROM clause.

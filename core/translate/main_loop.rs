@@ -923,14 +923,18 @@ pub fn open_loop(
                 }
             }
             Operation::Search(search) => {
-                assert!(
-                    !matches!(table.table, Table::FromClauseSubquery(_)),
-                    "Subqueries do not support index seeks"
-                );
+                // Check if this is a FROM clause subquery with a materialized ephemeral index
+                let is_materialized_subquery = matches!(&table.table, Table::FromClauseSubquery(_))
+                    && matches!(search, Search::Seek { index: Some(idx), .. } if idx.ephemeral);
+
                 // Open the loop for the index search.
                 // Rowid equality point lookups are handled with a SeekRowid instruction which does not loop, since it is a single row lookup.
                 match search {
                     Search::RowidEq { cmp_expr } => {
+                        assert!(
+                            !matches!(table.table, Table::FromClauseSubquery(_)),
+                            "Subqueries do not support rowid seeks"
+                        );
                         let src_reg = program.alloc_register();
                         translate_expr(
                             program,
@@ -952,7 +956,9 @@ pub fn open_loop(
                         // Otherwise, it's an index/rowid scan, i.e. first a seek is performed and then a scan until the comparison expression is not satisfied anymore.
                         let mut bloom_filter = false;
                         if let Some(index) = index {
-                            if index.ephemeral {
+                            if index.ephemeral && !is_materialized_subquery {
+                                // For regular tables with ephemeral indexes, build the auto-index now.
+                                // For materialized subqueries, the index was already built during emission.
                                 let table_has_rowid = if let Table::BTree(btree) = &table.table {
                                     btree.has_rowid
                                 } else {
@@ -977,13 +983,18 @@ pub fn open_loop(
                             }
                         }
 
-                        let seek_cursor_id = temp_cursor_id.unwrap_or_else(|| {
-                            index_cursor_id.unwrap_or_else(|| {
-                                table_cursor_id.expect(
-                                    "Either ephemeral or index or table cursor must be opened",
-                                )
+                        // For materialized subqueries, use the index cursor directly
+                        let seek_cursor_id = if is_materialized_subquery {
+                            index_cursor_id.expect("materialized subquery must have index cursor")
+                        } else {
+                            temp_cursor_id.unwrap_or_else(|| {
+                                index_cursor_id.unwrap_or_else(|| {
+                                    table_cursor_id.expect(
+                                        "Either ephemeral or index or table cursor must be opened",
+                                    )
+                                })
                             })
-                        });
+                        };
 
                         let max_registers = seek_def
                             .size(&seek_def.start)
@@ -1012,13 +1023,16 @@ pub fn open_loop(
                             index.as_ref(),
                         )?;
 
-                        if let Some(index_cursor_id) = index_cursor_id {
-                            if let Some(table_cursor_id) = table_cursor_id {
-                                // Don't do a btree table seek until it's actually necessary to read from the table.
-                                program.emit_insn(Insn::DeferredSeek {
-                                    index_cursor_id,
-                                    table_cursor_id,
-                                });
+                        if !is_materialized_subquery {
+                            // Only emit DeferredSeek for non-subquery tables
+                            if let Some(index_cursor_id) = index_cursor_id {
+                                if let Some(table_cursor_id) = table_cursor_id {
+                                    // Don't do a btree table seek until it's actually necessary to read from the table.
+                                    program.emit_insn(Insn::DeferredSeek {
+                                        index_cursor_id,
+                                        table_cursor_id,
+                                    });
+                                }
                             }
                         }
                     }
@@ -1749,9 +1763,13 @@ pub fn close_loop(
                 program.preassign_label_to_next_insn(loop_labels.loop_end);
             }
             Operation::Search(search) => {
+                // Materialized subqueries with ephemeral indexes are allowed
+                let is_materialized_subquery = matches!(&table.table, Table::FromClauseSubquery(_))
+                    && matches!(search, Search::Seek { index: Some(idx), .. } if idx.ephemeral);
                 assert!(
-                    !matches!(table.table, Table::FromClauseSubquery(_)),
-                    "Subqueries do not support index seeks"
+                    !matches!(table.table, Table::FromClauseSubquery(_))
+                        || is_materialized_subquery,
+                    "Subqueries do not support index seeks unless materialized"
                 );
                 program.resolve_label(loop_labels.next, program.offset());
                 let iteration_cursor_id =
@@ -1761,6 +1779,9 @@ pub fn close_loop(
                     }) = &mode
                     {
                         *ephemeral_table_cursor_id
+                    } else if is_materialized_subquery {
+                        // For materialized subqueries, use the index cursor
+                        index_cursor_id.expect("materialized subquery must have index cursor")
                     } else {
                         index_cursor_id.unwrap_or_else(|| {
                             table_cursor_id

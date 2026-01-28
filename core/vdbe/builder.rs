@@ -1110,13 +1110,18 @@ impl ProgramBuilder {
     /// Hence: currently we first try to resolve a table cursor, and if that fails,
     /// we resolve an index cursor via this method.
     pub fn resolve_any_index_cursor_id_for_table(&self, table_ref_id: TableInternalId) -> CursorID {
-        self.cursor_ref
-            .iter()
-            .position(|(k, _)| {
-                k.as_ref()
-                    .is_some_and(|k| k.table_reference_id == table_ref_id && k.index.is_some())
-            })
+        self.resolve_any_index_cursor_id_for_table_safe(table_ref_id)
             .unwrap_or_else(|| panic!("No index cursor found for table {table_ref_id}"))
+    }
+
+    pub fn resolve_any_index_cursor_id_for_table_safe(
+        &self,
+        table_ref_id: TableInternalId,
+    ) -> Option<CursorID> {
+        self.cursor_ref.iter().position(|(k, _)| {
+            k.as_ref()
+                .is_some_and(|k| k.table_reference_id == table_ref_id && k.index.is_some())
+        })
     }
 
     /// Resolve the [Index] that a given cursor is associated with.

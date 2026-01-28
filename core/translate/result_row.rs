@@ -131,9 +131,59 @@ pub fn emit_result_row_and_limit(
                 });
             } else {
                 let record_reg = program.alloc_register();
+
+                // For ephemeral indexes (materialized subqueries), columns need to be reordered
+                // to match the index definition (key columns first, then remaining columns).
+                // The index.columns[i].pos_in_table tells us which result column goes in position i.
+                let (record_start, record_count) = if dedupe_index.ephemeral
+                    && dedupe_index.columns.len() == plan.result_columns.len()
+                {
+                    // Reorder columns according to index definition
+                    // If the index has_rowid, we need an extra register for the rowid
+                    let extra_for_rowid = if dedupe_index.has_rowid { 1 } else { 0 };
+                    let reordered_start =
+                        program.alloc_registers(dedupe_index.columns.len() + extra_for_rowid);
+                    for (idx_pos, idx_col) in dedupe_index.columns.iter().enumerate() {
+                        let src_reg = result_columns_start_reg + idx_col.pos_in_table;
+                        let dst_reg = reordered_start + idx_pos;
+                        program.emit_insn(Insn::Copy {
+                            src_reg,
+                            dst_reg,
+                            extra_amount: 0,
+                        });
+                    }
+                    // For indexes with rowid (e.g., derived tables), generate a unique rowid
+                    // to ensure duplicate column values don't get dropped. For ephemeral indexes,
+                    // use a per-cursor sequence instead of NewRowid because NewRowid derives from
+                    // index order and can repeat when inserts are out of key order. SQLite does
+                    // the same for autoindex rowids (see where.c: translateColumnToCopy).
+                    if dedupe_index.has_rowid {
+                        let rowid_reg = reordered_start + dedupe_index.columns.len();
+                        if dedupe_index.ephemeral {
+                            program.emit_insn(Insn::Sequence {
+                                cursor_id: *index_cursor_id,
+                                target_reg: rowid_reg,
+                            });
+                        } else {
+                            program.emit_insn(Insn::NewRowid {
+                                cursor: *index_cursor_id,
+                                rowid_reg,
+                                prev_largest_reg: 0,
+                            });
+                        }
+                    }
+                    (
+                        reordered_start,
+                        dedupe_index.columns.len() + extra_for_rowid,
+                    )
+                } else {
+                    // Non-ephemeral indexes: use natural column order
+                    (result_columns_start_reg, plan.result_columns.len())
+                };
+
                 program.emit_insn(Insn::MakeRecord {
-                    start_reg: to_u16(result_columns_start_reg),
-                    count: to_u16(plan.result_columns.len()),
+                    start_reg: to_u16(record_start),
+                    count: to_u16(record_count),
                     dest_reg: to_u16(record_reg),
                     index_name: Some(dedupe_index.name.clone()),
                     affinity_str: None,
