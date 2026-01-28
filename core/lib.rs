@@ -642,7 +642,7 @@ impl Database {
                         path,
                         wal_path,
                         &io,
-                        db_file.clone(),
+                        db_file,
                         encryption_opts.clone(),
                     )?;
 
