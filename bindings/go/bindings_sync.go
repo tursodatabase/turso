@@ -48,6 +48,8 @@ type TursoSyncDatabaseConfig struct {
 	// optional remote url (libsql://..., https://... or http://...)
 	// this URL will be saved in the database metadata file in order to be able to reuse it if later client will be constructed without explicit remote url
 	RemoteUrl string
+	// Namespace for remote host
+	Namespace string
 	// Arbitrary client name used as a prefix for unique client id
 	ClientName string
 	// Long poll timeout for pull method in milliseconds
