@@ -1,4 +1,4 @@
-package com.turso.reactnative;
+package com.turso.sync.reactnative;
 
 import java.io.File;
 import java.lang.Exception;

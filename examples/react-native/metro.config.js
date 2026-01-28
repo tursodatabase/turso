@@ -7,7 +7,7 @@ const config = {
   watchFolders: [bindingsPath],
   resolver: {
     extraNodeModules: {
-      '@tursodatabase/react-native': bindingsPath,
+      '@tursodatabase/sync-react-native': bindingsPath,
     },
   },
 };

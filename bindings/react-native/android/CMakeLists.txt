@@ -24,6 +24,9 @@ set(TURSO_SOURCES
 # Create shared library
 add_library(${PROJECT_NAME} SHARED ${TURSO_SOURCES})
 
+# 16KB page alignment for Android 15+ compatibility
+target_link_options(${PROJECT_NAME} PRIVATE "-Wl,-z,max-page-size=16384")
+
 # Include directories
 target_include_directories(${PROJECT_NAME} PRIVATE
     ../cpp
