@@ -1312,10 +1312,24 @@ impl ProgramBuilder {
 
         use crate::translate::expr::sanitize_string;
 
+        // Compute physical column index by skipping VIRTUAL generated columns
+        // (since they are not stored in the record)
+        let physical_column = match cursor_type {
+            CursorType::BTreeTable(btree) => btree.logical_to_physical_column(column),
+            CursorType::MaterializedView(btree, _) => btree.logical_to_physical_column(column),
+            _ => column, // For indexes and other cursor types, use logical column
+        };
+
         let default = 'value: {
             let default = match cursor_type {
                 CursorType::BTreeTable(btree) => &btree.columns[column].default,
-                CursorType::BTreeIndex(index) => &index.columns[column].default,
+                CursorType::BTreeIndex(index) => {
+                    // Find the IndexColumn with matching pos_in_table, or break with None
+                    match index.columns.iter().find(|ic| ic.pos_in_table == column) {
+                        Some(ic) => &ic.default,
+                        None => break 'value None,
+                    }
+                }
                 CursorType::MaterializedView(btree, _) => &btree.columns[column].default,
                 _ => break 'value None,
             };
@@ -1351,7 +1365,7 @@ impl ProgramBuilder {
 
         self.emit_insn(Insn::Column {
             cursor_id,
-            column,
+            column: physical_column,
             dest: out,
             default,
         });

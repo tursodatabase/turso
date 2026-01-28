@@ -47,7 +47,7 @@ fn validate(body: &ast::CreateTableBody, connection: &Connection) -> Result<()> 
                         bail_parse_error!("CHECK constraints are not supported yet");
                     }
                     ast::ColumnConstraint::Generated { .. } => {
-                        bail_parse_error!("GENERATED columns are not supported yet");
+                        // Generated columns are supported - validation is done in core/schema.rs
                     }
                     ast::ColumnConstraint::NotNull {
                         conflict_clause, ..

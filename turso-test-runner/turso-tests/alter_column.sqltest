@@ -331,13 +331,14 @@ expect {
     CREATE TABLE c3 (x INTEGER PRIMARY KEY, fa INTEGER, fb INTEGER, FOREIGN KEY (fa, fb) REFERENCES p3_new (a, b))
 }
 
-# Adding a generated column via ALTER TABLE should error
+# Adding a STORED generated column via ALTER TABLE should error
+# (VIRTUAL is allowed since it doesn't require backfilling existing rows)
 test alter-table-add-generated-column-error {
     CREATE TABLE t(a);
-    ALTER TABLE t ADD COLUMN b AS (NULL);
+    ALTER TABLE t ADD COLUMN b AS (NULL) STORED;
 }
 expect error {
-    Parse error: Alter table does not support adding generated columns
+    cannot add a STORED column
 }
 
 test alter-column-only-to-generated-error {

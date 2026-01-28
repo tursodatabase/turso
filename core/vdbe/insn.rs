@@ -51,7 +51,17 @@ pub struct IntegrityCheckIndex {
     /// Whether this is a UNIQUE index
     pub unique: bool,
     /// Column positions in the table (for building index keys from table rows)
+    /// These are LOGICAL positions in the table schema.
     pub column_positions: Vec<usize>,
+    /// Physical positions in the stored record for each indexed column.
+    /// None means the column is VIRTUAL (not stored in the record).
+    /// This is needed because VIRTUAL columns are not stored, so logical
+    /// positions don't map directly to record positions.
+    pub physical_positions: Vec<Option<usize>>,
+    /// True if any indexed column is a VIRTUAL generated column.
+    /// When true, we skip row-index validation because we can't compute
+    /// the expected index key without evaluating the generated expression.
+    pub has_virtual_columns: bool,
     /// Starting register containing default values for indexed columns.
     /// Used for columns added via ALTER TABLE ADD COLUMN with DEFAULT - old rows
     /// don't physically have these columns, so we use these pre-evaluated defaults.

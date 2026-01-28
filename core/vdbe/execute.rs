@@ -20,9 +20,9 @@ use crate::types::{
     ImmutableRecord, IndexInfo, SeekResult, Text,
 };
 use crate::util::{
-    normalize_ident, rewrite_column_references_if_needed, rewrite_fk_parent_cols_if_self_ref,
-    rewrite_fk_parent_table_if_needed, rewrite_inline_col_fk_target_if_needed,
-    trim_ascii_whitespace,
+    normalize_ident, rename_column_refs_in_expr, rewrite_column_references_if_needed,
+    rewrite_fk_parent_cols_if_self_ref, rewrite_fk_parent_table_if_needed,
+    rewrite_inline_col_fk_target_if_needed, trim_ascii_whitespace,
 };
 use crate::vdbe::affinity::{apply_numeric_affinity, try_for_float, Affinity, ParsedNumber};
 use crate::vdbe::hash_table::{HashEntry, HashTable, HashTableConfig, DEFAULT_MEM_BUDGET};
@@ -741,7 +741,21 @@ pub fn op_comparison(
         return Ok(InsnFunctionStepResult::Step);
     }
 
-    let (new_lhs, new_rhs) = (affinity.convert(lhs_value), affinity.convert(rhs_value));
+    // Skip affinity conversion for Integer-Float pairs.
+    // The comparison logic (via ValueRef::partial_cmp -> sqlite_int_float_compare)
+    // correctly handles Integer-Float comparisons using a truncate-then-compare approach.
+    // Applying REAL affinity conversion here would convert Integer to Float first,
+    // causing precision loss (e.g., 3036093696168066000 -> 3036093696168066048.0).
+    let is_int_float_pair = matches!(
+        (lhs_value, rhs_value),
+        (Value::Integer(_), Value::Float(_)) | (Value::Float(_), Value::Integer(_))
+    );
+
+    let (new_lhs, new_rhs) = if is_int_float_pair {
+        (None, None)
+    } else {
+        (affinity.convert(lhs_value), affinity.convert(rhs_value))
+    };
 
     let should_jump = op.compare(
         new_lhs
@@ -3262,7 +3276,9 @@ pub fn seek_internal(
                                     .as_btree_mut();
                                 let record = match &registers[*record_reg] {
                                     Register::Record(ref record) => record,
-                                    _ => unreachable!("op_seek: record_reg should be a Record register when OpSeekKey::IndexKeyFromRegister is used"),
+                                    _ => unreachable!(
+                                        "op_seek: record_reg should be a Record register when OpSeekKey::IndexKeyFromRegister is used"
+                                    ),
                                 };
                                 (cursor, record)
                             };
@@ -5290,7 +5306,7 @@ pub fn op_function(
                             None => {
                                 return Err(LimboError::InvalidArgument(format!(
                                     "table_columns_json_array: table {table} doesn't exists"
-                                )))
+                                )));
                             }
                         }
                     };
@@ -5934,8 +5950,7 @@ pub fn op_function(
                                     let column = columns
                                         .iter_mut()
                                         .find(|column| {
-                                            column.col_name.as_str()
-                                                == original_rename_from.as_str()
+                                            normalize_ident(column.col_name.as_str()) == rename_from
                                         })
                                         .expect("column being renamed should be present");
 
@@ -6010,15 +6025,16 @@ pub fn op_function(
                                             }
                                             _ => {}
                                         }
+                                    }
 
-                                        for col in &mut columns {
-                                            rewrite_column_references_if_needed(
-                                                col,
-                                                &normalized_tbl_name,
-                                                &rename_from,
-                                                column_def.col_name.as_str(),
-                                            );
-                                        }
+                                    // Update column-level constraints (Generated, ForeignKey)
+                                    for col in &mut columns {
+                                        rewrite_column_references_if_needed(
+                                            col,
+                                            &normalized_tbl_name,
+                                            &rename_from,
+                                            column_def.col_name.as_str(),
+                                        );
                                     }
                                 } else {
                                     // This is a different table, check if it has FKs referencing the renamed column
@@ -6402,7 +6418,10 @@ pub fn op_insert(
                     continue;
                 }
 
-                turso_assert!(!flag.has(InsertFlags::REQUIRE_SEEK), "to capture old record accurately, we must be located at the correct position in the table");
+                turso_assert!(
+                    !flag.has(InsertFlags::REQUIRE_SEEK),
+                    "to capture old record accurately, we must be located at the correct position in the table"
+                );
 
                 // Get the key we're going to insert
                 let insert_key = match &state.registers[*key_reg].get_value() {
@@ -8128,7 +8147,7 @@ pub fn op_populate_materialized_views(
                 _ => {
                     return Err(LimboError::InternalError(
                         "Expected BTree cursor for materialized view".into(),
-                    ))
+                    ));
                 }
             };
 
@@ -8162,7 +8181,7 @@ pub fn op_populate_materialized_views(
                 _ => {
                     return Err(LimboError::InternalError(
                         "Expected BTree cursor for materialized view population".into(),
-                    ))
+                    ));
                 }
             };
 
@@ -8243,13 +8262,21 @@ pub fn op_set_cookie(
                 Cookie::SchemaVersion => {
                     // we update transaction state to indicate that the schema has changed
                     match program.connection.get_tx_state() {
-                    TransactionState::Write { .. } => {
-                        program.connection.set_tx_state(TransactionState::Write { schema_did_change: true });
-                    },
-                    TransactionState::Read => unreachable!("invalid transaction state for SetCookie: TransactionState::Read, should be write"),
-                    TransactionState::None => unreachable!("invalid transaction state for SetCookie: TransactionState::None, should be write"),
-                    TransactionState::PendingUpgrade { .. } => unreachable!("invalid transaction state for SetCookie: TransactionState::PendingUpgrade, should be write"),
-                }
+                        TransactionState::Write { .. } => {
+                            program.connection.set_tx_state(TransactionState::Write {
+                                schema_did_change: true,
+                            });
+                        }
+                        TransactionState::Read => unreachable!(
+                            "invalid transaction state for SetCookie: TransactionState::Read, should be write"
+                        ),
+                        TransactionState::None => unreachable!(
+                            "invalid transaction state for SetCookie: TransactionState::None, should be write"
+                        ),
+                        TransactionState::PendingUpgrade { .. } => unreachable!(
+                            "invalid transaction state for SetCookie: TransactionState::PendingUpgrade, should be write"
+                        ),
+                    }
                     program
                         .connection
                         .with_schema_mut(|schema| schema.schema_version = *value as u32);
@@ -9180,7 +9207,10 @@ pub fn op_integrity_check(
                         auto_vacuum_mode,
                         crate::storage::pager::AutoVacuumMode::None
                     ) {
-                        tracing::debug!("Integrity check: auto-vacuum mode detected ({:?}). Scanning for pointer-map pages.", auto_vacuum_mode);
+                        tracing::debug!(
+                            "Integrity check: auto-vacuum mode detected ({:?}). Scanning for pointer-map pages.",
+                            auto_vacuum_mode
+                        );
                         let page_size = pager.get_page_size_unchecked().get() as usize;
 
                         for page_number in 2..=integrity_check_state.db_size {
@@ -9188,7 +9218,10 @@ pub fn op_integrity_check(
                                 page_number as u32,
                                 page_size,
                             ) {
-                                tracing::debug!("Integrity check: Found and marking pointer-map page as visited: page_id={}", page_number);
+                                tracing::debug!(
+                                    "Integrity check: Found and marking pointer-map page as visited: page_id={}",
+                                    page_number
+                                );
 
                                 integrity_check_state.start(
                                     page_number as i64,
@@ -9805,8 +9838,19 @@ pub fn op_integrity_check(
                             continue;
                         }
 
-                        // Open cursor for this index if not already open
                         let index = &table.indexes[*current_index_idx];
+
+                        // Skip validation for indexes containing VIRTUAL generated columns.
+                        // We can't compute the expected index key without evaluating the
+                        // generated expression, which requires a runtime expression evaluator.
+                        // TODO: Refactor integrity_check to use proper VDBE bytecode (like SQLite)
+                        // which would allow computing VIRTUAL column values via OP_Column.
+                        if index.has_virtual_columns {
+                            *current_index_idx += 1;
+                            continue;
+                        }
+
+                        // Open cursor for this index if not already open
                         if index_cursor.is_none() {
                             let mut cursor = BTreeCursor::new(pager.clone(), index.root_page, 0);
                             cursor.index_info = Some(index.index_info.clone());
@@ -9817,21 +9861,28 @@ pub fn op_integrity_check(
                         // Index key = (indexed_col_values..., rowid)
                         let mut key_values: Vec<Value> =
                             Vec::with_capacity(index.column_positions.len() + 1);
-                        for (col_idx, &pos) in index.column_positions.iter().enumerate() {
+                        for (col_idx, &logical_pos) in index.column_positions.iter().enumerate() {
                             // For INTEGER PRIMARY KEY columns, the value in the record is NULL
                             // but the actual value is the rowid
-                            let value = if table.rowid_alias_column_pos == Some(pos) {
+                            let value = if table.rowid_alias_column_pos == Some(logical_pos) {
                                 Value::Integer(*rowid)
-                            } else if pos >= row_values.len() {
-                                // Columns added via ALTER TABLE ADD COLUMN: existing rows
-                                // don't have values for these columns. Use the column's
-                                // DEFAULT value from the pre-evaluated register. This is
-                                // NULL if no DEFAULT value is defined for the column.
-                                state.registers[index.default_values_start_reg + col_idx]
-                                    .get_value()
-                                    .clone()
+                            } else if let Some(physical_pos) = index.physical_positions[col_idx] {
+                                // Use physical position to get value from stored record
+                                if physical_pos >= row_values.len() {
+                                    // Columns added via ALTER TABLE ADD COLUMN: existing rows
+                                    // don't have values for these columns. Use the column's
+                                    // DEFAULT value from the pre-evaluated register. This is
+                                    // NULL if no DEFAULT value is defined for the column.
+                                    state.registers[index.default_values_start_reg + col_idx]
+                                        .get_value()
+                                        .clone()
+                                } else {
+                                    row_values[physical_pos].clone()
+                                }
                             } else {
-                                row_values[pos].clone()
+                                // VIRTUAL column - shouldn't reach here since we skip
+                                // indexes with virtual columns above
+                                unreachable!("VIRTUAL columns should be skipped")
                             };
                             key_values.push(value);
                         }
@@ -10268,6 +10319,10 @@ pub fn op_alter_column(
                     ) {
                         ic.name = new_name.clone();
                     }
+                    // Also update references in the expression (for VIRTUAL column indexes)
+                    if let Some(ref mut expr) = ic.expr {
+                        rename_column_refs_in_expr(expr, &old_column_name, &new_name);
+                    }
                 }
             }
         }
@@ -10306,6 +10361,13 @@ pub fn op_alter_column(
                         *pc = new_name.clone();
                     }
                 }
+            }
+        }
+
+        // Update generated column expressions that reference the renamed column.
+        for other_col in &mut btree.columns {
+            if let Some(ref mut gen_expr) = other_col.generated {
+                rename_column_refs_in_expr(gen_expr, &old_column_name, &new_name);
             }
         }
 
@@ -10993,18 +11055,23 @@ fn apply_affinity_char(target: &mut Register, affinity: Affinity) -> bool {
 }
 
 fn try_float_to_integer_affinity(value: &mut Value, fl: f64) -> bool {
-    // Check if the float can be exactly represented as an integer
-    if let Ok(int_val) = cast_real_to_integer(fl) {
-        // Additional check: ensure round-trip conversion is exact
-        // and value is within safe bounds (similar to SQLite's checks)
-        if (int_val as f64) == fl && int_val > i64::MIN + 1 && int_val < i64::MAX - 1 {
-            *value = Value::Integer(int_val);
-            return true;
-        }
+    // Check if the float has no fractional part
+    if !fl.is_finite() || fl.trunc() != fl {
+        *value = Value::Float(fl);
+        return false;
     }
 
-    // If we can't convert to exact integer, keep as float for Numeric affinity
-    // but return false to indicate the conversion wasn't "complete"
+    // Convert float to i64 with saturation at limits (like SQLite's doubleToInt64)
+    let int_val = super::affinity::real_to_i64(fl);
+
+    // Check if round-trip conversion is exact
+    // This is the key check from SQLite's sqlite3VdbeIntegerAffinity
+    if (int_val as f64) == fl && int_val != i64::MIN {
+        *value = Value::Integer(int_val);
+        return true;
+    }
+
+    // If round-trip isn't exact, keep as float
     *value = Value::Float(fl);
     false
 }
@@ -11498,7 +11565,9 @@ mod tests {
                     );
                 }
                 other => {
-                    panic!("String '{input}' should be converted to integer {expected_int}, got {other:?}");
+                    panic!(
+                        "String '{input}' should be converted to integer {expected_int}, got {other:?}"
+                    );
                 }
             }
         }
