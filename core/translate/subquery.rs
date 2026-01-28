@@ -831,6 +831,7 @@ pub fn emit_from_clause_subquery(
                 meta_window: None,
                 materialized_build_inputs: HashMap::default(),
                 hash_table_contexts: HashMap::default(),
+                captured_columns_in_agg_exprs: Vec::new(),
             };
             emit_query(program, select_plan, &mut metadata)?
         }
