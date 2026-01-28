@@ -404,3 +404,76 @@ test full-outer-join {
 }
 expect error {
 }
+
+# Regression test for LEFT JOIN + materialized subquery bug
+# After NullRow, Next should not continue iterating the ephemeral index
+# The fix is in op_next: check null_flag before advancing cursor
+test left-join-materialized-subquery-nullrow-bug {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, a INT, b INT, c INT, d INT);
+    CREATE TABLE t2(id INTEGER PRIMARY KEY, a INT, b INT, c INT, d INT);
+    CREATE TABLE t3(id INTEGER PRIMARY KEY, a INT, b INT, c INT, d INT);
+    CREATE TABLE t4(id INTEGER PRIMARY KEY, a INT, b INT, c INT, d INT);
+    INSERT INTO t1(id,a,b,c,d) VALUES (32, 2, 8, NULL, 11);
+    INSERT INTO t2(id,a,b,c,d) VALUES (10089, 2, 8, NULL, 7);
+    INSERT INTO t3(id,a,b,c,d) VALUES (20016, 2, 7, NULL, 20);
+    INSERT INTO t4(id,a,b,c,d) VALUES (30001, -3, -5, 0, 3);
+    INSERT INTO t4(id,a,b,c,d) VALUES (30002, -10, 4, NULL, 13);
+    INSERT INTO t4(id,a,b,c,d) VALUES (30003, -3, NULL, 4, 20);
+    INSERT INTO t4(id,a,b,c,d) VALUES (30004, 16, 13, 14, 3);
+    INSERT INTO t4(id,a,b,c,d) VALUES (30005, 13, 20, NULL, 18);
+    INSERT INTO t4(id,a,b,c,d) VALUES (30006, -9, 4, 7, 14);
+    INSERT INTO t4(id,a,b,c,d) VALUES (30007, 20, NULL, -8, NULL);
+    INSERT INTO t4(id,a,b,c,d) VALUES (30008, -8, -8, -3, -4);
+    INSERT INTO t4(id,a,b,c,d) VALUES (30009, 14, NULL, 15, 16);
+    INSERT INTO t4(id,a,b,c,d) VALUES (30010, 1, 0, 18, 3);
+    INSERT INTO t4(id,a,b,c,d) VALUES (30011, -7, NULL, 17, -5);
+    INSERT INTO t4(id,a,b,c,d) VALUES (30012, NULL, 0, 18, -7);
+    INSERT INTO t4(id,a,b,c,d) VALUES (30013, 15, NULL, 11, NULL);
+    INSERT INTO t4(id,a,b,c,d) VALUES (30014, 16, 5, 8, -4);
+    INSERT INTO t4(id,a,b,c,d) VALUES (30015, -6, -1, -8, NULL);
+    INSERT INTO t4(id,a,b,c,d) VALUES (30016, 13, NULL, 11, -5);
+    INSERT INTO t4(id,a,b,c,d) VALUES (30017, 18, -8, NULL, -9);
+    INSERT INTO t4(id,a,b,c,d) VALUES (30018, -4, 16, 9, 6);
+    INSERT INTO t4(id,a,b,c,d) VALUES (30019, 16, 19, 8, NULL);
+    INSERT INTO t4(id,a,b,c,d) VALUES (30020, -3, NULL, NULL, 7);
+    INSERT INTO t4(id,a,b,c,d) VALUES (30021, NULL, NULL, 6, NULL);
+    INSERT INTO t4(id,a,b,c,d) VALUES (30022, 20, -2, 16, 11);
+    INSERT INTO t4(id,a,b,c,d) VALUES (30023, NULL, NULL, 18, NULL);
+    INSERT INTO t4(id,a,b,c,d) VALUES (30024, -3, -9, 14, -3);
+    INSERT INTO t4(id,a,b,c,d) VALUES (30025, -9, -5, 19, -8);
+    INSERT INTO t4(id,a,b,c,d) VALUES (30026, -2, NULL, 3, -10);
+    INSERT INTO t4(id,a,b,c,d) VALUES (30027, NULL, 16, 14, 14);
+    INSERT INTO t4(id,a,b,c,d) VALUES (30028, 7, -4, -7, 15);
+    INSERT INTO t4(id,a,b,c,d) VALUES (30029, 14, -8, 17, -3);
+    INSERT INTO t4(id,a,b,c,d) VALUES (30030, -9, -7, 8, 6);
+    INSERT INTO t4(id,a,b,c,d) VALUES (30031, -4, -7, 17, -2);
+    INSERT INTO t4(id,a,b,c,d) VALUES (30032, NULL, -4, -4, NULL);
+    INSERT INTO t4(id,a,b,c,d) VALUES (30033, NULL, 7, NULL, NULL);
+    INSERT INTO t4(id,a,b,c,d) VALUES (30034, 12, NULL, NULL, -1);
+    INSERT INTO t4(id,a,b,c,d) VALUES (30035, NULL, 0, -9, 16);
+    INSERT INTO t4(id,a,b,c,d) VALUES (30036, 3, -3, 10, 6);
+    INSERT INTO t4(id,a,b,c,d) VALUES (30037, 12, 20, 13, -9);
+    INSERT INTO t4(id,a,b,c,d) VALUES (30038, 3, 3, 13, 14);
+    INSERT INTO t4(id,a,b,c,d) VALUES (30039, 4, NULL, 7, NULL);
+    INSERT INTO t4(id,a,b,c,d) VALUES (30040, NULL, 17, NULL, -2);
+    INSERT INTO t4(id,a,b,c,d) VALUES (30041, 9, -3, 19, 13);
+    INSERT INTO t4(id,a,b,c,d) VALUES (30042, 0, -7, 5, 10);
+    INSERT INTO t4(id,a,b,c,d) VALUES (30043, 11, 13, NULL, -9);
+    INSERT INTO t4(id,a,b,c,d) VALUES (30044, -1, NULL, -3, 19);
+    INSERT INTO t4(id,a,b,c,d) VALUES (30045, -1, -5, 20, NULL);
+    INSERT INTO t4(id,a,b,c,d) VALUES (30046, 0, -10, NULL, 20);
+    INSERT INTO t4(id,a,b,c,d) VALUES (30047, 2, -3, 6, 8);
+    INSERT INTO t4(id,a,b,c,d) VALUES (30048, 19, -2, 5, 17);
+    INSERT INTO t4(id,a,b,c,d) VALUES (30049, 9, -5, NULL, 8);
+    INSERT INTO t4(id,a,b,c,d) VALUES (30050, 12, NULL, 16, 12);
+    INSERT INTO t4(id,a,b,c,d) VALUES (30051, -1, 15, 15, -7);
+    INSERT INTO t4(id,a,b,c,d) VALUES (30052, 7, 18, -2, -10);
+    INSERT INTO t4(id,a,b,c,d) VALUES (30053, NULL, 19, 7, 13);
+    INSERT INTO t4(id,a,b,c,d) VALUES (30054, -2, 0, NULL, 14);
+    INSERT INTO t4(id,a,b,c,d) VALUES (30055, -8, NULL, NULL, -8);
+    SELECT t1.id, t2.id, t3.id, sub_t4.a FROM t1 LEFT JOIN t2 ON t1.a = t2.a AND t1.b = t2.b JOIN t3 ON t2.a = t3.a LEFT JOIN (SELECT * FROM t4 WHERE a IS NOT NULL) AS sub_t4 ON t3.a = sub_t4.a AND t3.c = sub_t4.c WHERE t1.b IS NOT NULL ORDER BY t1.id, t2.id, t3.id, sub_t4.a;
+}
+expect {
+    32|10089|20016|
+}
+
