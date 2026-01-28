@@ -527,7 +527,11 @@ pub fn begin_read_page(
     allow_empty_read: bool,
     io_ctx: &IOContext,
 ) -> Result<Completion> {
-    tracing::trace!("begin_read_btree_page(page_idx = {})", page_idx);
+    tracing::trace!(
+        "begin_read_btree_page(page_idx = {}): {:?}",
+        page_idx,
+        std::backtrace::Backtrace::capture()
+    );
     let buf = buffer_pool.get_page();
     #[allow(clippy::arc_with_non_send_sync)]
     let buf = Arc::new(buf);
