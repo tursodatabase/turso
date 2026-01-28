@@ -881,7 +881,7 @@ impl BTreeCursor {
                     .stack
                     .get_page_contents_at_level(old_top_idx)
                     .unwrap()
-                    .cell_interior_read_left_child_page(cell_idx);
+                    .cell_interior_read_left_child_page(cell_idx)?;
 
                 if page_type == PageType::IndexInterior {
                     // In backwards iteration, if we haven't just moved to this interior node from the
@@ -1088,7 +1088,7 @@ impl BTreeCursor {
                     return Ok(IOResult::Done(true));
                 }
 
-                let left_child_page = contents.cell_interior_read_left_child_page(cell_idx);
+                let left_child_page = contents.cell_interior_read_left_child_page(cell_idx)?;
                 let (mem_page, c) = self.read_page(left_child_page as i64)?;
                 self.stack.push(mem_page);
                 if let Some(c) = c {
@@ -1282,7 +1282,7 @@ impl BTreeCursor {
                     .stack
                     .get_page_contents_at_level(old_top_idx)
                     .unwrap()
-                    .cell_interior_read_left_child_page(nearest_matching_cell);
+                    .cell_interior_read_left_child_page(nearest_matching_cell)?;
                 self.stack.set_cell_index(nearest_matching_cell as i32);
                 let (mem_page, c) = self.read_page(left_child_page as i64)?;
                 self.stack.push(mem_page);
@@ -7850,7 +7850,7 @@ fn fill_cell_payload(
                     // if a write happened on an index interior page, it is always an overwrite.
                     // we must copy the left child pointer of the replaced cell to the new cell.
                     let left_child_page =
-                        page_contents.cell_interior_read_left_child_page(cell_idx);
+                        page_contents.cell_interior_read_left_child_page(cell_idx)?;
                     cell_payload.extend_from_slice(&left_child_page.to_be_bytes());
                 }
                 if matches!(page_type, PageType::TableLeaf) {

@@ -1487,7 +1487,7 @@ pub fn op_column(
                     CursorType::BTreeTable(_)
                     | CursorType::BTreeIndex(_)
                     | CursorType::MaterializedView(_, _) => {
-                        'ifnull: {
+                        {
                             let cursor_ref = must_be_btree_cursor!(
                                 active_cursor_id,
                                 program.cursor_ref,
@@ -1504,7 +1504,12 @@ pub fn op_column(
 
                             let record_result = return_if_io!(cursor.record());
                             let Some(record) = record_result else {
-                                break 'ifnull;
+                                // Cursor is not positioned on a valid row (e.g., empty table).
+                                // Return NULL, not the column's default value.
+                                // DEFAULT handling below is for when record exists
+                                // but has fewer columns than expected.
+                                state.registers[*dest] = Register::Value(Value::Null);
+                                break 'outer;
                             };
 
                             let mut payload_iterator = record.iter()?;

@@ -12,7 +12,10 @@ use crate::{
 
 use super::{
     emitter::{Resolver, TranslateCtx},
-    expr::{translate_condition_expr, translate_expr, ConditionMetadata},
+    expr::{
+        translate_condition_expr, translate_expr, translate_expr_no_constant_opt,
+        ConditionMetadata, NoConstantOptReason,
+    },
     plan::{Aggregate, Distinctness, SelectPlan, TableReferences},
     result_row::emit_select_result,
 };
@@ -82,6 +85,37 @@ pub fn emit_ungrouped_aggregation<'a>(
             target_pc: end_label,
             decrement_by: 0,
         });
+    }
+
+    // If the loop never ran (once-flag is still 0), we need to evaluate non-aggregate columns now.
+    // This ensures literals return their values and column references return NULL (since cursor
+    // is not on a valid row). The once-flag mechanism normally evaluates non-agg columns on first
+    // iteration, but if there were no iterations, we must do it here.
+    if let Some(once_flag) = t_ctx.reg_nonagg_emit_once_flag {
+        let skip_nonagg_eval = program.allocate_label();
+        // If once-flag is non-zero (loop ran at least once), skip evaluation
+        program.emit_insn(Insn::If {
+            reg: once_flag,
+            target_pc: skip_nonagg_eval,
+            jump_if_null: false,
+        });
+        // Evaluate non-aggregate columns now (with cursor in invalid state, columns return NULL)
+        // Must use no_constant_opt to prevent constant hoisting which would place the label
+        // after the hoisted constants, causing infinite loops in compound selects.
+        let col_start = t_ctx.reg_result_cols_start.unwrap();
+        for (i, rc) in plan.result_columns.iter().enumerate() {
+            if !rc.contains_aggregates {
+                translate_expr_no_constant_opt(
+                    program,
+                    Some(&plan.table_references),
+                    &rc.expr,
+                    col_start + i,
+                    &t_ctx.resolver,
+                    NoConstantOptReason::RegisterReuse,
+                )?;
+            }
+        }
+        program.preassign_label_to_next_insn(skip_nonagg_eval);
     }
 
     // Emit the result row (if we didn't skip it due to HAVING or OFFSET)
