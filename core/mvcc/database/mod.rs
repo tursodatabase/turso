@@ -927,9 +927,10 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
             }
 
             CommitState::SyncLogicalLog { end_ts } => {
-                // Skip fsync when synchronous mode is off
-                if self.sync_mode == SyncMode::Off {
-                    tracing::debug!("Skipping fsync of logical log (synchronous=off)");
+                // Skip fsync when synchronous mode is not FULL.
+                // NORMAL mode skips fsync on commit (but still fsyncs on checkpoint).
+                if self.sync_mode != SyncMode::Full {
+                    tracing::debug!("Skipping fsync of logical log (synchronous!=full)");
                     self.state = CommitState::EndCommitLogicalLog { end_ts: *end_ts };
                     return Ok(TransitionResult::Continue);
                 }

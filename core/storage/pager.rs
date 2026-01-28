@@ -3303,14 +3303,15 @@ impl Pager {
                         .into());
                     }
                     commit_info.completions.clear();
-                    // Writes done, submit fsync if needed
-                    if sync_mode == SyncMode::Off {
-                        commit_info.state = CommitState::WalCommitDone;
-                    } else {
+                    // Writes done, submit fsync if needed.
+                    // NORMAL mode skips fsync on WAL commit (but still fsyncs on checkpoint and wal restart).
+                    if sync_mode == SyncMode::Full {
                         let sync_c = wal.sync(self.get_sync_type())?;
                         // Reuse the existing Vec instead of allocating a new one
                         commit_info.completions.push(sync_c);
                         commit_info.state = CommitState::WaitSync;
+                    } else {
+                        commit_info.state = CommitState::WalCommitDone;
                     }
                 }
                 // To protect against partial writes, we MUST ensure that all write Completions
