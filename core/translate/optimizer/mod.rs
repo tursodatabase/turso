@@ -1162,6 +1162,7 @@ fn optimize_table_access(
             subqueries,
             schema,
             params,
+            auto_stats,
         )?;
     }
 
