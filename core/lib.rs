@@ -274,6 +274,8 @@ pub struct OpenDbAsyncState {
     conn: Option<Arc<Connection>>,
     encryption_key: Option<EncryptionKey>,
     make_from_btree_state: schema::MakeFromBtreeState,
+    /// Schema lock held during LoadingSchema phase to ensure atomicity across IO yields
+    schema_guard: Option<parking_lot::ArcMutexGuard<parking_lot::RawMutex, Arc<Schema>>>,
 }
 
 impl Default for OpenDbAsyncState {
@@ -291,6 +293,7 @@ impl OpenDbAsyncState {
             conn: None,
             encryption_key: None,
             make_from_btree_state: schema::MakeFromBtreeState::new(),
+            schema_guard: None,
         }
     }
 }
@@ -315,7 +318,7 @@ static DATABASE_MANAGER: LazyLock<parking_lot::Mutex<HashMap<String, Weak<Databa
 /// encryption key here.
 pub struct Database {
     mv_store: ArcSwapOption<MvStore>,
-    schema: Mutex<Arc<Schema>>,
+    schema: Arc<Mutex<Arc<Schema>>>,
     pub db_file: Arc<dyn DatabaseStorage>,
     pub path: String,
     wal_path: String,
@@ -439,7 +442,7 @@ impl Database {
             mv_store,
             path: path.into(),
             wal_path: wal_path.into(),
-            schema: Mutex::new(Arc::new(Schema::new())),
+            schema: Arc::new(Mutex::new(Arc::new(Schema::new()))),
             _shared_page_cache: shared_page_cache.clone(),
             shared_wal,
             db_file,
@@ -623,7 +626,7 @@ impl Database {
         encryption_opts: Option<EncryptionOpts>,
     ) -> Result<IOResult<Arc<Database>>> {
         loop {
-            tracing::trace!(
+            tracing::info!(
                 "open_with_flags_bypass_registry_async: state.phase={:?}",
                 state.phase
             );
@@ -642,7 +645,7 @@ impl Database {
                         path,
                         wal_path,
                         &io,
-                        db_file,
+                        db_file.clone(),
                         encryption_opts.clone(),
                     )?;
 
@@ -662,10 +665,17 @@ impl Database {
                     let db = Arc::new(db);
                     let conn = db._connect(false, Some(pager.clone()), encryption_key.clone())?;
 
+                    // Acquire schema lock and hold it through ReadingHeader and LoadingSchema phases
+                    // to ensure schema_version and make_from_btree are atomic
+                    let guard = parking_lot::Mutex::lock_arc(&db.schema);
+
+                    tracing::info!("indexes: {}", guard.indexes.len());
                     state.db = Some(db);
                     state.pager = Some(pager);
                     state.conn = Some(conn);
                     state.encryption_key = encryption_key;
+                    state.schema_guard = Some(guard);
+
                     state.phase = OpenDbAsyncPhase::ReadingHeader;
                 }
 
@@ -674,17 +684,15 @@ impl Database {
                         .pager
                         .as_ref()
                         .expect("pager must be initialized in Init phase");
-                    let header_schema_cookie =
-                        return_if_io!(pager.with_header(|header| header.schema_cookie.get()));
-
-                    let db = state
-                        .db
-                        .as_ref()
-                        .expect("db must be initialized in Init phase");
-                    db.with_schema_mut(|schema| {
-                        schema.schema_version = header_schema_cookie;
-                        Ok(())
-                    })?;
+                    let header_schema_cookie = return_if_io!(pager
+                        .with_header(|header| header.schema_cookie.get())
+                        .inspect_err(|_| state.schema_guard = None));
+                    let guard = state
+                        .schema_guard
+                        .as_mut()
+                        .expect("schema_guard must be acquired in Init phase");
+                    let schema = Arc::make_mut(&mut **guard);
+                    schema.schema_version = header_schema_cookie;
 
                     state.phase = OpenDbAsyncPhase::LoadingSchema;
                 }
@@ -705,27 +713,36 @@ impl Database {
                     let syms = conn.syms.read();
                     let enable_triggers = db.opts.enable_triggers;
 
-                    let result = db.with_schema_mut(|schema| {
-                        schema.make_from_btree(
-                            &mut state.make_from_btree_state,
-                            None,
-                            pager.clone(),
-                            &syms,
-                            enable_triggers,
-                        )
-                    });
+                    let guard = state
+                        .schema_guard
+                        .as_mut()
+                        .expect("schema_guard must be acquired in Init phase");
+                    let schema = Arc::make_mut(&mut **guard);
+
+                    let result = schema.make_from_btree(
+                        &mut state.make_from_btree_state,
+                        None,
+                        pager.clone(),
+                        &syms,
+                        enable_triggers,
+                    );
 
                     match result {
                         Ok(IOResult::IO(io)) => return Ok(IOResult::IO(io)),
-                        Ok(IOResult::Done(())) => {}
+                        Ok(IOResult::Done(())) => {
+                            // Release the schema lock
+                            state.schema_guard = None;
+                        }
                         Err(LimboError::ExtensionError(e)) => {
                             // this means that a vtab exists and we no longer have the module loaded.
                             // we print a warning to the user to load the module
                             state.make_from_btree_state.cleanup(pager);
+                            state.schema_guard = None;
                             eprintln!("Warning: {e}");
                         }
                         Err(e) => {
                             state.make_from_btree_state.cleanup(pager);
+                            state.schema_guard = None;
                             return Err(e);
                         }
                     }
