@@ -1532,6 +1532,39 @@ fn optimize_table_access(
                 table_references.joined_tables_mut()[table_idx].op =
                     Operation::Scan(Scan::Subquery);
             }
+            AccessMethodParams::MaterializedSubquery {
+                index,
+                constraint_refs,
+            } => {
+                // Mark constraints as consumed
+                // RangeConstraintRef.eq contains the position in the constraints array for equality constraints
+                let table_constraints = constraints_per_table
+                    .iter()
+                    .find(|c| c.table_id == table_references.joined_tables()[table_idx].internal_id)
+                    .expect("should have constraints for this table");
+
+                for cref in constraint_refs.iter() {
+                    if let Some(eq_pos) = cref.eq {
+                        let constraint = &table_constraints.constraints[eq_pos];
+                        where_clause[constraint.where_clause_pos.0].consumed = true;
+                    }
+                }
+
+                // Build seek definition from the constraints
+                let seek_def = build_seek_def_from_constraints(
+                    &table_constraints.constraints,
+                    constraint_refs,
+                    IterationDirection::Forwards,
+                    where_clause,
+                    Some(table_references),
+                )?;
+
+                table_references.joined_tables_mut()[table_idx].op =
+                    Operation::Search(Search::Seek {
+                        index: Some(index.clone()),
+                        seek_def,
+                    });
+            }
             AccessMethodParams::HashJoin {
                 build_table_idx,
                 probe_table_idx,
