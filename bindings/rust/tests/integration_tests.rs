@@ -462,10 +462,14 @@ async fn test_encryption() {
     let temp_dir = tempfile::tempdir().unwrap();
     let db_file = temp_dir.path().join("test-encrypted.db");
     let db_file = db_file.to_str().unwrap();
+    let hexkey = "b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327";
+    let wrong_key = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
     let encryption_opts = EncryptionOpts {
-        hexkey: "b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327".to_string(),
+        hexkey: hexkey.to_string(),
         cipher: "aegis256".to_string(),
     };
+
+    // 1. Create encrypted database and insert data
     {
         let builder = Builder::new_local(db_file)
             .experimental_encryption(true)
@@ -478,20 +482,35 @@ async fn test_encryption() {
         )
         .await
         .unwrap();
-        conn.execute("INSERT INTO test (value) VALUES ('Hello, World!')", ())
+        conn.execute("INSERT INTO test (value) VALUES ('secret_data')", ())
             .await
             .unwrap();
         let mut row_count = 0;
         let mut rows = conn.query("SELECT * FROM test", ()).await.unwrap();
         while let Some(row) = rows.next().await.unwrap() {
             assert_eq!(row.get::<i64>(0).unwrap(), 1);
-            assert_eq!(row.get::<String>(1).unwrap(), "Hello, World!");
+            assert_eq!(row.get::<String>(1).unwrap(), "secret_data");
             row_count += 1;
         }
         assert_eq!(row_count, 1);
+
+        // Checkpoint to ensure data is written to main db file
+        let mut rows = conn
+            .query("PRAGMA wal_checkpoint(TRUNCATE)", ())
+            .await
+            .unwrap();
+        while rows.next().await.unwrap().is_some() {}
     }
 
-    // lets verify we can open an existing encrypted db
+    // 2. Verify data is encrypted on disk
+    let content = std::fs::read(db_file).unwrap();
+    assert!(content.len() > 1024);
+    assert!(
+        !content.windows(11).any(|w| w == b"secret_data"),
+        "Plaintext should not appear in encrypted database file"
+    );
+
+    // 3. Reopen with correct key and verify data
     {
         let builder = Builder::new_local(db_file)
             .experimental_encryption(true)
@@ -503,10 +522,33 @@ async fn test_encryption() {
         let mut rows = conn.query("SELECT * FROM test", ()).await.unwrap();
         while let Some(row) = rows.next().await.unwrap() {
             assert_eq!(row.get::<i64>(0).unwrap(), 1);
-            assert_eq!(row.get::<String>(1).unwrap(), "Hello, World!");
+            assert_eq!(row.get::<String>(1).unwrap(), "secret_data");
             row_count += 1;
         }
         assert_eq!(row_count, 1);
+    }
+
+    // 4. Verify opening with wrong key fails
+    {
+        let wrong_opts = EncryptionOpts {
+            hexkey: wrong_key.to_string(),
+            cipher: "aegis256".to_string(),
+        };
+        let builder = Builder::new_local(db_file)
+            .experimental_encryption(true)
+            .with_encryption(wrong_opts);
+        let result = builder.build().await;
+        assert!(result.is_err(), "Opening with wrong key should fail");
+    }
+
+    // 5. Verify opening without encryption fails
+    {
+        let builder = Builder::new_local(db_file).experimental_encryption(true);
+        let result = builder.build().await;
+        assert!(
+            result.is_err(),
+            "Opening encrypted database without key should fail"
+        );
     }
 }
 

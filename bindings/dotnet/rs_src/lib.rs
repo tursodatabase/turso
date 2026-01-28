@@ -193,6 +193,21 @@ pub unsafe extern "C" fn db_open_with_encryption(
         }
     };
 
+    // Parse encryption key before opening database
+    let encryption_key = if let Some(ref opts) = encryption_opts {
+        match turso_core::EncryptionKey::from_hex_string(&opts.hexkey) {
+            Ok(key) => Some(key),
+            Err(err) => {
+                unsafe {
+                    *error_ptr = allocate_string(format!("Invalid encryption key: {err}").as_str())
+                }
+                return null();
+            }
+        }
+    } else {
+        None
+    };
+
     let db = match turso_core::Database::open_file_with_flags(
         io.clone(),
         path_str,
@@ -210,7 +225,8 @@ pub unsafe extern "C" fn db_open_with_encryption(
         }
     };
 
-    let connection = match db.connect() {
+    // Use connect_with_encryption to properly set up encryption context before reading pages
+    let connection = match db.connect_with_encryption(encryption_key) {
         Ok(conn) => conn,
         Err(err) => {
             unsafe {

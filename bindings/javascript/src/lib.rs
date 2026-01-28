@@ -226,6 +226,20 @@ fn connect_sync(db: &DatabaseInner) -> napi::Result<()> {
     } else {
         turso_core::DatabaseOpts::new()
     };
+    // Parse encryption key if encryption options are provided
+    let encryption_key = if let Some(opts) = &db.opts {
+        if let Some(encryption) = &opts.encryption {
+            Some(
+                turso_core::EncryptionKey::from_hex_string(&encryption.hexkey)
+                    .map_err(|e| to_generic_error("invalid encryption key", e))?,
+            )
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     let db_core = turso_core::Database::open_file_with_flags(
         io.clone(),
         &db.path,
@@ -235,8 +249,10 @@ fn connect_sync(db: &DatabaseInner) -> napi::Result<()> {
     )
     .map_err(|e| to_generic_error(&format!("failed to open database {}", db.path), e))?;
 
+    // Use connect_with_encryption to properly set up encryption context
+    // before the pager reads page 1. This is required for encrypted databases.
     let conn = db_core
-        .connect()
+        .connect_with_encryption(encryption_key)
         .map_err(|e| to_generic_error("failed to connect", e))?;
 
     if let Some(busy_timeout) = busy_timeout {
