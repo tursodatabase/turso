@@ -1,0 +1,63 @@
+---
+source: subqueries.sqltest
+expression: |-
+  SELECT id, name, department
+      FROM employees
+      WHERE id NOT IN (
+          SELECT DISTINCT manager_id
+          FROM employees
+          WHERE manager_id IS NOT NULL
+      );
+info:
+  statement_type: SELECT
+  tables:
+  - employees
+  setup_blocks:
+  - schema
+  database: ':memory:'
+---
+QUERY PLAN
+|--SCAN employees USING COVERING INDEX idx_employees_manager
+`--SCAN employees
+
+BYTECODE
+addr  opcode                  p1  p2  p3  p4              p5  comment
+   0  Init                     0  36   0                   0  Start at 36
+   1  Once                    12   0   0                   0  goto 12
+   2  OpenEphemeral            0   0   0                   0  cursor=0 is_table=false
+   3  OpenRead                 1  12   0  k(2,B)           0  index=idx_employees_manager, root=12, iDb=0
+   4  Rewind                   1  12   0                   0  Rewind index idx_employees_manager
+   5    Column                 1   0   3                   0  r[3]=idx_employees_manager.manager_id
+   6    Eq                     3   4  11  Binary           0  if r[3]==r[4] goto 11
+   7    Column                 1   0   1                   0  r[1]=idx_employees_manager.manager_id
+   8    HashDistinct  1073741824   1   1  jmp=11           0
+   9    MakeRecord             1   1   5                   0  r[5]=mkrec(r[1..1]); for ephemeral_index_where_sub_t2
+  10    IdxInsert              0   5   0                   8  key=r[5]
+  11  Next                     1   5   0                   0
+  12  OpenRead                 2   7   0  k(5,B,B,B,B,B)   0  table=employees, root=7, iDb=0
+  13  Rewind                   2  35   0                   0  Rewind table employees
+  14    Integer                0   9   0                   0  r[9]=0
+  15    RowId                  2  10   0                   0  r[10]=employees.rowid
+  16    Affinity              10   1   0                   0  r[10..11] = D
+  17    Found                  0  26  10                   0  if found goto 26
+  18    Rewind                 0  24   0                   0  Rewind  ephemeral_index_where_sub_t2
+  19      Column               0   0  11                   0  r[11]=ephemeral_index_where_sub_t2.manager_id
+  20      Ne                  10  11  22  Binary           0  if r[10]!=r[11] goto 22
+  21      Goto                 0  28   0                   0
+  22    Next                   0  19   0                   0
+  23    Goto                   0  24   0                   0
+  24    Integer                1   9   0                   0  r[9]=1
+  25    Goto                   0  29   0                   0
+  26    Integer                0   9   0                   0  r[9]=0
+  27    Goto                   0  29   0                   0
+  28    Null                   0   9   0                   0  r[9]=NULL
+  29    IfNot                  9  34   1                   0  if !r[9] goto 34
+  30    RowId                  2   6   0                   0  r[6]=employees.rowid
+  31    Column                 2   1   7                   0  r[7]=employees.name
+  32    Column                 2   3   8                   0  r[8]=employees.department
+  33    ResultRow              6   3   0                   0  output=r[6..8]
+  34  Next                     2  14   0                   0
+  35  Halt                     0   0   0                   0
+  36  Transaction              0   1  11                   0  iDb=0 tx_mode=Read
+  37  Null                     0   4   0                   0  r[4]=NULL
+  38  Goto                     0   1   0                   0

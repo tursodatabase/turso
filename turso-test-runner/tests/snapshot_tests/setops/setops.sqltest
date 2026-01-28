@@ -1,0 +1,206 @@
+# Set Operations Query Plan Snapshots
+# These snapshots capture EXPLAIN QUERY PLAN output for SQL set operations
+
+@database :memory:
+@skip-file-if mvcc "mvcc has slightly different cursor ids, so skipping it for now"
+
+setup schema {
+    CREATE TABLE current_employees (
+        id INTEGER PRIMARY KEY,
+        name TEXT NOT NULL,
+        department TEXT NOT NULL,
+        salary INTEGER NOT NULL
+    );
+
+    CREATE TABLE former_employees (
+        id INTEGER PRIMARY KEY,
+        name TEXT NOT NULL,
+        department TEXT NOT NULL,
+        last_salary INTEGER NOT NULL,
+        termination_date TEXT NOT NULL
+    );
+
+    CREATE TABLE contractors (
+        id INTEGER PRIMARY KEY,
+        name TEXT NOT NULL,
+        department TEXT NOT NULL,
+        hourly_rate INTEGER NOT NULL
+    );
+
+    CREATE INDEX idx_current_dept ON current_employees(department);
+    CREATE INDEX idx_former_dept ON former_employees(department);
+    CREATE INDEX idx_contractors_dept ON contractors(department);
+}
+
+# UNION ALL - append without dedup
+# Returns all rows from both queries, including duplicates
+@setup schema
+snapshot union-all-basic {
+    SELECT name, department FROM current_employees
+    UNION ALL
+    SELECT name, department FROM former_employees;
+}
+
+# UNION ALL with WHERE clause
+@setup schema
+snapshot union-all-filtered {
+    SELECT name, department FROM current_employees WHERE department = 'Engineering'
+    UNION ALL
+    SELECT name, department FROM former_employees WHERE department = 'Engineering';
+}
+
+# UNION - append with dedup (requires sort)
+# Returns distinct rows from both queries
+@setup schema
+snapshot union-distinct {
+    SELECT name, department FROM current_employees
+    UNION
+    SELECT name, department FROM former_employees;
+}
+
+# UNION with explicit DISTINCT keyword
+@setup schema
+snapshot union-explicit-distinct {
+    SELECT DISTINCT department FROM current_employees
+    UNION
+    SELECT DISTINCT department FROM former_employees;
+}
+
+# INTERSECT - set intersection
+# Returns only rows that appear in both queries
+@setup schema
+snapshot intersect-basic {
+    SELECT department FROM current_employees
+    INTERSECT
+    SELECT department FROM former_employees;
+}
+
+# INTERSECT with multiple columns
+@setup schema
+snapshot intersect-multiple-columns {
+    SELECT name, department FROM current_employees
+    INTERSECT
+    SELECT name, department FROM former_employees;
+}
+
+# EXCEPT - set difference
+# Returns rows from first query that don't appear in second query
+@setup schema
+snapshot except-basic {
+    SELECT department FROM current_employees
+    EXCEPT
+    SELECT department FROM former_employees;
+}
+
+# EXCEPT with multiple columns
+@setup schema
+snapshot except-multiple-columns {
+    SELECT name, department FROM current_employees
+    EXCEPT
+    SELECT name, department FROM former_employees;
+}
+
+# Compound set operations - chained unions
+# Multiple UNION ALL operations combined
+@setup schema
+snapshot compound-union-all-three-way {
+    SELECT name, department FROM current_employees
+    UNION ALL
+    SELECT name, department FROM former_employees
+    UNION ALL
+    SELECT name, department FROM contractors;
+}
+
+# Compound set operations - mixed UNION and UNION ALL
+@setup schema
+snapshot compound-mixed-union {
+    SELECT name, department FROM current_employees
+    UNION
+    SELECT name, department FROM former_employees
+    UNION ALL
+    SELECT name, department FROM contractors;
+}
+
+# Compound set operations - UNION with INTERSECT
+@setup schema
+snapshot compound-union-intersect {
+    SELECT department FROM current_employees
+    UNION
+    SELECT department FROM contractors
+    INTERSECT
+    SELECT department FROM former_employees;
+}
+
+# Compound set operations - UNION with EXCEPT
+@setup schema
+snapshot compound-union-except {
+    SELECT department FROM current_employees
+    UNION
+    SELECT department FROM contractors
+    EXCEPT
+    SELECT department FROM former_employees;
+}
+
+# UNION with ORDER BY - sorted union result
+# ORDER BY applies to the final combined result
+@setup schema
+snapshot union-with-order-by {
+    SELECT name, department FROM current_employees
+    UNION
+    SELECT name, department FROM former_employees
+    ORDER BY department, name;
+}
+
+# UNION ALL with ORDER BY
+@setup schema
+snapshot union-all-with-order-by {
+    SELECT name, department, salary as compensation FROM current_employees
+    UNION ALL
+    SELECT name, department, last_salary as compensation FROM former_employees
+    ORDER BY compensation DESC;
+}
+
+# UNION with LIMIT
+@setup schema
+snapshot union-with-limit {
+    SELECT name, department FROM current_employees
+    UNION
+    SELECT name, department FROM former_employees
+    LIMIT 10;
+}
+
+# UNION with ORDER BY and LIMIT
+@setup schema
+snapshot union-order-by-limit {
+    SELECT name, department FROM current_employees
+    UNION
+    SELECT name, department FROM former_employees
+    ORDER BY name
+    LIMIT 5;
+}
+
+# Complex: Subquery with UNION
+@setup schema
+snapshot subquery-with-union {
+    SELECT * FROM (
+        SELECT name, department FROM current_employees
+        UNION
+        SELECT name, department FROM former_employees
+    ) AS all_employees
+    WHERE department = 'Engineering';
+}
+
+# Complex: UNION in subquery with aggregation
+@setup schema
+snapshot union-subquery-aggregation {
+    SELECT department, COUNT(*) as total_people
+    FROM (
+        SELECT name, department FROM current_employees
+        UNION ALL
+        SELECT name, department FROM former_employees
+        UNION ALL
+        SELECT name, department FROM contractors
+    ) AS all_workers
+    GROUP BY department
+    ORDER BY total_people DESC;
+}
