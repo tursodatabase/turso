@@ -29,7 +29,8 @@ use crate::{
     types::{
         Coro, DatabaseMetadata, DatabasePullRevision, DatabaseRowTransformResult,
         DatabaseSavedConfiguration, DatabaseSyncEngineProtocolVersion, DatabaseTapeOperation,
-        DbChangesStatus, PartialSyncOpts, SyncEngineStats, DATABASE_METADATA_VERSION,
+        DbChangesStatus, PartialSyncOpts, SyncEngineIoResult, SyncEngineStats,
+        DATABASE_METADATA_VERSION,
     },
     wal_session::WalSession,
     Result,
@@ -494,14 +495,29 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             main_db_path,
             opts.remote_encryption_key.as_deref(),
         )?;
-        let main_db = turso_core::Database::open_with_flags(
-            io.clone(),
-            main_db_path,
-            main_db_storage,
-            OpenFlags::Create,
-            turso_core::DatabaseOpts::new(),
-            None,
-        )?;
+
+        // Use async database opening that yields on IO for large schemas
+        let mut open_state = turso_core::OpenDbAsyncState::new();
+        let main_db = loop {
+            match turso_core::Database::open_with_flags_bypass_registry_async(
+                &mut open_state,
+                io.clone(),
+                main_db_path,
+                &create_main_db_wal_path(main_db_path),
+                main_db_storage.clone(),
+                OpenFlags::Create,
+                turso_core::DatabaseOpts::new(),
+                None,
+            )? {
+                turso_core::IOResult::Done(db) => break db,
+                turso_core::IOResult::IO(io_completion) => {
+                    while !io_completion.finished() {
+                        coro.yield_(SyncEngineIoResult::IO).await?;
+                    }
+                }
+            }
+        };
+
         Self::open_db(coro, io, sync_engine_io, main_db, opts).await
     }
 

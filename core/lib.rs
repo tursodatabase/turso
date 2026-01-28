@@ -111,7 +111,7 @@ pub use storage::{
 use tracing::{instrument, Level};
 use turso_macros::{match_ignore_ascii_case, AtomicEnum};
 use turso_parser::{ast, ast::Cmd, parser::Parser};
-use types::IOResult;
+pub use types::IOResult;
 pub use types::Value;
 pub use types::ValueRef;
 use util::parse_schema_rows;
@@ -253,6 +253,46 @@ fn new_header_read_completion(buf: Arc<Buffer>) -> Completion {
         }
         None
     })
+}
+
+/// Phase tracking for async database opening
+#[derive(Default, Debug)]
+pub enum OpenDbAsyncPhase {
+    #[default]
+    Init,
+    ReadingHeader,
+    LoadingSchema,
+    BootstrapMvStore,
+    Done,
+}
+
+/// State machine for async database opening
+pub struct OpenDbAsyncState {
+    phase: OpenDbAsyncPhase,
+    db: Option<Arc<Database>>,
+    pager: Option<Arc<Pager>>,
+    conn: Option<Arc<Connection>>,
+    encryption_key: Option<EncryptionKey>,
+    make_from_btree_state: schema::MakeFromBtreeState,
+}
+
+impl Default for OpenDbAsyncState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl OpenDbAsyncState {
+    pub fn new() -> Self {
+        Self {
+            phase: OpenDbAsyncPhase::Init,
+            db: None,
+            pager: None,
+            conn: None,
+            encryption_key: None,
+            make_from_btree_state: schema::MakeFromBtreeState::new(),
+        }
+    }
 }
 
 /// The database manager ensures that there is a single, shared
@@ -575,9 +615,10 @@ impl Database {
             );
         }
 
-        let db = Arc::new(db);
-
         // Check: https://github.com/tursodatabase/turso/pull/1761#discussion_r2154013123
+
+        // Wrap db in Arc before connecting
+        let db = Arc::new(db);
 
         // parse schema
         let conn = db._connect(false, Some(pager.clone()), encryption_key.clone())?;
@@ -590,17 +631,28 @@ impl Database {
                 .io
                 .block(|| pager.with_header(|header| header.schema_cookie.get()))?;
             schema.schema_version = header_schema_cookie;
-            let result = schema
-                .make_from_btree(None, pager.clone(), &syms, enable_triggers)
-                .inspect_err(|_| pager.end_read_tx());
+            let mut make_from_btree_state = schema::MakeFromBtreeState::new();
+            let result = io.block(|| {
+                schema.make_from_btree(
+                    &mut make_from_btree_state,
+                    None,
+                    pager.clone(),
+                    &syms,
+                    enable_triggers,
+                )
+            });
             match result {
                 Err(LimboError::ExtensionError(e)) => {
                     // this means that a vtab exists and we no longer have the module loaded. we print
                     // a warning to the user to load the module
+                    make_from_btree_state.cleanup(&pager);
                     eprintln!("Warning: {e}");
                 }
-                Err(e) => return Err(e),
-                _ => {}
+                Err(e) => {
+                    make_from_btree_state.cleanup(&pager);
+                    return Err(e);
+                }
+                Ok(()) => {}
             }
 
             Ok(())
@@ -612,6 +664,138 @@ impl Database {
         }
 
         Ok(db)
+    }
+
+    /// Async version of database opening that returns IOResult.
+    /// Caller must drive the IO loop and pass state between calls.
+    /// This is useful for sync engine which needs to yield on IO.
+    #[allow(clippy::arc_with_non_send_sync)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_with_flags_bypass_registry_async(
+        state: &mut OpenDbAsyncState,
+        io: Arc<dyn IO>,
+        path: &str,
+        wal_path: &str,
+        db_file: Arc<dyn DatabaseStorage>,
+        flags: OpenFlags,
+        opts: DatabaseOpts,
+        encryption_opts: Option<EncryptionOpts>,
+    ) -> Result<IOResult<Arc<Database>>> {
+        use crate::return_if_io;
+
+        loop {
+            tracing::trace!(
+                "open_with_flags_bypass_registry_async: state.phase={:?}",
+                state.phase
+            );
+            match &state.phase {
+                OpenDbAsyncPhase::Init => {
+                    // Parse encryption key from encryption_opts if provided
+                    let encryption_key = if let Some(ref enc_opts) = encryption_opts {
+                        Some(EncryptionKey::from_hex_string(&enc_opts.hexkey)?)
+                    } else {
+                        None
+                    };
+
+                    let mut db = Self::new(
+                        opts,
+                        flags,
+                        path,
+                        wal_path,
+                        &io,
+                        db_file.clone(),
+                        encryption_opts.clone(),
+                    )?;
+
+                    let pager = db.header_validation(encryption_key.as_ref())?;
+
+                    #[cfg(debug_assertions)]
+                    {
+                        let wal_enabled = db.shared_wal.read().enabled.load(Ordering::SeqCst);
+                        let mv_store_enabled = db.get_mv_store().is_some();
+                        assert!(
+                            db.is_readonly() || wal_enabled || mv_store_enabled,
+                            "Either WAL or MVStore must be enabled"
+                        );
+                    }
+
+                    // Wrap db in Arc before connecting
+                    let db = Arc::new(db);
+                    let conn = db._connect(false, Some(pager.clone()), encryption_key.clone())?;
+
+                    state.db = Some(db);
+                    state.pager = Some(pager);
+                    state.conn = Some(conn);
+                    state.encryption_key = encryption_key;
+                    state.phase = OpenDbAsyncPhase::ReadingHeader;
+                }
+
+                OpenDbAsyncPhase::ReadingHeader => {
+                    let pager = state.pager.as_ref().unwrap();
+                    let header_schema_cookie =
+                        return_if_io!(pager.with_header(|header| header.schema_cookie.get()));
+
+                    let db = state.db.as_ref().unwrap();
+                    db.with_schema_mut(|schema| {
+                        schema.schema_version = header_schema_cookie;
+                        Ok(())
+                    })?;
+
+                    state.phase = OpenDbAsyncPhase::LoadingSchema;
+                }
+
+                OpenDbAsyncPhase::LoadingSchema => {
+                    let db = state.db.as_ref().unwrap();
+                    let pager = state.pager.as_ref().unwrap();
+                    let conn = state.conn.as_ref().unwrap();
+                    let syms = conn.syms.read();
+                    let enable_triggers = db.opts.enable_triggers;
+
+                    let result = db.with_schema_mut(|schema| {
+                        schema.make_from_btree(
+                            &mut state.make_from_btree_state,
+                            None,
+                            pager.clone(),
+                            &syms,
+                            enable_triggers,
+                        )
+                    });
+
+                    match result {
+                        Ok(IOResult::IO(io)) => return Ok(IOResult::IO(io)),
+                        Ok(IOResult::Done(())) => {}
+                        Err(LimboError::ExtensionError(e)) => {
+                            state.make_from_btree_state.cleanup(pager);
+                            eprintln!("Warning: {e}");
+                        }
+                        Err(e) => {
+                            state.make_from_btree_state.cleanup(pager);
+                            return Err(e);
+                        }
+                    }
+
+                    state.phase = OpenDbAsyncPhase::BootstrapMvStore;
+                }
+
+                OpenDbAsyncPhase::BootstrapMvStore => {
+                    let db = state.db.as_ref().unwrap();
+                    let pager = state.pager.as_ref().unwrap();
+
+                    if let Some(mv_store) = db.get_mv_store().as_ref() {
+                        let mvcc_bootstrap_conn =
+                            db._connect(true, Some(pager.clone()), state.encryption_key.clone())?;
+                        mv_store.bootstrap(mvcc_bootstrap_conn)?;
+                    }
+
+                    state.phase = OpenDbAsyncPhase::Done;
+                    return Ok(IOResult::Done(state.db.take().unwrap()));
+                }
+
+                OpenDbAsyncPhase::Done => {
+                    panic!("open_with_flags_bypass_registry_async called after completion");
+                }
+            }
+        }
     }
 
     /// Necessary Pager initialization, so that we are prepared to read from Page 1.

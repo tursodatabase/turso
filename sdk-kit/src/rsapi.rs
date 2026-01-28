@@ -16,7 +16,8 @@ use tracing_subscriber::{
 };
 use turso_core::{
     storage::database::DatabaseFile, types::AsValueRef, Connection, Database, DatabaseOpts,
-    DatabaseStorage, EncryptionKey, LimboError, OpenFlags, QueryMode, Statement, StepResult, IO,
+    DatabaseStorage, EncryptionKey, IOResult, LimboError, OpenDbAsyncState, OpenFlags, QueryMode,
+    Statement, StepResult, IO,
 };
 
 use crate::{
@@ -286,6 +287,44 @@ pub struct TursoDatabase {
     db: Arc<Mutex<Option<Arc<Database>>>>,
 }
 
+/// Phase tracking for async TursoDatabase opening
+#[derive(Default)]
+pub enum TursoDatabaseOpenPhase {
+    #[default]
+    Init,
+    Opening,
+    Done,
+}
+
+/// State machine for async TursoDatabase opening
+pub struct TursoDatabaseOpenState {
+    phase: TursoDatabaseOpenPhase,
+    io: Option<Arc<dyn IO>>,
+    db_file: Option<Arc<dyn DatabaseStorage>>,
+    opts: Option<DatabaseOpts>,
+    wal_path: Option<String>,
+    open_db_state: OpenDbAsyncState,
+}
+
+impl Default for TursoDatabaseOpenState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TursoDatabaseOpenState {
+    pub fn new() -> Self {
+        Self {
+            phase: TursoDatabaseOpenPhase::Init,
+            io: None,
+            db_file: None,
+            opts: None,
+            wal_path: None,
+            open_db_state: OpenDbAsyncState::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 pub enum TursoStatusCode {
@@ -502,93 +541,155 @@ impl TursoDatabase {
             db: Arc::new(Mutex::new(None)),
         })
     }
+    /// Async version of database opening that returns IOResult.
+    /// Caller must drive the IO loop and pass state between calls.
+    /// This is useful for environments where IO operations must be executed in a specific fashion.
+    pub fn open_async(
+        &self,
+        state: &mut TursoDatabaseOpenState,
+    ) -> Result<IOResult<()>, TursoError> {
+        loop {
+            match &state.phase {
+                TursoDatabaseOpenPhase::Init => {
+                    let inner_db = self.db.lock().unwrap();
+                    if inner_db.is_some() {
+                        return Err(TursoError::Misuse(
+                            "database must be opened only once".to_string(),
+                        ));
+                    }
+                    drop(inner_db);
+
+                    let io: Arc<dyn turso_core::IO> = if let Some(io) = &self.config.io {
+                        io.clone()
+                    } else {
+                        match self.config.vfs.as_deref() {
+                            Some("memory") => Arc::new(turso_core::MemoryIO::new()),
+                            Some("syscall") => {
+                                #[cfg(all(target_family = "unix", not(miri)))]
+                                {
+                                    Arc::new(turso_core::UnixIO::new().map_err(|e| {
+                                        TursoError::Error(format!(
+                                            "unable to create generic syscall backend: {e}"
+                                        ))
+                                    })?)
+                                }
+                                #[cfg(any(not(target_family = "unix"), miri))]
+                                {
+                                    Arc::new(turso_core::PlatformIO::new().map_err(|e| {
+                                        TursoError::Error(format!(
+                                            "unable to create generic syscall backend: {e}"
+                                        ))
+                                    })?)
+                                }
+                            }
+                            #[cfg(all(target_os = "linux", not(miri)))]
+                            Some("io_uring") => Arc::new(turso_core::UringIO::new().map_err(|e| {
+                                TursoError::Error(format!("unable to create io_uring backend: {e}"))
+                            })?),
+                            #[cfg(any(not(target_os = "linux"), miri))]
+                            Some("io_uring") => {
+                                return Err(TursoError::Error(
+                                    "io_uring is only available on Linux targets".to_string(),
+                                ));
+                            }
+                            Some(vfs) => {
+                                return Err(TursoError::Error(format!(
+                                    "unsupported VFS backend: '{vfs}'"
+                                )))
+                            }
+                            None => match self.config.path.as_str() {
+                                ":memory:" => Arc::new(turso_core::MemoryIO::new()),
+                                _ => Arc::new(turso_core::PlatformIO::new()?),
+                            },
+                        }
+                    };
+
+                    let open_flags = OpenFlags::default();
+                    let db_file = if let Some(db_file) = &self.config.db_file {
+                        db_file.clone()
+                    } else {
+                        let file = io.open_file(&self.config.path, open_flags, true)?;
+                        Arc::new(DatabaseFile::new(file))
+                    };
+
+                    let mut opts = DatabaseOpts::new();
+                    if let Some(experimental_features) = &self.config.experimental_features {
+                        for features in experimental_features.split(",").map(|s| s.trim()) {
+                            opts = match features {
+                                "views" => opts.with_views(true),
+                                "index_method" => opts.with_index_method(true),
+                                "strict" => opts.with_strict(true),
+                                "autovacuum" => opts.with_autovacuum(true),
+                                "triggers" => opts.with_triggers(true),
+                                "encryption" => opts.with_encryption(true),
+                                _ => opts,
+                            };
+                        }
+                    }
+
+                    if self.config.encryption.is_some() && !opts.enable_encryption {
+                        return Err(TursoError::Error(
+                            "encryption is experimental and must be explicitly enabled through experimental features list".to_string(),
+                        ));
+                    }
+
+                    let wal_path = format!("{}-wal", &self.config.path);
+
+                    state.io = Some(io);
+                    state.db_file = Some(db_file);
+                    state.opts = Some(opts);
+                    state.wal_path = Some(wal_path);
+                    state.phase = TursoDatabaseOpenPhase::Opening;
+                }
+
+                TursoDatabaseOpenPhase::Opening => {
+                    let io = state.io.as_ref().unwrap();
+                    let db_file = state.db_file.as_ref().unwrap();
+                    let opts = state.opts.unwrap();
+                    let wal_path = state.wal_path.as_ref().unwrap();
+
+                    match Database::open_with_flags_bypass_registry_async(
+                        &mut state.open_db_state,
+                        io.clone(),
+                        &self.config.path,
+                        wal_path,
+                        db_file.clone(),
+                        OpenFlags::default(),
+                        opts,
+                        self.config.encryption.clone(),
+                    )? {
+                        IOResult::Done(db) => {
+                            let mut inner_db = self.db.lock().unwrap();
+                            *inner_db = Some(db);
+                            state.phase = TursoDatabaseOpenPhase::Done;
+                            return Ok(IOResult::Done(()));
+                        }
+                        IOResult::IO(io_completion) => {
+                            return Ok(IOResult::IO(io_completion));
+                        }
+                    }
+                }
+
+                TursoDatabaseOpenPhase::Done => {
+                    return Ok(IOResult::Done(()));
+                }
+            }
+        }
+    }
+
     /// open the database
     /// this method must be called only once
     pub fn open(&self) -> Result<(), TursoError> {
-        let mut inner_db = self.db.lock().unwrap();
-        if inner_db.is_some() {
-            return Err(TursoError::Misuse(
-                "database must be opened only once".to_string(),
-            ));
-        }
-        let io: Arc<dyn turso_core::IO> = if let Some(io) = &self.config.io {
-            io.clone()
-        } else {
-            match self.config.vfs.as_deref() {
-                Some("memory") => Arc::new(turso_core::MemoryIO::new()),
-                Some("syscall") => {
-                    #[cfg(all(target_family = "unix", not(miri)))]
-                    {
-                        Arc::new(turso_core::UnixIO::new().map_err(|e| {
-                            TursoError::Error(format!(
-                                "unable to create generic syscall backend: {e}"
-                            ))
-                        })?)
-                    }
-                    #[cfg(any(not(target_family = "unix"), miri))]
-                    {
-                        Arc::new(turso_core::PlatformIO::new().map_err(|e| {
-                            TursoError::Error(format!(
-                                "unable to create generic syscall backend: {e}"
-                            ))
-                        })?)
-                    }
+        let mut state = TursoDatabaseOpenState::new();
+        loop {
+            match self.open_async(&mut state)? {
+                IOResult::Done(()) => return Ok(()),
+                IOResult::IO(io_completion) => {
+                    let io = state.io.as_ref().unwrap();
+                    io_completion.wait(&**io)?;
                 }
-                #[cfg(all(target_os = "linux", not(miri)))]
-                Some("io_uring") => Arc::new(turso_core::UringIO::new().map_err(|e| {
-                    TursoError::Error(format!("unable to create io_uring backend: {e}"))
-                })?),
-                #[cfg(any(not(target_os = "linux"), miri))]
-                Some("io_uring") => {
-                    return Err(TursoError::Error(
-                        "io_uring is only available on Linux targets".to_string(),
-                    ));
-                }
-                Some(vfs) => {
-                    return Err(TursoError::Error(format!(
-                        "unsupported VFS backend: '{vfs}'"
-                    )))
-                }
-                None => match self.config.path.as_str() {
-                    ":memory:" => Arc::new(turso_core::MemoryIO::new()),
-                    _ => Arc::new(turso_core::PlatformIO::new()?),
-                },
-            }
-        };
-        let open_flags = OpenFlags::default();
-        let db_file = if let Some(db_file) = &self.config.db_file {
-            db_file.clone()
-        } else {
-            let file = io.open_file(&self.config.path, open_flags, true)?;
-            Arc::new(DatabaseFile::new(file))
-        };
-        let mut opts = DatabaseOpts::new();
-        if let Some(experimental_features) = &self.config.experimental_features {
-            for features in experimental_features.split(",").map(|s| s.trim()) {
-                opts = match features {
-                    "views" => opts.with_views(true),
-                    "index_method" => opts.with_index_method(true),
-                    "strict" => opts.with_strict(true),
-                    "autovacuum" => opts.with_autovacuum(true),
-                    "triggers" => opts.with_triggers(true),
-                    "encryption" => opts.with_encryption(true),
-                    _ => opts,
-                };
             }
         }
-        if self.config.encryption.is_some() && !opts.enable_encryption {
-            return Err(TursoError::Error("encryption is experimental and must be explicitly enabled through experimental features list".to_string()));
-        }
-        let db = turso_core::Database::open_with_flags(
-            io.clone(),
-            &self.config.path,
-            db_file,
-            open_flags,
-            opts,
-            self.config.encryption.clone(),
-        )?;
-        *inner_db = Some(db);
-        Ok(())
     }
 
     /// creates database connection

@@ -2,11 +2,12 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 use turso_core::{MemoryIO, IO};
-use turso_sdk_kit::rsapi::{str_from_c_str, TursoError};
+use turso_sdk_kit::rsapi::{str_from_c_str, TursoDatabaseOpenState, TursoError};
 use turso_sync_engine::{
     database_sync_engine::{self, DatabaseSyncEngine},
     database_sync_engine_io::SyncEngineIo,
     database_sync_operations::SyncEngineIoStats,
+    types::SyncEngineIoResult,
 };
 
 use crate::{
@@ -255,11 +256,24 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
                         ..db_config
                     },
                 );
-                main_db.open().map_err(|e| {
-                    turso_sync_engine::errors::Error::DatabaseSyncEngineError(format!(
-                        "unable to open database file: {e}"
-                    ))
-                })?;
+
+                // Use async database opening that yields on IO for large schemas
+                let mut open_state = TursoDatabaseOpenState::new();
+                loop {
+                    match main_db.open_async(&mut open_state).map_err(|e| {
+                        turso_sync_engine::errors::Error::DatabaseSyncEngineError(format!(
+                            "unable to open database file: {e}"
+                        ))
+                    })? {
+                        turso_core::IOResult::Done(()) => break,
+                        turso_core::IOResult::IO(io_completion) => {
+                            while !io_completion.finished() {
+                                coro.yield_(SyncEngineIoResult::IO).await?;
+                            }
+                        }
+                    }
+                }
+
                 let main_db_core = main_db.db_core().map_err(|e| {
                     turso_sync_engine::errors::Error::DatabaseSyncEngineError(format!(
                         "unable to get core database instance: {e}",
@@ -326,11 +340,24 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
                         ..db_config
                     },
                 );
-                main_db.open().map_err(|e| {
-                    turso_sync_engine::errors::Error::DatabaseSyncEngineError(format!(
-                        "unable to open database file: {e}"
-                    ))
-                })?;
+
+                // Use async database opening that yields on IO for large schemas
+                let mut open_state = TursoDatabaseOpenState::new();
+                loop {
+                    match main_db.open_async(&mut open_state).map_err(|e| {
+                        turso_sync_engine::errors::Error::DatabaseSyncEngineError(format!(
+                            "unable to open database file: {e}"
+                        ))
+                    })? {
+                        turso_core::IOResult::Done(()) => break,
+                        turso_core::IOResult::IO(io_completion) => {
+                            while !io_completion.finished() {
+                                coro.yield_(SyncEngineIoResult::IO).await?;
+                            }
+                        }
+                    }
+                }
+
                 let main_db_core = main_db.db_core().map_err(|e| {
                     turso_sync_engine::errors::Error::DatabaseSyncEngineError(format!(
                         "unable to get core database instance: {e}",
