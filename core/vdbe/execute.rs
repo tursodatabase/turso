@@ -6543,8 +6543,13 @@ pub fn op_insert(
                 }
                 if program.connection.auto_analyze_enabled()
                     && !flag.has(InsertFlags::EPHEMERAL_TABLE_INSERT)
+                    && !flag.has(InsertFlags::IS_UPDATE)
+                    && !flag.has(InsertFlags::UPDATE_ROWID_CHANGE)
                 {
-                    state.auto_analyze.mark_table_written(table_name);
+                    // Track row insert for incremental stats update
+                    // Skip for IS_UPDATE (in-place update) and UPDATE_ROWID_CHANGE
+                    // (rowid change already tracked via Delete + Insert)
+                    state.auto_analyze.note_row_insert(table_name);
                 }
                 // Increment metrics for row write
                 state.metrics.rows_written = state.metrics.rows_written.saturating_add(1);
@@ -6752,8 +6757,11 @@ pub fn op_delete(
                     let cursor = cursor.as_btree_mut();
                     return_if_io!(cursor.delete());
                 }
-                if program.connection.auto_analyze_enabled() {
-                    state.auto_analyze.mark_table_written(table_name);
+                if program.connection.auto_analyze_enabled() && !is_part_of_update {
+                    // Track row delete for incremental stats update
+                    // Skip for is_part_of_update (UPDATE with rowid change - the
+                    // subsequent Insert won't be tracked either, so net change is 0)
+                    state.auto_analyze.note_row_delete(table_name);
                 }
                 // Increment metrics for row write (DELETE is a write operation)
                 state.metrics.rows_written = state.metrics.rows_written.saturating_add(1);

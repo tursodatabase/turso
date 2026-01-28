@@ -376,10 +376,11 @@ pub(crate) struct AutoAnalyzeRuntime {
     pub(crate) scan_states: Vec<AutoAnalyzeScanState>,
     /// Exact row counts from OP_Count, keyed by normalized table name.
     pub(crate) exact_counts: HashMap<String, u64>,
-    /// Tables written during the statement; recorded stats for these are discarded.
-    pub(crate) written_tables: HashSet<String>,
-    /// Raw table names for cheap de-dup before normalization.
-    written_tables_raw: HashSet<String>,
+    /// Row count deltas from INSERT/DELETE operations, keyed by normalized table name.
+    /// Positive = net inserts, negative = net deletes.
+    pub(crate) row_count_deltas: HashMap<String, i64>,
+    /// Raw table names that have row count deltas (for cheap de-dup).
+    row_count_deltas_raw: HashSet<String>,
 }
 
 impl AutoAnalyzeRuntime {
@@ -387,8 +388,8 @@ impl AutoAnalyzeRuntime {
         Self {
             scan_states: vec![AutoAnalyzeScanState::default(); max_cursors],
             exact_counts: HashMap::new(),
-            written_tables: HashSet::new(),
-            written_tables_raw: HashSet::new(),
+            row_count_deltas: HashMap::new(),
+            row_count_deltas_raw: HashSet::new(),
         }
     }
 
@@ -402,8 +403,8 @@ impl AutoAnalyzeRuntime {
             state.reset();
         }
         self.exact_counts.clear();
-        self.written_tables.clear();
-        self.written_tables_raw.clear();
+        self.row_count_deltas.clear();
+        self.row_count_deltas_raw.clear();
     }
 
     /// Record that a table scan has started (Rewind/Last).
@@ -457,14 +458,29 @@ impl AutoAnalyzeRuntime {
         self.exact_counts.insert(table_name, row_count);
     }
 
-    /// Record that a table was written to so we don't keep stale stats.
-    pub(crate) fn mark_table_written(&mut self, table_name: &str) {
-        if self.written_tables_raw.contains(table_name) {
-            return;
+    /// Record that a row was inserted into a table.
+    /// This allows incremental row count updates instead of full invalidation.
+    pub(crate) fn note_row_insert(&mut self, table_name: &str) {
+        if !self.row_count_deltas_raw.contains(table_name) {
+            self.row_count_deltas_raw.insert(table_name.to_string());
         }
-        self.written_tables_raw.insert(table_name.to_string());
         let table_name = normalize_ident(table_name);
-        self.written_tables.insert(table_name);
+        *self.row_count_deltas.entry(table_name).or_insert(0) += 1;
+    }
+
+    /// Record that a row was deleted from a table.
+    /// This allows incremental row count updates instead of full invalidation.
+    pub(crate) fn note_row_delete(&mut self, table_name: &str) {
+        if !self.row_count_deltas_raw.contains(table_name) {
+            self.row_count_deltas_raw.insert(table_name.to_string());
+        }
+        let table_name = normalize_ident(table_name);
+        *self.row_count_deltas.entry(table_name).or_insert(0) -= 1;
+    }
+
+    /// Check if a table has any writes (deltas).
+    pub(crate) fn has_any_writes(&self) -> bool {
+        !self.row_count_deltas.is_empty()
     }
 }
 

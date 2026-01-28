@@ -1484,40 +1484,57 @@ impl Connection {
             .scan_states
             .iter()
             .any(|scan| !scan.invalidated && (scan.completed || scan.row_count > 0));
-        if !has_scan_signal
-            && auto_state.exact_counts.is_empty()
-            && auto_state.written_tables.is_empty()
-        {
+        if !has_scan_signal && auto_state.exact_counts.is_empty() && !auto_state.has_any_writes() {
             return;
         }
 
-        let index_ranges_to_clear = if auto_state.written_tables.is_empty() {
+        // Collect index ranges to clear for tables with any writes
+        // (INSERT/DELETE invalidate index range stats since selectivity may have changed)
+        let index_ranges_to_clear = if !auto_state.has_any_writes() {
             Vec::new()
         } else {
             let schema = self.schema.read();
             auto_state
-                .written_tables
-                .iter()
+                .row_count_deltas
+                .keys()
                 .flat_map(|table| schema.get_indices(table).map(|index| index.name.clone()))
-                .collect::<Vec<_>>()
+                .collect()
         };
 
         let mut stats = self.auto_analyze_stats.write();
 
-        for table in &auto_state.written_tables {
-            stats.remove_table(table);
-        }
+        // Clear index range stats for any tables with writes
         for index_name in index_ranges_to_clear {
             stats.remove_index_range(&index_name);
         }
 
-        for (table, row_count) in &auto_state.exact_counts {
-            if auto_state.written_tables.contains(table) || is_system_table(table) {
+        // Apply row count deltas for INSERT/DELETE (if we have an existing count)
+        for (table, delta) in &auto_state.row_count_deltas {
+            if is_system_table(table) {
                 continue;
             }
+            if let Some(current_count) = stats.row_count(table) {
+                // Apply delta, clamping to 0 minimum
+                let new_count = if *delta >= 0 {
+                    current_count.saturating_add(*delta as u64)
+                } else {
+                    current_count.saturating_sub(delta.unsigned_abs())
+                };
+                stats.set_row_count(table, new_count);
+            }
+            // If we don't have a row count yet, we can't apply a delta
+        }
+
+        // Record exact counts from OP_Count
+        for (table, row_count) in &auto_state.exact_counts {
+            if is_system_table(table) {
+                continue;
+            }
+            // Exact count overrides any delta-based updates
             stats.set_row_count(table, *row_count);
         }
 
+        // Record row counts from completed full scans
         for (cursor_id, scan_state) in auto_state.scan_states.iter().enumerate() {
             if scan_state.invalidated {
                 continue;
@@ -1534,9 +1551,7 @@ impl Connection {
                 match cursor_type {
                     CursorType::BTreeTable(table) => {
                         let table_name = normalize_ident(&table.name);
-                        if is_system_table(&table_name)
-                            || auto_state.written_tables.contains(&table_name)
-                        {
+                        if is_system_table(&table_name) {
                             continue;
                         }
                         stats.set_row_count(&table_name, scan_state.row_count);
@@ -1546,9 +1561,7 @@ impl Connection {
                             continue;
                         }
                         let table_name = normalize_ident(&index.table_name);
-                        if is_system_table(&table_name)
-                            || auto_state.written_tables.contains(&table_name)
-                        {
+                        if is_system_table(&table_name) {
                             continue;
                         }
                         stats.set_row_count(&table_name, scan_state.row_count);
@@ -1572,7 +1585,7 @@ impl Connection {
                 continue;
             }
             let table_name = normalize_ident(&index.table_name);
-            if is_system_table(&table_name) || auto_state.written_tables.contains(&table_name) {
+            if is_system_table(&table_name) {
                 continue;
             }
             stats.set_index_range_row_count(&index.name, scan_state.row_count);

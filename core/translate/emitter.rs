@@ -3623,7 +3623,9 @@ fn emit_update_insns<'a>(
                 // so to insert a new user-provided rowid, we need to seek to the correct place.
                 InsertFlags::new().require_seek().update_rowid_change()
             } else {
-                InsertFlags::new()
+                // In-place update (no rowid change) - mark as IS_UPDATE so we don't
+                // incorrectly increment row count stats
+                InsertFlags::new().is_update()
             },
             table_name: target_table.identifier.clone(),
         });
