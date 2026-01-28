@@ -2082,6 +2082,48 @@ fn test_update_multiple_unique_columns_partial_rollback() {
     assert_eq!(&rows[0][0].to_string(), "ok");
 }
 
+
+/// Test that a transaction cannot see uncommitted changes from another transaction.
+/// This verifies snapshot isolation.
+#[test]
+fn test_mvcc_snapshot_isolation() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+
+    let conn1 = db.connect();
+    conn1
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, value INTEGER)")
+        .unwrap();
+    conn1
+        .execute("INSERT INTO t VALUES (1, 100), (2, 200), (3, 300)")
+        .unwrap();
+
+    // Start tx1 and read initial values
+    conn1.execute("BEGIN CONCURRENT").unwrap();
+    let rows1 = get_rows(&conn1, "SELECT value FROM t WHERE id = 2");
+    assert_eq!(rows1[0][0].to_string(), "200");
+
+    // Start tx2 and modify the same row
+    let conn2 = db.connect();
+    conn2.execute("BEGIN CONCURRENT").unwrap();
+    conn2
+        .execute("UPDATE t SET value = 999 WHERE id = 2")
+        .unwrap();
+    conn2.execute("COMMIT").unwrap();
+
+    // Tx1 should still see the old value (snapshot isolation)
+    let rows1_again = get_rows(&conn1, "SELECT value FROM t WHERE id = 2");
+    assert_eq!(
+        rows1_again[0][0].to_string(),
+        "200",
+        "Tx1 should not see tx2's committed changes"
+    );
+
+    conn1.execute("COMMIT").unwrap();
+
+    // After tx1 commits, new reads should see tx2's changes
+    let rows_after = get_rows(&conn1, "SELECT value FROM t WHERE id = 2");
+    assert_eq!(rows_after[0][0].to_string(), "999");
+}
 /// Similar test but with the constraint error happening on the third unique column.
 /// This tests that ALL previous index modifications are rolled back.
 /// Uses interactive transaction (BEGIN CONCURRENT) to reproduce the bug.
