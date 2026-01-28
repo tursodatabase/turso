@@ -622,8 +622,6 @@ impl Database {
         opts: DatabaseOpts,
         encryption_opts: Option<EncryptionOpts>,
     ) -> Result<IOResult<Arc<Database>>> {
-        use crate::return_if_io;
-
         loop {
             tracing::trace!(
                 "open_with_flags_bypass_registry_async: state.phase={:?}",
@@ -721,6 +719,8 @@ impl Database {
                         Ok(IOResult::IO(io)) => return Ok(IOResult::IO(io)),
                         Ok(IOResult::Done(())) => {}
                         Err(LimboError::ExtensionError(e)) => {
+                            // this means that a vtab exists and we no longer have the module loaded.
+                            // we print a warning to the user to load the module
                             state.make_from_btree_state.cleanup(pager);
                             eprintln!("Warning: {e}");
                         }

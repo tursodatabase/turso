@@ -74,6 +74,7 @@ Use if-statements only when both branches are expected paths.
 - Document WHY, not what
 - Document functions, structs, enums, variants
 - Focus on why something is necessary
+- Preserve explanatory comments when refactoring
 
 **Don't:**
 - Comments that repeat code
