@@ -111,7 +111,7 @@ pub use storage::{
 use tracing::{instrument, Level};
 use turso_macros::{match_ignore_ascii_case, AtomicEnum};
 use turso_parser::{ast, ast::Cmd, parser::Parser};
-use types::IOResult;
+pub use types::IOResult;
 pub use types::Value;
 pub use types::ValueRef;
 use util::parse_schema_rows;
@@ -255,6 +255,49 @@ fn new_header_read_completion(buf: Arc<Buffer>) -> Completion {
     })
 }
 
+/// Phase tracking for async database opening
+#[derive(Default, Debug)]
+pub enum OpenDbAsyncPhase {
+    #[default]
+    Init,
+    ReadingHeader,
+    LoadingSchema,
+    BootstrapMvStore,
+    Done,
+}
+
+/// State machine for async database opening
+pub struct OpenDbAsyncState {
+    phase: OpenDbAsyncPhase,
+    db: Option<Arc<Database>>,
+    pager: Option<Arc<Pager>>,
+    conn: Option<Arc<Connection>>,
+    encryption_key: Option<EncryptionKey>,
+    make_from_btree_state: schema::MakeFromBtreeState,
+    /// Schema lock held during LoadingSchema phase to ensure atomicity across IO yields
+    schema_guard: Option<sync::ArcMutexGuard<Arc<Schema>>>,
+}
+
+impl Default for OpenDbAsyncState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl OpenDbAsyncState {
+    pub fn new() -> Self {
+        Self {
+            phase: OpenDbAsyncPhase::Init,
+            db: None,
+            pager: None,
+            conn: None,
+            encryption_key: None,
+            make_from_btree_state: schema::MakeFromBtreeState::new(),
+            schema_guard: None,
+        }
+    }
+}
+
 /// The database manager ensures that there is a single, shared
 /// `Database` object per a database file. We need because it is not safe
 /// to have multiple independent WAL files open because coordination
@@ -275,7 +318,7 @@ static DATABASE_MANAGER: LazyLock<parking_lot::Mutex<HashMap<String, Weak<Databa
 /// encryption key here.
 pub struct Database {
     mv_store: ArcSwapOption<MvStore>,
-    schema: Mutex<Arc<Schema>>,
+    schema: Arc<Mutex<Arc<Schema>>>,
     pub db_file: Arc<dyn DatabaseStorage>,
     pub path: String,
     wal_path: String,
@@ -399,7 +442,7 @@ impl Database {
             mv_store,
             path: path.into(),
             wal_path: wal_path.into(),
-            schema: Mutex::new(Arc::new(Schema::new())),
+            schema: Arc::new(Mutex::new(Arc::new(Schema::new()))),
             _shared_page_cache: shared_page_cache.clone(),
             shared_wal,
             db_file,
@@ -466,10 +509,42 @@ impl Database {
         opts: DatabaseOpts,
         encryption_opts: Option<EncryptionOpts>,
     ) -> Result<Arc<Database>> {
-        // turso-sync-engine create 2 databases with different names in the same IO if MemoryIO is used
-        // in this case we need to bypass registry (as this is MemoryIO DB) but also preserve original distinction in names (e.g. :memory:-draft and :memory:-synced)
+        let mut state = OpenDbAsyncState::new();
+        loop {
+            match Self::open_with_flags_async(
+                &mut state,
+                io.clone(),
+                path,
+                db_file.clone(),
+                flags,
+                opts,
+                encryption_opts.clone(),
+            )? {
+                IOResult::Done(db) => return Ok(db),
+                IOResult::IO(io_completion) => {
+                    io_completion.wait(&*io)?;
+                }
+            }
+        }
+    }
+
+    /// Async version of open_with_flags that returns IOResult.
+    /// Uses the database registry to ensure single Database instance per file.
+    /// Caller must drive the IO loop and pass state between calls.
+    #[allow(clippy::arc_with_non_send_sync)]
+    pub fn open_with_flags_async(
+        state: &mut OpenDbAsyncState,
+        io: Arc<dyn IO>,
+        path: &str,
+        db_file: Arc<dyn DatabaseStorage>,
+        flags: OpenFlags,
+        opts: DatabaseOpts,
+        encryption_opts: Option<EncryptionOpts>,
+    ) -> Result<IOResult<Arc<Database>>> {
+        // For :memory: databases, bypass the registry
         if path.starts_with(":memory:") {
-            return Self::open_with_flags_bypass_registry_internal(
+            return Self::open_with_flags_bypass_registry_async(
+                state,
                 io,
                 path,
                 &format!("{path}-wal"),
@@ -480,39 +555,55 @@ impl Database {
             );
         }
 
-        let mut registry = DATABASE_MANAGER.lock();
+        // Check registry first (only on Init phase)
+        if matches!(state.phase, OpenDbAsyncPhase::Init) {
+            let registry = DATABASE_MANAGER.lock();
 
-        let canonical_path = std::fs::canonicalize(path)
-            .ok()
-            .and_then(|p| p.to_str().map(|s| s.to_string()))
-            .unwrap_or_else(|| path.to_string());
+            let canonical_path = std::fs::canonicalize(path)
+                .ok()
+                .and_then(|p| p.to_str().map(|s| s.to_string()))
+                .unwrap_or_else(|| path.to_string());
 
-        if let Some(db) = registry.get(&canonical_path).and_then(Weak::upgrade) {
-            tracing::debug!("took database {canonical_path:?} from the registry");
+            if let Some(db) = registry.get(&canonical_path).and_then(Weak::upgrade) {
+                tracing::debug!("took database {canonical_path:?} from the registry");
 
-            // Check encryption compatibility using cipher mode (key is not stored in Database for security)
-            let db_is_encrypted = !matches!(db.encryption_cipher_mode.get(), CipherMode::None);
+                let db_is_encrypted = !matches!(db.encryption_cipher_mode.get(), CipherMode::None);
 
-            if db_is_encrypted && encryption_opts.is_none() {
-                return Err(LimboError::InvalidArgument(
-                    "Database is encrypted but no encryption options provided".to_string(),
-                ));
+                if db_is_encrypted && encryption_opts.is_none() {
+                    return Err(LimboError::InvalidArgument(
+                        "Database is encrypted but no encryption options provided".to_string(),
+                    ));
+                }
+
+                return Ok(IOResult::Done(db));
             }
-
-            return Ok(db);
         }
-        tracing::debug!("initialize database {canonical_path:?} and put in the registry");
-        let db = Self::open_with_flags_bypass_registry_internal(
+
+        // Open the database asynchronously
+        let wal_path = format!("{path}-wal");
+        let result = Self::open_with_flags_bypass_registry_async(
+            state,
             io,
             path,
-            &format!("{path}-wal"),
+            &wal_path,
             db_file,
             flags,
             opts,
             encryption_opts,
         )?;
-        registry.insert(canonical_path, Arc::downgrade(&db));
-        Ok(db)
+
+        // If done, insert into registry
+        if let IOResult::Done(ref db) = result {
+            let canonical_path = std::fs::canonicalize(path)
+                .ok()
+                .and_then(|p| p.to_str().map(|s| s.to_string()))
+                .unwrap_or_else(|| path.to_string());
+
+            let mut registry = DATABASE_MANAGER.lock();
+            registry.insert(canonical_path, Arc::downgrade(db));
+        }
+
+        Ok(result)
     }
 
     #[allow(clippy::arc_with_non_send_sync)]
@@ -526,19 +617,33 @@ impl Database {
         opts: DatabaseOpts,
         encryption_opts: Option<EncryptionOpts>,
     ) -> Result<Arc<Database>> {
-        Self::open_with_flags_bypass_registry_internal(
-            io,
-            path,
-            wal_path,
-            db_file,
-            flags,
-            opts,
-            encryption_opts,
-        )
+        let mut state = OpenDbAsyncState::new();
+        loop {
+            match Self::open_with_flags_bypass_registry_async(
+                &mut state,
+                io.clone(),
+                path,
+                wal_path,
+                db_file.clone(),
+                flags,
+                opts,
+                encryption_opts.clone(),
+            )? {
+                IOResult::Done(db) => return Ok(db),
+                IOResult::IO(io_completion) => {
+                    io_completion.wait(&*io)?;
+                }
+            }
+        }
     }
 
+    /// Async version of database opening that returns IOResult.
+    /// Caller must drive the IO loop and pass state between calls.
+    /// This is useful for sync engine which needs to yield on IO.
     #[allow(clippy::arc_with_non_send_sync)]
-    fn open_with_flags_bypass_registry_internal(
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_with_flags_bypass_registry_async(
+        state: &mut OpenDbAsyncState,
         io: Arc<dyn IO>,
         path: &str,
         wal_path: &str,
@@ -546,72 +651,162 @@ impl Database {
         flags: OpenFlags,
         opts: DatabaseOpts,
         encryption_opts: Option<EncryptionOpts>,
-    ) -> Result<Arc<Database>> {
-        // Parse encryption key from encryption_opts if provided
-        let encryption_key = if let Some(ref enc_opts) = encryption_opts {
-            Some(EncryptionKey::from_hex_string(&enc_opts.hexkey)?)
-        } else {
-            None
-        };
-
-        let mut db = Self::new(
-            opts,
-            flags,
-            path,
-            wal_path,
-            &io,
-            db_file,
-            encryption_opts.clone(),
-        )?;
-
-        let pager = db.header_validation(encryption_key.as_ref())?;
-        #[cfg(debug_assertions)]
-        {
-            let wal_enabled = db.shared_wal.read().enabled.load(Ordering::SeqCst);
-            let mv_store_enabled = db.get_mv_store().is_some();
-            assert!(
-                db.is_readonly() || wal_enabled || mv_store_enabled,
-                "Either WAL or MVStore must be enabled"
+    ) -> Result<IOResult<Arc<Database>>> {
+        loop {
+            tracing::info!(
+                "open_with_flags_bypass_registry_async: state.phase={:?}",
+                state.phase
             );
-        }
+            match &state.phase {
+                OpenDbAsyncPhase::Init => {
+                    // Parse encryption key from encryption_opts if provided
+                    let encryption_key = if let Some(ref enc_opts) = encryption_opts {
+                        Some(EncryptionKey::from_hex_string(&enc_opts.hexkey)?)
+                    } else {
+                        None
+                    };
 
-        let db = Arc::new(db);
+                    let mut db = Self::new(
+                        opts,
+                        flags,
+                        path,
+                        wal_path,
+                        &io,
+                        db_file.clone(),
+                        encryption_opts.clone(),
+                    )?;
 
-        // Check: https://github.com/tursodatabase/turso/pull/1761#discussion_r2154013123
+                    let pager = db.header_validation(encryption_key.as_ref())?;
 
-        // parse schema
-        let conn = db._connect(false, Some(pager.clone()), encryption_key.clone())?;
-        let syms = conn.syms.read();
-        let pager = conn.pager.load();
+                    #[cfg(debug_assertions)]
+                    {
+                        let wal_enabled = db.shared_wal.read().enabled.load(Ordering::SeqCst);
+                        let mv_store_enabled = db.get_mv_store().is_some();
+                        assert!(
+                            db.is_readonly() || wal_enabled || mv_store_enabled,
+                            "Either WAL or MVStore must be enabled"
+                        );
+                    }
 
-        let enable_triggers = db.opts.enable_triggers;
-        db.with_schema_mut(|schema| {
-            let header_schema_cookie = pager
-                .io
-                .block(|| pager.with_header(|header| header.schema_cookie.get()))?;
-            schema.schema_version = header_schema_cookie;
-            let result = schema
-                .make_from_btree(None, pager.clone(), &syms, enable_triggers)
-                .inspect_err(|_| pager.end_read_tx());
-            match result {
-                Err(LimboError::ExtensionError(e)) => {
-                    // this means that a vtab exists and we no longer have the module loaded. we print
-                    // a warning to the user to load the module
-                    eprintln!("Warning: {e}");
+                    // Wrap db in Arc before connecting
+                    let db = Arc::new(db);
+                    let conn = db._connect(false, Some(pager.clone()), encryption_key.clone())?;
+
+                    // Acquire schema lock and hold it through ReadingHeader and LoadingSchema phases
+                    // to ensure schema_version and make_from_btree are atomic
+                    let guard = db.schema.lock_arc();
+
+                    tracing::info!("indexes: {}", guard.indexes.len());
+                    state.db = Some(db);
+                    state.pager = Some(pager);
+                    state.conn = Some(conn);
+                    state.encryption_key = encryption_key;
+                    state.schema_guard = Some(guard);
+
+                    state.phase = OpenDbAsyncPhase::ReadingHeader;
                 }
-                Err(e) => return Err(e),
-                _ => {}
+
+                OpenDbAsyncPhase::ReadingHeader => {
+                    let pager = state
+                        .pager
+                        .as_ref()
+                        .expect("pager must be initialized in Init phase");
+                    let header_schema_cookie = return_if_io!(pager
+                        .with_header(|header| header.schema_cookie.get())
+                        .inspect_err(|_| state.schema_guard = None));
+                    let guard = state
+                        .schema_guard
+                        .as_mut()
+                        .expect("schema_guard must be acquired in Init phase");
+                    let schema = Arc::make_mut(&mut **guard);
+                    schema.schema_version = header_schema_cookie;
+
+                    state.phase = OpenDbAsyncPhase::LoadingSchema;
+                }
+
+                OpenDbAsyncPhase::LoadingSchema => {
+                    let db = state
+                        .db
+                        .as_ref()
+                        .expect("db must be initialized in Init phase");
+                    let pager = state
+                        .pager
+                        .as_ref()
+                        .expect("pager must be initialized in Init phase");
+                    let conn = state
+                        .conn
+                        .as_ref()
+                        .expect("conn must be initialized in Init phase");
+                    let syms = conn.syms.read();
+                    let enable_triggers = db.opts.enable_triggers;
+
+                    let guard = state
+                        .schema_guard
+                        .as_mut()
+                        .expect("schema_guard must be acquired in Init phase");
+                    let schema = Arc::make_mut(&mut **guard);
+
+                    let result = schema.make_from_btree(
+                        &mut state.make_from_btree_state,
+                        None,
+                        pager.clone(),
+                        &syms,
+                        enable_triggers,
+                    );
+
+                    match result {
+                        Ok(IOResult::IO(io)) => return Ok(IOResult::IO(io)),
+                        Ok(IOResult::Done(())) => {
+                            // Release the schema lock
+                            state.schema_guard = None;
+                        }
+                        Err(LimboError::ExtensionError(e)) => {
+                            // this means that a vtab exists and we no longer have the module loaded.
+                            // we print a warning to the user to load the module
+                            state.make_from_btree_state.cleanup(pager);
+                            state.schema_guard = None;
+                            eprintln!("Warning: {e}");
+                        }
+                        Err(e) => {
+                            state.make_from_btree_state.cleanup(pager);
+                            state.schema_guard = None;
+                            return Err(e);
+                        }
+                    }
+
+                    state.phase = OpenDbAsyncPhase::BootstrapMvStore;
+                }
+
+                OpenDbAsyncPhase::BootstrapMvStore => {
+                    let db = state
+                        .db
+                        .as_ref()
+                        .expect("db must be initialized in Init phase");
+                    let pager = state
+                        .pager
+                        .as_ref()
+                        .expect("pager must be initialized in Init phase");
+
+                    if let Some(mv_store) = db.get_mv_store().as_ref() {
+                        let mvcc_bootstrap_conn =
+                            db._connect(true, Some(pager.clone()), state.encryption_key.clone())?;
+                        mv_store.bootstrap(mvcc_bootstrap_conn)?;
+                    }
+
+                    state.phase = OpenDbAsyncPhase::Done;
+                    return Ok(IOResult::Done(
+                        state
+                            .db
+                            .take()
+                            .expect("db must be initialized in Init phase"),
+                    ));
+                }
+
+                OpenDbAsyncPhase::Done => {
+                    panic!("open_with_flags_bypass_registry_async called after completion");
+                }
             }
-
-            Ok(())
-        })?;
-
-        if let Some(mv_store) = db.get_mv_store().as_ref() {
-            let mvcc_bootstrap_conn = db._connect(true, Some(pager.clone()), encryption_key)?;
-            mv_store.bootstrap(mvcc_bootstrap_conn)?;
         }
-
-        Ok(db)
     }
 
     /// Necessary Pager initialization, so that we are prepared to read from Page 1.
