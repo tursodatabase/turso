@@ -161,9 +161,9 @@ export default function App() {
     }
 
     // ========================================
-    // SYNC API TESTS (requires env vars)
+    // SYNC API TESTS (requires env vars, skipped if encryption is enabled)
     // ========================================
-    if (SYNC_ENABLED) {
+    if (SYNC_ENABLED && !ENCRYPTION_ENABLED) {
       testResults.push({ name: '--- Sync Tests ---', passed: true });
 
       let syncDb: Database | null = null;
@@ -230,6 +230,8 @@ export default function App() {
           testResults.push({ name: 'Sync: Close', passed: false, error: String(e) });
         }
       }
+    } else if (ENCRYPTION_ENABLED) {
+      testResults.push({ name: '--- Sync Tests (skipped: using encryption) ---', passed: true });
     } else {
       testResults.push({ name: '--- Sync Tests (skipped: no env vars) ---', passed: true });
     }

@@ -25,7 +25,7 @@ To test the sync API (pull/push), set the following environment variables before
 ```sh
 TURSO_DATABASE_URL=libsql://your-db.turso.io \
 TURSO_AUTH_TOKEN=your-auth-token \
-npm start
+npm start -- --reset-cache
 ```
 
 ### Testing Encryption (Optional)
@@ -37,10 +37,12 @@ TURSO_DATABASE_URL=libsql://your-db.turso.io \
 TURSO_AUTH_TOKEN=your-auth-token \
 TURSO_ENCRYPTION_KEY=your-base64-encryption-key \
 TURSO_ENCRYPTION_CIPHER=aes256gcm \
-npm start
+npm start -- --reset-cache
 ```
 
 Supported ciphers: `aes256gcm`, `aes128gcm`, `chacha20poly1305` (default: `aes256gcm`)
+
+> **Important**: Environment variables are inlined at build time by Babel. If you change env vars, you **must** reset Metro's cache with `--reset-cache`, otherwise the old values will be used.
 
 ## Step 2: Build and run your app
 
