@@ -82,6 +82,12 @@ pub trait SqlBackend: Send + Sync {
     /// Return the set of capabilities this backend supports
     fn capabilities(&self) -> HashSet<Capability>;
 
+    /// Whether this backend supports snapshot tests (EXPLAIN output comparison).
+    /// Returns false by default; only the Rust backend enables this.
+    fn supports_snapshots(&self) -> bool {
+        false
+    }
+
     /// Create a new isolated database instance
     async fn create_database(
         &self,

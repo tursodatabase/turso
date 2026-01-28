@@ -97,7 +97,7 @@ impl Statement {
     }
 
     pub fn set_mv_tx(&mut self, mv_tx: Option<(u64, TransactionMode)>) {
-        *self.program.connection.mv_tx.write() = mv_tx;
+        self.program.connection.set_mv_tx(mv_tx);
     }
 
     pub fn interrupt(&mut self) {
@@ -113,6 +113,14 @@ impl Statement {
     }
 
     fn _step(&mut self, waker: Option<&Waker>) -> Result<StepResult> {
+        if matches!(self.state.execution_state, ProgramExecutionState::Init)
+            && !self
+                .program
+                .prepare_context
+                .matches_connection(&self.program.connection)
+        {
+            self.reprepare()?;
+        }
         // If we're waiting for a busy handler timeout, check if we can proceed
         if let Some(busy_state) = self.busy_handler_state.as_ref() {
             if self.pager.io.current_time_monotonic() < busy_state.timeout() {
@@ -354,7 +362,60 @@ impl Statement {
         }
     }
 
-    pub fn get_column_type(&self, idx: usize) -> Option<String> {
+    /// Returns the declared type of a result column.
+    ///
+    /// This behaves similarly to SQLite's `sqlite3_column_decltype()`:
+    /// If the Nth column of the returned result set of a SELECT is a table column
+    /// (not an expression or subquery) then the declared type of the table column
+    /// is returned. If the Nth column of the result set is an expression or subquery,
+    /// then None is returned. The returned string is always UTF-8 encoded.
+    ///
+    /// See: <https://sqlite.org/c3ref/column_decltype.html>
+    pub fn get_column_decltype(&self, idx: usize) -> Option<String> {
+        if self.query_mode == QueryMode::Explain {
+            return Some(
+                EXPLAIN_COLUMNS_TYPE
+                    .get(idx)
+                    .expect("No column")
+                    .to_string(),
+            );
+        }
+        if self.query_mode == QueryMode::ExplainQueryPlan {
+            return Some(
+                EXPLAIN_QUERY_PLAN_COLUMNS_TYPE
+                    .get(idx)
+                    .expect("No column")
+                    .to_string(),
+            );
+        }
+        let column = &self.program.result_columns.get(idx).expect("No column");
+        match &column.expr {
+            turso_parser::ast::Expr::Column {
+                table,
+                column: column_idx,
+                ..
+            } => {
+                let (_, table_ref) = self
+                    .program
+                    .table_references
+                    .find_table_by_internal_id(*table)?;
+                let table_column = table_ref.get_column_at(*column_idx)?;
+                let ty_str = &table_column.ty_str;
+                if ty_str.is_empty() {
+                    None
+                } else {
+                    Some(ty_str.clone())
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Returns the type affinity name of a result column (e.g., "INTEGER", "TEXT", "REAL", "BLOB", "NUMERIC").
+    ///
+    /// Unlike `get_column_decltype` which returns the original declared type string,
+    /// this method returns the normalized SQLite type affinity name.
+    pub fn get_column_type_name(&self, idx: usize) -> Option<String> {
         if self.query_mode == QueryMode::Explain {
             return Some(
                 EXPLAIN_COLUMNS_TYPE

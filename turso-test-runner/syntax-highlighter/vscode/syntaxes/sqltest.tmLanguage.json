@@ -5,9 +5,11 @@
   "patterns": [
     { "include": "#comment" },
     { "include": "#database-declaration" },
+    { "include": "#file-directive" },
     { "include": "#setup-block" },
     { "include": "#test-decorator" },
     { "include": "#test-block" },
+    { "include": "#snapshot-block" },
     { "include": "#expect-block" }
   ],
   "repository": {
@@ -37,6 +39,72 @@
         }
       ]
     },
+    "file-directive": {
+      "patterns": [
+        { "include": "#directive-skip-file" },
+        { "include": "#directive-skip-file-if" },
+        { "include": "#directive-requires-file" }
+      ]
+    },
+    "directive-skip-file": {
+      "name": "meta.directive.skip-file.sqltest",
+      "begin": "(@skip-file)\\s+(\")",
+      "beginCaptures": {
+        "1": { "name": "keyword.control.directive.sqltest" },
+        "2": { "name": "punctuation.definition.string.begin.sqltest" }
+      },
+      "end": "(\")",
+      "endCaptures": {
+        "1": { "name": "punctuation.definition.string.end.sqltest" }
+      },
+      "contentName": "string.quoted.double.sqltest",
+      "patterns": [
+        {
+          "name": "constant.character.escape.sqltest",
+          "match": "\\\\."
+        }
+      ]
+    },
+    "directive-skip-file-if": {
+      "name": "meta.directive.skip-file-if.sqltest",
+      "begin": "(@skip-file-if)\\s+(mvcc)\\s+(\")",
+      "beginCaptures": {
+        "1": { "name": "keyword.control.directive.sqltest" },
+        "2": { "name": "constant.language.sqltest" },
+        "3": { "name": "punctuation.definition.string.begin.sqltest" }
+      },
+      "end": "(\")",
+      "endCaptures": {
+        "1": { "name": "punctuation.definition.string.end.sqltest" }
+      },
+      "contentName": "string.quoted.double.sqltest",
+      "patterns": [
+        {
+          "name": "constant.character.escape.sqltest",
+          "match": "\\\\."
+        }
+      ]
+    },
+    "directive-requires-file": {
+      "name": "meta.directive.requires-file.sqltest",
+      "begin": "(@requires-file)\\s+(trigger|strict|materialized_views)\\s+(\")",
+      "beginCaptures": {
+        "1": { "name": "keyword.control.directive.sqltest" },
+        "2": { "name": "constant.language.sqltest" },
+        "3": { "name": "punctuation.definition.string.begin.sqltest" }
+      },
+      "end": "(\")",
+      "endCaptures": {
+        "1": { "name": "punctuation.definition.string.end.sqltest" }
+      },
+      "contentName": "string.quoted.double.sqltest",
+      "patterns": [
+        {
+          "name": "constant.character.escape.sqltest",
+          "match": "\\\\."
+        }
+      ]
+    },
     "setup-block": {
       "name": "meta.setup-block.sqltest",
       "begin": "\\b(setup)\\s+([a-zA-Z_][a-zA-Z0-9_-]*)\\s*(\\{)",
@@ -59,7 +127,8 @@
         { "include": "#decorator-setup" },
         { "include": "#decorator-skip" },
         { "include": "#decorator-skip-if" },
-        { "include": "#decorator-backend" }
+        { "include": "#decorator-backend" },
+        { "include": "#decorator-requires" }
       ]
     },
     "decorator-setup": {
@@ -117,9 +186,46 @@
         "2": { "name": "constant.language.sqltest" }
       }
     },
+    "decorator-requires": {
+      "name": "meta.decorator.requires.sqltest",
+      "begin": "(@requires)\\s+(trigger|strict|materialized_views)\\s+(\")",
+      "beginCaptures": {
+        "1": { "name": "keyword.control.directive.sqltest" },
+        "2": { "name": "constant.language.sqltest" },
+        "3": { "name": "punctuation.definition.string.begin.sqltest" }
+      },
+      "end": "(\")",
+      "endCaptures": {
+        "1": { "name": "punctuation.definition.string.end.sqltest" }
+      },
+      "contentName": "string.quoted.double.sqltest",
+      "patterns": [
+        {
+          "name": "constant.character.escape.sqltest",
+          "match": "\\\\."
+        }
+      ]
+    },
     "test-block": {
       "name": "meta.test-block.sqltest",
       "begin": "\\b(test)\\s+([a-zA-Z_][a-zA-Z0-9_-]*)\\s*(\\{)",
+      "beginCaptures": {
+        "1": { "name": "keyword.control.sqltest" },
+        "2": { "name": "entity.name.function.sqltest" },
+        "3": { "name": "punctuation.section.block.begin.sqltest" }
+      },
+      "end": "(\\})",
+      "endCaptures": {
+        "1": { "name": "punctuation.section.block.end.sqltest" }
+      },
+      "contentName": "source.sql",
+      "patterns": [
+        { "include": "source.sql" }
+      ]
+    },
+    "snapshot-block": {
+      "name": "meta.snapshot-block.sqltest",
+      "begin": "\\b(snapshot)\\s+([a-zA-Z_][a-zA-Z0-9_-]*)\\s*(\\{)",
       "beginCaptures": {
         "1": { "name": "keyword.control.sqltest" },
         "2": { "name": "entity.name.function.sqltest" },

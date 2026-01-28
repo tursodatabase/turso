@@ -1358,6 +1358,8 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
                 _ => unreachable!("btree tables are indexed by integers!"),
             };
             let inclusive = true;
+
+            // Check MVCC first
             let rowid = self.db.seek_rowid(
                 RowID {
                     table_id: self.table_id,
@@ -1368,7 +1370,8 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
                 self.tx_id,
                 &mut self.table_iterator,
             );
-            let exists = if let Some(rowid) = &rowid {
+
+            let mvcc_exists = if let Some(rowid) = &rowid {
                 let RowKey::Int(rowid) = rowid.row_id else {
                     panic!("Rowid is not an integer in mvcc table cursor");
                 };
@@ -1376,8 +1379,14 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
             } else {
                 false
             };
-            tracing::trace!("Row exists: {exists} find={int_key} got={rowid:?}");
-            if exists {
+
+            tracing::trace!(
+                "MVCC exists check: mvcc_exists={mvcc_exists} find={int_key} got={rowid:?}"
+            );
+
+            // If found in MVCC, update dual_peek and return true
+            if mvcc_exists {
+                self.dual_peek.mvcc_peek = CursorPeek::Row(RowKey::Int(*int_key));
                 self.current_pos = CursorPosition::Loaded {
                     row_id: RowID {
                         table_id: self.table_id,
@@ -1386,11 +1395,15 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
                     in_btree: false,
                 };
                 self.state = None;
-                return Ok(IOResult::Done(exists));
-            } else if self.is_btree_allocated() {
+                return Ok(IOResult::Done(true));
+            }
+
+            // MVCC doesn't have it, but we need to check B-tree too
+            if self.is_btree_allocated() {
                 self.state
                     .replace(MvccLazyCursorState::Exists(ExistsState::ExistsBtree));
             } else {
+                // No B-tree allocated, row doesn't exist
                 self.state = None;
                 return Ok(IOResult::Done(false));
             }
@@ -1403,9 +1416,44 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
             self.is_btree_allocated(),
             "BTree should be allocated when we are in ExistsBtree state"
         );
-        self.state = None;
+
+        // Check if row exists in B-tree
         let found = return_if_io!(self.btree_cursor.exists(key));
-        Ok(IOResult::Done(found))
+
+        if found {
+            // Found in B-tree, but need to verify it's not shadowed by MVCC tombstone
+            let int_key = match key {
+                Value::Integer(i) => *i,
+                _ => unreachable!("btree tables are indexed by integers!"),
+            };
+            let row_key = RowKey::Int(int_key);
+
+            // Check if this B-tree row is shadowed (deleted/updated) in MVCC
+            let is_valid = self.query_btree_version_is_valid(&row_key);
+
+            if is_valid {
+                // B-tree row is visible (not shadowed), update dual_peek
+                self.dual_peek.btree_peek = CursorPeek::Row(row_key.clone());
+                self.current_pos = CursorPosition::Loaded {
+                    row_id: RowID {
+                        table_id: self.table_id,
+                        row_id: row_key,
+                    },
+                    in_btree: true,
+                };
+                self.state = None;
+                Ok(IOResult::Done(true))
+            } else {
+                // B-tree row is shadowed by MVCC (tombstone or update), so it doesn't exist
+                tracing::trace!("B-tree row {int_key} is shadowed by MVCC");
+                self.state = None;
+                Ok(IOResult::Done(false))
+            }
+        } else {
+            // Not found in B-tree either
+            self.state = None;
+            Ok(IOResult::Done(false))
+        }
     }
 
     fn clear_btree(&mut self) -> Result<IOResult<Option<usize>>> {

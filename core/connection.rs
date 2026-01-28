@@ -1,7 +1,7 @@
 #[cfg(target_family = "windows")]
 use crate::error::CompletionError;
 use crate::sync::{
-    atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU16, Ordering},
+    atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU16, AtomicU64, Ordering},
     Arc, RwLock,
 };
 #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
@@ -28,6 +28,32 @@ use std::fmt::Display;
 use std::ops::Deref;
 use tracing::{instrument, Level};
 
+/// Database connection handle.
+///
+/// # Compile-Affecting Fields
+///
+/// The following fields affect SQL statement compilation and are tracked by `PrepareContext`
+/// in `vdbe/mod.rs`. If you add a new field that affects how statements are compiled or
+/// executed, you MUST also update `PrepareContext::from_connection()` to include it
+/// in core/vdbe/mod.rs.
+/// Failure to do so will cause stale cached statements to be used incorrectly.
+///
+/// Currently tracked fields:
+/// - `db` (via database pointer identity)
+/// - `fk_pragma` (foreign_keys)
+/// - `query_only`
+/// - `capture_data_changes`
+/// - `syms` / `syms_generation` (registered functions, virtual tables, etc.)
+/// - `attached_databases` (via fingerprint)
+/// - `busy_handler` (timeout affects retry behavior)
+/// - `cache_size`
+/// - `page_size`
+/// - `sync_mode`
+/// - `data_sync_retry`
+/// - `encryption_key` (whether set)
+/// - `encryption_cipher_mode`
+/// - Pager's `spill_enabled` setting
+/// - MVCC checkpoint threshold (when MVCC enabled)
 pub struct Connection {
     pub(crate) db: Arc<Database>,
     pub(crate) pager: ArcSwap<Pager>,
@@ -42,6 +68,7 @@ pub struct Connection {
     pub(crate) last_change: AtomicI64,
     pub(crate) total_changes: AtomicI64,
     pub(crate) syms: parking_lot::RwLock<SymbolTable>,
+    pub(crate) syms_generation: AtomicU64,
     pub(super) _shared_cache: bool,
     pub(super) cache_size: AtomicI32,
     /// page size used for an uninitialized database or the next vacuum command.
@@ -89,6 +116,13 @@ pub struct Connection {
     pub(crate) fk_deferred_violations: AtomicIsize,
     /// Track when each virtual table instance is currently in transaction.
     pub(crate) vtab_txn_states: RwLock<HashSet<u64>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AttachedDatabasesFingerprint {
+    pub(crate) count: usize,
+    pub(crate) hash1: u64,
+    pub(crate) hash2: u64,
 }
 
 // SAFETY: This needs to be audited for thread safety.
@@ -1323,6 +1357,58 @@ impl Connection {
         }
     }
 
+    pub(crate) fn attached_databases_fingerprint(&self) -> AttachedDatabasesFingerprint {
+        const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+        const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+        fn hash_bytes(mut hash: u64, bytes: &[u8]) -> u64 {
+            for &byte in bytes {
+                hash ^= byte as u64;
+                hash = hash.wrapping_mul(FNV_PRIME);
+            }
+            hash
+        }
+
+        fn hash_u64(hash: u64, value: u64) -> u64 {
+            hash_bytes(hash, &value.to_le_bytes())
+        }
+
+        fn hash_entry(index: usize, alias: &str, db_ptr: usize) -> u64 {
+            let mut hash = FNV_OFFSET_BASIS;
+            hash = hash_u64(hash, index as u64);
+            hash = hash_bytes(hash, alias.as_bytes());
+            hash_u64(hash, db_ptr as u64)
+        }
+
+        let attached = self.attached_databases.read();
+        if attached.name_to_index.is_empty() {
+            return AttachedDatabasesFingerprint {
+                count: 0,
+                hash1: 0,
+                hash2: 0,
+            };
+        }
+
+        let mut hash1 = 0u64;
+        let mut hash2 = 0u64;
+        for (alias, &index) in attached.name_to_index.iter() {
+            let db_ptr = attached
+                .index_to_data
+                .get(&index)
+                .map(|(db, _pager)| Arc::as_ptr(db) as usize)
+                .unwrap_or(0);
+            let entry_hash = hash_entry(index, alias.as_str(), db_ptr);
+            hash1 = hash1.wrapping_add(entry_hash);
+            hash2 ^= entry_hash.rotate_left(17);
+        }
+
+        AttachedDatabasesFingerprint {
+            count: attached.name_to_index.len(),
+            hash1,
+            hash2,
+        }
+    }
+
     /// List all databases (main + attached) with their sequence numbers, names, and file paths
     /// Returns a vector of tuples: (seq_number, name, file_path)
     pub fn list_all_databases(&self) -> Vec<(usize, String, String)> {
@@ -1400,6 +1486,14 @@ impl Connection {
     /// Creates a HashSet of modules that have been loaded
     pub fn get_syms_vtab_mods(&self) -> HashSet<String> {
         self.syms.read().vtab_modules.keys().cloned().collect()
+    }
+
+    pub(crate) fn syms_generation(&self) -> u64 {
+        self.syms_generation.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn database_ptr(&self) -> usize {
+        Arc::as_ptr(&self.db) as usize
     }
 
     pub fn set_encryption_key(&self, key: EncryptionKey) -> Result<()> {
@@ -1506,7 +1600,9 @@ impl Connection {
         *self.mv_tx.read()
     }
 
+    #[inline(always)]
     pub(crate) fn set_mv_tx(&self, tx_id_and_mode: Option<(u64, TransactionMode)>) {
+        tracing::debug!("set_mv_tx: {:?}", tx_id_and_mode);
         *self.mv_tx.write() = tx_id_and_mode;
     }
 

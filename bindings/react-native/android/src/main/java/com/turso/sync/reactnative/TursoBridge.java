@@ -1,4 +1,4 @@
-package com.turso.reactnative;
+package com.turso.sync.reactnative;
 
 import com.facebook.react.bridge.ReactContext;
 import com.facebook.react.turbomodule.core.CallInvokerHolderImpl;

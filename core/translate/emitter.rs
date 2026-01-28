@@ -20,7 +20,8 @@ use super::main_loop::{
 };
 use super::order_by::{emit_order_by, init_order_by, SortMetadata};
 use super::plan::{
-    Distinctness, JoinOrderMember, Operation, Scan, SelectPlan, TableReferences, UpdatePlan,
+    Distinctness, JoinOrderMember, Operation, Scan, SeekKeyComponent, SelectPlan, TableReferences,
+    UpdatePlan,
 };
 use super::select::emit_simple_count;
 use super::subquery::emit_from_clause_subqueries;
@@ -39,8 +40,8 @@ use crate::translate::fkeys::{
     open_read_table, stabilize_new_row_for_fk,
 };
 use crate::translate::plan::{
-    DeletePlan, EphemeralRowidMode, EvalAt, JoinedTable, Plan, QueryDestination, ResultSetColumn,
-    Search,
+    DeletePlan, EphemeralRowidMode, EvalAt, IndexMethodQuery, JoinedTable, Plan, QueryDestination,
+    ResultSetColumn, Search,
 };
 use crate::translate::planner::ROWID_STRS;
 use crate::translate::planner::{table_mask_from_expr, TableMask};
@@ -450,10 +451,45 @@ fn emit_materialized_build_inputs(
                 )
             });
 
-            if build_table_was_prior_probe {
-                // Prior probe -> build chaining requires keys+payload so we don't SeekRowid.
-                let (_, included_tables) =
-                    materialization_prefix(plan, hash_join_op.build_table_idx, probe_table_idx)?;
+            // The join prefix is the set of tables we include when building this hash
+            // input (all tables before the probe + the build table). If the prefix
+            // has *any* table besides the build table, then rowid-only materialization
+            // is unsafe. Here's why:
+            //
+            // Rowid-only keeps each build-table rowid at most once. That throws away
+            // which prefix row it came from, so we lose the one-to-one link between
+            // a prefix match and a build row.
+            //
+            // Example (t1 is a left-side table earlier in the join order):
+            //   t1 rows:     t1_1(c=1), t1_2(c=2)
+            //   t2 rows:     t2_7(c=1), t2_8(c=2)   (build table)
+            //   t3 rows:     one row per t2 row
+            //
+            // Correct result after joining:
+            //   t1_1 + t2_7 + t2_7's t3 row
+            //   t1_2 + t2_8 + t2_8's t3 row   (2 rows)
+            //
+            // Key+payload materialization lets us PRUNE the prefix tables (like t1)
+            // from the main join order, because their needed columns now live in
+            // the payload. So the main plan does NOT loop t1 again.
+            //
+            // However, rowid-only materialization keeps just {t2_7, t2_8} with no link to t1_1/t1_2.
+            // Since t1 stays in the main join loop, each t1 row joins against the
+            // materialized t2 set. With no t1→t2 correlation, every t1 row matches
+            // both t2 rows, incorrectly producing 4 rows (a cross product).
+            //
+            // Therefore: if the prefix has other tables, we must store key+payload
+            // rows so each prefix match stays distinct and the main plan can drop
+            // the prefix loops.
+            let (_, included_tables) =
+                materialization_prefix(plan, hash_join_op.build_table_idx, probe_table_idx)?;
+            let prefix_has_other_tables = included_tables
+                .iter()
+                .any(|table_idx| *table_idx != hash_join_op.build_table_idx);
+
+            if build_table_was_prior_probe || prefix_has_other_tables {
+                // Prior probe -> build chaining OR any multi-table prefix requires keys+payload
+                // so we do not lose multiplicity or correlation.
                 let payload_columns = collect_materialized_payload_columns(plan, &included_tables)?;
                 let key_exprs: Vec<Expr> = hash_join_op
                     .join_keys
@@ -473,7 +509,8 @@ fn emit_materialized_build_inputs(
                     payload_columns,
                 });
             } else {
-                // Otherwise a rowid list is enough to preserve build-side filters.
+                // Single-table prefix: a rowid list preserves the build-side filters
+                // without losing multiplicity (as explained in the comment above).
                 materializations.push(MaterializationSpec {
                     build_table_idx: hash_join_op.build_table_idx,
                     probe_table_idx,
@@ -794,6 +831,8 @@ fn build_materialized_input_columns(
 }
 
 /// Construct a SELECT plan that materializes build-side inputs into an ephemeral table.
+/// This plan is separate from the main query plan and is exclusively used for the materialization.
+/// process.
 ///
 /// The join order is the original prefix up to (but excluding) the probe table, plus
 /// the build table itself. This filters build rows using only prior join constraints
@@ -810,10 +849,26 @@ fn build_materialized_build_input_plan(
     payload_columns: &[MaterializedColumnRef],
     materialized_build_inputs: &HashMap<usize, MaterializedBuildInput>,
 ) -> Result<SelectPlan> {
+    // Build a materialization subplan that only includes the join prefix
+    // (all tables prior to the probe + the build table). The resulting plan
+    // is smaller than the original select plan, so any access methods or
+    // predicates that depend on tables outside this prefix must be dropped.
     let (join_order, included_tables) =
         materialization_prefix(plan, build_table_idx, probe_table_idx)?;
-    let included_mask = TableMask::from_table_number_iter(included_tables.into_iter());
+    // Bitmask of tables that are actually in the prefix join order for
+    // this materialization subplan. Anything that depends on other tables
+    // cannot be evaluated during those table scans.
+    let join_prefix_mask =
+        TableMask::from_table_number_iter(join_order.iter().map(|m| m.original_idx));
+    // Expressions can also reference build tables of earlier hash joins in this subplan,
+    // because those tables are available during probe loops. Use the broader "included"
+    // set when deciding which WHERE terms can be evaluated inside the materialization.
+    let eval_prefix_mask = TableMask::from_table_number_iter(included_tables.iter().copied());
 
+    // Clone WHERE terms but mark as "consumed" any term that needs tables
+    // outside the prefix. This prevents the subplan from trying to evaluate
+    // predicates it doesn't have access to (e.g. autoindex lookups that
+    // would require non-prefix tables to bind parameters).
     let mut where_clause = plan.where_clause.clone();
     for term in where_clause.iter_mut() {
         let mask = table_mask_from_expr(
@@ -821,10 +876,15 @@ fn build_materialized_build_input_plan(
             &plan.table_references,
             &plan.non_from_clause_subqueries,
         )?;
-        // Preserve consumed terms that the optimizer already suppressed.
-        term.consumed |= !included_mask.contains_all(&mask);
+        let outside_prefix = !eval_prefix_mask.contains_all(&mask);
+        // Preserve consumed terms that the optimizer already suppressed, and
+        // additionally consume any term that depends on tables outside the prefix.
+        term.consumed |= outside_prefix;
     }
 
+    // Clone table references and then "sanitize" each access method so that
+    // the materialization subplan does not try to use an access path that
+    // requires tables outside the prefix. If it does, we fall back to a scan.
     let mut table_references = plan.table_references.clone();
     for joined_table in table_references.joined_tables_mut().iter_mut() {
         if let Operation::HashJoin(hash_join_op) = &mut joined_table.op {
@@ -838,6 +898,94 @@ fn build_materialized_build_input_plan(
                 // disable hash joins anchored on it.
                 joined_table.op = Operation::default_scan_for(&joined_table.table);
             }
+        }
+    }
+
+    // Helper to decide whether an expression depends on tables outside
+    // the prefix. If it does, any access method that relies on that
+    // expression must be invalidated for the materialization subplan.
+    let expr_depends_outside_prefix = |expr: &Expr| -> Result<bool> {
+        let mask = table_mask_from_expr(
+            expr,
+            &plan.table_references,
+            &plan.non_from_clause_subqueries,
+        )?;
+        Ok(!join_prefix_mask.contains_all(&mask))
+    };
+
+    // Walk each table in the cloned plan and ensure its access method is
+    // valid within the prefix. If the access method depends on tables
+    // outside the prefix, downgrade to a plain scan.
+    for (table_idx, joined_table) in table_references.joined_tables_mut().iter_mut().enumerate() {
+        if !join_prefix_mask.contains_table(table_idx) {
+            continue;
+        }
+
+        let mut reset_op = false;
+        match &joined_table.op {
+            Operation::Search(Search::RowidEq { cmp_expr }) => {
+                // Rowid equality searches may depend on other tables (e.g. column = other.col).
+                reset_op = expr_depends_outside_prefix(cmp_expr)?;
+            }
+            Operation::Search(Search::Seek { seek_def, .. }) => {
+                // Seek keys can include expressions bound by other tables. If so,
+                // the seek is not valid in the prefix-only subplan.
+                for component in seek_def.iter(&seek_def.start) {
+                    if let SeekKeyComponent::Expr(expr) = component {
+                        if expr_depends_outside_prefix(expr)? {
+                            reset_op = true;
+                            break;
+                        }
+                    }
+                }
+                if !reset_op {
+                    for component in seek_def.iter(&seek_def.end) {
+                        if let SeekKeyComponent::Expr(expr) = component {
+                            if expr_depends_outside_prefix(expr)? {
+                                reset_op = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            Operation::IndexMethodQuery(IndexMethodQuery { arguments, .. }) => {
+                // Index method queries are driven by argument expressions.
+                // If any argument depends on non-prefix tables, we cannot use it.
+                for expr in arguments {
+                    if expr_depends_outside_prefix(expr)? {
+                        reset_op = true;
+                        break;
+                    }
+                }
+            }
+            Operation::Scan(Scan::VirtualTable { constraints, .. }) => {
+                // Virtual table constraints are evaluated against expressions.
+                // If any constraint depends on non-prefix tables, drop the scan
+                // specialization and fall back to a full scan.
+                for expr in constraints {
+                    if expr_depends_outside_prefix(expr)? {
+                        reset_op = true;
+                        break;
+                    }
+                }
+            }
+            Operation::HashJoin(hash_join_op) => {
+                // Hash joins are driven by the probe table's loop. That probe table
+                // must be in the prefix; otherwise the hash join cannot be evaluated
+                // inside this subplan. The build table may live outside the prefix
+                // because the hash build phase scans it independently.
+                if !join_prefix_mask.contains_table(hash_join_op.probe_table_idx) {
+                    reset_op = true;
+                }
+            }
+            _ => {}
+        }
+
+        if reset_op {
+            // Downgrade to a default scan. This ensures the subplan only uses
+            // access paths that are valid within the prefix join order.
+            joined_table.op = Operation::default_scan_for(&joined_table.table);
         }
     }
 
@@ -1033,6 +1181,11 @@ pub fn emit_query<'a>(
     };
     if let Distinctness::Distinct { ctx } = &mut plan.distinctness {
         *ctx = distinct_ctx
+    }
+    if let Distinctness::Distinct { ctx: Some(ctx) } = &plan.distinctness {
+        program.emit_insn(Insn::HashClear {
+            hash_table_id: ctx.hash_table_id,
+        });
     }
 
     init_limit(program, t_ctx, &plan.limit, &plan.offset)?;

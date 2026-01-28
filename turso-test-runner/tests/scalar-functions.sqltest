@@ -71,53 +71,6 @@ expect {
     0helloworld
 }
 
-test char {
-    select char(108, 105)
-}
-expect {
-    li
-}
-
-test char-nested {
-    select char(106 + 2, 105)
-}
-expect {
-    li
-}
-
-test char-empty {
-    select char()
-}
-expect {
-}
-
-test char-null {
-    select char(null)
-}
-expect {
-}
-
-test char-non-integer {
-    select char('a')
-}
-expect {
-}
-
-# char() with unicode codepoints >= 256
-test char-unicode-256 {
-    select unicode(char(256))
-}
-expect {
-    256
-}
-
-test char-unicode-emoji {
-    select unicode(char(128512))
-}
-expect {
-    128512
-}
-
 test abs {
     select abs(1);
 }

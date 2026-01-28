@@ -651,8 +651,7 @@ impl Whopper {
                     .inspect_err(|e| error!("property failed: {e}"))?;
             }
 
-            if matches!(&completed_op, Operation::Rollback | Operation::Commit) && op_result.is_ok()
-            {
+            if ctx.fiber.connection.get_auto_commit() {
                 ctx.fiber.state = FiberState::Idle;
                 ctx.fiber.txn_id = None;
             }
@@ -661,15 +660,18 @@ impl Whopper {
                 match error {
                     // initiate rollback in case of some errors for fiber within transaction
                     turso_core::LimboError::SchemaUpdated
+                    | turso_core::LimboError::SchemaConflict
                     | turso_core::LimboError::TableLocked
                     | turso_core::LimboError::Busy
                     | turso_core::LimboError::BusySnapshot
                     | turso_core::LimboError::WriteWriteConflict
                     | turso_core::LimboError::InvalidArgument(..) => {
-                        if matches!(self.context.fibers[fiber_idx].state, FiberState::InTx) {
-                            self.context.fibers[fiber_idx].current_op = Some(Operation::Rollback);
+                        if matches!(ctx.fiber.state, FiberState::InTx)
+                            && !ctx.fiber.connection.get_auto_commit()
+                        {
+                            ctx.fiber.current_op = Some(Operation::Rollback);
                         } else {
-                            self.context.fibers[fiber_idx].txn_id = None;
+                            ctx.fiber.txn_id = None;
                         }
                     }
                     _ => return Err(error.into()),

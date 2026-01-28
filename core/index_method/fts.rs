@@ -1,3 +1,4 @@
+use crate::sync::Arc;
 use crate::{
     index_method::{
         parse_patterns, IndexMethod, IndexMethodAttachment, IndexMethodConfiguration,
@@ -17,11 +18,10 @@ use crate::{
 };
 use parking_lot::RwLock;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
-use std::cell::RefCell;
 use std::io::{BufWriter, Write};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::{cell::RefCell, sync::atomic::Ordering};
 use tantivy::{
     directory::{
         error::{DeleteError, OpenReadError, OpenWriteError},
@@ -1575,7 +1575,10 @@ fn initialize_btree_storage_table(conn: &Arc<Connection>, table_name: &str) -> R
     {
         conn.start_nested();
         let mut stmt = conn.prepare_stmt(create_table_stmt)?;
-        stmt.program.needs_stmt_subtransactions = false;
+        stmt.program
+            .prepared
+            .needs_stmt_subtransactions
+            .store(false, Ordering::Relaxed);
         let res = stmt.run_ignore_rows();
         conn.end_nested();
         res?;
@@ -1583,7 +1586,10 @@ fn initialize_btree_storage_table(conn: &Arc<Connection>, table_name: &str) -> R
     {
         conn.start_nested();
         let mut stmt = conn.prepare_stmt(create_index_stmt)?;
-        stmt.program.needs_stmt_subtransactions = false;
+        stmt.program
+            .prepared
+            .needs_stmt_subtransactions
+            .store(false, Ordering::Relaxed);
         let res = stmt.run_ignore_rows();
         conn.end_nested();
         res?;
@@ -2524,7 +2530,10 @@ impl IndexMethodCursor for FtsCursor {
         conn.start_nested();
         let mut stmt = conn.prepare_stmt(drop_table_ast)?;
         // Disable subtransactions since we're already inside a transaction from the parent DROP INDEX
-        stmt.program.needs_stmt_subtransactions = false;
+        stmt.program
+            .prepared
+            .needs_stmt_subtransactions
+            .store(false, Ordering::Relaxed);
         let result = stmt.run_ignore_rows();
         conn.end_nested();
         result?;

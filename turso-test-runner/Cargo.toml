@@ -33,6 +33,7 @@ num_cpus = "1"
 # Serialization
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
+serde_yaml = "0.9"
 
 # Output formatting
 owo-colors = "4.2.3"

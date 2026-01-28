@@ -24,17 +24,26 @@ pub struct CliBackend {
     default_db_resolver: Option<Arc<dyn DefaultDatabaseResolver>>,
     /// Enable MVCC mode
     mvcc: bool,
+    /// Whether the binary is sqlite3 (detected from binary name)
+    is_sqlite: bool,
 }
 
 impl CliBackend {
     /// Create a new CLI backend with the given binary path
     pub fn new(binary_path: impl Into<PathBuf>) -> Self {
+        let binary_path = binary_path.into();
+        let is_sqlite = binary_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|name| name.starts_with("sqlite"))
+            .unwrap_or(false);
         Self {
-            binary_path: binary_path.into(),
+            binary_path,
             working_dir: None,
             timeout: Duration::from_secs(30),
             default_db_resolver: None,
             mvcc: false,
+            is_sqlite,
         }
     }
 
@@ -120,6 +129,7 @@ impl SqlBackend for CliBackend {
             is_memory,
             setup_buffer: Vec::new(),
             mvcc: self.mvcc,
+            is_sqlite: self.is_sqlite,
         }))
     }
 }
@@ -139,6 +149,7 @@ pub struct CliDatabaseInstance {
     setup_buffer: Vec<String>,
     /// Enable MVCC mode
     mvcc: bool,
+    is_sqlite: bool,
 }
 
 impl CliDatabaseInstance {
@@ -153,7 +164,6 @@ impl CliDatabaseInstance {
             .ok_or_else(|| {
                 BackendError::Execute("binary path does not contain a file name".to_string())
             })?;
-        let is_sqlite = file_name.starts_with("sqlite");
         let is_turso_cli = file_name.starts_with("tursodb") || file_name.starts_with("turso");
 
         // Set working directory if specified
@@ -161,7 +171,7 @@ impl CliDatabaseInstance {
             cmd.current_dir(dir);
         }
 
-        if is_sqlite {
+        if self.is_sqlite {
             cmd.arg(format!("file:{}?immutable=1", self.db_path));
         }
 

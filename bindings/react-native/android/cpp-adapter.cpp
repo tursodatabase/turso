@@ -14,7 +14,7 @@ namespace jni = facebook::jni;
 // https://github.com/facebookincubator/fbjni/blob/main/docs/quickref.md
 struct TursoBridge : jni::JavaClass<TursoBridge>
 {
-    static constexpr auto kJavaDescriptor = "Lcom/turso/reactnative/TursoBridge;";
+    static constexpr auto kJavaDescriptor = "Lcom/turso/sync/reactnative/TursoBridge;";
 
     static void registerNatives()
     {

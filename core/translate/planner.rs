@@ -368,6 +368,15 @@ fn plan_cte(
     // exponential re-planning when CTEs have transitive dependencies.
     let mut outer_query_refs = base_outer_query_refs.to_vec();
     for &ref_idx in &cte_def.referenced_cte_indices {
+        let ref_cte_name = &cte_definitions[ref_idx].name;
+        // Check if this CTE has already been planned and is in outer_query_refs.
+        // This avoids exponential re-planning when CTEs have transitive dependencies.
+        if outer_query_refs
+            .iter()
+            .any(|r| &r.identifier == ref_cte_name)
+        {
+            continue;
+        }
         // Recursively plan the referenced CTE
         let referenced_table = plan_cte(
             ref_idx,
@@ -538,11 +547,19 @@ fn parse_from_clause_table(
             // This allows the subquery to reference CTEs defined in the parent's WITH clause.
             let mut outer_query_refs_for_subquery = table_references.outer_query_refs().to_vec();
             for (idx, cte_def) in cte_definitions.iter().enumerate() {
+                // Check if this CTE has already been planned and is in outer_query_refs.
+                // This avoids exponential re-planning when CTEs have transitive dependencies.
+                if outer_query_refs_for_subquery
+                    .iter()
+                    .any(|r| r.identifier == cte_def.name)
+                {
+                    continue;
+                }
                 // Plan each CTE so it can be used by the subquery
                 let cte_table = plan_cte(
                     idx,
                     cte_definitions,
-                    table_references.outer_query_refs(),
+                    &outer_query_refs_for_subquery,
                     resolver,
                     program,
                     connection,

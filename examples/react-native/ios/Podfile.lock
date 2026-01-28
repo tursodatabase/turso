@@ -1849,7 +1849,7 @@ PODS:
     - React-utils (= 0.83.1)
     - ReactNativeDependencies
   - ReactNativeDependencies (0.83.1)
-  - turso-sync-react-native (0.5.0-pre.1):
+  - turso-sync-react-native (0.5.0-pre.2):
     - hermes-engine
     - RCTRequired
     - RCTTypeSafety
@@ -2178,7 +2178,7 @@ SPEC CHECKSUMS:
   ReactCodegen: fc927f8651c51b06a38dff2328ffe27e75f4e211
   ReactCommon: c24a308601d0bce5c9edf2f36afb0dbf7afaf6ef
   ReactNativeDependencies: 551fd24a2ad4ad89817e6dca6a57ecc615c02c11
-  turso-sync-react-native: c033177472fe50c0aa44c846d1ff93859b851194
+  turso-sync-react-native: 917b8f2494b82f4ff0b3604b0b3d25def18e5e79
   Yoga: 35d573dff66536d48493acb65a519482f8219fe8
 
 PODFILE CHECKSUM: e6bd9e298e2f896bccf3db29e39bb42d539cd8bd

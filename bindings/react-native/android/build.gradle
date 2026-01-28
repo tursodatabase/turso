@@ -18,7 +18,7 @@ def reactNativeArchitectures() {
 }
 
 android {
-    namespace "com.turso.reactnative"
+    namespace "com.turso.sync.reactnative"
     compileSdk 34
 
     defaultConfig {

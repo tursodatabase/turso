@@ -235,7 +235,7 @@ impl TursoSyncServer {
                     let cols: Vec<Col> = (0..stmt.num_columns())
                         .map(|i| Col {
                             name: Some(stmt.get_column_name(i).to_string()),
-                            decltype: stmt.get_column_type(i),
+                            decltype: stmt.get_column_decltype(i),
                         })
                         .collect();
 
@@ -399,7 +399,7 @@ impl TursoSyncServer {
             let cols: Vec<Col> = (0..stmt.num_columns())
                 .map(|i| Col {
                     name: Some(stmt.get_column_name(i).to_string()),
-                    decltype: stmt.get_column_type(i),
+                    decltype: stmt.get_column_decltype(i),
                 })
                 .collect();
 

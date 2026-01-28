@@ -1,13 +1,28 @@
 import { useEffect, useState } from 'react';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 import { StyleSheet, Text, View, ScrollView } from 'react-native';
-import { connect, setup, Database } from '@tursodatabase/react-native';
+import { connect, setup, Database } from '@tursodatabase/sync-react-native';
 
 type TestResult = {
   name: string;
   passed: boolean;
   error?: string;
 };
+
+// Environment variables injected at build time via babel-plugin-transform-inline-environment-variables
+// Set these when running metro: TURSO_DATABASE_URL=... TURSO_AUTH_TOKEN=... npm start
+const TURSO_DATABASE_URL = process.env.TURSO_DATABASE_URL as string | undefined;
+const TURSO_AUTH_TOKEN = process.env.TURSO_AUTH_TOKEN as string | undefined;
+const TURSO_ENCRYPTION_KEY = process.env.TURSO_ENCRYPTION_KEY as string | undefined;
+const TURSO_ENCRYPTION_CIPHER = (process.env.TURSO_ENCRYPTION_CIPHER || 'aes256gcm') as
+  | 'aes256gcm'
+  | 'aes128gcm'
+  | 'chacha20poly1305';
+
+// Check if sync tests should run
+const SYNC_ENABLED = !!(TURSO_DATABASE_URL && TURSO_AUTH_TOKEN);
+// Check if encryption tests should run (requires sync + encryption key)
+const ENCRYPTION_ENABLED = !!(SYNC_ENABLED && TURSO_ENCRYPTION_KEY);
 
 export default function App() {
   const [openTime, setOpenTime] = useState(0);
@@ -137,12 +152,160 @@ export default function App() {
       testResults.push({ name: 'Performance (1000 queries)', passed: false, error: String(e) });
     }
 
-    // Cleanup
+    // Cleanup local database
     try {
       db.close();
       testResults.push({ name: 'Close database', passed: true });
     } catch (e) {
       testResults.push({ name: 'Close database', passed: false, error: String(e) });
+    }
+
+    // ========================================
+    // SYNC API TESTS (requires env vars, skipped if encryption is enabled)
+    // ========================================
+    if (SYNC_ENABLED && !ENCRYPTION_ENABLED) {
+      testResults.push({ name: '--- Sync Tests ---', passed: true });
+
+      let syncDb: Database | null = null;
+
+      // Test: Connect to sync database
+      try {
+        syncDb = await connect({
+          path: 'sync-test.db',
+          url: TURSO_DATABASE_URL,
+          authToken: TURSO_AUTH_TOKEN,
+        });
+        testResults.push({ name: 'Sync: Connect', passed: true });
+      } catch (e) {
+        testResults.push({ name: 'Sync: Connect', passed: false, error: String(e) });
+      }
+
+      if (syncDb) {
+        // Test: Pull from remote
+        try {
+          const hasChanges = await syncDb.pull();
+          testResults.push({ name: `Sync: Pull (changes: ${hasChanges})`, passed: true });
+        } catch (e) {
+          testResults.push({ name: 'Sync: Pull', passed: false, error: String(e) });
+        }
+
+        // Test: Create table and insert
+        try {
+          await syncDb.exec('CREATE TABLE IF NOT EXISTS rn_sync_test (id INTEGER PRIMARY KEY, value TEXT, created_at INTEGER DEFAULT (unixepoch()))');
+          await syncDb.run('INSERT INTO rn_sync_test (value) VALUES (?)', `test-${Date.now()}`);
+          testResults.push({ name: 'Sync: Insert data', passed: true });
+        } catch (e) {
+          testResults.push({ name: 'Sync: Insert data', passed: false, error: String(e) });
+        }
+
+        // Test: Query local data
+        try {
+          const rows = await syncDb.all('SELECT * FROM rn_sync_test ORDER BY created_at DESC LIMIT 5');
+          testResults.push({ name: `Sync: Query (${rows.length} rows)`, passed: true });
+        } catch (e) {
+          testResults.push({ name: 'Sync: Query', passed: false, error: String(e) });
+        }
+
+        // Test: Push to remote
+        try {
+          await syncDb.push();
+          testResults.push({ name: 'Sync: Push', passed: true });
+        } catch (e) {
+          testResults.push({ name: 'Sync: Push', passed: false, error: String(e) });
+        }
+
+        // Test: Get stats
+        try {
+          const stats = await syncDb.stats();
+          testResults.push({ name: `Sync: Stats (ops: ${stats.cdcOperations})`, passed: true });
+        } catch (e) {
+          testResults.push({ name: 'Sync: Stats', passed: false, error: String(e) });
+        }
+
+        // Cleanup sync database
+        try {
+          syncDb.close();
+          testResults.push({ name: 'Sync: Close', passed: true });
+        } catch (e) {
+          testResults.push({ name: 'Sync: Close', passed: false, error: String(e) });
+        }
+      }
+    } else if (ENCRYPTION_ENABLED) {
+      testResults.push({ name: '--- Sync Tests (skipped: using encryption) ---', passed: true });
+    } else {
+      testResults.push({ name: '--- Sync Tests (skipped: no env vars) ---', passed: true });
+    }
+
+    // ========================================
+    // ENCRYPTION TESTS (requires sync + encryption key)
+    // ========================================
+    if (ENCRYPTION_ENABLED) {
+      testResults.push({ name: '--- Encryption Tests ---', passed: true });
+
+      let encDb: Database | null = null;
+
+      // Test: Connect with encryption
+      try {
+        encDb = await connect({
+          path: 'encrypted-test.db',
+          url: TURSO_DATABASE_URL,
+          authToken: TURSO_AUTH_TOKEN,
+          remoteEncryption: {
+            key: TURSO_ENCRYPTION_KEY!,
+            cipher: TURSO_ENCRYPTION_CIPHER,
+          },
+        });
+        testResults.push({ name: 'Encryption: Connect', passed: true });
+      } catch (e) {
+        testResults.push({ name: 'Encryption: Connect', passed: false, error: String(e) });
+      }
+
+      if (encDb) {
+        // Test: Pull encrypted data
+        try {
+          const hasChanges = await encDb.pull();
+          testResults.push({ name: `Encryption: Pull (changes: ${hasChanges})`, passed: true });
+        } catch (e) {
+          testResults.push({ name: 'Encryption: Pull', passed: false, error: String(e) });
+        }
+
+        // Test: Create table and insert encrypted
+        try {
+          await encDb.exec('CREATE TABLE IF NOT EXISTS rn_enc_test (id INTEGER PRIMARY KEY, secret TEXT)');
+          await encDb.run('INSERT INTO rn_enc_test (secret) VALUES (?)', `secret-${Date.now()}`);
+          testResults.push({ name: 'Encryption: Insert', passed: true });
+        } catch (e) {
+          testResults.push({ name: 'Encryption: Insert', passed: false, error: String(e) });
+        }
+
+        // Test: Query encrypted data
+        try {
+          const rows = await encDb.all('SELECT * FROM rn_enc_test LIMIT 5');
+          testResults.push({ name: `Encryption: Query (${rows.length} rows)`, passed: true });
+        } catch (e) {
+          testResults.push({ name: 'Encryption: Query', passed: false, error: String(e) });
+        }
+
+        // Test: Push encrypted changes
+        try {
+          await encDb.push();
+          testResults.push({ name: 'Encryption: Push', passed: true });
+        } catch (e) {
+          testResults.push({ name: 'Encryption: Push', passed: false, error: String(e) });
+        }
+
+        // Cleanup encrypted database
+        try {
+          encDb.close();
+          testResults.push({ name: 'Encryption: Close', passed: true });
+        } catch (e) {
+          testResults.push({ name: 'Encryption: Close', passed: false, error: String(e) });
+        }
+      }
+    } else if (SYNC_ENABLED) {
+      testResults.push({ name: '--- Encryption Tests (skipped: no key) ---', passed: true });
+    } else {
+      testResults.push({ name: '--- Encryption Tests (skipped: no env vars) ---', passed: true });
     }
 
     setResults(testResults);
@@ -159,6 +322,12 @@ export default function App() {
         <View style={styles.statsContainer}>
           <Text style={styles.statsText}>DB open time: {openTime.toFixed(0)} ms</Text>
           <Text style={styles.statsText}>1000 queries: {queryTime.toFixed(0)} ms</Text>
+          <Text style={[styles.statsText, SYNC_ENABLED ? styles.enabled : styles.disabled]}>
+            Sync: {SYNC_ENABLED ? 'enabled' : 'disabled'}
+          </Text>
+          <Text style={[styles.statsText, ENCRYPTION_ENABLED ? styles.enabled : styles.disabled]}>
+            Encryption: {ENCRYPTION_ENABLED ? 'enabled' : 'disabled'}
+          </Text>
         </View>
 
         <View style={styles.summaryContainer}>
@@ -208,6 +377,12 @@ const styles = StyleSheet.create({
     color: '#4cc9f0',
     fontSize: 16,
     fontFamily: 'monospace',
+  },
+  enabled: {
+    color: '#4ade80',
+  },
+  disabled: {
+    color: '#888',
   },
   summaryContainer: {
     backgroundColor: '#16213e',

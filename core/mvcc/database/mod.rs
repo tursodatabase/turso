@@ -715,8 +715,8 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     .load(Ordering::Acquire)
                     > tx.begin_ts
                 {
-                    // Schema changes made after the transaction began always cause a [SchemaUpdated] error and the tx must abort.
-                    return Err(LimboError::SchemaUpdated);
+                    // Schema changes made after the transaction began always cause a [SchemaConflict] error and the tx must abort.
+                    return Err(LimboError::SchemaConflict);
                 }
 
                 tx.state.store(TransactionState::Preparing);
@@ -2421,7 +2421,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             .get(&tx_id)
             .expect("transaction should exist in txs map");
         let tx = tx_unlocked.value();
-        *connection.mv_tx.write() = None;
+        connection.set_mv_tx(None);
         assert!(tx.state == TransactionState::Active || tx.state == TransactionState::Preparing);
         tx.state.store(TransactionState::Aborted);
         tracing::trace!("abort(tx_id={})", tx_id);

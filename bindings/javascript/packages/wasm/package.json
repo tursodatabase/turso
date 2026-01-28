@@ -1,6 +1,6 @@
 {
   "name": "@tursodatabase/database-wasm",
-  "version": "0.5.0-pre.2",
+  "version": "0.5.0-pre.5",
   "repository": {
     "type": "git",
     "url": "https://github.com/tursodatabase/turso"
@@ -38,7 +38,7 @@
     "vitest": "^3.2.4"
   },
   "scripts": {
-    "napi-build": "napi build --features browser --release --platform --target wasm32-wasip1-threads --no-js --manifest-path ../../Cargo.toml --output-dir . && rm index.d.ts turso.wasi* wasi* browser.js",
+    "napi-build": "napi build --features browser --profile release-official --platform --target wasm32-wasip1-threads --no-js --manifest-path ../../Cargo.toml --output-dir . && rm index.d.ts turso.wasi* wasi* browser.js",
     "tsc-build": "npm exec tsc && cp turso.wasm32-wasi.wasm ./dist/turso.wasm32-wasi.wasm && WASM_FILE=turso.wasm32-wasi.wasm JS_FILE=./dist/wasm-inline.js node ../../scripts/inline-wasm-base64.js && npm run bundle",
     "bundle": "vite build",
     "build": "npm run napi-build && npm run tsc-build",
@@ -51,7 +51,7 @@
     ]
   },
   "dependencies": {
-    "@tursodatabase/database-common": "^0.5.0-pre.2",
-    "@tursodatabase/database-wasm-common": "^0.5.0-pre.2"
+    "@tursodatabase/database-common": "^0.5.0-pre.5",
+    "@tursodatabase/database-wasm-common": "^0.5.0-pre.5"
   }
 }

@@ -64,7 +64,9 @@ use crate::storage::journal_mode;
 use crate::storage::pager::{self, AutoVacuumMode, HeaderRef, HeaderRefMut};
 use crate::storage::sqlite3_ondisk::{RawVersion, Version};
 use crate::sync::{
-    atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU16, AtomicUsize, Ordering},
+    atomic::{
+        AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU16, AtomicU64, AtomicUsize, Ordering,
+    },
     Arc, LazyLock, Weak,
 };
 use crate::sync::{Mutex, RwLock};
@@ -116,7 +118,7 @@ use util::parse_schema_rows;
 pub use util::IOExt;
 pub use vdbe::{
     builder::QueryMode, explain::EXPLAIN_COLUMNS, explain::EXPLAIN_QUERY_PLAN_COLUMNS,
-    FromValueRow, Program, Register,
+    FromValueRow, PrepareContext, PreparedProgram, Program, Register,
 };
 
 #[cfg(feature = "cli_only")]
@@ -562,7 +564,7 @@ impl Database {
             encryption_opts.clone(),
         )?;
 
-        let pager = db.header_validation()?;
+        let pager = db.header_validation(encryption_key.as_ref())?;
         #[cfg(debug_assertions)]
         {
             let wal_enabled = db.shared_wal.read().enabled.load(Ordering::SeqCst);
@@ -612,10 +614,22 @@ impl Database {
         Ok(db)
     }
 
-    /// Necessary Pager initialization, so that we are prepared to read from Page 1
-    fn _init(&self) -> Result<Pager> {
+    /// Necessary Pager initialization, so that we are prepared to read from Page 1.
+    /// For encrypted databases, the encryption key must be provided to properly decrypt page 1.
+    fn _init(&self, encryption_key: Option<&EncryptionKey>) -> Result<Pager> {
         let pager = self.init_pager(None)?;
         pager.enable_encryption(self.opts.enable_encryption);
+
+        // Set up encryption context BEFORE reading the header page.
+        // For encrypted databases, page 1 has:
+        // - Bytes 0-15: Turso magic header (replaces SQLite magic)
+        // - Bytes 16-100: Unencrypted header metadata
+        // - Bytes 100+: Encrypted content
+        // The encryption context is needed to properly decrypt page 1 when reopening.
+        if let Some(key) = encryption_key {
+            let cipher_mode = self.encryption_cipher_mode.get();
+            pager.set_encryption_context(cipher_mode, key)?;
+        }
 
         // Start read transaction before reading page 1 to acquire a read lock
         // that prevents concurrent checkpoints from truncating the WAL
@@ -652,12 +666,12 @@ impl Database {
     /// Checks the Version numbers in the DatabaseHeader, and changes it according to the required options
     ///
     /// Will also open MVStore and WAL if needed
-    fn header_validation(&mut self) -> Result<Arc<Pager>> {
+    fn header_validation(&mut self, encryption_key: Option<&EncryptionKey>) -> Result<Arc<Pager>> {
         let wal_exists = journal_mode::wal_exists(std::path::Path::new(&self.wal_path));
         let log_exists = journal_mode::logical_log_exists(std::path::Path::new(&self.path));
         let is_readonly = self.open_flags.contains(OpenFlags::ReadOnly);
 
-        let mut pager = self._init()?;
+        let mut pager = self._init(encryption_key)?;
         assert!(pager.wal.is_none(), "Pager should have no WAL yet");
 
         let is_autovacuumed_db = self.io.block(|| {
@@ -811,7 +825,9 @@ impl Database {
         let pager = if let Some(pager) = pager {
             pager
         } else {
-            Arc::new(self._init()?)
+            // Pass encryption key to _init so it can set up encryption context
+            // before reading page 1. This is required for reopening encrypted databases.
+            Arc::new(self._init(encryption_key.as_ref())?)
         };
         let page_size = pager.get_page_size_unchecked();
 
@@ -822,12 +838,6 @@ impl Database {
             .get();
 
         let encryption_cipher = self.encryption_cipher_mode.get();
-
-        // Set up encryption on the pager if encryption key is provided
-        // Header is not encrypted, so this is only needed before reading data pages
-        if let Some(ref key) = encryption_key {
-            pager.set_encryption_context(encryption_cipher, key)?;
-        }
 
         let conn = Arc::new(Connection {
             db: self.clone(),
@@ -840,6 +850,7 @@ impl Database {
             last_change: AtomicI64::new(0),
             total_changes: AtomicI64::new(0),
             syms: parking_lot::RwLock::new(SymbolTable::new()),
+            syms_generation: AtomicU64::new(0),
             _shared_cache: false,
             cache_size: AtomicI32::new(default_cache_size),
             page_size: AtomicU16::new(page_size.get_raw()),

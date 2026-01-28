@@ -11,6 +11,9 @@ internal static class TursoInterop
     [DllImport(DllName, EntryPoint = "db_open", CallingConvention = CallingConvention.Cdecl)]
     public static extern IntPtr OpenDatabase(string path, out IntPtr errorPtr);
 
+    [DllImport(DllName, EntryPoint = "db_open_with_encryption", CallingConvention = CallingConvention.Cdecl)]
+    public static extern IntPtr OpenDatabaseWithEncryption(string path, string? cipher, string? hexkey, out IntPtr errorPtr);
+
     [DllImport(DllName, EntryPoint = "db_close", CallingConvention = CallingConvention.Cdecl)]
     public static extern void CloseDatabase(IntPtr db);
 

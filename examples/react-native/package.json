@@ -10,7 +10,7 @@
     "test": "jest"
   },
   "dependencies": {
-    "@tursodatabase/react-native": "file:../../bindings/react-native",
+    "@tursodatabase/sync-react-native": "file:../../bindings/react-native",
     "react": "19.2.0",
     "react-native": "0.83.1",
     "@react-native/new-app-screen": "0.83.1",
@@ -18,6 +18,7 @@
   },
   "devDependencies": {
     "@babel/core": "^7.25.2",
+    "babel-plugin-transform-inline-environment-variables": "^0.4.4",
     "@babel/preset-env": "^7.25.3",
     "@babel/runtime": "^7.25.0",
     "@react-native-community/cli": "20.0.0",
