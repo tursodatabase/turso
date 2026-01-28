@@ -1862,7 +1862,9 @@ impl Optimizable for ast::Expr {
                     .expect("table not found");
                 let columns = table_ref.columns();
                 let column = &columns[*column];
-                column.primary_key() || column.notnull()
+                // Only INTEGER PRIMARY KEY (rowid alias) is implicitly NOT NULL.
+                // Other PRIMARY KEY types (e.g., TEXT PRIMARY KEY) can contain NULL.
+                column.is_rowid_alias() || column.notnull()
             }
             Expr::RowId { .. } => true,
             Expr::InList { lhs, rhs, .. } => {
