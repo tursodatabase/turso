@@ -1,4 +1,4 @@
-use crate::generation::generated_expr::{extract_column_refs, has_transitive_concat};
+use crate::generation::generated_expr::extract_column_refs;
 use crate::generation::{
     gen_random_text, pick_index, pick_unique, Arbitrary, ArbitraryFrom, ArbitrarySized,
     GenerationContext,
@@ -403,27 +403,7 @@ impl Arbitrary for CreateIndex {
             );
         }
 
-        // TODO: Remove this workaround once concat operator bug is fixed.
-        // https://github.com/tursodatabase/turso/issues/4860
-        let indexable_column_indices: Vec<usize> = (0..table.columns.len())
-            .filter(|&i| {
-                let col = &table.columns[i];
-                // Skip generated columns with concat operator in their expression (direct or transitive)
-                if let Some(expr) = col.generated_expr() {
-                    if has_transitive_concat(expr, &table.columns) {
-                        return false;
-                    }
-                }
-                true
-            })
-            .collect();
-
-        if indexable_column_indices.is_empty() {
-            panic!(
-                "Cannot create an index on table '{}' as all columns are generated with concat operator.",
-                table.name
-            );
-        }
+        let indexable_column_indices: Vec<usize> = (0..table.columns.len()).collect();
 
         let num_columns_to_pick = rng.random_range(1..=indexable_column_indices.len());
         let picked_column_indices: Vec<usize> = indexable_column_indices

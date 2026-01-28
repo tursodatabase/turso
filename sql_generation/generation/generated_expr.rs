@@ -72,36 +72,43 @@ fn generate_expr_inner<R: Rng + ?Sized>(
         }
         // Binary operation (30% chance)
         4..=6 => {
-            let op = pick_binary_op(rng, target_type);
-            let lhs = generate_expr_inner(
-                rng,
-                all_columns,
-                current_col_idx,
-                target_type,
-                depth - 1,
-                refs,
-            );
-            let rhs = generate_expr_inner(
-                rng,
-                all_columns,
-                current_col_idx,
-                target_type,
-                depth - 1,
-                refs,
-            );
-            // Wrap subexpressions in parentheses to ensure correct evaluation order
-            // when the shadow model evaluates the expression tree directly
-            let lhs = if matches!(lhs, Expr::Binary(..)) {
-                Expr::Parenthesized(vec![Box::new(lhs)])
+            if let Some(op) = pick_binary_op(rng, target_type) {
+                let lhs = generate_expr_inner(
+                    rng,
+                    all_columns,
+                    current_col_idx,
+                    target_type,
+                    depth - 1,
+                    refs,
+                );
+                let rhs = generate_expr_inner(
+                    rng,
+                    all_columns,
+                    current_col_idx,
+                    target_type,
+                    depth - 1,
+                    refs,
+                );
+                // Wrap subexpressions in parentheses to ensure correct evaluation order
+                // when the shadow model evaluates the expression tree directly
+                let lhs = if matches!(lhs, Expr::Binary(..)) {
+                    Expr::Parenthesized(vec![Box::new(lhs)])
+                } else {
+                    lhs
+                };
+                let rhs = if matches!(rhs, Expr::Binary(..)) {
+                    Expr::Parenthesized(vec![Box::new(rhs)])
+                } else {
+                    rhs
+                };
+                Expr::Binary(Box::new(lhs), op, Box::new(rhs))
+            } else if !compatible_cols.is_empty() && rng.random_bool(0.7) {
+                let (idx, col) = compatible_cols[rng.random_range(0..compatible_cols.len())];
+                refs.insert(idx);
+                Expr::Id(Name::from_string(&col.name))
             } else {
-                lhs
-            };
-            let rhs = if matches!(rhs, Expr::Binary(..)) {
-                Expr::Parenthesized(vec![Box::new(rhs)])
-            } else {
-                rhs
-            };
-            Expr::Binary(Box::new(lhs), op, Box::new(rhs))
+                generate_literal(rng, target_type)
+            }
         }
         // Unary operation (15% chance)
         7..=8 => {
@@ -188,21 +195,14 @@ fn generate_literal<R: Rng + ?Sized>(rng: &mut R, target_type: &ColumnType) -> E
 }
 
 /// Pick an appropriate binary operator for the target type.
-fn pick_binary_op<R: Rng + ?Sized>(rng: &mut R, target_type: &ColumnType) -> Operator {
+fn pick_binary_op<R: Rng + ?Sized>(rng: &mut R, target_type: &ColumnType) -> Option<Operator> {
     match target_type {
         ColumnType::Integer | ColumnType::Float => {
             // Numeric operations
             let ops = [Operator::Add, Operator::Subtract, Operator::Multiply];
-            ops[rng.random_range(0..ops.len())]
+            Some(ops[rng.random_range(0..ops.len())])
         }
-        ColumnType::Text => {
-            // Text concatenation
-            Operator::Concat
-        }
-        ColumnType::Blob => {
-            // Blob concatenation
-            Operator::Concat
-        }
+        ColumnType::Text | ColumnType::Blob => None,
     }
 }
 
@@ -326,75 +326,6 @@ fn extract_refs_inner(expr: &ast::Expr, refs: &mut HashSet<String>) {
     }
 }
 
-/// Check if an expression contains the concat operator (||).
-///
-/// TODO: Remove this workaround once concat operator bug is fixed.
-/// https://github.com/tursodatabase/turso/issues/4860
-pub fn contains_concat_operator(expr: &ast::Expr) -> bool {
-    match expr {
-        Expr::Binary(lhs, op, rhs) => {
-            matches!(op, Operator::Concat)
-                || contains_concat_operator(lhs)
-                || contains_concat_operator(rhs)
-        }
-        Expr::Unary(_, inner) => contains_concat_operator(inner),
-        Expr::Parenthesized(exprs) => exprs.iter().any(|e| contains_concat_operator(e)),
-        Expr::Cast { expr, .. } => contains_concat_operator(expr),
-        Expr::IsNull(inner) | Expr::NotNull(inner) => contains_concat_operator(inner),
-        Expr::Collate(inner, _) => contains_concat_operator(inner),
-        _ => false,
-    }
-}
-
-/// Check if an expression uses concat operator directly or transitively through column references.
-///
-/// This function recursively follows column references to detect cases where a generated column
-/// references another column that uses the concat operator. For example:
-/// - Column `c` defined as `a || b` uses concat directly
-/// - Column `d` defined as `c` (referencing column `c`) transitively uses concat
-///
-/// TODO: Remove this workaround once concat operator bug is fixed.
-/// https://github.com/tursodatabase/turso/issues/4860
-pub fn has_transitive_concat(expr: &ast::Expr, columns: &[Column]) -> bool {
-    match expr {
-        Expr::Binary(lhs, op, rhs) => {
-            matches!(op, Operator::Concat)
-                || has_transitive_concat(lhs, columns)
-                || has_transitive_concat(rhs, columns)
-        }
-        Expr::Id(name) | Expr::Name(name) => {
-            // Check if the referenced column has concat in its generated expression
-            if let Some(col) = columns
-                .iter()
-                .find(|c| c.name.eq_ignore_ascii_case(name.as_str()))
-            {
-                if let Some(gen_expr) = col.generated_expr() {
-                    return has_transitive_concat(gen_expr, columns);
-                }
-            }
-            false
-        }
-        Expr::Qualified(_, name) | Expr::DoublyQualified(_, _, name) => {
-            // Same as Expr::Id - check if referenced column has transitive concat
-            if let Some(col) = columns
-                .iter()
-                .find(|c| c.name.eq_ignore_ascii_case(name.as_str()))
-            {
-                if let Some(gen_expr) = col.generated_expr() {
-                    return has_transitive_concat(gen_expr, columns);
-                }
-            }
-            false
-        }
-        Expr::Unary(_, inner) => has_transitive_concat(inner, columns),
-        Expr::Parenthesized(exprs) => exprs.iter().any(|e| has_transitive_concat(e, columns)),
-        Expr::Cast { expr, .. } => has_transitive_concat(expr, columns),
-        Expr::IsNull(inner) | Expr::NotNull(inner) => has_transitive_concat(inner, columns),
-        Expr::Collate(inner, _) => has_transitive_concat(inner, columns),
-        _ => false,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -478,131 +409,5 @@ mod tests {
 
         // Expression should be valid
         assert!(!matches!(expr, Expr::Id(name) if name.as_str() == "col_b"));
-    }
-
-    #[test]
-    fn test_contains_concat_operator() {
-        // Expression without concat: a + b
-        let no_concat = Expr::Binary(
-            Box::new(Expr::Id(Name::from_string("a"))),
-            Operator::Add,
-            Box::new(Expr::Id(Name::from_string("b"))),
-        );
-        assert!(!contains_concat_operator(&no_concat));
-
-        // Expression with concat: a || b
-        let with_concat = Expr::Binary(
-            Box::new(Expr::Id(Name::from_string("a"))),
-            Operator::Concat,
-            Box::new(Expr::Id(Name::from_string("b"))),
-        );
-        assert!(contains_concat_operator(&with_concat));
-
-        // Nested expression with concat: (a + b) || c
-        let nested_concat = Expr::Binary(
-            Box::new(Expr::Parenthesized(vec![Box::new(Expr::Binary(
-                Box::new(Expr::Id(Name::from_string("a"))),
-                Operator::Add,
-                Box::new(Expr::Id(Name::from_string("b"))),
-            ))])),
-            Operator::Concat,
-            Box::new(Expr::Id(Name::from_string("c"))),
-        );
-        assert!(contains_concat_operator(&nested_concat));
-
-        // Concat nested inside non-concat: (a || b) + c
-        let concat_inside = Expr::Binary(
-            Box::new(Expr::Parenthesized(vec![Box::new(Expr::Binary(
-                Box::new(Expr::Id(Name::from_string("a"))),
-                Operator::Concat,
-                Box::new(Expr::Id(Name::from_string("b"))),
-            ))])),
-            Operator::Add,
-            Box::new(Expr::Id(Name::from_string("c"))),
-        );
-        assert!(contains_concat_operator(&concat_inside));
-
-        // Literal - no concat
-        let literal = Expr::Literal(ast::Literal::Numeric("42".to_string()));
-        assert!(!contains_concat_operator(&literal));
-    }
-
-    #[test]
-    fn test_has_transitive_concat() {
-        use ast::ColumnConstraint;
-
-        // Test setup:
-        // - col_a: BLOB (non-generated)
-        // - col_b: BLOB (non-generated)
-        // - col_c: BLOB AS (col_a || col_b) -- direct concat
-        // - col_d: BLOB AS (col_c)          -- transitive concat (references col_c)
-        // - col_e: BLOB AS (col_a)          -- no concat (just references non-concat column)
-        let columns = vec![
-            Column {
-                name: "col_a".to_string(),
-                column_type: ColumnType::Blob,
-                constraints: vec![],
-            },
-            Column {
-                name: "col_b".to_string(),
-                column_type: ColumnType::Blob,
-                constraints: vec![],
-            },
-            Column {
-                name: "col_c".to_string(),
-                column_type: ColumnType::Blob,
-                constraints: vec![ColumnConstraint::Generated {
-                    expr: Box::new(Expr::Binary(
-                        Box::new(Expr::Id(Name::from_string("col_a"))),
-                        Operator::Concat,
-                        Box::new(Expr::Id(Name::from_string("col_b"))),
-                    )),
-                    typ: None,
-                }],
-            },
-            Column {
-                name: "col_d".to_string(),
-                column_type: ColumnType::Blob,
-                constraints: vec![ColumnConstraint::Generated {
-                    expr: Box::new(Expr::Id(Name::from_string("col_c"))),
-                    typ: None,
-                }],
-            },
-            Column {
-                name: "col_e".to_string(),
-                column_type: ColumnType::Blob,
-                constraints: vec![ColumnConstraint::Generated {
-                    expr: Box::new(Expr::Id(Name::from_string("col_a"))),
-                    typ: None,
-                }],
-            },
-        ];
-
-        // col_c's expression has direct concat
-        let col_c_expr = columns[2].generated_expr().unwrap();
-        assert!(has_transitive_concat(col_c_expr, &columns));
-
-        // col_d's expression transitively has concat (via col_c)
-        let col_d_expr = columns[3].generated_expr().unwrap();
-        assert!(has_transitive_concat(col_d_expr, &columns));
-
-        // col_e's expression has no concat (just references col_a which is non-generated)
-        let col_e_expr = columns[4].generated_expr().unwrap();
-        assert!(!has_transitive_concat(col_e_expr, &columns));
-
-        // Direct expressions without column references
-        let no_concat = Expr::Binary(
-            Box::new(Expr::Id(Name::from_string("col_a"))),
-            Operator::Add,
-            Box::new(Expr::Id(Name::from_string("col_b"))),
-        );
-        assert!(!has_transitive_concat(&no_concat, &columns));
-
-        let with_concat = Expr::Binary(
-            Box::new(Expr::Id(Name::from_string("col_a"))),
-            Operator::Concat,
-            Box::new(Expr::Id(Name::from_string("col_b"))),
-        );
-        assert!(has_transitive_concat(&with_concat, &columns));
     }
 }
