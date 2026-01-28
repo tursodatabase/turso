@@ -1064,7 +1064,7 @@ fn optimize_table_access(
         Vec::new()
     };
     let maybe_order_target = compute_order_target(order_by, group_by.as_mut(), table_references);
-    let constraints_per_table = constraints_from_where_clause(
+    let mut constraints_per_table = constraints_from_where_clause(
         where_clause,
         table_references,
         available_indexes,
@@ -1079,43 +1079,62 @@ fn optimize_table_access(
         .map(|t| base_row_estimate(schema, t, params))
         .collect::<Vec<_>>();
 
-    // Currently the expressions we evaluate as constraints are binary expressions that will never be true for a NULL operand.
+    // Currently the expressions we evaluate as constraints are binary comparisons that (except for IS/IS NOT)
+    // will never be true for a NULL operand.
     // If there are any constraints on the right hand side table of an outer join that are not part of the outer join condition,
     // the outer join can be converted into an inner join.
     // for example:
     // - SELECT * FROM t1 LEFT JOIN t2 ON false WHERE t2.id = 5
     // there can never be a situation where null columns are emitted for t2 because t2.id = 5 will never be true in that case.
     // hence: we can convert the outer join into an inner join.
-    for (i, t) in table_references
-        .joined_tables_mut()
-        .iter_mut()
-        .enumerate()
-        .filter(|(_, t)| {
-            t.join_info
-                .as_ref()
-                .is_some_and(|join_info| join_info.outer)
-        })
-    {
-        // Check if there's a constraint that would filter out NULL rows,
-        // allowing us to convert the LEFT JOIN into an INNER JOIN for join reordering purposes.
-        // Most binary ops like x = foo filter out NULL rows, but
-        // IS NULL constraints do NOT - they specifically KEEP them.
-        // So we should not convert LEFT JOIN to INNER JOIN based on IS NULL constraints.
-        if constraints_per_table[i].constraints.iter().any(|c| {
-            let is_from_where = where_clause[c.where_clause_pos.0].from_outer_join.is_none();
-            let is_is_null = c.operator == ast::Operator::Is.into();
-            is_from_where && !is_is_null
-        }) {
-            t.join_info.as_mut().unwrap().outer = false;
-            for term in where_clause.iter_mut() {
-                if let Some(from_outer_join) = term.from_outer_join {
-                    if from_outer_join == t.internal_id {
-                        term.from_outer_join = None;
+    //
+    // Converting a LEFT JOIN into an INNER JOIN is an optimization opportunity:
+    // it can enable join reordering and let more predicates participate in key selection.
+    // -> recompute constraints if we rewrote a LEFT JOIN into an INNER JOIN.
+    loop {
+        let mut outer_join_rewritten = false;
+        for (i, t) in table_references
+            .joined_tables_mut()
+            .iter_mut()
+            .enumerate()
+            .filter(|(_, t)| {
+                t.join_info
+                    .as_ref()
+                    .is_some_and(|join_info| join_info.outer)
+            })
+        {
+            // Check if there's a constraint that would filter out NULL rows,
+            // allowing us to convert the LEFT JOIN into an INNER JOIN for join reordering purposes.
+            // Most binary ops like x = foo filter out NULL rows, but
+            // IS NULL constraints do NOT - they specifically KEEP them.
+            // So we should not convert LEFT JOIN to INNER JOIN based on IS NULL constraints.
+            if constraints_per_table[i].constraints.iter().any(|c| {
+                let is_from_where = where_clause[c.where_clause_pos.0].from_outer_join.is_none();
+                let is_is_null = c.operator == ast::Operator::Is.into();
+                is_from_where && !is_is_null
+            }) {
+                t.join_info.as_mut().unwrap().outer = false;
+                for term in where_clause.iter_mut() {
+                    if let Some(from_outer_join) = term.from_outer_join {
+                        if from_outer_join == t.internal_id {
+                            term.from_outer_join = None;
+                        }
                     }
                 }
+                outer_join_rewritten = true;
             }
-            continue;
         }
+        if !outer_join_rewritten {
+            break;
+        }
+        constraints_per_table = constraints_from_where_clause(
+            where_clause,
+            table_references,
+            available_indexes,
+            subqueries,
+            schema,
+            params,
+        )?;
     }
 
     let Some(best_join_order_result) = compute_best_join_order(
