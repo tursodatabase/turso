@@ -2638,8 +2638,14 @@ impl BTreeCursor {
                     let parent_page = self.stack.get_page_at_level(parent_page_idx).unwrap();
                     let parent_contents = parent_page.get_contents();
                     if !past_rightmost_pointer && over_cell_count > 0 {
-                        // The ONLY way we can have an overflow cell in the parent is if we replaced an interior cell from a cell in the child, and that replacement did not fit.
-                        // This can only happen on index btrees.
+                        // OVERFLOW CELL DESIGN:
+                        // - Parent (interior) pages: At most 1 overflow cell, caused by InteriorNodeReplacement
+                        //   where an index key update overflows the interior cell.
+                        // - Sibling (leaf) pages: Can have multiple overflow cells during balancing,
+                        //   when consecutive inserts overflow before balance completes.
+                        //
+                        // The assertions below apply specifically to parent pages during the
+                        // overflow detection phase, NOT to sibling pages during collection.
                         if matches!(page_type, PageType::IndexInterior) {
                             turso_assert!(parent_contents.overflow_cells.len() == 1, "index interior page must have no more than 1 overflow cell, as a result of InteriorNodeReplacement");
                         } else {
@@ -2696,8 +2702,14 @@ impl BTreeCursor {
                     };
                     let sibling_count = sibling_pointer + 1;
 
-                    let last_sibling_is_right_pointer = sibling_pointer + first_cell_divider
-                        - parent_contents.overflow_cells.len()
+                    let logical_last_divider_idx = sibling_pointer + first_cell_divider;
+                    let overflow_cells_before_last_divider = parent_contents
+                        .overflow_cells
+                        .iter()
+                        .filter(|oc| oc.index < logical_last_divider_idx)
+                        .count();
+                    let last_sibling_is_right_pointer = logical_last_divider_idx
+                        - overflow_cells_before_last_divider
                         == parent_contents.cell_count();
                     // Get the right page pointer that we will need to update later
                     let right_pointer = if last_sibling_is_right_pointer {
@@ -2883,6 +2895,18 @@ impl BTreeCursor {
                         let sibling_page = balance_info.pages_to_balance[i].as_ref().unwrap();
                         turso_assert!(sibling_page.is_loaded(), "sibling page is not loaded");
                         let sibling_contents = sibling_page.get_contents();
+                        #[cfg(debug_assertions)]
+                        {
+                            // Verify overflow cells are sorted by index
+                            for window in sibling_contents.overflow_cells.windows(2) {
+                                turso_assert!(
+                                    window[0].index <= window[1].index,
+                                    "overflow cells must be sorted by index: {} > {}",
+                                    window[0].index,
+                                    window[1].index
+                                );
+                            }
+                        }
                         total_cells_to_redistribute += sibling_contents.cell_count();
                         total_cells_to_redistribute += sibling_contents.overflow_cells.len();
 
@@ -3023,15 +3047,35 @@ impl BTreeCursor {
                             // TODO(pere): make this reference and not copy
                             cell_array.cell_payloads.push(to_static_buf(cell_buf));
                         }
-                        // Insert overflow cells into correct place
+                        // Insert overflow cells into correct place.
+                        // Multiple overflow cells may have the same index, so we need to
+                        // account for previous insertions shifting positions.
+                        // When we insert at position P, all elements at P and after shift right.
+                        // So if we have two overflow cells at index 10, after inserting the first,
+                        // the second should go at index 11 (original index + 1 for the shift).
                         let offset = total_cells_inserted;
-                        for overflow_cell in old_page_contents.overflow_cells.iter_mut() {
+                        // Sort overflow cells by index to ensure consistent insertion order
+                        let mut overflow_cells: Vec<_> =
+                            old_page_contents.overflow_cells.iter_mut().collect();
+                        overflow_cells.sort_by_key(|oc| oc.index);
+                        // Track how many cells at each index we've inserted to adjust positions
+                        // We only need to offset when there are multiple cells at the SAME index
+                        let mut prev_index: Option<usize> = None;
+                        let mut same_index_count = 0usize;
+                        for overflow_cell in overflow_cells.into_iter() {
+                            let current_index = overflow_cell.index;
+                            if prev_index == Some(current_index) {
+                                same_index_count += 1;
+                            } else {
+                                same_index_count = 0;
+                            }
+                            prev_index = Some(current_index);
+                            // Only add offset for cells at the same index
                             cell_array.cell_payloads.insert(
-                                offset + overflow_cell.index,
+                                offset + overflow_cell.index + same_index_count,
                                 to_static_buf(&mut Pin::as_mut(&mut overflow_cell.payload)),
                             );
                         }
-
                         old_cell_count_per_page_cumulative[i] =
                             cell_array.cell_payloads.len() as u16;
 
@@ -3993,10 +4037,6 @@ impl BTreeCursor {
                 let cell_buf = to_static_buf(&mut buf[cell_start..cell_start + cell_len]);
                 let cell_buf_in_array = &cells_debug[current_index_cell];
                 if cell_buf != cell_buf_in_array {
-                    tracing::error!("balance_non_root(cell_not_found_debug, page_id={}, cell_in_cell_array_idx={})",
-                        page.get().id,
-                        current_index_cell,
-                    );
                     valid = false;
                 }
 
@@ -4197,10 +4237,17 @@ impl BTreeCursor {
                     }
                     continue;
                 }
+                // Convert logical index to physical index by subtracting overflow cells with index < cell_divider_idx
+                let overflow_cells_before = parent_contents
+                    .overflow_cells
+                    .iter()
+                    .filter(|oc| oc.index < cell_divider_idx)
+                    .count();
+                let physical_cell_idx = cell_divider_idx - overflow_cells_before;
                 // check if overflow
                 // check if right pointer, this is the last page. Do we update rightmost pointer and defragment moves it?
                 let (cell_start, cell_len) = parent_contents
-                    .cell_get_raw_region(cell_divider_idx, usable_space)
+                    .cell_get_raw_region(physical_cell_idx, usable_space)
                     .unwrap();
                 let cell_left_pointer = read_u32(&parent_buf[cell_start..cell_start + cell_len], 0);
                 if cell_left_pointer != page.get().id as u32 {
@@ -4230,7 +4277,7 @@ impl BTreeCursor {
                     )
                     .unwrap();
                     let parent_cell = parent_contents
-                        .cell_get(cell_divider_idx, usable_space)
+                        .cell_get(physical_cell_idx, usable_space)
                         .unwrap();
                     let rowid = match cell {
                         BTreeCell::TableLeafCell(table_leaf_cell) => table_leaf_cell.rowid,
@@ -4278,7 +4325,7 @@ impl BTreeCursor {
                         continue;
                     }
                     let (parent_cell_start, parent_cell_len) = parent_contents
-                        .cell_get_raw_region(cell_divider_idx, usable_space)
+                        .cell_get_raw_region(physical_cell_idx, usable_space)
                         .unwrap();
                     let cell_buf_in_array = &cells_debug[current_index_cell];
                     let left_pointer = read_u32(
@@ -6811,13 +6858,32 @@ fn edit_page(
         )?;
         count_cells += count;
     }
-    // TODO: overflow cells
+    // Handle overflow cells.
+    // During collection, overflow cells are sorted by index and inserted into cell_array
+    // with an offset to handle multiple cells at the same index.
+    // We need to use the same logic here when reading from cell_array.
     debug_validate_cells!(defragmented_page.0, usable_space);
-    for i in 0..defragmented_page.0.overflow_cells.len() {
-        let overflow_cell = &defragmented_page.0.overflow_cells[i];
+    // Sort overflow cells by index to match collection order
+    let mut sorted_overflow_indices: Vec<_> =
+        (0..defragmented_page.0.overflow_cells.len()).collect();
+    sorted_overflow_indices.sort_by_key(|&i| defragmented_page.0.overflow_cells[i].index);
+    // Track how many cells at each index we've processed
+    let mut prev_index: Option<usize> = None;
+    let mut same_index_count = 0usize;
+    for &oc_idx in sorted_overflow_indices.iter() {
+        let overflow_cell = &defragmented_page.0.overflow_cells[oc_idx];
+        let current_index = overflow_cell.index;
+        if prev_index == Some(current_index) {
+            same_index_count += 1;
+        } else {
+            same_index_count = 0;
+        }
+        prev_index = Some(current_index);
         // cell index in context of new list of cells that should be in the page
         if start_old_cells + overflow_cell.index >= start_new_cells {
-            let cell_idx = start_old_cells + overflow_cell.index - start_new_cells;
+            // Add same_index_count because that's how cells were inserted into cell_array
+            let cell_idx =
+                start_old_cells + overflow_cell.index + same_index_count - start_new_cells;
             if cell_idx < number_new_cells {
                 count_cells += 1;
                 page_insert_array(
@@ -7606,6 +7672,9 @@ fn _insert_into_cell(
     if !enough_space {
         #[cfg(debug_assertions)]
         {
+            // This assertion ensures overflow cells remain sorted by index.
+            // Multiple overflow cells only occur when a parent overflows during balancing
+            // as divider cells are inserted into it - those cells are always in-order and sequential.
             if let Some(overflow_cell) = page.overflow_cells.last() {
                 turso_assert!(overflow_cell.index + 1 == cell_idx, "multiple overflow cells can only occur when a parent overflows during balancing as divider cells are inserted into it. those cells should always be in-order and sequential");
             }
@@ -8020,6 +8089,17 @@ fn drop_cell(page: &mut PageContent, cell_idx: usize, usable_space: usize) -> Re
         page.write_fragmented_bytes_count(0);
     }
     page.write_cell_count(page.cell_count() as u16 - 1);
+
+    // Adjust overflow cell indices after deletion.
+    // Overflow cells track their intended position via `index`. When a regular cell
+    // is deleted, any overflow cells that were positioned after it need their
+    // indices decremented to maintain correct positioning during balance operations.
+    for overflow_cell in page.overflow_cells.iter_mut() {
+        if overflow_cell.index > cell_idx {
+            overflow_cell.index -= 1;
+        }
+    }
+
     debug_validate_cells!(page, usable_space);
     Ok(())
 }
@@ -10632,8 +10712,272 @@ mod tests {
         }
     }
 
+    /// Regression test for overflow cell handling during balance.
+    ///
+    /// Bug: When multiple overflow cells had the same index, they were inserted
+    /// at incorrect positions in cell_array during balance_non_root's collection
+    /// phase, causing data corruption.
+    ///
+    /// Root cause: The code used Vec::insert at the same position for all cells
+    /// with the same index, which caused them to appear in reverse order.
+    ///
+    /// This test creates an index B-tree and inserts keys in a pattern that
+    /// forces multiple overflow cells at the same index, then verifies all
+    /// cells can be read back correctly.
+    #[test]
+    pub fn test_overflow_cells_same_index() {
+        use crate::storage::pager::CreateBTreeFlags;
+        use crate::types::ValueRef;
+
+        // Create an index B-tree (not table) since the bug is most visible with index pages
+        let (pager, _, _, conn) = empty_btree();
+        let index_root = pager
+            .io
+            .block(|| pager.btree_create(&CreateBTreeFlags::new_index()))
+            .unwrap() as i64;
+
+        let index_def = Index {
+            name: "test_idx".to_string(),
+            where_clause: None,
+            columns: vec![IndexColumn {
+                name: "key".to_string(),
+                order: SortOrder::Asc,
+                collation: None,
+                pos_in_table: 0,
+                default: None,
+                expr: None,
+            }],
+            table_name: "test".to_string(),
+            root_page: index_root,
+            unique: false,
+            ephemeral: false,
+            has_rowid: false,
+            index_method: None,
+        };
+
+        // Strategy: Insert keys that will cause page splits and overflow cells.
+        // We use large keys (1500 bytes each) to quickly fill pages.
+        // The keys are designed so that when a page is full and we insert
+        // multiple keys that sort to the same position, they become overflow
+        // cells with the same index.
+
+        let mut inserted_keys: Vec<Vec<u8>> = Vec::new();
+
+        // Insert enough keys to create a multi-level B-tree with overflow cells
+        for batch in 0..5u8 {
+            // Each batch starts with a common prefix to group keys
+            let prefix = vec![batch; 100];
+
+            // Insert 20 keys per batch with large payloads
+            for i in 0..20u8 {
+                pager.begin_read_tx().unwrap();
+                pager.io.block(|| pager.begin_write_tx()).unwrap();
+
+                // Create a key: prefix + unique suffix + padding
+                let mut key = prefix.clone();
+                key.push(i);
+                // Pad to 1500 bytes to force overflow cells quickly
+                key.extend(std::iter::repeat_n(i, 1400));
+
+                // Create fresh cursor for each insert
+                let mut cursor = BTreeCursor::new_index(
+                    pager.clone(),
+                    index_root,
+                    &index_def,
+                    index_def.columns.len(),
+                );
+
+                let regs = vec![Register::Value(Value::Blob(key.clone()))];
+                let record = ImmutableRecord::from_registers(&regs, regs.len());
+
+                run_until_done(
+                    || cursor.seek(SeekKey::IndexKey(&record), SeekOp::GE { eq_only: true }),
+                    pager.deref(),
+                )
+                .unwrap();
+
+                run_until_done(
+                    || cursor.insert(&BTreeKey::new_index_key(&record)),
+                    pager.deref(),
+                )
+                .unwrap();
+
+                inserted_keys.push(key);
+
+                pager.io.block(|| pager.commit_tx(&conn, true)).unwrap();
+                pager.end_read_tx();
+            }
+        }
+
+        // Sort keys to get expected order
+        inserted_keys.sort();
+
+        // Verify all keys can be read back in correct order
+        pager.begin_read_tx().unwrap();
+
+        let mut cursor = BTreeCursor::new_index(
+            pager.clone(),
+            index_root,
+            &index_def,
+            index_def.columns.len(),
+        );
+        cursor.move_to_root().unwrap();
+        let mut count = 0;
+        loop {
+            run_until_done(|| cursor.next(), pager.deref()).unwrap();
+            if !cursor.has_record {
+                break;
+            }
+
+            // Read the key
+            let key_record = loop {
+                match cursor.record().unwrap() {
+                    IOResult::Done(r) => break r,
+                    IOResult::IO(io) => io.wait(&*pager.io).unwrap(),
+                }
+            }
+            .unwrap();
+            let actual_values: Vec<Value> = key_record
+                .get_values()
+                .unwrap()
+                .iter()
+                .map(ValueRef::to_owned)
+                .collect();
+
+            if let Value::Blob(actual_bytes) = &actual_values[0] {
+                assert_eq!(
+                    *actual_bytes,
+                    inserted_keys[count],
+                    "Key mismatch at position {}: actual first 10 bytes = {:?}, expected first 10 bytes = {:?}",
+                    count,
+                    &actual_bytes[..10.min(actual_bytes.len())],
+                    &inserted_keys[count][..10.min(inserted_keys[count].len())]
+                );
+            } else {
+                panic!("Expected Blob value at position {count}");
+            }
+
+            count += 1;
+        }
+
+        assert_eq!(
+            count,
+            inserted_keys.len(),
+            "Expected {} keys, found {}",
+            inserted_keys.len(),
+            count
+        );
+
+        pager.end_read_tx();
+    }
+
     fn run_until_done<T>(action: impl FnMut() -> Result<IOResult<T>>, pager: &Pager) -> Result<T> {
         pager.io.block(action)
+    }
+
+    /// Test that drop_cell correctly adjusts overflow cell indices.
+    ///
+    /// This test verifies the fix for a bug where balance_non_root would panic
+    /// when a sibling page had overflow cells with indices beyond cell_count.
+    ///
+    /// The bug occurred in IVM scenarios where:
+    /// 1. A page has an overflow cell created during an insert
+    /// 2. Before balance completes, another operation deletes a cell from the same page
+    /// 3. Without the fix, the overflow cell index would exceed cell_count
+    /// 4. balance_non_root would panic when collecting cells
+    ///
+    /// The fix: drop_cell now adjusts overflow cell indices when cells are deleted,
+    /// similar to how shift_pointers_left adjusts regular cell pointers.
+    #[test]
+    pub fn test_drop_cell_adjusts_overflow_cell_indices() {
+        let (pager, _, _, _) = empty_btree();
+        let usable_space = pager.usable_space();
+
+        // Create a test page
+        let page = run_until_done(|| pager.allocate_page(), &pager).unwrap();
+        btree_init_page(&page, PageType::TableLeaf, 0, usable_space);
+
+        let page_contents = page.get_contents();
+
+        // Insert several small cells to fill the page partially
+        for i in 0..10 {
+            let regs = &[Register::Value(Value::Integer(i))];
+            let record = ImmutableRecord::from_registers(regs, regs.len());
+            let mut payload = Vec::new();
+            let mut fill_state = FillCellPayloadState::Start;
+            run_until_done(
+                || {
+                    fill_cell_payload(
+                        &PinGuard::new(page.clone()),
+                        Some(i),
+                        &mut payload,
+                        i as usize,
+                        &record,
+                        usable_space,
+                        pager.clone(),
+                        &mut fill_state,
+                    )
+                },
+                &pager,
+            )
+            .unwrap();
+            insert_into_cell(page_contents, &payload, i as usize, usable_space).unwrap();
+        }
+
+        assert_eq!(page_contents.cell_count(), 10);
+
+        // Now manually add overflow cells at indices 10 and 11
+        // (simulating what happens when inserts overflow during balance)
+        page_contents.overflow_cells.push(OverflowCell {
+            index: 10,
+            payload: std::pin::Pin::new(vec![1, 2, 3, 4]), // Dummy payload
+        });
+        page_contents.overflow_cells.push(OverflowCell {
+            index: 11,
+            payload: std::pin::Pin::new(vec![5, 6, 7, 8]), // Dummy payload
+        });
+
+        assert_eq!(page_contents.overflow_cells.len(), 2);
+        assert_eq!(page_contents.overflow_cells[0].index, 10);
+        assert_eq!(page_contents.overflow_cells[1].index, 11);
+
+        // Delete cell at index 5 - this should adjust overflow indices
+        drop_cell(page_contents, 5, usable_space).unwrap();
+
+        // Verify: cell_count decreased by 1
+        assert_eq!(page_contents.cell_count(), 9);
+
+        // Verify: overflow cell indices were adjusted (decremented by 1)
+        // because they were both > 5
+        assert_eq!(page_contents.overflow_cells[0].index, 9);
+        assert_eq!(page_contents.overflow_cells[1].index, 10);
+
+        // Delete cell at index 0 - this should also adjust overflow indices
+        drop_cell(page_contents, 0, usable_space).unwrap();
+
+        assert_eq!(page_contents.cell_count(), 8);
+        assert_eq!(page_contents.overflow_cells[0].index, 8);
+        assert_eq!(page_contents.overflow_cells[1].index, 9);
+
+        // Delete cell at index 8 (now the last regular cell)
+        // This should NOT affect overflow indices since they point past the deleted cell
+        drop_cell(page_contents, 7, usable_space).unwrap();
+
+        assert_eq!(page_contents.cell_count(), 7);
+        // Overflow indices should still be valid (pointing past the regular cells)
+        assert_eq!(page_contents.overflow_cells[0].index, 7);
+        assert_eq!(page_contents.overflow_cells[1].index, 8);
+
+        // Key invariant: overflow cell indices should always be <= cell_count + overflow_cells.len()
+        // With cell_count=7 and 2 overflow cells, valid indices are 0..=9
+        assert!(
+            page_contents.overflow_cells[0].index
+                <= page_contents.cell_count() + page_contents.overflow_cells.len()
+        );
+        assert!(
+            page_contents.overflow_cells[1].index
+                <= page_contents.cell_count() + page_contents.overflow_cells.len()
+        );
     }
 
     #[test]
