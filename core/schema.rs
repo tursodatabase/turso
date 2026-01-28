@@ -1902,9 +1902,7 @@ fn has_transitive_dependency(
     }
 
     // Find the column with this name
-    let col = columns
-        .iter()
-        .find(|c| c.name.as_deref() == Some(start));
+    let col = columns.iter().find(|c| c.name.as_deref() == Some(start));
 
     let Some(col) = col else {
         return false; // Not a generated column or doesn't exist yet
@@ -2424,8 +2422,12 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                     // check if it can transitively reach back to the current column
                     for ref_col in &referenced_cols {
                         let mut visited = std::collections::HashSet::new();
-                        if has_transitive_dependency(ref_col, &current_col_name, &cols, &mut visited)
-                        {
+                        if has_transitive_dependency(
+                            ref_col,
+                            &current_col_name,
+                            &cols,
+                            &mut visited,
+                        ) {
                             crate::bail_parse_error!(
                                 "circular dependency in generated columns \"{}\" and \"{}\"",
                                 name,

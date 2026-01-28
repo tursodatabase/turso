@@ -1620,7 +1620,6 @@ pub fn rewrite_column_references_if_needed(
     from: &str,
     to: &str,
 ) {
-
     for cc in &mut col.constraints {
         match &mut cc.constraint {
             ast::ColumnConstraint::ForeignKey { clause, .. } => {

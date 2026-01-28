@@ -2774,11 +2774,7 @@ pub(super) fn propagate_virtual_column_updates(
     // Maximum iterations = number of VIRTUAL columns + 1
     // In a valid acyclic graph, we can add at most one column per iteration.
     // If we exceed this, there's a cyclic dependency that slipped past validation.
-    let max_iterations = columns
-        .iter()
-        .filter(|c| c.is_virtual_generated())
-        .count()
-        + 1;
+    let max_iterations = columns.iter().filter(|c| c.is_virtual_generated()).count() + 1;
     let mut iterations = 0;
 
     loop {
