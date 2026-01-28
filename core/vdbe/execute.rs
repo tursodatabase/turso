@@ -3946,11 +3946,15 @@ fn update_agg_payload(
             }
         }
         AggFunc::GroupConcat | AggFunc::StringAgg => {
+            if matches!(arg, Value::Null) {
+                return Ok(());
+            }
             let delimiter = maybe_arg2.unwrap_or_else(|| Value::build_text(","));
             let acc = &mut payload[0];
             if acc.to_string().is_empty() {
-                *acc = arg;
-            } else if !matches!(arg, Value::Null) {
+                // Convert arg to Text to ensure GROUP_CONCAT always returns TEXT type
+                *acc = Value::build_text(arg.to_string());
+            } else {
                 *acc += delimiter;
                 *acc += arg;
             }
