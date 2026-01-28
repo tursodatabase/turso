@@ -314,6 +314,20 @@ expect error {
     wrong number of arguments to function replace()
 }
 
+test replace-null-byte-pattern {
+    select replace('hello', char(0), 'world');
+}
+expect {
+    hello
+}
+
+test replace-null-byte-prefix {
+    select replace('hello', char(0) || 'e', 'world');
+}
+expect {
+    hello
+}
+
 test hex {
     select hex('limbo')
 }
@@ -571,6 +585,12 @@ expect {
 
 test trim-pattern-null {
     SELECT trim(null, 'null');
+}
+expect {
+}
+
+test trim-pattern-null-2 {
+    SELECT trim('abc', NULL);
 }
 expect {
 }

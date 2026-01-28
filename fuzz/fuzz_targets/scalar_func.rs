@@ -12,7 +12,7 @@ use turso_core::json::{
     json_object, json_patch, json_quote, json_remove, json_replace, json_set, json_type,
     JsonCacheCell,
 };
-use turso_core::vdbe::likeop::{construct_like_escape_arg, exec_glob, exec_like_with_escape};
+use turso_core::vdbe::likeop::exec_glob;
 use turso_core::vdbe::Register;
 use turso_core::MathFunc;
 use turso_core::Value as CoreValue;
@@ -209,8 +209,7 @@ enum ScalarFuncCall {
     Variadic(VariadicFunc, Vec<Value>),
     Cast(Value, CastType),
     Nullif(Value, Value),
-    Like(Value, Value),
-    LikeEscape(Value, Value, Value),
+    Like(Value, Value, Value),
     RandomBlob(Value),
     MathUnary(MathUnaryFunc, Value),
     MathBinary(MathBinaryFunc, Value, Value),
@@ -428,18 +427,11 @@ fn execute_scalar_func(call: ScalarFuncCall) {
             let v2: CoreValue = v2.into();
             let _ = v1.exec_nullif(&v2);
         }
-        ScalarFuncCall::Like(pattern, text) => {
+        ScalarFuncCall::Like(pattern, text, escape) => {
             let pattern: CoreValue = pattern.into();
             let text: CoreValue = text.into();
-            let _ = CoreValue::exec_like(None, &pattern.to_string(), &text.to_string());
-        }
-        ScalarFuncCall::LikeEscape(pattern, text, escape) => {
-            let pattern: CoreValue = pattern.into();
-            let text: CoreValue = text.into();
-            let escape: CoreValue = escape.into();
-            if let Ok(Some(escape_char)) = construct_like_escape_arg(&escape) {
-                let _ = exec_like_with_escape(&pattern.to_string(), &text.to_string(), escape_char);
-            }
+            let escape_char = CoreValue::from(escape).to_string().chars().next();
+            let _ = CoreValue::exec_like(&pattern.to_string(), &text.to_string(), escape_char);
         }
         ScalarFuncCall::RandomBlob(val) => {
             let v: CoreValue = val.into();
