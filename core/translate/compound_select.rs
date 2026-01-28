@@ -470,7 +470,7 @@ fn create_dedupe_index(
         root_page: 0,
         ephemeral: true,
         table_name: String::new(),
-        unique: false,
+        unique: true,
         has_rowid: false,
         where_clause: None,
         index_method: None,

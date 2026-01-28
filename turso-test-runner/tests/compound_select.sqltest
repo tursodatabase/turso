@@ -1,0 +1,78 @@
+@database :memory:
+
+test union-deduplicates-identical-values {
+    SELECT 1 AS col UNION SELECT 1;
+}
+expect {
+    1
+}
+
+test union-preserves-different-values {
+    SELECT 1 AS col UNION SELECT 2;
+}
+expect {
+    1
+    2
+}
+
+test union-deduplicates-multiple-duplicates {
+    SELECT 1 AS col UNION SELECT 1 UNION SELECT 2 UNION SELECT 2;
+}
+expect {
+    1
+    2
+}
+
+test union-all-preserves-duplicates {
+    SELECT 1 AS col UNION ALL SELECT 1;
+}
+expect {
+    1
+    1
+}
+
+test union-with-table-deduplicates {
+    CREATE TABLE t(x);
+    INSERT INTO t VALUES (1), (2), (1);
+    SELECT x FROM t UNION SELECT x FROM t;
+}
+expect {
+    1
+    2
+}
+
+test union-with-table-union-all-preserves {
+    CREATE TABLE t(x);
+    INSERT INTO t VALUES (1), (2), (1);
+    SELECT x FROM t UNION ALL SELECT x FROM t;
+}
+expect {
+    1
+    2
+    1
+    1
+    2
+    1
+}
+
+test union-with-null-values {
+    SELECT NULL AS col UNION SELECT NULL;
+}
+expect {
+}
+
+test union-multiple-columns {
+    SELECT 1 AS a, 'x' AS b UNION SELECT 1, 'x';
+}
+expect {
+    1|x
+}
+
+test union-multiple-columns-different {
+    SELECT 1 AS a, 'x' AS b UNION SELECT 1, 'y';
+}
+expect {
+    1|x
+    1|y
+}
+
