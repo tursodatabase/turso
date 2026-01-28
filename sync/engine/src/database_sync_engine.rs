@@ -499,11 +499,10 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         // Use async database opening that yields on IO for large schemas
         let mut open_state = turso_core::OpenDbAsyncState::new();
         let main_db = loop {
-            match turso_core::Database::open_with_flags_bypass_registry_async(
+            match turso_core::Database::open_with_flags_async(
                 &mut open_state,
                 io.clone(),
                 main_db_path,
-                &create_main_db_wal_path(main_db_path),
                 main_db_storage.clone(),
                 OpenFlags::Create,
                 turso_core::DatabaseOpts::new(),

@@ -302,7 +302,6 @@ pub struct TursoDatabaseOpenState {
     io: Option<Arc<dyn IO>>,
     db_file: Option<Arc<dyn DatabaseStorage>>,
     opts: Option<DatabaseOpts>,
-    wal_path: Option<String>,
     open_db_state: OpenDbAsyncState,
 }
 
@@ -319,7 +318,6 @@ impl TursoDatabaseOpenState {
             io: None,
             db_file: None,
             opts: None,
-            wal_path: None,
             open_db_state: OpenDbAsyncState::new(),
         }
     }
@@ -637,12 +635,9 @@ impl TursoDatabase {
                         ));
                     }
 
-                    let wal_path = format!("{}-wal", &self.config.path);
-
                     state.io = Some(io);
                     state.db_file = Some(db_file);
                     state.opts = Some(opts);
-                    state.wal_path = Some(wal_path);
                     state.phase = TursoDatabaseOpenPhase::Opening;
                 }
 
@@ -656,16 +651,11 @@ impl TursoDatabase {
                         .as_ref()
                         .expect("db_file must be initialized in Init phase");
                     let opts = state.opts.expect("opts must be initialized in Init phase");
-                    let wal_path = state
-                        .wal_path
-                        .as_ref()
-                        .expect("wal_path must be initialized in Init phase");
 
-                    match Database::open_with_flags_bypass_registry_async(
+                    match Database::open_with_flags_async(
                         &mut state.open_db_state,
                         io.clone(),
                         &self.config.path,
-                        wal_path,
                         db_file.clone(),
                         OpenFlags::default(),
                         opts,

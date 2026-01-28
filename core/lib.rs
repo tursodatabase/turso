@@ -509,10 +509,42 @@ impl Database {
         opts: DatabaseOpts,
         encryption_opts: Option<EncryptionOpts>,
     ) -> Result<Arc<Database>> {
-        // turso-sync-engine create 2 databases with different names in the same IO if MemoryIO is used
-        // in this case we need to bypass registry (as this is MemoryIO DB) but also preserve original distinction in names (e.g. :memory:-draft and :memory:-synced)
+        let mut state = OpenDbAsyncState::new();
+        loop {
+            match Self::open_with_flags_async(
+                &mut state,
+                io.clone(),
+                path,
+                db_file.clone(),
+                flags,
+                opts,
+                encryption_opts.clone(),
+            )? {
+                IOResult::Done(db) => return Ok(db),
+                IOResult::IO(io_completion) => {
+                    io_completion.wait(&*io)?;
+                }
+            }
+        }
+    }
+
+    /// Async version of open_with_flags that returns IOResult.
+    /// Uses the database registry to ensure single Database instance per file.
+    /// Caller must drive the IO loop and pass state between calls.
+    #[allow(clippy::arc_with_non_send_sync)]
+    pub fn open_with_flags_async(
+        state: &mut OpenDbAsyncState,
+        io: Arc<dyn IO>,
+        path: &str,
+        db_file: Arc<dyn DatabaseStorage>,
+        flags: OpenFlags,
+        opts: DatabaseOpts,
+        encryption_opts: Option<EncryptionOpts>,
+    ) -> Result<IOResult<Arc<Database>>> {
+        // For :memory: databases, bypass the registry
         if path.starts_with(":memory:") {
-            return Self::open_with_flags_bypass_registry_internal(
+            return Self::open_with_flags_bypass_registry_async(
+                state,
                 io,
                 path,
                 &format!("{path}-wal"),
@@ -523,39 +555,55 @@ impl Database {
             );
         }
 
-        let mut registry = DATABASE_MANAGER.lock();
+        // Check registry first (only on Init phase)
+        if matches!(state.phase, OpenDbAsyncPhase::Init) {
+            let registry = DATABASE_MANAGER.lock();
 
-        let canonical_path = std::fs::canonicalize(path)
-            .ok()
-            .and_then(|p| p.to_str().map(|s| s.to_string()))
-            .unwrap_or_else(|| path.to_string());
+            let canonical_path = std::fs::canonicalize(path)
+                .ok()
+                .and_then(|p| p.to_str().map(|s| s.to_string()))
+                .unwrap_or_else(|| path.to_string());
 
-        if let Some(db) = registry.get(&canonical_path).and_then(Weak::upgrade) {
-            tracing::debug!("took database {canonical_path:?} from the registry");
+            if let Some(db) = registry.get(&canonical_path).and_then(Weak::upgrade) {
+                tracing::debug!("took database {canonical_path:?} from the registry");
 
-            // Check encryption compatibility using cipher mode (key is not stored in Database for security)
-            let db_is_encrypted = !matches!(db.encryption_cipher_mode.get(), CipherMode::None);
+                let db_is_encrypted = !matches!(db.encryption_cipher_mode.get(), CipherMode::None);
 
-            if db_is_encrypted && encryption_opts.is_none() {
-                return Err(LimboError::InvalidArgument(
-                    "Database is encrypted but no encryption options provided".to_string(),
-                ));
+                if db_is_encrypted && encryption_opts.is_none() {
+                    return Err(LimboError::InvalidArgument(
+                        "Database is encrypted but no encryption options provided".to_string(),
+                    ));
+                }
+
+                return Ok(IOResult::Done(db));
             }
-
-            return Ok(db);
         }
-        tracing::debug!("initialize database {canonical_path:?} and put in the registry");
-        let db = Self::open_with_flags_bypass_registry_internal(
+
+        // Open the database asynchronously
+        let wal_path = format!("{path}-wal");
+        let result = Self::open_with_flags_bypass_registry_async(
+            state,
             io,
             path,
-            &format!("{path}-wal"),
+            &wal_path,
             db_file,
             flags,
             opts,
             encryption_opts,
         )?;
-        registry.insert(canonical_path, Arc::downgrade(&db));
-        Ok(db)
+
+        // If done, insert into registry
+        if let IOResult::Done(ref db) = result {
+            let canonical_path = std::fs::canonicalize(path)
+                .ok()
+                .and_then(|p| p.to_str().map(|s| s.to_string()))
+                .unwrap_or_else(|| path.to_string());
+
+            let mut registry = DATABASE_MANAGER.lock();
+            registry.insert(canonical_path, Arc::downgrade(db));
+        }
+
+        Ok(result)
     }
 
     #[allow(clippy::arc_with_non_send_sync)]
