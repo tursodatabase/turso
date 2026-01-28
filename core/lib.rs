@@ -587,83 +587,24 @@ impl Database {
         opts: DatabaseOpts,
         encryption_opts: Option<EncryptionOpts>,
     ) -> Result<Arc<Database>> {
-        // Parse encryption key from encryption_opts if provided
-        let encryption_key = if let Some(ref enc_opts) = encryption_opts {
-            Some(EncryptionKey::from_hex_string(&enc_opts.hexkey)?)
-        } else {
-            None
-        };
-
-        let mut db = Self::new(
-            opts,
-            flags,
-            path,
-            wal_path,
-            &io,
-            db_file,
-            encryption_opts.clone(),
-        )?;
-
-        let pager = db.header_validation(encryption_key.as_ref())?;
-        #[cfg(debug_assertions)]
-        {
-            let wal_enabled = db.shared_wal.read().enabled.load(Ordering::SeqCst);
-            let mv_store_enabled = db.get_mv_store().is_some();
-            assert!(
-                db.is_readonly() || wal_enabled || mv_store_enabled,
-                "Either WAL or MVStore must be enabled"
-            );
-        }
-
-        // Check: https://github.com/tursodatabase/turso/pull/1761#discussion_r2154013123
-
-        // Wrap db in Arc before connecting
-        let db = Arc::new(db);
-
-        // parse schema
-        let conn = db._connect(false, Some(pager.clone()), encryption_key.clone())?;
-        let syms = conn.syms.read();
-        let pager = conn.pager.load();
-
-        let enable_triggers = db.opts.enable_triggers;
-        db.with_schema_mut(|schema| {
-            let header_schema_cookie = pager
-                .io
-                .block(|| pager.with_header(|header| header.schema_cookie.get()))?;
-            schema.schema_version = header_schema_cookie;
-            let mut make_from_btree_state = schema::MakeFromBtreeState::new();
-            let result = io.block(|| {
-                schema.make_from_btree(
-                    &mut make_from_btree_state,
-                    None,
-                    pager.clone(),
-                    &syms,
-                    enable_triggers,
-                )
-            });
-            match result {
-                Err(LimboError::ExtensionError(e)) => {
-                    // this means that a vtab exists and we no longer have the module loaded. we print
-                    // a warning to the user to load the module
-                    make_from_btree_state.cleanup(&pager);
-                    eprintln!("Warning: {e}");
+        let mut state = OpenDbAsyncState::new();
+        loop {
+            match Self::open_with_flags_bypass_registry_async(
+                &mut state,
+                io.clone(),
+                path,
+                wal_path,
+                db_file.clone(),
+                flags,
+                opts,
+                encryption_opts.clone(),
+            )? {
+                IOResult::Done(db) => return Ok(db),
+                IOResult::IO(io_completion) => {
+                    io_completion.wait(&*io)?;
                 }
-                Err(e) => {
-                    make_from_btree_state.cleanup(&pager);
-                    return Err(e);
-                }
-                Ok(()) => {}
             }
-
-            Ok(())
-        })?;
-
-        if let Some(mv_store) = db.get_mv_store().as_ref() {
-            let mvcc_bootstrap_conn = db._connect(true, Some(pager.clone()), encryption_key)?;
-            mv_store.bootstrap(mvcc_bootstrap_conn)?;
         }
-
-        Ok(db)
     }
 
     /// Async version of database opening that returns IOResult.
