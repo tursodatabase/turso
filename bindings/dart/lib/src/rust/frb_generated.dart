@@ -714,8 +714,8 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   ConnectArgs dco_decode_connect_args(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     final arr = raw as List<dynamic>;
-    if (arr.length != 8)
-      throw Exception('unexpected arr length: expect 8 but see ${arr.length}');
+    if (arr.length != 9)
+      throw Exception('unexpected arr length: expect 9 but see ${arr.length}');
     return ConnectArgs(
       url: dco_decode_String(arr[0]),
       authToken: dco_decode_opt_String(arr[1]),
@@ -725,7 +725,38 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       readYourWrites: dco_decode_opt_box_autoadd_bool(arr[5]),
       openFlags: dco_decode_opt_box_autoadd_open_flags(arr[6]),
       offline: dco_decode_opt_box_autoadd_bool(arr[7]),
+      encryption: dco_decode_opt_box_autoadd_encryption_opts(arr[8]),
     );
+  }
+
+  @protected
+  EncryptionCipher dco_decode_encryption_cipher(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return EncryptionCipher.values[raw as int];
+  }
+
+  @protected
+  EncryptionOpts dco_decode_encryption_opts(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    final arr = raw as List<dynamic>;
+    if (arr.length != 2)
+      throw Exception('unexpected arr length: expect 2 but see ${arr.length}');
+    return EncryptionOpts(
+      cipher: dco_decode_encryption_cipher(arr[0]),
+      hexkey: dco_decode_String(arr[1]),
+    );
+  }
+
+  @protected
+  EncryptionOpts dco_decode_box_autoadd_encryption_opts(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return dco_decode_encryption_opts(raw);
+  }
+
+  @protected
+  EncryptionOpts? dco_decode_opt_box_autoadd_encryption_opts(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return raw == null ? null : dco_decode_box_autoadd_encryption_opts(raw);
   }
 
   @protected
@@ -1125,6 +1156,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     var var_readYourWrites = sse_decode_opt_box_autoadd_bool(deserializer);
     var var_openFlags = sse_decode_opt_box_autoadd_open_flags(deserializer);
     var var_offline = sse_decode_opt_box_autoadd_bool(deserializer);
+    var var_encryption = sse_decode_opt_box_autoadd_encryption_opts(deserializer);
     return ConnectArgs(
       url: var_url,
       authToken: var_authToken,
@@ -1134,6 +1166,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       readYourWrites: var_readYourWrites,
       openFlags: var_openFlags,
       offline: var_offline,
+      encryption: var_encryption,
     );
   }
 
@@ -1272,6 +1305,42 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
 
     if (sse_decode_bool(deserializer)) {
       return (sse_decode_box_autoadd_open_flags(deserializer));
+    } else {
+      return null;
+    }
+  }
+
+  @protected
+  EncryptionCipher sse_decode_encryption_cipher(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    var inner = sse_decode_i_32(deserializer);
+    return EncryptionCipher.values[inner];
+  }
+
+  @protected
+  EncryptionOpts sse_decode_encryption_opts(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    var var_cipher = sse_decode_encryption_cipher(deserializer);
+    var var_hexkey = sse_decode_String(deserializer);
+    return EncryptionOpts(cipher: var_cipher, hexkey: var_hexkey);
+  }
+
+  @protected
+  EncryptionOpts sse_decode_box_autoadd_encryption_opts(
+    SseDeserializer deserializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    return (sse_decode_encryption_opts(deserializer));
+  }
+
+  @protected
+  EncryptionOpts? sse_decode_opt_box_autoadd_encryption_opts(
+    SseDeserializer deserializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+
+    if (sse_decode_bool(deserializer)) {
+      return (sse_decode_box_autoadd_encryption_opts(deserializer));
     } else {
       return null;
     }
@@ -1614,6 +1683,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     sse_encode_opt_box_autoadd_bool(self.readYourWrites, serializer);
     sse_encode_opt_box_autoadd_open_flags(self.openFlags, serializer);
     sse_encode_opt_box_autoadd_bool(self.offline, serializer);
+    sse_encode_opt_box_autoadd_encryption_opts(self.encryption, serializer);
   }
 
   @protected
@@ -1740,6 +1810,47 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     sse_encode_bool(self != null, serializer);
     if (self != null) {
       sse_encode_box_autoadd_open_flags(self, serializer);
+    }
+  }
+
+  @protected
+  void sse_encode_encryption_cipher(
+    EncryptionCipher self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_i_32(self.index, serializer);
+  }
+
+  @protected
+  void sse_encode_encryption_opts(
+    EncryptionOpts self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_encryption_cipher(self.cipher, serializer);
+    sse_encode_String(self.hexkey, serializer);
+  }
+
+  @protected
+  void sse_encode_box_autoadd_encryption_opts(
+    EncryptionOpts self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_encryption_opts(self, serializer);
+  }
+
+  @protected
+  void sse_encode_opt_box_autoadd_encryption_opts(
+    EncryptionOpts? self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+
+    sse_encode_bool(self != null, serializer);
+    if (self != null) {
+      sse_encode_box_autoadd_encryption_opts(self, serializer);
     }
   }
 
