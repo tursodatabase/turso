@@ -18,7 +18,7 @@ use crate::translate::expression_index::{
     normalize_expr_for_index_matching, single_table_column_usage,
 };
 use crate::translate::optimizer::TakeOwnership;
-use crate::translate::plan::{Operation, ResultSetColumn};
+use crate::translate::plan::{Operation, ResultSetColumn, Search};
 use crate::translate::planner::parse_row_id;
 use crate::util::{exprs_are_equivalent, normalize_ident, parse_numeric_literal};
 use crate::vdbe::affinity::Affinity;
@@ -2586,8 +2586,67 @@ pub fn translate_expr(
                     Ok(target_register)
                 }
                 Table::FromClauseSubquery(from_clause_subquery) => {
-                    // If we are reading a column from a subquery, we instead copy the column from the
-                    // subquery's result registers.
+                    // For outer-scope references to materialized subqueries, read from the index cursor
+                    // (the coroutine result registers are not updated during index scans).
+                    if is_from_outer_query_scope {
+                        if let Some(cursor_id) =
+                            program.resolve_any_index_cursor_id_for_table_safe(*table_ref_id)
+                        {
+                            let index = program.resolve_index_for_cursor_id(cursor_id);
+                            let idx_col = index
+                                .columns
+                                .iter()
+                                .position(|c| c.pos_in_table == *column)
+                                .expect("index column not found for subquery column");
+                            program.emit_insn(Insn::Column {
+                                cursor_id,
+                                column: idx_col,
+                                dest: target_register,
+                                default: None,
+                            });
+                            return Ok(target_register);
+                        }
+                    }
+
+                    // Check if this subquery was materialized with an ephemeral index.
+                    // If so, read from the index cursor; otherwise copy from result registers.
+                    if let Some(refs) = referenced_tables {
+                        if let Some(table_reference) = refs
+                            .joined_tables()
+                            .iter()
+                            .find(|t| t.internal_id == *table_ref_id)
+                        {
+                            // Check if the operation is Search::Seek with an ephemeral index
+                            if let Operation::Search(Search::Seek {
+                                index: Some(index), ..
+                            }) = &table_reference.op
+                            {
+                                if index.ephemeral {
+                                    // Read from the index cursor. Index columns may be reordered
+                                    // (key columns first), so find the index column position that
+                                    // corresponds to the original subquery column position.
+                                    let idx_col = index
+                                        .columns
+                                        .iter()
+                                        .position(|c| c.pos_in_table == *column)
+                                        .expect("index column not found for subquery column");
+                                    let cursor_id = program.resolve_cursor_id(&CursorKey::index(
+                                        *table_ref_id,
+                                        index.clone(),
+                                    ));
+                                    program.emit_insn(Insn::Column {
+                                        cursor_id,
+                                        column: idx_col,
+                                        dest: target_register,
+                                        default: None,
+                                    });
+                                    return Ok(target_register);
+                                }
+                            }
+                        }
+                    }
+
+                    // Fallback: copy from result registers (coroutine-based subquery)
                     let result_columns_start = if is_from_outer_query_scope {
                         // For outer query subqueries, look up the register from the program builder
                         // since the cloned subquery doesn't have the register set yet.

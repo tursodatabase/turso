@@ -1671,7 +1671,13 @@ mod cte_tests {
                 let (body, columns, has_numeric, estimated_rows, is_cross_product) =
                     gen_cte_body(&mut rng, cte_idx, &ctes);
 
-                cte_defs.push(format!("{cte_name} AS ({body})"));
+                // Randomly add MATERIALIZED or NOT MATERIALIZED hints
+                let materialization_hint = match rng.random_range(0..10) {
+                    0 => " MATERIALIZED",     // 10% chance
+                    1 => " NOT MATERIALIZED", // 10% chance
+                    _ => "",                  // 80% no hint
+                };
+                cte_defs.push(format!("{cte_name} AS{materialization_hint} ({body})"));
                 ctes.push(CteInfo {
                     name: cte_name,
                     columns,

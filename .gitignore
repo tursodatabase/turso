@@ -8,7 +8,7 @@
 *.so
 *.ipynb
 *.o
-
+*.sqlite
 # Python
 .mypy_cache/
 .pytest_cache/

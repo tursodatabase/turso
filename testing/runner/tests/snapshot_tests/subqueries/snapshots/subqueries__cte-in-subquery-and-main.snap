@@ -1,140 +1,125 @@
 ---
 source: subqueries.sqltest
-expression: "WITH category_avg AS (\n        SELECT category_id, avg(price) AS avg_price\n        FROM products\n        GROUP BY category_id\n    )\n    SELECT p.name, p.price, ca.avg_price\n    FROM products p\n    JOIN category_avg ca ON ca.category_id = p.category_id\n    WHERE p.price > (\n        SELECT max(avg_price) FROM category_avg\n    ) * 0.8;"
+expression: |-
+  WITH category_avg AS (
+          SELECT category_id, avg(price) AS avg_price
+          FROM products
+          GROUP BY category_id
+      )
+      SELECT p.name, p.price, ca.avg_price
+      FROM products p
+      JOIN category_avg ca ON ca.category_id = p.category_id
+      WHERE p.price > (
+          SELECT max(avg_price) FROM category_avg
+      ) * 0.8;
 info:
   statement_type: WITH (CTE)
   tables:
-    - ca.category_id
-    - category_avg
-    - products
+  - ca.category_id
+  - category_avg
+  - products
   setup_blocks:
-    - schema
-  database: ":memory:"
+  - schema
+  database: ':memory:'
 ---
 QUERY PLAN
+|--SCAN products USING INDEX idx_products_category
 |--SCAN category_avg
-|  `--SCAN products USING INDEX idx_products_category
-|--SEARCH p USING INDEX idx_products_category
-`--SCAN category_avg AS ca
-   `--SCAN products USING INDEX idx_products_category
+|--SCAN products AS p
+`--SEARCH ca USING INDEX ephemeral_subquery_t5
 
 BYTECODE
-addr  opcode                            p1   p2   p3  p4              p5  comment
-   0                    Init             0  115    0                   0  Start at 115
-   1                    Once            54    0    0                   0  goto 54
-   2                    BeginSubrtn      2    0    0                   0  r[2]=NULL
-   3                    Null             0    1    0                   0  r[1]=NULL
-   4                    InitCoroutine    3   42    5                   0
-   5                    Null             0   11    0                   0  r[11]=NULL
-   6                    Integer          0    8    0                   0  r[8]=0; clear group by abort flag
-   7                    Null             0    9    0                   0  r[9]=NULL; initialize group by comparison registers to NULL
-   8                    Gosub           15   38    0                   0  ; go to clear accumulator subroutine
-   9                    OpenRead         0    2    0  k(5,B,B,B,B,B)   0  table=products, root=2, iDb=0
-  10                    OpenRead         1    8    0  k(2,B)           0  index=idx_products_category, root=8, iDb=0
-  11                    Rewind           1   27    0                   0  Rewind index idx_products_category
-  12                      DeferredSeek   1    0    0                   0
-  13                      Column         0    2   13                   0  r[13]=products.category_id
-  14                      Column         0    3   14                   0  r[14]=products.price
-  15                      RealAffinity  14    0    0                   0
-  16                      Compare        9   13    1  k(1, Binary)     0  r[9..9]==r[13..13]
-  17                      Jump          18   22   18                   0  ; start new group if comparison is not equal
-  18                      Gosub          6   31    0                   0  ; check if ended group had data, and output if so
-  19                      Move          13    9    1                   0  r[9..9]=r[13..13]
-  20                      IfPos          8   41    0                   0  r[8]>0 -> r[8]-=0, goto 41; check abort flag
-  21                      Gosub         15   38    0                   0  ; goto clear accumulator subroutine
-  22                      AggStep        0   14   11  avg              0  accum=r[11] step(r[14])
-  23                      If             7   25    0                   0  if r[7] goto 25; don't emit group columns if continuing existing group
-  24                      Column         0    2   10                   0  r[10]=products.category_id
-  25                      Integer        1    7    0                   0  r[7]=1; indicate data in accumulator
-  26                    Next             1   12    0                   0
-  27                    Gosub            6   31    0                   0  ; emit row for final group
-  28                    Goto             0   41    0                   0  ; group by finished
-  29                    Integer          1    8    0                   0  r[8]=1
-  30                  Return             6    0    0                   0
-  31                  IfPos              7   33    0                   0  r[7]>0 -> r[7]-=0, goto 33; output group by row subroutine start
-  32                Return               6    0    0                   0
-  33                AggFinal             0   11    0  avg              0  accum=r[11]
-  34                Copy                10    4    0                   0  r[4]=r[10]
-  35                Copy                11    5    0                   0  r[5]=r[11]
-  36                Yield                3    0    0                   0
-  37              Return                 6    0    0                   0
-  38              Null                   0   10   11                   0  r[10..11]=NULL; clear accumulator subroutine start
-  39              Integer                0    7    0                   0  r[7]=0
-  40            Return                  15    0    0                   0
-  41            EndCoroutine             3    0    0                   0
-  42            Null                     0   17    0                   0  r[17]=NULL
-  43            Integer                  1   18    0                   0  r[18]=1; LIMIT counter
-  44            IfNot                   18   50    0                   0  if !r[18] goto 50
-  45            InitCoroutine            3    0    5                   0
-  46              Yield                  3   50    0                   0
-  47              Copy                   5   19    0                   0  r[19]=r[5]
-  48              AggStep                0   19   17  max              0  accum=r[17] step(r[19])
-  49            Goto                     0   46    0                   0
-  50            AggFinal                 0   17    0  max              0  accum=r[17]
-  51            Copy                    17   16    0                   0  r[16]=r[17]
-  52            Copy                    16    1    0                   0  r[1]=r[16]
-  53          Return                     2    0    1                   0
-  54          InitCoroutine             20   92   55                   0
-  55          Null                       0   28    0                   0  r[28]=NULL
-  56          Integer                    0   25    0                   0  r[25]=0; clear group by abort flag
-  57          Null                       0   26    0                   0  r[26]=NULL; initialize group by comparison registers to NULL
-  58          Gosub                     32   88    0                   0  ; go to clear accumulator subroutine
-  59          OpenRead                   2    2    0  k(5,B,B,B,B,B)   0  table=products, root=2, iDb=0
-  60          OpenRead                   3    8    0  k(2,B)           0  index=idx_products_category, root=8, iDb=0
-  61          Rewind                     3   77    0                   0  Rewind index idx_products_category
-  62            DeferredSeek             3    2    0                   0
-  63            Column                   2    2   30                   0  r[30]=products.category_id
-  64            Column                   2    3   31                   0  r[31]=products.price
-  65            RealAffinity            31    0    0                   0
-  66            Compare                 26   30    1  k(1, Binary)     0  r[26..26]==r[30..30]
-  67            Jump                    68   72   68                   0  ; start new group if comparison is not equal
-  68            Gosub                   23   81    0                   0  ; check if ended group had data, and output if so
-  69            Move                    30   26    1                   0  r[26..26]=r[30..30]
-  70            IfPos                   25   91    0                   0  r[25]>0 -> r[25]-=0, goto 91; check abort flag
-  71            Gosub                   32   88    0                   0  ; goto clear accumulator subroutine
-  72            AggStep                  0   31   28  avg              0  accum=r[28] step(r[31])
-  73            If                      24   75    0                   0  if r[24] goto 75; don't emit group columns if continuing existing group
-  74            Column                   2    2   27                   0  r[27]=products.category_id
-  75            Integer                  1   24    0                   0  r[24]=1; indicate data in accumulator
-  76          Next                       3   62    0                   0
-  77          Gosub                     23   81    0                   0  ; emit row for final group
-  78          Goto                       0   91    0                   0  ; group by finished
-  79          Integer                    1   25    0                   0  r[25]=1
-  80        Return                      23    0    0                   0
-  81        IfPos                       24   83    0                   0  r[24]>0 -> r[24]-=0, goto 83; output group by row subroutine start
-  82      Return                        23    0    0                   0
-  83      AggFinal                       0   28    0  avg              0  accum=r[28]
-  84      Copy                          27   21    0                   0  r[21]=r[27]
-  85      Copy                          28   22    0                   0  r[22]=r[28]
-  86      Yield                         20    0    0                   0
-  87    Return                          23    0    0                   0
-  88    Null                             0   27   28                   0  r[27..28]=NULL; clear accumulator subroutine start
-  89    Integer                          0   24    0                   0  r[24]=0
-  90  Return                            32    0    0                   0
-  91  EndCoroutine                      20    0    0                   0
-  92  OpenRead                           4    2    0  k(5,B,B,B,B,B)   0  table=products, root=2, iDb=0
-  93  OpenRead                           5    8    0  k(2,B)           0  index=idx_products_category, root=8, iDb=0
-  94  InitCoroutine                     20    0   55                   0
-  95    Yield                           20  114    0                   0
-  96    Copy                            21   36    0                   0  r[36]=r[21]
-  97    IsNull                          36  113    0                   0  if (r[36]==NULL) goto 113
-  98    Affinity                        36    1    0                   0  r[36..37] = C
-  99    SeekGE                           5  113   36                   0  key=[36..36]
- 100      IdxGT                          5  113   36                   0  key=[36..36]
- 101      DeferredSeek                   5    4    0                   0
- 102      Column                         4    3   38                   0  r[38]=products.price
- 103      RealAffinity                  38    0    0                   0
- 104      Copy                           1   40    0                   0  r[40]=r[1]
- 105      Multiply                      40   41   39                   0  r[39]=r[40]*r[41]
- 106      Le                            38   39  112  Binary           0  if r[38]<=r[39] goto 112
- 107      Column                         4    1   33                   0  r[33]=products.name
- 108      Column                         4    3   34                   0  r[34]=products.price
- 109      RealAffinity                  34    0    0                   0
- 110      Copy                          22   35    0                   0  r[35]=r[22]
- 111      ResultRow                     33    3    0                   0  output=r[33..35]
- 112    Next                             5  100    0                   0
- 113  Goto                               0   95    0                   0
- 114  Halt                               0    0    0                   0
- 115  Transaction                        0    1   11                   0  iDb=0 tx_mode=Read
- 116  Real                               0   41    0  0.8              0  r[41]=0.8
- 117  Goto                               0    1    0                   0
+addr  opcode                    p1  p2  p3  p4              p5  comment
+   0            Init             0  90   0                   0  Start at 90
+   1            Once            57   0   0                   0  goto 57
+   2            BeginSubrtn      2   0   0                   0  r[2]=NULL
+   3            Null             0   1   0                   0  r[1]=NULL
+   4            OpenEphemeral    0   1   0                   0  cursor=0 is_table=true
+   5            Null             0  12   0                   0  r[12]=NULL
+   6            Integer          0   9   0                   0  r[9]=0; clear group by abort flag
+   7            Null             0  10   0                   0  r[10]=NULL; initialize group by comparison registers to NULL
+   8            Gosub           16  40   0                   0  ; go to clear accumulator subroutine
+   9            OpenRead         1   2   0  k(5,B,B,B,B,B)   0  table=products, root=2, iDb=0
+  10            OpenRead         2   8   0  k(2,B)           0  index=idx_products_category, root=8, iDb=0
+  11            Rewind           2  27   0                   0  Rewind index idx_products_category
+  12              DeferredSeek   2   1   0                   0
+  13              Column         1   2  14                   0  r[14]=products.category_id
+  14              Column         1   3  15                   0  r[15]=products.price
+  15              RealAffinity  15   0   0                   0
+  16              Compare       10  14   1  k(1, Binary)     0  r[10..10]==r[14..14]
+  17              Jump          18  22  18                   0  ; start new group if comparison is not equal
+  18              Gosub          7  31   0                   0  ; check if ended group had data, and output if so
+  19              Move          14  10   1                   0  r[10..10]=r[14..14]
+  20              IfPos          9  43   0                   0  r[9]>0 -> r[9]-=0, goto 43; check abort flag
+  21              Gosub         16  40   0                   0  ; goto clear accumulator subroutine
+  22              AggStep        0  15  12  avg              0  accum=r[12] step(r[15])
+  23              If             8  25   0                   0  if r[8] goto 25; don't emit group columns if continuing existing group
+  24              Column         1   2  11                   0  r[11]=products.category_id
+  25              Integer        1   8   0                   0  r[8]=1; indicate data in accumulator
+  26            Next             2  12   0                   0
+  27            Gosub            7  31   0                   0  ; emit row for final group
+  28            Goto             0  43   0                   0  ; group by finished
+  29            Integer          1   9   0                   0  r[9]=1
+  30          Return             7   0   0                   0
+  31          IfPos              8  33   0                   0  r[8]>0 -> r[8]-=0, goto 33; output group by row subroutine start
+  32        Return               7   0   0                   0
+  33        AggFinal             0  12   0  avg              0  accum=r[12]
+  34        Copy                11   5   0                   0  r[5]=r[11]
+  35        Copy                12   6   0                   0  r[6]=r[12]
+  36        MakeRecord           5   2  17                   0  r[17]=mkrec(r[5..6]); for
+  37        NewRowid             0  18   0                   0  r[18]=rowid
+  38        Insert               0  17  18                   4  intkey=r[18] data=r[17]
+  39      Return                 7   0   0                   0
+  40      Null                   0  11  12                   0  r[11..12]=NULL; clear accumulator subroutine start
+  41      Integer                0   8   0                   0  r[8]=0
+  42    Return                  16   0   0                   0
+  43    OpenDup                  3   0   0                   0  new_cursor=3, original_cursor=0
+  44    Null                     0  22   0                   0  r[22]=NULL
+  45    Integer                  1  23   0                   0  r[23]=1; LIMIT counter
+  46    IfNot                   23  53   0                   0  if !r[23] goto 53
+  47    Rewind                   3  53   0                   0  Rewind
+  48      Column                 3   0  19                   0  r[19]=.column 0
+  49      Column                 3   1  20                   0  r[20]=.column 1
+  50      Copy                  20  24   0                   0  r[24]=r[20]
+  51      AggStep                0  24  22  max              0  accum=r[22] step(r[24])
+  52    Next                     3  48   0                   0
+  53    AggFinal                 0  22   0  max              0  accum=r[22]
+  54    Copy                    22  21   0                   0  r[21]=r[22]
+  55    Copy                    21   1   0                   0  r[1]=r[21]
+  56  Return                     2   0   1                   0
+  57  OpenDup                    4   0   0                   0  new_cursor=4, original_cursor=0
+  58  OpenEphemeral              5   0   0                   0  cursor=5 is_table=false
+  59  Rewind                     4  68   0                   0  Rewind
+  60    Column                   4   0  26                   0  r[26]=.column 0
+  61    Column                   4   1  27                   0  r[27]=.column 1
+  62    Copy                    26  28   0                   0  r[28]=r[26]
+  63    Copy                    27  29   0                   0  r[29]=r[27]
+  64    RowId                    4  30   0                   0  r[30]=.rowid
+  65    MakeRecord              28   3  25                   0  r[25]=mkrec(r[28..30]); for ephemeral_subquery_t5
+  66    IdxInsert                5  25  28                   0  key=r[25]
+  67  Next                       4  60   0                   0
+  68  OpenRead                   6   2   0  k(5,B,B,B,B,B)   0  table=products, root=2, iDb=0
+  69  Rewind                     6  89   0                   0  Rewind table products
+  70    Column                   6   3  37                   0  r[37]=products.price
+  71    RealAffinity            37   0   0                   0
+  72    Copy                     1  39   0                   0  r[39]=r[1]
+  73    Multiply                39  40  38                   0  r[38]=r[39]*r[40]
+  74    Le                      37  38  88  Binary           0  if r[37]<=r[38] goto 88
+  75    Column                   6   2  41                   0  r[41]=products.category_id
+  76    IsNull                  41  88   0                   0  if (r[41]==NULL) goto 88
+  77    Affinity                41   1   0                   0  r[41..42] = C
+  78    SeekGE                   5  88  41                   0  key=[41..41]
+  79      IdxGT                  5  88  41                   0  key=[41..41]
+  80      Column                 5   0  31                   0  r[31]=ephemeral_subquery_t5.category_id
+  81      Column                 5   1  32                   0  r[32]=ephemeral_subquery_t5.avg_price
+  82      Column                 6   1  33                   0  r[33]=products.name
+  83      Column                 6   3  34                   0  r[34]=products.price
+  84      RealAffinity          34   0   0                   0
+  85      Column                 5   1  35                   0  r[35]=ephemeral_subquery_t5.avg_price
+  86      ResultRow             33   3   0                   0  output=r[33..35]
+  87    Next                     5  79   0                   0
+  88  Next                       6  70   0                   0
+  89  Halt                       0   0   0                   0
+  90  Transaction                0   1  11                   0  iDb=0 tx_mode=Read
+  91  Real                       0  40   0  0.8              0  r[40]=0.8
+  92  Goto                       0   1   0                   0

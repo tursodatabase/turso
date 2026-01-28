@@ -1165,29 +1165,52 @@ pub fn open_loop(
                         program.preassign_label_to_next_insn(loop_start);
                     }
                     (Scan::Subquery, Table::FromClauseSubquery(from_clause_subquery)) => {
-                        let (yield_reg, coroutine_implementation_start) =
-                            match from_clause_subquery.plan.select_query_destination() {
-                                Some(QueryDestination::CoroutineYield {
-                                    yield_reg,
-                                    coroutine_implementation_start,
-                                }) => (*yield_reg, *coroutine_implementation_start),
-                                _ => unreachable!("Subquery table with non-subquery query type"),
-                            };
-                        // In case the subquery is an inner loop, it needs to be reinitialized on each iteration of the outer loop.
-                        program.emit_insn(Insn::InitCoroutine {
-                            yield_reg,
-                            jump_on_definition: BranchOffset::Offset(0),
-                            start_offset: coroutine_implementation_start,
-                        });
-                        program.preassign_label_to_next_insn(loop_start);
-                        // A subquery within the main loop of a parent query has no cursor, so instead of advancing the cursor,
-                        // it emits a Yield which jumps back to the main loop of the subquery itself to retrieve the next row.
-                        // When the subquery coroutine completes, this instruction jumps to the label at the top of the termination_label_stack,
-                        // which in this case is the end of the Yield-Goto loop in the parent query.
-                        program.emit_insn(Insn::Yield {
-                            yield_reg,
-                            end_offset: loop_end,
-                        });
+                        match from_clause_subquery.plan.select_query_destination() {
+                            Some(QueryDestination::CoroutineYield {
+                                yield_reg,
+                                coroutine_implementation_start,
+                            }) => {
+                                // Coroutine-based subquery execution
+                                // In case the subquery is an inner loop, it needs to be reinitialized on each iteration of the outer loop.
+                                program.emit_insn(Insn::InitCoroutine {
+                                    yield_reg: *yield_reg,
+                                    jump_on_definition: BranchOffset::Offset(0),
+                                    start_offset: *coroutine_implementation_start,
+                                });
+                                program.preassign_label_to_next_insn(loop_start);
+                                // A subquery within the main loop of a parent query has no cursor, so instead of advancing the cursor,
+                                // it emits a Yield which jumps back to the main loop of the subquery itself to retrieve the next row.
+                                // When the subquery coroutine completes, this instruction jumps to the label at the top of the termination_label_stack,
+                                // which in this case is the end of the Yield-Goto loop in the parent query.
+                                program.emit_insn(Insn::Yield {
+                                    yield_reg: *yield_reg,
+                                    end_offset: loop_end,
+                                });
+                            }
+                            Some(QueryDestination::EphemeralTable { cursor_id, .. }) => {
+                                // Materialized CTE - scan the ephemeral table with Rewind/Next
+                                program.emit_insn(Insn::Rewind {
+                                    cursor_id: *cursor_id,
+                                    pc_if_empty: loop_end,
+                                });
+                                program.preassign_label_to_next_insn(loop_start);
+                                // Emit Column instructions to read from the ephemeral table
+                                // into the result registers at the start of each iteration
+                                if let Some(start_reg) =
+                                    from_clause_subquery.result_columns_start_reg
+                                {
+                                    for col_idx in 0..from_clause_subquery.columns.len() {
+                                        program.emit_insn(Insn::Column {
+                                            cursor_id: *cursor_id,
+                                            column: col_idx,
+                                            dest: start_reg + col_idx,
+                                            default: None,
+                                        });
+                                    }
+                                }
+                            }
+                            _ => unreachable!("Subquery table with unexpected query destination"),
+                        }
                     }
                     _ => unreachable!(
                         "{:?} scan cannot be used with {:?} table",
@@ -1204,14 +1227,18 @@ pub fn open_loop(
                 }
             }
             Operation::Search(search) => {
-                assert!(
-                    !matches!(table.table, Table::FromClauseSubquery(_)),
-                    "Subqueries do not support index seeks"
-                );
+                // Check if this is a FROM clause subquery with a materialized ephemeral index
+                let is_materialized_subquery = matches!(&table.table, Table::FromClauseSubquery(_))
+                    && matches!(search, Search::Seek { index: Some(idx), .. } if idx.ephemeral);
+
                 // Open the loop for the index search.
                 // Rowid equality point lookups are handled with a SeekRowid instruction which does not loop, since it is a single row lookup.
                 match search {
                     Search::RowidEq { cmp_expr } => {
+                        assert!(
+                            !matches!(table.table, Table::FromClauseSubquery(_)),
+                            "Subqueries do not support rowid seeks"
+                        );
                         let src_reg = program.alloc_register();
                         translate_expr(
                             program,
@@ -1233,7 +1260,9 @@ pub fn open_loop(
                         // Otherwise, it's an index/rowid scan, i.e. first a seek is performed and then a scan until the comparison expression is not satisfied anymore.
                         let mut bloom_filter = false;
                         if let Some(index) = index {
-                            if index.ephemeral {
+                            if index.ephemeral && !is_materialized_subquery {
+                                // For regular tables with ephemeral indexes, build the auto-index now.
+                                // For materialized subqueries, the index was already built during emission.
                                 let table_has_rowid = if let Table::BTree(btree) = &table.table {
                                     btree.has_rowid
                                 } else {
@@ -1258,13 +1287,18 @@ pub fn open_loop(
                             }
                         }
 
-                        let seek_cursor_id = temp_cursor_id.unwrap_or_else(|| {
-                            index_cursor_id.unwrap_or_else(|| {
-                                table_cursor_id.expect(
-                                    "Either ephemeral or index or table cursor must be opened",
-                                )
+                        // For materialized subqueries, use the index cursor directly
+                        let seek_cursor_id = if is_materialized_subquery {
+                            index_cursor_id.expect("materialized subquery must have index cursor")
+                        } else {
+                            temp_cursor_id.unwrap_or_else(|| {
+                                index_cursor_id.unwrap_or_else(|| {
+                                    table_cursor_id.expect(
+                                        "Either ephemeral or index or table cursor must be opened",
+                                    )
+                                })
                             })
-                        });
+                        };
 
                         let max_registers = seek_def
                             .size(&seek_def.start)
@@ -1293,13 +1327,36 @@ pub fn open_loop(
                             index.as_ref(),
                         )?;
 
-                        if let Some(index_cursor_id) = index_cursor_id {
-                            if let Some(table_cursor_id) = table_cursor_id {
-                                // Don't do a btree table seek until it's actually necessary to read from the table.
-                                program.emit_insn(Insn::DeferredSeek {
-                                    index_cursor_id,
-                                    table_cursor_id,
-                                });
+                        if is_materialized_subquery {
+                            // For materialized subqueries with seek indexes, emit Column
+                            // instructions to populate result registers from the covering index.
+                            // The index contains all columns so we can read directly from it.
+                            if let Table::FromClauseSubquery(from_clause_subquery) = &table.table {
+                                if let Some(start_reg) =
+                                    from_clause_subquery.result_columns_start_reg
+                                {
+                                    let index_cursor = index_cursor_id
+                                        .expect("materialized subquery must have index cursor");
+                                    for col_idx in 0..from_clause_subquery.columns.len() {
+                                        program.emit_insn(Insn::Column {
+                                            cursor_id: index_cursor,
+                                            column: col_idx,
+                                            dest: start_reg + col_idx,
+                                            default: None,
+                                        });
+                                    }
+                                }
+                            }
+                        } else {
+                            // Only emit DeferredSeek for non-subquery tables
+                            if let Some(index_cursor_id) = index_cursor_id {
+                                if let Some(table_cursor_id) = table_cursor_id {
+                                    // Don't do a btree table seek until it's actually necessary to read from the table.
+                                    program.emit_insn(Insn::DeferredSeek {
+                                        index_cursor_id,
+                                        table_cursor_id,
+                                    });
+                                }
                             }
                         }
                     }
@@ -2031,20 +2088,42 @@ pub fn close_loop(
                         });
                     }
                     Scan::Subquery => {
-                        // A subquery has no cursor to call Next on, so it just emits a Goto
-                        // to the Yield instruction, which in turn jumps back to the main loop of the subquery,
-                        // so that the next row from the subquery can be read.
-                        program.emit_insn(Insn::Goto {
-                            target_pc: loop_labels.loop_start,
-                        });
+                        // Check if this is a materialized CTE (EphemeralTable) or coroutine
+                        if let Table::FromClauseSubquery(subquery) = &table.table {
+                            if let Some(QueryDestination::EphemeralTable { cursor_id, .. }) =
+                                subquery.plan.select_query_destination()
+                            {
+                                // Materialized CTE - use Next to iterate
+                                program.emit_insn(Insn::Next {
+                                    cursor_id: *cursor_id,
+                                    pc_if_next: loop_labels.loop_start,
+                                });
+                            } else {
+                                // Coroutine-based subquery - use Goto to Yield
+                                program.emit_insn(Insn::Goto {
+                                    target_pc: loop_labels.loop_start,
+                                });
+                            }
+                        } else {
+                            // A subquery has no cursor to call Next on, so it just emits a Goto
+                            // to the Yield instruction, which in turn jumps back to the main loop of the subquery,
+                            // so that the next row from the subquery can be read.
+                            program.emit_insn(Insn::Goto {
+                                target_pc: loop_labels.loop_start,
+                            });
+                        }
                     }
                 }
                 program.preassign_label_to_next_insn(loop_labels.loop_end);
             }
             Operation::Search(search) => {
+                // Materialized subqueries with ephemeral indexes are allowed
+                let is_materialized_subquery = matches!(&table.table, Table::FromClauseSubquery(_))
+                    && matches!(search, Search::Seek { index: Some(idx), .. } if idx.ephemeral);
                 assert!(
-                    !matches!(table.table, Table::FromClauseSubquery(_)),
-                    "Subqueries do not support index seeks"
+                    !matches!(table.table, Table::FromClauseSubquery(_))
+                        || is_materialized_subquery,
+                    "Subqueries do not support index seeks unless materialized"
                 );
                 program.resolve_label(loop_labels.next, program.offset());
                 let iteration_cursor_id =
@@ -2054,6 +2133,9 @@ pub fn close_loop(
                     }) = &mode
                     {
                         *ephemeral_table_cursor_id
+                    } else if is_materialized_subquery {
+                        // For materialized subqueries, use the index cursor
+                        index_cursor_id.expect("materialized subquery must have index cursor")
                     } else {
                         index_cursor_id.unwrap_or_else(|| {
                             table_cursor_id

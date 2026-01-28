@@ -1102,3 +1102,196 @@ test correlated-exists-in-ungrouped-aggregate-empty-main-table {
 expect {
     0|0
 }
+
+# ============================================================================
+# FROM CLAUSE SUBQUERY JOINS (materialized subquery tests)
+# ============================================================================
+
+# Simple INNER JOIN with FROM clause subquery
+test from-subquery-inner-join {
+    create table users(id integer primary key, name text);
+    create table orders(id, user_id, amount);
+    insert into users values (1, 'Alice'), (2, 'Bob'), (3, 'Charlie');
+    insert into orders values (1, 1, 100), (2, 1, 200), (3, 2, 150);
+    select u.name, sub.total
+    from users u
+    join (select user_id, sum(amount) as total from orders group by user_id) sub
+    on u.id = sub.user_id;
+}
+expect {
+    Alice|300
+    Bob|150
+}
+
+# LEFT JOIN with FROM clause subquery (should return NULL for non-matching)
+test from-subquery-left-join {
+    create table users(id integer primary key, name text);
+    create table orders(id, user_id, amount);
+    insert into users values (1, 'Alice'), (2, 'Bob'), (3, 'Charlie');
+    insert into orders values (1, 1, 100), (2, 1, 200), (3, 2, 150);
+    select u.name, coalesce(sub.total, 0) as total
+    from users u
+    left join (select user_id, sum(amount) as total from orders group by user_id) sub
+    on u.id = sub.user_id;
+}
+expect {
+    Alice|300
+    Bob|150
+    Charlie|0
+}
+
+# Multiple FROM clause subqueries with joins
+test from-subquery-multiple-joins {
+    create table products(id integer primary key, name text);
+    create table sales(product_id, quantity);
+    create table returns(product_id, quantity);
+    insert into products values (1, 'hat'), (2, 'shirt'), (3, 'pants');
+    insert into sales values (1, 10), (1, 5), (2, 20);
+    insert into returns values (1, 2), (2, 5);
+    select p.name,
+           coalesce(s.total_sold, 0) as sold,
+           coalesce(r.total_returned, 0) as returned
+    from products p
+    left join (select product_id, sum(quantity) as total_sold from sales group by product_id) s
+    on p.id = s.product_id
+    left join (select product_id, sum(quantity) as total_returned from returns group by product_id) r
+    on p.id = r.product_id;
+}
+expect {
+    hat|15|2
+    shirt|20|5
+    pants|0|0
+}
+
+# FROM clause subquery with expression in join column
+test from-subquery-expression-join {
+    create table users(first_name text);
+    create table products(name text);
+    insert into users values ('alice'), ('bob'), ('charlie');
+    insert into products values ('ALICE'), ('BOB'), ('DAVE');
+    select u.first_name, sub.product_name
+    from users u
+    join (select lower(name) as product_name from products) sub
+    on u.first_name = sub.product_name;
+}
+expect {
+    alice|alice
+    bob|bob
+}
+
+# FROM clause subquery - subquery as outer table (driving table)
+test from-subquery-as-outer-table {
+    create table categories(id integer primary key, name text);
+    create table products(id, name, category_id);
+    insert into categories values (1, 'Electronics'), (2, 'Clothing');
+    insert into products values (1, 'Laptop', 1), (2, 'Shirt', 2), (3, 'Phone', 1);
+    select sub.category_name, p.name as product
+    from (select id, name as category_name from categories) sub
+    join products p on sub.id = p.category_id
+    order by sub.category_name, p.name;
+}
+expect {
+    Clothing|Shirt
+    Electronics|Laptop
+    Electronics|Phone
+}
+
+# FROM clause subquery with multiple join columns
+test from-subquery-multi-column-join {
+    create table sales(year int, region text, amount int);
+    create table targets(year int, region text, target int);
+    insert into sales values (2023, 'North', 100), (2023, 'South', 150), (2024, 'North', 200);
+    insert into targets values (2023, 'North', 90), (2023, 'South', 160), (2024, 'North', 180);
+    select s.year, s.region, s.amount, sub.target
+    from sales s
+    join (select year, region, target from targets) sub
+    on s.year = sub.year and s.region = sub.region;
+}
+expect {
+    2023|North|100|90
+    2023|South|150|160
+    2024|North|200|180
+}
+
+# FROM clause subquery with DISTINCT
+test from-subquery-distinct {
+    create table orders(id, product_id);
+    create table products(id integer primary key, name text);
+    insert into orders values (1, 1), (2, 1), (3, 2), (4, 1);
+    insert into products values (1, 'Apple'), (2, 'Banana'), (3, 'Cherry');
+    select p.name, sub.order_count
+    from products p
+    left join (select distinct product_id, count(*) as order_count from orders group by product_id) sub
+    on p.id = sub.product_id;
+}
+expect {
+    Apple|3
+    Banana|1
+    Cherry|
+}
+
+# FROM clause subquery with LIMIT
+test from-subquery-with-limit {
+    create table users(id integer primary key, name text);
+    create table scores(user_id, score);
+    insert into users values (1, 'Alice'), (2, 'Bob'), (3, 'Charlie');
+    insert into scores values (1, 100), (1, 90), (2, 80), (2, 95), (3, 70);
+    select u.name, coalesce(sub.top_score, 0) as top_score
+    from users u
+    left join (select user_id, max(score) as top_score from scores group by user_id order by top_score desc limit 2) sub
+    on u.id = sub.user_id;
+}
+expect {
+    Alice|100
+    Bob|95
+    Charlie|0
+}
+
+# FROM clause subquery nested in another FROM clause subquery
+test from-subquery-nested {
+    create table t(x);
+    insert into t values (1), (2), (3);
+    select * from (
+        select sub.doubled from (
+            select x * 2 as doubled from t
+        ) sub
+    ) outer_sub;
+}
+expect {
+    2
+    4
+    6
+}
+
+# Self-join with FROM clause subquery
+test from-subquery-self-join {
+    create table employees(id integer primary key, name text, manager_id int);
+    insert into employees values (1, 'Alice', null), (2, 'Bob', 1), (3, 'Charlie', 1), (4, 'Dave', 2);
+    select e.name as employee, coalesce(sub.manager_name, 'None') as manager
+    from employees e
+    left join (select id, name as manager_name from employees) sub
+    on e.manager_id = sub.id;
+}
+expect {
+    Alice|None
+    Bob|Alice
+    Charlie|Alice
+    Dave|Bob
+}
+
+# Correlated subquery referencing a derived table from the outer scope.
+# When the derived table is materialized, reads must come from the index cursor.
+test from-subquery-outer-ref-in-correlated-subquery {
+    create table orders(id int, user_id int);
+    create table purchases(user_id int, total int);
+    insert into orders values (1, 1), (2, 2);
+    insert into purchases values (1, 50), (2, 200);
+    select o.id
+    from orders o
+    left join (select user_id, total from purchases) d on d.user_id = o.user_id
+    where exists (select 1 where d.total > 100)
+    order by o.id;
+}
+expect {
+    2
+}

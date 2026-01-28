@@ -8971,9 +8971,6 @@ pub fn op_open_dup(
                 .replace(Cursor::new_btree(cursor));
         }
         CursorType::BTreeIndex(_) => {
-            // In principle, we could implement OpenDup for BTreeIndex,
-            // but doing so now would create dead code since we have no use case,
-            // and it wouldn't be possible to test it.
             return Err(LimboError::InternalError(
                 "OpenDup is not supported for BTreeIndex".to_string(),
             ));

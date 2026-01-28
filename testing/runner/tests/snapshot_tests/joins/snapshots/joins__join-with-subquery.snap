@@ -1,91 +1,118 @@
 ---
 source: joins.sqltest
-expression: "SELECT\n        c.name,\n        c.city,\n        recent_orders.order_count,\n        recent_orders.total_spent\n    FROM\n        customers c\n    INNER JOIN (\n        SELECT\n            customer_id,\n            COUNT(*) AS order_count,\n            SUM(total_amount) AS total_spent\n        FROM\n            orders\n        WHERE\n            order_date >= '2024-01-01'\n        GROUP BY\n            customer_id\n    ) AS recent_orders ON c.customer_id = recent_orders.customer_id\n    ORDER BY\n        recent_orders.total_spent DESC;"
+expression: |-
+  SELECT
+          c.name,
+          c.city,
+          recent_orders.order_count,
+          recent_orders.total_spent
+      FROM
+          customers c
+      INNER JOIN (
+          SELECT
+              customer_id,
+              COUNT(*) AS order_count,
+              SUM(total_amount) AS total_spent
+          FROM
+              orders
+          WHERE
+              order_date >= '2024-01-01'
+          GROUP BY
+              customer_id
+      ) AS recent_orders ON c.customer_id = recent_orders.customer_id
+      ORDER BY
+          recent_orders.total_spent DESC;
 info:
   statement_type: SELECT
   tables:
-    - c.customer_id
-    - customers
-    - orders
+  - c.customer_id
+  - customers
+  - orders
   setup_blocks:
-    - schema
-  database: ":memory:"
+  - schema
+  database: ':memory:'
 ---
 QUERY PLAN
-|--SEARCH c USING INTEGER PRIMARY KEY (rowid=?)
-|--SCAN recent_orders
+|--SCAN customers AS c
+|--SEARCH recent_orders USING INDEX ephemeral_subquery_t3
 |  `--SCAN orders USING INDEX idx_orders_customer_id
 `--USE TEMP B-TREE FOR ORDER BY
 
 BYTECODE
 addr  opcode                  p1  p2  p3  p4              p5  comment
-   0          Init             0  66   0                   0  Start at 66
-   1          InitCoroutine    1  43   2                   0
-   2          Null             0  10  11                   0  r[10..11]=NULL
-   3          Integer          0   7   0                   0  r[7]=0; clear group by abort flag
-   4          Null             0   8   0                   0  r[8]=NULL; initialize group by comparison registers to NULL
-   5          Gosub           15  39   0                   0  ; go to clear accumulator subroutine
-   6          OpenRead         0   4   0  k(5,B,B,B,B,B)   0  table=orders, root=4, iDb=0
-   7          OpenRead         1   8   0  k(2,B)           0  index=idx_orders_customer_id, root=8, iDb=0
-   8          Rewind           1  26   0                   0  Rewind index idx_orders_customer_id
-   9            DeferredSeek   1   0   0                   0
-  10            Column         0   2  17                   0  r[17]=orders.order_date
-  11            Lt            17  18  25  Binary           0  if r[17]<r[18] goto 25
-  12            Column         0   1  13                   0  r[13]=orders.customer_id
-  13            Column         0   4  14                   0  r[14]=orders.total_amount
-  14            Compare        8  13   1  k(1, Binary)     0  r[8..8]==r[13..13]
+   0          Init             0  72   0                   0  Start at 72
+   1          OpenEphemeral    0   0   0                   0  cursor=0 is_table=false
+   2          Null             0  12  13                   0  r[12..13]=NULL
+   3          Integer          0   9   0                   0  r[9]=0; clear group by abort flag
+   4          Null             0  10   0                   0  r[10]=NULL; initialize group by comparison registers to NULL
+   5          Gosub           17  42   0                   0  ; go to clear accumulator subroutine
+   6          OpenRead         1   4   0  k(5,B,B,B,B,B)   0  table=orders, root=4, iDb=0
+   7          OpenRead         2   8   0  k(2,B)           0  index=idx_orders_customer_id, root=8, iDb=0
+   8          Rewind           2  26   0                   0  Rewind index idx_orders_customer_id
+   9            DeferredSeek   2   1   0                   0
+  10            Column         1   2  19                   0  r[19]=orders.order_date
+  11            Lt            19  20  25  Binary           0  if r[19]<r[20] goto 25
+  12            Column         1   1  15                   0  r[15]=orders.customer_id
+  13            Column         1   4  16                   0  r[16]=orders.total_amount
+  14            Compare       10  15   1  k(1, Binary)     0  r[10..10]==r[15..15]
   15            Jump          16  20  16                   0  ; start new group if comparison is not equal
-  16            Gosub          5  30   0                   0  ; check if ended group had data, and output if so
-  17            Move          13   8   1                   0  r[8..8]=r[13..13]
-  18            IfPos          7  42   0                   0  r[7]>0 -> r[7]-=0, goto 42; check abort flag
-  19            Gosub         15  39   0                   0  ; goto clear accumulator subroutine
-  20            AggStep        0  19  10  count            0  accum=r[10] step(r[19])
-  21            AggStep        0  14  11  sum              0  accum=r[11] step(r[14])
-  22            If             6  24   0                   0  if r[6] goto 24; don't emit group columns if continuing existing group
-  23            Column         0   1   9                   0  r[9]=orders.customer_id
-  24            Integer        1   6   0                   0  r[6]=1; indicate data in accumulator
-  25          Next             1   9   0                   0
-  26          Gosub            5  30   0                   0  ; emit row for final group
-  27          Goto             0  42   0                   0  ; group by finished
-  28          Integer          1   7   0                   0  r[7]=1
-  29        Return             5   0   0                   0
-  30        IfPos              6  32   0                   0  r[6]>0 -> r[6]-=0, goto 32; output group by row subroutine start
-  31      Return               5   0   0                   0
-  32      AggFinal             0  10   0  count            0  accum=r[10]
-  33      AggFinal             0  11   0  sum              0  accum=r[11]
-  34      Copy                 9   2   0                   0  r[2]=r[9]
-  35      Copy                10   3   0                   0  r[3]=r[10]
-  36      Copy                11   4   0                   0  r[4]=r[11]
-  37      Yield                1   0   0                   0
-  38    Return                 5   0   0                   0
-  39    Null                   0   9  11                   0  r[9..11]=NULL; clear accumulator subroutine start
-  40    Integer                0   6   0                   0  r[6]=0
-  41  Return                  15   0   0                   0
-  42  EndCoroutine             1   0   0                   0
-  43  SorterOpen               2   1   0  k(1,-B)          0  cursor=2
-  44  OpenRead                 3   2   0  k(5,B,B,B,B,B)   0  table=customers, root=2, iDb=0
-  45  InitCoroutine            1   0   2                   0
-  46    Yield                  1  56   0                   0
-  47    Copy                   2  25   0                   0  r[25]=r[2]
-  48    SeekRowid              3  25  55                   0  if (r[25]!=cursor 3 for table customers.rowid) goto 55
-  49    Copy                   4  26   0                   0  r[26]=r[4]
-  50    Column                 3   1  27                   0  r[27]=customers.name
-  51    Column                 3   3  28                   0  r[28]=customers.city
-  52    Copy                   3  29   0                   0  r[29]=r[3]
-  53    MakeRecord            26   4  24                   0  r[24]=mkrec(r[26..29])
-  54    SorterInsert           2  24   0  0                0  key=r[24]
-  55  Goto                     0  46   0                   0
-  56  OpenPseudo               4  24   4                   0  4 columns in r[24]
-  57  SorterSort               2  65   0                   0
-  58    SorterData             2  24   4                   0  r[24]=data
-  59    Column                 4   1  20                   0  r[20]=pseudo.column 1
-  60    Column                 4   2  21                   0  r[21]=pseudo.column 2
-  61    Column                 4   3  22                   0  r[22]=pseudo.column 3
-  62    Column                 4   0  23                   0  r[23]=pseudo.column 0
-  63    ResultRow             20   4   0                   0  output=r[20..23]
-  64  SorterNext               2  58   0                   0
-  65  Halt                     0   0   0                   0
-  66  Transaction              0   1  10                   0  iDb=0 tx_mode=Read
-  67  String8                  0  18   0  2024-01-01       0  r[18]='2024-01-01'
-  68  Integer                  1  19   0                   0  r[19]=1
-  69  Goto                     0   1   0                   0
+  16            Gosub          7  30   0                   0  ; check if ended group had data, and output if so
+  17            Move          15  10   1                   0  r[10..10]=r[15..15]
+  18            IfPos          9  45   0                   0  r[9]>0 -> r[9]-=0, goto 45; check abort flag
+  19            Gosub         17  42   0                   0  ; goto clear accumulator subroutine
+  20            AggStep        0  21  12  count            0  accum=r[12] step(r[21])
+  21            AggStep        0  16  13  sum              0  accum=r[13] step(r[16])
+  22            If             8  24   0                   0  if r[8] goto 24; don't emit group columns if continuing existing group
+  23            Column         1   1  11                   0  r[11]=orders.customer_id
+  24            Integer        1   8   0                   0  r[8]=1; indicate data in accumulator
+  25          Next             2   9   0                   0
+  26          Gosub            7  30   0                   0  ; emit row for final group
+  27          Goto             0  45   0                   0  ; group by finished
+  28          Integer          1   9   0                   0  r[9]=1
+  29        Return             7   0   0                   0
+  30        IfPos              8  32   0                   0  r[8]>0 -> r[8]-=0, goto 32; output group by row subroutine start
+  31      Return               7   0   0                   0
+  32      AggFinal             0  12   0  count            0  accum=r[12]
+  33      AggFinal             0  13   0  sum              0  accum=r[13]
+  34      Copy                11   4   0                   0  r[4]=r[11]
+  35      Copy                12   5   0                   0  r[5]=r[12]
+  36      Copy                13   6   0                   0  r[6]=r[13]
+  37      Copy                 4  23   2                   0  r[23]=r[4]
+  38      Sequence             0  26   0                   0
+  39      MakeRecord          23   4  22                   0  r[22]=mkrec(r[23..26]); for ephemeral_subquery_t3
+  40      IdxInsert            0  22   0                   8  key=r[22]
+  41    Return                 7   0   0                   0
+  42    Null                   0  11  13                   0  r[11..13]=NULL; clear accumulator subroutine start
+  43    Integer                0   8   0                   0  r[8]=0
+  44  Return                  17   0   0                   0
+  45  SorterOpen               3   1   0  k(1,-B)          0  cursor=3
+  46  OpenRead                 4   2   0  k(5,B,B,B,B,B)   0  table=customers, root=2, iDb=0
+  47  Rewind                   4  62   0                   0  Rewind table customers
+  48    RowId                  4  32   0                   0  r[32]=customers.rowid
+  49    SeekGE                 0  61  32                   0  key=[32..32]
+  50      IdxGT                0  61  32                   0  key=[32..32]
+  51      Column               0   0   1                   0  r[1]=ephemeral_subquery_t3.customer_id
+  52      Column               0   1   2                   0  r[2]=ephemeral_subquery_t3.order_count
+  53      Column               0   2   3                   0  r[3]=ephemeral_subquery_t3.total_spent
+  54      Column               0   2  33                   0  r[33]=ephemeral_subquery_t3.total_spent
+  55      Column               4   1  34                   0  r[34]=customers.name
+  56      Column               4   3  35                   0  r[35]=customers.city
+  57      Column               0   1  36                   0  r[36]=ephemeral_subquery_t3.order_count
+  58      MakeRecord          33   4  31                   0  r[31]=mkrec(r[33..36])
+  59      SorterInsert         3  31   0  0                0  key=r[31]
+  60    Next                   0  50   0                   0
+  61  Next                     4  48   0                   0
+  62  OpenPseudo               5  31   4                   0  4 columns in r[31]
+  63  SorterSort               3  71   0                   0
+  64    SorterData             3  31   5                   0  r[31]=data
+  65    Column                 5   1  27                   0  r[27]=pseudo.column 1
+  66    Column                 5   2  28                   0  r[28]=pseudo.column 2
+  67    Column                 5   3  29                   0  r[29]=pseudo.column 3
+  68    Column                 5   0  30                   0  r[30]=pseudo.column 0
+  69    ResultRow             27   4   0                   0  output=r[27..30]
+  70  SorterNext               3  64   0                   0
+  71  Halt                     0   0   0                   0
+  72  Transaction              0   1  10                   0  iDb=0 tx_mode=Read
+  73  String8                  0  20   0  2024-01-01       0  r[20]='2024-01-01'
+  74  Integer                  1  21   0                   0  r[21]=1
+  75  Goto                     0   1   0                   0

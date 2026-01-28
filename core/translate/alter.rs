@@ -327,6 +327,7 @@ pub fn translate_alter_table(
                             col_used_mask: ColumnUsedMask::default(),
                             cte_select: None,
                             cte_explicit_columns: vec![],
+                            cte_id: None,
                         }],
                     );
                     let where_copy = index

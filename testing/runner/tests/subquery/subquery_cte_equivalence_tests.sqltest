@@ -1,0 +1,1145 @@
+@database :memory:
+
+setup banana_activity_seed {
+CREATE TABLE dispatch_log (
+    record_id VARCHAR(36) PRIMARY KEY NOT NULL,
+    banana_ref VARCHAR(36),
+    shift_ref VARCHAR(36),
+    archived_ms REAL,
+    captured_ms REAL,
+    note_body TEXT,
+    entry_kind TEXT,
+    input_channel TEXT,
+    operator_tag TEXT,
+    payload_text TEXT,
+    status_flag TEXT DEFAULT 'delivered'
+);
+CREATE INDEX idx_dispatch_banana ON dispatch_log (banana_ref, shift_ref);
+
+CREATE TABLE banana_batch (
+    record_id VARCHAR(36) PRIMARY KEY NOT NULL,
+    cultivar_code TEXT,
+    batch_state TEXT,
+    launch_ms REAL,
+    closed_ms REAL,
+    rolling_summary TEXT,
+    rolling_summary_ms REAL,
+    summary_text TEXT,
+    batch_title TEXT,
+    source_channel TEXT,
+    vector_summary F32_BLOB(256) DEFAULT NULL,
+    vector_title F32_BLOB(256) DEFAULT NULL
+);
+CREATE INDEX idx_banana_launch ON banana_batch (launch_ms DESC);
+
+CREATE TABLE orchard_signal (
+    record_id VARCHAR(36) PRIMARY KEY NOT NULL,
+    label_text VARCHAR NOT NULL DEFAULT '',
+    display_text VARCHAR NOT NULL DEFAULT '',
+    captured_ms REAL,
+    refreshed_ms REAL,
+    source_ref VARCHAR(36) DEFAULT 'N/A',
+    entry_kind VARCHAR DEFAULT 'node',
+    entity_json TEXT DEFAULT '{}',
+    meta_json TEXT DEFAULT '{}',
+    summary_text VARCHAR DEFAULT NULL,
+    vector_label F32_BLOB(256) DEFAULT NULL
+);
+
+INSERT INTO dispatch_log(record_id, banana_ref, shift_ref, archived_ms, captured_ms, note_body, entry_kind, input_channel, operator_tag, payload_text, status_flag)
+VALUES
+('log-001', 'batch-001', 'shift-a', NULL, 1770138759115.0, 'picked crate', 'note', 'scanner', 'picker', 'ok', 'delivered'),
+('log-002', 'batch-001', 'shift-a', NULL, 1770138507504.0, 'picked crate', 'note', 'scanner', 'picker', 'ok', 'delivered'),
+('log-003', 'batch-001', 'shift-a', NULL, 1770138667778.0, 'qc ping', 'note', 'scanner', 'system', 'ok', 'delivered');
+
+INSERT INTO banana_batch(record_id, cultivar_code, batch_state, launch_ms, closed_ms, rolling_summary, rolling_summary_ms, summary_text, batch_title, source_channel, vector_summary, vector_title)
+VALUES
+('batch-001', 'CAV', 'open', 1770138466941.0, NULL, NULL, NULL, NULL, 'north lot', 'dock-a', NULL, NULL),
+('batch-002', 'CAV', 'closed', 1769801482943.0, 1769805082943.0, NULL, NULL, NULL, 'west lot', 'dock-c', NULL, NULL);
+
+INSERT INTO orchard_signal(record_id, label_text, display_text, captured_ms, refreshed_ms, source_ref, entry_kind, entity_json, meta_json, summary_text, vector_label)
+VALUES
+('sig-001', 'memory marker', 'memory marker', 1769900000000.0, 1769900000000.0, 'N/A', 'memory', '{}', '{}', NULL, NULL);
+}
+
+@setup banana_activity_seed
+test banana-activity-streak-cte {
+WITH
+raw_stamps AS (
+  SELECT record_id, captured_ms AS stamp FROM dispatch_log WHERE operator_tag='picker'
+  UNION ALL
+  SELECT record_id, launch_ms AS stamp FROM banana_batch
+  UNION ALL
+  SELECT record_id, captured_ms AS stamp FROM orchard_signal WHERE entry_kind IN ('crate_note','quality_flag')
+  UNION ALL SELECT record_id, captured_ms AS stamp FROM orchard_signal WHERE entry_kind='quality_flag'
+  UNION ALL SELECT record_id, captured_ms AS stamp FROM orchard_signal WHERE entry_kind='crate_note'
+),
+activity_days AS (
+  SELECT DISTINCT
+    date(datetime(stamp / 1000, 'unixepoch', '+60 minutes')) AS activity_date
+  FROM raw_stamps
+),
+days_with_prev AS (
+  SELECT
+    ad1.activity_date,
+    MAX(ad2.activity_date) AS prev_date
+  FROM activity_days AS ad1
+  LEFT JOIN activity_days AS ad2
+    ON ad2.activity_date < ad1.activity_date
+  GROUP BY ad1.activity_date
+),
+marked AS (
+  SELECT
+    activity_date,
+    CASE
+      WHEN prev_date IS NOT NULL
+       AND julianday(activity_date) - julianday(prev_date) = 1
+      THEN 0
+      ELSE 1
+    END AS streak_start
+  FROM days_with_prev
+),
+numbered AS (
+  SELECT
+    activity_date,
+    streak_start,
+    SUM(streak_start) OVER (ORDER BY activity_date) AS streak_id
+  FROM marked
+),
+streak_ranges AS (
+  SELECT
+    streak_id,
+    MIN(activity_date) AS start_date,
+    MAX(activity_date) AS end_date,
+    COUNT(*) AS streak_length
+  FROM numbered
+  GROUP BY streak_id
+),
+latest_day AS (
+  SELECT MAX(activity_date) AS activity_date
+  FROM activity_days
+),
+latest_streak AS (
+  SELECT streak_id
+  FROM numbered
+  WHERE activity_date = (SELECT activity_date FROM latest_day)
+)
+SELECT start_date, end_date, streak_length
+FROM streak_ranges
+WHERE streak_id = (SELECT streak_id FROM latest_streak);
+}
+expect {
+    2026-02-03|2026-02-03|1
+}
+
+setup banana_report_seed {
+CREATE TABLE peel_note (
+    note_id TEXT PRIMARY KEY NOT NULL,
+    speaker_tag TEXT NOT NULL,
+    created_ms REAL NOT NULL
+);
+
+CREATE TABLE crate_session (
+    session_id TEXT PRIMARY KEY NOT NULL,
+    opened_ms REAL NOT NULL
+);
+
+CREATE TABLE grove_artifact (
+    artifact_id TEXT PRIMARY KEY NOT NULL,
+    artifact_kind TEXT NOT NULL,
+    created_ms REAL NOT NULL
+);
+
+CREATE TABLE banana_digest (
+    digest_id TEXT PRIMARY KEY NOT NULL,
+    batch_no INTEGER,
+    recipe_code TEXT,
+    recipe_name TEXT,
+    digest_kind TEXT,
+    is_draft INTEGER,
+    title_text TEXT,
+    summary_text TEXT,
+    char_count INTEGER,
+    word_count INTEGER,
+    logged_ms REAL,
+    created_ms REAL,
+    updated_ms REAL,
+    processed_ms REAL
+);
+
+CREATE TABLE banana_digest_slice (
+    slice_id TEXT PRIMARY KEY NOT NULL,
+    digest_ref TEXT NOT NULL,
+    slice_index INTEGER NOT NULL,
+    topic_text TEXT,
+    body_text TEXT,
+    char_count INTEGER,
+    word_count INTEGER
+);
+
+CREATE INDEX idx_peel_note_speaker ON peel_note (speaker_tag, created_ms);
+CREATE INDEX idx_crate_session_opened ON crate_session (opened_ms);
+CREATE INDEX idx_grove_artifact_kind ON grove_artifact (artifact_kind, created_ms);
+CREATE INDEX idx_digest_logged ON banana_digest (logged_ms DESC);
+CREATE INDEX idx_digest_slice_order ON banana_digest_slice (digest_ref, slice_index);
+
+INSERT INTO peel_note(note_id, speaker_tag, created_ms) VALUES
+('note-001', 'banana-user', 1769947200000.0),
+('note-002', 'banana-user', 1770033600000.0),
+('note-003', 'banana-system', 1770120000000.0),
+('note-004', 'banana-user', 1770123600000.0),
+('note-005', 'banana-system', 1770206400000.0),
+('note-006', 'banana-user', 1769950800000.0),
+('note-007', 'banana-user', 1770037200000.0),
+('note-008', 'banana-ops', 1770292800000.0),
+('note-009', 'banana-user', 1770379200000.0),
+('note-010', 'banana-user', 1770465600000.0),
+('note-011', 'banana-system', 1770552000000.0),
+('note-012', 'banana-user', 1770724800000.0),
+('note-013', 'banana-user', 1770811200000.0),
+('note-014', 'banana-review', 1770897600000.0),
+('note-015', 'banana-user', 1770127200000.0),
+('note-016', 'banana-observer', 1770984000000.0);
+
+INSERT INTO crate_session(session_id, opened_ms) VALUES
+('session-001', 1770120000000.0),
+('session-002', 1770292800000.0),
+('session-003', 1770552000000.0),
+('session-004', 1770724800000.0),
+('session-005', 1770811200000.0),
+('session-006', 1770123600000.0),
+('session-007', 1770296400000.0),
+('session-008', 1770555600000.0);
+
+INSERT INTO grove_artifact(artifact_id, artifact_kind, created_ms) VALUES
+('artifact-001', 'fact-peel', 1770120000000.0),
+('artifact-002', 'event-peel', 1770292800000.0),
+('artifact-003', 'note-peel', 1770033600000.0),
+('artifact-004', 'fact-peel', 1770379200000.0),
+('artifact-005', 'event-peel', 1770465600000.0),
+('artifact-006', 'fact-peel', 1770552000000.0),
+('artifact-007', 'note-peel', 1770638400000.0),
+('artifact-008', 'fact-peel', 1770724800000.0),
+('artifact-009', 'event-peel', 1770811200000.0),
+('artifact-010', 'note-peel', 1769947200000.0),
+('artifact-011', 'note-peel', 1770033600000.0),
+('artifact-012', 'note-peel', 1770120000000.0),
+('artifact-013', 'note-peel', 1770206400000.0),
+('artifact-014', 'note-peel', 1770292800000.0),
+('artifact-015', 'note-peel', 1770379200000.0),
+('artifact-016', 'note-peel', 1770465600000.0),
+('artifact-017', 'note-peel', 1770552000000.0),
+('artifact-018', 'note-peel', 1770724800000.0),
+('artifact-019', 'note-peel', 1770811200000.0),
+('artifact-020', 'note-peel', 1770897600000.0);
+
+INSERT INTO banana_digest(
+    digest_id, batch_no, recipe_code, recipe_name, digest_kind, is_draft, title_text, summary_text,
+    char_count, word_count, logged_ms, created_ms, updated_ms, processed_ms
+) VALUES
+('digest-100', 100, 'r-100', 'morning-peel', 'routine', 0, 'Banana Brief', 'Alpha', 120, 24, 2000.0, 2001.0, 2002.0, 2003.0),
+('digest-200', 200, 'r-200', 'evening-peel', 'reflection', 1, 'Peel Review', 'Beta', 220, 44, 3000.0, 3001.0, 3002.0, 3003.0),
+('digest-400', 400, 'r-400', 'late-peel', 'ops', 0, 'Late Shift', 'Gamma', 280, 55, 4000.0, 4001.0, 4002.0, 4003.0),
+('digest-340', 340, 'r-340', 'supply-peel', 'ops', 0, 'Supply Pulse', 'Delta', 260, 52, 3400.0, 3401.0, 3402.0, 3403.0),
+('digest-280', 280, 'r-280', 'quality-peel', 'review', 0, 'Quality Sweep', 'Epsilon', 230, 46, 2800.0, 2801.0, 2802.0, 2803.0),
+('digest-260', 260, 'r-260', 'dock-peel', 'ops', 1, 'Dock Check', 'Zeta', 210, 41, 2600.0, 2601.0, 2602.0, 2603.0),
+('digest-240', 240, 'r-240', 'crate-peel', 'ops', 0, 'Crate Scan', 'Eta', 205, 40, 2400.0, 2401.0, 2402.0, 2403.0),
+('digest-180', 180, 'r-180', 'fleet-peel', 'routine', 0, 'Fleet Notes', 'Theta', 170, 33, 1800.0, 1801.0, 1802.0, 1803.0),
+('digest-160', 160, 'r-160', 'orchard-peel', 'routine', 0, 'Orchard Notes', 'Iota', 160, 31, 1600.0, 1601.0, 1602.0, 1603.0),
+('digest-120', 120, 'r-120', 'sensor-peel', 'routine', 1, 'Sensor Logs', 'Kappa', 140, 27, 1200.0, 1201.0, 1202.0, 1203.0),
+('digest-080', 80, 'r-080', 'night-peel', 'archive', 0, 'Night Ledger', 'Lambda', 110, 21, 800.0, 801.0, 802.0, 803.0),
+('digest-275', 275, 'r-275', 'no-slice-peel', 'ops', 0, 'No Slice', 'Mu', 111, 22, 2750.0, 2751.0, 2752.0, 2753.0),
+('digest-999', 999, 'r-999', 'excluded-peel', 'archive', 0, 'Out Of Range', 'Skip', 1, 1, 5000000000000.0, 0.0, 0.0, 0.0);
+
+INSERT INTO banana_digest_slice(
+    slice_id, digest_ref, slice_index, topic_text, body_text, char_count, word_count
+) VALUES
+('slice-400-a', 'digest-400', 0, 'night-dock', 'Arrivals tracked', 72, 14),
+('slice-400-b', 'digest-400', 1, 'dispatch', 'Outbound loaded', 68, 13),
+('slice-340-a', 'digest-340', 0, 'supply', 'Stocks healthy', 63, 12),
+('slice-340-b', 'digest-340', 1, 'alerts', 'No blockers', 58, 11),
+('slice-280-a', 'digest-280', 0, 'quality', 'QC trend stable', 61, 12),
+('slice-280-b', 'digest-280', 1, 'returns', 'Return rate low', 59, 11),
+('slice-260-a', 'digest-260', 0, 'dock', 'Crate queue clear', 57, 11),
+('slice-240-a', 'digest-240', 0, 'crate-audit', 'Barcode pass', 54, 10),
+('slice-240-b', 'digest-240', 1, 'crate-loss', 'No losses', 52, 10),
+('slice-200-a', 'digest-200', 0, 'ripeness', 'Ripe and ready', 50, 10),
+('slice-200-b', 'digest-200', 1, 'shipping', 'Crates moved', 60, 12),
+('slice-180-a', 'digest-180', 0, 'fleet', 'Route summary', 49, 9),
+('slice-180-b', 'digest-180', 1, 'handoff', 'Smooth handoff', 47, 9),
+('slice-160-a', 'digest-160', 0, 'orchard', 'Field status', 45, 9),
+('slice-120-a', 'digest-120', 0, 'sensor', 'Signal stable', 42, 8),
+('slice-080-a', 'digest-080', 0, 'night', 'Quiet shift', 38, 7),
+('slice-100-a', 'digest-100', 0, 'overview', 'Short note', 40, 8);
+}
+
+@setup banana_report_seed
+test banana-report-streak-longest-subquery {
+SELECT start_date,
+       end_date,
+       streak_length
+FROM (
+    SELECT streak_id,
+           MIN(activity_date) AS start_date,
+           MAX(activity_date) AS end_date,
+           COUNT(*) AS streak_length
+    FROM (
+        SELECT activity_date,
+               SUM(streak_start) OVER (ORDER BY activity_date) AS streak_id
+        FROM (
+            SELECT activity_date,
+                   prev_date,
+                   JULIANDAY(activity_date) - JULIANDAY(prev_date) AS diff,
+                   CASE
+                       WHEN JULIANDAY(activity_date) - JULIANDAY(prev_date) = 1 THEN 0
+                       ELSE 1
+                   END AS streak_start
+            FROM (
+                SELECT activity_date,
+                       (
+                           SELECT MAX(ad2.activity_date)
+                           FROM (
+                               SELECT DISTINCT date(datetime(stamp / 1000, 'unixepoch', '+60 minutes')) AS activity_date
+                               FROM (
+                                   SELECT note_id, created_ms AS stamp FROM peel_note WHERE 1=1 AND speaker_tag='banana-user'
+                                   UNION ALL
+                                   SELECT session_id, opened_ms AS stamp FROM crate_session WHERE 1=1
+                                   UNION ALL
+                                   SELECT artifact_id, created_ms AS stamp FROM grove_artifact WHERE 1=1 AND (artifact_kind='fact-peel' OR artifact_kind='event-peel')
+                                   UNION ALL
+                                   SELECT artifact_id, created_ms AS stamp FROM grove_artifact WHERE 1=1 AND artifact_kind='event-peel'
+                                   UNION ALL
+                                   SELECT artifact_id, created_ms AS stamp FROM grove_artifact WHERE 1=1 AND artifact_kind='fact-peel'
+                               )
+                               ORDER BY activity_date
+                           ) ad2
+                           WHERE ad2.activity_date < ad1.activity_date
+                       ) AS prev_date
+                FROM (
+                    SELECT DISTINCT date(datetime(stamp / 1000, 'unixepoch', '+60 minutes')) AS activity_date
+                    FROM (
+                        SELECT note_id, created_ms AS stamp FROM peel_note WHERE 1=1 AND speaker_tag='banana-user'
+                        UNION ALL
+                        SELECT session_id, opened_ms AS stamp FROM crate_session WHERE 1=1
+                        UNION ALL
+                        SELECT artifact_id, created_ms AS stamp FROM grove_artifact WHERE 1=1 AND (artifact_kind='fact-peel' OR artifact_kind='event-peel')
+                        UNION ALL
+                        SELECT artifact_id, created_ms AS stamp FROM grove_artifact WHERE 1=1 AND artifact_kind='event-peel'
+                        UNION ALL
+                        SELECT artifact_id, created_ms AS stamp FROM grove_artifact WHERE 1=1 AND artifact_kind='fact-peel'
+                    )
+                    ORDER BY activity_date
+                ) ad1
+            )
+        )
+    )
+    GROUP BY streak_id
+)
+ORDER BY streak_length DESC
+LIMIT 1;
+}
+expect {
+  2026-02-05|2026-02-08|4
+}
+
+@setup banana_report_seed
+test banana-report-streak-longest-cte {
+WITH activity_dates AS (
+    SELECT DISTINCT date(datetime(stamp / 1000, 'unixepoch', '+60 minutes')) AS activity_date
+    FROM (
+        SELECT note_id, created_ms AS stamp FROM peel_note WHERE 1=1 AND speaker_tag='banana-user'
+        UNION ALL
+        SELECT session_id, opened_ms AS stamp FROM crate_session WHERE 1=1
+        UNION ALL
+        SELECT artifact_id, created_ms AS stamp FROM grove_artifact WHERE 1=1 AND (artifact_kind='fact-peel' OR artifact_kind='event-peel')
+        UNION ALL
+        SELECT artifact_id, created_ms AS stamp FROM grove_artifact WHERE 1=1 AND artifact_kind='event-peel'
+        UNION ALL
+        SELECT artifact_id, created_ms AS stamp FROM grove_artifact WHERE 1=1 AND artifact_kind='fact-peel'
+    )
+    ORDER BY activity_date
+),
+dated_differences AS (
+    SELECT activity_date,
+           (
+               SELECT MAX(ad2.activity_date)
+               FROM activity_dates ad2
+               WHERE ad2.activity_date < ad1.activity_date
+           ) AS prev_date
+    FROM activity_dates ad1
+),
+streaks AS (
+    SELECT activity_date,
+           prev_date,
+           JULIANDAY(activity_date) - JULIANDAY(prev_date) AS diff,
+           CASE
+               WHEN JULIANDAY(activity_date) - JULIANDAY(prev_date) = 1 THEN 0
+               ELSE 1
+           END AS streak_start
+    FROM dated_differences
+),
+streak_ids AS (
+    SELECT activity_date,
+           SUM(streak_start) OVER (ORDER BY activity_date) AS streak_id
+    FROM streaks
+),
+streak_lengths AS (
+    SELECT streak_id,
+           MIN(activity_date) AS start_date,
+           MAX(activity_date) AS end_date,
+           COUNT(*) AS streak_length
+    FROM streak_ids
+    GROUP BY streak_id
+)
+SELECT start_date,
+       end_date,
+       streak_length
+FROM streak_lengths
+ORDER BY streak_length DESC
+LIMIT 1;
+}
+expect {
+  2026-02-05|2026-02-08|4
+}
+
+@setup banana_report_seed
+test banana-report-streak-current-subquery {
+SELECT start_date,
+       end_date,
+       streak_length
+FROM (
+    SELECT streak_id,
+           MIN(activity_date) AS start_date,
+           MAX(activity_date) AS end_date,
+           COUNT(*) AS streak_length
+    FROM (
+        SELECT activity_date,
+               SUM(streak_start) OVER (ORDER BY activity_date) AS streak_id
+        FROM (
+            SELECT activity_date,
+                   prev_date,
+                   JULIANDAY(activity_date) - JULIANDAY(prev_date) AS diff,
+                   CASE
+                       WHEN JULIANDAY(activity_date) - JULIANDAY(prev_date) = 1 THEN 0
+                       ELSE 1
+                   END AS streak_start
+            FROM (
+                SELECT activity_date,
+                       (
+                           SELECT MAX(ad2.activity_date)
+                           FROM (
+                               SELECT DISTINCT date(datetime(stamp / 1000, 'unixepoch', '+60 minutes')) AS activity_date
+                               FROM (
+                                   SELECT note_id, created_ms AS stamp FROM peel_note WHERE 1=1 AND speaker_tag='banana-user'
+                                   UNION ALL
+                                   SELECT session_id, opened_ms AS stamp FROM crate_session WHERE 1=1
+                                   UNION ALL
+                                   SELECT artifact_id, created_ms AS stamp FROM grove_artifact WHERE 1=1 AND (artifact_kind='fact-peel' OR artifact_kind='event-peel')
+                                   UNION ALL
+                                   SELECT artifact_id, created_ms AS stamp FROM grove_artifact WHERE 1=1 AND artifact_kind='event-peel'
+                                   UNION ALL
+                                   SELECT artifact_id, created_ms AS stamp FROM grove_artifact WHERE 1=1 AND artifact_kind='fact-peel'
+                               )
+                               ORDER BY activity_date
+                           ) ad2
+                           WHERE ad2.activity_date < ad1.activity_date
+                       ) AS prev_date
+                FROM (
+                    SELECT DISTINCT date(datetime(stamp / 1000, 'unixepoch', '+60 minutes')) AS activity_date
+                    FROM (
+                        SELECT note_id, created_ms AS stamp FROM peel_note WHERE 1=1 AND speaker_tag='banana-user'
+                        UNION ALL
+                        SELECT session_id, opened_ms AS stamp FROM crate_session WHERE 1=1
+                        UNION ALL
+                        SELECT artifact_id, created_ms AS stamp FROM grove_artifact WHERE 1=1 AND (artifact_kind='fact-peel' OR artifact_kind='event-peel')
+                        UNION ALL
+                        SELECT artifact_id, created_ms AS stamp FROM grove_artifact WHERE 1=1 AND artifact_kind='event-peel'
+                        UNION ALL
+                        SELECT artifact_id, created_ms AS stamp FROM grove_artifact WHERE 1=1 AND artifact_kind='fact-peel'
+                    )
+                    ORDER BY activity_date
+                ) ad1
+            )
+        )
+    )
+    GROUP BY streak_id
+)
+WHERE streak_id = (
+    SELECT streak_id
+    FROM (
+        SELECT activity_date,
+               SUM(streak_start) OVER (ORDER BY activity_date) AS streak_id
+        FROM (
+            SELECT activity_date,
+                   prev_date,
+                   JULIANDAY(activity_date) - JULIANDAY(prev_date) AS diff,
+                   CASE
+                       WHEN JULIANDAY(activity_date) - JULIANDAY(prev_date) = 1 THEN 0
+                       ELSE 1
+                   END AS streak_start
+            FROM (
+                SELECT activity_date,
+                       (
+                           SELECT MAX(ad2.activity_date)
+                           FROM (
+                               SELECT DISTINCT date(datetime(stamp / 1000, 'unixepoch', '+60 minutes')) AS activity_date
+                               FROM (
+                                   SELECT note_id, created_ms AS stamp FROM peel_note WHERE 1=1 AND speaker_tag='banana-user'
+                                   UNION ALL
+                                   SELECT session_id, opened_ms AS stamp FROM crate_session WHERE 1=1
+                                   UNION ALL
+                                   SELECT artifact_id, created_ms AS stamp FROM grove_artifact WHERE 1=1 AND (artifact_kind='fact-peel' OR artifact_kind='event-peel')
+                                   UNION ALL
+                                   SELECT artifact_id, created_ms AS stamp FROM grove_artifact WHERE 1=1 AND artifact_kind='event-peel'
+                                   UNION ALL
+                                   SELECT artifact_id, created_ms AS stamp FROM grove_artifact WHERE 1=1 AND artifact_kind='fact-peel'
+                               )
+                               ORDER BY activity_date
+                           ) ad2
+                           WHERE ad2.activity_date < ad1.activity_date
+                       ) AS prev_date
+                FROM (
+                    SELECT DISTINCT date(datetime(stamp / 1000, 'unixepoch', '+60 minutes')) AS activity_date
+                    FROM (
+                        SELECT note_id, created_ms AS stamp FROM peel_note WHERE 1=1 AND speaker_tag='banana-user'
+                        UNION ALL
+                        SELECT session_id, opened_ms AS stamp FROM crate_session WHERE 1=1
+                        UNION ALL
+                        SELECT artifact_id, created_ms AS stamp FROM grove_artifact WHERE 1=1 AND (artifact_kind='fact-peel' OR artifact_kind='event-peel')
+                        UNION ALL
+                        SELECT artifact_id, created_ms AS stamp FROM grove_artifact WHERE 1=1 AND artifact_kind='event-peel'
+                        UNION ALL
+                        SELECT artifact_id, created_ms AS stamp FROM grove_artifact WHERE 1=1 AND artifact_kind='fact-peel'
+                    )
+                    ORDER BY activity_date
+                ) ad1
+            )
+        )
+    )
+    WHERE activity_date = (
+        SELECT MAX(activity_date)
+        FROM (
+            SELECT DISTINCT date(datetime(stamp / 1000, 'unixepoch', '+60 minutes')) AS activity_date
+            FROM (
+                SELECT note_id, created_ms AS stamp FROM peel_note WHERE 1=1 AND speaker_tag='banana-user'
+                UNION ALL
+                SELECT session_id, opened_ms AS stamp FROM crate_session WHERE 1=1
+                UNION ALL
+                SELECT artifact_id, created_ms AS stamp FROM grove_artifact WHERE 1=1 AND (artifact_kind='fact-peel' OR artifact_kind='event-peel')
+                UNION ALL
+                SELECT artifact_id, created_ms AS stamp FROM grove_artifact WHERE 1=1 AND artifact_kind='event-peel'
+                UNION ALL
+                SELECT artifact_id, created_ms AS stamp FROM grove_artifact WHERE 1=1 AND artifact_kind='fact-peel'
+            )
+            ORDER BY activity_date
+        )
+    )
+);
+}
+expect {
+  2026-02-10|2026-02-11|2
+}
+
+@setup banana_report_seed
+test banana-report-streak-current-cte {
+WITH activity_dates AS (
+    SELECT DISTINCT date(datetime(stamp / 1000, 'unixepoch', '+60 minutes')) AS activity_date
+    FROM (
+        SELECT note_id, created_ms AS stamp FROM peel_note WHERE 1=1 AND speaker_tag='banana-user'
+        UNION ALL
+        SELECT session_id, opened_ms AS stamp FROM crate_session WHERE 1=1
+        UNION ALL
+        SELECT artifact_id, created_ms AS stamp FROM grove_artifact WHERE 1=1 AND (artifact_kind='fact-peel' OR artifact_kind='event-peel')
+        UNION ALL
+        SELECT artifact_id, created_ms AS stamp FROM grove_artifact WHERE 1=1 AND artifact_kind='event-peel'
+        UNION ALL
+        SELECT artifact_id, created_ms AS stamp FROM grove_artifact WHERE 1=1 AND artifact_kind='fact-peel'
+    )
+    ORDER BY activity_date
+),
+dated_differences AS (
+    SELECT activity_date,
+           (
+               SELECT MAX(ad2.activity_date)
+               FROM activity_dates ad2
+               WHERE ad2.activity_date < ad1.activity_date
+           ) AS prev_date
+    FROM activity_dates ad1
+),
+streaks AS (
+    SELECT activity_date,
+           prev_date,
+           JULIANDAY(activity_date) - JULIANDAY(prev_date) AS diff,
+           CASE
+               WHEN JULIANDAY(activity_date) - JULIANDAY(prev_date) = 1 THEN 0
+               ELSE 1
+           END AS streak_start
+    FROM dated_differences
+),
+streak_ids AS (
+    SELECT activity_date,
+           SUM(streak_start) OVER (ORDER BY activity_date) AS streak_id
+    FROM streaks
+),
+streak_lengths AS (
+    SELECT streak_id,
+           MIN(activity_date) AS start_date,
+           MAX(activity_date) AS end_date,
+           COUNT(*) AS streak_length
+    FROM streak_ids
+    GROUP BY streak_id
+)
+SELECT start_date,
+       end_date,
+       streak_length
+FROM streak_lengths
+WHERE streak_id = (
+    SELECT streak_id
+    FROM streak_ids
+    WHERE activity_date = (
+        SELECT MAX(activity_date)
+        FROM activity_dates
+    )
+);
+}
+expect {
+  2026-02-10|2026-02-11|2
+}
+
+@setup banana_report_seed
+test banana-report-streak-current-subquery-rich {
+INSERT INTO peel_note(note_id, speaker_tag, created_ms) VALUES
+('note-rich-001', 'banana-user', 1770897600000.0);
+
+INSERT INTO crate_session(session_id, opened_ms) VALUES
+('session-rich-001', 1770984000000.0);
+
+INSERT INTO grove_artifact(artifact_id, artifact_kind, created_ms) VALUES
+('artifact-rich-001', 'fact-peel', 1771070400000.0),
+('artifact-rich-002', 'note-peel', 1771070400000.0);
+
+SELECT start_date,
+       end_date,
+       streak_length
+FROM (
+    SELECT streak_id,
+           MIN(activity_date) AS start_date,
+           MAX(activity_date) AS end_date,
+           COUNT(*) AS streak_length
+    FROM (
+        SELECT activity_date,
+               SUM(streak_start) OVER (ORDER BY activity_date) AS streak_id
+        FROM (
+            SELECT activity_date,
+                   prev_date,
+                   JULIANDAY(activity_date) - JULIANDAY(prev_date) AS diff,
+                   CASE
+                       WHEN JULIANDAY(activity_date) - JULIANDAY(prev_date) = 1 THEN 0
+                       ELSE 1
+                   END AS streak_start
+            FROM (
+                SELECT activity_date,
+                       (
+                           SELECT MAX(ad2.activity_date)
+                           FROM (
+                               SELECT DISTINCT date(datetime(stamp / 1000, 'unixepoch', '+60 minutes')) AS activity_date
+                               FROM (
+                                   SELECT note_id, created_ms AS stamp FROM peel_note WHERE 1=1 AND speaker_tag='banana-user'
+                                   UNION ALL
+                                   SELECT session_id, opened_ms AS stamp FROM crate_session WHERE 1=1
+                                   UNION ALL
+                                   SELECT artifact_id, created_ms AS stamp FROM grove_artifact WHERE 1=1 AND (artifact_kind='fact-peel' OR artifact_kind='event-peel')
+                                   UNION ALL
+                                   SELECT artifact_id, created_ms AS stamp FROM grove_artifact WHERE 1=1 AND artifact_kind='event-peel'
+                                   UNION ALL
+                                   SELECT artifact_id, created_ms AS stamp FROM grove_artifact WHERE 1=1 AND artifact_kind='fact-peel'
+                               )
+                               ORDER BY activity_date
+                           ) ad2
+                           WHERE ad2.activity_date < ad1.activity_date
+                       ) AS prev_date
+                FROM (
+                    SELECT DISTINCT date(datetime(stamp / 1000, 'unixepoch', '+60 minutes')) AS activity_date
+                    FROM (
+                        SELECT note_id, created_ms AS stamp FROM peel_note WHERE 1=1 AND speaker_tag='banana-user'
+                        UNION ALL
+                        SELECT session_id, opened_ms AS stamp FROM crate_session WHERE 1=1
+                        UNION ALL
+                        SELECT artifact_id, created_ms AS stamp FROM grove_artifact WHERE 1=1 AND (artifact_kind='fact-peel' OR artifact_kind='event-peel')
+                        UNION ALL
+                        SELECT artifact_id, created_ms AS stamp FROM grove_artifact WHERE 1=1 AND artifact_kind='event-peel'
+                        UNION ALL
+                        SELECT artifact_id, created_ms AS stamp FROM grove_artifact WHERE 1=1 AND artifact_kind='fact-peel'
+                    )
+                    ORDER BY activity_date
+                ) ad1
+            )
+        )
+    )
+    GROUP BY streak_id
+)
+WHERE streak_id = (
+    SELECT streak_id
+    FROM (
+        SELECT activity_date,
+               SUM(streak_start) OVER (ORDER BY activity_date) AS streak_id
+        FROM (
+            SELECT activity_date,
+                   prev_date,
+                   JULIANDAY(activity_date) - JULIANDAY(prev_date) AS diff,
+                   CASE
+                       WHEN JULIANDAY(activity_date) - JULIANDAY(prev_date) = 1 THEN 0
+                       ELSE 1
+                   END AS streak_start
+            FROM (
+                SELECT activity_date,
+                       (
+                           SELECT MAX(ad2.activity_date)
+                           FROM (
+                               SELECT DISTINCT date(datetime(stamp / 1000, 'unixepoch', '+60 minutes')) AS activity_date
+                               FROM (
+                                   SELECT note_id, created_ms AS stamp FROM peel_note WHERE 1=1 AND speaker_tag='banana-user'
+                                   UNION ALL
+                                   SELECT session_id, opened_ms AS stamp FROM crate_session WHERE 1=1
+                                   UNION ALL
+                                   SELECT artifact_id, created_ms AS stamp FROM grove_artifact WHERE 1=1 AND (artifact_kind='fact-peel' OR artifact_kind='event-peel')
+                                   UNION ALL
+                                   SELECT artifact_id, created_ms AS stamp FROM grove_artifact WHERE 1=1 AND artifact_kind='event-peel'
+                                   UNION ALL
+                                   SELECT artifact_id, created_ms AS stamp FROM grove_artifact WHERE 1=1 AND artifact_kind='fact-peel'
+                               )
+                               ORDER BY activity_date
+                           ) ad2
+                           WHERE ad2.activity_date < ad1.activity_date
+                       ) AS prev_date
+                FROM (
+                    SELECT DISTINCT date(datetime(stamp / 1000, 'unixepoch', '+60 minutes')) AS activity_date
+                    FROM (
+                        SELECT note_id, created_ms AS stamp FROM peel_note WHERE 1=1 AND speaker_tag='banana-user'
+                        UNION ALL
+                        SELECT session_id, opened_ms AS stamp FROM crate_session WHERE 1=1
+                        UNION ALL
+                        SELECT artifact_id, created_ms AS stamp FROM grove_artifact WHERE 1=1 AND (artifact_kind='fact-peel' OR artifact_kind='event-peel')
+                        UNION ALL
+                        SELECT artifact_id, created_ms AS stamp FROM grove_artifact WHERE 1=1 AND artifact_kind='event-peel'
+                        UNION ALL
+                        SELECT artifact_id, created_ms AS stamp FROM grove_artifact WHERE 1=1 AND artifact_kind='fact-peel'
+                    )
+                    ORDER BY activity_date
+                ) ad1
+            )
+        )
+    )
+    WHERE activity_date = (
+        SELECT MAX(activity_date)
+        FROM (
+            SELECT DISTINCT date(datetime(stamp / 1000, 'unixepoch', '+60 minutes')) AS activity_date
+            FROM (
+                SELECT note_id, created_ms AS stamp FROM peel_note WHERE 1=1 AND speaker_tag='banana-user'
+                UNION ALL
+                SELECT session_id, opened_ms AS stamp FROM crate_session WHERE 1=1
+                UNION ALL
+                SELECT artifact_id, created_ms AS stamp FROM grove_artifact WHERE 1=1 AND (artifact_kind='fact-peel' OR artifact_kind='event-peel')
+                UNION ALL
+                SELECT artifact_id, created_ms AS stamp FROM grove_artifact WHERE 1=1 AND artifact_kind='event-peel'
+                UNION ALL
+                SELECT artifact_id, created_ms AS stamp FROM grove_artifact WHERE 1=1 AND artifact_kind='fact-peel'
+            )
+            ORDER BY activity_date
+        )
+    )
+);
+}
+expect {
+  2026-02-10|2026-02-14|5
+}
+
+@setup banana_report_seed
+test banana-report-streak-current-cte-rich {
+INSERT INTO peel_note(note_id, speaker_tag, created_ms) VALUES
+('note-rich-002', 'banana-user', 1770897600000.0);
+
+INSERT INTO crate_session(session_id, opened_ms) VALUES
+('session-rich-002', 1770984000000.0);
+
+INSERT INTO grove_artifact(artifact_id, artifact_kind, created_ms) VALUES
+('artifact-rich-003', 'fact-peel', 1771070400000.0),
+('artifact-rich-004', 'note-peel', 1771070400000.0);
+
+WITH activity_dates AS (
+    SELECT DISTINCT date(datetime(stamp / 1000, 'unixepoch', '+60 minutes')) AS activity_date
+    FROM (
+        SELECT note_id, created_ms AS stamp FROM peel_note WHERE 1=1 AND speaker_tag='banana-user'
+        UNION ALL
+        SELECT session_id, opened_ms AS stamp FROM crate_session WHERE 1=1
+        UNION ALL
+        SELECT artifact_id, created_ms AS stamp FROM grove_artifact WHERE 1=1 AND (artifact_kind='fact-peel' OR artifact_kind='event-peel')
+        UNION ALL
+        SELECT artifact_id, created_ms AS stamp FROM grove_artifact WHERE 1=1 AND artifact_kind='event-peel'
+        UNION ALL
+        SELECT artifact_id, created_ms AS stamp FROM grove_artifact WHERE 1=1 AND artifact_kind='fact-peel'
+    )
+    ORDER BY activity_date
+),
+dated_differences AS (
+    SELECT activity_date,
+           (
+               SELECT MAX(ad2.activity_date)
+               FROM activity_dates ad2
+               WHERE ad2.activity_date < ad1.activity_date
+           ) AS prev_date
+    FROM activity_dates ad1
+),
+streaks AS (
+    SELECT activity_date,
+           prev_date,
+           JULIANDAY(activity_date) - JULIANDAY(prev_date) AS diff,
+           CASE
+               WHEN JULIANDAY(activity_date) - JULIANDAY(prev_date) = 1 THEN 0
+               ELSE 1
+           END AS streak_start
+    FROM dated_differences
+),
+streak_ids AS (
+    SELECT activity_date,
+           SUM(streak_start) OVER (ORDER BY activity_date) AS streak_id
+    FROM streaks
+),
+streak_lengths AS (
+    SELECT streak_id,
+           MIN(activity_date) AS start_date,
+           MAX(activity_date) AS end_date,
+           COUNT(*) AS streak_length
+    FROM streak_ids
+    GROUP BY streak_id
+)
+SELECT start_date,
+       end_date,
+       streak_length
+FROM streak_lengths
+WHERE streak_id = (
+    SELECT streak_id
+    FROM streak_ids
+    WHERE activity_date = (
+        SELECT MAX(activity_date)
+        FROM activity_dates
+    )
+);
+}
+expect {
+  2026-02-10|2026-02-14|5
+}
+
+@setup banana_report_seed
+test banana-report-digest-sections-subquery {
+SELECT e.digest_id,
+       e.batch_no,
+       e.recipe_code,
+       e.recipe_name,
+       e.digest_kind,
+       e.is_draft,
+       e.title_text,
+       e.summary_text,
+       e.char_count,
+       e.word_count,
+       e.logged_ms,
+       e.created_ms,
+       e.updated_ms,
+       e.processed_ms,
+       s.slice_id AS section_id,
+       s.topic_text AS section_topic,
+       s.body_text AS section_body,
+       s.char_count AS section_char_count,
+       s.word_count AS section_word_count
+FROM (
+    SELECT e.digest_id,
+           e.batch_no,
+           e.recipe_code,
+           e.recipe_name,
+           e.digest_kind,
+           e.is_draft,
+           e.title_text,
+           e.summary_text,
+           e.char_count,
+           e.word_count,
+           e.logged_ms,
+           e.created_ms,
+           e.updated_ms,
+           e.processed_ms
+    FROM banana_digest e
+    WHERE e.logged_ms >= 0 AND e.logged_ms < 4102441200000
+    ORDER BY e.logged_ms DESC
+    LIMIT 50 OFFSET 0
+) e
+INNER JOIN banana_digest_slice s ON e.digest_id = s.digest_ref
+ORDER BY e.logged_ms DESC, s.digest_ref ASC, s.slice_index ASC;
+}
+expect {
+  digest-400|400|r-400|late-peel|ops|0|Late Shift|Gamma|280|55|4000.0|4001.0|4002.0|4003.0|slice-400-a|night-dock|Arrivals tracked|72|14
+  digest-400|400|r-400|late-peel|ops|0|Late Shift|Gamma|280|55|4000.0|4001.0|4002.0|4003.0|slice-400-b|dispatch|Outbound loaded|68|13
+  digest-340|340|r-340|supply-peel|ops|0|Supply Pulse|Delta|260|52|3400.0|3401.0|3402.0|3403.0|slice-340-a|supply|Stocks healthy|63|12
+  digest-340|340|r-340|supply-peel|ops|0|Supply Pulse|Delta|260|52|3400.0|3401.0|3402.0|3403.0|slice-340-b|alerts|No blockers|58|11
+  digest-200|200|r-200|evening-peel|reflection|1|Peel Review|Beta|220|44|3000.0|3001.0|3002.0|3003.0|slice-200-a|ripeness|Ripe and ready|50|10
+  digest-200|200|r-200|evening-peel|reflection|1|Peel Review|Beta|220|44|3000.0|3001.0|3002.0|3003.0|slice-200-b|shipping|Crates moved|60|12
+  digest-280|280|r-280|quality-peel|review|0|Quality Sweep|Epsilon|230|46|2800.0|2801.0|2802.0|2803.0|slice-280-a|quality|QC trend stable|61|12
+  digest-280|280|r-280|quality-peel|review|0|Quality Sweep|Epsilon|230|46|2800.0|2801.0|2802.0|2803.0|slice-280-b|returns|Return rate low|59|11
+  digest-260|260|r-260|dock-peel|ops|1|Dock Check|Zeta|210|41|2600.0|2601.0|2602.0|2603.0|slice-260-a|dock|Crate queue clear|57|11
+  digest-240|240|r-240|crate-peel|ops|0|Crate Scan|Eta|205|40|2400.0|2401.0|2402.0|2403.0|slice-240-a|crate-audit|Barcode pass|54|10
+  digest-240|240|r-240|crate-peel|ops|0|Crate Scan|Eta|205|40|2400.0|2401.0|2402.0|2403.0|slice-240-b|crate-loss|No losses|52|10
+  digest-100|100|r-100|morning-peel|routine|0|Banana Brief|Alpha|120|24|2000.0|2001.0|2002.0|2003.0|slice-100-a|overview|Short note|40|8
+  digest-180|180|r-180|fleet-peel|routine|0|Fleet Notes|Theta|170|33|1800.0|1801.0|1802.0|1803.0|slice-180-a|fleet|Route summary|49|9
+  digest-180|180|r-180|fleet-peel|routine|0|Fleet Notes|Theta|170|33|1800.0|1801.0|1802.0|1803.0|slice-180-b|handoff|Smooth handoff|47|9
+  digest-160|160|r-160|orchard-peel|routine|0|Orchard Notes|Iota|160|31|1600.0|1601.0|1602.0|1603.0|slice-160-a|orchard|Field status|45|9
+  digest-120|120|r-120|sensor-peel|routine|1|Sensor Logs|Kappa|140|27|1200.0|1201.0|1202.0|1203.0|slice-120-a|sensor|Signal stable|42|8
+  digest-080|80|r-080|night-peel|archive|0|Night Ledger|Lambda|110|21|800.0|801.0|802.0|803.0|slice-080-a|night|Quiet shift|38|7
+}
+# Floating point 2.0 gets output as 2 in JS, etc. Otherwise the same.
+expect @js {
+  digest-400|400|r-400|late-peel|ops|0|Late Shift|Gamma|280|55|4000|4001|4002|4003|slice-400-a|night-dock|Arrivals tracked|72|14
+  digest-400|400|r-400|late-peel|ops|0|Late Shift|Gamma|280|55|4000|4001|4002|4003|slice-400-b|dispatch|Outbound loaded|68|13
+  digest-340|340|r-340|supply-peel|ops|0|Supply Pulse|Delta|260|52|3400|3401|3402|3403|slice-340-a|supply|Stocks healthy|63|12
+  digest-340|340|r-340|supply-peel|ops|0|Supply Pulse|Delta|260|52|3400|3401|3402|3403|slice-340-b|alerts|No blockers|58|11
+  digest-200|200|r-200|evening-peel|reflection|1|Peel Review|Beta|220|44|3000|3001|3002|3003|slice-200-a|ripeness|Ripe and ready|50|10
+  digest-200|200|r-200|evening-peel|reflection|1|Peel Review|Beta|220|44|3000|3001|3002|3003|slice-200-b|shipping|Crates moved|60|12
+  digest-280|280|r-280|quality-peel|review|0|Quality Sweep|Epsilon|230|46|2800|2801|2802|2803|slice-280-a|quality|QC trend stable|61|12
+  digest-280|280|r-280|quality-peel|review|0|Quality Sweep|Epsilon|230|46|2800|2801|2802|2803|slice-280-b|returns|Return rate low|59|11
+  digest-260|260|r-260|dock-peel|ops|1|Dock Check|Zeta|210|41|2600|2601|2602|2603|slice-260-a|dock|Crate queue clear|57|11
+  digest-240|240|r-240|crate-peel|ops|0|Crate Scan|Eta|205|40|2400|2401|2402|2403|slice-240-a|crate-audit|Barcode pass|54|10
+  digest-240|240|r-240|crate-peel|ops|0|Crate Scan|Eta|205|40|2400|2401|2402|2403|slice-240-b|crate-loss|No losses|52|10
+  digest-100|100|r-100|morning-peel|routine|0|Banana Brief|Alpha|120|24|2000|2001|2002|2003|slice-100-a|overview|Short note|40|8
+  digest-180|180|r-180|fleet-peel|routine|0|Fleet Notes|Theta|170|33|1800|1801|1802|1803|slice-180-a|fleet|Route summary|49|9
+  digest-180|180|r-180|fleet-peel|routine|0|Fleet Notes|Theta|170|33|1800|1801|1802|1803|slice-180-b|handoff|Smooth handoff|47|9
+  digest-160|160|r-160|orchard-peel|routine|0|Orchard Notes|Iota|160|31|1600|1601|1602|1603|slice-160-a|orchard|Field status|45|9
+  digest-120|120|r-120|sensor-peel|routine|1|Sensor Logs|Kappa|140|27|1200|1201|1202|1203|slice-120-a|sensor|Signal stable|42|8
+  digest-080|80|r-080|night-peel|archive|0|Night Ledger|Lambda|110|21|800|801|802|803|slice-080-a|night|Quiet shift|38|7
+}
+
+@setup banana_report_seed
+test banana-report-digest-sections-cte {
+WITH entries AS (
+    SELECT e.digest_id,
+           e.batch_no,
+           e.recipe_code,
+           e.recipe_name,
+           e.digest_kind,
+           e.is_draft,
+           e.title_text,
+           e.summary_text,
+           e.char_count,
+           e.word_count,
+           e.logged_ms,
+           e.created_ms,
+           e.updated_ms,
+           e.processed_ms
+    FROM banana_digest e
+    WHERE e.logged_ms >= 0 AND e.logged_ms < 4102441200000
+    ORDER BY e.logged_ms DESC
+    LIMIT 50 OFFSET 0
+)
+SELECT e.digest_id,
+       e.batch_no,
+       e.recipe_code,
+       e.recipe_name,
+       e.digest_kind,
+       e.is_draft,
+       e.title_text,
+       e.summary_text,
+       e.char_count,
+       e.word_count,
+       e.logged_ms,
+       e.created_ms,
+       e.updated_ms,
+       e.processed_ms,
+       s.slice_id AS section_id,
+       s.topic_text AS section_topic,
+       s.body_text AS section_body,
+       s.char_count AS section_char_count,
+       s.word_count AS section_word_count
+FROM entries e
+INNER JOIN banana_digest_slice s ON e.digest_id = s.digest_ref
+ORDER BY e.logged_ms DESC, s.digest_ref ASC, s.slice_index ASC;
+}
+expect {
+  digest-400|400|r-400|late-peel|ops|0|Late Shift|Gamma|280|55|4000.0|4001.0|4002.0|4003.0|slice-400-a|night-dock|Arrivals tracked|72|14
+  digest-400|400|r-400|late-peel|ops|0|Late Shift|Gamma|280|55|4000.0|4001.0|4002.0|4003.0|slice-400-b|dispatch|Outbound loaded|68|13
+  digest-340|340|r-340|supply-peel|ops|0|Supply Pulse|Delta|260|52|3400.0|3401.0|3402.0|3403.0|slice-340-a|supply|Stocks healthy|63|12
+  digest-340|340|r-340|supply-peel|ops|0|Supply Pulse|Delta|260|52|3400.0|3401.0|3402.0|3403.0|slice-340-b|alerts|No blockers|58|11
+  digest-200|200|r-200|evening-peel|reflection|1|Peel Review|Beta|220|44|3000.0|3001.0|3002.0|3003.0|slice-200-a|ripeness|Ripe and ready|50|10
+  digest-200|200|r-200|evening-peel|reflection|1|Peel Review|Beta|220|44|3000.0|3001.0|3002.0|3003.0|slice-200-b|shipping|Crates moved|60|12
+  digest-280|280|r-280|quality-peel|review|0|Quality Sweep|Epsilon|230|46|2800.0|2801.0|2802.0|2803.0|slice-280-a|quality|QC trend stable|61|12
+  digest-280|280|r-280|quality-peel|review|0|Quality Sweep|Epsilon|230|46|2800.0|2801.0|2802.0|2803.0|slice-280-b|returns|Return rate low|59|11
+  digest-260|260|r-260|dock-peel|ops|1|Dock Check|Zeta|210|41|2600.0|2601.0|2602.0|2603.0|slice-260-a|dock|Crate queue clear|57|11
+  digest-240|240|r-240|crate-peel|ops|0|Crate Scan|Eta|205|40|2400.0|2401.0|2402.0|2403.0|slice-240-a|crate-audit|Barcode pass|54|10
+  digest-240|240|r-240|crate-peel|ops|0|Crate Scan|Eta|205|40|2400.0|2401.0|2402.0|2403.0|slice-240-b|crate-loss|No losses|52|10
+  digest-100|100|r-100|morning-peel|routine|0|Banana Brief|Alpha|120|24|2000.0|2001.0|2002.0|2003.0|slice-100-a|overview|Short note|40|8
+  digest-180|180|r-180|fleet-peel|routine|0|Fleet Notes|Theta|170|33|1800.0|1801.0|1802.0|1803.0|slice-180-a|fleet|Route summary|49|9
+  digest-180|180|r-180|fleet-peel|routine|0|Fleet Notes|Theta|170|33|1800.0|1801.0|1802.0|1803.0|slice-180-b|handoff|Smooth handoff|47|9
+  digest-160|160|r-160|orchard-peel|routine|0|Orchard Notes|Iota|160|31|1600.0|1601.0|1602.0|1603.0|slice-160-a|orchard|Field status|45|9
+  digest-120|120|r-120|sensor-peel|routine|1|Sensor Logs|Kappa|140|27|1200.0|1201.0|1202.0|1203.0|slice-120-a|sensor|Signal stable|42|8
+  digest-080|80|r-080|night-peel|archive|0|Night Ledger|Lambda|110|21|800.0|801.0|802.0|803.0|slice-080-a|night|Quiet shift|38|7
+}
+expect @js {
+  digest-400|400|r-400|late-peel|ops|0|Late Shift|Gamma|280|55|4000|4001|4002|4003|slice-400-a|night-dock|Arrivals tracked|72|14
+  digest-400|400|r-400|late-peel|ops|0|Late Shift|Gamma|280|55|4000|4001|4002|4003|slice-400-b|dispatch|Outbound loaded|68|13
+  digest-340|340|r-340|supply-peel|ops|0|Supply Pulse|Delta|260|52|3400|3401|3402|3403|slice-340-a|supply|Stocks healthy|63|12
+  digest-340|340|r-340|supply-peel|ops|0|Supply Pulse|Delta|260|52|3400|3401|3402|3403|slice-340-b|alerts|No blockers|58|11
+  digest-200|200|r-200|evening-peel|reflection|1|Peel Review|Beta|220|44|3000|3001|3002|3003|slice-200-a|ripeness|Ripe and ready|50|10
+  digest-200|200|r-200|evening-peel|reflection|1|Peel Review|Beta|220|44|3000|3001|3002|3003|slice-200-b|shipping|Crates moved|60|12
+  digest-280|280|r-280|quality-peel|review|0|Quality Sweep|Epsilon|230|46|2800|2801|2802|2803|slice-280-a|quality|QC trend stable|61|12
+  digest-280|280|r-280|quality-peel|review|0|Quality Sweep|Epsilon|230|46|2800|2801|2802|2803|slice-280-b|returns|Return rate low|59|11
+  digest-260|260|r-260|dock-peel|ops|1|Dock Check|Zeta|210|41|2600|2601|2602|2603|slice-260-a|dock|Crate queue clear|57|11
+  digest-240|240|r-240|crate-peel|ops|0|Crate Scan|Eta|205|40|2400|2401|2402|2403|slice-240-a|crate-audit|Barcode pass|54|10
+  digest-240|240|r-240|crate-peel|ops|0|Crate Scan|Eta|205|40|2400|2401|2402|2403|slice-240-b|crate-loss|No losses|52|10
+  digest-100|100|r-100|morning-peel|routine|0|Banana Brief|Alpha|120|24|2000|2001|2002|2003|slice-100-a|overview|Short note|40|8
+  digest-180|180|r-180|fleet-peel|routine|0|Fleet Notes|Theta|170|33|1800|1801|1802|1803|slice-180-a|fleet|Route summary|49|9
+  digest-180|180|r-180|fleet-peel|routine|0|Fleet Notes|Theta|170|33|1800|1801|1802|1803|slice-180-b|handoff|Smooth handoff|47|9
+  digest-160|160|r-160|orchard-peel|routine|0|Orchard Notes|Iota|160|31|1600|1601|1602|1603|slice-160-a|orchard|Field status|45|9
+  digest-120|120|r-120|sensor-peel|routine|1|Sensor Logs|Kappa|140|27|1200|1201|1202|1203|slice-120-a|sensor|Signal stable|42|8
+  digest-080|80|r-080|night-peel|archive|0|Night Ledger|Lambda|110|21|800|801|802|803|slice-080-a|night|Quiet shift|38|7
+}
+
+@setup banana_activity_seed
+test banana-activity-streak-subquery {
+SELECT 
+    start_date, 
+    end_date, 
+    streak_length 
+FROM (
+    SELECT 
+        streak_id, 
+        MIN(activity_date) AS start_date, 
+        MAX(activity_date) AS end_date, 
+        COUNT(*) AS streak_length 
+    FROM (
+        SELECT 
+            activity_date, 
+            SUM(streak_start) OVER (ORDER BY activity_date) AS streak_id 
+        FROM (
+            SELECT 
+                activity_date, 
+                prev_date, 
+                JULIANDAY(activity_date) - JULIANDAY(prev_date) AS diff, 
+                CASE 
+                    WHEN JULIANDAY(activity_date) - JULIANDAY(prev_date) = 1 THEN 0 
+                    ELSE 1 
+                END AS streak_start 
+            FROM (
+                SELECT 
+                    activity_date, 
+                    (
+                        SELECT MAX(ad2.activity_date) 
+                        FROM (
+                            SELECT DISTINCT date(datetime(stamp / 1000, 'unixepoch', '+60 minutes')) AS activity_date 
+                            FROM (
+                                SELECT record_id, captured_ms AS stamp FROM dispatch_log WHERE 1=1 AND operator_tag='picker' 
+                                UNION ALL 
+                                SELECT record_id, launch_ms AS stamp FROM banana_batch WHERE 1=1 
+                                UNION ALL 
+                                SELECT record_id, captured_ms AS stamp FROM orchard_signal WHERE 1=1 AND (entry_kind='crate_note' OR entry_kind='quality_flag') 
+                                UNION ALL 
+                                SELECT record_id, captured_ms AS stamp FROM orchard_signal WHERE 1=1 AND entry_kind='quality_flag' 
+                                UNION ALL 
+                                SELECT record_id, captured_ms AS stamp FROM orchard_signal WHERE 1=1 AND entry_kind='crate_note'
+                            ) 
+                            ORDER BY activity_date
+                        ) ad2 
+                        WHERE ad2.activity_date < ad1.activity_date
+                    ) AS prev_date 
+                FROM (
+                    SELECT DISTINCT date(datetime(stamp / 1000, 'unixepoch', '+60 minutes')) AS activity_date 
+                    FROM (
+                        SELECT record_id, captured_ms AS stamp FROM dispatch_log WHERE 1=1 AND operator_tag='picker' 
+                        UNION ALL 
+                        SELECT record_id, launch_ms AS stamp FROM banana_batch WHERE 1=1 
+                        UNION ALL 
+                        SELECT record_id, captured_ms AS stamp FROM orchard_signal WHERE 1=1 AND (entry_kind='crate_note' OR entry_kind='quality_flag') 
+                        UNION ALL 
+                        SELECT record_id, captured_ms AS stamp FROM orchard_signal WHERE 1=1 AND entry_kind='quality_flag' 
+                        UNION ALL 
+                        SELECT record_id, captured_ms AS stamp FROM orchard_signal WHERE 1=1 AND entry_kind='crate_note'
+                    ) 
+                    ORDER BY activity_date
+                ) ad1
+            )
+        )
+    ) 
+    GROUP BY streak_id
+) 
+WHERE streak_id = (
+    SELECT streak_id 
+    FROM (
+        SELECT 
+            activity_date, 
+            SUM(streak_start) OVER (ORDER BY activity_date) AS streak_id 
+        FROM (
+            SELECT 
+                activity_date, 
+                prev_date, 
+                JULIANDAY(activity_date) - JULIANDAY(prev_date) AS diff, 
+                CASE 
+                    WHEN JULIANDAY(activity_date) - JULIANDAY(prev_date) = 1 THEN 0 
+                    ELSE 1 
+                END AS streak_start 
+            FROM (
+                SELECT 
+                    activity_date, 
+                    (
+                        SELECT MAX(ad2.activity_date) 
+                        FROM (
+                            SELECT DISTINCT date(datetime(stamp / 1000, 'unixepoch', '+60 minutes')) AS activity_date 
+                            FROM (
+                                SELECT record_id, captured_ms AS stamp FROM dispatch_log WHERE 1=1 AND operator_tag='picker' 
+                                UNION ALL 
+                                SELECT record_id, launch_ms AS stamp FROM banana_batch WHERE 1=1 
+                                UNION ALL 
+                                SELECT record_id, captured_ms AS stamp FROM orchard_signal WHERE 1=1 AND (entry_kind='crate_note' OR entry_kind='quality_flag') 
+                                UNION ALL 
+                                SELECT record_id, captured_ms AS stamp FROM orchard_signal WHERE 1=1 AND entry_kind='quality_flag' 
+                                UNION ALL 
+                                SELECT record_id, captured_ms AS stamp FROM orchard_signal WHERE 1=1 AND entry_kind='crate_note'
+                            ) 
+                            ORDER BY activity_date
+                        ) ad2 
+                        WHERE ad2.activity_date < ad1.activity_date
+                    ) AS prev_date 
+                FROM (
+                    SELECT DISTINCT date(datetime(stamp / 1000, 'unixepoch', '+60 minutes')) AS activity_date 
+                    FROM (
+                        SELECT record_id, captured_ms AS stamp FROM dispatch_log WHERE 1=1 AND operator_tag='picker' 
+                        UNION ALL 
+                        SELECT record_id, launch_ms AS stamp FROM banana_batch WHERE 1=1 
+                        UNION ALL 
+                        SELECT record_id, captured_ms AS stamp FROM orchard_signal WHERE 1=1 AND (entry_kind='crate_note' OR entry_kind='quality_flag') 
+                        UNION ALL 
+                        SELECT record_id, captured_ms AS stamp FROM orchard_signal WHERE 1=1 AND entry_kind='quality_flag' 
+                        UNION ALL 
+                        SELECT record_id, captured_ms AS stamp FROM orchard_signal WHERE 1=1 AND entry_kind='crate_note'
+                    ) 
+                    ORDER BY activity_date
+                ) ad1
+            )
+        )
+    ) 
+    WHERE activity_date = (
+        SELECT MAX(activity_date) 
+        FROM (
+            SELECT DISTINCT date(datetime(stamp / 1000, 'unixepoch', '+60 minutes')) AS activity_date 
+            FROM (
+                SELECT record_id, captured_ms AS stamp FROM dispatch_log WHERE 1=1 AND operator_tag='picker' 
+                UNION ALL 
+                SELECT record_id, launch_ms AS stamp FROM banana_batch WHERE 1=1 
+                UNION ALL 
+                SELECT record_id, captured_ms AS stamp FROM orchard_signal WHERE 1=1 AND (entry_kind='crate_note' OR entry_kind='quality_flag') 
+                UNION ALL 
+                SELECT record_id, captured_ms AS stamp FROM orchard_signal WHERE 1=1 AND entry_kind='quality_flag' 
+                UNION ALL 
+                SELECT record_id, captured_ms AS stamp FROM orchard_signal WHERE 1=1 AND entry_kind='crate_note'
+            ) 
+            ORDER BY activity_date
+        )
+    )
+);
+}
+expect {
+    2026-02-03|2026-02-03|1
+}

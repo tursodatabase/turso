@@ -18,6 +18,45 @@ expect {
     1|2
 }
 
+# Test WITH ... AS MATERIALIZED syntax - forces materialization even for single-ref CTEs
+test cte-as-materialized {
+    WITH t AS MATERIALIZED (SELECT 1 as x, 2 as y) SELECT x, y FROM t;
+}
+expect {
+    1|2
+}
+
+# Test AS NOT MATERIALIZED syntax (hint to avoid materialization)
+test cte-as-not-materialized {
+    WITH t AS NOT MATERIALIZED (SELECT 1 as x) SELECT * FROM t;
+}
+expect {
+    1
+}
+
+# Test multiple CTEs with mixed materialization hints
+test cte-mixed-materialization {
+    WITH
+      t1 AS MATERIALIZED (SELECT 1 as a),
+      t2 AS NOT MATERIALIZED (SELECT 2 as b),
+      t3 AS (SELECT 3 as c)
+    SELECT * FROM t1, t2, t3;
+}
+expect {
+    1|2|3
+}
+
+# Verify that AS MATERIALIZED actually materializes by using random().
+# A materialized CTE should compute random() once and return the same value
+# for multiple references, while non-materialized would re-evaluate.
+test cte-materialized-random-same-value {
+    WITH t AS MATERIALIZED (SELECT random() as r)
+    SELECT (SELECT r FROM t) = (SELECT r FROM t) as same;
+}
+expect {
+    1
+}
+
 test cte-chain {
     WITH a AS (SELECT 1 as x), b AS (SELECT x FROM a), c AS (SELECT x FROM b), d AS (SELECT x FROM c) SELECT * FROM d;
 }
@@ -609,3 +648,76 @@ expect error {
 # expect error {
 #     Materialized CTEs are not yet supported
 # }
+
+# =============================================================================
+# Multi-reference CTE with materialization - regression tests
+# =============================================================================
+
+# Original reproducer: multi-ref CTE with UNION where materialization is triggered.
+# The bug was that UNION deduplication was bypassed when the second reference
+# triggered materialization via ephemeral index, producing duplicate rows.
+test cte-multi-ref-union-dedupe {
+    WITH cte0 AS (SELECT -13 AS c0_0 UNION SELECT -14 UNION SELECT 19 UNION SELECT -13),
+         cte2 AS (SELECT c0_0 AS c2_0 FROM cte0)
+    SELECT t1.c2_0, t2.c0_0
+    FROM cte2 t1 INNER JOIN cte0 t2 ON t1.c2_0 = t2.c0_0
+    ORDER BY 1, 2;
+}
+expect {
+    -14|-14
+    -13|-13
+    19|19
+}
+
+# VALUES-based CTE with multiple references
+test cte-values-multi-ref {
+    WITH cte AS (VALUES (1), (2), (3))
+    SELECT * FROM cte t1 INNER JOIN cte t2 ON t1.column1 = t2.column1 ORDER BY 1, 2;
+}
+expect {
+    1|1
+    2|2
+    3|3
+}
+
+# Multi-ref UNION ALL (should preserve duplicates, not dedupe)
+test cte-multi-ref-union-all {
+    WITH cte AS (SELECT 1 AS x UNION ALL SELECT 1 UNION ALL SELECT 2)
+    SELECT a.x, b.x FROM cte a INNER JOIN cte b ON a.x = b.x ORDER BY 1, 2;
+}
+expect {
+    1|1
+    1|1
+    1|1
+    1|1
+    2|2
+}
+
+# Multi-ref CTE with join and WHERE clause
+test cte-multi-ref-join-where {
+    WITH cte AS (SELECT 1 AS x UNION SELECT 2 UNION SELECT 3)
+    SELECT a.x, b.x FROM cte a, cte b WHERE a.x = b.x ORDER BY 1;
+}
+expect {
+    1|1
+    2|2
+    3|3
+}
+
+# Multi-ref CTE with INTERSECT
+test cte-multi-ref-intersect {
+    WITH cte AS (SELECT 1 AS x INTERSECT SELECT 1)
+    SELECT a.x, b.x FROM cte a, cte b WHERE a.x = b.x;
+}
+expect {
+    1|1
+}
+
+# Multi-ref CTE with EXCEPT
+test cte-multi-ref-except {
+    WITH cte AS (SELECT 1 AS x UNION SELECT 2 EXCEPT SELECT 2)
+    SELECT a.x, b.x FROM cte a, cte b WHERE a.x = b.x;
+}
+expect {
+    1|1
+}
