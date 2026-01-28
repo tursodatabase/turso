@@ -2406,6 +2406,15 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                     let mut referenced_cols = Vec::new();
                     extract_column_refs(gen_expr, &mut referenced_cols);
 
+                    for ref_col in &referenced_cols {
+                        if !columns
+                            .iter()
+                            .any(|c| normalize_ident(c.col_name.as_str()) == *ref_col)
+                        {
+                            crate::bail_parse_error!("no such column: {}", ref_col);
+                        }
+                    }
+
                     // Normalize the current column name for comparison
                     let current_col_name = normalize_ident(&name);
 
