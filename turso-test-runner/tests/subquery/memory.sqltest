@@ -849,3 +849,41 @@ test subquery-column-affinity-inheritance-text {
 expect {
     0
 }
+
+# TEXT PRIMARY KEY can contain NULL (unlike INTEGER PRIMARY KEY which is rowid alias).
+# NOT IN subquery with NULL in TEXT PRIMARY KEY should return NULL, not 0.
+# Regression test: is_nonnull() must check is_rowid_alias(), not primary_key().
+test subquery-not-in-text-primary-key-null {
+    create table t(a TEXT PRIMARY KEY);
+    insert into t values (NULL);
+    insert into t values ('x');
+    select a, a NOT IN (SELECT a FROM t) from t order by a;
+}
+expect {
+    |
+    x|0
+}
+
+# Same test with IN (not NOT IN)
+test subquery-in-text-primary-key-null {
+    create table t(a TEXT PRIMARY KEY);
+    insert into t values (NULL);
+    insert into t values ('x');
+    select a, a IN (SELECT a FROM t) from t order by a;
+}
+expect {
+    |
+    x|1
+}
+
+# INTEGER PRIMARY KEY cannot contain NULL (auto-assigns rowid)
+test subquery-not-in-integer-primary-key-null {
+    create table t(a INTEGER PRIMARY KEY);
+    insert into t values (NULL);
+    insert into t values (2);
+    select a, a NOT IN (SELECT a FROM t) from t order by a;
+}
+expect {
+    1|0
+    2|0
+}
