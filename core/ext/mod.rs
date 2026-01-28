@@ -199,7 +199,8 @@ impl Database {
         }
         let syms = self.builtin_syms.data_ptr();
         // Pass the mutex pointer and the appropriate handler
-        let schema_mutex_ptr = &*self.schema as *const Mutex<Arc<Schema>> as *mut Mutex<Arc<Schema>>;
+        let schema_mutex_ptr =
+            &*self.schema as *const Mutex<Arc<Schema>> as *mut Mutex<Arc<Schema>>;
         let ctx = Box::into_raw(Box::new(ExtensionCtx {
             syms,
             schema: schema_mutex_ptr as *mut c_void,

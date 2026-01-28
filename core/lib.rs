@@ -275,7 +275,7 @@ pub struct OpenDbAsyncState {
     encryption_key: Option<EncryptionKey>,
     make_from_btree_state: schema::MakeFromBtreeState,
     /// Schema lock held during LoadingSchema phase to ensure atomicity across IO yields
-    schema_guard: Option<parking_lot::ArcMutexGuard<parking_lot::RawMutex, Arc<Schema>>>,
+    schema_guard: Option<sync::ArcMutexGuard<Arc<Schema>>>,
 }
 
 impl Default for OpenDbAsyncState {
@@ -617,27 +617,6 @@ impl Database {
         opts: DatabaseOpts,
         encryption_opts: Option<EncryptionOpts>,
     ) -> Result<Arc<Database>> {
-        Self::open_with_flags_bypass_registry_internal(
-            io,
-            path,
-            wal_path,
-            db_file,
-            flags,
-            opts,
-            encryption_opts,
-        )
-    }
-
-    #[allow(clippy::arc_with_non_send_sync)]
-    fn open_with_flags_bypass_registry_internal(
-        io: Arc<dyn IO>,
-        path: &str,
-        wal_path: &str,
-        db_file: Arc<dyn DatabaseStorage>,
-        flags: OpenFlags,
-        opts: DatabaseOpts,
-        encryption_opts: Option<EncryptionOpts>,
-    ) -> Result<Arc<Database>> {
         let mut state = OpenDbAsyncState::new();
         loop {
             match Self::open_with_flags_bypass_registry_async(
@@ -715,7 +694,7 @@ impl Database {
 
                     // Acquire schema lock and hold it through ReadingHeader and LoadingSchema phases
                     // to ensure schema_version and make_from_btree are atomic
-                    let guard = parking_lot::Mutex::lock_arc(&db.schema);
+                    let guard = db.schema.lock_arc();
 
                     tracing::info!("indexes: {}", guard.indexes.len());
                     state.db = Some(db);
