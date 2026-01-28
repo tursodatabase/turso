@@ -817,12 +817,12 @@ mod fuzz_tests {
             if sqlite_rows != limbo_rows {
                 // Print DDL and DML for reproduction
                 eprintln!("\n=== REPRODUCTION DDL/DML ===");
-                eprintln!("{}", schema);
+                eprintln!("{schema}");
                 for ins in &all_inserts {
-                    eprintln!("{};", ins);
+                    eprintln!("{ins};");
                 }
                 eprintln!("\n=== FAILING QUERY ===");
-                eprintln!("{}", query);
+                eprintln!("{query}");
                 eprintln!("=== END ===\n");
 
                 panic!(
