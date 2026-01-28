@@ -751,7 +751,10 @@ impl Database {
 
                     state.phase = OpenDbAsyncPhase::Done;
                     return Ok(IOResult::Done(
-                        state.db.take().expect("db must be initialized in Init phase"),
+                        state
+                            .db
+                            .take()
+                            .expect("db must be initialized in Init phase"),
                     ));
                 }
 
