@@ -1576,9 +1576,11 @@ def test_encryption(tmp_path):
         )
         cursor3 = conn3.cursor()
         cursor3.execute("select * from t")
+        cursor3.fetchone()  # trigger actual data read to cause decryption error
 
     # verify opening without encryption fails
     with pytest.raises(Exception):
         conn5 = turso.connect(str(tmp_path))
         cursor5 = conn5.cursor()
         cursor5.execute("select * from t")
+        cursor5.fetchone()  # trigger actual data read to cause decryption error
