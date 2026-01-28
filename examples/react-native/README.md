@@ -18,6 +18,30 @@ npm start
 yarn start
 ```
 
+### Testing Sync API (Optional)
+
+To test the sync API (pull/push), set the following environment variables before starting Metro:
+
+```sh
+TURSO_DATABASE_URL=libsql://your-db.turso.io \
+TURSO_AUTH_TOKEN=your-auth-token \
+npm start
+```
+
+### Testing Encryption (Optional)
+
+To also test encryption, add the encryption key:
+
+```sh
+TURSO_DATABASE_URL=libsql://your-db.turso.io \
+TURSO_AUTH_TOKEN=your-auth-token \
+TURSO_ENCRYPTION_KEY=your-base64-encryption-key \
+TURSO_ENCRYPTION_CIPHER=aes256gcm \
+npm start
+```
+
+Supported ciphers: `aes256gcm`, `aes128gcm`, `chacha20poly1305` (default: `aes256gcm`)
+
 ## Step 2: Build and run your app
 
 With Metro running, open a new terminal window/pane from the root of your React Native project, and use one of the following commands to build and run your Android or iOS app:
