@@ -731,11 +731,17 @@ impl Database {
                 }
 
                 OpenDbAsyncPhase::ReadingHeader => {
-                    let pager = state.pager.as_ref().unwrap();
+                    let pager = state
+                        .pager
+                        .as_ref()
+                        .expect("pager must be initialized in Init phase");
                     let header_schema_cookie =
                         return_if_io!(pager.with_header(|header| header.schema_cookie.get()));
 
-                    let db = state.db.as_ref().unwrap();
+                    let db = state
+                        .db
+                        .as_ref()
+                        .expect("db must be initialized in Init phase");
                     db.with_schema_mut(|schema| {
                         schema.schema_version = header_schema_cookie;
                         Ok(())
@@ -745,9 +751,18 @@ impl Database {
                 }
 
                 OpenDbAsyncPhase::LoadingSchema => {
-                    let db = state.db.as_ref().unwrap();
-                    let pager = state.pager.as_ref().unwrap();
-                    let conn = state.conn.as_ref().unwrap();
+                    let db = state
+                        .db
+                        .as_ref()
+                        .expect("db must be initialized in Init phase");
+                    let pager = state
+                        .pager
+                        .as_ref()
+                        .expect("pager must be initialized in Init phase");
+                    let conn = state
+                        .conn
+                        .as_ref()
+                        .expect("conn must be initialized in Init phase");
                     let syms = conn.syms.read();
                     let enable_triggers = db.opts.enable_triggers;
 
@@ -778,8 +793,14 @@ impl Database {
                 }
 
                 OpenDbAsyncPhase::BootstrapMvStore => {
-                    let db = state.db.as_ref().unwrap();
-                    let pager = state.pager.as_ref().unwrap();
+                    let db = state
+                        .db
+                        .as_ref()
+                        .expect("db must be initialized in Init phase");
+                    let pager = state
+                        .pager
+                        .as_ref()
+                        .expect("pager must be initialized in Init phase");
 
                     if let Some(mv_store) = db.get_mv_store().as_ref() {
                         let mvcc_bootstrap_conn =
@@ -788,7 +809,9 @@ impl Database {
                     }
 
                     state.phase = OpenDbAsyncPhase::Done;
-                    return Ok(IOResult::Done(state.db.take().unwrap()));
+                    return Ok(IOResult::Done(
+                        state.db.take().expect("db must be initialized in Init phase"),
+                    ));
                 }
 
                 OpenDbAsyncPhase::Done => {

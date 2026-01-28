@@ -650,13 +650,19 @@ impl Schema {
                 }
 
                 MakeFromBtreePhase::Rewinding => {
-                    let cursor = state.cursor.as_mut().unwrap();
+                    let cursor = state
+                        .cursor
+                        .as_mut()
+                        .expect("cursor must be initialized in Init phase");
                     return_if_io!(cursor.rewind());
                     state.phase = MakeFromBtreePhase::FetchingRecord;
                 }
 
                 MakeFromBtreePhase::FetchingRecord => {
-                    let cursor = state.cursor.as_mut().unwrap();
+                    let cursor = state
+                        .cursor
+                        .as_mut()
+                        .expect("cursor must be initialized in Init phase");
                     let row = return_if_io!(cursor.record());
 
                     let Some(row) = row else {
@@ -664,7 +670,10 @@ impl Schema {
                         pager.end_read_tx();
                         state.read_tx_active = false;
 
-                        let acc = state.accumulators.take().unwrap();
+                        let acc = state
+                            .accumulators
+                            .take()
+                            .expect("accumulators must be initialized in Init phase");
                         self.populate_indices(
                             syms,
                             acc.from_sql_indexes,
@@ -706,7 +715,10 @@ impl Schema {
                     };
                     let sql = sql_textref.map(|s| s.as_str());
 
-                    let acc = state.accumulators.as_mut().unwrap();
+                    let acc = state
+                        .accumulators
+                        .as_mut()
+                        .expect("accumulators must be initialized in Init phase");
                     self.handle_schema_row(
                         &ty,
                         &name,
@@ -727,7 +739,10 @@ impl Schema {
                 }
 
                 MakeFromBtreePhase::Advancing => {
-                    let cursor = state.cursor.as_mut().unwrap();
+                    let cursor = state
+                        .cursor
+                        .as_mut()
+                        .expect("cursor must be initialized in Init phase");
                     return_if_io!(cursor.next());
                     state.phase = MakeFromBtreePhase::FetchingRecord;
                 }

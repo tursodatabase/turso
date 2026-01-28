@@ -643,10 +643,21 @@ impl TursoDatabase {
                 }
 
                 TursoDatabaseOpenPhase::Opening => {
-                    let io = state.io.as_ref().unwrap();
-                    let db_file = state.db_file.as_ref().unwrap();
-                    let opts = state.opts.unwrap();
-                    let wal_path = state.wal_path.as_ref().unwrap();
+                    let io = state
+                        .io
+                        .as_ref()
+                        .expect("io must be initialized in Init phase");
+                    let db_file = state
+                        .db_file
+                        .as_ref()
+                        .expect("db_file must be initialized in Init phase");
+                    let opts = state
+                        .opts
+                        .expect("opts must be initialized in Init phase");
+                    let wal_path = state
+                        .wal_path
+                        .as_ref()
+                        .expect("wal_path must be initialized in Init phase");
 
                     match Database::open_with_flags_bypass_registry_async(
                         &mut state.open_db_state,
@@ -685,7 +696,10 @@ impl TursoDatabase {
             match self.open_async(&mut state)? {
                 IOResult::Done(()) => return Ok(()),
                 IOResult::IO(io_completion) => {
-                    let io = state.io.as_ref().unwrap();
+                    let io = state
+                        .io
+                        .as_ref()
+                        .expect("io must be initialized after first open_async call");
                     io_completion.wait(&**io)?;
                 }
             }
