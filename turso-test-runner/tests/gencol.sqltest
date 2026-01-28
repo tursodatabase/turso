@@ -1397,6 +1397,13 @@ test gencol_error_subquery {
 expect error {
 }
 
+test gencol_error_dot_operator {
+    CREATE TABLE t_dot(a AS (t_dot.b), b);
+}
+expect error {
+    the "." operator prohibited in generated columns
+}
+
 test gencol_error_aggregate {
     CREATE TABLE t2(a INT, b INT GENERATED ALWAYS AS (sum(a)));
 }

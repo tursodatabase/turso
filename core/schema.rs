@@ -1941,6 +1941,11 @@ fn validate_generated_expr(expr: &ast::Expr) -> Result<()> {
 fn validate_generated_expr_recursive(expr: &ast::Expr) -> Result<()> {
     use ast::Expr;
     match expr {
+        // Qualified column references prohibited (e.g. t.a or db.t.a)
+        Expr::Qualified(_, _) | Expr::DoublyQualified(_, _, _) => {
+            crate::bail_parse_error!("the \".\" operator prohibited in generated columns");
+        }
+
         // Subqueries prohibited (including InTable which is a table-valued subquery)
         Expr::Subquery(_) | Expr::InSelect { .. } | Expr::Exists(_) | Expr::InTable { .. } => {
             crate::bail_parse_error!("subqueries prohibited in generated columns");
