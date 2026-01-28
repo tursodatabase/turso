@@ -5,16 +5,26 @@ use jni::objects::{JByteArray, JObject, JString};
 use jni::sys::{jint, jlong};
 use jni::JNIEnv;
 use std::sync::Arc;
-use turso_core::{Database, DatabaseOpts, EncryptionOpts, OpenFlags};
+use turso_core::{Database, DatabaseOpts, EncryptionKey, EncryptionOpts, OpenFlags};
 
 struct TursoDB {
     db: Arc<Database>,
     io: Arc<dyn turso_core::IO>,
+    /// Encryption info: (cipher, hexkey) - stored as strings for lazy parsing
+    encryption_info: Option<(String, String)>,
 }
 
 impl TursoDB {
-    pub fn new(db: Arc<Database>, io: Arc<dyn turso_core::IO>) -> Self {
-        TursoDB { db, io }
+    pub fn new(
+        db: Arc<Database>,
+        io: Arc<dyn turso_core::IO>,
+        encryption_info: Option<(String, String)>,
+    ) -> Self {
+        TursoDB {
+            db,
+            io,
+            encryption_info,
+        }
     }
 
     #[allow(clippy::wrong_self_convention)]
@@ -76,7 +86,7 @@ pub extern "system" fn Java_tech_turso_core_TursoDB_openUtf8<'local>(
         }
     };
 
-    TursoDB::new(db, io).to_ptr()
+    TursoDB::new(db, io, None).to_ptr()
 }
 
 /// Opens a database with encryption support.
@@ -140,6 +150,11 @@ pub extern "system" fn Java_tech_turso_core_TursoDB_openWithEncryptionUtf8<'loca
         None
     };
 
+    // Clone encryption info before encryption_opts is consumed
+    let encryption_info = encryption_opts
+        .as_ref()
+        .map(|opts| (opts.cipher.clone(), opts.hexkey.clone()));
+
     let db_opts = if encryption_opts.is_some() {
         DatabaseOpts::new().with_encryption(true)
     } else {
@@ -160,7 +175,7 @@ pub extern "system" fn Java_tech_turso_core_TursoDB_openWithEncryptionUtf8<'loca
         }
     };
 
-    TursoDB::new(db, io).to_ptr()
+    TursoDB::new(db, io, encryption_info).to_ptr()
 }
 
 #[no_mangle]
@@ -177,8 +192,30 @@ pub extern "system" fn Java_tech_turso_core_TursoDB_connect0<'local>(
         }
     };
 
-    let conn = TursoConnection::new(db.db.connect().unwrap(), db.io.clone());
-    conn.to_ptr()
+    // Parse encryption key if encryption info is present
+    let encryption_key = if let Some((_cipher, hexkey)) = &db.encryption_info {
+        match EncryptionKey::from_hex_string(hexkey) {
+            Ok(key) => Some(key),
+            Err(e) => {
+                set_err_msg_and_throw_exception(&mut env, obj, TURSO_ETC, e.to_string());
+                return 0;
+            }
+        }
+    } else {
+        None
+    };
+
+    // Use connect_with_encryption to properly set up encryption context
+    // before the pager reads page 1. This is required for encrypted databases.
+    let conn = match db.db.connect_with_encryption(encryption_key) {
+        Ok(conn) => conn,
+        Err(e) => {
+            set_err_msg_and_throw_exception(&mut env, obj, TURSO_ETC, e.to_string());
+            return 0;
+        }
+    };
+
+    TursoConnection::new(conn, db.io.clone()).to_ptr()
 }
 
 #[no_mangle]
