@@ -2376,3 +2376,69 @@ expect {
     2024-04-30
 }
 
+# Tests for STRFTIME format argument coercion
+# SQLite coerces integer, float, and blob format arguments to text
+
+test strftime-format-integer {
+    SELECT STRFTIME(0, 1);
+}
+expect {
+    0
+}
+
+test strftime-format-integer-positive {
+    SELECT STRFTIME(123, '2024-01-01');
+}
+expect {
+    123
+}
+
+test strftime-format-integer-negative {
+    SELECT STRFTIME(-5, '2024-01-01');
+}
+expect {
+    -5
+}
+
+test strftime-format-float {
+    SELECT STRFTIME(3.14, '2024-01-01');
+}
+expect {
+    3.14
+}
+
+test strftime-format-float-negative {
+    SELECT STRFTIME(-2.5, '2024-01-01');
+}
+expect {
+    -2.5
+}
+
+test strftime-format-null {
+    SELECT STRFTIME(NULL, '2024-01-01');
+}
+expect {
+    
+}
+
+test strftime-format-blob {
+    SELECT STRFTIME(X'4142', '2024-01-01');
+}
+expect {
+    AB
+}
+
+test strftime-format-bool-true {
+    SELECT STRFTIME(1=1, '2024-01-01');
+}
+expect {
+    1
+}
+
+test strftime-format-bool-false {
+    SELECT STRFTIME(1=0, '2024-01-01');
+}
+expect {
+    0
+}
+

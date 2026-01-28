@@ -4,6 +4,7 @@ use crate::LimboError::InvalidModifier;
 use crate::{Result, ValueRef};
 // chrono isn't used more due to incompatibility with sqlite
 use chrono::{Local, Offset, TimeZone};
+use std::borrow::Cow;
 use std::fmt::Write;
 
 const JD_TO_MS: i64 = 86_400_000;
@@ -1179,8 +1180,9 @@ where
 
     let fmt_val = values.next().unwrap();
     let fmt_str = match fmt_val.as_value_ref() {
-        ValueRef::Text(s) => s.as_str(),
-        _ => return Value::Null,
+        ValueRef::Text(s) => Cow::Borrowed(s.as_str()),
+        ValueRef::Null => return Value::Null,
+        val => Cow::Owned(val.to_string()),
     };
 
     let mut p = DateTime::default();
@@ -2406,7 +2408,8 @@ mod tests {
 
         let fmt = Value::build_text("%Y".to_string());
         let date = Value::Null;
-        assert_eq!(exec_strftime(&[fmt, date]), Value::Null);
+        let expected = Value::Null;
+        assert_eq!(exec_strftime(&[fmt, date]), expected);
 
         let fmt = Value::build_text("%Y".to_string());
         let date = Value::build_text("invalid-date".to_string());
