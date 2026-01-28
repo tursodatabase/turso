@@ -1600,7 +1600,7 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@tursodatabase/database-common@npm:^0.5.0-pre.2, @tursodatabase/database-common@workspace:packages/common":
+"@tursodatabase/database-common@npm:^0.5.0-pre.4, @tursodatabase/database-common@workspace:packages/common":
   version: 0.0.0-use.local
   resolution: "@tursodatabase/database-common@workspace:packages/common"
   dependencies:
@@ -1609,7 +1609,7 @@ __metadata:
   languageName: unknown
   linkType: soft
 
-"@tursodatabase/database-wasm-common@npm:^0.5.0-pre.2, @tursodatabase/database-wasm-common@workspace:packages/wasm-common":
+"@tursodatabase/database-wasm-common@npm:^0.5.0-pre.4, @tursodatabase/database-wasm-common@workspace:packages/wasm-common":
   version: 0.0.0-use.local
   resolution: "@tursodatabase/database-wasm-common@workspace:packages/wasm-common"
   dependencies:
@@ -1623,8 +1623,8 @@ __metadata:
   resolution: "@tursodatabase/database-wasm@workspace:packages/wasm"
   dependencies:
     "@napi-rs/cli": "npm:^3.1.5"
-    "@tursodatabase/database-common": "npm:^0.5.0-pre.2"
-    "@tursodatabase/database-wasm-common": "npm:^0.5.0-pre.2"
+    "@tursodatabase/database-common": "npm:^0.5.0-pre.4"
+    "@tursodatabase/database-wasm-common": "npm:^0.5.0-pre.4"
     "@vitest/browser": "npm:^3.2.4"
     playwright: "npm:^1.55.0"
     typescript: "npm:^5.9.2"
@@ -1638,7 +1638,7 @@ __metadata:
   resolution: "@tursodatabase/database@workspace:packages/native"
   dependencies:
     "@napi-rs/cli": "npm:^3.1.5"
-    "@tursodatabase/database-common": "npm:^0.5.0-pre.2"
+    "@tursodatabase/database-common": "npm:^0.5.0-pre.4"
     "@types/node": "npm:^24.3.1"
     better-sqlite3: "npm:^12.2.0"
     drizzle-kit: "npm:^0.31.4"
@@ -1648,11 +1648,11 @@ __metadata:
   languageName: unknown
   linkType: soft
 
-"@tursodatabase/sync-common@npm:^0.5.0-pre.2, @tursodatabase/sync-common@workspace:sync/packages/common":
+"@tursodatabase/sync-common@npm:^0.5.0-pre.4, @tursodatabase/sync-common@workspace:sync/packages/common":
   version: 0.0.0-use.local
   resolution: "@tursodatabase/sync-common@workspace:sync/packages/common"
   dependencies:
-    "@tursodatabase/database-common": "npm:^0.5.0-pre.2"
+    "@tursodatabase/database-common": "npm:^0.5.0-pre.4"
     typescript: "npm:^5.9.2"
   languageName: unknown
   linkType: soft
@@ -1662,9 +1662,9 @@ __metadata:
   resolution: "@tursodatabase/sync-wasm@workspace:sync/packages/wasm"
   dependencies:
     "@napi-rs/cli": "npm:^3.1.5"
-    "@tursodatabase/database-common": "npm:^0.5.0-pre.2"
-    "@tursodatabase/database-wasm-common": "npm:^0.5.0-pre.2"
-    "@tursodatabase/sync-common": "npm:^0.5.0-pre.2"
+    "@tursodatabase/database-common": "npm:^0.5.0-pre.4"
+    "@tursodatabase/database-wasm-common": "npm:^0.5.0-pre.4"
+    "@tursodatabase/sync-common": "npm:^0.5.0-pre.4"
     "@vitest/browser": "npm:^3.2.4"
     playwright: "npm:^1.57.0"
     typescript: "npm:^5.9.2"
@@ -1678,8 +1678,8 @@ __metadata:
   resolution: "@tursodatabase/sync@workspace:sync/packages/native"
   dependencies:
     "@napi-rs/cli": "npm:^3.1.5"
-    "@tursodatabase/database-common": "npm:^0.5.0-pre.2"
-    "@tursodatabase/sync-common": "npm:^0.5.0-pre.2"
+    "@tursodatabase/database-common": "npm:^0.5.0-pre.4"
+    "@tursodatabase/sync-common": "npm:^0.5.0-pre.4"
     "@types/node": "npm:^24.3.1"
     typescript: "npm:^5.9.2"
     vitest: "npm:^3.2.4"
@@ -3012,8 +3012,8 @@ __metadata:
   linkType: hard
 
 "node-gyp@npm:latest":
-  version: 12.1.0
-  resolution: "node-gyp@npm:12.1.0"
+  version: 12.2.0
+  resolution: "node-gyp@npm:12.2.0"
   dependencies:
     env-paths: "npm:^2.2.0"
     exponential-backoff: "npm:^3.1.1"
@@ -3022,12 +3022,12 @@ __metadata:
     nopt: "npm:^9.0.0"
     proc-log: "npm:^6.0.0"
     semver: "npm:^7.3.5"
-    tar: "npm:^7.5.2"
+    tar: "npm:^7.5.4"
     tinyglobby: "npm:^0.2.12"
     which: "npm:^6.0.0"
   bin:
     node-gyp: bin/node-gyp.js
-  checksum: 10c0/f43efea8aaf0beb6b2f6184e533edad779b2ae38062953e21951f46221dd104006cc574154f2ad4a135467a5aae92c49e84ef289311a82e08481c5df0e8dc495
+  checksum: 10c0/3ed046746a5a7d90950cd8b0547332b06598443f31fe213ef4332a7174c7b7d259e1704835feda79b87d3f02e59d7791842aac60642ede4396ab25fdf0f8f759
   languageName: node
   linkType: hard
 
@@ -3564,16 +3564,16 @@ __metadata:
   languageName: node
   linkType: hard
 
-"tar@npm:^7.5.2":
-  version: 7.5.6
-  resolution: "tar@npm:7.5.6"
+"tar@npm:^7.5.4":
+  version: 7.5.7
+  resolution: "tar@npm:7.5.7"
   dependencies:
     "@isaacs/fs-minipass": "npm:^4.0.0"
     chownr: "npm:^3.0.0"
     minipass: "npm:^7.1.2"
     minizlib: "npm:^3.1.0"
     yallist: "npm:^5.0.0"
-  checksum: 10c0/08af3807035957650ad5f2a300c49ca4fe0566ac0ea5a23741a5b5103c6da42891a9eeaed39bc1fbcf21c5cac4dc846828a004727fb08b9d946322d3144d1fd2
+  checksum: 10c0/51f261afc437e1112c3e7919478d6176ea83f7f7727864d8c2cce10f0b03a631d1911644a567348c3063c45abdae39718ba97abb073d22aa3538b9a53ae1e31c
   languageName: node
   linkType: hard
 
