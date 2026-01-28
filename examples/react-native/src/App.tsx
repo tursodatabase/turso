@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 import { StyleSheet, Text, View, ScrollView } from 'react-native';
-import { connect, setup, Database } from '@tursodatabase/react-native';
+import { connect, setup, Database } from '@tursodatabase/sync-react-native';
 
 type TestResult = {
   name: string;
