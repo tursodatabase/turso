@@ -8783,11 +8783,39 @@ pub fn op_open_dup(
                 .expect("cursor_id should be valid")
                 .replace(Cursor::new_btree(cursor));
         }
-        CursorType::BTreeIndex(_) => {
-            // In principle, we could implement OpenDup for BTreeIndex,
-            // but doing so now would create dead code since we have no use case,
-            // and it wouldn't be possible to test it.
-            unimplemented!("OpenDup is not supported for BTreeIndex yet")
+        CursorType::BTreeIndex(index) => {
+            let num_columns = index.columns.len();
+            let cursor = Box::new(BTreeCursor::new_index(
+                pager.clone(),
+                maybe_transform_root_page_to_positive(mv_store.as_ref(), root_page),
+                index.as_ref(),
+                num_columns,
+            ));
+            let cursor: Box<dyn CursorTrait> = if !is_ephemeral {
+                if let Some(tx_id) = program.connection.get_mv_tx_id() {
+                    let mv_store = mv_store
+                        .as_ref()
+                        .expect("mv_store should be Some when MVCC transaction is active")
+                        .clone();
+                    let index_info = Arc::new(IndexInfo::new_from_index(index));
+                    Box::new(MvCursor::new(
+                        mv_store,
+                        tx_id,
+                        root_page,
+                        MvccCursorType::Index(index_info),
+                        cursor,
+                    )?)
+                } else {
+                    cursor
+                }
+            } else {
+                cursor
+            };
+            let cursors = &mut state.cursors;
+            cursors
+                .get_mut(*new_cursor_id)
+                .expect("cursor_id should be valid")
+                .replace(Cursor::new_btree(cursor));
         }
         _ => panic!("OpenDup is not supported for {cursor_type:?}"),
     }

@@ -9,7 +9,9 @@ use crate::translate::optimizer::constraints::{
 };
 use crate::translate::optimizer::cost::RowCountEstimate;
 use crate::translate::optimizer::cost_params::CostModelParams;
-use crate::translate::plan::{HashJoinKey, NonFromClauseSubquery, SubqueryState, WhereTerm};
+use crate::translate::plan::{
+    plan_is_correlated, HashJoinKey, NonFromClauseSubquery, SubqueryState, WhereTerm,
+};
 use crate::util::exprs_are_equivalent;
 use crate::vdbe::hash_table::DEFAULT_MEM_BUDGET;
 use crate::{
@@ -660,9 +662,10 @@ fn find_best_access_method_for_subquery(
 ) -> Result<Option<AccessMethod>> {
     use super::constraints::ConstraintRef;
 
-    // If this is the first/only table in the join, use coroutine (no need to materialize)
-    let is_leftmost = join_order.len() <= 1;
-    if is_leftmost {
+    // Correlated subqueries (referencing outer tables) cannot be materialized once -
+    // they must re-execute for each outer row. Use coroutine for these.
+    // This check must come first because correlated CTEs should NOT share materialized data.
+    if plan_is_correlated(&subquery.plan) {
         return Ok(Some(AccessMethod {
             cost: estimate_cost_for_scan_or_seek(
                 None,
@@ -677,9 +680,11 @@ fn find_best_access_method_for_subquery(
         }));
     }
 
-    // Correlated subqueries (referencing outer tables) cannot be materialized once -
-    // they must re-execute for each outer row. Use coroutine for these.
-    if crate::translate::plan::plan_is_correlated(&subquery.plan) {
+    // If this is the first/only table in the join and materialization is not requested, use coroutine.
+    // Note: materialize_hint is set for explicit WITH MATERIALIZED hints.
+    // Multi-reference CTE materialization decisions are handled at emission time via reference counting.
+    let is_leftmost = join_order.len() <= 1;
+    if is_leftmost && !subquery.materialize_hint {
         return Ok(Some(AccessMethod {
             cost: estimate_cost_for_scan_or_seek(
                 None,

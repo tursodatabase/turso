@@ -3,7 +3,7 @@ use crate::translate::expr::{translate_expr_no_constant_opt, NoConstantOptReason
 use crate::translate::plan::{QueryDestination, SelectPlan};
 use crate::translate::result_row::emit_offset;
 use crate::vdbe::builder::ProgramBuilder;
-use crate::vdbe::insn::{to_u16, IdxInsertFlags, Insn};
+use crate::vdbe::insn::{to_u16, IdxInsertFlags, InsertFlags, Insn};
 use crate::vdbe::BranchOffset;
 use crate::Result;
 
@@ -23,7 +23,7 @@ pub fn emit_values(
             emit_values_in_subquery(program, plan, t_ctx, yield_reg)?
         }
         QueryDestination::EphemeralIndex { .. } => emit_toplevel_values(program, plan, t_ctx)?,
-        QueryDestination::EphemeralTable { .. } => unreachable!(),
+        QueryDestination::EphemeralTable { .. } => emit_toplevel_values(program, plan, t_ctx)?,
         QueryDestination::ExistsSubqueryResult { result_reg } => {
             program.emit_insn(Insn::Integer {
                 value: 1,
@@ -197,7 +197,9 @@ fn emit_values_to_destination(
         QueryDestination::EphemeralIndex { .. } => {
             emit_values_to_index(program, plan, start_reg, row_len);
         }
-        QueryDestination::EphemeralTable { .. } => unreachable!(),
+        QueryDestination::EphemeralTable { .. } => {
+            emit_values_to_table(program, plan, start_reg, row_len);
+        }
         QueryDestination::ExistsSubqueryResult { result_reg } => {
             program.emit_insn(Insn::Integer {
                 value: 1,
@@ -260,4 +262,39 @@ fn emit_values_to_index(
             flags: IdxInsertFlags::new().no_op_duplicate(),
         });
     }
+}
+
+fn emit_values_to_table(
+    program: &mut ProgramBuilder,
+    plan: &SelectPlan,
+    start_reg: usize,
+    row_len: usize,
+) {
+    let (cursor_id, table) = match &plan.query_destination {
+        QueryDestination::EphemeralTable {
+            cursor_id, table, ..
+        } => (cursor_id, table),
+        _ => unreachable!(),
+    };
+    let record_reg = program.alloc_register();
+    let rowid_reg = program.alloc_register();
+    program.emit_insn(Insn::MakeRecord {
+        start_reg: to_u16(start_reg),
+        count: to_u16(row_len),
+        dest_reg: to_u16(record_reg),
+        index_name: Some(table.name.clone()),
+        affinity_str: None,
+    });
+    program.emit_insn(Insn::NewRowid {
+        cursor: *cursor_id,
+        rowid_reg,
+        prev_largest_reg: 0,
+    });
+    program.emit_insn(Insn::Insert {
+        cursor: *cursor_id,
+        key_reg: rowid_reg,
+        record_reg,
+        flag: InsertFlags::new().is_ephemeral_table_insert(),
+        table_name: table.name.clone(),
+    });
 }

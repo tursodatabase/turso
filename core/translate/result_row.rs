@@ -47,13 +47,16 @@ pub fn emit_select_result(
     // result column registers. If constants are moved to the init section, they can be
     // overwritten by subsequent subselects before being used.
     //
-    // We conservatively disable constant optimization for EphemeralIndex and CoroutineYield
-    // destinations because these are used in compound select contexts. This is slightly
-    // over-broad (e.g., simple INSERT INTO ... SELECT with no UNION doesn't need this),
-    // but we lack context here to distinguish compound vs non-compound cases.
+    // We conservatively disable constant optimization for EphemeralIndex, CoroutineYield,
+    // and EphemeralTable destinations because these are used in compound select contexts
+    // and CTE materialization. This is slightly over-broad (e.g., simple INSERT INTO ...
+    // SELECT with no UNION doesn't need this), but we lack context here to distinguish
+    // compound vs non-compound cases.
     let disable_constant_opt = matches!(
         plan.query_destination,
-        QueryDestination::EphemeralIndex { .. } | QueryDestination::CoroutineYield { .. }
+        QueryDestination::EphemeralIndex { .. }
+            | QueryDestination::CoroutineYield { .. }
+            | QueryDestination::EphemeralTable { .. }
     );
 
     if !skip_column_eval {
@@ -100,21 +103,25 @@ pub fn emit_select_result(
     Ok(())
 }
 
-/// Emits the bytecode for:
-/// - result row (or if a subquery, yields to the parent query)
-/// - limit
-pub fn emit_result_row_and_limit(
+/// Emits bytecode to send column values to a destination.
+/// This is the core "emit to destination" logic shared by both regular SELECT emission
+/// and compound SELECT (UNION/INTERSECT/EXCEPT) final output.
+///
+/// Parameters:
+/// - `start_reg`: First register containing column values
+/// - `num_columns`: Number of columns to emit
+/// - `destination`: Where to send the columns (ResultRow, EphemeralIndex, etc.)
+pub fn emit_columns_to_destination(
     program: &mut ProgramBuilder,
-    plan: &SelectPlan,
-    result_columns_start_reg: usize,
-    limit_ctx: Option<LimitCtx>,
-    label_on_limit_reached: Option<BranchOffset>,
+    destination: &QueryDestination,
+    start_reg: usize,
+    num_columns: usize,
 ) -> Result<()> {
-    match &plan.query_destination {
+    match destination {
         QueryDestination::ResultRows => {
             program.emit_insn(Insn::ResultRow {
-                start_reg: result_columns_start_reg,
-                count: plan.result_columns.len(),
+                start_reg,
+                count: num_columns,
             });
         }
         QueryDestination::EphemeralIndex {
@@ -124,8 +131,8 @@ pub fn emit_result_row_and_limit(
         } => {
             if *is_delete {
                 program.emit_insn(Insn::IdxDelete {
-                    start_reg: result_columns_start_reg,
-                    num_regs: plan.result_columns.len(),
+                    start_reg,
+                    num_regs: num_columns,
                     cursor_id: *index_cursor_id,
                     raise_error_if_no_matching_entry: false,
                 });
@@ -135,51 +142,50 @@ pub fn emit_result_row_and_limit(
                 // For ephemeral indexes (materialized subqueries), columns need to be reordered
                 // to match the index definition (key columns first, then remaining columns).
                 // The index.columns[i].pos_in_table tells us which result column goes in position i.
-                let (record_start, record_count) = if dedupe_index.ephemeral
-                    && dedupe_index.columns.len() == plan.result_columns.len()
-                {
-                    // Reorder columns according to index definition
-                    // If the index has_rowid, we need an extra register for the rowid
-                    let extra_for_rowid = if dedupe_index.has_rowid { 1 } else { 0 };
-                    let reordered_start =
-                        program.alloc_registers(dedupe_index.columns.len() + extra_for_rowid);
-                    for (idx_pos, idx_col) in dedupe_index.columns.iter().enumerate() {
-                        let src_reg = result_columns_start_reg + idx_col.pos_in_table;
-                        let dst_reg = reordered_start + idx_pos;
-                        program.emit_insn(Insn::Copy {
-                            src_reg,
-                            dst_reg,
-                            extra_amount: 0,
-                        });
-                    }
-                    // For indexes with rowid (e.g., derived tables), generate a unique rowid
-                    // to ensure duplicate column values don't get dropped. For ephemeral indexes,
-                    // use a per-cursor sequence instead of NewRowid because NewRowid derives from
-                    // index order and can repeat when inserts are out of key order. SQLite does
-                    // the same for autoindex rowids (see where.c: translateColumnToCopy).
-                    if dedupe_index.has_rowid {
-                        let rowid_reg = reordered_start + dedupe_index.columns.len();
-                        if dedupe_index.ephemeral {
-                            program.emit_insn(Insn::Sequence {
-                                cursor_id: *index_cursor_id,
-                                target_reg: rowid_reg,
-                            });
-                        } else {
-                            program.emit_insn(Insn::NewRowid {
-                                cursor: *index_cursor_id,
-                                rowid_reg,
-                                prev_largest_reg: 0,
+                let (record_start, record_count) =
+                    if dedupe_index.ephemeral && dedupe_index.columns.len() == num_columns {
+                        // Reorder columns according to index definition
+                        // If the index has_rowid, we need an extra register for the rowid
+                        let extra_for_rowid = if dedupe_index.has_rowid { 1 } else { 0 };
+                        let reordered_start =
+                            program.alloc_registers(dedupe_index.columns.len() + extra_for_rowid);
+                        for (idx_pos, idx_col) in dedupe_index.columns.iter().enumerate() {
+                            let src_reg = start_reg + idx_col.pos_in_table;
+                            let dst_reg = reordered_start + idx_pos;
+                            program.emit_insn(Insn::Copy {
+                                src_reg,
+                                dst_reg,
+                                extra_amount: 0,
                             });
                         }
-                    }
-                    (
-                        reordered_start,
-                        dedupe_index.columns.len() + extra_for_rowid,
-                    )
-                } else {
-                    // Non-ephemeral indexes: use natural column order
-                    (result_columns_start_reg, plan.result_columns.len())
-                };
+                        // For indexes with rowid (e.g., derived tables), generate a unique rowid
+                        // to ensure duplicate column values don't get dropped. For ephemeral indexes,
+                        // use a per-cursor sequence instead of NewRowid because NewRowid derives from
+                        // index order and can repeat when inserts are out of key order. SQLite does
+                        // the same for autoindex rowids (see where.c: translateColumnToCopy).
+                        if dedupe_index.has_rowid {
+                            let rowid_reg = reordered_start + dedupe_index.columns.len();
+                            if dedupe_index.ephemeral {
+                                program.emit_insn(Insn::Sequence {
+                                    cursor_id: *index_cursor_id,
+                                    target_reg: rowid_reg,
+                                });
+                            } else {
+                                program.emit_insn(Insn::NewRowid {
+                                    cursor: *index_cursor_id,
+                                    rowid_reg,
+                                    prev_largest_reg: 0,
+                                });
+                            }
+                        }
+                        (
+                            reordered_start,
+                            dedupe_index.columns.len() + extra_for_rowid,
+                        )
+                    } else {
+                        // Non-ephemeral indexes: use natural column order
+                        (start_reg, num_columns)
+                    };
 
                 program.emit_insn(Insn::MakeRecord {
                     start_reg: to_u16(record_start),
@@ -202,26 +208,26 @@ pub fn emit_result_row_and_limit(
             table,
             rowid_mode,
         } => {
+            // Prevent constant hoisting so that each row's constants are evaluated inline.
+            // This is critical for UNION ALL where each arm should insert its own values.
+            program.constant_span_end_all();
             let record_reg = program.alloc_register();
             match rowid_mode {
                 super::plan::EphemeralRowidMode::FromResultColumns => {
                     // For single-column case (RowidOnly materialization), we still need to
                     // create a record containing the rowid so it can be read back later.
-                    // The rowid is used as both the key (for deduplication) and stored
-                    // in the record (for read-back via Column instruction).
-                    if plan.result_columns.len() == 1 {
-                        // Single column case: create a record with just the rowid value
+                    if num_columns == 1 {
                         program.emit_insn(Insn::MakeRecord {
-                            start_reg: to_u16(result_columns_start_reg),
+                            start_reg: to_u16(start_reg),
                             count: to_u16(1),
                             dest_reg: to_u16(record_reg),
                             index_name: Some(table.name.clone()),
                             affinity_str: None,
                         });
-                    } else if plan.result_columns.len() > 1 {
+                    } else if num_columns > 1 {
                         program.emit_insn(Insn::MakeRecord {
-                            start_reg: to_u16(result_columns_start_reg),
-                            count: to_u16(plan.result_columns.len() - 1),
+                            start_reg: to_u16(start_reg),
+                            count: to_u16(num_columns - 1),
                             dest_reg: to_u16(record_reg),
                             index_name: Some(table.name.clone()),
                             affinity_str: None,
@@ -229,9 +235,8 @@ pub fn emit_result_row_and_limit(
                     }
                     program.emit_insn(Insn::Insert {
                         cursor: *table_cursor_id,
-                        key_reg: result_columns_start_reg + (plan.result_columns.len() - 1), // Rowid reg is the last register
+                        key_reg: start_reg + (num_columns - 1),
                         record_reg,
-                        // since we are not doing an Insn::NewRowid or an Insn::NotExists here, we need to seek to ensure the insertion happens in the correct place.
                         flag: InsertFlags::new()
                             .require_seek()
                             .is_ephemeral_table_insert(),
@@ -239,10 +244,10 @@ pub fn emit_result_row_and_limit(
                     });
                 }
                 super::plan::EphemeralRowidMode::Auto => {
-                    if !plan.result_columns.is_empty() {
+                    if num_columns > 0 {
                         program.emit_insn(Insn::MakeRecord {
-                            start_reg: to_u16(result_columns_start_reg),
-                            count: to_u16(plan.result_columns.len()),
+                            start_reg: to_u16(start_reg),
+                            count: to_u16(num_columns),
                             dest_reg: to_u16(record_reg),
                             index_name: Some(table.name.clone()),
                             affinity_str: None,
@@ -280,33 +285,50 @@ pub fn emit_result_row_and_limit(
             result_reg_start,
             num_regs,
         } => {
-            assert!(plan.result_columns.len() == *num_regs, "Row value subqueries should have the same number of result columns as the number of registers");
+            assert!(
+                num_columns == *num_regs,
+                "Row value subqueries should have the same number of result columns as the number of registers"
+            );
             program.emit_insn(Insn::Copy {
-                src_reg: result_columns_start_reg,
+                src_reg: start_reg,
                 dst_reg: *result_reg_start,
                 extra_amount: num_regs - 1,
             });
         }
         QueryDestination::RowSet { rowset_reg } => {
-            // For RowSet, we add the rowid (which should be the only result column) to the RowSet
             assert_eq!(
-                plan.result_columns.len(),
-                1,
+                num_columns, 1,
                 "RowSet should only have one result column (rowid)"
             );
             program.emit_insn(Insn::RowSetAdd {
                 rowset_reg: *rowset_reg,
-                value_reg: result_columns_start_reg,
+                value_reg: start_reg,
             });
         }
         QueryDestination::Unset => unreachable!("Unset query destination should not be reached"),
     }
+    Ok(())
+}
+
+/// Emits the bytecode for:
+/// - result row (or if a subquery, yields to the parent query)
+/// - limit
+pub fn emit_result_row_and_limit(
+    program: &mut ProgramBuilder,
+    plan: &SelectPlan,
+    result_columns_start_reg: usize,
+    limit_ctx: Option<LimitCtx>,
+    label_on_limit_reached: Option<BranchOffset>,
+) -> Result<()> {
+    emit_columns_to_destination(
+        program,
+        &plan.query_destination,
+        result_columns_start_reg,
+        plan.result_columns.len(),
+    )?;
 
     if plan.limit.is_some() {
         if label_on_limit_reached.is_none() {
-            // There are cases where LIMIT is ignored, e.g. aggregation without a GROUP BY clause.
-            // We already early return on LIMIT 0, so we can just return here since the n of rows
-            // is always 1 here.
             return Ok(());
         }
         let limit_ctx = limit_ctx.expect("limit_ctx must be Some if plan.limit is Some");

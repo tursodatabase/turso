@@ -42,6 +42,9 @@ use turso_parser::ast::{
 /// re-plan each time the CTE is referenced. This ensures each reference gets
 /// truly unique internal_ids and cursor IDs.
 struct CteDefinition {
+    /// Globally unique CTE identity for sharing materialized data.
+    /// Multiple references to this CTE will use this ID to look up shared cursors.
+    cte_id: usize,
     /// Normalized CTE name
     name: String,
     /// The original AST SELECT statement (cloned for each reference)
@@ -410,6 +413,11 @@ fn plan_cte(
     } else {
         Some(cte_def.explicit_columns.as_slice())
     };
+
+    // Track CTE reference count globally for materialization decisions during emission.
+    // Multi-ref CTEs should be materialized; single-ref CTEs can use coroutine.
+    program.increment_cte_reference(cte_def.cte_id);
+
     match cte_plan {
         Plan::Select(_) | Plan::CompoundSelect { .. } => JoinedTable::new_subquery_from_plan(
             cte_def.name.clone(),
@@ -417,6 +425,7 @@ fn plan_cte(
             None,
             program.table_reference_counter.next(),
             explicit_cols,
+            Some(cte_def.cte_id), // Pass the CTE identity for sharing materialized data
         ),
         Plan::Delete(_) | Plan::Update(_) => {
             crate::bail_parse_error!("DELETE/UPDATE queries are not supported in CTEs")
@@ -496,6 +505,7 @@ pub fn plan_ctes_as_outer_refs(
                 None,
                 program.table_reference_counter.next(),
                 explicit_cols,
+                None, // CTEs in DML don't share materialized data (TODO: implement if needed)
             )?,
             Plan::Delete(_) | Plan::Update(_) => {
                 crate::bail_parse_error!("Only SELECT queries are supported in CTEs")
@@ -602,6 +612,7 @@ fn parse_from_clause_table(
                 None,
                 program.table_reference_counter.next(),
                 None, // No explicit columns for regular subqueries
+                None, // Regular inline subqueries don't have a CTE identity
             )?);
             Ok(())
         }
@@ -985,6 +996,7 @@ pub fn parse_from(
                 .collect();
 
             cte_definitions.push(CteDefinition {
+                cte_id: program.alloc_cte_id(),
                 name: cte_name_normalized,
                 select: cte.select,
                 explicit_columns,

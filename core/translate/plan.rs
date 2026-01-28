@@ -1294,6 +1294,8 @@ impl JoinedTable {
             plan: Box::new(Plan::Select(plan)),
             columns,
             result_columns_start_reg: None,
+            cte_id: None,
+            materialize_hint: false,
         });
         Ok(Self {
             op: Operation::default_scan_for(&table),
@@ -1310,12 +1312,14 @@ impl JoinedTable {
 
     /// Creates a new TableReference for a subquery from a Plan (either SelectPlan or CompoundSelect).
     /// If `explicit_columns` is provided, those names override the derived column names from the SELECT.
+    /// If `cte_id` is provided, this subquery is a CTE reference that can share materialized data.
     pub fn new_subquery_from_plan(
         identifier: String,
         plan: Plan,
         join_info: Option<JoinInfo>,
         internal_id: TableInternalId,
         explicit_columns: Option<&[String]>,
+        cte_id: Option<usize>,
     ) -> Result<Self> {
         // Get result columns and table references from the plan
         let (result_columns, table_references) = match &plan {
@@ -1378,11 +1382,17 @@ impl JoinedTable {
             )?);
         }
 
+        // materialize_hint is set true only for explicit WITH MATERIALIZED hint.
+        // Multi-reference CTEs are detected at emission time via reference counting,
+        // and they may be materialized regardless of explicit keyword usage.
+        let materialize_hint = false;
         let table = Table::FromClauseSubquery(FromClauseSubquery {
             name: identifier.clone(),
             plan: Box::new(plan),
             columns,
             result_columns_start_reg: None,
+            cte_id,
+            materialize_hint,
         });
         Ok(Self {
             op: Operation::default_scan_for(&table),
