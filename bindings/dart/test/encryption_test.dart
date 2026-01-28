@@ -74,7 +74,12 @@ void main() async {
       expect(() async {
         final client3 = TursoClient.encrypted(dbPath, cipher: EncryptionCipher.aegis256, hexkey: wrongKey);
         await client3.connect();
-        await client3.query('SELECT * FROM t');
+      }, throwsException);
+
+      // Opening without encryption should fail
+      expect(() async {
+        final client4 = TursoClient.local(dbPath);
+        await client4.connect();
       }, throwsException);
     } finally {
       await _cleanup(dbPath);

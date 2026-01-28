@@ -56,6 +56,14 @@ pub struct ConnectArgs {
 }
 
 pub async fn connect(args: ConnectArgs) -> RustConnection {
+    // Parse encryption key from options if provided
+    let encryption_key = args
+        .encryption
+        .as_ref()
+        .map(|enc| turso_core::EncryptionKey::from_hex_string(&enc.hexkey))
+        .transpose()
+        .unwrap();
+
     let database = if args.url == ":memory:" {
         let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::MemoryIO::new());
         turso_core::Database::open_file(io, args.url.as_str())
@@ -83,6 +91,8 @@ pub async fn connect(args: ConnectArgs) -> RustConnection {
         )
     }
     .unwrap();
-    let connection = database.connect().unwrap();
+
+    // Use connect_with_encryption to set up encryption context before reading pages
+    let connection = database.connect_with_encryption(encryption_key).unwrap();
     RustConnection::new(Wrapper { inner: connection })
 }
