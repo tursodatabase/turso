@@ -522,3 +522,75 @@ func TestSyncPartial(t *testing.T) {
 	require.Nil(t, err)
 	require.Greater(t, stats2.NetworkReceivedBytes, int64(1024*1024))
 }
+
+// TestSyncLargeSchema tests syncing a database where the schema table spans multiple pages.
+// This reproduces a bug where make_from_btree does blocking IO during database opening,
+// but the caller (sync engine) has no way to spin the external IO loop to fetch
+// overflow pages that aren't loaded yet.
+func TestSyncLargeSchema(t *testing.T) {
+	server, err := NewTursoServer()
+	require.Nil(t, err)
+	t.Cleanup(func() { server.Close() })
+
+	// Create many tables with long column definitions to make sqlite_schema span multiple pages.
+	// Each CREATE TABLE statement will be stored in the schema table.
+	// SQLite page usable space is ~4000 bytes, so creating tables with ~500 byte definitions
+	// means we need ~8+ tables to overflow to another page.
+	numTables := 50
+	for i := 0; i < numTables; i++ {
+		// Create a table with many columns to make a long CREATE statement (~1KB each)
+		columns := ""
+		for j := 0; j < 20; j++ {
+			if j > 0 {
+				columns += ", "
+			}
+			columns += fmt.Sprintf("column_%d_%d_with_a_very_long_name_to_increase_size INTEGER DEFAULT 0", i, j)
+		}
+		sql := fmt.Sprintf("CREATE TABLE large_schema_table_%d (%s)", i, columns)
+		_, err = server.DbSql(sql)
+		require.Nil(t, err)
+	}
+
+	// Insert some data into the first table
+	_, err = server.DbSql("INSERT INTO large_schema_table_0 (column_0_0_with_a_very_long_name_to_increase_size) VALUES (42)")
+	require.Nil(t, err)
+
+	// Use partial sync with a small bootstrap prefix to ensure not all schema pages are fetched upfront.
+	// The bug manifests when opening the database: make_from_btree needs to read the full schema,
+	// but overflow pages for the schema table aren't loaded yet, and blocking IO can't be driven
+	// by the sync engine's coroutine-based IO loop.
+	db, err := NewTursoSyncDb(context.Background(), TursoSyncDbConfig{
+		Path:       ":memory:",
+		ClientName: "turso-sync-go",
+		RemoteUrl:  server.DbUrl,
+		PartialSyncExperimental: TursoPartialSyncConfig{
+			// Use a small prefix to ensure we don't fetch all schema pages upfront
+			BootstrapStrategyPrefix: 8 * 1024,
+		},
+	})
+	require.Nil(t, err)
+
+	conn, err := db.Connect(context.Background())
+	require.Nil(t, err)
+
+	// Verify we can query one of the tables created with the large schema
+	rows, err := conn.QueryContext(context.Background(), "SELECT column_0_0_with_a_very_long_name_to_increase_size FROM large_schema_table_0")
+	require.Nil(t, err)
+	values := make([]int, 0)
+	for rows.Next() {
+		var value int
+		require.Nil(t, rows.Scan(&value))
+		values = append(values, value)
+	}
+	require.Equal(t, values, []int{42})
+	rows.Close()
+
+	// Also verify that all tables are accessible in the schema
+	rows, err = conn.QueryContext(context.Background(), "SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name LIKE 'large_schema_table_%'")
+	require.Nil(t, err)
+	var count int
+	require.True(t, rows.Next())
+	require.Nil(t, rows.Scan(&count))
+	require.Equal(t, count, numTables)
+	rows.Close()
+}
