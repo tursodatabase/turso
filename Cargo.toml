@@ -122,6 +122,13 @@ codegen-units = 4
 panic = "abort"
 lto = "thin"
 
+# Official release profile - maximum optimization for published binaries
+# Use for CLI releases, PyPI, npm, Maven, NuGet, etc.
+[profile.release-official]
+inherits = "release"
+codegen-units = 1
+lto = true
+
 # override settings for sdk-kit release profiles in order to reduce size of produced binaries
 # otherwise, some platforms will have enormous libs (150MB+)
 [profile.lib-release]
@@ -144,8 +151,7 @@ lto = false               # LTO hides function boundaries
 codegen-units = 16        # Less cross-unit inlining
 
 [profile.dist]
-inherits = "release"
-lto = "thin"
+inherits = "release-official"
 
 [workspace.lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)', 'cfg(shuttle)'] }

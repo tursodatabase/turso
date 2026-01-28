@@ -52,7 +52,7 @@ jobs:
         run: rustup target add ${{ matrix.target }}
 
       - name: Build rust native library
-        run: make ${{ matrix.make-target }} RUST_RELEASE_OPT='--release'
+        run: make ${{ matrix.make-target }} RUST_RELEASE_OPT='--profile release-official'
       
       - name: Upload rust native library
         uses: actions/upload-artifact@v4
