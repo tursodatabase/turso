@@ -953,6 +953,13 @@ impl TursoStatement {
         }
         Ok(self.statement.get_column_name(index))
     }
+    /// returns column declared type (e.g. "INTEGER", "TEXT", "DATETIME", etc.)
+    pub fn column_decltype(&self, index: usize) -> Option<String> {
+        if index >= self.column_count() {
+            return None;
+        }
+        self.statement.get_column_decltype(index)
+    }
     /// finalize statement execution
     /// this method must be called in the end of statement execution (either successfull or not)
     pub fn finalize(&mut self, waker: Option<&Waker>) -> Result<TursoStatusCode, TursoError> {

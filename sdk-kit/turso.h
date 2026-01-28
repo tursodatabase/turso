@@ -240,6 +240,12 @@ int64_t turso_statement_column_count(const turso_statement_t *self);
  */
 const char *turso_statement_column_name(const turso_statement_t *self, size_t index);
 
+/** Get the column declared type at the index (e.g. "INTEGER", "TEXT", "DATETIME", etc.)
+ * Returns NULL if the column type is not available.
+ * C string allocated by Turso must be freed after the usage with corresponding turso_str_deinit(...) method
+ */
+const char *turso_statement_column_decltype(const turso_statement_t *self, size_t index);
+
 /** Get the row value at the the index for a current statement state
  * SAFETY: returned pointers will be valid only until next invocation of statement operation (step, finalize, reset, etc)
  * Caller must make sure that any non-owning memory is copied appropriated if it will be used for longer lifetime

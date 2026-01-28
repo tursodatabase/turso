@@ -259,6 +259,13 @@ unsafe extern "C" {
     ) -> *const ::std::os::raw::c_char;
 }
 unsafe extern "C" {
+    #[doc = " Get the column declared type at the index (e.g. \"INTEGER\", \"TEXT\", \"DATETIME\", etc.)\n Returns NULL if the column type is not available.\n C string allocated by Turso must be freed after the usage with corresponding turso_str_deinit(...) method"]
+    pub fn turso_statement_column_decltype(
+        self_: *const turso_statement_t,
+        index: usize,
+    ) -> *const ::std::os::raw::c_char;
+}
+unsafe extern "C" {
     #[doc = " Get the row value at the the index for a current statement state\n SAFETY: returned pointers will be valid only until next invocation of statement operation (step, finalize, reset, etc)\n Caller must make sure that any non-owning memory is copied appropriated if it will be used for longer lifetime"]
     pub fn turso_statement_row_value_kind(
         self_: *const turso_statement_t,
