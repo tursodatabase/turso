@@ -557,7 +557,7 @@ impl TursoDatabase {
                             "database must be opened only once".to_string(),
                         ));
                     }
-                    drop(inner_db);
+                    // keep lock for the whole method since open_async must be called only once and never will be called concurrently
 
                     let io: Arc<dyn turso_core::IO> = if let Some(io) = &self.config.io {
                         io.clone()
@@ -583,9 +583,13 @@ impl TursoDatabase {
                                 }
                             }
                             #[cfg(all(target_os = "linux", not(miri)))]
-                            Some("io_uring") => Arc::new(turso_core::UringIO::new().map_err(|e| {
-                                TursoError::Error(format!("unable to create io_uring backend: {e}"))
-                            })?),
+                            Some("io_uring") => {
+                                Arc::new(turso_core::UringIO::new().map_err(|e| {
+                                    TursoError::Error(format!(
+                                        "unable to create io_uring backend: {e}"
+                                    ))
+                                })?)
+                            }
                             #[cfg(any(not(target_os = "linux"), miri))]
                             Some("io_uring") => {
                                 return Err(TursoError::Error(
@@ -651,9 +655,7 @@ impl TursoDatabase {
                         .db_file
                         .as_ref()
                         .expect("db_file must be initialized in Init phase");
-                    let opts = state
-                        .opts
-                        .expect("opts must be initialized in Init phase");
+                    let opts = state.opts.expect("opts must be initialized in Init phase");
                     let wal_path = state
                         .wal_path
                         .as_ref()
