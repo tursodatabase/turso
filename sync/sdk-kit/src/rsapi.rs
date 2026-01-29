@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 use turso_core::{MemoryIO, IO};
-use turso_sdk_kit::rsapi::{str_from_c_str, TursoDatabaseOpenState, TursoError};
+use turso_sdk_kit::rsapi::{str_from_c_str, TursoError};
 use turso_sync_engine::{
     database_sync_engine::{self, DatabaseSyncEngine},
     database_sync_engine_io::SyncEngineIo,
@@ -182,9 +182,8 @@ async fn open_turso_database_async<Ctx>(
     coro: &turso_sync_engine::types::Coro<Ctx>,
     main_db: &Arc<turso_sdk_kit::rsapi::TursoDatabase>,
 ) -> Result<Arc<turso_core::Database>, turso_sync_engine::errors::Error> {
-    let mut open_state = TursoDatabaseOpenState::new();
     loop {
-        match main_db.open_async(&mut open_state).map_err(|e| {
+        match main_db.open().map_err(|e| {
             turso_sync_engine::errors::Error::DatabaseSyncEngineError(format!(
                 "unable to open database file: {e}"
             ))

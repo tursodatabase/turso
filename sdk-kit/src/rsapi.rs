@@ -1127,7 +1127,8 @@ mod tests {
                 io: None,
                 db_file: None,
             });
-            db.open().unwrap();
+            let result = db.open().unwrap();
+            assert!(!result.is_io());
             let conn = db.connect().unwrap();
             let stmt1 = conn
                 .prepare_single("SELECT * FROM generate_series(1, 100000)")
@@ -1187,7 +1188,8 @@ mod tests {
             io: None,
             db_file: None,
         });
-        db.open().unwrap();
+        let result = db.open().unwrap();
+        assert!(!result.is_io());
         let conn = db.connect().unwrap();
         let mut stmt = conn
             .prepare_single("SELECT * FROM generate_series(1, 10000)")
@@ -1208,7 +1210,8 @@ mod tests {
             io: None,
             db_file: None,
         });
-        db.open().unwrap();
+        let result = db.open().unwrap();
+        assert!(!result.is_io());
         let conn = db.connect().unwrap();
 
         let mut create = conn
@@ -1312,7 +1315,8 @@ mod tests {
                     io: None,
                     db_file: None,
                 });
-                db.open().unwrap();
+                let result = db.open().unwrap();
+                assert!(!result.is_io());
                 let conn = db.connect().unwrap();
 
                 let mut stmt = conn
@@ -1351,7 +1355,8 @@ mod tests {
                     io: None,
                     db_file: None,
                 });
-                db.open().unwrap();
+                let result = db.open().unwrap();
+                assert!(!result.is_io());
                 let conn = db.connect().unwrap();
 
                 let mut stmt = conn

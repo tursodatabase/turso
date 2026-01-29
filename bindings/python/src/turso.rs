@@ -136,7 +136,7 @@ pub struct PyTursoDatabaseConfig {
 #[pymethods]
 impl PyTursoDatabaseConfig {
     #[new]
-    #[pyo3(signature = (path, experimental_features=None, async_io=false, vfs=None, encryption=None))]
+    #[pyo3(signature = (path, experimental_features=None, vfs=None, encryption=None))]
     fn new(
         path: String,
         experimental_features: Option<String>,

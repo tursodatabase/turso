@@ -630,7 +630,7 @@ impl Schema {
     ) -> Result<IOResult<()>> {
         let result = self.make_from_btree_internal(state, mv_cursor, pager, syms, enable_triggers);
         if result.is_err() {
-            state.cleanup(&pager);
+            state.cleanup(pager);
         } else {
             turso_assert!(
                 !state.read_tx_active,
@@ -657,7 +657,7 @@ impl Schema {
                         "mvcc not yet supported for make_from_btree"
                     );
 
-                    state.cursor = Some(BTreeCursor::new_table(Arc::clone(&pager), 1, 10));
+                    state.cursor = Some(BTreeCursor::new_table(Arc::clone(pager), 1, 10));
                     pager.begin_read_tx()?;
                     state.read_tx_active = true;
 

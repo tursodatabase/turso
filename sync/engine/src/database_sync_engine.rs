@@ -540,7 +540,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                     turso_core::IOResult::Done(db) => break db,
                     turso_core::IOResult::IO(io_completion) => {
                         while !io_completion.finished() {
-                            let _ = coro.yield_(SyncEngineIoResult::IO).await?;
+                            coro.yield_(SyncEngineIoResult::IO).await?;
                         }
                         continue;
                     }

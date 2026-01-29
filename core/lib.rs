@@ -315,6 +315,7 @@ impl OpenDbAsyncState {
 /// state between iterations, but static variables persist - using shuttle's
 /// Mutex here would cause panics when the second iteration tries to lock a
 /// mutex that belongs to a stale execution context.
+#[allow(clippy::type_complexity)]
 static DATABASE_MANAGER: LazyLock<Arc<parking_lot::Mutex<HashMap<String, Weak<Database>>>>> =
     LazyLock::new(|| Arc::new(parking_lot::Mutex::new(HashMap::default())));
 
@@ -491,7 +492,6 @@ impl Database {
         Self::open_with_flags(io, path, db_file, flags, opts, encryption_opts)
     }
 
-    #[allow(clippy::arc_with_non_send_sync)]
     pub fn open(
         io: Arc<dyn IO>,
         path: &str,
@@ -507,7 +507,6 @@ impl Database {
         )
     }
 
-    #[allow(clippy::arc_with_non_send_sync)]
     pub fn open_with_flags(
         io: Arc<dyn IO>,
         path: &str,
@@ -542,7 +541,6 @@ impl Database {
     /// Uses the database registry to ensure single Database instance per file within a process.
     /// Caller must drive the IO loop and pass state between calls.
     /// The registry lock is held for the entire duration to prevent concurrent opens.
-    #[allow(clippy::arc_with_non_send_sync)]
     pub fn open_with_flags_async(
         state: &mut OpenDbAsyncState,
         io: Arc<dyn IO>,
@@ -568,7 +566,6 @@ impl Database {
         result
     }
 
-    #[allow(clippy::arc_with_non_send_sync)]
     fn open_with_flags_async_internal(
         state: &mut OpenDbAsyncState,
         io: Arc<dyn IO>,
@@ -638,8 +635,7 @@ impl Database {
     }
 
     /// method for tests - for all other code we must use async alternative
-    #[allow(clippy::arc_with_non_send_sync)]
-    #[cfg(all(test, feature = "fs", feature = "conn_raw_api"))]
+    #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
     pub fn open_with_flags_bypass_registry(
         io: Arc<dyn IO>,
         path: &str,
@@ -814,7 +810,7 @@ impl Database {
                     let result = schema.make_from_btree(
                         &mut state.make_from_btree_state,
                         None,
-                        &pager,
+                        pager,
                         &syms,
                         enable_triggers,
                     );
@@ -1319,7 +1315,6 @@ impl Database {
     /// Open a new database file with optionally specifying a VFS without an existing database
     /// connection and symbol table to register extensions.
     #[cfg(feature = "fs")]
-    #[allow(clippy::arc_with_non_send_sync)]
     pub fn open_new<S>(
         path: &str,
         vfs: Option<S>,
