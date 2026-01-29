@@ -3,7 +3,9 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use crate::schema::ROWID_SENTINEL;
 use crate::translate::emitter::Resolver;
-use crate::translate::expr::{bind_and_rewrite_expr, walk_expr, BindingBehavior, WalkControl};
+use crate::translate::expr::{
+    bind_and_rewrite_expr, walk_expr, walk_expr_mut, BindingBehavior, WalkControl,
+};
 use crate::translate::plan::{Operation, Scan};
 use crate::translate::planner::{parse_limit, ROWID_STRS};
 use crate::{
@@ -549,113 +551,30 @@ fn columns_used_by_index_expr(
 /// Used to determine dependencies for generated column expressions.
 pub fn collect_column_refs_from_ast_expr(expr: &Expr) -> HashSet<String> {
     let mut refs = HashSet::default();
-    collect_column_refs_recursive(expr, &mut refs);
-    refs
-}
-
-fn collect_column_refs_recursive(expr: &Expr, refs: &mut HashSet<String>) {
-    match expr {
+    let mut expr_copy = expr.clone();
+    let _ = walk_expr_mut(&mut expr_copy, &mut |expr: &mut Expr| match expr {
         Expr::Id(name) => {
             refs.insert(name.as_str().to_lowercase());
+            Ok(WalkControl::Continue)
         }
         Expr::Qualified(_, name) => {
             refs.insert(name.as_str().to_lowercase());
-        }
-        Expr::Binary(lhs, _, rhs) => {
-            collect_column_refs_recursive(lhs, refs);
-            collect_column_refs_recursive(rhs, refs);
-        }
-        Expr::Unary(_, inner) => {
-            collect_column_refs_recursive(inner, refs);
-        }
-        Expr::Parenthesized(exprs) => {
-            for e in exprs {
-                collect_column_refs_recursive(e, refs);
-            }
-        }
-        Expr::FunctionCall { args, .. } => {
-            for arg in args {
-                collect_column_refs_recursive(arg, refs);
-            }
-        }
-        Expr::Case {
-            base,
-            when_then_pairs,
-            else_expr,
-            ..
-        } => {
-            if let Some(op) = base {
-                collect_column_refs_recursive(op, refs);
-            }
-            for (when_expr, then_expr) in when_then_pairs {
-                collect_column_refs_recursive(when_expr, refs);
-                collect_column_refs_recursive(then_expr, refs);
-            }
-            if let Some(else_e) = else_expr {
-                collect_column_refs_recursive(else_e, refs);
-            }
-        }
-        Expr::Cast { expr, .. } => {
-            collect_column_refs_recursive(expr, refs);
-        }
-        Expr::InList { lhs, rhs, .. } => {
-            collect_column_refs_recursive(lhs, refs);
-            for e in rhs {
-                collect_column_refs_recursive(e, refs);
-            }
-        }
-        Expr::Between {
-            lhs, start, end, ..
-        } => {
-            collect_column_refs_recursive(lhs, refs);
-            collect_column_refs_recursive(start, refs);
-            collect_column_refs_recursive(end, refs);
-        }
-        Expr::Like {
-            lhs, rhs, escape, ..
-        } => {
-            collect_column_refs_recursive(lhs, refs);
-            collect_column_refs_recursive(rhs, refs);
-            if let Some(esc) = escape {
-                collect_column_refs_recursive(esc, refs);
-            }
+            Ok(WalkControl::Continue)
         }
         Expr::DoublyQualified(_, _, name) => {
-            // schema.table.column - extract column name
             refs.insert(name.as_str().to_lowercase());
+            Ok(WalkControl::Continue)
         }
-        Expr::IsNull(inner) => {
-            collect_column_refs_recursive(inner, refs);
+        Expr::Subquery(_)
+        | Expr::Exists(_)
+        | Expr::InTable { .. }
+        | Expr::SubqueryResult { .. }
+        | Expr::Raise(_, _) => {
+            Ok(WalkControl::SkipChildren)
         }
-        Expr::NotNull(inner) => {
-            collect_column_refs_recursive(inner, refs);
-        }
-        Expr::Collate(inner, _) => {
-            collect_column_refs_recursive(inner, refs);
-        }
-        // Subqueries have their own scope, don't recurse into them
-        // (Also disallowed in generated columns per CREATE-time validation)
-        Expr::Subquery(_) | Expr::Exists(_) | Expr::InTable { .. } => {}
-        Expr::InSelect { lhs, .. } => {
-            // Recurse into lhs; rhs is a Select with its own scope
-            collect_column_refs_recursive(lhs, refs);
-        }
-        Expr::Column { .. } => {
-            // Bound column reference - the column field has table context
-            // Column names have already been resolved at this point
-            // At this stage, we can't access the schema to reverse-lookup the name
-        }
-        Expr::Variable(_) => {
-            // Variables don't reference columns
-        }
-        Expr::Raise(_, _) => {
-            // RAISE expressions don't reference columns
-        }
-        Expr::SubqueryResult { .. } => {
-            // Internal representation after subquery execution - has own scope
-        }
-        _ => {}
-    }
+        _ => Ok(WalkControl::Continue),
+    });
+    refs
 }
 
 /// Checks if a column transitively depends on any column in the updated_cols set.
