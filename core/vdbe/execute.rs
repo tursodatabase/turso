@@ -11403,6 +11403,737 @@ pub fn op_filter_add(
     Ok(InsnFunctionStepResult::Step)
 }
 
+fn extract_pragma_int<T>(rows: &[Vec<Value>], pragma_name: &str) -> Result<T>
+where
+    T: TryFrom<i64>,
+{
+    rows.first()
+        .and_then(|row| row.first())
+        .and_then(|v| match v {
+            Value::Integer(i) => T::try_from(*i).ok(),
+            _ => None,
+        })
+        .ok_or_else(|| {
+            LimboError::InternalError(format!("failed to read {pragma_name} from source"))
+        })
+}
+
+/// Sub-states for the VACUUM INTO operation state machine.
+#[derive(Debug, Default)]
+pub enum OpVacuumIntoSubState {
+    /// Initial state - validate preconditions and create destination database
+    #[default]
+    Init,
+    /// Query schema from source database
+    QuerySchema,
+    /// Step through schema query to collect rows
+    CollectSchemaRows,
+    /// Prepare CREATE statement on destination (idx into schema_rows)
+    PrepareDestSchema { idx: usize },
+    /// Step through CREATE statement on destination (async)
+    StepDestSchema { idx: usize },
+    /// Start copying a table - prepare column info query
+    StartCopyTable { table_idx: usize },
+    /// Collect column info for current table
+    CollectColumnInfo { table_idx: usize },
+    /// Start selecting rows from source table
+    StartSelectRows { table_idx: usize },
+    /// Step through source SELECT to get next row
+    StepSourceSelect { table_idx: usize },
+    /// Prepare INSERT statement on destination for current row
+    PrepareDestInsert { table_idx: usize },
+    /// Step through INSERT statement on destination (async)
+    StepDestInsert { table_idx: usize },
+    /// Copy meta values (user_version, application_id) from source to destination
+    CopyMetaValues,
+    /// Create triggers and views after data copy (to avoid triggers firing during copy)
+    PrepareTriggersViews { idx: usize },
+    /// Step through CREATE TRIGGER/VIEW statement on destination
+    StepTriggersViews { idx: usize },
+    /// Operation complete
+    Done,
+}
+
+/// Holds the state for the VACUUM INTO operation.
+/// Uses Box for Statement fields to avoid recursive type issues.
+#[derive(Default)]
+pub struct OpVacuumIntoState {
+    pub sub_state: OpVacuumIntoSubState,
+    pub dest_db: Option<Arc<crate::Database>>,
+    pub dest_conn: Option<Arc<Connection>>,
+    /// Schema rows: [(type, name, tbl_name, sql), ...]
+    pub schema_rows: Vec<Vec<Value>>,
+    /// Names of tables to copy data for
+    pub table_names: Vec<String>,
+    /// Column names for the current table being copied
+    pub current_table_columns: Vec<String>,
+    // Source statements
+    /// Statement for querying schema (boxed to avoid recursive type)
+    pub schema_stmt: Option<Box<crate::Statement>>,
+    /// Statement for querying column info (boxed to avoid recursive type)
+    pub column_stmt: Option<Box<crate::Statement>>,
+    /// Statement for selecting rows from source (boxed to avoid recursive type)
+    pub select_stmt: Option<Box<crate::Statement>>,
+    // Destination statements
+    /// Statement for CREATE TABLE/INDEX on destination
+    pub dest_schema_stmt: Option<Box<crate::Statement>>,
+    /// Statement for INSERT on destination
+    pub dest_insert_stmt: Option<Box<crate::Statement>>,
+    /// Current row values for INSERT (stored between states)
+    pub current_row_values: Option<Vec<Value>>,
+    /// Meta values read from source database header
+    pub source_user_version: i32,
+    pub source_application_id: i32,
+    /// Reserved space bytes from source database (for encryption, checksum or other extensions)
+    pub source_reserved_space: u8,
+}
+
+/// VACUUM INTO - create a compacted copy of the database at the specified path.
+///
+/// This is an async state machine implementation that yields on I/O operations.
+/// It:
+/// 1. Creates a new database at the destination path with matching page_size
+/// 2. Queries sqlite_schema for all schema objects (tables, indexes, triggers, views)
+/// 3. Creates tables and indexes in destination (skipping sqlite_sequence - it's
+///    auto-created when AUTOINCREMENT tables are created, see translate/schema.rs)
+/// 4. Copies data for each table, including sqlite_sequence to preserve AUTOINCREMENT counters
+/// 5. Copies meta values (user_version, application_id) from source to destination
+/// 6. Creates triggers and views last (after data copy to avoid triggers firing during copy)
+pub fn op_vacuum_into(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    match op_vacuum_into_inner(program, state, insn) {
+        Ok(InsnFunctionStepResult::Step) => {
+            // Instruction complete, reset state
+            state.op_vacuum_into_state = OpVacuumIntoState::default();
+            Ok(InsnFunctionStepResult::Step)
+        }
+        Ok(InsnFunctionStepResult::IO(io)) => {
+            // Waiting for I/O, keep state for resumption
+            Ok(InsnFunctionStepResult::IO(io))
+        }
+        Ok(InsnFunctionStepResult::Done | InsnFunctionStepResult::Row) => {
+            unreachable!("op_vacuum_into_inner only returns Step or IO")
+        }
+        Err(err) => {
+            // Reset state on error
+            state.op_vacuum_into_state = OpVacuumIntoState::default();
+            Err(err)
+        }
+    }
+}
+
+fn op_vacuum_into_inner(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(VacuumInto { dest_path }, insn);
+
+    loop {
+        match &state.op_vacuum_into_state.sub_state {
+            OpVacuumIntoSubState::Init => {
+                // Check if we're in a transaction
+                // as vacuum cannot be run inside a transaction
+                if !program.connection.auto_commit.load(Ordering::SeqCst) {
+                    return Err(LimboError::TxError(
+                        "cannot VACUUM INTO from within a transaction".to_string(),
+                    ));
+                }
+
+                // we always vacuum into a new file, so check if it exists
+                if std::path::Path::new(dest_path).exists() {
+                    return Err(LimboError::ParseError(format!(
+                        "output file already exists: {dest_path}"
+                    )));
+                }
+
+                // make sure to create destination database with same experimental features as source
+                let io = program.connection.db.io.clone();
+                let source_db = &program.connection.db;
+                let dest_opts = crate::DatabaseOpts::new()
+                    .with_views(source_db.experimental_views_enabled())
+                    .with_triggers(source_db.experimental_triggers_enabled())
+                    .with_index_method(source_db.experimental_index_method_enabled())
+                    .with_strict(source_db.experimental_strict_enabled());
+
+                // lets set the same meta values as source db
+                let user_version: i32 = extract_pragma_int(
+                    &program.connection.pragma_query("user_version")?,
+                    "user_version",
+                )?;
+                let application_id: i32 = extract_pragma_int(
+                    &program.connection.pragma_query("application_id")?,
+                    "application_id",
+                )?;
+                let page_size: u32 = extract_pragma_int(
+                    &program.connection.pragma_query("page_size")?,
+                    "page_size",
+                )?;
+
+                let reserved_space = {
+                    let pager = program.connection.pager.load();
+                    let reserved_space: u8 = match program.connection.get_reserved_bytes() {
+                        Some(val) => val,
+                        None => io.block(|| pager.with_header(|header| header.reserved_space))?,
+                    };
+                    reserved_space
+                };
+
+                state.op_vacuum_into_state.source_user_version = user_version;
+                state.op_vacuum_into_state.source_application_id = application_id;
+                state.op_vacuum_into_state.source_reserved_space = reserved_space;
+
+                let dest_db = crate::Database::open_file_with_flags(
+                    io,
+                    dest_path,
+                    OpenFlags::Create,
+                    dest_opts,
+                    None,
+                )?;
+                let dest_conn = dest_db.connect()?;
+                dest_conn.reset_page_size(page_size)?;
+                // set reserved_space on destination to match source
+                // this is important for databases using encryption or checksums
+                // must be set before page 1 is allocated (before any schema operations)
+                dest_conn.set_reserved_bytes(reserved_space)?;
+
+                // Enable MVCC on destination if source has it enabled
+                // Must be done before any schema operations to ensure the log file is created
+                if program.connection.db.mvcc_enabled() {
+                    dest_conn.execute("PRAGMA journal_mode = 'experimental_mvcc'")?;
+                }
+
+                // Performance optimizations for destination database:
+                // 1. Disable fsync - destination is a new file, if crash occurs we just delete it
+                // 2. Disable foreign key checks - source data is already consistent
+                // These match SQLite's vacuum.c optimizations (PAGER_SYNCHRONOUS_OFF, ~SQLITE_ForeignKeys)
+                dest_conn.execute("PRAGMA synchronous = OFF")?;
+                dest_conn.execute("PRAGMA foreign_keys = OFF")?;
+
+                // Wrap all operations in a single transaction for atomicity and performance.
+                // This batches all writes and ensures destination is either empty or complete.
+                dest_conn.execute("BEGIN")?;
+
+                state.op_vacuum_into_state.dest_db = Some(dest_db);
+                state.op_vacuum_into_state.dest_conn = Some(dest_conn);
+                state.op_vacuum_into_state.sub_state = OpVacuumIntoSubState::QuerySchema;
+                continue;
+            }
+
+            OpVacuumIntoSubState::QuerySchema => {
+                turso_assert!(
+                    state.op_vacuum_into_state.schema_rows.is_empty(),
+                    "schema_rows should be empty when entering QuerySchema"
+                );
+                let schema_sql = "SELECT type, name, tbl_name, sql FROM sqlite_schema WHERE sql IS NOT NULL ORDER BY CASE type WHEN 'table' THEN 1 WHEN 'index' THEN 2 WHEN 'trigger' THEN 3 WHEN 'view' THEN 4 ELSE 5 END";
+                let schema_stmt = program.connection.prepare(schema_sql)?;
+                state.op_vacuum_into_state.schema_stmt = Some(Box::new(schema_stmt));
+                state.op_vacuum_into_state.sub_state = OpVacuumIntoSubState::CollectSchemaRows;
+                continue;
+            }
+
+            OpVacuumIntoSubState::CollectSchemaRows => {
+                // Collect rows from sqlite_schema query: (type, name, tbl_name, sql)
+                // These define all tables, indexes, triggers, and views to recreate in destination
+                let schema_stmt = state
+                    .op_vacuum_into_state
+                    .schema_stmt
+                    .as_mut()
+                    .expect("schema_stmt must be set in QuerySchema state");
+                match schema_stmt.step()? {
+                    crate::StepResult::Row => {
+                        let row = schema_stmt
+                            .row()
+                            .expect("StepResult::Row but row() returned None");
+                        let values: Vec<Value> = row.get_values().cloned().collect();
+                        state.op_vacuum_into_state.schema_rows.push(values);
+                        continue; // come back heer to get more rows
+                    }
+                    crate::StepResult::Done => {
+                        // all schema rows collected
+                        state.op_vacuum_into_state.schema_stmt = None;
+
+                        // Extract table names for data copy phase
+                        // Include sqlite_sequence for AUTOINCREMENT counters, but not other sqlite_ tables
+                        // this is sqlite's vacuum
+                        state.op_vacuum_into_state.table_names = state
+                            .op_vacuum_into_state
+                            .schema_rows
+                            .iter()
+                            .filter_map(|row| {
+                                if row.len() >= 2 {
+                                    if let (Value::Text(type_val), Value::Text(name_val)) =
+                                        (&row[0], &row[1])
+                                    {
+                                        let name = name_val.as_str();
+                                        if type_val.as_str() == "table"
+                                            && (!name.starts_with("sqlite_")
+                                                || name == "sqlite_sequence")
+                                        {
+                                            return Some(name.to_string());
+                                        }
+                                    }
+                                }
+                                None
+                            })
+                            .collect();
+
+                        state.op_vacuum_into_state.sub_state =
+                            OpVacuumIntoSubState::PrepareDestSchema { idx: 0 };
+                        continue;
+                    }
+                    crate::StepResult::IO => {
+                        let io = schema_stmt
+                            .take_io_completions()
+                            .expect("StepResult::IO returned but no completions available");
+                        return Ok(InsnFunctionStepResult::IO(io));
+                    }
+                    crate::StepResult::Busy | crate::StepResult::Interrupt => {
+                        return Err(LimboError::Busy);
+                    }
+                }
+            }
+
+            OpVacuumIntoSubState::PrepareDestSchema { idx } => {
+                let idx = *idx;
+                let schema_rows_len = state.op_vacuum_into_state.schema_rows.len();
+                turso_assert!(
+                    idx <= schema_rows_len,
+                    "idx {} incremented past end of schema_rows (len {})",
+                    idx,
+                    schema_rows_len
+                );
+                if idx == schema_rows_len {
+                    // Done creating schema, start copying data
+                    state.op_vacuum_into_state.sub_state =
+                        OpVacuumIntoSubState::StartCopyTable { table_idx: 0 };
+                    continue;
+                }
+
+                let row = &state.op_vacuum_into_state.schema_rows[idx];
+                turso_assert!(
+                    row.len() == 4,
+                    "schema row should have exactly 4 columns (type, name, tbl_name, sql), got {}",
+                    row.len()
+                );
+
+                // Skip triggers and views - they'll be created after data copy
+                // to avoid triggers firing during data copy
+                if let Value::Text(type_val) = &row[0] {
+                    let type_str = type_val.as_str();
+                    if type_str == "trigger" || type_str == "view" {
+                        state.op_vacuum_into_state.sub_state =
+                            OpVacuumIntoSubState::PrepareDestSchema { idx: idx + 1 };
+                        continue;
+                    }
+                }
+
+                // Skip sqlite_sequence in schema creation phase. When we create an AUTOINCREMENT
+                // table, Turso automatically creates sqlite_sequence if it doesn't exist (see
+                // translate/schema.rs). Since schema_rows order depends on sqlite_schema rowids,
+                // an AUTOINCREMENT table may appear before sqlite_sequence. If we create that
+                // table first (which auto-creates sqlite_sequence), then later try to run
+                // "CREATE TABLE sqlite_sequence(name,seq)", it fails with "table already exists".
+                // We still copy sqlite_sequence data in StartCopyTable to preserve counters.
+                if let Value::Text(name_val) = &row[1] {
+                    if name_val.as_str() == "sqlite_sequence" {
+                        state.op_vacuum_into_state.sub_state =
+                            OpVacuumIntoSubState::PrepareDestSchema { idx: idx + 1 };
+                        continue;
+                    }
+                }
+
+                // Query filters WHERE sql IS NOT NULL, so sql column must be text
+                let Value::Text(sql) = &row[3] else {
+                    unreachable!("sql column should be text (query has WHERE sql IS NOT NULL)");
+                };
+                let sql_str = sql.as_str();
+                let dest_conn = state
+                    .op_vacuum_into_state
+                    .dest_conn
+                    .as_ref()
+                    .expect("dest_conn must be set in Init state");
+                turso_assert!(
+                    state.op_vacuum_into_state.dest_schema_stmt.is_none(),
+                    "dest_schema_stmt should be None before preparing new statement"
+                );
+                let dest_stmt = dest_conn.prepare(sql_str)?;
+                state.op_vacuum_into_state.dest_schema_stmt = Some(Box::new(dest_stmt));
+                state.op_vacuum_into_state.sub_state = OpVacuumIntoSubState::StepDestSchema { idx };
+                continue;
+            }
+
+            OpVacuumIntoSubState::StepDestSchema { idx } => {
+                let idx = *idx;
+                let dest_stmt = state
+                    .op_vacuum_into_state
+                    .dest_schema_stmt
+                    .as_mut()
+                    .expect("dest_schema_stmt must be set in PrepareDestSchema");
+
+                match dest_stmt.step()? {
+                    crate::StepResult::Row => {
+                        unreachable!("CREATE statement unexpectedly returned a row");
+                    }
+                    crate::StepResult::Done => {
+                        state.op_vacuum_into_state.dest_schema_stmt = None;
+                        state.op_vacuum_into_state.sub_state =
+                            OpVacuumIntoSubState::PrepareDestSchema { idx: idx + 1 };
+                        continue;
+                    }
+                    crate::StepResult::IO => {
+                        let io = dest_stmt
+                            .take_io_completions()
+                            .expect("StepResult::IO returned but no completions available");
+                        return Ok(InsnFunctionStepResult::IO(io));
+                    }
+                    crate::StepResult::Busy | crate::StepResult::Interrupt => {
+                        return Err(LimboError::Busy);
+                    }
+                }
+            }
+
+            OpVacuumIntoSubState::StartCopyTable { table_idx } => {
+                let table_idx = *table_idx;
+                let table_names_len = state.op_vacuum_into_state.table_names.len();
+                turso_assert!(
+                    table_idx <= table_names_len,
+                    "table_idx {} incremented past end of table_names (len {})",
+                    table_idx,
+                    table_names_len
+                );
+                if table_idx == table_names_len {
+                    // Done copying all tables, now copy meta values
+                    state.op_vacuum_into_state.sub_state = OpVacuumIntoSubState::CopyMetaValues;
+                    continue;
+                }
+
+                let table_name = &state.op_vacuum_into_state.table_names[table_idx];
+                // Escape double quotes in table name for safe SQL
+                let escaped_table_name = table_name.replace('"', "\"\"");
+                let pragma_sql = format!("PRAGMA table_info(\"{escaped_table_name}\")");
+                turso_assert!(
+                    state.op_vacuum_into_state.column_stmt.is_none(),
+                    "column_stmt should be None before preparing new statement"
+                );
+                let column_stmt = program.connection.prepare(&pragma_sql)?;
+                state.op_vacuum_into_state.column_stmt = Some(Box::new(column_stmt));
+                // Clear columns from previous table (this state is re-entered for each table)
+                state.op_vacuum_into_state.current_table_columns.clear();
+                state.op_vacuum_into_state.sub_state =
+                    OpVacuumIntoSubState::CollectColumnInfo { table_idx };
+                continue;
+            }
+
+            OpVacuumIntoSubState::CollectColumnInfo { table_idx } => {
+                let table_idx = *table_idx;
+                let column_stmt = state
+                    .op_vacuum_into_state
+                    .column_stmt
+                    .as_mut()
+                    .expect("column_stmt must be set in StartCopyTable");
+
+                match column_stmt.step()? {
+                    crate::StepResult::Row => {
+                        let row = column_stmt
+                            .row()
+                            .expect("StepResult::Row but row() returned None");
+                        // Column name is at index 1
+                        if let Value::Text(name) = row.get_value(1) {
+                            // Escape double quotes in column name for safe SQL
+                            let escaped_name = name.as_str().replace('"', "\"\"");
+                            let col_name = format!("\"{escaped_name}\"");
+                            state
+                                .op_vacuum_into_state
+                                .current_table_columns
+                                .push(col_name);
+                        }
+                        continue; // Get more columns
+                    }
+                    crate::StepResult::Done => {
+                        state.op_vacuum_into_state.column_stmt = None;
+
+                        if state.op_vacuum_into_state.current_table_columns.is_empty() {
+                            // No columns, skip to next table
+                            state.op_vacuum_into_state.sub_state =
+                                OpVacuumIntoSubState::StartCopyTable {
+                                    table_idx: table_idx + 1,
+                                };
+                        } else {
+                            state.op_vacuum_into_state.sub_state =
+                                OpVacuumIntoSubState::StartSelectRows { table_idx };
+                        }
+                        continue;
+                    }
+                    crate::StepResult::IO => {
+                        let io = column_stmt
+                            .take_io_completions()
+                            .expect("StepResult::IO returned but no completions available");
+                        return Ok(InsnFunctionStepResult::IO(io));
+                    }
+                    crate::StepResult::Busy | crate::StepResult::Interrupt => {
+                        return Err(LimboError::Busy);
+                    }
+                }
+            }
+
+            OpVacuumIntoSubState::StartSelectRows { table_idx } => {
+                let table_idx = *table_idx;
+                let table_name = &state.op_vacuum_into_state.table_names[table_idx];
+                // Escape double quotes in table name for safe SQL
+                let escaped_table_name = table_name.replace('"', "\"\"");
+                let select_sql = format!("SELECT * FROM \"{escaped_table_name}\"");
+                turso_assert!(
+                    state.op_vacuum_into_state.select_stmt.is_none(),
+                    "select_stmt should be None before preparing new statement"
+                );
+                let select_stmt = program.connection.prepare(&select_sql)?;
+                state.op_vacuum_into_state.select_stmt = Some(Box::new(select_stmt));
+                state.op_vacuum_into_state.sub_state =
+                    OpVacuumIntoSubState::StepSourceSelect { table_idx };
+                continue;
+            }
+
+            OpVacuumIntoSubState::StepSourceSelect { table_idx } => {
+                let table_idx = *table_idx;
+                let select_stmt = state
+                    .op_vacuum_into_state
+                    .select_stmt
+                    .as_mut()
+                    .expect("select_stmt must be set in StartSelectRows");
+
+                match select_stmt.step()? {
+                    crate::StepResult::Row => {
+                        let row = select_stmt
+                            .row()
+                            .expect("StepResult::Row but row() returned None");
+
+                        let values: Vec<Value> = row.get_values().cloned().collect();
+                        state.op_vacuum_into_state.current_row_values = Some(values);
+                        state.op_vacuum_into_state.sub_state =
+                            OpVacuumIntoSubState::PrepareDestInsert { table_idx };
+                        continue;
+                    }
+                    crate::StepResult::Done => {
+                        state.op_vacuum_into_state.select_stmt = None;
+                        // Move to next table to insert data
+                        state.op_vacuum_into_state.sub_state =
+                            OpVacuumIntoSubState::StartCopyTable {
+                                table_idx: table_idx + 1,
+                            };
+                        continue;
+                    }
+                    crate::StepResult::IO => {
+                        let io = select_stmt
+                            .take_io_completions()
+                            .expect("StepResult::IO returned but no completions available");
+                        return Ok(InsnFunctionStepResult::IO(io));
+                    }
+                    crate::StepResult::Busy | crate::StepResult::Interrupt => {
+                        return Err(LimboError::Busy);
+                    }
+                }
+            }
+
+            OpVacuumIntoSubState::PrepareDestInsert { table_idx } => {
+                let table_idx = *table_idx;
+                let table_name = &state.op_vacuum_into_state.table_names[table_idx];
+                // Escape double quotes in table name for safe SQL
+                let escaped_table_name = table_name.replace('"', "\"\"");
+                // Column names are already escaped when collected
+                let column_names = state.op_vacuum_into_state.current_table_columns.join(", ");
+                let row_values = state
+                    .op_vacuum_into_state
+                    .current_row_values
+                    .as_ref()
+                    .expect("current_row_values must be set in StepSourceSelect");
+
+                // Generate placeholders for parameter binding (?, ?, ...)
+                let placeholders: String = (0..row_values.len())
+                    .map(|_| "?")
+                    .collect::<Vec<_>>()
+                    .join(", ");
+
+                let insert_sql = format!(
+                    "INSERT INTO \"{escaped_table_name}\" ({column_names}) VALUES ({placeholders})"
+                );
+
+                let dest_conn = state
+                    .op_vacuum_into_state
+                    .dest_conn
+                    .as_ref()
+                    .expect("dest_conn must be set in Init state");
+                turso_assert!(
+                    state.op_vacuum_into_state.dest_insert_stmt.is_none(),
+                    "dest_insert_stmt should be None before preparing new statement"
+                );
+                let mut dest_stmt = dest_conn.prepare(&insert_sql)?;
+
+                // Bind actual values
+                for (i, value) in row_values.iter().enumerate() {
+                    // i + 1 is always >= 1, so NonZero is safe
+                    let index = std::num::NonZero::new(i + 1).expect("i + 1 is always non-zero");
+                    dest_stmt.bind_at(index, value.clone());
+                }
+
+                state.op_vacuum_into_state.dest_insert_stmt = Some(Box::new(dest_stmt));
+                state.op_vacuum_into_state.sub_state =
+                    OpVacuumIntoSubState::StepDestInsert { table_idx };
+                continue;
+            }
+
+            OpVacuumIntoSubState::StepDestInsert { table_idx } => {
+                let table_idx = *table_idx;
+                let dest_stmt = state
+                    .op_vacuum_into_state
+                    .dest_insert_stmt
+                    .as_mut()
+                    .expect("dest_insert_stmt must be set in PrepareDestInsert");
+
+                match dest_stmt.step()? {
+                    crate::StepResult::Row => {
+                        unreachable!("INSERT statement unexpectedly returned a row");
+                    }
+                    crate::StepResult::Done => {
+                        state.op_vacuum_into_state.dest_insert_stmt = None;
+                        state.op_vacuum_into_state.current_row_values = None;
+                        // Go back to get next row from source
+                        state.op_vacuum_into_state.sub_state =
+                            OpVacuumIntoSubState::StepSourceSelect { table_idx };
+                        continue;
+                    }
+                    crate::StepResult::IO => {
+                        let io = dest_stmt
+                            .take_io_completions()
+                            .expect("StepResult::IO returned but no completions available");
+                        return Ok(InsnFunctionStepResult::IO(io));
+                    }
+                    crate::StepResult::Busy | crate::StepResult::Interrupt => {
+                        return Err(LimboError::Busy);
+                    }
+                }
+            }
+
+            OpVacuumIntoSubState::CopyMetaValues => {
+                // Copy meta values to destination database
+                let dest_conn = state
+                    .op_vacuum_into_state
+                    .dest_conn
+                    .as_ref()
+                    .expect("dest_conn must be set in Init state");
+                let user_version = state.op_vacuum_into_state.source_user_version;
+                let application_id = state.op_vacuum_into_state.source_application_id;
+
+                // Use pragma_update to set user_version and application_id
+                // Note: schema_version is not copied - VACUUM INTO creates a new file so
+                // there's no cache to invalidate. The destination will have its own
+                // schema_version based on the schema operations performed.
+                dest_conn.pragma_update("user_version", user_version.to_string())?;
+                dest_conn.pragma_update("application_id", application_id.to_string())?;
+
+                // Now create triggers and views (after data copy to avoid triggers firing)
+                state.op_vacuum_into_state.sub_state =
+                    OpVacuumIntoSubState::PrepareTriggersViews { idx: 0 };
+                continue;
+            }
+
+            OpVacuumIntoSubState::PrepareTriggersViews { idx } => {
+                let idx = *idx;
+                let schema_rows_len = state.op_vacuum_into_state.schema_rows.len();
+                turso_assert!(
+                    idx <= schema_rows_len,
+                    "idx {} incremented past end of schema_rows (len {})",
+                    idx,
+                    schema_rows_len
+                );
+                if idx == schema_rows_len {
+                    // Done creating triggers and views
+                    state.op_vacuum_into_state.sub_state = OpVacuumIntoSubState::Done;
+                    continue;
+                }
+
+                // We validated row.len() == 4 in PrepareDestSchema
+                let row = &state.op_vacuum_into_state.schema_rows[idx];
+
+                // Only process triggers and views in this phase
+                if let Value::Text(type_val) = &row[0] {
+                    let type_str = type_val.as_str();
+                    if type_str == "trigger" || type_str == "view" {
+                        if let Value::Text(sql) = &row[3] {
+                            let sql_str = sql.as_str();
+                            let dest_conn = state
+                                .op_vacuum_into_state
+                                .dest_conn
+                                .as_ref()
+                                .expect("dest_conn must be set in Init state");
+                            turso_assert!(
+                                state.op_vacuum_into_state.dest_schema_stmt.is_none(),
+                                "dest_schema_stmt should be None before preparing new statement"
+                            );
+                            let dest_stmt = dest_conn.prepare(sql_str)?;
+                            state.op_vacuum_into_state.dest_schema_stmt = Some(Box::new(dest_stmt));
+                            state.op_vacuum_into_state.sub_state =
+                                OpVacuumIntoSubState::StepTriggersViews { idx };
+                            continue;
+                        }
+                    }
+                }
+
+                // Skip non-trigger/view entries
+                state.op_vacuum_into_state.sub_state =
+                    OpVacuumIntoSubState::PrepareTriggersViews { idx: idx + 1 };
+            }
+
+            OpVacuumIntoSubState::StepTriggersViews { idx } => {
+                let idx = *idx;
+                let dest_stmt = state
+                    .op_vacuum_into_state
+                    .dest_schema_stmt
+                    .as_mut()
+                    .expect("dest_schema_stmt must be set in PrepareTriggersViews");
+
+                match dest_stmt.step()? {
+                    crate::StepResult::Row => {
+                        unreachable!("CREATE TRIGGER/VIEW statement unexpectedly returned a row");
+                    }
+                    crate::StepResult::Done => {
+                        state.op_vacuum_into_state.dest_schema_stmt = None;
+                        state.op_vacuum_into_state.sub_state =
+                            OpVacuumIntoSubState::PrepareTriggersViews { idx: idx + 1 };
+                        continue;
+                    }
+                    crate::StepResult::IO => {
+                        let io = dest_stmt
+                            .take_io_completions()
+                            .expect("StepResult::IO returned but no completions available");
+                        return Ok(InsnFunctionStepResult::IO(io));
+                    }
+                    crate::StepResult::Busy | crate::StepResult::Interrupt => {
+                        return Err(LimboError::Busy);
+                    }
+                }
+            }
+
+            OpVacuumIntoSubState::Done => {
+                // Commit the transaction that was started in Init state
+                let dest_conn = state
+                    .op_vacuum_into_state
+                    .dest_conn
+                    .as_ref()
+                    .expect("dest_conn must be set in Init state");
+                dest_conn.execute("COMMIT")?;
+
+                state.pc += 1;
+                return Ok(InsnFunctionStepResult::Step);
+            }
+        }
+    }
+}
+
 fn with_header<T, F>(
     pager: &Pager,
     mv_store: Option<&Arc<MvStore>>,
