@@ -108,11 +108,6 @@ fn main() -> anyhow::Result<()> {
     if args.enable_elle {
         let output_path = &args.elle_output;
         println!("\nElle history exported to: {output_path}");
-        println!("\nTo analyze with elle-cli:");
-        println!(
-            "  clojure -Sdeps '{{:deps {{elle-cli/elle-cli {{:mvn/version \"0.2.1\"}}}}}}' \\"
-        );
-        println!("    -M -m elle-cli.core --model list-append {output_path}");
     }
 
     Ok(())
