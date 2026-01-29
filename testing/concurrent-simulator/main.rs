@@ -53,7 +53,8 @@ fn main() -> anyhow::Result<()> {
 
     let seed = std::env::var("SEED")
         .ok()
-        .map(|s| s.parse::<u64>().unwrap())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.parse::<u64>().expect("SEED must be a valid u64"))
         .unwrap_or_else(|| {
             let mut rng = rand::rng();
             rng.next_u64()
