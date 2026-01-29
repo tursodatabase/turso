@@ -154,3 +154,248 @@ test string-agg-integer-separator {
 expect {
     a100b100c
 }
+
+# Mixed type permutation tests
+
+test group-concat-integer-and-text {
+    CREATE TABLE t(x);
+    INSERT INTO t VALUES (1), ('hello'), (2);
+    SELECT GROUP_CONCAT(x) FROM t;
+}
+expect {
+    1,hello,2
+}
+
+test group-concat-integer-and-text-type {
+    CREATE TABLE t(x);
+    INSERT INTO t VALUES (1), ('hello'), (2);
+    SELECT typeof(GROUP_CONCAT(x)) FROM t;
+}
+expect {
+    text
+}
+
+test group-concat-real-and-integer {
+    CREATE TABLE t(x);
+    INSERT INTO t VALUES (1.5), (2), (3.7);
+    SELECT GROUP_CONCAT(x) FROM t;
+}
+expect {
+    1.5,2,3.7
+}
+
+test group-concat-real-and-integer-type {
+    CREATE TABLE t(x);
+    INSERT INTO t VALUES (1.5), (2), (3.7);
+    SELECT typeof(GROUP_CONCAT(x)) FROM t;
+}
+expect {
+    text
+}
+
+test group-concat-text-and-real {
+    CREATE TABLE t(x);
+    INSERT INTO t VALUES ('abc'), (3.14), ('def');
+    SELECT GROUP_CONCAT(x) FROM t;
+}
+expect {
+    abc,3.14,def
+}
+
+test group-concat-blob-single {
+    CREATE TABLE t(x);
+    INSERT INTO t VALUES (x'48454c4c4f');
+    SELECT GROUP_CONCAT(x) FROM t;
+}
+expect {
+    HELLO
+}
+
+test group-concat-blob-single-type {
+    CREATE TABLE t(x);
+    INSERT INTO t VALUES (x'48454c4c4f');
+    SELECT typeof(GROUP_CONCAT(x)) FROM t;
+}
+expect {
+    text
+}
+
+test group-concat-blob-multiple {
+    CREATE TABLE t(x);
+    INSERT INTO t VALUES (x'48454c4c4f'), (x'574f524c44');
+    SELECT GROUP_CONCAT(x) FROM t;
+}
+expect {
+    HELLO,WORLD
+}
+
+test group-concat-blob-and-text {
+    CREATE TABLE t(x);
+    INSERT INTO t VALUES (x'48454c4c4f'), ('world');
+    SELECT GROUP_CONCAT(x) FROM t;
+}
+expect {
+    HELLO,world
+}
+
+test group-concat-blob-and-integer {
+    CREATE TABLE t(x);
+    INSERT INTO t VALUES (x'4142'), (123), (x'4344');
+    SELECT GROUP_CONCAT(x) FROM t;
+}
+expect {
+    AB,123,CD
+}
+
+test group-concat-blob-and-real {
+    CREATE TABLE t(x);
+    INSERT INTO t VALUES (x'4142'), (3.14);
+    SELECT GROUP_CONCAT(x) FROM t;
+}
+expect {
+    AB,3.14
+}
+
+test group-concat-null-and-integer {
+    CREATE TABLE t(x);
+    INSERT INTO t VALUES (NULL), (1), (NULL), (2);
+    SELECT GROUP_CONCAT(x) FROM t;
+}
+expect {
+    1,2
+}
+
+test group-concat-null-and-text {
+    CREATE TABLE t(x);
+    INSERT INTO t VALUES (NULL), ('a'), (NULL), ('b');
+    SELECT GROUP_CONCAT(x) FROM t;
+}
+expect {
+    a,b
+}
+
+test group-concat-null-and-blob {
+    CREATE TABLE t(x);
+    INSERT INTO t VALUES (NULL), (x'4142'), (NULL);
+    SELECT GROUP_CONCAT(x) FROM t;
+}
+expect {
+    AB
+}
+
+test group-concat-null-and-real {
+    CREATE TABLE t(x);
+    INSERT INTO t VALUES (NULL), (1.5), (NULL), (2.5);
+    SELECT GROUP_CONCAT(x) FROM t;
+}
+expect {
+    1.5,2.5
+}
+
+test group-concat-all-types-mixed {
+    CREATE TABLE t(x);
+    INSERT INTO t VALUES (1), ('hello'), (3.14), (x'4142'), (NULL), (2);
+    SELECT GROUP_CONCAT(x) FROM t;
+}
+expect {
+    1,hello,3.14,AB,2
+}
+
+test group-concat-all-types-mixed-type {
+    CREATE TABLE t(x);
+    INSERT INTO t VALUES (1), ('hello'), (3.14), (x'4142'), (NULL), (2);
+    SELECT typeof(GROUP_CONCAT(x)) FROM t;
+}
+expect {
+    text
+}
+
+test group-concat-integer-text-real-blob {
+    CREATE TABLE t(x);
+    INSERT INTO t VALUES (42), ('foo'), (2.718), (x'424152');
+    SELECT GROUP_CONCAT(x) FROM t;
+}
+expect {
+    42,foo,2.718,BAR
+}
+
+test group-concat-real-blob-text-integer {
+    CREATE TABLE t(x);
+    INSERT INTO t VALUES (1.1), (x'5858'), ('yy'), (99);
+    SELECT GROUP_CONCAT(x) FROM t;
+}
+expect {
+    1.1,XX,yy,99
+}
+
+# Mixed types with custom separator
+
+test group-concat-mixed-types-custom-separator {
+    CREATE TABLE t(x);
+    INSERT INTO t VALUES (1), ('a'), (2.5);
+    SELECT GROUP_CONCAT(x, ' | ') FROM t;
+}
+expect {
+    1 | a | 2.5
+}
+
+test group-concat-blob-text-integer-separator {
+    CREATE TABLE t(x);
+    INSERT INTO t VALUES (x'4142'), ('cd'), (12);
+    SELECT GROUP_CONCAT(x, '-') FROM t;
+}
+expect {
+    AB-cd-12
+}
+
+# Empty string and mixed types
+
+test group-concat-empty-string-and-integer {
+    CREATE TABLE t(x);
+    INSERT INTO t VALUES (''), (1), ('');
+    SELECT GROUP_CONCAT(x) FROM t;
+}
+expect {
+    ,1,
+}
+
+test group-concat-empty-string-and-blob {
+    CREATE TABLE t(x);
+    INSERT INTO t VALUES (''), (x'4142'), ('');
+    SELECT GROUP_CONCAT(x) FROM t;
+}
+expect {
+    ,AB,
+}
+
+# Zero values with different types
+
+test group-concat-zero-integer-and-text {
+    CREATE TABLE t(x);
+    INSERT INTO t VALUES (0), ('zero'), (0);
+    SELECT GROUP_CONCAT(x) FROM t;
+}
+expect {
+    0,zero,0
+}
+
+test group-concat-zero-real-and-text {
+    CREATE TABLE t(x);
+    INSERT INTO t VALUES (0.0), ('zero');
+    SELECT GROUP_CONCAT(x) FROM t;
+}
+expect {
+    0.0,zero
+}
+
+test group-concat-invalid-utf {
+    CREATE TABLE t(s TEXT);
+    INSERT INTO t VALUES (X'FF');
+    INSERT INTO t VALUES (X'C0C1'); 
+    select group_concat(s) from t;
+}
+expect {
+    �,��
+}
+
+
