@@ -237,3 +237,129 @@ pub fn estimate_cost_for_scan_or_seek(
         base_cost
     }
 }
+
+/// Estimate the cost of a multi-index scan (OR-by-union optimization).
+///
+/// The cost model accounts for:
+/// 1. Cost of each index branch scan
+/// 2. Deduplication overhead using RowSet
+/// 3. Table row fetches after deduplication
+/// 4. Potential overlap between branches (rows appearing in multiple disjuncts)
+///
+/// # Arguments
+/// * `branch_costs` - Cost of scanning each individual index branch
+/// * `branch_rows` - Estimated rows from each branch before deduplication
+/// * `base_row_count` - Total rows in the table
+/// * `input_cardinality` - Number of times the multi-index scan is executed (from outer join)
+/// * `params` - Cost model parameters
+pub fn estimate_multi_index_scan_cost(
+    branch_costs: &[Cost],
+    branch_rows: &[f64],
+    base_row_count: RowCountEstimate,
+    input_cardinality: f64,
+    params: &CostModelParams,
+) -> Cost {
+    let base_row_count = *base_row_count;
+
+    // Total cost of all branch scans
+    let branch_scan_cost: f64 = branch_costs.iter().map(|c| c.0).sum();
+
+    // Estimate total rows before deduplication (sum of all branch estimates)
+    let total_rows_before_dedup: f64 = branch_rows.iter().sum();
+
+    // Estimate overlap between branches (rough approximation)
+    // For independent branches, P(A OR B) = P(A) + P(B) - P(A AND B)
+    // We approximate P(A AND B) = P(A) * P(B) for independence
+    let mut unique_row_ratio = 1.0f64;
+    for rows in branch_rows.iter() {
+        let branch_selectivity = (*rows / base_row_count).min(1.0);
+        unique_row_ratio *= 1.0 - branch_selectivity;
+    }
+    let estimated_unique_rows = base_row_count * (1.0 - unique_row_ratio);
+
+    // Deduplication cost: adding and checking rowids in the RowSet
+    // RowSet operations are O(log n) for balanced tree implementation
+    let rowset_ops_cost = total_rows_before_dedup * params.cpu_cost_per_row * 2.0; // add + test
+
+    // Table fetch cost: seek to each unique row
+    let tree_depth = if base_row_count <= 1.0 {
+        1.0
+    } else {
+        (base_row_count.ln() / params.rows_per_page.ln())
+            .ceil()
+            .max(1.0)
+    };
+    let table_fetch_cost = estimated_unique_rows * tree_depth;
+
+    // Total cost
+    let total_cost = (branch_scan_cost + rowset_ops_cost + table_fetch_cost) * input_cardinality;
+
+    Cost(total_cost)
+}
+
+/// Estimate the cost of a multi-index intersection (AND-by-intersection optimization).
+///
+/// The cost model accounts for:
+/// 1. Cost of each index branch scan
+/// 2. Intersection overhead using RowSet test operations
+/// 3. Table row fetches for intersection result
+/// 4. Final row estimate is the product of selectivities (assuming independence)
+///
+/// Intersection works differently from union:
+/// - First branch populates the RowSet
+/// - Subsequent branches test against and reduce the set
+/// - Final result is only rowids that appear in ALL branches
+///
+/// # Arguments
+/// * `branch_costs` - Cost of scanning each individual index branch
+/// * `branch_rows` - Estimated rows from each branch
+/// * `base_row_count` - Total rows in the table
+/// * `input_cardinality` - Number of times the multi-index scan is executed (from outer join)
+/// * `params` - Cost model parameters
+///
+/// # Returns
+/// A tuple of (Cost, estimated_result_rows)
+pub fn estimate_multi_index_intersection_cost(
+    branch_costs: &[Cost],
+    branch_rows: &[f64],
+    base_row_count: RowCountEstimate,
+    input_cardinality: f64,
+    params: &CostModelParams,
+) -> (Cost, f64) {
+    let base_row_count = *base_row_count;
+
+    // Total cost of all branch scans
+    let branch_scan_cost: f64 = branch_costs.iter().map(|c| c.0).sum();
+
+    // Estimate intersection result (product of selectivities, assuming independence)
+    // P(A AND B) = P(A) * P(B) for independent predicates
+    let mut intersection_selectivity = 1.0f64;
+    for rows in branch_rows.iter() {
+        let branch_selectivity = (*rows / base_row_count).min(1.0);
+        intersection_selectivity *= branch_selectivity;
+    }
+    let estimated_intersection_rows = (base_row_count * intersection_selectivity).max(1.0);
+
+    // Intersection cost: first branch adds, subsequent branches test
+    // First branch: rows[0] inserts
+    // Subsequent branches: rows[i] tests
+    let first_branch_rows = branch_rows.first().copied().unwrap_or(0.0);
+    let subsequent_branch_rows: f64 = branch_rows.iter().skip(1).sum();
+    let rowset_ops_cost =
+        (first_branch_rows + subsequent_branch_rows) * params.cpu_cost_per_row * 1.5; // add is cheaper than test+add
+
+    // Table fetch cost: seek to each row in the intersection
+    let tree_depth = if base_row_count <= 1.0 {
+        1.0
+    } else {
+        (base_row_count.ln() / params.rows_per_page.ln())
+            .ceil()
+            .max(1.0)
+    };
+    let table_fetch_cost = estimated_intersection_rows * tree_depth;
+
+    // Total cost
+    let total_cost = (branch_scan_cost + rowset_ops_cost + table_fetch_cost) * input_cardinality;
+
+    (Cost(total_cost), estimated_intersection_rows)
+}

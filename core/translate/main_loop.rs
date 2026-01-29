@@ -1,6 +1,6 @@
 use turso_parser::ast::{Expr, SortOrder};
 
-use std::{borrow::Cow, collections::HashSet, sync::Arc};
+use std::{borrow::Cow, collections::HashSet, num::NonZeroUsize, sync::Arc};
 
 use super::{
     aggregation::{translate_aggregation_step, AggArgumentSource},
@@ -17,8 +17,9 @@ use super::{
     order_by::{order_by_sorter_insert, sorter_insert},
     plan::{
         Aggregate, DistinctCtx, Distinctness, EvalAt, HashJoinOp, IterationDirection,
-        JoinOrderMember, NonFromClauseSubquery, Operation, QueryDestination, Scan, Search, SeekDef,
-        SeekKeyComponent, SelectPlan, TableReferences, WhereTerm,
+        JoinOrderMember, JoinedTable, MultiIndexScanOp, NonFromClauseSubquery, Operation,
+        QueryDestination, Scan, Search, SeekDef, SeekKeyComponent, SelectPlan, SetOperation,
+        TableReferences, WhereTerm,
     },
 };
 use crate::{
@@ -395,6 +396,38 @@ pub fn init_loop(
                     _ => unreachable!("Hash joins should only occur in SELECT operations"),
                 }
             }
+            Operation::MultiIndexScan(multi_idx_op) => {
+                match mode {
+                    OperationMode::SELECT => {
+                        let Table::BTree(btree) = &table.table else {
+                            panic!("Expected multi-index scan table to be a BTree table");
+                        };
+                        // Open the table cursor
+                        if let Some(table_cursor_id) = table_cursor_id {
+                            program.emit_insn(Insn::OpenRead {
+                                cursor_id: table_cursor_id,
+                                root_page: btree.root_page,
+                                db: table.database_id,
+                            });
+                        }
+                        // Open cursors for each index branch
+                        for branch in &multi_idx_op.branches {
+                            if let Some(index) = &branch.index {
+                                let branch_cursor_id = program.alloc_cursor_index(
+                                    Some(CursorKey::index(table.internal_id, index.clone())),
+                                    index,
+                                )?;
+                                program.emit_insn(Insn::OpenRead {
+                                    cursor_id: branch_cursor_id,
+                                    root_page: index.root_page,
+                                    db: table.database_id,
+                                });
+                            }
+                        }
+                    }
+                    _ => unreachable!("Multi-index scans should only occur in SELECT operations"),
+                }
+            }
         }
     }
 
@@ -766,6 +799,569 @@ fn emit_hash_build_phase(
 
     program.preassign_label_to_next_insn(label_hash_build_end);
     Ok(payload_info)
+}
+
+/// Emit bytecode for a multi-index scan (OR-by-union or AND-by-intersection).
+///
+/// For **Union (OR)**: scans each index branch separately, collecting rowids into a RowSet
+/// for deduplication, then reads from the RowSet to fetch actual rows.
+///
+/// For **Intersection (AND)**: uses two RowSets. First branch populates rowset1,
+/// subsequent branches test against rowset1 and add found rows to rowset2.
+/// Only rowids appearing in ALL branches end up in the final result.
+///
+/// Union bytecode structure:
+/// ```text
+/// ; Initialize RowSet for deduplication
+///   Null      rowset_reg
+///
+/// ; Branch 1: scan index for first OR term
+///   SeekGE    idx1_cursor, branch1_end, key1_reg, 1
+/// branch1_loop:
+///   IdxRowId  idx1_cursor, rowid_reg
+///   RowSetTest rowset_reg, branch1_next, rowid_reg  ; skip if already seen
+/// branch1_next:
+///   Next      idx1_cursor, branch1_loop
+/// branch1_end:
+///
+/// ; Read from RowSet and fetch rows
+/// rowset_loop:
+///   RowSetRead rowset_reg, loop_end, rowid_reg
+///   SeekRowid table_cursor, rowset_loop, rowid_reg
+///   Goto      rowset_loop
+/// loop_end:
+/// ```
+///
+/// Intersection bytecode structure:
+/// ```text
+/// ; Initialize two RowSets
+///   Null      rowset1_reg
+///   Null      rowset2_reg
+///
+/// ; Branch 1: populate rowset1
+///   SeekGE    idx1_cursor, branch1_end, key1_reg, 1
+/// branch1_loop:
+///   IdxRowId  idx1_cursor, rowid_reg
+///   RowSetAdd rowset1_reg, rowid_reg
+///   Next      idx1_cursor, branch1_loop
+/// branch1_end:
+///
+/// ; Branch 2: test against rowset1, add to rowset2 if found
+///   SeekGE    idx2_cursor, branch2_end, key2_reg, 1
+/// branch2_loop:
+///   IdxRowId  idx2_cursor, rowid_reg
+///   RowSetTest rowset1_reg, found_in_both, rowid_reg, -1  ; test-only, no insert
+///   Goto      branch2_next                                 ; not found, skip
+/// found_in_both:
+///   RowSetAdd rowset2_reg, rowid_reg                       ; found, add to result
+/// branch2_next:
+///   Next      idx2_cursor, branch2_loop
+/// branch2_end:
+///
+/// ; Read intersection results from rowset2
+/// rowset_loop:
+///   RowSetRead rowset2_reg, loop_end, rowid_reg
+///   SeekRowid table_cursor, rowset_loop, rowid_reg
+///   Goto      rowset_loop
+/// loop_end:
+/// ```
+#[allow(clippy::too_many_arguments)]
+fn emit_multi_index_scan_loop(
+    program: &mut ProgramBuilder,
+    t_ctx: &mut TranslateCtx,
+    table: &JoinedTable,
+    table_references: &TableReferences,
+    multi_idx_op: &MultiIndexScanOp,
+    loop_start: BranchOffset,
+    loop_end: BranchOffset,
+    _next: BranchOffset,
+) -> Result<()> {
+    let table_cursor_id = program.resolve_cursor_id(&CursorKey::table(table.internal_id));
+
+    // Allocate register for rowid during collection and final fetch
+    let rowid_reg = program.alloc_register();
+
+    // For intersection, we need two rowsets (swap between them for multi-way intersection)
+    // For union, we only need one rowset
+    let is_intersection = multi_idx_op.set_op == SetOperation::Intersection;
+
+    // Allocate registers for RowSets
+    let rowset1_reg = program.alloc_register();
+    let rowset2_reg = if is_intersection {
+        program.alloc_register()
+    } else {
+        rowset1_reg // Union only uses one rowset
+    };
+
+    // Initialize RowSet(s) to NULL (empty)
+    program.emit_insn(Insn::Null {
+        dest: rowset1_reg,
+        dest_end: None,
+    });
+    if is_intersection {
+        program.emit_insn(Insn::Null {
+            dest: rowset2_reg,
+            dest_end: None,
+        });
+    }
+
+    // For intersection, we track which rowset to read from and write to
+    // First branch writes to rowset1, subsequent branches read from current and write to next
+    let mut current_read_rowset = rowset1_reg;
+    let mut current_write_rowset = if is_intersection {
+        rowset2_reg
+    } else {
+        rowset1_reg
+    };
+
+    // Emit each index branch - collect rowids into RowSet
+    for (branch_idx, branch) in multi_idx_op.branches.iter().enumerate() {
+        let branch_loop_start = program.allocate_label();
+        let branch_loop_end = program.allocate_label();
+        let branch_next = program.allocate_label();
+
+        // For intersection after first branch, we need a label for "found in previous rowset"
+        let found_in_prev_label = if is_intersection && branch_idx > 0 {
+            Some(program.allocate_label())
+        } else {
+            None
+        };
+
+        let seek_def = &branch.seek_def;
+        let is_index = branch.index.is_some();
+        let branch_cursor_id = if let Some(index) = &branch.index {
+            program.resolve_cursor_id(&CursorKey::index(table.internal_id, index.clone()))
+        } else {
+            // Rowid-based access
+            table_cursor_id
+        };
+
+        // Allocate registers for seek key
+        let key_count = seek_def.size(&seek_def.start);
+        let key_start_reg = program.alloc_registers(key_count.max(1));
+
+        // Emit expressions for seek key
+        for (i, key_component) in seek_def.iter(&seek_def.start).enumerate() {
+            if let SeekKeyComponent::Expr(expr) = key_component {
+                translate_expr(
+                    program,
+                    Some(table_references),
+                    expr,
+                    key_start_reg + i,
+                    &t_ctx.resolver,
+                )?;
+            }
+        }
+
+        // Apply affinities
+        let affinities: String = seek_def
+            .iter_affinity(&seek_def.start)
+            .map(|aff| aff.aff_mask())
+            .collect();
+        if !affinities.is_empty() {
+            if let Some(count) = NonZeroUsize::new(key_count) {
+                program.emit_insn(Insn::Affinity {
+                    start_reg: key_start_reg,
+                    count,
+                    affinities,
+                });
+            }
+        }
+
+        // Note: For Union, we use RowSetAdd (not RowSetTest) for all branches.
+        // Deduplication happens in RowSetRead via sort + dedup.
+        // For Intersection, batch semantics are handled in the intersection-specific code.
+
+        // Emit seek to start of range
+        let seek_op = seek_def.start.op;
+        match seek_op {
+            SeekOp::GE { eq_only } => {
+                if !is_index && eq_only {
+                    // Rowid equality - use SeekRowid
+                    program.emit_insn(Insn::SeekRowid {
+                        cursor_id: branch_cursor_id,
+                        src_reg: key_start_reg,
+                        target_pc: branch_loop_end,
+                    });
+                    program.preassign_label_to_next_insn(branch_loop_start);
+
+                    // Get rowid for RowSet
+                    program.emit_insn(Insn::RowId {
+                        cursor_id: branch_cursor_id,
+                        dest: rowid_reg,
+                    });
+
+                    if is_intersection {
+                        if branch_idx == 0 {
+                            // First branch: just add to rowset1
+                            program.emit_insn(Insn::RowSetAdd {
+                                rowset_reg: rowset1_reg,
+                                value_reg: rowid_reg,
+                            });
+                        } else {
+                            // Subsequent branches: test against previous rowset
+                            // If found, add to next rowset
+                            program.emit_insn(Insn::RowSetTest {
+                                rowset_reg: current_read_rowset,
+                                pc_if_found: found_in_prev_label.unwrap(),
+                                value_reg: rowid_reg,
+                                batch: -1, // Test only, no insert
+                            });
+                            // Not found - skip to next
+                            program.emit_insn(Insn::Goto {
+                                target_pc: branch_next,
+                            });
+                            // Found - add to result rowset
+                            program.preassign_label_to_next_insn(found_in_prev_label.unwrap());
+                            program.emit_insn(Insn::RowSetAdd {
+                                rowset_reg: current_write_rowset,
+                                value_reg: rowid_reg,
+                            });
+                        }
+                    } else {
+                        // Union: Just add all rowids, RowSetRead will deduplicate
+                        program.emit_insn(Insn::RowSetAdd {
+                            rowset_reg: rowset1_reg,
+                            value_reg: rowid_reg,
+                        });
+                    }
+
+                    program.preassign_label_to_next_insn(branch_next);
+                    // Single row for rowid equality - no loop needed
+                    program.preassign_label_to_next_insn(branch_loop_end);
+                } else {
+                    // Index seek - may have multiple rows
+                    program.emit_insn(Insn::SeekGE {
+                        is_index,
+                        cursor_id: branch_cursor_id,
+                        start_reg: key_start_reg,
+                        num_regs: key_count,
+                        target_pc: branch_loop_end,
+                        eq_only,
+                    });
+                    program.preassign_label_to_next_insn(branch_loop_start);
+
+                    if eq_only {
+                        // Check if we're still on a matching key
+                        program.emit_insn(Insn::IdxGT {
+                            cursor_id: branch_cursor_id,
+                            start_reg: key_start_reg,
+                            num_regs: key_count,
+                            target_pc: branch_loop_end,
+                        });
+                    }
+
+                    // Get rowid from index
+                    if is_index {
+                        program.emit_insn(Insn::IdxRowId {
+                            cursor_id: branch_cursor_id,
+                            dest: rowid_reg,
+                        });
+                    } else {
+                        program.emit_insn(Insn::RowId {
+                            cursor_id: branch_cursor_id,
+                            dest: rowid_reg,
+                        });
+                    }
+
+                    if is_intersection {
+                        if branch_idx == 0 {
+                            // First branch: just add to rowset1
+                            program.emit_insn(Insn::RowSetAdd {
+                                rowset_reg: rowset1_reg,
+                                value_reg: rowid_reg,
+                            });
+                        } else {
+                            // Subsequent branches: test against previous rowset
+                            program.emit_insn(Insn::RowSetTest {
+                                rowset_reg: current_read_rowset,
+                                pc_if_found: found_in_prev_label.unwrap(),
+                                value_reg: rowid_reg,
+                                batch: -1, // Test only, no insert
+                            });
+                            // Not found - skip to next
+                            program.emit_insn(Insn::Goto {
+                                target_pc: branch_next,
+                            });
+                            // Found - add to result rowset
+                            program.preassign_label_to_next_insn(found_in_prev_label.unwrap());
+                            program.emit_insn(Insn::RowSetAdd {
+                                rowset_reg: current_write_rowset,
+                                value_reg: rowid_reg,
+                            });
+                        }
+                    } else {
+                        // Union: Just add all rowids, RowSetRead will deduplicate
+                        program.emit_insn(Insn::RowSetAdd {
+                            rowset_reg: rowset1_reg,
+                            value_reg: rowid_reg,
+                        });
+                    }
+
+                    program.preassign_label_to_next_insn(branch_next);
+                    program.emit_insn(Insn::Next {
+                        cursor_id: branch_cursor_id,
+                        pc_if_next: branch_loop_start,
+                    });
+                    program.preassign_label_to_next_insn(branch_loop_end);
+                }
+            }
+            SeekOp::GT => {
+                program.emit_insn(Insn::SeekGT {
+                    is_index,
+                    cursor_id: branch_cursor_id,
+                    start_reg: key_start_reg,
+                    num_regs: key_count,
+                    target_pc: branch_loop_end,
+                });
+                program.preassign_label_to_next_insn(branch_loop_start);
+
+                // Get rowid from index
+                if is_index {
+                    program.emit_insn(Insn::IdxRowId {
+                        cursor_id: branch_cursor_id,
+                        dest: rowid_reg,
+                    });
+                } else {
+                    program.emit_insn(Insn::RowId {
+                        cursor_id: branch_cursor_id,
+                        dest: rowid_reg,
+                    });
+                }
+
+                if is_intersection {
+                    if branch_idx == 0 {
+                        program.emit_insn(Insn::RowSetAdd {
+                            rowset_reg: rowset1_reg,
+                            value_reg: rowid_reg,
+                        });
+                    } else {
+                        program.emit_insn(Insn::RowSetTest {
+                            rowset_reg: current_read_rowset,
+                            pc_if_found: found_in_prev_label.unwrap(),
+                            value_reg: rowid_reg,
+                            batch: -1,
+                        });
+                        program.emit_insn(Insn::Goto {
+                            target_pc: branch_next,
+                        });
+                        program.preassign_label_to_next_insn(found_in_prev_label.unwrap());
+                        program.emit_insn(Insn::RowSetAdd {
+                            rowset_reg: current_write_rowset,
+                            value_reg: rowid_reg,
+                        });
+                    }
+                } else {
+                    // Union: Just add all rowids, RowSetRead will deduplicate
+                    program.emit_insn(Insn::RowSetAdd {
+                        rowset_reg: rowset1_reg,
+                        value_reg: rowid_reg,
+                    });
+                }
+
+                program.preassign_label_to_next_insn(branch_next);
+                program.emit_insn(Insn::Next {
+                    cursor_id: branch_cursor_id,
+                    pc_if_next: branch_loop_start,
+                });
+                program.preassign_label_to_next_insn(branch_loop_end);
+            }
+            SeekOp::LE { eq_only } => {
+                // For LE, start from end and iterate backwards
+                program.emit_insn(Insn::SeekLE {
+                    is_index,
+                    cursor_id: branch_cursor_id,
+                    start_reg: key_start_reg,
+                    num_regs: key_count,
+                    target_pc: branch_loop_end,
+                    eq_only,
+                });
+                program.preassign_label_to_next_insn(branch_loop_start);
+
+                if eq_only {
+                    // Check if we're still on a matching key (for equality)
+                    program.emit_insn(Insn::IdxLT {
+                        cursor_id: branch_cursor_id,
+                        start_reg: key_start_reg,
+                        num_regs: key_count,
+                        target_pc: branch_loop_end,
+                    });
+                }
+
+                // Get rowid
+                if is_index {
+                    program.emit_insn(Insn::IdxRowId {
+                        cursor_id: branch_cursor_id,
+                        dest: rowid_reg,
+                    });
+                } else {
+                    program.emit_insn(Insn::RowId {
+                        cursor_id: branch_cursor_id,
+                        dest: rowid_reg,
+                    });
+                }
+
+                if is_intersection {
+                    if branch_idx == 0 {
+                        program.emit_insn(Insn::RowSetAdd {
+                            rowset_reg: rowset1_reg,
+                            value_reg: rowid_reg,
+                        });
+                    } else {
+                        program.emit_insn(Insn::RowSetTest {
+                            rowset_reg: current_read_rowset,
+                            pc_if_found: found_in_prev_label.unwrap(),
+                            value_reg: rowid_reg,
+                            batch: -1,
+                        });
+                        program.emit_insn(Insn::Goto {
+                            target_pc: branch_next,
+                        });
+                        program.preassign_label_to_next_insn(found_in_prev_label.unwrap());
+                        program.emit_insn(Insn::RowSetAdd {
+                            rowset_reg: current_write_rowset,
+                            value_reg: rowid_reg,
+                        });
+                    }
+                } else {
+                    // Union: Just add all rowids, RowSetRead will deduplicate
+                    program.emit_insn(Insn::RowSetAdd {
+                        rowset_reg: rowset1_reg,
+                        value_reg: rowid_reg,
+                    });
+                }
+
+                program.preassign_label_to_next_insn(branch_next);
+                program.emit_insn(Insn::Prev {
+                    cursor_id: branch_cursor_id,
+                    pc_if_prev: branch_loop_start,
+                });
+                program.preassign_label_to_next_insn(branch_loop_end);
+            }
+            SeekOp::LT => {
+                // For LT, start from end and iterate backwards
+                program.emit_insn(Insn::SeekLT {
+                    is_index,
+                    cursor_id: branch_cursor_id,
+                    start_reg: key_start_reg,
+                    num_regs: key_count,
+                    target_pc: branch_loop_end,
+                });
+                program.preassign_label_to_next_insn(branch_loop_start);
+
+                // Get rowid
+                if is_index {
+                    program.emit_insn(Insn::IdxRowId {
+                        cursor_id: branch_cursor_id,
+                        dest: rowid_reg,
+                    });
+                } else {
+                    program.emit_insn(Insn::RowId {
+                        cursor_id: branch_cursor_id,
+                        dest: rowid_reg,
+                    });
+                }
+
+                if is_intersection {
+                    if branch_idx == 0 {
+                        program.emit_insn(Insn::RowSetAdd {
+                            rowset_reg: rowset1_reg,
+                            value_reg: rowid_reg,
+                        });
+                    } else {
+                        program.emit_insn(Insn::RowSetTest {
+                            rowset_reg: current_read_rowset,
+                            pc_if_found: found_in_prev_label.unwrap(),
+                            value_reg: rowid_reg,
+                            batch: -1,
+                        });
+                        program.emit_insn(Insn::Goto {
+                            target_pc: branch_next,
+                        });
+                        program.preassign_label_to_next_insn(found_in_prev_label.unwrap());
+                        program.emit_insn(Insn::RowSetAdd {
+                            rowset_reg: current_write_rowset,
+                            value_reg: rowid_reg,
+                        });
+                    }
+                } else {
+                    // Union: Just add all rowids, RowSetRead will deduplicate
+                    program.emit_insn(Insn::RowSetAdd {
+                        rowset_reg: rowset1_reg,
+                        value_reg: rowid_reg,
+                    });
+                }
+
+                program.preassign_label_to_next_insn(branch_next);
+                program.emit_insn(Insn::Prev {
+                    cursor_id: branch_cursor_id,
+                    pc_if_prev: branch_loop_start,
+                });
+                program.preassign_label_to_next_insn(branch_loop_end);
+            }
+        }
+
+        // For intersection with more than 2 branches, swap the rowsets
+        // so the next iteration reads from what we just wrote and writes to the other
+        if is_intersection && branch_idx > 0 && branch_idx < multi_idx_op.branches.len() - 1 {
+            std::mem::swap(&mut current_read_rowset, &mut current_write_rowset);
+            // Re-initialize the write rowset for the next iteration
+            program.emit_insn(Insn::Null {
+                dest: current_write_rowset,
+                dest_end: None,
+            });
+        }
+    }
+
+    // Determine which rowset to read from for final results
+    let final_rowset = if is_intersection && multi_idx_op.branches.len() > 1 {
+        // After the last branch (index N-1), results are in current_write_rowset
+        // But due to potential swapping, let's calculate it properly:
+        // - After branch 0: results in rowset1
+        // - After branch 1: results in rowset2 (read from rowset1, wrote to rowset2)
+        // - After branch 2: results in rowset1 (swapped, read from rowset2, wrote to rowset1)
+        // For 2 branches: rowset2
+        // For 3 branches: rowset1 (after swap)
+        // Pattern: even number of swaps (N-2 swaps for N branches) -> rowset2
+        //          odd number of swaps -> rowset1
+        if (multi_idx_op.branches.len() - 1) % 2 == 1 {
+            rowset1_reg
+        } else {
+            rowset2_reg
+        }
+    } else {
+        rowset1_reg
+    };
+
+    // Now read from RowSet and fetch actual rows
+    program.preassign_label_to_next_insn(loop_start);
+    program.emit_insn(Insn::RowSetRead {
+        rowset_reg: final_rowset,
+        pc_if_empty: loop_end,
+        dest_reg: rowid_reg,
+    });
+
+    // Seek to the row in the table
+    let skip_label = program.allocate_label();
+    program.emit_insn(Insn::SeekRowid {
+        cursor_id: table_cursor_id,
+        src_reg: rowid_reg,
+        target_pc: skip_label,
+    });
+
+    // Cache the rowid expression for later use
+    let rowid_expr = Expr::RowId {
+        database: None,
+        table: table.internal_id,
+    };
+    t_ctx
+        .resolver
+        .expr_to_reg_cache
+        .push((Cow::Owned(rowid_expr), rowid_reg));
+
+    program.preassign_label_to_next_insn(skip_label);
+
+    Ok(())
 }
 
 /// Set up the main query execution loop
@@ -1238,6 +1834,18 @@ pub fn open_loop(
                         target_pc: hash_next_label,
                     });
                 }
+            }
+            Operation::MultiIndexScan(multi_idx_op) => {
+                emit_multi_index_scan_loop(
+                    program,
+                    t_ctx,
+                    table,
+                    table_references,
+                    multi_idx_op,
+                    loop_start,
+                    loop_end,
+                    next,
+                )?;
             }
         }
 
@@ -1838,6 +2446,15 @@ pub fn close_loop(
                 program.emit_insn(Insn::Next {
                     cursor_id: probe_cursor_id,
                     pc_if_next: loop_labels.loop_start,
+                });
+                program.preassign_label_to_next_insn(loop_labels.loop_end);
+            }
+            Operation::MultiIndexScan(_) => {
+                // MultiIndexScan uses RowSetRead for iteration - the next is handled
+                // at the end of the RowSet read loop in emit_multi_index_scan_loop
+                program.resolve_label(loop_labels.next, program.offset());
+                program.emit_insn(Insn::Goto {
+                    target_pc: loop_labels.loop_start,
                 });
                 program.preassign_label_to_next_insn(loop_labels.loop_end);
             }

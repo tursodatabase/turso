@@ -1201,6 +1201,49 @@ pub struct HashJoinOp {
     pub use_bloom_filter: bool,
 }
 
+/// Distinguishes union (OR) from intersection (AND) operations for multi-index scans.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetOperation {
+    /// Union: rowid appears in result if it's in ANY branch (OR)
+    Union,
+    /// Intersection: rowid appears in result only if it's in ALL branches (AND)
+    Intersection,
+}
+
+/// Multi-index scan operation metadata for OR-by-union or AND-by-intersection optimization.
+///
+/// When a WHERE clause contains an OR of terms that can each use a different index,
+/// we can scan each index separately and combine the results using a RowSet for deduplication.
+/// For example: `WHERE a = 1 OR b = 2` with indexes on `a` and `b`.
+///
+/// Similarly, when a WHERE clause contains AND terms on different indexed columns,
+/// we can scan each index and intersect the results to reduce the number of table fetches.
+/// For example: `WHERE a = 1 AND b = 2` with separate indexes on `a` and `b`.
+#[derive(Debug, Clone)]
+pub struct MultiIndexScanOp {
+    /// Each branch represents one term with its own index access
+    pub branches: Vec<MultiIndexBranch>,
+    /// Index of the primary WHERE term.
+    /// For Union: the index of the OR expression.
+    /// For Intersection: the index of the first AND term consumed.
+    pub where_term_idx: usize,
+    /// The set operation to perform when combining branches
+    pub set_op: SetOperation,
+    /// For Intersection: indices of additional WHERE terms consumed (besides where_term_idx)
+    pub additional_consumed_terms: Vec<usize>,
+}
+
+/// A single branch of a multi-index scan, representing one disjunct of an OR expression.
+#[derive(Debug, Clone)]
+pub struct MultiIndexBranch {
+    /// The index to use for this branch, or None for rowid access
+    pub index: Option<Arc<Index>>,
+    /// The seek definition for this branch
+    pub seek_def: SeekDef,
+    /// Estimated number of rows from this branch
+    pub estimated_rows: f64,
+}
+
 #[derive(Clone, Debug)]
 #[allow(clippy::large_enum_variant)]
 pub enum Operation {
@@ -1218,6 +1261,10 @@ pub enum Operation {
     // The build table is accessed normally (via Scan), and the probe table
     // uses this operation to indicate it should probe the hash table.
     HashJoin(HashJoinOp),
+    // Multi-index scan operation for OR-by-union optimization.
+    // This operation scans multiple indexes (one per OR branch) and combines
+    // results using RowSet deduplication.
+    MultiIndexScan(MultiIndexScanOp),
 }
 
 impl Operation {
@@ -1244,6 +1291,8 @@ impl Operation {
             Operation::Scan(_) => None,
             Operation::Search(Search::RowidEq { .. }) => None,
             Operation::HashJoin(_) => None,
+            // Multi-index scan uses multiple indexes; return None as there's no single index
+            Operation::MultiIndexScan(_) => None,
         }
     }
 }
