@@ -439,9 +439,9 @@ impl Deterministic for ScalarFunc {
             ScalarFunc::Replace => true,
             #[cfg(feature = "fs")]
             #[cfg(not(target_family = "wasm"))]
-            ScalarFunc::LoadExtension => true,
+            ScalarFunc::LoadExtension => false,
             ScalarFunc::StrfTime => false,
-            ScalarFunc::Printf => false,
+            ScalarFunc::Printf => true,
             ScalarFunc::Likely => true,
             ScalarFunc::TimeDiff => false,
             ScalarFunc::Likelihood => true,
