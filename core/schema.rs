@@ -649,7 +649,7 @@ impl Schema {
         enable_triggers: bool,
     ) -> Result<IOResult<()>> {
         loop {
-            tracing::trace!("make_from_btree: state.phase={:?}", state.phase);
+            tracing::debug!("make_from_btree: state.phase={:?}", state.phase);
             match &state.phase {
                 MakeFromBtreePhase::Init => {
                     assert!(

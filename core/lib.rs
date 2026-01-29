@@ -709,7 +709,7 @@ impl Database {
         encryption_opts: Option<EncryptionOpts>,
     ) -> Result<IOResult<Arc<Database>>> {
         loop {
-            tracing::info!(
+            tracing::debug!(
                 "open_with_flags_bypass_registry_async: state.phase={:?}",
                 state.phase
             );
