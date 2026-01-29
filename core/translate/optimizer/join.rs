@@ -1,3 +1,6 @@
+use std::collections::VecDeque;
+use std::sync::Arc;
+
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use smallvec::SmallVec;
@@ -5,17 +8,22 @@ use smallvec::SmallVec;
 use turso_parser::ast::{Expr, Operator, TableInternalId};
 
 use crate::{
+    schema::{Index, Schema},
     stats::AnalyzeStats,
     translate::{
         expr::{walk_expr, WalkControl},
         optimizer::{
             access_method::{
-                estimate_hash_join_cost, try_hash_join_access_method, AccessMethodParams,
+                consider_multi_index_and_scan, consider_multi_index_scan, estimate_hash_join_cost,
+                try_hash_join_access_method, AccessMethodParams,
             },
             cost::{Cost, RowCountEstimate},
             order::plan_satisfies_order_target,
         },
-        plan::{HashJoinKey, JoinOrderMember, JoinedTable, NonFromClauseSubquery, WhereTerm},
+        plan::{
+            HashJoinKey, JoinOrderMember, JoinedTable, NonFromClauseSubquery, TableReferences,
+            WhereTerm,
+        },
         planner::TableMask,
     },
     LimboError, Result,
@@ -84,6 +92,9 @@ pub fn join_lhs_and_rhs<'a>(
     index_method_candidates: &[IndexMethodCandidate],
     params: &CostModelParams,
     analyze_stats: &AnalyzeStats,
+    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    table_references: &TableReferences,
+    schema: &Schema,
 ) -> Result<Option<JoinN>> {
     // The input cardinality for this join is the output cardinality of the previous join.
     // For example, in a 2-way join, if the left table has 1000 rows, and the right table will return 2 rows for each of the left table's rows,
@@ -139,6 +150,41 @@ pub fn join_lhs_and_rhs<'a>(
     let lhs_cost = lhs.map_or(Cost(0.0), |l| l.cost);
     // If we have a previous table, consider hash join as an alternative
     let mut best_access_method = method;
+
+    // Consider multi-index scan (OR-by-union) as an alternative for BTree tables
+    // Only when accessing a single table (no LHS) and the table has a rowid
+    if lhs.is_none() && rhs_table_reference.btree().is_some_and(|b| b.has_rowid) {
+        if let Some(multi_idx_method) = consider_multi_index_scan(
+            rhs_table_reference,
+            where_clause,
+            available_indexes,
+            table_references,
+            subqueries,
+            schema,
+            input_cardinality as f64,
+            rhs_base_rows,
+            params,
+            best_access_method.cost,
+        ) {
+            best_access_method = multi_idx_method;
+        }
+
+        // Consider multi-index intersection (AND-by-intersection) as an alternative
+        if let Some(multi_idx_and_method) = consider_multi_index_and_scan(
+            rhs_table_reference,
+            where_clause,
+            available_indexes,
+            table_references,
+            subqueries,
+            schema,
+            input_cardinality as f64,
+            rhs_base_rows,
+            params,
+            best_access_method.cost,
+        ) {
+            best_access_method = multi_idx_and_method;
+        }
+    }
 
     // Reuse for both hash cost and output cardinality computation
     let lhs_mask = lhs.map_or_else(TableMask::new, |l| {
@@ -916,6 +962,9 @@ pub fn compute_best_join_order<'a>(
     index_method_candidates: &[IndexMethodCandidate],
     params: &CostModelParams,
     analyze_stats: &AnalyzeStats,
+    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    table_references: &TableReferences,
+    schema: &Schema,
 ) -> Result<Option<BestJoinOrderResult>> {
     // Skip work if we have no tables to consider.
     if joined_tables.is_empty() {
@@ -942,6 +991,9 @@ pub fn compute_best_join_order<'a>(
             index_method_candidates,
             params,
             analyze_stats,
+            available_indexes,
+            table_references,
+            schema,
         );
     }
 
@@ -958,6 +1010,9 @@ pub fn compute_best_join_order<'a>(
         index_method_candidates,
         params,
         analyze_stats,
+        available_indexes,
+        table_references,
+        schema,
     )?;
 
     // Keep track of both 1. the best plan overall (not considering sorting), and 2. the best ordered plan (which might not be the same).
@@ -1039,6 +1094,9 @@ pub fn compute_best_join_order<'a>(
             index_method_candidates,
             params,
             analyze_stats,
+            available_indexes,
+            table_references,
+            schema,
         )?;
         if let Some(rel) = rel {
             best_plan_memo.entry(mask).or_default().insert(i, rel);
@@ -1164,6 +1222,9 @@ pub fn compute_best_join_order<'a>(
                         index_method_candidates,
                         params,
                         analyze_stats,
+                        available_indexes,
+                        table_references,
+                        schema,
                     )?;
                     join_order.clear();
 
@@ -1278,6 +1339,9 @@ pub fn compute_greedy_join_order<'a>(
     index_method_candidates: &[IndexMethodCandidate],
     params: &CostModelParams,
     analyze_stats: &AnalyzeStats,
+    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    table_references: &TableReferences,
+    schema: &Schema,
 ) -> Result<Option<BestJoinOrderResult>> {
     let num_tables = joined_tables.len();
     if num_tables == 0 {
@@ -1329,6 +1393,9 @@ pub fn compute_greedy_join_order<'a>(
         index_method_candidates,
         params,
         analyze_stats,
+        available_indexes,
+        table_references,
+        schema,
     )?;
 
     if current_plan.is_none() {
@@ -1413,6 +1480,9 @@ pub fn compute_greedy_join_order<'a>(
                 index_method_candidates,
                 params,
                 analyze_stats,
+                available_indexes,
+                table_references,
+                schema,
             )? {
                 if best.as_ref().is_none_or(|(_, b)| plan.cost < b.cost) {
                     best = Some((idx, plan));
@@ -1520,6 +1590,9 @@ pub fn compute_naive_left_deep_plan<'a>(
     index_method_candidates: &[IndexMethodCandidate],
     params: &CostModelParams,
     analyze_stats: &AnalyzeStats,
+    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    table_references: &TableReferences,
+    schema: &Schema,
 ) -> Result<Option<JoinN>> {
     let n = joined_tables.len();
     assert!(n > 0);
@@ -1552,6 +1625,9 @@ pub fn compute_naive_left_deep_plan<'a>(
         index_method_candidates,
         params,
         analyze_stats,
+        available_indexes,
+        table_references,
+        schema,
     )?;
     if best_plan.is_none() {
         return Ok(None);
@@ -1576,6 +1652,9 @@ pub fn compute_naive_left_deep_plan<'a>(
             index_method_candidates,
             params,
             analyze_stats,
+            available_indexes,
+            table_references,
+            schema,
         )?;
         if best_plan.is_none() {
             return Ok(None);
@@ -1727,6 +1806,7 @@ mod tests {
         .unwrap();
 
         let base_table_rows = default_base_rows(table_references.joined_tables().len());
+        let schema = empty_schema();
         let result = compute_best_join_order(
             table_references.joined_tables(),
             None,
@@ -1738,6 +1818,9 @@ mod tests {
             &[],
             &DEFAULT_PARAMS,
             &AnalyzeStats::default(),
+            &available_indexes,
+            &table_references,
+            &schema,
         )
         .unwrap();
         assert!(result.is_none());
@@ -1771,6 +1854,7 @@ mod tests {
         // SELECT * from test_table
         // expecting best_best_plan() not to do any work due to empty where clause.
         let base_table_rows = default_base_rows(table_references.joined_tables().len());
+        let schema = empty_schema();
         let BestJoinOrderResult { best_plan, .. } = compute_best_join_order(
             table_references.joined_tables(),
             None,
@@ -1782,6 +1866,9 @@ mod tests {
             &[],
             &DEFAULT_PARAMS,
             &AnalyzeStats::default(),
+            &available_indexes,
+            &table_references,
+            &schema,
         )
         .unwrap()
         .unwrap();
@@ -1825,6 +1912,7 @@ mod tests {
         // SELECT * FROM test_table WHERE id = 42
         // expecting a RowidEq access method because id is a rowid alias.
         let base_table_rows = default_base_rows(table_references.joined_tables().len());
+        let schema = empty_schema();
         let result = compute_best_join_order(
             table_references.joined_tables(),
             None,
@@ -1836,6 +1924,9 @@ mod tests {
             &[],
             &DEFAULT_PARAMS,
             &AnalyzeStats::default(),
+            &available_indexes,
+            &table_references,
+            &schema,
         )
         .unwrap();
         assert!(result.is_some());
@@ -1907,6 +1998,7 @@ mod tests {
         // SELECT * FROM test_table WHERE id = 42
         // expecting an IndexScan access method because id is a primary key with an index
         let base_table_rows = default_base_rows(table_references.joined_tables().len());
+        let schema = empty_schema();
         let result = compute_best_join_order(
             table_references.joined_tables(),
             None,
@@ -1918,6 +2010,9 @@ mod tests {
             &[],
             &DEFAULT_PARAMS,
             &AnalyzeStats::default(),
+            &available_indexes,
+            &table_references,
+            &schema,
         )
         .unwrap();
         assert!(result.is_some());
@@ -2000,6 +2095,7 @@ mod tests {
         .unwrap();
 
         let base_table_rows = default_base_rows(table_references.joined_tables().len());
+        let schema = empty_schema();
         let result = compute_best_join_order(
             table_references.joined_tables(),
             None,
@@ -2011,6 +2107,9 @@ mod tests {
             &[],
             &DEFAULT_PARAMS,
             &AnalyzeStats::default(),
+            &available_indexes,
+            &table_references,
+            &schema,
         )
         .unwrap();
         assert!(result.is_some());
@@ -2194,6 +2293,7 @@ mod tests {
         .unwrap();
 
         let base_table_rows = default_base_rows(table_references.joined_tables().len());
+        let schema = empty_schema();
         let result = compute_best_join_order(
             table_references.joined_tables(),
             None,
@@ -2205,6 +2305,9 @@ mod tests {
             &[],
             &DEFAULT_PARAMS,
             &AnalyzeStats::default(),
+            &available_indexes,
+            &table_references,
+            &schema,
         )
         .unwrap();
         assert!(result.is_some());
@@ -2316,6 +2419,7 @@ mod tests {
         .unwrap();
 
         let base_table_rows = default_base_rows(table_references.joined_tables().len());
+        let schema = empty_schema();
         let BestJoinOrderResult { best_plan, .. } = compute_best_join_order(
             table_references.joined_tables(),
             None,
@@ -2327,6 +2431,9 @@ mod tests {
             &[],
             &DEFAULT_PARAMS,
             &AnalyzeStats::default(),
+            &available_indexes,
+            &table_references,
+            &schema,
         )
         .unwrap()
         .unwrap();
@@ -2435,6 +2542,7 @@ mod tests {
         .unwrap();
 
         let base_table_rows = default_base_rows(table_references.joined_tables().len());
+        let schema = empty_schema();
         let result = compute_best_join_order(
             table_references.joined_tables(),
             None,
@@ -2446,6 +2554,9 @@ mod tests {
             &[],
             &DEFAULT_PARAMS,
             &AnalyzeStats::default(),
+            &available_indexes,
+            &table_references,
+            &schema,
         )
         .unwrap();
         assert!(result.is_some());
@@ -2533,6 +2644,7 @@ mod tests {
 
         // Run the optimizer
         let base_table_rows = default_base_rows(table_references.joined_tables().len());
+        let schema = empty_schema();
         let BestJoinOrderResult { best_plan, .. } = compute_best_join_order(
             table_references.joined_tables(),
             None,
@@ -2544,6 +2656,9 @@ mod tests {
             &[],
             &DEFAULT_PARAMS,
             &AnalyzeStats::default(),
+            &available_indexes,
+            &table_references,
+            &schema,
         )
         .unwrap()
         .unwrap();
@@ -2671,6 +2786,7 @@ mod tests {
         .unwrap();
 
         let base_table_rows = default_base_rows(table_references.joined_tables().len());
+        let schema = empty_schema();
         let BestJoinOrderResult { best_plan, .. } = compute_best_join_order(
             table_references.joined_tables(),
             None,
@@ -2682,6 +2798,9 @@ mod tests {
             &[],
             &DEFAULT_PARAMS,
             &AnalyzeStats::default(),
+            &available_indexes,
+            &table_references,
+            &schema,
         )
         .unwrap()
         .unwrap();
@@ -2798,6 +2917,7 @@ mod tests {
         .unwrap();
 
         let base_table_rows = default_base_rows(table_references.joined_tables().len());
+        let schema = empty_schema();
         let BestJoinOrderResult { best_plan, .. } = compute_best_join_order(
             table_references.joined_tables(),
             None,
@@ -2809,6 +2929,9 @@ mod tests {
             &[],
             &DEFAULT_PARAMS,
             &AnalyzeStats::default(),
+            &available_indexes,
+            &table_references,
+            &schema,
         )
         .unwrap()
         .unwrap();
@@ -2943,6 +3066,7 @@ mod tests {
         .unwrap();
 
         let base_table_rows = default_base_rows(table_references.joined_tables().len());
+        let schema = empty_schema();
         let BestJoinOrderResult { best_plan, .. } = compute_best_join_order(
             table_references.joined_tables(),
             None,
@@ -2954,6 +3078,9 @@ mod tests {
             &[],
             &DEFAULT_PARAMS,
             &AnalyzeStats::default(),
+            &available_indexes,
+            &table_references,
+            &schema,
         )
         .unwrap()
         .unwrap();
@@ -3159,6 +3286,7 @@ mod tests {
         .unwrap();
 
         let base_table_rows = default_base_rows(table_references.joined_tables().len());
+        let schema = empty_schema();
         let result = compute_best_join_order(
             table_references.joined_tables(),
             None,
@@ -3170,6 +3298,9 @@ mod tests {
             &[],
             &DEFAULT_PARAMS,
             &AnalyzeStats::default(),
+            &available_indexes,
+            &table_references,
+            &schema,
         )
         .unwrap();
         assert!(result.is_some());

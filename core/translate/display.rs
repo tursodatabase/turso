@@ -13,7 +13,7 @@ use crate::{schema::Table, translate::plan::TableReferences};
 
 use super::plan::{
     Aggregate, DeletePlan, JoinedTable, Operation, Plan, ResultSetColumn, Scan, Search, SelectPlan,
-    UpdatePlan,
+    SetOperation, UpdatePlan,
 };
 
 impl Display for Aggregate {
@@ -155,6 +155,28 @@ impl Display for SelectPlan {
                 Operation::HashJoin(_) => {
                     writeln!(f, "{indent}HASH JOIN")?;
                 }
+                Operation::MultiIndexScan(multi_idx) => {
+                    let index_names: Vec<&str> = multi_idx
+                        .branches
+                        .iter()
+                        .map(|b| {
+                            b.index
+                                .as_ref()
+                                .map(|i| i.name.as_str())
+                                .unwrap_or("PRIMARY KEY")
+                        })
+                        .collect();
+                    let op_name = match multi_idx.set_op {
+                        SetOperation::Union => "MULTI-INDEX OR",
+                        SetOperation::Intersection => "MULTI-INDEX AND",
+                    };
+                    writeln!(
+                        f,
+                        "{indent}{op_name} {} ({}) ",
+                        reference.identifier,
+                        index_names.join(", ")
+                    )?;
+                }
             }
         }
         Ok(())
@@ -231,6 +253,28 @@ impl Display for DeletePlan {
                 }
                 Operation::HashJoin(_) => {
                     unreachable!("Delete plan should not have hash joins");
+                }
+                Operation::MultiIndexScan(multi_idx) => {
+                    let index_names: Vec<&str> = multi_idx
+                        .branches
+                        .iter()
+                        .map(|b| {
+                            b.index
+                                .as_ref()
+                                .map(|i| i.name.as_str())
+                                .unwrap_or("PRIMARY KEY")
+                        })
+                        .collect();
+                    let op_name = match multi_idx.set_op {
+                        SetOperation::Union => "MULTI-INDEX OR",
+                        SetOperation::Intersection => "MULTI-INDEX AND",
+                    };
+                    writeln!(
+                        f,
+                        "{indent}{op_name} {} ({})",
+                        reference.identifier,
+                        index_names.join(", ")
+                    )?;
                 }
             }
         }
@@ -321,6 +365,9 @@ impl fmt::Display for UpdatePlan {
                 }
                 Operation::HashJoin(_) => {
                     unreachable!("Update plan should not have hash joins");
+                }
+                Operation::MultiIndexScan(_) => {
+                    unreachable!("Update plan should not have multi-index scans");
                 }
             }
         }
