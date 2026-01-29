@@ -1017,3 +1017,65 @@ fn test_readonly_mvcc_db_can_be_read() {
         "Readonly MVCC DB header should NOT be modified (read_version should stay 255), got {read_ver}"
     );
 }
+
+/// Read text encoding from database header (offset 56, 4-byte big-endian integer)
+fn read_text_encoding(db_path: &Path) -> u32 {
+    let bytes = std::fs::read(db_path).expect("Failed to read database file");
+    assert!(
+        bytes.len() >= 60,
+        "Database file too small for encoding check"
+    );
+    // Text encoding is at offset 56, 4-byte big-endian
+    u32::from_be_bytes([bytes[56], bytes[57], bytes[58], bytes[59]])
+}
+
+/// Create a UTF-16LE encoded database using rusqlite
+fn create_utf16le_db(db_path: &Path) {
+    let conn = rusqlite::Connection::open(db_path).unwrap();
+    conn.pragma_update(None, "encoding", "UTF-16le").unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)", ())
+        .unwrap();
+    conn.execute("INSERT INTO t (val) VALUES ('test')", ())
+        .unwrap();
+    drop(conn);
+
+    // Verify it's UTF-16LE encoding (value 2)
+    let encoding = read_text_encoding(db_path);
+    assert_eq!(encoding, 2, "Expected UTF-16le encoding=2, got {encoding}");
+}
+
+/// Test that opening a UTF-16 encoded database returns UnsupportedEncoding error
+#[test]
+fn test_utf16_db_returns_unsupported_encoding_error() {
+    let tmp_dir = TempDir::new().unwrap();
+    let db_path = tmp_dir.path().join("test.db");
+
+    // Create a UTF-16LE encoded database
+    create_utf16le_db(&db_path);
+
+    let io = std::sync::Arc::new(turso_core::PlatformIO::new().unwrap());
+    let opts = DatabaseOpts::new();
+
+    // Try to open with Turso - this should fail with UnsupportedEncoding error
+    let result = Database::open_file_with_flags(
+        io.clone(),
+        db_path.to_str().unwrap(),
+        OpenFlags::default(),
+        opts,
+        None,
+    );
+
+    // Verify the error is UnsupportedEncoding
+    assert!(
+        matches!(result, Err(turso_core::LimboError::UnsupportedEncoding(_))),
+        "Opening UTF-16 database should return UnsupportedEncoding error, got: {result:?}"
+    );
+
+    // Verify the error message mentions UTF-16le
+    if let Err(turso_core::LimboError::UnsupportedEncoding(msg)) = result {
+        assert!(
+            msg.contains("UTF-16le"),
+            "Error message should mention UTF-16le encoding, got: {msg}"
+        );
+    }
+}

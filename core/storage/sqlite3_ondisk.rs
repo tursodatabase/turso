@@ -253,6 +253,10 @@ impl TextEncoding {
     pub const Utf8: Self = Self(U32BE::new(1));
     pub const Utf16Le: Self = Self(U32BE::new(2));
     pub const Utf16Be: Self = Self(U32BE::new(3));
+
+    pub fn is_utf8(&self) -> bool {
+        *self == Self::Utf8
+    }
 }
 
 impl std::fmt::Display for TextEncoding {
