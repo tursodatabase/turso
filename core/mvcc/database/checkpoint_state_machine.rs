@@ -1170,14 +1170,32 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                         };
                         let btree_table = Arc::make_mut(btree_table);
                         if btree_table.root_page < 0 {
-                            btree_table.root_page = btree_table.root_page.abs();
+                            let table_id = MVTableId::from(btree_table.root_page);
+                            let entry = self.mvstore.table_id_to_rootpage.get(&table_id).expect(
+                                "we should have checkpointed table with table_id {table_id:?}",
+                            );
+                            let value = entry
+                                .value()
+                                .expect("table with id {table_id:?} should have a mapping");
+                            btree_table.root_page = value as i64;
                         }
                     }
                     for table_index_list in schema.indexes.values_mut() {
                         for index in table_index_list.iter_mut() {
                             if index.root_page < 0 {
+                                let table_id = MVTableId::from(index.root_page);
+                                let entry = self
+                                    .mvstore
+                                    .table_id_to_rootpage
+                                    .get(&table_id)
+                                    .expect(
+                                    "we should have checkpointed index with table_id {table_id:?}",
+                                );
+                                let value = entry
+                                    .value()
+                                    .expect("index with id {table_id:?} should have a mapping");
                                 let index = Arc::make_mut(index);
-                                index.root_page = index.root_page.abs();
+                                index.root_page = value as i64;
                             }
                         }
                     }
