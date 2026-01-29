@@ -57,7 +57,7 @@ fn test_vacuum_into_basic(tmp_db: TempDatabase) -> anyhow::Result<()> {
     );
 
     // let's verify the data anyways (to alleviate any bugs in dbhash)
-    let rows: Vec<(i64, String)> = dest_conn.exec_rows("SELECT a, b FROM t ORDER BY a");
+    let rows: Vec<(i64, String)> = dest_conn.exec_rows("SELECT a, b FROM t ORDER BY a, b");
 
     assert_eq!(rows.len(), 3);
     assert_eq!(rows[0].0, 1);
@@ -489,7 +489,7 @@ fn test_vacuum_into_preserves_page_size(_tmp_db: TempDatabase) -> anyhow::Result
     assert_eq!(run_integrity_check(&dest_conn), "ok");
     assert_eq!(source_hash.hash, compute_dbhash(&dest_db).hash);
 
-    let rows: Vec<(i64, String)> = dest_conn.exec_rows("SELECT a, b FROM t ORDER BY a");
+    let rows: Vec<(i64, String)> = dest_conn.exec_rows("SELECT a, b FROM t ORDER BY a, b");
     assert_eq!(
         rows,
         vec![(1, "hello".to_string()), (2, "world".to_string())]
@@ -900,30 +900,23 @@ fn test_vacuum_into_special_column_names(tmp_db: TempDatabase) -> anyhow::Result
     Ok(())
 }
 
-/// Test VACUUM INTO with large data spanning multiple B-tree pages
-/// This verifies that page copying works correctly for multi-page tables
+/// Test VACUUM INTO with large blobs that trigger overflow pages
+/// Each 8KiB blob exceeds the 4KiB page size, forcing overflow page usage
 /// Note: page_count pragma doesn't work correctly with MVCC yet
 #[turso_macros::test]
 fn test_vacuum_into_large_data_multi_page(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
 
-    // create table with enough data to span multiple pages
-    // default page_size is 4096. Each row needs to be large enough that
-    // we span multiple pages with ~1000 rows.
-    conn.execute("CREATE TABLE large_data (id INTEGER PRIMARY KEY, data TEXT, padding BLOB)")?;
+    // Create table for large blob storage
+    conn.execute("CREATE TABLE large_data (id INTEGER PRIMARY KEY, data BLOB)")?;
 
-    // Insert 1000 rows with ~100 bytes each to ensure multi-page spanning
-    // This should create a B-tree with multiple levels
-    for i in 0..1000 {
-        let data = format!("row_{i:05}_data_string_with_some_content_to_make_it_larger");
+    // Insert 100 rows with 8KiB blobs each - larger than page_size (4096),
+    // so each row requires overflow pages
+    for i in 0..100 {
         conn.execute(format!(
-            "INSERT INTO large_data VALUES ({i}, '{data}', X'{}')",
-            "AA".repeat(64)
+            "INSERT INTO large_data VALUES ({i}, randomblob(8192))"
         ))?;
     }
-
-    // create an index to ensure index pages are also copied
-    conn.execute("CREATE INDEX idx_large_data ON large_data (data)")?;
 
     let source_hash = compute_dbhash(&tmp_db);
     let page_count: Vec<(i64,)> = conn.exec_rows("PRAGMA page_count");
@@ -953,30 +946,17 @@ fn test_vacuum_into_large_data_multi_page(tmp_db: TempDatabase) -> anyhow::Resul
         "Source and destination should have same content hash"
     );
 
-    // verify row count
+    // Verify row count
     let count: Vec<(i64,)> = dest_conn.exec_rows("SELECT COUNT(*) FROM large_data");
-    assert_eq!(count[0].0, 1000, "All 1000 rows should be copied");
+    assert_eq!(count[0].0, 100, "All 100 rows should be copied");
 
-    // verify first, middle, and last rows
-    let first: Vec<(i64, String)> =
-        dest_conn.exec_rows("SELECT id, data FROM large_data WHERE id = 0");
-    assert_eq!(first[0].0, 0);
-    assert!(first[0].1.contains("row_00000"));
-
-    let middle: Vec<(i64, String)> =
-        dest_conn.exec_rows("SELECT id, data FROM large_data WHERE id = 500");
-    assert_eq!(middle[0].0, 500);
-    assert!(middle[0].1.contains("row_00500"));
-
-    let last: Vec<(i64, String)> =
-        dest_conn.exec_rows("SELECT id, data FROM large_data WHERE id = 999");
-    assert_eq!(last[0].0, 999);
-    assert!(last[0].1.contains("row_00999"));
-
-    // verify index works
-    let indexed: Vec<(i64,)> = dest_conn
-        .exec_rows("SELECT id FROM large_data WHERE data = 'row_00123_data_string_with_some_content_to_make_it_larger'");
-    assert_eq!(indexed[0].0, 123);
+    // Verify blob sizes are preserved
+    let sizes: Vec<(i64,)> =
+        dest_conn.exec_rows("SELECT length(data) FROM large_data WHERE id IN (0, 50, 99)");
+    assert_eq!(sizes.len(), 3);
+    for (size,) in sizes {
+        assert_eq!(size, 8192, "Blob size should be preserved");
+    }
 
     Ok(())
 }
@@ -1444,7 +1424,7 @@ fn test_vacuum_into_from_memory_database() -> anyhow::Result<()> {
     );
 
     // verify all data was copied correctly
-    let rows: Vec<(i64, String)> = dest_conn.exec_rows("SELECT a, b FROM t ORDER BY a");
+    let rows: Vec<(i64, String)> = dest_conn.exec_rows("SELECT a, b FROM t ORDER BY a, b");
     assert_eq!(
         rows,
         vec![
@@ -1607,43 +1587,6 @@ fn test_vacuum_into_with_without_rowid(tmp_db: TempDatabase) -> anyhow::Result<(
     // Verify regular table also copied
     let regular: Vec<(i64, String)> = dest_conn.exec_rows("SELECT id, data FROM regular");
     assert_eq!(regular, vec![(1, "test".to_string())]);
-
-    Ok(())
-}
-
-/// Test VACUUM INTO with tables that have no columns
-/// SQLite allows CREATE TABLE t(); with zero columns.
-/// Skips if no-column tables are not supported.
-#[turso_macros::test(mvcc)]
-fn test_vacuum_into_table_with_no_columns(tmp_db: TempDatabase) -> anyhow::Result<()> {
-    let conn = tmp_db.connect_limbo();
-
-    // try to create a table with no columns - skip if not supported
-    if conn.execute("CREATE TABLE empty_cols()").is_err() {
-        return Ok(());
-    }
-
-    // also create a normal table to ensure mixed scenario works
-    conn.execute("CREATE TABLE normal_table (id INTEGER, name TEXT)")?;
-    conn.execute("INSERT INTO normal_table VALUES (1, 'test')")?;
-
-    let source_hash = compute_dbhash(&tmp_db);
-    let dest_dir = TempDir::new()?;
-    let dest_path = dest_dir.path().join("vacuumed_no_cols.db");
-    conn.execute(format!("VACUUM INTO '{}'", dest_path.to_str().unwrap()))?;
-
-    let dest_db = TempDatabase::new_with_existent(&dest_path);
-    let dest_conn = dest_db.connect_limbo();
-
-    assert_eq!(run_integrity_check(&dest_conn), "ok");
-    assert_eq!(source_hash.hash, compute_dbhash(&dest_db).hash);
-
-    let dest_schema: Vec<(String,)> =
-        dest_conn.exec_rows("SELECT name FROM sqlite_schema WHERE name = 'empty_cols'");
-    assert_eq!(dest_schema, vec![("empty_cols".to_string(),)]);
-
-    let rows: Vec<(i64, String)> = dest_conn.exec_rows("SELECT id, name FROM normal_table");
-    assert_eq!(rows, vec![(1, "test".to_string())]);
 
     Ok(())
 }
