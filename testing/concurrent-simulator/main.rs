@@ -1,4 +1,6 @@
 /// Whopper CLI - The Turso deterministic simulator
+use std::path::PathBuf;
+
 use clap::Parser;
 use rand::{Rng, RngCore};
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
@@ -28,6 +30,12 @@ struct Args {
     /// Enable database encryption
     #[arg(long)]
     enable_encryption: bool,
+    /// Enable Elle history recording for transactional consistency checking
+    #[arg(long)]
+    enable_elle: bool,
+    /// Output path for Elle history EDN file
+    #[arg(long, default_value = "elle-history.edn")]
+    elle_output: String,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -96,6 +104,17 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
+    // Print Elle analysis instructions if enabled
+    if args.enable_elle {
+        let output_path = &args.elle_output;
+        println!("\nElle history exported to: {output_path}");
+        println!("\nTo analyze with elle-cli:");
+        println!(
+            "  clojure -Sdeps '{{:deps {{elle-cli/elle-cli {{:mvn/version \"0.2.1\"}}}}}}' \\"
+        );
+        println!("    -M -m elle-cli.core --model list-append {output_path}");
+    }
+
     Ok(())
 }
 
@@ -111,35 +130,55 @@ fn build_opts(args: &Args, seed: u64) -> anyhow::Result<WhopperOpts> {
         base_opts = base_opts.with_max_steps(max_steps);
     }
 
-    Ok(base_opts
+    // Build workloads list
+    let mut workloads: Vec<(u32, Box<dyn Workload>)> = vec![
+        // Idle-only workloads
+        (10, Box::new(IntegrityCheckWorkload)),
+        (5, Box::new(WalCheckpointWorkload)),
+        (10, Box::new(CreateSimpleTableWorkload)),
+        (20, Box::new(SimpleSelectWorkload)),
+        (20, Box::new(SimpleInsertWorkload)),
+        // DML workloads (work in both Idle and InTx)
+        // (1, Box::new(SelectWorkload)),
+        // (30, Box::new(InsertWorkload)),
+        // (20, Box::new(UpdateWorkload)),
+        // (10, Box::new(DeleteWorkload)),
+        (2, Box::new(CreateIndexWorkload)),
+        (2, Box::new(DropIndexWorkload)),
+        // InTx-only workloads
+        (30, Box::new(BeginWorkload)),
+        (10, Box::new(CommitWorkload)),
+        (10, Box::new(RollbackWorkload)),
+    ];
+
+    // Build properties list
+    let mut properties: Vec<Box<dyn Property>> = vec![
+        Box::new(IntegrityCheckProperty),
+        Box::new(SimpleKeysDoNotDisappear::new()),
+    ];
+
+    // Add Elle workloads and property if enabled
+    if args.enable_elle {
+        // Add Elle workloads
+        workloads.push((10, Box::new(CreateElleTableWorkload)));
+        workloads.push((30, Box::new(ElleAppendWorkload::new())));
+        workloads.push((20, Box::new(ElleReadWorkload)));
+
+        // Create Elle history recorder (writes incrementally to file)
+        let output_path = PathBuf::from(&args.elle_output);
+        properties.push(Box::new(ElleHistoryRecorder::new(output_path)));
+    }
+
+    let opts = base_opts
         .with_seed(seed)
         .with_max_connections(args.max_connections)
         .with_keep_files(args.keep)
         .with_enable_mvcc(args.enable_mvcc)
         .with_enable_encryption(args.enable_encryption)
-        .with_workloads(vec![
-            // Idle-only workloads
-            (10, Box::new(IntegrityCheckWorkload)),
-            (5, Box::new(WalCheckpointWorkload)),
-            (10, Box::new(CreateSimpleTableWorkload)),
-            (20, Box::new(SimpleSelectWorkload)),
-            (20, Box::new(SimpleInsertWorkload)),
-            // DML workloads (work in both Idle and InTx)
-            // (1, Box::new(SelectWorkload)),
-            // (30, Box::new(InsertWorkload)),
-            // (20, Box::new(UpdateWorkload)),
-            // (10, Box::new(DeleteWorkload)),
-            (2, Box::new(CreateIndexWorkload)),
-            (2, Box::new(DropIndexWorkload)),
-            // InTx-only workloads
-            (30, Box::new(BeginWorkload)),
-            (10, Box::new(CommitWorkload)),
-            (10, Box::new(RollbackWorkload)),
-        ])
-        .with_properties(vec![
-            Box::new(IntegrityCheckProperty),
-            Box::new(SimpleKeysDoNotDisappear::new()),
-        ]))
+        .with_workloads(workloads)
+        .with_properties(properties);
+
+    Ok(opts)
 }
 
 fn init_logger() {

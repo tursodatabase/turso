@@ -18,6 +18,7 @@ use turso_core::{
 };
 use turso_parser::ast::{ColumnConstraint, SortOrder};
 
+pub mod elle;
 mod io;
 mod operations;
 pub mod properties;
@@ -338,6 +339,8 @@ pub struct SimulatorState {
     pub simple_tables: MergableMap<String, ()>,
     /// Sample of inserted keys per table for use in selects
     pub simple_tables_keys: HashMap<String, SamplesContainer<String>>,
+    /// Elle tables for consistency checking
+    pub elle_tables: MergableMap<String, ()>,
     /// Counter for generating unique execution IDs
     pub execution_id: u64,
     /// Counter for generating unique transaction IDs
@@ -359,6 +362,7 @@ impl SimulatorState {
             indexes: index_map,
             simple_tables: MergableMap::new(),
             simple_tables_keys: HashMap::new(),
+            elle_tables: MergableMap::new(),
             execution_id: 0,
             txn_id: 0,
         }
