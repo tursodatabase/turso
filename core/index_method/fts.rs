@@ -1,3 +1,4 @@
+use crate::sync::Arc;
 use crate::{
     index_method::{
         parse_patterns, IndexMethod, IndexMethodAttachment, IndexMethodConfiguration,
@@ -16,12 +17,11 @@ use crate::{
     Connection, LimboError, Result, Value,
 };
 use parking_lot::RwLock;
-use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::io::{BufWriter, Write};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::{cell::RefCell, sync::atomic::Ordering};
 use tantivy::{
     directory::{
         error::{DeleteError, OpenReadError, OpenWriteError},
@@ -87,7 +87,7 @@ pub fn fts_highlight(text: &str, query: &str, before_tag: &str, after_tag: &str)
 
         // Extract query terms (lowercased)
         let query_terms: HashSet<String> = {
-            let mut terms = HashSet::new();
+            let mut terms = HashSet::default();
             let mut query_stream = tokenizer.token_stream(query);
             while let Some(token) = query_stream.next() {
                 terms.insert(token.text.to_string());
@@ -166,7 +166,7 @@ pub fn fts_match(text: &str, query: &str) -> bool {
 
         // Extract query terms (lowercased)
         let query_terms: HashSet<String> = {
-            let mut terms = HashSet::new();
+            let mut terms = HashSet::default();
             let mut query_stream = tokenizer.token_stream(query);
             while let Some(token) = query_stream.next() {
                 terms.insert(token.text.to_string());
@@ -307,7 +307,7 @@ impl<K: Eq + std::hash::Hash + Clone> LruCache<K> {
             inner: RwLock::new(LruCacheInner {
                 current_size: 0,
                 clock: 0,
-                entries: HashMap::new(),
+                entries: HashMap::default(),
             }),
         }
     }
@@ -554,8 +554,8 @@ impl HybridBTreeDirectory {
             hot_cache: Arc::clone(&self.hot_cache),
             chunk_cache: Arc::clone(&self.chunk_cache),
             // Fresh pending state - not shared with cache
-            pending_writes: Arc::new(RwLock::new(HashMap::new())),
-            flushing_writes: Arc::new(RwLock::new(HashMap::new())),
+            pending_writes: Arc::new(RwLock::new(HashMap::default())),
+            flushing_writes: Arc::new(RwLock::new(HashMap::default())),
             pending_deletes: Arc::new(RwLock::new(Vec::new())),
             pager: Arc::clone(&self.pager),
             btree_root_page: self.btree_root_page,
@@ -584,8 +584,8 @@ impl HybridBTreeDirectory {
                 hot_files,
             )),
             chunk_cache: Arc::new(LruCache::<ChunkKey>::new(chunk_cache_capacity)),
-            pending_writes: Arc::new(RwLock::new(HashMap::new())),
-            flushing_writes: Arc::new(RwLock::new(HashMap::new())),
+            pending_writes: Arc::new(RwLock::new(HashMap::default())),
+            flushing_writes: Arc::new(RwLock::new(HashMap::default())),
             pending_deletes: Arc::new(RwLock::new(Vec::new())),
             pager,
             btree_root_page,
@@ -1210,15 +1210,14 @@ fn name(name: impl ToString) -> ast::Name {
 /// Parse field weights from a string like "body=2.0,title=1.0"
 /// Returns a HashMap mapping column names to tantivy 'boost factors'
 fn parse_field_weights(weights_str: &str, columns: &[IndexColumn]) -> Result<HashMap<String, f32>> {
-    let mut weights = HashMap::new();
+    let mut weights = HashMap::default();
 
     if weights_str.is_empty() {
         return Ok(weights);
     }
 
     // Get valid column names for validation
-    let valid_columns: std::collections::HashSet<&str> =
-        columns.iter().map(|c| c.name.as_str()).collect();
+    let valid_columns: HashSet<&str> = columns.iter().map(|c| c.name.as_str()).collect();
 
     // Parse format: "col1=1.5,col2=2.0"
     for part in weights_str.split(',') {
@@ -1370,7 +1369,7 @@ impl FtsIndexAttachment {
             };
             parse_field_weights(&weights_str, &cfg.columns)?
         } else {
-            HashMap::new()
+            HashMap::default()
         };
 
         // Build Tantivy schema (no Directory or Index creation yet)
@@ -1576,7 +1575,10 @@ fn initialize_btree_storage_table(conn: &Arc<Connection>, table_name: &str) -> R
     {
         conn.start_nested();
         let mut stmt = conn.prepare_stmt(create_table_stmt)?;
-        stmt.program.needs_stmt_subtransactions = false;
+        stmt.program
+            .prepared
+            .needs_stmt_subtransactions
+            .store(false, Ordering::Relaxed);
         let res = stmt.run_ignore_rows();
         conn.end_nested();
         res?;
@@ -1584,7 +1586,10 @@ fn initialize_btree_storage_table(conn: &Arc<Connection>, table_name: &str) -> R
     {
         conn.start_nested();
         let mut stmt = conn.prepare_stmt(create_index_stmt)?;
-        stmt.program.needs_stmt_subtransactions = false;
+        stmt.program
+            .prepared
+            .needs_stmt_subtransactions
+            .store(false, Ordering::Relaxed);
         let res = stmt.run_ignore_rows();
         conn.end_nested();
         res?;
@@ -2525,7 +2530,10 @@ impl IndexMethodCursor for FtsCursor {
         conn.start_nested();
         let mut stmt = conn.prepare_stmt(drop_table_ast)?;
         // Disable subtransactions since we're already inside a transaction from the parent DROP INDEX
-        stmt.program.needs_stmt_subtransactions = false;
+        stmt.program
+            .prepared
+            .needs_stmt_subtransactions
+            .store(false, Ordering::Relaxed);
         let result = stmt.run_ignore_rows();
         conn.end_nested();
         result?;
@@ -2575,7 +2583,7 @@ impl IndexMethodCursor for FtsCursor {
                     return_if_io!(cursor.rewind());
                     // Use catalog-first loading for HybridBTreeDirectory
                     self.state = FtsState::LoadingCatalog {
-                        catalog_builder: HashMap::new(),
+                        catalog_builder: HashMap::default(),
                         current_path: None,
                     };
                 }
@@ -2589,7 +2597,7 @@ impl IndexMethodCursor for FtsCursor {
 
                     if !cursor.has_record() {
                         // Done scanning - build catalog and identify files to preload
-                        let mut catalog = HashMap::new();
+                        let mut catalog = HashMap::default();
                         let mut files_to_load = Vec::new();
 
                         for (path, chunks) in catalog_builder.drain() {
@@ -2623,7 +2631,7 @@ impl IndexMethodCursor for FtsCursor {
                             pager,
                             root_page,
                             catalog,
-                            HashMap::new(), // Will be filled in PreloadingEssentials
+                            HashMap::default(), // Will be filled in PreloadingEssentials
                             DEFAULT_HOT_CACHE_BYTES,
                             DEFAULT_CHUNK_CACHE_BYTES,
                         );
@@ -2635,7 +2643,7 @@ impl IndexMethodCursor for FtsCursor {
                         } else {
                             self.state = FtsState::PreloadingEssentials {
                                 files_to_load,
-                                loaded_files: HashMap::new(),
+                                loaded_files: HashMap::default(),
                                 current_loading: None,
                                 current_chunks: Vec::new(),
                             };
@@ -3057,7 +3065,7 @@ impl IndexMethodCursor for FtsCursor {
 
         // Group results by segment for efficient fast field access.
         // This avoids creating a new fast field reader for each document.
-        let mut by_segment: HashMap<u32, Vec<(f32, tantivy::DocAddress)>> = HashMap::new();
+        let mut by_segment: HashMap<u32, Vec<(f32, tantivy::DocAddress)>> = HashMap::default();
         for (score, doc_addr) in top_docs {
             by_segment
                 .entry(doc_addr.segment_ord)

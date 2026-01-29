@@ -224,6 +224,7 @@ turso_status_code_t turso_statement_run_io(const turso_statement_t *self, const 
 turso_status_code_t turso_statement_reset(const turso_statement_t *self, const char **error_opt_out);
 
 /** Finalize a statement
+ * finalize returns TURSO_DONE if finalization completed
  * This method must be called in the end of statement execution (either successfull or not)
  */
 turso_status_code_t turso_statement_finalize(const turso_statement_t *self, const char **error_opt_out);
@@ -238,6 +239,12 @@ int64_t turso_statement_column_count(const turso_statement_t *self);
  * C string allocated by Turso must be freed after the usage with corresponding turso_str_deinit(...) method
  */
 const char *turso_statement_column_name(const turso_statement_t *self, size_t index);
+
+/** Get the column declared type at the index (e.g. "INTEGER", "TEXT", "DATETIME", etc.)
+ * Returns NULL if the column type is not available.
+ * C string allocated by Turso must be freed after the usage with corresponding turso_str_deinit(...) method
+ */
+const char *turso_statement_column_decltype(const turso_statement_t *self, size_t index);
 
 /** Get the row value at the the index for a current statement state
  * SAFETY: returned pointers will be valid only until next invocation of statement operation (step, finalize, reset, etc)

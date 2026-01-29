@@ -223,10 +223,6 @@ test select-with-group-by-and-agg-1 {
 expect {
     276|Zander|47.2777777777778
 }
-# JS shows more decimal places
-expect @js {
-    276|Zander|47.27777777777778
-}
 
 test select-with-group-by-and-agg-2 {
     select first_name, last_name from users where state = 'AL' group by last_name limit 10;
@@ -284,20 +280,6 @@ expect {
 59.7782771700224|{"9":"boots"}
 68.9227440029754|{"4":"sweater"}
 82.9389679823547|{"1":"hat"}
-}
-# JS shows more decimal places for some values
-expect @js {
-8.85709624556419|{"10":"coat"}
-22.720947004847073|{"3":"shirt"}
-23.81005419846484|{"5":"sweatshirt"}
-32.24754104443382|{"2":"cap"}
-36.1006791183673|{"8":"sneakers"}
-47.58756326526571|{"11":"accessories"}
-47.93797996324047|{"7":"jeans"}
-50.03637958241253|{"6":"shorts"}
-59.77827717002245|{"9":"boots"}
-68.92274400297542|{"4":"sweater"}
-82.93896798235465|{"1":"hat"}
 }
 
 test select-json-group-object-no-sorting-required {

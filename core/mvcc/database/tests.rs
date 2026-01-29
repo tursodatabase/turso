@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use rustc_hash::FxHashSet as HashSet;
 
 use super::*;
 use crate::io::PlatformIO;
@@ -1681,7 +1681,7 @@ fn test_cursor_with_btree_and_mvcc_with_backward_cursor_with_delete() {
 fn test_cursor_with_btree_and_mvcc_fuzz() {
     let mut db = MvccTestDbNoConn::new_with_random_db();
     let mut rows_in_db = sorted_vec::SortedVec::new();
-    let mut seen = HashSet::new();
+    let mut seen = HashSet::default();
     let (mut rng, _seed) = rng_from_time_or_env();
     println!("seed: {_seed}");
 
@@ -2406,4 +2406,39 @@ fn test_savepoint_insert_delete_then_fail() {
     let rows = get_rows(&conn, "PRAGMA integrity_check");
     assert_eq!(rows.len(), 1);
     assert_eq!(&rows[0][0].to_string(), "ok");
+}
+
+/// Test DELETE all B-tree rows and re-insert with same IDs in MVCC.
+/// Verifies tombstones correctly shadow B-tree and new rows are visible.
+///
+/// This test was initially failing with "UNIQUE constraint failed: t.id"
+/// Fixed by implementing dual-peek in the exists() method to check MVCC tombstones.
+#[test]
+fn test_mvcc_dual_cursor_delete_all_btree_reinsert() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'old1')").unwrap();
+        conn.execute("INSERT INTO t VALUES (2, 'old2')").unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    }
+
+    db.restart();
+
+    let conn = db.connect();
+    // Delete all B-tree rows
+    conn.execute("DELETE FROM t WHERE id IN (1, 2)").unwrap();
+    // Re-insert with new values
+    conn.execute("INSERT INTO t VALUES (1, 'new1')").unwrap();
+    conn.execute("INSERT INTO t VALUES (2, 'new2')").unwrap();
+
+    // Should see new values, not old B-tree values
+    let rows = get_rows(&conn, "SELECT id, val FROM t ORDER BY id");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0][1].to_string(), "new1");
+    assert_eq!(rows[1][1].to_string(), "new2");
 }

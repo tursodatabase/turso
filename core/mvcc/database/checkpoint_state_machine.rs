@@ -16,7 +16,7 @@ use crate::{
     CheckpointResult, Completion, Connection, IOExt, LimboError, Pager, Result, SyncMode,
     TransactionState, Value, ValueRef,
 };
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::num::NonZeroU64;
 
 #[derive(Debug)]
@@ -188,10 +188,10 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
             write_set: Vec::new(),
             write_row_state_machine: None,
             delete_row_state_machine: None,
-            cursors: HashMap::new(),
-            created_btrees: HashMap::new(),
-            destroyed_tables: HashSet::new(),
-            destroyed_indexes: HashSet::new(),
+            cursors: HashMap::default(),
+            created_btrees: HashMap::default(),
+            destroyed_tables: HashSet::default(),
+            destroyed_indexes: HashSet::default(),
             index_write_set: Vec::new(),
             index_id_to_index,
             checkpoint_result: None,
@@ -485,7 +485,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
 
     /// Fsync the logical log file
     fn fsync_logical_log(&self) -> Result<Completion> {
-        self.mvstore.storage.sync()
+        self.mvstore.storage.sync(self.pager.get_sync_type())
     }
 
     /// Truncate the logical log file
@@ -1102,7 +1102,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                     .expect("checkpoint_result should be set");
 
                 // Only sync if we actually backfilled any frames
-                if checkpoint_result.num_backfilled == 0 {
+                if checkpoint_result.wal_checkpoint_backfilled == 0 {
                     self.state = CheckpointState::TruncateWal;
                     return Ok(TransitionResult::Continue);
                 }
@@ -1114,7 +1114,10 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 }
 
                 tracing::debug!("Fsyncing database file before WAL truncation");
-                let c = self.pager.db_file.sync(Completion::new_sync(|_| {}))?;
+                let c = self
+                    .pager
+                    .db_file
+                    .sync(Completion::new_sync(|_| {}), self.pager.get_sync_type())?;
                 checkpoint_result.db_sync_sent = true;
                 Ok(TransitionResult::Io(IOCompletions::Single(c)))
             }
@@ -1130,7 +1133,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                     .checkpoint_result
                     .as_mut()
                     .expect("checkpoint_result should be set");
-                match wal.truncate_wal(checkpoint_result)? {
+                match wal.truncate_wal(checkpoint_result, self.pager.get_sync_type())? {
                     IOResult::Done(()) => {
                         self.state = CheckpointState::Finalize;
                         Ok(TransitionResult::Continue)

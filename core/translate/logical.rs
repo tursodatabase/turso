@@ -12,7 +12,7 @@ use crate::schema::{Schema, Type};
 use crate::sync::Arc;
 use crate::types::Value;
 use crate::{LimboError, Result};
-use std::collections::HashMap;
+use rustc_hash::FxHashMap as HashMap;
 use std::fmt::{self, Display, Formatter};
 use turso_macros::match_ignore_ascii_case;
 use turso_parser::ast;
@@ -415,7 +415,7 @@ impl<'a> LogicalPlanBuilder<'a> {
     pub fn new(schema: &'a Schema) -> Self {
         Self {
             schema,
-            ctes: HashMap::new(),
+            ctes: HashMap::default(),
         }
     }
 
@@ -450,7 +450,7 @@ impl<'a> LogicalPlanBuilder<'a> {
 
     // Build WITH CTE
     fn build_with_cte(&mut self, with: &ast::With, select: &ast::Select) -> Result<LogicalPlan> {
-        let mut cte_plans = HashMap::new();
+        let mut cte_plans = HashMap::default();
 
         // Build each CTE
         for cte in &with.ctes {
@@ -1158,7 +1158,7 @@ impl<'a> LogicalPlanBuilder<'a> {
         // and a vector of SELECT expressions for positional references
         // This allows GROUP BY to reference SELECT aliases (e.g., GROUP BY year)
         // or positions (e.g., GROUP BY 1)
-        let mut alias_to_expr = HashMap::new();
+        let mut alias_to_expr = HashMap::default();
         let mut select_exprs = Vec::new();
         for col in columns {
             if let ast::ResultColumn::Expr(expr, alias) = col {
@@ -1244,7 +1244,7 @@ impl<'a> LogicalPlanBuilder<'a> {
         }
 
         // Track aggregates we've already seen to avoid duplicates
-        let mut aggregate_map: HashMap<String, String> = HashMap::new();
+        let mut aggregate_map: HashMap<String, String> = HashMap::default();
 
         for col in columns {
             match col {

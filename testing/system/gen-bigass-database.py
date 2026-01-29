@@ -1,10 +1,44 @@
 #!/usr/bin/env python3
+import argparse
 import random
 import sqlite3
 
 from faker import Faker
 
-conn = sqlite3.connect("testing/system/testing-bigass.db")
+parser = argparse.ArgumentParser(description="Generate a test database with configurable size")
+parser.add_argument("--scale", type=float, default=1.0,
+                    help="Scale factor for row counts (default: 1.0)")
+parser.add_argument("--output", type=str, default="testing/system/testing-bigass.db",
+                    help="Output database path")
+parser.add_argument("--users", type=int, default=None, help="Number of users (default: 15000 * scale)")
+parser.add_argument("--products", type=int, default=None, help="Number of products (default: 12000 * scale)")
+parser.add_argument("--orders", type=int, default=None, help="Number of orders (default: 20000 * scale)")
+parser.add_argument("--reviews", type=int, default=None, help="Number of reviews (default: 25000 * scale)")
+parser.add_argument("--inventory", type=int, default=None, help="Number of inventory transactions (default: 18000 * scale)")  # noqa: E501
+parser.add_argument("--tickets", type=int, default=None, help="Number of support tickets (default: 10000 * scale)")
+parser.add_argument("--articles", type=int, default=None, help="Number of articles (default: 10000 * scale)")
+args = parser.parse_args()
+
+# Apply scale factor to defaults
+NUM_USERS = args.users or int(15000 * args.scale)
+NUM_PRODUCTS = args.products or int(12000 * args.scale)
+NUM_ORDERS = args.orders or int(20000 * args.scale)
+NUM_REVIEWS = args.reviews or int(25000 * args.scale)
+NUM_INVENTORY = args.inventory or int(18000 * args.scale)
+NUM_TICKETS = args.tickets or int(10000 * args.scale)
+NUM_ARTICLES = args.articles or int(10000 * args.scale)
+
+print(f"Generating database with scale={args.scale}:")
+print(f"  Users: {NUM_USERS:,}")
+print(f"  Products: {NUM_PRODUCTS:,}")
+print(f"  Orders: {NUM_ORDERS:,}")
+print(f"  Reviews: {NUM_REVIEWS:,}")
+print(f"  Inventory: {NUM_INVENTORY:,}")
+print(f"  Tickets: {NUM_TICKETS:,}")
+print(f"  Articles: {NUM_ARTICLES:,}")
+print()
+
+conn = sqlite3.connect(args.output)
 cursor = conn.cursor()
 
 fake = Faker()
@@ -50,7 +84,7 @@ cursor.execute("INSERT INTO products VALUES(9,'boots',1.0);")
 cursor.execute("INSERT INTO products VALUES(10,'coat',33.0);")
 cursor.execute("INSERT INTO products VALUES(11,'accessories',81.0);")
 
-for i in range(12, 12001):
+for i in range(12, NUM_PRODUCTS + 1):
     name = fake.word().title()
     price = round(random.uniform(5.0, 999.99), 2)
     cursor.execute("INSERT INTO products (id, name, price) VALUES (?, ?, ?)", [i, name, price])
@@ -144,7 +178,7 @@ cursor.execute("""
 
 print("Generating users...")
 users_data = []
-for i in range(15000):
+for i in range(NUM_USERS):
     if i % 1000 == 0:
         print(f"  Generated {i} users...")
 
@@ -178,11 +212,11 @@ order_statuses = ["pending", "processing", "shipped", "delivered", "cancelled", 
 payment_methods = ["credit_card", "debit_card", "paypal", "apple_pay", "google_pay", "bank_transfer"]
 
 orders_data = []
-for i in range(20000):
+for i in range(NUM_ORDERS):
     if i % 2000 == 0:
         print(f"  Generated {i} orders...")
 
-    user_id = random.randint(1, 15000)
+    user_id = random.randint(1, NUM_USERS)
     order_date = fake.date_time_between(start_date="-1y", end_date="now")
     total_amount = round(random.uniform(10.0, 5000.0), 2)
     status = random.choice(order_statuses)
@@ -222,13 +256,13 @@ cursor.executemany(
 
 print("Generating order items...")
 order_items_data = []
-for order_id in range(1, 20001):
+for order_id in range(1, NUM_ORDERS + 1):
     if order_id % 2000 == 0:
         print(f"  Generated items for {order_id} orders...")
 
     num_items = random.randint(1, 8)
     for _ in range(num_items):
-        product_id = random.randint(1, 12000)
+        product_id = random.randint(1, NUM_PRODUCTS)
         quantity = random.randint(1, 5)
         unit_price = round(random.uniform(0.99, 999.99), 2)
         discount = round(random.uniform(0, 0.3) * unit_price, 2) if random.random() < 0.2 else 0
@@ -248,12 +282,12 @@ cursor.executemany(
 
 print("Generating reviews...")
 reviews_data = []
-for i in range(25000):
+for i in range(NUM_REVIEWS):
     if i % 2500 == 0:
         print(f"  Generated {i} reviews...")
 
-    product_id = random.randint(1, 12000)
-    user_id = random.randint(1, 15000)
+    product_id = random.randint(1, NUM_PRODUCTS)
+    user_id = random.randint(1, NUM_USERS)
     rating = random.choices([1, 2, 3, 4, 5], weights=[5, 10, 15, 30, 40])[0]
     title = fake.catch_phrase()
     comment = fake.text(max_nb_chars=500)
@@ -277,11 +311,11 @@ transaction_types = ["purchase", "sale", "return", "adjustment", "transfer", "da
 reference_types = ["order", "return", "adjustment", "transfer", "manual"]
 
 inventory_data = []
-for i in range(18000):
+for i in range(NUM_INVENTORY):
     if i % 2000 == 0:
         print(f"  Generated {i} inventory transactions...")
 
-    product_id = random.randint(1, 12000)
+    product_id = random.randint(1, NUM_PRODUCTS)
     transaction_type = random.choice(transaction_types)
     quantity = random.randint(1, 100)
     previous_quantity = random.randint(0, 1000)
@@ -291,7 +325,7 @@ for i in range(18000):
     new_quantity = max(0, new_quantity)
     transaction_date = fake.date_time_between(start_date="-6m", end_date="now")
     reference_type = random.choice(reference_types)
-    reference_id = random.randint(1, 20000) if reference_type == "order" else random.randint(1, 1000)
+    reference_id = random.randint(1, NUM_ORDERS) if reference_type == "order" else random.randint(1, 1000)
     notes = fake.text(max_nb_chars=100) if random.random() < 0.3 else None
     performed_by = fake.name()
 
@@ -326,12 +360,12 @@ priorities = ["low", "medium", "high", "urgent"]
 ticket_statuses = ["open", "in_progress", "waiting_customer", "resolved", "closed"]
 
 tickets_data = []
-for i in range(10000):
+for i in range(NUM_TICKETS):
     if i % 1000 == 0:
         print(f"  Generated {i} support tickets...")
 
-    user_id = random.randint(1, 15000)
-    order_id = random.randint(1, 20000) if random.random() < 0.7 else None
+    user_id = random.randint(1, NUM_USERS)
+    order_id = random.randint(1, NUM_ORDERS) if random.random() < 0.7 else None
     ticket_number = f"TICKET-{fake.random_int(min=100000, max=999999)}"
     category = random.choice(ticket_categories)
     priority = random.choice(priorities)
@@ -393,7 +427,7 @@ print("Generating articles for FTS testing...")
 categories = ["technology", "science", "business", "health", "politics", "entertainment", "sports", "lifestyle"]
 
 articles_data = []
-for i in range(10000):
+for i in range(NUM_ARTICLES):
     if i % 1000 == 0:
         print(f"  Generated {i} articles...")
 

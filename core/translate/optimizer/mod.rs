@@ -31,15 +31,12 @@ use crate::{
 use constraints::{
     constraints_from_where_clause, usable_constraints_for_join_order, Constraint, ConstraintRef,
 };
-use cost::{Cost, ESTIMATED_HARDCODED_ROWS_PER_TABLE};
+use cost::Cost;
 use join::{compute_best_join_order, BestJoinOrderResult};
 use lift_common_subexpressions::lift_common_subexpressions_from_binary_or_terms;
 use order::{compute_order_target, plan_satisfies_order_target, EliminatesSortBy};
-use std::{
-    cmp::Ordering,
-    collections::{HashMap, HashSet, VecDeque},
-    sync::Arc,
-};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use std::{cmp::Ordering, collections::VecDeque, sync::Arc};
 use turso_ext::{ConstraintInfo, ConstraintUsage};
 use turso_parser::ast::{self, Expr, SortOrder, TriggerEvent};
 
@@ -55,6 +52,7 @@ use super::{
 pub(crate) mod access_method;
 pub(crate) mod constraints;
 pub(crate) mod cost;
+mod cost_params;
 pub(crate) mod join;
 pub(crate) mod lift_common_subexpressions;
 pub(crate) mod order;
@@ -199,7 +197,7 @@ fn try_match_index_method_pattern(
     }
 
     let mut where_query_covered: Option<usize> = None;
-    let mut parameters = HashMap::new();
+    let mut parameters = HashMap::default();
 
     // Match ORDER BY if pattern has it
     if pattern_has_order_by {
@@ -299,7 +297,7 @@ fn build_covered_columns_mapping(
     parameters: &HashMap<i32, ast::Expr>,
 ) -> HashMap<usize, usize> {
     let mut covered_column_id = 1_000_000;
-    let mut covered_columns = HashMap::new();
+    let mut covered_columns = HashMap::default();
     for (pattern_column_id, pattern_column) in pattern_columns.iter().enumerate() {
         let ast::ResultColumn::Expr(pattern_expr, _) = pattern_column else {
             continue;
@@ -333,6 +331,7 @@ fn collect_index_method_candidates(
     limit: &Option<Box<Expr>>,
     offset: &Option<Box<Expr>>,
     base_table_rows: &[RowCountEstimate],
+    params: &cost_params::CostModelParams,
 ) -> Result<Vec<IndexMethodCandidate>> {
     let mut candidates = Vec::new();
 
@@ -382,7 +381,7 @@ fn collect_index_method_candidates(
                     let base_rows = base_table_rows
                         .get(table_idx)
                         .map(|r| **r)
-                        .unwrap_or(ESTIMATED_HARDCODED_ROWS_PER_TABLE as f64);
+                        .unwrap_or(params.rows_per_table_fallback);
                     cursor.estimate_cost(pattern_match.pattern_idx, base_rows)
                 });
 
@@ -755,7 +754,8 @@ fn add_ephemeral_table_to_update_plan(
         distinctness: super::plan::Distinctness::NonDistinct,
         values: vec![],
         window: None,
-        non_from_clause_subqueries: vec![],
+        // Move subqueries from the main plan to the ephemeral plan since the WHERE clause was moved
+        non_from_clause_subqueries: plan.non_from_clause_subqueries.drain(..).collect(),
     };
 
     plan.ephemeral_plan = Some(ephemeral_plan);
@@ -848,7 +848,7 @@ fn optimize_table_access_with_custom_modules(
             // This differs from collect_index_method_candidates: we modify result_columns
             // and increment covered_column_id per matching query column, not per pattern column.
             let mut covered_column_id = 1_000_000;
-            let mut covered_columns = HashMap::new();
+            let mut covered_columns = HashMap::default();
             for (pattern_column_id, pattern_column) in
                 pattern_match.pattern_columns.iter().enumerate()
             {
@@ -940,7 +940,11 @@ fn register_expression_index_usages_for_plan(
 }
 
 /// Derive a base row-count estimate for a table, preferring ANALYZE stats.
-fn base_row_estimate(schema: &Schema, table: &JoinedTable) -> RowCountEstimate {
+fn base_row_estimate(
+    schema: &Schema,
+    table: &JoinedTable,
+    params: &cost_params::CostModelParams,
+) -> RowCountEstimate {
     match &table.table {
         Table::BTree(btree) => {
             if let Some(stats) = schema.analyze_stats.table_stats(&btree.name) {
@@ -953,9 +957,9 @@ fn base_row_estimate(schema: &Schema, table: &JoinedTable) -> RowCountEstimate {
                     return RowCountEstimate::AnalyzeStats(rows as f64);
                 }
             }
-            RowCountEstimate::HardcodedFallback(ESTIMATED_HARDCODED_ROWS_PER_TABLE as f64)
+            RowCountEstimate::hardcoded_fallback(params)
         }
-        _ => RowCountEstimate::HardcodedFallback(ESTIMATED_HARDCODED_ROWS_PER_TABLE as f64),
+        _ => RowCountEstimate::hardcoded_fallback(params),
     }
 }
 
@@ -983,6 +987,13 @@ fn optimize_table_access(
     limit: &mut Option<Box<Expr>>,
     offset: &mut Option<Box<Expr>>,
 ) -> Result<Option<Vec<JoinOrderMember>>> {
+    // When optimizer_params feature is enabled, use lazily-loaded params (cached process-wide).
+    // Otherwise, use the compile-time static for zero overhead.
+    #[cfg(feature = "optimizer_params")]
+    let params: &cost_params::CostModelParams = &cost_params::LOADED_PARAMS;
+    #[cfg(not(feature = "optimizer_params"))]
+    let params: &cost_params::CostModelParams = &cost_params::DEFAULT_PARAMS;
+
     if table_references.joined_tables().is_empty() {
         return Ok(None);
     }
@@ -1034,7 +1045,7 @@ fn optimize_table_access(
     let base_table_rows_for_candidates = table_references
         .joined_tables()
         .iter()
-        .map(|t| base_row_estimate(schema, t))
+        .map(|t| base_row_estimate(schema, t, params))
         .collect::<Vec<_>>();
 
     let index_method_candidates = if !is_single_table {
@@ -1047,57 +1058,83 @@ fn optimize_table_access(
             limit,
             offset,
             &base_table_rows_for_candidates,
+            params,
         )?
     } else {
         Vec::new()
     };
     let maybe_order_target = compute_order_target(order_by, group_by.as_mut(), table_references);
-    let constraints_per_table = constraints_from_where_clause(
+    let mut constraints_per_table = constraints_from_where_clause(
         where_clause,
         table_references,
         available_indexes,
         subqueries,
         schema,
+        params,
     )?;
 
     let base_table_rows = table_references
         .joined_tables()
         .iter()
-        .map(|t| base_row_estimate(schema, t))
+        .map(|t| base_row_estimate(schema, t, params))
         .collect::<Vec<_>>();
 
-    // Currently the expressions we evaluate as constraints are binary expressions that will never be true for a NULL operand.
+    // Currently the expressions we evaluate as constraints are binary comparisons that (except for IS/IS NOT)
+    // will never be true for a NULL operand.
     // If there are any constraints on the right hand side table of an outer join that are not part of the outer join condition,
     // the outer join can be converted into an inner join.
     // for example:
     // - SELECT * FROM t1 LEFT JOIN t2 ON false WHERE t2.id = 5
     // there can never be a situation where null columns are emitted for t2 because t2.id = 5 will never be true in that case.
     // hence: we can convert the outer join into an inner join.
-    for (i, t) in table_references
-        .joined_tables_mut()
-        .iter_mut()
-        .enumerate()
-        .filter(|(_, t)| {
-            t.join_info
-                .as_ref()
-                .is_some_and(|join_info| join_info.outer)
-        })
-    {
-        if constraints_per_table[i]
-            .constraints
-            .iter()
-            .any(|c| where_clause[c.where_clause_pos.0].from_outer_join.is_none())
+    //
+    // Converting a LEFT JOIN into an INNER JOIN is an optimization opportunity:
+    // it can enable join reordering and let more predicates participate in key selection.
+    // -> recompute constraints if we rewrote a LEFT JOIN into an INNER JOIN.
+    loop {
+        let mut outer_join_rewritten = false;
+        for (i, t) in table_references
+            .joined_tables_mut()
+            .iter_mut()
+            .enumerate()
+            .filter(|(_, t)| {
+                t.join_info
+                    .as_ref()
+                    .is_some_and(|join_info| join_info.outer)
+            })
         {
-            t.join_info.as_mut().unwrap().outer = false;
-            for term in where_clause.iter_mut() {
-                if let Some(from_outer_join) = term.from_outer_join {
-                    if from_outer_join == t.internal_id {
-                        term.from_outer_join = None;
+            // Check if there's a constraint that would filter out NULL rows,
+            // allowing us to convert the LEFT JOIN into an INNER JOIN for join reordering purposes.
+            // Most binary ops like x = foo filter out NULL rows, but
+            // IS NULL constraints do NOT - they specifically KEEP them.
+            // So we should not convert LEFT JOIN to INNER JOIN based on IS NULL constraints.
+            if constraints_per_table[i].constraints.iter().any(|c| {
+                let is_from_where = where_clause[c.where_clause_pos.0].from_outer_join.is_none();
+                let is_is_null = c.operator == ast::Operator::Is.into();
+                is_from_where && !is_is_null
+            }) {
+                t.join_info.as_mut().unwrap().outer = false;
+                for term in where_clause.iter_mut() {
+                    if let Some(from_outer_join) = term.from_outer_join {
+                        if from_outer_join == t.internal_id {
+                            term.from_outer_join = None;
+                        }
                     }
                 }
+                outer_join_rewritten = true;
             }
-            continue;
         }
+        if !outer_join_rewritten {
+            break;
+        }
+        constraints_per_table = constraints_from_where_clause(
+            where_clause,
+            table_references,
+            available_indexes,
+            subqueries,
+            schema,
+            params,
+        )?;
     }
 
     let Some(best_join_order_result) = compute_best_join_order(
@@ -1109,6 +1146,8 @@ fn optimize_table_access(
         where_clause,
         subqueries,
         &index_method_candidates,
+        params,
+        &schema.analyze_stats,
     )?
     else {
         return Ok(None);
@@ -1192,8 +1231,8 @@ fn optimize_table_access(
             .unzip();
     #[cfg(debug_assertions)]
     {
-        let mut probe_tables: HashSet<usize> = HashSet::new();
-        let mut build_tables: HashMap<usize, bool> = HashMap::new();
+        let mut probe_tables: HashSet<usize> = HashSet::default();
+        let mut build_tables: HashMap<usize, bool> = HashMap::default();
         let mut pos_by_table: Vec<Option<usize>> =
             vec![None; table_references.joined_tables().len()];
         for (pos, table_idx) in best_table_numbers.iter().enumerate() {
@@ -1823,7 +1862,9 @@ impl Optimizable for ast::Expr {
                     .expect("table not found");
                 let columns = table_ref.columns();
                 let column = &columns[*column];
-                column.primary_key() || column.notnull()
+                // Only INTEGER PRIMARY KEY (rowid alias) is implicitly NOT NULL.
+                // Other PRIMARY KEY types (e.g., TEXT PRIMARY KEY) can contain NULL.
+                column.is_rowid_alias() || column.notnull()
             }
             Expr::RowId { .. } => true,
             Expr::InList { lhs, rhs, .. } => {

@@ -560,7 +560,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             self.main_db_path,
             result
         );
-        if result.max_frame < watermark {
+        if result.wal_max_frame < watermark {
             return Err(Error::DatabaseSyncEngineError(
                 format!("unable to checkpoint synced portion of WAL: result={result:?}, watermark={watermark}"),
             ));

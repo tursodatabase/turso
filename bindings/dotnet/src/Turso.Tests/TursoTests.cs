@@ -1,6 +1,7 @@
 ﻿using System.Data.Common;
 using AwesomeAssertions;
 using Turso.Raw.Public;
+using Turso.Raw.Public.Value;
 
 namespace Turso.Tests;
 
@@ -243,7 +244,7 @@ public class TursoTests
         using var reader = select.ExecuteReader();
 
         var results = new List<(long id, string name, long age)>();
-        
+
         foreach (DbDataRecord record in reader)
         {
             var id = record.GetInt64(0);
@@ -256,5 +257,74 @@ public class TursoTests
         results[0].Should().Be((1, "alice", 30));
         results[1].Should().Be((2, "bob", 40));
         results[2].Should().Be((3, "charlie", 50));
+    }
+
+    [Test]
+    public void TestEncryption()
+    {
+        var tempPath = Path.Combine(Path.GetTempPath(), $"turso_test_encrypted_{Guid.NewGuid()}.db");
+        var hexkey = "b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327";
+        var wrongKey = "aaaaaaa4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327";
+
+        try
+        {
+            // Create encrypted database
+            using (var connection = new TursoConnection($"Data Source={tempPath};Encryption Cipher=aegis256;Encryption Key={hexkey}"))
+            {
+                connection.Open();
+
+                using var create = new TursoCommand(connection, "CREATE TABLE t(x TEXT)");
+                create.ExecuteNonQuery();
+
+                using var insert = new TursoCommand(connection, "INSERT INTO t VALUES ('secret')");
+                insert.ExecuteNonQuery();
+
+                using var checkpoint = new TursoCommand(connection, "PRAGMA wal_checkpoint(truncate)");
+                checkpoint.ExecuteNonQuery();
+            }
+
+            // Verify data is encrypted on disk
+            var content = File.ReadAllBytes(tempPath);
+            content.Length.Should().BeGreaterThan(1024);
+            var contentStr = System.Text.Encoding.UTF8.GetString(content);
+            contentStr.Should().NotContain("secret");
+
+            // Verify we can re-open with the same key
+            using (var connection2 = new TursoConnection($"Data Source={tempPath};Encryption Cipher=aegis256;Encryption Key={hexkey}"))
+            {
+                connection2.Open();
+
+                using var select = new TursoCommand(connection2, "SELECT * FROM t");
+                using var reader = select.ExecuteReader();
+                reader.Read().Should().BeTrue();
+                reader.GetString(0).Should().Be("secret");
+            }
+
+            // Verify opening with wrong key fails
+            Action openWithWrongKey = () =>
+            {
+                using var conn = new TursoConnection($"Data Source={tempPath};Encryption Cipher=aegis256;Encryption Key={wrongKey}");
+                conn.Open();
+                using var select = new TursoCommand(conn, "SELECT * FROM t");
+                using var reader = select.ExecuteReader();
+                reader.Read();
+            };
+            openWithWrongKey.Should().Throw<Exception>();
+
+            // Verify opening without encryption fails
+            Action openWithoutEncryption = () =>
+            {
+                using var conn = new TursoConnection($"Data Source={tempPath}");
+                conn.Open();
+                using var select = new TursoCommand(conn, "SELECT * FROM t");
+                using var reader = select.ExecuteReader();
+                reader.Read();
+            };
+            openWithoutEncryption.Should().Throw<Exception>();
+        }
+        finally
+        {
+            if (File.Exists(tempPath)) File.Delete(tempPath);
+        }
     }
 }

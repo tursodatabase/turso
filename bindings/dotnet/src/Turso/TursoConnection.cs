@@ -37,7 +37,17 @@ public class TursoConnection : DbConnection
     public override void Open()
     {
         var filename = _connectionOptions["Data Source"] ?? ":memory:";
-        _turso = TursoBindings.OpenDatabase(filename);
+        var cipher = _connectionOptions.GetEncryptionCipher();
+        var hexkey = _connectionOptions["Encryption Key"];
+
+        if (cipher.HasValue && hexkey is not null)
+        {
+            _turso = TursoBindings.OpenDatabaseWithEncryption(filename, cipher.Value, hexkey);
+        }
+        else
+        {
+            _turso = TursoBindings.OpenDatabase(filename);
+        }
     }
 
     public override void Close()

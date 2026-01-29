@@ -14,10 +14,8 @@ use crate::{
     LimboError, OpenFlags, Result, Statement, SymbolTable,
 };
 use either::Either;
-use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
-};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use std::sync::Arc;
 use tracing::{instrument, Level};
 use turso_macros::match_ignore_ascii_case;
 use turso_parser::ast::{self, CreateTableBody, Expr, Literal, UnaryOperator};
@@ -135,17 +133,14 @@ pub fn parse_schema_rows(
     // TODO: if we IO, this unparsed indexes is lost. Will probably need some state between
     // IO runs
     let mut from_sql_indexes = Vec::with_capacity(10);
-    let mut automatic_indices = std::collections::HashMap::with_capacity(10);
+    let mut automatic_indices = HashMap::with_capacity_and_hasher(10, Default::default());
 
     // Store DBSP state table root pages: view_name -> dbsp_state_root_page
-    let mut dbsp_state_roots: std::collections::HashMap<String, i64> =
-        std::collections::HashMap::new();
+    let mut dbsp_state_roots: HashMap<String, i64> = HashMap::default();
     // Store DBSP state table index root pages: view_name -> dbsp_state_index_root_page
-    let mut dbsp_state_index_roots: std::collections::HashMap<String, i64> =
-        std::collections::HashMap::new();
+    let mut dbsp_state_index_roots: HashMap<String, i64> = HashMap::default();
     // Store materialized view info (SQL and root page) for later creation
-    let mut materialized_view_info: std::collections::HashMap<String, (String, i64)> =
-        std::collections::HashMap::new();
+    let mut materialized_view_info: HashMap<String, (String, i64)> = HashMap::default();
 
     // TODO: How do we ensure that the I/O we submitted to
     // read the schema is actually complete?
@@ -415,7 +410,7 @@ pub fn try_substitute_parameters(
 }
 
 pub fn try_capture_parameters(pattern: &Expr, query: &Expr) -> Option<HashMap<i32, Expr>> {
-    let mut captured = HashMap::new();
+    let mut captured = HashMap::default();
     match (pattern, query) {
         (
             Expr::FunctionCall {
@@ -563,7 +558,7 @@ pub fn try_capture_parameters_column_agnostic(
         return None;
     }
 
-    let mut captured = HashMap::new();
+    let mut captured = HashMap::default();
 
     // Split args into column args (reorderable) and remaining args (positional)
     let pattern_col_args = &pattern_args[..num_column_args];
@@ -573,7 +568,7 @@ pub fn try_capture_parameters_column_agnostic(
 
     // For column arguments: check that the same set of columns is used (order-independent)
     // We use a greedy matching approach: for each query column, find a matching pattern column
-    let mut matched_pattern_indices: HashSet<usize> = HashSet::new();
+    let mut matched_pattern_indices: HashSet<usize> = HashSet::default();
 
     for query_col in query_col_args {
         let mut found_match = false;
@@ -1368,7 +1363,7 @@ pub fn extract_view_columns(
 ) -> Result<ViewColumnSchema> {
     let mut tables = Vec::new();
     let mut columns = Vec::new();
-    let mut column_name_counts: HashMap<String, usize> = HashMap::new();
+    let mut column_name_counts: HashMap<String, usize> = HashMap::default();
 
     // Navigate to the first SELECT in the statement
     if let ast::OneSelect::Select {

@@ -1,0 +1,1766 @@
+@database :memory:
+
+# IS TRUE/IS FALSE tests - SQLite uses truth semantics (only non-zero numbers are truthy)
+test is-true-integer {
+    SELECT 8 IS TRUE, 1 IS TRUE, 0 IS TRUE, -1 IS TRUE;
+}
+expect {
+    1|1|0|1
+}
+
+test is-true-float {
+    SELECT 0.0 IS TRUE, 0.5 IS TRUE, -0.5 IS TRUE;
+}
+expect {
+    0|1|1
+}
+
+test is-true-text {
+    SELECT 'hello' IS TRUE, '' IS TRUE, '0' IS TRUE, '1' IS TRUE, '42' IS TRUE;
+}
+expect {
+    0|0|0|1|1
+}
+
+test is-true-null {
+    SELECT NULL IS TRUE;
+}
+expect {
+    0
+}
+
+test is-false-integer {
+    SELECT 8 IS FALSE, 1 IS FALSE, 0 IS FALSE, -1 IS FALSE;
+}
+expect {
+    0|0|1|0
+}
+
+test is-false-float {
+    SELECT 0.0 IS FALSE, 0.5 IS FALSE, -0.5 IS FALSE;
+}
+expect {
+    1|0|0
+}
+
+test is-false-text {
+    SELECT 'hello' IS FALSE, '' IS FALSE, '0' IS FALSE, '1' IS FALSE;
+}
+expect {
+    1|1|1|0
+}
+
+test is-false-null {
+    SELECT NULL IS FALSE;
+}
+expect {
+    0
+}
+
+test is-not-true-integer {
+    SELECT 8 IS NOT TRUE, 1 IS NOT TRUE, 0 IS NOT TRUE;
+}
+expect {
+    0|0|1
+}
+
+test is-not-true-null {
+    SELECT NULL IS NOT TRUE;
+}
+expect {
+    1
+}
+
+test is-not-false-integer {
+    SELECT 8 IS NOT FALSE, 1 IS NOT FALSE, 0 IS NOT FALSE;
+}
+expect {
+    1|1|0
+}
+
+test is-not-false-null {
+    SELECT NULL IS NOT FALSE;
+}
+expect {
+    1
+}
+
+# IS TRUE/IS FALSE in WHERE clause
+test is-true-where {
+    CREATE TABLE t_truth(x);
+    INSERT INTO t_truth VALUES(1),(0),(NULL),(8),('hello');
+    SELECT x FROM t_truth WHERE x IS TRUE;
+}
+expect {
+    1
+    8
+}
+
+test is-false-where {
+    CREATE TABLE t_truth(x);
+    INSERT INTO t_truth VALUES(1),(0),(NULL),(8),('hello');
+    SELECT x FROM t_truth WHERE x IS FALSE;
+}
+expect {
+    0
+    hello
+}
+
+test select-union-all-1 {
+    CREATE TABLE t1 (x INTEGER);
+    CREATE TABLE t2 (x INTEGER);
+    CREATE TABLE t3 (x INTEGER);
+    INSERT INTO t1 VALUES(1),(2),(3);
+    INSERT INTO t2 VALUES(4),(5),(6);
+    INSERT INTO t3 VALUES(7),(8),(9);
+    SELECT x FROM t1
+    UNION ALL
+    SELECT x FROM t2
+    UNION ALL
+    SELECT x FROM t3;
+}
+expect {
+    1
+    2
+    3
+    4
+    5
+    6
+    7
+    8
+    9
+}
+
+test select-union-all-with-filters {
+    CREATE TABLE t4 (x INTEGER);
+    CREATE TABLE t5 (x INTEGER);
+    CREATE TABLE t6 (x INTEGER);
+    INSERT INTO t4 VALUES(1),(2),(3),(4);
+    INSERT INTO t5 VALUES(5),(6),(7),(8);
+    INSERT INTO t6 VALUES(9),(10),(11),(12);
+    SELECT x FROM t4 WHERE x > 2
+    UNION ALL
+    SELECT x FROM t5 WHERE x < 7
+    UNION ALL
+    SELECT x FROM t6 WHERE x = 10;
+}
+expect {
+    3
+    4
+    5
+    6
+    10
+}
+
+test select-union-1 {
+    CREATE TABLE t (x TEXT, y TEXT);
+    CREATE TABLE u (x TEXT, y TEXT);
+    INSERT INTO t VALUES('x','x'),('y','y');
+    INSERT INTO u VALUES('x','x'),('y','y');
+    select * from t UNION select * from u;
+}
+expect {
+    x|x
+    y|y
+}
+
+test select-union-all-union {
+    CREATE TABLE t (x TEXT, y TEXT);
+    CREATE TABLE u (x TEXT, y TEXT);
+    CREATE TABLE v (x TEXT, y TEXT);
+    INSERT INTO t VALUES('x','x'),('y','y');
+    INSERT INTO u VALUES('x','x'),('y','y');
+    INSERT INTO v VALUES('x','x'),('y','y');
+    select * from t UNION select * from u UNION ALL select * from v;
+}
+expect {
+    x|x
+    y|y
+    x|x
+    y|y
+}
+
+test select-union-all-union-2 {
+    CREATE TABLE t (x TEXT, y TEXT);
+    CREATE TABLE u (x TEXT, y TEXT);
+    CREATE TABLE v (x TEXT, y TEXT);
+    INSERT INTO t VALUES('x','x'),('y','y');
+    INSERT INTO u VALUES('x','x'),('y','y');
+    INSERT INTO v VALUES('x','x'),('y','y');
+    select * from t UNION ALL select * from u UNION select * from v;
+}
+expect {
+    x|x
+    y|y
+}
+
+test select-union-3 {
+    CREATE TABLE t (x TEXT, y TEXT);
+    CREATE TABLE u (x TEXT, y TEXT);
+    CREATE TABLE v (x TEXT, y TEXT);
+    INSERT INTO t VALUES('x','x'),('y','y');
+    INSERT INTO u VALUES('x','x'),('y','y');
+    INSERT INTO v VALUES('x','x'),('y','y');
+    select * from t UNION select * from u UNION select * from v;
+}
+expect {
+    x|x
+    y|y
+}
+
+test select-union-4 {
+    CREATE TABLE t (x TEXT, y TEXT);
+    CREATE TABLE u (x TEXT, y TEXT);
+    CREATE TABLE v (x TEXT, y TEXT);
+    INSERT INTO t VALUES('x','x'),('y','y');
+    INSERT INTO u VALUES('x','x'),('y','y');
+    INSERT INTO v VALUES('x','x'),('y','y');
+    select * from t UNION select * from u UNION select * from v UNION select * from t;
+}
+expect {
+    x|x
+    y|y
+}
+
+test select-union-all-union-3 {
+    CREATE TABLE t (x TEXT, y TEXT);
+    CREATE TABLE u (x TEXT, y TEXT);
+    CREATE TABLE v (x TEXT, y TEXT);
+    INSERT INTO t VALUES('x','x'),('y','y');
+    INSERT INTO u VALUES('x','x'),('y','y');
+    INSERT INTO v VALUES('x','x'),('y','y');
+    select * from t UNION select * from u UNION select * from v UNION ALL select * from t;
+}
+expect {
+    x|x
+    y|y
+    x|x
+    y|y
+}
+
+test select-union-all-with-offset {
+    CREATE TABLE t (x TEXT, y TEXT);
+    CREATE TABLE u (x TEXT, y TEXT);
+    INSERT INTO t VALUES('x','x'),('y','y');
+    INSERT INTO u VALUES('x','x'),('y','y'),('z', 'z');
+    select * from t UNION ALL select * from u limit 1 offset 1;
+}
+expect {
+    y|y
+}
+
+test select-union-with-offset {
+    CREATE TABLE t (x TEXT, y TEXT);
+    CREATE TABLE u (x TEXT, y TEXT);
+    INSERT INTO t VALUES('x','x'),('y','y');
+    INSERT INTO u VALUES('x','x'),('y','y'),('z', 'z');
+    select * from t UNION select * from u limit 1 offset 1;
+}
+expect {
+    y|y
+}
+
+test select-intersect-1 {
+    CREATE TABLE t (x TEXT, y TEXT);
+    CREATE TABLE u (x TEXT, y TEXT);
+    INSERT INTO t VALUES('x','x'),('y','y');
+    INSERT INTO u VALUES('x','x'),('z','y');
+    select * from t INTERSECT select * from u;
+}
+expect {
+    x|x
+}
+
+test select-intersect-2 {
+    CREATE TABLE t (x TEXT, y TEXT);
+    CREATE TABLE u (x TEXT, y TEXT);
+    CREATE TABLE v (x TEXT, y TEXT);
+    INSERT INTO t VALUES('x','x'),('y','y');
+    INSERT INTO u VALUES('x','x'),('y','y');
+    INSERT INTO v VALUES('a','x'),('y','y');
+    select * from t INTERSECT select * from u INTERSECT select * from v INTERSECT select * from t;
+}
+expect {
+    y|y
+}
+
+test select-intersect-union {
+    CREATE TABLE t (x TEXT, y TEXT);
+    CREATE TABLE u (x TEXT, y TEXT);
+    CREATE TABLE v (x TEXT, y TEXT);
+    INSERT INTO t VALUES('x','x'),('y','y');
+    INSERT INTO u VALUES('x','x'),('z','y');
+    INSERT INTO v VALUES('x','x'),('z','z');
+    select * from t INTERSECT select * from u UNION select * from v;
+}
+expect {
+    x|x
+    z|z
+}
+
+test select-union-intersect {
+    CREATE TABLE t (x TEXT, y TEXT);
+    CREATE TABLE u (x TEXT, y TEXT);
+    CREATE TABLE v (x TEXT, y TEXT);
+    INSERT INTO t VALUES('x','x'),('y','y');
+    INSERT INTO u VALUES('x','x'),('z','y');
+    INSERT INTO v VALUES('x','x'),('z','z');
+    select * from t UNION select * from u INTERSECT select * from v;
+}
+expect {
+    x|x
+}
+
+test select-union-all-intersect {
+    CREATE TABLE t (x TEXT, y TEXT);
+    CREATE TABLE u (x TEXT, y TEXT);
+    CREATE TABLE v (x TEXT, y TEXT);
+    INSERT INTO t VALUES('x','x'),('y','y');
+    INSERT INTO u VALUES('x','x'),('z','y');
+    INSERT INTO v VALUES('x','x'),('z','z');
+    select * from t UNION ALL select * from u INTERSECT select * from v;
+}
+expect {
+    x|x
+}
+
+test select-intersect-union-all {
+    CREATE TABLE t (x TEXT, y TEXT);
+    CREATE TABLE u (x TEXT, y TEXT);
+    CREATE TABLE v (x TEXT, y TEXT);
+    INSERT INTO t VALUES('x','x'),('y','y');
+    INSERT INTO u VALUES('x','x'),('z','y');
+    INSERT INTO v VALUES('x','x'),('z','z');
+    select * from t INTERSECT select * from u UNION ALL select * from v;
+}
+expect {
+    x|x
+    x|x
+    z|z
+}
+
+test select-intersect-with-limit {
+    CREATE TABLE t (x TEXT, y TEXT);
+    CREATE TABLE u (x TEXT, y TEXT);
+    INSERT INTO t VALUES('x','x'),('y','y'), ('z','z');
+    INSERT INTO u VALUES('x','x'),('y','y'), ('z','z');
+    select * from t INTERSECT select * from u limit 2;
+}
+expect {
+    x|x
+    y|y
+}
+
+test select-intersect-with-offset {
+    CREATE TABLE t (x TEXT, y TEXT);
+    CREATE TABLE u (x TEXT, y TEXT);
+    INSERT INTO t VALUES('x','x'),('y','y'), ('z','z');
+    INSERT INTO u VALUES('x','x'),('y','y'), ('z','z');
+    select * from t INTERSECT select * from u limit 2 offset 1;
+}
+expect {
+    y|y
+    z|z
+}
+
+test select-intersect-union-with-limit {
+    CREATE TABLE t (x TEXT, y TEXT);
+    CREATE TABLE u (x TEXT, y TEXT);
+    CREATE TABLE v (x TEXT, y TEXT);
+    INSERT INTO t VALUES('x','x'),('y','y'), ('z','z');
+    INSERT INTO u VALUES('d','d'),('e','e'), ('z','z');
+    INSERT INTO v VALUES('a','a'),('b','b');
+    select * from t INTERSECT select * from u UNION select * from v limit 3;
+}
+expect {
+    a|a
+    b|b
+    z|z
+}
+
+test select-except-1 {
+    CREATE TABLE t (x TEXT, y TEXT);
+    CREATE TABLE u (x TEXT, y TEXT);
+    INSERT INTO t VALUES('x','x'),('y','y');
+    INSERT INTO u VALUES('x','x'),('z','y');
+    select * from t EXCEPT select * from u;
+}
+expect {
+    y|y
+}
+
+test select-except-2 {
+    CREATE TABLE t (x TEXT, y TEXT);
+    CREATE TABLE u (x TEXT, y TEXT);
+    INSERT INTO t VALUES('x','x'),('y','y');
+    INSERT INTO u VALUES('x','x'),('y','y');
+    select * from t EXCEPT select * from u;
+}
+expect {
+}
+
+test select-except-3 {
+    CREATE TABLE t (x TEXT, y TEXT);
+    CREATE TABLE u (x TEXT, y TEXT);
+    CREATE TABLE v (x TEXT, y TEXT);
+    INSERT INTO t VALUES('x','x'),('y','y');
+    INSERT INTO u VALUES('x','x'),('a','y');
+    INSERT INTO v VALUES('a','x'),('b','y');
+    select * from t EXCEPT select * from u EXCEPT select * from v;
+}
+expect {
+    y|y
+}
+
+test select-except-limit {
+    CREATE TABLE t (x TEXT, y TEXT);
+    CREATE TABLE u (x TEXT, y TEXT);
+    INSERT INTO t VALUES('a', 'a'),('x','x'),('y','y'),('z','z');
+    INSERT INTO u VALUES('x','x'),('z','y');
+    select * from t EXCEPT select * from u limit 2;
+}
+expect {
+    a|a
+    y|y
+}
+
+test select-except-union-all {
+    CREATE TABLE t (x TEXT, y TEXT);
+    CREATE TABLE u (x TEXT, y TEXT);
+    CREATE TABLE v (x TEXT, y TEXT);
+    INSERT INTO t VALUES('x','x'),('y','y');
+    INSERT INTO u VALUES('x','x'),('z','y');
+    INSERT INTO v VALUES('x','x'),('y','y');
+    select * from t EXCEPT select * from u UNION ALL select * from v;
+}
+expect {
+    y|y
+    x|x
+    y|y
+}
+
+test select-union-all-except {
+    CREATE TABLE t (x TEXT, y TEXT);
+    CREATE TABLE u (x TEXT, y TEXT);
+    CREATE TABLE v (x TEXT, y TEXT);
+    INSERT INTO t VALUES('x','x'),('y','y');
+    INSERT INTO u VALUES('x','x'),('z','y');
+    INSERT INTO v VALUES('x','x'),('y','y');
+    select * from t UNION ALL select * from u EXCEPT select * from v;
+}
+expect {
+    z|y
+}
+
+test select-except-union {
+    CREATE TABLE t (x TEXT, y TEXT);
+    CREATE TABLE u (x TEXT, y TEXT);
+    CREATE TABLE v (x TEXT, y TEXT);
+    INSERT INTO t VALUES('x','x'),('y','y');
+    INSERT INTO u VALUES('x','x'),('z','y');
+    INSERT INTO v VALUES('x','x'),('z','z');
+    select * from t EXCEPT select * from u UNION select * from v;
+}
+expect {
+    x|x
+    y|y
+    z|z
+}
+
+test select-union-except {
+    CREATE TABLE t (x TEXT, y TEXT);
+    CREATE TABLE u (x TEXT, y TEXT);
+    CREATE TABLE v (x TEXT, y TEXT);
+    INSERT INTO t VALUES('x','x'),('y','y');
+    INSERT INTO u VALUES('x','x'),('z','y');
+    INSERT INTO v VALUES('x','x'),('z','z');
+    select * from t UNION select * from u EXCEPT select * from v;
+}
+expect {
+    y|y
+    z|y
+}
+
+test select-except-intersect {
+    CREATE TABLE t (x TEXT, y TEXT);
+    CREATE TABLE u (x TEXT, y TEXT);
+    CREATE TABLE v (x TEXT, y TEXT);
+    INSERT INTO t VALUES('x','x'),('y','y');
+    INSERT INTO u VALUES('x','x'),('z','y');
+    INSERT INTO v VALUES('y','y'),('z','z');
+    select * from t EXCEPT select * from u INTERSECT select * from v;
+}
+expect {
+    y|y
+}
+
+test select-intersect-except {
+    CREATE TABLE t (x TEXT, y TEXT);
+    CREATE TABLE u (x TEXT, y TEXT);
+    CREATE TABLE v (x TEXT, y TEXT);
+    INSERT INTO t VALUES('x','x'),('y','y');
+    INSERT INTO u VALUES('x','x'),('z','y');
+    INSERT INTO v VALUES('x','x'),('z','z');
+    select * from t INTERSECT select * from u EXCEPT select * from v;
+}
+expect {
+}
+
+test select-values-union {
+    CREATE TABLE t (x TEXT, y TEXT);
+    INSERT INTO t VALUES('x','x'),('y','y');
+    values('x', 'x') UNION select * from t;
+}
+expect {
+    x|x
+    y|y
+}
+
+test select-values-union-2 {
+    CREATE TABLE t (x TEXT, y TEXT);
+    INSERT INTO t VALUES('x','x'),('y','y');
+    values('x', 'x'), ('y', 'y') UNION select * from t;
+}
+expect {
+    x|x
+    y|y
+}
+
+test select-values-except {
+    CREATE TABLE t (x TEXT, y TEXT);
+    INSERT INTO t VALUES('x','x'),('y','y');
+    select * from t EXCEPT values('x','x'),('z','y');
+}
+expect {
+    y|y
+}
+
+test select-values-union-all-limit {
+    CREATE TABLE t (x TEXT);
+    INSERT INTO t VALUES('x'), ('y'), ('z');
+    values('x') UNION ALL select * from t limit 3;
+}
+expect {
+    x
+    x
+    y
+}
+
+test select-values-union-all-limit-1 {
+    CREATE TABLE t (x TEXT);
+    INSERT INTO t VALUES('x'), ('y'), ('z');
+    values('a'), ('b') UNION ALL select * from t limit 3;
+}
+expect {
+    a
+    b
+    x
+}
+
+test select-values-union-all-offset {
+    CREATE TABLE t (x TEXT);
+    INSERT INTO t VALUES('x'), ('y'), ('z');
+    values('a'), ('b') UNION ALL select * from t limit 3 offset 1;
+}
+expect {
+    b
+    x
+    y
+}
+
+test select-values-union-all-offset-1 {
+    CREATE TABLE t (x TEXT);
+    INSERT INTO t VALUES('i'), ('j'), ('x'), ('y'), ('z');
+    values('a') UNION ALL select * from t limit 3 offset 1;
+}
+expect {
+    i
+    j
+    x
+}
+
+# Test that CTE column resolution in UNION ALL properly rejects columns
+# that exist in one CTE's source table but not in another's.
+# This should produce a "no such column" error, not a panic.
+test select-cte-union-all-column-resolution {
+    CREATE TABLE t1(a, x);
+    CREATE TABLE t2(b);
+    INSERT INTO t1 VALUES(1, 2);
+    INSERT INTO t2 VALUES(3);
+    WITH cte1 AS (SELECT * FROM t1),
+    cte2 AS (SELECT *, x AS extra FROM t2)
+    SELECT * FROM cte1
+    UNION ALL
+    SELECT * FROM cte2;
+}
+expect error {
+    no such column: x
+}
+
+test select-no-match-in-leaf-page {
+    CREATE TABLE t (a INTEGER PRIMARY KEY, b);
+    insert into t values (1, randomblob(1024));
+    insert into t values (2, randomblob(1024));
+    insert into t values (3, randomblob(1024));
+    insert into t values (4, randomblob(1024));
+    insert into t values (5, randomblob(1024));
+    insert into t values (6, randomblob(1024));
+    insert into t values (7, randomblob(1024));
+    insert into t values (8, randomblob(1024));
+    insert into t values (9, randomblob(1024));
+    insert into t values (10, randomblob(1024));
+    insert into t values (11, randomblob(1024));
+    insert into t values (12, randomblob(1024));
+    insert into t values (13, randomblob(1024));
+    insert into t values (14, randomblob(1024));
+    insert into t values (15, randomblob(1024));
+    insert into t values (16, randomblob(1024));
+    delete from t where a in (3, 6, 9, 12);
+    select count(*) from t where a >= 2;
+    select count(*) from t where a >= 3;
+    select count(*) from t where a >= 4;
+    select count(*) from t where a > 1;
+    select count(*) from t where a > 2;
+    select count(*) from t where a > 3;
+    select count(*) from t where a <= 3 ORDER BY a DESC;
+    select count(*) from t where a <= 4 ORDER BY a DESC;
+    select count(*) from t where a <= 5 ORDER BY a DESC;
+    select count(*) from t where a < 2 ORDER BY a DESC;
+    select count(*) from t where a < 3 ORDER BY a DESC;
+    select count(*) from t where a < 4 ORDER BY a DESC;
+}
+expect {
+    11
+    10
+    10
+    11
+    10
+    10
+    2
+    3
+    4
+    1
+    2
+    2
+}
+
+test select-range-search-count-asc-index {
+    CREATE TABLE t (a, b);
+    CREATE INDEX t_idx ON t(a, b);
+    insert into t values (1, 1);
+    insert into t values (1, 2);
+    insert into t values (1, 3);
+    insert into t values (1, 4);
+    insert into t values (1, 5);
+    insert into t values (1, 6);
+    insert into t values (2, 1);
+    insert into t values (2, 2);
+    insert into t values (2, 3);
+    insert into t values (2, 4);
+    insert into t values (2, 5);
+    insert into t values (2, 6);
+    select count(*) from t where a = 1 AND b >= 2 ORDER BY a ASC, b ASC;
+    select count(*) from t where a = 1 AND b > 2 ORDER BY a ASC, b ASC;
+    select count(*) from t where a = 1 AND b <= 4 ORDER BY a ASC, b ASC;
+    select count(*) from t where a = 1 AND b < 4 ORDER BY a ASC, b ASC;
+    select count(*) from t where a = 1 AND b >= 2 AND b <= 4 ORDER BY a ASC, b ASC;
+    select count(*) from t where a = 1 AND b > 2 AND b <= 4 ORDER BY a ASC, b ASC;
+    select count(*) from t where a = 1 AND b >= 2 AND b < 4 ORDER BY a ASC, b ASC;
+    select count(*) from t where a = 1 AND b > 2 AND b < 4 ORDER BY a ASC, b ASC;
+    select count(*) from t where a = 1 AND b >= 2 ORDER BY a DESC, b DESC;
+    select count(*) from t where a = 1 AND b > 2 ORDER BY a DESC, b DESC;
+    select count(*) from t where a = 1 AND b <= 4 ORDER BY a DESC, b DESC;
+    select count(*) from t where a = 1 AND b < 4 ORDER BY a DESC, b DESC;
+    select count(*) from t where a = 1 AND b >= 2 AND b <= 4 ORDER BY a DESC, b DESC;
+    select count(*) from t where a = 1 AND b > 2 AND b <= 4 ORDER BY a DESC, b DESC;
+    select count(*) from t where a = 1 AND b >= 2 AND b < 4 ORDER BY a DESC, b DESC;
+    select count(*) from t where a = 1 AND b > 2 AND b < 4 ORDER BY a DESC, b DESC;
+}
+expect {
+    5
+    4
+    4
+    3
+    3
+    2
+    2
+    1
+    5
+    4
+    4
+    3
+    3
+    2
+    2
+    1
+}
+
+test select-range-search-count-desc-index {
+    CREATE TABLE t (a, b);
+    CREATE INDEX t_idx ON t(a, b DESC);
+    insert into t values (1, 1);
+    insert into t values (1, 2);
+    insert into t values (1, 3);
+    insert into t values (1, 4);
+    insert into t values (1, 5);
+    insert into t values (1, 6);
+    insert into t values (2, 1);
+    insert into t values (2, 2);
+    insert into t values (2, 3);
+    insert into t values (2, 4);
+    insert into t values (2, 5);
+    insert into t values (2, 6);
+    select count(*) from t where a = 1 AND b >= 2 ORDER BY a ASC, b DESC;
+    select count(*) from t where a = 1 AND b > 2 ORDER BY a ASC, b DESC;
+    select count(*) from t where a = 1 AND b <= 4 ORDER BY a ASC, b DESC;
+    select count(*) from t where a = 1 AND b < 4 ORDER BY a ASC, b DESC;
+    select count(*) from t where a = 1 AND b >= 2 AND b <= 4 ORDER BY a ASC, b DESC;
+    select count(*) from t where a = 1 AND b > 2 AND b <= 4 ORDER BY a ASC, b DESC;
+    select count(*) from t where a = 1 AND b >= 2 AND b < 4 ORDER BY a ASC, b DESC;
+    select count(*) from t where a = 1 AND b > 2 AND b < 4 ORDER BY a ASC, b DESC;
+    select count(*) from t where a = 1 AND b >= 2 ORDER BY a DESC, b ASC;
+    select count(*) from t where a = 1 AND b > 2 ORDER BY a DESC, b ASC;
+    select count(*) from t where a = 1 AND b <= 4 ORDER BY a DESC, b ASC;
+    select count(*) from t where a = 1 AND b < 4 ORDER BY a DESC, b ASC;
+    select count(*) from t where a = 1 AND b >= 2 AND b <= 4 ORDER BY a DESC, b ASC;
+    select count(*) from t where a = 1 AND b > 2 AND b <= 4 ORDER BY a DESC, b ASC;
+    select count(*) from t where a = 1 AND b >= 2 AND b < 4 ORDER BY a DESC, b ASC;
+    select count(*) from t where a = 1 AND b > 2 AND b < 4 ORDER BY a DESC, b ASC;
+}
+expect {
+    5
+    4
+    4
+    3
+    3
+    2
+    2
+    1
+    5
+    4
+    4
+    3
+    3
+    2
+    2
+    1
+}
+
+test select-range-search-scan-asc-index {
+    CREATE TABLE t (a, b);
+    CREATE INDEX t_idx ON t(a, b);
+    insert into t values (1, 1);
+    insert into t values (1, 2);
+    insert into t values (1, 3);
+    insert into t values (1, 4);
+    insert into t values (1, 5);
+    insert into t values (1, 6);
+    insert into t values (2, 1);
+    insert into t values (2, 2);
+    insert into t values (2, 3);
+    insert into t values (2, 4);
+    insert into t values (2, 5);
+    insert into t values (2, 6);
+    select * from t where a = 1 AND b > 1 AND b < 6 ORDER BY a ASC, b ASC;
+    select * from t where a = 2 AND b > 1 AND b < 6 ORDER BY a DESC, b DESC;
+    select * from t where a = 1 AND b > 1 AND b < 6 ORDER BY a DESC, b ASC;
+    select * from t where a = 2 AND b > 1 AND b < 6 ORDER BY a ASC, b DESC;
+}
+expect {
+    1|2
+    1|3
+    1|4
+    1|5
+    2|5
+    2|4
+    2|3
+    2|2
+    1|2
+    1|3
+    1|4
+    1|5
+    2|5
+    2|4
+    2|3
+    2|2
+}
+
+test select-range-search-scan-desc-index {
+    CREATE TABLE t (a, b);
+    CREATE INDEX t_idx ON t(a, b DESC);
+    insert into t values (1, 1);
+    insert into t values (1, 2);
+    insert into t values (1, 3);
+    insert into t values (1, 4);
+    insert into t values (1, 5);
+    insert into t values (1, 6);
+    insert into t values (2, 1);
+    insert into t values (2, 2);
+    insert into t values (2, 3);
+    insert into t values (2, 4);
+    insert into t values (2, 5);
+    insert into t values (2, 6);
+    select * from t where a = 1 AND b > 1 AND b < 6 ORDER BY a ASC, b ASC;
+    select * from t where a = 2 AND b > 1 AND b < 6 ORDER BY a DESC, b DESC;
+    select * from t where a = 1 AND b > 1 AND b < 6 ORDER BY a DESC, b ASC;
+    select * from t where a = 2 AND b > 1 AND b < 6 ORDER BY a ASC, b DESC;
+}
+expect {
+    1|2
+    1|3
+    1|4
+    1|5
+    2|5
+    2|4
+    2|3
+    2|2
+    1|2
+    1|3
+    1|4
+    1|5
+    2|5
+    2|4
+    2|3
+    2|2
+}
+
+# Regression tests for double-quoted strings in SELECT statements
+setup dqs_dml {
+    .dbconfig dqs_dml on
+}
+
+@backend cli
+@setup dqs_dml
+test select-double-quotes-values {
+    SELECT * FROM (VALUES ("select", "test"), ("double", "quotes"));
+}
+expect {
+    select|test
+    double|quotes
+}
+
+@backend cli
+@setup dqs_dml
+test select-double-quotes-no-column {
+    SELECT "first"
+}
+expect {
+    first
+}
+
+@backend cli
+@setup dqs_dml
+test select-double-quotes-literal {
+    SELECT "literal_string" AS col;
+}
+expect {
+    literal_string
+}
+
+test select-in-simple {
+    SELECT 1 IN (1, 2, 3);
+    SELECT 4 IN (1, 2, 3);
+}
+expect {
+    1
+    0
+}
+
+test select-in-with-nulls {
+    SELECT 4 IN (1, 4, null);
+    SELECT 4 NOT IN (1, 4, null);
+}
+expect {
+    1
+    0
+}
+
+# All should be null
+test select-in-with-nulls-2 {
+     SELECT 1 IN (2, 3, null);
+     SELECT 1 NOT IN (2, 3, null);
+     SELECT null in (null);
+}
+expect raw {
+
+
+
+}
+
+test select-in-complex {
+    CREATE TABLE test_table (id INTEGER, category TEXT, value INTEGER);
+    INSERT INTO test_table VALUES (1, 'A', 10), (2, 'B', 20), (3, 'A', 30), (4, 'C', 40);
+    SELECT * FROM test_table WHERE category IN ('A', 'B') AND value IN (10, 30, 40);
+}
+expect {
+    1|A|10
+    3|A|30
+}
+
+test limit-expr-can-be-cast-losslessly-1 {
+    SELECT 1 LIMIT 1.1 + 2.9;
+}
+expect {
+    1
+}
+
+test limit-expr-can-be-cast-losslessly-2 {
+    CREATE TABLE T(a);
+    INSERT INTO T VALUES (1),(1),(1),(1);
+    SELECT * FROM T LIMIT 1.6/2 + 3.6/3 + 4*0.25;
+}
+expect {
+    1
+    1
+    1
+}
+
+# Numeric strings are cast to float. The final evaluation of the expression returns an int losslessly
+test limit-expr-can-be-cast-losslessly-3 {
+    CREATE TABLE T(a);
+    INSERT INTO T VALUES (1),(1),(1),(1);
+    SELECT * FROM T LIMIT '0.8' + '1.2' + 4*0.25;
+}
+expect {
+    1
+    1
+    1
+}
+
+# Invalid strings are cast to 0. So expression is valid
+test limit-expr-int-and-string {
+    SELECT 1 LIMIT 3/3 + 'test' + 4*'test are best';
+}
+expect {
+    1
+}
+
+test limit-expr-cannot-be-cast-losslessly-1 {
+    SELECT 1 LIMIT 1.1;
+}
+expect error {
+    datatype mismatch
+}
+
+test limit-expr-cannot-be-cast-losslessly-2 {
+    SELECT 1 LIMIT 1.1 + 2.2 + 1.9/8;
+}
+expect error {
+    datatype mismatch
+}
+
+# Return error as float in the expression cannot be cast losslessly
+test limit-expr-cannot-be-cast-losslessly-3 {
+    SELECT 1 LIMIT 1.1 +'a';
+}
+expect error {
+    datatype mismatch
+}
+
+test limit-expr-invalid-data-type-1 {
+    SELECT 1 LIMIT 'a';
+}
+expect error {
+    datatype mismatch
+}
+
+test limit-expr-invalid-data-type-2 {
+    SELECT 1 LIMIT NULL;
+}
+expect error {
+    datatype mismatch
+}
+
+# The expression below evaluates to NULL as string is cast to 0
+test limit-expr-invalid-data-type-3 {
+    SELECT 1 LIMIT 1/'iwillbezero ;-; ' ;
+}
+expect error {
+    datatype mismatch
+}
+
+# Expression is evaluated as NULL
+test limit-expr-invalid-data-type-4 {
+    SELECT 1 LIMIT 4+NULL;
+}
+expect error {
+    datatype mismatch
+}
+
+test limit-expression-invalid-type {
+    SELECT 1 LIMIT '1.xx';
+}
+expect error {
+    datatype mismatch
+}
+
+test rowid-references {
+    CREATE TABLE test_table (id INTEGER);
+    INSERT INTO test_table VALUES (5),(5);
+    SELECT
+    rowid, "rowid", `rowid`, [rowid], _rowid_, "_rowid_", `_rowid_`, [_rowid_], oid, "oid", `oid`, [oid]
+    FROM test_table
+    WHERE rowid = 2
+    AND "rowid" = 2
+    AND `rowid` = 2
+    AND [rowid] = 2
+    AND _rowid_ = 2
+    AND "_rowid_" = 2
+    AND `_rowid_` = 2
+    AND [_rowid_] = 2
+    AND oid = 2
+    AND "oid" = 2
+    AND `oid` = 2
+    AND [oid] = 2;
+}
+expect {
+    2|2|2|2|2|2|2|2|2|2|2|2
+}
+
+test null-in-search {
+    CREATE TABLE t_x_asc (id INTEGER PRIMARY KEY, x);
+    CREATE INDEX t_x_asc_idx ON t_x_asc(x ASC);
+    CREATE TABLE t_x_desc (id INTEGER PRIMARY KEY, x);
+    CREATE INDEX t_x_desc_idx ON t_x_desc(x DESC);
+    INSERT INTO t_x_asc VALUES (1, NULL), (2, 2), (10, 10);
+    INSERT INTO t_x_desc VALUES (1, NULL), (2, 2), (10, 10);
+    SELECT * FROM t_x_asc WHERE x > 5 ORDER BY x ASC;
+    SELECT * FROM t_x_asc WHERE x > 5 ORDER BY x DESC;
+    SELECT * FROM t_x_asc WHERE x < 5 ORDER BY x ASC;
+    SELECT * FROM t_x_asc WHERE x < 5 ORDER BY x DESC;
+    SELECT * FROM t_x_desc WHERE x > 5 ORDER BY x ASC;
+    SELECT * FROM t_x_desc WHERE x > 5 ORDER BY x DESC;
+    SELECT * FROM t_x_desc WHERE x < 5 ORDER BY x ASC;
+    SELECT * FROM t_x_desc WHERE x < 5 ORDER BY x DESC;
+}
+expect {
+    10|10
+    10|10
+    2|2
+    2|2
+    10|10
+    10|10
+    2|2
+    2|2
+}
+
+test limit-column-reference-error {
+    CREATE TABLE t(a);
+    SELECT * FROM t LIMIT (t.a);
+}
+expect error {
+}
+
+# Regression test for https://github.com/tursodatabase/turso/issues/4554
+# LIMIT clause with hex/underscore numeric literals should work
+test limit-hex-literal {
+    SELECT 1 LIMIT 0x10;
+}
+expect {
+    1
+}
+
+test limit-underscore-literal {
+    SELECT 1 LIMIT 1_2_3;
+}
+expect {
+    1
+}
+
+# https://github.com/tursodatabase/turso/issues/3667 regression test
+test rowid-select-from-clause-subquery {
+    CREATE TABLE t(a);
+    SELECT rowid FROM (SELECT * FROM t);
+}
+expect error {
+    no such column: rowid
+}
+
+test rowid-select-from-clause-subquery-explicit-works {
+    CREATE TABLE t(a);
+    INSERT INTO t values ('abc');
+    SELECT rowid,a FROM (SELECT rowid,a FROM t);
+}
+expect {
+    1|abc
+}
+
+# https://github.com/tursodatabase/turso/issues/3505 regression test
+test ambiguous-self-join {
+    CREATE TABLE T(a);
+    INSERT INTO t VALUES (1), (2), (3);
+    SELECT * fROM t JOIN t;
+}
+expect error {
+}
+
+test unambiguous-self-join {
+    CREATE TABLE T(a);
+    INSERT INTO t VALUES (1), (2), (3);
+    SELECT * fROM t as ta JOIN t order by ta.a;
+}
+expect {
+    1|1
+    1|2
+    1|3
+    2|1
+    2|2
+    2|3
+    3|1
+    3|2
+    3|3
+}
+
+# Regression test for https://github.com/tursodatabase/turso/issues/3853
+test order-by-limit-0 {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES (1), (2), (3);
+    SELECT * FROM t ORDER BY a LIMIT 0;
+}
+expect {
+}
+
+# Regression test for https://github.com/tursodatabase/turso/issues/3853
+test group-by-limit-0 {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES (1), (2), (3);
+    SELECT a, COUNT(*) FROM t GROUP BY a LIMIT 0;
+}
+expect {
+}
+
+test duplicate-with-cte-name {
+    CREATE TABLE t2(x INTEGER);
+    WITH t as (SELECT 1), t as (SELECT 2)  SELECT  * FROM t2;
+}
+expect error {
+}
+
+# CTE referenced multiple times (issue: CTE cannot be referenced multiple times)
+test cte-multiple-refs-basic {
+    WITH t AS (SELECT 1 as x) SELECT * FROM t, t as t2;
+}
+expect {
+    1|1
+}
+
+test cte-multiple-refs-self-join {
+    WITH t AS (SELECT 1 as x) SELECT * FROM t JOIN t as t2 ON t.x = t2.x;
+}
+expect {
+    1|1
+}
+
+test cte-multiple-refs-scalar-subquery {
+    WITH t AS (SELECT 1 as x) SELECT (SELECT MAX(x) FROM t) as mx, t.x FROM t;
+}
+expect {
+    1|1
+}
+
+test cte-multiple-refs-where-subquery {
+    WITH t AS (SELECT 1 as x, 2 as y) SELECT * FROM t WHERE x IN (SELECT x FROM t);
+}
+expect {
+    1|2
+}
+
+test cte-multiple-refs-with-data {
+    CREATE TABLE items(id INTEGER PRIMARY KEY, val INTEGER);
+    INSERT INTO items VALUES (1, 10), (2, 20), (3, 30);
+    WITH cte AS (SELECT * FROM items WHERE val >= 20)
+    SELECT a.id, b.id FROM cte a, cte b WHERE a.id <= b.id ORDER BY a.id, b.id;
+}
+expect {
+    2|2
+    2|3
+    3|3
+}
+
+# Test CTEs with transitive dependencies and multiple references
+# (b references a, c references b twice but not a directly)
+test cte-transitive-deps-multi-ref {
+    WITH
+    a AS (SELECT 1 as x),
+    b AS (SELECT x + 1 as y FROM a),
+    c AS (SELECT b1.y, b2.y FROM b as b1, b as b2)
+    SELECT * FROM c;
+}
+expect {
+    2|2
+}
+
+# Test CTE chain where later CTE references multiple earlier CTEs
+test cte-multiple-deps {
+    WITH
+    a AS (SELECT 1 as x),
+    b AS (SELECT 2 as y),
+    c AS (SELECT x, y FROM a, b)
+    SELECT * FROM c;
+}
+expect {
+    1|2
+}
+
+# Multiple CTEs all referencing the same base CTE
+test cte-fan-out-refs {
+    WITH
+    base AS (SELECT 1 as x),
+    a AS (SELECT x FROM base),
+    b AS (SELECT x FROM base),
+    c AS (SELECT x FROM base)
+    SELECT a.x + b.x + c.x FROM a, b, c;
+}
+expect {
+    3
+}
+
+# Deep transitive chain with multiple references at the end
+test cte-deep-chain-multi-ref {
+    WITH
+    a AS (SELECT 1 as v),
+    b AS (SELECT v*2 as v FROM a),
+    c AS (SELECT v*2 as v FROM b),
+    d AS (SELECT d1.v, d2.v FROM c d1, c d2)
+    SELECT * FROM d;
+}
+expect {
+    4|4
+}
+
+# CTE referenced in JOIN ON clause
+test cte-join-on-clause {
+    WITH t AS (SELECT 1 as x) SELECT * FROM t t1 JOIN t t2 ON t1.x = t2.x;
+}
+expect {
+    1|1
+}
+
+test collation-rtrim-1 {
+    SELECT 'x' || CHAR(9) = 'x' COLLATE RTRIM;
+}
+expect {
+    0
+}
+
+# Test UNION with different collations
+test collate-compound-1 {
+    CREATE TABLE t1(a TEXT COLLATE NOCASE, b TEXT COLLATE BINARY);
+    INSERT INTO t1 VALUES ('abc', 'ABC'), ('ABC', 'abc'), ('def', 'DEF');
+    SELECT a FROM t1 WHERE a = 'ABC'
+    UNION
+    SELECT b FROM t1 WHERE b = 'ABC';
+}
+expect {
+    ABC
+}
+
+# Test INTERSECT with explicit collation
+test collate-compound-3 {
+    CREATE TABLE t2(x TEXT COLLATE NOCASE);
+    CREATE TABLE t3(y TEXT COLLATE BINARY);
+    INSERT INTO t2 VALUES ('abc'), ('def');
+    INSERT INTO t3 VALUES ('ABC'), ('def');
+    SELECT x FROM t2 INTERSECT SELECT y FROM t3;
+}
+expect {
+    abc
+    def
+}
+
+# Test EXCEPT with collation mismatch
+test collate-compound-4 {
+    CREATE TABLE t(x); -- Workaround because Turso thinks we need to have page 1 allocated
+    SELECT 'abc' COLLATE NOCASE EXCEPT SELECT 'ABC' COLLATE BINARY;
+}
+expect {
+}
+
+# Test compound with COLLATE in result column
+test collate-compound-5 {
+    CREATE TABLE t(x); -- Workaround because Turso thinks we need to have page 1 allocated
+    SELECT 'abc' COLLATE NOCASE
+    UNION
+    SELECT 'ABC' COLLATE NOCASE;
+}
+expect {
+    ABC
+}
+
+# Test nested compound with collations
+test collate-compound-7 {
+    CREATE TABLE t(x); -- Workaround because Turso thinks we need to have page 1 allocated
+    SELECT 'a' COLLATE NOCASE
+    UNION
+    SELECT 'A' COLLATE NOCASE UNION SELECT 'b' COLLATE NOCASE;
+}
+expect {
+    A
+    b
+}
+
+# Test UNION ALL preserving duplicates with case differences
+test collate-compound-8 {
+    CREATE TABLE t(x); -- Workaround because Turso thinks we need to have page 1 allocated
+    SELECT 'Test' COLLATE NOCASE
+    UNION ALL
+    SELECT 'TEST' COLLATE NOCASE
+    UNION ALL
+    SELECT 'test' COLLATE NOCASE;
+}
+expect {
+    Test
+    TEST
+    test
+}
+
+# Test INTERSECT with RTRIM collation
+test collate-compound-9 {
+    CREATE TABLE t(x); -- Workaround because Turso thinks we need to have page 1 allocated
+    SELECT 'abc  ' COLLATE RTRIM
+    INTERSECT
+    SELECT 'abc' COLLATE RTRIM;
+}
+expect raw {
+abc  
+}
+
+# Test compound with collation in WHERE clause
+test collate-compound-10 {
+    CREATE TABLE t(x); -- Workaround because Turso thinks we need to have page 1 allocated
+    CREATE TABLE t4(col TEXT);
+    INSERT INTO t4 VALUES ('abc'), ('ABC'), ('def');
+    SELECT col FROM t4 WHERE col = 'ABC' COLLATE NOCASE
+    UNION
+    SELECT col FROM t4 WHERE col = 'DEF' COLLATE NOCASE;
+}
+expect {
+    ABC
+    abc
+    def
+}
+
+# Test EXCEPT with multiple collations
+test collate-compound-11 {
+    CREATE TABLE t(x); -- Workaround because Turso thinks we need to have page 1 allocated
+    SELECT 'apple' UNION SELECT 'BANANA' UNION SELECT 'cherry'
+    EXCEPT
+    SELECT 'APPLE' COLLATE BINARY;
+}
+expect {
+    BANANA
+    apple
+    cherry
+}
+
+# Test UNION with table having default collation vs explicit
+test collate-compound-13 {
+    CREATE TABLE t5(n TEXT COLLATE NOCASE);
+    INSERT INTO t5 VALUES ('Test');
+    SELECT n FROM t5
+    UNION
+    SELECT 'TEST' COLLATE BINARY;
+}
+expect {
+    TEST
+}
+
+# Test three-way compound with different collations
+test collate-compound-14 {
+    CREATE TABLE t(x); -- Workaround because Turso thinks we need to have page 1 allocated
+    SELECT 'abc'
+    UNION
+    SELECT 'ABC' COLLATE NOCASE
+    UNION
+    SELECT 'def';
+}
+expect {
+    ABC
+    def
+}
+
+# Test INTERSECT ALL (if supported) with collations
+test collate-compound-15 {
+    CREATE TABLE t(x); -- Workaround because Turso thinks we need to have page 1 allocated
+    SELECT 'test' COLLATE NOCASE
+    INTERSECT
+    SELECT 'TEST' COLLATE NOCASE;
+}
+expect {
+    test
+}
+
+# Queries that use an idx and have to do an affinity conversion
+test affinity-conversion-1 {
+    CREATE TABLE t(a TEXT);
+    INSERT INTO t VALUES ('10'), ('2'), ('02'), ('2a');
+    CREATE INDEX idx ON t(a);
+    SELECT * FROM t WHERE a >= 2;
+}
+expect {
+    2
+    2a
+}
+
+test affinity-conversion-2 {
+    CREATE TABLE t(a TEXT);
+    INSERT INTO t VALUES ('10'), ('2'), ('02'), ('2a');
+    CREATE INDEX idx ON t(a);
+    SELECT * FROM t WHERE a == 2;
+}
+expect {
+    2
+}
+
+# Test suite for SQLite affinity conversion in WHERE clauses
+# ============================================
+# TEST 1: TEXT column with INTEGER value
+# Should emit OP_Affinity to convert 2 → '2'
+# ============================================
+test affinity-conversion-4 {
+    CREATE TABLE t1(a TEXT);
+    INSERT INTO t1 VALUES ('10'), ('2'), ('02'), ('2a');
+    CREATE INDEX idx1 ON t1(a);
+    SELECT * FROM t1 WHERE a >= 2;
+}
+expect {
+    2
+    2a
+}
+
+# ============================================
+# TEST 2: TEXT column with INTEGER equality
+# Should emit OP_Affinity for equality comparison
+# ============================================
+test affinity-conversion-5 {
+    CREATE TABLE t2(name TEXT);
+    INSERT INTO t2 VALUES ('100'), ('20'), ('abc'), ('2');
+    CREATE INDEX idx2 ON t2(name);
+    SELECT * FROM t2 WHERE name = 100;
+}
+expect {
+    100
+}
+
+# ============================================
+# TEST 3: INTEGER column with convertible string
+# Should emit OP_Affinity with INTEGER affinity
+# ============================================
+test affinity-conversion-6 {
+    CREATE TABLE t3(value INTEGER);
+    INSERT INTO t3 VALUES (100), (20), (5), (200);
+    CREATE INDEX idx3 ON t3(value);
+    SELECT * FROM t3 WHERE value >= '100';
+}
+expect {
+    100
+    200
+}
+
+# ============================================
+# TEST 4: INTEGER column with non-convertible string
+# String 'abc' cannot convert to integer
+# ============================================
+test affinity-conversion-7 {
+    CREATE TABLE t4(value INTEGER);
+    INSERT INTO t4 VALUES (100), (20), (5);
+    CREATE INDEX idx4 ON t4(value);
+    SELECT * FROM t4 WHERE value >= 'abc';
+}
+expect {
+}
+
+# ============================================
+# TEST 5: NUMERIC column with integer
+# Should emit OP_Affinity with NUMERIC affinity
+# ============================================
+test affinity-conversion-8 {
+    CREATE TABLE t5(score NUMERIC);
+    INSERT INTO t5 VALUES (100), (20.5), ('30'), (45);
+    CREATE INDEX idx5 ON t5(score);
+    SELECT * FROM t5 WHERE score >= 50;
+}
+expect {
+    100
+}
+
+# ============================================
+# TEST 6: REAL column with integer
+# Should emit OP_Affinity to convert to REAL
+# ============================================
+test affinity-conversion-9 {
+    CREATE TABLE t6(price REAL);
+    INSERT INTO t6 VALUES (99.99), (19.99), (50.00), (25.50);
+    CREATE INDEX idx6 ON t6(price);
+    SELECT * FROM t6 WHERE price < 50;
+}
+expect {
+    19.99
+    25.5
+}
+
+# ============================================
+# TEST 7: TEXT column with REAL value
+# Should emit OP_Affinity to convert 20.5 → '20.5'
+# ============================================
+test affinity-conversion-10 {
+    CREATE TABLE t7(name TEXT);
+    INSERT INTO t7 VALUES ('100'), ('20.5'), ('abc'), ('30');
+    CREATE INDEX idx7 ON t7(name);
+    SELECT * FROM t7 WHERE name = 20.5;
+}
+expect {
+    20.5
+}
+
+# ============================================
+# TEST 8: TEXT column with IN clause
+# Should emit OP_Affinity for batch conversion
+# ============================================
+test affinity-conversion-11 {
+    CREATE TABLE t8(name TEXT);
+    INSERT INTO t8 VALUES ('1'), ('2'), ('3'), ('4'), ('abc');
+    CREATE INDEX idx8 ON t8(name);
+    SELECT * FROM t8 WHERE name IN (1, 2, 3);
+}
+expect {
+    1
+    2
+    3
+}
+
+# ============================================
+# TEST 9: Compound index with mixed types
+# Should emit OP_Affinity with multi-char affinity string
+# ============================================
+test affinity-conversion-12 {
+    CREATE TABLE t9(a TEXT, b INTEGER, c NUMERIC);
+    INSERT INTO t9 VALUES ('100', 200, 300);
+    INSERT INTO t9 VALUES ('50', 100, 150);
+    INSERT INTO t9 VALUES ('200', 300, 400);
+    CREATE INDEX idx9 ON t9(a, b, c);
+    SELECT * FROM t9 WHERE a = 100 AND b = '200' AND c >= 300;
+}
+expect {
+    100|200|300
+}
+
+# ============================================
+# TEST 10: INTEGER PRIMARY KEY range (NO affinity)
+# Contrast: should NOT emit OP_Affinity
+# ============================================
+test affinity-conversion-13 {
+    CREATE TABLE t10(x INTEGER PRIMARY KEY);
+    INSERT INTO t10 VALUES (1), (2), (100), (200);
+    SELECT * FROM t10 WHERE x < '100';
+}
+expect {
+    1
+    2
+}
+
+# TODO: INDEXED BY not supported yet
+# ============================================
+# TEST 11: Same query but forcing index usage
+# Should emit OP_Affinity (takes indexed path)
+# ============================================
+# do_execsql_test_on_specific_db {:memory:} affinity-conversion-14 {
+#   CREATE TABLE t11(x INTEGER PRIMARY KEY);
+#   INSERT INTO t11 VALUES (1), (2), (100), (200);
+#   CREATE INDEX idx11 ON t11(x);
+#   SELECT * FROM t11 INDEXED BY idx11 WHERE x < '100';
+# } {1 2}
+# ============================================
+# TEST 12: TEXT column with string that looks numeric
+# Should apply TEXT affinity and use lexicographic order
+# ============================================
+test affinity-conversion-15 {
+    CREATE TABLE t12(name TEXT);
+    INSERT INTO t12 VALUES ('1'), ('10'), ('2'), ('20');
+    CREATE INDEX idx12 ON t12(name);
+    SELECT * FROM t12 WHERE name >= '2' ORDER BY name;
+}
+expect {
+    2
+    20
+}
+
+# ============================================
+# TEST 13: INTEGER column with float string
+# Should convert '50.5' to 50 (INTEGER affinity)
+# ============================================
+test affinity-conversion-16 {
+    CREATE TABLE t13(value INTEGER);
+    INSERT INTO t13 VALUES (50), (51), (100);
+    CREATE INDEX idx13 ON t13(value);
+    SELECT * FROM t13 WHERE value >= '50.5';
+}
+expect {
+    51
+    100
+}
+
+# ============================================
+# TEST 14: NUMERIC with text that converts
+# Should apply NUMERIC affinity
+# ============================================
+test affinity-conversion-17 {
+    CREATE TABLE t14(score NUMERIC);
+    INSERT INTO t14 VALUES (10), (20), (30), (40);
+    CREATE INDEX idx14 ON t14(score);
+    SELECT * FROM t14 WHERE score BETWEEN '15' AND '35';
+}
+expect {
+    20
+    30
+}
+
+# ============================================
+# TEST 15: Multiple columns, only one needs conversion
+# Should emit affinity string with mixed affinities
+# ============================================
+test affinity-conversion-18 {
+    CREATE TABLE t15(a INTEGER, b TEXT);
+    INSERT INTO t15 VALUES (1, '100'), (2, '200'), (3, '300');
+    CREATE INDEX idx15 ON t15(a, b);
+    SELECT * FROM t15 WHERE a = '2' AND b = 200;
+}
+expect {
+    2|200
+}
+
+# ============================================
+# TEST 16: BLOB column (should not convert)
+# BLOB affinity doesn't perform conversions
+# ============================================
+test affinity-conversion-19 {
+    CREATE TABLE t16(data BLOB);
+    INSERT INTO t16 VALUES (X'48656c6c6f'), (X'576f726c64');
+    CREATE INDEX idx16 ON t16(data);
+    SELECT typeof(data) FROM t16 WHERE data >= X'48';
+}
+expect {
+    blob
+    blob
+}
+
+# ============================================
+# TEST 17: Negative numbers with TEXT affinity
+# Should convert -5 to '-5' for comparison
+# ============================================
+test affinity-conversion-20 {
+    CREATE TABLE t17(name TEXT);
+    INSERT INTO t17 VALUES ('-10'), ('-5'), ('0'), ('5');
+    CREATE INDEX idx17 ON t17(name);
+    SELECT * FROM t17 WHERE name >= -5;
+}
+expect {
+    -5
+    0
+    5
+}
+
+# ============================================
+# TEST 18: Zero with different types
+# Tests affinity with special value zero
+# ============================================
+test affinity-conversion-21 {
+    CREATE TABLE t18(value NUMERIC);
+    INSERT INTO t18 VALUES (0), (0.0), ('0'), (1), (-1);
+    CREATE INDEX idx18 ON t18(value);
+    SELECT * FROM t18 WHERE value = 0;
+}
+expect {
+    0
+    0
+    0
+}
+
+# ============================================
+# TEST 19: Large numbers requiring conversion
+# Tests affinity (B) with large integer values
+# ============================================
+test affinity-conversion-22 {
+    CREATE TABLE t19(val TEXT);
+    INSERT INTO t19 VALUES ('1000000'), ('999999'), ('1000001');
+    CREATE INDEX idx19 ON t19(val);
+    SELECT * FROM t19 WHERE val = 1000000;
+}
+expect {
+    1000000
+}
+
+test large-values-comparison {
+    SELECT CAST('8211127122155032455' AS REAL) = CAST('8211127122155032455' AS INTEGER),
+    8211127122155032455 = 8211127122155033000;
+}
+expect {
+    0|0
+}
+
+setup headers {
+    .headers on
+}
+
+@backend cli
+@setup headers
+test compound-headers-1 {
+    .headers on
+    CREATE TABLE t(x);
+    SELECT * FROM t UNION VALUES(1);
+}
+expect {
+    x
+    1
+}
+
+@backend cli
+@setup headers
+test compound-headers-2 {
+    .headers on
+    CREATE TABLE t(x);
+    VALUES(1) UNION SELECT * FROM t;
+}
+expect {
+    column1
+    1
+}
+
+test values-select-empty-db {
+    values (1) intersect values (1);
+}
+expect {
+    1
+}
+
+test select-sqlite-schema-empty-db {
+    select group_concat(name) over () from sqlite_schema;
+}
+expect {
+}
+
+# Test BETWEEN ... AND ... IS NOT NULL operator precedence (issue #4653)
+# The IS NOT NULL should bind to the whole BETWEEN expression, not just the end value
+test between-is-not-null-precedence {
+    SELECT 'x' BETWEEN 1 AND 2 IS NOT NULL;
+}
+expect {
+    1
+}
+
+# Test LIKE ... IS NOT NULL operator precedence (issue #4653)
+test like-is-not-null-precedence {
+    SELECT 'x' LIKE 'y' IS NOT NULL;
+}
+expect {
+    1
+}
+
+# Test GLOB ... IS NOT NULL operator precedence (issue #4653)
+test glob-is-not-null-precedence {
+    SELECT 'x' GLOB 'y' IS NOT NULL;
+}
+expect {
+    1
+}
+

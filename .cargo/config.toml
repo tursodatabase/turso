@@ -35,6 +35,35 @@ rustflags = [
 [target.'cfg(target_env = "msvc")']
 rustflags = [
   "--cfg=tokio_unstable",
-  "-C", 
+  "-C",
   "link-args=/FORCE"
+]
+
+# Android targets need 16KB page alignment for Android 15+ compatibility
+[target.aarch64-linux-android]
+rustflags = [
+  "--cfg=tokio_unstable",
+  "-C",
+  "link-args=-Wl,-z,max-page-size=16384",
+]
+
+[target.armv7-linux-androideabi]
+rustflags = [
+  "--cfg=tokio_unstable",
+  "-C",
+  "link-args=-Wl,-z,max-page-size=16384",
+]
+
+[target.x86_64-linux-android]
+rustflags = [
+  "--cfg=tokio_unstable",
+  "-C",
+  "link-args=-Wl,-z,max-page-size=16384",
+]
+
+[target.i686-linux-android]
+rustflags = [
+  "--cfg=tokio_unstable",
+  "-C",
+  "link-args=-Wl,-z,max-page-size=16384",
 ]

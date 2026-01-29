@@ -1,4 +1,6 @@
-﻿namespace Turso;
+﻿using Turso.Raw.Public.Value;
+
+namespace Turso;
 
 public class TursoConnectionOptions
 {
@@ -41,6 +43,28 @@ public class TursoConnectionOptions
         set => AddOption(keyword, value  ?? "");
     }
 
+    /// <summary>
+    /// Gets the encryption cipher from the connection options.
+    /// </summary>
+    /// <returns>The cipher enum value, or null if not specified or invalid.</returns>
+    public TursoEncryptionCipher? GetEncryptionCipher()
+    {
+        var cipherStr = GetOption("Encryption Cipher");
+        if (cipherStr is null) return null;
+
+        return cipherStr.ToLowerInvariant() switch
+        {
+            "aes128gcm" => TursoEncryptionCipher.Aes128Gcm,
+            "aes256gcm" => TursoEncryptionCipher.Aes256Gcm,
+            "aegis256" => TursoEncryptionCipher.Aegis256,
+            "aegis256x2" => TursoEncryptionCipher.Aegis256x2,
+            "aegis128l" => TursoEncryptionCipher.Aegis128l,
+            "aegis128x2" => TursoEncryptionCipher.Aegis128x2,
+            "aegis128x4" => TursoEncryptionCipher.Aegis128x4,
+            _ => throw new InvalidOperationException($"Unknown encryption cipher: {cipherStr}")
+        };
+    }
+
     private readonly string[] _valid_keywords = [
         "Data Source",
         "Mode",
@@ -50,7 +74,9 @@ public class TursoConnectionOptions
         "Recursive Triggers",
         "Default Timeout",
         "Pooling",
-        "Vfs"
+        "Vfs",
+        "Encryption Cipher",
+        "Encryption Key"
     ];
 
     public static TursoConnectionOptions Parse(string connectionString)

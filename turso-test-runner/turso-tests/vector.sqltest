@@ -81,7 +81,7 @@ test vector-insert-double-quotes {
     VALUES (2, 'Bracketed_comma_separated', vector("[4.000000,5.000000,6.000000]"));
 }
 expect error {
-    no such column: [4.000000,5.000000,6.000000]
+    .*no such column: \[4.000000,5.000000,6.000000\]
 }
 
 test vector-distance-dot-table {

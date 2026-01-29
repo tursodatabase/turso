@@ -1,4 +1,5 @@
 use crate::sync::RwLock;
+use rustc_hash::FxHashSet as HashSet;
 use turso_parser::ast::{self, Expr, Literal, Name, QualifiedName, RefAct};
 
 use super::{translate_inner, ProgramBuilder, ProgramBuilderOpts};
@@ -13,7 +14,7 @@ use crate::{
     },
     Connection, LimboError, Result, Statement, Value,
 };
-use std::{collections::HashSet, num::NonZero, num::NonZeroUsize, sync::Arc};
+use std::{num::NonZero, num::NonZeroUsize, sync::Arc};
 
 #[inline]
 pub fn emit_guarded_fk_decrement(

@@ -29,8 +29,8 @@ use crate::vdbe::hash_table::{HashEntry, HashTable, HashTableConfig, DEFAULT_MEM
 use crate::vdbe::insn::InsertFlags;
 use crate::vdbe::value::ComparisonOp;
 use crate::vdbe::{
-    registers_to_ref_values, EndStatement, OpHashBuildState, OpHashProbeState, StepResult,
-    TxnCleanup,
+    registers_to_ref_values, DeferredSeekState, EndStatement, OpHashBuildState, OpHashProbeState,
+    StepResult, TxnCleanup,
 };
 use crate::vector::{
     vector32, vector32_sparse, vector64, vector_concat, vector_distance_cos, vector_distance_dot,
@@ -365,17 +365,17 @@ pub fn op_checkpoint(
             program.connection.get_sync_mode(),
         ));
         let CheckpointResult {
-            num_attempted,
-            num_backfilled,
+            wal_max_frame,
+            wal_total_backfilled,
             ..
         } = pager.io.block(|| ckpt_sm.step(&()))?;
         // https://sqlite.org/pragma.html#pragma_wal_checkpoint
         // 1st col: 1 (checkpoint SQLITE_BUSY) or 0 (not busy).
         state.registers[*dest] = Register::Value(Value::Integer(0));
         // 2nd col: # modified pages written to wal file
-        state.registers[*dest + 1] = Register::Value(Value::Integer(num_attempted as i64));
+        state.registers[*dest + 1] = Register::Value(Value::Integer(wal_max_frame as i64));
         // 3rd col: # pages moved to db after checkpoint
-        state.registers[*dest + 2] = Register::Value(Value::Integer(num_backfilled as i64));
+        state.registers[*dest + 2] = Register::Value(Value::Integer(wal_total_backfilled as i64));
 
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
@@ -387,17 +387,18 @@ pub fn op_checkpoint(
     );
     match step_result {
         Ok(IOResult::Done(CheckpointResult {
-            num_attempted,
-            num_backfilled,
+            wal_max_frame,
+            wal_total_backfilled,
             ..
         })) => {
             // https://sqlite.org/pragma.html#pragma_wal_checkpoint
             // 1st col: 1 (checkpoint SQLITE_BUSY) or 0 (not busy).
             state.registers[*dest] = Register::Value(Value::Integer(0));
             // 2nd col: # modified pages written to wal file
-            state.registers[*dest + 1] = Register::Value(Value::Integer(num_attempted as i64));
+            state.registers[*dest + 1] = Register::Value(Value::Integer(wal_max_frame as i64));
             // 3rd col: # pages moved to db after checkpoint
-            state.registers[*dest + 2] = Register::Value(Value::Integer(num_backfilled as i64));
+            state.registers[*dest + 2] =
+                Register::Value(Value::Integer(wal_total_backfilled as i64));
 
             state.pc += 1;
             Ok(InsnFunctionStepResult::Step)
@@ -1411,12 +1412,10 @@ pub fn op_column(
     'outer: loop {
         match state.op_column_state {
             OpColumnState::Start => {
-                if let Some((index_cursor_id, table_cursor_id)) =
-                    state.deferred_seeks[*cursor_id].take()
-                {
+                if let Some(deferred) = state.deferred_seeks[*cursor_id].take() {
                     state.op_column_state = OpColumnState::Rowid {
-                        index_cursor_id,
-                        table_cursor_id,
+                        index_cursor_id: deferred.index_cursor_id,
+                        table_cursor_id: deferred.table_cursor_id,
                     };
                 } else {
                     state.op_column_state = OpColumnState::GetColumn;
@@ -1467,12 +1466,13 @@ pub fn op_column(
                 state.op_column_state = OpColumnState::GetColumn;
             }
             OpColumnState::GetColumn => {
+                let (active_cursor_id, active_column) = (*cursor_id, *column);
                 // First check if this is a MaterializedViewCursor
                 {
-                    let cursor = state.get_cursor(*cursor_id);
+                    let cursor = state.get_cursor(active_cursor_id);
                     if let Cursor::MaterializedView(mv_cursor) = cursor {
                         // Handle materialized view column access
-                        let value = return_if_io!(mv_cursor.column(*column));
+                        let value = return_if_io!(mv_cursor.column(active_column));
                         state.registers[*dest] = Register::Value(value);
                         break 'outer;
                     }
@@ -1481,15 +1481,15 @@ pub fn op_column(
 
                 let (_, cursor_type) = program
                     .cursor_ref
-                    .get(*cursor_id)
+                    .get(active_cursor_id)
                     .expect("cursor_id should exist in cursor_ref");
                 match cursor_type {
                     CursorType::BTreeTable(_)
                     | CursorType::BTreeIndex(_)
                     | CursorType::MaterializedView(_, _) => {
-                        'ifnull: {
+                        {
                             let cursor_ref = must_be_btree_cursor!(
-                                *cursor_id,
+                                active_cursor_id,
                                 program.cursor_ref,
                                 state,
                                 "Column"
@@ -1504,7 +1504,12 @@ pub fn op_column(
 
                             let record_result = return_if_io!(cursor.record());
                             let Some(record) = record_result else {
-                                break 'ifnull;
+                                // Cursor is not positioned on a valid row (e.g., empty table).
+                                // Return NULL, not the column's default value.
+                                // DEFAULT handling below is for when record exists
+                                // but has fewer columns than expected.
+                                state.registers[*dest] = Register::Value(Value::Null);
+                                break 'outer;
                             };
 
                             let mut payload_iterator = record.iter()?;
@@ -2073,7 +2078,13 @@ pub fn op_transaction(
     insn: &Insn,
     pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
-    match op_transaction_inner(program, state, insn, pager) {
+    let result = op_transaction_inner(program, state, insn, pager);
+    tracing::debug!(
+        "op_transaction: end: state={:?}, tx_state={:?}",
+        state.op_transaction_state,
+        program.connection.get_tx_state()
+    );
+    match result {
         Ok(result) => Ok(result),
         Err(err) => {
             state.op_transaction_state = OpTransactionState::Start;
@@ -2120,7 +2131,7 @@ pub fn op_transaction_inner(
                     match (current_state, write) {
                         // pending state means that we tried beginning a tx and the method returned IO.
                         // instead of ending the read tx, just update the state to pending.
-                        (TransactionState::PendingUpgrade, write) => {
+                        (TransactionState::PendingUpgrade { .. }, write) => {
                             turso_assert!(
                                 write,
                                 "pending upgrade should only be set for write transactions"
@@ -2180,7 +2191,7 @@ pub fn op_transaction_inner(
                                 mv_store.begin_exclusive_tx(pager.clone(), None)?
                             }
                         };
-                        *program.connection.mv_tx.write() = Some((tx_id, *tx_mode));
+                        program.connection.set_mv_tx(Some((tx_id, *tx_mode)));
                     } else if updated {
                         // TODO: fix tx_mode in Insn::Transaction, now each statement overrides it even if there's already a CONCURRENT Tx in progress, for example
                         let (tx_id, mv_tx_mode) = current_mv_tx
@@ -2225,20 +2236,31 @@ pub fn op_transaction_inner(
                             // We failed to upgrade to write transaction so put the transaction into its original state.
                             // That is, if the transaction had not started, end the read transaction so that next time we
                             // start a new one.
-                            if matches!(current_state, TransactionState::None) {
-                                pager.end_read_tx();
-                                conn.set_tx_state(TransactionState::None);
-                                state.auto_txn_cleanup = TxnCleanup::None;
+                            match current_state {
+                                TransactionState::None
+                                | TransactionState::PendingUpgrade {
+                                    has_read_txn: false,
+                                } => {
+                                    pager.end_read_tx();
+                                    conn.set_tx_state(TransactionState::None);
+                                    state.auto_txn_cleanup = TxnCleanup::None;
+                                }
+                                TransactionState::Read
+                                | TransactionState::PendingUpgrade { has_read_txn: true } => {
+                                    conn.set_tx_state(TransactionState::Read);
+                                }
+                                TransactionState::Write { .. } => {
+                                    panic!("impossible state: {current_state:?}")
+                                }
                             }
-                            assert_eq!(conn.get_tx_state(), current_state);
                             return Err(begin_w_tx_res.unwrap_err());
                         }
                         if let IOResult::IO(io) = begin_w_tx_res? {
                             // set the transaction state to pending so we don't have to
                             // end the read transaction.
-                            program
-                                .connection
-                                .set_tx_state(TransactionState::PendingUpgrade);
+                            conn.set_tx_state(TransactionState::PendingUpgrade {
+                                has_read_txn: matches!(current_state, TransactionState::Read),
+                            });
                             return Ok(InsnFunctionStepResult::IO(io));
                         }
                     }
@@ -2278,7 +2300,7 @@ pub fn op_transaction_inner(
                 state.op_transaction_state = OpTransactionState::BeginStatement;
             }
             OpTransactionState::BeginStatement => {
-                if program.needs_stmt_subtransactions {
+                if program.needs_stmt_subtransactions.load(Ordering::Relaxed) {
                     let write = matches!(tx_mode, TransactionMode::Write);
                     let res = state.begin_statement(&program.connection, &pager, write)?;
                     if let IOResult::IO(io) = res {
@@ -2718,12 +2740,10 @@ pub fn op_row_id(
     loop {
         match state.op_row_id_state {
             OpRowIdState::Start => {
-                if let Some((index_cursor_id, table_cursor_id)) =
-                    state.deferred_seeks[*cursor_id].take()
-                {
+                if let Some(deferred) = state.deferred_seeks[*cursor_id].take() {
                     state.op_row_id_state = OpRowIdState::Record {
-                        index_cursor_id,
-                        table_cursor_id,
+                        index_cursor_id: deferred.index_cursor_id,
+                        table_cursor_id: deferred.table_cursor_id,
                     };
                 } else {
                     state.op_row_id_state = OpRowIdState::GetRowid;
@@ -2957,7 +2977,10 @@ pub fn op_deferred_seek(
         },
         insn
     );
-    state.deferred_seeks[*table_cursor_id] = Some((*index_cursor_id, *table_cursor_id));
+    state.deferred_seeks[*table_cursor_id] = Some(DeferredSeekState {
+        index_cursor_id: *index_cursor_id,
+        table_cursor_id: *table_cursor_id,
+    });
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -2969,8 +2992,8 @@ pub fn op_deferred_seek(
 #[derive(Debug)]
 pub enum OpSeekKey {
     TableRowId(i64),
-    IndexKeyOwned(ImmutableRecord),
     IndexKeyFromRegister(usize),
+    IndexKeyUnpacked { start_reg: usize, num_regs: usize },
 }
 
 #[derive(Debug)]
@@ -3120,10 +3143,11 @@ pub fn seek_internal(
                                 start_reg,
                                 num_regs,
                             } => {
-                                let record_from_regs =
-                                    make_record(&state.registers, &start_reg, &num_regs);
                                 state.seek_state = OpSeekState::Seek {
-                                    key: OpSeekKey::IndexKeyOwned(record_from_regs),
+                                    key: OpSeekKey::IndexKeyUnpacked {
+                                        start_reg,
+                                        num_regs,
+                                    },
                                     op,
                                 };
                             }
@@ -3225,20 +3249,45 @@ pub fn seek_internal(
                     continue;
                 }
                 OpSeekState::Seek { key, op } => {
-                    let seek_result = {
-                        let cursor = get_cursor!(state, cursor_id);
-                        let cursor = cursor.as_btree_mut();
-                        let seek_key = match key {
-                        OpSeekKey::TableRowId(rowid) => SeekKey::TableRowId(*rowid),
-                        OpSeekKey::IndexKeyOwned(record) => SeekKey::IndexKey(record),
-                        OpSeekKey::IndexKeyFromRegister(record_reg) => match &state.registers[*record_reg] {
-                            Register::Record(ref record) => SeekKey::IndexKey(record),
-                            _ => unreachable!("op_seek: record_reg should be a Record register when OpSeekKey::IndexKeyFromRegister is used"),
+                    let seek_result = match key {
+                        OpSeekKey::TableRowId(rowid) => {
+                            let cursor = get_cursor!(state, cursor_id).as_btree_mut();
+                            match cursor.seek(SeekKey::TableRowId(*rowid), *op)? {
+                                IOResult::Done(seek_result) => seek_result,
+                                IOResult::IO(io) => return Ok(SeekInternalResult::IO(io)),
+                            }
                         }
-                    };
-                        match cursor.seek(seek_key, *op)? {
-                            IOResult::Done(seek_result) => seek_result,
-                            IOResult::IO(io) => return Ok(SeekInternalResult::IO(io)),
+                        OpSeekKey::IndexKeyFromRegister(record_reg) => {
+                            let (cursor, record) = {
+                                let (cursors, registers) = (&mut state.cursors, &state.registers);
+                                let cursor = cursors
+                                    .get_mut(cursor_id)
+                                    .and_then(|c| c.as_mut())
+                                    .expect("op_seek: cursor should be allocated")
+                                    .as_btree_mut();
+                                let record = match &registers[*record_reg] {
+                                    Register::Record(ref record) => record,
+                                    _ => unreachable!("op_seek: record_reg should be a Record register when OpSeekKey::IndexKeyFromRegister is used"),
+                                };
+                                (cursor, record)
+                            };
+                            match cursor.seek(SeekKey::IndexKey(record), *op)? {
+                                IOResult::Done(seek_result) => seek_result,
+                                IOResult::IO(io) => return Ok(SeekInternalResult::IO(io)),
+                            }
+                        }
+                        OpSeekKey::IndexKeyUnpacked {
+                            start_reg,
+                            num_regs,
+                        } => {
+                            let start_reg = *start_reg;
+                            let num_regs = *num_regs;
+                            let cursor = get_cursor!(state, cursor_id).as_btree_mut();
+                            let registers = &state.registers[start_reg..start_reg + num_regs];
+                            match cursor.seek_unpacked(registers, *op)? {
+                                IOResult::Done(seek_result) => seek_result,
+                                IOResult::IO(io) => return Ok(SeekInternalResult::IO(io)),
+                            }
                         }
                     };
                     // Increment btree_seeks metric after seek operation and cursor is dropped
@@ -3636,6 +3685,415 @@ fn apply_kbn_step_int(acc: &mut Value, i: i64, state: &mut SumAggState) {
     }
 }
 
+/// Initialize aggregate payload with default values.
+/// Payload layout by aggregate type:
+/// - Count/Count0: [Integer(0)]
+/// - Sum: [Null, Float(0.0), Integer(0), Integer(0)]  // acc, r_err, approx, ovrfl
+/// - Total: [Float(0.0), Float(0.0), Integer(0), Integer(0)]  // same but starts at 0.0
+/// - Avg: [Float(0.0), Float(0.0), Integer(0)]  // sum, r_err, count - uses KBN like SUM
+/// - Min/Max: [Null]
+/// - GroupConcat/StringAgg: [Text("")]
+/// - JsonGroupObject/JsonbGroupObject: [Blob([])]
+/// - JsonGroupArray/JsonbGroupArray: [Blob([])]
+fn init_agg_payload(func: &AggFunc, payload: &mut Vec<Value>) -> Result<()> {
+    match func {
+        AggFunc::Count | AggFunc::Count0 => payload.push(Value::Integer(0)),
+        AggFunc::Sum | AggFunc::Total => {
+            let acc = if matches!(func, AggFunc::Total) {
+                Value::Float(0.0)
+            } else {
+                Value::Null
+            };
+            payload.push(acc);
+            payload.push(Value::Float(0.0));
+            payload.push(Value::Integer(0));
+            payload.push(Value::Integer(0));
+        }
+        AggFunc::Avg => {
+            payload.push(Value::Float(0.0));
+            payload.push(Value::Float(0.0));
+            payload.push(Value::Integer(0));
+        }
+        AggFunc::Min | AggFunc::Max => payload.push(Value::Null),
+        AggFunc::GroupConcat | AggFunc::StringAgg => {
+            payload.push(Value::build_text(""));
+        }
+        AggFunc::External(_) => {
+            // External aggregates use ExternalAggState, not flat payload
+            return Err(LimboError::InternalError(
+                "External aggregate not supported in init_agg_payload".to_string(),
+            ));
+        }
+        #[cfg(feature = "json")]
+        AggFunc::JsonGroupObject | AggFunc::JsonbGroupObject => {
+            payload.push(Value::Blob(vec![]));
+        }
+        #[cfg(feature = "json")]
+        AggFunc::JsonGroupArray | AggFunc::JsonbGroupArray => {
+            payload.push(Value::Blob(vec![]));
+        }
+    };
+    Ok(())
+}
+
+/// Process a single input row and update the aggregate state in the payload.
+///
+/// This is the core aggregation logic shared between both aggregation strategies:
+/// - **Register-based (sort-stream)**: Called from `op_agg_step` (AggStep instruction).
+///   The payload lives in `AggContext::Builtin` stored in a register.
+/// - **Hash-based (future enhancement)**: Called from `step_aggregate` during HashAggStep. The payload lives
+///   in hash table entries keyed by GROUP BY values.
+///
+/// The payload slice contains the intermediate aggregate state (initialized by
+/// `init_agg_payload`), and this function incorporates the new row's values.
+///
+/// # Payload layouts (see `init_agg_payload` for initial values):
+/// - **Count**: `[count: Integer]` - increments if arg is not NULL
+/// - **Count0**: `[count: Integer]` - always increments (COUNT(*))
+/// - **Avg**: `[sum: Float, r_err: Float, count: Integer]` - uses KBN compensation like SUM
+/// - **Sum/Total**: `[acc, r_err: Float, approx: Integer, ovrfl: Integer]`
+///   - `acc`: running sum (Null/Integer/Float depending on inputs)
+///   - `r_err`: Kahan-Babuška-Neumaier compensation term for floating-point precision
+///   - `approx`: 1 if result is approximate (float arithmetic used)
+///   - `ovrfl`: 1 if integer overflow occurred (Total promotes to float, Sum errors)
+/// - **Min/Max**: `[current_extreme: Value]` - tracks min/max seen so far
+/// - **GroupConcat/StringAgg**: `[accumulated: Text]` - concatenated string
+/// - **JsonGroup***: `[raw_jsonb: Blob]` - accumulated raw JSONB bytes
+fn update_agg_payload(
+    func: &AggFunc,
+    arg: Value,                // most agg functions take one argument
+    maybe_arg2: Option<Value>, // for GroupConcat/StringAgg, JsonGroupObject/JsonbGroupObject,
+    payload: &mut [Value],
+    collation: CollationSeq,
+) -> Result<()> {
+    match func {
+        AggFunc::Count => {
+            // COUNT(column) increments only when arg is not NULL. Empty args treated as non-NULL
+            // (would indicate a bug in query translation, but matches SQLite behavior of counting).
+            if !matches!(arg, Value::Null) {
+                // invariant as per init_agg_payload: payload[0] is always an integer
+                let Value::Integer(i) = &mut payload[0] else {
+                    return Err(LimboError::InternalError(
+                        "Count: payload is not an integer".to_string(),
+                    ));
+                };
+                *i = i.checked_add(1).ok_or(LimboError::IntegerOverflow)?;
+            }
+        }
+        AggFunc::Count0 => {
+            // invariant as per init_agg_payload: payload[0] is always an integer
+            let Value::Integer(i) = &mut payload[0] else {
+                return Err(LimboError::InternalError(
+                    "Count0: payload is not an integer".to_string(),
+                ));
+            };
+            *i = i.checked_add(1).ok_or(LimboError::IntegerOverflow)?;
+        }
+        AggFunc::Avg => {
+            if matches!(arg, Value::Null) {
+                return Ok(());
+            }
+            // invariant as per init_agg_payload: payload[0] is Float (sum), payload[1] is Float (r_err), payload[2] is Integer (count)
+            let [sum_val, r_err_val, count_val, ..] = payload else {
+                return Err(LimboError::InternalError(
+                    "Avg: payload too short".to_string(),
+                ));
+            };
+            let Value::Float(r_err) = r_err_val else {
+                return Err(LimboError::InternalError(
+                    "Avg: payload[1] is not a float".to_string(),
+                ));
+            };
+            let Value::Integer(count) = count_val else {
+                return Err(LimboError::InternalError(
+                    "Avg: payload[2] is not an integer".to_string(),
+                ));
+            };
+            let val = match arg {
+                Value::Integer(i) => i as f64,
+                Value::Float(f) => f,
+                Value::Text(t) => match try_for_float(t.as_str()).1 {
+                    ParsedNumber::Integer(i) => i as f64,
+                    ParsedNumber::Float(f) => f,
+                    ParsedNumber::None => 0.0,
+                },
+                Value::Blob(b) => match std::str::from_utf8(&b) {
+                    Ok(s) => match try_for_float(s).1 {
+                        ParsedNumber::Integer(i) => i as f64,
+                        ParsedNumber::Float(f) => f,
+                        ParsedNumber::None => 0.0,
+                    },
+                    Err(_) => 0.0,
+                },
+                Value::Null => unreachable!(),
+            };
+            // Use Kahan-Babuška-Neumaier compensation for better floating-point precision
+            let s = sum_val.as_float();
+            let t = s + val;
+            let correction = if s.abs() > val.abs() {
+                (s - t) + val
+            } else {
+                (val - t) + s
+            };
+            *r_err += correction;
+            *sum_val = Value::Float(t);
+            *count = count.checked_add(1).ok_or(LimboError::IntegerOverflow)?;
+        }
+        AggFunc::Sum | AggFunc::Total => {
+            // invariant as per init_agg_payload: payload[0] is acc (Null/Integer/Float),
+            // payload[1] is Float (r_err), payload[2] is Integer (approx), payload[3] is Integer (ovrfl)
+            let [acc, r_err_val, approx_val, ovrfl_val, ..] = payload else {
+                return Err(LimboError::InternalError(
+                    "Sum/Total: payload too short".to_string(),
+                ));
+            };
+            let Value::Float(r_err) = r_err_val else {
+                return Err(LimboError::InternalError(
+                    "Sum/Total: payload[1] is not a float".to_string(),
+                ));
+            };
+            let Value::Integer(approx_i) = approx_val else {
+                return Err(LimboError::InternalError(
+                    "Sum/Total: payload[2] is not an integer".to_string(),
+                ));
+            };
+            let Value::Integer(ovrfl_i) = ovrfl_val else {
+                return Err(LimboError::InternalError(
+                    "Sum/Total: payload[3] is not an integer".to_string(),
+                ));
+            };
+            let mut sum_state = SumAggState {
+                r_err: *r_err,
+                approx: *approx_i != 0,
+                ovrfl: *ovrfl_i != 0,
+            };
+            match arg {
+                Value::Null => {}
+                Value::Integer(i) => match acc {
+                    Value::Null => {
+                        *acc = Value::Integer(i);
+                    }
+                    Value::Integer(acc_i) => match acc_i.checked_add(i) {
+                        Some(sum) => *acc_i = sum,
+                        None => {
+                            if matches!(func, AggFunc::Total) {
+                                let acc_f = *acc_i as f64;
+                                *acc = Value::Float(acc_f);
+                                sum_state.approx = true;
+                                sum_state.ovrfl = true;
+                                apply_kbn_step_int(acc, i, &mut sum_state);
+                            } else {
+                                return Err(LimboError::IntegerOverflow);
+                            }
+                        }
+                    },
+                    Value::Float(_) => {
+                        apply_kbn_step_int(acc, i, &mut sum_state);
+                    }
+                    _ => unreachable!("Sum/Total accumulator initialized to Null/Integer/Float"),
+                },
+                Value::Float(f) => match acc {
+                    Value::Null => {
+                        *acc = Value::Float(f);
+                        sum_state.approx = true;
+                    }
+                    Value::Integer(i) => {
+                        *acc = Value::Float(*i as f64);
+                        sum_state.approx = true;
+                        apply_kbn_step(acc, f, &mut sum_state);
+                    }
+                    Value::Float(_) => {
+                        sum_state.approx = true;
+                        apply_kbn_step(acc, f, &mut sum_state);
+                    }
+                    _ => unreachable!("Sum/Total accumulator initialized to Null/Integer/Float"),
+                },
+                Value::Text(t) => {
+                    let (_, parsed_number) = try_for_float(t.as_str());
+                    handle_text_sum(acc, &mut sum_state, parsed_number);
+                }
+                Value::Blob(b) => {
+                    if let Ok(s) = std::str::from_utf8(&b) {
+                        let (_, parsed_number) = try_for_float(s);
+                        handle_text_sum(acc, &mut sum_state, parsed_number);
+                    } else {
+                        handle_text_sum(acc, &mut sum_state, ParsedNumber::None);
+                    }
+                }
+            }
+            *r_err = sum_state.r_err;
+            *approx_i = sum_state.approx as i64;
+            *ovrfl_i = sum_state.ovrfl as i64;
+        }
+        AggFunc::Min | AggFunc::Max => {
+            if matches!(arg, Value::Null) {
+                return Ok(());
+            }
+            if matches!(payload[0], Value::Null) {
+                payload[0] = arg;
+                return Ok(());
+            }
+            use std::cmp::Ordering;
+            // Borrow payload[0] only for comparison, then drop before assignment
+            let cmp = compare_with_collation(&arg, &payload[0], Some(collation));
+            let should_update = match func {
+                AggFunc::Max => cmp == Ordering::Greater,
+                AggFunc::Min => cmp == Ordering::Less,
+                _ => false,
+            };
+            if should_update {
+                payload[0] = arg;
+            }
+        }
+        AggFunc::GroupConcat | AggFunc::StringAgg => {
+            let delimiter = maybe_arg2.unwrap_or_else(|| Value::build_text(","));
+            let acc = &mut payload[0];
+            if acc.to_string().is_empty() {
+                *acc = arg;
+            } else if !matches!(arg, Value::Null) {
+                *acc += delimiter;
+                *acc += arg;
+            }
+        }
+        AggFunc::External(_) => {
+            return Err(LimboError::InternalError(
+                "External aggregate not supported in update_agg_payload".to_string(),
+            ));
+        }
+        #[cfg(feature = "json")]
+        AggFunc::JsonGroupObject | AggFunc::JsonbGroupObject => {
+            // arg = key, maybe_arg2 = value
+            let Some(value) = maybe_arg2 else {
+                return Err(LimboError::InternalError(
+                    "JsonGroupObject/JsonbGroupObject: no value provided".to_string(),
+                ));
+            };
+            let mut key_vec = convert_dbtype_to_raw_jsonb(&arg)?;
+            let mut val_vec = convert_dbtype_to_raw_jsonb(&value)?;
+            let Value::Blob(vec) = &mut payload[0] else {
+                return Err(LimboError::InternalError(
+                    "JsonGroupObject: payload[0] is not a blob".to_string(),
+                ));
+            };
+            if vec.is_empty() {
+                // bits for obj header
+                vec.push(12);
+            }
+            vec.append(&mut key_vec);
+            vec.append(&mut val_vec);
+        }
+        #[cfg(feature = "json")]
+        AggFunc::JsonGroupArray | AggFunc::JsonbGroupArray => {
+            // arg = value
+            let mut data = convert_dbtype_to_raw_jsonb(&arg)?;
+            let Value::Blob(vec) = &mut payload[0] else {
+                return Err(LimboError::InternalError(
+                    "JsonGroupArray: payload[0] is not a blob".to_string(),
+                ));
+            };
+            if vec.is_empty() {
+                vec.push(11); // bits for array header
+            }
+            vec.append(&mut data);
+        }
+    }
+    Ok(())
+}
+
+/// Convert the intermediate aggregate state in `payload` into the final result value.
+///
+/// This finalization logic is shared between both aggregation strategies:
+/// - **Register-based (sort-stream)**: Called from `op_agg_final` (AggFinal/AggValue
+///   instructions) when a group boundary is crossed.
+/// - **Hash-based (future enhancement)**: Called during the emit phase of HashAggNext after all rows have
+///   been processed. The payload may have been merged via `merge_agg_payload` if
+///   spilling occurred.
+///
+/// # Finalization logic by aggregate type:
+/// - **Count/Count0**: Returns the count directly
+/// - **Avg**: Computes `sum / count`, returns NULL if count is 0
+/// - **Sum**: Returns the accumulated value, applying Kahan compensation if approximate.
+///   Returns NULL if no non-NULL values were seen (unless float arithmetic was used).
+/// - **Total**: Like Sum but always returns Float, defaulting to 0.0 for empty groups
+/// - **Min/Max**: Returns the tracked extreme value directly
+/// - **GroupConcat/StringAgg**: Returns the accumulated string
+/// - **JsonGroup***: Parses accumulated raw JSONB bytes into proper JSON output
+fn finalize_agg_payload(func: &AggFunc, payload: &[Value]) -> Result<Value> {
+    let val = match func {
+        AggFunc::Count | AggFunc::Count0 => payload[0].clone(),
+        AggFunc::Avg => {
+            // Payload: [sum, r_err, count]
+            let sum = payload[0].as_float();
+            let r_err = payload[1].as_float();
+            let count = payload[2].as_int().unwrap_or(0);
+            if count == 0 {
+                Value::Null
+            } else {
+                // Apply KBN compensation before dividing
+                Value::Float((sum + r_err) / count as f64)
+            }
+        }
+        AggFunc::Sum => {
+            let acc = &payload[0];
+            let approx = payload[2].as_int().unwrap_or(0) != 0;
+            let ovrfl = payload[3].as_int().unwrap_or(0) != 0;
+            let r_err = payload[1].as_float();
+            match acc {
+                Value::Null => {
+                    if approx {
+                        Value::Float(0.0)
+                    } else {
+                        Value::Null
+                    }
+                }
+                Value::Integer(i) if !approx && !ovrfl => Value::Integer(*i),
+                _ => Value::Float(acc.as_float() + r_err),
+            }
+        }
+        AggFunc::Total => {
+            // Payload: [acc, r_err, approx, ovrfl]
+            let acc = &payload[0];
+            let r_err = payload[1].as_float();
+            match acc {
+                Value::Null => Value::Float(0.0),
+                Value::Integer(i) => Value::Float(*i as f64 + r_err),
+                Value::Float(f) => Value::Float(*f + r_err),
+                _ => unreachable!("Total accumulator initialized to Null/Integer/Float"),
+            }
+        }
+        AggFunc::Min | AggFunc::Max => payload[0].clone(),
+        AggFunc::GroupConcat | AggFunc::StringAgg => payload[0].clone(),
+        AggFunc::External(_) => {
+            // External aggregates are finalized via AggContext::compute_external()
+            return Err(LimboError::InternalError(
+                "finalize_agg_payload called for External aggregate".to_string(),
+            ));
+        }
+        #[cfg(feature = "json")]
+        AggFunc::JsonGroupObject => {
+            let data = payload[0].to_blob().expect("Should be blob");
+            json_from_raw_bytes_agg(data, false)?
+        }
+        #[cfg(feature = "json")]
+        AggFunc::JsonbGroupObject => {
+            let data = payload[0].to_blob().expect("Should be blob");
+            json_from_raw_bytes_agg(data, true)?
+        }
+        #[cfg(feature = "json")]
+        AggFunc::JsonGroupArray => {
+            let data = payload[0].to_blob().expect("Should be blob");
+            json_from_raw_bytes_agg(data, false)?
+        }
+        #[cfg(feature = "json")]
+        AggFunc::JsonbGroupArray => {
+            let data = payload[0].to_blob().expect("Should be blob");
+            json_from_raw_bytes_agg(data, true)?
+        }
+    };
+
+    Ok(val)
+}
+
 pub fn op_agg_step(
     _program: &Program,
     state: &mut ProgramState,
@@ -3651,37 +4109,11 @@ pub fn op_agg_step(
         },
         insn
     );
+
+    // Initialize aggregate state if not already done
     if let Register::Value(Value::Null) = state.registers[*acc_reg] {
         state.registers[*acc_reg] = match func {
-            AggFunc::Avg => {
-                Register::Aggregate(AggContext::Avg(Value::Float(0.0), Value::Integer(0)))
-            }
-            AggFunc::Sum => {
-                Register::Aggregate(AggContext::Sum(Value::Null, SumAggState::default()))
-            }
-            AggFunc::Total => {
-                // The result of total() is always a floating point value.
-                // No overflow error is ever raised if any prior input was a floating point value.
-                // Total() never throws an integer overflow.
-                Register::Aggregate(AggContext::Sum(Value::Float(0.0), SumAggState::default()))
-            }
-            AggFunc::Count | AggFunc::Count0 => {
-                Register::Aggregate(AggContext::Count(Value::Integer(0)))
-            }
-            AggFunc::Max => Register::Aggregate(AggContext::Max(None)),
-            AggFunc::Min => Register::Aggregate(AggContext::Min(None)),
-            AggFunc::GroupConcat | AggFunc::StringAgg => {
-                Register::Aggregate(AggContext::GroupConcat(Value::build_text("")))
-            }
-            #[cfg(feature = "json")]
-            AggFunc::JsonGroupArray | AggFunc::JsonbGroupArray => {
-                Register::Aggregate(AggContext::GroupConcat(Value::Blob(vec![])))
-            }
-            #[cfg(feature = "json")]
-            AggFunc::JsonGroupObject | AggFunc::JsonbGroupObject => {
-                Register::Aggregate(AggContext::GroupConcat(Value::Blob(vec![])))
-            }
-            AggFunc::External(func) => match func.as_ref() {
+            AggFunc::External(ext_func) => match ext_func.as_ref() {
                 ExtFunc::Aggregate {
                     init,
                     step,
@@ -3695,254 +4127,19 @@ pub fn op_agg_step(
                 })),
                 _ => unreachable!("scalar function called in aggregate context"),
             },
+            _ => {
+                // Built-in aggregates use flat payload
+                let mut payload = Vec::new();
+                init_agg_payload(func, &mut payload)?;
+                Register::Aggregate(AggContext::Builtin(payload))
+            }
         };
     }
+
+    // Step the aggregate
     match func {
-        AggFunc::Avg => {
-            let col = state.registers[*col].clone();
-            // > The avg() function returns the average value of all non-NULL X within a group
-            // https://sqlite.org/lang_aggfunc.html#avg
-            if !col.is_null() {
-                let Register::Aggregate(agg) = state.registers[*acc_reg].borrow_mut() else {
-                    panic!(
-                        "Unexpected value {:?} in AggStep at register {}",
-                        state.registers[*acc_reg], *acc_reg
-                    );
-                };
-                let AggContext::Avg(acc, count) = agg.borrow_mut() else {
-                    unreachable!();
-                };
-                *acc = acc.exec_add(col.get_value());
-                *count += 1;
-            }
-        }
-        AggFunc::Sum | AggFunc::Total => {
-            let col = state.registers[*col].clone();
-            let Register::Aggregate(agg) = state.registers[*acc_reg].borrow_mut() else {
-                panic!(
-                    "Unexpected value {:?} at register {:?} in AggStep",
-                    state.registers[*acc_reg], *acc_reg
-                );
-            };
-            let AggContext::Sum(acc, sum_state) = agg.borrow_mut() else {
-                unreachable!();
-            };
-            match col {
-                Register::Value(value) => {
-                    match value {
-                        Value::Null => {
-                            // Ignore NULLs
-                        }
-
-                        Value::Integer(i) => match acc {
-                            Value::Null => {
-                                *acc = Value::Integer(i);
-                            }
-                            Value::Integer(acc_i) => {
-                                match acc_i.checked_add(i) {
-                                    Some(sum) => *acc = Value::Integer(sum),
-                                    None => {
-                                        if matches!(func, AggFunc::Total) {
-                                            // Total() never throw an integer overflow -> switch to float with KBN summation
-                                            let acc_f = *acc_i as f64;
-                                            *acc = Value::Float(acc_f);
-                                            sum_state.approx = true;
-                                            sum_state.ovrfl = true;
-
-                                            apply_kbn_step_int(acc, i, sum_state);
-                                        } else {
-                                            return Err(LimboError::IntegerOverflow);
-                                        }
-                                    }
-                                }
-                            }
-                            Value::Float(_) => {
-                                apply_kbn_step_int(acc, i, sum_state);
-                            }
-                            _ => unreachable!(),
-                        },
-
-                        Value::Float(f) => match acc {
-                            Value::Null => {
-                                *acc = Value::Float(f);
-                                sum_state.approx = true;
-                            }
-                            Value::Integer(i) => {
-                                let i_f = *i as f64;
-                                *acc = Value::Float(i_f);
-                                sum_state.approx = true;
-                                apply_kbn_step(acc, f, sum_state);
-                            }
-                            Value::Float(_) => {
-                                sum_state.approx = true;
-                                apply_kbn_step(acc, f, sum_state);
-                            }
-                            _ => unreachable!(),
-                        },
-                        Value::Text(t) => {
-                            let s = t.as_str();
-                            let (_, parsed_number) = try_for_float(s);
-                            handle_text_sum(acc, sum_state, parsed_number);
-                        }
-                        Value::Blob(b) => {
-                            if let Ok(s) = std::str::from_utf8(&b) {
-                                let (_, parsed_number) = try_for_float(s);
-                                handle_text_sum(acc, sum_state, parsed_number);
-                            } else {
-                                handle_text_sum(acc, sum_state, ParsedNumber::None);
-                            }
-                        }
-                    }
-                }
-                _ => unreachable!(),
-            }
-        }
-        AggFunc::Count | AggFunc::Count0 => {
-            let skip = (matches!(func, AggFunc::Count)
-                && matches!(state.registers[*col].get_value(), Value::Null));
-            if matches!(&state.registers[*acc_reg], Register::Value(Value::Null)) {
-                state.registers[*acc_reg] =
-                    Register::Aggregate(AggContext::Count(Value::Integer(0)));
-            }
-            let Register::Aggregate(agg) = &mut state.registers[*acc_reg] else {
-                panic!(
-                    "Unexpected value {:?} in AggStep at register {}",
-                    state.registers[*acc_reg], *acc_reg
-                );
-            };
-            let AggContext::Count(count) = agg else {
-                unreachable!();
-            };
-            if !skip {
-                *count += 1;
-            };
-        }
-        AggFunc::Max => {
-            let col = state.registers[*col].clone();
-            let Register::Aggregate(agg) = state.registers[*acc_reg].borrow_mut() else {
-                panic!(
-                    "Unexpected value {:?} in AggStep at register {}",
-                    state.registers[*acc_reg], *acc_reg
-                );
-            };
-            let AggContext::Max(acc) = agg.borrow_mut() else {
-                unreachable!();
-            };
-
-            let new_value = col.get_value();
-            if *new_value != Value::Null
-                && acc.as_ref().is_none_or(|acc| {
-                    use std::cmp::Ordering;
-                    compare_with_collation(new_value, acc, state.current_collation)
-                        == Ordering::Greater
-                })
-            {
-                *acc = Some(new_value.clone());
-            }
-        }
-        AggFunc::Min => {
-            let col = state.registers[*col].clone();
-            let Register::Aggregate(agg) = state.registers[*acc_reg].borrow_mut() else {
-                panic!(
-                    "Unexpected value {:?} in AggStep",
-                    state.registers[*acc_reg]
-                );
-            };
-            let AggContext::Min(acc) = agg.borrow_mut() else {
-                unreachable!();
-            };
-
-            let new_value = col.get_value();
-
-            if *new_value != Value::Null
-                && acc.as_ref().is_none_or(|acc| {
-                    use std::cmp::Ordering;
-                    compare_with_collation(new_value, acc, state.current_collation)
-                        == Ordering::Less
-                })
-            {
-                *acc = Some(new_value.clone());
-            }
-        }
-        AggFunc::GroupConcat | AggFunc::StringAgg => {
-            let col = state.registers[*col].get_value().clone();
-            let delimiter = state.registers[*delimiter].clone();
-            let Register::Aggregate(agg) = state.registers[*acc_reg].borrow_mut() else {
-                unreachable!();
-            };
-            let AggContext::GroupConcat(acc) = agg.borrow_mut() else {
-                unreachable!();
-            };
-            if acc.to_string().is_empty() {
-                *acc = col;
-            } else {
-                match col {
-                    Value::Null => {}
-                    _ => {
-                        match delimiter {
-                            Register::Value(value) => {
-                                *acc += value;
-                            }
-                            _ => unreachable!(),
-                        }
-                        *acc += col;
-                    }
-                }
-            }
-        }
-        #[cfg(feature = "json")]
-        AggFunc::JsonGroupObject | AggFunc::JsonbGroupObject => {
-            let key = state.registers[*col].clone();
-            let value = state.registers[*delimiter].clone();
-            let Register::Aggregate(agg) = state.registers[*acc_reg].borrow_mut() else {
-                unreachable!();
-            };
-            let AggContext::GroupConcat(acc) = agg.borrow_mut() else {
-                unreachable!();
-            };
-
-            let mut key_vec = convert_dbtype_to_raw_jsonb(key.get_value())?;
-            let mut val_vec = convert_dbtype_to_raw_jsonb(value.get_value())?;
-
-            match acc {
-                Value::Blob(vec) => {
-                    if vec.is_empty() {
-                        // bits for obj header
-                        vec.push(12);
-                        vec.append(&mut key_vec);
-                        vec.append(&mut val_vec);
-                    } else {
-                        vec.append(&mut key_vec);
-                        vec.append(&mut val_vec);
-                    }
-                }
-                _ => unreachable!(),
-            };
-        }
-        #[cfg(feature = "json")]
-        AggFunc::JsonGroupArray | AggFunc::JsonbGroupArray => {
-            let col = state.registers[*col].clone();
-            let Register::Aggregate(agg) = state.registers[*acc_reg].borrow_mut() else {
-                unreachable!();
-            };
-            let AggContext::GroupConcat(acc) = agg.borrow_mut() else {
-                unreachable!();
-            };
-
-            let mut data = convert_dbtype_to_raw_jsonb(col.get_value())?;
-            match acc {
-                Value::Blob(vec) => {
-                    if vec.is_empty() {
-                        vec.push(11);
-                        vec.append(&mut data)
-                    } else {
-                        vec.append(&mut data);
-                    }
-                }
-                _ => unreachable!(),
-            };
-        }
         AggFunc::External(_) => {
+            // External aggregates use FFI and need special handling
             let (step_fn, state_ptr, argc) = {
                 let Register::Aggregate(agg) = &state.registers[*acc_reg] else {
                     unreachable!();
@@ -3967,7 +4164,33 @@ pub fn op_agg_step(
                 }
             }
         }
+        _ => {
+            let arg = state.registers[*col].get_value().clone();
+            // Only a subset of aggregate functions take two arguments
+            let maybe_arg2 = match func {
+                AggFunc::GroupConcat | AggFunc::StringAgg => {
+                    Some(state.registers[*delimiter].get_value().clone())
+                }
+                #[cfg(feature = "json")]
+                AggFunc::JsonGroupObject | AggFunc::JsonbGroupObject => {
+                    Some(state.registers[*delimiter].get_value().clone())
+                }
+                _ => None,
+            };
+            let collation = state.current_collation.unwrap_or(CollationSeq::Binary);
+
+            // Now get mutable borrow on payload
+            let Register::Aggregate(agg) = &mut state.registers[*acc_reg] else {
+                panic!(
+                    "Unexpected value {:?} in AggStep at register {}",
+                    state.registers[*acc_reg], *acc_reg
+                );
+            };
+            let payload = agg.payload_mut();
+            update_agg_payload(func, arg, maybe_arg2, payload, collation)?;
+        }
     };
+
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -3987,119 +4210,23 @@ pub fn op_agg_final(
         } => (*acc_reg, *dest_reg, func),
         _ => unreachable!("unexpected Insn {:?}", insn),
     };
+
     match &state.registers[acc_reg] {
-        Register::Aggregate(agg) => match func {
-            AggFunc::Avg => {
-                let AggContext::Avg(acc, count) = agg else {
-                    unreachable!();
-                };
-                let acc = if count.as_int() == Some(0) {
-                    Value::Null
-                } else {
-                    acc.clone() / count.clone()
-                };
-                state.registers[dest_reg] = Register::Value(acc);
-            }
-            AggFunc::Sum => {
-                let AggContext::Sum(acc, sum_state) = agg else {
-                    unreachable!();
-                };
-                let value = match acc {
-                    Value::Null => match sum_state.approx {
-                        true => Value::Float(0.0),
-                        false => Value::Null,
-                    },
-                    Value::Integer(i) if !sum_state.approx && !sum_state.ovrfl => {
-                        Value::Integer(*i)
-                    }
-                    _ => Value::Float(acc.as_float() + sum_state.r_err),
-                };
-                state.registers[dest_reg] = Register::Value(value);
-            }
-            AggFunc::Total => {
-                let AggContext::Sum(acc, _) = agg else {
-                    unreachable!();
-                };
-                let value = match acc {
-                    Value::Null => Value::Float(0.0),
-                    Value::Integer(i) => Value::Float(*i as f64),
-                    Value::Float(f) => Value::Float(*f),
-                    _ => unreachable!(),
-                };
-                state.registers[dest_reg] = Register::Value(value);
-            }
-            AggFunc::Count | AggFunc::Count0 => {
-                let AggContext::Count(count) = agg else {
-                    unreachable!();
-                };
-                state.registers[dest_reg] = Register::Value(count.clone());
-            }
-            AggFunc::Max => {
-                let AggContext::Max(acc) = agg else {
-                    unreachable!();
-                };
-                match acc {
-                    Some(value) => state.registers[dest_reg] = Register::Value(value.clone()),
-                    None => state.registers[dest_reg] = Register::Value(Value::Null),
+        Register::Aggregate(agg) => {
+            let value = match agg {
+                AggContext::External(_) => {
+                    // External aggregates use FFI finalization
+                    agg.compute_external()?
                 }
-            }
-            AggFunc::Min => {
-                let AggContext::Min(acc) = agg else {
-                    unreachable!();
-                };
-                match acc {
-                    Some(value) => state.registers[dest_reg] = Register::Value(value.clone()),
-                    None => state.registers[dest_reg] = Register::Value(Value::Null),
+                AggContext::Builtin(payload) => {
+                    // Built-in aggregates use shared finalization
+                    finalize_agg_payload(func, payload)?
                 }
-            }
-            AggFunc::GroupConcat | AggFunc::StringAgg => {
-                let AggContext::GroupConcat(acc) = agg else {
-                    unreachable!();
-                };
-                state.registers[dest_reg] = Register::Value(acc.clone());
-            }
-            #[cfg(feature = "json")]
-            AggFunc::JsonGroupObject => {
-                let AggContext::GroupConcat(acc) = agg else {
-                    unreachable!();
-                };
-                let data = acc.to_blob().expect("Should be blob");
-                state.registers[dest_reg] = Register::Value(json_from_raw_bytes_agg(data, false)?);
-            }
-            #[cfg(feature = "json")]
-            AggFunc::JsonbGroupObject => {
-                let AggContext::GroupConcat(acc) = agg else {
-                    unreachable!();
-                };
-                let data = acc.to_blob().expect("Should be blob");
-                state.registers[dest_reg] = Register::Value(json_from_raw_bytes_agg(data, true)?);
-            }
-            #[cfg(feature = "json")]
-            AggFunc::JsonGroupArray => {
-                let AggContext::GroupConcat(acc) = agg else {
-                    unreachable!();
-                };
-                let data = acc.to_blob().expect("Should be blob");
-                state.registers[dest_reg] = Register::Value(json_from_raw_bytes_agg(data, false)?);
-            }
-            #[cfg(feature = "json")]
-            AggFunc::JsonbGroupArray => {
-                let AggContext::GroupConcat(acc) = agg else {
-                    unreachable!();
-                };
-                let data = acc.to_blob().expect("Should be blob");
-                state.registers[dest_reg] = Register::Value(json_from_raw_bytes_agg(data, true)?);
-            }
-            AggFunc::External(_) => {
-                let AggContext::External(_) = agg else {
-                    unreachable!();
-                };
-                let value = agg.compute_external()?;
-                state.registers[dest_reg] = Register::Value(value)
-            }
-        },
+            };
+            state.registers[dest_reg] = Register::Value(value);
+        }
         Register::Value(Value::Null) => {
-            // when the set is empty
+            // When the set is empty, return appropriate default
             match func {
                 AggFunc::Total => {
                     state.registers[dest_reg] = Register::Value(Value::Float(0.0));
@@ -4114,6 +4241,7 @@ pub fn op_agg_final(
             panic!("Unexpected value {other:?} in AggFinal");
         }
     };
+
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -4152,12 +4280,14 @@ pub fn op_sorter_open(
         .iter()
         .map(|(ord, coll)| (*ord, coll.unwrap_or_default()))
         .unzip();
+    let temp_store = program.connection.get_temp_store();
     let cursor = Sorter::new(
         &order,
         collations,
         max_buffer_size_bytes,
         page_size,
         pager.io.clone(),
+        temp_store,
     );
     let cursors = &mut state.cursors;
     cursors
@@ -6796,11 +6926,16 @@ pub fn op_idx_insert(
                 panic!("IdxInsert: not a BTreeIndex cursor");
             };
 
-            // TODO: currently we never pass USE_SEEK, so this other check is a bit redundant and we always seek,
-            // but I guess it's FutureProofed™®
-            if !index_meta.unique && flags.has(IdxInsertFlags::USE_SEEK) {
+            // USE_SEEK: cursor was already positioned by a preceding NoConflict operation.
+            // Skip the redundant seek and go directly to insert.
+            // For unique indexes, this also skips UniqueConstraintCheck since NoConflict already verified uniqueness.
+            //
+            // HOWEVER: If the record contains NULLs, NoConflict skips the seek entirely
+            // (since NULLs can't conflict), so we must fall back to seeking here.
+            if flags.has(IdxInsertFlags::USE_SEEK) && !record_to_insert.contains_null()? {
                 state.op_idx_insert_state = OpIdxInsertState::Insert;
                 return Ok(InsnFunctionStepResult::Step);
+                // Fall through to do the seek since NoConflict skipped it due to NULLs
             }
 
             match seek_internal(
@@ -8118,7 +8253,7 @@ pub fn op_set_cookie(
                     },
                     TransactionState::Read => unreachable!("invalid transaction state for SetCookie: TransactionState::Read, should be write"),
                     TransactionState::None => unreachable!("invalid transaction state for SetCookie: TransactionState::None, should be write"),
-                    TransactionState::PendingUpgrade => unreachable!("invalid transaction state for SetCookie: TransactionState::PendingUpgrade, should be write"),
+                    TransactionState::PendingUpgrade { .. } => unreachable!("invalid transaction state for SetCookie: TransactionState::PendingUpgrade, should be write"),
                 }
                     program
                         .connection
@@ -8407,17 +8542,26 @@ pub fn op_open_ephemeral(
             }
             #[cfg(not(target_family = "wasm"))]
             {
-                let temp_dir = temp_dir();
-                let rand_path =
-                    std::path::Path::new(&temp_dir).join(format!("tursodb-ephemeral-{rand_num}"));
-                let Some(rand_path_str) = rand_path.to_str() else {
-                    return Err(LimboError::InternalError(
-                        "Failed to convert path to string".to_string(),
-                    ));
-                };
-                let file = io.open_file(rand_path_str, OpenFlags::Create, false)?;
-                db_file = Arc::new(DatabaseFile::new(file));
-                db_file_io = io;
+                let temp_store = conn.get_temp_store();
+                if matches!(temp_store, crate::TempStore::Memory) {
+                    // When temp_store=memory, use in-memory storage for ephemeral tables
+                    use crate::MemoryIO;
+                    db_file_io = Arc::new(MemoryIO::new());
+                    let file = db_file_io.open_file("temp-file", OpenFlags::Create, false)?;
+                    db_file = Arc::new(DatabaseFile::new(file));
+                } else {
+                    let temp_dir = temp_dir();
+                    let rand_path = std::path::Path::new(&temp_dir)
+                        .join(format!("tursodb-ephemeral-{rand_num}"));
+                    let Some(rand_path_str) = rand_path.to_str() else {
+                        return Err(LimboError::InternalError(
+                            "Failed to convert path to string".to_string(),
+                        ));
+                    };
+                    let file = io.open_file(rand_path_str, OpenFlags::Create, false)?;
+                    db_file = Arc::new(DatabaseFile::new(file));
+                    db_file_io = io;
+                }
             }
 
             let buffer_pool = program.connection.db.buffer_pool.clone();
@@ -8450,10 +8594,10 @@ pub fn op_open_ephemeral(
             return_if_io!(btree_cursor.clear_btree());
             // iterate over existing deferred seeks and clear them as well,
             // as any deferred seek on this cursor is now invalid.
-            for state in &mut state.deferred_seeks {
-                if let Some((id, other)) = state {
-                    if *id == cursor_id || *other == cursor_id {
-                        *state = None;
+            for deferred_seek in &mut state.deferred_seeks {
+                if let Some(ds) = deferred_seek {
+                    if ds.index_cursor_id == cursor_id || ds.table_cursor_id == cursor_id {
+                        *deferred_seek = None;
                     }
                 }
             }
@@ -10357,7 +10501,7 @@ pub fn op_fk_if_zero(
 }
 
 pub fn op_hash_build(
-    _program: &Program,
+    program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     pager: &Arc<Pager>,
@@ -10386,15 +10530,24 @@ pub fn op_hash_build(
         });
 
     // Create hash table if it doesn't exist yet
+    let temp_store = program.connection.get_temp_store();
+    // When temp_store=memory, disable the memory limit entirely to avoid spilling.
+    // Spilling to an in-memory file has serialization overhead - simpler to never spill.
+    let mem_budget = if matches!(temp_store, crate::TempStore::Memory) {
+        usize::MAX
+    } else {
+        data.mem_budget
+    };
     state
         .hash_tables
         .entry(data.hash_table_id)
         .or_insert_with(|| {
             let config = HashTableConfig {
                 initial_buckets: 1024,
-                mem_budget: data.mem_budget,
+                mem_budget,
                 num_keys: data.num_keys,
                 collations: data.collations.clone(),
+                temp_store,
             };
             HashTable::new(config, pager.io.clone())
         });
@@ -10477,22 +10630,30 @@ pub fn op_hash_build(
 }
 
 pub fn op_hash_distinct(
-    _program: &Program,
+    program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(HashDistinct { data }, insn);
 
+    let temp_store = program.connection.get_temp_store();
+    // When temp_store=memory, disable the memory limit entirely to avoid spilling.
+    let mem_budget = if matches!(temp_store, crate::TempStore::Memory) {
+        usize::MAX
+    } else {
+        DEFAULT_MEM_BUDGET
+    };
     let hash_table = state
         .hash_tables
         .entry(data.hash_table_id)
         .or_insert_with(|| {
             let config = HashTableConfig {
                 initial_buckets: 1024,
-                mem_budget: DEFAULT_MEM_BUDGET,
+                mem_budget,
                 num_keys: data.num_keys,
                 collations: data.collations.clone(),
+                temp_store,
             };
             HashTable::new(config, pager.io.clone())
         });
@@ -11374,5 +11535,197 @@ mod tests {
                 other => panic!("Unexpected value type: {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn test_init_agg_payload_count() {
+        let mut payload = Vec::new();
+        init_agg_payload(&AggFunc::Count, &mut payload).unwrap();
+        assert_eq!(payload.len(), 1);
+        assert_eq!(payload[0], Value::Integer(0));
+    }
+
+    #[test]
+    fn test_init_agg_payload_sum() {
+        let mut payload = Vec::new();
+        init_agg_payload(&AggFunc::Sum, &mut payload).unwrap();
+        assert_eq!(payload.len(), 4);
+        assert_eq!(payload[0], Value::Null); // acc
+        assert_eq!(payload[1], Value::Float(0.0)); // r_err
+        assert_eq!(payload[2], Value::Integer(0)); // approx
+        assert_eq!(payload[3], Value::Integer(0)); // ovrfl
+    }
+
+    #[test]
+    fn test_init_agg_payload_avg() {
+        let mut payload = Vec::new();
+        init_agg_payload(&AggFunc::Avg, &mut payload).unwrap();
+        assert_eq!(payload.len(), 3);
+        assert_eq!(payload[0], Value::Float(0.0)); // sum
+        assert_eq!(payload[1], Value::Float(0.0)); // r_err
+        assert_eq!(payload[2], Value::Integer(0)); // count
+    }
+
+    #[test]
+    fn test_update_count_skips_null() {
+        let mut payload = vec![Value::Integer(5)];
+        update_agg_payload(
+            &AggFunc::Count,
+            Value::Null,
+            None,
+            &mut payload,
+            CollationSeq::Binary,
+        )
+        .unwrap();
+        assert_eq!(payload[0], Value::Integer(5)); // unchanged
+    }
+
+    #[test]
+    fn test_update_count_increments() {
+        let mut payload = vec![Value::Integer(5)];
+        update_agg_payload(
+            &AggFunc::Count,
+            Value::Integer(42),
+            None,
+            &mut payload,
+            CollationSeq::Binary,
+        )
+        .unwrap();
+        assert_eq!(payload[0], Value::Integer(6));
+    }
+
+    #[test]
+    fn test_update_sum_integers() {
+        let mut payload = vec![
+            Value::Null,
+            Value::Float(0.0),
+            Value::Integer(0),
+            Value::Integer(0),
+        ];
+        update_agg_payload(
+            &AggFunc::Sum,
+            Value::Integer(10),
+            None,
+            &mut payload,
+            CollationSeq::Binary,
+        )
+        .unwrap();
+        assert_eq!(payload[0], Value::Integer(10));
+
+        update_agg_payload(
+            &AggFunc::Sum,
+            Value::Integer(5),
+            None,
+            &mut payload,
+            CollationSeq::Binary,
+        )
+        .unwrap();
+        assert_eq!(payload[0], Value::Integer(15));
+    }
+
+    #[test]
+    fn test_update_sum_null_is_skipped() {
+        let mut payload = vec![
+            Value::Integer(10),
+            Value::Float(0.0),
+            Value::Integer(0),
+            Value::Integer(0),
+        ];
+        update_agg_payload(
+            &AggFunc::Sum,
+            Value::Null,
+            None,
+            &mut payload,
+            CollationSeq::Binary,
+        )
+        .unwrap();
+        assert_eq!(payload[0], Value::Integer(10)); // unchanged
+    }
+
+    #[test]
+    fn test_update_min_max() {
+        let mut payload = vec![Value::Null];
+        // First value sets the min/max
+        update_agg_payload(
+            &AggFunc::Min,
+            Value::Integer(5),
+            None,
+            &mut payload,
+            CollationSeq::Binary,
+        )
+        .unwrap();
+        assert_eq!(payload[0], Value::Integer(5));
+
+        // Smaller value updates min
+        update_agg_payload(
+            &AggFunc::Min,
+            Value::Integer(3),
+            None,
+            &mut payload,
+            CollationSeq::Binary,
+        )
+        .unwrap();
+        assert_eq!(payload[0], Value::Integer(3));
+
+        // Larger value doesn't update min
+        update_agg_payload(
+            &AggFunc::Min,
+            Value::Integer(10),
+            None,
+            &mut payload,
+            CollationSeq::Binary,
+        )
+        .unwrap();
+        assert_eq!(payload[0], Value::Integer(3));
+    }
+
+    #[test]
+    fn test_update_avg() {
+        // Payload: [sum, r_err, count]
+        let mut payload = vec![Value::Float(0.0), Value::Float(0.0), Value::Integer(0)];
+        update_agg_payload(
+            &AggFunc::Avg,
+            Value::Integer(10),
+            None,
+            &mut payload,
+            CollationSeq::Binary,
+        )
+        .unwrap();
+        assert_eq!(payload[0], Value::Float(10.0));
+        assert_eq!(payload[2], Value::Integer(1));
+
+        update_agg_payload(
+            &AggFunc::Avg,
+            Value::Integer(20),
+            None,
+            &mut payload,
+            CollationSeq::Binary,
+        )
+        .unwrap();
+        assert_eq!(payload[0], Value::Float(30.0));
+        assert_eq!(payload[2], Value::Integer(2));
+    }
+
+    #[test]
+    fn test_finalize_count() {
+        let payload = vec![Value::Integer(42)];
+        let result = finalize_agg_payload(&AggFunc::Count, &payload).unwrap();
+        assert_eq!(result, Value::Integer(42));
+    }
+
+    #[test]
+    fn test_finalize_avg() {
+        // Payload: [sum, r_err, count]
+        let payload = vec![Value::Float(30.0), Value::Float(0.0), Value::Integer(3)];
+        let result = finalize_agg_payload(&AggFunc::Avg, &payload).unwrap();
+        assert_eq!(result, Value::Float(10.0));
+    }
+
+    #[test]
+    fn test_finalize_avg_empty() {
+        // Payload: [sum, r_err, count]
+        let payload = vec![Value::Float(0.0), Value::Float(0.0), Value::Integer(0)];
+        let result = finalize_agg_payload(&AggFunc::Avg, &payload).unwrap();
+        assert_eq!(result, Value::Null);
     }
 }

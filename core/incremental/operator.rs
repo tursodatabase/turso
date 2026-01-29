@@ -258,6 +258,8 @@ pub trait IncrementalOperator: Debug + Send {
 
 #[cfg(test)]
 mod tests {
+    use rustc_hash::FxHashSet as HashSet;
+
     use super::*;
     use crate::incremental::aggregate_operator::{AggregateOperator, AGG_TYPE_REGULAR};
     use crate::incremental::dbsp::HashableRow;
@@ -3322,7 +3324,7 @@ mod tests {
         );
 
         // Verify we have all combinations
-        let mut found_combinations = std::collections::HashSet::new();
+        let mut found_combinations = HashSet::default();
         for (row, weight) in &result.changes {
             assert_eq!(*weight, 1);
             let product = row.values[1].to_string();
@@ -3471,7 +3473,7 @@ mod tests {
         }
 
         // Verify we still have all three order IDs in the insertions
-        let mut order_ids = std::collections::HashSet::new();
+        let mut order_ids = HashSet::default();
         for (row, _) in &insertions {
             if let Value::Integer(order_id) = &row.values[1] {
                 order_ids.insert(*order_id);
@@ -3644,13 +3646,13 @@ mod tests {
         );
 
         // Verify the actual content of the results
-        let mut expected_results = std::collections::HashSet::new();
+        let mut expected_results = HashSet::default();
         // Expected: (Alice, 5), (Alice, 3), (Bob, 7)
         expected_results.insert(("Alice".to_string(), 5));
         expected_results.insert(("Alice".to_string(), 3));
         expected_results.insert(("Bob".to_string(), 7));
 
-        let mut actual_results = std::collections::HashSet::new();
+        let mut actual_results = HashSet::default();
         for (row, weight) in &result.changes {
             assert_eq!(*weight, 1, "All results should have weight 1");
 
@@ -3673,7 +3675,7 @@ mod tests {
         );
 
         // Also verify that rowids are unique (this is important for btree storage)
-        let mut seen_rowids = std::collections::HashSet::new();
+        let mut seen_rowids = HashSet::default();
         for (row, _) in &result.changes {
             let was_new = seen_rowids.insert(row.rowid);
             assert!(was_new, "Duplicate rowid found: {}. This would cause rows to overwrite each other in btree storage!", row.rowid);
@@ -3776,7 +3778,7 @@ mod tests {
             assert_eq!(merged1.len(), 6);
 
             // Collect unique rowids - should be 4
-            let unique_rowids: std::collections::HashSet<i64> =
+            let unique_rowids: HashSet<i64> =
                 merged1.changes.iter().map(|(row, _)| row.rowid).collect();
             assert_eq!(
                 unique_rowids.len(),
@@ -4161,7 +4163,7 @@ mod tests {
             .unwrap();
 
         // Should have exactly 3 distinct values (100, 200, 300)
-        let distinct_values: std::collections::HashSet<i64> = result
+        let distinct_values: HashSet<i64> = result
             .changes
             .iter()
             .map(|(row, _weight)| match &row.values[0] {
@@ -4477,7 +4479,7 @@ mod tests {
         }
 
         // Verify the distinct groups
-        let groups: std::collections::HashSet<(String, i64)> = result
+        let groups: HashSet<(String, i64)> = result
             .changes
             .iter()
             .map(|(row, _)| {

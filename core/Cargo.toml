@@ -38,6 +38,7 @@ test_helper = []
 bench = []
 fts = ["dep:tantivy"]
 codspeed = ["bench"]
+optimizer_params = ["serde", "dep:serde_json"]
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { version = "0.61.2", features = [
@@ -84,6 +85,7 @@ uncased = "0.9.10"
 strum_macros = { workspace = true }
 bitflags = { workspace = true }
 serde = { workspace = true, optional = true, features = ["derive"] }
+serde_json = { workspace = true, optional = true }
 paste = "1.0.15"
 uuid = { version = "1.11.0", features = ["v4", "v5", "v7"], optional = true }
 tempfile = { workspace = true }
@@ -121,7 +123,7 @@ aegis = "0.9.5"
 
 [build-dependencies]
 chrono = { workspace = true, default-features = false }
-built = { version = "0.7.5", features = ["git2", "chrono"] }
+built = { version = "0.7.5", features = ["chrono"] }
 
 [target.'cfg(not(target_family = "windows"))'.dev-dependencies]
 pprof = { version = "0.14.0", features = ["criterion", "flamegraph"] }
@@ -175,3 +177,7 @@ required-features = ["bench"]
 name = "hash_spill_benchmark"
 harness = false
 required-features = ["bench"]
+
+[[bench]]
+name = "write_perf_benchmark"
+harness = false

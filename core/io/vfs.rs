@@ -1,4 +1,4 @@
-use super::{Buffer, Completion, File, OpenFlags, IO};
+use super::{Buffer, Completion, File, FileSyncType, OpenFlags, IO};
 use crate::ext::VfsMod;
 use crate::io::clock::{Clock, DefaultClock, MonotonicInstant, WallClockInstant};
 use crate::io::CompletionInner;
@@ -166,7 +166,7 @@ impl File for VfsFileImpl {
         Ok(c)
     }
 
-    fn sync(&self, c: Completion) -> Result<Completion> {
+    fn sync(&self, c: Completion, _sync_type: FileSyncType) -> Result<Completion> {
         if self.vfs.is_null() {
             c.complete(-1);
             return Err(LimboError::ExtensionError("VFS is null".to_string()));

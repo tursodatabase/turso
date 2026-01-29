@@ -33,7 +33,7 @@ use crate::ValueRef;
 use crate::{Connection, Pager, SyncMode};
 use crossbeam_skiplist::map::Entry;
 use crossbeam_skiplist::{SkipMap, SkipSet};
-use std::collections::HashMap;
+use rustc_hash::FxHashMap as HashMap;
 use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::ops::Bound;
@@ -715,8 +715,8 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     .load(Ordering::Acquire)
                     > tx.begin_ts
                 {
-                    // Schema changes made after the transaction began always cause a [SchemaUpdated] error and the tx must abort.
-                    return Err(LimboError::SchemaUpdated);
+                    // Schema changes made after the transaction began always cause a [SchemaConflict] error and the tx must abort.
+                    return Err(LimboError::SchemaConflict);
                 }
 
                 tx.state.store(TransactionState::Preparing);
@@ -933,7 +933,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     self.state = CommitState::EndCommitLogicalLog { end_ts: *end_ts };
                     return Ok(TransitionResult::Continue);
                 }
-                let c = mvcc_store.storage.sync()?;
+                let c = mvcc_store.storage.sync(self.pager.get_sync_type())?;
                 self.state = CommitState::EndCommitLogicalLog { end_ts: *end_ts };
                 // if Completion Completed without errors we can continue
                 if c.succeeded() {
@@ -1312,7 +1312,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             checkpointed_txid_max: AtomicU64::new(0),
             last_committed_schema_change_ts: AtomicU64::new(0),
             last_committed_tx_ts: AtomicU64::new(0),
-            table_id_to_last_rowid: RwLock::new(HashMap::new()),
+            table_id_to_last_rowid: RwLock::new(HashMap::default()),
         }
     }
 
@@ -2421,7 +2421,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             .get(&tx_id)
             .expect("transaction should exist in txs map");
         let tx = tx_unlocked.value();
-        *connection.mv_tx.write() = None;
+        connection.set_mv_tx(None);
         assert!(tx.state == TransactionState::Active || tx.state == TransactionState::Preparing);
         tx.state.store(TransactionState::Aborted);
         tracing::trace!("abort(tx_id={})", tx_id);
@@ -2937,7 +2937,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         let tx_id = LOGICAL_LOG_RECOVERY_TRANSACTION_ID;
         self.begin_load_tx(connection.clone())?;
 
-        let mut index_infos: HashMap<MVTableId, Arc<IndexInfo>> = HashMap::new();
+        let mut index_infos: HashMap<MVTableId, Arc<IndexInfo>> = HashMap::default();
 
         // Helper to get an Arc<IndexInfo> to construct a SortableIndexKey
         let mut get_index_info = |index_id: MVTableId| -> Result<Arc<IndexInfo>> {
@@ -2969,6 +2969,11 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         };
         loop {
             let next_rec = reader.next_record(&pager.io, &mut get_index_info)?;
+
+            tracing::trace!("next_rec {next_rec:?}");
+            // Check if we need to reparse schema before processing this operation
+            // This happens when transitioning from schema inserts to any other operation
+
             match next_rec {
                 StreamingResult::InsertTableRow { row, rowid } => {
                     let is_schema_row = rowid.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID;
@@ -3012,10 +3017,10 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                         assert!(self.table_id_to_rootpage.get(&rowid.table_id).is_some(), "Logical log contains a row version insert with a table id {} that does not exist in the table_id_to_rootpage map: {:?}", rowid.table_id, self.table_id_to_rootpage.iter().collect::<Vec<_>>());
                     }
                     self.insert(tx_id, row)?;
+                    // Make sure the newly parsed schema change record gets populated into the in-memory schema object.
+                    // It's a bit inefficient this way (we could just deserialize the logical log row as well), but schema
+                    // changes in the logical log are special cases that don't happen that often.
                     if is_schema_row {
-                        // Make sure the newly parsed schema change record gets populated into the in-memory schema object.
-                        // It's a bit inefficient this way (we could just deserialize the logical log row as well), but schema
-                        // changes in the logical log are special cases that don't happen that often.
                         connection.reparse_schema()?;
                         *connection.db.schema.lock() = connection.schema.read().clone();
                     }
@@ -3038,6 +3043,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 }
             }
         }
+
         self.commit_load_tx(tx_id, &connection);
         Ok(true)
     }

@@ -9,6 +9,7 @@ cargo build                    # build. never build with release.
 cargo test                     # rust unit/integration tests
 cargo fmt                      # format (required)
 cargo clippy --workspace --all-features --all-targets -- --deny=warnings  # lint
+cargo run -q --bin tursodb -- -q # run the interactive cli
 
 make test                      # TCL compat, sqlite3 compat, Python wrappers
 make test-single TEST=foo.test # single TCL test file (requires separate build)

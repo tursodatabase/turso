@@ -1,8 +1,4 @@
-use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
-};
-
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use tracing::{instrument, Level};
 use turso_parser::ast::{self, ResolveType, SortOrder, TableInternalId};
 
@@ -16,7 +12,7 @@ use crate::{
         emitter::{MaterializedColumnRef, TransactionMode},
         plan::{ResultSetColumn, TableReferences},
     },
-    CaptureDataChangesMode, Connection, Value, VirtualTable,
+    Arc, CaptureDataChangesMode, Connection, Value, VirtualTable,
 };
 
 // Keep distinct hash-table ids far from table internal ids to avoid collisions.
@@ -42,7 +38,10 @@ impl TableRefIdCounter {
     }
 }
 
-use super::{BranchOffset, CursorID, Insn, InsnReference, JumpTarget, Program};
+use super::{
+    BranchOffset, CursorID, Insn, InsnReference, JumpTarget, PrepareContext, PreparedProgram,
+    Program,
+};
 
 /// A key that uniquely identifies a cursor.
 /// The key is a pair of table reference id and index.
@@ -373,10 +372,10 @@ impl ProgramBuilder {
             is_subprogram,
             resolve_type: ResolveType::Abort,
             trigger_conflict_override: None,
-            cursor_overrides: HashMap::new(),
-            hash_build_signatures: HashMap::new(),
-            hash_tables_to_keep_open: HashSet::new(),
-            subquery_result_regs: HashMap::new(),
+            cursor_overrides: HashMap::default(),
+            hash_build_signatures: HashMap::default(),
+            hash_tables_to_keep_open: HashSet::default(),
+            subquery_result_regs: HashMap::default(),
         }
     }
 
@@ -1379,23 +1378,25 @@ impl ProgramBuilder {
             .iter()
             .any(|(insn, _)| matches!(insn, Insn::Program { .. }));
 
-        Ok(Program {
+        let prepared = PreparedProgram {
             max_registers: self.next_free_register,
             insns: self.insns,
             cursor_ref: self.cursor_ref,
             comments: self.comments,
-            connection,
             parameters: self.parameters,
             change_cnt_on,
             result_columns: self.result_columns,
             table_references: self.table_references,
             sql: sql.to_string(),
-            accesses_db: !matches!(self.txn_mode, TransactionMode::None),
-            needs_stmt_subtransactions: self.needs_stmt_subtransactions,
+            needs_stmt_subtransactions: crate::Arc::new(crate::AtomicBool::new(
+                self.needs_stmt_subtransactions,
+            )),
             trigger: self.trigger.take(),
             is_subprogram: self.is_subprogram,
             contains_trigger_subprograms,
             resolve_type: self.resolve_type,
-        })
+            prepare_context: PrepareContext::from_connection(&connection),
+        };
+        Ok(Program::from_prepared(Arc::new(prepared), connection))
     }
 }

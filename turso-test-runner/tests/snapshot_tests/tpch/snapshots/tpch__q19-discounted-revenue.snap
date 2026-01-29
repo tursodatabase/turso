@@ -1,0 +1,157 @@
+---
+source: tpch.sqltest
+expression: |-
+  select
+          sum(l_extendedprice* (1 - l_discount)) as revenue
+      from
+          lineitem,
+          part
+      where
+          (
+              p_partkey = l_partkey
+              and p_brand = 'Brand#22'
+              and p_container in ('SM CASE', 'SM BOX', 'SM PACK', 'SM PKG')
+              and l_quantity >= 8 and l_quantity <= 8 + 10
+              and p_size between 1 and 5
+              and l_shipmode in ('AIR', 'AIR REG')
+              and l_shipinstruct = 'DELIVER IN PERSON'
+          )
+          or
+          (
+              p_partkey = l_partkey
+              and p_brand = 'Brand#23'
+              and p_container in ('MED BAG', 'MED BOX', 'MED PKG', 'MED PACK')
+              and l_quantity >= 10 and l_quantity <= 10 + 10
+              and p_size between 1 and 10
+              and l_shipmode in ('AIR', 'AIR REG')
+              and l_shipinstruct = 'DELIVER IN PERSON'
+          )
+          or
+          (
+              p_partkey = l_partkey
+              and p_brand = 'Brand#12'
+              and p_container in ('LG CASE', 'LG BOX', 'LG PACK', 'LG PKG')
+              and l_quantity >= 24 and l_quantity <= 24 + 10
+              and p_size between 1 and 15
+              and l_shipmode in ('AIR', 'AIR REG')
+              and l_shipinstruct = 'DELIVER IN PERSON'
+          );
+info:
+  statement_type: SELECT
+  tables:
+  - lineitem
+  setup_blocks:
+  - schema
+  database: ':memory:'
+---
+QUERY PLAN
+|--SCAN lineitem
+`--SEARCH part USING INTEGER PRIMARY KEY (rowid=?)
+
+BYTECODE
+addr  opcode       p1  p2  p3  p4                                     p5  comment
+   0  Init          0  69   0                                          0  Start at 69
+   1  Null          0   2   0                                          0  r[2]=NULL
+   2  OpenRead      0  10   0  k(17,B,B,B,B,B,B,B,B,B,B,B,B,B,B,B,B)   0  table=lineitem, root=10, iDb=0
+   3  OpenRead      1   4   0  k(9,B,B,B,B,B,B,B,B,B)                  0  table=part, root=4, iDb=0
+   4  Rewind        0  65   0                                          0  Rewind table lineitem
+   5    Column      0  14   3                                          0  r[3]=lineitem.l_shipmode
+   6    Eq          3   4   8  Binary                                  0  if r[3]==r[4] goto 8
+   7    Ne          3   5  64  Binary                                  0  if r[3]!=r[5] goto 64
+   8    Column      0  13   7                                          0  r[7]=lineitem.l_shipinstruct
+   9    Ne          7   8  64  Binary                                  0  if r[7]!=r[8] goto 64
+  10    Column      0   1   9                                          0  r[9]=lineitem.l_partkey
+  11    SeekRowid   1   9  64                                          0  if (r[9]!=cursor 1 for table part.rowid) goto 64
+  12    Column      1   3  11                                          0  r[11]=part.p_brand
+  13    Ne         11  12  28  Binary                                  0  if r[11]!=r[12] goto 28
+  14    Column      1   6  13                                          0  r[13]=part.p_container
+  15    BitAnd     13  13  14                                          0  r[14]=r[13]&r[13]
+  16    Eq         13  15  22  Binary                                  0  if r[13]==r[15] goto 22
+  17    Eq         13  16  22  Binary                                  0  if r[13]==r[16] goto 22
+  18    Eq         13  17  22  Binary                                  0  if r[13]==r[17] goto 22
+  19    Eq         13  18  22  Binary                                  0  if r[13]==r[18] goto 22
+  20    IsNull     14  64   0                                          0  if (r[14]==NULL) goto 64
+  21    Goto        0  28   0                                          0
+  22    Column      0   4  20                                          0  r[20]=lineitem.l_quantity
+  23    Lt         20  21  28  Binary                                  0  if r[20]<r[21] goto 28
+  24    Column      0   4  23                                          0  r[23]=lineitem.l_quantity
+  25    Gt         23  24  28  Binary                                  0  if r[23]>r[24] goto 28
+  26    Column      1   5  28                                          0  r[28]=part.p_size
+  27    Le         28  29  57  Binary                                  0  if r[28]<=r[29] goto 57
+  28    Column      1   3  31                                          0  r[31]=part.p_brand
+  29    Ne         31  32  44  Binary                                  0  if r[31]!=r[32] goto 44
+  30    Column      1   6  33                                          0  r[33]=part.p_container
+  31    BitAnd     33  33  34                                          0  r[34]=r[33]&r[33]
+  32    Eq         33  35  38  Binary                                  0  if r[33]==r[35] goto 38
+  33    Eq         33  36  38  Binary                                  0  if r[33]==r[36] goto 38
+  34    Eq         33  37  38  Binary                                  0  if r[33]==r[37] goto 38
+  35    Eq         33  38  38  Binary                                  0  if r[33]==r[38] goto 38
+  36    IsNull     34  64   0                                          0  if (r[34]==NULL) goto 64
+  37    Goto        0  44   0                                          0
+  38    Column      0   4  40                                          0  r[40]=lineitem.l_quantity
+  39    Lt         40  41  44  Binary                                  0  if r[40]<r[41] goto 44
+  40    Column      0   4  43                                          0  r[43]=lineitem.l_quantity
+  41    Gt         43  44  44  Binary                                  0  if r[43]>r[44] goto 44
+  42    Column      1   5  47                                          0  r[47]=part.p_size
+  43    Le         47  48  57  Binary                                  0  if r[47]<=r[48] goto 57
+  44    Column      1   3  50                                          0  r[50]=part.p_brand
+  45    Ne         50  51  64  Binary                                  0  if r[50]!=r[51] goto 64
+  46    Column      1   6  52                                          0  r[52]=part.p_container
+  47    Eq         52  53  51  Binary                                  0  if r[52]==r[53] goto 51
+  48    Eq         52  54  51  Binary                                  0  if r[52]==r[54] goto 51
+  49    Eq         52  55  51  Binary                                  0  if r[52]==r[55] goto 51
+  50    Ne         52  56  64  Binary                                  0  if r[52]!=r[56] goto 64
+  51    Column      0   4  58                                          0  r[58]=lineitem.l_quantity
+  52    Lt         58  59  64  Binary                                  0  if r[58]<r[59] goto 64
+  53    Column      0   4  61                                          0  r[61]=lineitem.l_quantity
+  54    Gt         61  62  64  Binary                                  0  if r[61]>r[62] goto 64
+  55    Column      1   5  66                                          0  r[66]=part.p_size
+  56    Gt         66  67  64  Binary                                  0  if r[66]>r[67] goto 64
+  57    Column      1   5  70                                          0  r[70]=part.p_size
+  58    Gt         69  70  64  Binary                                  0  if r[69]>r[70] goto 64
+  59    Column      0   5  72                                          0  r[72]=lineitem.l_extendedprice
+  60    Column      0   6  75                                          0  r[75]=lineitem.l_discount
+  61    Subtract   74  75  73                                          0  r[73]=r[74]-r[75]
+  62    Multiply   72  73  71                                          0  r[71]=r[72]*r[73]
+  63    AggStep     0  71   2  sum                                     0  accum=r[2] step(r[71])
+  64  Next          0   5   0                                          0
+  65  AggFinal      0   2   0  sum                                     0  accum=r[2]
+  66  Copy          2   1   0                                          0  r[1]=r[2]
+  67  ResultRow     1   1   0                                          0  output=r[1]
+  68  Halt          0   0   0                                          0
+  69  Transaction   0   1   8                                          0  iDb=0 tx_mode=Read
+  70  String8       0   4   0  AIR                                     0  r[4]='AIR'
+  71  String8       0   5   0  AIR REG                                 0  r[5]='AIR REG'
+  72  String8       0   8   0  DELIVER IN PERSON                       0  r[8]='DELIVER IN PERSON'
+  73  String8       0  12   0  Brand#22                                0  r[12]='Brand#22'
+  74  String8       0  15   0  SM CASE                                 0  r[15]='SM CASE'
+  75  String8       0  16   0  SM BOX                                  0  r[16]='SM BOX'
+  76  String8       0  17   0  SM PACK                                 0  r[17]='SM PACK'
+  77  String8       0  18   0  SM PKG                                  0  r[18]='SM PKG'
+  78  Integer       8  21   0                                          0  r[21]=8
+  79  Integer       8  25   0                                          0  r[25]=8
+  80  Integer      10  26   0                                          0  r[26]=10
+  81  Add          25  26  24                                          0  r[24]=r[25]+r[26]
+  82  Integer       5  29   0                                          0  r[29]=5
+  83  String8       0  32   0  Brand#23                                0  r[32]='Brand#23'
+  84  String8       0  35   0  MED BAG                                 0  r[35]='MED BAG'
+  85  String8       0  36   0  MED BOX                                 0  r[36]='MED BOX'
+  86  String8       0  37   0  MED PKG                                 0  r[37]='MED PKG'
+  87  String8       0  38   0  MED PACK                                0  r[38]='MED PACK'
+  88  Integer      10  41   0                                          0  r[41]=10
+  89  Integer      10  45   0                                          0  r[45]=10
+  90  Add          45  45  44                                          0  r[44]=r[45]+r[45]
+  91  Integer      10  48   0                                          0  r[48]=10
+  92  String8       0  51   0  Brand#12                                0  r[51]='Brand#12'
+  93  String8       0  53   0  LG CASE                                 0  r[53]='LG CASE'
+  94  String8       0  54   0  LG BOX                                  0  r[54]='LG BOX'
+  95  String8       0  55   0  LG PACK                                 0  r[55]='LG PACK'
+  96  String8       0  56   0  LG PKG                                  0  r[56]='LG PKG'
+  97  Integer      24  59   0                                          0  r[59]=24
+  98  Integer      24  63   0                                          0  r[63]=24
+  99  Integer      10  64   0                                          0  r[64]=10
+ 100  Add          63  64  62                                          0  r[62]=r[63]+r[64]
+ 101  Integer      15  67   0                                          0  r[67]=15
+ 102  Integer       1  69   0                                          0  r[69]=1
+ 103  Integer       1  74   0                                          0  r[74]=1
+ 104  Goto          0   1   0                                          0

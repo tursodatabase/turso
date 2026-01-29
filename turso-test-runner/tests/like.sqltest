@@ -1,0 +1,365 @@
+@database :default:
+@database :default-no-rowidalias:
+
+test like-fn {
+    select name, like('sweat%', name) from products;
+}
+expect {
+    hat|0
+    cap|0
+    shirt|0
+    sweater|1
+    sweatshirt|1
+    shorts|0
+    jeans|0
+    sneakers|0
+    boots|0
+    coat|0
+    accessories|0
+}
+
+test where-like {
+    select * from products where name like 'sweat%';
+}
+expect {
+    4|sweater|68.9227440029754
+    5|sweatshirt|23.8100541984648
+}
+
+test where-like-case-insensitive {
+    select * from products where name like 'SWEAT%';
+}
+expect {
+    4|sweater|68.9227440029754
+    5|sweatshirt|23.8100541984648
+}
+
+test where-like-underscore {
+    select * from products where name like 'sweat_r';
+}
+expect {
+    4|sweater|68.9227440029754
+}
+
+test where-like-underscore-case-insensitive {
+    select * from products where name like 'SwEaT_R';
+}
+expect {
+    4|sweater|68.9227440029754
+}
+
+test where-like-fn {
+    select * from products where like('sweat%', name)=1
+}
+expect {
+    4|sweater|68.9227440029754
+    5|sweatshirt|23.8100541984648
+}
+
+test where-not-like-and {
+    select * from products where name not like 'sweat%' and price >= 70.0;
+}
+expect {
+    1|hat|82.9389679823547
+}
+
+test where-like-or {
+    select * from products where name like 'sweat%' or price >= 80.0;
+}
+expect {
+    1|hat|82.9389679823547
+    4|sweater|68.9227440029754
+    5|sweatshirt|23.8100541984648
+}
+
+test where-like-another-column {
+    select first_name, last_name from users where last_name like first_name;
+}
+expect {
+    Brown|Brown
+    Walter|Walter
+    Fay|Fay
+}
+
+test where-like-another-column-prefix {
+    select first_name, last_name from users where last_name like concat(first_name, '%');
+}
+expect {
+    Brown|Brown
+    Walter|Walter
+    Bo|Bode
+    Fay|Fay
+}
+
+test where-like-another-column-prefix-2 {
+    select count(*) from users where last_name like 'Wal#ter' escape '#';
+}
+expect {
+    29
+}
+
+test where-like-impossible {
+    select * from products where 'foobar' like 'fooba';
+}
+expect {
+}
+
+test like-with-backslash {
+    select like('\%A', '\A')
+}
+expect {
+    1
+}
+
+test like-with-dollar {
+    select like('A$%', 'A$')
+}
+expect {
+    1
+}
+
+test like-with-dot {
+    select like('%a.a', 'aaaa')
+}
+expect {
+    0
+}
+
+test like-fn-esc-1 {
+    SELECT like('abcX%', 'abc%' , 'X')
+}
+expect {
+    1
+}
+
+test like-fn-esc-2 {
+    SELECT like('abcX%', 'abc5' , 'X')
+}
+expect {
+    0
+}
+
+test like-fn-esc-3 {
+    SELECT like('abcX%', 'abc', 'X')
+}
+expect {
+    0
+}
+
+test like-fn-esc-4 {
+    SELECT like('abcX%', 'abcX%', 'X')
+}
+expect {
+    0
+}
+
+test like-fn-esc-5 {
+    SELECT like('abcX%', 'abc%%', 'X')
+}
+expect {
+    0
+}
+
+test like-fn-esc-6 {
+    SELECT like('abcX_', 'abc_' , 'X')
+}
+expect {
+    1
+}
+
+test like-fn-esc-7 {
+    SELECT like('abcX_', 'abc5' , 'X')
+}
+expect {
+    0
+}
+
+test like-fn-esc-8 {
+    SELECT like('abcX_', 'abc'  , 'X')
+}
+expect {
+    0
+}
+
+test like-fn-esc-9 {
+    SELECT like('abcX_', 'abcX_', 'X')
+}
+expect {
+    0
+}
+
+test like-fn-esc-10 {
+    SELECT like('abcX_', 'abc__', 'X')
+}
+expect {
+    0
+}
+
+test like-fn-esc-11 {
+    SELECT like('abcXX', 'abcX' , 'X')
+}
+expect {
+    1
+}
+
+test like-fn-esc-12 {
+    SELECT like('abcXX', 'abc5' , 'X')
+}
+expect {
+    0
+}
+
+test like-fn-esc-13 {
+    SELECT like('abcXX', 'abc'  , 'X')
+}
+expect {
+    0
+}
+
+test like-fn-esc-14 {
+    SELECT like('abcXX', 'abcXX', 'X')
+}
+expect {
+    0
+}
+
+test unicode-like-case-sensitivity-1 {
+    SELECT like('ä', 'Ä');
+}
+expect {
+    0
+}
+
+test unicode-like-case-sensitivity-2 {
+    SELECT like('a', 'A');
+}
+expect {
+    1
+}
+
+test unicode-like-with-escape-1 {
+    SELECT like('ÄX%', 'ä%', 'X');
+}
+expect {
+    0
+}
+
+test unicode-like-with-escape-2 {
+    SELECT like('ÄX%', 'Ä%', 'X');
+}
+expect {
+    1
+}
+
+# UTF-8 multi-byte boundary tests for LIKE fast paths
+test unicode-like-prefix-multibyte-text-1 {
+    SELECT '日本語' LIKE 'ab%';
+}
+expect {
+    0
+}
+
+test unicode-like-prefix-multibyte-text-2 {
+    SELECT '日本語' LIKE '日%';
+}
+expect {
+    1
+}
+
+test unicode-like-prefix-multibyte-text-3 {
+    SELECT '日本語' LIKE '日本%';
+}
+expect {
+    1
+}
+
+test unicode-like-suffix-multibyte-text-1 {
+    SELECT '日本a' LIKE '%ab';
+}
+expect {
+    0
+}
+
+test unicode-like-suffix-multibyte-text-2 {
+    SELECT '日本語' LIKE '%語';
+}
+expect {
+    1
+}
+
+test unicode-like-suffix-multibyte-text-3 {
+    SELECT 'a日本' LIKE '%本';
+}
+expect {
+    1
+}
+
+test unicode-like-contains-multibyte-1 {
+    SELECT '日本語' LIKE '%本%';
+}
+expect {
+    1
+}
+
+test unicode-like-contains-multibyte-2 {
+    SELECT 'hello日本world' LIKE '%日本%';
+}
+expect {
+    1
+}
+
+test like-complexity-1 {
+    SELECT 'test' LIKE REPLACE(ZEROBLOB(135000), x'00', 'a');
+}
+expect error {
+    LIKE or GLOB pattern too complex
+}
+
+test like-complexity-2 {
+    SELECT 'test' LIKE REPLACE(ZEROBLOB(11000), x'00', '%');
+}
+expect {
+    0
+}
+
+test like-trim-null {
+    SELECT trim('abc', NULL);
+}
+expect {
+}
+
+# ESCAPE with non-text types (SQLite coerces via sqlite3_value_text)
+test like-escape-int-0 {
+    SELECT '' LIKE '' ESCAPE 0;
+}
+expect {
+    1
+}
+
+test like-escape-int-5 {
+    SELECT 'a%bc' LIKE 'a5%%' ESCAPE 5;
+}
+expect {
+    1
+}
+
+test like-escape-null {
+    SELECT '' LIKE '' ESCAPE NULL;
+}
+expect {
+}
+
+test like-escape-int-10 {
+    SELECT '' LIKE '' ESCAPE 10;
+}
+expect error {
+    ESCAPE expression must be a single character
+}
+
+test like-escape-float {
+    SELECT '' LIKE '' ESCAPE 1.5;
+}
+expect error {
+    ESCAPE expression must be a single character
+}
+

@@ -4,6 +4,7 @@ use std::{
 };
 
 use turso_core::{
+    io::FileSyncType,
     storage::sqlite3_ondisk::{self, PageContent},
     Buffer, Completion, DatabaseStorage, File, LimboError,
 };
@@ -674,16 +675,20 @@ impl<IO: SyncEngineIo> DatabaseStorage for LazyDatabaseStorage<IO> {
         self.clean_file.pwritev(start_pos, buffers, nc)
     }
 
-    fn sync(&self, c: turso_core::Completion) -> turso_core::Result<turso_core::Completion> {
+    fn sync(
+        &self,
+        c: turso_core::Completion,
+        sync_type: FileSyncType,
+    ) -> turso_core::Result<turso_core::Completion> {
         if let Some(dirty_file) = &self.dirty_file {
-            let dirty_c = dirty_file.sync(Completion::new_sync(|_| {}))?;
+            let dirty_c = dirty_file.sync(Completion::new_sync(|_| {}), sync_type)?;
             assert!(
                 dirty_c.finished(),
                 "LazyDatabaseStorage works only with sync IO"
             );
         }
 
-        self.clean_file.sync(c)
+        self.clean_file.sync(c, sync_type)
     }
 
     fn size(&self) -> turso_core::Result<u64> {

@@ -161,7 +161,7 @@ jobs:
         with:
           working-directory: ${{ env.working-directory }}
           target: ${{ matrix.target }}
-          args: --release --out dist --find-interpreter
+          args: --profile release-official --out dist --find-interpreter
           sccache: 'true'
           manylinux: auto
       - name: Upload wheels
@@ -192,7 +192,7 @@ jobs:
         with:
           working-directory: ${{ env.working-directory }}
           target: ${{ matrix.target }}
-          args: --release --out dist --find-interpreter
+          args: --profile release-official --out dist --find-interpreter
           sccache: 'true'
       - name: Upload wheels
         uses: actions/upload-artifact@v4

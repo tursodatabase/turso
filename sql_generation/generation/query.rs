@@ -384,9 +384,10 @@ impl Arbitrary for CreateIndex {
             .collect::<Vec<(String, SortOrder)>>();
 
         let index_name = format!(
-            "idx_{}_{}",
+            "idx_{}_{}_{}",
             table.name,
-            gen_random_text(rng).chars().take(8).collect::<String>()
+            gen_random_text(rng).chars().take(8).collect::<String>(),
+            rng.random_range(0..1000000)
         );
 
         CreateIndex {

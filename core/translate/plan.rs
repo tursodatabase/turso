@@ -1,4 +1,5 @@
-use std::{cmp::Ordering, collections::HashMap, marker::PhantomData, sync::Arc};
+use rustc_hash::FxHashMap as HashMap;
+use std::{cmp::Ordering, marker::PhantomData, sync::Arc};
 use turso_parser::ast::{
     self, FrameBound, FrameClause, FrameExclude, FrameMode, ResolveType, SortOrder, SubqueryType,
 };
@@ -9,7 +10,7 @@ use crate::{
     translate::{
         collate::{get_collseq_from_expr, CollationSeq},
         emitter::UpdateRowSource,
-        expr::as_binary_components,
+        expr::{as_binary_components, get_expr_affinity},
         expression_index::{normalize_expr_for_index_matching, single_table_column_usage},
         optimizer::constraints::{BinaryExprSide, SeekRangeConstraint},
         planner::determine_where_to_eval_term,
@@ -27,6 +28,29 @@ use crate::{schema::Type, types::SeekOp};
 use turso_parser::ast::TableInternalId;
 
 use super::emitter::OperationMode;
+
+/// Infer the Type and type name from an expression's affinity.
+///
+/// Used for subquery result columns. SQLite derives column affinity from:
+/// - Column references: the declared column type
+/// - CAST expressions: the cast target type
+/// - Subqueries: recursively from the subquery's result expression
+/// - Literals: BLOB affinity (no affinity)
+///
+/// The affinity determines comparison behavior in IN expressions, etc.
+fn infer_type_from_expr(
+    expr: &ast::Expr,
+    tables: Option<&TableReferences>,
+) -> (Type, &'static str) {
+    let affinity = get_expr_affinity(expr, tables);
+    match affinity {
+        Affinity::Integer => (Type::Integer, "INTEGER"),
+        Affinity::Real => (Type::Real, "REAL"),
+        Affinity::Text => (Type::Text, "TEXT"),
+        Affinity::Numeric => (Type::Numeric, "NUMERIC"),
+        Affinity::Blob => (Type::Blob, "BLOB"),
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct ResultSetColumn {
@@ -472,6 +496,14 @@ impl SelectPlan {
             .iter()
             .any(|t| t.is_used())
             || self.non_from_clause_subqueries.iter().any(|s| s.correlated)
+            || self
+                .table_references
+                .joined_tables()
+                .iter()
+                .any(|t| match &t.table {
+                    Table::FromClauseSubquery(subquery) => plan_is_correlated(&subquery.plan),
+                    _ => false,
+                })
     }
 
     /// Reference: https://github.com/sqlite/sqlite/blob/5db695197b74580c777b37ab1b787531f15f7f9f/src/select.c#L8613
@@ -1236,12 +1268,14 @@ impl JoinedTable {
             .result_columns
             .iter()
             .map(|rc| {
+                let (col_type, type_name) =
+                    infer_type_from_expr(&rc.expr, Some(&plan.table_references));
                 Column::new(
                     rc.name(&plan.table_references).map(String::from),
-                    "BLOB".to_string(),
+                    type_name.to_string(),
                     None,
                     None,
-                    Type::Blob, // FIXME: infer proper type
+                    col_type,
                     None,
                     ColDef::default(),
                 )
@@ -1324,12 +1358,13 @@ impl JoinedTable {
                 let col_name = explicit_columns
                     .and_then(|cols| cols.get(i).cloned())
                     .or_else(|| rc.name(table_references).map(String::from));
+                let (col_type, type_name) = infer_type_from_expr(&rc.expr, Some(table_references));
                 Column::new(
                     col_name,
-                    "BLOB".to_string(),
+                    type_name.to_string(),
                     None,
                     None,
-                    Type::Blob, // FIXME: infer proper type
+                    col_type,
                     None,
                     ColDef::default(),
                 )
@@ -2016,31 +2051,13 @@ impl NonFromClauseSubquery {
         join_order: &[JoinOrderMember],
         table_references: Option<&TableReferences>,
     ) -> Result<EvalAt> {
-        let mut eval_at = EvalAt::BeforeLoop;
         let plan = match &self.state {
             SubqueryState::Unevaluated { plan } => plan.as_ref().unwrap(),
             SubqueryState::Evaluated { evaluated_at, .. } => {
                 return Ok(*evaluated_at);
             }
         };
-        let used_outer_refs = plan
-            .table_references
-            .outer_query_refs()
-            .iter()
-            .filter(|t| t.is_used());
-
-        for outer_ref in used_outer_refs {
-            if let Some(loop_idx) =
-                resolve_outer_ref_loop(outer_ref.internal_id, join_order, table_references)
-            {
-                eval_at = eval_at.max(EvalAt::Loop(loop_idx));
-            }
-        }
-        for subquery in plan.non_from_clause_subqueries.iter() {
-            let eval_at_inner = subquery.get_eval_at(join_order, table_references)?;
-            eval_at = eval_at.max(eval_at_inner);
-        }
-        Ok(eval_at)
+        eval_at_for_select_plan(plan, join_order, table_references)
     }
 
     /// Consumes the plan and returns it, and sets the subquery to the evaluated state.
@@ -2073,6 +2090,85 @@ impl NonFromClauseSubquery {
             }
         }
     }
+}
+
+/// Determine the earliest evaluation point for a nested plan by walking all SELECT components.
+fn eval_at_for_plan(
+    plan: &Plan,
+    join_order: &[JoinOrderMember],
+    table_references: Option<&TableReferences>,
+) -> Result<EvalAt> {
+    match plan {
+        Plan::Select(select_plan) => {
+            eval_at_for_select_plan(select_plan, join_order, table_references)
+        }
+        Plan::CompoundSelect {
+            left, right_most, ..
+        } => {
+            let mut eval_at = EvalAt::BeforeLoop;
+            for (select_plan, _) in left.iter() {
+                eval_at = eval_at.max(eval_at_for_select_plan(
+                    select_plan,
+                    join_order,
+                    table_references,
+                )?);
+            }
+            eval_at = eval_at.max(eval_at_for_select_plan(
+                right_most,
+                join_order,
+                table_references,
+            )?);
+            Ok(eval_at)
+        }
+        Plan::Delete(_) | Plan::Update(_) => Ok(EvalAt::BeforeLoop),
+    }
+}
+
+/// Returns true if a plan (including compound SELECTs) references outer-scope tables.
+fn plan_is_correlated(plan: &Plan) -> bool {
+    match plan {
+        Plan::Select(select_plan) => select_plan.is_correlated(),
+        Plan::CompoundSelect {
+            left, right_most, ..
+        } => left.iter().any(|(plan, _)| plan.is_correlated()) || right_most.is_correlated(),
+        Plan::Delete(_) | Plan::Update(_) => false,
+    }
+}
+
+/// Determine when a SELECT plan can be evaluated, including nested non-FROM and FROM-clause subqueries.
+fn eval_at_for_select_plan(
+    plan: &SelectPlan,
+    join_order: &[JoinOrderMember],
+    table_references: Option<&TableReferences>,
+) -> Result<EvalAt> {
+    let mut eval_at = EvalAt::BeforeLoop;
+    let used_outer_refs = plan
+        .table_references
+        .outer_query_refs()
+        .iter()
+        .filter(|t| t.is_used());
+
+    for outer_ref in used_outer_refs {
+        if let Some(loop_idx) =
+            resolve_outer_ref_loop(outer_ref.internal_id, join_order, table_references)
+        {
+            eval_at = eval_at.max(EvalAt::Loop(loop_idx));
+        }
+    }
+    for subquery in plan.non_from_clause_subqueries.iter() {
+        let eval_at_inner = subquery.get_eval_at(join_order, table_references)?;
+        eval_at = eval_at.max(eval_at_inner);
+    }
+    for joined_table in plan.table_references.joined_tables().iter() {
+        if let Table::FromClauseSubquery(from_clause_subquery) = &joined_table.table {
+            eval_at = eval_at.max(eval_at_for_plan(
+                from_clause_subquery.plan.as_ref(),
+                join_order,
+                table_references,
+            )?);
+        }
+    }
+    Ok(eval_at)
 }
 
 /// Resolves the loop index for an outer-table reference.

@@ -93,7 +93,7 @@ impl File for GenericFile {
     }
 
     #[instrument(err, skip_all, level = Level::TRACE)]
-    fn sync(&self, c: Completion) -> Result<Completion> {
+    fn sync(&self, c: Completion, _sync_type: crate::io::FileSyncType) -> Result<Completion> {
         let file = self.file.write();
         file.sync_all()?;
         c.complete(0);

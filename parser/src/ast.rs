@@ -1483,6 +1483,9 @@ pub enum PragmaName {
     FreelistCount,
     /// Enable or disable foreign key constraint enforcement
     ForeignKeys,
+    /// Use F_FULLFSYNC instead of fsync on macOS (only supported on macOS)
+    #[cfg(target_vendor = "apple")]
+    Fullfsync,
     /// Run integrity check on the database file
     IntegrityCheck,
     /// `journal_mode` pragma
@@ -1510,6 +1513,8 @@ pub enum PragmaName {
     SchemaVersion,
     /// Control database synchronization mode (OFF | FULL | NORMAL | EXTRA)
     Synchronous,
+    /// Control where temporary tables and indices are stored (DEFAULT=0, FILE=1, MEMORY=2)
+    TempStore,
     /// returns information about the columns of a table
     TableInfo,
     /// returns extended information about the columns of a table

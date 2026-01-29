@@ -124,6 +124,10 @@ typedef struct
     // optional parameter which defines if pages prefetch must be enabled
     // one of valid partial_bootstrap_strategy_* values MUST be set in order for this setting to have some effect
     bool partial_bootstrap_prefetch;
+    // optional base64-encoded encryption key for remote encrypted databases
+    const char *remote_encryption_key;
+    // optional encryption cipher name (e.g. "aes256gcm", "chacha20poly1305")
+    const char *remote_encryption_cipher;
 } turso_sync_database_config_t;
 
 /// opaque pointer to the TursoDatabaseSync instance

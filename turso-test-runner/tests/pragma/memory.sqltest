@@ -1,0 +1,287 @@
+@database :memory:
+
+test pragma-cache-size-default {
+    PRAGMA cache_size
+}
+expect {
+    -2000
+}
+
+# 200 is minimum cache size value, so we test for this
+test pragma-set-cache-size {
+    PRAGMA cache_size = 200;
+    PRAGMA cache_size
+}
+expect {
+    200
+}
+
+# Even though the cache size was set to 100 in previous test, a new connection defaults back to -2000.
+test pragma-cache-size {
+    PRAGMA cache_size
+}
+expect {
+    -2000
+}
+
+test pragma-function-cache-size {
+    SELECT * FROM pragma_cache_size()
+}
+expect {
+    -2000
+}
+
+# SQLite has memory mode, but we only report wal or mvcc
+@backend rust
+@skip-if mvcc "should return something different for mvcc"
+test pragma-function-update-journal-mode {
+    SELECT * FROM pragma_journal_mode()
+}
+expect {
+    wal
+}
+
+# SQLite only allows memory mode when in memory, but we allow wal or mvcc for in-mem dbs
+@backend rust
+test pragma-update-journal-mode-wal {
+    PRAGMA journal_mode=WAL
+}
+expect {
+    wal
+}
+
+test pragma-table-info-vtable {
+    SELECT name FROM pragma_table_info('generate_series')
+}
+expect {
+    value
+}
+
+@skip-if mvcc "page_count not implemented for mvcc"
+test pragma-page-count-table {
+    CREATE TABLE foo (bar);
+    PRAGMA page_count
+}
+expect {
+    2
+}
+
+test pragma-function-argument-with-space {
+    CREATE TABLE "foo bar"(c0);
+    SELECT * FROM pragma_table_info('foo bar')
+}
+expect {
+    0|c0||0||0
+}
+
+# If the argument passed to the first function call were simply concatenated with the underlying PRAGMA statement,
+# we would end up with: PRAGMA table_info='sqlite_schema';CREATE TABLE foo (c0);SELECT 'bar'. Depending on how many
+# statements are executed at once, at least one of the following would run:
+# - PRAGMA table_info='sqlite_schema';
+# - CREATE TABLE foo (c0);
+# - SELECT 'bar';
+# No output means that none of them were executed.
+test pragma-function-sql-injection {
+    SELECT * FROM pragma_table_info('sqlite_schema'';CREATE TABLE foo (c0);SELECT ''bar');
+    SELECT * FROM pragma_table_info('foo');
+}
+expect {
+}
+
+# pragma page_size=xxx doesn't change the page size of an initialized database.
+test pragma-page-size-set-initialized-db {
+    CREATE TABLE "foo bar"(c0);
+    PRAGMA page_size=1024;
+    PRAGMA page_size
+}
+expect {
+    4096
+}
+
+@skip-if mvcc "max_page_count and page_count not implemented for mvcc"
+test pragma-max-page-count-clamping-with-data {
+    CREATE TABLE test (id INTEGER);
+    PRAGMA page_count;
+    PRAGMA max_page_count = 1;
+}
+expect {
+    2
+    2
+}
+
+@skip-if mvcc "max_page_count not implemented for mvcc"
+test pragma-max-page-count-enforcement-error {
+    PRAGMA max_page_count = 1;
+    CREATE TABLE test (id INTEGER)
+}
+expect error {
+}
+
+test pragma-page-count-empty {
+    PRAGMA page_count
+}
+expect {
+    0
+}
+
+@skip-if mvcc "page_count not implemented for mvcc"
+test pragma-page-count-empty-2 {
+    PRAGMA user_version=1;
+    PRAGMA page_count
+}
+expect {
+    1
+}
+
+test pragma-user-version-default {
+    PRAGMA user_version
+}
+expect {
+    0
+}
+
+@skip-if mvcc "user_version not implemented for mvcc"
+test pragma-user-version-update {
+    PRAGMA user_version = 42;
+    PRAGMA user_version;
+}
+expect {
+    42
+}
+
+@skip-if mvcc "user_version not implemented for mvcc"
+test pragma-user-version-negative-value {
+    PRAGMA user_version = -10;
+    PRAGMA user_version;
+}
+expect {
+    -10
+}
+
+@skip-if mvcc "user_version not implemented for mvcc"
+test pragma-user-version-float-value {
+    PRAGMA user_version = 10.9;
+    PRAGMA user_version;
+}
+expect {
+    10
+}
+
+test pragma-application-id-default {
+    PRAGMA application_id
+}
+expect {
+    0
+}
+
+@skip-if mvcc "application_id not implemented for mvcc"
+test pragma-application-id-update {
+    PRAGMA application_id = 12345;
+    PRAGMA application_id;
+}
+expect {
+    12345
+}
+
+@skip-if mvcc "application_id not implemented for mvcc"
+test pragma-application-id-float-value {
+    PRAGMA application_id = 10.9;
+    PRAGMA application_id;
+}
+expect {
+    10
+}
+
+@skip-if mvcc "application_id not implemented for mvcc"
+test pragma-application-id-large-value {
+    PRAGMA application_id = 2147483647;
+    PRAGMA application_id;
+}
+expect {
+    2147483647
+}
+
+@skip-if mvcc "application_id not implemented for mvcc"
+test pragma-application-id-negative-value {
+    PRAGMA application_id = -23;
+    PRAGMA application_id;
+}
+expect {
+    -23
+}
+
+test pragma-application-id-zero {
+    PRAGMA application_id = 0;
+    PRAGMA application_id;
+}
+expect {
+    0
+}
+
+test pragma-page-size-default {
+    PRAGMA page_size
+}
+expect {
+    4096
+}
+
+test pragma-page-size-set {
+    PRAGMA page_size=1024;
+    PRAGMA page_size
+}
+expect {
+    1024
+}
+
+test pragma-max-page-count-default {
+    PRAGMA max_page_count
+}
+expect {
+    4294967294
+}
+
+test pragma-max-page-count-set-large {
+    PRAGMA max_page_count = 1000;
+    PRAGMA max_page_count
+}
+expect {
+    1000
+    1000
+}
+
+test pragma-max-page-count-set-zero-ignored {
+    PRAGMA max_page_count = 0;
+    PRAGMA max_page_count
+}
+expect {
+    4294967294
+    4294967294
+}
+
+test pragma-integrity-check-empty {
+    PRAGMA integrity_check;
+}
+expect {
+    ok
+}
+
+test pragma-cache-spill-off {
+    PRAGMA cache_spill=off;
+    PRAGMA cache_spill;
+}
+expect {
+    0
+}
+
+# pragma page_size=xxx changes the page size of an uninitialized database and persists the change.
+# set user_version to trigger database initialization.
+test pragma-page-size-set-uninitialized-db {
+    PRAGMA page_size=1024;
+    PRAGMA user_version=1;
+    PRAGMA page_size
+}
+expect {
+    1024
+}
+
+

@@ -120,6 +120,8 @@ pub struct turso_sync_database_config_t {
     pub partial_bootstrap_strategy_query: *const ::std::os::raw::c_char,
     pub partial_bootstrap_segment_size: usize,
     pub partial_bootstrap_prefetch: bool,
+    pub remote_encryption_key: *const ::std::os::raw::c_char,
+    pub remote_encryption_cipher: *const ::std::os::raw::c_char,
 }
 impl Default for turso_sync_database_config_t {
     fn default() -> Self {

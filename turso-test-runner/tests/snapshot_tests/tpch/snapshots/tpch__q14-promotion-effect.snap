@@ -1,0 +1,74 @@
+---
+source: tpch.sqltest
+expression: |-
+  select
+          100.00 * sum(cast(case
+              when p_type like 'PROMO%'
+                  then l_extendedprice * (1 - l_discount)
+              else 0
+          end as number)) / sum(l_extendedprice * (1 - l_discount)) as promo_revenue
+      from
+          lineitem,
+          part
+      where
+          l_partkey = p_partkey
+          and l_shipdate >= '1994-03-01'
+          and l_shipdate < '1994-04-01';
+info:
+  statement_type: SELECT
+  tables:
+  - lineitem
+  setup_blocks:
+  - schema
+  database: ':memory:'
+---
+QUERY PLAN
+|--SCAN lineitem
+`--SEARCH part USING INTEGER PRIMARY KEY (rowid=?)
+
+BYTECODE
+addr  opcode       p1  p2  p3  p4                                     p5  comment
+   0  Init          0  38   0                                          0  Start at 38
+   1  Null          0   2   3                                          0  r[2..3]=NULL
+   2  OpenRead      0  10   0  k(17,B,B,B,B,B,B,B,B,B,B,B,B,B,B,B,B)   0  table=lineitem, root=10, iDb=0
+   3  OpenRead      1   4   0  k(9,B,B,B,B,B,B,B,B,B)                  0  table=part, root=4, iDb=0
+   4  Rewind        0  30   0                                          0  Rewind table lineitem
+   5    Column      0  10   5                                          0  r[5]=lineitem.l_shipdate
+   6    Lt          5   6  29  Binary                                  0  if r[5]<r[6] goto 29
+   7    Column      0  10   8                                          0  r[8]=lineitem.l_shipdate
+   8    Ge          8   9  29  Binary                                  0  if r[8]>=r[9] goto 29
+   9    Column      0   1  10                                          0  r[10]=lineitem.l_partkey
+  10    SeekRowid   1  10  29                                          0  if (r[10]!=cursor 1 for table part.rowid) goto 29
+  11    Column      1   4  14                                          0  r[14]=part.p_type
+  12    String8     0  13   0  PROMO%                                  0  r[13]='PROMO%'
+  13    Function    1  13  12  like(2)                                 0  r[12]=func(r[13..14])
+  14    IfNot      12  21   1                                          0  if !r[12] goto 21
+  15    Column      0   5  15                                          0  r[15]=lineitem.l_extendedprice
+  16    Integer     1  17   0                                          0  r[17]=1
+  17    Column      0   6  18                                          0  r[18]=lineitem.l_discount
+  18    Subtract   17  18  16                                          0  r[16]=r[17]-r[18]
+  19    Multiply   15  16  11                                          0  r[11]=r[15]*r[16]
+  20    Goto        0  22   0                                          0
+  21    Integer     0  11   0                                          0  r[11]=0
+  22    Cast       11   0   0                                          0  affinity(r[11]=Numeric)
+  23    AggStep     0  11   2  sum                                     0  accum=r[2] step(r[11])
+  24    Column      0   5  20                                          0  r[20]=lineitem.l_extendedprice
+  25    Column      0   6  23                                          0  r[23]=lineitem.l_discount
+  26    Subtract   22  23  21                                          0  r[21]=r[22]-r[23]
+  27    Multiply   20  21  19                                          0  r[19]=r[20]*r[21]
+  28    AggStep     0  19   3  sum                                     0  accum=r[3] step(r[19])
+  29  Next          0   5   0                                          0
+  30  AggFinal      0   2   0  sum                                     0  accum=r[2]
+  31  AggFinal      0   3   0  sum                                     0  accum=r[3]
+  32  Copy          2  27   0                                          0  r[27]=r[2]
+  33  Multiply     26  27  24                                          0  r[24]=r[26]*r[27]
+  34  Copy          3  25   0                                          0  r[25]=r[3]
+  35  Divide       24  25   1                                          0  r[1]=r[24]/r[25]
+  36  ResultRow     1   1   0                                          0  output=r[1]
+  37  Halt          0   0   0                                          0
+  38  Transaction   0   1   8                                          0  iDb=0 tx_mode=Read
+  39  String8       0   6   0  1994-03-01                              0  r[6]='1994-03-01'
+  40  String8       0   9   0  1994-04-01                              0  r[9]='1994-04-01'
+  41  Integer       1  22   0                                          0  r[22]=1
+  42  Real          0  26   0  100.0                                   0  r[26]=100
+  43  Goto          0   1   0                                          0

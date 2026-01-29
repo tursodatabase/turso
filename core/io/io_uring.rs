@@ -3,8 +3,8 @@
 use super::{common, Completion, CompletionInner, File, OpenFlags, IO};
 use crate::io::clock::{Clock, DefaultClock, MonotonicInstant, WallClockInstant};
 use crate::storage::wal::CKPT_BATCH_PAGES;
-use crate::{turso_assert, CompletionError, LimboError, Result};
 use crate::sync::Mutex;
+use crate::{turso_assert, CompletionError, LimboError, Result};
 use rustix::fs::{self, FlockOperation, OFlags};
 use std::ptr::NonNull;
 use std::{
@@ -122,7 +122,7 @@ impl UringIO {
                 ring,
                 overflow: VecDeque::new(),
                 pending_ops: 0,
-                writev_states: HashMap::new(),
+                writev_states: HashMap::default(),
                 iov_pool: IovecPool::new(),
             },
             free_files: (0..FILES).collect(),
@@ -781,7 +781,7 @@ impl File for UringFile {
         Ok(c)
     }
 
-    fn sync(&self, c: Completion) -> Result<Completion> {
+    fn sync(&self, c: Completion, _sync_type: crate::io::FileSyncType) -> Result<Completion> {
         trace!("sync()");
         let sync = with_fd!(self, |fd| {
             io_uring::opcode::Fsync::new(fd)

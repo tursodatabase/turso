@@ -2,25 +2,59 @@ use logos::{Lexer, Logos};
 use miette::{Diagnostic, SourceSpan};
 use std::fmt;
 
-/// Extract block content between braces, handling nested braces
-/// Note: Does NOT trim content - trimming is handled by the parser based on context
+/// Extract block content between braces, handling nested braces and escape sequences
+/// Use `\}` to include a literal `}` that doesn't close the block
+/// Strips structural newlines: first newline after `{` and last newline before `}`
 fn extract_block_content(lexer: &mut Lexer<'_, Token>) -> Option<String> {
     let remainder = lexer.remainder();
     let mut depth = 1;
+    let mut chars = remainder.char_indices().peekable();
+    let mut content = String::new();
+    let mut is_first_char = true;
 
-    for (idx, ch) in remainder.char_indices() {
+    while let Some((idx, ch)) = chars.next() {
+        // Skip first character if it's a newline (structural, after `{`)
+        if is_first_char {
+            is_first_char = false;
+            if ch == '\n' {
+                continue;
+            }
+        }
+
         match ch {
-            '{' => depth += 1,
+            '\\' => {
+                // Escape sequence: check next character
+                if let Some(&(_, next_ch)) = chars.peek() {
+                    if next_ch == '}' || next_ch == '{' || next_ch == '\\' {
+                        // Consume the escaped character and add it literally
+                        chars.next();
+                        content.push(next_ch);
+                        continue;
+                    }
+                }
+                // Not a recognized escape sequence, keep the backslash
+                content.push(ch);
+            }
+            '{' => {
+                depth += 1;
+                content.push(ch);
+            }
             '}' => {
                 depth -= 1;
                 if depth == 0 {
-                    let content = remainder[..idx].to_string();
                     // Bump past the content and the closing brace
                     lexer.bump(idx + 1);
+                    // Strip trailing newline if present (structural, before `}`)
+                    if content.ends_with('\n') {
+                        content.pop();
+                    }
                     return Some(content);
                 }
+                content.push(ch);
             }
-            _ => {}
+            _ => {
+                content.push(ch);
+            }
         }
     }
 
@@ -60,6 +94,26 @@ pub enum Token {
     #[token("mvcc")]
     Mvcc,
 
+    /// `@requires`
+    #[token("@requires")]
+    AtRequires,
+
+    /// `@requires-file`
+    #[token("@requires-file")]
+    AtRequiresFile,
+
+    /// `trigger` capability keyword
+    #[token("trigger")]
+    Trigger,
+
+    /// `strict` capability keyword
+    #[token("strict")]
+    Strict,
+
+    /// `materialized_views` capability keyword
+    #[token("materialized_views")]
+    MaterializedViews,
+
     /// `@backend`
     #[token("@backend")]
     AtBackend,
@@ -79,6 +133,10 @@ pub enum Token {
     /// `test` keyword
     #[token("test")]
     Test,
+
+    /// `snapshot` keyword
+    #[token("snapshot")]
+    Snapshot,
 
     /// `expect` keyword
     #[token("expect")]
@@ -160,10 +218,16 @@ impl fmt::Display for Token {
             Token::AtSkipFile => write!(f, "@skip-file"),
             Token::AtSkipFileIf => write!(f, "@skip-file-if"),
             Token::Mvcc => write!(f, "mvcc"),
+            Token::AtRequires => write!(f, "@requires"),
+            Token::AtRequiresFile => write!(f, "@requires-file"),
+            Token::Trigger => write!(f, "trigger"),
+            Token::Strict => write!(f, "strict"),
+            Token::MaterializedViews => write!(f, "materialized_views"),
             Token::AtBackend => write!(f, "@backend"),
             Token::AtIdentifier(s) => write!(f, "@{s}"),
             Token::Setup => write!(f, "setup"),
             Token::Test => write!(f, "test"),
+            Token::Snapshot => write!(f, "snapshot"),
             Token::Expect => write!(f, "expect"),
             Token::Error => write!(f, "error"),
             Token::Pattern => write!(f, "pattern"),
@@ -223,7 +287,7 @@ pub fn tokenize(input: &str) -> Result<Vec<SpannedToken>, LexerError> {
 /// Suggest a fix for an invalid token
 fn suggest_fix(slice: &str) -> Option<String> {
     if slice.starts_with('@') {
-        Some("Valid directives are: @database, @setup, @skip, @skip-if, @backend. Did you mean one of these?".to_string())
+        Some("Valid directives are: @database, @setup, @skip, @skip-if, @skip-file, @skip-file-if, @requires, @requires-file, @backend. Did you mean one of these?".to_string())
     } else if slice.starts_with(':') {
         Some(
             "Database specifiers are :memory:, :temp:, :default:, or :default-no-rowidalias:"
@@ -374,6 +438,33 @@ mod tests {
             tokens[2].token,
             Token::BlockContent(" SELECT json_object('a', 1); ".to_string())
         );
+    }
+
+    #[test]
+    fn test_tokenize_escaped_braces() {
+        // Escaped closing brace should not end the block
+        let input = r#"expect raw { "\}" }"#;
+        let tokens = tokenize(input).unwrap();
+
+        assert_eq!(tokens[0].token, Token::Expect);
+        assert_eq!(tokens[1].token, Token::Raw);
+        // The \} is unescaped to just }
+        assert_eq!(tokens[2].token, Token::BlockContent(" \"}\" ".to_string()));
+
+        // Escaped opening brace
+        let input = r#"expect { \{ }"#;
+        let tokens = tokenize(input).unwrap();
+        assert_eq!(tokens[1].token, Token::BlockContent(" { ".to_string()));
+
+        // Escaped backslash
+        let input = r#"expect { \\ }"#;
+        let tokens = tokenize(input).unwrap();
+        assert_eq!(tokens[1].token, Token::BlockContent(r" \ ".to_string()));
+
+        // Backslash followed by other character is preserved
+        let input = r#"expect { \n }"#;
+        let tokens = tokenize(input).unwrap();
+        assert_eq!(tokens[1].token, Token::BlockContent(r" \n ".to_string()));
     }
 
     #[test]

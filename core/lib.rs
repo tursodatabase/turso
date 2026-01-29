@@ -64,7 +64,9 @@ use crate::storage::journal_mode;
 use crate::storage::pager::{self, AutoVacuumMode, HeaderRef, HeaderRefMut};
 use crate::storage::sqlite3_ondisk::{RawVersion, Version};
 use crate::sync::{
-    atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU16, AtomicUsize, Ordering},
+    atomic::{
+        AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU16, AtomicU64, AtomicUsize, Ordering,
+    },
     Arc, LazyLock, Weak,
 };
 use crate::sync::{Mutex, RwLock};
@@ -85,13 +87,11 @@ pub use io::{
     Buffer, Completion, CompletionType, File, GroupCompletion, MemoryIO, OpenFlags, PlatformIO,
     SyscallIO, WriteCompletion, IO,
 };
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use schema::Schema;
 pub use statement::Statement;
-use std::collections::HashSet;
 use std::time::Duration;
 use std::{
-    collections::HashMap,
     fmt::{self},
     ops::Deref,
 };
@@ -118,7 +118,7 @@ use util::parse_schema_rows;
 pub use util::IOExt;
 pub use vdbe::{
     builder::QueryMode, explain::EXPLAIN_COLUMNS, explain::EXPLAIN_QUERY_PLAN_COLUMNS,
-    FromValueRow, Program, Register,
+    FromValueRow, PrepareContext, PreparedProgram, Program, Register,
 };
 
 #[cfg(feature = "cli_only")]
@@ -197,9 +197,16 @@ pub type Result<T, E = LimboError> = std::result::Result<T, E>;
 
 #[derive(Clone, AtomicEnum, Copy, PartialEq, Eq, Debug)]
 enum TransactionState {
-    Write { schema_did_change: bool },
+    Write {
+        schema_did_change: bool,
+    },
     Read,
-    PendingUpgrade,
+    /// PendingUpgrade remembers what transaction state was before upgrade to write (has_read_txn is true if before transaction were in Read state)
+    /// This is important, because if we failed to initialize write transaction immediatley - we need to end implicitly started read txn (e.g. for simiple INSERT INTO operation)
+    /// But for late upgrade of transaction we should keep read transaction active (e.g. BEGIN; SELECT ...; INSERT INTO ...)
+    PendingUpgrade {
+        has_read_txn: bool,
+    },
     None,
 }
 
@@ -207,6 +214,19 @@ enum TransactionState {
 pub enum SyncMode {
     Off = 0,
     Full = 2,
+}
+
+/// Control where temporary tables and indices are stored.
+/// Matches SQLite's PRAGMA temp_store values:
+/// - 0 = DEFAULT (use compile-time default, which is FILE)
+/// - 1 = FILE (always use temp files on disk)
+/// - 2 = MEMORY (always use in-memory storage)
+#[derive(Debug, AtomicEnum, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TempStore {
+    #[default]
+    Default = 0,
+    File = 1,
+    Memory = 2,
 }
 
 pub(crate) type MvStore = mvcc::MvStore<mvcc::LocalClock>;
@@ -246,10 +266,13 @@ fn new_header_read_completion(buf: Arc<Buffer>) -> Completion {
 /// Mutex here would cause panics when the second iteration tries to lock a
 /// mutex that belongs to a stale execution context.
 static DATABASE_MANAGER: LazyLock<parking_lot::Mutex<HashMap<String, Weak<Database>>>> =
-    LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
+    LazyLock::new(|| parking_lot::Mutex::new(HashMap::default()));
 
 /// The `Database` object contains per database file state that is shared
 /// between multiple connections.
+///
+/// Do that `Database` object is cached and can be long lived. DO NOT store anything sensitive like
+/// encryption key here.
 pub struct Database {
     mv_store: ArcSwapOption<MvStore>,
     schema: Mutex<Arc<Schema>>,
@@ -274,7 +297,6 @@ pub struct Database {
     init_page_1: Arc<ArcSwapOption<Page>>,
 
     // Encryption
-    encryption_key: RwLock<Option<EncryptionKey>>,
     encryption_cipher_mode: AtomicCipherMode,
 }
 
@@ -358,14 +380,11 @@ impl Database {
             BufferPool::DEFAULT_ARENA_SIZE
         };
 
-        let (encryption_key, encryption_cipher_mode) =
-            if let Some(encryption_opts) = encryption_opts {
-                let key = EncryptionKey::from_hex_string(&encryption_opts.hexkey)?;
-                let cipher = CipherMode::try_from(encryption_opts.cipher.as_str())?;
-                (Some(key), Some(cipher))
-            } else {
-                (None, None)
-            };
+        let encryption_cipher_mode = if let Some(encryption_opts) = encryption_opts {
+            Some(CipherMode::try_from(encryption_opts.cipher.as_str())?)
+        } else {
+            None
+        };
 
         let init_page_1 = if db_size == 0 {
             let default_page_1 = pager::default_page1(encryption_cipher_mode.as_ref());
@@ -394,7 +413,6 @@ impl Database {
 
             init_page_1: Arc::new(ArcSwapOption::new(init_page_1)),
 
-            encryption_key: RwLock::new(encryption_key),
             encryption_cipher_mode: AtomicCipherMode::new(
                 encryption_cipher_mode.unwrap_or(CipherMode::None),
             ),
@@ -472,37 +490,18 @@ impl Database {
         if let Some(db) = registry.get(&canonical_path).and_then(Weak::upgrade) {
             tracing::debug!("took database {canonical_path:?} from the registry");
 
-            // if we have encryption opts, let's ensure they match
-            {
-                let db_key_guard = db.encryption_key.read();
-                let db_key = db_key_guard.deref();
+            // Check encryption compatibility using cipher mode (key is not stored in Database for security)
+            let db_is_encrypted = !matches!(db.encryption_cipher_mode.get(), CipherMode::None);
 
-                match (&encryption_opts, db_key) {
-                    (Some(enc_opts), Some(key)) => {
-                        let expected_key = EncryptionKey::from_hex_string(&enc_opts.hexkey)?;
-                        if expected_key.as_slice() != key.as_slice() {
-                            return Err(LimboError::InvalidArgument(
-                                "Encryption key does not match existing database encryption key"
-                                    .to_string(),
-                            ));
-                        }
-                    }
-                    // user provided encryption opts but cached database doesn't have encryption_key set.
-                    // This can happen when encryption was set via PRAGMA (which doesn't update db.encryption_key).
-                    (Some(_), None) => {}
-                    // database is encrypted but user didn't provide encryption opts
-                    (None, Some(_)) => {
-                        return Err(LimboError::InvalidArgument(
-                            "Database is encrypted but no encryption options provided".to_string(),
-                        ));
-                    }
-                    // neither has encryption - OK
-                    (None, None) => {}
-                }
+            if db_is_encrypted && encryption_opts.is_none() {
+                return Err(LimboError::InvalidArgument(
+                    "Database is encrypted but no encryption options provided".to_string(),
+                ));
             }
 
             return Ok(db);
         }
+        tracing::debug!("initialize database {canonical_path:?} and put in the registry");
         let db = Self::open_with_flags_bypass_registry_internal(
             io,
             path,
@@ -548,6 +547,13 @@ impl Database {
         opts: DatabaseOpts,
         encryption_opts: Option<EncryptionOpts>,
     ) -> Result<Arc<Database>> {
+        // Parse encryption key from encryption_opts if provided
+        let encryption_key = if let Some(ref enc_opts) = encryption_opts {
+            Some(EncryptionKey::from_hex_string(&enc_opts.hexkey)?)
+        } else {
+            None
+        };
+
         let mut db = Self::new(
             opts,
             flags,
@@ -558,7 +564,7 @@ impl Database {
             encryption_opts.clone(),
         )?;
 
-        let pager = db.header_validation()?;
+        let pager = db.header_validation(encryption_key.as_ref())?;
         #[cfg(debug_assertions)]
         {
             let wal_enabled = db.shared_wal.read().enabled.load(Ordering::SeqCst);
@@ -574,7 +580,7 @@ impl Database {
         // Check: https://github.com/tursodatabase/turso/pull/1761#discussion_r2154013123
 
         // parse schema
-        let conn = db._connect(false, Some(pager.clone()))?;
+        let conn = db._connect(false, Some(pager.clone()), encryption_key.clone())?;
         let syms = conn.syms.read();
         let pager = conn.pager.load();
 
@@ -601,17 +607,29 @@ impl Database {
         })?;
 
         if let Some(mv_store) = db.get_mv_store().as_ref() {
-            let mvcc_bootstrap_conn = db._connect(true, Some(pager.clone()))?;
+            let mvcc_bootstrap_conn = db._connect(true, Some(pager.clone()), encryption_key)?;
             mv_store.bootstrap(mvcc_bootstrap_conn)?;
         }
 
         Ok(db)
     }
 
-    /// Necessary Pager initialization, so that we are prepared to read from Page 1
-    fn _init(&self) -> Result<Pager> {
+    /// Necessary Pager initialization, so that we are prepared to read from Page 1.
+    /// For encrypted databases, the encryption key must be provided to properly decrypt page 1.
+    fn _init(&self, encryption_key: Option<&EncryptionKey>) -> Result<Pager> {
         let pager = self.init_pager(None)?;
         pager.enable_encryption(self.opts.enable_encryption);
+
+        // Set up encryption context BEFORE reading the header page.
+        // For encrypted databases, page 1 has:
+        // - Bytes 0-15: Turso magic header (replaces SQLite magic)
+        // - Bytes 16-100: Unencrypted header metadata
+        // - Bytes 100+: Encrypted content
+        // The encryption context is needed to properly decrypt page 1 when reopening.
+        if let Some(key) = encryption_key {
+            let cipher_mode = self.encryption_cipher_mode.get();
+            pager.set_encryption_context(cipher_mode, key)?;
+        }
 
         // Start read transaction before reading page 1 to acquire a read lock
         // that prevents concurrent checkpoints from truncating the WAL
@@ -648,12 +666,12 @@ impl Database {
     /// Checks the Version numbers in the DatabaseHeader, and changes it according to the required options
     ///
     /// Will also open MVStore and WAL if needed
-    fn header_validation(&mut self) -> Result<Arc<Pager>> {
+    fn header_validation(&mut self, encryption_key: Option<&EncryptionKey>) -> Result<Arc<Pager>> {
         let wal_exists = journal_mode::wal_exists(std::path::Path::new(&self.wal_path));
         let log_exists = journal_mode::logical_log_exists(std::path::Path::new(&self.path));
         let is_readonly = self.open_flags.contains(OpenFlags::ReadOnly);
 
-        let mut pager = self._init()?;
+        let mut pager = self._init(encryption_key)?;
         assert!(pager.wal.is_none(), "Pager should have no WAL yet");
 
         let is_autovacuumed_db = self.io.block(|| {
@@ -784,7 +802,17 @@ impl Database {
 
     #[instrument(skip_all, level = Level::INFO)]
     pub fn connect(self: &Arc<Database>) -> Result<Arc<Connection>> {
-        self._connect(false, None)
+        self._connect(false, None, None)
+    }
+
+    /// Connect with an encryption key.
+    /// Use this when opening an encrypted database where the key is known at connect time.
+    #[instrument(skip_all, level = Level::INFO)]
+    pub fn connect_with_encryption(
+        self: &Arc<Database>,
+        encryption_key: Option<EncryptionKey>,
+    ) -> Result<Arc<Connection>> {
+        self._connect(false, None, encryption_key)
     }
 
     #[instrument(skip_all, level = Level::INFO)]
@@ -792,11 +820,14 @@ impl Database {
         self: &Arc<Database>,
         is_mvcc_bootstrap_connection: bool,
         pager: Option<Arc<Pager>>,
+        encryption_key: Option<EncryptionKey>,
     ) -> Result<Arc<Connection>> {
         let pager = if let Some(pager) = pager {
             pager
         } else {
-            Arc::new(self._init()?)
+            // Pass encryption key to _init so it can set up encryption context
+            // before reading page 1. This is required for reopening encrypted databases.
+            Arc::new(self._init(encryption_key.as_ref())?)
         };
         let page_size = pager.get_page_size_unchecked();
 
@@ -806,20 +837,20 @@ impl Database {
             .unwrap_or_default()
             .get();
 
-        let encryption_key = self.encryption_key.read().clone();
-        let encrytion_cipher = self.encryption_cipher_mode.get();
+        let encryption_cipher = self.encryption_cipher_mode.get();
 
         let conn = Arc::new(Connection {
             db: self.clone(),
             pager: ArcSwap::new(pager),
             schema: RwLock::new(self.schema.lock().clone()),
-            database_schemas: RwLock::new(FxHashMap::default()),
+            database_schemas: RwLock::new(HashMap::default()),
             auto_commit: AtomicBool::new(true),
             transaction_state: AtomicTransactionState::new(TransactionState::None),
             last_insert_rowid: AtomicI64::new(0),
             last_change: AtomicI64::new(0),
             total_changes: AtomicI64::new(0),
             syms: parking_lot::RwLock::new(SymbolTable::new()),
+            syms_generation: AtomicU64::new(0),
             _shared_cache: false,
             cache_size: AtomicI32::new(default_cache_size),
             page_size: AtomicU16::new(page_size.get_raw()),
@@ -834,15 +865,16 @@ impl Database {
             nestedness: AtomicI32::new(0),
             compiling_triggers: RwLock::new(Vec::new()),
             executing_triggers: RwLock::new(Vec::new()),
-            encryption_key: RwLock::new(encryption_key.clone()),
-            encryption_cipher_mode: AtomicCipherMode::new(encrytion_cipher),
+            encryption_key: RwLock::new(encryption_key),
+            encryption_cipher_mode: AtomicCipherMode::new(encryption_cipher),
             sync_mode: AtomicSyncMode::new(SyncMode::Full),
+            temp_store: AtomicTempStore::new(TempStore::Default),
             data_sync_retry: AtomicBool::new(false),
             busy_handler: RwLock::new(BusyHandler::None),
             is_mvcc_bootstrap_connection: AtomicBool::new(is_mvcc_bootstrap_connection),
             fk_pragma: AtomicBool::new(false),
             fk_deferred_violations: AtomicIsize::new(0),
-            vtab_txn_states: RwLock::new(HashSet::new()),
+            vtab_txn_states: RwLock::new(HashSet::default()),
         });
         self.n_connections
             .fetch_add(1, crate::sync::atomic::Ordering::SeqCst);
@@ -940,7 +972,6 @@ impl Database {
 
     fn init_pager(&self, requested_page_size: Option<usize>) -> Result<Pager> {
         let cipher = self.encryption_cipher_mode.get();
-        let encryption_key = self.encryption_key.read();
         let reserved_bytes = self.maybe_get_reserved_space_bytes()?.or_else(|| {
             if !matches!(cipher, CipherMode::None) {
                 // For encryption, use the cipher's metadata size
@@ -993,11 +1024,6 @@ impl Database {
         }
         if disable_checksums {
             pager.reset_checksum_context();
-        }
-        // Set encryption later after `disable_checksums` as it may reset the `pager.io_ctx`
-        if let Some(encryption_key) = encryption_key.as_ref() {
-            pager.enable_encryption(true);
-            pager.set_encryption_context(cipher, encryption_key)?;
         }
 
         Ok(pager)
@@ -1203,8 +1229,8 @@ struct DatabaseCatalog {
 impl DatabaseCatalog {
     fn new() -> Self {
         Self {
-            name_to_index: HashMap::new(),
-            index_to_data: HashMap::new(),
+            name_to_index: HashMap::default(),
+            index_to_data: HashMap::default(),
             allocated: vec![3], // 0 | 1, as those are reserved for main and temp
         }
     }

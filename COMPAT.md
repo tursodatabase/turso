@@ -96,6 +96,7 @@ Turso aims to be fully compatible with SQLite, with opt-in features not supporte
 | VACUUM                    | No      |                                                                                   |
 | WITH clause               | Partial | No RECURSIVE, no MATERIALIZED, only SELECT supported in CTEs                      |
 | WINDOW functions             | Partial | only default frame definition, no window-specific functions (rank() etc)         |
+| GENERATED                 | No      |                                                                                   |
 
 #### [PRAGMA](https://www.sqlite.org/pragma.html)
 
@@ -165,7 +166,7 @@ Turso aims to be fully compatible with SQLite, with opt-in features not supporte
 | PRAGMA table_info                | Yes        |                                              |
 | PRAGMA table_list                | No         |                                              |
 | PRAGMA table_xinfo               | Yes        |                                              |
-| PRAGMA temp_store                | No         |                                              |
+| PRAGMA temp_store                | Yes        |                                              |
 | PRAGMA temp_store_directory      | Not Needed | deprecated in SQLite                         |
 | PRAGMA threads                   | No         |                                              |
 | PRAGMA trusted_schema            | No         |                                              |

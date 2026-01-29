@@ -19,6 +19,26 @@ public static class TursoBindings
         return TursoDatabaseHandle.FromPtr(dbPtr);
     }
 
+    /// <summary>
+    /// Opens a database with local encryption.
+    /// </summary>
+    /// <param name="path">The path to the database file.</param>
+    /// <param name="cipher">The encryption cipher to use.</param>
+    /// <param name="hexkey">The hex-encoded encryption key.</param>
+    /// <returns>A handle to the opened database.</returns>
+    public static TursoDatabaseHandle OpenDatabaseWithEncryption(string path, TursoEncryptionCipher cipher, string hexkey)
+    {
+        ArgumentNullException.ThrowIfNull(path);
+        ArgumentNullException.ThrowIfNull(hexkey);
+
+        var cipherStr = cipher.ToRustString();
+        var dbPtr = TursoInterop.OpenDatabaseWithEncryption(path, cipherStr, hexkey, out var errorPtr);
+        if (errorPtr != IntPtr.Zero)
+            ThrowException(errorPtr);
+
+        return TursoDatabaseHandle.FromPtr(dbPtr);
+    }
+
     public static TursoStatementHandle PrepareStatement(TursoDatabaseHandle db, string sql)
     {
         db.ThrowIfInvalid();

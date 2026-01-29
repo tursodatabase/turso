@@ -399,7 +399,7 @@ pub fn load_schema(
     let conn = rusqlite::Connection::open(db_path)?;
 
     // Fetch user tables (ignore sqlite internal tables)
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
     )?;
 
@@ -441,7 +441,7 @@ pub fn load_schema(
             .find(|col| col.constraints.contains(&Constraint::PrimaryKey))
             .expect("Table should have a primary key");
         let mut select_stmt =
-            conn.prepare(&format!("SELECT {} FROM {table_name}", pk_column.name))?;
+            conn.prepare_cached(&format!("SELECT {} FROM {table_name}", pk_column.name))?;
         let mut rows = select_stmt.query(())?;
         let mut pk_values = Vec::new();
         while let Some(row) = rows.next()? {
@@ -650,7 +650,7 @@ fn sqlite_integrity_check(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     assert!(db_path.exists());
     let conn = rusqlite::Connection::open(db_path)?;
-    let mut stmt = conn.prepare("SELECT * FROM pragma_integrity_check;")?;
+    let mut stmt = conn.prepare_cached("SELECT * FROM pragma_integrity_check;")?;
     let mut rows = stmt.query(())?;
     let mut result: Vec<String> = Vec::new();
 

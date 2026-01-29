@@ -25,6 +25,25 @@ expect {
     1
 }
 
+# Test for long CTE chains - regression test for exponential re-planning issue
+# See: https://github.com/tursodatabase/turso/issues/4887
+test cte-chain-long {
+    CREATE TABLE t (x INT);
+    INSERT INTO t VALUES (1);
+    WITH
+      c1 AS (SELECT x FROM t),
+      c2 AS (SELECT x FROM c1),
+      c3 AS (SELECT x FROM c2),
+      c4 AS (SELECT x FROM c3),
+      c5 AS (SELECT x FROM c4),
+      c6 AS (SELECT x FROM c5),
+      c7 AS (SELECT x FROM c6)
+    SELECT * FROM c7;
+}
+expect {
+    1
+}
+
 # =============================================================================
 # CTE with compound SELECT (UNION, UNION ALL, INTERSECT, EXCEPT)
 # =============================================================================

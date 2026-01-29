@@ -9,6 +9,7 @@ use std::cell::RefCell;
 use std::fmt;
 use std::ptr::NonNull;
 use std::{fmt::Debug, pin::Pin};
+use turso_macros::AtomicEnum;
 
 cfg_block! {
     #[cfg(all(target_os = "linux", feature = "io_uring", not(miri)))] {
@@ -50,12 +51,25 @@ mod completions;
 pub use clock::Clock;
 pub use completions::*;
 
+/// Controls which sync mechanism to use for durability.
+/// `FullFsync` only has effect on Apple platforms (uses F_FULLFSYNC fcntl).
+/// On other platforms, both variants behave the same (regular fsync).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, AtomicEnum)]
+pub enum FileSyncType {
+    /// Regular fsync - flushes to disk but may not flush disk write cache on macOS.
+    Fsync,
+    /// Full fsync - on macOS uses F_FULLFSYNC to flush disk write cache.
+    /// On other platforms, behaves the same as Fsync.
+    FullFsync,
+}
+
 pub trait File: Send + Sync {
     fn lock_file(&self, exclusive: bool) -> Result<()>;
     fn unlock_file(&self) -> Result<()>;
     fn pread(&self, pos: u64, c: Completion) -> Result<Completion>;
     fn pwrite(&self, pos: u64, buffer: Arc<Buffer>, c: Completion) -> Result<Completion>;
-    fn sync(&self, c: Completion) -> Result<Completion>;
+    /// Sync file data&metadata to disk.
+    fn sync(&self, c: Completion, sync_type: FileSyncType) -> Result<Completion>;
     fn pwritev(&self, pos: u64, buffers: Vec<Arc<Buffer>>, c: Completion) -> Result<Completion> {
         use crate::sync::atomic::{AtomicUsize, Ordering};
         if buffers.is_empty() {
@@ -152,6 +166,32 @@ impl TempFile {
                 _temp_dir: None,
                 file: memory_file,
             })
+        }
+    }
+
+    /// Creates a TempFile respecting the temp_store setting.
+    /// When temp_store is Memory, uses in-memory storage.
+    /// When temp_store is Default or File, uses file-based storage.
+    pub fn with_temp_store(io: &Arc<dyn IO>, temp_store: crate::TempStore) -> Result<Self> {
+        #[cfg(not(target_family = "wasm"))]
+        {
+            if matches!(temp_store, crate::TempStore::Memory) {
+                let memory_io = Arc::new(MemoryIO::new());
+                let memory_file =
+                    memory_io.open_file("tursodb_temp_file", OpenFlags::Create, false)?;
+                return Ok(TempFile {
+                    _temp_dir: None,
+                    file: memory_file,
+                });
+            }
+            // Fall through to file-based for Default and File modes
+            Self::new(io)
+        }
+        #[cfg(target_family = "wasm")]
+        {
+            // WASM always uses memory, ignore temp_store setting
+            let _ = temp_store;
+            Self::new(io)
         }
     }
 }
@@ -1103,7 +1143,7 @@ mod shuttle_tests {
             let io = io.clone();
             handles.push(thread::spawn(move || {
                 let c = Completion::new_sync(|_| {});
-                let c = file.sync(c).unwrap();
+                let c = file.sync(c, FileSyncType::Fsync).unwrap();
                 wait_completion_ok(io.as_ref(), &c);
             }));
         }

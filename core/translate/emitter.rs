@@ -2,12 +2,12 @@
 // It handles translating high-level SQL operations into low-level bytecode that can be executed by the virtual machine.
 
 use crate::sync::Arc;
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::num::NonZeroUsize;
 
 use tracing::{instrument, Level};
 use turso_parser::ast::{
-    self, Expr, Literal, ResolveType, TableInternalId, TriggerEvent, TriggerTime,
+    self, Expr, Literal, ResolveType, SubqueryType, TableInternalId, TriggerEvent, TriggerTime,
 };
 
 use super::aggregation::emit_ungrouped_aggregation;
@@ -20,7 +20,8 @@ use super::main_loop::{
 };
 use super::order_by::{emit_order_by, init_order_by, SortMetadata};
 use super::plan::{
-    Distinctness, JoinOrderMember, Operation, Scan, SelectPlan, TableReferences, UpdatePlan,
+    Distinctness, JoinOrderMember, Operation, Scan, SeekKeyComponent, SelectPlan, TableReferences,
+    UpdatePlan,
 };
 use super::select::emit_simple_count;
 use super::subquery::emit_from_clause_subqueries;
@@ -30,7 +31,7 @@ use crate::schema::{BTreeTable, Column, Index, IndexColumn, Schema, Table, ROWID
 use crate::translate::compound_select::emit_program_for_compound_select;
 use crate::translate::expr::{
     bind_and_rewrite_expr, emit_returning_results, rewrite_between_expr,
-    translate_expr_no_constant_opt, walk_expr_mut, BindingBehavior, NoConstantOptReason,
+    translate_expr_no_constant_opt, walk_expr, walk_expr_mut, BindingBehavior, NoConstantOptReason,
     WalkControl,
 };
 use crate::translate::fkeys::{
@@ -39,8 +40,8 @@ use crate::translate::fkeys::{
     open_read_table, stabilize_new_row_for_fk,
 };
 use crate::translate::plan::{
-    DeletePlan, EphemeralRowidMode, EvalAt, JoinedTable, Plan, QueryDestination, ResultSetColumn,
-    Search,
+    DeletePlan, EphemeralRowidMode, EvalAt, IndexMethodQuery, JoinedTable, Plan, QueryDestination,
+    ResultSetColumn, Search,
 };
 use crate::translate::planner::ROWID_STRS;
 use crate::translate::planner::{table_mask_from_expr, TableMask};
@@ -60,6 +61,25 @@ use crate::vdbe::insn::{
 use crate::vdbe::{insn::Insn, BranchOffset, CursorID};
 use crate::{bail_parse_error, emit_explain, Result, SymbolTable};
 use crate::{turso_assert, Connection, QueryMode};
+
+/// Initialize EXISTS subquery result registers to 0.
+/// This is needed because for correlated subqueries, the result_reg is only set inside
+/// the loop. If the loop never runs (empty table), we need a sensible default (0 = false).
+fn init_exists_result_regs(program: &mut ProgramBuilder, expr: &ast::Expr) {
+    let _ = walk_expr(expr, &mut |e| {
+        if let ast::Expr::SubqueryResult {
+            query_type: SubqueryType::Exists { result_reg },
+            ..
+        } = e
+        {
+            program.emit_insn(Insn::Integer {
+                value: 0,
+                dest: *result_reg,
+            });
+        }
+        Ok(WalkControl::Continue)
+    });
+}
 
 pub struct Resolver<'a> {
     pub schema: &'a Schema,
@@ -278,8 +298,8 @@ impl<'a> TranslateCtx<'a> {
             meta_group_by: None,
             meta_left_joins: (0..table_count).map(|_| None).collect(),
             meta_sort: None,
-            hash_table_contexts: HashMap::new(),
-            materialized_build_inputs: HashMap::new(),
+            hash_table_contexts: HashMap::default(),
+            materialized_build_inputs: HashMap::default(),
             resolver: Resolver::new(schema, syms),
             non_aggregate_expressions: Vec::new(),
             cdc_cursor_id: None,
@@ -410,9 +430,9 @@ fn emit_materialized_build_inputs(
     resolver: &Resolver,
     plan: &mut SelectPlan,
 ) -> Result<HashMap<usize, MaterializedBuildInput>> {
-    let mut build_inputs: HashMap<usize, MaterializedBuildInput> = HashMap::new();
+    let mut build_inputs: HashMap<usize, MaterializedBuildInput> = HashMap::default();
     let mut materializations: Vec<MaterializationSpec> = Vec::new();
-    let mut hash_tables_to_keep_open: HashSet<usize> = HashSet::new();
+    let mut hash_tables_to_keep_open: HashSet<usize> = HashSet::default();
 
     // Keep hash tables open while running materialization subplans so we can reuse them.
     // A build table may appear in multiple hash joins when chaining, so we do not
@@ -424,7 +444,7 @@ fn emit_materialized_build_inputs(
         }
     }
 
-    let mut seen_build_tables: HashSet<usize> = HashSet::new();
+    let mut seen_build_tables: HashSet<usize> = HashSet::default();
 
     // decide per-hash-join materialization mode (rowid-only vs key+payload).
     for member in plan.join_order.iter() {
@@ -450,10 +470,45 @@ fn emit_materialized_build_inputs(
                 )
             });
 
-            if build_table_was_prior_probe {
-                // Prior probe -> build chaining requires keys+payload so we don't SeekRowid.
-                let (_, included_tables) =
-                    materialization_prefix(plan, hash_join_op.build_table_idx, probe_table_idx)?;
+            // The join prefix is the set of tables we include when building this hash
+            // input (all tables before the probe + the build table). If the prefix
+            // has *any* table besides the build table, then rowid-only materialization
+            // is unsafe. Here's why:
+            //
+            // Rowid-only keeps each build-table rowid at most once. That throws away
+            // which prefix row it came from, so we lose the one-to-one link between
+            // a prefix match and a build row.
+            //
+            // Example (t1 is a left-side table earlier in the join order):
+            //   t1 rows:     t1_1(c=1), t1_2(c=2)
+            //   t2 rows:     t2_7(c=1), t2_8(c=2)   (build table)
+            //   t3 rows:     one row per t2 row
+            //
+            // Correct result after joining:
+            //   t1_1 + t2_7 + t2_7's t3 row
+            //   t1_2 + t2_8 + t2_8's t3 row   (2 rows)
+            //
+            // Key+payload materialization lets us PRUNE the prefix tables (like t1)
+            // from the main join order, because their needed columns now live in
+            // the payload. So the main plan does NOT loop t1 again.
+            //
+            // However, rowid-only materialization keeps just {t2_7, t2_8} with no link to t1_1/t1_2.
+            // Since t1 stays in the main join loop, each t1 row joins against the
+            // materialized t2 set. With no t1→t2 correlation, every t1 row matches
+            // both t2 rows, incorrectly producing 4 rows (a cross product).
+            //
+            // Therefore: if the prefix has other tables, we must store key+payload
+            // rows so each prefix match stays distinct and the main plan can drop
+            // the prefix loops.
+            let (_, included_tables) =
+                materialization_prefix(plan, hash_join_op.build_table_idx, probe_table_idx)?;
+            let prefix_has_other_tables = included_tables
+                .iter()
+                .any(|table_idx| *table_idx != hash_join_op.build_table_idx);
+
+            if build_table_was_prior_probe || prefix_has_other_tables {
+                // Prior probe -> build chaining OR any multi-table prefix requires keys+payload
+                // so we do not lose multiplicity or correlation.
                 let payload_columns = collect_materialized_payload_columns(plan, &included_tables)?;
                 let key_exprs: Vec<Expr> = hash_join_op
                     .join_keys
@@ -473,7 +528,8 @@ fn emit_materialized_build_inputs(
                     payload_columns,
                 });
             } else {
-                // Otherwise a rowid list is enough to preserve build-side filters.
+                // Single-table prefix: a rowid list preserves the build-side filters
+                // without losing multiplicity (as explained in the comment above).
                 materializations.push(MaterializationSpec {
                     build_table_idx: hash_join_op.build_table_idx,
                     probe_table_idx,
@@ -619,7 +675,7 @@ fn prune_join_order_for_materialized_inputs(
         return Ok(());
     }
 
-    let mut build_tables_in_plan = HashSet::new();
+    let mut build_tables_in_plan = HashSet::default();
     for member in plan.join_order.iter() {
         let table = &plan.table_references.joined_tables()[member.original_idx];
         if let Operation::HashJoin(hash_join_op) = &table.op {
@@ -627,7 +683,7 @@ fn prune_join_order_for_materialized_inputs(
         }
     }
 
-    let mut tables_to_remove: HashSet<usize> = HashSet::new();
+    let mut tables_to_remove: HashSet<usize> = HashSet::default();
     for (build_table_idx, input) in build_inputs.iter() {
         if !build_tables_in_plan.contains(build_table_idx) {
             continue;
@@ -733,7 +789,7 @@ fn collect_materialized_payload_columns(
     included_tables: &[usize],
 ) -> Result<Vec<MaterializedColumnRef>> {
     let mut payload_columns: Vec<MaterializedColumnRef> = Vec::new();
-    let mut seen: HashSet<MaterializedColumnRef> = HashSet::new();
+    let mut seen: HashSet<MaterializedColumnRef> = HashSet::default();
     for table_idx in included_tables.iter().copied() {
         let table = &plan.table_references.joined_tables()[table_idx];
         for col_idx in table.col_used_mask.iter() {
@@ -794,6 +850,8 @@ fn build_materialized_input_columns(
 }
 
 /// Construct a SELECT plan that materializes build-side inputs into an ephemeral table.
+/// This plan is separate from the main query plan and is exclusively used for the materialization.
+/// process.
 ///
 /// The join order is the original prefix up to (but excluding) the probe table, plus
 /// the build table itself. This filters build rows using only prior join constraints
@@ -810,10 +868,26 @@ fn build_materialized_build_input_plan(
     payload_columns: &[MaterializedColumnRef],
     materialized_build_inputs: &HashMap<usize, MaterializedBuildInput>,
 ) -> Result<SelectPlan> {
+    // Build a materialization subplan that only includes the join prefix
+    // (all tables prior to the probe + the build table). The resulting plan
+    // is smaller than the original select plan, so any access methods or
+    // predicates that depend on tables outside this prefix must be dropped.
     let (join_order, included_tables) =
         materialization_prefix(plan, build_table_idx, probe_table_idx)?;
-    let included_mask = TableMask::from_table_number_iter(included_tables.into_iter());
+    // Bitmask of tables that are actually in the prefix join order for
+    // this materialization subplan. Anything that depends on other tables
+    // cannot be evaluated during those table scans.
+    let join_prefix_mask =
+        TableMask::from_table_number_iter(join_order.iter().map(|m| m.original_idx));
+    // Expressions can also reference build tables of earlier hash joins in this subplan,
+    // because those tables are available during probe loops. Use the broader "included"
+    // set when deciding which WHERE terms can be evaluated inside the materialization.
+    let eval_prefix_mask = TableMask::from_table_number_iter(included_tables.iter().copied());
 
+    // Clone WHERE terms but mark as "consumed" any term that needs tables
+    // outside the prefix. This prevents the subplan from trying to evaluate
+    // predicates it doesn't have access to (e.g. autoindex lookups that
+    // would require non-prefix tables to bind parameters).
     let mut where_clause = plan.where_clause.clone();
     for term in where_clause.iter_mut() {
         let mask = table_mask_from_expr(
@@ -821,10 +895,15 @@ fn build_materialized_build_input_plan(
             &plan.table_references,
             &plan.non_from_clause_subqueries,
         )?;
-        // Preserve consumed terms that the optimizer already suppressed.
-        term.consumed |= !included_mask.contains_all(&mask);
+        let outside_prefix = !eval_prefix_mask.contains_all(&mask);
+        // Preserve consumed terms that the optimizer already suppressed, and
+        // additionally consume any term that depends on tables outside the prefix.
+        term.consumed |= outside_prefix;
     }
 
+    // Clone table references and then "sanitize" each access method so that
+    // the materialization subplan does not try to use an access path that
+    // requires tables outside the prefix. If it does, we fall back to a scan.
     let mut table_references = plan.table_references.clone();
     for joined_table in table_references.joined_tables_mut().iter_mut() {
         if let Operation::HashJoin(hash_join_op) = &mut joined_table.op {
@@ -838,6 +917,94 @@ fn build_materialized_build_input_plan(
                 // disable hash joins anchored on it.
                 joined_table.op = Operation::default_scan_for(&joined_table.table);
             }
+        }
+    }
+
+    // Helper to decide whether an expression depends on tables outside
+    // the prefix. If it does, any access method that relies on that
+    // expression must be invalidated for the materialization subplan.
+    let expr_depends_outside_prefix = |expr: &Expr| -> Result<bool> {
+        let mask = table_mask_from_expr(
+            expr,
+            &plan.table_references,
+            &plan.non_from_clause_subqueries,
+        )?;
+        Ok(!join_prefix_mask.contains_all(&mask))
+    };
+
+    // Walk each table in the cloned plan and ensure its access method is
+    // valid within the prefix. If the access method depends on tables
+    // outside the prefix, downgrade to a plain scan.
+    for (table_idx, joined_table) in table_references.joined_tables_mut().iter_mut().enumerate() {
+        if !join_prefix_mask.contains_table(table_idx) {
+            continue;
+        }
+
+        let mut reset_op = false;
+        match &joined_table.op {
+            Operation::Search(Search::RowidEq { cmp_expr }) => {
+                // Rowid equality searches may depend on other tables (e.g. column = other.col).
+                reset_op = expr_depends_outside_prefix(cmp_expr)?;
+            }
+            Operation::Search(Search::Seek { seek_def, .. }) => {
+                // Seek keys can include expressions bound by other tables. If so,
+                // the seek is not valid in the prefix-only subplan.
+                for component in seek_def.iter(&seek_def.start) {
+                    if let SeekKeyComponent::Expr(expr) = component {
+                        if expr_depends_outside_prefix(expr)? {
+                            reset_op = true;
+                            break;
+                        }
+                    }
+                }
+                if !reset_op {
+                    for component in seek_def.iter(&seek_def.end) {
+                        if let SeekKeyComponent::Expr(expr) = component {
+                            if expr_depends_outside_prefix(expr)? {
+                                reset_op = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            Operation::IndexMethodQuery(IndexMethodQuery { arguments, .. }) => {
+                // Index method queries are driven by argument expressions.
+                // If any argument depends on non-prefix tables, we cannot use it.
+                for expr in arguments {
+                    if expr_depends_outside_prefix(expr)? {
+                        reset_op = true;
+                        break;
+                    }
+                }
+            }
+            Operation::Scan(Scan::VirtualTable { constraints, .. }) => {
+                // Virtual table constraints are evaluated against expressions.
+                // If any constraint depends on non-prefix tables, drop the scan
+                // specialization and fall back to a full scan.
+                for expr in constraints {
+                    if expr_depends_outside_prefix(expr)? {
+                        reset_op = true;
+                        break;
+                    }
+                }
+            }
+            Operation::HashJoin(hash_join_op) => {
+                // Hash joins are driven by the probe table's loop. That probe table
+                // must be in the prefix; otherwise the hash join cannot be evaluated
+                // inside this subplan. The build table may live outside the prefix
+                // because the hash build phase scans it independently.
+                if !join_prefix_mask.contains_table(hash_join_op.probe_table_idx) {
+                    reset_op = true;
+                }
+            }
+            _ => {}
+        }
+
+        if reset_op {
+            // Downgrade to a default scan. This ensures the subplan only uses
+            // access paths that are valid within the prefix join order.
+            joined_table.op = Operation::default_scan_for(&joined_table.table);
         }
     }
 
@@ -965,10 +1132,11 @@ pub fn emit_query<'a>(
     // For non-grouped aggregation queries that also have non-aggregate columns,
     // we need to ensure non-aggregate columns are only emitted once.
     // This flag helps track whether we've already emitted these columns.
-    if !plan.aggregates.is_empty()
+    let has_ungrouped_nonagg_cols = !plan.aggregates.is_empty()
         && plan.group_by.is_none()
-        && plan.result_columns.iter().any(|c| !c.contains_aggregates)
-    {
+        && plan.result_columns.iter().any(|c| !c.contains_aggregates);
+
+    if has_ungrouped_nonagg_cols {
         let flag = program.alloc_register();
         program.emit_int(0, flag); // Initialize flag to 0 (not yet emitted)
         t_ctx.reg_nonagg_emit_once_flag = Some(flag);
@@ -978,6 +1146,18 @@ pub fn emit_query<'a>(
     if t_ctx.reg_result_cols_start.is_none() {
         t_ctx.reg_result_cols_start = Some(program.alloc_registers(plan.result_columns.len()));
         program.reg_result_cols_start = t_ctx.reg_result_cols_start
+    }
+
+    // For ungrouped aggregates with non-aggregate columns, initialize EXISTS subquery
+    // result_regs to 0. EXISTS returns 0 (not NULL) when the subquery is never evaluated
+    // (correlated EXISTS in empty loop). Non-aggregate columns themselves are evaluated
+    // after the loop in emit_ungrouped_aggregation if the loop never ran.
+    if has_ungrouped_nonagg_cols {
+        for rc in plan.result_columns.iter() {
+            if !rc.contains_aggregates {
+                init_exists_result_regs(program, &rc.expr);
+            }
+        }
     }
 
     let has_group_by_exprs = plan
@@ -1033,6 +1213,11 @@ pub fn emit_query<'a>(
     };
     if let Distinctness::Distinct { ctx } = &mut plan.distinctness {
         *ctx = distinct_ctx
+    }
+    if let Distinctness::Distinct { ctx: Some(ctx) } = &plan.distinctness {
+        program.emit_insn(Insn::HashClear {
+            hash_table_id: ctx.hash_table_id,
+        });
     }
 
     init_limit(program, t_ctx, &plan.limit, &plan.offset)?;
@@ -1090,8 +1275,7 @@ pub fn emit_query<'a>(
 
     program.preassign_label_to_next_insn(after_main_loop_label);
 
-    let mut order_by_necessary =
-        !plan.order_by.is_empty() && !plan.contains_constant_false_condition;
+    let order_by_necessary = !plan.order_by.is_empty() && !plan.contains_constant_false_condition;
     let order_by = &plan.order_by;
 
     // Handle GROUP BY and aggregation processing
@@ -1108,8 +1292,6 @@ pub fn emit_query<'a>(
     } else if !plan.aggregates.is_empty() {
         // Handle aggregation without GROUP BY (or HAVING without GROUP BY)
         emit_ungrouped_aggregation(program, t_ctx, plan)?;
-        // Single row result for aggregates without GROUP BY, so ORDER BY not needed
-        order_by_necessary = false;
     } else if plan.window.is_some() {
         emit_window_results(program, t_ctx, plan)?;
     }
@@ -2621,7 +2803,7 @@ fn emit_update_insns<'a>(
     let preserved_old_registers: Option<Vec<usize>> = if let Some(btree_table) =
         target_table.table.btree()
     {
-        let updated_column_indices: std::collections::HashSet<usize> =
+        let updated_column_indices: HashSet<usize> =
             set_clauses.iter().map(|(col_idx, _)| *col_idx).collect();
         let relevant_before_update_triggers = get_relevant_triggers_type_and_time(
             t_ctx.resolver.schema,
@@ -2779,10 +2961,7 @@ fn emit_update_insns<'a>(
                     target_table_cursor_id,
                     start,
                     rowid_new_reg,
-                    &set_clauses
-                        .iter()
-                        .map(|(i, _)| *i)
-                        .collect::<std::collections::HashSet<_>>(),
+                    &set_clauses.iter().map(|(i, _)| *i).collect::<HashSet<_>>(),
                 )?;
             }
             // Parent-side NO ACTION/RESTRICT checks must happen BEFORE the update.
@@ -3508,7 +3687,7 @@ fn emit_update_insns<'a>(
 
         // Fire AFTER UPDATE triggers
         if let Some(btree_table) = target_table.table.btree() {
-            let updated_column_indices: std::collections::HashSet<usize> =
+            let updated_column_indices: HashSet<usize> =
                 set_clauses.iter().map(|(col_idx, _)| *col_idx).collect();
             let relevant_triggers = get_relevant_triggers_type_and_time(
                 t_ctx.resolver.schema,

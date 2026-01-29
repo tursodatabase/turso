@@ -1,5 +1,6 @@
-use std::{collections::HashSet, sync::Arc};
+use std::sync::Arc;
 
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use turso_parser::ast::{self, SortOrder, SubqueryType};
 
 use crate::{
@@ -27,7 +28,8 @@ use crate::{
 use super::{
     emitter::{emit_query, Resolver, TranslateCtx},
     main_loop::LoopLabels,
-    plan::{Operation, QueryDestination, Scan, Search, SelectPlan},
+    plan::{Aggregate, Operation, QueryDestination, Scan, Search, SelectPlan},
+    planner::resolve_window_and_aggregate_functions,
 };
 
 // Compute query plans for subqueries occurring in any position other than the FROM clause.
@@ -121,6 +123,18 @@ pub fn plan_subqueries_from_select_plan(
         if let Some(offset) = &mut plan.offset {
             walk_expr_mut(offset, &mut subquery_parser)?;
         }
+    }
+
+    // Recollect aggregates after all subquery planning.
+    // This is necessary because:
+    // 1. Aggregates are collected with cloned expressions before subquery planning modifies them
+    //    (e.g., EXISTS -> SubqueryResult), causing stale args in aggregates.
+    // 2. ORDER BY may be cleared for single-row aggregates AFTER aggregates were collected from it,
+    //    leaving orphaned aggregates with unprocessed subqueries in their args.
+    // Recollecting from the current state of result_columns, HAVING, and ORDER BY ensures
+    // aggregates have updated expressions and excludes aggregates from cleared ORDER BY.
+    if !plan.aggregates.is_empty() {
+        recollect_aggregates(plan, resolver)?;
     }
 
     update_column_used_masks(
@@ -442,7 +456,8 @@ fn get_subquery_parser<'a>(
                 };
                 if lhs_column_count != plan.result_columns.len() {
                     crate::bail_parse_error!(
-                        "lhs of IN subquery must have the same number of columns as the subquery"
+                        "sub-select returns {} columns - expected {lhs_column_count}",
+                        plan.result_columns.len()
                     );
                 }
 
@@ -513,6 +528,40 @@ fn get_subquery_parser<'a>(
     }
 }
 
+/// Recollect all aggregates after subquery planning.
+///
+/// Aggregates are collected during parsing with cloned expressions. When subquery planning
+/// modifies expressions in place (e.g. replacing EXISTS with SubqueryResult), the aggregate's
+/// cloned original_expr and args become stale. This causes cache misses during translation.
+///
+/// Instead of trying to sync stale clones, this function recollects all aggregates fresh
+/// from the updated expressions in result_columns, HAVING, and ORDER BY.
+fn recollect_aggregates(plan: &mut SelectPlan, resolver: &Resolver) -> Result<()> {
+    let mut new_aggregates: Vec<Aggregate> = Vec::new();
+
+    // Collect from result columns (same order as original collection)
+    for rc in &plan.result_columns {
+        resolve_window_and_aggregate_functions(&rc.expr, resolver, &mut new_aggregates, None)?;
+    }
+
+    // Collect from HAVING
+    if let Some(group_by) = &plan.group_by {
+        if let Some(having) = &group_by.having {
+            for expr in having {
+                resolve_window_and_aggregate_functions(expr, resolver, &mut new_aggregates, None)?;
+            }
+        }
+    }
+
+    // Collect from ORDER BY
+    for (expr, _) in &plan.order_by {
+        resolve_window_and_aggregate_functions(expr, resolver, &mut new_aggregates, None)?;
+    }
+
+    plan.aggregates = new_aggregates;
+    Ok(())
+}
+
 /// We make decisions about when to evaluate expressions or whether to use covering indexes based on
 /// which columns of a table have been referenced.
 /// Since subquery nesting is arbitrarily deep, a reference to a column must propagate recursively
@@ -526,15 +575,8 @@ fn update_column_used_masks(
     table_refs: &mut TableReferences,
     subqueries: &mut [NonFromClauseSubquery],
 ) {
-    for subquery in subqueries.iter_mut() {
-        let SubqueryState::Unevaluated { plan } = &mut subquery.state else {
-            panic!("subquery has already been evaluated");
-        };
-        let Some(child_plan) = plan.as_mut() else {
-            panic!("subquery has no plan");
-        };
-
-        for child_outer_query_ref in child_plan
+    fn propagate_outer_refs_from_select_plan(table_refs: &mut TableReferences, plan: &SelectPlan) {
+        for child_outer_query_ref in plan
             .table_references
             .outer_query_refs()
             .iter()
@@ -551,6 +593,57 @@ fn update_column_used_masks(
                 outer_query_ref.col_used_mask |= &child_outer_query_ref.col_used_mask;
             }
         }
+
+        for joined_table in plan.table_references.joined_tables().iter() {
+            if let Table::FromClauseSubquery(from_clause_subquery) = &joined_table.table {
+                propagate_outer_refs_from_plan(table_refs, from_clause_subquery.plan.as_ref());
+            }
+        }
+    }
+
+    fn propagate_outer_refs_from_plan(table_refs: &mut TableReferences, plan: &Plan) {
+        match plan {
+            Plan::Select(select_plan) => {
+                propagate_outer_refs_from_select_plan(table_refs, select_plan);
+            }
+            Plan::CompoundSelect {
+                left, right_most, ..
+            } => {
+                for (select_plan, _) in left.iter() {
+                    propagate_outer_refs_from_select_plan(table_refs, select_plan);
+                }
+                propagate_outer_refs_from_select_plan(table_refs, right_most);
+            }
+            Plan::Delete(_) | Plan::Update(_) => {}
+        }
+    }
+
+    for subquery in subqueries.iter_mut() {
+        let SubqueryState::Unevaluated { plan } = &mut subquery.state else {
+            panic!("subquery has already been evaluated");
+        };
+        let Some(child_plan) = plan.as_mut() else {
+            panic!("subquery has no plan");
+        };
+
+        propagate_outer_refs_from_select_plan(table_refs, child_plan);
+    }
+
+    // Collect raw plan pointers to avoid cloning while sidestepping borrow rules.
+    let from_clause_plans = table_refs
+        .joined_tables()
+        .iter()
+        .filter_map(|t| match &t.table {
+            Table::FromClauseSubquery(from_clause_subquery) => {
+                Some(from_clause_subquery.plan.as_ref() as *const Plan)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    for plan in from_clause_plans {
+        // SAFETY: plans live within table_refs for the duration of this function.
+        let plan = unsafe { &*plan };
+        propagate_outer_refs_from_plan(table_refs, plan);
     }
 }
 
@@ -736,8 +829,8 @@ pub fn emit_from_clause_subquery(
                 non_aggregate_expressions: Vec::new(),
                 cdc_cursor_id: None,
                 meta_window: None,
-                materialized_build_inputs: std::collections::HashMap::new(),
-                hash_table_contexts: std::collections::HashMap::new(),
+                materialized_build_inputs: HashMap::default(),
+                hash_table_contexts: HashMap::default(),
             };
             emit_query(program, select_plan, &mut metadata)?
         }

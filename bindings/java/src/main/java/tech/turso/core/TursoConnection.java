@@ -42,6 +42,19 @@ public final class TursoConnection {
     this.connectionPtr = this.database.connect();
   }
 
+  /**
+   * Creates a connection using an existing TursoDB instance. This is useful for encrypted databases
+   * created with TursoDB.createWithEncryption().
+   *
+   * @param url e.g. "jdbc:turso:fileName"
+   * @param database an existing TursoDB instance
+   */
+  public TursoConnection(String url, TursoDB database) throws SQLException {
+    this.url = url;
+    this.database = database;
+    this.connectionPtr = this.database.connect();
+  }
+
   private static TursoDB open(String url, String filePath, Properties properties)
       throws SQLException {
     return TursoDB.create(url, filePath);

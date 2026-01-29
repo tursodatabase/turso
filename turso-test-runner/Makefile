@@ -14,7 +14,7 @@ else
 endif
 
 TURSODB := $(ROOT_DIR)/target/$(TARGET_DIR)/tursodb
-TEST_RUNNER := ./target/$(TARGET_DIR)/turso-test-runner
+TEST_RUNNER := cargo run --bin turso-test-runner $(CARGO_PROFILE)
 
 .PHONY: all build build-tursodb build-runner check run test run-examples install-sqlite test-sqlite convert clean run-js build-js-bindings
 

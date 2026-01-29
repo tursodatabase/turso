@@ -10,6 +10,10 @@ repository.workspace = true
 description = "The Turso deterministic simulator"
 publish = false
 
+[lib]
+name = "turso_whopper"
+path = "lib.rs"
+
 [[bin]]
 name = "turso_whopper"
 path = "main.rs"

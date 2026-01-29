@@ -368,6 +368,15 @@ fn plan_cte(
     // exponential re-planning when CTEs have transitive dependencies.
     let mut outer_query_refs = base_outer_query_refs.to_vec();
     for &ref_idx in &cte_def.referenced_cte_indices {
+        let ref_cte_name = &cte_definitions[ref_idx].name;
+        // Check if this CTE has already been planned and is in outer_query_refs.
+        // This avoids exponential re-planning when CTEs have transitive dependencies.
+        if outer_query_refs
+            .iter()
+            .any(|r| &r.identifier == ref_cte_name)
+        {
+            continue;
+        }
         // Recursively plan the referenced CTE
         let referenced_table = plan_cte(
             ref_idx,
@@ -538,11 +547,19 @@ fn parse_from_clause_table(
             // This allows the subquery to reference CTEs defined in the parent's WITH clause.
             let mut outer_query_refs_for_subquery = table_references.outer_query_refs().to_vec();
             for (idx, cte_def) in cte_definitions.iter().enumerate() {
+                // Check if this CTE has already been planned and is in outer_query_refs.
+                // This avoids exponential re-planning when CTEs have transitive dependencies.
+                if outer_query_refs_for_subquery
+                    .iter()
+                    .any(|r| r.identifier == cte_def.name)
+                {
+                    continue;
+                }
                 // Plan each CTE so it can be used by the subquery
                 let cte_table = plan_cte(
                     idx,
                     cte_definitions,
-                    table_references.outer_query_refs(),
+                    &outer_query_refs_for_subquery,
                     resolver,
                     program,
                     connection,
@@ -1045,6 +1062,31 @@ pub fn parse_where(
                 connection,
                 BindingBehavior::TryCanonicalColumnsFirst,
             )?;
+        }
+        // BETWEEN is rewritten to (lhs >= start) AND (lhs <= end) by bind_and_rewrite_expr.
+        // Re-break any ANDs that were created so they become separate WhereTerms for
+        // constraint extraction.
+        let mut i = start_idx;
+        while i < out_where_clause.len() {
+            if matches!(
+                &out_where_clause[i].expr,
+                Expr::Binary(_, ast::Operator::And, _)
+            ) {
+                let term = out_where_clause.remove(i);
+                let mut new_terms: Vec<WhereTerm> = Vec::new();
+                break_predicate_at_and_boundaries(&term.expr, &mut new_terms);
+                // Preserve from_outer_join from the original term
+                for new_term in new_terms.iter_mut() {
+                    new_term.from_outer_join = term.from_outer_join;
+                }
+                let count = new_terms.len();
+                for (j, new_term) in new_terms.into_iter().enumerate() {
+                    out_where_clause.insert(i + j, new_term);
+                }
+                i += count;
+            } else {
+                i += 1;
+            }
         }
         Ok(())
     } else {

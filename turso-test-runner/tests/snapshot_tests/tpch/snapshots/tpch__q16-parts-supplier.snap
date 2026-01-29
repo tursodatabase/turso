@@ -1,0 +1,175 @@
+---
+source: tpch.sqltest
+expression: |-
+  select
+          p_brand,
+          p_type,
+          p_size,
+          count(distinct ps_suppkey) as supplier_cnt
+      from
+          partsupp,
+          part
+      where
+          p_partkey = ps_partkey
+          and p_brand <> 'Brand#45'
+          and p_type not like 'SMALL PLATED%'
+          and p_size in (19, 17, 16, 23, 10, 4, 38, 11)
+          and ps_suppkey not in (
+              select
+                  s_suppkey
+              from
+                  supplier
+              where
+                  s_comment like '%Customer%Complaints%'
+          )
+      group by
+          p_brand,
+          p_type,
+          p_size
+      order by
+          supplier_cnt desc,
+          p_brand,
+          p_type,
+          p_size;
+info:
+  statement_type: SELECT
+  tables:
+  - partsupp
+  - supplier
+  setup_blocks:
+  - schema
+  database: ':memory:'
+---
+QUERY PLAN
+|--SCAN supplier
+|--SEARCH partsupp USING INDEX sqlite_autoindex_partsupp_1
+|--SCAN part
+`--USE TEMP B-TREE FOR ORDER BY
+
+BYTECODE
+addr  opcode                            p1   p2  p3  p4                            p5  comment
+   0          Init                       0  112   0                                 0  Start at 112
+   1          Once                      12    0   0                                 0  goto 12
+   2          OpenEphemeral              0    0   0                                 0  cursor=0 is_table=false
+   3          OpenRead                   1    5   0  k(7,B,B,B,B,B,B,B)             0  table=supplier, root=5, iDb=0
+   4          Rewind                     1   12   0                                 0  Rewind table supplier
+   5            Column                   1    6   4                                 0  r[4]=supplier.s_comment
+   6            Function                 1    3   2  like(2)                        0  r[2]=func(r[3..4])
+   7            IfNot                    2   11   1                                 0  if !r[2] goto 11
+   8            RowId                    1    1   0                                 0  r[1]=supplier.rowid
+   9            MakeRecord               1    1   5                                 0  r[5]=mkrec(r[1..1]); for ephemeral_index_where_sub_t3
+  10            IdxInsert                0    5   0                                 8  key=r[5]
+  11          Next                       1    5   0                                 0
+  12          SorterOpen                 2    5   0  k(5,-B,B,B,B,Binary)           0  cursor=2
+  13          Null                       0   20   0                                 0  r[20]=NULL
+  14          SorterOpen                 3    4   0  k(3,B,B,B)                     0  cursor=3
+  15          Integer                    0   13   0                                 0  r[13]=0; clear group by abort flag
+  16          Null                       0   14  16                                 0  r[14..16]=NULL; initialize group by comparison registers to NULL
+  17          Gosub                     26   98   0                                 0  ; go to clear accumulator subroutine
+  18          OpenRead                   5    7   0  k(3,B,B)                       0  index=sqlite_autoindex_partsupp_1, root=7, iDb=0
+  19          OpenRead                   6    4   0  k(9,B,B,B,B,B,B,B,B,B)         0  table=part, root=4, iDb=0
+  20          Rewind                     6   62   0                                 0  Rewind table part
+  21            Column                   6    3  28                                 0  r[28]=part.p_brand
+  22            Eq                      28   29  61  Binary                         0  if r[28]==r[29] goto 61
+  23            Column                   6    4  32                                 0  r[32]=part.p_type
+  24            Function                 1   31  30  like(2)                        0  r[30]=func(r[31..32])
+  25            If                      30   61   1                                 0  if r[30] goto 61
+  26            Column                   6    5  33                                 0  r[33]=part.p_size
+  27            Eq                      33   34  35  Binary                         0  if r[33]==r[34] goto 35
+  28            Eq                      33   35  35  Binary                         0  if r[33]==r[35] goto 35
+  29            Eq                      33   36  35  Binary                         0  if r[33]==r[36] goto 35
+  30            Eq                      33   37  35  Binary                         0  if r[33]==r[37] goto 35
+  31            Eq                      33   38  35  Binary                         0  if r[33]==r[38] goto 35
+  32            Eq                      33   39  35  Binary                         0  if r[33]==r[39] goto 35
+  33            Eq                      33   40  35  Binary                         0  if r[33]==r[40] goto 35
+  34            Ne                      33   41  61  Binary                         0  if r[33]!=r[41] goto 61
+  35            RowId                    6   42   0                                 0  r[42]=part.rowid
+  36            SeekGE                   5   61  42                                 0  key=[42..42]
+  37              IdxGT                  5   61  42                                 0  key=[42..42]
+  38              Integer                0   43   0                                 0  r[43]=0
+  39              Column                 5    1  44                                 0  r[44]=sqlite_autoindex_partsupp_1.ps_suppkey
+  40              Affinity              44    1   0                                 0  r[44..45] = D
+  41              Found                  0   50  44                                 0  if found goto 50
+  42              Rewind                 0   48   0                                 0  Rewind  ephemeral_index_where_sub_t3
+  43                Column               0    0  45                                 0  r[45]=ephemeral_index_where_sub_t3.s_suppkey
+  44                Ne                  44   45  46  Binary                         0  if r[44]!=r[45] goto 46
+  45                Goto                 0   52   0                                 0
+  46              Next                   0   43   0                                 0
+  47              Goto                   0   48   0                                 0
+  48              Integer                1   43   0                                 0  r[43]=1
+  49              Goto                   0   53   0                                 0
+  50              Integer                0   43   0                                 0  r[43]=0
+  51              Goto                   0   53   0                                 0
+  52              Null                   0   43   0                                 0  r[43]=NULL
+  53              IfNot                 43   60   1                                 0  if !r[43] goto 60
+  54              Column                 6    3  22                                 0  r[22]=part.p_brand
+  55              Column                 6    4  23                                 0  r[23]=part.p_type
+  56              Column                 6    5  24                                 0  r[24]=part.p_size
+  57              Column                 5    1  25                                 0  r[25]=sqlite_autoindex_partsupp_1.ps_suppkey
+  58              MakeRecord            22    4  21                                 0  r[21]=mkrec(r[22..25])
+  59              SorterInsert           3   21   0  0                              0  key=r[21]
+  60            Next                     5   37   0                                 0
+  61          Next                       6   21   0                                 0
+  62          OpenPseudo                 4   21   4                                 0  4 columns in r[21]
+  63          SorterSort                 3   83   0                                 0
+  64            SorterData               3   21   4                                 0  r[21]=data
+  65            Column                   4    0  46                                 0  r[46]=pseudo.column 0
+  66            Column                   4    1  47                                 0  r[47]=pseudo.column 1
+  67            Column                   4    2  48                                 0  r[48]=pseudo.column 2
+  68            Compare                 14   46   3  k(3, Binary, Binary, Binary)   0  r[14..16]==r[46..48]
+  69            Jump                    70   74  70                                 0  ; start new group if comparison is not equal
+  70            Gosub                   11   87   0                                 0  ; check if ended group had data, and output if so
+  71            Move                    46   14   3                                 0  r[14..16]=r[46..48]
+  72            IfPos                   13  102   0                                 0  r[13]>0 -> r[13]-=0, goto 102; check abort flag
+  73            Gosub                   26   98   0                                 0  ; goto clear accumulator subroutine
+  74            Column                   4    3  49                                 0  r[49]=pseudo.column 3
+  75            HashDistinct    1073741824   49   1  jmp=77                         0
+  76            AggStep                  0   49  20  count                          0  accum=r[20] step(r[49])
+  77            If                      12   81   0                                 0  if r[12] goto 81; don't emit group columns if continuing existing group
+  78            Column                   4    0  17                                 0  r[17]=pseudo.column 0
+  79            Column                   4    1  18                                 0  r[18]=pseudo.column 1
+  80            Column                   4    2  19                                 0  r[19]=pseudo.column 2
+  81            Integer                  1   12   0                                 0  r[12]=1; indicate data in accumulator
+  82          SorterNext                 3   64   0                                 0
+  83          Gosub                     11   87   0                                 0  ; emit row for final group
+  84          Goto                       0  102   0                                 0  ; group by finished
+  85          Integer                    1   13   0                                 0  r[13]=1
+  86        Return                      11    0   0                                 0
+  87        IfPos                       12   89   0                                 0  r[12]>0 -> r[12]-=0, goto 89; output group by row subroutine start
+  88      Return                        11    0   0                                 0
+  89      AggFinal                       0   20   0  count                          0  accum=r[20]
+  90      Copy                          20   50   0                                 0  r[50]=r[20]
+  91      Copy                          17   51   0                                 0  r[51]=r[17]
+  92      Copy                          18   52   0                                 0  r[52]=r[18]
+  93      Copy                          19   53   0                                 0  r[53]=r[19]
+  94      Sequence                       2   54   0                                 0
+  95      MakeRecord                    50    5  10                                 0  r[10]=mkrec(r[50..54])
+  96      SorterInsert                   2   10   0  0                              0  key=r[10]
+  97    Return                          11    0   0                                 0
+  98    Null                             0   17  20                                 0  r[17..20]=NULL; clear accumulator subroutine start
+  99    HashClear               1073741824    0   0                                 0
+ 100    Integer                          0   12   0                                 0  r[12]=0
+ 101  Return                            26    0   0                                 0
+ 102  OpenPseudo                         7   10   5                                 0  5 columns in r[10]
+ 103  SorterSort                         2  111   0                                 0
+ 104    SorterData                       2   10   7                                 0  r[10]=data
+ 105    Column                           7    1   6                                 0  r[6]=pseudo.column 1
+ 106    Column                           7    2   7                                 0  r[7]=pseudo.column 2
+ 107    Column                           7    3   8                                 0  r[8]=pseudo.column 3
+ 108    Column                           7    0   9                                 0  r[9]=pseudo.column 0
+ 109    ResultRow                        6    4   0                                 0  output=r[6..9]
+ 110  SorterNext                         2  104   0                                 0
+ 111  Halt                               0    0   0                                 0
+ 112  Transaction                        0    1   8                                 0  iDb=0 tx_mode=Read
+ 113  String8                            0    3   0  %Customer%Complaints%          0  r[3]='%Customer%Complaints%'
+ 114  String8                            0   29   0  Brand#45                       0  r[29]='Brand#45'
+ 115  String8                            0   31   0  SMALL PLATED%                  0  r[31]='SMALL PLATED%'
+ 116  Integer                           19   34   0                                 0  r[34]=19
+ 117  Integer                           17   35   0                                 0  r[35]=17
+ 118  Integer                           16   36   0                                 0  r[36]=16
+ 119  Integer                           23   37   0                                 0  r[37]=23
+ 120  Integer                           10   38   0                                 0  r[38]=10
+ 121  Integer                            4   39   0                                 0  r[39]=4
+ 122  Integer                           38   40   0                                 0  r[40]=38
+ 123  Integer                           11   41   0                                 0  r[41]=11
+ 124  Goto                               0    1   0                                 0

@@ -2295,7 +2295,10 @@ fn emit_unique_index_check(
             record_reg,
             unpacked_start: Some(idx_start_reg),
             unpacked_count: Some((num_cols + 1) as u16),
-            flags: IdxInsertFlags::new().nchange(true),
+            // USE_SEEK: cursor was positioned by NoConflict above, skip redundant seek.
+            // Note: If record contains NULLs, NoConflict skips the seek entirely, so
+            // op_idx_insert must check for NULLs and fall back to seeking if found.
+            flags: IdxInsertFlags::new().nchange(true).use_seek(true),
         });
     }
     Ok(())

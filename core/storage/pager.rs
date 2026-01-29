@@ -1,4 +1,7 @@
 use crate::assert::assert_send_sync;
+#[cfg(target_vendor = "apple")]
+use crate::io::AtomicFileSyncType;
+use crate::io::FileSyncType;
 use crate::io::WriteBatch;
 use crate::storage::btree::PinGuard;
 use crate::storage::subjournal::Subjournal;
@@ -419,6 +422,75 @@ impl PageInner {
         pos += nr;
         let (rowid, _) = read_varint(&buf[pos..])?;
         Ok(rowid as i64)
+    }
+
+    /// Fast path for index cells: returns payload slice and overflow info without constructing BTreeCell.
+    ///
+    /// This bypasses the full `cell_get()` to `read_btree_cell()` path for binary search hot loops.
+    /// The returned slice is valid as long as the page is alive.
+    ///
+    /// Returns: (payload_slice, payload_size, first_overflow_page)
+    #[inline(always)]
+    pub fn cell_index_read_payload_ptr(
+        &self,
+        idx: usize,
+        usable_size: usize,
+    ) -> crate::Result<(&'static [u8], u64, Option<u32>)> {
+        let buf = self.as_ptr();
+        let cell_pointer_array_start = self.header_size();
+        let cell_pointer = cell_pointer_array_start + (idx * CELL_PTR_SIZE_BYTES);
+        let cell_offset = self.read_u16(cell_pointer) as usize;
+
+        let page_type = self.page_type()?;
+        let (payload_size, varint_len, header_skip) = match page_type {
+            PageType::IndexInterior => {
+                let (size, len) = read_varint(&buf[cell_offset + 4..])?;
+                (size, len, 4usize)
+            }
+            PageType::IndexLeaf => {
+                let (size, len) = read_varint(&buf[cell_offset..])?;
+                (size, len, 0usize)
+            }
+            _ => unreachable!("cell_index_read_payload_ptr called on non-index page"),
+        };
+
+        let payload_start = cell_offset + header_skip + varint_len;
+
+        let max_local = payload_overflow_threshold_max(page_type, usable_size);
+        let min_local = payload_overflow_threshold_min(page_type, usable_size);
+        let (overflows, local_size) = sqlite3_ondisk::payload_overflows(
+            payload_size as usize,
+            max_local,
+            min_local,
+            usable_size,
+        );
+
+        let (payload_slice, first_overflow) = if overflows {
+            let overflow_ptr_offset = payload_start + local_size - 4;
+            let first_overflow_page = u32::from_be_bytes([
+                buf[overflow_ptr_offset],
+                buf[overflow_ptr_offset + 1],
+                buf[overflow_ptr_offset + 2],
+                buf[overflow_ptr_offset + 3],
+            ]);
+            // SAFETY: valid as long as page is alive
+            let slice = unsafe {
+                std::mem::transmute::<&[u8], &'static [u8]>(
+                    &buf[payload_start..payload_start + local_size - 4],
+                )
+            };
+            (slice, Some(first_overflow_page))
+        } else {
+            // SAFETY: valid as long as page is alive
+            let slice = unsafe {
+                std::mem::transmute::<&[u8], &'static [u8]>(
+                    &buf[payload_start..payload_start + payload_size as usize],
+                )
+            };
+            (slice, None)
+        };
+
+        Ok((payload_slice, payload_size, first_overflow))
     }
 
     #[inline]
@@ -1140,6 +1212,10 @@ pub struct Pager {
     enable_encryption: AtomicBool,
     /// In Memory Page 1 for Empty Dbs
     init_page_1: Arc<ArcSwapOption<Page>>,
+    /// Sync type for durability. FullFsync uses F_FULLFSYNC on macOS (PRAGMA fullfsync).
+    /// Only stored on Apple platforms; on others, always returns Fsync.
+    #[cfg(target_vendor = "apple")]
+    sync_type: AtomicFileSyncType,
 }
 
 assert_send_sync!(Pager);
@@ -1306,7 +1382,37 @@ impl Pager {
             io_ctx: RwLock::new(IOContext::default()),
             enable_encryption: AtomicBool::new(false),
             init_page_1,
+            #[cfg(target_vendor = "apple")]
+            sync_type: AtomicFileSyncType::new(FileSyncType::Fsync),
         })
+    }
+
+    /// Get the sync type setting.
+    /// On non-Apple platforms, always returns Fsync (compile-time constant).
+    #[cfg(target_vendor = "apple")]
+    #[inline]
+    pub fn get_sync_type(&self) -> FileSyncType {
+        self.sync_type.get()
+    }
+
+    /// Get the sync type setting.
+    /// On non-Apple platforms, always returns Fsync (compile-time constant).
+    #[cfg(not(target_vendor = "apple"))]
+    #[inline]
+    pub fn get_sync_type(&self) -> FileSyncType {
+        FileSyncType::Fsync
+    }
+
+    /// Set the sync type (for PRAGMA fullfsync). Only effective on Apple platforms.
+    #[cfg(target_vendor = "apple")]
+    pub fn set_sync_type(&self, value: FileSyncType) {
+        self.sync_type.set(value);
+    }
+
+    /// Set the sync type. No-op on non-Apple platforms.
+    #[cfg(not(target_vendor = "apple"))]
+    pub fn set_sync_type(&self, _value: FileSyncType) {
+        // No-op: FullFsync only has effect on Apple platforms
     }
 
     pub fn init_page_1(&self) -> Arc<ArcSwapOption<Page>> {
@@ -2220,7 +2326,7 @@ impl Pager {
                     return_if_io!(self.commit_dirty_pages(
                         connection.is_wal_auto_checkpoint_disabled(),
                         connection.get_sync_mode(),
-                        connection.get_data_sync_retry()
+                        connection.get_data_sync_retry(),
                     ));
 
                     let schema_did_change = match connection.get_tx_state() {
@@ -2468,6 +2574,12 @@ impl Pager {
         self.subjournal_page_if_required(page)?;
         let mut dirty_pages = self.dirty_pages.write();
         dirty_pages.insert(page.get().id as u32);
+        // Notify cache before marking dirty (page was evictable, now it won't be)
+        // Only notify if page wasn't already dirty
+        if !page.is_dirty() {
+            let key = PageCacheKey::new(page.get().id);
+            self.page_cache.write().notify_page_dirty(key);
+        }
         page.set_dirty();
         Ok(())
     }
@@ -2560,7 +2672,7 @@ impl Pager {
             )),
             None => {
                 // No async prep needed, go straight to finish
-                let completion = wal.prepare_wal_finish()?;
+                let completion = wal.prepare_wal_finish(self.get_sync_type())?;
                 Ok(CacheFlushStep::Yield(
                     CacheFlushState::WalPrepareFinish {
                         dirty_ids,
@@ -2590,7 +2702,7 @@ impl Pager {
             ));
         }
 
-        let finish_completion = wal.prepare_wal_finish()?;
+        let finish_completion = wal.prepare_wal_finish(self.get_sync_type())?;
         Ok(CacheFlushStep::Yield(
             CacheFlushState::WalPrepareFinish {
                 dirty_ids,
@@ -2790,7 +2902,7 @@ impl Pager {
                             let prepare = wal.prepare_wal_start(page_sz)?;
                             if let Some(c) = prepare {
                                 self.io.wait_for_completion(c)?;
-                                let c = wal.prepare_wal_finish()?;
+                                let c = wal.prepare_wal_finish(self.get_sync_type())?;
                                 self.io.wait_for_completion(c)?;
                             }
 
@@ -2807,9 +2919,14 @@ impl Pager {
 
                             if c.succeeded() {
                                 // Synchronous completion, WAL tags already set by callback.
-                                for page in &pages {
-                                    if page.has_wal_tag() {
-                                        page.set_spilled();
+                                {
+                                    let mut cache = self.page_cache.write();
+                                    for page in &pages {
+                                        if page.has_wal_tag() {
+                                            let key = PageCacheKey::new(page.get().id);
+                                            cache.notify_page_spilled(key);
+                                            page.set_spilled();
+                                        }
                                     }
                                 }
                                 *self.spill_state.write() = SpillState::Idle;
@@ -2853,16 +2970,21 @@ impl Pager {
                 // Mark spilled pages so they can be evicted while dirty.
                 // Only do so if page wasn't modified since write started (each page has valid wal_tag).
                 let mut spilled_count = 0;
-                for page in &pages {
-                    if page.has_wal_tag() {
-                        page.set_spilled();
-                        spilled_count += 1;
-                    } else {
-                        // Page was modified during write, it will need to be re-spilled
-                        tracing::debug!(
-                            "try_spill_dirty_pages: page {} modified during write, not marking as spilled",
-                            page.get().id
-                        );
+                {
+                    let mut cache = self.page_cache.write();
+                    for page in &pages {
+                        if page.has_wal_tag() {
+                            let key = PageCacheKey::new(page.get().id);
+                            cache.notify_page_spilled(key);
+                            page.set_spilled();
+                            spilled_count += 1;
+                        } else {
+                            // Page was modified during write, it will need to be re-spilled
+                            tracing::debug!(
+                                "try_spill_dirty_pages: page {} modified during write, not marking as spilled",
+                                page.get().id
+                            );
+                        }
                     }
                 }
                 if spilled_count == 0 && !pages.is_empty() {
@@ -3041,7 +3163,7 @@ impl Pager {
                     }
                 }
                 CommitState::PrepareWalSync => {
-                    let c = wal.prepare_wal_finish()?;
+                    let c = wal.prepare_wal_finish(self.get_sync_type())?;
                     self.commit_info.write().state = CommitState::GetDbSize;
                     if !c.succeeded() {
                         io_yield_one!(c);
@@ -3201,7 +3323,7 @@ impl Pager {
                     if sync_mode == SyncMode::Off {
                         commit_info.state = CommitState::WalCommitDone;
                     } else {
-                        let sync_c = wal.sync()?;
+                        let sync_c = wal.sync(self.get_sync_type())?;
                         // Reuse the existing Vec instead of allocating a new one
                         commit_info.completions.push(sync_c);
                         commit_info.state = CommitState::WaitSync;
@@ -3322,6 +3444,7 @@ impl Pager {
             header.page_number as u64,
             header.db_size as u64,
             raw_page,
+            self.get_sync_type(),
         )?;
         if let Some(page) = self.cache_get(header.page_number as usize)? {
             let content = page.get_contents();
@@ -3430,16 +3553,17 @@ impl Pager {
                     let res = return_if_io!(wal.checkpoint(self, mode));
                     let mut state = self.checkpoint_state.write();
                     if matches!(mode, CheckpointMode::Truncate { .. })
-                        // `everything_backfilled` will be true for successful truncate checkpoint
-                        // as it will be all zeros, and we need to fsync+possibly trunc the db file
-                        && res.everything_backfilled()
+                        // `should_truncate` will be true for successful truncate checkpoint
+                        && res.should_truncate()
                     {
                         state.phase = CheckpointPhase::TruncateDbFile {
                             sync_mode,
                             clear_page_cache,
                             page1_invalidated: false,
                         };
-                    } else if res.num_backfilled == 0 || sync_mode == crate::SyncMode::Off {
+                    } else if res.wal_checkpoint_backfilled == 0
+                        || sync_mode == crate::SyncMode::Off
+                    {
                         state.phase = CheckpointPhase::Finalize { clear_page_cache };
                     } else {
                         state.phase = CheckpointPhase::SyncDbFile { clear_page_cache };
@@ -3547,8 +3671,11 @@ impl Pager {
                         continue;
                     }
 
-                    let c =
-                        sqlite3_ondisk::begin_sync(self.db_file.as_ref(), self.syncing.clone())?;
+                    let c = sqlite3_ondisk::begin_sync(
+                        self.db_file.as_ref(),
+                        self.syncing.clone(),
+                        self.get_sync_type(),
+                    )?;
                     self.checkpoint_state
                         .write()
                         .result
@@ -3582,7 +3709,8 @@ impl Pager {
                             .write()
                             .result
                             .as_mut()
-                            .expect("result should be set")
+                            .expect("result should be set"),
+                        self.get_sync_type(),
                     ));
                 }
                 CheckpointPhase::Finalize { clear_page_cache } => {
@@ -3652,7 +3780,7 @@ impl Pager {
                 ));
             };
             // fsync the wal syncronously before beginning checkpoint
-            let c = wal.sync()?;
+            let c = wal.sync(self.get_sync_type())?;
             self.io.wait_for_completion(c)?;
         }
         if !wal_auto_checkpoint_disabled {

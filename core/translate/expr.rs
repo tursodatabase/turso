@@ -1,4 +1,5 @@
 use crate::sync::Arc;
+use crate::translate::optimizer::constraints::ConstraintOperator;
 
 use tracing::{instrument, Level};
 use turso_parser::ast::{self, Expr, SubqueryType, UnaryOperator};
@@ -469,6 +470,43 @@ pub fn translate_condition_expr(
             translate_expr(program, Some(referenced_tables), expr, reg, resolver)?;
             emit_cond_jump(program, condition_metadata, reg);
         }
+        // Handle IS NULL/IS NOT NULL in conditions using IsNull/NotNull opcodes.
+        // "a IS NULL" is parsed as Binary(a, Is, Null), but we need to use the IsNull opcode
+        // (not Eq/Ne with null_eq flag) for correct NULL handling in WHERE clauses.
+        ast::Expr::Binary(e1, ast::Operator::Is, e2)
+            if matches!(e2.as_ref(), ast::Expr::Literal(ast::Literal::Null)) =>
+        {
+            let cur_reg = program.alloc_register();
+            translate_expr(program, Some(referenced_tables), e1, cur_reg, resolver)?;
+            if condition_metadata.jump_if_condition_is_true {
+                program.emit_insn(Insn::IsNull {
+                    reg: cur_reg,
+                    target_pc: condition_metadata.jump_target_when_true,
+                });
+            } else {
+                program.emit_insn(Insn::NotNull {
+                    reg: cur_reg,
+                    target_pc: condition_metadata.jump_target_when_false,
+                });
+            }
+        }
+        ast::Expr::Binary(e1, ast::Operator::IsNot, e2)
+            if matches!(e2.as_ref(), ast::Expr::Literal(ast::Literal::Null)) =>
+        {
+            let cur_reg = program.alloc_register();
+            translate_expr(program, Some(referenced_tables), e1, cur_reg, resolver)?;
+            if condition_metadata.jump_if_condition_is_true {
+                program.emit_insn(Insn::NotNull {
+                    reg: cur_reg,
+                    target_pc: condition_metadata.jump_target_when_true,
+                });
+            } else {
+                program.emit_insn(Insn::IsNull {
+                    reg: cur_reg,
+                    target_pc: condition_metadata.jump_target_when_false,
+                });
+            }
+        }
         ast::Expr::Binary(e1, op, e2) => {
             let result_reg = program.alloc_register();
             binary_expr_shared(
@@ -716,11 +754,13 @@ pub fn translate_expr(
                     Ok(target_register)
                 }
                 SubqueryType::In { cursor_id } => {
-                    // jump here when we can definitely skip the row
+                    // jump here when we can definitely skip the row (result = 0/false)
                     let label_skip_row = program.allocate_label();
-                    // jump here when we can definitely include the row
+                    // jump here when we can definitely include the row (result = 1/true)
                     let label_include_row = program.allocate_label();
-                    // jump here when we need to make extra null-related checks, because sql null is the greatest thing ever
+                    // jump here when the result should be NULL (unknown)
+                    let label_null_result = program.allocate_label();
+                    // jump here when we need to make extra null-related checks
                     let label_null_rewind = program.allocate_label();
                     let label_null_checks_loop_start = program.allocate_label();
                     let label_null_checks_next = program.allocate_label();
@@ -745,13 +785,13 @@ pub fn translate_expr(
                             resolver,
                         )?;
                         if !lhs_column.is_nonnull(referenced_tables.as_ref().unwrap()) {
+                            // If LHS is NULL, we need to check if ephemeral is empty first.
+                            // - If empty: IN returns FALSE, NOT IN returns TRUE
+                            // - If not empty: result is NULL (unknown)
+                            // Jump to label_null_rewind which does Rewind and handles empty case.
                             program.emit_insn(Insn::IsNull {
                                 reg: lhs_column_regs_start + i,
-                                target_pc: if *not_in {
-                                    label_null_rewind
-                                } else {
-                                    label_skip_row
-                                },
+                                target_pc: label_null_rewind,
                             });
                         }
                     }
@@ -776,80 +816,100 @@ pub fn translate_expr(
                         }
                     }
 
+                    // For NOT IN: empty ephemeral or no all-NULL row means TRUE (include)
+                    // For IN: empty ephemeral or no all-NULL row means FALSE (skip)
+                    let label_on_no_null = if *not_in {
+                        label_include_row
+                    } else {
+                        label_skip_row
+                    };
+
                     if *not_in {
-                        // WHERE ... NOT IN (SELECT ...)
-                        // We must skip the row if we find a match.
+                        // NOT IN: skip row if value is found
                         program.emit_insn(Insn::Found {
                             cursor_id: *cursor_id,
                             target_pc: label_skip_row,
                             record_reg: lhs_column_regs_start,
                             num_regs: lhs_column_count,
                         });
-                        // Ok, so Found didn't return a match.
-                        // Because SQL NULL, we need do extra checks to see if we can include the row.
-                        // Consider:
-                        // 1. SELECT * FROM T WHERE 1 NOT IN (SELECT NULL),
-                        // 2. SELECT * FROM T WHERE 1 IN (SELECT NULL) -- or anything else where the subquery evaluates to NULL.
-                        // _Both_ of these queries should return nothing, because... SQL NULL.
-                        // The same goes for e.g. SELECT * FROM T WHERE (1,1) NOT IN (SELECT NULL, NULL).
-                        // However, it does _NOT_ apply for SELECT * FROM T WHERE (1,1) NOT IN (SELECT NULL, 1).
-                        // BUT: it DOES apply for SELECT * FROM T WHERE (2,2) NOT IN ((1,1), (NULL, NULL))!!!
-                        // Ergo: if the subquery result has _ANY_ tuples with all NULLs, we need to NOT include the row.
-                        //
-                        // So, if we didn't found a match (and hence, so far, our 'NOT IN' condition still applies),
-                        // we must still rewind the subquery's ephemeral index cursor and go through ALL rows and compare each LHS column (with !=) to the corresponding column in the ephemeral index.
-                        // Comparison instructions have the default behavior that if either operand is NULL, the comparison is completely skipped.
-                        // That means: if we, for ANY row in the ephemeral index, get through all the != comparisons without jumping,
-                        // it means our subquery result has a tuple that is exactly NULL (or (NULL, NULL) etc.),
-                        // in which case we need to NOT include the row.
-                        // If ALL the rows jump at one of the != comparisons, it means our subquery result has no tuples with all NULLs -> we can include the row.
-                        program.preassign_label_to_next_insn(label_null_rewind);
-                        program.emit_insn(Insn::Rewind {
-                            cursor_id: *cursor_id,
-                            pc_if_empty: label_include_row,
-                        });
-                        program.preassign_label_to_next_insn(label_null_checks_loop_start);
-                        let column_check_reg = program.alloc_register();
-                        for (i, affinity) in affinity.enumerate().take(lhs_column_count) {
-                            program.emit_insn(Insn::Column {
-                                cursor_id: *cursor_id,
-                                column: i,
-                                dest: column_check_reg,
-                                default: None,
-                            });
-                            // Apply affinity to the comparison for proper type coercion
-                            program.emit_insn(Insn::Ne {
-                                lhs: lhs_column_regs_start + i,
-                                rhs: column_check_reg,
-                                target_pc: label_null_checks_next,
-                                flags: CmpInsFlags::default().with_affinity(affinity),
-                                collation: program.curr_collation(),
-                            });
-                        }
-                        program.emit_insn(Insn::Goto {
-                            target_pc: label_skip_row,
-                        });
-                        program.preassign_label_to_next_insn(label_null_checks_next);
-                        program.emit_insn(Insn::Next {
-                            cursor_id: *cursor_id,
-                            pc_if_next: label_null_checks_loop_start,
-                        })
                     } else {
-                        // WHERE ... IN (SELECT ...)
-                        // We can skip the row if we don't find a match
+                        // IN: if value found, include row; otherwise check for NULLs
                         program.emit_insn(Insn::NotFound {
                             cursor_id: *cursor_id,
-                            target_pc: label_skip_row,
+                            target_pc: label_null_rewind,
                             record_reg: lhs_column_regs_start,
                             num_regs: lhs_column_count,
                         });
+                        program.emit_insn(Insn::Goto {
+                            target_pc: label_include_row,
+                        });
                     }
+
+                    // Null checking loop: scan ephemeral for any all-NULL tuples.
+                    // If found, result is NULL (unknown). If not found, result depends on IN vs NOT IN.
+                    program.preassign_label_to_next_insn(label_null_rewind);
+                    program.emit_insn(Insn::Rewind {
+                        cursor_id: *cursor_id,
+                        pc_if_empty: label_on_no_null,
+                    });
+                    program.preassign_label_to_next_insn(label_null_checks_loop_start);
+                    let column_check_reg = program.alloc_register();
+                    for (i, affinity) in affinity.enumerate().take(lhs_column_count) {
+                        program.emit_insn(Insn::Column {
+                            cursor_id: *cursor_id,
+                            column: i,
+                            dest: column_check_reg,
+                            default: None,
+                        });
+                        // Ne with NULL operand does NOT jump (comparison is NULL/unknown)
+                        program.emit_insn(Insn::Ne {
+                            lhs: lhs_column_regs_start + i,
+                            rhs: column_check_reg,
+                            target_pc: label_null_checks_next,
+                            flags: CmpInsFlags::default().with_affinity(affinity),
+                            collation: program.curr_collation(),
+                        });
+                    }
+                    // All Ne comparisons fell through -> this row has all NULLs -> result is NULL
+                    program.emit_insn(Insn::Goto {
+                        target_pc: label_null_result,
+                    });
+                    program.preassign_label_to_next_insn(label_null_checks_next);
+                    program.emit_insn(Insn::Next {
+                        cursor_id: *cursor_id,
+                        pc_if_next: label_null_checks_loop_start,
+                    });
+                    // Loop exhausted without finding all-NULL row
+                    program.emit_insn(Insn::Goto {
+                        target_pc: label_on_no_null,
+                    });
+                    // Final result handling:
+                    // label_include_row: result = 1 (TRUE)
+                    // label_skip_row: result = 0 (FALSE)
+                    // label_null_result: result = NULL (unknown)
+                    let label_done = program.allocate_label();
                     program.preassign_label_to_next_insn(label_include_row);
                     program.emit_insn(Insn::Integer {
                         value: 1,
                         dest: target_register,
                     });
+                    program.emit_insn(Insn::Goto {
+                        target_pc: label_done,
+                    });
                     program.preassign_label_to_next_insn(label_skip_row);
+                    program.emit_insn(Insn::Integer {
+                        value: 0,
+                        dest: target_register,
+                    });
+                    program.emit_insn(Insn::Goto {
+                        target_pc: label_done,
+                    });
+                    program.preassign_label_to_next_insn(label_null_result);
+                    program.emit_insn(Insn::Null {
+                        dest: target_register,
+                        dest_end: None,
+                    });
+                    program.preassign_label_to_next_insn(label_done);
                     Ok(target_register)
                 }
                 SubqueryType::RowValue {
@@ -2438,15 +2498,65 @@ pub fn translate_expr(
                                 unreachable!("Either index or table cursor must be opened");
                             }
                         } else {
+                            let is_btree_index = index_cursor_id.is_some_and(|cid| {
+                                program.get_cursor_type(cid).is_some_and(|ct| ct.is_index())
+                            });
+                            // FIXME(https://github.com/tursodatabase/turso/issues/4801):
+                            // This is a defensive workaround for cursor desynchronization.
+                            //
+                            // When `use_covering_index` is false, both table AND index cursors
+                            // are open and positioned at the same row. If we read some columns
+                            // from the index cursor and others from the table cursor, we rely
+                            // on both cursors staying synchronized.
+                            //
+                            // The problem: AFTER triggers can INSERT into the same table,
+                            // which modifies the index btree. This repositions or invalidates
+                            // the parent program's index cursor, while the table cursor remains
+                            // at the correct position. Result: we read a mix of data from
+                            // different rows - corruption.
+                            //
+                            // Why does the table cursor not have this problem? Because it's
+                            // explicitly re-sought by rowid (via NotExists instruction) before
+                            // each use. The rowid is stored in a register and used as a stable
+                            // key. The index cursor, by contrast, just trusts its internal
+                            // position (page + cell index) without re-seeking.
+                            //
+                            // Why not check if the table has triggers and allow the optimization
+                            // when there are none? Several reasons:
+                            // 1. ProgramBuilder.trigger indicates if THIS program is a trigger
+                            //    subprogram, not whether the table has triggers.
+                            // 2. In translate_expr(), we lack context about which table is being
+                            //    modified or whether we're even in an UPDATE/INSERT/DELETE.
+                            // 3. Triggers can be recursive (trigger on T inserts into U, whose
+                            //    trigger inserts back into T).
+                            //
+                            // The proper fix is to implement SQLite's `saveAllCursors()` approach:
+                            // before ANY btree write, find all cursors pointing to that btree
+                            // (by root_page) and save their positions. When those cursors are
+                            // next accessed, they re-seek to their saved position. This could
+                            // be done lazily with a generation number per btree - cursors check
+                            // if the generation changed and re-seek if needed. This would
+                            // require a global cursor registry and significant refactoring.
+                            //
+                            // For now, we only read from the index cursor when `use_covering_index`
+                            // is true, meaning only the index cursor exists (no table cursor to
+                            // get out of sync with). This foregoes the optimization of reading
+                            // individual columns from a non-covering index.
                             let read_from_index = if is_from_outer_query_scope {
-                                index_cursor_id.is_some()
+                                is_btree_index
+                            } else if is_btree_index && use_covering_index {
+                                index.as_ref().is_some_and(|idx| {
+                                    idx.column_table_pos_to_index_pos(*column).is_some()
+                                })
                             } else {
-                                use_covering_index
+                                false
                             };
                             let read_cursor = if read_from_index {
                                 index_cursor_id.expect("index cursor should be opened")
                             } else {
-                                table_cursor_id.expect("table cursor should be opened")
+                                table_cursor_id
+                                    .or(index_cursor_id)
+                                    .expect("cursor should be opened")
                             };
                             let column = if read_from_index {
                                 let index = program.resolve_index_for_cursor_id(
@@ -3619,20 +3729,28 @@ pub fn sanitize_string(input: &str) -> String {
 /// e.g. t.x = 5 -> Some((t.x, =, 5))
 pub fn as_binary_components(
     expr: &ast::Expr,
-) -> Result<Option<(&ast::Expr, ast::Operator, &ast::Expr)>> {
+) -> Result<Option<(&ast::Expr, ConstraintOperator, &ast::Expr)>> {
     match unwrap_parens(expr)? {
         ast::Expr::Binary(lhs, operator, rhs)
             if matches!(
                 operator,
                 ast::Operator::Equals
+                    | ast::Operator::NotEquals
                     | ast::Operator::Greater
                     | ast::Operator::Less
                     | ast::Operator::GreaterEquals
                     | ast::Operator::LessEquals
+                    | ast::Operator::Is
+                    | ast::Operator::IsNot
             ) =>
         {
-            Ok(Some((lhs.as_ref(), *operator, rhs.as_ref())))
+            Ok(Some((lhs.as_ref(), (*operator).into(), rhs.as_ref())))
         }
+        ast::Expr::Like { lhs, not, rhs, .. } => Ok(Some((
+            lhs.as_ref(),
+            ConstraintOperator::Like { not: *not },
+            rhs.as_ref(),
+        ))),
         _ => Ok(None),
     }
 }
@@ -4881,7 +4999,7 @@ pub fn expr_vector_size(expr: &Expr) -> Result<usize> {
             1
         }
         Expr::DoublyQualified(..) => 1,
-        Expr::Exists(_) => todo!(),
+        Expr::Exists(_) => 1, // EXISTS returns a single boolean value (0 or 1)
         Expr::FunctionCall { name, args, .. } => {
             for (pos, arg) in args.iter().enumerate() {
                 let evs_arg = expr_vector_size(arg)?;

@@ -985,7 +985,16 @@ mod cte_tests {
         name: String,
         columns: Vec<String>,
         has_numeric_cols: bool,
+        /// Estimated number of rows in this CTE (used to avoid pathological plans)
+        estimated_rows: usize,
+        /// Whether this CTE was created via a cross product (self-join, cartesian)
+        is_cross_product: bool,
     }
+
+    /// Maximum estimated rows before we start adding safeguards
+    const MAX_SAFE_ROWS: usize = 50;
+    /// Maximum rows for a CTE that can be self-joined
+    const MAX_SELF_JOIN_ROWS: usize = 10;
 
     /// Generates a random literal value
     fn gen_literal(rng: &mut ChaCha8Rng) -> String {
@@ -1094,7 +1103,8 @@ mod cte_tests {
     }
 
     /// Generates a SELECT list with random expressions
-    fn gen_select_list(rng: &mut ChaCha8Rng, cte_idx: usize) -> (String, Vec<String>, bool) {
+    /// Returns (sql, column_names, has_numeric, estimated_rows)
+    fn gen_select_list(rng: &mut ChaCha8Rng, cte_idx: usize) -> (String, Vec<String>, bool, usize) {
         let num_cols = rng.random_range(1..=3);
         let mut cols = Vec::new();
         let mut col_names = Vec::new();
@@ -1113,11 +1123,13 @@ mod cte_tests {
             col_names.push(col_name);
         }
 
-        (cols.join(", "), col_names, has_numeric)
+        // Simple SELECT without FROM produces 1 row
+        (cols.join(", "), col_names, has_numeric, 1)
     }
 
     /// Generates a VALUES clause
-    fn gen_values(rng: &mut ChaCha8Rng, cte_idx: usize) -> (String, Vec<String>, bool) {
+    /// Returns (sql, column_names, has_numeric, estimated_rows)
+    fn gen_values(rng: &mut ChaCha8Rng, cte_idx: usize) -> (String, Vec<String>, bool, usize) {
         let num_cols = rng.random_range(1..=3);
         let num_rows = rng.random_range(2..=5);
         let col_names: Vec<String> = (0..num_cols).map(|i| gen_col_name(cte_idx, i)).collect();
@@ -1140,21 +1152,26 @@ mod cte_tests {
             rows.join(", ")
         );
 
-        (sql, col_names, true)
+        (sql, col_names, true, num_rows)
     }
 
     /// Generates a CTE body that references previous CTEs
+    /// Returns (sql, column_names, has_numeric, estimated_rows, is_cross_product)
     fn gen_cte_body_with_ref(
         rng: &mut ChaCha8Rng,
         cte_idx: usize,
         available_ctes: &[CteInfo],
-    ) -> (String, Vec<String>, bool) {
+    ) -> (String, Vec<String>, bool, usize, bool) {
         let ref_cte = &available_ctes[rng.random_range(0..available_ctes.len())];
         let col_names: Vec<String> = (0..ref_cte.columns.len().min(3))
             .map(|i| gen_col_name(cte_idx, i))
             .collect();
 
         // Decide what kind of reference to make
+        // Avoid self-join if source CTE is too large or is already a cross product
+        let allow_self_join =
+            ref_cte.estimated_rows <= MAX_SELF_JOIN_ROWS && !ref_cte.is_cross_product;
+
         match rng.random_range(0..5) {
             // Simple passthrough with rename
             0 => {
@@ -1168,6 +1185,8 @@ mod cte_tests {
                     format!("SELECT {} FROM {}", select_cols.join(", "), ref_cte.name),
                     col_names,
                     ref_cte.has_numeric_cols,
+                    ref_cte.estimated_rows,
+                    false,
                 )
             }
             // With transformation
@@ -1184,9 +1203,11 @@ mod cte_tests {
                     ),
                     vec![new_col],
                     true,
+                    ref_cte.estimated_rows,
+                    false,
                 )
             }
-            // With filter
+            // With filter (reduces rows by ~half on average)
             2 if ref_cte.has_numeric_cols => {
                 let col = &ref_cte.columns[0];
                 let new_col = gen_col_name(cte_idx, 0);
@@ -1198,9 +1219,11 @@ mod cte_tests {
                     ),
                     vec![new_col],
                     true,
+                    (ref_cte.estimated_rows / 2).max(1),
+                    false,
                 )
             }
-            // With aggregate
+            // With aggregate (always 1 row)
             3 if ref_cte.has_numeric_cols => {
                 let col = &ref_cte.columns[0];
                 let agg = ["SUM", "COUNT", "AVG", "MIN", "MAX"][rng.random_range(0..5)];
@@ -1212,13 +1235,16 @@ mod cte_tests {
                     ),
                     vec![new_col],
                     true,
+                    1, // Aggregate produces 1 row
+                    false,
                 )
             }
-            // Self-join (if CTE has data)
-            4 => {
+            // Self-join (if CTE is small enough and not already a cross product)
+            4 if allow_self_join => {
                 let col = &ref_cte.columns[0];
                 let new_col1 = gen_col_name(cte_idx, 0);
                 let new_col2 = gen_col_name(cte_idx, 1);
+                let cross_rows = ref_cte.estimated_rows * ref_cte.estimated_rows;
                 (
                     format!(
                         "SELECT t1.{} AS {}, t2.{} AS {} FROM {} t1, {} t2",
@@ -1226,6 +1252,8 @@ mod cte_tests {
                     ),
                     vec![new_col1, new_col2],
                     ref_cte.has_numeric_cols,
+                    cross_rows,
+                    true, // This is a cross product
                 )
             }
             // Fallback: simple passthrough
@@ -1236,17 +1264,20 @@ mod cte_tests {
                     format!("SELECT {} AS {} FROM {}", col, new_col, ref_cte.name),
                     vec![new_col],
                     ref_cte.has_numeric_cols,
+                    ref_cte.estimated_rows,
+                    false,
                 )
             }
         }
     }
 
     /// Generates a compound query (UNION/INTERSECT/EXCEPT)
+    /// Returns (sql, column_names, has_numeric, estimated_rows, is_cross_product)
     fn gen_compound_body(
         rng: &mut ChaCha8Rng,
         cte_idx: usize,
         available_ctes: &[CteInfo],
-    ) -> (String, Vec<String>, bool) {
+    ) -> (String, Vec<String>, bool, usize, bool) {
         let op = ["UNION", "UNION ALL", "INTERSECT", "EXCEPT"][rng.random_range(0..4)];
         let num_parts = rng.random_range(2..=4);
         let col_name = gen_col_name(cte_idx, 0);
@@ -1259,35 +1290,56 @@ mod cte_tests {
             None
         };
 
+        let mut total_rows = 0usize;
         let parts: Vec<String> = (0..num_parts)
             .map(|i| {
                 if i == 0 {
                     if let Some(cte) = ref_cte {
                         if cte.has_numeric_cols {
+                            total_rows += cte.estimated_rows;
                             return format!(
                                 "SELECT {} AS {} FROM {}",
                                 cte.columns[0], col_name, cte.name
                             );
                         }
                     }
+                    total_rows += 1;
                     let val = rng.random_range(-20..20);
                     format!("SELECT {val} AS {col_name}")
                 } else {
+                    total_rows += 1;
                     let val = rng.random_range(-20..20);
                     format!("SELECT {val}")
                 }
             })
             .collect();
 
-        (parts.join(&format!(" {op} ")), vec![col_name], true)
+        // Estimate rows based on operation
+        // UNION ALL adds all rows; others may deduplicate or filter
+        let estimated_rows = match op {
+            "UNION ALL" => total_rows,
+            "UNION" => total_rows,                 // Worst case, no duplicates
+            "INTERSECT" => total_rows / num_parts, // Conservative
+            "EXCEPT" => total_rows / 2,            // Conservative
+            _ => total_rows,
+        };
+
+        (
+            parts.join(&format!(" {op} ")),
+            vec![col_name],
+            true,
+            estimated_rows.max(1),
+            false,
+        )
     }
 
     /// Generates the body of a CTE
+    /// Returns (sql, column_names, has_numeric, estimated_rows, is_cross_product)
     fn gen_cte_body(
         rng: &mut ChaCha8Rng,
         cte_idx: usize,
         available_ctes: &[CteInfo],
-    ) -> (String, Vec<String>, bool) {
+    ) -> (String, Vec<String>, bool, usize, bool) {
         // If we have previous CTEs, sometimes reference them
         if !available_ctes.is_empty() && rng.random_bool(0.6) {
             return gen_cte_body_with_ref(rng, cte_idx, available_ctes);
@@ -1296,10 +1348,13 @@ mod cte_tests {
         // Otherwise generate a standalone body
         match rng.random_range(0..7) {
             0 => {
-                let (cols, names, has_num) = gen_select_list(rng, cte_idx);
-                (format!("SELECT {cols}"), names, has_num)
+                let (cols, names, has_num, rows) = gen_select_list(rng, cte_idx);
+                (format!("SELECT {cols}"), names, has_num, rows, false)
             }
-            1 => gen_values(rng, cte_idx),
+            1 => {
+                let (sql, names, has_num, rows) = gen_values(rng, cte_idx);
+                (sql, names, has_num, rows, false)
+            }
             2 => gen_compound_body(rng, cte_idx, available_ctes),
             // Nested CTE (CTE inside FROM subquery)
             3 => {
@@ -1312,6 +1367,8 @@ mod cte_tests {
                     ),
                     vec![col_name],
                     true,
+                    1, // Nested CTE produces 1 row
+                    false,
                 )
             }
             // Empty CTE (WHERE FALSE) - tests NULL/empty result handling
@@ -1321,6 +1378,8 @@ mod cte_tests {
                     format!("SELECT 1 AS {col_name} WHERE 0"),
                     vec![col_name],
                     true,
+                    0, // Empty CTE
+                    false,
                 )
             }
             // CTE with ORDER BY + LIMIT inside body (using VALUES)
@@ -1340,6 +1399,8 @@ mod cte_tests {
                     ),
                     vec![col_name],
                     true,
+                    limit, // Limited by LIMIT clause
+                    false,
                 )
             }
             // Compound SELECT in FROM clause subquery
@@ -1352,14 +1413,28 @@ mod cte_tests {
                     format!("SELECT * FROM (SELECT {v1} AS {col_name} {op} SELECT {v2})"),
                     vec![col_name],
                     true,
+                    2, // 2 rows max
+                    false,
                 )
             }
         }
     }
 
     /// Generates the final SELECT query using the available CTEs
+    /// Avoids cross products when CTEs have too many rows or are already cross products
     fn gen_final_query(rng: &mut ChaCha8Rng, ctes: &[CteInfo]) -> String {
         let last_cte = &ctes[ctes.len() - 1];
+
+        // Helper to check if a CTE is safe for cross product operations
+        let is_safe_for_cross = |cte: &CteInfo| -> bool {
+            cte.estimated_rows <= MAX_SELF_JOIN_ROWS && !cte.is_cross_product
+        };
+
+        // Helper to check if two CTEs can safely be cross-joined
+        let can_cross_join = |cte1: &CteInfo, cte2: &CteInfo| -> bool {
+            let result_rows = cte1.estimated_rows.saturating_mul(cte2.estimated_rows);
+            result_rows <= MAX_SAFE_ROWS && !cte1.is_cross_product && !cte2.is_cross_product
+        };
 
         match rng.random_range(0..17) {
             // Simple select
@@ -1379,17 +1454,25 @@ mod cte_tests {
                 };
                 format!("SELECT {} FROM {}", agg, last_cte.name)
             }
-            // Multiple CTE references (cross product)
+            // Multiple CTE references (cross product) - only if safe
             2 if ctes.len() >= 2 => {
                 let cte1 = &ctes[0];
                 let cte2 = &ctes[ctes.len() - 1];
-                format!(
-                    "SELECT t1.{}, t2.{} FROM {} t1, {} t2 ORDER BY 1, 2",
-                    cte1.columns[0], cte2.columns[0], cte1.name, cte2.name
-                )
+                if can_cross_join(cte1, cte2) {
+                    format!(
+                        "SELECT t1.{}, t2.{} FROM {} t1, {} t2 ORDER BY 1, 2",
+                        cte1.columns[0], cte2.columns[0], cte1.name, cte2.name
+                    )
+                } else {
+                    // Fallback to simple select
+                    format!(
+                        "SELECT {} FROM {} ORDER BY 1",
+                        last_cte.columns[0], last_cte.name
+                    )
+                }
             }
-            // Self-join
-            3 => {
+            // Self-join - only if safe
+            3 if is_safe_for_cross(last_cte) => {
                 format!(
                     "SELECT t1.{}, t2.{} FROM {} t1, {} t2 ORDER BY 1, 2",
                     last_cte.columns[0], last_cte.columns[0], last_cte.name, last_cte.name
@@ -1421,13 +1504,23 @@ mod cte_tests {
                     last_cte.name, last_cte.columns[0], last_cte.name
                 )
             }
-            // LEFT JOIN between CTEs
+            // LEFT JOIN between CTEs - only if safe (ON 1=1 is a cross product)
             7 if ctes.len() >= 2 => {
                 let other_cte = &ctes[rng.random_range(0..ctes.len() - 1)];
-                format!(
-                    "SELECT t1.{}, t2.{} FROM {} t1 LEFT JOIN {} t2 ON 1=1 ORDER BY 1, 2",
-                    last_cte.columns[0], other_cte.columns[0], last_cte.name, other_cte.name
-                )
+                if can_cross_join(last_cte, other_cte) {
+                    format!(
+                        "SELECT t1.{}, t2.{} FROM {} t1 LEFT JOIN {} t2 ON 1=1 ORDER BY 1, 2",
+                        last_cte.columns[0], other_cte.columns[0], last_cte.name, other_cte.name
+                    )
+                } else {
+                    // Use a proper join condition instead
+                    format!(
+                        "SELECT t1.{}, t2.{} FROM {} t1 LEFT JOIN {} t2 ON t1.{} = t2.{} ORDER BY 1, 2",
+                        last_cte.columns[0], other_cte.columns[0],
+                        last_cte.name, other_cte.name,
+                        last_cte.columns[0], other_cte.columns[0]
+                    )
+                }
             }
             // SELECT DISTINCT
             8 => {
@@ -1500,7 +1593,7 @@ mod cte_tests {
                     last_cte.columns[0]
                 )
             }
-            // COALESCE with LEFT JOIN (NULL handling)
+            // COALESCE with LEFT JOIN (NULL handling) - ON 1=0 produces no matches, safe
             15 if ctes.len() >= 2 => {
                 let other_cte = &ctes[rng.random_range(0..ctes.len() - 1)];
                 format!(
@@ -1575,13 +1668,16 @@ mod cte_tests {
             // Generate CTEs
             for cte_idx in 0..num_ctes {
                 let cte_name = format!("cte{cte_idx}");
-                let (body, columns, has_numeric) = gen_cte_body(&mut rng, cte_idx, &ctes);
+                let (body, columns, has_numeric, estimated_rows, is_cross_product) =
+                    gen_cte_body(&mut rng, cte_idx, &ctes);
 
                 cte_defs.push(format!("{cte_name} AS ({body})"));
                 ctes.push(CteInfo {
                     name: cte_name,
                     columns,
                     has_numeric_cols: has_numeric,
+                    estimated_rows,
+                    is_cross_product,
                 });
             }
 

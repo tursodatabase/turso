@@ -1,0 +1,33 @@
+[package]
+name = "differential-fuzzer"
+version.workspace = true
+authors.workspace = true
+edition = "2024"
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "differential_fuzzer"
+path = "main.rs"
+
+[lib]
+path = "lib.rs"
+
+[dependencies]
+turso_core = { workspace = true, features = ["simulator"] }
+sql_gen_prop = { path = "../sql_gen_prop" }
+rusqlite.workspace = true
+rand.workspace = true
+rand_chacha.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+clap = { workspace = true, features = ["derive"] }
+proptest = "1.9"
+indexmap.workspace = true
+parking_lot.workspace = true
+comfy-table = "7"
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

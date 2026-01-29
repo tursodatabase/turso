@@ -1,6 +1,6 @@
-use std::collections::HashSet;
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::num::NonZeroUsize;
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
 use turso_parser::ast::{self, TriggerEvent, TriggerTime, Upsert};
 
@@ -150,7 +150,8 @@ fn collect_changed_cols(
     table: &Table,
     set_pairs: &[(usize, Box<ast::Expr>)],
 ) -> (HashSet<usize>, bool) {
-    let mut cols_changed = HashSet::with_capacity(table.columns().len());
+    let mut cols_changed =
+        HashSet::with_capacity_and_hasher(table.columns().len(), Default::default());
     let mut rowid_changed = false;
     for (col_idx, _) in set_pairs {
         if let Some(c) = table.columns().get(*col_idx) {
@@ -191,7 +192,7 @@ fn upsert_index_is_affected(
 /// Collect HashSet of columns referenced by the partial WHERE (empty if none), or
 /// by the expression of any IndexColumn on the index.
 fn referenced_index_cols(idx: &Index, table: &Table) -> HashSet<usize> {
-    let mut out = HashSet::new();
+    let mut out = HashSet::default();
     if let Some(expr) = &idx.where_clause {
         index_expression_cols(table, &mut out, expr);
     }

@@ -1,0 +1,572 @@
+@database :default:
+@database :default-no-rowidalias:
+
+test subquery-inner-filter {
+    select sub.loud_hat from (
+    select concat(name, '!!!') as loud_hat
+    from products where name = 'hat'
+    ) sub;
+}
+expect {
+    hat!!!
+}
+
+test subquery-inner-filter-cte {
+    with sub as (
+    select concat(name, '!!!') as loud_hat
+    from products where name = 'hat'
+    )
+    select sub.loud_hat from sub;
+}
+expect {
+    hat!!!
+}
+
+test subquery-outer-filter {
+    select sub.loud_hat from (
+    select concat(name, '!!!') as loud_hat
+    from products
+    ) sub where sub.loud_hat = 'hat!!!'
+}
+expect {
+    hat!!!
+}
+
+test subquery-outer-filter-cte {
+    with sub as (
+    select concat(name, '!!!') as loud_hat
+    from products
+    )
+    select sub.loud_hat from sub where sub.loud_hat = 'hat!!!'
+}
+expect {
+    hat!!!
+}
+
+test subquery-without-alias {
+    select loud_hat from (
+    select concat(name, '!!!') as loud_hat
+    from products where name = 'hat'
+    );
+}
+expect {
+    hat!!!
+}
+
+test subquery-without-alias-cte {
+    with cte as (
+    select concat(name, '!!!') as loud_hat
+    from products where name = 'hat'
+    )
+    select loud_hat from cte;
+}
+expect {
+    hat!!!
+}
+
+test subquery-no-alias-on-col {
+    select price from (
+    select * from products where name = 'hat'
+    )
+}
+expect {
+    82.9389679823547
+}
+
+test subquery-no-alias-on-col-cte {
+    with cte as (
+    select * from products where name = 'hat'
+    )
+    select price from cte
+}
+expect {
+    82.9389679823547
+}
+
+test subquery-no-alias-on-col-named {
+    select price from (
+    select price from products where name = 'hat'
+    )
+}
+expect {
+    82.9389679823547
+}
+
+test subquery-no-alias-on-col-named-cte {
+    with cte as (
+    select price from products where name = 'hat'
+    )
+    select price from cte
+}
+expect {
+    82.9389679823547
+}
+
+test subquery-select-star {
+    select * from (
+    select price, price + 1.0, name from products where name = 'hat'
+    )
+}
+expect {
+    82.9389679823547|83.9389679823547|hat
+}
+
+test subquery-select-star-cte {
+    with cte as (
+    select price, price + 1.0, name from products where name = 'hat'
+    )
+    select * from cte
+}
+expect {
+    82.9389679823547|83.9389679823547|hat
+}
+
+test subquery-select-table-star {
+    select sub.* from (
+    select price, price + 1.0, name from products where name = 'hat'
+    ) sub
+}
+expect {
+    82.9389679823547|83.9389679823547|hat
+}
+
+test subquery-select-table-star-cte {
+    with sub as (
+    select price, price + 1.0, name from products where name = 'hat'
+    )
+    select sub.* from sub
+}
+expect {
+    82.9389679823547|83.9389679823547|hat
+}
+
+test nested-subquery {
+    select sub.loudest_hat from (
+    select upper(nested_sub.loud_hat) as loudest_hat from (
+    select concat(name, '!!!') as loud_hat
+    from products where name = 'hat'
+    ) nested_sub
+    ) sub;
+}
+expect {
+    HAT!!!
+}
+
+test nested-subquery-cte {
+    with nested_sub as (
+    select concat(name, '!!!') as loud_hat
+    from products where name = 'hat'
+    ),
+    sub as (
+    select upper(nested_sub.loud_hat) as loudest_hat from nested_sub
+    )
+    select sub.loudest_hat from sub;
+}
+expect {
+    HAT!!!
+}
+
+test subquery-orderby-limit {
+    select upper(sub.loud_name) as loudest_name
+    from (
+    select concat(name, '!!!') as loud_name
+    from products
+    order by name
+    limit 3
+    ) sub;
+}
+expect {
+    ACCESSORIES!!!
+    BOOTS!!!
+    CAP!!!
+}
+
+test subquery-orderby-limit-cte {
+    with sub as (
+    select concat(name, '!!!') as loud_name
+    from products
+    order by name
+    limit 3
+    )
+    select upper(sub.loud_name) as loudest_name from sub;
+}
+expect {
+    ACCESSORIES!!!
+    BOOTS!!!
+    CAP!!!
+}
+
+test table-join-subquery {
+    select sub.product_name, p.name
+    from products p join (
+    select name as product_name
+    from products
+    ) sub on p.name = sub.product_name where p.name = 'hat'
+}
+expect {
+    hat|hat
+}
+
+test table-join-subquery-cte {
+    with sub as (
+    select name as product_name
+    from products
+    )
+    select sub.product_name, p.name
+    from products p join sub on p.name = sub.product_name
+    where p.name = 'hat'
+}
+expect {
+    hat|hat
+}
+
+test subquery-join-table {
+    select sub.product_name, p.name
+    from (
+    select name as product_name
+    from products
+    ) sub join products p on sub.product_name = p.name where sub.product_name = 'hat'
+}
+expect {
+    hat|hat
+}
+
+test subquery-join-table-cte {
+    with sub as (
+    select name as product_name
+    from products
+    )
+    select sub.product_name, p.name
+    from sub join products p on sub.product_name = p.name
+    where sub.product_name = 'hat'
+}
+expect {
+    hat|hat
+}
+
+test subquery-join-subquery {
+    select sub1.sus_name, sub2.truthful_name
+    from (
+    select name as sus_name
+    from products
+    where name = 'cap'
+    ) sub1 join (
+    select concat('no ', name) as truthful_name
+    from products
+    where name = 'cap'
+    ) sub2;
+}
+expect {
+    cap|no cap
+}
+
+test subquery-join-subquery-cte {
+    with sub1 as (
+    select name as sus_name
+    from products
+    where name = 'cap'
+    ),
+    sub2 as (
+    select concat('no ', name) as truthful_name
+    from products
+    where name = 'cap'
+    )
+    select sub1.sus_name, sub2.truthful_name
+    from sub1 join sub2;
+}
+expect {
+    cap|no cap
+}
+
+test select-star-table-subquery {
+    select *
+    from products p join (
+    select name, price
+    from products
+    where name = 'hat'
+    ) sub on p.name = sub.name;
+}
+expect {
+    1|hat|82.9389679823547|hat|82.9389679823547
+}
+
+test select-star-table-subquery-cte {
+    with sub as (
+    select name, price
+    from products
+    where name = 'hat'
+    )
+    select *
+    from products p join sub on p.name = sub.name;
+}
+expect {
+    1|hat|82.9389679823547|hat|82.9389679823547
+}
+
+test select-star-subquery-table {
+    select *
+    from (
+    select name, price
+    from products
+    where name = 'hat'
+    ) sub join products p on sub.name = p.name;
+}
+expect {
+    hat|82.9389679823547|1|hat|82.9389679823547
+}
+
+test select-star-subquery-table-cte {
+    with sub as (
+    select name, price
+    from products
+    where name = 'hat'
+    )
+    select *
+    from sub join products p on sub.name = p.name;
+}
+expect {
+    hat|82.9389679823547|1|hat|82.9389679823547
+}
+
+test select-star-subquery-subquery {
+    select *
+    from (
+    select name, price
+    from products
+    where name = 'hat'
+    ) sub1 join (
+    select price
+    from products
+    where name = 'hat'
+    ) sub2 on sub1.price = sub2.price;
+}
+expect {
+    hat|82.9389679823547|82.9389679823547
+}
+
+test select-star-subquery-subquery-cte {
+    with sub1 as (
+    select name, price
+    from products
+    where name = 'hat'
+    ),
+    sub2 as (
+    select price
+    from products
+    where name = 'hat'
+    )
+    select *
+    from sub1 join sub2 on sub1.price = sub2.price;
+}
+expect {
+    hat|82.9389679823547|82.9389679823547
+}
+
+test subquery-inner-grouping {
+    select is_jennifer, person_count
+    from (
+    select first_name = 'Jennifer' as is_jennifer, count(1) as person_count from users
+    group by first_name = 'Jennifer'
+    ) order by person_count asc
+}
+expect {
+    1|1
+    0|9999
+}
+
+test subquery-inner-grouping-cte {
+    with cte as (
+    select first_name = 'Jennifer' as is_jennifer, count(1) as person_count from users
+    group by first_name = 'Jennifer'
+    )
+    select is_jennifer, person_count
+    from cte order by person_count asc
+}
+expect {
+    1|1
+    0|9999
+}
+
+test subquery-outer-grouping {
+    select is_jennifer, count(1) as person_count
+    from (
+    select first_name = 'Jennifer' as is_jennifer from users
+    ) group by is_jennifer order by count(1) asc
+}
+expect {
+    1|1
+    0|9999
+}
+
+test subquery-outer-grouping-cte {
+    with cte as (
+    select first_name = 'Jennifer' as is_jennifer from users
+    )
+    select is_jennifer, count(1) as person_count
+    from cte group by is_jennifer order by count(1) asc
+}
+expect {
+    1|1
+    0|9999
+}
+
+test subquery-join-using-with-outer-limit {
+    SELECT p.name, sub.funny_name
+    FROM products p
+    JOIN (
+    select id, concat(name, '-lol') as funny_name
+    from products
+    ) sub USING (id)
+    LIMIT 3;
+}
+expect {
+    hat|hat-lol
+    cap|cap-lol
+    shirt|shirt-lol
+}
+
+test subquery-join-using-with-outer-limit-cte {
+    WITH sub AS (
+    select id, concat(name, '-lol') as funny_name
+    from products
+    )
+    SELECT p.name, sub.funny_name
+    FROM products p
+    JOIN sub USING (id)
+    LIMIT 3;
+}
+expect {
+    hat|hat-lol
+    cap|cap-lol
+    shirt|shirt-lol
+}
+
+test subquery-join-using-with-inner-limit {
+    SELECT p.name, sub.funny_name
+    FROM products p
+    JOIN (
+    select id, concat(name, '-lol') as funny_name
+    from products
+    limit 3
+    ) sub USING (id);
+}
+expect {
+    hat|hat-lol
+    cap|cap-lol
+    shirt|shirt-lol
+}
+
+test subquery-join-using-with-inner-limit-cte {
+    WITH sub AS (
+    select id, concat(name, '-lol') as funny_name
+    from products
+    limit 3
+    )
+    SELECT p.name, sub.funny_name
+    FROM products p
+    JOIN sub USING (id);
+}
+expect {
+    hat|hat-lol
+    cap|cap-lol
+    shirt|shirt-lol
+}
+
+test subquery-join-using-with-both-limits {
+    SELECT p.name, sub.funny_name
+    FROM products p
+    JOIN (
+    select id, concat(name, '-lol') as funny_name
+    from products
+    limit 3
+    ) sub USING (id)
+    LIMIT 2;
+}
+expect {
+    hat|hat-lol
+    cap|cap-lol
+}
+
+test subquery-join-using-with-both-limits-cte {
+    WITH sub AS (
+    select id, concat(name, '-lol') as funny_name
+    from products
+    limit 3
+    )
+    SELECT p.name, sub.funny_name
+    FROM products p
+    JOIN sub USING (id)
+    LIMIT 2;
+}
+expect {
+    hat|hat-lol
+    cap|cap-lol
+}
+
+test subquery-containing-join {
+    select foo, bar
+    from (
+    select p.name as foo, u.first_name as bar
+    from products p join users u using (id)
+    ) limit 3;
+}
+expect {
+    hat|Dan
+    cap|Chaz
+    shirt|Edmond
+}
+
+test subquery-containing-join-cte {
+    with cte as (
+    select p.name as foo, u.first_name as bar
+    from products p join users u using (id)
+    )
+    select foo, bar
+    from cte limit 3;
+}
+expect {
+    hat|Dan
+    cap|Chaz
+    shirt|Edmond
+}
+
+test subquery-ignore-unused-cte {
+    with unused as (select last_name from users),
+    sub as (select first_name from users where first_name = 'Jamie' limit 1)
+    select * from sub;
+}
+expect {
+    Jamie
+}
+
+# Test verifying that select distinct works (distinct ages are 1-100)
+test subquery-count-distinct-age {
+    select count(1) from (select distinct age from users);
+}
+expect {
+    100
+}
+
+# Test verifying that select distinct works for multiple columns, and across joins
+test subquery-count-distinct {
+    select count(1) from (
+    select distinct first_name, name
+    from users u join products p
+    where u.id < 100
+    );
+}
+expect {
+    1078
+}
+
+test subquery-count-all {
+    select count(1) from (
+    select first_name, name
+    from users u join products p
+    where u.id < 100
+    );
+}
+expect {
+    1089
+}
+

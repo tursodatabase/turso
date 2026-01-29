@@ -1,4 +1,5 @@
 use crate::error::LimboError;
+use crate::io::FileSyncType;
 use crate::storage::checksum::ChecksumContext;
 use crate::storage::encryption::EncryptionContext;
 use crate::sync::Arc;
@@ -82,7 +83,7 @@ pub trait DatabaseStorage: Send + Sync {
         io_ctx: &IOContext,
         c: Completion,
     ) -> Result<Completion>;
-    fn sync(&self, c: Completion) -> Result<Completion>;
+    fn sync(&self, c: Completion, sync_type: FileSyncType) -> Result<Completion>;
     fn size(&self) -> Result<u64>;
     fn truncate(&self, len: usize, c: Completion) -> Result<Completion>;
 }
@@ -250,8 +251,8 @@ impl DatabaseStorage for DatabaseFile {
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
-    fn sync(&self, c: Completion) -> Result<Completion> {
-        self.file.sync(c)
+    fn sync(&self, c: Completion, sync_type: FileSyncType) -> Result<Completion> {
+        self.file.sync(c, sync_type)
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]

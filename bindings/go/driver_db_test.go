@@ -50,6 +50,9 @@ func TestMain(m *testing.M) {
 }
 
 func TestEncryption(t *testing.T) {
+	hexkey := "b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327"
+	wrongKey := "aaaaaaa4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327"
+
 	t.Run("encryption=disabled", func(t *testing.T) {
 		tmp := t.TempDir()
 		dbPath := path.Join(tmp, "local.db")
@@ -66,10 +69,12 @@ func TestEncryption(t *testing.T) {
 		require.Nil(t, err)
 		require.True(t, bytes.Contains(content, []byte("secret")))
 	})
+
 	t.Run("encryption=enabled", func(t *testing.T) {
 		tmp := t.TempDir()
 		dbPath := path.Join(tmp, "local.db")
-		conn, err := sql.Open("turso", fmt.Sprintf("%v?experimental=encryption&encryption_cipher=aegis256&encryption_hexkey=b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327", dbPath))
+		dsn := fmt.Sprintf("%v?experimental=encryption&encryption_cipher=aegis256&encryption_hexkey=%s", dbPath, hexkey)
+		conn, err := sql.Open("turso", dsn)
 		require.Nil(t, err)
 		require.Nil(t, conn.Ping())
 		_, err = conn.Exec("CREATE TABLE t(x)")
@@ -81,6 +86,53 @@ func TestEncryption(t *testing.T) {
 		content, err := os.ReadFile(dbPath)
 		require.Nil(t, err)
 		require.False(t, bytes.Contains(content, []byte("secret")))
+		conn.Close()
+	})
+
+	t.Run("encryption=full_test", func(t *testing.T) {
+		tmp := t.TempDir()
+		dbPath := path.Join(tmp, "encrypted.db")
+
+		dsn := fmt.Sprintf("%v?experimental=encryption&encryption_cipher=aegis256&encryption_hexkey=%s", dbPath, hexkey)
+		conn, err := sql.Open("turso", dsn)
+		require.Nil(t, err)
+		require.Nil(t, conn.Ping())
+		_, err = conn.Exec("CREATE TABLE t(x)")
+		require.Nil(t, err)
+		_, err = conn.Exec("INSERT INTO t SELECT 'secret' FROM generate_series(1, 1024)")
+		require.Nil(t, err)
+		_, err = conn.Exec("PRAGMA wal_checkpoint(TRUNCATE)")
+		require.Nil(t, err)
+		conn.Close()
+
+		content, err := os.ReadFile(dbPath)
+		require.Nil(t, err)
+		require.Greater(t, len(content), 16*1024)
+		require.False(t, bytes.Contains(content, []byte("secret")))
+
+		// verify we can re-open with the same key
+		conn2, err := sql.Open("turso", dsn)
+		require.Nil(t, err)
+		var count int
+		err = conn2.QueryRow("SELECT count(*) FROM t").Scan(&count)
+		require.Nil(t, err)
+		require.Equal(t, 1024, count)
+		conn2.Close()
+
+		// verify opening with wrong key fails
+		wrongDsn := fmt.Sprintf("%v?experimental=encryption&encryption_cipher=aegis256&encryption_hexkey=%s", dbPath, wrongKey)
+		conn3, err := sql.Open("turso", wrongDsn)
+		require.Nil(t, err) // open succeeds but query should fail
+		_, err = conn3.Exec("SELECT * FROM t")
+		require.NotNil(t, err)
+		conn3.Close()
+
+		// verify opening without encryption fails
+		conn4, err := sql.Open("turso", dbPath)
+		require.Nil(t, err) // Open succeeds but query should fail
+		_, err = conn4.Exec("SELECT * FROM t")
+		require.NotNil(t, err)
+		conn4.Close()
 	})
 }
 
@@ -1277,5 +1329,105 @@ func TestMultiStatementExecution(t *testing.T) {
 		if count != 1 {
 			t.Errorf("Expected 1 row, got %d", count)
 		}
+	})
+}
+
+func TestTimeValueRoundtrip(t *testing.T) {
+	db := openMem(t)
+
+	_, err := db.Exec(`CREATE TABLE time_test (
+		id INTEGER PRIMARY KEY,
+		created_at DATETIME,
+		updated_at DATETIME,
+		deleted_at TIMESTAMP
+	)`)
+	require.NoError(t, err)
+
+	// Use a fixed time for deterministic testing
+	// time.Time values are stored as RFC3339Nano strings
+	originalTime := time.Date(2024, 6, 15, 14, 30, 45, 123456789, time.UTC)
+	laterTime := originalTime.Add(24 * time.Hour)
+
+	// Insert using time.Time values
+	_, err = db.Exec(
+		`INSERT INTO time_test (id, created_at, updated_at, deleted_at) VALUES (?, ?, ?, ?)`,
+		1, originalTime, laterTime, nil,
+	)
+	require.NoError(t, err)
+
+	t.Run("scan into time.Time", func(t *testing.T) {
+		var id int
+		var createdAt, updatedAt time.Time
+		var deletedAt sql.NullTime
+
+		err := db.QueryRow(`SELECT id, created_at, updated_at, deleted_at FROM time_test WHERE id = 1`).
+			Scan(&id, &createdAt, &updatedAt, &deletedAt)
+		require.NoError(t, err)
+
+		require.Equal(t, 1, id)
+		require.True(t, originalTime.Equal(createdAt), "createdAt mismatch: expected %v, got %v", originalTime, createdAt)
+		require.True(t, laterTime.Equal(updatedAt), "updatedAt mismatch: expected %v, got %v", laterTime, updatedAt)
+		require.False(t, deletedAt.Valid, "deletedAt should be NULL")
+	})
+
+	t.Run("scan into string then parse", func(t *testing.T) {
+		var createdAtStr string
+		err := db.QueryRow(`SELECT created_at FROM time_test WHERE id = 1`).Scan(&createdAtStr)
+		require.NoError(t, err)
+
+		// Verify the stored format is RFC3339Nano
+		parsed, err := time.Parse(time.RFC3339Nano, createdAtStr)
+		require.NoError(t, err)
+		require.True(t, originalTime.Equal(parsed), "parsed time mismatch")
+	})
+
+	t.Run("update with time.Time", func(t *testing.T) {
+		newTime := originalTime.Add(48 * time.Hour)
+		_, err := db.Exec(`UPDATE time_test SET updated_at = ? WHERE id = ?`, newTime, 1)
+		require.NoError(t, err)
+
+		var updatedAt time.Time
+		err = db.QueryRow(`SELECT updated_at FROM time_test WHERE id = 1`).Scan(&updatedAt)
+		require.NoError(t, err)
+		require.True(t, newTime.Equal(updatedAt), "updated time mismatch")
+	})
+
+	t.Run("query with time.Time parameter", func(t *testing.T) {
+		// Insert another row
+		anotherTime := originalTime.Add(72 * time.Hour)
+		_, err := db.Exec(`INSERT INTO time_test (id, created_at) VALUES (?, ?)`, 2, anotherTime)
+		require.NoError(t, err)
+
+		// Query using time as parameter
+		var id int
+		err = db.QueryRow(`SELECT id FROM time_test WHERE created_at = ?`, originalTime).Scan(&id)
+		require.NoError(t, err)
+		require.Equal(t, 1, id)
+	})
+
+	t.Run("prepared statement with time.Time", func(t *testing.T) {
+		stmt, err := db.Prepare(`SELECT id, created_at FROM time_test WHERE created_at < ?`)
+		require.NoError(t, err)
+		defer stmt.Close()
+
+		cutoff := originalTime.Add(1 * time.Hour)
+		var id int
+		var createdAt time.Time
+		err = stmt.QueryRow(cutoff).Scan(&id, &createdAt)
+		require.NoError(t, err)
+		require.Equal(t, 1, id)
+		require.True(t, originalTime.Equal(createdAt))
+	})
+
+	// expected behaviour - similar to the sqlite3 go driver as it uses decltype
+	t.Run("transform datetime column", func(t *testing.T) {
+		stmt, err := db.Prepare(`SELECT concat(created_at || '') FROM time_test`)
+		require.NoError(t, err)
+		defer stmt.Close()
+
+		var createdAt string
+		err = stmt.QueryRow().Scan(&createdAt)
+		require.NoError(t, err)
+		require.Equal(t, createdAt, originalTime.Format(time.RFC3339Nano))
 	})
 }

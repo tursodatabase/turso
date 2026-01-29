@@ -80,12 +80,7 @@ run_queries() {
             if [ -n "$output_diff" ]; then
                 echo "Output difference:"
                 echo "$output_diff"
-                # Ignore differences for query 1 due to floating point precision incompatibility
-                if [ "$query_file" = "$QUERIES_DIR/1.sql" ]; then
-                    echo "Ignoring output difference for query 1 (known floating point precision incompatibility)"
-                else
-                    mode_exit_code=1
-                fi
+                mode_exit_code=1
             else
                 echo "No output difference"
             fi

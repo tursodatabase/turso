@@ -44,9 +44,27 @@ pub fn exec_printf(values: &[Register]) -> crate::Result<Value> {
     if values.is_empty() {
         return Ok(Value::Null);
     }
-    let format_str = match &values[0].get_value() {
+    // SQLite converts the format argument to text if not already text.
+    // Non-text formats get converted via their string representation,
+    // e.g. PRINTF(1, 'a') returns "1" not NULL.
+    let format_value = values[0].get_value();
+    let format_string: String;
+    let format_str = match &format_value {
         Value::Text(t) => t.as_str(),
-        _ => return Ok(Value::Null),
+        Value::Null => return Ok(Value::Null),
+        Value::Integer(i) => {
+            format_string = i.to_string();
+            format_string.as_str()
+        }
+        Value::Float(f) => {
+            format_string = f.to_string();
+            format_string.as_str()
+        }
+        Value::Blob(b) => {
+            // Blob to string - use lossy UTF-8 conversion like SQLite
+            format_string = String::from_utf8_lossy(b).to_string();
+            format_string.as_str()
+        }
     };
 
     let mut result = String::new();

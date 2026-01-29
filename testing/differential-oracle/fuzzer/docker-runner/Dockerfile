@@ -1,0 +1,87 @@
+FROM lukemathwalker/cargo-chef:latest-rust-1.88.0 AS chef
+RUN apt update \
+    && apt install -y git libssl-dev pkg-config\
+    && apt clean \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+
+#
+# Cache dependencies
+#
+
+FROM chef AS planner
+# cargo-chef requires all this crap to be present in the workspace
+COPY Cargo.toml Cargo.lock ./
+COPY core ./core/
+COPY bindings ./bindings/
+COPY extensions ./extensions/
+COPY macros ./macros/
+COPY sync ./sync
+COPY parser ./parser/
+COPY perf/encryption ./perf/encryption
+COPY perf/throughput/rusqlite ./perf/throughput/rusqlite
+COPY perf/throughput/turso ./perf/throughput/turso
+COPY cli ./cli/
+COPY sqlite3 ./sqlite3/
+COPY tests ./tests/
+COPY packages ./packages/
+COPY testing ./testing/
+COPY sql_generation ./sql_generation/
+COPY sdk-kit ./sdk-kit/
+COPY sdk-kit-macros ./sdk-kit-macros/
+RUN cargo chef prepare --bin differential_fuzzer --recipe-path recipe.json
+
+#
+# Build the project.
+#
+
+FROM chef AS builder
+
+COPY --from=planner /app/recipe.json recipe.json
+RUN cargo chef cook --bin differential_fuzzer --recipe-path recipe.json
+COPY --from=planner /app/core ./core/
+COPY --from=planner /app/extensions ./extensions/
+COPY --from=planner /app/macros ./macros/
+COPY --from=planner /app/parser ./parser/
+COPY --from=planner /app/perf/encryption ./perf/encryption
+COPY --from=planner /app/perf/throughput/rusqlite ./perf/throughput/rusqlite
+COPY --from=planner /app/perf/throughput/turso ./perf/throughput/turso
+COPY --from=planner /app/packages ./packages/
+COPY --from=planner /app/sql_generation ./sql_generation/
+COPY --from=planner /app/testing ./testing/
+COPY --from=planner /app/Cargo.toml /app/Cargo.lock ./
+
+RUN cargo build --bin differential_fuzzer
+
+#
+# The final image.
+#
+
+FROM debian:bookworm-slim AS runtime
+# Install Bun (we want to use a fancy shell so we can e.g. post github issues when simulator fails)
+RUN apt-get update && apt-get install -y \
+    curl \
+    unzip \
+    ca-certificates \
+    libssl3 \
+    openssl \
+    && curl -fsSL https://bun.sh/install | bash \
+    && ln -s /root/.bun/bin/bun /usr/local/bin/bun \
+    && rm -rf /var/lib/apt/lists/*
+
+# Accept git hash as build argument
+ARG GIT_HASH
+ENV GIT_HASH=${GIT_HASH:-unknown}
+
+WORKDIR /app
+COPY --from=builder /app/target/debug/differential_fuzzer /app/differential_fuzzer
+COPY testing/differential-oracle/fuzzer/docker-runner/package.json testing/differential-oracle/fuzzer/docker-runner/tsconfig.json ./
+RUN bun install
+COPY testing/differential-oracle/fuzzer/docker-runner/*.ts ./
+
+RUN chmod +x /app/docker-entrypoint.fuzzer.ts
+RUN chmod +x /app/differential_fuzzer
+
+ENTRYPOINT ["bun", "/app/docker-entrypoint.fuzzer.ts"]
+# Arguments can be passed at runtime
+CMD []

@@ -1,3 +1,4 @@
+use crate::io::FileSyncType;
 use crate::sync::Arc;
 use crate::sync::RwLock;
 use std::fmt::Debug;
@@ -28,8 +29,8 @@ impl Storage {
         todo!()
     }
 
-    pub fn sync(&self) -> Result<Completion> {
-        self.logical_log.write().sync()
+    pub fn sync(&self, sync_type: FileSyncType) -> Result<Completion> {
+        self.logical_log.write().sync(sync_type)
     }
 
     pub fn truncate(&self) -> Result<Completion> {

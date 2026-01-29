@@ -26,6 +26,7 @@ NPM_PACKAGES = [
     "bindings/javascript/sync/packages/common",
     "bindings/javascript/sync/packages/native",
     "bindings/javascript/sync/packages/wasm",
+    "bindings/react-native",
 ]
 
 NPM_WORKSPACE_PACKAGES = [

@@ -44,7 +44,7 @@ impl MergeOperator {
         Self {
             operator_id,
             union_mode: mode,
-            seen_rows: HashMap::new(),
+            seen_rows: HashMap::default(),
             next_rowid: 1,
         }
     }

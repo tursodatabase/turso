@@ -1480,3 +1480,77 @@ fn test_alter_table_rename_column_qualified_reference_to_trigger_table(db: TempD
         "Error should mention trigger or column: {error_msg}",
     );
 }
+
+/// Regression test for issue #4801: AFTER trigger INSERT corrupts index cursor position.
+///
+/// When an AFTER UPDATE trigger does INSERT on the same table, it modifies the index being
+/// used for the UPDATE scan. If the code reads columns from the index cursor (optimization
+/// for non-covering indexes), the cursor position becomes stale after the trigger's INSERT,
+/// causing wrong values to be read.
+///
+/// This test uses the exact SQL from the fuzz test seed 1768993693555 that exposed the bug
+/// in the test 'table_index_mutation_fuzz'.
+#[turso_macros::test]
+fn test_after_trigger_insert_does_not_corrupt_index_cursor(db: TempDatabase) {
+    use crate::common::{limbo_exec_rows, sqlite_exec_rows};
+
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .try_init();
+
+    // DDL/DML statements from the fuzz test
+    let setup_stmts = [
+        "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, c0 INTEGER, c1 INTEGER, c2 INTEGER, c3 INTEGER)",
+        "CREATE INDEX idx_0 ON t(c0, c1, c2)",
+        "CREATE INDEX idx_1 ON t(c0)",
+        "CREATE INDEX idx_2 ON t(LOWER(c1))",
+        "CREATE INDEX idx_3 ON t(c3, c2, c1)",
+        "CREATE TRIGGER test_trigger AFTER UPDATE ON t BEGIN INSERT OR REPLACE INTO t (c0, c1, c2, c3) VALUES (928, NEW.c1, NEW.c2, OLD.c3); END",
+        "INSERT OR IGNORE INTO t (c0, c1, c2, c3) VALUES (305, 505, 678, 408), (925, 33, 642, 768), (583, 336, 680, 881), (550, 569, 563, 307), (582, 496, 313, 909), (646, 904, 180, 6), (860, 120, 210, 757), (932, 252, 319, 425), (408, 927, 967, 472), (968, 655, 488, 815), (192, 492, 320, 583), (290, 819, 155, 412), (229, 397, 804, 872), (382, 602, 311, 134), (980, 231, 975, 87), (40, 982, 849, 979), (389, 110, 692, 784), (122, 17, 894, 15), (449, 34, 426, 718), (35, 553, 253, 866), (330, 314, 578, 799), (886, 650, 297, 945), (114, 798, 799, 339), (957, 424, 572, 357), (691, 192, 538, 906), (210, 676, 612, 188), (416, 555, 714, 692), (235, 851, 840, 175), (265, 625, 617, 161), (320, 655, 841, 693), (832, 354, 796, 910), (128, 87, 181, 298), (293, 5, 124, 647), (437, 43, 72, 59), (35, 974, 600, 448), (346, 726, 63, 230), (733, 887, 74, 528), (804, 583, 691, 264), (599, 130, 119, 263), (119, 712, 874, 40), (612, 711, 314, 876), (323, 885, 816, 999), (889, 154, 563, 566), (219, 803, 49, 686)",
+        "UPDATE t SET c1 = 494, c1 = c2 - 643, c1 = c1 - 603 WHERE c2 = 853",
+        "UPDATE t SET c1 = c1 + 569 WHERE c1 = 171",
+        "UPDATE t SET c3 = c2 - 928 WHERE c1 = 295 AND c1 % 2 = 0",
+        "UPDATE t SET c3 = c1 + 914, c3 = 766 WHERE c1 > 555",
+        "UPDATE t SET c3 = 602 WHERE c1 > 761",
+        "UPDATE t SET c2 = c2 + 26, c2 = 378 WHERE c2 < 41",
+        "UPDATE t SET c2 = 969, c2 = 379, c2 = c2 + 376, c2 = 488 WHERE c1 > 565",
+        // This UPDATE triggered the bug in issue #4801:
+        // - WHERE c3 < 92 causes optimizer to use idx_3 for scanning
+        // - SET c0 = 778 only modifies c0, so c1/c2/c3 are read from existing row
+        // - AFTER trigger INSERTs, modifying idx_3 and corrupting parent's index cursor position
+        "UPDATE t SET c0 = 550, c0 = c0 - 160, c0 = 225, c0 = 778 WHERE c3 < 92 AND c3 % 2 = 0",
+    ];
+
+    // Setup SQLite connection
+    let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
+
+    // Setup Limbo connection
+    let limbo_conn = db.connect_limbo();
+
+    // Execute all setup statements on both databases
+    for stmt in &setup_stmts {
+        sqlite_conn.execute(stmt, []).unwrap();
+        limbo_conn.execute(stmt).unwrap();
+    }
+
+    // Compare results
+    let query = "SELECT id, c0, c1, c2, c3 FROM t ORDER BY id";
+    let sqlite_rows = sqlite_exec_rows(&sqlite_conn, query);
+    let limbo_rows = limbo_exec_rows(&limbo_conn, query);
+
+    assert_eq!(
+        sqlite_rows.len(),
+        limbo_rows.len(),
+        "Row count mismatch: SQLite={}, Limbo={}",
+        sqlite_rows.len(),
+        limbo_rows.len()
+    );
+
+    for (i, (sqlite_row, limbo_row)) in sqlite_rows.iter().zip(limbo_rows.iter()).enumerate() {
+        assert_eq!(
+            sqlite_row, limbo_row,
+            "Row {i} differs!\nSQLite: {sqlite_row:?}\nLimbo:  {limbo_row:?}\n\
+             This indicates either a regression back to the bug in issue #4801 or a new bug",
+        );
+    }
+}

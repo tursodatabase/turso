@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
 use std::ops::Range;
 use std::path::PathBuf;
@@ -45,6 +45,65 @@ impl FromStr for Backend {
     }
 }
 
+/// Backend capabilities that tests can require
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Capability {
+    /// Support for CREATE TRIGGER
+    Trigger,
+    /// Support for STRICT tables
+    Strict,
+    /// Support for MATERIALIZED VIEW (experimental)
+    MaterializedViews,
+}
+
+impl Capability {
+    /// All known capability variants
+    pub const ALL: &'static [Capability] = &[
+        Capability::Trigger,
+        Capability::Strict,
+        Capability::MaterializedViews,
+    ];
+
+    /// Get all capabilities as a HashSet (convenience for backends that support everything)
+    pub fn all_set() -> HashSet<Capability> {
+        Self::ALL.iter().copied().collect()
+    }
+}
+
+impl Display for Capability {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Capability::Trigger => write!(f, "trigger"),
+            Capability::Strict => write!(f, "strict"),
+            Capability::MaterializedViews => write!(f, "materialized_views"),
+        }
+    }
+}
+
+impl FromStr for Capability {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "trigger" => Ok(Capability::Trigger),
+            "strict" => Ok(Capability::Strict),
+            "materialized_views" => Ok(Capability::MaterializedViews),
+            _ => Err(format!(
+                "unknown capability '{s}', valid capabilities are: trigger, strict, materialized_views"
+            )),
+        }
+    }
+}
+
+/// A capability requirement with a reason
+#[derive(Debug, Clone, PartialEq)]
+pub struct Requirement {
+    /// The required capability
+    pub capability: Capability,
+    /// Reason why this capability is required
+    pub reason: String,
+}
+
 /// A complete test file parsed from `.sqltest` format
 #[derive(Debug, Clone, PartialEq)]
 pub struct TestFile {
@@ -54,8 +113,12 @@ pub struct TestFile {
     pub setups: HashMap<String, String>,
     /// Test cases
     pub tests: Vec<TestCase>,
+    /// Snapshot test cases (for EXPLAIN output)
+    pub snapshots: Vec<SnapshotCase>,
     /// Global skip directive that applies to all tests in the file
     pub global_skip: Option<Skip>,
+    /// Global capability requirements that apply to all tests in the file
+    pub global_requires: Vec<Requirement>,
 }
 
 /// A setup reference with its span in the source
@@ -65,6 +128,32 @@ pub struct SetupRef {
     pub name: String,
     /// Span of the @setup directive in the source (includes @setup and the name)
     pub span: Range<usize>,
+}
+
+/// Common modifiers shared by test and snapshot cases
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct CaseModifiers {
+    /// Setup references with their spans
+    pub setups: Vec<SetupRef>,
+    /// If set, skip this case (unconditionally or conditionally)
+    pub skip: Option<Skip>,
+    /// If set, only run this case on the specified backend
+    pub backend: Option<Backend>,
+    /// Required capabilities for this case
+    pub requires: Vec<Requirement>,
+}
+
+/// A snapshot test case (for EXPLAIN output)
+#[derive(Debug, Clone, PartialEq)]
+pub struct SnapshotCase {
+    /// Unique name for this snapshot test
+    pub name: String,
+    /// Span of the snapshot name in the source
+    pub name_span: Range<usize>,
+    /// SQL to execute (EXPLAIN will be prepended)
+    pub sql: String,
+    /// Common modifiers (setups, skip, backend, requires)
+    pub modifiers: CaseModifiers,
 }
 
 /// A single test case
@@ -78,12 +167,8 @@ pub struct TestCase {
     pub sql: String,
     /// Expected results (with optional backend-specific overrides)
     pub expectations: Expectations,
-    /// Setup references with their spans
-    pub setups: Vec<SetupRef>,
-    /// If set, skip this test (unconditionally or conditionally)
-    pub skip: Option<Skip>,
-    /// If set, only run this test on the specified backend
-    pub backend: Option<Backend>,
+    /// Common modifiers (setups, skip, backend, requires)
+    pub modifiers: CaseModifiers,
 }
 
 /// Skip configuration for a test

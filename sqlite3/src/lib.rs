@@ -1256,7 +1256,7 @@ pub unsafe extern "C" fn sqlite3_column_decltype(
 ) -> *const ffi::c_char {
     let stmt = &mut *stmt;
 
-    if let Some(val) = stmt.stmt.get_column_type(idx as usize) {
+    if let Some(val) = stmt.stmt.get_column_decltype(idx as usize) {
         let c_string = CString::new(val).expect("CString::new failed");
         c_string.into_raw()
     } else {
@@ -1918,10 +1918,10 @@ pub unsafe extern "C" fn sqlite3_wal_checkpoint_v2(
     match db.conn.checkpoint(chkptmode) {
         Ok(res) => {
             if !log_size.is_null() {
-                (*log_size) = res.num_attempted as ffi::c_int;
+                (*log_size) = res.wal_max_frame as ffi::c_int;
             }
             if !checkpoint_count.is_null() {
-                (*checkpoint_count) = res.num_backfilled as ffi::c_int;
+                (*checkpoint_count) = res.wal_checkpoint_backfilled as ffi::c_int;
             }
             SQLITE_OK
         }

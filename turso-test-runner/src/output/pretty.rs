@@ -26,6 +26,9 @@ impl PrettyOutput {
             TestOutcome::Failed { .. } => style.red(),
             TestOutcome::Skipped { .. } => style.yellow(),
             TestOutcome::Error { .. } => style.red().bold(),
+            TestOutcome::SnapshotNew { .. } => style.cyan(),
+            TestOutcome::SnapshotUpdated { .. } => style.blue(),
+            TestOutcome::SnapshotMismatch { .. } => style.red(),
         };
         style.style(symbol)
     }
@@ -82,6 +85,34 @@ impl OutputFormat for PrettyOutput {
                     format!("({reason})").dimmed()
                 );
             }
+            TestOutcome::SnapshotNew { .. } => {
+                println!(
+                    "  [{}] {:<40} {} {}",
+                    self.outcome_colored(&result.outcome),
+                    result.name,
+                    duration_str.dimmed(),
+                    "(new snapshot)".cyan()
+                );
+            }
+            TestOutcome::SnapshotUpdated { .. } => {
+                println!(
+                    "  [{}] {:<40} {} {}",
+                    self.outcome_colored(&result.outcome),
+                    result.name,
+                    duration_str.dimmed(),
+                    "(updated)".blue()
+                );
+            }
+            TestOutcome::SnapshotMismatch { .. } => {
+                // Print status line, store for later detailed output
+                println!(
+                    "  [{}] {:<40} {}",
+                    self.outcome_colored(&result.outcome),
+                    result.name,
+                    duration_str.dimmed()
+                );
+                self.failed_tests.push(result.clone());
+            }
         }
     }
 
@@ -124,6 +155,18 @@ impl OutputFormat for PrettyOutput {
                             println!("   {}", line.red());
                         }
                     }
+                    TestOutcome::SnapshotMismatch { diff, .. } => {
+                        println!("   {}", "Snapshot mismatch:".yellow());
+                        for line in diff.lines() {
+                            if line.starts_with('+') {
+                                println!("   {}", line.green());
+                            } else if line.starts_with('-') {
+                                println!("   {}", line.red());
+                            } else {
+                                println!("   {line}");
+                            }
+                        }
+                    }
                     _ => {}
                 }
                 println!();
@@ -145,6 +188,20 @@ impl OutputFormat for PrettyOutput {
         }
         if summary.errors > 0 {
             parts.push(format!("{} errors", summary.errors).red().to_string());
+        }
+        if summary.snapshots_new > 0 {
+            parts.push(
+                format!("{} new snapshots", summary.snapshots_new)
+                    .cyan()
+                    .to_string(),
+            );
+        }
+        if summary.snapshots_updated > 0 {
+            parts.push(
+                format!("{} updated snapshots", summary.snapshots_updated)
+                    .blue()
+                    .to_string(),
+            );
         }
 
         println!("  {}", parts.join(", "));

@@ -1,0 +1,18 @@
+[package]
+name = "turso-dbhash"
+version.workspace = true
+edition = "2021"
+description = "Compute SHA1 hash of SQLite database content"
+
+[[bin]]
+name = "turso-dbhash"
+path = "src/main.rs"
+
+[dependencies]
+turso_core = { workspace = true, features = ["fs"] }
+sha1 = "0.10"
+clap = { workspace = true, features = ["derive"] }
+hex = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

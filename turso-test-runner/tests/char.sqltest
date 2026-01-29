@@ -1,5 +1,46 @@
 @database :memory:
 
+test char {
+    select char(108, 105)
+}
+expect {
+    li
+}
+
+test char-nested {
+    select char(106 + 2, 105)
+}
+expect {
+    li
+}
+
+test char-empty {
+    select char()
+}
+expect {
+}
+
+test char-null {
+    select hex(char(null))
+}
+expect {
+    00
+}
+
+test char-non-integer {
+    select char('a')
+}
+expect {
+}
+
+# char() with unicode codepoints >= 256
+test char-unicode-256 {
+    select unicode(char(256))
+}
+expect {
+    256
+}
+
 test char-basic-ascii {
     SELECT CHAR(65, 66, 67);
 }
@@ -61,5 +102,26 @@ test char-over-max-replacement {
 }
 expect {
     EFBFBD
+}
+
+test char-null-produces-nul {
+    SELECT HEX(CHAR(NULL));
+}
+expect {
+    00
+}
+
+test char-null-in-middle {
+    SELECT HEX(CHAR(65, NULL, 66));
+}
+expect {
+    410042
+}
+
+test char-multiple-nulls {
+    SELECT HEX(CHAR(NULL, 65, NULL, NULL, 66, NULL));
+}
+expect {
+    004100004200
 }
 

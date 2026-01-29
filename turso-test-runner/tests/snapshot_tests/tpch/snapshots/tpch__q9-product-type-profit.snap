@@ -1,0 +1,149 @@
+---
+source: tpch.sqltest
+expression: |-
+  select
+          nation,
+          o_year,
+          sum(amount) as sum_profit
+      from
+          (
+              select
+                  n_name as nation,
+                  substr(o_orderdate, 1, 4) as o_year,
+                  l_extendedprice * (1 - l_discount) - ps_supplycost * l_quantity as amount
+              from
+                  part,
+                  supplier,
+                  lineitem,
+                  partsupp,
+                  orders,
+                  nation
+              where
+                  s_suppkey = l_suppkey
+                  and ps_suppkey = l_suppkey
+                  and ps_partkey = l_partkey
+                  and p_partkey = l_partkey
+                  and o_orderkey = l_orderkey
+                  and s_nationkey = n_nationkey
+                  and p_name like '%yellow%'
+          ) as profit
+      group by
+          nation,
+          o_year
+      order by
+          nation,
+          o_year desc;
+info:
+  statement_type: SELECT
+  tables:
+  - part
+  setup_blocks:
+  - schema
+  database: ':memory:'
+---
+QUERY PLAN
+`--SCAN profit
+   |--SEARCH part USING INTEGER PRIMARY KEY (rowid=?)
+   |--SEARCH supplier USING INTEGER PRIMARY KEY (rowid=?)
+   |--SCAN lineitem
+   |--SEARCH partsupp USING INDEX sqlite_autoindex_partsupp_1
+   |--SEARCH orders USING INTEGER PRIMARY KEY (rowid=?)
+   `--SEARCH nation USING INTEGER PRIMARY KEY (rowid=?)
+
+BYTECODE
+addr  opcode                    p1  p2  p3  p4                                     p5  comment
+   0          Init               0  92   0                                          0  Start at 92
+   1          InitCoroutine      1  45   2                                          0
+   2          OpenRead           0   4   0  k(9,B,B,B,B,B,B,B,B,B)                  0  table=part, root=4, iDb=0
+   3          OpenRead           1   5   0  k(7,B,B,B,B,B,B,B)                      0  table=supplier, root=5, iDb=0
+   4          OpenRead           2  10   0  k(17,B,B,B,B,B,B,B,B,B,B,B,B,B,B,B,B)   0  table=lineitem, root=10, iDb=0
+   5          OpenRead           3   6   0  k(6,B,B,B,B,B)                          0  table=partsupp, root=6, iDb=0
+   6          OpenRead           4   7   0  k(3,B,B)                                0  index=sqlite_autoindex_partsupp_1, root=7, iDb=0
+   7          OpenRead           5   9   0  k(9,B,B,B,B,B,B,B,B,B)                  0  table=orders, root=9, iDb=0
+   8          OpenRead           6   2   0  k(4,B,B,B,B)                            0  table=nation, root=2, iDb=0
+   9          Rewind             2  44   0                                          0  Rewind table lineitem
+  10            Column           2   1   5                                          0  r[5]=lineitem.l_partkey
+  11            SeekRowid        0   5  43                                          0  if (r[5]!=cursor 0 for table part.rowid) goto 43
+  12            Column           0   1   8                                          0  r[8]=part.p_name
+  13            Function         1   7   6  like(2)                                 0  r[6]=func(r[7..8])
+  14            IfNot            6  43   1                                          0  if !r[6] goto 43
+  15            Column           2   2   9                                          0  r[9]=lineitem.l_suppkey
+  16            SeekRowid        1   9  43                                          0  if (r[9]!=cursor 1 for table supplier.rowid) goto 43
+  17            Column           1   3  10                                          0  r[10]=supplier.s_nationkey
+  18            SeekRowid        6  10  43                                          0  if (r[10]!=cursor 6 for table nation.rowid) goto 43
+  19            Column           2   0  11                                          0  r[11]=lineitem.l_orderkey
+  20            SeekRowid        5  11  43                                          0  if (r[11]!=cursor 5 for table orders.rowid) goto 43
+  21            Column           2   1  12                                          0  r[12]=lineitem.l_partkey
+  22            Column           2   2  13                                          0  r[13]=lineitem.l_suppkey
+  23            Affinity        12   2   0                                          0  r[12..14] = C, C
+  24            SeekGE           4  43  12                                          0  key=[12..13]
+  25              IdxGT          4  43  12                                          0  key=[12..13]
+  26              DeferredSeek   4   3   0                                          0
+  27              Column         6   1   2                                          0  r[2]=nation.n_name
+  28              Column         5   4  14                                          0  r[14]=orders.o_orderdate
+  29              Integer        1  15   0                                          0  r[15]=1
+  30              Integer        4  16   0                                          0  r[16]=4
+  31              Function       0  14   3  substr                                  0  r[3]=func(r[14..16])
+  32              Column         2   5  19                                          0  r[19]=lineitem.l_extendedprice
+  33              Integer        1  21   0                                          0  r[21]=1
+  34              Column         2   6  22                                          0  r[22]=lineitem.l_discount
+  35              Subtract      21  22  20                                          0  r[20]=r[21]-r[22]
+  36              Multiply      19  20  17                                          0  r[17]=r[19]*r[20]
+  37              Column         3   3  23                                          0  r[23]=partsupp.ps_supplycost
+  38              Column         2   4  24                                          0  r[24]=lineitem.l_quantity
+  39              Multiply      23  24  18                                          0  r[18]=r[23]*r[24]
+  40              Subtract      17  18   4                                          0  r[4]=r[17]-r[18]
+  41              Yield          1   0   0                                          0
+  42            Next             4  25   0                                          0
+  43          Next               2  10   0                                          0
+  44          EndCoroutine       1   0   0                                          0
+  45          Null               0  35   0                                          0  r[35]=NULL
+  46          SorterOpen         7   3   0  k(2,B,-B)                               0  cursor=7
+  47          Integer            0  30   0                                          0  r[30]=0; clear group by abort flag
+  48          Null               0  31  32                                          0  r[31..32]=NULL; initialize group by comparison registers to NULL
+  49          Gosub             40  88   0                                          0  ; go to clear accumulator subroutine
+  50          InitCoroutine      1   0   2                                          0
+  51            Yield            1  58   0                                          0
+  52            Copy             2  37   0                                          0  r[37]=r[2]
+  53            Copy             3  38   0                                          0  r[38]=r[3]
+  54            Copy             4  39   0                                          0  r[39]=r[4]
+  55            MakeRecord      37   3  36                                          0  r[36]=mkrec(r[37..39])
+  56            SorterInsert     7  36   0  0                                       0  key=r[36]
+  57          Goto               0  51   0                                          0
+  58          OpenPseudo         8  36   3                                          0  3 columns in r[36]
+  59          SorterSort         7  76   0                                          0
+  60            SorterData       7  36   8                                          0  r[36]=data
+  61            Column           8   0  41                                          0  r[41]=pseudo.column 0
+  62            Column           8   1  42                                          0  r[42]=pseudo.column 1
+  63            Compare         31  41   2  k(2, Binary, Binary)                    0  r[31..32]==r[41..42]
+  64            Jump            65  69  65                                          0  ; start new group if comparison is not equal
+  65            Gosub           28  80   0                                          0  ; check if ended group had data, and output if so
+  66            Move            41  31   2                                          0  r[31..32]=r[41..42]
+  67            IfPos           30  91   0                                          0  r[30]>0 -> r[30]-=0, goto 91; check abort flag
+  68            Gosub           40  88   0                                          0  ; goto clear accumulator subroutine
+  69            Column           8   2  43                                          0  r[43]=pseudo.column 2
+  70            AggStep          0  43  35  sum                                     0  accum=r[35] step(r[43])
+  71            If              29  74   0                                          0  if r[29] goto 74; don't emit group columns if continuing existing group
+  72            Column           8   0  33                                          0  r[33]=pseudo.column 0
+  73            Column           8   1  34                                          0  r[34]=pseudo.column 1
+  74            Integer          1  29   0                                          0  r[29]=1; indicate data in accumulator
+  75          SorterNext         7  60   0                                          0
+  76          Gosub             28  80   0                                          0  ; emit row for final group
+  77          Goto               0  91   0                                          0  ; group by finished
+  78          Integer            1  30   0                                          0  r[30]=1
+  79        Return              28   0   0                                          0
+  80        IfPos               29  82   0                                          0  r[29]>0 -> r[29]-=0, goto 82; output group by row subroutine start
+  81      Return                28   0   0                                          0
+  82      AggFinal               0  35   0  sum                                     0  accum=r[35]
+  83      Copy                  33  25   0                                          0  r[25]=r[33]
+  84      Copy                  34  26   0                                          0  r[26]=r[34]
+  85      Copy                  35  27   0                                          0  r[27]=r[35]
+  86      ResultRow             25   3   0                                          0  output=r[25..27]
+  87    Return                  28   0   0                                          0
+  88    Null                     0  33  35                                          0  r[33..35]=NULL; clear accumulator subroutine start
+  89    Integer                  0  29   0                                          0  r[29]=0
+  90  Return                    40   0   0                                          0
+  91  Halt                       0   0   0                                          0
+  92  Transaction                0   1   8                                          0  iDb=0 tx_mode=Read
+  93  String8                    0   7   0  %yellow%                                0  r[7]='%yellow%'
+  94  Goto                       0   1   0                                          0

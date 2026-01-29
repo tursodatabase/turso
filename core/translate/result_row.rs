@@ -34,6 +34,15 @@ pub fn emit_select_result(
     }
 
     let start_reg = reg_result_cols_start;
+
+    // For EXISTS subqueries, we only need to determine whether any row exists, not its
+    // column values. The result is simply writing `1` to the result register. Evaluating
+    // the actual result columns would be wasted CPU cycles.
+    let skip_column_eval = matches!(
+        plan.query_destination,
+        QueryDestination::ExistsSubqueryResult { .. }
+    );
+
     // For compound selects (UNION, UNION ALL, etc.), multiple subselects may share the same
     // result column registers. If constants are moved to the init section, they can be
     // overwritten by subsequent subselects before being used.
@@ -46,34 +55,37 @@ pub fn emit_select_result(
         plan.query_destination,
         QueryDestination::EphemeralIndex { .. } | QueryDestination::CoroutineYield { .. }
     );
-    for (i, rc) in plan.result_columns.iter().enumerate().filter(|(_, rc)| {
-        // For aggregate queries, we handle columns differently; example: select id, first_name, sum(age) from users limit 1;
-        // 1. Columns with aggregates (e.g., sum(age)) are computed in each iteration of aggregation
-        // 2. Non-aggregate columns (e.g., id, first_name) are only computed once in the first iteration
-        // This filter ensures we only emit expressions for non aggregate columns once,
-        // preserving previously calculated values while updating aggregate results
-        // For all other queries where reg_nonagg_emit_once_flag is none we do nothing.
-        reg_nonagg_emit_once_flag.is_some() && rc.contains_aggregates
-            || reg_nonagg_emit_once_flag.is_none()
-    }) {
-        let reg = start_reg + i;
-        if disable_constant_opt {
-            translate_expr_no_constant_opt(
-                program,
-                Some(&plan.table_references),
-                &rc.expr,
-                reg,
-                resolver,
-                NoConstantOptReason::RegisterReuse,
-            )?;
-        } else {
-            translate_expr(
-                program,
-                Some(&plan.table_references),
-                &rc.expr,
-                reg,
-                resolver,
-            )?;
+
+    if !skip_column_eval {
+        for (i, rc) in plan.result_columns.iter().enumerate().filter(|(_, rc)| {
+            // For aggregate queries, we handle columns differently; example: select id, first_name, sum(age) from users limit 1;
+            // 1. Columns with aggregates (e.g., sum(age)) are computed in each iteration of aggregation
+            // 2. Non-aggregate columns (e.g., id, first_name) are only computed once in the first iteration
+            // This filter ensures we only emit expressions for non aggregate columns once,
+            // preserving previously calculated values while updating aggregate results
+            // For all other queries where reg_nonagg_emit_once_flag is none we do nothing.
+            reg_nonagg_emit_once_flag.is_some() && rc.contains_aggregates
+                || reg_nonagg_emit_once_flag.is_none()
+        }) {
+            let reg = start_reg + i;
+            if disable_constant_opt {
+                translate_expr_no_constant_opt(
+                    program,
+                    Some(&plan.table_references),
+                    &rc.expr,
+                    reg,
+                    resolver,
+                    NoConstantOptReason::RegisterReuse,
+                )?;
+            } else {
+                translate_expr(
+                    program,
+                    Some(&plan.table_references),
+                    &rc.expr,
+                    reg,
+                    resolver,
+                )?;
+            }
         }
     }
 

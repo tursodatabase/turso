@@ -332,6 +332,22 @@ pub extern "C" fn turso_statement_column_count(statement: *const c::turso_statem
 
 #[no_mangle]
 #[signature(c)]
+pub extern "C" fn turso_statement_column_decltype(
+    statement: *const c::turso_statement_t,
+    index: usize,
+) -> *const std::ffi::c_char {
+    let statement = match unsafe { TursoStatement::ref_from_capi(statement) } {
+        Ok(statement) => statement,
+        Err(_) => return std::ptr::null(),
+    };
+    match statement.column_decltype(index) {
+        Some(decltype) => str_to_c_string(&decltype),
+        None => std::ptr::null(),
+    }
+}
+
+#[no_mangle]
+#[signature(c)]
 pub extern "C" fn turso_statement_row_value_kind(
     statement: *const c::turso_statement_t,
     index: usize,

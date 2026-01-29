@@ -152,7 +152,30 @@ spotless {
         target("**/*.java")
         targetExclude(layout.buildDirectory.dir("**/*.java").get().asFile)
         targetExclude("example/**/*.java")
+        targetExclude("src/main/java/examples/**/*.java")
         removeUnusedImports()
         googleJavaFormat("1.7") // or use eclipse().configFile("path/to/eclipse-format.xml")
     }
+}
+
+// Task to run the encryption example
+tasks.register<JavaExec>("runEncryptionExample") {
+    group = "examples"
+    description = "Run the local database encryption example"
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("examples.EncryptionExample")
+
+    // Set the library path for native bindings
+    // Check multiple possible locations for the native library
+    val limboRoot = projectDir.parentFile.parentFile
+    val tursoLibraryPath = System.getenv("TURSO_LIBRARY_PATH")
+        ?: listOf(
+            "${projectDir}/src/main/resources/libs/macos_arm64",
+            "${projectDir}/src/main/resources/libs/linux_x64",
+            "${projectDir}/build/resources/main/libs/macos_arm64",
+            "${projectDir}/build/resources/main/libs/linux_x64",
+            "${limboRoot}/target/debug",
+            "${limboRoot}/target/release"
+        ).joinToString(":")
+    jvmArgs = listOf("-Djava.library.path=${System.getProperty("java.library.path")}:$tursoLibraryPath")
 }

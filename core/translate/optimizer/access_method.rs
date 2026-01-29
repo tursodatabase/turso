@@ -7,7 +7,8 @@ use crate::translate::expr::{as_binary_components, walk_expr, WalkControl};
 use crate::translate::optimizer::constraints::{
     convert_to_vtab_constraint, BinaryExprSide, Constraint, RangeConstraintRef,
 };
-use crate::translate::optimizer::cost::{RowCountEstimate, ESTIMATED_HARDCODED_ROWS_PER_PAGE};
+use crate::translate::optimizer::cost::RowCountEstimate;
+use crate::translate::optimizer::cost_params::CostModelParams;
 use crate::translate::plan::{HashJoinKey, NonFromClauseSubquery, SubqueryState, WhereTerm};
 use crate::util::exprs_are_equivalent;
 use crate::vdbe::hash_table::DEFAULT_MEM_BUDGET;
@@ -96,6 +97,7 @@ pub fn find_best_access_method_for_join_order(
     maybe_order_target: Option<&OrderTarget>,
     input_cardinality: f64,
     base_row_count: RowCountEstimate,
+    params: &CostModelParams,
 ) -> Result<Option<AccessMethod>> {
     match &rhs_table.table {
         Table::BTree(_) => find_best_access_method_for_btree(
@@ -105,6 +107,7 @@ pub fn find_best_access_method_for_join_order(
             maybe_order_target,
             input_cardinality,
             base_row_count,
+            params,
         ),
         Table::Virtual(vtab) => find_best_access_method_for_vtab(
             vtab,
@@ -112,9 +115,18 @@ pub fn find_best_access_method_for_join_order(
             join_order,
             input_cardinality,
             base_row_count,
+            params,
         ),
         Table::FromClauseSubquery(_) => Ok(Some(AccessMethod {
-            cost: estimate_cost_for_scan_or_seek(None, &[], &[], input_cardinality, base_row_count),
+            cost: estimate_cost_for_scan_or_seek(
+                None,
+                &[],
+                &[],
+                input_cardinality,
+                base_row_count,
+                false,
+                params,
+            ),
             params: AccessMethodParams::Subquery,
         })),
     }
@@ -127,10 +139,18 @@ fn find_best_access_method_for_btree(
     maybe_order_target: Option<&OrderTarget>,
     input_cardinality: f64,
     base_row_count: RowCountEstimate,
+    params: &CostModelParams,
 ) -> Result<Option<AccessMethod>> {
     let table_no = join_order.last().unwrap().table_id;
-    let mut best_cost =
-        estimate_cost_for_scan_or_seek(None, &[], &[], input_cardinality, base_row_count);
+    let mut best_cost = estimate_cost_for_scan_or_seek(
+        None,
+        &[],
+        &[],
+        input_cardinality,
+        base_row_count,
+        false,
+        params,
+    );
     let mut best_params = AccessMethodParams::BTreeTable {
         iter_dir: IterationDirection::Forwards,
         index: None,
@@ -159,16 +179,9 @@ fn find_best_access_method_for_btree(
                 column_count: 1,
             },
         };
-        let cost = estimate_cost_for_scan_or_seek(
-            Some(index_info),
-            &rhs_constraints.constraints,
-            &usable_constraint_refs,
-            input_cardinality,
-            base_row_count,
-        );
 
-        // All other things being equal, prefer an access method that satisfies the order target.
-        let (iter_dir, order_satisfiability_bonus) = if let Some(order_target) = maybe_order_target
+        let (iter_dir, is_index_ordered, order_satisfiability_bonus) = if let Some(order_target) =
+            maybe_order_target
         {
             // If the index delivers rows in the same direction (or the exact reverse direction) as the order target, then it
             // satisfies the order target.
@@ -211,21 +224,38 @@ fn find_best_access_method_for_btree(
                     all_same_direction = false;
                 }
             }
-            if all_same_direction || all_opposite_direction {
+
+            let satisfies_order =
+                (all_same_direction || all_opposite_direction) && !order_target.0.is_empty();
+            if satisfies_order {
+                // Bonus = estimated sort cost saved. Sorting is O(n log n).
+                let n = *base_row_count;
+                let sort_cost_saved = Cost(n * (n.max(1.0).log2()) * params.sort_cpu_per_row);
                 (
                     if all_same_direction {
                         IterationDirection::Forwards
                     } else {
                         IterationDirection::Backwards
                     },
-                    Cost(1.0),
+                    true,
+                    sort_cost_saved,
                 )
             } else {
-                (IterationDirection::Forwards, Cost(0.0))
+                (IterationDirection::Forwards, false, Cost(0.0))
             }
         } else {
-            (IterationDirection::Forwards, Cost(0.0))
+            (IterationDirection::Forwards, false, Cost(0.0))
         };
+
+        let cost = estimate_cost_for_scan_or_seek(
+            Some(index_info),
+            &rhs_constraints.constraints,
+            &usable_constraint_refs,
+            input_cardinality,
+            base_row_count,
+            is_index_ordered,
+            params,
+        );
         if cost < best_cost + order_satisfiability_bonus {
             best_cost = cost;
             best_params = AccessMethodParams::BTreeTable {
@@ -248,6 +278,7 @@ fn find_best_access_method_for_vtab(
     join_order: &[JoinOrderMember],
     input_cardinality: f64,
     base_row_count: RowCountEstimate,
+    params: &CostModelParams,
 ) -> Result<Option<AccessMethod>> {
     let vtab_constraints = convert_to_vtab_constraint(constraints, join_order);
 
@@ -265,6 +296,8 @@ fn find_best_access_method_for_vtab(
                     &[],
                     input_cardinality,
                     base_row_count,
+                    false,
+                    params,
                 ),
                 params: AccessMethodParams::VirtualTable {
                     idx_num: index_info.idx_num,
@@ -325,7 +358,7 @@ pub fn find_equijoin_conditions(
         let Ok(Some((lhs, op, rhs))) = as_binary_components(&where_term.expr) else {
             continue;
         };
-        if !matches!(op, ast::Operator::Equals) {
+        if !matches!(op.as_ast_operator(), Some(ast::Operator::Equals)) {
             continue;
         }
 
@@ -376,32 +409,29 @@ pub fn estimate_hash_join_cost(
     probe_cardinality: f64,
     mem_budget: usize,
     probe_multiplier: f64,
+    params: &CostModelParams,
 ) -> Cost {
-    const CPU_HASH_COST: f64 = 0.001;
-    const CPU_INSERT_COST: f64 = 0.002;
-    const CPU_LOOKUP_COST: f64 = 0.003;
-    const BYTES_PER_ROW_ESTIMATE: usize = 100;
-
     // Estimate if the hash table will fit in memory based on actual row counts
     let estimated_hash_table_size =
-        (build_cardinality as usize).saturating_mul(BYTES_PER_ROW_ESTIMATE);
+        (build_cardinality as usize).saturating_mul(params.hash_bytes_per_row as usize);
     let will_spill = estimated_hash_table_size > mem_budget;
 
     // Build phase: hash and insert all rows from build table (one-time cost)
     // With real ANALYZE stats, this accurately reflects the actual build table size
-    let build_cost = build_cardinality * (CPU_HASH_COST + CPU_INSERT_COST);
+    let build_cost = build_cardinality * (params.hash_cpu_cost + params.hash_insert_cost);
 
     // Probe phase: scan probe table, hash each row and lookup in hash table.
     // If the hash-join probe loop is nested under prior tables, the probe
     // scan repeats per outer row, so scale by probe_multiplier.
-    let probe_cost = probe_cardinality * (CPU_HASH_COST + CPU_LOOKUP_COST) * probe_multiplier;
+    let probe_cost =
+        probe_cardinality * (params.hash_cpu_cost + params.hash_lookup_cost) * probe_multiplier;
 
     // Spill cost: if hash table exceeds memory budget, we need to write/read partitions to disk.
     // Grace hash join writes partitions and reads them back, so it's 2x the page IO.
     // Use page-based IO cost (rows / rows_per_page) rather than per-row IO.
     let spill_cost = if will_spill {
-        let build_pages = (build_cardinality / ESTIMATED_HARDCODED_ROWS_PER_PAGE as f64).ceil();
-        let probe_pages = (probe_cardinality / ESTIMATED_HARDCODED_ROWS_PER_PAGE as f64).ceil();
+        let build_pages = (build_cardinality / params.rows_per_page).ceil();
+        let probe_pages = (probe_cardinality / params.rows_per_page).ceil();
         // Write both sides to partitions, then read back: 2 * (build_pages + probe_pages)
         (build_pages + probe_pages) * 2.0 * probe_multiplier
     } else {
@@ -425,6 +455,7 @@ pub fn try_hash_join_access_method(
     probe_cardinality: f64,
     probe_multiplier: f64,
     subqueries: &[NonFromClauseSubquery],
+    params: &CostModelParams,
 ) -> Option<AccessMethod> {
     // Only works for B-tree tables
     if !matches!(build_table.table, Table::BTree(_))
@@ -582,6 +613,7 @@ pub fn try_hash_join_access_method(
         probe_cardinality,
         DEFAULT_MEM_BUDGET,
         probe_multiplier,
+        params,
     );
     Some(AccessMethod {
         cost,

@@ -1,0 +1,615 @@
+@database :memory:
+
+# SIMPLE SMOKE TESTS THAT DO NOT DEPEND ON SPECIFIC DATABASE ROWS
+test collate_nocase {
+    SELECT 'hat' == 'hAt' COLLATE NOCASE;
+}
+expect {
+    1
+}
+
+test collate_binary_1 {
+    SELECT 'hat' == 'hAt' COLLATE BINARY;
+}
+expect {
+    0
+}
+
+test collate_binary_2 {
+    SELECT 'hat' == 'hat' COLLATE BINARY;
+}
+expect {
+    1
+}
+
+test collate_rtrim_1 {
+    SELECT 'hat' == 'hAt ' COLLATE RTRIM;
+}
+expect {
+    0
+}
+
+test collate_rtrim_2 {
+    SELECT 'hat' == 'hat ' COLLATE RTRIM;
+}
+expect {
+    1
+}
+
+test collate_rtrim_3 {
+    SELECT 'hat' == ' hAt ' COLLATE RTRIM;
+}
+expect {
+    0
+}
+
+test collate_rtrim_4 {
+    SELECT 'hat' == ' hat ' COLLATE RTRIM;
+}
+expect {
+    0
+}
+
+test collate_left_precedence {
+    SELECT 'hat' COLLATE BINARY == 'hAt' COLLATE NOCASE;
+}
+expect {
+    0
+}
+
+test collate_left_precedence_2 {
+    SELECT 'hat' COLLATE NOCASE == 'hAt' COLLATE BINARY;
+}
+expect {
+    1
+}
+
+
+
+test collate_unique_constraint {
+    CREATE TABLE t (a TEXT COLLATE NOCASE PRIMARY KEY);
+    INSERT INTO t VALUES ('lol'), ('LOL'), ('lOl');
+}
+expect error {
+}
+
+test collate_unique_constraint-2 {
+    CREATE TABLE t (a TEXT COLLATE NOCASE PRIMARY KEY);
+    INSERT INTO t VALUES ('lol'), ('LOL'), ('lOl');
+}
+expect error {
+}
+
+test collate_aggregation_default_binary {
+    create table fruits(name collate binary);
+    insert into fruits(name) values ('Apple') ,('banana') ,('CHERRY');
+    select max(name) from fruits;
+}
+expect {
+    banana
+}
+
+test collate_aggregation_default_nocase {
+    create table fruits(name collate nocase);
+    insert into fruits(name) values ('Apple') ,('banana') ,('CHERRY');
+    select max(name) from fruits;
+}
+expect {
+    CHERRY
+}
+
+test collate_aggregation_explicit_binary {
+    create table fruits(name collate nocase);
+    insert into fruits(name) values ('Apple') ,('banana') ,('CHERRY');
+    select max(name collate binary) from fruits;
+}
+expect {
+    banana
+}
+
+test collate_aggregation_explicit_nocase {
+    create table fruits(name collate binary);
+    insert into fruits(name) values ('Apple') ,('banana') ,('CHERRY');
+    select max(name collate nocase) from fruits;
+}
+expect {
+    CHERRY
+}
+
+test collate_grouped_aggregation_default_binary {
+    create table fruits(name collate binary, category text);
+    insert into fruits(name, category) values ('Apple', 'A'), ('banana', 'A'), ('CHERRY', 'B'), ('blueberry', 'B');
+    select max(name) from fruits group by category;
+}
+expect {
+    banana
+    blueberry
+}
+
+test collate_grouped_aggregation_default_nocase {
+    create table fruits(name collate nocase, category text);
+    insert into fruits(name, category) values ('Apple', 'A'), ('banana', 'A'), ('CHERRY', 'B'), ('blueberry', 'B');
+    select max(name) from fruits group by category;
+}
+expect {
+    banana
+    CHERRY
+}
+
+test collate_grouped_aggregation_explicit_binary {
+    create table fruits(name collate nocase, category text);
+    insert into fruits(name, category) values ('Apple', 'A'), ('banana', 'A'), ('CHERRY', 'B'), ('blueberry', 'B');
+    select max(name collate binary) from fruits group by category;
+}
+expect {
+    banana
+    blueberry
+}
+
+test collate_groupped_aggregation_explicit_nocase {
+    create table fruits(name collate binary, category text);
+    insert into fruits(name, category) values ('Apple', 'A'), ('banana', 'A'), ('CHERRY', 'B'), ('blueberry', 'B');
+    select max(name collate nocase) from fruits group by category;
+}
+expect {
+    banana
+    CHERRY
+}
+
+test collate_join_nocase {
+    CREATE TABLE a(s TEXT);
+    CREATE TABLE b(s TEXT);
+    INSERT INTO a VALUES ('A');
+    INSERT INTO b VALUES ('a');
+    SELECT a.s, b.s FROM a JOIN b ON a.s COLLATE NOCASE = b.s;
+}
+expect {
+    A|a
+}
+
+test collate_columns_where_implicit {
+    CREATE TABLE t(
+    a TEXT COLLATE NOCASE,
+    b TEXT COLLATE BINARY,
+    c TEXT COLLATE RTRIM
+    );
+    INSERT INTO t(a,b,c) VALUES
+    ('hat','hat','hat '),
+    ('hAt','hAt','hat'),
+    ('HAT','HAT','hat    '),
+    ('other','other','other');
+    SELECT count(*) FROM t WHERE a = 'hAt';
+    SELECT count(*) FROM t WHERE b = 'hAt';
+    SELECT count(*) FROM t WHERE c = 'hat';
+}
+expect {
+    3
+    1
+    3
+}
+
+test collate_columns_where_explicit_override {
+    CREATE TABLE t(
+    a TEXT COLLATE NOCASE,
+    b TEXT COLLATE BINARY,
+    c TEXT COLLATE RTRIM
+    );
+    INSERT INTO t(a,b,c) VALUES
+    ('hat','hat','hat '),
+    ('hAt','hAt','hat'),
+    ('HAT','HAT','hat    '),
+    ('other','other','other');
+    SELECT count(*) FROM t WHERE a COLLATE BINARY = 'hAt';   -- override to binary
+    SELECT count(*) FROM t WHERE b COLLATE NOCASE = 'hAt';   -- override to nocase
+    SELECT count(*) FROM t WHERE c COLLATE BINARY = 'hat';   -- override to binary
+}
+expect {
+    1
+    3
+    1
+}
+
+test collate_order_by_binary {
+    CREATE TABLE words(w TEXT COLLATE BINARY);
+    INSERT INTO words(w) VALUES ('Apple'), ('banana'), ('CHERRY');
+    SELECT w FROM words ORDER BY w;
+}
+expect {
+    Apple
+    CHERRY
+    banana
+}
+
+test collate_order_by_nocase {
+    CREATE TABLE words(w TEXT COLLATE NOCASE);
+    INSERT INTO words(w) VALUES ('Apple'), ('banana'), ('CHERRY');
+    SELECT w FROM words ORDER BY w;
+}
+expect {
+    Apple
+    banana
+    CHERRY
+}
+
+test collate_order_by_explicit_override {
+    CREATE TABLE words(w TEXT COLLATE NOCASE);
+    INSERT INTO words(w) VALUES ('Apple'), ('banana'), ('CHERRY');
+    SELECT w FROM words ORDER BY w COLLATE BINARY;
+}
+expect {
+    Apple
+    CHERRY
+    banana
+}
+
+test collate_distinct_rtrim {
+    CREATE TABLE t(c TEXT COLLATE RTRIM);
+    INSERT INTO t(c) VALUES ('x'), ('x '), ('x  '), ('y'), ('y  ');
+    SELECT count(DISTINCT c) FROM t;
+}
+expect {
+    2
+}
+
+test collate_unique_nocase_conflict {
+    CREATE TABLE u(a TEXT COLLATE NOCASE UNIQUE);
+    INSERT INTO u VALUES ('aa');
+    INSERT INTO u VALUES ('AA');
+}
+expect error {
+}
+
+test collate_unique_rtrim_conflict {
+    CREATE TABLE r(a TEXT COLLATE RTRIM UNIQUE);
+    INSERT INTO r VALUES ('bb');
+    INSERT INTO r VALUES ('bb ');
+}
+expect error {
+}
+
+test collate_unique_binary_allows_case {
+    CREATE TABLE ub(a TEXT COLLATE BINARY UNIQUE);
+    INSERT INTO ub VALUES ('aa');
+    INSERT INTO ub VALUES ('AA');
+    SELECT count(*) FROM ub;
+}
+expect {
+    2
+}
+
+test collate_pk_rtrim_conflict {
+    CREATE TABLE p(a TEXT COLLATE RTRIM PRIMARY KEY);
+    INSERT INTO p VALUES ('key');
+    INSERT INTO p VALUES ('key   ');
+}
+expect error {
+}
+
+test collate_join_implicit_nocase_columns {
+    CREATE TABLE a(s TEXT COLLATE NOCASE);
+    CREATE TABLE b(s TEXT COLLATE NOCASE);
+    INSERT INTO a VALUES ('A');
+    INSERT INTO b VALUES ('a');
+    SELECT a.s, b.s FROM a JOIN b ON a.s = b.s;
+}
+expect {
+    A|a
+}
+
+test collate_join_mixed_implicit_binary_left {
+    CREATE TABLE a(s TEXT COLLATE BINARY);
+    CREATE TABLE b(s TEXT COLLATE NOCASE);
+    INSERT INTO a VALUES ('A');
+    INSERT INTO b VALUES ('a');
+    SELECT a.s, b.s FROM a JOIN b ON a.s = b.s;
+}
+expect {
+}
+
+test collate_join_mixed_explicit_nocase_left {
+    CREATE TABLE a(s TEXT COLLATE BINARY);
+    CREATE TABLE b(s TEXT COLLATE NOCASE);
+    INSERT INTO a VALUES ('A');
+    INSERT INTO b VALUES ('a');
+    SELECT a.s, b.s FROM a JOIN b ON a.s COLLATE NOCASE = b.s;
+}
+expect {
+    A|a
+}
+
+test collate_where_with_and_without_explicit {
+    CREATE TABLE t(a TEXT COLLATE NOCASE, b TEXT COLLATE BINARY, c TEXT COLLATE RTRIM);
+    INSERT INTO t VALUES ('Foo','Foo','Foo '), ('fOo','fOo','Foo'), ('other','other','other');
+    -- implicit uses column collation
+    SELECT count(*) FROM t WHERE a = 'foo';
+    -- explicit override on binary column
+    SELECT count(*) FROM t WHERE b COLLATE NOCASE = 'foo';
+    -- implicit RTRIM on c
+    SELECT count(*) FROM t WHERE c = 'Foo';
+    -- explicit override to BINARY on RTRIM column
+    SELECT count(*) FROM t WHERE c COLLATE BINARY = 'Foo';
+}
+expect {
+    2
+    2
+    2
+    1
+}
+
+test collate_group_by_implicit_nocase {
+    CREATE TABLE t(s TEXT COLLATE NOCASE);
+    INSERT INTO t VALUES ('A'), ('a'), ('B'), ('b');
+    SELECT s, count(*) FROM t GROUP BY s ORDER BY s;
+}
+expect {
+    A|2
+    B|2
+}
+
+test collate_group_by_implicit_rtrim {
+    CREATE TABLE t(s TEXT COLLATE RTRIM);
+    INSERT INTO t VALUES ('A'), ('A '), ('B'), ('B  ');
+    SELECT s, count(*) FROM t GROUP BY s ORDER BY s;
+}
+expect {
+    A|2
+    B|2
+}
+
+test collate_group_by_explicit_override {
+    CREATE TABLE t(s TEXT COLLATE BINARY);
+    INSERT INTO t VALUES ('A'), ('a'), ('B'), ('b');
+    SELECT s, count(*) FROM t GROUP BY s COLLATE NOCASE ORDER BY s;
+}
+expect {
+    A|2
+    B|2
+}
+
+test collate_group_by_mixed_columns {
+    CREATE TABLE t(a TEXT COLLATE NOCASE, b TEXT COLLATE RTRIM);
+    INSERT INTO t VALUES ('A', 'x'), ('a', 'x '), ('B', 'y'), ('b', 'y  ');
+    SELECT a, b, count(*) FROM t GROUP BY a, b ORDER BY a, b;
+}
+expect {
+    A|x|2
+    B|y|2
+}
+
+test collate_subquery_preserves_column_collation {
+    CREATE TABLE t(a TEXT COLLATE NOCASE, b TEXT COLLATE BINARY);
+    INSERT INTO t VALUES ('A', 'A'), ('a', 'a'), ('B', 'B'), ('b', 'b');
+    -- Subquery preserves NOCASE collation
+    SELECT count(*) FROM (SELECT a FROM t) WHERE a = 'a';
+    -- Subquery preserves BINARY collation
+    SELECT count(*) FROM (SELECT b FROM t) WHERE b = 'a';
+}
+expect {
+    2
+    1
+}
+
+test collate_subquery_preserves_explicit_collation {
+    CREATE TABLE t(a TEXT COLLATE BINARY, b TEXT COLLATE BINARY);
+    INSERT INTO t VALUES ('A', 'A'), ('a', 'a'), ('B', 'B'), ('b', 'b');
+    -- Explicit NOCASE in subquery is preserved
+    SELECT count(*) FROM (SELECT a COLLATE NOCASE as a FROM t) WHERE a = 'a';
+    -- Explicit BINARY in subquery is preserved
+    SELECT count(*) FROM (SELECT b COLLATE BINARY as b FROM t) WHERE b = 'a';
+}
+expect {
+    2
+    1
+}
+
+test collate_subquery_preserves_collation_in_order_by {
+    CREATE TABLE t(a TEXT COLLATE NOCASE, b TEXT COLLATE BINARY);
+    INSERT INTO t VALUES ('A', 'A'), ('b', 'b'), ('C', 'C');
+    -- ORDER BY in subquery preserves NOCASE collation
+    SELECT a FROM (SELECT a FROM t ORDER BY a);
+    -- ORDER BY in subquery preserves BINARY collation
+    SELECT b FROM (SELECT b FROM t ORDER BY b);
+}
+expect {
+    A
+    b
+    C
+    A
+    C
+    b
+}
+
+# =============================================================================
+# ORDER BY COLLATION vs INDEX COLLATION TESTS
+# =============================================================================
+# These tests verify that when ORDER BY uses a different collation than the
+# index, the optimizer correctly falls back to table scan + sort instead of
+# incorrectly using the index (which would produce wrong ordering).
+# ORDER BY COLLATE BINARY should not use an index
+# with COLLATE RTRIM, as the orderings are incompatible.
+test collate_orderby_binary_vs_index_rtrim {
+    CREATE TABLE t1 (c1 TEXT COLLATE RTRIM);
+    INSERT INTO t1 VALUES (' ');
+    CREATE INDEX i1 ON t1 (c1 COLLATE RTRIM DESC);
+    INSERT INTO t1 VALUES ('zzz');
+    SELECT c1, typeof(c1) FROM t1 ORDER BY c1 COLLATE BINARY DESC, rowid ASC;
+}
+expect raw {
+zzz|text
+ |text
+}
+
+# Verify correct ordering with matching collations (index should be usable)
+test collate_orderby_rtrim_matches_index_rtrim {
+    CREATE TABLE t1 (c1 TEXT COLLATE RTRIM);
+    CREATE INDEX i1 ON t1 (c1 COLLATE RTRIM DESC);
+    INSERT INTO t1 VALUES ('a'), ('b'), ('c'), ('d');
+    SELECT c1 FROM t1 ORDER BY c1 COLLATE RTRIM DESC;
+}
+expect {
+    d
+    c
+    b
+    a
+}
+
+# ORDER BY NOCASE should not use BINARY index
+test collate_orderby_nocase_vs_index_binary {
+    CREATE TABLE t1 (c1 TEXT COLLATE BINARY);
+    CREATE INDEX i1 ON t1 (c1 COLLATE BINARY);
+    INSERT INTO t1 VALUES ('Apple'), ('banana'), ('CHERRY'), ('date');
+    SELECT c1 FROM t1 ORDER BY c1 COLLATE NOCASE;
+}
+expect {
+    Apple
+    banana
+    CHERRY
+    date
+}
+
+# ORDER BY BINARY should not use NOCASE index
+test collate_orderby_binary_vs_index_nocase {
+    CREATE TABLE t1 (c1 TEXT COLLATE NOCASE);
+    CREATE INDEX i1 ON t1 (c1 COLLATE NOCASE);
+    INSERT INTO t1 VALUES ('Apple'), ('banana'), ('CHERRY'), ('date');
+    SELECT c1 FROM t1 ORDER BY c1 COLLATE BINARY;
+}
+expect {
+    Apple
+    CHERRY
+    banana
+    date
+}
+
+# Multi-column ORDER BY: first column collation matches, second doesn't
+test collate_orderby_multi_column_mixed {
+    CREATE TABLE t1 (a TEXT COLLATE BINARY, b TEXT COLLATE NOCASE);
+    CREATE INDEX i1 ON t1 (a COLLATE BINARY, b COLLATE NOCASE);
+    INSERT INTO t1 VALUES ('x', 'Apple'), ('x', 'banana'), ('y', 'CHERRY');
+    -- Second column uses BINARY but index has NOCASE - should not use index for full ordering
+    SELECT a, b FROM t1 ORDER BY a COLLATE BINARY, b COLLATE BINARY;
+}
+expect {
+    x|Apple
+    x|banana
+    y|CHERRY
+}
+
+# ORDER BY with implicit column collation vs explicit index collation
+test collate_orderby_implicit_vs_explicit_index {
+    CREATE TABLE t1 (c1 TEXT COLLATE NOCASE);
+    -- Index uses BINARY explicitly, but column defaults to NOCASE
+    CREATE INDEX i1 ON t1 (c1 COLLATE BINARY);
+    INSERT INTO t1 VALUES ('Apple'), ('banana'), ('CHERRY');
+    -- ORDER BY uses column's implicit NOCASE collation
+    SELECT c1 FROM t1 ORDER BY c1;
+}
+expect {
+    Apple
+    banana
+    CHERRY
+}
+
+# Explicit ORDER BY collation overrides column collation
+test collate_orderby_explicit_override_column {
+    CREATE TABLE t1 (c1 TEXT COLLATE NOCASE);
+    CREATE INDEX i1 ON t1 (c1 COLLATE NOCASE);
+    INSERT INTO t1 VALUES ('Apple'), ('banana'), ('CHERRY');
+    -- Explicit BINARY in ORDER BY should not use NOCASE index
+    SELECT c1 FROM t1 ORDER BY c1 COLLATE BINARY;
+}
+expect {
+    Apple
+    CHERRY
+    banana
+}
+
+# Test with rowid tiebreaker - collation mismatch
+test collate_orderby_with_rowid_tiebreaker {
+    CREATE TABLE t1 (c1 TEXT COLLATE RTRIM);
+    CREATE INDEX i1 ON t1 (c1 COLLATE RTRIM);
+    INSERT INTO t1 VALUES ('a');
+    INSERT INTO t1 VALUES ('b');
+    INSERT INTO t1 VALUES ('c');
+    -- BINARY collation should produce correct order
+    SELECT c1, rowid FROM t1 ORDER BY c1 COLLATE BINARY, rowid;
+}
+expect {
+    a|1
+    b|2
+    c|3
+}
+
+# DESC ordering with collation mismatch
+test collate_orderby_desc_collation_mismatch {
+    CREATE TABLE t1 (c1 TEXT);
+    CREATE INDEX i1 ON t1 (c1 COLLATE NOCASE DESC);
+    INSERT INTO t1 VALUES ('a'), ('B'), ('c'), ('D');
+    -- BINARY DESC ordering should not use NOCASE DESC index
+    SELECT c1 FROM t1 ORDER BY c1 COLLATE BINARY DESC;
+}
+expect {
+    c
+    a
+    D
+    B
+}
+
+# Matching collation with DESC - index should be usable
+test collate_orderby_desc_collation_match {
+    CREATE TABLE t1 (c1 TEXT);
+    CREATE INDEX i1 ON t1 (c1 COLLATE NOCASE DESC);
+    INSERT INTO t1 VALUES ('a'), ('B'), ('c'), ('D');
+    SELECT c1 FROM t1 ORDER BY c1 COLLATE NOCASE DESC;
+}
+expect {
+    D
+    c
+    B
+    a
+}
+
+# Test RTRIM vs BINARY - index with RTRIM shouldn't be used for BINARY ordering
+test collate_orderby_rtrim_vs_binary_spaces {
+    CREATE TABLE t1 (c1 TEXT);
+    CREATE INDEX i1 ON t1 (c1 COLLATE RTRIM);
+    INSERT INTO t1 VALUES ('a'), ('B'), ('c'), ('D');
+    -- BINARY ordering is case-sensitive (uppercase before lowercase in ASCII)
+    SELECT c1 FROM t1 ORDER BY c1 COLLATE BINARY;
+}
+expect {
+    B
+    D
+    a
+    c
+}
+
+# Test that index with matching collation is preferred
+test collate_orderby_prefers_matching_index {
+    CREATE TABLE t1 (c1 TEXT);
+    CREATE INDEX i1_nocase ON t1 (c1 COLLATE NOCASE);
+    CREATE INDEX i1_binary ON t1 (c1 COLLATE BINARY);
+    INSERT INTO t1 VALUES ('a'), ('B'), ('c');
+    -- Should use i1_binary for BINARY ordering
+    SELECT c1 FROM t1 ORDER BY c1 COLLATE BINARY;
+}
+expect {
+    B
+    a
+    c
+}
+
+# Expression in ORDER BY with collation
+test collate_orderby_expression_collation {
+    CREATE TABLE t1 (c1 TEXT COLLATE BINARY);
+    CREATE INDEX i1 ON t1 (c1 COLLATE BINARY);
+    INSERT INTO t1 VALUES ('Apple'), ('banana'), ('CHERRY');
+    -- LOWER() result compared with NOCASE
+    SELECT c1 FROM t1 ORDER BY LOWER(c1) COLLATE NOCASE;
+}
+expect {
+    Apple
+    banana
+    CHERRY
+}
+

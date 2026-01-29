@@ -1,0 +1,438 @@
+@database :default:
+@database :default-no-rowidalias:
+
+test cross-join {
+    select * from users, products limit 1;
+}
+expect {
+    1|Dan|Parker|caden@example.org|436.726.1331 x867|Davonte Mountains|Hodkiewicz side|NJ|758|31|1|hat|82.9389679823547
+}
+
+test cross-join-specific-columns {
+    select first_name, price from users, products limit 1;
+}
+expect {
+    Dan|82.9389679823547
+}
+
+test cross-join-where-right-tbl {
+    select users.first_name, products.name from users join products where products.id = 1 limit 2;
+}
+expect {
+    Dan|hat
+    Chaz|hat
+}
+
+test cross-join-where-left-tbl {
+    select users.first_name, products.name from users join products where users.id = 1 limit 2;
+}
+expect {
+    Dan|hat
+    Dan|cap
+}
+
+test inner-join-pk {
+    select users.first_name as user_name, products.name as product_name from users join products on users.id = products.id;
+}
+expect {
+    Dan|hat
+    Chaz|cap
+    Edmond|shirt
+    Krystel|sweater
+    Nikko|sweatshirt
+    Roscoe|shorts
+    Lilly|jeans
+    Darryl|sneakers
+    Lesley|boots
+    Gerald|coat
+    Lexie|accessories
+}
+
+test inner-join-non-pk-unqualified {
+    select first_name, name from users join products on first_name != name limit 1;
+}
+expect {
+    Dan|hat
+}
+
+test inner-join-non-pk-qualified {
+    select users.first_name as user_name, products.name as product_name from users join products on users.first_name = products.name;
+}
+expect {
+}
+
+test inner-join-self {
+    select u1.first_name as user_name, u2.first_name as neighbor_name from users u1 join users as u2 on u1.id = u2.id + 1 limit 1;
+}
+expect {
+    Chaz|Dan
+}
+
+test inner-join-self-with-where {
+    select u1.first_name as user_name, u2.first_name as neighbor_name from users u1 join users as u2 on u1.id = u2.id + 1 where u1.id = 5 limit 1;
+}
+expect {
+    Nikko|Krystel
+}
+
+# Uncomment this test when it works. Sqlite3 returns 'Aaron' due to the way it reorders tables in the join based on the where clause.
+#do_execsql_test inner-join-with-where-2 {
+#    select u.first_name from users u join products as p on u.first_name != p.name where u.last_name = 'Williams' limit 1;
+#} {Laura} <-- sqlite3 returns 'Aaron'
+test inner-join-constant-condition-true {
+    select u.first_name, p.name from users u join products as p where 1 limit 5;
+}
+expect {
+    Dan|hat
+    Dan|cap
+    Dan|shirt
+    Dan|sweater
+    Dan|sweatshirt
+}
+
+test inner-join-constant-condition-false {
+    select u.first_name from users u join products as p where 0 limit 5;
+}
+expect {
+}
+
+test left-join-pk {
+    select users.first_name as user_name, products.name as product_name from users left join products on users.id = products.id limit 12;
+}
+expect {
+    Dan|hat
+    Chaz|cap
+    Edmond|shirt
+    Krystel|sweater
+    Nikko|sweatshirt
+    Roscoe|shorts
+    Lilly|jeans
+    Darryl|sneakers
+    Lesley|boots
+    Gerald|coat
+    Lexie|accessories
+    Benjamin|
+}
+
+test left-join-with-where {
+    select u.first_name, p.name from users u left join products as p on u.id = p.id where u.id >= 10 limit 5;
+}
+expect {
+    Gerald|coat
+    Lexie|accessories
+    Benjamin|
+    Dagmar|
+    Leora|
+}
+
+test left-join-with-where-2 {
+    select users.first_name, products.name from users left join products on users.id < 2 where users.id < 3;
+}
+expect {
+    Dan|hat
+    Dan|cap
+    Dan|shirt
+    Dan|sweater
+    Dan|sweatshirt
+    Dan|shorts
+    Dan|jeans
+    Dan|sneakers
+    Dan|boots
+    Dan|coat
+    Dan|accessories
+    Chaz|
+}
+
+# This test verifies that the WHERE clause is evaluated after the LEFT JOIN,
+# effectively filtering out rows where the right table has no match.
+test left-join-with-where-right-table {
+    select users.id, price
+    from users left join products on users.id = products.id
+    where products.price is not null
+    order by users.id;
+}
+expect {
+    1|82.9389679823547
+    2|32.2475410444338
+    3|22.7209470048471
+    4|68.9227440029754
+    5|23.8100541984648
+    6|50.0363795824125
+    7|47.9379799632405
+    8|36.1006791183673
+    9|59.7782771700224
+    10|8.85709624556419
+    11|47.5875632652657
+}
+
+test left-join-row-id {
+    select u.rowid, p.rowid from users u left join products as p on u.rowid = p.rowid where u.rowid >= 10 limit 5;
+}
+expect {
+    10|10
+    11|11
+    12|
+    13|
+    14|
+}
+
+test left-join-constant-condition-true {
+    select u.first_name, p.name from users u left join products as p on true limit 1;
+}
+expect {
+    Dan|hat
+}
+
+test left-join-constant-condition-false {
+    select u.first_name, p.name from users u left join products as p on false limit 1;
+}
+expect {
+    Dan|
+}
+
+test left-join-constant-condition-where-false {
+    select u.first_name, p.name from users u left join products as p where false limit 1;
+}
+expect {
+}
+
+test left-join-non-pk {
+    select users.first_name as user_name, products.name as product_name from users left join products on users.first_name = products.name limit 3;
+}
+expect {
+    Dan|
+    Chaz|
+    Edmond|
+}
+
+test left-join-self {
+    select u1.first_name as user_name, u2.first_name as neighbor_name from users u1 left join users as u2 on u1.id = u2.id + 1 limit 2;
+}
+expect {
+    Dan|
+    Chaz|Dan
+}
+
+test left-join-self-2 {
+    select u1.first_name as user_name, u2.first_name as neighbor_name from users u1 left join users as u2 on u2.id = u1.id + 1 limit 2;
+}
+expect {
+    Dan|Chaz
+    Chaz|Edmond
+}
+
+test left-join-self-with-where {
+    select u1.first_name as user_name, u2.first_name as neighbor_name from users u1 left join users as u2 on u1.id = u2.id + 1 where u1.id = 5 limit 2;
+}
+expect {
+    Nikko|Krystel
+}
+
+test left-join-multiple-cond-and {
+    select u.first_name, p.name from users u left join products as p on u.id = p.id and u.first_name = p.name limit 2;
+}
+expect {
+    Dan|
+    Chaz|
+}
+
+test left-join-multiple-cond-or {
+    select u.first_name, p.name from users u left join products as p on u.id = p.id or u.first_name = p.name limit 2;
+}
+expect {
+    Dan|hat
+    Chaz|cap
+}
+
+test left-join-no-join-conditions-but-multiple-where {
+    select u.first_name, p.name from users u left join products as p where u.id = p.id or u.first_name = p.name limit 2;
+}
+expect {
+    Dan|hat
+    Chaz|cap
+}
+
+test left-join-order-by-qualified {
+    select users.first_name, products.name from users left join products on users.id = products.id where users.first_name like 'Jam%' order by null limit 2;
+}
+expect {
+    Jamarcus|
+    Jamil|
+}
+
+test left-join-order-by-qualified-nullable-sorting-col {
+    select users.first_name, products.name from users left join products on users.id = products.id order by products.name limit 1;
+}
+expect {
+    Benjamin|
+}
+
+test left-join-constant-condition-true-2 {
+    select u.first_name, p.name from users u left join products as p on 1 limit 5;
+}
+expect {
+    Dan|hat
+    Dan|cap
+    Dan|shirt
+    Dan|sweater
+    Dan|sweatshirt
+}
+
+test left-join-constant-condition-false-2 {
+    select u.first_name, p.name from users u left join products as p on 0 limit 5;
+}
+expect {
+    Dan|
+    Chaz|
+    Edmond|
+    Krystel|
+    Nikko|
+}
+
+test four-way-inner-join {
+    select u1.first_name, u2.first_name, u3.first_name, u4.first_name from users u1 join users u2 on u1.id = u2.id join users u3 on u2.id = u3.id + 1 join users u4 on u3.id = u4.id + 1 limit 1;
+}
+expect {
+    Edmond|Edmond|Chaz|Dan
+}
+
+# regression test for case where 3-way join that used 1 scan and 2 seeks (point lookups) was buggy due to incorrect jump opcodes
+test three-way-inner-join-with-two-seeks {
+    select * from users u join users u2 on u.id=u2.id join products p on u2.id = p.id limit 3;
+}
+expect {
+    1|Dan|Parker|caden@example.org|436.726.1331 x867|Davonte Mountains|Hodkiewicz side|NJ|758|31|1|Dan|Parker|caden@example.org|436.726.1331 x867|Davonte Mountains|Hodkiewicz side|NJ|758|31|1|hat|82.9389679823547
+    2|Chaz|Zemlak|kip@example.com|(242) 091-6326 x60303|Dibbert Street|Noe mouth|ND|656|10|2|Chaz|Zemlak|kip@example.com|(242) 091-6326 x60303|Dibbert Street|Noe mouth|ND|656|10|2|cap|32.2475410444338
+    3|Edmond|Doyle|rubye@example.com|(706) 742-0480 x647|Remington Shore|West Rigoberto Welch side|NY|843|83|3|Edmond|Doyle|rubye@example.com|(706) 742-0480 x647|Remington Shore|West Rigoberto Welch side|NY|843|83|3|shirt|22.7209470048471
+}
+
+test leftjoin-innerjoin-where {
+    select u.first_name, p.name, p2.name from users u left join products p on p.name = u.first_name join products p2 on length(p2.name) > 8 where u.first_name = 'Franklin';
+}
+expect {
+}
+
+test leftjoin-leftjoin-where {
+    select u.first_name, p.name, p2.name from users u left join products p on p.name = u.first_name join products p2 on length(p2.name) > 8 where u.first_name = 'Franklin';
+}
+expect {
+}
+
+test innerjoin-leftjoin-where {
+    select u.first_name, u2.first_name, p.name from users u join users u2 on u.id = u2.id + 1 left join products p on p.name = u.first_name where u.first_name = 'Franklin';
+}
+expect {
+}
+
+test innerjoin-leftjoin-with-or-terms {
+    select u.first_name, u2.first_name, p.name from users u join users u2 on u.id = u2.id + 1 left join products p on p.name = u.first_name or p.name like 'sweat%' where u.first_name = 'Franklin';
+}
+expect {
+}
+
+test left-join-constant-condition-false-inner-join-constant-condition-true {
+    select u.first_name, p.name, u2.first_name from users u left join products as p on 0 join users u2 on 1 limit 5;
+}
+expect {
+    Dan||Dan
+    Dan||Chaz
+    Dan||Edmond
+    Dan||Krystel
+    Dan||Nikko
+}
+
+test left-join-constant-condition-true-inner-join-constant-condition-false {
+    select u.first_name, p.name, u2.first_name from users u left join products as p on 1 join users u2 on 0 limit 5;
+}
+expect {
+}
+
+test join-utilizing-both-seekrowid-and-secondary-index {
+    select u.first_name, p.name from users u join products p on u.id = p.id and u.age > 70;
+}
+expect {
+    Edmond|shirt
+    Krystel|sweater
+}
+
+# important difference between regular SELECT * join and a SELECT * USING join is that the join keys are deduplicated
+# from the result in the USING case.
+test join-using {
+    select * from users join products using (id) limit 3;
+}
+expect {
+    1|Dan|Parker|caden@example.org|436.726.1331 x867|Davonte Mountains|Hodkiewicz side|NJ|758|31|hat|82.9389679823547
+    2|Chaz|Zemlak|kip@example.com|(242) 091-6326 x60303|Dibbert Street|Noe mouth|ND|656|10|cap|32.2475410444338
+    3|Edmond|Doyle|rubye@example.com|(706) 742-0480 x647|Remington Shore|West Rigoberto Welch side|NY|843|83|shirt|22.7209470048471
+}
+
+test join-using-multiple {
+    select u.first_name, u.last_name, p.name from users u join users u2 using(id) join products p using(id) limit 3;
+}
+expect {
+    Dan|Parker|hat
+    Chaz|Zemlak|cap
+    Edmond|Doyle|shirt
+}
+
+test join-using-multiple-with-quoting {
+    select u.first_name, u.last_name, p.name from users u join users u2 using(id) join [products] p using(`id`) limit 3;
+}
+expect {
+    Dan|Parker|hat
+    Chaz|Zemlak|cap
+    Edmond|Doyle|shirt
+}
+
+# NATURAL JOIN desugars to JOIN USING (common_column1, common_column2...)
+test join-using-2 {
+    select * from users natural join products limit 3;
+}
+expect {
+    1|Dan|Parker|caden@example.org|436.726.1331 x867|Davonte Mountains|Hodkiewicz side|NJ|758|31|hat|82.9389679823547
+    2|Chaz|Zemlak|kip@example.com|(242) 091-6326 x60303|Dibbert Street|Noe mouth|ND|656|10|cap|32.2475410444338
+    3|Edmond|Doyle|rubye@example.com|(706) 742-0480 x647|Remington Shore|West Rigoberto Welch side|NY|843|83|shirt|22.7209470048471
+}
+
+test natural-join-multiple {
+    select u.first_name, u2.last_name, p.name from users u natural join users u2 natural join products p limit 3;
+}
+expect {
+    Dan|Parker|hat
+    Chaz|Zemlak|cap
+    Edmond|Doyle|shirt
+}
+
+# have to be able to join between 1st table and 3rd table as well
+test natural-join-and-using-join {
+    select u.id, u2.id, p.id from users u natural join products p join users u2 using (first_name) limit 3;
+}
+expect {
+    1|1|1
+    1|9476|1
+    1|9537|1
+}
+
+# regression test for a backwards iteration left join case,
+# where the null flag of the right table was not cleared after a previous unmatched row.
+test left-join-backwards-iteration {
+    select users.id, users.first_name as user_name, products.name as product_name
+    from users left join products on users.id = products.id
+    where users.id < 13 order by users.id desc limit 3;
+}
+expect {
+    12|Benjamin|
+    11|Lexie|accessories
+    10|Gerald|coat
+}
+
+test hash-join-expr-equality-pred {
+    SELECT p.name, u.email
+    FROM products p
+    JOIN users u ON substr(p.name,1,2) = lower(substr(u.first_name, 1,2))
+    ORDER BY p.name, u.email limit 2;
+}
+expect {
+    boots|aaliyah@example.org
+    boots|alfredo@example.org
+}

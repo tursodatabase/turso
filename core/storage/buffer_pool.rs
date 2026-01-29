@@ -4,6 +4,7 @@ use crate::io::TEMP_BUFFER_CACHE;
 use crate::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use crate::sync::{Arc, Weak};
 use crate::{turso_assert, Buffer, LimboError, IO};
+
 use std::cell::UnsafeCell;
 use std::ptr::NonNull;
 use std::sync::OnceLock;
@@ -493,6 +494,7 @@ mod shuttle_tests {
     use crate::io::MemoryIO;
     use crate::sync::*;
     use crate::thread;
+    use rustc_hash::FxHashSet as HashSet;
 
     fn create_test_pool() -> Arc<BufferPool> {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
@@ -901,16 +903,14 @@ mod shuttle_tests {
                 let bufs3 = h3.join().unwrap();
 
                 // Verify buffers within each thread don't overlap
-                let ptrs2: std::collections::HashSet<_> =
-                    bufs2.iter().map(|b| b.as_ptr() as usize).collect();
+                let ptrs2: HashSet<_> = bufs2.iter().map(|b| b.as_ptr() as usize).collect();
                 assert_eq!(
                     ptrs2.len(),
                     bufs2.len(),
                     "Thread 2 got duplicate buffer pointers"
                 );
 
-                let ptrs3: std::collections::HashSet<_> =
-                    bufs3.iter().map(|b| b.as_ptr() as usize).collect();
+                let ptrs3: HashSet<_> = bufs3.iter().map(|b| b.as_ptr() as usize).collect();
                 assert_eq!(
                     ptrs3.len(),
                     bufs3.len(),
@@ -1127,7 +1127,7 @@ mod shuttle_tests {
                     }
                 }
 
-                let unique_ptrs: std::collections::HashSet<_> = all_ptrs.iter().copied().collect();
+                let unique_ptrs: HashSet<_> = all_ptrs.iter().copied().collect();
                 assert_eq!(
                     all_ptrs.len(),
                     unique_ptrs.len(),
@@ -1431,7 +1431,7 @@ mod shuttle_tests {
                 }
 
                 // Collect all pointers to verify no duplicates
-                let all_ptrs: std::collections::HashSet<_> = all_bufs
+                let all_ptrs: HashSet<_> = all_bufs
                     .iter()
                     .flat_map(|bufs| bufs.iter().map(|b| b.as_ptr() as usize))
                     .collect();
@@ -1579,7 +1579,7 @@ mod shuttle_tests {
                 }
 
                 // Collect all pointers and verify no duplicates
-                let all_ptrs: std::collections::HashSet<_> = results
+                let all_ptrs: HashSet<_> = results
                     .iter()
                     .flat_map(|bufs| bufs.iter().map(|b| b.as_ptr() as usize))
                     .collect();
@@ -1740,7 +1740,7 @@ mod shuttle_tests {
                 );
 
                 // Collect all pointers and verify no duplicates among remaining buffers
-                let all_ptrs: std::collections::HashSet<_> = results
+                let all_ptrs: HashSet<_> = results
                     .iter()
                     .flat_map(|(bufs, _)| bufs.iter().map(|b| b.as_ptr() as usize))
                     .collect();
