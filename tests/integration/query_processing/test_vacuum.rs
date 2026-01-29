@@ -1402,6 +1402,62 @@ fn test_vacuum_into_preserves_mvcc(tmp_db: TempDatabase) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[test]
+fn test_vacuum_into_from_memory_database() -> anyhow::Result<()> {
+    use std::sync::Arc;
+    use turso_core::{Database, MemoryIO, OpenFlags};
+
+    let _ = env_logger::try_init();
+
+    // create an in-memory database
+    let io = Arc::new(MemoryIO::new());
+    let db = Database::open_file_with_flags(
+        io,
+        ":memory:",
+        OpenFlags::Create,
+        turso_core::DatabaseOpts::new(),
+        None,
+    )?;
+    let conn = db.connect()?;
+
+    conn.execute("CREATE TABLE t (a INTEGER, b TEXT)")?;
+    conn.execute("INSERT INTO t VALUES (1, 'hello')")?;
+    conn.execute("INSERT INTO t VALUES (2, 'world')")?;
+    conn.execute("INSERT INTO t VALUES (3, 'from memory')")?;
+
+    let dest_dir = TempDir::new()?;
+    let dest_path = dest_dir.path().join("vacuumed_from_memory.db");
+    let dest_path_str = dest_path.to_str().unwrap();
+
+    conn.execute(format!("VACUUM INTO '{dest_path_str}'"))?;
+    assert!(
+        dest_path.exists(),
+        "Vacuumed file should exist on disk at {dest_path_str}"
+    );
+
+    let dest_db = TempDatabase::new_with_existent(&dest_path);
+    let dest_conn = dest_db.connect_limbo();
+    let integrity_result = run_integrity_check(&dest_conn);
+    assert_eq!(
+        integrity_result, "ok",
+        "Destination database should pass integrity check"
+    );
+
+    // verify all data was copied correctly
+    let rows: Vec<(i64, String)> = dest_conn.exec_rows("SELECT a, b FROM t ORDER BY a");
+    assert_eq!(
+        rows,
+        vec![
+            (1, "hello".to_string()),
+            (2, "world".to_string()),
+            (3, "from memory".to_string())
+        ],
+        "All data from in-memory database should be copied to disk"
+    );
+
+    Ok(())
+}
+
 // test for future stuff, as turso db does not support yet:
 // 1. CHECK constraints
 // 2. WITHOUT ROWID tables

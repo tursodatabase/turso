@@ -11552,7 +11552,9 @@ fn op_vacuum_into_inner(
                 }
 
                 // make sure to create destination database with same experimental features as source
-                let io = program.connection.db.io.clone();
+                // Always use PlatformIO for the destination file, even if source is in-memory.
+                // This ensures VACUUM INTO actually writes to disk.
+                let io: Arc<dyn crate::IO> = Arc::new(crate::io::PlatformIO::new()?);
                 let source_db = &program.connection.db;
                 let dest_opts = crate::DatabaseOpts::new()
                     .with_views(source_db.experimental_views_enabled())
