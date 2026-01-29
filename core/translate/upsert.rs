@@ -486,7 +486,7 @@ pub fn emit_upsert(
     let mut updated_col_set: HashSet<usize> = set_pairs.iter().map(|(i, _)| *i).collect();
 
     // Build column lookup once
-    let column_lookup = ctx.table.column_name_to_index_map();
+    let column_lookup = table.column_name_to_index_map();
 
     // Propagate "updated" status through VIRTUAL columns for transitive dependencies
     propagate_virtual_column_updates(columns, &column_lookup, &mut updated_col_set);

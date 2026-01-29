@@ -1727,16 +1727,6 @@ impl BTreeTable {
             .collect()
     }
 
-    /// Build a map from lowercased column names to their indices.
-    /// This is useful for looking up columns by name in generated column expressions.
-    pub fn column_name_to_index_map(&self) -> rustc_hash::FxHashMap<String, usize> {
-        self.columns
-            .iter()
-            .enumerate()
-            .filter_map(|(i, col)| col.name.as_ref().map(|name| (name.to_lowercase(), i)))
-            .collect()
-    }
-
     /// Convert a logical column index to a physical column index.
     /// Physical indices skip VIRTUAL generated columns since they are not stored in the record.
     #[inline]
