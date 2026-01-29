@@ -569,9 +569,7 @@ pub fn collect_column_refs_from_ast_expr(expr: &Expr) -> HashSet<String> {
         | Expr::Exists(_)
         | Expr::InTable { .. }
         | Expr::SubqueryResult { .. }
-        | Expr::Raise(_, _) => {
-            Ok(WalkControl::SkipChildren)
-        }
+        | Expr::Raise(_, _) => Ok(WalkControl::SkipChildren),
         _ => Ok(WalkControl::Continue),
     });
     refs
