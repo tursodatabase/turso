@@ -80,7 +80,7 @@ jobs:
           MAX_STEPS="${{ github.event.inputs.max_steps }}"
           MAX_STEPS="${MAX_STEPS:-100000}"
           ./target/debug/turso_whopper \
-            --enable-elle \
+            --elle list-append \
             --elle-output elle-history.edn \
             --max-steps "$MAX_STEPS"
 

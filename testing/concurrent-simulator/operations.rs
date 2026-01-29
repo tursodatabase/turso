@@ -66,7 +66,6 @@ pub enum Operation {
     /// Read an Elle list by key
     ElleRead { table_name: String, key: String },
 }
-
 pub type OpResult = Result<Vec<Vec<Value>>, LimboError>;
 /// Context passed to Operation::start_op and Operation::finish_op.
 pub struct OpContext<'a> {
