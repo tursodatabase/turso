@@ -876,7 +876,6 @@ def connect(
         cfg = PyTursoDatabaseConfig(
             path=database,
             experimental_features=experimental_features,
-            async_io=False,  # Let the Rust layer drive IO internally by default
             vfs=vfs,
             encryption=PyTursoEncryptionConfig(cipher=encryption.cipher, hexkey=encryption.hexkey)
             if encryption

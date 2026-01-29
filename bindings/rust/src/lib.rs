@@ -200,7 +200,9 @@ impl Builder {
                 io: None,
                 db_file: None,
             });
-        db.open()?;
+        let result = db.open()?;
+        // async_io is false - so db.open() will return result immediately
+        assert!(!result.is_io());
         Ok(Database { inner: db })
     }
 }
