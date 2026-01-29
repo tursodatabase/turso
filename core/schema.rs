@@ -631,7 +631,7 @@ impl Schema {
         let result = self.make_from_btree_internal(state, mv_cursor, pager, syms, enable_triggers);
         if result.is_err() {
             state.cleanup(pager);
-        } else {
+        } else if let Ok(IOResult::Done(..)) = result {
             turso_assert!(
                 !state.read_tx_active,
                 "make_from_btree must properly cleanup internal state in case of success"
