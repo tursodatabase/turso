@@ -830,15 +830,6 @@ impl InteractionType {
 fn reopen_database(env: &mut SimulatorEnv) {
     // 1. Close all connections without default checkpoint-on-close behavior
     // to expose bugs related to how we handle WAL
-    reopen_database_impl(env, false);
-}
-
-#[allow(dead_code)]
-fn reopen_database_with_checkpoint(env: &mut SimulatorEnv) {
-    reopen_database_impl(env, true);
-}
-
-fn reopen_database_impl(env: &mut SimulatorEnv, checkpoint_on_close: bool) {
     let mvcc = env.profile.experimental_mvcc;
     let num_conns = env.connections.len();
 
@@ -850,11 +841,6 @@ fn reopen_database_impl(env: &mut SimulatorEnv, checkpoint_on_close: bool) {
         }
     }
 
-    if checkpoint_on_close {
-        for conn in &mut env.connections {
-            conn.disconnect();
-        }
-    }
     env.connections.clear();
 
     // Clear all open files
