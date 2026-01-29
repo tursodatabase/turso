@@ -517,7 +517,11 @@ fn get_column_diff(table: &Table) -> IndexSet<&str> {
         if let Some(expr) = col.generated_expr() {
             let refs = extract_column_refs(expr);
             for ref_name in refs {
-                if let Some(ref_col) = table.columns.iter().find(|c| c.name == ref_name) {
+                if let Some(ref_col) = table
+                    .columns
+                    .iter()
+                    .find(|c| c.name.eq_ignore_ascii_case(&ref_name))
+                {
                     column_cannot_drop.insert(ref_col.name.as_str());
                 }
             }

@@ -211,40 +211,6 @@ impl Display for SimValue {
     }
 }
 
-/// SQLite's comparison algorithm for INTEGER vs FLOAT values.
-/// This matches the implementation in core/types.rs and handles precision
-/// correctly for large integers that can't be exactly represented as f64.
-fn sqlite_int_float_compare(int_val: i64, float_val: f64) -> Option<std::cmp::Ordering> {
-    use std::cmp::Ordering;
-
-    // NaN is considered greater than any integer
-    if float_val.is_nan() {
-        return Some(Ordering::Greater);
-    }
-
-    // Float underflows i64 range - integer is greater
-    if float_val < -9223372036854775808.0 {
-        return Some(Ordering::Greater);
-    }
-    // Float overflows i64 range - integer is less
-    if float_val >= 9223372036854775808.0 {
-        return Some(Ordering::Less);
-    }
-
-    // Truncate float to integer and compare
-    let float_as_int = float_val as i64;
-    Some(match int_val.cmp(&float_as_int) {
-        Ordering::Equal => {
-            // If truncated values are equal, compare as floats to handle fractional part
-            let int_as_float = int_val as f64;
-            int_as_float
-                .partial_cmp(&float_val)
-                .unwrap_or(Ordering::Equal)
-        }
-        other => other,
-    })
-}
-
 impl SimValue {
     pub const FALSE: Self = SimValue(types::Value::Integer(0));
     pub const TRUE: Self = SimValue(types::Value::Integer(1));
@@ -258,39 +224,10 @@ impl SimValue {
     /// In SQLite, INTEGER vs FLOAT comparisons use truncate-then-compare semantics
     /// to preserve precision for large integers.
     fn sqlite_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        use std::cmp::Ordering;
         match (&self.0, &other.0) {
             // NULL comparisons
             (types::Value::Null, _) | (_, types::Value::Null) => None,
-
-            // Same-type comparisons
-            (types::Value::Integer(a), types::Value::Integer(b)) => a.partial_cmp(b),
-            (types::Value::Float(a), types::Value::Float(b)) => a.partial_cmp(b),
-            (types::Value::Text(a), types::Value::Text(b)) => a.value.partial_cmp(&b.value),
-            (types::Value::Blob(a), types::Value::Blob(b)) => a.partial_cmp(b),
-
-            // Cross-type numeric comparisons: use SQLite's truncate-then-compare algorithm
-            (types::Value::Integer(i), types::Value::Float(f)) => sqlite_int_float_compare(*i, *f),
-            (types::Value::Float(f), types::Value::Integer(i)) => {
-                sqlite_int_float_compare(*i, *f).map(|o| o.reverse())
-            }
-
-            // Cross-type comparisons between numeric and non-numeric follow SQLite's type ordering:
-            // NULL < INTEGER/REAL < TEXT < BLOB
-            (types::Value::Integer(_) | types::Value::Float(_), types::Value::Text(_)) => {
-                Some(Ordering::Less)
-            }
-            (types::Value::Integer(_) | types::Value::Float(_), types::Value::Blob(_)) => {
-                Some(Ordering::Less)
-            }
-            (types::Value::Text(_), types::Value::Integer(_) | types::Value::Float(_)) => {
-                Some(Ordering::Greater)
-            }
-            (types::Value::Text(_), types::Value::Blob(_)) => Some(Ordering::Less),
-            (types::Value::Blob(_), types::Value::Integer(_) | types::Value::Float(_)) => {
-                Some(Ordering::Greater)
-            }
-            (types::Value::Blob(_), types::Value::Text(_)) => Some(Ordering::Greater),
+            _ => Some(self.0.cmp(&other.0)),
         }
     }
 

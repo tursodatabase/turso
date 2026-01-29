@@ -115,6 +115,8 @@ pub use types::Value;
 pub use types::ValueRef;
 use util::parse_schema_rows;
 pub use util::IOExt;
+pub use util::rename_column_refs_in_expr;
+pub use schema::extract_column_refs;
 pub use vdbe::{
     builder::QueryMode, explain::EXPLAIN_COLUMNS, explain::EXPLAIN_QUERY_PLAN_COLUMNS,
     FromValueRow, Program, Register,

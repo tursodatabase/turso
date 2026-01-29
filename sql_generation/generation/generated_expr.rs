@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 
 use rand::Rng;
-use turso_core::{walk_expr_mut, WalkControl};
+use turso_core::extract_column_refs as collect_column_refs;
 use turso_parser::ast::{self, Expr, Name, Operator, UnaryOperator};
 
 use crate::model::table::{Column, ColumnType};
@@ -223,55 +223,10 @@ fn pick_unary_op<R: Rng + ?Sized>(rng: &mut R, target_type: &ColumnType) -> Opti
 }
 
 /// Extract all column references from an expression.
-///
-/// Recursively walks the AST to find all `Expr::Id` column references.
 pub fn extract_column_refs(expr: &ast::Expr) -> HashSet<String> {
-    let mut refs = HashSet::new();
-    let mut expr_copy = expr.clone();
-    extract_refs_inner(&mut expr_copy, &mut refs);
-    refs
-}
-
-fn extract_refs_inner(expr: &mut ast::Expr, refs: &mut HashSet<String>) {
-    let _ = walk_expr_mut(expr, &mut |expr: &mut Expr| match expr {
-        Expr::Id(name) | Expr::Name(name) => {
-            refs.insert(name.as_str().to_string());
-            Ok(WalkControl::Continue)
-        }
-        Expr::Qualified(_, name) => {
-            refs.insert(name.as_str().to_string());
-            Ok(WalkControl::Continue)
-        }
-        Expr::DoublyQualified(_, _, name) => {
-            refs.insert(name.as_str().to_string());
-            Ok(WalkControl::Continue)
-        }
-        Expr::FunctionCall {
-            args, filter_over, ..
-        } => {
-            for arg in args {
-                extract_refs_inner(arg, refs);
-            }
-            if let Some(filter) = &mut filter_over.filter_clause {
-                extract_refs_inner(filter, refs);
-            }
-            Ok(WalkControl::SkipChildren)
-        }
-        Expr::InSelect { lhs, .. } => {
-            extract_refs_inner(lhs, refs);
-            Ok(WalkControl::SkipChildren)
-        }
-        Expr::InTable { lhs, .. } => {
-            extract_refs_inner(lhs, refs);
-            Ok(WalkControl::SkipChildren)
-        }
-        Expr::Subquery(_)
-        | Expr::Exists(_)
-        | Expr::FunctionCallStar { .. }
-        | Expr::Raise(..)
-        | Expr::SubqueryResult { .. } => Ok(WalkControl::SkipChildren),
-        _ => Ok(WalkControl::Continue),
-    });
+    let mut refs = Vec::new();
+    collect_column_refs(expr, &mut refs);
+    refs.into_iter().collect()
 }
 
 #[cfg(test)]
@@ -315,6 +270,19 @@ mod tests {
             Box::new(Expr::Id(Name::from_string("a"))),
             Operator::Add,
             Box::new(Expr::Name(Name::from_string("b"))),
+        );
+        let refs = extract_column_refs(&expr);
+        assert!(refs.contains("a"));
+        assert!(refs.contains("b"));
+        assert_eq!(refs.len(), 2);
+    }
+
+    #[test]
+    fn test_extract_column_refs_normalizes_case() {
+        let expr = Expr::Binary(
+            Box::new(Expr::Id(Name::from_string("A"))),
+            Operator::Add,
+            Box::new(Expr::Id(Name::from_string("b"))),
         );
         let refs = extract_column_refs(&expr);
         assert!(refs.contains("a"));

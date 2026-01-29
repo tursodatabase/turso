@@ -1801,7 +1801,7 @@ fn is_generated_stored(typ: &Option<ast::Name>) -> bool {
 /// Recursively extract all column name references from an expression.
 /// This is used to validate generated column expressions for self-references,
 /// forward references, and circular references.
-fn extract_column_refs(expr: &ast::Expr, refs: &mut Vec<String>) {
+pub fn extract_column_refs(expr: &ast::Expr, refs: &mut Vec<String>) {
     use ast::Expr;
     match expr {
         Expr::Id(name) => {
@@ -1857,9 +1857,12 @@ fn extract_column_refs(expr: &ast::Expr, refs: &mut Vec<String>) {
         Expr::Collate(e, _) => {
             extract_column_refs(e, refs);
         }
-        Expr::FunctionCall { args, .. } => {
+        Expr::FunctionCall { args, filter_over, .. } => {
             for arg in args {
                 extract_column_refs(arg, refs);
+            }
+            if let Some(filter) = &filter_over.filter_clause {
+                extract_column_refs(filter, refs);
             }
         }
         Expr::InList { lhs, rhs, .. } => {
