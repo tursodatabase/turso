@@ -1,4 +1,4 @@
-use crate::function::{Deterministic, Func};
+use crate::function::{Deterministic, ExtFunc, Func};
 use crate::incremental::view::IncrementalView;
 use crate::index_method::{IndexMethodAttachment, IndexMethodConfiguration};
 use crate::stats::AnalyzeStats;
@@ -1597,7 +1597,7 @@ impl BTreeTable {
         let cmd = parser.next_cmd()?;
         match cmd {
             Some(Cmd::Stmt(Stmt::CreateTable { tbl_name, body, .. })) => {
-                create_table(tbl_name.name.as_str(), &body, root_page)
+                create_table(tbl_name.name.as_str(), &body, root_page, None)
             }
             _ => unreachable!("Expected CREATE TABLE statement"),
         }
@@ -1931,14 +1931,35 @@ fn has_transitive_dependency(
     false
 }
 
+fn resolve_generated_expr_function(
+    resolver: Option<&Resolver>,
+    name: &ast::Name,
+    arg_count: usize,
+) -> Result<Func> {
+    if let Some(resolver) = resolver {
+        if let Some(func) = resolver.resolve_function(name.as_str(), arg_count) {
+            return Ok(func);
+        }
+    }
+    Func::resolve_function(name.as_str(), arg_count)
+}
+
+fn is_aggregate_function(func: &Func) -> bool {
+    match func {
+        Func::Agg(_) => true,
+        Func::External(ext) => matches!(&ext.as_ref().func, ExtFunc::Aggregate { .. }),
+        _ => false,
+    }
+}
+
 /// Validates generated column expression for prohibited constructs.
 /// SQLite prohibits: subqueries, aggregate functions, window functions,
 /// and non-deterministic functions in generated columns.
-fn validate_generated_expr(expr: &ast::Expr) -> Result<()> {
-    validate_generated_expr_recursive(expr)
+fn validate_generated_expr(expr: &ast::Expr, resolver: Option<&Resolver>) -> Result<()> {
+    validate_generated_expr_recursive(expr, resolver)
 }
 
-fn validate_generated_expr_recursive(expr: &ast::Expr) -> Result<()> {
+fn validate_generated_expr_recursive(expr: &ast::Expr, resolver: Option<&Resolver>) -> Result<()> {
     use ast::Expr;
     match expr {
         // Qualified column references prohibited (e.g. t.a or db.t.a)
@@ -1958,34 +1979,16 @@ fn validate_generated_expr_recursive(expr: &ast::Expr) -> Result<()> {
             filter_over,
             ..
         } => {
-            let func_name = name.as_str().to_lowercase();
-
             // Window functions prohibited
             if filter_over.over_clause.is_some() {
                 crate::bail_parse_error!("window functions prohibited in generated columns");
             }
 
-            // Aggregate functions prohibited
-            // Note: min/max with 2+ args are scalar functions, only reject with 1 arg
-            const AGGREGATE_FUNCS: &[&str] = &["sum", "count", "avg", "total", "group_concat"];
-            if AGGREGATE_FUNCS.contains(&func_name.as_str()) {
+            let func = resolve_generated_expr_function(resolver, name, args.len())?;
+            if is_aggregate_function(&func) {
                 crate::bail_parse_error!("aggregate functions prohibited in generated columns");
             }
-            // min/max are aggregates only with single argument
-            if (func_name == "min" || func_name == "max") && args.len() == 1 {
-                crate::bail_parse_error!("aggregate functions prohibited in generated columns");
-            }
-
-            // Non-deterministic functions prohibited for ALL generated columns
-            // SQLite rejects these at CREATE TABLE time for both VIRTUAL and STORED
-            const NONDETERMINISTIC_FUNCS: &[&str] = &[
-                "random",
-                "randomblob",
-                "changes",
-                "last_insert_rowid",
-                "total_changes",
-            ];
-            if NONDETERMINISTIC_FUNCS.contains(&func_name.as_str()) {
+            if !func.is_deterministic() {
                 crate::bail_parse_error!(
                     "non-deterministic functions prohibited in generated columns"
                 );
@@ -1993,7 +1996,7 @@ fn validate_generated_expr_recursive(expr: &ast::Expr) -> Result<()> {
 
             // Recurse into arguments
             for arg in args {
-                validate_generated_expr_recursive(arg)?;
+                validate_generated_expr_recursive(arg, resolver)?;
             }
         }
 
@@ -2002,21 +2005,26 @@ fn validate_generated_expr_recursive(expr: &ast::Expr) -> Result<()> {
             if filter_over.over_clause.is_some() {
                 crate::bail_parse_error!("window functions prohibited in generated columns");
             }
-            let func_name = name.as_str().to_lowercase();
-            if func_name == "count" {
+            let func = resolve_generated_expr_function(resolver, name, 0)?;
+            if is_aggregate_function(&func) {
                 crate::bail_parse_error!("aggregate functions prohibited in generated columns");
+            }
+            if !func.is_deterministic() {
+                crate::bail_parse_error!(
+                    "non-deterministic functions prohibited in generated columns"
+                );
             }
         }
 
         // Recurse into child expressions
         Expr::Binary(lhs, _, rhs) => {
-            validate_generated_expr_recursive(lhs)?;
-            validate_generated_expr_recursive(rhs)?;
+            validate_generated_expr_recursive(lhs, resolver)?;
+            validate_generated_expr_recursive(rhs, resolver)?;
         }
-        Expr::Unary(_, inner) => validate_generated_expr_recursive(inner)?,
+        Expr::Unary(_, inner) => validate_generated_expr_recursive(inner, resolver)?,
         Expr::Parenthesized(exprs) => {
             for e in exprs {
-                validate_generated_expr_recursive(e)?;
+                validate_generated_expr_recursive(e, resolver)?;
             }
         }
         Expr::Case {
@@ -2026,42 +2034,42 @@ fn validate_generated_expr_recursive(expr: &ast::Expr) -> Result<()> {
             ..
         } => {
             if let Some(b) = base {
-                validate_generated_expr_recursive(b)?;
+                validate_generated_expr_recursive(b, resolver)?;
             }
             for (w, t) in when_then_pairs {
-                validate_generated_expr_recursive(w)?;
-                validate_generated_expr_recursive(t)?;
+                validate_generated_expr_recursive(w, resolver)?;
+                validate_generated_expr_recursive(t, resolver)?;
             }
             if let Some(e) = else_expr {
-                validate_generated_expr_recursive(e)?;
+                validate_generated_expr_recursive(e, resolver)?;
             }
         }
-        Expr::Cast { expr, .. } => validate_generated_expr_recursive(expr)?,
+        Expr::Cast { expr, .. } => validate_generated_expr_recursive(expr, resolver)?,
         Expr::InList { lhs, rhs, .. } => {
-            validate_generated_expr_recursive(lhs)?;
+            validate_generated_expr_recursive(lhs, resolver)?;
             for e in rhs {
-                validate_generated_expr_recursive(e)?;
+                validate_generated_expr_recursive(e, resolver)?;
             }
         }
         Expr::Between {
             lhs, start, end, ..
         } => {
-            validate_generated_expr_recursive(lhs)?;
-            validate_generated_expr_recursive(start)?;
-            validate_generated_expr_recursive(end)?;
+            validate_generated_expr_recursive(lhs, resolver)?;
+            validate_generated_expr_recursive(start, resolver)?;
+            validate_generated_expr_recursive(end, resolver)?;
         }
         Expr::Like {
             lhs, rhs, escape, ..
         } => {
-            validate_generated_expr_recursive(lhs)?;
-            validate_generated_expr_recursive(rhs)?;
+            validate_generated_expr_recursive(lhs, resolver)?;
+            validate_generated_expr_recursive(rhs, resolver)?;
             if let Some(e) = escape {
-                validate_generated_expr_recursive(e)?;
+                validate_generated_expr_recursive(e, resolver)?;
             }
         }
-        Expr::Collate(inner, _) => validate_generated_expr_recursive(inner)?,
+        Expr::Collate(inner, _) => validate_generated_expr_recursive(inner, resolver)?,
         Expr::IsNull(inner) | Expr::NotNull(inner) => {
-            validate_generated_expr_recursive(inner)?;
+            validate_generated_expr_recursive(inner, resolver)?;
         }
         // Other expressions are allowed
         _ => {}
@@ -2069,7 +2077,12 @@ fn validate_generated_expr_recursive(expr: &ast::Expr) -> Result<()> {
     Ok(())
 }
 
-pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> Result<BTreeTable> {
+pub fn create_table(
+    tbl_name: &str,
+    body: &CreateTableBody,
+    root_page: i64,
+    resolver: Option<&Resolver>,
+) -> Result<BTreeTable> {
     let table_name = normalize_ident(tbl_name);
     trace!("Creating table {}", table_name);
     let mut has_rowid = true;
@@ -2276,7 +2289,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                         }
                         ast::ColumnConstraint::Generated { expr, typ } => {
                             generated_stored = is_generated_stored(typ);
-                            validate_generated_expr(expr)?;
+                            validate_generated_expr(expr, resolver)?;
                             generated = Some(expr.clone());
                         }
                         ast::ColumnConstraint::PrimaryKey {

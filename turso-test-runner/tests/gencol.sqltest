@@ -1422,6 +1422,30 @@ test gencol_error_nondeterministic_virtual {
 expect error {
 }
 
+# SQLite defers the error to the INSERT for this function.
+test gencol_error_nondeterministic_datetime {
+    CREATE TABLE t5(a INT, b TEXT GENERATED ALWAYS AS (datetime('now')));
+    INSERT INTO t6 DEFAULT VALUES;
+}
+expect error {
+}
+
+# SQLite defers the error to the INSERT for this function.
+test gencol_error_nondeterministic_strftime {
+    CREATE TABLE t6(a INT, b TEXT GENERATED ALWAYS AS (strftime('%s','now')));
+    INSERT INTO t6 DEFAULT VALUES;
+}
+expect error {
+}
+
+# SQLite defers the error to the INSERT for this function.
+test gencol_error_nondeterministic_unixepoch {
+    CREATE TABLE t7(a INT, b INT GENERATED ALWAYS AS (unixepoch('now')));
+    INSERT INTO t6 DEFAULT VALUES;
+}
+expect error {
+}
+
 # =============================================================================
 # Fix 18: Test Coverage Gaps - Comprehensive Generated Column Tests
 # =============================================================================
