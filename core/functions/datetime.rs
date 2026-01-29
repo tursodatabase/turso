@@ -179,6 +179,9 @@ fn get_digits(z: &str, digits: usize, min_val: i32, max_val: i32) -> Option<(i32
     if z.len() < digits {
         return None;
     }
+    if !z.is_char_boundary(digits) {
+        return None;
+    }
     let bytes = z.as_bytes();
     if !bytes.iter().take(digits).all(|b| b.is_ascii_digit()) {
         return None;
@@ -642,6 +645,11 @@ fn parse_arithmetic_modifier(p: &mut DateTime, z: &str) -> Result<()> {
     if clean_z.len() >= 10
         && clean_z.as_bytes().get(4) == Some(&b'-')
         && clean_z.as_bytes().get(7) == Some(&b'-')
+        && clean_z.is_char_boundary(4)
+        && clean_z.is_char_boundary(5)
+        && clean_z.is_char_boundary(7)
+        && clean_z.is_char_boundary(8)
+        && clean_z.is_char_boundary(10)
     {
         let y_res = get_digits(&clean_z[0..4], 4, 0, 9999);
         let m_res = get_digits(&clean_z[5..7], 2, 0, 11);

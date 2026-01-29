@@ -2164,6 +2164,12 @@ test datetime-multibyte-utf8-greek {
 expect {
 }
 
+test datetime-multibyte-modifier-arithmetic {
+    SELECT datetime('2024-01-01', '88:------ӄ');
+}
+expect {
+}
+
 # Invalid Leap Years
 test date-leapyear-floor {
     SELECT date('2000-02-31', 'floor');
@@ -2441,4 +2447,3 @@ test strftime-format-bool-false {
 expect {
     0
 }
-
