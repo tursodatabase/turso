@@ -370,3 +370,29 @@ expect @js {
     real|100000
     real|-100000
 }
+
+test affinity-compound-select-text-int-comparison {
+    SELECT x, x = 2 FROM (SELECT CAST(2 AS TEXT) AS x UNION ALL SELECT 2.0);
+}
+expect {
+    2|0
+    2.0|1
+}
+expect @js {
+    2|0
+    2|1
+}
+
+test affinity-compound-select-no-affinity {
+    SELECT typeof(x), x, x = 2, x = '2' FROM (SELECT CAST(2 AS TEXT) AS x UNION ALL SELECT 2 UNION ALL SELECT 2.0);
+}
+expect {
+    text|2|0|1
+    integer|2|1|0
+    real|2.0|1|0
+}
+expect @js {
+    text|2|0|1
+    integer|2|1|0
+    real|2|1|0
+}
