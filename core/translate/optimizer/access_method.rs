@@ -205,6 +205,8 @@ fn find_best_access_method_for_btree(
                     (ColumnTarget::Column(col_no), None) => {
                         rowid_column_idx.is_some_and(|idx| idx == *col_no)
                     }
+                    // Rowid target on rowid index
+                    (ColumnTarget::RowId, None) => true,
                     _ => false,
                 };
                 if !correct_table || !correct_column {
