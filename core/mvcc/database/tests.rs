@@ -2082,7 +2082,6 @@ fn test_update_multiple_unique_columns_partial_rollback() {
     assert_eq!(&rows[0][0].to_string(), "ok");
 }
 
-
 /// Test that a transaction cannot see uncommitted changes from another transaction.
 /// This verifies snapshot isolation.
 #[test]

@@ -3211,6 +3211,9 @@ pub(crate) fn is_write_write_conflict(
 }
 
 impl RowVersion {
+    /// A row is visible to a transaction if:
+    /// * Begin is visible to the transaction
+    /// * End timestamp is not applicable yet, meaning deletion of row is not visible to this transaction
     pub fn is_visible_to(&self, tx: &Transaction, txs: &SkipMap<TxID, Transaction>) -> bool {
         is_begin_visible(txs, tx, self) && is_end_visible(txs, tx, self)
     }
