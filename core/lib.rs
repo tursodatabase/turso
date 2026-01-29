@@ -541,7 +541,8 @@ impl Database {
         opts: DatabaseOpts,
         encryption_opts: Option<EncryptionOpts>,
     ) -> Result<IOResult<Arc<Database>>> {
-        // For :memory: databases, bypass the registry
+        // turso-sync-engine creates 2 databases with different names in the same IO if MemoryIO is used
+        // in this case we need to bypass registry (as this is MemoryIO DB) but also preserve original distinction in names (e.g. :memory:-draft and :memory:-synced)
         if path.starts_with(":memory:") {
             return Self::open_with_flags_bypass_registry_async(
                 state,
@@ -567,6 +568,7 @@ impl Database {
             if let Some(db) = registry.get(&canonical_path).and_then(Weak::upgrade) {
                 tracing::debug!("took database {canonical_path:?} from the registry");
 
+                // Check encryption compatibility using cipher mode (key is not stored in Database for security)
                 let db_is_encrypted = !matches!(db.encryption_cipher_mode.get(), CipherMode::None);
 
                 if db_is_encrypted && encryption_opts.is_none() {
@@ -690,6 +692,10 @@ impl Database {
 
                     // Wrap db in Arc before connecting
                     let db = Arc::new(db);
+
+                    // Check: https://github.com/tursodatabase/turso/pull/1761#discussion_r2154013123
+
+                    // parse schema
                     let conn = db._connect(false, Some(pager.clone()), encryption_key.clone())?;
 
                     // Acquire schema lock and hold it through ReadingHeader and LoadingSchema phases

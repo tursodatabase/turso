@@ -157,8 +157,11 @@ pub const TURSO_INTERNAL_PREFIX: &str = "__turso_internal_";
 struct MakeFromBtreeAccumulators {
     from_sql_indexes: Vec<UnparsedFromSqlIndex>,
     automatic_indices: HashMap<String, Vec<(String, i64)>>,
+    /// Store DBSP state table root pages: view_name -> dbsp_state_root_page
     dbsp_state_roots: HashMap<String, i64>,
+    /// Store DBSP state table index root pages: view_name -> dbsp_state_index_root_page
     dbsp_state_index_roots: HashMap<String, i64>,
+    /// Store materialized view info (SQL and root page) for later creation
     materialized_view_info: HashMap<String, (String, i64)>,
 }
 
