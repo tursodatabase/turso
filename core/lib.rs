@@ -691,7 +691,6 @@ impl Database {
         let header: HeaderRefMut = self.io.block(|| HeaderRefMut::from_pager(&pager))?;
         let header_mut = header.borrow_mut();
 
-        // Check that the database uses UTF-8 encoding (the only encoding we support)
         if !header_mut.text_encoding.is_utf8() {
             return Err(LimboError::UnsupportedEncoding(
                 header_mut.text_encoding.to_string(),
