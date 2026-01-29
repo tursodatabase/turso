@@ -1203,9 +1203,7 @@ impl SimulatorEnv {
         }
         self.db = None;
         self.io.discard_all_pending();
-        self.io
-            .persist_files()
-            .map_err(|e| format!("failed: {e}"))
+        self.io.persist_files().map_err(|e| format!("failed: {e}"))
     }
 
     /// Attempt crash recovery: reopen database, run integrity_check, verify durable data.
