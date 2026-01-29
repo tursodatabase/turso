@@ -50,7 +50,7 @@ done
 echo "=== Running Whopper with Elle enabled ==="
 cargo build -p turso_whopper
 
-time RUST_BACKTRACE=full ./target/debug/turso_whopper --enable-elle --elle-output "$OUTPUT_FILE" "${ARGS[@]}"
+time RUST_BACKTRACE=full ./target/debug/turso_whopper --elle list-append --elle-output "$OUTPUT_FILE" "${ARGS[@]}"
 
 if [[ "$SKIP_ANALYSIS" -eq 1 ]]; then
     echo ""
