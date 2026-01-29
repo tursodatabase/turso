@@ -134,9 +134,26 @@ if [[ -z "$ELLE_JAR" ]]; then
 fi
 
 # Step 3: Run elle-cli analysis
+ELLE_OUTPUT_DIR="${OUTPUT_FILE%.edn}-results"
+mkdir -p "$ELLE_OUTPUT_DIR"
+
 echo ""
 echo "=== Running elle-cli analysis ==="
 echo "JAR: $ELLE_JAR"
 echo "History: $OUTPUT_FILE"
+echo "Results: $ELLE_OUTPUT_DIR"
 echo ""
-java -jar "$ELLE_JAR" --model list-append --verbose "$OUTPUT_FILE"
+ELLE_ARGS=(--model list-append --verbose --directory "$ELLE_OUTPUT_DIR")
+if [[ "$ENABLE_MVCC" -eq 1 ]]; then
+    ELLE_ARGS+=(--consistency-models snapshot-isolation)
+else 
+	ELLE_ARGS+=(--consistency-models serializable)
+fi
+java -jar "$ELLE_JAR" "${ELLE_ARGS[@]}" "$OUTPUT_FILE"
+
+# Show results summary
+if [ -d "$ELLE_OUTPUT_DIR" ]; then
+    echo ""
+    echo "=== Results ==="
+    ls -la "$ELLE_OUTPUT_DIR"
+fi

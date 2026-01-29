@@ -109,16 +109,19 @@ jobs:
       - name: Run Elle analysis
         run: |
           ELLE_JAR=$(ls -t /tmp/elle-cli/target/*-standalone.jar | head -1)
+          mkdir -p elle-results
           echo "Using JAR: $ELLE_JAR"
           echo "History file: $(pwd)/elle-history.edn"
           echo "History size: $(wc -l < elle-history.edn) events"
           echo ""
-          java -jar "$ELLE_JAR" --model list-append --verbose elle-history.edn
+          java -jar "$ELLE_JAR" --model list-append --verbose --directory elle-results elle-history.edn
 
-      - name: Upload Elle history
+      - name: Upload Elle results
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: elle-history
-          path: elle-history.edn
+          name: elle-results
+          path: |
+            elle-history.edn
+            elle-results/
           retention-days: 30
