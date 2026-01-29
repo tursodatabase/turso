@@ -3,6 +3,7 @@
 use std::collections::HashSet;
 
 use rand::Rng;
+use turso_core::{walk_expr_mut, WalkControl};
 use turso_parser::ast::{self, Expr, Name, Operator, UnaryOperator};
 
 use crate::model::table::{Column, ColumnType};
@@ -226,67 +227,24 @@ fn pick_unary_op<R: Rng + ?Sized>(rng: &mut R, target_type: &ColumnType) -> Opti
 /// Recursively walks the AST to find all `Expr::Id` column references.
 pub fn extract_column_refs(expr: &ast::Expr) -> HashSet<String> {
     let mut refs = HashSet::new();
-    extract_refs_inner(expr, &mut refs);
+    let mut expr_copy = expr.clone();
+    extract_refs_inner(&mut expr_copy, &mut refs);
     refs
 }
 
-fn extract_refs_inner(expr: &ast::Expr, refs: &mut HashSet<String>) {
-    match expr {
+fn extract_refs_inner(expr: &mut ast::Expr, refs: &mut HashSet<String>) {
+    let _ = walk_expr_mut(expr, &mut |expr: &mut Expr| match expr {
         Expr::Id(name) | Expr::Name(name) => {
             refs.insert(name.as_str().to_string());
+            Ok(WalkControl::Continue)
         }
         Expr::Qualified(_, name) => {
             refs.insert(name.as_str().to_string());
+            Ok(WalkControl::Continue)
         }
         Expr::DoublyQualified(_, _, name) => {
             refs.insert(name.as_str().to_string());
-        }
-        Expr::Binary(lhs, _, rhs) => {
-            extract_refs_inner(lhs, refs);
-            extract_refs_inner(rhs, refs);
-        }
-        Expr::Unary(_, inner) => {
-            extract_refs_inner(inner, refs);
-        }
-        Expr::Parenthesized(exprs) => {
-            for e in exprs {
-                extract_refs_inner(e, refs);
-            }
-        }
-        Expr::Cast { expr, .. } => {
-            extract_refs_inner(expr, refs);
-        }
-        Expr::Between {
-            lhs, start, end, ..
-        } => {
-            extract_refs_inner(lhs, refs);
-            extract_refs_inner(start, refs);
-            extract_refs_inner(end, refs);
-        }
-        Expr::Like {
-            lhs, rhs, escape, ..
-        } => {
-            extract_refs_inner(lhs, refs);
-            extract_refs_inner(rhs, refs);
-            if let Some(esc) = escape {
-                extract_refs_inner(esc, refs);
-            }
-        }
-        Expr::Case {
-            base,
-            when_then_pairs,
-            else_expr,
-        } => {
-            if let Some(b) = base {
-                extract_refs_inner(b, refs);
-            }
-            for (when, then) in when_then_pairs {
-                extract_refs_inner(when, refs);
-                extract_refs_inner(then, refs);
-            }
-            if let Some(e) = else_expr {
-                extract_refs_inner(e, refs);
-            }
+            Ok(WalkControl::Continue)
         }
         Expr::FunctionCall {
             args, filter_over, ..
@@ -294,36 +252,26 @@ fn extract_refs_inner(expr: &ast::Expr, refs: &mut HashSet<String>) {
             for arg in args {
                 extract_refs_inner(arg, refs);
             }
-            if let Some(filter) = &filter_over.filter_clause {
+            if let Some(filter) = &mut filter_over.filter_clause {
                 extract_refs_inner(filter, refs);
             }
-        }
-        Expr::InList { lhs, rhs, .. } => {
-            extract_refs_inner(lhs, refs);
-            for e in rhs {
-                extract_refs_inner(e, refs);
-            }
+            Ok(WalkControl::SkipChildren)
         }
         Expr::InSelect { lhs, .. } => {
             extract_refs_inner(lhs, refs);
-            // Don't recurse into subquery for now
+            Ok(WalkControl::SkipChildren)
         }
         Expr::InTable { lhs, .. } => {
             extract_refs_inner(lhs, refs);
+            Ok(WalkControl::SkipChildren)
         }
-        Expr::IsNull(inner) | Expr::NotNull(inner) => {
-            extract_refs_inner(inner, refs);
-        }
-        Expr::Collate(inner, _) => {
-            extract_refs_inner(inner, refs);
-        }
-        // Literals and other leaf nodes don't have column refs
-        Expr::Literal(_) | Expr::Variable(_) | Expr::Raise(..) => {}
-        // Subquery doesn't contribute to direct column refs in the expression context
-        Expr::Subquery(_) | Expr::Exists(_) | Expr::FunctionCallStar { .. } => {}
-        // Internal AST nodes (Register, Column, RowId, Glob) used after analysis
-        _ => {}
-    }
+        Expr::Subquery(_)
+        | Expr::Exists(_)
+        | Expr::FunctionCallStar { .. }
+        | Expr::Raise(..)
+        | Expr::SubqueryResult { .. } => Ok(WalkControl::SkipChildren),
+        _ => Ok(WalkControl::Continue),
+    });
 }
 
 #[cfg(test)]

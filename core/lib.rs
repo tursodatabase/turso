@@ -76,6 +76,7 @@ use arc_swap::{ArcSwap, ArcSwapOption};
 pub use connection::{resolve_ext_path, Connection, Row, StepResult, SymbolTable};
 use core::str;
 pub use error::{CompletionError, LimboError};
+pub use translate::expr::{walk_expr_mut, WalkControl};
 pub use io::clock::{Clock, MonotonicInstant, WallClockInstant};
 #[cfg(all(feature = "fs", target_family = "unix", not(miri)))]
 pub use io::UnixIO;
