@@ -388,7 +388,7 @@ func buildHostname(baseURL, namespace string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return u.Scheme + namespace + "." + u.Host, nil
+	return namespace + "." + u.Host, nil
 }
 
 // handleIoItem performs execution of a single IO item.
