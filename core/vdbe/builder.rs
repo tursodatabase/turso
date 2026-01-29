@@ -14,7 +14,7 @@ use crate::{
         emitter::{MaterializedColumnRef, TransactionMode},
         plan::{ResultSetColumn, TableReferences},
     },
-    CaptureDataChangesMode, Connection, Value, VirtualTable,
+    turso_assert, CaptureDataChangesMode, Connection, Value, VirtualTable,
 };
 
 // Keep distinct hash-table ids far from table internal ids to avoid collisions.
@@ -1310,6 +1310,20 @@ impl ProgramBuilder {
         let (_, cursor_type) = self.cursor_ref.get(cursor_id).expect("cursor_id is valid");
 
         use crate::translate::expr::sanitize_string;
+
+        match cursor_type {
+            CursorType::BTreeTable(btree) | CursorType::MaterializedView(btree, _) => {
+                let column_def = btree
+                    .columns
+                    .get(column)
+                    .expect("column index out of bounds");
+                turso_assert!(
+                    !column_def.is_virtual_generated(),
+                    "emit_column called with virtual generated column index {column}"
+                );
+            }
+            _ => {}
+        }
 
         // Compute physical column index by skipping VIRTUAL generated columns
         // (since they are not stored in the record)
