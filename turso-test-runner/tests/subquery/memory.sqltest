@@ -1045,3 +1045,60 @@ test column-is-null-in-aggregate-empty-table {
 expect {
     1|0
 }
+
+# EXISTS subquery in ungrouped aggregate query with data
+# The EXISTS subquery is non-correlated and should be evaluated before the loop,
+# returning 1 when the subquery table has data.
+test exists-in-ungrouped-aggregate-with-data {
+    create table t11(a text);
+    insert into t11(a) values ('x');
+    select exists (select a from t11), sum(a) from t11;
+}
+expect {
+    1|0.0
+}
+expect @js {
+    1|0
+}
+
+# EXISTS subquery in ungrouped aggregate query with empty main table
+# The EXISTS subquery is non-correlated and evaluated before the loop.
+# Even though the main table is empty, EXISTS should return 1 because
+# the subquery table has data.
+test exists-in-ungrouped-aggregate-empty-main-table {
+    create table t12(a text);
+    create table t12_sub(b text);
+    insert into t12_sub(b) values ('y');
+    select exists (select b from t12_sub), count(*) from t12;
+}
+expect {
+    1|0
+}
+
+# EXISTS subquery in ungrouped aggregate query where subquery table is empty
+# EXISTS should return 0 because the subquery returns no rows.
+test exists-in-ungrouped-aggregate-empty-subquery-table {
+    create table t13(a text);
+    create table t13_sub(b text);
+    insert into t13(a) values ('x');
+    select exists (select b from t13_sub), sum(a) from t13;
+}
+expect {
+    0|0.0
+}
+expect @js {
+    0|0
+}
+
+# Correlated EXISTS in ungrouped aggregate with empty main table
+# Since the main loop never runs, the correlated EXISTS is never evaluated.
+# The result should be 0 (initialized default for EXISTS).
+test correlated-exists-in-ungrouped-aggregate-empty-main-table {
+    create table t14(a integer);
+    create table t14_sub(b integer);
+    insert into t14_sub(b) values (1);
+    select exists (select 1 from t14_sub where b = t14.a), count(*) from t14;
+}
+expect {
+    0|0
+}
