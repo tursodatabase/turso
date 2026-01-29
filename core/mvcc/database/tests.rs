@@ -2442,3 +2442,100 @@ fn test_mvcc_dual_cursor_delete_all_btree_reinsert() {
     assert_eq!(rows[0][1].to_string(), "new1");
     assert_eq!(rows[1][1].to_string(), "new2");
 }
+
+#[test]
+fn test_checkpoint_root_page_mismatch_with_index() {
+    // Strategy:
+    // 1. Create table1 with index, insert many rows to allocate many pages (e.g., pages 2-30)
+    // 2. Create table2 with index (will get negative IDs like -35, -36)
+    // 3. Insert into table2
+    // 4. Checkpoint - table2 will be allocated to pages 32, 33 (after table1's pages)
+    // 5. But schema update will do abs(-35) = 35, abs(-36) = 36 (WRONG!)
+    // 6. Query table2 using index - will look for page 36 but data is in page 33
+
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+
+    conn.execute("PRAGMA journal_mode = 'experimental_mvcc'")
+        .unwrap();
+
+    // Create MULTIPLE tables to consume enough page numbers
+    // so that test_table's allocated pages diverge from abs(negative_id)
+    for table_num in 1..=30 {
+        conn.execute(format!(
+            "CREATE TABLE tbl{table_num} (id INTEGER PRIMARY KEY, data TEXT)",
+        ))
+        .unwrap();
+        conn.execute(format!(
+            "CREATE INDEX idx{table_num} ON tbl{table_num}(data)",
+        ))
+        .unwrap();
+
+        // Insert data to force page allocation
+        for i in 0..10 {
+            let data = format!("data_{table_num}_{i}");
+            conn.execute(format!("INSERT INTO tbl{table_num} VALUES ({i}, '{data}')",))
+                .unwrap();
+        }
+    }
+
+    println!("Created 30 tables with indexes and data");
+
+    // Create test_table with UNIQUE index (auto-created for the key)
+    conn.execute("CREATE TABLE test_table (key TEXT PRIMARY KEY, value TEXT)")
+        .unwrap();
+
+    // Check test_table's root pages (should be negative)
+    let rows = get_rows(
+        &conn,
+        "SELECT name, rootpage FROM sqlite_schema WHERE tbl_name = 'test_table' ORDER BY name",
+    );
+    let table_root: i64 = rows
+        .iter()
+        .find(|r| r[0].to_string() == "test_table")
+        .unwrap()[1]
+        .to_string()
+        .parse()
+        .unwrap();
+    let index_root: i64 = rows
+        .iter()
+        .find(|r| r[0].to_string().contains("autoindex"))
+        .unwrap()[1]
+        .to_string()
+        .parse()
+        .unwrap();
+    assert!(
+        table_root < 0,
+        "test_table should have negative root before checkpoint"
+    );
+    assert!(
+        index_root < 0,
+        "test_table index should have negative root before checkpoint"
+    );
+
+    // Insert a row into test_table
+    conn.execute("INSERT INTO test_table (key, value) VALUES ('test_key', 'test_value')")
+        .unwrap();
+
+    // Verify row exists before checkpoint
+    let rows = get_rows(&conn, "SELECT value FROM test_table WHERE key = 'test_key'");
+    assert_eq!(rows.len(), 1, "Row should exist before checkpoint");
+    assert_eq!(rows[0][0].to_string(), "test_value");
+
+    println!("Inserted row into test_table, verified it exists");
+
+    // Run checkpoint
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    println!("Checkpoint complete");
+
+    // Now try to query using the index - this is where the bug manifests
+    // The query will use root_page from schema (e.g., abs(index_root) if bug exists)
+    // But data is actually in the correct allocated page
+    let rows = get_rows(&conn, "SELECT value FROM test_table WHERE key = 'test_key'");
+
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].to_string(), "test_value", "Value should match");
+
+    println!("Test passed - row found correctly after checkpoint");
+}
