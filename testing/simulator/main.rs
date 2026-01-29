@@ -205,6 +205,14 @@ fn run_simulator(
     let result = {
         let mut env_guard = env.lock().unwrap();
         if matches!(&result, SandboxedResult::Panicked { .. }) && env_guard.has_crashed() {
+            if cli_opts.crash_dump {
+                tracing::info!("Crash detected, dumping db/wal files for inspection (--crash-dump)...");
+                env_guard.persist_crash_files().unwrap_or_else(|e| {
+                    tracing::error!("Failed to persist crash files: {}", e);
+                });
+                let db_path = env_guard.get_db_path();
+                std::process::exit(0);
+            }
             tracing::info!("Panic was caused by crash injection, attempting recovery...");
             match env_guard.attempt_crash_recovery() {
                 Ok(()) => {

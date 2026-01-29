@@ -163,6 +163,12 @@ pub struct SimulatorCLI {
     pub keep_files: bool,
     #[clap(
         long,
+        help = "On crash, persist db/wal files and exit without recovery (for manual inspection)",
+        default_value_t = false
+    )]
+    pub crash_dump: bool,
+    #[clap(
+        long,
         help = "Disable the SQLite integrity check at the end of a simulation",
         default_value_t = normal_or_miri(false, true)
     )]

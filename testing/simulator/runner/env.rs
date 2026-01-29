@@ -1196,6 +1196,18 @@ impl SimulatorEnv {
         self.io.has_crashed()
     }
 
+    pub fn persist_crash_files(&mut self) -> Result<(), String> {
+        self.io.close_files();
+        for conn in &mut self.connections {
+            conn.disconnect();
+        }
+        self.db = None;
+        self.io.discard_all_pending();
+        self.io
+            .persist_files()
+            .map_err(|e| format!("failed: {e}"))
+    }
+
     /// Attempt crash recovery: reopen database, run integrity_check, verify durable data.
     pub fn attempt_crash_recovery(&mut self) -> Result<(), String> {
         let expected_tables = self.durability.expected_recoverable();
