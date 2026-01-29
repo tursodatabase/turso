@@ -86,6 +86,9 @@ mod shuttle_adapter {
         guard: shuttle::sync::MutexGuard<'static, T>,
     }
 
+    unsafe impl<T: ?Sized + 'static> Send for ArcMutexGuard<T> {}
+    unsafe impl<T: ?Sized + 'static> Sync for ArcMutexGuard<T> {}
+
     impl<T: ?Sized + 'static> Deref for ArcMutexGuard<T> {
         type Target = T;
         fn deref(&self) -> &T {
