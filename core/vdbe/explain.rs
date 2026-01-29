@@ -2057,6 +2057,15 @@ pub fn insn_to_row(
             0,
             String::new(),
         ),
+        Insn::VacuumInto { dest_path } => (
+            "VacuumInto",
+            0,
+            0,
+            0,
+            Value::build_text(dest_path.to_string()),
+            0,
+            format!("dest={dest_path}"),
+        ),
     }
 }
 
