@@ -2,6 +2,7 @@ use std::{
     borrow::Cow,
     collections::HashMap,
     fmt::Display,
+    ops::Deref,
     sync::{Arc, Mutex, Once, RwLock},
     task::Waker,
     time::Duration,
@@ -284,11 +285,12 @@ impl TursoDatabaseConfig {
 
 pub struct TursoDatabase {
     config: TursoDatabaseConfig,
+    open_state: Mutex<TursoDatabaseOpenState>,
     db: Arc<Mutex<Option<Arc<Database>>>>,
 }
 
 /// Phase tracking for async TursoDatabase opening
-#[derive(Default)]
+#[derive(Default, Clone, Copy)]
 pub enum TursoDatabaseOpenPhase {
     #[default]
     Init,
@@ -537,17 +539,16 @@ impl TursoDatabase {
         Arc::new(Self {
             config,
             db: Arc::new(Mutex::new(None)),
+            open_state: Mutex::new(TursoDatabaseOpenState::new()),
         })
     }
     /// Async version of database opening that returns IOResult.
     /// Caller must drive the IO loop and pass state between calls.
     /// This is useful for environments where IO operations must be executed in a specific fashion.
-    pub fn open_async(
-        &self,
-        state: &mut TursoDatabaseOpenState,
-    ) -> Result<IOResult<()>, TursoError> {
+    pub fn open(&self) -> Result<IOResult<()>, TursoError> {
         loop {
-            match &state.phase {
+            let mut state = self.open_state.lock().unwrap();
+            match state.phase {
                 TursoDatabaseOpenPhase::Init => {
                     let inner_db = self.db.lock().unwrap();
                     if inner_db.is_some() {
@@ -645,18 +646,20 @@ impl TursoDatabase {
                     let io = state
                         .io
                         .as_ref()
-                        .expect("io must be initialized in Init phase");
+                        .expect("io must be initialized in Init phase")
+                        .clone();
                     let db_file = state
                         .db_file
                         .as_ref()
-                        .expect("db_file must be initialized in Init phase");
+                        .expect("db_file must be initialized in Init phase")
+                        .clone();
                     let opts = state.opts.expect("opts must be initialized in Init phase");
 
                     match Database::open_with_flags_async(
                         &mut state.open_db_state,
                         io.clone(),
                         &self.config.path,
-                        db_file.clone(),
+                        db_file,
                         OpenFlags::default(),
                         opts,
                         self.config.encryption.clone(),
@@ -668,31 +671,17 @@ impl TursoDatabase {
                             return Ok(IOResult::Done(()));
                         }
                         IOResult::IO(io_completion) => {
-                            return Ok(IOResult::IO(io_completion));
+                            if self.config.async_io {
+                                return Ok(IOResult::IO(io_completion));
+                            } else {
+                                io_completion.wait(io.deref())?;
+                            }
                         }
                     }
                 }
 
                 TursoDatabaseOpenPhase::Done => {
                     return Ok(IOResult::Done(()));
-                }
-            }
-        }
-    }
-
-    /// open the database
-    /// this method must be called only once
-    pub fn open(&self) -> Result<(), TursoError> {
-        let mut state = TursoDatabaseOpenState::new();
-        loop {
-            match self.open_async(&mut state)? {
-                IOResult::Done(()) => return Ok(()),
-                IOResult::IO(io_completion) => {
-                    let io = state
-                        .io
-                        .as_ref()
-                        .expect("io must be initialized after first open_async call");
-                    io_completion.wait(&**io)?;
                 }
             }
         }

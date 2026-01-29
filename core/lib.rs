@@ -276,6 +276,11 @@ pub struct OpenDbAsyncState {
     make_from_btree_state: schema::MakeFromBtreeState,
     /// Schema lock held during LoadingSchema phase to ensure atomicity across IO yields
     schema_guard: Option<sync::ArcMutexGuard<Arc<Schema>>>,
+    /// Registry lock held during open_with_flags_async to prevent concurrent opens
+    registry_guard:
+        Option<parking_lot::ArcMutexGuard<parking_lot::RawMutex, HashMap<String, Weak<Database>>>>,
+    /// Canonical path for registry insertion (computed once at start)
+    canonical_path: Option<String>,
 }
 
 impl Default for OpenDbAsyncState {
@@ -294,6 +299,8 @@ impl OpenDbAsyncState {
             encryption_key: None,
             make_from_btree_state: schema::MakeFromBtreeState::new(),
             schema_guard: None,
+            registry_guard: None,
+            canonical_path: None,
         }
     }
 }
@@ -308,8 +315,8 @@ impl OpenDbAsyncState {
 /// state between iterations, but static variables persist - using shuttle's
 /// Mutex here would cause panics when the second iteration tries to lock a
 /// mutex that belongs to a stale execution context.
-static DATABASE_MANAGER: LazyLock<parking_lot::Mutex<HashMap<String, Weak<Database>>>> =
-    LazyLock::new(|| parking_lot::Mutex::new(HashMap::default()));
+static DATABASE_MANAGER: LazyLock<Arc<parking_lot::Mutex<HashMap<String, Weak<Database>>>>> =
+    LazyLock::new(|| Arc::new(parking_lot::Mutex::new(HashMap::default())));
 
 /// The `Database` object contains per database file state that is shared
 /// between multiple connections.
@@ -528,9 +535,13 @@ impl Database {
         }
     }
 
-    /// Async version of open_with_flags that returns IOResult.
-    /// Uses the database registry to ensure single Database instance per file.
+    /// async flow of opening the database
+    /// this is important to have open async, otherwise sync-engine will not work properly for cases when schema table span multiple pages
+    /// (so, potentially network IO is needed to load them)
+    ///
+    /// Uses the database registry to ensure single Database instance per file within a process.
     /// Caller must drive the IO loop and pass state between calls.
+    /// The registry lock is held for the entire duration to prevent concurrent opens.
     #[allow(clippy::arc_with_non_send_sync)]
     pub fn open_with_flags_async(
         state: &mut OpenDbAsyncState,
@@ -541,30 +552,46 @@ impl Database {
         opts: DatabaseOpts,
         encryption_opts: Option<EncryptionOpts>,
     ) -> Result<IOResult<Arc<Database>>> {
+        let result = Self::open_with_flags_async_internal(
+            state,
+            io,
+            path,
+            db_file,
+            flags,
+            opts,
+            encryption_opts,
+        );
+        if result.is_err() {
+            // registry_guard is set by the open_with_flags_async_internal - so we release it in case of error
+            let _ = state.registry_guard.take();
+        }
+        result
+    }
+
+    #[allow(clippy::arc_with_non_send_sync)]
+    fn open_with_flags_async_internal(
+        state: &mut OpenDbAsyncState,
+        io: Arc<dyn IO>,
+        path: &str,
+        db_file: Arc<dyn DatabaseStorage>,
+        flags: OpenFlags,
+        opts: DatabaseOpts,
+        encryption_opts: Option<EncryptionOpts>,
+    ) -> Result<IOResult<Arc<Database>>> {
         // turso-sync-engine creates 2 databases with different names in the same IO if MemoryIO is used
         // in this case we need to bypass registry (as this is MemoryIO DB) but also preserve original distinction in names (e.g. :memory:-draft and :memory:-synced)
-        if path.starts_with(":memory:") {
-            return Self::open_with_flags_bypass_registry_async(
-                state,
-                io,
-                path,
-                &format!("{path}-wal"),
-                db_file,
-                flags,
-                opts,
-                None,
-            );
-        }
+        // so, we bypass registry for all db paths which starts with ":memory:"
 
-        // Check registry first (only on Init phase)
-        if matches!(state.phase, OpenDbAsyncPhase::Init) {
-            let registry = DATABASE_MANAGER.lock();
+        if matches!(state.phase, OpenDbAsyncPhase::Init) && !path.starts_with(":memory:") {
+            // lock the database manager for the whole duration of open_with_flags_async method
+            let registry = DATABASE_MANAGER.lock_arc();
 
             let canonical_path = std::fs::canonicalize(path)
                 .ok()
                 .and_then(|p| p.to_str().map(|s| s.to_string()))
                 .unwrap_or_else(|| path.to_string());
 
+            // Check if already in registry
             if let Some(db) = registry.get(&canonical_path).and_then(Weak::upgrade) {
                 tracing::debug!("took database {canonical_path:?} from the registry");
 
@@ -577,39 +604,42 @@ impl Database {
                     ));
                 }
 
+                // Found in registry, no need to hold lock
                 return Ok(IOResult::Done(db));
             }
+
+            // Not in registry, hold the lock and store canonical path for later insertion
+            state.registry_guard = Some(registry);
+            state.canonical_path = Some(canonical_path);
         }
 
-        // Open the database asynchronously
-        let wal_path = format!("{path}-wal");
+        // Open the database asynchronously (registry lock is held in state for not `:memory:.*` pathes)
         let result = Self::open_with_flags_bypass_registry_async(
             state,
             io,
             path,
-            &wal_path,
+            None,
             db_file,
             flags,
             opts,
             encryption_opts,
         )?;
 
-        // If done, insert into registry
         if let IOResult::Done(ref db) = result {
-            let canonical_path = std::fs::canonicalize(path)
-                .ok()
-                .and_then(|p| p.to_str().map(|s| s.to_string()))
-                .unwrap_or_else(|| path.to_string());
-
-            let mut registry = DATABASE_MANAGER.lock();
-            registry.insert(canonical_path, Arc::downgrade(db));
+            // will be unset in case of `:memory:.*` path
+            if let (Some(mut registry), Some(canonical_path)) =
+                (state.registry_guard.take(), state.canonical_path.take())
+            {
+                registry.insert(canonical_path, Arc::downgrade(db));
+            }
         }
 
         Ok(result)
     }
 
+    /// method for tests - for all other code we must use async alternative
     #[allow(clippy::arc_with_non_send_sync)]
-    #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
+    #[cfg(all(test, feature = "fs", feature = "conn_raw_api"))]
     pub fn open_with_flags_bypass_registry(
         io: Arc<dyn IO>,
         path: &str,
@@ -625,7 +655,7 @@ impl Database {
                 &mut state,
                 io.clone(),
                 path,
-                wal_path,
+                Some(wal_path),
                 db_file.clone(),
                 flags,
                 opts,
@@ -642,13 +672,41 @@ impl Database {
     /// Async version of database opening that returns IOResult.
     /// Caller must drive the IO loop and pass state between calls.
     /// This is useful for sync engine which needs to yield on IO.
-    #[allow(clippy::arc_with_non_send_sync)]
     #[allow(clippy::too_many_arguments)]
     pub fn open_with_flags_bypass_registry_async(
         state: &mut OpenDbAsyncState,
         io: Arc<dyn IO>,
         path: &str,
-        wal_path: &str,
+        wal_path: Option<&str>,
+        db_file: Arc<dyn DatabaseStorage>,
+        flags: OpenFlags,
+        opts: DatabaseOpts,
+        encryption_opts: Option<EncryptionOpts>,
+    ) -> Result<IOResult<Arc<Database>>> {
+        let result = Self::open_with_flags_bypass_registry_async_internal(
+            state,
+            io,
+            path,
+            wal_path,
+            db_file,
+            flags,
+            opts,
+            encryption_opts,
+        );
+        if result.is_err() {
+            // schema_guard is set by the open_with_flags_bypass_registry_async_internal - so we release it in case of error
+            // registry_guard is not managed by this function - so we don't touch it here and reset in the appropriate place
+            let _ = state.schema_guard.take();
+        }
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn open_with_flags_bypass_registry_async_internal(
+        state: &mut OpenDbAsyncState,
+        io: Arc<dyn IO>,
+        path: &str,
+        wal_path: Option<&str>,
         db_file: Arc<dyn DatabaseStorage>,
         flags: OpenFlags,
         opts: DatabaseOpts,
@@ -668,6 +726,11 @@ impl Database {
                         None
                     };
 
+                    let wal_path = if let Some(wal_path) = wal_path {
+                        wal_path
+                    } else {
+                        &format!("{path}-wal")
+                    };
                     let mut db = Self::new(
                         opts,
                         flags,
@@ -694,15 +757,12 @@ impl Database {
                     let db = Arc::new(db);
 
                     // Check: https://github.com/tursodatabase/turso/pull/1761#discussion_r2154013123
-
-                    // parse schema
                     let conn = db._connect(false, Some(pager.clone()), encryption_key.clone())?;
 
                     // Acquire schema lock and hold it through ReadingHeader and LoadingSchema phases
                     // to ensure schema_version and make_from_btree are atomic
                     let guard = db.schema.lock_arc();
 
-                    tracing::info!("indexes: {}", guard.indexes.len());
                     state.db = Some(db);
                     state.pager = Some(pager);
                     state.conn = Some(conn);
@@ -717,9 +777,8 @@ impl Database {
                         .pager
                         .as_ref()
                         .expect("pager must be initialized in Init phase");
-                    let header_schema_cookie = return_if_io!(pager
-                        .with_header(|header| header.schema_cookie.get())
-                        .inspect_err(|_| state.schema_guard = None));
+                    let header_schema_cookie =
+                        return_if_io!(pager.with_header(|header| header.schema_cookie.get()));
                     let guard = state
                         .schema_guard
                         .as_mut()
@@ -755,7 +814,7 @@ impl Database {
                     let result = schema.make_from_btree(
                         &mut state.make_from_btree_state,
                         None,
-                        pager.clone(),
+                        &pager,
                         &syms,
                         enable_triggers,
                     );
@@ -769,15 +828,10 @@ impl Database {
                         Err(LimboError::ExtensionError(e)) => {
                             // this means that a vtab exists and we no longer have the module loaded.
                             // we print a warning to the user to load the module
-                            state.make_from_btree_state.cleanup(pager);
                             state.schema_guard = None;
-                            eprintln!("Warning: {e}");
+                            tracing::warn!("open warning, failed to load extension: {e}");
                         }
-                        Err(e) => {
-                            state.make_from_btree_state.cleanup(pager);
-                            state.schema_guard = None;
-                            return Err(e);
-                        }
+                        Err(e) => return Err(e),
                     }
 
                     state.phase = OpenDbAsyncPhase::BootstrapMvStore;

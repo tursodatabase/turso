@@ -6,7 +6,7 @@ use std::{
     },
 };
 
-use turso_core::{Buffer, Completion, DatabaseStorage, OpenFlags};
+use turso_core::{Buffer, Completion, DatabaseStorage, OpenDbAsyncState, OpenFlags};
 
 use crate::{
     database_replay_generator::DatabaseReplayGenerator,
@@ -520,16 +520,33 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         Self::open_db(coro, io, sync_engine_io, main_db, opts).await
     }
 
-    fn open_revert_db_conn(&self) -> Result<Arc<turso_core::Connection>> {
-        let db = turso_core::Database::open_with_flags_bypass_registry(
-            self.io.clone(),
-            &self.main_db_path,
-            &self.revert_db_wal_path,
-            self.db_file.clone(),
-            OpenFlags::Create,
-            turso_core::DatabaseOpts::new(),
-            None,
-        )?;
+    async fn open_revert_db_conn<Ctx>(
+        &self,
+        coro: &Coro<Ctx>,
+    ) -> Result<Arc<turso_core::Connection>> {
+        let db = {
+            let mut state = OpenDbAsyncState::new();
+            loop {
+                match turso_core::Database::open_with_flags_bypass_registry_async(
+                    &mut state,
+                    self.io.clone(),
+                    &self.main_db_path,
+                    Some(&self.revert_db_wal_path),
+                    self.db_file.clone(),
+                    OpenFlags::Create,
+                    turso_core::DatabaseOpts::new(),
+                    None,
+                )? {
+                    turso_core::IOResult::Done(db) => break db,
+                    turso_core::IOResult::IO(io_completion) => {
+                        while !io_completion.finished() {
+                            let _ = coro.yield_(SyncEngineIoResult::IO).await?;
+                        }
+                        continue;
+                    }
+                }
+            }
+        };
         let conn = db.connect()?;
         conn.wal_auto_checkpoint_disable();
         Ok(conn)
@@ -632,7 +649,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             self.main_db_path
         );
         let main_conn = connect_untracked(&self.main_tape)?;
-        let revert_conn = self.open_revert_db_conn()?;
+        let revert_conn = self.open_revert_db_conn(coro).await?;
 
         let mut page = [0u8; PAGE_SIZE];
         let db_size = if revert_conn.try_wal_watermark_read_page(1, &mut page, None)? {
@@ -835,7 +852,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
 
         let (_, watermark) = self.checkpoint_passive(coro).await?;
 
-        let revert_conn = self.open_revert_db_conn()?;
+        let revert_conn = self.open_revert_db_conn(coro).await?;
         let main_conn = connect_untracked(&self.main_tape)?;
 
         let mut revert_session = WalSession::new(revert_conn.clone());
