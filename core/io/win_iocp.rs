@@ -65,8 +65,8 @@ use windows_sys::Win32::Storage::FileSystem::{
     OPEN_ALWAYS, OPEN_EXISTING,
 };
 use windows_sys::Win32::System::IO::{
-    CancelIo, CancelIoEx, CreateIoCompletionPort, GetOverlappedResult, GetQueuedCompletionStatus,
-    OVERLAPPED, OVERLAPPED_0, OVERLAPPED_0_0,
+    CancelIoEx, CreateIoCompletionPort, GetOverlappedResult, GetQueuedCompletionStatus, OVERLAPPED,
+    OVERLAPPED_0, OVERLAPPED_0_0,
 };
 
 // Constants
@@ -303,7 +303,7 @@ impl IO for WindowsIOCP {
             if std::env::var(common::ENV_DISABLE_FILE_LOCK).is_err()
                 || !open_flags.contains(OpenFlags::ReadOnly)
             {
-                //windows_file.lock_file(true)?;
+                windows_file.lock_file(true)?;
             }
 
             Ok(windows_file)
@@ -418,7 +418,7 @@ impl InnerWindowsIOCP {
         })
     }
 
-    fn salvage_or_create_io_packet(&self) -> IoPacket {
+    fn recycle_or_create_io_packet(&self) -> IoPacket {
         self.free_io_packets.lock().pop_front().unwrap_or_else(|| {
             Arc::new(IoOverlappedPacket {
                 overlapped: OVERLAPPED::default(),
@@ -427,19 +427,19 @@ impl InnerWindowsIOCP {
         })
     }
 
-    fn salvage_or_create_io_packet_from_completion(
+    fn recycle_or_create_io_packet_from_completion(
         &self,
         completion: Completion,
         position: u64,
     ) -> IoPacket {
         trace!("new salvaged overlapped packet. ");
 
-        let mut packet = self.salvage_or_create_io_packet();
+        let mut packet = self.recycle_or_create_io_packet();
 
         assert!(packet.completion.is_none());
 
         let content =
-            Arc::get_mut(&mut packet).expect("This object should have no references elsewhere");
+            Arc::get_mut(&mut packet).expect("This IO Packet should not have references elsewhere");
 
         let low_part = position as u32;
         let high_part = (position >> 32) as u32;
@@ -469,8 +469,7 @@ impl InnerWindowsIOCP {
         let completion_key = get_unique_key_from_completion(&completion);
 
         if lock.contains_key(&completion_key) {
-            debug_assert!(false, "This should not happen");
-            return false;
+            panic!("Completion should have one and only one io packet, this should not happen");
         }
 
         let completion_key = add_ref_completion_pointer_and_get_key(completion);
@@ -490,7 +489,7 @@ impl InnerWindowsIOCP {
 
         if let Some(packet) = io_packet.completion.as_ref() {
             self.pop_io_context_from_completion(packet)
-                .expect("There should be record here");
+                .expect("There should be a completion record here in mapped I/O table");
         }
 
         let completion = Arc::get_mut(&mut io_packet)?.completion.take();
@@ -502,7 +501,7 @@ impl InnerWindowsIOCP {
     fn pop_io_context_from_completion(&self, completion: &Completion) -> Option<IoContext> {
         let key = get_unique_key_from_completion(completion);
         if let Some((key, context)) = self.tracked_io_packets.lock().remove_entry(&key) {
-            trace!("untrack completion for {key}");
+            trace!("remove completion {key} from mapped IO table");
             restore_and_consume_completion_ptr(key);
             return Some(context);
         }
@@ -532,7 +531,7 @@ pub struct WindowsFile {
 impl WindowsFile {
     fn sync_iocp_operation(&self, io_function: impl Fn(*mut OVERLAPPED) -> BOOL) -> Result<()> {
         let mut bytes = 0;
-        let packet_io = self.parent_io.salvage_or_create_io_packet();
+        let packet_io = self.parent_io.recycle_or_create_io_packet();
         let overlapped_ptr = Arc::into_raw(packet_io.clone()) as *mut OVERLAPPED;
         unsafe {
             let result = io_function(overlapped_ptr);
@@ -560,7 +559,7 @@ impl WindowsFile {
     ) -> Result<Completion> {
         let packet_io = self
             .parent_io
-            .salvage_or_create_io_packet_from_completion(completion.clone(), position);
+            .recycle_or_create_io_packet_from_completion(completion.clone(), position);
 
         let overlapped_ptr = Arc::into_raw(packet_io.clone()) as *mut OVERLAPPED;
 
@@ -592,7 +591,7 @@ impl File for WindowsFile {
     #[instrument(err, skip_all, level = Level::TRACE)]
     fn lock_file(&self, exclusive_access: bool) -> Result<()> {
         trace!(
-            "locking file {:08X} [ exclusive: {exclusive_access } ]..",
+            "locking file {:08X} [ exclusive: {exclusive_access} ]..",
             self.file_handle.addr()
         );
 
