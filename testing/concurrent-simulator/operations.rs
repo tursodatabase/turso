@@ -55,6 +55,16 @@ pub enum Operation {
     },
     /// Drop an index
     DropIndex { sql: String, index_name: String },
+    /// Create Elle list table for consistency checking
+    CreateElleTable { table_name: String },
+    /// Append value to an Elle list key
+    ElleAppend {
+        table_name: String,
+        key: String,
+        value: i64,
+    },
+    /// Read an Elle list by key
+    ElleRead { table_name: String, key: String },
 }
 
 pub type OpResult = Result<Vec<Vec<Value>>, LimboError>;
@@ -98,6 +108,31 @@ impl Operation {
             Operation::Delete { sql } => sql.clone(),
             Operation::CreateIndex { sql, .. } => sql.clone(),
             Operation::DropIndex { sql, .. } => sql.clone(),
+            Operation::CreateElleTable { table_name } => {
+                // Store values as comma-separated integers (e.g., "1,2,3")
+                // This avoids JSON function complexity while still being parseable
+                format!(
+                    "CREATE TABLE IF NOT EXISTS {table_name} (key TEXT PRIMARY KEY, vals TEXT DEFAULT '')"
+                )
+            }
+            Operation::ElleAppend {
+                table_name,
+                key,
+                value,
+            } => {
+                // Append value to vals column. If empty, set to value. Otherwise append with comma.
+                // Uses CASE to handle empty string vs non-empty string
+                format!(
+                    "INSERT INTO {table_name} (key, vals) VALUES ('{key}', '{value}') \
+                     ON CONFLICT(key) DO UPDATE SET vals = CASE \
+                       WHEN vals = '' THEN '{value}' \
+                       ELSE vals || ',' || '{value}' \
+                     END"
+                )
+            }
+            Operation::ElleRead { table_name, key } => {
+                format!("SELECT vals FROM {table_name} WHERE key = '{key}'")
+            }
         }
     }
 
@@ -155,6 +190,9 @@ impl Operation {
             }
             Operation::DropIndex { index_name, .. } => {
                 ctx.sim_state.indexes.remove(index_name);
+            }
+            Operation::CreateElleTable { table_name } => {
+                ctx.sim_state.elle_tables.insert(table_name.clone(), ());
             }
             _ => {}
         }

@@ -1,10 +1,13 @@
 //! Property-based validation for simulation.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Mutex;
 
 use anyhow::{anyhow, bail};
 use turso_core::{LimboError, Value};
 
+use crate::elle::ElleOp;
 use crate::operations::{OpResult, Operation};
 
 /// A property that can be validated during simulation.
@@ -201,4 +204,238 @@ impl Property for IntegrityCheckProperty {
             }
         }
     }
+}
+
+/// Property that records Elle history for transactional consistency analysis.
+/// Tracks all Elle operations and exports history to EDN format for elle-cli analysis.
+/// Writes events incrementally to the output file.
+pub struct ElleHistoryRecorder {
+    /// Pending transaction operations per fiber: fiber_id -> Vec<ElleOp>
+    pending_txns: Mutex<HashMap<usize, Vec<ElleOp>>>,
+    /// Output file handle for incremental writing
+    output_file: Mutex<std::fs::File>,
+    /// Counter for generating unique event indices
+    index_counter: Mutex<u64>,
+    /// Output path for reporting
+    output_path: PathBuf,
+    /// Count of events written
+    event_count: Mutex<usize>,
+}
+
+impl ElleHistoryRecorder {
+    pub fn new(output_path: PathBuf) -> Self {
+        let file = std::fs::File::create(&output_path).expect("Failed to create Elle output file");
+        Self {
+            pending_txns: Mutex::new(HashMap::new()),
+            output_file: Mutex::new(file),
+            index_counter: Mutex::new(0),
+            output_path,
+            event_count: Mutex::new(0),
+        }
+    }
+
+    /// Get the output path.
+    pub fn output_path(&self) -> &PathBuf {
+        &self.output_path
+    }
+
+    /// Get the number of events written.
+    pub fn event_count(&self) -> usize {
+        *self.event_count.lock().unwrap()
+    }
+
+    /// Write an event to the output file.
+    fn write_event(&self, event_type: &str, process: usize, ops: &[ElleOp]) {
+        use std::io::Write;
+
+        let mut index_counter = self.index_counter.lock().unwrap();
+        let index = *index_counter;
+        *index_counter += 1;
+        drop(index_counter);
+
+        let ops_str: Vec<String> = ops.iter().map(|op| op.to_edn()).collect();
+        let line = format!(
+            "{{:type {}, :f :txn, :value [{}], :process {}, :index {}}}\n",
+            event_type,
+            ops_str.join(" "),
+            process,
+            index
+        );
+
+        let mut file = self.output_file.lock().unwrap();
+        file.write_all(line.as_bytes())
+            .expect("Failed to write Elle event");
+
+        let mut count = self.event_count.lock().unwrap();
+        *count += 1;
+    }
+}
+
+impl Property for ElleHistoryRecorder {
+    fn finish_op(
+        &mut self,
+        _step: usize,
+        fiber_id: usize,
+        txn_id: Option<u64>,
+        _start_exec_id: u64,
+        _end_exec_id: u64,
+        op: &Operation,
+        result: &OpResult,
+    ) -> anyhow::Result<()> {
+        let mut pending_txns = self.pending_txns.lock().unwrap();
+
+        // Handle Begin - start tracking ops for this fiber
+        if let Operation::Begin { .. } = op {
+            if result.is_ok() {
+                pending_txns.insert(fiber_id, Vec::new());
+            }
+            return Ok(());
+        }
+
+        // Handle Commit - emit invoke/ok with all accumulated ops
+        if let Operation::Commit = op {
+            if result.is_ok() {
+                if let Some(ops) = pending_txns.remove(&fiber_id) {
+                    if !ops.is_empty() {
+                        // Record invoke with the ops (nil results for reads)
+                        let invoke_ops: Vec<ElleOp> = ops
+                            .iter()
+                            .map(|o| match o {
+                                ElleOp::Read { key, .. } => ElleOp::Read {
+                                    key: key.clone(),
+                                    result: None,
+                                },
+                                other => other.clone(),
+                            })
+                            .collect();
+                        drop(pending_txns); // Release lock before writing
+                        self.write_event(":invoke", fiber_id, &invoke_ops);
+                        self.write_event(":ok", fiber_id, &ops);
+                    }
+                }
+            }
+            return Ok(());
+        }
+
+        // Handle Rollback - emit invoke/fail with accumulated ops
+        if let Operation::Rollback = op {
+            if let Some(ops) = pending_txns.remove(&fiber_id) {
+                if !ops.is_empty() {
+                    let invoke_ops: Vec<ElleOp> = ops
+                        .iter()
+                        .map(|o| match o {
+                            ElleOp::Read { key, .. } => ElleOp::Read {
+                                key: key.clone(),
+                                result: None,
+                            },
+                            other => other.clone(),
+                        })
+                        .collect();
+                    drop(pending_txns); // Release lock before writing
+                    self.write_event(":invoke", fiber_id, &invoke_ops);
+                    self.write_event(":fail", fiber_id, &ops);
+                }
+            }
+            return Ok(());
+        }
+
+        // Handle ElleAppend
+        if let Operation::ElleAppend { key, value, .. } = op {
+            let elle_op = ElleOp::Append {
+                key: key.clone(),
+                value: *value,
+            };
+
+            if txn_id.is_some() {
+                // In a transaction - accumulate the op
+                if let Some(ops) = pending_txns.get_mut(&fiber_id) {
+                    if result.is_ok() {
+                        ops.push(elle_op);
+                    }
+                }
+            } else {
+                // Auto-commit mode - emit single-op transaction immediately
+                drop(pending_txns); // Release lock before writing
+                let ops = vec![elle_op];
+                if result.is_ok() {
+                    self.write_event(":invoke", fiber_id, &ops);
+                    self.write_event(":ok", fiber_id, &ops);
+                } else {
+                    self.write_event(":invoke", fiber_id, &ops);
+                    self.write_event(":fail", fiber_id, &ops);
+                }
+            }
+            return Ok(());
+        }
+
+        // Handle ElleRead
+        if let Operation::ElleRead { key, .. } = op {
+            // Parse the result to get the list values
+            let read_result = if let Ok(rows) = result {
+                if rows.is_empty() {
+                    // Key doesn't exist yet - empty list
+                    Some(vec![])
+                } else if let Some(row) = rows.first() {
+                    if let Some(Value::Text(csv_str)) = row.first() {
+                        // Parse comma-separated integers like "1,2,3"
+                        parse_comma_separated_ints(csv_str.as_str())
+                    } else {
+                        // Null or unexpected type - treat as empty list
+                        Some(vec![])
+                    }
+                } else {
+                    Some(vec![])
+                }
+            } else {
+                None // Operation failed
+            };
+
+            let elle_op = ElleOp::Read {
+                key: key.clone(),
+                result: read_result,
+            };
+
+            if txn_id.is_some() {
+                // In a transaction - accumulate the op
+                if let Some(ops) = pending_txns.get_mut(&fiber_id) {
+                    if result.is_ok() {
+                        ops.push(elle_op);
+                    }
+                }
+            } else {
+                // Auto-commit mode - emit single-op transaction immediately
+                let invoke_op = ElleOp::Read {
+                    key: key.clone(),
+                    result: None,
+                };
+                drop(pending_txns); // Release lock before writing
+                if result.is_ok() {
+                    self.write_event(":invoke", fiber_id, &[invoke_op]);
+                    self.write_event(":ok", fiber_id, &[elle_op]);
+                } else {
+                    self.write_event(":invoke", fiber_id, &[invoke_op]);
+                    self.write_event(
+                        ":fail",
+                        fiber_id,
+                        &[ElleOp::Read {
+                            key: key.clone(),
+                            result: None,
+                        }],
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// Parse a comma-separated list of integers like "1,2,3" into a Vec<i64>.
+fn parse_comma_separated_ints(s: &str) -> Option<Vec<i64>> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Some(vec![]);
+    }
+    let values: Result<Vec<i64>, _> = s.split(',').map(|v| v.trim().parse::<i64>()).collect();
+    values.ok()
 }
