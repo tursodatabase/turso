@@ -1154,6 +1154,16 @@ impl Value {
         result.map(|v| v.to_owned()).unwrap_or(Value::Null)
     }
 
+    /// Concatenate another value onto this Text value, converting both to strings.
+    /// Used by GROUP_CONCAT/STRING_AGG to properly handle all value types.
+    /// Panics if self is not a Text value.
+    pub fn exec_group_concat(&mut self, other: &Value) {
+        let Value::Text(text) = self else {
+            panic!("concat_to_text must be called only on Value::Text");
+        };
+        text.value.to_mut().push_str(&other.to_string());
+    }
+
     pub fn exec_concat_strings<'a, T: Iterator<Item = &'a Self>>(registers: T) -> Self {
         let mut result = String::new();
         for val in registers {

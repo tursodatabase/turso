@@ -3692,7 +3692,7 @@ fn apply_kbn_step_int(acc: &mut Value, i: i64, state: &mut SumAggState) {
 /// - Total: [Float(0.0), Float(0.0), Integer(0), Integer(0)]  // same but starts at 0.0
 /// - Avg: [Float(0.0), Float(0.0), Integer(0)]  // sum, r_err, count - uses KBN like SUM
 /// - Min/Max: [Null]
-/// - GroupConcat/StringAgg: [Text("")]
+/// - GroupConcat/StringAgg: [Null] (becomes Text on first non-null value)
 /// - JsonGroupObject/JsonbGroupObject: [Blob([])]
 /// - JsonGroupArray/JsonbGroupArray: [Blob([])]
 fn init_agg_payload(func: &AggFunc, payload: &mut Vec<Value>) -> Result<()> {
@@ -3716,7 +3716,8 @@ fn init_agg_payload(func: &AggFunc, payload: &mut Vec<Value>) -> Result<()> {
         }
         AggFunc::Min | AggFunc::Max => payload.push(Value::Null),
         AggFunc::GroupConcat | AggFunc::StringAgg => {
-            payload.push(Value::build_text(""));
+            // Use Null as sentinel to distinguish "no values yet" from "accumulated empty string"
+            payload.push(Value::Null);
         }
         AggFunc::External(_) => {
             // External aggregates use ExternalAggState, not flat payload
@@ -3757,7 +3758,7 @@ fn init_agg_payload(func: &AggFunc, payload: &mut Vec<Value>) -> Result<()> {
 ///   - `approx`: 1 if result is approximate (float arithmetic used)
 ///   - `ovrfl`: 1 if integer overflow occurred (Total promotes to float, Sum errors)
 /// - **Min/Max**: `[current_extreme: Value]` - tracks min/max seen so far
-/// - **GroupConcat/StringAgg**: `[accumulated: Text]` - concatenated string
+/// - **GroupConcat/StringAgg**: `[accumulated: Null|Text]` - Null until first value, then Text
 /// - **JsonGroup***: `[raw_jsonb: Blob]` - accumulated raw JSONB bytes
 fn update_agg_payload(
     func: &AggFunc,
@@ -3946,13 +3947,17 @@ fn update_agg_payload(
             }
         }
         AggFunc::GroupConcat | AggFunc::StringAgg => {
+            if matches!(arg, Value::Null) {
+                return Ok(());
+            }
             let delimiter = maybe_arg2.unwrap_or_else(|| Value::build_text(","));
             let acc = &mut payload[0];
-            if acc.to_string().is_empty() {
-                *acc = arg;
-            } else if !matches!(arg, Value::Null) {
-                *acc += delimiter;
-                *acc += arg;
+            if matches!(acc, Value::Null) {
+                // First non-null value: convert to Text
+                *acc = Value::build_text(arg.to_string());
+            } else {
+                acc.exec_group_concat(&delimiter);
+                acc.exec_group_concat(&arg);
             }
         }
         AggFunc::External(_) => {
