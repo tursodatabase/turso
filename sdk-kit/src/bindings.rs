@@ -155,7 +155,7 @@ unsafe extern "C" {
     ) -> turso_status_code_t;
 }
 unsafe extern "C" {
-    #[doc = " Open database"]
+    #[doc = " Open database\n  Can return TURSO_IO result if async_io=true is set"]
     pub fn turso_database_open(
         database: *const turso_database_t,
         error_opt_out: *mut *const ::std::os::raw::c_char,
