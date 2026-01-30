@@ -1921,51 +1921,58 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         self.find_next_visible_index_row(tx, mv_store_iterator)
     }
 
-    pub fn find_row_last_version_state(
+    /// Check if the B-tree version of a row should be shown to the given transaction.
+    ///
+    /// Returns true if the B-tree version is valid (should be shown).
+    /// Returns false if the B-tree version is shadowed or deleted by MVCC.
+    pub fn query_btree_version_is_valid(
         &self,
         table_id: MVTableId,
         row_id: &RowKey,
         tx_id: TxID,
-    ) -> RowVersionState {
+    ) -> bool {
         let tx = self
             .txs
             .get(&tx_id)
             .expect("transaction should exist in txs map");
         let tx = tx.value();
+
         match row_id {
             RowKey::Int(_) => {
-                let Some(versions) = self.rows.get(&RowID {
+                let row_id_full = RowID {
                     table_id,
                     row_id: row_id.clone(),
-                }) else {
-                    return RowVersionState::NotFound;
+                };
+                let Some(versions) = self.rows.get(&row_id_full) else {
+                    // No MVCC version -> B-tree is valid
+                    return true;
                 };
                 let versions = versions.value().read();
-                let Some(last_version) = versions.last() else {
-                    return RowVersionState::NotFound;
-                };
-                if last_version.is_visible_to(tx, &self.txs) {
-                    RowVersionState::LiveVersion
-                } else {
-                    RowVersionState::Deleted
-                }
+
+                // Check if any version invalidates the B-tree row
+                let btree_is_invalid = versions
+                    .iter()
+                    .rev()
+                    .any(|version| version.is_btree_invalidating_version(tx, &self.txs));
+
+                !btree_is_invalid
             }
             RowKey::Record(record) => {
                 let index_rows = self.index_rows.get_or_insert_with(table_id, SkipMap::new);
                 let index_rows = index_rows.value();
                 let Some(versions) = index_rows.get(record) else {
-                    return RowVersionState::NotFound;
+                    // No MVCC version -> B-tree is valid
+                    return true;
                 };
                 let versions = versions.value().read();
-                if let Some(last_version) = versions.last() {
-                    if last_version.is_visible_to(tx, &self.txs) {
-                        RowVersionState::LiveVersion
-                    } else {
-                        RowVersionState::Deleted
-                    }
-                } else {
-                    RowVersionState::NotFound
-                }
+
+                // Check if any version invalidates the B-tree row
+                let btree_is_invalid = versions
+                    .iter()
+                    .rev()
+                    .any(|version| version.is_btree_invalidating_version(tx, &self.txs));
+
+                !btree_is_invalid
             }
         }
     }
@@ -3204,8 +3211,44 @@ pub(crate) fn is_write_write_conflict(
 }
 
 impl RowVersion {
+    /// A row is visible to a transaction if:
+    /// * Begin is visible to the transaction
+    /// * End timestamp is not applicable yet, meaning deletion of row is not visible to this transaction
     pub fn is_visible_to(&self, tx: &Transaction, txs: &SkipMap<TxID, Transaction>) -> bool {
         is_begin_visible(txs, tx, self) && is_end_visible(txs, tx, self)
+    }
+
+    /// Check if this version indicates the B-tree row has been modified (updated or deleted).
+    ///
+    /// A version is "relevant" to a transaction if:
+    /// 1. The version is fully visible (begin visible AND end visible), OR
+    /// 2. The version has an end timestamp that indicates the row was deleted before/at the transaction's begin, OR
+    /// 3. The current transaction itself has deleted/updated this row (end = current tx_id)
+    ///
+    /// This is used by dual-cursor to determine if a B-tree row should be shown or hidden.
+    pub fn is_btree_invalidating_version(
+        &self,
+        tx: &Transaction,
+        txs: &SkipMap<TxID, Transaction>,
+    ) -> bool {
+        // If the version is fully visible, it invalidates the B-tree
+        if self.is_visible_to(tx, txs) {
+            return true;
+        }
+
+        // Check if this version represents a deletion/update that affects us
+        match self.end {
+            Some(TxTimestampOrID::Timestamp(end_ts)) => {
+                // Row was deleted at end_ts. If we started at or after end_ts, we shouldn't see it
+                tx.begin_ts >= end_ts
+            }
+            Some(TxTimestampOrID::TxID(end_tx_id)) => {
+                // Row is being deleted/updated by another transaction
+                // If it's OUR transaction, the B-tree row is invalid (we deleted/updated it)
+                end_tx_id == tx.tx_id
+            }
+            None => false,
+        }
     }
 }
 

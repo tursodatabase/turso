@@ -4,8 +4,7 @@ use crossbeam_skiplist::SkipMap;
 
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::database::{
-    create_seek_range, MVTableId, MvStore, Row, RowID, RowKey, RowVersion, RowVersionState,
-    SortableIndexKey,
+    create_seek_range, MVTableId, MvStore, Row, RowID, RowKey, RowVersion, SortableIndexKey,
 };
 use crate::storage::btree::{BTreeCursor, BTreeKey, CursorTrait};
 use crate::sync::Arc;
@@ -442,12 +441,8 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
     }
 
     fn query_btree_version_is_valid(&self, key: &RowKey) -> bool {
-        let res = self
-            .db
-            .find_row_last_version_state(self.table_id, key, self.tx_id);
-        tracing::trace!("query_btree_version_is_valid: {:?}, key: {:?}", res, key);
-        // If the row is not found in MVCC index, this means row_id is valid in btree
-        matches!(res, RowVersionState::NotFound)
+        self.db
+            .query_btree_version_is_valid(self.table_id, key, self.tx_id)
     }
 
     /// Advance MVCC iterator and return next visible row key in the direction that the iterator was initialized in.
@@ -1400,6 +1395,14 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
 
             // MVCC doesn't have it, but we need to check B-tree too
             if self.is_btree_allocated() {
+                // Check if the B-tree version is valid (not shadowed/deleted by MVCC)
+                let btree_is_valid = self.query_btree_version_is_valid(&RowKey::Int(*int_key));
+
+                // If B-tree is invalid (row is deleted or shadowed), don't check B-tree
+                if !btree_is_valid {
+                    self.state = None;
+                    return Ok(IOResult::Done(false));
+                }
                 self.state
                     .replace(MvccLazyCursorState::Exists(ExistsState::ExistsBtree));
             } else {
