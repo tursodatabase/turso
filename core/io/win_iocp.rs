@@ -47,6 +47,7 @@ use crate::{Clock, Completion, File, LimboError, OpenFlags, Result, IO};
 use smallvec::SmallVec;
 use std::collections::{HashMap, VecDeque};
 use std::error::Error;
+use std::io::ErrorKind;
 use std::ptr::NonNull;
 use windows_sys::core::BOOL;
 
@@ -68,6 +69,8 @@ use windows_sys::Win32::System::IO::{
     CancelIoEx, CreateIoCompletionPort, GetOverlappedResult, GetQueuedCompletionStatus, OVERLAPPED,
     OVERLAPPED_0, OVERLAPPED_0_0,
 };
+
+use super::FileSyncType;
 
 // Constants
 
@@ -529,22 +532,30 @@ pub struct WindowsFile {
 }
 
 impl WindowsFile {
-    fn sync_iocp_operation(&self, io_function: impl Fn(*mut OVERLAPPED) -> BOOL) -> Result<()> {
+    fn sync_iocp_operation(
+        &self,
+        io_function: impl Fn(*mut OVERLAPPED) -> BOOL,
+    ) -> Result<(), u32> {
         let mut bytes = 0;
         let packet_io = self.parent_io.recycle_or_create_io_packet();
         let overlapped_ptr = Arc::into_raw(packet_io.clone()) as *mut OVERLAPPED;
         unsafe {
             let result = io_function(overlapped_ptr);
             let error = GetLastError();
+            // the io function fails
             if result == FALSE && error != ERROR_IO_PENDING {
                 let io_packet = Arc::from_raw(overlapped_ptr as *mut IoOverlappedPacket);
                 let _ = self.parent_io.forget_io_packet(io_packet);
-                return Err(get_limboerror_from_last_os_err());
+                return Err(GetLastError());
             }
 
-            if GetOverlappedResult(self.file_handle, overlapped_ptr, &raw mut bytes, TRUE) == FALSE
+            // if it is async wait for it
+            if result == FALSE
+                // && error == ERROR_IO_PENDING
+                && GetOverlappedResult(self.file_handle, overlapped_ptr, &raw mut bytes, TRUE)
+                    == FALSE
             {
-                return Err(get_limboerror_from_last_os_err());
+                return Err(GetLastError());
             }
         }
 
@@ -611,6 +622,10 @@ impl File for WindowsFile {
                 overlapped,
             )
         })
+        .map_err(|err| {
+            let error = io::Error::from_raw_os_error(err as i32);
+            LimboError::LockingError(error.to_string())
+        })
     }
 
     #[instrument(err, skip_all, level = Level::TRACE)]
@@ -618,6 +633,10 @@ impl File for WindowsFile {
         trace!("Unlocking file {:08X}", self.file_handle.addr());
         self.sync_iocp_operation(|overlapped| unsafe {
             UnlockFileEx(self.file_handle, 0, u32::MAX, u32::MAX, overlapped)
+        })
+        .map_err(|err| {
+            let error = io::Error::from_raw_os_error(err as i32);
+            LimboError::LockingError(error.to_string())
         })
     }
 
@@ -679,7 +698,7 @@ impl File for WindowsFile {
     }
 
     #[instrument(err, skip_all, level = Level::TRACE)]
-    fn sync(&self, completion: Completion) -> Result<Completion> {
+    fn sync(&self, completion: Completion, _sync_type: FileSyncType) -> Result<Completion> {
         trace!(
             "sync for handle {:08X} with completion {}",
             self.file_handle.addr(),
@@ -750,5 +769,17 @@ impl Drop for WindowsFile {
             CancelIoEx(self.file_handle, ptr::null());
             CloseHandle(self.file_handle);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::io::common;
+
+    use super::WindowsIOCP;
+
+    #[test]
+    fn test_multiple_processes_cannot_open_file() {
+        common::tests::test_multiple_processes_cannot_open_file(WindowsIOCP::new);
     }
 }
