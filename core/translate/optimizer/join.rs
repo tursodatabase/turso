@@ -1723,6 +1723,7 @@ mod tests {
             &[],
             &empty_schema(),
             &DEFAULT_PARAMS,
+            None,
         )
         .unwrap();
 
@@ -1765,6 +1766,7 @@ mod tests {
             &[],
             &empty_schema(),
             &DEFAULT_PARAMS,
+            None,
         )
         .unwrap();
 
@@ -1819,6 +1821,7 @@ mod tests {
             &[],
             &empty_schema(),
             &DEFAULT_PARAMS,
+            None,
         )
         .unwrap();
 
@@ -1902,6 +1905,7 @@ mod tests {
             &[],
             &empty_schema(),
             &DEFAULT_PARAMS,
+            None,
         )
         .unwrap();
         // SELECT * FROM test_table WHERE id = 42
@@ -1996,6 +2000,7 @@ mod tests {
             &[],
             &empty_schema(),
             &DEFAULT_PARAMS,
+            None,
         )
         .unwrap();
 
@@ -2190,6 +2195,7 @@ mod tests {
             &[],
             &empty_schema(),
             &DEFAULT_PARAMS,
+            None,
         )
         .unwrap();
 
@@ -2312,6 +2318,7 @@ mod tests {
             &[],
             &empty_schema(),
             &DEFAULT_PARAMS,
+            None,
         )
         .unwrap();
 
@@ -2431,6 +2438,7 @@ mod tests {
             &[],
             &empty_schema(),
             &DEFAULT_PARAMS,
+            None,
         )
         .unwrap();
 
@@ -2528,6 +2536,7 @@ mod tests {
             &[],
             &empty_schema(),
             &DEFAULT_PARAMS,
+            None,
         )
         .unwrap();
 
@@ -2667,6 +2676,7 @@ mod tests {
             &[],
             &empty_schema(),
             &DEFAULT_PARAMS,
+            None,
         )
         .unwrap();
 
@@ -2794,6 +2804,7 @@ mod tests {
             &[],
             &empty_schema(),
             &DEFAULT_PARAMS,
+            None,
         )
         .unwrap();
 
@@ -2939,6 +2950,7 @@ mod tests {
             &[],
             &empty_schema(),
             &DEFAULT_PARAMS,
+            None,
         )
         .unwrap();
 
@@ -3155,6 +3167,7 @@ mod tests {
             &[],
             &empty_schema(),
             &DEFAULT_PARAMS,
+            None,
         )
         .unwrap();
 
