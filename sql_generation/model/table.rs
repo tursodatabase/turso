@@ -261,9 +261,9 @@ impl SimValue {
                 // TODO: support ESCAPE `expr` option in AST
                 // TODO: regex cache
                 types::Value::exec_like(
-                    None,
                     other.0.to_string().as_str(),
                     self.0.to_string().as_str(),
+                    None,
                 )
             }
             ast::LikeOperator::Match => todo!(),

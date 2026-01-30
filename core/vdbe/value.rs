@@ -1,7 +1,3 @@
-use std::collections::HashMap;
-
-use regex::{Regex, RegexBuilder};
-
 use crate::{
     function::MathFunc,
     numeric::{format_float, NullableInteger, Numeric},
@@ -833,7 +829,7 @@ impl Value {
         // If any of the casts failed, panic as text casting is not expected to fail.
         match (&source, &pattern, &replacement) {
             (Value::Text(source), Value::Text(pattern), Value::Text(replacement)) => {
-                if pattern.as_str().is_empty() {
+                if pattern.as_str().is_empty() || pattern.as_str().starts_with('\0') {
                     return Value::Text(source.clone());
                 }
 
@@ -1052,12 +1048,7 @@ impl Value {
         }
     }
 
-    // Implements LIKE pattern matching. Caches the constructed regex if a cache is provided
-    pub fn exec_like(
-        regex_cache: Option<&mut HashMap<String, Regex>>,
-        pattern: &str,
-        text: &str,
-    ) -> Result<bool, LimboError> {
+    pub fn exec_like(pattern: &str, text: &str, escape: Option<char>) -> Result<bool, LimboError> {
         const MAX_LIKE_PATTERN_LENGTH: usize = 50000;
         if pattern.len() > MAX_LIKE_PATTERN_LENGTH {
             return Err(LimboError::Constraint(
@@ -1065,13 +1056,18 @@ impl Value {
             ));
         }
 
+        let has_escape = escape.is_some_and(|e| pattern.contains(e));
+
         // 1. Exact match (no wildcards)
-        if !pattern.contains(['%', '_']) {
+        if !has_escape && !pattern.contains(['%', '_']) {
             return Ok(pattern.eq_ignore_ascii_case(text));
         }
 
         // 2. Fast Path: 'abc%' (Prefix)
-        if pattern.ends_with('%') && !pattern[..pattern.len() - 1].contains(['%', '_']) {
+        if !has_escape
+            && pattern.ends_with('%')
+            && !pattern[..pattern.len() - 1].contains(['%', '_'])
+        {
             let prefix = &pattern[..pattern.len() - 1];
             if text.len() >= prefix.len() && text.is_char_boundary(prefix.len()) {
                 return Ok(text[..prefix.len()].eq_ignore_ascii_case(prefix));
@@ -1080,7 +1076,7 @@ impl Value {
         }
 
         // 3. Fast Path: '%abc' (Suffix)
-        if pattern.starts_with('%') && !pattern[1..].contains(['%', '_']) {
+        if !has_escape && pattern.starts_with('%') && !pattern[1..].contains(['%', '_']) {
             let suffix = &pattern[1..];
             let start = text.len().wrapping_sub(suffix.len());
             if text.len() >= suffix.len() && text.is_char_boundary(start) {
@@ -1089,37 +1085,7 @@ impl Value {
             // Fall through to regex if boundary check fails (multi-byte UTF-8)
         }
 
-        // 4. Fast Path: '%abc%' (Contains)
-        if pattern.len() > 1 && pattern.starts_with('%') && pattern.ends_with('%') {
-            let inner = &pattern[1..pattern.len() - 1];
-            if !inner.contains(['%', '_']) {
-                return Ok(text
-                    .to_ascii_lowercase()
-                    .contains(&inner.to_ascii_lowercase()));
-            }
-        }
-
-        // 5. Fallback to Regex
-        if let Some(cache) = regex_cache {
-            match cache.get(pattern) {
-                Some(re) => Ok(re.is_match(text)),
-                None => {
-                    match construct_like_regex(pattern) {
-                        Ok(re) => {
-                            let res = re.is_match(text);
-                            cache.insert(pattern.to_string(), re);
-                            Ok(res)
-                        }
-                        Err(_) => Ok(false), // Suppress error, return 0
-                    }
-                }
-            }
-        } else {
-            match construct_like_regex(pattern) {
-                Ok(re) => Ok(re.is_match(text)),
-                Err(_) => Ok(false),
-            }
-        }
+        Ok(pattern_compare(pattern, text, escape) == CompareResult::Match)
     }
 
     pub fn exec_min<'a, T: Iterator<Item = &'a Value>>(regs: T) -> Value {
@@ -1222,39 +1188,141 @@ impl Value {
     }
 }
 
-pub fn construct_like_regex(pattern: &str) -> Result<Regex, LimboError> {
-    let mut regex_pattern = String::with_capacity(pattern.len() * 2);
+/// Result of LIKE pattern comparison.
+/// `NoWildcardMatch` signals an early abort when a literal after `%` cannot be found,
+/// allowing the algorithm to skip unnecessary backtracking.
+#[derive(PartialEq)]
+enum CompareResult {
+    Match,
+    NoMatch,
+    NoWildcardMatch,
+}
 
-    regex_pattern.push('^');
+/// LIKE pattern matching based on SQLite's patternCompare algorithm (src/func.c).
+/// Uses recursive descent with early termination via `NoWildcardMatch` to avoid
+/// exponential backtracking on patterns like `%a%a%a%...%b`.
+fn pattern_compare(pattern: &str, text: &str, escape: Option<char>) -> CompareResult {
+    let mut p_indices = pattern.char_indices();
+    let mut t_indices = text.char_indices();
 
-    for c in pattern.chars() {
-        match c {
-            '\\' => regex_pattern.push_str("\\\\"),
-            '%' => regex_pattern.push_str(".*"),
-            '_' => regex_pattern.push('.'),
-            ch => {
-                if ch.is_ascii_alphabetic() {
-                    regex_pattern.push('[');
-                    regex_pattern.push(ch.to_ascii_lowercase());
-                    regex_pattern.push(ch.to_ascii_uppercase());
-                    regex_pattern.push(']');
-                } else {
-                    if regex_syntax::is_meta_character(c) {
-                        regex_pattern.push('\\');
+    let mut p_curr = p_indices.next();
+    let mut t_curr = t_indices.next();
+
+    // Checkpoints for backtracking
+    let mut wildcard_p_iter: Option<std::str::CharIndices> = None;
+    let mut wildcard_t_iter: Option<std::str::CharIndices> = None;
+
+    let match_all = '%';
+    let match_one = '_';
+
+    loop {
+        match (p_curr, t_curr) {
+            (Some((_, p_char)), Some((_, t_char))) => {
+                if p_char == match_all && Some(p_char) != escape {
+                    // Consume consecutive wildcards
+                    let mut next_p = p_indices.clone();
+                    while let Some((_, c)) = next_p.clone().next() {
+                        if c == match_all && Some(c) != escape {
+                            next_p.next(); // Consume valid %
+                        } else {
+                            break;
+                        }
                     }
-                    regex_pattern.push(ch);
+
+                    let mut lookahead_p = next_p.clone();
+                    if let Some((_, next_char)) = lookahead_p.next() {
+                        let is_wildcard = next_char == match_all || next_char == match_one;
+                        let is_escaped = Some(next_char) == escape;
+
+                        if !is_wildcard && !is_escaped {
+                            let mut found = false;
+
+                            // Check the current text char
+                            if eq_ignore_ascii_case(next_char, t_char) {
+                                found = true;
+                            } else {
+                                // Scan the rest of the text
+                                let lookahead_t = t_indices.clone();
+                                for (_, t_c) in lookahead_t {
+                                    if eq_ignore_ascii_case(next_char, t_c) {
+                                        found = true;
+                                        break;
+                                    }
+                                }
+                            }
+
+                            if !found {
+                                return CompareResult::NoWildcardMatch;
+                            }
+                        }
+                    }
+                    p_indices = next_p;
+                    wildcard_p_iter = Some(p_indices.clone());
+                    p_curr = p_indices.next();
+
+                    if p_curr.is_none() {
+                        return CompareResult::Match;
+                    }
+
+                    wildcard_t_iter = Some(t_indices.clone());
+                    continue;
+                }
+
+                if p_char == match_one && Some(p_char) != escape {
+                    p_curr = p_indices.next();
+                    t_curr = t_indices.next();
+                    continue;
+                }
+
+                let (expected_char, next_p_iter) = if Some(p_char) == escape {
+                    if let Some((_, literal)) = p_indices.next() {
+                        (literal, p_indices.clone())
+                    } else {
+                        return CompareResult::NoMatch;
+                    }
+                } else {
+                    (p_char, p_indices.clone())
+                };
+
+                if eq_ignore_ascii_case(expected_char, t_char) {
+                    p_indices = next_p_iter;
+                    p_curr = p_indices.next();
+                    t_curr = t_indices.next();
+                    continue;
                 }
             }
+            (None, None) => return CompareResult::Match,
+            (Some((_, p_char)), None) if p_char == match_all && Some(p_char) != escape => {
+                let mut temp = p_indices.clone();
+                loop {
+                    match temp.next() {
+                        Some((_, c)) if c == match_all && Some(c) != escape => continue,
+                        None => return CompareResult::Match,
+                        _ => break,
+                    }
+                }
+            }
+            _ => {}
         }
+
+        if let (Some(wp), Some(wt)) = (wildcard_p_iter.clone(), wildcard_t_iter.clone()) {
+            p_indices = wp;
+            p_curr = p_indices.next();
+            t_indices = wt.clone();
+            t_curr = t_indices.next();
+
+            if t_curr.is_some() {
+                wildcard_t_iter = Some(t_indices.clone());
+                continue;
+            }
+        }
+
+        return CompareResult::NoMatch;
     }
+}
 
-    regex_pattern.push('$');
-
-    RegexBuilder::new(&regex_pattern)
-        .dot_matches_new_line(true)
-        .size_limit(10 * (1 << 20))
-        .build()
-        .map_err(|_| LimboError::Constraint("LIKE or GLOB pattern too complex".to_string()))
+fn eq_ignore_ascii_case(a: char, b: char) -> bool {
+    a.eq_ignore_ascii_case(&b)
 }
 
 #[cfg(test)]
@@ -1263,7 +1331,6 @@ mod tests {
     use crate::vdbe::Register;
 
     use rand::{Rng, RngCore};
-    use std::collections::HashMap;
 
     #[test]
     fn test_exec_add() {
@@ -1991,34 +2058,37 @@ mod tests {
 
     #[test]
     fn test_like_with_escape_or_regexmeta_chars() {
-        assert!(Value::exec_like(None, r#"\%A"#, r#"\A"#).unwrap());
-        assert!(Value::exec_like(None, "%a%a", "aaaa").unwrap());
+        assert!(Value::exec_like(r#"\%A"#, r#"\A"#, None).unwrap());
+        assert!(Value::exec_like("%a%a", "aaaa", None).unwrap());
     }
 
     #[test]
-    fn test_like_no_cache() {
-        assert!(Value::exec_like(None, "a%", "aaaa").unwrap());
-        assert!(Value::exec_like(None, "%a%a", "aaaa").unwrap());
-        assert!(!Value::exec_like(None, "%a.a", "aaaa").unwrap());
-        assert!(!Value::exec_like(None, "a.a%", "aaaa").unwrap());
-        assert!(!Value::exec_like(None, "%a.ab", "aaaa").unwrap());
+    fn test_like_without_escape() {
+        assert!(Value::exec_like("a%", "aaaa", None).unwrap());
+        assert!(Value::exec_like("%a%a", "aaaa", None).unwrap());
+        assert!(!Value::exec_like("%a.a", "aaaa", None).unwrap());
+        assert!(!Value::exec_like("a.a%", "aaaa", None).unwrap());
+        assert!(!Value::exec_like("%a.ab", "aaaa", None).unwrap());
     }
 
     #[test]
-    fn test_like_with_cache() {
-        let mut cache = HashMap::default();
-        assert!(Value::exec_like(Some(&mut cache), "a%", "aaaa").unwrap());
-        assert!(Value::exec_like(Some(&mut cache), "%a%a", "aaaa").unwrap());
-        assert!(!Value::exec_like(Some(&mut cache), "%a.a", "aaaa").unwrap());
-        assert!(!Value::exec_like(Some(&mut cache), "a.a%", "aaaa").unwrap());
-        assert!(!Value::exec_like(Some(&mut cache), "%a.ab", "aaaa").unwrap());
+    fn test_exec_like_with_escape() {
+        assert!(Value::exec_like("abcX%", "abc%", Some('X')).unwrap());
+        assert!(!Value::exec_like("abcX%", "abc5", Some('X')).unwrap());
+        assert!(!Value::exec_like("abcX%", "abc", Some('X')).unwrap());
+        assert!(!Value::exec_like("abcX%", "abcX%", Some('X')).unwrap());
+        assert!(!Value::exec_like("abcX%", "abc%%", Some('X')).unwrap());
 
-        // again after values have been cached
-        assert!(Value::exec_like(Some(&mut cache), "a%", "aaaa").unwrap());
-        assert!(Value::exec_like(Some(&mut cache), "%a%a", "aaaa").unwrap());
-        assert!(!Value::exec_like(Some(&mut cache), "%a.a", "aaaa").unwrap());
-        assert!(!Value::exec_like(Some(&mut cache), "a.a%", "aaaa").unwrap());
-        assert!(!Value::exec_like(Some(&mut cache), "%a.ab", "aaaa").unwrap());
+        assert!(Value::exec_like("abcX_", "abc_", Some('X')).unwrap());
+        assert!(!Value::exec_like("abcX_", "abc5", Some('X')).unwrap());
+        assert!(!Value::exec_like("abcX_", "abc", Some('X')).unwrap());
+        assert!(!Value::exec_like("abcX_", "abcX_", Some('X')).unwrap());
+        assert!(!Value::exec_like("abcX_", "abc__", Some('X')).unwrap());
+
+        assert!(Value::exec_like("abcXX", "abcX", Some('X')).unwrap());
+        assert!(!Value::exec_like("abcXX", "abc5", Some('X')).unwrap());
+        assert!(!Value::exec_like("abcXX", "abc", Some('X')).unwrap());
+        assert!(!Value::exec_like("abcXX", "abcXX", Some('X')).unwrap());
     }
 
     #[test]
