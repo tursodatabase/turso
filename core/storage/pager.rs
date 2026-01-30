@@ -393,7 +393,7 @@ impl PageInner {
     }
 
     #[inline(always)]
-    pub fn cell_interior_read_left_child_page(&self, idx: usize) -> u32 {
+    pub fn cell_interior_read_left_child_page(&self, idx: usize) -> crate::Result<u32> {
         debug_assert!(matches!(
             self.page_type(),
             Ok(PageType::TableInterior) | Ok(PageType::IndexInterior)
@@ -402,12 +402,20 @@ impl PageInner {
         let cell_pointer_array_start = self.header_size();
         let cell_pointer = cell_pointer_array_start + (idx * CELL_PTR_SIZE_BYTES);
         let cell_pointer = self.read_u16(cell_pointer) as usize;
-        u32::from_be_bytes([
+        // Validate cell pointer is within page bounds (need 4 bytes for u32)
+        if cell_pointer + 4 > buf.len() {
+            return Err(crate::LimboError::Corrupt(format!(
+                "cell pointer {} out of bounds for page size {}",
+                cell_pointer,
+                buf.len()
+            )));
+        }
+        Ok(u32::from_be_bytes([
             buf[cell_pointer],
             buf[cell_pointer + 1],
             buf[cell_pointer + 2],
             buf[cell_pointer + 3],
-        ])
+        ]))
     }
 
     #[inline(always)]
