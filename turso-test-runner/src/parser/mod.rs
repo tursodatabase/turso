@@ -1,12 +1,20 @@
 pub mod ast;
 pub mod lexer;
+mod sql_complete;
 
 use ast::*;
 use lexer::{SpannedToken, Token, tokenize};
 use miette::{Diagnostic, SourceSpan};
+use sql_complete::count_sql_statements;
 use std::collections::HashMap;
 use std::ops::Range;
 use std::path::PathBuf;
+
+/// Helper enum for parsing test or snapshot blocks with decorators
+enum TestOrSnapshot {
+    Test(TestCase),
+    Snapshot(SnapshotCase),
+}
 
 /// Parse a `.sqltest` file from source
 pub fn parse(input: &str) -> Result<TestFile, ParseError> {
@@ -29,6 +37,9 @@ impl Parser {
         let mut databases = Vec::new();
         let mut setups = HashMap::new();
         let mut tests = Vec::new();
+        let mut snapshots = Vec::new();
+        let mut global_skip = None;
+        let mut global_requires = Vec::new();
 
         while !self.is_at_end() {
             self.skip_newlines_and_comments();
@@ -41,6 +52,17 @@ impl Parser {
                 Some(Token::AtDatabase) => {
                     databases.push(self.parse_database()?);
                 }
+                // Global @skip-file or @skip-file-if: applies to all tests in the file
+                Some(Token::AtSkipFile) => {
+                    global_skip = Some(self.parse_global_skip()?);
+                }
+                Some(Token::AtSkipFileIf) => {
+                    global_skip = Some(self.parse_global_skip_if()?);
+                }
+                // Global @requires-file: applies to all tests in the file
+                Some(Token::AtRequiresFile) => {
+                    global_requires.push(self.parse_global_requires()?);
+                }
                 Some(Token::Setup) => {
                     let (name, sql) = self.parse_setup()?;
                     if setups.contains_key(&name) {
@@ -48,8 +70,21 @@ impl Parser {
                     }
                     setups.insert(name, sql);
                 }
-                Some(Token::AtSetup | Token::AtSkip | Token::Test) => {
-                    tests.push(self.parse_test()?);
+                Some(
+                    Token::AtSetup
+                    | Token::AtSkip
+                    | Token::AtSkipIf
+                    | Token::AtRequires
+                    | Token::AtBackend
+                    | Token::Test
+                    | Token::Snapshot,
+                ) => {
+                    // Could be test or snapshot with decorators, peek ahead
+                    let item = self.parse_test_or_snapshot()?;
+                    match item {
+                        TestOrSnapshot::Test(t) => tests.push(t),
+                        TestOrSnapshot::Snapshot(s) => snapshots.push(s),
+                    }
                 }
                 Some(token) => {
                     return Err(self.error(format!("unexpected token: {token}")));
@@ -62,6 +97,9 @@ impl Parser {
             databases,
             setups,
             tests,
+            snapshots,
+            global_skip,
+            global_requires,
         };
 
         self.validate(&test_file)?;
@@ -87,6 +125,20 @@ impl Parser {
                     readonly: false,
                 })
             }
+            Some(Token::Default) => {
+                self.advance();
+                Ok(DatabaseConfig {
+                    location: DatabaseLocation::Default,
+                    readonly: true,
+                })
+            }
+            Some(Token::DefaultNoRowidAlias) => {
+                self.advance();
+                Ok(DatabaseConfig {
+                    location: DatabaseLocation::DefaultNoRowidAlias,
+                    readonly: true,
+                })
+            }
             Some(Token::Path(path)) => {
                 let path = path.clone();
                 self.advance();
@@ -104,10 +156,36 @@ impl Parser {
                 })
             }
             Some(token) => Err(self.error(format!(
-                "expected database specifier (:memory:, :temp:, or path), got {token}"
+                "expected database specifier (:memory:, :temp:, :default:, :default-no-rowidalias:, or path), got {token}"
             ))),
             None => Err(self.error("expected database specifier, got EOF".to_string())),
         }
+    }
+
+    fn parse_global_skip(&mut self) -> Result<ast::Skip, ParseError> {
+        self.expect_token(Token::AtSkipFile)?;
+        let reason = self.expect_string()?;
+        Ok(ast::Skip {
+            reason,
+            condition: None,
+        })
+    }
+
+    fn parse_global_skip_if(&mut self) -> Result<ast::Skip, ParseError> {
+        self.expect_token(Token::AtSkipFileIf)?;
+        let condition = self.parse_skip_condition()?;
+        let reason = self.expect_string()?;
+        Ok(ast::Skip {
+            reason,
+            condition: Some(condition),
+        })
+    }
+
+    fn parse_global_requires(&mut self) -> Result<ast::Requirement, ParseError> {
+        self.expect_token(Token::AtRequiresFile)?;
+        let capability = self.parse_capability()?;
+        let reason = self.expect_string()?;
+        Ok(ast::Requirement { capability, reason })
     }
 
     fn parse_setup(&mut self) -> Result<(String, String), ParseError> {
@@ -119,9 +197,11 @@ impl Parser {
         Ok((name, content))
     }
 
-    fn parse_test(&mut self) -> Result<TestCase, ParseError> {
+    fn parse_test_or_snapshot(&mut self) -> Result<TestOrSnapshot, ParseError> {
         let mut test_setups = Vec::new();
         let mut skip = None;
+        let mut backend = None;
+        let mut requires = Vec::new();
 
         // Parse decorators
         loop {
@@ -138,33 +218,143 @@ impl Parser {
                 }
                 Some(Token::AtSkip) => {
                     self.advance();
-                    skip = Some(self.expect_string()?);
+                    let reason = self.expect_string()?;
+                    skip = Some(ast::Skip {
+                        reason,
+                        condition: None,
+                    });
+                    self.skip_newlines_and_comments();
+                }
+                Some(Token::AtSkipIf) => {
+                    self.advance();
+                    let condition = self.parse_skip_condition()?;
+                    let reason = self.expect_string()?;
+                    skip = Some(ast::Skip {
+                        reason,
+                        condition: Some(condition),
+                    });
+                    self.skip_newlines_and_comments();
+                }
+                Some(Token::AtRequires) => {
+                    self.advance();
+                    let capability = self.parse_capability()?;
+                    let reason = self.expect_string()?;
+                    requires.push(ast::Requirement { capability, reason });
+                    self.skip_newlines_and_comments();
+                }
+                Some(Token::AtBackend) => {
+                    self.advance();
+                    let backend_name = self.expect_identifier()?;
+                    backend = Some(
+                        backend_name
+                            .parse::<ast::Backend>()
+                            .map_err(|e| self.error(e))?,
+                    );
                     self.skip_newlines_and_comments();
                 }
                 _ => break,
             }
         }
 
-        // Parse test
-        self.expect_token(Token::Test)?;
-        let (name, name_span) = self.expect_identifier_with_span()?;
-        let sql = self.expect_block_content()?.trim().to_string();
+        // Now check if it's a test or snapshot
+        match self.peek() {
+            Some(Token::Snapshot) => {
+                self.expect_token(Token::Snapshot)?;
+                let (name, name_span) = self.expect_identifier_with_span()?;
+                let sql = self.expect_block_content()?.trim().to_string();
 
-        self.skip_newlines_and_comments();
+                self.skip_newlines_and_comments();
 
-        // Parse expect
-        self.expect_token(Token::Expect)?;
+                Ok(TestOrSnapshot::Snapshot(SnapshotCase {
+                    name,
+                    name_span,
+                    sql,
+                    modifiers: CaseModifiers {
+                        setups: test_setups,
+                        skip,
+                        backend,
+                        requires,
+                    },
+                }))
+            }
+            Some(Token::Test) => {
+                // Parse test as before
+                self.expect_token(Token::Test)?;
+                let (name, name_span) = self.expect_identifier_with_span()?;
+                let sql = self.expect_block_content()?.trim().to_string();
 
-        let expectation = self.parse_expectation()?;
+                self.skip_newlines_and_comments();
 
-        Ok(TestCase {
-            name,
-            name_span,
-            sql,
-            expectation,
-            setups: test_setups,
-            skip,
-        })
+                // Parse expect blocks (at least one required, with optional backend-specific overrides)
+                let mut default_expectation: Option<Expectation> = None;
+                let mut overrides: HashMap<ast::Backend, Expectation> = HashMap::new();
+
+                while matches!(self.peek(), Some(Token::Expect)) {
+                    self.expect_token(Token::Expect)?;
+
+                    // Check for backend qualifier: expect @js { ... }
+                    let backend_qualifier =
+                        if let Some(Token::AtIdentifier(backend_name)) = self.peek() {
+                            let backend_name = backend_name.clone();
+                            self.advance();
+                            let b = backend_name
+                                .parse::<ast::Backend>()
+                                .map_err(|e| self.error(e))?;
+                            Some(b)
+                        } else {
+                            None
+                        };
+
+                    let expectation = self.parse_expectation()?;
+
+                    if let Some(b) = backend_qualifier {
+                        if overrides.contains_key(&b) {
+                            return Err(
+                                self.error(format!("duplicate expect block for backend '{b}'"))
+                            );
+                        }
+                        overrides.insert(b, expectation);
+                    } else {
+                        if default_expectation.is_some() {
+                            return Err(
+                                self.error("multiple default expect blocks (use @backend qualifier for backend-specific expectations)".to_string()),
+                            );
+                        }
+                        default_expectation = Some(expectation);
+                    }
+
+                    self.skip_newlines_and_comments();
+                }
+
+                // Validate at least one default expectation
+                let default = default_expectation.ok_or_else(|| {
+                    self.error(
+                        "at least one default expect block (without @backend qualifier) is required"
+                            .to_string(),
+                    )
+                })?;
+
+                Ok(TestOrSnapshot::Test(TestCase {
+                    name,
+                    name_span,
+                    sql,
+                    expectations: Expectations { default, overrides },
+                    modifiers: CaseModifiers {
+                        setups: test_setups,
+                        skip,
+                        backend,
+                        requires,
+                    },
+                }))
+            }
+            Some(token) => Err(self.error(format!(
+                "expected 'test' or 'snapshot' after decorators, got {token}"
+            ))),
+            None => {
+                Err(self
+                    .error("expected 'test' or 'snapshot' after decorators, got EOF".to_string()))
+            }
+        }
     }
 
     fn parse_expectation(&mut self) -> Result<Expectation, ParseError> {
@@ -199,28 +389,52 @@ impl Parser {
             Some(Token::Raw) => {
                 self.advance();
                 let content = self.expect_block_content()?;
-                // Raw mode: preserve whitespace exactly, only split on newlines
-                // We still strip the leading/trailing newlines from the block itself
-                let content = content.strip_prefix('\n').unwrap_or(&content);
-                let content = content.strip_suffix('\n').unwrap_or(content);
-                let rows = content.lines().map(|s| s.to_string()).collect();
+                // Raw mode: preserve whitespace exactly
+                let rows = content.split('\n').map(|s| s.to_string()).collect();
                 Ok(Expectation::Exact(rows))
             }
             Some(Token::BlockContent(_)) => {
                 let content = self.expect_block_content()?;
-                // Trim each line to handle indentation in expect blocks
-                let rows = content
-                    .trim()
-                    .lines()
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect();
+                // Trim each line for indentation, but preserve empty lines (for NULL values)
+                let rows = content.split('\n').map(|s| s.trim().to_string()).collect();
                 Ok(Expectation::Exact(rows))
             }
             Some(token) => {
                 Err(self.error(format!("expected expect modifier or block, got {token}")))
             }
             None => Err(self.error("expected expect block, got EOF".to_string())),
+        }
+    }
+
+    fn parse_skip_condition(&mut self) -> Result<ast::SkipCondition, ParseError> {
+        match self.peek() {
+            Some(Token::Mvcc) => {
+                self.advance();
+                Ok(ast::SkipCondition::Mvcc)
+            }
+            Some(token) => Err(self.error(format!("expected skip condition (mvcc), got {token}"))),
+            None => Err(self.error("expected skip condition, got EOF".to_string())),
+        }
+    }
+
+    fn parse_capability(&mut self) -> Result<ast::Capability, ParseError> {
+        match self.peek() {
+            Some(Token::Trigger) => {
+                self.advance();
+                Ok(ast::Capability::Trigger)
+            }
+            Some(Token::Strict) => {
+                self.advance();
+                Ok(ast::Capability::Strict)
+            }
+            Some(Token::MaterializedViews) => {
+                self.advance();
+                Ok(ast::Capability::MaterializedViews)
+            }
+            Some(token) => Err(self.error(format!(
+                "expected capability (trigger, strict, materialized_views), got {token}"
+            ))),
+            None => Err(self.error("expected capability, got EOF".to_string())),
         }
     }
 
@@ -360,9 +574,9 @@ impl Parser {
             });
         }
 
-        // Rule 4: All referenced setup names must exist
+        // Rule 4: All referenced setup names must exist (for tests and snapshots)
         for test in &file.tests {
-            for setup_ref in &test.setups {
+            for setup_ref in &test.modifiers.setups {
                 if !file.setups.contains_key(&setup_ref.name) {
                     let available: Vec<_> = file.setups.keys().collect();
                     let help = if available.is_empty() {
@@ -392,6 +606,38 @@ impl Parser {
             }
         }
 
+        // Rule 4b: All referenced setup names must exist for snapshots
+        for snapshot in &file.snapshots {
+            for setup_ref in &snapshot.modifiers.setups {
+                if !file.setups.contains_key(&setup_ref.name) {
+                    let available: Vec<_> = file.setups.keys().collect();
+                    let help = if available.is_empty() {
+                        "No setup blocks are defined in this file".to_string()
+                    } else {
+                        format!(
+                            "Available setups: {}",
+                            available
+                                .iter()
+                                .map(|s| s.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )
+                    };
+                    return Err(ParseError::ValidationError {
+                        message: format!(
+                            "snapshot '{}' references undefined setup '{}'",
+                            snapshot.name, setup_ref.name
+                        ),
+                        span: Some(SourceSpan::new(
+                            setup_ref.span.start.into(),
+                            setup_ref.span.len(),
+                        )),
+                        help: Some(help),
+                    });
+                }
+            }
+        }
+
         // Rule 5: Test names must be unique
         let mut seen_names: std::collections::HashMap<&str, Range<usize>> =
             std::collections::HashMap::new();
@@ -401,12 +647,60 @@ impl Parser {
                     message: format!("duplicate test name: {}", test.name),
                     span: Some(SourceSpan::new(
                         test.name_span.start.into(),
-                        test.name_span.len().into(),
+                        test.name_span.len(),
                     )),
                     help: Some(format!("First defined at offset {}", first_span.start)),
                 });
             }
             seen_names.insert(&test.name, test.name_span.clone());
+        }
+
+        // Rule 6: Snapshot names must be unique
+        let mut seen_snapshot_names: std::collections::HashMap<&str, Range<usize>> =
+            std::collections::HashMap::new();
+        for snapshot in &file.snapshots {
+            if let Some(first_span) = seen_snapshot_names.get(snapshot.name.as_str()) {
+                return Err(ParseError::ValidationError {
+                    message: format!("duplicate snapshot name: {}", snapshot.name),
+                    span: Some(SourceSpan::new(
+                        snapshot.name_span.start.into(),
+                        snapshot.name_span.len(),
+                    )),
+                    help: Some(format!("First defined at offset {}", first_span.start)),
+                });
+            }
+            seen_snapshot_names.insert(&snapshot.name, snapshot.name_span.clone());
+        }
+
+        // Rule 7: Snapshots must contain exactly one SQL statement
+        for snapshot in &file.snapshots {
+            let statement_count = count_sql_statements(&snapshot.sql);
+            if statement_count == 0 {
+                return Err(ParseError::ValidationError {
+                    message: format!("snapshot '{}' contains no SQL statements", snapshot.name),
+                    span: Some(SourceSpan::new(
+                        snapshot.name_span.start.into(),
+                        snapshot.name_span.len(),
+                    )),
+                    help: Some("Add a SQL statement to the snapshot block".to_string()),
+                });
+            }
+            if statement_count > 1 {
+                return Err(ParseError::ValidationError {
+                    message: format!(
+                        "snapshot '{}' contains {} SQL statements, but only 1 is allowed",
+                        snapshot.name, statement_count
+                    ),
+                    span: Some(SourceSpan::new(
+                        snapshot.name_span.start.into(),
+                        snapshot.name_span.len(),
+                    )),
+                    help: Some(
+                        "Snapshots can only contain a single SQL statement. Split into multiple snapshot blocks if needed."
+                            .to_string(),
+                    ),
+                });
+            }
         }
 
         Ok(())
@@ -484,8 +778,8 @@ expect {
         let file = parse(input).unwrap();
         assert_eq!(file.setups.len(), 1);
         assert!(file.setups.contains_key("users"));
-        assert_eq!(file.tests[0].setups.len(), 1);
-        assert_eq!(file.tests[0].setups[0].name, "users");
+        assert_eq!(file.tests[0].modifiers.setups.len(), 1);
+        assert_eq!(file.tests[0].modifiers.setups[0].name, "users");
     }
 
     #[test]
@@ -524,7 +818,7 @@ expect error {
 
         let file = parse(input).unwrap();
         assert!(matches!(
-            file.tests[0].expectation,
+            file.tests[0].expectations.default,
             Expectation::Error(Some(_))
         ));
     }
@@ -543,7 +837,10 @@ expect pattern {
 "#;
 
         let file = parse(input).unwrap();
-        assert!(matches!(file.tests[0].expectation, Expectation::Pattern(_)));
+        assert!(matches!(
+            file.tests[0].expectations.default,
+            Expectation::Pattern(_)
+        ));
     }
 
     #[test]
@@ -561,7 +858,37 @@ expect {
 "#;
 
         let file = parse(input).unwrap();
-        assert_eq!(file.tests[0].skip, Some("known bug".to_string()));
+        assert_eq!(
+            file.tests[0].modifiers.skip,
+            Some(ast::Skip {
+                reason: "known bug".to_string(),
+                condition: None,
+            })
+        );
+    }
+
+    #[test]
+    fn test_parse_skip_if_mvcc() {
+        let input = r#"
+@database :memory:
+
+@skip-if mvcc "total_changes not supported in MVCC"
+test total-changes {
+    SELECT total_changes();
+}
+expect {
+    1
+}
+"#;
+
+        let file = parse(input).unwrap();
+        assert_eq!(
+            file.tests[0].modifiers.skip,
+            Some(ast::Skip {
+                reason: "total_changes not supported in MVCC".to_string(),
+                condition: Some(ast::SkipCondition::Mvcc),
+            })
+        );
     }
 
     #[test]
@@ -573,7 +900,7 @@ expect {
         let file = parse(input).unwrap();
         // Raw mode preserves leading/trailing whitespace
         assert!(matches!(
-            &file.tests[0].expectation,
+            &file.tests[0].expectations.default,
             Expectation::Exact(rows) if rows == &vec!["  hello  ".to_string()]
         ));
     }
@@ -593,7 +920,7 @@ expect {
 "#;
         let file_normal = parse(input_normal).unwrap();
         assert!(matches!(
-            &file_normal.tests[0].expectation,
+            &file_normal.tests[0].expectations.default,
             Expectation::Exact(rows) if rows == &vec!["hello world".to_string()]
         ));
 
@@ -601,7 +928,7 @@ expect {
         let input_raw = "@database :memory:\n\ntest select-1 {\n    SELECT 1;\n}\nexpect raw {\n    hello world  \n}\n";
         let file_raw = parse(input_raw).unwrap();
         assert!(matches!(
-            &file_raw.tests[0].expectation,
+            &file_raw.tests[0].expectations.default,
             Expectation::Exact(rows) if rows == &vec!["    hello world  ".to_string()]
         ));
     }
@@ -676,5 +1003,654 @@ expect {
 
         let result = parse(input);
         assert!(matches!(result, Err(ParseError::ValidationError { .. })));
+    }
+
+    #[test]
+    fn test_parse_global_skip() {
+        let input = r#"
+@database :memory:
+@skip-file "all tests skipped"
+
+test select-1 {
+    SELECT 1;
+}
+expect {
+    1
+}
+"#;
+
+        let file = parse(input).unwrap();
+        assert_eq!(
+            file.global_skip,
+            Some(ast::Skip {
+                reason: "all tests skipped".to_string(),
+                condition: None,
+            })
+        );
+        // Per-test skip should be None since we're using global skip
+        assert!(file.tests[0].modifiers.skip.is_none());
+    }
+
+    #[test]
+    fn test_parse_global_skip_if_mvcc() {
+        let input = r#"
+@database :memory:
+@skip-file-if mvcc "MVCC not supported for this file"
+
+test select-1 {
+    SELECT 1;
+}
+expect {
+    1
+}
+
+test select-2 {
+    SELECT 2;
+}
+expect {
+    2
+}
+"#;
+
+        let file = parse(input).unwrap();
+        assert_eq!(
+            file.global_skip,
+            Some(ast::Skip {
+                reason: "MVCC not supported for this file".to_string(),
+                condition: Some(ast::SkipCondition::Mvcc),
+            })
+        );
+        // All tests should have no per-test skip
+        assert!(file.tests[0].modifiers.skip.is_none());
+        assert!(file.tests[1].modifiers.skip.is_none());
+    }
+
+    #[test]
+    fn test_parse_backend_specific_expectations() {
+        let input = r#"
+@database :memory:
+
+test float-literal {
+    SELECT 1.0;
+}
+expect {
+    1.0
+}
+expect @js {
+    1
+}
+"#;
+
+        let file = parse(input).unwrap();
+        assert_eq!(file.tests.len(), 1);
+
+        // Check default expectation
+        assert!(matches!(
+            &file.tests[0].expectations.default,
+            Expectation::Exact(rows) if rows == &vec!["1.0".to_string()]
+        ));
+
+        // Check JS-specific override
+        assert!(matches!(
+            file.tests[0].expectations.for_backend(ast::Backend::Js),
+            Expectation::Exact(rows) if rows == &vec!["1".to_string()]
+        ));
+
+        // Check Rust backend gets default (no override)
+        assert!(matches!(
+            file.tests[0].expectations.for_backend(ast::Backend::Rust),
+            Expectation::Exact(rows) if rows == &vec!["1.0".to_string()]
+        ));
+    }
+
+    #[test]
+    fn test_parse_backend_specific_error_expectations() {
+        let input = r#"
+@database :memory:
+
+test error-test {
+    SELECT * FROM nonexistent;
+}
+expect error {
+    no such table
+}
+expect @cli error {
+    table not found
+}
+"#;
+
+        let file = parse(input).unwrap();
+
+        // Check default is Error
+        assert!(matches!(
+            &file.tests[0].expectations.default,
+            Expectation::Error(Some(s)) if s.contains("no such table")
+        ));
+
+        // Check CLI-specific override
+        assert!(matches!(
+            file.tests[0].expectations.for_backend(ast::Backend::Cli),
+            Expectation::Error(Some(s)) if s.contains("table not found")
+        ));
+    }
+
+    #[test]
+    fn test_parse_invalid_backend_name() {
+        let input = r#"
+@database :memory:
+
+test invalid-backend {
+    SELECT 1;
+}
+expect {
+    1
+}
+expect @invalid {
+    1
+}
+"#;
+
+        let result = parse(input);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_duplicate_backend_expectation() {
+        let input = r#"
+@database :memory:
+
+test duplicate-backend {
+    SELECT 1;
+}
+expect {
+    1
+}
+expect @js {
+    1
+}
+expect @js {
+    2
+}
+"#;
+
+        let result = parse(input);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_missing_default_expectation() {
+        let input = r#"
+@database :memory:
+
+test no-default {
+    SELECT 1;
+}
+expect @js {
+    1
+}
+"#;
+
+        let result = parse(input);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_global_skip_with_per_test_override() {
+        let input = r#"
+@database :memory:
+@skip-file-if mvcc "global skip reason"
+
+test test-with-override {
+    SELECT 1;
+}
+expect {
+    1
+}
+
+@skip "per-test skip"
+test test-overridden {
+    SELECT 2;
+}
+expect {
+    2
+}
+"#;
+
+        let file = parse(input).unwrap();
+        // Global skip should be set
+        assert_eq!(
+            file.global_skip,
+            Some(ast::Skip {
+                reason: "global skip reason".to_string(),
+                condition: Some(ast::SkipCondition::Mvcc),
+            })
+        );
+        // First test has no per-test skip (uses global)
+        assert!(file.tests[0].modifiers.skip.is_none());
+        // Second test has per-test skip (overrides global)
+        assert_eq!(
+            file.tests[1].modifiers.skip,
+            Some(ast::Skip {
+                reason: "per-test skip".to_string(),
+                condition: None,
+            })
+        );
+    }
+
+    #[test]
+    fn test_parse_requires() {
+        let input = r#"
+@database :memory:
+
+@requires trigger "test needs trigger support"
+test trigger-test {
+    CREATE TRIGGER test_trigger AFTER INSERT ON foo BEGIN SELECT 1; END;
+}
+expect {
+    1
+}
+"#;
+
+        let file = parse(input).unwrap();
+        assert_eq!(file.tests[0].modifiers.requires.len(), 1);
+        assert_eq!(
+            file.tests[0].modifiers.requires[0].capability,
+            ast::Capability::Trigger
+        );
+        assert_eq!(
+            file.tests[0].modifiers.requires[0].reason,
+            "test needs trigger support"
+        );
+    }
+
+    #[test]
+    fn test_parse_requires_strict() {
+        let input = r#"
+@database :memory:
+
+@requires strict "test needs strict tables"
+test strict-test {
+    CREATE TABLE foo (id INT) STRICT;
+}
+expect {
+}
+"#;
+
+        let file = parse(input).unwrap();
+        assert_eq!(file.tests[0].modifiers.requires.len(), 1);
+        assert_eq!(
+            file.tests[0].modifiers.requires[0].capability,
+            ast::Capability::Strict
+        );
+        assert_eq!(
+            file.tests[0].modifiers.requires[0].reason,
+            "test needs strict tables"
+        );
+    }
+
+    #[test]
+    fn test_parse_requires_file() {
+        let input = r#"
+@database :memory:
+@requires-file trigger "all tests need triggers"
+
+test trigger-test-1 {
+    SELECT 1;
+}
+expect {
+    1
+}
+
+test trigger-test-2 {
+    SELECT 2;
+}
+expect {
+    2
+}
+"#;
+
+        let file = parse(input).unwrap();
+        assert_eq!(file.global_requires.len(), 1);
+        assert_eq!(file.global_requires[0].capability, ast::Capability::Trigger);
+        assert_eq!(file.global_requires[0].reason, "all tests need triggers");
+        // Per-test requires should be empty
+        assert!(file.tests[0].modifiers.requires.is_empty());
+        assert!(file.tests[1].modifiers.requires.is_empty());
+    }
+
+    #[test]
+    fn test_parse_multiple_requires() {
+        let input = r#"
+@database :memory:
+
+@requires trigger "needs triggers"
+@requires strict "needs strict tables"
+test multi-require {
+    SELECT 1;
+}
+expect {
+    1
+}
+"#;
+
+        let file = parse(input).unwrap();
+        assert_eq!(file.tests[0].modifiers.requires.len(), 2);
+        assert!(
+            file.tests[0]
+                .modifiers
+                .requires
+                .iter()
+                .any(|r| r.capability == ast::Capability::Trigger)
+        );
+        assert!(
+            file.tests[0]
+                .modifiers
+                .requires
+                .iter()
+                .any(|r| r.capability == ast::Capability::Strict)
+        );
+    }
+
+    #[test]
+    fn test_parse_requires_file_and_per_test() {
+        let input = r#"
+@database :memory:
+@requires-file trigger "file needs triggers"
+
+test basic {
+    SELECT 1;
+}
+expect {
+    1
+}
+
+@requires strict "this test also needs strict"
+test strict-test {
+    SELECT 2;
+}
+expect {
+    2
+}
+"#;
+
+        let file = parse(input).unwrap();
+        // Global requires
+        assert_eq!(file.global_requires.len(), 1);
+        assert_eq!(file.global_requires[0].capability, ast::Capability::Trigger);
+        // First test has no per-test requires
+        assert!(file.tests[0].modifiers.requires.is_empty());
+        // Second test has per-test requires for strict
+        assert_eq!(file.tests[1].modifiers.requires.len(), 1);
+        assert_eq!(
+            file.tests[1].modifiers.requires[0].capability,
+            ast::Capability::Strict
+        );
+    }
+
+    #[test]
+    fn test_parse_snapshot() {
+        let input = r#"
+@database :memory:
+
+snapshot query-plan {
+    SELECT * FROM users WHERE id = 1;
+}
+"#;
+
+        let file = parse(input).unwrap();
+        assert_eq!(file.snapshots.len(), 1);
+        assert_eq!(file.snapshots[0].name, "query-plan");
+        assert_eq!(file.snapshots[0].sql, "SELECT * FROM users WHERE id = 1;");
+        assert!(file.snapshots[0].modifiers.setups.is_empty());
+        assert!(file.snapshots[0].modifiers.skip.is_none());
+    }
+
+    #[test]
+    fn test_parse_snapshot_with_setup() {
+        let input = r#"
+@database :memory:
+
+setup schema {
+    CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);
+}
+
+@setup schema
+snapshot query-plan {
+    SELECT * FROM users WHERE id = 1;
+}
+"#;
+
+        let file = parse(input).unwrap();
+        assert_eq!(file.snapshots.len(), 1);
+        assert_eq!(file.snapshots[0].modifiers.setups.len(), 1);
+        assert_eq!(file.snapshots[0].modifiers.setups[0].name, "schema");
+    }
+
+    #[test]
+    fn test_parse_snapshot_with_skip() {
+        let input = r#"
+@database :memory:
+
+@skip "not ready"
+snapshot query-plan {
+    SELECT * FROM users;
+}
+"#;
+
+        let file = parse(input).unwrap();
+        assert_eq!(file.snapshots.len(), 1);
+        assert!(file.snapshots[0].modifiers.skip.is_some());
+        assert_eq!(
+            file.snapshots[0].modifiers.skip.as_ref().unwrap().reason,
+            "not ready"
+        );
+    }
+
+    #[test]
+    fn test_parse_mixed_tests_and_snapshots() {
+        let input = r#"
+@database :memory:
+
+setup schema {
+    CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);
+}
+
+@setup schema
+test select-user {
+    SELECT * FROM users WHERE id = 1;
+}
+expect {
+    1|Alice
+}
+
+@setup schema
+snapshot query-plan {
+    SELECT * FROM users WHERE id = 1;
+}
+"#;
+
+        let file = parse(input).unwrap();
+        assert_eq!(file.tests.len(), 1);
+        assert_eq!(file.snapshots.len(), 1);
+        assert_eq!(file.tests[0].name, "select-user");
+        assert_eq!(file.snapshots[0].name, "query-plan");
+    }
+
+    #[test]
+    fn test_snapshot_supports_backend() {
+        let input = r#"
+@database :memory:
+
+@backend cli
+snapshot query-plan {
+    SELECT 1;
+}
+"#;
+
+        let result = parse(input).unwrap();
+        assert_eq!(result.snapshots.len(), 1);
+        assert_eq!(
+            result.snapshots[0].modifiers.backend,
+            Some(ast::Backend::Cli)
+        );
+    }
+
+    #[test]
+    fn test_snapshot_supports_requires() {
+        let input = r#"
+@database :memory:
+
+@requires trigger "test reason"
+snapshot query-plan {
+    SELECT 1;
+}
+"#;
+
+        let result = parse(input).unwrap();
+        assert_eq!(result.snapshots.len(), 1);
+        assert_eq!(result.snapshots[0].modifiers.requires.len(), 1);
+        assert_eq!(
+            result.snapshots[0].modifiers.requires[0].capability,
+            ast::Capability::Trigger
+        );
+        assert_eq!(
+            result.snapshots[0].modifiers.requires[0].reason,
+            "test reason"
+        );
+    }
+
+    #[test]
+    fn test_validation_duplicate_snapshot_name() {
+        let input = r#"
+@database :memory:
+
+snapshot same-name {
+    SELECT 1;
+}
+
+snapshot same-name {
+    SELECT 2;
+}
+"#;
+
+        let result = parse(input);
+        assert!(matches!(result, Err(ParseError::ValidationError { .. })));
+    }
+
+    #[test]
+    fn test_snapshot_single_statement_valid() {
+        let input = r#"
+@database :memory:
+
+snapshot query-plan {
+    SELECT * FROM users WHERE id = 1;
+}
+"#;
+
+        let result = parse(input);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_snapshot_multiple_statements_invalid() {
+        let input = r#"
+@database :memory:
+
+snapshot query-plan {
+    CREATE TABLE t (id INTEGER);
+    SELECT * FROM t;
+}
+"#;
+
+        let result = parse(input);
+        assert!(matches!(result, Err(ParseError::ValidationError { .. })));
+        if let Err(ParseError::ValidationError { message, .. }) = result {
+            assert!(message.contains("2 SQL statements"));
+        }
+    }
+
+    #[test]
+    fn test_snapshot_string_with_semicolon_valid() {
+        // Semicolon inside a string should not count as statement separator
+        let input = r#"
+@database :memory:
+
+snapshot query-plan {
+    SELECT 'hello; world' FROM users;
+}
+"#;
+
+        let result = parse(input);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_snapshot_comment_with_semicolon_valid() {
+        // Semicolon inside a comment should not count as statement separator
+        let input = r#"
+@database :memory:
+
+snapshot query-plan {
+    SELECT * FROM users; -- this; is; a; comment
+}
+"#;
+
+        // This has a semicolon after SELECT and then a comment with semicolons
+        // The semicolon after users ends the statement, the comment ones don't count
+        let result = parse(input);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_snapshot_block_comment_with_semicolon_valid() {
+        let input = r#"
+@database :memory:
+
+snapshot query-plan {
+    SELECT /* ; ; ; */ * FROM users;
+}
+"#;
+
+        let result = parse(input);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_snapshot_trigger_single_statement_valid() {
+        // A CREATE TRIGGER with internal semicolons is still one statement
+        let input = r#"
+@database :memory:
+
+snapshot trigger-plan {
+    CREATE TRIGGER log_insert AFTER INSERT ON users BEGIN
+        INSERT INTO log VALUES('inserted');
+        UPDATE stats SET count = count + 1;
+    END;
+}
+"#;
+
+        let result = parse(input);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_snapshot_trigger_followed_by_select_invalid() {
+        // A CREATE TRIGGER followed by another statement is two statements
+        let input = r#"
+@database :memory:
+
+snapshot trigger-plan {
+    CREATE TRIGGER log_insert AFTER INSERT ON users BEGIN
+        INSERT INTO log VALUES('inserted');
+    END;
+    SELECT 1;
+}
+"#;
+
+        let result = parse(input);
+        assert!(matches!(result, Err(ParseError::ValidationError { .. })));
+        if let Err(ParseError::ValidationError { message, .. }) = result {
+            assert!(message.contains("2 SQL statements"));
+        }
     }
 }

@@ -54,6 +54,33 @@ impl PyTursoPartialSyncOpts {
     }
 }
 
+/// Encryption cipher for Turso Cloud remote encryption.
+/// These match the server-side encryption settings.
+#[pyclass(eq, eq_int)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PyRemoteEncryptionCipher {
+    Aes256Gcm,
+    Aes128Gcm,
+    ChaCha20Poly1305,
+    Aegis128L,
+    Aegis128X2,
+    Aegis128X4,
+    Aegis256,
+    Aegis256X2,
+    Aegis256X4,
+}
+
+impl PyRemoteEncryptionCipher {
+    /// Returns the total reserved bytes as required by the server
+    pub fn reserved_bytes(&self) -> usize {
+        match self {
+            Self::Aes256Gcm | Self::Aes128Gcm | Self::ChaCha20Poly1305 => 28,
+            Self::Aegis128L | Self::Aegis128X2 | Self::Aegis128X4 => 32,
+            Self::Aegis256 | Self::Aegis256X2 | Self::Aegis256X4 => 48,
+        }
+    }
+}
+
 #[pyclass]
 pub struct PyTursoSyncDatabaseConfig {
     // path to the main database file (auxilary files like metadata, WAL, revert, changes will derive names from this path)
@@ -70,6 +97,10 @@ pub struct PyTursoSyncDatabaseConfig {
     // reserved bytes which must be set for the database - necessary if remote encryption is set for the db in cloud
     pub reserved_bytes: Option<usize>,
     pub partial_sync: Option<PyTursoPartialSyncOpts>,
+    // base64-encoded encryption key for the encrypted Turso Cloud databases
+    pub remote_encryption_key: Option<String>,
+    // encryption cipher for the remote database (used to calculate reserved_bytes)
+    pub remote_encryption_cipher: Option<PyRemoteEncryptionCipher>,
 }
 
 #[pymethods]
@@ -83,7 +114,10 @@ impl PyTursoSyncDatabaseConfig {
         bootstrap_if_empty=true,
         reserved_bytes=None,
         partial_sync=None,
+        remote_encryption_key=None,
+        remote_encryption_cipher=None,
     ))]
+    #[allow(clippy::too_many_arguments)]
     fn new(
         path: String,
         client_name: String,
@@ -92,6 +126,8 @@ impl PyTursoSyncDatabaseConfig {
         bootstrap_if_empty: bool,
         reserved_bytes: Option<usize>,
         partial_sync: Option<&PyTursoPartialSyncOpts>,
+        remote_encryption_key: Option<String>,
+        remote_encryption_cipher: Option<PyRemoteEncryptionCipher>,
     ) -> Self {
         Self {
             path,
@@ -101,6 +137,8 @@ impl PyTursoSyncDatabaseConfig {
             bootstrap_if_empty,
             reserved_bytes,
             partial_sync: partial_sync.cloned(),
+            remote_encryption_key,
+            remote_encryption_cipher,
         }
     }
 }
@@ -114,19 +152,24 @@ pub fn py_turso_sync_new(
     let db_config = TursoDatabaseConfig {
         path: db_config.path.clone(),
         experimental_features: db_config.experimental_features.clone(),
-        async_io: db_config.async_io,
+        async_io: true, // we will drive IO externally which is especially important for partial sync
         encryption: None,
         vfs: None,
         io: None,
         db_file: None,
     };
+    // calculate and set reserved_bytes from cipher if necessary
+    let reserved_bytes = sync_config
+        .remote_encryption_cipher
+        .map(|c| c.reserved_bytes())
+        .or(sync_config.reserved_bytes);
     let sync_config = rsapi::TursoDatabaseSyncConfig {
         path: sync_config.path.clone(),
         remote_url: sync_config.remote_url.clone(),
         client_name: sync_config.client_name.clone(),
         bootstrap_if_empty: sync_config.bootstrap_if_empty,
         long_poll_timeout_ms: sync_config.long_poll_timeout_ms,
-        reserved_bytes: sync_config.reserved_bytes,
+        reserved_bytes,
         partial_sync_opts: match &sync_config.partial_sync {
             Some(config) => {
                 if let Some(length) = config.bootstrap_strategy_prefix {
@@ -150,6 +193,7 @@ pub fn py_turso_sync_new(
             }
             None => None,
         },
+        remote_encryption_key: sync_config.remote_encryption_key.clone(),
     };
     let database =
         TursoDatabaseSync::<Vec<u8>>::new(db_config, sync_config).map_err(turso_error_to_py_err)?;

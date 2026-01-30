@@ -1,0 +1,163 @@
+---
+source: tpch.sqltest
+expression: |-
+  select
+          s_acctbal,
+          s_name,
+          n_name,
+          p_partkey,
+          p_mfgr,
+          s_address,
+          s_phone,
+          s_comment
+      from
+          part,
+          supplier,
+          partsupp,
+          nation,
+          region
+      where
+          p_partkey = ps_partkey
+          and s_suppkey = ps_suppkey
+          and p_size = 38
+          and p_type like '%TIN'
+          and s_nationkey = n_nationkey
+          and n_regionkey = r_regionkey
+          and r_name = 'MIDDLE EAST'
+          and ps_supplycost = (
+              select
+                  min(ps_supplycost)
+              from
+                  partsupp,
+                  supplier,
+                  nation,
+                  region
+              where
+                  p_partkey = ps_partkey
+                  and s_suppkey = ps_suppkey
+                  and s_nationkey = n_nationkey
+                  and n_regionkey = r_regionkey
+                  and r_name = 'MIDDLE EAST'
+          )
+      order by
+          s_acctbal desc,
+          n_name,
+          s_name,
+          p_partkey
+      limit 100;
+info:
+  statement_type: SELECT
+  tables:
+  - part
+  - partsupp
+  setup_blocks:
+  - schema
+  database: ':memory:'
+---
+QUERY PLAN
+|--SCAN part
+|--SEARCH supplier USING INTEGER PRIMARY KEY (rowid=?)
+|--SEARCH partsupp USING INDEX sqlite_autoindex_partsupp_1
+|--SEARCH nation USING INTEGER PRIMARY KEY (rowid=?)
+|--SEARCH region USING INTEGER PRIMARY KEY (rowid=?)
+|--SEARCH partsupp USING INDEX sqlite_autoindex_partsupp_1
+|--SEARCH supplier USING INTEGER PRIMARY KEY (rowid=?)
+|--SEARCH nation USING INTEGER PRIMARY KEY (rowid=?)
+|--SEARCH region USING INTEGER PRIMARY KEY (rowid=?)
+`--USE TEMP B-TREE FOR ORDER BY
+
+BYTECODE
+addr  opcode               p1  p2  p3  p4                      p5  comment
+   0    Init                0  87   0                           0  Start at 87
+   1    SorterOpen          0   4   0  k(4,-B,B,B,B)            0  cursor=0
+   2    Integer           100  11   0                           0  r[11]=100; LIMIT counter
+   3    IfNot              11  72   0                           0  if !r[11] goto 72
+   4    OpenRead            1   4   0  k(9,B,B,B,B,B,B,B,B,B)   0  table=part, root=4, iDb=0
+   5    OpenRead            2   5   0  k(7,B,B,B,B,B,B,B)       0  table=supplier, root=5, iDb=0
+   6    OpenRead            3   6   0  k(6,B,B,B,B,B)           0  table=partsupp, root=6, iDb=0
+   7    OpenRead            4   7   0  k(3,B,B)                 0  index=sqlite_autoindex_partsupp_1, root=7, iDb=0
+   8    OpenRead            5   2   0  k(4,B,B,B,B)             0  table=nation, root=2, iDb=0
+   9    OpenRead            6   3   0  k(3,B,B,B)               0  table=region, root=3, iDb=0
+  10    Rewind              1  72   0                           0  Rewind table part
+  11      Column            1   5  13                           0  r[13]=part.p_size
+  12      Ne               13  14  71  Binary                   0  if r[13]!=r[14] goto 71
+  13      Column            1   4  17                           0  r[17]=part.p_type
+  14      Function          1  16  15  like(2)                  0  r[15]=func(r[16..17])
+  15      IfNot            15  71   1                           0  if !r[15] goto 71
+  16      BeginSubrtn      18   0   0                           0  r[18]=NULL
+  17      Null              0   1   0                           0  r[1]=NULL
+  18      Null              0  20   0                           0  r[20]=NULL
+  19      Integer           1  21   0                           0  r[21]=1; LIMIT counter
+  20      IfNot            21  41   0                           0  if !r[21] goto 41
+  21      OpenRead          7   6   0  k(6,B,B,B,B,B)           0  table=partsupp, root=6, iDb=0
+  22      OpenRead          8   7   0  k(3,B,B)                 0  index=sqlite_autoindex_partsupp_1, root=7, iDb=0
+  23      OpenRead          9   5   0  k(7,B,B,B,B,B,B,B)       0  table=supplier, root=5, iDb=0
+  24      OpenRead         10   2   0  k(4,B,B,B,B)             0  table=nation, root=2, iDb=0
+  25      OpenRead         11   3   0  k(3,B,B,B)               0  table=region, root=3, iDb=0
+  26      RowId             1  22   0                           0  r[22]=part.rowid
+  27      SeekGE            8  41  22                           0  key=[22..22]
+  28        IdxGT           8  41  22                           0  key=[22..22]
+  29        DeferredSeek    8   7   0                           0
+  30        Column          7   1  23                           0  r[23]=partsupp.ps_suppkey
+  31        SeekRowid       9  23  40                           0  if (r[23]!=cursor 9 for table supplier.rowid) goto 40
+  32        Column          9   3  24                           0  r[24]=supplier.s_nationkey
+  33        SeekRowid      10  24  40                           0  if (r[24]!=cursor 10 for table nation.rowid) goto 40
+  34        Column         10   2  25                           0  r[25]=nation.n_regionkey
+  35        SeekRowid      11  25  40                           0  if (r[25]!=cursor 11 for table region.rowid) goto 40
+  36        Column         11   1  27                           0  r[27]=region.r_name
+  37        Ne             27  28  40  Binary                   0  if r[27]!=r[28] goto 40
+  38        Column          7   3  29                           0  r[29]=partsupp.ps_supplycost
+  39        AggStep         0  29  20  min                      0  accum=r[20] step(r[29])
+  40      Next              8  28   0                           0
+  41      AggFinal          0  20   0  min                      0  accum=r[20]
+  42      Copy             20  19   0                           0  r[19]=r[20]
+  43      Copy             19   1   0                           0  r[1]=r[19]
+  44    Return             18   0   1                           0
+  45    RowId               1  30   0                           0  r[30]=part.rowid
+  46    SeekGE              4  71  30                           0  key=[30..30]
+  47      IdxGT             4  71  30                           0  key=[30..30]
+  48      DeferredSeek      4   3   0                           0
+  49      Column            3   3  32                           0  r[32]=partsupp.ps_supplycost
+  50      Copy              1  33   0                           0  r[33]=r[1]
+  51      Ne               32  33  70  Binary                   0  if r[32]!=r[33] goto 70
+  52      Column            3   1  34                           0  r[34]=partsupp.ps_suppkey
+  53      SeekRowid         2  34  70                           0  if (r[34]!=cursor 2 for table supplier.rowid) goto 70
+  54      Column            2   3  35                           0  r[35]=supplier.s_nationkey
+  55      SeekRowid         5  35  70                           0  if (r[35]!=cursor 5 for table nation.rowid) goto 70
+  56      Column            5   2  36                           0  r[36]=nation.n_regionkey
+  57      SeekRowid         6  36  70                           0  if (r[36]!=cursor 6 for table region.rowid) goto 70
+  58      Column            6   1  38                           0  r[38]=region.r_name
+  59      Ne               38  39  70  Binary                   0  if r[38]!=r[39] goto 70
+  60      Column            2   5  40                           0  r[40]=supplier.s_acctbal
+  61      Column            5   1  41                           0  r[41]=nation.n_name
+  62      Column            2   1  42                           0  r[42]=supplier.s_name
+  63      RowId             1  43   0                           0  r[43]=part.rowid
+  64      Column            1   2  44                           0  r[44]=part.p_mfgr
+  65      Column            2   2  45                           0  r[45]=supplier.s_address
+  66      Column            2   4  46                           0  r[46]=supplier.s_phone
+  67      Column            2   6  47                           0  r[47]=supplier.s_comment
+  68      MakeRecord       40   8  10                           0  r[10]=mkrec(r[40..47])
+  69      SorterInsert      0  10   0  0                        0  key=r[10]
+  70    Next                4  47   0                           0
+  71  Next                  1  11   0                           0
+  72  OpenPseudo           12  10   8                           0  8 columns in r[10]
+  73  SorterSort            0  86   0                           0
+  74    SorterData          0  10  12                           0  r[10]=data
+  75    Column             12   0   2                           0  r[2]=pseudo.column 0
+  76    Column             12   2   3                           0  r[3]=pseudo.column 2
+  77    Column             12   1   4                           0  r[4]=pseudo.column 1
+  78    Column             12   3   5                           0  r[5]=pseudo.column 3
+  79    Column             12   4   6                           0  r[6]=pseudo.column 4
+  80    Column             12   5   7                           0  r[7]=pseudo.column 5
+  81    Column             12   6   8                           0  r[8]=pseudo.column 6
+  82    Column             12   7   9                           0  r[9]=pseudo.column 7
+  83    ResultRow           2   8   0                           0  output=r[2..9]
+  84    DecrJumpZero       11  86   0                           0  if (--r[11]==0) goto 86
+  85  SorterNext            0  74   0                           0
+  86  Halt                  0   0   0                           0
+  87  Transaction           0   1   8                           0  iDb=0 tx_mode=Read
+  88  Integer              38  14   0                           0  r[14]=38
+  89  String8               0  16   0  %TIN                     0  r[16]='%TIN'
+  90  String8               0  28   0  MIDDLE EAST              0  r[28]='MIDDLE EAST'
+  91  String8               0  39   0  MIDDLE EAST              0  r[39]='MIDDLE EAST'
+  92  Goto                  0   1   0                           0

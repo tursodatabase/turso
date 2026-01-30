@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use crate::sync::Arc;
 
 use turso_parser::ast::{self, SortOrder};
 

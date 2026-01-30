@@ -1,8 +1,9 @@
 use crate::error::LimboError;
+use crate::io::FileSyncType;
 use crate::storage::checksum::ChecksumContext;
 use crate::storage::encryption::EncryptionContext;
+use crate::sync::Arc;
 use crate::{io::Completion, Buffer, CompletionError, Result};
-use std::sync::Arc;
 use tracing::{instrument, Level};
 
 #[derive(Debug, Clone)]
@@ -82,7 +83,7 @@ pub trait DatabaseStorage: Send + Sync {
         io_ctx: &IOContext,
         c: Completion,
     ) -> Result<Completion>;
-    fn sync(&self, c: Completion) -> Result<Completion>;
+    fn sync(&self, c: Completion, sync_type: FileSyncType) -> Result<Completion>;
     fn size(&self) -> Result<u64>;
     fn truncate(&self, len: usize, c: Completion) -> Result<Completion>;
 }
@@ -122,7 +123,7 @@ impl DatabaseStorage for DatabaseFile {
                     Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
                         let Ok((buf, bytes_read)) = res else {
                             tracing::error!(err = ?res.unwrap_err());
-                            return;
+                            return None;
                         };
                         assert!(
                             bytes_read > 0,
@@ -133,6 +134,7 @@ impl DatabaseStorage for DatabaseFile {
                                 let original_buf = original_c.as_read().buf();
                                 original_buf.as_mut_slice().copy_from_slice(&decrypted_data);
                                 original_c.complete(bytes_read);
+                                None
                             }
                             Err(e) => {
                                 tracing::error!(
@@ -143,6 +145,7 @@ impl DatabaseStorage for DatabaseFile {
                                     "Original completion already has an error"
                                 );
                                 original_c.error(CompletionError::DecryptionError { page_idx });
+                                Some(CompletionError::DecryptionError { page_idx })
                             }
                         }
                     });
@@ -157,16 +160,17 @@ impl DatabaseStorage for DatabaseFile {
                 let verify_complete =
                     Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
                         let Ok((buf, bytes_read)) = res else {
-                            return;
+                            return None;
                         };
                         if bytes_read <= 0 {
                             tracing::trace!("Read page {page_idx} with {} bytes", bytes_read);
                             original_c.complete(bytes_read);
-                            return;
+                            return None;
                         }
                         match checksum_ctx.verify_checksum(buf.as_mut_slice(), page_idx) {
                             Ok(_) => {
                                 original_c.complete(bytes_read);
+                                None
                             }
                             Err(e) => {
                                 tracing::error!(
@@ -177,6 +181,7 @@ impl DatabaseStorage for DatabaseFile {
                                     "Original completion already has an error"
                                 );
                                 original_c.error(e);
+                                Some(e)
                             }
                         }
                     });
@@ -246,8 +251,8 @@ impl DatabaseStorage for DatabaseFile {
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
-    fn sync(&self, c: Completion) -> Result<Completion> {
-        self.file.sync(c)
+    fn sync(&self, c: Completion, sync_type: FileSyncType) -> Result<Completion> {
+        self.file.sync(c, sync_type)
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]

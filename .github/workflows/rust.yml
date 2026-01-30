@@ -28,8 +28,26 @@ jobs:
       - name: Check formatting (fuzz)
         run: cd fuzz && cargo fmt --check
 
+  check-bindings:
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install bindgen
+        run: cargo install --version 0.71.1 bindgen-cli
+      - name: Regenerate sdk-kit bindings
+        run: cd sdk-kit && ./bindgen.sh
+      - name: Regenerate sync/sdk-kit bindings
+        run: cd sync/sdk-kit && ./bindgen.sh
+      - name: Check bindings are up to date
+        run: |
+          if ! git diff --exit-code sdk-kit/src/bindings.rs sync/sdk-kit/src/bindings.rs; then
+            echo "Bindings are out of date. Run ./bindgen.sh in sdk-kit/ and sync/sdk-kit/ and commit the changes."
+            exit 1
+          fi
+
   build-native:
-    timeout-minutes: 30
+    timeout-minutes: ${{ matrix.os == 'windows-latest' && 120 || 30 }}
     strategy:
       matrix:
         os: [blacksmith-4vcpu-ubuntu-2404, macos-latest, windows-latest]
@@ -66,13 +84,64 @@ jobs:
           RUSTC_WRAPPER: "sccache"
           LOCAL_SYNC_SERVER: "../../target/debug/tursodb"
         run: cargo nextest run --workspace --all-features --locked --no-fail-fast -E 'not test(/^fuzz_tests::/)' --failure-output=final
-        timeout-minutes: 20
+        timeout-minutes: ${{ matrix.os == 'windows-latest' && 60 || 20 }}
+      - name: Test integrity_check corruption and short reads (no checksum feature because it interferes with the test)
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+          RUSTC_WRAPPER: "sccache"
+        run: cargo nextest run -p core_tester --locked --no-fail-fast -E 'test(integrity_check) | test(short_read)' --failure-output=final
+        timeout-minutes: 5
       - name: Test doctests
         env:
           SCCACHE_GHA_ENABLED: "true"
           RUSTC_WRAPPER: "sccache"
           LOCAL_SYNC_SERVER: "../../target/debug/tursodb"
         run: cargo test --workspace --all-features --doc --locked
+
+  shuttle-tests:
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Setup mold linker
+        uses: rui314/setup-mold@v1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-rust-shuttle"
+          cache-on-failure: true
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+      - name: Run shuttle tests
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+          RUSTC_WRAPPER: "sccache"
+        run: |
+          make test-shuttle
+
+  stress-nondeterminism-check:
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Setup mold linker
+        uses: rui314/setup-mold@v1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-rust-shuttle"
+          cache-on-failure: true
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+      - name: Check for uncontrolled nondeterminism
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+          RUSTC_WRAPPER: "sccache"
+          RUSTFLAGS: "--cfg tokio_unstable --cfg shuttle"
+        run: |
+          cargo run -p turso_stress -- --check-uncontrolled-nondeterminism
 
   clippy:
     runs-on: blacksmith-4vcpu-ubuntu-2404
@@ -93,6 +162,30 @@ jobs:
   simulator:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 35
+    strategy:
+      matrix:
+        profile:
+          - name: default
+            iterations: 10
+            args: "--maximum-tests 1000 --min-tick 10 --max-tick 50 --io-backend=memory"
+          - name: InsertHeavy
+            iterations: 5
+            args: "--maximum-tests 1000 --min-tick 10 --max-tick 50 --profile write_heavy --io-backend=memory"
+          - name: InsertHeavySpill
+            iterations: 5
+            args: "--maximum-tests 1000 --min-tick 10 --max-tick 50 --profile write_heavy_spill --io-backend=memory"
+          - name: Faultless
+            iterations: 10
+            args: "--maximum-tests 1000 --min-tick 10 --max-tick 50 --profile faultless --io-backend=memory"
+          - name: IOUring InsertHeavySpill
+            iterations: 5
+            args: "--io-backend=io-uring --maximum-tests 1000 --profile=write_heavy_spill"
+          - name: IOUring Differential
+            iterations: 10
+            args: "--io-backend=io-uring --maximum-tests 1000 --differential"
+          - name: Differential
+            iterations: 10
+            args: "--maximum-tests 1000 --differential --io-backend=memory"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -106,62 +199,36 @@ jobs:
         uses: mozilla-actions/sccache-action@v0.0.9
       # Run these with for loops (instead of --loop flag in sim) so that each iteration gets a separate seed -- this produces much easier-to-debug traces when there's a failure since we don't have to potentially
       # run 10 iterations of the same seed to get to the failure
-      - name: Simulator default
+      - name: Simulator ${{ matrix.profile.name }}
         env:
           SCCACHE_GHA_ENABLED: "true"
           RUSTC_WRAPPER: "sccache"
         run: |
-          for i in {1..10}; do
-            ./scripts/run-sim --maximum-tests 1000 --min-tick 10 --max-tick 50 --io-backend=memory || exit 1
+          for i in $(seq 1 ${{ matrix.profile.iterations }}); do
+            ./scripts/run-sim ${{ matrix.profile.args }} || exit 1
           done
-      - name: Simulator InsertHeavy
-        env:
-          SCCACHE_GHA_ENABLED: "true"
-          RUSTC_WRAPPER: "sccache"
-        run: |
-          for i in {1..5}; do
-            ./scripts/run-sim --maximum-tests 1000 --min-tick 10 --max-tick 50 --profile write_heavy --io-backend=memory || exit 1
-          done
-      - name: Simulator InsertHeavySpill
-        env:
-          SCCACHE_GHA_ENABLED: "true"
-          RUSTC_WRAPPER: "sccache"
-        run: |
-          for i in {1..5}; do
-            ./scripts/run-sim --maximum-tests 1000 --min-tick 10 --max-tick 50 --profile write_heavy_spill --io-backend=memory || exit 1
-          done
-      - name: Simulator Faultless
-        env:
-          SCCACHE_GHA_ENABLED: "true"
-          RUSTC_WRAPPER: "sccache"
-        run: |
-          for i in {1..10}; do
-            ./scripts/run-sim --maximum-tests 1000 --min-tick 10 --max-tick 50 --profile faultless --io-backend=memory || exit 1
-          done
-      - name: Simulator IOUring InsertHeavySpill
-        env:
-          SCCACHE_GHA_ENABLED: "true"
-          RUSTC_WRAPPER: "sccache"
-        run: |
-          for i in {1..5}; do
-            ./scripts/run-sim --io-backend=io-uring --maximum-tests 1000 --profile=write_heavy_spill || exit 1
-          done
-      - name: Simulator IOUring Differential
-        env:
-          SCCACHE_GHA_ENABLED: "true"
-          RUSTC_WRAPPER: "sccache"
-        run: |
-          for i in {1..10}; do
-            ./scripts/run-sim --io-backend=io-uring --maximum-tests 1000 --differential || exit 1
-          done
-      - name: Simulator Differential
-        env:
-          SCCACHE_GHA_ENABLED: "true"
-          RUSTC_WRAPPER: "sccache"
-        run: |
-          for i in {1..10}; do
-            ./scripts/run-sim --maximum-tests 1000 --differential --io-backend=memory || exit 1
-          done
+
+  # TODO: for now leave this commented out, as it always fails
+  # differential-fuzzer:
+  #   runs-on: blacksmith-4vcpu-ubuntu-2404
+  #   timeout-minutes: 30
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - uses: dtolnay/rust-toolchain@stable
+  #     - name: Setup mold linker
+  #       uses: rui314/setup-mold@v1
+  #     - uses: Swatinem/rust-cache@v2
+  #       with:
+  #         prefix-key: "v1-rust"
+  #         cache-on-failure: true
+  #     - name: Setup sccache
+  #       uses: mozilla-actions/sccache-action@v0.0.9
+  #     - name: Run differential_fuzzer
+  #       env:
+  #         SCCACHE_GHA_ENABLED: "true"
+  #         RUSTC_WRAPPER: "sccache"
+  #       run: |
+  #         cargo run -p differential-fuzzer -- -n 1000 loop 10
 
   test-limbo:
     runs-on: blacksmith-4vcpu-ubuntu-2404
@@ -199,6 +266,30 @@ jobs:
           RUSTC_WRAPPER: "sccache"
         run: make test-compat-mvcc
         timeout-minutes: 10
+
+  concurrent-simulator:
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Setup mold linker
+        uses: rui314/setup-mold@v1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-rust"
+          cache-on-failure: true
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+      - name: Run turso_whopper
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+          RUSTC_WRAPPER: "sccache"
+        run: |
+          cargo build -p turso_whopper
+          for i in $(seq 1 100); do
+            ./target/debug/turso_whopper --reopen-probability 0.001 || exit 1
+          done
 
   test-sqlite:
     runs-on: blacksmith-4vcpu-ubuntu-2404

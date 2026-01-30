@@ -1,22 +1,37 @@
 use super::{ComparisonResult, format_rows};
-use regex::Regex;
+use regex::RegexBuilder;
+
+/// Compare error string against a regex pattern (case-insensitive)
+pub fn compare_error(actual: &str, pattern: &str) -> ComparisonResult {
+    match RegexBuilder::new(pattern).case_insensitive(true).build() {
+        Ok(re) => {
+            if re.is_match(actual) {
+                ComparisonResult::Match
+            } else {
+                ComparisonResult::mismatch(format!(
+                    "error message '{actual}' does not contain expected pattern '{pattern}'"
+                ))
+            }
+        }
+        Err(e) => ComparisonResult::mismatch(format!("invalid regex pattern: {e}")),
+    }
+}
 
 /// Compare rows against a regex pattern
 pub fn compare(actual: &[Vec<String>], pattern: &str) -> ComparisonResult {
     let actual_str = format_rows(actual);
 
-    match Regex::new(pattern) {
+    match RegexBuilder::new(pattern).build() {
         Ok(re) => {
             if re.is_match(&actual_str) {
                 ComparisonResult::Match
             } else {
                 ComparisonResult::mismatch(format!(
-                    "output does not match pattern\nPattern: {}\nActual:\n{}",
-                    pattern, actual_str
+                    "output does not match pattern\nPattern: {pattern}\nActual:\n{actual_str}"
                 ))
             }
         }
-        Err(e) => ComparisonResult::mismatch(format!("invalid regex pattern: {}", e)),
+        Err(e) => ComparisonResult::mismatch(format!("invalid regex pattern: {e}")),
     }
 }
 

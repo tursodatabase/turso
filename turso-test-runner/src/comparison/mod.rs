@@ -82,14 +82,8 @@ fn compare_error(actual: &QueryResult, expected_pattern: Option<&str>) -> Compar
             // Normalize whitespace in both error and pattern for flexible matching
             let normalized_err = normalize_whitespace(err);
             let normalized_pattern = normalize_whitespace(pattern);
-            if normalized_err.contains(&normalized_pattern) {
-                ComparisonResult::Match
-            } else {
-                ComparisonResult::mismatch(format!(
-                    "error message '{}' does not contain expected pattern '{}'",
-                    err, pattern
-                ))
-            }
+
+            pattern::compare_error(&normalized_err, &normalized_pattern)
         }
     }
 }
@@ -103,11 +97,18 @@ pub fn format_rows(rows: &[Vec<String>]) -> String {
 }
 
 /// Parse expected rows from string lines
+/// Empty lines are preserved as rows with a single empty cell (representing NULL)
 pub fn parse_expected_rows(lines: &[String]) -> Vec<Vec<String>> {
     lines
         .iter()
-        .filter(|line| !line.is_empty())
-        .map(|line| line.split('|').map(|s| s.to_string()).collect())
+        .map(|line| {
+            if line.is_empty() {
+                // Empty line represents a row with a single empty cell (NULL)
+                vec!["".to_string()]
+            } else {
+                line.split('|').map(|s| s.to_string()).collect()
+            }
+        })
         .collect()
 }
 

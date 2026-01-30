@@ -45,9 +45,9 @@ mod tests {
         commit_tx_no_conn, generate_simple_string_row, MvccTestDbNoConn,
     };
     use crate::mvcc::database::{RowID, RowKey};
-    use std::sync::atomic::AtomicI64;
-    use std::sync::atomic::Ordering;
-    use std::sync::Arc;
+    use crate::sync::atomic::AtomicI64;
+    use crate::sync::atomic::Ordering;
+    use crate::sync::Arc;
 
     static IDS: AtomicI64 = AtomicI64::new(1);
 

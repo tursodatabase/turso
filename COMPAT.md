@@ -96,6 +96,7 @@ Turso aims to be fully compatible with SQLite, with opt-in features not supporte
 | VACUUM                    | No      |                                                                                   |
 | WITH clause               | Partial | No RECURSIVE, no MATERIALIZED, only SELECT supported in CTEs                      |
 | WINDOW functions             | Partial | only default frame definition, no window-specific functions (rank() etc)         |
+| GENERATED                 | No      |                                                                                   |
 
 #### [PRAGMA](https://www.sqlite.org/pragma.html)
 
@@ -151,7 +152,7 @@ Turso aims to be fully compatible with SQLite, with opt-in features not supporte
 | PRAGMA parser_trace              | No         |                                              |
 | PRAGMA pragma_list               | Yes        |                                              |
 | PRAGMA query_only                | Yes        |                                              |
-| PRAGMA quick_check               | No         |                                              |
+| PRAGMA quick_check               | Yes        |                                              |
 | PRAGMA read_uncommitted          | No         |                                              |
 | PRAGMA recursive_triggers        | No         |                                              |
 | PRAGMA reverse_unordered_selects | No         |                                              |
@@ -165,7 +166,7 @@ Turso aims to be fully compatible with SQLite, with opt-in features not supporte
 | PRAGMA table_info                | Yes        |                                              |
 | PRAGMA table_list                | No         |                                              |
 | PRAGMA table_xinfo               | Yes        |                                              |
-| PRAGMA temp_store                | No         |                                              |
+| PRAGMA temp_store                | Yes        |                                              |
 | PRAGMA temp_store_directory      | Not Needed | deprecated in SQLite                         |
 | PRAGMA threads                   | No         |                                              |
 | PRAGMA trusted_schema            | No         |                                              |
@@ -324,13 +325,13 @@ Feature support of [sqlite expr syntax](https://www.sqlite.org/lang_expr.html).
 
 | Function    | Status  | Comment                      |
 |-------------|---------|------------------------------|
-| date()      | Yes     | partially supports modifiers |
-| time()      | Yes     | partially supports modifiers |
-| datetime()  | Yes     | partially supports modifiers |
-| julianday() | Yes     | partially support modifiers  |
-| unixepoch() | Partial | does not support modifiers   |
-| strftime()  | Yes     | partially supports modifiers |
-| timediff()  | Yes     | partially supports modifiers |
+| date()      | Yes     |                              |
+| time()      | Yes     |                              |
+| datetime()  | Yes     |                              |
+| julianday() | Yes     |                              |
+| unixepoch() | Yes     |                              |
+| strftime()  | Yes     |                              |
+| timediff()  | Yes     |                              |
 
 Modifiers:
 
@@ -346,17 +347,17 @@ Modifiers:
 | DateOffset	 | Yes   |                                 |
 | DateTimeOffset | Yes   |                                 |
 | Ceiling	     | Yes   |                                 |
-| Floor          | No    |                                 |
+| Floor          | Yes   |                                 |
 | StartOfMonth	 | Yes	 |                                 |
 | StartOfYear	 | Yes	 |                                 |
 | StartOfDay	 | Yes	 |                                 |
 | Weekday(N)	 | Yes   |                                 |
-| Auto           | No    |                                 |
-| UnixEpoch      | No    |                                 |
-| JulianDay      | No    |                                 |
-| Localtime      |Partial| requires fixes to avoid double conversions.|
-| Utc            |Partial| requires fixes to avoid double conversions.|
-| Subsec         | Yes   |                                  |
+| Auto           | Yes   |                                 |
+| UnixEpoch      | Yes   |                                 |
+| JulianDay      | Yes   |                                 |
+| Localtime      | Yes   |                                 |
+| Utc            | Yes   |                                 |
+| Subsec         | Yes   |                                 |
 
 #### JSON functions
 

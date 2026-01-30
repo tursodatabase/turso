@@ -45,10 +45,16 @@ pub enum LimboError {
     InvalidFormatter(String),
     #[error("Runtime error: {0}")]
     Constraint(String),
+    #[error("Runtime error: {0}")]
+    /// We need to specify for ROLLBACK|FAIL resolve types when to roll the tx back
+    /// so instead of matching on the string, we introduce a specific ForeignKeyConstraint error
+    ForeignKeyConstraint(String),
     #[error("Extension error: {0}")]
     ExtensionError(String),
     #[error("Runtime error: integer overflow")]
     IntegerOverflow,
+    #[error("Runtime error: string or blob too big")]
+    TooBig,
     #[error("Runtime error: database table is locked")]
     TableLocked,
     #[error("Error: Resource is read-only")]
@@ -63,6 +69,8 @@ pub enum LimboError {
     Conflict(String),
     #[error("Database schema changed")]
     SchemaUpdated,
+    #[error("Database schema conflict")]
+    SchemaConflict,
     #[error(
         "Database is empty, header does not exist - page 1 should've been allocated before this"
     )]
@@ -130,6 +138,18 @@ pub enum CompletionError {
     DecryptionError { page_idx: usize },
     #[error("I/O error: partial write")]
     ShortWrite,
+    #[error("I/O error: short read on page {page_idx}: expected {expected} bytes, got {actual}")]
+    ShortRead {
+        page_idx: usize,
+        expected: usize,
+        actual: usize,
+    },
+    #[error("I/O error: short read on WAL frame at offset {offset}: expected {expected} bytes, got {actual}")]
+    ShortReadWalFrame {
+        offset: u64,
+        expected: usize,
+        actual: usize,
+    },
     #[error("Checksum mismatch on page {page_id}: expected {expected}, got {actual}")]
     ChecksumMismatch {
         page_id: usize,

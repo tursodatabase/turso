@@ -1,0 +1,172 @@
+GEM
+  remote: https://rubygems.org/
+  specs:
+    CFPropertyList (3.0.8)
+    activesupport (7.2.3)
+      base64
+      benchmark (>= 0.3)
+      bigdecimal
+      concurrent-ruby (~> 1.0, >= 1.3.1)
+      connection_pool (>= 2.2.5)
+      drb
+      i18n (>= 1.6, < 2)
+      logger (>= 1.4.2)
+      minitest (>= 5.1)
+      securerandom (>= 0.3)
+      tzinfo (~> 2.0, >= 2.0.5)
+    addressable (2.8.8)
+      public_suffix (>= 2.0.2, < 8.0)
+    algoliasearch (1.27.5)
+      httpclient (~> 2.8, >= 2.8.3)
+      json (>= 1.5.1)
+    atomos (0.1.3)
+    base64 (0.3.0)
+    benchmark (0.5.0)
+    bigdecimal (4.0.1)
+    claide (1.1.0)
+    cocoapods (1.15.2)
+      addressable (~> 2.8)
+      claide (>= 1.0.2, < 2.0)
+      cocoapods-core (= 1.15.2)
+      cocoapods-deintegrate (>= 1.0.3, < 2.0)
+      cocoapods-downloader (>= 2.1, < 3.0)
+      cocoapods-plugins (>= 1.0.0, < 2.0)
+      cocoapods-search (>= 1.0.0, < 2.0)
+      cocoapods-trunk (>= 1.6.0, < 2.0)
+      cocoapods-try (>= 1.1.0, < 2.0)
+      colored2 (~> 3.1)
+      escape (~> 0.0.4)
+      fourflusher (>= 2.3.0, < 3.0)
+      gh_inspector (~> 1.0)
+      molinillo (~> 0.8.0)
+      nap (~> 1.0)
+      ruby-macho (>= 2.3.0, < 3.0)
+      xcodeproj (>= 1.23.0, < 2.0)
+    cocoapods-core (1.15.2)
+      activesupport (>= 5.0, < 8)
+      addressable (~> 2.8)
+      algoliasearch (~> 1.0)
+      concurrent-ruby (~> 1.1)
+      fuzzy_match (~> 2.0.4)
+      nap (~> 1.0)
+      netrc (~> 0.11)
+      public_suffix (~> 4.0)
+      typhoeus (~> 1.0)
+    cocoapods-deintegrate (1.0.5)
+    cocoapods-downloader (2.1)
+    cocoapods-plugins (1.0.0)
+      nap
+    cocoapods-search (1.0.1)
+    cocoapods-trunk (1.6.0)
+      nap (>= 0.8, < 2.0)
+      netrc (~> 0.11)
+    cocoapods-try (1.2.0)
+    colored2 (3.1.2)
+    concurrent-ruby (1.3.3)
+    connection_pool (3.0.2)
+    drb (2.2.3)
+    escape (0.0.4)
+    ethon (0.15.0)
+      ffi (>= 1.15.0)
+    ffi (1.17.3)
+    fourflusher (2.3.1)
+    fuzzy_match (2.0.4)
+    gh_inspector (1.1.3)
+    httpclient (2.9.0)
+      mutex_m
+    i18n (1.14.8)
+      concurrent-ruby (~> 1.0)
+    json (2.18.0)
+    logger (1.7.0)
+    minitest (6.0.1)
+      prism (~> 1.5)
+    molinillo (0.8.0)
+    mutex_m (0.3.0)
+    nanaimo (0.3.0)
+    nap (1.1.0)
+    netrc (0.11.0)
+    nkf (0.2.0)
+    prism (1.8.0)
+    public_suffix (4.0.7)
+    rexml (3.4.4)
+    ruby-macho (2.5.1)
+    securerandom (0.4.1)
+    typhoeus (1.5.0)
+      ethon (>= 0.9.0, < 0.16.0)
+    tzinfo (2.0.6)
+      concurrent-ruby (~> 1.0)
+    xcodeproj (1.25.1)
+      CFPropertyList (>= 2.3.3, < 4.0)
+      atomos (~> 0.1.3)
+      claide (>= 1.0.2, < 2.0)
+      colored2 (~> 3.1)
+      nanaimo (~> 0.3.0)
+      rexml (>= 3.3.6, < 4.0)
+
+PLATFORMS
+  ruby
+
+DEPENDENCIES
+  activesupport (>= 6.1.7.5, != 7.1.0)
+  benchmark
+  bigdecimal
+  cocoapods (>= 1.13, != 1.15.1, != 1.15.0)
+  concurrent-ruby (< 1.3.4)
+  logger
+  mutex_m
+  nkf
+  xcodeproj (< 1.26.0)
+
+CHECKSUMS
+  CFPropertyList (3.0.8) sha256=2c99d0d980536d3d7ab252f7bd59ac8be50fbdd1ff487c98c949bb66bb114261
+  activesupport (7.2.3) sha256=5675c9770dac93e371412684249f9dc3c8cec104efd0624362a520ae685c7b10
+  addressable (2.8.8) sha256=7c13b8f9536cf6364c03b9d417c19986019e28f7c00ac8132da4eb0fe393b057
+  algoliasearch (1.27.5) sha256=26c1cddf3c2ec4bd60c148389e42702c98fdac862881dc6b07a4c0b89ffec853
+  atomos (0.1.3) sha256=7d43b22f2454a36bace5532d30785b06de3711399cb1c6bf932573eda536789f
+  base64 (0.3.0) sha256=27337aeabad6ffae05c265c450490628ef3ebd4b67be58257393227588f5a97b
+  benchmark (0.5.0) sha256=465df122341aedcb81a2a24b4d3bd19b6c67c1530713fd533f3ff034e419236c
+  bigdecimal (4.0.1) sha256=8b07d3d065a9f921c80ceaea7c9d4ae596697295b584c296fe599dd0ad01c4a7
+  claide (1.1.0) sha256=6d3c5c089dde904d96aa30e73306d0d4bd444b1accb9b3125ce14a3c0183f82e
+  cocoapods (1.15.2) sha256=f0f5153de8d028d133b96f423e04f37fb97a1da0d11dda581a9f46c0cba4090a
+  cocoapods-core (1.15.2) sha256=322650d97fe1ad4c0831a09669764b888bd91c6d79d0f6bb07281a17667a2136
+  cocoapods-deintegrate (1.0.5) sha256=517c2a448ef563afe99b6e7668704c27f5de9e02715a88ee9de6974dc1b3f6a2
+  cocoapods-downloader (2.1) sha256=bb6ebe1b3966dc4055de54f7a28b773485ac724fdf575d9bee2212d235e7b6d1
+  cocoapods-plugins (1.0.0) sha256=725d17ce90b52f862e73476623fd91441b4430b742d8a071000831efb440ca9a
+  cocoapods-search (1.0.1) sha256=1b133b0e6719ed439bd840e84a1828cca46425ab73a11eff5e096c3b2df05589
+  cocoapods-trunk (1.6.0) sha256=5f5bda8c172afead48fa2d43a718cf534b1313c367ba1194cebdeb9bfee9ed31
+  cocoapods-try (1.2.0) sha256=145b946c6e7747ed0301d975165157951153d27469e6b2763c83e25c84b9defe
+  colored2 (3.1.2) sha256=b13c2bd7eeae2cf7356a62501d398e72fde78780bd26aec6a979578293c28b4a
+  concurrent-ruby (1.3.3) sha256=4f9cd28965c4dcf83ffd3ea7304f9323277be8525819cb18a3b61edcb56a7c6a
+  connection_pool (3.0.2) sha256=33fff5ba71a12d2aa26cb72b1db8bba2a1a01823559fb01d29eb74c286e62e0a
+  drb (2.2.3) sha256=0b00d6fdb50995fe4a45dea13663493c841112e4068656854646f418fda13373
+  escape (0.0.4) sha256=e49f44ae2b4f47c6a3abd544ae77fe4157802794e32f19b8e773cbc4dcec4169
+  ethon (0.15.0) sha256=0809805a035bc10f54162ca99f15ded49e428e0488bcfe1c08c821e18261a74d
+  ffi (1.17.3) sha256=0e9f39f7bb3934f77ad6feab49662be77e87eedcdeb2a3f5c0234c2938563d4c
+  fourflusher (2.3.1) sha256=1b3de61c7c791b6a4e64f31e3719eb25203d151746bb519a0292bff1065ccaa9
+  fuzzy_match (2.0.4) sha256=b5de4f95816589c5b5c3ad13770c0af539b75131c158135b3f3bbba75d0cfca5
+  gh_inspector (1.1.3) sha256=04cca7171b87164e053aa43147971d3b7f500fcb58177698886b48a9fc4a1939
+  httpclient (2.9.0) sha256=4b645958e494b2f86c2f8a2f304c959baa273a310e77a2931ddb986d83e498c8
+  i18n (1.14.8) sha256=285778639134865c5e0f6269e0b818256017e8cde89993fdfcbfb64d088824a5
+  json (2.18.0) sha256=b10506aee4183f5cf49e0efc48073d7b75843ce3782c68dbeb763351c08fd505
+  logger (1.7.0) sha256=196edec7cc44b66cfb40f9755ce11b392f21f7967696af15d274dde7edff0203
+  minitest (6.0.1) sha256=7854c74f48e2e975969062833adc4013f249a4b212f5e7b9d5c040bf838d54bb
+  molinillo (0.8.0) sha256=efbff2716324e2a30bccd3eba1ff3a735f4d5d53ffddbc6a2f32c0ca9433045d
+  mutex_m (0.3.0) sha256=cfcb04ac16b69c4813777022fdceda24e9f798e48092a2b817eb4c0a782b0751
+  nanaimo (0.3.0) sha256=aaaedc60497070b864a7e220f7c4b4cad3a0daddda2c30055ba8dae306342376
+  nap (1.1.0) sha256=949691660f9d041d75be611bb2a8d2fd559c467537deac241f4097d9b5eea576
+  netrc (0.11.0) sha256=de1ce33da8c99ab1d97871726cba75151113f117146becbe45aa85cb3dabee3f
+  nkf (0.2.0) sha256=fbc151bda025451f627fafdfcb3f4f13d0b22ae11f58c6d3a2939c76c5f5f126
+  prism (1.8.0) sha256=84453a16ef5530ea62c5f03ec16b52a459575ad4e7b9c2b360fd8ce2c39c1254
+  public_suffix (4.0.7) sha256=8be161e2421f8d45b0098c042c06486789731ea93dc3a896d30554ee38b573b8
+  rexml (3.4.4) sha256=19e0a2c3425dfbf2d4fc1189747bdb2f849b6c5e74180401b15734bc97b5d142
+  ruby-macho (2.5.1) sha256=9075e52e0f9270b552a90b24fcc6219ad149b0d15eae1bc364ecd0ac8984f5c9
+  securerandom (0.4.1) sha256=cc5193d414a4341b6e225f0cb4446aceca8e50d5e1888743fac16987638ea0b1
+  typhoeus (1.5.0) sha256=120b67ed1ef515e6c0e938176db880f15b0916f038e78ce2a66290f3f1de3e3b
+  tzinfo (2.0.6) sha256=8daf828cc77bcf7d63b0e3bdb6caa47e2272dcfaf4fbfe46f8c3a9df087a829b
+  xcodeproj (1.25.1) sha256=9a2310dccf6d717076e86f602b17c640046b6f1dfe64480044596f6f2f13dc84
+
+RUBY VERSION
+  ruby 4.0.0
+
+BUNDLED WITH
+  4.0.4

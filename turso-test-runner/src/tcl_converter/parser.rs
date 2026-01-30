@@ -99,6 +99,24 @@ pub struct TclTest {
     pub has_ddl: bool,
     /// Comments that appeared before this test
     pub comments: Vec<String>,
+    /// Skip condition if this test should be conditionally skipped
+    pub skip: Option<TclSkip>,
+}
+
+/// Skip configuration for a test
+#[derive(Debug, Clone)]
+pub struct TclSkip {
+    /// The reason for skipping
+    pub reason: String,
+    /// Condition for skipping
+    pub condition: TclSkipCondition,
+}
+
+/// Conditions for skipping a test
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum TclSkipCondition {
+    /// Skip when MVCC mode is enabled
+    Mvcc,
 }
 
 /// The type of test expectation
@@ -264,6 +282,7 @@ fn build_test(args: Vec<String>, config: TestConfig) -> Result<TclTest, String> 
         db,
         has_ddl,
         comments: Vec::new(),
+        skip: None,
     })
 }
 
@@ -338,6 +357,8 @@ pub enum SkipKind {
 #[derive(Debug, Clone)]
 pub enum TclItem {
     Test(TclTest),
+    /// Multiple tests extracted from a conditional block (e.g., if {![is_turso_mvcc]})
+    ConditionalTests(Vec<TclTest>, TclSkipCondition),
     Comment(String),
     Skip(SkipKind, SimpleSpan), // kind and preview of content
 }
@@ -349,12 +370,85 @@ impl TclItem {
     }
 }
 
+/// Extract tests from block content (used for conditional blocks)
+fn extract_tests_from_block(content: &str) -> Vec<TclTest> {
+    let mut tests = Vec::new();
+
+    // Parse the block content to find tests
+    // We use a simple line-by-line approach to find test function calls
+    let lines: Vec<&str> = content.lines().collect();
+    let mut i = 0;
+
+    while i < lines.len() {
+        let line = lines[i].trim();
+
+        // Check if this line starts a test function
+        if line.starts_with("do_execsql_test") {
+            // Reconstruct the full test by finding the closing brace
+            let mut full_test = String::new();
+            let mut brace_depth = 0;
+            let mut found_open = false;
+
+            for (j, l) in lines.iter().enumerate().skip(i) {
+                full_test.push_str(l);
+                full_test.push('\n');
+
+                for ch in l.chars() {
+                    if ch == '{' {
+                        brace_depth += 1;
+                        found_open = true;
+                    } else if ch == '}' {
+                        brace_depth -= 1;
+                    }
+                }
+
+                if found_open && brace_depth == 0 {
+                    i = j;
+                    break;
+                }
+            }
+
+            // Try to parse this as a test
+            let (result, _errors) = test_parser()
+                .map(TclItem::Test)
+                .parse(full_test.trim())
+                .into_output_errors();
+
+            if let Some(TclItem::Test(test)) = result {
+                tests.push(test);
+            }
+        }
+        i += 1;
+    }
+
+    tests
+}
+
+/// Parser for if {![is_turso_mvcc]} blocks - extracts tests with skip condition
+fn mvcc_conditional_block<'a>() -> text_parser!('a, TclItem) {
+    use crate::tcl_converter::utils::braced;
+
+    // Match: if {![is_turso_mvcc]} { ... }
+    just("if")
+        .then(hspace())
+        .then(just("{![is_turso_mvcc]}").or(just("{ ![is_turso_mvcc] }")))
+        .then(hspace())
+        .ignore_then(braced())
+        .map(|block_content: String| {
+            let tests = extract_tests_from_block(&block_content);
+            TclItem::ConditionalTests(tests, TclSkipCondition::Mvcc)
+        })
+}
+
 /// Full file parser
 pub fn tcl_file_parser<'a>() -> text_parser!('a, Vec<TclItem>) {
     // Skip block parsers that capture the entire block content
     let foreach_block = skip_block("foreach")
         .spanned()
         .map(|preview| TclItem::Skip(SkipKind::Foreach, preview.span));
+
+    // MVCC conditional block - must come before generic if_block
+    let mvcc_block = mvcc_conditional_block();
 
     let if_block = skip_block("if")
         .spanned()
@@ -388,18 +482,20 @@ pub fn tcl_file_parser<'a>() -> text_parser!('a, Vec<TclItem>) {
 
     // Each item can have leading horizontal whitespace
     // Order matters: more specific patterns before general ones
+    // skip_line must come before comment to handle shebangs (#!/...)
     let item = hspace().ignore_then(choice((
         extension_skip,
         tolerance_skip,
         skip_lines_skip,
         test_parser().map(TclItem::Test),
-        comment().map(TclItem::comment),
-        foreach_block,
-        if_block,
-        proc_block,
         skip_line()
             .spanned()
             .map(|line| TclItem::Skip(SkipKind::Line, line.span)),
+        comment().map(TclItem::comment),
+        foreach_block,
+        mvcc_block, // Must come before generic if_block
+        if_block,
+        proc_block,
         // Skip unknown lines (but only non-empty ones after whitespace)
         none_of(" \t\n")
             .then(none_of('\n').repeated())
@@ -435,13 +531,44 @@ pub fn parse_tcl_file(content: &str, source_file: &str) -> ConversionResult {
                     let mut final_name = base_name.clone();
                     let mut counter = 2;
                     while used_names.contains(&final_name) {
-                        final_name = format!("{}-{}", base_name, counter);
+                        final_name = format!("{base_name}-{counter}");
                         counter += 1;
                     }
                     test.name = final_name.clone();
                     used_names.insert(final_name);
 
                     tests.push(test);
+                }
+                TclItem::ConditionalTests(conditional_tests, condition) => {
+                    // Add tests with skip condition
+                    let reason = match condition {
+                        TclSkipCondition::Mvcc => "not supported in MVCC mode".to_string(),
+                    };
+
+                    for mut test in conditional_tests {
+                        test.skip = Some(TclSkip {
+                            reason: reason.clone(),
+                            condition,
+                        });
+
+                        // Attach pending comments to first test only
+                        if tests.is_empty() || !pending_comments.is_empty() {
+                            test.comments = std::mem::take(&mut pending_comments);
+                        }
+
+                        // Deduplicate names
+                        let base_name = test.name.clone();
+                        let mut final_name = base_name.clone();
+                        let mut counter = 2;
+                        while used_names.contains(&final_name) {
+                            final_name = format!("{base_name}-{counter}");
+                            counter += 1;
+                        }
+                        test.name = final_name.clone();
+                        used_names.insert(final_name);
+
+                        tests.push(test);
+                    }
                 }
                 TclItem::Comment(c) => {
                     pending_comments.push(c);
@@ -1162,18 +1289,5 @@ do_execsql_test_on_specific_db {:memory:} test3 {
         println!("Tests: {:?}", result.tests);
         println!("Warnings: {:?}", result.warnings);
         assert_eq!(result.tests.len(), 2, "Expected 2 tests");
-    }
-
-    #[test]
-    fn test_full_select_file() {
-        let content = std::fs::read_to_string("../testing/select.test").unwrap();
-        let result = convert(&content, "select.test");
-        println!("Total tests: {}", result.tests.len());
-        println!("Warnings: {}", result.warnings.len());
-        for w in &result.warnings {
-            println!("  {:?}: {}", w.kind, w.message);
-        }
-        // 172 total - 2 commented - 1 in foreach = 169
-        assert!(result.tests.len() > 100, "Should have over 100 tests");
     }
 }

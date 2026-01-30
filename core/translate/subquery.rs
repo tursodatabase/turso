@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use turso_parser::ast::{self, SortOrder, SubqueryType};
 
 use crate::{
@@ -7,12 +8,13 @@ use crate::{
     schema::{Index, IndexColumn, Table},
     translate::{
         collate::get_collseq_from_expr,
+        compound_select::emit_program_for_compound_select,
         emitter::emit_program_for_select,
         expr::{unwrap_parens, walk_expr_mut, WalkControl},
         optimizer::optimize_select_plan,
         plan::{
-            ColumnUsedMask, NonFromClauseSubquery, OuterQueryReference, Plan, SubqueryPosition,
-            SubqueryState,
+            ColumnUsedMask, JoinOrderMember, NonFromClauseSubquery, OuterQueryReference, Plan,
+            SubqueryPosition, SubqueryState, TableReferences, WhereTerm,
         },
         select::prepare_select_plan,
     },
@@ -26,7 +28,8 @@ use crate::{
 use super::{
     emitter::{emit_query, Resolver, TranslateCtx},
     main_loop::LoopLabels,
-    plan::{Operation, QueryDestination, Scan, Search, SelectPlan, TableReferences},
+    plan::{Aggregate, Operation, QueryDestination, Scan, Search, SelectPlan},
+    planner::resolve_window_and_aggregate_functions,
 };
 
 // Compute query plans for subqueries occurring in any position other than the FROM clause.
@@ -122,10 +125,105 @@ pub fn plan_subqueries_from_select_plan(
         }
     }
 
+    // Recollect aggregates after all subquery planning.
+    // This is necessary because:
+    // 1. Aggregates are collected with cloned expressions before subquery planning modifies them
+    //    (e.g., EXISTS -> SubqueryResult), causing stale args in aggregates.
+    // 2. ORDER BY may be cleared for single-row aggregates AFTER aggregates were collected from it,
+    //    leaving orphaned aggregates with unprocessed subqueries in their args.
+    // Recollecting from the current state of result_columns, HAVING, and ORDER BY ensures
+    // aggregates have updated expressions and excludes aggregates from cleared ORDER BY.
+    if !plan.aggregates.is_empty() {
+        recollect_aggregates(plan, resolver)?;
+    }
+
     update_column_used_masks(
         &mut plan.table_references,
         &mut plan.non_from_clause_subqueries,
     );
+    Ok(())
+}
+
+/// Compute query plans for subqueries in a DML statement's WHERE clause.
+/// This is used by DELETE and UPDATE statements which only have subqueries in the WHERE clause.
+/// Similar to [plan_subqueries_from_select_plan] but only handles the WHERE clause
+/// since these statements don't have GROUP BY, ORDER BY, or result column subqueries.
+pub fn plan_subqueries_from_where_clause(
+    program: &mut ProgramBuilder,
+    non_from_clause_subqueries: &mut Vec<NonFromClauseSubquery>,
+    table_references: &mut TableReferences,
+    where_clause: &mut [WhereTerm],
+    resolver: &Resolver,
+    connection: &Arc<Connection>,
+) -> Result<()> {
+    plan_subqueries_with_outer_query_access(
+        program,
+        non_from_clause_subqueries,
+        table_references,
+        resolver,
+        where_clause.iter_mut().map(|t| &mut t.expr),
+        connection,
+        SubqueryPosition::Where,
+    )?;
+
+    update_column_used_masks(table_references, non_from_clause_subqueries);
+    Ok(())
+}
+
+/// Compute query plans for subqueries in VALUES expressions.
+/// This is used by INSERT statements with VALUES clauses and SELECT with VALUES.
+/// The VALUES expressions may contain scalar subqueries that need to be planned.
+#[allow(clippy::vec_box)]
+pub fn plan_subqueries_from_values(
+    program: &mut ProgramBuilder,
+    non_from_clause_subqueries: &mut Vec<NonFromClauseSubquery>,
+    table_references: &mut TableReferences,
+    values: &mut [Vec<Box<ast::Expr>>],
+    resolver: &Resolver,
+    connection: &Arc<Connection>,
+) -> Result<()> {
+    plan_subqueries_with_outer_query_access(
+        program,
+        non_from_clause_subqueries,
+        table_references,
+        resolver,
+        values.iter_mut().flatten().map(|e| e.as_mut()),
+        connection,
+        SubqueryPosition::ResultColumn, // VALUES are similar to result columns in terms of subquery handling
+    )?;
+
+    update_column_used_masks(table_references, non_from_clause_subqueries);
+    Ok(())
+}
+
+/// Compute query plans for subqueries in RETURNING expressions.
+/// This is used by INSERT, UPDATE, and DELETE statements with RETURNING clauses.
+/// RETURNING expressions may contain scalar subqueries that need to be planned.
+pub fn plan_subqueries_from_returning(
+    program: &mut ProgramBuilder,
+    non_from_clause_subqueries: &mut Vec<NonFromClauseSubquery>,
+    table_references: &mut TableReferences,
+    returning: &mut [ast::ResultColumn],
+    resolver: &Resolver,
+    connection: &Arc<Connection>,
+) -> Result<()> {
+    // Extract mutable references to expressions from ResultColumn::Expr variants
+    let exprs = returning.iter_mut().filter_map(|rc| match rc {
+        ast::ResultColumn::Expr(expr, _) => Some(expr.as_mut()),
+        ast::ResultColumn::Star | ast::ResultColumn::TableStar(_) => None,
+    });
+
+    plan_subqueries_with_outer_query_access(
+        program,
+        non_from_clause_subqueries,
+        table_references,
+        resolver,
+        exprs,
+        connection,
+        SubqueryPosition::ResultColumn,
+    )?;
+
+    update_column_used_masks(table_references, non_from_clause_subqueries);
     Ok(())
 }
 
@@ -358,7 +456,8 @@ fn get_subquery_parser<'a>(
                 };
                 if lhs_column_count != plan.result_columns.len() {
                     crate::bail_parse_error!(
-                        "lhs of IN subquery must have the same number of columns as the subquery"
+                        "sub-select returns {} columns - expected {lhs_column_count}",
+                        plan.result_columns.len()
                     );
                 }
 
@@ -429,6 +528,40 @@ fn get_subquery_parser<'a>(
     }
 }
 
+/// Recollect all aggregates after subquery planning.
+///
+/// Aggregates are collected during parsing with cloned expressions. When subquery planning
+/// modifies expressions in place (e.g. replacing EXISTS with SubqueryResult), the aggregate's
+/// cloned original_expr and args become stale. This causes cache misses during translation.
+///
+/// Instead of trying to sync stale clones, this function recollects all aggregates fresh
+/// from the updated expressions in result_columns, HAVING, and ORDER BY.
+fn recollect_aggregates(plan: &mut SelectPlan, resolver: &Resolver) -> Result<()> {
+    let mut new_aggregates: Vec<Aggregate> = Vec::new();
+
+    // Collect from result columns (same order as original collection)
+    for rc in &plan.result_columns {
+        resolve_window_and_aggregate_functions(&rc.expr, resolver, &mut new_aggregates, None)?;
+    }
+
+    // Collect from HAVING
+    if let Some(group_by) = &plan.group_by {
+        if let Some(having) = &group_by.having {
+            for expr in having {
+                resolve_window_and_aggregate_functions(expr, resolver, &mut new_aggregates, None)?;
+            }
+        }
+    }
+
+    // Collect from ORDER BY
+    for (expr, _) in &plan.order_by {
+        resolve_window_and_aggregate_functions(expr, resolver, &mut new_aggregates, None)?;
+    }
+
+    plan.aggregates = new_aggregates;
+    Ok(())
+}
+
 /// We make decisions about when to evaluate expressions or whether to use covering indexes based on
 /// which columns of a table have been referenced.
 /// Since subquery nesting is arbitrarily deep, a reference to a column must propagate recursively
@@ -442,15 +575,8 @@ fn update_column_used_masks(
     table_refs: &mut TableReferences,
     subqueries: &mut [NonFromClauseSubquery],
 ) {
-    for subquery in subqueries.iter_mut() {
-        let SubqueryState::Unevaluated { plan } = &mut subquery.state else {
-            panic!("subquery has already been evaluated");
-        };
-        let Some(child_plan) = plan.as_mut() else {
-            panic!("subquery has no plan");
-        };
-
-        for child_outer_query_ref in child_plan
+    fn propagate_outer_refs_from_select_plan(table_refs: &mut TableReferences, plan: &SelectPlan) {
+        for child_outer_query_ref in plan
             .table_references
             .outer_query_refs()
             .iter()
@@ -467,6 +593,57 @@ fn update_column_used_masks(
                 outer_query_ref.col_used_mask |= &child_outer_query_ref.col_used_mask;
             }
         }
+
+        for joined_table in plan.table_references.joined_tables().iter() {
+            if let Table::FromClauseSubquery(from_clause_subquery) = &joined_table.table {
+                propagate_outer_refs_from_plan(table_refs, from_clause_subquery.plan.as_ref());
+            }
+        }
+    }
+
+    fn propagate_outer_refs_from_plan(table_refs: &mut TableReferences, plan: &Plan) {
+        match plan {
+            Plan::Select(select_plan) => {
+                propagate_outer_refs_from_select_plan(table_refs, select_plan);
+            }
+            Plan::CompoundSelect {
+                left, right_most, ..
+            } => {
+                for (select_plan, _) in left.iter() {
+                    propagate_outer_refs_from_select_plan(table_refs, select_plan);
+                }
+                propagate_outer_refs_from_select_plan(table_refs, right_most);
+            }
+            Plan::Delete(_) | Plan::Update(_) => {}
+        }
+    }
+
+    for subquery in subqueries.iter_mut() {
+        let SubqueryState::Unevaluated { plan } = &mut subquery.state else {
+            panic!("subquery has already been evaluated");
+        };
+        let Some(child_plan) = plan.as_mut() else {
+            panic!("subquery has no plan");
+        };
+
+        propagate_outer_refs_from_select_plan(table_refs, child_plan);
+    }
+
+    // Collect raw plan pointers to avoid cloning while sidestepping borrow rules.
+    let from_clause_plans = table_refs
+        .joined_tables()
+        .iter()
+        .filter_map(|t| match &t.table {
+            Table::FromClauseSubquery(from_clause_subquery) => {
+                Some(from_clause_subquery.plan.as_ref() as *const Plan)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    for plan in from_clause_plans {
+        // SAFETY: plans live within table_refs for the duration of this function.
+        let plan = unsafe { &*plan };
+        propagate_outer_refs_from_plan(table_refs, plan);
     }
 }
 
@@ -476,12 +653,27 @@ pub fn emit_from_clause_subqueries(
     program: &mut ProgramBuilder,
     t_ctx: &mut TranslateCtx,
     tables: &mut TableReferences,
+    join_order: &[JoinOrderMember],
 ) -> Result<()> {
     if tables.joined_tables().is_empty() {
         emit_explain!(program, false, "SCAN CONSTANT ROW".to_owned());
     }
 
-    for table_reference in tables.joined_tables_mut() {
+    // Include hash-join build tables so EXPLAIN reflects all tables that feed the loop.
+    let mut required_tables: HashSet<usize> = join_order
+        .iter()
+        .map(|member| member.original_idx)
+        .collect();
+    for table in tables.joined_tables().iter() {
+        if let Operation::HashJoin(hash_join_op) = &table.op {
+            required_tables.insert(hash_join_op.build_table_idx);
+        }
+    }
+
+    for (table_index, table_reference) in tables.joined_tables_mut().iter_mut().enumerate() {
+        if !required_tables.contains(&table_index) {
+            continue;
+        }
         emit_explain!(
             program,
             true,
@@ -538,18 +730,32 @@ pub fn emit_from_clause_subqueries(
                         index_method.definition().method_name
                     )
                 }
-                Operation::HashJoin(_) => "HASH JOIN".to_string(),
+                Operation::HashJoin(_) => {
+                    let table_name =
+                        if table_reference.table.get_name() == table_reference.identifier {
+                            table_reference.identifier.clone()
+                        } else {
+                            format!(
+                                "{} AS {}",
+                                table_reference.table.get_name(),
+                                table_reference.identifier
+                            )
+                        };
+                    format!("HASH JOIN {table_name}")
+                }
             }
         );
 
         if let Table::FromClauseSubquery(from_clause_subquery) = &mut table_reference.table {
             // Emit the subquery and get the start register of the result columns.
             let result_columns_start =
-                emit_from_clause_subquery(program, &mut from_clause_subquery.plan, t_ctx)?;
+                emit_from_clause_subquery(program, from_clause_subquery.plan.as_mut(), t_ctx)?;
             // Set the start register of the subquery's result columns.
             // This is done so that translate_expr() can read the result columns of the subquery,
             // as if it were reading from a regular table.
             from_clause_subquery.result_columns_start_reg = Some(result_columns_start);
+            // Also store in program builder so nested subqueries can look it up by internal_id.
+            program.set_subquery_result_reg(table_reference.internal_id, result_columns_start);
         }
 
         program.pop_current_parent_explain();
@@ -559,7 +765,7 @@ pub fn emit_from_clause_subqueries(
 
 /// Emit a FROM clause subquery and return the start register of the result columns.
 /// This is done by emitting a coroutine that stores the result columns in sequential registers.
-/// Each FROM clause subquery has its own separate SelectPlan which is wrapped in a coroutine.
+/// Each FROM clause subquery has its own Plan (either SelectPlan or CompoundSelect) which is wrapped in a coroutine.
 ///
 /// The resulting bytecode from a subquery is mostly exactly the same as a regular query, except:
 /// - it ends in an EndCoroutine instead of a Halt.
@@ -568,20 +774,22 @@ pub fn emit_from_clause_subqueries(
 ///   so that translate_expr() can read the result columns of the subquery,
 ///   as if it were reading from a regular table.
 ///
-/// Since a subquery has its own SelectPlan, it can contain nested subqueries,
+/// Since a subquery has its own Plan, it can contain nested subqueries,
 /// which can contain even more nested subqueries, etc.
 pub fn emit_from_clause_subquery(
     program: &mut ProgramBuilder,
-    plan: &mut SelectPlan,
+    plan: &mut Plan,
     t_ctx: &mut TranslateCtx,
 ) -> Result<usize> {
     let yield_reg = program.alloc_register();
     let coroutine_implementation_start_offset = program.allocate_label();
-    match &mut plan.query_destination {
-        QueryDestination::CoroutineYield {
+
+    // Set up the coroutine yield destination for the plan
+    match plan.select_query_destination_mut() {
+        Some(QueryDestination::CoroutineYield {
             yield_reg: y,
             coroutine_implementation_start,
-        } => {
+        }) => {
             // The parent query will use this register to jump to/from the subquery.
             *y = yield_reg;
             // The parent query will use this register to reinitialize the coroutine when it needs to run multiple times.
@@ -589,36 +797,57 @@ pub fn emit_from_clause_subquery(
         }
         _ => unreachable!("emit_from_clause_subquery called on non-subquery"),
     }
-    let end_coroutine_label = program.allocate_label();
-    let mut metadata = TranslateCtx {
-        labels_main_loop: (0..plan.joined_tables().len())
-            .map(|_| LoopLabels::new(program))
-            .collect(),
-        label_main_loop_end: None,
-        meta_group_by: None,
-        meta_left_joins: (0..plan.joined_tables().len()).map(|_| None).collect(),
-        meta_sort: None,
-        reg_agg_start: None,
-        reg_nonagg_emit_once_flag: None,
-        reg_result_cols_start: None,
-        limit_ctx: None,
-        reg_offset: None,
-        reg_limit_offset_sum: None,
-        resolver: Resolver::new(t_ctx.resolver.schema, t_ctx.resolver.symbol_table),
-        non_aggregate_expressions: Vec::new(),
-        cdc_cursor_id: None,
-        meta_window: None,
-        hash_table_contexts: std::collections::HashMap::new(),
-    };
+
     let subquery_body_end_label = program.allocate_label();
+
     program.emit_insn(Insn::InitCoroutine {
         yield_reg,
         jump_on_definition: subquery_body_end_label,
         start_offset: coroutine_implementation_start_offset,
     });
     program.preassign_label_to_next_insn(coroutine_implementation_start_offset);
-    let result_column_start_reg = emit_query(program, plan, &mut metadata)?;
-    program.resolve_label(end_coroutine_label, program.offset());
+
+    let result_column_start_reg = match plan {
+        Plan::Select(select_plan) => {
+            let mut metadata = TranslateCtx {
+                labels_main_loop: (0..select_plan.joined_tables().len())
+                    .map(|_| LoopLabels::new(program))
+                    .collect(),
+                label_main_loop_end: None,
+                meta_group_by: None,
+                meta_left_joins: (0..select_plan.joined_tables().len())
+                    .map(|_| None)
+                    .collect(),
+                meta_sort: None,
+                reg_agg_start: None,
+                reg_nonagg_emit_once_flag: None,
+                reg_result_cols_start: None,
+                limit_ctx: None,
+                reg_offset: None,
+                reg_limit_offset_sum: None,
+                resolver: Resolver::new(t_ctx.resolver.schema, t_ctx.resolver.symbol_table),
+                non_aggregate_expressions: Vec::new(),
+                cdc_cursor_id: None,
+                meta_window: None,
+                materialized_build_inputs: HashMap::default(),
+                hash_table_contexts: HashMap::default(),
+            };
+            emit_query(program, select_plan, &mut metadata)?
+        }
+        Plan::CompoundSelect { .. } => {
+            // Clone the plan to pass to emit_program_for_compound_select (it takes ownership)
+            let plan_clone = plan.clone();
+            let resolver = Resolver::new(t_ctx.resolver.schema, t_ctx.resolver.symbol_table);
+            // emit_program_for_compound_select returns the result column start register
+            // for coroutine mode, which is needed by the outer query.
+            emit_program_for_compound_select(program, &resolver, plan_clone)?
+                .expect("compound CTE in coroutine mode must have result register")
+        }
+        Plan::Delete(_) | Plan::Update(_) => {
+            unreachable!("DELETE/UPDATE plans cannot be FROM clause subqueries")
+        }
+    };
+
     program.emit_insn(Insn::EndCoroutine { yield_reg });
     program.preassign_label_to_next_insn(subquery_body_end_label);
     Ok(result_column_start_reg)
@@ -638,7 +867,7 @@ pub fn emit_from_clause_subquery(
 /// - an ephemeral index for IN subqueries.
 pub fn emit_non_from_clause_subquery(
     program: &mut ProgramBuilder,
-    t_ctx: &mut TranslateCtx,
+    resolver: &Resolver,
     plan: SelectPlan,
     query_type: &SubqueryType,
     is_correlated: bool,
@@ -666,7 +895,7 @@ pub fn emit_non_from_clause_subquery(
                 value: 0,
                 dest: *result_reg,
             });
-            emit_program_for_select(program, &t_ctx.resolver, plan)?;
+            emit_program_for_select(program, resolver, plan)?;
             program.emit_insn(Insn::Return {
                 return_reg: subroutine_reg,
                 can_fallthrough: true,
@@ -677,7 +906,7 @@ pub fn emit_non_from_clause_subquery(
                 cursor_id: *cursor_id,
                 is_table: false,
             });
-            emit_program_for_select(program, &t_ctx.resolver, plan)?;
+            emit_program_for_select(program, resolver, plan)?;
         }
         SubqueryType::RowValue {
             result_reg_start,
@@ -694,7 +923,7 @@ pub fn emit_non_from_clause_subquery(
                     dest_end: None,
                 });
             }
-            emit_program_for_select(program, &t_ctx.resolver, plan)?;
+            emit_program_for_select(program, resolver, plan)?;
             program.emit_insn(Insn::Return {
                 return_reg: subroutine_reg,
                 can_fallthrough: true,

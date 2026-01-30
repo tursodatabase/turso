@@ -1,5 +1,5 @@
-use std::collections::HashMap;
-use std::sync::Arc;
+use crate::sync::Arc;
+use rustc_hash::FxHashMap as HashMap;
 
 use crate::schema::Schema;
 use crate::translate::emitter::TransactionMode;
@@ -13,10 +13,21 @@ const STATS_QUERY: &str = "SELECT tbl, idx, stat FROM sqlite_stat1";
 pub struct IndexStat {
     /// Estimated total number of rows in the table/index when the stat was collected.
     pub total_rows: Option<u64>,
-    /// Estimated number of distinct keys for each leftmost prefix of the index
-    /// columns. The entry at position `i` is the distinct count for the first
-    /// `i + 1` columns of the index.
-    pub distinct_per_prefix: Vec<u64>,
+    /// Average number of rows per distinct key prefix, for each leftmost prefix
+    /// of the index columns.
+    ///
+    /// These values come directly from sqlite_stat1's stat column (after the
+    /// first number which is total_rows). For a stat string "1000 100 10 1":
+    /// - total_rows = 1000
+    /// - avg_rows_per_distinct_prefix = [100, 10, 1]
+    ///
+    /// Entry at position `i` means: on average, this many rows share the same
+    /// values in the first `i + 1` columns of the index. Lower values indicate
+    /// higher selectivity (more distinct prefixes).
+    ///
+    /// To compute number of distinct values (NDV) for prefix i:
+    ///   ndv = total_rows / avg_rows_per_distinct_prefix[i]
+    pub avg_rows_per_distinct_prefix: Vec<u64>,
 }
 
 /// Statistics produced by ANALYZE for a single BTree table.
@@ -161,7 +172,7 @@ fn load_sqlite_stat1_from_stmt(
         {
             let idx_stats = stats.table_stats_mut(table_name).index_stats_mut(&idx_name);
             idx_stats.total_rows = total_rows;
-            idx_stats.distinct_per_prefix = numbers.iter().skip(1).copied().collect();
+            idx_stats.avg_rows_per_distinct_prefix = numbers.iter().skip(1).copied().collect();
         }
 
         // If we didn't see a table-level row yet, seed row_count from index stats.

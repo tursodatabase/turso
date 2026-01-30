@@ -1,10 +1,10 @@
 #![allow(clippy::arc_with_non_send_sync)]
 
 use super::{common, Completion, CompletionInner, File, OpenFlags, IO};
-use crate::io::clock::{Clock, DefaultClock, Instant};
+use crate::io::clock::{Clock, DefaultClock, MonotonicInstant, WallClockInstant};
 use crate::storage::wal::CKPT_BATCH_PAGES;
+use crate::sync::Mutex;
 use crate::{turso_assert, CompletionError, LimboError, Result};
-use parking_lot::Mutex;
 use rustix::fs::{self, FlockOperation, OFlags};
 use std::ptr::NonNull;
 use std::{
@@ -122,7 +122,7 @@ impl UringIO {
                 ring,
                 overflow: VecDeque::new(),
                 pending_ops: 0,
-                writev_states: HashMap::new(),
+                writev_states: HashMap::default(),
                 iov_pool: IovecPool::new(),
             },
             free_files: (0..FILES).collect(),
@@ -605,9 +605,10 @@ impl IO for UringIO {
             "fixed buffer length must be logical block aligned"
         );
         let mut inner = self.inner.lock();
-        let slot = inner.free_arenas.iter().position(|e| e.is_none()).ok_or({
-            crate::error::CompletionError::UringIOError("no free fixed buffer slots")
-        })?;
+        let slot =
+            inner.free_arenas.iter().position(|e| e.is_none()).ok_or({
+                crate::error::CompletionError::UringIOError("no free fixed buffer slots")
+            })?;
         unsafe {
             inner.ring.ring.submitter().register_buffers_update(
                 slot as u32,
@@ -624,8 +625,12 @@ impl IO for UringIO {
 }
 
 impl Clock for UringIO {
-    fn now(&self) -> Instant {
-        DefaultClock.now()
+    fn current_time_monotonic(&self) -> MonotonicInstant {
+        DefaultClock.current_time_monotonic()
+    }
+
+    fn current_time_wall_clock(&self) -> WallClockInstant {
+        DefaultClock.current_time_wall_clock()
     }
 }
 
@@ -776,7 +781,7 @@ impl File for UringFile {
         Ok(c)
     }
 
-    fn sync(&self, c: Completion) -> Result<Completion> {
+    fn sync(&self, c: Completion, _sync_type: crate::io::FileSyncType) -> Result<Completion> {
         trace!("sync()");
         let sync = with_fd!(self, |fd| {
             io_uring::opcode::Fsync::new(fd)

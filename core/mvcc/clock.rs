@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+use crate::sync::atomic::{AtomicU64, Ordering};
 
 /// Logical clock.
 pub trait LogicalClock: Send + Sync {

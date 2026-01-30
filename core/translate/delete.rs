@@ -1,4 +1,5 @@
-use crate::schema::{Schema, Table};
+use crate::schema::Table;
+use crate::sync::Arc;
 use crate::translate::emitter::{emit_program, Resolver};
 use crate::translate::expr::process_returning_clause;
 use crate::translate::optimizer::optimize_plan;
@@ -6,41 +7,66 @@ use crate::translate::plan::{
     DeletePlan, IterationDirection, JoinOrderMember, Operation, Plan, QueryDestination,
     ResultSetColumn, Scan, SelectPlan,
 };
-use crate::translate::planner::{parse_limit, parse_where};
+use crate::translate::planner::{parse_limit, parse_where, plan_ctes_as_outer_refs};
+use crate::translate::subquery::{
+    plan_subqueries_from_returning, plan_subqueries_from_select_plan,
+    plan_subqueries_from_where_clause,
+};
 use crate::translate::trigger_exec::has_relevant_triggers_type_only;
 use crate::util::normalize_ident;
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
 use crate::Result;
-use std::sync::Arc;
-use turso_parser::ast::{Expr, Limit, QualifiedName, ResultColumn, TriggerEvent};
+use turso_parser::ast::{Expr, Limit, QualifiedName, ResultColumn, TriggerEvent, With};
 
 use super::plan::{ColumnUsedMask, JoinedTable, TableReferences};
 
+#[allow(clippy::too_many_arguments)]
 pub fn translate_delete(
     tbl_name: &QualifiedName,
     resolver: &Resolver,
     where_clause: Option<Box<Expr>>,
     limit: Option<Limit>,
     returning: Vec<ResultColumn>,
+    with: Option<With>,
     mut program: ProgramBuilder,
     connection: &Arc<crate::Connection>,
 ) -> Result<ProgramBuilder> {
     let tbl_name = normalize_ident(tbl_name.name.as_str());
 
     // Check if this is a system table that should be protected from direct writes
-    if crate::schema::is_system_table(&tbl_name) {
+    if !connection.is_nested_stmt() && crate::schema::is_system_table(&tbl_name) {
         crate::bail_parse_error!("table {} may not be modified", tbl_name);
     }
 
     let mut delete_plan = prepare_delete_plan(
         &mut program,
-        resolver.schema,
+        resolver,
         tbl_name,
         where_clause,
         limit,
         returning,
+        with,
         connection,
     )?;
+
+    // Plan subqueries in the WHERE clause
+    if let Plan::Delete(ref mut delete_plan_inner) = delete_plan {
+        if let Some(ref mut rowset_plan) = delete_plan_inner.rowset_plan {
+            // When using rowset (triggers present), subqueries are in the rowset_plan's WHERE
+            plan_subqueries_from_select_plan(&mut program, rowset_plan, resolver, connection)?;
+        } else {
+            // Normal path: subqueries are in the DELETE plan's WHERE
+            plan_subqueries_from_where_clause(
+                &mut program,
+                &mut delete_plan_inner.non_from_clause_subqueries,
+                &mut delete_plan_inner.table_references,
+                &mut delete_plan_inner.where_clause,
+                resolver,
+                connection,
+            )?;
+        }
+    }
+
     optimize_plan(&mut program, &mut delete_plan, resolver.schema)?;
     if let Plan::Delete(delete_plan_inner) = &mut delete_plan {
         // Rewrite the Delete plan after optimization whenever a RowSet is used (DELETE triggers
@@ -80,15 +106,18 @@ pub fn translate_delete(
     Ok(program)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn prepare_delete_plan(
     program: &mut ProgramBuilder,
-    schema: &Schema,
+    resolver: &Resolver,
     tbl_name: String,
     where_clause: Option<Box<Expr>>,
     limit: Option<Limit>,
     mut returning: Vec<ResultColumn>,
+    with: Option<With>,
     connection: &Arc<crate::Connection>,
 ) -> Result<Plan> {
+    let schema = resolver.schema;
     let table = match schema.get_table(&tbl_name) {
         Some(table) => table,
         None => crate::bail_parse_error!("no such table: {}", tbl_name),
@@ -136,6 +165,9 @@ pub fn prepare_delete_plan(
     }];
     let mut table_references = TableReferences::new(joined_tables, vec![]);
 
+    // Plan CTEs and add them as outer query references for subquery resolution
+    plan_ctes_as_outer_refs(with, resolver, program, &mut table_references, connection)?;
+
     let mut where_predicates = vec![];
 
     // Parse the WHERE clause
@@ -144,6 +176,18 @@ pub fn prepare_delete_plan(
         &mut table_references,
         None,
         &mut where_predicates,
+        connection,
+    )?;
+
+    // Plan subqueries in RETURNING expressions before processing
+    // (so SubqueryResult nodes are cloned into result_columns)
+    let mut non_from_clause_subqueries = vec![];
+    plan_subqueries_from_returning(
+        program,
+        &mut non_from_clause_subqueries,
+        &mut table_references,
+        &mut returning,
+        resolver,
         connection,
     )?;
 
@@ -217,6 +261,7 @@ pub fn prepare_delete_plan(
             indexes,
             rowset_plan: Some(rowset_plan),
             rowset_reg: Some(rowset_reg),
+            non_from_clause_subqueries,
         }))
     } else {
         Ok(Plan::Delete(DeletePlan {
@@ -230,6 +275,7 @@ pub fn prepare_delete_plan(
             indexes,
             rowset_plan: None,
             rowset_reg: None,
+            non_from_clause_subqueries,
         }))
     }
 }

@@ -1,0 +1,1 @@
+../../bindings/java/src/main/java/examples/EncryptionExample.java

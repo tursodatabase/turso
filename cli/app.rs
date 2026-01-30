@@ -15,12 +15,13 @@ use crate::{
     read_state_machine::ReadState,
     HISTORY_FILE,
 };
-use anyhow::anyhow;
+use anyhow::{anyhow, Context};
 use clap::Parser;
 use comfy_table::{Attribute, Cell, CellAlignment, ContentArrangement, Row, Table};
 use rustyline::{error::ReadlineError, history::DefaultHistory, Editor};
 use std::{
-    io::{self, BufRead, IsTerminal, Write},
+    fs::File,
+    io::{self, BufRead, BufReader, IsTerminal, Write},
     mem::{forget, ManuallyDrop},
     path::PathBuf,
     sync::{
@@ -178,6 +179,18 @@ impl<'a> RowStepper<'a> {
             }
         }
     }
+}
+
+/// metadata from db, fetched from pragmas
+struct DbMetadata {
+    page_size: i64,
+    page_count: i64,
+    filename: String,
+}
+
+struct DbPage<'a> {
+    pgno: i64,
+    data: &'a [u8],
 }
 
 impl Limbo {
@@ -776,6 +789,16 @@ impl Limbo {
                     let w = self.writer.as_mut().unwrap();
                     if let Err(e) = manual::display_manual(args.page.as_deref(), w) {
                         let _ = self.writeln(e.to_string());
+                    }
+                }
+                Command::Read(args) => {
+                    if let Err(e) = self.read_sql_file(&args.path) {
+                        let _ = self.writeln(e.to_string());
+                    }
+                }
+                Command::Dbtotxt(args) => {
+                    if let Err(e) = self.dump_database_as_text(args.page_no) {
+                        let _ = self.writeln_fmt(format_args!("ERROR:{e}"));
                     }
                 }
             },
@@ -1807,10 +1830,244 @@ impl Limbo {
         Ok(())
     }
 
+    fn read_sql_file(&mut self, path: &str) -> anyhow::Result<()> {
+        let file =
+            File::open(path).map_err(|e| anyhow!("Error: cannot open \"{}\" – {}", path, e))?;
+        let reader = BufReader::new(file);
+
+        let mut query_buffer = String::new();
+        let mut in_single_quote: bool = false; // ''
+        let mut in_double_quote: bool = false; // ""
+        let mut in_block_comment = false; //  /* */
+        let mut in_hash = false; // #
+        let mut in_line_comment = false; // --
+
+        for line in reader.lines() {
+            let mut line = line
+                .map_err(|e| anyhow!("Error: file \"{}\" is not valid UTF-8 text – {}", path, e))?;
+            line.push('\n');
+            let mut iter = line.chars().peekable();
+
+            while let Some(ch) = iter.next() {
+                // Check exit for line comment and hash
+                if (in_line_comment || in_hash) && ch == '\n' {
+                    in_line_comment = false;
+                    in_hash = false;
+                    query_buffer.push(ch);
+                    continue;
+                }
+
+                // Check exit for block comment
+                if in_block_comment && ch == '*' && iter.peek() == Some(&'/') {
+                    query_buffer.push(ch);
+                    query_buffer.push('/');
+                    iter.next();
+                    in_block_comment = false;
+                    continue;
+                }
+
+                // Push into the query buffer if its inside comments
+                if in_line_comment || in_block_comment || in_hash {
+                    query_buffer.push(ch);
+                    continue;
+                }
+
+                // Block comment detection
+                if ch == '/' && iter.peek() == Some(&'*') && !in_single_quote && !in_double_quote {
+                    query_buffer.push('/');
+                    query_buffer.push('*');
+                    iter.next();
+                    in_block_comment = true;
+                    continue;
+                }
+
+                // Hash detection, instead of pushing '#' it pushes '-', '-'
+                // to make it act like line comment
+                if ch == '#' && !in_single_quote && !in_double_quote {
+                    query_buffer.push('-');
+                    query_buffer.push('-');
+                    in_hash = true;
+                    continue;
+                }
+
+                // Line comment detection
+                if ch == '-' && iter.peek() == Some(&'-') && !in_single_quote && !in_double_quote {
+                    query_buffer.push(ch);
+                    query_buffer.push('-');
+                    iter.next();
+                    in_line_comment = true;
+                    continue;
+                }
+
+                // Single quote
+                if ch == '\'' && !in_double_quote {
+                    in_single_quote = !in_single_quote;
+                }
+
+                // Double quote
+                if ch == '"' && !in_single_quote {
+                    in_double_quote = !in_double_quote;
+                }
+
+                query_buffer.push(ch);
+
+                if ch == ';'
+                    && !in_single_quote
+                    && !in_double_quote
+                    && !in_block_comment
+                    && !in_line_comment
+                    && !in_hash
+                {
+                    self.run_query(&query_buffer);
+                    query_buffer.clear();
+                }
+            }
+
+            // Reset comments
+            in_line_comment = false;
+            in_hash = false;
+        }
+
+        let remaining = query_buffer.trim();
+        if !remaining.is_empty() {
+            self.run_query(remaining);
+        }
+        query_buffer.clear();
+        Ok(())
+    }
+
     fn save_history(&mut self) {
         if let Some(rl) = &mut self.rl {
             let _ = rl.save_history(HISTORY_FILE.as_path());
         }
+    }
+
+    fn fetch_db_metadata(&mut self) -> anyhow::Result<DbMetadata> {
+        let page_size: i64 = if let Some(mut rows) = self.conn.query("PRAGMA page_size")? {
+            fetch_single_i64(&mut rows).context("Failed to execute PRAGMA page_size")?
+        } else {
+            anyhow::bail!("Failed to prepare PRAGMA page_size");
+        };
+
+        let page_count: i64 = if let Some(mut rows) = self.conn.query("PRAGMA page_count")? {
+            fetch_single_i64(&mut rows).context("Failed to execute PRAGMA page_count")?
+        } else {
+            anyhow::bail!("Failed to prepare PRAGMA page_count");
+        };
+
+        let filename = PathBuf::from(self.opts.db_file.clone())
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+
+        Ok(DbMetadata {
+            page_size,
+            page_count,
+            filename,
+        })
+    }
+
+    fn write_page_hexdump(&mut self, page: &DbPage, page_size: i64) -> anyhow::Result<()> {
+        let mut seen_page_label = false;
+
+        for (i, chunk) in page.data.chunks(16).enumerate() {
+            if chunk.iter().all(|&b| b == 0) {
+                continue;
+            }
+
+            if !seen_page_label {
+                writeln!(
+                    self,
+                    "| page {} offset {}",
+                    page.pgno,
+                    (page.pgno - 1) * page_size
+                )?;
+                seen_page_label = true;
+            }
+
+            // Line offset
+            write!(self, "|  {:5}:", i * 16)?;
+
+            // Hex bytes
+            for byte in chunk {
+                write!(self, " {byte:02x}")?;
+            }
+            for _ in 0..(16 - chunk.len()) {
+                write!(self, "   ")?; // Pad partial lines
+            }
+
+            write!(self, "   ")?;
+
+            // ASCII
+            for &byte in chunk {
+                let ch = match byte {
+                    b' '..=b'~' if ![b'{', b'}', b'"', b'\\'].contains(&byte) => byte as char,
+                    _ => '.',
+                };
+                write!(self, "{ch}")?;
+            }
+            writeln!(self)?;
+        }
+        Ok(())
+    }
+
+    fn dump_database_as_text(&mut self, page_no: Option<i64>) -> anyhow::Result<()> {
+        let metadata = self.fetch_db_metadata()?;
+        tracing::debug!(
+            page_size = metadata.page_size,
+            page_count = metadata.page_count,
+            "Fetched metadata"
+        );
+
+        if let Some(pgno) = page_no {
+            if pgno <= 0 {
+                anyhow::bail!("Page number must be a positive integer.");
+            }
+            if pgno > metadata.page_count {
+                anyhow::bail!(
+                    "Page number {pgno} is out of bounds. The database only has {} pages.",
+                    metadata.page_count
+                );
+            }
+        }
+
+        writeln!(
+            self,
+            "| size {} pagesize {} filename {}",
+            metadata.page_count * metadata.page_size,
+            metadata.page_size,
+            &metadata.filename
+        )?;
+
+        let dump_sql = if let Some(pgno) = page_no {
+            format!("SELECT pgno, data FROM sqlite_dbpage WHERE pgno = {pgno}")
+        } else {
+            "SELECT pgno, data FROM sqlite_dbpage ORDER BY pgno".to_string()
+        };
+
+        let mut pages: Vec<(i64, Vec<u8>)> = Vec::new();
+        if let Some(mut rows) = self.conn.query(&dump_sql)? {
+            rows.run_with_row_callback(|row| {
+                let pgno: i64 = row.get(0)?;
+                let value: &Value = row.get(1)?;
+                let data: Vec<u8> = match value {
+                    Value::Blob(bytes) => bytes.clone(),
+                    _ => vec![],
+                };
+                pages.push((pgno, data));
+                Ok(())
+            })?;
+        }
+
+        for (pgno, data) in &pages {
+            let page = DbPage { pgno: *pgno, data };
+            self.write_page_hexdump(&page, metadata.page_size)?;
+        }
+
+        writeln!(self, "| end {}", &metadata.filename)?;
+
+        Ok(())
     }
 }
 
@@ -1833,7 +2090,7 @@ fn sql_quote_string(s: &str) -> String {
     for ch in s.chars() {
         if ch == '\'' {
             out.push('\'');
-        } // escape as ''
+        }
         out.push(ch);
     }
     out.push('\'');
@@ -1846,4 +2103,13 @@ impl Drop for Limbo {
             ManuallyDrop::drop(&mut self.input_buff);
         }
     }
+}
+
+fn fetch_single_i64(rows: &mut turso_core::Statement) -> anyhow::Result<i64> {
+    let mut result: Option<i64> = None;
+    rows.run_with_row_callback(|row| {
+        result = Some(row.get(0)?);
+        Ok(())
+    })?;
+    result.ok_or_else(|| anyhow!("query did not return a row"))
 }

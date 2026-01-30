@@ -8,16 +8,16 @@ use crate::state_machine::{StateMachine, StateTransition, TransitionResult};
 use crate::storage::btree::{BTreeCursor, CursorTrait};
 use crate::storage::pager::CreateBTreeFlags;
 use crate::storage::wal::{CheckpointMode, TursoRwLock};
-use crate::types::{IOCompletions, IOResult, ImmutableRecord, RecordCursor};
+use crate::sync::atomic::Ordering;
+use crate::sync::Arc;
+use crate::sync::RwLock;
+use crate::types::{IOCompletions, IOResult, ImmutableRecord};
 use crate::{
-    CheckpointResult, Completion, Connection, IOExt, LimboError, Pager, Result, TransactionState,
-    Value, ValueRef,
+    CheckpointResult, Completion, Connection, IOExt, LimboError, Pager, Result, SyncMode,
+    TransactionState, Value, ValueRef,
 };
-use parking_lot::RwLock;
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::num::NonZeroU64;
-use std::sync::atomic::Ordering;
-use std::sync::Arc;
 
 #[derive(Debug)]
 pub enum CheckpointState {
@@ -47,6 +47,12 @@ pub enum CheckpointState {
     TruncateLogicalLog,
     FsyncLogicalLog,
     CheckpointWal,
+    /// Fsync the database file after checkpoint, before truncating WAL.
+    /// This ensures durability: if we crash after WAL truncation but before DB fsync,
+    /// the data would be lost.
+    SyncDbFile,
+    /// Truncate the WAL file after DB file is safely synced (for TRUNCATE checkpoint mode)
+    TruncateWal,
     Finalize,
 }
 
@@ -114,6 +120,8 @@ pub struct CheckpointStateMachine<Clock: LogicalClock> {
     /// process in a transaction we don't want to change the state as we assume we are already on a
     /// write transaction and any failure will be cleared on vdbe error handling.
     update_transaction_state: bool,
+    /// The synchronous mode for fsync operations. When set to Off, fsync is skipped.
+    sync_mode: SyncMode,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -146,6 +154,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
         mvstore: Arc<MvStore<Clock>>,
         connection: Arc<Connection>,
         update_transaction_state: bool,
+        sync_mode: SyncMode,
     ) -> Self {
         let checkpoint_lock = mvstore.blocking_checkpoint_lock.clone();
         let index_id_to_index = connection
@@ -179,14 +188,15 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
             write_set: Vec::new(),
             write_row_state_machine: None,
             delete_row_state_machine: None,
-            cursors: HashMap::new(),
-            created_btrees: HashMap::new(),
-            destroyed_tables: HashSet::new(),
-            destroyed_indexes: HashSet::new(),
+            cursors: HashMap::default(),
+            created_btrees: HashMap::default(),
+            destroyed_tables: HashSet::default(),
+            destroyed_indexes: HashSet::default(),
             index_write_set: Vec::new(),
             index_id_to_index,
             checkpoint_result: None,
             update_transaction_state,
+            sync_mode,
         }
     }
 
@@ -294,24 +304,16 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
 
                 if version.row.id.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID {
                     let row_data = ImmutableRecord::from_bin_record(version.row.payload().to_vec());
-                    let mut record_cursor = RecordCursor::new();
-                    record_cursor
-                        .parse_full_header(&row_data)
-                        .expect("failed to parse record header");
 
-                    // sqlite_schema has 5 columns: type, name, tbl_name, rootpage, sql
-                    // Column 0: type (TEXT) - "table", "index", "view", "trigger"
-                    let type_value = record_cursor
-                        .get_value(&row_data, 0)
-                        .expect("failed to get column 0 (type) from sqlite_schema");
-                    let ValueRef::Text(type_str) = type_value else {
-                        panic!("sqlite_schema.type column must be TEXT, got {type_value:?}");
+                    let (col0, col3) = row_data.get_two_values(0, 3).expect(
+                        "failed to get columns 0 and 3 (type, rootpage) from sqlite_schema",
+                    );
+
+                    let ValueRef::Text(type_str) = col0 else {
+                        panic!("sqlite_schema.type column must be TEXT, got {col0:?}");
                     };
 
-                    if let ValueRef::Integer(root_page) = record_cursor
-                        .get_value(&row_data, 3)
-                        .expect("failed to get column 3 (rootpage) from sqlite_schema")
-                    {
+                    if let ValueRef::Integer(root_page) = col3 {
                         if type_str.as_str() == "index" {
                             // This is an index schema change
                             let index_id = MVTableId::from(root_page);
@@ -483,7 +485,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
 
     /// Fsync the logical log file
     fn fsync_logical_log(&self) -> Result<Completion> {
-        self.mvstore.storage.sync()
+        self.mvstore.storage.sync(self.pager.get_sync_type())
     }
 
     /// Truncate the logical log file
@@ -739,15 +741,8 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                             })?;
                         let record =
                             ImmutableRecord::from_bin_record(row_version.row.payload().to_vec());
-                        let mut record_cursor = RecordCursor::new();
-                        record_cursor
-                            .parse_full_header(&record)
-                            .map_err(|e| LimboError::InternalError(e.to_string()))?;
-                        let values = record_cursor.get_values(&record);
-                        let mut values = values
-                            .into_iter()
-                            .map(|value| value.map(|v| v.to_owned()))
-                            .collect::<Result<Vec<_>>>()?;
+
+                        let mut values = record.get_values_owned()?;
                         values[3] = Value::Integer(root_page as i64);
                         let record = ImmutableRecord::from_values(&values, values.len());
                         row_version.row.data = Some(record.get_payload().to_owned());
@@ -781,15 +776,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                             })?;
                         let record =
                             ImmutableRecord::from_bin_record(row_version.row.payload().to_vec());
-                        let mut record_cursor = RecordCursor::new();
-                        record_cursor
-                            .parse_full_header(&record)
-                            .map_err(|e| LimboError::InternalError(e.to_string()))?;
-                        let values = record_cursor.get_values(&record);
-                        let mut values = values
-                            .into_iter()
-                            .map(|value| value.map(|v| v.to_owned()))
-                            .collect::<Result<Vec<_>>>()?;
+                        let mut values = record.get_values_owned()?;
                         values[3] = Value::Integer(root_page as i64);
                         let record = ImmutableRecord::from_values(&values, values.len());
                         row_version.row.data = Some(record.get_payload().to_owned());
@@ -1035,15 +1022,14 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
 
             CheckpointState::CommitPagerTxn => {
                 tracing::debug!("Committing pager transaction");
-                let result = self.pager.commit_tx(&self.connection)?;
+                let result = self
+                    .pager
+                    .commit_tx(&self.connection, self.update_transaction_state)?;
                 match result {
                     IOResult::Done(_) => {
                         self.state = CheckpointState::TruncateLogicalLog;
                         self.lock_states.pager_read_tx = false;
                         self.lock_states.pager_write_tx = false;
-                        if self.update_transaction_state {
-                            self.connection.set_tx_state(TransactionState::None);
-                        }
                         let header = self.pager.io.block(|| {
                             self.pager.with_header_mut(|header| {
                                 header.schema_cookie =
@@ -1071,6 +1057,12 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
             }
 
             CheckpointState::FsyncLogicalLog => {
+                // Skip fsync when synchronous mode is off
+                if self.sync_mode == SyncMode::Off {
+                    tracing::debug!("Skipping fsync of logical log file (synchronous=off)");
+                    self.state = CheckpointState::CheckpointWal;
+                    return Ok(TransitionResult::Continue);
+                }
                 tracing::debug!("Fsyncing logical log file");
                 let c = self.fsync_logical_log()?;
                 self.state = CheckpointState::CheckpointWal;
@@ -1087,6 +1079,62 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 match self.checkpoint_wal()? {
                     IOResult::Done(result) => {
                         self.checkpoint_result = Some(result);
+                        self.state = CheckpointState::SyncDbFile;
+                        Ok(TransitionResult::Continue)
+                    }
+                    IOResult::IO(io) => Ok(TransitionResult::Io(io)),
+                }
+            }
+
+            CheckpointState::SyncDbFile => {
+                // Fsync database file before truncating WAL.
+                // This ensures durability: if we crash after WAL truncation but before DB fsync,
+                // the checkpointed data would be lost.
+                if self.sync_mode == SyncMode::Off {
+                    tracing::debug!("Skipping fsync of database file (synchronous=off)");
+                    self.state = CheckpointState::TruncateWal;
+                    return Ok(TransitionResult::Continue);
+                }
+
+                let checkpoint_result = self
+                    .checkpoint_result
+                    .as_mut()
+                    .expect("checkpoint_result should be set");
+
+                // Only sync if we actually backfilled any frames
+                if checkpoint_result.wal_checkpoint_backfilled == 0 {
+                    self.state = CheckpointState::TruncateWal;
+                    return Ok(TransitionResult::Continue);
+                }
+
+                // Check if we already sent the sync
+                if checkpoint_result.db_sync_sent {
+                    self.state = CheckpointState::TruncateWal;
+                    return Ok(TransitionResult::Continue);
+                }
+
+                tracing::debug!("Fsyncing database file before WAL truncation");
+                let c = self
+                    .pager
+                    .db_file
+                    .sync(Completion::new_sync(|_| {}), self.pager.get_sync_type())?;
+                checkpoint_result.db_sync_sent = true;
+                Ok(TransitionResult::Io(IOCompletions::Single(c)))
+            }
+
+            CheckpointState::TruncateWal => {
+                // Truncate WAL file after DB file is safely synced.
+                // This must be done explicitly because MVCC calls wal.checkpoint() directly,
+                // bypassing the pager's TruncateWalFile phase.
+                let Some(wal) = &self.pager.wal else {
+                    panic!("No WAL to truncate");
+                };
+                let checkpoint_result = self
+                    .checkpoint_result
+                    .as_mut()
+                    .expect("checkpoint_result should be set");
+                match wal.truncate_wal(checkpoint_result, self.pager.get_sync_type())? {
+                    IOResult::Done(()) => {
                         self.state = CheckpointState::Finalize;
                         Ok(TransitionResult::Continue)
                     }

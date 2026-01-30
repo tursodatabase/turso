@@ -1,12 +1,11 @@
 use crate::pragma::{PragmaVirtualTable, PragmaVirtualTableCursor};
 use crate::schema::Column;
+use crate::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
+use crate::sync::{Arc, RwLock, Weak};
 use crate::util::columns_from_create_table_body;
 use crate::{Connection, LimboError, SymbolTable, Value};
-use parking_lot::RwLock;
 use std::ffi::c_void;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicPtr, Ordering};
-use std::sync::Arc;
 use turso_ext::{ConstraintInfo, IndexInfo, OrderByInfo, ResultCode, VTabKind, VTabModuleImpl};
 use turso_parser::{ast, parser::Parser};
 
@@ -31,12 +30,26 @@ impl VirtualTable {
     pub(crate) fn id(&self) -> u64 {
         self.vtab_id
     }
-    pub(crate) fn readonly(self: &Arc<VirtualTable>) -> bool {
+    pub(crate) fn readonly(&self) -> bool {
         match &self.vtab_type {
             VirtualTableType::Pragma(_) => true,
             VirtualTableType::External(table) => table.readonly(),
             VirtualTableType::Internal(_) => true,
         }
+    }
+
+    #[cfg(feature = "cli_only")]
+    fn dbpage_virtual_table() -> Arc<VirtualTable> {
+        let dbpage_table = crate::dbpage::DbPageTable::new();
+        let dbpage_vtab = VirtualTable {
+            name: dbpage_table.name(),
+            columns: Self::resolve_columns(dbpage_table.sql())
+                .expect("sqlite_dbpage schema resolution should not fail"),
+            kind: VTabKind::TableValuedFunction,
+            vtab_type: VirtualTableType::Internal(Arc::new(RwLock::new(dbpage_table))),
+            vtab_id: 0,
+        };
+        Arc::new(dbpage_vtab)
     }
 
     pub(crate) fn builtin_functions() -> Vec<Arc<VirtualTable>> {
@@ -57,6 +70,9 @@ impl VirtualTable {
 
         #[cfg(feature = "json")]
         vtables.extend(Self::json_virtual_tables());
+
+        #[cfg(feature = "cli_only")]
+        vtables.push(Self::dbpage_virtual_table());
 
         vtables
     }
@@ -247,6 +263,8 @@ pub enum VirtualTableCursor {
     Internal(Arc<RwLock<dyn InternalVirtualTableCursor>>),
 }
 
+crate::assert::assert_send_sync!(VirtualTableCursor);
+
 impl VirtualTableCursor {
     pub(crate) fn next(&mut self) -> crate::Result<bool> {
         match self {
@@ -302,13 +320,13 @@ pub(crate) struct ExtVirtualTable {
     implementation: Arc<VTabModuleImpl>,
     table_ptr: AtomicPtr<c_void>,
 }
-static VTAB_ID_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+static VTAB_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 impl Clone for ExtVirtualTable {
     fn clone(&self) -> Self {
         Self {
             implementation: self.implementation.clone(),
-            table_ptr: AtomicPtr::new(self.table_ptr.load(std::sync::atomic::Ordering::SeqCst)),
+            table_ptr: AtomicPtr::new(self.table_ptr.load(Ordering::SeqCst)),
         }
     }
 }
@@ -374,7 +392,7 @@ impl ExtVirtualTable {
         // store the leaked connection pointer on the table so it can be freed on drop
         let Some(cursor) = NonNull::new(unsafe {
             (self.implementation.open)(
-                self.table_ptr.load(std::sync::atomic::Ordering::SeqCst) as *const c_void,
+                self.table_ptr.load(Ordering::SeqCst) as *const c_void,
                 ext_conn_ptr.as_ptr(),
             ) as *mut c_void
         }) else {
@@ -389,7 +407,7 @@ impl ExtVirtualTable {
         let newrowid = 0i64;
         let rc = unsafe {
             (self.implementation.update)(
-                self.table_ptr.load(std::sync::atomic::Ordering::SeqCst) as *const c_void,
+                self.table_ptr.load(Ordering::SeqCst) as *const c_void,
                 arg_count as i32,
                 ext_args.as_ptr(),
                 &newrowid as *const _ as *mut i64,
@@ -409,9 +427,7 @@ impl ExtVirtualTable {
 
     fn destroy(&self) -> crate::Result<()> {
         let rc = unsafe {
-            (self.implementation.destroy)(
-                self.table_ptr.load(std::sync::atomic::Ordering::SeqCst) as *const c_void
-            )
+            (self.implementation.destroy)(self.table_ptr.load(Ordering::SeqCst) as *const c_void)
         };
         match rc {
             ResultCode::OK => Ok(()),
@@ -420,9 +436,7 @@ impl ExtVirtualTable {
     }
 
     fn commit(&self) -> crate::Result<()> {
-        let rc = unsafe {
-            (self.implementation.commit)(self.table_ptr.load(std::sync::atomic::Ordering::SeqCst))
-        };
+        let rc = unsafe { (self.implementation.commit)(self.table_ptr.load(Ordering::SeqCst)) };
         match rc {
             ResultCode::OK => Ok(()),
             _ => Err(LimboError::ExtensionError("Commit failed".to_string())),
@@ -430,9 +444,7 @@ impl ExtVirtualTable {
     }
 
     fn begin(&self) -> crate::Result<()> {
-        let rc = unsafe {
-            (self.implementation.begin)(self.table_ptr.load(std::sync::atomic::Ordering::SeqCst))
-        };
+        let rc = unsafe { (self.implementation.begin)(self.table_ptr.load(Ordering::SeqCst)) };
         match rc {
             ResultCode::OK => Ok(()),
             _ => Err(LimboError::ExtensionError("Begin failed".to_string())),
@@ -440,9 +452,7 @@ impl ExtVirtualTable {
     }
 
     fn rollback(&self) -> crate::Result<()> {
-        let rc = unsafe {
-            (self.implementation.rollback)(self.table_ptr.load(std::sync::atomic::Ordering::SeqCst))
-        };
+        let rc = unsafe { (self.implementation.rollback)(self.table_ptr.load(Ordering::SeqCst)) };
         match rc {
             ResultCode::OK => Ok(()),
             _ => Err(LimboError::ExtensionError("Rollback failed".to_string())),
@@ -452,10 +462,7 @@ impl ExtVirtualTable {
     fn rename(&self, new_name: &str) -> crate::Result<()> {
         let c_new_name = std::ffi::CString::new(new_name).unwrap();
         let rc = unsafe {
-            (self.implementation.rename)(
-                self.table_ptr.load(std::sync::atomic::Ordering::SeqCst),
-                c_new_name.as_ptr(),
-            )
+            (self.implementation.rename)(self.table_ptr.load(Ordering::SeqCst), c_new_name.as_ptr())
         };
         match rc {
             ResultCode::OK => Ok(()),
@@ -472,6 +479,12 @@ pub struct ExtVirtualTableCursor {
     implementation: Arc<VTabModuleImpl>,
     vtab_id: u64,
 }
+
+// SAFETY: Extension provider must guarantee Send + Sync on their side
+// we cannot properly infer Send + Sync for dynamic libraries
+unsafe impl Send for ExtVirtualTableCursor {}
+unsafe impl Sync for ExtVirtualTableCursor {}
+crate::assert::assert_send_sync!(ExtVirtualTableCursor);
 
 impl ExtVirtualTableCursor {
     fn new(
@@ -555,7 +568,7 @@ impl Drop for ExtVirtualTableCursor {
             let conn = unsafe { Box::from_raw(ptr.as_ptr()) };
             if !conn._ctx.is_null() {
                 // we also leaked the Weak 'ctx' pointer, so free this as well
-                let _ = unsafe { Box::from_raw(conn._ctx as *mut std::sync::Weak<Connection>) };
+                let _ = unsafe { Box::from_raw(conn._ctx as *mut Weak<Connection>) };
             }
         }
         let result = unsafe { (self.implementation.close)(self.cursor.as_ptr()) };

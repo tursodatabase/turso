@@ -110,3 +110,42 @@ test('blobs', () => {
     const rows = db.prepare("SELECT x'1020' as x").all();
     expect(rows).toEqual([{ x: Buffer.from([16, 32]) }])
 })
+
+test('encryption', () => {
+    const path = `test-encryption-${(Math.random() * 10000) | 0}.db`;
+    const hexkey = 'b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327';
+    const wrongKey = 'aaaaaaa4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327';
+    try {
+        const db = new Database(path, {
+            encryption: { cipher: 'aegis256', hexkey }
+        });
+        db.exec("CREATE TABLE t(x)");
+        db.exec("INSERT INTO t SELECT 'secret' FROM generate_series(1, 1024)");
+        db.exec("PRAGMA wal_checkpoint(truncate)");
+        db.close();
+
+        // lets re-open with the same key
+        const db2 = new Database(path, {
+            encryption: { cipher: 'aegis256', hexkey }
+        });
+        const rows = db2.prepare("SELECT COUNT(*) as cnt FROM t").all();
+        expect(rows).toEqual([{ cnt: 1024 }]);
+        db2.close();
+
+        // opening with wrong key MUST fail
+        expect(() => {
+            const db3 = new Database(path, {
+                encryption: { cipher: 'aegis256', hexkey: wrongKey }
+            });
+            db3.prepare("SELECT * FROM t").all();
+        }).toThrow();
+
+        // opening without encryption MUST fail
+        expect(() => {
+            const db5 = new Database(path);
+            db5.prepare("SELECT * FROM t").all();
+        }).toThrow();
+    } finally {
+        unlinkSync(path);
+    }
+})

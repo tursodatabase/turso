@@ -1,6 +1,6 @@
+use crate::sync::Arc;
 use std::fmt;
 use std::fmt::{Debug, Display};
-use std::sync::Arc;
 use turso_ext::{FinalizeFunction, InitAggFunction, ScalarFunction, StepFunction};
 
 use crate::LimboError;
@@ -189,6 +189,40 @@ impl Display for VectorFunc {
             Self::VectorDistanceDot => "vector_distance_dot",
             Self::VectorConcat => "vector_concat",
             Self::VectorSlice => "vector_slice",
+        };
+        write!(f, "{str}")
+    }
+}
+
+/// Full-text search functions
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+#[derive(Debug, Clone, PartialEq)]
+pub enum FtsFunc {
+    /// fts_score(col1, col2, ..., query): computes FTS relevance score
+    /// When used with an FTS index, the optimizer routes through the index method
+    Score,
+    /// fts_match(col1, col2, ..., query): returns true if document matches query
+    /// Used in WHERE clause for filtering rows by FTS match
+    Match,
+    /// fts_highlight(text, query, before_tag, after_tag): returns text with matching terms highlighted
+    /// Wraps matching query terms in the text with before_tag and after_tag markers
+    Highlight,
+}
+
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+impl FtsFunc {
+    pub fn is_deterministic(&self) -> bool {
+        true
+    }
+}
+
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+impl Display for FtsFunc {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let str = match self {
+            Self::Score => "fts_score",
+            Self::Match => "fts_match",
+            Self::Highlight => "fts_highlight",
         };
         write!(f, "{str}")
     }
@@ -405,9 +439,9 @@ impl Deterministic for ScalarFunc {
             ScalarFunc::Replace => true,
             #[cfg(feature = "fs")]
             #[cfg(not(target_family = "wasm"))]
-            ScalarFunc::LoadExtension => true,
+            ScalarFunc::LoadExtension => false,
             ScalarFunc::StrfTime => false,
-            ScalarFunc::Printf => false,
+            ScalarFunc::Printf => true,
             ScalarFunc::Likely => true,
             ScalarFunc::TimeDiff => false,
             ScalarFunc::Likelihood => true,
@@ -611,7 +645,7 @@ impl Display for MathFunc {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum AlterTableFunc {
     RenameTable,
     AlterColumn,
@@ -628,12 +662,14 @@ impl Display for AlterTableFunc {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Func {
     Agg(AggFunc),
     Scalar(ScalarFunc),
     Math(MathFunc),
     Vector(VectorFunc),
+    #[cfg(all(feature = "fts", not(target_family = "wasm")))]
+    Fts(FtsFunc),
     #[cfg(feature = "json")]
     Json(JsonFunc),
     AlterTable(AlterTableFunc),
@@ -647,6 +683,8 @@ impl Display for Func {
             Self::Scalar(scalar_func) => write!(f, "{scalar_func}"),
             Self::Math(math_func) => write!(f, "{math_func}"),
             Self::Vector(vector_func) => write!(f, "{vector_func}"),
+            #[cfg(all(feature = "fts", not(target_family = "wasm")))]
+            Self::Fts(fts_func) => write!(f, "{fts_func}"),
             #[cfg(feature = "json")]
             Self::Json(json_func) => write!(f, "{json_func}"),
             Self::External(generic_func) => write!(f, "{generic_func}"),
@@ -655,7 +693,7 @@ impl Display for Func {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct FuncCtx {
     pub func: Func,
     pub arg_count: usize,
@@ -668,6 +706,8 @@ impl Deterministic for Func {
             Self::Scalar(scalar_func) => scalar_func.is_deterministic(),
             Self::Math(math_func) => math_func.is_deterministic(),
             Self::Vector(vector_func) => vector_func.is_deterministic(),
+            #[cfg(all(feature = "fts", not(target_family = "wasm")))]
+            Self::Fts(fts_func) => fts_func.is_deterministic(),
             #[cfg(feature = "json")]
             Self::Json(json_func) => json_func.is_deterministic(),
             Self::External(external_func) => external_func.is_deterministic(),
@@ -678,6 +718,10 @@ impl Deterministic for Func {
 
 impl Func {
     pub fn supports_star_syntax(&self) -> bool {
+        // Functions that need star expansion also support star syntax
+        if self.needs_star_expansion() {
+            return true;
+        }
         match self {
             Self::Scalar(scalar_func) => {
                 matches!(
@@ -698,6 +742,23 @@ impl Func {
             Self::Agg(_) => false,
             _ => false,
         }
+    }
+
+    /// Returns true if the function needs the `*` to be expanded to all columns
+    /// from the referenced tables. This is used for functions like `json_object(*)`
+    /// and `jsonb_object(*)` which create a JSON object with column names as keys
+    /// and column values as values.
+    #[cfg(feature = "json")]
+    pub fn needs_star_expansion(&self) -> bool {
+        matches!(
+            self,
+            Self::Json(JsonFunc::JsonObject) | Self::Json(JsonFunc::JsonbObject)
+        )
+    }
+
+    #[cfg(not(feature = "json"))]
+    pub fn needs_star_expansion(&self) -> bool {
+        false
     }
     pub fn resolve_function(name: &str, arg_count: usize) -> Result<Self, LimboError> {
         let normalized_name = crate::util::normalize_ident(name);
@@ -910,6 +971,13 @@ impl Func {
             "vector_distance_dot" => Ok(Self::Vector(VectorFunc::VectorDistanceDot)),
             "vector_concat" => Ok(Self::Vector(VectorFunc::VectorConcat)),
             "vector_slice" => Ok(Self::Vector(VectorFunc::VectorSlice)),
+            // FTS functions
+            #[cfg(all(feature = "fts", not(target_family = "wasm")))]
+            "fts_score" => Ok(Self::Fts(FtsFunc::Score)),
+            #[cfg(all(feature = "fts", not(target_family = "wasm")))]
+            "fts_match" => Ok(Self::Fts(FtsFunc::Match)),
+            #[cfg(all(feature = "fts", not(target_family = "wasm")))]
+            "fts_highlight" => Ok(Self::Fts(FtsFunc::Highlight)),
             _ => crate::bail_parse_error!("no such function: {}", name),
         }
     }

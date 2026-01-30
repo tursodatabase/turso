@@ -1,15 +1,16 @@
-use std::{cmp::Ordering, collections::HashMap, marker::PhantomData, sync::Arc};
+use rustc_hash::FxHashMap as HashMap;
+use std::{cmp::Ordering, marker::PhantomData, sync::Arc};
 use turso_parser::ast::{
-    self, FrameBound, FrameClause, FrameExclude, FrameMode, SortOrder, SubqueryType,
+    self, FrameBound, FrameClause, FrameExclude, FrameMode, ResolveType, SortOrder, SubqueryType,
 };
 
 use crate::{
     function::AggFunc,
     schema::{BTreeTable, ColDef, Column, FromClauseSubquery, Index, Schema, Table},
     translate::{
-        collate::get_collseq_from_expr,
+        collate::{get_collseq_from_expr, CollationSeq},
         emitter::UpdateRowSource,
-        expr::as_binary_components,
+        expr::{as_binary_components, get_expr_affinity},
         expression_index::{normalize_expr_for_index_matching, single_table_column_usage},
         optimizer::constraints::{BinaryExprSide, SeekRangeConstraint},
         planner::determine_where_to_eval_term,
@@ -17,7 +18,7 @@ use crate::{
     vdbe::{
         affinity::Affinity,
         builder::{CursorKey, CursorType, ProgramBuilder},
-        insn::{to_u16, IdxInsertFlags, Insn},
+        insn::{HashDistinctData, Insn},
         BranchOffset, CursorID,
     },
     Result, VirtualTable,
@@ -27,6 +28,29 @@ use crate::{schema::Type, types::SeekOp};
 use turso_parser::ast::TableInternalId;
 
 use super::emitter::OperationMode;
+
+/// Infer the Type and type name from an expression's affinity.
+///
+/// Used for subquery result columns. SQLite derives column affinity from:
+/// - Column references: the declared column type
+/// - CAST expressions: the cast target type
+/// - Subqueries: recursively from the subquery's result expression
+/// - Literals: BLOB affinity (no affinity)
+///
+/// The affinity determines comparison behavior in IN expressions, etc.
+fn infer_type_from_expr(
+    expr: &ast::Expr,
+    tables: Option<&TableReferences>,
+) -> (Type, &'static str) {
+    let affinity = get_expr_affinity(expr, tables);
+    match affinity {
+        Affinity::Integer => (Type::Integer, "INTEGER"),
+        Affinity::Real => (Type::Real, "REAL"),
+        Affinity::Text => (Type::Text, "TEXT"),
+        Affinity::Numeric => (Type::Numeric, "NUMERIC"),
+        Affinity::Blob => (Type::Blob, "BLOB"),
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct ResultSetColumn {
@@ -220,11 +244,79 @@ pub enum Plan {
     Update(UpdatePlan),
 }
 
+impl Plan {
+    /// Returns true if this SELECT plan contains a reference to the given table.
+    /// For compound selects, checks all component selects.
+    /// Returns false for Delete/Update plans.
+    pub fn select_contains_table(&self, table: &Table) -> bool {
+        match self {
+            Plan::Select(select_plan) => select_plan.table_references.contains_table(table),
+            Plan::CompoundSelect {
+                left, right_most, ..
+            } => {
+                right_most.table_references.contains_table(table)
+                    || left
+                        .iter()
+                        .any(|(plan, _)| plan.table_references.contains_table(table))
+            }
+            Plan::Delete(_) | Plan::Update(_) => false,
+        }
+    }
+
+    /// Returns the query destination for Select/CompoundSelect plans.
+    /// Returns None for Delete/Update plans.
+    pub fn select_query_destination(&self) -> Option<&QueryDestination> {
+        match self {
+            Plan::Select(select_plan) => Some(&select_plan.query_destination),
+            Plan::CompoundSelect { right_most, .. } => Some(&right_most.query_destination),
+            Plan::Delete(_) | Plan::Update(_) => None,
+        }
+    }
+
+    /// Returns a mutable reference to the query destination for Select/CompoundSelect plans.
+    /// Returns None for Delete/Update plans.
+    pub fn select_query_destination_mut(&mut self) -> Option<&mut QueryDestination> {
+        match self {
+            Plan::Select(select_plan) => Some(&mut select_plan.query_destination),
+            Plan::CompoundSelect { right_most, .. } => Some(&mut right_most.query_destination),
+            Plan::Delete(_) | Plan::Update(_) => None,
+        }
+    }
+
+    /// Returns the result columns for Select/CompoundSelect plans.
+    /// Returns None for Delete/Update plans.
+    pub fn select_result_columns(&self) -> Option<&[ResultSetColumn]> {
+        match self {
+            Plan::Select(select_plan) => Some(&select_plan.result_columns),
+            Plan::CompoundSelect { right_most, .. } => Some(&right_most.result_columns),
+            Plan::Delete(_) | Plan::Update(_) => None,
+        }
+    }
+
+    /// Returns the table references for Select/CompoundSelect plans.
+    /// Returns None for Delete/Update plans.
+    pub fn select_table_references(&self) -> Option<&TableReferences> {
+        match self {
+            Plan::Select(select_plan) => Some(&select_plan.table_references),
+            Plan::CompoundSelect { right_most, .. } => Some(&right_most.table_references),
+            Plan::Delete(_) | Plan::Update(_) => None,
+        }
+    }
+}
+
 /// The destination of the results of a query.
 /// Typically, the results of a query are returned to the caller.
 /// However, there are some cases where the results are not returned to the caller,
 /// but rather are yielded to a parent query via coroutine, or stored in a temp table,
 /// later used by the parent query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EphemeralRowidMode {
+    /// The last result column is used as the rowid key.
+    FromResultColumns,
+    /// Generate a fresh rowid for each inserted row.
+    Auto,
+}
+
 #[derive(Debug, Clone)]
 pub enum QueryDestination {
     /// The results of the query are returned to the caller.
@@ -253,6 +345,8 @@ pub enum QueryDestination {
         cursor_id: CursorID,
         /// The table that will be used to store the results.
         table: Arc<BTreeTable>,
+        /// How to determine the rowid key for inserts.
+        rowid_mode: EphemeralRowidMode,
     },
     /// The result of an EXISTS subquery are stored in a single register.
     ExistsSubqueryResult {
@@ -323,10 +417,10 @@ impl Distinctness {
 /// Translation context for handling DISTINCT columns.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DistinctCtx {
-    /// The cursor ID for the ephemeral index opened for the purpose of deduplicating results.
-    pub cursor_id: usize,
-    /// The index name for the ephemeral index, needed to lookup the cursor ID.
-    pub ephemeral_index_name: String,
+    /// Hash table id used to deduplicate results.
+    pub hash_table_id: usize,
+    /// Collations for each distinct key column.
+    pub collations: Vec<CollationSeq>,
     /// The label for the on conflict branch.
     /// When a duplicate is found, the program will jump to the offset this label points to.
     pub label_on_conflict: BranchOffset,
@@ -339,26 +433,14 @@ impl DistinctCtx {
         num_regs: usize,
         start_reg: usize,
     ) {
-        program.emit_insn(Insn::Found {
-            cursor_id: self.cursor_id,
-            target_pc: self.label_on_conflict,
-            record_reg: start_reg,
-            num_regs,
-        });
-        let record_reg = program.alloc_register();
-        program.emit_insn(Insn::MakeRecord {
-            start_reg: to_u16(start_reg),
-            count: to_u16(num_regs),
-            dest_reg: to_u16(record_reg),
-            index_name: Some(self.ephemeral_index_name.to_string()),
-            affinity_str: None,
-        });
-        program.emit_insn(Insn::IdxInsert {
-            cursor_id: self.cursor_id,
-            record_reg,
-            unpacked_start: None,
-            unpacked_count: None,
-            flags: IdxInsertFlags::new(),
+        program.emit_insn(Insn::HashDistinct {
+            data: Box::new(HashDistinctData {
+                hash_table_id: self.hash_table_id,
+                key_start_reg: start_reg,
+                num_keys: num_regs,
+                collations: self.collations.clone(),
+                target_pc: self.label_on_conflict,
+            }),
         });
     }
 }
@@ -414,6 +496,14 @@ impl SelectPlan {
             .iter()
             .any(|t| t.is_used())
             || self.non_from_clause_subqueries.iter().any(|s| s.correlated)
+            || self
+                .table_references
+                .joined_tables()
+                .iter()
+                .any(|t| match &t.table {
+                    Table::FromClauseSubquery(subquery) => plan_is_correlated(&subquery.plan),
+                    _ => false,
+                })
     }
 
     /// Reference: https://github.com/sqlite/sqlite/blob/5db695197b74580c777b37ab1b787531f15f7f9f/src/select.c#L8613
@@ -492,11 +582,15 @@ pub struct DeletePlan {
     pub rowset_plan: Option<SelectPlan>,
     /// Register ID for the RowSet (if rowset_plan is Some)
     pub rowset_reg: Option<usize>,
+    /// Subqueries that appear in the WHERE clause (for non-rowset path)
+    pub non_from_clause_subqueries: Vec<NonFromClauseSubquery>,
 }
 
 #[derive(Debug, Clone)]
 pub struct UpdatePlan {
     pub table_references: TableReferences,
+    /// Conflict resolution strategy (e.g., OR IGNORE, OR REPLACE)
+    pub or_conflict: Option<ResolveType>,
     // (colum index, new value) pairs
     pub set_clauses: Vec<(usize, Box<ast::Expr>)>,
     pub where_clause: Vec<WhereTerm>,
@@ -516,6 +610,8 @@ pub struct UpdatePlan {
     // For ALTER TABLE turso-db emits appropriate DDL statement in the "updates" cell of CDC table
     // This field is present only for update plan created for ALTER TABLE when CDC mode has "updates" values
     pub cdc_update_alter_statement: Option<String>,
+    /// Subqueries that appear in the WHERE clause (for non-ephemeral path)
+    pub non_from_clause_subqueries: Vec<NonFromClauseSubquery>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -873,7 +969,7 @@ impl TableReferences {
             .chain(self.outer_query_refs.iter().map(|t| &t.table))
             .any(|t| match t {
                 Table::FromClauseSubquery(subquery_table) => {
-                    subquery_table.plan.table_references.contains_table(table)
+                    subquery_table.plan.select_contains_table(table)
                 }
                 _ => t == table,
             })
@@ -1093,6 +1189,10 @@ pub struct HashJoinOp {
     pub join_keys: Vec<HashJoinKey>,
     /// Memory budget for hash table
     pub mem_budget: usize,
+    /// Whether the build input should be materialized as a rowid list before hash build.
+    pub materialize_build_input: bool,
+    /// Whether to use a bloom filter on the probe side.
+    pub use_bloom_filter: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -1157,7 +1257,7 @@ impl JoinedTable {
         }
     }
 
-    /// Creates a new TableReference for a subquery.
+    /// Creates a new TableReference for a subquery from a SelectPlan.
     pub fn new_subquery(
         identifier: String,
         plan: SelectPlan,
@@ -1168,12 +1268,14 @@ impl JoinedTable {
             .result_columns
             .iter()
             .map(|rc| {
+                let (col_type, type_name) =
+                    infer_type_from_expr(&rc.expr, Some(&plan.table_references));
                 Column::new(
                     rc.name(&plan.table_references).map(String::from),
-                    "BLOB".to_string(),
+                    type_name.to_string(),
                     None,
                     None,
-                    Type::Blob, // FIXME: infer proper type
+                    col_type,
                     None,
                     ColDef::default(),
                 )
@@ -1184,6 +1286,95 @@ impl JoinedTable {
             column.set_collation(get_collseq_from_expr(
                 &plan.result_columns[i].expr,
                 &plan.table_references,
+            )?);
+        }
+
+        let table = Table::FromClauseSubquery(FromClauseSubquery {
+            name: identifier.clone(),
+            plan: Box::new(Plan::Select(plan)),
+            columns,
+            result_columns_start_reg: None,
+        });
+        Ok(Self {
+            op: Operation::default_scan_for(&table),
+            table,
+            identifier,
+            internal_id,
+            join_info,
+            col_used_mask: ColumnUsedMask::default(),
+            column_use_counts: Vec::new(),
+            expression_index_usages: Vec::new(),
+            database_id: 0,
+        })
+    }
+
+    /// Creates a new TableReference for a subquery from a Plan (either SelectPlan or CompoundSelect).
+    /// If `explicit_columns` is provided, those names override the derived column names from the SELECT.
+    pub fn new_subquery_from_plan(
+        identifier: String,
+        plan: Plan,
+        join_info: Option<JoinInfo>,
+        internal_id: TableInternalId,
+        explicit_columns: Option<&[String]>,
+    ) -> Result<Self> {
+        // Get result columns and table references from the plan
+        let (result_columns, table_references) = match &plan {
+            Plan::Select(select_plan) => {
+                (&select_plan.result_columns, &select_plan.table_references)
+            }
+            Plan::CompoundSelect {
+                left, right_most, ..
+            } => {
+                // For compound selects, SQLite uses the leftmost select's column names.
+                // The leftmost select is left[0] if the vec is not empty, otherwise right_most.
+                if !left.is_empty() {
+                    (&left[0].0.result_columns, &left[0].0.table_references)
+                } else {
+                    (&right_most.result_columns, &right_most.table_references)
+                }
+            }
+            Plan::Delete(_) | Plan::Update(_) => {
+                unreachable!("DELETE/UPDATE plans cannot be subqueries")
+            }
+        };
+
+        // Validate explicit column count if provided
+        if let Some(cols) = explicit_columns {
+            if cols.len() != result_columns.len() {
+                crate::bail_parse_error!(
+                    "table {} has {} columns but {} column names were provided",
+                    identifier,
+                    result_columns.len(),
+                    cols.len()
+                );
+            }
+        }
+
+        let mut columns = result_columns
+            .iter()
+            .enumerate()
+            .map(|(i, rc)| {
+                // Use explicit column name if provided, otherwise derive from result column
+                let col_name = explicit_columns
+                    .and_then(|cols| cols.get(i).cloned())
+                    .or_else(|| rc.name(table_references).map(String::from));
+                let (col_type, type_name) = infer_type_from_expr(&rc.expr, Some(table_references));
+                Column::new(
+                    col_name,
+                    type_name.to_string(),
+                    None,
+                    None,
+                    col_type,
+                    None,
+                    ColDef::default(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        for (i, column) in columns.iter_mut().enumerate() {
+            column.set_collation(get_collseq_from_expr(
+                &result_columns[i].expr,
+                table_references,
             )?);
         }
 
@@ -1787,8 +1978,16 @@ pub enum SubqueryState {
     /// The subquery has been evaluated.
     /// The [evaluated_at] field contains the loop index where the subquery was evaluated.
     /// The query plan struct no longer exists because translating the plan currently
-    /// requires an ownership transfer.
-    Evaluated { evaluated_at: EvalAt },
+    /// requires an ownership transfer. We retain the outer table references so
+    /// later masking/evaluation logic can still reason about dependencies.
+    Evaluated {
+        /// Join-loop position where the subquery was emitted into bytecode.
+        evaluated_at: EvalAt,
+        /// Outer table ids referenced by the subquery when it was planned.
+        /// We keep these so later analysis can still understand dependencies
+        /// even after the plan is consumed.
+        outer_ref_ids: Vec<TableInternalId>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1842,45 +2041,48 @@ impl NonFromClauseSubquery {
         matches!(self.state, SubqueryState::Evaluated { .. })
     }
 
-    /// Returns the loop index where the subquery should be evaluated in this particular join order.
-    /// If the subquery references tables from the parent query, it will be evaluated at the right-most
-    /// nested loop whose table it references.
-    pub fn get_eval_at(&self, join_order: &[JoinOrderMember]) -> Result<EvalAt> {
-        let mut eval_at = EvalAt::BeforeLoop;
-        let SubqueryState::Unevaluated { plan } = &self.state else {
-            crate::bail_parse_error!("subquery has already been evaluated");
+    /// Returns the loop index where the subquery should be evaluated in this join order.
+    ///
+    /// If the subquery references tables from the parent query, it is evaluated at
+    /// the right-most loop that makes those tables available. For hash joins, this
+    /// may map a build-table reference to the probe loop where its rows are produced.
+    pub fn get_eval_at(
+        &self,
+        join_order: &[JoinOrderMember],
+        table_references: Option<&TableReferences>,
+    ) -> Result<EvalAt> {
+        let plan = match &self.state {
+            SubqueryState::Unevaluated { plan } => plan.as_ref().unwrap(),
+            SubqueryState::Evaluated { evaluated_at, .. } => {
+                return Ok(*evaluated_at);
+            }
         };
-        let used_outer_refs = plan
-            .as_ref()
-            .unwrap()
-            .table_references
-            .outer_query_refs()
-            .iter()
-            .filter(|t| t.is_used());
-
-        for outer_ref in used_outer_refs {
-            let Some(loop_idx) = join_order
-                .iter()
-                .position(|t| t.table_id == outer_ref.internal_id)
-            else {
-                continue;
-            };
-            eval_at = eval_at.max(EvalAt::Loop(loop_idx));
-        }
-        for subquery in plan.as_ref().unwrap().non_from_clause_subqueries.iter() {
-            let eval_at_inner = subquery.get_eval_at(join_order)?;
-            eval_at = eval_at.max(eval_at_inner);
-        }
-        Ok(eval_at)
+        eval_at_for_select_plan(plan, join_order, table_references)
     }
 
     /// Consumes the plan and returns it, and sets the subquery to the evaluated state.
-    /// This is used when the subquery is translated into bytecode.
+    ///
+    /// This captures any outer references before the plan is moved so later
+    /// phases can still reason about dependencies.
     pub fn consume_plan(&mut self, evaluated_at: EvalAt) -> Box<SelectPlan> {
         match &mut self.state {
             SubqueryState::Unevaluated { plan } => {
+                let outer_ref_ids = plan
+                    .as_ref()
+                    .map(|plan| {
+                        plan.table_references
+                            .outer_query_refs()
+                            .iter()
+                            .filter(|t| t.is_used())
+                            .map(|t| t.internal_id)
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
                 let plan = plan.take().unwrap();
-                self.state = SubqueryState::Evaluated { evaluated_at };
+                self.state = SubqueryState::Evaluated {
+                    evaluated_at,
+                    outer_ref_ids,
+                };
                 plan
             }
             SubqueryState::Evaluated { .. } => {
@@ -1888,6 +2090,110 @@ impl NonFromClauseSubquery {
             }
         }
     }
+}
+
+/// Determine the earliest evaluation point for a nested plan by walking all SELECT components.
+fn eval_at_for_plan(
+    plan: &Plan,
+    join_order: &[JoinOrderMember],
+    table_references: Option<&TableReferences>,
+) -> Result<EvalAt> {
+    match plan {
+        Plan::Select(select_plan) => {
+            eval_at_for_select_plan(select_plan, join_order, table_references)
+        }
+        Plan::CompoundSelect {
+            left, right_most, ..
+        } => {
+            let mut eval_at = EvalAt::BeforeLoop;
+            for (select_plan, _) in left.iter() {
+                eval_at = eval_at.max(eval_at_for_select_plan(
+                    select_plan,
+                    join_order,
+                    table_references,
+                )?);
+            }
+            eval_at = eval_at.max(eval_at_for_select_plan(
+                right_most,
+                join_order,
+                table_references,
+            )?);
+            Ok(eval_at)
+        }
+        Plan::Delete(_) | Plan::Update(_) => Ok(EvalAt::BeforeLoop),
+    }
+}
+
+/// Returns true if a plan (including compound SELECTs) references outer-scope tables.
+fn plan_is_correlated(plan: &Plan) -> bool {
+    match plan {
+        Plan::Select(select_plan) => select_plan.is_correlated(),
+        Plan::CompoundSelect {
+            left, right_most, ..
+        } => left.iter().any(|(plan, _)| plan.is_correlated()) || right_most.is_correlated(),
+        Plan::Delete(_) | Plan::Update(_) => false,
+    }
+}
+
+/// Determine when a SELECT plan can be evaluated, including nested non-FROM and FROM-clause subqueries.
+fn eval_at_for_select_plan(
+    plan: &SelectPlan,
+    join_order: &[JoinOrderMember],
+    table_references: Option<&TableReferences>,
+) -> Result<EvalAt> {
+    let mut eval_at = EvalAt::BeforeLoop;
+    let used_outer_refs = plan
+        .table_references
+        .outer_query_refs()
+        .iter()
+        .filter(|t| t.is_used());
+
+    for outer_ref in used_outer_refs {
+        if let Some(loop_idx) =
+            resolve_outer_ref_loop(outer_ref.internal_id, join_order, table_references)
+        {
+            eval_at = eval_at.max(EvalAt::Loop(loop_idx));
+        }
+    }
+    for subquery in plan.non_from_clause_subqueries.iter() {
+        let eval_at_inner = subquery.get_eval_at(join_order, table_references)?;
+        eval_at = eval_at.max(eval_at_inner);
+    }
+    for joined_table in plan.table_references.joined_tables().iter() {
+        if let Table::FromClauseSubquery(from_clause_subquery) = &joined_table.table {
+            eval_at = eval_at.max(eval_at_for_plan(
+                from_clause_subquery.plan.as_ref(),
+                join_order,
+                table_references,
+            )?);
+        }
+    }
+    Ok(eval_at)
+}
+
+/// Resolves the loop index for an outer-table reference.
+///
+/// If the table is not present in the join order, we look for a hash join
+/// where that table is the build side and map it to the probe loop.
+fn resolve_outer_ref_loop(
+    table_id: TableInternalId,
+    join_order: &[JoinOrderMember],
+    table_references: Option<&TableReferences>,
+) -> Option<usize> {
+    if let Some(loop_idx) = join_order.iter().position(|t| t.table_id == table_id) {
+        return Some(loop_idx);
+    }
+    let tables = table_references?;
+    for (probe_idx, member) in join_order.iter().enumerate() {
+        let probe_table = &tables.joined_tables()[member.original_idx];
+        if let Operation::HashJoin(ref hj) = probe_table.op {
+            let build_table = &tables.joined_tables()[hj.build_table_idx];
+            if build_table.internal_id == table_id {
+                return Some(probe_idx);
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]

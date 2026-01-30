@@ -1,6 +1,7 @@
 use crate::{
     error::{SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE},
     schema::{self, BTreeTable, ColDef, Column, Index, IndexColumn, ResolvedFkRef, Schema, Table},
+    sync::Arc,
     translate::{
         emitter::{
             emit_cdc_full_record, emit_cdc_insns, emit_cdc_patch_record, prepare_cdc_if_necessary,
@@ -8,19 +9,20 @@ use crate::{
         },
         expr::{
             bind_and_rewrite_expr, emit_returning_results, process_returning_clause,
-            translate_expr, translate_expr_no_constant_opt, walk_expr_mut, BindingBehavior,
-            NoConstantOptReason, WalkControl,
+            rewrite_between_expr, translate_expr, translate_expr_no_constant_opt, walk_expr_mut,
+            BindingBehavior, NoConstantOptReason, WalkControl,
         },
         fkeys::{
             build_index_affinity_string, emit_fk_violation, emit_guarded_fk_decrement,
             fire_fk_delete_actions, index_probe, open_read_index, open_read_table,
         },
         plan::{
-            ColumnUsedMask, JoinedTable, Operation, QueryDestination, ResultSetColumn,
+            ColumnUsedMask, EvalAt, JoinedTable, Operation, QueryDestination, ResultSetColumn,
             TableReferences,
         },
-        planner::ROWID_STRS,
+        planner::{plan_ctes_as_outer_refs, ROWID_STRS},
         select::translate_select,
+        subquery::{emit_non_from_clause_subquery, plan_subqueries_from_returning},
         trigger_exec::{
             fire_trigger, get_relevant_triggers_type_and_time, has_relevant_triggers_type_only,
             TriggerContext,
@@ -46,16 +48,20 @@ use crate::{
     Connection, LimboError, Result, VirtualTable,
 };
 use std::num::NonZeroUsize;
-use std::sync::Arc;
 use turso_parser::ast::{
     self, Expr, InsertBody, OneSelect, QualifiedName, ResolveType, ResultColumn, TriggerEvent,
-    TriggerTime, Upsert, UpsertDo,
+    TriggerTime, Upsert, UpsertDo, With,
 };
 
 /// Validate anything with this insert statement that should throw an early parse error
-fn validate(table_name: &str, resolver: &Resolver, table: &Table) -> Result<()> {
+fn validate(
+    table_name: &str,
+    resolver: &Resolver,
+    table: &Table,
+    conn: &Arc<Connection>,
+) -> Result<()> {
     // Check if this is a system table that should be protected from direct writes
-    if !crate::schema::can_write_to_table(table_name) {
+    if !conn.is_nested_stmt() && !crate::schema::can_write_to_table(table_name) {
         crate::bail_parse_error!("table {} may not be modified", table_name);
     }
     // Check if this table has any incompatible dependent views
@@ -201,6 +207,7 @@ pub fn translate_insert(
     columns: Vec<ast::Name>,
     mut body: InsertBody,
     mut returning: Vec<ResultColumn>,
+    with: Option<With>,
     mut program: ProgramBuilder,
     connection: &Arc<crate::Connection>,
 ) -> Result<ProgramBuilder> {
@@ -211,12 +218,39 @@ pub fn translate_insert(
     };
     program.extend(&opts);
 
+    // Merge INSERT's WITH clause into the SELECT source's WITH clause.
+    // For VALUES/DEFAULT VALUES with subqueries, we route through the multi-row
+    // path which goes through translate_select and handles CTEs properly.
+    // We also keep a copy for RETURNING clause subqueries.
+    let with_for_returning = with.clone();
+    if let Some(insert_with) = with {
+        if let InsertBody::Select(select, _) = &mut body {
+            match &mut select.with {
+                Some(select_with) => {
+                    // Prepend INSERT's CTEs to SELECT's CTEs
+                    let mut merged = insert_with.ctes;
+                    merged.append(&mut select_with.ctes);
+                    select_with.ctes = merged;
+                    select_with.recursive |= insert_with.recursive;
+                }
+                None => select.with = Some(insert_with),
+            }
+        } else {
+            // WITH clause on INSERT with VALUES or DEFAULT VALUES is not useful
+            // e.g. WITH unused AS (SELECT c FROM a) INSERT INTO b VALUES (1, 2, 3)
+            // but: we can, and indeed must, just ignore it instead of erroring.
+            // leaving this empty else block here for documentation.
+        }
+        // For DEFAULT VALUES/VALUES without SELECT body, CTEs are still needed
+        // for RETURNING clause subqueries - handled below via with_for_returning.
+    }
+
     let table_name = &tbl_name.name;
     let table = match resolver.schema.get_table(table_name.as_str()) {
         Some(table) => table,
         None => crate::bail_parse_error!("no such table: {}", table_name),
     };
-    validate(table_name.as_str(), resolver, &table)?;
+    validate(table_name.as_str(), resolver, &table, connection)?;
 
     let fk_enabled = connection.foreign_keys_enabled();
     if let Some(virtual_table) = &table.virtual_table() {
@@ -273,6 +307,27 @@ pub fn translate_insert(
         vec![],
     );
 
+    // Plan CTEs and add them as outer query references for RETURNING subquery resolution
+    plan_ctes_as_outer_refs(
+        with_for_returning,
+        resolver,
+        &mut program,
+        &mut table_references,
+        connection,
+    )?;
+
+    // Plan subqueries in RETURNING expressions before processing
+    // (so SubqueryResult nodes are cloned into result_columns)
+    let mut returning_subqueries = vec![];
+    plan_subqueries_from_returning(
+        &mut program,
+        &mut returning_subqueries,
+        &mut table_references,
+        &mut returning,
+        resolver,
+        connection,
+    )?;
+
     // Process RETURNING clause using shared module
     let mut result_columns =
         process_returning_clause(&mut returning, &mut table_references, connection)?;
@@ -320,6 +375,26 @@ pub fn translate_insert(
         inserting_multiple_rows,
     )?;
 
+    // Emit subqueries for RETURNING clause (uncorrelated subqueries are evaluated once)
+    for subquery in returning_subqueries
+        .iter_mut()
+        .filter(|s| !s.has_been_evaluated())
+    {
+        let eval_at = subquery.get_eval_at(&[], Some(&table_references))?;
+        if eval_at != EvalAt::BeforeLoop {
+            continue;
+        }
+        let subquery_plan = subquery.consume_plan(EvalAt::BeforeLoop);
+
+        emit_non_from_clause_subquery(
+            &mut program,
+            resolver,
+            *subquery_plan,
+            &subquery.query_type,
+            subquery.correlated,
+        )?;
+    }
+
     let has_user_provided_rowid = insertion.key.is_provided_by_user();
 
     if ctx.table.has_autoincrement {
@@ -336,6 +411,7 @@ pub fn translate_insert(
         &btree_table,
     );
     let has_relevant_before_triggers = relevant_before_triggers.clone().count() > 0;
+
     if has_relevant_before_triggers {
         // Build NEW registers: for rowid alias columns, use the rowid register; otherwise use column register
         let new_registers: Vec<usize> = insertion
@@ -350,11 +426,33 @@ pub fn translate_insert(
             })
             .chain(std::iter::once(insertion.key_register()))
             .collect();
-        let trigger_ctx = TriggerContext::new(
-            btree_table.clone(),
-            Some(new_registers),
-            None, // No OLD for INSERT
-        );
+        // Determine the conflict resolution to propagate to triggers:
+        // 1. If there's already an override from UPSERT DO UPDATE context, use it (forces ABORT)
+        // 2. If the INSERT uses OR IGNORE, propagate IGNORE to trigger statements
+        //    (per SQLite semantics, OR IGNORE should apply to all statements in the trigger)
+        // 3. Otherwise, don't override (use statement's own conflict resolution)
+        let trigger_ctx = if let Some(override_conflict) = program.trigger_conflict_override {
+            TriggerContext::new_with_override_conflict(
+                btree_table.clone(),
+                Some(new_registers),
+                None, // No OLD for INSERT
+                override_conflict,
+            )
+        } else if matches!(ctx.on_conflict, ResolveType::Ignore) {
+            // Propagate OR IGNORE to trigger statements
+            TriggerContext::new_with_override_conflict(
+                btree_table.clone(),
+                Some(new_registers),
+                None, // No OLD for INSERT
+                ResolveType::Ignore,
+            )
+        } else {
+            TriggerContext::new(
+                btree_table.clone(),
+                Some(new_registers),
+                None, // No OLD for INSERT
+            )
+        };
         for trigger in relevant_before_triggers {
             fire_trigger(&mut program, resolver, trigger, &trigger_ctx, connection)?;
         }
@@ -521,8 +619,24 @@ pub fn translate_insert(
             })
             .chain(std::iter::once(insertion.key_register()))
             .collect();
-        let trigger_ctx_after =
-            TriggerContext::new(btree_table.clone(), Some(new_registers_after), None);
+        // Determine the conflict resolution to propagate to AFTER triggers (same logic as BEFORE)
+        let trigger_ctx_after = if let Some(override_conflict) = program.trigger_conflict_override {
+            TriggerContext::new_with_override_conflict(
+                btree_table.clone(),
+                Some(new_registers_after),
+                None,
+                override_conflict,
+            )
+        } else if matches!(ctx.on_conflict, ResolveType::Ignore) {
+            TriggerContext::new_with_override_conflict(
+                btree_table.clone(),
+                Some(new_registers_after),
+                None,
+                ResolveType::Ignore,
+            )
+        } else {
+            TriggerContext::new(btree_table.clone(), Some(new_registers_after), None)
+        };
         for trigger in relevant_after_triggers {
             fire_trigger(
                 &mut program,
@@ -695,6 +809,7 @@ fn emit_partial_index_check(
         return Ok(None);
     };
     let mut where_for_eval = where_clause.as_ref().clone();
+    rewrite_between_expr(&mut where_for_eval);
     rewrite_partial_index_where(&mut where_for_eval, insertion)?;
     let reg = program.alloc_register();
     translate_expr_no_constant_opt(
@@ -1123,6 +1238,25 @@ struct BoundInsertResult {
     inserting_multiple_rows: bool,
 }
 
+/// Check if an expression contains a subquery (Subquery, InSelect, or Exists).
+/// This is used to detect when single-row VALUES should be routed through the
+/// multi-row path which has proper subquery handling.
+fn expr_contains_subquery(expr: &Expr) -> bool {
+    use crate::translate::expr::{walk_expr, WalkControl};
+    let mut found_subquery = false;
+    let _ = walk_expr(expr, &mut |e| {
+        if matches!(
+            e,
+            Expr::Subquery(_) | Expr::InSelect { .. } | Expr::Exists(_)
+        ) {
+            found_subquery = true;
+            return Ok(WalkControl::SkipChildren);
+        }
+        Ok(WalkControl::Continue)
+    });
+    found_subquery
+}
+
 fn bind_insert(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
@@ -1157,35 +1291,45 @@ fn bind_insert(
                         if values_expr.is_empty() {
                             crate::bail_parse_error!("no values to insert");
                         }
-                        for expr in values_expr.iter_mut().flat_map(|v| v.iter_mut()) {
-                            match expr.as_mut() {
-                                Expr::Id(name) => {
-                                    if name.quoted_with('"') {
-                                        *expr =
-                                            Expr::Literal(ast::Literal::String(name.as_literal()))
-                                                .into();
-                                    } else {
-                                        // an INSERT INTO ... VALUES (...) cannot reference columns
-                                        crate::bail_parse_error!("no such column: {name}");
+                        // Check if any VALUES expression contains a subquery.
+                        // If so, route through multi-row path which handles subqueries.
+                        let has_subquery = values_expr
+                            .iter()
+                            .any(|row| row.iter().any(|expr| expr_contains_subquery(expr)));
+                        if has_subquery {
+                            inserting_multiple_rows = true;
+                        } else {
+                            for expr in values_expr.iter_mut().flat_map(|v| v.iter_mut()) {
+                                match expr.as_mut() {
+                                    Expr::Id(name) => {
+                                        if name.quoted_with('"') {
+                                            *expr = Expr::Literal(ast::Literal::String(
+                                                name.as_literal(),
+                                            ))
+                                            .into();
+                                        } else {
+                                            // an INSERT INTO ... VALUES (...) cannot reference columns
+                                            crate::bail_parse_error!("no such column: {name}");
+                                        }
                                     }
+                                    Expr::Qualified(first_name, second_name) => {
+                                        // an INSERT INTO ... VALUES (...) cannot reference columns
+                                        crate::bail_parse_error!(
+                                            "no such column: {first_name}.{second_name}"
+                                        );
+                                    }
+                                    _ => {}
                                 }
-                                Expr::Qualified(first_name, second_name) => {
-                                    // an INSERT INTO ... VALUES (...) cannot reference columns
-                                    crate::bail_parse_error!(
-                                        "no such column: {first_name}.{second_name}"
-                                    );
-                                }
-                                _ => {}
+                                bind_and_rewrite_expr(
+                                    expr,
+                                    None,
+                                    None,
+                                    connection,
+                                    BindingBehavior::ResultColumnsNotAllowed,
+                                )?;
                             }
-                            bind_and_rewrite_expr(
-                                expr,
-                                None,
-                                None,
-                                connection,
-                                BindingBehavior::ResultColumnsNotAllowed,
-                            )?;
+                            values = values_expr.pop().unwrap_or_else(Vec::new);
                         }
-                        values = values_expr.pop().unwrap_or_else(Vec::new);
                     }
                     _ => inserting_multiple_rows = true,
                 }
@@ -1195,22 +1339,15 @@ fn bind_insert(
             upsert = upsert_opt.take();
         }
     }
-    match on_conflict {
-        ResolveType::Ignore => {
-            program.set_resolve_type(ResolveType::Ignore);
-            upsert.replace(Box::new(ast::Upsert {
-                do_clause: UpsertDo::Nothing,
-                index: None,
-                next: None,
-            }));
-        }
-        ResolveType::Abort | ResolveType::Replace => {
-            // Abort is the default conflict resolution strategy for INSERT in SQLite,
-            // and we implement Replace.
-        }
-        _ => {
-            crate::bail_parse_error!("INSERT OR {} is not yet supported", on_conflict.to_string());
-        }
+    if let ResolveType::Ignore = on_conflict {
+        program.set_resolve_type(ResolveType::Ignore);
+        upsert.replace(Box::new(ast::Upsert {
+            do_clause: UpsertDo::Nothing,
+            index: None,
+            next: None,
+        }));
+    } else {
+        program.set_resolve_type(on_conflict);
     }
     while let Some(mut upsert_opt) = upsert.take() {
         if let UpsertDo::Set {
@@ -1304,7 +1441,10 @@ fn init_source_emission<'a>(
     let (num_values, cursor_id) = match body {
         InsertBody::Select(select, _) => {
             // Simple common case of INSERT INTO <table> VALUES (...) without compounds.
-            if select.body.compounds.is_empty()
+            // Note: values.is_empty() check ensures we use the multi-row path when
+            // single-row VALUES contains subqueries (values extraction was skipped).
+            if !values.is_empty()
+                && select.body.compounds.is_empty()
                 && matches!(&select.body.select, OneSelect::Values(values) if values.len() <= 1)
             {
                 (
@@ -2155,7 +2295,10 @@ fn emit_unique_index_check(
             record_reg,
             unpacked_start: Some(idx_start_reg),
             unpacked_count: Some((num_cols + 1) as u16),
-            flags: IdxInsertFlags::new().nchange(true),
+            // USE_SEEK: cursor was positioned by NoConflict above, skip redundant seek.
+            // Note: If record contains NULLs, NoConflict skips the seek entirely, so
+            // op_idx_insert must check for NULLs and fall back to seeking if found.
+            flags: IdxInsertFlags::new().nchange(true).use_seek(true),
         });
     }
     Ok(())

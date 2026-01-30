@@ -79,8 +79,9 @@ impl Display for SelectPlan {
         writeln!(f, "QUERY PLAN")?;
 
         // Print each table reference with appropriate indentation based on join depth
-        for (i, reference) in self.table_references.joined_tables().iter().enumerate() {
-            let is_last = i == self.table_references.joined_tables().len() - 1;
+        for (i, member) in self.join_order.iter().enumerate() {
+            let reference = &self.table_references.joined_tables()[member.original_idx];
+            let is_last = i == self.join_order.len() - 1;
             let indent = if i == 0 {
                 if is_last { "`--" } else { "|--" }.to_string()
             } else {
@@ -468,11 +469,8 @@ impl ToTokens for JoinedTable {
             }
             Table::FromClauseSubquery(from_clause_subquery) => {
                 s.append(TokenType::TK_LP, None)?;
-                // Could possibly merge the contexts together here
-                from_clause_subquery.plan.to_tokens(
-                    s,
-                    &PlanContext(&[&from_clause_subquery.plan.table_references]),
-                )?;
+                // Plan::to_tokens creates its own context internally, so we pass BlankContext here.
+                from_clause_subquery.plan.to_tokens(s, &BlankContext)?;
                 s.append(TokenType::TK_RP, None)?;
 
                 s.append(TokenType::TK_AS, None)?;

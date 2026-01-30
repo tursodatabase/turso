@@ -17,6 +17,7 @@ This document is a quick helper to get you going.
   - [Compatibility tests](#compatibility-tests)
     - [Prerequisites](#prerequisites)
     - [Running the tests](#running-the-tests)
+  - [SQL Test Runner](#sql-test-runner)
   - [TPC-H](#tpc-h)
   - [Deterministic simulation tests](#deterministic-simulation-tests)
     - [Whopper](#whopper)
@@ -44,14 +45,15 @@ Examples of contributing
 * [How to contribute a SQL function implementation](docs/contributing/contributing_functions.md)
 * [Rickrolling Turso DB](https://avi.im/blag/2025/rickrolling-turso)
 
-To build and run `tursodb` CLI: 
+To build and run `tursodb` CLI:
 
-```shell 
+```shell
 cargo run --package turso_cli --bin tursodb database.db
 ```
 
 Run tests:
 ```console
+cargo build -p turso_sqlite3 --features capi
 cargo test
 ```
 
@@ -113,7 +115,7 @@ sudo apt install python3.12 python3.12-dev
 ```console
 export PYO3_PYTHON=$(which python3)
 ```
-4. Build Cargo 
+4. Build Cargo
 ```console
 cargo build -p turso_sqlite3 --features capi
 ```
@@ -200,7 +202,7 @@ Fork the repository and open a pull request to submit your work.
 The CI checks for formatting, Clippy warnings, and test failures so remember to run the following before submitting your pull request:
 
 * `cargo fmt` and `cargo clippy --workspace --all-features --all-targets -- --deny=warnings` to keep the code formatting in check.
-* `make` to run the test suite.
+* `make test` to run the test suite.
 
 **Keep your pull requests focused and as small as possible, but not smaller.** IOW, when preparing a pull request, ensure it focuses on a single thing and that your commits align with that. For example, a good pull request might fix a specific bug or a group of related bugs. Or a good pull request might add a new feature and test for it. Conversely, a bad pull request might fix a bug, add a new feature, and refactor some code.
 
@@ -250,6 +252,19 @@ SQLITE_EXEC=sqlite3 SQLITE_FLAGS="" make test
 
 When working on a new feature, please consider adding a test case for it.
 
+## SQL Test Runner
+
+The `turso-test-runner` crate provides a dedicated test runner with a custom DSL for writing SQL tests.
+Tests should be added to `turso-test-runner/tests/` using the `.sqltest` format.
+
+To run tests:
+
+```console
+make -c turso-test-runner run
+```
+
+For full documentation on the DSL syntax and CLI usage, see the [turso-test-runner docs](turso-test-runner/docs/).
+
 ## TPC-H
 
 [TPC-H](https://www.tpc.org/tpch/) is a standard benchmark for testing database performance. To try out Turso's performance against a TPC-H compatible workload,
@@ -269,7 +284,7 @@ Whopper is a DST that, unlike `simulator`, performs concurrent query execution.
 To run Whopper for your local changes, run:
 
 ```console
-./whopper/bin/run
+./testing/concurrent-simulator/bin/run
 ```
 
 The output of the simulation run looks as follows:
@@ -306,19 +321,19 @@ This will do a short sanity check run in using the `fast` mode.
 If you need to reproduce a run, just defined the `SEED` environment variable as follows:
 
 ```console
-SEED=1234 ./whopper/bin/run
+SEED=1234 ./testing/concurrent-simulator/bin/run
 ```
 
 You can also run Whopper in exploration mode to find more serious bugs:
 
 ```console
-./whopper/bin/explore
+./testing/concurrent-simulator/bin/explore
 ```
 
 Note that exploration uses the `chaos` mode so if you need to reproduce a run, use:
 
 ```console
-SEED=1234 ./whopper/bin/run --mode chaos
+SEED=1234 ./testing/concurrent-simulator/bin/run --mode chaos
 ```
 
 Both `explore` and `run` accept the `--enable-checksums` and `--enable-encryption` flags for per page checksums and encryption respectively.
@@ -382,7 +397,7 @@ export ANTITHESIS_EMAIL=
 ```
 
 You can then publish a new Antithesis workflow with:
- 
+
 ```bash
 scripts/antithesis/publish-workload.sh
 ```

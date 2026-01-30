@@ -37,9 +37,8 @@ impl ReadRecord {
                                 "Found key {key:?} in aggregate storage but could not read record"
                             ))
                         })?;
-                        let values = r.get_values();
                         // The blob is in column 3: operator_id, zset_id, element_id, value, weight
-                        let blob = values[3].to_owned();
+                        let blob = r.get_value(3)?.to_owned();
 
                         let (state, _group_key) = match blob {
                             Value::Blob(blob) => AggregateState::from_blob(&blob),
@@ -151,10 +150,10 @@ impl WriteRow {
                                 "Found rowid in table but could not read record".to_string(),
                             )
                         })?;
-                        let values = r.get_values();
+                        let weight_opt = r.get_value_opt(4);
 
                         // Weight is always the last value (column 4 in our 5-column structure)
-                        let existing_weight = match values.get(4) {
+                        let existing_weight = match weight_opt {
                             Some(val) => match val.to_owned() {
                                 Value::Integer(w) => w as isize,
                                 _ => {

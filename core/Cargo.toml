@@ -35,6 +35,10 @@ encryption = []
 checksum = []
 cli_only = []
 test_helper = []
+bench = []
+fts = ["dep:tantivy"]
+codspeed = ["bench"]
+optimizer_params = ["serde", "dep:serde_json"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = { version = "0.7.5", optional = true }
@@ -47,6 +51,7 @@ libc = { version = "0.2.172" }
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 libloading = "0.8.6"
+tantivy = { version = "0.25.0", optional = true }
 
 [dependencies]
 antithesis_sdk = { workspace = true, optional = true }
@@ -65,7 +70,7 @@ libm = "0.2"
 turso_macros = { workspace = true }
 miette = { workspace = true }
 strum = { workspace = true }
-parking_lot = { workspace = true }
+parking_lot = { workspace = true, features = ["arc_lock"] }
 crossbeam-skiplist = "0.1.3"
 tracing = { workspace = true }
 ryu = "1.0.19"
@@ -73,6 +78,7 @@ uncased = "0.9.10"
 strum_macros = { workspace = true }
 bitflags = { workspace = true }
 serde = { workspace = true, optional = true, features = ["derive"] }
+serde_json = { workspace = true, optional = true }
 paste = "1.0.15"
 uuid = { version = "1.11.0", features = ["v4", "v5", "v7"], optional = true }
 tempfile = { workspace = true }
@@ -86,13 +92,20 @@ intrusive-collections = "0.9.7"
 roaring = "0.11.2"
 simsimd = "6.5.3"
 arc-swap = "1.7"
-bloom = "0.3.2"
 rustc-hash = "2.0"
 either = { workspace = true }
 tracing-subscriber.workspace = true
 rapidhash = "4.1.1"
 branches = { version = "0.4.3", default-features = false }
 bumpalo = { version = "3", features = ["collections"] }
+smallvec = "1.15.1"
+fastbloom = "0.14.1"
+
+[target.'cfg(loom)'.dependencies]
+loom = { workspace = true }
+
+[target.'cfg(shuttle)'.dependencies]
+shuttle = { workspace = true }
 
 # Use pure-rust for Android to avoid C cross-compilation issues
 [target.'cfg(target_os = "android")'.dependencies]
@@ -103,7 +116,7 @@ aegis = "0.9.5"
 
 [build-dependencies]
 chrono = { workspace = true, default-features = false }
-built = { version = "0.7.5", features = ["git2", "chrono"] }
+built = { version = "0.7.5", features = ["chrono"] }
 
 [target.'cfg(not(target_family = "windows"))'.dev-dependencies]
 pprof = { version = "0.14.0", features = ["criterion", "flamegraph"] }
@@ -111,6 +124,11 @@ pprof = { version = "0.14.0", features = ["criterion", "flamegraph"] }
 [dev-dependencies]
 memory-stats = "1.2.0"
 criterion = { workspace = true, features = [
+    "html_reports",
+    "async",
+    "async_futures",
+] }
+codspeed-criterion-compat = { workspace = true, features = [
     "html_reports",
     "async",
     "async_futures",
@@ -124,6 +142,9 @@ env_logger = { workspace = true }
 test-log = { version = "0.2.17", features = ["trace"] }
 sorted-vec = "0.8.6"
 mimalloc = { workspace = true, default-features = false }
+divan.workspace = true
+
+
 
 [[bench]]
 name = "benchmark"
@@ -139,4 +160,18 @@ harness = false
 
 [[bench]]
 name = "tpc_h_benchmark"
+harness = false
+
+[[bench]]
+name = "sql_functions"
+harness = false
+required-features = ["bench"]
+
+[[bench]]
+name = "hash_spill_benchmark"
+harness = false
+required-features = ["bench"]
+
+[[bench]]
+name = "write_perf_benchmark"
 harness = false

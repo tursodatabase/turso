@@ -16,7 +16,7 @@ from faker import Faker
 
 # for now, use debug for the debug assertions
 LIMBO_BIN = Path("./target/release/tursodb")
-DB_FILE = Path("testing/temp.db")
+DB_FILE = Path("testing/system/temp.db")
 
 SQLITE_BIN = "sqlite3"
 
@@ -81,7 +81,7 @@ def setup_temp_db() -> None:
     # make sure we start fresh, otherwise we could end up with
     # one having to checkpoint the others from the previous run
     cleanup_temp_db()
-    cmd = ["sqlite3", "testing/testing.db", ".clone testing/temp.db"]
+    cmd = ["sqlite3", "testing/system/testing.db", ".clone testing/system/temp.db"]
     proc = subprocess.run(cmd, check=True)
     proc.check_returncode()
     sleep(0.3)  # make sure it's finished

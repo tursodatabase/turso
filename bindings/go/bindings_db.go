@@ -108,6 +108,8 @@ type TursoDatabaseConfig struct {
 	// optional encryption parameters
 	// as encryption is experimental - ExperimentalFeatures must have "encryption" in the list
 	Encryption TursoDatabaseEncryptionOpts
+	// BusyTimeout in milliseconds (0 = no timeout, immediate SQLITE_BUSY)
+	BusyTimeout int
 }
 
 // define all necessary private C structs
@@ -162,6 +164,7 @@ var (
 	c_turso_statement_n_change               func(self TursoStatement) int64
 	c_turso_statement_column_count           func(self TursoStatement) int64
 	c_turso_statement_column_name            func(self TursoStatement, index uintptr) *byte
+	c_turso_statement_column_decltype        func(self TursoStatement, index uintptr) *byte
 	c_turso_statement_row_value_kind         func(self TursoStatement, index uintptr) int32
 	c_turso_statement_row_value_bytes_count  func(self TursoStatement, index uintptr) int64
 	c_turso_statement_row_value_bytes_ptr    func(self TursoStatement, index uintptr) *byte
@@ -201,6 +204,7 @@ func registerTursoDb(handle uintptr) error {
 	purego.RegisterLibFunc(&c_turso_statement_n_change, handle, "turso_statement_n_change")
 	purego.RegisterLibFunc(&c_turso_statement_column_count, handle, "turso_statement_column_count")
 	purego.RegisterLibFunc(&c_turso_statement_column_name, handle, "turso_statement_column_name")
+	purego.RegisterLibFunc(&c_turso_statement_column_decltype, handle, "turso_statement_column_decltype")
 	purego.RegisterLibFunc(&c_turso_statement_row_value_kind, handle, "turso_statement_row_value_kind")
 	purego.RegisterLibFunc(&c_turso_statement_row_value_bytes_count, handle, "turso_statement_row_value_bytes_count")
 	purego.RegisterLibFunc(&c_turso_statement_row_value_bytes_ptr, handle, "turso_statement_row_value_bytes_ptr")
@@ -541,6 +545,17 @@ func turso_statement_column_count(self TursoStatement) int64 {
 // The underlying C string is freed automatically.
 func turso_statement_column_name(self TursoStatement, index int) string {
 	ptr := c_turso_statement_column_name(self, uintptr(index))
+	return decodeAndFreeCString(ptr)
+}
+
+// turso_statement_column_decltype returns the column declared type at the index
+// (e.g. "INTEGER", "TEXT", "DATETIME", etc.). Returns empty string if not available.
+// The underlying C string is freed automatically.
+func turso_statement_column_decltype(self TursoStatement, index int) string {
+	ptr := c_turso_statement_column_decltype(self, uintptr(index))
+	if ptr == nil {
+		return ""
+	}
 	return decodeAndFreeCString(ptr)
 }
 

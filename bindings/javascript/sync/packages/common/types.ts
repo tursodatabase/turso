@@ -61,7 +61,10 @@ export interface EncryptionOpts {
     // base64 encoded encryption key (must be either 16 or 32 bytes depending on the cipher)
     key: string,
     // encryption cipher algorithm
-    cipher: 'aes256gcm' | 'aes128gcm' | 'chacha20poly1305' | 'aegis256'
+    // - aes256gcm, aes128gcm, chacha20poly1305: 28 reserved bytes
+    // - aegis128l, aegis128x2, aegis128x4: 32 reserved bytes
+    // - aegis256, aegis256x2, aegis256x4: 48 reserved bytes
+    cipher: 'aes256gcm' | 'aes128gcm' | 'chacha20poly1305' | 'aegis128l' | 'aegis128x2' | 'aegis128x4' | 'aegis256' | 'aegis256x2' | 'aegis256x4'
 }
 export interface DatabaseOpts {
     /**

@@ -16,6 +16,7 @@ A `.sqltest` file consists of:
 1. Database declarations (`@database`)
 2. Named setup blocks (`setup name { ... }`)
 3. Test cases (`test name { ... } expect { ... }`)
+4. Snapshot cases (`snapshot name { ... }`) - for capturing EXPLAIN output
 
 ```
 @database <db-spec>
@@ -34,6 +35,12 @@ test <name> {
 expect [modifier] {
     <expected-output>
 }
+
+# Snapshot tests (for EXPLAIN output)
+@setup <name>
+snapshot <name> {
+    <sql>
+}
 ```
 
 ## Database Declarations
@@ -45,6 +52,8 @@ Every file must have at least one `@database` declaration.
 ```
 @database :memory:
 @database :temp:
+@database :default:
+@database :default-no-rowidalias:
 @database path/to/file.db readonly
 ```
 
@@ -54,13 +63,30 @@ Every file must have at least one `@database` declaration.
 |------|-------------|
 | `:memory:` | Fresh in-memory database for each test |
 | `:temp:` | Fresh temporary file database for each test |
+| `:default:` | Pre-generated database with `INTEGER PRIMARY KEY` (rowid alias) |
+| `:default-no-rowidalias:` | Pre-generated database with `INT PRIMARY KEY` (no rowid alias) |
 | `path readonly` | Existing database opened in read-only mode |
+
+### Default Databases
+
+The `:default:` and `:default-no-rowidalias:` database types use pre-generated databases containing fake user and product data. These databases must be generated before running tests.
+
+- `:default:` - Uses `INTEGER PRIMARY KEY`, which creates a rowid alias (column is an alias for the internal rowid)
+- `:default-no-rowidalias:` - Uses `INT PRIMARY KEY`, which does NOT create a rowid alias (column is a regular integer with a unique constraint)
+
+Both databases contain:
+- `users` table: id, first_name, last_name, email, phone_number, address, city, state, zipcode, age
+- `products` table: id, name, price
+
+Database file locations:
+- `:default:` → `testing/database.db`
+- `:default-no-rowidalias:` → `testing/database-no-rowidalias.db`
 
 ### Rules
 
 1. **All databases in a file must be the same type:**
    - Writable (`:memory:`, `:temp:`) - can be mixed together
-   - Readonly (`path readonly`) - cannot mix with writable
+   - Readonly (`path readonly`, `:default:`, `:default-no-rowidalias:`) - cannot mix with writable
 
 2. **Multiple databases**: When multiple databases are declared, all tests run against each database.
 
@@ -74,6 +100,12 @@ Every file must have at least one `@database` declaration.
 # Readonly file - only readonly paths allowed
 @database testing/testing.db readonly
 @database testing/testing_small.db readonly
+
+# Default databases - pre-generated with fake data
+@database :default:
+
+# Default database without rowid alias
+@database :default-no-rowidalias:
 ```
 
 ## Setup Blocks
@@ -109,6 +141,41 @@ setup products {
 }
 ```
 
+## File-Level Directives
+
+These directives apply to all tests and snapshots in the file.
+
+### Syntax
+
+```
+@skip-file "reason"
+@skip-file-if <condition> "reason"
+@requires-file <capability> "reason"
+```
+
+### Directives
+
+| Directive | Description |
+|-----------|-------------|
+| `@skip-file "reason"` | Skip all tests in the file unconditionally |
+| `@skip-file-if <condition> "reason"` | Skip all tests conditionally (e.g., `mvcc`) |
+| `@requires-file <capability> "reason"` | Require capability for all tests (e.g., `trigger`) |
+
+### Example
+
+```sql
+@database :memory:
+@skip-file-if mvcc "MVCC not supported for this file"
+@requires-file trigger "all tests need trigger support"
+
+test example {
+    SELECT 1;
+}
+expect {
+    1
+}
+```
+
 ## Test Cases
 
 ### Basic Syntax
@@ -129,7 +196,28 @@ Decorators appear before the `test` keyword:
 | Decorator | Description |
 |-----------|-------------|
 | `@setup <name>` | Apply a named setup before the test (can be repeated) |
-| `@skip "reason"` | Skip this test with the given reason |
+| `@skip "reason"` | Skip this test unconditionally with the given reason |
+| `@skip-if <condition> "reason"` | Skip this test conditionally based on runtime configuration |
+| `@backend <name>` | Only run this test on the specified backend (`rust`, `cli`, `js`) |
+| `@requires <capability> "reason"` | Only run if the backend supports the capability |
+
+#### Skip Conditions
+
+The `@skip-if` decorator supports the following conditions:
+
+| Condition | Description |
+|-----------|-------------|
+| `mvcc` | Skip when MVCC mode is enabled (`--mvcc` flag) |
+
+#### Capabilities
+
+The `@requires` decorator supports the following capabilities:
+
+| Capability | Description |
+|------------|-------------|
+| `trigger` | Backend supports `CREATE TRIGGER` |
+| `strict` | Backend supports `STRICT` tables |
+| `materialized_views` | Backend supports materialized views (experimental) |
 
 ### Expect Modifiers
 
@@ -217,7 +305,7 @@ expect unordered {
     Alice
 }
 
-# Skipped test
+# Skipped test (unconditional)
 @skip "known bug #123"
 test select-buggy-feature {
     SELECT buggy();
@@ -225,21 +313,145 @@ test select-buggy-feature {
 expect {
     result
 }
+
+# Conditionally skipped test (only skipped in MVCC mode)
+@skip-if mvcc "total_changes not supported in MVCC mode"
+test total-changes {
+    CREATE TABLE t (id INTEGER PRIMARY KEY);
+    INSERT INTO t VALUES (1), (2), (3);
+    SELECT total_changes();
+}
+expect {
+    3
+}
+
+# Backend-specific test (only runs with CLI backend)
+@backend cli
+test cli-specific-feature {
+    SELECT sqlite_version();
+}
+expect pattern {
+    ^3\.\d+\.\d+$
+}
+
+# Backend-specific test (only runs with Rust backend)
+@backend rust
+test rust-specific-feature {
+    SELECT 'rust-only';
+}
+expect {
+    rust-only
+}
+
+# Test requiring a specific capability
+@requires trigger "this test uses triggers"
+test trigger-test {
+    CREATE TABLE t (id INTEGER PRIMARY KEY);
+    CREATE TRIGGER tr AFTER INSERT ON t BEGIN SELECT 1; END;
+    INSERT INTO t VALUES (1);
+    SELECT 'triggered';
+}
+expect {
+    triggered
+}
 ```
+
+## Snapshot Cases
+
+Snapshot tests capture the `EXPLAIN QUERY PLAN` and `EXPLAIN` (bytecode) output of a SQL query. They are used to detect changes in query execution plans over time.
+
+> **Note:** Snapshot tests only run on the **Rust backend**. Other backends skip snapshot tests automatically.
+
+### Basic Syntax
+
+```
+snapshot <name> {
+    <sql>
+}
+```
+
+Unlike regular tests, snapshot cases do not have an `expect` block. Instead, the expected output is stored in a `.snap` file that is automatically managed.
+
+### Snapshot Decorators
+
+Snapshots support all the same decorators as tests:
+
+| Decorator | Description |
+|-----------|-------------|
+| `@setup <name>` | Apply a named setup before the snapshot (can be repeated) |
+| `@skip "reason"` | Skip this snapshot unconditionally |
+| `@skip-if <condition> "reason"` | Skip this snapshot conditionally |
+| `@backend <name>` | Only run this snapshot on the specified backend (snapshots only run on `rust`) |
+| `@requires <capability> "reason"` | Only run if the backend supports the capability |
+
+### Snapshot File Location
+
+Snapshot files are stored in a `snapshots/` directory adjacent to the test file:
+
+```
+tests/
+  my-tests.sqltest
+  snapshots/
+    my-tests__query-plan-name.snap
+```
+
+The naming convention is: `{test-file-stem}__{snapshot-name}.snap`
+
+### Example
+
+```sql
+@database :memory:
+
+setup schema {
+    CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);
+    CREATE INDEX idx_users_name ON users(name);
+}
+
+setup data {
+    INSERT INTO users VALUES (1, 'Alice'), (2, 'Bob');
+}
+
+# Snapshot captures EXPLAIN QUERY PLAN + EXPLAIN output
+@setup schema
+@setup data
+snapshot query-plan-by-id {
+    SELECT * FROM users WHERE id = 1;
+}
+
+@setup schema
+@setup data
+snapshot query-plan-by-name {
+    SELECT * FROM users WHERE name = 'Alice';
+}
+```
+
+For detailed information about working with snapshots (update modes, commands, CI integration), see [Snapshot Testing Guide](./snapshot-testing.md).
 
 ## Grammar (EBNF-like)
 
 ```ebnf
-file            = { database_decl | setup_block | test_case }
+file            = { file_directive | database_decl | setup_block | test_case | snapshot_case }
+
+file_directive  = "@skip-file" STRING NEWLINE
+                | "@skip-file-if" skip_condition STRING NEWLINE
+                | "@requires-file" capability STRING NEWLINE
 
 database_decl   = "@database" database_spec NEWLINE
-database_spec   = ":memory:" | ":temp:" | PATH ["readonly"]
+database_spec   = ":memory:" | ":temp:" | ":default:" | ":default-no-rowidalias:" | PATH ["readonly"]
 
 setup_block     = "setup" IDENTIFIER block
 test_case       = { decorator } "test" IDENTIFIER block expect_block
+snapshot_case   = { decorator } "snapshot" IDENTIFIER block
 
 decorator       = "@setup" IDENTIFIER NEWLINE
                 | "@skip" STRING NEWLINE
+                | "@skip-if" skip_condition STRING NEWLINE
+                | "@backend" IDENTIFIER NEWLINE
+                | "@requires" capability STRING NEWLINE
+
+skip_condition  = "mvcc"
+
+capability      = "trigger" | "strict" | "materialized_views"
 
 expect_block    = "expect" [expect_modifier] block
 
@@ -267,6 +479,13 @@ NEWLINE         = '\n'
 1. Test names must be unique within a file
 2. Setup names in `@setup` decorators must reference defined setups
 3. SQL must end with semicolon
+
+### Snapshot-Level Validation
+
+1. Snapshot names must be unique within a file
+2. Snapshot names must not conflict with test names
+3. Setup names in `@setup` decorators must reference defined setups
+4. SQL must contain exactly one statement (semicolons in strings and comments are ignored)
 
 ## Execution Model
 
@@ -337,9 +556,11 @@ The lexer uses the [Logos](https://docs.rs/logos) crate (v0.16) for tokenization
 - **Block content extraction**: When `{` is encountered, a custom callback extracts all content until the matching `}`, handling nested braces. This allows arbitrary SQL and expected output without special escaping.
 
 - **Tokens**: The lexer produces these token types:
-  - Keywords: `@database`, `@setup`, `@skip`, `setup`, `test`, `expect`
-  - Modifiers: `error`, `pattern`, `unordered`, `readonly`
-  - Database types: `:memory:`, `:temp:`
+  - Keywords: `@database`, `@setup`, `@skip`, `@skip-if`, `@skip-file`, `@skip-file-if`, `@requires`, `@requires-file`, `@backend`, `setup`, `test`, `expect`, `snapshot`
+  - Modifiers: `error`, `pattern`, `unordered`, `readonly`, `raw`
+  - Skip conditions: `mvcc`
+  - Capabilities: `trigger`, `strict`, `materialized_views`
+  - Database types: `:memory:`, `:temp:`, `:default:`, `:default-no-rowidalias:`
   - Block content: `{...}` (content between braces)
   - Identifiers, strings, paths, comments, newlines
 
@@ -359,14 +580,55 @@ pub struct TestFile {
     pub databases: Vec<DatabaseConfig>,
     pub setups: HashMap<String, String>,
     pub tests: Vec<TestCase>,
+    pub snapshots: Vec<SnapshotCase>,
+    pub global_skip: Option<Skip>,        // @skip-file / @skip-file-if
+    pub global_requires: Vec<Requirement>, // @requires-file
 }
 
 pub struct TestCase {
     pub name: String,
     pub sql: String,
-    pub expectation: Expectation,
-    pub setups: Vec<String>,
-    pub skip: Option<String>,
+    pub expectations: Expectations,
+    pub modifiers: CaseModifiers,
+}
+
+pub struct SnapshotCase {
+    pub name: String,
+    pub sql: String,
+    pub modifiers: CaseModifiers,
+}
+
+pub struct CaseModifiers {
+    pub setups: Vec<SetupRef>,
+    pub skip: Option<Skip>,
+    pub backend: Option<Backend>,
+    pub requires: Vec<Requirement>,
+}
+
+pub struct Skip {
+    pub reason: String,
+    pub condition: Option<SkipCondition>,
+}
+
+pub enum SkipCondition {
+    Mvcc,  // Skip when MVCC mode is enabled
+}
+
+pub enum Capability {
+    Trigger,           // CREATE TRIGGER support
+    Strict,            // STRICT tables support
+    MaterializedViews, // Materialized views (experimental)
+}
+
+pub struct Requirement {
+    pub capability: Capability,
+    pub reason: String,
+}
+
+pub enum Backend {
+    Rust,
+    Cli,
+    Js,
 }
 
 pub enum Expectation {

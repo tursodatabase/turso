@@ -9,11 +9,11 @@
 //! from SQL AST nodes.
 use crate::function::AggFunc;
 use crate::schema::{Schema, Type};
+use crate::sync::Arc;
 use crate::types::Value;
 use crate::{LimboError, Result};
-use std::collections::HashMap;
+use rustc_hash::FxHashMap as HashMap;
 use std::fmt::{self, Display, Formatter};
-use std::sync::Arc;
 use turso_macros::match_ignore_ascii_case;
 use turso_parser::ast;
 
@@ -415,7 +415,7 @@ impl<'a> LogicalPlanBuilder<'a> {
     pub fn new(schema: &'a Schema) -> Self {
         Self {
             schema,
-            ctes: HashMap::new(),
+            ctes: HashMap::default(),
         }
     }
 
@@ -450,7 +450,7 @@ impl<'a> LogicalPlanBuilder<'a> {
 
     // Build WITH CTE
     fn build_with_cte(&mut self, with: &ast::With, select: &ast::Select) -> Result<LogicalPlan> {
-        let mut cte_plans = HashMap::new();
+        let mut cte_plans = HashMap::default();
 
         // Build each CTE
         for cte in &with.ctes {
@@ -1158,7 +1158,7 @@ impl<'a> LogicalPlanBuilder<'a> {
         // and a vector of SELECT expressions for positional references
         // This allows GROUP BY to reference SELECT aliases (e.g., GROUP BY year)
         // or positions (e.g., GROUP BY 1)
-        let mut alias_to_expr = HashMap::new();
+        let mut alias_to_expr = HashMap::default();
         let mut select_exprs = Vec::new();
         for col in columns {
             if let ast::ResultColumn::Expr(expr, alias) = col {
@@ -1244,7 +1244,7 @@ impl<'a> LogicalPlanBuilder<'a> {
         }
 
         // Track aggregates we've already seen to avoid duplicates
-        let mut aggregate_map: HashMap<String, String> = HashMap::new();
+        let mut aggregate_map: HashMap<String, String> = HashMap::default();
 
         for col in columns {
             match col {
@@ -1723,6 +1723,28 @@ impl<'a> LogicalPlanBuilder<'a> {
                         args: vec![],
                         distinct: false,
                     })
+                } else if let Ok(func) = crate::function::Func::resolve_function(&func_name, 0) {
+                    // Check if this function supports star expansion (e.g., json_object, jsonb_object)
+                    if func.needs_star_expansion() {
+                        // Expand * to all columns as alternating key-value pairs
+                        let mut args = Vec::new();
+                        for col in &_schema.columns {
+                            // Add column name as string literal
+                            args.push(LogicalExpr::Literal(crate::types::Value::Text(
+                                col.name.clone().into(),
+                            )));
+                            // Add column reference
+                            args.push(LogicalExpr::Column(Column::new(col.name.clone())));
+                        }
+                        Ok(LogicalExpr::ScalarFunction {
+                            fun: func_name,
+                            args,
+                        })
+                    } else {
+                        Err(LimboError::ParseError(format!(
+                            "Function {func_name}(*) is not supported"
+                        )))
+                    }
                 } else {
                     Err(LimboError::ParseError(format!(
                         "Function {func_name}(*) is not supported"
@@ -1884,6 +1906,8 @@ impl<'a> LogicalPlanBuilder<'a> {
     fn build_literal(lit: &ast::Literal) -> Result<Value> {
         match lit {
             ast::Literal::Null => Ok(Value::Null),
+            ast::Literal::True => Ok(Value::Integer(1)),
+            ast::Literal::False => Ok(Value::Integer(0)),
             ast::Literal::Keyword(k) => {
                 let k_bytes = k.as_bytes();
                 match_ignore_ascii_case!(match k_bytes {

@@ -32,7 +32,7 @@ impl std::str::FromStr for Format {
         match s.to_lowercase().as_str() {
             "pretty" => Ok(Format::Pretty),
             "json" => Ok(Format::Json),
-            _ => Err(format!("unknown output format: {}", s)),
+            _ => Err(format!("unknown output format: {s}")),
         }
     }
 }
@@ -52,5 +52,8 @@ pub fn outcome_symbol(outcome: &TestOutcome) -> &'static str {
         TestOutcome::Failed { .. } => "FAIL",
         TestOutcome::Skipped { .. } => "SKIP",
         TestOutcome::Error { .. } => "ERROR",
+        TestOutcome::SnapshotNew { .. } => "NEW",
+        TestOutcome::SnapshotUpdated { .. } => "UPDATED",
+        TestOutcome::SnapshotMismatch { .. } => "MISMATCH",
     }
 }

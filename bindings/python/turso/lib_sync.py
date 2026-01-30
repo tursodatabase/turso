@@ -22,6 +22,9 @@ from ._turso import (
     PyTursoSyncIoItemRequestKind,
     py_turso_sync_new,
 )
+from ._turso import (
+    PyRemoteEncryptionCipher as RemoteEncryptionCipher,
+)
 from .lib import Connection as _Connection
 from .lib import _map_turso_exception
 
@@ -415,6 +418,8 @@ def connect_sync(
     partial_sync_experimental: Optional[PartialSyncOpts] = None,
     experimental_features: Optional[str] = None,
     isolation_level: Optional[str] = "DEFERRED",
+    remote_encryption_key: Optional[str] = None,
+    remote_encryption_cipher: Optional[RemoteEncryptionCipher] = None,
 ) -> ConnectionSync:
     """
     Create and open a synchronized database connection.
@@ -427,6 +432,8 @@ def connect_sync(
     - bootstrap_if_empty: if True and db empty, bootstrap from remote during create()
     - partial_sync_experimental: EXPERIMENTAL partial sync configuration
     - experimental_features, isolation_level: passed to underlying connection
+    - remote_encryption_key: base64-encoded encryption key for encrypted Turso Cloud databases
+    - remote_encryption_cipher: encryption cipher for the remote database (used to calculate reserved_bytes)
     """
     # Resolve client name
     cname = client_name or "turso-sync-py"
@@ -438,7 +445,6 @@ def connect_sync(
     db_cfg = PyTursoDatabaseConfig(
         path=path,
         experimental_features=experimental_features,
-        async_io=True,
     )
 
     # Sync config with optional partial bootstrap strategy
@@ -468,6 +474,8 @@ def connect_sync(
         )
         if partial_sync_experimental is not None
         else None,
+        remote_encryption_key=remote_encryption_key,
+        remote_encryption_cipher=remote_encryption_cipher,
     )
 
     # Create sync database holder

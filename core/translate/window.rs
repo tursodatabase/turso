@@ -1,4 +1,5 @@
 use crate::schema::{BTreeTable, Table};
+use crate::sync::Arc;
 use crate::translate::aggregation::{translate_aggregation_step, AggArgumentSource};
 use crate::translate::collate::{get_collseq_from_expr, CollationSeq};
 use crate::translate::emitter::{Resolver, TranslateCtx};
@@ -19,7 +20,6 @@ use crate::vdbe::insn::{
 use crate::vdbe::{BranchOffset, CursorID};
 use crate::Result;
 use std::mem;
-use std::sync::Arc;
 use turso_parser::ast::Name;
 use turso_parser::ast::{Expr, FunctionTail, Literal, Over, SortOrder, TableInternalId};
 

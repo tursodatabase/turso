@@ -6,7 +6,7 @@ use crate::text_parser;
 pub fn braced<'a>() -> text_parser!('a, String) {
     recursive(|braced| {
         choice((
-            braced.map(|s: String| format!("{{{}}}", s)),
+            braced.map(|s: String| format!("{{{s}}}")),
             none_of("{}").map(|c: char| c.to_string()),
         ))
         .repeated()
@@ -29,7 +29,7 @@ pub fn arg<'a>() -> text_parser!('a, String) {
     choice((braced(), word()))
 }
 
-/// Parser for comment lines
+/// Parser for comment lines (excludes shebangs like #!/...)
 pub fn comment<'a>() -> text_parser!('a, &'a str) {
     just('#').then(none_of('\n').repeated()).to_slice()
 }
@@ -54,7 +54,7 @@ pub fn hspace<'a>() -> text_parser!('a, ()) {
 /// Horizontal whitespace only (no newlines)
 pub fn hpad<'a, T>(p: text_parser!('a, T)) -> text_parser!('a, T) {
     let hspace = one_of(" \t").repeated();
-    hspace.clone().ignore_then(p).then_ignore(hspace)
+    hspace.ignore_then(p).then_ignore(hspace)
 }
 
 /// Clean up a test name (remove quotes, convert invalid chars)
@@ -89,7 +89,7 @@ pub fn clean_name(s: &str) -> String {
         .map(|c| c.is_ascii_digit())
         .unwrap_or(false)
     {
-        result = format!("test-{}", result);
+        result = format!("test-{result}");
     }
 
     result
@@ -377,7 +377,7 @@ mod tests {
         // hspace should NOT consume newlines
         let (_, errs) = hspace().parse("  \n").into_output_errors();
         // Parser succeeds but stops before newline
-        assert!(errs.is_empty() || errs.iter().any(|e| format!("{:?}", e).contains("\\n")));
+        assert!(errs.is_empty() || errs.iter().any(|e| format!("{e:?}").contains("\\n")));
     }
 
     // ==================== clean_name() tests ====================

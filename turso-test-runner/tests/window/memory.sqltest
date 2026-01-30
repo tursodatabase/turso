@@ -1,0 +1,30 @@
+@database :memory:
+
+test window-collate-partition-by {
+    CREATE TABLE fruits(name collate nocase);
+    INSERT INTO fruits(name) VALUES ('Apple'), ('banana'), ('apple');
+    SELECT
+    name,
+    count(*) OVER (PARTITION BY name)
+    FROM fruits;
+}
+expect {
+    Apple|2
+    apple|2
+    banana|1
+}
+
+test window-collate-order-by {
+    CREATE TABLE fruits(name collate nocase);
+    INSERT INTO fruits(name) VALUES ('Apple'),('banana'), ('apple');
+    SELECT
+    name,
+    count(*) OVER (ORDER BY name)
+    FROM fruits;
+}
+expect {
+    Apple|2
+    apple|2
+    banana|3
+}
+

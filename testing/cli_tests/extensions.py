@@ -729,7 +729,7 @@ def test_vfs():
     turso.run_test_fn(".vfslist", lambda x: "testvfs" not in x, "testvfs not loaded")
     turso.execute_dot(f".load {ext_path}")
     turso.run_test_fn(".vfslist", lambda res: "testvfs" in res, "testvfs extension loaded")
-    turso.execute_dot(".open testing/vfs.db testvfs")
+    turso.execute_dot(".open testing/system/vfs.db testvfs")
     turso.execute_dot("create table test (id integer primary key, value float);")
     turso.execute_dot("create table vfs (id integer primary key, value blob);")
     for i in range(50):
@@ -753,11 +753,11 @@ def test_sqlite_vfs_compat():
     sqlite = TestTursoShell(
         init_commands="",
         exec_name="sqlite3",
-        flags="testing/vfs.db",
+        flags="testing/system/vfs.db",
     )
     sqlite.run_test_fn(
         ".show",
-        lambda res: "filename: testing/vfs.db" in res,
+        lambda res: "filename: testing/system/vfs.db" in res,
         "Opened db file created with vfs extension in sqlite3",
     )
     sqlite.run_test_fn(
@@ -785,7 +785,7 @@ def test_csv():
     test_module_list(turso, "target/debug/liblimbo_csv", "csv")
 
     turso.run_test_fn(
-        "CREATE VIRTUAL TABLE temp.csv USING csv(filename=./testing/test_files/test.csv);",
+        "CREATE VIRTUAL TABLE temp.csv USING csv(filename=./testing/cli_tests/test_files/test.csv);",
         null,
         "Create virtual table from CSV file",
     )
@@ -854,10 +854,10 @@ def test_csv():
 
 
 def cleanup():
-    if os.path.exists("testing/vfs.db"):
-        os.remove("testing/vfs.db")
-    if os.path.exists("testing/vfs.db-wal"):
-        os.remove("testing/vfs.db-wal")
+    if os.path.exists("testing/system/vfs.db"):
+        os.remove("testing/system/vfs.db")
+    if os.path.exists("testing/system/vfs.db-wal"):
+        os.remove("testing/system/vfs.db-wal")
 
 
 def test_tablestats():

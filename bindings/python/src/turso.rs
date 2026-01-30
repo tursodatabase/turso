@@ -18,6 +18,12 @@ pub enum PyTursoStatusCode {
     Io = 3,
 }
 create_exception!(turso, Busy, PyException, "database is locked");
+create_exception!(
+    turso,
+    BusySnapshot,
+    PyException,
+    "database snapshot is stale"
+);
 create_exception!(turso, Interrupt, PyException, "interrupted");
 create_exception!(turso, Error, PyException, "generic error");
 create_exception!(turso, Misuse, PyException, "API misuse");
@@ -31,6 +37,7 @@ create_exception!(turso, IoError, PyException, "I/O error");
 pub(crate) fn turso_error_to_py_err(err: TursoError) -> PyErr {
     match err {
         rsapi::TursoError::Busy(message) => Busy::new_err(message),
+        rsapi::TursoError::BusySnapshot(message) => BusySnapshot::new_err(message),
         rsapi::TursoError::Interrupt(message) => Interrupt::new_err(message),
         rsapi::TursoError::Error(message) => Error::new_err(message),
         rsapi::TursoError::Misuse(message) => Misuse::new_err(message),
@@ -114,10 +121,6 @@ pub struct PyTursoDatabaseConfig {
     /// this field is intentionally just a string in order to make enablement of experimental features as flexible as possible
     pub experimental_features: Option<String>,
 
-    /// if true, library methods will return Io status code and delegate Io loop to the caller
-    /// if false, library will spin IO itself in case of Io status code and never return it to the caller
-    pub async_io: bool,
-
     /// optional VFS parameter explicitly specifying FS backend for the database.
     /// Available options are:
     /// - "memory": in-memory backend
@@ -133,18 +136,16 @@ pub struct PyTursoDatabaseConfig {
 #[pymethods]
 impl PyTursoDatabaseConfig {
     #[new]
-    #[pyo3(signature = (path, experimental_features=None, async_io=false, vfs=None, encryption=None))]
+    #[pyo3(signature = (path, experimental_features=None, vfs=None, encryption=None))]
     fn new(
         path: String,
         experimental_features: Option<String>,
-        async_io: bool,
         vfs: Option<String>,
         encryption: Option<&PyTursoEncryptionConfig>,
     ) -> Self {
         Self {
             path,
             experimental_features,
-            async_io,
             vfs,
             encryption: encryption.cloned(),
         }
@@ -191,7 +192,7 @@ pub fn py_turso_database_open(config: &PyTursoDatabaseConfig) -> PyResult<PyTurs
     let database = rsapi::TursoDatabase::new(rsapi::TursoDatabaseConfig {
         path: config.path.clone(),
         experimental_features: config.experimental_features.clone(),
-        async_io: config.async_io,
+        async_io: false,
         encryption: config.encryption.as_ref().map(|encryption| EncryptionOpts {
             cipher: encryption.cipher.clone(),
             hexkey: encryption.hexkey.clone(),
@@ -200,7 +201,9 @@ pub fn py_turso_database_open(config: &PyTursoDatabaseConfig) -> PyResult<PyTurs
         io: None,
         db_file: None,
     });
-    database.open().map_err(turso_error_to_py_err)?;
+    let result = database.open().map_err(turso_error_to_py_err)?;
+    // async_io is false - so db.open() will return result immediately
+    assert!(!result.is_io());
     Ok(PyTursoDatabase { database })
 }
 

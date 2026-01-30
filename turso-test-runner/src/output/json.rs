@@ -62,6 +62,11 @@ impl OutputFormat for JsonOutput {
             TestOutcome::Failed { reason } => ("failed".to_string(), Some(reason.clone())),
             TestOutcome::Skipped { reason } => ("skipped".to_string(), Some(reason.clone())),
             TestOutcome::Error { message } => ("error".to_string(), Some(message.clone())),
+            TestOutcome::SnapshotNew { .. } => ("snapshot_new".to_string(), None),
+            TestOutcome::SnapshotUpdated { .. } => ("snapshot_updated".to_string(), None),
+            TestOutcome::SnapshotMismatch { diff, .. } => {
+                ("snapshot_mismatch".to_string(), Some(diff.clone()))
+            }
         };
 
         let json_result = JsonTestResult {
@@ -112,8 +117,8 @@ impl OutputFormat for JsonOutput {
 
         // Output the JSON
         match serde_json::to_string_pretty(&report) {
-            Ok(json) => println!("{}", json),
-            Err(e) => eprintln!("Error serializing JSON: {}", e),
+            Ok(json) => println!("{json}"),
+            Err(e) => eprintln!("Error serializing JSON: {e}"),
         }
     }
 

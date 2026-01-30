@@ -40,11 +40,8 @@ impl Table {
         }
 
         // Generate additional columns to reach target size
-        for col in std::iter::repeat_with(|| Column::arbitrary(rng, context)) {
-            column_set.insert(col);
-            if column_set.len() >= target_column_size {
-                break;
-            }
+        while column_set.len() < target_column_size {
+            column_set.insert(Column::arbitrary(rng, context));
         }
 
         Table {
@@ -67,10 +64,17 @@ impl Arbitrary for Column {
     fn arbitrary<R: Rng + ?Sized, C: GenerationContext>(rng: &mut R, context: &C) -> Self {
         let name = Name::arbitrary(rng, context).0;
         let column_type = ColumnType::arbitrary(rng, context);
+
+        let constraints = if rng.random_bool(0.1) {
+            vec![turso_parser::ast::ColumnConstraint::Unique(None)]
+        } else {
+            vec![]
+        };
+
         Self {
             name,
             column_type,
-            constraints: vec![], // TODO: later implement arbitrary here for ColumnConstraint
+            constraints,
         }
     }
 }

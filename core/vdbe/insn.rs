@@ -11,6 +11,7 @@ pub fn to_u16(v: usize) -> u16 {
 }
 
 use super::{execute, AggFunc, BranchOffset, CursorID, FuncCtx, InsnFunction, PageIdx};
+use crate::sync::RwLock;
 use crate::{
     schema::{BTreeTable, Column, Index},
     storage::{pager::CreateBTreeFlags, wal::CheckpointMode},
@@ -19,11 +20,46 @@ use crate::{
     vdbe::affinity::Affinity,
     Statement, Value,
 };
-use parking_lot::RwLock;
 use strum::EnumCount;
 use strum_macros::{EnumDiscriminants, FromRepr, VariantArray};
 use turso_macros::Description;
 use turso_parser::ast::SortOrder;
+
+/// Metadata for a table during integrity check, used for constraint validation.
+#[derive(Debug, Clone)]
+pub struct IntegrityCheckTable {
+    /// Table name (for error messages)
+    pub name: String,
+    /// Root page of the table's B-tree
+    pub root_page: i64,
+    /// Indexes on this table
+    pub indexes: Vec<IntegrityCheckIndex>,
+    /// Columns with NOT NULL constraint (column index, column name)
+    pub not_null_columns: Vec<(usize, String)>,
+    /// Position of INTEGER PRIMARY KEY column if it exists (rowid alias).
+    /// This column's value is stored as NULL in the record; the rowid should be used instead.
+    pub rowid_alias_column_pos: Option<usize>,
+}
+
+/// Metadata for an index during integrity check.
+#[derive(Debug, Clone)]
+pub struct IntegrityCheckIndex {
+    /// Index name (for error messages)
+    pub name: String,
+    /// Root page of the index's B-tree
+    pub root_page: i64,
+    /// Whether this is a UNIQUE index
+    pub unique: bool,
+    /// Column positions in the table (for building index keys from table rows)
+    pub column_positions: Vec<usize>,
+    /// Starting register containing default values for indexed columns.
+    /// Used for columns added via ALTER TABLE ADD COLUMN with DEFAULT - old rows
+    /// don't physically have these columns, so we use these pre-evaluated defaults.
+    /// The registers are contiguous: [default_values_start_reg..default_values_start_reg + column_positions.len())
+    pub default_values_start_reg: usize,
+    /// Index info for cursor operations (sort order, collation, etc)
+    pub index_info: std::sync::Arc<crate::types::IndexInfo>,
+}
 
 /// Flags provided to comparison instructions (e.g. Eq, Ne) which determine behavior related to NULL values.
 #[derive(Clone, Copy, Debug, Default)]
@@ -169,7 +205,7 @@ impl<T: Copy + std::fmt::Display> std::fmt::Display for RegisterOrLiteral<T> {
 }
 
 /// Data for HashBuild instruction (boxed to keep Insn small).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct HashBuildData {
     pub cursor_id: CursorID,
     pub key_start_reg: usize,
@@ -184,9 +220,19 @@ pub struct HashBuildData {
     pub num_payload: usize,
 }
 
+/// Data for HashDistinct instruction (boxed to keep Insn small).
+#[derive(Debug, Clone)]
+pub struct HashDistinctData {
+    pub hash_table_id: usize,
+    pub key_start_reg: usize,
+    pub num_keys: usize,
+    pub collations: Vec<CollationSeq>,
+    pub target_pc: BranchOffset,
+}
+
 // There are currently 190 opcodes in sqlite
 #[repr(u8)]
-#[derive(Description, Debug, EnumDiscriminants)]
+#[derive(Description, Debug, Clone, EnumDiscriminants)]
 #[strum_discriminants(vis(pub(crate)))]
 #[strum_discriminants(derive(VariantArray, EnumCount, FromRepr))]
 #[strum_discriminants(name(InsnVariants))]
@@ -985,6 +1031,11 @@ pub enum Insn {
         db: usize,
         cursor_id: CursorID,
     },
+    /// Optimize custom index method (calls [crate::index_method::IndexMethodCursor::optimize] under the hood)
+    IndexMethodOptimize {
+        db: usize,
+        cursor_id: CursorID,
+    },
     /// Query custom index method (call [crate::index_method::IndexMethodCursor::query_start] under the hood)
     IndexMethodQuery {
         db: usize,
@@ -1128,6 +1179,23 @@ pub enum Insn {
         reg: usize,
         dest: usize,
     },
+    /// Interpret the value in register `reg` as a boolean and store in `dest`.
+    /// Used to implement IS TRUE, IS FALSE, IS NOT TRUE, IS NOT FALSE.
+    ///
+    /// A value is considered "true" if it is a non-zero number.
+    /// Strings, blobs, and zero are "false". NULL is handled specially.
+    ///
+    /// - If reg is NULL, store `null_value` in dest
+    /// - Otherwise, store 1 if the value is a non-zero number, 0 otherwise
+    /// - If `invert` is true, invert the result (0↔1)
+    IsTrue {
+        reg: usize,
+        dest: usize,
+        /// Value to store if input is NULL (0 or 1)
+        null_value: bool,
+        /// Whether to invert the result
+        invert: bool,
+    },
     /// Concatenates the `rhs` and `lhs` values and stores the result in the third register.
     Concat {
         lhs: usize,
@@ -1240,6 +1308,11 @@ pub enum Insn {
         max_errors: usize,
         roots: Vec<i64>,
         message_register: usize,
+        /// If true, this is a quick_check that skips expensive index consistency validation.
+        /// If false, this is a full integrity_check.
+        quick: bool,
+        /// Table metadata for index count validation (only used when quick=false)
+        tables: Vec<IntegrityCheckTable>,
     },
     RenameTable {
         from: String,
@@ -1321,6 +1394,11 @@ pub enum Insn {
         data: Box<HashBuildData>,
     },
 
+    /// Deduplicate using a hash table. Jumps to target_pc if duplicate found.
+    HashDistinct {
+        data: Box<HashDistinctData>,
+    },
+
     /// Finalize the hash table build phase. Transitions the hash table from Building to Probing state.
     /// Should be called after the HashBuild loop completes.
     HashBuildFinalize {
@@ -1364,6 +1442,18 @@ pub enum Insn {
     /// Closes the hash table referenced by hash_table_id and releases memory.
     HashClose {
         hash_table_id: usize,
+    },
+
+    /// Clear hash table entries without releasing the table itself.
+    HashClear {
+        hash_table_id: usize,
+    },
+
+    /// VACUUM INTO - create a compacted copy of the database at the specified path.
+    /// This copies all schema and data from the current database to a new file.
+    VacuumInto {
+        /// Destination file path for the vacuumed database
+        dest_path: String,
     },
 }
 
@@ -1498,6 +1588,7 @@ impl InsnVariants {
             InsnVariants::CreateBtree => execute::op_create_btree,
             InsnVariants::IndexMethodCreate => execute::op_index_method_create,
             InsnVariants::IndexMethodDestroy => execute::op_index_method_destroy,
+            InsnVariants::IndexMethodOptimize => execute::op_index_method_optimize,
             InsnVariants::IndexMethodQuery => execute::op_index_method_query,
             InsnVariants::Destroy => execute::op_destroy,
             InsnVariants::ResetSorter => execute::op_reset_sorter,
@@ -1515,6 +1606,7 @@ impl InsnVariants {
             InsnVariants::Variable => execute::op_variable,
             InsnVariants::ZeroOrNull => execute::op_zero_or_null,
             InsnVariants::Not => execute::op_not,
+            InsnVariants::IsTrue => execute::op_is_true,
             InsnVariants::Concat => execute::op_concat,
             InsnVariants::And => execute::op_and,
             InsnVariants::Or => execute::op_or,
@@ -1548,10 +1640,13 @@ impl InsnVariants {
             InsnVariants::FilterAdd => execute::op_filter_add,
             InsnVariants::Filter => execute::op_filter,
             InsnVariants::HashBuild => execute::op_hash_build,
+            InsnVariants::HashDistinct => execute::op_hash_distinct,
             InsnVariants::HashBuildFinalize => execute::op_hash_build_finalize,
             InsnVariants::HashProbe => execute::op_hash_probe,
             InsnVariants::HashNext => execute::op_hash_next,
             InsnVariants::HashClose => execute::op_hash_close,
+            InsnVariants::HashClear => execute::op_hash_clear,
+            InsnVariants::VacuumInto => execute::op_vacuum_into,
         }
     }
 }

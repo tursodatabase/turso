@@ -7,6 +7,7 @@ use turso_sync_engine::{
     database_sync_engine::{self, DatabaseSyncEngine},
     database_sync_engine_io::SyncEngineIo,
     database_sync_operations::SyncEngineIoStats,
+    types::SyncEngineIoResult,
 };
 
 use crate::{
@@ -24,6 +25,8 @@ pub struct TursoDatabaseSyncConfig {
     pub bootstrap_if_empty: bool,
     pub reserved_bytes: Option<usize>,
     pub partial_sync_opts: Option<turso_sync_engine::types::PartialSyncOpts>,
+    /// Base64-encoded encryption key for the Turso Cloud encrypted database.
+    pub remote_encryption_key: Option<String>,
 }
 
 pub type PartialSyncOpts = turso_sync_engine::types::PartialSyncOpts;
@@ -90,6 +93,11 @@ impl TursoDatabaseSyncConfig {
             } else {
                 None
             },
+            remote_encryption_key: if config.remote_encryption_key.is_null() {
+                None
+            } else {
+                Some(str_from_c_str(config.remote_encryption_key)?.to_string())
+            },
         })
     }
 }
@@ -138,6 +146,7 @@ pub struct TursoDatabaseSync<TBytes: AsRef<[u8]> + Send + Sync + 'static> {
     db_io: Option<Arc<dyn IO>>,
 }
 
+#[allow(unused_variables)]
 fn persistent_io(partial: bool) -> Result<Arc<dyn IO>, turso_sync_engine::errors::Error> {
     #[cfg(target_os = "linux")]
     {
@@ -159,12 +168,39 @@ fn persistent_io(partial: bool) -> Result<Arc<dyn IO>, turso_sync_engine::errors
     }
     #[cfg(not(target_os = "linux"))]
     {
+        let _ = partial;
         Ok(Arc::new(turso_core::PlatformIO::new().map_err(|e| {
             turso_sync_engine::errors::Error::DatabaseSyncEngineError(format!(
                 "Failed to create platform IO: {e}"
             ))
         })?))
     }
+}
+
+/// Helper async function to open a TursoDatabase with proper IO yielding for large schemas
+async fn open_turso_database_async<Ctx>(
+    coro: &turso_sync_engine::types::Coro<Ctx>,
+    main_db: &Arc<turso_sdk_kit::rsapi::TursoDatabase>,
+) -> Result<Arc<turso_core::Database>, turso_sync_engine::errors::Error> {
+    loop {
+        match main_db.open().map_err(|e| {
+            turso_sync_engine::errors::Error::DatabaseSyncEngineError(format!(
+                "unable to open database file: {e}"
+            ))
+        })? {
+            turso_core::IOResult::Done(()) => break,
+            turso_core::IOResult::IO(io_completion) => {
+                while !io_completion.finished() {
+                    coro.yield_(SyncEngineIoResult::IO).await?;
+                }
+            }
+        }
+    }
+    main_db.db_core().map_err(|e| {
+        turso_sync_engine::errors::Error::DatabaseSyncEngineError(format!(
+            "unable to get core database instance: {e}",
+        ))
+    })
 }
 
 impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
@@ -187,6 +223,7 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
             bootstrap_if_empty: sync_config.bootstrap_if_empty,
             reserved_bytes: sync_config.reserved_bytes.unwrap_or(0),
             partial_sync_opts: sync_config.partial_sync_opts.clone(),
+            remote_encryption_key: sync_config.remote_encryption_key.clone(),
         };
         let is_memory = db_config.path == ":memory:";
         let db_io: Option<Arc<dyn IO>> = if is_memory {
@@ -236,6 +273,7 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
                     sync_engine_io.clone(),
                     &metadata,
                     &main_db_path,
+                    sync_engine_opts.remote_encryption_key.as_deref(),
                 )?;
                 let main_db = turso_sdk_kit::rsapi::TursoDatabase::new(
                     turso_sdk_kit::rsapi::TursoDatabaseConfig {
@@ -244,16 +282,8 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
                         ..db_config
                     },
                 );
-                main_db.open().map_err(|e| {
-                    turso_sync_engine::errors::Error::DatabaseSyncEngineError(format!(
-                        "unable to open database file: {e}"
-                    ))
-                })?;
-                let main_db_core = main_db.db_core().map_err(|e| {
-                    turso_sync_engine::errors::Error::DatabaseSyncEngineError(format!(
-                        "unable to get core database instance: {e}",
-                    ))
-                })?;
+
+                let main_db_core = open_turso_database_async(&coro, &main_db).await?;
                 let sync_engine_opened = database_sync_engine::DatabaseSyncEngine::open_db(
                     &coro,
                     io,
@@ -306,6 +336,7 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
                     sync_engine_io.clone(),
                     &metadata,
                     &main_db_path,
+                    sync_engine_opts.remote_encryption_key.as_deref(),
                 )?;
                 let main_db = turso_sdk_kit::rsapi::TursoDatabase::new(
                     turso_sdk_kit::rsapi::TursoDatabaseConfig {
@@ -314,16 +345,8 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
                         ..db_config
                     },
                 );
-                main_db.open().map_err(|e| {
-                    turso_sync_engine::errors::Error::DatabaseSyncEngineError(format!(
-                        "unable to open database file: {e}"
-                    ))
-                })?;
-                let main_db_core = main_db.db_core().map_err(|e| {
-                    turso_sync_engine::errors::Error::DatabaseSyncEngineError(format!(
-                        "unable to get core database instance: {e}",
-                    ))
-                })?;
+
+                let main_db_core = open_turso_database_async(&coro, &main_db).await?;
                 let sync_engine_opened = database_sync_engine::DatabaseSyncEngine::open_db(
                     &coro,
                     io,

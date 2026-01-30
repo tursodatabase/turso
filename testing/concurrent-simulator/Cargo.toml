@@ -1,0 +1,35 @@
+# Copyright 2025 the Turso authors. All rights reserved. MIT license.
+
+[package]
+name = "turso_whopper"
+version.workspace = true
+authors.workspace = true
+edition = "2024"
+license.workspace = true
+repository.workspace = true
+description = "The Turso deterministic simulator"
+publish = false
+
+[lib]
+name = "turso_whopper"
+path = "lib.rs"
+
+[[bin]]
+name = "turso_whopper"
+path = "main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap = { workspace = true, features = ["derive"] }
+memmap2 = "0.9"
+rand = { workspace = true }
+rand_chacha = { workspace = true }
+sql_generation = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+turso_core = { workspace = true, features = ["simulator"]}
+turso_parser = { workspace = true }
+hex = "0.4.3"
+
+[features]
+checksum = ["turso_core/checksum"]

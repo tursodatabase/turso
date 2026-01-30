@@ -1,13 +1,13 @@
-use std::collections::HashSet;
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::num::NonZeroUsize;
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
 use turso_parser::ast::{self, TriggerEvent, TriggerTime, Upsert};
 
 use crate::error::SQLITE_CONSTRAINT_PRIMARYKEY;
 use crate::schema::{IndexColumn, ROWID_SENTINEL};
 use crate::translate::emitter::UpdateRowSource;
-use crate::translate::expr::{walk_expr, WalkControl};
+use crate::translate::expr::{rewrite_between_expr, walk_expr, WalkControl};
 use crate::translate::fkeys::{
     emit_fk_child_update_counters, emit_parent_key_change_checks, fire_fk_update_actions,
 };
@@ -150,7 +150,8 @@ fn collect_changed_cols(
     table: &Table,
     set_pairs: &[(usize, Box<ast::Expr>)],
 ) -> (HashSet<usize>, bool) {
-    let mut cols_changed = HashSet::with_capacity(table.columns().len());
+    let mut cols_changed =
+        HashSet::with_capacity_and_hasher(table.columns().len(), Default::default());
     let mut rowid_changed = false;
     for (col_idx, _) in set_pairs {
         if let Some(c) = table.columns().get(*col_idx) {
@@ -191,7 +192,7 @@ fn upsert_index_is_affected(
 /// Collect HashSet of columns referenced by the partial WHERE (empty if none), or
 /// by the expression of any IndexColumn on the index.
 fn referenced_index_cols(idx: &Index, table: &Table) -> HashSet<usize> {
-    let mut out = HashSet::new();
+    let mut out = HashSet::default();
     if let Some(expr) = &idx.where_clause {
         index_expression_cols(table, &mut out, expr);
     }
@@ -528,10 +529,13 @@ pub fn emit_upsert(
                 .chain(std::iter::once(new_rowid_for_trigger))
                 .collect();
 
-            let trigger_ctx = TriggerContext::new(
+            // In UPSERT DO UPDATE context, trigger's INSERT/UPDATE OR IGNORE/REPLACE
+            // clauses should not suppress errors. Override conflict resolution to Abort.
+            let trigger_ctx = TriggerContext::new_with_override_conflict(
                 btree_table.clone(),
                 Some(new_registers),
                 Some(old_registers.clone()),
+                ast::ResolveType::Abort,
             );
 
             for trigger in relevant_before_update_triggers {
@@ -1039,10 +1043,13 @@ pub fn emit_upsert(
                 .chain(std::iter::once(new_rowid_for_trigger))
                 .collect();
 
-            let trigger_ctx_after = TriggerContext::new(
+            // In UPSERT DO UPDATE context, trigger's INSERT/UPDATE OR IGNORE/REPLACE
+            // clauses should not suppress errors. Override conflict resolution to Abort.
+            let trigger_ctx_after = TriggerContext::new_with_override_conflict(
                 btree_table.clone(),
                 Some(new_registers_after),
                 Some(old_regs),
+                ast::ResolveType::Abort,
             );
 
             for trigger in relevant_triggers {
@@ -1125,6 +1132,7 @@ fn eval_partial_pred_for_row_image(
         return None;
     };
     let mut e = where_expr.as_ref().clone();
+    rewrite_between_expr(&mut e);
     rewrite_expr_to_registers(
         &mut e, table, row_start, rowid_reg, None,  // table_name
         None,  // insertion

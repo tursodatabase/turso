@@ -52,23 +52,22 @@ pub use super::pager::{PageContent, PageInner};
 use super::wal::TursoRwLock;
 use crate::error::LimboError;
 use crate::fast_lock::SpinLock;
-use crate::io::{Buffer, Completion, ReadComplete};
+use crate::io::{Buffer, Completion, FileSyncType, ReadComplete};
 use crate::storage::btree::{payload_overflow_threshold_max, payload_overflow_threshold_min};
 use crate::storage::buffer_pool::BufferPool;
 use crate::storage::database::{DatabaseStorage, EncryptionOrChecksum};
 use crate::storage::pager::Pager;
 use crate::storage::wal::READMARK_NOT_USED;
+use crate::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use crate::sync::Arc;
+use crate::sync::RwLock;
 use crate::types::{SerialType, SerialTypeKind, TextRef, TextSubtype, ValueRef};
 use crate::{
     bail_corrupt_error, turso_assert, CompletionError, File, IOContext, Result, WalFileShared,
 };
-use parking_lot::RwLock;
 use rustc_hash::FxHashMap;
 use std::collections::BTreeMap;
-use std::mem::MaybeUninit;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
 
 /// The minimum size of a cell in bytes.
 pub const MINIMUM_CELL_SIZE: usize = 4;
@@ -535,22 +534,31 @@ pub fn begin_read_page(
     let complete = Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
         let Ok((buf, bytes_read)) = res else {
             page.clear_locked();
-            return;
+            return None; // IO error already captured in completion
         };
         let buf_len = buf.len();
         // Handle truncated database files: if we read fewer bytes than expected
-        // (and it's not an intentional empty read), the database is corrupt.
+        // (and it's not an intentional empty read), return a ShortRead error.
         if bytes_read == 0 {
             if !allow_empty_read {
-                turso_assert!(
-                    false,
-                    "read returned 0 bytes but empty reads are not allowed"
-                );
+                tracing::error!("short read on page {page_idx}: expected {buf_len} bytes, got 0");
+                page.clear_locked();
+                return Some(CompletionError::ShortRead {
+                    page_idx,
+                    expected: buf_len,
+                    actual: 0,
+                });
             }
         } else if bytes_read != buf_len as i32 {
-            panic!(
-                "database disk image is malformed: read {bytes_read} bytes but expected {buf_len}",
+            tracing::error!(
+                "short read on page {page_idx}: expected {buf_len} bytes, got {bytes_read}"
             );
+            page.clear_locked();
+            return Some(CompletionError::ShortRead {
+                page_idx,
+                expected: buf_len,
+                actual: bytes_read as usize,
+            });
         }
         let page = page.clone();
         let buffer = if bytes_read == 0 {
@@ -559,6 +567,7 @@ pub fn begin_read_page(
             buf
         };
         finish_read_page(page_idx, buffer, page.clone());
+        None
     });
     let c = Completion::new_read(buf, complete);
     db_file.read_page(page_idx, io_ctx, c)
@@ -624,7 +633,7 @@ pub fn write_pages_vectored(
     pager: &Pager,
     batch: BTreeMap<usize, Arc<Buffer>>,
     done_flag: Arc<AtomicBool>,
-    err: Arc<std::sync::OnceLock<CompletionError>>,
+    err: Arc<crate::sync::OnceLock<CompletionError>>,
 ) -> Result<Vec<Completion>> {
     if batch.is_empty() {
         done_flag.store(true, Ordering::Release);
@@ -715,14 +724,18 @@ pub fn write_pages_vectored(
 }
 
 #[instrument(skip_all, level = Level::DEBUG)]
-pub fn begin_sync(db_file: &dyn DatabaseStorage, syncing: Arc<AtomicBool>) -> Result<Completion> {
+pub fn begin_sync(
+    db_file: &dyn DatabaseStorage,
+    syncing: Arc<AtomicBool>,
+    sync_type: FileSyncType,
+) -> Result<Completion> {
     assert!(!syncing.load(Ordering::SeqCst));
     syncing.store(true, Ordering::SeqCst);
     let completion = Completion::new_sync(move |_| {
         syncing.store(false, Ordering::SeqCst);
     });
     #[allow(clippy::arc_with_non_send_sync)]
-    db_file.sync(completion)
+    db_file.sync(completion, sync_type)
 }
 
 #[allow(clippy::enum_variant_names)]
@@ -775,7 +788,7 @@ pub fn read_btree_cell(
     pos: usize,
     usable_size: usize,
 ) -> Result<BTreeCell> {
-    let page_type = page_content.page_type();
+    let page_type = page_content.page_type()?;
     let max_local = payload_overflow_threshold_max(page_type, usable_size);
     let min_local = payload_overflow_threshold_min(page_type, usable_size);
     match page_type {
@@ -881,87 +894,6 @@ pub fn validate_serial_type(value: u64) -> Result<()> {
     Ok(())
 }
 
-pub struct SmallVec<T, const N: usize = 64> {
-    /// Stack allocated data
-    pub data: [std::mem::MaybeUninit<T>; N],
-    /// Length of the vector, accounting for both stack and heap allocated data
-    pub len: usize,
-    /// Extra data on heap
-    pub extra_data: Option<Vec<T>>,
-}
-
-impl<T: Default + Copy, const N: usize> Default for SmallVec<T, N> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl<T: Default + Copy, const N: usize> SmallVec<T, N> {
-    pub fn new() -> Self {
-        Self {
-            data: unsafe { std::mem::MaybeUninit::uninit().assume_init() },
-            len: 0,
-            extra_data: None,
-        }
-    }
-
-    pub fn push(&mut self, value: T) {
-        if self.len < self.data.len() {
-            self.data[self.len] = MaybeUninit::new(value);
-            self.len += 1;
-        } else {
-            if self.extra_data.is_none() {
-                self.extra_data = Some(Vec::new());
-            }
-            self.extra_data.as_mut().unwrap().push(value);
-            self.len += 1;
-        }
-    }
-
-    fn get_from_heap(&self, index: usize) -> T {
-        assert!(self.extra_data.is_some());
-        assert!(index >= self.data.len());
-        let extra_data_index = index - self.data.len();
-        let extra_data = self.extra_data.as_ref().unwrap();
-        assert!(extra_data_index < extra_data.len());
-        extra_data[extra_data_index]
-    }
-
-    pub fn get(&self, index: usize) -> Option<T> {
-        if index >= self.len {
-            return None;
-        }
-        let data_is_on_stack = index < self.data.len();
-        if data_is_on_stack {
-            // SAFETY: We know this index is initialized we checked for index < self.len earlier above.
-            unsafe { Some(self.data[index].assume_init()) }
-        } else {
-            Some(self.get_from_heap(index))
-        }
-    }
-}
-
-impl<T: Default + Copy, const N: usize> SmallVec<T, N> {
-    pub fn iter(&self) -> SmallVecIter<'_, T, N> {
-        SmallVecIter { vec: self, pos: 0 }
-    }
-}
-
-pub struct SmallVecIter<'a, T, const N: usize> {
-    vec: &'a SmallVec<T, N>,
-    pos: usize,
-}
-
-impl<T: Default + Copy, const N: usize> Iterator for SmallVecIter<'_, T, N> {
-    type Item = T;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let next = self.vec.get(self.pos)?;
-        self.pos += 1;
-        Some(next)
-    }
-}
-
 /// Reads a value that might reference the buffer it is reading from. Be sure to store RefValue with the buffer
 /// always.
 #[inline(always)]
@@ -969,26 +901,126 @@ pub fn read_value<'a>(buf: &'a [u8], serial_type: SerialType) -> Result<(ValueRe
     match serial_type.kind() {
         SerialTypeKind::Null => Ok((ValueRef::Null, 0)),
         SerialTypeKind::I8 => {
-            if buf.is_empty() {
-                crate::bail_corrupt_error!("Invalid UInt8 value");
-            }
-            let val = buf[0] as i8;
-            Ok((ValueRef::Integer(val as i64), 1))
+            let val = *buf
+                .first()
+                .ok_or_else(|| LimboError::Corrupt("Invalid UInt8 value".into()))?;
+            Ok((ValueRef::Integer(val as i8 as i64), 1))
         }
         SerialTypeKind::I16 => {
+            let bytes: &[u8; 2] = buf
+                .get(..2)
+                .and_then(|s| s.try_into().ok())
+                .ok_or_else(|| LimboError::Corrupt("Invalid BEInt16 value".into()))?;
+            Ok((ValueRef::Integer(i16::from_be_bytes(*bytes) as i64), 2))
+        }
+        SerialTypeKind::I24 => {
+            let bytes: &[u8; 3] = buf
+                .get(..3)
+                .and_then(|s| s.try_into().ok())
+                .ok_or_else(|| LimboError::Corrupt("Invalid BEInt24 value".into()))?;
+            let sign_extension = (bytes[0] as i8 >> 7) as u8;
+            Ok((
+                ValueRef::Integer(
+                    i32::from_be_bytes([sign_extension, bytes[0], bytes[1], bytes[2]]) as i64,
+                ),
+                3,
+            ))
+        }
+        SerialTypeKind::I32 => {
+            let bytes: &[u8; 4] = buf
+                .get(..4)
+                .and_then(|s| s.try_into().ok())
+                .ok_or_else(|| LimboError::Corrupt("Invalid BEInt32 value".into()))?;
+            Ok((ValueRef::Integer(i32::from_be_bytes(*bytes) as i64), 4))
+        }
+        SerialTypeKind::I48 => {
+            let bytes: &[u8; 6] = buf
+                .get(..6)
+                .and_then(|s| s.try_into().ok())
+                .ok_or_else(|| LimboError::Corrupt("Invalid BEInt48 value".into()))?;
+            let sign_extension = (bytes[0] as i8 >> 7) as u8;
+            Ok((
+                ValueRef::Integer(i64::from_be_bytes([
+                    sign_extension,
+                    sign_extension,
+                    bytes[0],
+                    bytes[1],
+                    bytes[2],
+                    bytes[3],
+                    bytes[4],
+                    bytes[5],
+                ])),
+                6,
+            ))
+        }
+        SerialTypeKind::I64 => {
+            let bytes: &[u8; 8] = buf
+                .get(..8)
+                .and_then(|s| s.try_into().ok())
+                .ok_or_else(|| LimboError::Corrupt("Invalid BEInt64 value".into()))?;
+            Ok((ValueRef::Integer(i64::from_be_bytes(*bytes)), 8))
+        }
+        SerialTypeKind::F64 => {
+            let bytes: &[u8; 8] = buf
+                .get(..8)
+                .and_then(|s| s.try_into().ok())
+                .ok_or_else(|| LimboError::Corrupt("Invalid BEFloat64 value".into()))?;
+            Ok((ValueRef::Float(f64::from_be_bytes(*bytes)), 8))
+        }
+        SerialTypeKind::ConstInt0 => Ok((ValueRef::Integer(0), 0)),
+        SerialTypeKind::ConstInt1 => Ok((ValueRef::Integer(1), 0)),
+        SerialTypeKind::Blob => {
+            let content_size = serial_type.size();
+            let data = buf
+                .get(..content_size)
+                .ok_or_else(|| LimboError::Corrupt("Invalid Blob value".into()))?;
+            Ok((ValueRef::Blob(data), content_size))
+        }
+        SerialTypeKind::Text => {
+            let content_size = serial_type.size();
+            let data = buf.get(..content_size).ok_or_else(|| {
+                LimboError::Corrupt(format!(
+                    "Invalid String value, length {} < expected length {}",
+                    buf.len(),
+                    content_size
+                ))
+            })?;
+            // SAFETY: SerialTypeKind is Text so this buffer is a valid string
+            let val = unsafe { std::str::from_utf8_unchecked(data) };
+            Ok((
+                ValueRef::Text(TextRef::new(val, TextSubtype::Text)),
+                content_size,
+            ))
+        }
+    }
+}
+
+pub fn read_value_serial_type<'a>(
+    buf: &'a [u8],
+    serial_type: u64,
+) -> Result<(ValueRef<'a>, usize)> {
+    match serial_type {
+        0 => Ok((ValueRef::Null, 0)),
+        1 => {
+            if buf.is_empty() {
+                crate::bail_corrupt_error!("Invalid 1-byte int");
+            }
+            Ok((ValueRef::Integer(buf[0] as i8 as i64), 1))
+        }
+        2 => {
             if buf.len() < 2 {
-                crate::bail_corrupt_error!("Invalid BEInt16 value");
+                crate::bail_corrupt_error!("Invalid 2-byte int");
             }
             Ok((
                 ValueRef::Integer(i16::from_be_bytes([buf[0], buf[1]]) as i64),
                 2,
             ))
         }
-        SerialTypeKind::I24 => {
+        3 => {
             if buf.len() < 3 {
-                crate::bail_corrupt_error!("Invalid BEInt24 value");
+                crate::bail_corrupt_error!("Invalid 3-byte int");
             }
-            let sign_extension = if buf[0] <= 127 { 0 } else { 255 };
+            let sign_extension = if buf[0] <= 0x7F { 0 } else { 0xFF };
             Ok((
                 ValueRef::Integer(
                     i32::from_be_bytes([sign_extension, buf[0], buf[1], buf[2]]) as i64
@@ -996,20 +1028,20 @@ pub fn read_value<'a>(buf: &'a [u8], serial_type: SerialType) -> Result<(ValueRe
                 3,
             ))
         }
-        SerialTypeKind::I32 => {
+        4 => {
             if buf.len() < 4 {
-                crate::bail_corrupt_error!("Invalid BEInt32 value");
+                crate::bail_corrupt_error!("Invalid 4-byte int");
             }
             Ok((
                 ValueRef::Integer(i32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as i64),
                 4,
             ))
         }
-        SerialTypeKind::I48 => {
+        5 => {
             if buf.len() < 6 {
-                crate::bail_corrupt_error!("Invalid BEInt48 value");
+                crate::bail_corrupt_error!("Invalid 6-byte int");
             }
-            let sign_extension = if buf[0] <= 127 { 0 } else { 255 };
+            let sign_extension = if buf[0] <= 0x7F { 0 } else { 0xFF };
             Ok((
                 ValueRef::Integer(i64::from_be_bytes([
                     sign_extension,
@@ -1024,9 +1056,9 @@ pub fn read_value<'a>(buf: &'a [u8], serial_type: SerialType) -> Result<(ValueRe
                 6,
             ))
         }
-        SerialTypeKind::I64 => {
+        6 => {
             if buf.len() < 8 {
-                crate::bail_corrupt_error!("Invalid BEInt64 value");
+                crate::bail_corrupt_error!("Invalid 8-byte int");
             }
             Ok((
                 ValueRef::Integer(i64::from_be_bytes([
@@ -1035,9 +1067,9 @@ pub fn read_value<'a>(buf: &'a [u8], serial_type: SerialType) -> Result<(ValueRe
                 8,
             ))
         }
-        SerialTypeKind::F64 => {
+        7 => {
             if buf.len() < 8 {
-                crate::bail_corrupt_error!("Invalid BEFloat64 value");
+                crate::bail_corrupt_error!("Invalid 8-byte float");
             }
             Ok((
                 ValueRef::Float(f64::from_be_bytes([
@@ -1046,32 +1078,37 @@ pub fn read_value<'a>(buf: &'a [u8], serial_type: SerialType) -> Result<(ValueRe
                 8,
             ))
         }
-        SerialTypeKind::ConstInt0 => Ok((ValueRef::Integer(0), 0)),
-        SerialTypeKind::ConstInt1 => Ok((ValueRef::Integer(1), 0)),
-        SerialTypeKind::Blob => {
-            let content_size = serial_type.size();
-            if buf.len() < content_size {
-                crate::bail_corrupt_error!("Invalid Blob value");
+        8 => Ok((ValueRef::Integer(0), 0)),
+        9 => Ok((ValueRef::Integer(1), 0)),
+        n if n >= 12 => match n % 2 {
+            0 => {
+                // Blob
+                let content_size = ((n - 12) / 2) as usize;
+                let data = buf
+                    .get(..content_size)
+                    .ok_or_else(|| LimboError::Corrupt("Invalid Blob value".into()))?;
+                Ok((ValueRef::Blob(data), content_size))
             }
-            Ok((ValueRef::Blob(&buf[..content_size]), content_size))
-        }
-        SerialTypeKind::Text => {
-            let content_size = serial_type.size();
-            if buf.len() < content_size {
-                crate::bail_corrupt_error!(
-                    "Invalid String value, length {} < expected length {}",
-                    buf.len(),
-                    content_size
-                );
+            1 => {
+                // Text
+                let content_size = ((n - 13) / 2) as usize;
+                let data = buf.get(..content_size).ok_or_else(|| {
+                    LimboError::Corrupt(format!(
+                        "Invalid String value, length {} < expected length {}",
+                        buf.len(),
+                        content_size
+                    ))
+                })?;
+                // SAFETY: SerialTypeKind is Text so this buffer is a valid string
+                let val = unsafe { std::str::from_utf8_unchecked(data) };
+                Ok((
+                    ValueRef::Text(TextRef::new(val, TextSubtype::Text)),
+                    content_size,
+                ))
             }
-
-            // SAFETY: SerialTypeKind is Text so this buffer is a valid string
-            let val = unsafe { str::from_utf8_unchecked(&buf[..content_size]) };
-            Ok((
-                ValueRef::Text(TextRef::new(val, TextSubtype::Text)),
-                content_size,
-            ))
-        }
+            _ => unreachable!(),
+        },
+        _ => crate::bail_corrupt_error!("Invalid serial type for integer"),
     }
 }
 
@@ -1169,24 +1206,18 @@ pub fn read_varint(buf: &[u8]) -> Result<(u64, usize)> {
     }
 }
 
+// This is a branchless function to compute the length of a varint encoding for a given u64 value.
+#[inline(always)]
 pub fn varint_len(value: u64) -> usize {
-    if value <= 0x7f {
-        return 1;
-    }
-    if value <= 0x3fff {
-        return 2;
-    }
-    if (value & ((0xff000000_u64) << 32)) > 0 {
-        return 9;
-    }
+    // Number of bits required to represent value.
+    // leading_zeros returns the count of leading zero bits; subtract from 64.
+    let bits = 64 - value.leading_zeros() as usize;
 
-    let mut bytes = value;
-    let mut n = 0;
-    while bytes != 0 {
-        bytes >>= 7;
-        n += 1;
-    }
-    n
+    // Each varint byte stores 7 bits of payload.
+    // (bits + 6) / 7 is the ceiling of bits / 7.
+    let len = bits.div_ceil(7);
+
+    len.max(1)
 }
 
 pub fn write_varint(buf: &mut [u8], value: u64) -> usize {
@@ -1364,6 +1395,7 @@ impl StreamingWalReader {
         let completion: Box<ReadComplete> = Box::new(move |res| {
             let _reader = reader.clone();
             _reader.handle_header_read(res);
+            None
         });
         let c = Completion::new_read(header_buf, completion);
         self.file.pread(0, c)
@@ -1398,6 +1430,7 @@ impl StreamingWalReader {
             tracing::debug!("WAL chunk read complete");
             let reader = me.clone();
             reader.handle_chunk_read(res);
+            None
         });
         let c = Completion::new_read(buf, completion);
         let guard = self.file.pread(offset, c)?;
@@ -1486,30 +1519,41 @@ impl StreamingWalReader {
             let fh = &buf[pos..pos + WAL_FRAME_HEADER_SIZE];
             let page = &buf[pos + WAL_FRAME_HEADER_SIZE..pos + frame_size];
 
-            let page_number = u32::from_be_bytes(fh[0..4].try_into().unwrap());
+            let page_no = u32::from_be_bytes(fh[0..4].try_into().unwrap());
             let db_size = u32::from_be_bytes(fh[4..8].try_into().unwrap());
             let s1 = u32::from_be_bytes(fh[8..12].try_into().unwrap());
             let s2 = u32::from_be_bytes(fh[12..16].try_into().unwrap());
             let c1 = u32::from_be_bytes(fh[16..20].try_into().unwrap());
             let c2 = u32::from_be_bytes(fh[20..24].try_into().unwrap());
 
-            if page_number == 0 {
+            tracing::debug!("process_frames: page_no={page_no}, db_size={db_size}, s1={s1}, s2={s2}, c1={c1}, c2={c2}");
+
+            if page_no == 0 {
+                tracing::debug!(
+                    "process_frames: unexpected page_no, stop reading WAL at initialization phase"
+                );
                 break;
             }
             if s1 != header.salt_1 || s2 != header.salt_2 {
+                tracing::debug!(
+                    "process_frames: salt mismatch, stop reading WAL at initialization phase"
+                );
                 break;
             }
 
             let seed = checksum_wal(&fh[0..8], header, st.cumulative_checksum, use_native);
             let calc = checksum_wal(page, header, seed, use_native);
             if calc != (c1, c2) {
+                tracing::debug!(
+                    "process_frames: checksum mismatch, stop reading WAL at initialization phase"
+                );
                 break;
             }
 
             st.cumulative_checksum = calc;
             let frame_idx = st.frame_idx;
             st.pending_frames
-                .entry(page_number as u64)
+                .entry(page_no as u64)
                 .or_default()
                 .push(frame_idx);
 
@@ -1612,8 +1656,7 @@ pub fn begin_read_wal_frame<F: File + ?Sized>(
             let decrypt_complete =
                 Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
                     let Ok((encrypted_buf, bytes_read)) = res else {
-                        original_complete(res);
-                        return;
+                        return original_complete(res);
                     };
                     assert!(
                         bytes_read > 0,
@@ -1624,13 +1667,13 @@ pub fn begin_read_wal_frame<F: File + ?Sized>(
                             encrypted_buf
                                 .as_mut_slice()
                                 .copy_from_slice(&decrypted_data);
-                            original_complete(Ok((encrypted_buf, bytes_read)));
+                            original_complete(Ok((encrypted_buf, bytes_read)))
                         }
                         Err(e) => {
                             tracing::error!(
                                 "Failed to decrypt WAL frame data for page_idx={page_idx}: {e}"
                             );
-                            original_complete(Err(CompletionError::DecryptionError { page_idx }));
+                            original_complete(Err(CompletionError::DecryptionError { page_idx }))
                         }
                     }
                 });
@@ -1644,19 +1687,15 @@ pub fn begin_read_wal_frame<F: File + ?Sized>(
             let verify_complete =
                 Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
                     let Ok((buf, bytes_read)) = res else {
-                        original_c(res);
-                        return;
+                        return original_c(res);
                     };
                     if bytes_read <= 0 {
                         tracing::trace!("Read page {page_idx} with {} bytes", bytes_read);
-                        original_c(Ok((buf, bytes_read)));
-                        return;
+                        return original_c(Ok((buf, bytes_read)));
                     }
 
                     match checksum_ctx.verify_checksum(buf.as_mut_slice(), page_idx) {
-                        Ok(_) => {
-                            original_c(Ok((buf, bytes_read)));
-                        }
+                        Ok(_) => original_c(Ok((buf, bytes_read))),
                         Err(e) => {
                             tracing::error!(
                                 "Failed to verify checksum for page_id={page_idx}: {e}"
@@ -1954,35 +1993,6 @@ mod tests {
             let result = validate_serial_type(i);
             assert!(result.is_ok());
         }
-    }
-
-    #[test]
-    fn test_smallvec_iter() {
-        let mut small_vec = SmallVec::<i32, 4>::new();
-        (0..8).for_each(|i| small_vec.push(i));
-
-        let mut iter = small_vec.iter();
-        assert_eq!(iter.next(), Some(0));
-        assert_eq!(iter.next(), Some(1));
-        assert_eq!(iter.next(), Some(2));
-        assert_eq!(iter.next(), Some(3));
-        assert_eq!(iter.next(), Some(4));
-        assert_eq!(iter.next(), Some(5));
-        assert_eq!(iter.next(), Some(6));
-        assert_eq!(iter.next(), Some(7));
-        assert_eq!(iter.next(), None);
-    }
-
-    #[test]
-    fn test_smallvec_get() {
-        let mut small_vec = SmallVec::<i32, 4>::new();
-        (0..8).for_each(|i| small_vec.push(i));
-
-        (0..8usize).for_each(|i| {
-            assert_eq!(small_vec.get(i), Some(i as i32));
-        });
-
-        assert_eq!(small_vec.get(8), None);
     }
 
     #[rstest]

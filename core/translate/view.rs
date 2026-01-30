@@ -1,12 +1,12 @@
 use crate::schema::{Schema, SchemaObjectType, DBSP_TABLE_PREFIX};
 use crate::storage::pager::CreateBTreeFlags;
+use crate::sync::Arc;
 use crate::translate::emitter::Resolver;
 use crate::translate::schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID};
 use crate::util::{normalize_ident, PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX};
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
 use crate::vdbe::insn::{CmpInsFlags, Cookie, Insn, RegisterOrLiteral};
 use crate::{Connection, Result};
-use std::sync::Arc;
 use turso_parser::ast;
 
 pub fn translate_create_materialized_view(

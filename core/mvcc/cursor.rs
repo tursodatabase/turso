@@ -1,24 +1,24 @@
+use crate::sync::RwLock;
 use crossbeam_skiplist::map::Entry;
 use crossbeam_skiplist::SkipMap;
-use parking_lot::RwLock;
 
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::database::{
-    create_seek_range, MVTableId, MvStore, Row, RowID, RowKey, RowVersion, RowVersionState,
-    SortableIndexKey,
+    create_seek_range, MVTableId, MvStore, Row, RowID, RowKey, RowVersion, SortableIndexKey,
 };
 use crate::storage::btree::{BTreeCursor, BTreeKey, CursorTrait};
+use crate::sync::Arc;
 use crate::translate::plan::IterationDirection;
 use crate::types::{
     compare_immutable, IOCompletions, IOResult, ImmutableRecord, IndexInfo, SeekKey, SeekOp,
-    SeekResult,
+    SeekResult, Value,
 };
-use crate::{return_if_io, turso_assert, Completion, LimboError, Result};
-use crate::{Pager, Value};
+use crate::vdbe::make_record;
+use crate::vdbe::Register;
+use crate::{return_if_io, turso_assert, Completion, LimboError, Pager, Result};
 use std::any::Any;
 use std::fmt::Debug;
 use std::ops::Bound;
-use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 enum CursorPosition {
@@ -256,7 +256,7 @@ pub struct MvccLazyCursor<Clock: LogicalClock> {
     /// Stateful MVCC table iterator if this is a table cursor.
     table_iterator: Option<MvccIterator<'static, RowID>>,
     /// Stateful MVCC index iterator if this is an index cursor.
-    index_iterator: Option<MvccIterator<'static, SortableIndexKey>>,
+    index_iterator: Option<MvccIterator<'static, Arc<SortableIndexKey>>>,
     mv_cursor_type: MvccCursorType,
     table_id: MVTableId,
     tx_id: u64,
@@ -437,17 +437,12 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
     }
 
     fn is_btree_allocated(&self) -> bool {
-        let maybe_root_page = self.db.table_id_to_rootpage.get(&self.table_id);
-        maybe_root_page.is_some_and(|entry| entry.value().is_some())
+        self.db.is_btree_allocated(&self.table_id)
     }
 
     fn query_btree_version_is_valid(&self, key: &RowKey) -> bool {
-        let res = self
-            .db
-            .find_row_last_version_state(self.table_id, key, self.tx_id);
-        tracing::trace!("query_btree_version_is_valid: {:?}, key: {:?}", res, key);
-        // If the row is not found in MVCC index, this means row_id is valid in btree
-        matches!(res, RowVersionState::NotFound)
+        self.db
+            .query_btree_version_is_valid(self.table_id, key, self.tx_id)
     }
 
     /// Advance MVCC iterator and return next visible row key in the direction that the iterator was initialized in.
@@ -518,7 +513,8 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
                 }
                 Some(AdvanceBtreeState::NextBtree) => {
                     let peek = &mut self.dual_peek;
-                    let found = return_if_io!(self.btree_cursor.next());
+                    return_if_io!(self.btree_cursor.next());
+                    let found = self.btree_cursor.has_record();
                     if !found {
                         peek.btree_peek = CursorPeek::Exhausted;
                         self.btree_advance_state = None;
@@ -596,8 +592,9 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
                     }
                 }
                 Some(AdvanceBtreeState::NextBtree) => {
-                    let found = return_if_io!(self.btree_cursor.prev());
+                    return_if_io!(self.btree_cursor.prev());
                     let peek = &mut self.dual_peek;
+                    let found = self.btree_cursor.has_record();
                     if !found {
                         peek.btree_peek = CursorPeek::Exhausted;
                         self.btree_advance_state = None;
@@ -785,7 +782,7 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
                     .get_or_insert_with(self.table_id, SkipMap::new);
                 let index_rows = index_rows.value();
                 let iter_box = Box::new(index_rows.iter());
-                self.index_iterator = Some(static_iterator_hack!(iter_box, SortableIndexKey));
+                self.index_iterator = Some(static_iterator_hack!(iter_box, Arc<SortableIndexKey>));
             }
         }
     }
@@ -856,7 +853,7 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
     /// Move the cursor to the next row. Returns true if the cursor moved to the next row, false if the cursor is at the end of the table.
     ///
     /// Uses dual-cursor approach: only advances the cursor that was just consumed.
-    fn next(&mut self) -> Result<IOResult<bool>> {
+    fn next(&mut self) -> Result<IOResult<()>> {
         if self.state.is_none() {
             // If BeforeFirst and peek not initialized, initialize the iterators and peek values
             let current_pos = self.get_current_pos();
@@ -909,7 +906,7 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
                 }
                 CursorPosition::End => {
                     self.state = None;
-                    return Ok(IOResult::Done(false));
+                    return Ok(IOResult::Done(()));
                 }
             };
 
@@ -934,16 +931,13 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
         self.invalidate_record();
         self.state = None;
 
-        Ok(IOResult::Done(matches!(
-            self.get_current_pos(),
-            CursorPosition::Loaded { .. }
-        )))
+        Ok(IOResult::Done(()))
     }
 
     /// Move the cursor to the previous row. Returns true if the cursor moved, false if at the beginning.
     ///
     /// Uses dual-cursor approach: only advances the cursor that was just consumed.
-    fn prev(&mut self) -> Result<IOResult<bool>> {
+    fn prev(&mut self) -> Result<IOResult<()>> {
         if self.state.is_none() {
             // If End and peek not initialized, initialize via last()
             let current_pos = self.get_current_pos();
@@ -993,7 +987,7 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
                 }
                 CursorPosition::BeforeFirst => {
                     self.state = None;
-                    return Ok(IOResult::Done(false));
+                    return Ok(IOResult::Done(()));
                 }
             };
 
@@ -1017,10 +1011,7 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
         self.invalidate_record();
         self.state = None;
 
-        Ok(IOResult::Done(matches!(
-            self.get_current_pos(),
-            CursorPosition::Loaded { .. }
-        )))
+        Ok(IOResult::Done(()))
     }
 
     fn rowid(&mut self) -> Result<IOResult<Option<i64>>> {
@@ -1055,6 +1046,15 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
 
     fn record(&mut self) -> Result<IOResult<Option<&crate::types::ImmutableRecord>>> {
         self.current_row()
+    }
+
+    fn seek_unpacked(
+        &mut self,
+        registers: &[Register],
+        op: SeekOp,
+    ) -> Result<IOResult<SeekResult>> {
+        let record = make_record(registers, &0, &registers.len());
+        self.seek(SeekKey::IndexKey(&record), op)
     }
 
     fn seek(&mut self, seek_key: SeekKey<'_>, op: SeekOp) -> Result<IOResult<SeekResult>> {
@@ -1185,8 +1185,8 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
                                         .cloned()
                                         .collect();
                                     let cmp = compare_immutable(
-                                        index_key.get_values(),
-                                        found_key.key.get_values(),
+                                        index_key.get_values()?,
+                                        found_key.key.get_values()?,
                                         &key_info,
                                     );
                                     cmp.is_eq()
@@ -1353,6 +1353,8 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
                 _ => unreachable!("btree tables are indexed by integers!"),
             };
             let inclusive = true;
+
+            // Check MVCC first
             let rowid = self.db.seek_rowid(
                 RowID {
                     table_id: self.table_id,
@@ -1363,7 +1365,8 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
                 self.tx_id,
                 &mut self.table_iterator,
             );
-            let exists = if let Some(rowid) = &rowid {
+
+            let mvcc_exists = if let Some(rowid) = &rowid {
                 let RowKey::Int(rowid) = rowid.row_id else {
                     panic!("Rowid is not an integer in mvcc table cursor");
                 };
@@ -1371,8 +1374,14 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
             } else {
                 false
             };
-            tracing::trace!("Row exists: {exists} find={int_key} got={rowid:?}");
-            if exists {
+
+            tracing::trace!(
+                "MVCC exists check: mvcc_exists={mvcc_exists} find={int_key} got={rowid:?}"
+            );
+
+            // If found in MVCC, update dual_peek and return true
+            if mvcc_exists {
+                self.dual_peek.mvcc_peek = CursorPeek::Row(RowKey::Int(*int_key));
                 self.current_pos = CursorPosition::Loaded {
                     row_id: RowID {
                         table_id: self.table_id,
@@ -1381,11 +1390,23 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
                     in_btree: false,
                 };
                 self.state = None;
-                return Ok(IOResult::Done(exists));
-            } else if self.is_btree_allocated() {
+                return Ok(IOResult::Done(true));
+            }
+
+            // MVCC doesn't have it, but we need to check B-tree too
+            if self.is_btree_allocated() {
+                // Check if the B-tree version is valid (not shadowed/deleted by MVCC)
+                let btree_is_valid = self.query_btree_version_is_valid(&RowKey::Int(*int_key));
+
+                // If B-tree is invalid (row is deleted or shadowed), don't check B-tree
+                if !btree_is_valid {
+                    self.state = None;
+                    return Ok(IOResult::Done(false));
+                }
                 self.state
                     .replace(MvccLazyCursorState::Exists(ExistsState::ExistsBtree));
             } else {
+                // No B-tree allocated, row doesn't exist
                 self.state = None;
                 return Ok(IOResult::Done(false));
             }
@@ -1398,9 +1419,44 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
             self.is_btree_allocated(),
             "BTree should be allocated when we are in ExistsBtree state"
         );
-        self.state = None;
+
+        // Check if row exists in B-tree
         let found = return_if_io!(self.btree_cursor.exists(key));
-        Ok(IOResult::Done(found))
+
+        if found {
+            // Found in B-tree, but need to verify it's not shadowed by MVCC tombstone
+            let int_key = match key {
+                Value::Integer(i) => *i,
+                _ => unreachable!("btree tables are indexed by integers!"),
+            };
+            let row_key = RowKey::Int(int_key);
+
+            // Check if this B-tree row is shadowed (deleted/updated) in MVCC
+            let is_valid = self.query_btree_version_is_valid(&row_key);
+
+            if is_valid {
+                // B-tree row is visible (not shadowed), update dual_peek
+                self.dual_peek.btree_peek = CursorPeek::Row(row_key.clone());
+                self.current_pos = CursorPosition::Loaded {
+                    row_id: RowID {
+                        table_id: self.table_id,
+                        row_id: row_key,
+                    },
+                    in_btree: true,
+                };
+                self.state = None;
+                Ok(IOResult::Done(true))
+            } else {
+                // B-tree row is shadowed by MVCC (tombstone or update), so it doesn't exist
+                tracing::trace!("B-tree row {int_key} is shadowed by MVCC");
+                self.state = None;
+                Ok(IOResult::Done(false))
+            }
+        } else {
+            // Not found in B-tree either
+            self.state = None;
+            Ok(IOResult::Done(false))
+        }
     }
 
     fn clear_btree(&mut self) -> Result<IOResult<Option<usize>>> {
@@ -1512,7 +1568,7 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
                     .get_or_insert_with(self.table_id, SkipMap::new);
                 let index_rows = index_rows.value();
                 let iter_box = Box::new(index_rows.iter());
-                self.index_iterator = Some(static_iterator_hack!(iter_box, SortableIndexKey));
+                self.index_iterator = Some(static_iterator_hack!(iter_box, Arc<SortableIndexKey>));
             }
         }
 

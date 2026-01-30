@@ -24,6 +24,7 @@ typedef enum
     TURSO_IO = 3,
     TURSO_BUSY = 4,
     TURSO_INTERRUPT = 5,
+    TURSO_BUSY_SNAPSHOT = 6,
     TURSO_ERROR = 127,
     TURSO_MISUSE = 128,
     TURSO_CONSTRAINT = 129,
@@ -138,7 +139,9 @@ turso_status_code_t turso_database_new(
     /** Optional return error parameter (can be null) */
     const char **error_opt_out);
 
-/** Open database */
+/** Open database
+ *  Can return TURSO_IO result if async_io=true is set
+ */
 turso_status_code_t turso_database_open(
     const turso_database_t *database,
     /** Optional return error parameter (can be null) */
@@ -223,6 +226,7 @@ turso_status_code_t turso_statement_run_io(const turso_statement_t *self, const 
 turso_status_code_t turso_statement_reset(const turso_statement_t *self, const char **error_opt_out);
 
 /** Finalize a statement
+ * finalize returns TURSO_DONE if finalization completed
  * This method must be called in the end of statement execution (either successfull or not)
  */
 turso_status_code_t turso_statement_finalize(const turso_statement_t *self, const char **error_opt_out);
@@ -237,6 +241,12 @@ int64_t turso_statement_column_count(const turso_statement_t *self);
  * C string allocated by Turso must be freed after the usage with corresponding turso_str_deinit(...) method
  */
 const char *turso_statement_column_name(const turso_statement_t *self, size_t index);
+
+/** Get the column declared type at the index (e.g. "INTEGER", "TEXT", "DATETIME", etc.)
+ * Returns NULL if the column type is not available.
+ * C string allocated by Turso must be freed after the usage with corresponding turso_str_deinit(...) method
+ */
+const char *turso_statement_column_decltype(const turso_statement_t *self, size_t index);
 
 /** Get the row value at the the index for a current statement state
  * SAFETY: returned pointers will be valid only until next invocation of statement operation (step, finalize, reset, etc)

@@ -5,14 +5,17 @@ use crate::{
     translate::collate::CollationSeq,
     vdbe::{
         builder::ProgramBuilder,
-        insn::{to_u16, IdxInsertFlags, Insn},
+        insn::{HashDistinctData, Insn},
     },
     LimboError, Result,
 };
 
 use super::{
     emitter::{Resolver, TranslateCtx},
-    expr::{translate_condition_expr, translate_expr, ConditionMetadata},
+    expr::{
+        translate_condition_expr, translate_expr, translate_expr_no_constant_opt,
+        ConditionMetadata, NoConstantOptReason,
+    },
     plan::{Aggregate, Distinctness, SelectPlan, TableReferences},
     result_row::emit_select_result,
 };
@@ -84,6 +87,37 @@ pub fn emit_ungrouped_aggregation<'a>(
         });
     }
 
+    // If the loop never ran (once-flag is still 0), we need to evaluate non-aggregate columns now.
+    // This ensures literals return their values and column references return NULL (since cursor
+    // is not on a valid row). The once-flag mechanism normally evaluates non-agg columns on first
+    // iteration, but if there were no iterations, we must do it here.
+    if let Some(once_flag) = t_ctx.reg_nonagg_emit_once_flag {
+        let skip_nonagg_eval = program.allocate_label();
+        // If once-flag is non-zero (loop ran at least once), skip evaluation
+        program.emit_insn(Insn::If {
+            reg: once_flag,
+            target_pc: skip_nonagg_eval,
+            jump_if_null: false,
+        });
+        // Evaluate non-aggregate columns now (with cursor in invalid state, columns return NULL)
+        // Must use no_constant_opt to prevent constant hoisting which would place the label
+        // after the hoisted constants, causing infinite loops in compound selects.
+        let col_start = t_ctx.reg_result_cols_start.unwrap();
+        for (i, rc) in plan.result_columns.iter().enumerate() {
+            if !rc.contains_aggregates {
+                translate_expr_no_constant_opt(
+                    program,
+                    Some(&plan.table_references),
+                    &rc.expr,
+                    col_start + i,
+                    &t_ctx.resolver,
+                    NoConstantOptReason::RegisterReuse,
+                )?;
+            }
+        }
+        program.preassign_label_to_next_insn(skip_nonagg_eval);
+    }
+
     // Emit the result row (if we didn't skip it due to HAVING or OFFSET)
     emit_select_result(
         program,
@@ -96,6 +130,13 @@ pub fn emit_ungrouped_aggregation<'a>(
         t_ctx.reg_result_cols_start.unwrap(),
         t_ctx.limit_ctx,
     )?;
+
+    // Resolve the SELECT DISTINCT label if present
+    // When a duplicate is found by the Found instruction, jump here to skip emitting the row
+    if let Distinctness::Distinct { ctx } = &plan.distinctness {
+        let distinct_ctx = ctx.as_ref().expect("distinct context must exist");
+        program.preassign_label_to_next_insn(distinct_ctx.label_on_conflict);
+    }
 
     program.resolve_label(end_label, program.offset());
 
@@ -148,26 +189,14 @@ pub fn handle_distinct(
         .as_ref()
         .expect("distinct aggregate context not populated");
     let num_regs = 1;
-    program.emit_insn(Insn::Found {
-        cursor_id: distinct_ctx.cursor_id,
-        target_pc: distinct_ctx.label_on_conflict,
-        record_reg: agg_arg_reg,
-        num_regs,
-    });
-    let record_reg = program.alloc_register();
-    program.emit_insn(Insn::MakeRecord {
-        start_reg: to_u16(agg_arg_reg),
-        count: to_u16(num_regs),
-        dest_reg: to_u16(record_reg),
-        index_name: Some(distinct_ctx.ephemeral_index_name.to_string()),
-        affinity_str: None,
-    });
-    program.emit_insn(Insn::IdxInsert {
-        cursor_id: distinct_ctx.cursor_id,
-        record_reg,
-        unpacked_start: None,
-        unpacked_count: None,
-        flags: IdxInsertFlags::new(),
+    program.emit_insn(Insn::HashDistinct {
+        data: Box::new(HashDistinctData {
+            hash_table_id: distinct_ctx.hash_table_id,
+            key_start_reg: agg_arg_reg,
+            num_keys: num_regs,
+            collations: distinct_ctx.collations.clone(),
+            target_pc: distinct_ctx.label_on_conflict,
+        }),
     });
 }
 

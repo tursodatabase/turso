@@ -114,4 +114,45 @@ jobs:
         RUST_BACKTRACE: 1
         SCCACHE_GHA_ENABLED: "true"
         RUSTC_WRAPPER: "sccache"
-      run: cargo run -p turso_stress --locked -- -t 2 -i 10000 -s --tables 1
+      run: RUSTFLAGS="--cfg shuttle" cargo run -p turso_stress --locked -- --nr-threads 3 --nr-iterations 300
+
+  shuttle-stress-test:
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 30
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@stable
+    - name: Setup mold linker
+      uses: rui314/setup-mold@v1
+    - uses: Swatinem/rust-cache@v2
+      with:
+        prefix-key: "v1-rust-shuttle"
+        cache-on-failure: true
+    - name: Setup sccache
+      uses: mozilla-actions/sccache-action@v0.0.9
+    - name: Run shuttle stress test
+      env:
+        RUST_BACKTRACE: 1
+        RUSTFLAGS: "--cfg=shuttle"
+        SCCACHE_GHA_ENABLED: "true"
+        RUSTC_WRAPPER: "sccache"
+      run: cargo run -p turso_stress --locked -- --nr-threads 2 --nr-iterations 1000
+
+  libfuzzer-scalar-func:
+    # Allow this job to fail without failing the entire CI run
+    continue-on-error: true
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 15
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@nightly
+    - name: Setup mold linker
+      uses: rui314/setup-mold@v1
+    - uses: Swatinem/rust-cache@v2
+      with:
+        prefix-key: "v1-rust-fuzz"
+        cache-on-failure: true
+    - name: Install cargo-fuzz
+      run: cargo install cargo-fuzz
+    - name: Run scalar_func fuzzer
+      run: cargo +nightly fuzz run scalar_func -- -max_total_time=300

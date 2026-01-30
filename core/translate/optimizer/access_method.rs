@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use crate::sync::Arc;
 
 use turso_ext::{ConstraintInfo, ConstraintUsage, ResultCode};
 use turso_parser::ast::{self, SortOrder, TableInternalId};
@@ -7,13 +7,14 @@ use crate::translate::expr::{as_binary_components, walk_expr, WalkControl};
 use crate::translate::optimizer::constraints::{
     convert_to_vtab_constraint, BinaryExprSide, Constraint, RangeConstraintRef,
 };
-use crate::translate::optimizer::cost::{RowCountEstimate, ESTIMATED_HARDCODED_ROWS_PER_PAGE};
+use crate::translate::optimizer::cost::RowCountEstimate;
+use crate::translate::optimizer::cost_params::CostModelParams;
 use crate::translate::plan::{HashJoinKey, NonFromClauseSubquery, SubqueryState, WhereTerm};
 use crate::util::exprs_are_equivalent;
 use crate::vdbe::hash_table::DEFAULT_MEM_BUDGET;
 use crate::{
     schema::{Index, Table},
-    translate::plan::{IterationDirection, JoinOrderMember, JoinedTable},
+    translate::plan::{IndexMethodQuery, IterationDirection, JoinOrderMember, JoinedTable},
     vtab::VirtualTable,
     LimboError, Result,
 };
@@ -72,6 +73,19 @@ pub enum AccessMethodParams {
         join_keys: Vec<HashJoinKey>,
         /// Memory budget for the hash table in bytes.
         mem_budget: usize,
+        /// Whether the build input should be materialized as a rowid list before hash build.
+        materialize_build_input: bool,
+        /// Whether to use a bloom filter on the probe side.
+        use_bloom_filter: bool,
+    },
+    /// Custom index method access (e.g., FTS).
+    /// This variant is used when the optimizer determines that a custom index method
+    /// should be used for table access in a join query.
+    IndexMethod {
+        /// The fully constructed IndexMethodQuery operation to apply to this table.
+        query: IndexMethodQuery,
+        /// Index in WHERE clause that was covered by this index method (if any).
+        where_covered: Option<usize>,
     },
 }
 
@@ -83,6 +97,7 @@ pub fn find_best_access_method_for_join_order(
     maybe_order_target: Option<&OrderTarget>,
     input_cardinality: f64,
     base_row_count: RowCountEstimate,
+    params: &CostModelParams,
 ) -> Result<Option<AccessMethod>> {
     match &rhs_table.table {
         Table::BTree(_) => find_best_access_method_for_btree(
@@ -92,6 +107,7 @@ pub fn find_best_access_method_for_join_order(
             maybe_order_target,
             input_cardinality,
             base_row_count,
+            params,
         ),
         Table::Virtual(vtab) => find_best_access_method_for_vtab(
             vtab,
@@ -99,9 +115,18 @@ pub fn find_best_access_method_for_join_order(
             join_order,
             input_cardinality,
             base_row_count,
+            params,
         ),
         Table::FromClauseSubquery(_) => Ok(Some(AccessMethod {
-            cost: estimate_cost_for_scan_or_seek(None, &[], &[], input_cardinality, base_row_count),
+            cost: estimate_cost_for_scan_or_seek(
+                None,
+                &[],
+                &[],
+                input_cardinality,
+                base_row_count,
+                false,
+                params,
+            ),
             params: AccessMethodParams::Subquery,
         })),
     }
@@ -114,10 +139,18 @@ fn find_best_access_method_for_btree(
     maybe_order_target: Option<&OrderTarget>,
     input_cardinality: f64,
     base_row_count: RowCountEstimate,
+    params: &CostModelParams,
 ) -> Result<Option<AccessMethod>> {
     let table_no = join_order.last().unwrap().table_id;
-    let mut best_cost =
-        estimate_cost_for_scan_or_seek(None, &[], &[], input_cardinality, base_row_count);
+    let mut best_cost = estimate_cost_for_scan_or_seek(
+        None,
+        &[],
+        &[],
+        input_cardinality,
+        base_row_count,
+        false,
+        params,
+    );
     let mut best_params = AccessMethodParams::BTreeTable {
         iter_dir: IterationDirection::Forwards,
         index: None,
@@ -146,16 +179,9 @@ fn find_best_access_method_for_btree(
                 column_count: 1,
             },
         };
-        let cost = estimate_cost_for_scan_or_seek(
-            Some(index_info),
-            &rhs_constraints.constraints,
-            &usable_constraint_refs,
-            input_cardinality,
-            base_row_count,
-        );
 
-        // All other things being equal, prefer an access method that satisfies the order target.
-        let (iter_dir, order_satisfiability_bonus) = if let Some(order_target) = maybe_order_target
+        let (iter_dir, is_index_ordered, order_satisfiability_bonus) = if let Some(order_target) =
+            maybe_order_target
         {
             // If the index delivers rows in the same direction (or the exact reverse direction) as the order target, then it
             // satisfies the order target.
@@ -198,21 +224,38 @@ fn find_best_access_method_for_btree(
                     all_same_direction = false;
                 }
             }
-            if all_same_direction || all_opposite_direction {
+
+            let satisfies_order =
+                (all_same_direction || all_opposite_direction) && !order_target.0.is_empty();
+            if satisfies_order {
+                // Bonus = estimated sort cost saved. Sorting is O(n log n).
+                let n = *base_row_count;
+                let sort_cost_saved = Cost(n * (n.max(1.0).log2()) * params.sort_cpu_per_row);
                 (
                     if all_same_direction {
                         IterationDirection::Forwards
                     } else {
                         IterationDirection::Backwards
                     },
-                    Cost(1.0),
+                    true,
+                    sort_cost_saved,
                 )
             } else {
-                (IterationDirection::Forwards, Cost(0.0))
+                (IterationDirection::Forwards, false, Cost(0.0))
             }
         } else {
-            (IterationDirection::Forwards, Cost(0.0))
+            (IterationDirection::Forwards, false, Cost(0.0))
         };
+
+        let cost = estimate_cost_for_scan_or_seek(
+            Some(index_info),
+            &rhs_constraints.constraints,
+            &usable_constraint_refs,
+            input_cardinality,
+            base_row_count,
+            is_index_ordered,
+            params,
+        );
         if cost < best_cost + order_satisfiability_bonus {
             best_cost = cost;
             best_params = AccessMethodParams::BTreeTable {
@@ -235,6 +278,7 @@ fn find_best_access_method_for_vtab(
     join_order: &[JoinOrderMember],
     input_cardinality: f64,
     base_row_count: RowCountEstimate,
+    params: &CostModelParams,
 ) -> Result<Option<AccessMethod>> {
     let vtab_constraints = convert_to_vtab_constraint(constraints, join_order);
 
@@ -252,6 +296,8 @@ fn find_best_access_method_for_vtab(
                     &[],
                     input_cardinality,
                     base_row_count,
+                    false,
+                    params,
                 ),
                 params: AccessMethodParams::VirtualTable {
                     idx_num: index_info.idx_num,
@@ -283,47 +329,39 @@ fn collect_table_refs(expr: &ast::Expr) -> Option<Vec<TableInternalId>> {
     result.ok().map(|_| tables)
 }
 
-/// Detect equi-join conditions between two tables that could be used for a hash join.
-/// Returns a list of `HashJoinKey` entries pointing to equality conditions in the WHERE clause.
+/// Detect equi-join conditions between exactly two tables for hash join.
 ///
-/// This function analyzes the WHERE clause constraints to find equality conditions
-/// where one side references only the build table and the other side references only the probe table.
-/// This supports expression-based join keys like `lower(t.a) = substr(t2.b, 1, 3)`.
-/// The caller is responsible for marking WHERE terms as consumed if hash join is selected.
+/// Returns `HashJoinKey` entries pointing at `WHERE` terms of the form:
+///   <build-only expr> = <probe-only expr>
+/// or
+///   <probe-only expr> = <build-only expr>
+///
+/// Both sides may be arbitrary expressions (e.g. `lower(t1.a) = substr(t2.b,1,3)`),
+/// but each side must reference columns from exactly one table:
+/// - the build side must reference only `build_table_id`
+/// - the probe side must reference only `probe_table_id`
+///
+/// This function does *not* mark any terms as consumed; the caller is responsible
+/// for doing so if a hash join is selected.
 pub fn find_equijoin_conditions(
     build_table_id: TableInternalId,
     probe_table_id: TableInternalId,
-    constraints: &[Constraint],
     where_clause: &[WhereTerm],
 ) -> Vec<HashJoinKey> {
     let mut join_keys = Vec::new();
-    // Track which WHERE clause indices we've already processed to avoid duplicates
-    let mut seen_where_indices = Vec::new();
 
-    for constraint in constraints {
-        // Check if this is an equality constraint
-        if !matches!(constraint.operator, ast::Operator::Equals) {
-            continue;
-        }
-        // Get the original WHERE term
-        let (where_idx, _side) = constraint.where_clause_pos;
-        // Skip already processed indices (constraints can share the same WHERE term)
-        if seen_where_indices.contains(&where_idx) {
-            continue;
-        }
-
-        let where_term = &where_clause[where_idx];
-        // Skip already consumed terms
+    for (where_idx, where_term) in where_clause.iter().enumerate() {
         if where_term.consumed {
             continue;
         }
 
-        let Ok(Some((lhs, ast::Operator::Equals, rhs))) = as_binary_components(&where_term.expr)
-        else {
+        let Ok(Some((lhs, op, rhs))) = as_binary_components(&where_term.expr) else {
             continue;
         };
+        if !matches!(op.as_ast_operator(), Some(ast::Operator::Equals)) {
+            continue;
+        }
 
-        // Collect table references from each side of the equality
         let Some(lhs_tables) = collect_table_refs(lhs) else {
             continue;
         };
@@ -331,24 +369,25 @@ pub fn find_equijoin_conditions(
             continue;
         };
 
-        // Each side must reference exactly one table for a valid equi-join key
+        // Require each side to reference exactly one table. This prevents
+        // constants or multi-table expressions from being considered join keys.
         if lhs_tables.len() != 1 || rhs_tables.len() != 1 {
             continue;
         }
 
-        let lhs_table = lhs_tables[0];
-        let rhs_table = rhs_tables[0];
-        // Check if one side references build table and the other references probe table
-        let build_side = if lhs_table == build_table_id && rhs_table == probe_table_id {
+        let lhs_tid = lhs_tables[0];
+        let rhs_tid = rhs_tables[0];
+
+        // Accept either orientation: build=probe or probe=build.
+        let build_side = if lhs_tid == build_table_id && rhs_tid == probe_table_id {
             Some(BinaryExprSide::Lhs)
-        } else if lhs_table == probe_table_id && rhs_table == build_table_id {
+        } else if rhs_tid == build_table_id && lhs_tid == probe_table_id {
             Some(BinaryExprSide::Rhs)
         } else {
             None
         };
 
         if let Some(build_side) = build_side {
-            seen_where_indices.push(where_idx);
             join_keys.push(HashJoinKey {
                 where_clause_idx: where_idx,
                 build_side,
@@ -369,35 +408,32 @@ pub fn estimate_hash_join_cost(
     build_cardinality: f64,
     probe_cardinality: f64,
     mem_budget: usize,
+    probe_multiplier: f64,
+    params: &CostModelParams,
 ) -> Cost {
-    const CPU_HASH_COST: f64 = 0.001;
-    const CPU_INSERT_COST: f64 = 0.002;
-    const CPU_LOOKUP_COST: f64 = 0.003;
-    const BYTES_PER_ROW_ESTIMATE: usize = 100;
-
     // Estimate if the hash table will fit in memory based on actual row counts
     let estimated_hash_table_size =
-        (build_cardinality as usize).saturating_mul(BYTES_PER_ROW_ESTIMATE);
+        (build_cardinality as usize).saturating_mul(params.hash_bytes_per_row as usize);
     let will_spill = estimated_hash_table_size > mem_budget;
 
     // Build phase: hash and insert all rows from build table (one-time cost)
     // With real ANALYZE stats, this accurately reflects the actual build table size
-    let build_cost = build_cardinality * (CPU_HASH_COST + CPU_INSERT_COST);
+    let build_cost = build_cardinality * (params.hash_cpu_cost + params.hash_insert_cost);
 
-    // Probe phase: scan probe table once, hash each row and lookup in hash table.
-    // Unlike nested loop join, the probe phase is NOT multiplied by input_cardinality
-    // because a hash join executes as a single unit - the probe table is scanned
-    // exactly once regardless of how many rows came from prior tables.
-    let probe_cost = probe_cardinality * (CPU_HASH_COST + CPU_LOOKUP_COST);
+    // Probe phase: scan probe table, hash each row and lookup in hash table.
+    // If the hash-join probe loop is nested under prior tables, the probe
+    // scan repeats per outer row, so scale by probe_multiplier.
+    let probe_cost =
+        probe_cardinality * (params.hash_cpu_cost + params.hash_lookup_cost) * probe_multiplier;
 
     // Spill cost: if hash table exceeds memory budget, we need to write/read partitions to disk.
     // Grace hash join writes partitions and reads them back, so it's 2x the page IO.
     // Use page-based IO cost (rows / rows_per_page) rather than per-row IO.
     let spill_cost = if will_spill {
-        let build_pages = (build_cardinality / ESTIMATED_HARDCODED_ROWS_PER_PAGE as f64).ceil();
-        let probe_pages = (probe_cardinality / ESTIMATED_HARDCODED_ROWS_PER_PAGE as f64).ceil();
+        let build_pages = (build_cardinality / params.rows_per_page).ceil();
+        let probe_pages = (probe_cardinality / params.rows_per_page).ceil();
         // Write both sides to partitions, then read back: 2 * (build_pages + probe_pages)
-        (build_pages + probe_pages) * 2.0
+        (build_pages + probe_pages) * 2.0 * probe_multiplier
     } else {
         0.0
     };
@@ -406,7 +442,6 @@ pub fn estimate_hash_join_cost(
 }
 
 /// Try to create a hash join access method for joining two tables.
-/// NOTE: we are intentionally strict in choosing hash joins for the MVP, can be expanded on later on.
 #[allow(clippy::too_many_arguments)]
 pub fn try_hash_join_access_method(
     build_table: &JoinedTable,
@@ -418,7 +453,9 @@ pub fn try_hash_join_access_method(
     where_clause: &mut [WhereTerm],
     build_cardinality: f64,
     probe_cardinality: f64,
+    probe_multiplier: f64,
     subqueries: &[NonFromClauseSubquery],
+    params: &CostModelParams,
 ) -> Option<AccessMethod> {
     // Only works for B-tree tables
     if !matches!(build_table.table, Table::BTree(_))
@@ -478,8 +515,22 @@ pub fn try_hash_join_access_method(
     let join_keys = find_equijoin_conditions(
         build_table.internal_id,
         probe_table.internal_id,
-        &probe_constraints.constraints,
         where_clause,
+    )
+    .into_iter()
+    .filter(|join_key| {
+        let probe_expr = join_key.get_probe_expr(where_clause);
+        let Some(probe_tables) = collect_table_refs(probe_expr) else {
+            return false;
+        };
+        probe_tables.len() == 1 && probe_tables[0] == probe_table.internal_id
+    })
+    .collect::<Vec<_>>();
+    tracing::debug!(
+        build_table = build_table.table.get_name(),
+        probe_table = probe_table.table.get_name(),
+        join_key_count = join_keys.len(),
+        "hash-join equi-join keys"
     );
 
     // Need at least one equi-join condition
@@ -493,48 +544,63 @@ pub fn try_hash_join_access_method(
     // Check both tables because we could potentially use a different
     // join order where the indexed table becomes the probe/inner table.
     for join_key in &join_keys {
-        // Check probe table constraints for index on join column
-        if let Some(constraint) = probe_constraints
-            .constraints
-            .iter()
-            .find(|c| c.where_clause_pos.0 == join_key.where_clause_idx)
-        {
-            if let Some(col_pos) = constraint.table_col_pos {
-                // Check if the join column is a rowid alias directly from the table schema
-                if let Some(column) = probe_table.columns().get(col_pos) {
-                    if column.is_rowid_alias() {
-                        return None;
-                    }
-                }
-                // Also check regular indexes
-                for candidate in &probe_constraints.candidates {
-                    if let Some(index) = &candidate.index {
-                        if index.column_table_pos_to_index_pos(col_pos).is_some() {
+        let probe_expr = join_key.get_probe_expr(where_clause);
+        let probe_tables = collect_table_refs(probe_expr).unwrap_or_default();
+        let probe_is_single_table =
+            probe_tables.len() == 1 && probe_tables[0] == probe_table.internal_id;
+        let probe_is_simple_column =
+            expr_is_simple_column_from_table(probe_expr, probe_table.internal_id);
+        let build_expr = join_key.get_build_expr(where_clause);
+        let build_is_simple_column =
+            expr_is_simple_column_from_table(build_expr, build_table.internal_id);
+        // Check probe table constraints for index on join column, only when the probe side
+        // references the probe table alone and is a simple column/rowid reference.
+        if probe_is_single_table && probe_is_simple_column {
+            if let Some(constraint) = probe_constraints
+                .constraints
+                .iter()
+                .find(|c| c.where_clause_pos.0 == join_key.where_clause_idx)
+            {
+                if let Some(col_pos) = constraint.table_col_pos {
+                    // Check if the join column is a rowid alias directly from the table schema
+                    if let Some(column) = probe_table.columns().get(col_pos) {
+                        if column.is_rowid_alias() {
                             return None;
+                        }
+                    }
+                    // Also check regular indexes
+                    for candidate in &probe_constraints.candidates {
+                        if let Some(index) = &candidate.index {
+                            if index.column_table_pos_to_index_pos(col_pos).is_some() {
+                                return None;
+                            }
                         }
                     }
                 }
             }
         }
 
-        // Check build table constraints for index on join column
-        if let Some(constraint) = build_constraints
-            .constraints
-            .iter()
-            .find(|c| c.where_clause_pos.0 == join_key.where_clause_idx)
-        {
-            if let Some(col_pos) = constraint.table_col_pos {
-                // Check if the join column is a rowid alias directly from the table schema
-                if let Some(column) = build_table.columns().get(col_pos) {
-                    if column.is_rowid_alias() {
-                        return None;
-                    }
-                }
-                // Also check regular indexes
-                for candidate in &build_constraints.candidates {
-                    if let Some(index) = &candidate.index {
-                        if index.column_table_pos_to_index_pos(col_pos).is_some() {
+        // Check build table constraints for index on join column, only when the build side
+        // is a simple column/rowid reference.
+        if build_is_simple_column {
+            if let Some(constraint) = build_constraints
+                .constraints
+                .iter()
+                .find(|c| c.where_clause_pos.0 == join_key.where_clause_idx)
+            {
+                if let Some(col_pos) = constraint.table_col_pos {
+                    // Check if the join column is a rowid alias directly from the table schema
+                    if let Some(column) = build_table.columns().get(col_pos) {
+                        if column.is_rowid_alias() {
                             return None;
+                        }
+                    }
+                    // Also check regular indexes
+                    for candidate in &build_constraints.candidates {
+                        if let Some(index) = &candidate.index {
+                            if index.column_table_pos_to_index_pos(col_pos).is_some() {
+                                return None;
+                            }
                         }
                     }
                 }
@@ -542,7 +608,13 @@ pub fn try_hash_join_access_method(
         }
     }
 
-    let cost = estimate_hash_join_cost(build_cardinality, probe_cardinality, DEFAULT_MEM_BUDGET);
+    let cost = estimate_hash_join_cost(
+        build_cardinality,
+        probe_cardinality,
+        DEFAULT_MEM_BUDGET,
+        probe_multiplier,
+        params,
+    );
     Some(AccessMethod {
         cost,
         params: AccessMethodParams::HashJoin {
@@ -550,6 +622,17 @@ pub fn try_hash_join_access_method(
             probe_table_idx,
             join_keys,
             mem_budget: DEFAULT_MEM_BUDGET,
+            materialize_build_input: false,
+            use_bloom_filter: false,
         },
     })
+}
+
+/// Returns true when the expression is a simple column/rowid reference to the table.
+/// Used to decide if an index seek could replace a hash join.
+fn expr_is_simple_column_from_table(expr: &ast::Expr, table_id: TableInternalId) -> bool {
+    matches!(
+        expr,
+        ast::Expr::Column { table, .. } | ast::Expr::RowId { table, .. } if *table == table_id
+    )
 }

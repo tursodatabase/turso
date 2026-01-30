@@ -1375,6 +1375,15 @@ pub fn insn_to_row(
                 0,
                 "".to_string()
             ),
+            Insn::IndexMethodOptimize { db, cursor_id } => (
+                "IndexMethodOptimize",
+                *db as i64,
+                *cursor_id as i64,
+                0,
+                Value::build_text(""),
+                0,
+                "".to_string()
+            ),
             Insn::IndexMethodQuery { db, cursor_id, start_reg, .. } => (
                 "IndexMethodQuery",
                 *db as i64,
@@ -1564,6 +1573,15 @@ pub fn insn_to_row(
                 Value::build_text(""),
                 0,
                 format!("r[{dest}]=!r[{reg}]"),
+            ),
+            Insn::IsTrue { reg, dest, null_value, invert } => (
+                "IsTrue",
+                *reg as i64,
+                *dest as i64,
+                if *null_value { 1 } else { 0 },
+                Value::build_text(""),
+                if *invert { 1 } else { 0 },
+                format!("r[{dest}] = IsTrue(r[{reg}], null={}, invert={})", *null_value as i64, *invert as i64),
             ),
             Insn::Concat { lhs, rhs, dest } => (
                 "Concat",
@@ -1796,6 +1814,8 @@ pub fn insn_to_row(
                 max_errors,
                 roots,
                 message_register,
+                quick,
+                tables,
             } => (
                 "IntegrityCk",
                 *max_errors as i64,
@@ -1803,7 +1823,10 @@ pub fn insn_to_row(
                 0,
                 Value::build_text(""),
                 0,
-                format!("roots={roots:?} message_register={message_register}"),
+                format!(
+                    "roots={roots:?} message_register={message_register} quick={quick} tables={}",
+                    tables.len()
+                ),
             ),
             Insn::RowData { cursor_id, dest } => (
                 "RowData",
@@ -2007,6 +2030,15 @@ pub fn insn_to_row(
                 String::new(),
             )
         }
+        Insn::HashDistinct { data } => (
+            "HashDistinct",
+            data.hash_table_id as i64,
+            data.key_start_reg as i64,
+            data.num_keys as i64,
+            Value::build_text(format!("jmp={}", data.target_pc.as_debug_int())),
+            0,
+            String::new(),
+        ),
         Insn::HashClose{hash_table_id: hash_table_reg} => (
             "HashClose",
             *hash_table_reg as i64,
@@ -2015,6 +2047,24 @@ pub fn insn_to_row(
             Value::build_text(""),
             0,
             String::new(),
+        ),
+        Insn::HashClear { hash_table_id: hash_table_reg } => (
+            "HashClear",
+            *hash_table_reg as i64,
+            0,
+            0,
+            Value::build_text(""),
+            0,
+            String::new(),
+        ),
+        Insn::VacuumInto { dest_path } => (
+            "VacuumInto",
+            0,
+            0,
+            0,
+            Value::build_text(dest_path.to_string()),
+            0,
+            format!("dest={dest_path}"),
         ),
     }
 }

@@ -71,3 +71,87 @@ fn test_schema_update_reprepares_statement(tmp_db: TempDatabase) -> Result<()> {
 
     Ok(())
 }
+
+/// Test that deferred_seeks vector is properly resized when a statement is reprepared
+/// with a larger cursor count due to schema changes (e.g., new index creation).
+///
+/// This is a regression test for the bug where ProgramState::reset() didn't resize
+/// the deferred_seeks vector when resizing cursors and cursor_seqs, causing an
+/// index out of bounds panic in op_column when accessing deferred_seeks with a
+/// cursor_id larger than the original allocation.
+///
+/// Scenario:
+/// 1. Create tables with data
+/// 2. Prepare a JOIN query (multiple cursors)
+/// 3. Another connection creates indexes on the tables (schema change)
+/// 4. Execute the prepared statement - triggers reprepare
+/// 5. The reprepared query uses the new indexes with deferred seeks
+/// 6. If deferred_seeks wasn't resized, accessing a higher cursor_id would panic
+#[turso_macros::test]
+fn test_deferred_seeks_resize_on_reprepare(tmp_db: TempDatabase) -> Result<()> {
+    let conn1 = tmp_db.connect_limbo();
+    let conn2 = tmp_db.connect_limbo();
+
+    // Create two tables to JOIN - this gives us multiple table cursors
+    conn1.execute(
+        "CREATE TABLE orders (
+            order_id INTEGER PRIMARY KEY,
+            customer_id INTEGER,
+            total REAL
+        )",
+    )?;
+
+    conn1.execute(
+        "CREATE TABLE customers (
+            customer_id INTEGER PRIMARY KEY,
+            name TEXT,
+            email TEXT
+        )",
+    )?;
+
+    // Insert test data
+    conn1.execute(
+        "INSERT INTO customers VALUES
+            (1, 'Alice', 'alice@example.com'),
+            (2, 'Bob', 'bob@example.com'),
+            (3, 'Charlie', 'charlie@example.com')",
+    )?;
+
+    conn1.execute(
+        "INSERT INTO orders VALUES
+            (100, 1, 150.00),
+            (101, 2, 250.00),
+            (102, 1, 75.00),
+            (103, 3, 500.00)",
+    )?;
+
+    // Prepare a JOIN query that selects columns from both tables
+    // Initially no indexes on customer_id, so it's a nested loop scan
+    // This uses 2 cursors (one for each table)
+    let mut stmt = conn1.prepare(
+        "SELECT c.name, o.total FROM orders o
+         JOIN customers c ON o.customer_id = c.customer_id
+         WHERE o.total > 100.0",
+    )?;
+
+    // Create indexes on both tables (schema change) - causes reprepare
+    // After reprepare, the optimizer may use these indexes, requiring more cursors
+    // and potentially using deferred seeks
+    conn2.execute("CREATE INDEX idx_orders_customer ON orders(customer_id)")?;
+    conn2.execute("CREATE INDEX idx_orders_total ON orders(total)")?;
+
+    // Execute the statement - triggers reprepare with potentially more cursors
+    // Without the fix, this could panic with index out of bounds on deferred_seeks
+    let mut results = Vec::new();
+    stmt.run_with_row_callback(|row| {
+        let name: String = row.get(0)?;
+        let total: f64 = row.get(1)?;
+        results.push((name, total));
+        Ok(())
+    })?;
+
+    // Verify we got the expected results (orders with total > 100.0)
+    assert_eq!(results.len(), 3);
+
+    Ok(())
+}

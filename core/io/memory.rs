@@ -1,9 +1,9 @@
 use super::{Buffer, Clock, Completion, File, OpenFlags, IO};
+use crate::io::clock::{DefaultClock, MonotonicInstant, WallClockInstant};
+use crate::io::FileSyncType;
+use crate::sync::Mutex;
 use crate::turso_assert;
-use crate::{io::clock::DefaultClock, Result};
-
-use crate::io::clock::Instant;
-use parking_lot::Mutex;
+use crate::Result;
 use std::{
     cell::{Cell, UnsafeCell},
     collections::{BTreeMap, HashMap},
@@ -24,7 +24,7 @@ impl MemoryIO {
     pub fn new() -> Self {
         debug!("Using IO backend 'memory'");
         Self {
-            files: Arc::new(Mutex::new(HashMap::new())),
+            files: Arc::new(Mutex::new(HashMap::default())),
         }
     }
 }
@@ -36,8 +36,12 @@ impl Default for MemoryIO {
 }
 
 impl Clock for MemoryIO {
-    fn now(&self) -> Instant {
-        DefaultClock.now()
+    fn current_time_monotonic(&self) -> MonotonicInstant {
+        DefaultClock.current_time_monotonic()
+    }
+
+    fn current_time_wall_clock(&self) -> WallClockInstant {
+        DefaultClock.current_time_wall_clock()
     }
 }
 
@@ -173,7 +177,7 @@ impl File for MemoryFile {
         Ok(c)
     }
 
-    fn sync(&self, c: Completion) -> Result<Completion> {
+    fn sync(&self, c: Completion, _sync_type: FileSyncType) -> Result<Completion> {
         tracing::debug!("sync(path={})", self.path);
         // no-op
         c.complete(0);

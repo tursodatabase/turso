@@ -88,6 +88,8 @@ pub enum Error {
     #[error("{0}")]
     Busy(String),
     #[error("{0}")]
+    BusySnapshot(String),
+    #[error("{0}")]
     Interrupt(String),
     #[error("{0}")]
     Error(String),
@@ -111,6 +113,7 @@ impl From<turso_sdk_kit::rsapi::TursoError> for Error {
     fn from(value: turso_sdk_kit::rsapi::TursoError) -> Self {
         match value {
             turso_sdk_kit::rsapi::TursoError::Busy(err) => Error::Busy(err),
+            turso_sdk_kit::rsapi::TursoError::BusySnapshot(err) => Error::BusySnapshot(err),
             turso_sdk_kit::rsapi::TursoError::Interrupt(err) => Error::Interrupt(err),
             turso_sdk_kit::rsapi::TursoError::Error(err) => Error::Error(err),
             turso_sdk_kit::rsapi::TursoError::Misuse(err) => Error::Misuse(err),
@@ -133,6 +136,7 @@ pub type EncryptionOpts = turso_sdk_kit::rsapi::EncryptionOpts;
 pub struct Builder {
     path: String,
     enable_encryption: bool,
+    enable_triggers: bool,
     vfs: Option<String>,
     encryption_opts: Option<turso_sdk_kit::rsapi::EncryptionOpts>,
 }
@@ -143,6 +147,7 @@ impl Builder {
         Self {
             path: path.to_string(),
             enable_encryption: false,
+            enable_triggers: false,
             vfs: None,
             encryption_opts: None,
         }
@@ -158,29 +163,46 @@ impl Builder {
         self
     }
 
+    pub fn experimental_triggers(mut self, triggers_enabled: bool) -> Self {
+        self.enable_triggers = triggers_enabled;
+        self
+    }
+
     pub fn with_io(mut self, vfs: String) -> Self {
         self.vfs = Some(vfs);
         self
+    }
+    fn build_features_string(&self) -> Option<String> {
+        let mut features = Vec::new();
+        if self.enable_encryption {
+            features.push("encryption");
+        }
+        if self.enable_triggers {
+            features.push("triggers");
+        }
+        if features.is_empty() {
+            return None;
+        }
+        Some(features.join(","))
     }
 
     /// Build the database.
     #[allow(unused_variables, clippy::arc_with_non_send_sync)]
     pub async fn build(self) -> Result<Database> {
+        let features = self.build_features_string();
         let db =
             turso_sdk_kit::rsapi::TursoDatabase::new(turso_sdk_kit::rsapi::TursoDatabaseConfig {
                 path: self.path,
-                experimental_features: if self.enable_encryption {
-                    Some("encryption".to_string())
-                } else {
-                    None
-                },
+                experimental_features: features,
                 async_io: false,
                 encryption: self.encryption_opts,
                 vfs: self.vfs,
                 io: None,
                 db_file: None,
             });
-        db.open()?;
+        let result = db.open()?;
+        // async_io is false - so db.open() will return result immediately
+        assert!(!result.is_io());
         Ok(Database { inner: db })
     }
 }

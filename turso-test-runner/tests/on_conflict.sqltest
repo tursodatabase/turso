@@ -1,0 +1,783 @@
+@database :memory:
+
+# =============================================================================
+# ON CONFLICT clause tests for INSERT and UPDATE statements
+# Tests all five resolve types: ABORT, ROLLBACK, FAIL, IGNORE, REPLACE
+# =============================================================================
+
+# =============================================================================
+# INSERT OR ABORT tests (default behavior)
+# =============================================================================
+
+# ABORT is the default - rolls back the statement on constraint violation
+
+test insert-or-abort-notnull {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b NOT NULL);
+    INSERT INTO t1 VALUES (1, 'one');
+    INSERT OR ABORT INTO t1 VALUES (2, NULL);
+}
+expect error {
+}
+
+test insert-or-abort-notnull-verify-rollback {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b NOT NULL);
+    INSERT INTO t1 VALUES (1, 'one');
+    INSERT OR ABORT INTO t1 VALUES (2, NULL);
+    SELECT * FROM t1 ORDER BY a;
+}
+expect error {
+}
+
+test insert-or-abort-unique {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT UNIQUE);
+    INSERT INTO t1 VALUES (1, 'one');
+    INSERT OR ABORT INTO t1 VALUES (2, 'one');
+}
+expect error {
+}
+
+test insert-or-abort-pk {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT);
+    INSERT INTO t1 VALUES (1, 'one');
+    INSERT OR ABORT INTO t1 VALUES (1, 'duplicate');
+}
+expect error {
+}
+
+# =============================================================================
+# INSERT OR IGNORE tests
+# =============================================================================
+
+# IGNORE skips the row that would cause a constraint violation
+
+test insert-or-ignore-notnull {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b NOT NULL);
+    INSERT INTO t1 VALUES (1, 'one');
+    INSERT OR IGNORE INTO t1 VALUES (2, NULL);
+    SELECT * FROM t1 ORDER BY a;
+}
+expect {
+    1|one
+}
+
+test insert-or-ignore-unique {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT UNIQUE);
+    INSERT INTO t1 VALUES (1, 'one');
+    INSERT OR IGNORE INTO t1 VALUES (2, 'one');
+    SELECT * FROM t1 ORDER BY a;
+}
+expect {
+    1|one
+}
+
+test insert-or-ignore-pk {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT);
+    INSERT INTO t1 VALUES (1, 'one');
+    INSERT OR IGNORE INTO t1 VALUES (1, 'duplicate');
+    SELECT * FROM t1 ORDER BY a;
+}
+expect {
+    1|one
+}
+
+test insert-or-ignore-continue-after-skip {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT UNIQUE);
+    INSERT INTO t1 VALUES (1, 'one');
+    INSERT OR IGNORE INTO t1 VALUES (2, 'one'), (3, 'three'), (4, 'one');
+    SELECT * FROM t1 ORDER BY a;
+}
+expect {
+    1|one
+    3|three
+}
+
+test insert-or-ignore-no-conflict {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT NOT NULL);
+    INSERT INTO t1 VALUES (1, 'one');
+    INSERT OR IGNORE INTO t1 VALUES (2, 'two');
+    SELECT * FROM t1 ORDER BY a;
+}
+expect {
+    1|one
+    2|two
+}
+
+# =============================================================================
+# INSERT OR REPLACE tests
+# =============================================================================
+
+# REPLACE deletes conflicting rows before inserting the new row
+
+test insert-or-replace-unique {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT UNIQUE);
+    INSERT INTO t1 VALUES (1, 'one');
+    INSERT OR REPLACE INTO t1 VALUES (2, 'one');
+    SELECT * FROM t1 ORDER BY a;
+}
+expect {
+    2|one
+}
+
+test insert-or-replace-pk {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT);
+    INSERT INTO t1 VALUES (1, 'one');
+    INSERT OR REPLACE INTO t1 VALUES (1, 'replaced');
+    SELECT * FROM t1 ORDER BY a;
+}
+expect {
+    1|replaced
+}
+
+test insert-or-replace-notnull-with-default {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT NOT NULL DEFAULT 'default_val');
+    INSERT INTO t1 VALUES (1, 'one');
+    INSERT OR REPLACE INTO t1(a) VALUES (2);
+    SELECT * FROM t1 ORDER BY a;
+}
+expect {
+    1|one
+    2|default_val
+}
+
+test insert-or-replace-notnull-no-default {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT NOT NULL);
+    INSERT INTO t1 VALUES (1, 'one');
+    INSERT OR REPLACE INTO t1(a) VALUES (2);
+}
+expect error {
+}
+
+test insert-or-replace-multiple-conflicts {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT UNIQUE, c TEXT UNIQUE);
+    INSERT INTO t1 VALUES (1, 'b1', 'c1');
+    INSERT INTO t1 VALUES (2, 'b2', 'c2');
+    INSERT OR REPLACE INTO t1 VALUES (3, 'b1', 'c2');
+    SELECT * FROM t1 ORDER BY a;
+}
+expect {
+    3|b1|c2
+}
+
+test insert-or-replace-no-conflict {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT UNIQUE);
+    INSERT INTO t1 VALUES (1, 'one');
+    INSERT OR REPLACE INTO t1 VALUES (2, 'two');
+    SELECT * FROM t1 ORDER BY a;
+}
+expect {
+    1|one
+    2|two
+}
+
+# =============================================================================
+# INSERT OR ROLLBACK tests
+# =============================================================================
+
+# ROLLBACK rolls back the entire transaction, not just the statement
+
+test insert-or-rollback-autocommit {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT UNIQUE);
+    INSERT INTO t1 VALUES (1, 'one');
+    INSERT OR ROLLBACK INTO t1 VALUES (2, 'one');
+}
+expect error {
+}
+
+test insert-or-rollback-autocommit-no-partial {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT UNIQUE);
+    INSERT INTO t1 VALUES (1, 'one');
+    INSERT OR ROLLBACK INTO t1 VALUES (2, 'one');
+    SELECT * FROM t1 ORDER BY a;
+}
+expect error {
+}
+
+test insert-or-rollback-in-transaction {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT UNIQUE);
+    INSERT INTO t1 VALUES (1, 'one');
+    BEGIN;
+    INSERT INTO t1 VALUES (2, 'two');
+    INSERT OR ROLLBACK INTO t1 VALUES (3, 'one');
+}
+expect error {
+}
+
+test insert-or-rollback-rolls-back-entire-tx {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT UNIQUE);
+    INSERT INTO t1 VALUES (1, 'one');
+    BEGIN;
+    INSERT INTO t1 VALUES (2, 'two');
+    INSERT OR ROLLBACK INTO t1 VALUES (3, 'one');
+    SELECT * FROM t1 ORDER BY a;
+}
+expect error {
+}
+
+# After ROLLBACK error, should only see original data
+test insert-or-rollback-verify-state-after-error {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT UNIQUE);
+    INSERT INTO t1 VALUES (1, 'one');
+    SELECT * FROM t1 ORDER BY a;
+}
+expect {
+    1|one
+}
+
+# =============================================================================
+# INSERT OR FAIL tests
+# =============================================================================
+
+# FAIL aborts current statement but doesn't rollback changes already made
+
+test insert-or-fail-autocommit {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT UNIQUE);
+    INSERT INTO t1 VALUES (1, 'one');
+    INSERT OR FAIL INTO t1 VALUES (2, 'one');
+}
+expect error {
+}
+
+test insert-or-fail-keeps-prior-changes {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT UNIQUE);
+    INSERT INTO t1 VALUES (1, 'one');
+    INSERT OR FAIL INTO t1 VALUES (2, 'two'), (3, 'one'), (4, 'four');
+    SELECT * FROM t1 ORDER BY a;
+}
+expect error {
+}
+
+# FAIL in multi-row insert keeps rows before the failure
+test insert-or-fail-partial-insert {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT UNIQUE);
+    INSERT OR FAIL INTO t1 VALUES (1, 'one'), (2, 'two'), (3, 'one'), (4, 'four');
+    SELECT * FROM t1 ORDER BY a;
+}
+expect error {
+}
+
+test insert-or-fail-in-transaction {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT UNIQUE);
+    BEGIN;
+    INSERT INTO t1 VALUES (1, 'one');
+    INSERT OR FAIL INTO t1 VALUES (2, 'one');
+}
+expect error {
+}
+
+# FAIL in transaction - earlier changes persist, transaction still active
+test insert-or-fail-tx-still-active {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT UNIQUE);
+    BEGIN;
+    INSERT INTO t1 VALUES (1, 'one');
+    INSERT OR FAIL INTO t1 VALUES (2, 'one');
+    SELECT * FROM t1 ORDER BY a;
+}
+expect error {
+}
+
+# =============================================================================
+# UPDATE OR IGNORE tests
+# =============================================================================
+
+# UPDATE OR IGNORE with NOT NULL violation should skip the row
+
+test update-or-ignore-notnull {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b NOT NULL);
+    INSERT INTO t1 VALUES (1, 'one'), (2, 'two'), (3, 'three');
+    UPDATE OR IGNORE t1 SET b = NULL WHERE a = 2;
+    SELECT * FROM t1 ORDER BY a;
+}
+expect {
+    1|one
+    2|two
+    3|three
+}
+
+# UPDATE OR IGNORE with UNIQUE violation should skip the row
+
+test update-or-ignore-unique {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT UNIQUE);
+    INSERT INTO t1 VALUES (1, 'one'), (2, 'two'), (3, 'three');
+    UPDATE OR IGNORE t1 SET b = 'one' WHERE a = 2;
+    SELECT * FROM t1 ORDER BY a;
+}
+expect {
+    1|one
+    2|two
+    3|three
+}
+
+# UPDATE OR IGNORE with PRIMARY KEY violation (rowid update) should skip
+
+test update-or-ignore-pk {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT);
+    INSERT INTO t1 VALUES (1, 'one'), (2, 'two'), (3, 'three');
+    UPDATE OR IGNORE t1 SET a = 1 WHERE a = 2;
+    SELECT * FROM t1 ORDER BY a;
+}
+expect {
+    1|one
+    2|two
+    3|three
+}
+
+# UPDATE OR IGNORE with no conflict should proceed normally
+
+test update-or-ignore-no-conflict {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT NOT NULL);
+    INSERT INTO t1 VALUES (1, 'one'), (2, 'two'), (3, 'three');
+    UPDATE OR IGNORE t1 SET b = 'updated' WHERE a = 2;
+    SELECT * FROM t1 ORDER BY a;
+}
+expect {
+    1|one
+    2|updated
+    3|three
+}
+
+# UPDATE OR IGNORE should continue processing other rows after skipping
+
+test update-or-ignore-continue {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT UNIQUE);
+    INSERT INTO t1 VALUES (1, 'one'), (2, 'two'), (3, 'three');
+    UPDATE OR IGNORE t1 SET b = 'one' WHERE a IN (2, 3);
+    SELECT * FROM t1 ORDER BY a;
+}
+expect {
+    1|one
+    2|two
+    3|three
+}
+
+# UPDATE OR IGNORE - multiple rows, some skip, some succeed
+
+test update-or-ignore-partial-update {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT UNIQUE);
+    INSERT INTO t1 VALUES (1, 'one'), (2, 'two'), (3, 'three'), (4, 'four');
+    UPDATE OR IGNORE t1 SET b = 'one' WHERE a >= 2;
+    SELECT * FROM t1 ORDER BY a;
+}
+expect {
+    1|one
+    2|two
+    3|three
+    4|four
+}
+
+# =============================================================================
+# UPDATE OR ABORT tests (default behavior)
+# =============================================================================
+
+test update-or-abort-notnull {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b NOT NULL);
+    INSERT INTO t1 VALUES (1, 'one'), (2, 'two');
+    UPDATE OR ABORT t1 SET b = NULL WHERE a = 1;
+}
+expect error {
+}
+
+# UPDATE OR ABORT with UNIQUE violation should fail
+
+test update-or-abort-unique {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT UNIQUE);
+    INSERT INTO t1 VALUES (1, 'one'), (2, 'two');
+    UPDATE OR ABORT t1 SET b = 'one' WHERE a = 2;
+}
+expect error {
+}
+
+test update-or-abort-pk {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT);
+    INSERT INTO t1 VALUES (1, 'one'), (2, 'two');
+    UPDATE OR ABORT t1 SET a = 1 WHERE a = 2;
+}
+expect error {
+}
+
+# UPDATE OR ABORT should rollback statement changes when conflict occurs
+
+test update-or-abort-rollback-statement {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b INTEGER UNIQUE);
+    INSERT INTO t1 VALUES (1, 10), (2, 20), (3, 30);
+    UPDATE OR ABORT t1 SET b = 10 WHERE a > 1;
+}
+expect error {
+}
+
+# =============================================================================
+# UPDATE OR REPLACE tests
+# =============================================================================
+
+# UPDATE OR REPLACE with UNIQUE violation should delete the conflicting row
+
+test update-or-replace-unique {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT UNIQUE);
+    INSERT INTO t1 VALUES (1, 'one'), (2, 'two'), (3, 'three');
+    UPDATE OR REPLACE t1 SET b = 'one' WHERE a = 2;
+    SELECT * FROM t1 ORDER BY a;
+}
+expect {
+    2|one
+    3|three
+}
+
+# UPDATE OR REPLACE with NOT NULL violation and default value should use default
+
+test update-or-replace-notnull-default {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT NOT NULL DEFAULT 'default_val');
+    INSERT INTO t1 VALUES (1, 'one'), (2, 'two');
+    UPDATE OR REPLACE t1 SET b = NULL WHERE a = 1;
+    SELECT * FROM t1 ORDER BY a;
+}
+expect {
+    1|default_val
+    2|two
+}
+
+# UPDATE OR REPLACE with NOT NULL violation and no default should fail
+
+test update-or-replace-notnull-no-default {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT NOT NULL);
+    INSERT INTO t1 VALUES (1, 'one'), (2, 'two');
+    UPDATE OR REPLACE t1 SET b = NULL WHERE a = 1;
+}
+expect error {
+}
+
+# UPDATE OR REPLACE with PRIMARY KEY conflict should delete conflicting row
+
+test update-or-replace-pk {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT);
+    INSERT INTO t1 VALUES (1, 'one'), (2, 'two'), (3, 'three');
+    UPDATE OR REPLACE t1 SET a = 1 WHERE a = 2;
+    SELECT * FROM t1 ORDER BY a;
+}
+expect {
+    1|two
+    3|three
+}
+
+# UPDATE OR REPLACE with no conflict should proceed normally
+
+test update-or-replace-no-conflict {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT UNIQUE);
+    INSERT INTO t1 VALUES (1, 'one'), (2, 'two'), (3, 'three');
+    UPDATE OR REPLACE t1 SET b = 'new_value' WHERE a = 2;
+    SELECT * FROM t1 ORDER BY a;
+}
+expect {
+    1|one
+    2|new_value
+    3|three
+}
+
+# UPDATE OR REPLACE - multiple conflicts resolved by deletion
+
+test update-or-replace-multiple-conflicts {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT UNIQUE, c TEXT UNIQUE);
+    INSERT INTO t1 VALUES (1, 'b1', 'c1');
+    INSERT INTO t1 VALUES (2, 'b2', 'c2');
+    INSERT INTO t1 VALUES (3, 'b3', 'c3');
+    UPDATE OR REPLACE t1 SET b = 'b1', c = 'c2' WHERE a = 3;
+    SELECT * FROM t1 ORDER BY a;
+}
+expect {
+    3|b1|c2
+}
+
+# =============================================================================
+# UPDATE OR ROLLBACK tests
+# =============================================================================
+
+test update-or-rollback-autocommit {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT UNIQUE);
+    INSERT INTO t1 VALUES (1, 'one'), (2, 'two');
+    UPDATE OR ROLLBACK t1 SET b = 'one' WHERE a = 2;
+}
+expect error {
+}
+
+test update-or-rollback-in-transaction {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT UNIQUE);
+    INSERT INTO t1 VALUES (1, 'one');
+    BEGIN;
+    INSERT INTO t1 VALUES (2, 'two');
+    UPDATE OR ROLLBACK t1 SET b = 'one' WHERE a = 2;
+}
+expect error {
+}
+
+# ROLLBACK rolls back entire transaction
+test update-or-rollback-entire-tx-rolled-back {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT UNIQUE);
+    INSERT INTO t1 VALUES (1, 'one');
+    BEGIN;
+    INSERT INTO t1 VALUES (2, 'two');
+    UPDATE OR ROLLBACK t1 SET b = 'one' WHERE a = 2;
+    SELECT * FROM t1 ORDER BY a;
+}
+expect error {
+}
+
+# After ROLLBACK error in tx, only original data visible
+test update-or-rollback-verify-state {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT UNIQUE);
+    INSERT INTO t1 VALUES (1, 'one');
+    SELECT * FROM t1 ORDER BY a;
+}
+expect {
+    1|one
+}
+
+# =============================================================================
+# UPDATE OR FAIL tests
+# =============================================================================
+
+test update-or-fail-autocommit {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT UNIQUE);
+    INSERT INTO t1 VALUES (1, 'one'), (2, 'two');
+    UPDATE OR FAIL t1 SET b = 'one' WHERE a = 2;
+}
+expect error {
+}
+
+test update-or-fail-in-transaction {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT UNIQUE);
+    INSERT INTO t1 VALUES (1, 'one');
+    BEGIN;
+    INSERT INTO t1 VALUES (2, 'two');
+    UPDATE OR FAIL t1 SET b = 'one' WHERE a = 2;
+}
+expect error {
+}
+
+# FAIL keeps prior changes in the statement
+test update-or-fail-partial-update {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b INTEGER UNIQUE);
+    INSERT INTO t1 VALUES (1, 10), (2, 20), (3, 30), (4, 40);
+    UPDATE OR FAIL t1 SET b = 10 WHERE a >= 2;
+    SELECT * FROM t1 ORDER BY a;
+}
+expect error {
+}
+
+# FAIL in transaction - tx stays open with prior changes
+test update-or-fail-tx-stays-active {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT UNIQUE);
+    INSERT INTO t1 VALUES (1, 'one');
+    BEGIN;
+    INSERT INTO t1 VALUES (2, 'two');
+    UPDATE OR FAIL t1 SET b = 'one' WHERE a = 2;
+    SELECT * FROM t1 ORDER BY a;
+}
+expect error {
+}
+
+# =============================================================================
+# Foreign key constraints are NOT affected by ON CONFLICT
+# =============================================================================
+
+# FK errors always behave like ABORT, regardless of ON CONFLICT clause
+
+test insert-or-ignore-fk-still-fails {
+    CREATE TABLE parent(id INTEGER PRIMARY KEY);
+    CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent(id));
+    INSERT INTO parent VALUES (1);
+    PRAGMA foreign_keys = ON;
+    INSERT OR IGNORE INTO child VALUES (1, 999);
+}
+expect error {
+}
+
+test insert-or-replace-fk-still-fails {
+    CREATE TABLE parent(id INTEGER PRIMARY KEY);
+    CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent(id));
+    INSERT INTO parent VALUES (1);
+    PRAGMA foreign_keys = ON;
+    INSERT OR REPLACE INTO child VALUES (1, 999);
+}
+expect error {
+}
+
+test update-or-ignore-fk-still-fails {
+    CREATE TABLE parent(id INTEGER PRIMARY KEY);
+    CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent(id));
+    INSERT INTO parent VALUES (1);
+    INSERT INTO child VALUES (1, 1);
+    PRAGMA foreign_keys = ON;
+    UPDATE OR IGNORE child SET parent_id = 999 WHERE id = 1;
+}
+expect error {
+}
+
+test update-or-replace-fk-still-fails {
+    CREATE TABLE parent(id INTEGER PRIMARY KEY);
+    CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent(id));
+    INSERT INTO parent VALUES (1);
+    INSERT INTO child VALUES (1, 1);
+    PRAGMA foreign_keys = ON;
+    UPDATE OR REPLACE child SET parent_id = 999 WHERE id = 1;
+}
+expect error {
+}
+
+test insert-or-fail-fk-still-fails {
+    CREATE TABLE parent(id INTEGER PRIMARY KEY);
+    CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent(id));
+    INSERT INTO parent VALUES (1);
+    PRAGMA foreign_keys = ON;
+    INSERT OR FAIL INTO child VALUES (1, 999);
+}
+expect error {
+}
+
+test insert-or-rollback-fk-still-fails {
+    CREATE TABLE parent(id INTEGER PRIMARY KEY);
+    CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent(id));
+    INSERT INTO parent VALUES (1);
+    PRAGMA foreign_keys = ON;
+    INSERT OR ROLLBACK INTO child VALUES (1, 999);
+}
+expect error {
+}
+
+# =============================================================================
+# Edge cases and complex scenarios
+# =============================================================================
+
+# Multiple constraint violations in single row - first encountered wins
+
+test multiple-constraints-first-wins {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b NOT NULL, c UNIQUE);
+    INSERT INTO t1 VALUES (1, 'one', 'c1');
+    INSERT OR IGNORE INTO t1 VALUES (2, NULL, 'c1');
+    SELECT * FROM t1 ORDER BY a;
+}
+expect {
+    1|one|c1
+}
+
+# UPDATE affecting multiple rows with constraint violation
+
+test update-multiple-rows-one-fails {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b INTEGER UNIQUE);
+    INSERT INTO t1 VALUES (1, 10), (2, 20), (3, 30);
+    UPDATE OR ABORT t1 SET b = 10 WHERE a > 1;
+}
+expect error {
+}
+
+# INSERT with SELECT and ON CONFLICT
+
+test insert-select-or-ignore {
+    CREATE TABLE src(a INTEGER, b TEXT);
+    CREATE TABLE dst(a INTEGER PRIMARY KEY, b TEXT UNIQUE);
+    INSERT INTO src VALUES (1, 'one'), (2, 'one'), (3, 'three');
+    INSERT INTO dst VALUES (10, 'existing');
+    INSERT OR IGNORE INTO dst SELECT * FROM src;
+    SELECT * FROM dst ORDER BY a;
+}
+expect {
+    1|one
+    3|three
+    10|existing
+}
+
+test insert-select-or-replace {
+    CREATE TABLE src(a INTEGER, b TEXT);
+    CREATE TABLE dst(a INTEGER PRIMARY KEY, b TEXT UNIQUE);
+    INSERT INTO src VALUES (1, 'one'), (2, 'one'), (3, 'three');
+    INSERT INTO dst VALUES (10, 'one');
+    INSERT OR REPLACE INTO dst SELECT * FROM src;
+    SELECT * FROM dst ORDER BY a;
+}
+expect {
+    2|one
+    3|three
+}
+
+# Empty result - no violations
+
+test insert-or-ignore-empty {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT UNIQUE);
+    INSERT OR IGNORE INTO t1 SELECT * FROM t1;
+    SELECT * FROM t1;
+}
+expect {
+}
+
+# Self-referential update with constraint
+
+test self-ref-update-or-ignore {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b INTEGER UNIQUE);
+    INSERT INTO t1 VALUES (1, 10), (2, 20);
+    UPDATE OR IGNORE t1 SET b = a * 10 WHERE a = 2;
+    SELECT * FROM t1 ORDER BY a;
+}
+expect {
+    1|10
+    2|20
+}
+
+# RETURNING with ON CONFLICT
+
+test insert-or-ignore-returning {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT UNIQUE);
+    INSERT INTO t1 VALUES (1, 'one');
+    INSERT OR IGNORE INTO t1 VALUES (2, 'one'), (3, 'three') RETURNING a, b;
+}
+expect {
+    3|three
+}
+
+test insert-or-replace-returning {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT UNIQUE);
+    INSERT INTO t1 VALUES (1, 'one');
+    INSERT OR REPLACE INTO t1 VALUES (2, 'one') RETURNING a, b;
+}
+expect {
+    2|one
+}
+
+test update-or-ignore-returning {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT UNIQUE);
+    INSERT INTO t1 VALUES (1, 'one'), (2, 'two'), (3, 'three');
+    UPDATE OR IGNORE t1 SET b = 'one' WHERE a >= 2 RETURNING a, b;
+}
+expect {
+}
+
+test update-or-replace-returning {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT UNIQUE);
+    INSERT INTO t1 VALUES (1, 'one'), (2, 'two'), (3, 'three');
+    UPDATE OR REPLACE t1 SET b = 'one' WHERE a = 2 RETURNING a, b;
+}
+expect {
+    2|one
+}
+
+# =============================================================================
+# Autoincrement with ON CONFLICT
+# =============================================================================
+
+test insert-or-ignore-autoincrement {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY AUTOINCREMENT, b TEXT UNIQUE);
+    INSERT INTO t1(b) VALUES ('one');
+    INSERT OR IGNORE INTO t1(b) VALUES ('one');
+    INSERT INTO t1(b) VALUES ('three');
+    SELECT * FROM t1 ORDER BY a;
+}
+expect {
+    1|one
+    3|three
+}
+
+test insert-or-replace-autoincrement {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY AUTOINCREMENT, b TEXT UNIQUE);
+    INSERT INTO t1(b) VALUES ('one');
+    INSERT OR REPLACE INTO t1(b) VALUES ('one');
+    SELECT * FROM t1 ORDER BY a;
+}
+expect {
+    2|one
+}

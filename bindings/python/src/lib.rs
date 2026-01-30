@@ -13,10 +13,10 @@ use crate::{
         PyTursoStatement, PyTursoStatusCode, Readonly,
     },
     turso_sync::{
-        py_turso_sync_new, PyTursoAsyncOperation, PyTursoAsyncOperationResultKind,
-        PyTursoPartialSyncOpts, PyTursoSyncDatabase, PyTursoSyncDatabaseChanges,
-        PyTursoSyncDatabaseConfig, PyTursoSyncDatabaseStats, PyTursoSyncIoItem,
-        PyTursoSyncIoItemRequestKind,
+        py_turso_sync_new, PyRemoteEncryptionCipher, PyTursoAsyncOperation,
+        PyTursoAsyncOperationResultKind, PyTursoPartialSyncOpts, PyTursoSyncDatabase,
+        PyTursoSyncDatabaseChanges, PyTursoSyncDatabaseConfig, PyTursoSyncDatabaseStats,
+        PyTursoSyncIoItem, PyTursoSyncIoItemRequestKind,
     },
 };
 
@@ -60,5 +60,6 @@ fn _turso(m: &Bound<PyModule>) -> PyResult<()> {
     m.add_class::<PyTursoAsyncOperation>()?;
     m.add_class::<PyTursoAsyncOperationResultKind>()?;
     m.add_class::<PyTursoPartialSyncOpts>()?;
+    m.add_class::<PyRemoteEncryptionCipher>()?;
     Ok(())
 }

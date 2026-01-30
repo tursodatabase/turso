@@ -1,6 +1,8 @@
 use std::{
     borrow::Cow,
+    collections::HashMap,
     fmt::Display,
+    ops::Deref,
     sync::{Arc, Mutex, Once, RwLock},
     task::Waker,
     time::Duration,
@@ -15,7 +17,8 @@ use tracing_subscriber::{
 };
 use turso_core::{
     storage::database::DatabaseFile, types::AsValueRef, Connection, Database, DatabaseOpts,
-    DatabaseStorage, LimboError, OpenFlags, Statement, StepResult, IO,
+    DatabaseStorage, EncryptionKey, IOResult, LimboError, OpenDbAsyncState, OpenFlags, QueryMode,
+    Statement, StepResult, IO,
 };
 
 use crate::{
@@ -282,7 +285,44 @@ impl TursoDatabaseConfig {
 
 pub struct TursoDatabase {
     config: TursoDatabaseConfig,
+    open_state: Mutex<TursoDatabaseOpenState>,
     db: Arc<Mutex<Option<Arc<Database>>>>,
+}
+
+/// Phase tracking for async TursoDatabase opening
+#[derive(Default, Clone, Copy)]
+pub enum TursoDatabaseOpenPhase {
+    #[default]
+    Init,
+    Opening,
+    Done,
+}
+
+/// State machine for async TursoDatabase opening
+pub struct TursoDatabaseOpenState {
+    phase: TursoDatabaseOpenPhase,
+    io: Option<Arc<dyn IO>>,
+    db_file: Option<Arc<dyn DatabaseStorage>>,
+    opts: Option<DatabaseOpts>,
+    open_db_state: OpenDbAsyncState,
+}
+
+impl Default for TursoDatabaseOpenState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TursoDatabaseOpenState {
+    pub fn new() -> Self {
+        Self {
+            phase: TursoDatabaseOpenPhase::Init,
+            io: None,
+            db_file: None,
+            opts: None,
+            open_db_state: OpenDbAsyncState::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -296,6 +336,7 @@ pub enum TursoStatusCode {
 #[derive(Debug, Clone)]
 pub enum TursoError {
     Busy(String),
+    BusySnapshot(String),
     Interrupt(String),
     Error(String),
     Misuse(String),
@@ -333,6 +374,7 @@ impl TursoError {
     pub fn to_capi_code(&self) -> capi::c::turso_status_code_t {
         match self {
             TursoError::Busy(_) => capi::c::turso_status_code_t::TURSO_BUSY,
+            TursoError::BusySnapshot(_) => capi::c::turso_status_code_t::TURSO_BUSY_SNAPSHOT,
             TursoError::Interrupt(_) => capi::c::turso_status_code_t::TURSO_INTERRUPT,
             TursoError::Error(_) => capi::c::turso_status_code_t::TURSO_ERROR,
             TursoError::Misuse(_) => capi::c::turso_status_code_t::TURSO_MISUSE,
@@ -350,6 +392,7 @@ impl Display for TursoError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             TursoError::Busy(s)
+            | TursoError::BusySnapshot(s)
             | TursoError::Interrupt(s)
             | TursoError::Error(s)
             | TursoError::Misuse(s)
@@ -377,12 +420,17 @@ pub fn c_string_to_str(ptr: *const std::ffi::c_char) -> std::ffi::CString {
 impl From<LimboError> for TursoError {
     fn from(value: LimboError) -> Self {
         match value {
-            LimboError::Constraint(e) => TursoError::Constraint(e),
+            LimboError::ForeignKeyConstraint(e) | LimboError::Constraint(e) => {
+                TursoError::Constraint(e)
+            }
             LimboError::Corrupt(e) => TursoError::Corrupt(e),
             LimboError::NotADB => TursoError::NotAdb("file is not a database".to_string()),
             LimboError::DatabaseFull(e) => TursoError::DatabaseFull(e),
             LimboError::ReadOnly => TursoError::Readonly("database is readonly".to_string()),
             LimboError::Busy => TursoError::Busy("database is locked".to_string()),
+            LimboError::BusySnapshot => TursoError::BusySnapshot(
+                "database snapshot is stale, rollback and retry the transaction".to_string(),
+            ),
             LimboError::CompletionError(turso_core::CompletionError::IOError(kind)) => {
                 TursoError::IoError(kind)
             }
@@ -491,96 +539,153 @@ impl TursoDatabase {
         Arc::new(Self {
             config,
             db: Arc::new(Mutex::new(None)),
+            open_state: Mutex::new(TursoDatabaseOpenState::new()),
         })
     }
-    /// open the database
-    /// this method must be called only once
-    pub fn open(&self) -> Result<(), TursoError> {
-        let mut inner_db = self.db.lock().unwrap();
-        if inner_db.is_some() {
-            return Err(TursoError::Misuse(
-                "database must be opened only once".to_string(),
-            ));
-        }
-        let io: Arc<dyn turso_core::IO> = if let Some(io) = &self.config.io {
-            io.clone()
-        } else {
-            match self.config.vfs.as_deref() {
-                Some("memory") => Arc::new(turso_core::MemoryIO::new()),
-                Some("syscall") => {
-                    #[cfg(all(target_family = "unix", not(miri)))]
-                    {
-                        Arc::new(turso_core::UnixIO::new().map_err(|e| {
-                            TursoError::Error(format!(
-                                "unable to create generic syscall backend: {e}"
-                            ))
-                        })?)
+    /// Async version of database opening that returns IOResult.
+    /// Caller must drive the IO loop and pass state between calls.
+    /// This is useful for environments where IO operations must be executed in a specific fashion.
+    pub fn open(&self) -> Result<IOResult<()>, TursoError> {
+        loop {
+            let mut state = self.open_state.lock().unwrap();
+            match state.phase {
+                TursoDatabaseOpenPhase::Init => {
+                    let inner_db = self.db.lock().unwrap();
+                    if inner_db.is_some() {
+                        return Err(TursoError::Misuse(
+                            "database must be opened only once".to_string(),
+                        ));
                     }
-                    #[cfg(any(not(target_family = "unix"), miri))]
-                    {
-                        Arc::new(turso_core::PlatformIO::new().map_err(|e| {
-                            TursoError::Error(format!(
-                                "unable to create generic syscall backend: {e}"
-                            ))
-                        })?)
+                    // keep lock for the whole method since open_async must be called only once and never will be called concurrently
+
+                    let io: Arc<dyn turso_core::IO> = if let Some(io) = &self.config.io {
+                        io.clone()
+                    } else {
+                        match self.config.vfs.as_deref() {
+                            Some("memory") => Arc::new(turso_core::MemoryIO::new()),
+                            Some("syscall") => {
+                                #[cfg(all(target_family = "unix", not(miri)))]
+                                {
+                                    Arc::new(turso_core::UnixIO::new().map_err(|e| {
+                                        TursoError::Error(format!(
+                                            "unable to create generic syscall backend: {e}"
+                                        ))
+                                    })?)
+                                }
+                                #[cfg(any(not(target_family = "unix"), miri))]
+                                {
+                                    Arc::new(turso_core::PlatformIO::new().map_err(|e| {
+                                        TursoError::Error(format!(
+                                            "unable to create generic syscall backend: {e}"
+                                        ))
+                                    })?)
+                                }
+                            }
+                            #[cfg(all(target_os = "linux", not(miri)))]
+                            Some("io_uring") => {
+                                Arc::new(turso_core::UringIO::new().map_err(|e| {
+                                    TursoError::Error(format!(
+                                        "unable to create io_uring backend: {e}"
+                                    ))
+                                })?)
+                            }
+                            #[cfg(any(not(target_os = "linux"), miri))]
+                            Some("io_uring") => {
+                                return Err(TursoError::Error(
+                                    "io_uring is only available on Linux targets".to_string(),
+                                ));
+                            }
+                            Some(vfs) => {
+                                return Err(TursoError::Error(format!(
+                                    "unsupported VFS backend: '{vfs}'"
+                                )))
+                            }
+                            None => match self.config.path.as_str() {
+                                ":memory:" => Arc::new(turso_core::MemoryIO::new()),
+                                _ => Arc::new(turso_core::PlatformIO::new()?),
+                            },
+                        }
+                    };
+
+                    let open_flags = OpenFlags::default();
+                    let db_file = if let Some(db_file) = &self.config.db_file {
+                        db_file.clone()
+                    } else {
+                        let file = io.open_file(&self.config.path, open_flags, true)?;
+                        Arc::new(DatabaseFile::new(file))
+                    };
+
+                    let mut opts = DatabaseOpts::new();
+                    if let Some(experimental_features) = &self.config.experimental_features {
+                        for features in experimental_features.split(",").map(|s| s.trim()) {
+                            opts = match features {
+                                "views" => opts.with_views(true),
+                                "index_method" => opts.with_index_method(true),
+                                "strict" => opts.with_strict(true),
+                                "autovacuum" => opts.with_autovacuum(true),
+                                "triggers" => opts.with_triggers(true),
+                                "encryption" => opts.with_encryption(true),
+                                "attach" => opts.with_attach(true),
+                                _ => opts,
+                            };
+                        }
+                    }
+
+                    if self.config.encryption.is_some() && !opts.enable_encryption {
+                        return Err(TursoError::Error(
+                            "encryption is experimental and must be explicitly enabled through experimental features list".to_string(),
+                        ));
+                    }
+
+                    state.io = Some(io);
+                    state.db_file = Some(db_file);
+                    state.opts = Some(opts);
+                    state.phase = TursoDatabaseOpenPhase::Opening;
+                }
+
+                TursoDatabaseOpenPhase::Opening => {
+                    let io = state
+                        .io
+                        .as_ref()
+                        .expect("io must be initialized in Init phase")
+                        .clone();
+                    let db_file = state
+                        .db_file
+                        .as_ref()
+                        .expect("db_file must be initialized in Init phase")
+                        .clone();
+                    let opts = state.opts.expect("opts must be initialized in Init phase");
+
+                    match Database::open_with_flags_async(
+                        &mut state.open_db_state,
+                        io.clone(),
+                        &self.config.path,
+                        db_file,
+                        OpenFlags::default(),
+                        opts,
+                        self.config.encryption.clone(),
+                    )? {
+                        IOResult::Done(db) => {
+                            let mut inner_db = self.db.lock().unwrap();
+                            *inner_db = Some(db);
+                            state.phase = TursoDatabaseOpenPhase::Done;
+                            return Ok(IOResult::Done(()));
+                        }
+                        IOResult::IO(io_completion) => {
+                            if self.config.async_io {
+                                return Ok(IOResult::IO(io_completion));
+                            } else {
+                                io_completion.wait(io.deref())?;
+                            }
+                        }
                     }
                 }
-                #[cfg(all(target_os = "linux", not(miri)))]
-                Some("io_uring") => Arc::new(turso_core::UringIO::new().map_err(|e| {
-                    TursoError::Error(format!("unable to create io_uring backend: {e}"))
-                })?),
-                #[cfg(any(not(target_os = "linux"), miri))]
-                Some("io_uring") => {
-                    return Err(TursoError::Error(
-                        "io_uring is only available on Linux targets".to_string(),
-                    ));
+
+                TursoDatabaseOpenPhase::Done => {
+                    return Ok(IOResult::Done(()));
                 }
-                Some(vfs) => {
-                    return Err(TursoError::Error(format!(
-                        "unsupported VFS backend: '{vfs}'"
-                    )))
-                }
-                None => match self.config.path.as_str() {
-                    ":memory:" => Arc::new(turso_core::MemoryIO::new()),
-                    _ => Arc::new(turso_core::PlatformIO::new()?),
-                },
-            }
-        };
-        let open_flags = OpenFlags::default();
-        let db_file = if let Some(db_file) = &self.config.db_file {
-            db_file.clone()
-        } else {
-            let file = io.open_file(&self.config.path, open_flags, true)?;
-            Arc::new(DatabaseFile::new(file))
-        };
-        let mut opts = DatabaseOpts::new();
-        if let Some(experimental_features) = &self.config.experimental_features {
-            for features in experimental_features.split(",").map(|s| s.trim()) {
-                opts = match features {
-                    "views" => opts.with_views(true),
-                    "index_method" => opts.with_index_method(true),
-                    "strict" => opts.with_strict(true),
-                    "autovacuum" => opts.with_autovacuum(true),
-                    "triggers" => opts.with_triggers(true),
-                    "encryption" => opts.with_encryption(true),
-                    "attach" => opts.with_attach(true),
-                    _ => opts,
-                };
             }
         }
-        if self.config.encryption.is_some() && !opts.enable_encryption {
-            return Err(TursoError::Error("encryption is experimental and must be explicitly enabled through experimental features list".to_string()));
-        }
-        let db = turso_core::Database::open_with_flags(
-            io.clone(),
-            &self.config.path,
-            db_file,
-            open_flags,
-            opts,
-            self.config.encryption.clone(),
-        )?;
-        *inner_db = Some(db);
-        Ok(())
     }
 
     /// creates database connection
@@ -592,7 +697,19 @@ impl TursoDatabase {
                 "database must be opened first".to_string(),
             ));
         };
-        let connection = db.connect()?;
+
+        // Parse encryption key if configured - needed for connect_with_encryption
+        // which sets up encryption context before reading pages
+        let encryption_key = if let Some(ref encryption_opts) = self.config.encryption {
+            Some(EncryptionKey::from_hex_string(&encryption_opts.hexkey)?)
+        } else {
+            None
+        };
+
+        // Use connect_with_encryption to properly set up encryption context
+        // before the pager reads page 1. This is required for encrypted databases.
+        let connection = db.connect_with_encryption(encryption_key)?;
+
         Ok(TursoConnection::new(&self.config, connection))
     }
 
@@ -627,11 +744,17 @@ impl TursoDatabase {
     }
 }
 
+struct CachedStatement {
+    program: Arc<turso_core::PreparedProgram>,
+    query_mode: QueryMode,
+}
+
 #[derive(Clone)]
 pub struct TursoConnection {
     async_io: bool,
     concurrent_guard: Arc<ConcurrentGuard>,
     connection: Arc<Connection>,
+    cached_statements: Arc<Mutex<HashMap<String, Arc<CachedStatement>>>>,
 }
 
 impl TursoConnection {
@@ -640,6 +763,7 @@ impl TursoConnection {
             async_io: config.async_io,
             connection,
             concurrent_guard: Arc::new(ConcurrentGuard::new()),
+            cached_statements: Arc::new(Mutex::new(HashMap::new())),
         })
     }
     /// Set busy timeout for the connection
@@ -652,6 +776,7 @@ impl TursoConnection {
     pub fn last_insert_rowid(&self) -> i64 {
         self.connection.last_insert_rowid()
     }
+
     /// prepares single SQL statement
     pub fn prepare_single(&self, sql: impl AsRef<str>) -> Result<Box<TursoStatement>, TursoError> {
         let statement = self.connection.prepare(sql)?;
@@ -661,6 +786,48 @@ impl TursoConnection {
             statement,
         }))
     }
+
+    /// Prepare a statement from the provided SQL string and cache it for future use.
+    pub fn prepare_cached(&self, sql: impl AsRef<str>) -> Result<Box<TursoStatement>, TursoError> {
+        let sql_str = sql.as_ref();
+
+        // Check if we have a cached version
+        if let Some(cached) = self.cached_statements.lock().unwrap().get(sql_str) {
+            if cached.program.is_compatible_with(&self.connection) {
+                let program = turso_core::Program::from_prepared(
+                    cached.program.clone(),
+                    self.connection.clone(),
+                );
+                let statement =
+                    Statement::new(program, self.connection.get_pager(), cached.query_mode);
+                return Ok(Box::new(TursoStatement {
+                    concurrent_guard: self.concurrent_guard.clone(),
+                    async_io: self.async_io,
+                    statement,
+                }));
+            }
+        }
+
+        // Not cached, prepare it fresh
+        let statement = self.connection.prepare(sql_str)?;
+
+        // Cache it for future use
+        let cached = Arc::new(CachedStatement {
+            program: statement.get_program().prepared().clone(),
+            query_mode: statement.get_query_mode(),
+        });
+        self.cached_statements
+            .lock()
+            .unwrap()
+            .insert(sql_str.to_string(), cached);
+
+        Ok(Box::new(TursoStatement {
+            concurrent_guard: self.concurrent_guard.clone(),
+            async_io: self.async_io,
+            statement,
+        }))
+    }
+
     /// prepares first SQL statement from the string and return prepared statement and position after the end of the parsed statement
     /// this method can be useful if SDK provides an execute(...) method which run all statements from the provided input in sequence
     pub fn prepare_first(
@@ -883,6 +1050,13 @@ impl TursoStatement {
         }
         Ok(self.statement.get_column_name(index))
     }
+    /// returns column declared type (e.g. "INTEGER", "TEXT", "DATETIME", etc.)
+    pub fn column_decltype(&self, index: usize) -> Option<String> {
+        if index >= self.column_count() {
+            return None;
+        }
+        self.statement.get_column_decltype(index)
+    }
     /// finalize statement execution
     /// this method must be called in the end of statement execution (either successfull or not)
     pub fn finalize(&mut self, waker: Option<&Waker>) -> Result<TursoStatusCode, TursoError> {
@@ -954,7 +1128,8 @@ mod tests {
                 io: None,
                 db_file: None,
             });
-            db.open().unwrap();
+            let result = db.open().unwrap();
+            assert!(!result.is_io());
             let conn = db.connect().unwrap();
             let stmt1 = conn
                 .prepare_single("SELECT * FROM generate_series(1, 100000)")
@@ -1014,11 +1189,218 @@ mod tests {
             io: None,
             db_file: None,
         });
-        db.open().unwrap();
+        let result = db.open().unwrap();
+        assert!(!result.is_io());
         let conn = db.connect().unwrap();
         let mut stmt = conn
             .prepare_single("SELECT * FROM generate_series(1, 10000)")
             .unwrap();
         assert_eq!(stmt.execute(None).unwrap().status, TursoStatusCode::Done);
+    }
+
+    #[test]
+    pub fn test_prepare_cached_concurrent_use_errors() {
+        use std::sync::{Arc, Barrier};
+
+        let db = TursoDatabase::new(TursoDatabaseConfig {
+            path: ":memory:".to_string(),
+            experimental_features: None,
+            async_io: false,
+            encryption: None,
+            vfs: None,
+            io: None,
+            db_file: None,
+        });
+        let result = db.open().unwrap();
+        assert!(!result.is_io());
+        let conn = db.connect().unwrap();
+
+        let mut create = conn
+            .prepare_single(
+                "CREATE TABLE hosts (
+                    name TEXT PRIMARY KEY,
+                    app TEXT,
+                    address TEXT,
+                    namespace TEXT,
+                    cloud_cluster_name TEXT,
+                    allowed_ips TEXT,
+                    updated_at INTEGER
+                )",
+            )
+            .unwrap();
+        create.execute(None).unwrap();
+
+        let insert_sql = "INSERT INTO hosts (
+                name, app, address, namespace, cloud_cluster_name, allowed_ips, updated_at
+            ) SELECT
+                'host-' || uuid4_str(),
+                'app' || uuid4_str(),
+                'addr' || uuid4_str(),
+                'ns' || uuid4_str(),
+                'cluster' || uuid4_str(),
+                'ip' || uuid4_str(),
+                 datetime('now') FROM generate_series(1,100)";
+
+        let stmt1 = conn.prepare_cached(insert_sql).unwrap();
+        let stmt2 = conn.prepare_cached(insert_sql).unwrap();
+
+        let barrier = Arc::new(Barrier::new(2));
+        let mut handles = Vec::new();
+        for mut stmt in [stmt1, stmt2] {
+            let barrier = barrier.clone();
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                stmt.execute(None)
+            }));
+        }
+
+        let mut results = Vec::new();
+        for handle in handles {
+            results.push(handle.join().unwrap());
+        }
+
+        assert!(
+            results
+                .iter()
+                .any(|r| matches!(r, Err(TursoError::Misuse(_)))),
+            "expected at least one concurrent-use error, got: {results:?}"
+        );
+        assert!(
+            results
+                .iter()
+                .filter_map(|r| r.as_ref().err())
+                .all(|e| matches!(e, TursoError::Misuse(_))),
+            "expected only misuse errors, got: {results:?}"
+        );
+    }
+
+    #[cfg(feature = "encryption")]
+    mod encryption_tests {
+        use super::*;
+        use crate::rsapi::ValueRef;
+        use tempfile::NamedTempFile;
+
+        const TEST_CIPHER: &str = "aes256gcm";
+        const TEST_HEXKEY: &str =
+            "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+        const WRONG_HEXKEY: &str =
+            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+
+        fn create_encryption_opts() -> crate::rsapi::EncryptionOpts {
+            crate::rsapi::EncryptionOpts {
+                cipher: TEST_CIPHER.to_string(),
+                hexkey: TEST_HEXKEY.to_string(),
+            }
+        }
+
+        fn assert_integer(value: ValueRef, expected: i64) {
+            match value {
+                ValueRef::Integer(i) => assert_eq!(i, expected),
+                _ => panic!("Expected integer {expected}, got {value:?}"),
+            }
+        }
+
+        #[test]
+        fn test_encryption() {
+            let temp_file = NamedTempFile::new().unwrap();
+            let db_path = temp_file.path().to_str().unwrap();
+
+            // 1. Create encrypted database and insert data
+            {
+                let db = TursoDatabase::new(TursoDatabaseConfig {
+                    path: db_path.to_string(),
+                    experimental_features: Some("encryption".to_string()),
+                    async_io: false,
+                    encryption: Some(create_encryption_opts()),
+                    vfs: None,
+                    io: None,
+                    db_file: None,
+                });
+                let result = db.open().unwrap();
+                assert!(!result.is_io());
+                let conn = db.connect().unwrap();
+
+                let mut stmt = conn
+                    .prepare_single("CREATE TABLE test (id INTEGER PRIMARY KEY, value TEXT)")
+                    .unwrap();
+                stmt.execute(None).unwrap();
+
+                let mut stmt = conn
+                    .prepare_single("INSERT INTO test (id, value) VALUES (1, 'secret_data')")
+                    .unwrap();
+                stmt.execute(None).unwrap();
+
+                // Checkpoint to ensure data is written to main db file
+                let mut stmt = conn
+                    .prepare_single("PRAGMA wal_checkpoint(TRUNCATE)")
+                    .unwrap();
+                stmt.execute(None).unwrap();
+            }
+
+            // 2. Verify data is encrypted on disk
+            let content = std::fs::read(db_path).unwrap();
+            assert!(content.len() > 1024);
+            assert!(
+                !content.windows(11).any(|w| w == b"secret_data"),
+                "Plaintext should not appear in encrypted database file"
+            );
+
+            // 3. Reopen with correct key and verify data
+            {
+                let db = TursoDatabase::new(TursoDatabaseConfig {
+                    path: db_path.to_string(),
+                    experimental_features: Some("encryption".to_string()),
+                    async_io: false,
+                    encryption: Some(create_encryption_opts()),
+                    vfs: None,
+                    io: None,
+                    db_file: None,
+                });
+                let result = db.open().unwrap();
+                assert!(!result.is_io());
+                let conn = db.connect().unwrap();
+
+                let mut stmt = conn
+                    .prepare_single("SELECT id, value FROM test WHERE id = 1")
+                    .unwrap();
+                assert_eq!(stmt.step(None).unwrap(), TursoStatusCode::Row);
+                assert_integer(stmt.row_value(0).unwrap(), 1);
+                assert_eq!(stmt.row_value(1).unwrap().to_text(), Some("secret_data"));
+            }
+
+            // 4. Verify opening with wrong key fails
+            {
+                let db = TursoDatabase::new(TursoDatabaseConfig {
+                    path: db_path.to_string(),
+                    experimental_features: Some("encryption".to_string()),
+                    async_io: false,
+                    encryption: Some(crate::rsapi::EncryptionOpts {
+                        cipher: TEST_CIPHER.to_string(),
+                        hexkey: WRONG_HEXKEY.to_string(),
+                    }),
+                    vfs: None,
+                    io: None,
+                    db_file: None,
+                });
+                assert!(db.open().is_err(), "Opening with wrong key should fail");
+            }
+
+            // 5. Verify opening without encryption fails
+            {
+                let db = TursoDatabase::new(TursoDatabaseConfig {
+                    path: db_path.to_string(),
+                    experimental_features: Some("encryption".to_string()),
+                    async_io: false,
+                    encryption: None,
+                    vfs: None,
+                    io: None,
+                    db_file: None,
+                });
+                assert!(
+                    db.open().is_err(),
+                    "Opening encrypted database without key should fail"
+                );
+            }
+        }
     }
 }

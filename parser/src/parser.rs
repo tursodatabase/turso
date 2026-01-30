@@ -188,6 +188,11 @@ impl<'a> Parser<'a> {
             let variable_id = variable_str
                 .parse::<u32>()
                 .map_err(|e| Error::Custom(format!("non-integer positional variable id: {e}")))?;
+            if variable_id == 0 {
+                return Err(Error::Custom(
+                    "variable number must be between ?1 and ?250000".to_string(),
+                ));
+            }
             self.last_variable_id = variable_id;
             Ok(Expr::Variable(from_bytes(token)))
         }
@@ -609,7 +614,8 @@ impl<'a> Parser<'a> {
             TK_INSERT,
             TK_REPLACE,
             TK_UPDATE,
-            TK_REINDEX
+            TK_REINDEX,
+            TK_OPTIMIZE
         );
 
         match tok.token_type {
@@ -632,6 +638,7 @@ impl<'a> Parser<'a> {
             TK_INSERT | TK_REPLACE => self.parse_insert(),
             TK_UPDATE => self.parse_update(),
             TK_REINDEX => self.parse_reindex(),
+            TK_OPTIMIZE => self.parse_optimize(),
             _ => unreachable!(),
         }
     }
@@ -1582,10 +1589,10 @@ impl<'a> Parser<'a> {
                 } else {
                     match_ignore_ascii_case!(match name {
                         b"true" => {
-                            Ok(Box::new(Expr::Literal(Literal::Numeric("1".into()))))
+                            Ok(Box::new(Expr::Literal(Literal::True)))
                         }
                         b"false" => {
-                            Ok(Box::new(Expr::Literal(Literal::Numeric("0".into()))))
+                            Ok(Box::new(Expr::Literal(Literal::False)))
                         }
                         _ => Ok(Box::new(Expr::Id(Name::from_bytes(name)))),
                     })
@@ -1712,7 +1719,9 @@ impl<'a> Parser<'a> {
                     eat_assert!(self, TK_BETWEEN);
                     let start = self.parse_expr(pre)?;
                     eat_expect!(self, TK_AND);
-                    let end = self.parse_expr(pre)?;
+                    // Use pre + 1 so that same-precedence operators (like IS NOT NULL)
+                    // bind to the whole BETWEEN expression, not just the end value
+                    let end = self.parse_expr(pre + 1)?;
                     Box::new(Expr::Between {
                         lhs: result,
                         not,
@@ -1793,11 +1802,13 @@ impl<'a> Parser<'a> {
                         _ => unreachable!(),
                     };
 
-                    let expr = self.parse_expr(pre)?;
+                    // Use pre + 1 so that same-precedence operators (like IS NOT NULL)
+                    // bind to the whole LIKE expression, not just the pattern
+                    let expr = self.parse_expr(pre + 1)?;
                     let escape = if let Some(tok) = self.peek()? {
                         if tok.token_type == TK_ESCAPE {
                             eat_assert!(self, TK_ESCAPE);
-                            Some(self.parse_expr(pre)?)
+                            Some(self.parse_expr(pre + 1)?)
                         } else {
                             None
                         }
@@ -3153,9 +3164,9 @@ impl<'a> Parser<'a> {
             _ => {
                 let name = self.parse_nm()?;
                 let expr = if name.as_str().eq_ignore_ascii_case("true") {
-                    Expr::Literal(Literal::Numeric("1".into()))
+                    Expr::Literal(Literal::True)
                 } else if name.as_str().eq_ignore_ascii_case("false") {
-                    Expr::Literal(Literal::Numeric("0".into()))
+                    Expr::Literal(Literal::False)
                 } else {
                     Expr::Id(name)
                 };
@@ -3403,6 +3414,7 @@ impl<'a> Parser<'a> {
         in_alter: bool,
     ) -> Result<Vec<NamedColumnConstraint>> {
         let mut result = vec![];
+        let mut has_primary_key = false;
 
         loop {
             let name = match self.peek()? {
@@ -3453,6 +3465,13 @@ impl<'a> Parser<'a> {
                                     .to_owned(),
                             ));
                         }
+
+                        if has_primary_key {
+                            return Err(Error::Custom(
+                                "multiple PRIMARY KEY constraints on a single column".to_owned(),
+                            ));
+                        }
+                        has_primary_key = true;
 
                         result.push(NamedColumnConstraint {
                             name,
@@ -4133,6 +4152,21 @@ impl<'a> Parser<'a> {
                 _ => Ok(Stmt::Reindex { name: None }),
             },
             _ => Ok(Stmt::Reindex { name: None }),
+        }
+    }
+
+    /// Parse `OPTIMIZE INDEX [idx_name]`
+    fn parse_optimize(&mut self) -> Result<Stmt> {
+        eat_assert!(self, TK_OPTIMIZE);
+        eat_expect!(self, TK_INDEX);
+        match self.peek()? {
+            Some(tok) => match tok.token_type.fallback_id_if_ok() {
+                TK_ID | TK_STRING | TK_JOIN_KW | TK_INDEXED => Ok(Stmt::Optimize {
+                    idx_name: Some(self.parse_fullname(false)?),
+                }),
+                _ => Ok(Stmt::Optimize { idx_name: None }),
+            },
+            _ => Ok(Stmt::Optimize { idx_name: None }),
         }
     }
 }

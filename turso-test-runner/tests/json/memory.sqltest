@@ -1,0 +1,93 @@
+@database :memory:
+
+test non-string-path {
+    SELECT * FROM json_each('{}', 123);
+}
+expect error {
+}
+
+test invalid-path {
+    SELECT * FROM json_each('{}', '$$$');
+}
+expect error {
+}
+
+test json-tree-non-string-path {
+    SELECT * FROM json_tree('{}', 123);
+}
+expect error {
+}
+
+test json-tree-invalid-path {
+    SELECT * FROM json_tree('{}', '$$$');
+}
+expect error {
+}
+
+# Malformed JSON edge cases - must error like SQLite
+test json-malformed-empty-string {
+    SELECT json('');
+}
+expect error {
+}
+
+test json-malformed-plus-only {
+    SELECT json('+');
+}
+expect error {
+}
+
+test json-malformed-minus-only {
+    SELECT json('-');
+}
+expect error {
+}
+
+test json-malformed-double-minus {
+    SELECT json('--1');
+}
+expect error {
+}
+
+test json-malformed-double-plus {
+    SELECT json('++1');
+}
+expect error {
+}
+
+test json-malformed-incomplete-exponent {
+    SELECT json('1e');
+}
+expect error {
+}
+
+test json-malformed-incomplete-exponent-plus {
+    SELECT json('1e+');
+}
+expect error {
+}
+
+test json-malformed-incomplete-exponent-minus {
+    SELECT json('1e-');
+}
+expect error {
+}
+
+test json-malformed-hex-no-digits {
+    SELECT json('0x');
+}
+expect error {
+}
+
+test json-malformed-leading-zeros {
+    SELECT json('00');
+}
+expect error {
+}
+
+test json-malformed-leading-zero-digit {
+    SELECT json('01');
+}
+expect error {
+}
+

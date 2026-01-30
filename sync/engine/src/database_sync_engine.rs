@@ -6,7 +6,7 @@ use std::{
     },
 };
 
-use turso_core::{Buffer, Completion, DatabaseStorage, OpenFlags};
+use turso_core::{Buffer, Completion, DatabaseStorage, OpenDbAsyncState, OpenFlags};
 
 use crate::{
     database_replay_generator::DatabaseReplayGenerator,
@@ -29,7 +29,8 @@ use crate::{
     types::{
         Coro, DatabaseMetadata, DatabasePullRevision, DatabaseRowTransformResult,
         DatabaseSavedConfiguration, DatabaseSyncEngineProtocolVersion, DatabaseTapeOperation,
-        DbChangesStatus, PartialSyncOpts, SyncEngineStats, DATABASE_METADATA_VERSION,
+        DbChangesStatus, PartialSyncOpts, SyncEngineIoResult, SyncEngineStats,
+        DATABASE_METADATA_VERSION,
     },
     wal_session::WalSession,
     Result,
@@ -47,6 +48,8 @@ pub struct DatabaseSyncEngineOpts {
     pub bootstrap_if_empty: bool,
     pub reserved_bytes: usize,
     pub partial_sync_opts: Option<PartialSyncOpts>,
+    /// Base64-encoded encryption key for the Turso Cloud database
+    pub remote_encryption_key: Option<String>,
 }
 
 pub struct DataStats {
@@ -143,7 +146,10 @@ async fn full_read<Ctx, IO: SyncEngineIo>(
     loop {
         let c = Completion::new_read(buffer.clone(), {
             let read_len = read_len.clone();
-            move |r| *read_len.lock().unwrap() = r.expect("memory io must not fail").1
+            move |r| {
+                *read_len.lock().unwrap() = r.expect("memory io must not fail").1;
+                None
+            }
         });
         let read = file.pread(offset, c).expect("memory io must not fail");
         assert!(read.finished(), "memory io must complete immediately");
@@ -241,7 +247,12 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             None if opts.bootstrap_if_empty => {
                 let client_unique_id = format!("{}-{}", opts.client_name, uuid::Uuid::new_v4());
                 let revision = bootstrap_db_file(
-                    &SyncOperationCtx::new(coro, &sync_engine_io, opts.remote_url.clone()),
+                    &SyncOperationCtx::new(
+                        coro,
+                        &sync_engine_io,
+                        opts.remote_url.clone(),
+                        opts.remote_encryption_key.as_deref(),
+                    ),
                     &io,
                     main_db_path,
                     opts.protocol_version_hint,
@@ -256,7 +267,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                     revert_since_wal_watermark: 0,
                     last_pushed_change_id_hint: 0,
                     last_pushed_pull_gen_hint: 0,
-                    last_pull_unix_time: Some(io.now().secs),
+                    last_pull_unix_time: Some(io.current_time_wall_clock().secs),
                     last_push_unix_time: None,
                     partial_bootstrap_server_revision: if partial {
                         Some(revision.clone())
@@ -342,6 +353,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         sync_engine_io: SyncEngineIoStats<IO>,
         meta: &DatabaseMetadata,
         main_db_path: &str,
+        remote_encryption_key: Option<&str>,
     ) -> Result<Arc<dyn DatabaseStorage>> {
         let db_file = io.open_file(main_db_path, turso_core::OpenFlags::Create, false)?;
         let db_file: Arc<dyn DatabaseStorage> = if let Some(partial_sync_opts) =
@@ -359,6 +371,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                 ));
             };
             tracing::info!("create LazyDatabaseStorage database storage");
+            let encoded_key = remote_encryption_key.map(|k| k.to_string());
             Arc::new(LazyDatabaseStorage::new(
                 db_file,
                 None, // todo(sivukhin): allocate dirty file for FS IO
@@ -369,6 +382,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                     .as_ref()
                     .and_then(|x| x.remote_url.as_ref())
                     .cloned(),
+                encoded_key,
             )?)
         } else {
             Arc::new(turso_core::storage::database::DatabaseFile::new(db_file))
@@ -474,29 +488,65 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             meta,
         )
         .await?;
-        let main_db_storage =
-            Self::init_db_storage(io.clone(), sync_engine_io.clone(), &meta, main_db_path)?;
-        let main_db = turso_core::Database::open_with_flags(
+        let main_db_storage = Self::init_db_storage(
             io.clone(),
+            sync_engine_io.clone(),
+            &meta,
             main_db_path,
-            main_db_storage,
-            OpenFlags::Create,
-            turso_core::DatabaseOpts::new(),
-            None,
+            opts.remote_encryption_key.as_deref(),
         )?;
+
+        // Use async database opening that yields on IO for large schemas
+        let mut open_state = turso_core::OpenDbAsyncState::new();
+        let main_db = loop {
+            match turso_core::Database::open_with_flags_async(
+                &mut open_state,
+                io.clone(),
+                main_db_path,
+                main_db_storage.clone(),
+                OpenFlags::Create,
+                turso_core::DatabaseOpts::new(),
+                None,
+            )? {
+                turso_core::IOResult::Done(db) => break db,
+                turso_core::IOResult::IO(io_completion) => {
+                    while !io_completion.finished() {
+                        coro.yield_(SyncEngineIoResult::IO).await?;
+                    }
+                }
+            }
+        };
+
         Self::open_db(coro, io, sync_engine_io, main_db, opts).await
     }
 
-    fn open_revert_db_conn(&self) -> Result<Arc<turso_core::Connection>> {
-        let db = turso_core::Database::open_with_flags_bypass_registry(
-            self.io.clone(),
-            &self.main_db_path,
-            &self.revert_db_wal_path,
-            self.db_file.clone(),
-            OpenFlags::Create,
-            turso_core::DatabaseOpts::new(),
-            None,
-        )?;
+    async fn open_revert_db_conn<Ctx>(
+        &self,
+        coro: &Coro<Ctx>,
+    ) -> Result<Arc<turso_core::Connection>> {
+        let db = {
+            let mut state = OpenDbAsyncState::new();
+            loop {
+                match turso_core::Database::open_with_flags_bypass_registry_async(
+                    &mut state,
+                    self.io.clone(),
+                    &self.main_db_path,
+                    Some(&self.revert_db_wal_path),
+                    self.db_file.clone(),
+                    OpenFlags::Create,
+                    turso_core::DatabaseOpts::new(),
+                    None,
+                )? {
+                    turso_core::IOResult::Done(db) => break db,
+                    turso_core::IOResult::IO(io_completion) => {
+                        while !io_completion.finished() {
+                            coro.yield_(SyncEngineIoResult::IO).await?;
+                        }
+                        continue;
+                    }
+                }
+            }
+        };
         let conn = db.connect()?;
         conn.wal_auto_checkpoint_disable();
         Ok(conn)
@@ -542,7 +592,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             self.main_db_path,
             result
         );
-        if result.max_frame < watermark {
+        if result.wal_max_frame < watermark {
             return Err(Error::DatabaseSyncEngineError(
                 format!("unable to checkpoint synced portion of WAL: result={result:?}, watermark={watermark}"),
             ));
@@ -599,7 +649,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             self.main_db_path
         );
         let main_conn = connect_untracked(&self.main_tape)?;
-        let revert_conn = self.open_revert_db_conn()?;
+        let revert_conn = self.open_revert_db_conn(coro).await?;
 
         let mut page = [0u8; PAGE_SIZE];
         let db_size = if revert_conn.try_wal_watermark_read_page(1, &mut page, None)? {
@@ -712,9 +762,14 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
 
         let file = acquire_slot(&self.changes_file)?;
 
-        let now = self.io.now();
+        let now = self.io.current_time_wall_clock();
         let revision = self.meta().synced_revision.clone();
-        let ctx = &SyncOperationCtx::new(coro, &self.sync_engine_io, self.meta().remote_url());
+        let ctx = &SyncOperationCtx::new(
+            coro,
+            &self.sync_engine_io,
+            self.meta().remote_url(),
+            self.opts.remote_encryption_key.as_deref(),
+        );
         let next_revision = wal_pull_to_file(
             ctx,
             &file.value,
@@ -797,7 +852,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
 
         let (_, watermark) = self.checkpoint_passive(coro).await?;
 
-        let revert_conn = self.open_revert_db_conn()?;
+        let revert_conn = self.open_revert_db_conn(coro).await?;
         let main_conn = connect_untracked(&self.main_tape)?;
 
         let mut revert_session = WalSession::new(revert_conn.clone());
@@ -964,8 +1019,12 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             };
 
             let mut transformed = if self.opts.use_transform {
-                let ctx =
-                    &SyncOperationCtx::new(coro, &self.sync_engine_io, self.meta().remote_url());
+                let ctx = &SyncOperationCtx::new(
+                    coro,
+                    &self.sync_engine_io,
+                    self.meta().remote_url(),
+                    self.opts.remote_encryption_key.as_deref(),
+                );
                 Some(apply_transformation(ctx, &local_changes, &replay.generator).await?)
             } else {
                 None
@@ -1005,13 +1064,18 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
     pub async fn push_changes_to_remote<Ctx>(&self, coro: &Coro<Ctx>) -> Result<()> {
         tracing::info!("push_changes(path={})", self.main_db_path);
 
-        let ctx = &SyncOperationCtx::new(coro, &self.sync_engine_io, self.meta().remote_url());
+        let ctx = &SyncOperationCtx::new(
+            coro,
+            &self.sync_engine_io,
+            self.meta().remote_url(),
+            self.opts.remote_encryption_key.as_deref(),
+        );
         let (_, change_id) =
             push_logical_changes(ctx, &self.main_tape, &self.client_unique_id, &self.opts).await?;
 
         self.update_meta(coro, |m| {
             m.last_pushed_change_id_hint = change_id;
-            m.last_push_unix_time = Some(self.io.now().secs);
+            m.last_push_unix_time = Some(self.io.current_time_wall_clock().secs);
         })
         .await?;
 

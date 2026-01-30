@@ -866,7 +866,7 @@ pub fn group_by_emit_row_phase<'a>(
         ),
     });
 
-    // Reopen ephemeral indexes for distinct aggregates (effectively clearing them).
+    // Clear hash tables for distinct aggregates
     plan.aggregates
         .iter()
         .filter_map(|agg| {
@@ -880,9 +880,8 @@ pub fn group_by_emit_row_phase<'a>(
             let ctx = ctx
                 .as_ref()
                 .expect("distinct aggregate context not populated");
-            program.emit_insn(Insn::OpenEphemeral {
-                cursor_id: ctx.cursor_id,
-                is_table: false,
+            program.emit_insn(Insn::HashClear {
+                hash_table_id: ctx.hash_table_id,
             });
         });
 

@@ -7,7 +7,8 @@ mod parser;
 mod utils;
 
 pub use parser::{
-    ConversionResult, ConversionWarning, TclParser, TclTest, TclTestKind, WarningKind,
+    ConversionResult, ConversionWarning, TclParser, TclSkip, TclSkipCondition, TclTest,
+    TclTestKind, WarningKind,
 };
 
 use std::collections::HashMap;
@@ -59,17 +60,17 @@ fn get_db_declaration(db_key: &str, has_ddl: bool) -> String {
     if db_key == "memory" || has_ddl {
         "@database :memory:".to_string()
     } else {
-        // Map suffix back to database path
+        // Map suffix back to database type or path
         match db_key {
-            "default" => ["testing", "testing_norowidalias"]
-                .map(|key| format!("@database database/{key}.db readonly"))
-                .join("\n"),
-            "small" | "norowidalias" | "user_version_10" => {
-                format!("@database database/testing_{db_key}.db readonly")
+            "default" => "@database :default:\n@database :default-no-rowidalias:".to_string(),
+            "norowidalias" => "@database :default-no-rowidalias:".to_string(),
+            "small" => "@database database/testing_small.db readonly".to_string(),
+            "user_version_10" => {
+                "@database database/testing_user_version_10.db readonly".to_string()
             }
             other => {
                 // For unknown databases, try to construct a path
-                return format!("@database database/{}.db readonly", other);
+                format!("@database database/{other}.db readonly")
             }
         }
     }
@@ -134,7 +135,16 @@ fn generate_tests_output(tests: &[&TclTest], db_key: &str, has_ddl: bool) -> Str
 fn write_test(output: &mut String, test: &TclTest) {
     // Write comments before the test
     for comment in &test.comments {
-        writeln!(output, "{}", comment).unwrap();
+        writeln!(output, "{comment}").unwrap();
+    }
+
+    // Write skip decorator if present
+    if let Some(skip) = &test.skip {
+        match skip.condition {
+            TclSkipCondition::Mvcc => {
+                writeln!(output, "@skip-if mvcc \"{}\"", skip.reason).unwrap();
+            }
+        }
     }
 
     // Write test header
@@ -165,14 +175,14 @@ fn write_test(output: &mut String, test: &TclTest) {
                 writeln!(output, "expect raw {{").unwrap();
                 for line in expected.lines() {
                     if !line.is_empty() {
-                        writeln!(output, "{}", line).unwrap();
+                        writeln!(output, "{line}").unwrap();
                     }
                 }
             } else {
                 writeln!(output, "expect {{").unwrap();
                 for line in expected.lines() {
                     if !line.is_empty() {
-                        writeln!(output, "    {}", line).unwrap();
+                        writeln!(output, "    {line}").unwrap();
                     }
                 }
             }

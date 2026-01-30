@@ -80,6 +80,9 @@ const client = createClient({ url, authToken });
 await client.execute(sql, args);
 await client.batch(statements);
 
+// ✅ Supported: remote encryption key for encrypted Turso Cloud databases
+createClient({ url, authToken, remoteEncryptionKey: "base64-encoded-key" });
+
 // ❌ Unsupported (throws LibsqlError)
 createClient({ url, authToken, encryptionKey: "..." }); // Validation error
 await client.transaction(); // Not implemented

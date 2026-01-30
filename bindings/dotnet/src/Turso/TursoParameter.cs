@@ -65,7 +65,13 @@ public class TursoParameter : DbParameter
     public override ParameterDirection Direction
     {
         get => ParameterDirection.Input; 
-        set => throw new NotImplementedException();
+        set
+        {
+            if (value != ParameterDirection.Input)
+            {
+                throw new ArgumentException("Only input parameters are supported");
+            }
+        }
     }
     public override bool IsNullable { get; set; }
     public override string? ParameterName { get; set; }

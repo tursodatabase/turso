@@ -8,7 +8,7 @@ use crate::model::query::select::{
     CompoundOperator, CompoundSelect, Distinctness, FromClause, OrderBy, ResultColumn, SelectBody,
     SelectInner, SelectTable,
 };
-use crate::model::query::update::Update;
+use crate::model::query::update::{SetValue, Update};
 use crate::model::query::{Create, CreateIndex, Delete, Drop, DropIndex, Insert, Select};
 use crate::model::table::{
     Column, Index, JoinType, JoinedTable, Name, SimValue, Table, TableContext,
@@ -244,13 +244,25 @@ impl Arbitrary for Insert {
         let opts = &env.opts().query.insert;
         let gen_values = |rng: &mut R| {
             let table = pick(env.tables(), rng);
+
             let num_rows = rng.random_range(opts.min_rows.get()..opts.max_rows.get());
+            let base_offset: i64 = rng.random_range(1_000_000_000..2_000_000_000);
+
             let values: Vec<Vec<SimValue>> = (0..num_rows)
-                .map(|_| {
+                .map(|row_idx| {
                     table
                         .columns
                         .iter()
-                        .map(|c| SimValue::arbitrary_from(rng, env, &c.column_type))
+                        .enumerate()
+                        .map(|(col_idx, c)| {
+                            if c.has_unique_constraint() {
+                                let offset =
+                                    base_offset + (col_idx as i64 * 10_000_000) + row_idx as i64;
+                                SimValue::unique_for_type(&c.column_type, offset)
+                            } else {
+                                SimValue::arbitrary_from(rng, env, &c.column_type)
+                            }
+                        })
                         .collect()
                 })
                 .collect();
@@ -263,7 +275,13 @@ impl Arbitrary for Insert {
         // we keep this here for now, because gen_select does not generate subqueries, and they're
         // important for surfacing bugs.
         let gen_nested_self_insert = |rng: &mut R| {
-            let table = pick(env.tables(), rng);
+            let non_unique: Vec<_> = env
+                .tables()
+                .iter()
+                .filter(|t| !t.has_any_unique_column())
+                .collect();
+            non_unique.first()?;
+            let table = *pick(&non_unique, rng);
 
             const MAX_SELF_INSERT_DEPTH: i32 = 5;
             let nesting_depth = rng.random_range(1..=MAX_SELF_INSERT_DEPTH);
@@ -299,8 +317,11 @@ impl Arbitrary for Insert {
         };
 
         let gen_select = |rng: &mut R| {
-            // Find a non-empty table
-            let select_table = env.tables().iter().find(|t| !t.rows.is_empty())?;
+            // Find a non-empty table without UNIQUE constraints
+            let select_table = env
+                .tables()
+                .iter()
+                .find(|t| !t.rows.is_empty() && !t.has_any_unique_column())?;
             let row = pick(&select_table.rows, rng);
             let predicate = Predicate::arbitrary_from(rng, env, (select_table, row));
             // TODO change for arbitrary_sized and insert from arbitrary tables
@@ -384,9 +405,10 @@ impl Arbitrary for CreateIndex {
             .collect::<Vec<(String, SortOrder)>>();
 
         let index_name = format!(
-            "idx_{}_{}",
+            "idx_{}_{}_{}",
             table.name,
-            gen_random_text(rng).chars().take(8).collect::<String>()
+            gen_random_text(rng).chars().take(8).collect::<String>(),
+            rng.random_range(0..1000000)
         );
 
         CreateIndex {
@@ -402,20 +424,122 @@ impl Arbitrary for CreateIndex {
 impl Arbitrary for Update {
     fn arbitrary<R: Rng + ?Sized, C: GenerationContext>(rng: &mut R, env: &C) -> Self {
         let table = pick(env.tables(), rng);
-        let num_cols = rng.random_range(1..=table.columns.len());
-        let columns = pick_unique(&table.columns, num_cols, rng);
-        let set_values: Vec<(String, SimValue)> = columns
-            .map(|column| {
-                (
-                    column.name.clone(),
-                    SimValue::arbitrary_from(rng, env, &column.column_type),
-                )
+        let update_opts = &env.opts().query.update;
+
+        let unique_columns: Vec<(usize, &Column)> = table
+            .columns
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| {
+                c.has_unique_constraint()
+                    && !matches!(c.column_type, crate::model::table::ColumnType::Blob)
             })
             .collect();
+
+        let non_unique_columns: Vec<&Column> = table
+            .columns
+            .iter()
+            .filter(|c| !c.has_unique_constraint())
+            .collect();
+
+        // (first row and last row have different values)
+        let last_row_idx = table.rows.len().saturating_sub(1);
+        let conflict_capable_columns: Vec<(usize, &Column)> = if table.rows.len() >= 2 {
+            unique_columns
+                .iter()
+                .filter(|(col_idx, _)| {
+                    table.rows[0][*col_idx] != table.rows[last_row_idx][*col_idx]
+                })
+                .copied()
+                .collect()
+        } else {
+            vec![]
+        };
+
+        // CASE WHEN:
+        // 1. Profile explicitly enables force_late_failure
+        // 2. Table has conflict-capable UNIQUE columns
+        // 3. Table has at least one non-UNIQUE column
+        let use_case_when = update_opts.force_late_failure
+            && !conflict_capable_columns.is_empty()
+            && !non_unique_columns.is_empty();
+
+        let (set_values, predicate) = if use_case_when {
+            let (col_idx, unique_col) = *pick(&conflict_capable_columns, rng);
+            let marker_col = *pick(&non_unique_columns, rng);
+            let first_val = table.rows[0][col_idx].clone();
+            let last_val = table.rows[last_row_idx][col_idx].clone();
+
+            let marker_value = match update_opts.padding_size {
+                Some(size) => {
+                    let p = "X".repeat(size);
+                    if matches!(
+                        marker_col.column_type,
+                        crate::model::table::ColumnType::Blob
+                    ) {
+                        SimValue(turso_core::Value::Blob(p.into_bytes()))
+                    } else {
+                        SimValue(turso_core::Value::Text(p.into()))
+                    }
+                }
+                None => SimValue::arbitrary_from(rng, env, &marker_col.column_type),
+            };
+
+            let set_values = vec![
+                (marker_col.name.clone(), SetValue::Simple(marker_value)),
+                (
+                    unique_col.name.clone(),
+                    SetValue::CaseWhen {
+                        condition: Box::new(Predicate::eq(
+                            Predicate::column(unique_col.name.clone()),
+                            Predicate::value(last_val),
+                        )),
+                        then_value: first_val,
+                        else_column: unique_col.name.clone(),
+                    },
+                ),
+            ];
+            (set_values, Predicate::true_())
+        } else if non_unique_columns.is_empty() {
+            let column = pick(&table.columns, rng);
+            let base_offset: i64 = rng.random_range(2_000_000_000i64..3_000_000_000i64);
+
+            let unique_value = SimValue::unique_for_type(&column.column_type, base_offset);
+            let set_values = vec![(column.name.clone(), SetValue::Simple(unique_value))];
+
+            let predicate = if !table.rows.is_empty() {
+                let row = pick(&table.rows, rng);
+                Predicate::arbitrary_from(rng, env, (table, row))
+            } else {
+                Predicate::arbitrary_from(rng, env, table)
+            };
+
+            (set_values, predicate)
+        } else {
+            // Normal case: pick from non-UNIQUE columns
+            let num_cols = rng.random_range(1..=non_unique_columns.len());
+            let set_values: Vec<(String, SetValue)> =
+                pick_unique(&non_unique_columns, num_cols, rng)
+                    .map(|column| {
+                        (
+                            column.name.clone(),
+                            SetValue::Simple(SimValue::arbitrary_from(
+                                rng,
+                                env,
+                                &column.column_type,
+                            )),
+                        )
+                    })
+                    .collect();
+
+            let predicate = Predicate::arbitrary_from(rng, env, table);
+            (set_values, predicate)
+        };
+
         Update {
             table: table.name.clone(),
             set_values,
-            predicate: Predicate::arbitrary_from(rng, env, table),
+            predicate,
         }
     }
 }
@@ -445,29 +569,29 @@ const ALTER_TABLE_NO_ALTER_COL_NO_DROP: &[AlterTableTypeDiscriminants] = &[
     AlterTableTypeDiscriminants::RenameColumn,
 ];
 
-// TODO: Unfortunately this diff strategy allocates a couple of IndexSet's
-// in the future maybe change this to be more efficient. This is currently acceptable because this function
-// is only called for `DropColumn`
+/// Returns columns that can be dropped (not in indexes, not UNIQUE).
 fn get_column_diff(table: &Table) -> IndexSet<&str> {
-    // Columns that are referenced in INDEXES cannot be dropped
-    let column_cannot_drop = table
+    // Columns referenced in indexes or with UNIQUE constraints cannot be dropped
+    let mut undropable: IndexSet<&str> = table
         .indexes
         .iter()
-        .flat_map(|index| index.columns.iter().map(|(col_name, _)| col_name.as_str()))
-        .collect::<IndexSet<_>>();
-    if column_cannot_drop.len() == table.columns.len() {
-        // Optimization: all columns are present in indexes so we do not need to but the table column set
-        return IndexSet::new();
-    }
+        .flat_map(|idx| idx.columns.iter().map(|(name, _)| name.as_str()))
+        .collect();
 
-    let column_set: IndexSet<_, std::hash::RandomState> =
-        IndexSet::from_iter(table.columns.iter().map(|col| col.name.as_str()));
+    undropable.extend(
+        table
+            .columns
+            .iter()
+            .filter(|c| c.has_unique_constraint())
+            .map(|c| c.name.as_str()),
+    );
 
-    let diff = column_set
-        .difference(&column_cannot_drop)
-        .copied()
-        .collect::<IndexSet<_, std::hash::RandomState>>();
-    diff
+    table
+        .columns
+        .iter()
+        .map(|c| c.name.as_str())
+        .filter(|name| !undropable.contains(name))
+        .collect()
 }
 
 impl ArbitraryFrom<(&Table, &[AlterTableTypeDiscriminants])> for AlterTableType {
@@ -480,10 +604,19 @@ impl ArbitraryFrom<(&Table, &[AlterTableTypeDiscriminants])> for AlterTableType 
             AlterTableTypeDiscriminants::RenameTo => AlterTableType::RenameTo {
                 new_name: Name::arbitrary(rng, context).0,
             },
-            AlterTableTypeDiscriminants::AddColumn => AlterTableType::AddColumn {
-                column: Column::arbitrary(rng, context),
-            },
+            AlterTableTypeDiscriminants::AddColumn => {
+                use turso_parser::ast::ColumnConstraint;
+
+                let mut column = Column::arbitrary(rng, context);
+                // can't be dropped acc to sqlite
+                column
+                    .constraints
+                    .retain(|c| !matches!(c, ColumnConstraint::Unique(_)));
+                AlterTableType::AddColumn { column }
+            }
             AlterTableTypeDiscriminants::AlterColumn => {
+                use turso_parser::ast::ColumnConstraint;
+
                 let col_diff = get_column_diff(table);
 
                 if col_diff.is_empty() {
@@ -505,9 +638,14 @@ impl ArbitraryFrom<(&Table, &[AlterTableTypeDiscriminants])> for AlterTableType 
                 let col_idx = pick_index(col_diff.len(), rng);
                 let col_name = col_diff.get_index(col_idx).unwrap();
 
+                let mut column = Column::arbitrary(rng, context);
+                column
+                    .constraints
+                    .retain(|c| !matches!(c, ColumnConstraint::Unique(_)));
+
                 AlterTableType::AlterColumn {
                     old: col_name.to_string(),
-                    new: Column::arbitrary(rng, context),
+                    new: column,
                 }
             }
             AlterTableTypeDiscriminants::RenameColumn => AlterTableType::RenameColumn {

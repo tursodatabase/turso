@@ -11,6 +11,10 @@ use crate::storage::btree::CursorTrait;
 use crate::storage::btree::CursorValidState;
 use crate::storage::sqlite3_ondisk::DatabaseHeader;
 use crate::storage::wal::TursoRwLock;
+use crate::sync::atomic::{AtomicBool, AtomicI64};
+use crate::sync::atomic::{AtomicU64, Ordering};
+use crate::sync::Arc;
+use crate::sync::{Mutex, RwLock};
 use crate::translate::emitter::TransactionMode;
 use crate::translate::plan::IterationDirection;
 use crate::turso_assert;
@@ -19,7 +23,6 @@ use crate::types::IOCompletions;
 use crate::types::IOResult;
 use crate::types::ImmutableRecord;
 use crate::types::IndexInfo;
-use crate::types::RecordCursor;
 use crate::types::SeekResult;
 use crate::Completion;
 use crate::File;
@@ -27,17 +30,13 @@ use crate::IOExt;
 use crate::LimboError;
 use crate::Result;
 use crate::ValueRef;
-use crate::{Connection, Pager};
+use crate::{Connection, Pager, SyncMode};
 use crossbeam_skiplist::map::Entry;
 use crossbeam_skiplist::{SkipMap, SkipSet};
-use parking_lot::{Mutex, RwLock};
-use std::collections::HashMap;
+use rustc_hash::FxHashMap as HashMap;
 use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::ops::Bound;
-use std::sync::atomic::{AtomicBool, AtomicI64};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 use tracing::instrument;
 use tracing::Level;
 
@@ -117,19 +116,16 @@ impl SortableIndexKey {
     }
 
     fn compare(&self, other: &Self) -> Result<std::cmp::Ordering> {
-        let mut lhs_cursor = RecordCursor::new();
-        let mut rhs_cursor = RecordCursor::new();
-
         // We sometimes need to compare a shorter key to a longer one,
         // for example when seeking with an index key that is a prefix of the full key.
         let num_cols = self.metadata.num_cols.min(other.metadata.num_cols);
 
-        lhs_cursor.ensure_parsed_upto(&self.key, num_cols - 1)?;
-        rhs_cursor.ensure_parsed_upto(&other.key, num_cols - 1)?;
+        let mut lhs = self.key.iter()?;
+        let mut rhs = other.key.iter()?;
 
         for i in 0..num_cols {
-            let lhs_value = lhs_cursor.deserialize_column(&self.key, i)?;
-            let rhs_value = rhs_cursor.deserialize_column(&other.key, i)?;
+            let lhs_value = lhs.next().expect("we already checked length")?;
+            let rhs_value = rhs.next().expect("we already checked length")?;
 
             let cmp = compare_immutable(
                 std::iter::once(&lhs_value),
@@ -255,6 +251,9 @@ impl Row {
 /// TODO: we can optimize this by using bitpacking for the begin and end fields.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RowVersion {
+    /// Unique identifier for this version within the MvStore.
+    /// Used for savepoint tracking to identify specific versions to rollback.
+    pub id: u64,
     pub begin: Option<TxTimestampOrID>,
     pub end: Option<TxTimestampOrID>,
     pub row: Row,
@@ -303,6 +302,20 @@ pub enum TxTimestampOrID {
     TxID(TxID),
 }
 
+/// Tracks versions created/modified during a savepoint for rollback.
+/// Used for statement-level savepoints in interactive transactions.
+#[derive(Default, Debug)]
+pub struct Savepoint {
+    /// Versions CREATED during this savepoint (insert operations).
+    /// On rollback: these versions are removed from their chains.
+    created_table_versions: Vec<(RowID, u64)>,
+    created_index_versions: Vec<((MVTableId, Arc<SortableIndexKey>), u64)>,
+    /// Versions DELETED during this savepoint (end timestamp set).
+    /// On rollback: clear end timestamp to restore visibility.
+    deleted_table_versions: Vec<(RowID, u64)>,
+    deleted_index_versions: Vec<((MVTableId, Arc<SortableIndexKey>), u64)>,
+}
+
 /// Transaction
 #[derive(Debug)]
 pub struct Transaction {
@@ -318,6 +331,9 @@ pub struct Transaction {
     read_set: SkipSet<RowID>,
     /// The transaction header.
     header: RwLock<DatabaseHeader>,
+    /// Stack of savepoints for statement-level rollback.
+    /// Each savepoint tracks versions created/deleted during that statement.
+    savepoint_stack: RwLock<Vec<Savepoint>>,
 }
 
 impl Transaction {
@@ -329,6 +345,7 @@ impl Transaction {
             write_set: SkipSet::new(),
             read_set: SkipSet::new(),
             header: RwLock::new(header),
+            savepoint_stack: RwLock::new(Vec::new()),
         }
     }
 
@@ -338,6 +355,87 @@ impl Transaction {
 
     fn insert_to_write_set(&self, id: RowID) {
         self.write_set.insert(id);
+    }
+
+    /// Begin a new savepoint for statement-level tracking.
+    fn begin_savepoint(&self) {
+        let depth = self.savepoint_stack.read().len();
+        tracing::debug!("begin_savepoint(tx_id={}, depth={})", self.tx_id, depth);
+        self.savepoint_stack.write().push(Savepoint::default());
+    }
+
+    /// Release the newest savepoint (statement completed successfully).
+    fn release_savepoint(&self) {
+        let depth = self.savepoint_stack.read().len();
+        tracing::debug!("release_savepoint(tx_id={}, depth={})", self.tx_id, depth);
+        self.savepoint_stack.write().pop();
+    }
+
+    /// Pop and return the newest savepoint for rollback.
+    fn pop_savepoint(&self) -> Option<Savepoint> {
+        self.savepoint_stack.write().pop()
+    }
+
+    /// Record a version that was created during the current savepoint.
+    fn record_created_table_version(&self, rowid: RowID, version_id: u64) {
+        if let Some(savepoint) = self.savepoint_stack.write().last_mut() {
+            tracing::debug!(
+                "record_created_table_version(tx_id={}, table_id={}, row_id={}, version_id={})",
+                self.tx_id,
+                rowid.table_id,
+                rowid.row_id,
+                version_id
+            );
+            savepoint.created_table_versions.push((rowid, version_id));
+        }
+    }
+
+    /// Record an index version that was created during the current savepoint.
+    fn record_created_index_version(
+        &self,
+        key: (MVTableId, Arc<SortableIndexKey>),
+        version_id: u64,
+    ) {
+        if let Some(savepoint) = self.savepoint_stack.write().last_mut() {
+            tracing::debug!(
+                "record_created_index_version(tx_id={}, table_id={}, version_id={})",
+                self.tx_id,
+                key.0,
+                version_id
+            );
+            savepoint.created_index_versions.push((key, version_id));
+        }
+    }
+
+    /// Record a version that was deleted during the current savepoint.
+    fn record_deleted_table_version(&self, rowid: RowID, version_id: u64) {
+        if let Some(savepoint) = self.savepoint_stack.write().last_mut() {
+            tracing::debug!(
+                "record_deleted_table_version(tx_id={}, table_id={}, row_id={}, version_id={})",
+                self.tx_id,
+                rowid.table_id,
+                rowid.row_id,
+                version_id
+            );
+            savepoint.deleted_table_versions.push((rowid, version_id));
+        }
+    }
+
+    /// Record an index version that was deleted during the current savepoint.
+    fn record_deleted_index_version(
+        &self,
+        key: (MVTableId, Arc<SortableIndexKey>),
+        version_id: u64,
+    ) {
+        if let Some(savepoint) = self.savepoint_stack.write().last_mut() {
+            tracing::debug!(
+                "record_deleted_index_version(tx_id={}, table_id={}, version_id={})",
+                self.tx_id,
+                key.0,
+                version_id
+            );
+            savepoint.deleted_index_versions.push((key, version_id));
+        }
     }
 }
 
@@ -510,6 +608,8 @@ pub struct CommitStateMachine<Clock: LogicalClock> {
     commit_coordinator: Arc<CommitCoordinator>,
     header: Arc<RwLock<Option<DatabaseHeader>>>,
     pager: Arc<Pager>,
+    /// The synchronous mode for fsync operations. When set to Off, fsync is skipped.
+    sync_mode: SyncMode,
     _phantom: PhantomData<Clock>,
 }
 
@@ -552,6 +652,7 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
         connection: Arc<Connection>,
         commit_coordinator: Arc<CommitCoordinator>,
         header: Arc<RwLock<Option<DatabaseHeader>>>,
+        sync_mode: SyncMode,
     ) -> Self {
         let pager = connection.pager.load().clone();
         Self {
@@ -564,6 +665,7 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
             commit_coordinator,
             pager,
             header,
+            sync_mode,
             _phantom: PhantomData,
         }
     }
@@ -613,8 +715,8 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     .load(Ordering::Acquire)
                     > tx.begin_ts
                 {
-                    // Schema changes made after the transaction began always cause a [SchemaUpdated] error and the tx must abort.
-                    return Err(LimboError::SchemaUpdated);
+                    // Schema changes made after the transaction began always cause a [SchemaConflict] error and the tx must abort.
+                    return Err(LimboError::SchemaConflict);
                 }
 
                 tx.state.store(TransactionState::Preparing);
@@ -825,7 +927,13 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
             }
 
             CommitState::SyncLogicalLog { end_ts } => {
-                let c = mvcc_store.storage.sync()?;
+                // Skip fsync when synchronous mode is off
+                if self.sync_mode == SyncMode::Off {
+                    tracing::debug!("Skipping fsync of logical log (synchronous=off)");
+                    self.state = CommitState::EndCommitLogicalLog { end_ts: *end_ts };
+                    return Ok(TransitionResult::Continue);
+                }
+                let c = mvcc_store.storage.sync(self.pager.get_sync_type())?;
                 self.state = CommitState::EndCommitLogicalLog { end_ts: *end_ts };
                 // if Completion Completed without errors we can continue
                 if c.succeeded() {
@@ -894,6 +1002,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                         mvcc_store.clone(),
                         self.connection.clone(),
                         false,
+                        self.connection.get_sync_mode(),
                     ));
                     let state_machine = Mutex::new(state_machine);
                     self.state = CommitState::Checkpoint { state_machine };
@@ -1140,9 +1249,10 @@ pub struct MvStore<Clock: LogicalClock> {
     /// Unlike table rows which are stored in a single map, we have a separate map for every index
     /// because operations like last() on an index are much easier when we don't have to take the
     /// table identifier into account.
-    pub index_rows: SkipMap<MVTableId, SkipMap<SortableIndexKey, RwLock<Vec<RowVersion>>>>,
+    pub index_rows: SkipMap<MVTableId, SkipMap<Arc<SortableIndexKey>, RwLock<Vec<RowVersion>>>>,
     txs: SkipMap<TxID, Transaction>,
     tx_ids: AtomicU64,
+    version_id_counter: AtomicU64,
     next_rowid: AtomicU64,
     next_table_id: AtomicI64,
     clock: Clock,
@@ -1188,6 +1298,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             index_rows: SkipMap::new(),
             txs: SkipMap::new(),
             tx_ids: AtomicU64::new(1), // let's reserve transaction 0 for special purposes
+            version_id_counter: AtomicU64::new(1), // Reserve 0 for special purposes
             next_rowid: AtomicU64::new(0), // TODO: determine this from B-Tree
             next_table_id: AtomicI64::new(-2), // table id -1 / root page 1 is always sqlite_schema.
             clock,
@@ -1201,7 +1312,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             checkpointed_txid_max: AtomicU64::new(0),
             last_committed_schema_change_ts: AtomicU64::new(0),
             last_committed_tx_ts: AtomicU64::new(0),
-            table_id_to_last_rowid: RwLock::new(HashMap::new()),
+            table_id_to_last_rowid: RwLock::new(HashMap::default()),
         }
     }
 
@@ -1343,26 +1454,33 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         let id = row.id.clone();
         match maybe_index_id {
             Some(index_id) => {
+                let version_id = self.get_version_id();
                 let row_version = RowVersion {
+                    id: version_id,
                     begin: Some(TxTimestampOrID::TxID(tx.tx_id)),
                     end: None,
                     row: row.clone(),
                     btree_resident: false,
                 };
-                let RowKey::Record(sortable_key) = row.id.row_id else {
+                let RowKey::Record(sortable_key) = row.id.row_id.clone() else {
                     panic!("Index writes must be to a record");
                 };
+                let sortable_key = self.get_or_create_index_key_arc(index_id, sortable_key);
                 tx.insert_to_write_set(id.clone());
+                tx.record_created_index_version((index_id, sortable_key.clone()), version_id);
                 self.insert_index_version(index_id, sortable_key, row_version);
             }
             None => {
+                let version_id = self.get_version_id();
                 let row_version = RowVersion {
+                    id: version_id,
                     begin: Some(TxTimestampOrID::TxID(tx.tx_id)),
                     end: None,
                     row,
                     btree_resident: false,
                 };
                 tx.insert_to_write_set(id.clone());
+                tx.record_created_table_version(id.clone(), version_id);
                 let allocator = self.get_rowid_allocator(&id.table_id);
                 allocator.insert_row_id_maybe_update(id.row_id.to_int_or_panic());
                 self.insert_version(id, row_version);
@@ -1380,7 +1498,9 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         row: Row,
         maybe_index_id: Option<MVTableId>,
     ) -> Result<()> {
+        let version_id = self.get_version_id();
         let row_version = RowVersion {
+            id: version_id,
             begin: Some(TxTimestampOrID::Timestamp(0)),
             end: Some(TxTimestampOrID::TxID(tx_id)),
             row: row.clone(),
@@ -1394,12 +1514,15 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         tx.insert_to_write_set(id.clone());
         match maybe_index_id {
             Some(index_id) => {
-                let RowKey::Record(sortable_key) = row.id.row_id else {
+                let RowKey::Record(sortable_key) = row.id.row_id.clone() else {
                     panic!("Index writes must be to a record");
                 };
+                let sortable_key = self.get_or_create_index_key_arc(index_id, sortable_key);
+                tx.record_created_index_version((index_id, sortable_key.clone()), version_id);
                 self.insert_index_version(index_id, sortable_key, row_version);
             }
             None => {
+                tx.record_created_table_version(id.clone(), version_id);
                 self.insert_version(id, row_version);
             }
         }
@@ -1430,26 +1553,33 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         let id = row.id.clone();
         match maybe_index_id {
             Some(index_id) => {
+                let version_id = self.get_version_id();
                 let row_version = RowVersion {
+                    id: version_id,
                     begin: Some(TxTimestampOrID::TxID(tx.tx_id)),
                     end: None,
                     row: row.clone(),
                     btree_resident: true,
                 };
-                let RowKey::Record(sortable_key) = row.id.row_id else {
+                let RowKey::Record(sortable_key) = row.id.row_id.clone() else {
                     panic!("Index writes must be to a record");
                 };
+                let sortable_key = self.get_or_create_index_key_arc(index_id, sortable_key);
                 tx.insert_to_write_set(id.clone());
+                tx.record_created_index_version((index_id, sortable_key.clone()), version_id);
                 self.insert_index_version(index_id, sortable_key, row_version);
             }
             None => {
+                let version_id = self.get_version_id();
                 let row_version = RowVersion {
+                    id: version_id,
                     begin: Some(TxTimestampOrID::TxID(tx.tx_id)),
                     end: None,
                     row,
                     btree_resident: true,
                 };
                 tx.insert_to_write_set(id.clone());
+                tx.record_created_table_version(id.clone(), version_id);
                 self.insert_version(id, row_version);
             }
         }
@@ -1546,8 +1676,10 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                     panic!("Index deletes must have a record row_id");
                 };
                 let row_versions_opt = rows.get(&sortable_key);
-                if let Some(ref row_versions) = row_versions_opt {
-                    let mut row_versions = row_versions.value().write();
+                if let Some(ref row_versions_entry) = row_versions_opt {
+                    // Get the Arc key from the map entry for savepoint tracking
+                    let arc_key = row_versions_entry.key().clone();
+                    let mut row_versions = row_versions_entry.value().write();
                     for rv in row_versions.iter_mut().rev() {
                         let tx = self
                             .txs
@@ -1566,6 +1698,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                             return Err(LimboError::WriteWriteConflict);
                         }
 
+                        let version_id = rv.id;
                         rv.end = Some(TxTimestampOrID::TxID(tx.tx_id));
                         let tx = self
                             .txs
@@ -1573,6 +1706,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                             .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
                         let tx = tx.value();
                         tx.insert_to_write_set(id.clone());
+                        tx.record_deleted_index_version((index_id, arc_key), version_id);
                         return Ok(true);
                     }
                 }
@@ -1600,6 +1734,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                             return Err(LimboError::WriteWriteConflict);
                         }
 
+                        let version_id = rv.id;
                         rv.end = Some(TxTimestampOrID::TxID(tx.tx_id));
                         drop(row_versions);
                         drop(row_versions_opt);
@@ -1608,7 +1743,8 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                             .get(&tx_id)
                             .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
                         let tx = tx.value();
-                        tx.insert_to_write_set(id);
+                        tx.insert_to_write_set(id.clone());
+                        tx.record_deleted_table_version(id, version_id);
                         return Ok(true);
                     }
                 }
@@ -1769,7 +1905,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
 
     pub(crate) fn advance_cursor_and_get_row_id_for_index(
         &self,
-        mv_store_iterator: &mut Option<MvccIterator<'static, SortableIndexKey>>,
+        mv_store_iterator: &mut Option<MvccIterator<'static, Arc<SortableIndexKey>>>,
         tx_id: TxID,
     ) -> Option<RowID> {
         let mv_store_iterator = mv_store_iterator.as_mut().expect(
@@ -1785,51 +1921,58 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         self.find_next_visible_index_row(tx, mv_store_iterator)
     }
 
-    pub fn find_row_last_version_state(
+    /// Check if the B-tree version of a row should be shown to the given transaction.
+    ///
+    /// Returns true if the B-tree version is valid (should be shown).
+    /// Returns false if the B-tree version is shadowed or deleted by MVCC.
+    pub fn query_btree_version_is_valid(
         &self,
         table_id: MVTableId,
         row_id: &RowKey,
         tx_id: TxID,
-    ) -> RowVersionState {
+    ) -> bool {
         let tx = self
             .txs
             .get(&tx_id)
             .expect("transaction should exist in txs map");
         let tx = tx.value();
+
         match row_id {
             RowKey::Int(_) => {
-                let Some(versions) = self.rows.get(&RowID {
+                let row_id_full = RowID {
                     table_id,
                     row_id: row_id.clone(),
-                }) else {
-                    return RowVersionState::NotFound;
+                };
+                let Some(versions) = self.rows.get(&row_id_full) else {
+                    // No MVCC version -> B-tree is valid
+                    return true;
                 };
                 let versions = versions.value().read();
-                let Some(last_version) = versions.last() else {
-                    return RowVersionState::NotFound;
-                };
-                if last_version.is_visible_to(tx, &self.txs) {
-                    RowVersionState::LiveVersion
-                } else {
-                    RowVersionState::Deleted
-                }
+
+                // Check if any version invalidates the B-tree row
+                let btree_is_invalid = versions
+                    .iter()
+                    .rev()
+                    .any(|version| version.is_btree_invalidating_version(tx, &self.txs));
+
+                !btree_is_invalid
             }
             RowKey::Record(record) => {
                 let index_rows = self.index_rows.get_or_insert_with(table_id, SkipMap::new);
                 let index_rows = index_rows.value();
                 let Some(versions) = index_rows.get(record) else {
-                    return RowVersionState::NotFound;
+                    // No MVCC version -> B-tree is valid
+                    return true;
                 };
                 let versions = versions.value().read();
-                if let Some(last_version) = versions.last() {
-                    if last_version.is_visible_to(tx, &self.txs) {
-                        RowVersionState::LiveVersion
-                    } else {
-                        RowVersionState::Deleted
-                    }
-                } else {
-                    RowVersionState::NotFound
-                }
+
+                // Check if any version invalidates the B-tree row
+                let btree_is_invalid = versions
+                    .iter()
+                    .rev()
+                    .any(|version| version.is_btree_invalidating_version(tx, &self.txs));
+
+                !btree_is_invalid
             }
         }
     }
@@ -1837,11 +1980,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     fn find_last_visible_version(
         &self,
         tx: &Transaction,
-        row: &crossbeam_skiplist::map::Entry<
-            '_,
-            RowID,
-            parking_lot::lock_api::RwLock<parking_lot::RawRwLock, Vec<RowVersion>>,
-        >,
+        row: &crossbeam_skiplist::map::Entry<'_, RowID, RwLock<Vec<RowVersion>>>,
     ) -> Option<RowID> {
         row.value()
             .read()
@@ -1854,11 +1993,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     fn find_last_visible_index_version(
         &self,
         tx: &Transaction,
-        row: crossbeam_skiplist::map::Entry<
-            '_,
-            SortableIndexKey,
-            parking_lot::lock_api::RwLock<parking_lot::RawRwLock, Vec<RowVersion>>,
-        >,
+        row: crossbeam_skiplist::map::Entry<'_, Arc<SortableIndexKey>, RwLock<Vec<RowVersion>>>,
     ) -> Option<RowID> {
         row.value()
             .read()
@@ -1873,8 +2008,8 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         I: Iterator<
             Item = crossbeam_skiplist::map::Entry<
                 'a,
-                SortableIndexKey,
-                parking_lot::lock_api::RwLock<parking_lot::RawRwLock, Vec<RowVersion>>,
+                Arc<SortableIndexKey>,
+                RwLock<Vec<RowVersion>>,
             >,
         >,
     {
@@ -1893,13 +2028,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         table_id: MVTableId,
     ) -> Option<RowID>
     where
-        I: Iterator<
-            Item = crossbeam_skiplist::map::Entry<
-                'a,
-                RowID,
-                parking_lot::lock_api::RwLock<parking_lot::RawRwLock, Vec<RowVersion>>,
-            >,
-        >,
+        I: Iterator<Item = crossbeam_skiplist::map::Entry<'a, RowID, RwLock<Vec<RowVersion>>>>,
     {
         loop {
             let row = rows.next()?;
@@ -1965,7 +2094,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         inclusive: bool,
         direction: IterationDirection,
         tx_id: TxID,
-        index_iterator: &mut Option<MvccIterator<'static, SortableIndexKey>>,
+        index_iterator: &mut Option<MvccIterator<'static, Arc<SortableIndexKey>>>,
     ) -> Option<RowID> {
         let index_rows = self.index_rows.get_or_insert_with(index_id, SkipMap::new);
         let index_rows = index_rows.value();
@@ -1978,18 +2107,18 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         let iter_box = match direction {
             IterationDirection::Forwards => Box::new(index_rows.range(range))
                 as Box<
-                    dyn Iterator<Item = Entry<'_, SortableIndexKey, RwLock<Vec<RowVersion>>>>
+                    dyn Iterator<Item = Entry<'_, Arc<SortableIndexKey>, RwLock<Vec<RowVersion>>>>
                         + Send
                         + Sync,
                 >,
             IterationDirection::Backwards => Box::new(index_rows.range(range).rev())
                 as Box<
-                    dyn Iterator<Item = Entry<'_, SortableIndexKey, RwLock<Vec<RowVersion>>>>
+                    dyn Iterator<Item = Entry<'_, Arc<SortableIndexKey>, RwLock<Vec<RowVersion>>>>
                         + Send
                         + Sync,
                 >,
         };
-        *index_iterator = Some(static_iterator_hack!(iter_box, SortableIndexKey));
+        *index_iterator = Some(static_iterator_hack!(iter_box, Arc<SortableIndexKey>));
         let mv_store_iterator = index_iterator
             .as_mut()
             .expect("index_iterator was assigned above if it was None");
@@ -2216,6 +2345,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 connection.clone(),
                 self.commit_coordinator.clone(),
                 self.global_header.clone(),
+                connection.get_sync_mode(),
             ));
         Ok(state_machine)
     }
@@ -2298,7 +2428,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             .get(&tx_id)
             .expect("transaction should exist in txs map");
         let tx = tx_unlocked.value();
-        *connection.mv_tx.write() = None;
+        connection.set_mv_tx(None);
         assert!(tx.state == TransactionState::Active || tx.state == TransactionState::Preparing);
         tx.state.store(TransactionState::Aborted);
         tracing::trace!("abort(tx_id={})", tx_id);
@@ -2310,23 +2440,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
 
         for rowid in &tx.write_set {
             let rowid = rowid.value();
-            if let Some(row_versions) = self.rows.get(rowid) {
-                let mut row_versions = row_versions.value().write();
-                for rv in row_versions.iter_mut() {
-                    if let Some(TxTimestampOrID::TxID(id)) = rv.begin {
-                        assert_eq!(id, tx_id);
-                        // If the transaction has aborted,
-                        // it marks all its new versions as garbage and sets their Begin
-                        // and End timestamps to infinity to make them invisible
-                        // See section 2.4: https://www.cs.cmu.edu/~15721-f24/papers/Hekaton.pdf
-                        rv.begin = None;
-                        rv.end = None;
-                    } else if rv.end == Some(TxTimestampOrID::TxID(tx_id)) {
-                        // undo deletions by this transaction
-                        rv.end = None;
-                    }
-                }
-            }
+            self.rollback_rowid(tx_id, rowid);
         }
 
         if connection.schema.read().schema_version > connection.db.schema.lock().schema_version {
@@ -2340,6 +2454,143 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         // FIXME: verify that we can already remove the transaction here!
         // Maybe it's fine for snapshot isolation, but too early for serializable?
         self.remove_tx(tx_id);
+    }
+
+    fn rollback_rowid(&self, tx_id: u64, rowid: &RowID) {
+        if rowid.row_id.is_int_key() {
+            self.rollback_table_rowid(tx_id, rowid);
+        } else {
+            self.rollback_index_rowid(tx_id, rowid);
+        }
+    }
+
+    fn rollback_index_rowid(&self, tx_id: u64, rowid: &RowID) {
+        if let Some(index) = self.index_rows.get(&rowid.table_id) {
+            let index = index.value();
+            let RowKey::Record(ref index_key) = rowid.row_id else {
+                panic!("Index writes must have a record key");
+            };
+            if let Some(row_versions) = index.get(index_key) {
+                let mut row_versions = row_versions.value().write();
+                for rv in row_versions.iter_mut() {
+                    rollback_row_version(tx_id, rv);
+                }
+            }
+        }
+    }
+
+    fn rollback_table_rowid(&self, tx_id: u64, rowid: &RowID) {
+        if let Some(row_versions) = self.rows.get(rowid) {
+            let mut row_versions = row_versions.value().write();
+            for rv in row_versions.iter_mut() {
+                rollback_row_version(tx_id, rv);
+            }
+        }
+    }
+
+    /// Begin a savepoint for the transaction.
+    /// This should be called at the start of a statement in an interactive transaction.
+    pub fn begin_savepoint(&self, tx_id: TxID) {
+        let tx = self
+            .txs
+            .get(&tx_id)
+            .unwrap_or_else(|| panic!("Transaction {tx_id} not found while beginning savepoint"));
+        tx.value().begin_savepoint();
+    }
+
+    /// Release the newest savepoint for the transaction.
+    /// This should be called when a statement completes successfully.
+    /// Silently returns if the transaction doesn't exist (e.g., already committed).
+    pub fn release_savepoint(&self, tx_id: TxID) {
+        if let Some(tx) = self.txs.get(&tx_id) {
+            tx.value().release_savepoint();
+        }
+        // If transaction doesn't exist, it was already committed - nothing to release
+    }
+
+    /// Rolls back a savepoint within a transaction.
+    /// Returns true if a savepoint was rolled back, false if no savepoint was active.
+    pub fn rollback_first_savepoint(&self, tx_id: u64) -> Result<bool> {
+        let tx = self.txs.get(&tx_id).unwrap_or_else(|| {
+            panic!("Transaction {tx_id} not found while rolling back savepoint")
+        });
+
+        let tx = tx.value();
+        let savepoint = tx.pop_savepoint();
+
+        if let Some(savepoint) = savepoint {
+            tracing::debug!("rollback_savepoint(tx_id={}, created_table={}, created_index={}, deleted_table={}, deleted_index={})",
+                tx_id,
+                savepoint.created_table_versions.len(),
+                savepoint.created_index_versions.len(),
+                savepoint.deleted_table_versions.len(),
+                savepoint.deleted_index_versions.len());
+
+            // Remove created table versions
+            for (rowid, version_id) in savepoint.created_table_versions {
+                if let Some(entry) = self.rows.get(&rowid) {
+                    let mut versions = entry.value().write();
+                    versions.retain(|rv| rv.id != version_id);
+                    tracing::debug!("rollback_savepoint: removed table version(table_id={}, row_id={}, version_id={})",
+                        rowid.table_id, rowid.row_id, version_id);
+                }
+            }
+
+            // Remove created index versions
+            for ((table_id, key), version_id) in savepoint.created_index_versions {
+                if let Some(index) = self.index_rows.get(&table_id) {
+                    if let Some(entry) = index.value().get(&key) {
+                        let mut versions = entry.value().write();
+                        versions.retain(|rv| rv.id != version_id);
+                        tracing::debug!(
+                            "rollback_savepoint: removed index version(table_id={}, version_id={})",
+                            table_id,
+                            version_id
+                        );
+                    }
+                }
+            }
+
+            // Restore deleted table versions (clear end timestamp)
+            for (rowid, version_id) in savepoint.deleted_table_versions {
+                if let Some(entry) = self.rows.get(&rowid) {
+                    let mut versions = entry.value().write();
+                    for rv in versions.iter_mut() {
+                        if rv.id == version_id {
+                            rv.end = None;
+                            tracing::debug!("rollback_savepoint: restored table version(table_id={}, row_id={}, version_id={})",
+                                rowid.table_id, rowid.row_id, version_id);
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // Restore deleted index versions
+            for ((table_id, key), version_id) in savepoint.deleted_index_versions {
+                if let Some(index) = self.index_rows.get(&table_id) {
+                    if let Some(entry) = index.value().get(&key) {
+                        let mut versions = entry.value().write();
+                        for rv in versions.iter_mut() {
+                            if rv.id == version_id {
+                                rv.end = None;
+                                tracing::debug!("rollback_savepoint: restored index version(table_id={}, version_id={})",
+                                    table_id, version_id);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            Ok(true)
+        } else {
+            tracing::debug!(
+                "rollback_savepoint(tx_id={}): no savepoint was active",
+                tx_id
+            );
+            Ok(false)
+        }
     }
 
     /// Returns true if the given transaction is the exclusive transaction.
@@ -2391,6 +2642,11 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     /// Generates next unique transaction id
     pub fn get_tx_id(&self) -> u64 {
         self.tx_ids.fetch_add(1, Ordering::SeqCst)
+    }
+
+    /// Generates next unique version ID for RowVersion tracking.
+    pub fn get_version_id(&self) -> u64 {
+        self.version_id_counter.fetch_add(1, Ordering::SeqCst)
     }
 
     /// Gets current timestamp
@@ -2501,10 +2757,24 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         self.insert_version_raw(&mut versions, row_version)
     }
 
-    pub fn insert_index_version(
+    /// Gets an existing Arc<SortableIndexKey> from the index if the key exists,
+    /// otherwise creates a new Arc. This ensures we reuse Arc instances for the same key.
+    fn get_or_create_index_key_arc(
         &self,
         index_id: MVTableId,
         key: SortableIndexKey,
+    ) -> Arc<SortableIndexKey> {
+        let index = self.index_rows.get_or_insert_with(index_id, SkipMap::new);
+        let index = index.value();
+        // Check if key exists and get the Arc if so
+        let existing = index.get(&key).map(|entry| entry.key().clone());
+        existing.unwrap_or_else(|| Arc::new(key))
+    }
+
+    pub fn insert_index_version(
+        &self,
+        index_id: MVTableId,
+        key: Arc<SortableIndexKey>,
         row_version: RowVersion,
     ) {
         let index = self.index_rows.get_or_insert_with(index_id, SkipMap::new);
@@ -2641,16 +2911,17 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     pub fn get_last_index_rowid(
         &self,
         index_id: MVTableId,
-        index_iterator: &mut Option<MvccIterator<'static, SortableIndexKey>>,
+        index_iterator: &mut Option<MvccIterator<'static, Arc<SortableIndexKey>>>,
     ) -> Option<RowKey> {
         let index = self.index_rows.get_or_insert_with(index_id, SkipMap::new);
         let index = index.value();
         let iter_box = Box::new(index.iter().rev());
-        *index_iterator = Some(static_iterator_hack!(iter_box, SortableIndexKey));
+        *index_iterator = Some(static_iterator_hack!(iter_box, Arc<SortableIndexKey>));
         let iter = index_iterator
             .as_mut()
             .expect("index_iterator was assigned above");
-        iter.next().map(|entry| RowKey::Record(entry.key().clone()))
+        iter.next()
+            .map(|entry| RowKey::Record((**entry.key()).clone()))
     }
 
     pub fn get_logical_log_file(&self) -> Arc<dyn File> {
@@ -2673,7 +2944,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         let tx_id = LOGICAL_LOG_RECOVERY_TRANSACTION_ID;
         self.begin_load_tx(connection.clone())?;
 
-        let mut index_infos: HashMap<MVTableId, Arc<IndexInfo>> = HashMap::new();
+        let mut index_infos: HashMap<MVTableId, Arc<IndexInfo>> = HashMap::default();
 
         // Helper to get an Arc<IndexInfo> to construct a SortableIndexKey
         let mut get_index_info = |index_id: MVTableId| -> Result<Arc<IndexInfo>> {
@@ -2705,6 +2976,11 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         };
         loop {
             let next_rec = reader.next_record(&pager.io, &mut get_index_info)?;
+
+            tracing::trace!("next_rec {next_rec:?}");
+            // Check if we need to reparse schema before processing this operation
+            // This happens when transitioning from schema inserts to any other operation
+
             match next_rec {
                 StreamingResult::InsertTableRow { row, rowid } => {
                     let is_schema_row = rowid.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID;
@@ -2712,13 +2988,14 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                         // Sqlite schema row version inserts
                         let row_data = row.payload().to_vec();
                         let record = ImmutableRecord::from_bin_record(row_data);
-                        let mut record_cursor = RecordCursor::new();
-                        let mut record_values = record_cursor.get_values(&record);
-                        let val = record_values.nth(3).ok_or_else(|| {
-                            LimboError::InternalError(
-                                "Expected at least 4 columns in sqlite_schema".to_string(),
-                            )
-                        })??;
+                        let val = match record.get_value_opt(3) {
+                            Some(v) => v,
+                            None => {
+                                return Err(LimboError::InternalError(
+                                    "Expected at least 4 columns in sqlite_schema".to_string(),
+                                ));
+                            }
+                        };
                         let ValueRef::Integer(root_page) = val else {
                             panic!("Expected integer value for root page, got {val:?}");
                         };
@@ -2747,10 +3024,10 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                         assert!(self.table_id_to_rootpage.get(&rowid.table_id).is_some(), "Logical log contains a row version insert with a table id {} that does not exist in the table_id_to_rootpage map: {:?}", rowid.table_id, self.table_id_to_rootpage.iter().collect::<Vec<_>>());
                     }
                     self.insert(tx_id, row)?;
+                    // Make sure the newly parsed schema change record gets populated into the in-memory schema object.
+                    // It's a bit inefficient this way (we could just deserialize the logical log row as well), but schema
+                    // changes in the logical log are special cases that don't happen that often.
                     if is_schema_row {
-                        // Make sure the newly parsed schema change record gets populated into the in-memory schema object.
-                        // It's a bit inefficient this way (we could just deserialize the logical log row as well), but schema
-                        // changes in the logical log are special cases that don't happen that often.
                         connection.reparse_schema()?;
                         *connection.db.schema.lock() = connection.schema.read().clone();
                     }
@@ -2773,6 +3050,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 }
             }
         }
+
         self.commit_load_tx(tx_id, &connection);
         Ok(true)
     }
@@ -2807,6 +3085,25 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             map.insert(*table_id, allocator.clone());
             allocator
         }
+    }
+
+    pub fn is_btree_allocated(&self, table_id: &MVTableId) -> bool {
+        let maybe_root_page = self.table_id_to_rootpage.get(table_id);
+        maybe_root_page.is_some_and(|entry| entry.value().is_some())
+    }
+}
+
+fn rollback_row_version(tx_id: u64, rv: &mut RowVersion) {
+    if rv.begin == Some(TxTimestampOrID::TxID(tx_id)) {
+        // If the transaction has aborted,
+        // it marks all its new versions as garbage and sets their Begin
+        // and End timestamps to infinity to make them invisible
+        // See section 2.4: https://www.cs.cmu.edu/~15721-f24/papers/Hekaton.pdf
+        rv.begin = None;
+        rv.end = None;
+    } else if rv.end == Some(TxTimestampOrID::TxID(tx_id)) {
+        // undo deletions by this transaction
+        rv.end = None;
     }
 }
 
@@ -2914,8 +3211,44 @@ pub(crate) fn is_write_write_conflict(
 }
 
 impl RowVersion {
+    /// A row is visible to a transaction if:
+    /// * Begin is visible to the transaction
+    /// * End timestamp is not applicable yet, meaning deletion of row is not visible to this transaction
     pub fn is_visible_to(&self, tx: &Transaction, txs: &SkipMap<TxID, Transaction>) -> bool {
         is_begin_visible(txs, tx, self) && is_end_visible(txs, tx, self)
+    }
+
+    /// Check if this version indicates the B-tree row has been modified (updated or deleted).
+    ///
+    /// A version is "relevant" to a transaction if:
+    /// 1. The version is fully visible (begin visible AND end visible), OR
+    /// 2. The version has an end timestamp that indicates the row was deleted before/at the transaction's begin, OR
+    /// 3. The current transaction itself has deleted/updated this row (end = current tx_id)
+    ///
+    /// This is used by dual-cursor to determine if a B-tree row should be shown or hidden.
+    pub fn is_btree_invalidating_version(
+        &self,
+        tx: &Transaction,
+        txs: &SkipMap<TxID, Transaction>,
+    ) -> bool {
+        // If the version is fully visible, it invalidates the B-tree
+        if self.is_visible_to(tx, txs) {
+            return true;
+        }
+
+        // Check if this version represents a deletion/update that affects us
+        match self.end {
+            Some(TxTimestampOrID::Timestamp(end_ts)) => {
+                // Row was deleted at end_ts. If we started at or after end_ts, we shouldn't see it
+                tx.begin_ts >= end_ts
+            }
+            Some(TxTimestampOrID::TxID(end_tx_id)) => {
+                // Row is being deleted/updated by another transaction
+                // If it's OUR transaction, the B-tree row is invalid (we deleted/updated it)
+                end_tx_id == tx.tx_id
+            }
+            None => false,
+        }
     }
 }
 
@@ -2925,7 +3258,7 @@ fn is_begin_visible(txs: &SkipMap<TxID, Transaction>, tx: &Transaction, rv: &Row
         Some(TxTimestampOrID::TxID(rv_begin)) => {
             let tb = txs
                 .get(&rv_begin)
-                .expect("transaction should exist in txs map");
+                .unwrap_or_else(|| panic!("transaction {rv_begin:?} should exist in txs map"));
             let tb = tb.value();
             let visible = match tb.state.load() {
                 TransactionState::Active => tx.tx_id == tb.tx_id && rv.end.is_none(),

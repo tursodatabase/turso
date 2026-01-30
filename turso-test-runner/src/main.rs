@@ -1,13 +1,19 @@
 use clap::{Parser, Subcommand};
 use miette::{NamedSource, Report};
+use owo_colors::OwoColorize;
 use std::process::ExitCode;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
-use std::{path::PathBuf, time::Instant};
+use std::{
+    path::{Path, PathBuf},
+    time::Instant,
+};
 use turso_test_runner::{
-    Format, OutputFormat, ParseError, RunnerConfig, TestRunner, backends::cli::CliBackend,
-    create_output, summarize, tcl_converter,
+    DefaultDatabases, Format, GeneratorConfig, OutputFormat, ParseError, RunnerConfig,
+    SnapshotUpdateMode, TestRunner, backends::cli::CliBackend, backends::js::JsBackend,
+    backends::rust::RustBackend, create_output, find_all_pending_snapshots, generate_database,
+    load_test_files, summarize, tcl_converter,
 };
 
 #[derive(Parser)]
@@ -26,9 +32,21 @@ enum Commands {
         #[arg(required = true)]
         paths: Vec<PathBuf>,
 
-        /// Path to tursodb binary
+        /// Backend to use: "rust" (native), "cli" (subprocess), or "js" (JavaScript bindings)
+        #[arg(long, default_value = "rust")]
+        backend: String,
+
+        /// Path to tursodb binary (only used with --backend cli)
         #[arg(long, default_value = "tursodb")]
         binary: PathBuf,
+
+        /// Path to node binary (only used with --backend js)
+        #[arg(long, default_value = "node")]
+        node: PathBuf,
+
+        /// Path to JavaScript runner script (only used with --backend js)
+        #[arg(long)]
+        js_script: Option<PathBuf>,
 
         /// Filter tests by name pattern
         #[arg(short, long)]
@@ -42,12 +60,28 @@ enum Commands {
         #[arg(short, long, default_value = "pretty")]
         output: String,
 
-        /// Timeout per query in seconds
+        /// Timeout per query in seconds (only used with --backend cli or js)
         #[arg(long, default_value_t = 90)]
         timeout: u64,
+
+        /// Enable MVCC mode (experimental journal mode)
+        #[arg(long)]
+        mvcc: bool,
+
+        /// Snapshot update mode:
+        /// - auto: 'no' in CI, 'new' otherwise (default)
+        /// - new: write .snap.new files for review
+        /// - always: write directly to .snap files
+        /// - no: don't write any snapshot files
+        #[arg(long, default_value_t = SnapshotUpdateMode::default())]
+        snapshot_mode: SnapshotUpdateMode,
+
+        /// Filter snapshot tests by name pattern
+        #[arg(long)]
+        snapshot_filter: Option<String>,
     },
 
-    /// Validate test file syntax
+    /// Validate test file syntax and check for pending snapshots
     Check {
         /// Test files or directories
         #[arg(required = true)]
@@ -72,6 +106,27 @@ enum Commands {
         #[arg(short, long)]
         verbose: bool,
     },
+
+    /// [DEBUG ONLY] Generate test databases and save them to a directory.
+    /// This is intended for debugging purposes only - to inspect the database
+    /// files that the test runner generates for tests using :default: databases.
+    GenerateDb {
+        /// Output directory to save the generated databases
+        #[arg(required = true)]
+        output_dir: PathBuf,
+
+        /// Number of users to generate (default: 10000)
+        #[arg(long, default_value_t = 10000)]
+        user_count: usize,
+
+        /// Seed for reproducible random generation (default: 42)
+        #[arg(long, default_value_t = 42)]
+        seed: u64,
+
+        /// Enable MVCC mode (experimental journal mode)
+        #[arg(long)]
+        mvcc: bool,
+    },
 }
 
 #[tokio::main]
@@ -81,29 +136,69 @@ async fn main() -> ExitCode {
     match cli.command {
         Commands::Run {
             paths,
+            backend,
             binary,
+            node,
+            js_script,
             filter,
             jobs,
             output,
             timeout,
-        } => run_tests(paths, binary, filter, jobs, output, timeout).await,
-        Commands::Check { paths } => check_files(paths),
+            mvcc,
+            snapshot_mode,
+            snapshot_filter,
+        } => {
+            run_tests(
+                paths,
+                backend,
+                binary,
+                node,
+                js_script,
+                filter,
+                jobs,
+                output,
+                timeout,
+                mvcc,
+                snapshot_mode,
+                snapshot_filter,
+            )
+            .await
+        }
+        Commands::Check { paths } => check_files(paths).await,
         Commands::Convert {
             paths,
             output_dir,
             stdout,
             verbose,
         } => convert_files(paths, output_dir, stdout, verbose),
+        Commands::GenerateDb {
+            output_dir,
+            user_count,
+            seed,
+            mvcc,
+        } => generate_debug_databases(output_dir, user_count, seed, mvcc).await,
     }
 }
 
+/// Default seed for reproducible database generation
+const DEFAULT_SEED: u64 = 42;
+/// Default number of users to generate
+const DEFAULT_USER_COUNT: usize = 10000;
+
+#[allow(clippy::too_many_arguments)]
 async fn run_tests(
     paths: Vec<PathBuf>,
+    backend_type: String,
     binary: PathBuf,
+    node: PathBuf,
+    js_script: Option<PathBuf>,
     filter: Option<String>,
     jobs: usize,
     output_format: String,
     timeout: u64,
+    mvcc: bool,
+    snapshot_mode: SnapshotUpdateMode,
+    snapshot_filter: Option<String>,
 ) -> ExitCode {
     // Resolve paths, trying to add .sqltest extension if missing
     let mut resolved_paths = Vec::new();
@@ -137,39 +232,157 @@ async fn run_tests(
     let format: Format = match output_format.parse() {
         Ok(f) => f,
         Err(e) => {
-            eprintln!("Error: {}", e);
+            eprintln!("Error: {e}");
             return ExitCode::from(2);
         }
     };
 
-    // Create backend
-    let backend = CliBackend::new(&binary).with_timeout(Duration::from_secs(timeout));
+    // Load and parse test files
+    let loaded = match load_test_files(&paths).await {
+        Ok(loaded) => loaded,
+        Err(e) => {
+            eprintln!("Error loading test files: {e}");
+            return ExitCode::from(1);
+        }
+    };
+
+    // Check if we need to generate default databases
+    let needs = DefaultDatabases::scan_needs(loaded.test_files());
+
+    // Generate default databases if needed
+    let default_dbs = if needs.any() {
+        eprintln!("Generating default databases...");
+        match DefaultDatabases::generate(needs, DEFAULT_SEED, DEFAULT_USER_COUNT, mvcc).await {
+            Ok(dbs) => dbs,
+            Err(e) => {
+                eprintln!("Error generating default databases: {e}");
+                return ExitCode::from(1);
+            }
+        }
+    } else {
+        None
+    };
+
+    // Create backend with resolver if we have generated databases
+    let resolver = default_dbs.as_ref().map(|dbs| {
+        Arc::new(DefaultDatabasesResolver(
+            dbs.default_path.clone(),
+            dbs.no_rowid_alias_path.clone(),
+        ))
+    });
 
     // Create runner config
-    let mut config = RunnerConfig::default().with_max_jobs(jobs);
+    let mut config = RunnerConfig::default()
+        .with_max_jobs(jobs)
+        .with_mvcc(mvcc)
+        .with_snapshot_update_mode(snapshot_mode);
     if let Some(f) = filter {
         config = config.with_filter(f);
     }
-
-    // Create runner
-    let runner = TestRunner::new(backend).with_config(config);
+    if let Some(f) = snapshot_filter {
+        config = config.with_snapshot_filter(f);
+    }
 
     // Create output formatter
     let mut output: Box<dyn OutputFormat> = create_output(format);
-
     let start = Instant::now();
 
-    // Run tests with streaming output
-    let results = match runner
-        .run_paths(&paths, |result| {
-            output.write_test(result);
-            output.flush();
-        })
-        .await
-    {
+    // Run tests based on backend selection
+    let results = match backend_type.as_str() {
+        "cli" => {
+            let mut backend = CliBackend::new(&binary)
+                .with_timeout(Duration::from_secs(timeout))
+                .with_mvcc(mvcc);
+            if let Some(resolver) = resolver {
+                backend = backend.with_default_db_resolver(resolver);
+            }
+            let runner = TestRunner::new(backend).with_config(config);
+            runner
+                .run_loaded_tests(loaded, |result| {
+                    output.write_test(result);
+                    output.flush();
+                })
+                .await
+        }
+        "rust" => {
+            let mut backend = RustBackend::new().with_mvcc(mvcc);
+            if let Some(resolver) = resolver {
+                backend = backend.with_default_db_resolver(resolver);
+            }
+            let runner = TestRunner::new(backend).with_config(config);
+            runner
+                .run_loaded_tests(loaded, |result| {
+                    output.write_test(result);
+                    output.flush();
+                })
+                .await
+        }
+        "js" => {
+            // Default: script is in the bindings/javascript directory
+            let js_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../bindings/javascript");
+
+            // Determine script path - use provided or default to bundled script
+            let script_path = js_script.unwrap_or_else(|| js_dir.join("turso-sql-runner.mjs"));
+
+            if !script_path.exists() {
+                eprintln!(
+                    "Error: JavaScript runner script not found at {}",
+                    script_path.display()
+                );
+                eprintln!("Use --js-script to specify a custom script path");
+                return ExitCode::from(2);
+            }
+
+            // Check that native bindings are built
+            let native_dir = js_dir.join("packages/native");
+            let has_native_bindings = native_dir
+                .read_dir()
+                .map(|entries| {
+                    entries
+                        .filter_map(|e| e.ok())
+                        .any(|e| e.path().extension().is_some_and(|ext| ext == "node"))
+                })
+                .unwrap_or(false);
+
+            if !has_native_bindings {
+                eprintln!("Error: JavaScript native bindings not found");
+                eprintln!("Expected .node file in {}", native_dir.display());
+                eprintln!();
+                eprintln!("Build the bindings first:");
+                eprintln!("  make -C turso-test-runner build-js-bindings");
+                eprintln!();
+                eprintln!("Or manually:");
+                eprintln!("  cd bindings/javascript");
+                eprintln!("  yarn install");
+                eprintln!("  yarn workspace @tursodatabase/database-common build");
+                eprintln!("  yarn workspace @tursodatabase/database build");
+                return ExitCode::from(2);
+            }
+
+            let mut backend = JsBackend::new(&node, &script_path)
+                .with_timeout(Duration::from_secs(timeout))
+                .with_mvcc(mvcc);
+            if let Some(resolver) = resolver {
+                backend = backend.with_default_db_resolver(resolver);
+            }
+            let runner = TestRunner::new(backend).with_config(config);
+            runner
+                .run_loaded_tests(loaded, |result| {
+                    output.write_test(result);
+                    output.flush();
+                })
+                .await
+        }
+        other => {
+            eprintln!("Error: unknown backend '{other}'. Use 'rust', 'cli', or 'js'");
+            return ExitCode::from(2);
+        }
+    };
+
+    let results = match results {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("Error running tests: {}", e);
+            eprintln!("Error running tests: {e}");
             return ExitCode::from(1);
         }
     };
@@ -187,9 +400,54 @@ async fn run_tests(
     }
 }
 
-fn check_files(paths: Vec<PathBuf>) -> ExitCode {
+/// Simple resolver that holds the paths directly
+struct DefaultDatabasesResolver(Option<PathBuf>, Option<PathBuf>);
+
+impl turso_test_runner::DefaultDatabaseResolver for DefaultDatabasesResolver {
+    fn resolve(&self, location: &turso_test_runner::DatabaseLocation) -> Option<PathBuf> {
+        match location {
+            turso_test_runner::DatabaseLocation::Default => self.0.clone(),
+            turso_test_runner::DatabaseLocation::DefaultNoRowidAlias => self.1.clone(),
+            _ => None,
+        }
+    }
+}
+
+async fn check_files(paths: Vec<PathBuf>) -> ExitCode {
     let mut has_errors = false;
 
+    // Check for pending snapshot files
+    let mut pending_files = Vec::new();
+    for path in &paths {
+        let search_dir = if path.is_file() {
+            path.parent().unwrap_or(Path::new("."))
+        } else {
+            path.as_path()
+        };
+        let found = find_all_pending_snapshots(search_dir).await;
+        pending_files.extend(found);
+    }
+
+    if !pending_files.is_empty() {
+        eprintln!(
+            "{}",
+            "Error: Found pending snapshot files (.snap.new)"
+                .red()
+                .bold()
+        );
+        eprintln!("These files indicate uncommitted snapshot changes:");
+        for file in &pending_files {
+            eprintln!("  - {}", file.display());
+        }
+        eprintln!();
+        eprintln!("To resolve:");
+        eprintln!("  - Accept with: --snapshot-mode=always");
+        eprintln!("  - Or review with cargo-insta: https://insta.rs/docs/cli/");
+        eprintln!("  - Or delete the .snap.new files");
+        has_errors = true;
+    }
+
+    // Check test file syntax
     for path in &paths {
         if path.is_dir() {
             // Glob for .sqltest files
@@ -206,14 +464,14 @@ fn check_files(paths: Vec<PathBuf>) -> ExitCode {
                                 }
                             }
                             Err(e) => {
-                                eprintln!("Error: {}", e);
+                                eprintln!("Error: {e}");
                                 has_errors = true;
                             }
                         }
                     }
                 }
                 Err(e) => {
-                    eprintln!("Error: invalid glob pattern: {}", e);
+                    eprintln!("Error: invalid glob pattern: {e}");
                     has_errors = true;
                 }
             }
@@ -238,12 +496,18 @@ fn check_single_file(path: &PathBuf) -> bool {
     match std::fs::read_to_string(path) {
         Ok(content) => match turso_test_runner::parse(&content) {
             Ok(file) => {
+                let snapshots_str = if file.snapshots.is_empty() {
+                    String::new()
+                } else {
+                    format!(", {} snapshots", file.snapshots.len())
+                };
                 println!(
-                    "{} - OK ({} databases, {} setups, {} tests)",
+                    "{} - OK ({} databases, {} setups, {} tests{})",
                     path.display(),
                     file.databases.len(),
                     file.setups.len(),
-                    file.tests.len()
+                    file.tests.len(),
+                    snapshots_str
                 );
                 true
             }
@@ -259,13 +523,13 @@ fn check_single_file(path: &PathBuf) -> bool {
     }
 }
 
-fn print_parse_error(path: &PathBuf, content: &str, error: ParseError) {
+fn print_parse_error(path: &Path, content: &str, error: ParseError) {
     // Use miette for nice error display with source context
     let report = Report::from(error).with_source_code(NamedSource::new(
         path.display().to_string(),
         content.to_string(),
     ));
-    eprintln!("{:?}", report);
+    eprintln!("{report:?}");
 }
 
 fn convert_files(
@@ -274,8 +538,6 @@ fn convert_files(
     to_stdout: bool,
     verbose: bool,
 ) -> ExitCode {
-    use colored::Colorize;
-
     let mut total_tests = 0;
     let mut total_warnings = 0;
     let mut files_processed = 0;
@@ -351,8 +613,6 @@ fn convert_single_file(
     to_stdout: bool,
     _verbose: bool,
 ) -> (usize, usize) {
-    use colored::Colorize;
-
     let content = match std::fs::read_to_string(path) {
         Ok(c) => Arc::new(c),
         Err(e) => {
@@ -381,7 +641,7 @@ fn convert_single_file(
     for warning in &result.warnings {
         let report = warning.to_report(&path_display, content.clone());
         // Use debug format {:?} to get full miette diagnostic with source snippets
-        eprintln!("{:?}", report);
+        eprintln!("{report:?}");
     }
 
     if test_count == 0 {
@@ -396,7 +656,7 @@ fn convert_single_file(
         for (key, file) in &generated.files {
             println!(
                 "\n{} ({} tests)",
-                format!("--- {} tests ---", key).green().bold(),
+                format!("--- {key} tests ---").green().bold(),
                 file.test_count
             );
             println!("{}", file.content);
@@ -448,10 +708,10 @@ fn convert_single_file(
         for (key, file) in &generated.files {
             let output_path = if use_subdir {
                 // In subdirectory: use key as filename
-                output_base.join(format!("{}.sqltest", key))
+                output_base.join(format!("{key}.sqltest"))
             } else {
                 // Single file: use original name
-                output_base.join(format!("{}.sqltest", file_stem))
+                output_base.join(format!("{file_stem}.sqltest"))
             };
 
             match std::fs::write(&output_path, &file.content) {
@@ -475,4 +735,107 @@ fn convert_single_file(
     }
 
     (test_count, warning_count)
+}
+
+/// Generate test databases for debugging purposes.
+///
+/// This command creates the same databases that the test runner generates
+/// for tests using `:default:` and `:default-no-rowidalias:` database locations,
+/// but saves them to a specified directory instead of a temporary location.
+///
+/// **DEBUG ONLY**: This is intended for inspecting generated databases during
+/// debugging, not for normal test execution.
+async fn generate_debug_databases(
+    output_dir: PathBuf,
+    user_count: usize,
+    seed: u64,
+    mvcc: bool,
+) -> ExitCode {
+    eprintln!(
+        "{}",
+        "WARNING: This command is for debugging only!"
+            .yellow()
+            .bold()
+    );
+    eprintln!();
+
+    // Create output directory if it doesn't exist
+    if !output_dir.exists() {
+        if let Err(e) = std::fs::create_dir_all(&output_dir) {
+            eprintln!(
+                "{}: Failed to create output directory {}: {}",
+                "Error".red().bold(),
+                output_dir.display(),
+                e
+            );
+            return ExitCode::from(1);
+        }
+    }
+
+    // Generate default database (INTEGER PRIMARY KEY - has rowid alias)
+    let default_db_path = output_dir.join("database.db");
+    eprintln!(
+        "Generating default database (INTEGER PRIMARY KEY) at {}...",
+        default_db_path.display()
+    );
+
+    let config = GeneratorConfig {
+        db_path: default_db_path.to_string_lossy().to_string(),
+        user_count,
+        seed,
+        no_rowid_alias: false,
+        mvcc,
+    };
+
+    if let Err(e) = generate_database(&config).await {
+        eprintln!(
+            "{}: Failed to generate default database: {}",
+            "Error".red().bold(),
+            e
+        );
+        return ExitCode::from(1);
+    }
+
+    eprintln!("  {} {}", "OK".green().bold(), default_db_path.display());
+
+    // Generate no-rowid-alias database (INT PRIMARY KEY - no rowid alias)
+    let no_rowid_db_path = output_dir.join("database-no-rowidalias.db");
+    eprintln!(
+        "Generating no-rowid-alias database (INT PRIMARY KEY) at {}...",
+        no_rowid_db_path.display()
+    );
+
+    let config = GeneratorConfig {
+        db_path: no_rowid_db_path.to_string_lossy().to_string(),
+        user_count,
+        seed,
+        no_rowid_alias: true,
+        mvcc,
+    };
+
+    if let Err(e) = generate_database(&config).await {
+        eprintln!(
+            "{}: Failed to generate no-rowid-alias database: {}",
+            "Error".red().bold(),
+            e
+        );
+        return ExitCode::from(1);
+    }
+
+    eprintln!("  {} {}", "OK".green().bold(), no_rowid_db_path.display());
+
+    // Print summary
+    eprintln!();
+    eprintln!(
+        "{}: Generated {} databases in {}",
+        "Done".green().bold(),
+        2,
+        output_dir.display()
+    );
+    eprintln!("  - database.db (INTEGER PRIMARY KEY, rowid alias enabled)");
+    eprintln!("  - database-no-rowidalias.db (INT PRIMARY KEY, no rowid alias)");
+    eprintln!();
+    eprintln!("Configuration: seed={seed}, user_count={user_count}, mvcc={mvcc}");
+
+    ExitCode::SUCCESS
 }

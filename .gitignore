@@ -1,4 +1,5 @@
 /target
+/target.noindex
 /.idea
 /.vscode
 /.sqlite3
@@ -45,7 +46,7 @@ simulator.log
 profile.json.gz
 simulator-output/
 tests/*.sql
-
+stress-go/stress-go
 &1
 bisected.sql
 *.log
@@ -57,3 +58,7 @@ settings.local.json
 
 # Track empty wals for read only databases
 !turso-test-runner/database/*
+
+
+# For simulator redo
+test.sql

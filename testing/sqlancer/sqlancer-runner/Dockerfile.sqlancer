@@ -1,0 +1,156 @@
+# Dockerfile for SQLancer ECS Runner
+# Multi-stage build: builds Limbo JDBC driver and sets up SQLancer runner
+
+#
+# Stage 1: Build the Limbo native library and JDBC JAR
+#
+FROM lukemathwalker/cargo-chef:latest-rust-1.88.0 AS chef
+# Install OpenJDK 11 from Adoptium (Temurin)
+RUN apt update \
+    && apt install -y git libssl-dev pkg-config wget apt-transport-https gnupg \
+    && wget -qO - https://packages.adoptium.net/artifactory/api/gpg/key/public | gpg --dearmor -o /usr/share/keyrings/adoptium.gpg \
+    && echo "deb [signed-by=/usr/share/keyrings/adoptium.gpg] https://packages.adoptium.net/artifactory/deb $(awk -F= '/^VERSION_CODENAME/{print$2}' /etc/os-release) main" > /etc/apt/sources.list.d/adoptium.list \
+    && apt update \
+    && apt install -y temurin-11-jdk \
+    && apt clean \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+
+# Prepare recipe for caching
+FROM chef AS planner
+COPY Cargo.toml Cargo.lock ./
+COPY core ./core/
+COPY bindings ./bindings/
+COPY extensions ./extensions/
+COPY macros ./macros/
+COPY sync ./sync
+COPY parser ./parser/
+COPY cli ./cli/
+COPY sqlite3 ./sqlite3/
+COPY testing/stress ./testing/stress/
+COPY tests ./tests/
+COPY packages ./packages/
+COPY testing/sqlite_test_ext ./testing/sqlite_test_ext
+COPY testing/simulator ./testing/simulator/
+COPY sql_generation ./sql_generation/
+COPY testing/concurrent-simulator ./testing/concurrent-simulator
+COPY testing/differential-oracle ./testing/differential-oracle/
+COPY perf/encryption ./perf/encryption
+COPY perf/throughput/rusqlite ./perf/throughput/rusqlite
+COPY perf/throughput/turso ./perf/throughput/turso
+COPY turso-test-runner ./turso-test-runner/
+COPY sdk-kit ./sdk-kit/
+COPY sdk-kit-macros ./sdk-kit-macros/
+COPY tools ./tools/
+RUN cargo chef prepare --recipe-path recipe.json
+
+#
+# Stage 2: Build native library and JAR
+#
+FROM chef AS builder
+
+COPY --from=planner /app/recipe.json recipe.json
+RUN cargo chef cook --release --recipe-path recipe.json
+
+# Copy full source
+COPY --from=planner /app/Cargo.toml /app/Cargo.lock ./
+COPY --from=planner /app/core ./core/
+COPY --from=planner /app/bindings ./bindings/
+COPY --from=planner /app/extensions ./extensions/
+COPY --from=planner /app/macros ./macros/
+COPY --from=planner /app/sync ./sync
+COPY --from=planner /app/parser ./parser/
+COPY --from=planner /app/cli ./cli/
+COPY --from=planner /app/sqlite3 ./sqlite3/
+COPY --from=planner /app/testing/stress ./testing/stress/
+COPY --from=planner /app/tests ./tests/
+COPY --from=planner /app/packages ./packages/
+COPY --from=planner /app/testing/sqlite_test_ext ./testing/sqlite_test_ext
+COPY --from=planner /app/testing/simulator ./testing/simulator/
+COPY --from=planner /app/sql_generation ./sql_generation/
+COPY --from=planner /app/testing/concurrent-simulator ./testing/concurrent-simulator
+COPY --from=planner /app/testing/differential-oracle ./testing/differential-oracle/
+COPY --from=planner /app/perf/encryption ./perf/encryption
+COPY --from=planner /app/perf/throughput/rusqlite ./perf/throughput/rusqlite
+COPY --from=planner /app/perf/throughput/turso ./perf/throughput/turso
+COPY --from=planner /app/turso-test-runner ./turso-test-runner/
+COPY --from=planner /app/sdk-kit ./sdk-kit/
+COPY --from=planner /app/sdk-kit-macros ./sdk-kit-macros/
+COPY --from=planner /app/tools ./tools/
+
+
+# Build native library for Linux x86_64
+WORKDIR /app/bindings/java
+RUN mkdir -p libs/linux_x86 temp \
+    && CARGO_TARGET_DIR=temp cargo build --release --target x86_64-unknown-linux-gnu \
+    && cp temp/x86_64-unknown-linux-gnu/release/lib_turso_java.so libs/linux_x86/ \
+    && rm -rf temp
+
+# Build JAR
+RUN ./gradlew jar --no-daemon
+
+#
+# Stage 3: Runtime image
+#
+FROM debian:bookworm-slim AS runtime
+
+# Install dependencies and OpenJDK 11 from Adoptium (Temurin)
+RUN apt-get update && apt-get install -y \
+    curl \
+    unzip \
+    ca-certificates \
+    libssl3 \
+    openssl \
+    git \
+    wget \
+    apt-transport-https \
+    gnupg \
+    maven \
+    python3 \
+    python3-pip \
+    sqlite3 \
+    patch \
+    && wget -qO - https://packages.adoptium.net/artifactory/api/gpg/key/public | gpg --dearmor -o /usr/share/keyrings/adoptium.gpg \
+    && echo "deb [signed-by=/usr/share/keyrings/adoptium.gpg] https://packages.adoptium.net/artifactory/deb $(awk -F= '/^VERSION_CODENAME/{print$2}' /etc/os-release) main" > /etc/apt/sources.list.d/adoptium.list \
+    && apt-get update \
+    && apt-get install -y temurin-11-jdk \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Bun
+RUN curl -fsSL https://bun.sh/install | bash \
+    && ln -s /root/.bun/bin/bun /usr/local/bin/bun
+
+# Accept git hash as build argument
+ARG GIT_HASH
+ENV GIT_HASH=${GIT_HASH:-unknown}
+ENV RUST_BACKTRACE=1
+
+WORKDIR /app
+
+# Copy native library and JAR from builder
+COPY --from=builder /app/bindings/java/build/libs/turso-*.jar /app/turso.jar
+COPY --from=builder /app/bindings/java/libs/linux_x86/lib_turso_java.so /app/native/
+
+# Set up native library path
+ENV LIMBO_JAR=/app/turso.jar
+ENV NATIVE_LIB_DIR=/app/native
+ENV LD_LIBRARY_PATH=/app/native:$LD_LIBRARY_PATH
+
+# Copy SQLancer patches
+COPY testing/sqlancer/patches/LimboProvider.java /app/LimboProvider.java
+COPY testing/sqlancer/patches/SQLite3Schema.patch /app/SQLite3Schema.patch
+
+# Copy corruption debug tools
+COPY scripts/corruption-debug-tools /app/corruption-debug-tools
+ENV CORRUPTION_TOOLS_DIR=/app/corruption-debug-tools
+
+# Copy SQLancer runner
+COPY testing/sqlancer/sqlancer-runner/package.json testing/sqlancer/sqlancer-runner/bun.lock* testing/sqlancer/sqlancer-runner/tsconfig.json ./
+RUN bun install || true
+COPY testing/sqlancer/sqlancer-runner/* ./
+
+# Make entrypoint executable
+RUN chmod +x /app/docker-entrypoint.sqlancer.ts
+
+ENTRYPOINT ["bun", "/app/docker-entrypoint.sqlancer.ts"]
+CMD []

@@ -114,6 +114,43 @@ impl Task for DbTask {
     }
 }
 
+/// Supported encryption ciphers for local database encryption.
+#[napi]
+#[derive(Clone, Copy)]
+pub enum EncryptionCipher {
+    Aes128Gcm,
+    Aes256Gcm,
+    Aegis256,
+    Aegis256x2,
+    Aegis128l,
+    Aegis128x2,
+    Aegis128x4,
+}
+
+impl EncryptionCipher {
+    fn as_str(&self) -> &'static str {
+        match self {
+            EncryptionCipher::Aes128Gcm => "aes128gcm",
+            EncryptionCipher::Aes256Gcm => "aes256gcm",
+            EncryptionCipher::Aegis256 => "aegis256",
+            EncryptionCipher::Aegis256x2 => "aegis256x2",
+            EncryptionCipher::Aegis128l => "aegis128l",
+            EncryptionCipher::Aegis128x2 => "aegis128x2",
+            EncryptionCipher::Aegis128x4 => "aegis128x4",
+        }
+    }
+}
+
+/// Encryption configuration for local database encryption.
+#[napi(object)]
+#[derive(Clone)]
+pub struct EncryptionOpts {
+    /// The cipher to use for encryption
+    pub cipher: EncryptionCipher,
+    /// The hex-encoded encryption key
+    pub hexkey: String,
+}
+
 /// Most of the options are aligned with better-sqlite API
 /// (see https://github.com/WiseLibs/better-sqlite3/blob/master/docs/api.md#new-databasepath-options)
 #[napi(object)]
@@ -125,6 +162,8 @@ pub struct DatabaseOpts {
     pub tracing: Option<String>,
     /// Experimental features to enable
     pub experimental: Option<Vec<String>>,
+    /// Optional encryption configuration for local database encryption
+    pub encryption: Option<EncryptionOpts>,
 }
 
 fn step_sync(stmt: &Arc<RefCell<turso_core::Statement>>) -> napi::Result<u32> {
@@ -165,6 +204,7 @@ fn connect_sync(db: &DatabaseInner) -> napi::Result<()> {
     let mut flags = turso_core::OpenFlags::Create;
     let mut busy_timeout = None;
     let mut core_opts = turso_core::DatabaseOpts::new();
+    let mut encryption_opts = None;
     if let Some(opts) = &db.opts {
         if opts.readonly == Some(true) {
             flags.set(turso_core::OpenFlags::ReadOnly, true);
@@ -190,14 +230,43 @@ fn connect_sync(db: &DatabaseInner) -> napi::Result<()> {
                 };
             }
         }
+        if let Some(encryption) = &opts.encryption {
+            encryption_opts = Some(turso_core::EncryptionOpts {
+                cipher: encryption.cipher.as_str().to_string(),
+                hexkey: encryption.hexkey.clone(),
+            });
+            // Ensure encryption is enabled if encryption opts are provided
+            core_opts = core_opts.with_encryption(true);
+        }
     }
     let io = &db.io;
-    let db_core =
-        turso_core::Database::open_file_with_flags(io.clone(), &db.path, flags, core_opts, None)
-            .map_err(|e| to_generic_error(&format!("failed to open database {}", db.path), e))?;
+    // Parse encryption key if encryption options are provided
+    let encryption_key = if let Some(opts) = &db.opts {
+        if let Some(encryption) = &opts.encryption {
+            Some(
+                turso_core::EncryptionKey::from_hex_string(&encryption.hexkey)
+                    .map_err(|e| to_generic_error("invalid encryption key", e))?,
+            )
+        } else {
+            None
+        }
+    } else {
+        None
+    };
 
+    let db_core = turso_core::Database::open_file_with_flags(
+        io.clone(),
+        &db.path,
+        flags,
+        core_opts,
+        encryption_opts,
+    )
+    .map_err(|e| to_generic_error(&format!("failed to open database {}", db.path), e))?;
+
+    // Use connect_with_encryption to properly set up encryption context
+    // before the pager reads page 1. This is required for encrypted databases.
     let conn = db_core
-        .connect()
+        .connect_with_encryption(encryption_key)
         .map_err(|e| to_generic_error("failed to connect", e))?;
 
     if let Some(busy_timeout) = busy_timeout {
@@ -679,7 +748,7 @@ impl Statement {
         for i in 0..column_count {
             let mut js_obj = Object::new(env)?;
             let column_name = stmt.get_column_name(i);
-            let column_type = stmt.get_column_type(i);
+            let column_type = stmt.get_column_type_name(i);
 
             // Set the name property
             js_obj.set("name", column_name.as_ref())?;

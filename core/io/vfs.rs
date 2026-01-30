@@ -1,16 +1,20 @@
-use super::{Buffer, Completion, File, OpenFlags, IO};
+use super::{Buffer, Completion, File, FileSyncType, OpenFlags, IO};
 use crate::ext::VfsMod;
-use crate::io::clock::{Clock, DefaultClock, Instant};
+use crate::io::clock::{Clock, DefaultClock, MonotonicInstant, WallClockInstant};
 use crate::io::CompletionInner;
+use crate::sync::Arc;
 use crate::{LimboError, Result};
 use std::ffi::{c_void, CString};
 use std::ptr::NonNull;
-use std::sync::Arc;
 use turso_ext::{BufferRef, IOCallback, SendPtr, VfsFileImpl, VfsImpl};
 
 impl Clock for VfsMod {
-    fn now(&self) -> Instant {
-        DefaultClock.now()
+    fn current_time_monotonic(&self) -> MonotonicInstant {
+        DefaultClock.current_time_monotonic()
+    }
+
+    fn current_time_wall_clock(&self) -> WallClockInstant {
+        DefaultClock.current_time_wall_clock()
     }
 }
 
@@ -162,7 +166,7 @@ impl File for VfsFileImpl {
         Ok(c)
     }
 
-    fn sync(&self, c: Completion) -> Result<Completion> {
+    fn sync(&self, c: Completion, _sync_type: FileSyncType) -> Result<Completion> {
         if self.vfs.is_null() {
             c.complete(-1);
             return Err(LimboError::ExtensionError("VFS is null".to_string()));

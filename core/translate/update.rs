@@ -1,5 +1,5 @@
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use crate::sync::Arc;
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use crate::schema::ROWID_SENTINEL;
 use crate::translate::emitter::Resolver;
@@ -21,7 +21,11 @@ use super::optimizer::optimize_plan;
 use super::plan::{
     ColumnUsedMask, IterationDirection, JoinedTable, Plan, TableReferences, UpdatePlan,
 };
-use super::planner::parse_where;
+use super::planner::{parse_where, plan_ctes_as_outer_refs};
+use super::subquery::{
+    plan_subqueries_from_returning, plan_subqueries_from_select_plan,
+    plan_subqueries_from_where_clause,
+};
 /*
 * Update is simple. By default we scan the table, and for each row, we check the WHERE
 * clause. If it evaluates to true, we build the new record with the updated value and insert.
@@ -57,7 +61,26 @@ pub fn translate_update(
     mut program: ProgramBuilder,
     connection: &Arc<crate::Connection>,
 ) -> crate::Result<ProgramBuilder> {
-    let mut plan = prepare_update_plan(&mut program, resolver.schema, body, connection, false)?;
+    let mut plan = prepare_update_plan(&mut program, resolver, body, connection, false)?;
+
+    // Plan subqueries in the WHERE clause
+    if let Plan::Update(ref mut update_plan) = plan {
+        if let Some(ref mut ephemeral_plan) = update_plan.ephemeral_plan {
+            // When using ephemeral plan (key columns are being updated), subqueries are in the ephemeral_plan's WHERE
+            plan_subqueries_from_select_plan(&mut program, ephemeral_plan, resolver, connection)?;
+        } else {
+            // Normal path: subqueries are in the UPDATE plan's WHERE
+            plan_subqueries_from_where_clause(
+                &mut program,
+                &mut update_plan.non_from_clause_subqueries,
+                &mut update_plan.table_references,
+                &mut update_plan.where_clause,
+                resolver,
+                connection,
+            )?;
+        }
+    }
+
     optimize_plan(&mut program, &mut plan, resolver.schema)?;
     let opts = ProgramBuilderOpts {
         num_cursors: 1,
@@ -77,11 +100,25 @@ pub fn translate_update_for_schema_change(
     ddl_query: &str,
     after: impl FnOnce(&mut ProgramBuilder),
 ) -> crate::Result<ProgramBuilder> {
-    let mut plan = prepare_update_plan(&mut program, resolver.schema, body, connection, true)?;
+    let mut plan = prepare_update_plan(&mut program, resolver, body, connection, true)?;
 
-    if let Plan::Update(plan) = &mut plan {
+    if let Plan::Update(update_plan) = &mut plan {
         if program.capture_data_changes_mode().has_updates() {
-            plan.cdc_update_alter_statement = Some(ddl_query.to_string());
+            update_plan.cdc_update_alter_statement = Some(ddl_query.to_string());
+        }
+
+        // Plan subqueries in the WHERE clause
+        if let Some(ref mut ephemeral_plan) = update_plan.ephemeral_plan {
+            plan_subqueries_from_select_plan(&mut program, ephemeral_plan, resolver, connection)?;
+        } else {
+            plan_subqueries_from_where_clause(
+                &mut program,
+                &mut update_plan.non_from_clause_subqueries,
+                &mut update_plan.table_references,
+                &mut update_plan.where_clause,
+                resolver,
+                connection,
+            )?;
         }
     }
 
@@ -101,16 +138,14 @@ fn validate_update(
     body: &ast::Update,
     table_name: &str,
     is_internal_schema_change: bool,
+    conn: &Arc<Connection>,
 ) -> crate::Result<()> {
     // Check if this is a system table that should be protected from direct writes
-    if !is_internal_schema_change && !crate::schema::can_write_to_table(table_name) {
+    if !is_internal_schema_change
+        && !conn.is_nested_stmt()
+        && !crate::schema::can_write_to_table(table_name)
+    {
         crate::bail_parse_error!("table {} may not be modified", table_name);
-    }
-    if body.with.is_some() {
-        bail_parse_error!("WITH clause is not supported in UPDATE");
-    }
-    if body.or_conflict.is_some() {
-        bail_parse_error!("ON CONFLICT clause is not supported in UPDATE");
     }
     if body.from.is_some() {
         bail_parse_error!("FROM clause is not supported in UPDATE");
@@ -149,11 +184,12 @@ fn validate_update(
 
 pub fn prepare_update_plan(
     program: &mut ProgramBuilder,
-    schema: &Schema,
+    resolver: &Resolver,
     mut body: ast::Update,
     connection: &Arc<crate::Connection>,
     is_internal_schema_change: bool,
 ) -> crate::Result<Plan> {
+    let schema = resolver.schema;
     let table_name = &body.tbl_name.name;
     let table = match schema.get_table(table_name.as_str()) {
         Some(table) => table,
@@ -164,7 +200,13 @@ pub fn prepare_update_plan(
         &body,
         table_name.as_str(),
         is_internal_schema_change,
+        connection,
     )?;
+
+    // Extract WITH and OR conflict clause before borrowing body mutably
+    let with = body.with.take();
+    let or_conflict = body.or_conflict.take();
+
     let table_name = table.get_name();
     let iter_dir = body
         .order_by
@@ -196,6 +238,9 @@ pub fn prepare_update_plan(
         database_id: 0,
     }];
     let mut table_references = TableReferences::new(joined_tables, vec![]);
+
+    // Plan CTEs and add them as outer query references for subquery resolution
+    plan_ctes_as_outer_refs(with, resolver, program, &mut table_references, connection)?;
 
     let column_lookup: HashMap<String, usize> = table
         .columns()
@@ -270,6 +315,18 @@ pub fn prepare_update_plan(
             }
         }
     }
+
+    // Plan subqueries in RETURNING expressions before processing
+    // (so SubqueryResult nodes are cloned into result_columns)
+    let mut non_from_clause_subqueries = vec![];
+    plan_subqueries_from_returning(
+        program,
+        &mut non_from_clause_subqueries,
+        &mut table_references,
+        &mut body.returning,
+        resolver,
+        connection,
+    )?;
 
     let result_columns =
         process_returning_clause(&mut body.returning, &mut table_references, connection)?;
@@ -365,6 +422,7 @@ pub fn prepare_update_plan(
 
     Ok(Plan::Update(UpdatePlan {
         table_references,
+        or_conflict,
         set_clauses,
         where_clause,
         returning: if result_columns.is_empty() {
@@ -379,6 +437,7 @@ pub fn prepare_update_plan(
         indexes_to_update,
         ephemeral_plan: None,
         cdc_update_alter_statement: None,
+        non_from_clause_subqueries,
     }))
 }
 
@@ -396,7 +455,7 @@ fn build_scan_op(table: &Table, iter_dir: IterationDirection) -> Operation {
 /// Returns a set of column indices used in the expression.
 /// *Must* be used on an Expr already processed by `bind_and_rewrite_expr`
 fn collect_cols_used_in_expr(expr: &Expr) -> HashSet<usize> {
-    let mut acc = HashSet::new();
+    let mut acc = HashSet::default();
     let _ = walk_expr(expr, &mut |expr| match expr {
         Expr::Column { column, .. } => {
             acc.insert(*column);
@@ -424,7 +483,7 @@ fn columns_used_by_index_expr(
     )
     .is_err()
     {
-        return HashSet::new();
+        return HashSet::default();
     }
     collect_cols_used_in_expr(&expr_copy)
 }

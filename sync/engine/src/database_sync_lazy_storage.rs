@@ -4,6 +4,7 @@ use std::{
 };
 
 use turso_core::{
+    io::FileSyncType,
     storage::sqlite3_ondisk::{self, PageContent},
     Buffer, Completion, DatabaseStorage, File, LimboError,
 };
@@ -228,6 +229,8 @@ pub struct LazyDatabaseStorage<IO: SyncEngineIo> {
     opts: PartialSyncOpts,
     // optional remote_url from saved configuration section of metadata file
     remote_url: Option<String>,
+    // optional encryption key (base64 encoded) for encrypted Turso Cloud databases
+    remote_encryption_key: Option<String>,
 }
 
 impl<IO: SyncEngineIo> LazyDatabaseStorage<IO> {
@@ -238,6 +241,7 @@ impl<IO: SyncEngineIo> LazyDatabaseStorage<IO> {
         server_revision: String,
         opts: PartialSyncOpts,
         remote_url: Option<String>,
+        remote_encryption_key: Option<String>,
     ) -> Result<Self, errors::Error> {
         let clean_file_size = Arc::new(clean_file.size()?.into());
         Ok(Self {
@@ -249,6 +253,7 @@ impl<IO: SyncEngineIo> LazyDatabaseStorage<IO> {
             opts,
             page_states: Arc::new(Mutex::new(PageStates::new())),
             remote_url,
+            remote_encryption_key,
         })
     }
 }
@@ -404,10 +409,10 @@ async fn read_page<Ctx, IO: SyncEngineIo>(
     if prefetch {
         tracing::info!("read_page(page={page}): trying to prefetch more pages");
         let content = PageContent::new(buffer.clone());
-        if content.maybe_page_type().is_some() {
+        if content.page_type().is_ok() {
             tracing::info!(
                 "read_page(page={page}): detected valid page for prefetch load: {:?}",
-                content.maybe_page_type()
+                content.page_type().ok()
             );
             let mut page_refs = Vec::with_capacity(content.cell_count() + 1);
             for cell_id in 0..content.cell_count() {
@@ -417,7 +422,7 @@ async fn read_page<Ctx, IO: SyncEngineIo>(
                     );
                     break;
                 };
-                if let Some(pointer) = content.rightmost_pointer() {
+                if let Some(pointer) = content.rightmost_pointer().ok().flatten() {
                     page_refs.push(pointer);
                 }
                 match cell {
@@ -514,7 +519,7 @@ impl<IO: SyncEngineIo> DatabaseStorage for LazyDatabaseStorage<IO> {
             let check_buffer = Arc::new(Buffer::new_temporary(size));
             let check_c = dirty_file.pread(
                 page_offset,
-                Completion::new_read(check_buffer.clone(), |_| {}),
+                Completion::new_read(check_buffer.clone(), |_| None),
             )?;
             assert!(
                 check_c.finished(),
@@ -524,7 +529,7 @@ impl<IO: SyncEngineIo> DatabaseStorage for LazyDatabaseStorage<IO> {
             let clean_buffer = r.buf_arc();
             let clean_c = self.clean_file.pread(
                 page_offset,
-                Completion::new_read(clean_buffer.clone(), |_| {}),
+                Completion::new_read(clean_buffer.clone(), |_| None),
             )?;
             assert!(
                 clean_c.finished(),
@@ -544,6 +549,7 @@ impl<IO: SyncEngineIo> DatabaseStorage for LazyDatabaseStorage<IO> {
         );
         let mut generator = genawaiter::sync::Gen::new({
             let remote_url = self.remote_url.clone();
+            let remote_encryption_key = self.remote_encryption_key.clone();
             let sync_engine_io = self.sync_engine_io.clone();
             let server_revision = self.server_revision.clone();
             let clean_file = self.clean_file.clone();
@@ -555,7 +561,12 @@ impl<IO: SyncEngineIo> DatabaseStorage for LazyDatabaseStorage<IO> {
             move |coro| async move {
                 let coro = Coro::new((), coro);
                 let mut guard = PageStatesGuard::new(&page_states);
-                let ctx = &SyncOperationCtx::new(&coro, &sync_engine_io, remote_url);
+                let ctx = &SyncOperationCtx::new(
+                    &coro,
+                    &sync_engine_io,
+                    remote_url,
+                    remote_encryption_key.as_deref(),
+                );
                 read_page(
                     ctx,
                     clean_file,
@@ -664,16 +675,20 @@ impl<IO: SyncEngineIo> DatabaseStorage for LazyDatabaseStorage<IO> {
         self.clean_file.pwritev(start_pos, buffers, nc)
     }
 
-    fn sync(&self, c: turso_core::Completion) -> turso_core::Result<turso_core::Completion> {
+    fn sync(
+        &self,
+        c: turso_core::Completion,
+        sync_type: FileSyncType,
+    ) -> turso_core::Result<turso_core::Completion> {
         if let Some(dirty_file) = &self.dirty_file {
-            let dirty_c = dirty_file.sync(Completion::new_sync(|_| {}))?;
+            let dirty_c = dirty_file.sync(Completion::new_sync(|_| {}), sync_type)?;
             assert!(
                 dirty_c.finished(),
                 "LazyDatabaseStorage works only with sync IO"
             );
         }
 
-        self.clean_file.sync(c)
+        self.clean_file.sync(c, sync_type)
     }
 
     fn size(&self) -> turso_core::Result<u64> {

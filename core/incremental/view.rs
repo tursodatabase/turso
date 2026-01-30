@@ -3,16 +3,16 @@ use super::dbsp::Delta;
 use super::operator::ComputationTracker;
 use crate::schema::{BTreeTable, Schema};
 use crate::storage::btree::CursorTrait;
+use crate::sync::Arc;
+use crate::sync::Mutex;
 use crate::translate::logical::LogicalPlanBuilder;
 use crate::types::{IOResult, Value};
 use crate::util::{extract_view_columns, ViewColumnSchema};
 use crate::{return_if_io, LimboError, Pager, Result, Statement};
-use parking_lot::Mutex;
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::rc::Rc;
-use std::sync::Arc;
 use turso_parser::ast;
 use turso_parser::{
     ast::{Cmd, Stmt},
@@ -91,7 +91,7 @@ impl ViewTransactionState {
     /// Create a new transaction state
     pub fn new() -> Self {
         Self {
-            table_deltas: RefCell::new(HashMap::new()),
+            table_deltas: RefCell::new(HashMap::default()),
         }
     }
 
@@ -147,7 +147,7 @@ impl AllViewsTxState {
     /// Create a new container for view transaction states
     pub fn new() -> Self {
         Self {
-            states: Rc::new(RefCell::new(HashMap::new())),
+            states: Rc::new(RefCell::new(HashMap::default())),
         }
     }
 
@@ -335,9 +335,9 @@ impl IncrementalView {
         let column_schema = extract_view_columns(&select, schema)?;
 
         let mut referenced_tables = Vec::new();
-        let mut table_aliases = HashMap::new();
-        let mut qualified_table_names = HashMap::new();
-        let mut table_conditions = HashMap::new();
+        let mut table_aliases = HashMap::default();
+        let mut qualified_table_names = HashMap::default();
+        let mut table_conditions = HashMap::default();
         Self::extract_all_tables(
             &select,
             schema,
@@ -587,7 +587,7 @@ impl IncrementalView {
         qualified_names: &mut HashMap<String, String>,
         table_conditions: &mut HashMap<String, Vec<Option<ast::Expr>>>,
     ) -> Result<()> {
-        let mut table_map = HashMap::new();
+        let mut table_map = HashMap::default();
         Self::extract_all_tables_inner(
             select,
             schema,
@@ -595,7 +595,7 @@ impl IncrementalView {
             aliases,
             qualified_names,
             table_conditions,
-            &HashSet::new(),
+            &HashSet::default(),
         )?;
 
         // Convert deduplicated table map to vector
@@ -1137,8 +1137,8 @@ impl IncrementalView {
     /// This method is only for materialized views and will persist data to the btree
     pub fn populate_from_table(
         &mut self,
-        conn: &std::sync::Arc<crate::Connection>,
-        pager: &std::sync::Arc<crate::Pager>,
+        conn: &crate::sync::Arc<crate::Connection>,
+        pager: &crate::sync::Arc<crate::Pager>,
         _btree_cursor: &mut dyn CursorTrait,
     ) -> crate::Result<IOResult<()>> {
         // Assert that this is a materialized view with a root page
@@ -1400,7 +1400,7 @@ impl IncrementalView {
 mod tests {
     use super::*;
     use crate::schema::{BTreeTable, ColDef, Column as SchemaColumn, Schema, Type};
-    use std::sync::Arc;
+    use crate::sync::Arc;
     use turso_parser::ast;
     use turso_parser::parser::Parser;
 
@@ -1592,9 +1592,9 @@ mod tests {
 
     fn extract_all_tables(select: &ast::Select, schema: &Schema) -> Result<ExtractedTableInfo> {
         let mut referenced_tables = Vec::new();
-        let mut table_aliases = HashMap::new();
-        let mut qualified_table_names = HashMap::new();
-        let mut table_conditions = HashMap::new();
+        let mut table_aliases = HashMap::default();
+        let mut qualified_table_names = HashMap::default();
+        let mut table_conditions = HashMap::default();
         IncrementalView::extract_all_tables(
             select,
             schema,
@@ -2360,7 +2360,7 @@ mod tests {
 
         // We're finding duplicates because "customers" appears twice in the recursive CTE
         // Let's deduplicate
-        let unique_tables: std::collections::HashSet<&str> = table_names.iter().cloned().collect();
+        let unique_tables: HashSet<&str> = table_names.iter().cloned().collect();
         assert_eq!(unique_tables.len(), 2);
         assert!(unique_tables.contains("customers"));
         assert!(unique_tables.contains("orders"));
@@ -2531,9 +2531,9 @@ mod tests {
             "test_view".to_string(),
             select.clone(),
             referenced_tables,
-            HashMap::new(),
-            HashMap::new(),
-            HashMap::new(),
+            HashMap::default(),
+            HashMap::default(),
+            HashMap::default(),
             extract_view_columns(&select, &schema).unwrap(),
             &schema,
             1,
@@ -2570,9 +2570,9 @@ mod tests {
 
         // Test table extraction directly without creating a view
         let mut tables = Vec::new();
-        let mut aliases = HashMap::new();
-        let mut qualified_names = HashMap::new();
-        let mut table_conditions = HashMap::new();
+        let mut aliases = HashMap::default();
+        let mut qualified_names = HashMap::default();
+        let mut table_conditions = HashMap::default();
 
         IncrementalView::extract_all_tables(
             &select,

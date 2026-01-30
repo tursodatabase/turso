@@ -37,6 +37,7 @@ sql_generation = { path = "../sql_generation" }
 turso_parser = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 tracing = { workspace = true }
+turso-dbhash.workspace = true
 
 [dev-dependencies]
 similar-asserts.workspace = true
@@ -44,6 +45,7 @@ test-log = { version = "0.2.17", features = ["trace"] }
 turso_macros.workspace = true
 
 [features]
-default = ["test_helper"]
+default = ["test_helper", "fts"]
 checksum = ["turso_core/checksum"]
 test_helper = ["turso_core/test_helper"]
+fts = ["turso_core/fts"]

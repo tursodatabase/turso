@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use turso_core::types::Text;
+use turso_core::{types::Text, IOResult};
 use turso_sdk_kit_macros::signature;
 
 use crate::rsapi::{
@@ -69,7 +69,8 @@ pub extern "C" fn turso_database_open(
         Err(err) => return unsafe { err.to_capi(error_opt_out) },
     };
     match database.open() {
-        Ok(()) => c::turso_status_code_t::TURSO_OK,
+        Ok(IOResult::Done(..)) => c::turso_status_code_t::TURSO_OK,
+        Ok(IOResult::IO(..)) => c::turso_status_code_t::TURSO_IO,
         Err(err) => unsafe { err.to_capi(error_opt_out) },
     }
 }
@@ -332,6 +333,22 @@ pub extern "C" fn turso_statement_column_count(statement: *const c::turso_statem
 
 #[no_mangle]
 #[signature(c)]
+pub extern "C" fn turso_statement_column_decltype(
+    statement: *const c::turso_statement_t,
+    index: usize,
+) -> *const std::ffi::c_char {
+    let statement = match unsafe { TursoStatement::ref_from_capi(statement) } {
+        Ok(statement) => statement,
+        Err(_) => return std::ptr::null(),
+    };
+    match statement.column_decltype(index) {
+        Some(decltype) => str_to_c_string(&decltype),
+        None => std::ptr::null(),
+    }
+}
+
+#[no_mangle]
+#[signature(c)]
 pub extern "C" fn turso_statement_row_value_kind(
     statement: *const c::turso_statement_t,
     index: usize,
@@ -517,7 +534,11 @@ pub extern "C" fn turso_statement_bind_positional_text(
         Ok(text) => text,
         Err(err) => return unsafe { err.to_capi(std::ptr::null_mut()) },
     };
-    match statement.bind_positional(position, turso_core::Value::Text(Text::new(text))) {
+    // we can't guarantee lifetime for the provided text - so we explicitly copy it to the owned string
+    match statement.bind_positional(
+        position,
+        turso_core::Value::Text(Text::new(text.to_string())),
+    ) {
         Ok(()) => c::turso_status_code_t::TURSO_OK,
         Err(err) => unsafe { err.to_capi(std::ptr::null_mut()) },
     }

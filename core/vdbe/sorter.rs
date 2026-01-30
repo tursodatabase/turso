@@ -1,22 +1,23 @@
+use branches::mark_unlikely;
 use turso_parser::ast::SortOrder;
 
+use crate::sync::RwLock;
+use crate::sync::{atomic, Arc};
 use bumpalo::Bump;
-use parking_lot::RwLock;
 use std::cmp::{Eq, Ord, Ordering, PartialEq, PartialOrd, Reverse};
 use std::collections::BinaryHeap;
 use std::ptr::NonNull;
 use std::rc::Rc;
-use std::sync::{atomic, Arc};
 
 use crate::io::TempFile;
-use crate::types::IOCompletions;
+use crate::types::{IOCompletions, ValueIterator};
 use crate::{
     error::LimboError,
     io::{Buffer, Completion, CompletionGroup, File, IO},
     storage::sqlite3_ondisk::{read_varint, varint_len, write_varint},
     translate::collate::CollationSeq,
     turso_assert,
-    types::{IOResult, ImmutableRecord, KeyInfo, RecordCursor, ValueRef},
+    types::{IOResult, ImmutableRecord, KeyInfo, ValueRef},
     Result,
 };
 use crate::{io_yield_one, return_if_io, CompletionError};
@@ -82,6 +83,8 @@ pub struct Sorter {
     init_chunk_heap_state: InitChunkHeapState,
     /// Pending IO completion along with the chunk index that needs to be retried after IO completes.
     pending_completion: Option<(Completion, usize)>,
+    /// Temp storage mode (memory vs file) for spilled data
+    temp_store: crate::TempStore,
 }
 
 impl Sorter {
@@ -91,6 +94,7 @@ impl Sorter {
         max_buffer_size_bytes: usize,
         min_chunk_read_buffer_size_bytes: usize,
         io: Arc<dyn IO>,
+        temp_store: crate::TempStore,
     ) -> Self {
         assert_eq!(order.len(), collations.len());
         Self {
@@ -121,6 +125,7 @@ impl Sorter {
             insert_state: InsertState::Start,
             init_chunk_heap_state: InitChunkHeapState::Start,
             pending_completion: None,
+            temp_store,
         }
     }
 
@@ -157,6 +162,12 @@ impl Sorter {
                     }
                 }
                 SortState::InitHeap => {
+                    // Check for write errors before proceeding
+                    if self.chunks.iter().any(|chunk| {
+                        matches!(*chunk.io_state.read(), SortedChunkIOState::WriteError)
+                    }) {
+                        return Err(CompletionError::IOError(std::io::ErrorKind::WriteZero).into());
+                    }
                     turso_assert!(
                         !self.chunks.iter().any(|chunk| {
                             matches!(*chunk.io_state.read(), SortedChunkIOState::WaitingForWrite)
@@ -175,6 +186,7 @@ impl Sorter {
         }
     }
 
+    #[expect(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Result<IOResult<()>> {
         if self.chunks.is_empty() {
             match self.records.pop() {
@@ -238,6 +250,14 @@ impl Sorter {
                             if !c.succeeded() {
                                 io_yield_one!(c);
                             }
+                        }
+                        // Check for write errors immediately after flush completes
+                        if self.chunks.iter().any(|chunk| {
+                            matches!(*chunk.io_state.read(), SortedChunkIOState::WriteError)
+                        }) {
+                            return Err(
+                                CompletionError::IOError(std::io::ErrorKind::WriteZero).into()
+                            );
                         }
                     }
                 }
@@ -375,7 +395,7 @@ impl Sorter {
         let chunk_file = match &self.temp_file {
             Some(temp_file) => temp_file.file.clone(),
             None => {
-                let temp_file = TempFile::new(&self.io)?;
+                let temp_file = TempFile::with_temp_store(&self.io, self.temp_store)?;
                 let chunk_file = temp_file.file.clone();
                 self.temp_file = Some(temp_file);
                 chunk_file
@@ -623,7 +643,7 @@ impl SortedChunk {
         let total_bytes_read_copy = self.total_bytes_read.clone();
         let read_complete = Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
             let Ok((buf, bytes_read)) = res else {
-                return;
+                return None;
             };
             let read_buf_ref = buf.clone();
             let read_buf = read_buf_ref.as_slice();
@@ -631,7 +651,7 @@ impl SortedChunk {
             let bytes_read = bytes_read as usize;
             if bytes_read == 0 {
                 *chunk_io_state_copy.write() = SortedChunkIOState::ReadEOF;
-                return;
+                return None;
             }
             *chunk_io_state_copy.write() = SortedChunkIOState::ReadComplete;
 
@@ -645,6 +665,7 @@ impl SortedChunk {
 
             stored_buffer_len_copy.store(stored_buf_len, atomic::Ordering::SeqCst);
             total_bytes_read_copy.fetch_add(bytes_read, atomic::Ordering::SeqCst);
+            None
         });
 
         let c = Completion::new_read(read_buffer_ref, read_complete);
@@ -686,12 +707,15 @@ impl SortedChunk {
         let chunk_io_state_copy = self.io_state.clone();
         let write_complete = Box::new(move |res: Result<i32, CompletionError>| {
             let Ok(bytes_written) = res else {
+                *chunk_io_state_copy.write() = SortedChunkIOState::WriteError;
                 return;
             };
-            *chunk_io_state_copy.write() = SortedChunkIOState::WriteComplete;
             let buf_len = buffer_ref_copy.len();
             if bytes_written < buf_len as i32 {
                 tracing::error!("wrote({bytes_written}) less than expected({buf_len})");
+                *chunk_io_state_copy.write() = SortedChunkIOState::WriteError;
+            } else {
+                *chunk_io_state_copy.write() = SortedChunkIOState::WriteComplete;
             }
         });
 
@@ -722,16 +746,16 @@ impl ArenaSortableRecord {
     ) -> Result<Self> {
         let payload = arena.alloc_slice_copy(record.get_payload());
 
-        let mut cursor = RecordCursor::with_capacity(key_len);
-        cursor.ensure_parsed_upto_payload(payload, key_len - 1)?;
-        turso_assert!(
-            index_key_info.len() >= cursor.serials_offsets.len(),
-            "index_key_info.len() < cursor.serials_offsets.len()"
-        );
+        let mut payload_iter = ValueIterator::new(payload)?;
 
-        let mut key_values = bumpalo::collections::Vec::with_capacity_in(key_len, arena);
-        for i in 0..key_len {
-            let value = cursor.deserialize_column_payload(payload, i)?;
+        let mut key_values =
+            bumpalo::collections::Vec::with_capacity_in(payload_iter.clone().count(), arena);
+        for _ in 0..key_len {
+            let value = match payload_iter.next() {
+                Some(Ok(v)) => v,
+                Some(Err(e)) => return Err(e),
+                None => crate::bail_corrupt_error!("Not enough columns in record"),
+            };
             // SAFETY: value borrows from payload which is in the arena and outlives this struct.
             let value: ValueRef<'static> = unsafe { std::mem::transmute(value) };
             key_values.push(value);
@@ -824,25 +848,27 @@ impl BoxedSortableRecord {
         key_len: usize,
         index_key_info: Rc<Vec<KeyInfo>>,
     ) -> Result<Self> {
-        let mut cursor = RecordCursor::with_capacity(key_len);
-        cursor.ensure_parsed_upto(&record, key_len - 1)?;
-        turso_assert!(
-            index_key_info.len() >= cursor.serials_offsets.len(),
-            "index_key_info.len() < cursor.serials_offsets.len()"
-        );
-
+        let mut value_iterator = record.iter()?;
         let mut key_values = Vec::with_capacity(key_len);
         let mut deserialization_error = None;
 
-        for i in 0..key_len {
-            match cursor.deserialize_column(&record, i) {
-                Ok(value) => {
+        for _ in 0..key_len {
+            match value_iterator.next() {
+                Some(Ok(value)) => {
                     // SAFETY: value points into record which lives as long as this struct
                     let value: ValueRef<'static> = unsafe { std::mem::transmute(value) };
                     key_values.push(value);
                 }
-                Err(err) => {
+                Some(Err(err)) => {
+                    mark_unlikely();
                     deserialization_error = Some(err);
+                    break;
+                }
+                None => {
+                    mark_unlikely();
+                    deserialization_error = Some(LimboError::Corrupt(
+                        "Not enough columns in record".to_string(),
+                    ));
                     break;
                 }
             }
@@ -907,6 +933,7 @@ enum SortedChunkIOState {
     ReadComplete,
     WaitingForWrite,
     WriteComplete,
+    WriteError,
     ReadEOF,
     None,
 }
@@ -951,6 +978,7 @@ mod tests {
                 256,
                 64,
                 io.clone(),
+                crate::TempStore::Default,
             );
 
             let num_records = 1000 + rng.next_u64() % 2000;
@@ -979,7 +1007,7 @@ mod tests {
             for i in 0..num_records {
                 assert!(sorter.has_more());
                 let record = sorter.record().unwrap();
-                assert_eq!(record.get_values()[0], ValueRef::Integer(i));
+                assert_eq!(record.get_values().unwrap()[0], ValueRef::Integer(i));
                 // Check that the record remained unchanged after sorting.
                 assert_eq!(record, &initial_records[(num_records - i - 1) as usize]);
 

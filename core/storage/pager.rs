@@ -1,4 +1,7 @@
 use crate::assert::assert_send_sync;
+#[cfg(target_vendor = "apple")]
+use crate::io::AtomicFileSyncType;
+use crate::io::FileSyncType;
 use crate::io::WriteBatch;
 use crate::storage::btree::PinGuard;
 use crate::storage::subjournal::Subjournal;
@@ -11,8 +14,13 @@ use crate::storage::{
         CELL_PTR_SIZE_BYTES, INTERIOR_PAGE_HEADER_SIZE_BYTES, LEAF_PAGE_HEADER_SIZE_BYTES,
         MINIMUM_CELL_SIZE,
     },
-    wal::{CheckpointResult, Wal, IOV_MAX},
+    wal::{CheckpointResult, RollbackTo, Wal, IOV_MAX},
 };
+use crate::sync::atomic::{
+    AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering,
+};
+use crate::sync::Arc;
+use crate::sync::{Mutex, RwLock};
 use crate::types::{IOCompletions, WalState};
 use crate::util::IOExt as _;
 use crate::{
@@ -21,13 +29,8 @@ use crate::{
 };
 use crate::{io_yield_one, Buffer, CompletionError, IOContext, OpenFlags, SyncMode, IO};
 use arc_swap::ArcSwapOption;
-use parking_lot::{Mutex, RwLock};
 use roaring::RoaringBitmap;
 use std::cell::UnsafeCell;
-use std::sync::atomic::{
-    AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering,
-};
-use std::sync::Arc;
 use tracing::{instrument, trace, Level};
 
 use super::btree::offset::{
@@ -63,33 +66,8 @@ pub struct HeaderRef(PageRef);
 
 impl HeaderRef {
     pub fn from_pager(pager: &Pager) -> Result<IOResult<Self>> {
-        loop {
-            let state = pager.header_ref_state.read().clone();
-            tracing::trace!("HeaderRef::from_pager - {:?}", state);
-            match state {
-                HeaderRefState::Start => {
-                    // If db is not initialized, return the in-memory page
-                    if let Some(page1) = pager.init_page_1.load_full() {
-                        return Ok(IOResult::Done(Self(page1)));
-                    }
-
-                    let (page, c) = pager.read_page(DatabaseHeader::PAGE_ID as i64)?;
-                    *pager.header_ref_state.write() = HeaderRefState::CreateHeader { page };
-                    if let Some(c) = c {
-                        io_yield_one!(c);
-                    }
-                }
-                HeaderRefState::CreateHeader { page } => {
-                    turso_assert!(page.is_loaded(), "page should be loaded");
-                    turso_assert!(
-                        page.get().id == DatabaseHeader::PAGE_ID,
-                        "incorrect header page id"
-                    );
-                    *pager.header_ref_state.write() = HeaderRefState::Start;
-                    break Ok(IOResult::Done(Self(page)));
-                }
-            }
-        }
+        let page = return_if_io!(pager.read_header_page());
+        Ok(IOResult::Done(Self(page)))
     }
 
     pub fn borrow(&self) -> &DatabaseHeader {
@@ -104,35 +82,9 @@ pub struct HeaderRefMut(PageRef);
 
 impl HeaderRefMut {
     pub fn from_pager(pager: &Pager) -> Result<IOResult<Self>> {
-        loop {
-            let state = pager.header_ref_state.read().clone();
-            tracing::trace!(?state);
-            match state {
-                HeaderRefState::Start => {
-                    // If db is not initialized, return the in-memory page
-                    if let Some(page1) = pager.init_page_1.load_full() {
-                        return Ok(IOResult::Done(Self(page1)));
-                    }
-
-                    let (page, c) = pager.read_page(DatabaseHeader::PAGE_ID as i64)?;
-                    *pager.header_ref_state.write() = HeaderRefState::CreateHeader { page };
-                    if let Some(c) = c {
-                        io_yield_one!(c);
-                    }
-                }
-                HeaderRefState::CreateHeader { page } => {
-                    turso_assert!(page.is_loaded(), "page should be loaded");
-                    turso_assert!(
-                        page.get().id == DatabaseHeader::PAGE_ID,
-                        "incorrect header page id"
-                    );
-
-                    pager.add_dirty(&page)?;
-                    *pager.header_ref_state.write() = HeaderRefState::Start;
-                    break Ok(IOResult::Done(Self(page)));
-                }
-            }
-        }
+        let page = return_if_io!(pager.read_header_page());
+        pager.add_dirty(&page)?;
+        Ok(IOResult::Done(Self(page)))
     }
 
     pub fn borrow_mut(&self) -> &mut DatabaseHeader {
@@ -262,13 +214,8 @@ impl PageInner {
     }
 
     #[inline]
-    pub fn page_type(&self) -> PageType {
-        self.read_u8(BTREE_PAGE_TYPE).try_into().unwrap()
-    }
-
-    #[inline]
-    pub fn maybe_page_type(&self) -> Option<PageType> {
-        self.read_u8(0).try_into().ok()
+    pub fn page_type(&self) -> crate::Result<PageType> {
+        self.read_u8(BTREE_PAGE_TYPE).try_into()
     }
 
     /// Read a u16 from the page content at the given absolute offset (no db header offset).
@@ -394,24 +341,24 @@ impl PageInner {
     }
 
     #[inline]
-    pub fn rightmost_pointer(&self) -> Option<u32> {
-        match self.page_type() {
+    pub fn rightmost_pointer(&self) -> crate::Result<Option<u32>> {
+        match self.page_type()? {
             PageType::IndexInterior | PageType::TableInterior => {
-                Some(self.read_u32(BTREE_RIGHTMOST_PTR))
+                Ok(Some(self.read_u32(BTREE_RIGHTMOST_PTR)))
             }
-            PageType::IndexLeaf | PageType::TableLeaf => None,
+            PageType::IndexLeaf | PageType::TableLeaf => Ok(None),
         }
     }
 
     #[inline]
-    pub fn rightmost_pointer_raw(&self) -> Option<*mut u8> {
-        match self.page_type() {
-            PageType::IndexInterior | PageType::TableInterior => Some(unsafe {
+    pub fn rightmost_pointer_raw(&self) -> crate::Result<Option<*mut u8>> {
+        match self.page_type()? {
+            PageType::IndexInterior | PageType::TableInterior => Ok(Some(unsafe {
                 self.as_ptr()
                     .as_mut_ptr()
                     .add(self.offset() + BTREE_RIGHTMOST_PTR)
-            }),
-            PageType::IndexLeaf | PageType::TableLeaf => None,
+            })),
+            PageType::IndexLeaf | PageType::TableLeaf => Ok(None),
         }
     }
 
@@ -435,7 +382,7 @@ impl PageInner {
 
     #[inline(always)]
     pub fn cell_table_interior_read_rowid(&self, idx: usize) -> crate::Result<i64> {
-        debug_assert!(self.page_type() == PageType::TableInterior);
+        debug_assert!(matches!(self.page_type(), Ok(PageType::TableInterior)));
         let buf = self.as_ptr();
         let cell_pointer_array_start = self.header_size();
         let cell_pointer = cell_pointer_array_start + (idx * CELL_PTR_SIZE_BYTES);
@@ -446,26 +393,34 @@ impl PageInner {
     }
 
     #[inline(always)]
-    pub fn cell_interior_read_left_child_page(&self, idx: usize) -> u32 {
-        debug_assert!(
-            self.page_type() == PageType::TableInterior
-                || self.page_type() == PageType::IndexInterior
-        );
+    pub fn cell_interior_read_left_child_page(&self, idx: usize) -> crate::Result<u32> {
+        debug_assert!(matches!(
+            self.page_type(),
+            Ok(PageType::TableInterior) | Ok(PageType::IndexInterior)
+        ));
         let buf = self.as_ptr();
         let cell_pointer_array_start = self.header_size();
         let cell_pointer = cell_pointer_array_start + (idx * CELL_PTR_SIZE_BYTES);
         let cell_pointer = self.read_u16(cell_pointer) as usize;
-        u32::from_be_bytes([
+        // Validate cell pointer is within page bounds (need 4 bytes for u32)
+        if cell_pointer + 4 > buf.len() {
+            return Err(crate::LimboError::Corrupt(format!(
+                "cell pointer {} out of bounds for page size {}",
+                cell_pointer,
+                buf.len()
+            )));
+        }
+        Ok(u32::from_be_bytes([
             buf[cell_pointer],
             buf[cell_pointer + 1],
             buf[cell_pointer + 2],
             buf[cell_pointer + 3],
-        ])
+        ]))
     }
 
     #[inline(always)]
     pub fn cell_table_leaf_read_rowid(&self, idx: usize) -> crate::Result<i64> {
-        debug_assert!(self.page_type() == PageType::TableLeaf);
+        debug_assert!(matches!(self.page_type(), Ok(PageType::TableLeaf)));
         let buf = self.as_ptr();
         let cell_pointer_array_start = self.header_size();
         let cell_pointer = cell_pointer_array_start + (idx * CELL_PTR_SIZE_BYTES);
@@ -475,6 +430,75 @@ impl PageInner {
         pos += nr;
         let (rowid, _) = read_varint(&buf[pos..])?;
         Ok(rowid as i64)
+    }
+
+    /// Fast path for index cells: returns payload slice and overflow info without constructing BTreeCell.
+    ///
+    /// This bypasses the full `cell_get()` to `read_btree_cell()` path for binary search hot loops.
+    /// The returned slice is valid as long as the page is alive.
+    ///
+    /// Returns: (payload_slice, payload_size, first_overflow_page)
+    #[inline(always)]
+    pub fn cell_index_read_payload_ptr(
+        &self,
+        idx: usize,
+        usable_size: usize,
+    ) -> crate::Result<(&'static [u8], u64, Option<u32>)> {
+        let buf = self.as_ptr();
+        let cell_pointer_array_start = self.header_size();
+        let cell_pointer = cell_pointer_array_start + (idx * CELL_PTR_SIZE_BYTES);
+        let cell_offset = self.read_u16(cell_pointer) as usize;
+
+        let page_type = self.page_type()?;
+        let (payload_size, varint_len, header_skip) = match page_type {
+            PageType::IndexInterior => {
+                let (size, len) = read_varint(&buf[cell_offset + 4..])?;
+                (size, len, 4usize)
+            }
+            PageType::IndexLeaf => {
+                let (size, len) = read_varint(&buf[cell_offset..])?;
+                (size, len, 0usize)
+            }
+            _ => unreachable!("cell_index_read_payload_ptr called on non-index page"),
+        };
+
+        let payload_start = cell_offset + header_skip + varint_len;
+
+        let max_local = payload_overflow_threshold_max(page_type, usable_size);
+        let min_local = payload_overflow_threshold_min(page_type, usable_size);
+        let (overflows, local_size) = sqlite3_ondisk::payload_overflows(
+            payload_size as usize,
+            max_local,
+            min_local,
+            usable_size,
+        );
+
+        let (payload_slice, first_overflow) = if overflows {
+            let overflow_ptr_offset = payload_start + local_size - 4;
+            let first_overflow_page = u32::from_be_bytes([
+                buf[overflow_ptr_offset],
+                buf[overflow_ptr_offset + 1],
+                buf[overflow_ptr_offset + 2],
+                buf[overflow_ptr_offset + 3],
+            ]);
+            // SAFETY: valid as long as page is alive
+            let slice = unsafe {
+                std::mem::transmute::<&[u8], &'static [u8]>(
+                    &buf[payload_start..payload_start + local_size - 4],
+                )
+            };
+            (slice, Some(first_overflow_page))
+        } else {
+            // SAFETY: valid as long as page is alive
+            let slice = unsafe {
+                std::mem::transmute::<&[u8], &'static [u8]>(
+                    &buf[payload_start..payload_start + payload_size as usize],
+                )
+            };
+            (slice, None)
+        };
+
+        Ok((payload_slice, payload_size, first_overflow))
     }
 
     #[inline]
@@ -498,19 +522,23 @@ impl PageInner {
     }
 
     #[inline]
-    pub fn cell_get_raw_region(&self, idx: usize, usable_size: usize) -> (usize, usize) {
-        let page_type = self.page_type();
+    pub fn cell_get_raw_region(
+        &self,
+        idx: usize,
+        usable_size: usize,
+    ) -> crate::Result<(usize, usize)> {
+        let page_type = self.page_type()?;
         let max_local = payload_overflow_threshold_max(page_type, usable_size);
         let min_local = payload_overflow_threshold_min(page_type, usable_size);
         let cell_count = self.cell_count();
-        self._cell_get_raw_region_faster(
+        Ok(self._cell_get_raw_region_faster(
             idx,
             usable_size,
             cell_count,
             max_local,
             min_local,
             page_type,
-        )
+        ))
     }
 
     #[inline]
@@ -722,6 +750,7 @@ impl Page {
     }
 
     #[inline]
+    /// almost never should be called explicitly - instead [Pager::add_dirty] method must be used
     pub fn set_dirty(&self) {
         tracing::debug!("set_dirty(page={})", self.get().id);
         self.clear_wal_tag();
@@ -731,6 +760,7 @@ impl Page {
     }
 
     #[inline]
+    /// caller must ensure that [Pager::dirty_pages] will be updated accordingly
     pub fn clear_dirty(&self) {
         tracing::debug!("clear_dirty(page={})", self.get().id);
         self.get().flags.fetch_and(!PAGE_DIRTY, Ordering::Release);
@@ -781,11 +811,11 @@ impl Page {
     }
 
     #[inline]
-    pub fn is_index(&self) -> bool {
-        match self.get_contents().page_type() {
+    pub fn is_index(&self) -> crate::Result<bool> {
+        Ok(match self.get_contents().page_type()? {
             PageType::IndexLeaf | PageType::IndexInterior => true,
             PageType::TableLeaf | PageType::TableInterior => false,
-        }
+        })
     }
 
     /// Increment the pin count by 1. A pin count >0 means the page is pinned and not eligible for eviction from the page cache.
@@ -944,6 +974,8 @@ struct CheckpointState {
     phase: CheckpointPhase,
     /// The checkpoint result, set after WAL checkpoint completes
     result: Option<CheckpointResult>,
+    /// The checkpoint mode, used to determine if WAL truncation is needed
+    mode: Option<CheckpointMode>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -959,9 +991,15 @@ enum CheckpointPhase {
     TruncateDbFile {
         sync_mode: crate::SyncMode,
         clear_page_cache: bool,
+        /// Whether we've invalidated page 1 from cache (needed because checkpoint may write
+        /// pages directly from WALto DB file, so cached page 1 of the checkpointer connection may have stale database_size)
+        page1_invalidated: bool,
     },
     /// Sync the database file after checkpoint (if sync_mode != Off and we backfilled any frames from the WAL).
     SyncDbFile { clear_page_cache: bool },
+    /// Truncate the WAL file after DB file is safely synced (only for TRUNCATE checkpoint mode).
+    /// This must happen AFTER SyncDbFile to ensure data durability.
+    TruncateWalFile { clear_page_cache: bool },
     /// Finalize: release guard and optionally clear page cache.
     Finalize { clear_page_cache: bool },
 }
@@ -1070,7 +1108,10 @@ enum PtrMapPutState {
 #[derive(Debug, Clone)]
 enum HeaderRefState {
     Start,
-    CreateHeader { page: PageRef },
+    CreateHeader {
+        page: PageRef,
+        completion: Option<Completion>,
+    },
 }
 
 #[cfg(not(feature = "omit_autovacuum"))]
@@ -1092,15 +1133,27 @@ pub struct Savepoint {
     /// If the database grows during the savepoint and a rollback to the savepoint is performed,
     /// the pages exceeding the database size at the start of the savepoint will be ignored.
     db_size: AtomicU32,
+    /// We might want to rollback.
+    /// WAL max frame at the start of the savepoint.
+    wal_max_frame: AtomicU64,
+    /// WAL checksum at the start of the savepoint.
+    wal_checksum: RwLock<(u32, u32)>,
 }
 
 impl Savepoint {
-    pub fn new(subjournal_offset: u64, db_size: u32) -> Self {
+    pub fn new(
+        subjournal_offset: u64,
+        db_size: u32,
+        wal_max_frame: u64,
+        wal_checksum: (u32, u32),
+    ) -> Self {
         Self {
             start_offset: AtomicU64::new(subjournal_offset),
             write_offset: AtomicU64::new(subjournal_offset),
             page_bitmap: RwLock::new(RoaringBitmap::new()),
             db_size: AtomicU32::new(db_size),
+            wal_max_frame: AtomicU64::new(wal_max_frame),
+            wal_checksum: RwLock::new(wal_checksum),
         }
     }
 
@@ -1167,6 +1220,10 @@ pub struct Pager {
     enable_encryption: AtomicBool,
     /// In Memory Page 1 for Empty Dbs
     init_page_1: Arc<ArcSwapOption<Page>>,
+    /// Sync type for durability. FullFsync uses F_FULLFSYNC on macOS (PRAGMA fullfsync).
+    /// Only stored on Apple platforms; on others, always returns Fsync.
+    #[cfg(target_vendor = "apple")]
+    sync_type: AtomicFileSyncType,
 }
 
 assert_send_sync!(Pager);
@@ -1178,17 +1235,6 @@ pub struct VacuumState {
     /// State machine for [Pager::ptrmap_put]
     ptrmap_put_state: PtrMapPutState,
     btree_create_vacuum_full_state: BtreeCreateVacuumFullState,
-}
-
-#[derive(Debug, Clone)]
-/// The status of the current cache flush.
-pub enum PagerCommitResult {
-    /// The WAL was written to disk and fsynced.
-    WalWritten,
-    /// The WAL was written, fsynced, and a checkpoint was performed.
-    /// The database file was then also fsynced.
-    Checkpointed(CheckpointResult),
-    Rollback,
 }
 
 #[derive(Debug, Clone)]
@@ -1251,7 +1297,6 @@ enum SpillState {
         completions: Vec<Completion>,
     },
 }
-
 enum CacheFlushStep {
     /// Yield to caller with pending I/O, resume with given phase
     Yield(CacheFlushState, IOCompletions),
@@ -1295,7 +1340,7 @@ impl Pager {
         db_file: Arc<dyn DatabaseStorage>,
         wal: Option<Arc<dyn Wal>>,
         io: Arc<dyn crate::io::IO>,
-        page_cache: Arc<RwLock<PageCache>>,
+        page_cache: PageCache,
         buffer_pool: Arc<BufferPool>,
         init_lock: Arc<Mutex<()>>,
         init_page_1: Arc<ArcSwapOption<Page>>,
@@ -1308,7 +1353,7 @@ impl Pager {
         Ok(Self {
             db_file,
             wal,
-            page_cache,
+            page_cache: Arc::new(RwLock::new(page_cache)),
             io,
             dirty_pages: Arc::new(RwLock::new(RoaringBitmap::new())),
             subjournal: RwLock::new(None),
@@ -1345,11 +1390,83 @@ impl Pager {
             io_ctx: RwLock::new(IOContext::default()),
             enable_encryption: AtomicBool::new(false),
             init_page_1,
+            #[cfg(target_vendor = "apple")]
+            sync_type: AtomicFileSyncType::new(FileSyncType::Fsync),
         })
+    }
+
+    /// Get the sync type setting.
+    /// On non-Apple platforms, always returns Fsync (compile-time constant).
+    #[cfg(target_vendor = "apple")]
+    #[inline]
+    pub fn get_sync_type(&self) -> FileSyncType {
+        self.sync_type.get()
+    }
+
+    /// Get the sync type setting.
+    /// On non-Apple platforms, always returns Fsync (compile-time constant).
+    #[cfg(not(target_vendor = "apple"))]
+    #[inline]
+    pub fn get_sync_type(&self) -> FileSyncType {
+        FileSyncType::Fsync
+    }
+
+    /// Set the sync type (for PRAGMA fullfsync). Only effective on Apple platforms.
+    #[cfg(target_vendor = "apple")]
+    pub fn set_sync_type(&self, value: FileSyncType) {
+        self.sync_type.set(value);
+    }
+
+    /// Set the sync type. No-op on non-Apple platforms.
+    #[cfg(not(target_vendor = "apple"))]
+    pub fn set_sync_type(&self, _value: FileSyncType) {
+        // No-op: FullFsync only has effect on Apple platforms
     }
 
     pub fn init_page_1(&self) -> Arc<ArcSwapOption<Page>> {
         self.init_page_1.clone()
+    }
+
+    /// Read page 1 (the database header page) using the header_ref_state state machine.
+    /// Used by HeaderRef and HeaderRefMut to avoid duplicating the page-loading logic.
+    fn read_header_page(&self) -> Result<IOResult<PageRef>> {
+        loop {
+            let state = self.header_ref_state.read().clone();
+            tracing::trace!("read_header_page - {:?}", state);
+            match state {
+                HeaderRefState::Start => {
+                    // If db is not initialized, return the in-memory page
+                    if let Some(page1) = self.init_page_1.load_full() {
+                        return Ok(IOResult::Done(page1));
+                    }
+
+                    let (page, c) = self.read_page(DatabaseHeader::PAGE_ID as i64)?;
+                    *self.header_ref_state.write() = HeaderRefState::CreateHeader {
+                        page,
+                        completion: c.clone(),
+                    };
+                    if let Some(c) = c {
+                        io_yield_one!(c);
+                    }
+                }
+                HeaderRefState::CreateHeader { page, completion } => {
+                    // Check if the read failed (e.g., due to checksum/decryption error)
+                    if let Some(ref c) = completion {
+                        if let Some(err) = c.get_error() {
+                            *self.header_ref_state.write() = HeaderRefState::Start;
+                            return Err(err.into());
+                        }
+                    }
+                    turso_assert!(page.is_loaded(), "page should be loaded");
+                    turso_assert!(
+                        page.get().id == DatabaseHeader::PAGE_ID,
+                        "incorrect header page id"
+                    );
+                    *self.header_ref_state.write() = HeaderRefState::Start;
+                    return Ok(IOResult::Done(page));
+                }
+            }
+        }
     }
 
     /// Set whether cache spilling is enabled.
@@ -1486,7 +1603,12 @@ impl Pager {
         // the subjournal offset should always be 0 as we should only have max 1 savepoint
         // opened at any given time.
         turso_assert!(subjournal_offset == 0, "subjournal offset should be 0");
-        let savepoint = Savepoint::new(subjournal_offset, db_size);
+        let (wal_max_frame, wal_checksum) = if let Some(wal) = &self.wal {
+            (wal.get_max_frame(), wal.get_last_checksum())
+        } else {
+            (0, (0, 0))
+        };
+        let savepoint = Savepoint::new(subjournal_offset, db_size, wal_max_frame, wal_checksum);
         let mut savepoints = self.savepoints.write();
         turso_assert!(
             savepoints.is_empty(),
@@ -1600,18 +1722,22 @@ impl Pager {
             self.upsert_page_in_cache(page_id as usize, page, false)?;
         }
 
-        let truncate_completion = self
-            .subjournal
-            .read()
-            .as_ref()
-            .unwrap()
-            .truncate(journal_start_offset)?;
+        let truncate_completion = subjournal.truncate(journal_start_offset)?;
         assert!(
             truncate_completion.succeeded(),
             "memory IO should complete immediately"
         );
 
         self.page_cache.write().truncate(db_size as usize)?;
+
+        if let Some(wal) = &self.wal {
+            let wal_max_frame = savepoint.wal_max_frame.load(Ordering::SeqCst);
+            let wal_checksum = *savepoint.wal_checksum.read();
+            wal.rollback(Some(RollbackTo {
+                frame: wal_max_frame,
+                checksum: wal_checksum,
+            }));
+        }
 
         Ok(true)
     }
@@ -1999,7 +2125,7 @@ impl Pager {
         tracing::debug!(
             "do_allocate_page(id={}, page_type={:?})",
             page.get().id,
-            page.get_contents().page_type()
+            page.get_contents().page_type().ok()
         );
         Ok(IOResult::Done(page))
     }
@@ -2099,14 +2225,8 @@ impl Pager {
 
     /// Set the schema cookie cache.
     pub fn set_schema_cookie(&self, cookie: Option<u32>) {
-        match cookie {
-            Some(value) => {
-                self.schema_cookie.store(value as u64, Ordering::SeqCst);
-            }
-            None => self
-                .schema_cookie
-                .store(Self::SCHEMA_COOKIE_NOT_SET, Ordering::SeqCst),
-        }
+        let value = cookie.map_or(Self::SCHEMA_COOKIE_NOT_SET, |v| v as u64);
+        self.schema_cookie.store(value, Ordering::SeqCst);
     }
 
     /// Get the schema cookie, using the cached value if available to avoid reading page 1.
@@ -2139,15 +2259,10 @@ impl Pager {
     pub fn maybe_allocate_page1(&self) -> Result<IOResult<()>> {
         if !self.db_initialized() {
             if let Some(_lock) = self.init_lock.try_lock() {
-                if let IOResult::IO(c) = self.allocate_page1()? {
-                    return Ok(IOResult::IO(c));
-                } else {
-                    return Ok(IOResult::Done(()));
-                }
-            } else {
-                // Give a chance for the allocation to happen elsewhere
-                io_yield_one!(Completion::new_yield());
+                return Ok(self.allocate_page1()?.map(|_| ()));
             }
+            // Give a chance for the allocation to happen elsewhere
+            io_yield_one!(Completion::new_yield());
         }
         Ok(IOResult::Done(()))
     }
@@ -2164,34 +2279,87 @@ impl Pager {
         Ok(IOResult::Done(wal.begin_write_tx()?))
     }
 
+    /// commit dirty pages from current transaction in WAL mode if this is not nested statement (for nested statements, parent will do the commit)
+    /// if update_transaction_state set to false, then [Connection::transaction_state] left unchanged
+    /// if update_transaction_state set to true, then [Connection::transaction_state] reset to [TransactionState::None] in case when method completes without error
     #[instrument(skip_all, level = Level::DEBUG)]
-    pub fn commit_tx(&self, connection: &Connection) -> Result<IOResult<PagerCommitResult>> {
+    pub fn commit_tx(
+        &self,
+        connection: &Connection,
+        update_transaction_state: bool,
+    ) -> Result<IOResult<()>> {
         if connection.is_nested_stmt() {
             // Parent statement will handle the transaction commit.
-            return Ok(IOResult::Done(PagerCommitResult::Rollback));
+            return Ok(IOResult::Done(()));
         }
         let Some(wal) = self.wal.as_ref() else {
             // TODO: Unsure what the semantics of "end_tx" is for in-memory databases, ephemeral tables and ephemeral indexes.
-            return Ok(IOResult::Done(PagerCommitResult::Rollback));
+            return Ok(IOResult::Done(()));
         };
-        let (_, schema_did_change) = match connection.get_tx_state() {
-            TransactionState::Write { schema_did_change } => (true, schema_did_change),
-            _ => (false, false),
-        };
-        tracing::trace!("commit_tx(schema_did_change={})", schema_did_change);
-        let commit_status = return_if_io!(self.commit_dirty_pages(
-            connection.is_wal_auto_checkpoint_disabled(),
-            connection.get_sync_mode(),
-            connection.get_data_sync_retry()
-        ));
-        wal.end_write_tx();
-        wal.end_read_tx();
 
-        if schema_did_change {
-            let schema = connection.schema.read().clone();
-            connection.db.update_schema_if_newer(schema);
+        let complete_commit = || {
+            if update_transaction_state {
+                connection.set_tx_state(TransactionState::None);
+            }
+            self.commit_dirty_pages_end();
+        };
+
+        loop {
+            let commit_state = self.commit_info.read().state;
+            tracing::debug!("commit_state: {:?}", commit_state);
+            // we separate auto-checkpoint from the commit in order for checkpoint to be able to backfill WAL till the end
+            // (including new frames from current transaction)
+            // otherwise, we will be unable to do WAL restart
+            match commit_state {
+                CommitState::AutoCheckpoint => {
+                    let checkpoint_result = self.checkpoint(
+                        CheckpointMode::Passive {
+                            upper_bound_inclusive: None,
+                        },
+                        connection.get_sync_mode(),
+                        false,
+                    );
+                    match checkpoint_result {
+                        Ok(IOResult::IO(io)) => return Ok(IOResult::IO(io)),
+                        Ok(IOResult::Done(_)) => complete_commit(),
+                        Err(err) => {
+                            tracing::info!("auto-checkpoint failed: {err}");
+                            complete_commit();
+                            self.cleanup_after_auto_checkpoint_failure();
+                        }
+                    }
+                    return Ok(IOResult::Done(()));
+                }
+                _ => {
+                    return_if_io!(self.commit_dirty_pages(
+                        connection.is_wal_auto_checkpoint_disabled(),
+                        connection.get_sync_mode(),
+                        connection.get_data_sync_retry(),
+                    ));
+
+                    let schema_did_change = match connection.get_tx_state() {
+                        TransactionState::Write { schema_did_change } => schema_did_change,
+                        _ => false,
+                    };
+
+                    wal.end_write_tx();
+                    wal.end_read_tx();
+                    // we do not set TransactionState::None here - because caller can decide that nothing should be done for this connection
+                    // and skip next calls of the commit_tx methods after IO
+
+                    tracing::debug!("commit_tx: schema_did_change={schema_did_change}");
+                    if schema_did_change {
+                        let schema = connection.schema.read().clone();
+                        connection.db.update_schema_if_newer(schema);
+                    }
+
+                    if self.commit_info.read().state != CommitState::AutoCheckpoint {
+                        complete_commit();
+                        return Ok(IOResult::Done(()));
+                    }
+                }
+            }
         }
-        Ok(IOResult::Done(commit_status))
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
@@ -2414,6 +2582,12 @@ impl Pager {
         self.subjournal_page_if_required(page)?;
         let mut dirty_pages = self.dirty_pages.write();
         dirty_pages.insert(page.get().id as u32);
+        // Notify cache before marking dirty (page was evictable, now it won't be)
+        // Only notify if page wasn't already dirty
+        if !page.is_dirty() {
+            let key = PageCacheKey::new(page.get().id);
+            self.page_cache.write().notify_page_dirty(key);
+        }
         page.set_dirty();
         Ok(())
     }
@@ -2506,7 +2680,7 @@ impl Pager {
             )),
             None => {
                 // No async prep needed, go straight to finish
-                let completion = wal.prepare_wal_finish()?;
+                let completion = wal.prepare_wal_finish(self.get_sync_type())?;
                 Ok(CacheFlushStep::Yield(
                     CacheFlushState::WalPrepareFinish {
                         dirty_ids,
@@ -2536,7 +2710,7 @@ impl Pager {
             ));
         }
 
-        let finish_completion = wal.prepare_wal_finish()?;
+        let finish_completion = wal.prepare_wal_finish(self.get_sync_type())?;
         Ok(CacheFlushStep::Yield(
             CacheFlushState::WalPrepareFinish {
                 dirty_ids,
@@ -2590,7 +2764,7 @@ impl Pager {
                     trace!(
                         "cacheflush(page={}, page_type={:?})",
                         page_id,
-                        page.get_contents().maybe_page_type()
+                        page.get_contents().page_type().ok()
                     );
                     state.collected_pages.push(page);
                     state.current_idx += 1;
@@ -2617,7 +2791,7 @@ impl Pager {
                     trace!(
                         "cacheflush(page={}, page_type={:?}) [re-read sync]",
                         page_id,
-                        page.get_contents().maybe_page_type()
+                        page.get_contents().page_type().ok()
                     );
                     state.collected_pages.push(page);
                     state.current_idx += 1;
@@ -2655,7 +2829,7 @@ impl Pager {
         trace!(
             "cacheflush(page={}, page_type={:?}) [re-read complete]",
             page_id,
-            page.get_contents().maybe_page_type()
+            page.get_contents().page_type().ok()
         );
         state.collected_pages.push(page);
         state.current_idx += 1;
@@ -2729,17 +2903,14 @@ impl Pager {
                         }
                         let page_count = pages.len();
                         tracing::debug!("try_spill_dirty_pages: spilling {} pages", page_count);
-                        if self.wal.is_some() {
-                            let Some(wal) = self.wal.as_ref() else {
-                                unreachable!("wal checked above");
-                            };
+                        if let Some(wal) = self.wal.as_ref() {
                             let page_sz = self.get_page_size().unwrap_or_default();
 
                             // Ensure WAL is initialized. Most of the time this is a no-op.
                             let prepare = wal.prepare_wal_start(page_sz)?;
                             if let Some(c) = prepare {
                                 self.io.wait_for_completion(c)?;
-                                let c = wal.prepare_wal_finish()?;
+                                let c = wal.prepare_wal_finish(self.get_sync_type())?;
                                 self.io.wait_for_completion(c)?;
                             }
 
@@ -2756,9 +2927,14 @@ impl Pager {
 
                             if c.succeeded() {
                                 // Synchronous completion, WAL tags already set by callback.
-                                for page in &pages {
-                                    if page.has_wal_tag() {
-                                        page.set_spilled();
+                                {
+                                    let mut cache = self.page_cache.write();
+                                    for page in &pages {
+                                        if page.has_wal_tag() {
+                                            let key = PageCacheKey::new(page.get().id);
+                                            cache.notify_page_spilled(key);
+                                            page.set_spilled();
+                                        }
                                     }
                                 }
                                 *self.spill_state.write() = SpillState::Idle;
@@ -2802,16 +2978,21 @@ impl Pager {
                 // Mark spilled pages so they can be evicted while dirty.
                 // Only do so if page wasn't modified since write started (each page has valid wal_tag).
                 let mut spilled_count = 0;
-                for page in &pages {
-                    if page.has_wal_tag() {
-                        page.set_spilled();
-                        spilled_count += 1;
-                    } else {
-                        // Page was modified during write, it will need to be re-spilled
-                        tracing::debug!(
-                            "try_spill_dirty_pages: page {} modified during write, not marking as spilled",
-                            page.get().id
-                        );
+                {
+                    let mut cache = self.page_cache.write();
+                    for page in &pages {
+                        if page.has_wal_tag() {
+                            let key = PageCacheKey::new(page.get().id);
+                            cache.notify_page_spilled(key);
+                            page.set_spilled();
+                            spilled_count += 1;
+                        } else {
+                            // Page was modified during write, it will need to be re-spilled
+                            tracing::debug!(
+                                "try_spill_dirty_pages: page {} modified during write, not marking as spilled",
+                                page.get().id
+                            );
+                        }
                     }
                 }
                 if spilled_count == 0 && !pages.is_empty() {
@@ -2934,7 +3115,7 @@ impl Pager {
         wal_auto_checkpoint_disabled: bool,
         sync_mode: SyncMode,
         data_sync_retry: bool,
-    ) -> Result<IOResult<PagerCommitResult>> {
+    ) -> Result<IOResult<()>> {
         {
             let mut commit_info = self.commit_info.write();
             if commit_info.state == CommitState::PrepareWal {
@@ -2947,17 +3128,16 @@ impl Pager {
             return Ok(IOResult::IO(c));
         }
 
-        match self.commit_dirty_pages_inner(
-            wal_auto_checkpoint_disabled,
-            sync_mode,
-            data_sync_retry,
-        ) {
-            r @ (Ok(IOResult::Done(..)) | Err(..)) => {
-                self.commit_info.write().reset();
-                r
-            }
-            Ok(IOResult::IO(io)) => Ok(IOResult::IO(io)),
+        let result =
+            self.commit_dirty_pages_inner(wal_auto_checkpoint_disabled, sync_mode, data_sync_retry);
+        if result.is_err() {
+            self.commit_info.write().reset();
         }
+        result
+    }
+
+    pub fn commit_dirty_pages_end(&self) {
+        self.commit_info.write().reset();
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
@@ -2966,7 +3146,7 @@ impl Pager {
         wal_auto_checkpoint_disabled: bool,
         sync_mode: SyncMode,
         data_sync_retry: bool,
-    ) -> Result<IOResult<PagerCommitResult>> {
+    ) -> Result<IOResult<()>> {
         let Some(wal) = self.wal.as_ref() else {
             return Err(LimboError::InternalError(
                 "commit_dirty_pages() called without WAL".into(),
@@ -2991,7 +3171,7 @@ impl Pager {
                     }
                 }
                 CommitState::PrepareWalSync => {
-                    let c = wal.prepare_wal_finish()?;
+                    let c = wal.prepare_wal_finish(self.get_sync_type())?;
                     self.commit_info.write().state = CommitState::GetDbSize;
                     if !c.succeeded() {
                         io_yield_one!(c);
@@ -3008,7 +3188,7 @@ impl Pager {
                     let dirty_pages = self.dirty_pages.read();
 
                     if dirty_pages.is_empty() {
-                        return Ok(IOResult::Done(PagerCommitResult::WalWritten));
+                        return Ok(IOResult::Done(()));
                     }
                     commit_info.initialize(dirty_pages.len() as usize);
                     let mut cache = self.page_cache.write();
@@ -3106,7 +3286,7 @@ impl Pager {
                             self.dirty_pages.read().is_empty(),
                             "dirty pages must be empty if no frames prepared"
                         );
-                        return Ok(IOResult::Done(PagerCommitResult::WalWritten));
+                        return Ok(IOResult::Done(()));
                     }
                     // Submit all WAL writes
                     let wal_file = wal.wal_file()?;
@@ -3151,7 +3331,7 @@ impl Pager {
                     if sync_mode == SyncMode::Off {
                         commit_info.state = CommitState::WalCommitDone;
                     } else {
-                        let sync_c = wal.sync()?;
+                        let sync_c = wal.sync(self.get_sync_type())?;
                         // Reuse the existing Vec instead of allocating a new one
                         commit_info.completions.push(sync_c);
                         commit_info.state = CommitState::WaitSync;
@@ -3196,32 +3376,13 @@ impl Pager {
                     self.dirty_pages.write().clear();
                     commit_info.prepared_frames.clear();
 
-                    if wal_auto_checkpoint_disabled || !wal.should_checkpoint() {
-                        return Ok(IOResult::Done(PagerCommitResult::WalWritten));
+                    let need_checkpoint = !wal_auto_checkpoint_disabled && wal.should_checkpoint();
+                    if need_checkpoint {
+                        commit_info.state = CommitState::AutoCheckpoint;
                     }
-                    commit_info.state = CommitState::AutoCheckpoint;
+                    return Ok(IOResult::Done(()));
                 }
-                CommitState::AutoCheckpoint => {
-                    let checkpoint_mode = CheckpointMode::Passive {
-                        upper_bound_inclusive: None,
-                    };
-                    match self.checkpoint(checkpoint_mode, sync_mode, false) {
-                        Err(LimboError::Busy) => {
-                            tracing::debug!("Auto-checkpoint skipped: busy");
-                            return Ok(IOResult::Done(PagerCommitResult::WalWritten));
-                        }
-                        Err(e) => {
-                            tracing::error!("Auto-checkpoint failed: {}", e);
-                            return Err(LimboError::CheckpointFailed(e.to_string()));
-                        }
-                        Ok(IOResult::IO(IOCompletions::Single(c))) => {
-                            io_yield_one!(c);
-                        }
-                        Ok(IOResult::Done(res)) => {
-                            return Ok(IOResult::Done(PagerCommitResult::Checkpointed(res)));
-                        }
-                    }
-                }
+                CommitState::AutoCheckpoint => panic!("checkpoint must be handled externally"),
             }
         }
     }
@@ -3246,6 +3407,7 @@ impl Pager {
         // Chain from previous batch if any
         let prev = commit_info.prepared_frames.last();
         let prepared = wal.prepare_frames(&pages, page_sz, commit_flag, prev)?;
+        tracing::debug!("prepare_collected_frames: offset={}", prepared.offset);
         commit_info.prepared_frames.push(prepared);
         Ok(())
     }
@@ -3290,6 +3452,7 @@ impl Pager {
             header.page_number as u64,
             header.db_size as u64,
             raw_page,
+            self.get_sync_type(),
         )?;
         if let Some(page) = self.cache_get(header.page_number as usize)? {
             let content = page.get_contents();
@@ -3336,20 +3499,25 @@ impl Pager {
     }
 
     fn reset_checkpoint_state(&self) {
-        let mut state = self.checkpoint_state.write();
-        state.phase = CheckpointPhase::NotCheckpointing;
-        state.result = None;
+        self.clear_checkpoint_state();
         self.commit_info.write().state = CommitState::PrepareWal;
     }
 
-    /// Clean up after a checkpoint failure. The WAL commit succeeded but checkpoint failed.
-    /// This ends the write and read transactions that would normally be ended in commit_tx().
-    pub fn finish_commit_after_checkpoint_failure(&self) {
+    /// Reset checkpoint state machine to initial state.
+    /// Use this to clean up after a failed explicit checkpoint (PRAGMA wal_checkpoint).
+    pub fn clear_checkpoint_state(&self) {
+        let mut state = self.checkpoint_state.write();
+        state.phase = CheckpointPhase::NotCheckpointing;
+        state.result = None;
+        state.mode = None;
+    }
+
+    /// Clean up after a auto-checkpoint failure.
+    /// Auto-checkpoint executed outside of the main transaction - so WAL transaction was already finalized
+    pub fn cleanup_after_auto_checkpoint_failure(&self) {
         self.reset_checkpoint_state();
         if let Some(wal) = self.wal.as_ref() {
             wal.abort_checkpoint();
-            wal.end_write_tx();
-            wal.end_read_tx();
         }
     }
 
@@ -3377,11 +3545,13 @@ impl Pager {
             let phase = self.checkpoint_state.read().phase.clone();
             match phase {
                 CheckpointPhase::NotCheckpointing => {
-                    self.checkpoint_state.write().phase = CheckpointPhase::Checkpoint {
+                    let mut state = self.checkpoint_state.write();
+                    state.phase = CheckpointPhase::Checkpoint {
                         mode,
                         sync_mode,
                         clear_page_cache,
                     };
+                    state.mode = Some(mode);
                 }
                 CheckpointPhase::Checkpoint {
                     mode,
@@ -3390,17 +3560,18 @@ impl Pager {
                 } => {
                     let res = return_if_io!(wal.checkpoint(self, mode));
                     let mut state = self.checkpoint_state.write();
-                    if res.num_backfilled != 0
-                        && res.everything_backfilled()
-                        && matches!(mode, CheckpointMode::Truncate { .. })
+                    if matches!(mode, CheckpointMode::Truncate { .. })
+                        // `should_truncate` will be true for successful truncate checkpoint
+                        && res.should_truncate()
                     {
-                        // If we backfilled anything, check if we need to also truncate the database file
                         state.phase = CheckpointPhase::TruncateDbFile {
                             sync_mode,
                             clear_page_cache,
+                            page1_invalidated: false,
                         };
-                    } else if res.num_backfilled == 0 || sync_mode == crate::SyncMode::Off {
-                        // Nothing was backfilled so no need to truncate or fsync or anything else
+                    } else if res.wal_checkpoint_backfilled == 0
+                        || sync_mode == crate::SyncMode::Off
+                    {
                         state.phase = CheckpointPhase::Finalize { clear_page_cache };
                     } else {
                         state.phase = CheckpointPhase::SyncDbFile { clear_page_cache };
@@ -3410,22 +3581,41 @@ impl Pager {
                 CheckpointPhase::TruncateDbFile {
                     sync_mode,
                     clear_page_cache,
+                    page1_invalidated,
                 } => {
-                    let should_skip_truncate = {
+                    let should_skip_truncate_db_file = {
                         let state = self.checkpoint_state.read();
+                        turso_assert!(
+                            matches!(state.mode, Some(CheckpointMode::Truncate { .. })),
+                            "mode should be truncate in CheckpointPhase::TruncateDbFile"
+                        );
                         let result = state.result.as_ref().expect("result should be set");
                         // Skip if we already sent truncate
                         result.db_truncate_sent
                     };
 
-                    if should_skip_truncate {
+                    if should_skip_truncate_db_file {
                         let mut state = self.checkpoint_state.write();
                         if sync_mode == crate::SyncMode::Off {
-                            state.phase = CheckpointPhase::Finalize { clear_page_cache };
+                            // Skip DB sync, proceed to WAL truncation
+                            state.phase = CheckpointPhase::TruncateWalFile { clear_page_cache };
                         } else {
+                            // Sync DB first, then SyncDbFile will transition to TruncateWalFile
                             state.phase = CheckpointPhase::SyncDbFile { clear_page_cache };
                         }
                         continue;
+                    }
+                    // Invalidate page 1 (header) in cache before reading - checkpoint potentially wrote pages
+                    // directly to DB file from the WAL, so the checkpointer connections' page 1 may have stale database_size.
+                    if !page1_invalidated {
+                        let page1_key = PageCacheKey::new(DatabaseHeader::PAGE_ID);
+                        self.page_cache.write().delete(page1_key)?;
+                        let mut state = self.checkpoint_state.write();
+                        state.phase = CheckpointPhase::TruncateDbFile {
+                            sync_mode,
+                            clear_page_cache,
+                            page1_invalidated: true,
+                        };
                     }
 
                     // Truncate the database file unless already at correct size
@@ -3434,11 +3624,13 @@ impl Pager {
                     let page_size = self.get_page_size().unwrap_or_default();
                     let expected = (db_size * page_size.get()) as u64;
                     if expected >= self.db_file.size()? {
-                        // No truncation needed, move to next phase
+                        // No DB truncation needed, move to next phase
                         let mut state = self.checkpoint_state.write();
                         if sync_mode == crate::SyncMode::Off {
-                            state.phase = CheckpointPhase::Finalize { clear_page_cache };
+                            // Skip DB sync, proceed to WAL truncation
+                            state.phase = CheckpointPhase::TruncateWalFile { clear_page_cache };
                         } else {
+                            // Sync DB first, then SyncDbFile will transition to TruncateWalFile
                             state.phase = CheckpointPhase::SyncDbFile { clear_page_cache };
                         }
                         continue;
@@ -3472,13 +3664,26 @@ impl Pager {
                             !self.syncing.load(Ordering::SeqCst),
                             "syncing should be done"
                         );
-                        self.checkpoint_state.write().phase =
-                            CheckpointPhase::Finalize { clear_page_cache };
+                        // After DB is synced, truncate WAL if in TRUNCATE mode
+                        let is_truncate_mode = {
+                            let state = self.checkpoint_state.read();
+                            matches!(state.mode, Some(CheckpointMode::Truncate { .. }))
+                        };
+                        if is_truncate_mode {
+                            self.checkpoint_state.write().phase =
+                                CheckpointPhase::TruncateWalFile { clear_page_cache };
+                        } else {
+                            self.checkpoint_state.write().phase =
+                                CheckpointPhase::Finalize { clear_page_cache };
+                        }
                         continue;
                     }
 
-                    let c =
-                        sqlite3_ondisk::begin_sync(self.db_file.as_ref(), self.syncing.clone())?;
+                    let c = sqlite3_ondisk::begin_sync(
+                        self.db_file.as_ref(),
+                        self.syncing.clone(),
+                        self.get_sync_type(),
+                    )?;
                     self.checkpoint_state
                         .write()
                         .result
@@ -3487,21 +3692,52 @@ impl Pager {
                         .db_sync_sent = true;
                     io_yield_one!(c);
                 }
+                CheckpointPhase::TruncateWalFile { clear_page_cache } => {
+                    // Truncate WAL file after DB is safely synced - this ensures data durability.
+                    // If crash occurred after WAL truncate but before DB sync, data would be lost.
+                    let need_wal_truncate = {
+                        let state = self.checkpoint_state.read();
+                        turso_assert!(
+                            matches!(state.mode, Some(CheckpointMode::Truncate { .. })),
+                            "mode should be truncate in CheckpointPhase::TruncateWalFile"
+                        );
+                        let result = state.result.as_ref().expect("result should be set");
+                        !result.wal_truncate_sent || !result.wal_sync_sent
+                    };
+
+                    if !need_wal_truncate {
+                        self.checkpoint_state.write().phase =
+                            CheckpointPhase::Finalize { clear_page_cache };
+                        continue;
+                    }
+
+                    // Call WAL truncate
+                    return_if_io!(wal.truncate_wal(
+                        self.checkpoint_state
+                            .write()
+                            .result
+                            .as_mut()
+                            .expect("result should be set"),
+                        self.get_sync_type(),
+                    ));
+                }
                 CheckpointPhase::Finalize { clear_page_cache } => {
                     let mut state = self.checkpoint_state.write();
                     let mut res = state.result.take().expect("result should be set");
-
-                    // Release checkpoint guard
-                    res.release_guard();
+                    state.phase = CheckpointPhase::NotCheckpointing;
+                    state.mode = None;
 
                     // Clear page cache only if requested (explicit checkpoints do this, auto-checkpoint does not)
                     if clear_page_cache {
                         self.page_cache.write().clear(false).map_err(|e| {
+                            res.release_guard();
                             LimboError::InternalError(format!("Failed to clear page cache: {e:?}"))
                         })?;
                     }
 
-                    state.phase = CheckpointPhase::NotCheckpointing;
+                    // Release checkpoint guard
+                    res.release_guard();
+
                     return Ok(IOResult::Done(res));
                 }
             }
@@ -3552,7 +3788,7 @@ impl Pager {
                 ));
             };
             // fsync the wal syncronously before beginning checkpoint
-            let c = wal.sync()?;
+            let c = wal.sync(self.get_sync_type())?;
             self.io.wait_for_completion(c)?;
         }
         if !wal_auto_checkpoint_disabled {
@@ -3738,12 +3974,12 @@ impl Pager {
                 assert_eq!(default_header.database_size.get(), 0);
                 default_header.database_size = 1.into();
 
-                // based on the IOContext set, we will set the reserved space bytes as required by
-                // either the encryption or checksum, or None if they are not set.
-                let reserved_space_bytes = {
+                // Use cached reserved_space if set (e.g., by sync engine before page allocation),
+                // otherwise fall back to IOContext's encryption/checksum requirements.
+                let reserved_space_bytes = self.get_reserved_space().unwrap_or_else(|| {
                     let io_ctx = self.io_ctx.read();
                     io_ctx.get_reserved_space_bytes()
-                };
+                });
                 default_header.reserved_space = reserved_space_bytes;
                 self.set_reserved_space(reserved_space_bytes);
 
@@ -4093,8 +4329,17 @@ impl Pager {
     #[instrument(skip_all, level = Level::DEBUG)]
     pub fn rollback(&self, schema_did_change: bool, connection: &Connection, is_write: bool) {
         tracing::debug!(schema_did_change);
-        self.clear_page_cache(is_write);
         if is_write {
+            let clear_dirty = true;
+            // The page cache only needs to be cleared if we are rolling back a write transaction.
+            // If a read transaction rolls back, and the next read transaction detects that the
+            // database has changed in between (see db_changed() in wal.rs), then the page cache
+            // will be cleared. Since the read transaction itself has not modified anything, it can proceed
+            // with its cached pages in case the database has NOT changed in between.
+            //
+            // Even in the case of a write transaction, clearing the entire page cache is overkill,
+            // since we only need to clear the dirty pages that were modified by the write transaction.
+            self.clear_page_cache(clear_dirty);
             self.dirty_pages.write().clear();
         } else {
             turso_assert!(
@@ -4110,7 +4355,7 @@ impl Pager {
         }
         if is_write {
             if let Some(wal) = self.wal.as_ref() {
-                wal.rollback();
+                wal.rollback(None);
             }
         }
     }
@@ -4182,6 +4427,8 @@ impl Pager {
         // we only read the header which is unencrypted, but the rest of the page is. If so, lets
         // clear the cache.
         self.clear_page_cache(false);
+        // Also invalidate cached schema cookie to force re-read of page 1 with encryption
+        self.set_schema_cookie(None);
         Ok(())
     }
 
@@ -4250,7 +4497,7 @@ pub fn default_page1(cipher: Option<&CipherMode>) -> PageRef {
     page
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct CreateBTreeFlags(pub u8);
 impl CreateBTreeFlags {
     pub const TABLE: u8 = 0b0001;
@@ -4452,9 +4699,9 @@ pub(crate) mod ptrmap {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use crate::sync::Arc;
 
-    use parking_lot::RwLock;
+    use crate::sync::RwLock;
 
     use crate::storage::page_cache::{PageCache, PageCacheKey};
 
@@ -4487,7 +4734,7 @@ mod tests {
 #[cfg(test)]
 #[cfg(not(feature = "omit_autovacuum"))]
 mod ptrmap_tests {
-    use std::sync::Arc;
+    use crate::sync::Arc;
 
     use super::ptrmap::*;
     use super::*;
@@ -4524,15 +4771,17 @@ mod ptrmap_tests {
         let pages = initial_db_pages + 10;
         let sz = std::cmp::max(std::cmp::min(pages, 64), pages);
         let buffer_pool = BufferPool::begin_init(&io, (sz * page_size) as usize);
-        let page_cache = Arc::new(RwLock::new(PageCache::new(sz as usize)));
 
+        let wal_shared = WalFileShared::new_shared(
+            io.open_file("test.db-wal", OpenFlags::Create, false)
+                .unwrap(),
+        )
+        .unwrap();
+        let last_checksum_and_max_frame = wal_shared.read().last_checksum_and_max_frame();
         let wal: Arc<dyn Wal> = Arc::new(WalFile::new(
             io.clone(),
-            WalFileShared::new_shared(
-                io.open_file("test.db-wal", OpenFlags::Create, false)
-                    .unwrap(),
-            )
-            .unwrap(),
+            wal_shared,
+            last_checksum_and_max_frame,
             buffer_pool.clone(),
         ));
 
@@ -4542,7 +4791,7 @@ mod ptrmap_tests {
             db_file,
             Some(wal),
             io,
-            page_cache,
+            PageCache::new(sz as usize),
             buffer_pool,
             Arc::new(Mutex::new(())),
             init_page_1,

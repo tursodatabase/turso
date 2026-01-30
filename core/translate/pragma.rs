@@ -1,13 +1,15 @@
 //! VDBE bytecode generation for pragma statements.
 //! More info: https://www.sqlite.org/pragma.html.
 
+use crate::sync::Arc;
 use chrono::Datelike;
-use std::sync::Arc;
 use turso_macros::match_ignore_ascii_case;
 use turso_parser::ast::{self, ColumnDefinition, Expr, Literal};
 use turso_parser::ast::{PragmaName, QualifiedName};
 
-use super::integrity_check::translate_integrity_check;
+use super::integrity_check::{
+    translate_integrity_check, translate_quick_check, MAX_INTEGRITY_CHECK_ERRORS,
+};
 use crate::pragma::pragma_for;
 use crate::schema::Schema;
 use crate::storage::encryption::{CipherMode, EncryptionKey};
@@ -30,6 +32,17 @@ fn list_pragmas(program: &mut ProgramBuilder) {
         program.emit_result_row(register, 1);
     }
     program.add_pragma_result_column("pragma_list".into());
+}
+
+/// Parse max_errors from an optional value expression.
+/// Returns the parsed integer if value is a numeric literal, otherwise returns the default.
+fn parse_max_errors_from_value(value: &Option<Expr>) -> usize {
+    match value {
+        Some(Expr::Literal(Literal::Numeric(n))) => {
+            n.parse::<usize>().unwrap_or(MAX_INTEGRITY_CHECK_ERRORS)
+        }
+        _ => MAX_INTEGRITY_CHECK_ERRORS,
+    }
 }
 
 pub fn translate_pragma(
@@ -58,16 +71,15 @@ pub fn translate_pragma(
     };
 
     let (mut program, mode) = match body {
-        None => query_pragma(pragma, resolver.schema, None, pager, connection, program)?,
+        None => query_pragma(pragma, resolver, None, pager, connection, program)?,
         Some(ast::PragmaBody::Equals(value) | ast::PragmaBody::Call(value)) => match pragma {
-            PragmaName::TableInfo | PragmaName::TableXinfo => query_pragma(
-                pragma,
-                resolver.schema,
-                Some(*value),
-                pager,
-                connection,
-                program,
-            )?,
+            // These pragmas take a parameter but are queries, not setters
+            PragmaName::TableInfo
+            | PragmaName::TableXinfo
+            | PragmaName::IntegrityCheck
+            | PragmaName::QuickCheck => {
+                query_pragma(pragma, resolver, Some(*value), pager, connection, program)?
+            }
             _ => update_pragma(pragma, resolver, *value, pager, connection, program)?,
         },
     };
@@ -176,7 +188,7 @@ fn update_pragma(
         PragmaName::LegacyFileFormat => Ok((program, TransactionMode::None)),
         PragmaName::WalCheckpoint => query_pragma(
             PragmaName::WalCheckpoint,
-            resolver.schema,
+            resolver,
             Some(value),
             pager,
             connection,
@@ -185,7 +197,7 @@ fn update_pragma(
         PragmaName::ModuleList => Ok((program, TransactionMode::None)),
         PragmaName::PageCount => query_pragma(
             PragmaName::PageCount,
-            resolver.schema,
+            resolver,
             None,
             pager,
             connection,
@@ -329,6 +341,7 @@ fn update_pragma(
             Ok((program, TransactionMode::None))
         }
         PragmaName::IntegrityCheck => unreachable!("integrity_check cannot be set"),
+        PragmaName::QuickCheck => unreachable!("quick_check cannot be set"),
         PragmaName::UnstableCaptureDataChangesConn => {
             let value = parse_string(&value)?;
             // todo(sivukhin): ideally, we should consistently update capture_data_changes connection flag only after successfull execution of schema change statement
@@ -361,7 +374,7 @@ fn update_pragma(
         PragmaName::DatabaseList => unreachable!("database_list cannot be set"),
         PragmaName::QueryOnly => query_pragma(
             PragmaName::QueryOnly,
-            resolver.schema,
+            resolver,
             Some(value),
             pager,
             connection,
@@ -369,7 +382,7 @@ fn update_pragma(
         ),
         PragmaName::FreelistCount => query_pragma(
             PragmaName::FreelistCount,
-            resolver.schema,
+            resolver,
             Some(value),
             pager,
             connection,
@@ -417,17 +430,58 @@ fn update_pragma(
             connection.set_foreign_keys_enabled(enabled);
             Ok((program, TransactionMode::None))
         }
+        #[cfg(target_vendor = "apple")]
+        PragmaName::Fullfsync => {
+            let enabled = parse_pragma_enabled(&value);
+            let sync_type = if enabled {
+                crate::io::FileSyncType::FullFsync
+            } else {
+                crate::io::FileSyncType::Fsync
+            };
+            connection.set_sync_type(sync_type);
+            Ok((program, TransactionMode::None))
+        }
+        PragmaName::TempStore => {
+            use crate::TempStore;
+            // Try to parse as a string first (default, file, memory)
+            let temp_store = if let Expr::Literal(Literal::Numeric(n)) = &value {
+                // Numeric value: 0, 1, or 2
+                match n.as_str() {
+                    "0" => TempStore::Default,
+                    "1" => TempStore::File,
+                    "2" => TempStore::Memory,
+                    _ => bail_parse_error!("temp_store must be 0, 1, 2, DEFAULT, FILE, or MEMORY"),
+                }
+            } else {
+                // Try as keyword/identifier: DEFAULT, FILE, MEMORY
+                let name_bytes = match &value {
+                    Expr::Literal(Literal::Keyword(name)) => name.as_bytes(),
+                    Expr::Name(name) | Expr::Id(name) => name.as_str().as_bytes(),
+                    Expr::Literal(Literal::String(s)) => s.as_bytes(),
+                    _ => bail_parse_error!("temp_store must be 0, 1, 2, DEFAULT, FILE, or MEMORY"),
+                };
+                match_ignore_ascii_case!(match name_bytes {
+                    b"DEFAULT" | b"0" => TempStore::Default,
+                    b"FILE" | b"1" => TempStore::File,
+                    b"MEMORY" | b"2" => TempStore::Memory,
+                    _ => bail_parse_error!("temp_store must be 0, 1, 2, DEFAULT, FILE, or MEMORY"),
+                })
+            };
+            connection.set_temp_store(temp_store);
+            Ok((program, TransactionMode::None))
+        }
     }
 }
 
 fn query_pragma(
     pragma: PragmaName,
-    schema: &Schema,
+    resolver: &Resolver,
     value: Option<ast::Expr>,
     pager: Arc<Pager>,
     connection: Arc<crate::Connection>,
     mut program: ProgramBuilder,
 ) -> crate::Result<(ProgramBuilder, TransactionMode)> {
+    let schema = resolver.schema;
     let register = program.alloc_register();
     match pragma {
         PragmaName::ApplicationId => {
@@ -673,7 +727,13 @@ fn query_pragma(
             Ok((program, TransactionMode::None))
         }
         PragmaName::IntegrityCheck => {
-            translate_integrity_check(schema, &mut program)?;
+            let max_errors = parse_max_errors_from_value(&value);
+            translate_integrity_check(schema, &mut program, resolver, max_errors)?;
+            Ok((program, TransactionMode::Read))
+        }
+        PragmaName::QuickCheck => {
+            let max_errors = parse_max_errors_from_value(&value);
+            translate_quick_check(schema, &mut program, resolver, max_errors)?;
             Ok((program, TransactionMode::Read))
         }
         PragmaName::UnstableCaptureDataChangesConn => {
@@ -783,6 +843,23 @@ fn query_pragma(
             let enabled = connection.foreign_keys_enabled();
             let register = program.alloc_register();
             program.emit_int(enabled as i64, register);
+            program.emit_result_row(register, 1);
+            program.add_pragma_result_column(pragma.to_string());
+            Ok((program, TransactionMode::None))
+        }
+        #[cfg(target_vendor = "apple")]
+        PragmaName::Fullfsync => {
+            let enabled = connection.get_sync_type() == crate::io::FileSyncType::FullFsync;
+            let register = program.alloc_register();
+            program.emit_int(enabled as i64, register);
+            program.emit_result_row(register, 1);
+            program.add_pragma_result_column(pragma.to_string());
+            Ok((program, TransactionMode::None))
+        }
+        PragmaName::TempStore => {
+            let temp_store = connection.get_temp_store();
+            let register = program.alloc_register();
+            program.emit_int(temp_store as i64, register);
             program.emit_result_row(register, 1);
             program.add_pragma_result_column(pragma.to_string());
             Ok((program, TransactionMode::None))

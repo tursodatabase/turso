@@ -31,12 +31,12 @@ def test_schema_operations():
 
 def test_file_operations():
     shell = TestTursoShell()
-    shell.run_test("file-open", ".open testing/testing.db", "")
+    shell.run_test("file-open", ".open testing/system/testing.db", "")
     shell.run_test("file-users-count", "select count(*) from users;", "10000")
     shell.quit()
 
     shell = TestTursoShell()
-    shell.run_test("file-schema-1", ".open testing/testing.db", "")
+    shell.run_test("file-schema-1", ".open testing/system/testing.db", "")
     expected_user_schema = (
         "CREATE TABLE users (\n"
         "id INTEGER PRIMARY KEY,\n"
@@ -58,7 +58,7 @@ def test_file_operations():
 
 def test_joins():
     shell = TestTursoShell()
-    shell.run_test("open-file", ".open testing/testing.db", "")
+    shell.run_test("open-file", ".open testing/system/testing.db", "")
     shell.run_test("verify-tables", ".tables", "products users")
     shell.run_test(
         "file-cross-join",
@@ -71,7 +71,7 @@ def test_joins():
 def test_left_join_self():
     shell = TestTursoShell(
         init_commands="""
-    .open testing/testing.db
+    .open testing/system/testing.db
     """
     )
 
@@ -85,7 +85,7 @@ def test_left_join_self():
 
 def test_where_clauses():
     shell = TestTursoShell()
-    shell.run_test("open-testing-db-file", ".open testing/testing.db", "")
+    shell.run_test("open-testing-db-file", ".open testing/system/testing.db", "")
     shell.run_test(
         "where-clause-eq-string",
         "select count(1) from users where last_name = 'Rodriguez';",
@@ -97,7 +97,7 @@ def test_where_clauses():
 def test_switch_back_to_in_memory():
     shell = TestTursoShell()
     # First, open the file-based DB.
-    shell.run_test("open-testing-db-file", ".open testing/testing.db", "")
+    shell.run_test("open-testing-db-file", ".open testing/system/testing.db", "")
     # Then switch back to :memory:
     shell.run_test("switch-back", ".open :memory:", "")
     shell.run_test("schema-in-memory", ".schema users", "")
@@ -122,7 +122,7 @@ def test_output_file():
     output_filename = "turso_output.txt"
     output_file = shell.config.test_dir / shell.config.py_folder / output_filename
 
-    shell.execute_dot(".open testing/testing.db")
+    shell.execute_dot(".open testing/system/testing.db")
 
     shell.execute_dot(f".cd {shell.config.test_dir}/{shell.config.py_folder}")
     shell.execute_dot(".echo on")
@@ -148,7 +148,7 @@ def test_output_file():
         "TEST_ECHO": "Echoed result",
         "Null value: turso": "Null value setting",
         f"CWD: {shell.config.cwd}/{shell.config.test_dir}": "Working directory changed",
-        "DB: testing/testing.db": "File database opened",
+        "DB: testing/system/testing.db": "File database opened",
         "Echo: off": "Echo turned off",
     }
 
@@ -188,7 +188,7 @@ def test_import_csv():
     shell.run_test("create-csv-table", "CREATE TABLE csv_table (c1 INT, c2 REAL, c3 String);", "")
     shell.run_test(
         "import-csv-no-options",
-        ".import --csv ./testing/test_files/test.csv csv_table",
+        ".import --csv ./testing/cli_tests/test_files/test.csv csv_table",
         "",
     )
     shell.run_test(
@@ -205,7 +205,7 @@ def test_import_csv_verbose():
     shell.run_test("create-csv-table", "CREATE TABLE csv_table (c1 INT, c2 REAL, c3 String);", "")
     shell.run_test(
         "import-csv-verbose",
-        ".import --csv -v ./testing/test_files/test.csv csv_table",
+        ".import --csv -v ./testing/cli_tests/test_files/test.csv csv_table",
         "Added 2 rows with 0 errors using 2 lines of input",
     )
     shell.run_test(
@@ -222,7 +222,7 @@ def test_import_csv_skip():
     shell.run_test("create-csv-table", "CREATE TABLE csv_table (c1 INT, c2 REAL, c3 String);", "")
     shell.run_test(
         "import-csv-skip",
-        ".import --csv --skip 1 ./testing/test_files/test.csv csv_table",
+        ".import --csv --skip 1 ./testing/cli_tests/test_files/test.csv csv_table",
         "",
     )
     shell.run_test("verify-csv-skip", "select * from csv_table;", "3|4.0|String2")
@@ -235,7 +235,7 @@ def test_import_csv_create_table_from_header():
     # Import CSV with header - should create table automatically
     shell.run_test(
         "import-csv-create-table",
-        ".import --csv ./testing/test_files/test_w_header.csv auto_table",
+        ".import --csv ./testing/cli_tests/test_files/test_w_header.csv auto_table",
         "",
     )
     # Verify table was created with correct column names
@@ -300,7 +300,7 @@ def test_insert_default_values():
 
 
 def test_uri_readonly():
-    turso = TestTursoShell(flags="file:testing/testing_small.db?mode=ro", init_commands="")
+    turso = TestTursoShell(flags="file:testing/system/testing_small.db?mode=ro", init_commands="")
     turso.run_test("read-only-uri-reads-work", "SELECT COUNT(*) FROM demo;", "5")
     turso.run_test_fn(
         "INSERT INTO demo (id, value) values (6, 'demo');",
@@ -314,7 +314,7 @@ def test_uri_readonly():
 
 
 def test_copy_db_file():
-    testpath = "testing/test_copy.db"
+    testpath = "testing/system/test_copy.db"
     if Path(testpath).exists():
         os.unlink(Path(testpath))
         time.sleep(0.2)  # make sure closed
@@ -334,7 +334,7 @@ def test_copy_db_file():
 
 
 def test_copy_memory_db_to_file():
-    testpath = "testing/memory.db"
+    testpath = "testing/system/memory.db"
     if Path(testpath).exists():
         os.unlink(Path(testpath))
         time.sleep(0.2)  # make sure closed
@@ -357,7 +357,7 @@ def test_copy_memory_db_to_file():
 
 
 def test_parse_error():
-    testpath = "testing/memory.db"
+    testpath = "testing/system/memory.db"
     if Path(testpath).exists():
         os.unlink(Path(testpath))
         time.sleep(0.2)  # make sure closed
@@ -375,13 +375,112 @@ def test_tables_with_attached_db():
     shell = TestTursoShell(flags="-q --experimental-attach")
     shell.execute_dot(".open :memory:")
     shell.execute_dot("CREATE TABLE orders(a);")
-    shell.execute_dot("ATTACH DATABASE 'testing/testing.db' AS attached;")
+    shell.execute_dot("ATTACH DATABASE 'testing/system/testing.db' AS attached;")
     shell.run_test("tables-with-attached-database", ".tables", "orders attached.products attached.users")
+    shell.quit()
+
+
+def test_dbtotxt():
+    shell = TestTursoShell(init_commands="")
+    shell.run_test(
+        "dbtotxt-empty",
+        ".dbtotxt",
+        "| size 0 pagesize 4096 filename :memory:\n| end :memory:",
+    )
+    shell.quit()
+
+    shell = TestTursoShell(init_commands="")
+    shell.execute_dot("CREATE TABLE t(x);")
+    expected = (
+        "| size 8192 pagesize 4096 filename :memory:\n"
+        "| page 1 offset 0\n"
+        "|      0: 53 51 4c 69 74 65 20 66 6f 72 6d 61 74 20 33 00   SQLite format 3.\n"
+        "|     16: 10 00 02 02 00 40 20 20 00 00 00 01 00 00 00 02   .....@  ........\n"
+        "|     32: 00 00 00 00 00 00 00 00 00 00 00 01 00 00 00 04   ................\n"
+        "|     48: ff ff f8 30 00 00 00 00 00 00 00 01 00 00 00 00   ...0............\n"
+        "|     80: 00 00 00 00 00 00 00 00 00 00 00 00 00 2e 7e 58   ..............~X\n"
+        "|     96: 00 2e 7e 58 0d 00 00 00 01 0f de 00 0f de 00 00   ..~X............\n"
+        "|   4048: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 20 01   .............. .\n"
+        "|   4064: 06 17 0f 0f 01 31 74 61 62 6c 65 74 74 02 43 52   .....1tablett.CR\n"
+        "|   4080: 45 41 54 45 20 54 41 42 4c 45 20 74 20 28 78 29   EATE TABLE t (x)\n"
+        "| page 2 offset 4096\n"
+        "|      0: 0d 00 00 00 00 10 00 00 00 00 00 00 00 00 00 00   ................\n"
+        "| end :memory:"
+    )
+    shell.run_test("dbtotxt-with-table", ".dbtotxt", expected)
+    shell.quit()
+
+
+def test_read_command():
+    shell = TestTursoShell()
+    try:
+        shell.run_test(
+            "read-non-existing-file",
+            ".read /12jo/ddwuidu/s.sql",
+            ('Error: cannot open "/12jo/ddwuidu/s.sql" – No such file or directory (os error 2)'),
+        )
+
+        wrong_sql_file = Path("wrong.sql")
+        wrong_sql_file.write_text("""
+        DROP TABLE IF EXISTS students;
+        CREATE TABLE students (
+            id INTEGER PRIMARY KEY,
+            name TEXT,
+            email TEXT
+        );
+
+        INSERT INTO students (name,email) VALUES ('Alice','a@a.com');
+
+        -- THIS LINE IS INTENTIONALLY BROKEN
+        INSRT INTO students (name,email) VALUES ('Broken','b@b.com');
+
+        INSERT INTO students (name,email) VALUES ('Charlie','c@c.com');
+        """)
+
+        shell.run_test_fn(".read wrong.sql", lambda result: "INSRT" in result)
+
+        emp_sql_file = Path("empty.sql")
+        emp_sql_file.write_text("")
+        shell.run_test("read-empty-file", ".read empty.sql", "")
+
+        happy_sql_file = Path("happy.sql")
+        happy_sql_file.write_text("""
+        DROP TABLE IF EXISTS students;
+        CREATE TABLE students (
+            id INTEGER PRIMARY KEY,
+            name TEXT,
+            email TEXT
+        );
+
+        INSERT INTO students (name,email) VALUES ('Alice','a@a.com');
+
+        INSERT INTO students (name,email) VALUES ('Broken','b@b.com');
+
+        INSERT INTO students (name,email) VALUES ('Charlie','c@c.com');
+        """)
+        shell.run_test("read-happy-file", ".read happy.sql", "")
+
+        binary_sql_file = Path("binary_test.bin")
+        binary_sql_file.write_bytes(os.urandom(512))
+
+        shell.run_test(
+            "read-binary-file",
+            ".read binary_test.bin",
+            ('Error: file "binary_test.bin" is not valid UTF-8 text – stream did not contain valid UTF-8'),
+        )
+
+    finally:
+        for f in ["wrong.sql", "empty.sql", "happy.sql", "binary_test.bin"]:
+            p = Path(f)
+            if p.exists():
+                p.unlink()
+
     shell.quit()
 
 
 def main():
     console.info("Running all turso CLI tests...")
+    test_read_command()
     test_basic_queries()
     test_schema_operations()
     test_file_operations()
@@ -405,6 +504,7 @@ def main():
     test_copy_memory_db_to_file()
     test_parse_error()
     test_tables_with_attached_db()
+    test_dbtotxt()
     console.info("All tests have passed")
 
 
