@@ -16,6 +16,7 @@ pub mod alter_table;
 pub mod create_index;
 pub mod create_table;
 pub mod create_trigger;
+pub mod cte;
 pub mod delete;
 pub mod drop_index;
 pub mod drop_table;
@@ -45,6 +46,7 @@ pub use create_trigger::{
     CreateTriggerContext, CreateTriggerKind, CreateTriggerOpWeights, CreateTriggerStatement,
     TriggerEvent, TriggerTiming,
 };
+pub use cte::{CteDefinition, CteMaterialization, CteProfile, WithClause};
 pub use delete::DeleteStatement;
 pub use drop_index::DropIndexStatement;
 pub use drop_table::DropTableStatement;
@@ -135,6 +137,8 @@ pub mod strategies {
         control_flow_functions, datetime_functions, function_from_registry, functions_in_category,
         math_functions, null_handling_functions, scalar_function, string_functions, type_functions,
     };
+    // CTEs
+    pub use crate::cte::{cte_definition, materialization, optional_with_clause, with_clause};
 }
 
 #[cfg(test)]
@@ -180,8 +184,10 @@ mod tests {
             strategies::select_for_table(&schema.tables[0], &schema, &StatementProfile::default())
         }) {
             let sql = stmt.to_string();
-            prop_assert!(sql.starts_with("SELECT"));
-            prop_assert!(sql.contains("FROM users"));
+            // SQL can start with WITH (CTE) or SELECT
+            prop_assert!(sql.starts_with("SELECT") || sql.starts_with("WITH "));
+            // SQL must have a FROM clause (could be FROM users, FROM posts, or FROM cte_*)
+            prop_assert!(sql.contains(" FROM "));
         }
 
         #[test]

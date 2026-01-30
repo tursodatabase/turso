@@ -1,0 +1,700 @@
+@database :memory:
+
+# =============================================================================
+# Scalar subqueries in function arguments
+# =============================================================================
+
+test subquery-in-abs {
+    SELECT ABS((SELECT -5));
+}
+expect {
+    5
+}
+
+test subquery-in-length {
+    SELECT LENGTH((SELECT 'hello'));
+}
+expect {
+    5
+}
+
+test subquery-in-instr {
+    SELECT INSTR((SELECT 'hello world'), (SELECT 'world'));
+}
+expect {
+    7
+}
+
+test subquery-in-substr {
+    SELECT SUBSTR((SELECT 'hello'), (SELECT 2), (SELECT 3));
+}
+expect {
+    ell
+}
+
+test subquery-in-replace {
+    SELECT REPLACE((SELECT 'hello'), (SELECT 'l'), (SELECT 'L'));
+}
+expect {
+    heLLo
+}
+
+test subquery-in-upper-lower {
+    SELECT UPPER((SELECT 'hello')), LOWER((SELECT 'WORLD'));
+}
+expect {
+    HELLO|world
+}
+
+test subquery-in-trim {
+    SELECT TRIM((SELECT '  hello  '));
+}
+expect {
+    hello
+}
+
+test subquery-in-printf {
+    SELECT PRINTF('%d + %d = %d', (SELECT 1), (SELECT 2), (SELECT 3));
+}
+expect {
+    1 + 2 = 3
+}
+
+test subquery-in-typeof {
+    SELECT TYPEOF((SELECT 1)), TYPEOF((SELECT 'text')), TYPEOF((SELECT NULL));
+}
+expect {
+    integer|text|null
+}
+
+test subquery-in-coalesce {
+    SELECT COALESCE((SELECT NULL), (SELECT NULL), (SELECT 42));
+}
+expect {
+    42
+}
+
+test subquery-in-coalesce-first-non-null {
+    SELECT COALESCE((SELECT 1), (SELECT 2), (SELECT 3));
+}
+expect {
+    1
+}
+
+test subquery-in-nullif-equal {
+    SELECT NULLIF((SELECT 1), (SELECT 1));
+}
+expect {
+
+}
+
+test subquery-in-nullif-not-equal {
+    SELECT NULLIF((SELECT 1), (SELECT 2));
+}
+expect {
+    1
+}
+
+test subquery-in-ifnull {
+    SELECT IFNULL((SELECT NULL), (SELECT 42));
+}
+expect {
+    42
+}
+
+test subquery-in-ifnull-first-not-null {
+    SELECT IFNULL((SELECT 10), (SELECT 42));
+}
+expect {
+    10
+}
+
+test subquery-in-iif {
+    SELECT IIF((SELECT 1) > 0, 'positive', 'non-positive');
+}
+expect {
+    positive
+}
+
+test subquery-in-iif-false {
+    SELECT IIF((SELECT -1) > 0, 'positive', 'non-positive');
+}
+expect {
+    non-positive
+}
+
+test subquery-in-max-scalar {
+    SELECT MAX((SELECT 5), (SELECT 10), (SELECT 3));
+}
+expect {
+    10
+}
+
+test subquery-in-min-scalar {
+    SELECT MIN((SELECT 5), (SELECT 10), (SELECT 3));
+}
+expect {
+    3
+}
+
+# =============================================================================
+# Subqueries with string operators
+# =============================================================================
+
+test subquery-concat {
+    SELECT (SELECT 'hello') || (SELECT ' ') || (SELECT 'world');
+}
+expect {
+    hello world
+}
+
+test subquery-in-like {
+    SELECT 'hello' LIKE (SELECT 'h%');
+}
+expect {
+    1
+}
+
+test subquery-in-like-no-match {
+    SELECT 'hello' LIKE (SELECT 'x%');
+}
+expect {
+    0
+}
+
+test subquery-in-glob {
+    SELECT 'hello' GLOB (SELECT 'h*');
+}
+expect {
+    1
+}
+
+test subquery-in-glob-no-match {
+    SELECT 'hello' GLOB (SELECT 'H*');
+}
+expect {
+    0
+}
+
+test subquery-lhs-in-like {
+    SELECT (SELECT 'hello world') LIKE '%world';
+}
+expect {
+    1
+}
+
+# =============================================================================
+# Subqueries with arithmetic and bitwise operators
+# =============================================================================
+
+test subquery-arithmetic-all-ops {
+    SELECT (SELECT 10) + (SELECT 5),
+           (SELECT 10) - (SELECT 5),
+           (SELECT 10) * (SELECT 5),
+           (SELECT 10) / (SELECT 5),
+           (SELECT 10) % (SELECT 3);
+}
+expect {
+    15|5|50|2|1
+}
+
+test subquery-bitwise-ops {
+    SELECT (SELECT 5) | (SELECT 3),
+           (SELECT 5) & (SELECT 3),
+           (SELECT 5) << (SELECT 1),
+           (SELECT 8) >> (SELECT 2),
+           ~(SELECT 0);
+}
+expect {
+    7|1|10|2|-1
+}
+
+test subquery-unary-minus {
+    SELECT -(SELECT 5), +(SELECT 5);
+}
+expect {
+    -5|5
+}
+
+# =============================================================================
+# Subqueries with BETWEEN
+# =============================================================================
+
+test subquery-between-all-subqueries {
+    SELECT (SELECT 5) BETWEEN (SELECT 1) AND (SELECT 10);
+}
+expect {
+    1
+}
+
+test subquery-between-out-of-range {
+    SELECT (SELECT 15) BETWEEN (SELECT 1) AND (SELECT 10);
+}
+expect {
+    0
+}
+
+test subquery-not-between {
+    SELECT (SELECT 15) NOT BETWEEN (SELECT 1) AND (SELECT 10);
+}
+expect {
+    1
+}
+
+# =============================================================================
+# Subqueries with CASE expressions
+# =============================================================================
+
+test subquery-case-when-condition {
+    SELECT CASE WHEN (SELECT 1) = 1 THEN 'one' ELSE 'other' END;
+}
+expect {
+    one
+}
+
+test subquery-case-simple {
+    SELECT CASE (SELECT 2) WHEN 1 THEN 'one' WHEN 2 THEN 'two' ELSE 'other' END;
+}
+expect {
+    two
+}
+
+test subquery-case-then-result {
+    SELECT CASE 1 WHEN 1 THEN (SELECT 'matched') ELSE 'not matched' END;
+}
+expect {
+    matched
+}
+
+test subquery-case-else-result {
+    SELECT CASE 1 WHEN 2 THEN 'matched' ELSE (SELECT 'not matched') END;
+}
+expect {
+    not matched
+}
+
+test subquery-case-all-subqueries {
+    SELECT CASE (SELECT 1)
+           WHEN (SELECT 1) THEN (SELECT 'equal')
+           ELSE (SELECT 'not equal')
+           END;
+}
+expect {
+    equal
+}
+
+# =============================================================================
+# Subqueries with CAST
+# =============================================================================
+
+test subquery-cast-to-integer {
+    SELECT CAST((SELECT '123') AS INTEGER);
+}
+expect {
+    123
+}
+
+test subquery-cast-to-text {
+    SELECT CAST((SELECT 456) AS TEXT);
+}
+expect {
+    456
+}
+
+test subquery-cast-to-real {
+    SELECT CAST((SELECT '3.14') AS REAL);
+}
+expect {
+    3.14
+}
+
+# =============================================================================
+# Subqueries with IS NULL / IS NOT NULL
+# =============================================================================
+
+test subquery-is-null-true {
+    SELECT (SELECT NULL) IS NULL;
+}
+expect {
+    1
+}
+
+test subquery-is-null-false {
+    SELECT (SELECT 1) IS NULL;
+}
+expect {
+    0
+}
+
+test subquery-is-not-null-true {
+    SELECT (SELECT 1) IS NOT NULL;
+}
+expect {
+    1
+}
+
+test subquery-is-not-null-false {
+    SELECT (SELECT NULL) IS NOT NULL;
+}
+expect {
+    0
+}
+
+# =============================================================================
+# Empty subquery behavior
+# =============================================================================
+
+test subquery-empty-in-comparison {
+    SELECT 1 WHERE 1 = (SELECT 1 WHERE FALSE);
+}
+expect {
+}
+
+test subquery-empty-aggregate-sum {
+    SELECT (SELECT SUM(x) FROM (SELECT 1 as x WHERE FALSE));
+}
+expect {
+
+}
+
+test subquery-empty-aggregate-count {
+    SELECT (SELECT COUNT(*) FROM (SELECT 1 WHERE FALSE));
+}
+expect {
+    0
+}
+
+test subquery-empty-in-coalesce {
+    SELECT COALESCE((SELECT 1 WHERE FALSE), 'default');
+}
+expect {
+    default
+}
+
+# =============================================================================
+# Subqueries with LIMIT edge cases
+# =============================================================================
+
+test subquery-limit-zero {
+    SELECT * FROM (SELECT 1 UNION SELECT 2 LIMIT 0);
+}
+expect {
+}
+
+test subquery-limit-negative {
+    SELECT * FROM (SELECT 1 UNION SELECT 2 LIMIT -1);
+}
+expect {
+    1
+    2
+}
+
+test subquery-order-by-in-from-subquery {
+    SELECT * FROM (SELECT * FROM (VALUES(3),(1),(2)) ORDER BY 1);
+}
+expect {
+    1
+    2
+    3
+}
+
+test subquery-offset-without-limit {
+    SELECT * FROM (SELECT * FROM (VALUES(1),(2),(3)) LIMIT -1 OFFSET 1);
+}
+expect {
+    2
+    3
+}
+
+# =============================================================================
+# Joins between subqueries
+# =============================================================================
+
+test subquery-join-two-subqueries {
+    SELECT * FROM (SELECT 1 a, 2 b) x JOIN (SELECT 2 c, 3 d) y ON x.b = y.c;
+}
+expect {
+    1|2|2|3
+}
+
+test subquery-left-join-two-subqueries {
+    SELECT * FROM (SELECT 1 a) x LEFT JOIN (SELECT 2 b) y ON x.a = y.b;
+}
+expect {
+    1|
+}
+
+test subquery-cross-join-subqueries {
+    SELECT * FROM (SELECT 1 a UNION SELECT 2) x, (SELECT 'a' b UNION SELECT 'b') y ORDER BY a, b;
+}
+expect {
+    1|a
+    1|b
+    2|a
+    2|b
+}
+
+test subquery-natural-join-subqueries {
+    SELECT * FROM (SELECT 1 x, 'a' y) NATURAL JOIN (SELECT 1 x, 'b' z);
+}
+expect {
+    1|a|b
+}
+
+# =============================================================================
+# Deeply nested subqueries
+# =============================================================================
+
+test subquery-deeply-nested {
+    SELECT * FROM (
+        SELECT * FROM (
+            SELECT * FROM (
+                SELECT * FROM (
+                    SELECT 'deep' as level
+                )
+            )
+        )
+    );
+}
+expect {
+    deep
+}
+
+test subquery-nested-with-operations {
+    SELECT * FROM (
+        SELECT x + 1 as x FROM (
+            SELECT x * 2 as x FROM (
+                SELECT 5 as x
+            )
+        )
+    );
+}
+expect {
+    11
+}
+
+# =============================================================================
+# Subqueries with compound operators
+# =============================================================================
+
+test subquery-from-union {
+    SELECT * FROM (SELECT 1 x UNION SELECT 2) ORDER BY 1;
+}
+expect {
+    1
+    2
+}
+
+test subquery-from-union-all {
+    SELECT * FROM (SELECT 1 x UNION ALL SELECT 1) ORDER BY 1;
+}
+expect {
+    1
+    1
+}
+
+test subquery-from-intersect {
+    SELECT * FROM (SELECT 1 x UNION SELECT 2 INTERSECT SELECT 1 UNION SELECT 3) ORDER BY 1;
+}
+expect {
+    1
+    3
+}
+
+test subquery-from-except {
+    SELECT * FROM (SELECT 1 x UNION SELECT 2 EXCEPT SELECT 2);
+}
+expect {
+    1
+}
+
+test subquery-nested-compound-in-scalar {
+    SELECT (SELECT MAX(x) FROM (SELECT 1 x UNION SELECT 2 UNION SELECT 3));
+}
+expect {
+    3
+}
+
+# =============================================================================
+# Subqueries with GROUP BY / HAVING inside
+# =============================================================================
+
+test subquery-group-by-inside {
+    SELECT * FROM (
+        SELECT column1 g, SUM(column2) s
+        FROM (VALUES('a',1),('a',2),('b',3))
+        GROUP BY column1
+    ) ORDER BY g;
+}
+expect {
+    a|3
+    b|3
+}
+
+test subquery-having-inside {
+    SELECT * FROM (
+        SELECT column1 g, SUM(column2) s
+        FROM (VALUES('a',1),('a',2),('b',3))
+        GROUP BY column1
+        HAVING SUM(column2) > 2
+    ) ORDER BY g;
+}
+expect {
+    a|3
+    b|3
+}
+
+test subquery-distinct-inside {
+    SELECT * FROM (SELECT DISTINCT column1 FROM (VALUES(1),(1),(2),(2),(3)));
+}
+expect {
+    1
+    2
+    3
+}
+
+# =============================================================================
+# NOT IN with NULL handling
+# =============================================================================
+
+test subquery-not-in-with-null-in-list {
+    SELECT 1 WHERE 1 NOT IN (SELECT NULL);
+}
+expect {
+}
+
+test subquery-not-in-with-null-and-value {
+    SELECT 1 WHERE 3 NOT IN (SELECT column1 FROM (VALUES(1),(2),(NULL)));
+}
+expect {
+}
+
+test subquery-in-with-null-match {
+    SELECT 1 WHERE 1 IN (SELECT column1 FROM (VALUES(1),(NULL)));
+}
+expect {
+    1
+}
+
+# =============================================================================
+# Subqueries referencing outer CTEs
+# =============================================================================
+
+test cte-in-scalar-subquery-select {
+    WITH t(x) AS (VALUES(10),(20),(30))
+    SELECT (SELECT MAX(x) FROM t), (SELECT MIN(x) FROM t), (SELECT AVG(x) FROM t);
+}
+expect {
+    30|10|20.0
+}
+expect @js {
+    30|10|20
+}
+
+test cte-in-exists-subquery {
+    WITH data(x) AS (VALUES(1),(2),(3))
+    SELECT * FROM data d WHERE EXISTS (SELECT 1 FROM data WHERE x > d.x);
+}
+expect {
+    1
+    2
+}
+
+test cte-in-from-subquery {
+    WITH t(x) AS (VALUES(1),(2),(3))
+    SELECT * FROM (SELECT x * 2 as doubled FROM t) ORDER BY doubled;
+}
+expect {
+    2
+    4
+    6
+}
+
+test cte-used-in-both-direct-and-subquery {
+    WITH t(x) AS (VALUES(1),(2),(3))
+    SELECT t.x, (SELECT SUM(x) FROM t) as total FROM t;
+}
+expect {
+    1|6
+    2|6
+    3|6
+}
+
+# =============================================================================
+# CTE + subquery combinations
+# =============================================================================
+
+test cte-materialized-multiple-scalar-refs {
+    WITH t AS MATERIALIZED (SELECT 100 as x)
+    SELECT (SELECT x FROM t) + (SELECT x FROM t) + (SELECT x FROM t);
+}
+expect {
+    300
+}
+
+test cte-inside-from-subquery {
+    SELECT * FROM (
+        WITH inner_cte(x) AS (VALUES(1),(2))
+        SELECT * FROM inner_cte
+    );
+}
+expect {
+    1
+    2
+}
+
+test cte-chain-with-subquery {
+    WITH
+        a(x) AS (VALUES(1),(2),(3)),
+        b(y) AS (SELECT x * 10 FROM a)
+    SELECT * FROM (SELECT * FROM b WHERE y > 15) ORDER BY y;
+}
+expect {
+    20
+    30
+}
+
+test cte-union-with-subquery-ref {
+    WITH t(x) AS (SELECT 1 UNION SELECT 2)
+    SELECT * FROM (SELECT * FROM t UNION SELECT 3) ORDER BY 1;
+}
+expect {
+    1
+    2
+    3
+}
+
+# =============================================================================
+# Edge cases with comparison operators
+# =============================================================================
+
+test subquery-comparison-operators {
+    SELECT (SELECT 5) > (SELECT 3),
+           (SELECT 5) >= (SELECT 5),
+           (SELECT 5) < (SELECT 10),
+           (SELECT 5) <= (SELECT 5),
+           (SELECT 5) = (SELECT 5),
+           (SELECT 5) != (SELECT 3),
+           (SELECT 5) <> (SELECT 3);
+}
+expect {
+    1|1|1|1|1|1|1
+}
+
+test subquery-comparison-with-null {
+    SELECT (SELECT 1) = (SELECT NULL),
+           (SELECT NULL) = (SELECT NULL),
+           (SELECT 1) != (SELECT NULL);
+}
+expect {
+    ||
+}
+
+test subquery-is-distinct-from {
+    SELECT (SELECT 1) IS (SELECT 1),
+           (SELECT NULL) IS (SELECT NULL),
+           (SELECT 1) IS NOT (SELECT NULL);
+}
+expect {
+    1|1|1
+}
