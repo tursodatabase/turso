@@ -58,6 +58,11 @@ impl Table {
             indexes: vec![],
         }
     }
+
+    /// Returns true if any column in this table has a UNIQUE constraint.
+    pub fn has_any_unique_column(&self) -> bool {
+        self.columns.iter().any(|c| c.has_unique_constraint())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -81,6 +86,15 @@ impl PartialEq for Column {
 }
 
 impl Eq for Column {}
+
+impl Column {
+    /// Returns true if this column has a UNIQUE constraint.
+    pub fn has_unique_constraint(&self) -> bool {
+        self.constraints
+            .iter()
+            .any(|c| matches!(c, ColumnConstraint::Unique(_)))
+    }
+}
 
 impl Display for Column {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -195,6 +209,15 @@ impl SimValue {
     #[inline]
     fn is_null(&self) -> bool {
         matches!(self.0, types::Value::Null)
+    }
+
+    pub fn unique_for_type(column_type: &ColumnType, offset: i64) -> Self {
+        match column_type {
+            ColumnType::Integer => SimValue(types::Value::Integer(offset)),
+            ColumnType::Float => SimValue(types::Value::Float(offset as f64)),
+            ColumnType::Text => SimValue(types::Value::Text(format!("u{offset}").into())),
+            ColumnType::Blob => SimValue(types::Value::Blob(format!("u{offset}").into_bytes())),
+        }
     }
 
     // The result of any binary operator is either a numeric value or NULL, except for the || concatenation operator, and the -> and ->> extract operators which can return values of any type.

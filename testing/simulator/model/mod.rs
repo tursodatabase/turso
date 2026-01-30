@@ -12,7 +12,7 @@ use sql_generation::model::{
         pragma::Pragma,
         select::{CompoundOperator, FromClause, ResultColumn, SelectInner},
         transaction::{Begin, Commit, Rollback},
-        update::Update,
+        update::{SetValue, Update},
     },
     table::{Index, JoinTable, JoinType, SimValue, Table, TableContext},
 };
@@ -20,6 +20,33 @@ use turso_parser::ast::Distinctness;
 
 use crate::runner::env::TransactionMode;
 use crate::{generation::Shadow, runner::env::ShadowTablesMut};
+
+/// Validate UNIQUE constraints for rows being inserted
+fn validate_unique_insert(
+    table_name: &str,
+    columns: &[sql_generation::model::table::Column],
+    existing_rows: &[Vec<SimValue>],
+    new_rows: &[Vec<SimValue>],
+) -> anyhow::Result<()> {
+    for (row_idx, row) in new_rows.iter().enumerate() {
+        for (col_idx, col) in columns.iter().enumerate() {
+            if col.has_unique_constraint() && row[col_idx].0 != turso_core::Value::Null {
+                let duplicate = existing_rows
+                    .iter()
+                    .chain(new_rows[..row_idx].iter())
+                    .any(|existing| existing[col_idx] == row[col_idx]);
+                if duplicate {
+                    return Err(anyhow::anyhow!(
+                        "UNIQUE constraint violation: column '{}' in table '{}'",
+                        col.name,
+                        table_name
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
 
 pub mod interactions;
 pub mod metrics;
@@ -373,52 +400,28 @@ impl Shadow for Insert {
 
     //FIXME this doesn't handle type affinity
     fn shadow(&self, tables: &mut ShadowTablesMut) -> Self::Result {
-        match self {
-            Insert::Values { table, values } => {
-                if !tables.iter().any(|t| &t.name == table) {
-                    return Err(anyhow::anyhow!(
-                        "Table {} does not exist. INSERT statement ignored.",
-                        table
-                    ));
-                }
+        let (table_name, rows) = match self {
+            Insert::Values { table, values } => (table.clone(), values.clone()),
+            Insert::Select { table, select } => (table.clone(), select.shadow(tables)?),
+        };
 
-                // Record each inserted row for transaction tracking
-                for row in values {
-                    tables.record_insert(table.clone(), row.clone());
-                }
+        let sim_table = tables
+            .iter()
+            .find(|t| t.name == table_name)
+            .ok_or_else(|| anyhow::anyhow!("Table {} does not exist", table_name))?;
 
-                // Insert the rows
-                tables
-                    .iter_mut()
-                    .find(|t| &t.name == table)
-                    .expect("We already validated that the table exists")
-                    .rows
-                    .extend(values.clone());
-            }
-            Insert::Select { table, select } => {
-                let rows = select.shadow(tables)?;
+        validate_unique_insert(&table_name, &sim_table.columns, &sim_table.rows, &rows)?;
 
-                if !tables.iter().any(|t| &t.name == table) {
-                    return Err(anyhow::anyhow!(
-                        "Table {} does not exist. INSERT statement ignored.",
-                        table
-                    ));
-                }
-
-                // Record each inserted row for transaction tracking
-                for row in &rows {
-                    tables.record_insert(table.clone(), row.clone());
-                }
-
-                // Insert the rows
-                tables
-                    .iter_mut()
-                    .find(|t| &t.name == table)
-                    .expect("We already validated that the table exists")
-                    .rows
-                    .extend(rows);
-            }
+        for row in &rows {
+            tables.record_insert(table_name.clone(), row.clone());
         }
+
+        tables
+            .iter_mut()
+            .find(|t| t.name == table_name)
+            .unwrap()
+            .rows
+            .extend(rows);
 
         Ok(vec![])
     }
@@ -622,7 +625,7 @@ impl Shadow for Update {
 
     fn shadow(&self, tables: &mut ShadowTablesMut) -> Self::Result {
         // First pass: find rows to update and compute old/new values
-        let (columns, updates) = {
+        let (updates, columns) = {
             let table = tables.iter().find(|t| t.name == self.table);
             let table = if let Some(table) = table {
                 table
@@ -636,47 +639,93 @@ impl Shadow for Update {
             let t2 = table.clone();
             let columns = table.columns.clone();
 
-            let updates: Vec<(Vec<SimValue>, Vec<SimValue>)> = table
+            let updates: Vec<(usize, Vec<SimValue>, Vec<SimValue>)> = table
                 .rows
                 .iter()
-                .filter(|r| self.predicate.test(r, &t2))
-                .map(|old_row| {
+                .enumerate()
+                .filter(|(_, r)| self.predicate.test(r, &t2))
+                .map(|(row_idx, old_row)| {
                     let mut new_row = old_row.clone();
                     for (column, set_value) in &self.set_values {
                         if let Some((idx, _)) =
                             columns.iter().enumerate().find(|(_, c)| &c.name == column)
                         {
-                            new_row[idx] = set_value.clone();
+                            match set_value {
+                                SetValue::Simple(v) => {
+                                    new_row[idx] = v.clone();
+                                }
+                                SetValue::CaseWhen {
+                                    condition,
+                                    then_value,
+                                    else_column,
+                                } => {
+                                    debug_assert_eq!(else_column, column);
+                                    if condition.test(old_row, &t2) {
+                                        new_row[idx] = then_value.clone();
+                                    }
+                                }
+                            }
                         }
                     }
-                    (old_row.clone(), new_row)
+                    (row_idx, old_row.clone(), new_row)
                 })
                 .collect();
 
-            (columns, updates)
+            (updates, columns)
         };
 
+        let updated_row_indices: std::collections::HashSet<usize> =
+            updates.iter().map(|(idx, _, _)| *idx).collect();
+
+        if let Some(table) = tables.iter().find(|t| t.name == self.table) {
+            for (col_idx, col) in columns.iter().enumerate() {
+                if !col.has_unique_constraint() {
+                    continue;
+                }
+                let new_values: Vec<_> = updates
+                    .iter()
+                    .map(|(_, _, new)| &new[col_idx])
+                    .filter(|v| v.0 != turso_core::Value::Null)
+                    .collect();
+                // check duplicates within batch
+                for (i, v) in new_values.iter().enumerate() {
+                    if new_values[..i].contains(v) {
+                        return Err(anyhow::anyhow!(
+                            "UNIQUE constraint: duplicate '{}' in table '{}'",
+                            col.name,
+                            self.table
+                        ));
+                    }
+                }
+                // check against existing rows not being updated
+                for v in &new_values {
+                    let conflicts = table
+                        .rows
+                        .iter()
+                        .enumerate()
+                        .filter(|(row_idx, _)| !updated_row_indices.contains(row_idx))
+                        .any(|(_, r)| &r[col_idx] == *v);
+                    if conflicts {
+                        return Err(anyhow::anyhow!(
+                            "UNIQUE constraint: '{}' already exists in '{}'",
+                            col.name,
+                            self.table
+                        ));
+                    }
+                }
+            }
+        }
+
         // Record the operations for transaction tracking
-        for (old_row, new_row) in &updates {
+        for (_, old_row, new_row) in &updates {
             tables.record_delete(self.table.clone(), old_row.clone());
             tables.record_insert(self.table.clone(), new_row.clone());
         }
 
         // Second pass: apply the updates
         if let Some(table) = tables.iter_mut().find(|t| t.name == self.table) {
-            let t2 = table.clone();
-            for row in table
-                .rows
-                .iter_mut()
-                .filter(|r| self.predicate.test(r, &t2))
-            {
-                for (column, set_value) in &self.set_values {
-                    if let Some((idx, _)) =
-                        columns.iter().enumerate().find(|(_, c)| &c.name == column)
-                    {
-                        row[idx] = set_value.clone();
-                    }
-                }
+            for (row_idx, _, new_row) in &updates {
+                table.rows[*row_idx] = new_row.clone();
             }
         }
 

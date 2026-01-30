@@ -36,18 +36,20 @@ pub enum Property {
         /// Interactive query information if any
         interactive: Option<InteractiveQueryInfo>,
     },
-    /// ReadYourUpdatesBack is a property in which the updated rows
-    /// must be in the resulting rows of a select query that has a
-    /// where clause that matches the updated row.
-    /// The execution of the property is as follows
-    ///     UPDATE <t> SET <set_cols=set_vals> WHERE <predicate>
-    ///     SELECT <set_cols> FROM <t> WHERE <predicate>
-    /// These interactions are executed in immediate succession
-    /// just to verify the property that our updates did what they
-    /// were supposed to do.
+    /// ReadYourUpdatesBack verifies UPDATE behavior for both success and failure cases.
+    ///
+    /// Execution:
+    ///     SELECT <cols> FROM <t> WHERE <predicate>  -- snapshot before
+    ///     UPDATE <t> SET <cols> WHERE <predicate>
+    ///     SELECT <cols> FROM <t> WHERE <predicate>  -- snapshot after
+    ///
+    /// Assertion:
+    /// - If UPDATE succeeded: after rows have updated values
+    /// - If UPDATE failed (e.g., constraint error): before == after (rollback verified)
     ReadYourUpdatesBack {
         update: Update,
-        select: Select,
+        select_before: Select,
+        select_after: Select,
     },
     /// TableHasExpectedContent is a property in which the table
     /// must have the expected content, i.e. all the insertions and
