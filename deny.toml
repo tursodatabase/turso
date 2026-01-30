@@ -1,0 +1,49 @@
+# cargo-deny configuration
+# See: https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+# Include all targets for comprehensive checking
+all-features = true
+# Exclude internal perf/testing crates from license checks
+exclude = [
+    "encryption-throughput",
+    "write-throughput",
+    "write-throughput-sqlite",
+]
+
+[licenses]
+# Use version 2 for modern cargo-deny behavior
+version = 2
+
+# Confidence threshold for license detection
+confidence-threshold = 0.95
+
+# List of explicitly allowed licenses
+# All other licenses are denied by default (including all GPL variants)
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "CC0-1.0",
+    "Unlicense",
+    "MPL-2.0",
+]
+
+# Clarification for ring crate which has a complex license
+[[licenses.clarify]]
+name = "ring"
+expression = "MIT AND ISC AND OpenSSL"
+license-files = [
+    { path = "LICENSE", hash = 0xbd0eed23 },
+]
+
+# Private crates (workspace members) are ignored
+[licenses.private]
+ignore = true
+registries = []
