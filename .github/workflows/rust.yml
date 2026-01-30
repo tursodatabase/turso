@@ -139,7 +139,7 @@ jobs:
         env:
           SCCACHE_GHA_ENABLED: "true"
           RUSTC_WRAPPER: "sccache"
-          RUSTFLAGS: "--cfg tokio_unstable --cfg shuttle"
+          RUSTFLAGS: "--cfg shuttle"
         run: |
           cargo run -p turso_stress -- --check-uncontrolled-nondeterminism
 
