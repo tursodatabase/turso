@@ -40,8 +40,8 @@ use crate::translate::fkeys::{
     open_read_table, stabilize_new_row_for_fk,
 };
 use crate::translate::plan::{
-    DeletePlan, EphemeralRowidMode, EvalAt, IndexMethodQuery, JoinedTable, Plan, QueryDestination,
-    ResultSetColumn, Search,
+    DeletePlan, EphemeralRowidMode, EvalAt, IndexMethodQuery, JoinedTable, NonFromClauseSubquery,
+    Plan, QueryDestination, ResultSetColumn, Search,
 };
 use crate::translate::planner::ROWID_STRS;
 use crate::translate::planner::{table_mask_from_expr, TableMask};
@@ -62,20 +62,36 @@ use crate::vdbe::{insn::Insn, BranchOffset, CursorID};
 use crate::{bail_parse_error, emit_explain, Result, SymbolTable};
 use crate::{turso_assert, Connection, QueryMode};
 
-/// Initialize EXISTS subquery result registers to 0.
-/// This is needed because for correlated subqueries, the result_reg is only set inside
-/// the loop. If the loop never runs (empty table), we need a sensible default (0 = false).
-fn init_exists_result_regs(program: &mut ProgramBuilder, expr: &ast::Expr) {
+/// Initialize EXISTS subquery result registers to 0, but only for subqueries that haven't
+/// been evaluated yet (i.e., correlated subqueries that will be evaluated in the loop).
+/// Non-correlated EXISTS subqueries are evaluated before the loop and their result_reg
+/// is already properly initialized and populated by emit_non_from_clause_subquery.
+fn init_exists_result_regs(
+    program: &mut ProgramBuilder,
+    expr: &ast::Expr,
+    non_from_clause_subqueries: &[NonFromClauseSubquery],
+) {
     let _ = walk_expr(expr, &mut |e| {
         if let ast::Expr::SubqueryResult {
+            subquery_id,
             query_type: SubqueryType::Exists { result_reg },
             ..
         } = e
         {
-            program.emit_insn(Insn::Integer {
-                value: 0,
-                dest: *result_reg,
-            });
+            // Only initialize if the subquery hasn't been evaluated yet.
+            // Non-correlated EXISTS subqueries are evaluated before the loop and their
+            // result_reg is already set correctly. Initializing them here would overwrite
+            // the correct result with 0.
+            let already_evaluated = non_from_clause_subqueries
+                .iter()
+                .find(|s| s.internal_id == *subquery_id)
+                .is_some_and(|s| s.has_been_evaluated());
+            if !already_evaluated {
+                program.emit_insn(Insn::Integer {
+                    value: 0,
+                    dest: *result_reg,
+                });
+            }
         }
         Ok(WalkControl::Continue)
     });
@@ -1152,10 +1168,11 @@ pub fn emit_query<'a>(
     // result_regs to 0. EXISTS returns 0 (not NULL) when the subquery is never evaluated
     // (correlated EXISTS in empty loop). Non-aggregate columns themselves are evaluated
     // after the loop in emit_ungrouped_aggregation if the loop never ran.
+    // We only initialize EXISTS subqueries that haven't been evaluated yet (correlated ones).
     if has_ungrouped_nonagg_cols {
         for rc in plan.result_columns.iter() {
             if !rc.contains_aggregates {
-                init_exists_result_regs(program, &rc.expr);
+                init_exists_result_regs(program, &rc.expr, &plan.non_from_clause_subqueries);
             }
         }
     }
