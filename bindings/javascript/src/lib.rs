@@ -160,6 +160,8 @@ pub struct DatabaseOpts {
     pub timeout: Option<u32>,
     pub file_must_exist: Option<bool>,
     pub tracing: Option<String>,
+    /// Experimental features to enable
+    pub experimental: Option<Vec<String>>,
     /// Optional encryption configuration for local database encryption
     pub encryption: Option<EncryptionOpts>,
 }
@@ -201,6 +203,7 @@ fn connect_sync(db: &DatabaseInner) -> napi::Result<()> {
 
     let mut flags = turso_core::OpenFlags::Create;
     let mut busy_timeout = None;
+    let mut core_opts = turso_core::DatabaseOpts::new();
     let mut encryption_opts = None;
     if let Some(opts) = &db.opts {
         if opts.readonly == Some(true) {
@@ -213,19 +216,30 @@ fn connect_sync(db: &DatabaseInner) -> napi::Result<()> {
         if let Some(timeout) = opts.timeout {
             busy_timeout = Some(std::time::Duration::from_millis(timeout as u64));
         }
+        if let Some(experimental) = &opts.experimental {
+            for feature in experimental {
+                core_opts = match feature.as_str() {
+                    "views" => core_opts.with_views(true),
+                    "strict" => core_opts.with_strict(true),
+                    "encryption" => core_opts.with_encryption(true),
+                    "index_method" => core_opts.with_index_method(true),
+                    "autovacuum" => core_opts.with_autovacuum(true),
+                    "triggers" => core_opts.with_triggers(true),
+                    "attach" => core_opts.with_attach(true),
+                    _ => core_opts,
+                };
+            }
+        }
         if let Some(encryption) = &opts.encryption {
             encryption_opts = Some(turso_core::EncryptionOpts {
                 cipher: encryption.cipher.as_str().to_string(),
                 hexkey: encryption.hexkey.clone(),
             });
+            // Ensure encryption is enabled if encryption opts are provided
+            core_opts = core_opts.with_encryption(true);
         }
     }
     let io = &db.io;
-    let db_opts = if encryption_opts.is_some() {
-        turso_core::DatabaseOpts::new().with_encryption(true)
-    } else {
-        turso_core::DatabaseOpts::new()
-    };
     // Parse encryption key if encryption options are provided
     let encryption_key = if let Some(opts) = &db.opts {
         if let Some(encryption) = &opts.encryption {
@@ -244,7 +258,7 @@ fn connect_sync(db: &DatabaseInner) -> napi::Result<()> {
         io.clone(),
         &db.path,
         flags,
-        db_opts,
+        core_opts,
         encryption_opts,
     )
     .map_err(|e| to_generic_error(&format!("failed to open database {}", db.path), e))?;

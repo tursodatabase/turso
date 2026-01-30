@@ -1,3 +1,5 @@
+export type ExperimentalFeature = 'views' | 'strict' | 'encryption' | 'index_method' | 'autovacuum' | 'triggers' | 'attach';
+
 /** Supported encryption ciphers for local database encryption. */
 export type EncryptionCipher = 'aes128gcm' | 'aes256gcm' | 'aegis256' | 'aegis256x2' | 'aegis128l' | 'aegis128x2' | 'aegis128x4'
 
@@ -13,6 +15,8 @@ export interface DatabaseOpts {
     fileMustExist?: boolean,
     timeout?: number
     tracing?: 'info' | 'debug' | 'trace'
+    /** Experimental features to enable */
+    experimental?: ExperimentalFeature[]
     /** Optional local encryption configuration */
     encryption?: EncryptionOpts
 }

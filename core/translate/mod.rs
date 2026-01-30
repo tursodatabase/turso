@@ -154,7 +154,7 @@ pub fn translate_inner(
         }
         ast::Stmt::Analyze { name } => translate_analyze(name, resolver, program)?,
         ast::Stmt::Attach { expr, db_name, key } => {
-            attach::translate_attach(&expr, resolver, &db_name, &key, program)?
+            attach::translate_attach(&expr, resolver, &db_name, &key, program, connection.clone())?
         }
         ast::Stmt::Begin { typ, name } => translate_tx_begin(typ, name, resolver.schema, program)?,
         ast::Stmt::Commit { name } => translate_tx_commit(name, program)?,
@@ -261,7 +261,9 @@ pub fn translate_inner(
                 connection,
             )?
         }
-        ast::Stmt::Detach { name } => attach::translate_detach(&name, resolver, program)?,
+        ast::Stmt::Detach { name } => {
+            attach::translate_detach(&name, resolver, program, connection.clone())?
+        }
         ast::Stmt::DropIndex {
             if_exists,
             idx_name,

@@ -136,6 +136,7 @@ pub struct DatabaseOpts {
     pub enable_index_method: bool,
     pub enable_autovacuum: bool,
     pub enable_triggers: bool,
+    pub enable_attach: bool,
     enable_load_extension: bool,
 }
 
@@ -177,6 +178,11 @@ impl DatabaseOpts {
 
     pub fn with_triggers(mut self, enable: bool) -> Self {
         self.enable_triggers = enable;
+        self
+    }
+
+    pub fn with_attach(mut self, enable: bool) -> Self {
+        self.enable_attach = enable;
         self
     }
 }
@@ -1402,6 +1408,10 @@ impl Database {
         self.opts.enable_triggers
     }
 
+    pub fn experimental_attach_enabled(&self) -> bool {
+        self.opts.enable_attach
+    }
+
     /// check if database is currently in MVCC mode
     pub fn mvcc_enabled(&self) -> bool {
         self.mv_store.load().is_some()
@@ -1584,6 +1594,7 @@ impl DatabaseCatalog {
         inverted.trailing_zeros() as usize
     }
 }
+
 pub struct QueryRunner<'a> {
     parser: Parser<'a>,
     conn: &'a Arc<Connection>,

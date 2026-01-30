@@ -8,7 +8,7 @@ TURSODB="$PROJECT_ROOT/target/debug/tursodb"
 
 # Add experimental features for testing
 # Note: MVCC is enabled via PRAGMA journal_mode = 'experimental_mvcc'
-EXPERIMENTAL_FLAGS="--experimental-views --experimental-strict --experimental-triggers"
+EXPERIMENTAL_FLAGS="--experimental-views --experimental-strict --experimental-triggers --experimental-attach"
 
 # if RUST_LOG is non-empty, enable tracing output
 if [ -n "$RUST_LOG" ]; then

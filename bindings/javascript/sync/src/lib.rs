@@ -237,6 +237,7 @@ impl SyncEngine {
                 readonly: None,
                 timeout: None,
                 tracing: opts.tracing.clone(),
+                experimental: None,
                 encryption: None, // Local encryption not supported in sync mode
             }),
         )?));

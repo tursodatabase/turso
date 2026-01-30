@@ -1110,6 +1110,10 @@ impl Connection {
         self.db.experimental_triggers_enabled()
     }
 
+    pub fn experimental_attach_enabled(&self) -> bool {
+        self.db.experimental_attach_enabled()
+    }
+
     pub fn mvcc_enabled(&self) -> bool {
         self.db.mvcc_enabled()
     }
