@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.4.4 -- 2026-01-30
+
+### Added
+
+* Implement simple strategy to restart WAL log if possible (Nikita Sivukhin)
+* core/mvcc: Add support for synchronous off mode (Pekka Enberg)
+
+### Updated
+* Remove unused lints, variables and functions (Pedro Muniz)
+* WAL auto truncation: increase epoch to prevent stale pages reuse (Nikita Sivukhin)
+* Refactor core/lib.rs Connection impl out to its own file (Preston Thorpe)
+* Replace GPL-2.0 bloom crate with MIT-licensed fastbloom (Jussi Saurio)
+* core: Use fast monotonic time when possible (Pekka Enberg)
+
+### Fixed
+* Fix wal checkpoint (Nikita Sivukhin)
+* Busy snapshot bugfix (Nikita Sivukhin)
+* fix(vdbe): CHAR() function should handle full Unicode range (Mikaël Francoeur)
+* do not call unlock_after_restart in case of error during wal truncation - because we already released these locks earlier (Nikita Sivukhin)
+* properly unlock WriteLock if restart failed and ignore Busy errors when attempt to restart WAL file failed (Nikita Sivukhin)
+* Checkpoint restart fix (Nikita Sivukhin)
+* core/vdbe/sorter: Propagate write errors instead of corrupting data (Preston Thorpe)
+* fix/connect: read page1 in transaction to prevent illegal WAL read (Jussi Saurio)
+* fix(parser): reject duplicate PRIMARY KEY clauses on a single column (Mikaël Francoeur)
+* fix: fsync DB file before truncating WAL after checkpoint (Jussi Saurio)
+* fix/vdbe: convert BusySnapshot to Busy if conn rolled back (Jussi Saurio)
+* sdk-kit: Export busy snapshot error to callers (Pekka Enberg)
+
 ## 0.4.3 -- 2026-01-12
 
 ### Added
