@@ -217,95 +217,63 @@ impl Value {
     /// Generates the Soundex code for a given word
     pub fn exec_soundex(&self) -> Value {
         let s = match self {
+            Value::Text(s) => s.as_str(),
             Value::Null => return Value::build_text("?000"),
-            Value::Text(s) => {
-                // return ?000 if non ASCII alphabet character is found
-                if !s.as_str().chars().all(|c| c.is_ascii_alphabetic()) {
-                    return Value::build_text("?000");
-                }
-                s.clone()
-            }
-            _ => return Value::build_text("?000"), // For unsupported types, return NULL
+            _ => return Value::build_text("?000"),
         };
 
-        // Remove numbers and spaces
-        let word: String = s
-            .as_str()
-            .chars()
-            .filter(|c| !c.is_ascii_digit())
-            .collect::<String>()
-            .replace(" ", "");
-        if word.is_empty() {
-            return Value::build_text("0000");
+        if s.bytes().any(|b| !b.is_ascii_alphabetic()) {
+            return Value::build_text("?000");
         }
 
-        let soundex_code = |c| match c {
-            'b' | 'f' | 'p' | 'v' => Some('1'),
-            'c' | 'g' | 'j' | 'k' | 'q' | 's' | 'x' | 'z' => Some('2'),
-            'd' | 't' => Some('3'),
-            'l' => Some('4'),
-            'm' | 'n' => Some('5'),
-            'r' => Some('6'),
-            _ => None,
+        let mut bytes = s.bytes();
+        let Some(first_char) = bytes.next() else {
+            return Value::build_text("?000");
         };
 
-        // Convert the word to lowercase for consistent lookups
-        let word = word.to_lowercase();
-        let first_letter = word
-            .chars()
-            .next()
-            .expect("word should not be empty after validation");
-
-        // Remove all occurrences of 'h' and 'w' except the first letter
-        let code: String = word
-            .chars()
-            .skip(1)
-            .filter(|&ch| ch != 'h' && ch != 'w')
-            .fold(first_letter.to_string(), |mut acc, ch| {
-                acc.push(ch);
-                acc
-            });
-
-        // Replace consonants with digits based on Soundex mapping
-        let tmp: String = code
-            .chars()
-            .map(|ch| match soundex_code(ch) {
-                Some(code) => code.to_string(),
-                None => ch.to_string(),
-            })
-            .collect();
-
-        // Remove adjacent same digits
-        let tmp = tmp.chars().fold(String::new(), |mut acc, ch| {
-            if !acc.ends_with(ch) {
-                acc.push(ch);
+        let first_upper = first_char.to_ascii_uppercase();
+        let mut result = String::with_capacity(4);
+        result.push(first_upper as char);
+        let get_code = |b: u8| -> Option<char> {
+            match b.to_ascii_lowercase() {
+                b'b' | b'f' | b'p' | b'v' => Some('1'),
+                b'c' | b'g' | b'j' | b'k' | b'q' | b's' | b'x' | b'z' => Some('2'),
+                b'd' | b't' => Some('3'),
+                b'l' => Some('4'),
+                b'm' | b'n' => Some('5'),
+                b'r' => Some('6'),
+                _ => None, // a, e, i, o, u, y, h, w
             }
-            acc
-        });
+        };
 
-        // Remove all occurrences of a, e, i, o, u, y except the first letter
-        let mut result = tmp
-            .chars()
-            .enumerate()
-            .filter(|(i, ch)| *i == 0 || !matches!(ch, 'a' | 'e' | 'i' | 'o' | 'u' | 'y'))
-            .map(|(_, ch)| ch)
-            .collect::<String>();
+        let mut prev_code = get_code(first_char);
 
-        // If the first symbol is a digit, replace it with the saved first letter
-        if let Some(first_digit) = result.chars().next() {
-            if first_digit.is_ascii_digit() {
-                result.replace_range(0..1, &first_letter.to_string());
+        for b in bytes {
+            if result.len() >= 4 {
+                break;
+            }
+
+            // H and W are ignored completely in this step for continuity checks
+            let lower = b.to_ascii_lowercase();
+            if lower == b'h' || lower == b'w' {
+                continue;
+            }
+
+            let code = get_code(b);
+            if code.is_some() && code != prev_code {
+                result.push(code.unwrap());
+                prev_code = code;
+            } else if code.is_none() {
+                // Reset previous code for vowels/separators (a,e,i,o,u,y)
+                prev_code = None;
             }
         }
 
-        // Append zeros if the result contains less than 4 characters
         while result.len() < 4 {
             result.push('0');
         }
 
-        // Retain the first 4 characters and convert to uppercase
-        result.truncate(4);
-        Value::build_text(result.to_uppercase())
+        Value::build_text(result)
     }
 
     pub fn exec_abs(&self) -> Result<Self> {
