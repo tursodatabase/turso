@@ -20,6 +20,27 @@ This document describes the compatibility of Turso with SQLite.
       - [Date and time functions](#date-and-time-functions)
       - [JSON functions](#json-functions)
   - [SQLite C API](#sqlite-c-api)
+    - [Database Connection](#database-connection)
+    - [Prepared Statements](#prepared-statements)
+    - [Binding Parameters](#binding-parameters)
+    - [Result Columns](#result-columns)
+    - [Result Values](#result-values-sqlite3_value)
+    - [Error Handling](#error-handling)
+    - [Changes and Row IDs](#changes-and-row-ids)
+    - [Memory Management](#memory-management)
+    - [Callback Functions](#callback-functions)
+    - [User-Defined Functions](#user-defined-functions)
+    - [Collation Functions](#collation-functions)
+    - [Backup API](#backup-api)
+    - [BLOB I/O](#blob-io)
+    - [WAL Functions](#wal-functions)
+    - [Utility Functions](#utility-functions)
+    - [Table Metadata](#table-metadata)
+    - [Virtual Tables](#virtual-tables)
+    - [Loadable Extensions](#loadable-extensions)
+    - [Serialization](#serialization)
+    - [Miscellaneous](#miscellaneous)
+    - [Turso-specific Extensions](#turso-specific-extensions)
   - [SQLite VDBE opcodes](#sqlite-vdbe-opcodes)
   - [SQLite journaling modes](#sqlite-journaling-modes)
   - [Extensions](#extensions)
@@ -27,6 +48,11 @@ This document describes the compatibility of Turso with SQLite.
     - [regexp](#regexp)
     - [Vector](#vector)
     - [Time](#time)
+    - [Full-Text Search (FTS)](#full-text-search-fts)
+    - [CSV](#csv)
+    - [Percentile](#percentile)
+    - [Table-Valued Functions](#table-valued-functions)
+    - [Internal Virtual Tables](#internal-virtual-tables)
 
 ## Overview
 
@@ -42,7 +68,6 @@ Turso aims to be fully compatible with SQLite, with opt-in features not supporte
 
 * ⛔️ Concurrent access from multiple processes is not supported.
 * ⛔️ Savepoints are not supported.
-* ⛔️ Triggers are not supported.
 * ⛔️ Vacuum is not supported.
 
 ## SQLite query language
@@ -72,6 +97,7 @@ Turso aims to be fully compatible with SQLite, with opt-in features not supporte
 | EXPLAIN                   | Yes     |                                                                                   |
 | INDEXED BY                | No      |                                                                                   |
 | INSERT                    | Yes     |                                                                                   |
+| INSERT ... ON CONFLICT (UPSERT) | Yes |                                                                                   |
 | ON CONFLICT clause        | Yes     |                                                                                   |
 | REINDEX                   | No      |                                                                                   |
 | RELEASE SAVEPOINT         | No      |                                                                                   |
@@ -87,7 +113,7 @@ Turso aims to be fully compatible with SQLite, with opt-in features not supporte
 | SELECT ... GROUP BY       | Yes     |                                                                                   |
 | SELECT ... HAVING         | Yes     |                                                                                   |
 | SELECT ... JOIN           | Yes     |                                                                                   |
-| SELECT ... CROSS JOIN     | Yes     | SQLite CROSS JOIN means "do not reorder joins". We don't support that yet anyway. |
+| SELECT ... CROSS JOIN     | No     | SQLite CROSS JOIN means "do not reorder joins". |
 | SELECT ... INNER JOIN     | Yes     |                                                                                   |
 | SELECT ... OUTER JOIN     | Partial | no RIGHT JOIN                                                                     |
 | SELECT ... JOIN USING     | Yes     |                                                                                   |
@@ -107,8 +133,7 @@ Turso aims to be fully compatible with SQLite, with opt-in features not supporte
 | PRAGMA application_id            | Yes        |                                              |
 | PRAGMA auto_vacuum               | No         |                                              |
 | PRAGMA automatic_index           | No         |                                              |
-| PRAGMA busy_timeout              | No         |                                              |
-| PRAGMA busy_timeout              | No         |                                              |
+| PRAGMA busy_timeout              | Yes         |                                              |
 | PRAGMA cache_size                | Yes        |                                              |
 | PRAGMA cache_spill               | Partial    | Enabled/Disabled only                        |
 | PRAGMA case_sensitive_like       | Not Needed | deprecated in SQLite                         |
@@ -126,7 +151,7 @@ Turso aims to be fully compatible with SQLite, with opt-in features not supporte
 | PRAGMA encoding                  | Yes        |                                              |
 | PRAGMA foreign_key_check         | No         |                                              |
 | PRAGMA foreign_key_list          | No         |                                              |
-| PRAGMA foreign_keys              | No         |                                              |
+| PRAGMA foreign_keys              | Yes         |                                              |
 | PRAGMA freelist_count            | Yes        |                                              |
 | PRAGMA full_column_names         | Not Needed | deprecated in SQLite                         |
 | PRAGMA fullsync                  | No         |                                              |
@@ -223,6 +248,7 @@ Feature support of [sqlite expr syntax](https://www.sqlite.org/lang_expr.html).
 | glob(X,Y)                    | Yes     |                                                      |
 | hex(X)                       | Yes     |                                                      |
 | ifnull(X,Y)                  | Yes     |                                                      |
+| if(X,Y,Z)                    | Yes     | Alias of iif                                         |
 | iif(X,Y,Z)                   | Yes     |                                                      |
 | instr(X,Y)                   | Yes     |                                                      |
 | last_insert_rowid()          | Yes     |                                                      |
@@ -231,7 +257,7 @@ Feature support of [sqlite expr syntax](https://www.sqlite.org/lang_expr.html).
 | like(X,Y,Z)                  | Yes     |                                                      |
 | likelihood(X,Y)              | Yes     |                                                      |
 | likely(X)                    | Yes     |                                                      |
-| load_extension(X)            | Yes     | sqlite3 extensions not yet supported                 |
+| load_extension(X)            | Partial | Only Turso-native extensions, not SQLite .so/.dll    |
 | load_extension(X,Y)          | No      |                                                      |
 | lower(X)                     | Yes     |                                                      |
 | ltrim(X)                     | Yes     |                                                      |
@@ -269,6 +295,7 @@ Feature support of [sqlite expr syntax](https://www.sqlite.org/lang_expr.html).
 | unicode(X)                   | Yes     |                                                      |
 | unlikely(X)                  | Yes     |                                                      |
 | upper(X)                     | Yes     |                                                      |
+| unistr(X)                    | No      |                                                      |
 | zeroblob(N)                  | Yes     |                                                      |
 
 #### Mathematical functions
@@ -311,7 +338,7 @@ Feature support of [sqlite expr syntax](https://www.sqlite.org/lang_expr.html).
 | Function                     | Status  | Comment |
 |------------------------------|---------|---------|
 | avg(X)                       | Yes     |         |
-| count()                      | Yes     |         |
+| count(X)                     | Yes     |         |
 | count(*)                     | Yes     |         |
 | group_concat(X)              | Yes     |         |
 | group_concat(X,Y)            | Yes     |         |
@@ -320,6 +347,11 @@ Feature support of [sqlite expr syntax](https://www.sqlite.org/lang_expr.html).
 | min(X)                       | Yes     |         |
 | sum(X)                       | Yes     |         |
 | total(X)                     | Yes     |         |
+| median(X)                    | Yes     | Requires percentile extension                        |
+| percentile(Y,P)              | Yes     | Requires percentile extension                        |
+| percentile_cont(Y,P)         | Yes     | Requires percentile extension                        |
+| percentile_disc(Y,P)         | Yes     | Requires percentile extension                        |
+| stddev(X)                    | Yes     | Turso extension                                      |
 
 #### Date and time functions
 
@@ -403,14 +435,335 @@ Modifiers:
 
 ## SQLite C API
 
-| Interface           | Status  | Comment |
-|---------------------|---------|---------|
-| sqlite3_open        | Partial |         |
-| sqlite3_close       | Yes     |         |
-| sqlite3_prepare     | Partial |         |
-| sqlite3_finalize    | Yes     |         |
-| sqlite3_step        | Yes     |         |
-| sqlite3_column_text | Yes     |         |
+### Database Connection
+
+| Interface              | Status  | Comment |
+|------------------------|---------|---------|
+| sqlite3_open           | Yes     |         |
+| sqlite3_open_v2        | Partial | Delegates to sqlite3_open, flags/VFS ignored |
+| sqlite3_open16         | No      |         |
+| sqlite3_close          | Yes     |         |
+| sqlite3_close_v2       | Yes     | Same as sqlite3_close |
+| sqlite3_db_filename    | Yes     |         |
+| sqlite3_db_config      | No      | Stub    |
+| sqlite3_db_handle      | No      | Stub    |
+| sqlite3_db_readonly    | No      |         |
+| sqlite3_db_status      | No      |         |
+| sqlite3_db_cacheflush  | No      |         |
+| sqlite3_db_release_memory | No   |         |
+| sqlite3_db_name        | No      |         |
+| sqlite3_db_mutex       | No      |         |
+| sqlite3_get_autocommit | Yes     |         |
+| sqlite3_limit          | No      | Stub    |
+| sqlite3_initialize     | Yes     |         |
+| sqlite3_shutdown       | Yes     |         |
+| sqlite3_config         | No      |         |
+
+### Prepared Statements
+
+| Interface                   | Status  | Comment |
+|-----------------------------|---------|---------|
+| sqlite3_prepare             | No      |         |
+| sqlite3_prepare_v2          | Yes     |         |
+| sqlite3_prepare_v3          | No      |         |
+| sqlite3_prepare16           | No      |         |
+| sqlite3_prepare16_v2        | No      |         |
+| sqlite3_finalize            | Yes     |         |
+| sqlite3_step                | Yes     |         |
+| sqlite3_reset               | Yes     |         |
+| sqlite3_exec                | Yes     |         |
+| sqlite3_stmt_readonly       | No      | Stub    |
+| sqlite3_stmt_busy           | No      | Stub    |
+| sqlite3_stmt_status         | No      |         |
+| sqlite3_sql                 | No      |         |
+| sqlite3_expanded_sql        | No      | Stub    |
+| sqlite3_normalized_sql      | No      |         |
+| sqlite3_next_stmt           | Yes     |         |
+
+### Binding Parameters
+
+| Interface                    | Status  | Comment |
+|------------------------------|---------|---------|
+| sqlite3_bind_parameter_count | Yes     |         |
+| sqlite3_bind_parameter_name  | Yes     |         |
+| sqlite3_bind_parameter_index | Yes     |         |
+| sqlite3_bind_null            | Yes     |         |
+| sqlite3_bind_int             | Yes     |         |
+| sqlite3_bind_int64           | Yes     |         |
+| sqlite3_bind_double          | Yes     |         |
+| sqlite3_bind_text            | Yes     |         |
+| sqlite3_bind_text16          | No      |         |
+| sqlite3_bind_text64          | No      |         |
+| sqlite3_bind_blob            | Yes     |         |
+| sqlite3_bind_blob64          | No      |         |
+| sqlite3_bind_value           | No      |         |
+| sqlite3_bind_pointer         | No      |         |
+| sqlite3_bind_zeroblob        | No      |         |
+| sqlite3_bind_zeroblob64      | No      |         |
+| sqlite3_clear_bindings       | Yes     |         |
+
+### Result Columns
+
+| Interface                | Status  | Comment |
+|--------------------------|---------|---------|
+| sqlite3_column_count     | Yes     |         |
+| sqlite3_column_name      | Yes     |         |
+| sqlite3_column_name16    | No      |         |
+| sqlite3_column_decltype  | Yes     |         |
+| sqlite3_column_decltype16| No      |         |
+| sqlite3_column_type      | Yes     |         |
+| sqlite3_column_int       | Yes     |         |
+| sqlite3_column_int64     | Yes     |         |
+| sqlite3_column_double    | Yes     |         |
+| sqlite3_column_text      | Yes     |         |
+| sqlite3_column_text16    | No      |         |
+| sqlite3_column_blob      | Yes     |         |
+| sqlite3_column_bytes     | Yes     |         |
+| sqlite3_column_bytes16   | No      |         |
+| sqlite3_column_value     | No      |         |
+| sqlite3_column_table_name| Yes     |         |
+| sqlite3_column_database_name | No  |         |
+| sqlite3_column_origin_name | No    |         |
+| sqlite3_data_count       | Yes     |         |
+
+### Result Values (sqlite3_value)
+
+| Interface              | Status  | Comment |
+|------------------------|---------|---------|
+| sqlite3_value_type     | Yes     |         |
+| sqlite3_value_int      | No      |         |
+| sqlite3_value_int64    | Yes     |         |
+| sqlite3_value_double   | Yes     |         |
+| sqlite3_value_text     | Yes     |         |
+| sqlite3_value_text16   | No      |         |
+| sqlite3_value_blob     | Yes     |         |
+| sqlite3_value_bytes    | Yes     |         |
+| sqlite3_value_bytes16  | No      |         |
+| sqlite3_value_dup      | No      |         |
+| sqlite3_value_free     | No      |         |
+| sqlite3_value_nochange | No      |         |
+| sqlite3_value_frombind | No      |         |
+| sqlite3_value_subtype  | No      |         |
+| sqlite3_value_pointer  | No      |         |
+| sqlite3_value_encoding | No      |         |
+| sqlite3_value_numeric_type | No  |         |
+
+### Error Handling
+
+| Interface              | Status  | Comment |
+|------------------------|---------|---------|
+| sqlite3_errcode        | Yes     |         |
+| sqlite3_errmsg         | Yes     |         |
+| sqlite3_errmsg16       | No      |         |
+| sqlite3_errstr         | Yes     |         |
+| sqlite3_extended_errcode | Yes   |         |
+| sqlite3_extended_result_codes | No |        |
+| sqlite3_error_offset   | No      |         |
+| sqlite3_system_errno   | No      |         |
+
+### Changes and Row IDs
+
+| Interface              | Status  | Comment |
+|------------------------|---------|---------|
+| sqlite3_changes        | Yes     |         |
+| sqlite3_changes64      | Yes     |         |
+| sqlite3_total_changes  | Yes     |         |
+| sqlite3_total_changes64| No      |         |
+| sqlite3_last_insert_rowid | Yes  |         |
+| sqlite3_set_last_insert_rowid | No |       |
+
+### Memory Management
+
+| Interface              | Status  | Comment |
+|------------------------|---------|---------|
+| sqlite3_malloc         | Yes     |         |
+| sqlite3_malloc64       | Yes     |         |
+| sqlite3_free           | Yes     |         |
+| sqlite3_realloc        | No      |         |
+| sqlite3_realloc64      | No      |         |
+| sqlite3_msize          | No      |         |
+| sqlite3_memory_used    | No      |         |
+| sqlite3_memory_highwater | No    |         |
+| sqlite3_soft_heap_limit64 | No   |         |
+| sqlite3_hard_heap_limit64 | No   |         |
+| sqlite3_release_memory | No      |         |
+
+### Callback Functions
+
+| Interface                | Status  | Comment |
+|--------------------------|---------|---------|
+| sqlite3_busy_handler     | Yes     |         |
+| sqlite3_busy_timeout     | Yes     |         |
+| sqlite3_trace_v2         | No      | Stub    |
+| sqlite3_progress_handler | No      | Stub    |
+| sqlite3_set_authorizer   | No      | Stub    |
+| sqlite3_commit_hook      | No      |         |
+| sqlite3_rollback_hook    | No      |         |
+| sqlite3_update_hook      | No      |         |
+| sqlite3_preupdate_hook   | No      |         |
+| sqlite3_unlock_notify    | No      |         |
+| sqlite3_wal_hook         | No      |         |
+
+### User-Defined Functions
+
+| Interface                    | Status  | Comment |
+|------------------------------|---------|---------|
+| sqlite3_create_function      | No      |         |
+| sqlite3_create_function_v2   | No      | Stub    |
+| sqlite3_create_function16    | No      |         |
+| sqlite3_create_window_function | No    | Stub    |
+| sqlite3_aggregate_context    | No      | Stub    |
+| sqlite3_user_data            | No      | Stub    |
+| sqlite3_context_db_handle    | No      | Stub    |
+| sqlite3_get_auxdata          | No      |         |
+| sqlite3_set_auxdata          | No      |         |
+| sqlite3_result_null          | No      | Stub    |
+| sqlite3_result_int           | No      |         |
+| sqlite3_result_int64         | No      | Stub    |
+| sqlite3_result_double        | No      | Stub    |
+| sqlite3_result_text          | No      | Stub    |
+| sqlite3_result_text16        | No      |         |
+| sqlite3_result_text64        | No      |         |
+| sqlite3_result_blob          | No      | Stub    |
+| sqlite3_result_blob64        | No      |         |
+| sqlite3_result_value         | No      |         |
+| sqlite3_result_pointer       | No      |         |
+| sqlite3_result_zeroblob      | No      |         |
+| sqlite3_result_zeroblob64    | No      |         |
+| sqlite3_result_error         | No      | Stub    |
+| sqlite3_result_error16       | No      |         |
+| sqlite3_result_error_code    | No      |         |
+| sqlite3_result_error_nomem   | No      | Stub    |
+| sqlite3_result_error_toobig  | No      | Stub    |
+| sqlite3_result_subtype       | No      |         |
+
+### Collation Functions
+
+| Interface                   | Status  | Comment |
+|-----------------------------|---------|---------|
+| sqlite3_create_collation    | No      |         |
+| sqlite3_create_collation_v2 | No      | Stub    |
+| sqlite3_create_collation16  | No      |         |
+| sqlite3_collation_needed    | No      |         |
+| sqlite3_collation_needed16  | No      |         |
+| sqlite3_stricmp             | No      | Stub    |
+| sqlite3_strnicmp            | No      |         |
+
+### Backup API
+
+| Interface                | Status  | Comment |
+|--------------------------|---------|---------|
+| sqlite3_backup_init      | No      | Stub    |
+| sqlite3_backup_step      | No      | Stub    |
+| sqlite3_backup_finish    | No      | Stub    |
+| sqlite3_backup_remaining | No      | Stub    |
+| sqlite3_backup_pagecount | No      | Stub    |
+
+### BLOB I/O
+
+| Interface              | Status  | Comment |
+|------------------------|---------|---------|
+| sqlite3_blob_open      | No      | Stub    |
+| sqlite3_blob_close     | No      | Stub    |
+| sqlite3_blob_bytes     | No      | Stub    |
+| sqlite3_blob_read      | No      | Stub    |
+| sqlite3_blob_write     | No      | Stub    |
+| sqlite3_blob_reopen    | No      |         |
+
+### WAL Functions
+
+| Interface                  | Status  | Comment |
+|----------------------------|---------|---------|
+| sqlite3_wal_checkpoint     | Yes     |         |
+| sqlite3_wal_checkpoint_v2  | Yes     |         |
+| sqlite3_wal_autocheckpoint | No      |         |
+| sqlite3_wal_hook           | No      |         |
+
+### Utility Functions
+
+| Interface              | Status  | Comment |
+|------------------------|---------|---------|
+| sqlite3_libversion     | Yes     | Returns "3.42.0" |
+| sqlite3_libversion_number | Yes  | Returns 3042000 |
+| sqlite3_sourceid       | No      |         |
+| sqlite3_threadsafe     | Yes     | Returns 1 |
+| sqlite3_complete       | No      | Stub    |
+| sqlite3_interrupt      | No      | Stub    |
+| sqlite3_sleep          | No      | Stub    |
+| sqlite3_randomness     | No      |         |
+| sqlite3_get_table      | Yes     |         |
+| sqlite3_free_table     | Yes     |         |
+| sqlite3_mprintf        | No      |         |
+| sqlite3_vmprintf       | No      |         |
+| sqlite3_snprintf       | No      |         |
+| sqlite3_vsnprintf      | No      |         |
+| sqlite3_strglob        | No      |         |
+| sqlite3_strlike        | No      |         |
+
+### Table Metadata
+
+| Interface                    | Status  | Comment |
+|------------------------------|---------|---------|
+| sqlite3_table_column_metadata | Yes    |         |
+
+### Virtual Tables
+
+| Interface                | Status  | Comment |
+|--------------------------|---------|---------|
+| sqlite3_create_module    | No      |         |
+| sqlite3_create_module_v2 | No      |         |
+| sqlite3_drop_modules     | No      |         |
+| sqlite3_declare_vtab     | No      |         |
+| sqlite3_overload_function| No      |         |
+| sqlite3_vtab_config      | No      |         |
+| sqlite3_vtab_on_conflict | No      |         |
+| sqlite3_vtab_nochange    | No      |         |
+| sqlite3_vtab_collation   | No      |         |
+| sqlite3_vtab_distinct    | No      |         |
+| sqlite3_vtab_in          | No      |         |
+| sqlite3_vtab_in_first    | No      |         |
+| sqlite3_vtab_in_next     | No      |         |
+| sqlite3_vtab_rhs_value   | No      |         |
+
+### Loadable Extensions
+
+| Interface                    | Status  | Comment |
+|------------------------------|---------|---------|
+| sqlite3_load_extension       | No      |         |
+| sqlite3_enable_load_extension| No      |         |
+| sqlite3_auto_extension       | No      |         |
+| sqlite3_cancel_auto_extension| No      |         |
+| sqlite3_reset_auto_extension | No      |         |
+
+### Serialization
+
+| Interface              | Status  | Comment |
+|------------------------|---------|---------|
+| sqlite3_serialize      | No      | Stub    |
+| sqlite3_deserialize    | No      | Stub    |
+
+### Miscellaneous
+
+| Interface                | Status  | Comment |
+|--------------------------|---------|---------|
+| sqlite3_keyword_count    | No      |         |
+| sqlite3_keyword_name     | No      |         |
+| sqlite3_keyword_check    | No      |         |
+| sqlite3_txn_state        | No      |         |
+| sqlite3_file_control     | No      |         |
+| sqlite3_status           | No      |         |
+| sqlite3_status64         | No      |         |
+| sqlite3_test_control     | No      | Testing only |
+| sqlite3_log              | No      |         |
+
+### Turso-specific Extensions
+
+| Interface                      | Status  | Comment |
+|--------------------------------|---------|---------|
+| libsql_wal_frame_count         | Yes     | Get WAL frame count |
+| libsql_wal_get_frame           | Yes     | Extract frame from WAL |
+| libsql_wal_insert_frame        | Yes     | Insert frame into WAL |
+| libsql_wal_disable_checkpoint  | Yes     | Disable checkpointing |
 
 ## SQLite VDBE opcodes
 
@@ -446,7 +799,7 @@ Modifiers:
 | Divide         | Yes    |         |
 | DropIndex      | Yes    |         |
 | DropTable      | Yes    |         |
-| DropTrigger    | No     |         |
+| DropTrigger    | Yes     |         |
 | EndCoroutine   | Yes    |         |
 | Eq             | Yes    |         |
 | Expire         | No     |         |
@@ -470,7 +823,7 @@ Modifiers:
 | IdxLT          | Yes    |         |
 | IdxRowid       | Yes    |         |
 | If             | Yes    |         |
-| IfNeg          | No     |         |
+| IfNeg          | Yes     |         |
 | IfNot          | Yes    |         |
 | IfPos          | Yes    |         |
 | IfZero         | No     |         |
@@ -518,7 +871,7 @@ Modifiers:
 | ParseSchema    | Yes    |         |
 | Permutation    | No     |         |
 | Prev           | Yes     |         |
-| Program        | No     |         |
+| Program        | Yes     |         |
 | ReadCookie     | Partial| no temp databases, only user_version supported |
 | Real           | Yes    |         |
 | RealAffinity   | Yes    |         |
@@ -531,9 +884,9 @@ Modifiers:
 | RowData        | Yes     |         |
 | RowId          | Yes    |         |
 | RowKey         | No     |         |
-| RowSetAdd      | No     |         |
-| RowSetRead     | No     |         |
-| RowSetTest     | No     |         |
+| RowSetAdd      | Yes     |         |
+| RowSetRead     | Yes    |         |
+| RowSetTest     | Yes     |         |
 | Rowid          | Yes    |         |
 | SCopy          | No     |         |
 | Savepoint      | No     |         |
@@ -551,7 +904,7 @@ Modifiers:
 | ShiftRight     | Yes    |         |
 | SoftNull       | Yes    |         |
 | Sort           | No     |         |
-| SorterCompare  | No     |         |
+| SorterCompare  | Yes     |         |
 | SorterData     | Yes    |         |
 | SorterInsert   | Yes    |         |
 | SorterNext     | Yes    |         |
@@ -687,3 +1040,49 @@ The `time` extension is compatible with [sqlean-time](https://github.com/nalgeon
 | dur_s()                                                             | Yes    |         |
 | dur_m()                                                             | Yes    |         |
 | dur_h()                                                             | Yes    |         |
+
+### Full-Text Search (FTS)
+
+Turso implements FTS using Tantivy instead of SQLite's FTS3/FTS4/FTS5.
+
+| Feature | Status | Comment |
+|---------|--------|---------|
+| CREATE INDEX ... USING fts | Yes | Turso-specific syntax |
+| fts_match() | Yes | |
+| fts_score() | Yes | BM25 relevance scoring |
+| fts_highlight() | Yes | |
+| MATCH operator | Yes | |
+| SQLite FTS3/FTS4/FTS5 | No | Use Turso FTS instead |
+| snippet() | No | |
+
+### CSV
+
+The CSV extension provides RFC 4180 compliant CSV file reading.
+
+| Feature | Status | Comment |
+|---------|--------|---------|
+| CSV virtual table | Yes | `CREATE VIRTUAL TABLE ... USING csv(...)` |
+
+### Percentile
+
+Statistical aggregate functions.
+
+| Function | Status | Comment |
+|----------|--------|---------|
+| median(X) | Yes | |
+| percentile(Y,P) | Yes | |
+| percentile_cont(Y,P) | Yes | |
+| percentile_disc(Y,P) | Yes | |
+
+### Table-Valued Functions
+
+| Function | Status | Comment |
+|----------|--------|---------|
+| generate_series(start, stop[, step]) | Yes | All parameters supported |
+| carray() | No | C-API specific |
+
+### Internal Virtual Tables
+
+| Virtual Table | Status | Comment |
+|---------------|--------|---------|
+| sqlite_dbpage | Partial | readonly, no attach support |
