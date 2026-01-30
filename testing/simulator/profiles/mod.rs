@@ -103,6 +103,10 @@ impl Profile {
             cache_size_pages: Some(200),
             query: QueryProfile {
                 gen_opts: Opts {
+                    table: TableOpts {
+                        generate_unique_constraints: true,
+                        ..Default::default()
+                    },
                     query: QueryOpts {
                         insert: InsertOpts {
                             min_rows: NonZeroU32::new(50).unwrap(),

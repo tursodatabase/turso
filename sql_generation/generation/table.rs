@@ -65,11 +65,12 @@ impl Arbitrary for Column {
         let name = Name::arbitrary(rng, context).0;
         let column_type = ColumnType::arbitrary(rng, context);
 
-        let constraints = if rng.random_bool(0.1) {
-            vec![turso_parser::ast::ColumnConstraint::Unique(None)]
-        } else {
-            vec![]
-        };
+        let constraints =
+            if context.opts().table.generate_unique_constraints && rng.random_bool(0.1) {
+                vec![turso_parser::ast::ColumnConstraint::Unique(None)]
+            } else {
+                vec![]
+            };
 
         Self {
             name,
