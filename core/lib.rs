@@ -779,6 +779,11 @@ impl Database {
                         .schema_guard
                         .as_mut()
                         .expect("schema_guard must be acquired in Init phase");
+                    // while we logically exclusively own schema as we hold DATABASE_MANAGER lock in the top level `open_with_flags_async_internal` function
+                    // at the moment we already created connection which cloned the schema internally
+                    // so, we can't use get_mut here for now
+                    //
+                    // it's not ideal but correctness is OK - before prepare connection call maybe_update_schema and in case of divergence update schema ref from the db + we always check connection cookie in the VDBE program itself
                     let schema = Arc::make_mut(&mut **guard);
                     schema.schema_version = header_schema_cookie;
 
@@ -805,6 +810,11 @@ impl Database {
                         .schema_guard
                         .as_mut()
                         .expect("schema_guard must be acquired in Init phase");
+                    // while we logically exclusively own schema as we hold DATABASE_MANAGER lock in the top level `open_with_flags_async_internal` function
+                    // at the moment we already created connection which cloned the schema internally
+                    // so, we can't use get_mut here for now
+                    //
+                    // it's not ideal but correctness is OK - before prepare connection call maybe_update_schema and in case of divergence update schema ref from the db + we always check connection cookie in the VDBE program itself
                     let schema = Arc::make_mut(&mut **guard);
 
                     let result = schema.make_from_btree(
