@@ -88,7 +88,7 @@ use crate::sync::{Mutex, RwLock};
 use turso_parser::ast::{self, ForeignKeyClause, Name, ResolveType};
 use turso_parser::parser::Parser;
 
-use super::{likeop::exec_glob, sorter::Sorter};
+use super::sorter::Sorter;
 
 #[cfg(feature = "json")]
 use crate::{
@@ -4951,31 +4951,39 @@ pub fn op_function(
                 state.registers[*dest] = Register::Value(result);
             }
             ScalarFunc::Glob => {
-                let pattern = &state.registers[*start_reg];
-                let text = &state.registers[*start_reg + 1];
-                let result = match (pattern.get_value(), text.get_value()) {
-                    (Value::Null, _) | (_, Value::Null) => Value::Null,
-                    (Value::Text(pattern), Value::Text(text)) => {
-                        let cache = if *constant_mask > 0 {
-                            Some(&mut state.regex_cache.glob)
-                        } else {
-                            None
-                        };
-                        Value::Integer(exec_glob(cache, pattern.as_str(), text.as_str()) as i64)
-                    }
-                    // Convert any other value types to text for GLOB comparison
-                    (pattern_val, text_val) => {
-                        let pattern_str = pattern_val.to_string();
-                        let text_str = text_val.to_string();
-                        let cache = if *constant_mask > 0 {
-                            Some(&mut state.regex_cache.glob)
-                        } else {
-                            None
-                        };
-                        Value::Integer(exec_glob(cache, &pattern_str, &text_str) as i64)
-                    }
-                };
-                state.registers[*dest] = Register::Value(result);
+                if arg_count != 2 {
+                    return Err(LimboError::ParseError(
+                        "wrong number of arguments to function GLOB()".to_string(),
+                    ));
+                }
+                let pattern_reg = &state.registers[*start_reg];
+                let match_reg = &state.registers[*start_reg + 1];
+
+                let pattern_value = pattern_reg.get_value();
+                let match_value = match_reg.get_value();
+
+                if pattern_value == &Value::Null || match_value == &Value::Null {
+                    state.registers[*dest] = Register::Value(Value::Null);
+                } else {
+                    let pattern_cow = match pattern_value {
+                        Value::Text(s) => std::borrow::Cow::Borrowed(s.as_str()),
+                        v => match v.exec_cast("TEXT") {
+                            Value::Text(s) => std::borrow::Cow::Owned(s.to_string()),
+                            _ => unreachable!("Cast to TEXT should yield Text"),
+                        },
+                    };
+
+                    let match_cow = match match_value {
+                        Value::Text(s) => std::borrow::Cow::Borrowed(s.as_str()),
+                        v => match v.exec_cast("TEXT") {
+                            Value::Text(s) => std::borrow::Cow::Owned(s.to_string()),
+                            _ => unreachable!("Cast to TEXT should yield Text"),
+                        },
+                    };
+
+                    let matches = Value::exec_glob(&pattern_cow, &match_cow)?;
+                    state.registers[*dest] = Register::Value(Value::Integer(matches as i64));
+                }
             }
             ScalarFunc::IfNull => {}
             ScalarFunc::Iif => {}
