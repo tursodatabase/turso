@@ -11,6 +11,7 @@ use crate::translate::planner::ROWID_STRS;
 use crate::types::IOResult;
 use crate::util::{exprs_are_equivalent, normalize_ident};
 use crate::vdbe::affinity::Affinity;
+use crate::{return_if_io, turso_assert};
 use turso_macros::AtomicEnum;
 
 #[derive(Debug, Clone, AtomicEnum)]
@@ -126,7 +127,7 @@ use crate::sync::Mutex;
 use crate::translate::collate::CollationSeq;
 use crate::translate::plan::{Plan, TableReferences};
 use crate::util::{
-    module_args_from_sql, module_name_from_sql, type_from_name, IOExt, UnparsedFromSqlIndex,
+    module_args_from_sql, module_name_from_sql, type_from_name, UnparsedFromSqlIndex,
 };
 use crate::Result;
 use crate::{
@@ -151,6 +152,64 @@ const SCHEMA_TABLE_NAME_ALT: &str = "sqlite_master";
 pub const SQLITE_SEQUENCE_TABLE_NAME: &str = "sqlite_sequence";
 pub const DBSP_TABLE_PREFIX: &str = "__turso_internal_dbsp_state_v";
 pub const TURSO_INTERNAL_PREFIX: &str = "__turso_internal_";
+
+/// Accumulators for schema loading - kept separate to avoid moving through state variants
+struct MakeFromBtreeAccumulators {
+    from_sql_indexes: Vec<UnparsedFromSqlIndex>,
+    automatic_indices: HashMap<String, Vec<(String, i64)>>,
+    /// Store DBSP state table root pages: view_name -> dbsp_state_root_page
+    dbsp_state_roots: HashMap<String, i64>,
+    /// Store DBSP state table index root pages: view_name -> dbsp_state_index_root_page
+    dbsp_state_index_roots: HashMap<String, i64>,
+    /// Store materialized view info (SQL and root page) for later creation
+    materialized_view_info: HashMap<String, (String, i64)>,
+}
+
+/// Phase tracking for async schema loading
+#[derive(Default, Debug)]
+pub enum MakeFromBtreePhase {
+    #[default]
+    Init,
+    Rewinding,
+    FetchingRecord,
+    Advancing,
+    Done,
+}
+
+/// State machine for async schema loading - passed by caller, not stored on Schema
+pub struct MakeFromBtreeState {
+    phase: MakeFromBtreePhase,
+    cursor: Option<BTreeCursor>,
+    accumulators: Option<MakeFromBtreeAccumulators>,
+    read_tx_active: bool,
+}
+
+impl Default for MakeFromBtreeState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MakeFromBtreeState {
+    pub fn new() -> Self {
+        Self {
+            phase: MakeFromBtreePhase::Init,
+            cursor: None,
+            accumulators: None,
+            read_tx_active: false,
+        }
+    }
+
+    /// Cleanup on error - ensures end_read_tx is called
+    pub fn cleanup(&mut self, pager: &Pager) {
+        if self.read_tx_active {
+            pager.end_read_tx();
+            self.read_tx_active = false;
+        }
+        self.cursor = None;
+        self.accumulators = None;
+    }
+}
 
 /// Used to refer to the implicit rowid column in tables without an alias during UPDATE
 pub const ROWID_SENTINEL: usize = usize::MAX;
@@ -560,103 +619,162 @@ impl Schema {
     }
 
     /// Update [Schema] by scanning the first root page (sqlite_schema)
+    /// Returns Result<IOResult<()>> to allow async operation with external IO loop
     pub fn make_from_btree(
         &mut self,
+        state: &mut MakeFromBtreeState,
         mv_cursor: Option<Arc<RwLock<MvCursor>>>,
-        pager: Arc<Pager>,
+        pager: &Arc<Pager>,
         syms: &SymbolTable,
         enable_triggers: bool,
-    ) -> Result<()> {
-        assert!(
-            mv_cursor.is_none(),
-            "mvcc not yet supported for make_from_btree"
-        );
-        let mut cursor = BTreeCursor::new_table(Arc::clone(&pager), 1, 10);
-
-        let mut from_sql_indexes = Vec::with_capacity(10);
-        let mut automatic_indices: HashMap<String, Vec<(String, i64)>> =
-            HashMap::with_capacity_and_hasher(10, FxBuildHasher);
-
-        // Store DBSP state table root pages: view_name -> dbsp_state_root_page
-        let mut dbsp_state_roots: HashMap<String, i64> = HashMap::default();
-        // Store DBSP state table index root pages: view_name -> dbsp_state_index_root_page
-        let mut dbsp_state_index_roots: HashMap<String, i64> = HashMap::default();
-        // Store materialized view info (SQL and root page) for later creation
-        let mut materialized_view_info: HashMap<String, (String, i64)> = HashMap::default();
-
-        pager.begin_read_tx()?;
-
-        pager.io.block(|| cursor.rewind())?;
-
-        loop {
-            let row = loop {
-                match cursor.record()? {
-                    IOResult::Done(r) => break r,
-                    IOResult::IO(io) => io.wait(&*pager.io)?,
-                }
-            };
-            let Some(row) = row else {
-                break;
-            };
-
-            // sqlite schema table has 5 columns: type, name, tbl_name, rootpage, sql
-            let ty_value = row.get_value(0)?;
-            let ValueRef::Text(ty) = ty_value else {
-                return Err(LimboError::ConversionError("Expected text value".into()));
-            };
-            let ValueRef::Text(name) = row.get_value(1)? else {
-                return Err(LimboError::ConversionError("Expected text value".into()));
-            };
-            let table_name_value = row.get_value(2)?;
-            let ValueRef::Text(table_name) = table_name_value else {
-                return Err(LimboError::ConversionError("Expected text value".into()));
-            };
-            let root_page_value = row.get_value(3)?;
-            let ValueRef::Integer(root_page) = root_page_value else {
-                return Err(LimboError::ConversionError("Expected integer value".into()));
-            };
-            let sql_value = row.get_value(4)?;
-            let sql_textref = match sql_value {
-                ValueRef::Text(sql) => Some(sql),
-                _ => None,
-            };
-            let sql = sql_textref.map(|s| s.as_str());
-
-            self.handle_schema_row(
-                &ty,
-                &name,
-                &table_name,
-                root_page,
-                sql,
-                syms,
-                &mut from_sql_indexes,
-                &mut automatic_indices,
-                &mut dbsp_state_roots,
-                &mut dbsp_state_index_roots,
-                &mut materialized_view_info,
-                None,
-                enable_triggers,
-            )?;
-
-            pager.io.block(|| cursor.next())?;
+    ) -> Result<IOResult<()>> {
+        let result = self.make_from_btree_internal(state, mv_cursor, pager, syms, enable_triggers);
+        if result.is_err() {
+            state.cleanup(pager);
+        } else if let Ok(IOResult::Done(..)) = result {
+            turso_assert!(
+                !state.read_tx_active,
+                "make_from_btree must properly cleanup internal state in case of success"
+            );
         }
+        result
+    }
 
-        pager.end_read_tx();
+    fn make_from_btree_internal(
+        &mut self,
+        state: &mut MakeFromBtreeState,
+        mv_cursor: Option<Arc<RwLock<MvCursor>>>,
+        pager: &Arc<Pager>,
+        syms: &SymbolTable,
+        enable_triggers: bool,
+    ) -> Result<IOResult<()>> {
+        loop {
+            tracing::debug!("make_from_btree: state.phase={:?}", state.phase);
+            match &state.phase {
+                MakeFromBtreePhase::Init => {
+                    assert!(
+                        mv_cursor.is_none(),
+                        "mvcc not yet supported for make_from_btree"
+                    );
 
-        self.populate_indices(
-            syms,
-            from_sql_indexes,
-            automatic_indices,
-            mv_cursor.is_some(),
-        )?;
+                    state.cursor = Some(BTreeCursor::new_table(Arc::clone(pager), 1, 10));
+                    pager.begin_read_tx()?;
+                    state.read_tx_active = true;
 
-        self.populate_materialized_views(
-            materialized_view_info,
-            dbsp_state_roots,
-            dbsp_state_index_roots,
-        )?;
+                    state.accumulators = Some(MakeFromBtreeAccumulators {
+                        from_sql_indexes: Vec::with_capacity(10),
+                        automatic_indices: HashMap::with_capacity_and_hasher(10, FxBuildHasher),
+                        dbsp_state_roots: HashMap::default(),
+                        dbsp_state_index_roots: HashMap::default(),
+                        materialized_view_info: HashMap::default(),
+                    });
 
-        Ok(())
+                    state.phase = MakeFromBtreePhase::Rewinding;
+                }
+
+                MakeFromBtreePhase::Rewinding => {
+                    let cursor = state
+                        .cursor
+                        .as_mut()
+                        .expect("cursor must be initialized in Init phase");
+                    return_if_io!(cursor.rewind());
+                    state.phase = MakeFromBtreePhase::FetchingRecord;
+                }
+
+                MakeFromBtreePhase::FetchingRecord => {
+                    let cursor = state
+                        .cursor
+                        .as_mut()
+                        .expect("cursor must be initialized in Init phase");
+                    let row = return_if_io!(cursor.record());
+
+                    let Some(row) = row else {
+                        // EOF - finalize
+                        pager.end_read_tx();
+                        state.read_tx_active = false;
+
+                        let acc = state
+                            .accumulators
+                            .take()
+                            .expect("accumulators must be initialized in Init phase");
+                        self.populate_indices(
+                            syms,
+                            acc.from_sql_indexes,
+                            acc.automatic_indices,
+                            mv_cursor.is_some(),
+                        )?;
+                        self.populate_materialized_views(
+                            acc.materialized_view_info,
+                            acc.dbsp_state_roots,
+                            acc.dbsp_state_index_roots,
+                        )?;
+
+                        state.cursor = None;
+                        state.phase = MakeFromBtreePhase::Done;
+                        return Ok(IOResult::Done(()));
+                    };
+
+                    // Process the row (no IO - CPU only)
+                    // sqlite schema table has 5 columns: type, name, tbl_name, rootpage, sql
+                    let ty_value = row.get_value(0)?;
+                    let ValueRef::Text(ty) = ty_value else {
+                        return Err(LimboError::ConversionError("Expected text value".into()));
+                    };
+                    let ValueRef::Text(name) = row.get_value(1)? else {
+                        return Err(LimboError::ConversionError("Expected text value".into()));
+                    };
+                    let table_name_value = row.get_value(2)?;
+                    let ValueRef::Text(table_name) = table_name_value else {
+                        return Err(LimboError::ConversionError("Expected text value".into()));
+                    };
+                    let root_page_value = row.get_value(3)?;
+                    let ValueRef::Integer(root_page) = root_page_value else {
+                        return Err(LimboError::ConversionError("Expected integer value".into()));
+                    };
+                    let sql_value = row.get_value(4)?;
+                    let sql_textref = match sql_value {
+                        ValueRef::Text(sql) => Some(sql),
+                        _ => None,
+                    };
+                    let sql = sql_textref.map(|s| s.as_str());
+
+                    let acc = state
+                        .accumulators
+                        .as_mut()
+                        .expect("accumulators must be initialized in Init phase");
+                    self.handle_schema_row(
+                        &ty,
+                        &name,
+                        &table_name,
+                        root_page,
+                        sql,
+                        syms,
+                        &mut acc.from_sql_indexes,
+                        &mut acc.automatic_indices,
+                        &mut acc.dbsp_state_roots,
+                        &mut acc.dbsp_state_index_roots,
+                        &mut acc.materialized_view_info,
+                        None,
+                        enable_triggers,
+                    )?;
+
+                    state.phase = MakeFromBtreePhase::Advancing;
+                }
+
+                MakeFromBtreePhase::Advancing => {
+                    let cursor = state
+                        .cursor
+                        .as_mut()
+                        .expect("cursor must be initialized in Init phase");
+                    return_if_io!(cursor.next());
+                    state.phase = MakeFromBtreePhase::FetchingRecord;
+                }
+
+                MakeFromBtreePhase::Done => {
+                    return Ok(IOResult::Done(()));
+                }
+            }
+        }
     }
 
     /// Populate indices parsed from the schema.

@@ -139,7 +139,9 @@ turso_status_code_t turso_database_new(
     /** Optional return error parameter (can be null) */
     const char **error_opt_out);
 
-/** Open database */
+/** Open database
+ *  Can return TURSO_IO result if async_io=true is set
+ */
 turso_status_code_t turso_database_open(
     const turso_database_t *database,
     /** Optional return error parameter (can be null) */

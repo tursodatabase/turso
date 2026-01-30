@@ -41,6 +41,21 @@ mod shuttle_adapter {
         pub fn try_lock(&self) -> Option<MutexGuard<'_, T>> {
             self.0.try_lock().ok().map(MutexGuard)
         }
+
+        /// Lock the mutex through an Arc, returning an owned guard that can be stored
+        pub fn lock_arc(self: &Arc<Self>) -> ArcMutexGuard<T>
+        where
+            T: 'static,
+        {
+            // We need to lock the mutex and keep the Arc alive
+            // Safety: We hold the Arc which keeps the Mutex alive
+            let arc = Arc::clone(self);
+            let guard = arc.0.lock().unwrap();
+            // Transmute the guard to have 'static lifetime since Arc keeps it alive
+            let guard: shuttle::sync::MutexGuard<'static, T> =
+                unsafe { std::mem::transmute(guard) };
+            ArcMutexGuard { _arc: arc, guard }
+        }
     }
 
     impl<T: Default> Default for Mutex<T> {
@@ -61,6 +76,29 @@ mod shuttle_adapter {
     impl<T: ?Sized> DerefMut for MutexGuard<'_, T> {
         fn deref_mut(&mut self) -> &mut T {
             &mut self.0
+        }
+    }
+
+    /// An owned mutex guard that holds an Arc to the Mutex.
+    /// This allows the guard to be stored across async yield points.
+    pub struct ArcMutexGuard<T: ?Sized + 'static> {
+        _arc: Arc<Mutex<T>>,
+        guard: shuttle::sync::MutexGuard<'static, T>,
+    }
+
+    unsafe impl<T: ?Sized + 'static> Send for ArcMutexGuard<T> {}
+    unsafe impl<T: ?Sized + 'static> Sync for ArcMutexGuard<T> {}
+
+    impl<T: ?Sized + 'static> Deref for ArcMutexGuard<T> {
+        type Target = T;
+        fn deref(&self) -> &T {
+            &self.guard
+        }
+    }
+
+    impl<T: ?Sized + 'static> DerefMut for ArcMutexGuard<T> {
+        fn deref_mut(&mut self) -> &mut T {
+            &mut self.guard
         }
     }
 
@@ -168,4 +206,7 @@ mod shuttle_adapter {
 mod std_adapter {
     pub use parking_lot::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
     pub use std::sync::{atomic, Arc, LazyLock, OnceLock, Weak};
+
+    /// Type alias for ArcMutexGuard that hides the RawMutex type parameter
+    pub type ArcMutexGuard<T> = parking_lot::ArcMutexGuard<parking_lot::RawMutex, T>;
 }

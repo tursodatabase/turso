@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use turso_core::types::Text;
+use turso_core::{types::Text, IOResult};
 use turso_sdk_kit_macros::signature;
 
 use crate::rsapi::{
@@ -69,7 +69,8 @@ pub extern "C" fn turso_database_open(
         Err(err) => return unsafe { err.to_capi(error_opt_out) },
     };
     match database.open() {
-        Ok(()) => c::turso_status_code_t::TURSO_OK,
+        Ok(IOResult::Done(..)) => c::turso_status_code_t::TURSO_OK,
+        Ok(IOResult::IO(..)) => c::turso_status_code_t::TURSO_IO,
         Err(err) => unsafe { err.to_capi(error_opt_out) },
     }
 }

@@ -445,7 +445,6 @@ def connect_sync(
     db_cfg = PyTursoDatabaseConfig(
         path=path,
         experimental_features=experimental_features,
-        async_io=True,
     )
 
     # Sync config with optional partial bootstrap strategy

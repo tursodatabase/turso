@@ -23,6 +23,28 @@ Production database. Correctness paramount. Crash > corrupt.
 - Minimize heap allocations
 - Write CPU-friendly code (microsecond = long time)
 
+### Avoid `unwrap()`
+
+Never use bare `unwrap()`. Instead:
+
+**For truly unreachable states** (invariants that should never be violated):
+```rust
+// Good: documents the invariant
+let value = option.expect("value must be set in Init phase");
+```
+
+**For recoverable errors** (states that could happen at runtime):
+```rust
+// Good: proper error handling
+let Some(value) = option else {
+    return Err(LimboError::InvalidArgument("value not provided".into()));
+};
+```
+
+The choice depends on whether the None/Err case represents:
+- A bug in the code (use `expect` with descriptive message)
+- A valid runtime condition (use `let ... else` or `match`)
+
 ## If-Statements
 
 Wrong:
@@ -52,6 +74,7 @@ Use if-statements only when both branches are expected paths.
 - Document WHY, not what
 - Document functions, structs, enums, variants
 - Focus on why something is necessary
+- Preserve explanatory comments when refactoring
 
 **Don't:**
 - Comments that repeat code

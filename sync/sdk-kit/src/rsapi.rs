@@ -7,6 +7,7 @@ use turso_sync_engine::{
     database_sync_engine::{self, DatabaseSyncEngine},
     database_sync_engine_io::SyncEngineIo,
     database_sync_operations::SyncEngineIoStats,
+    types::SyncEngineIoResult,
 };
 
 use crate::{
@@ -176,6 +177,32 @@ fn persistent_io(partial: bool) -> Result<Arc<dyn IO>, turso_sync_engine::errors
     }
 }
 
+/// Helper async function to open a TursoDatabase with proper IO yielding for large schemas
+async fn open_turso_database_async<Ctx>(
+    coro: &turso_sync_engine::types::Coro<Ctx>,
+    main_db: &Arc<turso_sdk_kit::rsapi::TursoDatabase>,
+) -> Result<Arc<turso_core::Database>, turso_sync_engine::errors::Error> {
+    loop {
+        match main_db.open().map_err(|e| {
+            turso_sync_engine::errors::Error::DatabaseSyncEngineError(format!(
+                "unable to open database file: {e}"
+            ))
+        })? {
+            turso_core::IOResult::Done(()) => break,
+            turso_core::IOResult::IO(io_completion) => {
+                while !io_completion.finished() {
+                    coro.yield_(SyncEngineIoResult::IO).await?;
+                }
+            }
+        }
+    }
+    main_db.db_core().map_err(|e| {
+        turso_sync_engine::errors::Error::DatabaseSyncEngineError(format!(
+            "unable to get core database instance: {e}",
+        ))
+    })
+}
+
 impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
     /// create database sync holder struct but do not initialize it yet
     /// this can be useful for some environments, where IO operations must be executed in certain fashion (and open do IO under the hood)
@@ -255,16 +282,8 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
                         ..db_config
                     },
                 );
-                main_db.open().map_err(|e| {
-                    turso_sync_engine::errors::Error::DatabaseSyncEngineError(format!(
-                        "unable to open database file: {e}"
-                    ))
-                })?;
-                let main_db_core = main_db.db_core().map_err(|e| {
-                    turso_sync_engine::errors::Error::DatabaseSyncEngineError(format!(
-                        "unable to get core database instance: {e}",
-                    ))
-                })?;
+
+                let main_db_core = open_turso_database_async(&coro, &main_db).await?;
                 let sync_engine_opened = database_sync_engine::DatabaseSyncEngine::open_db(
                     &coro,
                     io,
@@ -326,16 +345,8 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
                         ..db_config
                     },
                 );
-                main_db.open().map_err(|e| {
-                    turso_sync_engine::errors::Error::DatabaseSyncEngineError(format!(
-                        "unable to open database file: {e}"
-                    ))
-                })?;
-                let main_db_core = main_db.db_core().map_err(|e| {
-                    turso_sync_engine::errors::Error::DatabaseSyncEngineError(format!(
-                        "unable to get core database instance: {e}",
-                    ))
-                })?;
+
+                let main_db_core = open_turso_database_async(&coro, &main_db).await?;
                 let sync_engine_opened = database_sync_engine::DatabaseSyncEngine::open_db(
                     &coro,
                     io,

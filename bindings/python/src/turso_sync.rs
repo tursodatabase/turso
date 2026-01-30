@@ -152,7 +152,7 @@ pub fn py_turso_sync_new(
     let db_config = TursoDatabaseConfig {
         path: db_config.path.clone(),
         experimental_features: db_config.experimental_features.clone(),
-        async_io: db_config.async_io,
+        async_io: true, // we will drive IO externally which is especially important for partial sync
         encryption: None,
         vfs: None,
         io: None,
