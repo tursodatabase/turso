@@ -1240,37 +1240,34 @@ mod tests {
                 'ip' || uuid4_str(),
                  datetime('now') FROM generate_series(1,100)";
 
-        let stmt1 = conn.prepare_cached(insert_sql).unwrap();
-        let stmt2 = conn.prepare_cached(insert_sql).unwrap();
+        // Run multiple attempts since thread scheduling is non-deterministic.
+        for i in 0..100 {
+            let stmt1 = conn.prepare_cached(insert_sql).unwrap();
+            let stmt2 = conn.prepare_cached(insert_sql).unwrap();
 
-        let barrier = Arc::new(Barrier::new(2));
-        let mut handles = Vec::new();
-        for mut stmt in [stmt1, stmt2] {
-            let barrier = barrier.clone();
-            handles.push(std::thread::spawn(move || {
-                barrier.wait();
-                stmt.execute(None)
-            }));
+            let barrier = Arc::new(Barrier::new(2));
+            let mut handles = Vec::new();
+            for mut stmt in [stmt1, stmt2] {
+                let barrier = barrier.clone();
+                handles.push(std::thread::spawn(move || {
+                    barrier.wait();
+                    stmt.execute(None)
+                }));
+            }
+
+            for handle in handles {
+                match handle.join().unwrap() {
+                    Err(TursoError::Misuse(_)) => {
+                        eprintln!("got expected misuse error on iteration {i}");
+                        return;
+                    }
+                    Err(e) => panic!("unexpected error: {e:?}"),
+                    Ok(_) => {}
+                }
+            }
         }
 
-        let mut results = Vec::new();
-        for handle in handles {
-            results.push(handle.join().unwrap());
-        }
-
-        assert!(
-            results
-                .iter()
-                .any(|r| matches!(r, Err(TursoError::Misuse(_)))),
-            "expected at least one concurrent-use error, got: {results:?}"
-        );
-        assert!(
-            results
-                .iter()
-                .filter_map(|r| r.as_ref().err())
-                .all(|e| matches!(e, TursoError::Misuse(_))),
-            "expected only misuse errors, got: {results:?}"
-        );
+        panic!("expected at least one concurrent-use error across 100 attempts");
     }
 
     #[cfg(feature = "encryption")]
