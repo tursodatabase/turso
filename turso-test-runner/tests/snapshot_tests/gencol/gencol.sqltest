@@ -1,0 +1,30 @@
+# Generated Columns Bytecode Snapshots
+# These snapshots verify the EXPLAIN output for queries involving generated columns
+
+@database :memory:
+@skip-file-if mvcc "mvcc has slightly different cursor ids"
+
+setup schema {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT, c AS (a * 2) STORED, d AS (LENGTH(b)) VIRTUAL);
+    CREATE INDEX idx_c ON t1(c);
+}
+
+@setup schema
+snapshot gencol-select-stored {
+    SELECT a, c FROM t1 WHERE a = 1;
+}
+
+@setup schema
+snapshot gencol-select-virtual {
+    SELECT a, d FROM t1 WHERE a = 1;
+}
+
+@setup schema
+snapshot gencol-index-scan {
+    SELECT a, b FROM t1 WHERE c = 4;
+}
+
+@setup schema
+snapshot gencol-insert {
+    INSERT INTO t1(a, b) VALUES (10, 'test');
+}
