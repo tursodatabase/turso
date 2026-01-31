@@ -250,9 +250,16 @@ pub struct TextEncoding(U32BE);
 
 impl TextEncoding {
     #![allow(non_upper_case_globals)]
-    pub const Utf8: Self = Self(U32BE::new(1));
-    pub const Utf16Le: Self = Self(U32BE::new(2));
-    pub const Utf16Be: Self = Self(U32BE::new(3));
+    const Utf8: Self = Self(U32BE::new(1));
+    const Utf16Le: Self = Self(U32BE::new(2));
+    const Utf16Be: Self = Self(U32BE::new(3));
+    // SQLite doesn't write the text encoding bytes until the first table is written, so when
+    // opening an empty SQLite file, the encoding bytes will be 0. SQLite considers this to mean UTF-8.
+    const Unset: Self = Self(U32BE::new(0));
+
+    pub fn is_utf8(&self) -> bool {
+        self == &Self::Utf8 || self == &Self::Unset
+    }
 }
 
 impl std::fmt::Display for TextEncoding {

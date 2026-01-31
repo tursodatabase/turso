@@ -91,6 +91,8 @@ pub enum LimboError {
     PlanningError(String),
     #[error("Checkpoint failed: {0}")]
     CheckpointFailed(String),
+    #[error("Unsupported text encoding: {0}. Only UTF-8 is supported.")]
+    UnsupportedEncoding(String),
 }
 
 // We only propagate the error kind so we can avoid string allocation in hot path and copying/cloning enums is cheaper
