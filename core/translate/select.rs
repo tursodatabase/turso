@@ -346,13 +346,27 @@ fn prepare_one_select_plan(
                             if column.hidden() {
                                 continue;
                             }
-                            plan.result_columns.push(ResultSetColumn {
-                                expr: ast::Expr::Column {
+                            let expr = if column.is_generated() && !column.is_generated_stored() {
+                                // For VIRTUAL generated columns, bind and use the generated expression
+                                let generated_expr = column
+                                    .generated
+                                    .as_ref()
+                                    .expect("Generated column must have expression");
+                                crate::translate::plan::bind_generated_expr_to_table(
+                                    generated_expr,
+                                    table,
+                                )
+                            } else {
+                                // For regular columns and STORED generated columns, use column reference
+                                ast::Expr::Column {
                                     database: None, // TODO: support different databases
                                     table: table.internal_id,
                                     column: idx,
                                     is_rowid_alias: column.is_rowid_alias(),
-                                },
+                                }
+                            };
+                            plan.result_columns.push(ResultSetColumn {
+                                expr,
                                 alias: None,
                                 contains_aggregates: false,
                             });

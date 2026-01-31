@@ -1,0 +1,450 @@
+@database :memory:
+
+# ============================================
+# STORED Generated Columns - Basic Tests
+# ============================================
+
+test generated-stored-insert {
+    CREATE TABLE t(a INTEGER, b GENERATED ALWAYS AS (a * 2) STORED);
+    INSERT INTO t(a) VALUES (5);
+    SELECT * FROM t;
+}
+expect {
+    5|10
+}
+
+test generated-stored-multiple-rows {
+    CREATE TABLE t(x INTEGER, y GENERATED ALWAYS AS (x * x) STORED);
+    INSERT INTO t(x) VALUES (2), (3), (4);
+    SELECT * FROM t;
+}
+expect {
+    2|4
+    3|9
+    4|16
+}
+
+test generated-stored-update {
+    CREATE TABLE t(a INTEGER, b GENERATED ALWAYS AS (a * 3.1415) STORED);
+    INSERT INTO t(a) VALUES (1);
+    UPDATE t SET a = 2;
+    SELECT * FROM t;
+}
+expect {
+    2|6.283
+}
+
+test generated-stored-update-multiple-columns {
+    CREATE TABLE t(a INTEGER, b INTEGER, c GENERATED ALWAYS AS (a + b) STORED);
+    INSERT INTO t(a, b) VALUES (1, 2);
+    UPDATE t SET a = 10;
+    SELECT * FROM t;
+}
+expect {
+    10|2|12
+}
+
+test generated-stored-update-both-source-columns {
+    CREATE TABLE t(a INTEGER, b INTEGER, c GENERATED ALWAYS AS (a + b) STORED);
+    INSERT INTO t(a, b) VALUES (1, 2);
+    UPDATE t SET a = 5, b = 15;
+    SELECT * FROM t;
+}
+expect {
+    5|15|20
+}
+
+# ============================================
+# VIRTUAL Generated Columns - Basic Tests
+# ============================================
+
+test generated-virtual-select {
+    CREATE TABLE t(a INTEGER, b GENERATED ALWAYS AS (a * 2) VIRTUAL);
+    INSERT INTO t(a) VALUES (5);
+    SELECT * FROM t;
+}
+expect {
+    5|10
+}
+
+test generated-virtual-multiple-rows {
+    CREATE TABLE t(x INTEGER, y GENERATED ALWAYS AS (x + 10) VIRTUAL);
+    INSERT INTO t(x) VALUES (2), (3), (4);
+    SELECT * FROM t;
+}
+expect {
+    2|12
+    3|13
+    4|14
+}
+
+test generated-virtual-after-update {
+    CREATE TABLE t(a INTEGER, b GENERATED ALWAYS AS (a * 3.1415) VIRTUAL);
+    INSERT INTO t(a) VALUES (1);
+    UPDATE t SET a = 2;
+    SELECT * FROM t;
+}
+expect {
+    2|6.283
+}
+
+# ============================================
+# Mixed STORED and VIRTUAL
+# ============================================
+
+test generated-mixed-stored-virtual {
+    CREATE TABLE t(
+        a INTEGER,
+        b GENERATED ALWAYS AS (a * 2) STORED,
+        c GENERATED ALWAYS AS (a + 10) VIRTUAL,
+        d GENERATED ALWAYS AS (b + a) VIRTUAL
+    );
+    INSERT INTO t(a) VALUES (5);
+    SELECT * FROM t;
+}
+expect {
+    5|10|15|15
+}
+
+test generated-mixed-after-update {
+    CREATE TABLE t(
+        a INTEGER,
+        b GENERATED ALWAYS AS (a * 2) STORED,
+        c GENERATED ALWAYS AS (a + 10) VIRTUAL
+    );
+    INSERT INTO t(a) VALUES (5);
+    UPDATE t SET a = 10;
+    SELECT * FROM t;
+}
+expect {
+    10|20|20
+}
+
+# ============================================
+# Validation Tests
+# ============================================
+
+test generated-cannot-insert-error {
+    CREATE TABLE t(a INTEGER, b GENERATED ALWAYS AS (a + 1) STORED);
+    INSERT INTO t(a, b) VALUES (1, 2);
+}
+expect error {
+}
+
+test generated-cannot-have-default-error {
+    CREATE TABLE t(a INTEGER, b GENERATED ALWAYS AS (a + 1) STORED DEFAULT 5);
+}
+expect error {
+}
+
+test generated-cannot-be-primary-key-error {
+    CREATE TABLE t(a INTEGER, b GENERATED ALWAYS AS (a + 1) STORED PRIMARY KEY);
+}
+expect error {
+}
+
+# ============================================
+# Expression Tests
+# ============================================
+
+test generated-expression-arithmetic {
+    CREATE TABLE t(
+        a INTEGER,
+        add_col GENERATED ALWAYS AS (a + 5) STORED,
+        sub_col GENERATED ALWAYS AS (a - 3) STORED,
+        mul_col GENERATED ALWAYS AS (a * 2) STORED,
+        div_col GENERATED ALWAYS AS (a / 2) STORED
+    );
+    INSERT INTO t(a) VALUES (10);
+    SELECT * FROM t;
+}
+expect {
+    10|15|7|20|5
+}
+
+test generated-expression-abs {
+    CREATE TABLE t(a INTEGER, b GENERATED ALWAYS AS (abs(a)) STORED);
+    INSERT INTO t(a) VALUES (-5), (5);
+    SELECT * FROM t;
+}
+expect {
+    -5|5
+    5|5
+}
+
+# ============================================
+# Default value for non-generated columns
+# ============================================
+
+test generated-with-default-on-regular-column {
+    CREATE TABLE t(
+        a INTEGER DEFAULT 100,
+        b GENERATED ALWAYS AS (a * 2) STORED
+    );
+    INSERT INTO t DEFAULT VALUES;
+    SELECT * FROM t;
+}
+expect {
+    100|200
+}
+
+# ============================================
+# Crazy Complex Expression Tests
+# ============================================
+
+test generated-complex-nested-arithmetic {
+    CREATE TABLE t(
+        x INTEGER,
+        y GENERATED ALWAYS AS (((x + 5) * 3 - 10) / 2 + x * x) STORED
+    );
+    INSERT INTO t(x) VALUES (10);
+    SELECT * FROM t;
+}
+expect {
+    10|117
+}
+
+test generated-multiple-operations {
+    CREATE TABLE t(
+        a INTEGER,
+        b INTEGER,
+        c GENERATED ALWAYS AS (a * b + a - b) STORED,
+        d GENERATED ALWAYS AS (a * a + b * b) VIRTUAL,
+        e GENERATED ALWAYS AS (abs(a - b) * 2) VIRTUAL
+    );
+    INSERT INTO t(a, b) VALUES (7, 3), (-5, 8);
+    SELECT * FROM t;
+}
+expect {
+    7|3|25|58|8
+    -5|8|-53|89|26
+}
+
+test generated-nested-case-expression {
+    CREATE TABLE t(
+        score INTEGER,
+        grade GENERATED ALWAYS AS (
+            CASE 
+                WHEN score >= 90 THEN 'A'
+                WHEN score >= 80 THEN 'B'
+                WHEN score >= 70 THEN 'C'
+                WHEN score >= 60 THEN 'D'
+                ELSE 'F'
+            END
+        ) VIRTUAL
+    );
+    INSERT INTO t(score) VALUES (95), (85), (75), (65), (55);
+    SELECT * FROM t;
+}
+expect {
+    95|A
+    85|B
+    75|C
+    65|D
+    55|F
+}
+
+test generated-complex-math-functions {
+    CREATE TABLE t(
+        val REAL,
+        result GENERATED ALWAYS AS (abs(val) + abs(val * -1) + abs(val - 100)) STORED
+    );
+    INSERT INTO t(val) VALUES (10.5), (-20.3), (150.7);
+    SELECT * FROM t;
+}
+expect {
+    10.5|110.5
+    -20.3|160.9
+    150.7|352.1
+}
+
+test generated-string-operations {
+    CREATE TABLE t(
+        x INTEGER,
+        str GENERATED ALWAYS AS (
+            CASE 
+                WHEN x < 0 THEN 'negative'
+                WHEN x = 0 THEN 'zero'
+                ELSE 'positive'
+            END || ' number'
+        ) STORED
+    );
+    INSERT INTO t(x) VALUES (-5), (0), (10);
+    SELECT * FROM t;
+}
+expect {
+    -5|negative number
+    0|zero number
+    10|positive number
+}
+
+test generated-complex-update-chain {
+    CREATE TABLE t(
+        base INTEGER,
+        double GENERATED ALWAYS AS (base * 2) STORED,
+        quad GENERATED ALWAYS AS (double * 2) VIRTUAL
+    );
+    INSERT INTO t(base) VALUES (3);
+    UPDATE t SET base = 5;
+    UPDATE t SET base = base + 10;
+    SELECT * FROM t;
+}
+expect {
+    15|30|60
+}
+
+test generated-division-and-modulo {
+    CREATE TABLE t(
+        n INTEGER,
+        div5 GENERATED ALWAYS AS (n / 5) STORED,
+        mod5 GENERATED ALWAYS AS (n - (n / 5) * 5) STORED,
+        combined GENERATED ALWAYS AS (div5 * 100 + mod5) VIRTUAL
+    );
+    INSERT INTO t(n) VALUES (0), (7), (15), (23), (50);
+    SELECT * FROM t;
+}
+expect {
+    0|0|0|0
+    7|1|2|102
+    15|3|0|300
+    23|4|3|403
+    50|10|0|1000
+}
+
+test generated-nullable-columns {
+    CREATE TABLE t(
+        a INTEGER,
+        b INTEGER,
+        sum GENERATED ALWAYS AS (a + b) STORED,
+        product GENERATED ALWAYS AS (a * b) VIRTUAL
+    );
+    INSERT INTO t(a, b) VALUES (5, 3), (NULL, 10), (7, NULL), (NULL, NULL);
+    SELECT * FROM t;
+}
+expect {
+    5|3|8|15
+    |10||
+    7|||
+    |||
+}
+
+test generated-boolean-logic {
+    CREATE TABLE t(
+        x INTEGER,
+        y INTEGER,
+        both_positive GENERATED ALWAYS AS (CASE WHEN x > 0 AND y > 0 THEN 1 ELSE 0 END) STORED,
+        either_negative GENERATED ALWAYS AS (CASE WHEN x < 0 OR y < 0 THEN 1 ELSE 0 END) VIRTUAL
+    );
+    INSERT INTO t(x, y) VALUES (5, 3), (-2, 4), (7, -1), (-3, -5);
+    SELECT * FROM t;
+}
+expect {
+    5|3|1|0
+    -2|4|0|1
+    7|-1|0|1
+    -3|-5|0|1
+}
+
+test generated-chained-comparisons {
+    CREATE TABLE t(
+        val INTEGER,
+        category GENERATED ALWAYS AS (
+            CASE 
+                WHEN val < -100 THEN 'very low'
+                WHEN val < 0 THEN 'low'
+                WHEN val = 0 THEN 'zero'
+                WHEN val <= 100 THEN 'medium'
+                ELSE 'high'
+            END
+        ) STORED
+    );
+    INSERT INTO t(val) VALUES (-150), (-50), (0), (50), (150);
+    SELECT * FROM t;
+}
+expect {
+    -150|very low
+    -50|low
+    0|zero
+    50|medium
+    150|high
+}
+
+test generated-multiple-abs-nested {
+    CREATE TABLE t(
+        x INTEGER,
+        result GENERATED ALWAYS AS (abs(abs(abs(x - 100) - 50) - 25)) VIRTUAL
+    );
+    INSERT INTO t(x) VALUES (0), (50), (100), (150), (200);
+    SELECT * FROM t;
+}
+expect {
+    0|25
+    50|25
+    100|25
+    150|25
+    200|25
+}
+
+test generated-fibonacci-like {
+    CREATE TABLE t(
+        n INTEGER,
+        a INTEGER DEFAULT 1,
+        b INTEGER DEFAULT 1,
+        next_val GENERATED ALWAYS AS (a + b) STORED
+    );
+    INSERT INTO t(n, a, b) VALUES (1, 1, 1), (2, 1, 2), (3, 2, 3), (4, 3, 5), (5, 5, 8);
+    SELECT * FROM t;
+}
+expect {
+    1|1|1|2
+    2|1|2|3
+    3|2|3|5
+    4|3|5|8
+    5|5|8|13
+}
+
+test generated-complex-real-arithmetic {
+    CREATE TABLE t(
+        radius REAL,
+        circumference GENERATED ALWAYS AS (2 * 3.14159 * radius) STORED,
+        area GENERATED ALWAYS AS (3.14159 * radius * radius) VIRTUAL
+    );
+    INSERT INTO t(radius) VALUES (2.5), (5.0);
+    SELECT * FROM t;
+}
+expect {
+    2.5|15.70795|19.6349375
+    5.0|31.4159|78.53975
+}
+
+test generated-max-min-simulation {
+    CREATE TABLE t(
+        a INTEGER,
+        b INTEGER,
+        c INTEGER,
+        max_val GENERATED ALWAYS AS (
+            CASE 
+                WHEN a >= b AND a >= c THEN a
+                WHEN b >= a AND b >= c THEN b
+                ELSE c
+            END
+        ) STORED,
+        min_val GENERATED ALWAYS AS (
+            CASE 
+                WHEN a <= b AND a <= c THEN a
+                WHEN b <= a AND b <= c THEN b
+                ELSE c
+            END
+        ) VIRTUAL
+    );
+    INSERT INTO t(a, b, c) VALUES (5, 3, 7), (10, 15, 12), (8, 8, 8);
+    SELECT * FROM t;
+}
+expect {
+    5|3|7|7|3
+    10|15|12|15|10
+    8|8|8|8|8
+}
+
+# Note: Subqueries in generated column expressions are accepted in CREATE TABLE
+# but may not work correctly at runtime. This is a known limitation.
