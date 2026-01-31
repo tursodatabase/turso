@@ -36,7 +36,7 @@ pub enum GeneratorKind {
 /// Trait abstracting SQL generation backends.
 pub trait SqlGenerator {
     /// Generate the next SQL statement given the current schema.
-    fn generate(&mut self, schema: &sql_gen::Schema) -> Result<GeneratedStatement>;
+    fn generate(&mut self, schema: &sql_gen_prop::Schema) -> Result<GeneratedStatement>;
 
     /// Take accumulated coverage data, if the backend supports it.
     fn take_coverage(&mut self) -> Option<sql_gen::Coverage> {
@@ -75,18 +75,19 @@ impl SqlGenBackend {
 }
 
 impl SqlGenerator for SqlGenBackend {
-    fn generate(&mut self, schema: &sql_gen::Schema) -> Result<GeneratedStatement> {
-        let generator: SqlGen<Full> = SqlGen::new(schema.clone(), self.policy.clone());
+    fn generate(&mut self, schema: &sql_gen_prop::Schema) -> Result<GeneratedStatement> {
+        let sql_gen_schema = to_sql_gen_schema(schema);
+        let generator: SqlGen<Full> = SqlGen::new(sql_gen_schema.clone(), self.policy.clone());
         let stmt = generator
             .statement(&mut self.ctx)
             .map_err(|e| anyhow::anyhow!("Failed to generate statement: {e}"))?;
         let sql = stmt.to_string();
         let is_ddl = StmtKind::from(&stmt).is_ddl();
-        let has_unordered_limit =
-            stmt.has_unordered_limit() || stmt.non_unique_order_by_reason(schema).is_some();
+        let has_unordered_limit = stmt.has_unordered_limit()
+            || stmt.non_unique_order_by_reason(&sql_gen_schema).is_some();
         let unordered_limit_reason = stmt
             .unordered_limit_reason()
-            .or_else(|| stmt.non_unique_order_by_reason(schema))
+            .or_else(|| stmt.non_unique_order_by_reason(&sql_gen_schema))
             .map(str::to_string);
         Ok(GeneratedStatement {
             sql,
@@ -130,9 +131,8 @@ impl PropTestBackend {
 }
 
 impl SqlGenerator for PropTestBackend {
-    fn generate(&mut self, schema: &sql_gen::Schema) -> Result<GeneratedStatement> {
-        let prop_schema = to_prop_schema(schema);
-        let strategy = sql_gen_prop::strategies::statement_for_schema(&prop_schema, &self.profile);
+    fn generate(&mut self, schema: &sql_gen_prop::Schema) -> Result<GeneratedStatement> {
+        let strategy = sql_gen_prop::strategies::statement_for_schema(schema, &self.profile);
         let value_tree = strategy
             .new_tree(&mut self.test_runner)
             .map_err(|e| anyhow::anyhow!("Failed to generate statement: {e}"))?;
@@ -149,7 +149,63 @@ impl SqlGenerator for PropTestBackend {
     }
 }
 
+/// Convert a `sql_gen_prop::Schema` to a `sql_gen::Schema`.
+///
+/// `sql_gen::ColumnDef` does not have `generated` or `check_constraint` fields,
+/// so generated columns are still included but without that metadata.
+pub fn to_sql_gen_schema(schema: &sql_gen_prop::Schema) -> sql_gen::Schema {
+    let mut builder = sql_gen::SchemaBuilder::new();
+    for table in schema.tables.iter() {
+        let columns: Vec<sql_gen::ColumnDef> = table
+            .columns
+            .iter()
+            .map(|c| {
+                let dt = match c.data_type {
+                    sql_gen_prop::DataType::Integer => sql_gen::DataType::Integer,
+                    sql_gen_prop::DataType::Real => sql_gen::DataType::Real,
+                    sql_gen_prop::DataType::Text => sql_gen::DataType::Text,
+                    sql_gen_prop::DataType::Blob => sql_gen::DataType::Blob,
+                    sql_gen_prop::DataType::Null => sql_gen::DataType::Null,
+                };
+                let mut col = sql_gen::ColumnDef::new(c.name.clone(), dt);
+                if !c.nullable {
+                    col = col.not_null();
+                }
+                if c.primary_key {
+                    col = col.primary_key();
+                }
+                if c.unique {
+                    col = col.unique();
+                }
+                if let Some(ref default) = c.default {
+                    col = col.default_value(default.clone());
+                }
+                col
+            })
+            .collect();
+        let sql_gen_table = if table.strict {
+            sql_gen::Table::new_strict(table.name.clone(), columns)
+        } else {
+            sql_gen::Table::new(table.name.clone(), columns)
+        };
+        builder = builder.table(sql_gen_table);
+    }
+    for index in schema.indexes.iter() {
+        let mut idx = sql_gen::Index::new(
+            index.name.clone(),
+            index.table_name.clone(),
+            index.columns.clone(),
+        );
+        if index.unique {
+            idx = idx.unique();
+        }
+        builder = builder.index(idx);
+    }
+    builder.build()
+}
+
 /// Convert a `sql_gen::Schema` to a `sql_gen_prop::Schema`.
+#[allow(dead_code)]
 fn to_prop_schema(schema: &sql_gen::Schema) -> sql_gen_prop::Schema {
     let mut builder = sql_gen_prop::SchemaBuilder::new();
     for table in &schema.tables {
