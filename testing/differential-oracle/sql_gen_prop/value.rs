@@ -111,8 +111,9 @@ impl Hash for SqlValue {
         match self {
             SqlValue::Integer(i) => i.hash(state),
             SqlValue::Real(f) => {
-                // Hash the bit representation for consistency
-                f.to_bits().hash(state);
+                // Normalize -0.0 to 0.0 for consistent hashing (they compare equal via PartialEq)
+                let normalized = if *f == 0.0 { 0.0 } else { *f };
+                normalized.to_bits().hash(state);
             }
             SqlValue::Text(s) => s.hash(state),
             SqlValue::Blob(b) => b.hash(state),
