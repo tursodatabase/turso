@@ -557,31 +557,23 @@ pub fn column_depends_on_updated(
     updated_cols: &HashSet<usize>,
     visited: &mut HashSet<usize>,
 ) -> bool {
-    // Prevent infinite recursion in case of circular references
-    if visited.contains(&col_idx) {
-        return false;
-    }
-    visited.insert(col_idx);
-
-    // If this column is directly updated, it depends on an updated column
     if updated_cols.contains(&col_idx) {
         return true;
     }
-
-    // Check if this column is a generated column
-    let col = &columns[col_idx];
-    if let Some(ref gen_expr) = col.generated {
-        let deps = crate::schema::collect_column_refs(gen_expr);
-        for dep_name in deps {
-            if let Some(&dep_idx) = column_lookup.get(&dep_name.to_lowercase()) {
-                // If the dependency is directly updated, or transitively depends on updated
-                if column_depends_on_updated(dep_idx, columns, column_lookup, updated_cols, visited)
-                {
-                    return true;
-                }
+    crate::schema::walk_gen_col_deps(
+        col_idx,
+        columns,
+        column_lookup,
+        visited,
+        &mut |dep_idx, dep_col| {
+            use crate::schema::GenColDepsAction;
+            if updated_cols.contains(&dep_idx) {
+                GenColDepsAction::Stop
+            } else if dep_col.generated.is_some() {
+                GenColDepsAction::Recurse
+            } else {
+                GenColDepsAction::Skip
             }
-        }
-    }
-
-    false
+        },
+    )
 }

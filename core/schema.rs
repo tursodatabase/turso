@@ -1736,31 +1736,6 @@ impl BTreeTable {
 
         let column_lookup = build_column_name_lookup(columns);
 
-        // Recursively find all STORED columns that a column transitively depends on,
-        // traversing through VIRTUAL columns.
-        fn find_stored_deps(
-            col_idx: usize,
-            columns: &[Column],
-            column_lookup: &rustc_hash::FxHashMap<String, usize>,
-            visited: &mut rustc_hash::FxHashSet<usize>,
-            result: &mut rustc_hash::FxHashSet<usize>,
-        ) {
-            if !visited.insert(col_idx) {
-                return;
-            }
-            if let Some(ref expr) = columns[col_idx].generated {
-                for ref_name in collect_column_refs(expr) {
-                    if let Some(&dep_idx) = column_lookup.get(&ref_name.to_lowercase()) {
-                        if columns[dep_idx].is_stored_generated() {
-                            result.insert(dep_idx);
-                        } else if columns[dep_idx].is_virtual_generated() {
-                            find_stored_deps(dep_idx, columns, column_lookup, visited, result);
-                        }
-                    }
-                }
-            }
-        }
-
         let mut gen_col_indices: HashSet<usize> = HashSet::default();
         let mut dependencies: HashMap<usize, HashSet<usize>> = HashMap::default();
 
@@ -1769,7 +1744,22 @@ impl BTreeTable {
                 gen_col_indices.insert(idx);
                 let mut deps = HashSet::default();
                 let mut visited = HashSet::default();
-                find_stored_deps(idx, columns, &column_lookup, &mut visited, &mut deps);
+                walk_gen_col_deps(
+                    idx,
+                    columns,
+                    &column_lookup,
+                    &mut visited,
+                    &mut |dep_idx, dep_col| {
+                        if dep_col.is_stored_generated() {
+                            deps.insert(dep_idx);
+                            GenColDepsAction::Skip
+                        } else if dep_col.is_virtual_generated() {
+                            GenColDepsAction::Recurse
+                        } else {
+                            GenColDepsAction::Skip
+                        }
+                    },
+                );
                 dependencies.insert(idx, deps);
             }
         }
@@ -2030,6 +2020,56 @@ pub fn collect_column_refs(expr: &ast::Expr) -> HashSet<String> {
         _ => Ok(WalkControl::Continue),
     });
     refs
+}
+
+/// Controls the DFS walk of the generated column dependency graph.
+pub enum GenColDepsAction {
+    /// Recurse into this column's dependencies.
+    Recurse,
+    /// Don't recurse into this column's dependencies.
+    Skip,
+    /// Stop the entire walk immediately (early termination).
+    Stop,
+}
+
+/// Walks the generated column dependency graph via DFS starting from `start_idx`.
+///
+/// For each dependency encountered, calls `visitor(dep_idx, &column)`.
+/// The visitor controls traversal via `GenColDepsAction`.
+/// Cycle-safe via `visited` set. Does NOT call the visitor for the starting column itself.
+///
+/// Returns `true` if the visitor ever returned `Stop` (useful for search queries).
+pub fn walk_gen_col_deps<F>(
+    start_idx: usize,
+    columns: &[Column],
+    column_lookup: &HashMap<String, usize>,
+    visited: &mut HashSet<usize>,
+    visitor: &mut F,
+) -> bool
+where
+    F: FnMut(usize, &Column) -> GenColDepsAction,
+{
+    if !visited.insert(start_idx) {
+        return false;
+    }
+    let Some(ref expr) = columns[start_idx].generated else {
+        return false;
+    };
+    for ref_name in collect_column_refs(expr) {
+        let Some(&dep_idx) = column_lookup.get(&ref_name.to_lowercase()) else {
+            continue;
+        };
+        match visitor(dep_idx, &columns[dep_idx]) {
+            GenColDepsAction::Recurse => {
+                if walk_gen_col_deps(dep_idx, columns, column_lookup, visited, visitor) {
+                    return true;
+                }
+            }
+            GenColDepsAction::Skip => {}
+            GenColDepsAction::Stop => return true,
+        }
+    }
+    false
 }
 
 /// Check if there's a path from `start` to `target` in the generated column dependency graph.
