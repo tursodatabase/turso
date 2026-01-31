@@ -4628,7 +4628,7 @@ pub fn op_function(
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
         Function {
-            constant_mask,
+            constant_mask: _,
             func,
             start_reg,
             dest,
