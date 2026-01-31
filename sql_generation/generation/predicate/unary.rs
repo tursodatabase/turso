@@ -276,7 +276,7 @@ mod tests {
     fn fuzz_true_unary_simple_predicate() {
         let seed = get_seed();
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
-        let context = &TestContext::default();
+        let context = &TestContext::no_gencol();
 
         for _ in 0..10000 {
             let mut table = Table::arbitrary(&mut rng, context);
@@ -306,7 +306,7 @@ mod tests {
     fn fuzz_false_unary_simple_predicate() {
         let seed = get_seed();
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
-        let context = &TestContext::default();
+        let context = &TestContext::no_gencol();
 
         for _ in 0..10000 {
             let mut table = Table::arbitrary(&mut rng, context);

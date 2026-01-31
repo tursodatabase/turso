@@ -26,6 +26,12 @@ pub enum Insert {
         #[serde(default)]
         on_conflict: Option<OnConflict>,
     },
+    /// Insert with explicit column list (required when skipping generated columns)
+    ValuesWithColumns {
+        table: String,
+        columns: Vec<String>,
+        values: Vec<Vec<SimValue>>,
+    },
     Select {
         table: String,
         select: Box<Select>,
@@ -35,14 +41,24 @@ pub enum Insert {
 impl Insert {
     pub fn table(&self) -> &str {
         match self {
-            Insert::Values { table, .. } | Insert::Select { table, .. } => table,
+            Insert::Values { table, .. }
+            | Insert::ValuesWithColumns { table, .. }
+            | Insert::Select { table, .. } => table,
         }
     }
 
     pub fn rows(&self) -> &[Vec<SimValue>] {
         match self {
-            Insert::Values { values, .. } => values,
+            Insert::Values { values, .. } | Insert::ValuesWithColumns { values, .. } => values,
             Insert::Select { .. } => unreachable!(),
+        }
+    }
+
+    /// Returns the column names for ValuesWithColumns, or None for other variants
+    pub fn columns(&self) -> Option<&[String]> {
+        match self {
+            Insert::ValuesWithColumns { columns, .. } => Some(columns),
+            _ => None,
         }
     }
 }
@@ -71,6 +87,34 @@ impl Display for Insert {
                 }
                 if let Some(on_conflict) = &on_conflict {
                     write!(f, " {on_conflict}")?;
+                }
+                Ok(())
+            }
+            Insert::ValuesWithColumns {
+                table,
+                columns,
+                values,
+            } => {
+                write!(f, "INSERT INTO {table} (")?;
+                for (i, col) in columns.iter().enumerate() {
+                    if i != 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{col}")?;
+                }
+                write!(f, ") VALUES ")?;
+                for (i, row) in values.iter().enumerate() {
+                    if i != 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "(")?;
+                    for (j, value) in row.iter().enumerate() {
+                        if j != 0 {
+                            write!(f, ", ")?;
+                        }
+                        write!(f, "{value}")?;
+                    }
+                    write!(f, ")")?;
                 }
                 Ok(())
             }
