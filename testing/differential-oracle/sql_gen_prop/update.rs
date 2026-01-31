@@ -25,6 +25,10 @@ pub struct UpdateProfile {
     pub allow_aggregates: bool,
     /// Expression profile for SET expressions.
     pub expression_profile: ExpressionProfile,
+    /// Probability (0-100) of including generated columns in UPDATE SET clause.
+    /// This tests that both DBs reject the invalid UPDATE consistently.
+    /// Default is 1 (1%).
+    pub include_generated_probability: u8,
 }
 
 impl Default for UpdateProfile {
@@ -33,6 +37,7 @@ impl Default for UpdateProfile {
             expression_max_depth: 2,
             allow_aggregates: false,
             expression_profile: ExpressionProfile::default(),
+            include_generated_probability: 1,
         }
     }
 }
@@ -53,6 +58,12 @@ impl UpdateProfile {
     /// Builder method to set expression profile.
     pub fn with_expression_profile(mut self, profile: ExpressionProfile) -> Self {
         self.expression_profile = profile;
+        self
+    }
+
+    /// Builder method to set probability of including generated columns.
+    pub fn with_include_generated_probability(mut self, probability: u8) -> Self {
+        self.include_generated_probability = probability.min(100);
         self
     }
 }
@@ -86,77 +97,109 @@ impl fmt::Display for UpdateStatement {
 }
 
 /// Generate an UPDATE statement for a table with profile.
+///
+/// By default, generated columns are excluded from the SET clause since
+/// SQLite/Turso will reject attempts to set them. With `include_generated_probability`,
+/// we occasionally include them to test that both databases reject consistently.
 pub fn update_for_table(
     table: &TableRef,
     schema: &Schema,
     profile: &StatementProfile,
 ) -> BoxedStrategy<UpdateStatement> {
     let table_name = table.name.clone();
-    let updatable: Vec<ColumnDef> = table.updatable_columns().cloned().collect();
     let functions = builtin_functions();
 
     // Extract profile values from the UpdateProfile
     let update_profile = profile.update_profile();
     let expression_max_depth = update_profile.expression_max_depth;
     let allow_aggregates = update_profile.allow_aggregates;
+    let include_generated_prob = update_profile.include_generated_probability;
 
     let table_clone = table.clone();
     let schema_clone = schema.clone();
     let profile_clone = profile.clone();
-    if updatable.is_empty() {
-        return optional_where_clause(&table_clone, &schema_clone, &profile_clone)
-            .prop_map(move |where_clause| UpdateStatement {
-                table: table_name.clone(),
-                assignments: vec![],
-                where_clause,
-            })
-            .boxed();
-    }
 
-    // Build expression context with columns (allows `SET x = x + 1` style expressions)
-    // Disable subqueries to avoid infinite recursion
-    let expr_profile = profile
-        .generation
-        .expression
-        .base
-        .clone()
-        .with_subqueries_disabled();
-    let ctx = ExpressionContext::new(functions, schema.clone())
-        .with_columns(table.columns.clone())
-        .with_max_depth(expression_max_depth)
-        .with_aggregates(allow_aggregates)
-        .with_profile(expr_profile);
+    // Decide whether to include generated columns (for error testing)
+    (0u8..100)
+        .prop_flat_map(move |roll| {
+            let include_generated = roll < include_generated_prob;
 
-    let col_indices: Vec<usize> = (0..updatable.len()).collect();
-    let updatable_clone = updatable.clone();
+            // Select columns based on whether we're including generated columns
+            let updatable: Vec<ColumnDef> = if include_generated {
+                // Include all non-PK columns (including generated - will cause error)
+                table_clone
+                    .columns
+                    .iter()
+                    .filter(|c| !c.primary_key)
+                    .cloned()
+                    .collect()
+            } else {
+                // Normal case: exclude both PK and generated columns
+                table_clone.updatable_columns().cloned().collect()
+            };
 
-    (
-        proptest::sample::subsequence(col_indices, 1..=updatable.len()),
-        optional_where_clause(&table_clone, &schema_clone, &profile_clone),
-    )
-        .prop_flat_map(move |(indices, where_clause)| {
-            let selected_cols: Vec<&ColumnDef> =
-                indices.iter().map(|&i| &updatable_clone[i]).collect();
+            if updatable.is_empty() {
+                let table_name = table_name.clone();
+                return optional_where_clause(&table_clone, &schema_clone, &profile_clone)
+                    .prop_map(move |where_clause| UpdateStatement {
+                        table: table_name.clone(),
+                        assignments: vec![],
+                        where_clause,
+                    })
+                    .boxed();
+            }
 
-            let assignment_strategies: Vec<BoxedStrategy<(String, Expression)>> = selected_cols
-                .iter()
-                .map(|c| {
-                    let name = c.name.clone();
-                    crate::expression::expression_for_type(Some(&c.data_type), &ctx)
-                        .prop_map(move |expr| (name.clone(), expr))
-                        .boxed()
-                })
-                .collect();
+            // Build expression context with columns (allows `SET x = x + 1` style expressions)
+            // Disable subqueries to avoid infinite recursion
+            let expr_profile = profile_clone
+                .generation
+                .expression
+                .base
+                .clone()
+                .with_subqueries_disabled();
+            let ctx = ExpressionContext::new(functions.clone(), schema_clone.clone())
+                .with_columns(table_clone.columns.clone())
+                .with_max_depth(expression_max_depth)
+                .with_aggregates(allow_aggregates)
+                .with_profile(expr_profile);
 
+            let col_indices: Vec<usize> = (0..updatable.len()).collect();
+            let updatable_clone = updatable.clone();
             let table_name = table_name.clone();
-            assignment_strategies
-                .into_iter()
-                .collect::<Vec<_>>()
-                .prop_map(move |assignments| UpdateStatement {
-                    table: table_name.clone(),
-                    assignments,
-                    where_clause: where_clause.clone(),
+            let table_clone = table_clone.clone();
+            let schema_clone = schema_clone.clone();
+            let profile_clone = profile_clone.clone();
+
+            (
+                proptest::sample::subsequence(col_indices, 1..=updatable.len()),
+                optional_where_clause(&table_clone, &schema_clone, &profile_clone),
+            )
+                .prop_flat_map(move |(indices, where_clause)| {
+                    let selected_cols: Vec<&ColumnDef> =
+                        indices.iter().map(|&i| &updatable_clone[i]).collect();
+
+                    let assignment_strategies: Vec<BoxedStrategy<(String, Expression)>> =
+                        selected_cols
+                            .iter()
+                            .map(|c| {
+                                let name = c.name.clone();
+                                crate::expression::expression_for_type(Some(&c.data_type), &ctx)
+                                    .prop_map(move |expr| (name.clone(), expr))
+                                    .boxed()
+                            })
+                            .collect();
+
+                    let table_name = table_name.clone();
+                    assignment_strategies
+                        .into_iter()
+                        .collect::<Vec<_>>()
+                        .prop_map(move |assignments| UpdateStatement {
+                            table: table_name.clone(),
+                            assignments,
+                            where_clause: where_clause.clone(),
+                        })
                 })
+                .boxed()
         })
         .boxed()
 }
