@@ -239,7 +239,7 @@ impl Builder {
             turso_sdk_kit::rsapi::TursoDatabase::new(turso_sdk_kit::rsapi::TursoDatabaseConfig {
                 path: self.path,
                 experimental_features: features,
-                async_io: false,
+                async_io: true,
                 encryption: self.encryption_opts,
                 vfs: self.vfs,
                 io: None,
@@ -247,7 +247,7 @@ impl Builder {
             });
         let result = db.open()?;
         // async_io is false - so db.open() will return result immediately
-        assert!(!result.is_io());
+        // assert!(!result.is_io());
         Ok(Database { inner: db })
     }
 }
