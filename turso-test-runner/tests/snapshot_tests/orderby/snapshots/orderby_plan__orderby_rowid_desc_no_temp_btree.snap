@@ -1,0 +1,25 @@
+---
+source: orderby_plan.sqltest
+expression: SELECT * FROM t ORDER BY rowid DESC;
+info:
+  statement_type: SELECT
+  tables:
+  - t
+  setup_blocks:
+  - orderby_temp_btree
+  database: ':memory:'
+---
+QUERY PLAN
+`--SCAN t
+
+BYTECODE
+addr  opcode       p1  p2  p3  p4      p5  comment
+   0  Init          0   7   0           0  Start at 7
+   1  OpenRead      0   2   0  k(2,B)   0  table=t, root=2, iDb=0
+   2  Last          0   6   0           0
+   3    Column      0   0   1           0  r[1]=t.a
+   4    ResultRow   1   1   0           0  output=r[1]
+   5  Prev          0   3   0           0
+   6  Halt          0   0   0           0
+   7  Transaction   0   1   1           0  iDb=0 tx_mode=Read
+   8  Goto          0   1   0           0
