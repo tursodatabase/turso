@@ -180,6 +180,7 @@ mod tests {
         let tmp_path = tmp_path.as_os_str().to_str().unwrap();
         let io = SparseLinuxIo::new().unwrap();
         let file = io.open_file(tmp_path, OpenFlags::default(), false).unwrap();
+        #[expect(clippy::let_underscore_future)]
         let _ = file
             .truncate(1024 * 1024, Completion::new_trunc(|_| {}))
             .unwrap();
@@ -187,6 +188,7 @@ mod tests {
 
         let buffer = Arc::new(Buffer::new_temporary(4096));
         buffer.as_mut_slice().fill(1);
+        #[expect(clippy::let_underscore_future)]
         let _ = file
             .pwrite(0, buffer.clone(), Completion::new_write(|_| {}))
             .unwrap();
@@ -195,6 +197,7 @@ mod tests {
         assert!(file.has_hole(4096, 4096).unwrap());
         assert!(file.has_hole(4096 * 2, 4096).unwrap());
 
+        #[expect(clippy::let_underscore_future)]
         let _ = file
             .pwrite(4096 * 2, buffer.clone(), Completion::new_write(|_| {}))
             .unwrap();
