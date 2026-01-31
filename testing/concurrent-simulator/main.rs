@@ -1,8 +1,18 @@
 /// Whopper CLI - The Turso deterministic simulator
-use clap::Parser;
+use std::path::PathBuf;
+
+use clap::{Parser, ValueEnum};
 use rand::{Rng, RngCore};
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 use turso_whopper::{StepResult, Whopper, WhopperOpts, properties::*, workloads::*};
+
+/// Elle consistency model to use
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum ElleModel {
+    /// List-append model: transactions append to and read from lists
+    ListAppend,
+    // TODO: rw-register model
+}
 
 #[derive(Parser)]
 #[command(name = "turso_whopper")]
@@ -28,6 +38,12 @@ struct Args {
     /// Enable database encryption
     #[arg(long)]
     enable_encryption: bool,
+    /// Enable Elle consistency checking with specified model (uses only Elle workloads)
+    #[arg(long, value_enum)]
+    elle: Option<ElleModel>,
+    /// Output path for Elle history EDN file
+    #[arg(long, default_value = "elle-history.edn")]
+    elle_output: String,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -37,7 +53,8 @@ fn main() -> anyhow::Result<()> {
 
     let seed = std::env::var("SEED")
         .ok()
-        .map(|s| s.parse::<u64>().unwrap())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.parse::<u64>().expect("SEED must be a valid u64"))
         .unwrap_or_else(|| {
             let mut rng = rand::rng();
             rng.next_u64()
@@ -96,6 +113,12 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
+    // Print Elle analysis instructions if enabled
+    if args.elle.is_some() {
+        let output_path = &args.elle_output;
+        println!("\nElle history exported to: {output_path}");
+    }
+
     Ok(())
 }
 
@@ -111,35 +134,62 @@ fn build_opts(args: &Args, seed: u64) -> anyhow::Result<WhopperOpts> {
         base_opts = base_opts.with_max_steps(max_steps);
     }
 
-    Ok(base_opts
-        .with_seed(seed)
-        .with_max_connections(args.max_connections)
-        .with_keep_files(args.keep)
-        .with_enable_mvcc(args.enable_mvcc)
-        .with_enable_encryption(args.enable_encryption)
-        .with_workloads(vec![
+    // Build workloads and properties based on Elle mode
+    let (workloads, properties) = if let Some(elle_model) = args.elle {
+        // Elle mode: only Elle workloads + transactions
+        let w: Vec<(u32, Box<dyn Workload>)> = match elle_model {
+            ElleModel::ListAppend => vec![
+                // Elle list-append workloads
+                (10, Box::new(CreateElleTableWorkload)),
+                (40, Box::new(ElleAppendWorkload::new())),
+                (30, Box::new(ElleReadWorkload)),
+                // Transaction control
+                (30, Box::new(BeginWorkload)),
+                (15, Box::new(CommitWorkload)),
+                (5, Box::new(RollbackWorkload)),
+            ],
+        };
+
+        let output_path = PathBuf::from(&args.elle_output);
+        let p: Vec<Box<dyn Property>> = vec![Box::new(ElleHistoryRecorder::new(output_path))];
+
+        (w, p)
+    } else {
+        // Normal mode: all workloads
+        let w: Vec<(u32, Box<dyn Workload>)> = vec![
             // Idle-only workloads
             (10, Box::new(IntegrityCheckWorkload)),
             (5, Box::new(WalCheckpointWorkload)),
             (10, Box::new(CreateSimpleTableWorkload)),
             (20, Box::new(SimpleSelectWorkload)),
             (20, Box::new(SimpleInsertWorkload)),
-            // DML workloads (work in both Idle and InTx)
-            // (1, Box::new(SelectWorkload)),
-            // (30, Box::new(InsertWorkload)),
-            // (20, Box::new(UpdateWorkload)),
-            // (10, Box::new(DeleteWorkload)),
+            // Index workloads
             (2, Box::new(CreateIndexWorkload)),
             (2, Box::new(DropIndexWorkload)),
-            // InTx-only workloads
+            // Transaction workloads
             (30, Box::new(BeginWorkload)),
             (10, Box::new(CommitWorkload)),
             (10, Box::new(RollbackWorkload)),
-        ])
-        .with_properties(vec![
+        ];
+
+        let p: Vec<Box<dyn Property>> = vec![
             Box::new(IntegrityCheckProperty),
             Box::new(SimpleKeysDoNotDisappear::new()),
-        ]))
+        ];
+
+        (w, p)
+    };
+
+    let opts = base_opts
+        .with_seed(seed)
+        .with_max_connections(args.max_connections)
+        .with_keep_files(args.keep)
+        .with_enable_mvcc(args.enable_mvcc)
+        .with_enable_encryption(args.enable_encryption)
+        .with_workloads(workloads)
+        .with_properties(properties);
+
+    Ok(opts)
 }
 
 fn init_logger() {

@@ -62,3 +62,7 @@ settings.local.json
 
 # For simulator redo
 test.sql
+
+# for elle edn transaction history
+*.edn
+elle-history-results/
