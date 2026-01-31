@@ -1,0 +1,32 @@
+---
+source: analyze.sqltest
+expression: SELECT id, value FROM uniform WHERE status = 'active' AND value = 100;
+info:
+  statement_type: SELECT
+  tables:
+  - uniform
+  setup_blocks:
+  - identical_values
+  database: ':memory:'
+---
+QUERY PLAN
+`--SCAN uniform
+
+BYTECODE
+addr  opcode        p1  p2  p3  p4          p5  comment
+   0  Init           0  12   0               0  Start at 12
+   1  OpenRead       0   2   0  k(3,B,B,B)   0  table=uniform, root=2, iDb=0
+   2  Rewind         0  11   0               0  Rewind table uniform
+   3    Column       0   1   4               0  r[4]=uniform.status
+   4    Ne           4   5  10  Binary       0  if r[4]!=r[5] goto 10
+   5    Column       0   2   7               0  r[7]=uniform.value
+   6    Ne           7   8  10  Binary       0  if r[7]!=r[8] goto 10
+   7    RowId        0   1   0               0  r[1]=uniform.rowid
+   8    Column       0   2   2               0  r[2]=uniform.value
+   9    ResultRow    1   2   0               0  output=r[1..2]
+  10  Next           0   3   0               0
+  11  Halt           0   0   0               0
+  12  Transaction    0   1   4               0  iDb=0 tx_mode=Read
+  13  String8        0   5   0  active       0  r[5]='active'
+  14  Integer      100   8   0               0  r[8]=100
+  15  Goto           0   1   0               0

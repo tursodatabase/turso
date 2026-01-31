@@ -1,0 +1,15 @@
+---
+source: windows.sqltest
+expression: "SELECT\n        emp_id,\n        name,\n        salary,\n        hire_date,\n        LEAD(salary, 1) OVER (ORDER BY hire_date) AS next_salary,\n        LEAD(name, 1) OVER (ORDER BY hire_date) AS next_employee\n    FROM employees;"
+info:
+  statement_type: SELECT
+  tables:
+    - employees
+  setup_blocks:
+    - schema
+  database: ":memory:"
+---
+QUERY PLAN
+
+
+BYTECODE
