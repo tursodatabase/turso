@@ -6,6 +6,7 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use sql_gen_prop::schema::{GeneratedColumn, GeneratedStorage};
 use sql_gen_prop::{ColumnDef, DataType, Schema, SchemaBuilder, Table};
 
 /// Introspects schema from a database connection.
@@ -79,15 +80,16 @@ impl SchemaIntrospector {
         table_name: &str,
     ) -> Result<Vec<ColumnDef>> {
         let mut columns = Vec::new();
-        // Use PRAGMA table_info to get column information
-        let query = format!("PRAGMA table_info(\"{table_name}\")");
+        // Use PRAGMA table_xinfo to get column information including generated column status.
+        // table_xinfo returns: cid, name, type, notnull, dflt_value, pk, hidden
+        // hidden: 0=normal, 2=VIRTUAL generated, 3=STORED generated
+        let query = format!("PRAGMA table_xinfo(\"{table_name}\")");
         let mut rows = conn
             .query(&query)
             .context("Failed to query column info")?
             .context("Expected rows from PRAGMA")?;
 
         rows.run_with_row_callback(|row| {
-            // PRAGMA table_info returns: cid, name, type, notnull, dflt_value, pk
             let name = match row.get_value(1) {
                 turso_core::Value::Text(s) => s.as_str().to_string(),
                 _ => return Ok(()),
@@ -108,6 +110,12 @@ impl SchemaIntrospector {
                 _ => false,
             };
 
+            // hidden column: 0=normal, 2=VIRTUAL generated, 3=STORED generated
+            let hidden = match row.get_value(6) {
+                turso_core::Value::Integer(i) => *i,
+                _ => 0,
+            };
+
             let data_type = Self::parse_type(&type_str);
             let mut column = ColumnDef::new(name, data_type);
 
@@ -121,6 +129,27 @@ impl SchemaIntrospector {
                 column = column.primary_key();
             }
 
+            // Set generated column info if this is a generated column.
+            // Note: We cannot introspect the actual expression from PRAGMA,
+            // but we record that it's generated so INSERT/UPDATE exclude it.
+            match hidden {
+                2 => {
+                    column.generated = Some(GeneratedColumn {
+                        expr: "/* introspected */".to_string(),
+                        storage: GeneratedStorage::Virtual,
+                        collation: None,
+                    });
+                }
+                3 => {
+                    column.generated = Some(GeneratedColumn {
+                        expr: "/* introspected */".to_string(),
+                        storage: GeneratedStorage::Stored,
+                        collation: None,
+                    });
+                }
+                _ => {}
+            }
+
             columns.push(column);
             Ok(())
         })
@@ -130,7 +159,10 @@ impl SchemaIntrospector {
     }
 
     fn get_columns_sqlite(conn: &rusqlite::Connection, table_name: &str) -> Result<Vec<ColumnDef>> {
-        let query = format!("PRAGMA table_info(\"{table_name}\")");
+        // Use PRAGMA table_xinfo to get column information including generated column status.
+        // table_xinfo returns: cid, name, type, notnull, dflt_value, pk, hidden
+        // hidden: 0=normal, 2=VIRTUAL generated, 3=STORED generated
+        let query = format!("PRAGMA table_xinfo(\"{table_name}\")");
         let mut stmt = conn.prepare(&query).context("Failed to prepare PRAGMA")?;
 
         let columns = stmt
@@ -139,15 +171,16 @@ impl SchemaIntrospector {
                 let type_str: String = row.get::<_, String>(2).unwrap_or_else(|_| "TEXT".into());
                 let notnull: i64 = row.get(3)?;
                 let pk: i64 = row.get(5)?;
+                let hidden: i64 = row.get(6)?;
 
-                Ok((name, type_str, notnull != 0, pk != 0))
+                Ok((name, type_str, notnull != 0, pk != 0, hidden))
             })
             .context("Failed to query columns")?
             .collect::<std::result::Result<Vec<_>, _>>()
             .context("Failed to collect columns")?;
 
         let mut result = Vec::new();
-        for (name, type_str, notnull, pk) in columns {
+        for (name, type_str, notnull, pk, hidden) in columns {
             let data_type = Self::parse_type(&type_str.to_uppercase());
             let mut column = ColumnDef::new(name, data_type);
 
@@ -157,6 +190,27 @@ impl SchemaIntrospector {
 
             if pk {
                 column = column.primary_key();
+            }
+
+            // Set generated column info if this is a generated column.
+            // Note: We cannot introspect the actual expression from PRAGMA,
+            // but we record that it's generated so INSERT/UPDATE exclude it.
+            match hidden {
+                2 => {
+                    column.generated = Some(GeneratedColumn {
+                        expr: "/* introspected */".to_string(),
+                        storage: GeneratedStorage::Virtual,
+                        collation: None,
+                    });
+                }
+                3 => {
+                    column.generated = Some(GeneratedColumn {
+                        expr: "/* introspected */".to_string(),
+                        storage: GeneratedStorage::Stored,
+                        collation: None,
+                    });
+                }
+                _ => {}
             }
 
             result.push(column);
