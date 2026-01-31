@@ -393,7 +393,7 @@ We'd love to have you contribute to Turso Database! Please check out the [contri
 ### Found a data corruption bug? Get up to $1,000.00
 
 SQLite is loved because it is the most reliable database in the world. The next evolution of SQLite has
-to match or surpass this level of reliability. Turso is built with [Deterministic Simulation Testing](simulator/)
+to match or surpass this level of reliability. Turso is built with [Deterministic Simulation Testing](testing/simulator/README.md/)
 from the ground up, and is also tested by [Antithesis](https://antithesis.com).
 
 Even during Alpha, if you find a bug that leads to a data corruption and demonstrate
