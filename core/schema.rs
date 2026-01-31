@@ -3250,7 +3250,7 @@ pub struct IndexColumn {
     pub expr: Option<Box<Expr>>,
     /// Affinity to apply when computing VIRTUAL column expressions for index storage.
     /// This ensures INTEGER->REAL conversions happen per SQLite's affinity rules.
-    pub affinity: Option<Affinity>, //TODO is this new column really necessary? There's a commented-out test in gencol.sqltest (line 4135), if it's related to that behaviour, we can remove it.
+    pub affinity: Option<Affinity>,
 }
 
 impl Index {
