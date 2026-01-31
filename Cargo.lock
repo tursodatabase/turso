@@ -6219,6 +6219,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "turso-coverage"
+version = "0.5.0-pre.5"
+dependencies = [
+ "linkme",
+]
+
+[[package]]
 name = "turso-dbhash"
 version = "0.5.0-pre.5"
 dependencies = [
@@ -6227,6 +6234,13 @@ dependencies = [
  "sha1",
  "tempfile",
  "turso_core",
+]
+
+[[package]]
+name = "turso-coverage"
+version = "0.1.0"
+dependencies = [
+ "linkme",
 ]
 
 [[package]]
