@@ -1,6 +1,7 @@
 mod opts;
 
 use clap::Parser;
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use opts::{Opts, TxMode};
 #[cfg(not(feature = "antithesis"))]
 use rand::rngs::StdRng;
@@ -9,7 +10,6 @@ use rand::{Rng, SeedableRng};
 #[cfg(shuttle)]
 use shuttle::scheduler::Scheduler;
 use std::collections::HashSet;
-use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -645,6 +645,14 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
     let mut handles = Vec::with_capacity(opts.nr_threads);
     let mut stop = false;
 
+    let multi_progress = MultiProgress::new();
+    let progress_style = ProgressStyle::default_bar()
+        .template(
+            "[{elapsed_precise}] {prefix} {bar:40.cyan/blue} {pos:>7}/{len:7} ({percent}%) {msg}",
+        )
+        .unwrap()
+        .progress_chars("##-");
+
     let tempfile = tempfile::NamedTempFile::new()?;
     let (_, path) = tempfile.keep().unwrap();
     let db_file = if let Some(db_file) = opts.db_file.clone() {
@@ -738,6 +746,10 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
         let busy_timeout = opts.busy_timeout;
         let tx_mode = opts.tx_mode;
 
+        let progress_bar = multi_progress.add(ProgressBar::new(nr_iterations as u64));
+        progress_bar.set_style(progress_style.clone());
+        progress_bar.set_prefix(format!("Thread {thread}"));
+
         let handle = turso_stress::future::spawn(async move {
             let mut conn = db.lock().await.connect()?;
 
@@ -745,7 +757,9 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
 
             conn.execute("PRAGMA data_sync_retry = 1", ()).await?;
 
-            println!("\rthread#{thread} Executing queries...");
+            if !silent {
+                progress_bar.set_message("executing queries...");
+            }
 
             let mut rng = ThreadRng::new(global_seed.wrapping_add(thread as u64));
 
@@ -799,14 +813,9 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
 
                 if !silent {
                     if verbose {
-                        println!("thread#{thread} executing query {sql}");
-                    } else if i % 100 == 0 {
-                        print!(
-                            "\rthread#{thread}: {:.2} %",
-                            (i as f64 / nr_iterations as f64 * 100.0)
-                        );
-                        std::io::stdout().flush().unwrap();
+                        progress_bar.println(format!("thread#{thread} executing query {sql}"));
                     }
+                    progress_bar.set_position(i as u64);
                 }
                 if verbose {
                     eprintln!("thread#{thread}(start): {sql}");
@@ -895,6 +904,9 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
             }
             // In case this thread is running an exclusive transaction, commit it so that it doesn't block other threads.
             let _ = conn.execute("COMMIT", ()).await;
+            if !silent {
+                progress_bar.finish_with_message("done");
+            }
             Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
         });
         handles.push(handle);

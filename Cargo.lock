@@ -6503,6 +6503,7 @@ dependencies = [
  "antithesis_sdk",
  "clap",
  "hex",
+ "indicatif",
  "rand 0.9.2",
  "rusqlite",
  "shuttle",
