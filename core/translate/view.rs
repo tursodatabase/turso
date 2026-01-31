@@ -81,6 +81,7 @@ pub fn translate_create_materialized_view(
 
         unique_sets: vec![],
         foreign_keys: vec![],
+        stored_gen_col_order: vec![],
     });
 
     // Allocate a cursor for writing to the view's btree during population

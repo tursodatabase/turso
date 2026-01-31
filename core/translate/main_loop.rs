@@ -5,12 +5,12 @@ use std::{borrow::Cow, collections::HashSet, sync::Arc};
 use super::{
     aggregation::{translate_aggregation_step, AggArgumentSource},
     emitter::{
-        MaterializedBuildInputMode, MaterializedColumnRef, OperationMode, TranslateCtx,
+        MaterializedBuildInputMode, MaterializedColumnRef, OperationMode, Resolver, TranslateCtx,
         UpdateRowSource,
     },
     expr::{
         translate_condition_expr, translate_expr, translate_expr_no_constant_opt, walk_expr,
-        ConditionMetadata, NoConstantOptReason, WalkControl,
+        ConditionMetadata, ExprContext, NoConstantOptReason, WalkControl,
     },
     group_by::{group_by_agg_phase, GroupByMetadata, GroupByRowSource},
     optimizer::Optimizable,
@@ -703,7 +703,29 @@ fn emit_hash_build_phase(
     let (payload_start_reg, mut payload_info) = if num_payload > 0 {
         let payload_reg = program.alloc_registers(num_payload);
         for (i, &col_idx) in payload_signature_columns.iter().enumerate() {
-            program.emit_column_or_rowid(payload_source_cursor_id, col_idx, payload_reg + i);
+            if let Some(column) = build_table.columns().get(col_idx) {
+                if column.is_virtual_generated() {
+                    let context = ExprContext::VirtualColumn {
+                        table: &build_table.table,
+                        table_ref_id: build_table.internal_id,
+                        referenced_tables: Some(table_references),
+                    };
+                    context.emit_virtual_column(
+                        program,
+                        column,
+                        payload_reg + i,
+                        &t_ctx.resolver,
+                    )?;
+                } else {
+                    program.emit_column_or_rowid(
+                        payload_source_cursor_id,
+                        col_idx,
+                        payload_reg + i,
+                    );
+                }
+            } else {
+                program.emit_column_or_rowid(payload_source_cursor_id, col_idx, payload_reg + i);
+            }
         }
         (
             Some(payload_reg),
@@ -972,6 +994,8 @@ pub fn open_loop(
                                     table_has_rowid,
                                     num_seek_keys,
                                     seek_def,
+                                    table_references,
+                                    &t_ctx.resolver,
                                 )?;
                                 bloom_filter = use_bloom_filter;
                             }
@@ -2284,6 +2308,7 @@ struct AutoIndexResult {
 /// Open an ephemeral index cursor and build an automatic index on a table.
 /// This is used as a last-resort to avoid a nested full table scan
 /// Returns the cursor id of the ephemeral index cursor.
+#[allow(clippy::too_many_arguments)]
 fn emit_autoindex(
     program: &mut ProgramBuilder,
     index: &Arc<Index>,
@@ -2292,6 +2317,8 @@ fn emit_autoindex(
     table_has_rowid: bool,
     num_seek_keys: usize,
     seek_def: &SeekDef,
+    table_references: &TableReferences,
+    resolver: &Resolver,
 ) -> Result<AutoIndexResult> {
     assert!(index.ephemeral, "Index {} is not ephemeral", index.name);
     let label_ephemeral_build_end = program.allocate_label();
@@ -2315,7 +2342,18 @@ fn emit_autoindex(
     let ephemeral_cols_start_reg = program.alloc_registers(num_regs_to_reserve);
     for (i, col) in index.columns.iter().enumerate() {
         let reg = ephemeral_cols_start_reg + i;
-        program.emit_column_or_rowid(table_cursor_id, col.pos_in_table, reg);
+        if let Some(expr) = &col.expr {
+            translate_expr(program, Some(table_references), expr, reg, resolver)?;
+            if let Some(affinity) = &col.affinity {
+                program.emit_insn(Insn::Affinity {
+                    start_reg: reg,
+                    count: std::num::NonZeroUsize::new(1).unwrap(),
+                    affinities: affinity.aff_mask().to_string(),
+                });
+            }
+        } else {
+            program.emit_column_or_rowid(table_cursor_id, col.pos_in_table, reg);
+        }
     }
     if table_has_rowid {
         program.emit_insn(Insn::RowId {

@@ -88,6 +88,7 @@ pub use io::{
     SyscallIO, WriteCompletion, IO,
 };
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+pub use schema::collect_column_refs;
 use schema::Schema;
 pub use statement::Statement;
 use std::time::Duration;
@@ -109,12 +110,14 @@ pub use storage::{
     wal::{CheckpointMode, CheckpointResult, Wal, WalFile, WalFileShared},
 };
 use tracing::{instrument, Level};
+pub use translate::expr::{walk_expr_mut, WalkControl};
 use turso_macros::{match_ignore_ascii_case, AtomicEnum};
 use turso_parser::{ast, ast::Cmd, parser::Parser};
 pub use types::IOResult;
 pub use types::Value;
 pub use types::ValueRef;
 use util::parse_schema_rows;
+pub use util::rename_column_refs_in_expr;
 pub use util::IOExt;
 pub use vdbe::{
     builder::QueryMode, explain::EXPLAIN_COLUMNS, explain::EXPLAIN_QUERY_PLAN_COLUMNS,

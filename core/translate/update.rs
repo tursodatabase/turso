@@ -279,7 +279,14 @@ pub fn prepare_update_plan(
             let ident = normalize_ident(col_name.as_str());
 
             let col_index = match column_lookup.get(&ident) {
-                Some(idx) => *idx,
+                Some(idx) => {
+                    // Check if this is a generated column - cannot update directly
+                    let col = &table.columns()[*idx];
+                    if col.is_generated() {
+                        bail_parse_error!("cannot UPDATE generated column \"{}\"", col_name);
+                    }
+                    *idx
+                }
                 None => {
                     // Check if this is the 'rowid' keyword
                     if ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(&ident)) {
@@ -315,6 +322,9 @@ pub fn prepare_update_plan(
             }
         }
     }
+
+    // Note: STORED generated columns are handled in the emitter (emit_update_column_values)
+    // to ensure they use the NEW values of columns being updated, not the old values from cursor
 
     // Plan subqueries in RETURNING expressions before processing
     // (so SubqueryResult nodes are cloned into result_columns)
@@ -373,21 +383,68 @@ pub fn prepare_update_plan(
     let rowid_alias_used = set_clauses
         .iter()
         .any(|(idx, _)| *idx == ROWID_SENTINEL || columns[*idx].is_rowid_alias());
+
+    // Build column name -> index lookup for transitive dependency checking
+    let column_lookup: HashMap<String, usize> = columns
+        .iter()
+        .enumerate()
+        .filter_map(|(i, col)| col.name.as_ref().map(|name| (name.to_lowercase(), i)))
+        .collect();
+
     let indexes_to_update = if rowid_alias_used {
         // If the rowid alias is used in the SET clause, we need to update all indexes
         indexes.cloned().collect()
     } else {
         // otherwise we need to update the indexes whose columns are set in the SET clause,
-        // or if the colunns used in the partial index WHERE clause are being updated
+        // or if the columns used in the partial index WHERE clause are being updated,
+        // or if any dependencies of a generated column are being updated (transitively)
         indexes
             .filter_map(|idx| {
                 let mut needs = idx.columns.iter().any(|c| {
                     c.expr.as_ref().map_or_else(
-                        || updated_cols.contains(&c.pos_in_table),
+                        || {
+                            // Simple column index - check if column is being updated directly
+                            if updated_cols.contains(&c.pos_in_table) {
+                                return true;
+                            }
+                            // Also check if this column is a generated column and if any of its
+                            // dependencies are being updated. This uses transitive checking to
+                            // handle chains like: STORED -> VIRTUAL -> regular column.
+                            // When the regular column is updated, indexes on the STORED column
+                            // that depends on the VIRTUAL column must also be updated.
+                            if columns[c.pos_in_table].generated.is_some() {
+                                let mut visited = HashSet::default();
+                                return column_depends_on_updated(
+                                    c.pos_in_table,
+                                    columns,
+                                    &column_lookup,
+                                    &updated_cols,
+                                    &mut visited,
+                                );
+                            }
+                            false
+                        },
                         |expr| {
                             columns_used_by_index_expr(expr, &table_references, connection)
                                 .iter()
-                                .any(|cidx| updated_cols.contains(cidx))
+                                .any(|cidx| {
+                                    // Check direct update
+                                    if updated_cols.contains(cidx) {
+                                        return true;
+                                    }
+                                    // If column in expression is a generated column, check transitive deps
+                                    if columns[*cidx].generated.is_some() {
+                                        let mut visited = HashSet::default();
+                                        return column_depends_on_updated(
+                                            *cidx,
+                                            columns,
+                                            &column_lookup,
+                                            &updated_cols,
+                                            &mut visited,
+                                        );
+                                    }
+                                    false
+                                })
                         },
                     )
                 });
@@ -486,4 +543,47 @@ fn columns_used_by_index_expr(
         return HashSet::default();
     }
     collect_cols_used_in_expr(&expr_copy)
+}
+
+/// Checks if a column transitively depends on any column in the updated_cols set.
+/// This follows through VIRTUAL column chains to find the underlying dependencies.
+///
+/// For example, if STORED column C depends on VIRTUAL column B, which depends on
+/// regular column A, and A is in updated_cols, this returns true for C.
+///
+/// `column_lookup` maps column names (lowercased) to their indices in `columns`.
+pub fn column_depends_on_updated(
+    col_idx: usize,
+    columns: &[crate::schema::Column],
+    column_lookup: &HashMap<String, usize>,
+    updated_cols: &HashSet<usize>,
+    visited: &mut HashSet<usize>,
+) -> bool {
+    // Prevent infinite recursion in case of circular references
+    if visited.contains(&col_idx) {
+        return false;
+    }
+    visited.insert(col_idx);
+
+    // If this column is directly updated, it depends on an updated column
+    if updated_cols.contains(&col_idx) {
+        return true;
+    }
+
+    // Check if this column is a generated column
+    let col = &columns[col_idx];
+    if let Some(ref gen_expr) = col.generated {
+        let deps = crate::schema::collect_column_refs(gen_expr);
+        for dep_name in deps {
+            if let Some(&dep_idx) = column_lookup.get(&dep_name.to_lowercase()) {
+                // If the dependency is directly updated, or transitively depends on updated
+                if column_depends_on_updated(dep_idx, columns, column_lookup, updated_cols, visited)
+                {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
 }

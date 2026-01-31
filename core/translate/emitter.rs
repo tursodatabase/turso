@@ -30,8 +30,8 @@ use crate::function::Func;
 use crate::schema::{BTreeTable, Column, Index, IndexColumn, Schema, Table, ROWID_SENTINEL};
 use crate::translate::compound_select::emit_program_for_compound_select;
 use crate::translate::expr::{
-    bind_and_rewrite_expr, emit_returning_results, rewrite_between_expr,
-    translate_expr_no_constant_opt, walk_expr, walk_expr_mut, BindingBehavior, NoConstantOptReason,
+    emit_returning_results, rewrite_between_expr, translate_expr_no_constant_opt,
+    translate_expr_with_context, walk_expr, walk_expr_mut, ExprContext, NoConstantOptReason,
     WalkControl,
 };
 use crate::translate::fkeys::{
@@ -61,6 +61,54 @@ use crate::vdbe::insn::{
 use crate::vdbe::{insn::Insn, BranchOffset, CursorID};
 use crate::{bail_parse_error, emit_explain, Result, SymbolTable};
 use crate::{turso_assert, Connection, QueryMode};
+
+/// Emit a MakeRecord instruction that excludes VIRTUAL generated columns.
+///
+/// VIRTUAL columns are computed on-the-fly during reads and should not be stored.
+/// When the table has VIRTUAL columns, this function copies the storable (non-VIRTUAL)
+/// columns into contiguous registers before emitting MakeRecord.
+///
+/// Returns the register containing the record.
+pub(super) fn emit_make_record_without_virtual(
+    program: &mut ProgramBuilder,
+    columns: &[Column],
+    source_start: usize,
+    dest_reg: usize,
+) {
+    let storable: Vec<(usize, &Column)> = columns
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| !c.is_virtual_generated())
+        .collect();
+    let storable_count = storable.len();
+
+    let (record_start, record_count) = if storable_count < columns.len() {
+        let record_start = program.alloc_registers(storable_count);
+        for (compact_idx, &(orig_idx, _)) in storable.iter().enumerate() {
+            program.emit_insn(Insn::Copy {
+                src_reg: source_start + orig_idx,
+                dst_reg: record_start + compact_idx,
+                extra_amount: 0,
+            });
+        }
+        (record_start, storable_count)
+    } else {
+        (source_start, columns.len())
+    };
+
+    let affinity_str: String = storable
+        .iter()
+        .map(|(_, c)| c.affinity().aff_mask())
+        .collect();
+
+    program.emit_insn(Insn::MakeRecord {
+        start_reg: to_u16(record_start),
+        count: to_u16(record_count),
+        dest_reg: to_u16(dest_reg),
+        index_name: None,
+        affinity_str: Some(affinity_str),
+    });
+}
 
 /// Initialize EXISTS subquery result registers to 0, but only for subqueries that haven't
 /// been evaluated yet (i.e., correlated subqueries that will be evaluated in the loop).
@@ -588,6 +636,7 @@ fn emit_materialized_build_inputs(
             is_strict: false,
             unique_sets: vec![],
             foreign_keys: vec![],
+            stored_gen_col_order: vec![],
         });
         let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(ephemeral_table.clone()));
 
@@ -1732,8 +1781,12 @@ fn emit_delete_insns<'a>(
             let columns_start_reg = program.alloc_registers(cols_len);
 
             // Read all column values from the row to be deleted
-            for (i, _column) in unsafe { &*table_reference }.columns().iter().enumerate() {
-                program.emit_column_or_rowid(main_table_cursor_id, i, columns_start_reg + i);
+            for (i, column) in unsafe { &*table_reference }.columns().iter().enumerate() {
+                if column.is_virtual_generated() {
+                    program.emit_null(columns_start_reg + i, None);
+                } else {
+                    program.emit_column_or_rowid(main_table_cursor_id, i, columns_start_reg + i);
+                }
             }
 
             (Some(columns_start_reg), rowid_reg)
@@ -1890,8 +1943,7 @@ fn emit_delete_row_common(
                 emit_index_column_value_old_image(
                     program,
                     &t_ctx.resolver,
-                    table_references,
-                    connection,
+                    unsafe { &*table_reference }.table.columns(),
                     main_table_cursor_id,
                     column_index,
                     start_reg + reg_offset,
@@ -2009,8 +2061,12 @@ fn emit_delete_insns_when_triggers_present(
         None
     } else {
         let columns_start_reg = program.alloc_registers(cols_len);
-        for (i, _column) in unsafe { &*table_reference }.columns().iter().enumerate() {
-            program.emit_column_or_rowid(main_table_cursor_id, i, columns_start_reg + i);
+        for (i, column) in unsafe { &*table_reference }.columns().iter().enumerate() {
+            if column.is_virtual_generated() {
+                program.emit_null(columns_start_reg + i, None);
+            } else {
+                program.emit_column_or_rowid(main_table_cursor_id, i, columns_start_reg + i);
+            }
         }
         Some(columns_start_reg)
     };
@@ -2420,6 +2476,7 @@ fn emit_update_column_values<'a>(
     t_ctx: &mut TranslateCtx<'a>,
     skip_set_clauses: bool,
     skip_row_label: BranchOffset,
+    rowid_reg: Option<usize>,
 ) -> crate::Result<()> {
     let or_conflict = program.resolve_type;
     if has_direct_rowid_update {
@@ -2564,38 +2621,45 @@ fn emit_update_column_values<'a>(
             }
         } else {
             // Column is not being updated, read it from the table
-            let column_idx_in_index = index.as_ref().and_then(|(idx, _)| {
-                idx.columns
-                    .iter()
-                    .position(|c| Some(&c.name) == table_column.name.as_ref())
-            });
-
-            // don't emit null for pkey of virtual tables. they require first two args
-            // before the 'record' to be explicitly non-null
-            if table_column.is_rowid_alias() && !is_virtual {
+            // Skip VIRTUAL generated columns - they are computed on-the-fly and not stored
+            if table_column.is_virtual_generated() {
+                // VIRTUAL columns are not stored, emit NULL as placeholder
+                // (the actual value will be computed during SELECT)
                 program.emit_null(target_reg, None);
-            } else if is_virtual {
-                program.emit_insn(Insn::VColumn {
-                    cursor_id: target_table_cursor_id,
-                    column: idx,
-                    dest: target_reg,
-                });
             } else {
-                let cursor_id = *index
-                    .as_ref()
-                    .and_then(|(_, id)| {
-                        if column_idx_in_index.is_some() {
-                            Some(id)
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap_or(&target_table_cursor_id);
-                program.emit_column_or_rowid(
-                    cursor_id,
-                    column_idx_in_index.unwrap_or(idx),
-                    target_reg,
-                );
+                let column_idx_in_index = index.as_ref().and_then(|(idx, _)| {
+                    idx.columns
+                        .iter()
+                        .position(|c| Some(&c.name) == table_column.name.as_ref())
+                });
+
+                // don't emit null for pkey of virtual tables. they require first two args
+                // before the 'record' to be explicitly non-null
+                if table_column.is_rowid_alias() && !is_virtual {
+                    program.emit_null(target_reg, None);
+                } else if is_virtual {
+                    program.emit_insn(Insn::VColumn {
+                        cursor_id: target_table_cursor_id,
+                        column: idx,
+                        dest: target_reg,
+                    });
+                } else {
+                    let cursor_id = *index
+                        .as_ref()
+                        .and_then(|(_, id)| {
+                            if column_idx_in_index.is_some() {
+                                Some(id)
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or(&target_table_cursor_id);
+                    program.emit_column_or_rowid(
+                        cursor_id,
+                        column_idx_in_index.unwrap_or(idx),
+                        target_reg,
+                    );
+                }
             }
 
             if let Some(cdc_updates_register) = cdc_updates_register {
@@ -2605,6 +2669,297 @@ fn emit_update_column_values<'a>(
                 program.mark_last_insn_constant();
                 program.emit_null(value_reg, None);
                 program.mark_last_insn_constant();
+            }
+        }
+    }
+
+    // Recompute STORED generated columns that depend on updated columns.
+    let column_lookup = target_table.table.column_name_to_index_map();
+    let columns = target_table.table.columns();
+    let initial_updated: Vec<usize> = set_clauses.iter().map(|(i, _)| *i).collect();
+    let not_null_handler = match or_conflict {
+        ResolveType::Ignore => NotNullHandler::SkipRow {
+            label: skip_row_label,
+        },
+        _ => NotNullHandler::Abort,
+    };
+    recompute_stored_generated_columns(
+        program,
+        columns,
+        &column_lookup,
+        &initial_updated,
+        start,
+        rowid_reg,
+        table_name,
+        &t_ctx.resolver,
+        &not_null_handler,
+        target_table.table.stored_gen_col_order(),
+    )?;
+
+    Ok(())
+}
+
+/// Propagate "updated" status through VIRTUAL columns.
+///
+/// When a base column is updated, any VIRTUAL column that depends on it should be
+/// considered "updated" for the purposes of recomputing STORED columns that depend
+/// on those VIRTUAL columns. This handles transitive dependencies:
+/// STORED A -> depends on -> VIRTUAL B -> depends on -> regular column C
+///
+/// When C is updated, B should be marked as updated so A gets recomputed.
+pub(super) fn propagate_virtual_column_updates(
+    columns: &[crate::schema::Column],
+    column_lookup: &HashMap<String, usize>,
+    updated_col_set: &mut HashSet<usize>,
+) -> crate::Result<()> {
+    // Maximum iterations = number of VIRTUAL columns + 1
+    // In a valid acyclic graph, we can add at most one column per iteration.
+    // If we exceed this, there's a cyclic dependency that slipped past validation.
+    let max_iterations = columns.iter().filter(|c| c.is_virtual_generated()).count() + 1;
+    let mut iterations = 0;
+
+    loop {
+        iterations += 1;
+        if iterations > max_iterations {
+            crate::bail_corrupt_error!("circular dependency detected in VIRTUAL generated columns");
+        }
+
+        let mut made_progress = false;
+        for (idx, col) in columns.iter().enumerate() {
+            // Only process virtual (non-stored) generated columns that aren't already in the set
+            if col.is_virtual_generated() && !updated_col_set.contains(&idx) {
+                if let Some(ref gen_expr) = col.generated {
+                    let deps = crate::schema::collect_column_refs(gen_expr);
+                    let any_dep_updated = deps.iter().any(|dep_name| {
+                        column_lookup
+                            .get(&dep_name.to_lowercase())
+                            .is_some_and(|&dep_idx| updated_col_set.contains(&dep_idx))
+                    });
+                    if any_dep_updated {
+                        updated_col_set.insert(idx);
+                        made_progress = true;
+                    }
+                }
+            }
+        }
+        if !made_progress {
+            break Ok(());
+        }
+    }
+}
+
+/// How to handle NOT NULL violations on recomputed STORED generated columns.
+pub(super) enum NotNullHandler {
+    /// IGNORE mode: skip the row on NOT NULL violation (branch to this label).
+    SkipRow { label: BranchOffset },
+    /// ABORT mode: halt with error on NOT NULL violation.
+    Abort,
+}
+
+/// Recompute STORED generated columns that depend on updated columns.
+///
+/// Shared by both UPDATE (emitter.rs) and UPSERT DO UPDATE (upsert.rs).
+/// After all SET clause values have been written to registers, this function:
+/// 1. Propagates "updated" status through VIRTUAL column chains
+/// 2. Topologically sorts STORED generated columns
+/// 3. For each that depends on an updated column: re-evaluates the expression,
+///    applies affinity, and checks NOT NULL constraints.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn recompute_stored_generated_columns(
+    program: &mut ProgramBuilder,
+    columns: &[crate::schema::Column],
+    column_lookup: &HashMap<String, usize>,
+    initial_updated_cols: &[usize],
+    registers_start: usize,
+    rowid_reg: Option<usize>,
+    table_name: &str,
+    resolver: &Resolver,
+    not_null_handler: &NotNullHandler,
+    sorted_gen_col_indices: &[usize],
+) -> crate::Result<()> {
+    use crate::error::SQLITE_CONSTRAINT_NOTNULL;
+
+    let mut updated_col_set: HashSet<usize> = initial_updated_cols.iter().copied().collect();
+
+    // Propagate "updated" status through VIRTUAL columns for transitive dependencies
+    propagate_virtual_column_updates(columns, column_lookup, &mut updated_col_set)?;
+
+    for idx in sorted_gen_col_indices.iter().copied() {
+        let table_column = &columns[idx];
+        if let Some(generated_expr) = &table_column.generated {
+            let deps = crate::schema::collect_column_refs(generated_expr);
+
+            // Check if any direct dependency is in updated_col_set.
+            // The direct-dep check works because:
+            // - We re-propagate through VIRTUAL columns after each STORED column
+            //   is added to updated_col_set, so chains like
+            //   STORED_s2 → VIRTUAL_v1 → STORED_s1 are handled
+            // - Topological order ensures STORED deps are processed first
+            let needs_recompute = deps.iter().any(|dep_name| {
+                column_lookup
+                    .get(&dep_name.to_lowercase())
+                    .is_some_and(|&dep_idx| updated_col_set.contains(&dep_idx))
+            });
+
+            if needs_recompute {
+                let target_reg = registers_start + idx;
+                emit_generated_expr_from_registers(
+                    program,
+                    generated_expr,
+                    target_reg,
+                    registers_start,
+                    column_lookup,
+                    columns,
+                    resolver,
+                    rowid_reg,
+                )?;
+                program.emit_insn(Insn::Affinity {
+                    start_reg: target_reg,
+                    count: NonZeroUsize::MIN,
+                    affinities: table_column.affinity().aff_mask().to_string(),
+                });
+
+                if table_column.notnull() {
+                    match not_null_handler {
+                        NotNullHandler::SkipRow { label } => {
+                            program.emit_insn(Insn::IsNull {
+                                reg: target_reg,
+                                target_pc: *label,
+                            });
+                        }
+                        NotNullHandler::Abort => {
+                            program.emit_insn(Insn::HaltIfNull {
+                                target_reg,
+                                err_code: SQLITE_CONSTRAINT_NOTNULL,
+                                description: format!(
+                                    "{}.{}",
+                                    table_name,
+                                    table_column
+                                        .name
+                                        .as_ref()
+                                        .expect("Column name must be present")
+                                ),
+                            });
+                        }
+                    }
+                }
+
+                updated_col_set.insert(idx);
+                // Re-propagate through VIRTUAL columns now that this STORED
+                // column is in the updated set. This handles chains like:
+                // STORED_s2 → VIRTUAL_v1 → STORED_s1 → base_col
+                // where s1 being marked as updated should propagate to v1,
+                // making s2 eligible for recomputation.
+                propagate_virtual_column_updates(columns, column_lookup, &mut updated_col_set)?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Emit bytecode to evaluate a generated expression using register values.
+/// This is used for STORED generated columns in UPDATE, where the expression
+/// should use the NEW values of columns (from registers) rather than old values (from cursor).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn emit_generated_expr_from_registers(
+    program: &mut ProgramBuilder,
+    expr: &turso_parser::ast::Expr,
+    target_reg: usize,
+    registers_start: usize,
+    column_lookup: &HashMap<String, usize>,
+    columns: &[crate::schema::Column],
+    resolver: &Resolver,
+    rowid_reg: Option<usize>,
+) -> crate::Result<()> {
+    use super::expr::{translate_expr_with_context, ExprContext};
+
+    // Use the unified evaluator with UpdateGenerated context
+    let context = ExprContext::UpdateGenerated {
+        registers_start,
+        column_lookup,
+        columns,
+        rowid_reg,
+    };
+    translate_expr_with_context(program, &context, expr, target_reg, resolver)?;
+    Ok(())
+}
+
+/// Compute VIRTUAL generated column values into their registers for trigger access during UPDATE.
+/// This is needed because VIRTUAL columns normally store NULL (computed on read),
+/// but triggers need the actual computed values in NEW contexts.
+///
+/// Similar to `compute_virtual_columns_for_triggers` in insert.rs, but adapted for UPDATE
+/// which uses a different register layout and doesn't have ColMapping structures.
+pub(super) fn compute_virtual_columns_for_update_triggers(
+    program: &mut ProgramBuilder,
+    columns: &[crate::schema::Column],
+    registers_start: usize,
+    column_lookup: &HashMap<String, usize>,
+    resolver: &Resolver,
+    rowid_reg: Option<usize>,
+) -> crate::Result<()> {
+    for (idx, column) in columns.iter().enumerate() {
+        if column.is_virtual_generated() {
+            if let Some(gen_expr) = &column.generated {
+                let target_reg = registers_start + idx;
+                emit_generated_expr_from_registers(
+                    program,
+                    gen_expr,
+                    target_reg,
+                    registers_start,
+                    column_lookup,
+                    columns,
+                    resolver,
+                    rowid_reg,
+                )?;
+                // Apply affinity for consistency
+                program.emit_insn(Insn::Affinity {
+                    start_reg: target_reg,
+                    count: NonZeroUsize::MIN,
+                    affinities: column.affinity().aff_mask().to_string(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Compute VIRTUAL generated column values for OLD context in UPDATE triggers.
+/// This variant takes a slice of register indices instead of a contiguous start,
+/// since OLD registers are allocated individually rather than contiguously.
+pub(super) fn compute_virtual_columns_for_old_context(
+    program: &mut ProgramBuilder,
+    columns: &[crate::schema::Column],
+    old_registers: &[usize],
+    column_lookup: &HashMap<String, usize>,
+    resolver: &Resolver,
+) -> crate::Result<()> {
+    use super::expr::{translate_expr_with_context, ExprContext};
+
+    // For OLD context, we need a custom approach since registers aren't contiguous.
+    // We'll evaluate each VIRTUAL column's expression using the OLD register values.
+    for (idx, column) in columns.iter().enumerate() {
+        if column.is_virtual_generated() {
+            if let Some(gen_expr) = &column.generated {
+                // The target register for this column in OLD context
+                let target_reg = old_registers[idx];
+
+                // Create a mapping from column index to OLD register
+                // Since OLD registers aren't contiguous, we need custom context
+                let context = ExprContext::OldGenerated {
+                    source: super::expr::OldColumnSource::Registers(old_registers),
+                    column_lookup,
+                    columns,
+                };
+                translate_expr_with_context(program, &context, gen_expr, target_reg, resolver)?;
+
+                // Apply affinity for consistency
+                program.emit_insn(Insn::Affinity {
+                    start_reg: target_reg,
+                    count: NonZeroUsize::MIN,
+                    affinities: column.affinity().aff_mask().to_string(),
+                });
             }
         }
     }
@@ -2794,6 +3149,7 @@ fn emit_update_insns<'a>(
         t_ctx,
         skip_set_clauses,
         skip_row_label,
+        Some(rowid_set_clause_reg.unwrap_or(beg)),
     )?;
 
     // For non-STRICT tables, apply column affinity to the NEW values early.
@@ -2830,10 +3186,15 @@ fn emit_update_insns<'a>(
             &btree_table,
         );
         // Read OLD row values for trigger context
+        let columns = target_table.table.columns();
         let old_registers: Vec<usize> = (0..col_len)
             .map(|i| {
                 let reg = program.alloc_register();
-                program.emit_column_or_rowid(target_table_cursor_id, i, reg);
+                if columns[i].is_virtual_generated() {
+                    program.emit_null(reg, None);
+                } else {
+                    program.emit_column_or_rowid(target_table_cursor_id, i, reg);
+                }
                 reg
             })
             .chain(std::iter::once(beg))
@@ -2842,6 +3203,33 @@ fn emit_update_insns<'a>(
         if !has_relevant_triggers {
             Some(old_registers)
         } else {
+            // Compute VIRTUAL column values for trigger access
+            // VIRTUAL columns are normally NULL (computed on read), but triggers need actual values
+            let column_lookup: HashMap<String, usize> = columns
+                .iter()
+                .enumerate()
+                .filter_map(|(i, col)| col.name.as_ref().map(|name| (name.to_lowercase(), i)))
+                .collect();
+
+            // Compute VIRTUAL columns for NEW values (contiguous registers at 'start')
+            compute_virtual_columns_for_update_triggers(
+                program,
+                columns,
+                start,
+                &column_lookup,
+                &t_ctx.resolver,
+                Some(beg),
+            )?;
+
+            // Compute VIRTUAL columns for OLD values (non-contiguous registers in old_registers slice)
+            compute_virtual_columns_for_old_context(
+                program,
+                columns,
+                &old_registers,
+                &column_lookup,
+                &t_ctx.resolver,
+            )?;
+
             // NEW row values are already in 'start' registers
             let new_registers = (0..col_len)
                 .map(|i| start + i)
@@ -2952,6 +3340,7 @@ fn emit_update_insns<'a>(
                 t_ctx,
                 skip_set_clauses,
                 skip_row_label,
+                Some(rowid_set_clause_reg.unwrap_or(beg)),
             )?;
         }
     }
@@ -3245,8 +3634,7 @@ fn emit_update_insns<'a>(
             emit_index_column_value_old_image(
                 program,
                 &t_ctx.resolver,
-                table_references,
-                connection,
+                target_table.table.columns(),
                 target_table_cursor_id,
                 column_index,
                 delete_start_reg + reg_offset,
@@ -3392,8 +3780,7 @@ fn emit_update_insns<'a>(
                             emit_index_column_value_old_image(
                                 program,
                                 &t_ctx.resolver,
-                                table_references,
-                                connection,
+                                target_table.table.columns(),
                                 target_table_cursor_id,
                                 column_index,
                                 other_start_reg + reg_offset,
@@ -3537,8 +3924,7 @@ fn emit_update_insns<'a>(
                             emit_index_column_value_old_image(
                                 program,
                                 &t_ctx.resolver,
-                                table_references,
-                                connection,
+                                target_table.table.columns(),
                                 target_table_cursor_id,
                                 column_index,
                                 other_start_reg + reg_offset,
@@ -3597,21 +3983,7 @@ fn emit_update_insns<'a>(
         }
 
         let record_reg = program.alloc_register();
-
-        let affinity_str = target_table
-            .table
-            .columns()
-            .iter()
-            .map(|col| col.affinity().aff_mask())
-            .collect::<String>();
-
-        program.emit_insn(Insn::MakeRecord {
-            start_reg: to_u16(start),
-            count: to_u16(col_len),
-            dest_reg: to_u16(record_reg),
-            index_name: None,
-            affinity_str: Some(affinity_str),
-        });
+        emit_make_record_without_virtual(program, target_table.table.columns(), start, record_reg);
 
         if not_exists_check_required {
             program.emit_insn(Insn::NotExists {
@@ -3715,6 +4087,36 @@ fn emit_update_insns<'a>(
             );
             let has_relevant_triggers = relevant_triggers.clone().count() > 0;
             if has_relevant_triggers {
+                // Compute VIRTUAL column values for trigger access
+                // VIRTUAL columns are normally NULL (computed on read), but triggers need actual values
+                let columns = target_table.table.columns();
+                let column_lookup: HashMap<String, usize> = columns
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, col)| col.name.as_ref().map(|name| (name.to_lowercase(), i)))
+                    .collect();
+
+                // Compute VIRTUAL columns for NEW values
+                compute_virtual_columns_for_update_triggers(
+                    program,
+                    columns,
+                    start,
+                    &column_lookup,
+                    &t_ctx.resolver,
+                    Some(beg),
+                )?;
+
+                // Compute VIRTUAL columns for OLD values if we have preserved OLD registers
+                if let Some(ref old_regs) = preserved_old_registers {
+                    compute_virtual_columns_for_old_context(
+                        program,
+                        columns,
+                        old_regs,
+                        &column_lookup,
+                        &t_ctx.resolver,
+                    )?;
+                }
+
                 let new_rowid_reg = rowid_set_clause_reg.unwrap_or(beg);
                 let new_registers_after = (0..col_len)
                     .map(|i| start + i)
@@ -3938,7 +4340,9 @@ pub fn emit_cdc_full_record(
 ) -> usize {
     let columns_reg = program.alloc_registers(columns.len() + 1);
     for (i, column) in columns.iter().enumerate() {
-        if column.is_rowid_alias() {
+        if column.is_virtual_generated() {
+            program.emit_null(columns_reg + 1 + i, None);
+        } else if column.is_rowid_alias() {
             program.emit_insn(Insn::Copy {
                 src_reg: rowid_reg,
                 dst_reg: columns_reg + 1 + i,
@@ -4230,33 +4634,45 @@ fn rewrite_where_for_update_registers(
 }
 
 /// Emit code to load the value of an IndexColumn from the OLD image of the row being updated.
-/// Handling expression indexes and regular columns
+/// Handling expression indexes and regular columns.
+///
+/// For expression indexes that reference VIRTUAL columns, this function properly
+/// evaluates the VIRTUAL column expressions recursively. Regular columns are read
+/// directly from the cursor since they represent the old (stored) values.
 fn emit_index_column_value_old_image(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
-    table_references: &mut TableReferences,
-    connection: &Arc<Connection>,
+    columns: &[Column],
     table_cursor_id: usize,
     idx_col: &IndexColumn,
     dest_reg: usize,
 ) -> Result<()> {
     if let Some(expr) = &idx_col.expr {
-        let mut expr = expr.as_ref().clone();
-        bind_and_rewrite_expr(
-            &mut expr,
-            Some(table_references),
-            None,
-            connection,
-            BindingBehavior::ResultColumnsNotAllowed,
-        )?;
-        translate_expr_no_constant_opt(
-            program,
-            Some(table_references),
-            &expr,
-            dest_reg,
-            resolver,
-            NoConstantOptReason::RegisterReuse,
-        )?;
+        // Build column lookup for OldGenerated context.
+        // This properly evaluates VIRTUAL column expressions recursively,
+        // while reading regular columns from the cursor.
+        let column_lookup: HashMap<String, usize> = columns
+            .iter()
+            .enumerate()
+            .filter_map(|(i, col)| col.name.as_ref().map(|n| (n.to_lowercase(), i)))
+            .collect();
+
+        let context = ExprContext::OldGenerated {
+            source: super::expr::OldColumnSource::Cursor(table_cursor_id),
+            columns,
+            column_lookup: &column_lookup,
+        };
+        translate_expr_with_context(program, &context, expr.as_ref(), dest_reg, resolver)?;
+
+        // Apply column affinity for VIRTUAL columns. This ensures INTEGER→REAL
+        // conversions (and other affinity rules) happen per SQLite's documentation.
+        if let Some(affinity) = &idx_col.affinity {
+            program.emit_insn(Insn::Affinity {
+                start_reg: dest_reg,
+                count: NonZeroUsize::MIN,
+                affinities: affinity.aff_mask().to_string(),
+            });
+        }
     } else {
         program.emit_column_or_rowid(table_cursor_id, idx_col.pos_in_table, dest_reg);
     }
@@ -4275,16 +4691,31 @@ fn emit_index_column_value_new_image(
     dest_reg: usize,
 ) -> Result<()> {
     if let Some(expr) = &idx_col.expr {
-        let mut expr = expr.as_ref().clone();
-        rewrite_where_for_update_registers(&mut expr, columns, columns_start_reg, rowid_reg)?;
-        translate_expr_no_constant_opt(
-            program,
-            None,
-            &expr,
-            dest_reg,
-            resolver,
-            NoConstantOptReason::RegisterReuse,
-        )?;
+        // Build column lookup for UpdateGenerated context.
+        // This properly evaluates VIRTUAL column expressions instead of just
+        // reading from registers (which would have NULL for VIRTUAL columns).
+        let column_lookup: HashMap<String, usize> = columns
+            .iter()
+            .enumerate()
+            .filter_map(|(i, col)| col.name.as_ref().map(|n| (n.to_lowercase(), i)))
+            .collect();
+
+        let context = ExprContext::UpdateGenerated {
+            registers_start: columns_start_reg,
+            column_lookup: &column_lookup,
+            columns,
+            rowid_reg: Some(rowid_reg),
+        };
+        translate_expr_with_context(program, &context, expr.as_ref(), dest_reg, resolver)?;
+        // Apply column affinity for VIRTUAL columns. This ensures INTEGER→REAL
+        // conversions (and other affinity rules) happen per SQLite's documentation.
+        if let Some(affinity) = &idx_col.affinity {
+            program.emit_insn(Insn::Affinity {
+                start_reg: dest_reg,
+                count: NonZeroUsize::MIN,
+                affinities: affinity.aff_mask().to_string(),
+            });
+        }
     } else {
         let col_in_table = columns
             .get(idx_col.pos_in_table)
