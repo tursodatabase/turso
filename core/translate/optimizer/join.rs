@@ -14,8 +14,8 @@ use crate::{
         expr::{walk_expr, WalkControl},
         optimizer::{
             access_method::{
-                consider_multi_index_and_scan, consider_multi_index_scan, estimate_hash_join_cost,
-                try_hash_join_access_method, AccessMethodParams,
+                consider_multi_index_intersection, consider_multi_index_union,
+                estimate_hash_join_cost, try_hash_join_access_method, AccessMethodParams,
             },
             cost::{Cost, RowCountEstimate},
             order::plan_satisfies_order_target,
@@ -151,10 +151,11 @@ pub fn join_lhs_and_rhs<'a>(
     // If we have a previous table, consider hash join as an alternative
     let mut best_access_method = method;
 
-    // Consider multi-index scan (OR-by-union) as an alternative for BTree tables
+    // Consider multi-index scans (OR-by-union and AND-by-intersection) for BTree tables
     // Only when accessing a single table (no LHS) and the table has a rowid
     if lhs.is_none() && rhs_table_reference.btree().is_some_and(|b| b.has_rowid) {
-        if let Some(multi_idx_method) = consider_multi_index_scan(
+        // Try OR-by-union
+        if let Some(multi_idx_method) = consider_multi_index_union(
             rhs_table_reference,
             where_clause,
             available_indexes,
@@ -169,8 +170,8 @@ pub fn join_lhs_and_rhs<'a>(
             best_access_method = multi_idx_method;
         }
 
-        // Consider multi-index intersection (AND-by-intersection) as an alternative
-        if let Some(multi_idx_and_method) = consider_multi_index_and_scan(
+        // Try AND-by-intersection
+        if let Some(multi_idx_and_method) = consider_multi_index_intersection(
             rhs_table_reference,
             where_clause,
             available_indexes,
