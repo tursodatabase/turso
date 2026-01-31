@@ -2813,11 +2813,7 @@ pub(super) fn recompute_stored_generated_columns(
                     resolver,
                     rowid_reg,
                 )?;
-                program.emit_insn(Insn::Affinity {
-                    start_reg: target_reg,
-                    count: NonZeroUsize::MIN,
-                    affinities: table_column.affinity().aff_mask().to_string(),
-                });
+                program.emit_column_affinity(target_reg, table_column.affinity());
 
                 if table_column.notnull() {
                     match not_null_handler {
@@ -2885,81 +2881,63 @@ pub(super) fn emit_generated_expr_from_registers(
     Ok(())
 }
 
-/// Compute VIRTUAL generated column values into their registers for trigger access during UPDATE.
-/// This is needed because VIRTUAL columns normally store NULL (computed on read),
-/// but triggers need the actual computed values in NEW contexts.
-///
-/// Similar to `compute_virtual_columns_for_triggers` in insert.rs, but adapted for UPDATE
-/// which uses a different register layout and doesn't have ColMapping structures.
-pub(super) fn compute_virtual_columns_for_update_triggers(
-    program: &mut ProgramBuilder,
-    columns: &[crate::schema::Column],
-    registers_start: usize,
-    column_lookup: &HashMap<String, usize>,
-    resolver: &Resolver,
-    rowid_reg: Option<usize>,
-) -> crate::Result<()> {
-    for (idx, column) in columns.iter().enumerate() {
-        if column.is_virtual_generated() {
-            if let Some(gen_expr) = &column.generated {
-                let target_reg = registers_start + idx;
-                emit_generated_expr_from_registers(
-                    program,
-                    gen_expr,
-                    target_reg,
-                    registers_start,
-                    column_lookup,
-                    columns,
-                    resolver,
-                    rowid_reg,
-                )?;
-                // Apply affinity for consistency
-                program.emit_insn(Insn::Affinity {
-                    start_reg: target_reg,
-                    count: NonZeroUsize::MIN,
-                    affinities: column.affinity().aff_mask().to_string(),
-                });
-            }
-        }
-    }
-    Ok(())
+/// Describes how virtual column registers are laid out for trigger contexts.
+pub(super) enum VirtualColumnRegisters<'a> {
+    /// Contiguous registers starting at a base offset (NEW context in UPDATE).
+    Contiguous {
+        registers_start: usize,
+        rowid_reg: Option<usize>,
+    },
+    /// Non-contiguous registers indexed per column (OLD context in UPDATE).
+    Indexed(&'a [usize]),
 }
 
-/// Compute VIRTUAL generated column values for OLD context in UPDATE triggers.
-/// This variant takes a slice of register indices instead of a contiguous start,
-/// since OLD registers are allocated individually rather than contiguously.
-pub(super) fn compute_virtual_columns_for_old_context(
+/// Compute VIRTUAL generated column values into their registers for trigger access during UPDATE.
+/// This is needed because VIRTUAL columns normally store NULL (computed on read),
+/// but triggers need the actual computed values in NEW/OLD contexts.
+pub(super) fn compute_virtual_columns_for_update(
     program: &mut ProgramBuilder,
     columns: &[crate::schema::Column],
-    old_registers: &[usize],
+    registers: &VirtualColumnRegisters<'_>,
     column_lookup: &HashMap<String, usize>,
     resolver: &Resolver,
 ) -> crate::Result<()> {
-    use super::expr::{translate_expr_with_context, ExprContext};
+    use super::expr::{translate_expr_with_context, ExprContext, OldColumnSource};
 
-    // For OLD context, we need a custom approach since registers aren't contiguous.
-    // We'll evaluate each VIRTUAL column's expression using the OLD register values.
     for (idx, column) in columns.iter().enumerate() {
         if column.is_virtual_generated() {
             if let Some(gen_expr) = &column.generated {
-                // The target register for this column in OLD context
-                let target_reg = old_registers[idx];
-
-                // Create a mapping from column index to OLD register
-                // Since OLD registers aren't contiguous, we need custom context
-                let context = ExprContext::OldGenerated {
-                    source: super::expr::OldColumnSource::Registers(old_registers),
-                    column_lookup,
-                    columns,
-                };
-                translate_expr_with_context(program, &context, gen_expr, target_reg, resolver)?;
-
-                // Apply affinity for consistency
-                program.emit_insn(Insn::Affinity {
-                    start_reg: target_reg,
-                    count: NonZeroUsize::MIN,
-                    affinities: column.affinity().aff_mask().to_string(),
-                });
+                match registers {
+                    VirtualColumnRegisters::Contiguous {
+                        registers_start,
+                        rowid_reg,
+                    } => {
+                        let target_reg = registers_start + idx;
+                        emit_generated_expr_from_registers(
+                            program,
+                            gen_expr,
+                            target_reg,
+                            *registers_start,
+                            column_lookup,
+                            columns,
+                            resolver,
+                            *rowid_reg,
+                        )?;
+                        program.emit_column_affinity(target_reg, column.affinity());
+                    }
+                    VirtualColumnRegisters::Indexed(old_registers) => {
+                        let target_reg = old_registers[idx];
+                        let context = ExprContext::OldGenerated {
+                            source: OldColumnSource::Registers(old_registers),
+                            column_lookup,
+                            columns,
+                        };
+                        translate_expr_with_context(
+                            program, &context, gen_expr, target_reg, resolver,
+                        )?;
+                        program.emit_column_affinity(target_reg, column.affinity());
+                    }
+                }
             }
         }
     }
@@ -3205,27 +3183,25 @@ fn emit_update_insns<'a>(
         } else {
             // Compute VIRTUAL column values for trigger access
             // VIRTUAL columns are normally NULL (computed on read), but triggers need actual values
-            let column_lookup: HashMap<String, usize> = columns
-                .iter()
-                .enumerate()
-                .filter_map(|(i, col)| col.name.as_ref().map(|name| (name.to_lowercase(), i)))
-                .collect();
+            let column_lookup = crate::schema::build_column_name_lookup(columns);
 
             // Compute VIRTUAL columns for NEW values (contiguous registers at 'start')
-            compute_virtual_columns_for_update_triggers(
+            compute_virtual_columns_for_update(
                 program,
                 columns,
-                start,
+                &VirtualColumnRegisters::Contiguous {
+                    registers_start: start,
+                    rowid_reg: Some(beg),
+                },
                 &column_lookup,
                 &t_ctx.resolver,
-                Some(beg),
             )?;
 
             // Compute VIRTUAL columns for OLD values (non-contiguous registers in old_registers slice)
-            compute_virtual_columns_for_old_context(
+            compute_virtual_columns_for_update(
                 program,
                 columns,
-                &old_registers,
+                &VirtualColumnRegisters::Indexed(&old_registers),
                 &column_lookup,
                 &t_ctx.resolver,
             )?;
@@ -4090,28 +4066,26 @@ fn emit_update_insns<'a>(
                 // Compute VIRTUAL column values for trigger access
                 // VIRTUAL columns are normally NULL (computed on read), but triggers need actual values
                 let columns = target_table.table.columns();
-                let column_lookup: HashMap<String, usize> = columns
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(i, col)| col.name.as_ref().map(|name| (name.to_lowercase(), i)))
-                    .collect();
+                let column_lookup = crate::schema::build_column_name_lookup(columns);
 
                 // Compute VIRTUAL columns for NEW values
-                compute_virtual_columns_for_update_triggers(
+                compute_virtual_columns_for_update(
                     program,
                     columns,
-                    start,
+                    &VirtualColumnRegisters::Contiguous {
+                        registers_start: start,
+                        rowid_reg: Some(beg),
+                    },
                     &column_lookup,
                     &t_ctx.resolver,
-                    Some(beg),
                 )?;
 
                 // Compute VIRTUAL columns for OLD values if we have preserved OLD registers
                 if let Some(ref old_regs) = preserved_old_registers {
-                    compute_virtual_columns_for_old_context(
+                    compute_virtual_columns_for_update(
                         program,
                         columns,
-                        old_regs,
+                        &VirtualColumnRegisters::Indexed(old_regs),
                         &column_lookup,
                         &t_ctx.resolver,
                     )?;
@@ -4667,11 +4641,7 @@ fn emit_index_column_value_old_image(
         // Apply column affinity for VIRTUAL columns. This ensures INTEGER→REAL
         // conversions (and other affinity rules) happen per SQLite's documentation.
         if let Some(affinity) = &idx_col.affinity {
-            program.emit_insn(Insn::Affinity {
-                start_reg: dest_reg,
-                count: NonZeroUsize::MIN,
-                affinities: affinity.aff_mask().to_string(),
-            });
+            program.emit_column_affinity(dest_reg, *affinity);
         }
     } else {
         program.emit_column_or_rowid(table_cursor_id, idx_col.pos_in_table, dest_reg);
@@ -4710,11 +4680,7 @@ fn emit_index_column_value_new_image(
         // Apply column affinity for VIRTUAL columns. This ensures INTEGER→REAL
         // conversions (and other affinity rules) happen per SQLite's documentation.
         if let Some(affinity) = &idx_col.affinity {
-            program.emit_insn(Insn::Affinity {
-                start_reg: dest_reg,
-                count: NonZeroUsize::MIN,
-                affinities: affinity.aff_mask().to_string(),
-            });
+            program.emit_column_affinity(dest_reg, *affinity);
         }
     } else {
         let col_in_table = columns

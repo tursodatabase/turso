@@ -282,9 +282,7 @@ pub fn prepare_update_plan(
                 Some(idx) => {
                     // Check if this is a generated column - cannot update directly
                     let col = &table.columns()[*idx];
-                    if col.is_generated() {
-                        bail_parse_error!("cannot UPDATE generated column \"{}\"", col_name);
-                    }
+                    col.ensure_not_generated("UPDATE", col_name.as_str())?;
                     *idx
                 }
                 None => {

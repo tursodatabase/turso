@@ -1574,6 +1574,16 @@ pub enum Table {
     FromClauseSubquery(FromClauseSubquery),
 }
 
+/// Build a map from lowercased column names to their indices.
+/// Used by both `Table::column_name_to_index_map()` and `BTreeTable::compute_stored_gen_col_order()`.
+pub fn build_column_name_lookup(columns: &[Column]) -> HashMap<String, usize> {
+    columns
+        .iter()
+        .enumerate()
+        .filter_map(|(i, col)| col.name.as_ref().map(|name| (name.to_lowercase(), i)))
+        .collect()
+}
+
 impl Table {
     pub fn get_root_page(&self) -> i64 {
         match self {
@@ -1662,11 +1672,7 @@ impl Table {
     /// Build a map from lowercased column names to their indices.
     /// This is useful for looking up columns by name in generated column expressions.
     pub fn column_name_to_index_map(&self) -> rustc_hash::FxHashMap<String, usize> {
-        self.columns()
-            .iter()
-            .enumerate()
-            .filter_map(|(i, col)| col.name.as_ref().map(|name| (name.to_lowercase(), i)))
-            .collect()
+        build_column_name_lookup(self.columns())
     }
 }
 
@@ -1728,11 +1734,7 @@ impl BTreeTable {
     pub fn compute_stored_gen_col_order(columns: &[Column]) -> Result<Vec<usize>> {
         use std::collections::VecDeque;
 
-        let column_lookup: HashMap<String, usize> = columns
-            .iter()
-            .enumerate()
-            .filter_map(|(i, col)| col.name.as_ref().map(|n| (n.to_lowercase(), i)))
-            .collect();
+        let column_lookup = build_column_name_lookup(columns);
 
         // Recursively find all STORED columns that a column transitively depends on,
         // traversing through VIRTUAL columns.
@@ -3039,6 +3041,15 @@ impl Column {
     #[inline]
     pub fn is_generated(&self) -> bool {
         self.generated.is_some()
+    }
+
+    /// Returns an error if this column is a generated column.
+    /// `verb_phrase` should describe the operation, e.g. "INSERT into" or "UPDATE".
+    pub fn ensure_not_generated(&self, verb_phrase: &str, col_name: &str) -> crate::Result<()> {
+        if self.is_generated() {
+            crate::bail_parse_error!("cannot {} generated column \"{}\"", verb_phrase, col_name);
+        }
+        Ok(())
     }
 
     /// Returns true if this is a STORED generated column

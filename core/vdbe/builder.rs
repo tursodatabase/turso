@@ -38,9 +38,11 @@ impl TableRefIdCounter {
     }
 }
 
+use std::num::NonZeroUsize;
+
 use super::{
-    BranchOffset, CursorID, Insn, InsnReference, JumpTarget, PrepareContext, PreparedProgram,
-    Program,
+    affinity::Affinity, BranchOffset, CursorID, Insn, InsnReference, JumpTarget, PrepareContext,
+    PreparedProgram, Program,
 };
 
 /// A key that uniquely identifies a cursor.
@@ -1305,6 +1307,15 @@ impl ProgramBuilder {
         } else {
             self.emit_column(cursor_id, column, out);
         }
+    }
+
+    /// Emit an Affinity instruction for a single register with the given column affinity.
+    pub fn emit_column_affinity(&mut self, register: usize, affinity: Affinity) {
+        self.emit_insn(Insn::Affinity {
+            start_reg: register,
+            count: NonZeroUsize::MIN,
+            affinities: affinity.aff_mask().to_string(),
+        });
     }
 
     fn emit_column(&mut self, cursor_id: CursorID, column: usize, out: usize) {

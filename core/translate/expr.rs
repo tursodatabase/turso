@@ -253,23 +253,24 @@ impl<'a> ExprContext<'a> {
                 column_lookup,
                 columns,
                 rowid_reg,
-            } => {
-                // Look up column by name in the HashMap
-                if let Some(&col_idx) = column_lookup.get(&col_name.to_lowercase()) {
-                    if let Some(col) = columns.get(col_idx) {
-                        if col.is_virtual_generated() {
-                            return self.emit_virtual_column(program, col, target_reg, resolver);
-                        }
-                        // Check if this is a rowid alias column with a separate rowid register
-                        if let Some(rowid_r) = rowid_reg {
-                            if col.is_rowid_alias() {
-                                program.emit_insn(Insn::Copy {
-                                    src_reg: *rowid_r,
-                                    dst_reg: target_reg,
-                                    extra_amount: 0,
-                                });
-                                return Ok(());
-                            }
+            } => self.resolve_generated_column(
+                program,
+                &col_name,
+                name,
+                column_lookup,
+                columns,
+                target_reg,
+                resolver,
+                |program, col_idx, col| {
+                    // Check if this is a rowid alias column with a separate rowid register
+                    if let Some(rowid_r) = rowid_reg {
+                        if col.is_rowid_alias() {
+                            program.emit_insn(Insn::Copy {
+                                src_reg: *rowid_r,
+                                dst_reg: target_reg,
+                                extra_amount: 0,
+                            });
+                            return Ok(());
                         }
                     }
                     // Regular column - copy from calculated register offset
@@ -280,10 +281,8 @@ impl<'a> ExprContext<'a> {
                         extra_amount: 0,
                     });
                     Ok(())
-                } else {
-                    crate::bail_parse_error!("unknown column: {}", name)
-                }
-            }
+                },
+            ),
 
             ExprContext::VirtualColumn {
                 table,
@@ -314,14 +313,15 @@ impl<'a> ExprContext<'a> {
                 source,
                 columns,
                 column_lookup,
-            } => {
-                // Look up column by name in the HashMap
-                if let Some(&col_idx) = column_lookup.get(&col_name.to_lowercase()) {
-                    if let Some(col) = columns.get(col_idx) {
-                        if col.is_virtual_generated() {
-                            return self.emit_virtual_column(program, col, target_reg, resolver);
-                        }
-                    }
+            } => self.resolve_generated_column(
+                program,
+                &col_name,
+                name,
+                column_lookup,
+                columns,
+                target_reg,
+                resolver,
+                |program, col_idx, _col| {
                     // Non-virtual column: read from appropriate source
                     match source {
                         OldColumnSource::Cursor(cursor_id) => {
@@ -337,10 +337,36 @@ impl<'a> ExprContext<'a> {
                         }
                     }
                     Ok(())
-                } else {
-                    crate::bail_parse_error!("unknown column: {}", name)
+                },
+            ),
+        }
+    }
+
+    /// Shared logic for resolving a column reference in generated-column contexts
+    /// (UpdateGenerated and OldGenerated). Looks up the column by name, emits the
+    /// virtual column expression if virtual, or calls `emit_non_virtual` for regular columns.
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_generated_column(
+        &self,
+        program: &mut ProgramBuilder,
+        col_name: &str,
+        original_name: &str,
+        column_lookup: &HashMap<String, usize>,
+        columns: &[crate::schema::Column],
+        target_reg: usize,
+        resolver: &Resolver,
+        emit_non_virtual: impl FnOnce(&mut ProgramBuilder, usize, &Column) -> Result<()>,
+    ) -> Result<()> {
+        if let Some(&col_idx) = column_lookup.get(&col_name.to_lowercase()) {
+            if let Some(col) = columns.get(col_idx) {
+                if col.is_virtual_generated() {
+                    return self.emit_virtual_column(program, col, target_reg, resolver);
                 }
             }
+            let col = &columns[col_idx];
+            emit_non_virtual(program, col_idx, col)
+        } else {
+            crate::bail_parse_error!("unknown column: {}", original_name)
         }
     }
 

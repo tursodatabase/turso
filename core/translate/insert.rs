@@ -1924,12 +1924,7 @@ fn build_insertion<'a>(
             let column_name = normalize_ident(column_name.as_str());
             if let Some((idx_in_table, col_in_table)) = table.get_column_by_name(&column_name) {
                 // Generated columns cannot be written to directly
-                if col_in_table.is_generated() {
-                    crate::bail_parse_error!(
-                        "cannot INSERT into generated column \"{}\"",
-                        column_name
-                    );
-                }
+                col_in_table.ensure_not_generated("INSERT into", &column_name)?;
                 // Named column
                 if col_in_table.is_rowid_alias() {
                     insertion_key = InsertionKey::RowidAlias(ColMapping {
@@ -2183,11 +2178,7 @@ fn translate_column<'a>(
         // column A (both STORED), B must see A's affinity-converted value, not the raw
         // expression result. Without this, INTEGER->REAL->INTEGER chains preserve too
         // much precision because the intermediate REAL conversion doesn't happen.
-        program.emit_insn(Insn::Affinity {
-            start_reg: column_register,
-            count: NonZeroUsize::MIN,
-            affinities: column.affinity().aff_mask().to_string(),
-        });
+        program.emit_column_affinity(column_register, column.affinity());
     } else if let Some(default_expr) = column.default.as_ref() {
         translate_expr(program, None, default_expr, column_register, resolver)?;
     } else {
@@ -2234,11 +2225,7 @@ pub fn compute_virtual_columns_for_triggers<'a>(
                     resolver,
                 )?;
                 // Apply affinity for consistency
-                program.emit_insn(Insn::Affinity {
-                    start_reg: col_mapping.register,
-                    count: NonZeroUsize::MIN,
-                    affinities: col_mapping.column.affinity().aff_mask().to_string(),
-                });
+                program.emit_column_affinity(col_mapping.register, col_mapping.column.affinity());
             }
         }
     }
@@ -2843,11 +2830,7 @@ fn emit_index_column_value_for_insert(
         // Apply column affinity for VIRTUAL columns. This ensures INTEGER→REAL
         // conversions (and other affinity rules) happen per SQLite's documentation.
         if let Some(affinity) = &idx_col.affinity {
-            program.emit_insn(Insn::Affinity {
-                start_reg: dest_reg,
-                count: NonZeroUsize::MIN,
-                affinities: affinity.aff_mask().to_string(),
-            });
+            program.emit_column_affinity(dest_reg, *affinity);
         }
     } else {
         let Some(cm) = insertion.get_col_mapping_by_name(&idx_col.name) else {

@@ -1119,9 +1119,7 @@ pub fn collect_set_clauses_for_upsert(
             let Some(idx) = lookup.get(&normalize_ident(cn.as_str())) else {
                 bail_parse_error!("no such column: {}", cn);
             };
-            if table.columns()[*idx].is_generated() {
-                bail_parse_error!("cannot UPDATE generated column \"{}\"", cn);
-            }
+            table.columns()[*idx].ensure_not_generated("UPDATE", cn.as_str())?;
             if let Some(existing) = out.iter_mut().find(|(i, _)| *i == *idx) {
                 existing.1 = e;
             } else {
