@@ -62,7 +62,10 @@ pub use profile::{
     ExtendedExpressionProfile, ExtendedFunctionProfile, GenerationProfile, InsertProfile,
     SelectProfile, StatementProfile, UpdateProfile, ValueProfile, WeightedProfile,
 };
-pub use schema::{ColumnDef, DataType, Index, Schema, SchemaBuilder, Table, Trigger, View};
+pub use schema::{
+    Collation, ColumnDef, DataType, GeneratedColumn, GeneratedStorage, Index, Schema,
+    SchemaBuilder, Table, Trigger, View,
+};
 pub use select::{OrderByItem, OrderDirection, SelectStatement};
 pub use statement::{SqlStatement, StatementContext, StatementKind};
 pub use transaction::{
