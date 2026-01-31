@@ -25,7 +25,6 @@ pub mod explain;
 #[allow(dead_code)]
 pub mod hash_table;
 pub mod insn;
-pub mod likeop;
 pub mod metrics;
 pub mod rowset;
 pub mod sorter;
@@ -81,7 +80,6 @@ use turso_parser::ast::ResolveType;
 use crate::vdbe::bloom_filter::BloomFilter;
 use crate::vdbe::rowset::RowSet;
 use explain::{insn_to_row_with_comment, EXPLAIN_COLUMNS, EXPLAIN_QUERY_PLAN_COLUMNS};
-use regex::Regex;
 use std::{
     collections::HashMap,
     num::NonZero,
@@ -200,18 +198,6 @@ pub enum StepResult {
     Row,
     Interrupt,
     Busy,
-}
-
-struct RegexCache {
-    glob: HashMap<String, Regex>,
-}
-
-impl RegexCache {
-    fn new() -> Self {
-        Self {
-            glob: HashMap::default(),
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -354,7 +340,6 @@ pub struct ProgramState {
     ended_coroutine: Vec<u32>,
     /// Indicate whether an [Insn::Once] instruction at a given program counter position has already been executed, well, once.
     once: SmallVec<[u32; 4]>,
-    regex_cache: RegexCache,
     pub execution_state: ProgramExecutionState,
     pub parameters: HashMap<NonZero<usize>, Value>,
     commit_state: CommitState,
@@ -443,7 +428,6 @@ impl ProgramState {
             deferred_seeks: vec![None; max_cursors],
             ended_coroutine: vec![],
             once: SmallVec::<[u32; 4]>::new(),
-            regex_cache: RegexCache::new(),
             execution_state: ProgramExecutionState::Init,
             parameters: HashMap::default(),
             commit_state: CommitState::Ready,
