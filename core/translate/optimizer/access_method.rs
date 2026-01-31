@@ -13,7 +13,7 @@ use crate::translate::optimizer::constraints::{
 use crate::translate::optimizer::cost::RowCountEstimate;
 use crate::translate::optimizer::cost_params::CostModelParams;
 use crate::translate::plan::{
-    HashJoinKey, NonFromClauseSubquery, SubqueryState, TableReferences, WhereTerm,
+    HashJoinKey, NonFromClauseSubquery, SetOperation, SubqueryState, TableReferences, WhereTerm,
 };
 use crate::util::exprs_are_equivalent;
 use crate::vdbe::hash_table::DEFAULT_MEM_BUDGET;
@@ -100,15 +100,14 @@ pub enum AccessMethodParams {
     },
     /// Multi-index scan for OR-by-union or AND-by-intersection optimization.
     /// Used when a WHERE clause has OR/AND terms that can each use a different index.
-    /// Example: WHERE a = 1 OR b = 2 with indexes on a and b.
-    /// Example: WHERE a = 1 AND b = 2 with separate indexes on a and b.
+    /// Example: WHERE a = 1 AND|OR b = 2 with separate indexes on a and b.
     MultiIndexScan {
         /// Each branch represents one term with its own index access.
         branches: Vec<MultiIndexBranchParams>,
         /// Index of the primary WHERE term.
         where_term_idx: usize,
         /// The set operation (Union for OR, Intersection for AND).
-        set_op: crate::translate::plan::SetOperation,
+        set_op: SetOperation,
         /// For Intersection: additional WHERE term indices consumed.
         additional_consumed_terms: Vec<usize>,
     },
@@ -127,12 +126,22 @@ pub struct MultiIndexBranchParams {
     pub estimated_rows: f64,
 }
 
+type MultiIdxBranch = (Option<Arc<Index>>, Constraint, Vec<RangeConstraintRef>, f64);
+
 /// Computes IndexInfo for a multi-index branch given an optional index and table reference.
-fn index_info_for_branch(index: Option<&Index>, rhs_table: &JoinedTable) -> Option<IndexInfo> {
+///
+/// When `rowid_only` is true (for intersection branches), the index is treated as covering
+/// because we only need to extract rowids during the branch scan, not fetch table data.
+fn index_info_for_branch(
+    index: Option<&Index>,
+    rhs_table: &JoinedTable,
+    rowid_only: bool,
+) -> Option<IndexInfo> {
     match index {
         Some(index) => Some(IndexInfo {
             unique: index.unique,
-            covering: rhs_table.index_is_covering(index),
+            // For intersection branches, we only collect rowids, so treat as covering
+            covering: rowid_only || rhs_table.index_is_covering(index),
             column_count: index.columns.len(),
         }),
         None => Some(IndexInfo {
@@ -144,6 +153,11 @@ fn index_info_for_branch(index: Option<&Index>, rhs_table: &JoinedTable) -> Opti
 }
 
 /// Computes cost and constructs MultiIndexBranchParams for a single branch.
+///
+/// When `rowid_only` is true (for intersection), the branch only scans the index to collect
+/// rowids into a RowSet, so we treat the index as covering (no table lookup during branch scan).
+/// For union branches, we eventually fetch all rows, so covering status depends on the query.
+#[allow(clippy::too_many_arguments)]
 fn compute_branch_cost_and_params(
     index: Option<&Arc<Index>>,
     constraint: &Constraint,
@@ -152,8 +166,9 @@ fn compute_branch_cost_and_params(
     rhs_table: &JoinedTable,
     base_row_count: RowCountEstimate,
     params: &CostModelParams,
+    rowid_only: bool,
 ) -> (Cost, MultiIndexBranchParams) {
-    let index_info = index_info_for_branch(index.map(|i| i.as_ref()), rhs_table);
+    let index_info = index_info_for_branch(index.map(|i| i.as_ref()), rhs_table, rowid_only);
 
     let cost = estimate_cost_for_scan_or_seek(
         index_info,
@@ -400,17 +415,86 @@ fn find_best_access_method_for_vtab(
     }
 }
 
-/// Analyze OR clauses in the WHERE clause and consider multi-index scan access method.
-///
-/// Returns an `AccessMethod` using `MultiIndexScan` if:
-/// 1. There are OR terms that reference the given table
-/// 2. All disjuncts of each OR term can use an index
-/// 3. The estimated cost is lower than the provided best_cost
-///
-/// This function should be called after finding the best regular access method to see
-/// if a multi-index scan would be more efficient for OR clauses.
+/// Evaluates multi-index branches and returns AccessMethod if cost-effective.
 #[allow(clippy::too_many_arguments)]
-pub fn consider_multi_index_scan(
+fn evaluate_multi_index_branches(
+    branches: &[MultiIdxBranch],
+    set_op: SetOperation,
+    where_term_idx: usize,
+    additional_consumed_terms: Vec<usize>,
+    rhs_table: &JoinedTable,
+    base_row_count: RowCountEstimate,
+    input_cardinality: f64,
+    params: &CostModelParams,
+    best_cost: Cost,
+) -> Option<AccessMethod> {
+    let mut branch_costs = Vec::with_capacity(branches.len());
+    let mut branch_rows = Vec::with_capacity(branches.len());
+    let mut branch_params = Vec::with_capacity(branches.len());
+
+    for (index, constraint, constraint_refs, estimated_rows) in branches {
+        if constraint_refs.is_empty() {
+            return None; // Cannot use multi-index if any branch has no index
+        }
+
+        let (cost, params_for_branch) = compute_branch_cost_and_params(
+            index.as_ref(),
+            constraint,
+            constraint_refs,
+            *estimated_rows,
+            rhs_table,
+            base_row_count,
+            params,
+            true, // rowid_only: branches only collect rowids
+        );
+
+        branch_costs.push(cost);
+        branch_rows.push(*estimated_rows);
+        branch_params.push(params_for_branch);
+    }
+
+    let multi_index_cost = match set_op {
+        SetOperation::Union => estimate_multi_index_scan_cost(
+            &branch_costs,
+            &branch_rows,
+            base_row_count,
+            input_cardinality,
+            params,
+        ),
+        SetOperation::Intersection => {
+            let (cost, _) = estimate_multi_index_intersection_cost(
+                &branch_costs,
+                &branch_rows,
+                base_row_count,
+                input_cardinality,
+                params,
+            );
+            cost
+        }
+    };
+
+    if multi_index_cost < best_cost {
+        Some(AccessMethod {
+            cost: multi_index_cost,
+            params: AccessMethodParams::MultiIndexScan {
+                branches: branch_params,
+                where_term_idx,
+                set_op,
+                additional_consumed_terms,
+            },
+        })
+    } else {
+        None
+    }
+}
+
+/// Analyze OR clauses for multi-index union optimization.
+///
+/// Returns an `AccessMethod` using `MultiIndexScan` with `SetOperation::Union` if:
+/// 1. An OR term has all disjuncts indexable on different indexes
+/// 2. The estimated cost is lower than the provided best_cost
+#[allow(clippy::too_many_arguments)]
+pub fn consider_multi_index_union(
     rhs_table: &JoinedTable,
     where_clause: &[WhereTerm],
     available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
@@ -422,19 +506,15 @@ pub fn consider_multi_index_scan(
     params: &CostModelParams,
     best_cost: Cost,
 ) -> Option<AccessMethod> {
-    // Analyze each WHERE term for OR-by-union optimization
     for (where_term_idx, term) in where_clause.iter().enumerate() {
-        // Skip already consumed terms
         if term.consumed {
             continue;
         }
 
-        // Check if this is an OR expression
         let ast::Expr::Binary(_, ast::Operator::Or, _) = &term.expr else {
             continue;
         };
 
-        // Analyze the OR term for multi-index scan potential
         let Some(decomposition) = analyze_or_term_for_multi_index(
             where_term_idx,
             &term.expr,
@@ -448,80 +528,59 @@ pub fn consider_multi_index_scan(
             continue;
         };
 
-        // All disjuncts must be indexable for multi-index scan
         if !decomposition.all_indexable {
             continue;
         }
 
-        // Calculate cost for each branch
-        let mut branch_costs = Vec::new();
-        let mut branch_rows = Vec::new();
-        let mut branch_params = Vec::new();
+        // Extract branch info from disjuncts
+        let branches: Option<Vec<_>> = decomposition
+            .disjuncts
+            .iter()
+            .map(|d| {
+                d.constraint.as_ref().map(|c| {
+                    (
+                        d.best_index.clone(),
+                        c.clone(),
+                        d.constraint_refs.clone(),
+                        d.estimated_rows,
+                    )
+                })
+            })
+            .collect();
 
-        for disjunct in &decomposition.disjuncts {
-            if disjunct.constraint_refs.is_empty() {
-                // Cannot use multi-index scan if any branch has no index
-                continue;
-            }
+        let Some(branches) = branches else {
+            continue;
+        };
 
-            let constraint = disjunct.constraint.as_ref()?;
-            let (cost, params_for_branch) = compute_branch_cost_and_params(
-                disjunct.best_index.as_ref(),
-                constraint,
-                &disjunct.constraint_refs,
-                disjunct.estimated_rows,
-                rhs_table,
-                base_row_count,
-                params,
-            );
-
-            branch_costs.push(cost);
-            branch_rows.push(disjunct.estimated_rows);
-            branch_params.push(params_for_branch);
-        }
-
-        if branch_params.is_empty() || branch_params.len() != decomposition.disjuncts.len() {
-            // Not all branches could use an index
+        if branches.len() != decomposition.disjuncts.len() {
             continue;
         }
 
-        // Calculate total cost for multi-index scan
-        let multi_index_cost = estimate_multi_index_scan_cost(
-            &branch_costs,
-            &branch_rows,
+        if let Some(access_method) = evaluate_multi_index_branches(
+            &branches,
+            SetOperation::Union,
+            where_term_idx,
+            vec![],
+            rhs_table,
             base_row_count,
             input_cardinality,
             params,
-        );
-
-        // Only use multi-index scan if it's cheaper than the best alternative
-        if multi_index_cost < best_cost {
-            return Some(AccessMethod {
-                cost: multi_index_cost,
-                params: AccessMethodParams::MultiIndexScan {
-                    branches: branch_params,
-                    where_term_idx,
-                    set_op: crate::translate::plan::SetOperation::Union,
-                    additional_consumed_terms: vec![],
-                },
-            });
+            best_cost,
+        ) {
+            return Some(access_method);
         }
     }
 
     None
 }
 
-/// Analyze AND terms in the WHERE clause and consider multi-index intersection access method.
+/// Analyze AND terms for multi-index intersection optimization.
 ///
 /// Returns an `AccessMethod` using `MultiIndexScan` with `SetOperation::Intersection` if:
-/// 1. Multiple AND terms reference the given table on different indexed columns
-/// 2. No composite index already covers multiple terms
-/// 3. The estimated cost is lower than the provided best_cost
-///
-/// This function should be called after finding the best regular access method to see
-/// if a multi-index intersection would be more efficient for AND clauses.
+/// 1. Multiple AND terms reference different indexed columns
+/// 2. The estimated cost is lower than the provided best_cost
 #[allow(clippy::too_many_arguments)]
-pub fn consider_multi_index_and_scan(
+pub fn consider_multi_index_intersection(
     rhs_table: &JoinedTable,
     where_clause: &[WhereTerm],
     available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
@@ -533,7 +592,6 @@ pub fn consider_multi_index_and_scan(
     params: &CostModelParams,
     best_cost: Cost,
 ) -> Option<AccessMethod> {
-    // Analyze AND terms for multi-index intersection potential
     let decomposition = analyze_and_terms_for_multi_index(
         rhs_table,
         where_clause,
@@ -544,65 +602,39 @@ pub fn consider_multi_index_and_scan(
         params,
     )?;
 
-    // Need at least 2 branches for intersection
     if decomposition.branches.len() < 2 {
         return None;
     }
 
-    // Calculate cost for each branch
-    let mut branch_costs = Vec::new();
-    let mut branch_rows = Vec::new();
-    let mut branch_params = Vec::new();
+    // Extract branch info
+    let branches: Vec<_> = decomposition
+        .branches
+        .iter()
+        .map(|b| {
+            (
+                b.index.clone(),
+                b.constraint.clone(),
+                b.constraint_refs.clone(),
+                b.estimated_rows,
+            )
+        })
+        .collect::<Vec<MultiIdxBranch>>();
 
-    for branch in &decomposition.branches {
-        if branch.constraint_refs.is_empty() {
-            // Cannot use multi-index intersection if any branch has no index
-            return None;
-        }
+    let where_term_idx = decomposition.term_indices[0];
+    let additional_consumed_terms: Vec<usize> =
+        decomposition.term_indices.iter().skip(1).copied().collect();
 
-        let (cost, params_for_branch) = compute_branch_cost_and_params(
-            branch.index.as_ref(),
-            &branch.constraint,
-            &branch.constraint_refs,
-            branch.estimated_rows,
-            rhs_table,
-            base_row_count,
-            params,
-        );
-
-        branch_costs.push(cost);
-        branch_rows.push(branch.estimated_rows);
-        branch_params.push(params_for_branch);
-    }
-
-    // Calculate total cost for multi-index intersection
-    let (multi_index_cost, _estimated_rows) = estimate_multi_index_intersection_cost(
-        &branch_costs,
-        &branch_rows,
+    evaluate_multi_index_branches(
+        &branches,
+        SetOperation::Intersection,
+        where_term_idx,
+        additional_consumed_terms,
+        rhs_table,
         base_row_count,
         input_cardinality,
         params,
-    );
-
-    // Only use multi-index intersection if it's cheaper than the best alternative
-    if multi_index_cost < best_cost {
-        // The first term index becomes where_term_idx, rest go to additional_consumed_terms
-        let where_term_idx = decomposition.term_indices[0];
-        let additional_consumed_terms: Vec<usize> =
-            decomposition.term_indices.iter().skip(1).copied().collect();
-
-        return Some(AccessMethod {
-            cost: multi_index_cost,
-            params: AccessMethodParams::MultiIndexScan {
-                branches: branch_params,
-                where_term_idx,
-                set_op: crate::translate::plan::SetOperation::Intersection,
-                additional_consumed_terms,
-            },
-        });
-    }
-
-    None
+        best_cost,
+    )
 }
 
 /// Collect all table IDs referenced in an expression.

@@ -1504,9 +1504,9 @@ fn analyze_binary_term_for_index(
     };
 
     // Store the pre-computed constraining expression for multi-index branches
-    let stored_constraining_expr = operator.as_ast_operator().map(|ast_op| {
-        (ast_op, constraining_expr.clone(), affinity)
-    });
+    let stored_constraining_expr = operator
+        .as_ast_operator()
+        .map(|ast_op| (ast_op, constraining_expr.clone(), affinity));
 
     let constraint = Constraint {
         where_clause_pos: (where_term_idx, side),

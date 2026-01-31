@@ -281,15 +281,12 @@ pub fn estimate_multi_index_scan_cost(
     // RowSet operations are O(log n) for balanced tree implementation
     let rowset_ops_cost = total_rows_before_dedup * params.cpu_cost_per_row * 2.0; // add + test
 
-    // Table fetch cost: seek to each unique row
-    let tree_depth = if base_row_count <= 1.0 {
-        1.0
-    } else {
-        (base_row_count.ln() / params.rows_per_page.ln())
-            .ceil()
-            .max(1.0)
-    };
-    let table_fetch_cost = estimated_unique_rows * tree_depth;
+    // Table fetch cost: use same formula as single-index table lookup for consistency
+    // This models the expected number of pages to fetch, assuming some locality benefit
+    // from sorted rowid access after RowSet deduplication
+    let table_pages = (base_row_count / params.rows_per_page).max(1.0);
+    let selectivity = estimated_unique_rows / base_row_count.max(1.0);
+    let table_fetch_cost = selectivity * table_pages;
 
     // Total cost
     let total_cost = (branch_scan_cost + rowset_ops_cost + table_fetch_cost) * input_cardinality;
@@ -348,15 +345,12 @@ pub fn estimate_multi_index_intersection_cost(
     let rowset_ops_cost =
         (first_branch_rows + subsequent_branch_rows) * params.cpu_cost_per_row * 1.5; // add is cheaper than test+add
 
-    // Table fetch cost: seek to each row in the intersection
-    let tree_depth = if base_row_count <= 1.0 {
-        1.0
-    } else {
-        (base_row_count.ln() / params.rows_per_page.ln())
-            .ceil()
-            .max(1.0)
-    };
-    let table_fetch_cost = estimated_intersection_rows * tree_depth;
+    // Table fetch cost: use same formula as single-index table lookup for consistency
+    // This models the expected number of pages to fetch, assuming some locality benefit
+    // from sorted rowid access after RowSet intersection
+    let table_pages = (base_row_count / params.rows_per_page).max(1.0);
+    let selectivity = estimated_intersection_rows / base_row_count.max(1.0);
+    let table_fetch_cost = selectivity * table_pages;
 
     // Total cost
     let total_cost = (branch_scan_cost + rowset_ops_cost + table_fetch_cost) * input_cardinality;

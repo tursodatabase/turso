@@ -803,68 +803,12 @@ fn emit_hash_build_phase(
 
 /// Emit bytecode for a multi-index scan (OR-by-union or AND-by-intersection).
 ///
-/// For **Union (OR)**: scans each index branch separately, collecting rowids into a RowSet
+/// For *Union (OR)*: scans each index branch separately, collecting rowids into a RowSet
 /// for deduplication, then reads from the RowSet to fetch actual rows.
 ///
-/// For **Intersection (AND)**: uses two RowSets. First branch populates rowset1,
+/// For *Intersection (AND)*: uses two RowSets. First branch populates rowset1,
 /// subsequent branches test against rowset1 and add found rows to rowset2.
 /// Only rowids appearing in ALL branches end up in the final result.
-///
-/// Union bytecode structure:
-/// ```text
-/// ; Initialize RowSet for deduplication
-///   Null      rowset_reg
-///
-/// ; Branch 1: scan index for first OR term
-///   SeekGE    idx1_cursor, branch1_end, key1_reg, 1
-/// branch1_loop:
-///   IdxRowId  idx1_cursor, rowid_reg
-///   RowSetTest rowset_reg, branch1_next, rowid_reg  ; skip if already seen
-/// branch1_next:
-///   Next      idx1_cursor, branch1_loop
-/// branch1_end:
-///
-/// ; Read from RowSet and fetch rows
-/// rowset_loop:
-///   RowSetRead rowset_reg, loop_end, rowid_reg
-///   SeekRowid table_cursor, rowset_loop, rowid_reg
-///   Goto      rowset_loop
-/// loop_end:
-/// ```
-///
-/// Intersection bytecode structure:
-/// ```text
-/// ; Initialize two RowSets
-///   Null      rowset1_reg
-///   Null      rowset2_reg
-///
-/// ; Branch 1: populate rowset1
-///   SeekGE    idx1_cursor, branch1_end, key1_reg, 1
-/// branch1_loop:
-///   IdxRowId  idx1_cursor, rowid_reg
-///   RowSetAdd rowset1_reg, rowid_reg
-///   Next      idx1_cursor, branch1_loop
-/// branch1_end:
-///
-/// ; Branch 2: test against rowset1, add to rowset2 if found
-///   SeekGE    idx2_cursor, branch2_end, key2_reg, 1
-/// branch2_loop:
-///   IdxRowId  idx2_cursor, rowid_reg
-///   RowSetTest rowset1_reg, found_in_both, rowid_reg, -1  ; test-only, no insert
-///   Goto      branch2_next                                 ; not found, skip
-/// found_in_both:
-///   RowSetAdd rowset2_reg, rowid_reg                       ; found, add to result
-/// branch2_next:
-///   Next      idx2_cursor, branch2_loop
-/// branch2_end:
-///
-/// ; Read intersection results from rowset2
-/// rowset_loop:
-///   RowSetRead rowset2_reg, loop_end, rowid_reg
-///   SeekRowid table_cursor, rowset_loop, rowid_reg
-///   Goto      rowset_loop
-/// loop_end:
-/// ```
 #[allow(clippy::too_many_arguments)]
 fn emit_multi_index_scan_loop(
     program: &mut ProgramBuilder,
@@ -1315,19 +1259,27 @@ fn emit_multi_index_scan_loop(
 
     // Determine which rowset to read from for final results
     let final_rowset = if is_intersection && multi_idx_op.branches.len() > 1 {
-        // After the last branch (index N-1), results are in current_write_rowset
-        // But due to potential swapping, let's calculate it properly:
-        // - After branch 0: results in rowset1
-        // - After branch 1: results in rowset2 (read from rowset1, wrote to rowset2)
-        // - After branch 2: results in rowset1 (swapped, read from rowset2, wrote to rowset1)
-        // For 2 branches: rowset2
-        // For 3 branches: rowset1 (after swap)
-        // Pattern: even number of swaps (N-2 swaps for N branches) -> rowset2
-        //          odd number of swaps -> rowset1
-        if (multi_idx_op.branches.len() - 1) % 2 == 1 {
-            rowset1_reg
-        } else {
+        // For intersection:
+        // - Branch 0: writes to rowset1 (rowset1 is write-only, never tested)
+        // - Branch 1: tests against rowset1, writes matches to rowset2
+        // - Branch 2: tests against rowset2, writes matches to rowset1 (after swap)
+        // - etc.
+        //
+        // After N branches, the results are in the rowset that branch N-1 wrote to.
+        // Branch 0 writes to rowset1, branch 1 writes to rowset2, branch 2 writes to rowset1...
+        // Number of swaps = N - 2 (swaps happen after branches 1, 2, ... N-2)
+        //
+        // For 2 branches: 0 swaps, final is rowset2 (branch 1 wrote there)
+        // For 3 branches: 1 swap, final is rowset1 (branch 2 wrote there after swap)
+        // For 4 branches: 2 swaps, final is rowset2
+        //
+        // Pattern: N branches -> (N-2) swaps
+        // If (N-2) is even -> rowset2, if odd -> rowset1
+        let num_swaps = multi_idx_op.branches.len().saturating_sub(2);
+        if num_swaps % 2 == 0 {
             rowset2_reg
+        } else {
+            rowset1_reg
         }
     } else {
         rowset1_reg
