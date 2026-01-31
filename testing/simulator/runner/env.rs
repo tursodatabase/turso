@@ -11,10 +11,12 @@ use garde::Validate;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use sql_generation::generation::GenerationContext;
+use sql_generation::generation::generated_expr::rename_column_refs_in_expr;
 use sql_generation::model::query::transaction::Rollback;
 use sql_generation::model::table::{SimValue, Table};
 use tracing::trace;
 use turso_core::Database;
+use turso_parser::ast::ColumnConstraint;
 
 use crate::generation::Shadow;
 use crate::model::Query;
@@ -34,7 +36,9 @@ fn enable_mvcc_on_attached_dbs(io: &Arc<dyn SimIO>, aux_paths: impl Iterator<Ite
             io.clone(),
             aux_path.to_str().unwrap(),
             turso_core::OpenFlags::default(),
-            turso_core::DatabaseOpts::new().with_attach(true),
+            turso_core::DatabaseOpts::new()
+                .with_attach(true)
+                .with_generated_columns(true),
             None,
         )
         .unwrap_or_else(|e| panic!("Failed to open aux DB {aux_path:?}: {e}"));
@@ -676,6 +680,14 @@ where
                             .find(|c| &c.name == old_name)
                             .expect("Column should exist");
                         col.name.clone_from(new_name);
+                        // Update generated column expressions that reference the old column name
+                        for col in &mut committed.columns {
+                            for constraint in &mut col.constraints {
+                                if let ColumnConstraint::Generated { expr, .. } = constraint {
+                                    rename_column_refs_in_expr(expr, old_name, new_name);
+                                }
+                            }
+                        }
                         // Update index column names
                         for index in &mut committed.indexes {
                             for (col_name, _) in &mut index.columns {
@@ -856,7 +868,8 @@ impl SimulatorEnv {
             turso_core::OpenFlags::default(),
             turso_core::DatabaseOpts::new()
                 .with_autovacuum(true)
-                .with_attach(true),
+                .with_attach(true)
+                .with_generated_columns(true),
             None,
         ) {
             Ok(db) => db,
@@ -1050,7 +1063,8 @@ impl SimulatorEnv {
             turso_core::OpenFlags::default(),
             turso_core::DatabaseOpts::new()
                 .with_autovacuum(true)
-                .with_attach(true),
+                .with_attach(true)
+                .with_generated_columns(true),
             None,
         ) {
             Ok(db) => db,
