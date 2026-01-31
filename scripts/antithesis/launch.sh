@@ -2,7 +2,7 @@
 
 curl --fail -u "$ANTITHESIS_USER:$ANTITHESIS_PASSWD" \
   -X POST https://$ANTITHESIS_TENANT.antithesis.com/api/v1/launch/limbo \
-  -d "{\"params\": { \"antithesis.description\":\"Mikaël - test on de85e5403\",
+  -d "{\"params\": { \"antithesis.description\":\"Mikaël - bisecting (94baf2564 w/o tokio-unstable)\",
       \"custom.duration\":\"0.25\",
       \"antithesis.config_image\":\"$ANTITHESIS_DOCKER_REPO/limbo-config:antithesis-latest\",
       \"antithesis.images\":\"$ANTITHESIS_DOCKER_REPO/limbo-workload:antithesis-latest\",
