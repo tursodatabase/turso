@@ -1694,6 +1694,9 @@ fn emit_delete_insns<'a>(
         Operation::HashJoin(_) => {
             unreachable!("access through HashJoin is not supported for delete statements")
         }
+        Operation::MultiIndexScan(_) => {
+            unreachable!("access through MultiIndexScan is not supported for delete statements")
+        }
     };
     let btree_table = unsafe { &*table_reference }.btree();
     let main_table_cursor_id = program.resolve_cursor_id(&CursorKey::table(internal_id));
@@ -2682,6 +2685,9 @@ fn emit_update_insns<'a>(
         }
         Operation::HashJoin(_) => {
             unreachable!("access through HashJoin is not supported for update operations")
+        }
+        Operation::MultiIndexScan(_) => {
+            unreachable!("access through MultiIndexScan is not supported for update operations")
         }
     };
 
