@@ -47,11 +47,10 @@ use crate::{Clock, Completion, File, LimboError, OpenFlags, Result, IO};
 use smallvec::SmallVec;
 use std::collections::{HashMap, VecDeque};
 use std::error::Error;
-use std::io::ErrorKind;
 use std::ptr::NonNull;
 use windows_sys::core::BOOL;
 
-use std::{io, ptr, u32};
+use std::{io, ptr};
 use tracing::{debug, instrument, trace, warn, Level};
 
 use windows_sys::Win32::Foundation::{
@@ -321,16 +320,17 @@ impl IO for WindowsIOCP {
 
     #[instrument(err, skip_all, level = Level::TRACE)]
     fn cancel(&self, completions: &[Completion]) -> Result<()> {
-        for c in completions {
-            trace!("cancelling {}", get_unique_key_from_completion(&c));
+        for cmpl in completions {
+            trace!("cancelling {}", get_unique_key_from_completion(cmpl));
             let mut succeeded = false;
             if let Some(IoContext {
                 file_handle,
                 io_packet,
-            }) = self.instance.pop_io_context_from_completion(c)
+            }) = self.instance.pop_io_context_from_completion(cmpl)
             {
                 unsafe {
                     if CancelIoEx(file_handle, &raw const io_packet.overlapped) == TRUE {
+                        // if succeeded the abort will be performed once cancel completed
                         succeeded = true;
                     } else {
                         trace!("CancelIoEx failed:{}.. Ignored", GetLastError());
@@ -339,7 +339,7 @@ impl IO for WindowsIOCP {
             }
 
             if !succeeded {
-                c.abort();
+                cmpl.abort();
             }
         }
         Ok(())
@@ -355,9 +355,7 @@ impl IO for WindowsIOCP {
                     break;
                 }
                 Err(GetIOCPPacketError::SystemError(e)) => {
-                    let error = e
-                        .try_into()
-                        .map_err(|err| get_limboerror_from_std_error(err))?;
+                    let error = e.try_into().map_err(get_limboerror_from_std_error)?;
                     let err = std::io::Error::from_raw_os_error(error);
                     return Err(err.into());
                 }
@@ -517,6 +515,12 @@ impl Drop for InnerWindowsIOCP {
         trace!("Dropping Windows IOCP Queue..");
 
         assert!(self.tracked_io_packets.lock().is_empty());
+        let free_io_packets = self.free_io_packets.lock();
+
+        for io_packet in (*free_io_packets).iter() {
+            assert_eq!(Arc::strong_count(io_packet), 1);
+            assert!(io_packet.completion.is_none());
+        }
 
         unsafe {
             CloseHandle(self.iocp_queue_handle);
@@ -551,11 +555,17 @@ impl WindowsFile {
 
             // if it is async wait for it
             if result == FALSE
-                // && error == ERROR_IO_PENDING
+                // && error == ERROR_IO_PENDING (just to remember)
                 && GetOverlappedResult(self.file_handle, overlapped_ptr, &raw mut bytes, TRUE)
                     == FALSE
             {
                 return Err(GetLastError());
+            }
+
+            // it is synchronous call
+            if result == TRUE {
+                let io_packet = Arc::from_raw(overlapped_ptr as *mut IoOverlappedPacket);
+                let _ = self.parent_io.forget_io_packet(io_packet);
             }
         }
 
@@ -774,12 +784,98 @@ impl Drop for WindowsFile {
 
 #[cfg(test)]
 mod tests {
-    use crate::io::common;
+    use std::sync::Arc;
+
+    use crate::{
+        io::{
+            common,
+            win_iocp::{
+                add_ref_completion_pointer_and_get_key, get_limboerror_from_os_err,
+                restore_and_consume_completion_ptr,
+            },
+            TempFile,
+        },
+        Buffer, Completion, IO,
+    };
 
     use super::WindowsIOCP;
 
     #[test]
     fn test_multiple_processes_cannot_open_file() {
         common::tests::test_multiple_processes_cannot_open_file(WindowsIOCP::new);
+    }
+
+    #[test]
+    fn test_file_read_write() {
+        let iocp: Arc<dyn IO> = Arc::new(WindowsIOCP::new().unwrap());
+        let file = TempFile::new(&iocp).unwrap();
+
+        let write = b"Abcd";
+        let vec = (1..150)
+            .map(|n| {
+                let comp = Completion::new_write(|res| assert_eq!(res, Ok(write.len() as i32)));
+                let buffer = Arc::new(Buffer::new_temporary(write.len()));
+
+                buffer.as_mut_slice().copy_from_slice(write);
+
+                file.pwrite(n * write.len() as u64, buffer, comp.clone())
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+
+        vec.iter().for_each(|c| {
+            iocp.wait_for_completion(c.clone()).unwrap();
+        });
+        vec.iter().any(|c| c.failed()).then(|| panic!());
+
+        const WRITE: &[u8] = b"Abcd";
+        let vec = (1..150)
+            .map(|n| {
+                let buffer = Arc::new(Buffer::new_temporary(WRITE.len()));
+                let comp = Completion::new_read(buffer, |res| {
+                    assert!(res.is_ok());
+                    assert_eq!(res.as_ref().unwrap().1, WRITE.len() as i32);
+                    assert_eq!(res.as_ref().unwrap().0.as_slice(), WRITE);
+
+                    res.err()
+                });
+
+                file.pread(n * WRITE.len() as u64, comp.clone()).unwrap()
+            })
+            .collect::<Vec<_>>();
+
+        vec.iter().for_each(|c| {
+            iocp.wait_for_completion(c.clone()).unwrap();
+        });
+
+        vec.iter().any(|c| c.failed()).then(|| panic!());
+        assert_eq!(file.file.size().unwrap(), 150 * write.iter().len() as u64);
+    }
+
+    #[test]
+    fn test_completion_key() {
+        let completion = Completion::new_write(|_| ());
+        assert_eq!(Arc::strong_count(completion.get_inner()), 1);
+        let key = add_ref_completion_pointer_and_get_key(completion.clone());
+        assert_eq!(Arc::strong_count(completion.get_inner()), 2);
+        restore_and_consume_completion_ptr(key);
+        assert_eq!(Arc::strong_count(completion.get_inner()), 1);
+    }
+
+    #[test]
+    fn test_error_functions() {
+        assert_eq!(
+            get_limboerror_from_os_err(5).to_string(),
+            String::from("I/O error: permission denied")
+        );
+        assert_eq!(
+            get_limboerror_from_os_err(u32::MAX).to_string(),
+            String::from("Internal error: Unknown error [4294967295]")
+        );
+
+        assert_eq!(
+            get_limboerror_from_os_err(15818).to_string(),
+            String::from("I/O error: uncategorized error")
+        );
     }
 }
