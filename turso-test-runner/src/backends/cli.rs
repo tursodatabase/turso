@@ -183,6 +183,7 @@ impl CliDatabaseInstance {
             cmd.arg("--experimental-views");
             cmd.arg("--experimental-strict");
             cmd.arg("--experimental-triggers");
+            cmd.arg("--experimental-attach");
         }
 
         if self.readonly {

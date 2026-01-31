@@ -81,7 +81,7 @@ async function main() {
 
     let db;
     try {
-        db = await connect(dbPath, { readonly });
+        db = await connect(dbPath, { readonly, experimental: ['triggers', 'attach'] });
         // Enable safe integers to preserve precision for large integers
         db.defaultSafeIntegers(true);
     } catch (err) {

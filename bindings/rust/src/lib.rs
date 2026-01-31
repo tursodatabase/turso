@@ -137,6 +137,7 @@ pub struct Builder {
     path: String,
     enable_encryption: bool,
     enable_triggers: bool,
+    enable_attach: bool,
     vfs: Option<String>,
     encryption_opts: Option<turso_sdk_kit::rsapi::EncryptionOpts>,
 }
@@ -148,6 +149,7 @@ impl Builder {
             path: path.to_string(),
             enable_encryption: false,
             enable_triggers: false,
+            enable_attach: false,
             vfs: None,
             encryption_opts: None,
         }
@@ -168,6 +170,11 @@ impl Builder {
         self
     }
 
+    pub fn experimental_attach(mut self, attach_enabled: bool) -> Self {
+        self.enable_attach = attach_enabled;
+        self
+    }
+
     pub fn with_io(mut self, vfs: String) -> Self {
         self.vfs = Some(vfs);
         self
@@ -179,6 +186,9 @@ impl Builder {
         }
         if self.enable_triggers {
             features.push("triggers");
+        }
+        if self.enable_attach {
+            features.push("attach");
         }
         if features.is_empty() {
             return None;
