@@ -1396,7 +1396,7 @@ fn pattern_compare(
                         c2_opt = p_indices.next();
                     }
 
-                    if c2_opt.is_none() || (seen ^ invert) == false {
+                    if c2_opt.is_none() || !(seen ^ invert) {
                         // Fallthrough to backtracking
                     } else {
                         p_curr = p_indices.next();

@@ -12,7 +12,6 @@ use turso_core::json::{
     json_object, json_patch, json_quote, json_remove, json_replace, json_set, json_type,
     JsonCacheCell,
 };
-use turso_core::vdbe::likeop::exec_glob;
 use turso_core::vdbe::Register;
 use turso_core::MathFunc;
 use turso_core::Value as CoreValue;
