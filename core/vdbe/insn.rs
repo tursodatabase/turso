@@ -51,7 +51,21 @@ pub struct IntegrityCheckIndex {
     /// Whether this is a UNIQUE index
     pub unique: bool,
     /// Column positions in the table (for building index keys from table rows)
+    /// These are LOGICAL positions in the table schema.
     pub column_positions: Vec<usize>,
+    /// Physical positions in the stored record for each indexed column.
+    /// None means the column is VIRTUAL (not stored in the record).
+    /// This is needed because VIRTUAL columns are not stored, so logical
+    /// positions don't map directly to record positions.
+    pub physical_positions: Vec<Option<usize>>,
+    /// True if any indexed column cannot be reconstructed from the stored row.
+    /// This includes VIRTUAL generated columns (not physically stored) and
+    /// expression index columns (EXPR_INDEX_SENTINEL — the expression result
+    /// is stored in the index but can't be recomputed without a runtime evaluator).
+    /// When true, we skip row-index validation entirely.
+    /// TODO: Refactor integrity_check to use VDBE bytecode so we can evaluate
+    /// generated/expression columns and validate these indexes properly.
+    pub has_unevaluable_columns: bool,
     /// Starting register containing default values for indexed columns.
     /// Used for columns added via ALTER TABLE ADD COLUMN with DEFAULT - old rows
     /// don't physically have these columns, so we use these pre-evaluated defaults.
@@ -546,8 +560,8 @@ pub enum Insn {
     TypeCheck {
         start_reg: usize, // P1
         count: usize,     // P2
-        /// GENERATED ALWAYS AS ... STATIC columns are only checked if P3 is zero.
-        /// When P3 is non-zero, no type checking occurs for static generated columns.
+        /// GENERATED ALWAYS AS ... STORED columns are only checked if P3 is zero.
+        /// When P3 is non-zero, no type checking occurs for stored generated columns.
         check_generated: bool, // P3
         table_reference: Arc<BTreeTable>, // P4
     },

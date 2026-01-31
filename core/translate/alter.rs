@@ -253,7 +253,18 @@ pub fn translate_alter_table(
                 }
             }
 
-            // TODO: check usage in generated column when implemented
+            // Check if column is referenced by any generated column expression
+            for col in btree.columns.iter() {
+                if let Some(ref generated_expr) = col.generated {
+                    let refs = crate::schema::collect_column_refs(generated_expr);
+                    if refs.contains(&column_name_norm) {
+                        let gen_col_name = col.name.as_deref().unwrap_or("<unnamed>");
+                        return Err(LimboError::ParseError(format!(
+                            "cannot drop column \"{column_name}\": referenced by generated column \"{gen_col_name}\""
+                        )));
+                    }
+                }
+            }
 
             // References in VIEWs are checked in the VDBE layer op_drop_column instruction.
 
@@ -296,9 +307,17 @@ pub fn translate_alter_table(
                 connection,
                 input,
                 |program| {
-                    let column_count = btree.columns.len();
+                    // Count only storable columns (exclude VIRTUAL generated columns)
+                    let storable_count = btree
+                        .columns
+                        .iter()
+                        .filter(|c| !c.is_virtual_generated())
+                        .count();
                     let root_page = btree.root_page;
                     let table_name = btree.name.clone();
+
+                    // Clone the columns info for use in the closure
+                    let original_columns = original_btree.columns.clone();
 
                     let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(original_btree));
 
@@ -309,12 +328,18 @@ pub fn translate_alter_table(
                     });
 
                     program.cursor_loop(cursor_id, |program, rowid| {
-                        let first_column = program.alloc_registers(column_count);
+                        let first_column = program.alloc_registers(storable_count);
 
                         let mut iter = first_column;
 
-                        for i in 0..(column_count + 1) {
+                        // Iterate through OLD columns and copy storable ones
+                        // Skip: 1) the dropped column, 2) VIRTUAL generated columns
+                        for (i, col) in original_columns.iter().enumerate() {
                             if i == dropped_index {
+                                continue;
+                            }
+                            // Skip VIRTUAL generated columns - they are not stored in records
+                            if col.is_virtual_generated() {
                                 continue;
                             }
 
@@ -325,15 +350,17 @@ pub fn translate_alter_table(
 
                         let record = program.alloc_register();
 
+                        // Build affinity string only for storable columns
                         let affinity_str = btree
                             .columns
                             .iter()
+                            .filter(|c| !c.is_virtual_generated())
                             .map(|col| col.affinity().aff_mask())
                             .collect::<String>();
 
                         program.emit_insn(Insn::MakeRecord {
                             start_reg: to_u16(first_column),
-                            count: to_u16(column_count),
+                            count: to_u16(storable_count),
                             dest_reg: to_u16(record),
                             index_name: None,
                             affinity_str: Some(affinity_str),
@@ -363,17 +390,39 @@ pub fn translate_alter_table(
             )?
         }
         ast::AlterTableBody::AddColumn(col_def) => {
-            if col_def
-                .constraints
-                .iter()
-                .any(|c| matches!(c.constraint, ast::ColumnConstraint::Generated { .. }))
-            {
+            // Allow VIRTUAL generated columns (computed on-the-fly, no storage needed).
+            // Reject STORED generated columns (would require computing for all existing rows).
+            if col_def.constraints.iter().any(|c| {
+                matches!(
+                    &c.constraint,
+                    ast::ColumnConstraint::Generated { typ, .. }
+                    if typ.as_ref().is_some_and(|t| t.as_str().eq_ignore_ascii_case("STORED"))
+                )
+            }) {
                 return Err(LimboError::ParseError(
-                    "Alter table does not support adding generated columns".to_string(),
+                    "cannot add a STORED column".to_string(),
                 ));
             }
             let constraints = col_def.constraints.clone();
             let column = Column::from(&col_def);
+
+            // Validate generated column constraints.
+            // Column::from() does not perform this validation, so we must do it here.
+            if column.generated.is_some() {
+                if column.primary_key() {
+                    return Err(LimboError::ParseError(format!(
+                        "generated column \"{}\" cannot be part of the PRIMARY KEY",
+                        column.name.as_deref().unwrap_or("?")
+                    )));
+                }
+                if column.default.is_some() {
+                    return Err(LimboError::ParseError(format!(
+                        "generated column \"{}\" cannot have a DEFAULT value",
+                        column.name.as_deref().unwrap_or("?")
+                    )));
+                }
+                crate::schema::validate_generated_expr(column.generated.as_ref().unwrap(), None)?;
+            }
 
             // SQLite is very strict about what constitutes a "constant" default for
             // ALTER TABLE ADD COLUMN. It only allows literals and signed literals,

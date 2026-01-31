@@ -814,6 +814,11 @@ pub(crate) fn type_from_name(type_name: &str) -> (Type, bool) {
         return (Type::Integer, false);
     }
 
+    // Handle ANY type for STRICT tables - it should have no affinity (Blob)
+    if eq_ignore_ascii_case!(type_name, b"ANY") {
+        return (Type::Blob, false);
+    }
+
     if let Some(ty) = type_name.windows(4).find_map(|s| {
         match_ignore_ascii_case!(match s {
             b"CHAR" | b"CLOB" | b"TEXT" => Some(Type::Text),
@@ -1580,7 +1585,35 @@ pub fn rewrite_fk_parent_cols_if_self_ref(
     }
 }
 
-/// Update a column-level REFERENCES <tbl>(col,...) constraint
+/// Rename column references in an expression from `from` to `to`.
+/// Renames Id, Name, Qualified, and DoublyQualified expressions that match the normalized `from` name.
+pub fn rename_column_refs_in_expr(expr: &mut ast::Expr, from: &str, to: &str) {
+    let from_norm = normalize_ident(from);
+    let _ = walk_expr_mut(expr, &mut |e: &mut ast::Expr| {
+        match e {
+            ast::Expr::Id(name) if normalize_ident(name.as_str()) == from_norm => {
+                *name = ast::Name::exact(to.to_owned());
+            }
+            ast::Expr::Name(name) if normalize_ident(name.as_str()) == from_norm => {
+                *name = ast::Name::exact(to.to_owned());
+            }
+            ast::Expr::Qualified(_, col_name)
+                if normalize_ident(col_name.as_str()) == from_norm =>
+            {
+                *col_name = ast::Name::exact(to.to_owned());
+            }
+            ast::Expr::DoublyQualified(_, _, col_name)
+                if normalize_ident(col_name.as_str()) == from_norm =>
+            {
+                *col_name = ast::Name::exact(to.to_owned());
+            }
+            _ => {}
+        }
+        Ok(WalkControl::Continue)
+    });
+}
+
+/// Update a column-level REFERENCES <tbl>(col,...) constraint and generated column expressions
 pub fn rewrite_column_references_if_needed(
     col: &mut ast::ColumnDefinition,
     table: &str,
@@ -1588,12 +1621,14 @@ pub fn rewrite_column_references_if_needed(
     to: &str,
 ) {
     for cc in &mut col.constraints {
-        if let ast::NamedColumnConstraint {
-            constraint: ast::ColumnConstraint::ForeignKey { clause, .. },
-            ..
-        } = cc
-        {
-            rewrite_fk_parent_cols_if_self_ref(clause, table, from, to);
+        match &mut cc.constraint {
+            ast::ColumnConstraint::ForeignKey { clause, .. } => {
+                rewrite_fk_parent_cols_if_self_ref(clause, table, from, to);
+            }
+            ast::ColumnConstraint::Generated { expr, .. } => {
+                rename_column_refs_in_expr(expr, from, to);
+            }
+            _ => {}
         }
     }
 }
@@ -2847,6 +2882,9 @@ pub mod tests {
             ("FLOAT", (SchemaValueType::Real, false)),
             ("DOUBLE", (SchemaValueType::Real, false)),
             ("U128", (SchemaValueType::Numeric, false)),
+            // ANY type for STRICT tables should have no affinity (Blob)
+            ("ANY", (SchemaValueType::Blob, false)),
+            ("any", (SchemaValueType::Blob, false)),
         ];
 
         for (input, expected) in tc {

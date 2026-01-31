@@ -480,19 +480,28 @@ impl TursoMcpServer {
             None => return "Missing table_name parameter".to_string(),
         };
 
-        let query = format!("PRAGMA table_info({table_name})");
+        // Use table_xinfo to include generated columns (table_info hides them)
+        let query = format!("PRAGMA table_xinfo({table_name})");
 
         let conn = self.conn.lock().unwrap().clone();
         match conn.query(&query) {
             Ok(Some(mut rows)) => {
                 let mut columns = Vec::new();
                 let res = rows.run_with_row_callback(|row| {
-                    if let (Ok(col_name), Ok(col_type), Ok(not_null), Ok(default_value), Ok(pk)) = (
+                    if let (
+                        Ok(col_name),
+                        Ok(col_type),
+                        Ok(not_null),
+                        Ok(default_value),
+                        Ok(pk),
+                        Ok(hidden),
+                    ) = (
                         row.get::<&DbValue>(1),
                         row.get::<&DbValue>(2),
                         row.get::<&DbValue>(3),
                         row.get::<&DbValue>(4),
                         row.get::<&DbValue>(5),
+                        row.get::<&DbValue>(6),
                     ) {
                         let default_str = if matches!(default_value, DbValue::Null) {
                             "".to_string()
@@ -500,9 +509,17 @@ impl TursoMcpServer {
                             format!("DEFAULT {default_value}")
                         };
 
+                        // Determine if this is a generated column
+                        // hidden: 0=normal, 2=VIRTUAL generated, 3=STORED generated
+                        let generated_str = match hidden {
+                            DbValue::Integer(2) => " VIRTUAL GENERATED",
+                            DbValue::Integer(3) => " STORED GENERATED",
+                            _ => "",
+                        };
+
                         columns.push(
                             format!(
-                                "{} {} {} {} {}",
+                                "{} {} {} {} {}{}",
                                 col_name,
                                 col_type,
                                 if matches!(not_null, DbValue::Integer(1)) {
@@ -515,7 +532,8 @@ impl TursoMcpServer {
                                     "PRIMARY KEY"
                                 } else {
                                     ""
-                                }
+                                },
+                                generated_str
                             )
                             .trim()
                             .to_string(),

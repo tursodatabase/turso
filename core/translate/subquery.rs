@@ -472,6 +472,7 @@ fn get_subquery_parser<'a>(
                         collation: None,
                         default: None,
                         expr: None,
+                        affinity: None,
                     })
                     .collect::<Vec<_>>();
 

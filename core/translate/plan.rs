@@ -1633,10 +1633,11 @@ impl JoinedTable {
                 // rowid is always implicitly covered by the index
                 continue;
             }
-            let covered_by_index = index
-                .columns
-                .iter()
-                .any(|c| c.expr.is_none() && c.pos_in_table == required_col);
+            // Note: We only check pos_in_table here, not expr.is_none().
+            // VIRTUAL generated columns have expr = Some(generated_expr) but still have
+            // a valid pos_in_table. Expression indexes (CREATE INDEX ON t(a+b)) use
+            // EXPR_INDEX_SENTINEL for pos_in_table, so they won't match valid column positions.
+            let covered_by_index = index.columns.iter().any(|c| c.pos_in_table == required_col);
             if !covered_by_index {
                 return false;
             }

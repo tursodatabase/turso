@@ -1,5 +1,6 @@
 mod test_btree;
 mod test_ddl;
+mod test_generated_columns;
 mod test_hash_join_materialization;
 mod test_read_path;
 mod test_vacuum;

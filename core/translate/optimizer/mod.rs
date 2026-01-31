@@ -47,6 +47,7 @@ use super::{
         Search, SeekDef, SeekKey, SelectPlan, TableReferences, UpdatePlan, WhereTerm,
     },
     planner::TableMask,
+    update::column_depends_on_updated,
 };
 
 pub(crate) mod access_method;
@@ -627,9 +628,33 @@ fn optimize_update_plan(
             break 'requires false;
         };
 
-        plan.set_clauses
+        // Build column lookup for column_depends_on_updated
+        let column_lookup: HashMap<String, usize> = btree_table
+            .columns
             .iter()
-            .any(|(idx, _)| index.columns.iter().any(|c| c.pos_in_table == *idx))
+            .enumerate()
+            .filter_map(|(i, col)| col.name.as_ref().map(|name| (name.to_lowercase(), i)))
+            .collect();
+
+        // Check if any index column is directly updated or transitively depends on updated columns
+        index.columns.iter().any(|c| {
+            // Direct update of index column
+            if updated_cols.contains(&c.pos_in_table) {
+                return true;
+            }
+            // Check if this is a generated column that depends on any updated column
+            if btree_table.columns[c.pos_in_table].generated.is_some() {
+                let mut visited = HashSet::default();
+                return column_depends_on_updated(
+                    c.pos_in_table,
+                    &btree_table.columns,
+                    &column_lookup,
+                    &updated_cols,
+                    &mut visited,
+                );
+            }
+            false
+        })
     };
 
     if !requires_ephemeral_table {
@@ -667,6 +692,7 @@ fn add_ephemeral_table_to_update_plan(
         is_strict: false,
         unique_sets: vec![],
         foreign_keys: vec![],
+        stored_gen_col_order: vec![],
     });
 
     let temp_cursor_id = program.alloc_cursor_id_keyed(
@@ -2093,13 +2119,21 @@ fn ephemeral_index_build(
         .columns()
         .iter()
         .enumerate()
-        .map(|(i, c)| IndexColumn {
-            name: c.name.clone().unwrap(),
-            order: SortOrder::Asc,
-            pos_in_table: i,
-            collation: c.collation_opt(),
-            default: c.default.clone(),
-            expr: None,
+        .map(|(i, c)| {
+            let (expr, affinity) = if c.is_virtual_generated() {
+                (c.generated.clone().map(|e| *e), Some(c.affinity()))
+            } else {
+                (None, None)
+            };
+            IndexColumn {
+                name: c.name.clone().unwrap(),
+                order: SortOrder::Asc,
+                pos_in_table: i,
+                collation: c.collation_opt(),
+                default: c.default.clone(),
+                expr: expr.map(Box::new),
+                affinity,
+            }
         })
         // only include columns that are used in the query
         .filter(|c| table_reference.column_is_used(c.pos_in_table))

@@ -1,5 +1,5 @@
 use crate::{
-    schema::Schema,
+    schema::{Schema, EXPR_INDEX_SENTINEL},
     types::IndexInfo,
     vdbe::{
         builder::ProgramBuilder,
@@ -87,6 +87,37 @@ fn translate_integrity_check_impl(
                         let column_positions: Vec<usize> =
                             index.columns.iter().map(|c| c.pos_in_table).collect();
 
+                        // Compute physical positions for each indexed column.
+                        // VIRTUAL generated columns are not stored in the record, so we need
+                        // to map from logical positions to physical positions in the stored record.
+                        // Expression indexes use EXPR_INDEX_SENTINEL - they have no single column.
+                        let mut has_unevaluable_columns = false;
+                        let physical_positions: Vec<Option<usize>> = column_positions
+                            .iter()
+                            .map(|&logical_pos| {
+                                // Expression indexes use EXPR_INDEX_SENTINEL - can't look up a column
+                                if logical_pos == EXPR_INDEX_SENTINEL {
+                                    has_unevaluable_columns = true;
+                                    return None;
+                                }
+                                let col = &btree_table.columns[logical_pos];
+                                if col.is_virtual_generated() {
+                                    has_unevaluable_columns = true;
+                                    None
+                                } else {
+                                    // Count non-VIRTUAL columns before this logical position
+                                    // to get the physical position in the stored record.
+                                    let physical_pos = btree_table
+                                        .columns
+                                        .iter()
+                                        .take(logical_pos)
+                                        .filter(|c| !c.is_virtual_generated())
+                                        .count();
+                                    Some(physical_pos)
+                                }
+                            })
+                            .collect();
+
                         // Allocate contiguous registers for default values of indexed columns.
                         // For columns added via ALTER TABLE ADD COLUMN with DEFAULT, old rows
                         // don't physically have these columns, so we need the defaults.
@@ -98,6 +129,14 @@ fn translate_integrity_check_impl(
                             program.alloc_registers(column_positions.len());
                         for (i, &pos) in column_positions.iter().enumerate() {
                             let target_reg = default_values_start_reg + i;
+                            // Expression indexes have no column - use NULL
+                            if pos == EXPR_INDEX_SENTINEL {
+                                program.emit_insn(Insn::Null {
+                                    dest: target_reg,
+                                    dest_end: None,
+                                });
+                                continue;
+                            }
                             let col = &btree_table.columns[pos];
                             if let Some(default_expr) = col.default.as_ref() {
                                 // Evaluate the default expression to the register.
@@ -118,6 +157,8 @@ fn translate_integrity_check_impl(
                             root_page: index.root_page,
                             unique: index.unique,
                             column_positions,
+                            physical_positions,
+                            has_unevaluable_columns,
                             default_values_start_reg,
                             index_info: Arc::new(IndexInfo::new_from_index(index)),
                         });

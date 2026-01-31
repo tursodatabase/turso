@@ -1427,6 +1427,7 @@ mod tests {
                         notnull: true,
                         unique: false,
                         hidden: false,
+                        generated_stored: false,
                     },
                 ),
                 SchemaColumn::new_default_text(Some("name".to_string()), "TEXT".to_string(), None),
@@ -1436,6 +1437,7 @@ mod tests {
             unique_sets: vec![],
             foreign_keys: vec![],
             has_autoincrement: false,
+            stored_gen_col_order: vec![],
         };
 
         // Create orders table
@@ -1457,6 +1459,7 @@ mod tests {
                         notnull: true,
                         unique: false,
                         hidden: false,
+                        generated_stored: false,
                     },
                 ),
                 SchemaColumn::new(
@@ -1479,6 +1482,7 @@ mod tests {
             has_autoincrement: false,
             foreign_keys: vec![],
             unique_sets: vec![],
+            stored_gen_col_order: vec![],
         };
 
         // Create products table
@@ -1500,6 +1504,7 @@ mod tests {
                         notnull: true,
                         unique: false,
                         hidden: false,
+                        generated_stored: false,
                     },
                 ),
                 SchemaColumn::new_default_text(Some("name".to_string()), "TEXT".to_string(), None),
@@ -1518,6 +1523,7 @@ mod tests {
             has_autoincrement: false,
             foreign_keys: vec![],
             unique_sets: vec![],
+            stored_gen_col_order: vec![],
         };
 
         // Create logs table - without a rowid alias (no INTEGER PRIMARY KEY)
@@ -1551,6 +1557,7 @@ mod tests {
             has_autoincrement: false,
             foreign_keys: vec![],
             unique_sets: vec![],
+            stored_gen_col_order: vec![],
         };
 
         schema

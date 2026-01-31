@@ -444,6 +444,7 @@ fn create_dedupe_index(
             default: None,
             collation: None,
             expr: None,
+            affinity: None,
         })
         .collect::<Vec<_>>();
     for (i, column) in dedupe_columns.iter_mut().enumerate() {
