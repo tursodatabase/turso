@@ -344,7 +344,7 @@ fn execute_scalar_func(call: ScalarFuncCall) {
                     let _ = v1.exec_or(&v2);
                 }
                 BinaryFunc::Glob => {
-                    let _ = exec_glob(None, &v1.to_string(), &v2.to_string());
+                    let _ = CoreValue::exec_glob(&v1.to_string(), &v2.to_string());
                 }
                 BinaryFunc::Substring2 => {
                     let _ = CoreValue::exec_substring(&v1, &v2, None);
