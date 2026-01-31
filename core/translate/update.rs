@@ -320,7 +320,12 @@ pub fn prepare_update_plan(
             let ident = normalize_ident(col_name.as_str());
 
             let col_index = match column_lookup.get(&ident) {
-                Some(idx) => *idx,
+                Some(idx) => {
+                    // Check if this is a generated column - cannot update directly
+                    let col = &table.columns()[*idx];
+                    col.ensure_not_generated("UPDATE", col_name.as_str())?;
+                    *idx
+                }
                 None => {
                     // Check if this is the 'rowid' keyword
                     if ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(&ident)) {
@@ -390,6 +395,8 @@ pub fn prepare_update_plan(
         }
     }
 
+    // Note: generated columns are computed on read (VIRTUAL) so no recomputation needed here
+
     // Plan subqueries in RETURNING expressions before processing
     // (so SubqueryResult nodes are cloned into result_columns)
     let mut non_from_clause_subqueries = vec![];
@@ -453,12 +460,20 @@ pub fn prepare_update_plan(
         .joined_tables()
         .first()
         .expect("UPDATE must have a target table reference");
+
+    // Build column name -> index lookup for transitive dependency checking
+    let column_lookup: HashMap<String, usize> = columns
+        .iter()
+        .enumerate()
+        .filter_map(|(i, col)| col.name.as_ref().map(|name| (name.to_lowercase(), i)))
+        .collect();
+
     let indexes_to_update = if rowid_alias_used {
         // If the rowid alias is used in the SET clause, we need to update all indexes
         indexes
     } else {
-        // otherwise we need to update the indexes whose columns are set in the SET clause,
-        // or if the columns used in the partial index WHERE clause are being updated.
+        // or if the columns used in the partial index WHERE clause are being updated,
+        // or if any dependencies of a generated column are being updated (transitively)
         let mut indexes_to_update = Vec::new();
         for idx in indexes {
             let mut needs = false;
@@ -466,13 +481,44 @@ pub fn prepare_update_plan(
                 if let Some(expr) = col.expr.as_ref() {
                     let cols_used =
                         expression_index_column_usage(expr.as_ref(), target_table_ref, resolver)?;
-                    if cols_used.iter().any(|cidx| updated_cols.contains(&cidx)) {
+                    if cols_used.iter().any(|cidx| {
+                        if updated_cols.contains(&cidx) {
+                            return true;
+                        }
+                        // If column in expression is a generated column, check transitive deps
+                        if columns[cidx].generated.is_some() {
+                            let mut visited = HashSet::default();
+                            return column_depends_on_updated(
+                                cidx,
+                                columns,
+                                &column_lookup,
+                                &updated_cols,
+                                &mut visited,
+                            );
+                        }
+                        false
+                    }) {
                         needs = true;
                         break;
                     }
                 } else if updated_cols.contains(&col.pos_in_table) {
                     needs = true;
                     break;
+                } else if columns[col.pos_in_table].generated.is_some() {
+                    // Check if this column is a generated column and if any of its
+                    // dependencies are being updated. This uses transitive checking to
+                    // handle chains like: generated -> VIRTUAL -> regular column.
+                    let mut visited = HashSet::default();
+                    if column_depends_on_updated(
+                        col.pos_in_table,
+                        columns,
+                        &column_lookup,
+                        &updated_cols,
+                        &mut visited,
+                    ) {
+                        needs = true;
+                        break;
+                    }
                 }
             }
 
@@ -527,4 +573,39 @@ fn build_scan_op(table: &Table, iter_dir: IterationDirection) -> Operation {
         Table::Virtual(_) => Operation::default_scan_for(table),
         _ => unreachable!(),
     }
+}
+
+/// Checks if a column transitively depends on any column in the updated_cols set.
+/// This follows through VIRTUAL column chains to find the underlying dependencies.
+///
+/// For example, if generated column C depends on VIRTUAL column B, which depends on
+/// regular column A, and A is in updated_cols, this returns true for C.
+///
+/// `column_lookup` maps column names (lowercased) to their indices in `columns`.
+pub fn column_depends_on_updated(
+    col_idx: usize,
+    columns: &[crate::schema::Column],
+    column_lookup: &HashMap<String, usize>,
+    updated_cols: &HashSet<usize>,
+    visited: &mut HashSet<usize>,
+) -> bool {
+    if updated_cols.contains(&col_idx) {
+        return true;
+    }
+    crate::schema::walk_gen_col_deps(
+        col_idx,
+        columns,
+        column_lookup,
+        visited,
+        &mut |dep_idx, dep_col| {
+            use crate::schema::GenColDepsAction;
+            if updated_cols.contains(&dep_idx) {
+                GenColDepsAction::Stop
+            } else if dep_col.generated.is_some() {
+                GenColDepsAction::Recurse
+            } else {
+                GenColDepsAction::Skip
+            }
+        },
+    )
 }

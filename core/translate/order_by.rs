@@ -203,6 +203,7 @@ impl EmitOrderBy {
                     collation,
                     default: None,
                     expr: None,
+                    affinity: None,
                 })
             }
             let pos_in_table = index_columns.len();
@@ -214,6 +215,7 @@ impl EmitOrderBy {
                 collation: None,
                 default: None,
                 expr: None,
+                affinity: None,
             });
             for _ in remappings.iter().filter(|r| !r.deduplicated) {
                 let pos_in_table = index_columns.len();
@@ -224,6 +226,7 @@ impl EmitOrderBy {
                     collation: None,
                     default: None,
                     expr: None,
+                    affinity: None,
                 })
             }
             let index = Arc::new(Index {

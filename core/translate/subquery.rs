@@ -708,6 +708,7 @@ fn get_subquery_parser<'a>(
                             collation: lhs_collations[i].or(rhs_collation),
                             default: None,
                             expr: None,
+                            affinity: None,
                         })
                     })
                     .collect::<Result<Vec<_>>>()?;

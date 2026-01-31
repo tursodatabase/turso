@@ -413,11 +413,33 @@ impl<'a, 'plan> PreparedHashBuild<'a, 'plan> {
         let (payload_start_reg, mut payload_info) = if num_payload > 0 {
             let payload_reg = planner.program.alloc_registers(num_payload);
             for (i, &col_idx) in config.payload_signature_columns.iter().enumerate() {
-                planner.program.emit_column_or_rowid(
-                    payload_source_cursor_id,
-                    col_idx,
-                    payload_reg + i,
-                );
+                if let Some(column) = build_table.columns().get(col_idx) {
+                    if column.is_virtual_generated() {
+                        let context = ExprContext::VirtualColumn {
+                            table: &build_table.table,
+                            table_ref_id: build_table.internal_id,
+                            referenced_tables: Some(planner.table_references),
+                        };
+                        context.emit_virtual_column(
+                            planner.program,
+                            column,
+                            payload_reg + i,
+                            &planner.t_ctx.resolver,
+                        )?;
+                    } else {
+                        planner.program.emit_column_or_rowid(
+                            payload_source_cursor_id,
+                            col_idx,
+                            payload_reg + i,
+                        );
+                    }
+                } else {
+                    planner.program.emit_column_or_rowid(
+                        payload_source_cursor_id,
+                        col_idx,
+                        payload_reg + i,
+                    );
+                }
             }
             (
                 Some(payload_reg),

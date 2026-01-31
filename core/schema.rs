@@ -1,4 +1,4 @@
-use crate::function::{Deterministic, Func};
+use crate::function::{Deterministic, ExtFunc, Func};
 use crate::incremental::view::IncrementalView;
 use crate::index_method::{IndexMethodAttachment, IndexMethodConfiguration};
 use crate::return_if_io;
@@ -1858,6 +1858,15 @@ pub enum Table {
     FromClauseSubquery(Arc<FromClauseSubquery>),
 }
 
+/// Build a map from lowercased column names to their indices.
+pub fn build_column_name_lookup(columns: &[Column]) -> HashMap<String, usize> {
+    columns
+        .iter()
+        .enumerate()
+        .filter_map(|(i, col)| col.name.as_ref().map(|name| (name.to_lowercase(), i)))
+        .collect()
+}
+
 impl Table {
     pub fn get_root_page(&self) -> crate::Result<i64> {
         match self {
@@ -1947,6 +1956,12 @@ impl Table {
             Self::Virtual(table) => Some(table.clone()),
             _ => None,
         }
+    }
+
+    /// Build a map from lowercased column names to their indices.
+    /// This is useful for looking up columns by name in generated column expressions.
+    pub fn column_name_to_index_map(&self) -> rustc_hash::FxHashMap<String, usize> {
+        build_column_name_lookup(self.columns())
     }
 }
 
@@ -2119,7 +2134,7 @@ impl BTreeTable {
         let cmd = parser.next_cmd()?;
         match cmd {
             Some(Cmd::Stmt(Stmt::CreateTable { tbl_name, body, .. })) => {
-                create_table(tbl_name.name.as_str(), &body, root_page)
+                create_table(tbl_name.name.as_str(), &body, root_page, None)
             }
             _ => unreachable!("Expected CREATE TABLE statement"),
         }
@@ -2311,6 +2326,24 @@ impl BTreeTable {
             .map(|column| column.collation())
             .collect()
     }
+
+    /// Convert a logical column index to a physical column index.
+    /// Physical indices skip VIRTUAL generated columns since they are not stored in the record.
+    /// Note: Rowid alias (INTEGER PRIMARY KEY) columns ARE counted as physical columns
+    /// because they are stored in the record body (even though the rowid is also the B-tree key).
+    #[inline]
+    pub fn logical_to_physical_column(&self, logical: usize) -> usize {
+        let mut physical = 0;
+        for (i, col) in self.columns.iter().enumerate() {
+            if i == logical {
+                break;
+            }
+            if !col.is_virtual_generated() {
+                physical += 1;
+            }
+        }
+        physical
+    }
 }
 
 fn identifier_contains_special_chars(name: &str) -> bool {
@@ -2400,7 +2433,273 @@ impl FromClauseSubquery {
     }
 }
 
-pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> Result<BTreeTable> {
+/// Extract all column name references from an expression as a set.
+/// Uses `walk_expr` to cover all expression types automatically.
+pub fn collect_column_refs(expr: &ast::Expr) -> HashSet<String> {
+    let mut refs = HashSet::default();
+    let _ = walk_expr(expr, &mut |e| match e {
+        ast::Expr::Id(name) | ast::Expr::Name(name) => {
+            refs.insert(normalize_ident(name.as_str()));
+            Ok(WalkControl::Continue)
+        }
+        ast::Expr::Qualified(_, col) | ast::Expr::DoublyQualified(_, _, col) => {
+            refs.insert(normalize_ident(col.as_str()));
+            Ok(WalkControl::Continue)
+        }
+        ast::Expr::Subquery(_)
+        | ast::Expr::Exists(_)
+        | ast::Expr::InTable { .. }
+        | ast::Expr::SubqueryResult { .. } => Ok(WalkControl::SkipChildren),
+        _ => Ok(WalkControl::Continue),
+    });
+    refs
+}
+
+/// Controls the DFS walk of the generated column dependency graph.
+pub enum GenColDepsAction {
+    /// Recurse into this column's dependencies.
+    Recurse,
+    /// Don't recurse into this column's dependencies.
+    Skip,
+    /// Stop the entire walk immediately (early termination).
+    Stop,
+}
+
+/// Walks the generated column dependency graph via DFS starting from `start_idx`.
+///
+/// For each dependency encountered, calls `visitor(dep_idx, &column)`.
+/// The visitor controls traversal via `GenColDepsAction`.
+/// Cycle-safe via `visited` set. Does NOT call the visitor for the starting column itself.
+///
+/// Returns `true` if the visitor ever returned `Stop` (useful for search queries).
+pub fn walk_gen_col_deps<F>(
+    start_idx: usize,
+    columns: &[Column],
+    column_lookup: &HashMap<String, usize>,
+    visited: &mut HashSet<usize>,
+    visitor: &mut F,
+) -> bool
+where
+    F: FnMut(usize, &Column) -> GenColDepsAction,
+{
+    if !visited.insert(start_idx) {
+        return false;
+    }
+    let Some(ref expr) = columns[start_idx].generated else {
+        return false;
+    };
+    for ref_name in collect_column_refs(expr) {
+        let Some(&dep_idx) = column_lookup.get(&ref_name.to_lowercase()) else {
+            continue;
+        };
+        match visitor(dep_idx, &columns[dep_idx]) {
+            GenColDepsAction::Recurse => {
+                if walk_gen_col_deps(dep_idx, columns, column_lookup, visited, visitor) {
+                    return true;
+                }
+            }
+            GenColDepsAction::Skip => {}
+            GenColDepsAction::Stop => return true,
+        }
+    }
+    false
+}
+
+/// Check if there's a path from `start` to `target` in the generated column dependency graph.
+/// Uses DFS with cycle detection to find transitive dependencies.
+/// `columns` is the list of columns seen so far during parsing.
+/// Returns true if target is reachable from start through generated column dependencies.
+fn has_transitive_dependency(
+    start: &str,
+    target: &str,
+    columns: &[Column],
+    visited: &mut std::collections::HashSet<String>,
+) -> bool {
+    if !visited.insert(start.to_owned()) {
+        return false; // Already visited this node, no cycle through here
+    }
+
+    // Find the column with this name
+    let col = columns.iter().find(|c| c.name.as_deref() == Some(start));
+
+    let Some(col) = col else {
+        return false; // Not a generated column or doesn't exist yet
+    };
+
+    let Some(ref gen_expr) = col.generated else {
+        return false; // Not a generated column
+    };
+
+    // Extract dependencies of this column
+    let deps = collect_column_refs(gen_expr);
+
+    // Check if target is directly referenced
+    if deps.contains(target) {
+        return true;
+    }
+
+    // Recursively check transitive dependencies
+    for dep in deps {
+        if has_transitive_dependency(&dep, target, columns, visited) {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn resolve_generated_expr_function(
+    resolver: Option<&Resolver>,
+    name: &ast::Name,
+    arg_count: usize,
+) -> Result<Func> {
+    if let Some(resolver) = resolver {
+        if let Some(func) = resolver.resolve_function(name.as_str(), arg_count) {
+            return Ok(func);
+        }
+    }
+    Func::resolve_function(name.as_str(), arg_count)
+}
+
+fn is_aggregate_function(func: &Func) -> bool {
+    match func {
+        Func::Agg(_) => true,
+        Func::External(ext) => matches!(&ext.as_ref().func, ExtFunc::Aggregate { .. }),
+        _ => false,
+    }
+}
+
+/// Validates generated column expression for prohibited constructs.
+/// SQLite prohibits: subqueries, aggregate functions, window functions,
+/// and non-deterministic functions in generated columns.
+pub(crate) fn validate_generated_expr(expr: &ast::Expr, resolver: Option<&Resolver>) -> Result<()> {
+    validate_generated_expr_recursive(expr, resolver)
+}
+
+fn validate_generated_expr_recursive(expr: &ast::Expr, resolver: Option<&Resolver>) -> Result<()> {
+    use ast::Expr;
+    match expr {
+        // Qualified column references prohibited (e.g. t.a or db.t.a)
+        Expr::Qualified(_, _) | Expr::DoublyQualified(_, _, _) => {
+            crate::bail_parse_error!("the \".\" operator prohibited in generated columns");
+        }
+
+        // Subqueries prohibited (including InTable which is a table-valued subquery)
+        Expr::Subquery(_) | Expr::InSelect { .. } | Expr::Exists(_) | Expr::InTable { .. } => {
+            crate::bail_parse_error!("subqueries prohibited in generated columns");
+        }
+
+        // Check function calls
+        Expr::FunctionCall {
+            name,
+            args,
+            filter_over,
+            ..
+        } => {
+            // Window functions prohibited
+            if filter_over.over_clause.is_some() {
+                crate::bail_parse_error!("window functions prohibited in generated columns");
+            }
+
+            let func = resolve_generated_expr_function(resolver, name, args.len())?;
+            if is_aggregate_function(&func) {
+                crate::bail_parse_error!("aggregate functions prohibited in generated columns");
+            }
+            if !func.is_deterministic() {
+                crate::bail_parse_error!(
+                    "non-deterministic functions prohibited in generated columns"
+                );
+            }
+
+            // Recurse into arguments
+            for arg in args {
+                validate_generated_expr_recursive(arg, resolver)?;
+            }
+        }
+
+        // Check for aggregate star function
+        Expr::FunctionCallStar { name, filter_over } => {
+            if filter_over.over_clause.is_some() {
+                crate::bail_parse_error!("window functions prohibited in generated columns");
+            }
+            let func = resolve_generated_expr_function(resolver, name, 0)?;
+            if is_aggregate_function(&func) {
+                crate::bail_parse_error!("aggregate functions prohibited in generated columns");
+            }
+            if !func.is_deterministic() {
+                crate::bail_parse_error!(
+                    "non-deterministic functions prohibited in generated columns"
+                );
+            }
+        }
+
+        // Recurse into child expressions
+        Expr::Binary(lhs, _, rhs) => {
+            validate_generated_expr_recursive(lhs, resolver)?;
+            validate_generated_expr_recursive(rhs, resolver)?;
+        }
+        Expr::Unary(_, inner) => validate_generated_expr_recursive(inner, resolver)?,
+        Expr::Parenthesized(exprs) => {
+            for e in exprs {
+                validate_generated_expr_recursive(e, resolver)?;
+            }
+        }
+        Expr::Case {
+            base,
+            when_then_pairs,
+            else_expr,
+            ..
+        } => {
+            if let Some(b) = base {
+                validate_generated_expr_recursive(b, resolver)?;
+            }
+            for (w, t) in when_then_pairs {
+                validate_generated_expr_recursive(w, resolver)?;
+                validate_generated_expr_recursive(t, resolver)?;
+            }
+            if let Some(e) = else_expr {
+                validate_generated_expr_recursive(e, resolver)?;
+            }
+        }
+        Expr::Cast { expr, .. } => validate_generated_expr_recursive(expr, resolver)?,
+        Expr::InList { lhs, rhs, .. } => {
+            validate_generated_expr_recursive(lhs, resolver)?;
+            for e in rhs {
+                validate_generated_expr_recursive(e, resolver)?;
+            }
+        }
+        Expr::Between {
+            lhs, start, end, ..
+        } => {
+            validate_generated_expr_recursive(lhs, resolver)?;
+            validate_generated_expr_recursive(start, resolver)?;
+            validate_generated_expr_recursive(end, resolver)?;
+        }
+        Expr::Like {
+            lhs, rhs, escape, ..
+        } => {
+            validate_generated_expr_recursive(lhs, resolver)?;
+            validate_generated_expr_recursive(rhs, resolver)?;
+            if let Some(e) = escape {
+                validate_generated_expr_recursive(e, resolver)?;
+            }
+        }
+        Expr::Collate(inner, _) => validate_generated_expr_recursive(inner, resolver)?,
+        Expr::IsNull(inner) | Expr::NotNull(inner) => {
+            validate_generated_expr_recursive(inner, resolver)?;
+        }
+        // Other expressions are allowed
+        _ => {}
+    }
+    Ok(())
+}
+
+pub fn create_table(
+    tbl_name: &str,
+    body: &CreateTableBody,
+    root_page: i64,
+    resolver: Option<&Resolver>,
+) -> Result<BTreeTable> {
     let table_name = normalize_ident(tbl_name);
     trace!("Creating table {}", table_name);
     let mut has_rowid = true;
@@ -2408,7 +2707,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
     let mut primary_key_columns = vec![];
     let mut foreign_keys = vec![];
     let mut check_constraints = vec![];
-    let mut cols = vec![];
+    let mut cols: Vec<Column> = vec![];
     let is_strict: bool;
     let mut unique_sets_columns: Vec<UniqueSet> = vec![];
     let mut unique_sets_constraints: Vec<UniqueSet> = vec![];
@@ -2607,6 +2906,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                 };
 
                 let mut default = None;
+                let mut generated: Option<Box<ast::Expr>> = None;
                 let mut primary_key = false;
                 let mut notnull = false;
                 let mut notnull_conflict_clause = None;
@@ -2622,9 +2922,17 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                                 Some(&name),
                             ));
                         }
-                        ast::ColumnConstraint::Generated { .. } => {
-                            // todo(sivukhin): table_xinfo must be updated when generated columns will be supported in order to properly emit "hidden" column value
-                            crate::bail_parse_error!("GENERATED columns are not yet supported");
+                        ast::ColumnConstraint::Generated { expr, typ } => {
+                            if typ
+                                .as_ref()
+                                .is_some_and(|t| t.as_str().eq_ignore_ascii_case("STORED"))
+                            {
+                                crate::bail_parse_error!(
+                                    "STORED generated columns are not supported"
+                                );
+                            }
+                            validate_generated_expr(expr, resolver)?;
+                            generated = Some(expr.clone());
                         }
                         ast::ColumnConstraint::PrimaryKey {
                             order: o,
@@ -2733,6 +3041,64 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                     }
                 }
 
+                // Validate generated column constraints
+                if let Some(ref gen_expr) = generated {
+                    if primary_key {
+                        crate::bail_parse_error!(
+                            "generated column \"{}\" cannot be part of the PRIMARY KEY",
+                            name
+                        );
+                    }
+                    if default.is_some() {
+                        crate::bail_parse_error!(
+                            "generated column \"{}\" cannot have a DEFAULT value",
+                            name
+                        );
+                    }
+
+                    // Extract column references from the generated expression
+                    let referenced_cols = collect_column_refs(gen_expr);
+
+                    for ref_col in &referenced_cols {
+                        if !columns
+                            .iter()
+                            .any(|c| normalize_ident(c.col_name.as_str()) == *ref_col)
+                        {
+                            crate::bail_parse_error!("no such column: {}", ref_col);
+                        }
+                    }
+
+                    // Normalize the current column name for comparison
+                    let current_col_name = normalize_ident(&name);
+
+                    // Check for self-reference
+                    if referenced_cols.iter().any(|c| c == &current_col_name) {
+                        crate::bail_parse_error!(
+                            "generated column \"{}\" cannot reference itself",
+                            name
+                        );
+                    }
+
+                    // Check for circular references (including transitive cycles)
+                    // For each referenced column that is also a generated column,
+                    // check if it can transitively reach back to the current column
+                    for ref_col in &referenced_cols {
+                        let mut visited = std::collections::HashSet::new();
+                        if has_transitive_dependency(
+                            ref_col,
+                            &current_col_name,
+                            &cols,
+                            &mut visited,
+                        ) {
+                            crate::bail_parse_error!(
+                                "circular dependency in generated columns \"{}\" and \"{}\"",
+                                name,
+                                ref_col
+                            );
+                        }
+                    }
+                }
+
                 if primary_key {
                     primary_key_columns.push((name.clone(), order));
                     if order == SortOrder::Desc {
@@ -2742,6 +3108,12 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                     .iter()
                     .any(|(col_name, _)| col_name.eq_ignore_ascii_case(&name))
                 {
+                    if generated.is_some() {
+                        crate::bail_parse_error!(
+                            "generated column \"{}\" cannot be part of the PRIMARY KEY",
+                            name
+                        );
+                    }
                     primary_key = true;
                 }
 
@@ -2749,7 +3121,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                     Some(name),
                     ty_str,
                     default,
-                    None,
+                    generated,
                     ty,
                     collation,
                     ColDef {
@@ -3052,7 +3424,7 @@ const F_UNIQUE: u16 = 8;
 const F_HIDDEN: u16 = 16;
 
 // pack Type and Collation in the remaining bits
-const TYPE_SHIFT: u16 = 5;
+const TYPE_SHIFT: u16 = 6;
 const TYPE_MASK: u16 = 0b111 << TYPE_SHIFT;
 const COLL_SHIFT: u16 = TYPE_SHIFT + 3;
 const COLL_MASK: u16 = 0b11 << COLL_SHIFT;
@@ -3231,6 +3603,27 @@ impl Column {
     #[inline]
     pub const fn hidden(&self) -> bool {
         self.raw & F_HIDDEN != 0
+    }
+
+    /// Returns true if this is a generated column (VIRTUAL or STORED)
+    #[inline]
+    pub fn is_generated(&self) -> bool {
+        self.generated.is_some()
+    }
+
+    /// Returns an error if this column is a generated column.
+    /// `verb_phrase` should describe the operation, e.g. "INSERT into" or "UPDATE".
+    pub fn ensure_not_generated(&self, verb_phrase: &str, col_name: &str) -> crate::Result<()> {
+        if self.is_generated() {
+            crate::bail_parse_error!("cannot {} generated column \"{}\"", verb_phrase, col_name);
+        }
+        Ok(())
+    }
+
+    /// Returns true if this is a VIRTUAL generated column (all generated columns are VIRTUAL)
+    #[inline]
+    pub fn is_virtual_generated(&self) -> bool {
+        self.generated.is_some()
     }
 
     #[inline]
@@ -3470,6 +3863,9 @@ pub struct IndexColumn {
     pub default: Option<Box<Expr>>,
     /// Expression for expression indexes. None for simple column indexes.
     pub expr: Option<Box<Expr>>,
+    /// Affinity to apply when computing VIRTUAL column expressions for index storage.
+    /// This ensures INTEGER->REAL conversions happen per SQLite's affinity rules.
+    pub affinity: Option<Affinity>,
 }
 
 impl Index {
@@ -3582,6 +3978,7 @@ impl Index {
                 collation: column.collation_opt(),
                 default: column.default.clone(),
                 expr: None,
+                affinity: None,
             });
         }
 
@@ -3629,6 +4026,7 @@ impl Index {
                 collation: col.collation_opt(),
                 default: col.default.clone(),
                 expr: None,
+                affinity: None,
             });
         }
 
@@ -3661,7 +4059,22 @@ impl Index {
     /// Given an expression, return the position in the index if it matches an expression index column.
     /// Expression index matching is textual (after binding), so the caller should normalize the query
     /// expression to resemble the stored index expression (e.g. unqualified column names).
+    ///
+    /// NOTE: Simple column references (Id, Column, Qualified) are NOT matched here.
+    /// They should use column_table_pos_to_index_pos() instead. This prevents incorrect
+    /// matching where a VIRTUAL column's dependency expression (e.g., `b AS (c)` has
+    /// expression `c`) would incorrectly match a query for the bare column `c`.
     pub fn expression_to_index_pos(&self, expr: &Expr) -> Option<usize> {
+        // Skip simple column references - these should use column_table_pos_to_index_pos()
+        // instead of expression index matching. Expression indexes are for computed
+        // expressions like `c + 1` or `LOWER(c)`, not bare column references.
+        if matches!(
+            expr,
+            Expr::Id(_) | Expr::Column { .. } | Expr::Qualified(_, _)
+        ) {
+            return None;
+        }
+
         self.columns.iter().position(|c| {
             c.expr
                 .as_ref()
@@ -4485,5 +4898,52 @@ mod tests {
         assert!(matches!(index.columns[0].order, SortOrder::Asc));
 
         Ok(())
+    }
+
+    #[test]
+    fn test_virtual_generated_columns() -> Result<()> {
+        let sql = r#"CREATE TABLE t (
+          a REAL,
+          b INTEGER AS (a),
+          c REAL AS (b),
+          d INTEGER AS (- (c - (141 - c)))
+        );"#;
+        let table = BTreeTable::from_sql(sql, 0)?;
+
+        // Column a should be regular (not generated)
+        let col_a = table.get_column("a").unwrap().1;
+        assert!(!col_a.is_generated(), "column 'a' should not be generated");
+
+        // Column b should be VIRTUAL generated (default)
+        let col_b = table.get_column("b").unwrap().1;
+        assert!(col_b.is_generated(), "column 'b' should be generated");
+        assert!(col_b.is_virtual_generated(), "column 'b' should be VIRTUAL");
+
+        // Column c should be VIRTUAL generated (default)
+        let col_c = table.get_column("c").unwrap().1;
+        assert!(col_c.is_generated(), "column 'c' should be generated");
+        assert!(col_c.is_virtual_generated(), "column 'c' should be VIRTUAL");
+
+        // Column d should be VIRTUAL generated (default)
+        let col_d = table.get_column("d").unwrap().1;
+        assert!(col_d.is_generated(), "column 'd' should be generated");
+        assert!(col_d.is_virtual_generated(), "column 'd' should be VIRTUAL");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_stored_generated_columns_rejected() {
+        let sql = r#"CREATE TABLE t (a REAL, b INTEGER GENERATED ALWAYS AS (a) STORED);"#;
+        let result = BTreeTable::from_sql(sql, 0);
+        assert!(
+            result.is_err(),
+            "STORED generated columns should be rejected"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("STORED generated columns are not supported"),
+            "unexpected error: {err_msg}"
+        );
     }
 }

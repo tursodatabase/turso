@@ -11,8 +11,9 @@ use crate::{
             check_expr_references_columns, delete::emit_fk_child_decrement_on_delete,
             emit_cdc_autocommit_commit, emit_cdc_full_record, emit_cdc_insns,
             emit_cdc_patch_record, emit_check_constraints, emit_index_column_value_new_image,
-            emit_index_column_value_old_image, emit_program_for_select, init_limit,
-            rewrite_where_for_update_registers, OperationMode, Resolver, UpdateRowSource,
+            emit_index_column_value_old_image, emit_make_record_without_virtual,
+            emit_program_for_select, init_limit, rewrite_where_for_update_registers, OperationMode,
+            Resolver, UpdateRowSource,
         },
         expr::{
             emit_returning_results, emit_returning_scan_back, restore_returning_row_image_in_cache,
@@ -43,6 +44,7 @@ use crate::{
     },
     CaptureDataChangesExt, Connection, HashSet, Result,
 };
+use rustc_hash::FxHashMap as HashMap;
 use std::num::NonZeroUsize;
 use tracing::{instrument, Level};
 use turso_parser::ast::{ResolveType, TriggerEvent, TriggerTime};
@@ -577,41 +579,48 @@ fn emit_update_column_values<'a>(
             }
         } else {
             // Column is not being updated, read it from the table
-            let column_idx_in_index = index.as_ref().and_then(|(idx, _)| {
-                idx.columns.iter().position(|c| {
-                    table_column
-                        .name
-                        .as_ref()
-                        .is_some_and(|tc_name| c.name.eq_ignore_ascii_case(tc_name))
-                })
-            });
-
-            // don't emit null for pkey of virtual tables. they require first two args
-            // before the 'record' to be explicitly non-null
-            if table_column.is_rowid_alias() && !is_virtual {
+            // Skip VIRTUAL generated columns - they are computed on-the-fly and not stored
+            if table_column.is_virtual_generated() {
+                // VIRTUAL columns are not stored, emit NULL as placeholder
+                // (the actual value will be computed during SELECT)
                 program.emit_null(target_reg, None);
-            } else if is_virtual {
-                program.emit_insn(Insn::VColumn {
-                    cursor_id: target_table_cursor_id,
-                    column: idx,
-                    dest: target_reg,
-                });
             } else {
-                let cursor_id = *index
-                    .as_ref()
-                    .and_then(|(_, id)| {
-                        if column_idx_in_index.is_some() {
-                            Some(id)
-                        } else {
-                            None
-                        }
+                let column_idx_in_index = index.as_ref().and_then(|(idx, _)| {
+                    idx.columns.iter().position(|c| {
+                        table_column
+                            .name
+                            .as_ref()
+                            .is_some_and(|tc_name| c.name.eq_ignore_ascii_case(tc_name))
                     })
-                    .unwrap_or(&target_table_cursor_id);
-                program.emit_column_or_rowid(
-                    cursor_id,
-                    column_idx_in_index.unwrap_or(idx),
-                    target_reg,
-                );
+                });
+
+                // don't emit null for pkey of virtual tables. they require first two args
+                // before the 'record' to be explicitly non-null
+                if table_column.is_rowid_alias() && !is_virtual {
+                    program.emit_null(target_reg, None);
+                } else if is_virtual {
+                    program.emit_insn(Insn::VColumn {
+                        cursor_id: target_table_cursor_id,
+                        column: idx,
+                        dest: target_reg,
+                    });
+                } else {
+                    let cursor_id = *index
+                        .as_ref()
+                        .and_then(|(_, id)| {
+                            if column_idx_in_index.is_some() {
+                                Some(id)
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or(&target_table_cursor_id);
+                    program.emit_column_or_rowid(
+                        cursor_id,
+                        column_idx_in_index.unwrap_or(idx),
+                        target_reg,
+                    );
+                }
             }
 
             if let Some(cdc_updates_register) = cdc_updates_register {
@@ -1014,12 +1023,18 @@ fn emit_update_insns<'a>(
         let needs_old_registers = has_before_triggers || has_after_triggers || has_fk_cascade;
 
         // Only read OLD row values when triggers or FK cascades need them
+        // Read OLD row values for trigger context
+        let columns = target_table.table.columns();
         let old_registers: Option<Vec<usize>> = if needs_old_registers {
             Some(
                 (0..col_len)
                     .map(|i| {
                         let reg = program.alloc_register();
-                        program.emit_column_or_rowid(target_table_cursor_id, i, reg);
+                        if columns[i].is_virtual_generated() {
+                            program.emit_null(reg, None);
+                        } else {
+                            program.emit_column_or_rowid(target_table_cursor_id, i, reg);
+                        }
                         reg
                     })
                     .chain(std::iter::once(beg))
@@ -1036,6 +1051,32 @@ fn emit_update_insns<'a>(
             // If the rowid is being updated (INTEGER PRIMARY KEY in SET clause),
             // use the new rowid register; otherwise use the current rowid (beg).
             let new_rowid_reg = rowid_set_clause_reg.unwrap_or(beg);
+
+            // Compute VIRTUAL column values for trigger access
+            // VIRTUAL columns are normally NULL (computed on read), but triggers need actual values
+            let column_lookup = crate::schema::build_column_name_lookup(columns);
+
+            // Compute VIRTUAL columns for NEW values (contiguous registers at 'start')
+            compute_virtual_columns_for_update(
+                program,
+                columns,
+                &VirtualColumnRegisters::Contiguous {
+                    registers_start: start,
+                    rowid_reg: Some(beg),
+                },
+                &column_lookup,
+                &t_ctx.resolver,
+            )?;
+
+            // Compute VIRTUAL columns for OLD values (non-contiguous registers in old_registers slice)
+            compute_virtual_columns_for_update(
+                program,
+                columns,
+                &VirtualColumnRegisters::Indexed(&old_registers),
+                &column_lookup,
+                &t_ctx.resolver,
+            )?;
+
             let new_registers = (0..col_len)
                 .map(|i| start + i)
                 .chain(std::iter::once(new_rowid_reg))
@@ -1223,6 +1264,32 @@ fn emit_update_insns<'a>(
             .register_affinities
             .insert(rowid_reg, Affinity::Integer);
     }
+    // Compute VIRTUAL generated column values into their registers.
+    // VIRTUAL columns hold NULL during UPDATE (they're not stored), but index operations
+    // need the computed values. This must happen BEFORE any index key building.
+    {
+        let columns = target_table.table.columns();
+        let column_lookup = crate::schema::build_column_name_lookup(columns);
+        let rowid_reg = rowid_set_clause_reg.unwrap_or(beg);
+        for (idx, col) in columns.iter().enumerate() {
+            if col.is_virtual_generated() {
+                if let Some(gen_expr) = &col.generated {
+                    emit_generated_expr_from_registers(
+                        program,
+                        gen_expr,
+                        start + idx,
+                        start,
+                        &column_lookup,
+                        columns,
+                        &t_ctx.resolver,
+                        Some(rowid_reg),
+                    )?;
+                    program.emit_column_affinity(start + idx, col.affinity());
+                }
+            }
+        }
+    }
+
     let target_is_strict = target_table
         .table
         .btree()
@@ -2161,25 +2228,7 @@ fn emit_update_insns<'a>(
         }
 
         let record_reg = program.alloc_register();
-
-        let is_strict = target_table
-            .table
-            .btree()
-            .is_some_and(|btree| btree.is_strict);
-        let affinity_str = target_table
-            .table
-            .columns()
-            .iter()
-            .map(|col| col.affinity_with_strict(is_strict).aff_mask())
-            .collect::<String>();
-
-        program.emit_insn(Insn::MakeRecord {
-            start_reg: to_u16(start),
-            count: to_u16(col_len),
-            dest_reg: to_u16(record_reg),
-            index_name: None,
-            affinity_str: Some(affinity_str),
-        });
+        emit_make_record_without_virtual(program, target_table.table.columns(), start, record_reg);
 
         if not_exists_check_required {
             program.emit_insn(Insn::NotExists {
@@ -2294,6 +2343,34 @@ fn emit_update_insns<'a>(
                 .collect()
             });
             if !relevant_triggers.is_empty() {
+                // Compute VIRTUAL column values for trigger access
+                // VIRTUAL columns are normally NULL (computed on read), but triggers need actual values
+                let columns = target_table.table.columns();
+                let column_lookup = crate::schema::build_column_name_lookup(columns);
+
+                // Compute VIRTUAL columns for NEW values
+                compute_virtual_columns_for_update(
+                    program,
+                    columns,
+                    &VirtualColumnRegisters::Contiguous {
+                        registers_start: start,
+                        rowid_reg: Some(beg),
+                    },
+                    &column_lookup,
+                    &t_ctx.resolver,
+                )?;
+
+                // Compute VIRTUAL columns for OLD values if we have preserved OLD registers
+                if let Some(ref old_regs) = preserved_old_registers {
+                    compute_virtual_columns_for_update(
+                        program,
+                        columns,
+                        &VirtualColumnRegisters::Indexed(old_regs),
+                        &column_lookup,
+                        &t_ctx.resolver,
+                    )?;
+                }
+
                 let new_rowid_reg = rowid_set_clause_reg.unwrap_or(beg);
                 // Build raw NEW registers. Values are encoded at this point;
                 // fire_trigger will decode them via decode_trigger_registers.
@@ -2497,5 +2574,95 @@ fn emit_update_insns<'a>(
     program.preassign_label_to_next_insn(trigger_ignore_jump_label);
 
     t_ctx.resolver.register_affinities.clear();
+    Ok(())
+}
+
+/// Emit bytecode to evaluate a generated expression using register values.
+/// This is used for generated columns in UPDATE, where the expression
+/// should use the NEW values of columns (from registers) rather than old values (from cursor).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn emit_generated_expr_from_registers(
+    program: &mut ProgramBuilder,
+    expr: &turso_parser::ast::Expr,
+    target_reg: usize,
+    registers_start: usize,
+    column_lookup: &HashMap<String, usize>,
+    columns: &[crate::schema::Column],
+    resolver: &Resolver,
+    rowid_reg: Option<usize>,
+) -> crate::Result<()> {
+    use crate::translate::expr::{translate_expr_with_context, ExprContext};
+
+    // Use the unified evaluator with UpdateGenerated context
+    let context = ExprContext::UpdateGenerated {
+        registers_start,
+        column_lookup,
+        columns,
+        rowid_reg,
+    };
+    translate_expr_with_context(program, &context, expr, target_reg, resolver)?;
+    Ok(())
+}
+
+/// Describes how virtual column registers are laid out for trigger contexts.
+pub(super) enum VirtualColumnRegisters<'a> {
+    /// Contiguous registers starting at a base offset (NEW context in UPDATE).
+    Contiguous {
+        registers_start: usize,
+        rowid_reg: Option<usize>,
+    },
+    /// Non-contiguous registers indexed per column (OLD context in UPDATE).
+    Indexed(&'a [usize]),
+}
+
+/// Compute VIRTUAL generated column values into their registers for trigger access during UPDATE.
+/// This is needed because VIRTUAL columns normally store NULL (computed on read),
+/// but triggers need the actual computed values in NEW/OLD contexts.
+pub(super) fn compute_virtual_columns_for_update(
+    program: &mut ProgramBuilder,
+    columns: &[crate::schema::Column],
+    registers: &VirtualColumnRegisters<'_>,
+    column_lookup: &HashMap<String, usize>,
+    resolver: &Resolver,
+) -> crate::Result<()> {
+    use crate::translate::expr::{translate_expr_with_context, ExprContext, OldColumnSource};
+
+    for (idx, column) in columns.iter().enumerate() {
+        if column.is_virtual_generated() {
+            if let Some(gen_expr) = &column.generated {
+                match registers {
+                    VirtualColumnRegisters::Contiguous {
+                        registers_start,
+                        rowid_reg,
+                    } => {
+                        let target_reg = registers_start + idx;
+                        emit_generated_expr_from_registers(
+                            program,
+                            gen_expr,
+                            target_reg,
+                            *registers_start,
+                            column_lookup,
+                            columns,
+                            resolver,
+                            *rowid_reg,
+                        )?;
+                        program.emit_column_affinity(target_reg, column.affinity());
+                    }
+                    VirtualColumnRegisters::Indexed(old_registers) => {
+                        let target_reg = old_registers[idx];
+                        let context = ExprContext::OldGenerated {
+                            source: OldColumnSource::Registers(old_registers),
+                            column_lookup,
+                            columns,
+                        };
+                        translate_expr_with_context(
+                            program, &context, gen_expr, target_reg, resolver,
+                        )?;
+                        program.emit_column_affinity(target_reg, column.affinity());
+                    }
+                }
+            }
+        }
+    }
     Ok(())
 }

@@ -120,6 +120,7 @@ pub use io::{
     SyscallIO, WriteCompletion, IO,
 };
 pub use numeric::{nonnan::NonNan, Numeric};
+pub use schema::collect_column_refs;
 pub use statement::Statement;
 pub use storage::{
     buffer_pool::BufferPool,
@@ -128,6 +129,7 @@ pub use storage::{
     pager::{Page, PageRef, Pager},
     wal::{CheckpointMode, CheckpointResult, Wal, WalFile, WalFileShared},
 };
+pub use translate::expr::{walk_expr_mut, WalkControl};
 pub use turso_macros::{
     turso_assert, turso_assert_all, turso_assert_eq, turso_assert_greater_than,
     turso_assert_greater_than_or_equal, turso_assert_less_than, turso_assert_less_than_or_equal,
@@ -137,6 +139,7 @@ pub use turso_macros::{
     turso_assert_unreachable, turso_debug_assert, turso_soft_unreachable,
 };
 pub use types::{IOResult, Value, ValueRef};
+pub use util::rename_column_refs_in_expr;
 pub use util::IOExt;
 pub use vdbe::{
     builder::QueryMode, explain::EXPLAIN_COLUMNS, explain::EXPLAIN_QUERY_PLAN_COLUMNS,

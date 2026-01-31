@@ -24,6 +24,56 @@ use strum_macros::{EnumDiscriminants, FromRepr, VariantArray};
 use turso_macros::Description;
 use turso_parser::ast::{ResolveType, SortOrder};
 
+/// Metadata for a table during integrity check, used for constraint validation.
+#[derive(Debug, Clone)]
+pub struct IntegrityCheckTable {
+    /// Table name (for error messages)
+    pub name: String,
+    /// Root page of the table's B-tree
+    pub root_page: i64,
+    /// Indexes on this table
+    pub indexes: Vec<IntegrityCheckIndex>,
+    /// Columns with NOT NULL constraint (column index, column name)
+    pub not_null_columns: Vec<(usize, String)>,
+    /// Position of INTEGER PRIMARY KEY column if it exists (rowid alias).
+    /// This column's value is stored as NULL in the record; the rowid should be used instead.
+    pub rowid_alias_column_pos: Option<usize>,
+}
+
+/// Metadata for an index during integrity check.
+#[derive(Debug, Clone)]
+pub struct IntegrityCheckIndex {
+    /// Index name (for error messages)
+    pub name: String,
+    /// Root page of the index's B-tree
+    pub root_page: i64,
+    /// Whether this is a UNIQUE index
+    pub unique: bool,
+    /// Column positions in the table (for building index keys from table rows)
+    /// These are LOGICAL positions in the table schema.
+    pub column_positions: Vec<usize>,
+    /// Physical positions in the stored record for each indexed column.
+    /// None means the column is VIRTUAL (not stored in the record).
+    /// This is needed because VIRTUAL columns are not stored, so logical
+    /// positions don't map directly to record positions.
+    pub physical_positions: Vec<Option<usize>>,
+    /// True if any indexed column cannot be reconstructed from the stored row.
+    /// This includes VIRTUAL generated columns (not physically stored) and
+    /// expression index columns (EXPR_INDEX_SENTINEL — the expression result
+    /// is stored in the index but can't be recomputed without a runtime evaluator).
+    /// When true, we skip row-index validation entirely.
+    /// TODO: Refactor integrity_check to use VDBE bytecode so we can evaluate
+    /// generated/expression columns and validate these indexes properly.
+    pub has_unevaluable_columns: bool,
+    /// Starting register containing default values for indexed columns.
+    /// Used for columns added via ALTER TABLE ADD COLUMN with DEFAULT - old rows
+    /// don't physically have these columns, so we use these pre-evaluated defaults.
+    /// The registers are contiguous: [default_values_start_reg..default_values_start_reg + column_positions.len())
+    pub default_values_start_reg: usize,
+    /// Index info for cursor operations (sort order, collation, etc)
+    pub index_info: std::sync::Arc<crate::types::IndexInfo>,
+}
+
 /// Flags provided to comparison instructions (e.g. Eq, Ne) which determine behavior related to NULL values.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CmpInsFlags(usize);
@@ -534,8 +584,8 @@ pub enum Insn {
     TypeCheck {
         start_reg: usize, // P1
         count: usize,     // P2
-        /// GENERATED ALWAYS AS ... STATIC columns are only checked if P3 is zero.
-        /// When P3 is non-zero, no type checking occurs for static generated columns.
+        /// GENERATED ALWAYS AS ... STORED columns are only checked if P3 is zero.
+        /// When P3 is non-zero, no type checking occurs for stored generated columns.
         check_generated: bool, // P3
         table_reference: Arc<BTreeTable>, // P4
     },

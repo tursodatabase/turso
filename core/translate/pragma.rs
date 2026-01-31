@@ -1358,8 +1358,11 @@ fn emit_columns_for_table_info(
         //
         // (see https://sqlite.org/pragma.html#pragma_table_xinfo)
         let column_type = if column.hidden() {
-            // hidden column
+            // hidden column in virtual table
             1
+        } else if column.is_virtual_generated() {
+            // VIRTUAL (dynamic) generated column
+            2
         } else {
             // normal column
             0

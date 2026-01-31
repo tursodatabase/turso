@@ -6,7 +6,9 @@ use turso_parser::ast::{self, TriggerEvent, TriggerTime, Upsert};
 
 use crate::error::SQLITE_CONSTRAINT_PRIMARYKEY;
 use crate::schema::{BTreeTable, IndexColumn, ROWID_SENTINEL};
-use crate::translate::emitter::{emit_check_constraints, UpdateRowSource};
+use crate::translate::emitter::{
+    emit_check_constraints, emit_make_record_without_virtual, UpdateRowSource,
+};
 use crate::translate::expr::{rewrite_between_expr, walk_expr, WalkControl};
 use crate::translate::fkeys::{
     emit_fk_child_update_counters, emit_parent_key_change_checks, fire_fk_update_actions,
@@ -408,18 +410,17 @@ pub fn emit_upsert(
     let num_cols = ctx.table.columns.len();
     let current_start = program.alloc_registers(num_cols);
     for (i, col) in ctx.table.columns.iter().enumerate() {
-        if col.is_rowid_alias() {
-            program.emit_insn(Insn::RowId {
-                cursor_id: ctx.cursor_id,
+        if col.is_virtual_generated() {
+            // VIRTUAL columns are not stored in the record — emit NULL.
+            // Their values are computed on-the-fly when needed.
+            program.emit_insn(Insn::Null {
                 dest: current_start + i,
+                dest_end: None,
             });
         } else {
-            program.emit_insn(Insn::Column {
-                cursor_id: ctx.cursor_id,
-                column: i,
-                dest: current_start + i,
-                default: None,
-            });
+            // emit_column_or_rowid handles: rowid alias → RowId instruction,
+            // regular columns → Column with logical-to-physical index conversion.
+            program.emit_column_or_rowid(ctx.cursor_id, i, current_start + i);
         }
     }
 
@@ -550,7 +551,7 @@ pub fn emit_upsert(
             program.emit_insn(Insn::HaltIfNull {
                 target_reg: new_start + *col_idx,
                 err_code: SQLITE_CONSTRAINT_NOTNULL,
-                description: String::from(table.get_name()) + "." + col.name.as_ref().unwrap(),
+                description: format!("{}.{}", table.get_name(), col.name.as_ref().unwrap()),
             });
         }
         if col.is_rowid_alias() {
@@ -1015,21 +1016,9 @@ pub fn emit_upsert(
         }
     }
 
-    // Build NEW table payload
+    // Build NEW table payload (excluding VIRTUAL columns)
     let rec = program.alloc_register();
-    let is_strict = table.btree().is_some_and(|btree| btree.is_strict);
-    let affinity_str = table
-        .columns()
-        .iter()
-        .map(|c| c.affinity_with_strict(is_strict).aff_mask())
-        .collect::<String>();
-    program.emit_insn(Insn::MakeRecord {
-        start_reg: to_u16(new_start),
-        count: to_u16(num_cols),
-        dest_reg: to_u16(rec),
-        index_name: None,
-        affinity_str: Some(affinity_str),
-    });
+    emit_make_record_without_virtual(program, table.columns(), new_start, rec);
 
     // If rowid changed, first ensure no other row owns it, then delete+insert
     if let Some(rnew) = new_rowid_reg {
@@ -1309,6 +1298,7 @@ pub fn collect_set_clauses_for_upsert(
             let Some(idx) = lookup.get(&normalize_ident(cn.as_str())) else {
                 bail_parse_error!("no such column: {}", cn);
             };
+            table.columns()[*idx].ensure_not_generated("UPDATE", cn.as_str())?;
             if let Some(existing) = out.iter_mut().find(|(i, _)| *i == *idx) {
                 existing.1 = e;
             } else {
@@ -1387,6 +1377,10 @@ fn rewrite_expr_to_registers(
         if c.is_rowid_alias() {
             Some(rowid_reg)
         } else {
+            // Note: For VIRTUAL generated columns, the register at base_start + idx
+            // holds NULL (VIRTUAL columns are not stored). Index expressions on
+            // VIRTUAL columns should use ic.expr (the generating expression which
+            // references base columns), not the VIRTUAL column name directly.
             Some(base_start + idx)
         }
     };

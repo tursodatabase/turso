@@ -9029,6 +9029,7 @@ mod tests {
                         pos_in_table: i,
                         default: None,
                         expr: None,
+                        affinity: None,
                     })
                     .collect(),
                 table_name: "test".to_string(),
@@ -9202,6 +9203,7 @@ mod tests {
                     pos_in_table: 0,
                     default: None,
                     expr: None,
+                    affinity: None,
                 }],
                 table_name: "test".to_string(),
                 root_page: index_root_page,
