@@ -8,12 +8,12 @@ description: How to write tests, when to use each type of test, and how to run t
 
 | Type | Location | Use Case |
 |------|----------|----------|
-| `.sqltest` | `turso-test-runner/tests/` | SQL compatibility. **Preferred for new tests** |
+| `.sqltest` | `testing/runner/tests/` | SQL compatibility. **Preferred for new tests** |
 | TCL `.test` | `testing/` | Legacy SQL compat (being phased out) |
 | Rust integration | `tests/integration/` | Regression tests, complex scenarios |
 | Fuzz | `tests/fuzz/` | Complex features, edge case discovery |
 
-**Note:** TCL tests are being phased out in favor of turso-test-runner. The `.sqltest` format allows the same test cases to run against multiple backends (CLI, Rust bindings, etc.).
+**Note:** TCL tests are being phased out in favor of testing/runner. The `.sqltest` format allows the same test cases to run against multiple backends (CLI, Rust bindings, etc.).
 
 ## Running Tests
 
@@ -25,7 +25,7 @@ make test
 make test-single TEST=select.test
 
 # SQL test runner
-make -C turso-test-runner run-cli
+make -C testing/runner run-cli
 
 # Rust unit/integration tests (full workspace)
 cargo test
@@ -52,9 +52,9 @@ expect {
     2|bob
 }
 ```
-Location: `turso-test-runner/tests/*.sqltest`
+Location: `testing/runner/tests/*.sqltest`
 
-You must start converting TCL tests with the `convert` command from the test runner (e.g `cargo run -- convert <TCL_test_path> -o <out_dir>`). It is not always accurate, but it will convert most of the tests. If some conversion emits a warning you will have to write by hand whatever is missing from it (e.g unroll a for each loop by hand). Then you need to verify the tests work by running them with `make -C turso-test-runner run-rust`, and adjust their output if something was wrong with the conversion. Also, we use harcoded databases in TCL, but with `.sqltest` we generate the database with a different seed, so you will probably need to change the expected test result to match the new database query output. Avoid changing the SQL statements from the test, just change the expected result 
+You must start converting TCL tests with the `convert` command from the test runner (e.g `cargo run -- convert <TCL_test_path> -o <out_dir>`). It is not always accurate, but it will convert most of the tests. If some conversion emits a warning you will have to write by hand whatever is missing from it (e.g unroll a for each loop by hand). Then you need to verify the tests work by running them with `make -C testing/runner run-rust`, and adjust their output if something was wrong with the conversion. Also, we use harcoded databases in TCL, but with `.sqltest` we generate the database with a different seed, so you will probably need to change the expected test result to match the new database query output. Avoid changing the SQL statements from the test, just change the expected result 
 
 ### TCL
 ```tcl

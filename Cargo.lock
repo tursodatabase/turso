@@ -5740,6 +5740,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "test-runner"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chumsky",
+ "clap",
+ "fake",
+ "futures",
+ "glob",
+ "indicatif",
+ "itertools 0.14.0",
+ "logos",
+ "miette",
+ "num_cpus",
+ "owo-colors 4.2.3",
+ "pretty_assertions",
+ "rand 0.9.2",
+ "rand_chacha 0.9.0",
+ "regex",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "similar",
+ "tempfile",
+ "thiserror 2.0.16",
+ "tokio",
+ "turso",
+ "turso_parser",
+]
+
+[[package]]
 name = "textwrap"
 version = "0.16.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6243,38 +6275,6 @@ dependencies = [
  "jni",
  "thiserror 2.0.16",
  "turso_core",
-]
-
-[[package]]
-name = "turso-test-runner"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "chumsky",
- "clap",
- "fake",
- "futures",
- "glob",
- "indicatif",
- "itertools 0.14.0",
- "logos",
- "miette",
- "num_cpus",
- "owo-colors 4.2.3",
- "pretty_assertions",
- "rand 0.9.2",
- "rand_chacha 0.9.0",
- "regex",
- "serde",
- "serde_json",
- "serde_yaml",
- "similar",
- "tempfile",
- "thiserror 2.0.16",
- "tokio",
- "turso",
- "turso_parser",
 ]
 
 [[package]]
