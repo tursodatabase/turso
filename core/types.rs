@@ -2835,6 +2835,14 @@ impl<T> IOResult<T> {
     }
 
     #[inline]
+    pub fn io(self) -> Option<IOCompletions> {
+        match self {
+            IOResult::Done(_) => None,
+            IOResult::IO(io) => Some(io),
+        }
+    }
+
+    #[inline]
     pub fn map<U>(self, func: impl FnOnce(T) -> U) -> IOResult<U> {
         match self {
             IOResult::Done(t) => IOResult::Done(func(t)),
