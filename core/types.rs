@@ -23,9 +23,10 @@ use crate::{Completion, CompletionError, Result, IO};
 use std::borrow::{Borrow, Cow};
 use std::cell::Cell;
 use std::fmt::{Debug, Display};
+use std::future::Future;
 use std::iter::{FusedIterator, Peekable};
 use std::ops::Deref;
-use std::task::Waker;
+use std::task::{Poll, Waker};
 
 /// SQLite by default uses 2000 as maximum numbers in a row.
 /// It controlld by the constant called SQLITE_MAX_COLUMN
@@ -2707,11 +2708,42 @@ pub enum IOCompletions {
     Single(Completion),
 }
 
+pub struct IOCompletionAsync<'a, I: ?Sized + IO> {
+    io: &'a I,
+    completion: Completion,
+}
+
+impl<'a, I: ?Sized + IO> Future for IOCompletionAsync<'a, I> {
+    type Output = Result<()>;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let completion = std::pin::pin!(&mut self.as_mut().completion);
+        match completion.poll(cx) {
+            Poll::Pending => {
+                self.io.step()?;
+                Poll::Pending
+            }
+            res => res,
+        }
+    }
+}
+
 impl IOCompletions {
     /// Wais for the Completions to complete
     pub fn wait<I: ?Sized + IO>(self, io: &I) -> Result<()> {
         match self {
             IOCompletions::Single(c) => io.wait_for_completion(c),
+        }
+    }
+
+    /// Waits for Completion to complete and `steps` IO. Ideally the user should do the stepping,
+    /// but we do not have yet a good api for this
+    pub async fn wait_async<I: ?Sized + IO>(self, io: &I) -> Result<()> {
+        match self {
+            IOCompletions::Single(c) => IOCompletionAsync { io, completion: c }.await,
         }
     }
 
