@@ -1,10 +1,5 @@
 @database :memory:
 
-# =============================================================================
-# Generated (Computed) Columns Tests
-# Based on SQLite gencol1.test
-# =============================================================================
-
 # -----------------------------------------------------------------------------
 # Basic VIRTUAL column tests
 # -----------------------------------------------------------------------------
@@ -913,8 +908,6 @@ expect {
 }
 
 # Test that INTEGER AS columns are correctly marked as VIRTUAL (hidden=2), not STORED (hidden=3).
-# This regression test covers a bug where TYPE_SHIFT=5 overlapped with F_GENERATED_STORED=32,
-# causing INTEGER columns (Type=3) to have bit 5 set, making them appear as STORED.
 test gencol_pragma_table_xinfo_integer_as_virtual {
     CREATE TABLE t1(a REAL, b INTEGER AS (a), c REAL AS (b), d INTEGER AS (c + 1));
     PRAGMA table_xinfo(t1);
@@ -1469,10 +1462,6 @@ test gencol_error_nondeterministic_unixepoch {
 expect error {
 }
 
-# =============================================================================
-# Fix 18: Test Coverage Gaps - Comprehensive Generated Column Tests
-# =============================================================================
-
 # -----------------------------------------------------------------------------
 # Indexes on Generated Columns
 # -----------------------------------------------------------------------------
@@ -1891,13 +1880,6 @@ expect {
     5|200|10
 }
 
-# TODO: CHECK constraints are not yet supported in TursoDB. When implemented, add:
-# - gencol_constraint_check_stored_success
-# - gencol_constraint_check_stored_violation
-# - gencol_constraint_check_virtual_success
-# - gencol_constraint_check_virtual_violation
-# - gencol_constraint_check_on_update
-
 # -----------------------------------------------------------------------------
 # Triggers with NEW.generated_col
 # -----------------------------------------------------------------------------
@@ -2215,10 +2197,6 @@ test gencol_upsert_unique_gencol {
 expect {
     2|1|3
 }
-
-# UPSERT constraint violation during DO UPDATE
-# CHECK constraints are not supported yet - skip this test
-# test gencol_upsert_constraint_violation
 
 # RETURNING clause with generated columns (works correctly on initial INSERT)
 test gencol_upsert_returning {
@@ -2646,12 +2624,6 @@ expect {
     5|20|25
 }
 
-# -----------------------------------------------------------------------------
-# Fix: Index on generated column updated during UPDATE
-# When a base column changes, indexes on generated columns that depend on it
-# must be updated. This was fixed in core/translate/update.rs.
-# -----------------------------------------------------------------------------
-
 # Test that index on VIRTUAL column is updated when base changes.
 # Index on VIRTUAL column - INSERT and UPDATE with integrity check.
 @skip-if mvcc "Expression indexes are not supported with MVCC"
@@ -2751,13 +2723,6 @@ expect {
     ok
 }
 
-# -----------------------------------------------------------------------------
-# Fix: STORED column depending on VIRTUAL column chain during UPDATE
-# When a STORED column depends on a VIRTUAL column which depends on a regular
-# column, updating the regular column should recompute the STORED column.
-# This was fixed in core/translate/emitter.rs.
-# -----------------------------------------------------------------------------
-
 # STORED depends on VIRTUAL depends on regular column - INSERT and UPDATE.
 test gencol_update_stored_via_virtual_chain {
     CREATE TABLE t1(a INTEGER, b AS (a * 2), c AS (b + 10) STORED);
@@ -2809,12 +2774,6 @@ expect {
     5|10|15|25
     10|20|30|50
 }
-
-# -----------------------------------------------------------------------------
-# Fix: Float-to-integer affinity conversion edge cases
-# SQLite converts floats to integers when the value can be represented exactly.
-# This was improved in core/vdbe/execute.rs.
-# -----------------------------------------------------------------------------
 
 # Float that can be exactly represented as integer
 test gencol_affinity_float_to_int_exact {
@@ -2895,14 +2854,6 @@ test gencol_division_truncated {
 expect {
     integer|3
 }
-
-# -----------------------------------------------------------------------------
-# Integrity check with VIRTUAL column indexes
-# Tests for the fix to integrity_check incorrectly reporting "row missing from
-# index" for indexes on VIRTUAL generated columns. The issue was that
-# integrity_check used logical column positions to index into the stored record,
-# but VIRTUAL columns are not stored, causing incorrect key lookups.
-# -----------------------------------------------------------------------------
 
 # Basic integrity check with index on VIRTUAL column
 @skip-if mvcc "Expression indexes are not supported with MVCC"
@@ -3087,17 +3038,6 @@ expect {
     ok
 }
 
-# -----------------------------------------------------------------------------
-# Fix: VIRTUAL column affinity applied when referenced by STORED columns
-# When a STORED column depends on a VIRTUAL column, the VIRTUAL column's
-# affinity must be applied to the expression result. Without this, an
-# INTEGER->REAL->INTEGER chain preserves too much precision. Large integers
-# that can't be exactly represented as float64 should lose precision.
-# -----------------------------------------------------------------------------
-
-# VIRTUAL REAL column referenced by STORED INTEGER - precision loss expected
-# 9007199254740993 is 2^53+1, the first integer not exactly representable as float64.
-# When converted through REAL and back to INTEGER, it becomes 9007199254740992.
 test gencol_stored_via_virtual_affinity_precision {
     CREATE TABLE t1(a INTEGER, b REAL AS (a) VIRTUAL, c INTEGER AS (b) STORED);
     INSERT INTO t1(a) VALUES (9007199254740993);
@@ -3107,7 +3047,6 @@ expect {
     9007199254740993|real|9007199254740992
 }
 
-# Same test with UPDATE to verify affinity is applied on update path
 test gencol_stored_via_virtual_affinity_precision_update {
     CREATE TABLE t1(a INTEGER, b REAL AS (a) VIRTUAL, c INTEGER AS (b) STORED);
     INSERT INTO t1(a) VALUES (1);
@@ -3158,13 +3097,6 @@ test gencol_drop_column_with_virtual_and_stored {
 expect {
     5|10|15
 }
-
-# -----------------------------------------------------------------------------
-# Fix: UPDATE must update indexes on STORED columns that depend on VIRTUAL columns
-# When a base column is updated, indexes on STORED columns that transitively
-# depend on that column (through VIRTUAL column chains) must also be updated.
-# Chain: regular column -> VIRTUAL column -> STORED column -> index
-# -----------------------------------------------------------------------------
 
 # Basic chain: a -> VIRTUAL b -> STORED c with index on c
 @skip-if mvcc "Expression indexes are not supported with MVCC"
@@ -3220,14 +3152,6 @@ test gencol_update_index_multiple_stored {
 expect {
     ok
 }
-
-# -----------------------------------------------------------------------------
-# VIRTUAL column chain in index during UPDATE (IdxDelete bug fix)
-# This tests the case where an index contains a VIRTUAL column that depends
-# on another VIRTUAL column. The old-image computation must recursively
-# evaluate VIRTUAL column expressions instead of trying to read them from
-# the cursor (where they don't exist).
-# -----------------------------------------------------------------------------
 
 # Test: VIRTUAL column chain in index during UPDATE
 @skip-if mvcc "Expression indexes are not supported with MVCC"
@@ -3303,15 +3227,11 @@ expect {
     ok
 }
 
-# -----------------------------------------------------------------------------
-# VIRTUAL column in covering index - expression index matching bug fix
-# -----------------------------------------------------------------------------
 # When a VIRTUAL column `b AS (c)` is in an index, selecting column `c` through
 # the covering index should read the correct index position for `c`, not match
 # against `b`'s expression `(c)`.
 # Index layout: [a=pos0, c=pos1, b=pos2]
 # Column c should read from index position 1, not position 2.
-
 @skip-if mvcc "Expression indexes are not supported with MVCC"
 test gencol_covering_index_virtual_column_dependency {
     CREATE TABLE t1 (a TEXT, b REAL AS (c), c INTEGER, d TEXT AS ('gen_46'));
@@ -3326,15 +3246,6 @@ expect {
 expect @js {
     test|4658494526751244000|4658494526751244126
 }
-
-# -----------------------------------------------------------------------------
-# UPDATE with WHERE on STORED column with multiple indexes (simulator seed 5029082658107442436)
-# -----------------------------------------------------------------------------
-# Bug: UPDATE fails to match rows when WHERE clause references a STORED column
-# and the table has multiple indexes including:
-# 1. An index that includes both the base column AND the STORED column
-# 2. A separate index on just the STORED column
-# The issue is that certain rows are not updated even though they match the predicate.
 
 @skip-if mvcc "Expression indexes are not supported with MVCC"
 test gencol_update_stored_multi_index_predicate {
@@ -3363,14 +3274,6 @@ expect {
     0
 }
 
-# -----------------------------------------------------------------------------
-# RENAME COLUMN with index on generated column (simulator seed 4248993518963963491)
-# -----------------------------------------------------------------------------
-# Bug: When a column referenced by a VIRTUAL generated column is renamed,
-# and an index exists on that generated column, the expression stored in
-# the index's IndexColumn.expr was not updated, causing "unknown column"
-# errors during UPDATE operations.
-
 @skip-if mvcc "Expression indexes are not supported with MVCC"
 test gencol_rename_column_with_index_on_generated {
     CREATE TABLE t1 (
@@ -3391,12 +3294,6 @@ expect {
 expect @js {
     updated|2|updatedupdated
 }
-
-# -----------------------------------------------------------------------------
-# VIRTUAL column chain recomputation after UPDATE
-# -----------------------------------------------------------------------------
-# Tests that VIRTUAL columns properly recompute through dependency chains
-# when base columns are updated.
 
 test virtual-column-chain-update {
     CREATE TABLE t (
@@ -3936,10 +3833,6 @@ expect {
     5|10|110
 }
 
-# -----------------------------------------------------------------------------
-# Function tests for INSERT+UPDATE paths (issue: 6 functions work on INSERT but fail on UPDATE)
-# -----------------------------------------------------------------------------
-
 # concat function
 test gencol_func_concat_insert {
     CREATE TABLE t1(a TEXT, b TEXT, c AS (concat(a, b)) STORED);
@@ -4060,12 +3953,6 @@ expect {
     66
 }
 
-# -----------------------------------------------------------------------------
-# Fix: INTEGER PRIMARY KEY in Generated Columns During UPDATE
-# When a generated column references INTEGER PRIMARY KEY (rowid alias) and
-# an UPDATE triggers recomputation, the rowid must be available in the context.
-# -----------------------------------------------------------------------------
-
 # UPDATE with VIRTUAL column referencing id (verify still works)
 test gencol_rowid_alias_update_virtual {
     CREATE TABLE t1(id INTEGER PRIMARY KEY, other INTEGER, b AS (id + other));
@@ -4150,11 +4037,7 @@ expect {
     42|Updated|42: Updated
 }
 
-# -----------------------------------------------------------------------------
-# Regression tests: ALTER TABLE RENAME COLUMN with generated columns
-# -----------------------------------------------------------------------------
-
-# TODO: Implement SQLite's MEM_IntReal behavior
+# TODO: Implement SQLite's MEM_IntReal behavior (Turso currently returns 20.0 20.0 20.0)
 @skip "IntReal display behavior not yet implemented"
 test gencol_rename_column_regression {
     CREATE TABLE t_rename_gencol (a REAL, b REAL, c REAL AS (b - a));
@@ -4169,10 +4052,6 @@ expect {
     20
     20
 }
-
-# -----------------------------------------------------------------------------
-# Regression tests: Index on REAL generated column with integer comparison
-# -----------------------------------------------------------------------------
 
 # Index on REAL column should return same results as table scan for integer comparisons.
 # Tests that index seek properly handles type coercion for generated columns.
@@ -4307,10 +4186,6 @@ expect @js {
     0
 }
 
-# -----------------------------------------------------------------------------
-# Deep dependency chain (10+ levels)
-# -----------------------------------------------------------------------------
-
 test gencol_deep_chain {
     CREATE TABLE t1(a INTEGER, b AS (a+1) STORED, c AS (b+1) STORED, d AS (c+1) STORED, e AS (d+1) STORED, f AS (e+1) STORED, g AS (f+1) STORED, h AS (g+1) STORED, i AS (h+1) STORED, j AS (i+1) STORED, k AS (j+1) STORED);
     INSERT INTO t1(a) VALUES(1);
@@ -4319,10 +4194,6 @@ test gencol_deep_chain {
 expect {
     1|2|3|4|5|6|7|8|9|10|11
 }
-
-# -----------------------------------------------------------------------------
-# Generated columns in CTE
-# -----------------------------------------------------------------------------
 
 test gencol_cte {
     CREATE TABLE t1(a INTEGER, b AS (a * 2) STORED, c AS (a + b) VIRTUAL);
@@ -4333,10 +4204,6 @@ expect {
     5|10|15
     10|20|30
 }
-
-# -----------------------------------------------------------------------------
-# Generated columns with window functions
-# -----------------------------------------------------------------------------
 
 test gencol_window_function {
     CREATE TABLE t1(a INTEGER, b AS (a * 2) STORED);
@@ -4379,7 +4246,7 @@ expect error {
 }
 
 # -----------------------------------------------------------------------------
-# Virtual generated column in JOIN (regression: emit_column panic)
+# Virtual generated column in JOIN
 # -----------------------------------------------------------------------------
 
 test gencol_virtual_join {
@@ -4409,10 +4276,7 @@ expect {
     integer|3
 }
 
-# -----------------------------------------------------------------------------
 # UPSERT ON CONFLICT DO UPDATE SET on generated columns must error
-# -----------------------------------------------------------------------------
-
 test gencol_upsert_stored_error {
     CREATE TABLE t_gencol_upsert_s(a INTEGER PRIMARY KEY, b INTEGER, c AS (b * 2) STORED);
     INSERT INTO t_gencol_upsert_s(a, b) VALUES(1, 10);
@@ -4431,10 +4295,7 @@ expect error {
     cannot UPDATE generated column
 }
 
-# -----------------------------------------------------------------------------
 # ALTER TABLE ADD COLUMN: generated expression validation
-# -----------------------------------------------------------------------------
-
 test gencol_alter_add_virtual_random_error {
     CREATE TABLE t_alter_gencol1(a INTEGER);
     ALTER TABLE t_alter_gencol1 ADD COLUMN b AS (random()) VIRTUAL;
@@ -4443,10 +4304,7 @@ expect error {
     non-deterministic function
 }
 
-# -----------------------------------------------------------------------------
 # STORED generated column: batch affinity must not corrupt stored columns
-# -----------------------------------------------------------------------------
-
 test gencol_stored_affinity_ordering {
     CREATE TABLE t_stored_aff(a TEXT, b INTEGER AS (a) STORED);
     INSERT INTO t_stored_aff(a) VALUES('42');
@@ -4456,11 +4314,8 @@ expect {
     integer|42
 }
 
-# -----------------------------------------------------------------------------
 # UPSERT DO UPDATE SET: NOT NULL error message must include dot separator
 # (table.column, not tablecolumn)
-# -----------------------------------------------------------------------------
-
 test gencol_upsert_notnull_error_dot_separator {
     CREATE TABLE t_dot(id INTEGER PRIMARY KEY, a INTEGER NOT NULL, b AS (a * 2) STORED);
     INSERT INTO t_dot(id, a) VALUES (1, 5);
@@ -4470,12 +4325,7 @@ expect error {
     NOT NULL constraint failed: t_dot.a
 }
 
-# =============================================================================
-# Regression: UPSERT with VIRTUAL column before regular columns
-# Bug: Column values were read using logical indices without logical→physical
-# conversion, causing data corruption when VIRTUAL columns precede regular ones.
-# =============================================================================
-
+# UPSERT with VIRTUAL column before regular columns
 test gencol_upsert_virtual_before_regular_no_update {
     CREATE TABLE t1(a INTEGER PRIMARY KEY, b AS (a * 2) VIRTUAL, c TEXT, d AS (c || '!') STORED);
     INSERT INTO t1(a, c) VALUES(1, 'hello');
@@ -4486,7 +4336,7 @@ expect {
     1|2|hello|hello!
 }
 
-# Same bug with index — verifies no index corruption
+# Same with index — verifies no index corruption
 test gencol_upsert_virtual_before_regular_with_index {
     CREATE TABLE t1(a INTEGER PRIMARY KEY, b AS (a * 2) VIRTUAL, c TEXT);
     CREATE INDEX idx_c ON t1(c);
@@ -4523,11 +4373,7 @@ expect {
     60|20.0|10|30
 }
 
-# =============================================================================
-# Phase 1: Correctness tests for generated column edge cases
-# =============================================================================
-
-# 1.1 Table-level PRIMARY KEY on generated column should be rejected
+# Table-level PRIMARY KEY on generated column should be rejected
 test gencol_table_pk_on_stored_generated_rejected {
     CREATE TABLE t1(a, b AS (a+1) STORED, PRIMARY KEY(b));
 }
@@ -4540,7 +4386,7 @@ test gencol_table_pk_on_virtual_generated_rejected {
 expect error {
 }
 
-# 1.2 Table with all generated columns should be rejected
+# Table with all generated columns should be rejected
 test gencol_all_generated_columns_rejected {
     CREATE TABLE t1(a AS (1), b AS (2));
 }
@@ -4553,7 +4399,7 @@ test gencol_all_generated_columns_stored_rejected {
 expect error {
 }
 
-# 1.3 ALTER TABLE ADD COLUMN with generated column + PK or DEFAULT
+# ALTER TABLE ADD COLUMN with generated column + PK or DEFAULT
 test gencol_alter_add_column_generated_pk_rejected {
     CREATE TABLE t1(a INTEGER);
     ALTER TABLE t1 ADD COLUMN b AS (a+1) PRIMARY KEY;
@@ -4568,7 +4414,7 @@ test gencol_alter_add_column_generated_default_rejected {
 expect error {
 }
 
-# 1.4 Hash join on VIRTUAL column with type affinity
+# Hash join on VIRTUAL column with type affinity
 test gencol_hash_join_virtual_affinity {
     CREATE TABLE t1(a INTEGER, b INTEGER AS (a * 2));
     CREATE TABLE t2(x INTEGER);
@@ -4581,7 +4427,7 @@ expect {
     2|4|4
 }
 
-# 1.5 IN-list NULL handling with generated columns
+# IN-list NULL handling with generated columns
 test gencol_in_list_null_handling {
     CREATE TABLE t1(a INTEGER, b AS (a) VIRTUAL);
     INSERT INTO t1(a) VALUES(1), (2), (NULL);
