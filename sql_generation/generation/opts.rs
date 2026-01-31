@@ -38,6 +38,10 @@ pub struct TableOpts {
     /// Range of numbers of columns to generate
     #[garde(custom(range_struct_min(1)))]
     pub column_range: Range<u32>,
+    /// Whether to generate UNIQUE constraints on columns.
+    /// Only enabled for write_stress profile which tests rollback on constraint failures.
+    #[garde(skip)]
+    pub generate_unique_constraints: bool,
 }
 
 impl Default for TableOpts {
@@ -46,6 +50,7 @@ impl Default for TableOpts {
             large_table: Default::default(),
             // Up to 10 columns
             column_range: 1..11,
+            generate_unique_constraints: false,
         }
     }
 }

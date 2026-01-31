@@ -340,43 +340,150 @@ impl Property {
                     vec![table_dependency.clone()],
                 ));
 
-                let before_interaction =
-                    InteractionType::Query(Query::Select(select_before.clone()));
-                let begin_tx = InteractionType::Query(Query::Begin(
-                    sql_generation::model::query::transaction::Begin::Immediate,
-                ));
+                let has_case_when = update
+                    .set_values
+                    .iter()
+                    .any(|(_, v)| matches!(v, SetValue::CaseWhen { .. }));
+
                 let update_interaction = InteractionType::Query(Query::Update(update.clone()));
-                let commit_tx = InteractionType::Query(Query::Commit(
-                    sql_generation::model::query::transaction::Commit,
-                ));
-                let after_interaction = InteractionType::Query(Query::Select(select_after.clone()));
 
-                let update = update.clone();
-                let table = update.table().to_string();
+                if has_case_when {
+                    // CaseWhen updates (write_stress): full rollback verification with
+                    // before/after snapshots wrapped in BEGIN IMMEDIATE..COMMIT
+                    let before_interaction =
+                        InteractionType::Query(Query::Select(select_before.clone()));
+                    let begin_tx = InteractionType::Query(Query::Begin(
+                        sql_generation::model::query::transaction::Begin::Immediate,
+                    ));
+                    let commit_tx = InteractionType::Query(Query::Commit(
+                        sql_generation::model::query::transaction::Commit,
+                    ));
+                    let after_interaction =
+                        InteractionType::Query(Query::Select(select_after.clone()));
 
-                let assertion = InteractionType::Assertion(Assertion::new(
-                    format!(
-                        "verify UPDATE result for table {}: success=values updated, failure=unchanged",
-                        table.clone()
-                    ),
-                    move |stack: &Vec<ResultSet>, _| {
-                        // Stack: [before, BEGIN, UPDATE, COMMIT, after]
-                        if stack.len() < 5 {
-                            return Err(LimboError::InternalError(
-                                "ReadYourUpdatesBack: expected 5 results on stack".into(),
-                            ));
-                        }
-                        let before = &stack[stack.len() - 5];
-                        let update_result = &stack[stack.len() - 3];
-                        let after = &stack[stack.len() - 1];
+                    let update = update.clone();
+                    let table = update.table().to_string();
 
-                        let update_succeeded = update_result.is_ok();
+                    let assertion = InteractionType::Assertion(Assertion::new(
+                        format!(
+                            "verify UPDATE result for table {}: success=values updated, failure=unchanged",
+                            table.clone()
+                        ),
+                        move |stack: &Vec<ResultSet>, _| {
+                            // Stack: [before, BEGIN, UPDATE, COMMIT, after]
+                            if stack.len() < 5 {
+                                return Err(LimboError::InternalError(
+                                    "ReadYourUpdatesBack: expected 5 results on stack".into(),
+                                ));
+                            }
+                            let before = &stack[stack.len() - 5];
+                            let update_result = &stack[stack.len() - 3];
+                            let after = &stack[stack.len() - 1];
 
-                        match (before, after) {
-                            (Ok(before_rows), Ok(after_rows)) => {
-                                if update_succeeded {
-                                    // Verify rows have updated values
-                                    for row in after_rows {
+                            let update_succeeded = update_result.is_ok();
+
+                            match (before, after) {
+                                (Ok(before_rows), Ok(after_rows)) => {
+                                    if update_succeeded {
+                                        for row in after_rows {
+                                            for (i, (col, set_val)) in
+                                                update.set_values.iter().enumerate()
+                                            {
+                                                match set_val {
+                                                    SetValue::Simple(expected) => {
+                                                        if &row[i] != expected {
+                                                            print_diff(
+                                                                &[row.to_vec()],
+                                                                &[vec![expected.clone()]],
+                                                                "database",
+                                                                "expected",
+                                                            );
+                                                            return Ok(Err(format!(
+                                                                "row has incorrect value for column {col}: expected {expected}, got {}",
+                                                                row[i]
+                                                            )));
+                                                        }
+                                                    }
+                                                    SetValue::CaseWhen { then_value, .. } => {
+                                                        let is_then = &row[i] == then_value;
+                                                        let existed_before = before_rows
+                                                            .iter()
+                                                            .any(|br| br[i] == row[i]);
+                                                        if !is_then && !existed_before {
+                                                            return Ok(Err(format!(
+                                                                "CaseWhen: row col {col} has unexpected value {} (expected {} or a value from before)",
+                                                                row[i], then_value
+                                                            )));
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        Ok(Ok(()))
+                                    } else {
+                                        // UPDATE failed - verify rollback (rows unchanged)
+                                        let rows_equal_as_multiset =
+                                            |a: &[Vec<SimValue>], b: &[Vec<SimValue>]| {
+                                                if a.len() != b.len() {
+                                                    return false;
+                                                }
+                                                let count_in =
+                                                    |row: &Vec<SimValue>, set: &[Vec<SimValue>]| {
+                                                        set.iter().filter(|r| *r == row).count()
+                                                    };
+                                                a.iter()
+                                                    .all(|row| count_in(row, a) == count_in(row, b))
+                                            };
+                                        if !rows_equal_as_multiset(before_rows, after_rows) {
+                                            print_diff(before_rows, after_rows, "before", "after");
+                                            return Ok(Err(format!(
+                                                "UPDATE failed but rows changed - rollback failed: {} rows before, {} after",
+                                                before_rows.len(),
+                                                after_rows.len()
+                                            )));
+                                        }
+                                        Ok(Ok(()))
+                                    }
+                                }
+                                (Err(e), _) | (_, Err(e)) => {
+                                    Err(LimboError::InternalError(format!("SELECT failed: {e}")))
+                                }
+                            }
+                        },
+                        vec![table_dependency],
+                    ));
+
+                    let mut update_builder =
+                        InteractionBuilder::with_interaction(update_interaction);
+                    update_builder.ignore_error(true);
+
+                    vec![
+                        InteractionBuilder::with_interaction(assumption),
+                        InteractionBuilder::with_interaction(before_interaction),
+                        InteractionBuilder::with_interaction(begin_tx),
+                        update_builder,
+                        InteractionBuilder::with_interaction(commit_tx),
+                        InteractionBuilder::with_interaction(after_interaction),
+                        InteractionBuilder::with_interaction(assertion),
+                    ]
+                } else {
+                    // Simple path: UPDATE then SELECT to verify values
+                    let select_interaction =
+                        InteractionType::Query(Query::Select(select_after.clone()));
+
+                    let update = update.clone();
+                    let table = update.table().to_string();
+
+                    let assertion = InteractionType::Assertion(Assertion::new(
+                        format!(
+                            "updated rows should have the updated values for table {}",
+                            table.clone()
+                        ),
+                        move |stack: &Vec<ResultSet>, _| {
+                            let rows = stack.last().unwrap();
+                            match rows {
+                                Ok(rows) => {
+                                    for row in rows {
                                         for (i, (col, set_val)) in
                                             update.set_values.iter().enumerate()
                                         {
@@ -395,67 +502,27 @@ impl Property {
                                                         )));
                                                     }
                                                 }
-                                                SetValue::CaseWhen { then_value, .. } => {
-                                                    let is_then = &row[i] == then_value;
-                                                    let existed_before = before_rows
-                                                        .iter()
-                                                        .any(|br| br[i] == row[i]);
-                                                    if !is_then && !existed_before {
-                                                        return Ok(Err(format!(
-                                                            "CaseWhen: row col {col} has unexpected value {} (expected {} or a value from before)",
-                                                            row[i], then_value
-                                                        )));
-                                                    }
+                                                SetValue::CaseWhen { .. } => {
+                                                    unreachable!("CaseWhen without has_case_when");
                                                 }
                                             }
                                         }
                                     }
                                     Ok(Ok(()))
-                                } else {
-                                    // UPDATE failed - verify rollback (rows unchanged)
-                                    let rows_equal_as_multiset =
-                                        |a: &[Vec<SimValue>], b: &[Vec<SimValue>]| {
-                                            if a.len() != b.len() {
-                                                return false;
-                                            }
-                                            // for each row in a, check it appears the same number of times in b
-                                            let count_in =
-                                                |row: &Vec<SimValue>, set: &[Vec<SimValue>]| {
-                                                    set.iter().filter(|r| *r == row).count()
-                                                };
-                                            a.iter().all(|row| count_in(row, a) == count_in(row, b))
-                                        };
-                                    if !rows_equal_as_multiset(before_rows, after_rows) {
-                                        print_diff(before_rows, after_rows, "before", "after");
-                                        return Ok(Err(format!(
-                                            "UPDATE failed but rows changed - rollback failed: {} rows before, {} after",
-                                            before_rows.len(),
-                                            after_rows.len()
-                                        )));
-                                    }
-                                    Ok(Ok(()))
                                 }
+                                Err(err) => Err(LimboError::InternalError(err.to_string())),
                             }
-                            (Err(e), _) | (_, Err(e)) => {
-                                Err(LimboError::InternalError(format!("SELECT failed: {e}")))
-                            }
-                        }
-                    },
-                    vec![table_dependency],
-                ));
+                        },
+                        vec![table_dependency],
+                    ));
 
-                let mut update_builder = InteractionBuilder::with_interaction(update_interaction);
-                update_builder.ignore_error(true);
-
-                vec![
-                    InteractionBuilder::with_interaction(assumption),
-                    InteractionBuilder::with_interaction(before_interaction),
-                    InteractionBuilder::with_interaction(begin_tx),
-                    update_builder,
-                    InteractionBuilder::with_interaction(commit_tx),
-                    InteractionBuilder::with_interaction(after_interaction),
-                    InteractionBuilder::with_interaction(assertion),
-                ]
+                    vec![
+                        InteractionBuilder::with_interaction(assumption),
+                        InteractionBuilder::with_interaction(update_interaction),
+                        InteractionBuilder::with_interaction(select_interaction),
+                        InteractionBuilder::with_interaction(assertion),
+                    ]
+                }
             }
             Property::InsertValuesSelect {
                 insert,
