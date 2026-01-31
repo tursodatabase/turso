@@ -4,6 +4,8 @@ use anyhow::Context;
 use bitflags::bitflags;
 use indexmap::IndexSet;
 use serde::{Deserialize, Serialize};
+use sql_generation::generation::generated_expr::extract_column_refs;
+use sql_generation::model::query::predicate::expr_to_value;
 use sql_generation::model::query::select::SelectTable;
 use sql_generation::model::{
     query::{
@@ -16,7 +18,8 @@ use sql_generation::model::{
     },
     table::{Index, JoinTable, JoinType, SimValue, Table, TableContext},
 };
-use turso_parser::ast::Distinctness;
+use turso_core::rename_column_refs_in_expr;
+use turso_parser::ast::{ColumnConstraint, Distinctness};
 
 use crate::runner::env::TransactionMode;
 use crate::{generation::Shadow, runner::env::ShadowTablesMut};
@@ -103,6 +106,7 @@ impl Query {
             Query::Create(_) => IndexSet::new(),
             Query::Insert(Insert::Select { table, .. })
             | Query::Insert(Insert::Values { table, .. })
+            | Query::Insert(Insert::ValuesWithColumns { table, .. })
             | Query::Delete(Delete { table, .. })
             | Query::Update(Update { table, .. })
             | Query::Drop(Drop { table, .. })
@@ -130,6 +134,7 @@ impl Query {
             Query::Select(select) => select.dependencies().into_iter().collect(),
             Query::Insert(Insert::Select { table, .. })
             | Query::Insert(Insert::Values { table, .. })
+            | Query::Insert(Insert::ValuesWithColumns { table, .. })
             | Query::Delete(Delete { table, .. })
             | Query::Update(Update { table, .. })
             | Query::Drop(Drop { table, .. })
@@ -395,33 +400,190 @@ impl Shadow for Drop {
     }
 }
 
+/// Compute all generated columns in dependency order.
+/// Modifies `row` in place, computing generated column values based on the current row state.
+fn compute_generated_columns(table: &Table, row: &mut [SimValue]) {
+    let mut computed = vec![false; table.columns.len()];
+    for (i, col) in table.columns.iter().enumerate() {
+        computed[i] = !col.is_generated();
+    }
+
+    loop {
+        let mut made_progress = false;
+        for (idx, col) in table.columns.iter().enumerate() {
+            if computed[idx] {
+                continue;
+            }
+            if let Some(expr) = col.generated_expr() {
+                let refs = extract_column_refs(expr);
+                let all_refs_ready = refs.iter().all(|ref_name| {
+                    table
+                        .columns
+                        .iter()
+                        .position(|c| c.name.eq_ignore_ascii_case(ref_name))
+                        .is_none_or(|i| computed[i])
+                });
+                if all_refs_ready {
+                    if let Some(value) = expr_to_value(expr, row, table) {
+                        row[idx] = value.apply_affinity(col.column_type);
+                    }
+                    computed[idx] = true;
+                    made_progress = true;
+                }
+            }
+        }
+        if !made_progress {
+            break;
+        }
+    }
+
+    debug_assert!(
+        computed.iter().all(|&c| c),
+        "Not all generated columns could be computed - possible missing dependency"
+    );
+}
+
+/// Compute a full row including generated column values.
+///
+/// Takes the inserted values (which may only cover non-generated columns)
+/// and computes the generated column values in dependency order.
+pub(crate) fn compute_full_row(
+    table: &Table,
+    insert_columns: Option<&[String]>,
+    insert_values: &[SimValue],
+) -> Vec<SimValue> {
+    let mut full_row = vec![SimValue::NULL; table.columns.len()];
+
+    // Map inserted values to their column positions
+    if let Some(cols) = insert_columns {
+        for (i, col_name) in cols.iter().enumerate() {
+            if let Some(pos) = table.columns.iter().position(|c| &c.name == col_name) {
+                if i < insert_values.len() {
+                    full_row[pos] = insert_values[i].clone();
+                }
+            }
+        }
+    } else {
+        // Values provided for all non-generated columns in order
+        let mut idx = 0;
+        for (col_idx, col) in table.columns.iter().enumerate() {
+            if !col.is_generated() && idx < insert_values.len() {
+                full_row[col_idx] = insert_values[idx].clone();
+                idx += 1;
+            }
+        }
+    }
+
+    compute_generated_columns(table, &mut full_row);
+    full_row
+}
+
+/// Recompute ALL generated columns (both STORED and VIRTUAL) after an UPDATE.
+/// SQLite computes VIRTUAL columns on-the-fly, so the model needs to keep them
+/// up to date when base columns change.
+fn recompute_all_generated(table: &Table, row: &mut [SimValue]) {
+    compute_generated_columns(table, row);
+}
+
 impl Shadow for Insert {
     type Result = anyhow::Result<Vec<Vec<SimValue>>>;
 
     //FIXME this doesn't handle type affinity
     fn shadow(&self, tables: &mut ShadowTablesMut) -> Self::Result {
-        let (table_name, rows) = match self {
-            Insert::Values { table, values } => (table.clone(), values.clone()),
-            Insert::Select { table, select } => (table.clone(), select.shadow(tables)?),
-        };
+        match self {
+            Insert::Values { table, values } => {
+                let table_ref = tables
+                    .iter()
+                    .find(|t| &t.name == table)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("Table {} does not exist. INSERT statement ignored.", table)
+                    })?
+                    .clone();
 
-        let sim_table = tables
-            .iter()
-            .find(|t| t.name == table_name)
-            .ok_or_else(|| anyhow::anyhow!("Table {} does not exist", table_name))?;
+                // Check if table has generated columns
+                let has_generated = table_ref.columns.iter().any(|c| c.is_generated());
 
-        validate_unique_insert(&table_name, &sim_table.columns, &sim_table.rows, &rows)?;
+                // Compute full rows with generated columns if needed
+                let full_rows: Vec<Vec<SimValue>> = if has_generated {
+                    values
+                        .iter()
+                        .map(|row| compute_full_row(&table_ref, None, row))
+                        .collect()
+                } else {
+                    values.clone()
+                };
 
-        for row in &rows {
-            tables.record_insert(table_name.clone(), row.clone());
+                validate_unique_insert(table, &table_ref.columns, &table_ref.rows, &full_rows)?;
+
+                // Record each inserted row for transaction tracking
+                for row in &full_rows {
+                    tables.record_insert(table.clone(), row.clone());
+                }
+
+                // Insert the rows
+                tables
+                    .iter_mut()
+                    .find(|t| &t.name == table)
+                    .expect("We already validated that the table exists")
+                    .rows
+                    .extend(full_rows);
+            }
+            Insert::ValuesWithColumns {
+                table,
+                columns,
+                values,
+            } => {
+                let table_ref = tables
+                    .iter()
+                    .find(|t| &t.name == table)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("Table {} does not exist. INSERT statement ignored.", table)
+                    })?
+                    .clone();
+
+                // Compute full rows with generated columns
+                let full_rows: Vec<Vec<SimValue>> = values
+                    .iter()
+                    .map(|row| compute_full_row(&table_ref, Some(columns), row))
+                    .collect();
+
+                validate_unique_insert(table, &table_ref.columns, &table_ref.rows, &full_rows)?;
+
+                // Record each inserted row for transaction tracking
+                for row in &full_rows {
+                    tables.record_insert(table.clone(), row.clone());
+                }
+
+                // Insert the rows
+                tables
+                    .iter_mut()
+                    .find(|t| &t.name == table)
+                    .expect("We already validated that the table exists")
+                    .rows
+                    .extend(full_rows);
+            }
+            Insert::Select { table, select } => {
+                let rows = select.shadow(tables)?;
+
+                let sim_table = tables
+                    .iter()
+                    .find(|t| &t.name == table)
+                    .ok_or_else(|| anyhow::anyhow!("Table {} does not exist", table))?;
+
+                validate_unique_insert(table, &sim_table.columns, &sim_table.rows, &rows)?;
+
+                for row in &rows {
+                    tables.record_insert(table.clone(), row.clone());
+                }
+
+                tables
+                    .iter_mut()
+                    .find(|t| &t.name == table)
+                    .unwrap()
+                    .rows
+                    .extend(rows);
+            }
         }
-
-        tables
-            .iter_mut()
-            .find(|t| t.name == table_name)
-            .unwrap()
-            .rows
-            .extend(rows);
 
         Ok(vec![])
     }
@@ -625,7 +787,7 @@ impl Shadow for Update {
 
     fn shadow(&self, tables: &mut ShadowTablesMut) -> Self::Result {
         // First pass: find rows to update and compute old/new values
-        let (updates, columns) = {
+        let (updates, columns, _has_generated) = {
             let table = tables.iter().find(|t| t.name == self.table);
             let table = if let Some(table) = table {
                 table
@@ -638,6 +800,8 @@ impl Shadow for Update {
 
             let t2 = table.clone();
             let columns = table.columns.clone();
+            // Check for any generated columns (both STORED and VIRTUAL)
+            let has_generated = table.columns.iter().any(|c| c.is_generated());
 
             let updates: Vec<(usize, Vec<SimValue>, Vec<SimValue>)> = table
                 .rows
@@ -667,11 +831,15 @@ impl Shadow for Update {
                             }
                         }
                     }
+                    // Recompute ALL generated columns (STORED and VIRTUAL)
+                    if has_generated {
+                        recompute_all_generated(&t2, &mut new_row);
+                    }
                     (row_idx, old_row.clone(), new_row)
                 })
                 .collect();
 
-            (updates, columns)
+            (updates, columns, has_generated)
         };
 
         let updated_row_indices: std::collections::HashSet<usize> =
@@ -782,9 +950,38 @@ impl Shadow for AlterTable {
             }
             AlterTableType::AddColumn { column } => {
                 table.columns.push(column.clone());
-                table.rows.iter_mut().for_each(|row| {
-                    row.push(SimValue(turso_core::Value::Null));
-                });
+                // For generated columns, compute the expression value for each existing row
+                // For non-generated columns, add NULL
+                if column.is_generated() {
+                    // Need to evaluate the generated expression for each row
+                    // First, collect the new values to avoid borrow conflicts
+                    let new_values: Vec<SimValue> = table
+                        .rows
+                        .iter()
+                        .map(|row| {
+                            if let Some(expr) = column.generated_expr() {
+                                // Create a temporary row with a placeholder for the new column
+                                let mut extended_row = row.clone();
+                                extended_row.push(SimValue::NULL);
+                                if let Some(value) = expr_to_value(expr, &extended_row, table) {
+                                    value.apply_affinity(column.column_type)
+                                } else {
+                                    SimValue::NULL
+                                }
+                            } else {
+                                SimValue::NULL
+                            }
+                        })
+                        .collect();
+                    // Now update all rows
+                    for (row, new_val) in table.rows.iter_mut().zip(new_values) {
+                        row.push(new_val);
+                    }
+                } else {
+                    table.rows.iter_mut().for_each(|row| {
+                        row.push(SimValue(turso_core::Value::Null));
+                    });
+                }
             }
             AlterTableType::AlterColumn { old, new } => {
                 let col = table.columns.iter_mut().find(|c| c.name == *old).unwrap();
@@ -798,8 +995,20 @@ impl Shadow for AlterTable {
                 });
             }
             AlterTableType::RenameColumn { old, new } => {
+                // Rename the column itself
                 let col = table.columns.iter_mut().find(|c| c.name == *old).unwrap();
                 col.name = new.clone();
+
+                // Update generated column expressions that reference the old column name
+                for col in &mut table.columns {
+                    for constraint in &mut col.constraints {
+                        if let ColumnConstraint::Generated { expr, .. } = constraint {
+                            rename_column_refs_in_expr(expr, old, new);
+                        }
+                    }
+                }
+
+                // Update index column references
                 table.indexes.iter_mut().for_each(|index| {
                     index.columns.iter_mut().for_each(|(col_name, _)| {
                         if col_name == old {

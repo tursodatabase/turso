@@ -19,7 +19,7 @@ use sql_generation::{
             transaction::{Begin, Commit, Rollback},
             update::{SetValue, Update},
         },
-        table::SimValue,
+        table::{Column, SimValue, Table},
     },
 };
 use strum::IntoEnumIterator;
@@ -30,7 +30,7 @@ use crate::{
     common::print_diff,
     generation::{Shadow, WeightedDistribution, query::QueryDistribution},
     model::{
-        Query, QueryCapabilities, QueryDiscriminants, ResultSet,
+        Query, QueryCapabilities, QueryDiscriminants, ResultSet, compute_full_row,
         interactions::{
             Assertion, Interaction, InteractionBuilder, InteractionType, PropertyMetadata,
         },
@@ -70,13 +70,25 @@ impl Property {
                         .find(|table| table.name == table_name)
                         .unwrap();
 
-                    let rows = insert.rows();
-                    let row = &rows[*row_index];
+                    let partial_rows = insert.rows();
+                    let partial_row = &partial_rows[*row_index];
+
+                    // Compute full row including generated column values for predicate testing.
+                    // The partial_row only contains user-provided values, but predicates may
+                    // reference generated columns and expect row.len() == table.columns.len().
+                    let full_row = match insert {
+                        Insert::ValuesWithColumns { columns, .. } => {
+                            compute_full_row(table, Some(columns), partial_row)
+                        }
+                        Insert::Values { .. } => compute_full_row(table, None, partial_row),
+                        _ => unreachable!(),
+                    };
+
                     match &query {
                         Query::Delete(Delete {
                             table: t,
                             predicate,
-                        }) if t == &table.name && predicate.test(row, table) => {
+                        }) if t == &table.name && predicate.test(&full_row, table) => {
                             // The inserted row will not be deleted.
                             None
                         }
@@ -89,7 +101,7 @@ impl Property {
                             table: t,
                             set_values: _,
                             predicate,
-                        }) if t == &table.name && predicate.test(row, table) => {
+                        }) if t == &table.name && predicate.test(&full_row, table) => {
                             // The inserted row will not be updated.
                             None
                         }
@@ -168,6 +180,16 @@ impl Property {
                                 && values.iter().any(|v| predicate.test(v, table)) =>
                         {
                             // A row that holds for the predicate will not be inserted.
+                            None
+                        }
+                        Query::Insert(Insert::ValuesWithColumns {
+                            table: t,
+                            columns: _,
+                            values: _,
+                        }) if *t == table_name => {
+                            // A row that holds for the predicate will not be inserted.
+                            // For ValuesWithColumns, we can't easily test partial rows against
+                            // the predicate, so conservatively reject all inserts to this table.
                             None
                         }
                         Query::Insert(Insert::Select {
@@ -464,12 +486,18 @@ impl Property {
                 select,
                 interactive,
             } => {
-                let (table, values) = if let Insert::Values { table, values } = insert {
-                    (table, values)
-                } else {
-                    unreachable!(
-                        "insert query should be Insert::Values for Insert-Values-Select property"
-                    )
+                let (table, values) = match insert {
+                    Insert::Values { table, values } => (table.clone(), values.clone()),
+                    Insert::ValuesWithColumns {
+                        table,
+                        columns: _,
+                        values,
+                    } => (table.clone(), values.clone()),
+                    Insert::Select { .. } => {
+                        unreachable!(
+                            "insert query should be Insert::Values or Insert::ValuesWithColumns for Insert-Values-Select property"
+                        )
+                    }
                 };
                 // Check that the insert query has at least 1 value
                 assert!(
@@ -1284,19 +1312,52 @@ fn property_insert_values_select<R: rand::Rng + ?Sized>(
         *pick(&non_unique_tables, rng)
     };
 
+    // Filter out generated columns - we can't insert into them
+    let non_generated_columns: Vec<Column> = table
+        .columns
+        .iter()
+        .filter(|c| !c.is_generated())
+        .cloned()
+        .collect();
+    let has_generated = non_generated_columns.len() < table.columns.len();
+
+    // Ensure we have at least one insertable column
+    debug_assert!(
+        !non_generated_columns.is_empty(),
+        "Table {} has no insertable columns (all are generated)",
+        table.name
+    );
+
+    // Generate rows to insert (only for non-generated columns)
     let rows = (0..rng.random_range(1..=5))
-        .map(|_| Vec::<SimValue>::arbitrary_from(rng, ctx, table))
+        .map(|_| {
+            non_generated_columns
+                .iter()
+                .map(|c| SimValue::arbitrary_from(rng, ctx, &c.column_type))
+                .collect::<Vec<_>>()
+        })
         .collect::<Vec<_>>();
 
     // Pick a random row to select
     let row_index = pick_index(rows.len(), rng);
     let row = rows[row_index].clone();
 
-    // Insert the rows
-    let insert_query = Query::Insert(Insert::Values {
-        table: table.name.clone(),
-        values: rows,
-    });
+    // Insert the rows - use ValuesWithColumns if table has generated columns
+    let insert_query = if has_generated {
+        Query::Insert(Insert::ValuesWithColumns {
+            table: table.name.clone(),
+            columns: non_generated_columns
+                .iter()
+                .map(|c| c.name.clone())
+                .collect(),
+            values: rows,
+        })
+    } else {
+        Query::Insert(Insert::Values {
+            table: table.name.clone(),
+            values: rows,
+        })
+    };
 
     // Choose if we want queries to be executed in an interactive transaction
     let interactive = if !mvcc && rng.random_bool(0.5) {
@@ -1330,11 +1391,37 @@ fn property_insert_values_select<R: rand::Rng + ?Sized>(
         });
     }
 
-    // Select the row
-    let select_query = Select::simple(
-        table.name.clone(),
-        Predicate::arbitrary_from(rng, ctx, (table, &row)),
-    );
+    // For tables with generated columns, create a "virtual" table with only
+    // non-generated columns for predicate generation. This ensures the predicate
+    // only references columns we have values for.
+    let predicate = if has_generated {
+        let virtual_table = Table {
+            name: table.name.clone(),
+            columns: non_generated_columns.clone(),
+            rows: vec![row.clone()],
+            indexes: vec![],
+        };
+        Predicate::arbitrary_from(rng, ctx, (&virtual_table, &row))
+    } else {
+        Predicate::arbitrary_from(rng, ctx, (table, &row))
+    };
+
+    // For tables with generated columns, select only the non-generated columns
+    // so the assertion can compare with the inserted values
+    let select_query = if has_generated {
+        Select::single(
+            table.name.clone(),
+            non_generated_columns
+                .iter()
+                .map(|c| ResultColumn::Column(c.name.clone()))
+                .collect(),
+            predicate,
+            None,
+            Distinctness::All,
+        )
+    } else {
+        Select::simple(table.name.clone(), predicate)
+    };
 
     Property::InsertValuesSelect {
         insert: insert_query.unwrap_insert(),

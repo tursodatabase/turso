@@ -15,6 +15,8 @@ use sql_generation::model::query::transaction::Rollback;
 use sql_generation::model::table::{SimValue, Table};
 use tracing::trace;
 use turso_core::Database;
+use turso_core::rename_column_refs_in_expr;
+use turso_parser::ast::ColumnConstraint;
 
 use crate::generation::Shadow;
 use crate::model::Query;
@@ -601,6 +603,14 @@ where
                             .find(|c| &c.name == old_name)
                             .expect("Column should exist");
                         col.name = new_name.clone();
+                        // Update generated column expressions that reference the old column name
+                        for col in &mut committed.columns {
+                            for constraint in &mut col.constraints {
+                                if let ColumnConstraint::Generated { expr, .. } = constraint {
+                                    rename_column_refs_in_expr(expr, old_name, new_name);
+                                }
+                            }
+                        }
                         // Update index column names
                         for index in &mut committed.indexes {
                             for (col_name, _) in &mut index.columns {
