@@ -46,6 +46,15 @@ pub fn emit_ungrouped_aggregation<'a>(
             agg_start_reg + i,
         ));
     }
+    // Add captured columns from aggregate-containing expressions to the cache.
+    // These columns were captured during the loop iteration and need to be used
+    // instead of reading from the cursor (which is now invalid).
+    for (col_expr, reg) in t_ctx.captured_columns_in_agg_exprs.iter() {
+        t_ctx
+            .resolver
+            .expr_to_reg_cache
+            .push((std::borrow::Cow::Borrowed(*col_expr), *reg));
+    }
     t_ctx.resolver.enable_expr_to_reg_cache();
 
     // Allocate a label for the end (used by both HAVING and OFFSET to skip row emission)
