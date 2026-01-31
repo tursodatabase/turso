@@ -107,7 +107,7 @@ Files are classified as either "writable" or "readonly":
 The `-j` / `--jobs` flag controls maximum concurrent tasks:
 
 ```bash
-turso-test-runner run tests/ -j 8  # Max 8 concurrent tests
+test-runner run tests/ -j 8  # Max 8 concurrent tests
 ```
 
 Default: Number of CPU cores.

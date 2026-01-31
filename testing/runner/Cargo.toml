@@ -1,5 +1,5 @@
 [package]
-name = "turso-test-runner"
+name = "test-runner"
 version = "0.1.0"
 edition = "2024"
 description = "SQL test runner for Turso/Limbo with custom DSL"
@@ -7,7 +7,7 @@ license = "MIT"
 repository = "https://github.com/tursodatabase/turso"
 
 [[bin]]
-name = "turso-test-runner"
+name = "test-runner"
 path = "src/main.rs"
 
 [dependencies]

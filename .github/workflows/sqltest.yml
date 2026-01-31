@@ -25,9 +25,9 @@ jobs:
         with:
           prefix-key: "v1-rust"
       - name: Build test runner
-        run: make -C turso-test-runner build-runner
+        run: make -C testing/runner build-runner
       - name: Check test syntax
-        run: make -C turso-test-runner check
+        run: make -C testing/runner check
 
   sqltest-run-cli:
     name: Run SQL tests (CLI backend)
@@ -44,16 +44,16 @@ jobs:
         env:
           SCCACHE_GHA_ENABLED: "true"
           RUSTC_WRAPPER: "sccache"
-        run: make -C turso-test-runner build-tursodb
+        run: make -C testing/runner build-tursodb
       - name: Build test runner
         env:
           SCCACHE_GHA_ENABLED: "true"
           RUSTC_WRAPPER: "sccache"
-        run: make -C turso-test-runner build-runner
+        run: make -C testing/runner build-runner
       - name: Run tests
-        run: make -C turso-test-runner run-cli
+        run: make -C testing/runner run-cli
       - name: Run tests (MVCC)
-        run: make -C turso-test-runner run-cli MVCC=1
+        run: make -C testing/runner run-cli MVCC=1
 
   sqltest-run-rust:
     name: Run SQL tests (Rust backend)
@@ -65,11 +65,11 @@ jobs:
         with:
           prefix-key: "v1-rust"
       - name: Build test runner
-        run: make -C turso-test-runner build-runner
+        run: make -C testing/runner build-runner
       - name: Run tests
-        run: make -C turso-test-runner run-rust
+        run: make -C testing/runner run-rust
       - name: Run tests (MVCC)
-        run: make -C turso-test-runner run-rust MVCC=1
+        run: make -C testing/runner run-rust MVCC=1
 
   sqltest-run-js:
     name: Run SQL tests (JS backend)
@@ -101,16 +101,16 @@ jobs:
       - name: Build TypeScript
         run: yarn workspace @tursodatabase/database tsc-build
       - name: Build test runner
-        working-directory: turso-test-runner
+        working-directory: testing/runner
         env:
           SCCACHE_GHA_ENABLED: "true"
           RUSTC_WRAPPER: "sccache"
         run: cargo build --release
       - name: Run tests
-        working-directory: turso-test-runner
+        working-directory: testing/runner
         run: make run-js
       - name: Run tests (MVCC)
-        working-directory: turso-test-runner
+        working-directory: testing/runner
         run: make run-js MVCC=1
 
   sqltest-sqlite:
@@ -124,6 +124,6 @@ jobs:
           prefix-key: "v1-rust"
       - uses: "./.github/shared/install_sqlite"
       - name: Build test runner
-        run: make -C turso-test-runner build-runner
+        run: make -C testing/runner build-runner
       - name: Run tests against SQLite
-        run: make -C turso-test-runner test-sqlite
+        run: make -C testing/runner test-sqlite

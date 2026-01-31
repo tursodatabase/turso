@@ -9,7 +9,7 @@ This document describes the command-line interface for the test runner.
 cargo build --release
 
 # The binary will be at:
-./target/release/turso-test-runner
+./target/release/test-runner
 ```
 
 ## Commands
@@ -19,7 +19,7 @@ cargo build --release
 Run SQL tests from files or directories.
 
 ```bash
-turso-test-runner run <PATHS>... [OPTIONS]
+test-runner run <PATHS>... [OPTIONS]
 ```
 
 #### Arguments
@@ -40,26 +40,26 @@ turso-test-runner run <PATHS>... [OPTIONS]
 
 ```bash
 # Run all tests in a directory
-turso-test-runner run tests/
+test-runner run tests/
 
 # Run a specific test file
-turso-test-runner run tests/select.sqltest
+test-runner run tests/select.sqltest
 
 # Run multiple paths
-turso-test-runner run tests/select.sqltest tests/insert/
+test-runner run tests/select.sqltest tests/insert/
 
 # Custom binary path
-turso-test-runner run tests/ --binary ./target/release/tursodb
+test-runner run tests/ --binary ./target/release/tursodb
 
 # Filter by test name
-turso-test-runner run tests/ -f "select-*"
-turso-test-runner run tests/ -f "*-join-*"
+test-runner run tests/ -f "select-*"
+test-runner run tests/ -f "*-join-*"
 
 # Limit concurrent jobs
-turso-test-runner run tests/ -j 4
+test-runner run tests/ -j 4
 
 # JSON output for CI
-turso-test-runner run tests/ -o json
+test-runner run tests/ -o json
 ```
 
 ### `check` - Validate Syntax
@@ -67,17 +67,17 @@ turso-test-runner run tests/ -o json
 Validate test file syntax without executing tests.
 
 ```bash
-turso-test-runner check <PATHS>...
+test-runner check <PATHS>...
 ```
 
 #### Examples
 
 ```bash
 # Check a single file
-turso-test-runner check tests/select.sqltest
+test-runner check tests/select.sqltest
 
 # Check all files in a directory
-turso-test-runner check tests/
+test-runner check tests/
 ```
 
 ## Output Formats
@@ -176,7 +176,7 @@ The `--filter` option supports simple glob patterns:
 ```yaml
 - name: Run SQL tests
   run: |
-    turso-test-runner run tests/ \
+    test-runner run tests/ \
       --binary ./target/release/tursodb \
       --output json \
       > test-results.json
@@ -209,7 +209,7 @@ Uses `clap` with derive macros for argument parsing:
 
 ```rust
 #[derive(Parser)]
-#[command(name = "turso-test-runner")]
+#[command(name = "test-runner")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,

@@ -8,12 +8,12 @@ description: Test types, when to use each, how to write and run tests
 
 | Type | Location | Use Case |
 |------|----------|----------|
-| `.sqltest` | `turso-test-runner/tests/` | SQL compatibility. **Preferred for new tests** |
+| `.sqltest` | `testing/runner/tests/` | SQL compatibility. **Preferred for new tests** |
 | TCL `.test` | `testing/` | Legacy SQL compat (being phased out) |
 | Rust integration | `tests/integration/` | Regression tests, complex scenarios |
 | Fuzz | `tests/fuzz/` | Complex features, edge case discovery |
 
-**Note:** TCL tests are being phased out in favor of turso-test-runner. The `.sqltest` format allows the same test cases to run against multiple backends (CLI, Rust bindings, etc.).
+**Note:** TCL tests are being phased out in favor of testing/runner. The `.sqltest` format allows the same test cases to run against multiple backends (CLI, Rust bindings, etc.).
 
 ## Running Tests
 
@@ -25,7 +25,7 @@ make test
 make test-single TEST=select.test
 
 # SQL test runner
-make -C turso-test-runner run-cli
+make -C testing/runner run-cli
 
 # Rust unit/integration tests (full workspace)
 cargo test
@@ -42,7 +42,7 @@ SELECT 1 + 1;
 @expected
 2
 ```
-Location: `turso-test-runner/tests/*.sqltest`
+Location: `testing/runner/tests/*.sqltest`
 
 ### TCL
 ```tcl

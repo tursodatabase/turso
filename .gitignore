@@ -57,7 +57,7 @@ settings.local.json
 .build-hash
 
 # Track empty wals for read only databases
-!turso-test-runner/database/*
+!testing/runner/database/*
 
 
 # For simulator redo

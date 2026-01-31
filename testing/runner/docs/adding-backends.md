@@ -400,7 +400,7 @@ mod tests {
 Create test files and run with your backend:
 
 ```bash
-turso-test-runner run tests/ --backend python --python /usr/bin/python3
+test-runner run tests/ --backend python --python /usr/bin/python3
 ```
 
 ## Checklist for New Backends

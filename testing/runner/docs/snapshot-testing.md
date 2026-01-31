@@ -1,6 +1,6 @@
 # Snapshot Testing Guide
 
-This guide covers how to use snapshot testing in the turso-test-runner to capture and validate SQL query execution plans.
+This guide covers how to use snapshot testing in the test-runner to capture and validate SQL query execution plans.
 
 ## Overview
 
@@ -36,17 +36,17 @@ snapshot my-query-plan {
 
 ```bash
 # First run creates .snap.new files for review
-make -C turso-test-runner run-cli
+make -C test-runner run-cli
 
 # Or directly:
-cargo run --bin turso-test-runner -- run tests/my-test.sqltest
+cargo run --bin test-runner -- run tests/my-test.sqltest
 ```
 
 ### 3. Accept the Snapshots
 
 ```bash
 # Review and accept all pending snapshots
-cargo run --bin turso-test-runner -- run tests/ --snapshot-mode=always
+cargo run --bin test-runner -- run tests/ --snapshot-mode=always
 ```
 
 ### 4. Commit the Snapshot Files
@@ -160,25 +160,25 @@ Naming convention: `{test-file-stem}__{snapshot-name}.snap`
 
 ```bash
 # Default mode (auto)
-cargo run --bin turso-test-runner -- run tests/
+cargo run --bin test-runner -- run tests/
 
 # Accept all snapshot changes
-cargo run --bin turso-test-runner -- run tests/ --snapshot-mode=always
+cargo run --bin test-runner -- run tests/ --snapshot-mode=always
 
 # Review mode (create .snap.new files)
-cargo run --bin turso-test-runner -- run tests/ --snapshot-mode=new
+cargo run --bin test-runner -- run tests/ --snapshot-mode=new
 
 # Read-only mode (CI)
-cargo run --bin turso-test-runner -- run tests/ --snapshot-mode=no
+cargo run --bin test-runner -- run tests/ --snapshot-mode=no
 
 # Filter specific snapshots
-cargo run --bin turso-test-runner -- run tests/ --snapshot-filter="query-plan*"
+cargo run --bin test-runner -- run tests/ --snapshot-filter="query-plan*"
 ```
 
 ### Check for Pending Snapshots
 
 ```bash
-cargo run --bin turso-test-runner -- check tests/
+cargo run --bin test-runner -- check tests/
 ```
 
 This command:
@@ -190,13 +190,13 @@ This command:
 
 ```bash
 # Run all tests including snapshots
-make -C turso-test-runner run-cli
+make -C test-runner run-cli
 
 # Run examples (includes snapshot examples)
-make -C turso-test-runner run-examples
+make -C test-runner run-examples
 
 # Check syntax and pending snapshots
-make -C turso-test-runner check
+make -C test-runner check
 ```
 
 ## CI Integration
@@ -207,11 +207,11 @@ make -C turso-test-runner check
 # .github/workflows/test.yml
 - name: Run SQL tests
   run: |
-    cargo run --bin turso-test-runner -- run tests/ --snapshot-mode=no
+    cargo run --bin test-runner -- run tests/ --snapshot-mode=no
 
 - name: Check for pending snapshots
   run: |
-    cargo run --bin turso-test-runner -- check tests/
+    cargo run --bin test-runner -- check tests/
 ```
 
 The `check` command will fail if any `.snap.new` files exist, ensuring all snapshot changes are committed.
@@ -345,9 +345,9 @@ addr  opcode       p1  p2  p3  p4          p5  comment
 
 ## Differences from cargo-insta
 
-While the workflow is similar to [cargo-insta](https://insta.rs/), turso-test-runner uses a custom snapshot implementation:
+While the workflow is similar to [cargo-insta](https://insta.rs/), test-runner uses a custom snapshot implementation:
 
-| Feature | turso-test-runner | cargo-insta |
+| Feature | test-runner | cargo-insta |
 |---------|-------------------|-------------|
 | File format | YAML frontmatter + content | YAML frontmatter + content |
 | Review tool | Manual diff / `--snapshot-mode` | `cargo insta review` |
