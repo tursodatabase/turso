@@ -14,12 +14,23 @@ impl ArbitraryFrom<(&SimValue, ColumnType)> for LTValue {
         (value, _col_type): (&SimValue, ColumnType),
     ) -> Self {
         let new_value = match &value.0 {
-            Value::Integer(i) => Value::Integer(rng.random_range(i64::MIN..*i - 1)),
+            Value::Integer(i) => {
+                // Handle edge case: if i is at or near minimum, return minimum
+                if *i <= i64::MIN + 1 {
+                    Value::Integer(i64::MIN)
+                } else {
+                    Value::Integer(rng.random_range(i64::MIN..*i - 1))
+                }
+            }
             Value::Float(f) => Value::Float(f - rng.random_range(0.0..1e10)),
             value @ Value::Text(..) => {
                 // Either shorten the string, or make at least one character smaller and mutate the rest
-                let mut t = value.to_string();
-                if rng.random_bool(0.01) {
+                let t = value.to_string();
+                if t.is_empty() {
+                    // Empty string - nothing is less, return empty
+                    Value::build_text(String::new())
+                } else if rng.random_bool(0.01) {
+                    let mut t = t;
                     t.pop();
                     Value::build_text(t)
                 } else {
@@ -29,12 +40,15 @@ impl ArbitraryFrom<(&SimValue, ColumnType)> for LTValue {
             Value::Blob(b) => {
                 // Either shorten the blob, or make at least one byte smaller and mutate the rest
                 let mut b = b.clone();
-                if rng.random_bool(0.01) {
+                if b.is_empty() {
+                    // Empty blob - nothing is less, return empty
+                    Value::Blob(b)
+                } else if rng.random_bool(0.01) {
                     b.pop();
                     Value::Blob(b)
                 } else {
                     let index = rng.random_range(0..b.len());
-                    b[index] -= 1;
+                    b[index] = b[index].saturating_sub(1);
                     // Mutate the rest of the blob
                     for val in b.iter_mut().skip(index + 1) {
                         *val = rng.random_range(0..=255);
@@ -58,12 +72,35 @@ impl ArbitraryFrom<(&SimValue, ColumnType)> for GTValue {
         (value, col_type): (&SimValue, ColumnType),
     ) -> Self {
         let new_value = match &value.0 {
-            Value::Integer(i) => Value::Integer(rng.random_range(*i..i64::MAX)),
-            Value::Float(f) => Value::Float(rng.random_range(*f..1e10)),
+            Value::Integer(i) => {
+                // Handle edge case: if i is at or near maximum, return maximum
+                if *i >= i64::MAX - 1 {
+                    Value::Integer(i64::MAX)
+                } else {
+                    Value::Integer(rng.random_range(*i + 1..=i64::MAX))
+                }
+            }
+            Value::Float(f) => {
+                // Handle edge case: if f is at or near upper bound, return upper bound
+                if *f >= 1e10 {
+                    Value::Float(1e10)
+                } else {
+                    Value::Float(rng.random_range(*f..1e10))
+                }
+            }
             value @ Value::Text(..) => {
-                // Either lengthen the string, or make at least one character smaller and mutate the rest
-                let mut t = value.to_string();
-                if rng.random_bool(0.01) {
+                // Either lengthen the string, or make at least one character larger and mutate the rest
+                let t = value.to_string();
+                if t.is_empty() {
+                    // Empty string - append a character to make it greater
+                    let c = if rng.random_bool(0.5) {
+                        rng.random_range(UPPERCASE_A..=UPPERCASE_Z) as u8 as char
+                    } else {
+                        rng.random_range(LOWERCASE_A..=LOWERCASE_Z) as u8 as char
+                    };
+                    Value::build_text(c.to_string())
+                } else if rng.random_bool(0.01) {
+                    let mut t = t;
                     if rng.random_bool(0.5) {
                         t.push(rng.random_range(UPPERCASE_A..=UPPERCASE_Z) as u8 as char);
                     } else {
@@ -75,14 +112,18 @@ impl ArbitraryFrom<(&SimValue, ColumnType)> for GTValue {
                 }
             }
             Value::Blob(b) => {
-                // Either lengthen the blob, or make at least one byte smaller and mutate the rest
+                // Either lengthen the blob, or make at least one byte larger and mutate the rest
                 let mut b = b.clone();
-                if rng.random_bool(0.01) {
+                if b.is_empty() {
+                    // Empty blob - append a byte to make it greater
+                    b.push(rng.random_range(0..=255));
+                    Value::Blob(b)
+                } else if rng.random_bool(0.01) {
                     b.push(rng.random_range(0..=255));
                     Value::Blob(b)
                 } else {
                     let index = rng.random_range(0..b.len());
-                    b[index] += 1;
+                    b[index] = b[index].saturating_add(1);
                     // Mutate the rest of the blob
                     for val in b.iter_mut().skip(index + 1) {
                         *val = rng.random_range(0..=255);
@@ -116,9 +157,14 @@ fn mutate_string<R: rand::Rng + ?Sized>(
     mutation_type: MutationType,
 ) -> String {
     if t.is_empty() {
-        // Handle empty string: for increment, return a single char; for decrement, stay empty
+        // Handle empty string: for increment, return a random char; for decrement, stay empty
         return if mutation_type == MutationType::Increment {
-            "A".to_string()
+            let c = if rng.random_bool(0.5) {
+                rng.random_range(UPPERCASE_A..=UPPERCASE_Z) as u8 as char
+            } else {
+                rng.random_range(LOWERCASE_A..=LOWERCASE_Z) as u8 as char
+            };
+            c.to_string()
         } else {
             String::new()
         };

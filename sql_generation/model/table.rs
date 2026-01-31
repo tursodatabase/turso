@@ -94,6 +94,32 @@ impl Column {
             .iter()
             .any(|c| matches!(c, ColumnConstraint::Unique(_)))
     }
+
+    /// Returns true if this column has a GENERATED constraint
+    pub fn is_generated(&self) -> bool {
+        self.constraints
+            .iter()
+            .any(|c| matches!(c, ColumnConstraint::Generated { .. }))
+    }
+
+    /// Returns true if this column is a STORED generated column
+    pub fn is_stored_generated(&self) -> bool {
+        self.constraints.iter().any(|c| {
+            matches!(
+                c,
+                ColumnConstraint::Generated { typ: Some(name), .. }
+                    if name.as_str().eq_ignore_ascii_case("STORED")
+            )
+        })
+    }
+
+    /// Returns the expression for this generated column, if any
+    pub fn generated_expr(&self) -> Option<&ast::Expr> {
+        self.constraints.iter().find_map(|c| match c {
+            ColumnConstraint::Generated { expr, .. } => Some(expr.as_ref()),
+            _ => None,
+        })
+    }
 }
 
 impl Display for Column {
@@ -206,9 +232,15 @@ impl SimValue {
         Numeric::from(&self.0).try_into_bool().unwrap_or_default()
     }
 
-    #[inline]
-    fn is_null(&self) -> bool {
-        matches!(self.0, types::Value::Null)
+    /// SQLite-compatible comparison that handles cross-type numeric comparisons.
+    /// In SQLite, INTEGER vs FLOAT comparisons use truncate-then-compare semantics
+    /// to preserve precision for large integers.
+    fn sqlite_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        match (&self.0, &other.0) {
+            // NULL comparisons
+            (types::Value::Null, _) | (_, types::Value::Null) => None,
+            _ => Some(self.0.cmp(&other.0)),
+        }
     }
 
     pub fn unique_for_type(column_type: &ColumnType, offset: i64) -> Self {
@@ -236,7 +268,6 @@ impl SimValue {
     /// [ast::Operator::GreaterEquals], [ast::Operator::Less], [ast::Operator::LessEquals] function to be extracted
     /// into its functions in turso_core so that it can be used here. For now we just do the `not_null` check to avoid refactoring code in core
     pub fn binary_compare(&self, other: &Self, operator: ast::Operator) -> SimValue {
-        let not_null = !self.is_null() && !other.is_null();
         match operator {
             ast::Operator::Add => self.0.exec_add(&other.0).into(),
             ast::Operator::And => self.0.exec_and(&other.0).into(),
@@ -246,10 +277,19 @@ impl SimValue {
             ast::Operator::BitwiseOr => self.0.exec_bit_or(&other.0).into(),
             ast::Operator::BitwiseNot => todo!(), // TODO: Do not see any function usage of this operator in Core
             ast::Operator::Concat => self.0.exec_concat(&other.0).into(),
-            ast::Operator::Equals => not_null.then(|| self == other).into(),
+            ast::Operator::Equals => self
+                .sqlite_cmp(other)
+                .map(|o| o == std::cmp::Ordering::Equal)
+                .into(),
             ast::Operator::Divide => self.0.exec_divide(&other.0).into(),
-            ast::Operator::Greater => not_null.then(|| self > other).into(),
-            ast::Operator::GreaterEquals => not_null.then(|| self >= other).into(),
+            ast::Operator::Greater => self
+                .sqlite_cmp(other)
+                .map(|o| o == std::cmp::Ordering::Greater)
+                .into(),
+            ast::Operator::GreaterEquals => self
+                .sqlite_cmp(other)
+                .map(|o| o != std::cmp::Ordering::Less)
+                .into(),
             // TODO: Test these implementations
             ast::Operator::Is => match (&self.0, &other.0) {
                 (types::Value::Null, types::Value::Null) => true.into(),
@@ -261,11 +301,20 @@ impl SimValue {
                 .binary_compare(other, ast::Operator::Is)
                 .unary_exec(ast::UnaryOperator::Not),
             ast::Operator::LeftShift => self.0.exec_shift_left(&other.0).into(),
-            ast::Operator::Less => not_null.then(|| self < other).into(),
-            ast::Operator::LessEquals => not_null.then(|| self <= other).into(),
+            ast::Operator::Less => self
+                .sqlite_cmp(other)
+                .map(|o| o == std::cmp::Ordering::Less)
+                .into(),
+            ast::Operator::LessEquals => self
+                .sqlite_cmp(other)
+                .map(|o| o != std::cmp::Ordering::Greater)
+                .into(),
             ast::Operator::Modulus => self.0.exec_remainder(&other.0).into(),
             ast::Operator::Multiply => self.0.exec_multiply(&other.0).into(),
-            ast::Operator::NotEquals => not_null.then(|| self != other).into(),
+            ast::Operator::NotEquals => self
+                .sqlite_cmp(other)
+                .map(|o| o != std::cmp::Ordering::Equal)
+                .into(),
             ast::Operator::Or => self.0.exec_or(&other.0).into(),
             ast::Operator::RightShift => self.0.exec_shift_right(&other.0).into(),
             ast::Operator::Subtract => self.0.exec_subtract(&other.0).into(),
@@ -306,6 +355,45 @@ impl SimValue {
             ast::UnaryOperator::Positive => self.0.clone(),
         };
         Self(new_value)
+    }
+
+    /// Apply column type affinity to a SimValue, matching SQLite's behavior.
+    /// This is necessary for generated columns where the expression result type
+    /// may differ from the declared column type.
+    pub fn apply_affinity(self, column_type: ColumnType) -> SimValue {
+        match column_type {
+            ColumnType::Integer => {
+                // For INTEGER affinity, convert floats that can be exactly represented as integers
+                if let types::Value::Float(fl) = &self.0 {
+                    // Check if the float has no fractional part
+                    if fl.is_finite() && fl.trunc() == *fl {
+                        // Convert float to i64 with saturation at limits (matches SQLite's doubleToInt64)
+                        let int_val = if *fl < -9223372036854774784.0 {
+                            i64::MIN
+                        } else if *fl > 9223372036854774784.0 {
+                            i64::MAX
+                        } else {
+                            *fl as i64
+                        };
+                        // Check if round-trip conversion is exact (key check from SQLite)
+                        if (int_val as f64) == *fl && int_val != i64::MIN {
+                            return SimValue(types::Value::Integer(int_val));
+                        }
+                    }
+                }
+                self
+            }
+            ColumnType::Float => {
+                // For REAL affinity, SQLite forces integer values into floating point representation.
+                // This can cause precision loss for large integers (> 2^53).
+                if let types::Value::Integer(i) = &self.0 {
+                    return SimValue(types::Value::Float(*i as f64));
+                }
+                self
+            }
+            // For other affinities (TEXT, BLOB, NUMERIC), no conversion needed in this context
+            _ => self,
+        }
     }
 }
 

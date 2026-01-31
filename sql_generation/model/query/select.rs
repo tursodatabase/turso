@@ -304,10 +304,17 @@ impl Select {
                                 ast::ResultColumn::Expr(expr.0.clone().into_boxed(), None)
                             }
                             ResultColumn::Star => ast::ResultColumn::Star,
-                            ResultColumn::Column(name) => ast::ResultColumn::Expr(
-                                ast::Expr::Id(ast::Name::exact(name.clone())).into_boxed(),
-                                None,
-                            ),
+                            ResultColumn::Column(name) => {
+                                let expr = if let Some((table, col)) = name.split_once('.') {
+                                    ast::Expr::Qualified(
+                                        ast::Name::exact(table.to_string()),
+                                        ast::Name::exact(col.to_string()),
+                                    )
+                                } else {
+                                    ast::Expr::Id(ast::Name::exact(name.clone()))
+                                };
+                                ast::ResultColumn::Expr(expr.into_boxed(), None)
+                            }
                         })
                         .collect(),
                     from: self.body.select.from.as_ref().map(|f| f.to_sql_ast()),
@@ -335,10 +342,18 @@ impl Select {
                                         ast::ResultColumn::Expr(expr.0.clone().into_boxed(), None)
                                     }
                                     ResultColumn::Star => ast::ResultColumn::Star,
-                                    ResultColumn::Column(name) => ast::ResultColumn::Expr(
-                                        ast::Expr::Id(ast::Name::exact(name.clone())).into_boxed(),
-                                        None,
-                                    ),
+                                    ResultColumn::Column(name) => {
+                                        let expr = if let Some((table, col)) = name.split_once('.')
+                                        {
+                                            ast::Expr::Qualified(
+                                                ast::Name::exact(table.to_string()),
+                                                ast::Name::exact(col.to_string()),
+                                            )
+                                        } else {
+                                            ast::Expr::Id(ast::Name::exact(name.clone()))
+                                        };
+                                        ast::ResultColumn::Expr(expr.into_boxed(), None)
+                                    }
                                 })
                                 .collect(),
                             from: compound.select.from.as_ref().map(|f| f.to_sql_ast()),

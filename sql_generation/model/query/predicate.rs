@@ -110,6 +110,7 @@ pub fn expr_to_value<T: TableContext>(
     match expr {
         ast::Expr::DoublyQualified(_, _, col_name)
         | ast::Expr::Qualified(_, col_name)
+        | ast::Expr::Name(col_name)
         | ast::Expr::Id(col_name) => {
             let columns = table.columns().collect::<Vec<_>>();
             let col_name = col_name.as_str();
@@ -118,8 +119,22 @@ pub fn expr_to_value<T: TableContext>(
                 .iter()
                 .zip(row.iter())
                 .find(|(column, _)| column.column.name == col_name)
-                .map(|(_, value)| value)
-                .cloned()
+                .and_then(|(col_ctx, stored_value)| {
+                    // For VIRTUAL generated columns (generated but not stored),
+                    // recompute the value on-the-fly to match SQLite behavior.
+                    // STORED generated columns use the stored value.
+                    let col = &col_ctx.column;
+                    if col.is_generated() && !col.is_stored_generated() {
+                        // VIRTUAL column: evaluate the expression and apply column type affinity
+                        // to match SQLite's behavior (e.g., INTEGER to REAL conversion)
+                        col.generated_expr()
+                            .and_then(|gen_expr| expr_to_value(gen_expr, row, table))
+                            .map(|v| v.apply_affinity(col.column_type))
+                    } else {
+                        // Regular column or STORED generated column: use stored value
+                        Some(stored_value.clone())
+                    }
+                })
         }
         ast::Expr::Literal(literal) => Some(literal.into()),
         ast::Expr::Binary(lhs, op, rhs) => {

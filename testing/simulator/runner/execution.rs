@@ -313,6 +313,8 @@ pub fn execute_interaction_turso(
             if !env.profile.experimental_mvcc && env.rng.random_ratio(1, 10) {
                 limbo_integrity_check(&conn)?;
             }
+            // FaultyQuery doesn't need special shadow handling
+            let _ = interaction.shadow(&mut env.get_conn_tables_mut(connection_index));
         }
     }
     if let Err(e) = interaction.shadow(&mut env.get_conn_tables_mut(connection_index)) {
@@ -400,8 +402,20 @@ fn execute_interaction_rusqlite(
             }
 
             tracing::debug!("{:?}", results);
-            stack.push(results);
+            stack.push(results.clone());
             env.update_conn_last_interaction(interaction.connection_index, Some(query));
+
+            // Only propagate shadow errors if the query succeeded
+            if results.is_ok() {
+                interaction
+                    .shadow(&mut env.get_conn_tables_mut(interaction.connection_index))
+                    .map_err(|e| {
+                        LimboError::InternalError(format!("shadow operation failed: {e}"))
+                    })?;
+            } else {
+                let _ =
+                    interaction.shadow(&mut env.get_conn_tables_mut(interaction.connection_index));
+            }
         }
         InteractionType::FsyncQuery(..) => {
             unimplemented!("cannot implement fsync query in rusqlite, as we do not control IO");
@@ -425,14 +439,6 @@ fn execute_interaction_rusqlite(
         InteractionType::FaultyQuery(_) => {
             unimplemented!("cannot implement faulty query in rusqlite, as we do not control IO");
         }
-    }
-
-    // Check shadow result - if DB succeeded but shadow detects constraint violation,
-    // that indicates a constraint enforcement bug in the database
-    if let Err(e) = interaction.shadow(&mut env.get_conn_tables_mut(interaction.connection_index)) {
-        return Err(LimboError::InternalError(format!(
-            "DB succeeded but shadow detected error: {e}. This may indicate a constraint enforcement bug."
-        )));
     }
     Ok(ExecutionContinuation::NextInteraction)
 }
