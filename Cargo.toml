@@ -40,7 +40,7 @@ members = [
     "sdk-kit-macros", 
     "testing/differential-oracle/sql_gen_prop", 
     "testing/differential-oracle/fuzzer",
-    "turso-test-runner"
+    "testing/runner"
 ]
 exclude = ["perf/latency/limbo"]
 
