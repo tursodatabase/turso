@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicU32, Ordering};
+use turso_std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::rsapi::TursoError;
 
