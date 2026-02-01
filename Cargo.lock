@@ -6179,6 +6179,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "turso-std"
+version = "0.5.0-pre.5"
+dependencies = [
+ "parking_lot",
+ "shuttle",
+]
+
+[[package]]
 name = "turso_cli"
 version = "0.5.0-pre.13"
 dependencies = [

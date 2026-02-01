@@ -39,7 +39,8 @@ members = [
     "sdk-kit-macros", 
     "testing/differential-oracle/sql_gen_prop", 
     "testing/differential-oracle/fuzzer",
-    "testing/runner"
+    "testing/runner",
+    "std"
 ]
 exclude = ["perf/latency/limbo"]
 
@@ -62,6 +63,7 @@ turso_sync_engine = { path = "sync/engine", version = "0.5.0-pre.13" }
 turso_ext = { path = "extensions/core", version = "0.5.0-pre.13" }
 turso_macros = { path = "macros", version = "0.5.0-pre.13" }
 turso_parser = { path = "parser", version = "0.5.0-pre.13" }
+turso-std = { path = "std", version = "0.5.0-pre.13" }
 sql_generation = { path = "sql_generation" }
 turso-dbhash = { path = "tools/dbhash" }
 strum = { version = "0.26", features = ["derive"] }
