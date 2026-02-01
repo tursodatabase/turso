@@ -4587,6 +4587,9 @@ pub fn get_expr_affinity(
             if let Some(tables) = referenced_tables {
                 if let Some((_, table_ref)) = tables.find_table_by_internal_id(*table) {
                     if let Some(col) = table_ref.get_column_at(*column) {
+                        if let Some(btree) = table_ref.btree() {
+                            return col.affinity_with_strict(btree.is_strict);
+                        }
                         return col.affinity();
                     }
                 }
