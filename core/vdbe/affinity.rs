@@ -162,7 +162,7 @@ impl Affinity {
         }
 
         // Rule 3: BLOB or empty -> BLOB affinity (historically called NONE)
-        if datatype.contains("BLOB") || datatype.is_empty() || datatype.contains("ANY") {
+        if datatype.contains("BLOB") || datatype.is_empty() {
             return Affinity::Blob;
         }
 

@@ -628,7 +628,7 @@ pub fn translate_alter_table(
                         let affinity_str = btree
                             .columns
                             .iter()
-                            .map(|col| col.affinity().aff_mask())
+                            .map(|col| col.affinity_with_strict(btree.is_strict).aff_mask())
                             .collect::<String>();
 
                         program.emit_insn(Insn::MakeRecord {

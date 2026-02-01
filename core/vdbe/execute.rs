@@ -1671,47 +1671,29 @@ pub fn op_type_check(
                 // NULL is valid in any column without NOT NULL constraint.
                 return Ok(());
             }
-            let col_affinity = col.affinity();
             let ty_str = &col.ty_str;
             let ty_bytes = ty_str.as_bytes();
-            let _applied = apply_affinity_char(reg, col_affinity);
-            let value_type = reg.get_value().value_type();
             match_ignore_ascii_case!(match ty_bytes {
-                b"INTEGER" | b"INT"
-                    if value_type == ValueType::Integer || value_type == ValueType::Float =>
-                {
-                    if value_type == ValueType::Float {
-                        if let Register::Value(value) = reg {
-                            if let Value::Numeric(Numeric::Float(f)) = *value {
-                                let i = f64::from(f) as i64;
-                                if (i as f64) == f64::from(f) {
-                                    *value = Value::from_i64(i);
-                                } else {
-                                    bail_constraint_error!(
-                                        "cannot store {} value in {} column {}.{} ({})",
-                                        value_type,
-                                        ty_str,
-                                        &table_reference.name,
-                                        col.name.as_deref().unwrap_or(""),
-                                        SQLITE_CONSTRAINT
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-                b"REAL" if value_type == ValueType::Float => {}
-                b"BLOB" if value_type == ValueType::Blob => {}
-                b"TEXT" if value_type == ValueType::Text => {}
                 b"ANY" => {}
-                _ => bail_constraint_error!(
-                    "cannot store {} value in {} column {}.{} ({})",
-                    value_type,
-                    ty_str,
-                    &table_reference.name,
-                    col.name.as_deref().unwrap_or(""),
-                    SQLITE_CONSTRAINT
-                ),
+                _ => {
+                    let col_affinity = col.affinity();
+                    let _applied = apply_affinity_char(reg, col_affinity);
+                    let value_type = reg.get_value().value_type();
+                    match_ignore_ascii_case!(match ty_bytes {
+                        b"INTEGER" | b"INT" if value_type == ValueType::Integer => {}
+                        b"REAL" if value_type == ValueType::Float => {}
+                        b"BLOB" if value_type == ValueType::Blob => {}
+                        b"TEXT" if value_type == ValueType::Text => {}
+                        _ => bail_constraint_error!(
+                            "cannot store {} value in {} column {}.{} ({})",
+                            value_type,
+                            ty_str,
+                            &table_reference.name,
+                            col.name.as_deref().unwrap_or(""),
+                            SQLITE_CONSTRAINT
+                        ),
+                    });
+                }
             });
             Ok(())
         })?;

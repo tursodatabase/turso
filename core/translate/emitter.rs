@@ -3910,11 +3910,15 @@ fn emit_update_insns<'a>(
 
         let record_reg = program.alloc_register();
 
+        let is_strict = target_table
+            .table
+            .btree()
+            .is_some_and(|btree| btree.is_strict);
         let affinity_str = target_table
             .table
             .columns()
             .iter()
-            .map(|col| col.affinity().aff_mask())
+            .map(|col| col.affinity_with_strict(is_strict).aff_mask())
             .collect::<String>();
 
         program.emit_insn(Insn::MakeRecord {
@@ -4234,10 +4238,11 @@ pub fn emit_cdc_patch_record(
             dst_reg: columns_reg + rowid_alias_position,
             extra_amount: 0,
         });
+        let is_strict = table.btree().is_some_and(|btree| btree.is_strict);
         let affinity_str = table
             .columns()
             .iter()
-            .map(|col| col.affinity().aff_mask())
+            .map(|col| col.affinity_with_strict(is_strict).aff_mask())
             .collect::<String>();
 
         program.emit_insn(Insn::MakeRecord {

@@ -2592,6 +2592,13 @@ impl Column {
     pub fn affinity(&self) -> Affinity {
         Affinity::affinity(&self.ty_str)
     }
+    pub fn affinity_with_strict(&self, is_strict: bool) -> Affinity {
+        if is_strict && self.ty_str.eq_ignore_ascii_case("ANY") {
+            Affinity::Blob
+        } else {
+            Affinity::affinity(&self.ty_str)
+        }
+    }
     pub fn new_default_text(
         name: Option<String>,
         ty_str: String,
