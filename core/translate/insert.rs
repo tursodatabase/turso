@@ -551,7 +551,12 @@ pub fn translate_insert(
     let affinity_str = insertion
         .col_mappings
         .iter()
-        .map(|col_mapping| col_mapping.column.affinity().aff_mask())
+        .map(|col_mapping| {
+            col_mapping
+                .column
+                .affinity_with_strict(ctx.table.is_strict)
+                .aff_mask()
+        })
         .collect::<String>();
 
     if let Some(lbl) = notnull_resume_label {
@@ -1527,7 +1532,7 @@ fn init_source_emission<'a>(
                             .columns
                             .iter()
                             .filter(|col| !col.hidden())
-                            .map(|col| col.affinity().aff_mask())
+                            .map(|col| col.affinity_with_strict(ctx.table.is_strict).aff_mask())
                             .collect::<String>()
                     } else {
                         columns
@@ -1544,7 +1549,7 @@ fn init_source_emission<'a>(
                                     .get_column_by_name(&column_name)
                                     .unwrap()
                                     .1
-                                    .affinity()
+                                    .affinity_with_strict(ctx.table.is_strict)
                                     .aff_mask()
                             })
                             .collect::<String>()
@@ -2202,7 +2207,9 @@ fn emit_unique_index_check(
             if ic.expr.is_some() {
                 Affinity::Blob.aff_mask()
             } else {
-                ctx.table.columns[ic.pos_in_table].affinity().aff_mask()
+                ctx.table.columns[ic.pos_in_table]
+                    .affinity_with_strict(ctx.table.is_strict)
+                    .aff_mask()
             }
         })
         .collect::<String>();
@@ -3176,7 +3183,9 @@ fn build_parent_key_image_for_insert(
                 let (_, col) = parent_table.get_column(name).ok_or_else(|| {
                     crate::LimboError::InternalError(format!("parent col {name} missing"))
                 })?;
-                Ok::<_, crate::LimboError>(col.affinity().aff_mask())
+                Ok::<_, crate::LimboError>(
+                    col.affinity_with_strict(parent_table.is_strict).aff_mask(),
+                )
             })
             .collect::<Result<String, _>>()?
     };
