@@ -11169,6 +11169,7 @@ pub fn op_hash_build(
                 collations: data.collations.clone(),
                 temp_store,
                 track_matched: data.track_matched,
+                partition_count: None,
             };
             HashTable::new(config, pager.io.clone())
         });
@@ -11227,7 +11228,12 @@ pub fn op_hash_build(
         let rowid = op_state.rowid.expect("rowid set");
         let key_values = std::mem::take(&mut op_state.key_values);
         let payload_values = std::mem::take(&mut op_state.payload_values);
-        match ht.insert(key_values.clone(), rowid, payload_values.clone()) {
+        match ht.insert_with_metrics(
+            key_values.clone(),
+            rowid,
+            payload_values.clone(),
+            Some(&mut state.metrics.hash_join),
+        ) {
             Ok(IOResult::Done(())) => {}
             Ok(IOResult::IO(io)) => {
                 op_state.key_values = key_values;
@@ -11276,6 +11282,7 @@ pub fn op_hash_distinct(
                 collations: data.collations.clone(),
                 temp_store,
                 track_matched: false,
+                partition_count: None,
             };
             HashTable::new(config, pager.io.clone())
         });
@@ -11289,7 +11296,11 @@ pub fn op_hash_distinct(
 
     let mut key_refs: SmallVec<[ValueRef; 2]> = SmallVec::with_capacity(data.num_keys);
     key_refs.extend(key_values.iter().map(|v| v.as_ref()));
-    match hash_table.insert_distinct(key_values, &key_refs)? {
+    match hash_table.insert_distinct_with_metrics(
+        key_values,
+        &key_refs,
+        Some(&mut state.metrics.hash_join),
+    )? {
         IOResult::Done(inserted) => {
             state.pc = if inserted {
                 state.pc + 1
@@ -11311,7 +11322,7 @@ pub fn op_hash_build_finalize(
     load_insn!(HashBuildFinalize { hash_table_id }, insn);
     if let Some(ht) = state.hash_tables.get_mut(hash_table_id) {
         // Finalize the build phase, may flush remaining partitions to disk if spilled
-        match ht.finalize_build()? {
+        match ht.finalize_build_with_metrics(Some(&mut state.metrics.hash_join))? {
             crate::types::IOResult::Done(()) => {
                 // Partitions will be loaded on-demand during probing
             }
@@ -11399,7 +11410,10 @@ pub fn op_hash_probe(
 
         // Load partition if not already loaded (may require multiple re-entries for multi-chunk partitions)
         if !hash_table.is_partition_loaded(partition_idx) {
-            match hash_table.load_spilled_partition(partition_idx)? {
+            match hash_table.load_spilled_partition_with_metrics(
+                partition_idx,
+                Some(&mut state.metrics.hash_join),
+            )? {
                 IOResult::Done(()) => {
                     // Partition loaded or nothing to load
                 }
@@ -11415,7 +11429,11 @@ pub fn op_hash_probe(
         }
 
         // Probe the loaded partition
-        match hash_table.probe_partition(partition_idx, &probe_keys) {
+        match hash_table.probe_partition_with_metrics(
+            partition_idx,
+            &probe_keys,
+            Some(&mut state.metrics.hash_join),
+        ) {
             Some(entry) => {
                 state.registers[dest_reg] = Register::Value(Value::from_i64(entry.rowid));
                 write_hash_payload_to_registers(
@@ -11434,7 +11452,7 @@ pub fn op_hash_probe(
         }
     } else {
         // Non-spilled hash table, use normal probe
-        match hash_table.probe(probe_keys) {
+        match hash_table.probe_with_metrics(probe_keys, Some(&mut state.metrics.hash_join)) {
             Some(entry) => {
                 state.registers[dest_reg] = Register::Value(Value::from_i64(entry.rowid));
                 write_hash_payload_to_registers(
