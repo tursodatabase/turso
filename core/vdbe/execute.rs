@@ -5285,7 +5285,8 @@ pub fn op_function(
                 } else {
                     let name = val.to_string();
                     let used = execute_sqlite_compileoption_used(&name);
-                    state.registers[*dest] = Register::Value(Value::Integer(if used { 1 } else { 0 }));
+                    state.registers[*dest] =
+                        Register::Value(Value::Integer(if used { 1 } else { 0 }));
                 }
             }
             ScalarFunc::Replace => {
