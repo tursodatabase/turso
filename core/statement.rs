@@ -498,7 +498,7 @@ impl Statement {
         // Skip for read-only statements (SELECT) as they have no side effects.
         // Skip if we're already panicking to avoid double-panic in drop handlers.
         while self.program.change_cnt_on
-            && !std::thread::panicking()
+            && !crate::thread::panicking()
             && self.state.execution_state.is_running()
         {
             match self
