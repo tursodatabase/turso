@@ -12,7 +12,7 @@ use std::sync::Arc;
 use turso_core::types::Value;
 use turso_core::vdbe::hash_table::{HashTable, HashTableConfig};
 use turso_core::vdbe::CollationSeq;
-use turso_core::MemoryIO;
+use turso_core::{IOResult, MemoryIO};
 
 #[cfg(not(target_family = "wasm"))]
 #[global_allocator]
@@ -28,6 +28,7 @@ fn create_hash_table(mem_budget: usize) -> HashTable {
         collations: vec![CollationSeq::Binary],
         temp_store: turso_core::TempStore::Default,
         track_matched: false,
+        partition_count: None,
     };
     HashTable::new(config, io)
 }
@@ -156,15 +157,19 @@ fn bench_build_and_probe(c: &mut Criterion) {
                     // Probe phase - look up every key
                     let mut found = 0;
                     for i in 0..count {
-                        let key = vec![Value::from_i64(i as i64)];
-                        let partition_idx = ht.partition_for_keys(&key);
-
-                        // Load partition if spilled
-                        if ht.has_spilled() && !ht.is_partition_loaded(partition_idx) {
-                            let _ = ht.load_spilled_partition(partition_idx);
-                        }
-
-                        if ht.probe_partition(partition_idx, &key).is_some() {
+                        let key = vec![Value::Integer(i as i64)];
+                        if ht.has_spilled() {
+                            let partition_idx = ht.partition_for_keys(&key);
+                            if !ht.is_partition_loaded(partition_idx) {
+                                while let Ok(IOResult::IO(_)) =
+                                    ht.load_spilled_partition(partition_idx)
+                                {
+                                }
+                            }
+                            if ht.probe_partition(partition_idx, &key).is_some() {
+                                found += 1;
+                            }
+                        } else if ht.probe(key).is_some() {
                             found += 1;
                         }
                     }
@@ -186,14 +191,19 @@ fn bench_build_and_probe(c: &mut Criterion) {
                     // Probe phase
                     let mut found = 0;
                     for i in 0..count {
-                        let key = vec![Value::from_i64(i as i64)];
-                        let partition_idx = ht.partition_for_keys(&key);
-
-                        if ht.has_spilled() && !ht.is_partition_loaded(partition_idx) {
-                            let _ = ht.load_spilled_partition(partition_idx);
-                        }
-
-                        if ht.probe_partition(partition_idx, &key).is_some() {
+                        let key = vec![Value::Integer(i as i64)];
+                        if ht.has_spilled() {
+                            let partition_idx = ht.partition_for_keys(&key);
+                            if !ht.is_partition_loaded(partition_idx) {
+                                while let Ok(IOResult::IO(_)) =
+                                    ht.load_spilled_partition(partition_idx)
+                                {
+                                }
+                            }
+                            if ht.probe_partition(partition_idx, &key).is_some() {
+                                found += 1;
+                            }
+                        } else if ht.probe(key).is_some() {
                             found += 1;
                         }
                     }
@@ -227,6 +237,7 @@ fn bench_text_key_hashing(c: &mut Criterion) {
                         collations: vec![CollationSeq::Binary],
                         temp_store: turso_core::TempStore::Default,
                         track_matched: false,
+                        partition_count: None,
                     };
                     let mut ht = HashTable::new(config, io);
                     insert_text_key_entries(&mut ht, count);
@@ -250,6 +261,7 @@ fn bench_text_key_hashing(c: &mut Criterion) {
                         collations: vec![CollationSeq::NoCase],
                         temp_store: turso_core::TempStore::Default,
                         track_matched: false,
+                        partition_count: None,
                     };
                     let mut ht = HashTable::new(config, io);
                     insert_text_key_entries(&mut ht, count);
