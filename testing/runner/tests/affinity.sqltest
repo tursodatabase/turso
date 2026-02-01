@@ -370,3 +370,29 @@ expect @js {
     real|100000
     real|-100000
 }
+
+# ============================================
+# ANY affinity (non-STRICT vs STRICT)
+# ============================================
+test affinity-any-non-strict {
+    CREATE TABLE t1 (c1 ANY);
+    INSERT INTO t1 VALUES ('1'), ('1.5'), ('1a');
+    SELECT c1, typeof(c1) FROM t1 ORDER BY rowid;
+}
+expect {
+    1|integer
+    1.5|real
+    1a|text
+}
+
+@requires strict "uses STRICT tables"
+test affinity-any-strict {
+    CREATE TABLE t1 (c1 ANY) STRICT;
+    INSERT INTO t1 VALUES ('1'), ('1.5'), ('1a');
+    SELECT c1, typeof(c1) FROM t1 ORDER BY rowid;
+}
+expect {
+    1|text
+    1.5|text
+    1a|text
+}
