@@ -6184,6 +6184,7 @@ version = "0.5.0-pre.5"
 dependencies = [
  "parking_lot",
  "shuttle",
+ "tokio",
 ]
 
 [[package]]
