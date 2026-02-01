@@ -268,9 +268,98 @@ pub unsafe extern "C" fn sqlite3_progress_handler(
     stub!();
 }
 
+/// Type for C busy handler callback function.
+type BusyHandlerFn = unsafe extern "C" fn(*mut ffi::c_void, ffi::c_int) -> ffi::c_int;
+
+/// Register a callback to handle SQLITE_BUSY errors.
+///
+/// The sqlite3_busy_handler(D,X,P) routine sets a callback function X that might be invoked
+/// with argument P whenever an attempt is made to access a database table associated with
+/// database connection D when another thread or process has the table locked.
+///
+/// If the busy callback is NULL, then SQLITE_BUSY is returned immediately upon encountering
+/// the lock. If the busy callback is not NULL, then the callback might be invoked with two
+/// arguments: the context pointer P and the number of times the busy handler has been invoked
+/// previously for the same locking event.
+///
+/// If the busy callback returns 0, then no additional attempts are made to access the database
+/// and SQLITE_BUSY is returned to the application. If the callback returns non-zero, then
+/// another attempt is made to access the database and the cycle repeats.
+///
+/// There can only be a single busy handler defined for each database connection. Setting a new
+/// busy handler clears any previously set handler. Note that calling sqlite3_busy_timeout()
+/// will change the busy handler and thus clear any previously set busy handler.
 #[no_mangle]
-pub unsafe extern "C" fn sqlite3_busy_timeout(_db: *mut sqlite3, _ms: ffi::c_int) -> ffi::c_int {
-    stub!();
+pub unsafe extern "C" fn sqlite3_busy_handler(
+    db: *mut sqlite3,
+    callback: Option<BusyHandlerFn>,
+    context: *mut ffi::c_void,
+) -> ffi::c_int {
+    if db.is_null() {
+        return SQLITE_MISUSE;
+    }
+
+    let db_ref = &*db;
+    let inner = match db_ref.inner.lock() {
+        Ok(guard) => guard,
+        Err(_) => return SQLITE_MISUSE,
+    };
+
+    match callback {
+        None => {
+            // Clear the busy handler
+            inner.conn.set_busy_handler(None);
+        }
+        Some(c_callback) => {
+            // We need a Rust wrapper for the C callback
+            // The context pointer is captured by value and must remain valid for the
+            // lifetime of the handler (caller's responsibility per SQLite spec)
+            let ctx = context as usize; // Convert to usize for Send+Sync
+            let cb = c_callback;
+            inner
+                .conn
+                .set_busy_handler(Some(Box::new(move |count: i32| {
+                    // SAFETY: Caller guarantees context validity for the handler's lifetime
+                    unsafe { cb(ctx as *mut ffi::c_void, count as ffi::c_int) }
+                })));
+        }
+    }
+
+    SQLITE_OK
+}
+
+/// Set a busy timeout for the database connection.
+///
+/// This routine sets a busy handler that sleeps for a specified amount of time when a table
+/// is locked. The handler will sleep multiple times until at least "ms" milliseconds of
+/// sleeping have accumulated. After at least "ms" milliseconds of sleeping, the handler
+/// returns 0 which causes sqlite3_step() to return SQLITE_BUSY.
+///
+/// Calling this routine with an argument less than or equal to zero turns off all busy
+/// handlers and returns SQLITE_BUSY immediately upon encountering a lock.
+///
+/// There can only be a single busy handler for a database connection. Setting a busy timeout
+/// clears any previously set busy handler.
+#[no_mangle]
+pub unsafe extern "C" fn sqlite3_busy_timeout(db: *mut sqlite3, ms: ffi::c_int) -> ffi::c_int {
+    if db.is_null() {
+        return SQLITE_MISUSE;
+    }
+
+    let db_ref = &*db;
+    let inner = match db_ref.inner.lock() {
+        Ok(guard) => guard,
+        Err(_) => return SQLITE_MISUSE,
+    };
+
+    let duration = if ms <= 0 {
+        std::time::Duration::ZERO
+    } else {
+        std::time::Duration::from_millis(ms as u64)
+    };
+
+    inner.conn.set_busy_timeout(duration);
+    SQLITE_OK
 }
 
 #[no_mangle]
@@ -1167,7 +1256,7 @@ pub unsafe extern "C" fn sqlite3_column_decltype(
 ) -> *const ffi::c_char {
     let stmt = &mut *stmt;
 
-    if let Some(val) = stmt.stmt.get_column_type(idx as usize) {
+    if let Some(val) = stmt.stmt.get_column_decltype(idx as usize) {
         let c_string = CString::new(val).expect("CString::new failed");
         c_string.into_raw()
     } else {
@@ -1829,10 +1918,10 @@ pub unsafe extern "C" fn sqlite3_wal_checkpoint_v2(
     match db.conn.checkpoint(chkptmode) {
         Ok(res) => {
             if !log_size.is_null() {
-                (*log_size) = res.num_attempted as ffi::c_int;
+                (*log_size) = res.wal_max_frame as ffi::c_int;
             }
             if !checkpoint_count.is_null() {
-                (*checkpoint_count) = res.num_backfilled as ffi::c_int;
+                (*checkpoint_count) = res.wal_checkpoint_backfilled as ffi::c_int;
             }
             SQLITE_OK
         }
@@ -2137,7 +2226,7 @@ fn handle_limbo_err(err: LimboError, container: *mut *mut ffi::c_char) -> i32 {
     match err {
         LimboError::Corrupt(..) => SQLITE_CORRUPT,
         LimboError::NotADB => SQLITE_NOTADB,
-        LimboError::Constraint(_) => SQLITE_CONSTRAINT,
+        LimboError::Constraint(_) | LimboError::ForeignKeyConstraint(_) => SQLITE_CONSTRAINT,
         LimboError::DatabaseFull(_) => SQLITE_FULL,
         LimboError::TableLocked => SQLITE_LOCKED,
         LimboError::ReadOnly => SQLITE_READONLY,

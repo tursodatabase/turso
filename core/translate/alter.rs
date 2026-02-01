@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use crate::sync::Arc;
 use turso_parser::{
     ast::{self, TableInternalId},
     parser::Parser,
@@ -15,13 +15,77 @@ use crate::{
     util::normalize_ident,
     vdbe::{
         builder::{CursorType, ProgramBuilder},
-        insn::{Cookie, Insn, RegisterOrLiteral},
+        insn::{to_u16, Cookie, Insn, RegisterOrLiteral},
     },
     vtab::VirtualTable,
     LimboError, Result,
 };
 
 use super::{schema::SQLITE_TABLEID, update::translate_update_for_schema_change};
+
+fn validate(alter_table: &ast::AlterTableBody, table_name: &str) -> Result<()> {
+    // Check if someone is trying to ALTER a system table
+    if crate::schema::is_system_table(table_name) {
+        crate::bail_parse_error!("table {} may not be modified", table_name);
+    }
+    if let ast::AlterTableBody::RenameTo(new_table_name) = alter_table {
+        let normalized_new_name = normalize_ident(new_table_name.as_str());
+        if RESERVED_TABLE_PREFIXES
+            .iter()
+            .any(|prefix| normalized_new_name.starts_with(prefix))
+        {
+            crate::bail_parse_error!("Object name reserved for internal use: {}", new_table_name);
+        }
+    }
+
+    Ok(())
+}
+
+/// Check if an expression is a valid "constant" default for ALTER TABLE ADD COLUMN.
+/// SQLite is very strict here - it only allows:
+/// - Literals (numbers, strings, blobs, NULL, CURRENT_TIME/DATE/TIMESTAMP)
+/// - Bare identifiers (treated as string literals, e.g., `DEFAULT hello` → "hello")
+/// - Signed literals (+5, -5, +NULL, -NULL)
+/// - Parenthesized versions of the above
+///
+/// It does NOT allow:
+/// - Binary operations like (5 + 3)
+/// - Function calls like COALESCE(NULL, 5)
+/// - Comparisons, CASE expressions, CAST, etc.
+///
+/// Note: CURRENT_TIME/DATE/TIMESTAMP are allowed here but will be rejected at
+/// runtime if the table has existing rows (see `default_requires_empty_table`).
+fn is_strict_constant_default(expr: &ast::Expr) -> bool {
+    match expr {
+        ast::Expr::Literal(_) => true,
+        // Bare identifiers are treated as string literals in DEFAULT clause
+        ast::Expr::Id(_) => true,
+        ast::Expr::Unary(ast::UnaryOperator::Positive | ast::UnaryOperator::Negative, inner) => {
+            // Only allow unary +/- on literals
+            matches!(inner.as_ref(), ast::Expr::Literal(_))
+        }
+        ast::Expr::Parenthesized(exprs) => {
+            // Parenthesized expression with a single inner expression
+            exprs.len() == 1 && is_strict_constant_default(&exprs[0])
+        }
+        _ => false,
+    }
+}
+
+/// Check if a default expression requires the table to be empty (non-deterministic defaults).
+/// CURRENT_TIME, CURRENT_DATE, CURRENT_TIMESTAMP cannot be used to backfill existing rows.
+fn default_requires_empty_table(expr: &ast::Expr) -> bool {
+    match expr {
+        ast::Expr::Literal(lit) => matches!(
+            lit,
+            ast::Literal::CurrentDate | ast::Literal::CurrentTime | ast::Literal::CurrentTimestamp
+        ),
+        ast::Expr::Parenthesized(exprs) => {
+            exprs.len() == 1 && default_requires_empty_table(&exprs[0])
+        }
+        _ => false,
+    }
+}
 
 pub fn translate_alter_table(
     alter: ast::AlterTable,
@@ -36,22 +100,7 @@ pub fn translate_alter_table(
         body: alter_table,
     } = alter;
     let table_name = table_name.name.as_str();
-
-    // Check if someone is trying to ALTER a system table
-    if crate::schema::is_system_table(table_name) {
-        crate::bail_parse_error!("table {} may not be modified", table_name);
-    }
-
-    if let ast::AlterTableBody::RenameTo(new_table_name) = &alter_table {
-        let normalized_new_name = normalize_ident(new_table_name.as_str());
-
-        if RESERVED_TABLE_PREFIXES
-            .iter()
-            .any(|prefix| normalized_new_name.starts_with(prefix))
-        {
-            crate::bail_parse_error!("Object name reserved for internal use: {}", new_table_name);
-        }
-    }
+    validate(&alter_table, table_name)?;
 
     let table_indexes = resolver.schema.get_indices(table_name).collect::<Vec<_>>();
 
@@ -192,7 +241,18 @@ pub fn translate_alter_table(
             }
 
             // TODO: check usage in CHECK constraint when implemented
-            // TODO: check usage in foreign key constraint when implemented
+
+            // Check if column is used in a foreign key constraint (child side)
+            // SQLite does not allow dropping a column that is part of a FK constraint
+            let column_name_norm = normalize_ident(column_name);
+            for fk in &btree.foreign_keys {
+                if fk.child_columns.contains(&column_name_norm) {
+                    return Err(LimboError::ParseError(format!(
+                        "error in table {table_name} after drop column: unknown column \"{column_name}\" in foreign key definition"
+                    )));
+                }
+            }
+
             // TODO: check usage in generated column when implemented
 
             // References in VIEWs are checked in the VDBE layer op_drop_column instruction.
@@ -272,9 +332,9 @@ pub fn translate_alter_table(
                             .collect::<String>();
 
                         program.emit_insn(Insn::MakeRecord {
-                            start_reg: first_column,
-                            count: column_count,
-                            dest_reg: record,
+                            start_reg: to_u16(first_column),
+                            count: to_u16(column_count),
+                            dest_reg: to_u16(record),
                             index_name: None,
                             affinity_str: Some(affinity_str),
                         });
@@ -315,22 +375,17 @@ pub fn translate_alter_table(
             let constraints = col_def.constraints.clone();
             let column = Column::from(&col_def);
 
-            if let Some(default) = &column.default {
-                if !matches!(
-                    default.as_ref(),
-                    ast::Expr::Literal(
-                        ast::Literal::Null
-                            | ast::Literal::Blob(_)
-                            | ast::Literal::Numeric(_)
-                            | ast::Literal::String(_)
-                    )
-                ) {
-                    // TODO: This is slightly inaccurate since sqlite returns a `Runtime
-                    // error`.
-                    return Err(LimboError::ParseError(
-                        "Cannot add a column with non-constant default".to_string(),
-                    ));
-                }
+            // SQLite is very strict about what constitutes a "constant" default for
+            // ALTER TABLE ADD COLUMN. It only allows literals and signed literals,
+            // not arbitrary constant expressions like (5 + 3) or COALESCE(NULL, 5).
+            if column
+                .default
+                .as_ref()
+                .is_some_and(|default| !is_strict_constant_default(default))
+            {
+                return Err(LimboError::ParseError(
+                    "Cannot add a column with non-constant default".to_string(),
+                ));
             }
 
             let new_column_name = column.name.as_ref().ok_or_else(|| {
@@ -427,6 +482,58 @@ pub fn translate_alter_table(
                 ));
             };
 
+            // Check if we need to verify the table is empty at runtime.
+            // This is required for:
+            // 1. NOT NULL columns without a non-null default (existing rows would get NULL)
+            // 2. Non-deterministic defaults like CURRENT_TIME (can't backfill existing rows)
+            let needs_notnull_check = column.notnull()
+                && column
+                    .default
+                    .as_ref()
+                    .is_none_or(|default| crate::util::expr_contains_null(default));
+
+            let needs_nondeterministic_check = column
+                .default
+                .as_ref()
+                .is_some_and(|default| default_requires_empty_table(default));
+
+            let (needs_empty_table_check, error_message) =
+                if needs_notnull_check && needs_nondeterministic_check {
+                    // Both conditions - use NOT NULL message (more specific)
+                    (true, "Cannot add a NOT NULL column with default value NULL")
+                } else if needs_notnull_check {
+                    (true, "Cannot add a NOT NULL column with default value NULL")
+                } else if needs_nondeterministic_check {
+                    (true, "Cannot add a column with non-constant default")
+                } else {
+                    (false, "")
+                };
+
+            if needs_empty_table_check {
+                // Emit bytecode to check if the table has any rows.
+                let check_cursor_id =
+                    program.alloc_cursor_id(CursorType::BTreeTable(original_btree.clone()));
+                program.emit_insn(Insn::OpenRead {
+                    cursor_id: check_cursor_id,
+                    root_page: original_btree.root_page,
+                    db: 0,
+                });
+
+                let skip_error_label = program.allocate_label();
+                program.emit_insn(Insn::Rewind {
+                    cursor_id: check_cursor_id,
+                    pc_if_empty: skip_error_label,
+                });
+
+                // Table has rows - emit error
+                program.emit_insn(Insn::Halt {
+                    err_code: 1,
+                    description: error_message.to_string(),
+                });
+
+                program.resolve_label(skip_error_label, program.offset());
+            }
+
             translate_update_for_schema_change(
                 update,
                 resolver,
@@ -442,7 +549,7 @@ pub fn translate_alter_table(
                     });
                     program.emit_insn(Insn::AddColumn {
                         table: table_name.to_owned(),
-                        column,
+                        column: Box::new(column),
                     });
                 },
             )?
@@ -512,9 +619,9 @@ pub fn translate_alter_table(
                 let record = program.alloc_register();
 
                 program.emit_insn(Insn::MakeRecord {
-                    start_reg: out,
-                    count: sqlite_schema_column_len,
-                    dest_reg: record,
+                    start_reg: to_u16(out),
+                    count: to_u16(sqlite_schema_column_len),
+                    dest_reg: to_u16(record),
                     index_name: None,
                     affinity_str: None,
                 });
@@ -786,9 +893,9 @@ pub fn translate_alter_table(
                 let record = program.alloc_register();
 
                 program.emit_insn(Insn::MakeRecord {
-                    start_reg: out,
-                    count: sqlite_schema_column_len,
-                    dest_reg: record,
+                    start_reg: to_u16(out),
+                    count: to_u16(sqlite_schema_column_len),
+                    dest_reg: to_u16(record),
                     index_name: None,
                     affinity_str: None,
                 });
@@ -844,7 +951,7 @@ pub fn translate_alter_table(
             program.emit_insn(Insn::AlterColumn {
                 table: table_name.to_owned(),
                 column_index,
-                definition,
+                definition: Box::new(definition),
                 rename,
             });
 
@@ -915,9 +1022,9 @@ fn translate_rename_virtual_table(
 
         let rec = program.alloc_register();
         program.emit_insn(Insn::MakeRecord {
-            start_reg: out,
-            count: ncols,
-            dest_reg: rec,
+            start_reg: to_u16(out),
+            count: to_u16(ncols),
+            dest_reg: to_u16(rec),
             index_name: None,
             affinity_str: None,
         });
@@ -1905,7 +2012,7 @@ fn rewrite_expr_for_column_rename(
     let is_renaming_trigger_table = trigger_table_name_norm == target_table_name_norm;
 
     // Get context table if provided (for UPDATE/DELETE WHERE clauses)
-    let context_table_info: Option<(std::sync::Arc<crate::schema::BTreeTable>, String, bool)> =
+    let context_table_info: Option<(crate::sync::Arc<crate::schema::BTreeTable>, String, bool)> =
         if let Some(ctx_name) = context_table_name {
             let ctx_name_norm = normalize_ident(ctx_name);
             let is_renaming = ctx_name_norm == target_table_name_norm;

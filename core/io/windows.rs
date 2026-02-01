@@ -1,9 +1,9 @@
-use crate::{
-    io::clock::DefaultClock, Clock, Completion, File, Instant, LimboError, OpenFlags, Result, IO,
-};
-use parking_lot::RwLock;
+use crate::io::clock::{DefaultClock, MonotonicInstant, WallClockInstant};
+use crate::io::FileSyncType;
+use crate::{Clock, Completion, File, LimboError, OpenFlags, Result, IO};
+use crate::sync::RwLock;
 use std::io::{Read, Seek, Write};
-use std::sync::Arc;
+use crate::sync::Arc;
 use tracing::{debug, instrument, trace, Level};
 pub struct WindowsIO {}
 
@@ -15,7 +15,7 @@ impl WindowsIO {
 }
 
 impl IO for WindowsIO {
-    #[instrument(err, skip_all, level = Level::TRACE)]
+    #[instrument(skip_all, level = Level::TRACE)]
     fn open_file(&self, path: &str, flags: OpenFlags, direct: bool) -> Result<Arc<dyn File>> {
         trace!("open_file(path = {})", path);
         let mut file = std::fs::File::options();
@@ -45,8 +45,12 @@ impl IO for WindowsIO {
 }
 
 impl Clock for WindowsIO {
-    fn now(&self) -> Instant {
-        DefaultClock.now()
+    fn current_time_monotonic(&self) -> MonotonicInstant {
+        DefaultClock.current_time_monotonic()
+    }
+
+    fn current_time_wall_clock(&self) -> WallClockInstant {
+        DefaultClock.current_time_wall_clock()
     }
 }
 
@@ -73,8 +77,7 @@ impl File for WindowsFile {
             let r = c.as_read();
             let buf = r.buf();
             let buf = buf.as_mut_slice();
-            file.read_exact(buf)?;
-            buf.len() as i32
+            file.read(buf)? as i32
         };
         c.complete(nr);
         Ok(c)
@@ -91,7 +94,7 @@ impl File for WindowsFile {
     }
 
     #[instrument(err, skip_all, level = Level::TRACE)]
-    fn sync(&self, c: Completion) -> Result<Completion> {
+    fn sync(&self, c: Completion, _sync_type: FileSyncType) -> Result<Completion> {
         let file = self.file.write();
         file.sync_all()?;
         c.complete(0);

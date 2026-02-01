@@ -397,8 +397,33 @@ public final class JDBC4PreparedStatement extends JDBC4Statement implements Prep
   }
 
   @Override
-  public void setCharacterStream(int parameterIndex, Reader reader, int length)
-      throws SQLException {}
+  public void setCharacterStream(int parameterIndex, @Nullable Reader reader, int length)
+      throws SQLException {
+    requireNonNull(this.statement);
+    if (reader == null) {
+      setParam(parameterIndex, null);
+      return;
+    }
+    if (length < 0) {
+      throw new SQLException("setCharacterStream length must be non-negative");
+    }
+    if (length == 0) {
+      setParam(parameterIndex, "");
+      return;
+    }
+    try {
+      char[] buffer = new char[length];
+      int offset = 0;
+      int read;
+      while (offset < length && (read = reader.read(buffer, offset, length - offset)) > 0) {
+        offset += read;
+      }
+      String value = new String(buffer, 0, offset);
+      setParam(parameterIndex, value);
+    } catch (IOException e) {
+      throw new SQLException("Error reading character stream", e);
+    }
+  }
 
   @Override
   public void setRef(int parameterIndex, Ref x) throws SQLException {
@@ -519,9 +544,10 @@ public final class JDBC4PreparedStatement extends JDBC4Statement implements Prep
   }
 
   @Override
-  public void setCharacterStream(int parameterIndex, Reader reader, long length)
+  public void setCharacterStream(int parameterIndex, @Nullable Reader reader, long length)
       throws SQLException {
-    // TODO
+    requireLengthIsPositiveInt(length);
+    setCharacterStream(parameterIndex, reader, (int) length);
   }
 
   private void requireLengthIsPositiveInt(long length) throws SQLFeatureNotSupportedException {
@@ -581,8 +607,23 @@ public final class JDBC4PreparedStatement extends JDBC4Statement implements Prep
   }
 
   @Override
-  public void setCharacterStream(int parameterIndex, Reader reader) throws SQLException {
-    // TODO
+  public void setCharacterStream(int parameterIndex, @Nullable Reader reader) throws SQLException {
+    requireNonNull(this.statement);
+    if (reader == null) {
+      setParam(parameterIndex, null);
+      return;
+    }
+    try {
+      StringBuilder sb = new StringBuilder();
+      char[] buffer = new char[8192];
+      int read;
+      while ((read = reader.read(buffer)) != -1) {
+        sb.append(buffer, 0, read);
+      }
+      setParam(parameterIndex, sb.toString());
+    } catch (IOException e) {
+      throw new SQLException("Error reading character stream", e);
+    }
   }
 
   @Override

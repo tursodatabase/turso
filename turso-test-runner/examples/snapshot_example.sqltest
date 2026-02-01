@@ -1,0 +1,41 @@
+@database :memory:
+
+setup schema {
+    CREATE TABLE users (
+        id INTEGER PRIMARY KEY,
+        name TEXT NOT NULL,
+        age INTEGER
+    );
+    CREATE INDEX idx_users_name ON users(name);
+}
+
+setup data {
+    INSERT INTO users VALUES (1, 'Alice', 30), (2, 'Bob', 25);
+}
+
+# Regular test - verifies query results
+@setup schema
+@setup data
+test select-user {
+    SELECT * FROM users WHERE id = 1;
+}
+expect {
+    1|Alice|30
+}
+
+# Snapshot test for EXPLAIN output
+# This captures the query execution plan
+# Should fail as we have 2 statements
+@setup schema
+@setup data
+snapshot query-plan-by-id {
+    SELECT * FROM users WHERE id = 1;
+    SELECT * FROM users WHERE id = 1;
+}
+
+# Another snapshot test using index
+@setup schema
+@setup data
+snapshot query-plan-by-name {
+    SELECT * FROM users WHERE name = 'Alice';
+}

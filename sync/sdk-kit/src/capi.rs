@@ -53,21 +53,6 @@ pub extern "C" fn turso_sync_database_new(
 
 #[no_mangle]
 #[signature(c)]
-pub extern "C" fn turso_sync_database_init(
-    db: *const c::turso_sync_database_t,
-    operation: *mut *const c::turso_sync_operation_t,
-    error_opt_out: *mut *const std::ffi::c_char,
-) -> turso_sdk_kit::capi::c::turso_status_code_t {
-    let db = match unsafe { TursoDatabaseSync::ref_from_capi(db) } {
-        Ok(db) => db,
-        Err(err) => return unsafe { err.to_capi(error_opt_out) },
-    };
-    unsafe { *operation = db.init().to_capi() };
-    capi::c::turso_status_code_t::TURSO_OK
-}
-
-#[no_mangle]
-#[signature(c)]
 pub extern "C" fn turso_sync_database_open(
     db: *const c::turso_sync_database_t,
     operation: *mut *const c::turso_sync_operation_t,
@@ -609,9 +594,6 @@ mod tests {
             let mut operation = std::ptr::null();
             let status = turso_sync_database_connect(db, &mut operation, std::ptr::null_mut());
             assert_eq!(status, turso_status_code_t::TURSO_OK);
-
-            let status = turso_sync_operation_resume(operation, std::ptr::null_mut());
-            assert_eq!(status, turso_status_code_t::TURSO_IO);
 
             let status = turso_sync_operation_resume(operation, std::ptr::null_mut());
             assert_eq!(status, turso_status_code_t::TURSO_DONE);

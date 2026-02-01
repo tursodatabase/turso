@@ -92,7 +92,9 @@ fn uuid7_ts(args: &[Value]) -> Value {
             let Some(blob) = &args[0].to_blob() else {
                 return Value::null();
             };
-            let uuid = uuid::Uuid::from_slice(blob.as_slice()).unwrap();
+            let Ok(uuid) = uuid::Uuid::from_slice(blob.as_slice()) else {
+                return Value::null();
+            };
             let unix = uuid_to_unix(uuid.as_bytes());
             Value::from_integer(unix as i64)
         }

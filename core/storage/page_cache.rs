@@ -1,6 +1,6 @@
+use crate::sync::{atomic::Ordering, Arc};
 use intrusive_collections::{intrusive_adapter, LinkedList, LinkedListLink};
-use rustc_hash::FxHashMap;
-use std::sync::{atomic::Ordering, Arc};
+use rustc_hash::FxHashMap as HashMap;
 use tracing::trace;
 
 use crate::{
@@ -100,7 +100,7 @@ pub struct PageCache {
     /// Capacity in pages
     capacity: usize,
     /// Map of Key -> pointer to entry in the queue
-    map: FxHashMap<PageCacheKey, *mut PageCacheEntry>,
+    map: HashMap<PageCacheKey, *mut PageCacheEntry>,
     /// The eviction queue (intrusive doubly-linked list)
     queue: LinkedList<EntryAdapter>,
     /// Clock hand cursor for SIEVE eviction (pointer to an entry in the queue, or null)
@@ -108,10 +108,13 @@ pub struct PageCache {
     /// Threshold number of pages at which we start spilling dirty pages.
     spill_threshold: usize,
     spill_enabled: bool,
+    /// Conservative estimation of pages that are evictable based on dirty/spilled state.
+    evictable_count: usize,
 }
 
 unsafe impl Send for PageCache {}
 unsafe impl Sync for PageCache {}
+crate::assert::assert_send_sync!(PageCache);
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum CacheError {
@@ -158,11 +161,12 @@ impl PageCache {
         let spill_threshold = (capacity * DEFAULT_SPILL_THRESHOLD_PERCENT) / 100;
         Self {
             capacity,
-            map: FxHashMap::default(),
+            map: HashMap::default(),
             queue: LinkedList::new(EntryAdapter::new()),
             clock_hand: std::ptr::null_mut(),
             spill_threshold: spill_threshold.max(1),
             spill_enabled,
+            evictable_count: 0,
         }
     }
 
@@ -227,6 +231,14 @@ impl PageCache {
             } else {
                 entry.bump_ref();
                 if update_in_place {
+                    // Track evictable count change if page state differs
+                    let old_evictable = Self::counted_as_evictable(&entry.page);
+                    let new_evictable = Self::counted_as_evictable(&value);
+                    if old_evictable && !new_evictable {
+                        self.evictable_count = self.evictable_count.saturating_sub(1);
+                    } else if !old_evictable && new_evictable {
+                        self.evictable_count += 1;
+                    }
                     entry.page = value;
                     return Ok(());
                 } else {
@@ -241,6 +253,9 @@ impl PageCache {
 
         // Key doesn't exist, proceed with new entry
         self.make_room_for(1)?;
+
+        // Track evictable count for the new page
+        let is_evictable = Self::counted_as_evictable(&value);
 
         let entry = PageCacheEntry::new(key, value);
 
@@ -262,6 +277,11 @@ impl PageCache {
                 })? as *const PageCacheEntry as *mut PageCacheEntry;
                 self.map.insert(key, entry_ptr);
             }
+        }
+
+        // Update evictable count after successful insertion
+        if is_evictable {
+            self.evictable_count += 1;
         }
 
         Ok(())
@@ -291,9 +311,12 @@ impl PageCache {
             });
         }
 
+        // Track evictable count before removing
+        let was_evictable = Self::counted_as_evictable(page);
+
         if clean_page {
             page.clear_loaded();
-            let _ = page.get().contents.take();
+            let _ = page.get().buffer.take();
         }
 
         // Remove from map first
@@ -312,6 +335,11 @@ impl PageCache {
         unsafe {
             let mut cursor = self.queue.cursor_mut_from_ptr(entry_ptr);
             cursor.remove();
+        }
+
+        // Update evictable count after successful removal
+        if was_evictable {
+            self.evictable_count = self.evictable_count.saturating_sub(1);
         }
 
         Ok(())
@@ -378,7 +406,39 @@ impl PageCache {
     /// This indicates that dirty pages should be flushed to make room for new pages.
     #[inline]
     pub fn needs_spill(&self) -> bool {
-        self.spill_enabled && self.len() >= self.spill_threshold
+        let len = self.len();
+
+        if len < self.spill_threshold || !self.spill_enabled {
+            return false;
+        }
+
+        let needed_evictable = len.saturating_sub(self.spill_threshold);
+
+        // Fast path: use tracked evictable_count to avoid O(n) scan:
+        // evictable_count is a conservative upper bound on evictable pages,
+        // Empty slots also count as available room since make_room_for uses them first.
+        // Calculate if we have enough room (evictable + empty slots) and won't need to spill.
+        let empty_slots = self.capacity.saturating_sub(len);
+        let available_room = self.evictable_count.saturating_add(empty_slots);
+        if available_room >= needed_evictable {
+            return false;
+        }
+
+        // Slow path: do the full count since our estimate suggests we might need to spill.
+        // The actual count may be lower than evictable_count due to locked/pinned pages.
+        self.count_evictable_pages() < needed_evictable
+    }
+
+    #[inline]
+    /// Count pages that can be evicted without spilling.
+    fn count_evictable_pages(&self) -> usize {
+        self.map
+            .values()
+            .filter(|&&entry_ptr| {
+                let entry = unsafe { &*entry_ptr };
+                Self::evictable(&entry.page)
+            })
+            .count()
     }
 
     /// Check if spilling is enabled for this cache.
@@ -412,11 +472,57 @@ impl PageCache {
             && !page.is_pinned()
             && Arc::strong_count(page) == 1
             && page.get().id.ne(&DatabaseHeader::PAGE_ID)
-            && page
-                .get()
-                .contents
-                .as_ref()
-                .is_some_and(|c| c.overflow_cells.is_empty())
+            && page.get().overflow_cells.is_empty()
+    }
+
+    #[inline]
+    /// Check if a page should be counted as evictable for tracking purposes.
+    /// This is a conservative check that ignores locked/pinned/strong_count state
+    /// since those are typically short-lived. We track based on dirty/spilled state.
+    fn counted_as_evictable(page: &PageRef) -> bool {
+        // Page 1 is never evictable
+        if page.get().id == DatabaseHeader::PAGE_ID {
+            return false;
+        }
+        // A page is evictable if it's clean OR spilled
+        !page.is_dirty() || page.is_spilled()
+    }
+
+    /// Notify the cache that a page has become dirty.
+    /// This should be called when a page transitions from clean/spilled to dirty.
+    /// The page must already be in the cache.
+    pub fn notify_page_dirty(&mut self, key: PageCacheKey) {
+        if let Some(&entry_ptr) = self.map.get(&key) {
+            let entry = unsafe { &*entry_ptr };
+            let page = &entry.page;
+            // Page was evictable (clean or spilled) before becoming dirty,
+            // now it's dirty && !spilled, so not evictable
+            if page.get().id != DatabaseHeader::PAGE_ID {
+                // Only decrement if we were counting it as evictable
+                // (it was clean or spilled before this call)
+                self.evictable_count = self.evictable_count.saturating_sub(1);
+            }
+        }
+    }
+
+    /// Notify the cache that a page has been spilled.
+    /// This should be called when a page transitions from dirty to spilled.
+    /// The page must already be in the cache.
+    pub fn notify_page_spilled(&mut self, key: PageCacheKey) {
+        if let Some(&entry_ptr) = self.map.get(&key) {
+            let entry = unsafe { &*entry_ptr };
+            let page = &entry.page;
+            // Page was dirty && !spilled (not evictable), now it's spilled (evictable)
+            if page.get().id != DatabaseHeader::PAGE_ID {
+                self.evictable_count += 1;
+            }
+        }
+    }
+
+    /// Get the current evictable page count (for diagnostics/testing).
+    #[cfg(test)]
+    pub fn evictable_count(&self) -> usize {
+        self.evictable_count
     }
 
     /// Collect dirty pages that can be spilled to make room in the cache.
@@ -426,20 +532,20 @@ impl PageCache {
             return Vec::new();
         }
         const EST_SPILL: usize = 128;
-        let mut spillable: Vec<(usize, PinGuard)> = Vec::with_capacity(EST_SPILL);
+        let mut spillable: Vec<PinGuard> = Vec::with_capacity(EST_SPILL);
 
-        for (&key, &entry_ptr) in self.map.iter() {
+        for (_, &entry_ptr) in self.map.iter() {
             let entry = unsafe { &*entry_ptr };
             let page = &entry.page;
             if Self::spillable(page) {
-                spillable.push((key.0, PinGuard::new(page.clone())));
+                spillable.push(PinGuard::new(page.clone()));
             }
             if spillable.len() >= max_pages {
                 break;
             }
         }
-        spillable.sort_by_key(|(pgno, _)| *pgno);
-        spillable.into_iter().map(|(_, page)| page).collect()
+        spillable.sort_by_key(|pg| pg.get().id);
+        spillable
     }
 
     /// Returns the number of dirty pages currently in the cache.
@@ -458,9 +564,6 @@ impl PageCache {
     pub fn check_spill(&self, max_pages: usize) -> SpillResult {
         if !self.needs_spill() {
             return SpillResult::NotNeeded;
-        }
-        if !self.spill_enabled {
-            return SpillResult::Disabled;
         }
 
         let pages = self.collect_spillable_pages(max_pages);
@@ -534,6 +637,11 @@ impl PageCache {
             let evictable = Self::evictable(page);
 
             if evictable && entry.ref_bit == CLEAR {
+                turso_assert!(
+                    Self::counted_as_evictable(page),
+                    "mismatched evictable count state"
+                );
+
                 // Evict this entry
                 self.advance_clock_hand();
                 // Check if clock hand wrapped back to the same entry (meaning this is the only/last entry)
@@ -544,13 +652,16 @@ impl PageCache {
                 self.map.remove(&key);
                 // Clean the page
                 page.clear_loaded();
-                let _ = page.get().contents.take();
+                let _ = page.get().buffer.take();
 
                 // Remove from queue
                 unsafe {
                     let mut cursor = self.queue.cursor_mut_from_ptr(entry_ptr);
                     cursor.remove();
                 }
+
+                // Update evictable count after successful eviction
+                self.evictable_count = self.evictable_count.saturating_sub(1);
 
                 return Ok(());
             } else if evictable {
@@ -583,12 +694,13 @@ impl PageCache {
         for &entry_ptr in self.map.values() {
             let entry = unsafe { &*entry_ptr };
             entry.page.clear_loaded();
-            let _ = entry.page.get().contents.take();
+            let _ = entry.page.get().buffer.take();
         }
 
         self.map.clear();
         self.queue.clear();
         self.clock_hand = std::ptr::null_mut();
+        self.evictable_count = 0;
         Ok(())
     }
 
@@ -641,12 +753,14 @@ impl PageCache {
 
     #[cfg(test)]
     fn verify_cache_integrity(&self) {
+        use rustc_hash::FxHashSet as HashSet;
+
         let map_len = self.map.len();
 
         // Count entries in queue
         let mut queue_len = 0;
         let mut cursor = self.queue.front();
-        let mut seen_keys = std::collections::HashSet::new();
+        let mut seen_keys = HashSet::default();
 
         while let Some(entry) = cursor.get() {
             queue_len += 1;
@@ -692,12 +806,11 @@ mod tests {
     use super::*;
     use crate::storage::page_cache::CacheError;
     use crate::storage::pager::{Page, PageRef};
-    use crate::storage::sqlite3_ondisk::PageContent;
+    use crate::sync::Arc;
     use rand_chacha::{
         rand_core::{RngCore, SeedableRng},
         ChaCha8Rng,
     };
-    use std::sync::Arc;
 
     fn create_key(id: usize) -> PageCacheKey {
         PageCacheKey::new(id)
@@ -706,15 +819,10 @@ mod tests {
     pub fn page_with_content(page_id: usize) -> PageRef {
         let page = Arc::new(Page::new(page_id as i64));
         {
-            let buffer = crate::Buffer::new_temporary(4096);
-            let page_content = PageContent {
-                offset: 0,
-                buffer: Arc::new(buffer),
-                overflow_cells: Vec::new(),
-            };
-            page.get().contents = Some(page_content);
-            page.set_loaded();
+            let inner = page.get();
+            inner.buffer = Some(Arc::new(crate::Buffer::new_temporary(4096)));
         }
+        page.set_loaded();
         page
     }
 
@@ -816,21 +924,22 @@ mod tests {
 
     #[test]
     fn test_page_cache_evict() {
+        // Note: page 1 is DatabaseHeader and is never evictable, so use page ids >= 2
         let mut cache = PageCache::new_with_spill(1, true);
-        let key1 = insert_page(&mut cache, 1);
         let key2 = insert_page(&mut cache, 2);
+        let key3 = insert_page(&mut cache, 3);
 
-        // With capacity=1, inserting key2 should evict key1
-        assert_eq!(cache.get(&key2).unwrap().unwrap().get().id, 2);
+        // With capacity=1, inserting key3 should evict key2
+        assert_eq!(cache.get(&key3).unwrap().unwrap().get().id, 3);
         assert!(
-            cache.get(&key1).unwrap().is_none(),
-            "key1 should be evicted"
+            cache.get(&key2).unwrap().is_none(),
+            "key2 should be evicted"
         );
 
-        // key2 should still be accessible
-        assert_eq!(cache.get(&key2).unwrap().unwrap().get().id, 2);
+        // key3 should still be accessible
+        assert_eq!(cache.get(&key3).unwrap().unwrap().get().id, 3);
         assert!(
-            cache.get(&key1).unwrap().is_none(),
+            cache.get(&key2).unwrap().is_none(),
             "capacity=1 should have evicted the older page"
         );
         cache.verify_cache_integrity();
@@ -840,31 +949,32 @@ mod tests {
     fn test_sieve_touch_non_tail_does_not_affect_immediate_eviction() {
         // SIEVE algorithm: touching a non-tail page marks it but doesn't move it.
         // The tail (if unmarked) will still be the first eviction candidate.
+        // Note: page 1 is DatabaseHeader and is never evictable, so use page ids >= 2
 
-        // Insert 1,2,3 -> order [3,2,1] with tail=1
+        // Insert 2,3,4 -> order [4,3,2] with tail=2
         let mut cache = PageCache::new_with_spill(3, true);
-        let key1 = insert_page(&mut cache, 1);
         let key2 = insert_page(&mut cache, 2);
         let key3 = insert_page(&mut cache, 3);
-
-        // Touch key2 (middle) to mark it with reference bit
-        assert!(cache.get(&key2).unwrap().is_some());
-
-        // Insert 4: SIEVE examines tail (key1, unmarked) -> evict key1
         let key4 = insert_page(&mut cache, 4);
 
+        // Touch key3 (middle) to mark it with reference bit
+        assert!(cache.get(&key3).unwrap().is_some());
+
+        // Insert 5: SIEVE examines tail (key2, unmarked) -> evict key2
+        let key5 = insert_page(&mut cache, 5);
+
         assert!(
-            cache.get(&key2).unwrap().is_some(),
-            "marked non-tail (key2) should remain"
+            cache.get(&key3).unwrap().is_some(),
+            "marked non-tail (key3) should remain"
         );
-        assert!(cache.get(&key3).unwrap().is_some(), "key3 should remain");
+        assert!(cache.get(&key4).unwrap().is_some(), "key4 should remain");
         assert!(
-            cache.get(&key4).unwrap().is_some(),
-            "key4 was just inserted"
+            cache.get(&key5).unwrap().is_some(),
+            "key5 was just inserted"
         );
         assert!(
-            cache.get(&key1).unwrap().is_none(),
-            "unmarked tail (key1) should be evicted first"
+            cache.get(&key2).unwrap().is_none(),
+            "unmarked tail (key2) should be evicted first"
         );
         cache.verify_cache_integrity();
     }
@@ -959,19 +1069,20 @@ mod tests {
     #[test]
     fn test_page_cache_over_capacity() {
         // Test SIEVE eviction when exceeding capacity
+        // Note: page 1 is DatabaseHeader and is never evictable, so use page ids >= 2
         let mut cache = PageCache::new_with_spill(2, true);
-        let key1 = insert_page(&mut cache, 1);
         let key2 = insert_page(&mut cache, 2);
-
-        // Insert 3: tail (key1, unmarked) should be evicted
         let key3 = insert_page(&mut cache, 3);
 
+        // Insert 4: tail (key2, unmarked) should be evicted
+        let key4 = insert_page(&mut cache, 4);
+
         assert_eq!(cache.len(), 2);
-        assert!(cache.get(&key2).unwrap().is_some(), "key2 should remain");
-        assert!(cache.get(&key3).unwrap().is_some(), "key3 just inserted");
+        assert!(cache.get(&key3).unwrap().is_some(), "key3 should remain");
+        assert!(cache.get(&key4).unwrap().is_some(), "key4 just inserted");
         assert!(
-            cache.get(&key1).unwrap().is_none(),
-            "key1 (oldest, unmarked) should be evicted"
+            cache.get(&key2).unwrap().is_none(),
+            "key2 (oldest, unmarked) should be evicted"
         );
         cache.verify_cache_integrity();
     }
@@ -1150,7 +1261,7 @@ mod tests {
 
         let max_pages = 10;
         let mut cache = PageCache::new_with_spill(10, true);
-        let mut reference_map = std::collections::HashMap::new();
+        let mut reference_map = HashMap::default();
 
         for _ in 0..10000 {
             cache.print();
@@ -1215,24 +1326,25 @@ mod tests {
     #[test]
     fn test_peek_without_touch() {
         // Test that peek with touch=false doesn't mark pages
+        // Note: page 1 is DatabaseHeader and is never evictable, so use page ids >= 2
         let mut cache = PageCache::new_with_spill(2, true);
-        let key1 = insert_page(&mut cache, 1);
         let key2 = insert_page(&mut cache, 2);
-
-        // Peek key1 without touching (no ref bit set)
-        assert!(cache.peek(&key1, false).is_some());
-
-        // Insert 3: should evict unmarked tail (key1)
         let key3 = insert_page(&mut cache, 3);
 
-        assert!(cache.get(&key2).unwrap().is_some(), "key2 should remain");
+        // Peek key2 without touching (no ref bit set)
+        assert!(cache.peek(&key2, false).is_some());
+
+        // Insert 4: should evict unmarked tail (key2)
+        let key4 = insert_page(&mut cache, 4);
+
+        assert!(cache.get(&key3).unwrap().is_some(), "key3 should remain");
         assert!(
-            cache.get(&key3).unwrap().is_some(),
-            "key3 was just inserted"
+            cache.get(&key4).unwrap().is_some(),
+            "key4 was just inserted"
         );
         assert!(
-            cache.get(&key1).unwrap().is_none(),
-            "key1 should be evicted since peek(false) didn't mark it"
+            cache.get(&key2).unwrap().is_none(),
+            "key2 should be evicted since peek(false) didn't mark it"
         );
         assert_eq!(cache.len(), 2);
         cache.verify_cache_integrity();
@@ -1298,32 +1410,33 @@ mod tests {
 
     #[test]
     fn clock_drains_hot_page_within_single_sweep_when_others_are_unevictable() {
-        // capacity 3: [3(head), 2, 1(tail)]
+        // Note: page 1 is DatabaseHeader and is never evictable, so use page ids >= 2
+        // capacity 3: [4(head), 3, 2(tail)]
         let mut c = PageCache::new_with_spill(3, true);
-        let k1 = insert_page(&mut c, 1);
         let k2 = insert_page(&mut c, 2);
-        let _k3 = insert_page(&mut c, 3);
+        let k3 = insert_page(&mut c, 3);
+        let k4 = insert_page(&mut c, 4);
 
-        // Make k1 hot: bump to Max
+        // Make k2 hot: bump to Max
         for _ in 0..3 {
-            assert!(c.get(&k1).unwrap().is_some());
+            assert!(c.get(&k2).unwrap().is_some());
         }
-        assert!(matches!(c.ref_of(&k1), Some(REF_MAX)));
+        assert!(matches!(c.ref_of(&k2), Some(REF_MAX)));
 
-        // Make other pages unevictable; clock must keep revisiting k1.
-        c.get(&k2).unwrap().unwrap().set_dirty();
-        c.get(&_k3).unwrap().unwrap().set_dirty();
+        // Make other pages unevictable; clock must keep revisiting k2.
+        c.get(&k3).unwrap().unwrap().set_dirty();
+        c.get(&k4).unwrap().unwrap().set_dirty();
 
-        // Insert 4 -> sweep rotates as needed, draining k1 and evicting it.
-        let _k4 = insert_page(&mut c, 4);
+        // Insert 5 -> sweep rotates as needed, draining k2 and evicting it.
+        let k5 = insert_page(&mut c, 5);
 
         assert!(
-            c.get(&k1).unwrap().is_none(),
-            "k1 should be evicted after its credit drains"
+            c.get(&k2).unwrap().is_none(),
+            "k2 should be evicted after its credit drains"
         );
-        assert!(c.get(&k2).unwrap().is_some(), "k2 is dirty (unevictable)");
-        assert!(c.get(&_k3).unwrap().is_some(), "k3 is dirty (unevictable)");
-        assert!(c.get(&_k4).unwrap().is_some(), "k4 just inserted");
+        assert!(c.get(&k3).unwrap().is_some(), "k3 is dirty (unevictable)");
+        assert!(c.get(&k4).unwrap().is_some(), "k4 is dirty (unevictable)");
+        assert!(c.get(&k5).unwrap().is_some(), "k5 just inserted");
         c.verify_cache_integrity();
     }
 
@@ -1488,15 +1601,16 @@ mod tests {
 
     #[test]
     fn test_hand_advances_on_eviction() {
+        // Note: page 1 is DatabaseHeader and is never evictable, so use page ids >= 2
         let mut cache = PageCache::new_with_spill(2, true);
-        let _key1 = insert_page(&mut cache, 1);
         let _key2 = insert_page(&mut cache, 2);
+        let _key3 = insert_page(&mut cache, 3);
 
         // Note initial hand position
         let initial_hand = cache.clock_hand;
 
         // Force eviction
-        let _key3 = insert_page(&mut cache, 3);
+        let _key4 = insert_page(&mut cache, 4);
 
         // Hand should exist (not null)
         let new_hand = cache.clock_hand;
@@ -1555,6 +1669,88 @@ mod tests {
         assert!(cache.contains_key(&key2));
         assert!(cache.contains_key(&key3));
         assert_eq!(cache.len(), 3);
+
+        cache.verify_cache_integrity();
+    }
+
+    #[test]
+    fn test_evictable_count_tracking() {
+        // Test that evictable_count is tracked correctly for fast-path spill check
+        // Note: page 1 is DatabaseHeader and is never evictable
+        let mut cache = PageCache::new_with_spill(10, true);
+
+        // Insert clean pages (all evictable except page 1)
+        let key1 = insert_page(&mut cache, 1); // page 1 is never evictable
+        let key2 = insert_page(&mut cache, 2);
+        let key3 = insert_page(&mut cache, 3);
+
+        // Page 1 is not counted, pages 2 and 3 are evictable
+        assert_eq!(cache.evictable_count(), 2);
+
+        // Make page 2 dirty - it becomes non-evictable
+        cache.notify_page_dirty(key2);
+        assert_eq!(cache.evictable_count(), 1);
+
+        // Make page 2 spilled - it becomes evictable again
+        cache.notify_page_spilled(key2);
+        assert_eq!(cache.evictable_count(), 2);
+
+        // Delete page 3 - evictable count decreases
+        assert!(cache.delete(key3).is_ok());
+        assert_eq!(cache.evictable_count(), 1);
+
+        // Delete page 1 (which wasn't counted) - no change
+        assert!(cache.delete(key1).is_ok());
+        assert_eq!(cache.evictable_count(), 1);
+
+        // Clear cache
+        assert!(cache.clear(true).is_ok());
+        assert_eq!(cache.evictable_count(), 0);
+
+        cache.verify_cache_integrity();
+    }
+
+    #[test]
+    fn test_needs_spill_fast_path() {
+        // Test that needs_spill uses the fast path when we have enough evictable pages
+        // Capacity 10, threshold 90% = 9, so when len > 9 we need some evictable pages
+        let mut cache = PageCache::new_with_spill(10, true);
+
+        // Insert 10 clean pages (all evictable except page 1)
+        for i in 1..=10 {
+            let _ = insert_page(&mut cache, i);
+        }
+
+        // len=10, threshold=9, needed_evictable = 10-9 = 1
+        // evictable_count = 9 (pages 2-10, page 1 not counted)
+        // Fast path: 9 >= 1, so no spill needed
+        assert!(!cache.needs_spill());
+        assert_eq!(cache.evictable_count(), 9);
+
+        // Make all pages dirty
+        for i in 2..=10 {
+            let key = create_key(i);
+            cache.notify_page_dirty(key);
+            cache.peek(&key, false).unwrap().set_dirty();
+        }
+
+        // Now evictable_count = 0 and pages are actually dirty
+        // needed_evictable = 1, but we have 0 evictable pages
+        assert_eq!(cache.evictable_count(), 0);
+        // needs_spill should return true because we need 1 evictable page but have 0
+        assert!(cache.needs_spill());
+
+        // Mark pages as spilled
+        for i in 2..=10 {
+            let key = create_key(i);
+            cache.notify_page_spilled(key);
+            cache.peek(&key, false).unwrap().set_spilled();
+        }
+
+        // Now evictable_count = 9 and pages are spilled (evictable)
+        assert_eq!(cache.evictable_count(), 9);
+        // Fast path: 9 >= 1, so no spill needed
+        assert!(!cache.needs_spill());
 
         cache.verify_cache_integrity();
     }

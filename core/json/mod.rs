@@ -44,7 +44,7 @@ pub fn get_json(json_value: &Value, indent: Option<&str>) -> crate::Result<Value
             let json_val = convert_dbtype_to_jsonb(json_value, Conv::Strict)?;
             let mut json = match indent {
                 Some(indent) => json_val.to_string_pretty(Some(indent))?,
-                None => json_val.to_string(),
+                None => json_val.to_string()?,
             };
 
             // Simplify infinity format to match SQLite (#4196)
@@ -55,7 +55,7 @@ pub fn get_json(json_value: &Value, indent: Option<&str>) -> crate::Result<Value
         Value::Blob(b) => {
             let jsonbin = Jsonb::new(b.len(), Some(b));
             jsonbin.element_type()?;
-            Ok(Value::Text(Text::json(jsonbin.to_string())))
+            Ok(Value::Text(Text::json(jsonbin.to_string()?)))
         }
         Value::Null => Ok(Value::Null),
         _ => {
@@ -145,7 +145,12 @@ pub fn convert_ref_dbtype_to_jsonb(val: ValueRef<'_>, strict: Conv) -> crate::Re
                 _ => match JsonbHeader::from_slice(0, slice) {
                     Ok((header, header_offset)) => {
                         let payload_size = header.payload_size();
-                        let total_expected = header_offset + payload_size;
+                        let total_expected = match header_offset.checked_add(payload_size) {
+                            Some(t) => t,
+                            None => {
+                                return Err(LimboError::ParseError("malformed JSON".to_string()))
+                            }
+                        };
 
                         if total_expected != slice.len() {
                             parse_as_json_text(slice, strict)?
@@ -369,7 +374,7 @@ pub fn json_arrow_extract(
         let res = json.operate_on_path(&path, &mut op);
         let extracted = op.result();
         if res.is_ok() {
-            Ok(Value::Text(Text::json(extracted.to_string())))
+            Ok(Value::Text(Text::json(extracted.to_string()?)))
         } else {
             Ok(Value::Null)
         }
@@ -541,10 +546,10 @@ pub fn json_string_to_db_type(
     element_type: ElementType,
     flag: OutputVariant,
 ) -> crate::Result<Value> {
-    let mut json_string = json.to_string();
     if matches!(flag, OutputVariant::Binary) {
         return Ok(Value::Blob(json.data()));
     }
+    let mut json_string = json.to_string()?;
     match element_type {
         ElementType::ARRAY | ElementType::OBJECT => Ok(Value::Text(Text::json(json_string))),
         ElementType::TEXT | ElementType::TEXT5 | ElementType::TEXTJ | ElementType::TEXTRAW => {
@@ -557,17 +562,20 @@ pub fn json_string_to_db_type(
             }
         }
         ElementType::FLOAT5 | ElementType::FLOAT => {
-            let float_val: f64 = json_string.parse().expect("Should be valid f64");
-            if float_val.is_infinite() && matches!(flag, OutputVariant::ElementType) {
-                // For json() function, SQLite returns bare infinity as "9e999" not "9.0e+999"
-                let simplified = if float_val.is_sign_negative() {
-                    "-9e999"
-                } else {
-                    "9e999"
-                };
-                Ok(Value::Text(Text::json(simplified.to_string())))
-            } else {
-                Ok(Value::Float(float_val))
+            match json_string.parse::<f64>() {
+                Ok(float_val)
+                    if float_val.is_infinite() && matches!(flag, OutputVariant::ElementType) =>
+                {
+                    // For json() function, SQLite returns bare infinity as "9e999" not "9.0e+999"
+                    let simplified = if float_val.is_sign_negative() {
+                        "-9e999"
+                    } else {
+                        "9e999"
+                    };
+                    Ok(Value::Text(Text::json(simplified.to_string())))
+                }
+                Ok(float_val) => Ok(Value::Float(float_val)),
+                Err(_) => Ok(Value::Null),
             }
         }
         ElementType::INT | ElementType::INT5 => {

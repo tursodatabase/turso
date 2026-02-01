@@ -42,6 +42,9 @@ mod rows;
 pub mod transaction;
 pub mod value;
 
+#[cfg(feature = "sync")]
+pub mod sync;
+
 pub use connection::Connection;
 pub use value::Value;
 
@@ -50,47 +53,93 @@ pub use params::IntoParams;
 
 use std::fmt::Debug;
 use std::future::Future;
-use std::num::NonZero;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::Mutex;
 use std::task::Poll;
-pub use turso_core::EncryptionOpts;
-use turso_core::OpenFlags;
 
 // Re-exports rows
 pub use crate::rows::{Row, Rows};
+
+/// Assert that a type implements both Send and Sync at compile time.
+/// Usage: assert_send_sync!(MyType);
+/// Usage: assert_send_sync!(Type1, Type2, Type3);
+macro_rules! assert_send_sync {
+    ($($t:ty),+ $(,)?) => {
+        #[cfg(test)]
+        $(const _: () = {
+            const fn _assert_send<T: ?Sized + Send>() {}
+            const fn _assert_sync<T: ?Sized + Sync>() {}
+            _assert_send::<$t>();
+            _assert_sync::<$t>();
+        };)+
+    };
+}
+
+pub(crate) use assert_send_sync;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("SQL conversion failure: `{0}`")]
     ToSqlConversionFailure(BoxError),
-    #[error("Mutex lock error: {0}")]
-    MutexError(String),
-    #[error("SQL execution failure: `{0}`")]
-    SqlExecutionFailure(String),
-    #[error("WAL operation error: `{0}`")]
-    WalOperationError(String),
     #[error("Query returned no rows")]
     QueryReturnedNoRows,
     #[error("Conversion failure: `{0}`")]
     ConversionFailure(String),
+    #[error("{0}")]
+    Busy(String),
+    #[error("{0}")]
+    BusySnapshot(String),
+    #[error("{0}")]
+    Interrupt(String),
+    #[error("{0}")]
+    Error(String),
+    #[error("{0}")]
+    Misuse(String),
+    #[error("{0}")]
+    Constraint(String),
+    #[error("{0}")]
+    Readonly(String),
+    #[error("{0}")]
+    DatabaseFull(String),
+    #[error("{0}")]
+    NotAdb(String),
+    #[error("{0}")]
+    Corrupt(String),
+    #[error("I/O error: {0}")]
+    IoError(std::io::ErrorKind),
 }
 
-impl From<turso_core::LimboError> for Error {
-    fn from(err: turso_core::LimboError) -> Self {
-        Error::SqlExecutionFailure(err.to_string())
+impl From<turso_sdk_kit::rsapi::TursoError> for Error {
+    fn from(value: turso_sdk_kit::rsapi::TursoError) -> Self {
+        match value {
+            turso_sdk_kit::rsapi::TursoError::Busy(err) => Error::Busy(err),
+            turso_sdk_kit::rsapi::TursoError::BusySnapshot(err) => Error::BusySnapshot(err),
+            turso_sdk_kit::rsapi::TursoError::Interrupt(err) => Error::Interrupt(err),
+            turso_sdk_kit::rsapi::TursoError::Error(err) => Error::Error(err),
+            turso_sdk_kit::rsapi::TursoError::Misuse(err) => Error::Misuse(err),
+            turso_sdk_kit::rsapi::TursoError::Constraint(err) => Error::Constraint(err),
+            turso_sdk_kit::rsapi::TursoError::Readonly(err) => Error::Readonly(err),
+            turso_sdk_kit::rsapi::TursoError::DatabaseFull(err) => Error::DatabaseFull(err),
+            turso_sdk_kit::rsapi::TursoError::NotAdb(err) => Error::NotAdb(err),
+            turso_sdk_kit::rsapi::TursoError::Corrupt(err) => Error::Corrupt(err),
+            turso_sdk_kit::rsapi::TursoError::IoError(kind) => Error::IoError(kind),
+        }
     }
 }
 
 pub(crate) type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 pub type Result<T> = std::result::Result<T, Error>;
+pub type EncryptionOpts = turso_sdk_kit::rsapi::EncryptionOpts;
 
 /// A builder for `Database`.
 pub struct Builder {
     path: String,
     enable_encryption: bool,
+    enable_triggers: bool,
+    enable_attach: bool,
     vfs: Option<String>,
-    encryption_opts: Option<EncryptionOpts>,
+    encryption_opts: Option<turso_sdk_kit::rsapi::EncryptionOpts>,
 }
 
 impl Builder {
@@ -99,6 +148,8 @@ impl Builder {
         Self {
             path: path.to_string(),
             enable_encryption: false,
+            enable_triggers: false,
+            enable_attach: false,
             vfs: None,
             encryption_opts: None,
         }
@@ -109,8 +160,18 @@ impl Builder {
         self
     }
 
-    pub fn with_encryption(mut self, opts: EncryptionOpts) -> Self {
+    pub fn with_encryption(mut self, opts: turso_sdk_kit::rsapi::EncryptionOpts) -> Self {
         self.encryption_opts = Some(opts);
+        self
+    }
+
+    pub fn experimental_triggers(mut self, triggers_enabled: bool) -> Self {
+        self.enable_triggers = triggers_enabled;
+        self
+    }
+
+    pub fn experimental_attach(mut self, attach_enabled: bool) -> Self {
+        self.enable_attach = attach_enabled;
         self
     }
 
@@ -118,72 +179,41 @@ impl Builder {
         self.vfs = Some(vfs);
         self
     }
+    fn build_features_string(&self) -> Option<String> {
+        let mut features = Vec::new();
+        if self.enable_encryption {
+            features.push("encryption");
+        }
+        if self.enable_triggers {
+            features.push("triggers");
+        }
+        if self.enable_attach {
+            features.push("attach");
+        }
+        if features.is_empty() {
+            return None;
+        }
+        Some(features.join(","))
+    }
 
     /// Build the database.
     #[allow(unused_variables, clippy::arc_with_non_send_sync)]
     pub async fn build(self) -> Result<Database> {
-        let io = self.get_io()?;
-        let opts = turso_core::DatabaseOpts::default().with_encryption(self.enable_encryption);
-        let db = turso_core::Database::open_file_with_flags(
-            io,
-            self.path.as_str(),
-            OpenFlags::default(),
-            opts,
-            self.encryption_opts.clone(),
-        )?;
+        let features = self.build_features_string();
+        let db =
+            turso_sdk_kit::rsapi::TursoDatabase::new(turso_sdk_kit::rsapi::TursoDatabaseConfig {
+                path: self.path,
+                experimental_features: features,
+                async_io: false,
+                encryption: self.encryption_opts,
+                vfs: self.vfs,
+                io: None,
+                db_file: None,
+            });
+        let result = db.open()?;
+        // async_io is false - so db.open() will return result immediately
+        assert!(!result.is_io());
         Ok(Database { inner: db })
-    }
-
-    fn get_io(&self) -> Result<Arc<dyn turso_core::IO>> {
-        let vfs_choice = self.vfs.as_deref().unwrap_or("");
-
-        if self.path == ":memory:" && vfs_choice.is_empty() {
-            return Ok(Arc::new(turso_core::MemoryIO::new()));
-        }
-
-        match vfs_choice {
-            "memory" => Ok(Arc::new(turso_core::MemoryIO::new())),
-            "syscall" => {
-                #[cfg(all(target_family = "unix", not(miri)))]
-                {
-                    Ok(Arc::new(
-                        turso_core::UnixIO::new()
-                            .map_err(|e| Error::SqlExecutionFailure(e.to_string()))?,
-                    ))
-                }
-                #[cfg(any(not(target_family = "unix"), miri))]
-                {
-                    Ok(Arc::new(
-                        turso_core::PlatformIO::new()
-                            .map_err(|e| Error::SqlExecutionFailure(e.to_string()))?,
-                    ))
-                }
-            }
-            #[cfg(all(target_os = "linux", not(miri)))]
-            "io_uring" => Ok(Arc::new(
-                turso_core::UringIO::new()
-                    .map_err(|e| Error::SqlExecutionFailure(e.to_string()))?,
-            )),
-            #[cfg(any(not(target_os = "linux"), miri))]
-            "io_uring" => Err(Error::SqlExecutionFailure(
-                "io_uring is only available on Linux targets".to_string(),
-            )),
-            "" => {
-                // Default behavior: memory for ":memory:", platform IO for files
-                if self.path == ":memory:" {
-                    Ok(Arc::new(turso_core::MemoryIO::new()))
-                } else {
-                    Ok(Arc::new(
-                        turso_core::PlatformIO::new()
-                            .map_err(|e| Error::SqlExecutionFailure(e.to_string()))?,
-                    ))
-                }
-            }
-            _ => Ok(Arc::new(
-                turso_core::PlatformIO::new()
-                    .map_err(|e| Error::SqlExecutionFailure(e.to_string()))?,
-            )),
-        }
     }
 }
 
@@ -192,11 +222,8 @@ impl Builder {
 /// The `Database` object points to a database and allows you to connect to it
 #[derive(Clone)]
 pub struct Database {
-    inner: Arc<turso_core::Database>,
+    inner: Arc<turso_sdk_kit::rsapi::TursoDatabase>,
 }
-
-unsafe impl Send for Database {}
-unsafe impl Sync for Database {}
 
 impl Debug for Database {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -208,32 +235,22 @@ impl Database {
     /// Connect to the database.
     pub fn connect(&self) -> Result<Connection> {
         let conn = self.inner.connect()?;
-        Ok(Connection::create(conn))
+        Ok(Connection::create(conn, None))
     }
 }
 
 /// A prepared statement.
+#[derive(Clone)]
 pub struct Statement {
-    inner: Arc<Mutex<turso_core::Statement>>,
+    conn: Connection,
+    inner: Arc<Mutex<Box<turso_sdk_kit::rsapi::TursoStatement>>>,
 }
-
-impl Clone for Statement {
-    fn clone(&self) -> Self {
-        Self {
-            inner: Arc::clone(&self.inner),
-        }
-    }
-}
-
-unsafe impl Send for Statement {}
-unsafe impl Sync for Statement {}
 
 struct Execute {
-    stmt: Arc<Mutex<turso_core::Statement>>,
+    stmt: Statement,
 }
 
-unsafe impl Send for Execute {}
-unsafe impl Sync for Execute {}
+assert_send_sync!(Execute);
 
 impl Future for Execute {
     type Output = Result<u64>;
@@ -242,52 +259,69 @@ impl Future for Execute {
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
-        let mut stmt = self.stmt.lock().unwrap();
-        match stmt.step_with_waker(cx.waker()) {
-            Ok(turso_core::StepResult::Row) => Poll::Ready(Err(Error::SqlExecutionFailure(
-                "unexpected row during execution".to_string(),
-            ))),
-            Ok(turso_core::StepResult::Done) => {
-                let changes = stmt.n_change();
-                assert!(changes >= 0);
-                Poll::Ready(Ok(changes as u64))
+        match self.stmt.step(None, cx)? {
+            Poll::Ready(_) => {
+                let n_change = self.stmt.inner.lock().unwrap().n_change();
+                Poll::Ready(Ok(n_change as u64))
             }
-            Ok(turso_core::StepResult::IO) => {
-                stmt._io().step()?;
-                Poll::Pending
-            }
-            Ok(turso_core::StepResult::Busy) => Poll::Ready(Err(Error::SqlExecutionFailure(
-                "database is locked".to_string(),
-            ))),
-            Ok(turso_core::StepResult::Interrupt) => {
-                Poll::Ready(Err(Error::SqlExecutionFailure("interrupted".to_string())))
-            }
-            Err(err) => Poll::Ready(Err(err.into())),
+            Poll::Pending => Poll::Pending,
         }
     }
 }
 
 impl Statement {
+    fn step(
+        &self,
+        columns: Option<usize>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Result<Option<Row>>> {
+        let mut stmt = self.inner.lock().unwrap();
+        match stmt.step(Some(cx.waker()))? {
+            turso_sdk_kit::rsapi::TursoStatusCode::Row => {
+                if let Some(columns) = columns {
+                    let mut values = Vec::with_capacity(columns);
+                    for i in 0..columns {
+                        let value = stmt.row_value(i)?;
+                        values.push(value.to_owned());
+                    }
+                    Poll::Ready(Ok(Some(Row { values })))
+                } else {
+                    Poll::Ready(Err(Error::Misuse(
+                        "unexpected row during execution".to_string(),
+                    )))
+                }
+            }
+            turso_sdk_kit::rsapi::TursoStatusCode::Done => Poll::Ready(Ok(None)),
+            turso_sdk_kit::rsapi::TursoStatusCode::Io => {
+                stmt.run_io()?;
+                if let Some(extra_io) = &self.conn.extra_io {
+                    extra_io(cx.waker().clone())?;
+                }
+                Poll::Pending
+            }
+        }
+    }
     /// Query the database with this prepared statement.
     pub async fn query(&mut self, params: impl IntoParams) -> Result<Rows> {
+        self.reset()?;
+
+        let mut stmt = self.inner.lock().unwrap();
         let params = params.into_params()?;
         match params {
             params::Params::None => (),
             params::Params::Positional(values) => {
                 for (i, value) in values.into_iter().enumerate() {
-                    let mut stmt = self.inner.lock().unwrap();
-                    stmt.bind_at(NonZero::new(i + 1).unwrap(), value.into());
+                    stmt.bind_positional(i + 1, value.into())?;
                 }
             }
             params::Params::Named(values) => {
                 for (name, value) in values.into_iter() {
-                    let mut stmt = self.inner.lock().unwrap();
-                    let i = stmt.parameters().index(name).unwrap();
-                    stmt.bind_at(i, value.into());
+                    let position = stmt.named_position(name)?;
+                    stmt.bind_positional(position, value.into())?;
                 }
             }
         }
-        let rows = Rows::new(&self.inner);
+        let rows = Rows::new(self.clone());
         Ok(rows)
     }
 
@@ -295,7 +329,7 @@ impl Statement {
     pub async fn execute(&mut self, params: impl IntoParams) -> Result<u64> {
         {
             // Reset the statement before executing
-            self.inner.lock().unwrap().reset();
+            self.inner.lock().unwrap().reset()?;
         }
         let params = params.into_params()?;
         match params {
@@ -303,24 +337,19 @@ impl Statement {
             params::Params::Positional(values) => {
                 for (i, value) in values.into_iter().enumerate() {
                     let mut stmt = self.inner.lock().unwrap();
-                    stmt.bind_at(NonZero::new(i + 1).unwrap(), value.into());
+                    stmt.bind_positional(i + 1, value.into())?;
                 }
             }
             params::Params::Named(values) => {
                 for (name, value) in values.into_iter() {
                     let mut stmt = self.inner.lock().unwrap();
-                    let i = stmt.parameters().index(&name).ok_or(
-                        turso_core::LimboError::InvalidArgument(
-                            format!("Unknown parameter '{name}' for query '{}'. Make sure you're using the correct parameter syntax - named: (:foo), positional: (?, ?)", stmt.get_sql())
-                        ))?;
-                    stmt.bind_at(i, value.into());
+                    let position = stmt.named_position(name)?;
+                    stmt.bind_positional(position, value.into())?;
                 }
             }
         }
 
-        let execute = Execute {
-            stmt: self.inner.clone(),
-        };
+        let execute = Execute { stmt: self.clone() };
         execute.await
     }
 
@@ -328,12 +357,15 @@ impl Statement {
     pub fn columns(&self) -> Vec<Column> {
         let stmt = self.inner.lock().unwrap();
 
-        let n = stmt.num_columns();
+        let n = stmt.column_count();
 
         let mut cols = Vec::with_capacity(n);
 
         for i in 0..n {
-            let name = stmt.get_column_name(i).into_owned();
+            let name = stmt
+                .column_name(i)
+                .expect("column index must be within valid range")
+                .into_owned();
             cols.push(Column {
                 name,
                 decl_type: None, // TODO
@@ -344,9 +376,10 @@ impl Statement {
     }
 
     /// Reset internal statement state after previous execution so it can be reused again
-    pub fn reset(&self) {
+    pub fn reset(&self) -> Result<()> {
         let mut stmt = self.inner.lock().unwrap();
-        stmt.reset();
+        stmt.reset()?;
+        Ok(())
     }
 
     /// Execute a query that returns the first [`Row`].
@@ -518,7 +551,7 @@ mod tests {
 
         match query_result_after_wal_delete {
             Ok(_) => panic!("Query succeeded after WAL deletion and DB reopen, but was expected to fail because the table definition should have been in the WAL."),
-            Err(Error::SqlExecutionFailure(msg)) => {
+            Err(Error::Error(msg)) => {
                 assert!(
                     msg.contains("no such table: test_large_persistence"),
                     "Expected 'test_large_persistence not found' error, but got: {msg}"

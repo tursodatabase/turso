@@ -1,12 +1,14 @@
 // This module contains code for emitting bytecode instructions for SQL query execution.
 // It handles translating high-level SQL operations into low-level bytecode that can be executed by the virtual machine.
 
-use std::collections::HashMap;
+use crate::sync::Arc;
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::num::NonZeroUsize;
-use std::sync::Arc;
 
 use tracing::{instrument, Level};
-use turso_parser::ast::{self, Expr, Literal, TriggerEvent, TriggerTime};
+use turso_parser::ast::{
+    self, Expr, Literal, ResolveType, SubqueryType, TableInternalId, TriggerEvent, TriggerTime,
+};
 
 use super::aggregation::emit_ungrouped_aggregation;
 use super::expr::translate_expr;
@@ -18,27 +20,31 @@ use super::main_loop::{
 };
 use super::order_by::{emit_order_by, init_order_by, SortMetadata};
 use super::plan::{
-    Distinctness, JoinOrderMember, Operation, Scan, SelectPlan, TableReferences, UpdatePlan,
+    Distinctness, JoinOrderMember, Operation, Scan, SeekKeyComponent, SelectPlan, TableReferences,
+    UpdatePlan,
 };
 use super::select::emit_simple_count;
 use super::subquery::emit_from_clause_subqueries;
-use crate::error::SQLITE_CONSTRAINT_PRIMARYKEY;
+use crate::error::{SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE};
 use crate::function::Func;
 use crate::schema::{BTreeTable, Column, Index, IndexColumn, Schema, Table, ROWID_SENTINEL};
 use crate::translate::compound_select::emit_program_for_compound_select;
 use crate::translate::expr::{
-    bind_and_rewrite_expr, emit_returning_results, translate_expr_no_constant_opt, walk_expr_mut,
-    BindingBehavior, NoConstantOptReason, WalkControl,
+    bind_and_rewrite_expr, emit_returning_results, rewrite_between_expr,
+    translate_expr_no_constant_opt, walk_expr, walk_expr_mut, BindingBehavior, NoConstantOptReason,
+    WalkControl,
 };
 use crate::translate::fkeys::{
-    build_index_affinity_string, emit_fk_child_update_counters,
-    emit_fk_delete_parent_existence_checks, emit_guarded_fk_decrement,
-    emit_parent_key_change_checks, open_read_index, open_read_table, stabilize_new_row_for_fk,
+    build_index_affinity_string, emit_fk_child_update_counters, emit_fk_update_parent_actions,
+    emit_guarded_fk_decrement, fire_fk_delete_actions, fire_fk_update_actions, open_read_index,
+    open_read_table, stabilize_new_row_for_fk,
 };
 use crate::translate::plan::{
-    DeletePlan, EvalAt, JoinedTable, Plan, QueryDestination, ResultSetColumn, Search,
+    DeletePlan, EphemeralRowidMode, EvalAt, IndexMethodQuery, JoinedTable, NonFromClauseSubquery,
+    Plan, QueryDestination, ResultSetColumn, Search,
 };
 use crate::translate::planner::ROWID_STRS;
+use crate::translate::planner::{table_mask_from_expr, TableMask};
 use crate::translate::subquery::emit_non_from_clause_subquery;
 use crate::translate::trigger_exec::{
     fire_trigger, get_relevant_triggers_type_and_time, has_relevant_triggers_type_only,
@@ -46,13 +52,50 @@ use crate::translate::trigger_exec::{
 };
 use crate::translate::values::emit_values;
 use crate::translate::window::{emit_window_results, init_window, WindowMetadata};
-use crate::util::{exprs_are_equivalent, normalize_ident};
+use crate::util::{exprs_are_equivalent, normalize_ident, parse_numeric_literal};
 use crate::vdbe::affinity::Affinity;
 use crate::vdbe::builder::{CursorKey, CursorType, ProgramBuilder};
-use crate::vdbe::insn::{CmpInsFlags, IdxInsertFlags, InsertFlags, RegisterOrLiteral};
-use crate::vdbe::{insn::Insn, BranchOffset};
-use crate::Connection;
-use crate::{bail_parse_error, Result, SymbolTable};
+use crate::vdbe::insn::{
+    to_u16, {CmpInsFlags, IdxInsertFlags, InsertFlags, RegisterOrLiteral},
+};
+use crate::vdbe::{insn::Insn, BranchOffset, CursorID};
+use crate::{bail_parse_error, emit_explain, Result, SymbolTable};
+use crate::{turso_assert, Connection, QueryMode};
+
+/// Initialize EXISTS subquery result registers to 0, but only for subqueries that haven't
+/// been evaluated yet (i.e., correlated subqueries that will be evaluated in the loop).
+/// Non-correlated EXISTS subqueries are evaluated before the loop and their result_reg
+/// is already properly initialized and populated by emit_non_from_clause_subquery.
+fn init_exists_result_regs(
+    program: &mut ProgramBuilder,
+    expr: &ast::Expr,
+    non_from_clause_subqueries: &[NonFromClauseSubquery],
+) {
+    let _ = walk_expr(expr, &mut |e| {
+        if let ast::Expr::SubqueryResult {
+            subquery_id,
+            query_type: SubqueryType::Exists { result_reg },
+            ..
+        } = e
+        {
+            // Only initialize if the subquery hasn't been evaluated yet.
+            // Non-correlated EXISTS subqueries are evaluated before the loop and their
+            // result_reg is already set correctly. Initializing them here would overwrite
+            // the correct result with 0.
+            let already_evaluated = non_from_clause_subqueries
+                .iter()
+                .find(|s| s.internal_id == *subquery_id)
+                .is_some_and(|s| s.has_been_evaluated());
+            if !already_evaluated {
+                program.emit_insn(Insn::Integer {
+                    value: 0,
+                    dest: *result_reg,
+                });
+            }
+        }
+        Ok(WalkControl::Continue)
+    });
+}
 
 pub struct Resolver<'a> {
     pub schema: &'a Schema,
@@ -85,10 +128,15 @@ impl<'a> Resolver<'a> {
         self.expr_to_reg_cache_enabled = true;
     }
 
+    /// Returns the register for a previously translated expression, if caching is enabled.
+    ///
+    /// We scan from newest to oldest so later translations win when equivalent
+    /// expressions are seen multiple times in the same translation pass.
     pub fn resolve_cached_expr_reg(&self, expr: &ast::Expr) -> Option<usize> {
         if self.expr_to_reg_cache_enabled {
             self.expr_to_reg_cache
                 .iter()
+                .rev()
                 .find(|(e, _)| exprs_are_equivalent(expr, e))
                 .map(|(_, reg)| *reg)
         } else {
@@ -105,6 +153,58 @@ pub struct LimitCtx {
     /// There are cases like compound SELECTs where all the sub-selects
     /// utilize the same limit register, but it is initialized only once.
     pub initialize_counter: bool,
+}
+
+/// Identifies a value stored in a materialized hash-build input.
+///
+/// These references are used to map payload registers back to the original
+/// table expressions during hash-probe evaluation. They are deliberately
+/// table-qualified so payloads can span multiple tables when the build input
+/// is derived from a join prefix.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum MaterializedColumnRef {
+    /// A concrete column from a specific table, including rowid alias metadata.
+    Column {
+        table_id: TableInternalId,
+        column_idx: usize,
+        is_rowid_alias: bool,
+    },
+    /// The implicit rowid (or integer primary key) of a specific table.
+    RowId { table_id: TableInternalId },
+}
+
+/// Describes how a hash-join build input was materialized.
+///
+/// Rowid-only materialization preserves prior join constraints while keeping
+/// the hash table payload small, but requires `SeekRowid` into the build table
+/// during probing. Key+payload materialization stores the join keys and needed
+/// payload columns directly so the hash build can operate without seeking.
+#[derive(Debug, Clone)]
+pub enum MaterializedBuildInputMode {
+    /// Ephemeral table contains only build-side rowids.
+    RowidOnly,
+    /// Ephemeral table contains join keys followed by payload columns.
+    KeyPayload {
+        /// Number of join keys stored at the start of each row.
+        num_keys: usize,
+        /// Payload columns (after the keys) in ephemeral-table order.
+        payload_columns: Vec<MaterializedColumnRef>,
+    },
+}
+
+/// Metadata for a materialized build input keyed by build table index.
+///
+/// The cursor refers to the ephemeral table containing the materialized rows.
+/// `prefix_tables` tracks which join-prefix tables were captured so we can
+/// prune redundant scans from downstream join orders.
+#[derive(Debug, Clone)]
+pub struct MaterializedBuildInput {
+    /// Cursor id for the ephemeral table holding the materialized rows.
+    pub cursor_id: CursorID,
+    /// Encoding mode for the materialized rows.
+    pub mode: MaterializedBuildInputMode,
+    /// Join-prefix table indices folded into this materialization.
+    pub prefix_tables: Vec<usize>,
 }
 
 impl LimitCtx {
@@ -136,9 +236,11 @@ pub struct HashCtx {
     /// Starting register where payload columns are stored after HashProbe/HashNext.
     /// None if payload optimization is not used for this hash join.
     pub payload_start_reg: Option<usize>,
-    /// Column indices from the build table that are stored in payload, in order.
-    /// payload_start_reg + i contains the value for column payload_columns[i].
-    pub payload_columns: Vec<usize>,
+    /// Column references stored in payload, in order.
+    /// `payload_start_reg + i` contains the value for `payload_columns[i]`.
+    /// These references may point at multiple tables when a build input was
+    /// materialized from a join prefix.
+    pub payload_columns: Vec<MaterializedColumnRef>,
 }
 
 /// The TranslateCtx struct holds various information and labels used during bytecode generation.
@@ -172,8 +274,11 @@ pub struct TranslateCtx<'a> {
     pub meta_left_joins: Vec<Option<LeftJoinMetadata>>,
     pub resolver: Resolver<'a>,
     /// Hash table contexts for hash joins, keyed by build table index.
-    /// Supports multiple hash joins in chain patterns.
     pub hash_table_contexts: HashMap<usize, HashCtx>,
+    /// Materialized build inputs for hash joins, keyed by build table index.
+    /// These entries are reused during nested materialization so we avoid
+    /// re-scanning prefix tables and preserve prior join constraints.
+    pub materialized_build_inputs: HashMap<usize, MaterializedBuildInput>,
     /// A list of expressions that are not aggregates, along with a flag indicating
     /// whether the expression should be included in the output for each group.
     ///
@@ -209,7 +314,8 @@ impl<'a> TranslateCtx<'a> {
             meta_group_by: None,
             meta_left_joins: (0..table_count).map(|_| None).collect(),
             meta_sort: None,
-            hash_table_contexts: HashMap::new(),
+            hash_table_contexts: HashMap::default(),
+            materialized_build_inputs: HashMap::default(),
             resolver: Resolver::new(schema, syms),
             non_aggregate_expressions: Vec::new(),
             cdc_cursor_id: None,
@@ -268,7 +374,9 @@ pub fn emit_program(
         Plan::Select(plan) => emit_program_for_select(program, resolver, plan),
         Plan::Delete(plan) => emit_program_for_delete(connection, resolver, program, plan),
         Plan::Update(plan) => emit_program_for_update(connection, resolver, program, plan, after),
-        Plan::CompoundSelect { .. } => emit_program_for_compound_select(program, resolver, plan),
+        Plan::CompoundSelect { .. } => {
+            emit_program_for_compound_select(program, resolver, plan).map(|_| ())
+        }
     }
 }
 
@@ -278,12 +386,28 @@ pub fn emit_program_for_select(
     resolver: &Resolver,
     mut plan: SelectPlan,
 ) -> Result<()> {
+    let materialized_build_inputs = emit_materialized_build_inputs(program, resolver, &mut plan)?;
+    emit_program_for_select_with_inputs(program, resolver, plan, materialized_build_inputs)
+}
+
+/// Returns the single-column schema used by rowid-only hash build inputs.
+fn build_rowid_column() -> Column {
+    Column::new_default_integer(Some("build_rowid".to_string()), "INTEGER".to_string(), None)
+}
+
+fn emit_program_for_select_with_inputs(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    mut plan: SelectPlan,
+    materialized_build_inputs: HashMap<usize, MaterializedBuildInput>,
+) -> Result<()> {
     let mut t_ctx = TranslateCtx::new(
         program,
         resolver.schema,
         resolver.symbol_table,
         plan.table_references.joined_tables().len(),
     );
+    t_ctx.materialized_build_inputs = materialized_build_inputs;
 
     // Emit main parts of query
     emit_query(program, &mut plan, &mut t_ctx)?;
@@ -291,6 +415,693 @@ pub fn emit_program_for_select(
     program.result_columns = plan.result_columns;
     program.table_references.extend(plan.table_references);
     Ok(())
+}
+
+#[derive(Debug, Clone)]
+/// Captures the parameters needed to materialize one hash-build input.
+struct MaterializationSpec {
+    build_table_idx: usize,
+    probe_table_idx: usize,
+    mode: MaterializedBuildInputMode,
+    prefix_tables: Vec<usize>,
+    key_exprs: Vec<Expr>,
+    payload_columns: Vec<MaterializedColumnRef>,
+}
+
+/// Build materialized hash-build inputs for hash joins that depend on prior joins.
+///
+/// A materialized build input is an ephemeral table that captures the rows
+/// a hash join is allowed to build from after earlier joins and filters have
+/// been applied. This prevents the build side from being re-scanned in its
+/// full, unfiltered form when prior join constraints must be respected.
+///
+/// The materialization uses a join-prefix: all tables that appear before the
+/// probe table in the join order, plus the build table itself. This prefix
+/// represents the minimal context needed to evaluate build-side constraints.
+/// For probe->build chaining we store join keys and payload columns directly
+/// in the ephemeral table; otherwise we only store rowids and `SeekRowid`
+/// during probing when needed.
+fn emit_materialized_build_inputs(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    plan: &mut SelectPlan,
+) -> Result<HashMap<usize, MaterializedBuildInput>> {
+    let mut build_inputs: HashMap<usize, MaterializedBuildInput> = HashMap::default();
+    let mut materializations: Vec<MaterializationSpec> = Vec::new();
+    let mut hash_tables_to_keep_open: HashSet<usize> = HashSet::default();
+
+    // Keep hash tables open while running materialization subplans so we can reuse them.
+    // A build table may appear in multiple hash joins when chaining, so we do not
+    // treat repeated build tables as an error.
+    for table in plan.table_references.joined_tables().iter() {
+        if let Operation::HashJoin(hash_join_op) = &table.op {
+            let build_table = &plan.table_references.joined_tables()[hash_join_op.build_table_idx];
+            hash_tables_to_keep_open.insert(build_table.internal_id.into());
+        }
+    }
+
+    let mut seen_build_tables: HashSet<usize> = HashSet::default();
+
+    // decide per-hash-join materialization mode (rowid-only vs key+payload).
+    for member in plan.join_order.iter() {
+        let table = &plan.table_references.joined_tables()[member.original_idx];
+        if let Operation::HashJoin(hash_join_op) = &table.op {
+            if !hash_join_op.materialize_build_input
+                || !seen_build_tables.insert(hash_join_op.build_table_idx)
+            {
+                continue;
+            }
+
+            let probe_table_idx = hash_join_op.probe_table_idx;
+            let probe_pos = plan
+                .join_order
+                .iter()
+                .position(|member| member.original_idx == probe_table_idx)
+                .unwrap_or(plan.join_order.len());
+            let build_table_was_prior_probe = plan.join_order[..probe_pos].iter().any(|member| {
+                let table_ref = &plan.table_references.joined_tables()[member.original_idx];
+                matches!(
+                    table_ref.op,
+                    Operation::HashJoin(ref hj) if hj.probe_table_idx == hash_join_op.build_table_idx
+                )
+            });
+
+            // The join prefix is the set of tables we include when building this hash
+            // input (all tables before the probe + the build table). If the prefix
+            // has *any* table besides the build table, then rowid-only materialization
+            // is unsafe. Here's why:
+            //
+            // Rowid-only keeps each build-table rowid at most once. That throws away
+            // which prefix row it came from, so we lose the one-to-one link between
+            // a prefix match and a build row.
+            //
+            // Example (t1 is a left-side table earlier in the join order):
+            //   t1 rows:     t1_1(c=1), t1_2(c=2)
+            //   t2 rows:     t2_7(c=1), t2_8(c=2)   (build table)
+            //   t3 rows:     one row per t2 row
+            //
+            // Correct result after joining:
+            //   t1_1 + t2_7 + t2_7's t3 row
+            //   t1_2 + t2_8 + t2_8's t3 row   (2 rows)
+            //
+            // Key+payload materialization lets us PRUNE the prefix tables (like t1)
+            // from the main join order, because their needed columns now live in
+            // the payload. So the main plan does NOT loop t1 again.
+            //
+            // However, rowid-only materialization keeps just {t2_7, t2_8} with no link to t1_1/t1_2.
+            // Since t1 stays in the main join loop, each t1 row joins against the
+            // materialized t2 set. With no t1→t2 correlation, every t1 row matches
+            // both t2 rows, incorrectly producing 4 rows (a cross product).
+            //
+            // Therefore: if the prefix has other tables, we must store key+payload
+            // rows so each prefix match stays distinct and the main plan can drop
+            // the prefix loops.
+            let (_, included_tables) =
+                materialization_prefix(plan, hash_join_op.build_table_idx, probe_table_idx)?;
+            let prefix_has_other_tables = included_tables
+                .iter()
+                .any(|table_idx| *table_idx != hash_join_op.build_table_idx);
+
+            if build_table_was_prior_probe || prefix_has_other_tables {
+                // Prior probe -> build chaining OR any multi-table prefix requires keys+payload
+                // so we do not lose multiplicity or correlation.
+                let payload_columns = collect_materialized_payload_columns(plan, &included_tables)?;
+                let key_exprs: Vec<Expr> = hash_join_op
+                    .join_keys
+                    .iter()
+                    .map(|key| key.get_build_expr(&plan.where_clause).clone())
+                    .collect();
+                let mode = MaterializedBuildInputMode::KeyPayload {
+                    num_keys: key_exprs.len(),
+                    payload_columns: payload_columns.clone(),
+                };
+                materializations.push(MaterializationSpec {
+                    build_table_idx: hash_join_op.build_table_idx,
+                    probe_table_idx,
+                    mode,
+                    prefix_tables: included_tables,
+                    key_exprs,
+                    payload_columns,
+                });
+            } else {
+                // Single-table prefix: a rowid list preserves the build-side filters
+                // without losing multiplicity (as explained in the comment above).
+                materializations.push(MaterializationSpec {
+                    build_table_idx: hash_join_op.build_table_idx,
+                    probe_table_idx,
+                    mode: MaterializedBuildInputMode::RowidOnly,
+                    prefix_tables: Vec::new(),
+                    key_exprs: Vec::new(),
+                    payload_columns: Vec::new(),
+                });
+            }
+        }
+    }
+
+    // Now we emit each of the materialization subplans into an ephemeral table.
+    for spec in materializations.iter() {
+        let build_table = &plan.table_references.joined_tables()[spec.build_table_idx];
+        let build_table_name = if build_table.table.get_name() == build_table.identifier {
+            build_table.identifier.clone()
+        } else {
+            format!(
+                "{} AS {}",
+                build_table.table.get_name(),
+                build_table.identifier
+            )
+        };
+        let internal_id = program.table_reference_counter.next();
+        let columns = match &spec.mode {
+            MaterializedBuildInputMode::RowidOnly => vec![build_rowid_column()],
+            MaterializedBuildInputMode::KeyPayload {
+                num_keys,
+                payload_columns,
+            } => build_materialized_input_columns(*num_keys, payload_columns),
+        };
+        let ephemeral_table = Arc::new(BTreeTable {
+            root_page: 0,
+            name: format!("hash_build_input_{internal_id}"),
+            has_rowid: true,
+            has_autoincrement: false,
+            primary_key_columns: vec![],
+            columns,
+            is_strict: false,
+            unique_sets: vec![],
+            foreign_keys: vec![],
+        });
+        let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(ephemeral_table.clone()));
+
+        // Build a plan that emits only rowids for the build table using the join prefix
+        // that makes the hash join legal (including any earlier hash joins).
+        let materialize_plan = build_materialized_build_input_plan(
+            plan,
+            spec.build_table_idx,
+            spec.probe_table_idx,
+            cursor_id,
+            ephemeral_table,
+            &spec.mode,
+            &spec.key_exprs,
+            &spec.payload_columns,
+            &build_inputs,
+        )?;
+
+        // Make the materialization plan show up as a subtree in EXPLAIN QUERY PLAN output.
+        emit_explain!(
+            program,
+            true,
+            format!("MATERIALIZE hash build input for {build_table_name}")
+        );
+        program.emit_insn(Insn::OpenEphemeral {
+            cursor_id,
+            is_table: true,
+        });
+        program.incr_nesting();
+        program.set_hash_tables_to_keep_open(&hash_tables_to_keep_open);
+        emit_program_for_select_with_inputs(
+            program,
+            resolver,
+            materialize_plan,
+            build_inputs.clone(),
+        )?;
+        program.clear_hash_tables_to_keep_open();
+        program.decr_nesting();
+        program.pop_current_parent_explain();
+
+        build_inputs.insert(
+            spec.build_table_idx,
+            MaterializedBuildInput {
+                cursor_id,
+                mode: spec.mode.clone(),
+                prefix_tables: spec.prefix_tables.clone(),
+            },
+        );
+    }
+
+    // Drop any join-prefix tables already captured by key+payload materializations.
+    prune_join_order_for_materialized_inputs(plan, &build_inputs)?;
+
+    #[cfg(debug_assertions)]
+    turso_assert!(
+        {
+            let join_order_tables: HashSet<_> = plan
+                .join_order
+                .iter()
+                .map(|member| member.original_idx)
+                .collect();
+            let build_tables_in_plan: HashSet<_> = plan
+                .join_order
+                .iter()
+                .filter_map(|member| {
+                    let table = &plan.table_references.joined_tables()[member.original_idx];
+                    if let Operation::HashJoin(hash_join_op) = &table.op {
+                        Some(hash_join_op.build_table_idx)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            build_inputs.iter().all(|(build_table_idx, input)| {
+                if !build_tables_in_plan.contains(build_table_idx) {
+                    return true;
+                }
+                if !matches!(input.mode, MaterializedBuildInputMode::KeyPayload { .. }) {
+                    return true;
+                }
+                input
+                    .prefix_tables
+                    .iter()
+                    .all(|table_idx| !join_order_tables.contains(table_idx))
+            })
+        },
+        "materialized build input prefix table still present in join order"
+    );
+    Ok(build_inputs)
+}
+
+/// Remove join-order entries already satisfied by key+payload materializations.
+///
+/// This prevents redundant scans (and cross products) when a hash-build input
+/// already captures a join prefix. It also marks fully covered WHERE terms as
+/// consumed so they are not re-applied later in the main plan.
+fn prune_join_order_for_materialized_inputs(
+    plan: &mut SelectPlan,
+    build_inputs: &HashMap<usize, MaterializedBuildInput>,
+) -> Result<()> {
+    if build_inputs.is_empty() {
+        return Ok(());
+    }
+
+    let mut build_tables_in_plan = HashSet::default();
+    for member in plan.join_order.iter() {
+        let table = &plan.table_references.joined_tables()[member.original_idx];
+        if let Operation::HashJoin(hash_join_op) = &table.op {
+            build_tables_in_plan.insert(hash_join_op.build_table_idx);
+        }
+    }
+
+    let mut tables_to_remove: HashSet<usize> = HashSet::default();
+    for (build_table_idx, input) in build_inputs.iter() {
+        if !build_tables_in_plan.contains(build_table_idx) {
+            continue;
+        }
+        if matches!(input.mode, MaterializedBuildInputMode::KeyPayload { .. }) {
+            tables_to_remove.extend(input.prefix_tables.iter().copied());
+        }
+    }
+
+    if tables_to_remove.is_empty() {
+        return Ok(());
+    }
+
+    let prefix_mask = TableMask::from_table_number_iter(tables_to_remove.iter().copied());
+    for term in plan.where_clause.iter_mut() {
+        if term.consumed {
+            continue;
+        }
+        let mask = table_mask_from_expr(
+            &term.expr,
+            &plan.table_references,
+            &plan.non_from_clause_subqueries,
+        )?;
+        if prefix_mask.contains_all(&mask) {
+            term.consumed = true;
+        }
+    }
+    plan.join_order
+        .retain(|member| !tables_to_remove.contains(&member.original_idx));
+    Ok(())
+}
+
+/// Compute the join-prefix used to materialize a hash-build input.
+///
+/// The prefix consists of all tables before the probe table plus the build
+/// table itself (if not already present). The returned `included_tables`
+/// list also includes build tables of earlier hash joins so payload collection
+/// can capture all referenced columns.
+fn materialization_prefix(
+    plan: &SelectPlan,
+    build_table_idx: usize,
+    probe_table_idx: usize,
+) -> Result<(Vec<JoinOrderMember>, Vec<usize>)> {
+    let mut join_order = plan.join_order.clone();
+    if join_order
+        .iter()
+        .all(|member| member.original_idx != probe_table_idx)
+    {
+        let probe_table = &plan.table_references.joined_tables()[probe_table_idx];
+        join_order.push(JoinOrderMember {
+            table_id: probe_table.internal_id,
+            original_idx: probe_table_idx,
+            is_outer: probe_table
+                .join_info
+                .as_ref()
+                .is_some_and(|join_info| join_info.outer),
+        });
+    }
+    let probe_pos = join_order
+        .iter()
+        .position(|m| m.original_idx == probe_table_idx)
+        .expect("probe table just ensured in join order");
+
+    // Only include tables prior to the probe table. The materialization subplan
+    // should filter the build table using prior join constraints, not scan the probe.
+    let mut prefix_join_order = join_order[..probe_pos].to_vec();
+    if prefix_join_order
+        .iter()
+        .all(|member| member.original_idx != build_table_idx)
+    {
+        let build_table = &plan.table_references.joined_tables()[build_table_idx];
+        prefix_join_order.push(JoinOrderMember {
+            table_id: build_table.internal_id,
+            original_idx: build_table_idx,
+            is_outer: build_table
+                .join_info
+                .as_ref()
+                .is_some_and(|join_info| join_info.outer),
+        });
+    }
+
+    let mut included_tables: Vec<usize> =
+        prefix_join_order.iter().map(|m| m.original_idx).collect();
+    for member in prefix_join_order.iter() {
+        let table_ref = &plan.table_references.joined_tables()[member.original_idx];
+        if let Operation::HashJoin(hash_join_op) = &table_ref.op {
+            included_tables.push(hash_join_op.build_table_idx);
+        }
+    }
+    included_tables.sort_unstable();
+    included_tables.dedup();
+
+    Ok((prefix_join_order, included_tables))
+}
+
+/// Collect the payload columns needed for a materialized build input.
+///
+/// This gathers referenced columns from the included tables and always adds
+/// rowids for tables that have them so probe-side expressions can be satisfied
+/// without seeking back into base tables.
+fn collect_materialized_payload_columns(
+    plan: &SelectPlan,
+    included_tables: &[usize],
+) -> Result<Vec<MaterializedColumnRef>> {
+    let mut payload_columns: Vec<MaterializedColumnRef> = Vec::new();
+    let mut seen: HashSet<MaterializedColumnRef> = HashSet::default();
+    for table_idx in included_tables.iter().copied() {
+        let table = &plan.table_references.joined_tables()[table_idx];
+        for col_idx in table.col_used_mask.iter() {
+            let is_rowid_alias = table
+                .columns()
+                .get(col_idx)
+                .is_some_and(|col| col.is_rowid_alias());
+            let col_ref = MaterializedColumnRef::Column {
+                table_id: table.internal_id,
+                column_idx: col_idx,
+                is_rowid_alias,
+            };
+            if seen.insert(col_ref.clone()) {
+                payload_columns.push(col_ref);
+            }
+        }
+        if table.btree().is_some_and(|btree| btree.has_rowid) {
+            let rowid_ref = MaterializedColumnRef::RowId {
+                table_id: table.internal_id,
+            };
+            if seen.insert(rowid_ref.clone()) {
+                payload_columns.push(rowid_ref);
+            }
+        }
+    }
+    Ok(payload_columns)
+}
+
+/// Build the ephemeral-table schema for key+payload materializations.
+///
+/// Keys are stored first (typed as BLOB for join-key affinity handling),
+/// followed by payload columns with integer or blob affinity.
+fn build_materialized_input_columns(
+    num_keys: usize,
+    payload_columns: &[MaterializedColumnRef],
+) -> Vec<Column> {
+    let mut columns = Vec::with_capacity(num_keys + payload_columns.len());
+    for i in 0..num_keys {
+        columns.push(Column::new_default_text(
+            Some(format!("key_{i}")),
+            "BLOB".to_string(),
+            None,
+        ));
+    }
+    for (i, payload) in payload_columns.iter().enumerate() {
+        let name = Some(format!("payload_{i}"));
+        let column = match payload {
+            MaterializedColumnRef::RowId { .. } => {
+                Column::new_default_integer(name, "INTEGER".to_string(), None)
+            }
+            MaterializedColumnRef::Column { .. } => {
+                Column::new_default_text(name, "BLOB".to_string(), None)
+            }
+        };
+        columns.push(column);
+    }
+    columns
+}
+
+/// Construct a SELECT plan that materializes build-side inputs into an ephemeral table.
+/// This plan is separate from the main query plan and is exclusively used for the materialization.
+/// process.
+///
+/// The join order is the original prefix up to (but excluding) the probe table, plus
+/// the build table itself. This filters build rows using only prior join constraints
+/// and then prunes any tables already captured by earlier key+payload materializations.
+#[allow(clippy::too_many_arguments)]
+fn build_materialized_build_input_plan(
+    plan: &SelectPlan,
+    build_table_idx: usize,
+    probe_table_idx: usize,
+    cursor_id: CursorID,
+    table: Arc<BTreeTable>,
+    mode: &MaterializedBuildInputMode,
+    key_exprs: &[Expr],
+    payload_columns: &[MaterializedColumnRef],
+    materialized_build_inputs: &HashMap<usize, MaterializedBuildInput>,
+) -> Result<SelectPlan> {
+    // Build a materialization subplan that only includes the join prefix
+    // (all tables prior to the probe + the build table). The resulting plan
+    // is smaller than the original select plan, so any access methods or
+    // predicates that depend on tables outside this prefix must be dropped.
+    let (join_order, included_tables) =
+        materialization_prefix(plan, build_table_idx, probe_table_idx)?;
+    // Bitmask of tables that are actually in the prefix join order for
+    // this materialization subplan. Anything that depends on other tables
+    // cannot be evaluated during those table scans.
+    let join_prefix_mask =
+        TableMask::from_table_number_iter(join_order.iter().map(|m| m.original_idx));
+    // Expressions can also reference build tables of earlier hash joins in this subplan,
+    // because those tables are available during probe loops. Use the broader "included"
+    // set when deciding which WHERE terms can be evaluated inside the materialization.
+    let eval_prefix_mask = TableMask::from_table_number_iter(included_tables.iter().copied());
+
+    // Clone WHERE terms but mark as "consumed" any term that needs tables
+    // outside the prefix. This prevents the subplan from trying to evaluate
+    // predicates it doesn't have access to (e.g. autoindex lookups that
+    // would require non-prefix tables to bind parameters).
+    let mut where_clause = plan.where_clause.clone();
+    for term in where_clause.iter_mut() {
+        let mask = table_mask_from_expr(
+            &term.expr,
+            &plan.table_references,
+            &plan.non_from_clause_subqueries,
+        )?;
+        let outside_prefix = !eval_prefix_mask.contains_all(&mask);
+        // Preserve consumed terms that the optimizer already suppressed, and
+        // additionally consume any term that depends on tables outside the prefix.
+        term.consumed |= outside_prefix;
+    }
+
+    // Clone table references and then "sanitize" each access method so that
+    // the materialization subplan does not try to use an access path that
+    // requires tables outside the prefix. If it does, we fall back to a scan.
+    let mut table_references = plan.table_references.clone();
+    for joined_table in table_references.joined_tables_mut().iter_mut() {
+        if let Operation::HashJoin(hash_join_op) = &mut joined_table.op {
+            if hash_join_op.build_table_idx == build_table_idx {
+                // Avoid recursive materialization and disable the hash join for the build table
+                // so it can be accessed using the join constraints.
+                hash_join_op.materialize_build_input = false;
+                joined_table.op = Operation::default_scan_for(&joined_table.table);
+            } else if hash_join_op.probe_table_idx == probe_table_idx {
+                // The probe table is not part of the materialization prefix, so
+                // disable hash joins anchored on it.
+                joined_table.op = Operation::default_scan_for(&joined_table.table);
+            }
+        }
+    }
+
+    // Helper to decide whether an expression depends on tables outside
+    // the prefix. If it does, any access method that relies on that
+    // expression must be invalidated for the materialization subplan.
+    let expr_depends_outside_prefix = |expr: &Expr| -> Result<bool> {
+        let mask = table_mask_from_expr(
+            expr,
+            &plan.table_references,
+            &plan.non_from_clause_subqueries,
+        )?;
+        Ok(!join_prefix_mask.contains_all(&mask))
+    };
+
+    // Walk each table in the cloned plan and ensure its access method is
+    // valid within the prefix. If the access method depends on tables
+    // outside the prefix, downgrade to a plain scan.
+    for (table_idx, joined_table) in table_references.joined_tables_mut().iter_mut().enumerate() {
+        if !join_prefix_mask.contains_table(table_idx) {
+            continue;
+        }
+
+        let mut reset_op = false;
+        match &joined_table.op {
+            Operation::Search(Search::RowidEq { cmp_expr }) => {
+                // Rowid equality searches may depend on other tables (e.g. column = other.col).
+                reset_op = expr_depends_outside_prefix(cmp_expr)?;
+            }
+            Operation::Search(Search::Seek { seek_def, .. }) => {
+                // Seek keys can include expressions bound by other tables. If so,
+                // the seek is not valid in the prefix-only subplan.
+                for component in seek_def.iter(&seek_def.start) {
+                    if let SeekKeyComponent::Expr(expr) = component {
+                        if expr_depends_outside_prefix(expr)? {
+                            reset_op = true;
+                            break;
+                        }
+                    }
+                }
+                if !reset_op {
+                    for component in seek_def.iter(&seek_def.end) {
+                        if let SeekKeyComponent::Expr(expr) = component {
+                            if expr_depends_outside_prefix(expr)? {
+                                reset_op = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            Operation::IndexMethodQuery(IndexMethodQuery { arguments, .. }) => {
+                // Index method queries are driven by argument expressions.
+                // If any argument depends on non-prefix tables, we cannot use it.
+                for expr in arguments {
+                    if expr_depends_outside_prefix(expr)? {
+                        reset_op = true;
+                        break;
+                    }
+                }
+            }
+            Operation::Scan(Scan::VirtualTable { constraints, .. }) => {
+                // Virtual table constraints are evaluated against expressions.
+                // If any constraint depends on non-prefix tables, drop the scan
+                // specialization and fall back to a full scan.
+                for expr in constraints {
+                    if expr_depends_outside_prefix(expr)? {
+                        reset_op = true;
+                        break;
+                    }
+                }
+            }
+            Operation::HashJoin(hash_join_op) => {
+                // Hash joins are driven by the probe table's loop. That probe table
+                // must be in the prefix; otherwise the hash join cannot be evaluated
+                // inside this subplan. The build table may live outside the prefix
+                // because the hash build phase scans it independently.
+                if !join_prefix_mask.contains_table(hash_join_op.probe_table_idx) {
+                    reset_op = true;
+                }
+            }
+            _ => {}
+        }
+
+        if reset_op {
+            // Downgrade to a default scan. This ensures the subplan only uses
+            // access paths that are valid within the prefix join order.
+            joined_table.op = Operation::default_scan_for(&joined_table.table);
+        }
+    }
+
+    let build_internal_id = plan.table_references.joined_tables()[build_table_idx].internal_id;
+    let result_columns = match mode {
+        MaterializedBuildInputMode::RowidOnly => vec![ResultSetColumn {
+            expr: Expr::RowId {
+                database: None,
+                table: build_internal_id,
+            },
+            alias: None,
+            contains_aggregates: false,
+        }],
+        MaterializedBuildInputMode::KeyPayload { num_keys, .. } => {
+            turso_assert!(
+                *num_keys == key_exprs.len(),
+                "materialized hash build input key count mismatch"
+            );
+            let mut result_columns: Vec<ResultSetColumn> = Vec::new();
+            for expr in key_exprs.iter() {
+                result_columns.push(ResultSetColumn {
+                    expr: expr.clone(),
+                    alias: None,
+                    contains_aggregates: false,
+                });
+            }
+            for payload in payload_columns.iter() {
+                let expr = match payload {
+                    MaterializedColumnRef::Column {
+                        table_id,
+                        column_idx,
+                        is_rowid_alias,
+                    } => Expr::Column {
+                        database: None,
+                        table: *table_id,
+                        column: *column_idx,
+                        is_rowid_alias: *is_rowid_alias,
+                    },
+                    MaterializedColumnRef::RowId { table_id } => Expr::RowId {
+                        database: None,
+                        table: *table_id,
+                    },
+                };
+                result_columns.push(ResultSetColumn {
+                    expr,
+                    alias: None,
+                    contains_aggregates: false,
+                });
+            }
+            result_columns
+        }
+    };
+
+    let mut materialize_plan = SelectPlan {
+        table_references,
+        join_order,
+        result_columns,
+        where_clause,
+        group_by: None,
+        order_by: vec![],
+        aggregates: vec![],
+        limit: None,
+        offset: None,
+        contains_constant_false_condition: false,
+        query_destination: QueryDestination::EphemeralTable {
+            cursor_id,
+            table,
+            rowid_mode: match mode {
+                MaterializedBuildInputMode::RowidOnly => EphemeralRowidMode::FromResultColumns,
+                MaterializedBuildInputMode::KeyPayload { .. } => EphemeralRowidMode::Auto,
+            },
+        },
+        distinctness: Distinctness::NonDistinct,
+        values: vec![],
+        window: None,
+        non_from_clause_subqueries: plan.non_from_clause_subqueries.clone(),
+    };
+
+    prune_join_order_for_materialized_inputs(&mut materialize_plan, materialized_build_inputs)?;
+
+    Ok(materialize_plan)
 }
 
 #[instrument(skip_all, level = Level::DEBUG)]
@@ -302,19 +1113,14 @@ pub fn emit_query<'a>(
     let after_main_loop_label = program.allocate_label();
     t_ctx.label_main_loop_end = Some(after_main_loop_label);
 
-    if !plan.values.is_empty() {
-        let reg_result_cols_start = emit_values(program, plan, t_ctx)?;
-        program.preassign_label_to_next_insn(after_main_loop_label);
-        return Ok(reg_result_cols_start);
-    }
-
     // Evaluate uncorrelated subqueries as early as possible, because even LIMIT can reference a subquery.
+    // This must happen before VALUES emission since VALUES expressions may contain scalar subqueries.
     for subquery in plan
         .non_from_clause_subqueries
         .iter_mut()
         .filter(|s| !s.has_been_evaluated())
     {
-        let eval_at = subquery.get_eval_at(&plan.join_order)?;
+        let eval_at = subquery.get_eval_at(&plan.join_order, Some(&plan.table_references))?;
         if eval_at != EvalAt::BeforeLoop {
             continue;
         }
@@ -322,32 +1128,31 @@ pub fn emit_query<'a>(
 
         emit_non_from_clause_subquery(
             program,
-            t_ctx,
+            &t_ctx.resolver,
             *plan,
             &subquery.query_type,
             subquery.correlated,
         )?;
     }
 
-    // Emit FROM clause subqueries first so the results can be read in the main query loop.
-    emit_from_clause_subqueries(program, t_ctx, &mut plan.table_references)?;
-
-    // No rows will be read from source table loops if there is a constant false condition eg. WHERE 0
-    // however an aggregation might still happen,
-    // e.g. SELECT COUNT(*) WHERE 0 returns a row with 0, not an empty result set
-    if plan.contains_constant_false_condition {
-        program.emit_insn(Insn::Goto {
-            target_pc: after_main_loop_label,
-        });
+    // Handle VALUES clause - emit values after subqueries are prepared
+    if !plan.values.is_empty() {
+        let reg_result_cols_start = emit_values(program, plan, t_ctx)?;
+        program.preassign_label_to_next_insn(after_main_loop_label);
+        return Ok(reg_result_cols_start);
     }
+
+    // Emit FROM clause subqueries first so the results can be read in the main query loop.
+    emit_from_clause_subqueries(program, t_ctx, &mut plan.table_references, &plan.join_order)?;
 
     // For non-grouped aggregation queries that also have non-aggregate columns,
     // we need to ensure non-aggregate columns are only emitted once.
     // This flag helps track whether we've already emitted these columns.
-    if !plan.aggregates.is_empty()
+    let has_ungrouped_nonagg_cols = !plan.aggregates.is_empty()
         && plan.group_by.is_none()
-        && plan.result_columns.iter().any(|c| !c.contains_aggregates)
-    {
+        && plan.result_columns.iter().any(|c| !c.contains_aggregates);
+
+    if has_ungrouped_nonagg_cols {
         let flag = program.alloc_register();
         program.emit_int(0, flag); // Initialize flag to 0 (not yet emitted)
         t_ctx.reg_nonagg_emit_once_flag = Some(flag);
@@ -359,6 +1164,24 @@ pub fn emit_query<'a>(
         program.reg_result_cols_start = t_ctx.reg_result_cols_start
     }
 
+    // For ungrouped aggregates with non-aggregate columns, initialize EXISTS subquery
+    // result_regs to 0. EXISTS returns 0 (not NULL) when the subquery is never evaluated
+    // (correlated EXISTS in empty loop). Non-aggregate columns themselves are evaluated
+    // after the loop in emit_ungrouped_aggregation if the loop never ran.
+    // We only initialize EXISTS subqueries that haven't been evaluated yet (correlated ones).
+    if has_ungrouped_nonagg_cols {
+        for rc in plan.result_columns.iter() {
+            if !rc.contains_aggregates {
+                init_exists_result_regs(program, &rc.expr, &plan.non_from_clause_subqueries);
+            }
+        }
+    }
+
+    let has_group_by_exprs = plan
+        .group_by
+        .as_ref()
+        .is_some_and(|gb| !gb.exprs.is_empty());
+
     // Initialize cursors and other resources needed for query execution
     if !plan.order_by.is_empty() {
         init_order_by(
@@ -367,22 +1190,25 @@ pub fn emit_query<'a>(
             &plan.result_columns,
             &plan.order_by,
             &plan.table_references,
-            plan.group_by.is_some(),
+            has_group_by_exprs,
             plan.distinctness != Distinctness::NonDistinct,
             &plan.aggregates,
         )?;
     }
 
-    if let Some(ref group_by) = plan.group_by {
-        init_group_by(
-            program,
-            t_ctx,
-            group_by,
-            plan,
-            &plan.result_columns,
-            &plan.order_by,
-        )?;
+    if has_group_by_exprs {
+        if let Some(ref group_by) = plan.group_by {
+            init_group_by(
+                program,
+                t_ctx,
+                group_by,
+                plan,
+                &plan.result_columns,
+                &plan.order_by,
+            )?;
+        }
     } else if !plan.aggregates.is_empty() {
+        // Handle aggregation without GROUP BY (or HAVING without GROUP BY)
         // Aggregate registers need to be NULLed at the start because the same registers might be reused on another invocation of a subquery,
         // and if they are not NULLed, the 2nd invocation of the same subquery will have values left over from the first invocation.
         t_ctx.reg_agg_start = Some(program.alloc_registers_and_init_w_null(plan.aggregates.len()));
@@ -405,15 +1231,30 @@ pub fn emit_query<'a>(
     if let Distinctness::Distinct { ctx } = &mut plan.distinctness {
         *ctx = distinct_ctx
     }
+    if let Distinctness::Distinct { ctx: Some(ctx) } = &plan.distinctness {
+        program.emit_insn(Insn::HashClear {
+            hash_table_id: ctx.hash_table_id,
+        });
+    }
 
     init_limit(program, t_ctx, &plan.limit, &plan.offset)?;
+
+    // No rows will be read from source table loops if there is a constant false condition eg. WHERE 0
+    // however an aggregation might still happen,
+    // e.g. SELECT COUNT(*) WHERE 0 returns a row with 0, not an empty result set.
+    // This Goto must be placed AFTER all initialization (cursors, sorters, etc.) so that
+    // resources like the GROUP BY sorter are properly opened before we skip to the aggregation phase.
+    if plan.contains_constant_false_condition {
+        program.emit_insn(Insn::Goto {
+            target_pc: after_main_loop_label,
+        });
+    }
 
     init_loop(
         program,
         t_ctx,
         &plan.table_references,
         &mut plan.aggregates,
-        plan.group_by.as_ref(),
         OperationMode::SELECT,
         &plan.where_clause,
         &plan.join_order,
@@ -451,12 +1292,11 @@ pub fn emit_query<'a>(
 
     program.preassign_label_to_next_insn(after_main_loop_label);
 
-    let mut order_by_necessary =
-        !plan.order_by.is_empty() && !plan.contains_constant_false_condition;
+    let order_by_necessary = !plan.order_by.is_empty() && !plan.contains_constant_false_condition;
     let order_by = &plan.order_by;
 
     // Handle GROUP BY and aggregation processing
-    if plan.group_by.is_some() {
+    if has_group_by_exprs {
         let row_source = &t_ctx
             .meta_group_by
             .as_ref()
@@ -467,10 +1307,8 @@ pub fn emit_query<'a>(
         }
         group_by_emit_row_phase(program, t_ctx, plan)?;
     } else if !plan.aggregates.is_empty() {
-        // Handle aggregation without GROUP BY
+        // Handle aggregation without GROUP BY (or HAVING without GROUP BY)
         emit_ungrouped_aggregation(program, t_ctx, plan)?;
-        // Single row result for aggregates without GROUP BY, so ORDER BY not needed
-        order_by_necessary = false;
     } else if plan.window.is_some() {
         emit_window_results(program, t_ctx, plan)?;
     }
@@ -521,17 +1359,40 @@ fn emit_program_for_delete(
         })
         .collect::<Vec<_>>();
 
+    // Evaluate uncorrelated subqueries as early as possible (only for normal path without rowset)
+    // For the rowset path, subqueries are handled by emit_program_for_select on the rowset_plan.
+    if plan.rowset_plan.is_none() {
+        for subquery in plan
+            .non_from_clause_subqueries
+            .iter_mut()
+            .filter(|s| !s.has_been_evaluated())
+        {
+            let eval_at = subquery.get_eval_at(&join_order, Some(&plan.table_references))?;
+            if eval_at != EvalAt::BeforeLoop {
+                continue;
+            }
+            let subquery_plan = subquery.consume_plan(EvalAt::BeforeLoop);
+
+            emit_non_from_clause_subquery(
+                program,
+                &t_ctx.resolver,
+                *subquery_plan,
+                &subquery.query_type,
+                subquery.correlated,
+            )?;
+        }
+    }
+
     // Initialize cursors and other resources needed for query execution
     init_loop(
         program,
         &mut t_ctx,
         &plan.table_references,
         &mut [],
-        None,
         OperationMode::DELETE,
         &plan.where_clause,
         &join_order,
-        &mut [],
+        &mut plan.non_from_clause_subqueries,
     )?;
 
     // If there's a rowset_plan, materialize rowids into a RowSet first and then iterate the RowSet
@@ -636,7 +1497,7 @@ fn emit_program_for_delete(
             &plan.where_clause,
             None,
             OperationMode::DELETE,
-            &mut [],
+            &mut plan.non_from_clause_subqueries,
         )?;
 
         emit_delete_insns(
@@ -947,12 +1808,14 @@ fn emit_delete_row_common(
                 .schema
                 .any_resolved_fks_referencing(table_name)
             {
-                emit_fk_delete_parent_existence_checks(
+                // Use sub-program based FK actions (CASCADE, SET NULL, SET DEFAULT, and NO ACTION)
+                fire_fk_delete_actions(
                     program,
-                    &t_ctx.resolver,
+                    &mut t_ctx.resolver,
                     table_name,
                     main_table_cursor_id,
                     rowid_reg,
+                    connection,
                 )?;
             }
             if t_ctx.resolver.schema.has_child_fks(table_name) {
@@ -1171,11 +2034,21 @@ fn emit_delete_insns_when_triggers_present(
                 .map(|i| columns_start_reg + i)
                 .chain(std::iter::once(rowid_reg))
                 .collect::<Vec<_>>();
-            let trigger_ctx = TriggerContext::new(
-                btree_table.clone(),
-                None, // No NEW for DELETE
-                Some(old_registers),
-            );
+            // If the program has a trigger_conflict_override, propagate it to the trigger context.
+            let trigger_ctx = if let Some(override_conflict) = program.trigger_conflict_override {
+                TriggerContext::new_with_override_conflict(
+                    btree_table.clone(),
+                    None, // No NEW for DELETE
+                    Some(old_registers),
+                    override_conflict,
+                )
+            } else {
+                TriggerContext::new(
+                    btree_table.clone(),
+                    None, // No NEW for DELETE
+                    Some(old_registers),
+                )
+            };
 
             for trigger in relevant_triggers {
                 fire_trigger(
@@ -1227,11 +2100,22 @@ fn emit_delete_insns_when_triggers_present(
                 .map(|i| columns_start_reg + i)
                 .chain(std::iter::once(rowid_reg))
                 .collect::<Vec<_>>();
-            let trigger_ctx_after = TriggerContext::new(
-                btree_table.clone(),
-                None, // No NEW for DELETE
-                Some(old_registers),
-            );
+            // If the program has a trigger_conflict_override, propagate it to the trigger context.
+            let trigger_ctx_after =
+                if let Some(override_conflict) = program.trigger_conflict_override {
+                    TriggerContext::new_with_override_conflict(
+                        btree_table.clone(),
+                        None, // No NEW for DELETE
+                        Some(old_registers),
+                        override_conflict,
+                    )
+                } else {
+                    TriggerContext::new(
+                        btree_table.clone(),
+                        None, // No NEW for DELETE
+                        Some(old_registers),
+                    )
+                };
 
             for trigger in relevant_triggers {
                 fire_trigger(
@@ -1258,6 +2142,8 @@ fn emit_program_for_update(
     mut plan: UpdatePlan,
     after: impl FnOnce(&mut ProgramBuilder),
 ) -> Result<()> {
+    program.set_resolve_type(plan.or_conflict.unwrap_or(ResolveType::Abort));
+
     let mut t_ctx = TranslateCtx::new(
         program,
         resolver.schema,
@@ -1334,17 +2220,40 @@ fn emit_program_for_update(
         })
         .collect::<Vec<_>>();
 
+    // Evaluate uncorrelated subqueries as early as possible (only for normal path without ephemeral table)
+    // For the ephemeral path, subqueries are handled by emit_program_for_select on the ephemeral_plan.
+    if !has_ephemeral_table {
+        for subquery in plan
+            .non_from_clause_subqueries
+            .iter_mut()
+            .filter(|s| !s.has_been_evaluated())
+        {
+            let eval_at = subquery.get_eval_at(&join_order, Some(&plan.table_references))?;
+            if eval_at != EvalAt::BeforeLoop {
+                continue;
+            }
+            let subquery_plan = subquery.consume_plan(EvalAt::BeforeLoop);
+
+            emit_non_from_clause_subquery(
+                program,
+                &t_ctx.resolver,
+                *subquery_plan,
+                &subquery.query_type,
+                subquery.correlated,
+            )?;
+        }
+    }
+
     // Initialize the main loop
     init_loop(
         program,
         &mut t_ctx,
         &plan.table_references,
         &mut [],
-        None,
         mode.clone(),
         &plan.where_clause,
         &join_order,
-        &mut [],
+        &mut plan.non_from_clause_subqueries,
     )?;
 
     // Prepare index cursors
@@ -1381,7 +2290,7 @@ fn emit_program_for_update(
         &plan.where_clause,
         temp_cursor_id,
         mode.clone(),
-        &mut [],
+        &mut plan.non_from_clause_subqueries,
     )?;
 
     let target_table_cursor_id =
@@ -1391,6 +2300,65 @@ fn emit_program_for_update(
         temp_cursor_id.unwrap()
     } else {
         target_table_cursor_id
+    };
+
+    // For REPLACE mode, we need cursors for ALL indexes because when we delete a
+    // conflicting row, we must delete from all indexes, not just those being updated.
+    // We construct this AFTER open_loop so we can determine which index is used for
+    // iteration and reuse that cursor instead of opening a new one.
+    let all_index_cursors = if matches!(program.resolve_type, ResolveType::Replace) {
+        let table_name = target_table.table.get_name();
+        let all_indexes = resolver.schema.get_indices(table_name);
+        let source_table = plan
+            .table_references
+            .joined_tables()
+            .first()
+            .expect("UPDATE must have a joined table");
+        let internal_id = source_table.internal_id;
+
+        // Determine which index (if any) is being used for iteration
+        // We need to reuse that cursor to avoid corruption when deleting from it
+        let iteration_index_name = match &source_table.op {
+            Operation::Scan(Scan::BTreeTable { index, .. }) => index.as_ref().map(|i| &i.name),
+            Operation::Search(Search::Seek {
+                index: Some(index), ..
+            }) => Some(&index.name),
+            _ => None,
+        };
+
+        all_indexes
+            .map(|index| {
+                // Check if this index already has a cursor opened (from indexes_to_update)
+                let existing_cursor = plan
+                    .indexes_to_update
+                    .iter()
+                    .zip(&index_cursors)
+                    .find(|(idx, _)| idx.name == index.name)
+                    .map(|(_, (cursor_id, _))| *cursor_id);
+
+                let cursor = if let Some(cursor) = existing_cursor {
+                    cursor
+                } else if iteration_index_name == Some(&index.name) {
+                    // This index is being used for iteration - reuse that cursor
+                    program.resolve_cursor_id(&CursorKey::index(internal_id, index.clone()))
+                } else {
+                    // This index is not in indexes_to_update and not used for iteration
+                    // Open a new cursor
+                    let cursor = program
+                        .alloc_cursor_index(None, index)
+                        .expect("to allocate index cursor");
+                    program.emit_insn(Insn::OpenWrite {
+                        cursor_id: cursor,
+                        root_page: RegisterOrLiteral::Literal(index.root_page),
+                        db: 0,
+                    });
+                    cursor
+                };
+                (index, cursor)
+            })
+            .collect::<Vec<(&Arc<Index>, usize)>>()
+    } else {
+        Vec::new()
     };
 
     // Emit update instructions
@@ -1404,7 +2372,8 @@ fn emit_program_for_update(
         plan.ephemeral_plan.as_ref(),
         &mut t_ctx,
         program,
-        index_cursors,
+        &index_cursors,
+        &all_index_cursors,
         iteration_cursor_id,
         target_table_cursor_id,
         target_table,
@@ -1450,7 +2419,9 @@ fn emit_update_column_values<'a>(
     cdc_updates_register: Option<usize>,
     t_ctx: &mut TranslateCtx<'a>,
     skip_set_clauses: bool,
+    skip_row_label: BranchOffset,
 ) -> crate::Result<()> {
+    let or_conflict = program.resolve_type;
     if has_direct_rowid_update {
         if let Some((_, expr)) = set_clauses.iter().find(|(i, _)| *i == ROWID_SENTINEL) {
             if !skip_set_clauses {
@@ -1503,19 +2474,70 @@ fn emit_update_column_values<'a>(
                         &t_ctx.resolver,
                     )?;
                     if table_column.notnull() {
-                        use crate::error::SQLITE_CONSTRAINT_NOTNULL;
-                        program.emit_insn(Insn::HaltIfNull {
-                            target_reg,
-                            err_code: SQLITE_CONSTRAINT_NOTNULL,
-                            description: format!(
-                                "{}.{}",
-                                table_name,
-                                table_column
-                                    .name
-                                    .as_ref()
-                                    .expect("Column name must be present")
-                            ),
-                        });
+                        match or_conflict {
+                            ResolveType::Ignore => {
+                                // For IGNORE, skip this row on NOT NULL violation
+                                program.emit_insn(Insn::IsNull {
+                                    reg: target_reg,
+                                    target_pc: skip_row_label,
+                                });
+                            }
+                            ResolveType::Replace => {
+                                // For REPLACE with NOT NULL, use default value if available
+                                if let Some(default_expr) = table_column.default.as_ref() {
+                                    let continue_label = program.allocate_label();
+
+                                    // If not null, skip to continue
+                                    program.emit_insn(Insn::NotNull {
+                                        reg: target_reg,
+                                        target_pc: continue_label,
+                                    });
+
+                                    // Value is null, use default.
+                                    translate_expr_no_constant_opt(
+                                        program,
+                                        Some(table_references),
+                                        default_expr,
+                                        target_reg,
+                                        &t_ctx.resolver,
+                                        NoConstantOptReason::RegisterReuse,
+                                    )?;
+
+                                    program.preassign_label_to_next_insn(continue_label);
+                                } else {
+                                    // No default value, fall through to ABORT behavior
+                                    use crate::error::SQLITE_CONSTRAINT_NOTNULL;
+                                    program.emit_insn(Insn::HaltIfNull {
+                                        target_reg,
+                                        err_code: SQLITE_CONSTRAINT_NOTNULL,
+                                        description: format!(
+                                            "{}.{}",
+                                            table_name,
+                                            table_column
+                                                .name
+                                                .as_ref()
+                                                .expect("Column name must be present")
+                                        ),
+                                    });
+                                }
+                            }
+                            _ => {
+                                // Default ABORT behavior
+                                use crate::error::SQLITE_CONSTRAINT_NOTNULL;
+                                program.emit_insn(Insn::HaltIfNull {
+                                    target_reg,
+                                    err_code: SQLITE_CONSTRAINT_NOTNULL,
+                                    description: format!(
+                                        "{}.{}",
+                                        table_name,
+                                        table_column
+                                            .name
+                                            .as_ref()
+                                            .expect("Column name must be present")
+                                    ),
+                                });
+                            }
+                        }
                     }
                 }
 
@@ -1598,7 +2620,11 @@ fn emit_update_column_values<'a>(
 /// `target_table_cursor_id` is the cursor id of the table that is being updated.
 ///
 /// `target_table` is the table that is being updated.
-#[allow(clippy::too_many_arguments)]
+///
+/// `or_conflict` specifies the conflict resolution strategy (IGNORE, REPLACE, ABORT).
+///
+/// `all_index_cursors` contains cursors for ALL indexes on the table (used for REPLACE to delete
+/// conflicting rows from all indexes, not just those being updated).
 fn emit_update_insns<'a>(
     connection: &Arc<Connection>,
     table_references: &mut TableReferences,
@@ -1609,14 +2635,25 @@ fn emit_update_insns<'a>(
     ephemeral_plan: Option<&SelectPlan>,
     t_ctx: &mut TranslateCtx<'a>,
     program: &mut ProgramBuilder,
-    index_cursors: Vec<(usize, usize)>,
+    index_cursors: &[(usize, usize)],
+    all_index_cursors: &[(&Arc<Index>, usize)],
     iteration_cursor_id: usize,
     target_table_cursor_id: usize,
     target_table: Arc<JoinedTable>,
 ) -> crate::Result<()> {
+    let or_conflict = program.resolve_type;
     let internal_id = target_table.internal_id;
-    let loop_labels = t_ctx.labels_main_loop.first().unwrap();
-    let source_table = table_references.joined_tables().first().unwrap();
+    // Copy loop labels early to avoid borrow conflicts with mutable t_ctx borrow later
+    let loop_labels = *t_ctx
+        .labels_main_loop
+        .first()
+        .expect("loop labels to exist");
+    // Label to skip to the next row on conflict (for IGNORE mode)
+    let skip_row_label = loop_labels.next;
+    let source_table = table_references
+        .joined_tables()
+        .first()
+        .expect("UPDATE must have a source table");
     let (index, is_virtual) = match &source_table.op {
         Operation::Scan(Scan::BTreeTable { index, .. }) => (
             index.as_ref().map(|index| {
@@ -1756,57 +2793,89 @@ fn emit_update_insns<'a>(
         cdc_updates_register,
         t_ctx,
         skip_set_clauses,
+        skip_row_label,
     )?;
 
+    // For non-STRICT tables, apply column affinity to the NEW values early.
+    // This must happen before index operations and triggers so that all operations
+    // use the converted values.
+    if let Some(btree_table) = target_table.table.btree() {
+        if !btree_table.is_strict {
+            let affinity = btree_table.columns.iter().map(|c| c.affinity());
+
+            // Only emit Affinity if there's meaningful affinity to apply
+            if affinity.clone().any(|a| a != Affinity::Blob) {
+                if let Ok(count) = std::num::NonZeroUsize::try_from(col_len) {
+                    program.emit_insn(Insn::Affinity {
+                        start_reg: start,
+                        count,
+                        affinities: affinity.map(|a| a.aff_mask()).collect(),
+                    });
+                }
+            }
+        }
+    }
+
     // Fire BEFORE UPDATE triggers and preserve old_registers for AFTER triggers
-    let preserved_old_registers: Option<Vec<usize>> =
-        if let Some(btree_table) = target_table.table.btree() {
-            let updated_column_indices: std::collections::HashSet<usize> =
-                set_clauses.iter().map(|(col_idx, _)| *col_idx).collect();
-            let relevant_before_update_triggers = get_relevant_triggers_type_and_time(
-                t_ctx.resolver.schema,
-                TriggerEvent::Update,
-                TriggerTime::Before,
-                Some(updated_column_indices.clone()),
-                &btree_table,
-            );
-            // Read OLD row values for trigger context
-            let old_registers: Vec<usize> = (0..col_len)
-                .map(|i| {
-                    let reg = program.alloc_register();
-                    program.emit_column_or_rowid(target_table_cursor_id, i, reg);
-                    reg
-                })
+    let preserved_old_registers: Option<Vec<usize>> = if let Some(btree_table) =
+        target_table.table.btree()
+    {
+        let updated_column_indices: HashSet<usize> =
+            set_clauses.iter().map(|(col_idx, _)| *col_idx).collect();
+        let relevant_before_update_triggers = get_relevant_triggers_type_and_time(
+            t_ctx.resolver.schema,
+            TriggerEvent::Update,
+            TriggerTime::Before,
+            Some(updated_column_indices.clone()),
+            &btree_table,
+        );
+        // Read OLD row values for trigger context
+        let old_registers: Vec<usize> = (0..col_len)
+            .map(|i| {
+                let reg = program.alloc_register();
+                program.emit_column_or_rowid(target_table_cursor_id, i, reg);
+                reg
+            })
+            .chain(std::iter::once(beg))
+            .collect();
+        let has_relevant_triggers = relevant_before_update_triggers.clone().count() > 0;
+        if !has_relevant_triggers {
+            Some(old_registers)
+        } else {
+            // NEW row values are already in 'start' registers
+            let new_registers = (0..col_len)
+                .map(|i| start + i)
                 .chain(std::iter::once(beg))
                 .collect();
-            let has_relevant_triggers = relevant_before_update_triggers.clone().count() > 0;
-            if !has_relevant_triggers {
-                Some(old_registers)
-            } else {
-                // NEW row values are already in 'start' registers
-                let new_registers = (0..col_len)
-                    .map(|i| start + i)
-                    .chain(std::iter::once(beg))
-                    .collect();
 
-                let trigger_ctx = TriggerContext::new(
+            // If the program has a trigger_conflict_override, propagate it to the trigger context.
+            let trigger_ctx = if let Some(override_conflict) = program.trigger_conflict_override {
+                TriggerContext::new_with_override_conflict(
                     btree_table.clone(),
                     Some(new_registers),
                     Some(old_registers.clone()), // Clone for AFTER trigger
-                );
+                    override_conflict,
+                )
+            } else {
+                TriggerContext::new(
+                    btree_table.clone(),
+                    Some(new_registers),
+                    Some(old_registers.clone()), // Clone for AFTER trigger
+                )
+            };
 
-                for trigger in relevant_before_update_triggers {
-                    fire_trigger(
-                        program,
-                        &mut t_ctx.resolver,
-                        trigger,
-                        &trigger_ctx,
-                        connection,
-                    )?;
-                }
+            for trigger in relevant_before_update_triggers {
+                fire_trigger(
+                    program,
+                    &mut t_ctx.resolver,
+                    trigger,
+                    &trigger_ctx,
+                    connection,
+                )?;
+            }
 
-                // BEFORE UPDATE Triggers may have altered the btree so we need to seek again.
-                program.emit_insn(Insn::NotExists {
+            // BEFORE UPDATE Triggers may have altered the btree so we need to seek again.
+            program.emit_insn(Insn::NotExists {
                 cursor: target_table_cursor_id,
                 rowid_reg: beg,
                 target_pc: check_rowid_not_exists_label.expect(
@@ -1814,39 +2883,39 @@ fn emit_update_insns<'a>(
                 ),
             });
 
-                let has_relevant_after_triggers = get_relevant_triggers_type_and_time(
-                    t_ctx.resolver.schema,
-                    TriggerEvent::Update,
-                    TriggerTime::After,
-                    Some(updated_column_indices),
-                    &btree_table,
-                )
-                .clone()
-                .count()
-                    > 0;
-                if has_relevant_after_triggers {
-                    // Preserve pseudo-row 'OLD' for AFTER triggers by copying to new registers
-                    // (since registers might be overwritten during trigger execution)
-                    let preserved: Vec<usize> = old_registers
-                        .iter()
-                        .map(|old_reg| {
-                            let preserved_reg = program.alloc_register();
-                            program.emit_insn(Insn::Copy {
-                                src_reg: *old_reg,
-                                dst_reg: preserved_reg,
-                                extra_amount: 0,
-                            });
-                            preserved_reg
-                        })
-                        .collect();
-                    Some(preserved)
-                } else {
-                    Some(old_registers)
-                }
+            let has_relevant_after_triggers = get_relevant_triggers_type_and_time(
+                t_ctx.resolver.schema,
+                TriggerEvent::Update,
+                TriggerTime::After,
+                Some(updated_column_indices),
+                &btree_table,
+            )
+            .clone()
+            .count()
+                > 0;
+            if has_relevant_after_triggers {
+                // Preserve pseudo-row 'OLD' for AFTER triggers by copying to new registers
+                // (since registers might be overwritten during trigger execution)
+                let preserved: Vec<usize> = old_registers
+                    .iter()
+                    .map(|old_reg| {
+                        let preserved_reg = program.alloc_register();
+                        program.emit_insn(Insn::Copy {
+                            src_reg: *old_reg,
+                            dst_reg: preserved_reg,
+                            extra_amount: 0,
+                        });
+                        preserved_reg
+                    })
+                    .collect();
+                Some(preserved)
+            } else {
+                Some(old_registers)
             }
-        } else {
-            None
-        };
+        }
+    } else {
+        None
+    };
 
     // If BEFORE UPDATE triggers fired, they may have modified the row being updated.
     // According to the SQLite documentation, the behavior in these cases is undefined:
@@ -1882,6 +2951,7 @@ fn emit_update_insns<'a>(
                 cdc_updates_register,
                 t_ctx,
                 skip_set_clauses,
+                skip_row_label,
             )?;
         }
     }
@@ -1908,22 +2978,18 @@ fn emit_update_insns<'a>(
                     target_table_cursor_id,
                     start,
                     rowid_new_reg,
-                    &set_clauses
-                        .iter()
-                        .map(|(i, _)| *i)
-                        .collect::<std::collections::HashSet<_>>(),
+                    &set_clauses.iter().map(|(i, _)| *i).collect::<HashSet<_>>(),
                 )?;
             }
-            // Parent-side checks:
-            // We only need to do work if the referenced key (the parent key) might change.
-            // we detect that by comparing OLD vs NEW primary key representation
-            // then run parent FK checks only when it actually changes.
+            // Parent-side NO ACTION/RESTRICT checks must happen BEFORE the update.
+            // This checks that no child rows reference the old parent key values.
+            // CASCADE/SET NULL actions are fired AFTER the update (see below after Insert).
             if t_ctx
                 .resolver
                 .schema
                 .any_resolved_fks_referencing(table_name)
             {
-                emit_parent_key_change_checks(
+                emit_fk_update_parent_actions(
                     program,
                     &t_ctx.resolver,
                     &table_btree,
@@ -1939,7 +3005,172 @@ fn emit_update_insns<'a>(
         }
     }
 
-    for (index, (idx_cursor_id, record_reg)) in indexes_to_update.iter().zip(&index_cursors) {
+    // For IGNORE, FAIL, and ROLLBACK modes, we need to do a preflight check for unique
+    // constraint violations BEFORE deleting any old index entries. This ensures that:
+    // - IGNORE: We can skip the row without corrupting it by partially deleting index entries
+    // - FAIL/ROLLBACK: We can halt without partial state (index deleted but not re-inserted)
+    if matches!(
+        or_conflict,
+        ResolveType::Ignore | ResolveType::Fail | ResolveType::Rollback
+    ) {
+        let rowid_reg = rowid_set_clause_reg.unwrap_or(beg);
+        for (index, (idx_cursor_id, _record_reg)) in indexes_to_update.iter().zip(index_cursors) {
+            if !index.unique {
+                continue;
+            }
+
+            // Build the new index key for conflict checking
+            let num_cols = index.columns.len();
+            let idx_start_reg = program.alloc_registers(num_cols);
+
+            for (i, col) in index.columns.iter().enumerate() {
+                emit_index_column_value_new_image(
+                    program,
+                    &t_ctx.resolver,
+                    target_table.table.columns(),
+                    start,
+                    rowid_reg,
+                    col,
+                    idx_start_reg + i,
+                )?;
+            }
+
+            // Apply affinity for proper comparison
+            let aff = index
+                .columns
+                .iter()
+                .map(|ic| {
+                    if ic.expr.is_some() {
+                        Affinity::Blob.aff_mask()
+                    } else {
+                        target_table.table.columns()[ic.pos_in_table]
+                            .affinity()
+                            .aff_mask()
+                    }
+                })
+                .collect::<String>();
+            program.emit_insn(Insn::Affinity {
+                start_reg: idx_start_reg,
+                count: NonZeroUsize::new(num_cols).expect("nonzero col count"),
+                affinities: aff,
+            });
+
+            // Check for conflicts - NoConflict jumps if no conflict
+            let no_conflict_label = program.allocate_label();
+            program.emit_insn(Insn::NoConflict {
+                cursor_id: *idx_cursor_id,
+                target_pc: no_conflict_label,
+                record_reg: idx_start_reg,
+                num_regs: num_cols,
+            });
+
+            // A conflict was found - check if it's the same row we're updating
+            let idx_rowid_reg = program.alloc_register();
+            program.emit_insn(Insn::IdxRowId {
+                cursor_id: *idx_cursor_id,
+                dest: idx_rowid_reg,
+            });
+
+            // If the conflicting row is the one we're updating, that's not actually a conflict
+            program.emit_insn(Insn::Eq {
+                lhs: beg,
+                rhs: idx_rowid_reg,
+                target_pc: no_conflict_label,
+                flags: CmpInsFlags::default(),
+                collation: program.curr_collation(),
+            });
+
+            // Conflict with a different row - handle based on conflict resolution mode
+            match or_conflict {
+                ResolveType::Ignore => {
+                    // Skip this row's update and continue with the next row
+                    program.emit_insn(Insn::Goto {
+                        target_pc: skip_row_label,
+                    });
+                }
+                ResolveType::Fail | ResolveType::Rollback => {
+                    // Halt with UNIQUE constraint error
+                    let column_names = index.columns.iter().enumerate().fold(
+                        String::with_capacity(50),
+                        |mut accum, (idx, col)| {
+                            if idx > 0 {
+                                accum.push_str(", ");
+                            }
+                            accum.push_str(table_name);
+                            accum.push('.');
+                            accum.push_str(&col.name);
+                            accum
+                        },
+                    );
+                    program.emit_insn(Insn::Halt {
+                        err_code: SQLITE_CONSTRAINT_UNIQUE,
+                        description: column_names,
+                    });
+                }
+                _ => unreachable!("Only IGNORE, FAIL, and ROLLBACK should reach preflight check"),
+            }
+
+            program.preassign_label_to_next_insn(no_conflict_label);
+        }
+
+        // Also check for rowid conflict in preflight
+        if has_user_provided_rowid {
+            let target_reg = rowid_set_clause_reg.unwrap();
+            let no_rowid_conflict_label = program.allocate_label();
+
+            // If the new rowid equals the old rowid, no conflict
+            program.emit_insn(Insn::Eq {
+                lhs: target_reg,
+                rhs: beg,
+                target_pc: no_rowid_conflict_label,
+                flags: CmpInsFlags::default(),
+                collation: program.curr_collation(),
+            });
+
+            // If a row with the new rowid doesn't exist, no conflict
+            program.emit_insn(Insn::NotExists {
+                cursor: target_table_cursor_id,
+                rowid_reg: target_reg,
+                target_pc: no_rowid_conflict_label,
+            });
+
+            // Conflict found - handle based on conflict resolution mode
+            match or_conflict {
+                ResolveType::Ignore => {
+                    // Skip this row's update and continue with the next row
+                    program.emit_insn(Insn::Goto {
+                        target_pc: skip_row_label,
+                    });
+                }
+                ResolveType::Fail | ResolveType::Rollback => {
+                    // Halt with PRIMARY KEY constraint error
+                    let description = if let Some(idx) = rowid_alias_index {
+                        String::from(table_name)
+                            + "."
+                            + target_table
+                                .table
+                                .columns()
+                                .get(idx)
+                                .expect("column to exist")
+                                .name
+                                .as_ref()
+                                .map_or("", |v| v)
+                    } else {
+                        String::from(table_name) + ".rowid"
+                    };
+                    program.emit_insn(Insn::Halt {
+                        err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
+                        description,
+                    });
+                }
+                _ => unreachable!("Only IGNORE, FAIL, and ROLLBACK should reach preflight check"),
+            }
+
+            program.preassign_label_to_next_insn(no_rowid_conflict_label);
+        }
+    }
+
+    for (index, (idx_cursor_id, record_reg)) in indexes_to_update.iter().zip(index_cursors) {
         // We need to know whether or not the OLD values satisfied the predicate on the
         // partial index, so we can know whether or not to delete the old index entry,
         // as well as whether or not the NEW values satisfy the predicate, to determine whether
@@ -2072,9 +3303,9 @@ fn emit_update_insns<'a>(
         });
 
         program.emit_insn(Insn::MakeRecord {
-            start_reg: idx_start_reg,
-            count: num_cols + 1,
-            dest_reg: *record_reg,
+            start_reg: to_u16(idx_start_reg),
+            count: to_u16(num_cols + 1),
+            dest_reg: to_u16(*record_reg),
             index_name: Some(index.name.clone()),
             affinity_str: None,
         });
@@ -2123,23 +3354,106 @@ fn emit_update_insns<'a>(
                 collation: program.curr_collation(),
             });
 
-            let column_names = index.columns.iter().enumerate().fold(
-                String::with_capacity(50),
-                |mut accum, (idx, col)| {
-                    if idx > 0 {
-                        accum.push_str(", ");
-                    }
-                    accum.push_str(table_name);
-                    accum.push('.');
-                    accum.push_str(&col.name);
-                    accum
-                },
-            );
+            match or_conflict {
+                ResolveType::Ignore => {
+                    // For IGNORE, skip this row's update but continue with other rows
+                    program.emit_insn(Insn::Goto {
+                        target_pc: skip_row_label,
+                    });
+                }
+                ResolveType::Replace => {
+                    // For REPLACE with unique constraint, delete the conflicting row
+                    // Save original rowid before seeking to conflicting row
+                    let original_rowid_reg = program.alloc_register();
+                    program.emit_insn(Insn::Copy {
+                        src_reg: beg,
+                        dst_reg: original_rowid_reg,
+                        extra_amount: 0,
+                    });
 
-            program.emit_insn(Insn::Halt {
-                err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
-                description: column_names,
-            });
+                    // Seek to the conflicting row
+                    let after_delete_label = program.allocate_label();
+                    program.emit_insn(Insn::SeekRowid {
+                        cursor_id: target_table_cursor_id,
+                        src_reg: idx_rowid_reg,
+                        target_pc: after_delete_label, // Skip if row doesn't exist
+                    });
+
+                    // Delete from ALL indexes for the conflicting row
+                    // We must delete from all indexes, not just indexes_to_update,
+                    // because the conflicting row may have entries in indexes
+                    // whose columns are not being modified by this UPDATE.
+                    for (other_index, other_idx_cursor_id) in all_index_cursors {
+                        // Build index key for the conflicting row
+                        let other_num_regs = other_index.columns.len() + 1;
+                        let other_start_reg = program.alloc_registers(other_num_regs);
+
+                        for (reg_offset, column_index) in other_index.columns.iter().enumerate() {
+                            emit_index_column_value_old_image(
+                                program,
+                                &t_ctx.resolver,
+                                table_references,
+                                connection,
+                                target_table_cursor_id,
+                                column_index,
+                                other_start_reg + reg_offset,
+                            )?;
+                        }
+
+                        // Add the conflicting rowid
+                        program.emit_insn(Insn::Copy {
+                            src_reg: idx_rowid_reg,
+                            dst_reg: other_start_reg + other_num_regs - 1,
+                            extra_amount: 0,
+                        });
+
+                        program.emit_insn(Insn::IdxDelete {
+                            start_reg: other_start_reg,
+                            num_regs: other_num_regs,
+                            cursor_id: *other_idx_cursor_id,
+                            raise_error_if_no_matching_entry: other_index.where_clause.is_none(),
+                        });
+                    }
+
+                    // Delete the conflicting row from the main table
+                    program.emit_insn(Insn::Delete {
+                        cursor_id: target_table_cursor_id,
+                        table_name: table_name.to_string(),
+                        is_part_of_update: false,
+                    });
+
+                    program.preassign_label_to_next_insn(after_delete_label);
+
+                    // Seek back to the original row we're updating
+                    let continue_label = program.allocate_label();
+                    program.emit_insn(Insn::SeekRowid {
+                        cursor_id: target_table_cursor_id,
+                        src_reg: original_rowid_reg,
+                        target_pc: continue_label, // Should always succeed
+                    });
+                    program.preassign_label_to_next_insn(continue_label);
+                }
+                _ => {
+                    // Default ABORT behavior
+                    let column_names = index.columns.iter().enumerate().fold(
+                        String::with_capacity(50),
+                        |mut accum, (idx, col)| {
+                            if idx > 0 {
+                                accum.push_str(", ");
+                            }
+                            accum.push_str(table_name);
+                            accum.push('.');
+                            accum.push_str(&col.name);
+                            accum
+                        },
+                    );
+
+                    program.emit_insn(Insn::Halt {
+                        err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
+                        description: column_names,
+                    });
+                }
+            }
 
             program.preassign_label_to_next_insn(constraint_check);
         }
@@ -2168,11 +3482,14 @@ fn emit_update_insns<'a>(
                 table_reference: Arc::clone(&btree_table),
             });
         }
+        // Note: Affinity for non-STRICT tables is applied earlier,
+        // right after emit_update_column_values, before index operations.
 
         if has_user_provided_rowid {
             let record_label = program.allocate_label();
             let target_reg = rowid_set_clause_reg.unwrap();
 
+            // If the new rowid equals the old rowid, no conflict
             program.emit_insn(Insn::Eq {
                 lhs: target_reg,
                 rhs: beg,
@@ -2181,31 +3498,100 @@ fn emit_update_insns<'a>(
                 collation: program.curr_collation(),
             });
 
+            // If a row with the new rowid doesn't exist, no conflict
             program.emit_insn(Insn::NotExists {
                 cursor: target_table_cursor_id,
                 rowid_reg: target_reg,
                 target_pc: record_label,
             });
 
-            let description = if let Some(idx) = rowid_alias_index {
-                String::from(table_name)
-                    + "."
-                    + target_table
-                        .table
-                        .columns()
-                        .get(idx)
-                        .unwrap()
-                        .name
-                        .as_ref()
-                        .map_or("", |v| v)
-            } else {
-                String::from(table_name) + ".rowid"
-            };
+            // Handle conflict resolution for rowid/primary key conflict
+            match or_conflict {
+                ResolveType::Ignore => {
+                    // For IGNORE, skip this row's update but continue with other rows
+                    program.emit_insn(Insn::Goto {
+                        target_pc: skip_row_label,
+                    });
+                }
+                ResolveType::Replace => {
+                    // For REPLACE with rowid conflict, delete the conflicting row
+                    // The conflicting row is at the new target rowid position
+                    // Seek to the conflicting row (target_reg has the new rowid)
+                    let after_delete_label = program.allocate_label();
+                    program.emit_insn(Insn::SeekRowid {
+                        cursor_id: target_table_cursor_id,
+                        src_reg: target_reg,
+                        target_pc: after_delete_label, // Skip if row doesn't exist
+                    });
 
-            program.emit_insn(Insn::Halt {
-                err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
-                description,
-            });
+                    // Delete from ALL indexes for the conflicting row
+                    // We must delete from all indexes, not just indexes_to_update,
+                    // because the conflicting row may have entries in indexes
+                    // whose columns are not being modified by this UPDATE.
+                    for (other_index, other_idx_cursor_id) in all_index_cursors {
+                        // Build index key for the conflicting row
+                        let other_num_regs = other_index.columns.len() + 1;
+                        let other_start_reg = program.alloc_registers(other_num_regs);
+
+                        for (reg_offset, column_index) in other_index.columns.iter().enumerate() {
+                            emit_index_column_value_old_image(
+                                program,
+                                &t_ctx.resolver,
+                                table_references,
+                                connection,
+                                target_table_cursor_id,
+                                column_index,
+                                other_start_reg + reg_offset,
+                            )?;
+                        }
+
+                        // Add the conflicting rowid (target_reg has the new/conflicting rowid)
+                        program.emit_insn(Insn::Copy {
+                            src_reg: target_reg,
+                            dst_reg: other_start_reg + other_num_regs - 1,
+                            extra_amount: 0,
+                        });
+
+                        program.emit_insn(Insn::IdxDelete {
+                            start_reg: other_start_reg,
+                            num_regs: other_num_regs,
+                            cursor_id: *other_idx_cursor_id,
+                            raise_error_if_no_matching_entry: other_index.where_clause.is_none(),
+                        });
+                    }
+
+                    // Delete the conflicting row from the main table
+                    program.emit_insn(Insn::Delete {
+                        cursor_id: target_table_cursor_id,
+                        table_name: table_name.to_string(),
+                        is_part_of_update: false,
+                    });
+
+                    program.preassign_label_to_next_insn(after_delete_label);
+                }
+                _ => {
+                    // Default ABORT behavior
+                    let description = if let Some(idx) = rowid_alias_index {
+                        String::from(table_name)
+                            + "."
+                            + target_table
+                                .table
+                                .columns()
+                                .get(idx)
+                                .unwrap()
+                                .name
+                                .as_ref()
+                                .map_or("", |v| v)
+                    } else {
+                        String::from(table_name) + ".rowid"
+                    };
+
+                    program.emit_insn(Insn::Halt {
+                        err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
+                        description,
+                    });
+                }
+            }
 
             program.preassign_label_to_next_insn(record_label);
         }
@@ -2220,9 +3606,9 @@ fn emit_update_insns<'a>(
             .collect::<String>();
 
         program.emit_insn(Insn::MakeRecord {
-            start_reg: start,
-            count: col_len,
-            dest_reg: record_reg,
+            start_reg: to_u16(start),
+            count: to_u16(col_len),
+            dest_reg: to_u16(record_reg),
             index_name: None,
             affinity_str: Some(affinity_str),
         });
@@ -2291,9 +3677,34 @@ fn emit_update_insns<'a>(
             table_name: target_table.identifier.clone(),
         });
 
+        // Fire FK CASCADE/SET NULL actions AFTER the parent row is updated
+        // This ensures the new parent key exists when cascade actions update child rows
+        if connection.foreign_keys_enabled()
+            && t_ctx
+                .resolver
+                .schema
+                .any_resolved_fks_referencing(table_name)
+        {
+            let new_rowid_reg = rowid_set_clause_reg.unwrap_or(beg);
+            // OLD column values are stored in preserved_old_registers (contiguous registers)
+            let old_values_start = preserved_old_registers
+                .as_ref()
+                .expect("FK check requires OLD values")[0];
+            fire_fk_update_actions(
+                program,
+                &mut t_ctx.resolver,
+                table_name,
+                beg, // old_rowid_reg
+                old_values_start,
+                start, // new_values_start
+                new_rowid_reg,
+                connection,
+            )?;
+        }
+
         // Fire AFTER UPDATE triggers
         if let Some(btree_table) = target_table.table.btree() {
-            let updated_column_indices: std::collections::HashSet<usize> =
+            let updated_column_indices: HashSet<usize> =
                 set_clauses.iter().map(|(col_idx, _)| *col_idx).collect();
             let relevant_triggers = get_relevant_triggers_type_and_time(
                 t_ctx.resolver.schema,
@@ -2313,11 +3724,22 @@ fn emit_update_insns<'a>(
                 // Use preserved OLD registers from BEFORE trigger
                 let old_registers_after = preserved_old_registers;
 
-                let trigger_ctx_after = TriggerContext::new(
-                    btree_table.clone(),
-                    Some(new_registers_after),
-                    old_registers_after, // OLD values preserved from BEFORE trigger
-                );
+                // If the program has a trigger_conflict_override, propagate it to the trigger context.
+                let trigger_ctx_after =
+                    if let Some(override_conflict) = program.trigger_conflict_override {
+                        TriggerContext::new_with_override_conflict(
+                            btree_table.clone(),
+                            Some(new_registers_after),
+                            old_registers_after, // OLD values preserved from BEFORE trigger
+                            override_conflict,
+                        )
+                    } else {
+                        TriggerContext::new(
+                            btree_table.clone(),
+                            Some(new_registers_after),
+                            old_registers_after, // OLD values preserved from BEFORE trigger
+                        )
+                    };
 
                 for trigger in relevant_triggers {
                     fire_trigger(
@@ -2361,9 +3783,9 @@ fn emit_update_insns<'a>(
         let cdc_updates_record = if let Some(cdc_updates_register) = cdc_updates_register {
             let record_reg = program.alloc_register();
             program.emit_insn(Insn::MakeRecord {
-                start_reg: cdc_updates_register,
-                count: 2 * col_len,
-                dest_reg: record_reg,
+                start_reg: to_u16(cdc_updates_register),
+                count: to_u16(2 * col_len),
+                dest_reg: to_u16(record_reg),
                 index_name: None,
                 affinity_str: None,
             });
@@ -2496,9 +3918,9 @@ pub fn emit_cdc_patch_record(
             .collect::<String>();
 
         program.emit_insn(Insn::MakeRecord {
-            start_reg: columns_reg,
-            count: table.columns().len(),
-            dest_reg: record_reg,
+            start_reg: to_u16(columns_reg),
+            count: to_u16(table.columns().len()),
+            dest_reg: to_u16(record_reg),
             index_name: None,
             affinity_str: Some(affinity_str),
         });
@@ -2532,9 +3954,9 @@ pub fn emit_cdc_full_record(
         .collect::<String>();
 
     program.emit_insn(Insn::MakeRecord {
-        start_reg: columns_reg + 1,
-        count: columns.len(),
-        dest_reg: columns_reg,
+        start_reg: to_u16(columns_reg + 1),
+        count: to_u16(columns.len()),
+        dest_reg: to_u16(columns_reg),
         index_name: None,
         affinity_str: Some(affinity_str),
     });
@@ -2635,9 +4057,9 @@ pub fn emit_cdc_insns(
 
     let record_reg = program.alloc_register();
     program.emit_insn(Insn::MakeRecord {
-        start_reg: turso_cdc_registers,
-        count: 8,
-        dest_reg: record_reg,
+        start_reg: to_u16(turso_cdc_registers),
+        count: to_u16(8),
+        dest_reg: to_u16(record_reg),
         index_name: None,
         affinity_str: None,
     });
@@ -2670,16 +4092,17 @@ fn init_limit(
     if limit_ctx.initialize_counter {
         if let Some(expr) = limit {
             match expr.as_ref() {
-                Expr::Literal(Literal::Numeric(n)) => {
-                    if let Ok(value) = n.parse::<i64>() {
+                Expr::Literal(Literal::Numeric(n)) => match parse_numeric_literal(n)? {
+                    crate::types::Value::Integer(value) => {
                         program.add_comment(program.offset(), "LIMIT counter");
                         program.emit_insn(Insn::Integer {
                             value,
                             dest: limit_ctx.reg_limit,
                         });
-                    } else {
+                    }
+                    crate::types::Value::Float(value) => {
                         program.emit_insn(Insn::Real {
-                            value: n.parse::<f64>().unwrap(),
+                            value,
                             dest: limit_ctx.reg_limit,
                         });
                         program.add_comment(program.offset(), "LIMIT counter");
@@ -2687,7 +4110,8 @@ fn init_limit(
                             reg: limit_ctx.reg_limit,
                         });
                     }
-                }
+                    _ => unreachable!("parse_numeric_literal only returns Integer or Float"),
+                },
                 _ => {
                     let r = limit_ctx.reg_limit;
 
@@ -2703,23 +4127,22 @@ fn init_limit(
             let offset_reg = program.alloc_register();
             t_ctx.reg_offset = Some(offset_reg);
             match expr.as_ref() {
-                Expr::Literal(Literal::Numeric(n)) => {
-                    if let Ok(value) = n.parse::<i64>() {
+                Expr::Literal(Literal::Numeric(n)) => match parse_numeric_literal(n)? {
+                    crate::types::Value::Integer(value) => {
                         program.emit_insn(Insn::Integer {
                             value,
                             dest: offset_reg,
                         });
-                    } else {
-                        let value = n.parse::<f64>()?;
+                    }
+                    crate::types::Value::Float(value) => {
                         program.emit_insn(Insn::Real {
                             value,
-                            dest: limit_ctx.reg_limit,
+                            dest: offset_reg,
                         });
-                        program.emit_insn(Insn::MustBeInt {
-                            reg: limit_ctx.reg_limit,
-                        });
+                        program.emit_insn(Insn::MustBeInt { reg: offset_reg });
                     }
-                }
+                    _ => unreachable!("parse_numeric_literal only returns Integer or Float"),
+                },
                 _ => {
                     _ = translate_expr(program, None, expr, offset_reg, &t_ctx.resolver)?;
                 }
@@ -2761,6 +4184,7 @@ fn rewrite_where_for_update_registers(
     columns_start_reg: usize,
     rowid_reg: usize,
 ) -> Result<WalkControl> {
+    rewrite_between_expr(expr);
     walk_expr_mut(expr, &mut |e: &mut Expr| -> Result<WalkControl> {
         match e {
             Expr::Qualified(_, col) | Expr::DoublyQualified(_, _, col) => {

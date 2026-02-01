@@ -585,7 +585,7 @@ pub fn insn_to_row(
                         "r[{}]={}.{}",
                         dest,
                         get_table_or_index_name(*cursor_id),
-                        column_name.unwrap_or(&format!("column {}", *column))
+                        &column_name.map_or_else(|| format!("column {}", *column), |name| name.to_string())
                     ),
                 )
             }
@@ -623,7 +623,7 @@ pub fn insn_to_row(
                         dest_reg,
                         start_reg,
                         start_reg + count - 1,
-                        for_index.unwrap_or("".to_string())
+                        for_index.unwrap_or_else(|| "".to_string())
                     ),
                 )
             }
@@ -814,7 +814,7 @@ pub fn insn_to_row(
                             if k.index.is_some() { "index" } else { "table" },
                             get_table_or_index_name(*cursor_id),
                         ))
-                        .unwrap_or(format!("cursor {cursor_id}"))
+                        .unwrap_or_else(|| format!("cursor {cursor_id}"))
                 ),
             ),
             Insn::SeekRowid {
@@ -840,7 +840,7 @@ pub fn insn_to_row(
                             if k.index.is_some() { "index" } else { "table" },
                             get_table_or_index_name(*cursor_id),
                         ))
-                        .unwrap_or(format!("cursor {cursor_id}")),
+                        .unwrap_or_else(|| format!("cursor {cursor_id}")),
                     target_pc.as_debug_int()
                 ),
             ),
@@ -1006,15 +1006,12 @@ pub fn insn_to_row(
             Insn::SorterOpen {
                 cursor_id,
                 columns,
-                order,
-                collations,
+                order_and_collations,
             } => {
-                let _p4 = String::new();
-                let to_print: Vec<String> = order
+                let to_print: Vec<String> = order_and_collations
                     .iter()
-                    .zip(collations.iter())
-                    .map(|(v, collation)| {
-                        let sign = match v {
+                    .map(|(order, collation)| {
+                        let sign = match order {
                             SortOrder::Asc => "",
                             SortOrder::Desc => "-",
                         };
@@ -1030,7 +1027,7 @@ pub fn insn_to_row(
                     *cursor_id as i64,
                     *columns as i64,
                     0,
-                    Value::build_text(format!("k({},{})", order.len(), to_print.join(","))),
+                    Value::build_text(format!("k({},{})", order_and_collations.len(), to_print.join(","))),
                     0,
                     format!("cursor={cursor_id}"),
                 )
@@ -1378,6 +1375,15 @@ pub fn insn_to_row(
                 0,
                 "".to_string()
             ),
+            Insn::IndexMethodOptimize { db, cursor_id } => (
+                "IndexMethodOptimize",
+                *db as i64,
+                *cursor_id as i64,
+                0,
+                Value::build_text(""),
+                0,
+                "".to_string()
+            ),
             Insn::IndexMethodQuery { db, cursor_id, start_reg, .. } => (
                 "IndexMethodQuery",
                 *db as i64,
@@ -1487,9 +1493,9 @@ pub fn insn_to_row(
                 *db as i64,
                 0,
                 0,
-                Value::build_text(where_clause.clone().unwrap_or("NULL".to_string())),
+                Value::build_text(where_clause.clone().unwrap_or_else(|| "NULL".to_string())),
                 0,
-                where_clause.clone().unwrap_or("NULL".to_string()),
+                where_clause.clone().unwrap_or_else(|| "NULL".to_string()),
             ),
             Insn::PopulateMaterializedViews { cursors } => (
                 "PopulateMaterializedViews",
@@ -1567,6 +1573,15 @@ pub fn insn_to_row(
                 Value::build_text(""),
                 0,
                 format!("r[{dest}]=!r[{reg}]"),
+            ),
+            Insn::IsTrue { reg, dest, null_value, invert } => (
+                "IsTrue",
+                *reg as i64,
+                *dest as i64,
+                if *null_value { 1 } else { 0 },
+                Value::build_text(""),
+                if *invert { 1 } else { 0 },
+                format!("r[{dest}] = IsTrue(r[{reg}], null={}, invert={})", *null_value as i64, *invert as i64),
             ),
             Insn::Concat { lhs, rhs, dest } => (
                 "Concat",
@@ -1799,6 +1814,8 @@ pub fn insn_to_row(
                 max_errors,
                 roots,
                 message_register,
+                quick,
+                tables,
             } => (
                 "IntegrityCk",
                 *max_errors as i64,
@@ -1806,7 +1823,10 @@ pub fn insn_to_row(
                 0,
                 Value::build_text(""),
                 0,
-                format!("roots={roots:?} message_register={message_register}"),
+                format!(
+                    "roots={roots:?} message_register={message_register} quick={quick} tables={}",
+                    tables.len()
+                ),
             ),
             Insn::RowData { cursor_id, dest } => (
                 "RowData",
@@ -1953,18 +1973,18 @@ pub fn insn_to_row(
             0,
             String::new(),
         ),
-        Insn::HashBuild{cursor_id, key_start_reg, num_keys, hash_table_id: hash_table_reg, mem_budget, collations: _, payload_start_reg, num_payload} => {
-            let payload_info = if let Some(p_reg) = payload_start_reg {
-                format!(" payload=r[{}]..r[{}]", p_reg, p_reg + num_payload - 1)
+        Insn::HashBuild { data } => {
+            let payload_info = if let Some(p_reg) = data.payload_start_reg {
+                format!(" payload=r[{}]..r[{}]", p_reg, p_reg + data.num_payload - 1)
             } else {
                 String::new()
             };
             (
                 "HashBuild",
-                *cursor_id as i64,
-                *key_start_reg as i64,
-                *num_keys as i64,
-                Value::build_text(format!("r=[{hash_table_reg}] budget={mem_budget}{payload_info}")),
+                data.cursor_id as i64,
+                data.key_start_reg as i64,
+                data.num_keys as i64,
+                Value::build_text(format!("r=[{}] budget={}{payload_info}", data.hash_table_id, data.mem_budget)),
                 0,
                 String::new(),
             )
@@ -2010,6 +2030,15 @@ pub fn insn_to_row(
                 String::new(),
             )
         }
+        Insn::HashDistinct { data } => (
+            "HashDistinct",
+            data.hash_table_id as i64,
+            data.key_start_reg as i64,
+            data.num_keys as i64,
+            Value::build_text(format!("jmp={}", data.target_pc.as_debug_int())),
+            0,
+            String::new(),
+        ),
         Insn::HashClose{hash_table_id: hash_table_reg} => (
             "HashClose",
             *hash_table_reg as i64,
@@ -2018,6 +2047,24 @@ pub fn insn_to_row(
             Value::build_text(""),
             0,
             String::new(),
+        ),
+        Insn::HashClear { hash_table_id: hash_table_reg } => (
+            "HashClear",
+            *hash_table_reg as i64,
+            0,
+            0,
+            Value::build_text(""),
+            0,
+            String::new(),
+        ),
+        Insn::VacuumInto { dest_path } => (
+            "VacuumInto",
+            0,
+            0,
+            0,
+            Value::build_text(dest_path.to_string()),
+            0,
+            format!("dest={dest_path}"),
         ),
     }
 }

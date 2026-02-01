@@ -1,0 +1,2449 @@
+@database :default:
+@database :default-no-rowidalias:
+
+test date-current-date {
+    SELECT length(date('now')) = 10;
+}
+expect {
+    1
+}
+
+test date-specific-date {
+    SELECT date('2023-05-18');
+}
+expect {
+    2023-05-18
+}
+
+test date-with-time {
+    SELECT date('2023-05-18 15:30:45');
+}
+expect {
+    2023-05-18
+}
+
+test date-iso8601 {
+    SELECT date('2023-05-18T15:30:45');
+}
+expect {
+    2023-05-18
+}
+
+test date-with-milliseconds {
+    SELECT date('2023-05-18 15:30:45.123');
+}
+expect {
+    2023-05-18
+}
+
+test date-julian-day-integer {
+    SELECT date(2460082);
+}
+expect {
+    2023-05-17
+}
+
+test date-julian-day-float {
+    SELECT date(2460082.5);
+}
+expect {
+    2023-05-18
+}
+
+test date-invalid-input {
+    SELECT date('not a date');
+}
+expect {
+}
+
+test date-null-input {
+    SELECT date(NULL);
+}
+expect {
+}
+
+test date-out-of-range {
+    SELECT date('10001-01-01');
+}
+expect {
+}
+
+test date-time-only {
+    SELECT date('15:30:45');
+}
+expect {
+    2000-01-01
+}
+
+test date-with-timezone-utc {
+    SELECT date('2023-05-18 15:30:45Z');
+}
+expect {
+    2023-05-18
+}
+
+test date-with-timezone-positive {
+    SELECT date('2023-05-18 23:30:45+02:00');
+}
+expect {
+    2023-05-18
+}
+
+test date-with-timezone-negative {
+    SELECT date('2023-05-19 01:30:45-05:00');
+}
+expect {
+    2023-05-19
+}
+
+test date-with-timezone-day-change-positive {
+    SELECT date('2023-05-18 23:30:45-03:00');
+}
+expect {
+    2023-05-19
+}
+
+test date-with-timezone-day-change-negative {
+    SELECT date('2023-05-19 01:30:45+03:00');
+}
+expect {
+    2023-05-18
+}
+
+test date-with-timezone-iso8601 {
+    SELECT date('2023-05-18T15:30:45+02:00');
+}
+expect {
+    2023-05-18
+}
+
+test date-with-timezone-and-milliseconds {
+    SELECT date('2023-05-18 15:30:45.123+02:00');
+}
+expect {
+    2023-05-18
+}
+
+test date-with-invalid-timezone {
+    SELECT date('2023-05-18 15:30:45+25:00');
+}
+expect {
+}
+
+test date-with-modifier-add-days {
+    SELECT date('2023-05-18', '+10 days');
+}
+expect {
+    2023-05-28
+}
+
+test date-with-modifier-subtract-days {
+    SELECT date('2023-05-18', '-10 days');
+}
+expect {
+    2023-05-08
+}
+
+test date-with-multiple-modifiers {
+    SELECT date('2023-05-18', '+1 days', '-1 days', '+10 days');
+}
+expect {
+    2023-05-28
+}
+
+test date-with-invalid-modifier {
+    SELECT date('2023-05-18', 'invalid modifier');
+}
+expect {
+}
+
+# julianday edge cases
+
+test julianday-null-input {
+    SELECT julianday(NULL);
+}
+expect {
+}
+
+test julianday-invalid-input {
+    SELECT julianday('not a date');
+}
+expect {
+}
+
+test julianday-empty-string {
+    SELECT julianday('');
+}
+expect {
+}
+
+test julianday-negative-timezone {
+    SELECT julianday('2023-05-18 15:30:45-05:00');
+}
+expect {
+    2460083.3546875
+}
+
+test julianday-z-suffix {
+    SELECT julianday('2023-05-18 15:30:45Z');
+}
+expect {
+    2460083.14635417
+}
+
+test julianday-iso8601-t-separator {
+    SELECT julianday('2023-05-18T15:30:45');
+}
+expect {
+    2460083.14635417
+}
+
+test julianday-out-of-range {
+    SELECT julianday('10001-01-01');
+}
+expect {
+}
+
+test julianday-string-with-modifier {
+    SELECT julianday('2023-05-18 12:00:00', '+1 day');
+}
+expect {
+    2460084.0
+}
+expect @js {
+    2460084
+}
+
+test julianday-string-with-start-of-month {
+    SELECT julianday('2023-05-18', 'start of month');
+}
+expect {
+    2460065.5
+}
+
+test julianday-string-with-minutes-modifier {
+    SELECT julianday('2023-05-18 12:00:00', '+30 minutes');
+}
+expect {
+    2460083.02083333
+}
+
+# timediff argument count
+test timediff-one-arg {
+    SELECT timediff('12:00:00');
+}
+expect error {
+    wrong number of arguments.*
+}
+
+# floor/ceiling edge cases
+test date-floor-then-add-day {
+    SELECT date('2024-01-31', '+1 month', 'floor', '+1 day');
+}
+expect {
+    2024-03-01
+}
+
+test datetime-floor-then-add-hours {
+    SELECT datetime('2024-01-31 10:00:00', '+1 month', 'floor', '+2 hours');
+}
+expect {
+    2024-02-29 12:00:00
+}
+
+test date-fractional-month-floor {
+    SELECT date('2024-01-15', '+1.5 month', 'floor');
+}
+expect {
+    2024-03-01
+}
+
+test datetime-fractional-month-floor {
+    SELECT datetime('2024-01-15 00:00:00', '+1.5 month', 'floor');
+}
+expect {
+    2024-03-01 00:00:00
+}
+
+# modifier ordering errors
+test unixepoch-not-first-modifier {
+    SELECT date(1000, '+1 day', 'unixepoch');
+}
+expect {
+}
+
+test julianday-not-first-modifier {
+    SELECT date(2460000, '+1 day', 'julianday');
+}
+expect {
+}
+
+test unixepoch-after-start-of-day {
+    SELECT datetime(86400, 'start of day', 'unixepoch');
+}
+expect {
+}
+
+test julianday-after-hours-modifier {
+    SELECT time(2460083, '+1 hour', 'julianday');
+}
+expect {
+}
+
+# negative date-only offset
+test date-negative-date-offset {
+    SELECT date('2023-05-18', '-0001-01-01');
+}
+expect {
+    2022-04-17
+}
+
+test date-negative-date-offset-2 {
+    SELECT date('2023-12-31', '-0001-00-00');
+}
+expect {
+    2022-12-31
+}
+
+test date-with-1200-offset {
+    SELECT date('2023-05-18 23:30:45+1200');
+}
+expect {
+}
+
+test date-with-12-offset {
+    SELECT date('2023-05-18 23:30:45+12');
+}
+expect {
+}
+
+test datetime-huge-number {
+    SELECT datetime(9466848000000.0, 'unixepoch');
+}
+expect {
+}
+
+test datetime-negative-date-offset {
+    SELECT datetime('2023-05-18 12:30:00', '-0001-01-01');
+}
+expect {
+    2022-04-17 12:30:00
+}
+
+test unixepoch-negative-date-offset {
+    SELECT unixepoch('2023-05-18', '-0001-01-01');
+}
+expect {
+    1650153600
+}
+
+test date-with-auto-julianday-top {
+    SELECT date(5373484, 'auto');
+}
+expect {
+    9999-12-31
+}
+
+test date-with-auto-unixepoch-top {
+    SELECT date(5373484.5, 'auto');
+}
+expect {
+    1970-03-04
+}
+
+test date-with-auto-julianday-bottom {
+    SELECT date(0, 'auto');
+}
+expect {
+    -4713-11-24
+}
+
+test date-with-auto-unixepoch-bottom {
+    SELECT date(-1, 'auto');
+}
+expect {
+    1969-12-31
+}
+
+test date-with-unixepoch {
+    SELECT date(2460292.5, 'unixepoch');
+}
+expect {
+    1970-01-29
+}
+
+test date-with-julianday {
+    SELECT date(2460292.5, 'julianday');
+}
+expect {
+    2023-12-14
+}
+
+test time-no-arg {
+    SELECT length(time()) = 8;
+}
+expect {
+    1
+}
+
+test time-current-time {
+    SELECT length(time('now')) = 8;
+}
+expect {
+    1
+}
+
+test time-specific-time {
+    SELECT time('04:02:00');
+}
+expect {
+    04:02:00
+}
+
+test time-of-datetime {
+    SELECT time('2023-05-18 15:30:45');
+}
+expect {
+    15:30:45
+}
+
+test time-iso8601 {
+    SELECT time('2023-05-18T15:30:45');
+}
+expect {
+    15:30:45
+}
+
+test time-with-milliseconds {
+    SELECT time('2023-05-18 15:30:45.123');
+}
+expect {
+    15:30:45
+}
+
+test time-julian-day-integer {
+    SELECT time(2460082);
+}
+expect {
+    12:00:00
+}
+
+test time-julian-day-float {
+    SELECT time(2460082.2);
+}
+expect {
+    16:48:00
+}
+
+test time-invalid-input {
+    SELECT time('not a time');
+}
+expect {
+}
+
+test time-null-input {
+    SELECT time(NULL);
+}
+expect {
+}
+
+test time-out-of-range {
+    SELECT time('25:05:01');
+}
+expect {
+}
+
+test time-date-only {
+    SELECT time('2024-02-02');
+}
+expect {
+    00:00:00
+}
+
+test time-with-timezone-utc {
+    SELECT time('2023-05-18 15:30:45Z');
+}
+expect {
+    15:30:45
+}
+
+test time-with-timezone-positive {
+    SELECT time('2023-05-18 23:30:45+07:00');
+}
+expect {
+    16:30:45
+}
+
+test time-with-timezone-negative {
+    SELECT time('2023-05-19 01:30:45-05:00');
+}
+expect {
+    06:30:45
+}
+
+test time-with-timezone-day-change-positive {
+    SELECT time('2023-05-18 23:30:45-03:00');
+}
+expect {
+    02:30:45
+}
+
+test time-with-timezone-day-change-negative {
+    SELECT time('2023-05-19 01:30:45+03:00');
+}
+expect {
+    22:30:45
+}
+
+test time-with-timezone-iso8601 {
+    SELECT time('2023-05-18T15:30:45+02:00');
+}
+expect {
+    13:30:45
+}
+
+test time-with-timezone-and-milliseconds {
+    SELECT time('2023-05-18 15:30:45.123+02:00');
+}
+expect {
+    13:30:45
+}
+
+test time-with-invalid-timezone {
+    SELECT time('2023-05-18 15:30:45+25:00');
+}
+expect {
+}
+
+test time-with-modifier-start-of-day {
+    SELECT time('2023-05-18 15:30:45', 'start of day');
+}
+expect {
+    00:00:00
+}
+
+test time-with-modifier-add-hours {
+    SELECT time('2023-05-18 15:30:45', '+2 hours');
+}
+expect {
+    17:30:45
+}
+
+test time-with-modifier-add-minutes {
+    SELECT time('2023-05-18 15:30:45', '+45 minutes');
+}
+expect {
+    16:15:45
+}
+
+test time-with-modifier-add-seconds {
+    SELECT time('2023-05-18 15:30:45', '+30 seconds');
+}
+expect {
+    15:31:15
+}
+
+test time-with-modifier-subtract-hours {
+    SELECT time('2023-05-18 15:30:45', '-3 hours');
+}
+expect {
+    12:30:45
+}
+
+test time-with-modifier-subtract-minutes {
+    SELECT time('2023-05-18 15:30:45', '-15 minutes');
+}
+expect {
+    15:15:45
+}
+
+test time-with-modifier-subtract-seconds {
+    SELECT time('2023-05-18 15:30:45', '-45 seconds');
+}
+expect {
+    15:30:00
+}
+
+test time-with-multiple-modifiers {
+    SELECT time('2023-05-18 15:30:45', '+1 hours', '-30 minutes', '+15 seconds');
+}
+expect {
+    16:01:00
+}
+
+test time-with-invalid-modifier {
+    SELECT time('2023-05-18 15:30:45', 'invalid modifier');
+}
+expect {
+}
+
+test time-with-invalid-modifier-2 {
+    SELECT time('2023-05-18 15:30:45', '+1 hour', 'invalid modifier');
+}
+expect {
+}
+
+test time-with-auto {
+    SELECT time('2025-12-12 16:30:00', 'auto');
+}
+expect {
+    16:30:00
+}
+
+test time-with-unixepoch {
+    SELECT time(2460292.5, 'unixepoch');
+}
+expect {
+    11:24:52
+}
+
+test time-with-unixepoch-modifiers {
+    SELECT time(2460292.5, 'unixepoch', '+1 hour', '15 seconds');
+}
+expect {
+    12:25:07
+}
+
+test time-with-julianday {
+    SELECT time(2460292.5, 'julianday');
+}
+expect {
+    00:00:00
+}
+
+test time-with-julianday-2 {
+    SELECT time(2460292.5, 'julianday');
+}
+expect {
+    00:00:00
+}
+
+test time-with-julianday-modifiers {
+    SELECT time(2460292, 'julianday', '+1 hour', '+15 second', '+7 minute');
+}
+expect {
+    13:07:15
+}
+
+test unixepoch-at-start {
+    SELECT unixepoch('1970-01-01');
+}
+expect {
+    0
+}
+
+test unixepoch-at-1-second-before-epochtime {
+    SELECT unixepoch('1969-12-31 23:59:59');
+}
+expect {
+    -1
+}
+
+test unixepoch-at-future {
+    SELECT unixepoch('9999-12-31 23:59:59');
+}
+expect {
+    253402300799
+}
+
+test unixepoch-at-start-of-time {
+    SELECT unixepoch('0000-01-01 00:00:00');
+}
+expect {
+    -62167219200
+}
+
+test unixepoch-at-millisecond-precision-input-produces-seconds-precision-output {
+    SELECT unixepoch('2022-01-27 12:59:28.052');
+}
+expect {
+    1643288368
+}
+
+test unixepoch-with-modifier-start-of-day {
+    SELECT unixepoch('2023-05-18 15:30:45', 'start of day');
+}
+expect {
+    1684368000
+}
+
+test unixepoch-with-modifier-start-of-month {
+    SELECT unixepoch('2023-05-18', 'start of month');
+}
+expect {
+    1682899200
+}
+
+test unixepoch-with-modifier-start-of-year {
+    SELECT unixepoch('2023-05-18', 'start of year');
+}
+expect {
+    1672531200
+}
+
+test unixepoch-with-modifier-add-months {
+    SELECT unixepoch('2023-05-18', '+2 months');
+}
+expect {
+    1689638400
+}
+
+test unixepoch-with-modifier-subtract-months {
+    SELECT unixepoch('2023-05-18', '-3 months');
+}
+expect {
+    1676678400
+}
+
+test unixepoch-with-modifier-add-years {
+    SELECT unixepoch('2023-05-18', '+1 year');
+}
+expect {
+    1715990400
+}
+
+test unixepoch-with-modifier-subtract-years {
+    SELECT unixepoch('2023-05-18', '-2 years');
+}
+expect {
+    1621296000
+}
+
+test unixepoch-default-ceiling {
+    SELECT unixepoch('2024-01-31', '+1 month');
+}
+expect {
+    1709337600
+}
+
+test unixepoch-default-ceiling-fractional {
+    SELECT unixepoch('2024-01-31', '+1.5 month');
+}
+expect {
+    1710633600
+}
+
+test unixepoch-floor {
+    SELECT unixepoch('2024-01-31', '+1 month', 'floor');
+}
+expect {
+    1709164800
+}
+
+test unixepoch-floor-keeps-time {
+    SELECT unixepoch('2024-01-31 10:20:30', '+1 month', 'floor');
+}
+expect {
+    1709202030
+}
+
+test unixepoch-ceiling-keeps-time {
+    SELECT unixepoch('2024-01-31 10:20:30', '+1 month', 'ceiling');
+}
+expect {
+    1709374830
+}
+
+test unixepoch-ceiling-floor-2 {
+    SELECT unixepoch('2024-01-31', '+1 month', 'floor');
+}
+expect {
+    1709164800
+}
+
+test unixepoch-ceiling-floor-5 {
+    SELECT unixepoch('2024-01-31', '+1 month', '+1 month', 'floor');
+}
+expect {
+    1712016000
+}
+
+test unixepoch-ceiling-floor-6 {
+    SELECT unixepoch('2024-01-31', '+1 month', 'ceiling');
+}
+expect {
+    1709337600
+}
+
+test unixepoch-ceiling-floor-7 {
+    SELECT unixepoch('2024-01-31', '+1 month', 'floor', 'ceiling');
+}
+expect {
+    1709164800
+}
+
+test unixepoch-ceiling-floor-8 {
+    SELECT unixepoch('2024-01-31', '+1 month', '+1 day', 'floor');
+}
+expect {
+    1709424000
+}
+
+test unixepoch-with-modifier-weekday {
+    SELECT unixepoch('2023-05-18', 'weekday 0');
+}
+expect {
+    1684627200
+}
+
+test unixepoch-with-subsec {
+    SELECT unixepoch('2023-05-18 15:30:45.123', 'subsec');
+}
+expect {
+    1684423845.123
+}
+
+test unixepoch-with-modifier-add-months-31 {
+    SELECT unixepoch('2023-01-31', '+1 month');
+}
+expect {
+    1677801600
+}
+
+test unixepoch-with-modifier-subtract-months-31 {
+    SELECT unixepoch('2023-03-31', '-1 month');
+}
+expect {
+    1677801600
+}
+
+test unixepoch-with-modifier-add-months-large {
+    SELECT unixepoch('2023-01-31', '+13 months');
+}
+expect {
+    1709337600
+}
+
+test unixepoch-with-modifier-subtract-months-large {
+    SELECT unixepoch('2023-01-31', '-13 months');
+}
+expect {
+    1640908800
+}
+
+test unixepoch-with-modifier-february-leap-year {
+    SELECT unixepoch('2020-02-29', '+12 months');
+}
+expect {
+    1614556800
+}
+
+test unixepoch-with-modifier-february-non-leap-year {
+    SELECT unixepoch('2019-02-28', '+12 months');
+}
+expect {
+    1582848000
+}
+
+test unixepoch-with-modifier-date {
+    SELECT unixepoch('2023-02-15 15:30:45', '+0001-01-01');
+}
+expect {
+    1710603045
+}
+
+test unixepoch-with-modifier-datetime-pos {
+    SELECT unixepoch('2023-02-15 15:30:45', '+0001-01-01 15:30');
+}
+expect {
+    1710658845
+}
+
+test unixepoch-with-modifier-sub {
+    SELECT unixepoch('2023-12-12', '-0002-10-10 15:30:45');
+}
+expect {
+    1612168155
+}
+
+test unixepoch-with-modifier-add {
+    SELECT unixepoch('2023-12-12', '+0002-10-10 15:30:45');
+}
+expect {
+    1792683045
+}
+
+test unixepoch-with-multiple-modifiers {
+    SELECT unixepoch('2023-05-18', '+1 month', '-10 days', 'start of year');
+}
+expect {
+    1672531200
+}
+
+test unixepoch-with-multiple-modifiers-datetime {
+    SELECT unixepoch('2024-01-31', '+1 month', '+13 hours', '+5 minutes', '+62 seconds');
+}
+expect {
+    1709384762
+}
+
+test date-with-modifier-start-of-day {
+    SELECT date('2023-05-18 15:30:45', 'start of day');
+}
+expect {
+    2023-05-18
+}
+
+test date-with-modifier-start-of-month {
+    SELECT date('2023-05-18', 'start of month');
+}
+expect {
+    2023-05-01
+}
+
+test date-with-modifier-start-of-year {
+    SELECT date('2023-05-18', 'start of year');
+}
+expect {
+    2023-01-01
+}
+
+test date-with-modifier-add-months {
+    SELECT date('2023-05-18', '+2 months');
+}
+expect {
+    2023-07-18
+}
+
+test datetime-default-ceiling {
+    SELECT date('2024-01-31', '+1 month'); -- default ceiling
+}
+expect {
+    2024-03-02
+}
+
+test datetime-floor-keeps-time {
+    SELECT datetime('2024-01-31 10:20:30', '+1 month', 'floor');
+}
+expect {
+    2024-02-29 10:20:30
+}
+
+test datetime-julianday-negative {
+    SELECT datetime(-1, 'julianday');
+}
+expect {
+}
+
+test datetime-unixepoch-negative {
+    SELECT datetime(-0.5, 'unixepoch');
+}
+expect {
+    1969-12-31 23:59:59
+}
+
+test datetime-unixepoch-4decimal {
+    SELECT datetime(0.9999, 'unixepoch');
+}
+expect {
+    1970-01-01 00:00:01
+}
+
+test datetime-fractional-month {
+    SELECT datetime('2025-01-01', '+1.5 month');
+}
+expect {
+    2025-02-16 00:00:00
+}
+
+test datetime-fractional-year {
+    SELECT datetime('2025-01-01', '+1.5 year');
+}
+expect {
+    2026-07-02 12:00:00
+}
+
+test datetime-ceiling-keeps-time {
+    SELECT datetime('2024-01-31 10:20:30', '+1 month', 'ceiling');
+}
+expect {
+    2024-03-02 10:20:30
+}
+
+test date-ceiling-floor-2 {
+    SELECT date('2024-01-31', '+1 month', 'floor');
+}
+expect {
+    2024-02-29
+}
+
+test date-ceiling-floor-3 {
+    SELECT date('2023-01-31', '+1 month', 'floor');
+}
+expect {
+    2023-02-28
+}
+
+test date-ceiling-floor-4 {
+    SELECT date('2024-03-31', '-1 month', 'floor');
+}
+expect {
+    2024-02-29
+}
+
+test date-ceiling-floor-5 {
+    SELECT date('2024-01-31', '+1 month', '+1 month', 'floor');
+}
+expect {
+    2024-04-02
+}
+
+test date-ceiling-floor-6 {
+    SELECT date('2024-01-31', '+1 month', 'ceiling');
+}
+expect {
+    2024-03-02
+}
+
+test date-ceiling-floor-7 {
+    SELECT date('2024-01-31', '+1 month', 'floor', 'ceiling');
+}
+expect {
+    2024-02-29
+}
+
+test date-ceiling-floor-8 {
+    SELECT date('2024-01-31', '+1 month', '+1 day', 'floor');
+}
+expect {
+    2024-03-03
+}
+
+test date-with-modifier-subtract-months {
+    SELECT date('2023-05-18', '-3 months');
+}
+expect {
+    2023-02-18
+}
+
+test date-with-modifier-add-years {
+    SELECT date('2023-05-18', '+1 year');
+}
+expect {
+    2024-05-18
+}
+
+test date-with-modifier-subtract-years {
+    SELECT date('2023-05-18', '-2 years');
+}
+expect {
+    2021-05-18
+}
+
+test date-with-modifier-weekday {
+    SELECT date('2023-05-18', 'weekday 0');
+}
+expect {
+    2023-05-21
+}
+
+test date-with-multiple-modifiers-2 {
+    SELECT date('2023-05-18', '+1 month', '-10 days', 'start of year');
+}
+expect {
+    2023-01-01
+}
+
+test date-with-subsec {
+    SELECT date('2023-05-18 15:30:45.123', 'subsec');
+}
+expect {
+    2023-05-18
+}
+
+test time-with-modifier-add-hours-2 {
+    SELECT time('2023-05-18 15:30:45', '+5 hours');
+}
+expect {
+    20:30:45
+}
+
+test time-with-modifier-subtract-hours-2 {
+    SELECT time('2023-05-18 15:30:45', '-2 hours');
+}
+expect {
+    13:30:45
+}
+
+test time-with-modifier-add-minutes-2 {
+    SELECT time('2023-05-18 15:30:45', '+45 minutes');
+}
+expect {
+    16:15:45
+}
+
+test time-with-modifier-subtract-seconds-2 {
+    SELECT time('2023-05-18 15:30:45', '-50 seconds');
+}
+expect {
+    15:29:55
+}
+
+test time-with-subsec {
+    SELECT time('2023-05-18 15:30:45.123', 'subsec');
+}
+expect {
+    15:30:45.123
+}
+
+test time-with-modifier-add {
+    SELECT time('15:30:45', '+15:30:15');
+}
+expect {
+    07:01:00
+}
+
+test time-with-modifier-sub {
+    SELECT time('15:30:45', '-15:30:15');
+}
+expect {
+    00:00:30
+}
+
+test date-with-modifier-add-months-2 {
+    SELECT date('2023-01-31', '+1 month');
+}
+expect {
+    2023-03-03
+}
+
+test date-with-modifier-subtract-months-2 {
+    SELECT date('2023-03-31', '-1 month');
+}
+expect {
+    2023-03-03
+}
+
+test date-with-modifier-add-months-large {
+    SELECT date('2023-01-31', '+13 months');
+}
+expect {
+    2024-03-02
+}
+
+test date-with-modifier-subtract-months-large {
+    SELECT date('2023-01-31', '-13 months');
+}
+expect {
+    2021-12-31
+}
+
+test date-with-modifier-february-leap-year {
+    SELECT date('2020-02-29', '+12 months');
+}
+expect {
+    2021-03-01
+}
+
+test date-with-modifier-february-non-leap-year {
+    SELECT date('2019-02-28', '+12 months');
+}
+expect {
+    2020-02-28
+}
+
+test date-with-modifier-invalid-date {
+    SELECT date('2023-02-15 15:30:45', '-0001-01-01 00:00');
+}
+expect {
+    2022-01-14
+}
+
+test date-with-modifier-date {
+    SELECT date('2023-02-15 15:30:45', '+0001-01-01');
+}
+expect {
+    2024-03-16
+}
+
+test datetime-with-modifier-datetime-pos {
+    SELECT datetime('2023-02-15 15:30:45', '+0001-01-01 15:30');
+}
+expect {
+    2024-03-17 07:00:45
+}
+
+test datetime-with-modifier-datetime-neg {
+    SELECT datetime('2023-02-15 15:30:45', '+0001-01-01 15:30');
+}
+expect {
+    2024-03-17 07:00:45
+}
+
+test datetime-with-modifier-datetime-large {
+    SELECT datetime('2023-02-15 15:30:45', '+7777-10-10 23:59');
+}
+expect {
+    9800-12-26 15:29:45
+}
+
+test datetime-with-modifier-datetime-sub-large {
+    SELECT datetime('2023-02-15 15:30:45', '-2024-10-10 23:59');
+}
+expect {
+    -0002-04-04 15:31:45
+}
+
+test datetime-with-timezone-utc {
+    SELECT datetime('2023-05-18 15:30:45Z');
+}
+expect {
+    2023-05-18 15:30:45
+}
+
+test datetime-with-modifier-sub {
+    SELECT datetime('2023-12-12', '-0002-10-10 15:30:45');
+}
+expect {
+    2021-02-01 08:29:15
+}
+
+test datetime-with-modifier-add {
+    SELECT datetime('2023-12-12', '+0002-10-10 15:30:45');
+}
+expect {
+    2026-10-22 15:30:45
+}
+
+test time-with-multiple-modifiers-2 {
+    SELECT time('2023-05-18 15:30:45', '+1 hours', '-20 minutes', '+15 seconds', 'subsec');
+}
+expect {
+    16:11:00.000
+}
+
+test datetime-with-multiple-modifiers {
+    select datetime('2024-01-31', '+1 month', '+13 hours', '+5 minutes', '+62 seconds');
+}
+expect {
+    2024-03-02 13:06:02
+}
+
+test datetime-with-modifier-ceiling {
+    SELECT datetime('2023-05-18 15:30:45', 'ceiling');
+}
+expect {
+    2023-05-18 15:30:45
+}
+
+test datetime-with-modifier-ceiling-already-ceiled {
+    SELECT datetime('2023-05-18 23:59:59', 'ceiling');
+}
+expect {
+    2023-05-18 23:59:59
+}
+
+test datetime-with-ceiling-modifier-invalid-input {
+    SELECT datetime('not-a-date', 'ceiling');
+}
+expect {
+}
+
+test datetime-with-ceiling-modifier-stacked {
+    SELECT datetime('2023-05-18 15:30:45', '+1 day', 'ceiling');
+}
+expect {
+    2023-05-19 15:30:45
+}
+
+test date-with-ceiling-modifier-basic {
+    SELECT date('2023-05-18 15:30:45', 'ceiling');
+}
+expect {
+    2023-05-18
+}
+
+test datetime-with-weekday {
+    SELECT datetime('2023-05-18', 'weekday 3');
+}
+expect {
+    2023-05-24 00:00:00
+}
+
+test unixepoch-subsec {
+    SELECT unixepoch('2023-05-18 15:30:45.123');
+}
+expect {
+    1684423845
+}
+
+test unixepoch-invalid-date {
+    SELECT unixepoch('not-a-date');
+}
+expect {
+}
+
+test unixepoch-leap-second {
+    SELECT unixepoch('2015-06-30 23:59:60');
+}
+expect {
+}
+
+test unixepoch-negative-timestamp {
+    SELECT unixepoch('1969-12-31 23:59:59');
+}
+expect {
+    -1
+}
+
+test unixepoch-large-date {
+    SELECT unixepoch('9999-12-31 23:59:59');
+}
+expect {
+    253402300799
+}
+
+test datetime-with-timezone {
+    SELECT datetime('2023-05-19 01:30:45+03:00');
+}
+expect {
+    2023-05-18 22:30:45
+}
+
+test julianday-fractional {
+    SELECT julianday('2023-05-18 15:30:45.123');
+}
+expect {
+    2460083.14635559
+}
+
+test julianday-fractional-2 {
+    SELECT julianday('2000-01-01 12:00:00.500');
+}
+expect {
+    2451545.00000579
+}
+
+test julianday-rounded-up {
+    SELECT julianday('2023-05-18 15:30:45.129');
+}
+expect {
+    2460083.14635566
+}
+
+test julianday-with-timezone {
+    SELECT julianday('2023-05-18 15:30:45+02:00');
+}
+expect {
+    2460083.06302083
+}
+
+test julianday-fractional-seconds {
+    SELECT julianday('2023-05-18 15:30:45.123');
+}
+expect {
+    2460083.14635559
+}
+
+test julianday-time-only {
+    SELECT julianday('15:30:45');
+}
+expect {
+    2451545.14635417
+}
+
+test julianday-midnight {
+    SELECT julianday('2023-05-18 00:00:00');
+}
+expect {
+    2460082.5
+}
+
+test julianday-noon {
+    SELECT julianday('2023-05-18 12:00:00');
+}
+expect {
+    2460083.0
+}
+expect @js {
+    2460083
+}
+
+test julianday-fractional-zero {
+    SELECT julianday('2023-05-18 00:00:00.000');
+}
+expect {
+    2460082.5
+}
+
+test julianday-date-only {
+    SELECT julianday('2023-05-18');
+}
+expect {
+    2460082.5
+}
+
+test julianday-with-modifier-day {
+    SELECT julianday(2454832.5,'+1 day');
+}
+expect {
+    2454833.5
+}
+
+test julianday-with-modifier-hour {
+    SELECT julianday(2454832.5,'-3 hours');
+}
+expect {
+    2454832.375
+}
+
+test julianday-max-day {
+    SELECT julianday('9999-12-31 23:59:59');
+}
+expect {
+    5373484.49998843
+}
+
+# Strftime tests
+test strftime-error-null {
+    SELECT strftime('%Y', 'not-a-valid-date');
+}
+expect {
+}
+
+test strftime-day {
+    SELECT strftime('%d', '2025-01-23T13:10:30.567');
+}
+expect {
+    23
+}
+
+test strftime-day-without-leading-zero-1 {
+    SELECT strftime('%e', '2025-01-23T13:10:30.567');
+}
+expect {
+    23
+}
+
+test strftime-day-without-leading-zero-2 {
+    SELECT strftime('%e', '2025-01-02T13:10:30.567');
+}
+expect raw {
+ 2
+}
+
+# TODO not a typo in sqlite there is also a space 
+test strftime-fractional-seconds {
+    SELECT strftime('%f', '2025-01-02T13:10:30.567');
+}
+expect {
+    30.567
+}
+
+test strftime-iso-8601-date {
+    SELECT strftime('%F', '2025-01-23T13:10:30.567');
+}
+expect {
+    2025-01-23
+}
+
+test strftime-iso-8601-year {
+    SELECT strftime('%G', '2025-01-23T13:10:30.567');
+}
+expect {
+    2025
+}
+
+test strftime-iso-8601-year-2_digit {
+    SELECT strftime('%g', '2025-01-23T13:10:30.567');
+}
+expect {
+    25
+}
+
+test strftime-hour {
+    SELECT strftime('%H', '2025-01-23T13:10:30.567');
+}
+expect {
+    13
+}
+
+test strftime-hour-12-hour-clock {
+    SELECT strftime('%I', '2025-01-23T13:10:30.567');
+}
+expect {
+    01
+}
+
+test strftime-day-of-year {
+    SELECT strftime('%j', '2025-01-23T13:10:30.567');
+}
+expect {
+    023
+}
+
+test strftime-julianday {
+    SELECT strftime('%J', '2025-01-23T13:10:30.567');
+}
+expect {
+    2460699.048964896
+}
+
+test strftime-hour-without-leading-zero-1 {
+    SELECT strftime('%k', '2025-01-23T13:10:30.567');
+}
+expect {
+    13
+}
+
+test strftime-hour-without-leading-zero-2 {
+    SELECT strftime('%k', '2025-01-23T02:10:30.567');
+}
+expect raw {
+ 2
+}
+
+test strftime-hour-12-hour-clock-without-leading-zero-2 {
+    SELECT strftime('%l', '2025-01-23T13:10:30.567');
+}
+expect raw {
+ 1
+}
+
+test strftime-month {
+    SELECT strftime('%m', '2025-01-23T13:10:30.567');
+}
+expect {
+    01
+}
+
+test strftime-minute {
+    SELECT strftime('%M', '2025-01-23T13:14:30.567');
+}
+expect {
+    14
+}
+
+test strftime-am-pm1 {
+    SELECT strftime('%p', '2025-01-23T11:14:30.567');
+}
+expect {
+    AM
+}
+
+test strftime-am-pm-2 {
+    SELECT strftime('%p', '2025-01-23T13:14:30.567');
+}
+expect {
+    PM
+}
+
+test strftime-am-pm-lower-1 {
+    SELECT strftime('%P', '2025-01-23T11:14:30.567');
+}
+expect {
+    am
+}
+
+test strftime-am-pm-lower-2 {
+    SELECT strftime('%P', '2025-01-23T13:14:30.567');
+}
+expect {
+    pm
+}
+
+test strftime-iso8601-time {
+    SELECT strftime('%R', '2025-01-23T13:14:30.567');
+}
+expect {
+    13:14
+}
+
+test strftime-seconds-since-epoch {
+    SELECT strftime('%s', '2025-01-23T13:14:30.567');
+}
+expect {
+    1737638070
+}
+
+test strftime-with-subsec {
+    SELECT strftime('%s', '2000-01-01 12:00:00.123', 'subsec');
+}
+expect {
+    946728000.123
+}
+
+test strftime-with-subsec-math {
+    SELECT (strftime('%s', '2000-01-01 12:00:00.123', 'subsec') - 946728000);
+}
+expect {
+    0.123000025749207
+}
+
+test strftime-seconds {
+    SELECT strftime('%S', '2025-01-23T13:14:30.567');
+}
+expect {
+    30
+}
+
+test strftime-iso8601-with-seconds {
+    SELECT strftime('%T', '2025-01-23T13:14:30.567');
+}
+expect {
+    13:14:30
+}
+
+test strftime-week-year-start-sunday {
+    SELECT strftime('%U', '2025-01-23T13:14:30.567');
+}
+expect {
+    03
+}
+
+test strftime-day-week-start-monday {
+    SELECT strftime('%u', '2025-01-23T13:14:30.567');
+}
+expect {
+    4
+}
+
+test strftime-iso8601-week-year {
+    SELECT strftime('%V', '2025-01-23T13:14:30.567');
+}
+expect {
+    04
+}
+
+test strftime-day-week-start-sunday {
+    SELECT strftime('%w', '2025-01-23T13:14:30.567');
+}
+expect {
+    4
+}
+
+test strftime-day-week-start-sunday-2 {
+    SELECT strftime('%w', '2025-01-23T13:14:30.567');
+}
+expect {
+    4
+}
+
+test strftime-week-year-start-sunday-2 {
+    SELECT strftime('%W', '2025-01-23T13:14:30.567');
+}
+expect {
+    03
+}
+
+test strftime-year {
+    SELECT strftime('%Y', '2025-01-23T13:14:30.567');
+}
+expect {
+    2025
+}
+
+test strftime-percent {
+    SELECT strftime('%%', '2025-01-23T13:14:30.567');
+}
+expect {
+    %
+}
+
+# Tests that should return null or empty string
+# Will test formatter strings that exist in chrono
+# But should not exist in sqlite
+
+test strftime-invalid-S-3f {
+    SELECT strftime('%S.%3f','2025-01-23T13:14:30.567');
+}
+expect {
+}
+
+test strftime-invalid-C {
+    SELECT strftime('%C','2025-01-23T13:14:30.567');
+}
+expect {
+}
+
+test strftime-invalid-y {
+    SELECT strftime('%y','2025-01-23T13:14:30.567');
+}
+expect {
+}
+
+test strftime-invalid-b {
+    SELECT strftime('%b','2025-01-23T13:14:30.567');
+}
+expect {
+}
+
+test strftime-invalid-B {
+    SELECT strftime('%B','2025-01-23T13:14:30.567');
+}
+expect {
+}
+
+test strftime-invalid-h {
+    SELECT strftime('%h','2025-01-23T13:14:30.567');
+}
+expect {
+}
+
+test strftime-invalid-a {
+    SELECT strftime('%a','2025-01-23T13:14:30.567');
+}
+expect {
+}
+
+test strftime-invalid-A {
+    SELECT strftime('%A','2025-01-23T13:14:30.567');
+}
+expect {
+}
+
+test strftime-invalid-D {
+    SELECT strftime('%D','2025-01-23T13:14:30.567');
+}
+expect {
+}
+
+test strftime-invalid-x {
+    SELECT strftime('%x','2025-01-23T13:14:30.567');
+}
+expect {
+}
+
+test strftime-invalid-v {
+    SELECT strftime('%v','2025-01-23T13:14:30.567');
+}
+expect {
+}
+
+test strftime-invalid-dotf {
+    SELECT strftime('%.f','2025-01-23T13:14:30.567');
+}
+expect {
+}
+
+test strftime-invalid-dot3f {
+    SELECT strftime('%.3f','2025-01-23T13:14:30.567');
+}
+expect {
+}
+
+test strftime-invalid-dot6f {
+    SELECT strftime('%.6f','2025-01-23T13:14:30.567');
+}
+expect {
+}
+
+test strftime-invalid-dot9f {
+    SELECT strftime('%.9f','2025-01-23T13:14:30.567');
+}
+expect {
+}
+
+test strftime-invalid-3f {
+    SELECT strftime('%3f','2025-01-23T13:14:30.567');
+}
+expect {
+}
+
+test strftime-invalid-6f {
+    SELECT strftime('%6f','2025-01-23T13:14:30.567');
+}
+expect {
+}
+
+test strftime-invalid-9f {
+    SELECT strftime('%9f','2025-01-23T13:14:30.567');
+}
+expect {
+}
+
+test strftime-invalid-X {
+    SELECT strftime('%X','2025-01-23T13:14:30.567');
+}
+expect {
+}
+
+test strftime-invalid-r {
+    SELECT strftime('%r','2025-01-23T13:14:30.567');
+}
+expect {
+}
+
+test strftime-invalid-Z {
+    SELECT strftime('%Z','2025-01-23T13:14:30.567');
+}
+expect {
+}
+
+test strftime-invalid-z {
+    SELECT strftime('%z','2025-01-23T13:14:30.567');
+}
+expect {
+}
+
+test strftime-invalid-colonz {
+    SELECT strftime('%:z','2025-01-23T13:14:30.567');
+}
+expect {
+}
+
+test strftime-invalid-doublecolonz {
+    SELECT strftime('%::z','2025-01-23T13:14:30.567');
+}
+expect {
+}
+
+test strftime-invalid-triplecolonz {
+    SELECT strftime('%:::z','2025-01-23T13:14:30.567');
+}
+expect {
+}
+
+test strftime-invalid-hashz {
+    SELECT strftime('%#z','2025-01-23T13:14:30.567');
+}
+expect {
+}
+
+test strftime-invalid-c {
+    SELECT strftime('%c','2025-01-23T13:14:30.567');
+}
+expect {
+}
+
+test strftime-invalid-plus {
+    SELECT strftime('%+','2025-01-23T13:14:30.567');
+}
+expect {
+}
+
+test strftime-invalid-t {
+    SELECT strftime('%t','2025-01-23T13:14:30.567');
+}
+expect {
+}
+
+test strftime-invalid-n {
+    SELECT strftime('%n','2025-01-23T13:14:30.567');
+}
+expect {
+}
+
+test strftime-invalid-dashquestion {
+    SELECT strftime('%-?','2025-01-23T13:14:30.567');
+}
+expect {
+}
+
+test strftime-invalid-underscorequestion {
+    SELECT strftime('%_?','2025-01-23T13:14:30.567');
+}
+expect {
+}
+
+test strftime-invalid-zeroquestion {
+    SELECT strftime('%0?','2025-01-23T13:14:30.567');
+}
+expect {
+}
+
+test strftime-julianday-2 {
+    SELECT strftime('%Y-%m-%d %H:%M:%fZ', 2459717.08070103);
+}
+expect {
+    2022-05-17 13:56:12.569Z
+}
+
+# Tests for the TIMEDIFF function
+test timediff-basic-positive {
+    SELECT timediff('14:30:45', '12:00:00');
+}
+expect {
+    +0000-00-00 02:30:45.000
+}
+
+test timediff-basic-negative {
+    SELECT timediff('12:00:00', '14:30:45');
+}
+expect {
+    -0000-00-00 02:30:45.000
+}
+
+test timediff-with-milliseconds-positive {
+    SELECT timediff('12:00:01.300', '12:00:00.500');
+}
+expect {
+    +0000-00-00 00:00:00.800
+}
+
+test timediff-same-time {
+    SELECT timediff('12:00:00', '12:00:00');
+}
+expect {
+    +0000-00-00 00:00:00.000
+}
+
+test timediff-across-dates {
+    SELECT timediff('2023-05-11 01:15:00', '2023-05-10 23:30:00');
+}
+expect {
+    +0000-00-00 01:45:00.000
+}
+
+test timediff-across-dates-negative {
+    SELECT timediff('2023-05-10 23:30:00', '2023-05-11 01:15:00');
+}
+expect {
+    -0000-00-00 01:45:00.000
+}
+
+test timediff-different-formats {
+    SELECT timediff('2023-05-10T23:30:00', '2023-05-10 14:15:00');
+}
+expect {
+    +0000-00-00 09:15:00.000
+}
+
+test timediff-with-timezone {
+    SELECT timediff('2023-05-10 23:30:00+02:00', '2023-05-10 18:30:00Z');
+}
+expect {
+    +0000-00-00 03:00:00.000
+}
+
+test timediff-large-difference {
+    SELECT timediff('2023-05-12 10:00:00', '2023-05-10 08:00:00');
+}
+expect {
+    +0000-00-02 02:00:00.000
+}
+
+test timediff-with-seconds-precision {
+    SELECT timediff('12:30:45.123', '12:30:44.987');
+}
+expect {
+    +0000-00-00 00:00:00.136
+}
+
+test timediff-null-first-arg {
+    SELECT timediff(NULL, '12:00:00');
+}
+expect {
+}
+
+test timediff-null-second-arg {
+    SELECT timediff('12:00:00', NULL);
+}
+expect {
+}
+
+test timediff-invalid-first-arg {
+    SELECT timediff('not-a-time', '12:00:00');
+}
+expect {
+}
+
+test timediff-invalid-second-arg {
+    SELECT timediff('12:00:00', 'not-a-time');
+}
+expect {
+}
+
+test timediff-julian-day {
+    SELECT timediff(2460000, 2460000.5);
+}
+expect {
+    -0000-00-00 12:00:00.000
+}
+
+test timediff-different-time-formats {
+    SELECT timediff('23:59:59', '00:00:00');
+}
+expect {
+    +0000-00-00 23:59:59.000
+}
+
+# Edge case regression tests
+# Whitespace around 'now' should be rejected (SQLite compatibility)
+test datetime-whitespace-now-rejected {
+    SELECT datetime('  now  ');
+}
+expect {
+}
+
+test datetime-whitespace-now-rejected-leading {
+    SELECT datetime(' now');
+}
+expect {
+}
+
+test datetime-whitespace-now-rejected-trailing {
+    SELECT datetime('now ');
+}
+expect {
+}
+
+# Negative years should be parsed correctly
+test datetime-negative-year {
+    SELECT datetime('-0001-01-01');
+}
+expect {
+    -0001-01-01 00:00:00
+}
+
+test datetime-negative-year-with-time {
+    SELECT datetime('-0001-06-15 12:30:45');
+}
+expect {
+    -0001-06-15 12:30:45
+}
+
+test date-negative-year {
+    SELECT date('-0001-01-01');
+}
+expect {
+    -0001-01-01
+}
+
+# Date overflow (SQLite compatibility - invalid days overflow to next month)
+test datetime-date-overflow-feb30 {
+    SELECT datetime('2024-02-30');
+}
+expect {
+    2024-03-01 00:00:00
+}
+
+test datetime-date-overflow-feb31 {
+    SELECT datetime('2024-02-31');
+}
+expect {
+    2024-03-02 00:00:00
+}
+
+test datetime-date-overflow-apr31 {
+    SELECT datetime('2024-04-31');
+}
+expect {
+    2024-05-01 00:00:00
+}
+
+test datetime-date-overflow-feb29-non-leap {
+    SELECT datetime('2023-02-29');
+}
+expect {
+    2023-03-01 00:00:00
+}
+
+test date-date-overflow-feb30 {
+    SELECT date('2024-02-30');
+}
+expect {
+    2024-03-01
+}
+
+# Fractional modifiers
+test datetime-fractional-days {
+    SELECT datetime('2024-01-15', '+1.5 days');
+}
+expect {
+    2024-01-16 12:00:00
+}
+
+test datetime-fractional-hours {
+    SELECT datetime('2024-01-15', '+0.5 hours');
+}
+expect {
+    2024-01-15 00:30:00
+}
+
+test datetime-fractional-days-negative {
+    SELECT datetime('2024-01-15', '-2.25 days');
+}
+expect {
+    2024-01-12 18:00:00
+}
+
+test datetime-fractional-minutes {
+    SELECT datetime('2024-01-15 12:00:00', '+30.5 minutes');
+}
+expect {
+    2024-01-15 12:30:30
+}
+
+test datetime-fractional-seconds {
+    SELECT datetime('2024-01-15 12:00:00', '+90.5 seconds');
+}
+expect {
+    2024-01-15 12:01:30
+}
+
+# Trailing garbage after fractional seconds should be rejected
+test datetime-trailing-garbage-rejected {
+    SELECT datetime('10:30:45.12abc');
+}
+expect {
+}
+
+test datetime-trailing-garbage-date-rejected {
+    SELECT datetime('2024-01-15 10:30:45.123xyz');
+}
+expect {
+}
+
+# Overflows
+test arithmetic-overflow {
+    SELECT datetime('2000-01-01', '-262145 years', 'start of year');
+}
+expect {
+}
+
+test out-of-bounds-unixepoch {
+    SELECT datetime(-99999999999999999, 'unixepoch', 'start of month');
+}
+expect {
+}
+
+test arithmetic-overflow-julianday {
+    SELECT datetime(9999999999999999999.0, 'julianday', 'start of month');
+}
+expect {
+}
+
+test overflows-with-large-days-modifier {
+    SELECT datetime('9999-12-31', '+100000000 days', 'start of year');
+}
+expect {
+}
+
+# Invalid date and time
+test invalid-date {
+    SELECT date('2024-07-21 24:00:00');
+}
+expect {
+    2024-07-21
+}
+
+test invalid-time {
+    SELECT time('2024-07-21 24:59:59');
+}
+expect {
+    24:59:59
+}
+
+test invalid-datetime {
+    SELECT datetime('2024-07-21 24:59:59');
+}
+expect {
+    2024-07-21 24:59:59
+}
+
+# Regression tests for multi-byte UTF-8 characters (issue #4551)
+# These should return NULL, not panic
+test datetime-multibyte-utf8-emoji {
+    SELECT datetime('2024-01-01 🎉🎉');
+}
+expect {
+}
+
+test date-multibyte-utf8-chinese {
+    SELECT date('2024-01-01 中文字');
+}
+expect {
+}
+
+test time-multibyte-utf8-japanese {
+    SELECT time('2024-01-01 日本語');
+}
+expect {
+}
+
+test julianday-multibyte-utf8-cyrillic {
+    SELECT julianday('2024-01-01 Привет');
+}
+expect {
+}
+
+test datetime-multibyte-utf8-greek {
+    SELECT datetime('2024-01-01 αβγδεζ');
+}
+expect {
+}
+
+test datetime-multibyte-modifier-arithmetic {
+    SELECT datetime('2024-01-01', '88:------ӄ');
+}
+expect {
+}
+
+# Invalid Leap Years
+test date-leapyear-floor {
+    SELECT date('2000-02-31', 'floor');
+}
+expect {
+    2000-02-29
+}
+
+test date-leapyear-floor2 {
+    SELECT date('1999-02-31', 'floor');
+}
+expect {
+    1999-02-28
+}
+
+test date-leapyear-ceiling {
+    SELECT date('2000-02-31', 'ceiling');
+}
+expect {
+    2000-03-02
+}
+
+test date-leapyear-ceiling2 {
+    SELECT date('1999-02-31', 'ceiling');
+}
+expect {
+    1999-03-03
+}
+
+test leapyear-plus-month {
+    SELECT date('2023-02-31', '+1 month');
+}
+expect {
+    2023-03-31
+}
+
+test invalid-date-format {
+    SELECT datetime('now', '+2024-1-1');
+}
+expect {
+}
+
+test invalid-datetime-modifier-format {
+    SELECT datetime(-100, 'start of month');
+}
+expect {
+}
+
+# UTC modifier tests
+test datetime-utc-basic {
+    SELECT typeof(datetime('2024-01-15 12:00:00', 'utc'));
+}
+expect {
+    text
+}
+
+test datetime-utc-with-z-suffix {
+    SELECT datetime('2024-01-15 12:00:00Z', 'utc');
+}
+expect {
+    2024-01-15 12:00:00
+}
+
+test datetime-utc-idempotent {
+    SELECT datetime('2024-01-15 12:00:00Z', 'utc', 'utc');
+}
+expect {
+    2024-01-15 12:00:00
+}
+
+test datetime-localtime-utc-roundtrip {
+    SELECT datetime('2024-01-15 12:00:00Z', 'localtime', 'utc');
+}
+expect {
+    2024-01-15 12:00:00
+}
+
+# Localtime modifier tests
+test datetime-localtime-basic {
+    SELECT typeof(datetime('2024-01-15 12:00:00', 'localtime'));
+}
+expect {
+    text
+}
+
+# julianday modifier tests
+test datetime-julianday-modifier {
+    SELECT datetime(2460400.5, 'julianday');
+}
+expect {
+    2024-03-31 00:00:00
+}
+
+test strftime-julianday-modifier {
+    SELECT strftime('%Y-%m-%d', 2460400.5, 'julianday');
+}
+expect {
+    2024-03-31
+}
+
+test unixepoch-julianday-modifier {
+    SELECT unixepoch(2440587.5, 'julianday');
+}
+expect {
+    0
+}
+
+# unixepoch modifier tests
+test time-unixepoch-modifier {
+    SELECT time(3661, 'unixepoch');
+}
+expect {
+    01:01:01
+}
+
+test julianday-unixepoch-modifier {
+    SELECT julianday(0, 'unixepoch');
+}
+expect {
+    2440587.5
+}
+
+test strftime-unixepoch-modifier {
+    SELECT strftime('%Y-%m-%d %H:%M:%S', 946684800, 'unixepoch');
+}
+expect {
+    2000-01-01 00:00:00
+}
+
+test datetime-unixepoch-negative-2 {
+    SELECT datetime(-86400, 'unixepoch');
+}
+expect {
+    1969-12-31 00:00:00
+}
+
+# auto modifier tests
+test datetime-auto-julianday {
+    SELECT datetime(2460400.5, 'auto');
+}
+expect {
+    2024-03-31 00:00:00
+}
+
+test datetime-auto-unixepoch {
+    SELECT datetime(1711065600, 'auto');
+}
+expect {
+    2024-03-22 00:00:00
+}
+
+test julianday-auto {
+    SELECT julianday(0, 'auto');
+}
+expect {
+    0.0
+}
+expect @js {
+    0
+}
+
+test unixepoch-auto {
+    SELECT unixepoch(2440587.5, 'auto');
+}
+expect {
+    0
+}
+
+test strftime-auto {
+    SELECT strftime('%Y-%m-%d', 2460400.5, 'auto');
+}
+expect {
+    2024-03-31
+}
+
+# subsec modifier tests
+test datetime-without-subsec {
+    SELECT datetime('2024-01-15 12:30:45.123');
+}
+expect {
+    2024-01-15 12:30:45
+}
+
+test datetime-with-subsec {
+    SELECT datetime('2024-01-15 12:30:45.123', 'subsec');
+}
+expect {
+    2024-01-15 12:30:45.123
+}
+
+# Combined modifier tests
+test datetime-floor-localtime {
+    SELECT typeof(datetime('2024-01-31', '+1 month', 'floor', 'localtime'));
+}
+expect {
+    text
+}
+
+test datetime-auto-start-of-month {
+    SELECT datetime(1711065600, 'auto', 'start of month');
+}
+expect {
+    2024-03-01 00:00:00
+}
+
+test date-julianday-floor {
+    SELECT date(2460400.5, 'julianday', '+1 month', 'floor');
+}
+expect {
+    2024-04-30
+}
+
+# Tests for STRFTIME format argument coercion
+# SQLite coerces integer, float, and blob format arguments to text
+
+test strftime-format-integer {
+    SELECT STRFTIME(0, 1);
+}
+expect {
+    0
+}
+
+test strftime-format-integer-positive {
+    SELECT STRFTIME(123, '2024-01-01');
+}
+expect {
+    123
+}
+
+test strftime-format-integer-negative {
+    SELECT STRFTIME(-5, '2024-01-01');
+}
+expect {
+    -5
+}
+
+test strftime-format-float {
+    SELECT STRFTIME(3.14, '2024-01-01');
+}
+expect {
+    3.14
+}
+
+test strftime-format-float-negative {
+    SELECT STRFTIME(-2.5, '2024-01-01');
+}
+expect {
+    -2.5
+}
+
+test strftime-format-null {
+    SELECT STRFTIME(NULL, '2024-01-01');
+}
+expect {
+    
+}
+
+test strftime-format-blob {
+    SELECT STRFTIME(X'4142', '2024-01-01');
+}
+expect {
+    AB
+}
+
+test strftime-format-bool-true {
+    SELECT STRFTIME(1=1, '2024-01-01');
+}
+expect {
+    1
+}
+
+test strftime-format-bool-false {
+    SELECT STRFTIME(1=0, '2024-01-01');
+}
+expect {
+    0
+}

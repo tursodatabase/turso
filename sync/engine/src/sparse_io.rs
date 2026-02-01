@@ -5,7 +5,8 @@ use std::{
 
 use tracing::{instrument, Level};
 use turso_core::{
-    io::clock::DefaultClock, Buffer, Clock, Completion, File, Instant, OpenFlags, Result, IO,
+    io::{clock::DefaultClock, FileSyncType},
+    Buffer, Clock, Completion, File, MonotonicInstant, OpenFlags, Result, WallClockInstant, IO,
 };
 
 pub struct SparseLinuxIo {}
@@ -17,7 +18,7 @@ impl SparseLinuxIo {
 }
 
 impl IO for SparseLinuxIo {
-    #[instrument(err, skip_all, level = Level::TRACE)]
+    #[instrument(skip_all, level = Level::TRACE)]
     fn open_file(&self, path: &str, flags: OpenFlags, _direct: bool) -> Result<Arc<dyn File>> {
         let mut file = std::fs::File::options();
         file.read(true);
@@ -45,8 +46,12 @@ impl IO for SparseLinuxIo {
 }
 
 impl Clock for SparseLinuxIo {
-    fn now(&self) -> Instant {
-        DefaultClock.now()
+    fn current_time_monotonic(&self) -> MonotonicInstant {
+        DefaultClock.current_time_monotonic()
+    }
+
+    fn current_time_wall_clock(&self) -> WallClockInstant {
+        DefaultClock.current_time_wall_clock()
     }
 }
 
@@ -90,7 +95,7 @@ impl File for SparseLinuxFile {
     }
 
     #[instrument(err, skip_all, level = Level::TRACE)]
-    fn sync(&self, c: Completion) -> Result<Completion> {
+    fn sync(&self, c: Completion, _sync_type: FileSyncType) -> Result<Completion> {
         let file = self.file.write().unwrap();
         file.sync_all()?;
         c.complete(0);

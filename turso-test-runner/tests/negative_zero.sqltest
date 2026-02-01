@@ -1,0 +1,143 @@
+@database :memory:
+
+# Tests for negative zero (-0.0) handling
+# IEEE 754 floating-point has distinct representations for -0.0 and 0.0
+# but they should compare as equal and display as 0.0
+
+test negative-zero-literal {
+    SELECT -0.0;
+}
+expect {
+    0.0
+}
+expect @js {
+    0
+}
+
+test negative-zero-multiplication {
+    SELECT -1.0 * 0.0;
+}
+expect {
+    0.0
+}
+expect @js {
+    0
+}
+
+test negative-zero-tiny-times-zero {
+    SELECT -0.0000000001 * 0;
+}
+expect {
+    0.0
+}
+expect @js {
+    0
+}
+
+test negative-zero-comparison-equals {
+    SELECT -0.0 = 0.0;
+}
+expect {
+    1
+}
+
+test negative-zero-comparison-not-equals {
+    SELECT -0.0 != 0.0;
+}
+expect {
+    0
+}
+
+test negative-zero-comparison-less-than {
+    SELECT -0.0 < 0.0;
+}
+expect {
+    0
+}
+
+test negative-zero-comparison-greater-than {
+    SELECT -0.0 > 0.0;
+}
+expect {
+    0
+}
+
+test negative-zero-in-table {
+    CREATE TABLE t1(x REAL);
+    INSERT INTO t1 VALUES (-0.0);
+    SELECT x FROM t1;
+}
+expect {
+    0.0
+}
+expect @js {
+    0
+}
+
+test negative-zero-in-table-comparison {
+    CREATE TABLE t2(x REAL);
+    INSERT INTO t2 VALUES (-0.0);
+    SELECT x = 0.0 FROM t2;
+}
+expect {
+    1
+}
+
+test negative-zero-arithmetic-result {
+    CREATE TABLE t3(x REAL);
+    INSERT INTO t3 VALUES (-1e-300 * 0);
+    SELECT x, x = 0.0 FROM t3;
+}
+expect {
+    0.0|1
+}
+expect @js {
+    0|1
+}
+
+
+test negative-zero-order-by {
+    CREATE TABLE t4(id INTEGER, x REAL);
+    INSERT INTO t4 VALUES (1, 0.0);
+    INSERT INTO t4 VALUES (2, -0.0);
+    INSERT INTO t4 VALUES (3, 0.0);
+    SELECT id, x FROM t4 ORDER BY x, id;
+}
+expect {
+    1|0.0
+    2|0.0
+    3|0.0
+}
+expect @js {
+    1|0
+    2|0
+    3|0
+}
+
+test negative-zero-distinct {
+    CREATE TABLE t5(x REAL);
+    INSERT INTO t5 VALUES (0.0);
+    INSERT INTO t5 VALUES (-0.0);
+    INSERT INTO t5 VALUES (0.0);
+    SELECT DISTINCT x FROM t5;
+}
+expect {
+    0.0
+}
+expect @js {
+    0
+}
+
+test negative-zero-group-by {
+    CREATE TABLE t6(x REAL, v INTEGER);
+    INSERT INTO t6 VALUES (0.0, 1);
+    INSERT INTO t6 VALUES (-0.0, 2);
+    INSERT INTO t6 VALUES (0.0, 3);
+    SELECT x, SUM(v) FROM t6 GROUP BY x;
+}
+expect {
+    0.0|6
+}
+expect @js {
+    0|6
+}

@@ -11,62 +11,148 @@ on:
     branches:
       - main
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_NET_RETRY: 10
+
 jobs:
   run-fuzz-tests:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30
 
     steps:
-    - uses: actions/checkout@v3
-    - uses: useblacksmith/rust-cache@v3
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@stable
+    - name: Setup mold linker
+      uses: rui314/setup-mold@v1
+    - uses: Swatinem/rust-cache@v2
       with:
-        prefix-key: "v1-rust" # can be updated if we need to reset caches due to non-trivial change in the dependencies (for example, custom env var were set for single workspace project)
+        prefix-key: "v1-rust"
+        cache-on-failure: true
+    - name: Setup sccache
+      uses: mozilla-actions/sccache-action@v0.0.9
+    - name: Install cargo-nextest
+      uses: taiki-e/install-action@nextest
     - name: Set up Python 3.10
       uses: useblacksmith/setup-python@v6
       with:
         python-version: "3.10"
     - name: Build
-      run: cargo build --verbose
-    - name: Run ignored long tests
-      run: cargo test --test fuzz_tests
+      env:
+        SCCACHE_GHA_ENABLED: "true"
+        RUSTC_WRAPPER: "sccache"
+      run: cargo build --verbose --locked --all-features
+    - name: Run fuzz tests
       env:
         RUST_BACKTRACE: 1
+        SCCACHE_GHA_ENABLED: "true"
+        RUSTC_WRAPPER: "sccache"
+      run: cargo nextest run --locked --no-fail-fast -E 'test(/^fuzz_tests::/)' --failure-output=final
 
   run-long-fuzz-tests:
     runs-on: blacksmith-4vcpu-ubuntu-2404
-    timeout-minutes: 30 
-    
+    timeout-minutes: 30
+
     steps:
-    - uses: actions/checkout@v3
-    - uses: useblacksmith/rust-cache@v3
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@stable
+    - name: Setup mold linker
+      uses: rui314/setup-mold@v1
+    - uses: Swatinem/rust-cache@v2
       with:
-        prefix-key: "v1-rust" # can be updated if we need to reset caches due to non-trivial change in the dependencies (for example, custom env var were set for single workspace project)
+        prefix-key: "v1-rust"
+        cache-on-failure: true
+    - name: Setup sccache
+      uses: mozilla-actions/sccache-action@v0.0.9
+    - name: Install cargo-nextest
+      uses: taiki-e/install-action@nextest
     - name: Set up Python 3.10
       uses: useblacksmith/setup-python@v6
       with:
         python-version: "3.10"
     - name: Build
-      run: cargo build --verbose
-    - name: Run ignored long tests
-      run: cargo test -- --ignored fuzz_long
+      env:
+        SCCACHE_GHA_ENABLED: "true"
+        RUSTC_WRAPPER: "sccache"
+      run: cargo build --verbose --locked --all-features
+    - name: Run ignored long fuzz tests
       env:
         RUST_BACKTRACE: 1
+        SCCACHE_GHA_ENABLED: "true"
+        RUSTC_WRAPPER: "sccache"
+      run: cargo nextest run --locked --no-fail-fast --run-ignored ignored-only -E 'test(/fuzz_long/)' --failure-output=final
 
   simple-stress-test:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30
     steps:
-    - uses: actions/checkout@v3
-    - uses: useblacksmith/rust-cache@v3
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@stable
+    - name: Setup mold linker
+      uses: rui314/setup-mold@v1
+    - uses: Swatinem/rust-cache@v2
       with:
         prefix-key: "v1-rust"
+        cache-on-failure: true
+    - name: Setup sccache
+      uses: mozilla-actions/sccache-action@v0.0.9
     - name: Set up Python 3.10
       uses: useblacksmith/setup-python@v6
       with:
         python-version: "3.10"
     - name: Build
-      run: cargo build --verbose
+      env:
+        SCCACHE_GHA_ENABLED: "true"
+        RUSTC_WRAPPER: "sccache"
+      run: cargo build --verbose --locked --all-features
     - name: Run ignored long tests
-      run: cargo run -p turso_stress -- -t 2 -i 10000 -s --tables 1
       env:
         RUST_BACKTRACE: 1
+        SCCACHE_GHA_ENABLED: "true"
+        RUSTC_WRAPPER: "sccache"
+      run: RUSTFLAGS="--cfg shuttle" cargo run -p turso_stress --locked -- --nr-threads 3 --nr-iterations 300
+
+  shuttle-stress-test:
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 30
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@stable
+    - name: Setup mold linker
+      uses: rui314/setup-mold@v1
+    - uses: Swatinem/rust-cache@v2
+      with:
+        prefix-key: "v1-rust-shuttle"
+        cache-on-failure: true
+    - name: Setup sccache
+      uses: mozilla-actions/sccache-action@v0.0.9
+    - name: Run shuttle stress test
+      env:
+        RUST_BACKTRACE: 1
+        RUSTFLAGS: "--cfg=shuttle"
+        SCCACHE_GHA_ENABLED: "true"
+        RUSTC_WRAPPER: "sccache"
+      run: cargo run -p turso_stress --locked -- --nr-threads 2 --nr-iterations 1000
+
+  libfuzzer-scalar-func:
+    # Allow this job to fail without failing the entire CI run
+    continue-on-error: true
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 15
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@nightly
+    - name: Setup mold linker
+      uses: rui314/setup-mold@v1
+    - uses: Swatinem/rust-cache@v2
+      with:
+        prefix-key: "v1-rust-fuzz"
+        cache-on-failure: true
+    - name: Install cargo-fuzz
+      run: cargo install cargo-fuzz
+    - name: Run scalar_func fuzzer
+      run: cargo +nightly fuzz run scalar_func -- -max_total_time=300

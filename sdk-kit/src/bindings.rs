@@ -7,15 +7,6 @@ pub struct turso_slice_ref_t {
     pub ptr: *const ::std::os::raw::c_void,
     pub len: usize,
 }
-#[allow(clippy::unnecessary_operation, clippy::identity_op)]
-const _: () = {
-    ["Size of turso_slice_ref_t"][::std::mem::size_of::<turso_slice_ref_t>() - 16usize];
-    ["Alignment of turso_slice_ref_t"][::std::mem::align_of::<turso_slice_ref_t>() - 8usize];
-    ["Offset of field: turso_slice_ref_t::ptr"]
-        [::std::mem::offset_of!(turso_slice_ref_t, ptr) - 0usize];
-    ["Offset of field: turso_slice_ref_t::len"]
-        [::std::mem::offset_of!(turso_slice_ref_t, len) - 8usize];
-};
 impl Default for turso_slice_ref_t {
     fn default() -> Self {
         let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
@@ -34,6 +25,7 @@ pub enum turso_status_code_t {
     TURSO_IO = 3,
     TURSO_BUSY = 4,
     TURSO_INTERRUPT = 5,
+    TURSO_BUSY_SNAPSHOT = 6,
     TURSO_ERROR = 127,
     TURSO_MISUSE = 128,
     TURSO_CONSTRAINT = 129,
@@ -41,6 +33,7 @@ pub enum turso_status_code_t {
     TURSO_DATABASE_FULL = 131,
     TURSO_NOTADB = 132,
     TURSO_CORRUPT = 133,
+    TURSO_IOERR = 134,
 }
 #[repr(u32)]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
@@ -82,6 +75,9 @@ pub struct turso_statement {
 }
 #[doc = " opaque pointer to the TursoStatement instance\n SAFETY: the statement must be used exclusive and can't be accessed concurrently"]
 pub type turso_statement_t = turso_statement;
+unsafe extern "C" {
+    pub fn turso_version() -> *const ::std::os::raw::c_char;
+}
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct turso_log_t {
@@ -92,19 +88,6 @@ pub struct turso_log_t {
     pub line: usize,
     pub level: turso_tracing_level_t,
 }
-#[allow(clippy::unnecessary_operation, clippy::identity_op)]
-const _: () = {
-    ["Size of turso_log_t"][::std::mem::size_of::<turso_log_t>() - 48usize];
-    ["Alignment of turso_log_t"][::std::mem::align_of::<turso_log_t>() - 8usize];
-    ["Offset of field: turso_log_t::message"]
-        [::std::mem::offset_of!(turso_log_t, message) - 0usize];
-    ["Offset of field: turso_log_t::target"][::std::mem::offset_of!(turso_log_t, target) - 8usize];
-    ["Offset of field: turso_log_t::file"][::std::mem::offset_of!(turso_log_t, file) - 16usize];
-    ["Offset of field: turso_log_t::timestamp"]
-        [::std::mem::offset_of!(turso_log_t, timestamp) - 24usize];
-    ["Offset of field: turso_log_t::line"][::std::mem::offset_of!(turso_log_t, line) - 32usize];
-    ["Offset of field: turso_log_t::level"][::std::mem::offset_of!(turso_log_t, level) - 40usize];
-};
 impl Default for turso_log_t {
     fn default() -> Self {
         let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
@@ -121,15 +104,6 @@ pub struct turso_config_t {
     pub logger: ::std::option::Option<unsafe extern "C" fn(log: *const turso_log_t)>,
     pub log_level: *const ::std::os::raw::c_char,
 }
-#[allow(clippy::unnecessary_operation, clippy::identity_op)]
-const _: () = {
-    ["Size of turso_config_t"][::std::mem::size_of::<turso_config_t>() - 16usize];
-    ["Alignment of turso_config_t"][::std::mem::align_of::<turso_config_t>() - 8usize];
-    ["Offset of field: turso_config_t::logger"]
-        [::std::mem::offset_of!(turso_config_t, logger) - 0usize];
-    ["Offset of field: turso_config_t::log_level"]
-        [::std::mem::offset_of!(turso_config_t, log_level) - 8usize];
-};
 impl Default for turso_config_t {
     fn default() -> Self {
         let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
@@ -143,25 +117,19 @@ impl Default for turso_config_t {
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct turso_database_config_t {
+    #[doc = " Parameter which defines who drives the IO - callee or the caller (non-zero parameter value interpreted as async IO)"]
+    pub async_io: u64,
     #[doc = " Path to the database file or `:memory:`\n zero-terminated C string"]
     pub path: *const ::std::os::raw::c_char,
     #[doc = " Optional comma separated list of experimental features to enable\n zero-terminated C string or null pointer"]
     pub experimental_features: *const ::std::os::raw::c_char,
-    #[doc = " Parameter which defines who drives the IO - callee or the caller"]
-    pub async_io: bool,
+    #[doc = " optional VFS parameter explicitly specifying FS backend for the database.\n Available options are:\n - \"memory\": in-memory backend\n - \"syscall\": generic syscall backend\n - \"io_uring\": IO uring (supported only on Linux)"]
+    pub vfs: *const ::std::os::raw::c_char,
+    #[doc = " optional encryption cipher\n as encryption is experimental - experimental_features must have \"encryption\" in the list"]
+    pub encryption_cipher: *const ::std::os::raw::c_char,
+    #[doc = " optional encryption hexkey\n as encryption is experimental - experimental_features must have \"encryption\" in the list"]
+    pub encryption_hexkey: *const ::std::os::raw::c_char,
 }
-#[allow(clippy::unnecessary_operation, clippy::identity_op)]
-const _: () = {
-    ["Size of turso_database_config_t"][::std::mem::size_of::<turso_database_config_t>() - 24usize];
-    ["Alignment of turso_database_config_t"]
-        [::std::mem::align_of::<turso_database_config_t>() - 8usize];
-    ["Offset of field: turso_database_config_t::path"]
-        [::std::mem::offset_of!(turso_database_config_t, path) - 0usize];
-    ["Offset of field: turso_database_config_t::experimental_features"]
-        [::std::mem::offset_of!(turso_database_config_t, experimental_features) - 8usize];
-    ["Offset of field: turso_database_config_t::async_io"]
-        [::std::mem::offset_of!(turso_database_config_t, async_io) - 16usize];
-};
 impl Default for turso_database_config_t {
     fn default() -> Self {
         let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
@@ -170,9 +138,6 @@ impl Default for turso_database_config_t {
             s.assume_init()
         }
     }
-}
-unsafe extern "C" {
-    pub fn turso_version() -> *const ::std::os::raw::c_char;
 }
 unsafe extern "C" {
     #[doc = " Setup global database info"]
@@ -190,7 +155,7 @@ unsafe extern "C" {
     ) -> turso_status_code_t;
 }
 unsafe extern "C" {
-    #[doc = " Open database"]
+    #[doc = " Open database\n  Can return TURSO_IO result if async_io=true is set"]
     pub fn turso_database_open(
         database: *const turso_database_t,
         error_opt_out: *mut *const ::std::os::raw::c_char,
@@ -203,6 +168,10 @@ unsafe extern "C" {
         connection: *mut *mut turso_connection_t,
         error_opt_out: *mut *const ::std::os::raw::c_char,
     ) -> turso_status_code_t;
+}
+unsafe extern "C" {
+    #[doc = " Set busy timeout for the connection"]
+    pub fn turso_connection_set_busy_timeout_ms(self_: *const turso_connection_t, timeout_ms: i64);
 }
 unsafe extern "C" {
     #[doc = " Get autocommit state of the connection"]
@@ -268,11 +237,15 @@ unsafe extern "C" {
     ) -> turso_status_code_t;
 }
 unsafe extern "C" {
-    #[doc = " Finalize a statement\n This method must be called in the end of statement execution (either successfull or not)"]
+    #[doc = " Finalize a statement\n finalize returns TURSO_DONE if finalization completed\n This method must be called in the end of statement execution (either successfull or not)"]
     pub fn turso_statement_finalize(
         self_: *const turso_statement_t,
         error_opt_out: *mut *const ::std::os::raw::c_char,
     ) -> turso_status_code_t;
+}
+unsafe extern "C" {
+    #[doc = " return amount of row modifications (insert/delete operations) made by the most recent executed statement"]
+    pub fn turso_statement_n_change(self_: *const turso_statement_t) -> i64;
 }
 unsafe extern "C" {
     #[doc = " Get column count"]
@@ -281,6 +254,13 @@ unsafe extern "C" {
 unsafe extern "C" {
     #[doc = " Get the column name at the index\n C string allocated by Turso must be freed after the usage with corresponding turso_str_deinit(...) method"]
     pub fn turso_statement_column_name(
+        self_: *const turso_statement_t,
+        index: usize,
+    ) -> *const ::std::os::raw::c_char;
+}
+unsafe extern "C" {
+    #[doc = " Get the column declared type at the index (e.g. \"INTEGER\", \"TEXT\", \"DATETIME\", etc.)\n Returns NULL if the column type is not available.\n C string allocated by Turso must be freed after the usage with corresponding turso_str_deinit(...) method"]
+    pub fn turso_statement_column_decltype(
         self_: *const turso_statement_t,
         index: usize,
     ) -> *const ::std::os::raw::c_char;

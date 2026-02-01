@@ -6,10 +6,11 @@ use crate::incremental::dbsp::{Delta, DeltaPair};
 use crate::incremental::operator::{
     ComputationTracker, DbspStateCursors, EvalState, IncrementalOperator,
 };
+use crate::sync::Arc;
+use crate::sync::Mutex;
 use crate::types::IOResult;
 use crate::{Result, Value};
-use parking_lot::Mutex;
-use std::sync::Arc;
+use std::cmp::Ordering;
 
 /// Filter predicate for filtering rows
 #[derive(Debug, Clone)]
@@ -77,61 +78,28 @@ impl FilterOperator {
         match &self.predicate {
             FilterPredicate::None => true,
             FilterPredicate::Equals { column_idx, value } => {
-                if let Some(v) = values.get(*column_idx) {
-                    return v == value;
-                }
-                false
+                let v = &values[*column_idx];
+                v == value
             }
             FilterPredicate::NotEquals { column_idx, value } => {
-                if let Some(v) = values.get(*column_idx) {
-                    return v != value;
-                }
-                false
+                let v = &values[*column_idx];
+                v != value
             }
             FilterPredicate::GreaterThan { column_idx, value } => {
-                if let Some(v) = values.get(*column_idx) {
-                    // Compare based on value types
-                    match (v, value) {
-                        (Value::Integer(a), Value::Integer(b)) => return a > b,
-                        (Value::Float(a), Value::Float(b)) => return a > b,
-                        (Value::Text(a), Value::Text(b)) => return a.as_str() > b.as_str(),
-                        _ => {}
-                    }
-                }
-                false
+                let v = &values[*column_idx];
+                v.cmp(value) == Ordering::Greater
             }
             FilterPredicate::GreaterThanOrEqual { column_idx, value } => {
-                if let Some(v) = values.get(*column_idx) {
-                    match (v, value) {
-                        (Value::Integer(a), Value::Integer(b)) => return a >= b,
-                        (Value::Float(a), Value::Float(b)) => return a >= b,
-                        (Value::Text(a), Value::Text(b)) => return a.as_str() >= b.as_str(),
-                        _ => {}
-                    }
-                }
-                false
+                let v = &values[*column_idx];
+                v.cmp(value) != Ordering::Less
             }
             FilterPredicate::LessThan { column_idx, value } => {
-                if let Some(v) = values.get(*column_idx) {
-                    match (v, value) {
-                        (Value::Integer(a), Value::Integer(b)) => return a < b,
-                        (Value::Float(a), Value::Float(b)) => return a < b,
-                        (Value::Text(a), Value::Text(b)) => return a.as_str() < b.as_str(),
-                        _ => {}
-                    }
-                }
-                false
+                let v = &values[*column_idx];
+                v.cmp(value) == Ordering::Less
             }
             FilterPredicate::LessThanOrEqual { column_idx, value } => {
-                if let Some(v) = values.get(*column_idx) {
-                    match (v, value) {
-                        (Value::Integer(a), Value::Integer(b)) => return a <= b,
-                        (Value::Float(a), Value::Float(b)) => return a <= b,
-                        (Value::Text(a), Value::Text(b)) => return a.as_str() <= b.as_str(),
-                        _ => {}
-                    }
-                }
-                false
+                let v = &values[*column_idx];
+                v.cmp(value) != Ordering::Greater
             }
             FilterPredicate::And(left, right) => {
                 // Temporarily create sub-filters to evaluate
@@ -145,92 +113,59 @@ impl FilterOperator {
                 left_filter.evaluate_predicate(values) || right_filter.evaluate_predicate(values)
             }
 
-            // Column-to-column comparisons
             FilterPredicate::ColumnEquals {
                 left_idx,
                 right_idx,
             } => {
-                if let (Some(left), Some(right)) = (values.get(*left_idx), values.get(*right_idx)) {
-                    return left == right;
-                }
-                false
+                let left = &values[*left_idx];
+                let right = &values[*right_idx];
+                left == right
             }
             FilterPredicate::ColumnNotEquals {
                 left_idx,
                 right_idx,
             } => {
-                if let (Some(left), Some(right)) = (values.get(*left_idx), values.get(*right_idx)) {
-                    return left != right;
-                }
-                false
+                let left = &values[*left_idx];
+                let right = &values[*right_idx];
+                left != right
             }
             FilterPredicate::ColumnGreaterThan {
                 left_idx,
                 right_idx,
             } => {
-                if let (Some(left), Some(right)) = (values.get(*left_idx), values.get(*right_idx)) {
-                    match (left, right) {
-                        (Value::Integer(a), Value::Integer(b)) => return a > b,
-                        (Value::Float(a), Value::Float(b)) => return a > b,
-                        (Value::Text(a), Value::Text(b)) => return a.as_str() > b.as_str(),
-                        _ => {}
-                    }
-                }
-                false
+                let left = &values[*left_idx];
+                let right = &values[*right_idx];
+                left.cmp(right) == Ordering::Greater
             }
             FilterPredicate::ColumnGreaterThanOrEqual {
                 left_idx,
                 right_idx,
             } => {
-                if let (Some(left), Some(right)) = (values.get(*left_idx), values.get(*right_idx)) {
-                    match (left, right) {
-                        (Value::Integer(a), Value::Integer(b)) => return a >= b,
-                        (Value::Float(a), Value::Float(b)) => return a >= b,
-                        (Value::Text(a), Value::Text(b)) => return a.as_str() >= b.as_str(),
-                        _ => {}
-                    }
-                }
-                false
+                let left = &values[*left_idx];
+                let right = &values[*right_idx];
+                left.cmp(right) != Ordering::Less
             }
             FilterPredicate::ColumnLessThan {
                 left_idx,
                 right_idx,
             } => {
-                if let (Some(left), Some(right)) = (values.get(*left_idx), values.get(*right_idx)) {
-                    match (left, right) {
-                        (Value::Integer(a), Value::Integer(b)) => return a < b,
-                        (Value::Float(a), Value::Float(b)) => return a < b,
-                        (Value::Text(a), Value::Text(b)) => return a.as_str() < b.as_str(),
-                        _ => {}
-                    }
-                }
-                false
+                let left = &values[*left_idx];
+                let right = &values[*right_idx];
+                left.cmp(right) == Ordering::Less
             }
             FilterPredicate::ColumnLessThanOrEqual {
                 left_idx,
                 right_idx,
             } => {
-                if let (Some(left), Some(right)) = (values.get(*left_idx), values.get(*right_idx)) {
-                    match (left, right) {
-                        (Value::Integer(a), Value::Integer(b)) => return a <= b,
-                        (Value::Float(a), Value::Float(b)) => return a <= b,
-                        (Value::Text(a), Value::Text(b)) => return a.as_str() <= b.as_str(),
-                        _ => {}
-                    }
-                }
-                false
+                let left = &values[*left_idx];
+                let right = &values[*right_idx];
+                left.cmp(right) != Ordering::Greater
             }
             FilterPredicate::IsNull { column_idx } => {
-                if let Some(v) = values.get(*column_idx) {
-                    return matches!(v, Value::Null);
-                }
-                false
+                matches!(values[*column_idx], Value::Null)
             }
             FilterPredicate::IsNotNull { column_idx } => {
-                if let Some(v) = values.get(*column_idx) {
-                    return !matches!(v, Value::Null);
-                }
-                false
+                !matches!(values[*column_idx], Value::Null)
             }
         }
     }
@@ -508,5 +443,82 @@ mod tests {
             Value::Text(Text::from("test")),
         ];
         assert!(!filter.evaluate_predicate(&values4));
+    }
+
+    #[test]
+    fn test_cross_type_numeric_comparisons() {
+        // GreaterThan: Integer > Float
+        let predicate = FilterPredicate::GreaterThan {
+            column_idx: 0,
+            value: Value::Float(1.5),
+        };
+        let filter = FilterOperator::new(predicate);
+        assert!(filter.evaluate_predicate(&[Value::Integer(2)])); // 2 > 1.5
+        assert!(!filter.evaluate_predicate(&[Value::Integer(1)])); // 1 > 1.5
+
+        // GreaterThan: Float > Integer
+        let predicate = FilterPredicate::GreaterThan {
+            column_idx: 0,
+            value: Value::Integer(2),
+        };
+        let filter = FilterOperator::new(predicate);
+        assert!(filter.evaluate_predicate(&[Value::Float(2.5)])); // 2.5 > 2
+        assert!(!filter.evaluate_predicate(&[Value::Float(1.5)])); // 1.5 > 2
+
+        // GreaterThanOrEqual: Integer >= Float
+        let predicate = FilterPredicate::GreaterThanOrEqual {
+            column_idx: 0,
+            value: Value::Float(2.0),
+        };
+        let filter = FilterOperator::new(predicate);
+        assert!(filter.evaluate_predicate(&[Value::Integer(2)])); // 2 >= 2.0
+        assert!(filter.evaluate_predicate(&[Value::Integer(3)])); // 3 >= 2.0
+        assert!(!filter.evaluate_predicate(&[Value::Integer(1)])); // 1 >= 2.0
+
+        // GreaterThanOrEqual: Float >= Integer
+        let predicate = FilterPredicate::GreaterThanOrEqual {
+            column_idx: 0,
+            value: Value::Integer(2),
+        };
+        let filter = FilterOperator::new(predicate);
+        assert!(filter.evaluate_predicate(&[Value::Float(2.0)])); // 2.0 >= 2
+        assert!(!filter.evaluate_predicate(&[Value::Float(1.9)])); // 1.9 >= 2
+
+        // LessThan: Integer < Float
+        let predicate = FilterPredicate::LessThan {
+            column_idx: 0,
+            value: Value::Float(1.5),
+        };
+        let filter = FilterOperator::new(predicate);
+        assert!(filter.evaluate_predicate(&[Value::Integer(1)])); // 1 < 1.5
+        assert!(!filter.evaluate_predicate(&[Value::Integer(2)])); // 2 < 1.5
+
+        // LessThan: Float < Integer
+        let predicate = FilterPredicate::LessThan {
+            column_idx: 0,
+            value: Value::Integer(2),
+        };
+        let filter = FilterOperator::new(predicate);
+        assert!(filter.evaluate_predicate(&[Value::Float(1.5)])); // 1.5 < 2
+        assert!(!filter.evaluate_predicate(&[Value::Float(2.5)])); // 2.5 < 2
+
+        // LessThanOrEqual: Integer <= Float
+        let predicate = FilterPredicate::LessThanOrEqual {
+            column_idx: 0,
+            value: Value::Float(2.0),
+        };
+        let filter = FilterOperator::new(predicate);
+        assert!(filter.evaluate_predicate(&[Value::Integer(2)])); // 2 <= 2.0
+        assert!(filter.evaluate_predicate(&[Value::Integer(1)])); // 1 <= 2.0
+        assert!(!filter.evaluate_predicate(&[Value::Integer(3)])); // 3 <= 2.0
+
+        // LessThanOrEqual: Float <= Integer
+        let predicate = FilterPredicate::LessThanOrEqual {
+            column_idx: 0,
+            value: Value::Integer(2),
+        };
+        let filter = FilterOperator::new(predicate);
+        assert!(filter.evaluate_predicate(&[Value::Float(2.0)])); // 2.0 <= 2
+        assert!(!filter.evaluate_predicate(&[Value::Float(2.1)])); // 2.1 <= 2
     }
 }

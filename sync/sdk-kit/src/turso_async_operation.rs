@@ -2,7 +2,7 @@ use std::sync::{Arc, Mutex};
 
 use turso_sdk_kit::{
     capi::c::turso_slice_ref_t,
-    rsapi::{self, turso_slice_from_bytes, TursoError, TursoStatusCode},
+    rsapi::{self, turso_slice_from_bytes, TursoError},
 };
 
 use crate::{
@@ -63,7 +63,10 @@ impl TursoDatabaseAsyncOperation {
             }
         });
         Self {
-            generator: Arc::new(Mutex::new(generator)),
+            generator: Arc::new(Mutex::new(OperationGen {
+                future: generator,
+                result: None,
+            })),
             response,
         }
     }
@@ -74,10 +77,7 @@ impl TursoDatabaseAsyncOperation {
     pub fn take_result(&self) -> Result<TursoAsyncOperationResult, TursoError> {
         match self.response.lock().unwrap().take() {
             Some(response) => Ok(response),
-            None => Err(TursoError {
-                code: TursoStatusCode::Misuse,
-                message: Some("operation has no result".to_string()),
-            }),
+            None => Err(TursoError::Misuse("operation has no result".to_string())),
         }
     }
     pub fn take_connection_to_capi(
@@ -85,10 +85,9 @@ impl TursoDatabaseAsyncOperation {
     ) -> Result<*const turso_sdk_kit::capi::c::turso_connection_t, TursoError> {
         match self.take_result()? {
             TursoAsyncOperationResult::Connection { connection } => Ok(connection.to_capi()),
-            _ => Err(TursoError {
-                code: TursoStatusCode::Misuse,
-                message: Some("unexpected async operation result".to_string()),
-            }),
+            _ => Err(TursoError::Misuse(
+                "unexpected async operation result".to_string(),
+            )),
         }
     }
     pub fn take_changes_to_capi(&self) -> Result<*const c::turso_sync_changes_t, TursoError> {
@@ -100,10 +99,9 @@ impl TursoDatabaseAsyncOperation {
                     Ok(changes.to_capi())
                 }
             }
-            _ => Err(TursoError {
-                code: TursoStatusCode::Misuse,
-                message: Some("unexpected async operation result".to_string()),
-            }),
+            _ => Err(TursoError::Misuse(
+                "unexpected async operation result".to_string(),
+            )),
         }
     }
     pub fn get_stats_to_capi(&self) -> Result<c::turso_sync_stats_t, TursoError> {
@@ -122,10 +120,9 @@ impl TursoDatabaseAsyncOperation {
                     turso_slice_ref_t::default()
                 },
             }),
-            _ => Err(TursoError {
-                code: TursoStatusCode::Misuse,
-                message: Some("unexpected async operation result".to_string()),
-            }),
+            _ => Err(TursoError::Misuse(
+                "unexpected async operation result".to_string(),
+            )),
         }
     }
     pub fn result_kind_to_capi(&self) -> c::turso_sync_operation_result_type_t {
@@ -154,10 +151,7 @@ impl TursoDatabaseAsyncOperation {
         value: *const c::turso_sync_operation_t,
     ) -> Result<&'a Self, TursoError> {
         if value.is_null() {
-            Err(TursoError {
-                code: TursoStatusCode::Misuse,
-                message: Some("got null pointer".to_string()),
-            })
+            Err(TursoError::Misuse("got null pointer".to_string()))
         } else {
             Ok(&*(value as *const Self))
         }
@@ -172,31 +166,59 @@ impl TursoDatabaseAsyncOperation {
     }
 }
 
-type OperationGen<F> = genawaiter::sync::Gen<
-    turso_sync_engine::types::SyncEngineIoResult,
-    turso_sync_engine::Result<()>,
-    F,
->;
+struct OperationGen<F: std::future::Future<Output = turso_sync_engine::Result<()>>> {
+    future: genawaiter::sync::Gen<
+        turso_sync_engine::types::SyncEngineIoResult,
+        turso_sync_engine::Result<()>,
+        F,
+    >,
+    result: Option<Result<TursoAsyncOperationStatus, rsapi::TursoError>>,
+}
 
 impl<F: std::future::Future<Output = turso_sync_engine::Result<()>>> TursoAsyncOperation
     for OperationGen<F>
 {
     fn resume(&mut self) -> Result<TursoAsyncOperationStatus, rsapi::TursoError> {
-        match self.resume_with(Ok(())) {
+        // make resume re-entrant even if operation finished
+        if let Some(result) = &self.result {
+            match result {
+                Ok(status) => {
+                    return Ok(TursoAsyncOperationStatus {
+                        status: status.status,
+                        result: None,
+                    })
+                }
+                Err(err) => return Err(err.clone()),
+            }
+        }
+        let result = self.future.resume_with(Ok(()));
+        match result {
             genawaiter::GeneratorState::Yielded(
                 turso_sync_engine::types::SyncEngineIoResult::IO,
-            ) => Ok(TursoAsyncOperationStatus {
-                status: rsapi::TursoStatusCode::Io,
-                result: None,
-            }),
-            genawaiter::GeneratorState::Complete(Ok(())) => Ok(TursoAsyncOperationStatus {
-                status: rsapi::TursoStatusCode::Done,
-                result: None,
-            }),
-            genawaiter::GeneratorState::Complete(Err(err)) => Err(rsapi::TursoError {
-                code: turso_sdk_kit::rsapi::TursoStatusCode::Error,
-                message: Some(format!("sync engine operation failed: {err}")),
-            }),
+            ) => {
+                tracing::debug!("TursoAsyncOperation::resume: result=IO");
+                Ok(TursoAsyncOperationStatus {
+                    status: rsapi::TursoStatusCode::Io,
+                    result: None,
+                })
+            }
+            genawaiter::GeneratorState::Complete(Ok(())) => {
+                tracing::debug!("TursoAsyncOperation::resume: result=Done");
+                self.result = Some(Ok(TursoAsyncOperationStatus {
+                    status: rsapi::TursoStatusCode::Done,
+                    result: None,
+                }));
+                Ok(TursoAsyncOperationStatus {
+                    status: rsapi::TursoStatusCode::Done,
+                    result: None,
+                })
+            }
+            genawaiter::GeneratorState::Complete(Err(err)) => {
+                tracing::debug!("TursoAsyncOperation::resume: result=Err({err})");
+                let message = format!("sync engine operation failed: {err}");
+                self.result = Some(Err(rsapi::TursoError::Error(message.clone())));
+                Err(rsapi::TursoError::Error(message))
+            }
         }
     }
 }

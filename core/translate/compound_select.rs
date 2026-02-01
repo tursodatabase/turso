@@ -1,24 +1,27 @@
 use crate::schema::{Index, IndexColumn, Schema};
+use crate::sync::Arc;
 use crate::translate::collate::get_collseq_from_expr;
 use crate::translate::emitter::{emit_query, LimitCtx, Resolver, TranslateCtx};
 use crate::translate::expr::translate_expr;
 use crate::translate::plan::{Plan, QueryDestination, SelectPlan};
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
-use crate::vdbe::insn::Insn;
+use crate::vdbe::insn::{to_u16, Insn};
 use crate::vdbe::BranchOffset;
 use crate::{emit_explain, LimboError, QueryMode, SymbolTable};
-use std::sync::Arc;
 use tracing::instrument;
 use turso_parser::ast::{CompoundOperator, Expr, Literal, SortOrder};
 
 use tracing::Level;
 
+/// Emits bytecode for a compound SELECT statement (UNION, INTERSECT, EXCEPT, UNION ALL).
+/// Returns the result column start register when in coroutine mode (for CTE subqueries),
+/// or None for top-level queries.
 #[instrument(skip_all, level = Level::DEBUG)]
 pub fn emit_program_for_compound_select(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
     plan: Plan,
-) -> crate::Result<()> {
+) -> crate::Result<Option<usize>> {
     let Plan::CompoundSelect {
         left,
         right_most,
@@ -144,7 +147,7 @@ pub fn emit_program_for_compound_select(
     )?;
     program.pop_current_parent_explain();
 
-    Ok(())
+    Ok(reg_result_cols_start)
 }
 
 // Emits bytecode for a compound SELECT statement. This function processes the rightmost part of
@@ -192,6 +195,7 @@ fn emit_compound_select(
                 if matches!(
                     right_most.query_destination,
                     QueryDestination::EphemeralIndex { .. }
+                        | QueryDestination::CoroutineYield { .. }
                 ) {
                     plan.query_destination = right_most.query_destination.clone();
                 }
@@ -285,6 +289,7 @@ fn emit_compound_select(
                         limit_ctx,
                         offset_reg,
                         yield_reg,
+                        reg_result_cols_start,
                     );
                 }
             }
@@ -341,6 +346,7 @@ fn emit_compound_select(
                     limit_ctx,
                     offset_reg,
                     yield_reg,
+                    reg_result_cols_start,
                 );
             }
             CompoundOperator::Except => {
@@ -386,7 +392,13 @@ fn emit_compound_select(
                 program.pop_current_parent_explain();
                 if new_index {
                     read_deduplicated_union_or_except_rows(
-                        program, cursor_id, &index, limit_ctx, offset_reg, yield_reg,
+                        program,
+                        cursor_id,
+                        &index,
+                        limit_ctx,
+                        offset_reg,
+                        yield_reg,
+                        reg_result_cols_start,
                     );
                 }
             }
@@ -473,6 +485,7 @@ fn create_dedupe_index(
 
 /// Emits the bytecode for reading deduplicated rows from the ephemeral index created for
 /// UNION or EXCEPT operators.
+#[allow(clippy::too_many_arguments)]
 fn read_deduplicated_union_or_except_rows(
     program: &mut ProgramBuilder,
     dedupe_cursor_id: usize,
@@ -480,11 +493,15 @@ fn read_deduplicated_union_or_except_rows(
     limit_ctx: Option<LimitCtx>,
     offset_reg: Option<usize>,
     yield_reg: Option<usize>,
+    reg_result_cols_start: Option<usize>,
 ) {
     let label_close = program.allocate_label();
     let label_dedupe_next = program.allocate_label();
     let label_dedupe_loop_start = program.allocate_label();
-    let dedupe_cols_start_reg = program.alloc_registers(dedupe_index.columns.len());
+    // When in coroutine mode, use the pre-allocated result column registers.
+    // Otherwise, allocate new registers for reading from the dedupe index.
+    let dedupe_cols_start_reg = reg_result_cols_start
+        .unwrap_or_else(|| program.alloc_registers(dedupe_index.columns.len()));
     program.emit_insn(Insn::Rewind {
         cursor_id: dedupe_cursor_id,
         pc_if_empty: label_dedupe_next,
@@ -498,16 +515,10 @@ fn read_deduplicated_union_or_except_rows(
         });
     }
     for col_idx in 0..dedupe_index.columns.len() {
-        let start_reg = if let Some(yield_reg) = yield_reg {
-            // Need to reuse the yield_reg for the column being emitted
-            yield_reg + 1
-        } else {
-            dedupe_cols_start_reg
-        };
         program.emit_insn(Insn::Column {
             cursor_id: dedupe_cursor_id,
             column: col_idx,
-            dest: start_reg + col_idx,
+            dest: dedupe_cols_start_reg + col_idx,
             default: None,
         });
     }
@@ -551,6 +562,7 @@ fn read_intersect_rows(
     limit_ctx: Option<LimitCtx>,
     offset_reg: Option<usize>,
     yield_reg: Option<usize>,
+    reg_result_cols_start: Option<usize>,
 ) {
     let label_close = program.allocate_label();
     let label_loop_start = program.allocate_label();
@@ -580,11 +592,10 @@ fn read_intersect_rows(
         });
     }
     let column_count = index.columns.len();
-    let cols_start_reg = if let Some(yield_reg) = yield_reg {
-        yield_reg + 1
-    } else {
-        program.alloc_registers(column_count)
-    };
+    // When in coroutine mode, use the pre-allocated result column registers.
+    // Otherwise, allocate new registers for reading from the index.
+    let cols_start_reg =
+        reg_result_cols_start.unwrap_or_else(|| program.alloc_registers(column_count));
     for i in 0..column_count {
         program.emit_insn(Insn::Column {
             cursor_id: left_cursor_id,
@@ -595,9 +606,9 @@ fn read_intersect_rows(
     }
     if let Some(target_cursor_id) = target_cursor {
         program.emit_insn(Insn::MakeRecord {
-            start_reg: cols_start_reg,
-            count: column_count,
-            dest_reg: row_content_reg,
+            start_reg: to_u16(cols_start_reg),
+            count: to_u16(column_count),
+            dest_reg: to_u16(row_content_reg),
             index_name: None,
             affinity_str: None,
         });

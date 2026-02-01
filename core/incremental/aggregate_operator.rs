@@ -8,12 +8,13 @@ use crate::incremental::operator::{
 };
 use crate::incremental::persistence::{ReadRecord, WriteRow};
 use crate::storage::btree::CursorTrait;
+use crate::sync::Arc;
+use crate::sync::Mutex;
 use crate::types::{IOResult, ImmutableRecord, SeekKey, SeekOp, SeekResult, ValueRef};
 use crate::{return_and_restore_if_io, return_if_io, LimboError, Result, Value};
-use parking_lot::Mutex;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use std::collections::BTreeMap;
 use std::fmt::{self, Display};
-use std::sync::Arc;
 
 // Architecture of the Aggregate Operator
 // ========================================
@@ -995,8 +996,7 @@ impl AggregateState {
 
     pub fn from_blob(blob: &[u8]) -> Result<(Self, Vec<Value>)> {
         let record = ImmutableRecord::from_bin_record(blob.to_vec());
-        let ref_values = record.get_values();
-        let mut all_values: Vec<Value> = ref_values.into_iter().map(|rv| rv.to_owned()).collect();
+        let mut all_values: Vec<Value> = record.get_values_owned()?;
 
         if all_values.is_empty() {
             return Err(LimboError::InternalError(
@@ -1055,8 +1055,8 @@ impl AggregateState {
         // Track which columns have had their distinct counts/sums updated
         // This prevents double-counting when multiple distinct aggregates
         // operate on the same column (e.g., COUNT(DISTINCT col), SUM(DISTINCT col), AVG(DISTINCT col))
-        let mut processed_counts: HashSet<usize> = HashSet::new();
-        let mut processed_sums: HashSet<usize> = HashSet::new();
+        let mut processed_counts: HashSet<usize> = HashSet::default();
+        let mut processed_sums: HashSet<usize> = HashSet::default();
 
         // Update distinct aggregate state
         for agg in aggregates {
@@ -1294,7 +1294,7 @@ impl AggregateOperator {
         existing_state: &AggregateState,
         group_distinct_deltas: Option<&HashMap<(usize, HashableRow), isize>>,
     ) -> HashMap<usize, DistinctTransition> {
-        let mut transitions = HashMap::new();
+        let mut transitions = HashMap::default();
 
         // Plain Distinct doesn't track individual values, so no transitions needed
         if self.is_distinct_only {
@@ -1339,8 +1339,8 @@ impl AggregateOperator {
         let is_distinct_only = aggregates.is_empty();
 
         // Build map of column indices to their MIN/MAX info
-        let mut column_min_max = HashMap::new();
-        let mut storage_indices = HashMap::new();
+        let mut column_min_max = HashMap::default();
+        let mut storage_indices = HashMap::default();
         let mut current_index = 0;
 
         // First pass: assign storage indices to unique MIN/MAX columns
@@ -1391,7 +1391,7 @@ impl AggregateOperator {
         }
 
         // Build the distinct columns set
-        let mut distinct_columns = HashSet::new();
+        let mut distinct_columns = HashSet::default();
         for agg in &aggregates {
             match agg {
                 AggregateFunction::CountDistinct(col_idx)
@@ -1443,7 +1443,7 @@ impl AggregateOperator {
 
                 if deltas.left.changes.is_empty() {
                     *state = EvalState::Done;
-                    return Ok(IOResult::Done((Delta::new(), HashMap::new())));
+                    return Ok(IOResult::Done((Delta::new(), HashMap::default())));
                 }
 
                 let mut groups_to_read = BTreeMap::new();
@@ -1458,9 +1458,9 @@ impl AggregateOperator {
                     delta,
                     current_idx: 0,
                     groups_to_read: groups_to_read.into_iter().collect(),
-                    existing_groups: HashMap::new(),
-                    old_values: HashMap::new(),
-                    pre_existing_groups: HashSet::new(), // Initialize empty
+                    existing_groups: HashMap::default(),
+                    old_values: HashMap::default(),
+                    pre_existing_groups: HashSet::default(), // Initialize empty
                 }));
             }
             EvalState::Aggregate(_agg_state) => {
@@ -1492,11 +1492,11 @@ impl AggregateOperator {
         pre_existing_groups: &HashSet<String>,
     ) -> MergeResult {
         let mut output_delta = Delta::new();
-        let mut temp_keys: HashMap<String, Vec<Value>> = HashMap::new();
+        let mut temp_keys: HashMap<String, Vec<Value>> = HashMap::default();
 
         // Track distinct value weights as we process the batch
         let mut batch_distinct_weights: HashMap<String, HashMap<(usize, HashableRow), isize>> =
-            HashMap::new();
+            HashMap::default();
 
         // Process each change in the delta
         for (row, weight) in delta.changes.iter() {
@@ -1518,7 +1518,7 @@ impl AggregateOperator {
             let distinct_transitions = if self.has_distinct() {
                 self.detect_distinct_transitions(&row.values, *weight, state, group_batch_weights)
             } else {
-                HashMap::new()
+                HashMap::default()
             };
 
             // Update batch weights after detecting transitions
@@ -1551,7 +1551,7 @@ impl AggregateOperator {
         }
 
         // Generate output delta from temporary states and collect final states
-        let mut final_states = HashMap::new();
+        let mut final_states = HashMap::default();
 
         for (group_key_str, state) in existing_groups.iter() {
             let group_key = if let Some(key) = temp_keys.get(group_key_str) {
@@ -1621,7 +1621,7 @@ impl AggregateOperator {
 
     /// Extract distinct values from delta changes for batch tracking
     fn extract_distinct_deltas(&self, delta: &Delta) -> DistinctDeltas {
-        let mut distinct_deltas: DistinctDeltas = HashMap::new();
+        let mut distinct_deltas: DistinctDeltas = HashMap::default();
 
         for (row, weight) in &delta.changes {
             let group_key = self.extract_group_key(&row.values);
@@ -1663,7 +1663,7 @@ impl AggregateOperator {
 
     /// Extract MIN/MAX values from delta changes for persistence to index
     fn extract_min_max_deltas(&self, delta: &Delta) -> MinMaxDeltas {
-        let mut min_max_deltas: MinMaxDeltas = HashMap::new();
+        let mut min_max_deltas: MinMaxDeltas = HashMap::default();
 
         for (row, weight) in &delta.changes {
             let group_key = self.extract_group_key(&row.values);
@@ -1796,12 +1796,12 @@ impl IncrementalOperator for AggregateOperator {
                     let distinct_deltas = if self.has_distinct() || self.is_distinct_only {
                         self.extract_distinct_deltas(&input_delta)
                     } else {
-                        HashMap::new()
+                        HashMap::default()
                     };
 
                     // Get old counts before eval modifies the states
                     // We need to extract this from the eval_state before it's consumed
-                    let old_states = HashMap::new(); // TODO: Extract from eval_state
+                    let old_states = HashMap::default(); // TODO: Extract from eval_state
 
                     let (output_delta, computed_states) = return_and_restore_if_io!(
                         &mut self.commit_state,
@@ -2025,7 +2025,7 @@ impl RecomputeMinMax {
         existing_groups: &HashMap<String, AggregateState>,
         operator: &AggregateOperator,
     ) -> Self {
-        let mut groups_to_check: HashSet<(String, usize, bool)> = HashSet::new();
+        let mut groups_to_check: HashSet<(String, usize, bool)> = HashSet::default();
 
         // Remember the min_max_deltas are essentially just the only column that is affected by
         // this min/max, in delta (actually ZSet - consolidated delta) format. This makes it easier
@@ -2291,21 +2291,19 @@ impl ScanState {
             )
         })?;
 
-        let values = record.get_values();
-        if values.len() < 3 {
-            return Ok(IOResult::Done(None));
-        }
+        let mut values = record.iter()?;
 
-        let Some(rec_storage_id) = values.first() else {
+        let Some(rec_storage_id) = values.next() else {
             return Ok(IOResult::Done(None));
         };
-        let Some(rec_zset_hash) = values.get(1) else {
+
+        let Some(rec_zset_hash) = values.next() else {
             return Ok(IOResult::Done(None));
         };
 
         // Check if we're still in the same group
-        if let ValueRef::Integer(rec_sid) = rec_storage_id {
-            if *rec_sid != storage_id {
+        if let ValueRef::Integer(rec_sid) = rec_storage_id? {
+            if rec_sid != storage_id {
                 return Ok(IOResult::Done(None));
             }
         } else {
@@ -2313,7 +2311,7 @@ impl ScanState {
         }
 
         // Compare zset_hash as blob
-        if let ValueRef::Blob(rec_zset_blob) = rec_zset_hash {
+        if let ValueRef::Blob(rec_zset_blob) = rec_zset_hash? {
             if let Some(rec_hash) = Hash128::from_blob(rec_zset_blob) {
                 if rec_hash != zset_hash {
                     return Ok(IOResult::Done(None));
@@ -2325,8 +2323,13 @@ impl ScanState {
             return Ok(IOResult::Done(None));
         }
 
+        let third = values.next();
+        let Some(third) = third else {
+            return Ok(IOResult::Done(None));
+        };
+
         // Get the value (3rd element)
-        Ok(IOResult::Done(values.get(2).map(|v| v.to_owned())))
+        Ok(IOResult::Done(Some(third?.to_owned())))
     }
 
     pub fn new_for_max(
@@ -2576,7 +2579,7 @@ impl FetchDistinctState {
         is_plain_distinct: bool,
     ) -> Self {
         let mut groups_to_fetch: HashMap<String, HashMap<usize, HashSet<HashableRow>>> =
-            HashMap::new();
+            HashMap::default();
 
         for (row, _weight) in &delta.changes {
             let group_key = extract_group_key(&row.values);
@@ -2766,13 +2769,11 @@ impl FetchDistinctState {
                     let record = return_if_io!(cursors.table_cursor.record());
 
                     if let Some(r) = record {
-                        let values = r.get_values();
-
                         // The table has 5 columns: storage_id, zset_hash, element_id, blob, weight
                         // The weight is at index 4
-                        if values.len() >= 5 {
-                            // Get the weight directly from column 4
-                            let weight = match values[4].to_owned() {
+                        if let Some(weight) = r.get_value_opt(4) {
+                            // Get the weight directly from column 5(index 4)
+                            let weight = match weight.to_owned() {
                                 Value::Integer(w) => w,
                                 _ => 0,
                             };

@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeSet, HashSet, VecDeque},
-    sync::Arc,
+    sync::atomic::Ordering,
 };
 
 use turso_parser::ast::{self, SortOrder};
@@ -13,6 +13,7 @@ use crate::{
     },
     return_if_io,
     storage::btree::{BTreeCursor, BTreeKey, CursorTrait},
+    sync::Arc,
     translate::collate::CollationSeq,
     types::{IOResult, ImmutableRecord, KeyInfo, SeekKey, SeekOp, SeekResult},
     vdbe::Register,
@@ -423,7 +424,10 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
             //
             // as we run nested statement - we actually don't need subjournal as it already started before in the parent statement
             // so, this is hacky way to fix the situation for toy index for now, but we need to implement proper helpers in order to avoid similar errors in other code later
-            stmt.program.needs_stmt_subtransactions = false;
+            stmt.program
+                .prepared
+                .needs_stmt_subtransactions
+                .store(false, Ordering::Relaxed);
             connection.start_nested();
             let result = stmt.run_ignore_rows();
             connection.end_nested();
@@ -682,7 +686,7 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                     idx,
                 } => {
                     let record = return_if_io!(stats_cursor.record());
-                    let component = parse_stat_row(record.as_deref())?;
+                    let component = parse_stat_row(record)?;
                     let Some(v) = vector.as_ref() else {
                         return Err(LimboError::InternalError(
                             "vector must be present in ReadStats state".to_string(),
@@ -869,7 +873,8 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                     rowid,
                     idx,
                 } => {
-                    if !return_if_io!(cursor.next()) {
+                    return_if_io!(cursor.next());
+                    if !cursor.has_record() {
                         return Err(LimboError::Corrupt("inverted index corrupted".to_string()));
                     }
                     self.delete_state = VectorSparseInvertedIndexDeleteState::DeleteInverted {
@@ -939,7 +944,7 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                     idx,
                 } => {
                     let record = return_if_io!(stats_cursor.record());
-                    let component = parse_stat_row(record.as_deref())?;
+                    let component = parse_stat_row(record)?;
                     let Some(v) = vector.as_ref() else {
                         return Err(LimboError::InternalError(
                             "vector must be present in ReadStats state".to_string(),
@@ -1092,7 +1097,7 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                         self.search_state = VectorSparseInvertedIndexSearchState::Seek {
                             sum: *sum,
                             components: Some(components.into()),
-                            collected: Some(HashSet::new()),
+                            collected: Some(HashSet::default()),
                             distances: Some(BTreeSet::new()),
                             limit: *limit,
                             key: None,
@@ -1159,7 +1164,7 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                         ));
                     };
                     let value = v.as_f32_sparse().values[*idx];
-                    let component = parse_stat_row(record.as_deref())?;
+                    let component = parse_stat_row(record)?;
                     let Some(comps) = components.as_mut() else {
                         return Err(LimboError::InternalError(
                             "components must be present in CollectComponentsRead state".to_string(),
@@ -1315,7 +1320,7 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                     current,
                 } => {
                     let record = return_if_io!(inverted.record());
-                    let row = parse_inverted_index_row(record.as_deref())?;
+                    let row = parse_inverted_index_row(record)?;
                     if row.position != *component
                         || (sum_threshold.is_some()
                             && row.sum
@@ -1378,8 +1383,8 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                     component,
                     current,
                 } => {
-                    let result = return_if_io!(inverted.next());
-                    if !result {
+                    return_if_io!(inverted.next());
+                    if !inverted.has_record() {
                         let Some(mut current) = current.take() else {
                             return Err(LimboError::InternalError(
                                 "current must be present in Next state".to_string(),

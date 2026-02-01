@@ -1,4 +1,5 @@
 from ...lib_sync import (
+    ConnectionSync,
     PartialSyncOpts,
     PartialSyncPrefixBootstrap,
     PartialSyncQueryBootstrap,
@@ -9,6 +10,7 @@ from ...lib_sync_aio import (
 
 __all__ = [
     "connect",
+    "ConnectionSync",
     "PartialSyncOpts",
     "PartialSyncPrefixBootstrap",
     "PartialSyncQueryBootstrap",

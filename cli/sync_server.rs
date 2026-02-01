@@ -235,7 +235,7 @@ impl TursoSyncServer {
                     let cols: Vec<Col> = (0..stmt.num_columns())
                         .map(|i| Col {
                             name: Some(stmt.get_column_name(i).to_string()),
-                            decltype: stmt.get_column_type(i),
+                            decltype: stmt.get_column_decltype(i),
                         })
                         .collect();
 
@@ -399,7 +399,7 @@ impl TursoSyncServer {
             let cols: Vec<Col> = (0..stmt.num_columns())
                 .map(|i| Col {
                     name: Some(stmt.get_column_name(i).to_string()),
-                    decltype: stmt.get_column_type(i),
+                    decltype: stmt.get_column_decltype(i),
                 })
                 .collect();
 
@@ -518,7 +518,7 @@ impl TursoSyncServer {
         let db_size = if wal_state.max_frame > 0 {
             let mut last_frame = vec![0u8; frame_size];
             let last_info = conn.wal_get_frame(wal_state.max_frame, &mut last_frame)?;
-            last_info.db_size as u64 * PAGE_SIZE as u64
+            last_info.db_size as u64
         } else {
             0
         };

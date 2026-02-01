@@ -1,13 +1,17 @@
-use crate::function::Func;
+use crate::function::{Deterministic, Func};
 use crate::incremental::view::IncrementalView;
 use crate::index_method::{IndexMethodAttachment, IndexMethodConfiguration};
 use crate::stats::AnalyzeStats;
+use crate::sync::RwLock;
+use crate::translate::emitter::Resolver;
 use crate::translate::expr::{bind_and_rewrite_expr, walk_expr, BindingBehavior, WalkControl};
 use crate::translate::index::{resolve_index_method_parameters, resolve_sorted_columns};
+use crate::translate::optimizer::Optimizable;
 use crate::translate::planner::ROWID_STRS;
+use crate::types::IOResult;
 use crate::util::{exprs_are_equivalent, normalize_ident};
 use crate::vdbe::affinity::Affinity;
-use parking_lot::RwLock;
+use crate::{return_if_io, turso_assert};
 use turso_macros::AtomicEnum;
 
 #[derive(Debug, Clone, AtomicEnum)]
@@ -118,10 +122,12 @@ impl Trigger {
 }
 
 use crate::storage::btree::{BTreeCursor, CursorTrait};
+use crate::sync::Arc;
+use crate::sync::Mutex;
 use crate::translate::collate::CollationSeq;
-use crate::translate::plan::{SelectPlan, TableReferences};
+use crate::translate::plan::{Plan, TableReferences};
 use crate::util::{
-    module_args_from_sql, module_name_from_sql, type_from_name, IOExt, UnparsedFromSqlIndex,
+    module_args_from_sql, module_name_from_sql, type_from_name, UnparsedFromSqlIndex,
 };
 use crate::Result;
 use crate::{
@@ -129,10 +135,9 @@ use crate::{
     Connection, LimboError, MvCursor, MvStore, Pager, SymbolTable, ValueRef, VirtualTable,
 };
 use core::fmt;
-use parking_lot::Mutex;
-use std::collections::{HashMap, HashSet, VecDeque};
+use rustc_hash::{FxBuildHasher, FxHashMap as HashMap, FxHashSet as HashSet};
+use std::collections::VecDeque;
 use std::ops::Deref;
-use std::sync::Arc;
 use tracing::trace;
 use turso_parser::ast::{
     self, ColumnDefinition, Expr, InitDeferredPred, Literal, RefAct, SortOrder, TableOptions,
@@ -144,7 +149,67 @@ use turso_parser::{
 
 const SCHEMA_TABLE_NAME: &str = "sqlite_schema";
 const SCHEMA_TABLE_NAME_ALT: &str = "sqlite_master";
+pub const SQLITE_SEQUENCE_TABLE_NAME: &str = "sqlite_sequence";
 pub const DBSP_TABLE_PREFIX: &str = "__turso_internal_dbsp_state_v";
+pub const TURSO_INTERNAL_PREFIX: &str = "__turso_internal_";
+
+/// Accumulators for schema loading - kept separate to avoid moving through state variants
+struct MakeFromBtreeAccumulators {
+    from_sql_indexes: Vec<UnparsedFromSqlIndex>,
+    automatic_indices: HashMap<String, Vec<(String, i64)>>,
+    /// Store DBSP state table root pages: view_name -> dbsp_state_root_page
+    dbsp_state_roots: HashMap<String, i64>,
+    /// Store DBSP state table index root pages: view_name -> dbsp_state_index_root_page
+    dbsp_state_index_roots: HashMap<String, i64>,
+    /// Store materialized view info (SQL and root page) for later creation
+    materialized_view_info: HashMap<String, (String, i64)>,
+}
+
+/// Phase tracking for async schema loading
+#[derive(Default, Debug)]
+pub enum MakeFromBtreePhase {
+    #[default]
+    Init,
+    Rewinding,
+    FetchingRecord,
+    Advancing,
+    Done,
+}
+
+/// State machine for async schema loading - passed by caller, not stored on Schema
+pub struct MakeFromBtreeState {
+    phase: MakeFromBtreePhase,
+    cursor: Option<BTreeCursor>,
+    accumulators: Option<MakeFromBtreeAccumulators>,
+    read_tx_active: bool,
+}
+
+impl Default for MakeFromBtreeState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MakeFromBtreeState {
+    pub fn new() -> Self {
+        Self {
+            phase: MakeFromBtreePhase::Init,
+            cursor: None,
+            accumulators: None,
+            read_tx_active: false,
+        }
+    }
+
+    /// Cleanup on error - ensures end_read_tx is called
+    pub fn cleanup(&mut self, pager: &Pager) {
+        if self.read_tx_active {
+            pager.end_read_tx();
+            self.read_tx_active = false;
+        }
+        self.cursor = None;
+        self.accumulators = None;
+    }
+}
 
 /// Used to refer to the implicit rowid column in tables without an alias during UPDATE
 pub const ROWID_SENTINEL: usize = usize::MAX;
@@ -157,10 +222,16 @@ pub const RESERVED_TABLE_PREFIXES: [&str; 2] = ["sqlite_", "__turso_internal_"];
 
 /// Check if a table name refers to a system table that should be protected from direct writes
 pub fn is_system_table(table_name: &str) -> bool {
+    RESERVED_TABLE_PREFIXES
+        .iter()
+        .any(|prefix| table_name.to_lowercase().starts_with(prefix))
+}
+
+pub fn can_write_to_table(table_name: &str) -> bool {
     let normalized = table_name.to_lowercase();
-    normalized == SCHEMA_TABLE_NAME
+    !(normalized == SCHEMA_TABLE_NAME
         || normalized == SCHEMA_TABLE_NAME_ALT
-        || table_name.starts_with(DBSP_TABLE_PREFIX)
+        || normalized.starts_with(TURSO_INTERNAL_PREFIX))
 }
 
 /// Type of schema object for conflict checking
@@ -189,7 +260,7 @@ pub struct Schema {
 
     /// table_name to list of indexes for the table
     pub indexes: HashMap<String, VecDeque<Arc<Index>>>,
-    pub has_indexes: std::collections::HashSet<String>,
+    pub has_indexes: HashSet<String>,
     pub schema_version: u32,
     /// Statistics collected via ANALYZE for regular B-tree tables and indexes.
     pub analyze_stats: AnalyzeStats,
@@ -209,9 +280,9 @@ impl Default for Schema {
 
 impl Schema {
     pub fn new() -> Self {
-        let mut tables: HashMap<String, Arc<Table>> = HashMap::new();
-        let has_indexes = std::collections::HashSet::new();
-        let indexes: HashMap<String, VecDeque<Arc<Index>>> = HashMap::new();
+        let mut tables: HashMap<String, Arc<Table>> = HashMap::default();
+        let has_indexes = HashSet::default();
+        let indexes: HashMap<String, VecDeque<Arc<Index>>> = HashMap::default();
         #[allow(clippy::arc_with_non_send_sync)]
         tables.insert(
             SCHEMA_TABLE_NAME.to_string(),
@@ -223,13 +294,13 @@ impl Schema {
                 Arc::new(Table::Virtual(Arc::new((*function).clone()))),
             );
         }
-        let materialized_view_names = HashSet::new();
-        let materialized_view_sql = HashMap::new();
-        let incremental_views = HashMap::new();
-        let views: ViewsMap = HashMap::new();
-        let triggers = HashMap::new();
-        let table_to_materialized_views: HashMap<String, Vec<String>> = HashMap::new();
-        let incompatible_views = HashSet::new();
+        let materialized_view_names = HashSet::default();
+        let materialized_view_sql = HashMap::default();
+        let incremental_views = HashMap::default();
+        let views: ViewsMap = HashMap::default();
+        let triggers = HashMap::default();
+        let table_to_materialized_views: HashMap<String, Vec<String>> = HashMap::default();
+        let incompatible_views = HashSet::default();
         Self {
             tables,
             materialized_view_names,
@@ -548,97 +619,162 @@ impl Schema {
     }
 
     /// Update [Schema] by scanning the first root page (sqlite_schema)
+    /// Returns Result<IOResult<()>> to allow async operation with external IO loop
     pub fn make_from_btree(
         &mut self,
+        state: &mut MakeFromBtreeState,
         mv_cursor: Option<Arc<RwLock<MvCursor>>>,
-        pager: Arc<Pager>,
+        pager: &Arc<Pager>,
         syms: &SymbolTable,
-    ) -> Result<()> {
-        assert!(
-            mv_cursor.is_none(),
-            "mvcc not yet supported for make_from_btree"
-        );
-        let mut cursor = BTreeCursor::new_table(Arc::clone(&pager), 1, 10);
-
-        let mut from_sql_indexes = Vec::with_capacity(10);
-        let mut automatic_indices: HashMap<String, Vec<(String, i64)>> = HashMap::with_capacity(10);
-
-        // Store DBSP state table root pages: view_name -> dbsp_state_root_page
-        let mut dbsp_state_roots: HashMap<String, i64> = HashMap::new();
-        // Store DBSP state table index root pages: view_name -> dbsp_state_index_root_page
-        let mut dbsp_state_index_roots: HashMap<String, i64> = HashMap::new();
-        // Store materialized view info (SQL and root page) for later creation
-        let mut materialized_view_info: HashMap<String, (String, i64)> = HashMap::new();
-
-        pager.begin_read_tx()?;
-
-        pager.io.block(|| cursor.rewind())?;
-
-        loop {
-            let Some(row) = pager.io.block(|| cursor.record())? else {
-                break;
-            };
-
-            let mut record_cursor = cursor.record_cursor.borrow_mut();
-            // sqlite schema table has 5 columns: type, name, tbl_name, rootpage, sql
-            let ty_value = record_cursor.get_value(&row, 0)?;
-            let ValueRef::Text(ty) = ty_value else {
-                return Err(LimboError::ConversionError("Expected text value".into()));
-            };
-            let ValueRef::Text(name) = record_cursor.get_value(&row, 1)? else {
-                return Err(LimboError::ConversionError("Expected text value".into()));
-            };
-            let table_name_value = record_cursor.get_value(&row, 2)?;
-            let ValueRef::Text(table_name) = table_name_value else {
-                return Err(LimboError::ConversionError("Expected text value".into()));
-            };
-            let root_page_value = record_cursor.get_value(&row, 3)?;
-            let ValueRef::Integer(root_page) = root_page_value else {
-                return Err(LimboError::ConversionError("Expected integer value".into()));
-            };
-            let sql_value = record_cursor.get_value(&row, 4)?;
-            let sql_textref = match sql_value {
-                ValueRef::Text(sql) => Some(sql),
-                _ => None,
-            };
-            let sql = sql_textref.map(|s| s.as_str());
-
-            self.handle_schema_row(
-                &ty,
-                &name,
-                &table_name,
-                root_page,
-                sql,
-                syms,
-                &mut from_sql_indexes,
-                &mut automatic_indices,
-                &mut dbsp_state_roots,
-                &mut dbsp_state_index_roots,
-                &mut materialized_view_info,
-                None,
-            )?;
-            drop(record_cursor);
-            drop(row);
-
-            pager.io.block(|| cursor.next())?;
+        enable_triggers: bool,
+    ) -> Result<IOResult<()>> {
+        let result = self.make_from_btree_internal(state, mv_cursor, pager, syms, enable_triggers);
+        if result.is_err() {
+            state.cleanup(pager);
+        } else if let Ok(IOResult::Done(..)) = result {
+            turso_assert!(
+                !state.read_tx_active,
+                "make_from_btree must properly cleanup internal state in case of success"
+            );
         }
+        result
+    }
 
-        pager.end_read_tx();
+    fn make_from_btree_internal(
+        &mut self,
+        state: &mut MakeFromBtreeState,
+        mv_cursor: Option<Arc<RwLock<MvCursor>>>,
+        pager: &Arc<Pager>,
+        syms: &SymbolTable,
+        enable_triggers: bool,
+    ) -> Result<IOResult<()>> {
+        loop {
+            tracing::debug!("make_from_btree: state.phase={:?}", state.phase);
+            match &state.phase {
+                MakeFromBtreePhase::Init => {
+                    assert!(
+                        mv_cursor.is_none(),
+                        "mvcc not yet supported for make_from_btree"
+                    );
 
-        self.populate_indices(
-            syms,
-            from_sql_indexes,
-            automatic_indices,
-            mv_cursor.is_some(),
-        )?;
+                    state.cursor = Some(BTreeCursor::new_table(Arc::clone(pager), 1, 10));
+                    pager.begin_read_tx()?;
+                    state.read_tx_active = true;
 
-        self.populate_materialized_views(
-            materialized_view_info,
-            dbsp_state_roots,
-            dbsp_state_index_roots,
-        )?;
+                    state.accumulators = Some(MakeFromBtreeAccumulators {
+                        from_sql_indexes: Vec::with_capacity(10),
+                        automatic_indices: HashMap::with_capacity_and_hasher(10, FxBuildHasher),
+                        dbsp_state_roots: HashMap::default(),
+                        dbsp_state_index_roots: HashMap::default(),
+                        materialized_view_info: HashMap::default(),
+                    });
 
-        Ok(())
+                    state.phase = MakeFromBtreePhase::Rewinding;
+                }
+
+                MakeFromBtreePhase::Rewinding => {
+                    let cursor = state
+                        .cursor
+                        .as_mut()
+                        .expect("cursor must be initialized in Init phase");
+                    return_if_io!(cursor.rewind());
+                    state.phase = MakeFromBtreePhase::FetchingRecord;
+                }
+
+                MakeFromBtreePhase::FetchingRecord => {
+                    let cursor = state
+                        .cursor
+                        .as_mut()
+                        .expect("cursor must be initialized in Init phase");
+                    let row = return_if_io!(cursor.record());
+
+                    let Some(row) = row else {
+                        // EOF - finalize
+                        pager.end_read_tx();
+                        state.read_tx_active = false;
+
+                        let acc = state
+                            .accumulators
+                            .take()
+                            .expect("accumulators must be initialized in Init phase");
+                        self.populate_indices(
+                            syms,
+                            acc.from_sql_indexes,
+                            acc.automatic_indices,
+                            mv_cursor.is_some(),
+                        )?;
+                        self.populate_materialized_views(
+                            acc.materialized_view_info,
+                            acc.dbsp_state_roots,
+                            acc.dbsp_state_index_roots,
+                        )?;
+
+                        state.cursor = None;
+                        state.phase = MakeFromBtreePhase::Done;
+                        return Ok(IOResult::Done(()));
+                    };
+
+                    // Process the row (no IO - CPU only)
+                    // sqlite schema table has 5 columns: type, name, tbl_name, rootpage, sql
+                    let ty_value = row.get_value(0)?;
+                    let ValueRef::Text(ty) = ty_value else {
+                        return Err(LimboError::ConversionError("Expected text value".into()));
+                    };
+                    let ValueRef::Text(name) = row.get_value(1)? else {
+                        return Err(LimboError::ConversionError("Expected text value".into()));
+                    };
+                    let table_name_value = row.get_value(2)?;
+                    let ValueRef::Text(table_name) = table_name_value else {
+                        return Err(LimboError::ConversionError("Expected text value".into()));
+                    };
+                    let root_page_value = row.get_value(3)?;
+                    let ValueRef::Integer(root_page) = root_page_value else {
+                        return Err(LimboError::ConversionError("Expected integer value".into()));
+                    };
+                    let sql_value = row.get_value(4)?;
+                    let sql_textref = match sql_value {
+                        ValueRef::Text(sql) => Some(sql),
+                        _ => None,
+                    };
+                    let sql = sql_textref.map(|s| s.as_str());
+
+                    let acc = state
+                        .accumulators
+                        .as_mut()
+                        .expect("accumulators must be initialized in Init phase");
+                    self.handle_schema_row(
+                        &ty,
+                        &name,
+                        &table_name,
+                        root_page,
+                        sql,
+                        syms,
+                        &mut acc.from_sql_indexes,
+                        &mut acc.automatic_indices,
+                        &mut acc.dbsp_state_roots,
+                        &mut acc.dbsp_state_index_roots,
+                        &mut acc.materialized_view_info,
+                        None,
+                        enable_triggers,
+                    )?;
+
+                    state.phase = MakeFromBtreePhase::Advancing;
+                }
+
+                MakeFromBtreePhase::Advancing => {
+                    let cursor = state
+                        .cursor
+                        .as_mut()
+                        .expect("cursor must be initialized in Init phase");
+                    return_if_io!(cursor.next());
+                    state.phase = MakeFromBtreePhase::FetchingRecord;
+                }
+
+                MakeFromBtreePhase::Done => {
+                    return Ok(IOResult::Done(()));
+                }
+            }
+        }
     }
 
     /// Populate indices parsed from the schema.
@@ -648,7 +784,7 @@ impl Schema {
         &mut self,
         syms: &SymbolTable,
         from_sql_indexes: Vec<UnparsedFromSqlIndex>,
-        automatic_indices: std::collections::HashMap<String, Vec<(String, i64)>>,
+        automatic_indices: HashMap<String, Vec<(String, i64)>>,
         mvcc_enabled: bool,
     ) -> Result<()> {
         for unparsed_sql_from_index in from_sql_indexes {
@@ -711,11 +847,22 @@ impl Schema {
                         }
                     }
 
-                    self.add_index(Arc::new(Index::automatic_from_primary_key(
-                        table.as_ref(),
-                        automatic_indexes.pop().unwrap(),
-                        unique_set.columns.len(),
-                    )?))?;
+                    if let Some(index_entry) = automatic_indexes.pop() {
+                        self.add_index(Arc::new(Index::automatic_from_primary_key(
+                            table.as_ref(),
+                            index_entry,
+                            unique_set.columns.len(),
+                        )?))?;
+                    } else if mvcc_enabled {
+                        // In MVCC mode, automatic indices might not be fully populated yet during recovery
+                        // Skip creating this index - it will be added later when its schema row is processed
+                        continue;
+                    } else {
+                        return Err(LimboError::InternalError(format!(
+                            "Missing automatic index entry for primary key on table {}",
+                            table.name
+                        )));
+                    }
                 } else {
                     // Add composite unique index
                     let mut column_indices_and_sort_orders =
@@ -729,15 +876,30 @@ impl Schema {
                         };
                         column_indices_and_sort_orders.push((pos_in_table, *sort_order));
                     }
-                    self.add_index(Arc::new(Index::automatic_from_unique(
-                        table.as_ref(),
-                        automatic_indexes.pop().unwrap(),
-                        column_indices_and_sort_orders,
-                    )?))?;
+                    if let Some(index_entry) = automatic_indexes.pop() {
+                        self.add_index(Arc::new(Index::automatic_from_unique(
+                            table.as_ref(),
+                            index_entry,
+                            column_indices_and_sort_orders,
+                        )?))?;
+                    } else if mvcc_enabled {
+                        // In MVCC mode, automatic indices might not be fully populated yet during recovery
+                        // Skip creating this index - it will be added later when its schema row is processed
+                        continue;
+                    } else {
+                        return Err(LimboError::InternalError(format!(
+                            "Missing automatic index entry for UNIQUE constraint on table {}",
+                            table.name
+                        )));
+                    }
                 }
             }
 
-            assert!(automatic_indexes.is_empty(), "all automatic indexes parsed from sqlite_schema should have been consumed, but {} remain", automatic_indexes.len());
+            // In MVCC mode during recovery, not all automatic index schema rows might be visible yet
+            // during incremental schema reparsing, so we may have extra entries
+            if !mvcc_enabled {
+                assert!(automatic_indexes.is_empty(), "all automatic indexes parsed from sqlite_schema should have been consumed, but {} remain", automatic_indexes.len());
+            }
         }
         Ok(())
     }
@@ -745,9 +907,9 @@ impl Schema {
     /// Populate materialized views parsed from the schema.
     pub fn populate_materialized_views(
         &mut self,
-        materialized_view_info: std::collections::HashMap<String, (String, i64)>,
-        dbsp_state_roots: std::collections::HashMap<String, i64>,
-        dbsp_state_index_roots: std::collections::HashMap<String, i64>,
+        materialized_view_info: HashMap<String, (String, i64)>,
+        dbsp_state_roots: HashMap<String, i64>,
+        dbsp_state_index_roots: HashMap<String, i64>,
     ) -> Result<()> {
         for (view_name, (sql, main_root)) in materialized_view_info {
             // Look up the DBSP state root for this view
@@ -816,11 +978,12 @@ impl Schema {
         maybe_sql: Option<&str>,
         syms: &SymbolTable,
         from_sql_indexes: &mut Vec<UnparsedFromSqlIndex>,
-        automatic_indices: &mut std::collections::HashMap<String, Vec<(String, i64)>>,
-        dbsp_state_roots: &mut std::collections::HashMap<String, i64>,
-        dbsp_state_index_roots: &mut std::collections::HashMap<String, i64>,
-        materialized_view_info: &mut std::collections::HashMap<String, (String, i64)>,
+        automatic_indices: &mut HashMap<String, Vec<(String, i64)>>,
+        dbsp_state_roots: &mut HashMap<String, i64>,
+        dbsp_state_index_roots: &mut HashMap<String, i64>,
+        materialized_view_info: &mut HashMap<String, (String, i64)>,
         mv_store: Option<&Arc<MvStore>>,
+        enable_triggers: bool,
     ) -> Result<()> {
         match ty {
             "table" => {
@@ -980,6 +1143,13 @@ impl Schema {
                 }
             }
             "trigger" => {
+                // Check if experimental triggers are enabled
+                if !enable_triggers {
+                    return Err(crate::LimboError::ParseError(
+                        "Database contains triggers but --experimental-triggers flag is not set. Enable with --experimental-triggers flag to use this database.".to_string(),
+                    ));
+                }
+
                 use turso_parser::ast::{Cmd, Stmt};
                 use turso_parser::parser::Parser;
 
@@ -1029,7 +1199,7 @@ impl Schema {
     /// strategy (rowid vs. UNIQUE index or PK).
     pub fn resolved_fks_referencing(&self, table_name: &str) -> Result<Vec<ResolvedFkRef>> {
         let fk_mismatch_err = |child: &str, parent: &str| -> crate::LimboError {
-            crate::LimboError::Constraint(format!(
+            crate::LimboError::ForeignKeyConstraint(format!(
                 "foreign key mismatch - \"{child}\" referencing \"{parent}\""
             ))
         };
@@ -1109,20 +1279,18 @@ impl Schema {
                     parent_pos.push(p);
                 }
 
-                // Determine if parent key is ROWID/alias
-                let parent_uses_rowid = parent_tbl.primary_key_columns.len().eq(&1) && {
-                    if parent_tbl.primary_key_columns.len() == 1 {
-                        let pk_name = &parent_tbl.primary_key_columns[0].0;
-                        // rowid or alias INTEGER PRIMARY KEY; either is ok implicitly
-                        parent_tbl.columns.iter().any(|c| {
+                // Determine if the FK's parent key is the ROWID or a rowid alias.
+                let parent_uses_rowid = if parent_cols.len() == 1 {
+                    let pc = &parent_cols[0];
+                    ROWID_STRS.iter().any(|&r| r.eq_ignore_ascii_case(pc))
+                        || parent_tbl.columns.iter().any(|c| {
                             c.is_rowid_alias()
                                 && c.name
                                     .as_deref()
-                                    .is_some_and(|n| n.eq_ignore_ascii_case(pk_name))
-                        }) || ROWID_STRS.iter().any(|&r| r.eq_ignore_ascii_case(pk_name))
-                    } else {
-                        false
-                    }
+                                    .is_some_and(|n| n.eq_ignore_ascii_case(pc))
+                        })
+                } else {
+                    false
                 };
 
                 // If not rowid, there must be a non-partial UNIQUE exactly on parent_cols
@@ -1149,7 +1317,7 @@ impl Schema {
     /// Compute all resolved FKs *declared by* `child_table`
     pub fn resolved_fks_for_child(&self, child_table: &str) -> crate::Result<Vec<ResolvedFkRef>> {
         let fk_mismatch_err = |child: &str, parent: &str| -> crate::LimboError {
-            crate::LimboError::Constraint(format!(
+            crate::LimboError::ForeignKeyConstraint(format!(
                 "foreign key mismatch - \"{child}\" referencing \"{parent}\""
             ))
         };
@@ -1513,13 +1681,10 @@ pub struct BTreeTable {
 
 impl BTreeTable {
     pub fn get_rowid_alias_column(&self) -> Option<(usize, &Column)> {
-        if self.primary_key_columns.len() == 1 {
-            let (idx, col) = self.get_column(&self.primary_key_columns[0].0)?;
-            if col.is_rowid_alias() {
-                return Some((idx, col));
-            }
-        }
-        None
+        self.columns
+            .iter()
+            .enumerate()
+            .find(|(_, column)| column.is_rowid_alias())
     }
 
     /// Returns the column position and column for a given column name.
@@ -1692,8 +1857,9 @@ impl PseudoCursorType {
 pub struct FromClauseSubquery {
     /// The name of the derived table; uses the alias if available.
     pub name: String,
-    /// The query plan for the derived table.
-    pub plan: Box<SelectPlan>,
+    /// The query plan for the derived table. Can be either a simple SelectPlan
+    /// or a compound select (UNION/INTERSECT/EXCEPT).
+    pub plan: Box<Plan>,
     /// The columns of the derived table.
     pub columns: Vec<Column>,
     /// The start register for the result columns of the derived table;
@@ -1951,7 +2117,8 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                         }
                         ast::ColumnConstraint::Default(ref expr) => {
                             default = Some(
-                                translate_ident_to_string_literal(expr).unwrap_or(expr.clone()),
+                                translate_ident_to_string_literal(expr)
+                                    .unwrap_or_else(|| expr.clone()),
                             );
                         }
                         // TODO: for now we don't check Resolve type of unique
@@ -2142,9 +2309,13 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
     })
 }
 
+/// SQLite treats bare identifiers in DEFAULT clauses as string literals.
+/// E.g., `DEFAULT hello` becomes the string "hello", not a column reference.
 pub fn translate_ident_to_string_literal(expr: &Expr) -> Option<Box<Expr>> {
     match expr {
-        Expr::Name(name) => Some(Box::new(Expr::Literal(Literal::String(name.as_literal())))),
+        Expr::Name(name) | Expr::Id(name) => {
+            Some(Box::new(Expr::Literal(Literal::String(name.as_literal()))))
+        }
         _ => None,
     }
 }
@@ -2182,20 +2353,12 @@ pub struct ForeignKey {
 }
 impl ForeignKey {
     fn validate(&self) -> Result<()> {
-        // TODO: remove this when actions are implemented
-        if !(matches!(self.on_update, RefAct::NoAction)
-            && matches!(self.on_delete, RefAct::NoAction))
-        {
-            crate::bail_parse_error!(
-                "foreign key actions other than NO ACTION are not implemented"
-            );
-        }
         if self
             .parent_columns
             .iter()
             .any(|c| ROWID_STRS.iter().any(|&r| r.eq_ignore_ascii_case(c)))
         {
-            return Err(crate::LimboError::Constraint(format!(
+            return Err(crate::LimboError::ForeignKeyConstraint(format!(
                 "foreign key mismatch referencing \"{}\"",
                 self.parent_table
             )));
@@ -2486,8 +2649,9 @@ impl From<&ColumnDefinition> for Column {
                 ast::ColumnConstraint::NotNull { .. } => notnull = true,
                 ast::ColumnConstraint::Unique(..) => unique = true,
                 ast::ColumnConstraint::Default(expr) => {
-                    default
-                        .replace(translate_ident_to_string_literal(expr).unwrap_or(expr.clone()));
+                    default.replace(
+                        translate_ident_to_string_literal(expr).unwrap_or_else(|| expr.clone()),
+                    );
                 }
                 ast::ColumnConstraint::Collate { collation_name } => {
                     collation.replace(
@@ -2698,6 +2862,11 @@ impl Index {
         }
     }
 
+    /// Check if this is an expression index.
+    pub fn is_expression_index(&self) -> bool {
+        self.columns.iter().any(|c| c.expr.is_some())
+    }
+
     /// check if this is special backing_btree index created and managed by custom index_method
     pub fn is_backing_btree_index(&self) -> bool {
         self.index_method
@@ -2817,20 +2986,20 @@ impl Index {
 
     /// Walk the where_clause Expr of a partial index and validate that it doesn't reference any other
     /// tables or use any disallowed constructs.
-    pub fn validate_where_expr(&self, table: &Table) -> bool {
+    pub fn validate_where_expr(&self, table: &Table, resolver: &Resolver) -> bool {
         let Some(where_clause) = &self.where_clause else {
             return true;
         };
 
-        let tbl_norm = normalize_ident(self.table_name.as_str());
+        let tbl_norm = self.table_name.as_str();
         let has_col = |name: &str| {
             let n = normalize_ident(name);
             table
                 .columns()
                 .iter()
-                .any(|c| c.name.as_ref().is_some_and(|cn| normalize_ident(cn) == n))
+                .any(|c| c.name.as_ref().is_some_and(|cn| *cn == n))
         };
-        let is_tbl = |ns: &str| normalize_ident(ns).eq_ignore_ascii_case(&tbl_norm);
+        let is_tbl = |ns: &str| normalize_ident(ns) == tbl_norm;
         let is_deterministic_fn = |name: &str, argc: usize| {
             let n = normalize_ident(name);
             Func::resolve_function(&n, argc).is_ok_and(|f| f.is_deterministic())
@@ -2869,7 +3038,12 @@ impl Index {
                         ok = false;
                     } else {
                         let argc = match e {
-                            Expr::FunctionCall { args, .. } => args.len(),
+                            Expr::FunctionCall { args, .. } => {
+                                if !args.iter().all(|a| a.is_constant(resolver)) {
+                                    ok = false;
+                                }
+                                args.len()
+                            }
                             Expr::FunctionCallStar { .. } => 0,
                             _ => unreachable!(),
                         };

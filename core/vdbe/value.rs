@@ -1,10 +1,6 @@
-use std::collections::HashMap;
-
-use regex::{Regex, RegexBuilder};
-
 use crate::{
     function::MathFunc,
-    numeric::{NullableInteger, Numeric},
+    numeric::{format_float, NullableInteger, Numeric},
     translate::collate::CollationSeq,
     types::{compare_immutable_single, AsValueRef, SeekOp},
     vdbe::affinity::Affinity,
@@ -167,16 +163,6 @@ enum TrimType {
     Right,
 }
 
-impl TrimType {
-    fn trim<'a>(&self, text: &'a str, pattern: &[char]) -> &'a str {
-        match self {
-            TrimType::All => text.trim_matches(pattern),
-            TrimType::Right => text.trim_end_matches(pattern),
-            TrimType::Left => text.trim_start_matches(pattern),
-        }
-    }
-}
-
 impl Value {
     pub fn exec_lower(&self) -> Option<Self> {
         self.cast_text()
@@ -204,10 +190,9 @@ impl Value {
 
     pub fn exec_octet_length(&self) -> Self {
         match self {
-            Value::Text(_) | Value::Integer(_) | Value::Float(_) => {
-                Value::Integer(self.to_string().into_bytes().len() as i64)
-            }
+            Value::Text(s) => Value::Integer(s.as_str().len() as i64),
             Value::Blob(blob) => Value::Integer(blob.len() as i64),
+            Value::Integer(_) | Value::Float(_) => Value::Integer(self.to_string().len() as i64),
             _ => self.to_owned(),
         }
     }
@@ -232,95 +217,63 @@ impl Value {
     /// Generates the Soundex code for a given word
     pub fn exec_soundex(&self) -> Value {
         let s = match self {
+            Value::Text(s) => s.as_str(),
             Value::Null => return Value::build_text("?000"),
-            Value::Text(s) => {
-                // return ?000 if non ASCII alphabet character is found
-                if !s.as_str().chars().all(|c| c.is_ascii_alphabetic()) {
-                    return Value::build_text("?000");
-                }
-                s.clone()
-            }
-            _ => return Value::build_text("?000"), // For unsupported types, return NULL
+            _ => return Value::build_text("?000"),
         };
 
-        // Remove numbers and spaces
-        let word: String = s
-            .as_str()
-            .chars()
-            .filter(|c| !c.is_ascii_digit())
-            .collect::<String>()
-            .replace(" ", "");
-        if word.is_empty() {
-            return Value::build_text("0000");
+        if s.bytes().any(|b| !b.is_ascii_alphabetic()) {
+            return Value::build_text("?000");
         }
 
-        let soundex_code = |c| match c {
-            'b' | 'f' | 'p' | 'v' => Some('1'),
-            'c' | 'g' | 'j' | 'k' | 'q' | 's' | 'x' | 'z' => Some('2'),
-            'd' | 't' => Some('3'),
-            'l' => Some('4'),
-            'm' | 'n' => Some('5'),
-            'r' => Some('6'),
-            _ => None,
+        let mut bytes = s.bytes();
+        let Some(first_char) = bytes.next() else {
+            return Value::build_text("?000");
         };
 
-        // Convert the word to lowercase for consistent lookups
-        let word = word.to_lowercase();
-        let first_letter = word
-            .chars()
-            .next()
-            .expect("word should not be empty after validation");
-
-        // Remove all occurrences of 'h' and 'w' except the first letter
-        let code: String = word
-            .chars()
-            .skip(1)
-            .filter(|&ch| ch != 'h' && ch != 'w')
-            .fold(first_letter.to_string(), |mut acc, ch| {
-                acc.push(ch);
-                acc
-            });
-
-        // Replace consonants with digits based on Soundex mapping
-        let tmp: String = code
-            .chars()
-            .map(|ch| match soundex_code(ch) {
-                Some(code) => code.to_string(),
-                None => ch.to_string(),
-            })
-            .collect();
-
-        // Remove adjacent same digits
-        let tmp = tmp.chars().fold(String::new(), |mut acc, ch| {
-            if !acc.ends_with(ch) {
-                acc.push(ch);
+        let first_upper = first_char.to_ascii_uppercase();
+        let mut result = String::with_capacity(4);
+        result.push(first_upper as char);
+        let get_code = |b: u8| -> Option<char> {
+            match b.to_ascii_lowercase() {
+                b'b' | b'f' | b'p' | b'v' => Some('1'),
+                b'c' | b'g' | b'j' | b'k' | b'q' | b's' | b'x' | b'z' => Some('2'),
+                b'd' | b't' => Some('3'),
+                b'l' => Some('4'),
+                b'm' | b'n' => Some('5'),
+                b'r' => Some('6'),
+                _ => None, // a, e, i, o, u, y, h, w
             }
-            acc
-        });
+        };
 
-        // Remove all occurrences of a, e, i, o, u, y except the first letter
-        let mut result = tmp
-            .chars()
-            .enumerate()
-            .filter(|(i, ch)| *i == 0 || !matches!(ch, 'a' | 'e' | 'i' | 'o' | 'u' | 'y'))
-            .map(|(_, ch)| ch)
-            .collect::<String>();
+        let mut prev_code = get_code(first_char);
 
-        // If the first symbol is a digit, replace it with the saved first letter
-        if let Some(first_digit) = result.chars().next() {
-            if first_digit.is_ascii_digit() {
-                result.replace_range(0..1, &first_letter.to_string());
+        for b in bytes {
+            if result.len() >= 4 {
+                break;
+            }
+
+            // H and W are ignored completely in this step for continuity checks
+            let lower = b.to_ascii_lowercase();
+            if lower == b'h' || lower == b'w' {
+                continue;
+            }
+
+            let code = get_code(b);
+            if code.is_some() && code != prev_code {
+                result.push(code.unwrap());
+                prev_code = code;
+            } else if code.is_none() {
+                // Reset previous code for vowels/separators (a,e,i,o,u,y)
+                prev_code = None;
             }
         }
 
-        // Append zeros if the result contains less than 4 characters
         while result.len() < 4 {
             result.push('0');
         }
 
-        // Retain the first 4 characters and convert to uppercase
-        result.truncate(4);
-        Value::build_text(result.to_uppercase())
+        Value::build_text(result)
     }
 
     pub fn exec_abs(&self) -> Result<Self> {
@@ -351,7 +304,10 @@ impl Value {
         Value::Integer(generate_random_number())
     }
 
-    pub fn exec_randomblob<F>(&self, fill_bytes: F) -> Value
+    /// SQLite default max blob/string size (1GB)
+    pub const MAX_BLOB_LENGTH: i64 = 1_000_000_000;
+
+    pub fn exec_randomblob<F>(&self, fill_bytes: F) -> Result<Value>
     where
         F: Fn(&mut [u8]),
     {
@@ -361,18 +317,22 @@ impl Value {
             Value::Text(t) => t.as_str().parse().unwrap_or(1),
             _ => 1,
         }
-        .max(1) as usize;
+        .max(1);
 
-        let mut blob: Vec<u8> = vec![0; length];
+        if length > Self::MAX_BLOB_LENGTH {
+            return Err(LimboError::TooBig);
+        }
+
+        let mut blob: Vec<u8> = vec![0; length as usize];
         fill_bytes(&mut blob);
-        Value::Blob(blob)
+        Ok(Value::Blob(blob))
     }
 
     pub fn exec_quote(&self) -> Self {
         use std::fmt::Write;
         match self {
             Value::Null => Value::build_text("NULL"),
-            Value::Integer(_) | Value::Float(_) => self.to_owned(),
+            Value::Integer(_) | Value::Float(_) => Value::build_text(self.to_string()),
             Value::Blob(b) => {
                 // SQLite returns X'hexdigits' for blobs
                 let mut quoted = String::with_capacity(3 + b.len() * 2);
@@ -441,40 +401,63 @@ impl Value {
             }
         }
 
+        // Match SQLite's substr algorithm exactly (func.c substrFunc)
+        // Uses wrapping arithmetic to match C overflow behavior
         fn calculate_postions(
-            start: i64,
-            bytes_len: usize,
+            mut p1: i64,
+            len: usize,
             length_value: Option<&Value>,
         ) -> (usize, usize) {
-            let bytes_len = bytes_len as i64;
-
-            // The left-most character of X is number 1.
-            // If Y is negative then the first character of the substring is found by counting from the right rather than the left.
-            let first_position = if start < 0 {
-                bytes_len.saturating_sub((start).abs())
-            } else {
-                start - 1
-            };
-            // If Z is negative then the abs(Z) characters preceding the Y-th character are returned.
-            let last_position = match length_value {
-                Some(Value::Integer(length)) => first_position + *length,
-                _ => bytes_len,
+            let len = len as i64;
+            let mut p2 = match length_value {
+                Some(Value::Integer(length)) => *length,
+                // SQLite uses SQLITE_LIMIT_LENGTH (default 1 billion) when no explicit length.
+                // Using len causes wrong results when p1 is large negative number.
+                _ => Value::MAX_BLOB_LENGTH,
             };
 
-            let (start, end) = if first_position <= last_position {
-                (first_position, last_position)
-            } else {
-                (last_position, first_position)
-            };
+            // Track if length was explicitly provided
+            let explicit_length = length_value.is_some();
 
-            (
-                start.clamp(-0, bytes_len) as usize,
-                end.clamp(0, bytes_len) as usize,
-            )
+            // Handle negative start position (count from end)
+            if p1 < 0 {
+                p1 = p1.wrapping_add(len);
+                if p1 < 0 {
+                    p2 = p2.wrapping_add(p1);
+                    p1 = 0;
+                }
+            } else if p1 > 0 {
+                p1 -= 1; // Convert 1-indexed to 0-indexed
+            } else if p2 > 0 && explicit_length {
+                // SQLite quirk: when p1==0, p2>0, and explicit length, decrement p2
+                // This means substr('x', 0, 3) returns 2 chars, not 3
+                // But substr('x', 0) with no length returns whole string
+                p2 -= 1;
+            }
+
+            // Handle negative length (characters preceding position)
+            if p2 < 0 {
+                if p2 < -p1 {
+                    p2 = p1;
+                } else {
+                    p2 = -p2;
+                }
+                p1 -= p2;
+            }
+
+            // Clamp to valid range
+            let start = p1.max(0).min(len) as usize;
+            let end = p1.saturating_add(p2).max(0).min(len) as usize;
+            (start, end)
         }
 
         let start_value = start_value.exec_cast("INT");
         let length_value = length_value.map(|value| value.exec_cast("INT"));
+
+        // If length is explicitly NULL, return NULL (SQLite behavior)
+        if matches!(length_value, Some(Value::Null)) {
+            return Value::Null;
+        }
 
         match (value, start_value) {
             (Value::Blob(b), Value::Integer(start)) => {
@@ -544,7 +527,11 @@ impl Value {
         };
 
         match reg.find(pattern) {
-            Some(position) => Value::Integer(position as i64 + 1),
+            Some(byte_pos) => {
+                // Convert byte position to character position (1-indexed)
+                let char_pos = reg[..byte_pos].chars().count() + 1;
+                Value::Integer(char_pos as i64)
+            }
             None => Value::Integer(0),
         }
     }
@@ -644,17 +631,34 @@ impl Value {
     }
 
     fn _exec_trim(&self, pattern: Option<&Value>, trim_type: TrimType) -> Value {
-        match (self, pattern) {
-            (Value::Text(_) | Value::Integer(_) | Value::Float(_), Some(pattern)) => {
-                let pattern_chars: Vec<char> = pattern.to_string().chars().collect();
-                let text = self.to_string();
-                Value::build_text(trim_type.trim(&text, &pattern_chars).to_string())
+        let text_cow = match self {
+            Value::Text(s) => std::borrow::Cow::Borrowed(s.as_str()),
+            Value::Null => return Value::Null,
+            _ => std::borrow::Cow::Owned(self.to_string()),
+        };
+        let trimmed = match pattern {
+            Some(p) => {
+                if matches!(p, Value::Null) {
+                    return Value::Null;
+                }
+                let pat_cow = match p {
+                    Value::Text(s) => std::borrow::Cow::Borrowed(s.as_str()),
+                    _ => std::borrow::Cow::Owned(p.to_string()),
+                };
+                let p_str = pat_cow.as_ref();
+                match trim_type {
+                    TrimType::All => text_cow.trim_matches(|c| p_str.contains(c)),
+                    TrimType::Left => text_cow.trim_start_matches(|c| p_str.contains(c)),
+                    TrimType::Right => text_cow.trim_end_matches(|c| p_str.contains(c)),
+                }
             }
-            (Value::Text(t), None) => {
-                Value::build_text(trim_type.trim(t.as_str(), &[' ']).to_string())
-            }
-            (reg, _) => reg.to_owned(),
-        }
+            None => match trim_type {
+                TrimType::All => text_cow.trim_matches(' '),
+                TrimType::Left => text_cow.trim_start_matches(' '),
+                TrimType::Right => text_cow.trim_end_matches(' '),
+            },
+        };
+        Value::build_text(trimmed.to_string())
     }
 
     // Implements TRIM pattern matching.
@@ -671,14 +675,20 @@ impl Value {
         self._exec_trim(pattern, TrimType::Left)
     }
 
-    pub fn exec_zeroblob(&self) -> Value {
+    pub fn exec_zeroblob(&self) -> Result<Value> {
         let length: i64 = match self {
             Value::Integer(i) => *i,
             Value::Float(f) => *f as i64,
             Value::Text(s) => s.as_str().parse().unwrap_or(0),
             _ => 0,
-        };
-        Value::Blob(vec![0; length.max(0) as usize])
+        }
+        .max(0);
+
+        if length > Self::MAX_BLOB_LENGTH {
+            return Err(LimboError::TooBig);
+        }
+
+        Ok(Value::Blob(vec![0; length as usize]))
     }
 
     // exec_if returns whether you should jump
@@ -755,25 +765,13 @@ impl Value {
                 Value::Float(v) => Self::Float(*v),
                 _ => {
                     let s = match self {
-                        Value::Text(text) => text.to_string(),
-                        Value::Blob(blob) => String::from_utf8_lossy(blob.as_slice()).to_string(),
+                        Value::Text(text) => text.as_str().into(),
+                        Value::Blob(blob) => String::from_utf8_lossy(blob.as_slice()),
                         _ => unreachable!(),
                     };
-
-                    match crate::numeric::str_to_f64(&s) {
-                        Some(parsed) => {
-                            let Some(int) = crate::numeric::str_to_i64(&s) else {
-                                return Value::Integer(0);
-                            };
-
-                            if f64::from(parsed) == int as f64 {
-                                return Value::Integer(int);
-                            }
-
-                            Value::Float(parsed.into())
-                        }
-                        None => Value::Integer(0),
-                    }
+                    crate::util::checked_cast_text_to_numeric(&s, false)
+                        .ok()
+                        .unwrap_or(Value::Integer(0))
                 }
             },
         }
@@ -799,7 +797,7 @@ impl Value {
         // If any of the casts failed, panic as text casting is not expected to fail.
         match (&source, &pattern, &replacement) {
             (Value::Text(source), Value::Text(pattern), Value::Text(replacement)) => {
-                if pattern.as_str().is_empty() {
+                if pattern.as_str().is_empty() || pattern.as_str().starts_with('\0') {
                     return Value::Text(source.clone());
                 }
 
@@ -982,9 +980,7 @@ impl Value {
 
     pub fn exec_concat(&self, rhs: &Value) -> Value {
         if let (Value::Blob(lhs), Value::Blob(rhs)) = (self, rhs) {
-            return Value::build_text(
-                String::from_utf8_lossy(&[lhs.as_slice(), rhs.as_slice()].concat()).into_owned(),
-            );
+            return Value::Blob([lhs.as_slice(), rhs.as_slice()].concat().to_vec());
         }
 
         let Some(lhs) = self.cast_text() else {
@@ -1020,34 +1016,86 @@ impl Value {
         }
     }
 
-    // Implements LIKE pattern matching. Caches the constructed regex if a cache is provided
-    pub fn exec_like(
-        regex_cache: Option<&mut HashMap<String, Regex>>,
-        pattern: &str,
-        text: &str,
-    ) -> bool {
-        if let Some(cache) = regex_cache {
-            match cache.get(pattern) {
-                Some(re) => re.is_match(text),
-                None => {
-                    let re = construct_like_regex(pattern);
-                    let res = re.is_match(text);
-                    cache.insert(pattern.to_string(), re);
-                    res
-                }
-            }
-        } else {
-            let re = construct_like_regex(pattern);
-            re.is_match(text)
+    pub fn exec_like(pattern: &str, text: &str, escape: Option<char>) -> Result<bool, LimboError> {
+        const MAX_LIKE_PATTERN_LENGTH: usize = 50000;
+        if pattern.len() > MAX_LIKE_PATTERN_LENGTH {
+            return Err(LimboError::Constraint(
+                "LIKE or GLOB pattern too complex".to_string(),
+            ));
         }
+
+        let has_escape = escape.is_some_and(|e| pattern.contains(e));
+
+        // 1. Exact match (no wildcards)
+        if !has_escape && !pattern.contains(['%', '_']) {
+            return Ok(pattern.eq_ignore_ascii_case(text));
+        }
+
+        // 2. Fast Path: 'abc%' (Prefix)
+        if !has_escape
+            && pattern.ends_with('%')
+            && !pattern[..pattern.len() - 1].contains(['%', '_'])
+        {
+            let prefix = &pattern[..pattern.len() - 1];
+            if text.len() >= prefix.len() && text.is_char_boundary(prefix.len()) {
+                return Ok(text[..prefix.len()].eq_ignore_ascii_case(prefix));
+            }
+            // Fall through to regex if boundary check fails (multi-byte UTF-8)
+        }
+
+        // 3. Fast Path: '%abc' (Suffix)
+        if !has_escape && pattern.starts_with('%') && !pattern[1..].contains(['%', '_']) {
+            let suffix = &pattern[1..];
+            let start = text.len().wrapping_sub(suffix.len());
+            if text.len() >= suffix.len() && text.is_char_boundary(start) {
+                return Ok(text[start..].eq_ignore_ascii_case(suffix));
+            }
+            // Fall through to regex if boundary check fails (multi-byte UTF-8)
+        }
+
+        Ok(pattern_compare(pattern, text, escape) == CompareResult::Match)
     }
 
     pub fn exec_min<'a, T: Iterator<Item = &'a Value>>(regs: T) -> Value {
-        regs.min().map(|v| v.to_owned()).unwrap_or(Value::Null)
+        // SQLite: multi-arg min() returns NULL if ANY argument is NULL
+        let mut result: Option<&Value> = None;
+        for v in regs {
+            if matches!(v, Value::Null) {
+                return Value::Null;
+            }
+            result = Some(match result {
+                None => v,
+                Some(cur) if v < cur => v,
+                Some(cur) => cur,
+            });
+        }
+        result.map(|v| v.to_owned()).unwrap_or(Value::Null)
     }
 
     pub fn exec_max<'a, T: Iterator<Item = &'a Value>>(regs: T) -> Value {
-        regs.max().map(|v| v.to_owned()).unwrap_or(Value::Null)
+        // SQLite: multi-arg max() returns NULL if ANY argument is NULL
+        let mut result: Option<&Value> = None;
+        for v in regs {
+            if matches!(v, Value::Null) {
+                return Value::Null;
+            }
+            result = Some(match result {
+                None => v,
+                Some(cur) if v > cur => v,
+                Some(cur) => cur,
+            });
+        }
+        result.map(|v| v.to_owned()).unwrap_or(Value::Null)
+    }
+
+    /// Concatenate another value onto this Text value, converting both to strings.
+    /// Used by GROUP_CONCAT/STRING_AGG to properly handle all value types.
+    /// Panics if self is not a Text value.
+    pub fn exec_group_concat(&mut self, other: &Value) {
+        let Value::Text(text) = self else {
+            panic!("concat_to_text must be called only on Value::Text");
+        };
+        text.value.to_mut().push_str(&other.to_string());
     }
 
     pub fn exec_concat_strings<'a, T: Iterator<Item = &'a Self>>(registers: T) -> Self {
@@ -1055,8 +1103,10 @@ impl Value {
         for val in registers {
             match val {
                 Value::Null => continue,
-                Value::Blob(_) => todo!("TODO concat blob"),
-                v => result.push_str(&format!("{v}")),
+                Value::Text(s) => result.push_str(s.as_str()),
+                Value::Blob(b) => result.push_str(&String::from_utf8_lossy(b)),
+                Value::Integer(i) => result.push_str(&i.to_string()),
+                Value::Float(f) => result.push_str(&format_float(*f)),
             }
         }
         Value::build_text(result)
@@ -1086,50 +1136,161 @@ impl Value {
 
     pub fn exec_char<'a, T: Iterator<Item = &'a Self>>(values: T) -> Self {
         let result: String = values
-            .filter_map(|x| {
-                if let Value::Integer(i) = x {
-                    Some(*i as u8 as char)
-                } else {
-                    None
+            .filter_map(|x| match x {
+                Value::Integer(i) => {
+                    // Convert integer to Unicode codepoint.
+                    // For invalid codepoints (negative, surrogates, or > U+10FFFF),
+                    // output U+FFFD (replacement character) to match SQLite behavior.
+                    if *i >= 0 {
+                        Some(char::from_u32(*i as u32).unwrap_or('\u{FFFD}'))
+                    } else {
+                        Some('\u{FFFD}')
+                    }
                 }
+                // NULL arguments produce NUL characters to match SQLite behavior.
+                Value::Null => Some('\0'),
+                _ => None,
             })
             .collect();
         Value::build_text(result)
     }
 }
 
-pub fn construct_like_regex(pattern: &str) -> Regex {
-    let mut regex_pattern = String::with_capacity(pattern.len() * 2);
+/// Result of LIKE pattern comparison.
+/// `NoWildcardMatch` signals an early abort when a literal after `%` cannot be found,
+/// allowing the algorithm to skip unnecessary backtracking.
+#[derive(PartialEq)]
+enum CompareResult {
+    Match,
+    NoMatch,
+    NoWildcardMatch,
+}
 
-    regex_pattern.push('^');
+/// LIKE pattern matching based on SQLite's patternCompare algorithm (src/func.c).
+/// Uses recursive descent with early termination via `NoWildcardMatch` to avoid
+/// exponential backtracking on patterns like `%a%a%a%...%b`.
+fn pattern_compare(pattern: &str, text: &str, escape: Option<char>) -> CompareResult {
+    let mut p_indices = pattern.char_indices();
+    let mut t_indices = text.char_indices();
 
-    for c in pattern.chars() {
-        match c {
-            '\\' => regex_pattern.push_str("\\\\"),
-            '%' => regex_pattern.push_str(".*"),
-            '_' => regex_pattern.push('.'),
-            ch => {
-                if ch.is_ascii_alphabetic() {
-                    regex_pattern.push('[');
-                    regex_pattern.push(ch.to_ascii_lowercase());
-                    regex_pattern.push(ch.to_ascii_uppercase());
-                    regex_pattern.push(']');
-                } else {
-                    if regex_syntax::is_meta_character(c) {
-                        regex_pattern.push('\\');
+    let mut p_curr = p_indices.next();
+    let mut t_curr = t_indices.next();
+
+    // Checkpoints for backtracking
+    let mut wildcard_p_iter: Option<std::str::CharIndices> = None;
+    let mut wildcard_t_iter: Option<std::str::CharIndices> = None;
+
+    let match_all = '%';
+    let match_one = '_';
+
+    loop {
+        match (p_curr, t_curr) {
+            (Some((_, p_char)), Some((_, t_char))) => {
+                if p_char == match_all && Some(p_char) != escape {
+                    // Consume consecutive wildcards
+                    let mut next_p = p_indices.clone();
+                    while let Some((_, c)) = next_p.clone().next() {
+                        if c == match_all && Some(c) != escape {
+                            next_p.next(); // Consume valid %
+                        } else {
+                            break;
+                        }
                     }
-                    regex_pattern.push(ch);
+
+                    let mut lookahead_p = next_p.clone();
+                    if let Some((_, next_char)) = lookahead_p.next() {
+                        let is_wildcard = next_char == match_all || next_char == match_one;
+                        let is_escaped = Some(next_char) == escape;
+
+                        if !is_wildcard && !is_escaped {
+                            let mut found = false;
+
+                            // Check the current text char
+                            if eq_ignore_ascii_case(next_char, t_char) {
+                                found = true;
+                            } else {
+                                // Scan the rest of the text
+                                let lookahead_t = t_indices.clone();
+                                for (_, t_c) in lookahead_t {
+                                    if eq_ignore_ascii_case(next_char, t_c) {
+                                        found = true;
+                                        break;
+                                    }
+                                }
+                            }
+
+                            if !found {
+                                return CompareResult::NoWildcardMatch;
+                            }
+                        }
+                    }
+                    p_indices = next_p;
+                    wildcard_p_iter = Some(p_indices.clone());
+                    p_curr = p_indices.next();
+
+                    if p_curr.is_none() {
+                        return CompareResult::Match;
+                    }
+
+                    wildcard_t_iter = Some(t_indices.clone());
+                    continue;
+                }
+
+                if p_char == match_one && Some(p_char) != escape {
+                    p_curr = p_indices.next();
+                    t_curr = t_indices.next();
+                    continue;
+                }
+
+                let (expected_char, next_p_iter) = if Some(p_char) == escape {
+                    if let Some((_, literal)) = p_indices.next() {
+                        (literal, p_indices.clone())
+                    } else {
+                        return CompareResult::NoMatch;
+                    }
+                } else {
+                    (p_char, p_indices.clone())
+                };
+
+                if eq_ignore_ascii_case(expected_char, t_char) {
+                    p_indices = next_p_iter;
+                    p_curr = p_indices.next();
+                    t_curr = t_indices.next();
+                    continue;
                 }
             }
+            (None, None) => return CompareResult::Match,
+            (Some((_, p_char)), None) if p_char == match_all && Some(p_char) != escape => {
+                let mut temp = p_indices.clone();
+                loop {
+                    match temp.next() {
+                        Some((_, c)) if c == match_all && Some(c) != escape => continue,
+                        None => return CompareResult::Match,
+                        _ => break,
+                    }
+                }
+            }
+            _ => {}
         }
+
+        if let (Some(wp), Some(wt)) = (wildcard_p_iter.clone(), wildcard_t_iter.clone()) {
+            p_indices = wp;
+            p_curr = p_indices.next();
+            t_indices = wt.clone();
+            t_curr = t_indices.next();
+
+            if t_curr.is_some() {
+                wildcard_t_iter = Some(t_indices.clone());
+                continue;
+            }
+        }
+
+        return CompareResult::NoMatch;
     }
+}
 
-    regex_pattern.push('$');
-
-    RegexBuilder::new(&regex_pattern)
-        .dot_matches_new_line(true)
-        .build()
-        .expect("constructed LIKE regex pattern should be valid")
+fn eq_ignore_ascii_case(a: char, b: char) -> bool {
+    a.eq_ignore_ascii_case(&b)
 }
 
 #[cfg(test)]
@@ -1138,7 +1299,6 @@ mod tests {
     use crate::vdbe::Register;
 
     use rand::{Rng, RngCore};
-    use std::collections::HashMap;
 
     #[test]
     fn test_exec_add() {
@@ -1520,7 +1680,11 @@ mod tests {
         assert_eq!(input.exec_quote(), expected);
 
         let input = Value::Integer(123);
-        let expected = Value::Integer(123);
+        let expected = Value::build_text("123");
+        assert_eq!(input.exec_quote(), expected);
+
+        let input = Value::Float(12.34);
+        let expected = Value::build_text("12.34");
         assert_eq!(input.exec_quote(), expected);
 
         let input = Value::build_text("hello''world");
@@ -1616,6 +1780,20 @@ mod tests {
             Value::exec_max(input_mixed_vec.iter().map(|v| v.get_value())),
             Value::build_text("A")
         );
+
+        // SQLite: multi-arg min/max returns NULL if ANY argument is NULL
+        let input_with_null = [
+            Register::Value(Value::Integer(1)),
+            Register::Value(Value::Null),
+        ];
+        assert_eq!(
+            Value::exec_min(input_with_null.iter().map(|v| v.get_value())),
+            Value::Null
+        );
+        assert_eq!(
+            Value::exec_max(input_with_null.iter().map(|v| v.get_value())),
+            Value::Null
+        );
     }
 
     #[test]
@@ -1636,6 +1814,16 @@ mod tests {
         let input_str = Value::build_text("\na");
         let expected_str = Value::build_text("\na");
         assert_eq!(input_str.exec_trim(None), expected_str);
+
+        // TRIM on Integer should return TEXT (SQLite compatibility)
+        let input_int = Value::Integer(12345);
+        let expected_text = Value::build_text("12345");
+        assert_eq!(input_int.exec_trim(None), expected_text);
+
+        // TRIM on Float should return TEXT (SQLite compatibility)
+        let input_float = Value::Float(123.5);
+        let expected_text = Value::build_text("123.5");
+        assert_eq!(input_float.exec_trim(None), expected_text);
     }
 
     #[test]
@@ -1824,7 +2012,7 @@ mod tests {
                     .iter()
                     .map(|reg| reg.get_value())
             ),
-            Value::build_text("")
+            Value::build_text("\0")
         );
         assert_eq!(
             Value::exec_char(
@@ -1838,34 +2026,37 @@ mod tests {
 
     #[test]
     fn test_like_with_escape_or_regexmeta_chars() {
-        assert!(Value::exec_like(None, r#"\%A"#, r#"\A"#));
-        assert!(Value::exec_like(None, "%a%a", "aaaa"));
+        assert!(Value::exec_like(r#"\%A"#, r#"\A"#, None).unwrap());
+        assert!(Value::exec_like("%a%a", "aaaa", None).unwrap());
     }
 
     #[test]
-    fn test_like_no_cache() {
-        assert!(Value::exec_like(None, "a%", "aaaa"));
-        assert!(Value::exec_like(None, "%a%a", "aaaa"));
-        assert!(!Value::exec_like(None, "%a.a", "aaaa"));
-        assert!(!Value::exec_like(None, "a.a%", "aaaa"));
-        assert!(!Value::exec_like(None, "%a.ab", "aaaa"));
+    fn test_like_without_escape() {
+        assert!(Value::exec_like("a%", "aaaa", None).unwrap());
+        assert!(Value::exec_like("%a%a", "aaaa", None).unwrap());
+        assert!(!Value::exec_like("%a.a", "aaaa", None).unwrap());
+        assert!(!Value::exec_like("a.a%", "aaaa", None).unwrap());
+        assert!(!Value::exec_like("%a.ab", "aaaa", None).unwrap());
     }
 
     #[test]
-    fn test_like_with_cache() {
-        let mut cache = HashMap::new();
-        assert!(Value::exec_like(Some(&mut cache), "a%", "aaaa"));
-        assert!(Value::exec_like(Some(&mut cache), "%a%a", "aaaa"));
-        assert!(!Value::exec_like(Some(&mut cache), "%a.a", "aaaa"));
-        assert!(!Value::exec_like(Some(&mut cache), "a.a%", "aaaa"));
-        assert!(!Value::exec_like(Some(&mut cache), "%a.ab", "aaaa"));
+    fn test_exec_like_with_escape() {
+        assert!(Value::exec_like("abcX%", "abc%", Some('X')).unwrap());
+        assert!(!Value::exec_like("abcX%", "abc5", Some('X')).unwrap());
+        assert!(!Value::exec_like("abcX%", "abc", Some('X')).unwrap());
+        assert!(!Value::exec_like("abcX%", "abcX%", Some('X')).unwrap());
+        assert!(!Value::exec_like("abcX%", "abc%%", Some('X')).unwrap());
 
-        // again after values have been cached
-        assert!(Value::exec_like(Some(&mut cache), "a%", "aaaa"));
-        assert!(Value::exec_like(Some(&mut cache), "%a%a", "aaaa"));
-        assert!(!Value::exec_like(Some(&mut cache), "%a.a", "aaaa"));
-        assert!(!Value::exec_like(Some(&mut cache), "a.a%", "aaaa"));
-        assert!(!Value::exec_like(Some(&mut cache), "%a.ab", "aaaa"));
+        assert!(Value::exec_like("abcX_", "abc_", Some('X')).unwrap());
+        assert!(!Value::exec_like("abcX_", "abc5", Some('X')).unwrap());
+        assert!(!Value::exec_like("abcX_", "abc", Some('X')).unwrap());
+        assert!(!Value::exec_like("abcX_", "abcX_", Some('X')).unwrap());
+        assert!(!Value::exec_like("abcX_", "abc__", Some('X')).unwrap());
+
+        assert!(Value::exec_like("abcXX", "abcX", Some('X')).unwrap());
+        assert!(!Value::exec_like("abcXX", "abc5", Some('X')).unwrap());
+        assert!(!Value::exec_like("abcXX", "abc", Some('X')).unwrap());
+        assert!(!Value::exec_like("abcXX", "abcXX", Some('X')).unwrap());
     }
 
     #[test]
@@ -1933,9 +2124,12 @@ mod tests {
         ];
 
         for test_case in &test_cases {
-            let result = test_case.input.exec_randomblob(|dest| {
-                rand::rng().fill_bytes(dest);
-            });
+            let result = test_case
+                .input
+                .exec_randomblob(|dest| {
+                    rand::rng().fill_bytes(dest);
+                })
+                .unwrap();
             match result {
                 Value::Blob(blob) => {
                     assert_eq!(blob.len(), test_case.expected_len);
@@ -1943,6 +2137,10 @@ mod tests {
                 _ => panic!("exec_randomblob did not return a Blob variant"),
             }
         }
+
+        // Test TooBig error
+        let input = Value::Integer(Value::MAX_BLOB_LENGTH + 1);
+        assert!(input.exec_randomblob(|_| {}).is_err());
     }
 
     #[test]
@@ -2064,7 +2262,7 @@ mod tests {
         let str_value = Value::build_text("limbo");
         let start_value = Value::Integer(3);
         let length_value = Value::Null;
-        let expected_val = Value::build_text("mbo");
+        let expected_val = Value::Null;
         assert_eq!(
             Value::exec_substring(&str_value, &start_value, Some(&length_value)),
             expected_val
@@ -2073,7 +2271,7 @@ mod tests {
         let str_value = Value::build_text("limbo");
         let start_value = Value::Integer(10);
         let length_value = Value::Null;
-        let expected_val = Value::build_text("");
+        let expected_val = Value::Null;
         assert_eq!(
             Value::exec_substring(&str_value, &start_value, Some(&length_value)),
             expected_val
@@ -2259,39 +2457,43 @@ mod tests {
     fn test_exec_zeroblob() {
         let input = Value::Integer(0);
         let expected = Value::Blob(vec![]);
-        assert_eq!(input.exec_zeroblob(), expected);
+        assert_eq!(input.exec_zeroblob().unwrap(), expected);
 
         let input = Value::Null;
         let expected = Value::Blob(vec![]);
-        assert_eq!(input.exec_zeroblob(), expected);
+        assert_eq!(input.exec_zeroblob().unwrap(), expected);
 
         let input = Value::Integer(4);
         let expected = Value::Blob(vec![0; 4]);
-        assert_eq!(input.exec_zeroblob(), expected);
+        assert_eq!(input.exec_zeroblob().unwrap(), expected);
 
         let input = Value::Integer(-1);
         let expected = Value::Blob(vec![]);
-        assert_eq!(input.exec_zeroblob(), expected);
+        assert_eq!(input.exec_zeroblob().unwrap(), expected);
 
         let input = Value::build_text("5");
         let expected = Value::Blob(vec![0; 5]);
-        assert_eq!(input.exec_zeroblob(), expected);
+        assert_eq!(input.exec_zeroblob().unwrap(), expected);
 
         let input = Value::build_text("-5");
         let expected = Value::Blob(vec![]);
-        assert_eq!(input.exec_zeroblob(), expected);
+        assert_eq!(input.exec_zeroblob().unwrap(), expected);
 
         let input = Value::build_text("text");
         let expected = Value::Blob(vec![]);
-        assert_eq!(input.exec_zeroblob(), expected);
+        assert_eq!(input.exec_zeroblob().unwrap(), expected);
 
         let input = Value::Float(2.6);
         let expected = Value::Blob(vec![0; 2]);
-        assert_eq!(input.exec_zeroblob(), expected);
+        assert_eq!(input.exec_zeroblob().unwrap(), expected);
 
         let input = Value::Blob(vec![1]);
         let expected = Value::Blob(vec![]);
-        assert_eq!(input.exec_zeroblob(), expected);
+        assert_eq!(input.exec_zeroblob().unwrap(), expected);
+
+        // Test TooBig error
+        let input = Value::Integer(Value::MAX_BLOB_LENGTH + 1);
+        assert!(input.exec_zeroblob().is_err());
     }
 
     #[test]

@@ -172,8 +172,21 @@ pub struct ManualArgs {
     pub page: Option<String>,
 }
 
+#[derive(Debug, Clone, Args)]
+pub struct ReadArgs {
+    /// Path to the SQL file to execute
+    #[arg(add = ArgValueCompleter::new(PathCompleter::file()))]
+    pub path: String,
+}
+
 #[derive(ValueEnum, Copy, Clone, Debug, PartialEq, Eq)]
 pub enum HeadersMode {
     On,
     Off,
+}
+
+#[derive(Debug, Clone, clap::Parser)]
+pub struct DbtotxtArgs {
+    #[clap(long = "page")]
+    pub page_no: Option<i64>,
 }

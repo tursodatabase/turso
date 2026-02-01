@@ -244,7 +244,7 @@ impl Delta {
         }
 
         // Use a HashMap to accumulate weights
-        let mut consolidated: HashMap<HashableRow, isize> = HashMap::new();
+        let mut consolidated: HashMap<HashableRow, isize> = HashMap::default();
 
         for (row, weight) in self.changes.drain(..) {
             *consolidated.entry(row).or_insert(0) += weight;

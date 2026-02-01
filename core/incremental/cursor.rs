@@ -1,3 +1,5 @@
+use crate::sync::Arc;
+use crate::sync::Mutex;
 use crate::{
     incremental::{
         compiler::{DeltaSet, ExecuteState},
@@ -9,8 +11,6 @@ use crate::{
     types::{IOResult, SeekKey, SeekOp, SeekResult, Value},
     LimboError, Pager, Result,
 };
-use parking_lot::Mutex;
-use std::sync::Arc;
 
 /// State machine for seek operations
 #[derive(Debug)]
@@ -123,11 +123,7 @@ impl MaterializedViewCursor {
                 "Invalid data in materialized view: found a rowid, but not the row!".to_string(),
             )
         })?;
-        let btree_ref_values = btree_record.get_values();
-
-        // Convert RefValues to Values (copying for now - can optimize later)
-        let mut btree_values: Vec<Value> =
-            btree_ref_values.iter().map(|rv| rv.to_owned()).collect();
+        let mut btree_values = btree_record.get_values_owned()?;
 
         // The last column should be the weight
         let weight_value = btree_values.pop().ok_or_else(|| {
@@ -298,9 +294,9 @@ impl MaterializedViewCursor {
 mod tests {
     use super::*;
     use crate::storage::btree::BTreeCursor;
+    use crate::sync::Arc;
     use crate::util::IOExt;
     use crate::{Connection, Database, OpenFlags};
-    use std::sync::Arc;
 
     /// Helper to create a test connection with a table and materialized view
     fn create_test_connection() -> Result<Arc<Connection>> {
@@ -317,6 +313,8 @@ mod tests {
                 enable_encryption: false,
                 enable_index_method: false,
                 enable_autovacuum: false,
+                enable_triggers: false,
+                enable_attach: false,
             },
             None,
         )?;
@@ -344,9 +342,7 @@ mod tests {
             .schema
             .read()
             .get_materialized_view("test_view")
-            .ok_or(crate::LimboError::InternalError(
-                "View not found".to_string(),
-            ))?;
+            .ok_or_else(|| crate::LimboError::InternalError("View not found".to_string()))?;
 
         // Get the view's root page
         let view = view_mutex.lock();

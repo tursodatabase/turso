@@ -8,6 +8,7 @@ import turso.aio
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s", force=True)
 
+
 @pytest.fixture(autouse=True)
 def setup_database():
     db_path = "tests/database.db"
@@ -50,6 +51,7 @@ def setup_database():
     except PermissionError as e:
         print(f"Failed to clean up: {e}")
 
+
 @pytest.mark.asyncio
 async def test_connection_execute_helpers_and_context_manager():
     async with turso.aio.connect(":memory:") as conn:
@@ -60,6 +62,7 @@ async def test_connection_execute_helpers_and_context_manager():
         cur = await conn.execute("SELECT COUNT(*) FROM t")
         count = (await cur.fetchone())[0]
         assert count == 1
+
 
 @pytest.mark.asyncio
 async def test_subqueries_and_join():
@@ -83,17 +86,21 @@ async def test_subqueries_and_join():
         assert [r[0] for r in rows] == ["adam", "alice"]
 
         # JOIN with subquery
-        await cur.execute("""
+        await cur.execute(
+            """
             SELECT u.username, p.city
             FROM users u
             JOIN (SELECT user_id, city FROM profiles) p
             ON u.id = p.user_id
             WHERE u.username = ?
-        """, ("alice",))
+        """,
+            ("alice",),
+        )
         row = await cur.fetchone()
         assert row == ("alice", "NY")
     finally:
         await conn.close()
+
 
 @pytest.mark.asyncio
 async def test_conflict_do_nothing_and_rowcount():
@@ -188,6 +195,7 @@ async def test_json_functions_extract_patch_and_array_length():
 @pytest.mark.asyncio
 async def test_async_operations_do_not_block_event_loop():
     import time
+
     async with turso.aio.connect(":memory:") as conn:
         count = 1_000_000
         await conn.execute("CREATE TABLE t (id INTEGER)")
@@ -196,6 +204,7 @@ async def test_async_operations_do_not_block_event_loop():
         task = asyncio.create_task(cur.fetchone())
         assert (time.time() - start) < 0.001
         assert await task == (count * (count + 1) // 2,)
+
 
 @pytest.mark.asyncio
 async def test_operation_after_connection_close_raises():

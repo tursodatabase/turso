@@ -1,0 +1,288 @@
+@database :memory:
+
+# Boolean NOT tests
+
+test boolean-not-int-1 {
+    SELECT not 1;
+}
+expect {
+    0
+}
+
+test boolean-not-int-2 {
+    SELECT not 2;
+}
+expect {
+    0
+}
+
+test boolean-not-int-3 {
+    SELECT not 0;
+}
+expect {
+    1
+}
+
+test boolean-not-float-1 {
+    SELECT not 1.0;
+}
+expect {
+    0
+}
+
+test boolean-not-float-2 {
+    SELECT not 2.0;
+}
+expect {
+    0
+}
+
+test boolean-not-float-3 {
+    SELECT not 0.0;
+}
+expect {
+    1
+}
+
+test boolean-not-text {
+    SELECT not 'a';
+}
+expect {
+    1
+}
+
+test boolean-not-text-int-1 {
+    SELECT not '0';
+}
+expect {
+    1
+}
+
+test boolean-not-text-int-2 {
+    SELECT not '1';
+}
+expect {
+    0
+}
+
+test boolean-not-text-float-1 {
+    SELECT not '1.0';
+}
+expect {
+    0
+}
+
+test boolean-not-text-float-2 {
+    SELECT not '0.0';
+}
+expect {
+    1
+}
+
+test boolean-not-text-float-edge {
+    SELECT not '12-23.0';
+}
+expect {
+    0
+}
+
+test boolean-not-null {
+    SELECT not NULL;
+}
+expect {
+}
+
+test boolean-not-empty-blob {
+    SELECT not x'';
+}
+expect {
+    1
+}
+
+test boolean-not-cast-blob {
+    SELECT not CAST ('af' AS BLOB);
+}
+expect {
+    1
+}
+
+test boolean-not-blob {
+    SELECT not x'0000';
+}
+expect {
+    1
+}
+
+test boolean-not-blob-2 {
+    SELECT not x'0001';
+}
+expect {
+    1
+}
+
+# Boolean AND tests
+
+test boolean-and-blob-blob {
+    SELECT x'' AND x'';
+}
+expect {
+    0
+}
+
+test boolean-and-1-blob {
+    SELECT 1 AND x'';
+}
+expect {
+    0
+}
+
+test boolean-and-0-blob {
+    SELECT 0 AND x'';
+}
+expect {
+    0
+}
+
+test boolean-and-0-1 {
+    SELECT 0 AND 1;
+}
+expect {
+    0
+}
+
+test boolean-and-1-1 {
+    SELECT 1 AND 1;
+}
+expect {
+    1
+}
+
+test boolean-and-int-int {
+    SELECT 20 AND 1000;
+}
+expect {
+    1
+}
+
+test boolean-and-int-float {
+    SELECT 20 AND 1.0;
+}
+expect {
+    1
+}
+
+test boolean-and-int-0_0 {
+    SELECT 20 AND 0.0;
+}
+expect {
+    0
+}
+
+test boolean-and-0_0-0_0 {
+    SELECT 0.0 AND 0.0;
+}
+expect {
+    0
+}
+
+test boolean-and-text {
+    SELECT 'a' AND 1;
+}
+expect {
+    0
+}
+
+test boolean-and-text-int-1 {
+    SELECT '0' AND 1;
+}
+expect {
+    0
+}
+
+test boolean-and-text-int-2 {
+    SELECT '1' AND 0;
+}
+expect {
+    0
+}
+
+test boolean-and-text-float-1 {
+    SELECT '1.0' AND 0;
+}
+expect {
+    0
+}
+
+test boolean-and-text-float-2 {
+    SELECT '0.0' AND 1;
+}
+expect {
+    0
+}
+
+test boolean-and-text-float-3 {
+    SELECT '1.0' AND 1;
+}
+expect {
+    1
+}
+
+test boolean-and-text-float-edge {
+    SELECT '12-23.0' AND 0;
+}
+expect {
+    0
+}
+
+test boolean-and-null-null {
+    SELECT NULL AND NULL;
+}
+expect {
+}
+
+test boolean-and-1-null {
+    SELECT 1 AND NULL;
+}
+expect {
+}
+
+test boolean-and-1_0-null {
+    SELECT 1.0 AND NULL;
+}
+expect {
+}
+
+test boolean-and-blob-null {
+    SELECT x'' AND NULL;
+}
+expect {
+    0
+}
+
+test boolean-and-blob2-null {
+    SELECT x'0001' AND NULL;
+}
+expect {
+    0
+}
+
+test boolean-and-0-null {
+    SELECT 0 AND NULL;
+}
+expect {
+    0
+}
+
+test boolean-and-0_0-null {
+    SELECT 0.0 AND NULL;
+}
+expect {
+    0
+}
+
+test boolean-and-str0_0-null {
+    SELECT '0.0' AND NULL;
+}
+expect {
+    0
+}

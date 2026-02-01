@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tempfile::TempDir;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
-use turso_core::{Connection, Database, FromValueRow, Row, IO};
+use turso_core::{Clock, Connection, Database, FromValueRow, Row, IO};
 
 pub struct TempDatabase {
     pub path: PathBuf,
@@ -29,6 +29,69 @@ pub struct TempDatabaseBuilder {
     flags: Option<turso_core::OpenFlags>,
     init_sql: Option<String>,
     enable_mvcc: bool,
+}
+
+struct TestIo {
+    io: Arc<dyn IO>,
+}
+
+impl Clock for TestIo {
+    fn current_time_monotonic(&self) -> turso_core::MonotonicInstant {
+        self.io.current_time_monotonic()
+    }
+
+    fn current_time_wall_clock(&self) -> turso_core::WallClockInstant {
+        self.io.current_time_wall_clock()
+    }
+}
+
+impl IO for TestIo {
+    // we don't sleep in test io in order to make tests faster
+    fn sleep(&self, _duration: std::time::Duration) {}
+
+    fn open_file(
+        &self,
+        path: &str,
+        flags: turso_core::OpenFlags,
+        direct: bool,
+    ) -> turso_core::Result<Arc<dyn turso_core::File>> {
+        self.io.open_file(path, flags, direct)
+    }
+
+    fn remove_file(&self, path: &str) -> turso_core::Result<()> {
+        self.io.remove_file(path)
+    }
+    fn cancel(&self, c: &[turso_core::Completion]) -> turso_core::Result<()> {
+        self.io.cancel(c)
+    }
+    fn drain(&self) -> turso_core::Result<()> {
+        self.io.drain()
+    }
+    fn fill_bytes(&self, dest: &mut [u8]) {
+        self.io.fill_bytes(dest);
+    }
+    fn generate_random_number(&self) -> i64 {
+        self.io.generate_random_number()
+    }
+    fn get_memory_io(&self) -> Arc<turso_core::MemoryIO> {
+        self.io.get_memory_io()
+    }
+    fn register_fixed_buffer(
+        &self,
+        ptr: std::ptr::NonNull<u8>,
+        len: usize,
+    ) -> turso_core::Result<u32> {
+        self.io.register_fixed_buffer(ptr, len)
+    }
+    fn step(&self) -> turso_core::Result<()> {
+        self.io.step()
+    }
+    fn wait_for_completion(&self, c: turso_core::Completion) -> turso_core::Result<()> {
+        self.io.wait_for_completion(c)
+    }
+    fn yield_now(&self) {
+        self.io.yield_now();
+    }
 }
 
 impl TempDatabaseBuilder {
@@ -112,7 +175,9 @@ impl TempDatabaseBuilder {
             connection.execute(init_sql, ()).unwrap();
         }
 
-        let io = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let io = Arc::new(TestIo {
+            io: Arc::new(turso_core::PlatformIO::new().unwrap()),
+        });
         let db = Database::open_file_with_flags(
             io.clone(),
             db_path.to_str().unwrap(),
@@ -462,6 +527,41 @@ pub fn rusqlite_integrity_check(db_path: &Path) -> anyhow::Result<()> {
         anyhow::bail!("integrity check returned: {}", result.join("\n"))
     }
     Ok(())
+}
+
+/// Compute dbhash of the test database.
+pub fn compute_dbhash(tmp_db: &TempDatabase) -> turso_dbhash::DbHashResult {
+    let path = tmp_db.path.to_str().unwrap();
+    turso_dbhash::hash_database(path, &turso_dbhash::DbHashOptions::default())
+        .expect("dbhash failed")
+}
+
+/// Compute dbhash with custom options.
+#[allow(dead_code)]
+pub fn compute_dbhash_with_options(
+    tmp_db: &TempDatabase,
+    options: &turso_dbhash::DbHashOptions,
+) -> turso_dbhash::DbHashResult {
+    let path = tmp_db.path.to_str().unwrap();
+    turso_dbhash::hash_database(path, options).expect("dbhash failed")
+}
+
+/// Assert that checkpoint does not change database content.
+/// Computes hash before and after checkpoint, asserts they match.
+pub fn assert_checkpoint_preserves_content(conn: &Arc<Connection>, tmp_db: &TempDatabase) {
+    do_flush(conn, tmp_db).unwrap();
+    let hash_before = compute_dbhash(tmp_db);
+
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    do_flush(conn, tmp_db).unwrap();
+    let hash_after = compute_dbhash(tmp_db);
+
+    assert_eq!(
+        hash_before.hash, hash_after.hash,
+        "Checkpoint changed database content! before={}, after={}",
+        hash_before.hash, hash_after.hash
+    );
 }
 
 pub trait ExecRows<T> {

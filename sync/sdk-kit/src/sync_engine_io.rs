@@ -3,13 +3,14 @@ use std::{
     sync::{Arc, Mutex, MutexGuard},
 };
 
-use turso_sdk_kit::rsapi::{turso_slice_from_bytes, TursoError, TursoStatusCode};
+use turso_sdk_kit::rsapi::{turso_slice_from_bytes, turso_slice_null, TursoError};
 
 use crate::capi::c::{self};
 
 /// sync engine extended IO request
 pub enum SyncEngineIoRequest {
     Http {
+        url: Option<String>,
         method: String,
         path: String,
         body: Option<Vec<u8>>,
@@ -46,25 +47,25 @@ impl SyncEngineIoRequest {
                 })
             }
             SyncEngineIoRequest::Http { headers, .. } if index >= headers.len() => {
-                Err(TursoError {
-                    code: TursoStatusCode::Misuse,
-                    message: Some("header index out of boudns".to_string()),
-                })
+                Err(TursoError::Misuse("header index out of boudns".to_string()))
             }
-            _ => Err(TursoError {
-                code: TursoStatusCode::Misuse,
-                message: Some("unexpected io request type".to_string()),
-            }),
+            _ => Err(TursoError::Misuse("unexpected io request type".to_string())),
         }
     }
     pub fn http_to_capi(&self) -> Result<c::turso_sync_io_http_request_t, TursoError> {
         match self {
             SyncEngineIoRequest::Http {
+                url,
                 method,
                 path,
                 body,
                 headers,
             } => Ok(c::turso_sync_io_http_request_t {
+                url: if let Some(url) = url {
+                    turso_slice_from_bytes(url.as_bytes())
+                } else {
+                    turso_slice_null()
+                },
                 method: turso_slice_from_bytes(method.as_bytes()),
                 path: turso_slice_from_bytes(path.as_bytes()),
                 body: if let Some(body) = body {
@@ -74,10 +75,7 @@ impl SyncEngineIoRequest {
                 },
                 headers: headers.len() as i32,
             }),
-            _ => Err(TursoError {
-                code: TursoStatusCode::Misuse,
-                message: Some("unexpected io request type".to_string()),
-            }),
+            _ => Err(TursoError::Misuse("unexpected io request type".to_string())),
         }
     }
     pub fn full_read_to_capi(&self) -> Result<c::turso_sync_io_full_read_request_t, TursoError> {
@@ -85,10 +83,7 @@ impl SyncEngineIoRequest {
             SyncEngineIoRequest::FullRead { path } => Ok(c::turso_sync_io_full_read_request_t {
                 path: turso_slice_from_bytes(path.as_bytes()),
             }),
-            _ => Err(TursoError {
-                code: TursoStatusCode::Misuse,
-                message: Some("unexpected io request type".to_string()),
-            }),
+            _ => Err(TursoError::Misuse("unexpected io request type".to_string())),
         }
     }
     pub fn full_write_to_capi(&self) -> Result<c::turso_sync_io_full_write_request_t, TursoError> {
@@ -99,10 +94,7 @@ impl SyncEngineIoRequest {
                     content: turso_slice_from_bytes(content.as_ref()),
                 })
             }
-            _ => Err(TursoError {
-                code: TursoStatusCode::Misuse,
-                message: Some("unexpected io request type".to_string()),
-            }),
+            _ => Err(TursoError::Misuse("unexpected io request type".to_string())),
         }
     }
 }
@@ -252,10 +244,7 @@ impl<TBytes: AsRef<[u8]>> SyncEngineIoQueueItem<TBytes> {
         value: *const c::turso_sync_io_item_t,
     ) -> Result<&'a Self, TursoError> {
         if value.is_null() {
-            Err(TursoError {
-                code: TursoStatusCode::Misuse,
-                message: Some("got null pointer".to_string()),
-            })
+            Err(TursoError::Misuse("got null pointer".to_string()))
         } else {
             Ok(&*(value as *const Self))
         }
@@ -283,12 +272,14 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static>
 
     fn http(
         &self,
+        url: Option<&str>,
         method: &str,
         path: &str,
         body: Option<Vec<u8>>,
         headers: &[(&str, &str)],
     ) -> turso_sync_engine::Result<Self::DataCompletionBytes> {
         Ok(self.push_back(SyncEngineIoRequest::Http {
+            url: url.map(|x| x.to_string()),
             method: method.to_string(),
             path: path.to_string(),
             body,

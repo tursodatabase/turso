@@ -4,7 +4,6 @@ use std::{
     ops::Deref,
     sync::{atomic::Ordering, Arc},
     task::Waker,
-    time::Duration,
 };
 
 use tracing::{instrument, Level};
@@ -14,6 +13,7 @@ use turso_parser::{
 };
 
 use crate::{
+    busy::BusyHandlerState,
     parameters,
     schema::Trigger,
     stats::refresh_analyze_stats,
@@ -22,7 +22,7 @@ use crate::{
         self,
         explain::{EXPLAIN_COLUMNS_TYPE, EXPLAIN_QUERY_PLAN_COLUMNS_TYPE},
     },
-    Instant, LimboError, MvStore, Pager, QueryMode, Result, Value, EXPLAIN_COLUMNS,
+    LimboError, MvStore, Pager, QueryMode, Result, Value, EXPLAIN_COLUMNS,
     EXPLAIN_QUERY_PLAN_COLUMNS,
 };
 
@@ -30,91 +30,19 @@ type ProgramExecutionState = vdbe::ProgramExecutionState;
 type Row = vdbe::Row;
 type StepResult = vdbe::StepResult;
 
-#[derive(Debug)]
-struct BusyTimeout {
-    /// Busy timeout instant
-    timeout: Instant,
-    /// Next iteration index for DELAYS
-    iteration: usize,
-}
-
-impl BusyTimeout {
-    const DELAYS: [std::time::Duration; 12] = [
-        Duration::from_millis(1),
-        Duration::from_millis(2),
-        Duration::from_millis(5),
-        Duration::from_millis(10),
-        Duration::from_millis(15),
-        Duration::from_millis(20),
-        Duration::from_millis(25),
-        Duration::from_millis(25),
-        Duration::from_millis(25),
-        Duration::from_millis(50),
-        Duration::from_millis(50),
-        Duration::from_millis(100),
-    ];
-
-    const TOTALS: [std::time::Duration; 12] = [
-        Duration::from_millis(0),
-        Duration::from_millis(1),
-        Duration::from_millis(3),
-        Duration::from_millis(8),
-        Duration::from_millis(18),
-        Duration::from_millis(33),
-        Duration::from_millis(53),
-        Duration::from_millis(78),
-        Duration::from_millis(103),
-        Duration::from_millis(128),
-        Duration::from_millis(178),
-        Duration::from_millis(228),
-    ];
-
-    pub fn new(now: Instant) -> Self {
-        Self {
-            timeout: now,
-            iteration: 0,
-        }
-    }
-
-    // implementation of sqliteDefaultBusyCallback
-    pub fn busy_callback(&mut self, now: Instant, max_duration: Duration) {
-        let idx = self.iteration.min(11);
-        let mut delay = Self::DELAYS[idx];
-        let mut prior = Self::TOTALS[idx];
-
-        if self.iteration >= 12 {
-            prior += delay * (self.iteration as u32 - 11);
-        }
-
-        if prior + delay > max_duration {
-            delay = max_duration.saturating_sub(prior);
-            // no more waiting after this
-            if delay.is_zero() {
-                return;
-            }
-        }
-
-        self.iteration = self.iteration.saturating_add(1);
-        self.timeout = now + delay;
-    }
-}
-
 pub struct Statement {
     pub(crate) program: vdbe::Program,
     state: vdbe::ProgramState,
     pager: Arc<Pager>,
-    /// Whether the statement accesses the database.
-    /// Used to determine whether we need to check for schema changes when
-    /// starting a transaction.
-    accesses_db: bool,
     /// indicates if the statement is a NORMAL/EXPLAIN/EXPLAIN QUERY PLAN
     query_mode: QueryMode,
     /// Flag to show if the statement was busy
     busy: bool,
-    /// Busy timeout instant
-    /// We need Option here because `io.now()` is not a cheap call
-    busy_timeout: Option<BusyTimeout>,
+    /// Busy handler state for tracking invocations and timeouts
+    busy_handler_state: Option<BusyHandlerState>,
 }
+
+crate::assert::assert_send_sync!(Statement);
 
 impl std::fmt::Debug for Statement {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -130,7 +58,6 @@ impl Drop for Statement {
 
 impl Statement {
     pub fn new(program: vdbe::Program, pager: Arc<Pager>, query_mode: QueryMode) -> Self {
-        let accesses_db = program.accesses_db;
         let (max_registers, cursor_count) = match query_mode {
             QueryMode::Normal => (program.max_registers, program.cursor_ref.len()),
             QueryMode::Explain => (EXPLAIN_COLUMNS.len(), 0),
@@ -141,10 +68,9 @@ impl Statement {
             program,
             state,
             pager,
-            accesses_db,
             query_mode,
             busy: false,
-            busy_timeout: None,
+            busy_handler_state: None,
         }
     }
 
@@ -156,14 +82,22 @@ impl Statement {
         self.query_mode
     }
 
+    pub fn get_program(&self) -> &vdbe::Program {
+        &self.program
+    }
+
+    pub fn get_pager(&self) -> &Arc<Pager> {
+        &self.pager
+    }
+
     pub fn n_change(&self) -> i64 {
-        self.program
+        self.state
             .n_change
-            .load(std::sync::atomic::Ordering::SeqCst)
+            .load(crate::sync::atomic::Ordering::SeqCst)
     }
 
     pub fn set_mv_tx(&mut self, mv_tx: Option<(u64, TransactionMode)>) {
-        *self.program.connection.mv_tx.write() = mv_tx;
+        self.program.connection.set_mv_tx(mv_tx);
     }
 
     pub fn interrupt(&mut self) {
@@ -178,9 +112,25 @@ impl Statement {
         self.program.connection.mv_store()
     }
 
+    /// Take the pending IO completions from this statement.
+    /// Returns None if no IO is pending.
+    /// This is used by async state machines that need to yield the completions.
+    pub fn take_io_completions(&mut self) -> Option<crate::types::IOCompletions> {
+        self.state.io_completions.take()
+    }
+
     fn _step(&mut self, waker: Option<&Waker>) -> Result<StepResult> {
-        if let Some(busy_timeout) = self.busy_timeout.as_ref() {
-            if self.pager.io.now() < busy_timeout.timeout {
+        if matches!(self.state.execution_state, ProgramExecutionState::Init)
+            && !self
+                .program
+                .prepare_context
+                .matches_connection(&self.program.connection)
+        {
+            self.reprepare()?;
+        }
+        // If we're waiting for a busy handler timeout, check if we can proceed
+        if let Some(busy_state) = self.busy_handler_state.as_ref() {
+            if self.pager.io.current_time_monotonic() < busy_state.timeout() {
                 // Yield the query as the timeout has not been reached yet
                 if let Some(waker) = waker {
                     waker.wake_by_ref();
@@ -189,33 +139,28 @@ impl Statement {
             }
         }
 
-        let mut res = if !self.accesses_db {
+        const MAX_SCHEMA_RETRY: usize = 50;
+        let mut res =
             self.program
-                .step(&mut self.state, self.pager.clone(), self.query_mode, waker)
-        } else {
-            const MAX_SCHEMA_RETRY: usize = 50;
-            let mut res =
-                self.program
-                    .step(&mut self.state, self.pager.clone(), self.query_mode, waker);
-            for attempt in 0..MAX_SCHEMA_RETRY {
-                // Only reprepare if we still need to update schema
-                if !matches!(res, Err(LimboError::SchemaUpdated)) {
-                    break;
-                }
-                tracing::debug!("reprepare: attempt={}", attempt);
-                self.reprepare()?;
-                res =
-                    self.program
-                        .step(&mut self.state, self.pager.clone(), self.query_mode, waker);
+                .step(&mut self.state, self.pager.clone(), self.query_mode, waker);
+        for attempt in 0..MAX_SCHEMA_RETRY {
+            // Only reprepare if we still need to update schema
+            if !matches!(res, Err(LimboError::SchemaUpdated)) {
+                break;
             }
-            res
-        };
+            tracing::debug!("reprepare: attempt={}", attempt);
+            self.reprepare()?;
+            res = self
+                .program
+                .step(&mut self.state, self.pager.clone(), self.query_mode, waker);
+        }
 
         // Aggregate metrics when statement completes
         if matches!(res, Ok(StepResult::Done)) {
             let mut conn_metrics = self.program.connection.metrics.write();
             conn_metrics.record_statement(self.state.metrics.clone());
             self.busy = false;
+            self.busy_handler_state = None; // Reset busy state on completion
             drop(conn_metrics);
 
             // After ANALYZE completes, refresh in-memory stats so planners can use them.
@@ -227,27 +172,27 @@ impl Statement {
             self.busy = true;
         }
 
+        // Handle busy result by invoking the busy handler
         if matches!(res, Ok(StepResult::Busy)) {
-            let now = self.pager.io.now();
-            let max_duration = *self.program.connection.busy_timeout.read();
-            self.busy_timeout = match self.busy_timeout.take() {
-                None => {
-                    let mut result = BusyTimeout::new(now);
-                    result.busy_callback(now, max_duration);
-                    Some(result)
-                }
-                Some(mut bt) => {
-                    bt.busy_callback(now, max_duration);
-                    Some(bt)
-                }
-            };
+            let now = self.pager.io.current_time_monotonic();
+            let handler = self.program.connection.get_busy_handler();
 
-            if now < self.busy_timeout.as_ref().unwrap().timeout {
+            // Initialize or get existing busy handler state
+            let busy_state = self
+                .busy_handler_state
+                .get_or_insert_with(|| BusyHandlerState::new(now));
+
+            // Invoke the busy handler to determine if we should retry
+            if busy_state.invoke(&handler, now) {
+                // Handler says retry, yield with IO to wait for timeout
                 if let Some(waker) = waker {
                     waker.wake_by_ref();
                 }
                 res = Ok(StepResult::IO);
+                #[cfg(shuttle)]
+                crate::thread::spin_loop();
             }
+            // else: Handler says stop, res stays as Busy
         }
 
         res
@@ -424,7 +369,60 @@ impl Statement {
         }
     }
 
-    pub fn get_column_type(&self, idx: usize) -> Option<String> {
+    /// Returns the declared type of a result column.
+    ///
+    /// This behaves similarly to SQLite's `sqlite3_column_decltype()`:
+    /// If the Nth column of the returned result set of a SELECT is a table column
+    /// (not an expression or subquery) then the declared type of the table column
+    /// is returned. If the Nth column of the result set is an expression or subquery,
+    /// then None is returned. The returned string is always UTF-8 encoded.
+    ///
+    /// See: <https://sqlite.org/c3ref/column_decltype.html>
+    pub fn get_column_decltype(&self, idx: usize) -> Option<String> {
+        if self.query_mode == QueryMode::Explain {
+            return Some(
+                EXPLAIN_COLUMNS_TYPE
+                    .get(idx)
+                    .expect("No column")
+                    .to_string(),
+            );
+        }
+        if self.query_mode == QueryMode::ExplainQueryPlan {
+            return Some(
+                EXPLAIN_QUERY_PLAN_COLUMNS_TYPE
+                    .get(idx)
+                    .expect("No column")
+                    .to_string(),
+            );
+        }
+        let column = &self.program.result_columns.get(idx).expect("No column");
+        match &column.expr {
+            turso_parser::ast::Expr::Column {
+                table,
+                column: column_idx,
+                ..
+            } => {
+                let (_, table_ref) = self
+                    .program
+                    .table_references
+                    .find_table_by_internal_id(*table)?;
+                let table_column = table_ref.get_column_at(*column_idx)?;
+                let ty_str = &table_column.ty_str;
+                if ty_str.is_empty() {
+                    None
+                } else {
+                    Some(ty_str.clone())
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Returns the type affinity name of a result column (e.g., "INTEGER", "TEXT", "REAL", "BLOB", "NUMERIC").
+    ///
+    /// Unlike `get_column_decltype` which returns the original declared type string,
+    /// this method returns the normalized SQLite type affinity name.
+    pub fn get_column_type_name(&self, idx: usize) -> Option<String> {
         if self.query_mode == QueryMode::Explain {
             return Some(
                 EXPLAIN_COLUMNS_TYPE
@@ -491,12 +489,41 @@ impl Statement {
     }
 
     fn reset_internal(&mut self, max_registers: Option<usize>, max_cursors: Option<usize>) {
+        // Run write statements (INSERT/UPDATE/DELETE) to completion if still in progress.
+        // This ensures INSERT...RETURNING and similar statements complete their work
+        // even if not all returned rows were consumed.
+        // Skip for read-only statements (SELECT) as they have no side effects.
+        // Skip if we're already panicking to avoid double-panic in drop handlers.
+        while self.program.change_cnt_on
+            && !std::thread::panicking()
+            && self.state.execution_state.is_running()
+        {
+            match self
+                .program
+                .step(&mut self.state, self.pager.clone(), QueryMode::Normal, None)
+            {
+                Ok(vdbe::StepResult::Done) | Ok(vdbe::StepResult::Row) => continue,
+                Ok(vdbe::StepResult::IO) => {
+                    if let Err(e) = self.pager.io.step() {
+                        tracing::error!("Error running statement to completion: {}", e);
+                        break;
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Error running statement to completion: {}", e);
+                    break;
+                }
+                Ok(vdbe::StepResult::Interrupt) | Ok(vdbe::StepResult::Busy) => break,
+            }
+        }
         // as abort uses auto_txn_cleanup value - it needs to be called before state.reset
-        self.program.abort(&self.pager, None, &mut self.state);
+        if let Err(abort_err) = self.program.abort(&self.pager, None, &mut self.state) {
+            tracing::error!("Abort failed during statement reset: {abort_err}");
+        }
         self.state.reset(max_registers, max_cursors);
-        self.program.n_change.store(0, Ordering::SeqCst);
+        self.state.n_change.store(0, Ordering::SeqCst);
         self.busy = false;
-        self.busy_timeout = None;
+        self.busy_handler_state = None;
     }
 
     pub fn row(&self) -> Option<&Row> {

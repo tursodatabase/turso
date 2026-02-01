@@ -5,6 +5,7 @@ from typing import Any, Callable
 
 STOP_RUNNING_SENTINEL = object()
 
+
 class Worker(Thread):
     """
     Dedicated worker thread executing database operations sequentially.

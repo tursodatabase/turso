@@ -1,0 +1,44 @@
+@database :memory:
+
+test isnull {
+    select null isnull, 'hi' isnull;
+}
+expect {
+    1|0
+}
+
+test is-null {
+    select null is null, 'hi' is null;
+}
+expect {
+    1|0
+}
+
+test notnull {
+    select null notnull, 'hi' notnull;
+}
+expect {
+    0|1
+}
+
+test not-null {
+    select null not null, 'hi' not null;
+}
+expect {
+    0|1
+}
+
+test sel-true {
+    select true;
+}
+expect {
+    1
+}
+
+test sel-false {
+    select false;
+}
+expect {
+    0
+}
+

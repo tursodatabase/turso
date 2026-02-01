@@ -89,3 +89,24 @@ pub extern "system" fn Java_tech_turso_core_TursoConnection_prepareUtf8<'local>(
         }
     }
 }
+
+#[no_mangle]
+pub extern "system" fn Java_tech_turso_core_TursoConnection__1getAutoCommit<'local>(
+    mut env: JNIEnv<'local>,
+    obj: JObject<'local>,
+    connection_ptr: jlong,
+) -> jni::sys::jboolean {
+    let connection = match to_turso_connection(connection_ptr) {
+        Ok(conn) => conn,
+        Err(e) => {
+            set_err_msg_and_throw_exception(&mut env, obj, TURSO_ETC, e.to_string());
+            return 0; // equivalent to false, but exception is thrown
+        }
+    };
+
+    if connection.conn.get_auto_commit() {
+        1
+    } else {
+        0
+    }
+}

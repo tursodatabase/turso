@@ -302,9 +302,11 @@ fn test_wal_frame_api_no_schema_changes_fuzz(db: TempDatabase) {
         let conn1 = db1.connect_limbo();
         let db2 = builder.clone().build();
         let conn2 = db2.connect_limbo();
+        conn1.wal_auto_checkpoint_disable();
         conn1
             .execute("CREATE TABLE t(x INTEGER PRIMARY KEY, y)")
             .unwrap();
+        conn2.wal_auto_checkpoint_disable();
         conn2
             .execute("CREATE TABLE t(x INTEGER PRIMARY KEY, y)")
             .unwrap();
@@ -893,7 +895,7 @@ fn test_db_share_same_file() {
         path.to_str().unwrap(),
         &format!("{}-wal-copy", path.to_str().unwrap()),
         db_file.clone(),
-        turso_core::OpenFlags::empty(),
+        turso_core::OpenFlags::default(),
         turso_core::DatabaseOpts::new(),
         None,
     )

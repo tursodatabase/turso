@@ -11,9 +11,15 @@ on:
     branches:
       - main
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
 env:
   working-directory: bindings/python
   PIP_DISABLE_PIP_VERSION_CHECK: "true"
+  CARGO_INCREMENTAL: "0"
+  CARGO_NET_RETRY: 10
 
 jobs:
   configure-strategy:
@@ -45,13 +51,24 @@ jobs:
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Setup mold linker
+        if: runner.os == 'Linux'
+        uses: rui314/setup-mold@v1
+
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
           prefix-key: "v1-rust"
+          cache-on-failure: true
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
 
       - name: Build Rust (debug)
-        run: cargo build --verbose
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+          RUSTC_WRAPPER: "sccache"
+        run: cargo build --verbose --locked
 
       - name: Set up Python ${{ matrix.python-version }}
         uses: useblacksmith/setup-python@v6
@@ -144,7 +161,7 @@ jobs:
         with:
           working-directory: ${{ env.working-directory }}
           target: ${{ matrix.target }}
-          args: --release --out dist --find-interpreter
+          args: --profile release-official --out dist --find-interpreter
           sccache: 'true'
           manylinux: auto
       - name: Upload wheels
@@ -175,7 +192,7 @@ jobs:
         with:
           working-directory: ${{ env.working-directory }}
           target: ${{ matrix.target }}
-          args: --release --out dist --find-interpreter
+          args: --profile release-official --out dist --find-interpreter
           sccache: 'true'
       - name: Upload wheels
         uses: actions/upload-artifact@v4

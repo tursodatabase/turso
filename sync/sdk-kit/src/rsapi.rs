@@ -2,11 +2,12 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 use turso_core::{MemoryIO, IO};
-use turso_sdk_kit::rsapi::{str_from_c_str, TursoError, TursoStatusCode};
+use turso_sdk_kit::rsapi::{str_from_c_str, TursoError};
 use turso_sync_engine::{
     database_sync_engine::{self, DatabaseSyncEngine},
     database_sync_engine_io::SyncEngineIo,
     database_sync_operations::SyncEngineIoStats,
+    types::SyncEngineIoResult,
 };
 
 use crate::{
@@ -17,17 +18,20 @@ use crate::{
 
 #[derive(Clone)]
 pub struct TursoDatabaseSyncConfig {
+    pub remote_url: Option<String>,
     pub path: String,
     pub client_name: String,
     pub long_poll_timeout_ms: Option<u32>,
     pub bootstrap_if_empty: bool,
     pub reserved_bytes: Option<usize>,
     pub partial_sync_opts: Option<turso_sync_engine::types::PartialSyncOpts>,
-    pub db_io: Option<Arc<dyn IO>>,
+    /// Base64-encoded encryption key for the Turso Cloud encrypted database.
+    pub remote_encryption_key: Option<String>,
 }
 
 pub type PartialSyncOpts = turso_sync_engine::types::PartialSyncOpts;
 pub type PartialBootstrapStrategy = turso_sync_engine::types::PartialBootstrapStrategy;
+pub type DatabaseSyncStats = turso_sync_engine::types::SyncEngineStats;
 
 impl TursoDatabaseSyncConfig {
     /// helper method to restore [TursoDatabaseSyncConfig] instance from C representation
@@ -41,14 +45,18 @@ impl TursoDatabaseSyncConfig {
         config: *const capi::c::turso_sync_database_config_t,
     ) -> Result<Self, turso_sdk_kit::rsapi::TursoError> {
         if config.is_null() {
-            return Err(TursoError {
-                code: TursoStatusCode::Misuse,
-                message: Some("config pointer must be not null".to_string()),
-            });
+            return Err(TursoError::Misuse(
+                "config pointer must be not null".to_string(),
+            ));
         }
         let config = *config;
         Ok(Self {
             path: str_from_c_str(config.path)?.to_string(),
+            remote_url: if config.remote_url.is_null() {
+                None
+            } else {
+                Some(str_from_c_str(config.remote_url)?.to_string())
+            },
             client_name: str_from_c_str(config.client_name)?.to_string(),
             long_poll_timeout_ms: if config.long_poll_timeout_ms == 0 {
                 None
@@ -63,26 +71,33 @@ impl TursoDatabaseSyncConfig {
             },
             partial_sync_opts: if config.partial_bootstrap_strategy_prefix != 0 {
                 Some(turso_sync_engine::types::PartialSyncOpts {
-                    bootstrap_strategy:
+                    bootstrap_strategy: Some(
                         turso_sync_engine::types::PartialBootstrapStrategy::Prefix {
                             length: config.partial_bootstrap_strategy_prefix as usize,
                         },
+                    ),
                     segment_size: config.partial_bootstrap_segment_size,
                     prefetch: config.partial_bootstrap_prefetch,
                 })
             } else if !config.partial_bootstrap_strategy_query.is_null() {
                 let query = str_from_c_str(config.partial_bootstrap_strategy_query)?;
                 Some(turso_sync_engine::types::PartialSyncOpts {
-                    bootstrap_strategy: turso_sync_engine::types::PartialBootstrapStrategy::Query {
-                        query: query.to_string(),
-                    },
+                    bootstrap_strategy: Some(
+                        turso_sync_engine::types::PartialBootstrapStrategy::Query {
+                            query: query.to_string(),
+                        },
+                    ),
                     segment_size: config.partial_bootstrap_segment_size,
                     prefetch: config.partial_bootstrap_prefetch,
                 })
             } else {
                 None
             },
-            db_io: None,
+            remote_encryption_key: if config.remote_encryption_key.is_null() {
+                None
+            } else {
+                Some(str_from_c_str(config.remote_encryption_key)?.to_string())
+            },
         })
     }
 }
@@ -107,10 +122,7 @@ impl TursoDatabaseSyncChanges {
         value: *mut capi::c::turso_sync_changes_t,
     ) -> Result<&'a Self, TursoError> {
         if value.is_null() {
-            Err(TursoError {
-                code: TursoStatusCode::Misuse,
-                message: Some("got null pointer".to_string()),
-            })
+            Err(TursoError::Misuse("got null pointer".to_string()))
         } else {
             Ok(&*(value as *const Self))
         }
@@ -129,9 +141,66 @@ pub struct TursoDatabaseSync<TBytes: AsRef<[u8]> + Send + Sync + 'static> {
     db_config: turso_sdk_kit::rsapi::TursoDatabaseConfig,
     sync_config: TursoDatabaseSyncConfig,
     sync_engine_opts: turso_sync_engine::database_sync_engine::DatabaseSyncEngineOpts,
-    db_io: Arc<dyn IO>,
     sync_engine_io_queue: SyncEngineIoStats<SyncEngineIoQueue<TBytes>>,
     sync_engine: Arc<Mutex<Option<DatabaseSyncEngine<SyncEngineIoQueue<TBytes>>>>>,
+    db_io: Option<Arc<dyn IO>>,
+}
+
+#[allow(unused_variables)]
+fn persistent_io(partial: bool) -> Result<Arc<dyn IO>, turso_sync_engine::errors::Error> {
+    #[cfg(target_os = "linux")]
+    {
+        if !partial {
+            Ok(Arc::new(turso_core::PlatformIO::new().map_err(|e| {
+                turso_sync_engine::errors::Error::DatabaseSyncEngineError(format!(
+                    "Failed to create platform IO: {e}"
+                ))
+            })?))
+        } else {
+            use turso_sync_engine::sparse_io::SparseLinuxIo;
+
+            Ok(Arc::new(SparseLinuxIo::new().map_err(|e| {
+                turso_sync_engine::errors::Error::DatabaseSyncEngineError(format!(
+                    "Failed to create sparse IO: {e}"
+                ))
+            })?))
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = partial;
+        Ok(Arc::new(turso_core::PlatformIO::new().map_err(|e| {
+            turso_sync_engine::errors::Error::DatabaseSyncEngineError(format!(
+                "Failed to create platform IO: {e}"
+            ))
+        })?))
+    }
+}
+
+/// Helper async function to open a TursoDatabase with proper IO yielding for large schemas
+async fn open_turso_database_async<Ctx>(
+    coro: &turso_sync_engine::types::Coro<Ctx>,
+    main_db: &Arc<turso_sdk_kit::rsapi::TursoDatabase>,
+) -> Result<Arc<turso_core::Database>, turso_sync_engine::errors::Error> {
+    loop {
+        match main_db.open().map_err(|e| {
+            turso_sync_engine::errors::Error::DatabaseSyncEngineError(format!(
+                "unable to open database file: {e}"
+            ))
+        })? {
+            turso_core::IOResult::Done(()) => break,
+            turso_core::IOResult::IO(io_completion) => {
+                while !io_completion.finished() {
+                    coro.yield_(SyncEngineIoResult::IO).await?;
+                }
+            }
+        }
+    }
+    main_db.db_core().map_err(|e| {
+        turso_sync_engine::errors::Error::DatabaseSyncEngineError(format!(
+            "unable to get core database instance: {e}",
+        ))
+    })
 }
 
 impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
@@ -142,6 +211,7 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
         sync_config: TursoDatabaseSyncConfig,
     ) -> Result<Arc<Self>, turso_sdk_kit::rsapi::TursoError> {
         let sync_engine_opts = turso_sync_engine::database_sync_engine::DatabaseSyncEngineOpts {
+            remote_url: sync_config.remote_url.clone(),
             client_name: sync_config.client_name.clone(),
             tables_ignore: vec![],
             use_transform: false,
@@ -153,36 +223,14 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
             bootstrap_if_empty: sync_config.bootstrap_if_empty,
             reserved_bytes: sync_config.reserved_bytes.unwrap_or(0),
             partial_sync_opts: sync_config.partial_sync_opts.clone(),
+            remote_encryption_key: sync_config.remote_encryption_key.clone(),
         };
         let is_memory = db_config.path == ":memory:";
-        let db_io: Arc<dyn IO> = if let Some(io) = sync_config.db_io.as_ref() {
-            io.clone()
-        } else if is_memory {
-            Arc::new(MemoryIO::new())
+        let db_io: Option<Arc<dyn IO>> = if is_memory {
+            Some(Arc::new(MemoryIO::new()))
         } else {
-            #[cfg(target_os = "linux")]
-            {
-                if sync_engine_opts.partial_sync_opts.is_none() {
-                    Arc::new(turso_core::PlatformIO::new().map_err(|e| TursoError {
-                        code: TursoStatusCode::Error,
-                        message: Some(format!("Failed to create platform IO: {e}")),
-                    })?)
-                } else {
-                    use turso_sync_engine::sparse_io::SparseLinuxIo;
-
-                    Arc::new(SparseLinuxIo::new().map_err(|e| TursoError {
-                        code: TursoStatusCode::Error,
-                        message: Some(format!("Failed to create sparse IO: {e}")),
-                    })?)
-                }
-            }
-            #[cfg(not(target_os = "linux"))]
-            {
-                Arc::new(turso_core::PlatformIO::new().map_err(|e| TursoError {
-                    code: TursoStatusCode::Error,
-                    message: Some(format!("Failed to create platform IO: {e}")),
-                })?)
-            }
+            // persitent IO initialized later in order to read metadata first and decide if we need partial DB IO
+            None
         };
         let sync_engine_io_queue = SyncEngineIoStats::new(SyncEngineIoQueue::new());
         Ok(Arc::new(Self {
@@ -190,29 +238,9 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
             sync_config,
             sync_engine_opts,
             sync_engine_io_queue,
-            db_io,
             sync_engine: Arc::new(Mutex::new(None)),
+            db_io,
         }))
-    }
-    /// initialize database on disk and bootstrap if necessary (bootstrap requires network availability)
-    pub fn init(&self) -> Box<TursoDatabaseAsyncOperation> {
-        let io = self.db_io.clone();
-        let sync_engine_io = self.sync_engine_io_queue.clone();
-        let main_db_path = self.sync_config.path.clone();
-        let sync_engine_opts = self.sync_engine_opts.clone();
-        Box::new(TursoDatabaseAsyncOperation::new(Box::new(move |coro| {
-            Box::pin(async move {
-                let _ = database_sync_engine::DatabaseSyncEngine::bootstrap_db(
-                    &coro,
-                    io,
-                    sync_engine_io,
-                    &main_db_path,
-                    &sync_engine_opts,
-                )
-                .await?;
-                Ok(None)
-            })
-        })))
     }
     /// open the database which must be created earlier (e.g. through [Self::init])
     pub fn open(&self) -> Box<TursoDatabaseAsyncOperation> {
@@ -236,12 +264,16 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
                         "metadata not found".to_string(),
                     ));
                 };
+                let io = match io {
+                    Some(io) => io,
+                    None => persistent_io(metadata.partial_bootstrap_server_revision.is_some())?,
+                };
                 let db_file = database_sync_engine::DatabaseSyncEngine::init_db_storage(
                     io.clone(),
                     sync_engine_io.clone(),
                     &metadata,
                     &main_db_path,
-                    &sync_engine_opts,
+                    sync_engine_opts.remote_encryption_key.as_deref(),
                 )?;
                 let main_db = turso_sdk_kit::rsapi::TursoDatabase::new(
                     turso_sdk_kit::rsapi::TursoDatabaseConfig {
@@ -250,16 +282,8 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
                         ..db_config
                     },
                 );
-                main_db.open().map_err(|e| {
-                    turso_sync_engine::errors::Error::DatabaseSyncEngineError(format!(
-                        "unable to open database file: {e}"
-                    ))
-                })?;
-                let main_db_core = main_db.db_core().map_err(|e| {
-                    turso_sync_engine::errors::Error::DatabaseSyncEngineError(format!(
-                        "unable to get core database instance: {e}",
-                    ))
-                })?;
+
+                let main_db_core = open_turso_database_async(&coro, &main_db).await?;
                 let sync_engine_opened = database_sync_engine::DatabaseSyncEngine::open_db(
                     &coro,
                     io,
@@ -283,12 +307,28 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
         let sync_engine = self.sync_engine.clone();
         Box::new(TursoDatabaseAsyncOperation::new(Box::new(move |coro| {
             Box::pin(async move {
+                let metadata = database_sync_engine::DatabaseSyncEngine::read_db_meta(
+                    &coro,
+                    io.clone(),
+                    sync_engine_io.clone(),
+                    &main_db_path,
+                )
+                .await?;
+                let io = match io {
+                    Some(io) => io,
+                    None => persistent_io(if let Some(metadata) = &metadata {
+                        metadata.partial_sync_opts().is_some()
+                    } else {
+                        sync_engine_opts.partial_sync_opts.is_some()
+                    })?,
+                };
                 let metadata = database_sync_engine::DatabaseSyncEngine::bootstrap_db(
                     &coro,
                     io.clone(),
                     sync_engine_io.clone(),
                     &main_db_path,
                     &sync_engine_opts,
+                    metadata,
                 )
                 .await?;
                 let db_file = database_sync_engine::DatabaseSyncEngine::init_db_storage(
@@ -296,7 +336,7 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
                     sync_engine_io.clone(),
                     &metadata,
                     &main_db_path,
-                    &sync_engine_opts,
+                    sync_engine_opts.remote_encryption_key.as_deref(),
                 )?;
                 let main_db = turso_sdk_kit::rsapi::TursoDatabase::new(
                     turso_sdk_kit::rsapi::TursoDatabaseConfig {
@@ -305,16 +345,8 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
                         ..db_config
                     },
                 );
-                main_db.open().map_err(|e| {
-                    turso_sync_engine::errors::Error::DatabaseSyncEngineError(format!(
-                        "unable to open database file: {e}"
-                    ))
-                })?;
-                let main_db_core = main_db.db_core().map_err(|e| {
-                    turso_sync_engine::errors::Error::DatabaseSyncEngineError(format!(
-                        "unable to get core database instance: {e}",
-                    ))
-                })?;
+
+                let main_db_core = open_turso_database_async(&coro, &main_db).await?;
                 let sync_engine_opened = database_sync_engine::DatabaseSyncEngine::open_db(
                     &coro,
                     io,
@@ -465,10 +497,7 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
         value: *const capi::c::turso_sync_database_t,
     ) -> Result<&'a Self, TursoError> {
         if value.is_null() {
-            Err(TursoError {
-                code: TursoStatusCode::Misuse,
-                message: Some("got null pointer".to_string()),
-            })
+            Err(TursoError::Misuse("got null pointer".to_string()))
         } else {
             Ok(&*(value as *const Self))
         }

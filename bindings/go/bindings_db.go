@@ -87,6 +87,11 @@ type TursoConfig struct {
 	LogLevel string // zero-terminated C string expected by C; wrapper converts
 }
 
+type TursoDatabaseEncryptionOpts struct {
+	Cipher string
+	Hexkey string
+}
+
 type TursoDatabaseConfig struct {
 	// Path to the database file or ":memory:"
 	Path string
@@ -94,6 +99,17 @@ type TursoDatabaseConfig struct {
 	ExperimentalFeatures string
 	// Parameter which defines who drives the IO - callee or the caller
 	AsyncIO bool
+	// optional VFS parameter explicitly specifying FS backend for the database.
+	// Available options are:
+	// - "memory": in-memory backend
+	// - "syscall": generic syscall backend
+	// - "io_uring": IO uring (supported only on Linux)
+	Vfs string
+	// optional encryption parameters
+	// as encryption is experimental - ExperimentalFeatures must have "encryption" in the list
+	Encryption TursoDatabaseEncryptionOpts
+	// BusyTimeout in milliseconds (0 = no timeout, immediate SQLITE_BUSY)
+	BusyTimeout int
 }
 
 // define all necessary private C structs
@@ -117,10 +133,12 @@ type turso_config_t struct {
 }
 
 type turso_database_config_t struct {
+	async_io              uint64  // non-zero value interpreted as async IO
 	path                  uintptr // const char*
 	experimental_features uintptr // const char* or null
-	async_io              bool
-	// pad to match C ABI if needed; Go will add padding as necessary
+	vfs                   uintptr // const char* or null
+	encryption_cipher     uintptr // const char* or null
+	encryption_hexkey     uintptr // const char* or null
 }
 
 // C extern method types
@@ -133,6 +151,7 @@ var (
 	c_turso_database_open                    func(database TursoDatabase, error_opt_out **byte) turso_status_code_t
 	c_turso_database_connect                 func(self TursoDatabase, connection **turso_connection_t, error_opt_out **byte) turso_status_code_t
 	c_turso_connection_get_autocommit        func(self TursoConnection) bool
+	c_turso_connection_set_busy_timeout_ms   func(self TursoConnection, timeout_ms int64)
 	c_turso_connection_last_insert_rowid     func(self TursoConnection) int64
 	c_turso_connection_prepare_single        func(self TursoConnection, sql string, statement **turso_statement_t, error_opt_out **byte) turso_status_code_t
 	c_turso_connection_prepare_first         func(self TursoConnection, sql string, statement **turso_statement_t, tail_idx *uintptr, error_opt_out **byte) turso_status_code_t
@@ -142,8 +161,10 @@ var (
 	c_turso_statement_run_io                 func(self TursoStatement, error_opt_out **byte) turso_status_code_t
 	c_turso_statement_reset                  func(self TursoStatement, error_opt_out **byte) turso_status_code_t
 	c_turso_statement_finalize               func(self TursoStatement, error_opt_out **byte) turso_status_code_t
+	c_turso_statement_n_change               func(self TursoStatement) int64
 	c_turso_statement_column_count           func(self TursoStatement) int64
 	c_turso_statement_column_name            func(self TursoStatement, index uintptr) *byte
+	c_turso_statement_column_decltype        func(self TursoStatement, index uintptr) *byte
 	c_turso_statement_row_value_kind         func(self TursoStatement, index uintptr) int32
 	c_turso_statement_row_value_bytes_count  func(self TursoStatement, index uintptr) int64
 	c_turso_statement_row_value_bytes_ptr    func(self TursoStatement, index uintptr) *byte
@@ -170,6 +191,7 @@ func registerTursoDb(handle uintptr) error {
 	purego.RegisterLibFunc(&c_turso_database_open, handle, "turso_database_open")
 	purego.RegisterLibFunc(&c_turso_database_connect, handle, "turso_database_connect")
 	purego.RegisterLibFunc(&c_turso_connection_get_autocommit, handle, "turso_connection_get_autocommit")
+	purego.RegisterLibFunc(&c_turso_connection_set_busy_timeout_ms, handle, "turso_connection_set_busy_timeout_ms")
 	purego.RegisterLibFunc(&c_turso_connection_last_insert_rowid, handle, "turso_connection_last_insert_rowid")
 	purego.RegisterLibFunc(&c_turso_connection_prepare_single, handle, "turso_connection_prepare_single")
 	purego.RegisterLibFunc(&c_turso_connection_prepare_first, handle, "turso_connection_prepare_first")
@@ -179,8 +201,10 @@ func registerTursoDb(handle uintptr) error {
 	purego.RegisterLibFunc(&c_turso_statement_run_io, handle, "turso_statement_run_io")
 	purego.RegisterLibFunc(&c_turso_statement_reset, handle, "turso_statement_reset")
 	purego.RegisterLibFunc(&c_turso_statement_finalize, handle, "turso_statement_finalize")
+	purego.RegisterLibFunc(&c_turso_statement_n_change, handle, "turso_statement_n_change")
 	purego.RegisterLibFunc(&c_turso_statement_column_count, handle, "turso_statement_column_count")
 	purego.RegisterLibFunc(&c_turso_statement_column_name, handle, "turso_statement_column_name")
+	purego.RegisterLibFunc(&c_turso_statement_column_decltype, handle, "turso_statement_column_decltype")
 	purego.RegisterLibFunc(&c_turso_statement_row_value_kind, handle, "turso_statement_row_value_kind")
 	purego.RegisterLibFunc(&c_turso_statement_row_value_bytes_count, handle, "turso_statement_row_value_bytes_count")
 	purego.RegisterLibFunc(&c_turso_statement_row_value_bytes_ptr, handle, "turso_statement_row_value_bytes_ptr")
@@ -333,17 +357,35 @@ func turso_database_new(config TursoDatabaseConfig) (TursoDatabase, error) {
 	var cconf turso_database_config_t
 	var pathBytes []byte
 	var expBytes []byte
+	var vfsBytes []byte
+	var encryptionCipherBytes []byte
+	var encryptionHexkeyBytes []byte
 	pathBytes, cconf.path = makeCStringBytes(config.Path)
 	if config.ExperimentalFeatures != "" {
 		expBytes, cconf.experimental_features = makeCStringBytes(config.ExperimentalFeatures)
 	}
-	cconf.async_io = config.AsyncIO
+	if config.Vfs != "" {
+		vfsBytes, cconf.vfs = makeCStringBytes(config.Vfs)
+	}
+	if config.Encryption.Cipher != "" {
+		encryptionCipherBytes, cconf.encryption_cipher = makeCStringBytes(config.Encryption.Cipher)
+	}
+	if config.Encryption.Hexkey != "" {
+		encryptionHexkeyBytes, cconf.encryption_hexkey = makeCStringBytes(config.Encryption.Hexkey)
+	}
+	cconf.async_io = 0
+	if config.AsyncIO {
+		cconf.async_io = 1
+	}
 
 	var db *turso_database_t
 	var errPtr *byte
 	status := c_turso_database_new(&cconf, &db, &errPtr)
 	runtime.KeepAlive(pathBytes)
 	runtime.KeepAlive(expBytes)
+	runtime.KeepAlive(vfsBytes)
+	runtime.KeepAlive(encryptionCipherBytes)
+	runtime.KeepAlive(encryptionHexkeyBytes)
 	if status == int32(TURSO_OK) {
 		return TursoDatabase(db), nil
 	}
@@ -377,6 +419,11 @@ func turso_database_connect(self TursoDatabase) (TursoConnection, error) {
 // turso_connection_get_autocommit returns the autocommit state of the connection.
 func turso_connection_get_autocommit(self TursoConnection) bool {
 	return c_turso_connection_get_autocommit(self)
+}
+
+// turso_connection_set_busy_timeout_ms sets busy timeout for the connection
+func turso_connection_set_busy_timeout_ms(self TursoConnection, timeoutMs int64) {
+	c_turso_connection_set_busy_timeout_ms(self, timeoutMs)
 }
 
 // turso_connection_last_insert_rowid returns last insert rowid.
@@ -484,6 +531,11 @@ func turso_statement_finalize(self TursoStatement) error {
 	return statusToError(TursoStatusCode(status), msg)
 }
 
+// turso_statement_n_change returns amount of row modifications (insert/delete operations) made by the most recent executed statement.
+func turso_statement_n_change(self TursoStatement) int64 {
+	return c_turso_statement_n_change(self)
+}
+
 // turso_statement_column_count returns the number of columns.
 func turso_statement_column_count(self TursoStatement) int64 {
 	return c_turso_statement_column_count(self)
@@ -493,6 +545,17 @@ func turso_statement_column_count(self TursoStatement) int64 {
 // The underlying C string is freed automatically.
 func turso_statement_column_name(self TursoStatement, index int) string {
 	ptr := c_turso_statement_column_name(self, uintptr(index))
+	return decodeAndFreeCString(ptr)
+}
+
+// turso_statement_column_decltype returns the column declared type at the index
+// (e.g. "INTEGER", "TEXT", "DATETIME", etc.). Returns empty string if not available.
+// The underlying C string is freed automatically.
+func turso_statement_column_decltype(self TursoStatement, index int) string {
+	ptr := c_turso_statement_column_decltype(self, uintptr(index))
+	if ptr == nil {
+		return ""
+	}
 	return decodeAndFreeCString(ptr)
 }
 

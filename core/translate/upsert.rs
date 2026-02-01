@@ -1,20 +1,22 @@
-use std::collections::HashSet;
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::num::NonZeroUsize;
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
 use turso_parser::ast::{self, TriggerEvent, TriggerTime, Upsert};
 
 use crate::error::SQLITE_CONSTRAINT_PRIMARYKEY;
 use crate::schema::{IndexColumn, ROWID_SENTINEL};
 use crate::translate::emitter::UpdateRowSource;
-use crate::translate::expr::{walk_expr, WalkControl};
-use crate::translate::fkeys::{emit_fk_child_update_counters, emit_parent_key_change_checks};
+use crate::translate::expr::{rewrite_between_expr, walk_expr, WalkControl};
+use crate::translate::fkeys::{
+    emit_fk_child_update_counters, emit_parent_key_change_checks, fire_fk_update_actions,
+};
 use crate::translate::insert::{format_unique_violation_desc, InsertEmitCtx};
 use crate::translate::planner::ROWID_STRS;
 use crate::translate::trigger_exec::{
     fire_trigger, get_relevant_triggers_type_and_time, TriggerContext,
 };
-use crate::vdbe::insn::CmpInsFlags;
+use crate::vdbe::insn::{to_u16, CmpInsFlags};
 use crate::Connection;
 use crate::{
     bail_parse_error,
@@ -33,6 +35,7 @@ use crate::{
     },
     util::normalize_ident,
     vdbe::{
+        affinity::Affinity,
         builder::ProgramBuilder,
         insn::{IdxInsertFlags, InsertFlags, Insn},
     },
@@ -147,7 +150,8 @@ fn collect_changed_cols(
     table: &Table,
     set_pairs: &[(usize, Box<ast::Expr>)],
 ) -> (HashSet<usize>, bool) {
-    let mut cols_changed = HashSet::with_capacity(table.columns().len());
+    let mut cols_changed =
+        HashSet::with_capacity_and_hasher(table.columns().len(), Default::default());
     let mut rowid_changed = false;
     for (col_idx, _) in set_pairs {
         if let Some(c) = table.columns().get(*col_idx) {
@@ -188,7 +192,7 @@ fn upsert_index_is_affected(
 /// Collect HashSet of columns referenced by the partial WHERE (empty if none), or
 /// by the expression of any IndexColumn on the index.
 fn referenced_index_cols(idx: &Index, table: &Table) -> HashSet<usize> {
-    let mut out = HashSet::new();
+    let mut out = HashSet::default();
     if let Some(expr) = &idx.where_clause {
         index_expression_cols(table, &mut out, expr);
     }
@@ -369,7 +373,7 @@ pub fn emit_upsert(
     program.emit_insn(Insn::SeekRowid {
         cursor_id: ctx.cursor_id,
         src_reg: ctx.conflict_rowid_reg,
-        target_pc: ctx.row_done_label,
+        target_pc: ctx.loop_labels.row_done,
     });
     let num_cols = ctx.table.columns.len();
     let current_start = program.alloc_registers(num_cols);
@@ -425,7 +429,7 @@ pub fn emit_upsert(
         translate_expr(program, None, pred, pr, resolver)?;
         program.emit_insn(Insn::IfNot {
             reg: pr,
-            target_pc: ctx.row_done_label,
+            target_pc: ctx.loop_labels.row_done,
             jump_if_null: true,
         });
     }
@@ -479,6 +483,22 @@ pub fn emit_upsert(
                 check_generated: true,
                 table_reference: Arc::clone(&bt),
             });
+        } else {
+            // For non-STRICT tables, apply column affinity to the values.
+            // This must happen early so that both index records and the table record
+            // use the converted values.
+            let affinity = bt.columns.iter().map(|c| c.affinity());
+
+            // Only emit Affinity if there's meaningful affinity to apply
+            if affinity.clone().any(|a| a != Affinity::Blob) {
+                if let Ok(count) = std::num::NonZeroUsize::try_from(num_cols) {
+                    program.emit_insn(Insn::Affinity {
+                        start_reg: new_start,
+                        count,
+                        affinities: affinity.map(|a| a.aff_mask()).collect(),
+                    });
+                }
+            }
         }
     }
 
@@ -509,10 +529,13 @@ pub fn emit_upsert(
                 .chain(std::iter::once(new_rowid_for_trigger))
                 .collect();
 
-            let trigger_ctx = TriggerContext::new(
+            // In UPSERT DO UPDATE context, trigger's INSERT/UPDATE OR IGNORE/REPLACE
+            // clauses should not suppress errors. Override conflict resolution to Abort.
+            let trigger_ctx = TriggerContext::new_with_override_conflict(
                 btree_table.clone(),
                 Some(new_registers),
                 Some(old_registers.clone()),
+                ast::ResolveType::Abort,
             );
 
             for trigger in relevant_before_update_triggers {
@@ -523,7 +546,7 @@ pub fn emit_upsert(
             program.emit_insn(Insn::NotExists {
                 cursor: ctx.cursor_id,
                 rowid_reg: ctx.conflict_rowid_reg,
-                target_pc: ctx.row_done_label,
+                target_pc: ctx.loop_labels.row_done,
             });
 
             let has_relevant_after_triggers = get_relevant_triggers_type_and_time(
@@ -755,9 +778,9 @@ pub fn emit_upsert(
 
             let rec = program.alloc_register();
             program.emit_insn(Insn::MakeRecord {
-                start_reg: ins,
-                count: k + 1,
-                dest_reg: rec,
+                start_reg: to_u16(ins),
+                count: to_u16(k + 1),
+                dest_reg: to_u16(rec),
                 index_name: Some((*idx_name).clone()),
                 affinity_str: None,
             });
@@ -834,9 +857,9 @@ pub fn emit_upsert(
         .map(|c| c.affinity().aff_mask())
         .collect::<String>();
     program.emit_insn(Insn::MakeRecord {
-        start_reg: new_start,
-        count: num_cols,
-        dest_reg: rec,
+        start_reg: to_u16(new_start),
+        count: to_u16(num_cols),
+        dest_reg: to_u16(rec),
         index_name: None,
         affinity_str: Some(affinity_str),
     });
@@ -869,8 +892,8 @@ pub fn emit_upsert(
                     .columns()
                     .iter()
                     .find(|c| c.is_rowid_alias())
-                    .and_then(|c| c.name.as_ref())
-                    .unwrap_or(&"rowid".to_string())
+                    .and_then(|c| c.name.as_deref())
+                    .unwrap_or("rowid")
             ),
         });
         program.preassign_label_to_next_insn(ok);
@@ -896,6 +919,27 @@ pub fn emit_upsert(
             flag: InsertFlags::new(),
             table_name: table.get_name().to_string(),
         });
+    }
+
+    // Fire FK actions (CASCADE, SET NULL, SET DEFAULT) for parent-side updates.
+    // This must be done after the update is complete but before AFTER triggers.
+    if let Some(bt) = table.btree() {
+        if connection.foreign_keys_enabled()
+            && resolver
+                .schema
+                .any_resolved_fks_referencing(bt.name.as_str())
+        {
+            fire_fk_update_actions(
+                program,
+                resolver,
+                bt.name.as_str(),
+                ctx.conflict_rowid_reg, // old_rowid_reg
+                current_start,          // old_values_start
+                new_start,              // new_values_start
+                new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg), // new_rowid_reg
+                connection,
+            )?;
+        }
     }
 
     // emit CDC instructions
@@ -999,10 +1043,13 @@ pub fn emit_upsert(
                 .chain(std::iter::once(new_rowid_for_trigger))
                 .collect();
 
-            let trigger_ctx_after = TriggerContext::new(
+            // In UPSERT DO UPDATE context, trigger's INSERT/UPDATE OR IGNORE/REPLACE
+            // clauses should not suppress errors. Override conflict resolution to Abort.
+            let trigger_ctx_after = TriggerContext::new_with_override_conflict(
                 btree_table.clone(),
                 Some(new_registers_after),
                 Some(old_regs),
+                ast::ResolveType::Abort,
             );
 
             for trigger in relevant_triggers {
@@ -1024,7 +1071,7 @@ pub fn emit_upsert(
     }
 
     program.emit_insn(Insn::Goto {
-        target_pc: ctx.row_done_label,
+        target_pc: ctx.loop_labels.row_done,
     });
     Ok(())
 }
@@ -1085,6 +1132,7 @@ fn eval_partial_pred_for_row_image(
         return None;
     };
     let mut e = where_expr.as_ref().clone();
+    rewrite_between_expr(&mut e);
     rewrite_expr_to_registers(
         &mut e, table, row_start, rowid_reg, None,  // table_name
         None,  // insertion

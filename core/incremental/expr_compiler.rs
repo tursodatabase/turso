@@ -4,6 +4,7 @@
 
 use crate::schema::Schema;
 use crate::storage::pager::Pager;
+use crate::sync::Arc;
 use crate::translate::emitter::Resolver;
 use crate::translate::expr::translate_expr;
 use crate::types::Text;
@@ -12,7 +13,6 @@ use crate::vdbe::insn::Insn;
 use crate::vdbe::{Program, ProgramState, Register};
 use crate::SymbolTable;
 use crate::{CaptureDataChangesMode, Connection, QueryMode, Result, Value};
-use std::sync::Arc;
 use turso_parser::ast::{Expr, Literal, Operator};
 
 // Transform an expression to replace column references with Register expressions Why do we want to

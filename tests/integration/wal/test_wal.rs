@@ -1,4 +1,4 @@
-use crate::common::{do_flush, maybe_setup_tracing, TempDatabase};
+use crate::common::{compute_dbhash, do_flush, maybe_setup_tracing, TempDatabase};
 use std::ops::Deref;
 use std::sync::{Arc, Mutex};
 use turso_core::{Connection, LimboError, Result};
@@ -18,6 +18,9 @@ fn test_wal_checkpoint_result(tmp_db: TempDatabase) -> Result<()> {
     conn.execute("select * from t1;")?;
     do_flush(&conn, &tmp_db).unwrap();
 
+    // hash BEFORE checkpoint
+    let hash_before = compute_dbhash(&tmp_db);
+
     // checkpoint result should return > 0 num pages now as database has data
     let res = execute_and_get_ints(&conn, "pragma wal_checkpoint;")?;
     println!("'pragma wal_checkpoint;' returns: {res:?}");
@@ -25,6 +28,15 @@ fn test_wal_checkpoint_result(tmp_db: TempDatabase) -> Result<()> {
     assert_eq!(res[0], 0); // checkpoint successfully
     assert!(res[1] > 0); // num pages in wal
     assert!(res[2] > 0); // num pages checkpointed successfully
+
+    do_flush(&conn, &tmp_db).unwrap();
+
+    // hash AFTER checkpoint - must be identical
+    let hash_after = compute_dbhash(&tmp_db);
+    assert_eq!(
+        hash_before.hash, hash_after.hash,
+        "checkpoint changed database content!!!!!!"
+    );
 
     Ok(())
 }

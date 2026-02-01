@@ -1,20 +1,23 @@
+use branches::mark_unlikely;
 use turso_parser::ast::SortOrder;
 
-use parking_lot::RwLock;
+use crate::sync::RwLock;
+use crate::sync::{atomic, Arc};
+use bumpalo::Bump;
 use std::cmp::{Eq, Ord, Ordering, PartialEq, PartialOrd, Reverse};
 use std::collections::BinaryHeap;
+use std::ptr::NonNull;
 use std::rc::Rc;
-use std::sync::{atomic, Arc};
 
 use crate::io::TempFile;
-use crate::types::IOCompletions;
+use crate::types::{IOCompletions, ValueIterator};
 use crate::{
     error::LimboError,
     io::{Buffer, Completion, CompletionGroup, File, IO},
     storage::sqlite3_ondisk::{read_varint, varint_len, write_varint},
     translate::collate::CollationSeq,
     turso_assert,
-    types::{IOResult, ImmutableRecord, KeyInfo, RecordCursor, ValueRef},
+    types::{IOResult, ImmutableRecord, KeyInfo, ValueRef},
     Result,
 };
 use crate::{io_yield_one, return_if_io, CompletionError};
@@ -40,8 +43,13 @@ enum InitChunkHeapState {
 }
 
 pub struct Sorter {
-    /// The records in the in-memory buffer.
-    records: Vec<SortableImmutableRecord>,
+    /// Arena allocator for records - provides fast bump allocation and bulk deallocation.
+    /// All record data (payload bytes, key_values) is stored here for in-memory sorting.
+    arena: Bump,
+    /// Pointers to records allocated in the arena. Sorting moves only 8-byte pointers,
+    /// which prevents high memmove costs during sorting.
+    /// SAFETY: These pointers are valid as long as the arena hasn't been reset.
+    records: Vec<NonNull<ArenaSortableRecord>>,
     /// The current record.
     current: Option<ImmutableRecord>,
     /// The number of values in the key.
@@ -51,7 +59,7 @@ pub struct Sorter {
     /// Sorted chunks stored on disk.
     chunks: Vec<SortedChunk>,
     /// The heap of records consumed from the chunks and their corresponding chunk index.
-    chunk_heap: BinaryHeap<(Reverse<SortableImmutableRecord>, usize)>,
+    chunk_heap: BinaryHeap<(Reverse<Box<BoxedSortableRecord>>, usize)>,
     /// The maximum size of the in-memory buffer in bytes before the records are flushed to a chunk file.
     max_buffer_size: usize,
     /// The current size of the in-memory buffer in bytes.
@@ -75,6 +83,8 @@ pub struct Sorter {
     init_chunk_heap_state: InitChunkHeapState,
     /// Pending IO completion along with the chunk index that needs to be retried after IO completes.
     pending_completion: Option<(Completion, usize)>,
+    /// Temp storage mode (memory vs file) for spilled data
+    temp_store: crate::TempStore,
 }
 
 impl Sorter {
@@ -84,9 +94,11 @@ impl Sorter {
         max_buffer_size_bytes: usize,
         min_chunk_read_buffer_size_bytes: usize,
         io: Arc<dyn IO>,
+        temp_store: crate::TempStore,
     ) -> Self {
         assert_eq!(order.len(), collations.len());
         Self {
+            arena: Bump::new(),
             records: Vec::new(),
             current: None,
             key_len: order.len(),
@@ -113,6 +125,7 @@ impl Sorter {
             insert_state: InsertState::Start,
             init_chunk_heap_state: InitChunkHeapState::Start,
             pending_completion: None,
+            temp_store,
         }
     }
 
@@ -130,7 +143,12 @@ impl Sorter {
             match self.sort_state {
                 SortState::Start => {
                     if self.chunks.is_empty() {
-                        self.records.sort();
+                        // Sort ascending then reverse - we pop from end so this gives ascending output.
+                        // NOTE: We can't just sort descending because stable sort preserves insertion
+                        // order for equal elements, and descending sort doesn't reverse equal elements.
+                        // SAFETY: All pointers in records are valid (arena hasn't been reset).
+                        self.records
+                            .sort_by(|a, b| unsafe { a.as_ref().cmp(b.as_ref()) });
                         self.records.reverse();
                         self.sort_state = SortState::Next;
                     } else {
@@ -144,6 +162,12 @@ impl Sorter {
                     }
                 }
                 SortState::InitHeap => {
+                    // Check for write errors before proceeding
+                    if self.chunks.iter().any(|chunk| {
+                        matches!(*chunk.io_state.read(), SortedChunkIOState::WriteError)
+                    }) {
+                        return Err(CompletionError::IOError(std::io::ErrorKind::WriteZero).into());
+                    }
                     turso_assert!(
                         !self.chunks.iter().any(|chunk| {
                             matches!(*chunk.io_state.read(), SortedChunkIOState::WaitingForWrite)
@@ -162,23 +186,51 @@ impl Sorter {
         }
     }
 
+    #[expect(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Result<IOResult<()>> {
-        let record = if self.chunks.is_empty() {
-            // Serve from the in-memory buffer.
-            self.records.pop()
-        } else {
-            // Serve from sorted chunk files.
-            return_if_io!(self.next_from_chunk_heap())
-        };
-        match record {
-            Some(record) => {
-                if let Some(error) = record.deserialization_error {
-                    // If there was a key deserialization error during the comparison, return the error.
-                    return Err(error);
+        if self.chunks.is_empty() {
+            match self.records.pop() {
+                Some(ptr) => {
+                    // SAFETY: ptr is valid - arena hasn't been reset yet.
+                    let arena_record = unsafe { ptr.as_ref() };
+                    let payload = arena_record.payload();
+
+                    match &mut self.current {
+                        Some(record) => {
+                            record.invalidate();
+                            record.start_serialization(payload);
+                        }
+                        None => {
+                            self.current = Some(arena_record.to_immutable_record());
+                        }
+                    }
+
+                    if self.records.is_empty() {
+                        self.arena.reset();
+                    }
                 }
-                self.current = Some(record.record);
+                None => self.current = None,
             }
-            None => self.current = None,
+        } else {
+            // Serve from sorted chunk files
+            match return_if_io!(self.next_from_chunk_heap()) {
+                Some(boxed_record) => {
+                    if let Some(ref error) = boxed_record.deserialization_error {
+                        return Err(error.clone());
+                    }
+                    let payload = boxed_record.record.get_payload();
+                    match &mut self.current {
+                        Some(record) => {
+                            record.invalidate();
+                            record.start_serialization(payload);
+                        }
+                        None => {
+                            self.current = Some(boxed_record.record);
+                        }
+                    }
+                }
+                None => self.current = None,
+            }
         }
         Ok(IOResult::Done(()))
     }
@@ -199,14 +251,26 @@ impl Sorter {
                                 io_yield_one!(c);
                             }
                         }
+                        // Check for write errors immediately after flush completes
+                        if self.chunks.iter().any(|chunk| {
+                            matches!(*chunk.io_state.read(), SortedChunkIOState::WriteError)
+                        }) {
+                            return Err(
+                                CompletionError::IOError(std::io::ErrorKind::WriteZero).into()
+                            );
+                        }
                     }
                 }
                 InsertState::Insert => {
-                    self.records.push(SortableImmutableRecord::new(
-                        record.clone(),
+                    let sortable_record = ArenaSortableRecord::new(
+                        &self.arena,
+                        record,
                         self.key_len,
-                        self.index_key_info.clone(),
-                    )?);
+                        &self.index_key_info,
+                    )?;
+                    let record_ref = self.arena.alloc(sortable_record);
+                    // SAFETY: arena.alloc returns a valid, aligned, non-null pointer
+                    self.records.push(NonNull::from(record_ref));
                     self.current_buffer_size += payload_size;
                     self.max_payload_size_in_buffer =
                         self.max_payload_size_in_buffer.max(payload_size);
@@ -271,7 +335,7 @@ impl Sorter {
     /// from that chunk. If IO is needed, we store it in `pending_completion` and wait for it
     /// on the next call before popping again - this ensures all non-exhausted chunks have
     /// a record in the heap before we decide which is smallest.
-    fn next_from_chunk_heap(&mut self) -> Result<IOResult<Option<SortableImmutableRecord>>> {
+    fn next_from_chunk_heap(&mut self) -> Result<IOResult<Option<Box<BoxedSortableRecord>>>> {
         // If there is a pending IO, we must wait for it before popping from the heap,
         // otherwise we might return records out of order.
         while let Some((completion, chunk_idx)) = self.pending_completion.take() {
@@ -304,11 +368,11 @@ impl Sorter {
         match chunk.next()? {
             ChunkNextResult::Done(Some(record)) => {
                 self.chunk_heap.push((
-                    Reverse(SortableImmutableRecord::new(
+                    Reverse(Box::new(BoxedSortableRecord::new(
                         record,
                         self.key_len,
                         self.index_key_info.clone(),
-                    )?),
+                    )?)),
                     chunk_idx,
                 ));
                 Ok(None)
@@ -324,12 +388,14 @@ impl Sorter {
             return Ok(None);
         }
 
-        self.records.sort();
+        // SAFETY: All pointers are valid (arena not reset).
+        self.records
+            .sort_by(|a, b| unsafe { a.as_ref().cmp(b.as_ref()) });
 
         let chunk_file = match &self.temp_file {
             Some(temp_file) => temp_file.file.clone(),
             None => {
-                let temp_file = TempFile::new(&self.io)?;
+                let temp_file = TempFile::with_temp_store(&self.io, self.temp_store)?;
                 let chunk_file = temp_file.file.clone();
                 self.temp_file = Some(temp_file);
                 chunk_file
@@ -343,17 +409,22 @@ impl Sorter {
 
         let mut chunk_size = 0;
         // Pre-compute varint lengths for record sizes to determine the total buffer size.
+        // SAFETY: All pointers are valid because they are allocated in the arena,
+        // and the arena hasn't been reset.
         let mut record_size_lengths = Vec::with_capacity(self.records.len());
-        for record in self.records.iter() {
-            let record_size = record.record.get_payload().len();
+        for ptr in self.records.iter() {
+            let record_size = unsafe { ptr.as_ref().payload().len() };
             let size_len = varint_len(record_size as u64);
             record_size_lengths.push(size_len);
             chunk_size += size_len + record_size;
         }
 
         let mut chunk = SortedChunk::new(chunk_file, self.next_chunk_offset, chunk_buffer_size);
-        let c = chunk.write(&mut self.records, record_size_lengths, chunk_size)?;
+        let c = chunk.write(&self.records, record_size_lengths, chunk_size)?;
         self.chunks.push(chunk);
+
+        self.records.clear();
+        self.arena.reset();
 
         self.current_buffer_size = 0;
         self.max_payload_size_in_buffer = 0;
@@ -572,7 +643,7 @@ impl SortedChunk {
         let total_bytes_read_copy = self.total_bytes_read.clone();
         let read_complete = Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
             let Ok((buf, bytes_read)) = res else {
-                return;
+                return None;
             };
             let read_buf_ref = buf.clone();
             let read_buf = read_buf_ref.as_slice();
@@ -580,7 +651,7 @@ impl SortedChunk {
             let bytes_read = bytes_read as usize;
             if bytes_read == 0 {
                 *chunk_io_state_copy.write() = SortedChunkIOState::ReadEOF;
-                return;
+                return None;
             }
             *chunk_io_state_copy.write() = SortedChunkIOState::ReadComplete;
 
@@ -594,6 +665,7 @@ impl SortedChunk {
 
             stored_buffer_len_copy.store(stored_buf_len, atomic::Ordering::SeqCst);
             total_bytes_read_copy.fetch_add(bytes_read, atomic::Ordering::SeqCst);
+            None
         });
 
         let c = Completion::new_read(read_buffer_ref, read_complete);
@@ -606,7 +678,7 @@ impl SortedChunk {
 
     fn write(
         &mut self,
-        records: &mut Vec<SortableImmutableRecord>,
+        records: &[NonNull<ArenaSortableRecord>],
         record_size_lengths: Vec<usize>,
         chunk_size: usize,
     ) -> Result<Completion> {
@@ -618,8 +690,9 @@ impl SortedChunk {
 
         let mut buf_pos = 0;
         let buf = buffer.as_mut_slice();
-        for (record, size_len) in records.drain(..).zip(record_size_lengths) {
-            let payload = record.record.get_payload();
+        for (ptr, size_len) in records.iter().zip(record_size_lengths) {
+            // SAFETY: All pointers are valid (arena not reset).
+            let payload = unsafe { ptr.as_ref().payload() };
             // Write the record size varint.
             write_varint(&mut buf[buf_pos..buf_pos + size_len], payload.len() as u64);
             buf_pos += size_len;
@@ -634,12 +707,15 @@ impl SortedChunk {
         let chunk_io_state_copy = self.io_state.clone();
         let write_complete = Box::new(move |res: Result<i32, CompletionError>| {
             let Ok(bytes_written) = res else {
+                *chunk_io_state_copy.write() = SortedChunkIOState::WriteError;
                 return;
             };
-            *chunk_io_state_copy.write() = SortedChunkIOState::WriteComplete;
             let buf_len = buffer_ref_copy.len();
             if bytes_written < buf_len as i32 {
                 tracing::error!("wrote({bytes_written}) less than expected({buf_len})");
+                *chunk_io_state_copy.write() = SortedChunkIOState::WriteError;
+            } else {
+                *chunk_io_state_copy.write() = SortedChunkIOState::WriteComplete;
             }
         });
 
@@ -649,46 +725,150 @@ impl SortedChunk {
     }
 }
 
-struct SortableImmutableRecord {
+/// Record for in-memory sorting. All data lives in the arena, so no Drop is needed.
+struct ArenaSortableRecord {
+    /// Payload bytes in arena. Using NonNull avoids lifetime issues with
+    /// self-referential struct (key_values points into this payload).
+    payload: NonNull<[u8]>,
+    /// Pre-computed key values in arena. Points into `payload`.
+    key_values: NonNull<[ValueRef<'static>]>,
+    /// Shared KeyInfo owned by Sorter. Avoids Rc refcount overhead that would
+    /// leak when arena.reset() skips Drop.
+    index_key_info: NonNull<[KeyInfo]>,
+}
+
+impl ArenaSortableRecord {
+    fn new(
+        arena: &Bump,
+        record: &ImmutableRecord,
+        key_len: usize,
+        index_key_info: &[KeyInfo],
+    ) -> Result<Self> {
+        let payload = arena.alloc_slice_copy(record.get_payload());
+
+        let mut payload_iter = ValueIterator::new(payload)?;
+
+        let mut key_values =
+            bumpalo::collections::Vec::with_capacity_in(payload_iter.clone().count(), arena);
+        for _ in 0..key_len {
+            let value = match payload_iter.next() {
+                Some(Ok(v)) => v,
+                Some(Err(e)) => return Err(e),
+                None => crate::bail_corrupt_error!("Not enough columns in record"),
+            };
+            // SAFETY: value borrows from payload which is in the arena and outlives this struct.
+            let value: ValueRef<'static> = unsafe { std::mem::transmute(value) };
+            key_values.push(value);
+        }
+
+        Ok(Self {
+            payload: NonNull::from(payload),
+            key_values: NonNull::from(key_values.into_bump_slice()),
+            index_key_info: NonNull::from(index_key_info),
+        })
+    }
+
+    #[inline]
+    fn key_values(&self) -> &[ValueRef<'static>] {
+        // SAFETY: valid from construction, arena not reset
+        unsafe { self.key_values.as_ref() }
+    }
+
+    #[inline]
+    fn payload(&self) -> &[u8] {
+        // SAFETY: valid from construction, arena not reset
+        unsafe { self.payload.as_ref() }
+    }
+
+    /// Create an ImmutableRecord by copying payload bytes out of the arena.
+    fn to_immutable_record(&self) -> ImmutableRecord {
+        let payload = self.payload();
+        let mut record = ImmutableRecord::new(payload.len());
+        record.start_serialization(payload);
+        record
+    }
+}
+
+impl Ord for ArenaSortableRecord {
+    #[inline]
+    fn cmp(&self, other: &Self) -> Ordering {
+        let self_values = self.key_values();
+        let other_values = other.key_values();
+        // SAFETY: index_key_info points to Sorter-owned data that outlives all records.
+        let index_key_info = unsafe { self.index_key_info.as_ref() };
+
+        for ((&self_val, &other_val), key_info) in self_values
+            .iter()
+            .zip(other_values.iter())
+            .zip(index_key_info.iter())
+        {
+            let cmp = match (self_val, other_val) {
+                (ValueRef::Text(left), ValueRef::Text(right)) => {
+                    key_info.collation.compare_strings(&left, &right)
+                }
+                _ => self_val.partial_cmp(&other_val).unwrap_or(Ordering::Equal),
+            };
+            if cmp != Ordering::Equal {
+                return match key_info.sort_order {
+                    SortOrder::Asc => cmp,
+                    SortOrder::Desc => cmp.reverse(),
+                };
+            }
+        }
+        Ordering::Equal
+    }
+}
+
+impl PartialOrd for ArenaSortableRecord {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for ArenaSortableRecord {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for ArenaSortableRecord {}
+
+/// Heap-allocated record for external merge sort. Used when records are read
+/// back from chunk files. Normal Drop semantics apply.
+struct BoxedSortableRecord {
     record: ImmutableRecord,
-    cursor: RecordCursor,
-    /// SAFETY: borrows from self
-    /// These are precomputed on record construction so that they can be reused during
-    /// sorting comparisons.
     key_values: Vec<ValueRef<'static>>,
-    key_len: usize,
     index_key_info: Rc<Vec<KeyInfo>>,
-    /// The key deserialization error, if any.
     deserialization_error: Option<LimboError>,
 }
 
-impl SortableImmutableRecord {
+impl BoxedSortableRecord {
     fn new(
         record: ImmutableRecord,
         key_len: usize,
         index_key_info: Rc<Vec<KeyInfo>>,
     ) -> Result<Self> {
-        let mut cursor = RecordCursor::with_capacity(key_len);
-        cursor.ensure_parsed_upto(&record, key_len - 1)?;
-        turso_assert!(
-            index_key_info.len() >= cursor.serial_types.len(),
-            "index_key_info.len() < cursor.serial_types.len()"
-        );
-
-        // Pre-compute all key values upfront
+        let mut value_iterator = record.iter()?;
         let mut key_values = Vec::with_capacity(key_len);
         let mut deserialization_error = None;
 
-        for i in 0..key_len {
-            match cursor.deserialize_column(&record, i) {
-                Ok(value) => {
-                    // SAFETY: We're storing the value with 'static lifetime but it's actually bound to the record
-                    // This is safe because the record lives as long as this struct
+        for _ in 0..key_len {
+            match value_iterator.next() {
+                Some(Ok(value)) => {
+                    // SAFETY: value points into record which lives as long as this struct
                     let value: ValueRef<'static> = unsafe { std::mem::transmute(value) };
                     key_values.push(value);
                 }
-                Err(err) => {
+                Some(Err(err)) => {
+                    mark_unlikely();
                     deserialization_error = Some(err);
+                    break;
+                }
+                None => {
+                    mark_unlikely();
+                    deserialization_error = Some(LimboError::Corrupt(
+                        "Not enough columns in record".to_string(),
+                    ));
                     break;
                 }
             }
@@ -696,66 +876,56 @@ impl SortableImmutableRecord {
 
         Ok(Self {
             record,
-            cursor,
             key_values,
             index_key_info,
             deserialization_error,
-            key_len,
         })
     }
 }
 
-impl Ord for SortableImmutableRecord {
+impl Ord for BoxedSortableRecord {
+    #[inline]
     fn cmp(&self, other: &Self) -> Ordering {
         if self.deserialization_error.is_some() || other.deserialization_error.is_some() {
-            // If one of the records has a deserialization error, circumvent the comparison and return early.
             return Ordering::Equal;
         }
-        assert_eq!(
-            self.cursor.serial_types.len(),
-            other.cursor.serial_types.len()
-        );
 
-        for i in 0..self.key_len {
-            let this_key_value = self.key_values[i];
-            let other_key_value = other.key_values[i];
-
-            let column_order = self.index_key_info[i].sort_order;
-            let collation = self.index_key_info[i].collation;
-
-            let cmp = match (this_key_value, other_key_value) {
-                (ValueRef::Text(left), ValueRef::Text(right)) => collation.compare_strings(
-                    // SAFETY: these were checked to be valid UTF-8 on construction.
-                    &left, &right,
-                ),
-                _ => this_key_value
-                    .partial_cmp(&other_key_value)
-                    .expect("sorter values of the same column should be comparable"),
+        for ((&self_val, &other_val), key_info) in self
+            .key_values
+            .iter()
+            .zip(other.key_values.iter())
+            .zip(self.index_key_info.iter())
+        {
+            let cmp = match (self_val, other_val) {
+                (ValueRef::Text(left), ValueRef::Text(right)) => {
+                    key_info.collation.compare_strings(&left, &right)
+                }
+                _ => self_val.partial_cmp(&other_val).unwrap_or(Ordering::Equal),
             };
-            if !cmp.is_eq() {
-                return match column_order {
+            if cmp != Ordering::Equal {
+                return match key_info.sort_order {
                     SortOrder::Asc => cmp,
                     SortOrder::Desc => cmp.reverse(),
                 };
             }
         }
-        std::cmp::Ordering::Equal
+        Ordering::Equal
     }
 }
 
-impl PartialOrd for SortableImmutableRecord {
+impl PartialOrd for BoxedSortableRecord {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl PartialEq for SortableImmutableRecord {
+impl PartialEq for BoxedSortableRecord {
     fn eq(&self, other: &Self) -> bool {
         self.cmp(other) == Ordering::Equal
     }
 }
 
-impl Eq for SortableImmutableRecord {}
+impl Eq for BoxedSortableRecord {}
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 enum SortedChunkIOState {
@@ -763,6 +933,7 @@ enum SortedChunkIOState {
     ReadComplete,
     WaitingForWrite,
     WriteComplete,
+    WriteError,
     ReadEOF,
     None,
 }
@@ -807,6 +978,7 @@ mod tests {
                 256,
                 64,
                 io.clone(),
+                crate::TempStore::Default,
             );
 
             let num_records = 1000 + rng.next_u64() % 2000;
@@ -835,7 +1007,7 @@ mod tests {
             for i in 0..num_records {
                 assert!(sorter.has_more());
                 let record = sorter.record().unwrap();
-                assert_eq!(record.get_values()[0], ValueRef::Integer(i));
+                assert_eq!(record.get_values().unwrap()[0], ValueRef::Integer(i));
                 // Check that the record remained unchanged after sorting.
                 assert_eq!(record, &initial_records[(num_records - i - 1) as usize]);
 

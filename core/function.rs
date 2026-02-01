@@ -1,18 +1,23 @@
+use crate::sync::Arc;
 use std::fmt;
 use std::fmt::{Debug, Display};
-use std::sync::Arc;
 use turso_ext::{FinalizeFunction, InitAggFunction, ScalarFunction, StepFunction};
 
 use crate::LimboError;
+
+pub trait Deterministic: std::fmt::Display {
+    fn is_deterministic(&self) -> bool;
+}
 
 pub struct ExternalFunc {
     pub name: String,
     pub func: ExtFunc,
 }
 
-impl ExternalFunc {
-    pub fn is_deterministic(&self) -> bool {
-        false // external functions can be whatever so let's just default to false
+impl Deterministic for ExternalFunc {
+    fn is_deterministic(&self) -> bool {
+        // external functions can be whatever so let's just default to false
+        false
     }
 }
 
@@ -105,8 +110,8 @@ pub enum JsonFunc {
 }
 
 #[cfg(feature = "json")]
-impl JsonFunc {
-    pub fn is_deterministic(&self) -> bool {
+impl Deterministic for JsonFunc {
+    fn is_deterministic(&self) -> bool {
         true
     }
 }
@@ -118,32 +123,32 @@ impl Display for JsonFunc {
             f,
             "{}",
             match self {
-                Self::Json => "json".to_string(),
-                Self::Jsonb => "jsonb".to_string(),
-                Self::JsonArray => "json_array".to_string(),
-                Self::JsonbArray => "jsonb_array".to_string(),
-                Self::JsonExtract => "json_extract".to_string(),
-                Self::JsonbExtract => "jsonb_extract".to_string(),
-                Self::JsonArrayLength => "json_array_length".to_string(),
-                Self::JsonArrowExtract => "->".to_string(),
-                Self::JsonArrowShiftExtract => "->>".to_string(),
-                Self::JsonObject => "json_object".to_string(),
-                Self::JsonbObject => "jsonb_object".to_string(),
-                Self::JsonType => "json_type".to_string(),
-                Self::JsonErrorPosition => "json_error_position".to_string(),
-                Self::JsonValid => "json_valid".to_string(),
-                Self::JsonPatch => "json_patch".to_string(),
-                Self::JsonbPatch => "jsonb_patch".to_string(),
-                Self::JsonRemove => "json_remove".to_string(),
-                Self::JsonbRemove => "jsonb_remove".to_string(),
-                Self::JsonReplace => "json_replace".to_string(),
-                Self::JsonbReplace => "jsonb_replace".to_string(),
-                Self::JsonInsert => "json_insert".to_string(),
-                Self::JsonbInsert => "jsonb_insert".to_string(),
-                Self::JsonPretty => "json_pretty".to_string(),
-                Self::JsonSet => "json_set".to_string(),
-                Self::JsonbSet => "jsonb_set".to_string(),
-                Self::JsonQuote => "json_quote".to_string(),
+                Self::Json => "json",
+                Self::Jsonb => "jsonb",
+                Self::JsonArray => "json_array",
+                Self::JsonbArray => "jsonb_array",
+                Self::JsonExtract => "json_extract",
+                Self::JsonbExtract => "jsonb_extract",
+                Self::JsonArrayLength => "json_array_length",
+                Self::JsonArrowExtract => "->",
+                Self::JsonArrowShiftExtract => "->>",
+                Self::JsonObject => "json_object",
+                Self::JsonbObject => "jsonb_object",
+                Self::JsonType => "json_type",
+                Self::JsonErrorPosition => "json_error_position",
+                Self::JsonValid => "json_valid",
+                Self::JsonPatch => "json_patch",
+                Self::JsonbPatch => "jsonb_patch",
+                Self::JsonRemove => "json_remove",
+                Self::JsonbRemove => "jsonb_remove",
+                Self::JsonReplace => "json_replace",
+                Self::JsonbReplace => "jsonb_replace",
+                Self::JsonInsert => "json_insert",
+                Self::JsonbInsert => "jsonb_insert",
+                Self::JsonPretty => "json_pretty",
+                Self::JsonSet => "json_set",
+                Self::JsonbSet => "jsonb_set",
+                Self::JsonQuote => "json_quote",
             }
         )
     }
@@ -164,8 +169,8 @@ pub enum VectorFunc {
     VectorSlice,
 }
 
-impl VectorFunc {
-    pub fn is_deterministic(&self) -> bool {
+impl Deterministic for VectorFunc {
+    fn is_deterministic(&self) -> bool {
         true
     }
 }
@@ -173,17 +178,51 @@ impl VectorFunc {
 impl Display for VectorFunc {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let str = match self {
-            Self::Vector => "vector".to_string(),
-            Self::Vector32 => "vector32".to_string(),
-            Self::Vector32Sparse => "vector32_sparse".to_string(),
-            Self::Vector64 => "vector64".to_string(),
-            Self::VectorExtract => "vector_extract".to_string(),
-            Self::VectorDistanceCos => "vector_distance_cos".to_string(),
-            Self::VectorDistanceL2 => "vector_distance_l2".to_string(),
-            Self::VectorDistanceJaccard => "vector_distance_jaccard".to_string(),
-            Self::VectorDistanceDot => "vector_distance_dot".to_string(),
-            Self::VectorConcat => "vector_concat".to_string(),
-            Self::VectorSlice => "vector_slice".to_string(),
+            Self::Vector => "vector",
+            Self::Vector32 => "vector32",
+            Self::Vector32Sparse => "vector32_sparse",
+            Self::Vector64 => "vector64",
+            Self::VectorExtract => "vector_extract",
+            Self::VectorDistanceCos => "vector_distance_cos",
+            Self::VectorDistanceL2 => "vector_distance_l2",
+            Self::VectorDistanceJaccard => "vector_distance_jaccard",
+            Self::VectorDistanceDot => "vector_distance_dot",
+            Self::VectorConcat => "vector_concat",
+            Self::VectorSlice => "vector_slice",
+        };
+        write!(f, "{str}")
+    }
+}
+
+/// Full-text search functions
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+#[derive(Debug, Clone, PartialEq)]
+pub enum FtsFunc {
+    /// fts_score(col1, col2, ..., query): computes FTS relevance score
+    /// When used with an FTS index, the optimizer routes through the index method
+    Score,
+    /// fts_match(col1, col2, ..., query): returns true if document matches query
+    /// Used in WHERE clause for filtering rows by FTS match
+    Match,
+    /// fts_highlight(text, query, before_tag, after_tag): returns text with matching terms highlighted
+    /// Wraps matching query terms in the text with before_tag and after_tag markers
+    Highlight,
+}
+
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+impl FtsFunc {
+    pub fn is_deterministic(&self) -> bool {
+        true
+    }
+}
+
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+impl Display for FtsFunc {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let str = match self {
+            Self::Score => "fts_score",
+            Self::Match => "fts_match",
+            Self::Highlight => "fts_highlight",
         };
         write!(f, "{str}")
     }
@@ -228,11 +267,18 @@ impl PartialEq for AggFunc {
     }
 }
 
-impl AggFunc {
-    pub fn is_deterministic(&self) -> bool {
+impl Deterministic for AggFunc {
+    fn is_deterministic(&self) -> bool {
         false // consider aggregate functions nondeterministic since they depend on the number of rows, not only the input arguments
     }
+}
+impl std::fmt::Display for AggFunc {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
 
+impl AggFunc {
     pub fn num_args(&self) -> usize {
         match self {
             Self::Avg => 1,
@@ -344,8 +390,8 @@ pub enum ScalarFunc {
     StatGet,
 }
 
-impl ScalarFunc {
-    pub fn is_deterministic(&self) -> bool {
+impl Deterministic for ScalarFunc {
+    fn is_deterministic(&self) -> bool {
         match self {
             ScalarFunc::Cast => true,
             ScalarFunc::Changes => false, // depends on DB state
@@ -397,9 +443,9 @@ impl ScalarFunc {
             ScalarFunc::Replace => true,
             #[cfg(feature = "fs")]
             #[cfg(not(target_family = "wasm"))]
-            ScalarFunc::LoadExtension => true,
+            ScalarFunc::LoadExtension => false,
             ScalarFunc::StrfTime => false,
-            ScalarFunc::Printf => false,
+            ScalarFunc::Printf => true,
             ScalarFunc::Likely => true,
             ScalarFunc::TimeDiff => false,
             ScalarFunc::Likelihood => true,
@@ -418,70 +464,70 @@ impl ScalarFunc {
 impl Display for ScalarFunc {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let str = match self {
-            Self::Cast => "cast".to_string(),
-            Self::Changes => "changes".to_string(),
-            Self::Char => "char".to_string(),
-            Self::Coalesce => "coalesce".to_string(),
-            Self::Concat => "concat".to_string(),
-            Self::ConcatWs => "concat_ws".to_string(),
-            Self::Glob => "glob".to_string(),
-            Self::IfNull => "ifnull".to_string(),
-            Self::Iif => "iif".to_string(),
-            Self::Instr => "instr".to_string(),
-            Self::Like => "like(2)".to_string(),
-            Self::Abs => "abs".to_string(),
-            Self::Upper => "upper".to_string(),
-            Self::Lower => "lower".to_string(),
-            Self::Random => "random".to_string(),
-            Self::RandomBlob => "randomblob".to_string(),
-            Self::Trim => "trim".to_string(),
-            Self::LTrim => "ltrim".to_string(),
-            Self::RTrim => "rtrim".to_string(),
-            Self::Round => "round".to_string(),
-            Self::Length => "length".to_string(),
-            Self::OctetLength => "octet_length".to_string(),
-            Self::Min => "min".to_string(),
-            Self::Max => "max".to_string(),
-            Self::Nullif => "nullif".to_string(),
-            Self::Sign => "sign".to_string(),
-            Self::Substr => "substr".to_string(),
-            Self::Substring => "substring".to_string(),
-            Self::Soundex => "soundex".to_string(),
-            Self::Date => "date".to_string(),
-            Self::Time => "time".to_string(),
-            Self::TotalChanges => "total_changes".to_string(),
-            Self::Typeof => "typeof".to_string(),
-            Self::Unicode => "unicode".to_string(),
-            Self::Quote => "quote".to_string(),
-            Self::SqliteVersion => "sqlite_version".to_string(),
-            Self::TursoVersion => "turso_version".to_string(),
-            Self::SqliteSourceId => "sqlite_source_id".to_string(),
-            Self::SqliteCompileOptionGet => "sqlite_compileoption_get".to_string(),
-            Self::SqliteCompileOptionUsed => "sqlite_compileoption_used".to_string(),
-            Self::JulianDay => "julianday".to_string(),
-            Self::UnixEpoch => "unixepoch".to_string(),
-            Self::Hex => "hex".to_string(),
-            Self::Unhex => "unhex".to_string(),
-            Self::ZeroBlob => "zeroblob".to_string(),
-            Self::LastInsertRowid => "last_insert_rowid".to_string(),
-            Self::Replace => "replace".to_string(),
-            Self::DateTime => "datetime".to_string(),
+            Self::Cast => "cast",
+            Self::Changes => "changes",
+            Self::Char => "char",
+            Self::Coalesce => "coalesce",
+            Self::Concat => "concat",
+            Self::ConcatWs => "concat_ws",
+            Self::Glob => "glob",
+            Self::IfNull => "ifnull",
+            Self::Iif => "iif",
+            Self::Instr => "instr",
+            Self::Like => "like(2)",
+            Self::Abs => "abs",
+            Self::Upper => "upper",
+            Self::Lower => "lower",
+            Self::Random => "random",
+            Self::RandomBlob => "randomblob",
+            Self::Trim => "trim",
+            Self::LTrim => "ltrim",
+            Self::RTrim => "rtrim",
+            Self::Round => "round",
+            Self::Length => "length",
+            Self::OctetLength => "octet_length",
+            Self::Min => "min",
+            Self::Max => "max",
+            Self::Nullif => "nullif",
+            Self::Sign => "sign",
+            Self::Substr => "substr",
+            Self::Substring => "substring",
+            Self::Soundex => "soundex",
+            Self::Date => "date",
+            Self::Time => "time",
+            Self::TotalChanges => "total_changes",
+            Self::Typeof => "typeof",
+            Self::Unicode => "unicode",
+            Self::Quote => "quote",
+            Self::SqliteVersion => "sqlite_version",
+            Self::TursoVersion => "turso_version",
+            Self::SqliteSourceId => "sqlite_source_id",
+            Self::SqliteCompileOptionGet => "sqlite_compileoption_get",
+            Self::SqliteCompileOptionUsed => "sqlite_compileoption_used",
+            Self::JulianDay => "julianday",
+            Self::UnixEpoch => "unixepoch",
+            Self::Hex => "hex",
+            Self::Unhex => "unhex",
+            Self::ZeroBlob => "zeroblob",
+            Self::LastInsertRowid => "last_insert_rowid",
+            Self::Replace => "replace",
+            Self::DateTime => "datetime",
             #[cfg(feature = "fs")]
             #[cfg(not(target_family = "wasm"))]
-            Self::LoadExtension => "load_extension".to_string(),
-            Self::StrfTime => "strftime".to_string(),
-            Self::Printf => "printf".to_string(),
-            Self::Likely => "likely".to_string(),
-            Self::TimeDiff => "timediff".to_string(),
-            Self::Likelihood => "likelihood".to_string(),
-            Self::TableColumnsJsonArray => "table_columns_json_array".to_string(),
-            Self::BinRecordJsonObject => "bin_record_json_object".to_string(),
-            Self::Attach => "attach".to_string(),
-            Self::Detach => "detach".to_string(),
-            Self::Unlikely => "unlikely".to_string(),
-            Self::StatInit => "stat_init".to_string(),
-            Self::StatPush => "stat_push".to_string(),
-            Self::StatGet => "stat_get".to_string(),
+            Self::LoadExtension => "load_extension",
+            Self::StrfTime => "strftime",
+            Self::Printf => "printf",
+            Self::Likely => "likely",
+            Self::TimeDiff => "timediff",
+            Self::Likelihood => "likelihood",
+            Self::TableColumnsJsonArray => "table_columns_json_array",
+            Self::BinRecordJsonObject => "bin_record_json_object",
+            Self::Attach => "attach",
+            Self::Detach => "detach",
+            Self::Unlikely => "unlikely",
+            Self::StatInit => "stat_init",
+            Self::StatPush => "stat_push",
+            Self::StatGet => "stat_get",
         };
         write!(f, "{str}")
     }
@@ -527,10 +573,13 @@ pub enum MathFuncArity {
     UnaryOrBinary,
 }
 
-impl MathFunc {
-    pub fn is_deterministic(&self) -> bool {
+impl Deterministic for MathFunc {
+    fn is_deterministic(&self) -> bool {
         true
     }
+}
+
+impl MathFunc {
     pub fn arity(&self) -> MathFuncArity {
         match self {
             Self::Pi => MathFuncArity::Nullary,
@@ -568,41 +617,41 @@ impl MathFunc {
 impl Display for MathFunc {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let str = match self {
-            Self::Acos => "acos".to_string(),
-            Self::Acosh => "acosh".to_string(),
-            Self::Asin => "asin".to_string(),
-            Self::Asinh => "asinh".to_string(),
-            Self::Atan => "atan".to_string(),
-            Self::Atan2 => "atan2".to_string(),
-            Self::Atanh => "atanh".to_string(),
-            Self::Ceil => "ceil".to_string(),
-            Self::Ceiling => "ceiling".to_string(),
-            Self::Cos => "cos".to_string(),
-            Self::Cosh => "cosh".to_string(),
-            Self::Degrees => "degrees".to_string(),
-            Self::Exp => "exp".to_string(),
-            Self::Floor => "floor".to_string(),
-            Self::Ln => "ln".to_string(),
-            Self::Log => "log".to_string(),
-            Self::Log10 => "log10".to_string(),
-            Self::Log2 => "log2".to_string(),
-            Self::Mod => "mod".to_string(),
-            Self::Pi => "pi".to_string(),
-            Self::Pow => "pow".to_string(),
-            Self::Power => "power".to_string(),
-            Self::Radians => "radians".to_string(),
-            Self::Sin => "sin".to_string(),
-            Self::Sinh => "sinh".to_string(),
-            Self::Sqrt => "sqrt".to_string(),
-            Self::Tan => "tan".to_string(),
-            Self::Tanh => "tanh".to_string(),
-            Self::Trunc => "trunc".to_string(),
+            Self::Acos => "acos",
+            Self::Acosh => "acosh",
+            Self::Asin => "asin",
+            Self::Asinh => "asinh",
+            Self::Atan => "atan",
+            Self::Atan2 => "atan2",
+            Self::Atanh => "atanh",
+            Self::Ceil => "ceil",
+            Self::Ceiling => "ceiling",
+            Self::Cos => "cos",
+            Self::Cosh => "cosh",
+            Self::Degrees => "degrees",
+            Self::Exp => "exp",
+            Self::Floor => "floor",
+            Self::Ln => "ln",
+            Self::Log => "log",
+            Self::Log10 => "log10",
+            Self::Log2 => "log2",
+            Self::Mod => "mod",
+            Self::Pi => "pi",
+            Self::Pow => "pow",
+            Self::Power => "power",
+            Self::Radians => "radians",
+            Self::Sin => "sin",
+            Self::Sinh => "sinh",
+            Self::Sqrt => "sqrt",
+            Self::Tan => "tan",
+            Self::Tanh => "tanh",
+            Self::Trunc => "trunc",
         };
         write!(f, "{str}")
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum AlterTableFunc {
     RenameTable,
     AlterColumn,
@@ -619,12 +668,14 @@ impl Display for AlterTableFunc {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Func {
     Agg(AggFunc),
     Scalar(ScalarFunc),
     Math(MathFunc),
     Vector(VectorFunc),
+    #[cfg(all(feature = "fts", not(target_family = "wasm")))]
+    Fts(FtsFunc),
     #[cfg(feature = "json")]
     Json(JsonFunc),
     AlterTable(AlterTableFunc),
@@ -638,6 +689,8 @@ impl Display for Func {
             Self::Scalar(scalar_func) => write!(f, "{scalar_func}"),
             Self::Math(math_func) => write!(f, "{math_func}"),
             Self::Vector(vector_func) => write!(f, "{vector_func}"),
+            #[cfg(all(feature = "fts", not(target_family = "wasm")))]
+            Self::Fts(fts_func) => write!(f, "{fts_func}"),
             #[cfg(feature = "json")]
             Self::Json(json_func) => write!(f, "{json_func}"),
             Self::External(generic_func) => write!(f, "{generic_func}"),
@@ -646,27 +699,35 @@ impl Display for Func {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct FuncCtx {
     pub func: Func,
     pub arg_count: usize,
 }
 
-impl Func {
-    pub fn is_deterministic(&self) -> bool {
+impl Deterministic for Func {
+    fn is_deterministic(&self) -> bool {
         match self {
             Self::Agg(agg_func) => agg_func.is_deterministic(),
             Self::Scalar(scalar_func) => scalar_func.is_deterministic(),
             Self::Math(math_func) => math_func.is_deterministic(),
             Self::Vector(vector_func) => vector_func.is_deterministic(),
+            #[cfg(all(feature = "fts", not(target_family = "wasm")))]
+            Self::Fts(fts_func) => fts_func.is_deterministic(),
             #[cfg(feature = "json")]
             Self::Json(json_func) => json_func.is_deterministic(),
             Self::External(external_func) => external_func.is_deterministic(),
             Self::AlterTable(_) => true,
         }
     }
+}
 
+impl Func {
     pub fn supports_star_syntax(&self) -> bool {
+        // Functions that need star expansion also support star syntax
+        if self.needs_star_expansion() {
+            return true;
+        }
         match self {
             Self::Scalar(scalar_func) => {
                 matches!(
@@ -687,6 +748,23 @@ impl Func {
             Self::Agg(_) => false,
             _ => false,
         }
+    }
+
+    /// Returns true if the function needs the `*` to be expanded to all columns
+    /// from the referenced tables. This is used for functions like `json_object(*)`
+    /// and `jsonb_object(*)` which create a JSON object with column names as keys
+    /// and column values as values.
+    #[cfg(feature = "json")]
+    pub fn needs_star_expansion(&self) -> bool {
+        matches!(
+            self,
+            Self::Json(JsonFunc::JsonObject) | Self::Json(JsonFunc::JsonbObject)
+        )
+    }
+
+    #[cfg(not(feature = "json"))]
+    pub fn needs_star_expansion(&self) -> bool {
+        false
     }
     pub fn resolve_function(name: &str, arg_count: usize) -> Result<Self, LimboError> {
         let normalized_name = crate::util::normalize_ident(name);
@@ -889,7 +967,7 @@ impl Func {
             #[cfg(not(target_family = "wasm"))]
             "load_extension" => Ok(Self::Scalar(ScalarFunc::LoadExtension)),
             "strftime" => Ok(Self::Scalar(ScalarFunc::StrfTime)),
-            "printf" => Ok(Self::Scalar(ScalarFunc::Printf)),
+            "printf" | "format" => Ok(Self::Scalar(ScalarFunc::Printf)),
             "vector" => Ok(Self::Vector(VectorFunc::Vector)),
             "vector32" => Ok(Self::Vector(VectorFunc::Vector32)),
             "vector32_sparse" => Ok(Self::Vector(VectorFunc::Vector32Sparse)),
@@ -901,6 +979,13 @@ impl Func {
             "vector_distance_dot" => Ok(Self::Vector(VectorFunc::VectorDistanceDot)),
             "vector_concat" => Ok(Self::Vector(VectorFunc::VectorConcat)),
             "vector_slice" => Ok(Self::Vector(VectorFunc::VectorSlice)),
+            // FTS functions
+            #[cfg(all(feature = "fts", not(target_family = "wasm")))]
+            "fts_score" => Ok(Self::Fts(FtsFunc::Score)),
+            #[cfg(all(feature = "fts", not(target_family = "wasm")))]
+            "fts_match" => Ok(Self::Fts(FtsFunc::Match)),
+            #[cfg(all(feature = "fts", not(target_family = "wasm")))]
+            "fts_highlight" => Ok(Self::Fts(FtsFunc::Highlight)),
             _ => crate::bail_parse_error!("no such function: {}", name),
         }
     }

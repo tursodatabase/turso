@@ -1,10 +1,4 @@
-use parking_lot::RwLock;
-use std::{
-    cmp::Ordering,
-    collections::HashMap,
-    sync::{atomic::AtomicI64, Arc},
-};
-
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use tracing::{instrument, Level};
 use turso_parser::ast::{self, ResolveType, SortOrder, TableInternalId};
 
@@ -15,11 +9,14 @@ use crate::{
     schema::{BTreeTable, Index, PseudoCursorType, Schema, Table, Trigger},
     translate::{
         collate::CollationSeq,
-        emitter::TransactionMode,
+        emitter::{MaterializedColumnRef, TransactionMode},
         plan::{ResultSetColumn, TableReferences},
     },
-    CaptureDataChangesMode, Connection, Value, VirtualTable,
+    Arc, CaptureDataChangesMode, Connection, Value, VirtualTable,
 };
+
+// Keep distinct hash-table ids far from table internal ids to avoid collisions.
+const HASH_TABLE_ID_BASE: usize = 1 << 30;
 
 #[derive(Default)]
 pub struct TableRefIdCounter {
@@ -33,6 +30,7 @@ impl TableRefIdCounter {
         }
     }
 
+    #[expect(clippy::should_implement_trait)]
     pub fn next(&mut self) -> ast::TableInternalId {
         let id = self.next_free;
         self.next_free += 1;
@@ -40,7 +38,10 @@ impl TableRefIdCounter {
     }
 }
 
-use super::{BranchOffset, CursorID, ExplainState, Insn, InsnReference, JumpTarget, Program};
+use super::{
+    BranchOffset, CursorID, Insn, InsnReference, JumpTarget, PrepareContext, PreparedProgram,
+    Program,
+};
 
 /// A key that uniquely identifies a cursor.
 /// The key is a pair of table reference id and index.
@@ -107,6 +108,7 @@ pub struct ProgramBuilder {
     pub table_reference_counter: TableRefIdCounter,
     next_free_register: usize,
     next_free_cursor_id: usize,
+    next_hash_table_id: usize,
     /// Instruction, the function to execute it with, and its original index in the vector.
     pub insns: Vec<(Insn, usize)>,
     /// A span of instructions from (offset_start_inclusive, offset_end_exclusive),
@@ -148,10 +150,47 @@ pub struct ProgramBuilder {
     needs_stmt_subtransactions: bool,
     /// If this ProgramBuilder is building trigger subprogram, a ref to the trigger is stored here.
     pub trigger: Option<Arc<Trigger>>,
+    /// Whether this is a subprogram (trigger or FK action). Subprograms skip Transaction instructions.
+    pub is_subprogram: bool,
     pub resolve_type: ResolveType,
+    /// When set, all triggers fired from this program should use this conflict resolution.
+    /// This is used in UPSERT DO UPDATE context to ensure nested trigger's OR IGNORE/REPLACE
+    /// clauses don't suppress errors.
+    pub trigger_conflict_override: Option<ResolveType>,
     /// Temporary cursor overrides maps table internal IDs to cursor IDs that should be used instead of the normal resolution.
     /// This allows for things like hash build to use a separate cursor for iterating the same table.
     cursor_overrides: HashMap<usize, CursorID>,
+    /// Hash join build signatures keyed by hash table id.
+    hash_build_signatures: HashMap<usize, HashBuildSignature>,
+    /// Hash tables to keep open across subplans (e.g. materialization).
+    hash_tables_to_keep_open: HashSet<usize>,
+    /// Maps table internal_id to result_columns_start_reg for FROM clause subqueries.
+    /// Used when nested subqueries need to reference columns from outer query subqueries.
+    subquery_result_regs: HashMap<TableInternalId, usize>,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum MaterializedBuildInputModeTag {
+    RowidOnly,
+    Payload,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+/// Signature of a hash build to allow reuse when inputs are unchanged.
+/// TODO: this is very heavy... we might consider hashing instead of storing full data.
+pub struct HashBuildSignature {
+    /// WHERE term indices used as hash join keys.
+    pub join_key_indices: Vec<usize>,
+    /// Build-table columns stored as payload.
+    pub payload_refs: Vec<MaterializedColumnRef>,
+    /// Affinity string applied to join keys.
+    pub key_affinities: String,
+    /// Whether a bloom filter is enabled for this build.
+    pub use_bloom_filter: bool,
+    /// Rowid input cursor when the build side is materialized.
+    pub materialized_input_cursor: Option<CursorID>,
+    /// RowidOnly vs KeyPayload
+    pub materialized_mode: Option<MaterializedBuildInputModeTag>,
 }
 
 #[derive(Debug, Clone)]
@@ -164,7 +203,7 @@ pub enum CursorType {
     VirtualTable(Arc<VirtualTable>),
     MaterializedView(
         Arc<BTreeTable>,
-        Arc<parking_lot::Mutex<crate::incremental::view::IncrementalView>>,
+        Arc<crate::sync::Mutex<crate::incremental::view::IncrementalView>>,
     ),
 }
 
@@ -271,7 +310,7 @@ impl ProgramBuilder {
         capture_data_changes_mode: CaptureDataChangesMode,
         opts: ProgramBuilderOpts,
     ) -> Self {
-        ProgramBuilder::_new(query_mode, capture_data_changes_mode, opts, None)
+        ProgramBuilder::_new(query_mode, capture_data_changes_mode, opts, None, false)
     }
     pub fn new_for_trigger(
         query_mode: QueryMode,
@@ -279,18 +318,35 @@ impl ProgramBuilder {
         opts: ProgramBuilderOpts,
         trigger: Arc<Trigger>,
     ) -> Self {
-        ProgramBuilder::_new(query_mode, capture_data_changes_mode, opts, Some(trigger))
+        ProgramBuilder::_new(
+            query_mode,
+            capture_data_changes_mode,
+            opts,
+            Some(trigger),
+            true,
+        )
+    }
+    /// Create a ProgramBuilder for a subprogram (FK actions, etc.) that runs within
+    /// an existing transaction and doesn't emit Transaction instructions.
+    pub fn new_for_subprogram(
+        query_mode: QueryMode,
+        capture_data_changes_mode: CaptureDataChangesMode,
+        opts: ProgramBuilderOpts,
+    ) -> Self {
+        ProgramBuilder::_new(query_mode, capture_data_changes_mode, opts, None, true)
     }
     fn _new(
         query_mode: QueryMode,
         capture_data_changes_mode: CaptureDataChangesMode,
         opts: ProgramBuilderOpts,
         trigger: Option<Arc<Trigger>>,
+        is_subprogram: bool,
     ) -> Self {
         Self {
             table_reference_counter: TableRefIdCounter::new(),
             next_free_register: 1,
             next_free_cursor_id: 0,
+            next_hash_table_id: HASH_TABLE_ID_BASE,
             insns: Vec::with_capacity(opts.approx_num_insns),
             cursor_ref: Vec::with_capacity(opts.num_cursors),
             constant_spans: Vec::new(),
@@ -313,13 +369,90 @@ impl ProgramBuilder {
             reg_result_cols_start: None,
             needs_stmt_subtransactions: false,
             trigger,
+            is_subprogram,
             resolve_type: ResolveType::Abort,
-            cursor_overrides: HashMap::new(),
+            trigger_conflict_override: None,
+            cursor_overrides: HashMap::default(),
+            hash_build_signatures: HashMap::default(),
+            hash_tables_to_keep_open: HashSet::default(),
+            subquery_result_regs: HashMap::default(),
         }
+    }
+
+    pub fn alloc_hash_table_id(&mut self) -> usize {
+        let id = self.next_hash_table_id;
+        self.next_hash_table_id = self
+            .next_hash_table_id
+            .checked_add(1)
+            .expect("hash table id overflow");
+        id
     }
 
     pub fn set_resolve_type(&mut self, resolve_type: ResolveType) {
         self.resolve_type = resolve_type;
+    }
+
+    /// Set the trigger conflict override. When set, all triggers fired from this program
+    /// should use this conflict resolution instead of their own OR clauses.
+    pub fn set_trigger_conflict_override(&mut self, resolve_type: ResolveType) {
+        self.trigger_conflict_override = Some(resolve_type);
+    }
+
+    /// Returns true if the given hash table id should be kept open across subplans.
+    pub fn should_keep_hash_table_open(&self, hash_table_id: usize) -> bool {
+        self.hash_tables_to_keep_open.contains(&hash_table_id)
+    }
+
+    /// Set the set of hash tables to keep open across subplans.
+    pub fn set_hash_tables_to_keep_open(&mut self, tables: &HashSet<usize>) {
+        self.hash_tables_to_keep_open = tables.clone();
+    }
+
+    /// Reset the set of hash tables to keep open.
+    pub fn clear_hash_tables_to_keep_open(&mut self) {
+        self.hash_tables_to_keep_open.clear();
+    }
+
+    /// Returns true if the given hash build signature matches the recorded one for the given hash table id.
+    pub fn hash_build_signature_matches(
+        &self,
+        hash_table_id: usize,
+        signature: &HashBuildSignature,
+    ) -> bool {
+        self.hash_build_signatures
+            .get(&hash_table_id)
+            .is_some_and(|existing| existing == signature)
+    }
+
+    /// Returns true if there is a recorded hash build signature for the given hash table id.
+    pub fn has_hash_build_signature(&self, hash_table_id: usize) -> bool {
+        self.hash_build_signatures.contains_key(&hash_table_id)
+    }
+
+    /// Insert or update the hash build signature for the given hash table id.
+    pub fn record_hash_build_signature(
+        &mut self,
+        hash_table_id: usize,
+        signature: HashBuildSignature,
+    ) {
+        self.hash_build_signatures.insert(hash_table_id, signature);
+    }
+
+    /// Clear the hash build signature for the given hash table id.
+    pub fn clear_hash_build_signature(&mut self, hash_table_id: usize) {
+        self.hash_build_signatures.remove(&hash_table_id);
+    }
+
+    /// Store the result_columns_start_reg for a FROM clause subquery by its internal_id.
+    /// Used so nested subqueries can access columns from outer query subqueries.
+    pub fn set_subquery_result_reg(&mut self, internal_id: TableInternalId, result_reg: usize) {
+        self.subquery_result_regs.insert(internal_id, result_reg);
+    }
+
+    /// Look up the result_columns_start_reg for a FROM clause subquery by its internal_id.
+    /// Returns None if the subquery hasn't been emitted yet.
+    pub fn get_subquery_result_reg(&self, internal_id: TableInternalId) -> Option<usize> {
+        self.subquery_result_regs.get(&internal_id).copied()
     }
 
     pub fn set_needs_stmt_subtransactions(&mut self, needs_stmt_subtransactions: bool) {
@@ -397,6 +530,11 @@ impl ProgramBuilder {
         let reg = self.next_free_register;
         self.next_free_register += amount;
         reg
+    }
+
+    /// Returns the next register that will be allocated by alloc_register/alloc_registers.
+    pub fn peek_next_register(&self) -> usize {
+        self.next_free_register
     }
 
     pub fn alloc_registers_and_init_w_null(&mut self, amount: usize) -> usize {
@@ -595,73 +733,65 @@ impl ProgramBuilder {
     }
 
     fn emit_constant_insns(&mut self) {
-        // move compile-time constant instructions to the end of the program, where they are executed once after Init jumps to it.
-        // any label_to_resolved_offset that points to an instruction within any moved constant span should be updated to point to the new location.
+        // Move compile-time constant instructions to the end of the program,
+        // where they are executed once after Init jumps to it.
 
-        // the instruction reordering can be done by sorting the insns, so that the ordering is:
-        // 1. if insn not in any constant span, it stays where it is
-        // 2. if insn is in a constant span, it is after other insns, except those that are in a later constant span
-        // 3. within a single constant span the order is preserver
-        self.insns.sort_by(|(_, index_a), (_, index_b)| {
-            let a_span = self
-                .constant_spans
-                .iter()
-                .find(|span| span.0 <= *index_a && span.1 >= *index_a);
-            let b_span = self
-                .constant_spans
-                .iter()
-                .find(|span| span.0 <= *index_b && span.1 >= *index_b);
-            if let (Some(a_span), Some(b_span)) = (a_span, b_span) {
-                a_span.0.cmp(&b_span.0)
-            } else if a_span.is_some() {
-                Ordering::Greater
-            } else if b_span.is_some() {
-                Ordering::Less
-            } else {
-                Ordering::Equal
+        // Stable partition: non-constant instructions first, then constant.
+        // Since spans are sorted and non-overlapping, we track our position
+        // in the span list and never look back - O(n + m) total, where
+        // n = number of instructions, m = number of constant spans.
+        let mut non_constant = Vec::with_capacity(self.insns.len());
+        let mut constant = Vec::new();
+        let mut span_idx = 0;
+
+        for item in self.insns.drain(..) {
+            let idx = item.1;
+
+            // Advance past spans we've completely passed
+            while span_idx < self.constant_spans.len() && self.constant_spans[span_idx].1 < idx {
+                span_idx += 1;
             }
-        });
-        for resolved_offset in self.label_to_resolved_offset.iter_mut() {
-            if let Some((old_offset, target)) = resolved_offset {
-                let new_offset =
-                    self.insns
-                        .iter()
-                        .position(|(_, index)| *old_offset == *index as u32)
-                        .expect("instruction offset must exist") as u32;
-                *resolved_offset = Some((new_offset, *target));
+
+            // Check if current span contains this index
+            let is_constant =
+                span_idx < self.constant_spans.len() && self.constant_spans[span_idx].0 <= idx;
+
+            if is_constant {
+                constant.push(item);
+            } else {
+                non_constant.push(item);
             }
         }
 
-        // Fix comments to refer to new locations
-        for (old_offset, _) in self.comments.iter_mut() {
-            let new_offset = self
-                .insns
-                .iter()
-                .position(|(_, index)| *old_offset == *index as u32)
-                .expect("comment must exist") as u32;
-            *old_offset = new_offset;
+        self.insns = non_constant;
+        self.insns.extend(constant);
+
+        // Build old index -> new position mapping
+        let mut old_to_new = vec![0usize; self.insns.len()];
+        for (new_pos, (_, old_idx)) in self.insns.iter().enumerate() {
+            old_to_new[*old_idx] = new_pos;
+        }
+
+        for resolved_offset in self.label_to_resolved_offset.iter_mut() {
+            if let Some((old_offset, target)) = resolved_offset {
+                *resolved_offset = Some((old_to_new[*old_offset as usize] as u32, *target));
+            }
+        }
+
+        for (offset, _) in self.comments.iter_mut() {
+            *offset = old_to_new[*offset as usize] as u32;
         }
 
         if let QueryMode::ExplainQueryPlan = self.query_mode {
             self.current_parent_explain_idx =
-                if let Some(old_parent) = self.current_parent_explain_idx {
-                    self.insns
-                        .iter()
-                        .position(|(_, index)| old_parent == *index)
-                } else {
-                    None
-                };
+                self.current_parent_explain_idx.map(|old| old_to_new[old]);
 
             for i in 0..self.insns.len() {
                 let (Insn::Explain { p2, .. }, _) = &self.insns[i] else {
                     continue;
                 };
 
-                let new_p2 = if p2.is_some() {
-                    self.insns.iter().position(|(_, index)| *p2 == Some(*index))
-                } else {
-                    None
-                };
+                let new_p2 = p2.map(|old| old_to_new[old]);
 
                 let (Insn::Explain { p1, p2, .. }, _) = &mut self.insns[i] else {
                     unreachable!();
@@ -923,6 +1053,7 @@ impl ProgramBuilder {
                 Insn::Filter { target_pc, .. } => resolve(target_pc, "Filter")?,
                 Insn::HashProbe { target_pc, .. } => resolve(target_pc, "HashProbe")?,
                 Insn::HashNext { target_pc, .. } => resolve(target_pc, "HashNext")?,
+                Insn::HashDistinct { data } => resolve(&mut data.target_pc, "HashDistinct")?,
                 _ => {}
             }
         }
@@ -1036,7 +1167,8 @@ impl ProgramBuilder {
 
     /// Initialize the program with basic setup and return initial metadata and labels
     pub fn prologue(&mut self) {
-        if self.trigger.is_some() {
+        if self.is_subprogram {
+            // Subprograms (triggers, FK actions) don't need Transaction - they run within parent's tx
             self.init_label = self.allocate_label();
             self.emit_insn(Insn::Init {
                 target_pc: self.init_label,
@@ -1083,10 +1215,16 @@ impl ProgramBuilder {
     /// Note that although these are the final instructions, typically an SQLite
     /// query will jump to the Transaction instruction via init_label.
     pub fn epilogue(&mut self, schema: &Schema) {
-        if self.trigger.is_some() {
+        if self.is_subprogram {
+            // Subprograms (triggers, FK actions) just emit Halt without Transaction
+            let description = if self.trigger.is_some() {
+                "trigger"
+            } else {
+                "fk action"
+            };
             self.emit_insn(Insn::Halt {
                 err_code: 0,
-                description: "trigger".to_string(),
+                description: description.to_string(),
             });
             return;
         }
@@ -1103,7 +1241,9 @@ impl ProgramBuilder {
                 });
             }
 
-            self.emit_constant_insns();
+            if !self.constant_spans.is_empty() {
+                self.emit_constant_insns();
+            }
             self.emit_insn(Insn::Goto {
                 target_pc: self.start_offset,
             });
@@ -1238,24 +1378,25 @@ impl ProgramBuilder {
             .iter()
             .any(|(insn, _)| matches!(insn, Insn::Program { .. }));
 
-        Ok(Program {
+        let prepared = PreparedProgram {
             max_registers: self.next_free_register,
             insns: self.insns,
             cursor_ref: self.cursor_ref,
             comments: self.comments,
-            connection,
             parameters: self.parameters,
-            n_change: AtomicI64::new(0),
             change_cnt_on,
             result_columns: self.result_columns,
             table_references: self.table_references,
             sql: sql.to_string(),
-            accesses_db: !matches!(self.txn_mode, TransactionMode::None),
-            needs_stmt_subtransactions: self.needs_stmt_subtransactions,
+            needs_stmt_subtransactions: crate::Arc::new(crate::AtomicBool::new(
+                self.needs_stmt_subtransactions,
+            )),
             trigger: self.trigger.take(),
+            is_subprogram: self.is_subprogram,
             contains_trigger_subprograms,
             resolve_type: self.resolve_type,
-            explain_state: RwLock::new(ExplainState::default()),
-        })
+            prepare_context: PrepareContext::from_connection(&connection),
+        };
+        Ok(Program::from_prepared(Arc::new(prepared), connection))
     }
 }

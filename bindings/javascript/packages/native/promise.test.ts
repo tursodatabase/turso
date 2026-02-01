@@ -207,10 +207,10 @@ test('attach', async () => {
     const path1 = `test-${(Math.random() * 10000) | 0}.db`;
     const path2 = `test-${(Math.random() * 10000) | 0}.db`;
     try {
-        const db1 = await connect(path1);
+        const db1 = await connect(path1, { experimental: ["attach"] });
         await db1.exec("CREATE TABLE t(x)");
         await db1.exec("INSERT INTO t VALUES (1), (2), (3)");
-        const db2 = await connect(path2);
+        const db2 = await connect(path2, { experimental: ["attach"] });
         await db2.exec("CREATE TABLE q(x)");
         await db2.exec("INSERT INTO q VALUES (4), (5), (6)");
 

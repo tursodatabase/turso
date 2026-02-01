@@ -1,5 +1,6 @@
 [package]
 name = "turso_sdk_kit_macros"
+description = "Turso SDK kit macros"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true

@@ -1,0 +1,107 @@
+@database :memory:
+
+test vector-functions-valid {
+    SELECT vector_extract(vector('[]'));
+    SELECT vector_extract(vector('  [  1  ,  2  ,  3  ]  '));
+    SELECT vector_extract(vector('[-1000000000000000000]'));
+}
+expect {
+    []
+    [1,2,3]
+    [-1000000000000000000]
+}
+
+test vector-distance-dot {
+    SELECT vector_distance_dot(vector('[1, 2]'), vector('[3, 4]'));
+    SELECT vector_distance_dot(vector('[1, 0]'), vector('[0, 1]'));
+    SELECT vector_distance_dot(vector('[1, 1]'), vector('[-1, -1]'));
+    SELECT vector_distance_dot(vector('[0.5, 0.5]'), vector('[4.0, 4.0]'));
+}
+expect {
+    -11.0
+    0.0
+    2.0
+    -4.0
+}
+expect @js {
+    -11
+    0
+    2
+    -4
+}
+
+test vector-insert {
+    CREATE TABLE IF NOT EXISTS vector_test (
+    id INTEGER PRIMARY KEY,
+    format TEXT NOT NULL,
+    vec_data F32_BLOB(3) -- 3-dimensional vector
+    );
+    INSERT INTO vector_test (id, format, vec_data)
+    VALUES (2, 'Bracketed_comma_separated', vector('[4.000000,5.000000,6.000000]'));
+    SELECT id, format, vector_extract(vec_data) from vector_test;
+}
+expect {
+    2|Bracketed_comma_separated|[4,5,6]
+}
+
+test vector-insert-2 {
+    CREATE TABLE IF NOT EXISTS vector_test (
+        id INTEGER PRIMARY KEY,
+        format TEXT NOT NULL,
+        vec_data F32_BLOB(3) -- 3-dimensional vector
+    );
+    INSERT INTO vector_test (id, format, vec_data)
+    VALUES (2, 'Bracketed_comma_separated', vector('[4.000000,5.000000,6.000000]'));
+    SELECT id, format, vector_extract(vec_data) from vector_test;
+}
+expect {
+    2|Bracketed_comma_separated|[4,5,6]
+}
+
+test vector-insert-no-quotes {
+    CREATE TABLE IF NOT EXISTS vector_test (
+        id INTEGER PRIMARY KEY,
+        format TEXT NOT NULL,
+        vec_data F32_BLOB(3) -- 3-dimensional vector
+    );
+    INSERT INTO vector_test (id, format, vec_data)
+    VALUES (2, 'Bracketed_comma_separated', vector([4.000000,5.000000,6.000000]));
+}
+expect error {
+    Parse error: no such column: 4.000000,5.000000,6.000000
+}
+
+test vector-insert-double-quotes {
+    CREATE TABLE IF NOT EXISTS vector_test (
+        id INTEGER PRIMARY KEY,
+        format TEXT NOT NULL,
+        vec_data F32_BLOB(3) -- 3-dimensional vector
+    );
+    INSERT INTO vector_test (id, format, vec_data)
+    VALUES (2, 'Bracketed_comma_separated', vector("[4.000000,5.000000,6.000000]"));
+}
+expect error {
+    .*no such column: \[4.000000,5.000000,6.000000\]
+}
+
+test vector-distance-dot-table {
+    CREATE TABLE dot_test (
+        id INTEGER PRIMARY KEY,
+        vec F32_BLOB(2)
+    );
+    INSERT INTO dot_test (id, vec) VALUES (1, vector('[1, 1]'));
+    INSERT INTO dot_test (id, vec) VALUES (2, vector('[2, 2]'));
+
+    SELECT vector_distance_dot(vec, vector('[1, 1]')) as dist
+    FROM dot_test
+    ORDER BY dist ASC;
+}
+expect {
+    -4.0
+    -2.0
+}
+expect @js {
+    -4
+    -2
+}
+

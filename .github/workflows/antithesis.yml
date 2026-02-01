@@ -32,3 +32,5 @@ jobs:
 
     - name: Launch experiment
       run: bash ./scripts/antithesis/launch.sh
+      env:
+        ANTITHESIS_TRIGGER: ${{ github.event_name }}

@@ -501,7 +501,7 @@ pub fn derive_atomic_enum(input: TokenStream) -> TokenStream {
 ///
 /// Generates a runnable Rust test from the following function signature
 ///
-/// ```no_run
+/// ```ignore
 /// fn test_x(db: TempDatabase) -> Result<()> {}
 /// // Or
 /// fn test_y(db: TempDatabase) {}

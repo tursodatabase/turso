@@ -17,14 +17,26 @@ test.serial('createClient rejects unsupported config options', async t => {
     createClient({
       url: process.env.TURSO_DATABASE_URL,
       authToken: process.env.TURSO_AUTH_TOKEN,
-      encryptionKey: 'some-key',
+      encryptionKey: 'some-key', // local encryption - not supported
       syncUrl: 'https://sync.example.com',
     });
   }, { instanceOf: LibsqlError });
 
   t.is(error.code, 'UNSUPPORTED_CONFIG');
   t.regex(error.message, /encryptionKey.*syncUrl/);
-  t.regex(error.message, /Only 'url' and 'authToken' are supported/);
+  t.regex(error.message, /Only 'url', 'authToken', and 'remoteEncryptionKey' are supported/);
+});
+
+test.serial('createClient accepts remoteEncryptionKey config option', async t => {
+  // remoteEncryptionKey should be accepted without throwing
+  t.notThrows(() => {
+    const client = createClient({
+      url: process.env.TURSO_DATABASE_URL,
+      authToken: process.env.TURSO_AUTH_TOKEN,
+      remoteEncryptionKey: 'dGVzdC1lbmNyeXB0aW9uLWtleQ==', // base64-encoded test key
+    });
+    client.close();
+  });
 });
 
 test.serial('createClient requires url config option', async t => {

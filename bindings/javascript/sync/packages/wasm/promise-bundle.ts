@@ -52,20 +52,20 @@ class Database extends DatabasePromise {
         }
 
         let partialSyncOpts = undefined;
-        if (opts.partialSync != null) {
-            switch (opts.partialSync.bootstrapStrategy.kind) {
+        if (opts.partialSyncExperimental != null) {
+            switch (opts.partialSyncExperimental.bootstrapStrategy.kind) {
                 case "prefix":
                     partialSyncOpts = {
-                        bootstrapStrategy: { type: "Prefix", length: opts.partialSync.bootstrapStrategy.length },
-                        segmentSize: opts.partialSync.segmentSize,
-                        prefetch: opts.partialSync.prefetch,
+                        bootstrapStrategy: { type: "Prefix", length: opts.partialSyncExperimental.bootstrapStrategy.length },
+                        segmentSize: opts.partialSyncExperimental.segmentSize,
+                        prefetch: opts.partialSyncExperimental.prefetch,
                     };
                     break;
                 case "query":
                     partialSyncOpts = {
-                        bootstrapStrategy: { type: "Query", query: opts.partialSync.bootstrapStrategy.query },
-                        segmentSize: opts.partialSync.segmentSize,
-                        prefetch: opts.partialSync.prefetch,
+                        bootstrapStrategy: { type: "Query", query: opts.partialSyncExperimental.bootstrapStrategy.query },
+                        segmentSize: opts.partialSyncExperimental.segmentSize,
+                        prefetch: opts.partialSyncExperimental.prefetch,
                     };
                     break;
             }
@@ -112,7 +112,7 @@ class Database extends DatabasePromise {
         const memory = db.memory;
         const io = memory ? memoryIO() : BrowserIO;
         const run = runner(runOpts, io, engine);
-        super(engine.db() as unknown as any, () => run.wait());
+        super(db, () => run.wait());
 
         this.#runner = run;
         this.#engine = engine;
@@ -126,6 +126,14 @@ class Database extends DatabasePromise {
         if (this.connected) {
             return;
         } else if (this.#engine == null) {
+            if (!this.memory) {
+                const worker = await init();
+                await Promise.all([
+                    registerFileAtWorker(worker, this.name),
+                    registerFileAtWorker(worker, `${this.name}-wal`)
+                ]);
+                this.#worker = worker;
+            }
             await super.connect();
         } else {
             if (!this.memory) {

@@ -1,0 +1,43 @@
+{
+  "name": "vscode-sqltest",
+  "displayName": "SQLTest Syntax Highlighting",
+  "description": "Syntax highlighting for Turso's .sqltest test files",
+  "version": "0.1.0",
+  "publisher": "turso",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/tursodatabase/limbo"
+  },
+  "engines": {
+    "vscode": "^1.75.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "sqltest",
+        "aliases": [
+          "SQLTest",
+          "sqltest"
+        ],
+        "extensions": [
+          ".sqltest"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "sqltest",
+        "scopeName": "source.sqltest",
+        "path": "./syntaxes/sqltest.tmLanguage.json",
+        "embeddedLanguages": {
+          "source.sql": "sql"
+        }
+      }
+    ]
+  }
+}

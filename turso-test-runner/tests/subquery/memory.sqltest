@@ -1,0 +1,1104 @@
+@database :memory:
+
+test correlated-left-join-exists {
+    create table t(a);
+    create table s(a);
+    insert into t values (1);
+    select t.a
+    from t
+    left join s
+    on t.a = s.a
+    where exists (select 1 where s.a is null);
+}
+expect {
+    1
+}
+
+test subquery-correlated-from-clause-nested {
+    create table t1 (name text, region text);
+    insert into t1 values ('Alice', 'North'), ('Bob', 'South');
+    select name, (
+        select region
+          from (select distinct region from t1 t2 where t2.name = t1.name)
+         limit 1
+      )
+      from t1
+     order by name;
+}
+expect {
+    Alice|North
+    Bob|South
+}
+
+test subquery-correlated-derived-in-select {
+    create table t1 (id int primary key, value1 integer, value2 integer);
+    create table t2 (id int primary key, ref_id integer, data integer);
+    create table t3 (id int primary key, category integer, amount integer);
+    insert into t1 values (1, 7, -4), (2, 6, 2), (3, 12, 4), (4, -2, 1), (5, 18, -2),
+        (6, 1, 7), (7, 6, 12), (8, 1, 5), (9, 19, 13), (10, 14, 9), (11, 18, 1),
+        (12, 7, -2), (13, 3, 7), (14, 10, 10), (15, -9, 5), (16, 10, 10),
+        (17, -5, 5), (18, 19, 1), (19, 2, -3), (20, 18, 3);
+    insert into t2 values (1, 4, 6), (2, 12, -3), (3, 13, 9), (4, 6, 7), (5, 18, 0),
+        (6, 12, -3), (7, 1, 6), (8, 12, -2), (9, 19, 6), (10, 4, 3),
+        (11, 1, -3), (12, 13, 1), (13, 8, 4), (14, 14, -2), (15, 10, 6),
+        (16, 12, 2), (17, 18, 4), (18, 17, -1), (19, 10, 8), (20, 7, 9);
+    insert into t3 values (1, 4, 93), (2, 3, 71), (3, 2, 71), (4, 4, 21), (5, 3, 52);
+    select t2.id, t2.ref_id, t2.data,
+           (select id
+              from t1
+             where id in (
+                   select value1
+                     from (select distinct value1 from t1 where t1.value2 < t2.id)
+                  )
+             order by t1.id
+             limit 1) as s_sub
+      from t2
+     where exists (select 1 from t3 where t3.category = t2.ref_id)
+     order by t2.id
+     limit 2;
+}
+expect {
+    1|4|6|2
+    10|4|3|1
+}
+
+test subquery-cte-available-in-arbitrary-depth {
+    with cte as (select 1 as one)
+    select onehundredandeleven+1 as onehundredandtwelve
+    from (
+    with cte2 as (select 10 as ten)
+    select onehundredandone+ten as onehundredandeleven
+    from (
+    with cte3 as (select 100 as hundred)
+    select one+hundred as onehundredandone
+    from cte join cte3
+    ) join cte2
+    );
+}
+expect {
+    112
+}
+
+# WHERE CLAUSE SUBQUERIES
+# EXISTS/NOT EXISTS
+test subquery-exists-basic {
+    create table test(a);
+    insert into test values (1);
+    select * from test where exists (select 0);
+    select * from test where not exists (select 0 where false);
+}
+expect {
+    1
+    1
+}
+
+# Trivial example: get all users if there are any products
+test subquery-exists-uncorrelated {
+    create table products(id, name, price);
+    create table users(id, name);
+    insert into products values (1, 'hat', 50), (2, 'cap', 75), (3, 'shirt', 100);
+    insert into users values (1, 'Alice'), (2, 'Bob'), (3, 'Charlie');
+    select * from users where exists (select 1 from products);
+}
+expect {
+    1|Alice
+    2|Bob
+    3|Charlie
+}
+
+# Get all products when there are no users
+test subquery-not-exists-uncorrelated {
+    create table products(id, name, price);
+    create table users(id, name);
+    insert into products values (1, 'hat', 50), (2, 'cap', 75);
+    select * from products where not exists (select 1 from users);
+}
+expect {
+    1|hat|50
+    2|cap|75
+}
+
+# Get products that have a matching category
+test subquery-exists-correlated {
+    create table products(id, name, category_id);
+    create table categories(id, name);
+    insert into products values (1, 'hat', 10), (2, 'cap', 20), (3, 'shirt', 10);
+    insert into categories values (10, 'Clothing'), (30, 'Electronics');
+    select * from products p where exists (
+    select * from categories c where c.id = p.category_id
+    );
+}
+expect {
+    1|hat|10
+    3|shirt|10
+}
+
+# Get users who have no orders
+test subquery-not-exists-correlated {
+    create table users(id, name, age);
+    create table orders(id, user_id, amount);
+    insert into users values (1, 'Alice', 25), (2, 'Bob', 30), (3, 'Charlie', 35);
+    insert into orders values (1, 1, 100), (2, 3, 200);
+    select * from users u where not exists (
+    select * from orders o where o.user_id = u.id
+    );
+}
+expect {
+    2|Bob|30
+}
+
+# Get products that belong to the 'Clothing' category
+test subquery-exists-with-conditions {
+    create table categories(id, name);
+    create table products(id, name, price, category_id);
+    insert into categories values (1, 'Clothing'), (2, 'Electronics');
+    insert into products values (1, 'hat', 50, 1), (2, 'cap', 25, 1), (3, 'macbook', 75, 2);
+    select * from products p where exists (
+    select * from categories c
+    where c.id = p.category_id and c.name = 'Clothing'
+    );
+}
+expect {
+    1|hat|50|1
+    2|cap|25|1
+}
+
+# Get users who have products with high-rated reviews
+test subquery-nested-exists {
+    create table users(id, name);
+    create table products(id, name, user_id);
+    create table reviews(id, product_id, rating);
+    insert into users values (1, 'Alice'), (2, 'Bob');
+    insert into products values (1, 'hat', 1), (2, 'cap', 2);
+    insert into reviews values (1, 1, 5);
+    select * from users u where exists (
+    select * from products p where p.user_id = u.id and exists (
+    select 1 from reviews r where r.product_id = p.id and r.rating >= 4
+    )
+    );
+}
+expect {
+    1|Alice
+}
+
+# Get products that have tags (none exist, so empty result)
+test subquery-exists-empty-result {
+    create table products(id, name);
+    create table tags(product_id, tag);
+    insert into products values (1, 'hat'), (2, 'cap');
+    select * from products p where exists (
+    select * from tags t where t.product_id = p.id
+    );
+}
+expect {
+}
+
+# Get users whose emails are not in the blocked list
+test subquery-not-exists-all-match {
+    create table users(id, email);
+    create table blocked_emails(email);
+    insert into users values (1, 'alice@test.com'), (2, 'bob@test.com');
+    insert into blocked_emails values ('spam@test.com');
+    select * from users u where not exists (
+    select * from blocked_emails b where b.email = u.email
+    );
+}
+expect {
+    1|alice@test.com
+    2|bob@test.com
+}
+
+# SCALAR SUBQUERIES
+# Get products with price higher than average price
+test subquery-scalar-comparison {
+    create table products(id, name, price);
+    insert into products values (1, 'hat', 50), (2, 'cap', 25), (3, 'jacket', 75);
+    select * from products where price >= (
+    select avg(price) from products
+    );
+}
+expect {
+    1|hat|50
+    3|jacket|75
+}
+
+# Get users with the highest score
+test subquery-scalar-max {
+    create table users(id, name, score);
+    insert into users values (1, 'Alice', 85), (2, 'Bob', 92), (3, 'Charlie', 92);
+    select * from users where score = (
+    select max(score) from users
+    );
+}
+expect {
+    2|Bob|92
+    3|Charlie|92
+}
+
+# (x,y) IN SUBQUERIES
+# Get products from specific categories using IN
+test subquery-in-single-column {
+    create table products(id, name, category_id);
+    create table categories(id, name);
+    insert into categories values (1, 'Clothing'), (2, 'Electronics'), (3, 'Books');
+    insert into products values (1, 'hat', 1), (2, 'laptop', 2), (3, 'novel', 3), (4, 'cap', 1);
+    select * from products where category_id in (
+    select id from categories where name in ('Clothing', 'Electronics')
+    );
+}
+expect {
+    1|hat|1
+    2|laptop|2
+    4|cap|1
+}
+
+# Get products NOT in discontinued categories
+test subquery-not-in-single-column {
+    create table products(id, name, category_id);
+    create table discontinued_categories(category_id);
+    insert into products values (1, 'hat', 1), (2, 'laptop', 2), (3, 'book', 3);
+    insert into discontinued_categories values (2);
+    select * from products where category_id not in (
+    select category_id from discontinued_categories
+    );
+}
+expect {
+    1|hat|1
+    3|book|3
+}
+
+# Get order items matching specific product-quantity combinations
+test subquery-in-multiple-columns {
+    create table order_items(order_id, product_id, quantity);
+    create table special_offers(product_id, min_quantity);
+    insert into order_items values (1, 10, 5), (2, 20, 3), (3, 10, 2), (4, 30, 1);
+    insert into special_offers values (10, 5), (20, 3);
+    select * from order_items where (product_id, quantity) in (
+    select product_id, min_quantity from special_offers
+    );
+}
+expect {
+    1|10|5
+    2|20|3
+}
+
+# Get users whose (name, age) combination is not in the restricted list
+test subquery-not-in-multiple-columns {
+    create table users(id, name, age);
+    create table restricted_profiles(name, age);
+    insert into users values (1, 'Alice', 25), (2, 'Bob', 30), (3, 'Charlie', 25);
+    insert into restricted_profiles values ('Bob', 30);
+    select * from users where (name, age) not in (
+    select name, age from restricted_profiles
+    );
+}
+expect {
+    1|Alice|25
+    3|Charlie|25
+}
+
+# NULL HANDLING IN IN/NOT IN SUBQUERIES
+# When value is found in subquery, result is 1 (regardless of NULLs)
+test subquery-in-null-value-found {
+    create table t(x);
+    insert into t values (5), (NULL);
+    select 5 in (select * from t);
+}
+expect {
+    1
+}
+
+# When value not found and subquery has NULLs, result is NULL (unknown)
+test subquery-in-null-value-not-found {
+    create table t(x);
+    insert into t values (5), (NULL);
+    select 6 in (select * from t);
+}
+expect {
+
+}
+
+# When LHS is NULL and subquery is non-empty, result is NULL
+test subquery-in-null-lhs-nonempty {
+    create table t(x);
+    insert into t values (5), (NULL);
+    select null in (select * from t);
+}
+expect {
+
+}
+
+# When LHS is NULL and subquery is empty, result is 0 (FALSE)
+test subquery-in-null-lhs-empty {
+    create table t(x);
+    select null in (select * from t);
+}
+expect {
+    0
+}
+
+# NOT IN: when value found, result is 0 (regardless of NULLs)
+test subquery-not-in-null-value-found {
+    create table t(x);
+    insert into t values (5), (NULL);
+    select 5 not in (select * from t);
+}
+expect {
+    0
+}
+
+# NOT IN: when value not found and subquery has NULLs, result is NULL
+test subquery-not-in-null-value-not-found {
+    create table t(x);
+    insert into t values (5), (NULL);
+    select 6 not in (select * from t);
+}
+expect {
+
+}
+
+# NOT IN: when LHS is NULL and subquery is non-empty, result is NULL
+test subquery-not-in-null-lhs-nonempty {
+    create table t(x);
+    insert into t values (5), (NULL);
+    select null not in (select * from t);
+}
+expect {
+
+}
+
+# NOT IN: when LHS is NULL and subquery is empty, result is 1 (TRUE)
+test subquery-not-in-null-lhs-empty {
+    create table t(x);
+    select null not in (select * from t);
+}
+expect {
+    1
+}
+
+# IN subquery in result column with NULL handling
+test subquery-in-result-column-null-handling {
+    create table t(x);
+    insert into t values (5), (NULL);
+    select x, x in (select * from t) from t;
+}
+expect {
+    5|1
+    |
+}
+
+# NOT IN subquery in result column with NULL handling
+test subquery-not-in-result-column-null-handling {
+    create table t(x);
+    insert into t values (5), (NULL);
+    select x, x not in (select * from t) from t;
+}
+expect {
+    5|0
+    |
+}
+
+# IN subquery with NULL in both LHS column and subquery result
+test subquery-in-null-handling-multiple-rows {
+    create table t(x);
+    create table t2(y);
+    insert into t values (5), (NULL);
+    insert into t2 values (5), (6), (NULL);
+    select y, y in (select x from t) from t2;
+}
+expect {
+    5|1
+    6|
+    |
+}
+
+# SUBQUERIES IN OTHER POSITIONS (result columns, GROUP BY, ORDER BY, HAVING, LIMIT, OFFSET)
+# Uncorrelated subquery in result column
+test subquery-uncorrelated-in-result-column {
+    create table employees(id, name, dept_id);
+    create table company_info(total_depts);
+    insert into employees values (1, 'Alice', 10), (2, 'Bob', 20);
+    insert into company_info values (5);
+    select id, name, (select total_depts from company_info) as total_depts from employees;
+}
+expect {
+    1|Alice|5
+    2|Bob|5
+}
+
+# Correlated subquery in result column
+test subquery-correlated-in-result-column {
+    create table employees(id, name, dept_id);
+    create table departments(id, name);
+    insert into employees values (1, 'Alice', 10), (2, 'Bob', 20);
+    insert into departments values (10, 'Sales'), (20, 'Engineering');
+    select id, name, (select name from departments where id = dept_id) as dept_name from employees;
+}
+expect {
+    1|Alice|Sales
+    2|Bob|Engineering
+}
+
+# Correlated subquery in result column with join
+test subquery-correlated-in-result-column-with-join {
+    create table employees(id, name, dept_id, manager_id);
+    create table departments(id, name);
+    create table managers(id, name);
+    insert into employees values (1, 'Alice', 10, 100), (2, 'Bob', 20, 200);
+    insert into departments values (10, 'Sales'), (20, 'Engineering');
+    insert into managers values (100, 'Carol'), (200, 'Dave');
+    select e.id, e.name, m.name as manager, (select name from departments where id = e.dept_id) as dept_name
+    from employees e join managers m on e.manager_id = m.id;
+}
+expect {
+    1|Alice|Carol|Sales
+    2|Bob|Dave|Engineering
+}
+
+# Uncorrelated IN-subquery in result column
+test subquery-uncorrelated-in-result-column-in {
+    create table employees(id, name, dept_id);
+    create table special_depts(dept_id);
+    insert into employees values (1, 'Alice', 10), (2, 'Bob', 20), (3, 'Charlie', 30);
+    insert into special_depts values (10), (20);
+    select id, name, dept_id in (select dept_id from special_depts) as is_special from employees;
+}
+expect {
+    1|Alice|1
+    2|Bob|1
+    3|Charlie|0
+}
+
+# Correlated IN-subquery in result column
+test subquery-correlated-in-result-column-in {
+    create table employees(id, name, dept_id);
+    create table dept_awards(dept_id, employee_id);
+    insert into employees values (1, 'Alice', 10), (2, 'Bob', 20), (3, 'Charlie', 10);
+    insert into dept_awards values (10, 1), (20, 2);
+    select id, name, id in (select employee_id from dept_awards where dept_id = employees.dept_id) as has_award from employees;
+}
+expect {
+    1|Alice|1
+    2|Bob|1
+    3|Charlie|0
+}
+
+# Uncorrelated subquery in GROUP BY clause
+test subquery-uncorrelated-in-group-by {
+    create table sales(id, amount, region_id);
+    create table grouping_config(group_column);
+    insert into sales values (1, 100, 1), (2, 200, 1), (3, 150, 2);
+    insert into grouping_config values ('region_id');
+    select region_id, sum(amount)
+    from sales
+    group by (select case when group_column = 'region_id' then region_id else amount end from grouping_config);
+}
+expect {
+    1|300
+    2|150
+}
+
+# Correlated subquery in GROUP BY clause
+test subquery-correlated-in-group-by {
+    create table sales(id, amount, region_id);
+    create table regions(id, name);
+    insert into sales values (1, 100, 1), (2, 200, 1), (3, 150, 2);
+    insert into regions values (1, 'North'), (2, 'South');
+    select (select name from regions where id = region_id) as region, sum(amount)
+    from sales
+    group by (select name from regions where id = region_id);
+}
+expect {
+    North|300
+    South|150
+}
+
+# Correlated subquery in GROUP BY clause with join
+test subquery-correlated-in-group-by-with-join {
+    create table sales(id, amount, region_id, salesperson_id);
+    create table regions(id, name);
+    create table salespeople(id, name);
+    insert into sales values (1, 100, 1, 10), (2, 200, 1, 20), (3, 150, 2, 10);
+    insert into regions values (1, 'North'), (2, 'South');
+    insert into salespeople values (10, 'Alice'), (20, 'Bob');
+    select (select name from regions where id = s.region_id) as region, sp.name as salesperson, sum(amount)
+    from sales s join salespeople sp on s.salesperson_id = sp.id
+    group by (select name from regions where id = s.region_id), sp.name;
+}
+expect {
+    North|Alice|100
+    North|Bob|200
+    South|Alice|150
+}
+
+# Uncorrelated IN-subquery in ORDER BY clause
+test subquery-uncorrelated-in-order-by-in {
+    create table products(id, name, category_id);
+    create table priority_categories(category_id);
+    insert into products values (1, 'hat', 2), (2, 'laptop', 1), (3, 'book', 3);
+    insert into priority_categories values (1), (3);
+    select id, name from products
+    order by category_id in (select category_id from priority_categories) desc, id;
+}
+expect {
+    2|laptop
+    3|book
+    1|hat
+}
+
+# Uncorrelated subquery in HAVING clause
+test subquery-uncorrelated-in-having {
+    create table orders(id, customer_id, amount);
+    create table vip_threshold(min_amount);
+    insert into orders values (1, 100, 50), (2, 100, 150), (3, 200, 30);
+    insert into vip_threshold values (100);
+    select customer_id, sum(amount) as total
+    from orders
+    group by customer_id
+    having total > (select min_amount from vip_threshold);
+}
+expect {
+    100|200
+}
+
+# Uncorrelated IN-subquery in HAVING clause
+test subquery-uncorrelated-in-having-in {
+    create table orders(id, customer_id, amount);
+    create table target_totals(total_amount);
+    insert into orders values (1, 100, 50), (2, 100, 150), (3, 200, 30), (4, 300, 100);
+    insert into target_totals values (200), (100);
+    select customer_id, sum(amount) as total
+    from orders
+    group by customer_id
+    having total in (select total_amount from target_totals);
+}
+expect {
+    100|200
+    300|100
+}
+
+# Uncorrelated subquery in LIMIT clause
+test subquery-in-limit {
+    create table items(id, name);
+    create table config(max_results);
+    insert into items values (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd');
+    insert into config values (2);
+    select * from items limit (select max_results from config);
+}
+expect {
+    1|a
+    2|b
+}
+
+# Uncorrelated subquery in OFFSET clause
+test subquery-in-offset {
+    create table items(id, name);
+    create table config(skip_count);
+    insert into items values (1, 'a'), (2, 'b'), (3, 'c');
+    insert into config values (1);
+    select * from items limit 2 offset (select skip_count from config);
+}
+expect {
+    2|b
+    3|c
+}
+
+### INCORRECT NUMBER OF RETURNED VALUES - ERROR TESTS ###
+# Subquery returning multiple columns in SELECT clause (should error)
+test subquery-multiple-columns-in-select {
+    create table t(x, y);
+    insert into t values (1, 2);
+    select (select x, y from t) as result;
+}
+expect error {
+}
+
+# Subquery returning multiple columns in WHERE clause (should error)
+test subquery-vector-in-where {
+    create table t1(x,y);
+    create table t2(y);
+    insert into t1 values (1,1);
+    insert into t2 values (1);
+    select * from t2 where y = (select x,y from t1);
+}
+expect error {
+}
+
+# Subquery returning multiple columns in HAVING clause (should error)
+test subquery-vector-in-having {
+    create table orders(customer_id, amount);
+    create table thresholds(min_amount, max_amount);
+    insert into orders values (100, 50), (100, 150);
+    insert into thresholds values (100, 200);
+    select customer_id, sum(amount) as total
+    from orders
+    group by customer_id
+    having total > (select min_amount, max_amount from thresholds);
+}
+expect error {
+}
+
+# Subquery returning multiple columns in LIMIT clause (should error)
+test subquery-vector-in-limit {
+    create table items(id);
+    create table config(max_results, other_col);
+    insert into items values (1), (2), (3);
+    insert into config values (2, 3);
+    select * from items limit (select max_results, other_col from config);
+}
+expect error {
+}
+
+# Subquery returning multiple columns in OFFSET clause (should error)
+test subquery-vector-in-offset {
+    create table items(id);
+    create table config(skip_count, other_col);
+    insert into items values (1), (2), (3);
+    insert into config values (1, 2);
+    select * from items limit 1 offset (select skip_count, other_col from config);
+}
+expect error {
+}
+
+# Subquery returning multiple columns in ORDER BY clause (should error)
+test subquery-vector-in-order-by {
+    create table items(id, name);
+    create table sort_order(priority, other_col);
+    insert into items values (1, 'a'), (2, 'b');
+    insert into sort_order values (1, 2);
+    select * from items order by (select priority, other_col from sort_order);
+}
+expect error {
+}
+
+# Subquery returning multiple columns in GROUP BY clause (should error)
+test subquery-vector-in-group-by {
+    create table sales(product_id, amount);
+    create table grouping(category, other_col);
+    insert into sales values (1, 100), (2, 200);
+    insert into grouping values (1, 2);
+    select sum(amount) from sales group by (select category, other_col from grouping);
+}
+expect error {
+}
+
+# Subquery returning multiple columns in CASE WHEN (should error)
+test subquery-vector-in-case-when {
+    create table t1(x);
+    create table t2(y, z);
+    insert into t1 values (1);
+    insert into t2 values (1, 2);
+    select case when (select y, z from t2) then 'yes' else 'no' end from t1;
+}
+expect error {
+}
+
+# Subquery returning multiple columns in CASE THEN (should error)
+test subquery-vector-in-case-then {
+    create table t1(x);
+    create table t2(y, z);
+    insert into t1 values (1);
+    insert into t2 values (1, 2);
+    select case when x = 1 then (select y, z from t2) else 0 end from t1;
+}
+expect error {
+}
+
+# Subquery returning multiple columns in CASE ELSE (should error)
+test subquery-vector-in-case-else {
+    create table t1(x);
+    create table t2(y, z);
+    insert into t1 values (1);
+    insert into t2 values (1, 2);
+    select case when x = 2 then 0 else (select y, z from t2) end from t1;
+}
+expect error {
+}
+
+# Subquery returning multiple columns in aggregate function argument (should error)
+test subquery-vector-in-aggregate-arg {
+    create table t1(x);
+    create table t2(y, z);
+    insert into t1 values (1);
+    insert into t2 values (1, 2);
+    select max((select y, z from t2)) from t1;
+}
+expect error {
+}
+
+# Subquery returning multiple columns in binary expression (should error)
+test subquery-vector-in-binary-expr {
+    create table t1(x);
+    create table t2(y, z);
+    insert into t1 values (1);
+    insert into t2 values (1, 2);
+    select x + (select y, z from t2) from t1;
+}
+expect error {
+}
+
+# Subquery returning multiple columns in BETWEEN (should error)
+test subquery-vector-in-between {
+    create table t1(x);
+    create table t2(y, z);
+    insert into t1 values (5);
+    insert into t2 values (1, 2);
+    select * from t1 where x between (select y, z from t2) and 10;
+}
+expect error {
+}
+
+# Subquery returning multiple columns in CAST (should error)
+test subquery-vector-in-cast {
+    create table t1(x);
+    create table t2(y, z);
+    insert into t1 values (1);
+    insert into t2 values (1, 2);
+    select cast((select y, z from t2) as integer) from t1;
+}
+expect error {
+}
+
+# Subquery returning multiple columns in COLLATE (should error)
+test subquery-vector-in-collate {
+    create table t1(x);
+    create table t2(y, z);
+    insert into t1 values (1);
+    insert into t2 values ('a', 'b');
+    select (select y, z from t2) collate nocase from t1;
+}
+expect error {
+}
+
+# Subquery returning multiple columns in IS NULL (should error)
+test subquery-vector-in-is-null {
+    create table t1(x);
+    create table t2(y, z);
+    insert into t1 values (1);
+    insert into t2 values (1, 2);
+    select * from t1 where (select y, z from t2) is null;
+}
+expect error {
+}
+
+# Subquery returning multiple columns in NOT NULL (should error)
+test subquery-vector-in-not-null {
+    create table t1(x);
+    create table t2(y, z);
+    insert into t1 values (1);
+    insert into t2 values (1, 2);
+    select * from t1 where (select y, z from t2) not null;
+}
+expect error {
+}
+
+# Subquery returning multiple columns in LIKE (should error)
+test subquery-vector-in-like {
+    create table t1(x);
+    create table t2(y, z);
+    insert into t1 values (1);
+    insert into t2 values ('a', 'b');
+    select * from t1 where (select y, z from t2) like 'a%';
+}
+expect error {
+}
+
+# Subquery returning multiple columns in unary operator (should error)
+test subquery-vector-in-unary {
+    create table t1(x);
+    create table t2(y, z);
+    insert into t1 values (1);
+    insert into t2 values (1, 2);
+    select -(select y, z from t2) from t1;
+}
+expect error {
+}
+
+# Subquery returning multiple columns in function call (should error)
+test subquery-vector-in-function-call {
+    create table t1(x);
+    create table t2(y, z);
+    insert into t1 values (1);
+    insert into t2 values (1, 2);
+    select abs((select y, z from t2)) from t1;
+}
+expect error {
+}
+
+# EXISTS inside aggregate function arguments
+test subquery-exists-in-aggregate-group-concat {
+    select group_concat(exists (select 1));
+}
+expect {
+    1
+}
+
+test subquery-exists-in-aggregate-sum {
+    select sum(exists (select 1));
+}
+expect {
+    1
+}
+
+test subquery-exists-in-aggregate-count {
+    select count(exists (select 1));
+}
+expect {
+    1
+}
+
+test subquery-exists-in-aggregate-with-table {
+    create table t1(x);
+    insert into t1 values (1), (2), (3);
+    select group_concat(exists (select 1)) from t1;
+}
+expect {
+    1,1,1
+}
+
+test subquery-exists-false-in-aggregate {
+    select sum(exists (select 1 where false));
+}
+expect {
+    0
+}
+
+test subquery-exists-in-aggregate-expression {
+    select sum(1 + exists (select 1));
+}
+expect {
+    2
+}
+
+# Scalar subquery inside aggregate function arguments
+test subquery-scalar-in-aggregate-sum {
+    select sum((select 5));
+}
+expect {
+    5
+}
+
+test subquery-scalar-in-aggregate-group-concat {
+    create table t2(x);
+    insert into t2 values (1), (2);
+    select group_concat((select 'a')) from t2;
+}
+expect {
+    a,a
+}
+
+test subquery-scalar-in-aggregate-with-table-ref {
+    create table t3(x);
+    insert into t3 values (10), (20), (30);
+    select sum((select max(x) from t3)) from t3;
+}
+expect {
+    90
+}
+
+# Subqueries in ORDER BY aggregates
+# When ORDER BY has a single-row aggregate (no GROUP BY), the ORDER BY is optimized away.
+# The aggregate shouldn't be translated with stale subquery expressions.
+test subquery-exists-in-order-by-aggregate {
+    select 1 order by sum(exists (select 1));
+}
+expect {
+    1
+}
+
+test subquery-scalar-in-order-by-aggregate {
+    select 1 order by sum((select 42));
+}
+expect {
+    1
+}
+
+# With actual ORDER BY effect (GROUP BY present, so ORDER BY is not cleared)
+# Uses uncorrelated subquery since correlated subqueries in ORDER BY are not yet supported
+test subquery-exists-in-order-by-aggregate-with-group {
+    create table t4(x, g);
+    insert into t4 values (1, 'a'), (2, 'a'), (3, 'b'), (4, 'b');
+    select g, sum(x) as s from t4 group by g order by sum(exists (select 1));
+}
+expect {
+    a|3
+    b|7
+}
+
+# Subquery column affinity inheritance
+# When a subquery selects from a table column, the result column should inherit
+# the affinity of the source column. This affects comparison behavior:
+# - INTEGER affinity causes string operands to be coerced to numeric
+# - Without proper affinity inheritance, '9' would not be coerced and
+#   10 > '9' would be false (comparing int to text directly)
+test subquery-column-affinity-inheritance {
+    create table t11(x INTEGER);
+    insert into t11 values (10);
+    select y > '9' from (select x as y from t11);
+}
+expect {
+    1
+}
+
+# Same test with TEXT affinity - should preserve text comparison behavior
+test subquery-column-affinity-inheritance-text {
+    create table t12(x TEXT);
+    insert into t12 values ('10');
+    select y > '9' from (select x as y from t12);
+}
+expect {
+    0
+}
+
+# TEXT PRIMARY KEY can contain NULL (unlike INTEGER PRIMARY KEY which is rowid alias).
+# NOT IN subquery with NULL in TEXT PRIMARY KEY should return NULL, not 0.
+# Regression test: is_nonnull() must check is_rowid_alias(), not primary_key().
+test subquery-not-in-text-primary-key-null {
+    create table t(a TEXT PRIMARY KEY);
+    insert into t values (NULL);
+    insert into t values ('x');
+    select a, a NOT IN (SELECT a FROM t) from t order by a;
+}
+expect {
+    |
+    x|0
+}
+
+# Same test with IN (not NOT IN)
+test subquery-in-text-primary-key-null {
+    create table t(a TEXT PRIMARY KEY);
+    insert into t values (NULL);
+    insert into t values ('x');
+    select a, a IN (SELECT a FROM t) from t order by a;
+}
+expect {
+    |
+    x|1
+}
+
+# INTEGER PRIMARY KEY cannot contain NULL (auto-assigns rowid)
+test subquery-not-in-integer-primary-key-null {
+    create table t(a INTEGER PRIMARY KEY);
+    insert into t values (NULL);
+    insert into t values (2);
+    select a, a NOT IN (SELECT a FROM t) from t order by a;
+}
+expect {
+    1|0
+    2|0
+}
+
+# EXISTS in SELECT list with aggregates on empty table
+# When the source table is empty, the aggregate loop never runs, but EXISTS
+# should still return 0 (not NULL) because the subquery result is evaluated.
+test subquery-exists-in-select-with-aggregate-empty-table {
+    create table t5(x);
+    select exists (select 1 from t5), count(*) from t5;
+}
+expect {
+    0|0
+}
+
+# Correlated EXISTS in SELECT list with aggregates on empty table
+test subquery-correlated-exists-in-select-with-aggregate-empty-table {
+    create table t6(id);
+    select exists (select 1 where t6.id = 1), count(*) from t6;
+}
+expect {
+    0|0
+}
+
+# Scalar subquery in SELECT list with aggregates on empty table
+# Scalar subquery returns a constant, should work even when main table is empty
+test subquery-scalar-in-select-with-aggregate-empty-table {
+    create table t7(x);
+    select (select 42), count(*) from t7;
+}
+expect {
+    42|0
+}
+
+# Scalar subquery returning NULL in SELECT list with aggregates on empty table
+test subquery-scalar-null-in-select-with-aggregate-empty-table {
+    create table t8(x);
+    create table t8_empty(y);
+    select (select y from t8_empty), count(*) from t8;
+}
+expect {
+    |0
+}
+
+# IN subquery in SELECT list with aggregates on empty table
+test subquery-in-in-select-with-aggregate-empty-table {
+    create table t9(x);
+    select 1 in (select x from t9), count(*) from t9;
+}
+expect {
+    0|0
+}
+
+# Column IS NULL in ungrouped aggregate on empty table
+test column-is-null-in-aggregate-empty-table {
+    create table t10(x);
+    select x IS NULL, count(*) from t10;
+}
+expect {
+    1|0
+}
+
+# EXISTS subquery in ungrouped aggregate query with data
+# The EXISTS subquery is non-correlated and should be evaluated before the loop,
+# returning 1 when the subquery table has data.
+test exists-in-ungrouped-aggregate-with-data {
+    create table t11(a text);
+    insert into t11(a) values ('x');
+    select exists (select a from t11), sum(a) from t11;
+}
+expect {
+    1|0.0
+}
+expect @js {
+    1|0
+}
+
+# EXISTS subquery in ungrouped aggregate query with empty main table
+# The EXISTS subquery is non-correlated and evaluated before the loop.
+# Even though the main table is empty, EXISTS should return 1 because
+# the subquery table has data.
+test exists-in-ungrouped-aggregate-empty-main-table {
+    create table t12(a text);
+    create table t12_sub(b text);
+    insert into t12_sub(b) values ('y');
+    select exists (select b from t12_sub), count(*) from t12;
+}
+expect {
+    1|0
+}
+
+# EXISTS subquery in ungrouped aggregate query where subquery table is empty
+# EXISTS should return 0 because the subquery returns no rows.
+test exists-in-ungrouped-aggregate-empty-subquery-table {
+    create table t13(a text);
+    create table t13_sub(b text);
+    insert into t13(a) values ('x');
+    select exists (select b from t13_sub), sum(a) from t13;
+}
+expect {
+    0|0.0
+}
+expect @js {
+    0|0
+}
+
+# Correlated EXISTS in ungrouped aggregate with empty main table
+# Since the main loop never runs, the correlated EXISTS is never evaluated.
+# The result should be 0 (initialized default for EXISTS).
+test correlated-exists-in-ungrouped-aggregate-empty-main-table {
+    create table t14(a integer);
+    create table t14_sub(b integer);
+    insert into t14_sub(b) values (1);
+    select exists (select 1 from t14_sub where b = t14.a), count(*) from t14;
+}
+expect {
+    0|0
+}

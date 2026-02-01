@@ -45,6 +45,11 @@ const (
 type TursoSyncDatabaseConfig struct {
 	// Path to the main database file (auxiliary files will derive names from this path)
 	Path string
+	// optional remote url (libsql://..., https://... or http://...)
+	// this URL will be saved in the database metadata file in order to be able to reuse it if later client will be constructed without explicit remote url
+	RemoteUrl string
+	// Namespace for remote host
+	Namespace string
 	// Arbitrary client name used as a prefix for unique client id
 	ClientName string
 	// Long poll timeout for pull method in milliseconds
@@ -63,6 +68,10 @@ type TursoSyncDatabaseConfig struct {
 	// optional parameter which defines if pages prefetch must be enabled
 	// one of valid PartialBootstrapStrategy* values MUST be set in order for this setting to have some effect
 	PartialBootstrapPrefetch bool
+	// optional base64-encoded encryption key for remote encrypted databases
+	RemoteEncryptionKey string
+	// optional encryption cipher name (e.g. "aes256gcm", "chacha20poly1305")
+	RemoteEncryptionCipher string
 }
 
 // TursoSyncStats holds sync engine stats.
@@ -79,6 +88,7 @@ type TursoSyncStats struct {
 
 // HTTP request description used by IO layer.
 type TursoSyncIoHttpRequest struct {
+	Url     string
 	Method  string
 	Path    string
 	Body    []byte
@@ -106,6 +116,7 @@ type TursoSyncIoFullWriteRequest struct {
 
 type turso_sync_database_config_t struct {
 	path                              uintptr // const char*
+	remote_url                        uintptr // const char*
 	client_name                       uintptr // const char*
 	long_poll_timeout_ms              int32
 	bootstrap_if_empty                bool
@@ -114,9 +125,12 @@ type turso_sync_database_config_t struct {
 	partial_bootstrap_strategy_query  uintptr // const char*
 	partial_bootstrap_segment_size    uintptr
 	partial_bootstrap_prefetch        bool
+	remote_encryption_key             uintptr // const char*
+	remote_encryption_cipher          uintptr // const char*
 }
 
 type turso_sync_io_http_request_t struct {
+	url     turso_slice_ref_t
 	method  turso_slice_ref_t
 	path    turso_slice_ref_t
 	body    turso_slice_ref_t
@@ -155,12 +169,6 @@ var (
 		dbConfig *turso_database_config_t,
 		syncConfig *turso_sync_database_config_t,
 		database **turso_sync_database_t,
-		errorOptOut **byte,
-	) int32
-
-	c_turso_sync_database_init func(
-		self TursoSyncDatabase,
-		operation **turso_sync_operation_t,
 		errorOptOut **byte,
 	) int32
 
@@ -315,7 +323,6 @@ var (
 // Do not load library here; it is done externally.
 func registerTursoSync(handle uintptr) error {
 	purego.RegisterLibFunc(&c_turso_sync_database_new, handle, "turso_sync_database_new")
-	purego.RegisterLibFunc(&c_turso_sync_database_init, handle, "turso_sync_database_init")
 	purego.RegisterLibFunc(&c_turso_sync_database_open, handle, "turso_sync_database_open")
 	purego.RegisterLibFunc(&c_turso_sync_database_create, handle, "turso_sync_database_create")
 	purego.RegisterLibFunc(&c_turso_sync_database_connect, handle, "turso_sync_database_connect")
@@ -380,12 +387,17 @@ func turso_sync_database_new(dbConfig TursoDatabaseConfig, syncConfig TursoSyncD
 	if dbConfig.ExperimentalFeatures != "" {
 		expBytes, cdb.experimental_features = makeCStringBytes(dbConfig.ExperimentalFeatures)
 	}
-	cdb.async_io = dbConfig.AsyncIO
+	cdb.async_io = 0
+	if dbConfig.AsyncIO {
+		cdb.async_io = 1
+	}
 
 	// Build C sync config
 	var csync turso_sync_database_config_t
-	var syncPathBytes, clientNameBytes, queryBytes []byte
+	var syncPathBytes, remoteUrlBytes, clientNameBytes, queryBytes []byte
+	var encryptionKeyBytes, encryptionCipherBytes []byte
 	syncPathBytes, csync.path = makeCStringBytes(syncConfig.Path)
+	remoteUrlBytes, csync.remote_url = makeCStringBytes(syncConfig.RemoteUrl)
 	clientNameBytes, csync.client_name = makeCStringBytes(syncConfig.ClientName)
 	csync.long_poll_timeout_ms = int32(syncConfig.LongPollTimeoutMs)
 	csync.bootstrap_if_empty = syncConfig.BootstrapIfEmpty
@@ -396,6 +408,12 @@ func turso_sync_database_new(dbConfig TursoDatabaseConfig, syncConfig TursoSyncD
 	if syncConfig.PartialBootstrapStrategyQuery != "" {
 		queryBytes, csync.partial_bootstrap_strategy_query = makeCStringBytes(syncConfig.PartialBootstrapStrategyQuery)
 	}
+	if syncConfig.RemoteEncryptionKey != "" {
+		encryptionKeyBytes, csync.remote_encryption_key = makeCStringBytes(syncConfig.RemoteEncryptionKey)
+	}
+	if syncConfig.RemoteEncryptionCipher != "" {
+		encryptionCipherBytes, csync.remote_encryption_cipher = makeCStringBytes(syncConfig.RemoteEncryptionCipher)
+	}
 
 	var db *turso_sync_database_t
 	var errPtr *byte
@@ -403,26 +421,16 @@ func turso_sync_database_new(dbConfig TursoDatabaseConfig, syncConfig TursoSyncD
 
 	// Keep Go memory alive during C call
 	runtime.KeepAlive(pathBytes)
+	runtime.KeepAlive(remoteUrlBytes)
 	runtime.KeepAlive(expBytes)
 	runtime.KeepAlive(syncPathBytes)
 	runtime.KeepAlive(clientNameBytes)
 	runtime.KeepAlive(queryBytes)
+	runtime.KeepAlive(encryptionKeyBytes)
+	runtime.KeepAlive(encryptionCipherBytes)
 
 	if status == int32(TURSO_OK) {
 		return TursoSyncDatabase(db), nil
-	}
-	msg := decodeAndFreeCString(errPtr)
-	return nil, statusToError(TursoStatusCode(status), msg)
-}
-
-// turso_sync_database_init prepares synced database for use (bootstrap if needed).
-// AsyncOperation returns None.
-func turso_sync_database_init(self TursoSyncDatabase) (TursoSyncOperation, error) {
-	var op *turso_sync_operation_t
-	var errPtr *byte
-	status := c_turso_sync_database_init(self, &op, &errPtr)
-	if status == int32(TURSO_OK) {
-		return TursoSyncOperation(op), nil
 	}
 	msg := decodeAndFreeCString(errPtr)
 	return nil, statusToError(TursoStatusCode(status), msg)
@@ -634,6 +642,7 @@ func turso_sync_database_io_request_http(self TursoSyncIoItem) (TursoSyncIoHttpR
 		return TursoSyncIoHttpRequest{}, statusToError(TursoStatusCode(status), "")
 	}
 	return TursoSyncIoHttpRequest{
+		Url:     sliceRefToStringCopy(creq.url),
 		Method:  sliceRefToStringCopy(creq.method),
 		Path:    sliceRefToStringCopy(creq.path),
 		Body:    sliceRefToBytesCopy(creq.body),

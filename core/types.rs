@@ -1,3 +1,4 @@
+use branches::{mark_unlikely, unlikely};
 use either::Either;
 #[cfg(feature = "serde")]
 use serde::Deserialize;
@@ -19,15 +20,16 @@ use crate::vdbe::Register;
 use crate::vtab::VirtualTableCursor;
 use crate::{Completion, CompletionError, Result, IO};
 use std::borrow::{Borrow, Cow};
+use std::cell::Cell;
 use std::fmt::{Debug, Display};
-use std::iter::Peekable;
+use std::iter::{FusedIterator, Peekable};
 use std::ops::Deref;
 use std::task::Waker;
 
 /// SQLite by default uses 2000 as maximum numbers in a row.
 /// It controlld by the constant called SQLITE_MAX_COLUMN
 /// But the hard limit of number of columns is 32,767 columns i16::MAX
-const MAX_COLUMN: usize = 2000;
+/// const MAX_COLUMN: usize = 2000;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ValueType {
@@ -134,9 +136,29 @@ pub trait Extendable<T> {
 impl<T: AnyText> Extendable<T> for Text {
     #[inline(always)]
     fn do_extend(&mut self, other: &T) {
-        let value = self.value.to_mut();
-        value.clear();
-        value.push_str(other.as_ref());
+        let other_str = other.as_ref();
+        match &mut self.value {
+            Cow::Owned(s) => {
+                let needed = other_str.len();
+                if s.capacity() >= needed {
+                    // SAFETY: capacity >= needed, source is valid UTF-8
+                    debug_assert!(
+                        s.as_ptr().wrapping_add(s.len()) <= other_str.as_ptr()
+                            || other_str.as_ptr().wrapping_add(other_str.len()) <= s.as_ptr(),
+                        "source and destination ranges must not overlap"
+                    );
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(other_str.as_ptr(), s.as_mut_ptr(), needed);
+                        s.as_mut_vec().set_len(needed);
+                    }
+                } else {
+                    *s = other_str.to_owned();
+                }
+            }
+            Cow::Borrowed(_) => {
+                self.value = Cow::Owned(other_str.to_owned());
+            }
+        }
         self.subtype = other.subtype();
     }
 }
@@ -144,8 +166,23 @@ impl<T: AnyText> Extendable<T> for Text {
 impl<T: AnyBlob> Extendable<T> for Vec<u8> {
     #[inline(always)]
     fn do_extend(&mut self, other: &T) {
-        self.clear();
-        self.extend_from_slice(other.as_slice());
+        let other_slice = other.as_slice();
+        let needed = other_slice.len();
+        if self.capacity() >= needed {
+            // SAFETY: capacity >= needed
+            debug_assert!(
+                self.as_ptr().wrapping_add(self.len()) <= other_slice.as_ptr()
+                    || other_slice.as_ptr().wrapping_add(other_slice.len()) <= self.as_ptr(),
+                "source and destination ranges must not overlap"
+            );
+            unsafe {
+                std::ptr::copy_nonoverlapping(other_slice.as_ptr(), self.as_mut_ptr(), needed);
+                self.set_len(needed);
+            }
+        } else {
+            self.clear();
+            self.extend_from_slice(other_slice);
+        }
     }
 }
 
@@ -666,14 +703,15 @@ impl Default for SumAggState {
     }
 }
 
+/// Aggregate context for accumulating values during GROUP BY.
+/// Built-in aggregates use a flat payload representation for efficiency and
+/// to share code between register-based and hash-based aggregation (future enhancement).
 #[derive(Debug, Clone, PartialEq)]
 pub enum AggContext {
-    Avg(Value, Value), // acc and count
-    Sum(Value, SumAggState),
-    Count(Value),
-    Max(Option<Value>),
-    Min(Option<Value>),
-    GroupConcat(Value),
+    /// Built-in aggregates store state as a flat Vec<Value> payload.
+    /// The layout depends on the aggregate function (see init_agg_payload).
+    Builtin(Vec<Value>),
+    /// External (extension) aggregates need FFI state that can't be serialized.
     External(ExternalAggState),
 }
 
@@ -684,6 +722,22 @@ impl AggContext {
             Value::from_ffi(final_value)
         } else {
             panic!("AggContext::compute_external() expected External, found {self:?}");
+        }
+    }
+
+    /// Get a mutable reference to the builtin payload
+    pub fn payload_mut(&mut self) -> &mut [Value] {
+        match self {
+            Self::Builtin(payload) => payload,
+            Self::External(_) => panic!("payload_mut() called on External aggregate"),
+        }
+    }
+
+    /// Get an immutable reference to the builtin payload
+    pub fn payload(&self) -> &[Value] {
+        match self {
+            Self::Builtin(payload) => payload,
+            Self::External(_) => panic!("payload() called on External aggregate"),
         }
     }
 }
@@ -704,12 +758,13 @@ impl PartialOrd<Value> for Value {
 impl PartialOrd<AggContext> for AggContext {
     fn partial_cmp(&self, other: &AggContext) -> Option<std::cmp::Ordering> {
         match (self, other) {
-            (Self::Avg(a, _), Self::Avg(b, _)) => a.partial_cmp(b),
-            (Self::Sum(a, _), Self::Sum(b, _)) => a.partial_cmp(b),
-            (Self::Count(a), Self::Count(b)) => a.partial_cmp(b),
-            (Self::Max(a), Self::Max(b)) => a.partial_cmp(b),
-            (Self::Min(a), Self::Min(b)) => a.partial_cmp(b),
-            (Self::GroupConcat(a), Self::GroupConcat(b)) => a.partial_cmp(b),
+            (Self::Builtin(a), Self::Builtin(b)) => {
+                // Compare by first element (the accumulator) if present
+                match (a.first(), b.first()) {
+                    (Some(a), Some(b)) => a.partial_cmp(b),
+                    _ => None,
+                }
+            }
             _ => None,
         }
     }
@@ -877,7 +932,6 @@ impl<'a> TryFrom<ValueRef<'a>> for &'a str {
 /// A value in a record that has already been serialized can stay serialized and what this struct offsers
 /// is easy acces to each value which point to the payload.
 /// The name might be contradictory as it is immutable in the sense that you cannot modify the values without modifying the payload.
-#[derive(Clone, Eq, Ord, PartialEq, PartialOrd)]
 pub struct ImmutableRecord {
     // We have to be super careful with this buffer since we make values point to the payload we need to take care reallocations
     // happen in a controlled manner. If we realocate with values that should be correct, they will now point to undefined data.
@@ -885,6 +939,39 @@ pub struct ImmutableRecord {
     //
     // payload is the Vec<u8> but in order to use Register which holds ImmutableRecord as a Value - we store Vec<u8> as Value::Blob
     payload: Value,
+}
+
+// SAFETY: all ImmutableRecord instances are intended to be used in a single thread
+// by a single connection.
+unsafe impl Send for ImmutableRecord {}
+unsafe impl Sync for ImmutableRecord {}
+
+impl Clone for ImmutableRecord {
+    fn clone(&self) -> Self {
+        Self {
+            payload: self.payload.clone(),
+        }
+    }
+}
+
+impl PartialEq for ImmutableRecord {
+    fn eq(&self, other: &Self) -> bool {
+        self.payload == other.payload // Only compare payload, ignore cursor state
+    }
+}
+
+impl Eq for ImmutableRecord {}
+
+impl PartialOrd for ImmutableRecord {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for ImmutableRecord {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.payload.cmp(&other.payload) // Only compare payload, ignore cursor state
+    }
 }
 
 impl std::fmt::Debug for ImmutableRecord {
@@ -992,16 +1079,113 @@ impl ImmutableRecord {
         }
     }
 
-    // TODO: inline the complete record parsing code here.
-    // Its probably more efficient.
-    // fixme(pedrocarlo): this function is very inneficient and kind of misleading because
-    // it always deserializes the columns
-    pub fn get_values<'a>(&'a self) -> Vec<ValueRef<'a>> {
-        let mut cursor = RecordCursor::new();
-        cursor
-            .get_values(self)
-            .collect::<Result<Vec<_>>>()
-            .unwrap_or_default()
+    // Don't use this in performance critical paths, prefer using `iter()` instead
+    pub fn get_values(&self) -> Result<Vec<ValueRef<'_>>> {
+        let iter = self.iter()?;
+        let mut values = Vec::with_capacity(iter.size_hint().0);
+        for value in iter {
+            values.push(value?);
+        }
+        Ok(values)
+    }
+
+    // Don't use this in performance critical paths, prefer using `iter()` instead
+    pub fn get_values_range(&self, range: std::ops::Range<usize>) -> Result<Vec<ValueRef<'_>>> {
+        let mut iter = self.iter()?;
+        let mut values = Vec::with_capacity(range.end - range.start);
+        // advance to start
+        if let Some(value) = iter.nth(range.start) {
+            values.push(value?);
+        } else {
+            return Ok(values);
+        }
+        // collect rest
+        for _ in range.start + 1..range.end {
+            if let Some(value) = iter.next() {
+                values.push(value?);
+            } else {
+                break;
+            }
+        }
+        Ok(values)
+    }
+
+    // Idx values must be sorted ascending
+    pub fn get_two_values(&self, idx1: usize, idx2: usize) -> Result<(ValueRef<'_>, ValueRef<'_>)> {
+        let mut iter = self.iter()?;
+        let val1 = iter.nth(idx1);
+        let val2 = iter.nth(idx2 - idx1 - 1); // idx2 - idx1 - 1 because we already advanced to idx1
+        match (val1, val2) {
+            (Some(v1), Some(v2)) => Ok((v1?, v2?)),
+            _ => Err(LimboError::InternalError("index out of bound".to_string())),
+        }
+    }
+
+    // Idx values must be sorted ascending
+    pub fn get_three_values(
+        &self,
+        idx1: usize,
+        idx2: usize,
+        idx3: usize,
+    ) -> Result<(ValueRef<'_>, ValueRef<'_>, ValueRef<'_>)> {
+        let mut iter = self.iter()?;
+        let val1 = iter.nth(idx1);
+        let val2 = iter.nth(idx2 - idx1 - 1); // idx2 - idx1 - 1 because we already advanced to idx1
+        let val3 = iter.nth(idx3 - idx2 - 1); // idx3 - idx2 - 1 because we already advanced to idx2
+        match (val1, val2, val3) {
+            (Some(v1), Some(v2), Some(v3)) => Ok((v1?, v2?, v3?)),
+            _ => Err(LimboError::InternalError("index out of bound".to_string())),
+        }
+    }
+
+    // Idx values must be sorted ascending
+    pub fn get_four_values(
+        &self,
+        idx1: usize,
+        idx2: usize,
+        idx3: usize,
+        idx4: usize,
+    ) -> Result<(ValueRef<'_>, ValueRef<'_>, ValueRef<'_>, ValueRef<'_>)> {
+        let mut iter = self.iter()?;
+        let val1 = iter.nth(idx1);
+        let val2 = iter.nth(idx2 - idx1 - 1); // idx2 - idx1 - 1 because we already advanced to idx1
+        let val3 = iter.nth(idx3 - idx2 - 1); // idx3 - idx2 - 1 because we already advanced to idx2
+        let val4 = iter.nth(idx4 - idx3 - 1); // idx4 - idx3 - 1 because we already advanced to idx3
+        match (val1, val2, val3, val4) {
+            (Some(v1), Some(v2), Some(v3), Some(v4)) => Ok((v1?, v2?, v3?, v4?)),
+            _ => Err(LimboError::InternalError("index out of bound".to_string())),
+        }
+    }
+
+    // Don't use this in performance critical paths, prefer using `iter()` instead
+    pub fn get_values_owned(&self) -> Result<Vec<Value>> {
+        let iter = self.iter().expect("Failed to create payload iterator");
+        let mut values = Vec::with_capacity(iter.size_hint().0);
+        for value in iter {
+            values.push(value?.to_owned());
+        }
+        Ok(values)
+    }
+
+    // Don't use this in performance critical paths, prefer using `iter()` instead
+    pub fn get_values_owned_range(&self, range: std::ops::Range<usize>) -> Result<Vec<Value>> {
+        let mut iter = self.iter().expect("Failed to create payload iterator");
+        let mut values = Vec::with_capacity(range.end - range.start);
+        // advance to start
+        if let Some(value) = iter.nth(range.start) {
+            values.push(value?.to_owned());
+        } else {
+            return Ok(values);
+        }
+        // collect rest
+        for _ in range.start + 1..range.end {
+            if let Some(value) = iter.next() {
+                values.push(value?.to_owned());
+            } else {
+                break;
+            }
+        }
+        Ok(values)
     }
 
     pub fn from_registers<'a, I: Iterator<Item = &'a Register> + Clone>(
@@ -1089,6 +1273,15 @@ impl ImmutableRecord {
         }
     }
 
+    #[inline]
+    pub fn into_payload(self) -> Vec<u8> {
+        match self.payload {
+            Value::Blob(b) => b,
+            _ => panic!("payload must be a blob"),
+        }
+    }
+
+    #[inline]
     pub fn as_blob(&self) -> &Vec<u8> {
         match &self.payload {
             Value::Blob(b) => b,
@@ -1096,6 +1289,7 @@ impl ImmutableRecord {
         }
     }
 
+    #[inline]
     pub fn as_blob_mut(&mut self) -> &mut Vec<u8> {
         match &mut self.payload {
             Value::Blob(b) => b,
@@ -1103,392 +1297,342 @@ impl ImmutableRecord {
         }
     }
 
+    #[inline]
     pub fn as_blob_value(&self) -> &Value {
         &self.payload
     }
 
+    #[inline]
     pub fn start_serialization(&mut self, payload: &[u8]) {
         self.as_blob_mut().extend_from_slice(payload);
     }
 
+    #[inline]
     pub fn invalidate(&mut self) {
         self.as_blob_mut().clear();
     }
 
+    #[inline]
     pub fn is_invalidated(&self) -> bool {
         self.as_blob().is_empty()
     }
 
+    #[inline]
     pub fn get_payload(&self) -> &[u8] {
         self.as_blob()
     }
 
-    // TODO: its probably better to not instantiate the RecordCurosr. Instead do the deserialization
-    // inside the function.
-    pub fn last_value<'a>(
-        &'a self,
-        record_cursor: &mut RecordCursor,
-    ) -> Option<Result<ValueRef<'a>>> {
-        if self.is_invalidated() {
+    #[inline(always)]
+    pub fn iter(&self) -> Result<ValueIterator<'_>, LimboError> {
+        ValueIterator::new(self.get_payload())
+    }
+
+    #[inline]
+    /// Returns true if the record contains any NULL values.
+    /// This is an optimization that only examines the header (serial types)
+    /// without deserializing the data section.
+    pub fn contains_null(&self) -> Result<bool> {
+        let payload = self.get_payload();
+        let (header_size, header_varint_len) = read_varint(payload)?;
+        let header_size = header_size as usize;
+
+        if header_size > payload.len() || header_varint_len > payload.len() {
+            return Err(LimboError::Corrupt(
+                "Payload too small for indicated header size".into(),
+            ));
+        }
+
+        let mut header = &payload[header_varint_len..header_size];
+
+        while !header.is_empty() {
+            let (serial_type, bytes_read) = read_varint(header)?;
+            if serial_type == 0 {
+                return Ok(true);
+            }
+            header = &header[bytes_read..];
+        }
+
+        Ok(false)
+    }
+
+    #[inline]
+    pub fn last_value(&self) -> Option<Result<ValueRef<'_>>> {
+        if unlikely(self.is_invalidated()) {
             return Some(Err(LimboError::InternalError(
                 "Record is invalidated".into(),
             )));
         }
-        record_cursor.parse_full_header(self).unwrap();
-        let last_idx = record_cursor.serial_types.len().checked_sub(1)?;
-        Some(record_cursor.get_value(self, last_idx))
+        let iter = match self.iter() {
+            Ok(it) => it,
+            Err(e) => return Some(Err(e)),
+        };
+        iter.last()
     }
 
-    pub fn get_value<'a>(&'a self, idx: usize) -> Result<ValueRef<'a>> {
-        let mut cursor = RecordCursor::new();
-        cursor.get_value(self, idx)
-    }
-
-    pub fn get_value_opt<'a>(&'a self, idx: usize) -> Option<ValueRef<'a>> {
-        if self.is_invalidated() {
-            return None;
+    #[inline]
+    pub fn first_value(&self) -> Result<ValueRef<'_>> {
+        if unlikely(self.is_invalidated()) {
+            return Err(LimboError::InternalError("Record is invalidated".into()));
         }
+        match self.iter()?.next() {
+            Some(v) => v,
+            None => Err(LimboError::InternalError("Record has no columns".into())),
+        }
+    }
 
-        let mut cursor = RecordCursor::new();
+    #[inline]
+    pub fn get_value(&self, idx: usize) -> Result<ValueRef<'_>> {
+        if unlikely(self.is_invalidated()) {
+            return Err(LimboError::InternalError("Record is invalidated".into()));
+        }
+        let mut iter = self.iter()?;
+        iter.nth(idx)
+            .transpose()?
+            .ok_or_else(|| LimboError::InternalError("Index out of bounds".into()))
+    }
 
-        match cursor.ensure_parsed_upto(self, idx) {
-            Ok(()) => {
-                if idx >= cursor.serial_types.len() {
-                    return None;
-                }
-
-                cursor.deserialize_column(self, idx).ok()
+    #[inline]
+    pub fn get_value_opt(&self, idx: usize) -> Option<ValueRef<'_>> {
+        let mut iter = match self.iter() {
+            Ok(it) => it,
+            Err(_) => {
+                mark_unlikely();
+                return None;
             }
-            Err(_) => None,
+        };
+        match iter.nth(idx) {
+            Some(Ok(v)) => Some(v),
+            _ => {
+                mark_unlikely();
+                None
+            }
         }
     }
 
     pub fn column_count(&self) -> usize {
-        let mut cursor = RecordCursor::new();
-        cursor.parse_full_header(self).unwrap();
-        cursor.serial_types.len()
+        self.iter().map(|it| it.count()).unwrap_or_default()
     }
 }
 
-/// A cursor for lazily parsing SQLite record format data.
+/// A zero-allocation iterator over SQLite record payload data.
 ///
-/// `RecordCursor` provides incremental parsing of SQLite records, which follow the format:
-/// `[header_size][serial_type1][serial_type2]...[data1][data2]...`
+/// This iterator provides efficient, lazy parsing of SQLite records without
+/// any heap allocation. It processes record data on-the-fly, returning `ValueRef`
+/// instances that borrow directly from the underlying payload.
 ///
-/// Instead of parsing the entire record upfront, this cursor parses only what's needed
-/// for the requested operations, improving performance for large records where only
-/// a few columns are accessed.
+/// # Memory Layout
 ///
-/// SQLite records consist of:
-/// - **Header size**: Varint indicating total header length
-/// - **Serial types**: Variable-length integers describing each field's type and size
-/// - **Data section**: The actual field data in the same order as serial types
-#[derive(Debug, Default)]
-pub struct RecordCursor {
-    /// Parsed serial type values for each column.
-    /// Serial types encode both the data type and size information.
-    pub serial_types: Vec<u64>,
-    /// Byte offsets where each column's data begins in the record payload.
-    /// Always has one more entry than `serial_types` (the final offset marks the end).
-    pub offsets: Vec<usize>,
-    /// Total size of the record header in bytes.
-    pub header_size: usize,
-    /// Current parsing position within the header section.
-    pub header_offset: usize,
+/// SQLite records follow this binary format:
+/// ```text
+/// [header_size: varint][serial_type1: varint][serial_type2: varint]...
+/// [data1][data2][data3]...
+/// ```
+///
+/// - **header_size**: Total bytes in the header section (including this varint)
+/// - **serial_typeN**: Encodes the type and size of column N's data
+/// - **dataN**: The actual data for column N (length determined by serial_typeN)
+pub struct ValueIterator<'a> {
+    /// Reference to header section up to data offset
+    header_section: Cell<&'a [u8]>,
+    /// Reference to data section only
+    data_section: Cell<&'a [u8]>,
 }
 
-impl RecordCursor {
-    pub fn new() -> Self {
-        Self {
-            serial_types: Vec::new(),
-            offsets: Vec::new(),
-            header_size: 0,
-            header_offset: 0,
-        }
-    }
-
-    pub fn with_capacity(num_columns: usize) -> Self {
-        Self {
-            serial_types: Vec::with_capacity(num_columns),
-            offsets: Vec::with_capacity(num_columns + 1),
-            header_size: 0,
-            header_offset: 0,
-        }
-    }
-
-    pub fn invalidate(&mut self) {
-        self.serial_types.clear();
-        self.offsets.clear();
-        self.header_size = 0;
-        self.header_offset = 0;
-    }
-
-    pub fn is_invalidated(&self) -> bool {
-        self.serial_types.is_empty() && self.offsets.is_empty()
-    }
-
-    pub fn parse_full_header(&mut self, record: &ImmutableRecord) -> Result<()> {
-        self.ensure_parsed_upto(record, MAX_COLUMN)
-    }
-
-    /// Ensures the header is parsed up to (and including) the target column index.
-    ///
-    /// This is the core lazy parsing method. It only parses as much of the header
-    /// as needed to access the requested column, making it efficient for sparse
-    /// column access patterns.
+impl<'a> ValueIterator<'a> {
+    /// Creates a new payload iterator from a raw payload slice.
     ///
     /// # Arguments
     ///
-    /// * `record` - The record containing the data to parse
-    /// * `target_idx` - The column index that needs to be accessible (0-based)
+    /// * `payload` - The serialized SQLite record payload
     ///
     /// # Returns
     ///
-    /// * `Ok(())` - Parsing completed successfully
-    /// * `Err(LimboError)` - Parsing failed due to corrupt data or I/O error
-    ///
-    /// # Behavior
-    ///
-    /// - If `target_idx` is already parsed, returns immediately
-    /// - Parses incrementally from the current position to the target
-    /// - Handles the initial header size parsing on first call
-    /// - Calculates and caches data offsets for each parsed column
-    ///
+    /// Returns `Ok(Self)` if the header can be parsed, or an error if the
+    /// payload is malformed.
     #[inline(always)]
-    pub fn ensure_parsed_upto(
-        &mut self,
-        record: &ImmutableRecord,
-        target_idx: usize,
-    ) -> Result<()> {
-        let payload = record.get_payload();
-        if payload.is_empty() {
-            return Ok(());
+    pub fn new(payload: &'a [u8]) -> Result<Self> {
+        let (header_size, header_varint_len) = read_varint(payload)?;
+        let header_size = header_size as usize;
+
+        if header_size > payload.len() || header_varint_len > payload.len() {
+            return Err(LimboError::Corrupt(
+                "Payload too small for indicated header size".into(),
+            ));
         }
 
-        // Parse header size and initialize parsing
-        if self.serial_types.is_empty() && self.offsets.is_empty() {
-            let (header_size, bytes_read) = read_varint(payload)?;
-            self.header_size = header_size as usize;
-            self.header_offset = bytes_read;
-            self.offsets.push(self.header_size); // First column starts after header
-        }
-
-        // Parse serial types incrementally
-        while self.serial_types.len() <= target_idx
-            && self.header_offset < self.header_size
-            && self.header_offset < payload.len()
-        {
-            let (serial_type, read_bytes) = read_varint(&payload[self.header_offset..])?;
-            self.serial_types.push(serial_type);
-            self.header_offset += read_bytes;
-
-            let serial_type_obj = SerialType::try_from(serial_type)?;
-            let data_size = serial_type_obj.size();
-            let prev_offset = *self.offsets.last().unwrap();
-            self.offsets.push(prev_offset + data_size);
-        }
-
-        Ok(())
+        Ok(Self {
+            header_section: Cell::new(&payload[header_varint_len..header_size]),
+            data_section: Cell::new(&payload[header_size..]),
+        })
     }
 
-    /// Deserializes a specific column without additional parsing.
-    ///
-    /// This method assumes the header has already been parsed up to the target
-    /// column index (via `ensure_parsed_upto`). It extracts the actual data
-    /// value from the record's data section.
-    ///
-    /// # Arguments
-    ///
-    /// * `record` - The record containing the data
-    /// * `idx` - The column index to deserialize (0-based)
-    ///
-    /// # Returns
-    ///
-    /// * `Ok(RefValue)` - The deserialized value (may reference record data)
-    /// * `Err(LimboError)` - Deserialization failed
-    ///
-    /// # Special Cases
-    ///
-    /// - Returns `RefValue::Null` for out-of-bounds indices
-    pub fn deserialize_column<'a>(
-        &self,
-        record: &'a ImmutableRecord,
-        idx: usize,
-    ) -> Result<ValueRef<'a>> {
-        if idx >= self.serial_types.len() {
-            return Ok(ValueRef::Null);
-        }
-
-        let serial_type = self.serial_types[idx];
-        let serial_type_obj = SerialType::try_from(serial_type)?;
-
-        match serial_type_obj.kind() {
-            SerialTypeKind::Null => return Ok(ValueRef::Null),
-            SerialTypeKind::ConstInt0 => return Ok(ValueRef::Integer(0)),
-            SerialTypeKind::ConstInt1 => return Ok(ValueRef::Integer(1)),
-            _ => {} // continue
-        }
-
-        if idx + 1 >= self.offsets.len() {
-            return Ok(ValueRef::Null);
-        }
-
-        let start = self.offsets[idx];
-        let end = self.offsets[idx + 1];
-        let payload = record.get_payload();
-
-        let slice = &payload[start..end];
-        let (value, _) = crate::storage::sqlite3_ondisk::read_value(slice, serial_type_obj)?;
-        Ok(value)
+    /// Returns `true` if the payload is empty or the record has no columns.
+    pub fn is_empty(&self) -> bool {
+        self.header_section.get().is_empty()
     }
 
-    /// Gets the value at the specified column index.
-    ///
-    /// This is the primary method for accessing record data. It combines
-    /// lazy parsing with deserialization in a single call.
-    ///
-    /// # Arguments
-    ///
-    /// * `record` - The record to read from
-    /// * `idx` - The column index (0-based)
-    ///
-    /// # Returns
-    ///
-    /// * `Ok(RefValue)` - The value at the specified index
-    /// * `Err(LimboError)` - Access failed due to invalid record or parsing error
-    ///
+    /// Returns a reference to the current header section.
     #[inline(always)]
-    pub fn get_value<'a>(
-        &mut self,
-        record: &'a ImmutableRecord,
-        idx: usize,
-    ) -> Result<ValueRef<'a>> {
-        if record.is_invalidated() {
-            return Err(LimboError::InternalError("Record not initialized".into()));
-        }
-
-        self.ensure_parsed_upto(record, idx)?;
-        self.deserialize_column(record, idx)
+    pub fn header_section_ref(&self) -> &'a [u8] {
+        self.header_section.get()
     }
 
-    /// Gets the value at the specified column index, returning `None` on any error.
-    ///
-    /// # Arguments
-    ///
-    /// * `record` - The record to read from
-    /// * `idx` - The column index (0-based)
-    ///
-    /// # Returns
-    ///
-    /// * `Some(Ok(RefValue))` - Successfully read value
-    /// * `Some(Err(LimboError))` - Parsing succeeded but deserialization failed
-    /// * `None` - Record is invalid or index is out of bounds
-    ///
-    pub fn get_value_opt<'a>(
-        &mut self,
-        record: &'a ImmutableRecord,
-        idx: usize,
-    ) -> Option<Result<ValueRef<'a>>> {
-        if record.is_invalidated() {
+    /// Returns a reference to the current data section.
+    #[inline(always)]
+    pub fn data_section_ref(&self) -> &'a [u8] {
+        self.data_section.get()
+    }
+
+    /// Sets the header section to a new slice.
+    #[inline(always)]
+    pub fn set_header_section(&self, header: &'a [u8]) {
+        self.header_section.set(header);
+    }
+
+    /// Sets the data section to a new slice.
+    #[inline(always)]
+    pub fn set_data_section(&self, data: &'a [u8]) {
+        self.data_section.set(data);
+    }
+}
+
+impl<'a> Iterator for ValueIterator<'a> {
+    type Item = Result<ValueRef<'a>, LimboError>;
+
+    #[inline(always)]
+    fn count(self) -> usize
+    where
+        Self: Sized,
+    {
+        let mut count = 0;
+        let mut header = self.header_section.get();
+        while !header.is_empty() {
+            match read_varint(header) {
+                Ok((_, bytes_read)) => {
+                    count += 1;
+                    header = &header[bytes_read..];
+                }
+                Err(_) => break,
+            }
+        }
+        count
+    }
+
+    #[inline(always)]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let mut count = 0;
+        let mut header = self.header_section.get();
+        while !header.is_empty() {
+            match read_varint(header) {
+                Ok((_, bytes_read)) => {
+                    count += 1;
+                    header = &header[bytes_read..];
+                }
+                Err(_) => break,
+            }
+        }
+        (count, Some(count))
+    }
+
+    fn fold<B, F>(self, init: B, mut f: F) -> B
+    where
+        F: FnMut(B, Self::Item) -> B,
+    {
+        let mut acc = init;
+        for item in self {
+            acc = f(acc, item);
+        }
+        acc
+    }
+
+    /// Returns the nth element of the iterator.
+    #[inline(always)]
+    fn nth(&mut self, n: usize) -> Option<Self::Item> {
+        let mut header = self.header_section.get();
+        let mut data = self.data_section.get();
+
+        let mut data_sum = 0;
+        for _ in 0..n {
+            if unlikely(header.is_empty()) {
+                return None;
+            }
+
+            let (serial_type, bytes_read) = match read_varint(header) {
+                Ok(v) => v,
+                Err(e) => {
+                    mark_unlikely();
+                    return Some(Err(e));
+                }
+            };
+            header = &header[bytes_read..];
+
+            data_sum += match get_serial_type_size(serial_type) {
+                Ok(size) => size,
+                Err(e) => {
+                    mark_unlikely();
+                    return Some(Err(e));
+                }
+            };
+        }
+
+        if unlikely(data_sum > data.len()) {
+            return Some(Err(LimboError::Corrupt(
+                "Data section too small for indicated serial type size".into(),
+            )));
+        }
+        data = &data[data_sum..];
+
+        // Update iterator state
+        self.header_section.set(header);
+        self.data_section.set(data);
+
+        // Return the nth value
+        self.next()
+    }
+
+    #[inline(always)]
+    fn next(&mut self) -> Option<Self::Item> {
+        let header = self.header_section.get();
+        if unlikely(header.is_empty()) {
             return None;
         }
 
-        if let Err(e) = self.ensure_parsed_upto(record, idx) {
-            return Some(Err(e));
-        }
-
-        Some(self.deserialize_column(record, idx))
-    }
-
-    /// Returns the number of columns in the record.
-    ///
-    /// This method parses the complete header to determine the total
-    /// column count. The result is cached for subsequent calls.
-    /// # Arguments
-    ///
-    /// * `record` - The record to count columns in
-    ///
-    /// # Returns
-    ///
-    /// The number of columns, or 0 if the record is invalid.
-    pub fn count(&mut self, record: &ImmutableRecord) -> usize {
-        if record.is_invalidated() {
-            return 0;
-        }
-
-        let _ = self.parse_full_header(record);
-        self.serial_types.len()
-    }
-
-    /// Alias for `count()`. Returns the number of columns in the record.
-    ///
-    /// # Arguments
-    ///
-    /// * `record` - The record to get length of
-    ///
-    /// # Returns
-    ///
-    /// The number of columns, or 0 if the record is invalid.
-    pub fn len(&mut self, record: &ImmutableRecord) -> usize {
-        self.count(record)
-    }
-
-    /// Returns all values in the record as a vector.
-    ///
-    /// This method parses the complete header and deserializes all columns.
-    /// Use this when you need access to most or all columns in the record.
-    ///
-    /// # Arguments
-    ///
-    /// * `record` - The record to extract all values from
-    ///
-    /// # Returns
-    ///
-    /// * `Ok(Vec<RefValue>)` - All values in column order
-    /// * `Err(LimboError)` - Parsing or deserialization failed
-    ///
-    pub fn get_values<'a, 'b>(
-        &'b mut self,
-        record: &'a ImmutableRecord,
-    ) -> Peekable<impl ExactSizeIterator<Item = Result<ValueRef<'a>>> + use<'a, 'b>> {
-        struct GetValues<'a, 'b> {
-            cursor: &'b mut RecordCursor,
-            record: &'a ImmutableRecord,
-            idx: usize,
-        }
-
-        impl<'a, 'b> Iterator for GetValues<'a, 'b> {
-            type Item = Result<ValueRef<'a>>;
-
-            fn next(&mut self) -> Option<Self::Item> {
-                if self.idx == 0 {
-                    // So that we can have the full length of serial types
-                    if let Err(err) = self.cursor.parse_full_header(self.record) {
-                        return Some(Err(err));
-                    }
-                }
-                if !self.record.is_invalidated() && self.idx < self.cursor.serial_types.len() {
-                    let res = self.cursor.deserialize_column(self.record, self.idx);
-                    self.idx += 1;
-                    Some(res)
-                } else {
-                    None
-                }
+        // Read next serial type
+        let (serial_type, bytes_read) = match read_varint(header) {
+            Ok(v) => v,
+            Err(e) => {
+                mark_unlikely();
+                return Some(Err(e));
             }
-        }
-
-        impl<'a, 'b> ExactSizeIterator for GetValues<'a, 'b> {
-            fn len(&self) -> usize {
-                self.cursor.serial_types.len() - self.idx
-            }
-        }
-
-        let get_values = GetValues {
-            cursor: self,
-            record,
-            idx: 0,
         };
-        get_values.peekable()
+
+        // Update header section to remove the consumed serial type
+        self.header_section.set(&header[bytes_read..]);
+
+        let data_section = self.data_section.get();
+
+        match crate::storage::sqlite3_ondisk::read_value_serial_type(data_section, serial_type) {
+            Ok((value, n)) => {
+                self.data_section.set(&data_section[n..]);
+                Some(Ok(value))
+            }
+            Err(e) => {
+                mark_unlikely();
+                Some(Err(e))
+            }
+        }
+    }
+}
+
+// Optimization: indicate that once the iterator is exhausted, it will always return None.
+impl<'a> FusedIterator for ValueIterator<'a> {}
+
+impl<'a> Clone for ValueIterator<'a> {
+    fn clone(&self) -> Self {
+        Self {
+            header_section: Cell::new(self.header_section.get()),
+            data_section: Cell::new(self.data_section.get()),
+        }
     }
 }
 
@@ -1775,6 +1919,38 @@ where
         }
     }
     std::cmp::Ordering::Equal
+}
+
+pub fn compare_immutable_iter<V, E1, E2>(
+    mut l: E1,
+    mut r: E2,
+    column_info: &[KeyInfo],
+) -> Result<std::cmp::Ordering>
+where
+    V: AsValueRef,
+    E1: Iterator<Item = Result<V>>,
+    E2: Iterator<Item = Result<V>>,
+{
+    for col_info in column_info.iter() {
+        let l = match l.next() {
+            Some(v) => v,
+            None => break,
+        };
+        let r = match r.next() {
+            Some(v) => v,
+            None => break,
+        };
+        let column_order = col_info.sort_order;
+        let collation = col_info.collation;
+        let cmp = compare_immutable_single(l?, r?, collation);
+        if !cmp.is_eq() {
+            return match column_order {
+                SortOrder::Asc => Ok(cmp),
+                SortOrder::Desc => Ok(cmp.reverse()),
+            };
+        }
+    }
+    Ok(std::cmp::Ordering::Equal)
 }
 
 pub fn compare_immutable_single<V1, V2>(l: V1, r: V2, collation: CollationSeq) -> std::cmp::Ordering
@@ -2301,6 +2477,7 @@ impl SerialType {
         Self(13 + size * 2)
     }
 
+    #[inline(always)]
     pub fn kind(&self) -> SerialTypeKind {
         match self.0 {
             0 => SerialTypeKind::Null,
@@ -2340,6 +2517,27 @@ impl SerialType {
     }
 }
 
+#[inline(always)]
+pub fn get_serial_type_size(serial: u64) -> Result<usize> {
+    match serial {
+        0 | 8 | 9 => Ok(0),
+        1 => Ok(1),
+        2 => Ok(2),
+        3 => Ok(3),
+        4 => Ok(4),
+        5 => Ok(6),
+        6 | 7 => Ok(8),
+        n if n >= 12 => match n % 2 {
+            0 => Ok(((n - 12) / 2) as usize), // Blob
+            1 => Ok(((n - 13) / 2) as usize), // Text
+            _ => unreachable!(),
+        },
+        _ => Err(LimboError::Corrupt(format!(
+            "Invalid serial type: {serial}"
+        ))),
+    }
+}
+
 impl<T: AsValueRef> From<T> for SerialType {
     fn from(value: T) -> Self {
         let value = value.as_value_ref();
@@ -2371,8 +2569,9 @@ impl From<SerialType> for u64 {
 impl TryFrom<u64> for SerialType {
     type Error = LimboError;
 
+    #[inline(always)]
     fn try_from(uint: u64) -> Result<Self> {
-        if uint == 10 || uint == 11 {
+        if unlikely(uint == 10 || uint == 11) {
             return Err(LimboError::Corrupt(format!("Invalid serial type: {uint}")));
         }
         Ok(SerialType(uint))
@@ -2465,8 +2664,8 @@ impl Record {
 pub enum Cursor {
     BTree(Box<dyn CursorTrait>),
     IndexMethod(Box<dyn IndexMethodCursor>),
-    Pseudo(PseudoCursor),
-    Sorter(Sorter),
+    Pseudo(Box<PseudoCursor>),
+    Sorter(Box<Sorter>),
     Virtual(VirtualTableCursor),
     MaterializedView(Box<crate::incremental::cursor::MaterializedViewCursor>),
 }
@@ -2490,11 +2689,11 @@ impl Cursor {
     }
 
     pub fn new_pseudo(cursor: PseudoCursor) -> Self {
-        Self::Pseudo(cursor)
+        Self::Pseudo(Box::new(cursor))
     }
 
     pub fn new_sorter(cursor: Sorter) -> Self {
-        Self::Sorter(cursor)
+        Self::Sorter(Box::new(cursor))
     }
 
     pub fn new_materialized_view(
@@ -2598,8 +2797,17 @@ pub enum IOResult<T> {
 }
 
 impl<T> IOResult<T> {
+    #[inline]
     pub fn is_io(&self) -> bool {
         matches!(self, IOResult::IO(..))
+    }
+
+    #[inline]
+    pub fn map<U>(self, func: impl FnOnce(T) -> U) -> IOResult<U> {
+        match self {
+            IOResult::Done(t) => IOResult::Done(func(t)),
+            IOResult::IO(io) => IOResult::IO(io),
+        }
     }
 }
 
@@ -2754,6 +2962,100 @@ impl WalFrameInfo {
 mod tests {
     use super::*;
     use crate::translate::collate::CollationSeq;
+
+    #[test]
+    fn test_value_iterator_simple() {
+        let mut buf = Vec::new();
+        let record = Record::new(vec![Value::Integer(42), Value::Text(Text::new("hello"))]);
+        record.serialize(&mut buf);
+
+        let iter = ValueIterator::new(&buf).unwrap();
+        assert!(!iter.is_empty());
+        assert_eq!(iter.clone().count(), 2);
+
+        let mut iter = ValueIterator::new(&buf).unwrap();
+
+        let val = iter.next().unwrap().unwrap();
+        assert_eq!(val, ValueRef::Integer(42));
+
+        let val = iter.next().unwrap().unwrap();
+        assert_eq!(
+            val,
+            ValueRef::Text(TextRef::new("hello", TextSubtype::Text))
+        );
+
+        assert!(iter.next().is_none());
+    }
+
+    #[test]
+    fn test_value_iterator_nulls() {
+        let mut buf = Vec::new();
+        let record = Record::new(vec![Value::Null, Value::Null, Value::Null]);
+        record.serialize(&mut buf);
+
+        let iter = ValueIterator::new(&buf).unwrap();
+
+        for val in iter {
+            assert_eq!(val.unwrap(), ValueRef::Null);
+        }
+    }
+
+    #[test]
+    fn test_value_iterator_mixed_types() {
+        let mut buf = Vec::new();
+        let record = Record::new(vec![
+            Value::Null,
+            Value::Integer(100),
+            Value::Float(std::f64::consts::PI),
+            Value::Text(Text::new("test")),
+            Value::Blob(vec![1, 2, 3]),
+            Value::Integer(0),
+            Value::Integer(1),
+        ]);
+        record.serialize(&mut buf);
+
+        let iter = ValueIterator::new(&buf).unwrap();
+        let values: Vec<_> = iter.collect::<Result<Vec<_>>>().unwrap();
+
+        assert_eq!(values[0], ValueRef::Null);
+        assert_eq!(values[1], ValueRef::Integer(100));
+        assert_eq!(values[2], ValueRef::Float(std::f64::consts::PI));
+        assert_eq!(
+            values[3],
+            ValueRef::Text(TextRef::new("test", TextSubtype::Text))
+        );
+        assert_eq!(values[4], ValueRef::Blob(&[1, 2, 3]));
+        assert_eq!(values[5], ValueRef::Integer(0));
+        assert_eq!(values[6], ValueRef::Integer(1));
+    }
+
+    #[test]
+    fn test_value_iterator_large_record() {
+        let mut buf = Vec::new();
+        let values: Vec<Value> = (0..20).map(|i| Value::Integer(i as i64)).collect();
+        let record = Record::new(values);
+        record.serialize(&mut buf);
+
+        let iter = ValueIterator::new(&buf).unwrap();
+        assert_eq!(iter.count(), 20);
+
+        let iter = ValueIterator::new(&buf).unwrap();
+        for (i, val) in iter.enumerate() {
+            assert_eq!(val.unwrap(), ValueRef::Integer(i as i64));
+        }
+    }
+
+    #[test]
+    fn test_value_iterator_zero_allocation() {
+        let mut buf = Vec::new();
+        let values: Vec<Value> = (0..5).map(|i| Value::Integer(i as i64)).collect();
+        let record = Record::new(values);
+        record.serialize(&mut buf);
+
+        let mut iter = ValueIterator::new(&buf).unwrap();
+        let _ = iter.next();
+        let _ = iter.next();
+    }
 
     pub fn compare_immutable_for_testing(
         l: &[ValueRef],
@@ -3300,78 +3602,6 @@ mod tests {
             find_compare(blob_values.iter().peekable(), &index_info_small),
             RecordCompare::Generic
         ));
-    }
-
-    #[test]
-    fn test_record_parsing() {
-        let values = [
-            Value::Integer(42),
-            Value::Text(Text::new("hello")),
-            Value::Float(64.4),
-            Value::Null,
-            Value::Integer(1000000),
-            Value::Blob(vec![1, 2, 3, 4, 5]),
-        ];
-
-        let registers: Vec<Register> = values.iter().cloned().map(Register::Value).collect();
-        let record = ImmutableRecord::from_registers(&registers, registers.len());
-
-        // Full Parsing
-        let mut cursor1 = RecordCursor::new();
-        cursor1
-            .parse_full_header(&record)
-            .expect("Failed to parse full header");
-
-        assert_eq!(
-            cursor1.offsets.len(),
-            cursor1.serial_types.len() + 1,
-            "offsets should be one longer than serial_types"
-        );
-
-        for i in 0..values.len() {
-            cursor1
-                .deserialize_column(&record, i)
-                .expect("Failed to deserialize column");
-        }
-
-        // Incremental Parsing
-        let mut cursor2 = RecordCursor::new();
-        cursor2
-            .ensure_parsed_upto(&record, 2)
-            .expect("Failed to parse up to column 2");
-
-        assert_eq!(
-            cursor2.offsets.len(),
-            cursor2.serial_types.len() + 1,
-            "offsets should be one longer than serial_types"
-        );
-
-        cursor2.get_value(&record, 2).expect("Column 2 failed");
-
-        // Access column 0 (already parsed)
-        let before = cursor2.serial_types.len();
-        cursor2.get_value(&record, 0).expect("Column 0 failed");
-        let after = cursor2.serial_types.len();
-        assert_eq!(before, after, "Should not parse more");
-
-        // Access column 5 (forces full parse)
-        cursor2
-            .ensure_parsed_upto(&record, 5)
-            .expect("Column 5 parse failed");
-        cursor2.get_value(&record, 5).expect("Column 5 failed");
-
-        // Compare both parsing strategies
-        for i in 0..values.len() {
-            let full = cursor1.get_value(&record, i).expect("full failed");
-            let incr = cursor2.get_value(&record, i).expect("incr failed");
-            assert_eq!(full, incr, "Mismatch at column {i}");
-        }
-
-        assert_eq!(
-            cursor1.serial_types, cursor2.serial_types,
-            "serial_types must match"
-        );
-        assert_eq!(cursor1.offsets, cursor2.offsets, "offsets must match");
     }
 
     #[test]

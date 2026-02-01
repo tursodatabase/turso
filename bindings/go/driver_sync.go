@@ -8,6 +8,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -17,6 +18,7 @@ import (
 	turso_libs "github.com/tursodatabase/turso-go-platform-libs"
 )
 
+// TursoPartialSyncConfig configures partial sync behavior.
 type TursoPartialSyncConfig struct {
 	// if positive, prefix partial bootstrap strategy will be used
 	BootstrapStrategyPrefix int
@@ -39,6 +41,9 @@ type TursoSyncDbConfig struct {
 	// remote_url MUST be used in all sync engine operations: during bootstrap and all further operations
 	RemoteUrl string
 
+	// remote namespace for the sync client (optional)
+	Namespace string
+
 	// token for remote authentication
 	// auth token value WILL not have any prefix and must be used as "Authorization" header prepended with "Bearer " prefix
 	AuthToken string
@@ -54,7 +59,8 @@ type TursoSyncDbConfig struct {
 	BootstrapIfEmpty *bool
 
 	// configuration for partial sync (disabled by default)
-	PartialSyncConfig TursoPartialSyncConfig
+	// WARNING: This feature is EXPERIMENTAL
+	PartialSyncExperimental TursoPartialSyncConfig
 
 	// pass it as-is to the underlying connection
 	ExperimentalFeatures string
@@ -88,6 +94,7 @@ type TursoSyncDb struct {
 	db        TursoSyncDatabase
 	baseURL   string
 	authToken string
+	namespace string
 	client    *http.Client
 
 	mu sync.Mutex
@@ -99,9 +106,6 @@ func NewTursoSyncDb(ctx context.Context, config TursoSyncDbConfig) (*TursoSyncDb
 	if strings.TrimSpace(config.Path) == "" {
 		return nil, errors.New("turso: empty Path in TursoSyncDbConfig")
 	}
-	if strings.TrimSpace(config.RemoteUrl) == "" {
-		return nil, errors.New("turso: empty RemoteUrl in TursoSyncDbConfig")
-	}
 	clientName := config.ClientName
 	if clientName == "" {
 		clientName = "turso-sync-go"
@@ -111,6 +115,7 @@ func NewTursoSyncDb(ctx context.Context, config TursoSyncDbConfig) (*TursoSyncDb
 		bootstrap = *config.BootstrapIfEmpty
 	}
 
+	remoteUrl := normalizeUrl(config.RemoteUrl)
 	// Create sync database holder
 	dbCfg := TursoDatabaseConfig{
 		Path:                 config.Path,
@@ -119,14 +124,16 @@ func NewTursoSyncDb(ctx context.Context, config TursoSyncDbConfig) (*TursoSyncDb
 	}
 	syncCfg := TursoSyncDatabaseConfig{
 		Path:                           config.Path,
+		RemoteUrl:                      remoteUrl,
+		Namespace:                      config.Namespace,
 		ClientName:                     clientName,
 		LongPollTimeoutMs:              config.LongPollTimeoutMs,
 		BootstrapIfEmpty:               bootstrap,
 		ReservedBytes:                  0,
-		PartialBootstrapStrategyPrefix: config.PartialSyncConfig.BootstrapStrategyPrefix,
-		PartialBootstrapStrategyQuery:  config.PartialSyncConfig.BootstrapStrategyQuery,
-		PartialBootstrapSegmentSize:    config.PartialSyncConfig.SegmentSize,
-		PartialBootstrapPrefetch:       config.PartialSyncConfig.Prefetch,
+		PartialBootstrapStrategyPrefix: config.PartialSyncExperimental.BootstrapStrategyPrefix,
+		PartialBootstrapStrategyQuery:  config.PartialSyncExperimental.BootstrapStrategyQuery,
+		PartialBootstrapSegmentSize:    config.PartialSyncExperimental.SegmentSize,
+		PartialBootstrapPrefetch:       config.PartialSyncExperimental.Prefetch,
 	}
 	sdb, err := turso_sync_database_new(dbCfg, syncCfg)
 	if err != nil {
@@ -135,7 +142,7 @@ func NewTursoSyncDb(ctx context.Context, config TursoSyncDbConfig) (*TursoSyncDb
 
 	d := &TursoSyncDb{
 		db:        sdb,
-		baseURL:   strings.TrimRight(config.RemoteUrl, "/"),
+		baseURL:   strings.TrimRight(remoteUrl, "/"),
 		authToken: strings.TrimSpace(config.AuthToken),
 		client: &http.Client{
 			// No global timeout to allow long-poll; rely on request context.
@@ -373,6 +380,17 @@ func (d *TursoSyncDb) processIoQueue(ctx context.Context) error {
 	return turso_sync_database_io_step_callbacks(d.db)
 }
 
+func buildHostname(baseURL, namespace string) (string, error) {
+	if namespace == "" {
+		return baseURL, nil
+	}
+	u, err := url.Parse(baseURL)
+	if err != nil {
+		return "", err
+	}
+	return namespace + "." + u.Host, nil
+}
+
 // handleIoItem performs execution of a single IO item.
 // It streams data in chunks for HTTP and file operations to avoid loading whole payloads in memory.
 func (d *TursoSyncDb) handleIoItem(ctx context.Context, item TursoSyncIoItem) error {
@@ -385,7 +403,7 @@ func (d *TursoSyncDb) handleIoItem(ctx context.Context, item TursoSyncIoItem) er
 			return err
 		}
 		// Build URL
-		url := joinURL(d.baseURL, req.Path)
+		buildUrl := joinUrl(d.baseURL, req.Path)
 
 		// Build headers
 		hdr := make(http.Header, req.Headers+2)
@@ -413,12 +431,17 @@ func (d *TursoSyncDb) handleIoItem(ctx context.Context, item TursoSyncIoItem) er
 		if len(req.Body) > 0 {
 			body = bytes.NewReader(req.Body)
 		}
-		httpReq, err := http.NewRequestWithContext(ctx, req.Method, url, body)
+		httpReq, err := http.NewRequestWithContext(ctx, req.Method, buildUrl, body)
 		if err != nil {
 			_ = turso_sync_database_io_poison(item, err.Error())
 			_ = turso_sync_database_io_done(item)
 			return err
 		}
+		host, err := buildHostname(d.baseURL, d.namespace)
+		if err != nil {
+			return err
+		}
+		httpReq.Host = host
 		httpReq.Header = hdr
 
 		resp, err := d.client.Do(httpReq)
@@ -526,16 +549,16 @@ func (d *TursoSyncDb) handleIoItem(ctx context.Context, item TursoSyncIoItem) er
 	}
 }
 
-func joinURL(base, p string) string {
-	if p == "" {
-		return base
-	}
-	if strings.HasPrefix(p, "http://") || strings.HasPrefix(p, "https://") {
-		return p
-	}
-	b := strings.TrimRight(base, "/")
+func joinUrl(base, p string) string {
 	if !strings.HasPrefix(p, "/") {
 		p = "/" + p
 	}
-	return b + p
+	return strings.TrimRight(base, "/") + p
+}
+
+func normalizeUrl(base string) string {
+	if cut, ok := strings.CutPrefix(base, "libsql://"); ok {
+		return "https://" + cut
+	}
+	return base
 }

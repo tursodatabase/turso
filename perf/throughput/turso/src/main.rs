@@ -162,7 +162,8 @@ async fn setup_database(
         mode,
         TransactionMode::Mvcc | TransactionMode::Concurrent | TransactionMode::LogicalLog
     ) {
-        conn.pragma_update("journal_mode", "'experimental_mvcc'")?;
+        conn.pragma_update("journal_mode", "'experimental_mvcc'")
+            .await?;
     }
 
     conn.execute(
@@ -207,22 +208,41 @@ async fn worker_thread(
                 TransactionMode::Legacy | TransactionMode::Mvcc => "BEGIN",
                 TransactionMode::Concurrent | TransactionMode::LogicalLog => "BEGIN CONCURRENT",
             };
-            conn.execute(begin_stmt, ()).await?;
 
-            let result = perform_compute(thread_id, compute_usec);
-            std::hint::black_box(result);
+            // Retry loop for BusySnapshot errors (stale snapshot requires full tx restart)
+            'tx: loop {
+                conn.execute(begin_stmt, ()).await?;
 
-            for i in 0..batch_size {
-                let id = thread_id * iterations * batch_size + iteration * batch_size + i;
-                stmt.execute(turso::params::Params::Positional(vec![
-                    turso::Value::Integer(id as i64),
-                    turso::Value::Text(format!("data_{id}")),
-                ]))
-                .await?;
-                total_inserts.fetch_add(1, Ordering::Relaxed);
+                let result = perform_compute(thread_id, compute_usec);
+                std::hint::black_box(result);
+
+                let mut insert_count = 0u64;
+                for i in 0..batch_size {
+                    let id = thread_id * iterations * batch_size + iteration * batch_size + i;
+                    match stmt
+                        .execute(turso::params::Params::Positional(vec![
+                            turso::Value::Integer(id as i64),
+                            turso::Value::Text(format!("data_{id}")),
+                        ]))
+                        .await
+                    {
+                        Ok(_) => insert_count += 1,
+                        Err(turso::Error::BusySnapshot(_)) => {
+                            eprintln!("[Thread {thread_id}] Snapshot is stale during INSERT, rolling back transaction");
+                            conn.execute("ROLLBACK", ())
+                                .await
+                                .expect("Failed to rollback transaction");
+                            continue 'tx;
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+
+                conn.execute("COMMIT", ()).await?;
+                total_inserts.fetch_add(insert_count, Ordering::Relaxed);
+                break 'tx;
             }
 
-            conn.execute("COMMIT", ()).await?;
             Ok::<_, turso::Error>(())
         };
         match mode {
@@ -237,6 +257,8 @@ async fn worker_thread(
     }
 
     let final_inserts = total_inserts.load(Ordering::Relaxed);
+
+    eprintln!("[Thread {thread_id}] Final inserts: {final_inserts}");
 
     Ok(final_inserts)
 }

@@ -2,7 +2,7 @@ use std::{fmt::Display, hash::Hash, ops::Deref};
 
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
-use turso_core::{numeric::Numeric, types};
+use turso_core::{numeric::Numeric, types, LimboError};
 use turso_parser::ast::{self, ColumnConstraint, SortOrder};
 
 use crate::model::query::predicate::Predicate;
@@ -58,6 +58,11 @@ impl Table {
             indexes: vec![],
         }
     }
+
+    /// Returns true if any column in this table has a UNIQUE constraint.
+    pub fn has_any_unique_column(&self) -> bool {
+        self.columns.iter().any(|c| c.has_unique_constraint())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -81,6 +86,15 @@ impl PartialEq for Column {
 }
 
 impl Eq for Column {}
+
+impl Column {
+    /// Returns true if this column has a UNIQUE constraint.
+    pub fn has_unique_constraint(&self) -> bool {
+        self.constraints
+            .iter()
+            .any(|c| matches!(c, ColumnConstraint::Unique(_)))
+    }
+}
 
 impl Display for Column {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -197,6 +211,15 @@ impl SimValue {
         matches!(self.0, types::Value::Null)
     }
 
+    pub fn unique_for_type(column_type: &ColumnType, offset: i64) -> Self {
+        match column_type {
+            ColumnType::Integer => SimValue(types::Value::Integer(offset)),
+            ColumnType::Float => SimValue(types::Value::Float(offset as f64)),
+            ColumnType::Text => SimValue(types::Value::Text(format!("u{offset}").into())),
+            ColumnType::Blob => SimValue(types::Value::Blob(format!("u{offset}").into_bytes())),
+        }
+    }
+
     // The result of any binary operator is either a numeric value or NULL, except for the || concatenation operator, and the -> and ->> extract operators which can return values of any type.
     // All operators generally evaluate to NULL when any operand is NULL, with specific exceptions as stated below. This is in accordance with the SQL92 standard.
     // When paired with NULL:
@@ -250,16 +273,20 @@ impl SimValue {
     }
 
     // TODO: support more operators. Copy the implementation for exec_glob
-    pub fn like_compare(&self, other: &Self, operator: ast::LikeOperator) -> bool {
+    pub fn like_compare(
+        &self,
+        other: &Self,
+        operator: ast::LikeOperator,
+    ) -> Result<bool, LimboError> {
         match operator {
             ast::LikeOperator::Glob => todo!(),
             ast::LikeOperator::Like => {
                 // TODO: support ESCAPE `expr` option in AST
                 // TODO: regex cache
                 types::Value::exec_like(
-                    None,
                     other.0.to_string().as_str(),
                     self.0.to_string().as_str(),
+                    None,
                 )
             }
             ast::LikeOperator::Match => todo!(),

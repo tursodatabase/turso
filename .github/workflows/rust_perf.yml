@@ -9,13 +9,20 @@ on:
 
 env:
   CARGO_TERM_COLOR: never
+  CARGO_INCREMENTAL: "0"
+  CARGO_NET_RETRY: 10
 
 jobs:
   bench:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45 # FIXME: make this run faster
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-rust"
+          cache-on-failure: true
       - uses: useblacksmith/setup-node@v5
         with:
           node-version: 20
@@ -59,7 +66,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-rust"
+          cache-on-failure: true
       - uses: useblacksmith/setup-node@v5
         with:
           node-version: 20
@@ -115,10 +127,12 @@ jobs:
     env:
       DB_FILE: "perf/tpc-h/TPC-H.db"
     steps:
-      - uses: actions/checkout@v3
-      - uses: useblacksmith/rust-cache@v3
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
         with:
-          prefix-key: "v1-rust" # can be updated if we need to reset caches due to non-trivial change in the dependencies (for example, custom env var were set for single workspace project)
+          prefix-key: "v1-rust"
+          cache-on-failure: true
 
       - name: Cache TPC-H
         id: cache-primes
@@ -133,7 +147,7 @@ jobs:
         run: wget -O $DB_FILE --no-verbose $DB_URL
 
       - name: Bench
-        run: cargo bench --bench tpc_h_benchmark  2>&1 | tee output.txt
+        run: cargo bench --bench tpc_h_benchmark --locked  2>&1 | tee output.txt
       - name: Analyze benchmark result with Nyrkiö
         uses: nyrkio/change-detection@HEAD
         with:
@@ -168,9 +182,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-rust"
+          cache-on-failure: true
       - name: TPC-H
-        env: 
+        env:
           RUST_LOG: "off"
         run: ./perf/tpc-h/benchmark.sh
 
@@ -178,13 +197,15 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v3
-      - uses: useblacksmith/rust-cache@v3
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
         with:
-          prefix-key: "v1-rust" # can be updated if we need to reset caches due to non-trivial change in the dependencies (for example, custom env var were set for single workspace project)
+          prefix-key: "v1-rust"
+          cache-on-failure: true
 
       - name: Build
-        run: cargo build --release --verbose
+        run: cargo build --release --verbose --locked
 
       - name: Install uv
         uses: useblacksmith/setup-uv@v4

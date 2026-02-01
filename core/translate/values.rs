@@ -3,7 +3,7 @@ use crate::translate::expr::{translate_expr_no_constant_opt, NoConstantOptReason
 use crate::translate::plan::{QueryDestination, SelectPlan};
 use crate::translate::result_row::emit_offset;
 use crate::vdbe::builder::ProgramBuilder;
-use crate::vdbe::insn::{IdxInsertFlags, Insn};
+use crate::vdbe::insn::{to_u16, IdxInsertFlags, Insn};
 use crate::vdbe::BranchOffset;
 use crate::Result;
 
@@ -246,9 +246,9 @@ fn emit_values_to_index(
     } else {
         let record_reg = program.alloc_register();
         program.emit_insn(Insn::MakeRecord {
-            start_reg,
-            count: row_len,
-            dest_reg: record_reg,
+            start_reg: to_u16(start_reg),
+            count: to_u16(row_len),
+            dest_reg: to_u16(record_reg),
             index_name: Some(index.name.clone()),
             affinity_str: None,
         });

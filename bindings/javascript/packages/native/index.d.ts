@@ -148,4 +148,32 @@ export interface DatabaseOpts {
   timeout?: number
   fileMustExist?: boolean
   tracing?: string
+  /** Optional encryption configuration for local database encryption */
+  encryption?: EncryptionOpts
+}
+
+/** Supported encryption ciphers for local database encryption. */
+export declare const enum EncryptionCipher {
+  /** AES-128-GCM cipher */
+  Aes128Gcm = 0,
+  /** AES-256-GCM cipher */
+  Aes256Gcm = 1,
+  /** AEGIS-256 cipher */
+  Aegis256 = 2,
+  /** AEGIS-256X2 cipher */
+  Aegis256x2 = 3,
+  /** AEGIS-128L cipher */
+  Aegis128l = 4,
+  /** AEGIS-128X2 cipher */
+  Aegis128x2 = 5,
+  /** AEGIS-128X4 cipher */
+  Aegis128x4 = 6
+}
+
+/** Encryption configuration for local database encryption. */
+export interface EncryptionOpts {
+  /** The cipher to use for encryption */
+  cipher: EncryptionCipher
+  /** The hex-encoded encryption key */
+  hexkey: string
 }

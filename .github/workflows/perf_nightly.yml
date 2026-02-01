@@ -18,7 +18,7 @@ env:
 jobs:
   bench:
     runs-on: nyrkio_perf_server_4cpu_ubuntu2404
-    timeout-minutes: 30
+    timeout-minutes: 45 # FIXME: make this run faster
     steps:
       - uses: actions/checkout@v3
       - uses: useblacksmith/setup-node@v5
@@ -122,9 +122,10 @@ jobs:
       DB_FILE: "perf/tpc-h/TPC-H.db"
     steps:
       - uses: actions/checkout@v3
-      - uses: useblacksmith/rust-cache@v3
+      - uses: Swatinem/rust-cache@v2
         with:
-          prefix-key: "v1-rust" # can be updated if we need to reset caches due to non-trivial change in the dependencies (for example, custom env var were set for single workspace project)
+          prefix-key: "v1-rust"
+          cache-on-failure: true
 
       - name: Cache TPC-H
         id: cache-primes

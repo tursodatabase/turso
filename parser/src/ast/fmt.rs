@@ -612,6 +612,14 @@ impl ToTokens for Stmt {
                 }
                 Ok(())
             }
+            Self::Optimize { idx_name } => {
+                s.append(TK_OPTIMIZE, None)?;
+                s.append(TK_INDEX, None)?;
+                if let Some(name) = idx_name {
+                    name.to_tokens(s, context)?;
+                }
+                Ok(())
+            }
             Self::Release { name } => {
                 s.append(TK_RELEASE, None)?;
                 name.to_tokens(s, context)
@@ -948,6 +956,8 @@ impl ToTokens for Literal {
             Self::Blob(ref blob) => s.append(TK_BLOB, Some(blob)),
             Self::Keyword(ref str) => s.append(TK_ID, Some(str)), // TODO Validate TK_ID
             Self::Null => s.append(TK_NULL, None),
+            Self::True => s.append(TK_ID, Some("TRUE")),
+            Self::False => s.append(TK_ID, Some("FALSE")),
             Self::CurrentDate => s.append(TK_CTIME_KW, Some("CURRENT_DATE")),
             Self::CurrentTime => s.append(TK_CTIME_KW, Some("CURRENT_TIME")),
             Self::CurrentTimestamp => s.append(TK_CTIME_KW, Some("CURRENT_TIMESTAMP")),
@@ -1377,9 +1387,11 @@ impl ToTokens for GroupBy {
         s: &mut S,
         context: &C,
     ) -> Result<(), S::Error> {
-        s.append(TK_GROUP, None)?;
-        s.append(TK_BY, None)?;
-        comma(&self.exprs, s, context)?;
+        if !self.exprs.is_empty() {
+            s.append(TK_GROUP, None)?;
+            s.append(TK_BY, None)?;
+            comma(&self.exprs, s, context)?;
+        }
         if let Some(ref having) = self.having {
             s.append(TK_HAVING, None)?;
             having.to_tokens(s, context)?;

@@ -2,7 +2,7 @@ use std::{cell::RefCell, collections::HashMap, sync::Arc};
 
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
-use turso_core::{Clock, Completion, File, Instant, IO};
+use turso_core::{Clock, Completion, File, MonotonicInstant, WallClockInstant, IO};
 
 pub struct NoopTask;
 
@@ -82,12 +82,12 @@ impl Opfs {
 }
 
 impl Clock for Opfs {
-    fn now(&self) -> Instant {
-        let now = chrono::Local::now();
-        Instant {
-            secs: now.timestamp(),
-            micros: now.timestamp_subsec_micros(),
-        }
+    fn current_time_monotonic(&self) -> MonotonicInstant {
+        MonotonicInstant::now()
+    }
+
+    fn current_time_wall_clock(&self) -> WallClockInstant {
+        WallClockInstant::now()
     }
 }
 
@@ -233,7 +233,11 @@ impl File for OpfsFile {
         Ok(c)
     }
 
-    fn sync(&self, c: turso_core::Completion) -> turso_core::Result<turso_core::Completion> {
+    fn sync(
+        &self,
+        c: turso_core::Completion,
+        _sync_type: turso_core::io::FileSyncType,
+    ) -> turso_core::Result<turso_core::Completion> {
         let web_worker = is_web_worker_safe();
         tracing::debug!("sync({}, is_web_worker={})", self.handle, web_worker);
         let handle = self.handle;

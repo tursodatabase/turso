@@ -1,5 +1,8 @@
 // FIXME: remove this once we add recovery
 #![allow(dead_code)]
+use crate::io::FileSyncType;
+use crate::sync::Arc;
+use crate::sync::RwLock;
 use crate::{
     io::ReadComplete,
     mvcc::database::{LogRecord, MVTableId, Row, RowID, RowKey, RowVersion, SortableIndexKey},
@@ -8,8 +11,6 @@ use crate::{
     types::{ImmutableRecord, IndexInfo},
     Buffer, Completion, CompletionError, LimboError, Result,
 };
-use parking_lot::RwLock;
-use std::sync::Arc;
 
 use crate::File;
 
@@ -218,11 +219,11 @@ impl LogicalLog {
         Ok(c)
     }
 
-    pub fn sync(&mut self) -> Result<Completion> {
+    pub fn sync(&mut self, sync_type: FileSyncType) -> Result<Completion> {
         let completion = Completion::new_sync(move |_| {
             tracing::debug!("logical_log_sync finish");
         });
-        let c = self.file.sync(completion)?;
+        let c = self.file.sync(completion, sync_type)?;
         Ok(c)
     }
 
@@ -307,7 +308,7 @@ impl StreamingLogicalLogReader {
             let mut header = header.write();
             let Ok((buf, bytes_read)) = res else {
                 tracing::error!("couldn't ready log err={:?}", res,);
-                return;
+                return None;
             };
             if bytes_read != LOG_HEADER_MAX_SIZE as i32 {
                 tracing::error!(
@@ -315,15 +316,16 @@ impl StreamingLogicalLogReader {
                     bytes_read,
                     LOG_HEADER_MAX_SIZE
                 );
-                return;
+                return None;
             }
             let buf = buf.as_slice();
             header.version = buf[0];
             header.salt = u64::from_be_bytes([
                 buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7], buf[8],
             ]);
-            header.encrypted = buf[10];
+            header.encrypted = buf[9];
             tracing::trace!("LogicalLog header={:?}", header);
+            None
         });
         let c = Completion::new_read(header_buf, completion);
         self.offset += LOG_HEADER_MAX_SIZE;
@@ -358,7 +360,7 @@ impl StreamingLogicalLogReader {
                     transaction_read_bytes,
                 } => {
                     if transaction_read_bytes > transaction_size as usize {
-                        return Err(LimboError::Corrupt(format!("streaming log read more bytes than expected from a transaction expected={transaction_size} read={transaction_size}")));
+                        return Err(LimboError::Corrupt(format!("streaming log read more bytes than expected from a transaction expected={transaction_size} read={transaction_read_bytes}")));
                     } else if transaction_size as usize == transaction_read_bytes {
                         // TODO: offset verification
                         let _offset_after = self.consume_u64(io)?;
@@ -554,7 +556,7 @@ impl StreamingLogicalLogReader {
         Ok(buffer)
     }
 
-    fn get_buffer(&self) -> parking_lot::RwLockReadGuard<'_, Vec<u8>> {
+    fn get_buffer(&self) -> crate::sync::RwLockReadGuard<'_, Vec<u8>> {
         self.buffer.read()
     }
 
@@ -610,6 +612,7 @@ impl StreamingLogicalLogReader {
                 if bytes_read > 0 {
                     buffer.extend_from_slice(&buf[..bytes_read as usize]);
                 }
+                None
             });
             let c = Completion::new_read(header_buf, completion);
             let c = self.file.pread(self.offset as u64, c)?;
@@ -650,6 +653,7 @@ mod tests {
         ChaCha8Rng,
     };
 
+    use crate::sync::Arc;
     use crate::{
         mvcc::database::{
             tests::{commit_tx, generate_simple_string_row, MvccTestDbNoConn},
@@ -658,7 +662,6 @@ mod tests {
         types::{ImmutableRecord, IndexInfo, Text},
         Value, ValueRef,
     };
-    use std::sync::Arc;
 
     use super::LogRecordType;
 
@@ -714,8 +717,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let record = ImmutableRecord::from_bin_record(row.payload().to_vec());
-        let values = record.get_values();
-        let foo = values.first().unwrap();
+        let foo = record.iter().unwrap().next().unwrap().unwrap();
         let ValueRef::Text(foo) = foo else {
             unreachable!()
         };
@@ -789,8 +791,7 @@ mod tests {
             let tx = mvcc_store.begin_tx(pager.clone()).unwrap();
             let row = mvcc_store.read(tx, rowid.clone()).unwrap().unwrap();
             let record = ImmutableRecord::from_bin_record(row.payload().to_vec());
-            let values = record.get_values();
-            let foo = values.first().unwrap();
+            let foo = record.iter().unwrap().next().unwrap().unwrap();
             let ValueRef::Text(foo) = foo else {
                 unreachable!()
             };
@@ -908,8 +909,7 @@ mod tests {
         for present_rowid in present_rowids {
             let row = mvcc_store.read(tx, present_rowid.clone()).unwrap().unwrap();
             let record = ImmutableRecord::from_bin_record(row.payload().to_vec());
-            let values = record.get_values();
-            let foo = values.first().unwrap();
+            let foo = record.iter().unwrap().next().unwrap().unwrap();
             let ValueRef::Text(foo) = foo else {
                 unreachable!()
             };
@@ -981,7 +981,7 @@ mod tests {
                 .unwrap()
                 .expect("Table row should exist");
             let record = ImmutableRecord::from_bin_record(row.payload().to_vec());
-            let values = record.get_values();
+            let values = record.get_values().unwrap();
             let data_value = values.get(1).expect("Should have data column");
             let ValueRef::Text(data_text) = data_value else {
                 panic!("Data column should be text");
@@ -1022,7 +1022,7 @@ mod tests {
                 panic!("Index row should have a record row_id");
             };
             let record = sortable_key.key.clone();
-            let values = record.get_values();
+            let values = record.get_values().unwrap();
             assert_eq!(
                 values.len(),
                 2,

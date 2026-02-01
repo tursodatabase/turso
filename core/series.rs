@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use crate::sync::Arc;
 
 use turso_ext::{
     Connection, ConstraintInfo, ConstraintOp, ConstraintUsage, ExtensionApi, IndexInfo,

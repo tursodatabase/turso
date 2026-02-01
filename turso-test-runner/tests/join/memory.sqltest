@@ -1,0 +1,371 @@
+@database :memory:
+
+# regression test for issue 2794: not nulling out rowid properly when left join does not match
+test min-null-regression-test {
+    create table t (x integer primary key, y);
+    create table u (x integer primary key, y);
+    insert into t values (1,1),(2,2);
+    insert into u values (1,1),(3,3);
+    select count(u.x) from t left join u using(y);
+}
+expect {
+    1
+}
+
+# regression test for issue 2949: consuming WHERE terms not originating from the LEFT JOIN
+test left-join-seek-key-regression-test {
+    CREATE TABLE t (x INTEGER PRIMARY KEY);
+    CREATE TABLE u (x INTEGER PRIMARY KEY);
+    INSERT INTO t VALUES (1);
+    SELECT * FROM t LEFT JOIN u ON false WHERE u.x = 1;
+}
+expect {
+}
+
+# regression test for issue 2924: calling Next on a cursor that hasn't moved yet
+test next-crash {
+    create table a(x int primary key,y);
+    create table b(x int primary key,y);
+    create table c(x int primary key,y);
+    insert into a values (1,1),(2,2);
+    select a.x, b.x, c.x from a left join b on a.y=b.x left join c on b.y=c.x;
+}
+expect {
+    1||
+    2||
+}
+
+# regression test for crash in op_column
+test left-join-column-crash {
+    create table a(x int primary key,y);
+    create table b(x int primary key,y);
+    insert into a values (1,1),(2,2);
+    insert into b values (3,3),(4,4);
+    select * from a left join b on a.x < 2 where a.x < 3 and b.x < 12;
+}
+expect {
+    1|1|3|3
+    1|1|4|4
+}
+
+# regression test for ignoring ON clause when LEFT JOIN uses a FROM clause subquery
+test left-join-subquery-on {
+    CREATE TABLE t1(a INTEGER);
+    INSERT INTO t1 VALUES (1),(2),(3);
+    CREATE TABLE t2(b INTEGER);
+    INSERT INTO t2 VALUES (2),(4);
+    SELECT a, b FROM t1 LEFT JOIN (SELECT * FROM t2 WHERE b > 2) ON t1.a = b ORDER BY a;
+}
+expect {
+    1|
+    2|
+    3|
+}
+
+# Test that column names in USING clause are not ambiguous since they are deduplicated.
+# The column 'a' appears in both tables but can be referenced unqualified in the SELECT
+# since it's in the USING clause.
+test using-deduplicates-columns {
+    create table t(a);
+    create table tt(a);
+    insert into t values (1),(2),(3),(4),(5);
+    insert into tt values (4),(5),(6),(7),(8);
+    select a from t join tt using(a);
+}
+expect {
+    4
+    5
+}
+
+# regression test for https://github.com/tursodatabase/turso/issues/3470
+test left-join-where-clause-regression {
+    create table t(a);
+    create table s(a);
+    insert into t values (1), (2);
+    insert into s values (2);
+    select t.a, s.a from t left join s on t.a=s.a where t.a = 2;
+    select t.a, s.a from t left join s on t.a=s.a where s.a = 2;
+}
+expect {
+    2|2
+    2|2
+}
+
+# Regression test for: https://github.com/tursodatabase/turso/issues/3468
+test left-join-using-star-vs-explicit {
+    create table t(a, tb);
+    create table s(a, sb);
+    insert into t values (1, 't1'), (2, 't2');
+    insert into s values (1, 's1'), (3, 's3');
+    select * from t left join s using(a);
+    select a, tb, sb from t left join s using(a);
+}
+expect {
+    1|t1|s1
+    2|t2|
+    1|t1|s1
+    2|t2|
+}
+
+test left-join-using-null {
+    create table t(a, b);
+    create table s(a, b);
+    insert into t values (1, null), (2, null);
+    insert into s values (1, null), (2, null);
+    select a, b from t left join s using (a, b);
+}
+expect {
+    1|
+    2|
+}
+
+# Regression test for: https://github.com/tursodatabase/turso/issues/3656
+test redundant-join-condition {
+    create table t(x);
+    insert into t values ('lol');
+    select t1.x from t t1 join t t2 on t1.x=t2.x where t1.x=t2.x;
+}
+expect {
+    lol
+}
+
+# Regression test for: https://github.com/tursodatabase/turso/issues/4098
+test left-join-duplicate-column-constraints {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, a INT, c INT);
+    CREATE TABLE t2(id INTEGER PRIMARY KEY, a INT, c INT);
+    CREATE TABLE t3(id INTEGER PRIMARY KEY, b INT);
+    INSERT INTO t1 VALUES (1, 17, 20);
+    INSERT INTO t2 VALUES (1, 17, 20);
+    INSERT INTO t3 VALUES (1, 17);
+    SELECT t1.a, t2.a, t2.c, t3.b FROM t1 LEFT JOIN t2 ON t1.a = t2.a AND t1.c = t2.c LEFT JOIN t3 ON t2.a = t3.b WHERE t2.a = 17;
+}
+expect {
+    17|17|20|17
+}
+
+test test-spill-hash-join-count {
+    CREATE TABLE t(a,b);
+    CREATE TABLE t2(a,b);
+    -- insert 150 rows @ 10kb/ea into each table to ensure the hash table we build is much large enough to trigger spilling
+    INSERT INTO t SELECT replace(substr(quote(zeroblob((1024*10 + 1) / 2)), 3, 1024*10), '0', 'a'), 'abcdef' FROM generate_series(1,150);
+    INSERT INTO t2 SELECT replace(substr(quote(zeroblob((1024*10 + 1) / 2)), 3,1024*10), '0', 'a'), 'abcdef' FROM generate_series(1,150);
+    -- uses hash join because we have no indexes on either column
+    SELECT count(*) FROM t JOIN t2 ON t.a = t2.a;
+}
+expect {
+    22500
+}
+
+test test-spill-hash-join-rows {
+    CREATE TABLE t(a,b);
+    CREATE TABLE t2(a,b);
+    -- insert 150 rows @ 10kb/ea into each table to ensure the hash table we build is much large enough to trigger spilling
+    INSERT INTO t SELECT replace(substr(quote(zeroblob((1024*10 + 1) / 2)), 3, 1024*10), '0', 'a'), 'abcdef' FROM generate_series(1,150);
+    INSERT INTO t2 SELECT replace(substr(quote(zeroblob((1024*10 + 1) / 2)), 3,1024*10), '0', 'a'), 'abcdef' FROM generate_series(1,150);
+    -- uses hash join because we have no indexes on either column
+    SELECT substr(t.a, 1,4), substr(t2.b, 1, 4) FROM t JOIN t2 ON t.a = t2.a limit 2;
+}
+expect {
+    aaaa|abcd
+    aaaa|abcd
+}
+
+test inner-join-using-null {
+    create table t(a, b);
+    create table s(a, b);
+    insert into t values (1, null), (2, null);
+    insert into s values (1, null), (2, null);
+    select a, b from t join s using (a, b);
+}
+expect {
+}
+
+test left-join-null-probe-key {
+    create table t(a, b);
+    create table s(a, b);
+    insert into t values (1, 'x'), (null, 'y');
+    insert into s values (1, 'x');
+    select t.a, t.b, s.a, s.b
+    from t
+    left join s on t.a = s.a and t.b = s.b
+    order by t.rowid;
+}
+expect {
+    1|x|1|x
+    |y||
+}
+
+test three-way-left-chain-null {
+    create table t(a, b);
+    create table u(a, b);
+    create table v(a, b);
+    insert into t values (1, 't1'), (2, 't2'), (3, null);
+    insert into u values (1, 'u1'), (2, null);
+    insert into v values (1, 'v1'), (2, 'v2'), (3, 'v3');
+    select t.a, t.b, u.b, v.b
+    from t
+    left join u on t.a = u.a and t.b = u.b
+    left join v on t.a = v.a
+    order by t.a;
+}
+expect {
+    1|t1||v1
+    2|t2||v2
+    3|||v3
+}
+
+test three-way-inner-using-null {
+    create table t(a, b);
+    create table u(a, b);
+    create table v(a, b);
+    insert into t values (1, 'x'), (2, null), (3, 'z');
+    insert into u values (1, 'x'), (2, null), (3, 'z');
+    insert into v values (1, 'x'), (2, null), (3, 'z');
+    select a, b, '|' as sep
+    from t
+    join u using(a, b)
+    join v using(a, b)
+    order by a;
+}
+expect {
+    1|x||
+    3|z||
+}
+
+test four-way-left-joins-null-keys {
+    create table t(a, b);
+    create table u(a, b);
+    create table v(a, b);
+    create table w(a, b);
+    insert into t values (1, 't1'), (2, null);
+    insert into u values (1, 't1'), (2, 'u2');
+    insert into v values (1, 'v1'), (2, null);
+    insert into w values (1, 'w1');
+    select t.a, t.b, u.b, v.b, w.b
+    from t
+    left join u on t.a = u.a and t.b = u.b
+    left join v on t.a = v.a and t.b = v.b
+    left join w on t.a = w.a
+    order by t.a;
+}
+expect {
+    1|t1|t1||w1
+    2||||
+}
+
+test left-join-integer-real {
+    CREATE TABLE IF NOT EXISTS t1 (a INTEGER, b INTEGER);
+    CREATE TABLE IF NOT EXISTS t2 (a INTEGER, c REAL);
+    INSERT INTO t1 (a, b) VALUES (1, NULL), (2, 10);
+    INSERT INTO t2 (a, c) VALUES (1, 10.0), (3, NULL);
+    SELECT * FROM t1 LEFT JOIN t2 ON t1.b = t2.c;
+}
+expect {
+    1|||
+    2|10|1|10.0
+}
+expect @js {
+    1|||
+    2|10|1|10
+}
+
+test left-join-real-integer {
+    CREATE TABLE IF NOT EXISTS t3 (a INTEGER, b REAL);
+    CREATE TABLE IF NOT EXISTS t4 (a INTEGER, c INTEGER);
+    INSERT INTO t3 (a, b) VALUES (1, NULL), (2, 10.0);
+    INSERT INTO t4 (a, c) VALUES (1, 10), (3, NULL);
+    SELECT * FROM t3 LEFT JOIN t4 ON t3.b = t4.c;
+}
+expect {
+    1|||
+    2|10.0|1|10
+}
+expect @js {
+    1|||
+    2|10|1|10
+}
+
+test inner-join-integer-real {
+    CREATE TABLE IF NOT EXISTS t5 (a INTEGER, b INTEGER);
+    CREATE TABLE IF NOT EXISTS t6 (a INTEGER, c REAL);
+    INSERT INTO t5 (a, b) VALUES (1, 5), (2, 10), (3, 15);
+    INSERT INTO t6 (a, c) VALUES (1, 10.0), (2, 20.0), (3, 5.0);
+    SELECT t5.a, t5.b, t6.a, t6.c FROM t5 INNER JOIN t6 ON t5.b = t6.c ORDER BY t5.a;
+}
+expect {
+    1|5|3|5.0
+    2|10|1|10.0
+}
+expect @js {
+    1|5|3|5
+    2|10|1|10
+}
+
+test left-join-integer-real-zero {
+    CREATE TABLE IF NOT EXISTS t7 (a INTEGER, b INTEGER);
+    CREATE TABLE IF NOT EXISTS t8 (a INTEGER, c REAL);
+    INSERT INTO t7 (a, b) VALUES (1, 0);
+    INSERT INTO t8 (a, c) VALUES (1, 0.0);
+    SELECT * FROM t7 LEFT JOIN t8 ON t7.b = t8.c;
+}
+expect {
+    1|0|1|0.0
+}
+expect @js {
+    1|0|1|0
+}
+
+test left-join-integer-real-negative {
+    CREATE TABLE IF NOT EXISTS t9 (a INTEGER, b INTEGER);
+    CREATE TABLE IF NOT EXISTS t10 (a INTEGER, c REAL);
+    INSERT INTO t9 (a, b) VALUES (1, -10);
+    INSERT INTO t10 (a, c) VALUES (1, -10.0);
+    SELECT * FROM t9 LEFT JOIN t10 ON t9.b = t10.c;
+}
+expect {
+    1|-10|1|-10.0
+}
+expect @js {
+    1|-10|1|-10
+}
+
+test left-join-integer-real-no-match {
+    CREATE TABLE IF NOT EXISTS t11 (a INTEGER, b INTEGER);
+    CREATE TABLE IF NOT EXISTS t12 (a INTEGER, c REAL);
+    INSERT INTO t11 (a, b) VALUES (1, 10);
+    INSERT INTO t12 (a, c) VALUES (1, 10.5);
+    SELECT * FROM t11 LEFT JOIN t12 ON t11.b = t12.c;
+}
+expect {
+    1|10||
+}
+
+test left-join-integer-real-multi-key {
+    CREATE TABLE IF NOT EXISTS t13 (a INTEGER, b INTEGER, c INTEGER);
+    CREATE TABLE IF NOT EXISTS t14 (a INTEGER, b REAL, c REAL);
+    INSERT INTO t13 (a, b, c) VALUES (1, 10, 20);
+    INSERT INTO t14 (a, b, c) VALUES (1, 10.0, 20.0);
+    SELECT * FROM t13 LEFT JOIN t14 ON t13.b = t14.b AND t13.c = t14.c;
+}
+expect {
+    1|10|20|1|10.0|20.0
+}
+expect @js {
+    1|10|20|1|10|20
+}
+
+test affinity-hash-join {
+    CREATE TABLE x(a INTEGER);
+    CREATE TABLE y(b TEXT);
+    INSERT INTO x VALUES (2),(3);
+    INSERT INTO y VALUES ('02'),('2'),('2.0'),('3x'),('3.5');
+    SELECT a, b
+    FROM x JOIN y ON a = b
+    ORDER BY a, b;
+}
+expect {
+    2|02
+    2|2
+    2|2.0
+}
+
