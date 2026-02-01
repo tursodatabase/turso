@@ -370,3 +370,57 @@ expect @js {
     real|100000
     real|-100000
 }
+
+test affinity-real-large-int-ne {
+    CREATE TABLE t1 (x REAL);
+    INSERT INTO t1 VALUES (7417939124117640360);
+    SELECT x != 7417939124117640360 FROM t1;
+}
+expect {
+    1
+}
+
+test affinity-real-large-int-eq {
+    CREATE TABLE t1 (x REAL);
+    INSERT INTO t1 VALUES (7417939124117640360);
+    SELECT x = 7417939124117640360 FROM t1;
+}
+expect {
+    0
+}
+
+test affinity-real-large-int-comparison {
+    CREATE TABLE t1 (x REAL);
+    INSERT INTO t1 VALUES (9007199254740993);
+    SELECT x = 9007199254740993, x != 9007199254740993 FROM t1;
+}
+expect {
+    0|1
+}
+
+test affinity-text-float-no-match {
+    CREATE TABLE t1 (x TEXT);
+    INSERT INTO t1 VALUES ('3462429749.397455');
+    SELECT COUNT(*) FROM t1 WHERE x = 3462429749.397455;
+}
+expect {
+    0
+}
+
+test affinity-text-float-match {
+    CREATE TABLE t1 (x TEXT);
+    INSERT INTO t1 VALUES ('3.14');
+    SELECT COUNT(*) FROM t1 WHERE x = 3.14;
+}
+expect {
+    1
+}
+
+test affinity-text-float-precision {
+    CREATE TABLE t1 (x TEXT);
+    INSERT INTO t1 VALUES ('3462429749.39746');
+    SELECT COUNT(*) FROM t1 WHERE x = 3462429749.397455;
+}
+expect {
+    1
+}

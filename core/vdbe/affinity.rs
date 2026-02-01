@@ -203,15 +203,13 @@ impl Affinity {
             }
 
             Affinity::Real => {
-                let mut left = is_text
+                // REAL affinity only converts TEXT to numeric for comparisons.
+                // Integer values are NOT converted to Float, this preserves precision
+                // for large integers that can't be exactly represented as f64.
+                is_text
                     .then(|| apply_numeric_affinity(val, false))
-                    .flatten();
-
-                if let ValueRef::Integer(i) = left.unwrap_or(val) {
-                    left = Some(ValueRef::Float(i as f64));
-                }
-
-                left.map(Either::Left)
+                    .flatten()
+                    .map(Either::Left)
             }
 
             Affinity::Blob => None, // Do nothing for blob affinity.
