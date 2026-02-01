@@ -5250,18 +5250,28 @@ pub fn op_function(
             }
             ScalarFunc::SqliteCompileOptionGet => {
                 assert_eq!(arg_count, 1);
-                let n = extract_int_value(state.registers[*start_reg].get_value());
-                let option = execute_sqlite_compileoption_get(n as i32);
-                state.registers[*dest] = match option {
-                    Some(opt) => Register::Value(Value::build_text(opt)),
-                    None => Register::Value(Value::Null),
-                };
+                let val = state.registers[*start_reg].get_value();
+                if matches!(val, Value::Null) {
+                    state.registers[*dest] = Register::Value(Value::Null);
+                } else {
+                    let n = extract_int_value(val);
+                    let option = execute_sqlite_compileoption_get(n);
+                    state.registers[*dest] = match option {
+                        Some(opt) => Register::Value(Value::build_text(opt)),
+                        None => Register::Value(Value::Null),
+                    };
+                }
             }
             ScalarFunc::SqliteCompileOptionUsed => {
                 assert_eq!(arg_count, 1);
-                let name = state.registers[*start_reg].get_value().to_string();
-                let used = execute_sqlite_compileoption_used(&name);
-                state.registers[*dest] = Register::Value(Value::Integer(if used { 1 } else { 0 }));
+                let val = state.registers[*start_reg].get_value();
+                if matches!(val, Value::Null) {
+                    state.registers[*dest] = Register::Value(Value::Null);
+                } else {
+                    let name = val.to_string();
+                    let used = execute_sqlite_compileoption_used(&name);
+                    state.registers[*dest] = Register::Value(Value::Integer(if used { 1 } else { 0 }));
+                }
             }
             ScalarFunc::Replace => {
                 assert_eq!(arg_count, 3);
@@ -9841,18 +9851,25 @@ const COMPILE_OPTIONS: &[&str] = &[
     "THREADSAFE=1",
 ];
 
-fn execute_sqlite_compileoption_get(n: i32) -> Option<String> {
-    if n >= 0 && (n as usize) < COMPILE_OPTIONS.len() {
-        Some(COMPILE_OPTIONS[n as usize].to_string())
+fn execute_sqlite_compileoption_get(n: i64) -> Option<String> {
+    let idx: usize = n.try_into().ok()?;
+    if idx < COMPILE_OPTIONS.len() {
+        Some(COMPILE_OPTIONS[idx].to_string())
     } else {
         None
     }
 }
 
 fn execute_sqlite_compileoption_used(name: &str) -> bool {
+    let target = if name.len() >= 7 && name[..7].eq_ignore_ascii_case("SQLITE_") {
+        &name[7..]
+    } else {
+        name
+    };
+
     COMPILE_OPTIONS
         .iter()
-        .any(|opt| opt.eq_ignore_ascii_case(name))
+        .any(|opt| opt.eq_ignore_ascii_case(target))
 }
 
 // Compat for applications that test for SQLite.
@@ -10321,6 +10338,8 @@ mod tests {
         assert!(execute_sqlite_compileoption_used("SYSTEM_MALLOC"));
         assert!(execute_sqlite_compileoption_used("THREADSAFE=1"));
         assert!(execute_sqlite_compileoption_used("system_malloc")); // Case insensitive
+        assert!(execute_sqlite_compileoption_used("SQLITE_SYSTEM_MALLOC")); // Prefix stripping
+        assert!(execute_sqlite_compileoption_used("sqlite_system_malloc")); // Prefix stripping case insensitive
         assert!(!execute_sqlite_compileoption_used("NON_EXISTENT_OPTION"));
 
         // Test get
@@ -10329,10 +10348,10 @@ mod tests {
         let opt0 = opt0.unwrap();
         assert!(execute_sqlite_compileoption_used(&opt0));
 
-        let opt_last = execute_sqlite_compileoption_get((COMPILE_OPTIONS.len() - 1) as i32);
+        let opt_last = execute_sqlite_compileoption_get((COMPILE_OPTIONS.len() - 1) as i64);
         assert!(opt_last.is_some());
 
-        let opt_out_of_bounds = execute_sqlite_compileoption_get(COMPILE_OPTIONS.len() as i32);
+        let opt_out_of_bounds = execute_sqlite_compileoption_get(COMPILE_OPTIONS.len() as i64);
         assert!(opt_out_of_bounds.is_none());
     }
 
