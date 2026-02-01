@@ -27,6 +27,7 @@ COPY tests ./tests/
 COPY packages ./packages/
 COPY testing ./testing/
 COPY sql_generation ./sql_generation/
+COPY std ./std/
 COPY sdk-kit ./sdk-kit/
 COPY sdk-kit-macros ./sdk-kit-macros/
 RUN cargo chef prepare --bin differential_fuzzer --recipe-path recipe.json
@@ -48,6 +49,7 @@ COPY --from=planner /app/perf/throughput/rusqlite ./perf/throughput/rusqlite
 COPY --from=planner /app/perf/throughput/turso ./perf/throughput/turso
 COPY --from=planner /app/packages ./packages/
 COPY --from=planner /app/sql_generation ./sql_generation/
+COPY --from=planner /app/std ./std/
 COPY --from=planner /app/testing ./testing/
 COPY --from=planner /app/Cargo.toml /app/Cargo.lock ./
 
