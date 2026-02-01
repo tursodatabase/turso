@@ -1,5 +1,60 @@
 use std::fmt;
 
+/// Hash join spill/probe metrics.
+#[derive(Debug, Default, Clone)]
+pub struct HashJoinMetrics {
+    // Spill metrics
+    pub spill_bytes_written: u64,
+    pub spill_chunks: u64,
+    pub spill_max_chunks_per_partition: u64,
+    pub spill_max_partition_bytes: u64,
+
+    // Load metrics
+    pub load_bytes_read: u64,
+    pub partition_loads: u64,
+    pub partition_evictions: u64,
+    pub max_loaded_partitions_mem: u64,
+
+    // Probe metrics
+    pub probe_calls: u64,
+    pub probe_partition_switches: u64,
+
+    // I/O wait time (nanoseconds)
+    pub io_wait_nanos: u64,
+}
+
+impl HashJoinMetrics {
+    pub fn merge(&mut self, other: &HashJoinMetrics) {
+        self.spill_bytes_written = self
+            .spill_bytes_written
+            .saturating_add(other.spill_bytes_written);
+        self.spill_chunks = self.spill_chunks.saturating_add(other.spill_chunks);
+        self.spill_max_chunks_per_partition = self
+            .spill_max_chunks_per_partition
+            .max(other.spill_max_chunks_per_partition);
+        self.spill_max_partition_bytes = self
+            .spill_max_partition_bytes
+            .max(other.spill_max_partition_bytes);
+        self.load_bytes_read = self.load_bytes_read.saturating_add(other.load_bytes_read);
+        self.partition_loads = self.partition_loads.saturating_add(other.partition_loads);
+        self.partition_evictions = self
+            .partition_evictions
+            .saturating_add(other.partition_evictions);
+        self.max_loaded_partitions_mem = self
+            .max_loaded_partitions_mem
+            .max(other.max_loaded_partitions_mem);
+        self.probe_calls = self.probe_calls.saturating_add(other.probe_calls);
+        self.probe_partition_switches = self
+            .probe_partition_switches
+            .saturating_add(other.probe_partition_switches);
+        self.io_wait_nanos = self.io_wait_nanos.saturating_add(other.io_wait_nanos);
+    }
+
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
 /// Statement-level execution metrics
 ///
 /// These metrics are collected unconditionally during statement execution
@@ -27,6 +82,9 @@ pub struct StatementMetrics {
     pub btree_seeks: u64,
     pub btree_next: u64,
     pub btree_prev: u64,
+
+    // Hash join spill/probe metrics
+    pub hash_join: HashJoinMetrics,
 }
 
 impl StatementMetrics {
@@ -54,6 +112,7 @@ impl StatementMetrics {
         self.btree_seeks = self.btree_seeks.saturating_add(other.btree_seeks);
         self.btree_next = self.btree_next.saturating_add(other.btree_next);
         self.btree_prev = self.btree_prev.saturating_add(other.btree_prev);
+        self.hash_join.merge(&other.hash_join);
     }
 
     /// Reset all counters to zero
@@ -81,6 +140,50 @@ impl fmt::Display for StatementMetrics {
         writeln!(f, "    Seeks:            {}", self.btree_seeks)?;
         writeln!(f, "    Next:             {}", self.btree_next)?;
         writeln!(f, "    Prev:             {}", self.btree_prev)?;
+        writeln!(f, "  Hash Join:")?;
+        writeln!(
+            f,
+            "    Spill bytes:      {}",
+            self.hash_join.spill_bytes_written
+        )?;
+        writeln!(f, "    Spill chunks:     {}", self.hash_join.spill_chunks)?;
+        writeln!(
+            f,
+            "    Max chunks/part:  {}",
+            self.hash_join.spill_max_chunks_per_partition
+        )?;
+        writeln!(
+            f,
+            "    Max part bytes:   {}",
+            self.hash_join.spill_max_partition_bytes
+        )?;
+        writeln!(
+            f,
+            "    Load bytes:       {}",
+            self.hash_join.load_bytes_read
+        )?;
+        writeln!(
+            f,
+            "    Partition loads:  {}",
+            self.hash_join.partition_loads
+        )?;
+        writeln!(
+            f,
+            "    Evictions:        {}",
+            self.hash_join.partition_evictions
+        )?;
+        writeln!(
+            f,
+            "    Peak loaded mem:  {}",
+            self.hash_join.max_loaded_partitions_mem
+        )?;
+        writeln!(f, "    Probes:           {}", self.hash_join.probe_calls)?;
+        writeln!(
+            f,
+            "    Partition switches: {}",
+            self.hash_join.probe_partition_switches
+        )?;
+        writeln!(f, "    IO wait (ns):     {}", self.hash_join.io_wait_nanos)?;
         Ok(())
     }
 }
@@ -166,14 +269,19 @@ mod tests {
         let mut m1 = StatementMetrics::new();
         m1.rows_read = 100;
         m1.vm_steps = 50;
+        m1.hash_join.spill_bytes_written = 42;
 
         let mut m2 = StatementMetrics::new();
         m2.rows_read = 200;
         m2.vm_steps = 75;
+        m2.hash_join.spill_bytes_written = 8;
+        m2.hash_join.spill_max_partition_bytes = 1024;
 
         m1.merge(&m2);
         assert_eq!(m1.rows_read, 300);
         assert_eq!(m1.vm_steps, 125);
+        assert_eq!(m1.hash_join.spill_bytes_written, 50);
+        assert_eq!(m1.hash_join.spill_max_partition_bytes, 1024);
     }
 
     #[test]
