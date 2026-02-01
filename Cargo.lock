@@ -6180,7 +6180,7 @@ dependencies = [
 
 [[package]]
 name = "turso-std"
-version = "0.5.0-pre.5"
+version = "0.5.0-pre.13"
 dependencies = [
  "parking_lot",
  "shuttle",
@@ -6295,6 +6295,7 @@ dependencies = [
  "thiserror 2.0.16",
  "tracing",
  "tracing-subscriber",
+ "turso-std",
  "turso_ext",
  "turso_macros",
  "turso_parser",

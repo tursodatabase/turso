@@ -136,6 +136,12 @@ pub use vdbe::{
     FromValueRow, PrepareContext, PreparedProgram, Program, Register,
 };
 
+#[cfg(feature = "cli_only")]
+pub mod dbpage;
+
+pub(crate) use turso_std::sync;
+pub(crate) use turso_std::thread;
+
 /// Configuration for database features
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct DatabaseOpts {
