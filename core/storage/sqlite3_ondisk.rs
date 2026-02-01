@@ -1235,6 +1235,29 @@ pub fn read_varint(buf: &[u8]) -> Result<(u64, usize)> {
     }
 }
 
+#[inline(always)]
+/// Reads a varint from the buffer, returning None if more data is needed.
+pub fn read_varint_partial(buf: &[u8]) -> Result<Option<(u64, usize)>> {
+    let mut v: u64 = 0;
+    for i in 0..8 {
+        let Some(&c) = buf.get(i) else {
+            return Ok(None);
+        };
+        v = (v << 7) + (c & 0x7f) as u64;
+        if (c & 0x80) == 0 {
+            return Ok(Some((v, i + 1)));
+        }
+    }
+    let Some(&c) = buf.get(8) else {
+        return Ok(None);
+    };
+    if (v >> 48) == 0 {
+        return Err(LimboError::Corrupt("Invalid varint".into()));
+    }
+    v = (v << 8) + c as u64;
+    Ok(Some((v, 9)))
+}
+
 // This is a branchless function to compute the length of a varint encoding for a given u64 value.
 #[inline(always)]
 pub fn varint_len(value: u64) -> usize {
