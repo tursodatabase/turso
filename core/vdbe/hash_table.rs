@@ -2,10 +2,8 @@ use crate::turso_assert;
 use crate::{
     error::LimboError,
     io::{Buffer, Completion, TempFile, IO},
-    io_yield_one,
-    numeric::Numeric,
-    return_if_io,
-    storage::sqlite3_ondisk::{read_varint, varint_len, write_varint},
+    io_yield_one, return_if_io,
+    storage::sqlite3_ondisk::{read_varint, read_varint_partial, varint_len, write_varint},
     sync::{
         atomic::{self, AtomicUsize},
         Arc, RwLock,
@@ -13,7 +11,7 @@ use crate::{
     translate::collate::CollationSeq,
     types::{IOCompletions, IOResult, Value, ValueRef},
     vdbe::metrics::HashJoinMetrics,
-    CompletionError, Result,
+    CompletionError, Numeric, Result,
 };
 use rapidhash::fast::RapidHasher;
 use std::cmp::Ordering;
@@ -178,28 +176,6 @@ fn keys_equal_distinct(key1: &[Value], key2: &[ValueRef], collations: &[Collatio
         }
     }
     true
-}
-
-/// Reads a varint from the buffer, returning None if more data is needed.
-fn read_varint_partial(buf: &[u8]) -> Result<Option<(u64, usize)>> {
-    let mut v: u64 = 0;
-    for i in 0..8 {
-        let Some(&c) = buf.get(i) else {
-            return Ok(None);
-        };
-        v = (v << 7) + (c & 0x7f) as u64;
-        if (c & 0x80) == 0 {
-            return Ok(Some((v, i + 1)));
-        }
-    }
-    let Some(&c) = buf.get(8) else {
-        return Ok(None);
-    };
-    if (v >> 48) == 0 {
-        return Err(LimboError::Corrupt("Invalid varint".into()));
-    }
-    v = (v << 8) + c as u64;
-    Ok(Some((v, 9)))
 }
 
 /// State machine states for hash table operations.
@@ -2376,9 +2352,8 @@ impl HashTable {
     fn parse_partition_chunk(
         &mut self,
         partition_idx: usize,
-        metrics: Option<&mut HashJoinMetrics>,
+        mut metrics: Option<&mut HashJoinMetrics>,
     ) -> Result<ParseChunkResult> {
-        let mut metrics = metrics;
         let (has_more_chunks, resident_mem) = {
             let spill_state = self.spill_state.as_mut().expect("spill state must exist");
             let partition = spill_state
@@ -2386,7 +2361,7 @@ impl HashTable {
                 .expect("partition must exist for parsing");
 
             let data_len = partition.buffer_len();
-            if let Some(metrics) = metrics.as_deref_mut() {
+            if let Some(metrics) = metrics.as_mut() {
                 metrics.load_bytes_read = metrics.load_bytes_read.saturating_add(data_len as u64);
                 if let Some(start) = partition.read_wait_start.take() {
                     metrics.io_wait_nanos = metrics
