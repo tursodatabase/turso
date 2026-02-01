@@ -6376,6 +6376,7 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "turso-std",
  "turso_core",
  "turso_sdk_kit_macros",
 ]

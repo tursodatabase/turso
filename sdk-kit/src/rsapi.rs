@@ -1,12 +1,9 @@
 use std::{
-    borrow::Cow,
-    collections::HashMap,
-    fmt::Display,
-    ops::Deref,
-    sync::{Arc, Mutex, Once, RwLock},
-    task::Waker,
+    borrow::Cow, collections::HashMap, fmt::Display, ops::Deref, sync::Once, task::Waker,
     time::Duration,
 };
+
+use turso_std::sync::{Arc, Mutex, RwLock};
 
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::{
@@ -481,7 +478,7 @@ where
 
 pub fn turso_setup(config: TursoSetupConfig) -> Result<(), TursoError> {
     fn callback(log: TursoLog<'_>) {
-        let Ok(logger) = LOGGER.try_read() else {
+        let Some(logger) = LOGGER.try_read() else {
             return;
         };
 
@@ -491,7 +488,7 @@ pub fn turso_setup(config: TursoSetupConfig) -> Result<(), TursoError> {
     }
 
     if let Some(logger) = config.logger {
-        let mut guard = LOGGER.write().unwrap();
+        let mut guard = LOGGER.write();
         *guard = Some(logger);
     }
 
@@ -530,7 +527,7 @@ impl TursoDatabase {
     }
     /// method to get [turso_core::Database] instance which can be useful for code which integrates with sdk-kit
     pub fn db_core(&self) -> Result<Arc<turso_core::Database>, TursoError> {
-        let db = self.db.lock().unwrap();
+        let db = self.db.lock();
         match &*db {
             Some(db) => Ok(db.clone()),
             None => Err(TursoError::Misuse("database must be opened".to_string())),
@@ -539,7 +536,7 @@ impl TursoDatabase {
 
     /// method to get [turso_core::IO] instance which can be useful for code which integrates with sdk-kit
     pub fn io(&self) -> Result<Arc<dyn turso_core::IO>, TursoError> {
-        let io = self.io.lock().unwrap();
+        let io = self.io.lock();
         match &*io {
             Some(io) => Ok(io.clone()),
             None => Err(TursoError::Misuse("io must be opened".to_string())),
@@ -611,10 +608,10 @@ impl TursoDatabase {
     /// This is useful for environments where IO operations must be executed in a specific fashion.
     pub fn open(&self) -> Result<IOResult<()>, TursoError> {
         loop {
-            let mut state = self.open_state.lock().unwrap();
+            let mut state = self.open_state.lock();
             match state.phase {
                 TursoDatabaseOpenPhase::Init => {
-                    let inner_db = self.db.lock().unwrap();
+                    let inner_db = self.db.lock();
                     if inner_db.is_some() {
                         return Err(TursoError::Misuse(
                             "database must be opened only once".to_string(),
@@ -625,7 +622,7 @@ impl TursoDatabase {
                     let io: Arc<dyn turso_core::IO> = self.open_vfs_io()?;
 
                     // Store the IO so that it can be retrieved with `io()` call even if the database is still opening
-                    *self.io.lock().unwrap() = Some(io.clone());
+                    *self.io.lock() = Some(io.clone());
 
                     let open_flags = OpenFlags::default();
                     let db_file = if let Some(db_file) = &self.config.db_file {
@@ -686,7 +683,7 @@ impl TursoDatabase {
                         self.config.encryption.clone(),
                     )? {
                         IOResult::Done(db) => {
-                            let mut inner_db = self.db.lock().unwrap();
+                            let mut inner_db = self.db.lock();
                             *inner_db = Some(db);
                             state.phase = TursoDatabaseOpenPhase::Done;
                             return Ok(IOResult::Done(()));
@@ -711,7 +708,7 @@ impl TursoDatabase {
     /// creates database connection
     /// database must be already opened with [Self::open] method
     pub fn connect(&self) -> Result<Arc<TursoConnection>, TursoError> {
-        let inner_db = self.db.lock().unwrap();
+        let inner_db = self.db.lock();
         let Some(db) = inner_db.as_ref() else {
             return Err(TursoError::Misuse(
                 "database must be opened first".to_string(),
@@ -812,7 +809,7 @@ impl TursoConnection {
         let sql_str = sql.as_ref();
 
         // Check if we have a cached version
-        if let Some(cached) = self.cached_statements.lock().unwrap().get(sql_str) {
+        if let Some(cached) = self.cached_statements.lock().get(sql_str) {
             if cached.program.is_compatible_with(&self.connection) {
                 let program = turso_core::Program::from_prepared(
                     cached.program.clone(),
@@ -838,7 +835,6 @@ impl TursoConnection {
         });
         self.cached_statements
             .lock()
-            .unwrap()
             .insert(sql_str.to_string(), cached);
 
         Ok(Box::new(TursoStatement {
