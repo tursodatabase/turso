@@ -124,8 +124,8 @@ pub use vdbe::{
 #[cfg(feature = "cli_only")]
 pub mod dbpage;
 
-pub(crate) mod sync;
-pub(crate) mod thread;
+pub(crate) use turso_std::sync;
+pub(crate) use turso_std::thread;
 
 /// Configuration for database features
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
