@@ -6141,6 +6141,7 @@ dependencies = [
  "rand_chacha 0.9.0",
  "reqwest",
  "serde_json",
+ "shuttle",
  "tempfile",
  "thiserror 2.0.16",
  "tokio",
