@@ -1,6 +1,6 @@
 use crate::assert_send_sync;
-use crate::sync_primitives::atomic::{AtomicU8, Ordering};
-use crate::sync_primitives::{Arc, Mutex};
+use turso_std::sync::atomic::{AtomicU8, Ordering};
+use turso_std::sync::{Arc, Mutex};
 use crate::transaction::DropBehavior;
 use crate::transaction::TransactionBehavior;
 use crate::Error;
