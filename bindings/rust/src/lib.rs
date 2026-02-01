@@ -39,6 +39,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 pub mod connection;
 pub mod params;
 mod rows;
+mod sync_primitives;
 pub mod transaction;
 pub mod value;
 
@@ -54,9 +55,9 @@ pub use params::IntoParams;
 
 use std::fmt::Debug;
 use std::future::Future;
-use std::sync::Arc;
-use std::sync::Mutex;
 use std::task::Poll;
+
+use sync_primitives::{Arc, Mutex};
 
 // Re-exports rows
 pub use crate::rows::{Row, Rows};
