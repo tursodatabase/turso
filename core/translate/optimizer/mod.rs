@@ -1765,6 +1765,9 @@ fn maybe_remove_index_candidate(
                 ColumnTarget::Column(col_no) => {
                     idx.columns.iter().find(|ic| ic.pos_in_table == *col_no)
                 }
+                ColumnTarget::RowId => {
+                    continue;
+                }
                 ColumnTarget::Expr(_expr) => {
                     continue;
                 }

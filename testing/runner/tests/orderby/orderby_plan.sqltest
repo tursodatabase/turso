@@ -1,0 +1,26 @@
+@database :memory:
+@skip-file-if mvcc "mvcc has slightly different cursor ids, so skipping it for now"
+
+setup orderby_temp_btree {
+    CREATE TABLE t(a);
+}
+
+@setup orderby_temp_btree
+snapshot orderby_a_uses_temp_btree {
+    SELECT * FROM t ORDER BY a;
+}
+
+@setup orderby_temp_btree
+snapshot orderby_a_desc_uses_temp_btree {
+    SELECT * FROM t ORDER BY a DESC;
+}
+
+@setup orderby_temp_btree
+snapshot orderby_rowid_no_temp_btree {
+    SELECT * FROM t ORDER BY rowid;
+}
+
+@setup orderby_temp_btree
+snapshot orderby_rowid_desc_no_temp_btree {
+    SELECT * FROM t ORDER BY rowid DESC;
+}
