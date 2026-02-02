@@ -144,6 +144,7 @@ func NewTursoSyncDb(ctx context.Context, config TursoSyncDbConfig) (*TursoSyncDb
 		db:        sdb,
 		baseURL:   strings.TrimRight(remoteUrl, "/"),
 		authToken: strings.TrimSpace(config.AuthToken),
+		namespace: config.Namespace,
 		client: &http.Client{
 			// No global timeout to allow long-poll; rely on request context.
 			Transport: &http.Transport{
