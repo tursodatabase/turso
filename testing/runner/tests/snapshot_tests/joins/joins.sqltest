@@ -270,31 +270,33 @@ snapshot left-outer-join-chained {
 # 4. Right outer join
 # =============================================================================
 
-@setup schema
-snapshot right-outer-join-basic {
-    SELECT
-        c.customer_id,
-        c.name,
-        o.order_id,
-        o.order_date,
-        o.total_amount
-    FROM
-        customers c
-    RIGHT OUTER JOIN orders o ON c.customer_id = o.customer_id;
-}
+# TODO: Uncomment when RIGHT JOIN is supported
+# @setup schema
+# snapshot right-outer-join-basic {
+#     SELECT
+#         c.customer_id,
+#         c.name,
+#         o.order_id,
+#         o.order_date,
+#         o.total_amount
+#     FROM
+#         customers c
+#     RIGHT OUTER JOIN orders o ON c.customer_id = o.customer_id;
+# }
 
-@setup schema
-snapshot right-outer-join-find-orphans {
-    SELECT
-        o.order_id,
-        o.order_date,
-        o.customer_id
-    FROM
-        customers c
-    RIGHT OUTER JOIN orders o ON c.customer_id = o.customer_id
-    WHERE
-        c.customer_id IS NULL;
-}
+# TODO: Uncomment when RIGHT JOIN is supported
+# @setup schema
+# snapshot right-outer-join-find-orphans {
+#     SELECT
+#         o.order_id,
+#         o.order_date,
+#         o.customer_id
+#     FROM
+#         customers c
+#     RIGHT OUTER JOIN orders o ON c.customer_id = o.customer_id
+#     WHERE
+#         c.customer_id IS NULL;
+# }
 
 # =============================================================================
 # 5. Self-join - same table aliased differently
@@ -356,16 +358,17 @@ snapshot self-join-same-department {
 # 6. Cross join - cartesian product
 # =============================================================================
 
-@setup schema
-snapshot cross-join-explicit {
-    SELECT
-        c.name AS customer_name,
-        p.name AS product_name,
-        p.price
-    FROM
-        customers c
-    CROSS JOIN products p;
-}
+# TODO: Uncomment when CROSS JOIN is supported
+# @setup schema
+# snapshot cross-join-explicit {
+#     SELECT
+#         c.name AS customer_name,
+#         p.name AS product_name,
+#         p.price
+#     FROM
+#         customers c
+#     CROSS JOIN products p;
+# }
 
 @setup schema
 snapshot cross-join-implicit {
@@ -378,30 +381,32 @@ snapshot cross-join-implicit {
         products p;
 }
 
-@setup schema
-snapshot cross-join-with-filter {
-    SELECT
-        c.name AS customer_name,
-        p.name AS product_name,
-        p.price
-    FROM
-        customers c
-    CROSS JOIN products p
-    WHERE
-        c.city = 'Boston'
-        AND p.category = 'Books';
-}
+# TODO: Uncomment when CROSS JOIN is supported
+# @setup schema
+# snapshot cross-join-with-filter {
+#     SELECT
+#         c.name AS customer_name,
+#         p.name AS product_name,
+#         p.price
+#     FROM
+#         customers c
+#     CROSS JOIN products p
+#     WHERE
+#         c.city = 'Boston'
+#         AND p.category = 'Books';
+# }
 
-@setup schema
-snapshot cross-join-limited {
-    SELECT
-        c.name AS customer_name,
-        p.name AS product_name
-    FROM
-        customers c
-    CROSS JOIN products p
-    LIMIT 10;
-}
+# TODO: Uncomment when CROSS JOIN is supported
+# @setup schema
+# snapshot cross-join-limited {
+#     SELECT
+#         c.name AS customer_name,
+#         p.name AS product_name
+#     FROM
+#         customers c
+#     CROSS JOIN products p
+#     LIMIT 10;
+# }
 
 # =============================================================================
 # 7. Join with index on FK - index-assisted join

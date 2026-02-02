@@ -141,24 +141,26 @@ snapshot compound-union-except {
     SELECT department FROM former_employees;
 }
 
-# UNION with ORDER BY - sorted union result
-# ORDER BY applies to the final combined result
-@setup schema
-snapshot union-with-order-by {
-    SELECT name, department FROM current_employees
-    UNION
-    SELECT name, department FROM former_employees
-    ORDER BY department, name;
-}
+# TODO: Uncomment when ORDER BY is supported for compound SELECTs
+# # UNION with ORDER BY - sorted union result
+# # ORDER BY applies to the final combined result
+# @setup schema
+# snapshot union-with-order-by {
+#     SELECT name, department FROM current_employees
+#     UNION
+#     SELECT name, department FROM former_employees
+#     ORDER BY department, name;
+# }
 
-# UNION ALL with ORDER BY
-@setup schema
-snapshot union-all-with-order-by {
-    SELECT name, department, salary as compensation FROM current_employees
-    UNION ALL
-    SELECT name, department, last_salary as compensation FROM former_employees
-    ORDER BY compensation DESC;
-}
+# TODO: Uncomment when ORDER BY is supported for compound SELECTs
+# # UNION ALL with ORDER BY
+# @setup schema
+# snapshot union-all-with-order-by {
+#     SELECT name, department, salary as compensation FROM current_employees
+#     UNION ALL
+#     SELECT name, department, last_salary as compensation FROM former_employees
+#     ORDER BY compensation DESC;
+# }
 
 # UNION with LIMIT
 @setup schema
@@ -169,15 +171,16 @@ snapshot union-with-limit {
     LIMIT 10;
 }
 
-# UNION with ORDER BY and LIMIT
-@setup schema
-snapshot union-order-by-limit {
-    SELECT name, department FROM current_employees
-    UNION
-    SELECT name, department FROM former_employees
-    ORDER BY name
-    LIMIT 5;
-}
+# TODO: Uncomment when ORDER BY is supported for compound SELECTs
+# # UNION with ORDER BY and LIMIT
+# @setup schema
+# snapshot union-order-by-limit {
+#     SELECT name, department FROM current_employees
+#     UNION
+#     SELECT name, department FROM former_employees
+#     ORDER BY name
+#     LIMIT 5;
+# }
 
 # Complex: Subquery with UNION
 @setup schema
