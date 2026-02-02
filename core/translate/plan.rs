@@ -1318,9 +1318,9 @@ impl JoinedTable {
         explicit_columns: Option<&[String]>,
     ) -> Result<Self> {
         // Get result columns and table references from the plan
-        let (result_columns, table_references) = match &plan {
+        let (result_columns, table_references, is_compound) = match &plan {
             Plan::Select(select_plan) => {
-                (&select_plan.result_columns, &select_plan.table_references)
+                (&select_plan.result_columns, &select_plan.table_references, false)
             }
             Plan::CompoundSelect {
                 left, right_most, ..
@@ -1328,9 +1328,9 @@ impl JoinedTable {
                 // For compound selects, SQLite uses the leftmost select's column names.
                 // The leftmost select is left[0] if the vec is not empty, otherwise right_most.
                 if !left.is_empty() {
-                    (&left[0].0.result_columns, &left[0].0.table_references)
+                    (&left[0].0.result_columns, &left[0].0.table_references, true)
                 } else {
-                    (&right_most.result_columns, &right_most.table_references)
+                    (&right_most.result_columns, &right_most.table_references, true)
                 }
             }
             Plan::Delete(_) | Plan::Update(_) => {
@@ -1358,7 +1358,14 @@ impl JoinedTable {
                 let col_name = explicit_columns
                     .and_then(|cols| cols.get(i).cloned())
                     .or_else(|| rc.name(table_references).map(String::from));
-                let (col_type, type_name) = infer_type_from_expr(&rc.expr, Some(table_references));
+                // Compound SELECT columns have no affinity in SQLite (BLOB).
+                // Inferring type from the leftmost SELECT would incorrectly apply
+                // affinity coercion during comparisons.
+                let (col_type, type_name) = if is_compound {
+                    (Type::Blob, "BLOB")
+                } else {
+                    infer_type_from_expr(&rc.expr, Some(table_references))
+                };
                 Column::new(
                     col_name,
                     type_name.to_string(),
