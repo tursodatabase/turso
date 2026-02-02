@@ -1090,6 +1090,8 @@ impl Value {
 
     pub fn exec_glob(pattern: &str, text: &str) -> Result<bool, LimboError> {
         const MAX_GLOB_PATTERN_LENGTH: usize = 50000;
+        const GLOB_CHARS: [char; 3] = ['*', '?', '['];
+
         if pattern.len() > MAX_GLOB_PATTERN_LENGTH {
             return Err(LimboError::Constraint(
                 "GLOB pattern too complex".to_string(),
@@ -1097,12 +1099,12 @@ impl Value {
         }
 
         // 1. Exact match (no wildcards)
-        if !pattern.contains(['*', '?', '[']) {
+        if !pattern.contains(GLOB_CHARS) {
             return Ok(pattern == text);
         }
 
         // 2. Fast Path: 'abc*' (Prefix)
-        if pattern.ends_with('*') && !pattern[..pattern.len() - 1].contains(['*', '?', '[']) {
+        if pattern.ends_with('*') && !pattern[..pattern.len() - 1].contains(GLOB_CHARS) {
             let prefix = &pattern[..pattern.len() - 1];
             if text.len() >= prefix.len() && text.is_char_boundary(prefix.len()) {
                 return Ok(&text[..prefix.len()] == prefix);
@@ -1111,7 +1113,7 @@ impl Value {
         }
 
         // 3. Fast Path: '*abc' (Suffix)
-        if pattern.starts_with('*') && !pattern[1..].contains(['*', '?', '[']) {
+        if pattern.starts_with('*') && !pattern[1..].contains(GLOB_CHARS) {
             let suffix = &pattern[1..];
             let start = text.len().wrapping_sub(suffix.len());
             if text.len() >= suffix.len() && text.is_char_boundary(start) {
