@@ -18,9 +18,6 @@ pub struct HashJoinMetrics {
     // Probe metrics
     pub probe_calls: u64,
     pub probe_partition_switches: u64,
-
-    // I/O wait time (nanoseconds)
-    pub io_wait_nanos: u64,
 }
 
 impl HashJoinMetrics {
@@ -47,7 +44,6 @@ impl HashJoinMetrics {
         self.probe_partition_switches = self
             .probe_partition_switches
             .saturating_add(other.probe_partition_switches);
-        self.io_wait_nanos = self.io_wait_nanos.saturating_add(other.io_wait_nanos);
     }
 
     pub fn reset(&mut self) {
@@ -183,7 +179,6 @@ impl fmt::Display for StatementMetrics {
             "    Partition switches: {}",
             self.hash_join.probe_partition_switches
         )?;
-        writeln!(f, "    IO wait (ns):     {}", self.hash_join.io_wait_nanos)?;
         Ok(())
     }
 }
