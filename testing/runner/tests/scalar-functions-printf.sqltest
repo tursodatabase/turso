@@ -514,3 +514,140 @@ expect {
     ABC
 }
 
+# Width formatting for integers
+test printf-width-integer-basic {
+    SELECT printf('Number: %5d', 42);
+}
+expect {
+    Number:    42
+}
+
+test printf-width-integer-exact {
+    SELECT printf('Number: %3d', 123);
+}
+expect {
+    Number: 123
+}
+
+test printf-width-integer-smaller {
+    SELECT printf('Number: %2d', 12345);
+}
+expect {
+    Number: 12345
+}
+
+test printf-width-integer-negative-value {
+    SELECT printf('Number: %5d', -42);
+}
+expect {
+    Number:   -42
+}
+
+test printf-width-integer-zero-value {
+    SELECT printf('Number: %5d', 0);
+}
+expect {
+    Number:     0
+}
+
+test printf-width-integer-zero-width {
+    SELECT printf('Number: %0d', 42);
+}
+expect {
+    Number: 42
+}
+
+test printf-width-integer-large-width {
+    SELECT printf('Number: %20d', 42);
+}
+expect {
+    Number:                   42
+}
+
+test printf-width-integer-float-input {
+    SELECT printf('Number: %5d', 42.7);
+}
+expect {
+    Number:    42
+}
+
+test printf-width-integer-negative-float-input {
+    SELECT printf('Number: %5d', -42.9);
+}
+expect {
+    Number:   -42
+}
+
+test printf-width-integer-string-input {
+    SELECT printf('Number: %5d', 'not a number');
+}
+expect {
+    Number:     0
+}
+
+test printf-width-integer-null-input {
+    SELECT printf('Number: %5d', NULL);
+}
+expect {
+    Number:     0
+}
+
+test printf-width-integer-leading-zero {
+    SELECT printf('Number: %01d', 42);
+}
+expect {
+    Number: 42
+}
+
+# Zero-pad formatting
+test printf-zero-pad-basic {
+    SELECT printf('Number: %05d', 42);
+}
+expect {
+    Number: 00042
+}
+
+test printf-zero-pad-negative {
+    SELECT printf('Number: %05d', -42);
+}
+expect {
+    Number: -0042
+}
+
+# Precision formatting
+test printf-precision-basic {
+    SELECT printf('Number: %.3d', 42);
+}
+expect {
+    Number: 042
+}
+
+test printf-precision-negative {
+    SELECT printf('Number: %.3d', -42);
+}
+expect {
+    Number: -042
+}
+
+test printf-precision-zero {
+    SELECT printf('Number: %.0d', 42);
+}
+expect {
+    Number: 42
+}
+
+# Width and precision combined
+test printf-width-precision-basic {
+    SELECT printf('Number: %5.3d', 42);
+}
+expect {
+    Number:   042
+}
+
+test printf-width-precision-negative {
+    SELECT printf('Number: %6.3d', -42);
+}
+expect {
+    Number:   -042
+}
+
