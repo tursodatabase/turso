@@ -113,6 +113,9 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
+    // Finalize properties (e.g., export Elle history)
+    whopper.finalize_properties()?;
+
     // Print Elle analysis instructions if enabled
     if args.elle.is_some() {
         let output_path = &args.elle_output;
@@ -139,8 +142,7 @@ fn build_opts(args: &Args, seed: u64) -> anyhow::Result<WhopperOpts> {
         // Elle mode: only Elle workloads + transactions
         let w: Vec<(u32, Box<dyn Workload>)> = match elle_model {
             ElleModel::ListAppend => vec![
-                // Elle list-append workloads
-                (10, Box::new(CreateElleTableWorkload)),
+                // Elle list-append workloads (single pre-created table)
                 (40, Box::new(ElleAppendWorkload::new())),
                 (30, Box::new(ElleReadWorkload)),
                 // Transaction control
@@ -186,6 +188,7 @@ fn build_opts(args: &Args, seed: u64) -> anyhow::Result<WhopperOpts> {
         .with_keep_files(args.keep)
         .with_enable_mvcc(args.enable_mvcc)
         .with_enable_encryption(args.enable_encryption)
+        .with_elle_enabled(args.elle.is_some())
         .with_workloads(workloads)
         .with_properties(properties);
 

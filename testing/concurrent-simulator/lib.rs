@@ -203,6 +203,8 @@ pub struct WhopperOpts {
     pub enable_mvcc: bool,
     /// Enable database encryption with random cipher.
     pub enable_encryption: bool,
+    /// Enable Elle consistency checking (creates Elle tables at init).
+    pub elle_enabled: bool,
     /// Workloads with weights: (weight, workload). Higher weight = more likely.
     pub workloads: Vec<(u32, Box<dyn Workload>)>,
     /// Properties to check
@@ -219,6 +221,7 @@ impl Default for WhopperOpts {
             keep_files: false,
             enable_mvcc: false,
             enable_encryption: false,
+            elle_enabled: false,
             workloads: vec![],
             properties: vec![],
         }
@@ -283,6 +286,11 @@ impl WhopperOpts {
 
     pub fn with_enable_encryption(mut self, enable: bool) -> Self {
         self.enable_encryption = enable;
+        self
+    }
+
+    pub fn with_elle_enabled(mut self, enable: bool) -> Self {
+        self.elle_enabled = enable;
         self
     }
 
@@ -480,6 +488,18 @@ impl Whopper {
             bootstrap_conn.execute(&sql)?;
         }
 
+        // Create Elle table if Elle mode is enabled
+        let mut elle_tables = Vec::new();
+        if opts.elle_enabled {
+            let table_name = "elle_lists".to_string();
+            let sql = format!(
+                "CREATE TABLE IF NOT EXISTS {table_name} (key TEXT PRIMARY KEY, vals TEXT DEFAULT '')"
+            );
+            debug!("{}", sql);
+            bootstrap_conn.execute(&sql)?;
+            elle_tables.push(table_name);
+        }
+
         bootstrap_conn.close()?;
 
         let indexes_vec: Vec<(String, String)> = indexes
@@ -487,9 +507,14 @@ impl Whopper {
             .map(|idx| (idx.table_name.clone(), idx.index_name.clone()))
             .collect();
 
+        let mut state = SimulatorState::new(tables, indexes_vec);
+        for table_name in elle_tables {
+            state.elle_tables.insert(table_name, ());
+        }
+
         let context = SimulatorContext {
             fibers: vec![],
-            state: SimulatorState::new(tables, indexes_vec),
+            state,
             enable_mvcc: opts.enable_mvcc,
         };
 
@@ -761,8 +786,15 @@ impl Whopper {
             if let Operation::Begin { .. } = &op {
                 self.context.fibers[fiber_idx].txn_id = Some(ctx.sim_state.gen_txn_id());
             }
+            let txn_id = self.context.fibers[fiber_idx].txn_id;
             self.context.fibers[fiber_idx].execution_id = Some(exec_id);
-            self.context.fibers[fiber_idx].current_op = Some(op);
+            self.context.fibers[fiber_idx].current_op = Some(op.clone());
+
+            // Notify properties that operation is starting
+            for property in &self.properties {
+                let mut property = property.lock().unwrap();
+                property.init_op(self.current_step, fiber_idx, txn_id, exec_id, &op)?;
+            }
         }
 
         Ok(())
@@ -775,6 +807,16 @@ impl Whopper {
                 StepResult::Ok => {}
                 StepResult::WalSizeLimitExceeded => break,
             }
+        }
+        self.finalize_properties()?;
+        Ok(())
+    }
+
+    /// Finalize all properties (e.g., export Elle history).
+    pub fn finalize_properties(&self) -> anyhow::Result<()> {
+        for property in &self.properties {
+            let property = property.lock().unwrap();
+            property.finalize()?;
         }
         Ok(())
     }
