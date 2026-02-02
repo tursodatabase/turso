@@ -1,8 +1,12 @@
+// Copyright 2023-2025 the Limbo authors. All rights reserved. MIT license.
+
+//! Synchronization primitives that switch between std/parking_lot and shuttle implementations.
+
 #[cfg(shuttle)]
-pub(crate) use shuttle_adapter::*;
+pub use shuttle_adapter::*;
 
 #[cfg(not(shuttle))]
-pub(crate) use std_adapter::*;
+pub use std_adapter::*;
 
 #[cfg(shuttle)]
 mod shuttle_adapter {
@@ -116,7 +120,7 @@ mod shuttle_adapter {
     }
 
     impl<T> RwLock<T> {
-        pub fn new(val: T) -> Self {
+        pub const fn new(val: T) -> Self {
             Self(shuttle::sync::RwLock::new(val))
         }
 

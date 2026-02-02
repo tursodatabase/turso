@@ -2,10 +2,11 @@ use std::{
     future::Future,
     io::ErrorKind,
     pin::Pin,
-    sync::{Arc, Mutex},
     task::{Context, Poll, Waker},
     time::Duration,
 };
+
+use turso_std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
@@ -468,7 +469,7 @@ impl IoWorker {
 
     // Register a waker to be awakened upon IO progress.
     fn register(&self, waker: Waker) {
-        let mut wakers = self.wakers.lock().unwrap();
+        let mut wakers = self.wakers.lock();
         wakers.push(waker);
     }
 
@@ -480,7 +481,7 @@ impl IoWorker {
     // Called from the IO thread once progress has been made to notify all pending futures.
     fn notify_progress(wakers: &Arc<Mutex<Vec<Waker>>>) {
         let wakers = {
-            let mut guard = wakers.lock().unwrap();
+            let mut guard = wakers.lock();
             std::mem::take(&mut *guard)
         };
         for w in wakers {

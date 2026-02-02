@@ -28,6 +28,7 @@ antithesis = ["turso/antithesis", "dep:antithesis_sdk", "antithesis_sdk?/full"]
 antithesis_sdk = { workspace = true, optional = true }
 clap = { workspace = true, features = ["derive"] }
 hex = { workspace = true }
+indicatif = { workspace = true }
 rand = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["full"] }

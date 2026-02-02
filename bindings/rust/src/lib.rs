@@ -46,6 +46,7 @@ pub mod value;
 pub mod sync;
 
 pub use connection::Connection;
+use turso_sdk_kit::rsapi::TursoError;
 pub use value::Value;
 
 pub use params::params_from_iter;
@@ -53,9 +54,9 @@ pub use params::IntoParams;
 
 use std::fmt::Debug;
 use std::future::Future;
-use std::sync::Arc;
-use std::sync::Mutex;
 use std::task::Poll;
+
+use turso_std::sync::{Arc, Mutex};
 
 // Re-exports rows
 pub use crate::rows::{Row, Rows};
@@ -204,15 +205,21 @@ impl Builder {
             turso_sdk_kit::rsapi::TursoDatabase::new(turso_sdk_kit::rsapi::TursoDatabaseConfig {
                 path: self.path,
                 experimental_features: features,
-                async_io: false,
+                async_io: true,
                 encryption: self.encryption_opts,
                 vfs: self.vfs,
                 io: None,
                 db_file: None,
             });
-        let result = db.open()?;
-        // async_io is false - so db.open() will return result immediately
-        assert!(!result.is_io());
+        while let Some(io_c) = db.open()?.io() {
+            // At this point the db must already be
+            let io = db
+                .io()
+                .expect("IO must have been set on the first call to db open");
+            io_c.wait_async(io.as_ref())
+                .await
+                .map_err(TursoError::from)?;
+        }
         Ok(Database { inner: db })
     }
 }
@@ -261,7 +268,7 @@ impl Future for Execute {
     ) -> std::task::Poll<Self::Output> {
         match self.stmt.step(None, cx)? {
             Poll::Ready(_) => {
-                let n_change = self.stmt.inner.lock().unwrap().n_change();
+                let n_change = self.stmt.inner.lock().n_change();
                 Poll::Ready(Ok(n_change as u64))
             }
             Poll::Pending => Poll::Pending,
@@ -275,7 +282,7 @@ impl Statement {
         columns: Option<usize>,
         cx: &mut std::task::Context<'_>,
     ) -> Poll<Result<Option<Row>>> {
-        let mut stmt = self.inner.lock().unwrap();
+        let mut stmt = self.inner.lock();
         match stmt.step(Some(cx.waker()))? {
             turso_sdk_kit::rsapi::TursoStatusCode::Row => {
                 if let Some(columns) = columns {
@@ -305,7 +312,7 @@ impl Statement {
     pub async fn query(&mut self, params: impl IntoParams) -> Result<Rows> {
         self.reset()?;
 
-        let mut stmt = self.inner.lock().unwrap();
+        let mut stmt = self.inner.lock();
         let params = params.into_params()?;
         match params {
             params::Params::None => (),
@@ -329,20 +336,20 @@ impl Statement {
     pub async fn execute(&mut self, params: impl IntoParams) -> Result<u64> {
         {
             // Reset the statement before executing
-            self.inner.lock().unwrap().reset()?;
+            self.inner.lock().reset()?;
         }
         let params = params.into_params()?;
         match params {
             params::Params::None => (),
             params::Params::Positional(values) => {
                 for (i, value) in values.into_iter().enumerate() {
-                    let mut stmt = self.inner.lock().unwrap();
+                    let mut stmt = self.inner.lock();
                     stmt.bind_positional(i + 1, value.into())?;
                 }
             }
             params::Params::Named(values) => {
                 for (name, value) in values.into_iter() {
-                    let mut stmt = self.inner.lock().unwrap();
+                    let mut stmt = self.inner.lock();
                     let position = stmt.named_position(name)?;
                     stmt.bind_positional(position, value.into())?;
                 }
@@ -355,7 +362,7 @@ impl Statement {
 
     /// Returns columns of the result of this prepared statement.
     pub fn columns(&self) -> Vec<Column> {
-        let stmt = self.inner.lock().unwrap();
+        let stmt = self.inner.lock();
 
         let n = stmt.column_count();
 
@@ -377,7 +384,7 @@ impl Statement {
 
     /// Reset internal statement state after previous execution so it can be reused again
     pub fn reset(&self) -> Result<()> {
-        let mut stmt = self.inner.lock().unwrap();
+        let mut stmt = self.inner.lock();
         stmt.reset()?;
         Ok(())
     }

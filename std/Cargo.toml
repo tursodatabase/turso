@@ -1,0 +1,24 @@
+# Copyright 2023-2025 the Limbo authors. All rights reserved. MIT license.
+
+[package]
+name = "turso-std"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Standard library primitives for Turso with shuttle support for deterministic testing"
+
+[dependencies]
+parking_lot = { workspace = true, features = ["arc_lock", "send_guard"] }
+tokio = { workspace = true, optional = true, features = ["full"] }
+
+[target.'cfg(shuttle)'.dependencies]
+shuttle = { workspace = true }
+
+[features]
+default = []
+future = ["dep:tokio"]
+
+[lints]
+workspace = true
