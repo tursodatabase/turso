@@ -254,16 +254,16 @@ When working on a new feature, please consider adding a test case for it.
 
 ## SQL Test Runner
 
-The `turso-test-runner` crate provides a dedicated test runner with a custom DSL for writing SQL tests.
-Tests should be added to `turso-test-runner/tests/` using the `.sqltest` format.
+The `test-runner` crate provides a dedicated test runner with a custom DSL for writing SQL tests.
+Tests should be added to `testing/runner/tests/` using the `.sqltest` format.
 
 To run tests:
 
 ```console
-make -c turso-test-runner run
+make -C testing/runner run
 ```
 
-For full documentation on the DSL syntax and CLI usage, see the [turso-test-runner docs](turso-test-runner/docs/).
+For full documentation on the DSL syntax and CLI usage, see the [test-runner docs](testing/runner/docs/).
 
 ## TPC-H
 

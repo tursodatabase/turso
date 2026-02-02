@@ -1,6 +1,6 @@
 # Turso Test Runner Documentation
 
-This directory contains documentation for the turso-test-runner crate.
+This directory contains documentation for the test-runner crate.
 
 ## Quick Start
 
@@ -9,10 +9,10 @@ This directory contains documentation for the turso-test-runner crate.
 cargo build --release
 
 # Check test file syntax
-./target/release/turso-test-runner check tests/
+./target/release/test-runner check tests/
 
 # Run tests
-./target/release/turso-test-runner run tests/ --binary ./target/release/tursodb
+./target/release/test-runner run tests/ --binary ./target/release/tursodb
 ```
 
 ## Documentation Index
@@ -48,7 +48,7 @@ Example test files are available in the `examples/` directory:
 ## Crate Structure
 
 ```
-turso-test-runner/
+test-runner/
 ├── src/
 │   ├── lib.rs              # Public API exports
 │   ├── main.rs             # CLI binary entry point

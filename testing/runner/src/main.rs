@@ -9,7 +9,7 @@ use std::{
     path::{Path, PathBuf},
     time::Instant,
 };
-use turso_test_runner::{
+use test_runner::{
     DefaultDatabases, Format, GeneratorConfig, OutputFormat, ParseError, RunnerConfig,
     SnapshotUpdateMode, TestRunner, backends::cli::CliBackend, backends::js::JsBackend,
     backends::rust::RustBackend, create_output, find_all_pending_snapshots, generate_database,
@@ -17,7 +17,7 @@ use turso_test_runner::{
 };
 
 #[derive(Parser)]
-#[command(name = "turso-test-runner")]
+#[command(name = "test-runner")]
 #[command(about = "SQL test runner for Turso/Limbo")]
 struct Cli {
     #[command(subcommand)]
@@ -319,7 +319,8 @@ async fn run_tests(
         }
         "js" => {
             // Default: script is in the bindings/javascript directory
-            let js_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../bindings/javascript");
+            let js_dir =
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../bindings/javascript");
 
             // Determine script path - use provided or default to bundled script
             let script_path = js_script.unwrap_or_else(|| js_dir.join("turso-sql-runner.mjs"));
@@ -349,7 +350,7 @@ async fn run_tests(
                 eprintln!("Expected .node file in {}", native_dir.display());
                 eprintln!();
                 eprintln!("Build the bindings first:");
-                eprintln!("  make -C turso-test-runner build-js-bindings");
+                eprintln!("  make -C testing/runner build-js-bindings");
                 eprintln!();
                 eprintln!("Or manually:");
                 eprintln!("  cd bindings/javascript");
@@ -403,11 +404,11 @@ async fn run_tests(
 /// Simple resolver that holds the paths directly
 struct DefaultDatabasesResolver(Option<PathBuf>, Option<PathBuf>);
 
-impl turso_test_runner::DefaultDatabaseResolver for DefaultDatabasesResolver {
-    fn resolve(&self, location: &turso_test_runner::DatabaseLocation) -> Option<PathBuf> {
+impl test_runner::DefaultDatabaseResolver for DefaultDatabasesResolver {
+    fn resolve(&self, location: &test_runner::DatabaseLocation) -> Option<PathBuf> {
         match location {
-            turso_test_runner::DatabaseLocation::Default => self.0.clone(),
-            turso_test_runner::DatabaseLocation::DefaultNoRowidAlias => self.1.clone(),
+            test_runner::DatabaseLocation::Default => self.0.clone(),
+            test_runner::DatabaseLocation::DefaultNoRowidAlias => self.1.clone(),
             _ => None,
         }
     }
@@ -494,7 +495,7 @@ async fn check_files(paths: Vec<PathBuf>) -> ExitCode {
 
 fn check_single_file(path: &PathBuf) -> bool {
     match std::fs::read_to_string(path) {
-        Ok(content) => match turso_test_runner::parse(&content) {
+        Ok(content) => match test_runner::parse(&content) {
             Ok(file) => {
                 let snapshots_str = if file.snapshots.is_empty() {
                     String::new()

@@ -1,7 +1,7 @@
 # Turso Test Runner Makefile
 
 # Paths
-ROOT_DIR := $(shell cd .. && pwd)
+ROOT_DIR := $(shell cd ../.. && pwd)
 SQLITE := $(ROOT_DIR)/.sqlite3/sqlite3
 
 # Use release mode in CI, debug mode locally
@@ -14,7 +14,7 @@ else
 endif
 
 TURSODB := $(ROOT_DIR)/target/$(TARGET_DIR)/tursodb
-TEST_RUNNER := cargo run --bin turso-test-runner $(CARGO_PROFILE)
+TEST_RUNNER := cargo run --bin test-runner $(CARGO_PROFILE)
 
 .PHONY: all build build-tursodb build-runner check run test run-examples install-sqlite test-sqlite convert clean run-js build-js-bindings
 
