@@ -1242,14 +1242,14 @@ struct PatternInfo {
     no_case: bool,
 }
 
-static LIKE_INFO: PatternInfo = PatternInfo {
+const LIKE_INFO: PatternInfo = PatternInfo {
     match_all: '%',
     match_one: '_',
     match_set: None,
     no_case: true,
 };
 
-static GLOB_INFO: PatternInfo = PatternInfo {
+const GLOB_INFO: PatternInfo = PatternInfo {
     match_all: '*',
     match_one: '?',
     match_set: Some('['),
@@ -1259,6 +1259,7 @@ static GLOB_INFO: PatternInfo = PatternInfo {
 /// LIKE and GLOB pattern matching based on SQLite's patternCompare algorithm (src/func.c).
 /// Uses recursive descent with early termination via `NoWildcardMatch` to avoid
 /// exponential backtracking on patterns like `%a%a%a%...%b`.
+/// Ref: https://github.com/sqlite/sqlite/blob/master/src/func.c#L728
 fn pattern_compare(
     pattern: &str,
     text: &str,
