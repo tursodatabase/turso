@@ -382,12 +382,12 @@ func (d *TursoSyncDb) processIoQueue(ctx context.Context) error {
 }
 
 func buildHostname(baseURL, namespace string) (string, error) {
-	if namespace == "" {
-		return baseURL, nil
-	}
 	u, err := url.Parse(baseURL)
 	if err != nil {
 		return "", err
+	}
+	if namespace == "" {
+		return u.Host, nil
 	}
 	return namespace + "." + u.Host, nil
 }
