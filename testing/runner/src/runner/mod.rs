@@ -169,6 +169,18 @@ impl Runnable for SnapshotCase {
         let eqp_result = results.first().expect("should have two query results");
         let explain_result = results.get(1).expect("should have two query results");
 
+        // Check for errors in query execution
+        if let Some(err) = &eqp_result.error {
+            return TestOutcome::Error {
+                message: format!("EXPLAIN QUERY PLAN failed: {err}"),
+            };
+        }
+        if let Some(err) = &explain_result.error {
+            return TestOutcome::Error {
+                message: format!("EXPLAIN failed: {err}"),
+            };
+        }
+
         // Format both outputs
         let actual_output = format_snapshot_content(&eqp_result.rows, &explain_result.rows);
 
