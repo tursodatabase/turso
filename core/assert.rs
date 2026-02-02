@@ -178,6 +178,148 @@ macro_rules! turso_assert_less_than_or_equal {
     };
 }
 
+/// Assert that left == right with more visibility for Antithesis.
+#[cfg(not(feature = "antithesis"))]
+#[macro_export]
+macro_rules! turso_assert_eq {
+    ($left:expr, $right:expr, $msg:literal) => {
+        assert_eq!($left, $right, $msg);
+    };
+}
+
+#[cfg(feature = "antithesis")]
+#[macro_export]
+macro_rules! turso_assert_eq {
+    ($left:expr, $right:expr, $msg:literal) => {
+        antithesis_sdk::assert_always!($left == $right, $msg);
+        assert_eq!($left, $right, $msg);
+    };
+}
+
+/// Assert that left != right with more visibility for Antithesis.
+#[cfg(not(feature = "antithesis"))]
+#[macro_export]
+macro_rules! turso_assert_ne {
+    ($left:expr, $right:expr, $msg:literal) => {
+        assert_ne!($left, $right, $msg);
+    };
+}
+
+#[cfg(feature = "antithesis")]
+#[macro_export]
+macro_rules! turso_assert_ne {
+    ($left:expr, $right:expr, $msg:literal) => {
+        antithesis_sdk::assert_always!($left != $right, $msg);
+        assert_ne!($left, $right, $msg);
+    };
+}
+
+/// Assert that left > right at least once during testing.
+#[cfg(not(feature = "antithesis"))]
+#[macro_export]
+macro_rules! turso_assert_sometimes_greater_than {
+    ($left:expr, $right:expr, $msg:literal) => {
+        let _ = ($left, $right);
+    };
+}
+
+#[cfg(feature = "antithesis")]
+#[macro_export]
+macro_rules! turso_assert_sometimes_greater_than {
+    ($left:expr, $right:expr, $msg:literal) => {
+        antithesis_sdk::assert_sometimes_greater_than!($left, $right, $msg);
+    };
+}
+
+/// Assert that left < right at least once during testing.
+#[cfg(not(feature = "antithesis"))]
+#[macro_export]
+macro_rules! turso_assert_sometimes_less_than {
+    ($left:expr, $right:expr, $msg:literal) => {
+        let _ = ($left, $right);
+    };
+}
+
+#[cfg(feature = "antithesis")]
+#[macro_export]
+macro_rules! turso_assert_sometimes_less_than {
+    ($left:expr, $right:expr, $msg:literal) => {
+        antithesis_sdk::assert_sometimes_less_than!($left, $right, $msg);
+    };
+}
+
+/// Assert that left >= right at least once during testing.
+#[cfg(not(feature = "antithesis"))]
+#[macro_export]
+macro_rules! turso_assert_sometimes_greater_than_or_equal {
+    ($left:expr, $right:expr, $msg:literal) => {
+        let _ = ($left, $right);
+    };
+}
+
+#[cfg(feature = "antithesis")]
+#[macro_export]
+macro_rules! turso_assert_sometimes_greater_than_or_equal {
+    ($left:expr, $right:expr, $msg:literal) => {
+        antithesis_sdk::assert_sometimes_greater_than_or_equal_to!($left, $right, $msg);
+    };
+}
+
+/// Assert that left <= right at least once during testing.
+#[cfg(not(feature = "antithesis"))]
+#[macro_export]
+macro_rules! turso_assert_sometimes_less_than_or_equal {
+    ($left:expr, $right:expr, $msg:literal) => {
+        let _ = ($left, $right);
+    };
+}
+
+#[cfg(feature = "antithesis")]
+#[macro_export]
+macro_rules! turso_assert_sometimes_less_than_or_equal {
+    ($left:expr, $right:expr, $msg:literal) => {
+        antithesis_sdk::assert_sometimes_less_than_or_equal_to!($left, $right, $msg);
+    };
+}
+
+/// Assert that a condition is always true when evaluated, but only when it has been evaluated
+/// at least once. Unlike `turso_assert!`, this won't fail if the code path is never reached.
+#[cfg(not(feature = "antithesis"))]
+#[macro_export]
+macro_rules! turso_assert_always_some {
+    ($cond:expr, $msg:literal) => {
+        // When not using Antithesis, this is a no-op
+        let _ = $cond;
+    };
+}
+
+#[cfg(feature = "antithesis")]
+#[macro_export]
+macro_rules! turso_assert_always_some {
+    ($cond:expr, $msg:literal) => {
+        antithesis_sdk::assert_always_some!($cond, $msg);
+    };
+}
+
+/// Assert that a condition is true across all evaluations, at least once during testing.
+/// Combines "always true" with "sometimes reached".
+#[cfg(not(feature = "antithesis"))]
+#[macro_export]
+macro_rules! turso_assert_sometimes_all {
+    ($cond:expr, $msg:literal) => {
+        // When not using Antithesis, this is a no-op
+        let _ = $cond;
+    };
+}
+
+#[cfg(feature = "antithesis")]
+#[macro_export]
+macro_rules! turso_assert_sometimes_all {
+    ($cond:expr, $msg:literal) => {
+        antithesis_sdk::assert_sometimes_all!($cond, $msg);
+    };
+}
+
 /// Assert that a type implements Send at compile time.
 /// Usage: assert_send!(MyType);
 /// Usage: assert_send!(Type1, Type2, Type3);
