@@ -15,6 +15,7 @@ use super::{access_method::AccessMethod, join::JoinN};
 #[derive(Debug, PartialEq, Clone)]
 pub enum ColumnTarget {
     Column(usize),
+    RowId,
     /// We know that the ast lives at least as long as the Statement/Program,
     /// so we store a raw pointer here to avoid cloning yet another ast::Expr
     Expr(*const ast::Expr),
@@ -193,14 +194,19 @@ pub fn plan_satisfies_order_target(
                         .columns()
                         .iter()
                         .position(|c| c.is_rowid_alias());
-                    let Some(rowid_alias_col) = rowid_alias_col else {
-                        return false;
-                    };
-                    if !matches!(
-                        target_col.target,
-                        ColumnTarget::Column(col_no) if col_no == rowid_alias_col
-                    ) {
-                        return false;
+                    match target_col.target {
+                        ColumnTarget::RowId => {}
+                        ColumnTarget::Column(col_no) => {
+                            let Some(rowid_alias_col) = rowid_alias_col else {
+                                return false;
+                            };
+                            if col_no != rowid_alias_col {
+                                return false;
+                            }
+                        }
+                        ColumnTarget::Expr(_) => {
+                            return false;
+                        }
                     }
                     let correct_order = if *iter_dir == IterationDirection::Forwards {
                         target_col.order == SortOrder::Asc
@@ -227,6 +233,7 @@ pub fn plan_satisfies_order_target(
                             (ColumnTarget::Expr(expr), Some(idx_expr)) => {
                                 exprs_are_equivalent(unsafe { &**expr }, idx_expr)
                             }
+                            (ColumnTarget::RowId, _) => false,
                             _ => false,
                         };
                         if !column_matches {
@@ -303,6 +310,14 @@ fn expr_to_column_order(
                     collation,
                 });
             };
+        }
+        ast::Expr::RowId { table, .. } => {
+            return Some(ColumnOrder {
+                table_id: *table,
+                target: ColumnTarget::RowId,
+                order,
+                collation: CollationSeq::default(),
+            });
         }
         _ => {}
     }
