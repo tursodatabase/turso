@@ -3,6 +3,12 @@ name: Antithesis experiment
 on:
   # Allows the workflow to be triggered manually
   workflow_dispatch:
+    inputs:
+      test_name:
+        description: "Name to differentiate this run (optional)"
+        required: false
+        default: ""
+        type: string
   schedule:
     - cron: "0 0 * * *"
 
@@ -31,6 +37,27 @@ jobs:
       run: bash ./scripts/antithesis/publish-config.sh
 
     - name: Launch experiment
+      if: github.event_name == 'schedule'
       run: bash ./scripts/antithesis/launch.sh
       env:
         ANTITHESIS_TRIGGER: ${{ github.event_name }}
+
+    - name: Run Antithesis Tests
+      if: github.event_name == 'workflow_dispatch'
+      uses: antithesishq/antithesis-trigger-action@v0.5
+      with:
+        notebook_name: Limbo Test
+        tenant: ${{ secrets.ANTITHESIS_TENANT }}
+        username: ${{ secrets.ANTITHESIS_USERNAME }}
+        password: ${{ secrets.ANTITHESIS_PASSWORD }}
+        github_token: ${{ secrets.ANTITHESIS_GITHUB_TOKEN }}
+        config_image: ${{ secrets.ANTITHESIS_DOCKER_REPO }}/limbo-config:antithesis-latest
+        images: ${{ secrets.ANTITHESIS_DOCKER_REPO }}/limbo-workload:antithesis-latest
+        description: "Turso - ${{ github.event_name }} on ${{ github.ref_name }} by ${{ github.actor }}"
+        email_recipients: ${{ secrets.ANTITHESIS_EMAIL }}
+        test_name: ${{ github.event.inputs.test_name }}
+        additional_parameters: |-
+          branch=${{ github.ref_name }}
+          commit_message=${{ github.event.head_commit.message }}
+          who_triggered_this=${{ github.actor }}
+          gh_actions_run_id=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
