@@ -16,7 +16,6 @@ use crate::{
 use rapidhash::fast::RapidHasher;
 use std::cmp::Ordering;
 use std::hash::Hasher;
-use std::time::Instant;
 use std::{cell::RefCell, collections::VecDeque};
 use turso_macros::{turso_debug_assert, AtomicEnum};
 
@@ -643,8 +642,6 @@ pub struct SpilledPartition {
     partial_entry: Vec<u8>,
     /// Parsed entries for validation
     parsed_entries: usize,
-    /// Start time for the current read I/O (if any)
-    read_wait_start: Option<Instant>,
 }
 
 impl SpilledPartition {
@@ -662,7 +659,6 @@ impl SpilledPartition {
             matched_bits: Vec::new(),
             partial_entry: Vec::new(),
             parsed_entries: 0,
-            read_wait_start: None,
         }
     }
 
@@ -686,7 +682,7 @@ impl SpilledPartition {
     }
 
     fn buffer_len(&self) -> usize {
-        self.buffer_len.load(atomic::Ordering::SeqCst)
+        self.buffer_len.load(atomic::Ordering::Acquire)
     }
 
     /// Check if partition is ready for probing
@@ -785,8 +781,6 @@ struct SpillState {
     temp_file: TempFile,
     /// Partitioning strategy for this spill.
     partitioning: Partitioning,
-    /// Start time for the current write I/O (if any).
-    write_wait_start: Option<Instant>,
 }
 
 impl SpillState {
@@ -803,7 +797,6 @@ impl SpillState {
             next_spill_offset: 0,
             temp_file: TempFile::with_temp_store(io, temp_store)?,
             partitioning,
-            write_wait_start: None,
         })
     }
 
@@ -838,112 +831,6 @@ impl SpillState {
 /// Collisions within a hash bucket are resolved using simple chaining (a `Vec<HashEntry>`),
 /// and equality is determined by comparing the stored key values against probe keys using
 /// the same collation-aware comparison logic that was used when hashing.
-///
-/// - Construction:
-///   - `mem_budget` is an approximate upper bound on memory consumed by the
-///     build side for this join or DISTINCT set. It applies to:
-///       * `mem_used`: the base in-memory structures (buckets in non-spilled
-///         mode, plus any never-spilled partitions).
-///       * `loaded_partitions_mem`: additional resident memory for partitions
-///         that were spilled to disk and later reloaded for probing.
-///
-/// - Build phase ([HashTableState::Building] / `::Spilled`):
-///   - `insert`:
-///       * Inserts (key_values, rowid) into the in-memory hash table.
-///       * Tracks per-entry size via [HashEntry::size_bytes] and increments
-///         `mem_used`.
-///       * If `mem_used + new_entry_size > mem_budget`:
-///           - On first overflow, transitions into spilled mode:
-///               * Allocates `SpillState`.
-///               * Redistributes existing buckets into partition buffers via
-///                 `partition_index`.
-///               * Sets `state to [HashTableState::Spilled].
-///           - Spills whole partition buffers to disk, always picking the largest
-///             non-empty partition first, until the new entry fits.
-///           - Spilling:
-///               * Serializes entries in a partition buffer into a temp file,
-///                 appending as one `SpillChunk` (file_offset, size, #entries).
-///               * Clears that partition buffer and reduces `mem_used` by
-///                 its `partition.mem_used`.
-///               * Updates `SpilledPartition.chunks` and `next_spill_offset`.
-///   - In spilled mode:
-///       * New inserts are written into the corresponding `PartitionBuffer`.
-///       * These entries are either:
-///           - Spilled later (creating new chunks), or
-///           - Materialized in-memory as never-spilled partitions if they never
-///             required spilling at finalize time (see below).
-///
-/// - `finalize_build`:
-///   - Completes pending writes for any partitions that were already spilled.
-///   - For each `partition_buffers[i]`:
-///       * If there is already a `SpilledPartition` for `i` (i.e. we have
-///         existing chunks), we spill the buffer to disk (creating more chunks)
-///         and clear it, reducing `mem_used` accordingly.
-///       * Otherwise, the partition has never been spilled:
-///           - We call `materialize_partition_in_memory(i)`:
-///               * Takes owned entries out of the buffer.
-///               * Builds in-memory buckets for that partition.
-///               * Marks the resulting `SpilledPartition` as
-///                 `PartitionState::InMemory`.
-///               * These InMemory partitions are not tracked in
-///                 `loaded_partitions_lru` and do not contribute to
-///                 `loaded_partitions_mem`.
-///   - After this, the table transitions to `HashTableState::Probing`.
-///
-/// - Probe phase (`HashTableState::Probing`):
-///   - Non-spilled case:
-///       * If `spill_state.is_none()`, probing is directly over `buckets`.
-///       * `probe()` / `next_match()` walk the bucket chain for the hash.
-///   - Spilled case:
-///   * All build-side data now lives in `SpilledPartition`s:
-///       - Some partitions may be `InMemory` (never spilled, always
-///         resident, counted only in `mem_used`).
-///       - Some partitions may be `OnDisk` with one or more `chunks`
-///         (spilled build side).
-///       - Some partitions may be `Loaded` (disk-backed but currently
-///         resident in memory as buckets; counted in `loaded_partitions_mem`
-///         and tracked in `loaded_partitions_lru`).
-///   * The VDBE is expected to:
-///    - Compute the partition index for a probe key:
-///      `partition_for_keys(probe_keys)`.
-///    - Ensure the partition is resident:
-///      `load_spilled_partition(partition_idx)`
-///      (no-op for never-spilled / InMemory partitions).
-///    - Then probe via:
-///      `probe_partition(partition_idx, keys)`
-///      or the top-level `probe()` / `next_match()` helpers.
-///
-/// - Probe-time cache / thrash behavior:
-///   - `loaded_partitions_lru` and `loaded_partitions_mem` form an LRU cache of
-///     *only spilled* partitions that are currently loaded.
-///  - When loading or parsing a spilled partition:
-///    * We estimate its memory footprint as:
-///      `resident_mem = partition_bucket_mem(partition.buckets)`
-///      and set `partition.resident_mem`.
-///    * Before keeping it resident, we call:
-///      `evict_partitions_to_fit(resident_mem, protect_idx)`
-///      which:
-///         - Repeatedly evicts the least-recently-used partition whose state
-///           is `Loaded` and that has backing `chunks` (`!chunks.is_empty()`),
-///           skipping `protect_idx`.
-///         - Eviction clears the partition’s buckets, resets its state to
-///           `OnDisk`, zeros `resident_mem`, and decrements
-///           `loaded_partitions_mem`.
-///         - The loop stops once:
-///           mem_used + loaded_partitions_mem + incoming_mem <= mem_budget
-///           or there is no further evictable candidate, in which case the
-///           hash join may temporarily exceed `mem_budget` (bounded by one
-///           partition’s `resident_mem`).
-///   * After eviction, we call:
-///     `record_partition_resident(partition_idx, resident_mem)`
-///     which:
-///       - Adjusts `loaded_partitions_mem` by replacing the prior
-///         `resident_mem` for that partition.
-///       - Marks the partition as most recently used in
-///         `loaded_partitions_lru`.
-///   - For partitions that are already loaded, `load_spilled_partition()`
-///     simply updates their position in the LRU without changing the memory
-///     accounting.
 pub struct HashTable {
     /// Initial bucket count used to reinitialize after spills.
     initial_buckets: usize,
@@ -1068,6 +955,8 @@ impl HashTable {
         &self.state
     }
 
+    /// Based on average entry size and number of entries,
+    /// determine the number of partitions to use for spilling.
     fn choose_partition_count(&self, entry_size: usize) -> usize {
         if let Some(count) = self.partition_count_override {
             turso_assert!(
@@ -1085,49 +974,16 @@ impl HashTable {
         let target_partition_bytes = (self.mem_budget / 2).max(avg_entry_size);
         let target_entries_per_partition = (target_partition_bytes / avg_entry_size).max(1);
         let estimated_total_entries = self.num_entries.saturating_add(1);
-        let mut partitions = (estimated_total_entries + target_entries_per_partition - 1)
-            / target_entries_per_partition;
-
-        if partitions < MIN_PARTITIONS {
-            partitions = MIN_PARTITIONS;
-        }
-        if partitions > MAX_PARTITIONS {
-            partitions = MAX_PARTITIONS;
-        }
-
+        let mut partitions = estimated_total_entries.div_ceil(target_entries_per_partition);
+        partitions = partitions.clamp(MIN_PARTITIONS, MAX_PARTITIONS);
         partitions.next_power_of_two()
     }
 
-    fn partitioning(&self) -> Partitioning {
-        let spill_state = self.spill_state.as_ref().expect("spill state must exist");
-        spill_state.partitioning
-    }
-
+    /// For a given hash value, get the partition index.
+    /// SAFETY: only call this when spill_state is Some.
     fn partition_index(&self, hash: u64) -> usize {
-        self.partitioning().index(hash)
-    }
-
-    fn maybe_record_write_wait(&mut self, metrics: Option<&mut HashJoinMetrics>) {
-        let Some(metrics) = metrics else {
-            return;
-        };
-        let Some(spill_state) = self.spill_state.as_mut() else {
-            return;
-        };
-        let Some(start) = spill_state.write_wait_start.take() else {
-            return;
-        };
-        let has_pending = spill_state
-            .partitions
-            .iter()
-            .any(|p| matches!(p.io_state.get(), SpillIOState::WaitingForWrite));
-        if has_pending {
-            spill_state.write_wait_start = Some(start);
-            return;
-        }
-        metrics.io_wait_nanos = metrics
-            .io_wait_nanos
-            .saturating_add(start.elapsed().as_nanos() as u64);
+        let spill_state = self.spill_state.as_ref().expect("spill state must exist");
+        spill_state.partitioning.index(hash)
     }
 
     fn record_probe_partition(
@@ -1267,16 +1123,13 @@ impl HashTable {
         &mut self,
         key_values: &[Value],
         key_refs: &[ValueRef],
-        metrics: Option<&mut HashJoinMetrics>,
+        mut metrics: Option<&mut HashJoinMetrics>,
     ) -> Result<IOResult<bool>> {
-        let mut metrics = metrics;
         turso_assert!(
             self.state == HashTableState::Building || self.state == HashTableState::Spilled,
             "Cannot insert_distinct into hash table in unexpected state",
             { "state": format!("{:?}", self.state) }
         );
-
-        self.maybe_record_write_wait(metrics.as_deref_mut());
 
         let hash = hash_join_key(key_refs, &self.collations);
 
@@ -1531,9 +1384,6 @@ impl HashTable {
         };
 
         io_state.set(SpillIOState::WaitingForWrite);
-        if spill_state.write_wait_start.is_none() {
-            spill_state.write_wait_start = Some(Instant::now());
-        }
 
         let buffer_ref = Arc::new(buffer);
         let write_complete = Box::new(move |res: Result<i32, crate::CompletionError>| match res {
@@ -1716,9 +1566,6 @@ impl HashTable {
         // Update state
         self.mem_used -= total_mem_freed;
         spill_state.next_spill_offset += total_size as u64;
-        if spill_state.write_wait_start.is_none() {
-            spill_state.write_wait_start = Some(Instant::now());
-        }
         Ok(Some(completion))
     }
 
@@ -1822,8 +1669,6 @@ impl HashTable {
             "Cannot finalize build in unexpected state",
             { "state": format!("{:?}", self.state) }
         );
-
-        self.maybe_record_write_wait(metrics.as_deref_mut());
 
         if self.spill_state.is_some() {
             {
@@ -2169,9 +2014,8 @@ impl HashTable {
     pub fn load_spilled_partition_with_metrics(
         &mut self,
         partition_idx: usize,
-        metrics: Option<&mut HashJoinMetrics>,
+        mut metrics: Option<&mut HashJoinMetrics>,
     ) -> Result<IOResult<()>> {
-        let mut metrics = metrics;
         loop {
             // to avoid holding mut borrows, split this into two phases.
             let action = {
@@ -2236,9 +2080,6 @@ impl HashTable {
 
                                 spilled.io_state.set(SpillIOState::WaitingForRead);
                                 spilled.state = PartitionState::Loading;
-                                if spilled.read_wait_start.is_none() {
-                                    spilled.read_wait_start = Some(Instant::now());
-                                }
 
                                 SpillAction::LoadChunk {
                                     read_size,
@@ -2326,7 +2167,7 @@ impl HashTable {
                                 persistent_buf.clear();
                                 persistent_buf
                                     .extend_from_slice(&buf.as_slice()[..bytes_read as usize]);
-                                buffer_len.store(bytes_read as usize, atomic::Ordering::SeqCst);
+                                buffer_len.store(bytes_read as usize, atomic::Ordering::Release);
                                 io_state.set(SpillIOState::ReadComplete);
                                 None
                             }
@@ -2363,13 +2204,6 @@ impl HashTable {
             let data_len = partition.buffer_len();
             if let Some(metrics) = metrics.as_mut() {
                 metrics.load_bytes_read = metrics.load_bytes_read.saturating_add(data_len as u64);
-                if let Some(start) = partition.read_wait_start.take() {
-                    metrics.io_wait_nanos = metrics
-                        .io_wait_nanos
-                        .saturating_add(start.elapsed().as_nanos() as u64);
-                }
-            } else {
-                partition.read_wait_start = None;
             }
 
             let data_guard = partition.read_buffer.read();
@@ -2385,7 +2219,7 @@ impl HashTable {
             drop(data_guard);
 
             partition.partial_entry.clear();
-            partition.buffer_len.store(0, atomic::Ordering::SeqCst);
+            partition.buffer_len.store(0, atomic::Ordering::Release);
             partition.read_buffer.write().clear();
             partition.io_state.set(SpillIOState::None);
 
@@ -2586,11 +2420,10 @@ impl HashTable {
                         victim.state = PartitionState::OnDisk;
                         victim.resident_mem = 0;
                         victim.current_chunk_idx = 0;
-                        victim.buffer_len.store(0, atomic::Ordering::SeqCst);
+                        victim.buffer_len.store(0, atomic::Ordering::Release);
                         victim.read_buffer.write().clear();
                         victim.partial_entry.clear();
                         victim.parsed_entries = 0;
-                        victim.read_wait_start = None;
                         victim.io_state.set(SpillIOState::None);
                         if let Some(metrics) = metrics.as_deref_mut() {
                             metrics.partition_evictions =
@@ -3096,7 +2929,6 @@ mod hashtests {
             next_spill_offset: 0,
             temp_file,
             partitioning,
-            write_wait_start: None,
         };
         ht.spill_state = Some(spill_state);
         ht.state = HashTableState::Probing;
@@ -3146,7 +2978,6 @@ mod hashtests {
             next_spill_offset: truncated.len() as u64,
             temp_file,
             partitioning,
-            write_wait_start: None,
         };
         ht.spill_state = Some(spill_state);
         ht.state = HashTableState::Probing;
