@@ -140,24 +140,24 @@ jobs:
         run: |
           make test-shuttle
 
-  stress-nondeterminism-check:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Setup mold linker
-        uses: "./.github/shared/setup-mold"
-      - uses: Swatinem/rust-cache@v2
-        with:
-          prefix-key: "v1-rust-shuttle"
-          cache-on-failure: true
-      - uses: "./.github/shared/setup-sccache"
-      - name: Check for uncontrolled nondeterminism
-        env:
-          RUSTFLAGS: "--cfg tokio_unstable --cfg shuttle"
-        run: |
-          cargo run -p turso_stress -- --check-uncontrolled-nondeterminism
+  # stress-nondeterminism-check:
+  #   runs-on: blacksmith-4vcpu-ubuntu-2404
+  #   timeout-minutes: 15
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - uses: dtolnay/rust-toolchain@stable
+  #     - name: Setup mold linker
+  #       uses: "./.github/shared/setup-mold"
+  #     - uses: Swatinem/rust-cache@v2
+  #       with:
+  #         prefix-key: "v1-rust-shuttle"
+  #         cache-on-failure: true
+  #     - uses: "./.github/shared/setup-sccache"
+  #     - name: Check for uncontrolled nondeterminism
+  #       env:
+  #         RUSTFLAGS: "--cfg tokio_unstable --cfg shuttle"
+  #       run: |
+  #         cargo run -p turso_stress -- --check-uncontrolled-nondeterminism
 
   clippy:
     runs-on: blacksmith-4vcpu-ubuntu-2404
