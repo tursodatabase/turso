@@ -31,6 +31,40 @@ macro_rules! turso_assert {
     };
 }
 
+/// turso_debug_assert! is a replacement for debug_assert! which under the hood uses Antithesis SDK
+/// to guide Antithesis simulator if --features antithesis is enabled.
+/// Unlike turso_assert!, this only panics in debug builds.
+#[cfg(not(feature = "antithesis"))]
+#[macro_export]
+macro_rules! turso_debug_assert {
+    ($cond:expr, $msg:literal, { $($details:tt)* }) => {
+        debug_assert!($cond, $msg);
+    };
+    ($cond:expr, $msg:literal, $($optional:tt)+) => {
+        debug_assert!($cond, $msg, $($optional)+);
+    };
+    ($cond:expr, $msg:literal) => {
+        debug_assert!($cond, $msg);
+    };
+}
+
+#[cfg(feature = "antithesis")]
+#[macro_export]
+macro_rules! turso_debug_assert {
+    ($cond:expr, $msg:literal, { $($details:tt)* }) => {
+        antithesis_sdk::assert_always_or_unreachable!($cond, $msg, &serde_json::json!({ $($details)* }));
+        debug_assert!($cond, $msg);
+    };
+    ($cond:expr, $msg:literal, $($optional:tt)+) => {
+        antithesis_sdk::assert_always_or_unreachable!($cond, $msg);
+        debug_assert!($cond, $msg, $($optional)+);
+    };
+    ($cond:expr, $msg:literal) => {
+        antithesis_sdk::assert_always_or_unreachable!($cond, $msg);
+        debug_assert!($cond, $msg);
+    };
+}
+
 /// Assert that a condition is true at least once during testing.
 /// This helps Antithesis identify rare conditions that should be triggered.
 ///
