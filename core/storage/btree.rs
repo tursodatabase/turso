@@ -1,10 +1,10 @@
-use crate::turso_assert_ne;
-#[allow(unused_imports)]
-use crate::turso_soft_unreachable;
 use branches::mark_unlikely;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use smallvec::SmallVec;
 use tracing::{instrument, Level};
+use turso_macros::turso_assert_ne;
+#[allow(unused_imports)]
+use turso_macros::turso_soft_unreachable;
 
 use crate::{
     io::CompletionGroup,
@@ -42,7 +42,7 @@ use crate::{
     LimboError, Result,
 };
 #[allow(unused_imports)]
-use crate::{
+use turso_macros::{
     turso_assert_eq, turso_assert_greater_than, turso_assert_greater_than_or_equal,
     turso_assert_less_than, turso_assert_less_than_or_equal,
 };

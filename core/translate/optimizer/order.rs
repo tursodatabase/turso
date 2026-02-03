@@ -1,5 +1,3 @@
-#[allow(unused_imports)]
-use crate::turso_assert_greater_than_or_equal;
 use crate::{
     translate::{
         collate::{get_collseq_from_expr, CollationSeq},
@@ -9,6 +7,8 @@ use crate::{
     },
     util::exprs_are_equivalent,
 };
+#[allow(unused_imports)]
+use turso_macros::turso_assert_greater_than_or_equal;
 use turso_parser::ast::{self, SortOrder, TableInternalId};
 
 use super::{access_method::AccessMethod, join::JoinN};

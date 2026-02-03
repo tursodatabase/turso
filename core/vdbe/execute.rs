@@ -65,8 +65,8 @@ use std::{
 use turso_macros::match_ignore_ascii_case;
 
 use crate::pseudo::PseudoCursor;
-use crate::turso_assert_reachable;
-use crate::turso_soft_unreachable;
+use turso_macros::turso_assert_reachable;
+use turso_macros::turso_soft_unreachable;
 
 use crate::storage::btree::{BTreeCursor, BTreeKey};
 
@@ -82,7 +82,7 @@ use crate::{
 
 use crate::{connection::Row, info, OpenFlags, TransactionState, ValueRef};
 #[allow(unused_imports)]
-use crate::{
+use turso_macros::{
     turso_assert, turso_assert_eq, turso_assert_greater_than_or_equal, turso_assert_less_than,
 };
 

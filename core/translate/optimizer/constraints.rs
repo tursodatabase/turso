@@ -1,5 +1,3 @@
-#[allow(unused_imports)]
-use crate::turso_assert;
 use crate::{
     schema::{Column, Index, Schema},
     stats::TableStat,
@@ -17,6 +15,8 @@ use crate::{
 use rustc_hash::FxHashMap as HashMap;
 use std::{cmp::Ordering, collections::VecDeque, sync::Arc};
 use turso_ext::{ConstraintInfo, ConstraintOp};
+#[allow(unused_imports)]
+use turso_macros::turso_assert;
 use turso_parser::ast::{self, SortOrder, TableInternalId};
 
 use super::cost_params::CostModelParams;

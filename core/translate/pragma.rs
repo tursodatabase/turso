@@ -19,14 +19,14 @@ use crate::storage::sqlite3_ondisk::CacheSize;
 use crate::storage::wal::CheckpointMode;
 use crate::translate::emitter::{Resolver, TransactionMode};
 use crate::translate::schema::translate_create_table;
-#[allow(unused_imports)]
-use crate::turso_soft_unreachable;
 use crate::util::{normalize_ident, parse_signed_number, parse_string, IOExt as _};
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
 use crate::vdbe::insn::{Cookie, Insn};
 use crate::{bail_parse_error, CaptureDataChangesMode, LimboError, Value};
 use std::str::FromStr;
 use strum::IntoEnumIterator;
+#[allow(unused_imports)]
+use turso_macros::turso_soft_unreachable;
 
 fn list_pragmas(program: &mut ProgramBuilder) {
     for x in PragmaName::iter() {

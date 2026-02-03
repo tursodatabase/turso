@@ -3,7 +3,8 @@ use crate::fast_lock::SpinLock;
 use crate::io::TEMP_BUFFER_CACHE;
 use crate::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use crate::sync::{Arc, Weak};
-use crate::{turso_assert, Buffer, LimboError, IO};
+use crate::{Buffer, LimboError, IO};
+use turso_macros::turso_assert;
 
 use std::cell::UnsafeCell;
 use std::ptr::NonNull;

@@ -1,5 +1,3 @@
-#[allow(unused_imports)]
-use crate::turso_soft_unreachable;
 use crate::{
     function::Deterministic,
     index_method::IndexMethodCostEstimate,
@@ -40,6 +38,8 @@ use order::{compute_order_target, plan_satisfies_order_target, EliminatesSortBy}
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::{cmp::Ordering, collections::VecDeque, sync::Arc};
 use turso_ext::{ConstraintInfo, ConstraintUsage};
+#[allow(unused_imports)]
+use turso_macros::{turso_assert, turso_assert_eq, turso_soft_unreachable};
 use turso_parser::ast::{self, Expr, SortOrder, TriggerEvent};
 
 use super::{
@@ -1260,7 +1260,7 @@ fn optimize_table_access(
                     pos_by_table[*build_table_idx],
                     pos_by_table[*probe_table_idx],
                 ) {
-                    crate::turso_assert!(
+                    turso_assert!(
                         probe_pos == build_pos + 1,
                         "hash join build/probe tables are not adjacent in join order"
                     );
@@ -1272,7 +1272,7 @@ fn optimize_table_access(
 
         for (build_table_idx, materialize_build_input) in build_tables {
             if probe_tables.contains(&build_table_idx) {
-                crate::turso_assert!(
+                turso_assert!(
                     materialize_build_input,
                     "probe->build chaining requires materialized build input"
                 );
@@ -1458,7 +1458,7 @@ fn optimize_table_access(
                             let constraint =
                                 &constraints_per_table[table_idx].constraints[*constraint_vec_pos];
                             let where_term = &mut where_clause[constraint.where_clause_pos.0];
-                            crate::turso_assert!(
+                            turso_assert!(
                                 !where_term.consumed,
                                 "optimizer: trying to consume a where clause term twice",
                                 {"where_term": format!("{where_term:?}")}
@@ -1493,7 +1493,7 @@ fn optimize_table_access(
                             });
                         continue;
                     }
-                    crate::turso_assert_eq!(
+                    turso_assert_eq!(
                         constraint_refs.len(),
                         1,
                         "optimizer: expected exactly one constraint for rowid seek"
@@ -2161,7 +2161,7 @@ pub fn build_seek_def_from_constraints(
     where_clause: &[WhereTerm],
     referenced_tables: Option<&TableReferences>,
 ) -> Result<SeekDef> {
-    crate::turso_assert!(
+    turso_assert!(
         !constraint_refs.is_empty(),
         "optimizer: cannot build seek def from empty constraint refs"
     );
@@ -2204,7 +2204,7 @@ fn build_seek_def(
     iter_dir: IterationDirection,
     mut key: Vec<SeekRangeConstraint>,
 ) -> Result<SeekDef> {
-    crate::turso_assert!(!key.is_empty(), "optimizer: seek key must not be empty");
+    turso_assert!(!key.is_empty(), "optimizer: seek key must not be empty");
     let last = key.last().unwrap();
 
     // if we searching for exact key - emit definition immediately with prefix as a full key
@@ -2228,7 +2228,7 @@ fn build_seek_def(
             },
         });
     }
-    crate::turso_assert!(
+    turso_assert!(
         last.lower_bound.is_some() || last.upper_bound.is_some(),
         "optimizer: last seek key component must have a bound"
     );

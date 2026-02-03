@@ -15,10 +15,11 @@ use crate::types::{
 };
 use crate::vdbe::make_record;
 use crate::vdbe::Register;
-use crate::{return_if_io, turso_assert, Completion, LimboError, Pager, Result};
+use crate::{return_if_io, Completion, LimboError, Pager, Result};
 use std::any::Any;
 use std::fmt::Debug;
 use std::ops::Bound;
+use turso_macros::turso_assert;
 
 #[derive(Debug, Clone)]
 enum CursorPosition {

@@ -13,7 +13,7 @@ use crate::Page;
 use crate::{
     ast, function,
     io::{MemoryIO, PlatformIO, IO},
-    match_ignore_ascii_case, parse_schema_rows, refresh_analyze_stats, translate, turso_assert,
+    match_ignore_ascii_case, parse_schema_rows, refresh_analyze_stats, translate,
     util::IOExt,
     vdbe, AllViewsTxState, AtomicCipherMode, AtomicSyncMode, AtomicTempStore,
     AtomicTransactionState, BusyHandler, BusyHandlerCallback, CaptureDataChangesMode,
@@ -27,6 +27,7 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::fmt::Display;
 use std::ops::Deref;
 use tracing::{instrument, Level};
+use turso_macros::turso_assert;
 
 /// Database connection handle.
 ///

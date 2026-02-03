@@ -11,10 +11,6 @@ use crate::storage::wal::{CheckpointMode, TursoRwLock};
 use crate::sync::atomic::Ordering;
 use crate::sync::Arc;
 use crate::sync::RwLock;
-#[allow(unused_imports)]
-use crate::turso_assert;
-#[allow(unused_imports)]
-use crate::turso_assert_eq;
 use crate::types::{IOCompletions, IOResult, ImmutableRecord};
 use crate::{
     CheckpointResult, Completion, Connection, IOExt, LimboError, Pager, Result, SyncMode,
@@ -22,6 +18,8 @@ use crate::{
 };
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::num::NonZeroU64;
+#[allow(unused_imports)]
+use turso_macros::{turso_assert, turso_assert_eq};
 
 #[derive(Debug)]
 pub enum CheckpointState {

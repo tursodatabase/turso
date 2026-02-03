@@ -15,7 +15,7 @@ use crate::{
     Arc, CaptureDataChangesMode, Connection, Value, VirtualTable,
 };
 #[allow(unused_imports)]
-use crate::{turso_assert, turso_assert_eq};
+use turso_macros::{turso_assert, turso_assert_eq};
 
 // Keep distinct hash-table ids far from table internal ids to avoid collisions.
 const HASH_TABLE_ID_BASE: usize = 1 << 30;

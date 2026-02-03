@@ -3,6 +3,9 @@ mod atomic_enum;
 mod ext;
 mod test;
 
+// Import assertion proc macro implementations
+mod assert;
+
 use proc_macro::{token_stream::IntoIter, Group, TokenStream, TokenTree};
 use std::collections::HashMap;
 
@@ -524,4 +527,439 @@ pub fn derive_atomic_enum(input: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn test(args: TokenStream, input: TokenStream) -> TokenStream {
     test::test_macro_attribute(args, input)
+}
+
+// =============================================================================
+// Turso assertion proc macros
+// =============================================================================
+
+use assert::{
+    details_json, expr_to_lit_str, ComparisonAssertInput, ConditionAssertInput, MessageAssertInput,
+};
+use quote::quote;
+use syn::parse_macro_input;
+
+/// turso_assert! is a direct replacement for assert! which under the hood
+/// uses Antithesis SDK to guide the Antithesis simulator if --features antithesis is enabled.
+///
+/// Usage:
+/// - `turso_assert!(condition)`
+/// - `turso_assert!(condition, "message")`
+/// - `turso_assert!(condition, "message", { "key": value })`
+#[proc_macro]
+pub fn turso_assert(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as ConditionAssertInput);
+    let cond = &input.condition;
+    let msg = input
+        .message
+        .clone()
+        .unwrap_or_else(|| expr_to_lit_str(cond));
+    let details = details_json(&input.details);
+
+    let assert_call = if let Some(fmt_args) = &input.format_args {
+        quote! { assert!(#cond, #msg, #fmt_args); }
+    } else {
+        quote! { assert!(#cond, "{}", #msg); }
+    };
+
+    quote! {
+        {
+            #[cfg(feature = "antithesis")]
+            {
+                antithesis_sdk::assert_always_or_unreachable!(#cond, #msg, #details);
+            }
+            #assert_call
+        }
+    }
+    .into()
+}
+
+/// turso_debug_assert! is a replacement for debug_assert! which under the hood uses Antithesis SDK
+/// to guide the Antithesis simulator if --features antithesis is enabled.
+/// Unlike turso_assert!, this only panics in debug builds.
+#[proc_macro]
+pub fn turso_debug_assert(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as ConditionAssertInput);
+    let cond = &input.condition;
+    let msg = input
+        .message
+        .clone()
+        .unwrap_or_else(|| expr_to_lit_str(cond));
+    let details = details_json(&input.details);
+
+    let assert_call = if let Some(fmt_args) = &input.format_args {
+        quote! { debug_assert!(#cond, #msg, #fmt_args); }
+    } else {
+        quote! { debug_assert!(#cond, "{}", #msg); }
+    };
+
+    quote! {
+        {
+            #[cfg(feature = "antithesis")]
+            {
+                antithesis_sdk::assert_always_or_unreachable!(#cond, #msg, #details);
+            }
+            #assert_call
+        }
+    }
+    .into()
+}
+
+/// Assert that a condition is true at least once during testing.
+/// This helps Antithesis identify rare conditions that should be triggered.
+#[proc_macro]
+pub fn turso_assert_sometimes(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as ConditionAssertInput);
+    let cond = &input.condition;
+    let msg = input
+        .message
+        .clone()
+        .unwrap_or_else(|| expr_to_lit_str(cond));
+    let details = details_json(&input.details);
+
+    quote! {
+        {
+            #[cfg(feature = "antithesis")]
+            {
+                antithesis_sdk::assert_sometimes!(#cond, #msg, #details);
+            }
+            #[cfg(not(feature = "antithesis"))]
+            {
+                let _ = #cond;
+            }
+        }
+    }
+    .into()
+}
+
+/// Assert that a condition is always true when evaluated, but only when it has been evaluated
+/// at least once. Unlike `turso_assert!`, this won't fail if the code path is never reached.
+#[proc_macro]
+pub fn turso_assert_always_some(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as ConditionAssertInput);
+    let cond = &input.condition;
+    let msg = input
+        .message
+        .clone()
+        .unwrap_or_else(|| expr_to_lit_str(cond));
+    let details = details_json(&input.details);
+
+    quote! {
+        {
+            #[cfg(feature = "antithesis")]
+            {
+                antithesis_sdk::assert_always_or_unreachable!(#cond, #msg, #details);
+            }
+            #[cfg(not(feature = "antithesis"))]
+            {
+                let _ = #cond;
+            }
+        }
+    }
+    .into()
+}
+
+/// Assert that a condition is true across all evaluations, at least once during testing.
+/// Combines "always true" with "sometimes reached".
+#[proc_macro]
+pub fn turso_assert_sometimes_all(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as ConditionAssertInput);
+    let cond = &input.condition;
+    let msg = input
+        .message
+        .clone()
+        .unwrap_or_else(|| expr_to_lit_str(cond));
+    let details = details_json(&input.details);
+
+    quote! {
+        {
+            #[cfg(feature = "antithesis")]
+            {
+                antithesis_sdk::assert_sometimes!(#cond, #msg, #details);
+            }
+            #[cfg(not(feature = "antithesis"))]
+            {
+                let _ = #cond;
+            }
+        }
+    }
+    .into()
+}
+
+/// Assert that a code path is reached at least once during testing.
+#[proc_macro]
+pub fn turso_assert_reachable(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as MessageAssertInput);
+    let msg = &input.message;
+    let details = details_json(&input.details);
+
+    quote! {
+        {
+            #[cfg(feature = "antithesis")]
+            {
+                antithesis_sdk::assert_reachable!(#msg, #details);
+            }
+        }
+    }
+    .into()
+}
+
+/// Assert that a code path is never reached during testing.
+#[proc_macro]
+pub fn turso_assert_unreachable(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as MessageAssertInput);
+    let msg = &input.message;
+    let details = details_json(&input.details);
+
+    quote! {
+        {
+            #[cfg(feature = "antithesis")]
+            {
+                antithesis_sdk::assert_unreachable!(#msg, #details);
+            }
+            unreachable!(#msg)
+        }
+    }
+    .into()
+}
+
+/// Soft unreachable assertion: signals to Antithesis that this code path should
+/// never be reached, but does NOT panic. Without the antithesis feature this is a no-op.
+#[proc_macro]
+pub fn turso_soft_unreachable(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as MessageAssertInput);
+    let msg = &input.message;
+    let details = details_json(&input.details);
+
+    quote! {
+        {
+            #[cfg(feature = "antithesis")]
+            {
+                antithesis_sdk::assert_unreachable!(#msg, #details);
+            }
+        }
+    }
+    .into()
+}
+
+/// Assert that left > right with more visibility for Antithesis.
+#[proc_macro]
+pub fn turso_assert_greater_than(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as ComparisonAssertInput);
+    let left = &input.left;
+    let right = &input.right;
+    let msg = &input.message;
+    let details = details_json(&input.details);
+
+    quote! {
+        {
+            #[cfg(feature = "antithesis")]
+            {
+                antithesis_sdk::assert_always_greater_than!(#left, #right, #msg, #details);
+            }
+            assert!(#left > #right, #msg);
+        }
+    }
+    .into()
+}
+
+/// Assert that left >= right with more visibility for Antithesis.
+#[proc_macro]
+pub fn turso_assert_greater_than_or_equal(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as ComparisonAssertInput);
+    let left = &input.left;
+    let right = &input.right;
+    let msg = &input.message;
+    let details = details_json(&input.details);
+
+    quote! {
+        {
+            #[cfg(feature = "antithesis")]
+            {
+                antithesis_sdk::assert_always_greater_than_or_equal_to!(#left, #right, #msg, #details);
+            }
+            assert!(#left >= #right, #msg);
+        }
+    }
+    .into()
+}
+
+/// Assert that left < right with more visibility for Antithesis.
+#[proc_macro]
+pub fn turso_assert_less_than(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as ComparisonAssertInput);
+    let left = &input.left;
+    let right = &input.right;
+    let msg = &input.message;
+    let details = details_json(&input.details);
+
+    quote! {
+        {
+            #[cfg(feature = "antithesis")]
+            {
+                antithesis_sdk::assert_always_less_than!(#left, #right, #msg, #details);
+            }
+            assert!(#left < #right, #msg);
+        }
+    }
+    .into()
+}
+
+/// Assert that left <= right with more visibility for Antithesis.
+#[proc_macro]
+pub fn turso_assert_less_than_or_equal(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as ComparisonAssertInput);
+    let left = &input.left;
+    let right = &input.right;
+    let msg = &input.message;
+    let details = details_json(&input.details);
+
+    quote! {
+        {
+            #[cfg(feature = "antithesis")]
+            {
+                antithesis_sdk::assert_always_less_than_or_equal_to!(#left, #right, #msg, #details);
+            }
+            assert!(#left <= #right, #msg);
+        }
+    }
+    .into()
+}
+
+/// Assert that left == right with more visibility for Antithesis.
+#[proc_macro]
+pub fn turso_assert_eq(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as ComparisonAssertInput);
+    let left = &input.left;
+    let right = &input.right;
+    let msg = &input.message;
+    let details = details_json(&input.details);
+
+    quote! {
+        {
+            #[cfg(feature = "antithesis")]
+            {
+                antithesis_sdk::assert_always!(#left == #right, #msg, #details);
+            }
+            assert_eq!(#left, #right, #msg);
+        }
+    }
+    .into()
+}
+
+/// Assert that left != right with more visibility for Antithesis.
+#[proc_macro]
+pub fn turso_assert_ne(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as ComparisonAssertInput);
+    let left = &input.left;
+    let right = &input.right;
+    let msg = &input.message;
+    let details = details_json(&input.details);
+
+    quote! {
+        {
+            #[cfg(feature = "antithesis")]
+            {
+                antithesis_sdk::assert_always!(#left != #right, #msg, #details);
+            }
+            assert_ne!(#left, #right, #msg);
+        }
+    }
+    .into()
+}
+
+/// Assert that left > right at least once during testing.
+#[proc_macro]
+pub fn turso_assert_sometimes_greater_than(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as ComparisonAssertInput);
+    let left = &input.left;
+    let right = &input.right;
+    let msg = &input.message;
+    let details = details_json(&input.details);
+
+    quote! {
+        {
+            #[cfg(feature = "antithesis")]
+            {
+                antithesis_sdk::assert_sometimes_greater_than!(#left, #right, #msg, #details);
+            }
+            #[cfg(not(feature = "antithesis"))]
+            {
+                let _ = (#left, #right);
+            }
+        }
+    }
+    .into()
+}
+
+/// Assert that left < right at least once during testing.
+#[proc_macro]
+pub fn turso_assert_sometimes_less_than(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as ComparisonAssertInput);
+    let left = &input.left;
+    let right = &input.right;
+    let msg = &input.message;
+    let details = details_json(&input.details);
+
+    quote! {
+        {
+            #[cfg(feature = "antithesis")]
+            {
+                antithesis_sdk::assert_sometimes_less_than!(#left, #right, #msg, #details);
+            }
+            #[cfg(not(feature = "antithesis"))]
+            {
+                let _ = (#left, #right);
+            }
+        }
+    }
+    .into()
+}
+
+/// Assert that left >= right at least once during testing.
+#[proc_macro]
+pub fn turso_assert_sometimes_greater_than_or_equal(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as ComparisonAssertInput);
+    let left = &input.left;
+    let right = &input.right;
+    let msg = &input.message;
+    let details = details_json(&input.details);
+
+    quote! {
+        {
+            #[cfg(feature = "antithesis")]
+            {
+                antithesis_sdk::assert_sometimes_greater_than_or_equal_to!(#left, #right, #msg, #details);
+            }
+            #[cfg(not(feature = "antithesis"))]
+            {
+                let _ = (#left, #right);
+            }
+        }
+    }
+    .into()
+}
+
+/// Assert that left <= right at least once during testing.
+#[proc_macro]
+pub fn turso_assert_sometimes_less_than_or_equal(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as ComparisonAssertInput);
+    let left = &input.left;
+    let right = &input.right;
+    let msg = &input.message;
+    let details = details_json(&input.details);
+
+    quote! {
+        {
+            #[cfg(feature = "antithesis")]
+            {
+                antithesis_sdk::assert_sometimes_less_than_or_equal_to!(#left, #right, #msg, #details);
+            }
+            #[cfg(not(feature = "antithesis"))]
+            {
+                let _ = (#left, #right);
+            }
+        }
+    }
+    .into()
 }

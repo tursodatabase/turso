@@ -1,5 +1,3 @@
-#[allow(unused_imports)]
-use crate::{turso_assert, turso_assert_eq};
 use crate::{
     vdbe::{
         builder::ProgramBuilder,
@@ -8,6 +6,8 @@ use crate::{
     },
     Result,
 };
+#[allow(unused_imports)]
+use turso_macros::{turso_assert, turso_assert_eq};
 
 use super::{
     emitter::{LimitCtx, Resolver},

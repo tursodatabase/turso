@@ -24,19 +24,19 @@ use crate::sync::{Mutex, RwLock};
 use crate::types::{IOCompletions, WalState};
 use crate::util::IOExt as _;
 use crate::{
-    io::CompletionGroup, return_if_io, turso_assert, types::WalFrameInfo, Completion, Connection,
-    IOResult, LimboError, Result, TransactionState,
+    io::CompletionGroup, return_if_io, types::WalFrameInfo, Completion, Connection, IOResult,
+    LimboError, Result, TransactionState,
 };
 use crate::{io_yield_one, Buffer, CompletionError, IOContext, OpenFlags, SyncMode, IO};
-#[allow(unused_imports)]
-use crate::{
-    turso_assert_eq, turso_assert_greater_than, turso_assert_greater_than_or_equal,
-    turso_assert_less_than, turso_assert_ne, turso_soft_unreachable,
-};
 use arc_swap::ArcSwapOption;
 use roaring::RoaringBitmap;
 use std::cell::UnsafeCell;
 use tracing::{instrument, trace, Level};
+#[allow(unused_imports)]
+use turso_macros::{
+    turso_assert, turso_assert_eq, turso_assert_greater_than, turso_assert_greater_than_or_equal,
+    turso_assert_less_than, turso_assert_ne, turso_soft_unreachable,
+};
 
 use super::btree::offset::{
     BTREE_CELL_CONTENT_AREA, BTREE_CELL_COUNT, BTREE_FIRST_FREEBLOCK, BTREE_FRAGMENTED_BYTES_COUNT,
@@ -4602,8 +4602,8 @@ impl CreateBTreeFlags {
 #[cfg(not(feature = "omit_autovacuum"))]
 pub(crate) mod ptrmap {
     #[allow(unused_imports)]
-    use crate::turso_assert_greater_than_or_equal;
-    use crate::{storage::sqlite3_ondisk::PageSize, turso_soft_unreachable, LimboError, Result};
+    use crate::{storage::sqlite3_ondisk::PageSize, LimboError, Result};
+    use turso_macros::{turso_assert_greater_than_or_equal, turso_soft_unreachable};
 
     // Constants
     pub const PTRMAP_ENTRY_SIZE: usize = 5;

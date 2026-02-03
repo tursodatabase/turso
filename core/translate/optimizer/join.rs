@@ -18,10 +18,10 @@ use crate::{
         plan::{HashJoinKey, JoinOrderMember, JoinedTable, NonFromClauseSubquery, WhereTerm},
         planner::TableMask,
     },
-    turso_assert_greater_than, LimboError, Result,
+    LimboError, Result,
 };
 #[allow(unused_imports)]
-use crate::{turso_assert, turso_assert_eq};
+use turso_macros::{turso_assert, turso_assert_eq, turso_assert_greater_than};
 
 use super::{
     access_method::{find_best_access_method_for_join_order, AccessMethod},

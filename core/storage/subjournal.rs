@@ -7,7 +7,7 @@ use crate::{
     storage::sqlite3_ondisk::finish_read_page, Buffer, Completion, CompletionError, PageRef, Result,
 };
 #[allow(unused_imports)]
-use crate::{turso_assert, turso_assert_eq};
+use turso_macros::{turso_assert, turso_assert_eq};
 
 #[derive(Clone)]
 pub struct Subjournal {

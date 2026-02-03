@@ -28,7 +28,8 @@ use crate::vdbe::{
     insn::{CmpInsFlags, Insn},
     BranchOffset,
 };
-use crate::{turso_assert, Result, Value};
+use crate::{Result, Value};
+use turso_macros::turso_assert;
 
 use super::collate::CollationSeq;
 

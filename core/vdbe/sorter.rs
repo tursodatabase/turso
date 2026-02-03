@@ -21,7 +21,7 @@ use crate::{
 };
 use crate::{io_yield_one, return_if_io, CompletionError};
 #[allow(unused_imports)]
-use crate::{turso_assert, turso_assert_eq};
+use turso_macros::{turso_assert, turso_assert_eq};
 
 #[derive(Debug, Clone, Copy)]
 enum SortState {

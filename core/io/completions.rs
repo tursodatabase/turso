@@ -9,9 +9,9 @@ use std::{
 
 use crate::sync::Mutex;
 
-#[allow(unused_imports)]
-use crate::turso_assert_eq;
 use crate::{Buffer, CompletionError};
+#[allow(unused_imports)]
+use turso_macros::turso_assert_eq;
 
 /// Callback for read completions. Returns `Some(error)` if the callback detects an error
 /// (e.g., short read), which will be stored in the completion and propagated to VDBE.

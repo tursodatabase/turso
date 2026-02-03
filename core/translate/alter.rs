@@ -1,6 +1,6 @@
 use crate::sync::Arc;
 #[allow(unused_imports)]
-use crate::{turso_assert, turso_assert_eq, turso_assert_ne};
+use turso_macros::{turso_assert, turso_assert_eq, turso_assert_ne};
 use turso_parser::{
     ast::{self, TableInternalId},
     parser::Parser,

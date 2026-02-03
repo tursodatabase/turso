@@ -109,7 +109,10 @@ pub use storage::{
     wal::{CheckpointMode, CheckpointResult, Wal, WalFile, WalFileShared},
 };
 use tracing::{instrument, Level};
-use turso_macros::{match_ignore_ascii_case, AtomicEnum};
+use turso_macros::{
+    match_ignore_ascii_case, turso_assert, turso_assert_eq, turso_assert_greater_than_or_equal,
+    AtomicEnum,
+};
 use turso_parser::{ast, ast::Cmd, parser::Parser};
 pub use types::IOResult;
 pub use types::Value;

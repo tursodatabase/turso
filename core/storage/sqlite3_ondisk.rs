@@ -62,13 +62,11 @@ use crate::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Orderin
 use crate::sync::Arc;
 use crate::sync::RwLock;
 use crate::types::{SerialType, SerialTypeKind, TextRef, TextSubtype, ValueRef};
-use crate::{
-    bail_corrupt_error, turso_assert, turso_assert_eq, turso_assert_greater_than, CompletionError,
-    File, IOContext, Result, WalFileShared,
-};
+use crate::{bail_corrupt_error, CompletionError, File, IOContext, Result, WalFileShared};
 use rustc_hash::FxHashMap;
 use std::collections::BTreeMap;
 use std::pin::Pin;
+use turso_macros::{turso_assert, turso_assert_eq, turso_assert_greater_than};
 
 /// The minimum size of a cell in bytes.
 pub const MINIMUM_CELL_SIZE: usize = 4;

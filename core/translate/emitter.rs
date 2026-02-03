@@ -60,7 +60,8 @@ use crate::vdbe::insn::{
 };
 use crate::vdbe::{insn::Insn, BranchOffset, CursorID};
 use crate::{bail_parse_error, emit_explain, Result, SymbolTable};
-use crate::{turso_assert, Connection, QueryMode};
+use crate::{Connection, QueryMode};
+use turso_macros::turso_assert;
 
 /// Initialize EXISTS subquery result registers to 0, but only for subqueries that haven't
 /// been evaluated yet (i.e., correlated subqueries that will be evaluated in the loop).

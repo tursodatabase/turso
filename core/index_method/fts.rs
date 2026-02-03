@@ -11,7 +11,6 @@ use crate::{
         pager::Pager,
     },
     translate::collate::CollationSeq,
-    turso_assert,
     types::{IOResult, ImmutableRecord, IndexInfo, KeyInfo, SeekKey, SeekOp, SeekResult, Text},
     vdbe::Register,
     Connection, LimboError, Result, Value,
@@ -35,6 +34,7 @@ use tantivy::{
     },
     DocAddress, HasLen, Index, IndexReader, IndexSettings, IndexWriter, Searcher, TantivyDocument,
 };
+use turso_macros::turso_assert;
 use turso_parser::ast::{self, Select, SortOrder};
 
 /// Name identifier for the FTS index method, used in `CREATE INDEX ... USING fts`.

@@ -17,11 +17,6 @@ use crate::sync::Arc;
 use crate::sync::{Mutex, RwLock};
 use crate::translate::emitter::TransactionMode;
 use crate::translate::plan::IterationDirection;
-use crate::turso_assert;
-use crate::turso_assert_eq;
-use crate::turso_assert_less_than;
-use crate::turso_assert_reachable;
-use crate::turso_soft_unreachable;
 use crate::types::compare_immutable;
 use crate::types::IOCompletions;
 use crate::types::IOResult;
@@ -43,6 +38,10 @@ use std::marker::PhantomData;
 use std::ops::Bound;
 use tracing::instrument;
 use tracing::Level;
+use turso_macros::{
+    turso_assert, turso_assert_eq, turso_assert_less_than, turso_assert_reachable,
+    turso_soft_unreachable,
+};
 
 pub mod checkpoint_state_machine;
 pub use checkpoint_state_machine::{CheckpointState, CheckpointStateMachine};

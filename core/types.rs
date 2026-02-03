@@ -15,8 +15,6 @@ use crate::storage::btree::CursorTrait;
 use crate::storage::sqlite3_ondisk::{read_integer, read_value, read_varint, write_varint};
 use crate::translate::collate::CollationSeq;
 use crate::translate::plan::IterationDirection;
-#[allow(unused_imports)]
-use crate::turso_soft_unreachable;
 use crate::vdbe::sorter::Sorter;
 use crate::vdbe::Register;
 use crate::vtab::VirtualTableCursor;
@@ -27,6 +25,8 @@ use std::fmt::{Debug, Display};
 use std::iter::{FusedIterator, Peekable};
 use std::ops::Deref;
 use std::task::Waker;
+#[allow(unused_imports)]
+use turso_macros::turso_soft_unreachable;
 
 /// SQLite by default uses 2000 as maximum numbers in a row.
 /// It controlld by the constant called SQLITE_MAX_COLUMN

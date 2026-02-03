@@ -8,7 +8,6 @@ use crate::{
         Arc, RwLock,
     },
     translate::collate::CollationSeq,
-    turso_assert,
     types::{IOCompletions, IOResult, Value, ValueRef},
     CompletionError, Result,
 };
@@ -16,7 +15,7 @@ use rapidhash::fast::RapidHasher;
 use std::cmp::{Eq, Ordering};
 use std::hash::Hasher;
 use std::{cell::RefCell, collections::VecDeque};
-use turso_macros::AtomicEnum;
+use turso_macros::{turso_assert, AtomicEnum};
 
 const DEFAULT_SEED: u64 = 1337;
 

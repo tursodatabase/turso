@@ -27,7 +27,7 @@
 
 use std::collections::BTreeSet;
 
-use crate::turso_assert;
+use turso_macros::turso_assert;
 
 /// The mode of usage for a RowSet.
 /// Test: the rowset will be used for set membership tests.

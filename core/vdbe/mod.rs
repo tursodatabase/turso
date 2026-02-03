@@ -53,7 +53,6 @@ use crate::{
     },
     CipherMode, ValueRef,
 };
-
 use smallvec::SmallVec;
 
 use crate::{
@@ -80,8 +79,6 @@ use turso_parser::ast::ResolveType;
 
 use crate::vdbe::bloom_filter::BloomFilter;
 use crate::vdbe::rowset::RowSet;
-#[allow(unused_imports)]
-use crate::{turso_assert, turso_assert_ne};
 use explain::{insn_to_row_with_comment, EXPLAIN_COLUMNS, EXPLAIN_QUERY_PLAN_COLUMNS};
 use regex::Regex;
 use std::{
@@ -95,6 +92,8 @@ use std::{
     task::Waker,
 };
 use tracing::{instrument, Level};
+#[allow(unused_imports)]
+use turso_macros::{turso_assert, turso_assert_ne};
 
 /// State machine for committing view deltas with I/O handling
 #[derive(Debug, Clone)]

@@ -10,13 +10,13 @@
 use crate::function::AggFunc;
 use crate::schema::{Schema, Type};
 use crate::sync::Arc;
-#[allow(unused_imports)]
-use crate::turso_assert;
 use crate::types::Value;
 use crate::{LimboError, Result};
 use rustc_hash::FxHashMap as HashMap;
 use std::fmt::{self, Display, Formatter};
 use turso_macros::match_ignore_ascii_case;
+#[allow(unused_imports)]
+use turso_macros::turso_assert;
 use turso_parser::ast;
 
 /// Result type for preprocessing aggregate expressions
