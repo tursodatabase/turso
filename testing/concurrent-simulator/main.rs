@@ -44,6 +44,9 @@ struct Args {
     /// Output path for Elle history EDN file
     #[arg(long, default_value = "elle-history.edn")]
     elle_output: String,
+    /// Dump database files to simulator-output directory after run
+    #[arg(long)]
+    dump_db: bool,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -115,6 +118,11 @@ fn main() -> anyhow::Result<()> {
 
     // Finalize properties (e.g., export Elle history)
     whopper.finalize_properties()?;
+
+    // Dump database files if requested
+    if args.dump_db {
+        whopper.dump_db_files()?;
+    }
 
     // Print Elle analysis instructions if enabled
     if args.elle.is_some() {

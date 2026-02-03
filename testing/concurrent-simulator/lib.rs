@@ -397,7 +397,7 @@ struct SimulatorContext {
 /// The Whopper deterministic simulator.
 pub struct Whopper {
     context: SimulatorContext,
-    io: Arc<dyn IO>,
+    io: Arc<SimulatorIO>,
     file_sizes: Arc<std::sync::Mutex<HashMap<String, u64>>>,
     db_path: String,
     wal_path: String,
@@ -431,9 +431,8 @@ impl Whopper {
             cosmic_ray_probability: opts.cosmic_ray_probability,
         };
 
-        let simulator_io = Arc::new(SimulatorIO::new(opts.keep_files, io_rng, fault_config));
-        let file_sizes = simulator_io.file_sizes();
-        let io = simulator_io as Arc<dyn IO>;
+        let io = Arc::new(SimulatorIO::new(opts.keep_files, io_rng, fault_config));
+        let file_sizes = io.file_sizes();
 
         let db_path = format!("whopper-{}-{}.db", seed, std::process::id());
         let wal_path = format!("{db_path}-wal");
@@ -818,6 +817,16 @@ impl Whopper {
             let mut property = property.lock().unwrap();
             property.finalize()?;
         }
+        Ok(())
+    }
+
+    /// Dump database files to simulator-output directory.
+    pub fn dump_db_files(&self) -> anyhow::Result<()> {
+        let out_dir = std::path::PathBuf::from("simulator-output");
+        if !out_dir.exists() {
+            std::fs::create_dir_all(&out_dir)?;
+        }
+        self.io.dump_files(&out_dir)?;
         Ok(())
     }
 

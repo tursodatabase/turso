@@ -57,7 +57,7 @@ else
 fi
 cargo build -p turso_whopper
 
-WHOPPER_ARGS=(--elle list-append --elle-output "$OUTPUT_FILE")
+WHOPPER_ARGS=(--elle list-append --elle-output "$OUTPUT_FILE" --dump-db)
 if [[ "$ENABLE_MVCC" -eq 1 ]]; then
     WHOPPER_ARGS+=(--enable-mvcc)
 fi
