@@ -2,9 +2,9 @@
 
 curl --fail -u "$ANTITHESIS_USER:$ANTITHESIS_PASSWD" \
   -X POST https://$ANTITHESIS_TENANT.antithesis.com/api/v1/launch/limbo \
-  -d "{\"params\": { \"antithesis.description\":\"basic_test on main\",
-      \"custom.duration\":\"4\",
+  -d "{\"params\": { \"antithesis.description\":\"Mikaël - bisecting (4028e4fdb)\",
+      \"custom.duration\":\"0.25\",
       \"antithesis.config_image\":\"$ANTITHESIS_DOCKER_REPO/limbo-config:antithesis-latest\",
       \"antithesis.images\":\"$ANTITHESIS_DOCKER_REPO/limbo-workload:antithesis-latest\",
-      \"antithesis.report.recipients\":\"$ANTITHESIS_EMAIL\"
+      \"antithesis.report.recipients\":\"mikael@turso.tech\"
       } }"
