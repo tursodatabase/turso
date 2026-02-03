@@ -219,6 +219,7 @@ enum TransactionState {
 #[derive(Debug, AtomicEnum, Clone, Copy, PartialEq, Eq)]
 pub enum SyncMode {
     Off = 0,
+    Normal = 1,
     Full = 2,
 }
 
