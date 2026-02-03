@@ -23,6 +23,8 @@ use crate::sync::Arc;
 use crate::sync::{Mutex, RwLock};
 use crate::types::{IOCompletions, WalState};
 use crate::util::IOExt as _;
+#[allow(unused_imports)]
+use crate::turso_soft_unreachable;
 use crate::{
     io::CompletionGroup, return_if_io, turso_assert, types::WalFrameInfo, Completion, Connection,
     IOResult, LimboError, Result, TransactionState,
@@ -1867,6 +1869,7 @@ impl Pager {
 
                     // Check if the calculated offset for the entry is within the bounds of the actual page data length.
                     if offset_in_ptrmap_page + PTRMAP_ENTRY_SIZE > actual_data_length {
+                        turso_soft_unreachable!("Ptrmap offset out of bounds", { "offset": offset_in_ptrmap_page, "entry_size": PTRMAP_ENTRY_SIZE, "page": ptrmap_pg_no, "data_len": actual_data_length });
                         return Err(LimboError::InternalError(format!(
                         "Ptrmap offset {offset_in_ptrmap_page} + entry size {PTRMAP_ENTRY_SIZE} out of bounds for page {ptrmap_pg_no} (actual data len {actual_data_length})"
                     )));
@@ -1915,6 +1918,7 @@ impl Pager {
                     if db_page_no_to_update < FIRST_PTRMAP_PAGE_NO
                         || is_ptrmap_page(db_page_no_to_update, page_size)
                     {
+                        turso_soft_unreachable!("Cannot set ptrmap entry for header/ptrmap page or invalid page", { "page": db_page_no_to_update });
                         return Err(LimboError::InternalError(format!(
                         "Cannot set ptrmap entry for page {db_page_no_to_update}: it's a header/ptrmap page or invalid."
                     )));
@@ -1954,6 +1958,7 @@ impl Pager {
                     let full_buffer_slice = page_content.as_ptr();
 
                     if offset_in_ptrmap_page + PTRMAP_ENTRY_SIZE > full_buffer_slice.len() {
+                        turso_soft_unreachable!("Ptrmap offset out of bounds", { "offset": offset_in_ptrmap_page, "entry_size": PTRMAP_ENTRY_SIZE, "page": ptrmap_pg_no, "data_len": full_buffer_slice.len() });
                         return Err(LimboError::InternalError(format!(
                         "Ptrmap offset {} + entry size {} out of bounds for page {} (actual data len {})",
                         offset_in_ptrmap_page,
@@ -2594,6 +2599,7 @@ impl Pager {
 
     pub fn wal_state(&self) -> Result<WalState> {
         let Some(wal) = self.wal.as_ref() else {
+            turso_soft_unreachable!("wal_state() called on database without WAL");
             return Err(LimboError::InternalError(
                 "wal_state() called on database without WAL".to_string(),
             ));
@@ -3148,6 +3154,7 @@ impl Pager {
         data_sync_retry: bool,
     ) -> Result<IOResult<()>> {
         let Some(wal) = self.wal.as_ref() else {
+            turso_soft_unreachable!("commit_dirty_pages() called without WAL");
             return Err(LimboError::InternalError(
                 "commit_dirty_pages() called without WAL".into(),
             ));
@@ -3431,6 +3438,7 @@ impl Pager {
     #[instrument(skip_all, level = Level::DEBUG)]
     pub fn wal_get_frame(&self, frame_no: u64, frame: &mut [u8]) -> Result<Completion> {
         let Some(wal) = self.wal.as_ref() else {
+            turso_soft_unreachable!("wal_get_frame() called on database without WAL");
             return Err(LimboError::InternalError(
                 "wal_get_frame() called on database without WAL".to_string(),
             ));
@@ -3441,6 +3449,7 @@ impl Pager {
     #[instrument(skip_all, level = Level::DEBUG)]
     pub fn wal_insert_frame(&self, frame_no: u64, frame: &[u8]) -> Result<WalFrameInfo> {
         let Some(wal) = self.wal.as_ref() else {
+            turso_soft_unreachable!("wal_insert_frame() called on database without WAL");
             return Err(LimboError::InternalError(
                 "wal_insert_frame() called on database without WAL".to_string(),
             ));
@@ -3535,6 +3544,7 @@ impl Pager {
         clear_page_cache: bool,
     ) -> Result<IOResult<CheckpointResult>> {
         let Some(wal) = self.wal.as_ref() else {
+            turso_soft_unreachable!("checkpoint() called on database without WAL");
             return Err(LimboError::InternalError(
                 "checkpoint() called on database without WAL".to_string(),
             ));
@@ -3784,6 +3794,7 @@ impl Pager {
         let mut attempts = 0;
         {
             let Some(wal) = self.wal.as_ref() else {
+                turso_soft_unreachable!("checkpoint_shutdown() called on database without WAL");
                 return Err(LimboError::InternalError(
                     "checkpoint_shutdown() called on database without WAL".to_string(),
                 ));
@@ -4558,7 +4569,7 @@ impl CreateBTreeFlags {
 */
 #[cfg(not(feature = "omit_autovacuum"))]
 pub(crate) mod ptrmap {
-    use crate::{storage::sqlite3_ondisk::PageSize, LimboError, Result};
+    use crate::{storage::sqlite3_ondisk::PageSize, turso_soft_unreachable, LimboError, Result};
 
     // Constants
     pub const PTRMAP_ENTRY_SIZE: usize = 5;
@@ -4598,6 +4609,7 @@ pub(crate) mod ptrmap {
     impl PtrmapEntry {
         pub fn serialize(&self, buffer: &mut [u8]) -> Result<()> {
             if buffer.len() < PTRMAP_ENTRY_SIZE {
+                turso_soft_unreachable!("Buffer too small to serialize ptrmap entry", { "expected": PTRMAP_ENTRY_SIZE, "got": buffer.len() });
                 return Err(LimboError::InternalError(format!(
                     "Buffer too small to serialize ptrmap entry. Expected at least {} bytes, got {}",
                     PTRMAP_ENTRY_SIZE,
@@ -4683,11 +4695,13 @@ pub(crate) mod ptrmap {
         if db_page_no_to_query < first_data_page_mapped
             || db_page_no_to_query > last_data_page_mapped
         {
+            turso_soft_unreachable!("Page is not mapped by ptrmap data range", { "page": db_page_no_to_query, "range_start": first_data_page_mapped, "range_end": last_data_page_mapped, "ptrmap_page": ptrmap_page_no });
             return Err(LimboError::InternalError(format!(
                 "Page {db_page_no_to_query} is not mapped by the data page range [{first_data_page_mapped}, {last_data_page_mapped}] of ptrmap page {ptrmap_page_no}"
             )));
         }
         if is_ptrmap_page(db_page_no_to_query, page_size) {
+            turso_soft_unreachable!("Page is a pointer map page and should not have an entry calculated this way", { "page": db_page_no_to_query });
             return Err(LimboError::InternalError(format!(
                 "Page {db_page_no_to_query} is a pointer map page and should not have an entry calculated this way."
             )));

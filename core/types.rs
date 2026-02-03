@@ -7,6 +7,8 @@ use turso_parser::ast::SortOrder;
 
 use crate::error::LimboError;
 use crate::ext::{ExtValue, ExtValueType};
+#[allow(unused_imports)]
+use crate::turso_soft_unreachable;
 use crate::index_method::IndexMethodCursor;
 use crate::numeric::format_float;
 use crate::pseudo::PseudoCursor;
@@ -1372,6 +1374,7 @@ impl ImmutableRecord {
     #[inline]
     pub fn first_value(&self) -> Result<ValueRef<'_>> {
         if unlikely(self.is_invalidated()) {
+            turso_soft_unreachable!("Record is invalidated");
             return Err(LimboError::InternalError("Record is invalidated".into()));
         }
         match self.iter()?.next() {
@@ -1383,6 +1386,7 @@ impl ImmutableRecord {
     #[inline]
     pub fn get_value(&self, idx: usize) -> Result<ValueRef<'_>> {
         if unlikely(self.is_invalidated()) {
+            turso_soft_unreachable!("Record is invalidated");
             return Err(LimboError::InternalError("Record is invalidated".into()));
         }
         let mut iter = self.iter()?;

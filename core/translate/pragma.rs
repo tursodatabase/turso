@@ -12,6 +12,8 @@ use super::integrity_check::{
 };
 use crate::pragma::pragma_for;
 use crate::schema::Schema;
+#[allow(unused_imports)]
+use crate::turso_soft_unreachable;
 use crate::storage::encryption::{CipherMode, EncryptionKey};
 use crate::storage::pager::AutoVacuumMode;
 use crate::storage::pager::Pager;
@@ -978,6 +980,7 @@ fn update_cache_size(
             .unwrap_or_default()
             .get() as i64;
         if page_size == 0 {
+            turso_soft_unreachable!("Page size cannot be zero");
             return Err(LimboError::InternalError(
                 "Page size cannot be zero".to_string(),
             ));

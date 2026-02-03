@@ -3,6 +3,9 @@
 #[cfg(not(feature = "antithesis"))]
 #[macro_export]
 macro_rules! turso_assert {
+    ($cond:expr, $msg:literal, { $($details:tt)* }) => {
+        assert!($cond, $msg);
+    };
     ($cond:expr, $msg:literal, $($optional:tt)+) => {
         assert!($cond, $msg, $($optional)+);
     };
@@ -14,6 +17,10 @@ macro_rules! turso_assert {
 #[cfg(feature = "antithesis")]
 #[macro_export]
 macro_rules! turso_assert {
+    ($cond:expr, $msg:literal, { $($details:tt)* }) => {
+        antithesis_sdk::assert_always_or_unreachable!($cond, $msg, &serde_json::json!({ $($details)* }));
+        assert!($cond, $msg);
+    };
     ($cond:expr, $msg:literal, $($optional:tt)+) => {
         antithesis_sdk::assert_always_or_unreachable!($cond, $msg);
         assert!($cond, $msg, $($optional)+);
@@ -69,6 +76,9 @@ macro_rules! turso_assert_sometimes {
 #[cfg(not(feature = "antithesis"))]
 #[macro_export]
 macro_rules! turso_assert_reachable {
+    ($msg:literal, { $($details:tt)* }) => {
+        // When not using Antithesis, this is a no-op
+    };
     ($msg:literal) => {
         // When not using Antithesis, this is a no-op
     };
@@ -77,6 +87,9 @@ macro_rules! turso_assert_reachable {
 #[cfg(feature = "antithesis")]
 #[macro_export]
 macro_rules! turso_assert_reachable {
+    ($msg:literal, { $($details:tt)* }) => {
+        antithesis_sdk::assert_reachable!($msg, &serde_json::json!({ $($details)* }));
+    };
     ($msg:literal) => {
         antithesis_sdk::assert_reachable!($msg);
     };
@@ -86,6 +99,9 @@ macro_rules! turso_assert_reachable {
 #[cfg(not(feature = "antithesis"))]
 #[macro_export]
 macro_rules! turso_assert_unreachable {
+    ($msg:literal, { $($details:tt)* }) => {
+        unreachable!($msg)
+    };
     ($msg:literal) => {
         unreachable!($msg)
     };
@@ -94,16 +110,48 @@ macro_rules! turso_assert_unreachable {
 #[cfg(feature = "antithesis")]
 #[macro_export]
 macro_rules! turso_assert_unreachable {
+    ($msg:literal, { $($details:tt)* }) => {{
+        antithesis_sdk::assert_unreachable!($msg, &serde_json::json!({ $($details)* }));
+        unreachable!($msg)
+    }};
     ($msg:literal) => {{
         antithesis_sdk::assert_unreachable!($msg);
         unreachable!($msg)
     }};
 }
 
+/// Soft unreachable assertion: signals to Antithesis that this code path should
+/// never be reached, but does NOT panic. Execution continues to the subsequent
+/// error return. Without the antithesis feature this is a no-op.
+#[cfg(not(feature = "antithesis"))]
+#[macro_export]
+macro_rules! turso_soft_unreachable {
+    ($msg:literal, { $($details:tt)* }) => {
+        // no-op without Antithesis
+    };
+    ($msg:literal) => {
+        // no-op without Antithesis
+    };
+}
+
+#[cfg(feature = "antithesis")]
+#[macro_export]
+macro_rules! turso_soft_unreachable {
+    ($msg:literal, { $($details:tt)* }) => {
+        antithesis_sdk::assert_unreachable!($msg, &serde_json::json!({ $($details)* }));
+    };
+    ($msg:literal) => {
+        antithesis_sdk::assert_unreachable!($msg);
+    };
+}
+
 /// Assert that left > right with more visibility for Antithesis.
 #[cfg(not(feature = "antithesis"))]
 #[macro_export]
 macro_rules! turso_assert_greater_than {
+    ($left:expr, $right:expr, $msg:literal, { $($details:tt)* }) => {
+        assert!($left > $right, $msg);
+    };
     ($left:expr, $right:expr, $msg:literal) => {
         assert!($left > $right, $msg);
     };
@@ -112,6 +160,10 @@ macro_rules! turso_assert_greater_than {
 #[cfg(feature = "antithesis")]
 #[macro_export]
 macro_rules! turso_assert_greater_than {
+    ($left:expr, $right:expr, $msg:literal, { $($details:tt)* }) => {
+        antithesis_sdk::assert_always_greater_than!($left, $right, $msg, &serde_json::json!({ $($details)* }));
+        assert!($left > $right, $msg);
+    };
     ($left:expr, $right:expr, $msg:literal) => {
         antithesis_sdk::assert_always_greater_than!($left, $right, $msg);
         assert!($left > $right, $msg);
@@ -124,6 +176,9 @@ macro_rules! turso_assert_greater_than {
 #[cfg(not(feature = "antithesis"))]
 #[macro_export]
 macro_rules! turso_assert_greater_than_or_equal {
+    ($left:expr, $right:expr, $msg:literal, { $($details:tt)* }) => {
+        assert!($left >= $right, $msg);
+    };
     ($left:expr, $right:expr, $msg:literal) => {
         assert!($left >= $right, $msg);
     };
@@ -132,6 +187,10 @@ macro_rules! turso_assert_greater_than_or_equal {
 #[cfg(feature = "antithesis")]
 #[macro_export]
 macro_rules! turso_assert_greater_than_or_equal {
+    ($left:expr, $right:expr, $msg:literal, { $($details:tt)* }) => {
+        // Bug in SDK: antithesis_sdk::assert_always_greater_than_or_equal_to!($left, $right, $msg, &serde_json::json!({ $($details)* }));
+        assert!($left >= $right, $msg);
+    };
     ($left:expr, $right:expr, $msg:literal) => {
         // Bug in SDK: antithesis_sdk::assert_always_greater_than_or_equal_to!($left, $right, $msg);
         assert!($left >= $right, $msg);
@@ -144,6 +203,9 @@ macro_rules! turso_assert_greater_than_or_equal {
 #[cfg(not(feature = "antithesis"))]
 #[macro_export]
 macro_rules! turso_assert_less_than {
+    ($left:expr, $right:expr, $msg:literal, { $($details:tt)* }) => {
+        assert!($left < $right, $msg);
+    };
     ($left:expr, $right:expr, $msg:literal) => {
         assert!($left < $right, $msg);
     };
@@ -152,6 +214,10 @@ macro_rules! turso_assert_less_than {
 #[cfg(feature = "antithesis")]
 #[macro_export]
 macro_rules! turso_assert_less_than {
+    ($left:expr, $right:expr, $msg:literal, { $($details:tt)* }) => {
+        // Bug in SDK: antithesis_sdk::assert_always_less_than!($left, $right, $msg, &serde_json::json!({ $($details)* }));
+        assert!($left < $right, $msg);
+    };
     ($left:expr, $right:expr, $msg:literal) => {
         // Bug in SDK: antithesis_sdk::assert_always_less_than!($left, $right, $msg);
         assert!($left < $right, $msg);
@@ -164,6 +230,9 @@ macro_rules! turso_assert_less_than {
 #[cfg(not(feature = "antithesis"))]
 #[macro_export]
 macro_rules! turso_assert_less_than_or_equal {
+    ($left:expr, $right:expr, $msg:literal, { $($details:tt)* }) => {
+        assert!($left <= $right, $msg);
+    };
     ($left:expr, $right:expr, $msg:literal) => {
         assert!($left <= $right, $msg);
     };
@@ -172,6 +241,10 @@ macro_rules! turso_assert_less_than_or_equal {
 #[cfg(feature = "antithesis")]
 #[macro_export]
 macro_rules! turso_assert_less_than_or_equal {
+    ($left:expr, $right:expr, $msg:literal, { $($details:tt)* }) => {
+        // Bug in SDK: antithesis_sdk::assert_always_less_than_or_equal_to!($left, $right, $msg, &serde_json::json!({ $($details)* }));
+        assert!($left <= $right, $msg);
+    };
     ($left:expr, $right:expr, $msg:literal) => {
         // Bug in SDK: antithesis_sdk::assert_always_less_than_or_equal_to!($left, $right, $msg);
         assert!($left <= $right, $msg);
@@ -182,6 +255,9 @@ macro_rules! turso_assert_less_than_or_equal {
 #[cfg(not(feature = "antithesis"))]
 #[macro_export]
 macro_rules! turso_assert_eq {
+    ($left:expr, $right:expr, $msg:literal, { $($details:tt)* }) => {
+        assert_eq!($left, $right, $msg);
+    };
     ($left:expr, $right:expr, $msg:literal) => {
         assert_eq!($left, $right, $msg);
     };
@@ -190,6 +266,10 @@ macro_rules! turso_assert_eq {
 #[cfg(feature = "antithesis")]
 #[macro_export]
 macro_rules! turso_assert_eq {
+    ($left:expr, $right:expr, $msg:literal, { $($details:tt)* }) => {
+        antithesis_sdk::assert_always!($left == $right, $msg, &serde_json::json!({ $($details)* }));
+        assert_eq!($left, $right, $msg);
+    };
     ($left:expr, $right:expr, $msg:literal) => {
         antithesis_sdk::assert_always!($left == $right, $msg);
         assert_eq!($left, $right, $msg);
@@ -200,6 +280,9 @@ macro_rules! turso_assert_eq {
 #[cfg(not(feature = "antithesis"))]
 #[macro_export]
 macro_rules! turso_assert_ne {
+    ($left:expr, $right:expr, $msg:literal, { $($details:tt)* }) => {
+        assert_ne!($left, $right, $msg);
+    };
     ($left:expr, $right:expr, $msg:literal) => {
         assert_ne!($left, $right, $msg);
     };
@@ -208,6 +291,10 @@ macro_rules! turso_assert_ne {
 #[cfg(feature = "antithesis")]
 #[macro_export]
 macro_rules! turso_assert_ne {
+    ($left:expr, $right:expr, $msg:literal, { $($details:tt)* }) => {
+        antithesis_sdk::assert_always!($left != $right, $msg, &serde_json::json!({ $($details)* }));
+        assert_ne!($left, $right, $msg);
+    };
     ($left:expr, $right:expr, $msg:literal) => {
         antithesis_sdk::assert_always!($left != $right, $msg);
         assert_ne!($left, $right, $msg);
@@ -218,6 +305,9 @@ macro_rules! turso_assert_ne {
 #[cfg(not(feature = "antithesis"))]
 #[macro_export]
 macro_rules! turso_assert_sometimes_greater_than {
+    ($left:expr, $right:expr, $msg:literal, { $($details:tt)* }) => {
+        let _ = ($left, $right);
+    };
     ($left:expr, $right:expr, $msg:literal) => {
         let _ = ($left, $right);
     };
@@ -226,6 +316,9 @@ macro_rules! turso_assert_sometimes_greater_than {
 #[cfg(feature = "antithesis")]
 #[macro_export]
 macro_rules! turso_assert_sometimes_greater_than {
+    ($left:expr, $right:expr, $msg:literal, { $($details:tt)* }) => {
+        antithesis_sdk::assert_sometimes_greater_than!($left, $right, $msg, &serde_json::json!({ $($details)* }));
+    };
     ($left:expr, $right:expr, $msg:literal) => {
         antithesis_sdk::assert_sometimes_greater_than!($left, $right, $msg);
     };
@@ -235,6 +328,9 @@ macro_rules! turso_assert_sometimes_greater_than {
 #[cfg(not(feature = "antithesis"))]
 #[macro_export]
 macro_rules! turso_assert_sometimes_less_than {
+    ($left:expr, $right:expr, $msg:literal, { $($details:tt)* }) => {
+        let _ = ($left, $right);
+    };
     ($left:expr, $right:expr, $msg:literal) => {
         let _ = ($left, $right);
     };
@@ -243,6 +339,9 @@ macro_rules! turso_assert_sometimes_less_than {
 #[cfg(feature = "antithesis")]
 #[macro_export]
 macro_rules! turso_assert_sometimes_less_than {
+    ($left:expr, $right:expr, $msg:literal, { $($details:tt)* }) => {
+        antithesis_sdk::assert_sometimes_less_than!($left, $right, $msg, &serde_json::json!({ $($details)* }));
+    };
     ($left:expr, $right:expr, $msg:literal) => {
         antithesis_sdk::assert_sometimes_less_than!($left, $right, $msg);
     };
@@ -252,6 +351,9 @@ macro_rules! turso_assert_sometimes_less_than {
 #[cfg(not(feature = "antithesis"))]
 #[macro_export]
 macro_rules! turso_assert_sometimes_greater_than_or_equal {
+    ($left:expr, $right:expr, $msg:literal, { $($details:tt)* }) => {
+        let _ = ($left, $right);
+    };
     ($left:expr, $right:expr, $msg:literal) => {
         let _ = ($left, $right);
     };
@@ -260,6 +362,9 @@ macro_rules! turso_assert_sometimes_greater_than_or_equal {
 #[cfg(feature = "antithesis")]
 #[macro_export]
 macro_rules! turso_assert_sometimes_greater_than_or_equal {
+    ($left:expr, $right:expr, $msg:literal, { $($details:tt)* }) => {
+        antithesis_sdk::assert_sometimes_greater_than_or_equal_to!($left, $right, $msg, &serde_json::json!({ $($details)* }));
+    };
     ($left:expr, $right:expr, $msg:literal) => {
         antithesis_sdk::assert_sometimes_greater_than_or_equal_to!($left, $right, $msg);
     };
@@ -269,6 +374,9 @@ macro_rules! turso_assert_sometimes_greater_than_or_equal {
 #[cfg(not(feature = "antithesis"))]
 #[macro_export]
 macro_rules! turso_assert_sometimes_less_than_or_equal {
+    ($left:expr, $right:expr, $msg:literal, { $($details:tt)* }) => {
+        let _ = ($left, $right);
+    };
     ($left:expr, $right:expr, $msg:literal) => {
         let _ = ($left, $right);
     };
@@ -277,6 +385,9 @@ macro_rules! turso_assert_sometimes_less_than_or_equal {
 #[cfg(feature = "antithesis")]
 #[macro_export]
 macro_rules! turso_assert_sometimes_less_than_or_equal {
+    ($left:expr, $right:expr, $msg:literal, { $($details:tt)* }) => {
+        antithesis_sdk::assert_sometimes_less_than_or_equal_to!($left, $right, $msg, &serde_json::json!({ $($details)* }));
+    };
     ($left:expr, $right:expr, $msg:literal) => {
         antithesis_sdk::assert_sometimes_less_than_or_equal_to!($left, $right, $msg);
     };
@@ -287,6 +398,10 @@ macro_rules! turso_assert_sometimes_less_than_or_equal {
 #[cfg(not(feature = "antithesis"))]
 #[macro_export]
 macro_rules! turso_assert_always_some {
+    ($cond:expr, $msg:literal, { $($details:tt)* }) => {
+        // When not using Antithesis, this is a no-op
+        let _ = $cond;
+    };
     ($cond:expr, $msg:literal) => {
         // When not using Antithesis, this is a no-op
         let _ = $cond;
@@ -296,6 +411,9 @@ macro_rules! turso_assert_always_some {
 #[cfg(feature = "antithesis")]
 #[macro_export]
 macro_rules! turso_assert_always_some {
+    ($cond:expr, $msg:literal, { $($details:tt)* }) => {
+        antithesis_sdk::assert_always_some!($cond, $msg, &serde_json::json!({ $($details)* }));
+    };
     ($cond:expr, $msg:literal) => {
         antithesis_sdk::assert_always_some!($cond, $msg);
     };
@@ -306,6 +424,10 @@ macro_rules! turso_assert_always_some {
 #[cfg(not(feature = "antithesis"))]
 #[macro_export]
 macro_rules! turso_assert_sometimes_all {
+    ($cond:expr, $msg:literal, { $($details:tt)* }) => {
+        // When not using Antithesis, this is a no-op
+        let _ = $cond;
+    };
     ($cond:expr, $msg:literal) => {
         // When not using Antithesis, this is a no-op
         let _ = $cond;
@@ -315,6 +437,9 @@ macro_rules! turso_assert_sometimes_all {
 #[cfg(feature = "antithesis")]
 #[macro_export]
 macro_rules! turso_assert_sometimes_all {
+    ($cond:expr, $msg:literal, { $($details:tt)* }) => {
+        antithesis_sdk::assert_sometimes_all!($cond, $msg, &serde_json::json!({ $($details)* }));
+    };
     ($cond:expr, $msg:literal) => {
         antithesis_sdk::assert_sometimes_all!($cond, $msg);
     };

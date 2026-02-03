@@ -28,6 +28,8 @@ use crate::{
     },
     LimboError, Result,
 };
+#[allow(unused_imports)]
+use crate::turso_soft_unreachable;
 use constraints::{
     constraints_from_where_clause, usable_constraints_for_join_order, Constraint, ConstraintRef,
 };
@@ -778,6 +780,7 @@ fn optimize_subqueries(plan: &mut SelectPlan, schema: &Schema) -> Result<()> {
                     }
                 }
                 Plan::Delete(_) | Plan::Update(_) => {
+                    turso_soft_unreachable!("DELETE/UPDATE plans should not appear in FROM clause subqueries");
                     return Err(LimboError::InternalError(
                         "DELETE/UPDATE plans should not appear in FROM clause subqueries"
                             .to_string(),

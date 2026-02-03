@@ -1,3 +1,5 @@
+#[allow(unused_imports)]
+use crate::turso_soft_unreachable;
 use branches::mark_unlikely;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use smallvec::SmallVec;
@@ -4462,6 +4464,7 @@ impl BTreeCursor {
                                     .get()
                         {
                             self.overflow_state = OverflowState::Start;
+                            turso_soft_unreachable!("Invalid overflow page number");
                             return Err(LimboError::Corrupt("Invalid overflow page number".into()));
                         }
                         let (page, c) = self.read_page(next_page as i64)?;
@@ -4494,6 +4497,7 @@ impl BTreeCursor {
                                     .get()
                         {
                             self.overflow_state = OverflowState::Start;
+                            turso_soft_unreachable!("Invalid overflow page number");
                             return Err(LimboError::Corrupt("Invalid overflow page number".into()));
                         }
                         let (page, c) = self.read_page(next as i64)?;

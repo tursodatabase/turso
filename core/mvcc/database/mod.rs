@@ -18,6 +18,8 @@ use crate::sync::{Mutex, RwLock};
 use crate::translate::emitter::TransactionMode;
 use crate::translate::plan::IterationDirection;
 use crate::turso_assert;
+#[allow(unused_imports)]
+use crate::turso_soft_unreachable;
 use crate::types::compare_immutable;
 use crate::types::IOCompletions;
 use crate::types::IOResult;
@@ -2992,6 +2994,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                         let val = match record.get_value_opt(3) {
                             Some(v) => v,
                             None => {
+                                turso_soft_unreachable!("Expected at least 4 columns in sqlite_schema");
                                 return Err(LimboError::InternalError(
                                     "Expected at least 4 columns in sqlite_schema".to_string(),
                                 ));

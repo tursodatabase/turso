@@ -11,6 +11,8 @@ use crate::translate::planner::ROWID_STRS;
 use crate::types::IOResult;
 use crate::util::{exprs_are_equivalent, normalize_ident};
 use crate::vdbe::affinity::Affinity;
+#[allow(unused_imports)]
+use crate::turso_soft_unreachable;
 use crate::{return_if_io, turso_assert};
 use turso_macros::AtomicEnum;
 
@@ -858,6 +860,7 @@ impl Schema {
                         // Skip creating this index - it will be added later when its schema row is processed
                         continue;
                     } else {
+                        turso_soft_unreachable!("Missing automatic index entry for primary key on table", { "table": table.name });
                         return Err(LimboError::InternalError(format!(
                             "Missing automatic index entry for primary key on table {}",
                             table.name
@@ -887,6 +890,7 @@ impl Schema {
                         // Skip creating this index - it will be added later when its schema row is processed
                         continue;
                     } else {
+                        turso_soft_unreachable!("Missing automatic index entry for UNIQUE constraint on table", { "table": table.name });
                         return Err(LimboError::InternalError(format!(
                             "Missing automatic index entry for UNIQUE constraint on table {}",
                             table.name
