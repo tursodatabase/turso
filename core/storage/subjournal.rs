@@ -6,6 +6,8 @@ use crate::sync::{
 use crate::{
     storage::sqlite3_ondisk::finish_read_page, Buffer, Completion, CompletionError, PageRef, Result,
 };
+#[allow(unused_imports)]
+use crate::{turso_assert, turso_assert_eq};
 
 #[derive(Clone)]
 pub struct Subjournal {
@@ -35,9 +37,9 @@ impl Subjournal {
         let result = self
             .in_use
             .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst);
-        assert!(
+        turso_assert!(
             result.is_ok(),
-            "try_start_use must succeed before stop_use call"
+            "subjournal: try_start_use must succeed before stop_use call"
         );
     }
 
@@ -56,17 +58,19 @@ impl Subjournal {
         buffer: Arc<Buffer>,
         c: Completion,
     ) -> Result<Completion> {
-        assert!(
-            buffer.len() == page_size + 4,
-            "buffer length should be page_size + 4 bytes for page id"
+        turso_assert_eq!(
+            buffer.len(),
+            page_size + 4,
+            "subjournal: buffer length should be page_size + 4 bytes for page id"
         );
         self.file.pwrite(offset, buffer, c)
     }
 
     pub fn read_page_number(&self, offset: u64, page_id_buffer: Arc<Buffer>) -> Result<Completion> {
-        assert!(
-            page_id_buffer.len() == 4,
-            "page_id_buffer length should be 4 bytes"
+        turso_assert_eq!(
+            page_id_buffer.len(),
+            4,
+            "subjournal: page_id_buffer length should be 4 bytes"
         );
         let c = Completion::new_read(
             page_id_buffer,
@@ -99,9 +103,10 @@ impl Subjournal {
         page: PageRef,
         page_size: usize,
     ) -> Result<Completion> {
-        assert!(
-            buffer.len() == page_size,
-            "buffer length should be page_size"
+        turso_assert_eq!(
+            buffer.len(),
+            page_size,
+            "subjournal: buffer length should be page_size"
         );
         let c = Completion::new_read(
             buffer,
