@@ -47,10 +47,7 @@ pub(crate) fn lift_common_subexpressions_from_binary_or_terms(
         // e.g. a OR b OR c becomes effectively OR [a,b,c].
         let or_operands = flatten_or_expr_owned(term_expr_owned)?;
 
-        turso_assert!(
-            or_operands.len() > 1,
-            "optimizer: OR expression must have more than one operand"
-        );
+        turso_assert!(or_operands.len() > 1);
 
         // Each OR operand is potentially an AND chain, e.g.
         // (a AND b) OR (c AND d).
@@ -166,10 +163,7 @@ fn flatten_and_expr_owned(expr: Expr) -> Result<Vec<Expr>> {
 
 /// Rebuild an ast::Expr::Binary(lhs, AND, rhs) for a list of conjuncts.
 fn rebuild_and_expr_from_list(mut conjuncts: Vec<Expr>) -> Expr {
-    turso_assert!(
-        !conjuncts.is_empty(),
-        "optimizer: conjuncts list must not be empty"
-    );
+    turso_assert!(!conjuncts.is_empty());
 
     if conjuncts.len() == 1 {
         return conjuncts.pop().unwrap();

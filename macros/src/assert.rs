@@ -126,12 +126,13 @@ impl Parse for MessageAssertInput {
 
 /// Input for comparison assertions: turso_assert_eq!, turso_assert_greater_than!, etc.
 /// Supports:
+/// - `(left, right)`
 /// - `(left, right, "msg")`
 /// - `(left, right, "msg", { ... })`
 pub struct ComparisonAssertInput {
     pub left: Expr,
     pub right: Expr,
-    pub message: LitStr,
+    pub message: Option<LitStr>,
     pub details: Option<TokenStream2>,
 }
 
@@ -140,7 +141,26 @@ impl Parse for ComparisonAssertInput {
         let left: Expr = input.parse()?;
         input.parse::<Token![,]>()?;
         let right: Expr = input.parse()?;
+
+        if !input.peek(Token![,]) {
+            return Ok(ComparisonAssertInput {
+                left,
+                right,
+                message: None,
+                details: None,
+            });
+        }
         input.parse::<Token![,]>()?;
+
+        if !input.peek(LitStr) {
+            return Ok(ComparisonAssertInput {
+                left,
+                right,
+                message: None,
+                details: None,
+            });
+        }
+
         let message: LitStr = input.parse()?;
 
         let details = if input.peek(Token![,]) {
@@ -160,15 +180,27 @@ impl Parse for ComparisonAssertInput {
         Ok(ComparisonAssertInput {
             left,
             right,
-            message,
+            message: Some(message),
             details,
         })
     }
 }
 
-/// Convert an expression to a string literal token
+/// Generate an auto-message for comparison assertions from the left/right expressions and operator.
+/// Braces are escaped so the message is safe to use as a format string in `assert!`.
+pub fn comparison_auto_message(left: &Expr, right: &Expr, op: &str) -> LitStr {
+    let left_str = left.to_token_stream().to_string();
+    let right_str = right.to_token_stream().to_string();
+    let msg = format!("{left_str} {op} {right_str}");
+    let msg = msg.replace('{', "{{").replace('}', "}}");
+    LitStr::new(&msg, Span::call_site())
+}
+
+/// Convert an expression to a string literal token.
+/// Braces are escaped so the message is safe to use as a format string in `assert!`.
 pub fn expr_to_lit_str(expr: &Expr) -> LitStr {
     let expr_str = expr.to_token_stream().to_string();
+    let expr_str = expr_str.replace('{', "{{").replace('}', "}}");
     LitStr::new(&expr_str, Span::call_site())
 }
 

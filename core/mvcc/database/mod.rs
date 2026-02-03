@@ -491,10 +491,7 @@ impl TransactionState {
             TransactionState::Committed(ts) => {
                 // We only support 2*62 - 1 timestamps, because the extra bit
                 // is used to encode the type.
-                turso_assert!(
-                    ts & 0x8000_0000_0000_0000 == 0,
-                    "mvcc: commit timestamp exceeds max supported value"
-                );
+                turso_assert!(ts & 0x8000_0000_0000_0000 == 0);
                 0x8000_0000_0000_0000 | ts
             }
         }
@@ -712,11 +709,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                         return Err(LimboError::TxTerminated);
                     }
                     _ => {
-                        turso_assert_eq!(
-                            tx.state,
-                            TransactionState::Active,
-                            "mvcc: tx must be Active"
-                        );
+                        turso_assert_eq!(tx.state, TransactionState::Active);
                     }
                 }
 
@@ -1090,11 +1083,7 @@ impl StateTransition for WriteRowStateMachine {
                         return Ok(TransitionResult::Io(io));
                     }
                 }
-                turso_assert_eq!(
-                    self.cursor.write().valid_state,
-                    CursorValidState::Valid,
-                    "mvcc: cursor must be valid before insert"
-                );
+                turso_assert_eq!(self.cursor.write().valid_state, CursorValidState::Valid);
                 self.state = WriteRowState::Insert;
                 Ok(TransitionResult::Continue)
             }
@@ -1466,11 +1455,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             .get(&tx_id)
             .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
         let tx = tx.value();
-        turso_assert_eq!(
-            tx.state,
-            TransactionState::Active,
-            "mvcc: tx must be Active"
-        );
+        turso_assert_eq!(tx.state, TransactionState::Active);
         let id = row.id.clone();
         match maybe_index_id {
             Some(index_id) => {
@@ -1569,11 +1554,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             .get(&tx_id)
             .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
         let tx = tx.value();
-        turso_assert_eq!(
-            tx.state,
-            TransactionState::Active,
-            "mvcc: tx must be Active"
-        );
+        turso_assert_eq!(tx.state, TransactionState::Active);
         let id = row.id.clone();
         match maybe_index_id {
             Some(index_id) => {
@@ -1710,11 +1691,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                             .get(&tx_id)
                             .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
                         let tx = tx.value();
-                        turso_assert_eq!(
-                            tx.state,
-                            TransactionState::Active,
-                            "mvcc: tx must be Active"
-                        );
+                        turso_assert_eq!(tx.state, TransactionState::Active);
                         // A transaction cannot delete a version that it cannot see,
                         // nor can it conflict with it.
                         if !rv.is_visible_to(tx, &self.txs) {
@@ -1751,11 +1728,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                             .get(&tx_id)
                             .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
                         let tx = tx.value();
-                        turso_assert_eq!(
-                            tx.state,
-                            TransactionState::Active,
-                            "mvcc: tx must be Active"
-                        );
+                        turso_assert_eq!(tx.state, TransactionState::Active);
                         // A transaction cannot delete a version that it cannot see,
                         // nor can it conflict with it.
                         if !rv.is_visible_to(tx, &self.txs) {
@@ -1826,11 +1799,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             .get(&tx_id)
             .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
         let tx = tx.value();
-        turso_assert_eq!(
-            tx.state,
-            TransactionState::Active,
-            "mvcc: tx must be Active"
-        );
+        turso_assert_eq!(tx.state, TransactionState::Active);
         match maybe_index_id {
             Some(index_id) => {
                 let rows = self.index_rows.get_or_insert_with(index_id, SkipMap::new);
@@ -2468,8 +2437,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         let tx = tx_unlocked.value();
         connection.set_mv_tx(None);
         turso_assert!(
-            tx.state == TransactionState::Active || tx.state == TransactionState::Preparing,
-            "mvcc: tx must be Active or Preparing at rollback"
+            tx.state == TransactionState::Active || tx.state == TransactionState::Preparing
         );
         tx.state.store(TransactionState::Aborted);
         tracing::trace!("abort(tx_id={})", tx_id);

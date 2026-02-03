@@ -52,11 +52,7 @@ impl LogHeader {
         let padding = 64 - header_size_before_padding;
         turso_debug_assert!(header_size_before_padding <= LOG_HEADER_MAX_SIZE);
         buffer.extend_from_slice(&LOG_HEADER_PADDING[0..padding]);
-        turso_assert_eq!(
-            buffer.len() - buffer_size_start,
-            LOG_HEADER_MAX_SIZE,
-            "mvcc: log header size mismatch"
-        );
+        turso_assert_eq!(buffer.len() - buffer_size_start, LOG_HEADER_MAX_SIZE);
     }
 }
 

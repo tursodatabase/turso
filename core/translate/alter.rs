@@ -143,11 +143,7 @@ pub fn translate_alter_table(
             let column_name = column_name.as_str();
 
             // Tables always have at least one column.
-            turso_assert_ne!(
-                btree.columns.len(),
-                0,
-                "alter: tables must have at least one column"
-            );
+            turso_assert!(!btree.columns.is_empty());
 
             if btree.columns.len() == 1 {
                 return Err(LimboError::ParseError(format!(
@@ -596,11 +592,7 @@ pub fn translate_alter_table(
 
             program.cursor_loop(cursor_id, |program, rowid| {
                 let sqlite_schema_column_len = sqlite_schema.columns.len();
-                turso_assert_eq!(
-                    sqlite_schema_column_len,
-                    5,
-                    "alter: sqlite_schema must have 5 columns"
-                );
+                turso_assert_eq!(sqlite_schema_column_len, 5);
 
                 let first_column = program.alloc_registers(sqlite_schema_column_len);
 
@@ -867,11 +859,7 @@ pub fn translate_alter_table(
 
             program.cursor_loop(cursor_id, |program, rowid| {
                 let sqlite_schema_column_len = sqlite_schema.columns.len();
-                turso_assert_eq!(
-                    sqlite_schema_column_len,
-                    5,
-                    "alter: sqlite_schema must have 5 columns"
-                );
+                turso_assert_eq!(sqlite_schema_column_len, 5);
 
                 let first_column = program.alloc_registers(sqlite_schema_column_len);
 
@@ -1009,7 +997,7 @@ fn translate_rename_virtual_table(
 
     program.cursor_loop(schema_cur, |program, rowid| {
         let ncols = sqlite_schema.columns.len();
-        turso_assert_eq!(ncols, 5, "alter: sqlite_schema must have 5 columns");
+        turso_assert_eq!(ncols, 5);
 
         let first_col = program.alloc_registers(ncols);
         for i in 0..ncols {

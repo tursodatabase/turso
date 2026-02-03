@@ -2865,11 +2865,7 @@ impl BTreeCursor {
                         {
                             let contents = page.get_contents();
                             debug_validate_cells!(&contents, usable_space);
-                            turso_assert_eq!(
-                                contents.page_type().ok(),
-                                page_type_of_siblings,
-                                "btree: sibling page type mismatch during balance"
-                            );
+                            turso_assert_eq!(contents.page_type().ok(), page_type_of_siblings);
                         }
                     }
                     // Start balancing.
@@ -3122,11 +3118,7 @@ impl BTreeCursor {
                         for cell in &cell_array.cell_payloads {
                             cells_debug.push(cell.to_vec());
                             if is_leaf {
-                                turso_assert_ne!(
-                                    cell[0],
-                                    0,
-                                    "btree: leaf cell first byte must be non-zero"
-                                );
+                                turso_assert_ne!(cell[0], 0);
                             }
                         }
                     }
@@ -3386,8 +3378,7 @@ impl BTreeCursor {
                                 cell_array.cell_count_per_page_cumulative[i - 2]
                             } else {
                                 0
-                            },
-                            "btree: cell count per page must be increasing"
+                            }
                         );
                     }
 
@@ -3800,11 +3791,7 @@ impl BTreeCursor {
                         // child page into the parent, decreasing the overall height of the
                         // b-tree structure by one. This is described as the "balance-shallower"
                         // sub-algorithm in some documentation.
-                        turso_assert_eq!(
-                            sibling_count_new,
-                            1,
-                            "btree: balance-shallower requires exactly 1 sibling"
-                        );
+                        turso_assert_eq!(sibling_count_new, 1);
                         let parent_offset = if parent_page.get().id == 1 {
                             DatabaseHeader::SIZE
                         } else {
@@ -3841,11 +3828,7 @@ impl BTreeCursor {
                             );
 
                         sibling_count_new -= 1; // decrease sibling count for debugging and free at the end
-                        turso_assert_less_than!(
-                            sibling_count_new,
-                            balance_info.sibling_count,
-                            "btree: sibling_count_new must decrease after balance-shallower"
-                        );
+                        turso_assert_less_than!(sibling_count_new, balance_info.sibling_count);
                     }
 
                     #[cfg(debug_assertions)]
@@ -5302,15 +5285,8 @@ impl CursorTrait for BTreeCursor {
                     let (cell_payload, leaf_cell_idx) = {
                         let leaf_page = self.stack.top_ref();
                         let leaf_contents = leaf_page.get_contents();
-                        turso_assert!(
-                            leaf_contents.is_leaf(),
-                            "btree: expected leaf page during delete"
-                        );
-                        turso_assert_greater_than!(
-                            leaf_contents.cell_count(),
-                            0,
-                            "btree: leaf must have cells during delete"
-                        );
+                        turso_assert!(leaf_contents.is_leaf());
+                        turso_assert_greater_than!(leaf_contents.cell_count(), 0);
                         let leaf_cell_idx = leaf_contents.cell_count() - 1;
                         let last_cell_on_child_page =
                             leaf_contents.cell_get(leaf_cell_idx, usable_space)?;
@@ -5601,15 +5577,8 @@ impl CursorTrait for BTreeCursor {
 
                     let cell_idx = self.stack.current_cell_index() as usize;
 
-                    turso_assert_less_than_or_equal!(
-                        cell_idx,
-                        contents.cell_count(),
-                        "btree: cell_idx out of bounds during interior delete"
-                    );
-                    turso_assert!(
-                        !contents.is_leaf(),
-                        "btree: expected interior page for right-child pointer update"
-                    );
+                    turso_assert_less_than_or_equal!(cell_idx, contents.cell_count());
+                    turso_assert!(!contents.is_leaf());
 
                     if cell_idx == contents.cell_count() {
                         // Move to right child
@@ -5780,10 +5749,7 @@ impl CursorTrait for BTreeCursor {
                 }
                 SeekToLastState::IsEmpty => {
                     let is_empty = return_if_io!(self.is_empty_table());
-                    turso_assert!(
-                        is_empty,
-                        "btree: table must be empty in SeekToLastState::IsEmpty"
-                    );
+                    turso_assert!(is_empty);
                     self.seek_to_last_state = SeekToLastState::Start;
                     return Ok(IOResult::Done(()));
                 }
@@ -6332,10 +6298,10 @@ impl PartialOrd for IntegrityCheckCellRange {
 #[cfg(debug_assertions)]
 fn validate_cells_after_insertion(cell_array: &CellArray, leaf_data: bool) {
     for cell in &cell_array.cell_payloads {
-        turso_assert_greater_than_or_equal!(cell.len(), 4, "btree: cell must be at least 4 bytes");
+        turso_assert_greater_than_or_equal!(cell.len(), 4);
 
         if leaf_data {
-            turso_assert!(cell[0] != 0, "btree: leaf cell first byte must be non-zero");
+            turso_assert!(cell[0] != 0);
         }
     }
 }
@@ -6446,11 +6412,7 @@ impl PageStack {
         }
         self.populate_parent_cell_count();
         self.current_page += 1;
-        turso_assert_greater_than_or_equal!(
-            self.current_page,
-            0,
-            "btree: current_page must be non-negative after push"
-        );
+        turso_assert_greater_than_or_equal!(self.current_page, 0);
         let current = self.current_page as usize;
         turso_assert_less_than!(
             current,
@@ -6509,11 +6471,7 @@ impl PageStack {
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG, name = "pagestack::pop"))]
     fn pop(&mut self) {
         let current = self.current_page;
-        turso_assert_greater_than_or_equal!(
-            current,
-            0,
-            "btree: current_page must be non-negative in pop"
-        );
+        turso_assert_greater_than_or_equal!(current, 0);
         tracing::trace!(current);
         let current = current as usize;
 
@@ -6522,7 +6480,7 @@ impl PageStack {
             page.unpin();
         }
 
-        turso_assert_greater_than!(current, 0, "btree: cannot pop root page from stack");
+        turso_assert_greater_than!(current, 0);
         self.node_states[current] = BTreeNodeState::default();
         self.stack[current] = None;
         self.current_page -= 1;
@@ -6547,11 +6505,7 @@ impl PageStack {
     /// Current page pointer being used
     #[inline(always)]
     fn current(&self) -> usize {
-        turso_assert_greater_than_or_equal!(
-            self.current_page,
-            0,
-            "btree: current_page must be non-negative"
-        );
+        turso_assert_greater_than_or_equal!(self.current_page, 0);
         self.current_page as usize
     }
 
@@ -6848,11 +6802,7 @@ fn edit_page(
             cell_array,
             usable_space,
         )?;
-        turso_assert_greater_than_or_equal!(
-            count_cells,
-            number_tail_removed,
-            "btree: count_cells must be >= number_tail_removed"
-        );
+        turso_assert_greater_than_or_equal!(count_cells, number_tail_removed);
         count_cells -= number_tail_removed;
         debug_validate_cells!(page, usable_space);
     }
@@ -7628,10 +7578,7 @@ fn debug_validate_cells_core(page: &PageContent, usable_space: usize) {
             { "idx": i, "offset": offset, "buf": _buf }
         );
         if page.is_leaf() {
-            turso_assert!(
-                page.as_ptr()[offset] != 0,
-                "btree: leaf cell first byte must be non-zero"
-            );
+            turso_assert!(page.as_ptr()[offset] != 0);
         }
         turso_assert_less_than_or_equal!(
             offset + size,
@@ -7692,11 +7639,7 @@ fn _insert_into_cell(
         new_cell_data_pointer,
         payload.len()
     );
-    turso_assert_less_than_or_equal!(
-        new_cell_data_pointer as usize + payload.len(),
-        usable_space,
-        "btree: cell data extends past usable space"
-    );
+    turso_assert_less_than_or_equal!(new_cell_data_pointer as usize + payload.len(), usable_space);
     let buf = page.as_ptr();
 
     // copy data
@@ -7848,11 +7791,7 @@ fn allocate_cell_space(
     cell_content_area_start -= amount;
     page_ref.write_cell_content_area(cell_content_area_start);
 
-    turso_assert_less_than_or_equal!(
-        cell_content_area_start + amount,
-        usable_space,
-        "btree: cell content area extends past usable space"
-    );
+    turso_assert_less_than_or_equal!(cell_content_area_start + amount, usable_space);
     // we can just return the start of the cell content area, since the cell is inserted to the very left of the cell content area.
     Ok(cell_content_area_start as u16)
 }
@@ -8104,11 +8043,7 @@ fn drop_cell(page: &mut PageContent, cell_idx: usize, usable_space: usize) -> Re
 /// the empty space that's not needed
 #[inline]
 fn shift_pointers_left(page: &mut PageContent, cell_idx: usize) {
-    turso_assert_greater_than!(
-        page.cell_count(),
-        0,
-        "btree: shift_pointers_left requires non-empty page"
-    );
+    turso_assert_greater_than!(page.cell_count(), 0);
     let buf = page.as_ptr();
     let (start, _) = page.cell_pointer_array_offset_and_size();
     let start = start + (cell_idx * 2) + 2;

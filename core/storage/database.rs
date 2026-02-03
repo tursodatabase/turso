@@ -108,14 +108,10 @@ impl DatabaseStorage for DatabaseFile {
     fn read_page(&self, page_idx: usize, io_ctx: &IOContext, c: Completion) -> Result<Completion> {
         // casting to i64 to check some weird casting that could've happened before. This should be
         // okay since page numbers should be u32
-        turso_assert_greater_than_or_equal!(
-            page_idx as i64,
-            0,
-            "database: page_idx should be non-negative"
-        );
+        turso_assert_greater_than_or_equal!(page_idx as i64, 0);
         let r = c.as_read();
         let size = r.buf().len();
-        turso_assert_greater_than!(page_idx, 0, "database: page_idx must be positive");
+        turso_assert_greater_than!(page_idx, 0);
         if !(512..=65536).contains(&size) || size & (size - 1) != 0 {
             return Err(LimboError::NotADB);
         }
@@ -150,10 +146,7 @@ impl DatabaseStorage for DatabaseFile {
                                 tracing::error!(
                                     "Failed to decrypt page data for page_id={page_idx}: {e}"
                                 );
-                                turso_assert!(
-                                    !original_c.failed(),
-                                    "database: original completion already has an error"
-                                );
+                                turso_assert!(!original_c.failed());
                                 original_c.error(CompletionError::DecryptionError { page_idx });
                                 Some(CompletionError::DecryptionError { page_idx })
                             }
@@ -186,10 +179,7 @@ impl DatabaseStorage for DatabaseFile {
                                 tracing::error!(
                                     "Failed to verify checksum for page_id={page_idx}: {e}"
                                 );
-                                turso_assert!(
-                                    !original_c.failed(),
-                                    "database: original completion already has an error"
-                                );
+                                turso_assert!(!original_c.failed());
                                 original_c.error(e);
                                 Some(e)
                             }
@@ -212,22 +202,10 @@ impl DatabaseStorage for DatabaseFile {
         c: Completion,
     ) -> Result<Completion> {
         let buffer_size = buffer.len();
-        turso_assert_greater_than!(page_idx, 0, "database: write page_idx must be positive");
-        turso_assert_greater_than_or_equal!(
-            buffer_size,
-            512,
-            "database: buffer_size must be >= 512"
-        );
-        turso_assert_less_than_or_equal!(
-            buffer_size,
-            65536,
-            "database: buffer_size must be <= 65536"
-        );
-        turso_assert_eq!(
-            buffer_size & (buffer_size - 1),
-            0,
-            "database: buffer_size must be power of 2"
-        );
+        turso_assert_greater_than!(page_idx, 0);
+        turso_assert_greater_than_or_equal!(buffer_size, 512);
+        turso_assert_less_than_or_equal!(buffer_size, 65536);
+        turso_assert_eq!(buffer_size & (buffer_size - 1), 0);
         let Some(pos) = (page_idx as u64 - 1).checked_mul(buffer_size as u64) else {
             return Err(LimboError::IntegerOverflow);
         };
@@ -247,18 +225,10 @@ impl DatabaseStorage for DatabaseFile {
         io_ctx: &IOContext,
         c: Completion,
     ) -> Result<Completion> {
-        turso_assert_greater_than!(
-            first_page_idx,
-            0,
-            "database: write_pages first_page_idx must be positive"
-        );
-        turso_assert_greater_than_or_equal!(page_size, 512, "database: page_size must be >= 512");
-        turso_assert_less_than_or_equal!(page_size, 65536, "database: page_size must be <= 65536");
-        turso_assert_eq!(
-            page_size & (page_size - 1),
-            0,
-            "database: page_size must be power of 2"
-        );
+        turso_assert_greater_than!(first_page_idx, 0);
+        turso_assert_greater_than_or_equal!(page_size, 512);
+        turso_assert_less_than_or_equal!(page_size, 65536);
+        turso_assert_eq!(page_size & (page_size - 1), 0);
 
         let Some(pos) = (first_page_idx as u64 - 1).checked_mul(page_size as u64) else {
             return Err(LimboError::IntegerOverflow);

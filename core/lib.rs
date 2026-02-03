@@ -1537,9 +1537,8 @@ impl DatabaseCatalog {
     }
 
     fn add(&mut self, s: &str) -> usize {
-        turso_assert_eq!(
-            self.name_to_index.get(s),
-            None,
+        turso_assert!(
+            !self.name_to_index.contains_key(s),
             "lib: database name already exists in catalog",
             { "name": s }
         );

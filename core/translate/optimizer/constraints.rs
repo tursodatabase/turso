@@ -1150,10 +1150,7 @@ impl SeekRangeConstraint {
         lower_bound: Option<(ast::Operator, ast::Expr, Affinity)>,
         upper_bound: Option<(ast::Operator, ast::Expr, Affinity)>,
     ) -> Self {
-        turso_assert!(
-            lower_bound.is_some() || upper_bound.is_some(),
-            "optimizer: range key must have at least one bound"
-        );
+        turso_assert!(lower_bound.is_some() || upper_bound.is_some());
         Self {
             sort_order,
             eq: None,

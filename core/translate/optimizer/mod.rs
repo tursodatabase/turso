@@ -2204,7 +2204,7 @@ fn build_seek_def(
     iter_dir: IterationDirection,
     mut key: Vec<SeekRangeConstraint>,
 ) -> Result<SeekDef> {
-    turso_assert!(!key.is_empty(), "optimizer: seek key must not be empty");
+    turso_assert!(!key.is_empty());
     let last = key.last().unwrap();
 
     // if we searching for exact key - emit definition immediately with prefix as a full key
@@ -2228,10 +2228,7 @@ fn build_seek_def(
             },
         });
     }
-    turso_assert!(
-        last.lower_bound.is_some() || last.upper_bound.is_some(),
-        "optimizer: last seek key component must have a bound"
-    );
+    turso_assert!(last.lower_bound.is_some() || last.upper_bound.is_some());
 
     // pop last key as we will do some form of range search
     let last = key.pop().unwrap();

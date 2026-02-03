@@ -1884,10 +1884,7 @@ impl<'a> LogicalPlanBuilder<'a> {
             ast::Expr::Parenthesized(exprs) => {
                 // the assumption is that there is at least one parenthesis here.
                 // If this is not true, then I don't understand this code and can't be trusted.
-                turso_assert!(
-                    !exprs.is_empty(),
-                    "logical: parenthesized expression must have at least one element"
-                );
+                turso_assert!(!exprs.is_empty());
                 // Multiple expressions in parentheses is unusual but handle it
                 // by building the first one (SQLite behavior)
                 self.build_expr(&exprs[0], _schema)

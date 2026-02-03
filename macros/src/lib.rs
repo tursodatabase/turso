@@ -534,7 +534,8 @@ pub fn test(args: TokenStream, input: TokenStream) -> TokenStream {
 // =============================================================================
 
 use assert::{
-    details_json, expr_to_lit_str, ComparisonAssertInput, ConditionAssertInput, MessageAssertInput,
+    comparison_auto_message, details_json, expr_to_lit_str, ComparisonAssertInput,
+    ConditionAssertInput, MessageAssertInput,
 };
 use quote::quote;
 use syn::parse_macro_input;
@@ -748,7 +749,10 @@ pub fn turso_assert_greater_than(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as ComparisonAssertInput);
     let left = &input.left;
     let right = &input.right;
-    let msg = &input.message;
+    let msg = input
+        .message
+        .clone()
+        .unwrap_or_else(|| comparison_auto_message(left, right, ">"));
     let details = details_json(&input.details);
 
     quote! {
@@ -769,7 +773,10 @@ pub fn turso_assert_greater_than_or_equal(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as ComparisonAssertInput);
     let left = &input.left;
     let right = &input.right;
-    let msg = &input.message;
+    let msg = input
+        .message
+        .clone()
+        .unwrap_or_else(|| comparison_auto_message(left, right, ">="));
     let details = details_json(&input.details);
 
     quote! {
@@ -790,7 +797,10 @@ pub fn turso_assert_less_than(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as ComparisonAssertInput);
     let left = &input.left;
     let right = &input.right;
-    let msg = &input.message;
+    let msg = input
+        .message
+        .clone()
+        .unwrap_or_else(|| comparison_auto_message(left, right, "<"));
     let details = details_json(&input.details);
 
     quote! {
@@ -811,7 +821,10 @@ pub fn turso_assert_less_than_or_equal(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as ComparisonAssertInput);
     let left = &input.left;
     let right = &input.right;
-    let msg = &input.message;
+    let msg = input
+        .message
+        .clone()
+        .unwrap_or_else(|| comparison_auto_message(left, right, "<="));
     let details = details_json(&input.details);
 
     quote! {
@@ -832,7 +845,10 @@ pub fn turso_assert_eq(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as ComparisonAssertInput);
     let left = &input.left;
     let right = &input.right;
-    let msg = &input.message;
+    let msg = input
+        .message
+        .clone()
+        .unwrap_or_else(|| comparison_auto_message(left, right, "=="));
     let details = details_json(&input.details);
 
     quote! {
@@ -853,7 +869,10 @@ pub fn turso_assert_ne(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as ComparisonAssertInput);
     let left = &input.left;
     let right = &input.right;
-    let msg = &input.message;
+    let msg = input
+        .message
+        .clone()
+        .unwrap_or_else(|| comparison_auto_message(left, right, "!="));
     let details = details_json(&input.details);
 
     quote! {
@@ -874,7 +893,10 @@ pub fn turso_assert_sometimes_greater_than(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as ComparisonAssertInput);
     let left = &input.left;
     let right = &input.right;
-    let msg = &input.message;
+    let msg = input
+        .message
+        .clone()
+        .unwrap_or_else(|| comparison_auto_message(left, right, ">"));
     let details = details_json(&input.details);
 
     quote! {
@@ -898,7 +920,10 @@ pub fn turso_assert_sometimes_less_than(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as ComparisonAssertInput);
     let left = &input.left;
     let right = &input.right;
-    let msg = &input.message;
+    let msg = input
+        .message
+        .clone()
+        .unwrap_or_else(|| comparison_auto_message(left, right, "<"));
     let details = details_json(&input.details);
 
     quote! {
@@ -922,7 +947,10 @@ pub fn turso_assert_sometimes_greater_than_or_equal(input: TokenStream) -> Token
     let input = parse_macro_input!(input as ComparisonAssertInput);
     let left = &input.left;
     let right = &input.right;
-    let msg = &input.message;
+    let msg = input
+        .message
+        .clone()
+        .unwrap_or_else(|| comparison_auto_message(left, right, ">="));
     let details = details_json(&input.details);
 
     quote! {
@@ -946,7 +974,10 @@ pub fn turso_assert_sometimes_less_than_or_equal(input: TokenStream) -> TokenStr
     let input = parse_macro_input!(input as ComparisonAssertInput);
     let left = &input.left;
     let right = &input.right;
-    let msg = &input.message;
+    let msg = input
+        .message
+        .clone()
+        .unwrap_or_else(|| comparison_auto_message(left, right, "<="));
     let details = details_json(&input.details);
 
     quote! {

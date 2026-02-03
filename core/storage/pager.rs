@@ -373,7 +373,7 @@ impl PageInner {
         let buf = self.as_ptr();
 
         let ncells = self.cell_count();
-        turso_assert_less_than!(idx, ncells, "pager: cell_get idx out of bounds");
+        turso_assert_less_than!(idx, ncells);
         let cell_pointer_array_start = self.header_size();
         let cell_pointer = cell_pointer_array_start + (idx * CELL_PTR_SIZE_BYTES);
         let cell_pointer = self.read_u16(cell_pointer) as usize;
@@ -554,7 +554,7 @@ impl PageInner {
         page_type: PageType,
     ) -> (usize, usize) {
         let buf = self.as_ptr();
-        turso_assert_less_than!(idx, cell_count, "pager: cell_get idx out of bounds");
+        turso_assert_less_than!(idx, cell_count);
         let start = self.cell_get_raw_start_offset(idx);
         let len = match page_type {
             PageType::IndexInterior => {
@@ -701,7 +701,7 @@ const PAGE_SPILLED: usize = 0b100000;
 
 impl Page {
     pub fn new(id: i64) -> Self {
-        turso_assert_greater_than_or_equal!(id, 0, "pager: page id should be non-negative");
+        turso_assert_greater_than_or_equal!(id, 0);
         Self {
             inner: UnsafeCell::new(PageInner {
                 flags: AtomicUsize::new(0),
@@ -2045,9 +2045,12 @@ impl Pager {
                                         )
                                     }));
 
-                                turso_assert_greater_than!(root_page_num, 0, "pager: largest root page number cannot be 0 because that is set to 1 when creating the database with autovacuum enabled");
+                                turso_assert_greater_than!(root_page_num, 0);
                                 root_page_num += 1;
-                                turso_assert_greater_than_or_equal!(root_page_num, FIRST_PTRMAP_PAGE_NO, "pager: root_page_num must be >= FIRST_PTRMAP_PAGE_NO after increment");
+                                turso_assert_greater_than_or_equal!(
+                                    root_page_num,
+                                    FIRST_PTRMAP_PAGE_NO
+                                );
 
                                 while is_ptrmap_page(root_page_num, page_size as usize) {
                                     root_page_num += 1;
@@ -2213,7 +2216,7 @@ impl Pager {
     /// Get the current page size, panicking if not set.
     pub fn get_page_size_unchecked(&self) -> PageSize {
         let value = self.page_size.load(Ordering::SeqCst);
-        turso_assert_ne!(value, 0, "pager: page size not set");
+        turso_assert_ne!(value, 0);
         PageSize::new(value).expect("invalid page size stored")
     }
 
@@ -2473,7 +2476,7 @@ impl Pager {
     /// Reads a page from the database.
     #[tracing::instrument(skip_all, level = Level::TRACE)]
     pub fn read_page(&self, page_idx: i64) -> Result<(PageRef, Option<Completion>)> {
-        turso_assert_greater_than_or_equal!(page_idx, 0, "pager: page_idx must be non-negative in read_page, otherwise it might indicate unallocated pages from mvcc or another nasty bug");
+        turso_assert_greater_than_or_equal!(page_idx, 0);
         tracing::debug!("read_page(page_idx = {})", page_idx);
 
         // First check if page is in cache

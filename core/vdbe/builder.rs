@@ -599,11 +599,7 @@ impl ProgramBuilder {
         let cursor = self.next_free_cursor_id;
         self.next_free_cursor_id += 1;
         self.cursor_ref.push((key, cursor_type));
-        turso_assert_eq!(
-            self.cursor_ref.len(),
-            self.next_free_cursor_id,
-            "builder: cursor_ref length must match next_free_cursor_id"
-        );
+        turso_assert_eq!(self.cursor_ref.len(), self.next_free_cursor_id);
         cursor
     }
 
@@ -852,10 +848,7 @@ impl ProgramBuilder {
             matches!(label, BranchOffset::Label(_)),
             "builder: label must be BranchOffset::Label"
         );
-        turso_assert!(
-            matches!(to_offset, BranchOffset::Offset(_)),
-            "builder: to_offset must be BranchOffset::Offset"
-        );
+        turso_assert!(matches!(to_offset, BranchOffset::Offset(_)));
         let BranchOffset::Label(label_number) = label else {
             unreachable!("Label is not a label");
         };
