@@ -54,7 +54,7 @@ jobs:
         notebook_name: limbo
         tenant: ${{ secrets.ANTITHESIS_TENANT }}
         username: ${{ secrets.ANTITHESIS_USERNAME }}
-        password: ${{ secrets.ANTITHESIS_PASSWORD }}
+        password: ${{ secrets.ANTITHESIS_PASSWD }}
         github_token: ${{ secrets.ANTITHESIS_GITHUB_TOKEN }}
         config_image: ${{ secrets.ANTITHESIS_DOCKER_REPO }}/limbo-config:antithesis-latest
         images: ${{ secrets.ANTITHESIS_DOCKER_REPO }}/limbo-workload:antithesis-latest
