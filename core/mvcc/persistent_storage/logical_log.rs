@@ -12,6 +12,8 @@ use crate::{
     Buffer, Completion, CompletionError, LimboError, Result,
 };
 
+use crate::turso_assert_eq;
+use crate::turso_assert_less_than;
 use crate::File;
 
 pub const DEFAULT_LOG_CHECKPOINT_THRESHOLD: i64 = -1; // Disabled by default
@@ -52,7 +54,11 @@ impl LogHeader {
         let padding = 64 - header_size_before_padding;
         debug_assert!(header_size_before_padding <= LOG_HEADER_MAX_SIZE);
         buffer.extend_from_slice(&LOG_HEADER_PADDING[0..padding]);
-        assert_eq!(buffer.len() - buffer_size_start, LOG_HEADER_MAX_SIZE);
+        turso_assert_eq!(
+            buffer.len() - buffer_size_start,
+            LOG_HEADER_MAX_SIZE,
+            "mvcc: log header size mismatch"
+        );
     }
 }
 
@@ -113,9 +119,10 @@ impl LogRecordType {
     ///   * key_data (bytes) - the SortableIndexKey.key.as_blob()
     fn serialize(&self, buffer: &mut Vec<u8>, row_version: &RowVersion) {
         let table_id_i64: i64 = row_version.row.id.table_id.into();
-        assert!(
-            table_id_i64 < 0,
-            "table_id_i64 should be negative, but got {table_id_i64}"
+        turso_assert_less_than!(
+            table_id_i64,
+            0,
+            "mvcc: table_id must be negative in log serialization"
         );
         buffer.extend_from_slice(&table_id_i64.to_be_bytes());
 

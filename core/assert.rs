@@ -171,8 +171,6 @@ macro_rules! turso_assert_greater_than {
 }
 
 /// Assert that left >= right with more visibility for Antithesis.
-/// Note: assert_always_greater_than_or_equal_to has a bug in antithesis_sdk 0.2.5,
-/// so we can't use it yet. Use turso_assert! instead for >= comparisons.
 #[cfg(not(feature = "antithesis"))]
 #[macro_export]
 macro_rules! turso_assert_greater_than_or_equal {
@@ -188,18 +186,16 @@ macro_rules! turso_assert_greater_than_or_equal {
 #[macro_export]
 macro_rules! turso_assert_greater_than_or_equal {
     ($left:expr, $right:expr, $msg:literal, { $($details:tt)* }) => {
-        // Bug in SDK: antithesis_sdk::assert_always_greater_than_or_equal_to!($left, $right, $msg, &serde_json::json!({ $($details)* }));
+        antithesis_sdk::assert_always_greater_than_or_equal_to!($left, $right, $msg, &serde_json::json!({ $($details)* }));
         assert!($left >= $right, $msg);
     };
     ($left:expr, $right:expr, $msg:literal) => {
-        // Bug in SDK: antithesis_sdk::assert_always_greater_than_or_equal_to!($left, $right, $msg);
+        antithesis_sdk::assert_always_greater_than_or_equal_to!($left, $right, $msg);
         assert!($left >= $right, $msg);
     };
 }
 
 /// Assert that left < right with more visibility for Antithesis.
-/// Note: assert_always_less_than has a bug in antithesis_sdk 0.2.5,
-/// so we can't use it yet. Use turso_assert! instead for < comparisons.
 #[cfg(not(feature = "antithesis"))]
 #[macro_export]
 macro_rules! turso_assert_less_than {
@@ -215,18 +211,16 @@ macro_rules! turso_assert_less_than {
 #[macro_export]
 macro_rules! turso_assert_less_than {
     ($left:expr, $right:expr, $msg:literal, { $($details:tt)* }) => {
-        // Bug in SDK: antithesis_sdk::assert_always_less_than!($left, $right, $msg, &serde_json::json!({ $($details)* }));
+        antithesis_sdk::assert_always_less_than!($left, $right, $msg, &serde_json::json!({ $($details)* }));
         assert!($left < $right, $msg);
     };
     ($left:expr, $right:expr, $msg:literal) => {
-        // Bug in SDK: antithesis_sdk::assert_always_less_than!($left, $right, $msg);
+        antithesis_sdk::assert_always_less_than!($left, $right, $msg);
         assert!($left < $right, $msg);
     };
 }
 
 /// Assert that left <= right with more visibility for Antithesis.
-/// Note: assert_always_less_than_or_equal_to has a bug in antithesis_sdk 0.2.5,
-/// so we can't use it yet. Use turso_assert! instead for <= comparisons.
 #[cfg(not(feature = "antithesis"))]
 #[macro_export]
 macro_rules! turso_assert_less_than_or_equal {
@@ -242,11 +236,11 @@ macro_rules! turso_assert_less_than_or_equal {
 #[macro_export]
 macro_rules! turso_assert_less_than_or_equal {
     ($left:expr, $right:expr, $msg:literal, { $($details:tt)* }) => {
-        // Bug in SDK: antithesis_sdk::assert_always_less_than_or_equal_to!($left, $right, $msg, &serde_json::json!({ $($details)* }));
+        antithesis_sdk::assert_always_less_than_or_equal_to!($left, $right, $msg, &serde_json::json!({ $($details)* }));
         assert!($left <= $right, $msg);
     };
     ($left:expr, $right:expr, $msg:literal) => {
-        // Bug in SDK: antithesis_sdk::assert_always_less_than_or_equal_to!($left, $right, $msg);
+        antithesis_sdk::assert_always_less_than_or_equal_to!($left, $right, $msg);
         assert!($left <= $right, $msg);
     };
 }

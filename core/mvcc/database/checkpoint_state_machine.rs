@@ -11,6 +11,10 @@ use crate::storage::wal::{CheckpointMode, TursoRwLock};
 use crate::sync::atomic::Ordering;
 use crate::sync::Arc;
 use crate::sync::RwLock;
+#[allow(unused_imports)]
+use crate::turso_assert;
+#[allow(unused_imports)]
+use crate::turso_assert_eq;
 use crate::types::{IOCompletions, IOResult, ImmutableRecord};
 use crate::{
     CheckpointResult, Completion, Connection, IOExt, LimboError, Pager, Result, SyncMode,
@@ -334,10 +338,12 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                                 );
 
                                 // Verify it's actually an index, not a table
-                                assert_eq!(
-                                        table_id, index_id,
-                                        "Found table_id {table_id} but expected index_id {index_id} for root_page {root_page}",
-                                    );
+                                turso_assert_eq!(
+                                    table_id,
+                                    index_id,
+                                    "mvcc: checkpoint table_id/index_id mismatch for DROP INDEX",
+                                    { "table_id": i64::from(table_id), "index_id": i64::from(index_id), "root_page": root_page }
+                                );
 
                                 self.destroyed_indexes.insert(index_id);
 
@@ -615,7 +621,12 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                             let known_root_page = known_root_page
                                 .value()
                                 .expect("Table ID does not have a root page");
-                            assert_eq!(known_root_page, root_page, "MV store root page does not match root page in the sqlite_schema record: {known_root_page} != {root_page}");
+                            turso_assert_eq!(
+                                known_root_page,
+                                root_page,
+                                "mvcc: checkpoint root page mismatch for BTreeDestroy",
+                                { "known_root_page": known_root_page, "schema_root_page": root_page }
+                            );
                             let cursor = if let Some(cursor) = self.cursors.get(&known_root_page) {
                                 cursor.clone()
                             } else {
@@ -640,7 +651,11 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                                 Some(created_root_page as u64),
                             );
                             // Index struct should already be stored in index_id_to_index from collect_committed_versions
-                            assert!(self.index_id_to_index.contains_key(&index_id), "Index struct for index_id {index_id} must be stored before creating btree");
+                            turso_assert!(
+                                self.index_id_to_index.contains_key(&index_id),
+                                "mvcc: checkpoint index struct missing before BTreeCreateIndex",
+                                { "index_id": i64::from(index_id) }
+                            );
                         }
                         SpecialWrite::BTreeDestroyIndex {
                             index_id,
@@ -655,9 +670,11 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                             let known_root_page = known_root_page
                                 .value()
                                 .expect("Index ID does not have a root page");
-                            assert_eq!(
-                                known_root_page, root_page,
-                                "MV store root page does not match root page in the sqlite_schema record: {known_root_page} != {root_page}"
+                            turso_assert_eq!(
+                                known_root_page,
+                                root_page,
+                                "mvcc: checkpoint root page mismatch for BTreeDestroyIndex",
+                                { "known_root_page": known_root_page, "schema_root_page": root_page }
                             );
 
                             // Get Index struct for creating cursor

@@ -204,9 +204,9 @@ dependencies = [
 
 [[package]]
 name = "antithesis_sdk"
-version = "0.2.5"
+version = "0.2.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "201eba73b76341631014baf9c0018e703af204a1e0f15d7664d8a0947f6be74d"
+checksum = "aa9414f07948b76e1f6aec64946ef8768db0534d8954a6bc7080e4f4575b6cea"
 dependencies = [
  "libc",
  "libloading",
@@ -3056,7 +3056,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc2f4eb4bc735547cfed7c0a4922cbd04a4655978c09b54f1f7b228750664c34"
 dependencies = [
  "cfg-if",
- "windows-targets 0.52.6",
+ "windows-targets 0.48.5",
 ]
 
 [[package]]
