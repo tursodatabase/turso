@@ -1,3 +1,5 @@
+#[allow(unused_imports)]
+use crate::turso_assert;
 use crate::{
     schema::{Column, Index, Schema},
     stats::TableStat,
@@ -1048,9 +1050,9 @@ pub fn constraints_from_where_clause(
                         index.expression_to_index_pos(&normalized)
                     }),
                 } {
-                    assert!(
+                    turso_assert!(
                         constraint.usable,
-                        "constraint collation must match table column collation"
+                        "optimizer: constraint collation must match table column collation"
                     );
                     if let Some(table_col_pos) = constraint.table_col_pos {
                         let constrained_column = &table_reference.table.columns()[table_col_pos];
@@ -1148,7 +1150,10 @@ impl SeekRangeConstraint {
         lower_bound: Option<(ast::Operator, ast::Expr, Affinity)>,
         upper_bound: Option<(ast::Operator, ast::Expr, Affinity)>,
     ) -> Self {
-        assert!(lower_bound.is_some() || upper_bound.is_some());
+        turso_assert!(
+            lower_bound.is_some() || upper_bound.is_some(),
+            "optimizer: range key must have at least one bound"
+        );
         Self {
             sort_order,
             eq: None,

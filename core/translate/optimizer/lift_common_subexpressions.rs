@@ -1,7 +1,10 @@
 use turso_parser::ast::{Expr, Operator};
 
+#[allow(unused_imports)]
+use crate::turso_assert;
 use crate::{
     translate::{expr::unwrap_parens_owned, plan::WhereTerm},
+    turso_assert_greater_than,
     util::exprs_are_equivalent,
     Result,
 };
@@ -45,7 +48,10 @@ pub(crate) fn lift_common_subexpressions_from_binary_or_terms(
         // e.g. a OR b OR c becomes effectively OR [a,b,c].
         let or_operands = flatten_or_expr_owned(term_expr_owned)?;
 
-        assert!(or_operands.len() > 1);
+        turso_assert!(
+            or_operands.len() > 1,
+            "optimizer: OR expression must have more than one operand"
+        );
 
         // Each OR operand is potentially an AND chain, e.g.
         // (a AND b) OR (c AND d).
@@ -115,7 +121,11 @@ pub(crate) fn lift_common_subexpressions_from_binary_or_terms(
             // E.g. (a AND b) OR (a) OR (a AND c) just becomes a.
             where_clause[i].consumed = true;
         } else {
-            assert!(new_or_operands_for_original_term.len() > 1);
+            turso_assert_greater_than!(
+                new_or_operands_for_original_term.len(),
+                1,
+                "optimizer: reconstructed OR must have more than one operand"
+            );
             // Update the original WhereTerm's expression with the new OR structure (without common parts).
             where_clause[i].expr = rebuild_or_expr_from_list(new_or_operands_for_original_term);
         }
@@ -157,7 +167,10 @@ fn flatten_and_expr_owned(expr: Expr) -> Result<Vec<Expr>> {
 
 /// Rebuild an ast::Expr::Binary(lhs, AND, rhs) for a list of conjuncts.
 fn rebuild_and_expr_from_list(mut conjuncts: Vec<Expr>) -> Expr {
-    assert!(!conjuncts.is_empty());
+    turso_assert!(
+        !conjuncts.is_empty(),
+        "optimizer: conjuncts list must not be empty"
+    );
 
     if conjuncts.len() == 1 {
         return conjuncts.pop().unwrap();
@@ -172,7 +185,10 @@ fn rebuild_and_expr_from_list(mut conjuncts: Vec<Expr>) -> Expr {
 
 /// Rebuild an ast::Expr::Binary(lhs, OR, rhs) for a list of operands.
 fn rebuild_or_expr_from_list(mut operands: Vec<Expr>) -> Expr {
-    assert!(!operands.is_empty());
+    turso_assert!(
+        !operands.is_empty(),
+        "optimizer: operands list must not be empty"
+    );
 
     if operands.len() == 1 {
         return operands.pop().unwrap();

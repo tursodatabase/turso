@@ -9,6 +9,8 @@ use std::{
 
 use crate::sync::Mutex;
 
+#[allow(unused_imports)]
+use crate::turso_assert_eq;
 use crate::{Buffer, CompletionError};
 
 /// Callback for read completions. Returns `Some(error)` if the callback detects an error
@@ -218,10 +220,10 @@ impl GroupCompletion {
     }
 
     pub fn callback(&self, result: Result<i32, CompletionError>) {
-        assert_eq!(
+        turso_assert_eq!(
             self.inner.outstanding.load(Ordering::SeqCst),
             0,
-            "callback called before all completions finished"
+            "completions: callback called before all completions finished"
         );
         (self.inner.complete)(result);
     }

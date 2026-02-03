@@ -7618,14 +7618,14 @@ fn defragment_page(page: &PageContent, usable_space: usize, max_frag_bytes: isiz
 fn debug_validate_cells_core(page: &PageContent, usable_space: usize) {
     for i in 0..page.cell_count() {
         let (offset, size) = page.cell_get_raw_region(i, usable_space).unwrap();
-        let buf = &page.as_ptr()[offset..offset + size];
+        let _buf = &page.as_ptr()[offset..offset + size];
         // E.g. the following table btree cell may just have two bytes:
         // Payload size 0 (stored as SerialTypeKind::ConstInt0)
         // Rowid 1 (stored as SerialTypeKind::ConstInt1)
         turso_assert_greater_than_or_equal!(
             size, 2,
             "btree: cell size should be at least 2 bytes",
-            { "idx": i, "offset": offset, "buf": buf }
+            { "idx": i, "offset": offset, "buf": _buf }
         );
         if page.is_leaf() {
             turso_assert!(

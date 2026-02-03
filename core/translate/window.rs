@@ -19,6 +19,8 @@ use crate::vdbe::insn::{
 };
 use crate::vdbe::{BranchOffset, CursorID};
 use crate::Result;
+#[allow(unused_imports)]
+use crate::{turso_assert, turso_assert_eq};
 use std::mem;
 use turso_parser::ast::Name;
 use turso_parser::ast::{Expr, FunctionTail, Literal, Over, SortOrder, TableInternalId};
@@ -95,9 +97,9 @@ pub fn plan_windows(
 
     if !windows.is_empty() {
         // Sanity check: this should never happen because the syntax disallows combining VALUES with windows
-        assert!(
+        turso_assert!(
             plan.values.is_empty(),
-            "VALUES clause with windows is not supported"
+            "window: VALUES clause with windows is not supported"
         );
     }
 
@@ -230,9 +232,11 @@ fn prepare_window_subquery(
 
     // Verify that the subquery has the expected database ID.
     // This is required to ensure that assumptions in `rewrite_terminal_expr` are valid.
-    assert_eq!(
-        subquery.database_id, SUBQUERY_DATABASE_ID,
-        "expected subquery database id to be {SUBQUERY_DATABASE_ID}"
+    turso_assert_eq!(
+        subquery.database_id,
+        SUBQUERY_DATABASE_ID,
+        "window: subquery database id must be SUBQUERY_DATABASE_ID",
+        {"SUBQUERY_DATABASE_ID": SUBQUERY_DATABASE_ID}
     );
 
     outer_plan.window = Some(current_window);
@@ -325,9 +329,9 @@ fn rewrite_expr_referencing_current_window(
     fn normalize_over_clause(filter_over: &mut FunctionTail, window_name: &str) {
         // FILTER clause is not supported yet. Proper checks elsewhere return appropriate
         // error messages, and this ensures that nothing slips through unnoticed.
-        assert!(
+        turso_assert!(
             filter_over.filter_clause.is_none(),
-            "FILTER in window functions is not supported"
+            "window: FILTER clause in window functions is not supported"
         );
 
         // Replace inline OVER clause with a reference to the named window.
@@ -351,9 +355,9 @@ fn rewrite_expr_referencing_current_window(
                     resolve_window_and_aggregate_functions(arg, ctx.resolver, aggregates, None)?;
                 rewrite_expr_as_subquery_column(arg, ctx, contains_aggregates);
             }
-            assert!(
+            turso_assert!(
                 order_by.is_empty(),
-                "ORDER BY in window functions is not supported"
+                "window: ORDER BY in window function args is not supported"
             );
             normalize_over_clause(filter_over, &window_name);
         }
@@ -472,7 +476,11 @@ pub fn init_window<'a>(
     order_by: &'a [(Box<Expr>, SortOrder)],
 ) -> crate::Result<()> {
     let joined_tables = &plan.joined_tables();
-    assert_eq!(joined_tables.len(), 1, "expected only one joined table");
+    turso_assert_eq!(
+        joined_tables.len(),
+        1,
+        "window: expected only one joined table"
+    );
 
     let src_table = &joined_tables[0];
     let reg_src_columns_start =
@@ -611,9 +619,10 @@ fn collect_expressions_referencing_subquery<'a>(
                         }
                     }
                     Expr::Column { column, table, .. } => {
-                        assert_eq!(
-                            table, subquery_id,
-                            "only subquery columns can be referenced"
+                        turso_assert_eq!(
+                            table,
+                            subquery_id,
+                            "window: only subquery columns can be referenced"
                         );
                         if expressions_referencing_subquery
                             .iter()

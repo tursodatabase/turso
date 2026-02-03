@@ -36,14 +36,21 @@ use crate::vector::{
     vector32, vector32_sparse, vector64, vector_concat, vector_distance_cos, vector_distance_dot,
     vector_distance_jaccard, vector_distance_l2, vector_extract, vector_slice,
 };
-use crate::{error::{
-    LimboError, SQLITE_CONSTRAINT, SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY,
-}, ext::ExtValue, function::{AggFunc, ExtFunc, MathFunc, MathFuncArity, ScalarFunc, VectorFunc}, functions::{
-    datetime::{
-        exec_date, exec_datetime_full, exec_julianday, exec_strftime, exec_time, exec_unixepoch,
+use crate::{
+    error::{
+        LimboError, SQLITE_CONSTRAINT, SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY,
     },
-    printf::exec_printf,
-}, stats::StatAccum, translate::emitter::TransactionMode, turso_assert_always_some};
+    ext::ExtValue,
+    function::{AggFunc, ExtFunc, MathFunc, MathFuncArity, ScalarFunc, VectorFunc},
+    functions::{
+        datetime::{
+            exec_date, exec_datetime_full, exec_julianday, exec_strftime, exec_time, exec_unixepoch,
+        },
+        printf::exec_printf,
+    },
+    stats::StatAccum,
+    translate::emitter::TransactionMode,
+};
 use crate::{get_cursor, CheckpointMode, Completion, Connection, DatabaseStorage, IOExt, MvCursor};
 use either::Either;
 use smallvec::SmallVec;

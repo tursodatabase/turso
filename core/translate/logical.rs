@@ -10,6 +10,8 @@
 use crate::function::AggFunc;
 use crate::schema::{Schema, Type};
 use crate::sync::Arc;
+#[allow(unused_imports)]
+use crate::turso_assert;
 use crate::types::Value;
 use crate::{LimboError, Result};
 use rustc_hash::FxHashMap as HashMap;
@@ -1882,7 +1884,10 @@ impl<'a> LogicalPlanBuilder<'a> {
             ast::Expr::Parenthesized(exprs) => {
                 // the assumption is that there is at least one parenthesis here.
                 // If this is not true, then I don't understand this code and can't be trusted.
-                assert!(!exprs.is_empty());
+                turso_assert!(
+                    !exprs.is_empty(),
+                    "logical: parenthesized expression must have at least one element"
+                );
                 // Multiple expressions in parentheses is unusual but handle it
                 // by building the first one (SQLite behavior)
                 self.build_expr(&exprs[0], _schema)

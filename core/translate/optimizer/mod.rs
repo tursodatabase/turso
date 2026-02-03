@@ -1,3 +1,5 @@
+#[allow(unused_imports)]
+use crate::turso_soft_unreachable;
 use crate::{
     function::Deterministic,
     index_method::IndexMethodCostEstimate,
@@ -28,8 +30,6 @@ use crate::{
     },
     LimboError, Result,
 };
-#[allow(unused_imports)]
-use crate::turso_soft_unreachable;
 use constraints::{
     constraints_from_where_clause, usable_constraints_for_join_order, Constraint, ConstraintRef,
 };
@@ -780,7 +780,9 @@ fn optimize_subqueries(plan: &mut SelectPlan, schema: &Schema) -> Result<()> {
                     }
                 }
                 Plan::Delete(_) | Plan::Update(_) => {
-                    turso_soft_unreachable!("DELETE/UPDATE plans should not appear in FROM clause subqueries");
+                    turso_soft_unreachable!(
+                        "DELETE/UPDATE plans should not appear in FROM clause subqueries"
+                    );
                     return Err(LimboError::InternalError(
                         "DELETE/UPDATE plans should not appear in FROM clause subqueries"
                             .to_string(),
@@ -1456,9 +1458,10 @@ fn optimize_table_access(
                             let constraint =
                                 &constraints_per_table[table_idx].constraints[*constraint_vec_pos];
                             let where_term = &mut where_clause[constraint.where_clause_pos.0];
-                            assert!(
+                            crate::turso_assert!(
                                 !where_term.consumed,
-                                "trying to consume a where clause term twice: {where_term:?}",
+                                "optimizer: trying to consume a where clause term twice",
+                                {"where_term": format!("{where_term:?}")}
                             );
                             if is_outer_join && where_term.from_outer_join.is_none() {
                                 // Don't consume WHERE terms from outer joins if the where term is not part of the outer join condition. Consider:
@@ -1490,9 +1493,10 @@ fn optimize_table_access(
                             });
                         continue;
                     }
-                    assert!(
-                        constraint_refs.len() == 1,
-                        "expected exactly one constraint for rowid seek, got {constraint_refs:?}"
+                    crate::turso_assert_eq!(
+                        constraint_refs.len(),
+                        1,
+                        "optimizer: expected exactly one constraint for rowid seek"
                     );
                     table_references.joined_tables_mut()[table_idx].op =
                         if let Some(eq) = constraint_refs[0].eq {
@@ -2157,9 +2161,9 @@ pub fn build_seek_def_from_constraints(
     where_clause: &[WhereTerm],
     referenced_tables: Option<&TableReferences>,
 ) -> Result<SeekDef> {
-    assert!(
+    crate::turso_assert!(
         !constraint_refs.is_empty(),
-        "cannot build seek def from empty list of constraint refs"
+        "optimizer: cannot build seek def from empty constraint refs"
     );
     // Extract the key values and operators
     let key = constraint_refs
@@ -2200,7 +2204,7 @@ fn build_seek_def(
     iter_dir: IterationDirection,
     mut key: Vec<SeekRangeConstraint>,
 ) -> Result<SeekDef> {
-    assert!(!key.is_empty());
+    crate::turso_assert!(!key.is_empty(), "optimizer: seek key must not be empty");
     let last = key.last().unwrap();
 
     // if we searching for exact key - emit definition immediately with prefix as a full key
@@ -2224,7 +2228,10 @@ fn build_seek_def(
             },
         });
     }
-    assert!(last.lower_bound.is_some() || last.upper_bound.is_some());
+    crate::turso_assert!(
+        last.lower_bound.is_some() || last.upper_bound.is_some(),
+        "optimizer: last seek key component must have a bound"
+    );
 
     // pop last key as we will do some form of range search
     let last = key.pop().unwrap();

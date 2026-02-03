@@ -1,3 +1,5 @@
+#[allow(unused_imports)]
+use crate::{turso_assert, turso_assert_eq};
 use crate::{
     vdbe::{
         builder::ProgramBuilder,
@@ -230,7 +232,11 @@ pub fn emit_result_row_and_limit(
             result_reg_start,
             num_regs,
         } => {
-            assert!(plan.result_columns.len() == *num_regs, "Row value subqueries should have the same number of result columns as the number of registers");
+            turso_assert_eq!(
+                plan.result_columns.len(),
+                *num_regs,
+                "result_row: row value subqueries must have matching result columns and registers"
+            );
             program.emit_insn(Insn::Copy {
                 src_reg: result_columns_start_reg,
                 dst_reg: *result_reg_start,
@@ -239,10 +245,10 @@ pub fn emit_result_row_and_limit(
         }
         QueryDestination::RowSet { rowset_reg } => {
             // For RowSet, we add the rowid (which should be the only result column) to the RowSet
-            assert_eq!(
+            turso_assert_eq!(
                 plan.result_columns.len(),
                 1,
-                "RowSet should only have one result column (rowid)"
+                "result_row: RowSet should only have one result column (rowid)"
             );
             program.emit_insn(Insn::RowSetAdd {
                 rowset_reg: *rowset_reg,
