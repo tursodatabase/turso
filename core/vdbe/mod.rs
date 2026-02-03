@@ -80,6 +80,8 @@ use turso_parser::ast::ResolveType;
 
 use crate::vdbe::bloom_filter::BloomFilter;
 use crate::vdbe::rowset::RowSet;
+#[allow(unused_imports)]
+use crate::{turso_assert, turso_assert_ne};
 use explain::{insn_to_row_with_comment, EXPLAIN_COLUMNS, EXPLAIN_QUERY_PLAN_COLUMNS};
 use regex::Regex;
 use std::{
@@ -745,7 +747,10 @@ impl Register {
         match self {
             Register::Value(v) => v,
             Register::Record(r) => {
-                assert!(!r.is_invalidated());
+                turso_assert!(
+                    !r.is_invalidated(),
+                    "vdbe: record should not be invalidated when getting value"
+                );
                 r.as_blob_value()
             }
             _ => panic!("register holds unexpected value: {self:?}"),
@@ -1285,9 +1290,10 @@ impl Program {
                             let root_page = view.get_root_page();
 
                             // Materialized views should always have storage (root_page != 0)
-                            assert!(
-                                root_page != 0,
-                                "Materialized view '{view_name}' should have a root page"
+                            turso_assert_ne!(
+                                root_page, 0,
+                                "vdbe: materialized view should have a root page",
+                                { "view_name": view_name }
                             );
 
                             views.push(view_name);
@@ -1396,7 +1402,10 @@ impl Program {
                 };
                 match self.step_end_mvcc_txn(state_machine, mv_store)? {
                     IOResult::Done(_) => {
-                        assert!(state_machine.is_finalized());
+                        turso_assert!(
+                            state_machine.is_finalized(),
+                            "vdbe: state_machine must be finalized after commit"
+                        );
                         conn.set_mv_tx(None);
                         conn.set_tx_state(TransactionState::None);
                         program_state.commit_state = CommitState::Ready;

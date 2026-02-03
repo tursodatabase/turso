@@ -14,6 +14,8 @@ use crate::{
     },
     Arc, CaptureDataChangesMode, Connection, Value, VirtualTable,
 };
+#[allow(unused_imports)]
+use crate::{turso_assert, turso_assert_eq};
 
 // Keep distinct hash-table ids far from table internal ids to avoid collisions.
 const HASH_TABLE_ID_BASE: usize = 1 << 30;
@@ -551,12 +553,12 @@ impl ProgramBuilder {
     }
 
     pub fn alloc_cursor_id_keyed(&mut self, key: CursorKey, cursor_type: CursorType) -> usize {
-        assert!(
+        turso_assert!(
             !self
                 .cursor_ref
                 .iter()
                 .any(|(k, _)| k.as_ref().is_some_and(|k| k.equals(&key))),
-            "duplicate cursor key"
+            "builder: duplicate cursor key"
         );
         self._alloc_cursor_id(Some(key), cursor_type)
     }
@@ -597,7 +599,11 @@ impl ProgramBuilder {
         let cursor = self.next_free_cursor_id;
         self.next_free_cursor_id += 1;
         self.cursor_ref.push((key, cursor_type));
-        assert_eq!(self.cursor_ref.len(), self.next_free_cursor_id);
+        turso_assert_eq!(
+            self.cursor_ref.len(),
+            self.next_free_cursor_id,
+            "builder: cursor_ref length must match next_free_cursor_id"
+        );
         cursor
     }
 
@@ -826,7 +832,7 @@ impl ProgramBuilder {
     /// reordering the emitted instructions.
     #[inline]
     pub fn preassign_label_to_next_insn(&mut self, label: BranchOffset) {
-        assert!(label.is_label(), "BranchOffset {label:?} is not a label");
+        turso_assert!(label.is_label(), "builder: BranchOffset should be a label", { "label": format!("{:?}", label) });
         self._resolve_label(label, self.offset().sub(1u32), JumpTarget::AfterThisInsn);
     }
 
@@ -842,8 +848,14 @@ impl ProgramBuilder {
     }
 
     fn _resolve_label(&mut self, label: BranchOffset, to_offset: BranchOffset, target: JumpTarget) {
-        assert!(matches!(label, BranchOffset::Label(_)));
-        assert!(matches!(to_offset, BranchOffset::Offset(_)));
+        turso_assert!(
+            matches!(label, BranchOffset::Label(_)),
+            "builder: label must be BranchOffset::Label"
+        );
+        turso_assert!(
+            matches!(to_offset, BranchOffset::Offset(_)),
+            "builder: to_offset must be BranchOffset::Offset"
+        );
         let BranchOffset::Label(label_number) = label else {
             unreachable!("Label is not a label");
         };

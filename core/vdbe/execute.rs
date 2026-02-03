@@ -36,21 +36,14 @@ use crate::vector::{
     vector32, vector32_sparse, vector64, vector_concat, vector_distance_cos, vector_distance_dot,
     vector_distance_jaccard, vector_distance_l2, vector_extract, vector_slice,
 };
-use crate::{
-    error::{
-        LimboError, SQLITE_CONSTRAINT, SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY,
+use crate::{error::{
+    LimboError, SQLITE_CONSTRAINT, SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY,
+}, ext::ExtValue, function::{AggFunc, ExtFunc, MathFunc, MathFuncArity, ScalarFunc, VectorFunc}, functions::{
+    datetime::{
+        exec_date, exec_datetime_full, exec_julianday, exec_strftime, exec_time, exec_unixepoch,
     },
-    ext::ExtValue,
-    function::{AggFunc, ExtFunc, MathFunc, MathFuncArity, ScalarFunc, VectorFunc},
-    functions::{
-        datetime::{
-            exec_date, exec_datetime_full, exec_julianday, exec_strftime, exec_time, exec_unixepoch,
-        },
-        printf::exec_printf,
-    },
-    stats::StatAccum,
-    translate::emitter::TransactionMode,
-};
+    printf::exec_printf,
+}, stats::StatAccum, translate::emitter::TransactionMode, turso_assert_always_some};
 use crate::{get_cursor, CheckpointMode, Completion, Connection, DatabaseStorage, IOExt, MvCursor};
 use either::Either;
 use smallvec::SmallVec;
@@ -80,7 +73,11 @@ use crate::{
     },
 };
 
-use crate::{connection::Row, info, turso_assert, OpenFlags, TransactionState, ValueRef};
+use crate::{connection::Row, info, OpenFlags, TransactionState, ValueRef};
+#[allow(unused_imports)]
+use crate::{
+    turso_assert, turso_assert_eq, turso_assert_greater_than_or_equal, turso_assert_less_than,
+};
 
 use super::{
     insn::{Cookie, RegisterOrLiteral},
@@ -519,9 +516,18 @@ pub fn op_jump(
         },
         insn
     );
-    assert!(target_pc_lt.is_offset());
-    assert!(target_pc_eq.is_offset());
-    assert!(target_pc_gt.is_offset());
+    turso_assert!(
+        target_pc_lt.is_offset(),
+        "execute: Jump target_pc_lt must be an offset"
+    );
+    turso_assert!(
+        target_pc_eq.is_offset(),
+        "execute: Jump target_pc_eq must be an offset"
+    );
+    turso_assert!(
+        target_pc_gt.is_offset(),
+        "execute: Jump target_pc_gt must be an offset"
+    );
     let cmp = state.last_compare.take();
     if cmp.is_none() {
         turso_soft_unreachable!("Jump without compare");
@@ -899,9 +905,10 @@ pub fn op_open_read(
         .get(*cursor_id)
         .expect("cursor_id should exist in cursor_ref");
     if program.connection.get_mv_tx_id().is_none() {
-        assert!(
-            *root_page >= 0,
-            "root page should be non negative when we are not in a MVCC transaction"
+        turso_assert_greater_than_or_equal!(
+            *root_page,
+            0,
+            "execute: root page should be non-negative when not in MVCC transaction"
         );
     }
     let cursors = &mut state.cursors;
@@ -1363,7 +1370,10 @@ pub fn op_rewind(
         },
         insn
     );
-    assert!(pc_if_empty.is_offset());
+    turso_assert!(
+        pc_if_empty.is_offset(),
+        "execute: Rewind pc_if_empty must be an offset"
+    );
     let is_empty = {
         let cursor = state.get_cursor(*cursor_id);
         match cursor {
@@ -1402,7 +1412,10 @@ pub fn op_last(
         },
         insn
     );
-    assert!(pc_if_empty.is_offset());
+    turso_assert!(
+        pc_if_empty.is_offset(),
+        "execute: Last pc_if_empty must be an offset"
+    );
     let is_empty = {
         let cursor = must_be_btree_cursor!(*cursor_id, program.cursor_ref, state, "Last");
         let cursor = cursor.as_btree_mut();
@@ -1660,7 +1673,10 @@ pub fn op_type_check(
         },
         insn
     );
-    assert!(table_reference.is_strict);
+    turso_assert!(
+        table_reference.is_strict,
+        "execute: TypeCheck requires strict table"
+    );
     state.registers[*start_reg..*start_reg + *count]
         .iter_mut()
         .zip(table_reference.columns.iter())
@@ -1803,7 +1819,10 @@ pub fn op_next(
         },
         insn
     );
-    assert!(pc_if_next.is_offset());
+    turso_assert!(
+        pc_if_next.is_offset(),
+        "execute: Next pc_if_next must be an offset"
+    );
     let is_empty = {
         let cursor = state.get_cursor(*cursor_id);
         match cursor {
@@ -1857,7 +1876,10 @@ pub fn op_prev(
         },
         insn
     );
-    assert!(pc_if_prev.is_offset());
+    turso_assert!(
+        pc_if_prev.is_offset(),
+        "execute: Prev pc_if_prev must be an offset"
+    );
     let is_empty = {
         let cursor = must_be_btree_cursor!(*cursor_id, program.cursor_ref, state, "Prev");
         let cursor = cursor.as_btree_mut();
@@ -3129,9 +3151,10 @@ pub fn op_seek(
         ),
         _ => unreachable!("unexpected Insn {:?}", insn),
     };
-    assert!(
+    turso_assert!(
         target_pc.is_offset(),
-        "op_seek: target_pc should be an offset, is: {target_pc:?}"
+        "execute: op_seek target_pc should be an offset",
+        { "target_pc": format!("{:?}", target_pc) }
     );
     let op = match insn {
         Insn::SeekGE { eq_only, .. } => SeekOp::GE { eq_only: *eq_only },
@@ -3238,7 +3261,11 @@ pub fn seek_internal(
                     else {
                         unreachable!("op_seek: record_source should be Unpacked for table-btree");
                     };
-                    assert_eq!(num_regs, 1, "op_seek: num_regs should be 1 for table-btree");
+                    turso_assert_eq!(
+                        num_regs,
+                        1,
+                        "execute: op_seek num_regs should be 1 for table-btree"
+                    );
                     let original_value = state.registers[start_reg].get_value();
                     let mut temp_value = original_value.clone();
 
@@ -4510,7 +4537,10 @@ pub fn op_sorter_next(
         },
         insn
     );
-    assert!(pc_if_next.is_offset());
+    turso_assert!(
+        pc_if_next.is_offset(),
+        "execute: SorterNext pc_if_next must be an offset"
+    );
     let has_more = {
         let cursor = state.get_cursor(*cursor_id);
         let cursor = cursor.as_sorter_mut();
@@ -4641,7 +4671,10 @@ pub fn op_rowset_read(
         },
         insn
     );
-    assert!(pc_if_empty.is_offset());
+    turso_assert!(
+        pc_if_empty.is_offset(),
+        "execute: RowSetRead pc_if_empty must be an offset"
+    );
 
     let rowset = state.rowsets.get_mut(rowset_reg);
 
@@ -4694,7 +4727,10 @@ pub fn op_rowset_test(
         },
         insn
     );
-    assert!(pc_if_found.is_offset());
+    turso_assert!(
+        pc_if_found.is_offset(),
+        "execute: RowSetTest pc_if_found must be an offset"
+    );
 
     let value = state.registers[*value_reg].get_value();
     let rowid = match value {
@@ -4828,7 +4864,11 @@ pub fn op_function(
             }
 
             JsonFunc::JsonArrowExtract | JsonFunc::JsonArrowShiftExtract => {
-                assert_eq!(arg_count, 2);
+                turso_assert_eq!(
+                    arg_count,
+                    2,
+                    "execute: JsonArrowExtract requires exactly 2 arguments"
+                );
                 let json = &state.registers[*start_reg];
                 let path = &state.registers[*start_reg + 1];
                 let json_func = match json_func {
@@ -4878,8 +4918,16 @@ pub fn op_function(
                 state.registers[*dest] = Register::Value(is_json_valid(json_value.get_value()));
             }
             JsonFunc::JsonPatch => {
-                assert_eq!(arg_count, 2);
-                assert!(*start_reg + 1 < state.registers.len());
+                turso_assert_eq!(
+                    arg_count,
+                    2,
+                    "execute: JsonPatch requires exactly 2 arguments"
+                );
+                turso_assert_less_than!(
+                    *start_reg + 1,
+                    state.registers.len(),
+                    "execute: JsonPatch register out of bounds"
+                );
                 let target = &state.registers[*start_reg];
                 let patch = &state.registers[*start_reg + 1];
                 state.registers[*dest] = Register::Value(json_patch(
@@ -4889,8 +4937,16 @@ pub fn op_function(
                 )?);
             }
             JsonFunc::JsonbPatch => {
-                assert_eq!(arg_count, 2);
-                assert!(*start_reg + 1 < state.registers.len());
+                turso_assert_eq!(
+                    arg_count,
+                    2,
+                    "execute: JsonbPatch requires exactly 2 arguments"
+                );
+                turso_assert_less_than!(
+                    *start_reg + 1,
+                    state.registers.len(),
+                    "execute: JsonbPatch register out of bounds"
+                );
                 let target = &state.registers[*start_reg];
                 let patch = &state.registers[*start_reg + 1];
                 state.registers[*dest] = Register::Value(jsonb_patch(
@@ -5025,8 +5081,12 @@ pub fn op_function(
         },
         crate::function::Func::Scalar(scalar_func) => match scalar_func {
             ScalarFunc::Cast => {
-                assert_eq!(arg_count, 2);
-                assert!(*start_reg + 1 < state.registers.len());
+                turso_assert_eq!(arg_count, 2, "execute: Cast requires exactly 2 arguments");
+                turso_assert_less_than!(
+                    *start_reg + 1,
+                    state.registers.len(),
+                    "execute: Cast register out of bounds"
+                );
                 let reg_value_argument = state.registers[*start_reg].clone();
                 let Value::Text(reg_value_type) =
                     state.registers[*start_reg + 1].get_value().clone()
@@ -5259,7 +5319,10 @@ pub fn op_function(
             }
             ScalarFunc::Round => {
                 let reg_value = &state.registers[*start_reg];
-                assert!(arg_count == 1 || arg_count == 2);
+                turso_assert!(
+                    arg_count == 1 || arg_count == 2,
+                    "execute: Round requires 1 or 2 arguments"
+                );
                 let precision_value = if arg_count > 1 {
                     state.registers.get(*start_reg + 1)
                 } else {
@@ -5375,7 +5438,11 @@ pub fn op_function(
                 state.registers[*dest] = Register::Value(Value::build_text(src_id));
             }
             ScalarFunc::Replace => {
-                assert_eq!(arg_count, 3);
+                turso_assert_eq!(
+                    arg_count,
+                    3,
+                    "execute: Replace requires exactly 3 arguments"
+                );
                 let source = &state.registers[*start_reg];
                 let pattern = &state.registers[*start_reg + 1];
                 let replacement = &state.registers[*start_reg + 2];
@@ -5406,7 +5473,11 @@ pub fn op_function(
                 state.registers[*dest] = Register::Value(result);
             }
             ScalarFunc::TableColumnsJsonArray => {
-                assert_eq!(arg_count, 1);
+                turso_assert_eq!(
+                    arg_count,
+                    1,
+                    "execute: TableColumnsJsonArray requires exactly 1 argument"
+                );
                 #[cfg(not(feature = "json"))]
                 {
                     return Err(LimboError::InvalidArgument(
@@ -5457,7 +5528,11 @@ pub fn op_function(
                 }
             }
             ScalarFunc::BinRecordJsonObject => {
-                assert_eq!(arg_count, 2);
+                turso_assert_eq!(
+                    arg_count,
+                    2,
+                    "execute: BinRecordJsonObject requires exactly 2 arguments"
+                );
                 #[cfg(not(feature = "json"))]
                 {
                     return Err(LimboError::InvalidArgument(
@@ -5537,7 +5612,7 @@ pub fn op_function(
                 }
             }
             ScalarFunc::Attach => {
-                assert_eq!(arg_count, 3);
+                turso_assert_eq!(arg_count, 3, "execute: Attach requires exactly 3 arguments");
                 let filename = state.registers[*start_reg].get_value();
                 let dbname = state.registers[*start_reg + 1].get_value();
                 let _key = state.registers[*start_reg + 2].get_value(); // Not used in read-only implementation
@@ -5561,7 +5636,7 @@ pub fn op_function(
                 state.registers[*dest] = Register::Value(Value::Null);
             }
             ScalarFunc::Detach => {
-                assert_eq!(arg_count, 1);
+                turso_assert_eq!(arg_count, 1, "execute: Detach requires exactly 1 argument");
                 let dbname = state.registers[*start_reg].get_value();
 
                 let Value::Text(dbname_str) = dbname else {
@@ -5584,7 +5659,11 @@ pub fn op_function(
             ScalarFunc::StatInit => {
                 // stat_init(n_col): Initialize a statistics accumulator
                 // Returns a blob containing the serialized StatAccum
-                assert!(arg_count >= 1);
+                turso_assert_greater_than_or_equal!(
+                    arg_count,
+                    1,
+                    "execute: StatInit requires at least 1 argument"
+                );
                 let n_col = match state.registers[*start_reg].get_value() {
                     Value::Integer(n) => *n as usize,
                     _ => 0,
@@ -5596,7 +5675,11 @@ pub fn op_function(
                 // stat_push(accum_blob, i_chng): Push a row into the accumulator
                 // i_chng is the index of the leftmost column that changed from the previous row
                 // Returns the updated accumulator blob
-                assert!(arg_count >= 2);
+                turso_assert_greater_than_or_equal!(
+                    arg_count,
+                    2,
+                    "execute: StatPush requires at least 2 arguments"
+                );
                 let accum_blob = state.registers[*start_reg].get_value();
                 let i_chng = match state.registers[*start_reg + 1].get_value() {
                     Value::Integer(n) => *n as usize,
@@ -5618,7 +5701,11 @@ pub fn op_function(
             ScalarFunc::StatGet => {
                 // stat_get(accum_blob): Get the stat1 string from the accumulator
                 // Returns the stat string "total avg1 avg2 ..."
-                assert!(arg_count >= 1);
+                turso_assert_greater_than_or_equal!(
+                    arg_count,
+                    1,
+                    "execute: StatGet requires at least 1 argument"
+                );
                 let accum_blob = state.registers[*start_reg].get_value();
                 let result = match accum_blob {
                     Value::Blob(bytes) => {
@@ -6422,7 +6509,10 @@ pub fn op_init_coroutine(
         },
         insn
     );
-    assert!(jump_on_definition.is_offset());
+    turso_assert!(
+        jump_on_definition.is_offset(),
+        "execute: InitCoroutine jump_on_definition must be an offset"
+    );
     let start_offset = start_offset.as_offset_int();
     state.registers[*yield_reg] = Register::Value(Value::Integer(start_offset as i64));
     state.ended_coroutine.retain(|n| *n != *yield_reg as u32);
@@ -6695,7 +6785,10 @@ pub fn op_insert(
             OpInsertSubState::ApplyViewChange => {
                 let schema = program.connection.schema.read();
                 let dependent_views = schema.get_dependent_materialized_views(table_name);
-                assert!(!dependent_views.is_empty());
+                turso_assert!(
+                    !dependent_views.is_empty(),
+                    "execute: Insert ApplyViewChange requires non-empty dependent views"
+                );
 
                 let (key, values) = {
                     let key = match &state.registers[*key_reg].get_value() {
@@ -6869,7 +6962,10 @@ pub fn op_delete(
             OpDeleteSubState::ApplyViewChange => {
                 let schema = program.connection.schema.read();
                 let dependent_views = schema.get_dependent_materialized_views(table_name);
-                assert!(!dependent_views.is_empty());
+                turso_assert!(
+                    !dependent_views.is_empty(),
+                    "execute: Delete ApplyViewChange requires non-empty dependent views"
+                );
                 let maybe_deleted_record = state.op_delete_state.deleted_record.take();
                 if let Some((key, values)) = maybe_deleted_record {
                     for view_name in dependent_views {
@@ -7832,7 +7928,7 @@ pub fn op_create_btree(
     turso_assert_reachable!("opcode: CreateBtree");
     load_insn!(CreateBtree { db, root, flags }, insn);
 
-    assert_eq!(*db, 0);
+    turso_assert_eq!(*db, 0, "execute: CreateBtree only supports main database");
 
     if program.connection.is_readonly(*db) {
         return Err(LimboError::ReadOnly);
@@ -7864,7 +7960,11 @@ pub fn op_index_method_create(
 ) -> Result<InsnFunctionStepResult> {
     turso_assert_reachable!("opcode: IndexMethodCreate");
     load_insn!(IndexMethodCreate { db, cursor_id }, insn);
-    assert_eq!(*db, 0);
+    turso_assert_eq!(
+        *db,
+        0,
+        "execute: IndexMethodCreate only supports main database"
+    );
     if program.connection.is_readonly(*db) {
         return Err(LimboError::ReadOnly);
     }
@@ -7897,7 +7997,11 @@ pub fn op_index_method_destroy(
 ) -> Result<InsnFunctionStepResult> {
     turso_assert_reachable!("opcode: IndexMethodDestroy");
     load_insn!(IndexMethodDestroy { db, cursor_id }, insn);
-    assert_eq!(*db, 0);
+    turso_assert_eq!(
+        *db,
+        0,
+        "execute: IndexMethodDestroy only supports main database"
+    );
     if program.connection.is_readonly(*db) {
         return Err(LimboError::ReadOnly);
     }
@@ -7930,7 +8034,11 @@ pub fn op_index_method_optimize(
 ) -> Result<InsnFunctionStepResult> {
     turso_assert_reachable!("opcode: IndexMethodOptimize");
     load_insn!(IndexMethodOptimize { db, cursor_id }, insn);
-    assert_eq!(*db, 0);
+    turso_assert_eq!(
+        *db,
+        0,
+        "execute: IndexMethodOptimize only supports main database"
+    );
     if program.connection.is_readonly(*db) {
         return Err(LimboError::ReadOnly);
     }
@@ -7972,7 +8080,11 @@ pub fn op_index_method_query(
         },
         insn
     );
-    assert_eq!(*db, 0);
+    turso_assert_eq!(
+        *db,
+        0,
+        "execute: IndexMethodQuery only supports main database"
+    );
     let mv_store = program.connection.mv_store();
     if let Some(_mv_store) = mv_store.as_ref() {
         todo!("MVCC is not supported yet");
@@ -9006,7 +9118,10 @@ pub fn op_once(
         },
         insn
     );
-    assert!(target_pc_when_reentered.is_offset());
+    turso_assert!(
+        target_pc_when_reentered.is_offset(),
+        "execute: Once target_pc_when_reentered must be an offset"
+    );
     let offset = state.pc;
     if state.once.contains(&offset) {
         state.pc = target_pc_when_reentered.as_offset_int();

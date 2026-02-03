@@ -7656,7 +7656,7 @@ fn _insert_into_cell(
     turso_assert_less_than_or_equal!(
         cell_idx, page.cell_count() + page.overflow_cells.len(),
         "btree: attempting to add cell to incorrect place",
-        { "cell_idx": cell_idx, "cell_count": page.cell_count(), "overflow_count": page.overflow_cells.len(), "page_type": page.page_type().ok() }
+        { "cell_idx": cell_idx, "cell_count": page.cell_count(), "overflow_count": page.overflow_cells.len(), "page_type": format!("{:?}", page.page_type()) }
     );
     let already_has_overflow = !page.overflow_cells.is_empty();
     let free = compute_free_space(page, usable_space);
