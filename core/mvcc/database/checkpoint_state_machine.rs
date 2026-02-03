@@ -1201,6 +1201,10 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                     }
 
                     schema.schema_version += 1;
+                    // Clear dropped root pages now that the checkpoint has completed.
+                    // The btree pages for dropped tables have been freed, so integrity_check
+                    // no longer needs to track them.
+                    schema.dropped_root_pages.clear();
                     let _ = self.pager.io.block(|| {
                         self.pager.with_header_mut(|header| {
                             header.schema_cookie = schema.schema_version.into();

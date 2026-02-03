@@ -1988,6 +1988,41 @@ fn test_mvcc_integrity_check() {
     ensure_integrity();
 }
 
+/// Test that integrity_check passes after DROP TABLE but before checkpoint.
+/// Issue #4975: After checkpointing a table and then dropping it, integrity_check
+/// would fail because the dropped table's btree pages still exist but aren't
+/// tracked by the schema. The fix is to track dropped root pages until checkpoint.
+#[test]
+fn test_integrity_check_after_drop_table_before_checkpoint() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, data TEXT)")
+        .unwrap();
+    conn.execute("CREATE INDEX idx_t_data ON t(data)").unwrap();
+
+    // Insert data to force page allocation
+    for i in 0..10 {
+        let data = format!("data_{i}");
+        conn.execute(format!("INSERT INTO t VALUES ({i}, '{data}')"))
+            .unwrap();
+    }
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    drop(conn);
+
+    db.restart();
+
+    let conn = db.connect();
+
+    // Now drop table. Before the fix, this would make integrity_check fail because
+    // we dropped the table before checkpointing, meaning integrity_check would find
+    // pages not being used since we didn't provide root page of table t for checks.
+    conn.execute("DROP TABLE t").unwrap();
+    let rows = get_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(&rows[0][0].to_string(), "ok");
+}
+
 #[test]
 fn test_rollback_with_index() {
     let db = MvccTestDbNoConn::new_with_random_db();

@@ -7935,8 +7935,32 @@ pub fn op_drop_table(
         todo!("temp databases not implemented yet");
     }
     let conn = program.connection.clone();
+    let is_mvcc = conn.mv_store().is_some();
     {
         conn.with_schema_mut(|schema| {
+            // In MVCC mode, track dropped root pages so integrity_check knows about them.
+            // The btree pages won't be freed until checkpoint, so integrity_check needs
+            // to include them to avoid "page never used" false positives.
+            if is_mvcc {
+                let table = schema
+                    .get_table(table_name)
+                    .expect("DROP TABLE: table must exist in schema");
+                if let Some(btree) = table.btree() {
+                    // Only track positive root pages (checkpointed tables).
+                    // Negative root pages are non-checkpointed and don't exist in btree file.
+                    if btree.root_page > 0 {
+                        schema.dropped_root_pages.insert(btree.root_page);
+                    }
+                }
+                // Capture index root pages (table may not have indexes)
+                if let Some(indexes) = schema.indexes.get(table_name) {
+                    for index in indexes.iter() {
+                        if index.root_page > 0 {
+                            schema.dropped_root_pages.insert(index.root_page);
+                        }
+                    }
+                }
+            }
             schema.remove_indices_for_table(table_name);
             schema.remove_triggers_for_table(table_name);
             schema.remove_table(table_name);
