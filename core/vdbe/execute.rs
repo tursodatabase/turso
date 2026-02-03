@@ -256,9 +256,17 @@ pub fn op_drop_index(
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(DropIndex { index, db: _ }, insn);
-    program
-        .connection
-        .with_schema_mut(|schema| schema.remove_index(index));
+    let conn = program.connection.clone();
+    let is_mvcc = conn.mv_store().is_some();
+    conn.with_schema_mut(|schema| {
+        // In MVCC mode, track dropped index root pages so integrity_check knows about them.
+        // The btree pages won't be freed until checkpoint, so integrity_check needs to
+        // include them to avoid "page never used" false positives.
+        if is_mvcc && index.root_page > 0 {
+            schema.dropped_root_pages.insert(index.root_page);
+        }
+        schema.remove_index(index);
+    });
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
