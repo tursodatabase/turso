@@ -3,6 +3,7 @@ mod functions;
 mod fuzz_transaction;
 mod index_method;
 mod integrity_check;
+mod mvcc;
 mod pragma;
 mod query_processing;
 mod storage;
