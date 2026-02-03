@@ -77,6 +77,16 @@ pub const INTERIOR_PAGE_HEADER_SIZE_BYTES: usize = 12;
 pub const LEAF_PAGE_HEADER_SIZE_BYTES: usize = 8;
 pub const LEFT_CHILD_PTR_SIZE_BYTES: usize = 4;
 
+// Freelist trunk page layout:
+// - Bytes 0-3: Page number of next freelist trunk page (0 if none)
+// - Bytes 4-7: Number of leaf page pointers on this trunk page
+// - Bytes 8+: Array of 4-byte leaf page pointers
+pub const FREELIST_TRUNK_OFFSET_NEXT_TRUNK_PTR: usize = 0;
+pub const FREELIST_TRUNK_OFFSET_LEAF_COUNT: usize = 4;
+pub const FREELIST_TRUNK_OFFSET_FIRST_LEAF_PTR: usize = 8;
+pub const FREELIST_TRUNK_HEADER_SIZE: usize = 8;
+pub const FREELIST_LEAF_PTR_SIZE: usize = 4;
+
 #[derive(PartialEq, Eq, Zeroable, Pod, Clone, Copy, Debug)]
 #[repr(transparent)]
 /// Read/Write file format version.

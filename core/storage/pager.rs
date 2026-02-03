@@ -42,7 +42,11 @@ use super::btree::{
 };
 use super::page_cache::{CacheError, CacheResizeResult, PageCache, PageCacheKey, SpillResult};
 use super::sqlite3_ondisk::read_varint;
-use super::sqlite3_ondisk::{begin_write_btree_page, read_btree_cell, read_u32, BTreeCell};
+use super::sqlite3_ondisk::{
+    begin_write_btree_page, read_btree_cell, read_u32, BTreeCell, FREELIST_LEAF_PTR_SIZE,
+    FREELIST_TRUNK_OFFSET_FIRST_LEAF_PTR, FREELIST_TRUNK_OFFSET_LEAF_COUNT,
+    FREELIST_TRUNK_OFFSET_NEXT_TRUNK_PTR,
+};
 use super::wal::CheckpointMode;
 use crate::storage::encryption::{CipherMode, EncryptionContext, EncryptionKey};
 
@@ -1247,7 +1251,6 @@ enum AllocatePageState {
     ///   and set the next trunk page as the database's "first freelist trunk page".
     SearchAvailableFreeListLeaf {
         trunk_page: PageRef,
-        current_db_size: u32,
     },
     /// If a freelist leaf is found, reuse it for the page allocation and remove it from the trunk page.
     ReuseFreelistLeaf {
@@ -3836,12 +3839,8 @@ impl Pager {
     #[instrument(skip_all, level = Level::DEBUG)]
     pub fn free_page(&self, mut page: Option<PageRef>, page_id: usize) -> Result<IOResult<()>> {
         tracing::trace!("free_page(page_id={})", page_id);
-        const TRUNK_PAGE_HEADER_SIZE: usize = 8;
-        const LEAF_ENTRY_SIZE: usize = 4;
+        // Number of reserved slots in trunk header (next pointer + leaf count)
         const RESERVED_SLOTS: usize = 2;
-
-        const TRUNK_PAGE_NEXT_PAGE_OFFSET: usize = 0; // Offset to next trunk page pointer
-        const TRUNK_PAGE_LEAF_COUNT_OFFSET: usize = 4; // Offset to leaf count
 
         let header_ref = self.io.block(|| HeaderRefMut::from_pager(self))?;
         let header = header_ref.borrow_mut();
@@ -3904,11 +3903,10 @@ impl Pager {
 
                     let trunk_page_contents = trunk_page.get_contents();
                     let number_of_leaf_pages =
-                        trunk_page_contents.read_u32_no_offset(TRUNK_PAGE_LEAF_COUNT_OFFSET);
+                        trunk_page_contents.read_u32_no_offset(FREELIST_TRUNK_OFFSET_LEAF_COUNT);
 
-                    // Reserve 2 slots for the trunk page header which is 8 bytes or 2*LEAF_ENTRY_SIZE
                     let max_free_list_entries =
-                        (header.usable_space() / LEAF_ENTRY_SIZE) - RESERVED_SLOTS;
+                        (header.usable_space() / FREELIST_LEAF_PTR_SIZE) - RESERVED_SLOTS;
 
                     if number_of_leaf_pages < max_free_list_entries as u32 {
                         turso_assert!(
@@ -3918,12 +3916,12 @@ impl Pager {
                         self.add_dirty(&trunk_page)?;
 
                         trunk_page_contents.write_u32_no_offset(
-                            TRUNK_PAGE_LEAF_COUNT_OFFSET,
+                            FREELIST_TRUNK_OFFSET_LEAF_COUNT,
                             number_of_leaf_pages + 1,
                         );
                         trunk_page_contents.write_u32_no_offset(
-                            TRUNK_PAGE_HEADER_SIZE
-                                + (number_of_leaf_pages as usize * LEAF_ENTRY_SIZE),
+                            FREELIST_TRUNK_OFFSET_FIRST_LEAF_PTR
+                                + (number_of_leaf_pages as usize * FREELIST_LEAF_PTR_SIZE),
                             page_id as u32,
                         );
 
@@ -3944,9 +3942,10 @@ impl Pager {
 
                     let contents = page.get_contents();
                     // Point to previous trunk
-                    contents.write_u32_no_offset(TRUNK_PAGE_NEXT_PAGE_OFFSET, trunk_page_id);
+                    contents
+                        .write_u32_no_offset(FREELIST_TRUNK_OFFSET_NEXT_TRUNK_PTR, trunk_page_id);
                     // Zero leaf count
-                    contents.write_u32_no_offset(TRUNK_PAGE_LEAF_COUNT_OFFSET, 0);
+                    contents.write_u32_no_offset(FREELIST_TRUNK_OFFSET_LEAF_COUNT, 0);
                     // Update page 1 to point to new trunk
                     header.freelist_trunk_page = (page_id as u32).into();
                     // Unpin page before finishing - it's now a trunk page
@@ -4054,10 +4053,6 @@ impl Pager {
     #[allow(clippy::readonly_write_lock)]
     #[instrument(skip_all, level = Level::DEBUG)]
     pub fn allocate_page(&self) -> Result<IOResult<PageRef>> {
-        const FREELIST_TRUNK_OFFSET_NEXT_TRUNK: usize = 0;
-        const FREELIST_TRUNK_OFFSET_LEAF_COUNT: usize = 4;
-        const FREELIST_TRUNK_OFFSET_FIRST_LEAF: usize = 8;
-
         // Ensure cache has room before allocating (we may spill dirty pages first)
         return_if_io!(self.ensure_cache_space());
 
@@ -4106,18 +4101,12 @@ impl Pager {
                     let (trunk_page, c) = self.read_page(first_freelist_trunk_page_id as i64)?;
                     // Pin trunk_page to prevent eviction while stored in state machine
                     trunk_page.pin();
-                    *state = AllocatePageState::SearchAvailableFreeListLeaf {
-                        trunk_page,
-                        current_db_size: new_db_size,
-                    };
+                    *state = AllocatePageState::SearchAvailableFreeListLeaf { trunk_page };
                     if let Some(c) = c {
                         io_yield_one!(c);
                     }
                 }
-                AllocatePageState::SearchAvailableFreeListLeaf {
-                    trunk_page,
-                    current_db_size,
-                } => {
+                AllocatePageState::SearchAvailableFreeListLeaf { trunk_page } => {
                     turso_assert!(
                         trunk_page.is_loaded(),
                         "Freelist trunk page {} is not loaded",
@@ -4125,7 +4114,7 @@ impl Pager {
                     );
                     let page_contents = trunk_page.get_contents();
                     let next_trunk_page_id =
-                        page_contents.read_u32_no_offset(FREELIST_TRUNK_OFFSET_NEXT_TRUNK);
+                        page_contents.read_u32_no_offset(FREELIST_TRUNK_OFFSET_NEXT_TRUNK_PTR);
                     let number_of_freelist_leaves =
                         page_contents.read_u32_no_offset(FREELIST_TRUNK_OFFSET_LEAF_COUNT);
 
@@ -4134,7 +4123,7 @@ impl Pager {
                     if number_of_freelist_leaves != 0 {
                         let page_contents = trunk_page.get_contents();
                         let next_leaf_page_id =
-                            page_contents.read_u32_no_offset(FREELIST_TRUNK_OFFSET_FIRST_LEAF);
+                            page_contents.read_u32_no_offset(FREELIST_TRUNK_OFFSET_FIRST_LEAF_PTR);
                         let (leaf_page, c) = self.read_page(next_leaf_page_id as i64)?;
 
                         turso_assert!(
@@ -4159,18 +4148,8 @@ impl Pager {
                     }
 
                     // No freelist leaves on this trunk page.
-                    // If the freelist is completely empty, allocate a new page.
-                    if next_trunk_page_id == 0 {
-                        // Unpin trunk_page since we're transitioning away
-                        trunk_page.unpin();
-                        *state = AllocatePageState::AllocateNewPage {
-                            current_db_size: *current_db_size,
-                        };
-                        continue;
-                    }
-
-                    // Freelist is not empty, so we can reuse the trunk itself as a new page
-                    // and update the database's first freelist trunk page to the next trunk page.
+                    // Reuse the trunk page itself (even if this is the last trunk).
+                    // Update the database's first freelist trunk page to the next trunk page (may be 0 if there are no more trunk pages).
                     header.freelist_trunk_page = next_trunk_page_id.into();
                     header.freelist_pages = (header.freelist_pages.get() - 1).into();
                     self.add_dirty(trunk_page)?;
@@ -4233,14 +4212,13 @@ impl Pager {
                     {
                         let buf = page_contents.as_ptr();
                         // use copy within the same page
-                        const LEAF_PTR_SIZE_BYTES: usize = 4;
                         let offset_remaining_leaves_start =
-                            FREELIST_TRUNK_OFFSET_FIRST_LEAF + LEAF_PTR_SIZE_BYTES;
+                            FREELIST_TRUNK_OFFSET_FIRST_LEAF_PTR + FREELIST_LEAF_PTR_SIZE;
                         let offset_remaining_leaves_end = offset_remaining_leaves_start
-                            + remaining_leaves_count * LEAF_PTR_SIZE_BYTES;
+                            + remaining_leaves_count * FREELIST_LEAF_PTR_SIZE;
                         buf.copy_within(
                             offset_remaining_leaves_start..offset_remaining_leaves_end,
-                            FREELIST_TRUNK_OFFSET_FIRST_LEAF,
+                            FREELIST_TRUNK_OFFSET_FIRST_LEAF_PTR,
                         );
                     }
                     // write the new leaf count
