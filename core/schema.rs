@@ -8,11 +8,11 @@ use crate::translate::expr::{bind_and_rewrite_expr, walk_expr, BindingBehavior, 
 use crate::translate::index::{resolve_index_method_parameters, resolve_sorted_columns};
 use crate::translate::optimizer::Optimizable;
 use crate::translate::planner::ROWID_STRS;
+#[allow(unused_imports)]
+use crate::turso_soft_unreachable;
 use crate::types::IOResult;
 use crate::util::{exprs_are_equivalent, normalize_ident};
 use crate::vdbe::affinity::Affinity;
-#[allow(unused_imports)]
-use crate::turso_soft_unreachable;
 use crate::{return_if_io, turso_assert};
 use turso_macros::AtomicEnum;
 

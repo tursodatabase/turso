@@ -1,10 +1,10 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-#[allow(unused_imports)]
-use crate::{turso_assert_greater_than, turso_soft_unreachable};
 use crate::io::FileSyncType;
 use crate::sync::Mutex;
 use crate::sync::OnceLock;
+#[allow(unused_imports)]
+use crate::{turso_assert_greater_than, turso_soft_unreachable};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::array;
 use std::borrow::Cow;
@@ -2411,7 +2411,9 @@ impl WalFile {
                         ongoing_chkpt.state = CheckpointState::DetermineResult;
                     } else {
                         // This should be impossible now so we treat it as logic error.
-                        turso_soft_unreachable!("checkpoint stuck: no inflight completions but not complete");
+                        turso_soft_unreachable!(
+                            "checkpoint stuck: no inflight completions but not complete"
+                        );
                         return Err(LimboError::InternalError(
                             "checkpoint stuck: no inflight completions but not complete".into(),
                         ));

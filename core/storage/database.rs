@@ -3,12 +3,12 @@ use crate::io::FileSyncType;
 use crate::storage::checksum::ChecksumContext;
 use crate::storage::encryption::EncryptionContext;
 use crate::sync::Arc;
+use crate::{io::Completion, Buffer, CompletionError, Result};
 #[allow(unused_imports)]
 use crate::{
-    turso_assert, turso_assert_eq, turso_assert_greater_than,
-    turso_assert_greater_than_or_equal, turso_assert_less_than_or_equal,
+    turso_assert, turso_assert_eq, turso_assert_greater_than, turso_assert_greater_than_or_equal,
+    turso_assert_less_than_or_equal,
 };
-use crate::{io::Completion, Buffer, CompletionError, Result};
 use tracing::{instrument, Level};
 
 #[derive(Debug, Clone)]
@@ -108,7 +108,11 @@ impl DatabaseStorage for DatabaseFile {
     fn read_page(&self, page_idx: usize, io_ctx: &IOContext, c: Completion) -> Result<Completion> {
         // casting to i64 to check some weird casting that could've happened before. This should be
         // okay since page numbers should be u32
-        turso_assert_greater_than_or_equal!(page_idx as i64, 0, "database: page_idx should be non-negative");
+        turso_assert_greater_than_or_equal!(
+            page_idx as i64,
+            0,
+            "database: page_idx should be non-negative"
+        );
         let r = c.as_read();
         let size = r.buf().len();
         turso_assert_greater_than!(page_idx, 0, "database: page_idx must be positive");
@@ -209,9 +213,21 @@ impl DatabaseStorage for DatabaseFile {
     ) -> Result<Completion> {
         let buffer_size = buffer.len();
         turso_assert_greater_than!(page_idx, 0, "database: write page_idx must be positive");
-        turso_assert_greater_than_or_equal!(buffer_size, 512, "database: buffer_size must be >= 512");
-        turso_assert_less_than_or_equal!(buffer_size, 65536, "database: buffer_size must be <= 65536");
-        turso_assert_eq!(buffer_size & (buffer_size - 1), 0, "database: buffer_size must be power of 2");
+        turso_assert_greater_than_or_equal!(
+            buffer_size,
+            512,
+            "database: buffer_size must be >= 512"
+        );
+        turso_assert_less_than_or_equal!(
+            buffer_size,
+            65536,
+            "database: buffer_size must be <= 65536"
+        );
+        turso_assert_eq!(
+            buffer_size & (buffer_size - 1),
+            0,
+            "database: buffer_size must be power of 2"
+        );
         let Some(pos) = (page_idx as u64 - 1).checked_mul(buffer_size as u64) else {
             return Err(LimboError::IntegerOverflow);
         };
@@ -231,10 +247,18 @@ impl DatabaseStorage for DatabaseFile {
         io_ctx: &IOContext,
         c: Completion,
     ) -> Result<Completion> {
-        turso_assert_greater_than!(first_page_idx, 0, "database: write_pages first_page_idx must be positive");
+        turso_assert_greater_than!(
+            first_page_idx,
+            0,
+            "database: write_pages first_page_idx must be positive"
+        );
         turso_assert_greater_than_or_equal!(page_size, 512, "database: page_size must be >= 512");
         turso_assert_less_than_or_equal!(page_size, 65536, "database: page_size must be <= 65536");
-        turso_assert_eq!(page_size & (page_size - 1), 0, "database: page_size must be power of 2");
+        turso_assert_eq!(
+            page_size & (page_size - 1),
+            0,
+            "database: page_size must be power of 2"
+        );
 
         let Some(pos) = (first_page_idx as u64 - 1).checked_mul(page_size as u64) else {
             return Err(LimboError::IntegerOverflow);

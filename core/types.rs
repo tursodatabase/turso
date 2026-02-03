@@ -7,8 +7,6 @@ use turso_parser::ast::SortOrder;
 
 use crate::error::LimboError;
 use crate::ext::{ExtValue, ExtValueType};
-#[allow(unused_imports)]
-use crate::turso_soft_unreachable;
 use crate::index_method::IndexMethodCursor;
 use crate::numeric::format_float;
 use crate::pseudo::PseudoCursor;
@@ -17,6 +15,8 @@ use crate::storage::btree::CursorTrait;
 use crate::storage::sqlite3_ondisk::{read_integer, read_value, read_varint, write_varint};
 use crate::translate::collate::CollationSeq;
 use crate::translate::plan::IterationDirection;
+#[allow(unused_imports)]
+use crate::turso_soft_unreachable;
 use crate::vdbe::sorter::Sorter;
 use crate::vdbe::Register;
 use crate::vtab::VirtualTableCursor;

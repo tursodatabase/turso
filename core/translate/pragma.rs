@@ -12,8 +12,6 @@ use super::integrity_check::{
 };
 use crate::pragma::pragma_for;
 use crate::schema::Schema;
-#[allow(unused_imports)]
-use crate::turso_soft_unreachable;
 use crate::storage::encryption::{CipherMode, EncryptionKey};
 use crate::storage::pager::AutoVacuumMode;
 use crate::storage::pager::Pager;
@@ -21,6 +19,8 @@ use crate::storage::sqlite3_ondisk::CacheSize;
 use crate::storage::wal::CheckpointMode;
 use crate::translate::emitter::{Resolver, TransactionMode};
 use crate::translate::schema::translate_create_table;
+#[allow(unused_imports)]
+use crate::turso_soft_unreachable;
 use crate::util::{normalize_ident, parse_signed_number, parse_string, IOExt as _};
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
 use crate::vdbe::insn::{Cookie, Insn};

@@ -23,16 +23,16 @@ use crate::sync::Arc;
 use crate::sync::{Mutex, RwLock};
 use crate::types::{IOCompletions, WalState};
 use crate::util::IOExt as _;
-#[allow(unused_imports)]
-use crate::{
-    turso_assert_eq, turso_assert_greater_than, turso_assert_greater_than_or_equal,
-    turso_assert_less_than, turso_assert_ne, turso_soft_unreachable,
-};
 use crate::{
     io::CompletionGroup, return_if_io, turso_assert, types::WalFrameInfo, Completion, Connection,
     IOResult, LimboError, Result, TransactionState,
 };
 use crate::{io_yield_one, Buffer, CompletionError, IOContext, OpenFlags, SyncMode, IO};
+#[allow(unused_imports)]
+use crate::{
+    turso_assert_eq, turso_assert_greater_than, turso_assert_greater_than_or_equal,
+    turso_assert_less_than, turso_assert_ne, turso_soft_unreachable,
+};
 use arc_swap::ArcSwapOption;
 use roaring::RoaringBitmap;
 use std::cell::UnsafeCell;
@@ -373,10 +373,7 @@ impl PageInner {
         let buf = self.as_ptr();
 
         let ncells = self.cell_count();
-        turso_assert_less_than!(
-            idx, ncells,
-            "pager: cell_get idx out of bounds"
-        );
+        turso_assert_less_than!(idx, ncells, "pager: cell_get idx out of bounds");
         let cell_pointer_array_start = self.header_size();
         let cell_pointer = cell_pointer_array_start + (idx * CELL_PTR_SIZE_BYTES);
         let cell_pointer = self.read_u16(cell_pointer) as usize;
@@ -1569,7 +1566,10 @@ impl Pager {
         let subjournal = subjournal.as_ref().unwrap();
 
         let c = subjournal.write_page(write_offset, page_size, buffer.clone(), c)?;
-        turso_assert!(c.succeeded(), "pager: memory IO should complete immediately");
+        turso_assert!(
+            c.succeeded(),
+            "pager: memory IO should complete immediately"
+        );
         Ok(())
     }
 
@@ -1639,7 +1639,10 @@ impl Pager {
         // opened at any given time.
         turso_assert!(start_offset == 0, "start offset should be 0");
         let c = subjournal.truncate(start_offset)?;
-        turso_assert!(c.succeeded(), "pager: memory IO should complete immediately");
+        turso_assert!(
+            c.succeeded(),
+            "pager: memory IO should complete immediately"
+        );
         Ok(())
     }
 
@@ -1650,7 +1653,10 @@ impl Pager {
             return Ok(());
         };
         let c = subjournal.truncate(0)?;
-        turso_assert!(c.succeeded(), "pager: memory IO should complete immediately");
+        turso_assert!(
+            c.succeeded(),
+            "pager: memory IO should complete immediately"
+        );
         Ok(())
     }
 
@@ -1682,7 +1688,10 @@ impl Pager {
             // Read 4 bytes for page id
             let page_id_buffer = Arc::new(self.buffer_pool.allocate(4));
             let c = subjournal.read_page_number(current_offset, page_id_buffer.clone())?;
-            turso_assert!(c.succeeded(), "pager: memory IO should complete immediately");
+            turso_assert!(
+                c.succeeded(),
+                "pager: memory IO should complete immediately"
+            );
             let page_id = u32::from_be_bytes(page_id_buffer.as_slice()[0..4].try_into().unwrap());
             current_offset += 4;
 
@@ -1717,7 +1726,10 @@ impl Pager {
                 page.clone(),
                 page_size as usize,
             )?;
-            turso_assert!(c.succeeded(), "pager: memory IO should complete immediately");
+            turso_assert!(
+                c.succeeded(),
+                "pager: memory IO should complete immediately"
+            );
             current_offset += page_size;
 
             // Add page to rollback bitset
@@ -2040,7 +2052,11 @@ impl Pager {
                                 while is_ptrmap_page(root_page_num, page_size as usize) {
                                     root_page_num += 1;
                                 }
-                                turso_assert_greater_than_or_equal!(root_page_num, 3, "pager: root page must be >= 3 (number of the first root page)");
+                                turso_assert_greater_than_or_equal!(
+                                    root_page_num,
+                                    3,
+                                    "pager: root page must be >= 3 (number of the first root page)"
+                                );
                                 self.vacuum_state.write().btree_create_vacuum_full_state =
                                     BtreeCreateVacuumFullState::AllocatePage { root_page_num };
                             }
@@ -2170,7 +2186,10 @@ impl Pager {
 
     /// Set the initial page size for the database. Should only be called before the database is initialized
     pub fn set_initial_page_size(&self, size: PageSize) -> Result<()> {
-        turso_assert!(!self.db_initialized(), "pager: db must not be initialized when setting initial page size");
+        turso_assert!(
+            !self.db_initialized(),
+            "pager: db must not be initialized when setting initial page size"
+        );
         let IOResult::Done(_) = self.with_header_mut(|header| {
             header.page_size = size;
         })?
@@ -2415,7 +2434,11 @@ impl Pager {
         frame_watermark: Option<u64>,
         allow_empty_read: bool,
     ) -> Result<(PageRef, Completion)> {
-        turso_assert_greater_than_or_equal!(page_idx, 0, "pager: read_page_no_cache page_idx must be non-negative");
+        turso_assert_greater_than_or_equal!(
+            page_idx,
+            0,
+            "pager: read_page_no_cache page_idx must be non-negative"
+        );
         tracing::debug!("read_page_no_cache(page_idx = {})", page_idx);
         let page = Arc::new(Page::new(page_idx));
         let io_ctx = self.io_ctx.read();
@@ -3978,14 +4001,21 @@ impl Pager {
         let state = self.allocate_page1_state.read().clone();
         match state {
             AllocatePage1State::Start => {
-                turso_assert!(!self.db_initialized(), "pager: db must not be initialized in allocate_page1");
+                turso_assert!(
+                    !self.db_initialized(),
+                    "pager: db must not be initialized in allocate_page1"
+                );
                 tracing::trace!("allocate_page1(Start)");
 
                 let IOResult::Done(mut default_header) = self.with_header(|header| *header)? else {
                     panic!("DB should not be initialized and should not do any IO");
                 };
 
-                turso_assert_eq!(default_header.database_size.get(), 0, "pager: database_size must be 0 in allocate_page1");
+                turso_assert_eq!(
+                    default_header.database_size.get(),
+                    0,
+                    "pager: database_size must be 0 in allocate_page1"
+                );
                 default_header.database_size = 1.into();
 
                 // Use cached reserved_space if set (e.g., by sync engine before page allocation),
@@ -4642,14 +4672,22 @@ pub(crate) mod ptrmap {
     /// Calculates how many database pages are mapped by a single pointer map page.
     /// This is based on the total page size, as ptrmap pages are filled with entries.
     pub fn entries_per_ptrmap_page(page_size: usize) -> usize {
-        turso_assert_greater_than_or_equal!(page_size, PageSize::MIN as usize, "pager: page_size must be >= MIN");
+        turso_assert_greater_than_or_equal!(
+            page_size,
+            PageSize::MIN as usize,
+            "pager: page_size must be >= MIN"
+        );
         page_size / PTRMAP_ENTRY_SIZE
     }
 
     /// Calculates the cycle length of pointer map pages
     /// The cycle length is the number of database pages that are mapped by a single pointer map page.
     pub fn ptrmap_page_cycle_length(page_size: usize) -> usize {
-        turso_assert_greater_than_or_equal!(page_size, PageSize::MIN as usize, "pager: page_size must be >= MIN");
+        turso_assert_greater_than_or_equal!(
+            page_size,
+            PageSize::MIN as usize,
+            "pager: page_size must be >= MIN"
+        );
         (page_size / PTRMAP_ENTRY_SIZE) + 1
     }
 
