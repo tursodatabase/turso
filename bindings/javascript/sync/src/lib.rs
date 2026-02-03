@@ -216,6 +216,12 @@ impl SyncEngine {
             }
             #[cfg(all(not(target_os = "linux"), not(feature = "browser")))]
             {
+                if opts.partial_sync_opts.is_some() {
+                    return Err(napi::Error::new(
+                        napi::Status::GenericFailure,
+                        "partial sync is not supported for this platform at the moment",
+                    ));
+                }
                 Arc::new(turso_core::PlatformIO::new().map_err(|e| {
                     napi::Error::new(
                         napi::Status::GenericFailure,
