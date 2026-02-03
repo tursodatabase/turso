@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use strum::EnumString;
 use tracing::{instrument, Level};
 #[allow(unused_imports)]
-use turso_macros::{turso_assert_greater_than, turso_soft_unreachable};
+use turso_macros::{turso_assert_greater_than, turso_debug_assert, turso_soft_unreachable};
 
 use crate::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use crate::sync::RwLock;
@@ -254,7 +254,7 @@ impl TursoRwLock {
     #[inline]
     pub fn downgrade(&self) {
         let cur = self.0.load(Ordering::Acquire);
-        debug_assert!(Self::has_writer(cur));
+        turso_debug_assert!(Self::has_writer(cur));
         // Preserve value bits, replace writer with one reader
         let desired = (cur & Self::VALUE_MASK) | Self::READER_INC;
         self.0.store(desired, Ordering::Release);

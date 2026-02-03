@@ -7,7 +7,7 @@ use crate::{
     LimboError, Result, Value, ValueRef,
 };
 #[allow(unused_imports)]
-use turso_macros::turso_assert;
+use turso_macros::{turso_assert, turso_debug_assert};
 
 // we use math functions from Rust stdlib in order to be as portable as possible for the production version of the tursodb
 #[cfg(not(test))]
@@ -400,6 +400,7 @@ impl Value {
                 }
 
                 //  The character boundary will be within four bytes of the index
+                //TODO use an Antithesis macro (not currently const)
                 debug_assert!(i <= index + 3);
 
                 i

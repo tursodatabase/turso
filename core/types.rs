@@ -26,7 +26,7 @@ use std::iter::{FusedIterator, Peekable};
 use std::ops::Deref;
 use std::task::Waker;
 #[allow(unused_imports)]
-use turso_macros::turso_soft_unreachable;
+use turso_macros::{turso_debug_assert, turso_soft_unreachable};
 
 /// SQLite by default uses 2000 as maximum numbers in a row.
 /// It controlld by the constant called SQLITE_MAX_COLUMN
@@ -144,7 +144,7 @@ impl<T: AnyText> Extendable<T> for Text {
                 let needed = other_str.len();
                 if s.capacity() >= needed {
                     // SAFETY: capacity >= needed, source is valid UTF-8
-                    debug_assert!(
+                    turso_debug_assert!(
                         s.as_ptr().wrapping_add(s.len()) <= other_str.as_ptr()
                             || other_str.as_ptr().wrapping_add(other_str.len()) <= s.as_ptr(),
                         "source and destination ranges must not overlap"
@@ -172,7 +172,7 @@ impl<T: AnyBlob> Extendable<T> for Vec<u8> {
         let needed = other_slice.len();
         if self.capacity() >= needed {
             // SAFETY: capacity >= needed
-            debug_assert!(
+            turso_debug_assert!(
                 self.as_ptr().wrapping_add(self.len()) <= other_slice.as_ptr()
                     || other_slice.as_ptr().wrapping_add(other_slice.len()) <= self.as_ptr(),
                 "source and destination ranges must not overlap"
@@ -2218,7 +2218,7 @@ where
     let string_len = (first_serial_type as usize - 13) / 2;
     let data_start = header_size;
 
-    debug_assert!(data_start + string_len <= payload.len());
+    turso_debug_assert!(data_start + string_len <= payload.len());
 
     let serial_type = SerialType::try_from(first_serial_type)?;
     let (lhs_value, _) = read_value(&payload[data_start..], serial_type)?;
@@ -2305,7 +2305,7 @@ where
 
     let (header_size, mut header_pos) = read_varint(payload)?;
     let header_end = header_size as usize;
-    debug_assert!(header_end <= payload.len());
+    turso_debug_assert!(header_end <= payload.len());
 
     let mut data_pos = header_size as usize;
 

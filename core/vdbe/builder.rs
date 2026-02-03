@@ -15,7 +15,7 @@ use crate::{
     Arc, CaptureDataChangesMode, Connection, Value, VirtualTable,
 };
 #[allow(unused_imports)]
-use turso_macros::{turso_assert, turso_assert_eq};
+use turso_macros::{turso_assert, turso_assert_eq, turso_debug_assert};
 
 // Keep distinct hash-table ids far from table internal ids to avoid collisions.
 const HASH_TABLE_ID_BASE: usize = 1 << 30;
@@ -724,7 +724,7 @@ impl ProgramBuilder {
                 self.current_parent_explain_idx = *p2;
             }
         } else {
-            debug_assert!(self.current_parent_explain_idx.is_none())
+            turso_debug_assert!(self.current_parent_explain_idx.is_none());
         }
     }
 

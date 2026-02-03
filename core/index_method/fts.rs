@@ -34,7 +34,7 @@ use tantivy::{
     },
     DocAddress, HasLen, Index, IndexReader, IndexSettings, IndexWriter, Searcher, TantivyDocument,
 };
-use turso_macros::turso_assert;
+use turso_macros::{turso_assert, turso_debug_assert};
 use turso_parser::ast::{self, Select, SortOrder};
 
 /// Name identifier for the FTS index method, used in `CREATE INDEX ... USING fts`.
@@ -976,7 +976,7 @@ impl FileHandle for LazyFileHandle {
             };
 
             // Defensive bounds check - should not be needed if logic is correct
-            debug_assert!(
+            turso_debug_assert!(
                 local_start <= chunk.len() && local_end <= chunk.len(),
                 "chunk slice out of bounds: local_start={}, local_end={}, chunk_len={}",
                 local_start,

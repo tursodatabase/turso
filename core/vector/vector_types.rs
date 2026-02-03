@@ -1,4 +1,6 @@
 use crate::{LimboError, Result};
+#[allow(unused_imports)]
+use turso_macros::turso_debug_assert;
 
 #[derive(Debug, Clone, PartialEq, Copy)]
 pub enum VectorType {
@@ -222,7 +224,7 @@ impl<'a> Vector<'a> {
     /// - The buffer is correctly aligned for `f32`
     /// - The length of the buffer is exactly `dims * size_of::<f32>()`
     pub fn as_f32_slice(&self) -> &[f32] {
-        debug_assert!(self.vector_type == VectorType::Float32Dense);
+        turso_debug_assert!(self.vector_type == VectorType::Float32Dense);
         if self.dims == 0 {
             return &[];
         }
@@ -251,7 +253,7 @@ impl<'a> Vector<'a> {
     /// - The buffer is correctly aligned for `f64`
     /// - The length of the buffer is exactly `dims * size_of::<f64>()`
     pub fn as_f64_slice(&self) -> &[f64] {
-        debug_assert!(self.vector_type == VectorType::Float64Dense);
+        turso_debug_assert!(self.vector_type == VectorType::Float64Dense);
         if self.dims == 0 {
             return &[];
         }
@@ -274,7 +276,7 @@ impl<'a> Vector<'a> {
     }
 
     pub fn as_f32_sparse(&self) -> VectorSparse<'_, f32> {
-        debug_assert!(self.vector_type == VectorType::Float32Sparse);
+        turso_debug_assert!(self.vector_type == VectorType::Float32Sparse);
         let ptr = self.bin_data().as_ptr();
         let align = std::mem::align_of::<f32>();
         assert_eq!(
@@ -285,7 +287,7 @@ impl<'a> Vector<'a> {
         let length = self.bin_data().len() / 4 / 2;
         let values = unsafe { std::slice::from_raw_parts(ptr as *const f32, length) };
         let idx = unsafe { std::slice::from_raw_parts((ptr as *const u32).add(length), length) };
-        debug_assert!(idx.is_sorted());
+        turso_debug_assert!(idx.is_sorted());
         VectorSparse { idx, values }
     }
 }

@@ -35,7 +35,7 @@ use tracing::{instrument, trace, Level};
 #[allow(unused_imports)]
 use turso_macros::{
     turso_assert, turso_assert_eq, turso_assert_greater_than, turso_assert_greater_than_or_equal,
-    turso_assert_less_than, turso_assert_ne, turso_soft_unreachable,
+    turso_assert_less_than, turso_assert_ne, turso_debug_assert, turso_soft_unreachable,
 };
 
 use super::btree::offset::{
@@ -288,7 +288,7 @@ impl PageInner {
     }
 
     pub fn write_cell_content_area(&self, value: usize) {
-        debug_assert!(value <= PageSize::MAX as usize);
+        turso_debug_assert!(value <= PageSize::MAX as usize);
         let value = value as u16;
         self.write_u16(BTREE_CELL_CONTENT_AREA, value);
     }
@@ -384,7 +384,7 @@ impl PageInner {
 
     #[inline(always)]
     pub fn cell_table_interior_read_rowid(&self, idx: usize) -> crate::Result<i64> {
-        debug_assert!(matches!(self.page_type(), Ok(PageType::TableInterior)));
+        turso_debug_assert!(matches!(self.page_type(), Ok(PageType::TableInterior)));
         let buf = self.as_ptr();
         let cell_pointer_array_start = self.header_size();
         let cell_pointer = cell_pointer_array_start + (idx * CELL_PTR_SIZE_BYTES);
@@ -396,7 +396,7 @@ impl PageInner {
 
     #[inline(always)]
     pub fn cell_interior_read_left_child_page(&self, idx: usize) -> crate::Result<u32> {
-        debug_assert!(matches!(
+        turso_debug_assert!(matches!(
             self.page_type(),
             Ok(PageType::TableInterior) | Ok(PageType::IndexInterior)
         ));
@@ -422,7 +422,7 @@ impl PageInner {
 
     #[inline(always)]
     pub fn cell_table_leaf_read_rowid(&self, idx: usize) -> crate::Result<i64> {
-        debug_assert!(matches!(self.page_type(), Ok(PageType::TableLeaf)));
+        turso_debug_assert!(matches!(self.page_type(), Ok(PageType::TableLeaf)));
         let buf = self.as_ptr();
         let cell_pointer_array_start = self.header_size();
         let cell_pointer = cell_pointer_array_start + (idx * CELL_PTR_SIZE_BYTES);
@@ -723,7 +723,7 @@ impl Page {
     /// Panics if the page buffer is not loaded.
     pub fn get_contents(&self) -> &mut PageInner {
         let inner = self.get();
-        debug_assert!(
+        turso_debug_assert!(
             inner.buffer.is_some(),
             "page {} buffer not loaded",
             inner.id

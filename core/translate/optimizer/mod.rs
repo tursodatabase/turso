@@ -39,7 +39,7 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::{cmp::Ordering, collections::VecDeque, sync::Arc};
 use turso_ext::{ConstraintInfo, ConstraintUsage};
 #[allow(unused_imports)]
-use turso_macros::{turso_assert, turso_assert_eq, turso_soft_unreachable};
+use turso_macros::{turso_assert, turso_assert_eq, turso_debug_assert, turso_soft_unreachable};
 use turso_parser::ast::{self, Expr, SortOrder, TriggerEvent};
 
 use super::{
@@ -2237,7 +2237,7 @@ fn build_seek_def(
     let last = key.pop().unwrap();
 
     // after that all key components must be equality constraints
-    debug_assert!(key.iter().all(|k| k.eq.is_some()));
+    turso_debug_assert!(key.iter().all(|k| k.eq.is_some()));
 
     // For the commented examples below, keep in mind that since a descending index is laid out in reverse order, the comparison operators are reversed, e.g. LT becomes GT, LE becomes GE, etc.
     // Also keep in mind that index keys are compared based on the number of columns given, so for example:

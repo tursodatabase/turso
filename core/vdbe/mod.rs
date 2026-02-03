@@ -93,7 +93,7 @@ use std::{
 };
 use tracing::{instrument, Level};
 #[allow(unused_imports)]
-use turso_macros::{turso_assert, turso_assert_ne};
+use turso_macros::{turso_assert, turso_assert_ne, turso_debug_assert};
 
 /// State machine for committing view deltas with I/O handling
 #[derive(Debug, Clone)]
@@ -959,7 +959,7 @@ impl Program {
     }
 
     fn explain_step(&self, state: &mut ProgramState, pager: Arc<Pager>) -> Result<StepResult> {
-        debug_assert!(state.column_count() == EXPLAIN_COLUMNS.len());
+        turso_debug_assert!(state.column_count() == EXPLAIN_COLUMNS.len());
         if self.connection.is_closed() {
             // Connection is closed for whatever reason, rollback the transaction.
             let state = self.connection.get_tx_state();
@@ -1109,7 +1109,7 @@ impl Program {
         state: &mut ProgramState,
         pager: Arc<Pager>,
     ) -> Result<StepResult> {
-        debug_assert!(state.column_count() == EXPLAIN_QUERY_PLAN_COLUMNS.len());
+        turso_debug_assert!(state.column_count() == EXPLAIN_QUERY_PLAN_COLUMNS.len());
         loop {
             if self.connection.is_closed() {
                 // Connection is closed for whatever reason, rollback the transaction.

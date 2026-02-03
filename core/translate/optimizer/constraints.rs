@@ -16,7 +16,7 @@ use rustc_hash::FxHashMap as HashMap;
 use std::{cmp::Ordering, collections::VecDeque, sync::Arc};
 use turso_ext::{ConstraintInfo, ConstraintOp};
 #[allow(unused_imports)]
-use turso_macros::turso_assert;
+use turso_macros::{turso_assert, turso_debug_assert};
 use turso_parser::ast::{self, SortOrder, TableInternalId};
 
 use super::cost_params::CostModelParams;
@@ -1196,7 +1196,7 @@ pub fn usable_constraints_for_join_order<'a>(
     refs: &'a [ConstraintRef],
     join_order: &[JoinOrderMember],
 ) -> Vec<RangeConstraintRef> {
-    debug_assert!(refs.is_sorted_by_key(|x| x.index_col_pos));
+    turso_debug_assert!(refs.is_sorted_by_key(|x| x.index_col_pos));
 
     let table_idx = join_order.last().unwrap().original_idx;
     let lhs_mask = TableMask::from_table_number_iter(
