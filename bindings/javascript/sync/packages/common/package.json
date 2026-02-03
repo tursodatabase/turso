@@ -1,6 +1,6 @@
 {
   "name": "@tursodatabase/sync-common",
-  "version": "0.4.4",
+  "version": "0.4.5-pre.1",
   "repository": {
     "type": "git",
     "url": "https://github.com/tursodatabase/turso"
@@ -23,6 +23,6 @@
     "test": "echo 'no tests'"
   },
   "dependencies": {
-    "@tursodatabase/database-common": "^0.4.4"
+    "@tursodatabase/database-common": "^0.4.5-pre.1"
   }
 }
