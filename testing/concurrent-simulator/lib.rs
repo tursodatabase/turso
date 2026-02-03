@@ -815,7 +815,7 @@ impl Whopper {
     /// Finalize all properties (e.g., export Elle history).
     pub fn finalize_properties(&self) -> anyhow::Result<()> {
         for property in &self.properties {
-            let property = property.lock().unwrap();
+            let mut property = property.lock().unwrap();
             property.finalize()?;
         }
         Ok(())

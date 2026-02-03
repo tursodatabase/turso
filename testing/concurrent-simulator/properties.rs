@@ -42,7 +42,7 @@ pub trait Property: Send + Sync {
 
     /// Called when the simulation finishes.
     /// Default implementation does nothing.
-    fn finalize(&self) -> anyhow::Result<()> {
+    fn finalize(&mut self) -> anyhow::Result<()> {
         Ok(())
     }
 }
@@ -549,10 +549,15 @@ impl Property for ElleHistoryRecorder {
                                 }],
                             );
                         } else {
-                            self.add_event(completion_index, ElleEventType::Fail, fiber_id, vec![ElleOp::Read {
-                                key: key.clone(),
-                                result: None,
-                            }]);
+                            self.add_event(
+                                completion_index,
+                                ElleEventType::Fail,
+                                fiber_id,
+                                vec![ElleOp::Read {
+                                    key: key.clone(),
+                                    result: None,
+                                }],
+                            );
                         }
                     }
                 }
@@ -563,7 +568,49 @@ impl Property for ElleHistoryRecorder {
         Ok(())
     }
 
-    fn finalize(&self) -> anyhow::Result<()> {
+    fn finalize(&mut self) -> anyhow::Result<()> {
+        // Emit :info events for any pending transactions (incomplete)
+        let pending_txns: Vec<_> = self.pending_txns.drain().collect();
+        for (fiber_id, pending) in pending_txns {
+            if !pending.ops.is_empty() {
+                // Invoke with nil results for reads
+                let invoke_ops: Vec<ElleOp> = pending
+                    .ops
+                    .iter()
+                    .map(|o| match o {
+                        ElleOp::Read { key, .. } => ElleOp::Read {
+                            key: key.clone(),
+                            result: None,
+                        },
+                        other => other.clone(),
+                    })
+                    .collect();
+                self.add_event(
+                    pending.invoke_index,
+                    ElleEventType::Invoke,
+                    fiber_id,
+                    invoke_ops,
+                );
+
+                // Info for incomplete transaction
+                let info_index = self.next_index();
+                self.add_event(info_index, ElleEventType::Info, fiber_id, pending.ops);
+            }
+        }
+
+        // Emit :info events for any pending auto-commit operations (incomplete)
+        let pending_auto: Vec<_> = self.pending_auto_commits.drain().collect();
+        for (fiber_id, pending) in pending_auto {
+            self.add_event(
+                pending.invoke_index,
+                ElleEventType::Invoke,
+                fiber_id,
+                vec![pending.op.clone()],
+            );
+            let info_index = self.next_index();
+            self.add_event(info_index, ElleEventType::Info, fiber_id, vec![pending.op]);
+        }
+
         self.export()?;
         Ok(())
     }
