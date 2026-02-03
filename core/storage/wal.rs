@@ -316,6 +316,8 @@ pub trait Wal: Debug + Send + Sync {
     /// Begin a read transaction.
     /// Returns whether the database state has changed since the last read transaction.
     fn begin_read_tx(&self) -> Result<bool>;
+    /// MVCC helper: check if WAL state changed without starting a read tx.
+    fn mvcc_refresh_if_db_changed(&self) -> bool;
 
     /// Begin a write transaction.
     fn begin_write_tx(&self) -> Result<()>;
@@ -1161,6 +1163,10 @@ impl Wal for WalFile {
                 }
             }
         }
+    }
+
+    fn mvcc_refresh_if_db_changed(&self) -> bool {
+        WalFile::mvcc_refresh_if_db_changed(self)
     }
 
     /// End a read transaction.
@@ -2803,6 +2809,38 @@ impl WalFile {
             || checkpoint_seq != self.checkpoint_seq.load(Ordering::Acquire)
             || transaction_count != self.transaction_count.load(Ordering::Acquire)
             || nbackfills + 1 != self.min_frame.load(Ordering::Acquire)
+    }
+
+    /// MVCC helper: check if WAL state changed and refresh local snapshot without starting a read tx.
+    /// FIXME: this isn't TOCTOU safe because we're not taking WAL read locks.
+    ///
+    /// This is only used to invalidate page cache, so false positives are sort of acceptable since
+    /// MVCC reads currently don't read from WAL frames ever.
+    /// FIXME: MVCC should start using pager read transactions anyway so that we can get rid of
+    /// the stop-the-world MVCC checkpoint that blocks all reads.
+    pub fn mvcc_refresh_if_db_changed(&self) -> bool {
+        self.with_shared(|shared| {
+            let shared_max = shared.max_frame.load(Ordering::Acquire);
+            let nbackfills = shared.nbackfills.load(Ordering::Acquire);
+            let last_checksum = shared.last_checksum;
+            let checkpoint_seq = shared.wal_header.lock().checkpoint_seq;
+            let transaction_count = shared.transaction_count.load(Ordering::Acquire);
+
+            let changed = shared_max != self.max_frame.load(Ordering::Acquire)
+                || last_checksum != *self.last_checksum.read()
+                || checkpoint_seq != self.checkpoint_seq.load(Ordering::Acquire)
+                || transaction_count != self.transaction_count.load(Ordering::Acquire)
+                || nbackfills + 1 != self.min_frame.load(Ordering::Acquire);
+            if changed {
+                self.max_frame.store(shared_max, Ordering::Release);
+                self.min_frame.store(nbackfills + 1, Ordering::Release);
+                *self.last_checksum.write() = last_checksum;
+                self.checkpoint_seq.store(checkpoint_seq, Ordering::Release);
+                self.transaction_count
+                    .store(transaction_count, Ordering::Release);
+            }
+            changed
+        })
     }
 }
 

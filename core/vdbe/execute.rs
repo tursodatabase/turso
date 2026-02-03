@@ -2173,6 +2173,8 @@ pub fn op_transaction_inner(
 
                 // 2. Start transaction if needed
                 if let Some(mv_store) = mv_store.as_ref() {
+                    // MVCC reads must refresh WAL change counters to avoid stale page-cache reads.
+                    pager.mvcc_refresh_if_db_changed();
                     // In MVCC we don't have write exclusivity, therefore we just need to start a transaction if needed.
                     // Programs can run Transaction twice, first with read flag and then with write flag. So a single txid is enough
                     // for both.

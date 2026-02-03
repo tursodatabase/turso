@@ -2255,6 +2255,18 @@ impl Pager {
         Ok(())
     }
 
+    /// MVCC-only: refresh connection-private WAL change counters without starting a read tx and invalidate cache if needed.
+    pub fn mvcc_refresh_if_db_changed(&self) {
+        let Some(wal) = self.wal.as_ref() else {
+            return;
+        };
+        if wal.mvcc_refresh_if_db_changed() {
+            // Prevents stale page cache reads after MVCC checkpoints update the DB file.
+            self.clear_page_cache(false);
+            self.set_schema_cookie(None);
+        }
+    }
+
     #[instrument(skip_all, level = Level::DEBUG)]
     pub fn maybe_allocate_page1(&self) -> Result<IOResult<()>> {
         if !self.db_initialized() {
