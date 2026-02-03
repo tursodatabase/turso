@@ -2,11 +2,12 @@
 set -e
 
 # Run the Whopper simulator with Elle consistency checking, then analyze with elle-cli
-# Usage: ./bin/run-elle [--max-steps N] [--mode MODE] [--skip-analysis] [--clean]
+# Usage: ./bin/run-elle [--max-steps N] [--mode MODE] [--mvcc] [--skip-analysis] [--clean]
 #
 # Options:
 #   --max-steps N     Number of simulation steps (default: 100000)
 #   --mode MODE       Simulation mode: fast, chaos, ragnarok (default: fast)
+#   --mvcc            Enable MVCC (Multi-Version Concurrency Control)
 #   --skip-analysis   Only run simulation, don't analyze with elle-cli
 #   --clean           Re-clone and rebuild elle-cli
 #
@@ -22,6 +23,7 @@ LEIN_DIR="/tmp/lein"
 OUTPUT_FILE="$WORKING_DIR/elle-history.edn"
 SKIP_ANALYSIS=0
 CLEAN=0
+ENABLE_MVCC=0
 ARGS=()
 
 # Parse arguments
@@ -29,6 +31,7 @@ while [[ $# -gt 0 ]]; do
     case $1 in
         --skip-analysis) SKIP_ANALYSIS=1; shift ;;
         --clean) CLEAN=1; shift ;;
+        --mvcc) ENABLE_MVCC=1; shift ;;
         --elle-output)
             # Convert to absolute path
             if [[ "$2" = /* ]]; then
@@ -47,10 +50,20 @@ while [[ $# -gt 0 ]]; do
 done
 
 # Step 1: Run whopper simulation
-echo "=== Running Whopper with Elle enabled ==="
+if [[ "$ENABLE_MVCC" -eq 1 ]]; then
+    echo "=== Running Whopper with Elle enabled (MVCC mode) ==="
+else
+    echo "=== Running Whopper with Elle enabled ==="
+fi
 cargo build -p turso_whopper
 
-time RUST_BACKTRACE=full ./target/debug/turso_whopper --elle list-append --elle-output "$OUTPUT_FILE" "${ARGS[@]}"
+WHOPPER_ARGS=(--elle list-append --elle-output "$OUTPUT_FILE")
+if [[ "$ENABLE_MVCC" -eq 1 ]]; then
+    WHOPPER_ARGS+=(--enable-mvcc)
+fi
+WHOPPER_ARGS+=("${ARGS[@]}")
+
+time RUST_BACKTRACE=full ./target/debug/turso_whopper "${WHOPPER_ARGS[@]}"
 
 if [[ "$SKIP_ANALYSIS" -eq 1 ]]; then
     echo ""
