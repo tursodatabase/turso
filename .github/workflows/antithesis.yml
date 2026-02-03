@@ -9,6 +9,11 @@ on:
         required: false
         default: ""
         type: string
+      duration:
+        description: "Duration in minutes (default 4 hours)"
+        required: false
+        default: 240
+        type: number
   schedule:
     - cron: "0 0 * * *"
 
@@ -46,7 +51,7 @@ jobs:
       if: github.event_name == 'workflow_dispatch'
       uses: antithesishq/antithesis-trigger-action@v0.5
       with:
-        notebook_name: Limbo Test
+        notebook_name: limbo
         tenant: ${{ secrets.ANTITHESIS_TENANT }}
         username: ${{ secrets.ANTITHESIS_USERNAME }}
         password: ${{ secrets.ANTITHESIS_PASSWORD }}
@@ -55,9 +60,5 @@ jobs:
         images: ${{ secrets.ANTITHESIS_DOCKER_REPO }}/limbo-workload:antithesis-latest
         description: "Turso - ${{ github.event_name }} on ${{ github.ref_name }} by ${{ github.actor }}"
         email_recipients: ${{ secrets.ANTITHESIS_EMAIL }}
-        test_name: ${{ github.event.inputs.test_name }}
         additional_parameters: |-
-          branch=${{ github.ref_name }}
-          commit_message=${{ github.event.head_commit.message }}
-          who_triggered_this=${{ github.actor }}
-          gh_actions_run_id=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          antithesis.duration=${{ github.event.inputs.duration }}
