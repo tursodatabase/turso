@@ -12,6 +12,9 @@ macro_rules! turso_assert {
     ($cond:expr, $msg:literal) => {
         assert!($cond, $msg);
     };
+    ($cond:expr) => {
+        assert!($cond, "{}", stringify!($cond));
+    };
 }
 
 #[cfg(feature = "antithesis")]
@@ -28,6 +31,10 @@ macro_rules! turso_assert {
     ($cond:expr, $msg:literal) => {
         antithesis_sdk::assert_always_or_unreachable!($cond, $msg);
         assert!($cond, $msg);
+    };
+    ($cond:expr) => {
+        antithesis_sdk::assert_always_or_unreachable!($cond, stringify!($cond));
+        assert!($cond, "{}", stringify!($cond));
     };
 }
 
@@ -46,6 +53,9 @@ macro_rules! turso_debug_assert {
     ($cond:expr, $msg:literal) => {
         debug_assert!($cond, $msg);
     };
+    ($cond:expr) => {
+        debug_assert!($cond, "{}", stringify!($cond));
+    };
 }
 
 #[cfg(feature = "antithesis")]
@@ -62,6 +72,10 @@ macro_rules! turso_debug_assert {
     ($cond:expr, $msg:literal) => {
         antithesis_sdk::assert_always_or_unreachable!($cond, $msg);
         debug_assert!($cond, $msg);
+    };
+    ($cond:expr) => {
+        antithesis_sdk::assert_always_or_unreachable!($cond, stringify!($cond));
+        debug_assert!($cond, "{}", stringify!($cond));
     };
 }
 
@@ -82,11 +96,15 @@ macro_rules! turso_debug_assert {
 #[macro_export]
 macro_rules! turso_assert_sometimes {
     ($cond:expr, $msg:literal) => {
-        // When not using Antithesis, this is a no-op
+        // no-op
         let _ = $cond;
     };
     ($cond:expr, $msg:literal, { $($details:tt)* }) => {
-        // When not using Antithesis, this is a no-op
+        // no-op
+        let _ = $cond;
+    };
+    ($cond:expr) => {
+        // no-op
         let _ = $cond;
     };
 }
@@ -104,6 +122,9 @@ macro_rules! turso_assert_sometimes {
             &serde_json::json!({ $($details)* })
         );
     };
+    ($cond:expr) => {
+        antithesis_sdk::assert_sometimes!($cond, stringify!($cond));
+    };
 }
 
 /// Assert that a code path is reached at least once during testing.
@@ -111,10 +132,10 @@ macro_rules! turso_assert_sometimes {
 #[macro_export]
 macro_rules! turso_assert_reachable {
     ($msg:literal, { $($details:tt)* }) => {
-        // When not using Antithesis, this is a no-op
+        // no-op
     };
     ($msg:literal) => {
-        // When not using Antithesis, this is a no-op
+        // no-op
     };
 }
 
@@ -427,11 +448,15 @@ macro_rules! turso_assert_sometimes_less_than_or_equal {
 #[macro_export]
 macro_rules! turso_assert_always_some {
     ($cond:expr, $msg:literal, { $($details:tt)* }) => {
-        // When not using Antithesis, this is a no-op
+        // no-op
         let _ = $cond;
     };
     ($cond:expr, $msg:literal) => {
-        // When not using Antithesis, this is a no-op
+        // no-op
+        let _ = $cond;
+    };
+    ($cond:expr) => {
+        // no-op
         let _ = $cond;
     };
 }
@@ -445,6 +470,9 @@ macro_rules! turso_assert_always_some {
     ($cond:expr, $msg:literal) => {
         antithesis_sdk::assert_always_some!($cond, $msg);
     };
+    ($cond:expr) => {
+        antithesis_sdk::assert_always_some!($cond, stringify!($cond));
+    };
 }
 
 /// Assert that a condition is true across all evaluations, at least once during testing.
@@ -453,11 +481,15 @@ macro_rules! turso_assert_always_some {
 #[macro_export]
 macro_rules! turso_assert_sometimes_all {
     ($cond:expr, $msg:literal, { $($details:tt)* }) => {
-        // When not using Antithesis, this is a no-op
+        // no-op
         let _ = $cond;
     };
     ($cond:expr, $msg:literal) => {
-        // When not using Antithesis, this is a no-op
+        // no-op
+        let _ = $cond;
+    };
+    ($cond:expr) => {
+        // no-op
         let _ = $cond;
     };
 }
@@ -470,6 +502,9 @@ macro_rules! turso_assert_sometimes_all {
     };
     ($cond:expr, $msg:literal) => {
         antithesis_sdk::assert_sometimes_all!($cond, $msg);
+    };
+    ($cond:expr) => {
+        antithesis_sdk::assert_sometimes_all!($cond, stringify!($cond));
     };
 }
 
