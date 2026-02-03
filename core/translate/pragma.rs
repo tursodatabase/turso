@@ -389,9 +389,23 @@ fn update_pragma(
         }
         PragmaName::Synchronous => {
             use crate::SyncMode;
-            let mode = match parse_pragma_enabled(&value) {
-                true => SyncMode::Full,
-                false => SyncMode::Off,
+            let mode = if let Expr::Literal(Literal::Numeric(n)) = &value {
+                match n.as_str() {
+                    "0" => SyncMode::Off,
+                    "1" => SyncMode::Normal,
+                    _ => SyncMode::Full, // SQLite defaults to NORMAL for invalid values, but we want to default to a higher durability level so deviating here.
+                }
+            } else {
+                let name_bytes = match &value {
+                    Expr::Literal(Literal::Keyword(name)) => name.as_bytes(),
+                    Expr::Name(name) | Expr::Id(name) => name.as_str().as_bytes(),
+                    _ => b"",
+                };
+                match_ignore_ascii_case!(match name_bytes {
+                    b"OFF" | b"0" => SyncMode::Off,
+                    b"NORMAL" | b"1" => SyncMode::Normal,
+                    _ => SyncMode::Full,
+                })
             };
             connection.set_sync_mode(mode);
             Ok((program, TransactionMode::None))
