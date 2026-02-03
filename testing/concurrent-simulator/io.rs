@@ -71,7 +71,12 @@ impl SimulatorIO {
                 let dest_path = out_dir.join(&filename);
                 let mmap = file.mmap.lock().unwrap();
                 std::fs::write(&dest_path, &mmap[..actual_size])?;
-                println!("Dumped {} ({} bytes) to {}", path, actual_size, dest_path.display());
+                println!(
+                    "Dumped {} ({} bytes) to {}",
+                    path,
+                    actual_size,
+                    dest_path.display()
+                );
             }
         }
         Ok(())

@@ -235,7 +235,8 @@ struct BufferedElleEvent {
 
 /// Pending transaction state: invoke index and accumulated operations.
 struct PendingTxn {
-    invoke_index: u64,
+    /// Index reserved when the first operation executes (None for deferred transactions until first op)
+    invoke_index: Option<u64>,
     ops: Vec<ElleOp>,
 }
 
@@ -337,9 +338,15 @@ impl Property for ElleHistoryRecorder {
         op: &Operation,
     ) -> anyhow::Result<()> {
         match op {
-            Operation::Begin { .. } => {
-                // Reserve invoke index and start tracking ops
-                let invoke_index = self.next_index();
+            Operation::Begin { mode } => {
+                // For BEGIN and BEGIN DEFERRED, defer index reservation until first operation
+                // For BEGIN IMMEDIATE/EXCLUSIVE, reserve index now since they acquire locks immediately
+                let is_deferred = mode == "BEGIN" || mode.to_uppercase().contains("DEFERRED");
+                let invoke_index = if is_deferred {
+                    None
+                } else {
+                    Some(self.next_index())
+                };
                 self.pending_txns.insert(
                     fiber_id,
                     PendingTxn {
@@ -400,6 +407,11 @@ impl Property for ElleHistoryRecorder {
             }
             Operation::Commit => {
                 if let Some(pending) = self.pending_txns.remove(&fiber_id) {
+                    // Only emit events if we have operations and an invoke index was reserved
+                    let Some(invoke_index) = pending.invoke_index else {
+                        // If invoke_index is None, the transaction had no Elle operations - nothing to record
+                        return Ok(());
+                    };
                     if !pending.ops.is_empty() {
                         // Invoke with nil results for reads
                         let invoke_ops: Vec<ElleOp> = pending
@@ -413,12 +425,7 @@ impl Property for ElleHistoryRecorder {
                                 other => other.clone(),
                             })
                             .collect();
-                        self.add_event(
-                            pending.invoke_index,
-                            ElleEventType::Invoke,
-                            fiber_id,
-                            invoke_ops,
-                        );
+                        self.add_event(invoke_index, ElleEventType::Invoke, fiber_id, invoke_ops);
 
                         // Ok or Fail with new index
                         let completion_index = self.next_index();
@@ -442,6 +449,11 @@ impl Property for ElleHistoryRecorder {
             }
             Operation::Rollback => {
                 if let Some(pending) = self.pending_txns.remove(&fiber_id) {
+                    // Only emit events if we have operations and an invoke index was reserved
+                    let Some(invoke_index) = pending.invoke_index else {
+                        // If invoke_index is None, the transaction had no Elle operations - nothing to record
+                        return Ok(());
+                    };
                     if !pending.ops.is_empty() {
                         // Invoke with nil results for reads
                         let invoke_ops: Vec<ElleOp> = pending
@@ -455,12 +467,7 @@ impl Property for ElleHistoryRecorder {
                                 other => other.clone(),
                             })
                             .collect();
-                        self.add_event(
-                            pending.invoke_index,
-                            ElleEventType::Invoke,
-                            fiber_id,
-                            invoke_ops,
-                        );
+                        self.add_event(invoke_index, ElleEventType::Invoke, fiber_id, invoke_ops);
 
                         // Rollback always means fail
                         let completion_index = self.next_index();
@@ -476,8 +483,22 @@ impl Property for ElleHistoryRecorder {
             Operation::ElleAppend { key, value, .. } => {
                 if txn_id.is_some() {
                     // In a transaction - accumulate the op
+                    // Check if we need to reserve index before getting mutable borrow
+                    let needs_index = self
+                        .pending_txns
+                        .get(&fiber_id)
+                        .is_some_and(|p| p.invoke_index.is_none());
+                    let new_index = if needs_index {
+                        Some(self.next_index())
+                    } else {
+                        None
+                    };
                     if let Some(pending) = self.pending_txns.get_mut(&fiber_id) {
                         if result.is_ok() {
+                            // Reserve invoke index on first operation for deferred transactions
+                            if let Some(idx) = new_index {
+                                pending.invoke_index = Some(idx);
+                            }
                             pending.ops.push(ElleOp::Append {
                                 key: key.clone(),
                                 value: *value,
@@ -516,8 +537,22 @@ impl Property for ElleHistoryRecorder {
             Operation::ElleRead { key, .. } => {
                 if txn_id.is_some() {
                     // In a transaction - accumulate the op with result
+                    // Check if we need to reserve index before getting mutable borrow
+                    let needs_index = self
+                        .pending_txns
+                        .get(&fiber_id)
+                        .is_some_and(|p| p.invoke_index.is_none());
+                    let new_index = if needs_index {
+                        Some(self.next_index())
+                    } else {
+                        None
+                    };
                     if let Some(pending) = self.pending_txns.get_mut(&fiber_id) {
                         if result.is_ok() {
+                            // Reserve invoke index on first operation for deferred transactions
+                            if let Some(idx) = new_index {
+                                pending.invoke_index = Some(idx);
+                            }
                             let read_result = parse_read_result(result);
                             pending.ops.push(ElleOp::Read {
                                 key: key.clone(),
@@ -572,6 +607,11 @@ impl Property for ElleHistoryRecorder {
         // Emit :info events for any pending transactions (incomplete)
         let pending_txns: Vec<_> = self.pending_txns.drain().collect();
         for (fiber_id, pending) in pending_txns {
+            // Only emit events if we have operations and an invoke index was reserved
+            let Some(invoke_index) = pending.invoke_index else {
+                // If invoke_index is None, the transaction had no Elle operations - nothing to record
+                continue;
+            };
             if !pending.ops.is_empty() {
                 // Invoke with nil results for reads
                 let invoke_ops: Vec<ElleOp> = pending
@@ -585,12 +625,7 @@ impl Property for ElleHistoryRecorder {
                         other => other.clone(),
                     })
                     .collect();
-                self.add_event(
-                    pending.invoke_index,
-                    ElleEventType::Invoke,
-                    fiber_id,
-                    invoke_ops,
-                );
+                self.add_event(invoke_index, ElleEventType::Invoke, fiber_id, invoke_ops);
 
                 // Info for incomplete transaction
                 let info_index = self.next_index();
