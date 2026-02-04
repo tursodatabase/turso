@@ -12,7 +12,6 @@ use turso_core::json::{
     json_object, json_patch, json_quote, json_remove, json_replace, json_set, json_type,
     JsonCacheCell,
 };
-use turso_core::vdbe::likeop::exec_glob;
 use turso_core::vdbe::Register;
 use turso_core::MathFunc;
 use turso_core::Value as CoreValue;
@@ -345,7 +344,7 @@ fn execute_scalar_func(call: ScalarFuncCall) {
                     let _ = v1.exec_or(&v2);
                 }
                 BinaryFunc::Glob => {
-                    let _ = exec_glob(None, &v1.to_string(), &v2.to_string());
+                    let _ = CoreValue::exec_glob(&v1.to_string(), &v2.to_string());
                 }
                 BinaryFunc::Substring2 => {
                     let _ = CoreValue::exec_substring(&v1, &v2, None);
