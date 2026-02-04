@@ -944,19 +944,9 @@ impl Value {
     }
 
     pub fn exec_remainder(&self, rhs: &Value) -> Value {
-        let convert_to_float = matches!(Numeric::from(self), Numeric::Float(_))
-            || matches!(Numeric::from(rhs), Numeric::Float(_));
-
-        match NullableInteger::from(self) % NullableInteger::from(rhs) {
-            NullableInteger::Null => Value::Null,
-            NullableInteger::Integer(v) => {
-                if convert_to_float {
-                    Value::Float(v as f64)
-                } else {
-                    Value::Integer(v)
-                }
-            }
-        }
+        // SQLite's % operator always returns an integer (or null).
+        // Operands are converted to integers before the operation.
+        (NullableInteger::from(self) % NullableInteger::from(rhs)).into()
     }
 
     pub fn exec_bit_not(&self) -> Value {
@@ -1677,6 +1667,7 @@ mod tests {
             (Value::Text("12.0".into()), Value::Float(3.0)),
             (Value::Float(12.0), Value::Text("3.0".into())),
         ];
+        // SQLite's % operator always returns integer (or null)
         let outputs = vec![
             Value::Null,
             Value::Null,
@@ -1688,18 +1679,18 @@ mod tests {
             Value::Null,
             Value::Null,
             Value::Null,
-            Value::Float(0.0),
             Value::Integer(0),
-            Value::Float(0.0),
-            Value::Float(0.0),
-            Value::Float(0.0),
             Value::Integer(0),
-            Value::Float(0.0),
-            Value::Float(0.0),
-            Value::Float(0.0),
-            Value::Float(0.0),
-            Value::Float(0.0),
-            Value::Float(0.0),
+            Value::Integer(0),
+            Value::Integer(0),
+            Value::Integer(0),
+            Value::Integer(0),
+            Value::Integer(0),
+            Value::Integer(0),
+            Value::Integer(0),
+            Value::Integer(0),
+            Value::Integer(0),
+            Value::Integer(0),
         ];
 
         assert_eq!(
