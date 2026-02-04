@@ -2274,3 +2274,63 @@ fn test_fts_multi_table_join(tmp_db: TempDatabase) {
     assert!(titles.contains(&"Database Systems".to_string()));
     assert!(titles.contains(&"SQL Performance".to_string()));
 }
+
+/// Test that DROP TABLE properly handles tables with FTS indexes
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+#[turso_macros::test]
+fn test_fts_drop_table_with_index(tmp_db: TempDatabase) {
+    let _ = env_logger::try_init();
+    let conn = tmp_db.connect_limbo();
+
+    // Create table and FTS index
+    conn.execute("CREATE TABLE docs (id INTEGER PRIMARY KEY, title TEXT, body TEXT)")
+        .unwrap();
+    conn.execute("CREATE INDEX fts_docs ON docs USING fts (title, body)")
+        .unwrap();
+
+    // Verify the table and FTS-related tables exist
+    let tables_before: Vec<String> = limbo_exec_rows(
+        &conn,
+        "SELECT name FROM sqlite_master WHERE type IN ('table', 'index') ORDER BY name",
+    )
+    .into_iter()
+    .filter_map(|r| match &r[0] {
+        rusqlite::types::Value::Text(t) => Some(t.clone()),
+        _ => None,
+    })
+    .collect();
+
+    assert!(
+        tables_before.contains(&"docs".to_string()),
+        "docs table should exist"
+    );
+    // FTS creates additional internal tables
+    assert!(
+        tables_before.iter().any(|t| t.contains("fts")),
+        "FTS internal tables should exist"
+    );
+
+    // Drop the table - this should also clean up FTS index and its internal tables
+    conn.execute("DROP TABLE IF EXISTS docs").unwrap();
+
+    // Verify all FTS-related tables are cleaned up
+    let tables_after: Vec<String> = limbo_exec_rows(
+        &conn,
+        "SELECT name FROM sqlite_master WHERE type IN ('table', 'index') ORDER BY name",
+    )
+    .into_iter()
+    .filter_map(|r| match &r[0] {
+        rusqlite::types::Value::Text(t) => Some(t.clone()),
+        _ => None,
+    })
+    .collect();
+
+    assert!(
+        !tables_after.contains(&"docs".to_string()),
+        "docs table should be dropped"
+    );
+    assert!(
+        !tables_after.iter().any(|t| t.contains("fts")),
+        "FTS internal tables should be cleaned up, but found: {tables_after:?}"
+    );
+}
