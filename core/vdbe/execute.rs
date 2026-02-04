@@ -256,9 +256,17 @@ pub fn op_drop_index(
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(DropIndex { index, db: _ }, insn);
-    program
-        .connection
-        .with_schema_mut(|schema| schema.remove_index(index));
+    let conn = program.connection.clone();
+    let is_mvcc = conn.mv_store().is_some();
+    conn.with_schema_mut(|schema| {
+        // In MVCC mode, track dropped index root pages so integrity_check knows about them.
+        // The btree pages won't be freed until checkpoint, so integrity_check needs to
+        // include them to avoid "page never used" false positives.
+        if is_mvcc && index.root_page > 0 {
+            schema.dropped_root_pages.insert(index.root_page);
+        }
+        schema.remove_index(index);
+    });
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -2165,6 +2173,8 @@ pub fn op_transaction_inner(
 
                 // 2. Start transaction if needed
                 if let Some(mv_store) = mv_store.as_ref() {
+                    // MVCC reads must refresh WAL change counters to avoid stale page-cache reads.
+                    pager.mvcc_refresh_if_db_changed();
                     // In MVCC we don't have write exclusivity, therefore we just need to start a transaction if needed.
                     // Programs can run Transaction twice, first with read flag and then with write flag. So a single txid is enough
                     // for both.
@@ -7943,8 +7953,32 @@ pub fn op_drop_table(
         todo!("temp databases not implemented yet");
     }
     let conn = program.connection.clone();
+    let is_mvcc = conn.mv_store().is_some();
     {
         conn.with_schema_mut(|schema| {
+            // In MVCC mode, track dropped root pages so integrity_check knows about them.
+            // The btree pages won't be freed until checkpoint, so integrity_check needs
+            // to include them to avoid "page never used" false positives.
+            if is_mvcc {
+                let table = schema
+                    .get_table(table_name)
+                    .expect("DROP TABLE: table must exist in schema");
+                if let Some(btree) = table.btree() {
+                    // Only track positive root pages (checkpointed tables).
+                    // Negative root pages are non-checkpointed and don't exist in btree file.
+                    if btree.root_page > 0 {
+                        schema.dropped_root_pages.insert(btree.root_page);
+                    }
+                }
+                // Capture index root pages (table may not have indexes)
+                if let Some(indexes) = schema.indexes.get(table_name) {
+                    for index in indexes.iter() {
+                        if index.root_page > 0 {
+                            schema.dropped_root_pages.insert(index.root_page);
+                        }
+                    }
+                }
+            }
             schema.remove_indices_for_table(table_name);
             schema.remove_triggers_for_table(table_name);
             schema.remove_table(table_name);
