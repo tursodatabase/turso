@@ -140,7 +140,7 @@ use std::collections::VecDeque;
 use std::ops::Deref;
 use tracing::trace;
 use turso_parser::ast::{
-    self, ColumnDefinition, Expr, InitDeferredPred, Literal, RefAct, SortOrder, TableOptions,
+    self, ColumnDefinition, Expr, InitDeferredPred, Literal, RefAct, SortOrder,
 };
 use turso_parser::{
     ast::{Cmd, CreateTableBody, ResultColumn, Stmt},
@@ -1827,6 +1827,12 @@ impl BTreeTable {
             }
         }
         sql.push(')');
+
+        // Add STRICT keyword if this is a STRICT table
+        if self.is_strict {
+            sql.push_str(" STRICT");
+        }
+
         sql
     }
 
@@ -1891,7 +1897,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
             constraints,
             options,
         } => {
-            is_strict = options.contains(TableOptions::STRICT);
+            is_strict = options.contains_strict();
 
             // we need to preserve order of unique sets definition
             // but also, we analyze constraints first in order to check PRIMARY KEY constraint and recognize rowid alias properly
@@ -2225,7 +2231,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                 ));
             }
 
-            if options.contains(TableOptions::WITHOUT_ROWID) {
+            if options.contains_without_rowid() {
                 has_rowid = false;
             }
         }
@@ -3618,6 +3624,50 @@ mod tests {
         assert_eq!(index.columns[0].name, "a");
         assert_eq!(index.columns[1].name, "b");
         assert!(matches!(index.columns[0].order, SortOrder::Asc));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_strict_table_to_sql() -> Result<()> {
+        let sql = r#"CREATE TABLE test_strict (id INTEGER, name TEXT) STRICT"#;
+        let table = BTreeTable::from_sql(sql, 0)?;
+
+        // Verify the table is marked as strict
+        assert!(table.is_strict);
+
+        // Verify that to_sql() includes the STRICT keyword
+        let reconstructed_sql = table.to_sql();
+        assert!(
+            reconstructed_sql.contains("STRICT"),
+            "Reconstructed SQL should contain STRICT keyword: {reconstructed_sql}"
+        );
+        assert_eq!(
+            reconstructed_sql,
+            "CREATE TABLE test_strict (id INTEGER, name TEXT) STRICT"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_non_strict_table_to_sql() -> Result<()> {
+        let sql = r#"CREATE TABLE test_normal (id INTEGER, name TEXT)"#;
+        let table = BTreeTable::from_sql(sql, 0)?;
+
+        // Verify the table is NOT marked as strict
+        assert!(!table.is_strict);
+
+        // Verify that to_sql() does NOT include the STRICT keyword
+        let reconstructed_sql = table.to_sql();
+        assert!(
+            !reconstructed_sql.contains("STRICT"),
+            "Non-strict table SQL should not contain STRICT keyword: {reconstructed_sql}"
+        );
+        assert_eq!(
+            reconstructed_sql,
+            "CREATE TABLE test_normal (id INTEGER, name TEXT)"
+        );
 
         Ok(())
     }

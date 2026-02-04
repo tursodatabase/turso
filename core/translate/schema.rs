@@ -29,11 +29,10 @@ fn validate(body: &ast::CreateTableBody, connection: &Connection) -> Result<()> 
         options, columns, ..
     } = &body
     {
-        if options.contains(ast::TableOptions::WITHOUT_ROWID) {
+        if options.contains_without_rowid() {
             bail_parse_error!("WITHOUT ROWID tables are not supported");
         }
-        if options.contains(ast::TableOptions::STRICT) && !connection.experimental_strict_enabled()
-        {
+        if options.contains_strict() && !connection.experimental_strict_enabled() {
             bail_parse_error!(
                 "STRICT tables are an experimental feature. Enable them with --experimental-strict flag"
             );

@@ -2815,43 +2815,56 @@ impl<'a> Parser<'a> {
         Ok(result)
     }
 
-    fn parse_table_option(&mut self) -> Result<TableOptions> {
+    fn parse_table_option(&mut self, options: &mut TableOptions) -> Result<()> {
         match self.peek()? {
             Some(tok) => match tok.token_type.fallback_id_if_ok() {
                 TK_WITHOUT => {
-                    eat_assert!(self, TK_WITHOUT);
-                    let tok = eat_expect!(self, TK_ID);
-                    match_ignore_ascii_case!(match tok.value {
-                        b"ROWID" => Ok(TableOptions::WITHOUT_ROWID),
+                    let without_tok = eat_assert!(self, TK_WITHOUT);
+                    let rowid_tok = eat_expect!(self, TK_ID);
+                    match_ignore_ascii_case!(match rowid_tok.value {
+                        b"ROWID" => {
+                            // Preserve the original text "WITHOUT ROWID" with original capitalization
+                            let without_text = from_bytes(without_tok.as_bytes());
+                            let rowid_text = from_bytes(rowid_tok.as_bytes());
+                            options.without_rowid_text =
+                                Some(format!("{without_text} {rowid_text}"));
+                            Ok(())
+                        }
                         _ => Err(Error::Custom(format!(
-                            "unknown table option: {}",
-                            from_bytes(tok.as_bytes())
+                            "unknown table option: {} {}",
+                            from_bytes(without_tok.as_bytes()),
+                            from_bytes(rowid_tok.as_bytes())
                         ))),
                     })
                 }
                 TK_ID => {
                     let tok = eat_assert!(self, TK_ID);
                     match_ignore_ascii_case!(match tok.value {
-                        b"STRICT" => Ok(TableOptions::STRICT),
+                        b"STRICT" => {
+                            // Preserve the original text "STRICT" with original capitalization
+                            options.strict_text = Some(from_bytes(tok.as_bytes()));
+                            Ok(())
+                        }
                         _ => Err(Error::Custom(format!(
                             "unknown table option: {}",
                             from_bytes(tok.as_bytes())
                         ))),
                     })
                 }
-                _ => Ok(TableOptions::NONE),
+                _ => Ok(()),
             },
-            _ => Ok(TableOptions::NONE),
+            _ => Ok(()),
         }
     }
 
     fn parse_table_options(&mut self) -> Result<TableOptions> {
-        let mut result = self.parse_table_option()?;
+        let mut result = TableOptions::empty();
+        self.parse_table_option(&mut result)?;
         loop {
             match self.peek()? {
                 Some(tok) if tok.token_type == TK_COMMA => {
                     eat_assert!(self, TK_COMMA);
-                    result |= self.parse_table_option()?;
+                    self.parse_table_option(&mut result)?;
                 }
                 _ => break,
             }
@@ -2926,7 +2939,7 @@ impl<'a> Parser<'a> {
                 let options = self.parse_table_options()?;
 
                 // strict check
-                if options.contains(TableOptions::STRICT) {
+                if options.contains_strict() {
                     for c in &columns {
                         match &c.col_type {
                             Some(Type { name, .. }) => {
@@ -2954,7 +2967,7 @@ impl<'a> Parser<'a> {
                 }
 
                 // primary key check
-                if options.contains(TableOptions::WITHOUT_ROWID) && !has_primary_key {
+                if options.contains_without_rowid() && !has_primary_key {
                     return Err(Error::Custom(format!(
                         "PRIMARY KEY missing on table {tbl_name}"
                     )));
@@ -10192,7 +10205,7 @@ mod tests {
                             },
                         ],
                         constraints: vec![],
-                        options: TableOptions::NONE,
+                        options: TableOptions::empty(),
                     },
                 })],
             ),
@@ -10263,7 +10276,7 @@ mod tests {
                                 }
                             },
                         ],
-                        options: TableOptions::STRICT,
+                        options: TableOptions { without_rowid_text: None, strict_text: Some("STRICT".to_string()) },
                     },
                 })],
             ),
@@ -10320,7 +10333,7 @@ mod tests {
                                 }
                             },
                         ],
-                        options: TableOptions::WITHOUT_ROWID,
+                        options: TableOptions { without_rowid_text: Some("WITHOUT ROWID".to_string()), strict_text: None },
                     },
                 })],
             ),
@@ -10358,7 +10371,7 @@ mod tests {
                                 )),
                             },
                         ],
-                        options: TableOptions::NONE,
+                        options: TableOptions::empty(),
                     },
                 })],
             ),
@@ -10420,7 +10433,7 @@ mod tests {
                                 )),
                             },
                         ],
-                        options: TableOptions::NONE,
+                        options: TableOptions::empty(),
                     },
                 })],
             ),
@@ -11707,7 +11720,7 @@ mod tests {
                             }
                         ],
                         constraints: vec![],
-                        options: TableOptions::NONE,
+                        options: TableOptions::empty(),
                     },
                 })],
             ),
