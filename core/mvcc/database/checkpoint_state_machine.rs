@@ -318,44 +318,39 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                     if let ValueRef::Integer(root_page) = col3 {
                         if type_str.as_str() == "index" {
                             // This is an index schema change
-                            let index_id = MVTableId::from(root_page);
-
                             if is_delete {
                                 // DROP INDEX
-                                let found_index_id = self
+                                let index_id = self
                                     .mvstore
                                     .table_id_to_rootpage
                                     .iter()
                                     .find(|entry| {
                                         entry.value().is_some_and(|r| r == root_page as u64)
                                     })
-                                    .map(|entry| *entry.key());
-
-                                let table_id = found_index_id.expect(
-                                    "index_id to rootpage mapping should exist for dropped index",
-                                );
-
-                                // Verify it's actually an index, not a table
-                                assert_eq!(
-                                        table_id, index_id,
-                                        "Found table_id {table_id} but expected index_id {index_id} for root_page {root_page}",
+                                    .map(|entry| *entry.key())
+                                    .expect(
+                                        "index_id to rootpage mapping should exist for dropped index",
                                     );
 
                                 self.destroyed_indexes.insert(index_id);
 
-                                // Get Index struct from schema to determine num_columns
-                                let index = self
+                                // DROP INDEX during checkpoint: schema may no longer contain the index definition.
+                                // Fixes DROP INDEX during checkpoint when the schema cache no longer
+                                // contains the index metadata; we only need a cursor to destroy pages so num_columns is not important.
+                                let num_columns = self
                                     .index_id_to_index
                                     .get(&index_id)
-                                    .expect("Index ID does not have a index struct");
+                                    .map(|index| index.columns.len())
+                                    .unwrap_or(0);
 
                                 special_write = Some(SpecialWrite::BTreeDestroyIndex {
                                     index_id,
                                     root_page: root_page as u64,
-                                    num_columns: index.columns.len(),
+                                    num_columns,
                                 });
                             } else if root_page < 0 {
                                 // CREATE INDEX (root page is negative so the index has not been checkpointed yet).
+                                let index_id = MVTableId::from(root_page);
                                 let sqlite_schema_rowid = version.row.id.row_id.to_int_or_panic();
 
                                 special_write = Some(SpecialWrite::BTreeCreateIndex {
@@ -662,14 +657,9 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                                 "MV store root page does not match root page in the sqlite_schema record: {known_root_page} != {root_page}"
                             );
 
-                            // Get Index struct for creating cursor
-                            let index = self.index_id_to_index.get(&index_id).unwrap_or_else(|| panic!(
-                                "Index struct for index_id {index_id} must exist when destroying btree",
-                            ));
-
                             let cursor = if let Some(cursor) = self.cursors.get(&known_root_page) {
                                 cursor.clone()
-                            } else {
+                            } else if let Some(index) = self.index_id_to_index.get(&index_id) {
                                 let cursor = BTreeCursor::new_index(
                                     self.pager.clone(),
                                     known_root_page as i64,
@@ -679,6 +669,14 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                                 let cursor = Arc::new(RwLock::new(cursor));
                                 self.cursors.insert(root_page, cursor.clone());
                                 cursor
+                            } else {
+                                // DROP INDEX destroy path: schema may no longer contain the index definition.
+                                // We only need a cursor to destroy pages so num_columns is not important.
+                                Arc::new(RwLock::new(BTreeCursor::new_table(
+                                    self.pager.clone(),
+                                    known_root_page as i64,
+                                    num_columns,
+                                )))
                             };
                             self.pager.io.block(|| cursor.write().btree_destroy())?;
                             self.destroyed_indexes.insert(index_id);
