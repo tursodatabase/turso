@@ -137,16 +137,13 @@ impl Drop for Connection {
             // while holding a read or write lock.
             let pager = self.pager.load();
             if let Some(wal) = &pager.wal {
-                // TODO: remove this if once we start using WAL txns in MVCC, see https://github.com/tursodatabase/turso/issues/5011
-                if !self.mvcc_enabled() {
-                    // Write lock is tracked by TransactionState
-                    if matches!(self.transaction_state.get(), TransactionState::Write { .. }) {
-                        wal.end_write_tx();
-                    }
-                    // Read lock is tracked by the WAL itself
-                    if wal.holds_read_lock() {
-                        wal.end_read_tx();
-                    }
+                // Write lock is tracked by TransactionState
+                if matches!(self.transaction_state.get(), TransactionState::Write { .. }) {
+                    wal.end_write_tx();
+                }
+                // Read lock is tracked by the WAL itself
+                if wal.holds_read_lock() {
+                    wal.end_read_tx();
                 }
             }
 
@@ -910,14 +907,21 @@ impl Connection {
             return Ok(());
         }
         self.closed.store(true, Ordering::SeqCst);
+        let pager = self.pager.load();
 
         match self.get_tx_state() {
             TransactionState::None => {
                 // No active transaction
             }
             _ => {
-                if !self.mvcc_enabled() {
-                    let pager = self.pager.load();
+                if self.mvcc_enabled() {
+                    if let Some(mv_store) = self.mv_store().as_ref() {
+                        if let Some(tx_id) = self.get_mv_tx_id() {
+                            mv_store.rollback_tx(tx_id, pager.clone(), self);
+                        }
+                    }
+                    pager.end_read_tx();
+                } else {
                     pager.rollback_tx(self);
                 }
                 self.set_tx_state(TransactionState::None);

@@ -2173,6 +2173,16 @@ pub fn op_transaction_inner(
 
                 // 2. Start transaction if needed
                 if let Some(mv_store) = mv_store.as_ref() {
+                    let started_read_tx =
+                        updated && matches!(current_state, TransactionState::None);
+                    if started_read_tx {
+                        turso_assert!(
+                            !conn.is_nested_stmt(),
+                            "nested stmt should not begin a new read transaction"
+                        );
+                        pager.begin_read_tx()?;
+                        state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
+                    }
                     // MVCC reads must refresh WAL change counters to avoid stale page-cache reads.
                     pager.mvcc_refresh_if_db_changed();
                     // In MVCC we don't have write exclusivity, therefore we just need to start a transaction if needed.
@@ -2193,12 +2203,24 @@ pub fn op_transaction_inner(
                         let tx_id = match tx_mode {
                             TransactionMode::None
                             | TransactionMode::Read
-                            | TransactionMode::Concurrent => mv_store.begin_tx(pager.clone())?,
+                            | TransactionMode::Concurrent => mv_store.begin_tx(pager.clone()),
                             TransactionMode::Write => {
-                                mv_store.begin_exclusive_tx(pager.clone(), None)?
+                                mv_store.begin_exclusive_tx(pager.clone(), None)
                             }
                         };
-                        program.connection.set_mv_tx(Some((tx_id, *tx_mode)));
+                        match tx_id {
+                            Ok(tx_id) => {
+                                program.connection.set_mv_tx(Some((tx_id, *tx_mode)));
+                            }
+                            Err(err) => {
+                                if started_read_tx {
+                                    pager.end_read_tx();
+                                    conn.set_tx_state(TransactionState::None);
+                                    state.auto_txn_cleanup = TxnCleanup::None;
+                                }
+                                return Err(err);
+                            }
+                        }
                     } else if updated {
                         // TODO: fix tx_mode in Insn::Transaction, now each statement overrides it even if there's already a CONCURRENT Tx in progress, for example
                         let (tx_id, mv_tx_mode) = current_mv_tx
@@ -2211,7 +2233,16 @@ pub fn op_transaction_inner(
                         if matches!(new_transaction_state, TransactionState::Write { .. })
                             && matches!(actual_tx_mode, TransactionMode::Write)
                         {
-                            mv_store.begin_exclusive_tx(pager.clone(), Some(tx_id))?;
+                            if let Err(err) =
+                                mv_store.begin_exclusive_tx(pager.clone(), Some(tx_id))
+                            {
+                                if started_read_tx {
+                                    pager.end_read_tx();
+                                    conn.set_tx_state(TransactionState::None);
+                                    state.auto_txn_cleanup = TxnCleanup::None;
+                                }
+                                return Err(err);
+                            }
                         }
                     }
                 } else {
@@ -2390,6 +2421,7 @@ pub fn op_auto_commit(
                 if let Some(tx_id) = conn.get_mv_tx_id() {
                     mv_store.rollback_tx(tx_id, pager.clone(), &conn);
                 }
+                pager.end_read_tx();
             } else {
                 pager.rollback_tx(&conn);
             }

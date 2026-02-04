@@ -1589,6 +1589,39 @@ fn test_auto_checkpoint_busy_is_ignored() {
 }
 
 #[test]
+fn test_mvcc_read_tx_lifecycle() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+
+    conn.execute("CREATE TABLE t(x)").unwrap();
+    conn.execute("BEGIN").unwrap();
+    conn.execute("SELECT * FROM t").unwrap();
+
+    let pager = conn.pager.load();
+    let wal = pager.wal.as_ref().expect("wal should be enabled");
+    assert!(wal.holds_read_lock());
+
+    conn.execute("COMMIT").unwrap();
+    assert!(!wal.holds_read_lock());
+}
+
+#[test]
+fn test_mvcc_conn_drop_releases_read_tx() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+
+    conn.execute("CREATE TABLE t(x)").unwrap();
+
+    let pager = conn.pager.load();
+    pager.begin_read_tx().unwrap();
+    let wal = pager.wal.as_ref().expect("wal should be enabled").clone();
+    assert!(wal.holds_read_lock());
+
+    drop(conn);
+    assert!(!wal.holds_read_lock());
+}
+
+#[test]
 fn test_select_empty_table() {
     let db = MvccTestDbNoConn::new_with_random_db();
     let mv_store = db.get_mvcc_store();
