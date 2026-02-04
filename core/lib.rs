@@ -958,6 +958,13 @@ impl Database {
 
         let header: HeaderRefMut = self.io.block(|| HeaderRefMut::from_pager(&pager))?;
         let header_mut = header.borrow_mut();
+
+        if !header_mut.text_encoding.is_utf8() {
+            return Err(LimboError::UnsupportedEncoding(
+                header_mut.text_encoding.to_string(),
+            ));
+        }
+
         let (read_version, write_version) = { (header_mut.read_version, header_mut.write_version) };
         // TODO: right now we don't support READ ONLY and no READ or WRITE in the Version header
         // https://www.sqlite.org/fileformat.html#file_format_version_numbers
