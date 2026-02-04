@@ -132,6 +132,24 @@ crate::assert::assert_send_sync!(Connection);
 impl Drop for Connection {
     fn drop(&mut self) {
         if !self.is_closed() {
+            // Release any WAL locks the connection might be holding.
+            // This prevents deadlocks if a connection is dropped (e.g., due to a panic)
+            // while holding a read or write lock.
+            let pager = self.pager.load();
+            if let Some(wal) = &pager.wal {
+                // TODO: remove this if once we start using WAL txns in MVCC, see https://github.com/tursodatabase/turso/issues/5011
+                if !self.mvcc_enabled() {
+                    // Write lock is tracked by TransactionState
+                    if matches!(self.transaction_state.get(), TransactionState::Write { .. }) {
+                        wal.end_write_tx();
+                    }
+                    // Read lock is tracked by the WAL itself
+                    if wal.holds_read_lock() {
+                        wal.end_read_tx();
+                    }
+                }
+            }
+
             // if connection wasn't properly closed, decrement the connection counter
             self.db
                 .n_connections

@@ -328,6 +328,9 @@ pub trait Wal: Debug + Send + Sync {
     /// End a write transaction.
     fn end_write_tx(&self);
 
+    /// Returns true if this WAL instance currently holds a read lock.
+    fn holds_read_lock(&self) -> bool;
+
     /// Find the latest frame containing a page.
     ///
     /// optional frame_watermark parameter can be passed to force WAL to find frame not larger than watermark value
@@ -1234,6 +1237,11 @@ impl Wal for WalFile {
     fn end_write_tx(&self) {
         tracing::debug!("end_write_txn");
         self.with_shared(|shared| shared.write_lock.unlock());
+    }
+
+    /// Returns true if this WAL instance currently holds a read lock.
+    fn holds_read_lock(&self) -> bool {
+        self.max_frame_read_lock_index.load(Ordering::Acquire) != NO_LOCK_HELD
     }
 
     /// Find the latest frame containing a page.
