@@ -2108,7 +2108,7 @@ impl WalFile {
     }
 
     fn frame_offset(&self, frame_id: u64) -> u64 {
-        turso_assert_greater_than!(frame_id, 0, "wal: frame_id must be 1-based");
+        turso_assert_greater_than!(frame_id, 0, "Frame ID must be 1-based");
         let page_offset = (frame_id - 1) * (self.page_size() + WAL_FRAME_HEADER_SIZE as u32) as u64;
         WAL_HEADER_SIZE as u64 + page_offset
     }

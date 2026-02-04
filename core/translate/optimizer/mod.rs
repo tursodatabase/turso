@@ -38,7 +38,6 @@ use order::{compute_order_target, plan_satisfies_order_target, EliminatesSortBy}
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::{cmp::Ordering, collections::VecDeque, sync::Arc};
 use turso_ext::{ConstraintInfo, ConstraintUsage};
-#[allow(unused_imports)]
 use turso_macros::{turso_assert, turso_assert_eq, turso_debug_assert, turso_soft_unreachable};
 use turso_parser::ast::{self, Expr, SortOrder, TriggerEvent};
 
@@ -1460,7 +1459,7 @@ fn optimize_table_access(
                             let where_term = &mut where_clause[constraint.where_clause_pos.0];
                             turso_assert!(
                                 !where_term.consumed,
-                                "optimizer: trying to consume a where clause term twice",
+                                "trying to consume a where clause term twice",
                                 {"where_term": format!("{where_term:?}")}
                             );
                             if is_outer_join && where_term.from_outer_join.is_none() {
@@ -1496,7 +1495,8 @@ fn optimize_table_access(
                     turso_assert_eq!(
                         constraint_refs.len(),
                         1,
-                        "optimizer: expected exactly one constraint for rowid seek"
+                        "expected exactly one constraint for rowid seek",
+                        {"constraint_refs": format!("{constraint_refs:?}")}
                     );
                     table_references.joined_tables_mut()[table_idx].op =
                         if let Some(eq) = constraint_refs[0].eq {
@@ -2163,7 +2163,7 @@ pub fn build_seek_def_from_constraints(
 ) -> Result<SeekDef> {
     turso_assert!(
         !constraint_refs.is_empty(),
-        "optimizer: cannot build seek def from empty constraint refs"
+        "cannot build seek def from empty list of constraint refs"
     );
     // Extract the key values and operators
     let key = constraint_refs

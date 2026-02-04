@@ -15,8 +15,8 @@ use crate::{LimboError, Result};
 use rustc_hash::FxHashMap as HashMap;
 use std::fmt::{self, Display, Formatter};
 use turso_macros::match_ignore_ascii_case;
-#[allow(unused_imports)]
 use turso_macros::turso_assert;
+use turso_macros::turso_assert_ne;
 use turso_parser::ast;
 
 /// Result type for preprocessing aggregate expressions
@@ -1884,7 +1884,7 @@ impl<'a> LogicalPlanBuilder<'a> {
             ast::Expr::Parenthesized(exprs) => {
                 // the assumption is that there is at least one parenthesis here.
                 // If this is not true, then I don't understand this code and can't be trusted.
-                turso_assert!(!exprs.is_empty());
+                turso_assert_ne!(exprs.len(), 0);
                 // Multiple expressions in parentheses is unusual but handle it
                 // by building the first one (SQLite behavior)
                 self.build_expr(&exprs[0], _schema)

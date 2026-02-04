@@ -807,7 +807,7 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
                     .expect("rewind state is not initialized"),
                 MvccLazyCursorState::Rewind(RewindState::Advance)
             ),
-            "mvcc: invalid last state",
+            "invalid last state",
             { "state": format!("{:?}", self.state) }
         );
 
@@ -1536,7 +1536,7 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
                     .expect("rewind state is not initialized"),
                 MvccLazyCursorState::Rewind(RewindState::Advance)
             ),
-            "mvcc: invalid rewind state",
+            "invalid rewind state",
             { "state": format!("{:?}", self.state) }
         );
         // First run btree_cursor rewind so that we don't need a explicit state machine.

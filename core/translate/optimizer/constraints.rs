@@ -1052,7 +1052,7 @@ pub fn constraints_from_where_clause(
                 } {
                     turso_assert!(
                         constraint.usable,
-                        "optimizer: constraint collation must match table column collation"
+                        "constraint collation must match table column collation"
                     );
                     if let Some(table_col_pos) = constraint.table_col_pos {
                         let constrained_column = &table_reference.table.columns()[table_col_pos];

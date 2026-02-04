@@ -18,7 +18,6 @@ use crate::{
 };
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::num::NonZeroU64;
-#[allow(unused_imports)]
 use turso_macros::{turso_assert, turso_assert_eq};
 
 #[derive(Debug)]
@@ -339,7 +338,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                                 turso_assert_eq!(
                                     table_id,
                                     index_id,
-                                    "mvcc: checkpoint table_id/index_id mismatch for DROP INDEX",
+                                    "checkpoint table_id/index_id mismatch for DROP INDEX",
                                     { "table_id": i64::from(table_id), "index_id": i64::from(index_id), "root_page": root_page }
                                 );
 
@@ -622,7 +621,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                             turso_assert_eq!(
                                 known_root_page,
                                 root_page,
-                                "mvcc: checkpoint root page mismatch for BTreeDestroy",
+                                "checkpoint root page mismatch for BTreeDestroy",
                                 { "known_root_page": known_root_page, "schema_root_page": root_page }
                             );
                             let cursor = if let Some(cursor) = self.cursors.get(&known_root_page) {
@@ -651,7 +650,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                             // Index struct should already be stored in index_id_to_index from collect_committed_versions
                             turso_assert!(
                                 self.index_id_to_index.contains_key(&index_id),
-                                "mvcc: checkpoint index struct missing before BTreeCreateIndex",
+                                "checkpoint index struct missing before BTreeCreateIndex",
                                 { "index_id": i64::from(index_id) }
                             );
                         }
@@ -671,7 +670,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                             turso_assert_eq!(
                                 known_root_page,
                                 root_page,
-                                "mvcc: checkpoint root page mismatch for BTreeDestroyIndex",
+                                "checkpoint root page mismatch for BTreeDestroyIndex",
                                 { "known_root_page": known_root_page, "schema_root_page": root_page }
                             );
 

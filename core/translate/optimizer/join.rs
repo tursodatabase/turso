@@ -1023,11 +1023,7 @@ pub fn compute_best_join_order<'a>(
             original_idx: i,
             is_outer: false,
         };
-        turso_assert_eq!(
-            join_order.len(),
-            1,
-            "optimizer: join_order must have exactly one element for single-table base case"
-        );
+        turso_assert_eq!(join_order.len(), 1);
         let rel = join_lhs_and_rhs(
             None,
             table_ref,
@@ -1532,7 +1528,7 @@ pub fn compute_naive_left_deep_plan<'a>(
     analyze_stats: &AnalyzeStats,
 ) -> Result<Option<JoinN>> {
     let n = joined_tables.len();
-    turso_assert_greater_than!(n, 0, "optimizer: joined_tables must not be empty");
+    turso_assert_greater_than!(n, 0);
 
     let join_order = joined_tables
         .iter()

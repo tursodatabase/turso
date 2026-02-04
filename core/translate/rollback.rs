@@ -4,7 +4,6 @@ use crate::{
     vdbe::{builder::ProgramBuilder, insn::Insn},
     Result,
 };
-#[allow(unused_imports)]
 use turso_macros::turso_assert;
 
 pub fn translate_rollback(
@@ -14,7 +13,7 @@ pub fn translate_rollback(
 ) -> Result<ProgramBuilder> {
     turso_assert!(
         txn_name.is_none() && savepoint_name.is_none(),
-        "rollback: txn_name and savepoint not supported yet"
+        "txn_name and savepoint not supported yet"
     );
     program.emit_insn(Insn::AutoCommit {
         auto_commit: true,

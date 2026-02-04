@@ -491,7 +491,7 @@ impl TransactionState {
             TransactionState::Committed(ts) => {
                 // We only support 2*62 - 1 timestamps, because the extra bit
                 // is used to encode the type.
-                turso_assert!(ts & 0x8000_0000_0000_0000 == 0);
+                turso_assert_eq!(ts & 0x8000_0000_0000_0000, 0);
                 0x8000_0000_0000_0000 | ts
             }
         }
@@ -822,7 +822,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 let mut log_record = LogRecord::new(*end_ts);
                 if !mvcc_store.is_exclusive_tx(&self.tx_id) && mvcc_store.has_exclusive_tx() {
                     // A non-CONCURRENT transaction is holding the exclusive lock, we must abort.
-                    turso_assert_reachable!("mvcc: commit aborted due to exclusive tx conflict");
+                    turso_assert_reachable!("commit aborted due to exclusive tx conflict");
                     return Err(LimboError::WriteWriteConflict);
                 }
                 for id in &self.write_set {
@@ -1698,7 +1698,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                             continue;
                         }
                         if is_write_write_conflict(&self.txs, tx, rv) {
-                            turso_assert_reachable!("mvcc: write-write conflict on delete");
+                            turso_assert_reachable!("write-write conflict on delete");
                             drop(row_versions);
                             drop(row_versions_opt);
                             return Err(LimboError::WriteWriteConflict);
@@ -1735,7 +1735,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                             continue;
                         }
                         if is_write_write_conflict(&self.txs, tx, rv) {
-                            turso_assert_reachable!("mvcc: write-write conflict on delete");
+                            turso_assert_reachable!("write-write conflict on delete");
                             drop(row_versions);
                             drop(row_versions_opt);
                             return Err(LimboError::WriteWriteConflict);
@@ -2230,7 +2230,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         tracing::trace!("begin_load_tx(tx_id={tx_id})");
         turso_assert!(
             !self.txs.contains_key(&tx_id),
-            "mvcc: begin_load_tx called twice"
+            "begin_load_tx called twice"
         );
         self.txs.insert(tx_id, tx);
 
@@ -2407,12 +2407,10 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 let mut index_row_versions = index_row_versions.value().write();
                 for index_row_version in index_row_versions.iter_mut() {
                     if let Some(TxTimestampOrID::TxID(id)) = index_row_version.begin {
-                        turso_assert_eq!(id, tx_id, "mvcc: index row version begin tx_id mismatch", { "expected": tx_id, "actual": id });
-                        index_row_version.begin = Some(TxTimestampOrID::Timestamp(end_ts));
+                        turso_assert_eq!(id, tx_id);
                     }
                     if let Some(TxTimestampOrID::TxID(id)) = index_row_version.end {
-                        turso_assert_eq!(id, tx_id, "mvcc: index row version end tx_id mismatch", { "expected": tx_id, "actual": id });
-                        index_row_version.end = Some(TxTimestampOrID::Timestamp(end_ts));
+                        turso_assert_eq!(id, tx_id);
                     }
                 }
             }
@@ -2642,7 +2640,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     fn release_exclusive_tx(&self, tx_id: &TxID) {
         tracing::trace!("release_exclusive_tx(tx_id={})", tx_id);
         let prev = self.exclusive_tx.swap(NO_EXCLUSIVE_TX, Ordering::Release);
-        turso_assert_eq!(prev, *tx_id, "mvcc: exclusive lock released by wrong tx", { "expected_tx_id": *tx_id, "actual_tx_id": prev });
+        turso_assert_eq!(prev, *tx_id, "exclusive lock released by wrong tx", { "expected_tx_id": *tx_id, "actual_tx_id": prev });
     }
 
     /// Generates next unique transaction id
@@ -2997,9 +2995,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                         let val = match record.get_value_opt(3) {
                             Some(v) => v,
                             None => {
-                                turso_soft_unreachable!(
-                                    "Expected at least 4 columns in sqlite_schema"
-                                );
+                                turso_soft_unreachable!("Expected at least 4 columns in sqlite_schema");
                                 return Err(LimboError::InternalError(
                                     "Expected at least 4 columns in sqlite_schema".to_string(),
                                 ));
@@ -3026,13 +3022,13 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                             let Some(value) = *entry.value() else {
                                 panic!("Logical log contains root page reference {root_page} that does not have a root page in the table_id_to_rootpage map");
                             };
-                            turso_assert_eq!(value, root_page as u64, "mvcc: logical log root page does not match table_id_to_rootpage map", { "root_page": root_page, "map_value": value });
+                            turso_assert_eq!(value, root_page as u64, "logical log root page does not match table_id_to_rootpage map", { "root_page": root_page, "map_value": value });
                         }
                     } else {
                         // Other table row version inserts; table id must exist in mapping (otherwise there's a row version insert to an unknown table)
                         turso_assert!(
                             self.table_id_to_rootpage.get(&rowid.table_id).is_some(),
-                            "mvcc: log row version insert references unknown table_id"
+                            "log row version insert references unknown table_id"
                         );
                     }
                     self.insert(tx_id, row)?;
@@ -3047,7 +3043,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 StreamingResult::DeleteTableRow { row, rowid } => {
                     turso_assert!(
                         self.table_id_to_rootpage.get(&rowid.table_id).is_some(),
-                        "mvcc: log row version delete references unknown table_id"
+                        "log row version delete references unknown table_id"
                     );
                     self.insert_tombstone_to_table(tx_id, rowid, row)?;
                 }

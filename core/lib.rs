@@ -943,10 +943,7 @@ impl Database {
         let is_readonly = self.open_flags.contains(OpenFlags::ReadOnly);
 
         let mut pager = self._init(encryption_key)?;
-        turso_assert!(
-            pager.wal.is_none(),
-            "lib: pager should have no WAL yet during header_validation"
-        );
+        turso_assert!(pager.wal.is_none(),"Pager should have no WAL yet");
 
         let is_autovacuumed_db = self.io.block(|| {
             pager.with_header(|header| {

@@ -50,6 +50,7 @@ impl LogHeader {
 
         let header_size_before_padding = buffer.len() - buffer_size_start;
         let padding = 64 - header_size_before_padding;
+        //TODO change to debug_less_than_or_eq
         turso_debug_assert!(header_size_before_padding <= LOG_HEADER_MAX_SIZE);
         buffer.extend_from_slice(&LOG_HEADER_PADDING[0..padding]);
         turso_assert_eq!(buffer.len() - buffer_size_start, LOG_HEADER_MAX_SIZE);
@@ -116,7 +117,7 @@ impl LogRecordType {
         turso_assert_less_than!(
             table_id_i64,
             0,
-            "mvcc: table_id must be negative in log serialization"
+            "table_id must be negative in log serialization"
         );
         buffer.extend_from_slice(&table_id_i64.to_be_bytes());
 

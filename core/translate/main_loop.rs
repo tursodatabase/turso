@@ -112,18 +112,14 @@ pub fn init_loop(
     turso_assert_eq!(
         t_ctx.meta_left_joins.len(),
         tables.joined_tables().len(),
-        "main_loop: meta_left_joins length must match tables length"
+        "meta_left_joins length must match tables length"
     );
 
     if matches!(
         &mode,
         OperationMode::INSERT | OperationMode::UPDATE { .. } | OperationMode::DELETE
     ) {
-        turso_assert_eq!(
-            tables.joined_tables().len(),
-            1,
-            "main_loop: INSERT/UPDATE/DELETE targets single table"
-        );
+        turso_assert_eq!(tables.joined_tables().len(), 1);
         let changed_table = &tables.joined_tables()[0].table;
         let prepared =
             prepare_cdc_if_necessary(program, t_ctx.resolver.schema, changed_table.get_name())?;
@@ -137,7 +133,7 @@ pub fn init_loop(
         turso_assert_eq!(
             agg.args.len(),
             1,
-            "main_loop: DISTINCT aggregate functions must have exactly one argument"
+            "DISTINCT aggregate functions must have exactly one argument"
         );
         let collations = vec![
             get_collseq_from_expr(&agg.original_expr, tables)?.unwrap_or(CollationSeq::Binary)
@@ -931,7 +927,7 @@ pub fn open_loop(
             Operation::Search(search) => {
                 turso_assert!(
                     !matches!(table.table, Table::FromClauseSubquery(_)),
-                    "main_loop: subqueries do not support index seeks"
+                    "Subqueries do not support index seeks"
                 );
                 // Open the loop for the index search.
                 // Rowid equality point lookups are handled with a SeekRowid instruction which does not loop, since it is a single row lookup.
@@ -1301,10 +1297,7 @@ pub fn open_loop(
         )?;
 
         for subquery in subqueries.iter_mut().filter(|s| !s.has_been_evaluated()) {
-            turso_assert!(
-                subquery.correlated,
-                "main_loop: subquery must be correlated"
-            );
+            turso_assert!(subquery.correlated, "subquery must be correlated");
             let eval_at = subquery.get_eval_at(join_order, Some(table_references))?;
 
             if eval_at != EvalAt::Loop(join_index) {
@@ -1646,7 +1639,7 @@ fn emit_loop_source(
         LoopEmitTarget::QueryResult => {
             turso_assert!(
                 plan.aggregates.is_empty(),
-                "main_loop: QueryResult target should not have aggregates"
+                "QueryResult target should not have aggregates"
             );
             let offset_jump_to = t_ctx
                 .labels_main_loop
@@ -1760,7 +1753,7 @@ pub fn close_loop(
             Operation::Search(search) => {
                 turso_assert!(
                     !matches!(table.table, Table::FromClauseSubquery(_)),
-                    "main_loop: subqueries do not support index seeks"
+                    "Subqueries do not support index seeks"
                 );
                 program.resolve_label(loop_labels.next, program.offset());
                 let iteration_cursor_id =
@@ -2302,7 +2295,7 @@ fn emit_autoindex(
     num_seek_keys: usize,
     seek_def: &SeekDef,
 ) -> Result<AutoIndexResult> {
-    turso_assert!(index.ephemeral, "main_loop: index must be ephemeral", { "index_name": &index.name });
+    turso_assert!(index.ephemeral, "index must be ephemeral", { "index_name": &index.name });
     let label_ephemeral_build_end = program.allocate_label();
     // Since this typically happens in an inner loop, we only build it once.
     program.emit_insn(Insn::Once {

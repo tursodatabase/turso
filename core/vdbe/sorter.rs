@@ -20,7 +20,6 @@ use crate::{
     Result,
 };
 use crate::{io_yield_one, return_if_io, CompletionError};
-#[allow(unused_imports)]
 use turso_macros::{turso_assert, turso_assert_eq};
 
 #[derive(Debug, Clone, Copy)]
@@ -97,11 +96,7 @@ impl Sorter {
         io: Arc<dyn IO>,
         temp_store: crate::TempStore,
     ) -> Self {
-        turso_assert_eq!(
-            order.len(),
-            collations.len(),
-            "sorter: order and collations must have the same length"
-        );
+        turso_assert_eq!(order.len(), collations.len());
         Self {
             arena: Bump::new(),
             records: Vec::new(),
@@ -687,10 +682,7 @@ impl SortedChunk {
         record_size_lengths: Vec<usize>,
         chunk_size: usize,
     ) -> Result<Completion> {
-        turso_assert!(
-            *self.io_state.read() == SortedChunkIOState::None,
-            "sorter: io_state must be None before write"
-        );
+        turso_assert_eq!(*self.io_state.read(), SortedChunkIOState::None);
         *self.io_state.write() = SortedChunkIOState::WaitingForWrite;
         self.chunk_size = chunk_size;
 

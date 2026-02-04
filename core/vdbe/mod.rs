@@ -92,7 +92,6 @@ use std::{
     task::Waker,
 };
 use tracing::{instrument, Level};
-#[allow(unused_imports)]
 use turso_macros::{turso_assert, turso_assert_ne, turso_debug_assert};
 
 /// State machine for committing view deltas with I/O handling
@@ -746,10 +745,7 @@ impl Register {
         match self {
             Register::Value(v) => v,
             Register::Record(r) => {
-                turso_assert!(
-                    !r.is_invalidated(),
-                    "vdbe: record should not be invalidated when getting value"
-                );
+                turso_assert!(!r.is_invalidated());
                 r.as_blob_value()
             }
             _ => panic!("register holds unexpected value: {self:?}"),
@@ -1109,6 +1105,7 @@ impl Program {
         state: &mut ProgramState,
         pager: Arc<Pager>,
     ) -> Result<StepResult> {
+        //TODO replace with debug_assert_eq
         turso_debug_assert!(state.column_count() == EXPLAIN_QUERY_PLAN_COLUMNS.len());
         loop {
             if self.connection.is_closed() {
@@ -1401,10 +1398,7 @@ impl Program {
                 };
                 match self.step_end_mvcc_txn(state_machine, mv_store)? {
                     IOResult::Done(_) => {
-                        turso_assert!(
-                            state_machine.is_finalized(),
-                            "vdbe: state_machine must be finalized after commit"
-                        );
+                        turso_assert!(state_machine.is_finalized());
                         conn.set_mv_tx(None);
                         conn.set_tx_state(TransactionState::None);
                         program_state.commit_state = CommitState::Ready;

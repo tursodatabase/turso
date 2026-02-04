@@ -25,7 +25,6 @@ use crate::vdbe::insn::{Cookie, Insn};
 use crate::{bail_parse_error, CaptureDataChangesMode, LimboError, Value};
 use std::str::FromStr;
 use strum::IntoEnumIterator;
-#[allow(unused_imports)]
 use turso_macros::turso_soft_unreachable;
 
 fn list_pragmas(program: &mut ProgramBuilder) {

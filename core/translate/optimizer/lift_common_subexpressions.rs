@@ -117,11 +117,7 @@ pub(crate) fn lift_common_subexpressions_from_binary_or_terms(
             // E.g. (a AND b) OR (a) OR (a AND c) just becomes a.
             where_clause[i].consumed = true;
         } else {
-            turso_assert_greater_than!(
-                new_or_operands_for_original_term.len(),
-                1,
-                "optimizer: reconstructed OR must have more than one operand"
-            );
+            turso_assert_greater_than!(new_or_operands_for_original_term.len(), 1);
             // Update the original WhereTerm's expression with the new OR structure (without common parts).
             where_clause[i].expr = rebuild_or_expr_from_list(new_or_operands_for_original_term);
         }
@@ -178,10 +174,7 @@ fn rebuild_and_expr_from_list(mut conjuncts: Vec<Expr>) -> Expr {
 
 /// Rebuild an ast::Expr::Binary(lhs, OR, rhs) for a list of operands.
 fn rebuild_or_expr_from_list(mut operands: Vec<Expr>) -> Expr {
-    turso_assert!(
-        !operands.is_empty(),
-        "optimizer: operands list must not be empty"
-    );
+    turso_assert!(!operands.is_empty());
 
     if operands.len() == 1 {
         return operands.pop().unwrap();

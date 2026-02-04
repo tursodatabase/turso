@@ -6,7 +6,6 @@ use crate::vdbe::builder::ProgramBuilder;
 use crate::vdbe::insn::{to_u16, IdxInsertFlags, Insn};
 use crate::vdbe::BranchOffset;
 use crate::Result;
-#[allow(unused_imports)]
 use turso_macros::turso_assert_eq;
 
 pub fn emit_values(
@@ -213,7 +212,7 @@ fn emit_values_to_destination(
             turso_assert_eq!(
                 row_len,
                 *num_regs,
-                "values: row value subqueries must have matching result columns and registers"
+                "row value subqueries must have matching result columns and registers"
             );
             program.emit_insn(Insn::Copy {
                 src_reg: start_reg,

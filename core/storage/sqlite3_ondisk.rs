@@ -728,10 +728,7 @@ pub fn begin_sync(
     syncing: Arc<AtomicBool>,
     sync_type: FileSyncType,
 ) -> Result<Completion> {
-    turso_assert!(
-        !syncing.load(Ordering::SeqCst),
-        "ondisk: begin_sync called while already syncing"
-    );
+    turso_assert!(!syncing.load(Ordering::SeqCst));
     syncing.store(true, Ordering::SeqCst);
     let completion = Completion::new_sync(move |_| {
         syncing.store(false, Ordering::SeqCst);

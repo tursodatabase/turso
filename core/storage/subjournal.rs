@@ -39,7 +39,7 @@ impl Subjournal {
             .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst);
         turso_assert!(
             result.is_ok(),
-            "subjournal: try_start_use must succeed before stop_use call"
+            "try_start_use must succeed before stop_use call"
         );
     }
 
@@ -61,7 +61,7 @@ impl Subjournal {
         turso_assert_eq!(
             buffer.len(),
             page_size + 4,
-            "subjournal: buffer length should be page_size + 4 bytes for page id"
+            "buffer length should be page_size + 4 bytes for page id"
         );
         self.file.pwrite(offset, buffer, c)
     }
@@ -70,7 +70,7 @@ impl Subjournal {
         turso_assert_eq!(
             page_id_buffer.len(),
             4,
-            "subjournal: page_id_buffer length should be 4 bytes"
+            "page_id_buffer length should be 4 bytes"
         );
         let c = Completion::new_read(
             page_id_buffer,
@@ -106,7 +106,7 @@ impl Subjournal {
         turso_assert_eq!(
             buffer.len(),
             page_size,
-            "subjournal: buffer length should be page_size"
+            "buffer length should be page_size"
         );
         let c = Completion::new_read(
             buffer,

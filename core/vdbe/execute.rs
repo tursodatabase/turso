@@ -81,7 +81,6 @@ use crate::{
 };
 
 use crate::{connection::Row, info, OpenFlags, TransactionState, ValueRef};
-#[allow(unused_imports)]
 use turso_macros::{
     turso_assert, turso_assert_eq, turso_assert_greater_than_or_equal, turso_assert_less_than,
 };
@@ -906,7 +905,7 @@ pub fn op_open_read(
         turso_assert_greater_than_or_equal!(
             *root_page,
             0,
-            "execute: root page should be non-negative when not in MVCC transaction"
+            "root page should be non negative when we are not in a MVCC transaction"
         );
     }
     let cursors = &mut state.cursors;
@@ -3136,7 +3135,7 @@ pub fn op_seek(
     };
     turso_assert!(
         target_pc.is_offset(),
-        "execute: op_seek target_pc should be an offset",
+        "op_seek target_pc should be an offset",
         { "target_pc": format!("{:?}", target_pc) }
     );
     let op = match insn {
@@ -3247,7 +3246,7 @@ pub fn seek_internal(
                     turso_assert_eq!(
                         num_regs,
                         1,
-                        "execute: op_seek num_regs should be 1 for table-btree"
+                        "op_seek: num_regs should be 1 for table-btree"
                     );
                     let original_value = state.registers[start_reg].get_value();
                     let mut temp_value = original_value.clone();

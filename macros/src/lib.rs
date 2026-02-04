@@ -6,8 +6,14 @@ mod test;
 // Import assertion proc macro implementations
 mod assert;
 
+use assert::{
+    comparison_auto_message, details_json, expr_to_lit_str, ComparisonAssertInput,
+    ConditionAssertInput, MessageAssertInput,
+};
 use proc_macro::{token_stream::IntoIter, Group, TokenStream, TokenTree};
+use quote::quote;
 use std::collections::HashMap;
+use syn::parse_macro_input;
 
 /// A procedural macro that derives a `Description` trait for enums.
 /// This macro extracts documentation comments (specified with `/// Description...`) for enum variants
@@ -528,17 +534,6 @@ pub fn derive_atomic_enum(input: TokenStream) -> TokenStream {
 pub fn test(args: TokenStream, input: TokenStream) -> TokenStream {
     test::test_macro_attribute(args, input)
 }
-
-// =============================================================================
-// Turso assertion proc macros
-// =============================================================================
-
-use assert::{
-    comparison_auto_message, details_json, expr_to_lit_str, ComparisonAssertInput,
-    ConditionAssertInput, MessageAssertInput,
-};
-use quote::quote;
-use syn::parse_macro_input;
 
 /// turso_assert! is a direct replacement for assert! which under the hood
 /// uses Antithesis SDK to guide the Antithesis simulator if --features antithesis is enabled.

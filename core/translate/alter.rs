@@ -1,5 +1,4 @@
 use crate::sync::Arc;
-#[allow(unused_imports)]
 use turso_macros::{turso_assert, turso_assert_eq, turso_assert_ne};
 use turso_parser::{
     ast::{self, TableInternalId},
@@ -143,7 +142,7 @@ pub fn translate_alter_table(
             let column_name = column_name.as_str();
 
             // Tables always have at least one column.
-            turso_assert!(!btree.columns.is_empty());
+            turso_assert_ne!(btree.columns.len(), 0);
 
             if btree.columns.len() == 1 {
                 return Err(LimboError::ParseError(format!(

@@ -13,7 +13,6 @@ use crate::types::IOResult;
 use crate::util::{exprs_are_equivalent, normalize_ident};
 use crate::vdbe::affinity::Affinity;
 use turso_macros::turso_assert;
-#[allow(unused_imports)]
 use turso_macros::turso_soft_unreachable;
 use turso_macros::AtomicEnum;
 

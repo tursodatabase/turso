@@ -1,5 +1,4 @@
 use crate::{LimboError, Result};
-#[allow(unused_imports)]
 use turso_macros::turso_debug_assert;
 
 #[derive(Debug, Clone, PartialEq, Copy)]

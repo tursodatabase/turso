@@ -14,7 +14,6 @@ use crate::{
     },
     Arc, CaptureDataChangesMode, Connection, Value, VirtualTable,
 };
-#[allow(unused_imports)]
 use turso_macros::{turso_assert, turso_assert_eq, turso_debug_assert};
 
 // Keep distinct hash-table ids far from table internal ids to avoid collisions.
@@ -558,7 +557,7 @@ impl ProgramBuilder {
                 .cursor_ref
                 .iter()
                 .any(|(k, _)| k.as_ref().is_some_and(|k| k.equals(&key))),
-            "builder: duplicate cursor key"
+            "duplicate cursor key"
         );
         self._alloc_cursor_id(Some(key), cursor_type)
     }
@@ -844,10 +843,7 @@ impl ProgramBuilder {
     }
 
     fn _resolve_label(&mut self, label: BranchOffset, to_offset: BranchOffset, target: JumpTarget) {
-        turso_assert!(
-            matches!(label, BranchOffset::Label(_)),
-            "builder: label must be BranchOffset::Label"
-        );
+        turso_assert!(matches!(label, BranchOffset::Label(_)));
         turso_assert!(matches!(to_offset, BranchOffset::Offset(_)));
         let BranchOffset::Label(label_number) = label else {
             unreachable!("Label is not a label");

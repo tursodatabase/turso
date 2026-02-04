@@ -20,7 +20,6 @@ use crate::vdbe::insn::{
 use crate::vdbe::{BranchOffset, CursorID};
 use crate::Result;
 use std::mem;
-#[allow(unused_imports)]
 use turso_macros::{turso_assert, turso_assert_eq};
 use turso_parser::ast::Name;
 use turso_parser::ast::{Expr, FunctionTail, Literal, Over, SortOrder, TableInternalId};
@@ -99,7 +98,7 @@ pub fn plan_windows(
         // Sanity check: this should never happen because the syntax disallows combining VALUES with windows
         turso_assert!(
             plan.values.is_empty(),
-            "window: VALUES clause with windows is not supported"
+            "VALUES clause with windows is not supported"
         );
     }
 
@@ -235,7 +234,7 @@ fn prepare_window_subquery(
     turso_assert_eq!(
         subquery.database_id,
         SUBQUERY_DATABASE_ID,
-        "window: subquery database id must be SUBQUERY_DATABASE_ID",
+        "subquery database id must be SUBQUERY_DATABASE_ID",
         {"SUBQUERY_DATABASE_ID": SUBQUERY_DATABASE_ID}
     );
 
@@ -331,7 +330,7 @@ fn rewrite_expr_referencing_current_window(
         // error messages, and this ensures that nothing slips through unnoticed.
         turso_assert!(
             filter_over.filter_clause.is_none(),
-            "window: FILTER clause in window functions is not supported"
+            "FILTER in window functions is not supported"
         );
 
         // Replace inline OVER clause with a reference to the named window.
@@ -357,7 +356,7 @@ fn rewrite_expr_referencing_current_window(
             }
             turso_assert!(
                 order_by.is_empty(),
-                "window: ORDER BY in window function args is not supported"
+                "ORDER BY in window functions is not supported"
             );
             normalize_over_clause(filter_over, &window_name);
         }
@@ -476,11 +475,7 @@ pub fn init_window<'a>(
     order_by: &'a [(Box<Expr>, SortOrder)],
 ) -> crate::Result<()> {
     let joined_tables = &plan.joined_tables();
-    turso_assert_eq!(
-        joined_tables.len(),
-        1,
-        "window: expected only one joined table"
-    );
+    turso_assert_eq!(joined_tables.len(), 1, "expected only one joined table");
 
     let src_table = &joined_tables[0];
     let reg_src_columns_start =
@@ -622,7 +617,7 @@ fn collect_expressions_referencing_subquery<'a>(
                         turso_assert_eq!(
                             table,
                             subquery_id,
-                            "window: only subquery columns can be referenced"
+                            "only subquery columns can be referenced"
                         );
                         if expressions_referencing_subquery
                             .iter()

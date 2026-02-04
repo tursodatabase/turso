@@ -6,7 +6,6 @@ use crate::{
     vdbe::affinity::Affinity,
     LimboError, Result, Value, ValueRef,
 };
-#[allow(unused_imports)]
 use turso_macros::{turso_assert, turso_debug_assert};
 
 // we use math functions from Rust stdlib in order to be as portable as possible for the production version of the tursodb
@@ -131,10 +130,7 @@ impl ComparisonOp {
         null_eq: bool,
     ) -> bool {
         let (lhs, rhs) = (lhs.as_value_ref(), rhs.as_value_ref());
-        turso_assert!(
-            matches!(lhs, ValueRef::Null) || matches!(rhs, ValueRef::Null),
-            "value: compare_nulls requires at least one null operand"
-        );
+        turso_assert!(matches!(lhs, ValueRef::Null) || matches!(rhs, ValueRef::Null));
 
         match self {
             ComparisonOp::Eq => {
@@ -400,7 +396,6 @@ impl Value {
                 }
 
                 //  The character boundary will be within four bytes of the index
-                //TODO use an Antithesis macro (not currently const)
                 debug_assert!(i <= index + 3);
 
                 i
