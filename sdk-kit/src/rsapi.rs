@@ -1320,8 +1320,10 @@ mod tests {
                     io: None,
                     db_file: None,
                 });
+                let result = db.open();
+                println!("result: {:?}", result);
                 assert!(
-                    db.open().is_err(),
+                    result.is_err(),
                     "Opening encrypted database without key should fail"
                 );
             }
