@@ -1,0 +1,43 @@
+---
+source: indexes.sqltest
+expression: "SELECT id, order_date, total_amount\n    FROM orders\n    WHERE customer_id = 100\n    ORDER BY order_date;"
+info:
+  statement_type: SELECT
+  tables:
+    - orders
+  setup_blocks:
+    - schema
+  database: ":memory:"
+---
+QUERY PLAN
+|--SEARCH orders USING INDEX idx_orders_customer_date
+`--USE TEMP B-TREE FOR ORDER BY
+
+BYTECODE
+addr  opcode           p1  p2  p3  p4                p5  comment
+   0  Init              0  24   0                     0  Start at 24
+   1  SorterOpen        0   1   0  k(1,B)             0  cursor=0
+   2  OpenRead          1   6   0  k(6,B,B,B,B,B,B)   0  table=orders, root=6, iDb=0
+   3  OpenRead          2   7   0  k(3,B,B)           0  index=idx_orders_customer_date, root=7, iDb=0
+   4  Integer         100   5   0                     0  r[5]=100
+   5  SeekGE            2  15   5                     0  key=[5..5]
+   6    IdxGT           2  15   5                     0  key=[5..5]
+   7    DeferredSeek    2   1   0                     0
+   8    Column          1   2   6                     0  r[6]=orders.order_date
+   9    IdxRowId        2   7   0                     0  r[7]=cursor 2 for index idx_orders_customer_date.rowid
+  10    Column          1   4   8                     0  r[8]=orders.total_amount
+  11    RealAffinity    8   0   0                     0
+  12    MakeRecord      6   3   4                     0  r[4]=mkrec(r[6..8])
+  13    SorterInsert    0   4   0  0                  0  key=r[4]
+  14  Next              2   6   0                     0
+  15  OpenPseudo        3   4   3                     0  3 columns in r[4]
+  16  SorterSort        0  23   0                     0
+  17    SorterData      0   4   3                     0  r[4]=data
+  18    Column          3   1   1                     0  r[1]=pseudo.column 1
+  19    Column          3   0   2                     0  r[2]=pseudo.column 0
+  20    Column          3   2   3                     0  r[3]=pseudo.column 2
+  21    ResultRow       1   3   0                     0  output=r[1..3]
+  22  SorterNext        0  17   0                     0
+  23  Halt              0   0   0                     0
+  24  Transaction       0   1  14                     0  iDb=0 tx_mode=Read
+  25  Goto              0   1   0                     0

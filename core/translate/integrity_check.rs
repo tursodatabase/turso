@@ -153,6 +153,13 @@ fn translate_integrity_check_impl(
         };
     }
 
+    // Include root pages from tables/indexes that have been dropped but not yet checkpointed.
+    // In MVCC mode, dropped tables' btree pages are not freed until checkpoint, so we need
+    // to check them to avoid "page never used" false positives.
+    for &dropped_root in &schema.dropped_root_pages {
+        root_pages.push(dropped_root);
+    }
+
     let message_register = program.alloc_register();
     program.emit_insn(Insn::IntegrityCk {
         max_errors,

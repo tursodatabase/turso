@@ -1,0 +1,85 @@
+---
+source: joins.sqltest
+expression: "SELECT\n        m.name AS manager_name,\n        COUNT(e.employee_id) AS subordinate_count,\n        AVG(e.salary) AS avg_subordinate_salary\n    FROM\n        employees m\n    INNER JOIN employees e ON m.employee_id = e.manager_id\n    GROUP BY\n        m.employee_id, m.name\n    ORDER BY\n        subordinate_count DESC;"
+info:
+  statement_type: SELECT
+  tables:
+    - employees
+    - m.employee_id
+  setup_blocks:
+    - schema
+  database: ":memory:"
+---
+QUERY PLAN
+|--SEARCH m USING INTEGER PRIMARY KEY (rowid=?)
+|--SCAN employees AS e
+`--USE TEMP B-TREE FOR ORDER BY
+
+BYTECODE
+addr  opcode                  p1  p2  p3  p4                    p5  comment
+   0          Init             0  64   0                         0  Start at 64
+   1          SorterOpen       0   1   0  k(1,-B)                0  cursor=0
+   2          Null             0  12  13                         0  r[12..13]=NULL
+   3          SorterOpen       1   4   0  k(2,-B,-B)             0  cursor=1
+   4          Integer          0   7   0                         0  r[7]=0; clear group by abort flag
+   5          Null             0   8   9                         0  r[8..9]=NULL; initialize group by comparison registers to NULL
+   6          Gosub           19  52   0                         0  ; go to clear accumulator subroutine
+   7          OpenRead         3   6   0  k(5,B,B,B,B,B)         0  table=employees, root=6, iDb=0
+   8          OpenRead         4   6   0  k(5,B,B,B,B,B)         0  table=employees, root=6, iDb=0
+   9          Rewind           4  19   0                         0  Rewind table employees
+  10            Column         4   2  20                         0  r[20]=employees.manager_id
+  11            SeekRowid      3  20  18                         0  if (r[20]!=cursor 3 for table employees.rowid) goto 18
+  12            RowId          3  15   0                         0  r[15]=employees.rowid
+  13            Column         3   1  16                         0  r[16]=employees.name
+  14            RowId          4  17   0                         0  r[17]=employees.rowid
+  15            Column         4   4  18                         0  r[18]=employees.salary
+  16            MakeRecord    15   4  14                         0  r[14]=mkrec(r[15..18])
+  17            SorterInsert   1  14   0  0                      0  key=r[14]
+  18          Next             4  10   0                         0
+  19          OpenPseudo       2  14   4                         0  4 columns in r[14]
+  20          SorterSort       1  38   0                         0
+  21            SorterData     1  14   2                         0  r[14]=data
+  22            Column         2   0  21                         0  r[21]=pseudo.column 0
+  23            Column         2   1  22                         0  r[22]=pseudo.column 1
+  24            Compare        8  21   2  k(2, Binary, Binary)   0  r[8..9]==r[21..22]
+  25            Jump          26  30  26                         0  ; start new group if comparison is not equal
+  26            Gosub          5  42   0                         0  ; check if ended group had data, and output if so
+  27            Move          21   8   2                         0  r[8..9]=r[21..22]
+  28            IfPos          7  55   0                         0  r[7]>0 -> r[7]-=0, goto 55; check abort flag
+  29            Gosub         19  52   0                         0  ; goto clear accumulator subroutine
+  30            Column         2   2  23                         0  r[23]=pseudo.column 2
+  31            AggStep        0  23  12  count                  0  accum=r[12] step(r[23])
+  32            Column         2   3  24                         0  r[24]=pseudo.column 3
+  33            AggStep        0  24  13  avg                    0  accum=r[13] step(r[24])
+  34            If             6  36   0                         0  if r[6] goto 36; don't emit group columns if continuing existing group
+  35            Column         2   1  10                         0  r[10]=pseudo.column 1
+  36            Integer        1   6   0                         0  r[6]=1; indicate data in accumulator
+  37          SorterNext       1  21   0                         0
+  38          Gosub            5  42   0                         0  ; emit row for final group
+  39          Goto             0  55   0                         0  ; group by finished
+  40          Integer          1   7   0                         0  r[7]=1
+  41        Return             5   0   0                         0
+  42        IfPos              6  44   0                         0  r[6]>0 -> r[6]-=0, goto 44; output group by row subroutine start
+  43      Return               5   0   0                         0
+  44      AggFinal             0  12   0  count                  0  accum=r[12]
+  45      AggFinal             0  13   0  avg                    0  accum=r[13]
+  46      Copy                12  25   0                         0  r[25]=r[12]
+  47      Copy                10  26   0                         0  r[26]=r[10]
+  48      Copy                13  27   0                         0  r[27]=r[13]
+  49      MakeRecord          25   3   4                         0  r[4]=mkrec(r[25..27])
+  50      SorterInsert         0   4   0  0                      0  key=r[4]
+  51    Return                 5   0   0                         0
+  52    Null                   0  10  13                         0  r[10..13]=NULL; clear accumulator subroutine start
+  53    Integer                0   6   0                         0  r[6]=0
+  54  Return                  19   0   0                         0
+  55  OpenPseudo               5   4   3                         0  3 columns in r[4]
+  56  SorterSort               0  63   0                         0
+  57    SorterData             0   4   5                         0  r[4]=data
+  58    Column                 5   1   1                         0  r[1]=pseudo.column 1
+  59    Column                 5   0   2                         0  r[2]=pseudo.column 0
+  60    Column                 5   2   3                         0  r[3]=pseudo.column 2
+  61    ResultRow              1   3   0                         0  output=r[1..3]
+  62  SorterNext               0  57   0                         0
+  63  Halt                     0   0   0                         0
+  64  Transaction              0   1  10                         0  iDb=0 tx_mode=Read
+  65  Goto                     0   1   0                         0

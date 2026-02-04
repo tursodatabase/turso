@@ -1,0 +1,79 @@
+---
+source: subqueries.sqltest
+expression: "SELECT c.name, order_stats.total_orders, order_stats.total_spent\n    FROM customers c\n    JOIN (\n        SELECT\n            customer_id,\n            count(*) AS total_orders,\n            sum(total_amount) AS total_spent\n        FROM orders\n        GROUP BY customer_id\n    ) AS order_stats ON order_stats.customer_id = c.id\n    WHERE order_stats.total_spent > 500;"
+info:
+  statement_type: SELECT
+  tables:
+    - customers
+    - order_stats.customer_id
+    - orders
+  setup_blocks:
+    - schema
+  database: ":memory:"
+---
+QUERY PLAN
+|--SEARCH c USING INTEGER PRIMARY KEY (rowid=?)
+`--SCAN order_stats
+   `--SCAN orders USING INDEX idx_orders_customer
+
+BYTECODE
+addr  opcode                   p1  p2  p3  p4            p5  comment
+   0          Init              0  55   0                 0  Start at 55
+   1          InitCoroutine     1  42   2                 0
+   2          Null              0  10  11                 0  r[10..11]=NULL
+   3          Integer           0   7   0                 0  r[7]=0; clear group by abort flag
+   4          Null              0   8   0                 0  r[8]=NULL; initialize group by comparison registers to NULL
+   5          Gosub            15  38   0                 0  ; go to clear accumulator subroutine
+   6          OpenRead          0   4   0  k(4,B,B,B,B)   0  table=orders, root=4, iDb=0
+   7          OpenRead          1   9   0  k(2,B)         0  index=idx_orders_customer, root=9, iDb=0
+   8          Rewind            1  25   0                 0  Rewind index idx_orders_customer
+   9            DeferredSeek    1   0   0                 0
+  10            Column          0   1  13                 0  r[13]=orders.customer_id
+  11            Column          0   3  14                 0  r[14]=orders.total_amount
+  12            RealAffinity   14   0   0                 0
+  13            Compare         8  13   1  k(1, Binary)   0  r[8..8]==r[13..13]
+  14            Jump           15  19  15                 0  ; start new group if comparison is not equal
+  15            Gosub           5  29   0                 0  ; check if ended group had data, and output if so
+  16            Move           13   8   1                 0  r[8..8]=r[13..13]
+  17            IfPos           7  41   0                 0  r[7]>0 -> r[7]-=0, goto 41; check abort flag
+  18            Gosub          15  38   0                 0  ; goto clear accumulator subroutine
+  19            AggStep         0  16  10  count          0  accum=r[10] step(r[16])
+  20            AggStep         0  14  11  sum            0  accum=r[11] step(r[14])
+  21            If              6  23   0                 0  if r[6] goto 23; don't emit group columns if continuing existing group
+  22            Column          0   1   9                 0  r[9]=orders.customer_id
+  23            Integer         1   6   0                 0  r[6]=1; indicate data in accumulator
+  24          Next              1   9   0                 0
+  25          Gosub             5  29   0                 0  ; emit row for final group
+  26          Goto              0  41   0                 0  ; group by finished
+  27          Integer           1   7   0                 0  r[7]=1
+  28        Return              5   0   0                 0
+  29        IfPos               6  31   0                 0  r[6]>0 -> r[6]-=0, goto 31; output group by row subroutine start
+  30      Return                5   0   0                 0
+  31      AggFinal              0  10   0  count          0  accum=r[10]
+  32      AggFinal              0  11   0  sum            0  accum=r[11]
+  33      Copy                  9   2   0                 0  r[2]=r[9]
+  34      Copy                 10   3   0                 0  r[3]=r[10]
+  35      Copy                 11   4   0                 0  r[4]=r[11]
+  36      Yield                 1   0   0                 0
+  37    Return                  5   0   0                 0
+  38    Null                    0   9  11                 0  r[9..11]=NULL; clear accumulator subroutine start
+  39    Integer                 0   6   0                 0  r[6]=0
+  40  Return                   15   0   0                 0
+  41  EndCoroutine              1   0   0                 0
+  42  OpenRead                  2   6   0  k(4,B,B,B,B)   0  table=customers, root=6, iDb=0
+  43  InitCoroutine             1   0   2                 0
+  44    Yield                   1  54   0                 0
+  45    Copy                    4  21   0                 0  r[21]=r[4]
+  46    Le                     21  22  53  Binary         0  if r[21]<=r[22] goto 53
+  47    Copy                    2  23   0                 0  r[23]=r[2]
+  48    SeekRowid               2  23  53                 0  if (r[23]!=cursor 2 for table customers.rowid) goto 53
+  49    Column                  2   1  17                 0  r[17]=customers.name
+  50    Copy                    3  18   0                 0  r[18]=r[3]
+  51    Copy                    4  19   0                 0  r[19]=r[4]
+  52    ResultRow              17   3   0                 0  output=r[17..19]
+  53  Goto                      0  44   0                 0
+  54  Halt                      0   0   0                 0
+  55  Transaction               0   1  11                 0  iDb=0 tx_mode=Read
+  56  Integer                   1  16   0                 0  r[16]=1
+  57  Integer                 500  22   0                 0  r[22]=500
+  58  Goto                      0   1   0                 0

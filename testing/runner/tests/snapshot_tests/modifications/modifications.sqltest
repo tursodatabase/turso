@@ -1,0 +1,139 @@
+# Data Modification Query Plan Snapshots
+# These snapshots capture EXPLAIN QUERY PLAN output for INSERT, UPDATE, and DELETE operations
+
+@database :memory:
+@skip-file-if mvcc "mvcc has slightly different cursor ids, so skipping it for now"
+
+setup schema {
+    -- Products table with primary key for basic operations
+    CREATE TABLE products (
+        id INTEGER PRIMARY KEY,
+        name TEXT NOT NULL,
+        price REAL NOT NULL,
+        quantity INTEGER DEFAULT 0,
+        category TEXT
+    );
+
+    -- Users table with unique constraint for conflict handling
+    CREATE TABLE users (
+        id INTEGER PRIMARY KEY,
+        email TEXT UNIQUE NOT NULL,
+        name TEXT NOT NULL,
+        status TEXT DEFAULT 'active'
+    );
+
+    -- Orders table for subquery demonstrations
+    CREATE TABLE orders (
+        id INTEGER PRIMARY KEY,
+        user_id INTEGER NOT NULL,
+        product_id INTEGER NOT NULL,
+        quantity INTEGER NOT NULL,
+        total_price REAL NOT NULL,
+        created_at TEXT,
+        FOREIGN KEY (user_id) REFERENCES users(id),
+        FOREIGN KEY (product_id) REFERENCES products(id)
+    );
+
+    -- Inventory table for batch operations
+    CREATE TABLE inventory (
+        product_id INTEGER PRIMARY KEY,
+        warehouse TEXT NOT NULL,
+        stock INTEGER NOT NULL,
+        last_updated TEXT,
+        FOREIGN KEY (product_id) REFERENCES products(id)
+    );
+
+    -- Archive table for INSERT ... SELECT
+    CREATE TABLE order_archive (
+        id INTEGER PRIMARY KEY,
+        user_id INTEGER NOT NULL,
+        product_id INTEGER NOT NULL,
+        quantity INTEGER NOT NULL,
+        total_price REAL NOT NULL,
+        archived_at TEXT
+    );
+
+    -- Create indexes for query optimization
+    CREATE INDEX idx_products_category ON products(category);
+    CREATE INDEX idx_orders_user_id ON orders(user_id);
+    CREATE INDEX idx_orders_product_id ON orders(product_id);
+    CREATE INDEX idx_inventory_warehouse ON inventory(warehouse);
+}
+
+# INSERT single row - VALUES clause
+@setup schema
+snapshot insert-single-row {
+    INSERT INTO products (id, name, price, quantity, category)
+    VALUES (1, 'Widget', 19.99, 100, 'Electronics');
+}
+
+# INSERT multiple rows - batch insert
+@setup schema
+snapshot insert-multiple-rows {
+    INSERT INTO products (id, name, price, quantity, category)
+    VALUES
+        (1, 'Widget', 19.99, 100, 'Electronics'),
+        (2, 'Gadget', 29.99, 50, 'Electronics'),
+        (3, 'Gizmo', 9.99, 200, 'Accessories');
+}
+
+# INSERT ... SELECT - insert from query
+@setup schema
+snapshot insert-select {
+    INSERT INTO order_archive (id, user_id, product_id, quantity, total_price)
+    SELECT id, user_id, product_id, quantity, total_price
+    FROM orders
+    WHERE created_at < '2024-01-01';
+}
+
+# UPDATE simple - basic update with WHERE
+@setup schema
+snapshot update-simple {
+    UPDATE products
+    SET price = price * 1.10, quantity = quantity - 10
+    WHERE category = 'Electronics';
+}
+
+# TODO: Uncomment when subquery in UPDATE SET is supported
+# # UPDATE with subquery - computed update value
+# @setup schema
+# snapshot update-with-subquery {
+#     UPDATE inventory
+#     SET stock = (
+#         SELECT SUM(quantity)
+#         FROM orders
+#         WHERE orders.product_id = inventory.product_id
+#     )
+#     WHERE warehouse = 'Main';
+# }
+
+# DELETE with WHERE - filtered delete
+@setup schema
+snapshot delete-with-where {
+    DELETE FROM orders
+    WHERE total_price < 10.00
+    AND created_at < '2024-01-01';
+}
+
+# DELETE with subquery - correlated delete
+@setup schema
+snapshot delete-with-subquery {
+    DELETE FROM orders
+    WHERE user_id IN (
+        SELECT id FROM users WHERE status = 'inactive'
+    );
+}
+
+# INSERT OR REPLACE - upsert behavior
+@setup schema
+snapshot insert-or-replace {
+    INSERT OR REPLACE INTO users (id, email, name, status)
+    VALUES (1, 'john@example.com', 'John Doe', 'active');
+}
+
+# INSERT OR IGNORE - ignore conflicts
+@setup schema
+snapshot insert-or-ignore {
+    INSERT OR IGNORE INTO users (id, email, name, status)
+    VALUES (1, 'jane@example.com', 'Jane Doe', 'active');
+}

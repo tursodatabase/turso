@@ -1,0 +1,94 @@
+---
+source: subqueries.sqltest
+expression: "WITH dept_avg AS (\n        SELECT department, avg(salary) AS avg_salary\n        FROM employees\n        GROUP BY department\n    )\n    SELECT e.name, e.department, e.salary\n    FROM employees e\n    WHERE e.salary > (\n        SELECT da.avg_salary\n        FROM dept_avg da\n        WHERE da.department = e.department\n    );"
+info:
+  statement_type: WITH (CTE)
+  tables:
+    - dept_avg
+    - employees
+  setup_blocks:
+    - schema
+  database: ":memory:"
+---
+QUERY PLAN
+|--SCAN employees AS e
+`--SCAN dept_avg AS da
+   `--SCAN employees
+
+BYTECODE
+addr  opcode                      p1  p2  p3  p4              p5  comment
+   0            Init               0  73   0                   0  Start at 73
+   1            OpenRead           0   7   0  k(5,B,B,B,B,B)   0  table=employees, root=7, iDb=0
+   2            Rewind             0  72   0                   0  Rewind table employees
+   3              BeginSubrtn      5   0   0                   0  r[5]=NULL
+   4              Null             0   1   0                   0  r[1]=NULL
+   5              InitCoroutine    6  50   6                   0
+   6              Null             0  14   0                   0  r[14]=NULL
+   7              SorterOpen       1   2   0  k(1,B)           0  cursor=1
+   8              Integer          0  11   0                   0  r[11]=0; clear group by abort flag
+   9              Null             0  12   0                   0  r[12]=NULL; initialize group by comparison registers to NULL
+  10              Gosub           18  46   0                   0  ; go to clear accumulator subroutine
+  11              OpenRead         3   7   0  k(5,B,B,B,B,B)   0  table=employees, root=7, iDb=0
+  12              Rewind           3  19   0                   0  Rewind table employees
+  13                Column         3   3  16                   0  r[16]=employees.department
+  14                Column         3   4  17                   0  r[17]=employees.salary
+  15                RealAffinity  17   0   0                   0
+  16                MakeRecord    16   2  15                   0  r[15]=mkrec(r[16..17])
+  17                SorterInsert   1  15   0  0                0  key=r[15]
+  18              Next             3  13   0                   0
+  19              OpenPseudo       2  15   2                   0  2 columns in r[15]
+  20              SorterSort       1  35   0                   0
+  21                SorterData     1  15   2                   0  r[15]=data
+  22                Column         2   0  19                   0  r[19]=pseudo.column 0
+  23                Compare       12  19   1  k(1, Binary)     0  r[12..12]==r[19..19]
+  24                Jump          25  29  25                   0  ; start new group if comparison is not equal
+  25                Gosub          9  39   0                   0  ; check if ended group had data, and output if so
+  26                Move          19  12   1                   0  r[12..12]=r[19..19]
+  27                IfPos         11  49   0                   0  r[11]>0 -> r[11]-=0, goto 49; check abort flag
+  28                Gosub         18  46   0                   0  ; goto clear accumulator subroutine
+  29                Column         2   1  20                   0  r[20]=pseudo.column 1
+  30                AggStep        0  20  14  avg              0  accum=r[14] step(r[20])
+  31                If            10  33   0                   0  if r[10] goto 33; don't emit group columns if continuing existing group
+  32                Column         2   0  13                   0  r[13]=pseudo.column 0
+  33                Integer        1  10   0                   0  r[10]=1; indicate data in accumulator
+  34              SorterNext       1  21   0                   0
+  35              Gosub            9  39   0                   0  ; emit row for final group
+  36              Goto             0  49   0                   0  ; group by finished
+  37              Integer          1  11   0                   0  r[11]=1
+  38            Return             9   0   0                   0
+  39            IfPos             10  41   0                   0  r[10]>0 -> r[10]-=0, goto 41; output group by row subroutine start
+  40          Return               9   0   0                   0
+  41          AggFinal             0  14   0  avg              0  accum=r[14]
+  42          Copy                13   7   0                   0  r[7]=r[13]
+  43          Copy                14   8   0                   0  r[8]=r[14]
+  44          Yield                6   0   0                   0
+  45        Return                 9   0   0                   0
+  46        Null                   0  13  14                   0  r[13..14]=NULL; clear accumulator subroutine start
+  47        Integer                0  10   0                   0  r[10]=0
+  48      Return                  18   0   0                   0
+  49      EndCoroutine             6   0   0                   0
+  50      Integer                  1  22   0                   0  r[22]=1; LIMIT counter
+  51      IfNot                   22  61   0                   0  if !r[22] goto 61
+  52      InitCoroutine            6   0   6                   0
+  53        Yield                  6  61   0                   0
+  54        Copy                   7  24   0                   0  r[24]=r[7]
+  55        Column                 0   3  25                   0  r[25]=employees.department
+  56        Ne                    24  25  60  Binary           0  if r[24]!=r[25] goto 60
+  57        Copy                   8  21   0                   0  r[21]=r[8]
+  58        Copy                  21   1   0                   0  r[1]=r[21]
+  59        DecrJumpZero          22  61   0                   0  if (--r[22]==0) goto 61
+  60      Goto                     0  53   0                   0
+  61    Return                     5   0   1                   0
+  62    Column                     0   4  27                   0  r[27]=employees.salary
+  63    RealAffinity              27   0   0                   0
+  64    Copy                       1  28   0                   0  r[28]=r[1]
+  65    Le                        27  28  71  Binary           0  if r[27]<=r[28] goto 71
+  66    Column                     0   1   2                   0  r[2]=employees.name
+  67    Column                     0   3   3                   0  r[3]=employees.department
+  68    Column                     0   4   4                   0  r[4]=employees.salary
+  69    RealAffinity               4   0   0                   0
+  70    ResultRow                  2   3   0                   0  output=r[2..4]
+  71  Next                         0   3   0                   0
+  72  Halt                         0   0   0                   0
+  73  Transaction                  0   1  11                   0  iDb=0 tx_mode=Read
+  74  Goto                         0   1   0                   0

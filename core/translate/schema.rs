@@ -782,11 +782,17 @@ pub fn translate_drop_table(
     //  2. Destroy the indices within a loop
     let indices = resolver.schema.get_indices(tbl_name.name.as_str());
     for index in indices {
-        program.emit_insn(Insn::Destroy {
-            root: index.root_page,
-            former_root_reg: 0, //  no autovacuum (https://www.sqlite.org/opcode.html#Destroy)
-            is_temp: 0,
-        });
+        if index.index_method.is_some() && !index.is_backing_btree_index() {
+            // Index methods without backing btree need special destroy handling
+            let cursor_id = program.alloc_cursor_index(None, index)?;
+            program.emit_insn(Insn::IndexMethodDestroy { db: 0, cursor_id });
+        } else {
+            program.emit_insn(Insn::Destroy {
+                root: index.root_page,
+                former_root_reg: 0, //  no autovacuum (https://www.sqlite.org/opcode.html#Destroy)
+                is_temp: 0,
+            });
+        }
 
         //  3. TODO: Open an ephemeral table, and read over triggers from schema table into ephemeral table
         //  Requires support via https://github.com/tursodatabase/turso/pull/768

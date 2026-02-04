@@ -157,9 +157,11 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
         sync_mode: SyncMode,
     ) -> Self {
         let checkpoint_lock = mvstore.blocking_checkpoint_lock.clone();
-        let index_id_to_index = connection
-            .schema
-            .read()
+        // Prevent stale per-connection schema during checkpoint by using the shared DB schema.
+        // Unlike in WAL mode we actually write stuff from mv store to pager in checkpoint
+        // so this is important.
+        let schema = connection.db.clone_schema();
+        let index_id_to_index = schema
             .indexes
             .values()
             .flatten()
@@ -202,7 +204,11 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
 
     /// Determine whether the newest valid version of a row should be checkpointed.
     /// Returns the version to checkpoint if it should be checkpointed, otherwise None.
-    fn maybe_get_checkpointable_version(&self, versions: &[RowVersion]) -> Option<RowVersion> {
+    fn maybe_get_checkpointable_version(
+        &self,
+        versions: &[RowVersion],
+        table_id: MVTableId,
+    ) -> Option<RowVersion> {
         let mut version_to_checkpoint = None;
         let mut exists_in_db_file = false;
         // Iterate versions from oldest-to-newest to determine if the row exists in the database file and whether the newest version should be checkpointed.
@@ -252,7 +258,16 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 });
             // - It is a delete, AND some version of the row exists in the database file.
             let is_delete_and_exists_in_db_file = end_ts.is_some() && exists_in_db_file;
-            let should_checkpoint = is_uncheckpointed_insert || is_delete_and_exists_in_db_file;
+            // - It is a delete of a sqlite_schema row that hasn't been checkpointed yet. We need to
+            //   return these even if they don't exist in the DB file so we can track destroyed
+            //   tables/indexes and skip their data rows.
+            let is_schema_delete = table_id == SQLITE_SCHEMA_MVCC_TABLE_ID
+                && !exists_in_db_file
+                && self
+                    .checkpointed_txid_max_old
+                    .is_none_or(|txid_max_old| end_ts.is_some_and(|e| e > u64::from(txid_max_old)));
+            let should_checkpoint =
+                is_uncheckpointed_insert || is_delete_and_exists_in_db_file || is_schema_delete;
             if should_checkpoint {
                 version_to_checkpoint = Some(version.clone());
             }
@@ -278,11 +293,13 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
         // Reliance on SkipMap ordering is a bit yolo-swag fragile, but oh well.
         for entry in self.mvstore.rows.iter().rev() {
             let key = entry.key();
+            tracing::trace!("collecting {key:?}");
             if self.destroyed_tables.contains(&key.table_id) {
                 // We won't checkpoint rows for tables that will be destroyed in this checkpoint.
                 // There's two forms of destroyed table:
                 // 1. A non-checkpointed table that was created in the logical log and then destroyed. We don't need to do anything about this table in the pager/btree layer.
                 // 2. A checkpointed table that was destroyed in the logical log. We need to destroy the btree in the pager/btree layer.
+                tracing::trace!("skipping {key:?}");
                 continue;
             }
 
@@ -297,10 +314,15 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 }
             }
 
-            if let Some(version) = self.maybe_get_checkpointable_version(&row_versions) {
+            if let Some(version) =
+                self.maybe_get_checkpointable_version(&row_versions, key.table_id)
+            {
                 let is_delete = version.end.is_some();
 
                 let mut special_write = None;
+                // Set to true for schema deletes of never-checkpointed tables/indexes.
+                // These don't need to be written to the B-tree, we just need to track them.
+                let mut skip_write = false;
 
                 if version.row.id.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID {
                     let row_data = ImmutableRecord::from_bin_record(version.row.payload().to_vec());
@@ -316,44 +338,48 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                     if let ValueRef::Integer(root_page) = col3 {
                         if type_str.as_str() == "index" {
                             // This is an index schema change
-                            let index_id = MVTableId::from(root_page);
-
                             if is_delete {
                                 // DROP INDEX
-                                let found_index_id = self
-                                    .mvstore
-                                    .table_id_to_rootpage
-                                    .iter()
-                                    .find(|entry| {
-                                        entry.value().is_some_and(|r| r == root_page as u64)
-                                    })
-                                    .map(|entry| *entry.key());
+                                if root_page < 0 {
+                                    // Index was never checkpointed - derive index_id directly from root_page.
+                                    // No BTreeDestroyIndex needed since there's no physical B-tree.
+                                    let index_id = MVTableId(root_page);
+                                    self.destroyed_indexes.insert(index_id);
+                                    skip_write = true;
+                                } else {
+                                    // DROP INDEX - index was checkpointed
+                                    let index_id = self
+                                        .mvstore
+                                        .table_id_to_rootpage
+                                        .iter()
+                                        .find(|entry| {
+                                            entry.value().is_some_and(|r| r == root_page as u64)
+                                        })
+                                        .map(|entry| *entry.key())
+                                        .expect(
+                                            "index_id to rootpage mapping should exist for dropped index",
+                                        );
 
-                                let table_id = found_index_id.expect(
-                                    "index_id to rootpage mapping should exist for dropped index",
-                                );
+                                    self.destroyed_indexes.insert(index_id);
 
-                                // Verify it's actually an index, not a table
-                                assert_eq!(
-                                        table_id, index_id,
-                                        "Found table_id {table_id} but expected index_id {index_id} for root_page {root_page}",
-                                    );
+                                    // DROP INDEX during checkpoint: schema may no longer contain the index definition.
+                                    // Fixes DROP INDEX during checkpoint when the schema cache no longer
+                                    // contains the index metadata; we only need a cursor to destroy pages so num_columns is not important.
+                                    let num_columns = self
+                                        .index_id_to_index
+                                        .get(&index_id)
+                                        .map(|index| index.columns.len())
+                                        .unwrap_or(0);
 
-                                self.destroyed_indexes.insert(index_id);
-
-                                // Get Index struct from schema to determine num_columns
-                                let index = self
-                                    .index_id_to_index
-                                    .get(&index_id)
-                                    .expect("Index ID does not have a index struct");
-
-                                special_write = Some(SpecialWrite::BTreeDestroyIndex {
-                                    index_id,
-                                    root_page: root_page as u64,
-                                    num_columns: index.columns.len(),
-                                });
+                                    special_write = Some(SpecialWrite::BTreeDestroyIndex {
+                                        index_id,
+                                        root_page: root_page as u64,
+                                        num_columns,
+                                    });
+                                }
                             } else if root_page < 0 {
                                 // CREATE INDEX (root page is negative so the index has not been checkpointed yet).
+                                let index_id = MVTableId::from(root_page);
                                 let sqlite_schema_rowid = version.row.id.row_id.to_int_or_panic();
 
                                 special_write = Some(SpecialWrite::BTreeCreateIndex {
@@ -365,24 +391,34 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                             }
                         } else if type_str.as_str() == "table" {
                             // This is a table schema change (existing logic)
+                            tracing::trace!("table schema change with root page {root_page}, is_delete={is_delete}");
                             if is_delete {
-                                let table_id = self
-                                    .mvstore
-                                    .table_id_to_rootpage
-                                    .iter()
-                                    .find(|entry| {
-                                        entry.value().is_some_and(|r| r == root_page as u64)
-                                    })
-                                    .map(|entry| *entry.key())
-                                    .expect("table_id to rootpage mapping should exist");
-                                self.destroyed_tables.insert(table_id);
+                                if root_page < 0 {
+                                    // Table was never checkpointed - derive table_id directly from root_page.
+                                    // No BTreeDestroy needed since there's no physical B-tree.
+                                    let table_id = MVTableId::from(root_page);
+                                    self.destroyed_tables.insert(table_id);
+                                    skip_write = true;
+                                } else {
+                                    // Table was checkpointed - look up by physical root page
+                                    let table_id = self
+                                        .mvstore
+                                        .table_id_to_rootpage
+                                        .iter()
+                                        .find(|entry| {
+                                            entry.value().is_some_and(|r| r == root_page as u64)
+                                        })
+                                        .map(|entry| *entry.key())
+                                        .expect("table_id to rootpage mapping should exist");
+                                    self.destroyed_tables.insert(table_id);
 
-                                // We might need to create or destroy a B-tree in the pager during checkpoint if a row in root page 1 is deleted or created.
-                                special_write = Some(SpecialWrite::BTreeDestroy {
-                                    table_id,
-                                    root_page: root_page as u64,
-                                    num_columns: version.row.column_count,
-                                });
+                                    // Destroy the B-tree in the pager during checkpoint
+                                    special_write = Some(SpecialWrite::BTreeDestroy {
+                                        table_id,
+                                        root_page: root_page as u64,
+                                        num_columns: version.row.column_count,
+                                    });
+                                }
                             } else if root_page < 0 {
                                 // CREATE TABLE (root page is negative so the table has not been checkpointed yet).
                                 let table_id = MVTableId::from(root_page);
@@ -397,7 +433,10 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                         }
                     }
                 }
-                self.write_set.push((version, special_write));
+                if !skip_write {
+                    tracing::trace!("adding to write_set {:?}", (&version, &special_write));
+                    self.write_set.push((version, special_write));
+                }
             }
         }
         // Writing in ascending order of rowid gives us a better chance of using balance-quick algorithm
@@ -446,7 +485,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                     }
                 }
 
-                if let Some(version) = self.maybe_get_checkpointable_version(&versions) {
+                if let Some(version) = self.maybe_get_checkpointable_version(&versions, index_id) {
                     let is_delete = version.end.is_some();
 
                     // Only write the row to the B-tree if it is not a delete, or if it is a delete and it exists in
@@ -583,6 +622,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                                 "row version not found in write set".to_string(),
                             )
                         })?;
+                    tracing::trace!("checkpointing row {row_version:?} ");
                     (
                         row_version.row.column_count,
                         row_version.row.id.table_id,
@@ -660,14 +700,9 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                                 "MV store root page does not match root page in the sqlite_schema record: {known_root_page} != {root_page}"
                             );
 
-                            // Get Index struct for creating cursor
-                            let index = self.index_id_to_index.get(&index_id).unwrap_or_else(|| panic!(
-                                "Index struct for index_id {index_id} must exist when destroying btree",
-                            ));
-
                             let cursor = if let Some(cursor) = self.cursors.get(&known_root_page) {
                                 cursor.clone()
-                            } else {
+                            } else if let Some(index) = self.index_id_to_index.get(&index_id) {
                                 let cursor = BTreeCursor::new_index(
                                     self.pager.clone(),
                                     known_root_page as i64,
@@ -677,6 +712,14 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                                 let cursor = Arc::new(RwLock::new(cursor));
                                 self.cursors.insert(root_page, cursor.clone());
                                 cursor
+                            } else {
+                                // DROP INDEX destroy path: schema may no longer contain the index definition.
+                                // We only need a cursor to destroy pages so num_columns is not important.
+                                Arc::new(RwLock::new(BTreeCursor::new_table(
+                                    self.pager.clone(),
+                                    known_root_page as i64,
+                                    num_columns,
+                                )))
                             };
                             self.pager.io.block(|| cursor.write().btree_destroy())?;
                             self.destroyed_indexes.insert(index_id);
@@ -1201,6 +1244,10 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                     }
 
                     schema.schema_version += 1;
+                    // Clear dropped root pages now that the checkpoint has completed.
+                    // The btree pages for dropped tables have been freed, so integrity_check
+                    // no longer needs to track them.
+                    schema.dropped_root_pages.clear();
                     let _ = self.pager.io.block(|| {
                         self.pager.with_header_mut(|header| {
                             header.schema_cookie = schema.schema_version.into();

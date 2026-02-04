@@ -270,6 +270,11 @@ pub struct Schema {
 
     /// Track views that exist but have incompatible versions
     pub incompatible_views: HashSet<String>,
+
+    /// Root pages of tables/indexes that have been dropped but not yet checkpointed.
+    /// In MVCC mode, when a table is dropped, the btree pages are not freed until checkpoint.
+    /// integrity_check needs to know about these pages to avoid false positives about "page never used".
+    pub dropped_root_pages: HashSet<i64>,
 }
 
 impl Default for Schema {
@@ -314,6 +319,7 @@ impl Schema {
             analyze_stats: AnalyzeStats::default(),
             table_to_materialized_views,
             incompatible_views,
+            dropped_root_pages: HashSet::default(),
         }
     }
 
@@ -1562,6 +1568,7 @@ impl Clone for Schema {
             analyze_stats: self.analyze_stats.clone(),
             table_to_materialized_views: self.table_to_materialized_views.clone(),
             incompatible_views,
+            dropped_root_pages: self.dropped_root_pages.clone(),
         }
     }
 }

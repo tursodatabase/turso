@@ -1040,7 +1040,7 @@ impl Value {
             if text.len() >= prefix.len() && text.is_char_boundary(prefix.len()) {
                 return Ok(text[..prefix.len()].eq_ignore_ascii_case(prefix));
             }
-            // Fall through to regex if boundary check fails (multi-byte UTF-8)
+            // Fall through to pattern_compare if boundary check fails (multi-byte UTF-8)
         }
 
         // 3. Fast Path: '%abc' (Suffix)
@@ -1050,10 +1050,47 @@ impl Value {
             if text.len() >= suffix.len() && text.is_char_boundary(start) {
                 return Ok(text[start..].eq_ignore_ascii_case(suffix));
             }
-            // Fall through to regex if boundary check fails (multi-byte UTF-8)
+            // Fall through to pattern_compare if boundary check fails (multi-byte UTF-8)
         }
 
-        Ok(pattern_compare(pattern, text, escape) == CompareResult::Match)
+        Ok(pattern_compare(pattern, text, &LIKE_INFO, escape) == CompareResult::Match)
+    }
+
+    pub fn exec_glob(pattern: &str, text: &str) -> Result<bool, LimboError> {
+        const MAX_GLOB_PATTERN_LENGTH: usize = 50000;
+        const GLOB_CHARS: [char; 3] = ['*', '?', '['];
+
+        if pattern.len() > MAX_GLOB_PATTERN_LENGTH {
+            return Err(LimboError::Constraint(
+                "GLOB pattern too complex".to_string(),
+            ));
+        }
+
+        // 1. Exact match (no wildcards)
+        if !pattern.contains(GLOB_CHARS) {
+            return Ok(pattern == text);
+        }
+
+        // 2. Fast Path: 'abc*' (Prefix)
+        if pattern.ends_with('*') && !pattern[..pattern.len() - 1].contains(GLOB_CHARS) {
+            let prefix = &pattern[..pattern.len() - 1];
+            if text.len() >= prefix.len() && text.is_char_boundary(prefix.len()) {
+                return Ok(&text[..prefix.len()] == prefix);
+            }
+            // Fall through to pattern_compare if boundary check fails (multi-byte UTF-8)
+        }
+
+        // 3. Fast Path: '*abc' (Suffix)
+        if pattern.starts_with('*') && !pattern[1..].contains(GLOB_CHARS) {
+            let suffix = &pattern[1..];
+            let start = text.len().wrapping_sub(suffix.len());
+            if text.len() >= suffix.len() && text.is_char_boundary(start) {
+                return Ok(&text[start..] == suffix);
+            }
+            // Fall through to pattern_compare if boundary check fails (multi-byte UTF-8)
+        }
+
+        Ok(pattern_compare(pattern, text, &GLOB_INFO, None) == CompareResult::Match)
     }
 
     pub fn exec_min<'a, T: Iterator<Item = &'a Value>>(regs: T) -> Value {
@@ -1166,10 +1203,37 @@ enum CompareResult {
     NoWildcardMatch,
 }
 
-/// LIKE pattern matching based on SQLite's patternCompare algorithm (src/func.c).
+struct PatternInfo {
+    match_all: char,
+    match_one: char,
+    match_set: Option<char>,
+    no_case: bool,
+}
+
+const LIKE_INFO: PatternInfo = PatternInfo {
+    match_all: '%',
+    match_one: '_',
+    match_set: None,
+    no_case: true,
+};
+
+const GLOB_INFO: PatternInfo = PatternInfo {
+    match_all: '*',
+    match_one: '?',
+    match_set: Some('['),
+    no_case: false,
+};
+
+/// LIKE and GLOB pattern matching based on SQLite's patternCompare algorithm (src/func.c).
 /// Uses recursive descent with early termination via `NoWildcardMatch` to avoid
 /// exponential backtracking on patterns like `%a%a%a%...%b`.
-fn pattern_compare(pattern: &str, text: &str, escape: Option<char>) -> CompareResult {
+/// Ref: https://github.com/sqlite/sqlite/blob/master/src/func.c#L728
+fn pattern_compare(
+    pattern: &str,
+    text: &str,
+    info: &PatternInfo,
+    escape: Option<char>,
+) -> CompareResult {
     let mut p_indices = pattern.char_indices();
     let mut t_indices = text.char_indices();
 
@@ -1180,18 +1244,15 @@ fn pattern_compare(pattern: &str, text: &str, escape: Option<char>) -> CompareRe
     let mut wildcard_p_iter: Option<std::str::CharIndices> = None;
     let mut wildcard_t_iter: Option<std::str::CharIndices> = None;
 
-    let match_all = '%';
-    let match_one = '_';
-
     loop {
         match (p_curr, t_curr) {
             (Some((_, p_char)), Some((_, t_char))) => {
-                if p_char == match_all && Some(p_char) != escape {
-                    // Consume consecutive wildcards
+                if p_char == info.match_all && Some(p_char) != escape {
+                    // Consume consecutive match_alls
                     let mut next_p = p_indices.clone();
                     while let Some((_, c)) = next_p.clone().next() {
-                        if c == match_all && Some(c) != escape {
-                            next_p.next(); // Consume valid %
+                        if c == info.match_all && Some(c) != escape {
+                            next_p.next();
                         } else {
                             break;
                         }
@@ -1199,20 +1260,24 @@ fn pattern_compare(pattern: &str, text: &str, escape: Option<char>) -> CompareRe
 
                     let mut lookahead_p = next_p.clone();
                     if let Some((_, next_char)) = lookahead_p.next() {
-                        let is_wildcard = next_char == match_all || next_char == match_one;
-                        let is_escaped = Some(next_char) == escape;
+                        let is_wildcard = (next_char == info.match_all
+                            && Some(next_char) != escape)
+                            || (next_char == info.match_one && Some(next_char) != escape)
+                            || (info.match_set == Some(next_char));
 
-                        if !is_wildcard && !is_escaped {
+                        let is_escaped_next = Some(next_char) == escape;
+
+                        if !is_wildcard && !is_escaped_next {
                             let mut found = false;
 
-                            // Check the current text char
-                            if eq_ignore_ascii_case(next_char, t_char) {
+                            // Check current text char
+                            if compare_chars(next_char, t_char, info.no_case) {
                                 found = true;
                             } else {
-                                // Scan the rest of the text
+                                // Scan remaining text
                                 let lookahead_t = t_indices.clone();
                                 for (_, t_c) in lookahead_t {
-                                    if eq_ignore_ascii_case(next_char, t_c) {
+                                    if compare_chars(next_char, t_c, info.no_case) {
                                         found = true;
                                         break;
                                     }
@@ -1224,6 +1289,7 @@ fn pattern_compare(pattern: &str, text: &str, escape: Option<char>) -> CompareRe
                             }
                         }
                     }
+
                     p_indices = next_p;
                     wildcard_p_iter = Some(p_indices.clone());
                     p_curr = p_indices.next();
@@ -1236,35 +1302,103 @@ fn pattern_compare(pattern: &str, text: &str, escape: Option<char>) -> CompareRe
                     continue;
                 }
 
-                if p_char == match_one && Some(p_char) != escape {
+                if p_char == info.match_one && Some(p_char) != escape {
                     p_curr = p_indices.next();
                     t_curr = t_indices.next();
                     continue;
                 }
 
-                let (expected_char, next_p_iter) = if Some(p_char) == escape {
-                    if let Some((_, literal)) = p_indices.next() {
-                        (literal, p_indices.clone())
+                // Handle Set (GLOB only)
+                if info.match_set == Some(p_char) {
+                    let mut seen = false;
+                    let mut invert = false;
+                    let c = t_char;
+
+                    let mut next_c_opt = p_indices.next();
+
+                    if let Some((_, c2)) = next_c_opt {
+                        if c2 == '^' {
+                            invert = true;
+                            next_c_opt = p_indices.next();
+                        }
+                    }
+
+                    let mut c2_opt = next_c_opt;
+                    if let Some((_, c2)) = c2_opt {
+                        if c2 == ']' {
+                            if c == ']' {
+                                seen = true;
+                            }
+                            c2_opt = p_indices.next();
+                        }
+                    }
+
+                    let mut prior_c: Option<char> = None;
+
+                    while let Some((_, c2)) = c2_opt {
+                        if c2 == ']' {
+                            break;
+                        }
+
+                        let mut is_range = false;
+                        if c2 == '-' && prior_c.is_some() {
+                            let lookahead = p_indices.clone().next();
+                            if let Some((_, c3)) = lookahead {
+                                if c3 != ']' {
+                                    is_range = true;
+                                    let start = prior_c.unwrap();
+                                    let end = c3;
+                                    if c >= start && c <= end {
+                                        seen = true;
+                                    }
+                                    p_indices.next();
+                                    prior_c = None;
+                                }
+                            }
+                        }
+
+                        if !is_range {
+                            if c == c2 {
+                                seen = true;
+                            }
+                            prior_c = Some(c2);
+                        }
+
+                        c2_opt = p_indices.next();
+                    }
+
+                    if c2_opt.is_none() || !(seen ^ invert) {
+                        // Fallthrough to backtracking
                     } else {
-                        return CompareResult::NoMatch;
+                        p_curr = p_indices.next();
+                        t_curr = t_indices.next();
+                        continue;
                     }
                 } else {
-                    (p_char, p_indices.clone())
-                };
+                    let (expected_char, next_p_iter) = if Some(p_char) == escape {
+                        if let Some((_, literal)) = p_indices.next() {
+                            (literal, p_indices.clone())
+                        } else {
+                            return CompareResult::NoMatch;
+                        }
+                    } else {
+                        (p_char, p_indices.clone())
+                    };
 
-                if eq_ignore_ascii_case(expected_char, t_char) {
-                    p_indices = next_p_iter;
-                    p_curr = p_indices.next();
-                    t_curr = t_indices.next();
-                    continue;
+                    if compare_chars(expected_char, t_char, info.no_case) {
+                        p_indices = next_p_iter;
+                        p_curr = p_indices.next();
+                        t_curr = t_indices.next();
+                        continue;
+                    }
                 }
             }
             (None, None) => return CompareResult::Match,
-            (Some((_, p_char)), None) if p_char == match_all && Some(p_char) != escape => {
+            (Some((_, p_char)), None) if p_char == info.match_all && Some(p_char) != escape => {
                 let mut temp = p_indices.clone();
                 loop {
                     match temp.next() {
-                        Some((_, c)) if c == match_all && Some(c) != escape => continue,
+                        Some((_, c)) if c == info.match_all && Some(c) != escape => continue,
                         None => return CompareResult::Match,
                         _ => break,
                     }
@@ -1273,6 +1407,7 @@ fn pattern_compare(pattern: &str, text: &str, escape: Option<char>) -> CompareRe
             _ => {}
         }
 
+        // Backtracking
         if let (Some(wp), Some(wt)) = (wildcard_p_iter.clone(), wildcard_t_iter.clone()) {
             p_indices = wp;
             p_curr = p_indices.next();
@@ -1289,8 +1424,12 @@ fn pattern_compare(pattern: &str, text: &str, escape: Option<char>) -> CompareRe
     }
 }
 
-fn eq_ignore_ascii_case(a: char, b: char) -> bool {
-    a.eq_ignore_ascii_case(&b)
+fn compare_chars(p: char, t: char, no_case: bool) -> bool {
+    if no_case {
+        p.eq_ignore_ascii_case(&t)
+    } else {
+        p == t
+    }
 }
 
 #[cfg(test)]
@@ -2057,6 +2196,18 @@ mod tests {
         assert!(!Value::exec_like("abcXX", "abc5", Some('X')).unwrap());
         assert!(!Value::exec_like("abcXX", "abc", Some('X')).unwrap());
         assert!(!Value::exec_like("abcXX", "abcXX", Some('X')).unwrap());
+    }
+
+    #[test]
+    fn test_glob() {
+        assert!(Value::exec_glob(r#"?*/abc/?*"#, r#"x//a/ab/abc/y"#).unwrap());
+        assert!(Value::exec_glob(r#"a[1^]"#, r#"a1"#).unwrap());
+        assert!(Value::exec_glob(r#"a[1^]*"#, r#"a^"#).unwrap());
+        assert!(!Value::exec_glob(r#"a[a*"#, r#"a["#).unwrap());
+        assert!(!Value::exec_glob(r#"a[a"#, r#"a[a"#).unwrap());
+        assert!(Value::exec_glob(r#"a[[]"#, r#"a["#).unwrap());
+        assert!(Value::exec_glob(r#"abc[^][*?]efg"#, r#"abcdefg"#).unwrap());
+        assert!(!Value::exec_glob(r#"abc[^][*?]efg"#, r#"abc]efg"#).unwrap());
     }
 
     #[test]

@@ -1,0 +1,42 @@
+---
+source: setops.sqltest
+expression: "SELECT department FROM current_employees\n    EXCEPT\n    SELECT department FROM former_employees;"
+info:
+  statement_type: SELECT
+  tables:
+    - current_employees
+    - former_employees
+  setup_blocks:
+    - schema
+  database: ":memory:"
+---
+QUERY PLAN
+`--COMPOUND QUERY
+   |--LEFT-MOST SUBQUERY
+   |  `--SCAN current_employees USING COVERING INDEX idx_current_dept
+   `--EXCEPT USING TEMP B-TREE
+      `--SCAN former_employees USING COVERING INDEX idx_former_dept
+
+BYTECODE
+addr  opcode         p1  p2  p3  p4      p5  comment
+   0  Init            0  19   0           0  Start at 19
+   1  OpenEphemeral   0   0   0           0  cursor=0 is_table=false
+   2  OpenRead        1   5   0  k(2,B)   0  index=idx_current_dept, root=5, iDb=0
+   3  Rewind          1   8   0           0  Rewind index idx_current_dept
+   4    Column        1   0   1           0  r[1]=idx_current_dept.department
+   5    MakeRecord    1   1   2           0  r[2]=mkrec(r[1..1]); for compound_dedupe
+   6    IdxInsert     0   2   0           8  key=r[2]
+   7  Next            1   4   0           0
+   8  OpenRead        2   6   0  k(2,B)   0  index=idx_former_dept, root=6, iDb=0
+   9  Rewind          2  13   0           0  Rewind index idx_former_dept
+  10    Column        2   0   3           0  r[3]=idx_former_dept.department
+  11    IdxDelete     0   3   1           0
+  12  Next            2  10   0           0
+  13  Rewind          0  16   0           0  Rewind  compound_dedupe
+  14    Column        0   0   4           0  r[4]=compound_dedupe.department
+  15    ResultRow     4   1   0           0  output=r[4]
+  16  Next            0  14   0           0
+  17  Close           0   0   0           0
+  18  Halt            0   0   0           0
+  19  Transaction     0   1   6           0  iDb=0 tx_mode=Read
+  20  Goto            0   1   0           0

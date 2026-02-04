@@ -88,7 +88,7 @@ use crate::sync::{Mutex, RwLock};
 use turso_parser::ast::{self, ForeignKeyClause, Name, ResolveType};
 use turso_parser::parser::Parser;
 
-use super::{likeop::exec_glob, sorter::Sorter};
+use super::sorter::Sorter;
 
 #[cfg(feature = "json")]
 use crate::{
@@ -256,9 +256,17 @@ pub fn op_drop_index(
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(DropIndex { index, db: _ }, insn);
-    program
-        .connection
-        .with_schema_mut(|schema| schema.remove_index(index));
+    let conn = program.connection.clone();
+    let is_mvcc = conn.mv_store().is_some();
+    conn.with_schema_mut(|schema| {
+        // In MVCC mode, track dropped index root pages so integrity_check knows about them.
+        // The btree pages won't be freed until checkpoint, so integrity_check needs to
+        // include them to avoid "page never used" false positives.
+        if is_mvcc && index.root_page > 0 {
+            schema.dropped_root_pages.insert(index.root_page);
+        }
+        schema.remove_index(index);
+    });
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -2165,6 +2173,8 @@ pub fn op_transaction_inner(
 
                 // 2. Start transaction if needed
                 if let Some(mv_store) = mv_store.as_ref() {
+                    // MVCC reads must refresh WAL change counters to avoid stale page-cache reads.
+                    pager.mvcc_refresh_if_db_changed();
                     // In MVCC we don't have write exclusivity, therefore we just need to start a transaction if needed.
                     // Programs can run Transaction twice, first with read flag and then with write flag. So a single txid is enough
                     // for both.
@@ -4628,7 +4638,7 @@ pub fn op_function(
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
         Function {
-            constant_mask,
+            constant_mask: _,
             func,
             start_reg,
             dest,
@@ -4951,31 +4961,39 @@ pub fn op_function(
                 state.registers[*dest] = Register::Value(result);
             }
             ScalarFunc::Glob => {
-                let pattern = &state.registers[*start_reg];
-                let text = &state.registers[*start_reg + 1];
-                let result = match (pattern.get_value(), text.get_value()) {
-                    (Value::Null, _) | (_, Value::Null) => Value::Null,
-                    (Value::Text(pattern), Value::Text(text)) => {
-                        let cache = if *constant_mask > 0 {
-                            Some(&mut state.regex_cache.glob)
-                        } else {
-                            None
-                        };
-                        Value::Integer(exec_glob(cache, pattern.as_str(), text.as_str()) as i64)
-                    }
-                    // Convert any other value types to text for GLOB comparison
-                    (pattern_val, text_val) => {
-                        let pattern_str = pattern_val.to_string();
-                        let text_str = text_val.to_string();
-                        let cache = if *constant_mask > 0 {
-                            Some(&mut state.regex_cache.glob)
-                        } else {
-                            None
-                        };
-                        Value::Integer(exec_glob(cache, &pattern_str, &text_str) as i64)
-                    }
-                };
-                state.registers[*dest] = Register::Value(result);
+                if arg_count != 2 {
+                    return Err(LimboError::ParseError(
+                        "wrong number of arguments to function GLOB()".to_string(),
+                    ));
+                }
+                let pattern_reg = &state.registers[*start_reg];
+                let match_reg = &state.registers[*start_reg + 1];
+
+                let pattern_value = pattern_reg.get_value();
+                let match_value = match_reg.get_value();
+
+                if pattern_value == &Value::Null || match_value == &Value::Null {
+                    state.registers[*dest] = Register::Value(Value::Null);
+                } else {
+                    let pattern_cow = match pattern_value {
+                        Value::Text(s) => std::borrow::Cow::Borrowed(s.as_str()),
+                        v => match v.exec_cast("TEXT") {
+                            Value::Text(s) => std::borrow::Cow::Owned(s.to_string()),
+                            _ => unreachable!("Cast to TEXT should yield Text"),
+                        },
+                    };
+
+                    let match_cow = match match_value {
+                        Value::Text(s) => std::borrow::Cow::Borrowed(s.as_str()),
+                        v => match v.exec_cast("TEXT") {
+                            Value::Text(s) => std::borrow::Cow::Owned(s.to_string()),
+                            _ => unreachable!("Cast to TEXT should yield Text"),
+                        },
+                    };
+
+                    let matches = Value::exec_glob(&pattern_cow, &match_cow)?;
+                    state.registers[*dest] = Register::Value(Value::Integer(matches as i64));
+                }
             }
             ScalarFunc::IfNull => {}
             ScalarFunc::Iif => {}
@@ -7119,10 +7137,6 @@ fn new_rowid_inner(
     loop {
         match state.op_new_rowid_state {
             OpNewRowidState::Start => {
-                state.op_new_rowid_state = OpNewRowidState::SeekingToLast {
-                    mvcc_already_initialized: false,
-                };
-
                 if mv_store.is_some() {
                     let cursor = state.get_cursor(*cursor);
                     let cursor = cursor.as_btree_mut() as &mut dyn Any;
@@ -7170,7 +7184,14 @@ fn new_rowid_inner(
                             ephemeral_cursor.pager.wal.is_none(),
                             "MVCC is enabled but got a non-ephemeral BTreeCursor"
                         );
+                        state.op_new_rowid_state = OpNewRowidState::SeekingToLast {
+                            mvcc_already_initialized: false,
+                        };
                     }
+                } else {
+                    state.op_new_rowid_state = OpNewRowidState::SeekingToLast {
+                        mvcc_already_initialized: false,
+                    };
                 }
             }
 
@@ -7935,8 +7956,32 @@ pub fn op_drop_table(
         todo!("temp databases not implemented yet");
     }
     let conn = program.connection.clone();
+    let is_mvcc = conn.mv_store().is_some();
     {
         conn.with_schema_mut(|schema| {
+            // In MVCC mode, track dropped root pages so integrity_check knows about them.
+            // The btree pages won't be freed until checkpoint, so integrity_check needs
+            // to include them to avoid "page never used" false positives.
+            if is_mvcc {
+                let table = schema
+                    .get_table(table_name)
+                    .expect("DROP TABLE: table must exist in schema");
+                if let Some(btree) = table.btree() {
+                    // Only track positive root pages (checkpointed tables).
+                    // Negative root pages are non-checkpointed and don't exist in btree file.
+                    if btree.root_page > 0 {
+                        schema.dropped_root_pages.insert(btree.root_page);
+                    }
+                }
+                // Capture index root pages (table may not have indexes)
+                if let Some(indexes) = schema.indexes.get(table_name) {
+                    for index in indexes.iter() {
+                        if index.root_page > 0 {
+                            schema.dropped_root_pages.insert(index.root_page);
+                        }
+                    }
+                }
+            }
             schema.remove_indices_for_table(table_name);
             schema.remove_triggers_for_table(table_name);
             schema.remove_table(table_name);
