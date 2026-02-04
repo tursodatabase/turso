@@ -1,5 +1,5 @@
 use crate::sync::Arc;
-use turso_macros::{turso_assert, turso_assert_eq, turso_assert_ne};
+use turso_macros::{turso_assert_eq, turso_assert_ne};
 use turso_parser::{
     ast::{self, TableInternalId},
     parser::Parser,

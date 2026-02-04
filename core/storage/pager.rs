@@ -2129,10 +2129,7 @@ impl Pager {
         turso_assert_eq!(
             offset,
             page.get_contents().offset(),
-            "offset parameter {} doesn't match computed offset {} for page {}",
-            offset,
-            page.get_contents().offset(),
-            page.get().id
+            "offset doesn't match computed offset for page"
         );
         btree_init_page(&page, page_type, offset, self.usable_space());
         tracing::debug!(

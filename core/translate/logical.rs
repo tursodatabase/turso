@@ -15,7 +15,6 @@ use crate::{LimboError, Result};
 use rustc_hash::FxHashMap as HashMap;
 use std::fmt::{self, Display, Formatter};
 use turso_macros::match_ignore_ascii_case;
-use turso_macros::turso_assert;
 use turso_macros::turso_assert_ne;
 use turso_parser::ast;
 

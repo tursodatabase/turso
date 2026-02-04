@@ -1,6 +1,7 @@
 use std::fmt::Display;
 
 use anyhow::Context;
+use turso_macros::turso_assert_eq;
 use bitflags::bitflags;
 use indexmap::IndexSet;
 use serde::{Deserialize, Serialize};

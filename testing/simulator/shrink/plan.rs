@@ -1,5 +1,6 @@
 use indexmap::IndexSet;
 use sql_generation::model::query::alter_table::{AlterTable, AlterTableType};
+use turso_macros::turso_assert_eq;
 
 use crate::{
     SandboxedResult, SimulatorEnv,

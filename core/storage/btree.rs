@@ -6727,10 +6727,7 @@ pub fn btree_init_page(page: &PageRef, page_type: PageType, offset: usize, usabl
     turso_assert_eq!(
         offset,
         contents.offset(),
-        "offset parameter {} doesn't match computed offset {} for page {}",
-        offset,
-        contents.offset(),
-        page.get().id
+        "offset doesn't match computed offset for page"
     );
     let id = page_type as u8;
     contents.write_page_type(id);
