@@ -1024,14 +1024,20 @@ impl Database {
         }
         if !matches!(
             header_mut.text_encoding,
-            TextEncoding::Utf8 | TextEncoding::Utf16Le | TextEncoding::Utf16Be
+            TextEncoding::Unset
+                | TextEncoding::Utf8
+                | TextEncoding::Utf16Le
+                | TextEncoding::Utf16Be
         ) {
             return Err(LimboError::Corrupt(format!(
                 "Invalid text_encoding: {}",
                 header_mut.text_encoding
             )));
         }
-        if !matches!(header_mut.text_encoding, TextEncoding::Utf8) {
+        if !matches!(
+            header_mut.text_encoding,
+            TextEncoding::Unset | TextEncoding::Utf8
+        ) {
             return Err(LimboError::Corrupt(format!(
                 "Only utf8 text_encoding is supported by tursodb: got={}",
                 header_mut.text_encoding
