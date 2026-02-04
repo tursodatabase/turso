@@ -1016,7 +1016,8 @@ impl Database {
             )));
         }
         let schema_format = header_mut.schema_format.get();
-        if !(1..=4).contains(&schema_format) {
+        // If the database is completely empty, if it has no schema, then the schema format number can be zero.
+        if !(0..=4).contains(&schema_format) {
             return Err(LimboError::Corrupt(format!(
                 "Invalid schema_format: expected 1-4, got {schema_format}"
             )));
