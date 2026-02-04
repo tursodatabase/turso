@@ -186,8 +186,7 @@ class Database {
       while (true) {
         const stepResult = exec.stepSync();
         if (stepResult === STEP_IO) {
-          await this.db.ioLoopAsync();
-          await this.ioStep();
+          await this.io();
           continue;
         }
         if (stepResult === STEP_DONE) {
@@ -225,6 +224,13 @@ class Database {
    */
   async close() {
     this.db.close();
+  }
+
+  async io() {
+    // we do not spin this.db.ioLoopAsync() 
+    // because all IO we use in JS SDK (MemoryIO, PlatformIO) are synchronous 
+    // so this call will only degrade performance for no reason
+    await this.ioStep();
   }
 }
 
@@ -428,7 +434,7 @@ class Statement {
       while (true) {
         const stepResult = await stmt.stepSync();
         if (stepResult === STEP_IO) {
-          await this.db.ioLoopAsync();
+          await this.io();
           continue;
         }
         if (stepResult === STEP_DONE) {
@@ -479,7 +485,9 @@ class Statement {
   }
 
   async io() {
-    await this.db.ioLoopAsync();
+    // we do not spin this.db.ioLoopAsync() 
+    // because all IO we use in JS SDK (MemoryIO, PlatformIO) are synchronous 
+    // so this call will only degrade performance for no reason
     await this.ioStep();
   }
 
