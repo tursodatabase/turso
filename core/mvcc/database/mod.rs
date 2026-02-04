@@ -3114,12 +3114,15 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         let row_versions = row_versions.value();
         let row_versions = row_versions.write();
         let conflict = row_versions.iter().rev().any(|version| {
-            // Check if there is another version with same rowid visible or there is another version with same rowid being inserted
+            // Check if there is another version with same rowid visible or there is another version with same rowid being inserted by a different transaction
             version.is_visible_to(tx, &self.txs)
-                || version
-                    .begin
-                    .as_ref()
-                    .is_some_and(|version| matches!(version, TxTimestampOrID::TxID(_)))
+                || version.begin.as_ref().is_some_and(|v| {
+                    if let TxTimestampOrID::TxID(other_tx_id) = v {
+                        *other_tx_id != tx.tx_id
+                    } else {
+                        false
+                    }
+                })
         });
         if conflict {
             Err(LimboError::WriteWriteConflict)
