@@ -14,7 +14,9 @@ use crate::{
 
 use crate::File;
 
-pub const DEFAULT_LOG_CHECKPOINT_THRESHOLD: i64 = -1; // Disabled by default
+/// Logical log size in bytes at which a committing transaction will trigger a checkpoint.
+/// Default to the size of 1000 SQLite WAL frames; disable by setting a negative value.
+pub const DEFAULT_LOG_CHECKPOINT_THRESHOLD: i64 = 4120 * 1000;
 
 pub struct LogicalLog {
     pub file: Arc<dyn File>,
