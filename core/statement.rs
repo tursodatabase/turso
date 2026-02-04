@@ -7,6 +7,7 @@ use std::{
 };
 
 use tracing::{instrument, Level};
+use turso_macros::turso_assert_eq;
 use turso_parser::{
     ast::{fmt::ToTokens, Cmd},
     parser::Parser,
@@ -291,7 +292,8 @@ impl Statement {
 
             let syms = conn.syms.read();
             let mode = self.query_mode;
-            debug_assert_eq!(QueryMode::new(&cmd), mode,);
+            #[cfg(debug_assertions)]
+            turso_assert_eq!(QueryMode::new(&cmd), mode);
             let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt)) = cmd;
             translate::translate(
                 conn.schema.read().deref(),

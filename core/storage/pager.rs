@@ -2125,7 +2125,8 @@ impl Pager {
         _alloc_mode: BtreePageAllocMode,
     ) -> Result<IOResult<PageRef>> {
         let page = return_if_io!(self.allocate_page());
-        debug_assert_eq!(
+        #[cfg(debug_assertions)]
+        turso_assert_eq!(
             offset,
             page.get_contents().offset(),
             "offset parameter {} doesn't match computed offset {} for page {}",

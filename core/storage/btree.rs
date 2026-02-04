@@ -3795,7 +3795,8 @@ impl BTreeCursor {
                         } else {
                             0
                         };
-                        debug_assert_eq!(parent_offset, parent_contents.offset());
+                        #[cfg(debug_assertions)]
+                        turso_assert_eq!(parent_offset, parent_contents.offset());
 
                         // From SQLite:
                         // It is critical that the child page be defragmented before being
@@ -4368,7 +4369,8 @@ impl BTreeCursor {
 
         let is_page_1 = root.get().id == 1;
         let offset = if is_page_1 { DatabaseHeader::SIZE } else { 0 };
-        debug_assert_eq!(offset, root_contents.offset());
+        #[cfg(debug_assertions)]
+        turso_assert_eq!(offset, root_contents.offset());
 
         tracing::debug!(
             "balance_root(root={}, rightmost={}, page_type={:?})",
@@ -6721,7 +6723,8 @@ pub fn btree_init_page(page: &PageRef, page_type: PageType, offset: usize, usabl
         offset,
         usable_space
     );
-    debug_assert_eq!(
+    #[cfg(debug_assertions)]
+    turso_assert_eq!(
         offset,
         contents.offset(),
         "offset parameter {} doesn't match computed offset {} for page {}",

@@ -92,7 +92,7 @@ use std::{
     task::Waker,
 };
 use tracing::{instrument, Level};
-use turso_macros::{turso_assert, turso_assert_ne, turso_debug_assert};
+use turso_macros::{turso_assert, turso_assert_eq, turso_assert_ne, turso_debug_assert};
 
 /// State machine for committing view deltas with I/O handling
 #[derive(Debug, Clone)]
@@ -1105,8 +1105,8 @@ impl Program {
         state: &mut ProgramState,
         pager: Arc<Pager>,
     ) -> Result<StepResult> {
-        //TODO replace with debug_assert_eq
-        turso_debug_assert!(state.column_count() == EXPLAIN_QUERY_PLAN_COLUMNS.len());
+        #[cfg(debug_assertions)]
+        turso_assert_eq!(state.column_count(), EXPLAIN_QUERY_PLAN_COLUMNS.len());
         loop {
             if self.connection.is_closed() {
                 // Connection is closed for whatever reason, rollback the transaction.

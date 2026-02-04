@@ -1674,7 +1674,8 @@ impl HashTable {
         if let Some(spill_state) = self.spill_state.as_ref() {
             let partition_idx = self.current_spill_partition_idx;
             // sanity check to ensure we cached the correct position
-            debug_assert_eq!(partition_idx, partition_from_hash(hash));
+            #[cfg(debug_assertions)]
+            turso_assert_eq!(partition_idx, partition_from_hash(hash));
             let partition = spill_state.find_partition(partition_idx)?;
             if partition.buckets.is_empty() {
                 return None;

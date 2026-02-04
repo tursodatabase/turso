@@ -659,7 +659,8 @@ impl Shadow for Update {
                                     then_value,
                                     else_column,
                                 } => {
-                                    debug_assert_eq!(else_column, column);
+                                    #[cfg(debug_assertions)]
+                                    turso_assert_eq!(else_column, column);
                                     if condition.test(old_row, &t2) {
                                         new_row[idx] = then_value.clone();
                                     }

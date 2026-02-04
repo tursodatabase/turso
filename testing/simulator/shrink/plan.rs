@@ -265,7 +265,8 @@ impl InteractionPlan {
             }
         }
 
-        debug_assert_eq!(self.len(), retain_map.len());
+        #[cfg(debug_assertions)]
+        turso_assert_eq!(self.len(), retain_map.len());
 
         let mut idx = 0;
         // Remove all properties that do not use the failing tables
