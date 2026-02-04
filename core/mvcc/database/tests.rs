@@ -2650,3 +2650,30 @@ fn test_checkpoint_root_page_mismatch_with_index() {
 
     println!("Test passed - row found correctly after checkpoint");
 }
+
+#[test]
+fn test_checkpoint_drop_table() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, data TEXT)")
+        .unwrap();
+    conn.execute("CREATE INDEX idx_t_data ON t(data)").unwrap();
+
+    // Insert data to force page allocation
+    for i in 0..10 {
+        let data = format!("data_{i}");
+        conn.execute(format!("INSERT INTO t VALUES ({i}, '{data}')",))
+            .unwrap();
+    }
+    conn.execute("DROP TABLE t").unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    drop(conn);
+
+    db.restart();
+
+    let conn = db.connect();
+    let rows = get_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(&rows[0][0].to_string(), "ok");
+}
