@@ -118,6 +118,15 @@ impl TursoSyncServer {
         info!("Request: {} {}", method, path);
 
         let response = match (method.as_str(), path.as_str()) {
+            ("OPTIONS", _) => {
+                // necessary for WASM browser tests
+                debug!("Handling CORS preflight request");
+                Ok(HttpResponse {
+                    status: 204,
+                    content_type: "text/plain".to_string(),
+                    body: vec![],
+                })
+            }
             ("POST", "/v2/pipeline") => {
                 debug!("Handling /v2/pipeline request");
                 self.handle_pipeline(&body)
@@ -602,13 +611,22 @@ fn parse_http_request(data: &[u8]) -> Result<(String, String, Vec<u8>)> {
 fn format_http_response(resp: &HttpResponse) -> Vec<u8> {
     let status_text = match resp.status {
         200 => "OK",
+        204 => "No Content",
         404 => "Not Found",
         500 => "Internal Server Error",
         _ => "Unknown",
     };
 
+    // necessary for WASM browser tests
     let header = format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {} {}\r\n\
+         Content-Type: {}\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\
+         Access-Control-Allow-Origin: *\r\n\
+         Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n\
+         Access-Control-Allow-Headers: Content-Type\r\n\
+         \r\n",
         resp.status,
         status_text,
         resp.content_type,
