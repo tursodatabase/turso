@@ -1,0 +1,443 @@
+//! Expression generation.
+
+use crate::SqlGen;
+use crate::ast::{BinOp, Expr, Literal, UnaryOp};
+use crate::capabilities::Capabilities;
+use crate::context::Context;
+use crate::error::GenError;
+use crate::generate::literal::generate_literal;
+use crate::schema::{DataType, Table};
+use crate::trace::Origin;
+
+/// Generate an expression.
+pub fn generate_expr<C: Capabilities>(
+    generator: &SqlGen<C>,
+    ctx: &mut Context,
+    table: &Table,
+    depth: usize,
+) -> Result<Expr, GenError> {
+    // Check depth limit
+    if depth >= generator.policy().max_expr_depth {
+        // At max depth, only generate simple expressions
+        return generate_simple_expr(generator, ctx, table);
+    }
+
+    let weights = &generator.policy().expr_weights;
+
+    // Build candidates with weights
+    let mut candidates: Vec<(ExprType, u32)> = vec![
+        (ExprType::ColumnRef, weights.column_ref),
+        (ExprType::Literal, weights.literal),
+    ];
+
+    // Add complex expressions if we have depth budget
+    if depth < generator.policy().max_expr_depth {
+        candidates.push((ExprType::BinaryOp, weights.binary_op));
+        candidates.push((ExprType::UnaryOp, weights.unary_op));
+        candidates.push((ExprType::IsNull, weights.is_null));
+        candidates.push((ExprType::Between, weights.between));
+        candidates.push((ExprType::InList, weights.in_list));
+
+        if weights.case_expr > 0 {
+            candidates.push((ExprType::CaseExpr, weights.case_expr));
+        }
+
+        if weights.cast > 0 {
+            candidates.push((ExprType::Cast, weights.cast));
+        }
+
+        // Subqueries require capability and depth budget
+        if C::SUBQUERY
+            && weights.subquery > 0
+            && ctx.subquery_depth() < generator.policy().max_subquery_depth
+        {
+            candidates.push((ExprType::Subquery, weights.subquery));
+        }
+    }
+
+    let expr_type = generator
+        .policy()
+        .select_weighted(ctx, &candidates)
+        .map_err(|e| e.with_context("generating expression"))?;
+
+    match expr_type {
+        ExprType::ColumnRef => generate_column_ref(ctx, table),
+        ExprType::Literal => generate_literal_expr(generator, ctx, table),
+        ExprType::BinaryOp => generate_binary_op(generator, ctx, table, depth),
+        ExprType::UnaryOp => generate_unary_op(generator, ctx, table, depth),
+        ExprType::IsNull => generate_is_null(generator, ctx, table, depth),
+        ExprType::Between => generate_between(generator, ctx, table, depth),
+        ExprType::InList => generate_in_list(generator, ctx, table, depth),
+        ExprType::CaseExpr => generate_case(generator, ctx, table, depth),
+        ExprType::Cast => generate_cast(generator, ctx, table, depth),
+        ExprType::Subquery => generate_subquery_expr(generator, ctx),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ExprType {
+    ColumnRef,
+    Literal,
+    BinaryOp,
+    UnaryOp,
+    IsNull,
+    Between,
+    InList,
+    CaseExpr,
+    Cast,
+    Subquery,
+}
+
+/// Generate a simple expression (column ref or literal).
+fn generate_simple_expr<C: Capabilities>(
+    generator: &SqlGen<C>,
+    ctx: &mut Context,
+    table: &Table,
+) -> Result<Expr, GenError> {
+    if ctx.gen_bool() && !table.columns.is_empty() {
+        generate_column_ref(ctx, table)
+    } else {
+        generate_literal_expr(generator, ctx, table)
+    }
+}
+
+/// Generate a column reference.
+fn generate_column_ref(ctx: &mut Context, table: &Table) -> Result<Expr, GenError> {
+    let cols: Vec<_> = table.filterable_columns().collect();
+    if cols.is_empty() {
+        return Err(GenError::exhausted("column_ref", "no filterable columns"));
+    }
+
+    let col = ctx.choose(&cols).unwrap();
+    Ok(Expr::column_ref(ctx, None, col.name.clone()))
+}
+
+/// Generate a literal expression.
+fn generate_literal_expr<C: Capabilities>(
+    generator: &SqlGen<C>,
+    ctx: &mut Context,
+    table: &Table,
+) -> Result<Expr, GenError> {
+    // Pick a random data type from the table's columns, or default to Integer
+    let data_type = if !table.columns.is_empty() {
+        let col = ctx.choose(&table.columns).unwrap();
+        col.data_type
+    } else {
+        DataType::Integer
+    };
+
+    let lit = generate_literal(ctx, data_type, generator.policy());
+    Ok(Expr::literal(ctx, lit))
+}
+
+/// Generate a binary operation.
+fn generate_binary_op<C: Capabilities>(
+    generator: &SqlGen<C>,
+    ctx: &mut Context,
+    table: &Table,
+    depth: usize,
+) -> Result<Expr, GenError> {
+    // Pick operator type
+    let op_type = if ctx.gen_bool() {
+        OpType::Comparison
+    } else if ctx.gen_bool() {
+        OpType::Logical
+    } else {
+        OpType::Arithmetic
+    };
+
+    let ops = match op_type {
+        OpType::Comparison => BinOp::comparison(),
+        OpType::Logical => BinOp::logical(),
+        OpType::Arithmetic => BinOp::arithmetic(),
+    };
+
+    let op = *ctx
+        .choose(ops)
+        .ok_or_else(|| GenError::exhausted("binary_op", "no operators available"))?;
+
+    ctx.enter_scope(Origin::BinaryOpLeft);
+    let left = generate_expr(generator, ctx, table, depth + 1)?;
+    ctx.exit_scope();
+
+    ctx.enter_scope(Origin::BinaryOpRight);
+    let right = generate_expr(generator, ctx, table, depth + 1)?;
+    ctx.exit_scope();
+
+    Ok(Expr::binary_op(ctx, left, op, right))
+}
+
+enum OpType {
+    Comparison,
+    Logical,
+    Arithmetic,
+}
+
+/// Generate a unary operation.
+fn generate_unary_op<C: Capabilities>(
+    generator: &SqlGen<C>,
+    ctx: &mut Context,
+    table: &Table,
+    depth: usize,
+) -> Result<Expr, GenError> {
+    let ops = [UnaryOp::Neg, UnaryOp::Not, UnaryOp::BitNot];
+    let op = *ctx.choose(&ops).unwrap();
+
+    let operand = generate_expr(generator, ctx, table, depth + 1)?;
+    Ok(Expr::unary_op(ctx, op, operand))
+}
+
+/// Generate an IS NULL / IS NOT NULL expression.
+fn generate_is_null<C: Capabilities>(
+    generator: &SqlGen<C>,
+    ctx: &mut Context,
+    table: &Table,
+    depth: usize,
+) -> Result<Expr, GenError> {
+    let negated = ctx.gen_bool();
+    let expr = generate_expr(generator, ctx, table, depth + 1)?;
+    Ok(Expr::is_null(ctx, expr, negated))
+}
+
+/// Generate a BETWEEN expression.
+fn generate_between<C: Capabilities>(
+    generator: &SqlGen<C>,
+    ctx: &mut Context,
+    table: &Table,
+    depth: usize,
+) -> Result<Expr, GenError> {
+    let negated = ctx.gen_bool();
+    let expr = generate_expr(generator, ctx, table, depth + 1)?;
+    let low = generate_expr(generator, ctx, table, depth + 1)?;
+    let high = generate_expr(generator, ctx, table, depth + 1)?;
+    Ok(Expr::between(ctx, expr, low, high, negated))
+}
+
+/// Generate an IN list expression.
+fn generate_in_list<C: Capabilities>(
+    generator: &SqlGen<C>,
+    ctx: &mut Context,
+    table: &Table,
+    depth: usize,
+) -> Result<Expr, GenError> {
+    let negated = ctx.gen_bool();
+    let expr = generate_expr(generator, ctx, table, depth + 1)?;
+
+    let list_size = ctx.gen_range_inclusive(1, generator.policy().max_in_list_size.min(5));
+    let mut list = Vec::with_capacity(list_size);
+    for _ in 0..list_size {
+        list.push(generate_simple_expr(generator, ctx, table)?);
+    }
+
+    Ok(Expr::in_list(ctx, expr, list, negated))
+}
+
+/// Generate a CASE expression.
+fn generate_case<C: Capabilities>(
+    generator: &SqlGen<C>,
+    ctx: &mut Context,
+    table: &Table,
+    depth: usize,
+) -> Result<Expr, GenError> {
+    let num_when = ctx.gen_range_inclusive(1, 3);
+    let mut when_clauses = Vec::with_capacity(num_when);
+
+    for _ in 0..num_when {
+        ctx.enter_scope(Origin::CaseWhen);
+        let when_expr = generate_expr(generator, ctx, table, depth + 1)?;
+        ctx.exit_scope();
+
+        ctx.enter_scope(Origin::CaseThen);
+        let then_expr = generate_expr(generator, ctx, table, depth + 1)?;
+        ctx.exit_scope();
+
+        when_clauses.push((when_expr, then_expr));
+    }
+
+    let else_clause = if ctx.gen_bool() {
+        ctx.enter_scope(Origin::CaseElse);
+        let expr = generate_expr(generator, ctx, table, depth + 1)?;
+        ctx.exit_scope();
+        Some(expr)
+    } else {
+        None
+    };
+
+    Ok(Expr::case_expr(ctx, None, when_clauses, else_clause))
+}
+
+/// Generate a CAST expression.
+fn generate_cast<C: Capabilities>(
+    generator: &SqlGen<C>,
+    ctx: &mut Context,
+    table: &Table,
+    depth: usize,
+) -> Result<Expr, GenError> {
+    let types = [DataType::Integer, DataType::Real, DataType::Text];
+    let target_type = *ctx.choose(&types).unwrap();
+
+    let expr = generate_expr(generator, ctx, table, depth + 1)?;
+    Ok(Expr::cast(ctx, expr, target_type))
+}
+
+/// Generate a subquery expression.
+fn generate_subquery_expr<C: Capabilities>(
+    generator: &SqlGen<C>,
+    ctx: &mut Context,
+) -> Result<Expr, GenError> {
+    ctx.enter_scope(Origin::Subquery);
+
+    // Pick a random table
+    let table = ctx
+        .choose(&generator.schema().tables)
+        .ok_or_else(|| GenError::schema_empty("tables"))?;
+
+    // Generate a simple single-column SELECT
+    let result = crate::generate::select::generate_simple_select(generator, ctx, table);
+    ctx.exit_scope();
+
+    let select = result?;
+    Ok(Expr::subquery(ctx, select))
+}
+
+/// Generate a WHERE clause condition.
+pub fn generate_condition<C: Capabilities>(
+    generator: &SqlGen<C>,
+    ctx: &mut Context,
+    table: &Table,
+) -> Result<Expr, GenError> {
+    ctx.enter_scope(Origin::Where);
+
+    // For WHERE, prefer comparison expressions
+    let weights = &generator.policy().expr_weights;
+
+    let mut candidates = vec![
+        (CondType::Comparison, weights.column_ref + weights.literal),
+        (CondType::IsNull, weights.is_null),
+        (CondType::Between, weights.between),
+        (CondType::InList, weights.in_list),
+    ];
+
+    // Compound conditions with AND/OR
+    if ctx.depth() < 3 {
+        candidates.push((CondType::Compound, weights.binary_op));
+    }
+
+    let cond_type = generator.policy().select_weighted(ctx, &candidates)?;
+
+    let result = match cond_type {
+        CondType::Comparison => generate_comparison(generator, ctx, table),
+        CondType::IsNull => generate_is_null(generator, ctx, table, 0),
+        CondType::Between => generate_between(generator, ctx, table, 0),
+        CondType::InList => generate_in_list(generator, ctx, table, 0),
+        CondType::Compound => generate_compound_condition(generator, ctx, table),
+    };
+
+    ctx.exit_scope();
+    result
+}
+
+#[derive(Clone, Copy)]
+enum CondType {
+    Comparison,
+    IsNull,
+    Between,
+    InList,
+    Compound,
+}
+
+/// Generate a simple comparison (column op value).
+fn generate_comparison<C: Capabilities>(
+    generator: &SqlGen<C>,
+    ctx: &mut Context,
+    table: &Table,
+) -> Result<Expr, GenError> {
+    let cols: Vec<_> = table.filterable_columns().collect();
+    if cols.is_empty() {
+        // Fall back to a tautology - create literals before binary_op to avoid borrow issues
+        let left = Expr::literal(ctx, Literal::Integer(1));
+        let right = Expr::literal(ctx, Literal::Integer(1));
+        return Ok(Expr::binary_op(ctx, left, BinOp::Eq, right));
+    }
+
+    let col = ctx.choose(&cols).unwrap();
+    let op = *ctx.choose(BinOp::comparison()).unwrap();
+
+    let left = Expr::column_ref(ctx, None, col.name.clone());
+    let lit = generate_literal(ctx, col.data_type, generator.policy());
+    let right = Expr::literal(ctx, lit);
+
+    Ok(Expr::binary_op(ctx, left, op, right))
+}
+
+/// Generate a compound condition (AND/OR).
+fn generate_compound_condition<C: Capabilities>(
+    generator: &SqlGen<C>,
+    ctx: &mut Context,
+    table: &Table,
+) -> Result<Expr, GenError> {
+    let op = if ctx.gen_bool() {
+        BinOp::And
+    } else {
+        BinOp::Or
+    };
+
+    let left = generate_comparison(generator, ctx, table)?;
+    let right = generate_comparison(generator, ctx, table)?;
+
+    Ok(Expr::binary_op(ctx, left, op, right))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Full;
+    use crate::policy::Policy;
+    use crate::schema::{ColumnDef, SchemaBuilder, Table};
+
+    fn test_generator() -> SqlGen<Full> {
+        let schema = SchemaBuilder::new()
+            .table(Table::new(
+                "users",
+                vec![
+                    ColumnDef::new("id", DataType::Integer).primary_key(),
+                    ColumnDef::new("name", DataType::Text),
+                    ColumnDef::new("age", DataType::Integer),
+                ],
+            ))
+            .build();
+
+        SqlGen::new(schema, Policy::default())
+    }
+
+    #[test]
+    fn test_generate_expr() {
+        let generator = test_generator();
+        let table = &generator.schema().tables[0];
+        let mut ctx = Context::new_with_seed(42);
+
+        let expr = generate_expr(&generator, &mut ctx, table, 0);
+        assert!(expr.is_ok());
+    }
+
+    #[test]
+    fn test_generate_condition() {
+        let generator = test_generator();
+        let table = &generator.schema().tables[0];
+        let mut ctx = Context::new_with_seed(42);
+
+        let cond = generate_condition(&generator, &mut ctx, table);
+        assert!(cond.is_ok());
+    }
+
+    #[test]
+    fn test_depth_limiting() {
+        let generator = test_generator();
+        let table = &generator.schema().tables[0];
+        let mut ctx = Context::new_with_seed(42);
+
+        // At max depth, should only generate simple expressions
+        let expr = generate_expr(&generator, &mut ctx, table, 10);
+        assert!(expr.is_ok());
+    }
+}

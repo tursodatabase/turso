@@ -1,0 +1,21 @@
+[package]
+name = "sql_gen"
+version.workspace = true
+authors.workspace = true
+edition = "2024"
+license.workspace = true
+repository.workspace = true
+description = "SQL generator with type-state capabilities, runtime policy, and invisible tracing"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+proptest = "1.9"
+rand = { workspace = true }
+
+[dev-dependencies]
+proptest = "1.9"
+
+[lints]
+workspace = true
