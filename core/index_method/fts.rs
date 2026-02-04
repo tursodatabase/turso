@@ -805,8 +805,10 @@ impl HybridBTreeDirectory {
             }
 
             // Cache and collect the chunk
-            let cache_key = (path.to_path_buf(), expected_chunk_no as i64);
-            self.chunk_cache.put(cache_key, bytes.clone());
+            if can_cache_chunks(path) {
+                let cache_key = (path.to_path_buf(), expected_chunk_no as i64);
+                self.chunk_cache.put(cache_key, bytes.clone());
+            }
             chunks.push(bytes);
 
             // Advance cursor to next record (unless this is the last chunk we need)
@@ -1108,8 +1110,10 @@ impl Directory for HybridBTreeDirectory {
             let mut catalog = self.catalog.write();
             catalog.remove(path);
         }
-        // Invalidate chunk cache
-        self.chunk_cache.invalidate(path);
+        if can_cache_chunks(path) {
+            // Invalidate chunk cache
+            self.chunk_cache.invalidate(path);
+        }
         // Queue for BTree deletion
         {
             let mut pending = self.pending_deletes.write();
@@ -1607,6 +1611,16 @@ const FTS_PATTERN_COMBINED: i64 = 4;
 const FTS_PATTERN_MATCH_LIMIT: i64 = 5;
 const FTS_PATTERN_MATCH: i64 = 6;
 const TANTIVY_META_FILE: &str = "meta.json";
+const TANTIVY_META_LOCK_FILE: &str = ".tantivy-meta.lock";
+
+/// Check if a file's chunks should be cached.
+///
+/// The meta lock file is excluded because Tantivy calls `open_write` on it for every search query.
+/// Since `open_write` calls `delete` first, caching the lock file would trigger a full chunk cache
+/// scan on every query, causing significant overhead.
+fn can_cache_chunks(path: &Path) -> bool {
+    path.as_str() != Ok(TANTIVY_META_LOCK_FILE)
+}
 
 /// State machine for FTS cursor async operations
 #[derive(Debug)]
