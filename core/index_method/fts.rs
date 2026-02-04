@@ -1619,7 +1619,7 @@ const TANTIVY_META_LOCK_FILE: &str = ".tantivy-meta.lock";
 /// Since `open_write` calls `delete` first, caching the lock file would trigger a full chunk cache
 /// scan on every query, causing significant overhead.
 fn can_cache_chunks(path: &Path) -> bool {
-    path.as_str() != Ok(TANTIVY_META_LOCK_FILE)
+    path.as_os_str().to_str() != Some(TANTIVY_META_LOCK_FILE)
 }
 
 /// State machine for FTS cursor async operations
