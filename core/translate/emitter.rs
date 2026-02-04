@@ -3009,6 +3009,9 @@ fn emit_update_insns<'a>(
     // constraint violations BEFORE deleting any old index entries. This ensures that:
     // - IGNORE: We can skip the row without corrupting it by partially deleting index entries
     // - FAIL/ROLLBACK: We can halt without partial state (index deleted but not re-inserted)
+    // Note: ABORT is not included because the NotExists instruction used for rowid conflict
+    // checking repositions the table cursor, which would corrupt subsequent Column reads.
+    // ABORT halts the entire operation anyway, so preflight checking isn't strictly needed.
     if matches!(
         or_conflict,
         ResolveType::Ignore | ResolveType::Fail | ResolveType::Rollback
@@ -3302,6 +3305,28 @@ fn emit_update_insns<'a>(
             extra_amount: 0,
         });
 
+        // Apply affinity BEFORE MakeRecord so the index record has correctly converted values.
+        // This is needed for all indexes (not just unique) because the index should store
+        // values with proper affinity conversion.
+        let aff = index
+            .columns
+            .iter()
+            .map(|ic| {
+                if ic.expr.is_some() {
+                    Affinity::Blob.aff_mask()
+                } else {
+                    target_table.table.columns()[ic.pos_in_table]
+                        .affinity()
+                        .aff_mask()
+                }
+            })
+            .collect::<String>();
+        program.emit_insn(Insn::Affinity {
+            start_reg: idx_start_reg,
+            count: NonZeroUsize::new(num_cols).expect("nonzero col count"),
+            affinities: aff,
+        });
+
         program.emit_insn(Insn::MakeRecord {
             start_reg: to_u16(idx_start_reg),
             count: to_u16(num_cols + 1),
@@ -3312,24 +3337,6 @@ fn emit_update_insns<'a>(
 
         // Handle unique constraint
         if index.unique {
-            let aff = index
-                .columns
-                .iter()
-                .map(|ic| {
-                    if ic.expr.is_some() {
-                        Affinity::Blob.aff_mask()
-                    } else {
-                        target_table.table.columns()[ic.pos_in_table]
-                            .affinity()
-                            .aff_mask()
-                    }
-                })
-                .collect::<String>();
-            program.emit_insn(Insn::Affinity {
-                start_reg: idx_start_reg,
-                count: NonZeroUsize::new(num_cols).expect("nonzero col count"),
-                affinities: aff,
-            });
             let constraint_check = program.allocate_label();
             // check if the record already exists in the index for unique indexes and abort if so
             program.emit_insn(Insn::NoConflict {
