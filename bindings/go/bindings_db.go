@@ -22,6 +22,11 @@ var (
 	ErrTursoCorrupt      = errors.New("turso: database is corrupt")
 )
 
+// DefaultBusyTimeout is the default busy timeout in milliseconds (5 seconds).
+// This matches common SQLite production recommendations. Set _busy_timeout=-1
+// in the DSN to disable the busy handler completely.
+const DefaultBusyTimeout = 5000
+
 // define all necessary constants first
 type TursoStatusCode int32
 
