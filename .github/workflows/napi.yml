@@ -233,6 +233,109 @@ jobs:
         shell: bash
       - name: Test bindings
         run: yarn workspace @tursodatabase/database-wasm test
+  test-sync-linux-x64-gnu-binding:
+    name: Test Sync bindings on Linux-x64-gnu - node@${{ matrix.node }}
+    timeout-minutes: 30
+    needs:
+      - build
+    strategy:
+      fail-fast: false
+      matrix:
+        node:
+          - "20"
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup node
+        uses: useblacksmith/setup-node@v5
+        with:
+          node-version: ${{ matrix.node }}
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: x86_64-unknown-linux-gnu-cargo-blacksmith-4vcpu-ubuntu-2404-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            x86_64-unknown-linux-gnu-cargo-blacksmith-4vcpu-ubuntu-2404-
+      - name: Build tursodb
+        run: cargo build --bin tursodb
+        working-directory: ${{ github.workspace }}
+      - name: Install dependencies
+        run: yarn install
+      - name: Build common packages
+        run: |
+          yarn workspace @tursodatabase/database-common build
+          yarn workspace @tursodatabase/sync-common build
+      - name: Download all sync artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: bindings/javascript
+          merge-multiple: true
+          pattern: 'sync*'
+      - name: List packages
+        run: ls -R .
+        shell: bash
+      - name: Test bindings
+        run: yarn workspace @tursodatabase/sync test
+  test-sync-wasm-binding:
+    name: Test Sync bindings on browser@${{ matrix.node }}
+    timeout-minutes: 30
+    needs:
+      - build
+    strategy:
+      fail-fast: false
+      matrix:
+        node:
+          - "20"
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup node
+        uses: useblacksmith/setup-node@v5
+        with:
+          node-version: ${{ matrix.node }}
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: x86_64-unknown-linux-gnu-cargo-blacksmith-4vcpu-ubuntu-2404-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            x86_64-unknown-linux-gnu-cargo-blacksmith-4vcpu-ubuntu-2404-
+      - name: Build tursodb
+        run: cargo build --bin tursodb
+        working-directory: ${{ github.workspace }}
+      - name: Install dependencies
+        run: yarn install
+      - name: Build common packages
+        run: |
+          yarn workspace @tursodatabase/database-common build
+          yarn workspace @tursodatabase/database-wasm-common build
+          yarn workspace @tursodatabase/sync-common build
+      - name: Install playwright with deps
+        run: yarn workspace @tursodatabase/sync-wasm playwright install --with-deps
+      - name: Download all sync artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: bindings/javascript
+          merge-multiple: true
+          pattern: 'sync*'
+      - name: List packages
+        run: ls -R .
+        shell: bash
+      - name: Test bindings
+        run: yarn workspace @tursodatabase/sync-wasm test
   publish:
     name: Publish
     runs-on: ubuntu-latest
@@ -243,6 +346,8 @@ jobs:
     needs:
       - test-db-linux-x64-gnu-binding
       - test-db-wasm-binding
+      - test-sync-linux-x64-gnu-binding
+      - test-sync-wasm-binding
     steps:
       - uses: actions/checkout@v4
       - name: Setup node
