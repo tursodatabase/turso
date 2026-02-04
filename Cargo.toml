@@ -37,7 +37,8 @@ members = [
     "tools/dbhash",
     "sdk-kit",
     "sdk-kit-macros", 
-    "testing/differential-oracle/sql_gen_prop", 
+    "testing/differential-oracle/sql_gen_prop",
+    "testing/differential-oracle/sql_gen",
     "testing/differential-oracle/fuzzer",
     "testing/runner"
 ]
