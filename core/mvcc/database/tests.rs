@@ -1118,12 +1118,12 @@ fn test_snapshot_isolation_tx_visible1() {
         (1, new_tx(1, 1, TransactionState::Committed(2))),
         (2, new_tx(2, 2, TransactionState::Committed(5))),
         (3, new_tx(3, 3, TransactionState::Aborted)),
-        (5, new_tx(5, 5, TransactionState::Preparing)),
+        (5, new_tx(5, 5, TransactionState::Preparing(8))),
         (6, new_tx(6, 6, TransactionState::Committed(10))),
         (7, new_tx(7, 7, TransactionState::Active)),
     ]);
 
-    let current_tx = new_tx(4, 4, TransactionState::Preparing);
+    let current_tx = new_tx(4, 4, TransactionState::Preparing(7));
 
     let rv_visible = |begin: Option<TxTimestampOrID>, end: Option<TxTimestampOrID>| {
         let row_version = RowVersion {
@@ -1504,7 +1504,7 @@ fn test_batch_writes() {
 
 #[test]
 fn transaction_display() {
-    let state = AtomicTransactionState::from(TransactionState::Preparing);
+    let state = AtomicTransactionState::from(TransactionState::Preparing(20250915));
     let tx_id = 42;
     let begin_ts = 20250914;
 
@@ -1526,7 +1526,7 @@ fn transaction_display() {
         savepoint_stack: RwLock::new(Vec::new()),
     };
 
-    let expected = "{ state: Preparing, id: 42, begin_ts: 20250914, write_set: [RowID { table_id: MVTableId(-2), row_id: Int(11) }, RowID { table_id: MVTableId(-2), row_id: Int(13) }], read_set: [RowID { table_id: MVTableId(-2), row_id: Int(17) }, RowID { table_id: MVTableId(-2), row_id: Int(19) }] }";
+    let expected = "{ state: Preparing(20250915), id: 42, begin_ts: 20250914, write_set: [RowID { table_id: MVTableId(-2), row_id: Int(11) }, RowID { table_id: MVTableId(-2), row_id: Int(13) }], read_set: [RowID { table_id: MVTableId(-2), row_id: Int(17) }, RowID { table_id: MVTableId(-2), row_id: Int(19) }] }";
     let output = format!("{tx}");
     assert_eq!(output, expected);
 }
@@ -2739,6 +2739,8 @@ fn test_checkpoint_drop_table() {
     assert_eq!(&rows[0][0].to_string(), "ok");
 }
 
+/// Test that inserting a duplicate primary key fails when the existing row
+/// was committed before this transaction started (and thus is visible).
 #[test]
 fn test_mvcc_same_primary_key() {
     let db = MvccTestDbNoConn::new_with_random_db();
@@ -2752,14 +2754,18 @@ fn test_mvcc_same_primary_key() {
     conn.execute("INSERT INTO t VALUES (666)").unwrap();
     conn.execute("COMMIT").unwrap();
 
+    // conn2 starts AFTER conn1 committed, so conn2 can see the committed row.
+    // INSERT should fail with UNIQUE constraint because the row is visible.
     conn2.execute("BEGIN CONCURRENT").unwrap();
     conn2
         .execute("INSERT INTO t VALUES (666)")
-        .expect_err("duplicate key");
+        .expect_err("duplicate key - visible committed row");
 }
 
 #[test]
 fn test_mvcc_same_primary_key_concurrent() {
+    // Pure optimistic concurrency: both transactions can INSERT the same rowid,
+    // but only one can commit (first-committer-wins based on end_ts comparison).
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();
 
@@ -2771,7 +2777,14 @@ fn test_mvcc_same_primary_key_concurrent() {
     conn.execute("INSERT INTO t VALUES (666)").unwrap();
 
     conn2.execute("BEGIN CONCURRENT").unwrap();
+    // With pure optimistic CC, INSERT succeeds - conflict detected at commit time
+    conn2.execute("INSERT INTO t VALUES (666)").unwrap();
+
+    // First transaction commits successfully (gets lower end_ts)
+    conn.execute("COMMIT").unwrap();
+
+    // Second transaction fails at commit time (first-committer-wins)
     conn2
-        .execute("INSERT INTO t VALUES (666)")
-        .expect_err("duplicate key");
+        .execute("COMMIT")
+        .expect_err("duplicate key - first committer wins");
 }

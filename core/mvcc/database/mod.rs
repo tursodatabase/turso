@@ -472,24 +472,34 @@ impl std::fmt::Display for Transaction {
 #[derive(Debug, Clone, PartialEq)]
 enum TransactionState {
     Active,
-    Preparing,
+    /// Preparing state includes the end_ts so other transactions can compare
+    /// timestamps during validation to resolve races (first-committer-wins).
+    Preparing(u64),
     Aborted,
     Terminated,
     Committed(u64),
 }
 
 impl TransactionState {
+    // Bit patterns for encoding states with timestamps
+    const PREPARING_BIT: u64 = 0x4000_0000_0000_0000;
+    const COMMITTED_BIT: u64 = 0x8000_0000_0000_0000;
+    const TIMESTAMP_MASK: u64 = 0x3fff_ffff_ffff_ffff;
+
     pub fn encode(&self) -> u64 {
         match self {
             TransactionState::Active => 0,
-            TransactionState::Preparing => 1,
-            TransactionState::Aborted => 2,
-            TransactionState::Terminated => 3,
+            TransactionState::Preparing(ts) => {
+                // We only support 2^62 - 1 timestamps
+                assert!(ts & !Self::TIMESTAMP_MASK == 0);
+                Self::PREPARING_BIT | ts
+            }
+            TransactionState::Aborted => 1,
+            TransactionState::Terminated => 2,
             TransactionState::Committed(ts) => {
-                // We only support 2*62 - 1 timestamps, because the extra bit
-                // is used to encode the type.
-                assert!(ts & 0x8000_0000_0000_0000 == 0);
-                0x8000_0000_0000_0000 | ts
+                // We only support 2^62 - 1 timestamps
+                assert!(ts & !Self::TIMESTAMP_MASK == 0);
+                Self::COMMITTED_BIT | ts
             }
         }
     }
@@ -497,11 +507,13 @@ impl TransactionState {
     pub fn decode(v: u64) -> Self {
         match v {
             0 => TransactionState::Active,
-            1 => TransactionState::Preparing,
-            2 => TransactionState::Aborted,
-            3 => TransactionState::Terminated,
-            v if v & 0x8000_0000_0000_0000 != 0 => {
-                TransactionState::Committed(v & 0x7fff_ffff_ffff_ffff)
+            1 => TransactionState::Aborted,
+            2 => TransactionState::Terminated,
+            v if v & Self::COMMITTED_BIT != 0 => {
+                TransactionState::Committed(v & Self::TIMESTAMP_MASK)
+            }
+            v if v & Self::PREPARING_BIT != 0 => {
+                TransactionState::Preparing(v & Self::TIMESTAMP_MASK)
             }
             _ => panic!("Invalid transaction state"),
         }
@@ -539,7 +551,7 @@ impl std::fmt::Display for TransactionState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::result::Result<(), std::fmt::Error> {
         match self {
             TransactionState::Active => write!(f, "Active"),
-            TransactionState::Preparing => write!(f, "Preparing"),
+            TransactionState::Preparing(ts) => write!(f, "Preparing({ts})"),
             TransactionState::Committed(ts) => write!(f, "Committed({ts})"),
             TransactionState::Aborted => write!(f, "Aborted"),
             TransactionState::Terminated => write!(f, "Terminated"),
@@ -719,8 +731,8 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     return Err(LimboError::SchemaConflict);
                 }
 
-                tx.state.store(TransactionState::Preparing);
-                tracing::trace!("prepare_tx(tx_id={})", self.tx_id);
+                tx.state.store(TransactionState::Preparing(end_ts));
+                tracing::trace!("prepare_tx(tx_id={}, end_ts={})", self.tx_id, end_ts);
 
                 /* TODO: The code we have here is sufficient for snapshot isolation.
                 ** In order to implement serializability, we need the following steps:
@@ -816,11 +828,90 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 Ok(TransitionResult::Continue)
             }
             CommitState::Commit { end_ts } => {
-                let mut log_record = LogRecord::new(*end_ts);
                 if !mvcc_store.is_exclusive_tx(&self.tx_id) && mvcc_store.has_exclusive_tx() {
                     // A non-CONCURRENT transaction is holding the exclusive lock, we must abort.
                     return Err(LimboError::WriteWriteConflict);
                 }
+                // Check for rowid conflicts before committing (pure optimistic, first-committer-wins)
+                // Ref: Hekaton paper Section 3.2 - validation uses end_ts comparison
+                let tx = mvcc_store
+                    .txs
+                    .get(&self.tx_id)
+                    .ok_or(LimboError::TxTerminated)?;
+                let tx = tx.value();
+
+                for id in &self.write_set {
+                    // TODO: check for conflicts with indices, check for uniqueness too.
+                    if !id.row_id.is_int_key() {
+                        continue;
+                    }
+
+                    let row_versions = mvcc_store.rows.get(id);
+                    if row_versions.is_none() {
+                        continue;
+                    }
+
+                    let row_versions = row_versions.unwrap();
+                    let row_versions = row_versions.value();
+                    let row_versions = row_versions.read();
+
+                    // Check for conflicts - iterate in reverse for faster early termination
+                    for version in row_versions.iter().rev() {
+                        // Skip deleted versions
+                        if version.end.is_some() {
+                            continue;
+                        }
+
+                        match version.begin {
+                            Some(TxTimestampOrID::TxID(other_tx_id)) => {
+                                // Skip our own version
+                                if other_tx_id == self.tx_id {
+                                    continue;
+                                }
+                                // Another transaction's uncommitted version - check their state
+                                let other_tx = mvcc_store.txs.get(&other_tx_id);
+                                if let Some(other_tx) = other_tx {
+                                    let other_tx = other_tx.value();
+                                    match other_tx.state.load() {
+                                        // Other tx already committed = conflict
+                                        TransactionState::Committed(_) => {
+                                            return Err(LimboError::WriteWriteConflict);
+                                        }
+                                        // Both preparing - compare end_ts (lower wins)
+                                        TransactionState::Preparing(other_end_ts) => {
+                                            if other_end_ts < *end_ts {
+                                                // Other tx has lower end_ts, they win
+                                                return Err(LimboError::WriteWriteConflict);
+                                            }
+                                            // We have lower end_ts, we win - they'll abort when they validate
+                                        }
+                                        // Other tx still active - we're already Preparing so we're ahead
+                                        // They'll see us in Preparing/Committed when they try to commit
+                                        TransactionState::Active => {}
+                                        // Other tx aborted - no conflict
+                                        TransactionState::Aborted
+                                        | TransactionState::Terminated => {}
+                                    }
+                                }
+                            }
+                            Some(TxTimestampOrID::Timestamp(begin_ts)) => {
+                                // Committed version - check if it was inserted after we started
+                                if begin_ts >= tx.begin_ts {
+                                    // Duplicate! A version was committed after we started
+                                    return Err(LimboError::WriteWriteConflict);
+                                }
+                                // Commited before we started, any other previous versions are also committed before us so irrelevant.
+                                break;
+                            }
+                            None => {
+                                // Invalid version
+                            }
+                        }
+                    }
+                }
+
+                // Now update timestamps
+                let mut log_record = LogRecord::new(*end_ts);
                 for id in &self.write_set {
                     if let Some(row_versions) = mvcc_store.rows.get(id) {
                         let mut row_versions = row_versions.value().write();
@@ -1482,6 +1573,11 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 self.insert_index_version(index_id, sortable_key, row_version);
             }
             None => {
+                // NOTE: We do NOT check for conflicts at insert time (pure optimistic).
+                // Conflicts are detected at commit time using end_ts comparison.
+                // This allows multiple transactions to insert the same rowid,
+                // with first-committer-wins semantics.
+
                 let version_id = self.get_version_id();
                 let row_version = RowVersion {
                     id: version_id,
@@ -1494,7 +1590,6 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 tx.record_created_table_version(id.clone(), version_id);
                 let allocator = self.get_rowid_allocator(&id.table_id);
                 allocator.insert_row_id_maybe_update(id.row_id.to_int_or_panic());
-                self.check_rowid_conflict(tx, &id)?;
                 self.insert_version(id, row_version);
             }
         }
@@ -2441,7 +2536,10 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             .expect("transaction should exist in txs map");
         let tx = tx_unlocked.value();
         connection.set_mv_tx(None);
-        assert!(tx.state == TransactionState::Active || tx.state == TransactionState::Preparing);
+        assert!(matches!(
+            tx.state.load(),
+            TransactionState::Active | TransactionState::Preparing(_)
+        ));
         tx.state.store(TransactionState::Aborted);
         tracing::trace!("abort(tx_id={})", tx_id);
 
@@ -2689,7 +2787,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                             let tx = tx.value();
                             // FIXME: verify!
                             match tx.state.load() {
-                                TransactionState::Active | TransactionState::Preparing => {
+                                TransactionState::Active | TransactionState::Preparing(_) => {
                                     version_end_ts > tx.begin_ts
                                 }
                                 _ => false,
@@ -3103,33 +3201,6 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         let maybe_root_page = self.table_id_to_rootpage.get(table_id);
         maybe_root_page.is_some_and(|entry| entry.value().is_some())
     }
-
-    fn check_rowid_conflict(&self, tx: &Transaction, id: &RowID) -> Result<()> {
-        let row_versions = self.rows.get(id);
-        if row_versions.is_none() {
-            return Ok(());
-        }
-
-        let row_versions = row_versions.unwrap();
-        let row_versions = row_versions.value();
-        let row_versions = row_versions.write();
-        let conflict = row_versions.iter().rev().any(|version| {
-            // Check if there is another version with same rowid visible or there is another version with same rowid being inserted by a different transaction
-            version.is_visible_to(tx, &self.txs)
-                || version.begin.as_ref().is_some_and(|v| {
-                    if let TxTimestampOrID::TxID(other_tx_id) = v {
-                        *other_tx_id != tx.tx_id
-                    } else {
-                        false
-                    }
-                })
-        });
-        if conflict {
-            Err(LimboError::WriteWriteConflict)
-        } else {
-            Ok(())
-        }
-    }
 }
 
 fn rollback_row_version(tx_id: u64, rv: &mut RowVersion) {
@@ -3301,7 +3372,7 @@ fn is_begin_visible(txs: &SkipMap<TxID, Transaction>, tx: &Transaction, rv: &Row
             let tb = tb.value();
             let visible = match tb.state.load() {
                 TransactionState::Active => tx.tx_id == tb.tx_id && rv.end.is_none(),
-                TransactionState::Preparing => false, // NOTICE: makes sense for snapshot isolation, not so much for serializable!
+                TransactionState::Preparing(_) => false, // NOTICE: makes sense for snapshot isolation, not so much for serializable!
                 TransactionState::Committed(committed_ts) => tx.begin_ts >= committed_ts,
                 TransactionState::Aborted => false,
                 TransactionState::Terminated => {
@@ -3337,7 +3408,7 @@ fn is_end_visible(
                 // transaction can see a row version if the end is a TXId only if it isn't the same transaction.
                 // Source: https://avi.im/blag/2023/hekaton-paper-typo/
                 TransactionState::Active => current_tx.tx_id != other_tx.tx_id,
-                TransactionState::Preparing => false, // NOTICE: makes sense for snapshot isolation, not so much for serializable!
+                TransactionState::Preparing(_) => false, // NOTICE: makes sense for snapshot isolation, not so much for serializable!
                 TransactionState::Committed(committed_ts) => current_tx.begin_ts < committed_ts,
                 TransactionState::Aborted => false,
                 TransactionState::Terminated => {
