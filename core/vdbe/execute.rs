@@ -7137,10 +7137,6 @@ fn new_rowid_inner(
     loop {
         match state.op_new_rowid_state {
             OpNewRowidState::Start => {
-                state.op_new_rowid_state = OpNewRowidState::SeekingToLast {
-                    mvcc_already_initialized: false,
-                };
-
                 if mv_store.is_some() {
                     let cursor = state.get_cursor(*cursor);
                     let cursor = cursor.as_btree_mut() as &mut dyn Any;
@@ -7188,7 +7184,14 @@ fn new_rowid_inner(
                             ephemeral_cursor.pager.wal.is_none(),
                             "MVCC is enabled but got a non-ephemeral BTreeCursor"
                         );
+                        state.op_new_rowid_state = OpNewRowidState::SeekingToLast {
+                            mvcc_already_initialized: false,
+                        };
                     }
+                } else {
+                    state.op_new_rowid_state = OpNewRowidState::SeekingToLast {
+                        mvcc_already_initialized: false,
+                    };
                 }
             }
 
