@@ -157,9 +157,11 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
         sync_mode: SyncMode,
     ) -> Self {
         let checkpoint_lock = mvstore.blocking_checkpoint_lock.clone();
-        let index_id_to_index = connection
-            .schema
-            .read()
+        // Prevent stale per-connection schema during checkpoint by using the shared DB schema.
+        // Unlike in WAL mode we actually write stuff from mv store to pager in checkpoint
+        // so this is important.
+        let schema = connection.db.clone_schema();
+        let index_id_to_index = schema
             .indexes
             .values()
             .flatten()
