@@ -250,6 +250,7 @@ pub struct TextEncoding(U32BE);
 
 impl TextEncoding {
     #![allow(non_upper_case_globals)]
+    pub const Unset: Self = Self(U32BE::new(0));
     pub const Utf8: Self = Self(U32BE::new(1));
     pub const Utf16Le: Self = Self(U32BE::new(2));
     pub const Utf16Be: Self = Self(U32BE::new(3));

@@ -59,10 +59,10 @@ use crate::index_method::IndexMethod;
 use crate::schema::Trigger;
 use crate::stats::refresh_analyze_stats;
 use crate::storage::checksum::CHECKSUM_REQUIRED_RESERVED_BYTES;
-use crate::storage::encryption::AtomicCipherMode;
+use crate::storage::encryption::{AtomicCipherMode, SQLITE_HEADER, TURSO_HEADER_PREFIX};
 use crate::storage::journal_mode;
 use crate::storage::pager::{self, AutoVacuumMode, HeaderRef, HeaderRefMut};
-use crate::storage::sqlite3_ondisk::{RawVersion, Version};
+use crate::storage::sqlite3_ondisk::{RawVersion, TextEncoding, Version};
 use crate::sync::{
     atomic::{
         AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU16, AtomicU64, AtomicUsize, Ordering,
@@ -959,6 +959,26 @@ impl Database {
         let header: HeaderRefMut = self.io.block(|| HeaderRefMut::from_pager(&pager))?;
         let header_mut = header.borrow_mut();
         let (read_version, write_version) = { (header_mut.read_version, header_mut.write_version) };
+
+        if encryption_key.is_none() && header_mut.magic != SQLITE_HEADER {
+            tracing::error!(
+                "invalid value of database header magic bytes: {:?}",
+                header_mut.magic
+            );
+            return Err(LimboError::NotADB);
+        }
+        // when we open fresh db with encryption params - header will be SQLite at this point
+        if encryption_key.is_some()
+            && (header_mut.magic != SQLITE_HEADER
+                && !header_mut.magic.starts_with(TURSO_HEADER_PREFIX))
+        {
+            tracing::error!(
+                "invalid value of database header magic bytes: {:?}",
+                header_mut.magic
+            );
+            return Err(LimboError::NotADB);
+        }
+
         // TODO: right now we don't support READ ONLY and no READ or WRITE in the Version header
         // https://www.sqlite.org/fileformat.html#file_format_version_numbers
         if read_version != write_version {
@@ -975,6 +995,54 @@ impl Database {
                 .to_version()
                 .map_err(|val| LimboError::Corrupt(format!("Invalid write_version: {val}")))?,
         );
+
+        // Validate fixed header fields per SQLite spec
+        if header_mut.max_embed_frac != 64 {
+            return Err(LimboError::Corrupt(format!(
+                "Invalid max_embed_frac: expected 64, got {}",
+                header_mut.max_embed_frac
+            )));
+        }
+        if header_mut.min_embed_frac != 32 {
+            return Err(LimboError::Corrupt(format!(
+                "Invalid min_embed_frac: expected 32, got {}",
+                header_mut.min_embed_frac
+            )));
+        }
+        if header_mut.leaf_frac != 32 {
+            return Err(LimboError::Corrupt(format!(
+                "Invalid leaf_frac: expected 32, got {}",
+                header_mut.leaf_frac
+            )));
+        }
+        let schema_format = header_mut.schema_format.get();
+        // If the database is completely empty, if it has no schema, then the schema format number can be zero.
+        if !(0..=4).contains(&schema_format) {
+            return Err(LimboError::Corrupt(format!(
+                "Invalid schema_format: expected 1-4, got {schema_format}"
+            )));
+        }
+        if !matches!(
+            header_mut.text_encoding,
+            TextEncoding::Unset
+                | TextEncoding::Utf8
+                | TextEncoding::Utf16Le
+                | TextEncoding::Utf16Be
+        ) {
+            return Err(LimboError::Corrupt(format!(
+                "Invalid text_encoding: {}",
+                header_mut.text_encoding
+            )));
+        }
+        if !matches!(
+            header_mut.text_encoding,
+            TextEncoding::Unset | TextEncoding::Utf8
+        ) {
+            return Err(LimboError::Corrupt(format!(
+                "Only utf8 text_encoding is supported by tursodb: got={}",
+                header_mut.text_encoding
+            )));
+        }
 
         // Determine if we should open in MVCC mode based on the database header version
         // MVCC is controlled only by the database header (set via PRAGMA journal_mode)

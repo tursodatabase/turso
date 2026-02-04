@@ -65,12 +65,12 @@ use turso_macros::{match_ignore_ascii_case, AtomicEnum};
 /// ```
 ///
 /// constants used for the Turso page header in the encrypted dbs.
-const TURSO_HEADER_PREFIX: &[u8] = b"Turso";
+pub const TURSO_HEADER_PREFIX: &[u8] = b"Turso";
+pub const SQLITE_HEADER: &[u8] = b"SQLite format 3\0";
 const TURSO_VERSION: u8 = 0x00;
 const VERSION_OFFSET: usize = 5;
 const CIPHER_OFFSET: usize = 6;
 const TURSO_HEADER_SIZE: usize = 16;
-const SQLITE_HEADER: &[u8] = b"SQLite format 3\0";
 
 #[derive(Clone)]
 pub enum EncryptionKey {
