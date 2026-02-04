@@ -1,0 +1,40 @@
+---
+source: indexes.sqltest
+expression: "SELECT id, event_type, severity, source\n    FROM events\n    WHERE (event_type = 'ERROR' AND severity > 5)\n       OR (event_type = 'WARNING' AND severity > 7);"
+info:
+  statement_type: SELECT
+  tables:
+    - events
+  setup_blocks:
+    - schema
+  database: ":memory:"
+---
+QUERY PLAN
+`--SCAN events
+
+BYTECODE
+addr  opcode       p1  p2  p3  p4                p5  comment
+   0  Init          0  18   0                     0  Start at 18
+   1  OpenRead      0  11   0  k(6,B,B,B,B,B,B)   0  table=events, root=11, iDb=0
+   2  Rewind        0  17   0                     0  Rewind table events
+   3    Column      0   1   6                     0  r[6]=events.event_type
+   4    Ne          6   7   7  Binary             0  if r[6]!=r[7] goto 7
+   5    Column      0   2   9                     0  r[9]=events.severity
+   6    Gt          9  10  11  Binary             0  if r[9]>r[10] goto 11
+   7    Column      0   1  12                     0  r[12]=events.event_type
+   8    Ne         12  13  16  Binary             0  if r[12]!=r[13] goto 16
+   9    Column      0   2  15                     0  r[15]=events.severity
+  10    Le         15  16  16  Binary             0  if r[15]<=r[16] goto 16
+  11    RowId       0   1   0                     0  r[1]=events.rowid
+  12    Column      0   1   2                     0  r[2]=events.event_type
+  13    Column      0   2   3                     0  r[3]=events.severity
+  14    Column      0   4   4                     0  r[4]=events.source
+  15    ResultRow   1   4   0                     0  output=r[1..4]
+  16  Next          0   3   0                     0
+  17  Halt          0   0   0                     0
+  18  Transaction   0   1  14                     0  iDb=0 tx_mode=Read
+  19  String8       0   7   0  ERROR              0  r[7]='ERROR'
+  20  Integer       5  10   0                     0  r[10]=5
+  21  String8       0  13   0  WARNING            0  r[13]='WARNING'
+  22  Integer       7  16   0                     0  r[16]=7
+  23  Goto          0   1   0                     0

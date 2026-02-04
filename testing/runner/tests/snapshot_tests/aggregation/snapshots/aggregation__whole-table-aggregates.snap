@@ -1,0 +1,49 @@
+---
+source: aggregation.sqltest
+expression: "SELECT\n        COUNT(*) as total_transactions,\n        SUM(amount) as total_revenue,\n        AVG(amount) as avg_transaction,\n        MIN(amount) as min_transaction,\n        MAX(amount) as max_transaction,\n        SUM(quantity) as total_units_sold\n    FROM\n        sales;"
+info:
+  statement_type: SELECT
+  tables:
+    - sales
+  setup_blocks:
+    - schema
+  database: ":memory:"
+---
+QUERY PLAN
+`--SCAN sales
+
+BYTECODE
+addr  opcode       p1  p2  p3  p4                  p5  comment
+   0  Init          0  30   0                       0  Start at 30
+   1  Null          0   7  12                       0  r[7..12]=NULL
+   2  OpenRead      0   2   0  k(7,B,B,B,B,B,B,B)   0  table=sales, root=2, iDb=0
+   3  Rewind        0  16   0                       0  Rewind table sales
+   4    AggStep     0  13   7  count                0  accum=r[7] step(r[13])
+   5    Column      0   4  14                       0  r[14]=sales.amount
+   6    AggStep     0  14   8  sum                  0  accum=r[8] step(r[14])
+   7    Column      0   4  15                       0  r[15]=sales.amount
+   8    AggStep     0  15   9  avg                  0  accum=r[9] step(r[15])
+   9    Column      0   4  16                       0  r[16]=sales.amount
+  10    AggStep     0  16  10  min                  0  accum=r[10] step(r[16])
+  11    Column      0   4  17                       0  r[17]=sales.amount
+  12    AggStep     0  17  11  max                  0  accum=r[11] step(r[17])
+  13    Column      0   5  18                       0  r[18]=sales.quantity
+  14    AggStep     0  18  12  sum                  0  accum=r[12] step(r[18])
+  15  Next          0   4   0                       0
+  16  AggFinal      0   7   0  count                0  accum=r[7]
+  17  AggFinal      0   8   0  sum                  0  accum=r[8]
+  18  AggFinal      0   9   0  avg                  0  accum=r[9]
+  19  AggFinal      0  10   0  min                  0  accum=r[10]
+  20  AggFinal      0  11   0  max                  0  accum=r[11]
+  21  AggFinal      0  12   0  sum                  0  accum=r[12]
+  22  Copy          7   1   0                       0  r[1]=r[7]
+  23  Copy          8   2   0                       0  r[2]=r[8]
+  24  Copy          9   3   0                       0  r[3]=r[9]
+  25  Copy         10   4   0                       0  r[4]=r[10]
+  26  Copy         11   5   0                       0  r[5]=r[11]
+  27  Copy         12   6   0                       0  r[6]=r[12]
+  28  ResultRow     1   6   0                       0  output=r[1..6]
+  29  Halt          0   0   0                       0
+  30  Transaction   0   1   8                       0  iDb=0 tx_mode=Read
+  31  Integer       1  13   0                       0  r[13]=1
+  32  Goto          0   1   0                       0

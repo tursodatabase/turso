@@ -1,0 +1,45 @@
+---
+source: setops.sqltest
+expression: "SELECT name, department FROM current_employees WHERE department = 'Engineering'\n    UNION ALL\n    SELECT name, department FROM former_employees WHERE department = 'Engineering';"
+info:
+  statement_type: SELECT
+  tables:
+    - current_employees
+    - former_employees
+  setup_blocks:
+    - schema
+  database: ":memory:"
+---
+QUERY PLAN
+`--COMPOUND QUERY
+   |--LEFT-MOST SUBQUERY
+   |  `--SEARCH current_employees USING INDEX idx_current_dept
+   `--UNION ALL
+      `--SEARCH former_employees USING INDEX idx_former_dept
+
+BYTECODE
+addr  opcode          p1  p2  p3  p4              p5  comment
+   0  Init             0  22   0                   0  Start at 22
+   1  OpenRead         0   2   0  k(4,B,B,B,B)     0  table=current_employees, root=2, iDb=0
+   2  OpenRead         1   5   0  k(2,B)           0  index=idx_current_dept, root=5, iDb=0
+   3  String8          0   3   0  Engineering      0  r[3]='Engineering'
+   4  SeekGE           1  11   3                   0  key=[3..3]
+   5    IdxGT          1  11   3                   0  key=[3..3]
+   6    DeferredSeek   1   0   0                   0
+   7    Column         0   1   1                   0  r[1]=current_employees.name
+   8    Column         0   2   2                   0  r[2]=current_employees.department
+   9    ResultRow      1   2   0                   0  output=r[1..2]
+  10  Next             1   5   0                   0
+  11  OpenRead         2   3   0  k(5,B,B,B,B,B)   0  table=former_employees, root=3, iDb=0
+  12  OpenRead         3   6   0  k(2,B)           0  index=idx_former_dept, root=6, iDb=0
+  13  String8          0   6   0  Engineering      0  r[6]='Engineering'
+  14  SeekGE           3  21   6                   0  key=[6..6]
+  15    IdxGT          3  21   6                   0  key=[6..6]
+  16    DeferredSeek   3   2   0                   0
+  17    Column         2   1   4                   0  r[4]=former_employees.name
+  18    Column         2   2   5                   0  r[5]=former_employees.department
+  19    ResultRow      4   2   0                   0  output=r[4..5]
+  20  Next             3  15   0                   0
+  21  Halt             0   0   0                   0
+  22  Transaction      0   1   6                   0  iDb=0 tx_mode=Read
+  23  Goto             0   1   0                   0

@@ -1,0 +1,56 @@
+---
+source: setops.sqltest
+expression: "SELECT department FROM current_employees\n    UNION\n    SELECT department FROM contractors\n    INTERSECT\n    SELECT department FROM former_employees;"
+info:
+  statement_type: SELECT
+  tables:
+    - contractors
+    - current_employees
+    - former_employees
+  setup_blocks:
+    - schema
+  database: ":memory:"
+---
+QUERY PLAN
+`--COMPOUND QUERY
+   |--LEFT-MOST SUBQUERY
+   |  `--SCAN current_employees USING COVERING INDEX idx_current_dept
+   |--UNION USING TEMP B-TREE
+   |  `--SCAN contractors USING COVERING INDEX idx_contractors_dept
+   `--INTERSECT USING TEMP B-TREE
+      `--SCAN former_employees USING COVERING INDEX idx_former_dept
+
+BYTECODE
+addr  opcode         p1  p2  p3  p4      p5  comment
+   0  Init            0  30   0           0  Start at 30
+   1  OpenEphemeral   0   0   0           0  cursor=0 is_table=false
+   2  OpenEphemeral   1   0   0           0  cursor=1 is_table=false
+   3  OpenRead        2   5   0  k(2,B)   0  index=idx_current_dept, root=5, iDb=0
+   4  Rewind          2   9   0           0  Rewind index idx_current_dept
+   5    Column        2   0   1           0  r[1]=idx_current_dept.department
+   6    MakeRecord    1   1   2           0  r[2]=mkrec(r[1..1]); for compound_dedupe
+   7    IdxInsert     0   2   0           8  key=r[2]
+   8  Next            2   5   0           0
+   9  OpenRead        3   7   0  k(2,B)   0  index=idx_contractors_dept, root=7, iDb=0
+  10  Rewind          3  15   0           0  Rewind index idx_contractors_dept
+  11    Column        3   0   3           0  r[3]=idx_contractors_dept.department
+  12    MakeRecord    3   1   4           0  r[4]=mkrec(r[3..3]); for compound_dedupe
+  13    IdxInsert     0   4   0           8  key=r[4]
+  14  Next            3  11   0           0
+  15  OpenRead        4   6   0  k(2,B)   0  index=idx_former_dept, root=6, iDb=0
+  16  Rewind          4  21   0           0  Rewind index idx_former_dept
+  17    Column        4   0   5           0  r[5]=idx_former_dept.department
+  18    MakeRecord    5   1   6           0  r[6]=mkrec(r[5..5]); for compound_dedupe
+  19    IdxInsert     1   6   0           8  key=r[6]
+  20  Next            4  17   0           0
+  21  Rewind          0  27   0           0  Rewind  compound_dedupe
+  22    RowData       0   7   0           0  r[7] = data
+  23    NotFound      1  26   7           0  if not found goto 26
+  24    Column        0   0   8           0  r[8]=compound_dedupe.department
+  25    ResultRow     8   1   0           0  output=r[8]
+  26  Next            0  22   0           0
+  27  Close           1   0   0           0
+  28  Close           0   0   0           0
+  29  Halt            0   0   0           0
+  30  Transaction     0   1   6           0  iDb=0 tx_mode=Read
+  31  Goto            0   1   0           0

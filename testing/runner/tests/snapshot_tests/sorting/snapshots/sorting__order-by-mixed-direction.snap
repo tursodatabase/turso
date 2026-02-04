@@ -1,0 +1,41 @@
+---
+source: sorting.sqltest
+expression: "SELECT id, name, category, price\n    FROM products\n    ORDER BY category ASC, price DESC;"
+info:
+  statement_type: SELECT
+  tables:
+    - products
+  setup_blocks:
+    - schema
+  database: ":memory:"
+---
+QUERY PLAN
+|--SCAN products
+`--USE TEMP B-TREE FOR ORDER BY
+
+BYTECODE
+addr  opcode          p1  p2  p3  p4                p5  comment
+   0  Init             0  22   0                     0  Start at 22
+   1  SorterOpen       0   2   0  k(2,B,-B)          0  cursor=0
+   2  OpenRead         1   2   0  k(6,B,B,B,B,B,B)   0  table=products, root=2, iDb=0
+   3  Rewind           1  12   0                     0  Rewind table products
+   4    Column         1   3   6                     0  r[6]=products.category
+   5    Column         1   2   7                     0  r[7]=products.price
+   6    RealAffinity   7   0   0                     0
+   7    RowId          1   8   0                     0  r[8]=products.rowid
+   8    Column         1   1   9                     0  r[9]=products.name
+   9    MakeRecord     6   4   5                     0  r[5]=mkrec(r[6..9])
+  10    SorterInsert   0   5   0  0                  0  key=r[5]
+  11  Next             1   4   0                     0
+  12  OpenPseudo       2   5   4                     0  4 columns in r[5]
+  13  SorterSort       0  21   0                     0
+  14    SorterData     0   5   2                     0  r[5]=data
+  15    Column         2   2   1                     0  r[1]=pseudo.column 2
+  16    Column         2   3   2                     0  r[2]=pseudo.column 3
+  17    Column         2   0   3                     0  r[3]=pseudo.column 0
+  18    Column         2   1   4                     0  r[4]=pseudo.column 1
+  19    ResultRow      1   4   0                     0  output=r[1..4]
+  20  SorterNext       0  14   0                     0
+  21  Halt             0   0   0                     0
+  22  Transaction      0   1   7                     0  iDb=0 tx_mode=Read
+  23  Goto             0   1   0                     0

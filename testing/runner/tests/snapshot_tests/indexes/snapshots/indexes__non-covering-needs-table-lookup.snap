@@ -1,0 +1,33 @@
+---
+source: indexes.sqltest
+expression: "SELECT warehouse_id, product_id, quantity, last_updated\n    FROM inventory\n    WHERE warehouse_id = 1 AND product_id = 500;"
+info:
+  statement_type: SELECT
+  tables:
+    - inventory
+  setup_blocks:
+    - schema
+  database: ":memory:"
+---
+QUERY PLAN
+`--SEARCH inventory USING INDEX idx_inventory_covering
+
+BYTECODE
+addr  opcode           p1  p2  p3  p4              p5  comment
+   0  Init              0  15   0                   0  Start at 15
+   1  OpenRead          0   9   0  k(5,B,B,B,B,B)   0  table=inventory, root=9, iDb=0
+   2  OpenRead          1  10   0  k(4,B,B,B)       0  index=idx_inventory_covering, root=10, iDb=0
+   3  Integer           1   5   0                   0  r[5]=1
+   4  Integer         500   6   0                   0  r[6]=500
+   5  SeekGE            1  14   5                   0  key=[5..6]
+   6    IdxGT           1  14   5                   0  key=[5..6]
+   7    DeferredSeek    1   0   0                   0
+   8    Column          0   1   1                   0  r[1]=inventory.warehouse_id
+   9    Column          0   2   2                   0  r[2]=inventory.product_id
+  10    Column          0   3   3                   0  r[3]=inventory.quantity
+  11    Column          0   4   4                   0  r[4]=inventory.last_updated
+  12    ResultRow       1   4   0                   0  output=r[1..4]
+  13  Next              1   6   0                   0
+  14  Halt              0   0   0                   0
+  15  Transaction       0   1  14                   0  iDb=0 tx_mode=Read
+  16  Goto              0   1   0                   0

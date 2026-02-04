@@ -1,0 +1,100 @@
+---
+source: aggregation.sqltest
+expression: "SELECT\n        p.category,\n        COUNT(o.order_id) as num_orders,\n        SUM(o.total_amount) as total_revenue,\n        AVG(o.quantity) as avg_quantity_per_order\n    FROM\n        products p\n        LEFT JOIN orders o ON p.product_id = o.product_id\n    GROUP BY\n        p.category\n    ORDER BY\n        total_revenue DESC;"
+info:
+  statement_type: SELECT
+  tables:
+    - orders
+    - p.product_id
+    - products
+  setup_blocks:
+    - schema
+  database: ":memory:"
+---
+QUERY PLAN
+|--SCAN products AS p
+|--SEARCH o USING INDEX idx_orders_product
+`--USE TEMP B-TREE FOR ORDER BY
+
+BYTECODE
+addr  opcode                    p1  p2  p3  p4                p5  comment
+   0          Init               0  78   0                     0  Start at 78
+   1          SorterOpen         0   1   0  k(1,-B)            0  cursor=0
+   2          Null               0  11  13                     0  r[11..13]=NULL
+   3          SorterOpen         1   4   0  k(1,-B)            0  cursor=1
+   4          Integer            0   8   0                     0  r[8]=0; clear group by abort flag
+   5          Null               0   9   0                     0  r[9]=NULL; initialize group by comparison registers to NULL
+   6          Gosub             19  65   0                     0  ; go to clear accumulator subroutine
+   7          OpenRead           3   6   0  k(4,B,B,B,B)       0  table=products, root=6, iDb=0
+   8          OpenRead           4   7   0  k(6,B,B,B,B,B,B)   0  table=orders, root=7, iDb=0
+   9          OpenRead           5   9   0  k(2,B)             0  index=idx_orders_product, root=9, iDb=0
+  10          Rewind             3  29   0                     0  Rewind table products
+  11            Integer          0  20   0                     0  r[20]=0
+  12            RowId            3  21   0                     0  r[21]=products.rowid
+  13            SeekGE           5  24  21                     0  key=[21..21]
+  14              IdxGT          5  24  21                     0  key=[21..21]
+  15              DeferredSeek   5   4   0                     0
+  16              Integer        1  20   0                     0  r[20]=1
+  17              Column         3   2  15                     0  r[15]=products.category
+  18              IdxRowId       5  16   0                     0  r[16]=cursor 5 for index idx_orders_product.rowid
+  19              Column         4   5  17                     0  r[17]=orders.total_amount
+  20              Column         4   4  18                     0  r[18]=orders.quantity
+  21              MakeRecord    15   4  14                     0  r[14]=mkrec(r[15..18])
+  22              SorterInsert   1  14   0  0                  0  key=r[14]
+  23            Next             5  14   0                     0
+  24            IfPos           20  28   0                     0  r[20]>0 -> r[20]-=0, goto 28
+  25            NullRow          4   0   0                     0  Set cursor 4 to a (pseudo) NULL row
+  26            NullRow          5   0   0                     0  Set cursor 5 to a (pseudo) NULL row
+  27            Goto             0  16   0                     0
+  28          Next               3  11   0                     0
+  29          OpenPseudo         2  14   4                     0  4 columns in r[14]
+  30          SorterSort         1  49   0                     0
+  31            SorterData       1  14   2                     0  r[14]=data
+  32            Column           2   0  22                     0  r[22]=pseudo.column 0
+  33            Compare          9  22   1  k(1, Binary)       0  r[9..9]==r[22..22]
+  34            Jump            35  39  35                     0  ; start new group if comparison is not equal
+  35            Gosub            6  53   0                     0  ; check if ended group had data, and output if so
+  36            Move            22   9   1                     0  r[9..9]=r[22..22]
+  37            IfPos            8  68   0                     0  r[8]>0 -> r[8]-=0, goto 68; check abort flag
+  38            Gosub           19  65   0                     0  ; goto clear accumulator subroutine
+  39            Column           2   1  23                     0  r[23]=pseudo.column 1
+  40            AggStep          0  23  11  count              0  accum=r[11] step(r[23])
+  41            Column           2   2  24                     0  r[24]=pseudo.column 2
+  42            AggStep          0  24  12  sum                0  accum=r[12] step(r[24])
+  43            Column           2   3  25                     0  r[25]=pseudo.column 3
+  44            AggStep          0  25  13  avg                0  accum=r[13] step(r[25])
+  45            If               7  47   0                     0  if r[7] goto 47; don't emit group columns if continuing existing group
+  46            Column           2   0  10                     0  r[10]=pseudo.column 0
+  47            Integer          1   7   0                     0  r[7]=1; indicate data in accumulator
+  48          SorterNext         1  31   0                     0
+  49          Gosub              6  53   0                     0  ; emit row for final group
+  50          Goto               0  68   0                     0  ; group by finished
+  51          Integer            1   8   0                     0  r[8]=1
+  52        Return               6   0   0                     0
+  53        IfPos                7  55   0                     0  r[7]>0 -> r[7]-=0, goto 55; output group by row subroutine start
+  54      Return                 6   0   0                     0
+  55      AggFinal               0  11   0  count              0  accum=r[11]
+  56      AggFinal               0  12   0  sum                0  accum=r[12]
+  57      AggFinal               0  13   0  avg                0  accum=r[13]
+  58      Copy                  12  26   0                     0  r[26]=r[12]
+  59      Copy                  10  27   0                     0  r[27]=r[10]
+  60      Copy                  11  28   0                     0  r[28]=r[11]
+  61      Copy                  13  29   0                     0  r[29]=r[13]
+  62      MakeRecord            26   4   5                     0  r[5]=mkrec(r[26..29])
+  63      SorterInsert           0   5   0  0                  0  key=r[5]
+  64    Return                   6   0   0                     0
+  65    Null                     0  10  13                     0  r[10..13]=NULL; clear accumulator subroutine start
+  66    Integer                  0   7   0                     0  r[7]=0
+  67  Return                    19   0   0                     0
+  68  OpenPseudo                 6   5   4                     0  4 columns in r[5]
+  69  SorterSort                 0  77   0                     0
+  70    SorterData               0   5   6                     0  r[5]=data
+  71    Column                   6   1   1                     0  r[1]=pseudo.column 1
+  72    Column                   6   2   2                     0  r[2]=pseudo.column 2
+  73    Column                   6   0   3                     0  r[3]=pseudo.column 0
+  74    Column                   6   3   4                     0  r[4]=pseudo.column 3
+  75    ResultRow                1   4   0                     0  output=r[1..4]
+  76  SorterNext                 0  70   0                     0
+  77  Halt                       0   0   0                     0
+  78  Transaction                0   1   8                     0  iDb=0 tx_mode=Read
+  79  Goto                       0   1   0                     0

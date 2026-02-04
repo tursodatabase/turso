@@ -1,0 +1,49 @@
+---
+source: subqueries.sqltest
+expression: "SELECT o.id, o.order_date, o.total_amount\n    FROM orders o\n    WHERE (\n        SELECT count(*)\n        FROM order_items oi\n        WHERE oi.order_id = o.id\n    ) >= 3;"
+info:
+  statement_type: SELECT
+  tables:
+    - order_items
+    - orders
+  setup_blocks:
+    - schema
+  database: ":memory:"
+---
+QUERY PLAN
+|--SCAN orders AS o
+`--SEARCH oi USING INDEX idx_order_items_order
+
+BYTECODE
+addr  opcode           p1  p2  p3  p4            p5  comment
+   0    Init            0  27   0                 0  Start at 27
+   1    OpenRead        0   4   0  k(4,B,B,B,B)   0  table=orders, root=4, iDb=0
+   2    Rewind          0  26   0                 0  Rewind table orders
+   3      BeginSubrtn   5   0   0                 0  r[5]=NULL
+   4      Null          0   1   0                 0  r[1]=NULL
+   5      Null          0   7   0                 0  r[7]=NULL
+   6      Integer       1   8   0                 0  r[8]=1; LIMIT counter
+   7      IfNot         8  14   0                 0  if !r[8] goto 14
+   8      OpenRead      1  10   0  k(2,B)         0  index=idx_order_items_order, root=10, iDb=0
+   9      RowId         0   9   0                 0  r[9]=orders.rowid
+  10      SeekGE        1  14   9                 0  key=[9..9]
+  11        IdxGT       1  14   9                 0  key=[9..9]
+  12        AggStep     0  10   7  count          0  accum=r[7] step(r[10])
+  13      Next          1  11   0                 0
+  14      AggFinal      0   7   0  count          0  accum=r[7]
+  15      Copy          7   6   0                 0  r[6]=r[7]
+  16      Copy          6   1   0                 0  r[1]=r[6]
+  17    Return          5   0   1                 0
+  18    Copy            1  12   0                 0  r[12]=r[1]
+  19    Lt             12  13  25  Binary         0  if r[12]<r[13] goto 25
+  20    RowId           0   2   0                 0  r[2]=orders.rowid
+  21    Column          0   2   3                 0  r[3]=orders.order_date
+  22    Column          0   3   4                 0  r[4]=orders.total_amount
+  23    RealAffinity    4   0   0                 0
+  24    ResultRow       2   3   0                 0  output=r[2..4]
+  25  Next              0   3   0                 0
+  26  Halt              0   0   0                 0
+  27  Transaction       0   1  11                 0  iDb=0 tx_mode=Read
+  28  Integer           1  10   0                 0  r[10]=1
+  29  Integer           3  13   0                 0  r[13]=3
+  30  Goto              0   1   0                 0
