@@ -1494,6 +1494,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 tx.record_created_table_version(id.clone(), version_id);
                 let allocator = self.get_rowid_allocator(&id.table_id);
                 allocator.insert_row_id_maybe_update(id.row_id.to_int_or_panic());
+                self.check_rowid_conflict(tx, &id)?;
                 self.insert_version(id, row_version);
             }
         }
@@ -3101,6 +3102,30 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     pub fn is_btree_allocated(&self, table_id: &MVTableId) -> bool {
         let maybe_root_page = self.table_id_to_rootpage.get(table_id);
         maybe_root_page.is_some_and(|entry| entry.value().is_some())
+    }
+
+    fn check_rowid_conflict(&self, tx: &Transaction, id: &RowID) -> Result<()> {
+        let row_versions = self.rows.get(id);
+        if row_versions.is_none() {
+            return Ok(());
+        }
+
+        let row_versions = row_versions.unwrap();
+        let row_versions = row_versions.value();
+        let row_versions = row_versions.write();
+        let conflict = row_versions.iter().rev().any(|version| {
+            // Check if there is another version with same rowid visible or there is another version with same rowid being inserted
+            version.is_visible_to(tx, &self.txs)
+                || version
+                    .begin
+                    .as_ref()
+                    .is_some_and(|version| matches!(version, TxTimestampOrID::TxID(_)))
+        });
+        if conflict {
+            Err(LimboError::WriteWriteConflict)
+        } else {
+            Ok(())
+        }
     }
 }
 
