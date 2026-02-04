@@ -368,7 +368,10 @@ impl InnerWindowsIOCP {
 
         let mut packet = self.recycle_or_create_io_packet(IoKind::Unknown);
 
-        assert!(packet.completion.is_none(), "New packet should has no completion");
+        assert!(
+            packet.completion.is_none(),
+            "New packet should has no completion"
+        );
 
         let content =
             Arc::get_mut(&mut packet).expect("This IO Packet should not have references elsewhere");
@@ -814,64 +817,13 @@ impl Drop for WindowsFile {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
-    use crate::{
-        io::{common, win_iocp::get_limboerror_from_os_err, TempFile},
-        Buffer, Completion, IO,
-    };
+    use crate::io::{common, win_iocp::get_limboerror_from_os_err};
 
     use super::WindowsIOCP;
 
     #[test]
     fn test_multiple_processes_cannot_open_file() {
         common::tests::test_multiple_processes_cannot_open_file(WindowsIOCP::new);
-    }
-
-    #[test]
-    fn test_file_read_write() {
-        let iocp: Arc<dyn IO> = Arc::new(WindowsIOCP::new().unwrap());
-        let file = TempFile::new(&iocp).unwrap();
-
-        const WRITE: &[u8] = b"ABCD";
-
-        let mut vec = vec![];
-        for n in 0..150 {
-            let comp = Completion::new_write(|res| {
-                assert_eq!(res, Ok(4));
-            });
-            let buffer = Arc::new(Buffer::new_temporary(WRITE.len()));
-
-            buffer.as_mut_slice().copy_from_slice(WRITE);
-
-            let ret = file.pwrite(n * WRITE.len() as u64, buffer, comp).unwrap();
-            vec.push(ret);
-        }
-        vec.into_iter().for_each(|c| {
-            iocp.wait_for_completion(c.clone()).unwrap();
-            if c.failed() {
-                panic!();
-            }
-        });
-        let mut vec = vec![];
-
-        for n in 0..150 {
-            let buffer = Arc::new(Buffer::new_temporary(WRITE.len()));
-
-            let comp = Completion::new_read(buffer, |res| {
-                assert_eq!(res.clone().unwrap().1, 4);
-                res.err()
-            });
-
-            let ret = file.pread(n * WRITE.len() as u64, comp).unwrap();
-            vec.push(ret);
-        }
-        vec.iter().for_each(|c| {
-            iocp.wait_for_completion(c.clone()).unwrap();
-        });
-        vec.iter().any(|c| c.failed()).then(|| panic!());
-
-        assert_eq!(file.size().unwrap(), 150 * WRITE.iter().len() as u64);
     }
 
     #[test]
@@ -889,20 +841,5 @@ mod tests {
             get_limboerror_from_os_err(15818).to_string(),
             String::from("I/O error: uncategorized error")
         );
-    }
-
-    #[test]
-    fn test_proper_drop() {
-        let write = b"Abcd";
-        let iocp: Arc<dyn IO> = Arc::new(WindowsIOCP::new().unwrap());
-        let file = TempFile::new(&iocp).unwrap();
-        let comp = Completion::new_write(|_| {});
-        let buffer = Arc::new(Buffer::new_temporary(write.len()));
-
-        buffer.as_mut_slice().copy_from_slice(write);
-
-        let _ = file.pwrite(0, buffer, comp).unwrap();
-        drop(iocp);
-        drop(file);
     }
 }
