@@ -16,62 +16,19 @@ pub fn generate_expr<C: Capabilities>(
     table: &Table,
     depth: usize,
 ) -> Result<Expr, GenError> {
-    // Check depth limit
+    // At max depth, only generate simple expressions
     if depth >= generator.policy().max_expr_depth {
-        // At max depth, only generate simple expressions
         return generate_simple_expr(generator, ctx, table);
     }
 
-    let weights = &generator.policy().expr_weights;
-
-    // Build candidates with weights
-    let mut candidates: Vec<(ExprType, u32)> = vec![
-        (ExprType::ColumnRef, weights.column_ref),
-        (ExprType::Literal, weights.literal),
-    ];
-
-    // Add complex expressions if we have depth budget
-    if depth < generator.policy().max_expr_depth {
-        candidates.push((ExprType::BinaryOp, weights.binary_op));
-        candidates.push((ExprType::UnaryOp, weights.unary_op));
-        candidates.push((ExprType::IsNull, weights.is_null));
-        candidates.push((ExprType::Between, weights.between));
-        candidates.push((ExprType::InList, weights.in_list));
-
-        if weights.case_expr > 0 {
-            candidates.push((ExprType::CaseExpr, weights.case_expr));
-        }
-
-        if weights.cast > 0 {
-            candidates.push((ExprType::Cast, weights.cast));
-        }
-
-        // Subqueries require capability and depth budget
-        if C::SUBQUERY
-            && weights.subquery > 0
-            && ctx.subquery_depth() < generator.policy().max_subquery_depth
-        {
-            candidates.push((ExprType::Subquery, weights.subquery));
-        }
-    }
+    let candidates = build_expr_candidates::<C>(generator, ctx, depth);
 
     let expr_type = generator
         .policy()
         .select_weighted(ctx, &candidates)
         .map_err(|e| e.with_context("generating expression"))?;
 
-    match expr_type {
-        ExprType::ColumnRef => generate_column_ref(ctx, table),
-        ExprType::Literal => generate_literal_expr(generator, ctx, table),
-        ExprType::BinaryOp => generate_binary_op(generator, ctx, table, depth),
-        ExprType::UnaryOp => generate_unary_op(generator, ctx, table, depth),
-        ExprType::IsNull => generate_is_null(generator, ctx, table, depth),
-        ExprType::Between => generate_between(generator, ctx, table, depth),
-        ExprType::InList => generate_in_list(generator, ctx, table, depth),
-        ExprType::CaseExpr => generate_case(generator, ctx, table, depth),
-        ExprType::Cast => generate_cast(generator, ctx, table, depth),
-        ExprType::Subquery => generate_subquery_expr(generator, ctx),
-    }
+    dispatch_expr_generation(generator, ctx, table, depth, expr_type)
 }
 
 #[derive(Clone, Copy)]
@@ -86,6 +43,85 @@ enum ExprType {
     CaseExpr,
     Cast,
     Subquery,
+}
+
+/// Build expression candidates with their weights.
+fn build_expr_candidates<C: Capabilities>(
+    generator: &SqlGen<C>,
+    ctx: &Context,
+    depth: usize,
+) -> Vec<(ExprType, u32)> {
+    let mut candidates = build_simple_expr_candidates(generator);
+
+    if depth < generator.policy().max_expr_depth {
+        add_complex_expr_candidates::<C>(generator, ctx, &mut candidates);
+    }
+
+    candidates
+}
+
+/// Build candidates for simple expressions (always available).
+fn build_simple_expr_candidates<C: Capabilities>(generator: &SqlGen<C>) -> Vec<(ExprType, u32)> {
+    let weights = &generator.policy().expr_weights;
+    vec![
+        (ExprType::ColumnRef, weights.column_ref),
+        (ExprType::Literal, weights.literal),
+    ]
+}
+
+/// Add complex expression candidates when depth budget allows.
+fn add_complex_expr_candidates<C: Capabilities>(
+    generator: &SqlGen<C>,
+    ctx: &Context,
+    candidates: &mut Vec<(ExprType, u32)>,
+) {
+    let weights = &generator.policy().expr_weights;
+
+    // Core complex expressions
+    candidates.push((ExprType::BinaryOp, weights.binary_op));
+    candidates.push((ExprType::UnaryOp, weights.unary_op));
+    candidates.push((ExprType::IsNull, weights.is_null));
+    candidates.push((ExprType::Between, weights.between));
+    candidates.push((ExprType::InList, weights.in_list));
+
+    // Optional expressions (only if weight > 0)
+    if weights.case_expr > 0 {
+        candidates.push((ExprType::CaseExpr, weights.case_expr));
+    }
+
+    if weights.cast > 0 {
+        candidates.push((ExprType::Cast, weights.cast));
+    }
+
+    // Subqueries require capability and depth budget
+    if C::SUBQUERY
+        && weights.subquery > 0
+        && ctx.subquery_depth() < generator.policy().max_subquery_depth
+    {
+        candidates.push((ExprType::Subquery, weights.subquery));
+    }
+}
+
+/// Dispatch to the appropriate expression generator.
+fn dispatch_expr_generation<C: Capabilities>(
+    generator: &SqlGen<C>,
+    ctx: &mut Context,
+    table: &Table,
+    depth: usize,
+    expr_type: ExprType,
+) -> Result<Expr, GenError> {
+    match expr_type {
+        ExprType::ColumnRef => generate_column_ref(ctx, table),
+        ExprType::Literal => generate_literal_expr(generator, ctx, table),
+        ExprType::BinaryOp => generate_binary_op(generator, ctx, table, depth),
+        ExprType::UnaryOp => generate_unary_op(generator, ctx, table, depth),
+        ExprType::IsNull => generate_is_null(generator, ctx, table, depth),
+        ExprType::Between => generate_between(generator, ctx, table, depth),
+        ExprType::InList => generate_in_list(generator, ctx, table, depth),
+        ExprType::CaseExpr => generate_case(generator, ctx, table, depth),
+        ExprType::Cast => generate_cast(generator, ctx, table, depth),
+        ExprType::Subquery => generate_subquery_expr(generator, ctx),
+    }
 }
 
 /// Generate a simple expression (column ref or literal).
@@ -308,30 +344,9 @@ pub fn generate_condition<C: Capabilities>(
 ) -> Result<Expr, GenError> {
     ctx.enter_scope(Origin::Where);
 
-    // For WHERE, prefer comparison expressions
-    let weights = &generator.policy().expr_weights;
-
-    let mut candidates = vec![
-        (CondType::Comparison, weights.column_ref + weights.literal),
-        (CondType::IsNull, weights.is_null),
-        (CondType::Between, weights.between),
-        (CondType::InList, weights.in_list),
-    ];
-
-    // Compound conditions with AND/OR
-    if ctx.depth() < 3 {
-        candidates.push((CondType::Compound, weights.binary_op));
-    }
-
+    let candidates = build_condition_candidates(generator, ctx);
     let cond_type = generator.policy().select_weighted(ctx, &candidates)?;
-
-    let result = match cond_type {
-        CondType::Comparison => generate_comparison(generator, ctx, table),
-        CondType::IsNull => generate_is_null(generator, ctx, table, 0),
-        CondType::Between => generate_between(generator, ctx, table, 0),
-        CondType::InList => generate_in_list(generator, ctx, table, 0),
-        CondType::Compound => generate_compound_condition(generator, ctx, table),
-    };
+    let result = dispatch_condition_generation(generator, ctx, table, cond_type);
 
     ctx.exit_scope();
     result
@@ -344,6 +359,44 @@ enum CondType {
     Between,
     InList,
     Compound,
+}
+
+/// Build condition candidates with their weights.
+fn build_condition_candidates<C: Capabilities>(
+    generator: &SqlGen<C>,
+    ctx: &Context,
+) -> Vec<(CondType, u32)> {
+    let weights = &generator.policy().expr_weights;
+
+    let mut candidates = vec![
+        (CondType::Comparison, weights.column_ref + weights.literal),
+        (CondType::IsNull, weights.is_null),
+        (CondType::Between, weights.between),
+        (CondType::InList, weights.in_list),
+    ];
+
+    // Compound conditions with AND/OR (limited depth to avoid deep nesting)
+    if ctx.depth() < 3 {
+        candidates.push((CondType::Compound, weights.binary_op));
+    }
+
+    candidates
+}
+
+/// Dispatch to the appropriate condition generator.
+fn dispatch_condition_generation<C: Capabilities>(
+    generator: &SqlGen<C>,
+    ctx: &mut Context,
+    table: &Table,
+    cond_type: CondType,
+) -> Result<Expr, GenError> {
+    match cond_type {
+        CondType::Comparison => generate_comparison(generator, ctx, table),
+        CondType::IsNull => generate_is_null(generator, ctx, table, 0),
+        CondType::Between => generate_between(generator, ctx, table, 0),
+        CondType::InList => generate_in_list(generator, ctx, table, 0),
+        CondType::Compound => generate_compound_condition(generator, ctx, table),
+    }
 }
 
 /// Generate a simple comparison (column op value).

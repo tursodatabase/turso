@@ -19,7 +19,41 @@ pub fn generate_statement<C: Capabilities>(
     generator: &SqlGen<C>,
     ctx: &mut Context,
 ) -> Result<Stmt, GenError> {
-    // Build list of allowed statement kinds based on capabilities
+    let candidates = build_stmt_candidates::<C>(generator)?;
+
+    let kind = generator.policy().select_stmt_kind(ctx, &candidates)?;
+    ctx.record_stmt(kind);
+
+    dispatch_stmt_generation(generator, ctx, kind)
+}
+
+/// Build list of allowed statement kinds based on capabilities and policy weights.
+fn build_stmt_candidates<C: Capabilities>(
+    generator: &SqlGen<C>,
+) -> Result<Vec<StmtKind>, GenError> {
+    let capability_candidates = collect_capability_allowed_stmts::<C>();
+
+    if capability_candidates.is_empty() {
+        return Err(GenError::exhausted(
+            "statement",
+            "no statement types allowed by capabilities",
+        ));
+    }
+
+    let weighted_candidates = filter_by_policy_weight(generator, capability_candidates);
+
+    if weighted_candidates.is_empty() {
+        return Err(GenError::exhausted(
+            "statement",
+            "all allowed statement types have zero weight",
+        ));
+    }
+
+    Ok(weighted_candidates)
+}
+
+/// Collect statement kinds allowed by the capability type parameter.
+fn collect_capability_allowed_stmts<C: Capabilities>() -> Vec<StmtKind> {
     let mut candidates = Vec::new();
 
     if C::SELECT {
@@ -56,30 +90,26 @@ pub fn generate_statement<C: Capabilities>(
         candidates.push(StmtKind::Rollback);
     }
 
-    if candidates.is_empty() {
-        return Err(GenError::exhausted(
-            "statement",
-            "no statement types allowed by capabilities",
-        ));
-    }
+    candidates
+}
 
-    // Filter to only statements with weight > 0
-    let candidates: Vec<_> = candidates
+/// Filter candidates to only those with positive policy weight.
+fn filter_by_policy_weight<C: Capabilities>(
+    generator: &SqlGen<C>,
+    candidates: Vec<StmtKind>,
+) -> Vec<StmtKind> {
+    candidates
         .into_iter()
         .filter(|k| generator.policy().stmt_weights.weight_for(*k) > 0)
-        .collect();
+        .collect()
+}
 
-    if candidates.is_empty() {
-        return Err(GenError::exhausted(
-            "statement",
-            "all allowed statement types have zero weight",
-        ));
-    }
-
-    // Select based on weights
-    let kind = generator.policy().select_stmt_kind(ctx, &candidates)?;
-    ctx.record_stmt(kind);
-
+/// Dispatch to the appropriate statement generator.
+fn dispatch_stmt_generation<C: Capabilities>(
+    generator: &SqlGen<C>,
+    ctx: &mut Context,
+    kind: StmtKind,
+) -> Result<Stmt, GenError> {
     match kind {
         StmtKind::Select => generate_select(generator, ctx),
         StmtKind::Insert => generate_insert(generator, ctx),
