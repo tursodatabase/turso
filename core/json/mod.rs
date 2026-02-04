@@ -297,11 +297,18 @@ where
             )
         })?;
 
-        let path = json_path_from_db_value(&first, true)?;
-
         let second = args.next().ok_or_else(|| {
             crate::LimboError::InternalError("args should have second element in loop".to_string())
         })?;
+
+        if second.as_value_ref().value_type() == ValueType::Blob {
+            return Err(crate::LimboError::Constraint(
+                "JSON cannot hold BLOB values".to_string(),
+            ));
+        }
+
+        let path = json_path_from_db_value(&first, true)?;
+
         let value = convert_dbtype_to_jsonb(second, Conv::NotStrict)?;
         let mut op = SetOperation::new(value);
         if let Some(path) = path {
