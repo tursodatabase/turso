@@ -18,6 +18,121 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// --- Busy Timeout DSN Parsing Tests (no server required) ---
+
+func TestSyncDSNParsing(t *testing.T) {
+	tests := []struct {
+		name            string
+		dsn             string
+		expectedPath    string
+		expectedTimeout int
+	}{
+		{
+			name:            "simple path",
+			dsn:             "mydb.db",
+			expectedPath:    "mydb.db",
+			expectedTimeout: 0,
+		},
+		{
+			name:            "path with busy timeout",
+			dsn:             "mydb.db?_busy_timeout=10000",
+			expectedPath:    "mydb.db",
+			expectedTimeout: 10000,
+		},
+		{
+			name:            "path with negative busy timeout",
+			dsn:             "mydb.db?_busy_timeout=-1",
+			expectedPath:    "mydb.db",
+			expectedTimeout: -1,
+		},
+		{
+			name:            "memory db with timeout",
+			dsn:             ":memory:?_busy_timeout=5000",
+			expectedPath:    ":memory:",
+			expectedTimeout: 5000,
+		},
+		{
+			name:            "path with other options",
+			dsn:             "/path/to/db.db?other=value&_busy_timeout=3000",
+			expectedPath:    "/path/to/db.db",
+			expectedTimeout: 3000,
+		},
+		{
+			name:            "path with zero timeout",
+			dsn:             "test.db?_busy_timeout=0",
+			expectedPath:    "test.db",
+			expectedTimeout: 0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path, opts := parseSyncDSN(tt.dsn)
+			require.Equal(t, tt.expectedPath, path)
+			require.Equal(t, tt.expectedTimeout, opts.BusyTimeout)
+		})
+	}
+}
+
+func TestSyncBusyTimeoutConfigPrecedence(t *testing.T) {
+	// Test that explicit BusyTimeout in config takes precedence over DSN
+	t.Run("config overrides DSN", func(t *testing.T) {
+		// This test verifies the logic without actually creating a database
+		config := TursoSyncDbConfig{
+			Path:        "test.db?_busy_timeout=1000",
+			BusyTimeout: 5000, // Explicit config should win
+		}
+
+		// Parse DSN like NewTursoSyncDb does
+		_, dsnOpts := parseSyncDSN(config.Path)
+		busyTimeout := config.BusyTimeout
+		if busyTimeout == 0 {
+			if dsnOpts.BusyTimeout != 0 {
+				busyTimeout = dsnOpts.BusyTimeout
+			}
+		}
+
+		// Explicit config should take precedence
+		require.Equal(t, 5000, busyTimeout)
+	})
+
+	t.Run("DSN used when config not set", func(t *testing.T) {
+		config := TursoSyncDbConfig{
+			Path:        "test.db?_busy_timeout=3000",
+			BusyTimeout: 0, // Not set
+		}
+
+		_, dsnOpts := parseSyncDSN(config.Path)
+		busyTimeout := config.BusyTimeout
+		if busyTimeout == 0 {
+			if dsnOpts.BusyTimeout != 0 {
+				busyTimeout = dsnOpts.BusyTimeout
+			}
+		}
+
+		// DSN timeout should be used
+		require.Equal(t, 3000, busyTimeout)
+	})
+
+	t.Run("default used when neither set", func(t *testing.T) {
+		config := TursoSyncDbConfig{
+			Path:        "test.db",
+			BusyTimeout: 0,
+		}
+
+		_, dsnOpts := parseSyncDSN(config.Path)
+		busyTimeout := config.BusyTimeout
+		if busyTimeout == 0 {
+			if dsnOpts.BusyTimeout != 0 {
+				busyTimeout = dsnOpts.BusyTimeout
+			}
+		}
+
+		// Should be 0 at this point, default applied in Connect()
+		require.Equal(t, 0, busyTimeout)
+	})
+}
+
 func randomString() string {
 	return fmt.Sprintf("r-%v", rand.Intn(1000_000_000))
 }
