@@ -33,8 +33,9 @@ type tursoDbConnection struct {
 	conn    TursoConnection
 	extraIo func() error
 
-	mu     sync.Mutex
-	closed bool
+	mu          sync.Mutex
+	closed      bool
+	busyTimeout int // current busy timeout in milliseconds
 	// keep flags for configuration if needed
 	async bool
 }
@@ -106,13 +107,24 @@ func (d *tursoDbDriver) Open(dsn string) (driver.Conn, error) {
 		turso_database_deinit(db)
 		return nil, err
 	}
-	if config.BusyTimeout > 0 {
-		turso_connection_set_busy_timeout_ms(c, int64(config.BusyTimeout))
+	// Apply busy timeout - use default if not explicitly set
+	// A value of -1 in config means explicitly disabled (no timeout)
+	// A value of 0 means use the default timeout
+	// A positive value is used as-is
+	timeout := config.BusyTimeout
+	if timeout == 0 {
+		timeout = DefaultBusyTimeout // Apply sensible default
+	} else if timeout < 0 {
+		timeout = 0 // -1 means explicitly disable
+	}
+	if timeout > 0 {
+		turso_connection_set_busy_timeout_ms(c, int64(timeout))
 	}
 	return &tursoDbConnection{
-		db:    db,
-		conn:  c,
-		async: config.AsyncIO,
+		db:          db,
+		conn:        c,
+		busyTimeout: timeout,
+		async:       config.AsyncIO,
 	}, nil
 }
 
@@ -301,6 +313,124 @@ func (c *tursoDbConnection) checkOpen() error {
 	}
 	return nil
 }
+
+// SetBusyTimeout sets the busy timeout for this connection in milliseconds.
+// Pass 0 to disable the busy handler (immediate SQLITE_BUSY on contention).
+// This method is thread-safe.
+func (c *tursoDbConnection) SetBusyTimeout(timeoutMs int) error {
+	if err := c.checkOpen(); err != nil {
+		return err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if timeoutMs < 0 {
+		timeoutMs = 0
+	}
+	turso_connection_set_busy_timeout_ms(c.conn, int64(timeoutMs))
+	c.busyTimeout = timeoutMs
+	return nil
+}
+
+// GetBusyTimeout returns the current busy timeout in milliseconds.
+// Returns 0 if the busy handler is disabled.
+func (c *tursoDbConnection) GetBusyTimeout() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.busyTimeout
+}
+
+// --- Connector Pattern ---
+
+// ConnectorOption configures a TursoConnector.
+type ConnectorOption func(*TursoConnector)
+
+// WithBusyTimeout sets the busy timeout in milliseconds.
+// Use 0 to disable the busy handler, -1 to use the default (5000ms).
+func WithBusyTimeout(ms int) ConnectorOption {
+	return func(c *TursoConnector) {
+		c.busyTimeout = ms
+	}
+}
+
+// TursoConnector implements driver.Connector for programmatic configuration.
+type TursoConnector struct {
+	dsn         string
+	busyTimeout int // -1 = use default, 0 = disabled, >0 = custom
+}
+
+// NewConnector creates a new TursoConnector with the given DSN and options.
+// By default, uses the DefaultBusyTimeout (5000ms).
+func NewConnector(dsn string, opts ...ConnectorOption) (*TursoConnector, error) {
+	c := &TursoConnector{
+		dsn:         dsn,
+		busyTimeout: -1, // -1 means use default
+	}
+	for _, opt := range opts {
+		opt(c)
+	}
+	return c, nil
+}
+
+// Connect implements driver.Connector.
+func (c *TursoConnector) Connect(ctx context.Context) (driver.Conn, error) {
+	InitLibrary(turso_libs.LoadTursoLibraryConfig{})
+	config, err := parseDSN(c.dsn)
+	if err != nil {
+		return nil, err
+	}
+	// Override busy timeout from connector if set
+	if c.busyTimeout >= 0 {
+		// If connector explicitly sets 0, that means disabled
+		// We use -1 internally to signal "disabled" to Open logic
+		if c.busyTimeout == 0 {
+			config.BusyTimeout = -1 // Will be converted to 0 in Open
+		} else {
+			config.BusyTimeout = c.busyTimeout
+		}
+	}
+	// If busyTimeout is -1 (use default) and DSN didn't set one, leave it as 0
+	// which will trigger the default in Open()
+
+	db, err := turso_database_new(config)
+	if err != nil {
+		return nil, err
+	}
+	if err := turso_database_open(db); err != nil {
+		turso_database_deinit(db)
+		return nil, err
+	}
+	conn, err := turso_database_connect(db)
+	if err != nil {
+		turso_database_deinit(db)
+		return nil, err
+	}
+
+	// Apply busy timeout - same logic as Open()
+	timeout := config.BusyTimeout
+	if timeout == 0 {
+		timeout = DefaultBusyTimeout
+	} else if timeout < 0 {
+		timeout = 0
+	}
+	if timeout > 0 {
+		turso_connection_set_busy_timeout_ms(conn, int64(timeout))
+	}
+
+	return &tursoDbConnection{
+		db:          db,
+		conn:        conn,
+		busyTimeout: timeout,
+		async:       config.AsyncIO,
+	}, nil
+}
+
+// Driver implements driver.Connector.
+func (c *TursoConnector) Driver() driver.Driver {
+	return &tursoDbDriver{}
+}
+
+// Ensure TursoConnector implements driver.Connector
+var _ driver.Connector = (*TursoConnector)(nil)
 
 // --- driver.Stmt and friends ---
 
