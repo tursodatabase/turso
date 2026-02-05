@@ -8,7 +8,7 @@ use crate::error::GenError;
 use crate::functions::FunctionDef;
 use crate::generate::literal::generate_literal;
 use crate::schema::{DataType, Table};
-use crate::trace::Origin;
+use crate::trace::{ExprKind, Origin};
 use sql_gen_macros::trace_gen;
 
 /// Generate an expression.
@@ -33,29 +33,12 @@ pub fn generate_expr<C: Capabilities>(
     dispatch_expr_generation(generator, ctx, table, depth, expr_type)
 }
 
-#[derive(Clone, Copy)]
-enum ExprType {
-    ColumnRef,
-    Literal,
-    BinaryOp,
-    UnaryOp,
-    FunctionCall,
-    IsNull,
-    Between,
-    InList,
-    InSubquery,
-    CaseExpr,
-    Cast,
-    Subquery,
-    Exists,
-}
-
 /// Build expression candidates with their weights.
 fn build_expr_candidates<C: Capabilities>(
     generator: &SqlGen<C>,
     ctx: &Context,
     depth: usize,
-) -> Vec<(ExprType, u32)> {
+) -> Vec<(ExprKind, u32)> {
     let mut candidates = build_simple_expr_candidates(generator);
 
     if depth < generator.policy().max_expr_depth {
@@ -66,11 +49,11 @@ fn build_expr_candidates<C: Capabilities>(
 }
 
 /// Build candidates for simple expressions (always available).
-fn build_simple_expr_candidates<C: Capabilities>(generator: &SqlGen<C>) -> Vec<(ExprType, u32)> {
+fn build_simple_expr_candidates<C: Capabilities>(generator: &SqlGen<C>) -> Vec<(ExprKind, u32)> {
     let weights = &generator.policy().expr_weights;
     vec![
-        (ExprType::ColumnRef, weights.column_ref),
-        (ExprType::Literal, weights.literal),
+        (ExprKind::ColumnRef, weights.column_ref),
+        (ExprKind::Literal, weights.literal),
     ]
 }
 
@@ -78,40 +61,40 @@ fn build_simple_expr_candidates<C: Capabilities>(generator: &SqlGen<C>) -> Vec<(
 fn add_complex_expr_candidates<C: Capabilities>(
     generator: &SqlGen<C>,
     ctx: &Context,
-    candidates: &mut Vec<(ExprType, u32)>,
+    candidates: &mut Vec<(ExprKind, u32)>,
 ) {
     let weights = &generator.policy().expr_weights;
 
     // Core complex expressions
-    candidates.push((ExprType::BinaryOp, weights.binary_op));
-    candidates.push((ExprType::UnaryOp, weights.unary_op));
-    candidates.push((ExprType::IsNull, weights.is_null));
-    candidates.push((ExprType::Between, weights.between));
-    candidates.push((ExprType::InList, weights.in_list));
+    candidates.push((ExprKind::BinaryOp, weights.binary_op));
+    candidates.push((ExprKind::UnaryOp, weights.unary_op));
+    candidates.push((ExprKind::IsNull, weights.is_null));
+    candidates.push((ExprKind::Between, weights.between));
+    candidates.push((ExprKind::InList, weights.in_list));
 
     // Optional expressions (only if weight > 0)
     if weights.function_call > 0 {
-        candidates.push((ExprType::FunctionCall, weights.function_call));
+        candidates.push((ExprKind::FunctionCall, weights.function_call));
     }
 
     if weights.case_expr > 0 {
-        candidates.push((ExprType::CaseExpr, weights.case_expr));
+        candidates.push((ExprKind::Case, weights.case_expr));
     }
 
     if weights.cast > 0 {
-        candidates.push((ExprType::Cast, weights.cast));
+        candidates.push((ExprKind::Cast, weights.cast));
     }
 
     // Subqueries require capability and depth budget
     if C::SUBQUERY && ctx.subquery_depth() < generator.policy().max_subquery_depth {
         if weights.subquery > 0 {
-            candidates.push((ExprType::Subquery, weights.subquery));
+            candidates.push((ExprKind::Subquery, weights.subquery));
         }
         if weights.in_subquery > 0 {
-            candidates.push((ExprType::InSubquery, weights.in_subquery));
+            candidates.push((ExprKind::InSubquery, weights.in_subquery));
         }
         if weights.exists > 0 {
-            candidates.push((ExprType::Exists, weights.exists));
+            candidates.push((ExprKind::Exists, weights.exists));
         }
     }
 }
@@ -122,22 +105,24 @@ fn dispatch_expr_generation<C: Capabilities>(
     ctx: &mut Context,
     table: &Table,
     depth: usize,
-    expr_type: ExprType,
+    expr_type: ExprKind,
 ) -> Result<Expr, GenError> {
     match expr_type {
-        ExprType::ColumnRef => generate_column_ref(ctx, table),
-        ExprType::Literal => generate_literal_expr(generator, ctx, table),
-        ExprType::BinaryOp => generate_binary_op(generator, ctx, table, depth),
-        ExprType::UnaryOp => generate_unary_op(generator, ctx, table, depth),
-        ExprType::FunctionCall => generate_function_call(generator, ctx, table, depth),
-        ExprType::IsNull => generate_is_null(generator, ctx, table, depth),
-        ExprType::Between => generate_between(generator, ctx, table, depth),
-        ExprType::InList => generate_in_list(generator, ctx, table, depth),
-        ExprType::InSubquery => generate_in_subquery(generator, ctx, table, depth),
-        ExprType::CaseExpr => generate_case(generator, ctx, table, depth),
-        ExprType::Cast => generate_cast(generator, ctx, table, depth),
-        ExprType::Subquery => generate_subquery_expr(generator, ctx),
-        ExprType::Exists => generate_exists(generator, ctx),
+        ExprKind::ColumnRef => generate_column_ref(ctx, table),
+        ExprKind::Literal => generate_literal_expr(generator, ctx, table),
+        ExprKind::BinaryOp => generate_binary_op(generator, ctx, table, depth),
+        ExprKind::UnaryOp => generate_unary_op(generator, ctx, table, depth),
+        ExprKind::FunctionCall => generate_function_call(generator, ctx, table, depth),
+        ExprKind::IsNull => generate_is_null(generator, ctx, table, depth),
+        ExprKind::Between => generate_between(generator, ctx, table, depth),
+        ExprKind::InList => generate_in_list(generator, ctx, table, depth),
+        ExprKind::InSubquery => generate_in_subquery(generator, ctx, table, depth),
+        ExprKind::Case => generate_case(generator, ctx, table, depth),
+        ExprKind::Cast => generate_cast(generator, ctx, table, depth),
+        ExprKind::Subquery => generate_subquery_expr(generator, ctx),
+        ExprKind::Exists => generate_exists(generator, ctx),
+        // Parenthesized is not generated directly - it's just for grouping
+        ExprKind::Parenthesized => unreachable!("parenthesized is not generated directly")
     }
 }
 
