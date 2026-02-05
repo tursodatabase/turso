@@ -163,11 +163,28 @@ impl Index {
     }
 }
 
+/// A trigger definition in a schema.
+#[derive(Debug, Clone)]
+pub struct Trigger {
+    pub name: String,
+    pub table_name: String,
+}
+
+impl Trigger {
+    pub fn new(name: impl Into<String>, table_name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            table_name: table_name.into(),
+        }
+    }
+}
+
 /// Builder for constructing a schema.
 #[derive(Debug, Default)]
 pub struct SchemaBuilder {
     tables: Vec<Table>,
     indexes: Vec<Index>,
+    triggers: Vec<Trigger>,
 }
 
 impl SchemaBuilder {
@@ -185,19 +202,26 @@ impl SchemaBuilder {
         self
     }
 
+    pub fn trigger(mut self, trigger: Trigger) -> Self {
+        self.triggers.push(trigger);
+        self
+    }
+
     pub fn build(self) -> Schema {
         Schema {
             tables: self.tables,
             indexes: self.indexes,
+            triggers: self.triggers,
         }
     }
 }
 
-/// A schema containing tables and indexes.
+/// A schema containing tables, indexes, and triggers.
 #[derive(Debug, Clone, Default)]
 pub struct Schema {
     pub tables: Vec<Table>,
     pub indexes: Vec<Index>,
+    pub triggers: Vec<Trigger>,
 }
 
 impl Schema {
@@ -209,6 +233,11 @@ impl Schema {
     /// Returns all index names in the schema.
     pub fn index_names(&self) -> HashSet<String> {
         self.indexes.iter().map(|i| i.name.clone()).collect()
+    }
+
+    /// Returns all trigger names in the schema.
+    pub fn trigger_names(&self) -> HashSet<String> {
+        self.triggers.iter().map(|t| t.name.clone()).collect()
     }
 
     /// Returns a table by name.
