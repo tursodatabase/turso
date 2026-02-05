@@ -139,3 +139,67 @@ pub(crate) fn execute_and_get_ints(conn: &Arc<Connection>, sql: &str) -> Result<
 
     Ok(result)
 }
+
+#[test]
+fn test_wal_read_lock_released_on_conn_drop() {
+    maybe_setup_tracing();
+    let tmp_db = TempDatabase::new("test_wal_read_lock_released.db");
+    let db = tmp_db.limbo_database();
+
+    // Setup: create table and insert data so WAL has content
+    let setup_conn = db.connect().unwrap();
+    setup_conn
+        .execute("CREATE TABLE t (id integer primary key)")
+        .unwrap();
+    setup_conn.execute("INSERT INTO t VALUES (1)").unwrap();
+
+    let conn1 = db.connect().unwrap();
+    let conn2 = db.connect().unwrap();
+
+    // conn1 starts a read transaction and panics while holding the read lock
+    let join_result = std::thread::spawn(move || {
+        conn1.execute("BEGIN").unwrap();
+        conn1.execute("SELECT * FROM t").unwrap();
+        panic!("intentional panic while holding read tx");
+    })
+    .join();
+    assert!(join_result.is_err(), "conn1 thread should panic");
+
+    // TRUNCATE checkpoint requires that there be no readers - this would hang/fail if read lock wasn't released
+    let res = conn2.pragma_update("wal_checkpoint", "TRUNCATE").unwrap();
+    let row = res.first().unwrap();
+    let truncate_succeeded = row.first().unwrap() == &turso_core::Value::Integer(0)
+        && row.get(1).unwrap() == &turso_core::Value::Integer(0)
+        && row.get(2).unwrap() == &turso_core::Value::Integer(0);
+
+    // Expect full truncate, i.e. 0 0 0 result.
+    assert!(
+        truncate_succeeded,
+        "truncate should have succeeded, got checkpoint result: {res:?}"
+    );
+}
+
+#[test]
+fn test_wal_write_lock_released_on_conn_drop() {
+    maybe_setup_tracing();
+    let tmp_db = TempDatabase::new("test_wal_write_lock_released.db");
+    let db = tmp_db.limbo_database();
+
+    let conn1 = db.connect().unwrap();
+    let conn2 = db.connect().unwrap();
+
+    let join_result = std::thread::spawn(move || {
+        conn1.execute("BEGIN IMMEDIATE").unwrap();
+        panic!("intentional panic while holding write tx");
+    })
+    .join();
+    assert!(join_result.is_err(), "conn1 thread should panic");
+
+    conn2.set_busy_handler(Some(Box::new(move |_| {
+        panic!("Got busy, this should not happen");
+    })));
+
+    conn2
+        .execute("CREATE TABLE t (id integer primary key)")
+        .unwrap();
+}
