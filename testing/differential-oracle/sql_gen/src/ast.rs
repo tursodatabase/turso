@@ -23,6 +23,8 @@ pub enum Stmt {
     DropTable(DropTableStmt),
     CreateIndex(CreateIndexStmt),
     DropIndex(DropIndexStmt),
+    CreateTrigger(CreateTriggerStmt),
+    DropTrigger(DropTriggerStmt),
     Begin,
     Commit,
     Rollback,
@@ -39,6 +41,8 @@ impl fmt::Display for Stmt {
             Stmt::DropTable(s) => write!(f, "{s}"),
             Stmt::CreateIndex(s) => write!(f, "{s}"),
             Stmt::DropIndex(s) => write!(f, "{s}"),
+            Stmt::CreateTrigger(s) => write!(f, "{s}"),
+            Stmt::DropTrigger(s) => write!(f, "{s}"),
             Stmt::Begin => write!(f, "BEGIN"),
             Stmt::Commit => write!(f, "COMMIT"),
             Stmt::Rollback => write!(f, "ROLLBACK"),
@@ -397,6 +401,134 @@ pub struct DropIndexStmt {
 impl fmt::Display for DropIndexStmt {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "DROP INDEX ")?;
+        if self.if_exists {
+            write!(f, "IF EXISTS ")?;
+        }
+        write!(f, "{}", self.name)
+    }
+}
+
+/// A CREATE TRIGGER statement.
+#[derive(Debug, Clone)]
+pub struct CreateTriggerStmt {
+    pub name: String,
+    pub table: String,
+    pub timing: TriggerTiming,
+    pub event: TriggerEvent,
+    pub for_each_row: bool,
+    pub when_clause: Option<Expr>,
+    pub body: Vec<TriggerStmt>,
+    pub if_not_exists: bool,
+}
+
+impl fmt::Display for CreateTriggerStmt {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "CREATE TRIGGER ")?;
+        if self.if_not_exists {
+            write!(f, "IF NOT EXISTS ")?;
+        }
+        write!(
+            f,
+            "{} {} {} ON {}",
+            self.name, self.timing, self.event, self.table
+        )?;
+
+        if self.for_each_row {
+            write!(f, " FOR EACH ROW")?;
+        }
+
+        if let Some(when) = &self.when_clause {
+            write!(f, " WHEN {when}")?;
+        }
+
+        write!(f, " BEGIN ")?;
+        for stmt in &self.body {
+            write!(f, "{stmt}; ")?;
+        }
+        write!(f, "END")
+    }
+}
+
+/// Trigger timing (BEFORE, AFTER, INSTEAD OF).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TriggerTiming {
+    Before,
+    After,
+    InsteadOf,
+}
+
+impl fmt::Display for TriggerTiming {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TriggerTiming::Before => write!(f, "BEFORE"),
+            TriggerTiming::After => write!(f, "AFTER"),
+            TriggerTiming::InsteadOf => write!(f, "INSTEAD OF"),
+        }
+    }
+}
+
+/// Trigger event (INSERT, UPDATE, DELETE).
+#[derive(Debug, Clone, PartialEq, Eq, strum::EnumDiscriminants)]
+#[strum_discriminants(name(TriggerEventKind))]
+pub enum TriggerEvent {
+    Insert,
+    Update(Vec<String>), // Optional column list for UPDATE OF
+    Delete,
+}
+
+impl fmt::Display for TriggerEvent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TriggerEvent::Insert => write!(f, "INSERT"),
+            TriggerEvent::Update(cols) => {
+                write!(f, "UPDATE")?;
+                if !cols.is_empty() {
+                    write!(f, " OF ")?;
+                    for (i, col) in cols.iter().enumerate() {
+                        if i > 0 {
+                            write!(f, ", ")?;
+                        }
+                        write!(f, "{col}")?;
+                    }
+                }
+                Ok(())
+            }
+            TriggerEvent::Delete => write!(f, "DELETE"),
+        }
+    }
+}
+
+/// A statement that can appear in a trigger body.
+#[derive(Debug, Clone, strum::EnumDiscriminants)]
+#[strum_discriminants(name(TriggerBodyStmtKind))]
+pub enum TriggerStmt {
+    Insert(InsertStmt),
+    Update(UpdateStmt),
+    Delete(DeleteStmt),
+    Select(SelectStmt),
+}
+
+impl fmt::Display for TriggerStmt {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TriggerStmt::Insert(s) => write!(f, "{s}"),
+            TriggerStmt::Update(s) => write!(f, "{s}"),
+            TriggerStmt::Delete(s) => write!(f, "{s}"),
+            TriggerStmt::Select(s) => write!(f, "{s}"),
+        }
+    }
+}
+
+/// A DROP TRIGGER statement.
+#[derive(Debug, Clone)]
+pub struct DropTriggerStmt {
+    pub name: String,
+    pub if_exists: bool,
+}
+
+impl fmt::Display for DropTriggerStmt {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "DROP TRIGGER ")?;
         if self.if_exists {
             write!(f, "IF EXISTS ")?;
         }

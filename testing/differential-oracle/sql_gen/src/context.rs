@@ -60,6 +60,9 @@ impl Context {
             Origin::FunctionArg => "function_arg",
             Origin::BinaryOpLeft => "binary_op_left",
             Origin::BinaryOpRight => "binary_op_right",
+            Origin::CreateTrigger => "create_trigger",
+            Origin::TriggerWhen => "trigger_when",
+            Origin::TriggerBody => "trigger_body",
         }
     }
 

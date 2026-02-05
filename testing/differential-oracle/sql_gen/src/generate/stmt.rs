@@ -2,8 +2,9 @@
 
 use crate::SqlGen;
 use crate::ast::{
-    ColumnDefStmt, CreateIndexStmt, CreateTableStmt, DeleteStmt, DropIndexStmt, DropTableStmt,
-    Expr, InsertStmt, Stmt, UpdateStmt,
+    ColumnDefStmt, CreateIndexStmt, CreateTableStmt, CreateTriggerStmt, DeleteStmt, DropIndexStmt,
+    DropTableStmt, DropTriggerStmt, Expr, InsertStmt, Stmt, TriggerBodyStmtKind, TriggerEvent,
+    TriggerEventKind, TriggerStmt, TriggerTiming, UpdateStmt,
 };
 use crate::capabilities::Capabilities;
 use crate::context::Context;
@@ -90,6 +91,12 @@ fn collect_capability_allowed_stmts<C: Capabilities>() -> Vec<StmtKind> {
     if C::ROLLBACK {
         candidates.push(StmtKind::Rollback);
     }
+    if C::CREATE_TRIGGER {
+        candidates.push(StmtKind::CreateTrigger);
+    }
+    if C::DROP_TRIGGER {
+        candidates.push(StmtKind::DropTrigger);
+    }
 
     candidates
 }
@@ -123,6 +130,8 @@ fn dispatch_stmt_generation<C: Capabilities>(
         StmtKind::Begin => Ok(Stmt::Begin),
         StmtKind::Commit => Ok(Stmt::Commit),
         StmtKind::Rollback => Ok(Stmt::Rollback),
+        StmtKind::CreateTrigger => generate_create_trigger(generator, ctx),
+        StmtKind::DropTrigger => generate_drop_trigger(generator, ctx),
     }
 }
 
@@ -405,6 +414,208 @@ pub fn generate_drop_index<C: Capabilities>(
     }))
 }
 
+/// Generate a CREATE TRIGGER statement.
+#[trace_gen(Origin::CreateTrigger)]
+pub fn generate_create_trigger<C: Capabilities>(
+    generator: &SqlGen<C>,
+    ctx: &mut Context,
+) -> Result<Stmt, GenError> {
+    let trigger_config = &generator.policy().trigger_config;
+
+    let table = ctx
+        .choose(&generator.schema().tables)
+        .ok_or_else(|| GenError::schema_empty("tables"))?
+        .clone();
+
+    // Generate unique trigger name
+    let trigger_name = format!("trg_{}_{}", table.name, ctx.gen_range(10000));
+
+    // Select timing (BEFORE, AFTER, INSTEAD OF)
+    let timing = generate_trigger_timing(ctx, generator)?;
+
+    // Select event (INSERT, UPDATE, DELETE)
+    let event = generate_trigger_event(ctx, generator, &table)?;
+
+    // Generate FOR EACH ROW
+    let for_each_row = ctx.gen_bool_with_prob(trigger_config.for_each_row_probability);
+
+    // Generate optional WHEN clause
+    let when_clause = if ctx.gen_bool_with_prob(trigger_config.when_probability) {
+        Some(generate_trigger_when(generator, ctx, &table)?)
+    } else {
+        None
+    };
+
+    // Generate trigger body (one or more statements)
+    let body = generate_trigger_body(generator, ctx, trigger_config)?;
+
+    // IF NOT EXISTS
+    let if_not_exists = ctx.gen_bool_with_prob(trigger_config.if_not_exists_probability);
+
+    Ok(Stmt::CreateTrigger(CreateTriggerStmt {
+        name: trigger_name,
+        table: table.name.clone(),
+        timing,
+        event,
+        for_each_row,
+        when_clause,
+        body,
+        if_not_exists,
+    }))
+}
+
+/// Generate trigger timing (BEFORE, AFTER, INSTEAD OF).
+fn generate_trigger_timing<C: Capabilities>(
+    ctx: &mut Context,
+    generator: &SqlGen<C>,
+) -> Result<TriggerTiming, GenError> {
+    let weights = &generator.policy().trigger_config.timing_weights;
+    let items = [
+        (TriggerTiming::Before, weights.before),
+        (TriggerTiming::After, weights.after),
+        (TriggerTiming::InsteadOf, weights.instead_of),
+    ];
+
+    let weight_vec: Vec<u32> = items.iter().map(|(_, w)| *w).collect();
+    let idx = ctx.weighted_index(&weight_vec).ok_or_else(|| {
+        GenError::exhausted("trigger_timing", "no valid trigger timing options")
+    })?;
+    Ok(items[idx].0)
+}
+
+/// Generate trigger event (INSERT, UPDATE, DELETE).
+fn generate_trigger_event<C: Capabilities>(
+    ctx: &mut Context,
+    generator: &SqlGen<C>,
+    table: &crate::schema::Table,
+) -> Result<TriggerEvent, GenError> {
+    let trigger_config = &generator.policy().trigger_config;
+    let weights = &trigger_config.event_weights;
+    let items = [
+        (TriggerEventKind::Insert, weights.insert),
+        (TriggerEventKind::Update, weights.update),
+        (TriggerEventKind::Delete, weights.delete),
+    ];
+
+    let weight_vec: Vec<u32> = items.iter().map(|(_, w)| *w).collect();
+    let idx = ctx.weighted_index(&weight_vec).ok_or_else(|| {
+        GenError::exhausted("trigger_event", "no valid trigger event options")
+    })?;
+
+    Ok(match items[idx].0 {
+        TriggerEventKind::Insert => TriggerEvent::Insert,
+        TriggerEventKind::Update => {
+            // UPDATE event - optionally with specific columns
+            if ctx.gen_bool_with_prob(trigger_config.update_of_columns_probability)
+                && !table.columns.is_empty()
+            {
+                let num_cols = ctx.gen_range_inclusive(
+                    1,
+                    trigger_config
+                        .max_update_of_columns
+                        .min(table.columns.len()),
+                );
+                let columns: Vec<String> = (0..num_cols)
+                    .filter_map(|_| ctx.choose(&table.columns).map(|c| c.name.clone()))
+                    .collect();
+                TriggerEvent::Update(columns)
+            } else {
+                TriggerEvent::Update(vec![])
+            }
+        }
+        TriggerEventKind::Delete => TriggerEvent::Delete,
+    })
+}
+
+/// Generate the WHEN clause for a trigger.
+#[trace_gen(Origin::TriggerWhen)]
+fn generate_trigger_when<C: Capabilities>(
+    generator: &SqlGen<C>,
+    ctx: &mut Context,
+    table: &crate::schema::Table,
+) -> Result<Expr, GenError> {
+    // Generate a simple condition using NEW or OLD references
+    generate_condition(generator, ctx, table)
+}
+
+/// Generate the body of a trigger.
+#[trace_gen(Origin::TriggerBody)]
+fn generate_trigger_body<C: Capabilities>(
+    generator: &SqlGen<C>,
+    ctx: &mut Context,
+    config: &crate::policy::TriggerConfig,
+) -> Result<Vec<TriggerStmt>, GenError> {
+    let num_stmts = ctx.gen_range_inclusive(config.min_body_statements, config.max_body_statements);
+    let mut body = Vec::with_capacity(num_stmts);
+
+    for _ in 0..num_stmts {
+        let stmt = generate_trigger_body_stmt(generator, ctx)?;
+        body.push(stmt);
+    }
+
+    Ok(body)
+}
+
+/// Generate a single statement for a trigger body.
+fn generate_trigger_body_stmt<C: Capabilities>(
+    generator: &SqlGen<C>,
+    ctx: &mut Context,
+) -> Result<TriggerStmt, GenError> {
+    let body_weights = &generator.policy().trigger_config.body_stmt_weights;
+
+    let weights = [
+        (TriggerBodyStmtKind::Insert, body_weights.insert),
+        (TriggerBodyStmtKind::Update, body_weights.update),
+        (TriggerBodyStmtKind::Delete, body_weights.delete),
+        (TriggerBodyStmtKind::Select, body_weights.select),
+    ];
+
+    let weight_vec: Vec<u32> = weights.iter().map(|(_, w)| *w).collect();
+    let idx = ctx.weighted_index(&weight_vec).ok_or_else(|| {
+        GenError::exhausted("trigger_body_stmt", "no valid trigger body statement options")
+    })?;
+
+    match weights[idx].0 {
+        TriggerBodyStmtKind::Insert => match generate_insert(generator, ctx)? {
+            Stmt::Insert(stmt) => Ok(TriggerStmt::Insert(stmt)),
+            _ => unreachable!(),
+        },
+        TriggerBodyStmtKind::Update => match generate_update(generator, ctx)? {
+            Stmt::Update(stmt) => Ok(TriggerStmt::Update(stmt)),
+            _ => unreachable!(),
+        },
+        TriggerBodyStmtKind::Delete => match generate_delete(generator, ctx)? {
+            Stmt::Delete(stmt) => Ok(TriggerStmt::Delete(stmt)),
+            _ => unreachable!(),
+        },
+        TriggerBodyStmtKind::Select => match generate_select(generator, ctx)? {
+            Stmt::Select(stmt) => Ok(TriggerStmt::Select(stmt)),
+            _ => unreachable!(),
+        },
+    }
+}
+
+/// Generate a DROP TRIGGER statement.
+pub fn generate_drop_trigger<C: Capabilities>(
+    generator: &SqlGen<C>,
+    ctx: &mut Context,
+) -> Result<Stmt, GenError> {
+    let trigger_config = &generator.policy().trigger_config;
+
+    // Generate a plausible trigger name
+    let table = ctx.choose(&generator.schema().tables);
+    let trigger_name = if let Some(t) = table {
+        format!("trg_{}_{}", t.name, ctx.gen_range(10000))
+    } else {
+        format!("trg_{}", ctx.gen_range(10000))
+    };
+
+    Ok(Stmt::DropTrigger(DropTriggerStmt {
+        name: trigger_name,
+        if_exists: ctx.gen_bool_with_prob(trigger_config.if_exists_probability),
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -513,6 +724,69 @@ mod tests {
                 stmt,
                 Stmt::Select(_) | Stmt::Insert(_) | Stmt::Update(_) | Stmt::Delete(_)
             ));
+        }
+    }
+
+    #[test]
+    fn test_generate_create_trigger() {
+        let generator = test_generator();
+        let mut ctx = Context::new_with_seed(42);
+
+        let stmt = generate_create_trigger(&generator, &mut ctx);
+        assert!(stmt.is_ok());
+
+        let sql = stmt.unwrap().to_string();
+        assert!(sql.starts_with("CREATE TRIGGER"));
+        assert!(sql.contains("ON users"));
+        assert!(sql.contains("BEGIN"));
+        assert!(sql.contains("END"));
+    }
+
+    #[test]
+    fn test_generate_drop_trigger() {
+        let generator = test_generator();
+        let mut ctx = Context::new_with_seed(42);
+
+        let stmt = generate_drop_trigger(&generator, &mut ctx);
+        assert!(stmt.is_ok());
+
+        let sql = stmt.unwrap().to_string();
+        assert!(sql.starts_with("DROP TRIGGER"));
+    }
+
+    #[test]
+    fn test_trigger_timing_variants() {
+        let generator = test_generator();
+
+        // Test multiple seeds to exercise different timing variants
+        for seed in [42, 123, 456, 789, 1000] {
+            let mut ctx = Context::new_with_seed(seed);
+            let stmt = generate_create_trigger(&generator, &mut ctx).unwrap();
+
+            let sql = stmt.to_string();
+            // Should contain one of BEFORE, AFTER, or INSTEAD OF
+            let has_timing =
+                sql.contains("BEFORE ") || sql.contains("AFTER ") || sql.contains("INSTEAD OF ");
+            assert!(has_timing, "Trigger should have timing: {sql}");
+        }
+    }
+
+    #[test]
+    fn test_trigger_event_variants() {
+        let generator = test_generator();
+
+        // Test multiple seeds to exercise different event variants
+        for seed in [42, 123, 456, 789, 1000] {
+            let mut ctx = Context::new_with_seed(seed);
+            let stmt = generate_create_trigger(&generator, &mut ctx).unwrap();
+
+            let sql = stmt.to_string();
+            // Should contain one of INSERT, UPDATE, or DELETE
+            let has_event = sql.contains(" INSERT ON")
+                || sql.contains(" UPDATE ON")
+                || sql.contains(" UPDATE OF ")
+                || sql.contains(" DELETE ON");
+            assert!(has_event, "Trigger should have event: {sql}");
         }
     }
 }

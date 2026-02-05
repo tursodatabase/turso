@@ -73,6 +73,9 @@ pub enum Origin {
     FunctionArg,
     BinaryOpLeft,
     BinaryOpRight,
+    CreateTrigger,
+    TriggerWhen,
+    TriggerBody,
 }
 
 impl fmt::Display for Origin {
@@ -98,6 +101,9 @@ impl fmt::Display for Origin {
             Origin::FunctionArg => write!(f, "FunctionArg"),
             Origin::BinaryOpLeft => write!(f, "BinaryOpLeft"),
             Origin::BinaryOpRight => write!(f, "BinaryOpRight"),
+            Origin::CreateTrigger => write!(f, "CreateTrigger"),
+            Origin::TriggerWhen => write!(f, "TriggerWhen"),
+            Origin::TriggerBody => write!(f, "TriggerBody"),
         }
     }
 }
@@ -151,6 +157,8 @@ pub enum StmtKind {
     DropTable,
     CreateIndex,
     DropIndex,
+    CreateTrigger,
+    DropTrigger,
     // Transactions
     Begin,
     Commit,
@@ -168,6 +176,8 @@ impl fmt::Display for StmtKind {
             StmtKind::DropTable => write!(f, "DROP TABLE"),
             StmtKind::CreateIndex => write!(f, "CREATE INDEX"),
             StmtKind::DropIndex => write!(f, "DROP INDEX"),
+            StmtKind::CreateTrigger => write!(f, "CREATE TRIGGER"),
+            StmtKind::DropTrigger => write!(f, "DROP TRIGGER"),
             StmtKind::Begin => write!(f, "BEGIN"),
             StmtKind::Commit => write!(f, "COMMIT"),
             StmtKind::Rollback => write!(f, "ROLLBACK"),

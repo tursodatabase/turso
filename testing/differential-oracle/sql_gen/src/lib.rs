@@ -45,7 +45,10 @@ pub mod strategy;
 pub mod trace;
 
 // Re-export main types
-pub use ast::{BinOp, Expr, Literal, Stmt, UnaryOp};
+pub use ast::{
+    BinOp, Expr, Literal, Stmt, TriggerBodyStmtKind, TriggerEvent, TriggerEventKind, TriggerStmt,
+    TriggerTiming, UnaryOp,
+};
 pub use builder::SqlGenBuilder;
 pub use capabilities::{
     CanAggregate, CanCte, CanDelete, CanInsert, CanSelect, CanSubquery, CanUpdate, CanWindowFn,
@@ -56,8 +59,9 @@ pub use error::{GenError, GenErrorKind};
 pub use policy::{
     BinOpCategoryWeights, BinOpWeights, CompoundOpWeights, DeleteConfig, ExprConfig, ExprWeights,
     IdentifierConfig, InsertConfig, LiteralConfig, LiteralTypeWeights, NullsOrderWeights,
-    OrderDirectionWeights, Policy, SelectConfig, StmtWeights, StringCharset, UnaryOpWeights,
-    UpdateConfig,
+    OrderDirectionWeights, Policy, SelectConfig, StmtWeights, StringCharset,
+    TriggerBodyStmtWeights, TriggerConfig, TriggerEventWeights, TriggerTimingWeights,
+    UnaryOpWeights, UpdateConfig,
 };
 pub use schema::{ColumnDef, DataType, Index, Schema, SchemaBuilder, Table};
 pub use strategy::{GeneratedSql, SqlStrategy};
