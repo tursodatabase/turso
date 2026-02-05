@@ -133,19 +133,8 @@ fn filter_by_schema_validity<C: Capabilities>(
     let has_tables = !schema.tables.is_empty();
     let has_indexes = !schema.indexes.is_empty();
     let has_triggers = !schema.triggers.is_empty();
-    let has_updatable_columns = schema
-        .tables
-        .iter()
-        .any(|t| t.columns.iter().any(|c| !c.primary_key));
-
     candidates.filter(move |kind| {
-        is_stmt_valid_for_schema(
-            *kind,
-            has_tables,
-            has_indexes,
-            has_triggers,
-            has_updatable_columns,
-        )
+        is_stmt_valid_for_schema(*kind, has_tables, has_indexes, has_triggers)
     })
 }
 
@@ -155,15 +144,12 @@ fn is_stmt_valid_for_schema(
     has_tables: bool,
     has_indexes: bool,
     has_triggers: bool,
-    has_updatable_columns: bool,
 ) -> bool {
     match kind {
         // SELECT is always valid (SELECT 1, SELECT ABS(-5), etc.)
         StmtKind::Select => true,
-        // INSERT/DELETE require tables
-        StmtKind::Insert | StmtKind::Delete => has_tables,
-        // UPDATE requires tables with updatable (non-PK) columns
-        StmtKind::Update => has_tables && has_updatable_columns,
+        // INSERT/DELETE/UPDATE require tables
+        StmtKind::Insert | StmtKind::Delete | StmtKind::Update => has_tables,
         // DDL that operates on existing tables
         StmtKind::DropTable
         | StmtKind::AlterTable
@@ -282,14 +268,12 @@ pub fn generate_update<C: Capabilities>(
         .ok_or_else(|| GenError::schema_empty("tables"))?
         .clone();
 
-    // Get updatable columns (non-primary key)
-    let updatable: Vec<_> = table.updatable_columns().collect();
-    if updatable.is_empty() {
-        return Err(GenError::exhausted("update", "no updatable columns"));
+    if table.columns.is_empty() {
+        return Err(GenError::schema_empty("columns"));
     }
 
     // Generate SET clause
-    let sets = generate_update_sets(generator, ctx, &updatable)?;
+    let sets = generate_update_sets(generator, ctx, &table)?;
 
     // Generate optional WHERE clause
     let where_clause = if ctx.gen_bool_with_prob(update_config.where_probability) {
@@ -306,20 +290,39 @@ pub fn generate_update<C: Capabilities>(
 }
 
 /// Generate the SET clause for an UPDATE statement.
+///
+/// All columns are eligible. Primary key columns are included with lower
+/// probability controlled by `UpdateConfig::primary_key_update_probability`.
 #[trace_gen(Origin::UpdateSet)]
 fn generate_update_sets<C: Capabilities>(
     generator: &SqlGen<C>,
     ctx: &mut Context,
-    updatable: &[&crate::schema::ColumnDef],
+    table: &crate::schema::Table,
 ) -> Result<Vec<(String, Expr)>, GenError> {
     let update_config = &generator.policy().update_config;
-    let max_sets = update_config.max_set_clauses.min(updatable.len());
+    let pk_prob = update_config.primary_key_update_probability;
+
+    // Build candidate columns: always include non-PK, include PK with probability
+    let candidates: Vec<_> = table
+        .columns
+        .iter()
+        .filter(|c| !c.primary_key || ctx.gen_bool_with_prob(pk_prob))
+        .collect();
+
+    // If all PK columns were filtered out and there are no others, fall back to all columns
+    let candidates = if candidates.is_empty() {
+        table.columns.iter().collect::<Vec<_>>()
+    } else {
+        candidates
+    };
+
+    let max_sets = update_config.max_set_clauses.min(candidates.len());
     let min_sets = update_config.min_set_clauses.min(max_sets);
     let num_sets = ctx.gen_range_inclusive(min_sets, max_sets);
     let mut sets = Vec::with_capacity(num_sets);
 
     for _ in 0..num_sets {
-        let col = ctx.choose(updatable).unwrap();
+        let col = ctx.choose(&candidates).unwrap();
         let lit = generate_literal(ctx, col.data_type, generator.policy());
         sets.push((col.name.clone(), Expr::literal(ctx, lit)));
     }

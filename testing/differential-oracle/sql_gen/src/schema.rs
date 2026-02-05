@@ -124,11 +124,6 @@ impl Table {
             .filter(|c| c.data_type != DataType::Blob)
     }
 
-    /// Returns columns that can be updated (non-primary key).
-    pub fn updatable_columns(&self) -> impl Iterator<Item = &ColumnDef> {
-        self.columns.iter().filter(|c| !c.primary_key)
-    }
-
     /// Returns columns with a specific data type.
     pub fn columns_of_type(&self, data_type: DataType) -> impl Iterator<Item = &ColumnDef> {
         self.columns
