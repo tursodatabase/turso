@@ -43,9 +43,11 @@ enum ExprType {
     IsNull,
     Between,
     InList,
+    InSubquery,
     CaseExpr,
     Cast,
     Subquery,
+    Exists,
 }
 
 /// Build expression candidates with their weights.
@@ -101,11 +103,16 @@ fn add_complex_expr_candidates<C: Capabilities>(
     }
 
     // Subqueries require capability and depth budget
-    if C::SUBQUERY
-        && weights.subquery > 0
-        && ctx.subquery_depth() < generator.policy().max_subquery_depth
-    {
-        candidates.push((ExprType::Subquery, weights.subquery));
+    if C::SUBQUERY && ctx.subquery_depth() < generator.policy().max_subquery_depth {
+        if weights.subquery > 0 {
+            candidates.push((ExprType::Subquery, weights.subquery));
+        }
+        if weights.in_subquery > 0 {
+            candidates.push((ExprType::InSubquery, weights.in_subquery));
+        }
+        if weights.exists > 0 {
+            candidates.push((ExprType::Exists, weights.exists));
+        }
     }
 }
 
@@ -126,9 +133,11 @@ fn dispatch_expr_generation<C: Capabilities>(
         ExprType::IsNull => generate_is_null(generator, ctx, table, depth),
         ExprType::Between => generate_between(generator, ctx, table, depth),
         ExprType::InList => generate_in_list(generator, ctx, table, depth),
+        ExprType::InSubquery => generate_in_subquery(generator, ctx, table, depth),
         ExprType::CaseExpr => generate_case(generator, ctx, table, depth),
         ExprType::Cast => generate_cast(generator, ctx, table, depth),
         ExprType::Subquery => generate_subquery_expr(generator, ctx),
+        ExprType::Exists => generate_exists(generator, ctx),
     }
 }
 
@@ -468,7 +477,40 @@ fn generate_subquery_select<C: Capabilities>(
         .ok_or_else(|| GenError::schema_empty("tables"))?;
 
     // Generate a simple single-column SELECT
-    crate::generate::select::generate_simple_select(generator, ctx, table)
+    crate::generate::select::generate_select_for_table(generator, ctx, table)
+}
+
+/// Generate an IN subquery expression (expr IN (SELECT ...) or expr NOT IN (SELECT ...)).
+fn generate_in_subquery<C: Capabilities>(
+    generator: &SqlGen<C>,
+    ctx: &mut Context,
+    table: &Table,
+    depth: usize,
+) -> Result<Expr, GenError> {
+    let expr_config = &generator.policy().expr_config;
+    let negated = ctx.gen_bool_with_prob(expr_config.in_subquery_negation_probability);
+
+    // Generate the left-hand expression (typically a column or simple expression)
+    let expr = generate_expr(generator, ctx, table, depth + 1)?;
+
+    // IN subqueries must return exactly 1 column
+    let subquery = generate_simple_select(generator, ctx, table)?;
+
+    Ok(Expr::in_subquery(ctx, expr, subquery, negated))
+}
+
+/// Generate an EXISTS expression (EXISTS (SELECT ...) or NOT EXISTS (SELECT ...)).
+fn generate_exists<C: Capabilities>(
+    generator: &SqlGen<C>,
+    ctx: &mut Context,
+) -> Result<Expr, GenError> {
+    let expr_config = &generator.policy().expr_config;
+    let negated = ctx.gen_bool_with_prob(expr_config.exists_negation_probability);
+
+    // Generate the subquery
+    let subquery = generate_subquery_select(generator, ctx)?;
+
+    Ok(Expr::exists(ctx, subquery, negated))
 }
 
 /// Generate a WHERE clause condition.
@@ -655,7 +697,9 @@ mod tests {
             cast: 0,
             between: 0,
             in_list: 0,
+            in_subquery: 0,
             is_null: 0,
+            exists: 0,
         });
 
         let generator: SqlGen<Full> = SqlGen::new(schema, policy);
@@ -696,7 +740,9 @@ mod tests {
             cast: 0,
             between: 0,
             in_list: 0,
+            in_subquery: 0,
             is_null: 0,
+            exists: 0,
         });
 
         let generator: SqlGen<Full> = SqlGen::new(schema, policy);
@@ -749,7 +795,9 @@ mod tests {
             cast: 0,
             between: 0,
             in_list: 0,
+            in_subquery: 0,
             is_null: 0,
+            exists: 0,
         });
 
         let generator: SqlGen<Full> = SqlGen::new(schema, policy);
@@ -770,6 +818,71 @@ mod tests {
         assert!(
             function_count > 0,
             "Should have generated some function calls"
+        );
+    }
+
+    #[test]
+    fn test_generate_exists_and_in_subquery() {
+        use crate::policy::ExprWeights;
+
+        let schema = SchemaBuilder::new()
+            .table(Table::new(
+                "users",
+                vec![
+                    ColumnDef::new("id", DataType::Integer).primary_key(),
+                    ColumnDef::new("name", DataType::Text),
+                ],
+            ))
+            .table(Table::new(
+                "orders",
+                vec![
+                    ColumnDef::new("id", DataType::Integer).primary_key(),
+                    ColumnDef::new("user_id", DataType::Integer),
+                ],
+            ))
+            .build();
+
+        // High weights for EXISTS and IN subquery
+        let policy = Policy::default().with_expr_weights(ExprWeights {
+            column_ref: 10,
+            literal: 10,
+            binary_op: 0,
+            unary_op: 0,
+            function_call: 0,
+            subquery: 0,
+            case_expr: 0,
+            cast: 0,
+            between: 0,
+            in_list: 0,
+            in_subquery: 40,
+            is_null: 0,
+            exists: 40,
+        });
+
+        let generator: SqlGen<Full> = SqlGen::new(schema, policy);
+        let mut ctx = Context::new_with_seed(42);
+
+        let mut found_exists = false;
+        let mut found_in_subquery = false;
+
+        for _ in 0..50 {
+            if let Ok(stmt) = generator.statement(&mut ctx) {
+                let sql = stmt.to_string();
+                if sql.contains("EXISTS") {
+                    found_exists = true;
+                }
+                if sql.contains(" IN (SELECT") || sql.contains(" NOT IN (SELECT") {
+                    found_in_subquery = true;
+                }
+                if found_exists && found_in_subquery {
+                    break;
+                }
+            }
+        }
+
+        assert!(
+            found_exists || found_in_subquery,
+            "Should generate EXISTS or IN subquery expressions"
         );
     }
 }

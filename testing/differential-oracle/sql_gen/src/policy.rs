@@ -484,7 +484,9 @@ pub struct ExprWeights {
     pub cast: u32,
     pub between: u32,
     pub in_list: u32,
+    pub in_subquery: u32,
     pub is_null: u32,
+    pub exists: u32,
 }
 
 impl Default for ExprWeights {
@@ -500,7 +502,9 @@ impl Default for ExprWeights {
             cast: 3,
             between: 5,
             in_list: 5,
+            in_subquery: 3,
             is_null: 6,
+            exists: 3,
         }
     }
 }
@@ -519,7 +523,9 @@ impl ExprWeights {
             cast: 0,
             between: 0,
             in_list: 0,
+            in_subquery: 0,
             is_null: 0,
+            exists: 0,
         }
     }
 
@@ -536,7 +542,9 @@ impl ExprWeights {
             cast: 5,
             between: 2,
             in_list: 2,
+            in_subquery: 5,
             is_null: 1,
+            exists: 5,
         }
     }
 }
@@ -1414,6 +1422,12 @@ pub struct ExprConfig {
     /// Probability of negating IN expressions (NOT IN).
     pub in_list_negation_probability: f64,
 
+    /// Probability of negating IN subquery expressions (NOT IN (SELECT ...)).
+    pub in_subquery_negation_probability: f64,
+
+    /// Probability of negating EXISTS expressions (NOT EXISTS).
+    pub exists_negation_probability: f64,
+
     /// Probability of generating ELSE clause in CASE expressions.
     pub case_else_probability: f64,
 
@@ -1436,6 +1450,8 @@ impl Default for ExprConfig {
             is_null_negation_probability: 0.5,
             between_negation_probability: 0.3,
             in_list_negation_probability: 0.3,
+            in_subquery_negation_probability: 0.3,
+            exists_negation_probability: 0.3,
             case_else_probability: 0.5,
             case_min_branches: 1,
             max_compound_condition_depth: 3,
