@@ -53,6 +53,8 @@ impl Context {
             Origin::Update => "update",
             Origin::UpdateSet => "update_set",
             Origin::Delete => "delete",
+            Origin::AlterTable => "alter_table",
+            Origin::AlterTableAction => "alter_table_action",
             Origin::Subquery => "subquery",
             Origin::CaseWhen => "case_when",
             Origin::CaseThen => "case_then",
