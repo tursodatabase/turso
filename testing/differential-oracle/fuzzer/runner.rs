@@ -3,7 +3,7 @@
 //! This module orchestrates the simulation by:
 //! 1. Creating both Turso and SQLite databases
 //! 2. Generating and executing CREATE TABLE statements
-//! 3. Generating statements (DML and DDL) using sql_gen_prop
+//! 3. Generating statements (DML and DDL) using sql_gen
 //! 4. Executing them on both databases
 //! 5. Checking the differential oracle
 //! 6. Re-introspecting schemas after DDL statements
@@ -16,11 +16,12 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use comfy_table::{Attribute, Cell, Color, ContentArrangement, Table};
-use proptest::strategy::{Strategy, ValueTree};
-use proptest::test_runner::TestRunner;
+// sql_gen_prop imports (commented out, kept for reference)
+// use proptest::strategy::{Strategy, ValueTree};
+// use proptest::test_runner::TestRunner;
 use rand::{RngCore, SeedableRng};
 use rand_chacha::ChaCha8Rng;
-use sql_gen_prop::{Schema, SqlStatement, StatementKind};
+use sql_gen::{Full, Policy, SqlGen, StmtKind};
 use turso_core::Database;
 
 use crate::memory::{MemorySimIO, SimIO};
@@ -234,7 +235,7 @@ impl Fuzzer {
     }
 
     /// Introspect and return the current schema from the Turso database.
-    pub fn get_schema(&self) -> Result<Schema> {
+    pub fn get_schema(&self) -> Result<sql_gen::Schema> {
         SchemaIntrospector::from_turso(&self.turso_conn)
             .context("Failed to introspect Turso schema")
     }
@@ -278,40 +279,83 @@ impl Fuzzer {
             self.config.num_statements
         );
 
-        // Create a deterministic seed for proptest
-        let seed_bytes: [u8; 32] = {
-            let mut bytes = [0u8; 32];
-            self.rng.borrow_mut().fill_bytes(&mut bytes);
-            bytes
-        };
+        // Create a deterministic seed for sql_gen context
+        let gen_seed: u64 = self.rng.borrow_mut().next_u64();
 
-        let mut test_runner = TestRunner::new_with_rng(
-            proptest::test_runner::Config::default(),
-            proptest::test_runner::TestRng::from_seed(
-                proptest::test_runner::RngAlgorithm::ChaCha,
-                &seed_bytes,
-            ),
-        );
+        // sql_gen_prop code (commented out, kept for reference)
+        // let seed_bytes: [u8; 32] = {
+        //     let mut bytes = [0u8; 32];
+        //     self.rng.borrow_mut().fill_bytes(&mut bytes);
+        //     bytes
+        // };
+        //
+        // let mut test_runner = TestRunner::new_with_rng(
+        //     proptest::test_runner::Config::default(),
+        //     proptest::test_runner::TestRng::from_seed(
+        //         proptest::test_runner::RngAlgorithm::ChaCha,
+        //         &seed_bytes,
+        //     ),
+        // );
 
         let mut schema = self.introspect_and_verify_schemas()?;
 
-        let mut profile = sql_gen_prop::profile::StatementProfile::default();
-        profile
-            .generation
-            .expression
-            .base
-            .order_by_allow_integer_positions = false;
+        // sql_gen_prop profile (commented out, kept for reference)
+        // let mut profile = sql_gen_prop::profile::StatementProfile::default();
+        // profile
+        //     .generation
+        //     .expression
+        //     .base
+        //     .order_by_allow_integer_positions = false;
+
+        let mut ctx = sql_gen::Context::new_with_seed(gen_seed);
+
+        // Policy that only generates CREATE TABLE (used when schema is empty)
+        // let create_table_only_policy = Policy::default().with_stmt_weights(sql_gen::StmtWeights {
+        //     create_table: 100,
+        //     select: 0,
+        //     insert: 0,
+        //     update: 0,
+        //     delete: 0,
+        //     drop_table: 0,
+        //     alter_table: 0,
+        //     create_index: 0,
+        //     drop_index: 0,
+        //     create_trigger: 0,
+        //     drop_trigger: 0,
+        //     begin: 0,
+        //     commit: 0,
+        //     rollback: 0,
+        // });
+
+        let policy = Policy::default().with_stmt_weights(sql_gen::StmtWeights {
+            create_trigger: 0,
+            drop_trigger: 0,
+            ..sql_gen::StmtWeights::default()
+        });
 
         for i in 0..self.config.num_statements {
-            // Generate a statement (DML or DDL)
-            let strategy = sql_gen_prop::strategies::statement_for_schema(&schema, &profile);
-            let value_tree = strategy
-                .new_tree(&mut test_runner)
-                .map_err(|e| anyhow::anyhow!("Failed to generate statement: {e}"))?;
+            // Build generator from current schema
+            let generator: SqlGen<Full> = SqlGen::new(schema.clone(), policy.clone());
 
-            let stmt = value_tree.current();
+            // Generate a statement (DML or DDL)
+            let stmt = match generator.statement(&mut ctx) {
+                Ok(stmt) => stmt,
+                Err(e) => {
+                    tracing::warn!("Failed to generate statement {i}: {e}");
+                    stats.errors += 1;
+                    continue;
+                }
+            };
+
+            // sql_gen_prop generation (commented out, kept for reference)
+            // let strategy = sql_gen_prop::strategies::statement_for_schema(&schema, &profile);
+            // let value_tree = strategy
+            //     .new_tree(&mut test_runner)
+            //     .map_err(|e| anyhow::anyhow!("Failed to generate statement: {e}"))?;
+            // let stmt = value_tree.current();
+
             let sql = stmt.to_string();
-            let is_ddl = Self::is_ddl_statement(&stmt);
+            let is_ddl = StmtKind::from(&stmt).is_ddl();
 
             if self.config.verbose {
                 let stmt_type = if is_ddl { "DDL" } else { "DML" };
@@ -356,13 +400,8 @@ impl Fuzzer {
         Ok(())
     }
 
-    /// Check if a statement is a DDL statement (modifies schema).
-    fn is_ddl_statement(stmt: &SqlStatement) -> bool {
-        StatementKind::from(stmt).is_ddl()
-    }
-
     /// Introspect schemas from both databases and verify they match.
-    fn introspect_and_verify_schemas(&self) -> Result<Schema> {
+    fn introspect_and_verify_schemas(&self) -> Result<sql_gen::Schema> {
         let (turso_schema, sqlite_schema) = (
             SchemaIntrospector::from_turso_with_attached(&self.turso_conn)
                 .context("Failed to introspect Turso schema (with attached)")?,
