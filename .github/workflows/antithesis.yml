@@ -60,5 +60,6 @@ jobs:
         images: ${{ secrets.ANTITHESIS_DOCKER_REPO }}/limbo-workload:antithesis-latest
         description: "Turso - ${{ github.event_name }} on ${{ github.ref_name }} by ${{ github.actor }}"
         email_recipients: ${{ secrets.ANTITHESIS_EMAIL }}
+        test_name: ${{ github.event.inputs.test_name }}
         additional_parameters: |-
           antithesis.duration=${{ github.event.inputs.duration }}
