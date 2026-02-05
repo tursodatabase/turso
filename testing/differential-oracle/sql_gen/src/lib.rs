@@ -65,6 +65,9 @@ pub use trace::{
     Coverage, CoverageReport, ExprKind, Origin, OriginPath, StmtKind, Trace, TraceNode,
 };
 
+// Re-export procedural macros
+pub use sql_gen_macros::trace_gen;
+
 use std::marker::PhantomData;
 
 /// The main SQL generator, parameterized by capability constraints.

@@ -8,6 +8,7 @@ use crate::error::GenError;
 use crate::generate::expr::{generate_condition, generate_expr};
 use crate::schema::Table;
 use crate::trace::Origin;
+use sql_gen_macros::trace_gen;
 
 /// Generate a SELECT statement.
 pub fn generate_select<C: Capabilities>(
@@ -24,13 +25,12 @@ pub fn generate_select<C: Capabilities>(
 }
 
 /// Generate a SELECT statement for a specific table.
+#[trace_gen(Origin::Select)]
 pub fn generate_select_for_table<C: Capabilities>(
     generator: &SqlGen<C>,
     ctx: &mut Context,
     table: &Table,
 ) -> Result<SelectStmt, GenError> {
-    ctx.enter_scope(Origin::Select);
-
     let select_config = &generator.policy().select_config;
     let ident_config = &generator.policy().identifier_config;
 
@@ -78,7 +78,6 @@ pub fn generate_select_for_table<C: Capabilities>(
         None
     };
 
-    ctx.exit_scope();
     Ok(SelectStmt {
         columns,
         from: table.name.clone(),
