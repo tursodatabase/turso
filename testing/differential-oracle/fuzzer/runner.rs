@@ -16,14 +16,11 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use comfy_table::{Attribute, Cell, Color, ContentArrangement, Table};
-// sql_gen_prop imports (commented out, kept for reference)
-// use proptest::strategy::{Strategy, ValueTree};
-// use proptest::test_runner::TestRunner;
 use rand::{RngCore, SeedableRng};
 use rand_chacha::ChaCha8Rng;
-use sql_gen::{Full, Policy, SqlGen, StmtKind};
 use turso_core::Database;
 
+use crate::generate::{GeneratorKind, PropTestBackend, SqlGenBackend, SqlGenerator};
 use crate::memory::{MemorySimIO, SimIO};
 use crate::oracle::{OracleResult, check_differential};
 use crate::schema::SchemaIntrospector;
@@ -43,6 +40,8 @@ pub struct SimConfig {
     pub verbose: bool,
     /// Keep simulation databases
     pub keep_files: bool,
+    /// Which SQL generator backend to use.
+    pub generator: GeneratorKind,
 }
 
 impl Default for SimConfig {
@@ -54,6 +53,7 @@ impl Default for SimConfig {
             num_statements: 100,
             verbose: false,
             keep_files: false,
+            generator: GeneratorKind::default(),
         }
     }
 }
@@ -273,118 +273,67 @@ impl Fuzzer {
 
     fn run_inner(&self, stats: &mut SimStats, executed_sql: &mut Vec<String>) -> Result<()> {
         tracing::info!(
-            "Starting simulation with seed={}, tables={}, statements={}",
+            "Starting simulation with seed={}, tables={}, statements={}, generator={:?}",
             self.config.seed,
             self.config.num_tables,
-            self.config.num_statements
+            self.config.num_statements,
+            self.config.generator,
         );
 
-        // Create a deterministic seed for sql_gen context
-        let gen_seed: u64 = self.rng.borrow_mut().next_u64();
-
-        // sql_gen_prop code (commented out, kept for reference)
-        // let seed_bytes: [u8; 32] = {
-        //     let mut bytes = [0u8; 32];
-        //     self.rng.borrow_mut().fill_bytes(&mut bytes);
-        //     bytes
-        // };
-        //
-        // let mut test_runner = TestRunner::new_with_rng(
-        //     proptest::test_runner::Config::default(),
-        //     proptest::test_runner::TestRng::from_seed(
-        //         proptest::test_runner::RngAlgorithm::ChaCha,
-        //         &seed_bytes,
-        //     ),
-        // );
+        let mut generator: Box<dyn SqlGenerator> = match self.config.generator {
+            GeneratorKind::SqlGen => {
+                let seed: u64 = self.rng.borrow_mut().next_u64();
+                Box::new(SqlGenBackend::new(seed))
+            }
+            GeneratorKind::SqlGenProp => {
+                let seed_bytes: [u8; 32] = {
+                    let mut bytes = [0u8; 32];
+                    self.rng.borrow_mut().fill_bytes(&mut bytes);
+                    bytes
+                };
+                Box::new(PropTestBackend::new(seed_bytes))
+            }
+        };
 
         let mut schema = self.introspect_and_verify_schemas()?;
 
-        // sql_gen_prop profile (commented out, kept for reference)
-        // let mut profile = sql_gen_prop::profile::StatementProfile::default();
-        // profile
-        //     .generation
-        //     .expression
-        //     .base
-        //     .order_by_allow_integer_positions = false;
-
-        let mut ctx = sql_gen::Context::new_with_seed(gen_seed);
-
-        // Policy that only generates CREATE TABLE (used when schema is empty)
-        // let create_table_only_policy = Policy::default().with_stmt_weights(sql_gen::StmtWeights {
-        //     create_table: 100,
-        //     select: 0,
-        //     insert: 0,
-        //     update: 0,
-        //     delete: 0,
-        //     drop_table: 0,
-        //     alter_table: 0,
-        //     create_index: 0,
-        //     drop_index: 0,
-        //     create_trigger: 0,
-        //     drop_trigger: 0,
-        //     begin: 0,
-        //     commit: 0,
-        //     rollback: 0,
-        // });
-
-        let policy = Policy::default()
-            .with_stmt_weights(sql_gen::StmtWeights {
-                create_trigger: 0,
-                drop_trigger: 0,
-                ..sql_gen::StmtWeights::default()
-            })
-            .with_function_config(sql_gen::FunctionConfig::deterministic());
-
         for i in 0..self.config.num_statements {
-            // Build generator from current schema
-            let generator: SqlGen<Full> = SqlGen::new(schema.clone(), policy.clone());
-
-            // Generate a statement (DML or DDL)
-            let stmt = generator
-                .statement(&mut ctx)
-                .map_err(|e| anyhow::anyhow!("Failed to generate statement: {e}"))?;
-
-            // sql_gen_prop generation (commented out, kept for reference)
-            // let strategy = sql_gen_prop::strategies::statement_for_schema(&schema, &profile);
-            // let value_tree = strategy
-            //     .new_tree(&mut test_runner)
-            //     .map_err(|e| anyhow::anyhow!("Failed to generate statement: {e}"))?;
-            // let stmt = value_tree.current();
-
-            let sql = stmt.to_string();
-            let is_ddl = StmtKind::from(&stmt).is_ddl();
+            let stmt = generator.generate(&schema)?;
 
             if self.config.verbose {
-                let stmt_type = if is_ddl { "DDL" } else { "DML" };
-                tracing::info!("Statement {} [{}]: {}", i, stmt_type, sql);
+                let stmt_type = if stmt.is_ddl { "DDL" } else { "DML" };
+                tracing::info!("Statement {} [{}]: {}", i, stmt_type, stmt.sql);
             }
 
             // Execute on both databases and check oracle
             match check_differential(&self.turso_conn, &self.sqlite_conn, &stmt) {
                 OracleResult::Pass => {
                     stats.statements_executed += 1;
-                    executed_sql.push(sql.clone());
+                    executed_sql.push(stmt.sql.clone());
                 }
                 OracleResult::Warning(reason) => {
                     stats.statements_executed += 1;
                     stats.warnings += 1;
-                    executed_sql.push(sql.clone());
+                    executed_sql.push(stmt.sql.clone());
                     tracing::warn!("Oracle warning at statement {i}: {reason}");
                 }
                 OracleResult::Fail(reason) => {
                     stats.oracle_failures += 1;
-                    executed_sql.push(format!("-- FAILED: {sql}"));
+                    executed_sql.push(format!("-- FAILED: {}", stmt.sql));
                     tracing::error!("Oracle failure at statement {i}: {reason}");
                     if !self.config.verbose {
-                        tracing::error!("Failing SQL: {sql}");
+                        tracing::error!("Failing SQL: {}", stmt.sql);
                     }
                     return Err(anyhow::anyhow!("Oracle failure: {reason}"));
                 }
             }
 
-            if is_ddl {
+            if stmt.is_ddl {
                 schema = self.introspect_and_verify_schemas().map_err(|e| {
-                    anyhow::anyhow!("Schema mismatch after DDL statement {i} ({sql}): {e}")
+                    anyhow::anyhow!(
+                        "Schema mismatch after DDL statement {i} ({}): {e}",
+                        stmt.sql
+                    )
                 })?;
                 tracing::debug!(
                     "Schema updated after DDL: {} tables, {} indexes",
@@ -473,6 +422,7 @@ mod tests {
             num_statements: 10,
             verbose: false,
             keep_files: false,
+            generator: GeneratorKind::default(),
         };
         let sim = Fuzzer::new(config);
         assert!(sim.is_ok());
