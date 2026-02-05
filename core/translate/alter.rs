@@ -6,7 +6,7 @@ use turso_parser::{
 
 use crate::{
     function::{AlterTableFunc, Func},
-    schema::{Column, ForeignKey, Table, RESERVED_TABLE_PREFIXES},
+    schema::{CheckConstraint, Column, ForeignKey, Table, RESERVED_TABLE_PREFIXES},
     translate::{
         emitter::Resolver,
         expr::{walk_expr, WalkControl},
@@ -415,55 +415,64 @@ pub fn translate_alter_table(
             // TODO: All quoted ids will be quoted with `[]`, we should store some info from the parsed AST
             btree.columns.push(column.clone());
 
-            // Add foreign key constraints to the btree table
+            // Add foreign key constraints and CHECK constraints to the btree table
             for constraint in constraints {
-                if let ast::ColumnConstraint::ForeignKey {
-                    clause,
-                    defer_clause,
-                } = constraint.constraint
-                {
-                    let fk = ForeignKey {
-                        parent_table: normalize_ident(clause.tbl_name.as_str()),
-                        parent_columns: clause
-                            .columns
-                            .iter()
-                            .map(|c| normalize_ident(c.col_name.as_str()))
-                            .collect(),
-                        on_delete: clause
-                            .args
-                            .iter()
-                            .find_map(|arg| {
-                                if let ast::RefArg::OnDelete(act) = arg {
-                                    Some(*act)
-                                } else {
-                                    None
+                match constraint.constraint {
+                    ast::ColumnConstraint::ForeignKey {
+                        clause,
+                        defer_clause,
+                    } => {
+                        let fk = ForeignKey {
+                            parent_table: normalize_ident(clause.tbl_name.as_str()),
+                            parent_columns: clause
+                                .columns
+                                .iter()
+                                .map(|c| normalize_ident(c.col_name.as_str()))
+                                .collect(),
+                            on_delete: clause
+                                .args
+                                .iter()
+                                .find_map(|arg| {
+                                    if let ast::RefArg::OnDelete(act) = arg {
+                                        Some(*act)
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .unwrap_or(ast::RefAct::NoAction),
+                            on_update: clause
+                                .args
+                                .iter()
+                                .find_map(|arg| {
+                                    if let ast::RefArg::OnUpdate(act) = arg {
+                                        Some(*act)
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .unwrap_or(ast::RefAct::NoAction),
+                            child_columns: vec![new_column_name.to_string()],
+                            deferred: match defer_clause {
+                                Some(d) => {
+                                    d.deferrable
+                                        && matches!(
+                                            d.init_deferred,
+                                            Some(ast::InitDeferredPred::InitiallyDeferred)
+                                        )
                                 }
-                            })
-                            .unwrap_or(ast::RefAct::NoAction),
-                        on_update: clause
-                            .args
-                            .iter()
-                            .find_map(|arg| {
-                                if let ast::RefArg::OnUpdate(act) = arg {
-                                    Some(*act)
-                                } else {
-                                    None
-                                }
-                            })
-                            .unwrap_or(ast::RefAct::NoAction),
-                        child_columns: vec![new_column_name.to_string()],
-                        deferred: match defer_clause {
-                            Some(d) => {
-                                d.deferrable
-                                    && matches!(
-                                        d.init_deferred,
-                                        Some(ast::InitDeferredPred::InitiallyDeferred)
-                                    )
-                            }
-                            None => false,
-                        },
-                    };
-                    btree.foreign_keys.push(Arc::new(fk));
+                                None => false,
+                            },
+                        };
+                        btree.foreign_keys.push(Arc::new(fk));
+                    }
+                    ast::ColumnConstraint::Check(expr) => {
+                        btree
+                            .check_constraints
+                            .push(CheckConstraint::new(constraint.name.as_ref(), &expr));
+                    }
+                    _ => {
+                        // Other constraints (PRIMARY KEY, NOT NULL, etc.) are handled elsewhere
+                    }
                 }
             }
 
@@ -563,6 +572,7 @@ pub fn translate_alter_table(
                     program.emit_insn(Insn::AddColumn {
                         table: table_name.to_owned(),
                         column: Box::new(column),
+                        check_constraints: btree.check_constraints.clone(),
                     });
                 },
             )?

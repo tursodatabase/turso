@@ -81,6 +81,7 @@ Turso aims to be fully compatible with SQLite, with opt-in features not supporte
 | ATTACH DATABASE           | 🚧 Partial | Only for reads. All modifications will currently fail to find the table           |
 | BEGIN TRANSACTION         | 🚧 Partial | Transaction names are not supported.                                              |
 | COMMIT TRANSACTION        | 🚧 Partial | Transaction names are not supported.                                              |
+| CHECK                     | ✅ Yes     |                                                                                   |
 | CREATE INDEX              | ✅ Yes     |                                                                                   |
 | CREATE TABLE              | ✅ Yes     |                                                                                   |
 | CREATE TABLE ... STRICT   | 🚧 Partial | Strict schema mode is experimental.                                               |
@@ -157,7 +158,7 @@ Turso aims to be fully compatible with SQLite, with opt-in features not supporte
 | PRAGMA fullsync                  | ❌ No         |                                              |
 | PRAGMA function_list             | ❌ No         |                                              |
 | PRAGMA hard_heap_limit           | ❌ No         |                                              |
-| PRAGMA ignore_check_constraints  | ❌ No         |                                              |
+| PRAGMA ignore_check_constraints  | ✅ Yes        |                                              |
 | PRAGMA incremental_vacuum        | ❌ No         |                                              |
 | PRAGMA index_info                | ❌ No         |                                              |
 | PRAGMA index_list                | ❌ No         |                                              |

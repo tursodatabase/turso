@@ -40,10 +40,10 @@ fn validate(body: &ast::CreateTableBody, connection: &Connection) -> Result<()> 
         for i in 0..columns.len() {
             let col_i = &columns[i];
             for constraint in &col_i.constraints {
-                // don't silently ignore CHECK constraints, throw parse error for now
                 match &constraint.constraint {
-                    ast::ColumnConstraint::Check { .. } => {
-                        bail_parse_error!("CHECK constraints are not supported yet");
+                    ast::ColumnConstraint::Check(_) => {
+                        // No validation needed; CHECK constraints are enforced at INSERT/UPDATE time
+                        continue;
                     }
                     ast::ColumnConstraint::Generated { .. } => {
                         bail_parse_error!("GENERATED columns are not supported yet");
@@ -855,6 +855,7 @@ pub fn translate_drop_table(
             is_strict: false,
             unique_sets: vec![],
             foreign_keys: vec![],
+            check_constraints: vec![],
         });
         // cursor id 2
         let ephemeral_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(simple_table_rc));

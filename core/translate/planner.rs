@@ -842,6 +842,7 @@ fn parse_table(
 
             unique_sets: vec![],
             foreign_keys: vec![],
+            check_constraints: vec![],
         });
         drop(view_guard);
 

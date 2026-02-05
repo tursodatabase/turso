@@ -38,7 +38,8 @@ use crate::vector::{
 };
 use crate::{
     error::{
-        LimboError, SQLITE_CONSTRAINT, SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY,
+        LimboError, SQLITE_CONSTRAINT, SQLITE_CONSTRAINT_CHECK, SQLITE_CONSTRAINT_NOTNULL,
+        SQLITE_CONSTRAINT_PRIMARYKEY,
     },
     ext::ExtValue,
     function::{AggFunc, ExtFunc, MathFunc, MathFuncArity, ScalarFunc, VectorFunc},
@@ -1879,6 +1880,9 @@ pub fn halt(
         0 => None,
         SQLITE_CONSTRAINT_PRIMARYKEY => Some(LimboError::Constraint(format!(
             "UNIQUE constraint failed: {description} (19)"
+        ))),
+        SQLITE_CONSTRAINT_CHECK => Some(LimboError::Constraint(format!(
+            "CHECK constraint failed: {description} (19)"
         ))),
         SQLITE_CONSTRAINT_NOTNULL => Some(LimboError::Constraint(format!(
             "NOT NULL constraint failed: {description} (19)"
@@ -10294,24 +10298,33 @@ pub fn op_add_column(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
-    load_insn!(AddColumn { table, column }, insn);
+    load_insn!(
+        AddColumn {
+            table,
+            column,
+            check_constraints
+        },
+        insn
+    );
 
     let conn = program.connection.clone();
 
     conn.with_schema_mut(|schema| {
-        let table = schema
+        let table_ref = schema
             .tables
             .get_mut(table)
             .expect("table being altered should be in schema");
 
-        let table = Arc::make_mut(table);
+        let table_ref = Arc::make_mut(table_ref);
 
-        let Table::BTree(btree) = table else {
+        let crate::schema::Table::BTree(btree) = table_ref else {
             panic!("only btree tables can have columns added");
         };
 
         let btree = Arc::make_mut(btree);
-        btree.columns.push((**column).clone())
+        btree.columns.push((**column).clone());
+        // Update CHECK constraints to include any constraints from the new column
+        btree.check_constraints = check_constraints.clone();
     });
 
     state.pc += 1;

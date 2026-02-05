@@ -3,6 +3,7 @@
 
 use crate::sync::Arc;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use std::borrow::Cow;
 use std::num::NonZeroUsize;
 
 use tracing::{instrument, Level};
@@ -25,9 +26,13 @@ use super::plan::{
 };
 use super::select::emit_simple_count;
 use super::subquery::emit_from_clause_subqueries;
-use crate::error::{SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE};
+use crate::error::{
+    SQLITE_CONSTRAINT_CHECK, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE,
+};
 use crate::function::Func;
-use crate::schema::{BTreeTable, Column, Index, IndexColumn, Schema, Table, ROWID_SENTINEL};
+use crate::schema::{
+    BTreeTable, CheckConstraint, Column, Index, IndexColumn, Schema, Table, ROWID_SENTINEL,
+};
 use crate::translate::compound_select::emit_program_for_compound_select;
 use crate::translate::expr::{
     bind_and_rewrite_expr, emit_returning_results, rewrite_between_expr,
@@ -101,7 +106,7 @@ pub struct Resolver<'a> {
     pub schema: &'a Schema,
     pub symbol_table: &'a SymbolTable,
     pub expr_to_reg_cache_enabled: bool,
-    pub expr_to_reg_cache: Vec<(std::borrow::Cow<'a, ast::Expr>, usize)>,
+    pub expr_to_reg_cache: Vec<(Cow<'a, ast::Expr>, usize)>,
 }
 
 impl<'a> Resolver<'a> {
@@ -588,6 +593,7 @@ fn emit_materialized_build_inputs(
             is_strict: false,
             unique_sets: vec![],
             foreign_keys: vec![],
+            check_constraints: vec![],
         });
         let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(ephemeral_table.clone()));
 
@@ -3498,6 +3504,23 @@ fn emit_update_insns<'a>(
         // Note: Affinity for non-STRICT tables is applied earlier,
         // right after emit_update_column_values, before index operations.
 
+        // Evaluate CHECK constraints for the updated values.
+        // Use rowid_set_clause_reg if the user is updating the rowid, otherwise beg (old rowid).
+        emit_check_constraints(
+            program,
+            &btree_table.check_constraints,
+            &mut t_ctx.resolver,
+            rowid_set_clause_reg.unwrap_or(beg),
+            btree_table
+                .columns
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, col)| col.name.as_deref().map(|n| (n, start + idx))),
+            connection,
+            or_conflict,
+            skip_row_label,
+        )?;
+
         if has_user_provided_rowid {
             let record_label = program.allocate_label();
             let target_reg = rowid_set_clause_reg.unwrap();
@@ -4315,5 +4338,124 @@ fn emit_index_column_value_new_image(
             extra_amount: 0,
         });
     }
+    Ok(())
+}
+
+/// Emit bytecode for evaluating CHECK constraints.
+/// Assumes the resolver cache is already populated with column-to-register mappings.
+fn emit_check_constraint_bytecode(
+    program: &mut ProgramBuilder,
+    check_constraints: &[CheckConstraint],
+    resolver: &mut Resolver,
+    or_conflict: ResolveType,
+    skip_row_label: BranchOffset,
+) -> Result<()> {
+    for check_constraint in check_constraints {
+        let expr_result_reg = program.alloc_register();
+
+        let mut rewritten_expr = check_constraint.expr.clone();
+        rewrite_between_expr(&mut rewritten_expr);
+
+        translate_expr_no_constant_opt(
+            program,
+            None,
+            &rewritten_expr,
+            expr_result_reg,
+            resolver,
+            NoConstantOptReason::RegisterReuse,
+        )?;
+
+        // CHECK constraint passes if the result is NULL or non-zero (truthy)
+        let constraint_passed_label = program.allocate_label();
+
+        // NULL means unknown, which passes CHECK constraints in SQLite
+        program.emit_insn(Insn::IsNull {
+            reg: expr_result_reg,
+            target_pc: constraint_passed_label,
+        });
+
+        program.emit_insn(Insn::If {
+            reg: expr_result_reg,
+            target_pc: constraint_passed_label,
+            jump_if_null: false,
+        });
+
+        let constraint_name = check_constraint
+            .name
+            .as_deref()
+            .unwrap_or(&check_constraint.sql);
+
+        match or_conflict {
+            ResolveType::Ignore => {
+                program.emit_insn(Insn::Goto {
+                    target_pc: skip_row_label,
+                });
+            }
+            // In SQLite, REPLACE does not apply to CHECK constraints — it aborts,
+            // same as Abort/Fail/Rollback.
+            ResolveType::Abort
+            | ResolveType::Fail
+            | ResolveType::Rollback
+            | ResolveType::Replace => {
+                program.emit_insn(Insn::Halt {
+                    err_code: SQLITE_CONSTRAINT_CHECK,
+                    description: constraint_name.to_string(),
+                });
+            }
+        }
+
+        program.preassign_label_to_next_insn(constraint_passed_label);
+    }
+    Ok(())
+}
+
+/// Emit CHECK constraint evaluation with resolver cache setup and teardown.
+/// Takes column-to-register mappings as an iterator to avoid heap allocation.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_check_constraints<'a>(
+    program: &mut ProgramBuilder,
+    check_constraints: &[CheckConstraint],
+    resolver: &mut Resolver,
+    rowid_reg: usize,
+    column_mappings: impl Iterator<Item = (&'a str, usize)>,
+    connection: &Arc<Connection>,
+    or_conflict: ResolveType,
+    skip_row_label: BranchOffset,
+) -> Result<()> {
+    if connection.check_constraints_ignored() || check_constraints.is_empty() {
+        return Ok(());
+    }
+
+    let initial_cache_size = resolver.expr_to_reg_cache.len();
+
+    // Map rowid aliases to the actual rowid register
+    for rowid_name in ROWID_STRS {
+        let rowid_expr = ast::Expr::Id(ast::Name::exact(rowid_name.to_string()));
+        resolver
+            .expr_to_reg_cache
+            .push((Cow::Owned(rowid_expr), rowid_reg));
+    }
+
+    // Map each column to its register
+    for (col_name, register) in column_mappings {
+        let column_expr = ast::Expr::Id(ast::Name::exact(col_name.to_string()));
+        resolver
+            .expr_to_reg_cache
+            .push((Cow::Owned(column_expr), register));
+    }
+
+    resolver.enable_expr_to_reg_cache();
+
+    emit_check_constraint_bytecode(
+        program,
+        check_constraints,
+        resolver,
+        or_conflict,
+        skip_row_label,
+    )?;
+
+    resolver.expr_to_reg_cache.truncate(initial_cache_size);
+    resolver.expr_to_reg_cache_enabled = false;
+
     Ok(())
 }

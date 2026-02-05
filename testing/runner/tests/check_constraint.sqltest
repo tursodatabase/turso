@@ -1,0 +1,1111 @@
+@database :memory:
+
+# Basic column-level CHECK constraints
+test check_constraint_column_level_basic {
+    CREATE TABLE employees (
+        id INTEGER PRIMARY KEY,
+        name TEXT NOT NULL,
+        age INTEGER CHECK (age >= 18),
+        salary INTEGER CHECK (salary > 0)
+    );
+    INSERT INTO employees VALUES (1, 'Alice', 25, 50000);
+    INSERT INTO employees VALUES (2, 'Bob', 30, 75000);
+    SELECT id, name, age, salary FROM employees ORDER BY id;
+}
+expect {
+    1|Alice|25|50000
+    2|Bob|30|75000
+}
+
+# Column-level CHECK constraint violation on INSERT
+test check_constraint_column_age_violation {
+    CREATE TABLE employees (
+        id INTEGER PRIMARY KEY,
+        age INTEGER CHECK (age >= 18)
+    );
+    INSERT INTO employees VALUES (1, 17);
+}
+expect error {
+}
+
+test check_constraint_column_salary_violation {
+    CREATE TABLE employees (
+        id INTEGER PRIMARY KEY,
+        salary REAL CHECK (salary > 0)
+    );
+    INSERT INTO employees VALUES (1, -1000);
+}
+expect error {
+}
+
+test check_constraint_column_salary_zero_violation {
+    CREATE TABLE employees (
+        id INTEGER PRIMARY KEY,
+        salary REAL CHECK (salary > 0)
+    );
+    INSERT INTO employees VALUES (1, 0);
+}
+expect error {
+}
+
+# Table-level CHECK constraints
+test check_constraint_table_level_basic {
+    CREATE TABLE products (
+        id INTEGER PRIMARY KEY,
+        price INTEGER,
+        discount INTEGER,
+        CHECK (price >= discount)
+    );
+    INSERT INTO products VALUES (1, 100, 20);
+    INSERT INTO products VALUES (2, 50, 50);
+    SELECT id, price, discount FROM products ORDER BY id;
+}
+expect {
+    1|100|20
+    2|50|50
+}
+
+test check_constraint_table_level_violation {
+    CREATE TABLE products (
+        id INTEGER PRIMARY KEY,
+        price INTEGER,
+        discount INTEGER,
+        CHECK (price >= discount)
+    );
+    INSERT INTO products VALUES (1, 50, 75);
+}
+expect error {
+}
+
+# Complex CHECK constraints with IN operator
+test check_constraint_in_operator {
+    CREATE TABLE employees (
+        id INTEGER PRIMARY KEY,
+        department TEXT,
+        CHECK (department IN ('HR', 'Engineering', 'Sales', 'Marketing'))
+    );
+    INSERT INTO employees VALUES (1, 'HR');
+    INSERT INTO employees VALUES (2, 'Engineering');
+    INSERT INTO employees VALUES (3, 'Sales');
+    INSERT INTO employees VALUES (4, 'Marketing');
+    SELECT id, department FROM employees ORDER BY id;
+}
+expect {
+    1|HR
+    2|Engineering
+    3|Sales
+    4|Marketing
+}
+
+test check_constraint_in_operator_violation {
+    CREATE TABLE employees (
+        id INTEGER PRIMARY KEY,
+        department TEXT,
+        CHECK (department IN ('HR', 'Engineering', 'Sales', 'Marketing'))
+    );
+    INSERT INTO employees VALUES (1, 'Finance');
+}
+expect error {
+}
+
+# NULL handling in CHECK constraints
+test check_constraint_null_passes {
+    CREATE TABLE employees (
+        id INTEGER PRIMARY KEY,
+        age INTEGER CHECK (age >= 18)
+    );
+    INSERT INTO employees VALUES (1, NULL);
+    INSERT INTO employees VALUES (2, 25);
+    SELECT id, age FROM employees ORDER BY id;
+}
+expect {
+    1|
+    2|25
+}
+
+# UPDATE operations with CHECK constraints
+test check_constraint_update_success {
+    CREATE TABLE employees (
+        id INTEGER PRIMARY KEY,
+        age INTEGER CHECK (age >= 18),
+        salary INTEGER CHECK (salary > 0)
+    );
+    INSERT INTO employees VALUES (1, 25, 50000);
+    UPDATE employees SET age = 30 WHERE id = 1;
+    UPDATE employees SET salary = 60000 WHERE id = 1;
+    SELECT id, age, salary FROM employees;
+}
+expect {
+    1|30|60000
+}
+
+test check_constraint_update_age_violation {
+    CREATE TABLE employees (
+        id INTEGER PRIMARY KEY,
+        age INTEGER CHECK (age >= 18)
+    );
+    INSERT INTO employees VALUES (1, 25);
+    UPDATE employees SET age = 17 WHERE id = 1;
+}
+expect error {
+}
+
+test check_constraint_update_salary_violation {
+    CREATE TABLE employees (
+        id INTEGER PRIMARY KEY,
+        salary INTEGER CHECK (salary > 0)
+    );
+    INSERT INTO employees VALUES (1, 50000);
+    UPDATE employees SET salary = -1000 WHERE id = 1;
+}
+expect error {
+}
+
+# Multiple CHECK constraints on same table
+test check_constraint_multiple {
+    CREATE TABLE employees (
+        id INTEGER PRIMARY KEY,
+        age INTEGER CHECK (age >= 18) CHECK (age <= 65),
+        salary INTEGER CHECK (salary > 0) CHECK (salary <= 1000000)
+    );
+    INSERT INTO employees VALUES (1, 25, 50000);
+    INSERT INTO employees VALUES (2, 65, 1000000);
+    SELECT id, age, salary FROM employees ORDER BY id;
+}
+expect {
+    1|25|50000
+    2|65|1000000
+}
+
+test check_constraint_multiple_first_violation {
+    CREATE TABLE employees (
+        id INTEGER PRIMARY KEY,
+        age INTEGER CHECK (age >= 18) CHECK (age <= 65)
+    );
+    INSERT INTO employees VALUES (1, 17);
+}
+expect error {
+}
+
+test check_constraint_multiple_second_violation {
+    CREATE TABLE employees (
+        id INTEGER PRIMARY KEY,
+        age INTEGER CHECK (age >= 18) CHECK (age <= 65)
+    );
+    INSERT INTO employees VALUES (1, 66);
+}
+expect error {
+}
+
+# STRICT tables with CHECK constraints
+@requires strict "uses STRICT tables"
+test check_constraint_strict_table_basic {
+    CREATE TABLE employees (
+        id INTEGER PRIMARY KEY,
+        age INTEGER CHECK (age >= 18)
+    ) STRICT;
+    INSERT INTO employees VALUES (1, 25);
+    INSERT INTO employees VALUES (2, 30);
+    SELECT id, age FROM employees ORDER BY id;
+}
+expect {
+    1|25
+    2|30
+}
+
+@requires strict "uses STRICT tables"  
+test check_constraint_strict_type_violation {
+    CREATE TABLE employees (
+        id INTEGER PRIMARY KEY,
+        age INTEGER CHECK (age >= 18)
+    ) STRICT;
+    INSERT INTO employees VALUES (1, 'twenty-five');
+}
+expect error {
+}
+
+@requires strict "uses STRICT tables"
+test check_constraint_strict_numeric_string_coercion {
+    CREATE TABLE employees (
+        id INTEGER PRIMARY KEY,
+        age INTEGER CHECK (age >= 18)
+    ) STRICT;
+    -- Numeric string should be coerced to integer in STRICT table
+    INSERT INTO employees VALUES (1, '25');
+    SELECT id, age, typeof(age) FROM employees;
+}
+expect {
+    1|25|integer
+}
+
+@requires strict "uses STRICT tables"
+test check_constraint_strict_check_violation_after_coercion {
+    CREATE TABLE employees (
+        id INTEGER PRIMARY KEY,
+        age INTEGER CHECK (age >= 18)
+    ) STRICT;
+    -- Numeric string coerced to integer, then CHECK fails
+    INSERT INTO employees VALUES (1, '17');
+}
+expect error {
+}
+
+# Regular (non-STRICT) tables with type affinity
+test check_constraint_regular_table_numeric_string {
+    CREATE TABLE employees (
+        id INTEGER PRIMARY KEY,
+        age INTEGER CHECK (age >= 18)
+    );
+    -- Numeric string gets INTEGER affinity applied
+    INSERT INTO employees VALUES (1, '25');
+    INSERT INTO employees VALUES (2, '30');
+    SELECT id, age, typeof(age) FROM employees ORDER BY id;
+}
+expect {
+    1|25|integer
+    2|30|integer
+}
+
+test check_constraint_regular_table_text_stored {
+    CREATE TABLE employees (
+        id INTEGER PRIMARY KEY,
+        age INTEGER CHECK (age >= 18)
+    );
+    -- Non-numeric text bypasses INTEGER affinity and is stored as TEXT
+    -- But CHECK constraint compares text 'twenty-five' >= 18 which evaluates differently
+    INSERT INTO employees VALUES (1, 'twenty-five');
+    SELECT id, age, typeof(age) FROM employees;
+}
+expect {
+    1|twenty-five|text
+}
+
+# Complex expressions in CHECK constraints
+test check_constraint_complex_expression {
+    CREATE TABLE orders (
+        id INTEGER PRIMARY KEY,
+        quantity INTEGER,
+        unit_price INTEGER,
+        total INTEGER,
+        CHECK (total = quantity * unit_price)
+    );
+    INSERT INTO orders VALUES (1, 5, 10, 50);
+    INSERT INTO orders VALUES (2, 3, 25, 75);
+    SELECT id, quantity, unit_price, total FROM orders ORDER BY id;
+}
+expect {
+    1|5|10|50
+    2|3|25|75
+}
+
+test check_constraint_complex_expression_violation {
+    CREATE TABLE orders (
+        id INTEGER PRIMARY KEY,
+        quantity INTEGER,
+        unit_price INTEGER,
+        total INTEGER,
+        CHECK (total = quantity * unit_price)
+    );
+    INSERT INTO orders VALUES (1, 5, 10, 60);
+}
+expect error {
+}
+
+# CHECK constraints with AND/OR logic
+test check_constraint_and_logic {
+    CREATE TABLE employees (
+        id INTEGER PRIMARY KEY,
+        age INTEGER,
+        experience INTEGER,
+        CHECK (age >= 18 AND experience >= 0 AND experience <= age - 18)
+    );
+    INSERT INTO employees VALUES (1, 25, 5);
+    INSERT INTO employees VALUES (2, 30, 10);
+    SELECT id, age, experience FROM employees ORDER BY id;
+}
+expect {
+    1|25|5
+    2|30|10
+}
+
+test check_constraint_and_logic_violation {
+    CREATE TABLE employees (
+        id INTEGER PRIMARY KEY,
+        age INTEGER,
+        experience INTEGER,
+        CHECK (age >= 18 AND experience >= 0 AND experience <= age - 18)
+    );
+    -- Experience > age - 18
+    INSERT INTO employees VALUES (1, 25, 10);
+}
+expect error {
+}
+
+test check_constraint_or_logic {
+    CREATE TABLE products (
+        id INTEGER PRIMARY KEY,
+        status TEXT,
+        CHECK (status = 'active' OR status = 'inactive' OR status = 'pending')
+    );
+    INSERT INTO products VALUES (1, 'active');
+    INSERT INTO products VALUES (2, 'inactive');
+    INSERT INTO products VALUES (3, 'pending');
+    SELECT id, status FROM products ORDER BY id;
+}
+expect {
+    1|active
+    2|inactive
+    3|pending
+}
+
+# BETWEEN operator in CHECK constraints
+test check_constraint_between {
+    CREATE TABLE employees (
+        id INTEGER PRIMARY KEY,
+        age INTEGER,
+        CHECK (age BETWEEN 18 AND 65)
+    );
+    INSERT INTO employees VALUES (1, 18);
+    INSERT INTO employees VALUES (2, 40);
+    INSERT INTO employees VALUES (3, 65);
+    SELECT id, age FROM employees ORDER BY id;
+}
+expect {
+    1|18
+    2|40
+    3|65
+}
+
+test check_constraint_between_lower_violation {
+    CREATE TABLE employees (
+        id INTEGER PRIMARY KEY,
+        age INTEGER,
+        CHECK (age BETWEEN 18 AND 65)
+    );
+    INSERT INTO employees VALUES (1, 17);
+}
+expect error {
+}
+
+test check_constraint_between_upper_violation {
+    CREATE TABLE employees (
+        id INTEGER PRIMARY KEY,
+        age INTEGER,
+        CHECK (age BETWEEN 18 AND 65)
+    );
+    INSERT INTO employees VALUES (1, 66);
+}
+expect error {
+}
+
+# String pattern matching in CHECK constraints
+test check_constraint_like_pattern {
+    CREATE TABLE emails (
+        id INTEGER PRIMARY KEY,
+        email TEXT,
+        CHECK (email LIKE '%@%.%')
+    );
+    INSERT INTO emails VALUES (1, 'user@example.com');
+    INSERT INTO emails VALUES (2, 'admin@test.org');
+    SELECT id, email FROM emails ORDER BY id;
+}
+expect {
+    1|user@example.com
+    2|admin@test.org
+}
+
+test check_constraint_like_pattern_violation {
+    CREATE TABLE emails (
+        id INTEGER PRIMARY KEY,
+        email TEXT,
+        CHECK (email LIKE '%@%.%')
+    );
+    INSERT INTO emails VALUES (1, 'invalid-email');
+}
+expect error {
+}
+
+# CHECK constraints with NOT operator
+test check_constraint_not_operator {
+    CREATE TABLE products (
+        id INTEGER PRIMARY KEY,
+        status TEXT,
+        CHECK (status NOT IN ('deleted', 'archived'))
+    );
+    INSERT INTO products VALUES (1, 'active');
+    INSERT INTO products VALUES (2, 'pending');
+    SELECT id, status FROM products ORDER BY id;
+}
+expect {
+    1|active
+    2|pending
+}
+
+test check_constraint_not_operator_violation {
+    CREATE TABLE products (
+        id INTEGER PRIMARY KEY,
+        status TEXT,
+        CHECK (status NOT IN ('deleted', 'archived'))
+    );
+    INSERT INTO products VALUES (1, 'deleted');
+}
+expect error {
+}
+
+# CHECK constraint with length() function
+test check_constraint_length_function {
+    CREATE TABLE users (
+        id INTEGER PRIMARY KEY,
+        username TEXT,
+        CHECK (length(username) >= 3 AND length(username) <= 20)
+    );
+    INSERT INTO users VALUES (1, 'joe');
+    INSERT INTO users VALUES (2, 'alice_wonderland');
+    SELECT id, username FROM users ORDER BY id;
+}
+expect {
+    1|joe
+    2|alice_wonderland
+}
+
+test check_constraint_length_too_short {
+    CREATE TABLE users (
+        id INTEGER PRIMARY KEY,
+        username TEXT,
+        CHECK (length(username) >= 3 AND length(username) <= 20)
+    );
+    INSERT INTO users VALUES (1, 'ab');
+}
+expect error {
+}
+
+test check_constraint_length_too_long {
+    CREATE TABLE users (
+        id INTEGER PRIMARY KEY,
+        username TEXT,
+        CHECK (length(username) >= 3 AND length(username) <= 20)
+    );
+    INSERT INTO users VALUES (1, 'this_username_is_way_too_long');
+}
+expect error {
+}
+
+# Multiple rows insert with CHECK constraint
+test check_constraint_multi_row_insert_all_pass {
+    CREATE TABLE employees (
+        id INTEGER PRIMARY KEY,
+        age INTEGER CHECK (age >= 18)
+    );
+    INSERT INTO employees VALUES (1, 25), (2, 30), (3, 45);
+    SELECT id, age FROM employees ORDER BY id;
+}
+expect {
+    1|25
+    2|30
+    3|45
+}
+
+test check_constraint_multi_row_insert_one_fails {
+    CREATE TABLE employees (
+        id INTEGER PRIMARY KEY,
+        age INTEGER CHECK (age >= 18)
+    );
+    INSERT INTO employees VALUES (1, 25), (2, 17), (3, 45);
+}
+expect error {
+}
+
+# CHECK constraints on REAL values with precision
+test check_constraint_real_precision {
+    CREATE TABLE measurements (
+        id INTEGER PRIMARY KEY,
+        value REAL CHECK (value >= 0.0 AND value <= 100.0)
+    );
+    INSERT INTO measurements VALUES (1, 0.0);
+    INSERT INTO measurements VALUES (2, 50.5);
+    INSERT INTO measurements VALUES (3, 100.0);
+    SELECT id, value FROM measurements ORDER BY id;
+}
+expect {
+    1|0.0
+    2|50.5
+    3|100.0
+}
+# JS Number omits .0 for whole numbers
+expect @js {
+    1|0
+    2|50.5
+    3|100
+}
+
+test check_constraint_real_precision_violation {
+    CREATE TABLE measurements (
+        id INTEGER PRIMARY KEY,
+        value REAL CHECK (value >= 0.0 AND value <= 100.0)
+    );
+    INSERT INTO measurements VALUES (1, 100.1);
+}
+expect error {
+}
+
+# Transaction rollback on CHECK constraint failure
+test check_constraint_transaction_rollback {
+    CREATE TABLE employees (
+        id INTEGER PRIMARY KEY,
+        age INTEGER CHECK (age >= 18)
+    );
+    BEGIN;
+    INSERT INTO employees VALUES (1, 25);
+    INSERT INTO employees VALUES (2, 30);
+    -- This should fail and rollback entire transaction
+    INSERT INTO employees VALUES (3, 17);
+    COMMIT;
+}
+expect error {
+}
+
+test check_constraint_verify_rollback {
+    CREATE TABLE employees (
+        id INTEGER PRIMARY KEY,
+        age INTEGER CHECK (age >= 18)
+    );
+    BEGIN;
+    INSERT INTO employees VALUES (1, 25);
+    INSERT INTO employees VALUES (2, 30);
+    COMMIT;
+    -- Try to violate in a new transaction
+    BEGIN;
+    INSERT INTO employees VALUES (3, 17);
+    COMMIT;
+    -- Transaction should have rolled back, only first two rows exist
+    SELECT id FROM employees ORDER BY id;
+}
+expect error {
+}
+
+# Edge case: CHECK constraint with 0 and 1 (false and true)
+test check_constraint_boolean_style {
+    CREATE TABLE flags (
+        id INTEGER PRIMARY KEY,
+        is_active INTEGER CHECK (is_active IN (0, 1))
+    );
+    INSERT INTO flags VALUES (1, 0);
+    INSERT INTO flags VALUES (2, 1);
+    SELECT id, is_active FROM flags ORDER BY id;
+}
+expect {
+    1|0
+    2|1
+}
+
+test check_constraint_boolean_style_violation {
+    CREATE TABLE flags (
+        id INTEGER PRIMARY KEY,
+        is_active INTEGER CHECK (is_active IN (0, 1))
+    );
+    INSERT INTO flags VALUES (1, 2);
+}
+expect error {
+}
+
+# CASE expressions in CHECK constraints
+test check_constraint_case_expression {
+    CREATE TABLE orders (
+        id INTEGER PRIMARY KEY,
+        status TEXT,
+        value INTEGER,
+        CHECK (CASE
+            WHEN status = 'active' THEN value > 0
+            WHEN status = 'inactive' THEN value = 0
+            ELSE 1
+        END)
+    );
+    INSERT INTO orders VALUES (1, 'active', 100);
+    INSERT INTO orders VALUES (2, 'inactive', 0);
+    INSERT INTO orders VALUES (3, 'pending', -50);
+    SELECT id, status, value FROM orders ORDER BY id;
+}
+expect {
+    1|active|100
+    2|inactive|0
+    3|pending|-50
+}
+
+test check_constraint_case_expression_violation {
+    CREATE TABLE orders (
+        id INTEGER PRIMARY KEY,
+        status TEXT,
+        value INTEGER,
+        CHECK (CASE
+            WHEN status = 'active' THEN value > 0
+            WHEN status = 'inactive' THEN value = 0
+            ELSE 1
+        END)
+    );
+    INSERT INTO orders VALUES (1, 'active', -10);
+}
+expect error {
+}
+
+# Rowid references in CHECK constraints
+test check_constraint_rowid_reference {
+    CREATE TABLE audit_log (
+        message TEXT,
+        CHECK (rowid > 0)
+    );
+    INSERT INTO audit_log VALUES ('First entry');
+    INSERT INTO audit_log VALUES ('Second entry');
+    SELECT rowid, message FROM audit_log ORDER BY rowid;
+}
+expect {
+    1|First entry
+    2|Second entry
+}
+
+test check_constraint_rowid_reference_violation {
+    CREATE TABLE audit_log (
+        message TEXT,
+        CHECK (rowid > 0)
+    );
+    INSERT INTO audit_log(rowid, message) VALUES (-1, 'Invalid');
+}
+expect error {
+}
+
+# DEFAULT values with CHECK constraints
+test check_constraint_default_value {
+    CREATE TABLE tasks (
+        id INTEGER PRIMARY KEY,
+        status TEXT DEFAULT 'pending' CHECK (status IN ('pending', 'active', 'done'))
+    );
+    INSERT INTO tasks(id) VALUES (1);
+    INSERT INTO tasks VALUES (2, 'active');
+    SELECT id, status FROM tasks ORDER BY id;
+}
+expect {
+    1|pending
+    2|active
+}
+
+test check_constraint_default_value_violation {
+    CREATE TABLE tasks (
+        id INTEGER PRIMARY KEY,
+        status TEXT DEFAULT 'pending' CHECK (status IN ('pending', 'active', 'done'))
+    );
+    INSERT INTO tasks VALUES (1, 'invalid');
+}
+expect error {
+}
+
+# CAST in CHECK constraints
+test check_constraint_cast_expression {
+    CREATE TABLE numeric_strings (
+        id INTEGER PRIMARY KEY,
+        num_str TEXT,
+        CHECK (CAST(num_str AS INTEGER) > 0)
+    );
+    INSERT INTO numeric_strings VALUES (1, '123');
+    INSERT INTO numeric_strings VALUES (2, '456');
+    SELECT id, num_str FROM numeric_strings ORDER BY id;
+}
+expect {
+    1|123
+    2|456
+}
+
+test check_constraint_cast_expression_violation {
+    CREATE TABLE numeric_strings (
+        id INTEGER PRIMARY KEY,
+        num_str TEXT,
+        CHECK (CAST(num_str AS INTEGER) > 0)
+    );
+    INSERT INTO numeric_strings VALUES (1, '-5');
+}
+expect error {
+}
+
+# ON CONFLICT clauses with CHECK constraints
+test check_constraint_on_conflict_ignore {
+    CREATE TABLE items (
+        id INTEGER PRIMARY KEY,
+        value INTEGER CHECK (value > 0)
+    );
+    INSERT OR IGNORE INTO items VALUES (1, 10);
+    INSERT OR IGNORE INTO items VALUES (2, -5);
+    INSERT OR IGNORE INTO items VALUES (3, 20);
+    SELECT id, value FROM items ORDER BY id;
+}
+expect {
+    1|10
+    3|20
+}
+
+test check_constraint_on_conflict_replace {
+    CREATE TABLE items (
+        id INTEGER PRIMARY KEY,
+        value INTEGER CHECK (value > 0)
+    );
+    INSERT INTO items VALUES (1, 10);
+    -- REPLACE can't bypass CHECK constraints
+    INSERT OR REPLACE INTO items VALUES (1, -5);
+}
+expect error {
+}
+
+test check_constraint_on_conflict_fail {
+    CREATE TABLE items (
+        id INTEGER PRIMARY KEY,
+        value INTEGER CHECK (value > 0)
+    );
+    BEGIN;
+    INSERT INTO items VALUES (1, 10);
+    INSERT OR FAIL INTO items VALUES (2, -5);
+    COMMIT;
+}
+expect error {
+}
+
+# Foreign key + CHECK constraint interaction
+test check_constraint_with_foreign_key {
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE parent (id INTEGER PRIMARY KEY);
+    CREATE TABLE child (
+        id INTEGER PRIMARY KEY,
+        parent_id INTEGER REFERENCES parent(id),
+        CHECK (parent_id > 0)
+    );
+    INSERT INTO parent VALUES (1);
+    INSERT INTO parent VALUES (2);
+    INSERT INTO child VALUES (1, 1);
+    INSERT INTO child VALUES (2, 2);
+    SELECT id, parent_id FROM child ORDER BY id;
+}
+expect {
+    1|1
+    2|2
+}
+
+test check_constraint_before_foreign_key {
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE parent (id INTEGER PRIMARY KEY);
+    CREATE TABLE child (
+        id INTEGER PRIMARY KEY,
+        parent_id INTEGER REFERENCES parent(id),
+        CHECK (parent_id > 0)
+    );
+    -- CHECK constraint should fail before FK is checked
+    INSERT INTO child VALUES (1, -1);
+}
+expect error {
+}
+
+test check_constraint_foreign_key_fails {
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE parent (id INTEGER PRIMARY KEY);
+    CREATE TABLE child (
+        id INTEGER PRIMARY KEY,
+        parent_id INTEGER REFERENCES parent(id),
+        CHECK (parent_id > 0)
+    );
+    -- CHECK passes but FK fails (parent doesn't exist)
+    INSERT INTO child VALUES (1, 999);
+}
+expect error {
+}
+
+# COLLATE in CHECK constraints
+test check_constraint_collate_nocase {
+    CREATE TABLE users (
+        id INTEGER PRIMARY KEY,
+        username TEXT,
+        CHECK (username COLLATE NOCASE != 'admin')
+    );
+    INSERT INTO users VALUES (1, 'user1');
+    INSERT INTO users VALUES (2, 'USER2');
+    SELECT id, username FROM users ORDER BY id;
+}
+expect {
+    1|user1
+    2|USER2
+}
+
+test check_constraint_collate_nocase_violation {
+    CREATE TABLE users (
+        id INTEGER PRIMARY KEY,
+        username TEXT,
+        CHECK (username COLLATE NOCASE != 'admin')
+    );
+    INSERT INTO users VALUES (1, 'ADMIN');
+}
+expect error {
+}
+
+# Arithmetic overflow in CHECK constraints
+test check_constraint_arithmetic_overflow {
+    CREATE TABLE numbers (
+        id INTEGER PRIMARY KEY,
+        value INTEGER,
+        CHECK (value * 2 < 100)
+    );
+    INSERT INTO numbers VALUES (1, 10);
+    INSERT INTO numbers VALUES (2, 49);
+    SELECT id, value FROM numbers ORDER BY id;
+}
+expect {
+    1|10
+    2|49
+}
+
+test check_constraint_arithmetic_overflow_violation {
+    CREATE TABLE numbers (
+        id INTEGER PRIMARY KEY,
+        value INTEGER,
+        CHECK (value * 2 < 100)
+    );
+    INSERT INTO numbers VALUES (1, 50);
+}
+expect error {
+}
+
+# ALTER TABLE with CHECK constraints
+test check_constraint_alter_table_add_column {
+    CREATE TABLE products (
+        id INTEGER PRIMARY KEY,
+        name TEXT
+    );
+    INSERT INTO products VALUES (1, 'Widget');
+    ALTER TABLE products ADD COLUMN price REAL CHECK (price > 0);
+    -- Existing rows get NULL for new column, which passes CHECK
+    SELECT id, name, price FROM products;
+    INSERT INTO products VALUES (2, 'Gadget', 19.99);
+    SELECT id, name, price FROM products WHERE id = 2;
+}
+expect {
+    1|Widget|
+    2|Gadget|19.99
+}
+
+test check_constraint_alter_table_add_column_violation {
+    CREATE TABLE products (
+        id INTEGER PRIMARY KEY,
+        name TEXT
+    );
+    ALTER TABLE products ADD COLUMN price REAL CHECK (price > 0);
+    INSERT INTO products VALUES (1, 'Widget', -5.00);
+}
+expect error {
+}
+
+test check_constraint_trigger_violation {
+    CREATE TABLE audit (
+        id INTEGER PRIMARY KEY,
+        action TEXT CHECK (action IN ('INSERT', 'UPDATE', 'DELETE'))
+    );
+
+    CREATE TABLE data (
+        id INTEGER PRIMARY KEY,
+        value INTEGER
+    );
+
+    CREATE TRIGGER bad_log AFTER INSERT ON data BEGIN INSERT INTO audit VALUES (NULL, 'INVALID'); END;
+
+    INSERT INTO data VALUES (1, 100);
+}
+expect error {
+}
+
+# PRAGMA ignore_check_constraints
+test check_constraint_pragma_ignore {
+    CREATE TABLE restricted (
+        id INTEGER PRIMARY KEY,
+        value INTEGER CHECK (value > 100)
+    );
+    PRAGMA ignore_check_constraints = ON;
+    INSERT INTO restricted VALUES (1, 50);
+    INSERT INTO restricted VALUES (2, 150);
+    PRAGMA ignore_check_constraints = OFF;
+    SELECT id, value FROM restricted ORDER BY id;
+}
+expect {
+    1|50
+    2|150
+}
+
+test check_constraint_pragma_ignore_then_enforce {
+    CREATE TABLE restricted (
+        id INTEGER PRIMARY KEY,
+        value INTEGER CHECK (value > 100)
+    );
+    PRAGMA ignore_check_constraints = ON;
+    INSERT INTO restricted VALUES (1, 50);
+    PRAGMA ignore_check_constraints = OFF;
+    -- Should now enforce CHECK
+    INSERT INTO restricted VALUES (2, 75);
+}
+expect error {
+}
+
+# ALTER TABLE ADD COLUMN with CHECK constraints
+test alter_table_add_column_check_constraint {
+    CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT);
+    INSERT INTO products VALUES (1, 'Widget A');
+
+    ALTER TABLE products ADD COLUMN price REAL CHECK (price > 0);
+
+    -- Should succeed with positive price
+    INSERT INTO products VALUES (2, 'Widget B', 25.99);
+
+    -- Should fail with negative price (the original issue)
+    INSERT INTO products VALUES (3, 'Widget C', -5.00);
+}
+expect error {
+}
+
+test alter_table_add_column_check_constraint_success {
+    CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT);
+    ALTER TABLE products ADD COLUMN price REAL CHECK (price > 0);
+
+    -- All insertions should succeed
+    INSERT INTO products VALUES (1, 'Widget A', 10.50);
+    INSERT INTO products VALUES (2, 'Widget B', 25.99);
+
+    SELECT id, name, price FROM products ORDER BY id;
+}
+expect {
+    1|Widget A|10.5
+    2|Widget B|25.99
+}
+
+test alter_table_add_column_preserves_existing_check {
+    CREATE TABLE t (a INTEGER CHECK(a > 0));
+    INSERT INTO t VALUES (1);
+    ALTER TABLE t ADD COLUMN b INTEGER CHECK(b > 0);
+    -- b's CHECK should pass (positive value), but a's original CHECK must still reject negative a
+    INSERT INTO t VALUES (-1, 1);
+}
+expect error {
+}
+
+test alter_table_add_column_preserves_existing_check_success {
+    CREATE TABLE t (a INTEGER CHECK(a > 0));
+    INSERT INTO t VALUES (1);
+    ALTER TABLE t ADD COLUMN b INTEGER CHECK(b > 0);
+    -- Both CHECK constraints should pass
+    INSERT INTO t VALUES (2, 5);
+    SELECT * FROM t;
+}
+expect {
+    1|
+    2|5
+}
+
+test alter_table_add_column_check_constraint_named {
+    CREATE TABLE employees (id INTEGER PRIMARY KEY, name TEXT);
+
+    ALTER TABLE employees ADD COLUMN age INTEGER CONSTRAINT chk_age CHECK (age >= 18);
+
+    -- Should succeed with valid age
+    INSERT INTO employees VALUES (1, 'Alice', 25);
+
+    -- Should fail with invalid age
+    INSERT INTO employees VALUES (2, 'Bob', 16);
+}
+expect error {
+}
+
+# UPSERT DO UPDATE must evaluate CHECK constraints on the updated values
+test check_constraint_upsert_do_update_violation {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, value INTEGER CHECK(value > 0));
+    INSERT INTO t VALUES(1, 10);
+    -- INSERT value passes CHECK, but DO UPDATE SET value = -5 violates it
+    INSERT INTO t VALUES(1, 20) ON CONFLICT(id) DO UPDATE SET value = -5;
+}
+expect error {
+}
+
+test check_constraint_upsert_do_update_success {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, value INTEGER CHECK(value > 0));
+    INSERT INTO t VALUES(1, 10);
+    INSERT INTO t VALUES(1, 20) ON CONFLICT(id) DO UPDATE SET value = excluded.value;
+    SELECT id, value FROM t;
+}
+expect {
+    1|20
+}
+
+# UPDATE OR IGNORE should skip rows that violate CHECK constraints
+test check_constraint_update_or_ignore_single_row {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, value INTEGER CHECK(value > 0));
+    INSERT INTO t VALUES(1, 10);
+    INSERT INTO t VALUES(2, 20);
+    INSERT INTO t VALUES(3, 30);
+    -- Row 2 update violates CHECK, should be silently skipped
+    UPDATE OR IGNORE t SET value = -1 WHERE id = 2;
+    SELECT id, value FROM t ORDER BY id;
+}
+expect {
+    1|10
+    2|20
+    3|30
+}
+
+test check_constraint_update_or_ignore_all_rows {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, value INTEGER CHECK(value > 0));
+    INSERT INTO t VALUES(1, 10);
+    INSERT INTO t VALUES(2, 20);
+    -- All rows violate CHECK, all should be silently skipped
+    UPDATE OR IGNORE t SET value = -1;
+    SELECT id, value FROM t ORDER BY id;
+}
+expect {
+    1|10
+    2|20
+}
+
+# CHECK constraints referencing rowid aliases (_rowid_, oid)
+test check_constraint_rowid_alias_underscore {
+    CREATE TABLE t(val INTEGER, CHECK(_rowid_ > 0));
+    INSERT INTO t VALUES(100);
+    SELECT _rowid_, val FROM t;
+}
+expect {
+    1|100
+}
+
+test check_constraint_rowid_alias_oid {
+    CREATE TABLE t(val INTEGER, CHECK(oid > 0));
+    INSERT INTO t(rowid, val) VALUES(-1, 100);
+}
+expect error {
+}
+
+# UPDATE that changes rowid to a value violating CHECK
+test check_constraint_update_rowid_violation {
+    CREATE TABLE t(val INTEGER, CHECK(rowid > 0));
+    INSERT INTO t VALUES(100);
+    UPDATE t SET rowid = -1, val = 999 WHERE rowid = 1;
+}
+expect error {
+}
+
+# UPDATE that does NOT change rowid should still pass CHECK referencing rowid
+test check_constraint_update_no_rowid_change {
+    CREATE TABLE t(val INTEGER, CHECK(rowid > 0));
+    INSERT INTO t VALUES(100);
+    UPDATE t SET val = 999 WHERE rowid = 1;
+    SELECT rowid, val FROM t;
+}
+expect {
+    1|999
+}
+
+# UPSERT DO UPDATE with rowid CHECK
+test check_constraint_upsert_rowid_check {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, val INTEGER, CHECK(rowid > 0));
+    INSERT INTO t VALUES(1, 10);
+    INSERT INTO t VALUES(1, 20) ON CONFLICT(id) DO UPDATE SET val = excluded.val;
+    SELECT id, val FROM t;
+}
+expect {
+    1|20
+}

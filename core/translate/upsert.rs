@@ -6,7 +6,7 @@ use turso_parser::ast::{self, TriggerEvent, TriggerTime, Upsert};
 
 use crate::error::SQLITE_CONSTRAINT_PRIMARYKEY;
 use crate::schema::{IndexColumn, ROWID_SENTINEL};
-use crate::translate::emitter::UpdateRowSource;
+use crate::translate::emitter::{emit_check_constraints, UpdateRowSource};
 use crate::translate::expr::{rewrite_between_expr, walk_expr, WalkControl};
 use crate::translate::fkeys::{
     emit_fk_child_update_counters, emit_parent_key_change_checks, fire_fk_update_actions,
@@ -500,6 +500,21 @@ pub fn emit_upsert(
                 }
             }
         }
+
+        // Evaluate CHECK constraints on the new values
+        emit_check_constraints(
+            program,
+            &bt.check_constraints,
+            resolver,
+            new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg),
+            bt.columns
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, col)| col.name.as_deref().map(|n| (n, new_start + idx))),
+            connection,
+            ast::ResolveType::Abort,
+            ctx.loop_labels.row_done,
+        )?;
     }
 
     let (changed_cols, rowid_changed) = collect_changed_cols(table, set_pairs);
