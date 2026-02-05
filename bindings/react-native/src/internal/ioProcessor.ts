@@ -21,7 +21,7 @@ export interface IoContext {
   /** Auth token for HTTP requests */
   authToken?: string | (() => string | Promise<string> | null);
   /** Base URL for normalization (e.g., 'libsql://mydb.turso.io') */
-  baseUrl?: string;
+  baseUrl?: string | (() => string | null);
 }
 
 // Allow users to optionally override file system implementation
