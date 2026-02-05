@@ -79,7 +79,7 @@ export class Database {
   private _extraIo?: () => Promise<void>;
   private _ioContext?: {
     authToken?: string | (() => string | Promise<string> | null);
-    baseUrl: string;
+    baseUrl?: string | (() => string | null);
   };
 
   /**
@@ -150,10 +150,6 @@ export class Database {
       url = this._opts.url;
     }
 
-    if (!url) {
-      throw new Error('Sync database requires a URL');
-    }
-
     // Build dbConfig (path normalization happens in C++ JSI layer)
     const dbConfig = {
       path: this._opts.path,
@@ -193,7 +189,7 @@ export class Database {
     // Create IO context with auth token and base URL
     this._ioContext = {
       authToken: this._opts.authToken,
-      baseUrl: url,
+      baseUrl: this._opts.url,
     };
 
     // Create extraIo callback for partial sync support
