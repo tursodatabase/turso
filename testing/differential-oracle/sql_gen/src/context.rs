@@ -1,5 +1,6 @@
 //! Generation context with RNG, trace, and coverage.
 
+use anarchist_readable_name_generator_lib::readable_name_custom;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
@@ -235,10 +236,18 @@ impl Context {
         (0..len).map(|_| self.rng.random()).collect()
     }
 
+    /// Generate a readable identifier name.
+    ///
+    /// Uses the anarchist readable name generator to create human-readable
+    /// names like "happy_elephant" or "swift_falcon".
+    pub fn gen_readable_name(&mut self) -> String {
+        readable_name_custom("_", &mut self.rng).replace('-', "_")
+    }
+
     /// Generate a unique name with the given prefix that doesn't exist in the provided set.
     ///
-    /// Generates names in the format `{prefix}_{random_number}` until finding one
-    /// that is not present in `existing`.
+    /// Generates readable names in the format `{prefix}_{readable_name}` until finding one
+    /// that is not present in `existing`. Example: "tbl_happy_elephant".
     ///
     /// # Panics
     /// Panics if unable to find a unique name after 1,000,000 attempts.
@@ -248,7 +257,8 @@ impl Context {
         existing: &std::collections::HashSet<String>,
     ) -> String {
         for _ in 0..1_000_000 {
-            let name = format!("{}_{}", prefix, self.gen_range(10000));
+            let readable = self.gen_readable_name();
+            let name = format!("{prefix}_{readable}");
             if !existing.contains(&name) {
                 return name;
             }
@@ -260,7 +270,7 @@ impl Context {
     /// and a specific excluded name.
     ///
     /// Useful when renaming something - the new name must not match existing names
-    /// AND must not match the current name.
+    /// AND must not match the current name. Example: "col_swift_falcon".
     ///
     /// # Panics
     /// Panics if unable to find a unique name after 1,000,000 attempts.
@@ -271,7 +281,8 @@ impl Context {
         exclude: &str,
     ) -> String {
         for _ in 0..1_000_000 {
-            let name = format!("{}_{}", prefix, self.gen_range(10000));
+            let readable = self.gen_readable_name();
+            let name = format!("{prefix}_{readable}");
             if !existing.contains(&name) && name != exclude {
                 return name;
             }
