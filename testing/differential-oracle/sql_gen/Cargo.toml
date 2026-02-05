@@ -15,6 +15,7 @@ proptest = "1.9"
 rand = { workspace = true }
 sql_gen_macros = { path = "../sql_gen_macros" }
 strum = { workspace = true }
+anarchist-readable-name-generator-lib = "0.2.0"
 
 [dev-dependencies]
 proptest = "1.9"
