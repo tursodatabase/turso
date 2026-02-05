@@ -44,6 +44,9 @@ pub struct Policy {
     /// Configuration for expression generation.
     pub expr_config: ExprConfig,
 
+    /// Configuration for ALTER TABLE statement generation.
+    pub alter_table_config: AlterTableConfig,
+
     /// Configuration for trigger generation.
     pub trigger_config: TriggerConfig,
 
@@ -86,6 +89,7 @@ impl Default for Policy {
             delete_config: DeleteConfig::default(),
             identifier_config: IdentifierConfig::default(),
             expr_config: ExprConfig::default(),
+            alter_table_config: AlterTableConfig::default(),
             trigger_config: TriggerConfig::default(),
             max_expr_depth: 4,
             max_subquery_depth: 2,
@@ -178,6 +182,12 @@ impl Policy {
     /// Builder method to set trigger configuration.
     pub fn with_trigger_config(mut self, config: TriggerConfig) -> Self {
         self.trigger_config = config;
+        self
+    }
+
+    /// Builder method to set ALTER TABLE configuration.
+    pub fn with_alter_table_config(mut self, config: AlterTableConfig) -> Self {
+        self.alter_table_config = config;
         self
     }
 
@@ -283,6 +293,7 @@ pub struct StmtWeights {
     // DDL
     pub create_table: u32,
     pub drop_table: u32,
+    pub alter_table: u32,
     pub create_index: u32,
     pub drop_index: u32,
     pub create_trigger: u32,
@@ -305,6 +316,7 @@ impl Default for StmtWeights {
             // DDL (lower weights - less common)
             create_table: 2,
             drop_table: 1,
+            alter_table: 1,
             create_index: 2,
             drop_index: 1,
             create_trigger: 1,
@@ -327,6 +339,7 @@ impl StmtWeights {
             delete: 10,
             create_table: 0,
             drop_table: 0,
+            alter_table: 0,
             create_index: 0,
             drop_index: 0,
             create_trigger: 0,
@@ -346,6 +359,7 @@ impl StmtWeights {
             delete: 0,
             create_table: 0,
             drop_table: 0,
+            alter_table: 0,
             create_index: 0,
             drop_index: 0,
             create_trigger: 0,
@@ -365,6 +379,7 @@ impl StmtWeights {
             StmtKind::Delete => self.delete,
             StmtKind::CreateTable => self.create_table,
             StmtKind::DropTable => self.drop_table,
+            StmtKind::AlterTable => self.alter_table,
             StmtKind::CreateIndex => self.create_index,
             StmtKind::DropIndex => self.drop_index,
             StmtKind::CreateTrigger => self.create_trigger,
@@ -384,6 +399,7 @@ impl StmtWeights {
             (StmtKind::Delete, self.delete),
             (StmtKind::CreateTable, self.create_table),
             (StmtKind::DropTable, self.drop_table),
+            (StmtKind::AlterTable, self.alter_table),
             (StmtKind::CreateIndex, self.create_index),
             (StmtKind::DropIndex, self.drop_index),
             (StmtKind::CreateTrigger, self.create_trigger),
@@ -1000,6 +1016,37 @@ impl DeleteConfig {
         Self {
             where_probability: 1.0,
             ..Default::default()
+        }
+    }
+}
+
+// =============================================================================
+// ALTER TABLE Configuration
+// =============================================================================
+
+/// Configuration for ALTER TABLE statement generation.
+#[derive(Debug, Clone, Default)]
+pub struct AlterTableConfig {
+    /// Weights for ALTER TABLE actions.
+    pub action_weights: AlterTableActionWeights,
+}
+
+/// Weights for ALTER TABLE actions.
+#[derive(Debug, Clone)]
+pub struct AlterTableActionWeights {
+    pub rename_table: u32,
+    pub add_column: u32,
+    pub drop_column: u32,
+    pub rename_column: u32,
+}
+
+impl Default for AlterTableActionWeights {
+    fn default() -> Self {
+        Self {
+            rename_table: 20,
+            add_column: 40,
+            drop_column: 20,
+            rename_column: 20,
         }
     }
 }

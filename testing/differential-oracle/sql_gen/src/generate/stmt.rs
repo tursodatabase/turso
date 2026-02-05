@@ -2,9 +2,10 @@
 
 use crate::SqlGen;
 use crate::ast::{
-    ColumnDefStmt, CreateIndexStmt, CreateTableStmt, CreateTriggerStmt, DeleteStmt, DropIndexStmt,
-    DropTableStmt, DropTriggerStmt, Expr, InsertStmt, Stmt, TriggerBodyStmtKind, TriggerEvent,
-    TriggerEventKind, TriggerStmt, TriggerTiming, UpdateStmt,
+    AlterTableAction, AlterTableActionKind, AlterTableStmt, ColumnDefStmt, CreateIndexStmt,
+    CreateTableStmt, CreateTriggerStmt, DeleteStmt, DropIndexStmt, DropTableStmt, DropTriggerStmt,
+    Expr, InsertStmt, Stmt, TriggerBodyStmtKind, TriggerEvent, TriggerEventKind, TriggerStmt,
+    TriggerTiming, UpdateStmt,
 };
 use crate::capabilities::Capabilities;
 use crate::context::Context;
@@ -12,6 +13,7 @@ use crate::error::GenError;
 use crate::generate::expr::generate_condition;
 use crate::generate::literal::generate_literal;
 use crate::generate::select::generate_select;
+use crate::policy::AlterTableConfig;
 use crate::schema::DataType;
 use crate::trace::{Origin, StmtKind};
 use sql_gen_macros::trace_gen;
@@ -76,6 +78,9 @@ fn collect_capability_allowed_stmts<C: Capabilities>() -> Vec<StmtKind> {
     if C::DROP_TABLE {
         candidates.push(StmtKind::DropTable);
     }
+    if C::ALTER_TABLE {
+        candidates.push(StmtKind::AlterTable);
+    }
     if C::CREATE_INDEX {
         candidates.push(StmtKind::CreateIndex);
     }
@@ -125,6 +130,7 @@ fn dispatch_stmt_generation<C: Capabilities>(
         StmtKind::Delete => generate_delete(generator, ctx),
         StmtKind::CreateTable => generate_create_table(generator, ctx),
         StmtKind::DropTable => generate_drop_table(generator, ctx),
+        StmtKind::AlterTable => generate_alter_table(generator, ctx),
         StmtKind::CreateIndex => generate_create_index(generator, ctx),
         StmtKind::DropIndex => generate_drop_index(generator, ctx),
         StmtKind::Begin => Ok(Stmt::Begin),
@@ -356,6 +362,142 @@ pub fn generate_drop_table<C: Capabilities>(
         table: table.name.clone(),
         if_exists: ctx.gen_bool_with_prob(0.5),
     }))
+}
+
+/// Generate an ALTER TABLE statement.
+#[trace_gen(Origin::AlterTable)]
+pub fn generate_alter_table<C: Capabilities>(
+    generator: &SqlGen<C>,
+    ctx: &mut Context,
+) -> Result<Stmt, GenError> {
+    let alter_config = &generator.policy().alter_table_config;
+
+    let table = ctx
+        .choose(&generator.schema().tables)
+        .ok_or_else(|| GenError::schema_empty("tables"))?
+        .clone();
+
+    let action = generate_alter_table_action(generator, ctx, &table, alter_config)?;
+
+    Ok(Stmt::AlterTable(AlterTableStmt {
+        table: table.name.clone(),
+        action,
+    }))
+}
+
+/// Generate an ALTER TABLE action.
+#[trace_gen(Origin::AlterTableAction)]
+fn generate_alter_table_action<C: Capabilities>(
+    generator: &SqlGen<C>,
+    ctx: &mut Context,
+    table: &crate::schema::Table,
+    config: &AlterTableConfig,
+) -> Result<AlterTableAction, GenError> {
+    let weights = &config.action_weights;
+    let items = [
+        (AlterTableActionKind::RenameTo, weights.rename_table),
+        (AlterTableActionKind::AddColumn, weights.add_column),
+        (AlterTableActionKind::DropColumn, weights.drop_column),
+        (AlterTableActionKind::RenameColumn, weights.rename_column),
+    ];
+
+    let weight_vec: Vec<u32> = items.iter().map(|(_, w)| *w).collect();
+    let idx = ctx.weighted_index(&weight_vec).ok_or_else(|| {
+        GenError::exhausted("alter_table_action", "no valid alter table actions available")
+    })?;
+
+    match items[idx].0 {
+        AlterTableActionKind::RenameTo => {
+            // Generate a unique new table name
+            let existing_names = generator.schema().table_names();
+            let new_name = loop {
+                let name = format!("tbl_{}", ctx.gen_range(10000));
+                if !existing_names.contains(&name) && name != table.name {
+                    break name;
+                }
+            };
+            Ok(AlterTableAction::RenameTo(new_name))
+        }
+        AlterTableActionKind::AddColumn => {
+            // Generate a new column definition
+            let existing_col_names: Vec<_> = table.columns.iter().map(|c| &c.name).collect();
+            let col_name = loop {
+                let name = format!("col_{}", ctx.gen_range(10000));
+                if !existing_col_names.contains(&&name) {
+                    break name;
+                }
+            };
+
+            let types = [
+                DataType::Integer,
+                DataType::Real,
+                DataType::Text,
+                DataType::Blob,
+            ];
+            let data_type = *ctx.choose(&types).unwrap();
+            let not_null = ctx.gen_bool_with_prob(0.3);
+
+            Ok(AlterTableAction::AddColumn(ColumnDefStmt {
+                name: col_name,
+                data_type,
+                primary_key: false,
+                not_null,
+                unique: false,
+                default: None,
+            }))
+        }
+        AlterTableActionKind::DropColumn => {
+            // Pick a non-primary-key column to drop
+            let droppable: Vec<_> = table
+                .columns
+                .iter()
+                .filter(|c| !c.primary_key)
+                .collect();
+
+            if droppable.is_empty() {
+                // Fall back to RenameTo if no droppable columns
+                let existing_names = generator.schema().table_names();
+                let new_name = loop {
+                    let name = format!("tbl_{}", ctx.gen_range(10000));
+                    if !existing_names.contains(&name) && name != table.name {
+                        break name;
+                    }
+                };
+                return Ok(AlterTableAction::RenameTo(new_name));
+            }
+
+            let col = ctx.choose(&droppable).unwrap();
+            Ok(AlterTableAction::DropColumn(col.name.clone()))
+        }
+        AlterTableActionKind::RenameColumn => {
+            // Pick a column to rename
+            if table.columns.is_empty() {
+                // Fall back to RenameTo if no columns
+                let existing_names = generator.schema().table_names();
+                let new_name = loop {
+                    let name = format!("tbl_{}", ctx.gen_range(10000));
+                    if !existing_names.contains(&name) && name != table.name {
+                        break name;
+                    }
+                };
+                return Ok(AlterTableAction::RenameTo(new_name));
+            }
+
+            let col = ctx.choose(&table.columns).unwrap();
+            let existing_col_names: Vec<_> = table.columns.iter().map(|c| &c.name).collect();
+            let new_name = loop {
+                let name = format!("col_{}", ctx.gen_range(10000));
+                if !existing_col_names.contains(&&name) {
+                    break name;
+                }
+            };
+
+            Ok(AlterTableAction::RenameColumn {
+                old_name: col.name.clone(),
+                new_name,
+            })
+        }
+    }
 }
 
 /// Generate a CREATE INDEX statement.
@@ -787,6 +929,37 @@ mod tests {
                 || sql.contains(" UPDATE OF ")
                 || sql.contains(" DELETE ON");
             assert!(has_event, "Trigger should have event: {sql}");
+        }
+    }
+
+    #[test]
+    fn test_generate_alter_table() {
+        let generator = test_generator();
+        let mut ctx = Context::new_with_seed(42);
+
+        let stmt = generate_alter_table(&generator, &mut ctx);
+        assert!(stmt.is_ok());
+
+        let sql = stmt.unwrap().to_string();
+        assert!(sql.starts_with("ALTER TABLE"));
+    }
+
+    #[test]
+    fn test_alter_table_action_variants() {
+        let generator = test_generator();
+
+        // Test multiple seeds to exercise different action variants
+        for seed in [42, 123, 456, 789, 1000, 2000, 3000, 4000] {
+            let mut ctx = Context::new_with_seed(seed);
+            let stmt = generate_alter_table(&generator, &mut ctx).unwrap();
+
+            let sql = stmt.to_string();
+            // Should contain one of RENAME TO, ADD COLUMN, DROP COLUMN, or RENAME COLUMN
+            let has_action = sql.contains("RENAME TO ")
+                || sql.contains("ADD COLUMN ")
+                || sql.contains("DROP COLUMN ")
+                || sql.contains("RENAME COLUMN ");
+            assert!(has_action, "ALTER TABLE should have action: {sql}");
         }
     }
 }

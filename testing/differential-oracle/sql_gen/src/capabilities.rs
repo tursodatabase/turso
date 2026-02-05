@@ -33,6 +33,7 @@ pub trait Capabilities: 'static + Clone {
     // DDL
     const CREATE_TABLE: bool;
     const DROP_TABLE: bool;
+    const ALTER_TABLE: bool;
     const CREATE_INDEX: bool;
     const DROP_INDEX: bool;
     const CREATE_TRIGGER: bool;
@@ -93,6 +94,7 @@ impl Capabilities for Full {
     const DELETE: bool = true;
     const CREATE_TABLE: bool = true;
     const DROP_TABLE: bool = true;
+    const ALTER_TABLE: bool = true;
     const CREATE_INDEX: bool = true;
     const DROP_INDEX: bool = true;
     const CREATE_TRIGGER: bool = true;
@@ -126,6 +128,7 @@ impl Capabilities for DmlOnly {
     const DELETE: bool = true;
     const CREATE_TABLE: bool = false;
     const DROP_TABLE: bool = false;
+    const ALTER_TABLE: bool = false;
     const CREATE_INDEX: bool = false;
     const DROP_INDEX: bool = false;
     const CREATE_TRIGGER: bool = false;
@@ -159,6 +162,7 @@ impl Capabilities for SelectOnly {
     const DELETE: bool = false;
     const CREATE_TABLE: bool = false;
     const DROP_TABLE: bool = false;
+    const ALTER_TABLE: bool = false;
     const CREATE_INDEX: bool = false;
     const DROP_INDEX: bool = false;
     const CREATE_TRIGGER: bool = false;
@@ -189,6 +193,7 @@ impl Capabilities for NoSubquery {
     const DELETE: bool = true;
     const CREATE_TABLE: bool = true;
     const DROP_TABLE: bool = true;
+    const ALTER_TABLE: bool = true;
     const CREATE_INDEX: bool = true;
     const DROP_INDEX: bool = true;
     const CREATE_TRIGGER: bool = true;

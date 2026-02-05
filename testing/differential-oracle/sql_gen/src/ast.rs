@@ -21,6 +21,7 @@ pub enum Stmt {
     Delete(DeleteStmt),
     CreateTable(CreateTableStmt),
     DropTable(DropTableStmt),
+    AlterTable(AlterTableStmt),
     CreateIndex(CreateIndexStmt),
     DropIndex(DropIndexStmt),
     CreateTrigger(CreateTriggerStmt),
@@ -39,6 +40,7 @@ impl fmt::Display for Stmt {
             Stmt::Delete(s) => write!(f, "{s}"),
             Stmt::CreateTable(s) => write!(f, "{s}"),
             Stmt::DropTable(s) => write!(f, "{s}"),
+            Stmt::AlterTable(s) => write!(f, "{s}"),
             Stmt::CreateIndex(s) => write!(f, "{s}"),
             Stmt::DropIndex(s) => write!(f, "{s}"),
             Stmt::CreateTrigger(s) => write!(f, "{s}"),
@@ -355,6 +357,47 @@ impl fmt::Display for DropTableStmt {
             write!(f, "IF EXISTS ")?;
         }
         write!(f, "{}", self.table)
+    }
+}
+
+/// An ALTER TABLE statement.
+#[derive(Debug, Clone)]
+pub struct AlterTableStmt {
+    pub table: String,
+    pub action: AlterTableAction,
+}
+
+impl fmt::Display for AlterTableStmt {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "ALTER TABLE {} {}", self.table, self.action)
+    }
+}
+
+/// An action in an ALTER TABLE statement.
+#[derive(Debug, Clone, strum::EnumDiscriminants)]
+#[strum_discriminants(name(AlterTableActionKind))]
+pub enum AlterTableAction {
+    /// RENAME TO new_name
+    RenameTo(String),
+    /// ADD COLUMN column_def
+    AddColumn(ColumnDefStmt),
+    /// DROP COLUMN column_name
+    DropColumn(String),
+    /// RENAME COLUMN old_name TO new_name
+    RenameColumn { old_name: String, new_name: String },
+    // TODO: ADD alter column later
+}
+
+impl fmt::Display for AlterTableAction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            AlterTableAction::RenameTo(new_name) => write!(f, "RENAME TO {new_name}"),
+            AlterTableAction::AddColumn(col) => write!(f, "ADD COLUMN {col}"),
+            AlterTableAction::DropColumn(col_name) => write!(f, "DROP COLUMN {col_name}"),
+            AlterTableAction::RenameColumn { old_name, new_name } => {
+                write!(f, "RENAME COLUMN {old_name} TO {new_name}")
+            }
+        }
     }
 }
 
