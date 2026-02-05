@@ -297,12 +297,17 @@ pub fn generate_create_table<C: Capabilities>(
     generator: &SqlGen<C>,
     ctx: &mut Context,
 ) -> Result<Stmt, GenError> {
+    let create_table_config = &generator.policy().create_table_config;
+
     // Generate a unique table name
     let existing_names = generator.schema().table_names();
     let table_name = ctx.gen_unique_name("tbl", &existing_names);
 
     // Generate columns
-    let num_cols = ctx.gen_range_inclusive(2, 6);
+    let num_cols = ctx.gen_range_inclusive(
+        create_table_config.min_columns,
+        create_table_config.max_columns,
+    );
     let mut columns = Vec::with_capacity(num_cols);
 
     // First column is usually the primary key
@@ -324,8 +329,8 @@ pub fn generate_create_table<C: Capabilities>(
     ];
     for i in 1..num_cols {
         let data_type = *ctx.choose(&types).unwrap();
-        let not_null = ctx.gen_bool_with_prob(0.3);
-        let unique = !not_null && ctx.gen_bool_with_prob(0.1);
+        let not_null = ctx.gen_bool_with_prob(create_table_config.not_null_probability);
+        let unique = !not_null && ctx.gen_bool_with_prob(create_table_config.unique_probability);
 
         columns.push(ColumnDefStmt {
             name: format!("col{i}"),
@@ -340,7 +345,7 @@ pub fn generate_create_table<C: Capabilities>(
     Ok(Stmt::CreateTable(CreateTableStmt {
         table: table_name,
         columns,
-        if_not_exists: ctx.gen_bool_with_prob(0.5),
+        if_not_exists: ctx.gen_bool_with_prob(create_table_config.if_not_exists_probability),
     }))
 }
 
@@ -349,13 +354,15 @@ pub fn generate_drop_table<C: Capabilities>(
     generator: &SqlGen<C>,
     ctx: &mut Context,
 ) -> Result<Stmt, GenError> {
+    let drop_table_config = &generator.policy().drop_table_config;
+
     let table = ctx
         .choose(&generator.schema().tables)
         .ok_or_else(|| GenError::schema_empty("tables"))?;
 
     Ok(Stmt::DropTable(DropTableStmt {
         table: table.name.clone(),
-        if_exists: ctx.gen_bool_with_prob(0.5),
+        if_exists: ctx.gen_bool_with_prob(drop_table_config.if_exists_probability),
     }))
 }
 
@@ -444,7 +451,7 @@ fn generate_alter_table_action<C: Capabilities>(
                 DataType::Blob,
             ];
             let data_type = *ctx.choose(&types).unwrap();
-            let not_null = ctx.gen_bool_with_prob(0.3);
+            let not_null = ctx.gen_bool_with_prob(config.not_null_probability);
 
             Ok(AlterTableAction::AddColumn(ColumnDefStmt {
                 name: col_name,
@@ -476,6 +483,8 @@ pub fn generate_create_index<C: Capabilities>(
     generator: &SqlGen<C>,
     ctx: &mut Context,
 ) -> Result<Stmt, GenError> {
+    let create_index_config = &generator.policy().create_index_config;
+
     let table = ctx
         .choose(&generator.schema().tables)
         .ok_or_else(|| GenError::schema_empty("tables"))?
@@ -487,7 +496,8 @@ pub fn generate_create_index<C: Capabilities>(
     let index_name = ctx.gen_unique_name(&prefix, &existing_names);
 
     // Select columns for the index
-    let num_cols = ctx.gen_range_inclusive(1, table.columns.len().min(3));
+    let max_cols = table.columns.len().min(create_index_config.max_columns);
+    let num_cols = ctx.gen_range_inclusive(1, max_cols);
     let columns: Vec<String> = (0..num_cols)
         .filter_map(|_| ctx.choose(&table.columns).map(|c| c.name.clone()))
         .collect();
@@ -500,8 +510,8 @@ pub fn generate_create_index<C: Capabilities>(
         name: index_name,
         table: table.name.clone(),
         columns,
-        unique: ctx.gen_bool_with_prob(0.2),
-        if_not_exists: ctx.gen_bool_with_prob(0.5),
+        unique: ctx.gen_bool_with_prob(create_index_config.unique_probability),
+        if_not_exists: ctx.gen_bool_with_prob(create_index_config.if_not_exists_probability),
     }))
 }
 
@@ -510,16 +520,19 @@ pub fn generate_drop_index<C: Capabilities>(
     generator: &SqlGen<C>,
     ctx: &mut Context,
 ) -> Result<Stmt, GenError> {
+    let drop_index_config = &generator.policy().drop_index_config;
+    let ident_config = &generator.policy().identifier_config;
+
     // Try to use an existing index, or generate a plausible name
     let index_name = if let Some(index) = ctx.choose(&generator.schema().indexes) {
         index.name.clone()
     } else {
-        format!("idx_{}", ctx.gen_range(10000))
+        format!("idx_{}", ctx.gen_range(ident_config.name_suffix_range))
     };
 
     Ok(Stmt::DropIndex(DropIndexStmt {
         name: index_name,
-        if_exists: ctx.gen_bool_with_prob(0.7),
+        if_exists: ctx.gen_bool_with_prob(drop_index_config.if_exists_probability),
     }))
 }
 
@@ -530,6 +543,7 @@ pub fn generate_create_trigger<C: Capabilities>(
     ctx: &mut Context,
 ) -> Result<Stmt, GenError> {
     let trigger_config = &generator.policy().trigger_config;
+    let ident_config = &generator.policy().identifier_config;
 
     let table = ctx
         .choose(&generator.schema().tables)
@@ -537,7 +551,11 @@ pub fn generate_create_trigger<C: Capabilities>(
         .clone();
 
     // Generate unique trigger name
-    let trigger_name = format!("trg_{}_{}", table.name, ctx.gen_range(10000));
+    let trigger_name = format!(
+        "trg_{}_{}",
+        table.name,
+        ctx.gen_range(ident_config.name_suffix_range)
+    );
 
     // Select timing (BEFORE, AFTER, INSTEAD OF)
     let timing = generate_trigger_timing(ctx, generator)?;
@@ -713,13 +731,18 @@ pub fn generate_drop_trigger<C: Capabilities>(
     ctx: &mut Context,
 ) -> Result<Stmt, GenError> {
     let trigger_config = &generator.policy().trigger_config;
+    let ident_config = &generator.policy().identifier_config;
 
     // Generate a plausible trigger name
     let table = ctx.choose(&generator.schema().tables);
     let trigger_name = if let Some(t) = table {
-        format!("trg_{}_{}", t.name, ctx.gen_range(10000))
+        format!(
+            "trg_{}_{}",
+            t.name,
+            ctx.gen_range(ident_config.name_suffix_range)
+        )
     } else {
-        format!("trg_{}", ctx.gen_range(10000))
+        format!("trg_{}", ctx.gen_range(ident_config.name_suffix_range))
     };
 
     Ok(Stmt::DropTrigger(DropTriggerStmt {
