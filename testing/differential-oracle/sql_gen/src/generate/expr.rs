@@ -173,14 +173,17 @@ fn generate_binary_op<C: Capabilities>(
     table: &Table,
     depth: usize,
 ) -> Result<Expr, GenError> {
-    // Pick operator type
-    let op_type = if ctx.gen_bool() {
-        OpType::Comparison
-    } else if ctx.gen_bool() {
-        OpType::Logical
-    } else {
-        OpType::Arithmetic
-    };
+    let expr_config = &generator.policy().expr_config;
+    let category_weights = &expr_config.binop_category_weights;
+
+    // Pick operator category using weights
+    let candidates = [
+        (OpType::Comparison, category_weights.comparison),
+        (OpType::Logical, category_weights.logical),
+        (OpType::Arithmetic, category_weights.arithmetic),
+    ];
+
+    let op_type = generator.policy().select_weighted(ctx, &candidates)?;
 
     let ops = match op_type {
         OpType::Comparison => BinOp::comparison(),
@@ -203,6 +206,7 @@ fn generate_binary_op<C: Capabilities>(
     Ok(Expr::binary_op(ctx, left, op, right))
 }
 
+#[derive(Clone, Copy)]
 enum OpType {
     Comparison,
     Logical,
@@ -230,7 +234,8 @@ fn generate_is_null<C: Capabilities>(
     table: &Table,
     depth: usize,
 ) -> Result<Expr, GenError> {
-    let negated = ctx.gen_bool();
+    let expr_config = &generator.policy().expr_config;
+    let negated = ctx.gen_bool_with_prob(expr_config.is_null_negation_probability);
     let expr = generate_expr(generator, ctx, table, depth + 1)?;
     Ok(Expr::is_null(ctx, expr, negated))
 }
@@ -242,7 +247,8 @@ fn generate_between<C: Capabilities>(
     table: &Table,
     depth: usize,
 ) -> Result<Expr, GenError> {
-    let negated = ctx.gen_bool();
+    let expr_config = &generator.policy().expr_config;
+    let negated = ctx.gen_bool_with_prob(expr_config.between_negation_probability);
     let expr = generate_expr(generator, ctx, table, depth + 1)?;
     let low = generate_expr(generator, ctx, table, depth + 1)?;
     let high = generate_expr(generator, ctx, table, depth + 1)?;
@@ -256,7 +262,8 @@ fn generate_in_list<C: Capabilities>(
     table: &Table,
     depth: usize,
 ) -> Result<Expr, GenError> {
-    let negated = ctx.gen_bool();
+    let expr_config = &generator.policy().expr_config;
+    let negated = ctx.gen_bool_with_prob(expr_config.in_list_negation_probability);
     let expr = generate_expr(generator, ctx, table, depth + 1)?;
 
     let list_size = ctx.gen_range_inclusive(1, generator.policy().max_in_list_size.min(5));
@@ -275,7 +282,11 @@ fn generate_case<C: Capabilities>(
     table: &Table,
     depth: usize,
 ) -> Result<Expr, GenError> {
-    let num_when = ctx.gen_range_inclusive(1, 3);
+    let expr_config = &generator.policy().expr_config;
+    let max_branches = generator.policy().max_case_branches;
+    let min_branches = expr_config.case_min_branches.min(max_branches);
+
+    let num_when = ctx.gen_range_inclusive(min_branches, max_branches);
     let mut when_clauses = Vec::with_capacity(num_when);
 
     for _ in 0..num_when {
@@ -290,7 +301,7 @@ fn generate_case<C: Capabilities>(
         when_clauses.push((when_expr, then_expr));
     }
 
-    let else_clause = if ctx.gen_bool() {
+    let else_clause = if ctx.gen_bool_with_prob(expr_config.case_else_probability) {
         ctx.enter_scope(Origin::CaseElse);
         let expr = generate_expr(generator, ctx, table, depth + 1)?;
         ctx.exit_scope();
@@ -429,11 +440,14 @@ fn generate_compound_condition<C: Capabilities>(
     ctx: &mut Context,
     table: &Table,
 ) -> Result<Expr, GenError> {
-    let op = if ctx.gen_bool() {
-        BinOp::And
-    } else {
-        BinOp::Or
-    };
+    let compound_weights = &generator.policy().expr_config.compound_op_weights;
+
+    let candidates = [
+        (BinOp::And, compound_weights.and),
+        (BinOp::Or, compound_weights.or),
+    ];
+
+    let op = generator.policy().select_weighted(ctx, &candidates)?;
 
     let left = generate_comparison(generator, ctx, table)?;
     let right = generate_comparison(generator, ctx, table)?;

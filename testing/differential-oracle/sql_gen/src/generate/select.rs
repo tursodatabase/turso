@@ -31,40 +31,49 @@ pub fn generate_select_for_table<C: Capabilities>(
 ) -> Result<SelectStmt, GenError> {
     ctx.enter_scope(Origin::Select);
 
+    let select_config = &generator.policy().select_config;
+    let ident_config = &generator.policy().identifier_config;
+
     // Generate columns
     let columns = generate_select_columns(generator, ctx, table)?;
 
     // Generate optional WHERE clause
-    let where_clause = if ctx.gen_bool_with_prob(0.7) {
+    let where_clause = if ctx.gen_bool_with_prob(select_config.where_probability) {
         Some(generate_condition(generator, ctx, table)?)
     } else {
         None
     };
 
     // Generate optional ORDER BY
-    let order_by = if ctx.gen_bool_with_prob(0.3) {
+    let order_by = if ctx.gen_bool_with_prob(select_config.order_by_probability) {
         generate_order_by(generator, ctx, table)?
     } else {
         vec![]
     };
 
     // Generate optional LIMIT
-    let limit = if ctx.gen_bool_with_prob(0.4) {
+    let limit = if ctx.gen_bool_with_prob(select_config.limit_probability) {
         Some(ctx.gen_range_inclusive(1, generator.policy().max_limit as usize) as u64)
     } else {
         None
     };
 
     // Generate optional OFFSET (only if LIMIT is present)
-    let offset = if limit.is_some() && ctx.gen_bool_with_prob(0.2) {
-        Some(ctx.gen_range_inclusive(0, 100) as u64)
+    let offset = if limit.is_some() && ctx.gen_bool_with_prob(select_config.offset_probability) {
+        Some(ctx.gen_range_inclusive(0, select_config.max_offset as usize) as u64)
     } else {
         None
     };
 
     // Generate alias if policy allows
-    let from_alias = if generator.policy().generate_aliases && ctx.gen_bool_with_prob(0.3) {
-        Some(format!("t{}", ctx.gen_range(1000)))
+    let from_alias = if ident_config.generate_table_aliases
+        && ctx.gen_bool_with_prob(select_config.table_alias_probability)
+    {
+        Some(format!(
+            "{}{}",
+            ident_config.table_alias_prefix,
+            ctx.gen_range(1000)
+        ))
     } else {
         None
     };
@@ -126,15 +135,23 @@ fn generate_select_columns<C: Capabilities>(
     ctx: &mut Context,
     table: &Table,
 ) -> Result<Vec<SelectColumn>, GenError> {
-    let policy = generator.policy();
+    let select_config = &generator.policy().select_config;
+    let ident_config = &generator.policy().identifier_config;
 
     // Decide: SELECT * or specific columns
-    if ctx.gen_bool_with_prob(0.2) {
+    if select_config.min_columns == 0
+        && ctx.gen_bool_with_prob(select_config.select_star_probability)
+    {
         // SELECT * - return empty vec which displays as *
         return Ok(vec![]);
     }
 
-    let num_cols = ctx.gen_range_inclusive(1, policy.max_select_columns.min(table.columns.len()));
+    let min_cols = select_config.min_columns.max(1);
+    let max_cols = select_config
+        .max_columns
+        .min(table.columns.len())
+        .max(min_cols);
+    let num_cols = ctx.gen_range_inclusive(min_cols, max_cols);
     let mut columns = Vec::with_capacity(num_cols);
 
     for i in 0..num_cols {
@@ -143,8 +160,10 @@ fn generate_select_columns<C: Capabilities>(
             let table_col = ctx.choose(&table.columns).unwrap();
             SelectColumn {
                 expr: Expr::column_ref(ctx, None, table_col.name.clone()),
-                alias: if policy.generate_aliases && ctx.gen_bool_with_prob(0.2) {
-                    Some(format!("col{i}"))
+                alias: if ident_config.generate_column_aliases
+                    && ctx.gen_bool_with_prob(select_config.column_alias_probability)
+                {
+                    Some(format!("{}{i}", ident_config.column_alias_prefix))
                 } else {
                     None
                 },
@@ -154,8 +173,8 @@ fn generate_select_columns<C: Capabilities>(
             let expr = generate_expr(generator, ctx, table, 0)?;
             SelectColumn {
                 expr,
-                alias: if policy.generate_aliases {
-                    Some(format!("expr{i}"))
+                alias: if ident_config.generate_column_aliases {
+                    Some(format!("{}{i}", ident_config.expr_alias_prefix))
                 } else {
                     None
                 },
@@ -170,23 +189,19 @@ fn generate_select_columns<C: Capabilities>(
 
 /// Generate ORDER BY clause.
 fn generate_order_by<C: Capabilities>(
-    _generator: &SqlGen<C>,
+    generator: &SqlGen<C>,
     ctx: &mut Context,
     table: &Table,
 ) -> Result<Vec<OrderByItem>, GenError> {
-    // Note: We don't use scope guard here to avoid borrow conflicts
-    // The origin tracking happens at higher levels
+    let select_config = &generator.policy().select_config;
+    let max_items = generator.policy().max_order_by_items;
 
-    let num_items = ctx.gen_range_inclusive(1, 3);
+    let num_items = ctx.gen_range_inclusive(1, max_items.min(table.columns.len()));
     let mut items = Vec::with_capacity(num_items);
 
     for _ in 0..num_items {
         let col = ctx.choose(&table.columns).unwrap();
-        let direction = if ctx.gen_bool() {
-            OrderDirection::Asc
-        } else {
-            OrderDirection::Desc
-        };
+        let direction = select_order_direction(ctx, &select_config.order_direction_weights);
 
         items.push(OrderByItem {
             expr: Expr::column_ref(ctx, None, col.name.clone()),
@@ -196,6 +211,22 @@ fn generate_order_by<C: Capabilities>(
     }
 
     Ok(items)
+}
+
+/// Select an order direction based on weights.
+fn select_order_direction(
+    ctx: &mut Context,
+    weights: &crate::policy::OrderDirectionWeights,
+) -> OrderDirection {
+    let candidates = [
+        (OrderDirection::Asc, weights.asc),
+        (OrderDirection::Desc, weights.desc),
+    ];
+
+    match ctx.weighted_index(&[weights.asc, weights.desc]) {
+        Some(idx) => candidates[idx].0,
+        None => OrderDirection::Asc, // Default if all weights are zero
+    }
 }
 
 #[cfg(test)]

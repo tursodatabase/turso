@@ -132,13 +132,16 @@ pub fn generate_insert<C: Capabilities>(
 ) -> Result<Stmt, GenError> {
     ctx.enter_scope(Origin::Insert);
 
+    let insert_config = &generator.policy().insert_config;
+
     let table = ctx
         .choose(&generator.schema().tables)
         .ok_or_else(|| GenError::schema_empty("tables"))?
         .clone();
 
     // Generate column list (all columns or subset)
-    let columns: Vec<String> = if ctx.gen_bool_with_prob(0.7) {
+    let columns: Vec<String> = if ctx.gen_bool_with_prob(insert_config.explicit_columns_probability)
+    {
         // All columns
         table.columns.iter().map(|c| c.name.clone()).collect()
     } else {
@@ -158,7 +161,7 @@ pub fn generate_insert<C: Capabilities>(
 
     // Generate values
     ctx.enter_scope(Origin::InsertValues);
-    let num_rows = ctx.gen_range_inclusive(1, generator.policy().max_insert_rows);
+    let num_rows = ctx.gen_range_inclusive(insert_config.min_rows, insert_config.max_rows);
     let mut values = Vec::with_capacity(num_rows);
 
     for _ in 0..num_rows {
@@ -187,6 +190,8 @@ pub fn generate_update<C: Capabilities>(
 ) -> Result<Stmt, GenError> {
     ctx.enter_scope(Origin::Update);
 
+    let update_config = &generator.policy().update_config;
+
     let table = ctx
         .choose(&generator.schema().tables)
         .ok_or_else(|| GenError::schema_empty("tables"))?
@@ -201,7 +206,9 @@ pub fn generate_update<C: Capabilities>(
 
     // Generate SET clause
     ctx.enter_scope(Origin::UpdateSet);
-    let num_sets = ctx.gen_range_inclusive(1, updatable.len().min(3));
+    let max_sets = update_config.max_set_clauses.min(updatable.len());
+    let min_sets = update_config.min_set_clauses.min(max_sets);
+    let num_sets = ctx.gen_range_inclusive(min_sets, max_sets);
     let mut sets = Vec::with_capacity(num_sets);
 
     for _ in 0..num_sets {
@@ -212,7 +219,7 @@ pub fn generate_update<C: Capabilities>(
     ctx.exit_scope();
 
     // Generate optional WHERE clause
-    let where_clause = if ctx.gen_bool_with_prob(0.8) {
+    let where_clause = if ctx.gen_bool_with_prob(update_config.where_probability) {
         Some(generate_condition(generator, ctx, &table)?)
     } else {
         None
@@ -233,13 +240,15 @@ pub fn generate_delete<C: Capabilities>(
 ) -> Result<Stmt, GenError> {
     ctx.enter_scope(Origin::Delete);
 
+    let delete_config = &generator.policy().delete_config;
+
     let table = ctx
         .choose(&generator.schema().tables)
         .ok_or_else(|| GenError::schema_empty("tables"))?
         .clone();
 
     // Generate optional WHERE clause (almost always have one to avoid deleting everything)
-    let where_clause = if ctx.gen_bool_with_prob(0.95) {
+    let where_clause = if ctx.gen_bool_with_prob(delete_config.where_probability) {
         Some(generate_condition(generator, ctx, &table)?)
     } else {
         None
