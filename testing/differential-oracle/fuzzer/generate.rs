@@ -47,13 +47,15 @@ pub struct SqlGenBackend {
 impl SqlGenBackend {
     pub fn new(seed: u64) -> Self {
         let ctx = sql_gen::Context::new_with_seed(seed);
-        let policy = Policy::default()
+        let mut policy = Policy::default()
             .with_stmt_weights(sql_gen::StmtWeights {
                 create_trigger: 0,
                 drop_trigger: 0,
                 ..sql_gen::StmtWeights::default()
             })
             .with_function_config(sql_gen::FunctionConfig::deterministic());
+        policy.select_config.nulls_order_weights.first = 0;
+        policy.select_config.nulls_order_weights.last = 0;
         Self { ctx, policy }
     }
 }

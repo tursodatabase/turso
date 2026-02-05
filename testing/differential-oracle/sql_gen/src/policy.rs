@@ -898,6 +898,21 @@ pub struct SelectConfig {
 
     /// Nulls ordering weights.
     pub nulls_order_weights: NullsOrderWeights,
+
+    /// Weight for ORDER BY using column references.
+    pub order_by_column_weight: u32,
+
+    /// Weight for ORDER BY using full expressions.
+    pub order_by_expr_weight: u32,
+
+    /// Probability of adding ORDER BY in scalar subqueries.
+    pub subquery_order_by_probability: f64,
+
+    /// Probability of adding GROUP BY in scalar subqueries.
+    pub subquery_group_by_probability: f64,
+
+    /// Probability of adding DISTINCT in scalar subqueries (non-grouped only).
+    pub subquery_distinct_probability: f64,
 }
 
 impl Default for SelectConfig {
@@ -922,6 +937,11 @@ impl Default for SelectConfig {
             subquery_where_probability: 0.5,
             order_direction_weights: OrderDirectionWeights::default(),
             nulls_order_weights: NullsOrderWeights::default(),
+            order_by_column_weight: 6,
+            order_by_expr_weight: 4,
+            subquery_order_by_probability: 0.3,
+            subquery_group_by_probability: 0.2,
+            subquery_distinct_probability: 0.15,
         }
     }
 }
@@ -937,6 +957,9 @@ impl SelectConfig {
             group_by_probability: 0.0,
             having_probability: 0.0,
             distinct_probability: 0.0,
+            subquery_order_by_probability: 0.0,
+            subquery_group_by_probability: 0.0,
+            subquery_distinct_probability: 0.0,
             ..Default::default()
         }
     }
@@ -951,6 +974,11 @@ impl SelectConfig {
             group_by_probability: 0.5,
             having_probability: 0.6,
             distinct_probability: 0.3,
+            order_by_column_weight: 5,
+            order_by_expr_weight: 5,
+            subquery_order_by_probability: 0.5,
+            subquery_group_by_probability: 0.4,
+            subquery_distinct_probability: 0.25,
             ..Default::default()
         }
     }

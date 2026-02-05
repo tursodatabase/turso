@@ -553,101 +553,7 @@ pub fn generate_condition<C: Capabilities>(
     ctx: &mut Context,
     table: &Table,
 ) -> Result<Expr, GenError> {
-    let candidates = build_condition_candidates(generator, ctx);
-    let cond_type = generator.policy().select_weighted(ctx, &candidates)?;
-    dispatch_condition_generation(generator, ctx, table, cond_type)
-}
-
-#[derive(Clone, Copy)]
-enum CondType {
-    Comparison,
-    IsNull,
-    Between,
-    InList,
-    Compound,
-}
-
-/// Build condition candidates with their weights.
-fn build_condition_candidates<C: Capabilities>(
-    generator: &SqlGen<C>,
-    ctx: &Context,
-) -> Vec<(CondType, u32)> {
-    let weights = &generator.policy().expr_weights;
-
-    let mut candidates = vec![
-        (CondType::Comparison, weights.column_ref + weights.literal),
-        (CondType::IsNull, weights.is_null),
-        (CondType::Between, weights.between),
-        (CondType::InList, weights.in_list),
-    ];
-
-    // Compound conditions with AND/OR (limited depth to avoid deep nesting)
-    if ctx.depth() < generator.policy().expr_config.max_compound_condition_depth {
-        candidates.push((CondType::Compound, weights.binary_op));
-    }
-
-    candidates
-}
-
-/// Dispatch to the appropriate condition generator.
-fn dispatch_condition_generation<C: Capabilities>(
-    generator: &SqlGen<C>,
-    ctx: &mut Context,
-    table: &Table,
-    cond_type: CondType,
-) -> Result<Expr, GenError> {
-    match cond_type {
-        CondType::Comparison => generate_comparison(generator, ctx, table),
-        CondType::IsNull => generate_is_null(generator, ctx, table, 0),
-        CondType::Between => generate_between(generator, ctx, table, 0),
-        CondType::InList => generate_in_list(generator, ctx, table, 0),
-        CondType::Compound => generate_compound_condition(generator, ctx, table),
-    }
-}
-
-/// Generate a simple comparison (column op value).
-fn generate_comparison<C: Capabilities>(
-    generator: &SqlGen<C>,
-    ctx: &mut Context,
-    table: &Table,
-) -> Result<Expr, GenError> {
-    let cols: Vec<_> = table.filterable_columns().collect();
-    if cols.is_empty() {
-        // Fall back to a tautology - create literals before binary_op to avoid borrow issues
-        let left = Expr::literal(ctx, Literal::Integer(1));
-        let right = Expr::literal(ctx, Literal::Integer(1));
-        return Ok(Expr::binary_op(ctx, left, BinOp::Eq, right));
-    }
-
-    let col = ctx.choose(&cols).unwrap();
-    let op = *ctx.choose(BinOp::comparison()).unwrap();
-
-    let left = Expr::column_ref(ctx, None, col.name.clone());
-    let lit = generate_literal(ctx, col.data_type, generator.policy());
-    let right = Expr::literal(ctx, lit);
-
-    Ok(Expr::binary_op(ctx, left, op, right))
-}
-
-/// Generate a compound condition (AND/OR).
-fn generate_compound_condition<C: Capabilities>(
-    generator: &SqlGen<C>,
-    ctx: &mut Context,
-    table: &Table,
-) -> Result<Expr, GenError> {
-    let compound_weights = &generator.policy().expr_config.compound_op_weights;
-
-    let candidates = [
-        (BinOp::And, compound_weights.and),
-        (BinOp::Or, compound_weights.or),
-    ];
-
-    let op = generator.policy().select_weighted(ctx, &candidates)?;
-
-    let left = generate_comparison(generator, ctx, table)?;
-    let right = generate_comparison(generator, ctx, table)?;
-
-    Ok(Expr::binary_op(ctx, left, op, right))
+    generate_expr(generator, ctx, table, 0)
 }
 
 #[cfg(test)]
@@ -852,6 +758,73 @@ mod tests {
         assert!(
             function_count > 0,
             "Should have generated some function calls"
+        );
+    }
+
+    #[test]
+    fn test_where_with_subqueries() {
+        use crate::policy::{ExprWeights, SelectConfig};
+
+        let schema = SchemaBuilder::new()
+            .table(Table::new(
+                "users",
+                vec![
+                    ColumnDef::new("id", DataType::Integer).primary_key(),
+                    ColumnDef::new("name", DataType::Text),
+                    ColumnDef::new("age", DataType::Integer),
+                ],
+            ))
+            .build();
+
+        // High weights for EXISTS and IN subquery so WHERE clauses contain them
+        let policy = Policy::default()
+            .with_expr_weights(ExprWeights {
+                column_ref: 5,
+                literal: 5,
+                binary_op: 5,
+                unary_op: 0,
+                function_call: 0,
+                subquery: 10,
+                case_expr: 0,
+                cast: 0,
+                between: 0,
+                in_list: 0,
+                in_subquery: 30,
+                is_null: 0,
+                exists: 30,
+            })
+            .with_select_config(SelectConfig {
+                where_probability: 1.0,
+                ..Default::default()
+            });
+
+        let generator: SqlGen<Full> = SqlGen::new(schema, policy);
+        let mut ctx = Context::new_with_seed(42);
+
+        let mut found_exists_in_where = false;
+        let mut found_in_select_in_where = false;
+
+        for _ in 0..100 {
+            if let Ok(stmt) = generator.statement(&mut ctx) {
+                let sql = stmt.to_string();
+                if let Some(where_part) = sql.split("WHERE").nth(1) {
+                    if where_part.contains("EXISTS") {
+                        found_exists_in_where = true;
+                    }
+                    if where_part.contains("IN (SELECT") || where_part.contains("NOT IN (SELECT")
+                    {
+                        found_in_select_in_where = true;
+                    }
+                }
+                if found_exists_in_where && found_in_select_in_where {
+                    break;
+                }
+            }
+        }
+
+        assert!(
+            found_exists_in_where || found_in_select_in_where,
+            "WHERE clauses should contain EXISTS or IN (SELECT ...) expressions"
         );
     }
 
