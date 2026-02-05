@@ -83,7 +83,8 @@ impl StmtKind {
 #[derive(Debug, Clone)]
 pub struct SelectStmt {
     pub columns: Vec<SelectColumn>,
-    pub from: String,
+    /// The FROM table. None for table-less SELECTs (e.g. `SELECT 1+2`).
+    pub from: Option<String>,
     pub from_alias: Option<String>,
     pub where_clause: Option<Expr>,
     pub group_by: Vec<Expr>,
@@ -108,9 +109,11 @@ impl fmt::Display for SelectStmt {
             }
         }
 
-        write!(f, " FROM {}", self.from)?;
-        if let Some(alias) = &self.from_alias {
-            write!(f, " AS {alias}")?;
+        if let Some(from) = &self.from {
+            write!(f, " FROM {from}")?;
+            if let Some(alias) = &self.from_alias {
+                write!(f, " AS {alias}")?;
+            }
         }
 
         if let Some(where_clause) = &self.where_clause {
@@ -1120,7 +1123,7 @@ mod tests {
                 }),
                 alias: None,
             }],
-            from: "users".to_string(),
+            from: Some("users".to_string()),
             from_alias: None,
             where_clause: None,
             group_by: vec![],

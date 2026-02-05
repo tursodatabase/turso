@@ -1,14 +1,15 @@
 //! Expression generation.
 
-use crate::SqlGen;
 use crate::ast::{BinOp, Expr, Literal, UnaryOp};
 use crate::capabilities::Capabilities;
 use crate::context::Context;
 use crate::error::GenError;
 use crate::functions::FunctionDef;
 use crate::generate::literal::generate_literal;
+use crate::generate::select::generate_select;
 use crate::schema::{DataType, Table};
 use crate::trace::{ExprKind, Origin};
+use crate::{SqlGen, Stmt};
 use sql_gen_macros::trace_gen;
 
 /// Generate an expression.
@@ -502,13 +503,12 @@ fn generate_subquery_select<C: Capabilities>(
     generator: &SqlGen<C>,
     ctx: &mut Context,
 ) -> Result<crate::ast::SelectStmt, GenError> {
-    // Pick a random table
-    let table = ctx
-        .choose(&generator.schema().tables)
-        .ok_or_else(|| GenError::schema_empty("tables"))?;
-
-    // Generate a simple single-column SELECT
-    crate::generate::select::generate_select_for_table(generator, ctx, table)
+    generate_select(generator, ctx).map(|stmt| {
+        let Stmt::Select(select) = stmt else {
+            unreachable!()
+        };
+        select
+    })
 }
 
 /// Generate an IN subquery expression (expr IN (SELECT ...) or expr NOT IN (SELECT ...)).
