@@ -6,8 +6,8 @@ github.com/pmezard/go-difflib v1.0.0 h1:4DBwDE0NGyQoBHbLQYPwSUPoCMWR5BEzIk/f1lZb
 github.com/pmezard/go-difflib v1.0.0/go.mod h1:iKH77koFhYxTK1pcRnkKkqfTogsbg7gZNVY4sRDYZ/4=
 github.com/stretchr/testify v1.11.1 h1:7s2iGBzp5EwR7/aIZr8ao5+dra3wiQyKjjFuvgVKu7U=
 github.com/stretchr/testify v1.11.1/go.mod h1:wZwfW3scLgRK+23gO65QZefKpKQRnfz6sD981Nm4B6U=
-github.com/tursodatabase/turso-go-platform-libs v0.0.0-20260203001331-862d7406cbf7 h1:K7Te8PXYHFZ7yDCXpGlWDWe8bxBQT6YVH1laolNC2V4=
-github.com/tursodatabase/turso-go-platform-libs v0.0.0-20260203001331-862d7406cbf7/go.mod h1:bo+Lpv5OYOX1gRV9L5DLKMsYxmDs56SkZwnCOLEFcxU=
+github.com/tursodatabase/turso-go-platform-libs v0.0.0-20260205000213-45970e22195f h1:Wqrdq6ON5PGMHcAWIPtoTcBpRYaTz84VB86GAU4gEiE=
+github.com/tursodatabase/turso-go-platform-libs v0.0.0-20260205000213-45970e22195f/go.mod h1:bo+Lpv5OYOX1gRV9L5DLKMsYxmDs56SkZwnCOLEFcxU=
 golang.org/x/sys v0.38.0 h1:3yZWxaJjBmCWXqhN1qh02AkOnCQ1poK6oF+a7xWL6Gc=
 golang.org/x/sys v0.38.0/go.mod h1:OgkHotnGiDImocRcuBABYBEXf8A9a87e/uXjp9XT3ks=
 gopkg.in/check.v1 v0.0.0-20161208181325-20d25e280405 h1:yhCVgyC4o1eVCa2tZl7eS0r+SDo693bJlVdllGtEeKM=
