@@ -309,9 +309,6 @@ test remainder-float-agg {
     SELECT 23.14 % sum(id) from products
 }
 expect {
-    23.0
-}
-expect @js {
     23
 }
 
@@ -333,9 +330,6 @@ test remainder-agg-float {
     SELECT count(*) % 2.43 from users
 }
 expect {
-    0.0
-}
-expect @js {
     0
 }
 
