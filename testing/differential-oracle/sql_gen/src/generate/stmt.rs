@@ -370,10 +370,13 @@ pub fn generate_create_table<C: Capabilities>(
         create_table_config.max_columns,
     );
     let mut columns = Vec::with_capacity(num_cols);
+    let mut col_names: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     // First column is usually the primary key
+    let pk_name = ctx.gen_unique_name("col", &col_names);
+    col_names.insert(pk_name.clone());
     columns.push(ColumnDefStmt {
-        name: "id".to_string(),
+        name: pk_name,
         data_type: DataType::Integer,
         primary_key: true,
         not_null: true,
@@ -388,13 +391,15 @@ pub fn generate_create_table<C: Capabilities>(
         DataType::Text,
         DataType::Blob,
     ];
-    for i in 1..num_cols {
+    for _ in 1..num_cols {
         let data_type = *ctx.choose(&types).unwrap();
         let not_null = ctx.gen_bool_with_prob(create_table_config.not_null_probability);
         let unique = !not_null && ctx.gen_bool_with_prob(create_table_config.unique_probability);
+        let name = ctx.gen_unique_name("col", &col_names);
+        col_names.insert(name.clone());
 
         columns.push(ColumnDefStmt {
-            name: format!("col{i}"),
+            name,
             data_type,
             primary_key: false,
             not_null,
