@@ -252,8 +252,12 @@ export class Statement {
               // In raw mode, yield arrays of values
               yield decodedRow;
             } else {
-              const rowObject = this.session.createRowObject(decodedRow, columns);
-              yield rowObject;
+              // In expanded mode, yield plain objects with named properties (consistent with all())
+              const obj: any = {};
+              columns.forEach((col: string, i: number) => {
+                obj[col] = decodedRow[i];
+              });
+              yield obj;
             }
           }
           break;

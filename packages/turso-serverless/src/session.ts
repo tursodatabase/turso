@@ -22,8 +22,8 @@ import { DatabaseError } from './error.js';
 export interface SessionConfig {
   /** Database URL */
   url: string;
-  /** Authentication token */
-  authToken: string;
+  /** Authentication token (optional for local development with turso dev) */
+  authToken?: string;
   /**
    * Encryption key for the remote database (base64 encoded)
    * to enable access to encrypted Turso Cloud databases.

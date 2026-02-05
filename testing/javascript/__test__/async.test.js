@@ -333,6 +333,34 @@ test.serial("Statement.iterate()", async (t) => {
   }
 });
 
+test.serial("Statement.iterate() [expanded mode returns objects]", async (t) => {
+  const db = t.context.db;
+
+  const stmt = await db.prepare("SELECT * FROM users");
+  const expected = [
+    { id: 1, name: "Alice", email: "alice@example.org" },
+    { id: 2, name: "Bob", email: "bob@example.com" },
+  ];
+  var idx = 0;
+  for await (const row of await stmt.iterate()) {
+    t.deepEqual(row, expected[idx++]);
+  }
+});
+
+test.serial("Statement.iterate() [raw]", async (t) => {
+  const db = t.context.db;
+
+  const stmt = await db.prepare("SELECT * FROM users");
+  const expected = [
+    [1, "Alice", "alice@example.org"],
+    [2, "Bob", "bob@example.com"],
+  ];
+  var idx = 0;
+  for await (const row of await stmt.raw().iterate()) {
+    t.deepEqual(row, expected[idx++]);
+  }
+});
+
 // ==========================================================================
 // Statement.all()
 // ==========================================================================
