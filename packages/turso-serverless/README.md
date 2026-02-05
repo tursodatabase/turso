@@ -16,7 +16,7 @@
 
 A serverless database driver for Turso Cloud, using only `fetch()`. Connect to your database from serverless and edge functions, such as Cloudflare Workers and Vercel.
 
-> **📝 Note:** This driver is experimental and, therefore, subject to change at any time.
+> **⚠️ Warning:** This software is in BETA. It may still contain bugs and unexpected behavior. Use caution with production data and ensure you have backups.
 
 ## Installation
 
