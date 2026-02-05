@@ -185,14 +185,16 @@ export const ENCRYPTION_KEY_HEADER = 'x-turso-encryption-key';
 
 export async function executeCursor(
   url: string,
-  authToken: string,
+  authToken: string | undefined,
   request: CursorRequest,
   remoteEncryptionKey?: string
 ): Promise<{ response: CursorResponse; entries: AsyncGenerator<CursorEntry> }> {
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
-    'Authorization': `Bearer ${authToken}`,
   };
+  if (authToken) {
+    headers['Authorization'] = `Bearer ${authToken}`;
+  }
   if (remoteEncryptionKey) {
     headers[ENCRYPTION_KEY_HEADER] = remoteEncryptionKey;
   }
@@ -293,14 +295,16 @@ export async function executeCursor(
 
 export async function executePipeline(
   url: string,
-  authToken: string,
+  authToken: string | undefined,
   request: PipelineRequest,
   remoteEncryptionKey?: string
 ): Promise<PipelineResponse> {
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
-    'Authorization': `Bearer ${authToken}`,
   };
+  if (authToken) {
+    headers['Authorization'] = `Bearer ${authToken}`;
+  }
   if (remoteEncryptionKey) {
     headers[ENCRYPTION_KEY_HEADER] = remoteEncryptionKey;
   }
