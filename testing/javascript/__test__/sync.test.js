@@ -493,6 +493,59 @@ test.serial("Statement.columns()", async (t) => {
   t.is(columns2[2].type, "TEXT");
 });
 
+// ==========================================================================
+// Statement.reader
+// ==========================================================================
+
+test.serial("Statement.reader [SELECT is true]", (t) => {
+  const db = t.context.db;
+
+  const stmt = db.prepare("SELECT * FROM users WHERE id = ?");
+  t.is(stmt.reader, true);
+});
+
+test.serial("Statement.reader [INSERT is false]", (t) => {
+  const db = t.context.db;
+
+  const stmt = db.prepare("INSERT INTO users (name, email) VALUES (?, ?)");
+  t.is(stmt.reader, false);
+});
+
+test.serial("Statement.reader [UPDATE is false]", (t) => {
+  const db = t.context.db;
+
+  const stmt = db.prepare("UPDATE users SET name = ? WHERE id = ?");
+  t.is(stmt.reader, false);
+});
+
+test.serial("Statement.reader [DELETE is false]", (t) => {
+  const db = t.context.db;
+
+  const stmt = db.prepare("DELETE FROM users WHERE id = ?");
+  t.is(stmt.reader, false);
+});
+
+test.serial("Statement.reader [INSERT RETURNING is true]", (t) => {
+  const db = t.context.db;
+
+  const stmt = db.prepare("INSERT INTO users (name, email) VALUES (?, ?) RETURNING *");
+  t.is(stmt.reader, true);
+});
+
+test.serial("Statement.reader [UPDATE RETURNING is true]", (t) => {
+  const db = t.context.db;
+
+  const stmt = db.prepare("UPDATE users SET name = ? WHERE id = ? RETURNING *");
+  t.is(stmt.reader, true);
+});
+
+test.serial("Statement.reader [DELETE RETURNING is true]", (t) => {
+  const db = t.context.db;
+
+  const stmt = db.prepare("DELETE FROM users WHERE id = ? RETURNING *");
+  t.is(stmt.reader, true);
+});
+
 test.skip("Timeout option", async (t) => {
   const timeout = 1000;
   const path = genDatabaseFilename();
