@@ -900,8 +900,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                                     // Duplicate! A version was committed after we started
                                     return Err(LimboError::WriteWriteConflict);
                                 }
-                                // Commited before we started, any other previous versions are also committed before us so irrelevant.
-                                break;
+                                turso_assert!(false, "there is another row insterted and not updated/deleted from before");
                             }
                             None => {
                                 // Invalid version
