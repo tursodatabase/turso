@@ -1492,12 +1492,17 @@ impl ToTokens for CreateTableBody {
                     comma(constraints, s, context)?;
                 }
                 s.append(TK_RP, None)?;
-                if options.contains(TableOptions::WITHOUT_ROWID) {
-                    s.append(TK_WITHOUT, None)?;
-                    s.append(TK_ID, Some("ROWID"))?;
+                // Use the original text if available
+                if let Some(ref without_rowid) = options.without_rowid_text {
+                    // Split "WITHOUT ROWID" back into tokens
+                    let parts: Vec<&str> = without_rowid.split_whitespace().collect();
+                    if parts.len() == 2 {
+                        s.append(TK_WITHOUT, None)?;
+                        s.append(TK_ID, Some(parts[1]))?;
+                    }
                 }
-                if options.contains(TableOptions::STRICT) {
-                    s.append(TK_ID, Some("STRICT"))?;
+                if let Some(ref strict) = options.strict_text {
+                    s.append(TK_ID, Some(strict))?;
                 }
                 Ok(())
             }
