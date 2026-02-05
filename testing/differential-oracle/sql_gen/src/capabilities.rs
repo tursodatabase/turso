@@ -35,6 +35,8 @@ pub trait Capabilities: 'static + Clone {
     const DROP_TABLE: bool;
     const CREATE_INDEX: bool;
     const DROP_INDEX: bool;
+    const CREATE_TRIGGER: bool;
+    const DROP_TRIGGER: bool;
 
     // Transactions
     const BEGIN: bool;
@@ -93,6 +95,8 @@ impl Capabilities for Full {
     const DROP_TABLE: bool = true;
     const CREATE_INDEX: bool = true;
     const DROP_INDEX: bool = true;
+    const CREATE_TRIGGER: bool = true;
+    const DROP_TRIGGER: bool = true;
     const BEGIN: bool = true;
     const COMMIT: bool = true;
     const ROLLBACK: bool = true;
@@ -124,6 +128,8 @@ impl Capabilities for DmlOnly {
     const DROP_TABLE: bool = false;
     const CREATE_INDEX: bool = false;
     const DROP_INDEX: bool = false;
+    const CREATE_TRIGGER: bool = false;
+    const DROP_TRIGGER: bool = false;
     const BEGIN: bool = false;
     const COMMIT: bool = false;
     const ROLLBACK: bool = false;
@@ -155,6 +161,8 @@ impl Capabilities for SelectOnly {
     const DROP_TABLE: bool = false;
     const CREATE_INDEX: bool = false;
     const DROP_INDEX: bool = false;
+    const CREATE_TRIGGER: bool = false;
+    const DROP_TRIGGER: bool = false;
     const BEGIN: bool = false;
     const COMMIT: bool = false;
     const ROLLBACK: bool = false;
@@ -183,6 +191,8 @@ impl Capabilities for NoSubquery {
     const DROP_TABLE: bool = true;
     const CREATE_INDEX: bool = true;
     const DROP_INDEX: bool = true;
+    const CREATE_TRIGGER: bool = true;
+    const DROP_TRIGGER: bool = true;
     const BEGIN: bool = true;
     const COMMIT: bool = true;
     const ROLLBACK: bool = true;

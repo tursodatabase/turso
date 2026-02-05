@@ -5191,6 +5191,7 @@ dependencies = [
  "proptest",
  "rand 0.9.2",
  "sql_gen_macros",
+ "strum",
 ]
 
 [[package]]

@@ -14,6 +14,7 @@ path = "src/lib.rs"
 proptest = "1.9"
 rand = { workspace = true }
 sql_gen_macros = { path = "../sql_gen_macros" }
+strum = { workspace = true }
 
 [dev-dependencies]
 proptest = "1.9"

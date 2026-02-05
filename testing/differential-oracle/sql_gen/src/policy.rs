@@ -44,6 +44,9 @@ pub struct Policy {
     /// Configuration for expression generation.
     pub expr_config: ExprConfig,
 
+    /// Configuration for trigger generation.
+    pub trigger_config: TriggerConfig,
+
     /// Maximum recursion depth for expressions.
     pub max_expr_depth: usize,
 
@@ -83,6 +86,7 @@ impl Default for Policy {
             delete_config: DeleteConfig::default(),
             identifier_config: IdentifierConfig::default(),
             expr_config: ExprConfig::default(),
+            trigger_config: TriggerConfig::default(),
             max_expr_depth: 4,
             max_subquery_depth: 2,
             max_tables: 3,
@@ -168,6 +172,12 @@ impl Policy {
     /// Builder method to set expression configuration.
     pub fn with_expr_config(mut self, config: ExprConfig) -> Self {
         self.expr_config = config;
+        self
+    }
+
+    /// Builder method to set trigger configuration.
+    pub fn with_trigger_config(mut self, config: TriggerConfig) -> Self {
+        self.trigger_config = config;
         self
     }
 
@@ -275,6 +285,8 @@ pub struct StmtWeights {
     pub drop_table: u32,
     pub create_index: u32,
     pub drop_index: u32,
+    pub create_trigger: u32,
+    pub drop_trigger: u32,
 
     // Transactions
     pub begin: u32,
@@ -295,6 +307,8 @@ impl Default for StmtWeights {
             drop_table: 1,
             create_index: 2,
             drop_index: 1,
+            create_trigger: 1,
+            drop_trigger: 1,
             // Transactions (disabled by default)
             begin: 0,
             commit: 0,
@@ -315,6 +329,8 @@ impl StmtWeights {
             drop_table: 0,
             create_index: 0,
             drop_index: 0,
+            create_trigger: 0,
+            drop_trigger: 0,
             begin: 0,
             commit: 0,
             rollback: 0,
@@ -332,6 +348,8 @@ impl StmtWeights {
             drop_table: 0,
             create_index: 0,
             drop_index: 0,
+            create_trigger: 0,
+            drop_trigger: 0,
             begin: 0,
             commit: 0,
             rollback: 0,
@@ -349,6 +367,8 @@ impl StmtWeights {
             StmtKind::DropTable => self.drop_table,
             StmtKind::CreateIndex => self.create_index,
             StmtKind::DropIndex => self.drop_index,
+            StmtKind::CreateTrigger => self.create_trigger,
+            StmtKind::DropTrigger => self.drop_trigger,
             StmtKind::Begin => self.begin,
             StmtKind::Commit => self.commit,
             StmtKind::Rollback => self.rollback,
@@ -366,6 +386,8 @@ impl StmtWeights {
             (StmtKind::DropTable, self.drop_table),
             (StmtKind::CreateIndex, self.create_index),
             (StmtKind::DropIndex, self.drop_index),
+            (StmtKind::CreateTrigger, self.create_trigger),
+            (StmtKind::DropTrigger, self.drop_trigger),
             (StmtKind::Begin, self.begin),
             (StmtKind::Commit, self.commit),
             (StmtKind::Rollback, self.rollback),
@@ -978,6 +1000,121 @@ impl DeleteConfig {
         Self {
             where_probability: 1.0,
             ..Default::default()
+        }
+    }
+}
+
+// =============================================================================
+// Trigger Configuration
+// =============================================================================
+
+/// Configuration for trigger generation.
+#[derive(Debug, Clone)]
+pub struct TriggerConfig {
+    /// Minimum number of statements in trigger body.
+    pub min_body_statements: usize,
+
+    /// Maximum number of statements in trigger body.
+    pub max_body_statements: usize,
+
+    /// Probability of generating WHEN clause.
+    pub when_probability: f64,
+
+    /// Probability of using FOR EACH ROW.
+    pub for_each_row_probability: f64,
+
+    /// Probability of using IF NOT EXISTS.
+    pub if_not_exists_probability: f64,
+
+    /// Probability of using IF EXISTS in DROP TRIGGER.
+    pub if_exists_probability: f64,
+
+    /// Weights for trigger timing (BEFORE, AFTER, INSTEAD OF).
+    pub timing_weights: TriggerTimingWeights,
+
+    /// Weights for trigger events (INSERT, UPDATE, DELETE).
+    pub event_weights: TriggerEventWeights,
+
+    /// Weights for statement types in trigger body.
+    pub body_stmt_weights: TriggerBodyStmtWeights,
+
+    /// Probability of UPDATE OF specifying columns.
+    pub update_of_columns_probability: f64,
+
+    /// Maximum number of columns in UPDATE OF clause.
+    pub max_update_of_columns: usize,
+}
+
+impl Default for TriggerConfig {
+    fn default() -> Self {
+        Self {
+            min_body_statements: 1,
+            max_body_statements: 3,
+            when_probability: 0.3,
+            for_each_row_probability: 0.8,
+            if_not_exists_probability: 0.5,
+            if_exists_probability: 0.7,
+            timing_weights: TriggerTimingWeights::default(),
+            event_weights: TriggerEventWeights::default(),
+            body_stmt_weights: TriggerBodyStmtWeights::default(),
+            update_of_columns_probability: 0.3,
+            max_update_of_columns: 3,
+        }
+    }
+}
+
+/// Weights for trigger timing.
+#[derive(Debug, Clone)]
+pub struct TriggerTimingWeights {
+    pub before: u32,
+    pub after: u32,
+    pub instead_of: u32,
+}
+
+impl Default for TriggerTimingWeights {
+    fn default() -> Self {
+        Self {
+            before: 40,
+            after: 50,
+            instead_of: 10,
+        }
+    }
+}
+
+/// Weights for trigger events.
+#[derive(Debug, Clone)]
+pub struct TriggerEventWeights {
+    pub insert: u32,
+    pub update: u32,
+    pub delete: u32,
+}
+
+impl Default for TriggerEventWeights {
+    fn default() -> Self {
+        Self {
+            insert: 35,
+            update: 35,
+            delete: 30,
+        }
+    }
+}
+
+/// Weights for statement types in trigger body.
+#[derive(Debug, Clone)]
+pub struct TriggerBodyStmtWeights {
+    pub insert: u32,
+    pub update: u32,
+    pub delete: u32,
+    pub select: u32,
+}
+
+impl Default for TriggerBodyStmtWeights {
+    fn default() -> Self {
+        Self {
+            insert: 30,
+            update: 25,
+            delete: 20,
+            select: 25,
         }
     }
 }
