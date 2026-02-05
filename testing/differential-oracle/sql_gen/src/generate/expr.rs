@@ -18,12 +18,7 @@ pub fn generate_expr<C: Capabilities>(
     table: &Table,
     depth: usize,
 ) -> Result<Expr, GenError> {
-    // At max depth, only generate simple expressions
-    if depth >= generator.policy().max_expr_depth {
-        return generate_simple_expr(generator, ctx, table);
-    }
-
-    let candidates = build_expr_candidates::<C>(generator, ctx, depth);
+    let candidates = build_expr_candidates::<C>(generator, ctx, depth)?;
 
     let expr_type = generator
         .policy()
@@ -33,69 +28,133 @@ pub fn generate_expr<C: Capabilities>(
     dispatch_expr_generation(generator, ctx, table, depth, expr_type)
 }
 
-/// Build expression candidates with their weights.
+/// Build list of allowed expression kinds based on capabilities, policy weights, and depth validity.
 fn build_expr_candidates<C: Capabilities>(
     generator: &SqlGen<C>,
     ctx: &Context,
     depth: usize,
-) -> Vec<(ExprKind, u32)> {
-    let mut candidates = build_simple_expr_candidates(generator);
+) -> Result<Vec<(ExprKind, u32)>, GenError> {
+    let capability_candidates = collect_capability_allowed_exprs::<C>();
 
-    if depth < generator.policy().max_expr_depth {
-        add_complex_expr_candidates::<C>(generator, ctx, &mut candidates);
+    if capability_candidates.is_empty() {
+        return Err(GenError::exhausted(
+            "expression",
+            "no expression types allowed by capabilities",
+        ));
+    }
+
+    let weighted_candidates = filter_by_expr_weight(generator, capability_candidates);
+
+    let valid_candidates: Vec<(ExprKind, u32)> =
+        filter_by_depth_validity(generator, ctx, depth, weighted_candidates).collect();
+
+    if valid_candidates.is_empty() {
+        return Err(GenError::exhausted(
+            "expression",
+            "no expression types valid for current depth",
+        ));
+    }
+
+    Ok(valid_candidates)
+}
+
+/// Collect expression kinds allowed by the capability type parameter.
+fn collect_capability_allowed_exprs<C: Capabilities>() -> Vec<ExprKind> {
+    let mut candidates = vec![
+        // Simple expressions (always available)
+        ExprKind::ColumnRef,
+        ExprKind::Literal,
+        // Complex expressions
+        ExprKind::BinaryOp,
+        ExprKind::UnaryOp,
+        ExprKind::IsNull,
+        ExprKind::Between,
+        ExprKind::InList,
+        ExprKind::FunctionCall,
+        ExprKind::Case,
+        ExprKind::Cast,
+    ];
+
+    // Subquery expressions require capability
+    if C::SUBQUERY {
+        candidates.push(ExprKind::Subquery);
+        candidates.push(ExprKind::InSubquery);
+        candidates.push(ExprKind::Exists);
     }
 
     candidates
 }
 
-/// Build candidates for simple expressions (always available).
-fn build_simple_expr_candidates<C: Capabilities>(generator: &SqlGen<C>) -> Vec<(ExprKind, u32)> {
-    let weights = &generator.policy().expr_weights;
-    vec![
-        (ExprKind::ColumnRef, weights.column_ref),
-        (ExprKind::Literal, weights.literal),
-    ]
+/// Filter candidates to only those with positive policy weight.
+fn filter_by_expr_weight<C: Capabilities>(
+    generator: &SqlGen<C>,
+    candidates: impl IntoIterator<Item = ExprKind>,
+) -> impl Iterator<Item = ExprKind> {
+    candidates
+        .into_iter()
+        .filter(|k| generator.policy().expr_weights.weight_for(*k) > 0)
 }
 
-/// Add complex expression candidates when depth budget allows.
-fn add_complex_expr_candidates<C: Capabilities>(
+/// Filter candidates to only those valid for the current expression depth.
+///
+/// This prevents attempting to generate complex expressions when at max depth,
+/// and filters out subqueries when at max subquery depth.
+fn filter_by_depth_validity<C: Capabilities>(
     generator: &SqlGen<C>,
     ctx: &Context,
-    candidates: &mut Vec<(ExprKind, u32)>,
-) {
-    let weights = &generator.policy().expr_weights;
+    depth: usize,
+    candidates: impl Iterator<Item = ExprKind>,
+) -> impl Iterator<Item = (ExprKind, u32)> {
+    let max_expr_depth = generator.policy().max_expr_depth;
+    let max_subquery_depth = generator.policy().max_subquery_depth;
+    let subquery_depth = ctx.subquery_depth();
+    let weights = generator.policy().expr_weights.clone();
 
-    // Core complex expressions
-    candidates.push((ExprKind::BinaryOp, weights.binary_op));
-    candidates.push((ExprKind::UnaryOp, weights.unary_op));
-    candidates.push((ExprKind::IsNull, weights.is_null));
-    candidates.push((ExprKind::Between, weights.between));
-    candidates.push((ExprKind::InList, weights.in_list));
-
-    // Optional expressions (only if weight > 0)
-    if weights.function_call > 0 {
-        candidates.push((ExprKind::FunctionCall, weights.function_call));
-    }
-
-    if weights.case_expr > 0 {
-        candidates.push((ExprKind::Case, weights.case_expr));
-    }
-
-    if weights.cast > 0 {
-        candidates.push((ExprKind::Cast, weights.cast));
-    }
-
-    // Subqueries require capability and depth budget
-    if C::SUBQUERY && ctx.subquery_depth() < generator.policy().max_subquery_depth {
-        if weights.subquery > 0 {
-            candidates.push((ExprKind::Subquery, weights.subquery));
+    candidates.filter_map(move |kind| {
+        let valid = is_expr_valid_for_depth(
+            kind,
+            depth,
+            max_expr_depth,
+            subquery_depth,
+            max_subquery_depth,
+        );
+        if valid {
+            Some((kind, weights.weight_for(kind)))
+        } else {
+            None
         }
-        if weights.in_subquery > 0 {
-            candidates.push((ExprKind::InSubquery, weights.in_subquery));
+    })
+}
+
+/// Check if an expression kind is valid given the current depth state.
+fn is_expr_valid_for_depth(
+    kind: ExprKind,
+    depth: usize,
+    max_expr_depth: usize,
+    subquery_depth: usize,
+    max_subquery_depth: usize,
+) -> bool {
+    match kind {
+        // Simple expressions are always valid
+        ExprKind::ColumnRef | ExprKind::Literal => true,
+
+        // Complex expressions require depth budget
+        ExprKind::BinaryOp
+        | ExprKind::UnaryOp
+        | ExprKind::IsNull
+        | ExprKind::Between
+        | ExprKind::InList
+        | ExprKind::FunctionCall
+        | ExprKind::Case
+        | ExprKind::Cast => depth < max_expr_depth,
+
+        // Subquery expressions require both depth budgets
+        ExprKind::Subquery | ExprKind::InSubquery | ExprKind::Exists => {
+            depth < max_expr_depth && subquery_depth < max_subquery_depth
         }
-        if weights.exists > 0 {
-            candidates.push((ExprKind::Exists, weights.exists));
-        }
+
+        // Parenthesized is not generated directly
+        ExprKind::Parenthesized => false,
     }
 }
 
@@ -122,20 +181,7 @@ fn dispatch_expr_generation<C: Capabilities>(
         ExprKind::Subquery => generate_subquery_expr(generator, ctx),
         ExprKind::Exists => generate_exists(generator, ctx),
         // Parenthesized is not generated directly - it's just for grouping
-        ExprKind::Parenthesized => unreachable!("parenthesized is not generated directly")
-    }
-}
-
-/// Generate a simple expression (column ref or literal).
-fn generate_simple_expr<C: Capabilities>(
-    generator: &SqlGen<C>,
-    ctx: &mut Context,
-    table: &Table,
-) -> Result<Expr, GenError> {
-    if ctx.gen_bool() && !table.columns.is_empty() {
-        generate_column_ref(ctx, table)
-    } else {
-        generate_literal_expr(generator, ctx, table)
+        ExprKind::Parenthesized => unreachable!("parenthesized is not generated directly"),
     }
 }
 
@@ -359,7 +405,7 @@ fn generate_in_list<C: Capabilities>(
     let list_size = ctx.gen_range_inclusive(1, generator.policy().max_in_list_size.min(5));
     let mut list = Vec::with_capacity(list_size);
     for _ in 0..list_size {
-        list.push(generate_simple_expr(generator, ctx, table)?);
+        list.push(generate_expr(generator, ctx, table, depth)?);
     }
 
     Ok(Expr::in_list(ctx, expr, list, negated))

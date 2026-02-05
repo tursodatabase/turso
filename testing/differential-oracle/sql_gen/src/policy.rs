@@ -510,6 +510,27 @@ impl Default for ExprWeights {
 }
 
 impl ExprWeights {
+    /// Get the weight for an expression kind.
+    pub fn weight_for(&self, kind: crate::trace::ExprKind) -> u32 {
+        use crate::trace::ExprKind;
+        match kind {
+            ExprKind::ColumnRef => self.column_ref,
+            ExprKind::Literal => self.literal,
+            ExprKind::BinaryOp => self.binary_op,
+            ExprKind::UnaryOp => self.unary_op,
+            ExprKind::FunctionCall => self.function_call,
+            ExprKind::Subquery => self.subquery,
+            ExprKind::Case => self.case_expr,
+            ExprKind::Cast => self.cast,
+            ExprKind::Between => self.between,
+            ExprKind::InList => self.in_list,
+            ExprKind::InSubquery => self.in_subquery,
+            ExprKind::IsNull => self.is_null,
+            ExprKind::Exists => self.exists,
+            ExprKind::Parenthesized => 0, // Never generated directly
+        }
+    }
+
     /// Create simple expression weights (only column refs and literals).
     pub fn simple() -> Self {
         Self {
