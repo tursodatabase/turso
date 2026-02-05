@@ -279,8 +279,8 @@ class Statement {
     throw new Error("not implemented");
   }
 
-  get reader() {
-    throw new Error("not implemented");
+  get reader(): boolean {
+    return this.stmt.columns().length > 0;
   }
 
   get database() {
