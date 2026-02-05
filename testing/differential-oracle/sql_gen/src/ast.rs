@@ -53,6 +53,32 @@ impl fmt::Display for Stmt {
     }
 }
 
+impl Stmt {
+    /// Returns true if this is a SELECT with LIMIT but no ORDER BY.
+    pub fn has_unordered_limit(&self) -> bool {
+        match self {
+            Stmt::Select(s) => s.limit.is_some() && s.order_by.is_empty(),
+            _ => false,
+        }
+    }
+}
+
+impl StmtKind {
+    /// Returns true if this is a DDL statement (modifies schema).
+    pub fn is_ddl(&self) -> bool {
+        matches!(
+            self,
+            StmtKind::CreateTable
+                | StmtKind::DropTable
+                | StmtKind::AlterTable
+                | StmtKind::CreateIndex
+                | StmtKind::DropIndex
+                | StmtKind::CreateTrigger
+                | StmtKind::DropTrigger
+        )
+    }
+}
+
 /// A SELECT statement.
 #[derive(Debug, Clone)]
 pub struct SelectStmt {

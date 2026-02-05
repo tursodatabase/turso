@@ -1530,6 +1530,7 @@ dependencies = [
  "rand_chacha 0.9.0",
  "rusqlite",
  "serde_json",
+ "sql_gen",
  "sql_gen_prop",
  "tracing",
  "tracing-subscriber",
@@ -5128,6 +5129,7 @@ dependencies = [
  "anarchist-readable-name-generator-lib",
  "proptest",
  "rand 0.9.2",
+ "serde",
  "sql_gen_macros",
  "strum",
 ]
