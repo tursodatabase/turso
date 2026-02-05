@@ -4,6 +4,7 @@
 //! the probability of generating different SQL constructs. Unlike capabilities
 //! which are enforced at compile time, policy weights can be adjusted at runtime.
 
+use crate::Schema;
 use crate::context::Context;
 use crate::error::GenError;
 use crate::functions::{FunctionCategory, FunctionDef, SCALAR_FUNCTIONS};
@@ -276,11 +277,14 @@ impl Policy {
         &self,
         ctx: &mut Context,
         candidates: &[StmtKind],
+        schema: &Schema,
     ) -> Result<StmtKind, GenError> {
-        let weights: Vec<u32> = candidates
-            .iter()
-            .map(|k| self.stmt_weights.weight_for(*k))
-            .collect();
+        let mut weights = self.stmt_weights.clone();
+        if schema.tables.is_empty() {
+            // More chance to generate tables
+            weights.create_table *= 100;
+        }
+        let weights: Vec<u32> = candidates.iter().map(|k| weights.weight_for(*k)).collect();
 
         let idx = ctx.weighted_index(&weights).ok_or_else(|| {
             GenError::exhausted(

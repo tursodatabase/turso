@@ -25,7 +25,9 @@ pub fn generate_statement<C: Capabilities>(
 ) -> Result<Stmt, GenError> {
     let candidates = build_stmt_candidates::<C>(generator)?;
 
-    let kind = generator.policy().select_stmt_kind(ctx, &candidates)?;
+    let kind = generator
+        .policy()
+        .select_stmt_kind(ctx, &candidates, generator.schema())?;
     ctx.record_stmt(kind);
 
     dispatch_stmt_generation(generator, ctx, kind)

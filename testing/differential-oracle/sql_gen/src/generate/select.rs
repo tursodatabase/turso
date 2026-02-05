@@ -6,7 +6,8 @@ use crate::capabilities::Capabilities;
 use crate::context::Context;
 use crate::error::GenError;
 use crate::generate::expr::{generate_condition, generate_expr};
-use crate::schema::Table;
+use crate::generate::literal::generate_literal;
+use crate::schema::{DataType, Table};
 use crate::trace::Origin;
 use sql_gen_macros::trace_gen;
 
@@ -15,13 +16,54 @@ pub fn generate_select<C: Capabilities>(
     generator: &SqlGen<C>,
     ctx: &mut Context,
 ) -> Result<crate::ast::Stmt, GenError> {
+    if generator.schema().tables.is_empty() {
+        let select = generate_tableless_select(generator, ctx)?;
+        return Ok(crate::ast::Stmt::Select(select));
+    }
+
     let table = ctx
         .choose(&generator.schema().tables)
-        .ok_or_else(|| GenError::schema_empty("tables"))?
+        .unwrap()
         .clone();
 
     let select = generate_select_for_table(generator, ctx, &table)?;
     Ok(crate::ast::Stmt::Select(select))
+}
+
+/// Generate a table-less SELECT statement (e.g. `SELECT 1+2, abs(-5)`).
+///
+/// Used when no tables exist in the schema. Only generates literal and
+/// function-call expressions (no column refs, no WHERE/ORDER BY).
+#[trace_gen(Origin::Select)]
+pub fn generate_tableless_select<C: Capabilities>(
+    generator: &SqlGen<C>,
+    ctx: &mut Context,
+) -> Result<SelectStmt, GenError> {
+    let num_cols = ctx.gen_range_inclusive(1, 3);
+    let mut columns = Vec::with_capacity(num_cols);
+    let types = [DataType::Integer, DataType::Real, DataType::Text];
+
+    for i in 0..num_cols {
+        let data_type = *ctx.choose(&types).unwrap();
+        let lit = generate_literal(ctx, data_type, generator.policy());
+        let expr = Expr::literal(ctx, lit);
+        columns.push(SelectColumn {
+            expr,
+            alias: Some(format!("expr{i}")),
+        });
+    }
+
+    Ok(SelectStmt {
+        columns,
+        from: None,
+        from_alias: None,
+        where_clause: None,
+        group_by: vec![],
+        having: None,
+        order_by: vec![],
+        limit: None,
+        offset: None,
+    })
 }
 
 /// Generate a SELECT statement for a specific table.
@@ -80,7 +122,7 @@ pub fn generate_select_for_table<C: Capabilities>(
 
     Ok(SelectStmt {
         columns,
-        from: table.name.clone(),
+        from: Some(table.name.clone()),
         from_alias,
         where_clause,
         group_by: vec![],
@@ -119,7 +161,7 @@ pub fn generate_simple_select<C: Capabilities>(
     // Always add LIMIT 1 for scalar subqueries
     Ok(SelectStmt {
         columns,
-        from: table.name.clone(),
+        from: Some(table.name.clone()),
         from_alias: None,
         where_clause,
         group_by: vec![],
