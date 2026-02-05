@@ -5,6 +5,7 @@ use std::fmt;
 
 /// SQL data types supported by the generator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub enum DataType {
     Integer,
     Real,
@@ -27,6 +28,7 @@ impl fmt::Display for DataType {
 
 /// A column definition for table schemas.
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct ColumnDef {
     pub name: String,
     pub data_type: DataType,
@@ -101,6 +103,7 @@ impl fmt::Display for ColumnDef {
 
 /// A table schema definition.
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct Table {
     pub name: String,
     pub columns: Vec<ColumnDef>,
@@ -136,6 +139,7 @@ impl Table {
 
 /// An index definition in a schema.
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct Index {
     pub name: String,
     pub table_name: String,
@@ -165,6 +169,7 @@ impl Index {
 
 /// A trigger definition in a schema.
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct Trigger {
     pub name: String,
     pub table_name: String,
@@ -218,6 +223,7 @@ impl SchemaBuilder {
 
 /// A schema containing tables, indexes, and triggers.
 #[derive(Debug, Clone, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct Schema {
     pub tables: Vec<Table>,
     pub indexes: Vec<Index>,
