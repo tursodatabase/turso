@@ -34,10 +34,6 @@ pub struct Opts {
     #[clap(long, help = "transaction mode", default_value_t = TxMode::SQLite)]
     pub tx_mode: TxMode,
 
-    /// Silent mode
-    #[clap(long, help = "silent mode")]
-    pub silent: bool,
-
     /// Number of threads to run
     #[clap(short = 't', long, help = "the number of threads", default_value_t = 1)]
     pub nr_threads: usize,
