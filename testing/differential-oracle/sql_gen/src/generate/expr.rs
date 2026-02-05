@@ -5,6 +5,7 @@ use crate::ast::{BinOp, Expr, Literal, UnaryOp};
 use crate::capabilities::Capabilities;
 use crate::context::Context;
 use crate::error::GenError;
+use crate::functions::FunctionDef;
 use crate::generate::literal::generate_literal;
 use crate::schema::{DataType, Table};
 use crate::trace::Origin;
@@ -38,6 +39,7 @@ enum ExprType {
     Literal,
     BinaryOp,
     UnaryOp,
+    FunctionCall,
     IsNull,
     Between,
     InList,
@@ -86,6 +88,10 @@ fn add_complex_expr_candidates<C: Capabilities>(
     candidates.push((ExprType::InList, weights.in_list));
 
     // Optional expressions (only if weight > 0)
+    if weights.function_call > 0 {
+        candidates.push((ExprType::FunctionCall, weights.function_call));
+    }
+
     if weights.case_expr > 0 {
         candidates.push((ExprType::CaseExpr, weights.case_expr));
     }
@@ -116,6 +122,7 @@ fn dispatch_expr_generation<C: Capabilities>(
         ExprType::Literal => generate_literal_expr(generator, ctx, table),
         ExprType::BinaryOp => generate_binary_op(generator, ctx, table, depth),
         ExprType::UnaryOp => generate_unary_op(generator, ctx, table, depth),
+        ExprType::FunctionCall => generate_function_call(generator, ctx, table, depth),
         ExprType::IsNull => generate_is_null(generator, ctx, table, depth),
         ExprType::Between => generate_between(generator, ctx, table, depth),
         ExprType::InList => generate_in_list(generator, ctx, table, depth),
@@ -243,6 +250,77 @@ fn generate_unary_op<C: Capabilities>(
 
     let operand = generate_expr(generator, ctx, table, depth + 1)?;
     Ok(Expr::unary_op(ctx, op, operand))
+}
+
+/// Generate a function call expression.
+fn generate_function_call<C: Capabilities>(
+    generator: &SqlGen<C>,
+    ctx: &mut Context,
+    table: &Table,
+    depth: usize,
+) -> Result<Expr, GenError> {
+    let func_config = &generator.policy().function_config;
+    let func = func_config.select_function(ctx)?;
+
+    let args = generate_function_args(generator, ctx, table, depth, func)?;
+
+    Ok(Expr::function_call(ctx, func.name.to_string(), args))
+}
+
+/// Generate arguments for a function call.
+#[trace_gen(Origin::FunctionArg)]
+fn generate_function_args<C: Capabilities>(
+    generator: &SqlGen<C>,
+    ctx: &mut Context,
+    table: &Table,
+    depth: usize,
+    func: &FunctionDef,
+) -> Result<Vec<Expr>, GenError> {
+    let arg_count = func.arg_count(ctx);
+    let mut args = Vec::with_capacity(arg_count);
+
+    for i in 0..arg_count {
+        let arg = generate_function_arg(generator, ctx, table, depth, func, i)?;
+        args.push(arg);
+    }
+
+    Ok(args)
+}
+
+/// Generate a single function argument.
+fn generate_function_arg<C: Capabilities>(
+    generator: &SqlGen<C>,
+    ctx: &mut Context,
+    table: &Table,
+    depth: usize,
+    func: &FunctionDef,
+    arg_index: usize,
+) -> Result<Expr, GenError> {
+    // Check if this function has integer argument constraints (e.g., zeroblob)
+    if let Some(max_val) = func.int_arg_max {
+        if let Some(expected_type) = func.arg_type_at(arg_index) {
+            if expected_type == DataType::Integer {
+                // Generate a constrained integer literal
+                let val = ctx.gen_range_inclusive(0, max_val as usize) as i64;
+                return Ok(Expr::literal(ctx, Literal::Integer(val)));
+            }
+        }
+        // If no specific type, still apply the constraint for safety
+        if func.arg_types.is_empty() {
+            let val = ctx.gen_range_inclusive(0, max_val as usize) as i64;
+            return Ok(Expr::literal(ctx, Literal::Integer(val)));
+        }
+    }
+
+    // Check if there's a specific expected type for this argument
+    if let Some(expected_type) = func.arg_type_at(arg_index) {
+        // Generate a literal of the expected type
+        let lit = generate_literal(ctx, expected_type, generator.policy());
+        return Ok(Expr::literal(ctx, lit));
+    }
+
+    // Otherwise, generate a general expression
+    generate_expr(generator, ctx, table, depth + 1)
 }
 
 /// Generate an IS NULL / IS NOT NULL expression.
@@ -548,5 +626,147 @@ mod tests {
         // At max depth, should only generate simple expressions
         let expr = generate_expr(&generator, &mut ctx, table, 10);
         assert!(expr.is_ok());
+    }
+
+    #[test]
+    fn test_generate_function_call() {
+        use crate::policy::ExprWeights;
+
+        let schema = SchemaBuilder::new()
+            .table(Table::new(
+                "users",
+                vec![
+                    ColumnDef::new("id", DataType::Integer).primary_key(),
+                    ColumnDef::new("name", DataType::Text),
+                    ColumnDef::new("age", DataType::Integer),
+                ],
+            ))
+            .build();
+
+        // Create policy with high function_call weight to ensure we hit it
+        let policy = Policy::default().with_expr_weights(ExprWeights {
+            function_call: 100,
+            column_ref: 0,
+            literal: 0,
+            binary_op: 0,
+            unary_op: 0,
+            subquery: 0,
+            case_expr: 0,
+            cast: 0,
+            between: 0,
+            in_list: 0,
+            is_null: 0,
+        });
+
+        let generator: SqlGen<Full> = SqlGen::new(schema, policy);
+        let table = &generator.schema().tables[0];
+        let mut ctx = Context::new_with_seed(42);
+
+        let expr = generate_function_call(&generator, &mut ctx, table, 0);
+        assert!(expr.is_ok());
+
+        let expr_str = expr.unwrap().to_string();
+        // Should contain a function call with parentheses
+        assert!(expr_str.contains('('));
+        assert!(expr_str.contains(')'));
+    }
+
+    #[test]
+    fn test_function_call_in_select() {
+        use crate::policy::ExprWeights;
+
+        let schema = SchemaBuilder::new()
+            .table(Table::new(
+                "users",
+                vec![
+                    ColumnDef::new("id", DataType::Integer).primary_key(),
+                    ColumnDef::new("name", DataType::Text),
+                ],
+            ))
+            .build();
+
+        let policy = Policy::default().with_expr_weights(ExprWeights {
+            function_call: 50,
+            column_ref: 25,
+            literal: 25,
+            binary_op: 0,
+            unary_op: 0,
+            subquery: 0,
+            case_expr: 0,
+            cast: 0,
+            between: 0,
+            in_list: 0,
+            is_null: 0,
+        });
+
+        let generator: SqlGen<Full> = SqlGen::new(schema, policy);
+        let mut ctx = Context::new_with_seed(123);
+
+        // Generate several statements; some should contain function calls
+        let mut found_function_call = false;
+        for _ in 0..20 {
+            if let Ok(stmt) = generator.statement(&mut ctx) {
+                let sql = stmt.to_string();
+                if sql.contains("ABS(")
+                    || sql.contains("LENGTH(")
+                    || sql.contains("UPPER(")
+                    || sql.contains("LOWER(")
+                    || sql.contains("COALESCE(")
+                    || sql.contains("TYPEOF(")
+                {
+                    found_function_call = true;
+                    break;
+                }
+            }
+        }
+        assert!(found_function_call, "Should generate function calls");
+    }
+
+    #[test]
+    fn test_show_generated_functions() {
+        use crate::policy::ExprWeights;
+
+        let schema = SchemaBuilder::new()
+            .table(Table::new(
+                "users",
+                vec![
+                    ColumnDef::new("id", DataType::Integer).primary_key(),
+                    ColumnDef::new("name", DataType::Text),
+                    ColumnDef::new("age", DataType::Integer),
+                ],
+            ))
+            .build();
+
+        // High function_call weight to generate lots of functions
+        let policy = Policy::default().with_expr_weights(ExprWeights {
+            function_call: 60,
+            column_ref: 20,
+            literal: 20,
+            binary_op: 0,
+            unary_op: 0,
+            subquery: 0,
+            case_expr: 0,
+            cast: 0,
+            between: 0,
+            in_list: 0,
+            is_null: 0,
+        });
+
+        let generator: SqlGen<Full> = SqlGen::new(schema, policy);
+        let mut ctx = Context::new_with_seed(12345);
+
+        println!("\n=== Generated SQL with Function Calls ===");
+        let mut function_count = 0;
+        for i in 0..15 {
+            if let Ok(stmt) = generator.statement(&mut ctx) {
+                let sql = stmt.to_string();
+                println!("{}. {}", i + 1, sql);
+                if sql.contains('(') && !sql.contains("INSERT") {
+                    function_count += 1;
+                }
+            }
+        }
+        println!("=== Found {} statements with function calls ===\n", function_count);
+        assert!(function_count > 0, "Should have generated some function calls");
     }
 }

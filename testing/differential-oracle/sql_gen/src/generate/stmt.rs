@@ -419,7 +419,10 @@ fn generate_alter_table_action<C: Capabilities>(
 
     let weight_vec: Vec<u32> = items.iter().map(|(_, w)| *w).collect();
     let idx = ctx.weighted_index(&weight_vec).ok_or_else(|| {
-        GenError::exhausted("alter_table_action", "no valid alter table actions available")
+        GenError::exhausted(
+            "alter_table_action",
+            "no valid alter table actions available",
+        )
     })?;
 
     let existing_table_names = generator.schema().table_names();
@@ -583,9 +586,9 @@ fn generate_trigger_timing<C: Capabilities>(
     ];
 
     let weight_vec: Vec<u32> = items.iter().map(|(_, w)| *w).collect();
-    let idx = ctx.weighted_index(&weight_vec).ok_or_else(|| {
-        GenError::exhausted("trigger_timing", "no valid trigger timing options")
-    })?;
+    let idx = ctx
+        .weighted_index(&weight_vec)
+        .ok_or_else(|| GenError::exhausted("trigger_timing", "no valid trigger timing options"))?;
     Ok(items[idx].0)
 }
 
@@ -604,9 +607,9 @@ fn generate_trigger_event<C: Capabilities>(
     ];
 
     let weight_vec: Vec<u32> = items.iter().map(|(_, w)| *w).collect();
-    let idx = ctx.weighted_index(&weight_vec).ok_or_else(|| {
-        GenError::exhausted("trigger_event", "no valid trigger event options")
-    })?;
+    let idx = ctx
+        .weighted_index(&weight_vec)
+        .ok_or_else(|| GenError::exhausted("trigger_event", "no valid trigger event options"))?;
 
     Ok(match items[idx].0 {
         TriggerEventKind::Insert => TriggerEvent::Insert,
@@ -678,7 +681,10 @@ fn generate_trigger_body_stmt<C: Capabilities>(
 
     let weight_vec: Vec<u32> = weights.iter().map(|(_, w)| *w).collect();
     let idx = ctx.weighted_index(&weight_vec).ok_or_else(|| {
-        GenError::exhausted("trigger_body_stmt", "no valid trigger body statement options")
+        GenError::exhausted(
+            "trigger_body_stmt",
+            "no valid trigger body statement options",
+        )
     })?;
 
     match weights[idx].0 {

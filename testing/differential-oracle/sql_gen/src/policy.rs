@@ -6,6 +6,7 @@
 
 use crate::context::Context;
 use crate::error::GenError;
+use crate::functions::{FunctionCategory, FunctionDef, SCALAR_FUNCTIONS};
 use crate::trace::StmtKind;
 
 /// Runtime policy controlling generation weights and limits.
@@ -50,6 +51,9 @@ pub struct Policy {
     /// Configuration for trigger generation.
     pub trigger_config: TriggerConfig,
 
+    /// Configuration for function call generation.
+    pub function_config: FunctionConfig,
+
     /// Maximum recursion depth for expressions.
     pub max_expr_depth: usize,
 
@@ -91,6 +95,7 @@ impl Default for Policy {
             expr_config: ExprConfig::default(),
             alter_table_config: AlterTableConfig::default(),
             trigger_config: TriggerConfig::default(),
+            function_config: FunctionConfig::default(),
             max_expr_depth: 4,
             max_subquery_depth: 2,
             max_tables: 3,
@@ -191,6 +196,12 @@ impl Policy {
         self
     }
 
+    /// Builder method to set function configuration.
+    pub fn with_function_config(mut self, config: FunctionConfig) -> Self {
+        self.function_config = config;
+        self
+    }
+
     /// Builder method to set max expression depth.
     pub fn with_max_expr_depth(mut self, depth: usize) -> Self {
         self.max_expr_depth = depth;
@@ -232,7 +243,10 @@ impl Policy {
             .collect();
 
         let idx = ctx.weighted_index(&weights).ok_or_else(|| {
-            GenError::exhausted(ctx.current_scope(), "all statement candidates have zero weight")
+            GenError::exhausted(
+                ctx.current_scope(),
+                "all statement candidates have zero weight",
+            )
         })?;
         Ok(candidates[idx])
     }
@@ -440,7 +454,7 @@ impl Default for ExprWeights {
             literal: 25,
             binary_op: 15,
             unary_op: 5,
-            function_call: 0, // Disabled initially
+            function_call: 10,
             subquery: 3,
             case_expr: 3,
             cast: 3,
@@ -1320,6 +1334,133 @@ pub struct CompoundOpWeights {
 impl Default for CompoundOpWeights {
     fn default() -> Self {
         Self { and: 60, or: 40 }
+    }
+}
+
+// =============================================================================
+// Function Configuration
+// =============================================================================
+
+/// Configuration for function call generation.
+#[derive(Debug, Clone)]
+pub struct FunctionConfig {
+    /// Available functions with their weights. Functions with weight 0 are disabled.
+    pub function_weights: Vec<(&'static FunctionDef, u32)>,
+    /// Whether to only use deterministic functions.
+    pub deterministic_only: bool,
+    /// Category weights for selecting function categories.
+    pub category_weights: FunctionCategoryWeights,
+}
+
+impl Default for FunctionConfig {
+    fn default() -> Self {
+        Self {
+            function_weights: SCALAR_FUNCTIONS.iter().map(|f| (f, 10)).collect(),
+            deterministic_only: false,
+            category_weights: FunctionCategoryWeights::default(),
+        }
+    }
+}
+
+impl FunctionConfig {
+    /// Create a config with only math functions.
+    pub fn math_only() -> Self {
+        Self {
+            function_weights: SCALAR_FUNCTIONS
+                .iter()
+                .map(|f| {
+                    let weight = if f.category == FunctionCategory::Math {
+                        10
+                    } else {
+                        0
+                    };
+                    (f, weight)
+                })
+                .collect(),
+            deterministic_only: false,
+            category_weights: FunctionCategoryWeights::default(),
+        }
+    }
+
+    /// Create a config with only string functions.
+    pub fn string_only() -> Self {
+        Self {
+            function_weights: SCALAR_FUNCTIONS
+                .iter()
+                .map(|f| {
+                    let weight = if f.category == FunctionCategory::String {
+                        10
+                    } else {
+                        0
+                    };
+                    (f, weight)
+                })
+                .collect(),
+            deterministic_only: false,
+            category_weights: FunctionCategoryWeights::default(),
+        }
+    }
+
+    /// Create a config with only deterministic functions.
+    pub fn deterministic() -> Self {
+        Self {
+            function_weights: SCALAR_FUNCTIONS
+                .iter()
+                .map(|f| {
+                    let weight = if f.is_deterministic { 10 } else { 0 };
+                    (f, weight)
+                })
+                .collect(),
+            deterministic_only: true,
+            category_weights: FunctionCategoryWeights::default(),
+        }
+    }
+
+    /// Select a function based on weights.
+    pub fn select_function(&self, ctx: &mut Context) -> Result<&'static FunctionDef, GenError> {
+        let eligible: Vec<_> = self
+            .function_weights
+            .iter()
+            .filter(|(f, w)| *w > 0 && (!self.deterministic_only || f.is_deterministic))
+            .collect();
+
+        if eligible.is_empty() {
+            return Err(GenError::exhausted(
+                "function_call",
+                "no functions configured or all have zero weight",
+            ));
+        }
+
+        let weights: Vec<u32> = eligible.iter().map(|(_, w)| *w).collect();
+        let idx = ctx.weighted_index(&weights).ok_or_else(|| {
+            GenError::exhausted("function_call", "all functions have zero weight")
+        })?;
+
+        Ok(eligible[idx].0)
+    }
+}
+
+/// Weights for function categories.
+#[derive(Debug, Clone)]
+pub struct FunctionCategoryWeights {
+    pub math: u32,
+    pub string: u32,
+    pub type_fn: u32,
+    pub null_fn: u32,
+    pub blob: u32,
+    pub misc: u32,
+}
+
+impl Default for FunctionCategoryWeights {
+    fn default() -> Self {
+        Self {
+            math: 25,
+            string: 30,
+            type_fn: 10,
+            null_fn: 20,
+            blob: 5,
+            misc: 10,
+        }
     }
 }
 
