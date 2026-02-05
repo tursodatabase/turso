@@ -2,7 +2,7 @@
 
 use crate::SqlGen;
 use crate::ast::{
-    BinOp, Expr, GroupByClause, OrderByItem, OrderDirection, SelectColumn, SelectStmt,
+    BinOp, Expr, GroupByClause, NullsOrder, OrderByItem, OrderDirection, SelectColumn, SelectStmt,
 };
 use crate::capabilities::Capabilities;
 use crate::context::Context;
@@ -152,6 +152,9 @@ pub fn generate_select_for_table<C: Capabilities>(
 }
 
 /// Generate a simple single-column SELECT (for scalar subqueries).
+///
+/// Always returns exactly 1 column with LIMIT 1. Optionally includes
+/// GROUP BY (with aggregate output), ORDER BY, and DISTINCT.
 pub fn generate_simple_select<C: Capabilities>(
     generator: &SqlGen<C>,
     ctx: &mut Context,
@@ -159,15 +162,36 @@ pub fn generate_simple_select<C: Capabilities>(
 ) -> Result<SelectStmt, GenError> {
     let select_config = &generator.policy().select_config;
 
-    // Pick one column
-    let col = ctx
-        .choose(&table.columns)
-        .ok_or_else(|| GenError::schema_empty("columns"))?;
+    let use_group_by = ctx.gen_bool_with_prob(select_config.subquery_group_by_probability);
 
-    let columns = vec![SelectColumn {
-        expr: Expr::column_ref(ctx, None, col.name.clone()),
-        alias: None,
-    }];
+    let (columns, group_by) = if use_group_by && table.columns.len() >= 2 {
+        // GROUP BY path: output a single aggregate call, group by another column
+        let gb_col = ctx
+            .choose(&table.columns)
+            .ok_or_else(|| GenError::schema_empty("columns"))?
+            .clone();
+        let gb_expr = Expr::column_ref(ctx, None, gb_col.name.clone());
+        let agg = generate_aggregate_call(ctx, table)?;
+        let columns = vec![SelectColumn {
+            expr: agg,
+            alias: None,
+        }];
+        let group_by = Some(GroupByClause {
+            exprs: vec![gb_expr],
+            having: None,
+        });
+        (columns, group_by)
+    } else {
+        // Simple path: pick one column ref
+        let col = ctx
+            .choose(&table.columns)
+            .ok_or_else(|| GenError::schema_empty("columns"))?;
+        let columns = vec![SelectColumn {
+            expr: Expr::column_ref(ctx, None, col.name.clone()),
+            alias: None,
+        }];
+        (columns, None)
+    };
 
     // Maybe add WHERE
     let where_clause = if ctx.gen_bool_with_prob(select_config.subquery_where_probability) {
@@ -176,15 +200,30 @@ pub fn generate_simple_select<C: Capabilities>(
         None
     };
 
+    // Maybe add ORDER BY
+    let order_by = if ctx.gen_bool_with_prob(select_config.subquery_order_by_probability) {
+        if let Some(gb) = &group_by {
+            generate_grouped_order_by(generator, ctx, table, &gb.exprs)?
+        } else {
+            generate_order_by(generator, ctx, table)?
+        }
+    } else {
+        vec![]
+    };
+
+    // Maybe add DISTINCT (only for non-grouped queries)
+    let distinct =
+        group_by.is_none() && ctx.gen_bool_with_prob(select_config.subquery_distinct_probability);
+
     // Always add LIMIT 1 for scalar subqueries
     Ok(SelectStmt {
-        distinct: false,
+        distinct,
         columns,
         from: Some(table.name.clone()),
         from_alias: None,
         where_clause,
-        group_by: None,
-        order_by: vec![],
+        group_by,
+        order_by,
         limit: Some(1),
         offset: None,
     })
@@ -318,10 +357,11 @@ fn generate_grouped_order_by<C: Capabilities>(
         .into_iter()
         .map(|expr| {
             let direction = select_order_direction(ctx, &select_config.order_direction_weights);
+            let nulls = select_nulls_order(ctx, &select_config.nulls_order_weights);
             OrderByItem {
                 expr,
                 direction,
-                nulls: None,
+                nulls,
             }
         })
         .collect();
@@ -405,13 +445,34 @@ fn generate_order_by<C: Capabilities>(
     let mut items = Vec::with_capacity(num_items);
 
     for _ in 0..num_items {
-        let col = ctx.choose(&table.columns).unwrap();
+        let col_w = select_config.order_by_column_weight;
+        let expr_w = select_config.order_by_expr_weight;
+
+        let expr = match ctx.weighted_index(&[col_w, expr_w]) {
+            Some(1) => {
+                let e = generate_expr(generator, ctx, table, 0)?;
+                // Avoid bare literals — SQLite interprets integer literals in
+                // ORDER BY as column-ordinal positions (e.g. ORDER BY 2).
+                if matches!(e, Expr::Literal(_)) {
+                    let col = ctx.choose(&table.columns).unwrap();
+                    Expr::column_ref(ctx, None, col.name.clone())
+                } else {
+                    e
+                }
+            }
+            _ => {
+                let col = ctx.choose(&table.columns).unwrap();
+                Expr::column_ref(ctx, None, col.name.clone())
+            }
+        };
+
         let direction = select_order_direction(ctx, &select_config.order_direction_weights);
+        let nulls = select_nulls_order(ctx, &select_config.nulls_order_weights);
 
         items.push(OrderByItem {
-            expr: Expr::column_ref(ctx, None, col.name.clone()),
+            expr,
             direction,
-            nulls: None,
+            nulls,
         });
     }
 
@@ -431,6 +492,18 @@ fn select_order_direction(
     match ctx.weighted_index(&[weights.asc, weights.desc]) {
         Some(idx) => candidates[idx].0,
         None => OrderDirection::Asc, // Default if all weights are zero
+    }
+}
+
+/// Select a NULLS ordering based on weights.
+fn select_nulls_order(
+    ctx: &mut Context,
+    weights: &crate::policy::NullsOrderWeights,
+) -> Option<NullsOrder> {
+    match ctx.weighted_index(&[weights.first, weights.last, weights.unspecified]) {
+        Some(0) => Some(NullsOrder::First),
+        Some(1) => Some(NullsOrder::Last),
+        _ => None,
     }
 }
 
@@ -546,6 +619,140 @@ mod tests {
         assert!(
             sql.contains("DISTINCT"),
             "SQL should contain DISTINCT: {sql}"
+        );
+    }
+
+    #[test]
+    fn test_expression_order_by() {
+        let policy = Policy::default().with_select_config(crate::policy::SelectConfig {
+            order_by_probability: 1.0,
+            order_by_column_weight: 0,
+            order_by_expr_weight: 100,
+            group_by_probability: 0.0,
+            ..Default::default()
+        });
+        let schema = SchemaBuilder::new()
+            .table(Table::new(
+                "users",
+                vec![
+                    ColumnDef::new("id", DataType::Integer).primary_key(),
+                    ColumnDef::new("name", DataType::Text),
+                    ColumnDef::new("age", DataType::Integer),
+                ],
+            ))
+            .build();
+        let generator: SqlGen<Full> = SqlGen::new(schema, policy);
+        let table = &generator.schema().tables[0];
+
+        let mut found_expr_order_by = false;
+        for seed in 0..50 {
+            let mut ctx = Context::new_with_seed(seed);
+            if let Ok(select) = generate_select_for_table(&generator, &mut ctx, table) {
+                let sql = select.to_string();
+                if sql.contains("ORDER BY") {
+                    // Expression ORDER BY will contain operators or function calls,
+                    // not just bare column names
+                    let order_part = sql.split("ORDER BY").nth(1).unwrap_or("");
+                    if order_part.contains('(')
+                        || order_part.contains('+')
+                        || order_part.contains('-')
+                        || order_part.contains('*')
+                        || order_part.contains("CASE")
+                        || order_part.contains("CAST")
+                    {
+                        found_expr_order_by = true;
+                        break;
+                    }
+                }
+            }
+        }
+        assert!(
+            found_expr_order_by,
+            "Should generate expression-based ORDER BY items"
+        );
+    }
+
+    #[test]
+    fn test_nulls_ordering() {
+        let policy = Policy::default().with_select_config(crate::policy::SelectConfig {
+            order_by_probability: 1.0,
+            group_by_probability: 0.0,
+            nulls_order_weights: crate::policy::NullsOrderWeights {
+                first: 50,
+                last: 50,
+                unspecified: 0,
+            },
+            ..Default::default()
+        });
+        let schema = SchemaBuilder::new()
+            .table(Table::new(
+                "users",
+                vec![
+                    ColumnDef::new("id", DataType::Integer).primary_key(),
+                    ColumnDef::new("name", DataType::Text),
+                ],
+            ))
+            .build();
+        let generator: SqlGen<Full> = SqlGen::new(schema, policy);
+        let table = &generator.schema().tables[0];
+
+        let mut found_nulls = false;
+        for seed in 0..30 {
+            let mut ctx = Context::new_with_seed(seed);
+            if let Ok(select) = generate_select_for_table(&generator, &mut ctx, table) {
+                let sql = select.to_string();
+                if sql.contains("NULLS FIRST") || sql.contains("NULLS LAST") {
+                    found_nulls = true;
+                    break;
+                }
+            }
+        }
+        assert!(found_nulls, "Should generate NULLS FIRST or NULLS LAST");
+    }
+
+    #[test]
+    fn test_rich_subquery_with_group_by() {
+        let policy = Policy::default().with_select_config(crate::policy::SelectConfig {
+            subquery_group_by_probability: 1.0,
+            subquery_where_probability: 0.0,
+            subquery_order_by_probability: 0.0,
+            ..Default::default()
+        });
+        let schema = SchemaBuilder::new()
+            .table(Table::new(
+                "users",
+                vec![
+                    ColumnDef::new("id", DataType::Integer).primary_key(),
+                    ColumnDef::new("name", DataType::Text),
+                    ColumnDef::new("age", DataType::Integer),
+                ],
+            ))
+            .build();
+        let generator: SqlGen<Full> = SqlGen::new(schema, policy);
+        let table = &generator.schema().tables[0];
+
+        let mut found_grouped = false;
+        for seed in 0..30 {
+            let mut ctx = Context::new_with_seed(seed);
+            if let Ok(select) = generate_simple_select(&generator, &mut ctx, table) {
+                let sql = select.to_string();
+                assert_eq!(select.columns.len(), 1, "Should have exactly 1 column");
+                assert_eq!(select.limit, Some(1), "Should have LIMIT 1");
+                if sql.contains("GROUP BY") {
+                    found_grouped = true;
+                    // Verify the output column contains an aggregate
+                    let col_str = select.columns[0].expr.to_string();
+                    assert!(
+                        col_str.contains('('),
+                        "Grouped subquery column should be aggregate: {col_str}"
+                    );
+                    break;
+                }
+            }
+        }
+        assert!(
+            found_grouped,
+            "Should generate subqueries with GROUP BY"
         );
     }
 
