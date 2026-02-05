@@ -125,8 +125,12 @@ pub enum ExprKind {
     Cast,
     Between,
     InList,
+    InSubquery,
+    NotInSubquery,
     IsNull,
     IsNotNull,
+    Exists,
+    NotExists,
 }
 
 impl fmt::Display for ExprKind {
@@ -142,8 +146,12 @@ impl fmt::Display for ExprKind {
             ExprKind::Cast => write!(f, "Cast"),
             ExprKind::Between => write!(f, "Between"),
             ExprKind::InList => write!(f, "InList"),
+            ExprKind::InSubquery => write!(f, "InSubquery"),
+            ExprKind::NotInSubquery => write!(f, "NotInSubquery"),
             ExprKind::IsNull => write!(f, "IsNull"),
             ExprKind::IsNotNull => write!(f, "IsNotNull"),
+            ExprKind::Exists => write!(f, "Exists"),
+            ExprKind::NotExists => write!(f, "NotExists"),
         }
     }
 }

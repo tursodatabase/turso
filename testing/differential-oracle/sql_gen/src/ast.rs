@@ -596,7 +596,9 @@ pub enum Expr {
     Cast(Box<CastExpr>),
     Between(Box<BetweenExpr>),
     InList(Box<InListExpr>),
+    InSubquery(Box<InSubqueryExpr>),
     IsNull(Box<IsNullExpr>),
+    Exists(Box<ExistsExpr>),
     Parenthesized(Box<Expr>),
 }
 
@@ -613,7 +615,9 @@ impl fmt::Display for Expr {
             Expr::Cast(c) => write!(f, "{c}"),
             Expr::Between(b) => write!(f, "{b}"),
             Expr::InList(i) => write!(f, "{i}"),
+            Expr::InSubquery(i) => write!(f, "{i}"),
             Expr::IsNull(i) => write!(f, "{i}"),
+            Expr::Exists(e) => write!(f, "{e}"),
             Expr::Parenthesized(e) => write!(f, "({e})"),
         }
     }
@@ -707,6 +711,30 @@ impl Expr {
             ctx.record(ExprKind::IsNull);
         }
         Expr::IsNull(Box::new(IsNullExpr { expr, negated }))
+    }
+
+    /// Create an EXISTS expression (records to context).
+    pub fn exists(ctx: &mut Context, subquery: SelectStmt, negated: bool) -> Self {
+        if negated {
+            ctx.record(ExprKind::NotExists);
+        } else {
+            ctx.record(ExprKind::Exists);
+        }
+        Expr::Exists(Box::new(ExistsExpr { subquery, negated }))
+    }
+
+    /// Create an IN subquery expression (records to context).
+    pub fn in_subquery(ctx: &mut Context, expr: Expr, subquery: SelectStmt, negated: bool) -> Self {
+        if negated {
+            ctx.record(ExprKind::NotInSubquery);
+        } else {
+            ctx.record(ExprKind::InSubquery);
+        }
+        Expr::InSubquery(Box::new(InSubqueryExpr {
+            expr,
+            subquery,
+            negated,
+        }))
     }
 
     /// Create a parenthesized expression (does not record - it's just grouping).
@@ -1014,6 +1042,40 @@ impl fmt::Display for IsNullExpr {
         } else {
             write!(f, " IS NULL")
         }
+    }
+}
+
+/// An EXISTS expression.
+#[derive(Debug, Clone)]
+pub struct ExistsExpr {
+    pub subquery: SelectStmt,
+    pub negated: bool,
+}
+
+impl fmt::Display for ExistsExpr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.negated {
+            write!(f, "NOT ")?;
+        }
+        write!(f, "EXISTS ({})", self.subquery)
+    }
+}
+
+/// An IN subquery expression.
+#[derive(Debug, Clone)]
+pub struct InSubqueryExpr {
+    pub expr: Expr,
+    pub subquery: SelectStmt,
+    pub negated: bool,
+}
+
+impl fmt::Display for InSubqueryExpr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.expr)?;
+        if self.negated {
+            write!(f, " NOT")?;
+        }
+        write!(f, " IN ({})", self.subquery)
     }
 }
 
