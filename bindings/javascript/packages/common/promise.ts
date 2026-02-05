@@ -70,7 +70,9 @@ class Database {
    * @param {string} sql - The SQL statement string to prepare.
    */
   prepare(sql) {
-    if (!this.open) {
+    // Only throw if we connected before but now the database is closed
+    // Allow implicit connection if not connected yet
+    if (this.connected && !this.open) {
       throw new TypeError("The database connection is not open");
     }
     if (!sql) {
