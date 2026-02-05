@@ -748,18 +748,19 @@ mod tests {
         let generator: SqlGen<Full> = SqlGen::new(schema, policy);
         let mut ctx = Context::new_with_seed(123);
 
+        // Get all function names from the static definitions
+        let function_names: Vec<_> = crate::functions::scalar_functions()
+            .chain(crate::functions::aggregate_functions())
+            .map(|f| f.name)
+            .collect();
+
         // Generate several statements; some should contain function calls
         let mut found_function_call = false;
-        for _ in 0..20 {
+        for _ in 0..50 {
             if let Ok(stmt) = generator.statement(&mut ctx) {
                 let sql = stmt.to_string();
-                if sql.contains("ABS(")
-                    || sql.contains("LENGTH(")
-                    || sql.contains("UPPER(")
-                    || sql.contains("LOWER(")
-                    || sql.contains("COALESCE(")
-                    || sql.contains("TYPEOF(")
-                {
+                // Check if any known function name appears in the SQL
+                if function_names.iter().any(|name| sql.contains(name)) {
                     found_function_call = true;
                     break;
                 }

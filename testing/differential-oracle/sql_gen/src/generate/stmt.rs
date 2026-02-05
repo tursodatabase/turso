@@ -31,7 +31,7 @@ pub fn generate_statement<C: Capabilities>(
     dispatch_stmt_generation(generator, ctx, kind)
 }
 
-/// Build list of allowed statement kinds based on capabilities and policy weights.
+/// Build list of allowed statement kinds based on capabilities, policy weights, and schema validity.
 fn build_stmt_candidates<C: Capabilities>(
     generator: &SqlGen<C>,
 ) -> Result<Vec<StmtKind>, GenError> {
@@ -46,14 +46,17 @@ fn build_stmt_candidates<C: Capabilities>(
 
     let weighted_candidates = filter_by_policy_weight(generator, capability_candidates);
 
-    if weighted_candidates.is_empty() {
+    let valid_candidates: Vec<StmtKind> =
+        filter_by_schema_validity(generator, weighted_candidates).collect();
+
+    if valid_candidates.is_empty() {
         return Err(GenError::exhausted(
             "statement",
-            "all allowed statement types have zero weight",
+            "no statement types valid for current schema state",
         ));
     }
 
-    Ok(weighted_candidates)
+    Ok(valid_candidates)
 }
 
 /// Collect statement kinds allowed by the capability type parameter.
@@ -109,12 +112,68 @@ fn collect_capability_allowed_stmts<C: Capabilities>() -> Vec<StmtKind> {
 /// Filter candidates to only those with positive policy weight.
 fn filter_by_policy_weight<C: Capabilities>(
     generator: &SqlGen<C>,
-    candidates: Vec<StmtKind>,
-) -> Vec<StmtKind> {
+    candidates: impl IntoIterator<Item = StmtKind>,
+) -> impl Iterator<Item = StmtKind> {
     candidates
         .into_iter()
         .filter(|k| generator.policy().stmt_weights.weight_for(*k) > 0)
-        .collect()
+}
+
+/// Filter candidates to only those valid for the current schema state.
+///
+/// This prevents attempting to generate statements that will clearly fail,
+/// such as INSERT when there are no tables.
+fn filter_by_schema_validity<C: Capabilities>(
+    generator: &SqlGen<C>,
+    candidates: impl Iterator<Item = StmtKind>,
+) -> impl Iterator<Item = StmtKind> {
+    let schema = generator.schema();
+    let has_tables = !schema.tables.is_empty();
+    let has_indexes = !schema.indexes.is_empty();
+    let has_triggers = !schema.triggers.is_empty();
+    let has_updatable_columns = schema
+        .tables
+        .iter()
+        .any(|t| t.columns.iter().any(|c| !c.primary_key));
+
+    candidates.filter(move |kind| {
+        is_stmt_valid_for_schema(
+            *kind,
+            has_tables,
+            has_indexes,
+            has_triggers,
+            has_updatable_columns,
+        )
+    })
+}
+
+/// Check if a statement kind is valid given the current schema state.
+fn is_stmt_valid_for_schema(
+    kind: StmtKind,
+    has_tables: bool,
+    has_indexes: bool,
+    has_triggers: bool,
+    has_updatable_columns: bool,
+) -> bool {
+    match kind {
+        // SELECT is always valid (SELECT 1, SELECT ABS(-5), etc.)
+        StmtKind::Select => true,
+        // INSERT/DELETE require tables
+        StmtKind::Insert | StmtKind::Delete => has_tables,
+        // UPDATE requires tables with updatable (non-PK) columns
+        StmtKind::Update => has_tables && has_updatable_columns,
+        // DDL that operates on existing tables
+        StmtKind::DropTable
+        | StmtKind::AlterTable
+        | StmtKind::CreateIndex
+        | StmtKind::CreateTrigger => has_tables,
+        // DROP INDEX requires indexes to exist
+        StmtKind::DropIndex => has_indexes,
+        // DROP TRIGGER requires triggers to exist
+        StmtKind::DropTrigger => has_triggers,
+        // These are always valid
+        StmtKind::CreateTable | StmtKind::Begin | StmtKind::Commit | StmtKind::Rollback => true,
+    }
 }
 
 /// Dispatch to the appropriate statement generator.
