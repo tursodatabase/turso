@@ -53,12 +53,13 @@ jobs:
       with:
         notebook_name: limbo
         tenant: ${{ secrets.ANTITHESIS_TENANT }}
-        username: ${{ secrets.ANTITHESIS_USERNAME }}
-        password: ${{ secrets.ANTITHESIS_PASSWORD }}
+        username: ${{ secrets.ANTITHESIS_USER }}
+        password: ${{ secrets.ANTITHESIS_PASSWD }}
         github_token: ${{ secrets.ANTITHESIS_GITHUB_TOKEN }}
         config_image: ${{ secrets.ANTITHESIS_DOCKER_REPO }}/limbo-config:antithesis-latest
         images: ${{ secrets.ANTITHESIS_DOCKER_REPO }}/limbo-workload:antithesis-latest
         description: "Turso - ${{ github.event_name }} on ${{ github.ref_name }} by ${{ github.actor }}"
         email_recipients: ${{ secrets.ANTITHESIS_EMAIL }}
+        test_name: ${{ github.event.inputs.test_name }}
         additional_parameters: |-
           antithesis.duration=${{ github.event.inputs.duration }}
