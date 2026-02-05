@@ -66,6 +66,17 @@ pub fn generate_tableless_select<C: Capabilities>(
     })
 }
 
+/// Controls whether `generate_select_for_table` produces a full SELECT or a
+/// single-column scalar subquery.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SelectMode {
+    /// Normal SELECT — arbitrary columns, clauses governed by `SelectConfig`.
+    Full,
+    /// Scalar subquery — exactly 1 output column, LIMIT 1, no alias/offset.
+    /// Probabilities come from the `subquery_*` fields in `SelectConfig`.
+    Scalar,
+}
+
 /// Generate a SELECT statement for a specific table.
 #[trace_gen(Origin::Select)]
 pub fn generate_select_for_table<C: Capabilities>(
@@ -73,32 +84,101 @@ pub fn generate_select_for_table<C: Capabilities>(
     ctx: &mut Context,
     table: &Table,
 ) -> Result<SelectStmt, GenError> {
+    generate_select_impl(generator, ctx, table, SelectMode::Full)
+}
+
+/// Generate a simple single-column SELECT (for scalar subqueries).
+///
+/// Always returns exactly 1 column with LIMIT 1.
+pub fn generate_simple_select<C: Capabilities>(
+    generator: &SqlGen<C>,
+    ctx: &mut Context,
+    table: &Table,
+) -> Result<SelectStmt, GenError> {
+    generate_select_impl(generator, ctx, table, SelectMode::Scalar)
+}
+
+/// Shared implementation for both full and scalar SELECT generation.
+fn generate_select_impl<C: Capabilities>(
+    generator: &SqlGen<C>,
+    ctx: &mut Context,
+    table: &Table,
+    mode: SelectMode,
+) -> Result<SelectStmt, GenError> {
     let select_config = &generator.policy().select_config;
     let ident_config = &generator.policy().identifier_config;
 
-    // Generate optional GROUP BY (with optional HAVING)
-    let group_by = if ctx.gen_bool_with_prob(select_config.group_by_probability) {
-        Some(generate_group_by_clause(generator, ctx, table)?)
+    let gb_prob = match mode {
+        SelectMode::Full => select_config.group_by_probability,
+        SelectMode::Scalar => select_config.subquery_group_by_probability,
+    };
+    let where_prob = match mode {
+        SelectMode::Full => select_config.where_probability,
+        SelectMode::Scalar => select_config.subquery_where_probability,
+    };
+    let order_by_prob = match mode {
+        SelectMode::Full => select_config.order_by_probability,
+        SelectMode::Scalar => select_config.subquery_order_by_probability,
+    };
+
+    // --- GROUP BY ---
+    let group_by = if ctx.gen_bool_with_prob(gb_prob) {
+        match mode {
+            SelectMode::Full => Some(generate_group_by_clause(generator, ctx, table)?),
+            // Scalar: single GROUP BY column, no HAVING
+            SelectMode::Scalar if table.columns.len() >= 2 => {
+                let gb_col = ctx
+                    .choose(&table.columns)
+                    .ok_or_else(|| GenError::schema_empty("columns"))?
+                    .clone();
+                Some(GroupByClause {
+                    exprs: vec![Expr::column_ref(ctx, None, gb_col.name.clone())],
+                    having: None,
+                })
+            }
+            _ => None,
+        }
     } else {
         None
     };
 
-    // Generate columns — dispatch based on GROUP BY
-    let columns = if let Some(gb) = &group_by {
-        generate_grouped_select_columns(generator, ctx, table, &gb.exprs)?
-    } else {
-        generate_select_columns(generator, ctx, table)?
+    // --- Columns ---
+    let columns = match mode {
+        SelectMode::Full => {
+            if let Some(gb) = &group_by {
+                generate_grouped_select_columns(generator, ctx, table, &gb.exprs)?
+            } else {
+                generate_select_columns(generator, ctx, table)?
+            }
+        }
+        SelectMode::Scalar => {
+            if group_by.is_some() {
+                // Aggregate output column
+                vec![SelectColumn {
+                    expr: generate_aggregate_call(ctx, table)?,
+                    alias: None,
+                }]
+            } else {
+                let col = ctx
+                    .choose(&table.columns)
+                    .ok_or_else(|| GenError::schema_empty("columns"))?;
+                vec![SelectColumn {
+                    expr: Expr::column_ref(ctx, None, col.name.clone()),
+                    alias: None,
+                }]
+            }
+        }
     };
 
-    // Generate optional WHERE clause
-    let where_clause = if ctx.gen_bool_with_prob(select_config.where_probability) {
+    // --- WHERE ---
+    let where_clause = if ctx.gen_bool_with_prob(where_prob) {
         Some(generate_condition(generator, ctx, table)?)
     } else {
         None
     };
 
-    // Generate optional ORDER BY — dispatch based on GROUP BY
-    let order_by = if ctx.gen_bool_with_prob(select_config.order_by_probability) {
+    // --- ORDER BY ---
+    let order_by = if ctx.gen_bool_with_prob(order_by_prob) {
         if let Some(gb) = &group_by {
             generate_grouped_order_by(generator, ctx, table, &gb.exprs)?
         } else {
@@ -108,25 +188,38 @@ pub fn generate_select_for_table<C: Capabilities>(
         vec![]
     };
 
-    // Generate optional DISTINCT
-    let distinct = ctx.gen_bool_with_prob(select_config.distinct_probability);
-
-    // Generate optional LIMIT
-    let limit = if ctx.gen_bool_with_prob(select_config.limit_probability) {
-        Some(ctx.gen_range_inclusive(1, generator.policy().max_limit as usize) as u64)
-    } else {
-        None
+    // --- DISTINCT ---
+    let distinct = match mode {
+        SelectMode::Full => ctx.gen_bool_with_prob(select_config.distinct_probability),
+        // Scalar: only when not grouped
+        SelectMode::Scalar => {
+            group_by.is_none()
+                && ctx.gen_bool_with_prob(select_config.subquery_distinct_probability)
+        }
     };
 
-    // Generate optional OFFSET (only if LIMIT is present)
-    let offset = if limit.is_some() && ctx.gen_bool_with_prob(select_config.offset_probability) {
-        Some(ctx.gen_range_inclusive(0, select_config.max_offset as usize) as u64)
-    } else {
-        None
+    // --- LIMIT / OFFSET ---
+    let (limit, offset) = match mode {
+        SelectMode::Full => {
+            let limit = if ctx.gen_bool_with_prob(select_config.limit_probability) {
+                Some(ctx.gen_range_inclusive(1, generator.policy().max_limit as usize) as u64)
+            } else {
+                None
+            };
+            let offset =
+                if limit.is_some() && ctx.gen_bool_with_prob(select_config.offset_probability) {
+                    Some(ctx.gen_range_inclusive(0, select_config.max_offset as usize) as u64)
+                } else {
+                    None
+                };
+            (limit, offset)
+        }
+        SelectMode::Scalar => (Some(1), None),
     };
 
-    // Generate alias if policy allows
-    let from_alias = if ident_config.generate_table_aliases
+    // --- Alias ---
+    let from_alias = if mode == SelectMode::Full
+        && ident_config.generate_table_aliases
         && ctx.gen_bool_with_prob(select_config.table_alias_probability)
     {
         Some(format!(
@@ -148,84 +241,6 @@ pub fn generate_select_for_table<C: Capabilities>(
         order_by,
         limit,
         offset,
-    })
-}
-
-/// Generate a simple single-column SELECT (for scalar subqueries).
-///
-/// Always returns exactly 1 column with LIMIT 1. Optionally includes
-/// GROUP BY (with aggregate output), ORDER BY, and DISTINCT.
-pub fn generate_simple_select<C: Capabilities>(
-    generator: &SqlGen<C>,
-    ctx: &mut Context,
-    table: &Table,
-) -> Result<SelectStmt, GenError> {
-    let select_config = &generator.policy().select_config;
-
-    let use_group_by = ctx.gen_bool_with_prob(select_config.subquery_group_by_probability);
-
-    let (columns, group_by) = if use_group_by && table.columns.len() >= 2 {
-        // GROUP BY path: output a single aggregate call, group by another column
-        let gb_col = ctx
-            .choose(&table.columns)
-            .ok_or_else(|| GenError::schema_empty("columns"))?
-            .clone();
-        let gb_expr = Expr::column_ref(ctx, None, gb_col.name.clone());
-        let agg = generate_aggregate_call(ctx, table)?;
-        let columns = vec![SelectColumn {
-            expr: agg,
-            alias: None,
-        }];
-        let group_by = Some(GroupByClause {
-            exprs: vec![gb_expr],
-            having: None,
-        });
-        (columns, group_by)
-    } else {
-        // Simple path: pick one column ref
-        let col = ctx
-            .choose(&table.columns)
-            .ok_or_else(|| GenError::schema_empty("columns"))?;
-        let columns = vec![SelectColumn {
-            expr: Expr::column_ref(ctx, None, col.name.clone()),
-            alias: None,
-        }];
-        (columns, None)
-    };
-
-    // Maybe add WHERE
-    let where_clause = if ctx.gen_bool_with_prob(select_config.subquery_where_probability) {
-        Some(generate_condition(generator, ctx, table)?)
-    } else {
-        None
-    };
-
-    // Maybe add ORDER BY
-    let order_by = if ctx.gen_bool_with_prob(select_config.subquery_order_by_probability) {
-        if let Some(gb) = &group_by {
-            generate_grouped_order_by(generator, ctx, table, &gb.exprs)?
-        } else {
-            generate_order_by(generator, ctx, table)?
-        }
-    } else {
-        vec![]
-    };
-
-    // Maybe add DISTINCT (only for non-grouped queries)
-    let distinct =
-        group_by.is_none() && ctx.gen_bool_with_prob(select_config.subquery_distinct_probability);
-
-    // Always add LIMIT 1 for scalar subqueries
-    Ok(SelectStmt {
-        distinct,
-        columns,
-        from: Some(table.name.clone()),
-        from_alias: None,
-        where_clause,
-        group_by,
-        order_by,
-        limit: Some(1),
-        offset: None,
     })
 }
 
