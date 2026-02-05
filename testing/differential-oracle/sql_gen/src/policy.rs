@@ -848,8 +848,17 @@ pub struct SelectConfig {
     /// Maximum number of columns in SELECT.
     pub max_columns: usize,
 
-    /// Probability of generating SELECT * (only if min_columns == 0).
-    pub select_star_probability: f64,
+    /// Weight for SELECT * strategy.
+    pub select_star_weight: u32,
+
+    /// Weight for selecting a subset of table columns.
+    pub column_list_weight: u32,
+
+    /// Weight for selecting generated expressions.
+    pub expression_list_weight: u32,
+
+    /// Range for the number of expressions in expression list strategy.
+    pub expression_count_range: std::ops::RangeInclusive<usize>,
 
     /// Probability of generating WHERE clause.
     pub where_probability: f64,
@@ -884,9 +893,6 @@ pub struct SelectConfig {
     /// Probability of WHERE clause in simple/subquery SELECT.
     pub subquery_where_probability: f64,
 
-    /// Probability of choosing a column ref vs expression in SELECT columns.
-    pub column_ref_probability: f64,
-
     /// Order direction weights.
     pub order_direction_weights: OrderDirectionWeights,
 
@@ -899,7 +905,10 @@ impl Default for SelectConfig {
         Self {
             min_columns: 0,
             max_columns: 10,
-            select_star_probability: 0.2,
+            select_star_weight: 2,
+            column_list_weight: 5,
+            expression_list_weight: 3,
+            expression_count_range: 1..=5,
             where_probability: 0.7,
             order_by_probability: 0.3,
             limit_probability: 0.4,
@@ -911,7 +920,6 @@ impl Default for SelectConfig {
             column_alias_probability: 0.2,
             max_offset: 100,
             subquery_where_probability: 0.5,
-            column_ref_probability: 0.7,
             order_direction_weights: OrderDirectionWeights::default(),
             nulls_order_weights: NullsOrderWeights::default(),
         }

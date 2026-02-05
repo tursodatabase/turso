@@ -173,6 +173,11 @@ pub fn generate_simple_select<C: Capabilities>(
 }
 
 /// Generate SELECT column list.
+///
+/// Uses a weighted three-way strategy:
+/// 1. SELECT * (empty vec)
+/// 2. Column list (subsequence of table columns)
+/// 3. Expression list (generated expressions)
 fn generate_select_columns<C: Capabilities>(
     generator: &SqlGen<C>,
     ctx: &mut Context,
@@ -181,53 +186,53 @@ fn generate_select_columns<C: Capabilities>(
     let select_config = &generator.policy().select_config;
     let ident_config = &generator.policy().identifier_config;
 
-    // Decide: SELECT * or specific columns
-    if select_config.min_columns == 0
-        && ctx.gen_bool_with_prob(select_config.select_star_probability)
-    {
-        // SELECT * - return empty vec which displays as *
-        return Ok(vec![]);
-    }
+    let star_weight = if select_config.min_columns == 0 {
+        select_config.select_star_weight
+    } else {
+        0
+    };
+    let weights = [
+        star_weight,
+        select_config.column_list_weight,
+        select_config.expression_list_weight,
+    ];
 
-    let min_cols = select_config.min_columns.max(1);
-    let max_cols = select_config
-        .max_columns
-        .min(table.columns.len())
-        .max(min_cols);
-    let num_cols = ctx.gen_range_inclusive(min_cols, max_cols);
-    let mut columns = Vec::with_capacity(num_cols);
+    let strategy = ctx.weighted_index(&weights).unwrap_or(1);
 
-    for i in 0..num_cols {
-        let col = if ctx.gen_bool_with_prob(select_config.column_ref_probability) {
-            // Column reference
-            let table_col = ctx.choose(&table.columns).unwrap();
-            SelectColumn {
-                expr: Expr::column_ref(ctx, None, table_col.name.clone()),
-                alias: if ident_config.generate_column_aliases
-                    && ctx.gen_bool_with_prob(select_config.column_alias_probability)
-                {
-                    Some(format!("{}{i}", ident_config.column_alias_prefix))
-                } else {
-                    None
-                },
+    match strategy {
+        // SELECT *
+        0 => Ok(vec![]),
+        // Column list: random subsequence of table columns
+        1 => {
+            let cols = ctx.subsequence(&table.columns);
+            Ok(cols
+                .into_iter()
+                .map(|col| SelectColumn {
+                    expr: Expr::column_ref(ctx, None, col.name.clone()),
+                    alias: None,
+                })
+                .collect())
+        }
+        // Expression list
+        _ => {
+            let range = &select_config.expression_count_range;
+            let num_cols = ctx.gen_range_inclusive((*range.start()).max(1), *range.end());
+            let mut columns = Vec::with_capacity(num_cols);
+
+            for i in 0..num_cols {
+                let expr = generate_expr(generator, ctx, table, 0)?;
+                columns.push(SelectColumn {
+                    expr,
+                    alias: if ident_config.generate_column_aliases {
+                        Some(format!("{}{i}", ident_config.expr_alias_prefix))
+                    } else {
+                        None
+                    },
+                });
             }
-        } else {
-            // Expression
-            let expr = generate_expr(generator, ctx, table, 0)?;
-            SelectColumn {
-                expr,
-                alias: if ident_config.generate_column_aliases {
-                    Some(format!("{}{i}", ident_config.expr_alias_prefix))
-                } else {
-                    None
-                },
-            }
-        };
-
-        columns.push(col);
+            Ok(columns)
+        }
     }
-
-    Ok(columns)
 }
 
 /// Generate ORDER BY clause.
