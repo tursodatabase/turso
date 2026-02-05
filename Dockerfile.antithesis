@@ -90,6 +90,15 @@ COPY --from=planner /app/sdk-kit ./sdk-kit/
 COPY --from=planner /app/sdk-kit-macros ./sdk-kit-macros/
 COPY --from=planner /app/tools ./tools/
 
+# Remove cdylib and staticlib from this line: `crate-type = ["lib", "cdylib", "staticlib"]`
+# This is because somehow we lose llvm sanitizer coverage if the crate is not just a lib.
+RUN for f in sdk-kit/Cargo.toml sync/sdk-kit/Cargo.toml; do \
+        grep -qF 'crate-type = ["lib", "cdylib", "staticlib"]' "$f" \
+        || { echo "ERROR: expected crate-type not found in $f"; exit 1; }; \
+    done \
+    && sed -i 's/crate-type = \["lib", "cdylib", "staticlib"\]/crate-type = ["lib"]/' \
+        sdk-kit/Cargo.toml sync/sdk-kit/Cargo.toml
+
 RUN if [ "$antithesis" = "true" ]; then \
         cp /opt/antithesis/libvoidstar.so /usr/lib/libvoidstar.so && \
         export RUSTFLAGS="--cfg=tokio_unstable -Ccodegen-units=1 -Cpasses=sancov-module -Cllvm-args=-sanitizer-coverage-level=3 -Cllvm-args=-sanitizer-coverage-trace-pc-guard -Clink-args=-Wl,--build-id -L/usr/lib/ -lvoidstar" && \
