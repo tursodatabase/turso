@@ -9,7 +9,7 @@ repository.workspace = true
 
 [lib]
 doc = false
-crate-type = ["lib", "cdylib", "staticlib"]
+crate-type = ["lib"]
 
 [dependencies]
 env_logger = { workspace = true, default-features = false }
