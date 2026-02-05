@@ -58,7 +58,10 @@ jobs:
         github_token: ${{ secrets.ANTITHESIS_GITHUB_TOKEN }}
         config_image: ${{ secrets.ANTITHESIS_DOCKER_REPO }}/limbo-config:antithesis-latest
         images: ${{ secrets.ANTITHESIS_DOCKER_REPO }}/limbo-workload:antithesis-latest
-        description: "Turso - ${{ github.event_name }} on ${{ github.ref_name }} by ${{ github.actor }}"
+        description: >-
+          Turso - ${{ github.event_name }}
+          on ${{ github.ref_name }} (${{ github.sha }})
+          by ${{ github.actor }}${{ github.event.inputs.test_name && format(' ({0})', github.event.inputs.test_name) || '' }}
         email_recipients: ${{ secrets.ANTITHESIS_EMAIL }}
         test_name: ${{ github.event.inputs.test_name }}
         additional_parameters: |-
