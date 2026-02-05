@@ -1020,18 +1020,8 @@ impl HashTable {
         key_values: Vec<Value>,
         rowid: i64,
         payload_values: Vec<Value>,
-    ) -> Result<IOResult<()>> {
-        self.insert_with_metrics(key_values, rowid, payload_values, None)
-    }
-
-    pub fn insert_with_metrics(
-        &mut self,
-        key_values: Vec<Value>,
-        rowid: i64,
-        payload_values: Vec<Value>,
         metrics: Option<&mut HashJoinMetrics>,
     ) -> Result<IOResult<()>> {
-        let mut metrics = metrics;
         turso_assert!(
             self.state == HashTableState::Building || self.state == HashTableState::Spilled,
             "Cannot insert into hash table in unexpected state",
@@ -1074,7 +1064,7 @@ impl HashTable {
             };
 
             // Spill whole partitions until the new entry fits
-            if let Some(c) = self.spill_partitions_for_entry(entry_size, metrics.as_deref_mut())? {
+            if let Some(c) = self.spill_partitions_for_entry(entry_size, metrics)? {
                 // I/O pending, caller will re-enter after completion and retry the insert.
                 if !c.finished() {
                     return Ok(IOResult::IO(IOCompletions::Single(c)));
@@ -1115,14 +1105,6 @@ impl HashTable {
         &mut self,
         key_values: &[Value],
         key_refs: &[ValueRef],
-    ) -> Result<IOResult<bool>> {
-        self.insert_distinct_with_metrics(key_values, key_refs, None)
-    }
-
-    pub fn insert_distinct_with_metrics(
-        &mut self,
-        key_values: &[Value],
-        key_refs: &[ValueRef],
         mut metrics: Option<&mut HashJoinMetrics>,
     ) -> Result<IOResult<bool>> {
         turso_assert!(
@@ -1154,9 +1136,7 @@ impl HashTable {
                 spill_state.find_partition(partition_idx).is_some()
             };
             if has_partition && !self.is_partition_loaded(partition_idx) {
-                return_if_io!(
-                    self.load_spilled_partition_with_metrics(partition_idx, metrics.as_deref_mut())
-                );
+                return_if_io!(self.load_spilled_partition(partition_idx, metrics.as_deref_mut()));
             }
 
             // Check loaded partition for duplicates
@@ -1219,7 +1199,7 @@ impl HashTable {
                 self.redistribute_to_partitions();
                 self.state = HashTableState::Spilled;
             }
-            return self.insert_distinct_with_metrics(key_values, key_refs, metrics.as_deref_mut());
+            return self.insert_distinct(key_values, key_refs, metrics);
         }
 
         if self.buckets[bucket_idx].entries.is_empty() {
@@ -1367,7 +1347,7 @@ impl HashTable {
         } else {
             let mut new_partition = SpilledPartition::new(partition_idx);
             new_partition.add_chunk(file_offset, data_size, num_entries);
-            if let Some(metrics) = metrics.as_deref_mut() {
+            if let Some(metrics) = metrics {
                 metrics.spill_bytes_written =
                     metrics.spill_bytes_written.saturating_add(data_size as u64);
                 metrics.spill_chunks = metrics.spill_chunks.saturating_add(1);
@@ -1655,11 +1635,7 @@ impl HashTable {
 
     /// Finalize the build phase and prepare for probing.
     /// If spilled, flushes remaining in-memory partition entries to disk.
-    pub fn finalize_build(&mut self) -> Result<IOResult<()>> {
-        self.finalize_build_with_metrics(None)
-    }
-
-    pub fn finalize_build_with_metrics(
+    pub fn finalize_build(
         &mut self,
         metrics: Option<&mut HashJoinMetrics>,
     ) -> Result<IOResult<()>> {
@@ -1720,16 +1696,11 @@ impl HashTable {
     /// Probe the hash table with the given keys, returns the first matching entry if found.
     /// NOTE: Calling `probe` on a spilled table requires the relevant partition to be loaded.
     /// Returns None immediately if any probe key is NULL since NULL != NULL in SQL.
-    pub fn probe(&mut self, probe_keys: Vec<Value>) -> Option<&HashEntry> {
-        self.probe_with_metrics(probe_keys, None)
-    }
-
-    pub fn probe_with_metrics(
+    pub fn probe(
         &mut self,
         probe_keys: Vec<Value>,
         metrics: Option<&mut HashJoinMetrics>,
     ) -> Option<&HashEntry> {
-        let mut metrics = metrics;
         turso_assert!(
             self.state == HashTableState::Probing,
             "Cannot probe hash table in unexpected state",
@@ -1762,7 +1733,7 @@ impl HashTable {
                 spill_state.partitioning
             };
             let target_partition = partitioning.index(hash);
-            self.record_probe_partition(target_partition, metrics.as_deref_mut());
+            self.record_probe_partition(target_partition, metrics);
             self.touch_partition_lru(target_partition);
 
             let bucket_idx = {
@@ -2007,11 +1978,7 @@ impl HashTable {
     }
 
     /// Re-entrantly load spilled partitions from disk
-    pub fn load_spilled_partition(&mut self, partition_idx: usize) -> Result<IOResult<()>> {
-        self.load_spilled_partition_with_metrics(partition_idx, None)
-    }
-
-    pub fn load_spilled_partition_with_metrics(
+    pub fn load_spilled_partition(
         &mut self,
         partition_idx: usize,
         mut metrics: Option<&mut HashJoinMetrics>,
@@ -2113,11 +2080,7 @@ impl HashTable {
                     return Ok(IOResult::Done(()));
                 }
                 SpillAction::NoChunks => {
-                    self.evict_partitions_to_fit_with_metrics(
-                        0,
-                        partition_idx,
-                        metrics.as_deref_mut(),
-                    );
+                    self.evict_partitions_to_fit(0, partition_idx, metrics.as_deref_mut());
                     self.record_partition_resident(partition_idx, 0);
                     self.update_max_loaded_mem(metrics.as_deref_mut());
                     return Ok(IOResult::Done(()));
@@ -2129,7 +2092,7 @@ impl HashTable {
                     match self.parse_partition_chunk(partition_idx, metrics.as_deref_mut())? {
                         ParseChunkResult::MoreChunks => continue,
                         ParseChunkResult::Done { resident_mem } => {
-                            self.evict_partitions_to_fit_with_metrics(
+                            self.evict_partitions_to_fit(
                                 resident_mem,
                                 partition_idx,
                                 metrics.as_deref_mut(),
@@ -2301,17 +2264,8 @@ impl HashTable {
         &mut self,
         partition_idx: usize,
         probe_keys: &[Value],
-    ) -> Option<&HashEntry> {
-        self.probe_partition_with_metrics(partition_idx, probe_keys, None)
-    }
-
-    pub fn probe_partition_with_metrics(
-        &mut self,
-        partition_idx: usize,
-        probe_keys: &[Value],
         metrics: Option<&mut HashJoinMetrics>,
     ) -> Option<&HashEntry> {
-        let mut metrics = metrics;
         // Skip probing if any key is NULL - NULL can never match anything in SQL
         if has_null_key(probe_keys) {
             self.current_probe_keys = Some(probe_keys.to_vec());
@@ -2326,7 +2280,7 @@ impl HashTable {
         self.current_probe_keys = Some(probe_keys.to_vec());
         self.current_probe_hash = Some(hash);
 
-        self.record_probe_partition(partition_idx, metrics.as_deref_mut());
+        self.record_probe_partition(partition_idx, metrics);
         self.touch_partition_lru(partition_idx);
         let spill_state = self.spill_state.as_ref()?;
         let partition = spill_state.find_partition(partition_idx)?;
@@ -2394,18 +2348,12 @@ impl HashTable {
         }
     }
 
-    /// Evict least-recently used spillable partitions until there is room for `incoming_mem`.
-    fn evict_partitions_to_fit(&mut self, incoming_mem: usize, protect_idx: usize) {
-        self.evict_partitions_to_fit_with_metrics(incoming_mem, protect_idx, None);
-    }
-
-    fn evict_partitions_to_fit_with_metrics(
+    fn evict_partitions_to_fit(
         &mut self,
         incoming_mem: usize,
         protect_idx: usize,
-        metrics: Option<&mut HashJoinMetrics>,
+        mut metrics: Option<&mut HashJoinMetrics>,
     ) {
-        let mut metrics = metrics;
         while self.mem_used + self.loaded_partitions_mem + incoming_mem > self.mem_budget {
             let Some(victim_idx) = self.next_evictable(protect_idx) else {
                 break;
@@ -2574,30 +2522,30 @@ mod hashtests {
         let mut ht = HashTable::new(config, io);
 
         // Insert some entries (late materialization - only store rowids)
-        let key1 = vec![Value::from_i64(1)];
-        let _ = ht.insert(key1.clone(), 100, vec![]).unwrap();
+        let key1 = vec![Value::Integer(1)];
+        let _ = ht.insert(key1.clone(), 100, vec![], None).unwrap();
 
-        let key2 = vec![Value::from_i64(2)];
-        let _ = ht.insert(key2.clone(), 200, vec![]).unwrap();
+        let key2 = vec![Value::Integer(2)];
+        let _ = ht.insert(key2.clone(), 200, vec![], None).unwrap();
 
-        let _ = ht.finalize_build();
+        let _ = ht.finalize_build(None);
 
         // Probe for key1
-        let result = ht.probe(key1);
+        let result = ht.probe(key1.clone(), None);
         assert!(result.is_some());
         let entry1 = result.unwrap();
         assert_eq!(entry1.key_values[0].as_ref(), ValueRef::from_i64(1));
         assert_eq!(entry1.rowid, 100);
 
         // Probe for key2
-        let result = ht.probe(key2);
+        let result = ht.probe(key2, None);
         assert!(result.is_some());
         let entry2 = result.unwrap();
         assert_eq!(entry2.key_values[0].as_ref(), ValueRef::from_i64(2));
         assert_eq!(entry2.rowid, 200);
 
         // Probe for non-existent key
-        let result = ht.probe(vec![Value::from_i64(999)]);
+        let result = ht.probe(vec![Value::Integer(999)], None);
         assert!(result.is_none());
     }
 
@@ -2617,15 +2565,15 @@ mod hashtests {
 
         // Insert multiple entries (late materialization - only store rowids)
         for i in 0..10 {
-            let key = vec![Value::from_i64(i)];
-            let _ = ht.insert(key, i * 100, vec![]).unwrap();
+            let key = vec![Value::Integer(i)];
+            let _ = ht.insert(key, i * 100, vec![], None).unwrap();
         }
 
-        let _ = ht.finalize_build();
+        let _ = ht.finalize_build(None);
 
         // Verify all entries can be found
         for i in 0..10 {
-            let result = ht.probe(vec![Value::from_i64(i)]);
+            let result = ht.probe(vec![Value::Integer(i)], None);
             assert!(result.is_some());
             let entry = result.unwrap();
             assert_eq!(entry.key_values[0].as_ref(), ValueRef::from_i64(i));
@@ -2650,13 +2598,13 @@ mod hashtests {
         // Insert multiple entries with the same key
         let key = vec![Value::from_i64(42)];
         for i in 0..3 {
-            let _ = ht.insert(key.clone(), 1000 + i, vec![]).unwrap();
+            let _ = ht.insert(key.clone(), 1000 + i, vec![], None).unwrap();
         }
 
-        let _ = ht.finalize_build();
+        let _ = ht.finalize_build(None);
 
         // Probe should return first match
-        let result = ht.probe(key);
+        let result = ht.probe(key.clone(), None);
         assert!(result.is_some());
         assert_eq!(result.unwrap().rowid, 1000);
 
@@ -2821,7 +2769,7 @@ mod hashtests {
         };
         let mut ht = HashTable::new(config, io);
         insert_many_force_spill(&mut ht, 0, 1024);
-        let _ = ht.finalize_build().unwrap();
+        let _ = ht.finalize_build(None).unwrap();
         assert!(ht.has_spilled());
 
         let spill_state = ht.spill_state.as_ref().expect("spill state exists");
@@ -2842,7 +2790,7 @@ mod hashtests {
         };
         let mut ht = HashTable::new(config, io);
         insert_many_force_spill(&mut ht, 0, 1024);
-        let _ = ht.finalize_build().unwrap();
+        let _ = ht.finalize_build(None).unwrap();
         assert!(ht.has_spilled());
 
         let spill_state = ht.spill_state.as_ref().expect("spill state exists");
@@ -2868,13 +2816,13 @@ mod hashtests {
 
         let key = vec![Value::Integer(1)];
         for i in 0..2048 {
-            match ht.insert(key.clone(), i, vec![]).unwrap() {
+            match ht.insert(key.clone(), i, vec![], None).unwrap() {
                 IOResult::Done(()) => {}
                 IOResult::IO(_) => panic!("memory IO"),
             }
         }
 
-        match ht.finalize_build().unwrap() {
+        match ht.finalize_build(None).unwrap() {
             IOResult::Done(()) => {}
             IOResult::IO(_) => panic!("memory IO"),
         }
@@ -2889,10 +2837,10 @@ mod hashtests {
             assert!(partition.chunks.len() > 1, "expected multiple spill chunks");
         }
 
-        while let IOResult::IO(_) = ht.load_spilled_partition(partition_idx).unwrap() {}
+        while let IOResult::IO(_) = ht.load_spilled_partition(partition_idx, None).unwrap() {}
         assert!(ht.is_partition_loaded(partition_idx));
 
-        let entry = ht.probe_partition(partition_idx, &key).unwrap();
+        let entry = ht.probe_partition(partition_idx, &key, None).unwrap();
         assert_eq!(entry.rowid, 0);
 
         let mut matches = 1usize;
@@ -2933,7 +2881,7 @@ mod hashtests {
         ht.spill_state = Some(spill_state);
         ht.state = HashTableState::Probing;
 
-        while let IOResult::IO(_) = ht.load_spilled_partition(0).unwrap() {}
+        while let IOResult::IO(_) = ht.load_spilled_partition(0, None).unwrap() {}
         assert!(ht.is_partition_loaded(0));
     }
 
@@ -2984,7 +2932,7 @@ mod hashtests {
 
         let mut saw_err = false;
         loop {
-            match ht.load_spilled_partition(0) {
+            match ht.load_spilled_partition(0, None) {
                 Ok(IOResult::Done(())) => break,
                 Ok(IOResult::IO(_)) => continue,
                 Err(_) => {
@@ -3115,8 +3063,8 @@ mod hashtests {
     fn insert_many_force_spill(ht: &mut HashTable, start: i64, count: i64) {
         for i in 0..count {
             let rowid = start + i;
-            let key = vec![Value::from_i64(rowid)];
-            let _ = ht.insert(key, rowid, vec![]);
+            let key = vec![Value::Integer(rowid)];
+            let _ = ht.insert(key, rowid, vec![], None);
         }
     }
 
@@ -3138,7 +3086,7 @@ mod hashtests {
         // Insert enough fat rows to exceed budget and force spills
         insert_many_force_spill(&mut ht, 0, 1024);
 
-        let _ = ht.finalize_build().unwrap();
+        let _ = ht.finalize_build(None).unwrap();
         assert!(ht.has_spilled(), "hash table should have spilled");
 
         // Pick a key and find its partition
@@ -3146,7 +3094,7 @@ mod hashtests {
         let partition_idx = ht.partition_for_keys(&probe_key);
 
         // Load that partition into memory
-        match ht.load_spilled_partition(partition_idx).unwrap() {
+        match ht.load_spilled_partition(partition_idx, None).unwrap() {
             IOResult::Done(()) => {}
             IOResult::IO(_) => panic!("test harness must drive IO completions here"),
         }
@@ -3157,7 +3105,7 @@ mod hashtests {
         );
 
         // Probe via partition API
-        let entry = ht.probe_partition(partition_idx, &probe_key);
+        let entry = ht.probe_partition(partition_idx, &probe_key, None);
         assert!(entry.is_some()); // here
         assert_eq!(entry.unwrap().rowid, 10);
     }
@@ -3181,7 +3129,7 @@ mod hashtests {
         insert_many_force_spill(&mut ht, 0, 256);
         insert_many_force_spill(&mut ht, 256, 1024);
 
-        let _ = ht.finalize_build().unwrap();
+        let _ = ht.finalize_build(None).unwrap();
         assert!(ht.has_spilled());
 
         let key_a = vec![Value::from_i64(1)];
@@ -3191,11 +3139,11 @@ mod hashtests {
         assert_ne!(pa, pb);
 
         // Load partition A
-        while let IOResult::IO(_) = ht.load_spilled_partition(pa).unwrap() {}
+        while let IOResult::IO(_) = ht.load_spilled_partition(pa, None).unwrap() {}
         assert!(ht.is_partition_loaded(pa));
 
         // Now load partition B, this should (under tight memory) evict A
-        let _ = ht.load_spilled_partition(pb).unwrap();
+        let _ = ht.load_spilled_partition(pb, None).unwrap();
         assert!(ht.is_partition_loaded(pb));
 
         // Depending on mem_budget and actual entry sizes, A should now be evicted
@@ -3223,12 +3171,12 @@ mod hashtests {
 
         let key = vec![Value::from_i64(42)];
         for i in 0..1024 {
-            match ht.insert(key.clone(), 1000 + i, vec![]).unwrap() {
+            match ht.insert(key.clone(), 1000 + i, vec![], None).unwrap() {
                 IOResult::Done(()) => {}
                 IOResult::IO(_) => panic!("memory IO"),
             }
         }
-        match ht.finalize_build().unwrap() {
+        match ht.finalize_build(None).unwrap() {
             IOResult::Done(()) => {}
             IOResult::IO(_) => panic!("memory IO"),
         }
@@ -3236,14 +3184,14 @@ mod hashtests {
         assert!(ht.has_spilled());
         let partition_idx = ht.partition_for_keys(&key);
 
-        match ht.load_spilled_partition(partition_idx).unwrap() {
+        match ht.load_spilled_partition(partition_idx, None).unwrap() {
             IOResult::Done(()) => {}
             IOResult::IO(_) => panic!("memory IO"),
         }
         assert!(ht.is_partition_loaded(partition_idx));
 
         // First probe should give us the first rowid
-        let entry1 = ht.probe_partition(partition_idx, &key).unwrap();
+        let entry1 = ht.probe_partition(partition_idx, &key, None).unwrap();
         assert_eq!(entry1.rowid, 1000);
 
         // Then iterate through the rest with next_match
@@ -3275,7 +3223,9 @@ mod hashtests {
             Value::from_i64(30),
             Value::from_f64(1000.50),
         ];
-        let _ = ht.insert(key1.clone(), 100, payload1).unwrap();
+        let _ = ht
+            .insert(key1.clone(), 100, payload1.clone(), None)
+            .unwrap();
 
         let key2 = vec![Value::from_i64(2)];
         let payload2 = vec![
@@ -3283,12 +3233,14 @@ mod hashtests {
             Value::from_i64(25),
             Value::from_f64(2000.75),
         ];
-        let _ = ht.insert(key2.clone(), 200, payload2).unwrap();
+        let _ = ht
+            .insert(key2.clone(), 200, payload2.clone(), None)
+            .unwrap();
 
-        let _ = ht.finalize_build();
+        let _ = ht.finalize_build(None);
 
         // Probe and verify payload is returned correctly
-        let result = ht.probe(key1);
+        let result = ht.probe(key1, None);
         assert!(result.is_some());
         let entry1 = result.unwrap();
         assert_eq!(entry1.rowid, 100);
@@ -3298,7 +3250,7 @@ mod hashtests {
         assert_eq!(entry1.payload_values[1], Value::from_i64(30));
         assert_eq!(entry1.payload_values[2], Value::from_f64(1000.50));
 
-        let result = ht.probe(key2);
+        let result = ht.probe(key2, None);
         assert!(result.is_some());
         let entry2 = result.unwrap();
         assert_eq!(entry2.rowid, 200);
@@ -3325,11 +3277,11 @@ mod hashtests {
         // Insert entry with NULL values in payload
         let key = vec![Value::from_i64(1)];
         let payload = vec![Value::Null, Value::Text("test".into()), Value::Null];
-        let _ = ht.insert(key.clone(), 100, payload).unwrap();
+        let _ = ht.insert(key.clone(), 100, payload, None).unwrap();
 
-        let _ = ht.finalize_build();
+        let _ = ht.finalize_build(None);
 
-        let result = ht.probe(key);
+        let result = ht.probe(key, None);
         assert!(result.is_some());
         let entry = result.unwrap();
         assert_eq!(entry.payload_values.len(), 3);
@@ -3355,33 +3307,33 @@ mod hashtests {
         let mut ht = HashTable::new(config, io);
 
         // Insert entry with NULL key - should be silently skipped
-        let null_key = vec![Value::Null, Value::from_i64(1)];
-        let _ = ht.insert(null_key.clone(), 100, vec![]).unwrap();
+        let null_key = vec![Value::Null, Value::Integer(1)];
+        let _ = ht.insert(null_key.clone(), 100, vec![], None).unwrap();
 
         // Insert entry with non-NULL keys
-        let valid_key = vec![Value::from_i64(1), Value::from_i64(2)];
-        let _ = ht.insert(valid_key.clone(), 200, vec![]).unwrap();
+        let valid_key = vec![Value::Integer(1), Value::Integer(2)];
+        let _ = ht.insert(valid_key.clone(), 200, vec![], None).unwrap();
 
         // Insert another entry where second key is NULL
-        let null_key2 = vec![Value::from_i64(1), Value::Null];
-        let _ = ht.insert(null_key2.clone(), 300, vec![]).unwrap();
+        let null_key2 = vec![Value::Integer(1), Value::Null];
+        let _ = ht.insert(null_key2.clone(), 300, vec![], None).unwrap();
 
-        let _ = ht.finalize_build();
+        let _ = ht.finalize_build(None);
 
         // Only one entry should be in the table (the one with valid keys)
         assert_eq!(ht.num_entries, 1);
 
         // Probing with NULL key should return None
-        let result = ht.probe(null_key);
+        let result = ht.probe(null_key, None);
         assert!(result.is_none());
 
         // Probing with valid key should return the entry
-        let result = ht.probe(valid_key);
+        let result = ht.probe(valid_key, None);
         assert!(result.is_some());
         assert_eq!(result.unwrap().rowid, 200);
 
         // Probing with NULL in second position should also return None
-        let result = ht.probe(null_key2);
+        let result = ht.probe(null_key2, None);
         assert!(result.is_none());
     }
 
@@ -3402,12 +3354,12 @@ mod hashtests {
         // Insert entry with blob payload
         let key = vec![Value::from_i64(1)];
         let blob_data = vec![0xDE, 0xAD, 0xBE, 0xEF];
-        let payload = vec![Value::Blob(blob_data.clone()), Value::from_i64(42)];
-        let _ = ht.insert(key.clone(), 100, payload).unwrap();
+        let payload = vec![Value::Blob(blob_data.clone()), Value::Integer(42)];
+        let _ = ht.insert(key.clone(), 100, payload, None).unwrap();
 
-        let _ = ht.finalize_build();
+        let _ = ht.finalize_build(None);
 
-        let result = ht.probe(key);
+        let result = ht.probe(key, None);
         assert!(result.is_some());
         let entry = result.unwrap();
         assert_eq!(entry.payload_values.len(), 2);
@@ -3435,28 +3387,31 @@ mod hashtests {
             .insert(
                 key.clone(),
                 100,
-                vec![Value::Text("first".into()), Value::from_i64(1)],
+                vec![Value::Text("first".into()), Value::Integer(1)],
+                None,
             )
             .unwrap();
         let _ = ht
             .insert(
                 key.clone(),
                 200,
-                vec![Value::Text("second".into()), Value::from_i64(2)],
+                vec![Value::Text("second".into()), Value::Integer(2)],
+                None,
             )
             .unwrap();
         let _ = ht
             .insert(
                 key.clone(),
                 300,
-                vec![Value::Text("third".into()), Value::from_i64(3)],
+                vec![Value::Text("third".into()), Value::Integer(3)],
+                None,
             )
             .unwrap();
 
-        let _ = ht.finalize_build();
+        let _ = ht.finalize_build(None);
 
         // First probe should return first match
-        let result = ht.probe(key);
+        let result = ht.probe(key, None);
         assert!(result.is_some());
         let entry1 = result.unwrap();
         assert_eq!(entry1.rowid, 100);
