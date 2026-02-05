@@ -48,6 +48,18 @@ pub struct Policy {
     /// Configuration for ALTER TABLE statement generation.
     pub alter_table_config: AlterTableConfig,
 
+    /// Configuration for CREATE TABLE statement generation.
+    pub create_table_config: CreateTableConfig,
+
+    /// Configuration for DROP TABLE statement generation.
+    pub drop_table_config: DropTableConfig,
+
+    /// Configuration for CREATE INDEX statement generation.
+    pub create_index_config: CreateIndexConfig,
+
+    /// Configuration for DROP INDEX statement generation.
+    pub drop_index_config: DropIndexConfig,
+
     /// Configuration for trigger generation.
     pub trigger_config: TriggerConfig,
 
@@ -94,6 +106,10 @@ impl Default for Policy {
             identifier_config: IdentifierConfig::default(),
             expr_config: ExprConfig::default(),
             alter_table_config: AlterTableConfig::default(),
+            create_table_config: CreateTableConfig::default(),
+            drop_table_config: DropTableConfig::default(),
+            create_index_config: CreateIndexConfig::default(),
+            drop_index_config: DropIndexConfig::default(),
             trigger_config: TriggerConfig::default(),
             function_config: FunctionConfig::default(),
             max_expr_depth: 4,
@@ -193,6 +209,30 @@ impl Policy {
     /// Builder method to set ALTER TABLE configuration.
     pub fn with_alter_table_config(mut self, config: AlterTableConfig) -> Self {
         self.alter_table_config = config;
+        self
+    }
+
+    /// Builder method to set CREATE TABLE configuration.
+    pub fn with_create_table_config(mut self, config: CreateTableConfig) -> Self {
+        self.create_table_config = config;
+        self
+    }
+
+    /// Builder method to set DROP TABLE configuration.
+    pub fn with_drop_table_config(mut self, config: DropTableConfig) -> Self {
+        self.drop_table_config = config;
+        self
+    }
+
+    /// Builder method to set CREATE INDEX configuration.
+    pub fn with_create_index_config(mut self, config: CreateIndexConfig) -> Self {
+        self.create_index_config = config;
+        self
+    }
+
+    /// Builder method to set DROP INDEX configuration.
+    pub fn with_drop_index_config(mut self, config: DropIndexConfig) -> Self {
+        self.drop_index_config = config;
         self
     }
 
@@ -808,6 +848,12 @@ pub struct SelectConfig {
     /// Maximum offset value.
     pub max_offset: u64,
 
+    /// Probability of WHERE clause in simple/subquery SELECT.
+    pub subquery_where_probability: f64,
+
+    /// Probability of choosing a column ref vs expression in SELECT columns.
+    pub column_ref_probability: f64,
+
     /// Order direction weights.
     pub order_direction_weights: OrderDirectionWeights,
 
@@ -831,6 +877,8 @@ impl Default for SelectConfig {
             table_alias_probability: 0.3,
             column_alias_probability: 0.2,
             max_offset: 100,
+            subquery_where_probability: 0.5,
+            column_ref_probability: 0.7,
             order_direction_weights: OrderDirectionWeights::default(),
             nulls_order_weights: NullsOrderWeights::default(),
         }
@@ -1039,10 +1087,22 @@ impl DeleteConfig {
 // =============================================================================
 
 /// Configuration for ALTER TABLE statement generation.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct AlterTableConfig {
     /// Weights for ALTER TABLE actions.
     pub action_weights: AlterTableActionWeights,
+
+    /// Probability of NOT NULL constraint when adding a column.
+    pub not_null_probability: f64,
+}
+
+impl Default for AlterTableConfig {
+    fn default() -> Self {
+        Self {
+            action_weights: AlterTableActionWeights::default(),
+            not_null_probability: 0.3,
+        }
+    }
 }
 
 /// Weights for ALTER TABLE actions.
@@ -1061,6 +1121,106 @@ impl Default for AlterTableActionWeights {
             add_column: 40,
             drop_column: 20,
             rename_column: 20,
+        }
+    }
+}
+
+// =============================================================================
+// CREATE TABLE Configuration
+// =============================================================================
+
+/// Configuration for CREATE TABLE statement generation.
+#[derive(Debug, Clone)]
+pub struct CreateTableConfig {
+    /// Minimum number of columns (excluding the primary key).
+    pub min_columns: usize,
+
+    /// Maximum number of columns (excluding the primary key).
+    pub max_columns: usize,
+
+    /// Probability of NOT NULL constraint on a column.
+    pub not_null_probability: f64,
+
+    /// Probability of UNIQUE constraint on a column (only if not NOT NULL).
+    pub unique_probability: f64,
+
+    /// Probability of IF NOT EXISTS clause.
+    pub if_not_exists_probability: f64,
+}
+
+impl Default for CreateTableConfig {
+    fn default() -> Self {
+        Self {
+            min_columns: 2,
+            max_columns: 6,
+            not_null_probability: 0.3,
+            unique_probability: 0.1,
+            if_not_exists_probability: 0.5,
+        }
+    }
+}
+
+// =============================================================================
+// DROP TABLE Configuration
+// =============================================================================
+
+/// Configuration for DROP TABLE statement generation.
+#[derive(Debug, Clone)]
+pub struct DropTableConfig {
+    /// Probability of IF EXISTS clause.
+    pub if_exists_probability: f64,
+}
+
+impl Default for DropTableConfig {
+    fn default() -> Self {
+        Self {
+            if_exists_probability: 0.5,
+        }
+    }
+}
+
+// =============================================================================
+// CREATE INDEX Configuration
+// =============================================================================
+
+/// Configuration for CREATE INDEX statement generation.
+#[derive(Debug, Clone)]
+pub struct CreateIndexConfig {
+    /// Maximum number of columns in the index.
+    pub max_columns: usize,
+
+    /// Probability of UNIQUE index.
+    pub unique_probability: f64,
+
+    /// Probability of IF NOT EXISTS clause.
+    pub if_not_exists_probability: f64,
+}
+
+impl Default for CreateIndexConfig {
+    fn default() -> Self {
+        Self {
+            max_columns: 3,
+            unique_probability: 0.2,
+            if_not_exists_probability: 0.5,
+        }
+    }
+}
+
+// =============================================================================
+// DROP INDEX Configuration
+// =============================================================================
+
+/// Configuration for DROP INDEX statement generation.
+#[derive(Debug, Clone)]
+pub struct DropIndexConfig {
+    /// Probability of IF EXISTS clause.
+    pub if_exists_probability: f64,
+}
+
+impl Default for DropIndexConfig {
+    fn default() -> Self {
+        Self {
+            if_exists_probability: 0.7,
         }
     }
 }
@@ -1204,6 +1364,12 @@ pub struct IdentifierConfig {
 
     /// Maximum length for generated identifiers.
     pub max_identifier_length: usize,
+
+    /// Range for alias suffix numbers (e.g., t0-t999 with range 1000).
+    pub alias_suffix_range: usize,
+
+    /// Range for generated name suffix numbers (e.g., trg_users_0 to trg_users_9999 with range 10000).
+    pub name_suffix_range: usize,
 }
 
 impl Default for IdentifierConfig {
@@ -1215,6 +1381,8 @@ impl Default for IdentifierConfig {
             column_alias_prefix: "col".to_string(),
             expr_alias_prefix: "expr".to_string(),
             max_identifier_length: 64,
+            alias_suffix_range: 1000,
+            name_suffix_range: 10000,
         }
     }
 }
@@ -1252,6 +1420,9 @@ pub struct ExprConfig {
     /// Minimum number of WHEN clauses in CASE expression.
     pub case_min_branches: usize,
 
+    /// Maximum depth for compound conditions (AND/OR nesting).
+    pub max_compound_condition_depth: usize,
+
     /// Weights for binary operator categories (comparison, logical, arithmetic).
     pub binop_category_weights: BinOpCategoryWeights,
 
@@ -1267,6 +1438,7 @@ impl Default for ExprConfig {
             in_list_negation_probability: 0.3,
             case_else_probability: 0.5,
             case_min_branches: 1,
+            max_compound_condition_depth: 3,
             binop_category_weights: BinOpCategoryWeights::default(),
             compound_op_weights: CompoundOpWeights::default(),
         }

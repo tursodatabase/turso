@@ -72,7 +72,7 @@ pub fn generate_select_for_table<C: Capabilities>(
         Some(format!(
             "{}{}",
             ident_config.table_alias_prefix,
-            ctx.gen_range(1000)
+            ctx.gen_range(ident_config.alias_suffix_range)
         ))
     } else {
         None
@@ -97,6 +97,8 @@ pub fn generate_simple_select<C: Capabilities>(
     ctx: &mut Context,
     table: &Table,
 ) -> Result<SelectStmt, GenError> {
+    let select_config = &generator.policy().select_config;
+
     // Pick one column
     let col = ctx
         .choose(&table.columns)
@@ -108,7 +110,7 @@ pub fn generate_simple_select<C: Capabilities>(
     }];
 
     // Maybe add WHERE
-    let where_clause = if ctx.gen_bool_with_prob(0.5) {
+    let where_clause = if ctx.gen_bool_with_prob(select_config.subquery_where_probability) {
         Some(generate_condition(generator, ctx, table)?)
     } else {
         None
@@ -154,7 +156,7 @@ fn generate_select_columns<C: Capabilities>(
     let mut columns = Vec::with_capacity(num_cols);
 
     for i in 0..num_cols {
-        let col = if ctx.gen_bool_with_prob(0.7) {
+        let col = if ctx.gen_bool_with_prob(select_config.column_ref_probability) {
             // Column reference
             let table_col = ctx.choose(&table.columns).unwrap();
             SelectColumn {

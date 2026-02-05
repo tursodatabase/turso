@@ -507,7 +507,7 @@ fn build_condition_candidates<C: Capabilities>(
     ];
 
     // Compound conditions with AND/OR (limited depth to avoid deep nesting)
-    if ctx.depth() < 3 {
+    if ctx.depth() < generator.policy().expr_config.max_compound_condition_depth {
         candidates.push((CondType::Compound, weights.binary_op));
     }
 
@@ -766,7 +766,10 @@ mod tests {
                 }
             }
         }
-        println!("=== Found {} statements with function calls ===\n", function_count);
-        assert!(function_count > 0, "Should have generated some function calls");
+        println!("=== Found {function_count} statements with function calls ===\n");
+        assert!(
+            function_count > 0,
+            "Should have generated some function calls"
+        );
     }
 }
