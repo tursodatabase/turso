@@ -113,8 +113,8 @@ impl Default for Policy {
             drop_index_config: DropIndexConfig::default(),
             trigger_config: TriggerConfig::default(),
             function_config: FunctionConfig::default(),
-            max_expr_depth: 4,
-            max_subquery_depth: 2,
+            max_expr_depth: 6,
+            max_subquery_depth: 3,
             max_tables: 3,
             max_limit: 1000,
             max_in_list_size: 10,
@@ -496,19 +496,19 @@ pub struct ExprWeights {
 impl Default for ExprWeights {
     fn default() -> Self {
         Self {
-            column_ref: 30,
-            literal: 25,
-            binary_op: 15,
-            unary_op: 5,
-            function_call: 10,
-            subquery: 3,
-            case_expr: 3,
-            cast: 3,
-            between: 5,
-            in_list: 5,
-            in_subquery: 3,
-            is_null: 6,
-            exists: 3,
+            column_ref: 20,
+            literal: 15,
+            binary_op: 20,
+            unary_op: 8,
+            function_call: 15,
+            subquery: 5,
+            case_expr: 7,
+            cast: 5,
+            between: 2,
+            in_list: 2,
+            in_subquery: 5,
+            is_null: 1,
+            exists: 5,
         }
     }
 }
@@ -554,22 +554,22 @@ impl ExprWeights {
         }
     }
 
-    /// Create complex expression weights.
+    /// Create complex expression weights (even heavier on subqueries and nesting).
     pub fn complex() -> Self {
         Self {
-            column_ref: 20,
-            literal: 15,
+            column_ref: 15,
+            literal: 10,
             binary_op: 20,
             unary_op: 8,
             function_call: 15,
-            subquery: 5,
-            case_expr: 7,
+            subquery: 8,
+            case_expr: 8,
             cast: 5,
             between: 2,
             in_list: 2,
-            in_subquery: 5,
+            in_subquery: 8,
             is_null: 1,
-            exists: 5,
+            exists: 8,
         }
     }
 }
@@ -909,13 +909,13 @@ impl Default for SelectConfig {
             column_list_weight: 5,
             expression_list_weight: 3,
             expression_count_range: 1..=5,
-            where_probability: 0.7,
-            order_by_probability: 0.3,
-            limit_probability: 0.4,
-            offset_probability: 0.2,
-            group_by_probability: 0.0, // Disabled by default
-            having_probability: 0.3,
-            distinct_probability: 0.1,
+            where_probability: 0.9,
+            order_by_probability: 0.7,
+            limit_probability: 0.6,
+            offset_probability: 0.4,
+            group_by_probability: 0.3,
+            having_probability: 0.5,
+            distinct_probability: 0.2,
             table_alias_probability: 0.3,
             column_alias_probability: 0.2,
             max_offset: 100,
@@ -944,13 +944,13 @@ impl SelectConfig {
     /// Create config with all optional clauses highly likely.
     pub fn complex() -> Self {
         Self {
-            where_probability: 0.9,
-            order_by_probability: 0.7,
-            limit_probability: 0.6,
-            offset_probability: 0.4,
-            group_by_probability: 0.3,
-            having_probability: 0.5,
-            distinct_probability: 0.2,
+            where_probability: 0.95,
+            order_by_probability: 0.8,
+            limit_probability: 0.7,
+            offset_probability: 0.5,
+            group_by_probability: 0.5,
+            having_probability: 0.6,
+            distinct_probability: 0.3,
             ..Default::default()
         }
     }
@@ -1696,8 +1696,8 @@ mod tests {
     #[test]
     fn test_default_policy() {
         let policy = Policy::default();
-        assert_eq!(policy.max_expr_depth, 4);
-        assert_eq!(policy.max_subquery_depth, 2);
+        assert_eq!(policy.max_expr_depth, 6);
+        assert_eq!(policy.max_subquery_depth, 3);
         assert!(policy.generate_aliases());
     }
 
