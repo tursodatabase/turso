@@ -1100,6 +1100,9 @@ pub struct UpdateConfig {
 
     /// Probability of using UPDATE OR IGNORE.
     pub or_ignore_probability: f64,
+
+    /// Probability of including a primary key column in SET clauses.
+    pub primary_key_update_probability: f64,
 }
 
 impl Default for UpdateConfig {
@@ -1110,6 +1113,7 @@ impl Default for UpdateConfig {
             where_probability: 0.8,
             or_replace_probability: 0.0,
             or_ignore_probability: 0.0,
+            primary_key_update_probability: 0.1,
         }
     }
 }
