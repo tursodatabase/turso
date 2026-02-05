@@ -389,11 +389,32 @@ fn generate_alter_table_action<C: Capabilities>(
     config: &AlterTableConfig,
 ) -> Result<AlterTableAction, GenError> {
     let weights = &config.action_weights;
+
+    // Check which actions are possible
+    let droppable_columns: Vec<_> = table.columns.iter().filter(|c| !c.primary_key).collect();
+    let can_drop_column = !droppable_columns.is_empty();
+    let can_rename_column = !table.columns.is_empty();
+
+    // Build weights, disabling impossible actions
     let items = [
         (AlterTableActionKind::RenameTo, weights.rename_table),
         (AlterTableActionKind::AddColumn, weights.add_column),
-        (AlterTableActionKind::DropColumn, weights.drop_column),
-        (AlterTableActionKind::RenameColumn, weights.rename_column),
+        (
+            AlterTableActionKind::DropColumn,
+            if can_drop_column {
+                weights.drop_column
+            } else {
+                0
+            },
+        ),
+        (
+            AlterTableActionKind::RenameColumn,
+            if can_rename_column {
+                weights.rename_column
+            } else {
+                0
+            },
+        ),
     ];
 
     let weight_vec: Vec<u32> = items.iter().map(|(_, w)| *w).collect();
@@ -407,8 +428,7 @@ fn generate_alter_table_action<C: Capabilities>(
 
     match items[idx].0 {
         AlterTableActionKind::RenameTo => {
-            let new_name =
-                ctx.gen_unique_name_excluding("tbl", &existing_table_names, &table.name);
+            let new_name = ctx.gen_unique_name_excluding("tbl", &existing_table_names, &table.name);
             Ok(AlterTableAction::RenameTo(new_name))
         }
         AlterTableActionKind::AddColumn => {
@@ -433,27 +453,10 @@ fn generate_alter_table_action<C: Capabilities>(
             }))
         }
         AlterTableActionKind::DropColumn => {
-            // Pick a non-primary-key column to drop
-            let droppable: Vec<_> = table.columns.iter().filter(|c| !c.primary_key).collect();
-
-            if droppable.is_empty() {
-                // Fall back to RenameTo if no droppable columns
-                let new_name =
-                    ctx.gen_unique_name_excluding("tbl", &existing_table_names, &table.name);
-                return Ok(AlterTableAction::RenameTo(new_name));
-            }
-
-            let col = ctx.choose(&droppable).unwrap();
+            let col = ctx.choose(&droppable_columns).unwrap();
             Ok(AlterTableAction::DropColumn(col.name.clone()))
         }
         AlterTableActionKind::RenameColumn => {
-            if table.columns.is_empty() {
-                // Fall back to RenameTo if no columns
-                let new_name =
-                    ctx.gen_unique_name_excluding("tbl", &existing_table_names, &table.name);
-                return Ok(AlterTableAction::RenameTo(new_name));
-            }
-
             let col = ctx.choose(&table.columns).unwrap();
             let new_name = ctx.gen_unique_name("col", &existing_col_names);
 
