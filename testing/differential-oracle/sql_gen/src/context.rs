@@ -220,14 +220,21 @@ impl Context {
         Some(weights.len().saturating_sub(1))
     }
 
-    /// Select a random subsequence of `items` with length in `1..=items.len()`.
+    /// Select a random subsequence of `items` with length in the given range,
+    /// clamped to `1..=items.len()`.
     ///
     /// Returns elements in their original order (stable selection).
-    pub fn subsequence<T: Clone>(&mut self, items: &[T]) -> Vec<T> {
+    pub fn subsequence<T: Clone>(
+        &mut self,
+        items: &[T],
+        range: std::ops::RangeInclusive<usize>,
+    ) -> Vec<T> {
         if items.is_empty() {
             return vec![];
         }
-        let count = self.gen_range_inclusive(1, items.len());
+        let min = (*range.start()).max(1).min(items.len());
+        let max = (*range.end()).min(items.len()).max(min);
+        let count = self.gen_range_inclusive(min, max);
         // Fisher-Yates partial shuffle on indices, then sort to preserve order
         let mut indices: Vec<usize> = (0..items.len()).collect();
         for i in 0..count {

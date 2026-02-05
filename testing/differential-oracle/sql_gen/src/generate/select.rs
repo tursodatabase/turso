@@ -1,10 +1,13 @@
 //! SELECT statement generation.
 
 use crate::SqlGen;
-use crate::ast::{Expr, OrderByItem, OrderDirection, SelectColumn, SelectStmt};
+use crate::ast::{
+    BinOp, Expr, GroupByClause, OrderByItem, OrderDirection, SelectColumn, SelectStmt,
+};
 use crate::capabilities::Capabilities;
 use crate::context::Context;
 use crate::error::GenError;
+use crate::functions::AGGREGATE_FUNCTIONS;
 use crate::generate::expr::{generate_condition, generate_expr};
 use crate::generate::literal::generate_literal;
 use crate::schema::{DataType, Table};
@@ -51,12 +54,12 @@ pub fn generate_tableless_select<C: Capabilities>(
     }
 
     Ok(SelectStmt {
+        distinct: false,
         columns,
         from: None,
         from_alias: None,
         where_clause: None,
-        group_by: vec![],
-        having: None,
+        group_by: None,
         order_by: vec![],
         limit: None,
         offset: None,
@@ -73,8 +76,19 @@ pub fn generate_select_for_table<C: Capabilities>(
     let select_config = &generator.policy().select_config;
     let ident_config = &generator.policy().identifier_config;
 
-    // Generate columns
-    let columns = generate_select_columns(generator, ctx, table)?;
+    // Generate optional GROUP BY (with optional HAVING)
+    let group_by = if ctx.gen_bool_with_prob(select_config.group_by_probability) {
+        Some(generate_group_by_clause(generator, ctx, table)?)
+    } else {
+        None
+    };
+
+    // Generate columns — dispatch based on GROUP BY
+    let columns = if let Some(gb) = &group_by {
+        generate_grouped_select_columns(generator, ctx, table, &gb.exprs)?
+    } else {
+        generate_select_columns(generator, ctx, table)?
+    };
 
     // Generate optional WHERE clause
     let where_clause = if ctx.gen_bool_with_prob(select_config.where_probability) {
@@ -83,12 +97,19 @@ pub fn generate_select_for_table<C: Capabilities>(
         None
     };
 
-    // Generate optional ORDER BY
+    // Generate optional ORDER BY — dispatch based on GROUP BY
     let order_by = if ctx.gen_bool_with_prob(select_config.order_by_probability) {
-        generate_order_by(generator, ctx, table)?
+        if let Some(gb) = &group_by {
+            generate_grouped_order_by(generator, ctx, table, &gb.exprs)?
+        } else {
+            generate_order_by(generator, ctx, table)?
+        }
     } else {
         vec![]
     };
+
+    // Generate optional DISTINCT
+    let distinct = ctx.gen_bool_with_prob(select_config.distinct_probability);
 
     // Generate optional LIMIT
     let limit = if ctx.gen_bool_with_prob(select_config.limit_probability) {
@@ -118,12 +139,12 @@ pub fn generate_select_for_table<C: Capabilities>(
     };
 
     Ok(SelectStmt {
+        distinct,
         columns,
         from: Some(table.name.clone()),
         from_alias,
         where_clause,
-        group_by: vec![],
-        having: None,
+        group_by,
         order_by,
         limit,
         offset,
@@ -157,16 +178,155 @@ pub fn generate_simple_select<C: Capabilities>(
 
     // Always add LIMIT 1 for scalar subqueries
     Ok(SelectStmt {
+        distinct: false,
         columns,
         from: Some(table.name.clone()),
         from_alias: None,
         where_clause,
-        group_by: vec![],
-        having: None,
+        group_by: None,
         order_by: vec![],
         limit: Some(1),
         offset: None,
     })
+}
+
+/// Generate a GROUP BY clause with optional HAVING.
+#[trace_gen(Origin::GroupBy)]
+fn generate_group_by_clause<C: Capabilities>(
+    generator: &SqlGen<C>,
+    ctx: &mut Context,
+    table: &Table,
+) -> Result<GroupByClause, GenError> {
+    if table.columns.is_empty() {
+        return Err(GenError::schema_empty("columns"));
+    }
+    let select_config = &generator.policy().select_config;
+
+    // Pick GROUP BY columns
+    let max = generator.policy().max_group_by_items;
+    let cols = ctx.subsequence(&table.columns, 1..=max);
+    let exprs: Vec<Expr> = cols
+        .into_iter()
+        .map(|col| Expr::column_ref(ctx, None, col.name.clone()))
+        .collect();
+
+    // Optionally generate HAVING
+    let having = if ctx.gen_bool_with_prob(select_config.having_probability) {
+        Some(generate_having(generator, ctx, table)?)
+    } else {
+        None
+    };
+
+    Ok(GroupByClause { exprs, having })
+}
+
+/// Generate an aggregate function call on a random column.
+fn generate_aggregate_call(ctx: &mut Context, table: &Table) -> Result<Expr, GenError> {
+    let func = ctx
+        .choose(AGGREGATE_FUNCTIONS)
+        .ok_or_else(|| GenError::schema_empty("aggregate_functions"))?;
+    let col = ctx
+        .choose(&table.columns)
+        .ok_or_else(|| GenError::schema_empty("columns"))?;
+    let arg = Expr::column_ref(ctx, None, col.name.clone());
+    Ok(Expr::function_call(ctx, func.name.to_string(), vec![arg]))
+}
+
+/// Generate SELECT columns for a grouped query.
+///
+/// Each column is either a GROUP BY column ref or an aggregate call,
+/// ensuring non-aggregated columns appear in GROUP BY.
+fn generate_grouped_select_columns<C: Capabilities>(
+    _generator: &SqlGen<C>,
+    ctx: &mut Context,
+    table: &Table,
+    group_by_exprs: &[Expr],
+) -> Result<Vec<SelectColumn>, GenError> {
+    // Extract GROUP BY column names
+    let group_by_names: Vec<&str> = group_by_exprs
+        .iter()
+        .filter_map(|e| match e {
+            Expr::ColumnRef(cr) => Some(cr.column.as_str()),
+            _ => None,
+        })
+        .collect();
+
+    let num_cols = ctx.gen_range_inclusive(1, group_by_names.len() + 2);
+    let mut columns = Vec::with_capacity(num_cols);
+    let mut has_group_col = false;
+
+    for _ in 0..num_cols {
+        if ctx.gen_bool_with_prob(0.5) && !group_by_names.is_empty() {
+            // Pick a GROUP BY column ref
+            let name = *ctx.choose(&group_by_names).unwrap();
+            columns.push(SelectColumn {
+                expr: Expr::column_ref(ctx, None, name.to_string()),
+                alias: None,
+            });
+            has_group_col = true;
+        } else {
+            // Generate an aggregate call
+            columns.push(SelectColumn {
+                expr: generate_aggregate_call(ctx, table)?,
+                alias: None,
+            });
+        }
+    }
+
+    // Ensure at least one GROUP BY column is present
+    if !has_group_col && !group_by_names.is_empty() {
+        let name = *ctx.choose(&group_by_names).unwrap();
+        columns[0] = SelectColumn {
+            expr: Expr::column_ref(ctx, None, name.to_string()),
+            alias: None,
+        };
+    }
+
+    Ok(columns)
+}
+
+/// Generate HAVING clause: `aggregate_call comparison_op literal`.
+#[trace_gen(Origin::Having)]
+fn generate_having<C: Capabilities>(
+    generator: &SqlGen<C>,
+    ctx: &mut Context,
+    table: &Table,
+) -> Result<Expr, GenError> {
+    let agg = generate_aggregate_call(ctx, table)?;
+    let ops = BinOp::comparison();
+    let op = *ctx
+        .choose(ops)
+        .ok_or_else(|| GenError::schema_empty("comparison_ops"))?;
+    let lit = generate_literal(ctx, DataType::Integer, generator.policy());
+    let right = Expr::literal(ctx, lit);
+    Ok(Expr::binary_op(ctx, agg, op, right))
+}
+
+/// Generate ORDER BY clause for a grouped query.
+///
+/// Only orders by columns that appear in GROUP BY.
+fn generate_grouped_order_by<C: Capabilities>(
+    generator: &SqlGen<C>,
+    ctx: &mut Context,
+    _table: &Table,
+    group_by_exprs: &[Expr],
+) -> Result<Vec<OrderByItem>, GenError> {
+    let select_config = &generator.policy().select_config;
+    let max_items = generator.policy().max_order_by_items;
+    let picked = ctx.subsequence(group_by_exprs, 1..=max_items);
+    let items = picked
+        .into_iter()
+        .map(|expr| {
+            let direction = select_order_direction(ctx, &select_config.order_direction_weights);
+            OrderByItem {
+                expr,
+                direction,
+                nulls: None,
+            }
+        })
+        .collect();
+
+    Ok(items)
 }
 
 /// Generate SELECT column list.
@@ -201,7 +361,7 @@ fn generate_select_columns<C: Capabilities>(
         0 => Ok(vec![]),
         // Column list: random subsequence of table columns
         1 => {
-            let cols = ctx.subsequence(&table.columns);
+            let cols = ctx.subsequence(&table.columns, 1..=table.columns.len());
             Ok(cols
                 .into_iter()
                 .map(|col| SelectColumn {
@@ -321,5 +481,99 @@ mod tests {
         let select = select.unwrap();
         assert_eq!(select.columns.len(), 1);
         assert_eq!(select.limit, Some(1));
+    }
+
+    #[test]
+    fn test_generate_group_by_clause() {
+        let generator = test_generator();
+        let table = &generator.schema().tables[0];
+        let mut ctx = Context::new_with_seed(42);
+
+        let clause = generate_group_by_clause(&generator, &mut ctx, table).unwrap();
+        assert!(!clause.exprs.is_empty());
+        assert!(clause.exprs.len() <= generator.policy().max_group_by_items);
+    }
+
+    #[test]
+    fn test_generate_select_with_group_by() {
+        let policy = Policy::default().with_select_config(crate::policy::SelectConfig {
+            group_by_probability: 1.0,
+            ..Default::default()
+        });
+        let schema = SchemaBuilder::new()
+            .table(Table::new(
+                "users",
+                vec![
+                    ColumnDef::new("id", DataType::Integer).primary_key(),
+                    ColumnDef::new("name", DataType::Text),
+                    ColumnDef::new("age", DataType::Integer),
+                ],
+            ))
+            .build();
+        let generator: SqlGen<Full> = SqlGen::new(schema, policy);
+        let table = &generator.schema().tables[0];
+        let mut ctx = Context::new_with_seed(42);
+
+        let select = generate_select_for_table(&generator, &mut ctx, table).unwrap();
+        let sql = select.to_string();
+        assert!(
+            sql.contains("GROUP BY"),
+            "SQL should contain GROUP BY: {sql}"
+        );
+    }
+
+    #[test]
+    fn test_generate_select_with_distinct() {
+        let policy = Policy::default().with_select_config(crate::policy::SelectConfig {
+            distinct_probability: 1.0,
+            ..Default::default()
+        });
+        let schema = SchemaBuilder::new()
+            .table(Table::new(
+                "users",
+                vec![
+                    ColumnDef::new("id", DataType::Integer).primary_key(),
+                    ColumnDef::new("name", DataType::Text),
+                ],
+            ))
+            .build();
+        let generator: SqlGen<Full> = SqlGen::new(schema, policy);
+        let table = &generator.schema().tables[0];
+        let mut ctx = Context::new_with_seed(42);
+
+        let select = generate_select_for_table(&generator, &mut ctx, table).unwrap();
+        let sql = select.to_string();
+        assert!(
+            sql.contains("DISTINCT"),
+            "SQL should contain DISTINCT: {sql}"
+        );
+    }
+
+    #[test]
+    fn test_having_only_with_group_by() {
+        let policy = Policy::default().with_select_config(crate::policy::SelectConfig {
+            group_by_probability: 0.0,
+            having_probability: 1.0,
+            ..Default::default()
+        });
+        let schema = SchemaBuilder::new()
+            .table(Table::new(
+                "users",
+                vec![
+                    ColumnDef::new("id", DataType::Integer).primary_key(),
+                    ColumnDef::new("name", DataType::Text),
+                ],
+            ))
+            .build();
+        let generator: SqlGen<Full> = SqlGen::new(schema, policy);
+        let table = &generator.schema().tables[0];
+        let mut ctx = Context::new_with_seed(42);
+
+        let select = generate_select_for_table(&generator, &mut ctx, table).unwrap();
+        let sql = select.to_string();
+        assert!(
+            !sql.contains("HAVING"),
+            "SQL should not contain HAVING without GROUP BY: {sql}"
+        );
     }
 }
