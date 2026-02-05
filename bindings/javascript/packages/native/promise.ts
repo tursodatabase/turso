@@ -1,4 +1,4 @@
-import { DatabasePromise, NativeDatabase, SqliteError, DatabaseOpts } from "@tursodatabase/database-common"
+import { DatabasePromise, NativeDatabase, SqliteError, DatabaseOpts, sql, SqlQuery } from "@tursodatabase/database-common"
 import { Database as NativeDB } from "#index";
 
 class Database extends DatabasePromise {
@@ -9,7 +9,7 @@ class Database extends DatabasePromise {
 
 /**
  * Creates a new database connection asynchronously.
- * 
+ *
  * @param {string} path - Path to the database file.
  * @param {Object} opts - Options for database behavior.
  * @returns {Promise<Database>} - A promise that resolves to a Database instance.
@@ -20,4 +20,4 @@ async function connect(path: string, opts: DatabaseOpts = {}): Promise<Database>
     return db;
 }
 
-export { connect, Database, SqliteError }
+export { connect, Database, SqliteError, sql, SqlQuery }

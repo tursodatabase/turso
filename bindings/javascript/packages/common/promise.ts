@@ -1,6 +1,7 @@
 import { AsyncLock } from "./async-lock.js";
 import { bindParams } from "./bind.js";
 import { SqliteError } from "./sqlite-error.js";
+import { SqlQuery, isSqlQuery } from "./sql-template.js";
 import { NativeDatabase, NativeStatement, STEP_IO, STEP_ROW, STEP_DONE, DatabaseOpts } from "./types.js";
 
 const convertibleErrorTypes = { TypeError };
@@ -24,6 +25,14 @@ function createErrorByName(name, message) {
   }
 
   return new ErrorConstructor(message);
+}
+
+/**
+ * Result of a mutation operation (INSERT, UPDATE, DELETE).
+ */
+interface RunResult {
+  changes: number;
+  lastInsertRowid: number;
 }
 
 /**
@@ -68,20 +77,127 @@ class Database {
    * Prepares a SQL statement for execution.
    *
    * @param {string} sql - The SQL statement string to prepare.
+   * @returns A typed Statement instance.
+   *
+   * @example
+   * ```typescript
+   * interface User { id: number; name: string; }
+   * const stmt = db.prepare<User>('SELECT * FROM users');
+   * const users = await stmt.all(); // User[]
+   * ```
    */
-  prepare(sql) {
+  prepare<T = unknown>(sql: string): Statement<T> {
     if (!sql) {
       throw new RangeError("The supplied SQL string contains no statements");
     }
 
     try {
       if (this.connected) {
-        return new Statement(maybeValue(this.db.prepare(sql)), this.db, this.execLock, this.ioStep);
+        return new Statement<T>(maybeValue(this.db.prepare(sql)), this.db, this.execLock, this.ioStep);
       } else {
-        return new Statement(maybePromise(() => this.connect().then(() => this.db.prepare(sql))), this.db, this.execLock, this.ioStep)
+        return new Statement<T>(maybePromise(() => this.connect().then(() => this.db.prepare(sql))), this.db, this.execLock, this.ioStep)
       }
     } catch (err) {
       throw convertError(err);
+    }
+  }
+
+  /**
+   * Execute a query and return the first result row.
+   * This is a convenience method that prepares, executes, and closes the statement.
+   *
+   * @param {string | SqlQuery} sql - The SQL query string or a SqlQuery from the `sql` tagged template.
+   * @param {any[]} params - Optional bind parameters (ignored if sql is a SqlQuery).
+   * @returns The first row or undefined if no results.
+   *
+   * @example
+   * ```typescript
+   * // With string and parameters
+   * const user = await db.query<User>('SELECT * FROM users WHERE id = ?', [1]);
+   *
+   * // With sql tagged template
+   * const user = await db.query<User>(sql`SELECT * FROM users WHERE id = ${1}`);
+   * ```
+   */
+  async query<T = unknown>(sql: string | SqlQuery, params?: unknown[]): Promise<T | undefined> {
+    const [sqlStr, bindParams] = isSqlQuery(sql) ? [sql.sql, sql.params] : [sql, params];
+    const stmt = this.prepare<T>(sqlStr);
+    try {
+      return bindParams?.length ? await stmt.get(...bindParams) : await stmt.get();
+    } finally {
+      stmt.close();
+    }
+  }
+
+  /**
+   * Execute a query and return all result rows.
+   * This is a convenience method that prepares, executes, and closes the statement.
+   *
+   * @param {string | SqlQuery} sql - The SQL query string or a SqlQuery from the `sql` tagged template.
+   * @param {any[]} params - Optional bind parameters (ignored if sql is a SqlQuery).
+   * @returns An array of all result rows.
+   *
+   * @example
+   * ```typescript
+   * // With string and parameters
+   * const users = await db.queryAll<User>('SELECT * FROM users WHERE age > ?', [18]);
+   *
+   * // With sql tagged template
+   * const users = await db.queryAll<User>(sql`SELECT * FROM users WHERE age > ${18}`);
+   * ```
+   */
+  async queryAll<T = unknown>(sql: string | SqlQuery, params?: unknown[]): Promise<T[]> {
+    const [sqlStr, bindParams] = isSqlQuery(sql) ? [sql.sql, sql.params] : [sql, params];
+    const stmt = this.prepare<T>(sqlStr);
+    try {
+      return bindParams?.length ? await stmt.all(...bindParams) : await stmt.all();
+    } finally {
+      stmt.close();
+    }
+  }
+
+  /**
+   * Execute multiple statements atomically within a transaction.
+   * All statements are executed in order, and the entire batch is rolled back if any statement fails.
+   *
+   * @param {Statement[]} statements - Array of prepared (and optionally bound) statements to execute.
+   * @returns An array of RunResult objects, one per statement.
+   *
+   * @example
+   * ```typescript
+   * const results = await db.batch([
+   *   db.prepare('INSERT INTO users (name) VALUES (?)').bind('Alice'),
+   *   db.prepare('INSERT INTO users (name) VALUES (?)').bind('Bob'),
+   *   db.prepare('UPDATE users SET active = 1'),
+   * ]);
+   * // results[0] = { changes: 1, lastInsertRowid: 1 }
+   * // results[1] = { changes: 1, lastInsertRowid: 2 }
+   * // results[2] = { changes: 2, lastInsertRowid: 2 }
+   * ```
+   */
+  async batch(statements: Statement<unknown>[]): Promise<RunResult[]> {
+    if (!Array.isArray(statements)) {
+      throw new TypeError("Expected an array of statements");
+    }
+    if (statements.length === 0) {
+      return [];
+    }
+
+    await this.exec("BEGIN");
+    this._inTransaction = true;
+    const results: RunResult[] = [];
+
+    try {
+      for (const stmt of statements) {
+        results.push(await stmt.run());
+      }
+      await this.exec("COMMIT");
+      this._inTransaction = false;
+      return results;
+    } catch (err) {
+      await this.exec("ROLLBACK");
+      this._inTransaction = false;
+      throw err;
     }
   }
 
@@ -284,8 +400,10 @@ function maybeValue<T>(value: T): MaybeLazy<T> {
 
 /**
  * Statement represents a prepared SQL statement that can be executed.
+ *
+ * @template T - The type of rows returned by this statement.
  */
-class Statement {
+class Statement<T = unknown> {
   private stmt: MaybeLazy<NativeStatement>;
   private db: NativeDatabase;
   private execLock: AsyncLock;
@@ -351,8 +469,11 @@ class Statement {
 
   /**
    * Executes the SQL statement and returns an info object.
+   *
+   * @param bindParameters - The bind parameters for executing the statement.
+   * @returns An object with `changes` and `lastInsertRowid`.
    */
-  async run(...bindParameters) {
+  async run(...bindParameters: unknown[]): Promise<RunResult> {
     let stmt = await this.stmt.resolve();
 
     bindParams(stmt, bindParameters);
@@ -389,14 +510,15 @@ class Statement {
    * Executes the SQL statement and returns the first row.
    *
    * @param bindParameters - The bind parameters for executing the statement.
+   * @returns The first row or undefined if no results.
    */
-  async get(...bindParameters) {
+  async get(...bindParameters: unknown[]): Promise<T | undefined> {
     let stmt = await this.stmt.resolve();
 
     bindParams(stmt, bindParameters);
 
     await this.execLock.acquire();
-    let row = undefined;
+    let row: T | undefined = undefined;
     try {
       while (true) {
         const stepResult = await stmt.stepSync();
@@ -408,7 +530,7 @@ class Statement {
           break;
         }
         if (stepResult === STEP_ROW && row === undefined) {
-          row = stmt.row();
+          row = stmt.row() as T;
           continue;
         }
       }
@@ -420,11 +542,19 @@ class Statement {
   }
 
   /**
-   * Executes the SQL statement and returns an iterator to the resulting rows.
+   * Executes the SQL statement and returns an async iterator to the resulting rows.
    *
    * @param bindParameters - The bind parameters for executing the statement.
+   * @returns An async iterator yielding rows.
+   *
+   * @example
+   * ```typescript
+   * for await (const user of stmt.iterate()) {
+   *   console.log(user.name);
+   * }
+   * ```
    */
-  async *iterate(...bindParameters) {
+  async *iterate(...bindParameters: unknown[]): AsyncIterableIterator<T> {
     let stmt = await this.stmt.resolve();
 
     bindParams(stmt, bindParameters);
@@ -441,7 +571,7 @@ class Statement {
           break;
         }
         if (stepResult === STEP_ROW) {
-          yield stmt.row();
+          yield stmt.row() as T;
         }
       }
     } finally {
@@ -454,12 +584,13 @@ class Statement {
    * Executes the SQL statement and returns an array of the resulting rows.
    *
    * @param bindParameters - The bind parameters for executing the statement.
+   * @returns An array of all result rows.
    */
-  async all(...bindParameters) {
+  async all(...bindParameters: unknown[]): Promise<T[]> {
     let stmt = await this.stmt.resolve();
 
     bindParams(stmt, bindParameters);
-    const rows: any[] = [];
+    const rows: T[] = [];
 
     await this.execLock.acquire();
     try {
@@ -473,12 +604,57 @@ class Statement {
           break;
         }
         if (stepResult === STEP_ROW) {
-          rows.push(stmt.row());
+          rows.push(stmt.row() as T);
         }
       }
       return rows;
     }
     finally {
+      stmt.reset();
+      this.execLock.release();
+    }
+  }
+
+  /**
+   * Executes the SQL statement and returns results as an array of arrays.
+   * This is more memory-efficient than `all()` for large result sets.
+   *
+   * @param bindParameters - The bind parameters for executing the statement.
+   * @returns An array of arrays, where each inner array is a row's values.
+   *
+   * @example
+   * ```typescript
+   * const rows = await stmt.values();
+   * // [['Alice', 1], ['Bob', 2]]
+   * ```
+   */
+  async values(...bindParameters: unknown[]): Promise<unknown[][]> {
+    let stmt = await this.stmt.resolve();
+
+    // Temporarily enable raw mode, then restore
+    stmt.raw(true);
+    bindParams(stmt, bindParameters);
+    const rows: unknown[][] = [];
+
+    await this.execLock.acquire();
+    try {
+      while (true) {
+        const stepResult = await stmt.stepSync();
+        if (stepResult === STEP_IO) {
+          await this.io();
+          continue;
+        }
+        if (stepResult === STEP_DONE) {
+          break;
+        }
+        if (stepResult === STEP_ROW) {
+          rows.push(stmt.row() as unknown[]);
+        }
+      }
+      return rows;
+    }
+    finally {
+      stmt.raw(false);
       stmt.reset();
       this.execLock.release();
     }
@@ -500,14 +676,14 @@ class Statement {
 
 
   /**
-   * Binds the given parameters to the statement _permanently_
+   * Binds the given parameters to the statement _permanently_.
    *
    * @param bindParameters - The bind parameters for binding the statement.
-   * @returns this - Statement with binded parameters
+   * @returns this - Statement with bound parameters.
    */
-  bind(...bindParameters) {
+  bind(...bindParameters: unknown[]): this {
     try {
-      bindParams(this.stmt, bindParameters);
+      this.stmt.apply(s => bindParams(s, bindParameters));
       return this;
     } catch (err) {
       throw convertError(err);
@@ -527,3 +703,4 @@ class Statement {
 }
 
 export { Database, Statement, maybePromise, maybeValue }
+export type { RunResult }
