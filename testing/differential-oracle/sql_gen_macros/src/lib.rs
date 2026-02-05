@@ -6,8 +6,9 @@ use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
 use quote::ToTokens;
 use syn::{
+    FnArg, ItemFn, Pat, Path, Type,
     parse::{Parse, ParseStream},
-    parse_macro_input, FnArg, ItemFn, Pat, Path, Type,
+    parse_macro_input,
 };
 
 /// Attribute to automatically wrap a generator function body in a tracing scope.

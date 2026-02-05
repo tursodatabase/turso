@@ -21,10 +21,7 @@ pub fn generate_select<C: Capabilities>(
         return Ok(crate::ast::Stmt::Select(select));
     }
 
-    let table = ctx
-        .choose(&generator.schema().tables)
-        .unwrap()
-        .clone();
+    let table = ctx.choose(&generator.schema().tables).unwrap().clone();
 
     let select = generate_select_for_table(generator, ctx, &table)?;
     Ok(crate::ast::Stmt::Select(select))

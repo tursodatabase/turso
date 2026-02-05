@@ -7,10 +7,11 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use sql_gen::Stmt;
 use sql_gen_prop::SqlValue;
 use sql_gen_prop::result::diff_results;
 use turso_core::{Numeric, Value};
+
+use crate::generate::GeneratedStatement;
 
 /// Result of an oracle check.
 #[derive(Debug, Clone)]
@@ -49,7 +50,7 @@ pub trait Oracle {
     /// or Fail with a reason otherwise.
     fn check(
         &self,
-        stmt: &Stmt,
+        stmt: &GeneratedStatement,
         turso_result: &QueryResult,
         sqlite_result: &QueryResult,
     ) -> OracleResult;
@@ -81,11 +82,11 @@ pub struct DifferentialOracle;
 impl Oracle for DifferentialOracle {
     fn check(
         &self,
-        stmt: &Stmt,
+        stmt: &GeneratedStatement,
         turso_result: &QueryResult,
         sqlite_result: &QueryResult,
     ) -> OracleResult {
-        let has_unordered_limit = stmt.has_unordered_limit();
+        let has_unordered_limit = stmt.has_unordered_limit;
 
         match (turso_result, sqlite_result) {
             (QueryResult::Rows(turso_rows), QueryResult::Rows(sqlite_rows)) => {
@@ -239,11 +240,10 @@ impl DifferentialOracle {
 pub fn check_differential(
     turso_conn: &Arc<turso_core::Connection>,
     sqlite_conn: &rusqlite::Connection,
-    stmt: &Stmt,
+    stmt: &GeneratedStatement,
 ) -> OracleResult {
-    let sql = stmt.to_string();
-    let turso_result = DifferentialOracle::execute_turso(turso_conn, &sql);
-    let sqlite_result = DifferentialOracle::execute_sqlite(sqlite_conn, &sql);
+    let turso_result = DifferentialOracle::execute_turso(turso_conn, &stmt.sql);
+    let sqlite_result = DifferentialOracle::execute_sqlite(sqlite_conn, &stmt.sql);
 
     let oracle = DifferentialOracle;
     oracle.check(stmt, &turso_result, &sqlite_result)

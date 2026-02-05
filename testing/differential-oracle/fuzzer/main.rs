@@ -11,7 +11,7 @@ use std::{
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use differential_fuzzer::{Fuzzer, SimConfig};
+use differential_fuzzer::{Fuzzer, GeneratorKind, SimConfig};
 use parking_lot::Mutex;
 use rand::RngCore;
 
@@ -45,6 +45,10 @@ struct Args {
     /// Persist database files to disk after simulation.
     #[arg(short, long)]
     keep_files: bool,
+
+    /// SQL generator backend to use.
+    #[arg(short = 'g', long, default_value = "sql-gen", value_enum)]
+    generator: GeneratorKind,
 }
 
 #[derive(Subcommand, Debug)]
@@ -99,6 +103,7 @@ fn run_single(args: &Args) -> Result<()> {
         num_statements: args.num_statements,
         verbose: args.verbose,
         keep_files: args.keep_files,
+        generator: args.generator,
     };
 
     tracing::info!("Starting differential_fuzzer with config: {:?}", config);
