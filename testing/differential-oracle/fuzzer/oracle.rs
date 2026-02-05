@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use sql_gen_prop::SqlStatement;
+use sql_gen::Stmt;
 use sql_gen_prop::SqlValue;
 use sql_gen_prop::result::diff_results;
 use turso_core::{Numeric, Value};
@@ -49,7 +49,7 @@ pub trait Oracle {
     /// or Fail with a reason otherwise.
     fn check(
         &self,
-        stmt: &SqlStatement,
+        stmt: &Stmt,
         turso_result: &QueryResult,
         sqlite_result: &QueryResult,
     ) -> OracleResult;
@@ -81,7 +81,7 @@ pub struct DifferentialOracle;
 impl Oracle for DifferentialOracle {
     fn check(
         &self,
-        stmt: &SqlStatement,
+        stmt: &Stmt,
         turso_result: &QueryResult,
         sqlite_result: &QueryResult,
     ) -> OracleResult {
@@ -239,7 +239,7 @@ impl DifferentialOracle {
 pub fn check_differential(
     turso_conn: &Arc<turso_core::Connection>,
     sqlite_conn: &rusqlite::Connection,
-    stmt: &SqlStatement,
+    stmt: &Stmt,
 ) -> OracleResult {
     let sql = stmt.to_string();
     let turso_result = DifferentialOracle::execute_turso(turso_conn, &sql);
