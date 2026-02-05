@@ -5190,6 +5190,16 @@ version = "0.5.0-pre.11"
 dependencies = [
  "proptest",
  "rand 0.9.2",
+ "sql_gen_macros",
+]
+
+[[package]]
+name = "sql_gen_macros"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.100",
 ]
 
 [[package]]

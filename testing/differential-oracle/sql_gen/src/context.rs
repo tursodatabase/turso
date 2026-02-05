@@ -90,8 +90,16 @@ impl Context {
         self.trace_builder.add_stmt(kind);
     }
 
+    /// Run the closure under the given scope. Should only be used for generation
+    pub fn scope<T>(&mut self, origin: Origin, func: impl FnOnce(&mut Self) -> T) -> T {
+        self.enter_scope(origin);
+        let t = func(self);
+        self.exit_scope();
+        t
+    }
+
     /// Enter a named scope.
-    pub fn enter_scope(&mut self, origin: Origin) {
+    fn enter_scope(&mut self, origin: Origin) {
         self.origin_stack.push(origin);
         self.depth += 1;
         self.trace_builder.push_scope(origin);
@@ -102,7 +110,7 @@ impl Context {
     }
 
     /// Exit the current scope.
-    pub fn exit_scope(&mut self) {
+    fn exit_scope(&mut self) {
         let origin = self.origin_stack.current();
         if matches!(origin, Origin::Subquery) {
             self.subquery_depth = self.subquery_depth.saturating_sub(1);

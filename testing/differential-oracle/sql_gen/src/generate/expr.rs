@@ -8,6 +8,7 @@ use crate::error::GenError;
 use crate::generate::literal::generate_literal;
 use crate::schema::{DataType, Table};
 use crate::trace::Origin;
+use sql_gen_macros::trace_gen;
 
 /// Generate an expression.
 pub fn generate_expr<C: Capabilities>(
@@ -195,15 +196,32 @@ fn generate_binary_op<C: Capabilities>(
         .choose(ops)
         .ok_or_else(|| GenError::exhausted("binary_op", "no operators available"))?;
 
-    ctx.enter_scope(Origin::BinaryOpLeft);
-    let left = generate_expr(generator, ctx, table, depth + 1)?;
-    ctx.exit_scope();
-
-    ctx.enter_scope(Origin::BinaryOpRight);
-    let right = generate_expr(generator, ctx, table, depth + 1)?;
-    ctx.exit_scope();
+    let left = generate_binop_left(generator, ctx, table, depth)?;
+    let right = generate_binop_right(generator, ctx, table, depth)?;
 
     Ok(Expr::binary_op(ctx, left, op, right))
+}
+
+/// Generate the left operand of a binary operation.
+#[trace_gen(Origin::BinaryOpLeft)]
+fn generate_binop_left<C: Capabilities>(
+    generator: &SqlGen<C>,
+    ctx: &mut Context,
+    table: &Table,
+    depth: usize,
+) -> Result<Expr, GenError> {
+    generate_expr(generator, ctx, table, depth + 1)
+}
+
+/// Generate the right operand of a binary operation.
+#[trace_gen(Origin::BinaryOpRight)]
+fn generate_binop_right<C: Capabilities>(
+    generator: &SqlGen<C>,
+    ctx: &mut Context,
+    table: &Table,
+    depth: usize,
+) -> Result<Expr, GenError> {
+    generate_expr(generator, ctx, table, depth + 1)
 }
 
 #[derive(Clone, Copy)]
@@ -290,27 +308,51 @@ fn generate_case<C: Capabilities>(
     let mut when_clauses = Vec::with_capacity(num_when);
 
     for _ in 0..num_when {
-        ctx.enter_scope(Origin::CaseWhen);
-        let when_expr = generate_expr(generator, ctx, table, depth + 1)?;
-        ctx.exit_scope();
-
-        ctx.enter_scope(Origin::CaseThen);
-        let then_expr = generate_expr(generator, ctx, table, depth + 1)?;
-        ctx.exit_scope();
-
+        let when_expr = generate_case_when(generator, ctx, table, depth)?;
+        let then_expr = generate_case_then(generator, ctx, table, depth)?;
         when_clauses.push((when_expr, then_expr));
     }
 
     let else_clause = if ctx.gen_bool_with_prob(expr_config.case_else_probability) {
-        ctx.enter_scope(Origin::CaseElse);
-        let expr = generate_expr(generator, ctx, table, depth + 1)?;
-        ctx.exit_scope();
-        Some(expr)
+        Some(generate_case_else(generator, ctx, table, depth)?)
     } else {
         None
     };
 
     Ok(Expr::case_expr(ctx, None, when_clauses, else_clause))
+}
+
+/// Generate the WHEN condition of a CASE expression.
+#[trace_gen(Origin::CaseWhen)]
+fn generate_case_when<C: Capabilities>(
+    generator: &SqlGen<C>,
+    ctx: &mut Context,
+    table: &Table,
+    depth: usize,
+) -> Result<Expr, GenError> {
+    generate_expr(generator, ctx, table, depth + 1)
+}
+
+/// Generate the THEN result of a CASE expression.
+#[trace_gen(Origin::CaseThen)]
+fn generate_case_then<C: Capabilities>(
+    generator: &SqlGen<C>,
+    ctx: &mut Context,
+    table: &Table,
+    depth: usize,
+) -> Result<Expr, GenError> {
+    generate_expr(generator, ctx, table, depth + 1)
+}
+
+/// Generate the ELSE result of a CASE expression.
+#[trace_gen(Origin::CaseElse)]
+fn generate_case_else<C: Capabilities>(
+    generator: &SqlGen<C>,
+    ctx: &mut Context,
+    table: &Table,
+    depth: usize,
+) -> Result<Expr, GenError> {
+    generate_expr(generator, ctx, table, depth + 1)
 }
 
 /// Generate a CAST expression.
@@ -332,35 +374,35 @@ fn generate_subquery_expr<C: Capabilities>(
     generator: &SqlGen<C>,
     ctx: &mut Context,
 ) -> Result<Expr, GenError> {
-    ctx.enter_scope(Origin::Subquery);
+    let select = generate_subquery_select(generator, ctx)?;
+    Ok(Expr::subquery(ctx, select))
+}
 
+/// Generate the SELECT statement for a subquery.
+#[trace_gen(Origin::Subquery)]
+fn generate_subquery_select<C: Capabilities>(
+    generator: &SqlGen<C>,
+    ctx: &mut Context,
+) -> Result<crate::ast::SelectStmt, GenError> {
     // Pick a random table
     let table = ctx
         .choose(&generator.schema().tables)
         .ok_or_else(|| GenError::schema_empty("tables"))?;
 
     // Generate a simple single-column SELECT
-    let result = crate::generate::select::generate_simple_select(generator, ctx, table);
-    ctx.exit_scope();
-
-    let select = result?;
-    Ok(Expr::subquery(ctx, select))
+    crate::generate::select::generate_simple_select(generator, ctx, table)
 }
 
 /// Generate a WHERE clause condition.
+#[trace_gen(Origin::Where)]
 pub fn generate_condition<C: Capabilities>(
     generator: &SqlGen<C>,
     ctx: &mut Context,
     table: &Table,
 ) -> Result<Expr, GenError> {
-    ctx.enter_scope(Origin::Where);
-
     let candidates = build_condition_candidates(generator, ctx);
     let cond_type = generator.policy().select_weighted(ctx, &candidates)?;
-    let result = dispatch_condition_generation(generator, ctx, table, cond_type);
-
-    ctx.exit_scope();
-    result
+    dispatch_condition_generation(generator, ctx, table, cond_type)
 }
 
 #[derive(Clone, Copy)]

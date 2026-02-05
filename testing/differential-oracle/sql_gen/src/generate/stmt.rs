@@ -13,6 +13,7 @@ use crate::generate::literal::generate_literal;
 use crate::generate::select::generate_select;
 use crate::schema::DataType;
 use crate::trace::{Origin, StmtKind};
+use sql_gen_macros::trace_gen;
 
 /// Generate a statement respecting capability constraints.
 pub fn generate_statement<C: Capabilities>(
@@ -126,12 +127,11 @@ fn dispatch_stmt_generation<C: Capabilities>(
 }
 
 /// Generate an INSERT statement.
+#[trace_gen(Origin::Insert)]
 pub fn generate_insert<C: Capabilities>(
     generator: &SqlGen<C>,
     ctx: &mut Context,
 ) -> Result<Stmt, GenError> {
-    ctx.enter_scope(Origin::Insert);
-
     let insert_config = &generator.policy().insert_config;
 
     let table = ctx
@@ -155,27 +155,12 @@ pub fn generate_insert<C: Capabilities>(
     };
 
     if columns.is_empty() {
-        ctx.exit_scope();
         return Err(GenError::exhausted("insert", "no columns to insert"));
     }
 
     // Generate values
-    ctx.enter_scope(Origin::InsertValues);
-    let num_rows = ctx.gen_range_inclusive(insert_config.min_rows, insert_config.max_rows);
-    let mut values = Vec::with_capacity(num_rows);
+    let values = generate_insert_values(generator, ctx, &table, &columns);
 
-    for _ in 0..num_rows {
-        let mut row = Vec::with_capacity(columns.len());
-        for col_name in &columns {
-            let col = table.columns.iter().find(|c| &c.name == col_name).unwrap();
-            let lit = generate_literal(ctx, col.data_type, generator.policy());
-            row.push(Expr::literal(ctx, lit));
-        }
-        values.push(row);
-    }
-    ctx.exit_scope();
-
-    ctx.exit_scope();
     Ok(Stmt::Insert(InsertStmt {
         table: table.name.clone(),
         columns,
@@ -183,13 +168,37 @@ pub fn generate_insert<C: Capabilities>(
     }))
 }
 
+/// Generate the VALUES clause for an INSERT statement.
+#[trace_gen(Origin::InsertValues)]
+fn generate_insert_values<C: Capabilities>(
+    generator: &SqlGen<C>,
+    ctx: &mut Context,
+    table: &crate::schema::Table,
+    columns: &[String],
+) -> Vec<Vec<Expr>> {
+    let insert_config = &generator.policy().insert_config;
+    let num_rows = ctx.gen_range_inclusive(insert_config.min_rows, insert_config.max_rows);
+    let mut values = Vec::with_capacity(num_rows);
+
+    for _ in 0..num_rows {
+        let mut row = Vec::with_capacity(columns.len());
+        for col_name in columns {
+            let col = table.columns.iter().find(|c| &c.name == col_name).unwrap();
+            let lit = generate_literal(ctx, col.data_type, generator.policy());
+            row.push(Expr::literal(ctx, lit));
+        }
+        values.push(row);
+    }
+
+    values
+}
+
 /// Generate an UPDATE statement.
+#[trace_gen(Origin::Update)]
 pub fn generate_update<C: Capabilities>(
     generator: &SqlGen<C>,
     ctx: &mut Context,
 ) -> Result<Stmt, GenError> {
-    ctx.enter_scope(Origin::Update);
-
     let update_config = &generator.policy().update_config;
 
     let table = ctx
@@ -200,23 +209,11 @@ pub fn generate_update<C: Capabilities>(
     // Get updatable columns (non-primary key)
     let updatable: Vec<_> = table.updatable_columns().collect();
     if updatable.is_empty() {
-        ctx.exit_scope();
         return Err(GenError::exhausted("update", "no updatable columns"));
     }
 
     // Generate SET clause
-    ctx.enter_scope(Origin::UpdateSet);
-    let max_sets = update_config.max_set_clauses.min(updatable.len());
-    let min_sets = update_config.min_set_clauses.min(max_sets);
-    let num_sets = ctx.gen_range_inclusive(min_sets, max_sets);
-    let mut sets = Vec::with_capacity(num_sets);
-
-    for _ in 0..num_sets {
-        let col = ctx.choose(&updatable).unwrap();
-        let lit = generate_literal(ctx, col.data_type, generator.policy());
-        sets.push((col.name.clone(), Expr::literal(ctx, lit)));
-    }
-    ctx.exit_scope();
+    let sets = generate_update_sets(generator, ctx, &updatable)?;
 
     // Generate optional WHERE clause
     let where_clause = if ctx.gen_bool_with_prob(update_config.where_probability) {
@@ -225,7 +222,6 @@ pub fn generate_update<C: Capabilities>(
         None
     };
 
-    ctx.exit_scope();
     Ok(Stmt::Update(UpdateStmt {
         table: table.name.clone(),
         sets,
@@ -233,13 +229,34 @@ pub fn generate_update<C: Capabilities>(
     }))
 }
 
+/// Generate the SET clause for an UPDATE statement.
+#[trace_gen(Origin::UpdateSet)]
+fn generate_update_sets<C: Capabilities>(
+    generator: &SqlGen<C>,
+    ctx: &mut Context,
+    updatable: &[&crate::schema::ColumnDef],
+) -> Result<Vec<(String, Expr)>, GenError> {
+    let update_config = &generator.policy().update_config;
+    let max_sets = update_config.max_set_clauses.min(updatable.len());
+    let min_sets = update_config.min_set_clauses.min(max_sets);
+    let num_sets = ctx.gen_range_inclusive(min_sets, max_sets);
+    let mut sets = Vec::with_capacity(num_sets);
+
+    for _ in 0..num_sets {
+        let col = ctx.choose(updatable).unwrap();
+        let lit = generate_literal(ctx, col.data_type, generator.policy());
+        sets.push((col.name.clone(), Expr::literal(ctx, lit)));
+    }
+
+    Ok(sets)
+}
+
 /// Generate a DELETE statement.
+#[trace_gen(Origin::Delete)]
 pub fn generate_delete<C: Capabilities>(
     generator: &SqlGen<C>,
     ctx: &mut Context,
 ) -> Result<Stmt, GenError> {
-    ctx.enter_scope(Origin::Delete);
-
     let delete_config = &generator.policy().delete_config;
 
     let table = ctx
@@ -254,7 +271,6 @@ pub fn generate_delete<C: Capabilities>(
         None
     };
 
-    ctx.exit_scope();
     Ok(Stmt::Delete(DeleteStmt {
         table: table.name.clone(),
         where_clause,
