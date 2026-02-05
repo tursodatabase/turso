@@ -137,11 +137,9 @@ impl Drop for Connection {
             // while holding a read or write lock.
             let pager = self.pager.load();
             if let Some(wal) = &pager.wal {
-                // Write lock is tracked by TransactionState
-                if matches!(self.transaction_state.get(), TransactionState::Write { .. }) {
+                if wal.holds_write_lock() {
                     wal.end_write_tx();
                 }
-                // Read lock is tracked by the WAL itself
                 if wal.holds_read_lock() {
                     wal.end_read_tx();
                 }
