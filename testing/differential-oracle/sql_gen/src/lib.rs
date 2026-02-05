@@ -38,6 +38,7 @@ pub mod builder;
 pub mod capabilities;
 pub mod context;
 pub mod error;
+pub mod functions;
 pub mod generate;
 pub mod policy;
 pub mod schema;
@@ -56,10 +57,11 @@ pub use capabilities::{
 };
 pub use context::Context;
 pub use error::{GenError, GenErrorKind};
+pub use functions::{FunctionCategory, FunctionDef, SCALAR_FUNCTIONS};
 pub use policy::{
     BinOpCategoryWeights, BinOpWeights, CompoundOpWeights, DeleteConfig, ExprConfig, ExprWeights,
-    IdentifierConfig, InsertConfig, LiteralConfig, LiteralTypeWeights, NullsOrderWeights,
-    OrderDirectionWeights, Policy, SelectConfig, StmtWeights, StringCharset,
+    FunctionConfig, IdentifierConfig, InsertConfig, LiteralConfig, LiteralTypeWeights,
+    NullsOrderWeights, OrderDirectionWeights, Policy, SelectConfig, StmtWeights, StringCharset,
     TriggerBodyStmtWeights, TriggerConfig, TriggerEventWeights, TriggerTimingWeights,
     UnaryOpWeights, UpdateConfig,
 };
