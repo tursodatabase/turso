@@ -82,21 +82,31 @@ impl StmtKind {
 /// A SELECT statement.
 #[derive(Debug, Clone)]
 pub struct SelectStmt {
+    pub distinct: bool,
     pub columns: Vec<SelectColumn>,
     /// The FROM table. None for table-less SELECTs (e.g. `SELECT 1+2`).
     pub from: Option<String>,
     pub from_alias: Option<String>,
     pub where_clause: Option<Expr>,
-    pub group_by: Vec<Expr>,
-    pub having: Option<Expr>,
+    pub group_by: Option<GroupByClause>,
     pub order_by: Vec<OrderByItem>,
     pub limit: Option<u64>,
     pub offset: Option<u64>,
 }
 
+/// A GROUP BY clause with an optional HAVING condition.
+#[derive(Debug, Clone)]
+pub struct GroupByClause {
+    pub exprs: Vec<Expr>,
+    pub having: Option<Expr>,
+}
+
 impl fmt::Display for SelectStmt {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "SELECT ")?;
+        if self.distinct {
+            write!(f, "DISTINCT ")?;
+        }
 
         if self.columns.is_empty() {
             write!(f, "*")?;
@@ -120,18 +130,17 @@ impl fmt::Display for SelectStmt {
             write!(f, " WHERE {where_clause}")?;
         }
 
-        if !self.group_by.is_empty() {
+        if let Some(group_by) = &self.group_by {
             write!(f, " GROUP BY ")?;
-            for (i, expr) in self.group_by.iter().enumerate() {
+            for (i, expr) in group_by.exprs.iter().enumerate() {
                 if i > 0 {
                     write!(f, ", ")?;
                 }
                 write!(f, "{expr}")?;
             }
-        }
-
-        if let Some(having) = &self.having {
-            write!(f, " HAVING {having}")?;
+            if let Some(having) = &group_by.having {
+                write!(f, " HAVING {having}")?;
+            }
         }
 
         if !self.order_by.is_empty() {
@@ -1116,6 +1125,7 @@ mod tests {
     #[test]
     fn test_select_display() {
         let select = SelectStmt {
+            distinct: false,
             columns: vec![SelectColumn {
                 expr: Expr::ColumnRef(ColumnRef {
                     table: None,
@@ -1126,14 +1136,36 @@ mod tests {
             from: Some("users".to_string()),
             from_alias: None,
             where_clause: None,
-            group_by: vec![],
-            having: None,
+            group_by: None,
             order_by: vec![],
             limit: Some(10),
             offset: None,
         };
 
         assert_eq!(select.to_string(), "SELECT name FROM users LIMIT 10");
+    }
+
+    #[test]
+    fn test_select_distinct_display() {
+        let select = SelectStmt {
+            distinct: true,
+            columns: vec![SelectColumn {
+                expr: Expr::ColumnRef(ColumnRef {
+                    table: None,
+                    column: "name".to_string(),
+                }),
+                alias: None,
+            }],
+            from: Some("users".to_string()),
+            from_alias: None,
+            where_clause: None,
+            group_by: None,
+            order_by: vec![],
+            limit: None,
+            offset: None,
+        };
+
+        assert_eq!(select.to_string(), "SELECT DISTINCT name FROM users");
     }
 
     #[test]
