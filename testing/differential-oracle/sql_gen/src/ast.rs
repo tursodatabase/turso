@@ -5,7 +5,6 @@
 
 use crate::context::Context;
 use crate::schema::DataType;
-use crate::trace::ExprKind;
 use std::fmt;
 
 // =============================================================================
@@ -13,7 +12,9 @@ use std::fmt;
 // =============================================================================
 
 /// A SQL statement.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, strum::EnumDiscriminants)]
+#[strum_discriminants(name(StmtKind))]
+#[strum_discriminants(derive(Hash, strum::EnumIter, strum::Display))]
 pub enum Stmt {
     Select(SelectStmt),
     Insert(InsertStmt),
@@ -584,7 +585,9 @@ impl fmt::Display for DropTriggerStmt {
 // =============================================================================
 
 /// A SQL expression.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, strum::EnumDiscriminants)]
+#[strum_discriminants(name(ExprKind))]
+#[strum_discriminants(derive(Hash, strum::EnumIter, strum::Display))]
 pub enum Expr {
     ColumnRef(ColumnRef),
     Literal(Literal),
@@ -668,7 +671,7 @@ impl Expr {
         when_clauses: Vec<(Expr, Expr)>,
         else_clause: Option<Expr>,
     ) -> Self {
-        ctx.record(ExprKind::CaseExpr);
+        ctx.record(ExprKind::Case);
         Expr::Case(Box::new(CaseExpr {
             operand: operand.map(Box::new),
             when_clauses,
@@ -705,31 +708,19 @@ impl Expr {
 
     /// Create an IS NULL expression (records to context).
     pub fn is_null(ctx: &mut Context, expr: Expr, negated: bool) -> Self {
-        if negated {
-            ctx.record(ExprKind::IsNotNull);
-        } else {
-            ctx.record(ExprKind::IsNull);
-        }
+        ctx.record(ExprKind::IsNull);
         Expr::IsNull(Box::new(IsNullExpr { expr, negated }))
     }
 
     /// Create an EXISTS expression (records to context).
     pub fn exists(ctx: &mut Context, subquery: SelectStmt, negated: bool) -> Self {
-        if negated {
-            ctx.record(ExprKind::NotExists);
-        } else {
-            ctx.record(ExprKind::Exists);
-        }
+        ctx.record(ExprKind::Exists);
         Expr::Exists(Box::new(ExistsExpr { subquery, negated }))
     }
 
     /// Create an IN subquery expression (records to context).
     pub fn in_subquery(ctx: &mut Context, expr: Expr, subquery: SelectStmt, negated: bool) -> Self {
-        if negated {
-            ctx.record(ExprKind::NotInSubquery);
-        } else {
-            ctx.record(ExprKind::InSubquery);
-        }
+        ctx.record(ExprKind::InSubquery);
         Expr::InSubquery(Box::new(InSubqueryExpr {
             expr,
             subquery,
