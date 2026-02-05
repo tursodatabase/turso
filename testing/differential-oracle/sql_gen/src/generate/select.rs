@@ -453,7 +453,8 @@ fn generate_order_by<C: Capabilities>(
                 let e = generate_expr(generator, ctx, table, 0)?;
                 // Avoid bare literals — SQLite interprets integer literals in
                 // ORDER BY as column-ordinal positions (e.g. ORDER BY 2).
-                if matches!(e, Expr::Literal(_)) {
+                // Also catch unary wrappers like -478008 or +3.
+                if looks_like_literal(&e) {
                     let col = ctx.choose(&table.columns).unwrap();
                     Expr::column_ref(ctx, None, col.name.clone())
                 } else {
@@ -477,6 +478,18 @@ fn generate_order_by<C: Capabilities>(
     }
 
     Ok(items)
+}
+
+/// Check whether an expression is a bare literal or a unary op wrapping one
+/// (e.g. `-42`, `+3`). SQLite interprets such values as column-ordinal
+/// positions in ORDER BY, so we must avoid generating them there.
+fn looks_like_literal(expr: &Expr) -> bool {
+    match expr {
+        Expr::Literal(_) => true,
+        Expr::UnaryOp(u) => looks_like_literal(&u.operand),
+        Expr::Parenthesized(inner) => looks_like_literal(inner),
+        _ => false,
+    }
 }
 
 /// Select an order direction based on weights.
