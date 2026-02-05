@@ -327,25 +327,22 @@ impl Fuzzer {
         //     rollback: 0,
         // });
 
-        let policy = Policy::default().with_stmt_weights(sql_gen::StmtWeights {
-            create_trigger: 0,
-            drop_trigger: 0,
-            ..sql_gen::StmtWeights::default()
-        });
+        let policy = Policy::default()
+            .with_stmt_weights(sql_gen::StmtWeights {
+                create_trigger: 0,
+                drop_trigger: 0,
+                ..sql_gen::StmtWeights::default()
+            })
+            .with_function_config(sql_gen::FunctionConfig::deterministic());
 
         for i in 0..self.config.num_statements {
             // Build generator from current schema
             let generator: SqlGen<Full> = SqlGen::new(schema.clone(), policy.clone());
 
             // Generate a statement (DML or DDL)
-            let stmt = match generator.statement(&mut ctx) {
-                Ok(stmt) => stmt,
-                Err(e) => {
-                    tracing::warn!("Failed to generate statement {i}: {e}");
-                    stats.errors += 1;
-                    continue;
-                }
-            };
+            let stmt = generator
+                .statement(&mut ctx)
+                .map_err(|e| anyhow::anyhow!("Failed to generate statement: {e}"))?;
 
             // sql_gen_prop generation (commented out, kept for reference)
             // let strategy = sql_gen_prop::strategies::statement_for_schema(&schema, &profile);
