@@ -6,7 +6,7 @@ use crate::context::Context;
 use crate::error::GenError;
 use crate::functions::FunctionDef;
 use crate::generate::literal::generate_literal;
-use crate::generate::select::generate_select;
+use crate::generate::select::{generate_select, generate_simple_select};
 use crate::schema::{DataType, Table};
 use crate::trace::{ExprKind, Origin};
 use crate::{SqlGen, Stmt};
@@ -179,7 +179,7 @@ fn dispatch_expr_generation<C: Capabilities>(
         ExprKind::InSubquery => generate_in_subquery(generator, ctx, table, depth),
         ExprKind::Case => generate_case(generator, ctx, table, depth),
         ExprKind::Cast => generate_cast(generator, ctx, table, depth),
-        ExprKind::Subquery => generate_subquery_expr(generator, ctx),
+        ExprKind::Subquery => generate_subquery_expr(generator, ctx, table),
         ExprKind::Exists => generate_exists(generator, ctx),
         // Parenthesized is not generated directly - it's just for grouping
         ExprKind::Parenthesized => unreachable!("parenthesized is not generated directly"),
@@ -488,12 +488,14 @@ fn generate_cast<C: Capabilities>(
     Ok(Expr::cast(ctx, expr, target_type))
 }
 
-/// Generate a subquery expression.
+/// Generate a scalar subquery expression.
+/// Scalar subqueries must return exactly 1 column.
 fn generate_subquery_expr<C: Capabilities>(
     generator: &SqlGen<C>,
     ctx: &mut Context,
+    table: &Table,
 ) -> Result<Expr, GenError> {
-    let select = generate_subquery_select(generator, ctx)?;
+    let select = generate_simple_select(generator, ctx, table)?;
     Ok(Expr::subquery(ctx, select))
 }
 
