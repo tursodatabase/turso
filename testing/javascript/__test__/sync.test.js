@@ -82,8 +82,8 @@ test.serial("Database.exec() after close()", async (t) => {
   t.throws(() => {
     db.exec("SELECT 1");
   }, {
-    instanceOf: Error,
-    message: "database must be connected"
+    instanceOf: TypeError,
+    message: "The database connection is not open"
   });
 });
 
@@ -108,8 +108,8 @@ test.serial("Database.prepare() after close()", async (t) => {
   t.throws(() => {
     db.prepare("SELECT 1");
   }, {
-    instanceOf: Error,
-    message: "database must be connected"
+    instanceOf: TypeError,
+    message: "The database connection is not open"
   });
 });
 
@@ -129,8 +129,8 @@ test.serial("Database.pragma() after close()", async (t) => {
   t.throws(() => {
     db.pragma("cache_size = 2000");
   }, {
-    instanceOf: Error,
-    message: "database must be connected"
+    instanceOf: TypeError,
+    message: "The database connection is not open"
   });
 });
 
@@ -207,7 +207,7 @@ test.serial("Statement.run() [named]", async (t) => {
   const db = t.context.db;
 
   const stmt = db.prepare("INSERT INTO users(name, email) VALUES (@name, @email);");
-  const info = stmt.run({ "name": "Carol", "email": "carol@example.net" });
+  const info = stmt.run({"name": "Carol", "email": "carol@example.net"});
   t.is(info.changes, 1);
   t.is(info.lastInsertRowid, 3);
 });
@@ -262,11 +262,11 @@ test.skip("Statement.run() for vector feature with Float32Array bind parameter",
   `);
 
   const insertStmt = db.prepare("INSERT INTO t VALUES (?)");
-  insertStmt.run([new Float32Array([1, 1, 1, 1, 1, 1, 1, 1])]);
-  insertStmt.run([new Float32Array([-1, -1, -1, -1, -1, -1, -1, -1])]);
+  insertStmt.run([new Float32Array([1,1,1,1,1,1,1,1])]);
+  insertStmt.run([new Float32Array([-1,-1,-1,-1,-1,-1,-1,-1])]);
 
   const selectStmt = db.prepare("SELECT embedding FROM vector_top_k('t_idx', vector('[2,2,2,2,2,2,2,2]'), 1) n JOIN t ON n.rowid = t.rowid");
-  t.deepEqual(selectStmt.raw().get()[0], Buffer.from(new Float32Array([1, 1, 1, 1, 1, 1, 1, 1]).buffer));
+  t.deepEqual(selectStmt.raw().get()[0], Buffer.from(new Float32Array([1,1,1,1,1,1,1,1]).buffer));
 
   // we need to explicitly delete this table because later when sqlite-based (not LibSQL) tests will delete table 't' they will leave 't_idx_shadow' table untouched
   db.exec(`DROP TABLE t`);
@@ -298,9 +298,9 @@ test.serial("Statement.get() [positional]", async (t) => {
   t.is(stmt.get(2).name, "Bob");
 
   stmt = db.prepare("SELECT * FROM users WHERE id = ?1");
-  t.is(stmt.get({ 1: 0 }), undefined);
-  t.is(stmt.get({ 1: 1 }).name, "Alice");
-  t.is(stmt.get({ 1: 2 }).name, "Bob");
+  t.is(stmt.get({1: 0}), undefined);
+  t.is(stmt.get({1: 1}).name, "Alice");
+  t.is(stmt.get({1: 2}).name, "Bob");
 });
 
 test.serial("Statement.get() [named]", async (t) => {
@@ -350,16 +350,16 @@ test.serial("Statement.get() [blob]", (t) => {
 
   // Create table with blob column
   db.exec("CREATE TABLE IF NOT EXISTS blobs (id INTEGER PRIMARY KEY, data BLOB)");
-
+  
   // Test inserting and retrieving blob data
   const binaryData = Buffer.from([0x48, 0x65, 0x6c, 0x6c, 0x6f, 0x20, 0x57, 0x6f, 0x72, 0x6c, 0x64]); // "Hello World"
   const insertStmt = db.prepare("INSERT INTO blobs (data) VALUES (?)");
   insertStmt.run([binaryData]);
-
+  
   // Retrieve the blob data
   const selectStmt = db.prepare("SELECT data FROM blobs WHERE id = 1");
   const result = selectStmt.get();
-
+  
   t.truthy(result, "Should return a result");
   t.true(Buffer.isBuffer(result.data), "Should return Buffer for blob data");
   t.deepEqual(result.data, binaryData, "Blob data should match original");
@@ -481,14 +481,14 @@ test.serial("Statement.columns()", async (t) => {
   stmt = await db.prepare("SELECT * FROM users WHERE id = ?");
   const columns2 = stmt.columns();
   t.is(columns2.length, 3);
-
+  
   // Check column names and types only
   t.is(columns2[0].name, "id");
   t.is(columns2[0].type, "INTEGER");
-
-  t.is(columns2[1].name, "name");
+  
+  t.is(columns2[1].name, "name");  
   t.is(columns2[1].type, "TEXT");
-
+  
   t.is(columns2[2].name, "email");
   t.is(columns2[2].type, "TEXT");
 });
@@ -510,7 +510,7 @@ test.skip("Timeout option", async (t) => {
     const end = Date.now();
     const elapsed = end - start;
     // Allow some tolerance for the timeout.
-    t.is(elapsed > timeout / 2, true);
+    t.is(elapsed > timeout/2, true);
   }
   fs.unlinkSync(path);
 });
@@ -521,7 +521,7 @@ const connect = async (path, options = {}) => {
   }
   const provider = process.env.PROVIDER;
   if (provider === "turso") {
-    const { Database, SqliteError } = await import("@tursodatabase/database/compat");
+    const { Database, SqliteError }= await import("@tursodatabase/database/compat");
     const db = new Database(path, options);
     return [db, path, provider, SqliteError];
   }
