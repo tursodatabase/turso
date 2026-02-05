@@ -2,6 +2,7 @@
   "type": "module",
   "scripts": {
     "build": "npm run build --workspaces",
+    "build:native": "npm run build --workspace=packages/common --workspace=packages/native",
     "tsc-build": "npm run tsc-build --workspaces",
     "test": "npm run test --workspaces"
   },
