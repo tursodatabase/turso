@@ -299,12 +299,7 @@ pub fn generate_create_table<C: Capabilities>(
 ) -> Result<Stmt, GenError> {
     // Generate a unique table name
     let existing_names = generator.schema().table_names();
-    let table_name = loop {
-        let name = format!("tbl_{}", ctx.gen_range(10000));
-        if !existing_names.contains(&name) {
-            break name;
-        }
-    };
+    let table_name = ctx.gen_unique_name("tbl", &existing_names);
 
     // Generate columns
     let num_cols = ctx.gen_range_inclusive(2, 6);
@@ -406,27 +401,18 @@ fn generate_alter_table_action<C: Capabilities>(
         GenError::exhausted("alter_table_action", "no valid alter table actions available")
     })?;
 
+    let existing_table_names = generator.schema().table_names();
+    let existing_col_names: std::collections::HashSet<String> =
+        table.columns.iter().map(|c| c.name.clone()).collect();
+
     match items[idx].0 {
         AlterTableActionKind::RenameTo => {
-            // Generate a unique new table name
-            let existing_names = generator.schema().table_names();
-            let new_name = loop {
-                let name = format!("tbl_{}", ctx.gen_range(10000));
-                if !existing_names.contains(&name) && name != table.name {
-                    break name;
-                }
-            };
+            let new_name =
+                ctx.gen_unique_name_excluding("tbl", &existing_table_names, &table.name);
             Ok(AlterTableAction::RenameTo(new_name))
         }
         AlterTableActionKind::AddColumn => {
-            // Generate a new column definition
-            let existing_col_names: Vec<_> = table.columns.iter().map(|c| &c.name).collect();
-            let col_name = loop {
-                let name = format!("col_{}", ctx.gen_range(10000));
-                if !existing_col_names.contains(&&name) {
-                    break name;
-                }
-            };
+            let col_name = ctx.gen_unique_name("col", &existing_col_names);
 
             let types = [
                 DataType::Integer,
@@ -448,21 +434,12 @@ fn generate_alter_table_action<C: Capabilities>(
         }
         AlterTableActionKind::DropColumn => {
             // Pick a non-primary-key column to drop
-            let droppable: Vec<_> = table
-                .columns
-                .iter()
-                .filter(|c| !c.primary_key)
-                .collect();
+            let droppable: Vec<_> = table.columns.iter().filter(|c| !c.primary_key).collect();
 
             if droppable.is_empty() {
                 // Fall back to RenameTo if no droppable columns
-                let existing_names = generator.schema().table_names();
-                let new_name = loop {
-                    let name = format!("tbl_{}", ctx.gen_range(10000));
-                    if !existing_names.contains(&name) && name != table.name {
-                        break name;
-                    }
-                };
+                let new_name =
+                    ctx.gen_unique_name_excluding("tbl", &existing_table_names, &table.name);
                 return Ok(AlterTableAction::RenameTo(new_name));
             }
 
@@ -470,27 +447,15 @@ fn generate_alter_table_action<C: Capabilities>(
             Ok(AlterTableAction::DropColumn(col.name.clone()))
         }
         AlterTableActionKind::RenameColumn => {
-            // Pick a column to rename
             if table.columns.is_empty() {
                 // Fall back to RenameTo if no columns
-                let existing_names = generator.schema().table_names();
-                let new_name = loop {
-                    let name = format!("tbl_{}", ctx.gen_range(10000));
-                    if !existing_names.contains(&name) && name != table.name {
-                        break name;
-                    }
-                };
+                let new_name =
+                    ctx.gen_unique_name_excluding("tbl", &existing_table_names, &table.name);
                 return Ok(AlterTableAction::RenameTo(new_name));
             }
 
             let col = ctx.choose(&table.columns).unwrap();
-            let existing_col_names: Vec<_> = table.columns.iter().map(|c| &c.name).collect();
-            let new_name = loop {
-                let name = format!("col_{}", ctx.gen_range(10000));
-                if !existing_col_names.contains(&&name) {
-                    break name;
-                }
-            };
+            let new_name = ctx.gen_unique_name("col", &existing_col_names);
 
             Ok(AlterTableAction::RenameColumn {
                 old_name: col.name.clone(),
@@ -512,12 +477,8 @@ pub fn generate_create_index<C: Capabilities>(
 
     // Generate unique index name
     let existing_names = generator.schema().index_names();
-    let index_name = loop {
-        let name = format!("idx_{}_{}", table.name, ctx.gen_range(10000));
-        if !existing_names.contains(&name) {
-            break name;
-        }
-    };
+    let prefix = format!("idx_{}", table.name);
+    let index_name = ctx.gen_unique_name(&prefix, &existing_names);
 
     // Select columns for the index
     let num_cols = ctx.gen_range_inclusive(1, table.columns.len().min(3));

@@ -234,6 +234,52 @@ impl Context {
     pub fn gen_bytes(&mut self, len: usize) -> Vec<u8> {
         (0..len).map(|_| self.rng.random()).collect()
     }
+
+    /// Generate a unique name with the given prefix that doesn't exist in the provided set.
+    ///
+    /// Generates names in the format `{prefix}_{random_number}` until finding one
+    /// that is not present in `existing`.
+    ///
+    /// # Panics
+    /// Panics if unable to find a unique name after 1,000,000 attempts.
+    pub fn gen_unique_name(
+        &mut self,
+        prefix: &str,
+        existing: &std::collections::HashSet<String>,
+    ) -> String {
+        for _ in 0..1_000_000 {
+            let name = format!("{}_{}", prefix, self.gen_range(10000));
+            if !existing.contains(&name) {
+                return name;
+            }
+        }
+        panic!("failed to generate unique name with prefix '{prefix}' after 1,000,000 attempts");
+    }
+
+    /// Generate a unique name with the given prefix, excluding both an existing set
+    /// and a specific excluded name.
+    ///
+    /// Useful when renaming something - the new name must not match existing names
+    /// AND must not match the current name.
+    ///
+    /// # Panics
+    /// Panics if unable to find a unique name after 1,000,000 attempts.
+    pub fn gen_unique_name_excluding(
+        &mut self,
+        prefix: &str,
+        existing: &std::collections::HashSet<String>,
+        exclude: &str,
+    ) -> String {
+        for _ in 0..1_000_000 {
+            let name = format!("{}_{}", prefix, self.gen_range(10000));
+            if !existing.contains(&name) && name != exclude {
+                return name;
+            }
+        }
+        panic!(
+            "failed to generate unique name with prefix '{prefix}' (excluding '{exclude}') after 1,000,000 attempts"
+        );
+    }
 }
 
 impl Default for Context {
@@ -351,5 +397,30 @@ mod tests {
         let s = ctx.gen_string(10);
         assert_eq!(s.len(), 10);
         assert!(s.chars().all(|c| c.is_ascii_alphanumeric()));
+    }
+
+    #[test]
+    fn test_gen_unique_name() {
+        let mut ctx = Context::new_with_seed(42);
+
+        let existing: std::collections::HashSet<String> = ["tbl_1", "tbl_2", "tbl_3"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let name = ctx.gen_unique_name("tbl", &existing);
+        assert!(name.starts_with("tbl_"));
+        assert!(!existing.contains(&name));
+    }
+
+    #[test]
+    fn test_gen_unique_name_excluding() {
+        let mut ctx = Context::new_with_seed(42);
+
+        let existing: std::collections::HashSet<String> =
+            ["tbl_1", "tbl_2"].into_iter().map(String::from).collect();
+        let name = ctx.gen_unique_name_excluding("tbl", &existing, "tbl_100");
+        assert!(name.starts_with("tbl_"));
+        assert!(!existing.contains(&name));
+        assert_ne!(name, "tbl_100");
     }
 }
