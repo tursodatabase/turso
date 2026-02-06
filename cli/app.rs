@@ -33,9 +33,7 @@ use std::{
 
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
-use turso_core::{
-    Connection, Database, DatabaseOpts, LimboError, OpenFlags, QueryMode, Statement, Value,
-};
+use turso_core::{Connection, Database, LimboError, OpenFlags, QueryMode, Statement, Value};
 
 #[derive(Parser, Debug)]
 #[command(name = "Turso")]
@@ -101,6 +99,7 @@ pub struct Limbo {
     pub interrupt_count: Arc<AtomicUsize>,
     input_buff: ManuallyDrop<String>,
     pub(crate) opts: Settings,
+    db_opts: turso_core::DatabaseOpts,
     read_state: ReadState,
     pub rl: Option<Editor<LimboHelper, DefaultHistory>>,
     config: Option<Config>,
@@ -203,17 +202,17 @@ impl Limbo {
             .as_ref()
             .map_or(":memory:".to_string(), |p| p.to_string_lossy().to_string());
 
+        let db_opts = turso_core::DatabaseOpts::new()
+            .with_views(opts.experimental_views)
+            .with_strict(opts.experimental_strict)
+            .with_encryption(opts.experimental_encryption)
+            .with_index_method(opts.experimental_index_method)
+            .with_autovacuum(opts.experimental_autovacuum)
+            .with_triggers(opts.experimental_triggers)
+            .with_attach(opts.experimental_attach);
+
         let (io, conn) = if db_file.contains([':', '?', '&', '#']) {
-            Connection::from_uri(
-                &db_file,
-                DatabaseOpts::new()
-                    .with_views(opts.experimental_views)
-                    .with_strict(opts.experimental_strict)
-                    .with_encryption(opts.experimental_encryption)
-                    .with_index_method(opts.experimental_index_method)
-                    .with_triggers(opts.experimental_triggers)
-                    .with_attach(opts.experimental_attach),
-            )?
+            Connection::from_uri(&db_file, db_opts)?
         } else {
             let flags = if opts.readonly {
                 OpenFlags::default().union(OpenFlags::ReadOnly)
@@ -224,15 +223,7 @@ impl Limbo {
                 &db_file,
                 opts.vfs.as_ref(),
                 flags,
-                turso_core::DatabaseOpts::new()
-                    .with_views(opts.experimental_views)
-                    .with_strict(opts.experimental_strict)
-                    .with_encryption(opts.experimental_encryption)
-                    .with_index_method(opts.experimental_index_method)
-                    .with_autovacuum(opts.experimental_autovacuum)
-                    .with_triggers(opts.experimental_triggers)
-                    .with_attach(opts.experimental_attach)
-                    .turso_cli(),
+                db_opts.turso_cli(),
                 None,
             )?;
             let conn = db.connect()?;
@@ -269,6 +260,7 @@ impl Limbo {
             input_buff: ManuallyDrop::new(sql.unwrap_or_default()),
             read_state: ReadState::default(),
             opts: Settings::from(opts),
+            db_opts,
             rl: None,
             config: Some(config),
         };
@@ -435,7 +427,16 @@ impl Limbo {
                     _path => get_io(DbLocation::Path, &self.opts.io.to_string())?,
                 }
             };
-            (io.clone(), Database::open_file(io.clone(), path)?)
+            (
+                io.clone(),
+                Database::open_file_with_flags(
+                    io.clone(),
+                    path,
+                    OpenFlags::default(),
+                    self.db_opts,
+                    None,
+                )?,
+            )
         };
         self.io = io;
         self.conn = db.connect()?;
