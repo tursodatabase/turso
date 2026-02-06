@@ -407,6 +407,48 @@ impl Expression {
             _ => false,
         }
     }
+
+    /// Returns true if this expression contains any subquery with LIMIT but no ORDER BY.
+    pub fn has_unordered_limit(&self) -> bool {
+        match self {
+            Expression::Subquery(s) => s.has_unordered_limit(),
+            Expression::Exists { subquery } | Expression::NotExists { subquery } => {
+                subquery.has_unordered_limit()
+            }
+            Expression::InSubquery { expr, subquery }
+            | Expression::NotInSubquery { expr, subquery } => {
+                expr.has_unordered_limit() || subquery.has_unordered_limit()
+            }
+            Expression::BinaryOp { left, right, .. } => {
+                left.has_unordered_limit() || right.has_unordered_limit()
+            }
+            Expression::UnaryOp { operand, .. } => operand.has_unordered_limit(),
+            Expression::Parenthesized(e) => e.has_unordered_limit(),
+            Expression::FunctionCall { args, .. } => {
+                args.iter().any(|a| a.has_unordered_limit())
+            }
+            Expression::Case {
+                operand,
+                when_clauses,
+                else_clause,
+            } => {
+                operand
+                    .as_ref()
+                    .is_some_and(|o| o.has_unordered_limit())
+                    || when_clauses
+                        .iter()
+                        .any(|(w, t)| w.has_unordered_limit() || t.has_unordered_limit())
+                    || else_clause
+                        .as_ref()
+                        .is_some_and(|e| e.has_unordered_limit())
+            }
+            Expression::Cast { expr, .. } => expr.has_unordered_limit(),
+            Expression::IsNull { expr } | Expression::IsNotNull { expr } => {
+                expr.has_unordered_limit()
+            }
+            Expression::Value(_) | Expression::Column(_) => false,
+        }
+    }
 }
 
 /// Profile for controlling expression generation weights.
