@@ -1,4 +1,5 @@
 use crate::sync::RwLock;
+use crate::turso_assert;
 use crossbeam_skiplist::map::Entry;
 use crossbeam_skiplist::SkipMap;
 
@@ -15,7 +16,7 @@ use crate::types::{
 };
 use crate::vdbe::make_record;
 use crate::vdbe::Register;
-use crate::{return_if_io, turso_assert, Completion, LimboError, Pager, Result};
+use crate::{return_if_io, Completion, LimboError, Pager, Result};
 use std::any::Any;
 use std::fmt::Debug;
 use std::ops::Bound;
@@ -293,7 +294,7 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
         mv_cursor_type: MvccCursorType,
         btree_cursor: Box<dyn CursorTrait>,
     ) -> Result<MvccLazyCursor<Clock>> {
-        assert!(
+        turso_assert!(
             (&*btree_cursor as &dyn Any).is::<BTreeCursor>(),
             "BTreeCursor expected for mvcc cursor"
         );
@@ -799,14 +800,15 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
                 .replace(MvccLazyCursorState::Rewind(RewindState::Advance));
         }
 
-        assert!(
+        turso_assert!(
             matches!(
                 self.state
                     .as_ref()
                     .expect("rewind state is not initialized"),
                 MvccLazyCursorState::Rewind(RewindState::Advance)
             ),
-            "Invalid last state {state:?}"
+            "invalid last state",
+            { "state": format!("{:?}", self.state) }
         );
 
         // Initialize btree cursor to last position
@@ -1418,7 +1420,7 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
         let Some(MvccLazyCursorState::Exists(ExistsState::ExistsBtree)) = self.state.clone() else {
             panic!("Invalid state {:?}", self.state);
         };
-        assert!(
+        turso_assert!(
             self.is_btree_allocated(),
             "BTree should be allocated when we are in ExistsBtree state"
         );
@@ -1530,14 +1532,15 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
                 .replace(MvccLazyCursorState::Rewind(RewindState::Advance));
         }
 
-        assert!(
+        turso_assert!(
             matches!(
                 self.state
                     .as_ref()
                     .expect("rewind state is not initialized"),
                 MvccLazyCursorState::Rewind(RewindState::Advance)
             ),
-            "Invalid rewind state {state:?}",
+            "invalid rewind state",
+            { "state": format!("{:?}", self.state) }
         );
         // First run btree_cursor rewind so that we don't need a explicit state machine.
         return_if_io!(self.advance_btree_forward());

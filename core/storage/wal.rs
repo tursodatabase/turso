@@ -3,6 +3,7 @@
 use crate::io::FileSyncType;
 use crate::sync::Mutex;
 use crate::sync::OnceLock;
+use crate::{turso_assert, turso_assert_greater_than, turso_debug_assert};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::array;
 use std::borrow::Cow;
@@ -29,8 +30,8 @@ use crate::storage::sqlite3_ondisk::{
 };
 use crate::types::{IOCompletions, IOResult};
 use crate::{
-    bail_corrupt_error, io_yield_one, turso_assert, Buffer, Completion, CompletionError, IOContext,
-    LimboError, Result,
+    bail_corrupt_error, io_yield_one, Buffer, Completion, CompletionError, IOContext, LimboError,
+    Result,
 };
 
 /// this contains the frame to rollback to and its associated checksum.
@@ -251,7 +252,7 @@ impl TursoRwLock {
     #[inline]
     pub fn downgrade(&self) {
         let cur = self.0.load(Ordering::Acquire);
-        debug_assert!(Self::has_writer(cur));
+        turso_debug_assert!(Self::has_writer(cur));
         // Preserve value bits, replace writer with one reader
         let desired = (cur & Self::VALUE_MASK) | Self::READER_INC;
         self.0.store(desired, Ordering::Release);
@@ -2154,7 +2155,7 @@ impl WalFile {
     }
 
     fn frame_offset(&self, frame_id: u64) -> u64 {
-        assert!(frame_id > 0, "Frame ID must be 1-based");
+        turso_assert_greater_than!(frame_id, 0, "Frame ID must be 1-based");
         let page_offset = (frame_id - 1) * (self.page_size() + WAL_FRAME_HEADER_SIZE as u32) as u64;
         WAL_HEADER_SIZE as u64 + page_offset
     }

@@ -1,4 +1,6 @@
 use crate::sync::Arc;
+use crate::turso_assert;
+use crate::turso_debug_assert;
 use crate::{
     index_method::{
         parse_patterns, IndexMethod, IndexMethodAttachment, IndexMethodConfiguration,
@@ -11,7 +13,6 @@ use crate::{
         pager::Pager,
     },
     translate::collate::CollationSeq,
-    turso_assert,
     types::{IOResult, ImmutableRecord, IndexInfo, KeyInfo, SeekKey, SeekOp, SeekResult, Text},
     vdbe::Register,
     Connection, LimboError, Result, Value,
@@ -979,7 +980,7 @@ impl FileHandle for LazyFileHandle {
             };
 
             // Defensive bounds check - should not be needed if logic is correct
-            debug_assert!(
+            turso_debug_assert!(
                 local_start <= chunk.len() && local_end <= chunk.len(),
                 "chunk slice out of bounds",
                 { "local_start": local_start, "local_end": local_end, "chunk_len": chunk.len() }

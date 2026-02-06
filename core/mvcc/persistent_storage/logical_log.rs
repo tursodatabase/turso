@@ -98,14 +98,15 @@
 //!
 //! Frame-level atomicity only: torn tails are discarded; partially written frames are not salvaged.
 #![allow(dead_code)]
+
 use crate::io::FileSyncType;
 use crate::sync::Arc;
 use crate::sync::RwLock;
+use crate::turso_assert;
 use crate::{
     io::ReadComplete,
     mvcc::database::{LogRecord, MVTableId, Row, RowID, RowKey, RowVersion, SortableIndexKey},
     storage::sqlite3_ondisk::{read_varint, varint_len, write_varint_to_vec},
-    turso_assert,
     types::IndexInfo,
     Buffer, Completion, CompletionError, LimboError, Result,
 };

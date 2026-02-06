@@ -11,7 +11,6 @@ use crate::{
         Arc, RwLock,
     },
     translate::collate::CollationSeq,
-    turso_assert,
     types::{IOCompletions, IOResult, Value, ValueRef},
     CompletionError, Result,
 };
@@ -19,7 +18,7 @@ use rapidhash::fast::RapidHasher;
 use std::cmp::{Eq, Ordering};
 use std::hash::Hasher;
 use std::{cell::RefCell, collections::VecDeque};
-use turso_macros::AtomicEnum;
+use turso_macros::{turso_debug_assert, AtomicEnum};
 
 const DEFAULT_SEED: u64 = 1337;
 
@@ -1675,7 +1674,7 @@ impl HashTable {
         if let Some(spill_state) = self.spill_state.as_ref() {
             let partition_idx = self.current_spill_partition_idx;
             // sanity check to ensure we cached the correct position
-            debug_assert_eq!(partition_idx, partition_from_hash(hash));
+            turso_debug_assert!(partition_idx == partition_from_hash(hash));
             let partition = spill_state.find_partition(partition_idx)?;
             if partition.buckets.is_empty() {
                 return None;

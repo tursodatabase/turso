@@ -5,6 +5,12 @@ use rustc_hash::FxHashSet as HashSet;
 use smallvec::SmallVec;
 use tracing::{instrument, Level};
 
+use super::{
+    pager::PageRef,
+    sqlite3_ondisk::{
+        write_varint_to_vec, IndexInteriorCell, IndexLeafCell, OverflowCell, MINIMUM_CELL_SIZE,
+    },
+};
 use crate::{
     io::CompletionGroup,
     io_yield_one,
@@ -34,7 +40,6 @@ use crate::{
     vdbe::Register,
     Completion, MvStore,
 };
-
 use crate::{
     numeric::Numeric,
     return_corrupt, return_if_io,
@@ -43,12 +48,9 @@ use crate::{
     },
     LimboError, Result,
 };
-
-use super::{
-    pager::PageRef,
-    sqlite3_ondisk::{
-        write_varint_to_vec, IndexInteriorCell, IndexLeafCell, OverflowCell, MINIMUM_CELL_SIZE,
-    },
+use crate::{
+    turso_assert_eq, turso_assert_greater_than, turso_assert_greater_than_or_equal,
+    turso_assert_less_than, turso_assert_less_than_or_equal, turso_assert_ne,
 };
 use std::{
     any::Any,
@@ -2308,7 +2310,7 @@ impl BTreeCursor {
 
                     if overflows {
                         *write_state = WriteState::Balancing;
-                        assert!(matches!(self.balance_state.sub_state, BalanceSubState::Start), "There should be no balancing operation in progress when insert state is {:?}, got: {:?}", self.state, self.balance_state.sub_state);
+                        turso_assert!(matches!(self.balance_state.sub_state, BalanceSubState::Start), "no balancing operation should be in progress during insert", { "state": format!("{:?}", self.state), "sub_state": format!("{:?}", self.balance_state.sub_state) });
                         // If we balance, we must save the cursor position and seek to it later.
                         self.save_context(CursorContext::seek_eq_only(bkey));
                     } else {
@@ -2351,7 +2353,7 @@ impl BTreeCursor {
                     };
                     if overflows || underflows {
                         *write_state = WriteState::Balancing;
-                        assert!(matches!(self.balance_state.sub_state, BalanceSubState::Start), "There should be no balancing operation in progress when overwrite state is {:?}, got: {:?}", self.state, self.balance_state.sub_state);
+                        turso_assert!(matches!(self.balance_state.sub_state, BalanceSubState::Start), "no balancing operation should be in progress during overwrite", { "state": format!("{:?}", self.state), "sub_state": format!("{:?}", self.balance_state.sub_state) });
                         // If we balance, we must save the cursor position and seek to it later.
                         self.save_context(CursorContext::seek_eq_only(bkey));
                     } else {
@@ -2403,7 +2405,7 @@ impl BTreeCursor {
             } = &mut self.balance_state;
             match sub_state {
                 BalanceSubState::Start => {
-                    assert!(
+                    turso_assert!(
                         balance_info.is_none(),
                         "BalanceInfo should be empty on start"
                     );
@@ -2857,7 +2859,7 @@ impl BTreeCursor {
                         {
                             let contents = page.get_contents();
                             debug_validate_cells!(&contents, usable_space);
-                            assert_eq!(contents.page_type().ok(), page_type_of_siblings);
+                            turso_assert_eq!(contents.page_type().ok(), page_type_of_siblings);
                         }
                     }
                     // Start balancing.
@@ -3101,7 +3103,7 @@ impl BTreeCursor {
                         for cell in &cell_array.cell_payloads {
                             cells_debug.push(cell.to_vec());
                             if is_leaf {
-                                assert!(cell[0] != 0)
+                                turso_assert_ne!(cell[0], 0);
                             }
                         }
                     }
@@ -3355,13 +3357,13 @@ impl BTreeCursor {
 
                         new_page_sizes[i] = size_right_page;
                         new_page_sizes[i - 1] = size_left_page;
-                        assert!(
-                            cell_array.cell_count_per_page_cumulative[i - 1]
-                                > if i > 1 {
-                                    cell_array.cell_count_per_page_cumulative[i - 2]
-                                } else {
-                                    0
-                                }
+                        turso_assert_greater_than!(
+                            cell_array.cell_count_per_page_cumulative[i - 1],
+                            if i > 1 {
+                                cell_array.cell_count_per_page_cumulative[i - 2]
+                            } else {
+                                0
+                            }
                         );
                     }
 
@@ -3658,10 +3660,10 @@ impl BTreeCursor {
                         // Let's ensure every page is pointed to by the divider cell or the rightmost pointer.
                         for page in pages_to_balance_new.iter().take(sibling_count_new) {
                             let page = page.as_ref().unwrap();
-                            assert!(
+                            turso_assert!(
                                 pages_pointed_to.contains(&(page.get().id as u32)),
-                                "page {} not pointed to by divider cell or rightmost pointer",
-                                page.get().id
+                                "page not pointed to by divider cell or rightmost pointer",
+                                { "page_id": page.get().id }
                             );
                         }
                     }
@@ -3773,13 +3775,14 @@ impl BTreeCursor {
                         // child page into the parent, decreasing the overall height of the
                         // b-tree structure by one. This is described as the "balance-shallower"
                         // sub-algorithm in some documentation.
-                        assert!(sibling_count_new == 1);
+                        turso_assert_eq!(sibling_count_new, 1);
                         let parent_offset = if parent_page.get().id == 1 {
                             DatabaseHeader::SIZE
                         } else {
                             0
                         };
-                        debug_assert_eq!(parent_offset, parent_contents.offset());
+                        #[cfg(debug_assertions)]
+                        turso_assert_eq!(parent_offset, parent_contents.offset());
 
                         // From SQLite:
                         // It is critical that the child page be defragmented before being
@@ -3810,7 +3813,7 @@ impl BTreeCursor {
                             );
 
                         sibling_count_new -= 1; // decrease sibling count for debugging and free at the end
-                        assert!(sibling_count_new < balance_info.sibling_count);
+                        turso_assert_less_than!(sibling_count_new, balance_info.sibling_count);
                     }
 
                     #[cfg(debug_assertions)]
@@ -3914,12 +3917,11 @@ impl BTreeCursor {
         };
 
         // Verify the left pointer points to the correct page
-        assert_eq!(
+        turso_assert_eq!(
             left_pointer,
             child_page.get().id as u32,
-            "the cell we just inserted doesn't point to the correct page. points to {}, should point to {}",
-            left_pointer,
-            child_page.get().id as u32
+            "inserted cell doesn't point to correct page",
+            { "left_pointer": left_pointer, "child_page_id": child_page.get().id }
         );
     }
 
@@ -4327,7 +4329,7 @@ impl BTreeCursor {
             valid = false;
         }
 
-        assert!(
+        turso_assert!(
             valid,
             "corrupted database, cells were not balanced properly"
         );
@@ -4353,7 +4355,8 @@ impl BTreeCursor {
 
         let is_page_1 = root.get().id == 1;
         let offset = if is_page_1 { DatabaseHeader::SIZE } else { 0 };
-        debug_assert_eq!(offset, root_contents.offset());
+        #[cfg(debug_assertions)]
+        turso_assert_eq!(offset, root_contents.offset());
 
         tracing::debug!(
             "balance_root(root={}, rightmost={}, page_type={:?})",
@@ -5266,8 +5269,8 @@ impl CursorTrait for BTreeCursor {
                     let (cell_payload, leaf_cell_idx) = {
                         let leaf_page = self.stack.top_ref();
                         let leaf_contents = leaf_page.get_contents();
-                        assert!(leaf_contents.is_leaf());
-                        assert!(leaf_contents.cell_count() > 0);
+                        turso_assert!(leaf_contents.is_leaf());
+                        turso_assert_greater_than!(leaf_contents.cell_count(), 0);
                         let leaf_cell_idx = leaf_contents.cell_count() - 1;
                         let last_cell_on_child_page =
                             leaf_contents.cell_get(leaf_cell_idx, usable_space)?;
@@ -5389,7 +5392,7 @@ impl CursorTrait for BTreeCursor {
                             }
                         }
                         let balance_both = leaf_underflows && interior_overflows_or_underflows;
-                        assert!(matches!(self.balance_state.sub_state, BalanceSubState::Start), "There should be no balancing operation in progress when delete state is {:?}, got: {:?}", self.state, self.balance_state.sub_state);
+                        turso_assert!(matches!(self.balance_state.sub_state, BalanceSubState::Start), "no balancing operation should be in progress during delete", { "sub_state": format!("{:?}", self.balance_state.sub_state) });
                         let post_balancing_seek_key = post_balancing_seek_key
                             .take()
                             .expect("post_balancing_seek_key should be Some");
@@ -5557,8 +5560,8 @@ impl CursorTrait for BTreeCursor {
 
                     let cell_idx = self.stack.current_cell_index() as usize;
 
-                    assert!(cell_idx <= contents.cell_count(),);
-                    assert!(!contents.is_leaf());
+                    turso_assert_less_than_or_equal!(cell_idx, contents.cell_count());
+                    turso_assert!(!contents.is_leaf());
 
                     if cell_idx == contents.cell_count() {
                         // Move to right child
@@ -5729,7 +5732,7 @@ impl CursorTrait for BTreeCursor {
                 }
                 SeekToLastState::IsEmpty => {
                     let is_empty = return_if_io!(self.is_empty_table());
-                    assert!(is_empty);
+                    turso_assert!(is_empty);
                     self.seek_to_last_state = SeekToLastState::Start;
                     return Ok(IOResult::Done(()));
                 }
@@ -5899,7 +5902,7 @@ impl IntegrityCheckState {
         page_category: PageCategory,
         errors: &mut Vec<IntegrityCheckError>,
     ) {
-        assert!(
+        turso_assert!(
             self.page_stack.is_empty(),
             "stack should be empty before integrity check for new root"
         );
@@ -6349,10 +6352,10 @@ impl PartialOrd for IntegrityCheckCellRange {
 #[cfg(debug_assertions)]
 fn validate_cells_after_insertion(cell_array: &CellArray, leaf_data: bool) {
     for cell in &cell_array.cell_payloads {
-        assert!(cell.len() >= 4);
+        turso_assert_greater_than_or_equal!(cell.len(), 4);
 
         if leaf_data {
-            assert!(cell[0] != 0, "payload is {cell:?}");
+            turso_assert!(cell[0] != 0);
         }
     }
 }
@@ -6463,10 +6466,11 @@ impl PageStack {
         }
         self.populate_parent_cell_count();
         self.current_page += 1;
-        assert!(self.current_page >= 0);
+        turso_assert_greater_than_or_equal!(self.current_page, 0);
         let current = self.current_page as usize;
-        assert!(
-            current < BTCURSOR_MAX_DEPTH,
+        turso_assert_less_than!(
+            current,
+            BTCURSOR_MAX_DEPTH,
             "corrupted database, stack is bigger than expected"
         );
 
@@ -6521,7 +6525,7 @@ impl PageStack {
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG, name = "pagestack::pop"))]
     fn pop(&mut self) {
         let current = self.current_page;
-        assert!(current >= 0);
+        turso_assert_greater_than_or_equal!(current, 0);
         tracing::trace!(current);
         let current = current as usize;
 
@@ -6530,7 +6534,7 @@ impl PageStack {
             page.unpin();
         }
 
-        assert!(current > 0);
+        turso_assert_greater_than!(current, 0);
         self.node_states[current] = BTreeNodeState::default();
         self.stack[current] = None;
         self.current_page -= 1;
@@ -6555,7 +6559,7 @@ impl PageStack {
     /// Current page pointer being used
     #[inline(always)]
     fn current(&self) -> usize {
-        assert!(self.current_page >= 0);
+        turso_assert_greater_than_or_equal!(self.current_page, 0);
         self.current_page as usize
     }
 
@@ -6773,13 +6777,12 @@ pub fn btree_init_page(page: &PageRef, page_type: PageType, offset: usize, usabl
         offset,
         usable_space
     );
-    debug_assert_eq!(
+    #[cfg(debug_assertions)]
+    //TODO restore format args (as the "details" last arg)
+    turso_assert_eq!(
         offset,
         contents.offset(),
-        "offset parameter {} doesn't match computed offset {} for page {}",
-        offset,
-        contents.offset(),
-        page.get().id
+        "offset doesn't match computed offset for page"
     );
     let id = page_type as u8;
     contents.write_page_type(id);
@@ -6852,7 +6855,7 @@ fn edit_page(
             cell_array,
             usable_space,
         )?;
-        assert!(count_cells >= number_tail_removed);
+        turso_assert_greater_than_or_equal!(count_cells, number_tail_removed);
         count_cells -= number_tail_removed;
         debug_validate_cells!(page, usable_space);
     }
@@ -6946,14 +6949,14 @@ fn page_free_array(
         let cell_pointer = cell.as_ptr_range();
         // check if not overflow cell
         if cell_pointer.start >= buf_range.start && cell_pointer.start < buf_range.end {
-            assert!(
+            turso_assert!(
                 cell_pointer.end >= buf_range.start && cell_pointer.end <= buf_range.end,
                 "whole cell should be inside the page"
             );
             // TODO: remove pointer too
             let offset = cell_pointer.start as usize - buf_range.start as usize;
             let len = cell_pointer.end as usize - cell_pointer.start as usize;
-            assert!(len > 0, "cell size should be greater than 0");
+            turso_assert_greater_than!(len, 0, "cell size should be greater than 0");
             let end = offset + len;
 
             /* Try to merge the current cell with a contiguous buffered cell to reduce the number of
@@ -7612,19 +7615,21 @@ fn defragment_page(page: &PageContent, usable_space: usize, max_frag_bytes: isiz
 fn debug_validate_cells_core(page: &PageContent, usable_space: usize) {
     for i in 0..page.cell_count() {
         let (offset, size) = page.cell_get_raw_region(i, usable_space).unwrap();
-        let buf = &page.as_ptr()[offset..offset + size];
+        let _buf = &page.as_ptr()[offset..offset + size];
         // E.g. the following table btree cell may just have two bytes:
         // Payload size 0 (stored as SerialTypeKind::ConstInt0)
         // Rowid 1 (stored as SerialTypeKind::ConstInt1)
-        assert!(
-            size >= 2,
-            "cell size should be at least 2 bytes idx={i}, cell={buf:?}, offset={offset}"
+        turso_assert_greater_than_or_equal!(
+            size, 2,
+            "cell size should be at least 2 bytes",
+            { "idx": i, "offset": offset, "buf": _buf }
         );
         if page.is_leaf() {
-            assert!(page.as_ptr()[offset] != 0);
+            turso_assert!(page.as_ptr()[offset] != 0);
         }
-        assert!(
-            offset + size <= usable_space,
+        turso_assert_less_than_or_equal!(
+            offset + size,
+            usable_space,
             "cell spans out of usable space"
         );
     }
@@ -7642,12 +7647,10 @@ fn _insert_into_cell(
     usable_space: usize,
     allow_regular_insert_despite_overflow: bool, // used during balancing to allow regular insert despite overflow cells
 ) -> Result<()> {
-    assert!(
-        cell_idx <= page.cell_count() + page.overflow_cells.len(),
-        "attempting to add cell to an incorrect place cell_idx={} cell_count={} page_type={:?}",
-        cell_idx,
-        page.cell_count(),
-        page.page_type().ok()
+    turso_assert_less_than_or_equal!(
+        cell_idx, page.cell_count() + page.overflow_cells.len(),
+        "attempting to add cell to incorrect place",
+        { "cell_idx": cell_idx, "cell_count": page.cell_count(), "overflow_count": page.overflow_cells.len(), "page_type": format!("{:?}", page.page_type()) }
     );
     let already_has_overflow = !page.overflow_cells.is_empty();
     let free = compute_free_space(page, usable_space);
@@ -7670,9 +7673,10 @@ fn _insert_into_cell(
         });
         return Ok(());
     }
-    assert!(
-        cell_idx <= page.cell_count(),
-        "cell_idx > page.cell_count() without overflow cells"
+    turso_assert_less_than_or_equal!(
+        cell_idx,
+        page.cell_count(),
+        "cell_idx > cell_count without overflow cells"
     );
 
     let new_cell_data_pointer = allocate_cell_space(page, payload.len(), usable_space, free)?;
@@ -7682,7 +7686,7 @@ fn _insert_into_cell(
         new_cell_data_pointer,
         payload.len()
     );
-    assert!(new_cell_data_pointer as usize + payload.len() <= usable_space);
+    turso_assert_less_than_or_equal!(new_cell_data_pointer as usize + payload.len(), usable_space);
     let buf = page.as_ptr();
 
     // copy data
@@ -7766,20 +7770,23 @@ fn compute_free_space(page: &PageContent, usable_space: usize) -> usize {
         }
 
         // Next should always be 0 (NULL) at this point since we have reached the end of the freeblocks linked list
-        assert_eq!(
+        turso_assert_eq!(
             next, 0,
-            "corrupted page: freeblocks list not in ascending order: cur_freeblock_ptr={cur_freeblock_ptr} size={size} next={next}"
+            "corrupted page, freeblocks list not in ascending order",
+            { "cur_freeblock_ptr": cur_freeblock_ptr, "size": size, "next": next }
         );
 
-        assert!(
-            cur_freeblock_ptr + size <= usable_space,
-            "corrupted page: last freeblock extends last page end"
+        turso_assert_less_than_or_equal!(
+            cur_freeblock_ptr + size,
+            usable_space,
+            "corrupted page, last freeblock extends past page end"
         );
     }
 
-    assert!(
-        free_space_bytes <= usable_space,
-        "corrupted page: free space is greater than usable space"
+    turso_assert_less_than_or_equal!(
+        free_space_bytes,
+        usable_space,
+        "corrupted page, free space is greater than usable space"
     );
 
     free_space_bytes - first_cell
@@ -7831,7 +7838,7 @@ fn allocate_cell_space(
     cell_content_area_start -= amount;
     page_ref.write_cell_content_area(cell_content_area_start);
 
-    assert!(cell_content_area_start + amount <= usable_space);
+    turso_assert_less_than_or_equal!(cell_content_area_start + amount, usable_space);
     // we can just return the start of the cell content area, since the cell is inserted to the very left of the cell content area.
     Ok(cell_content_area_start as u16)
 }
@@ -8083,7 +8090,7 @@ fn drop_cell(page: &mut PageContent, cell_idx: usize, usable_space: usize) -> Re
 /// the empty space that's not needed
 #[inline]
 fn shift_pointers_left(page: &mut PageContent, cell_idx: usize) {
-    assert!(page.cell_count() > 0);
+    turso_assert_greater_than!(page.cell_count(), 0);
     let buf = page.as_ptr();
     let (start, _) = page.cell_pointer_array_offset_and_size();
     let start = start + (cell_idx * 2) + 2;
