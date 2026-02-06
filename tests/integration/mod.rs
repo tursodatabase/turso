@@ -1,3 +1,4 @@
+mod assert_details;
 mod common;
 mod functions;
 mod fuzz_transaction;
