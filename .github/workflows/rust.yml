@@ -61,7 +61,7 @@ jobs:
           components: llvm-tools-preview
       - name: Setup mold linker
         if: runner.os == 'Linux'
-        uses: rui314/setup-mold@v1
+        uses: "./.github/shared/setup-mold"
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: "v1-rust"
@@ -118,7 +118,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - name: Setup mold linker
-        uses: rui314/setup-mold@v1
+        uses: "./.github/shared/setup-mold"
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: "v1-rust-shuttle"
@@ -137,7 +137,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - name: Setup mold linker
-        uses: rui314/setup-mold@v1
+        uses: "./.github/shared/setup-mold"
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: "v1-rust-shuttle"
@@ -196,7 +196,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - name: Setup mold linker
-        uses: rui314/setup-mold@v1
+        uses: "./.github/shared/setup-mold"
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: "v1-rust"
@@ -239,7 +239,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - name: Setup mold linker
-        uses: rui314/setup-mold@v1
+        uses: "./.github/shared/setup-mold"
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: "v1-rust"
@@ -269,7 +269,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - name: Setup mold linker
-        uses: rui314/setup-mold@v1
+        uses: "./.github/shared/setup-mold"
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: "v1-rust"
