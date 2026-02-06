@@ -84,7 +84,7 @@ jobs:
           RUST_LOG: ${{ runner.debug && 'turso_core::storage=trace' || '' }}
           LOCAL_SYNC_SERVER: "../../target/debug/tursodb"
         run: |
-          cargo llvm-cov nextest --workspace --all-features --locked --no-fail-fast -E 'not test(/^fuzz_tests::/)' --failure-output=final --html --output-dir coverage
+          cargo llvm-cov nextest --workspace --all-features --locked --no-fail-fast -E 'not binary(fuzz_tests)' --failure-output=final --html --output-dir coverage
           echo "::group::Coverage Summary"
           cargo llvm-cov report | tee coverage/summary.txt
           echo "::endgroup::"
@@ -94,7 +94,7 @@ jobs:
         env:
           RUST_LOG: ${{ runner.debug && 'turso_core::storage=trace' || '' }}
           LOCAL_SYNC_SERVER: "../../target/debug/tursodb"
-        run: cargo nextest run --workspace --all-features --locked --no-fail-fast -E 'not test(/^fuzz_tests::/)' --failure-output=final
+        run: cargo nextest run --workspace --all-features --locked --no-fail-fast -E 'not binary(fuzz_tests)' --failure-output=final
         timeout-minutes: ${{ matrix.os == 'windows-latest' && 60 || 20 }}
       - name: Test integrity_check corruption and short reads (no checksum feature because it interferes with the test)
         run: cargo nextest run -p core_tester --locked --no-fail-fast -E 'test(integrity_check) | test(short_read)' --failure-output=final

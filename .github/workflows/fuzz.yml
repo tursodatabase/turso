@@ -45,7 +45,7 @@ jobs:
     - name: Run fuzz tests
       env:
         RUST_BACKTRACE: 1
-      run: cargo nextest run --locked --no-fail-fast -E 'test(/^fuzz_tests::/)' --failure-output=final
+      run: cargo nextest run --locked --no-fail-fast -E 'binary(fuzz_tests)' --failure-output=final
 
   run-long-fuzz-tests:
     runs-on: blacksmith-4vcpu-ubuntu-2404
