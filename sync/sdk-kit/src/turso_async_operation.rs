@@ -2,7 +2,7 @@ use std::sync::{Arc, Mutex};
 
 use turso_sdk_kit::{
     capi::c::turso_slice_ref_t,
-    rsapi::{self, TursoError, turso_slice_from_bytes},
+    rsapi::{self, turso_slice_from_bytes, TursoError},
 };
 
 use crate::{

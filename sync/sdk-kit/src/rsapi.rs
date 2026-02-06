@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use parking_lot::{Mutex, RwLock};
-use turso_core::{IO, MemoryIO};
-use turso_sdk_kit::rsapi::{TursoError, str_from_c_str};
+use turso_core::{MemoryIO, IO};
+use turso_sdk_kit::rsapi::{str_from_c_str, TursoError};
 use turso_sync_engine::{
     database_sync_engine::{self, DatabaseSyncEngine},
     database_sync_engine_io::SyncEngineIo,
@@ -515,36 +515,61 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
     /// - Set to the same value as before
     ///
     /// Attempting to change from one URL to a different URL will return an error.
+    /// This method propagates the change to the underlying sync engine if it's initialized.
     pub fn set_url(&self, url: Option<String>) -> Result<(), TursoError> {
-        let mut params = self.lazy_params.write();
-        match (&params.remote_url, &url) {
-            // Allow setting from None to Some
-            (None, Some(_)) => {
-                params.remote_url = url;
-                Ok(())
+        // First, update local lazy params
+        {
+            let mut params = self.lazy_params.write();
+            match (&params.remote_url, &url) {
+                // Allow setting from None to Some
+                (None, Some(_)) => {
+                    params.remote_url = url.clone();
+                }
+                // Allow setting to the same value
+                (Some(current), Some(new)) if current == new => {}
+                // Allow setting None to None (no-op)
+                (None, None) => {}
+                // Disallow unsetting
+                (Some(current), None) => {
+                    return Err(TursoError::Misuse(format!(
+                        "cannot unset remote_url: current value is '{current}'"
+                    )));
+                }
+                // Disallow changing from one value to another
+                (Some(current), Some(new)) => {
+                    return Err(TursoError::Misuse(format!(
+                        "cannot change remote_url from '{current}' to '{new}'"
+                    )));
+                }
             }
-            // Allow setting to the same value
-            (Some(current), Some(new)) if current == new => Ok(()),
-            // Allow setting None to None (no-op)
-            (None, None) => Ok(()),
-            // Allow setting Some to None only if already None (already handled above)
-            (Some(current), None) => Err(TursoError::Misuse(format!(
-                "cannot unset remote_url: current value is '{current}'"
-            ))),
-            // Disallow changing from one value to another
-            (Some(current), Some(new)) => Err(TursoError::Misuse(format!(
-                "cannot change remote_url from '{current}' to '{new}'"
-            ))),
         }
+
+        // Then, propagate to sync engine if initialized
+        if let Some(sync_engine) = self.sync_engine.lock().as_ref() {
+            sync_engine.set_url(url).map_err(|e| {
+                TursoError::Misuse(format!("failed to set url in sync engine: {e}"))
+            })?;
+        }
+
+        Ok(())
     }
 
     /// Set the authorization token for HTTP requests.
     ///
     /// This method allows changing the auth token at any time. The token is used
     /// for Authorization header in HTTP requests to Turso Cloud.
+    /// This method propagates the change to the underlying sync engine if it's initialized.
     pub fn set_auth_token(&self, auth_token: Option<String>) {
-        let mut params = self.lazy_params.write();
-        params.auth_token = auth_token;
+        // Update local lazy params
+        {
+            let mut params = self.lazy_params.write();
+            params.auth_token = auth_token.clone();
+        }
+
+        // Propagate to sync engine if initialized
+        if let Some(sync_engine) = self.sync_engine.lock().as_ref() {
+            sync_engine.set_auth_token(auth_token);
+        }
     }
 
     /// Set the encryption key for Turso Cloud encrypted databases.
@@ -555,27 +580,43 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
     ///
     /// Attempting to change from one key to a different key will return an error.
     /// The key should be base64-encoded.
+    /// This method propagates the change to the underlying sync engine if it's initialized.
     pub fn set_encryption_key(&self, key: Option<String>) -> Result<(), TursoError> {
-        let mut params = self.lazy_params.write();
-        match (&params.remote_encryption_key, &key) {
-            // Allow setting from None to Some
-            (None, Some(_)) => {
-                params.remote_encryption_key = key;
-                Ok(())
+        // First, update local lazy params
+        {
+            let mut params = self.lazy_params.write();
+            match (&params.remote_encryption_key, &key) {
+                // Allow setting from None to Some
+                (None, Some(_)) => {
+                    params.remote_encryption_key = key.clone();
+                }
+                // Allow setting to the same value
+                (Some(current), Some(new)) if current == new => {}
+                // Allow setting None to None (no-op)
+                (None, None) => {}
+                // Disallow unsetting
+                (Some(_), None) => {
+                    return Err(TursoError::Misuse(
+                        "cannot unset remote_encryption_key".to_string(),
+                    ));
+                }
+                // Disallow changing from one value to another
+                (Some(_), Some(_)) => {
+                    return Err(TursoError::Misuse(
+                        "cannot change remote_encryption_key to a different value".to_string(),
+                    ));
+                }
             }
-            // Allow setting to the same value
-            (Some(current), Some(new)) if current == new => Ok(()),
-            // Allow setting None to None (no-op)
-            (None, None) => Ok(()),
-            // Disallow unsetting
-            (Some(_), None) => Err(TursoError::Misuse(
-                "cannot unset remote_encryption_key".to_string(),
-            )),
-            // Disallow changing from one value to another
-            (Some(_), Some(_)) => Err(TursoError::Misuse(
-                "cannot change remote_encryption_key to a different value".to_string(),
-            )),
         }
+
+        // Then, propagate to sync engine if initialized
+        if let Some(sync_engine) = self.sync_engine.lock().as_ref() {
+            sync_engine.set_encryption_key(key).map_err(|e| {
+                TursoError::Misuse(format!("failed to set encryption key in sync engine: {e}"))
+            })?;
+        }
+
+        Ok(())
     }
 
     /// Get the current remote URL.
