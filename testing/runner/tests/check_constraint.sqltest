@@ -1222,3 +1222,60 @@ test check_constraint_rowid_alias_column_qualified_violation {
 }
 expect error {
 }
+
+# CHECK constraint should still work after ALTER TABLE RENAME COLUMN (column-level)
+test check_constraint_rename_column_inline {
+    CREATE TABLE t(a INTEGER CHECK(a > 0));
+    ALTER TABLE t RENAME COLUMN a TO b;
+    INSERT INTO t(b) VALUES(1);
+    SELECT b FROM t;
+}
+expect {
+    1
+}
+
+test check_constraint_rename_column_inline_violation {
+    CREATE TABLE t(a INTEGER CHECK(a > 0));
+    ALTER TABLE t RENAME COLUMN a TO b;
+    INSERT INTO t(b) VALUES(-1);
+}
+expect error {
+}
+
+# CHECK constraint should still work after ALTER TABLE RENAME COLUMN (table-level)
+test check_constraint_rename_column_table_level {
+    CREATE TABLE t(a INTEGER, CHECK(a > 0));
+    ALTER TABLE t RENAME COLUMN a TO b;
+    INSERT INTO t(b) VALUES(1);
+    SELECT b FROM t;
+}
+expect {
+    1
+}
+
+test check_constraint_rename_column_table_level_violation {
+    CREATE TABLE t(a INTEGER, CHECK(a > 0));
+    ALTER TABLE t RENAME COLUMN a TO b;
+    INSERT INTO t(b) VALUES(-1);
+}
+expect error {
+}
+
+# CHECK constraint with qualified column ref should work after RENAME COLUMN
+test check_constraint_rename_column_qualified_ref {
+    CREATE TABLE t(x INTEGER, CHECK(t.x > 0));
+    ALTER TABLE t RENAME COLUMN x TO y;
+    INSERT INTO t(y) VALUES(1);
+    SELECT y FROM t;
+}
+expect {
+    1
+}
+
+test check_constraint_rename_column_qualified_ref_violation {
+    CREATE TABLE t(x INTEGER, CHECK(t.x > 0));
+    ALTER TABLE t RENAME COLUMN x TO y;
+    INSERT INTO t(y) VALUES(-1);
+}
+expect error {
+}

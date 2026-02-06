@@ -20,9 +20,9 @@ use crate::types::{
     ImmutableRecord, IndexInfo, SeekResult, Text,
 };
 use crate::util::{
-    normalize_ident, rewrite_column_references_if_needed, rewrite_fk_parent_cols_if_self_ref,
-    rewrite_fk_parent_table_if_needed, rewrite_inline_col_fk_target_if_needed,
-    trim_ascii_whitespace,
+    normalize_ident, rewrite_check_expr_column_refs, rewrite_column_references_if_needed,
+    rewrite_fk_parent_cols_if_self_ref, rewrite_fk_parent_table_if_needed,
+    rewrite_inline_col_fk_target_if_needed, trim_ascii_whitespace,
 };
 use crate::vdbe::affinity::{apply_numeric_affinity, try_for_float, Affinity, ParsedNumber};
 use crate::vdbe::hash_table::{HashEntry, HashTable, HashTableConfig, DEFAULT_MEM_BUDGET};
@@ -6097,17 +6097,23 @@ pub fn op_function(
                                                     column_def.col_name.as_str(),
                                                 );
                                             }
-                                            _ => {}
+                                            ast::TableConstraint::Check(ref mut expr) => {
+                                                rewrite_check_expr_column_refs(
+                                                    expr,
+                                                    &rename_from,
+                                                    column_def.col_name.as_str(),
+                                                );
+                                            }
                                         }
+                                    }
 
-                                        for col in &mut columns {
-                                            rewrite_column_references_if_needed(
-                                                col,
-                                                &normalized_tbl_name,
-                                                &rename_from,
-                                                column_def.col_name.as_str(),
-                                            );
-                                        }
+                                    for col in &mut columns {
+                                        rewrite_column_references_if_needed(
+                                            col,
+                                            &normalized_tbl_name,
+                                            &rename_from,
+                                            column_def.col_name.as_str(),
+                                        );
                                     }
                                 } else {
                                     // This is a different table, check if it has FKs referencing the renamed column
@@ -10416,13 +10422,25 @@ pub fn op_alter_column(
             }
         }
 
+        // Update CHECK constraint expressions to reference the new column name
+        let old_col_normalized = normalize_ident(&old_column_name);
+        for check in &mut btree.check_constraints {
+            rewrite_check_expr_column_refs(&mut check.expr, &old_col_normalized, &new_name);
+            check.sql = format!("CHECK ({})", check.expr);
+            if let Some(ref mut col) = check.column {
+                if col.eq_ignore_ascii_case(&old_column_name) {
+                    *col = new_name.clone();
+                }
+            }
+        }
+
         // Maintain rowid-alias bit after change/rename (INTEGER PRIMARY KEY)
         if !*rename {
             // recompute alias from `new_column`
             btree.columns[*column_index].set_rowid_alias(new_column.is_rowid_alias());
         }
 
-        // Update this table’s OWN foreign keys
+        // Update this table's OWN foreign keys
         for fk_arc in &mut btree.foreign_keys {
             let fk = Arc::make_mut(fk_arc);
             // child side: rename child column if it matches

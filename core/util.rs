@@ -1580,6 +1580,37 @@ pub fn rewrite_fk_parent_cols_if_self_ref(
     }
 }
 
+/// Rewrite column name references in a CHECK constraint expression.
+/// Replaces `Id(old)` and `Name(old)` with `Id(new)`, and updates the
+/// column name in `Qualified(tbl, old)` references.
+pub fn rewrite_check_expr_column_refs(expr: &mut ast::Expr, from: &str, to: &str) {
+    let from_normalized = normalize_ident(from);
+    // The closure is infallible, so walk_expr_mut cannot fail.
+    let _ = walk_expr_mut(
+        expr,
+        &mut |e: &mut ast::Expr| -> crate::Result<WalkControl> {
+            match e {
+                ast::Expr::Id(ref name) | ast::Expr::Name(ref name)
+                    if normalize_ident(name.as_str()) == from_normalized =>
+                {
+                    *e = ast::Expr::Id(ast::Name::exact(to.to_owned()));
+                }
+                ast::Expr::Qualified(_, ref col_name)
+                    if normalize_ident(col_name.as_str()) == from_normalized =>
+                {
+                    let ast::Expr::Qualified(ref tbl, _) = *e else {
+                        unreachable!()
+                    };
+                    let tbl = tbl.clone();
+                    *e = ast::Expr::Qualified(tbl, ast::Name::exact(to.to_owned()));
+                }
+                _ => {}
+            }
+            Ok(WalkControl::Continue)
+        },
+    );
+}
+
 /// Update a column-level REFERENCES <tbl>(col,...) constraint
 pub fn rewrite_column_references_if_needed(
     col: &mut ast::ColumnDefinition,
@@ -1588,12 +1619,14 @@ pub fn rewrite_column_references_if_needed(
     to: &str,
 ) {
     for cc in &mut col.constraints {
-        if let ast::NamedColumnConstraint {
-            constraint: ast::ColumnConstraint::ForeignKey { clause, .. },
-            ..
-        } = cc
-        {
-            rewrite_fk_parent_cols_if_self_ref(clause, table, from, to);
+        match &mut cc.constraint {
+            ast::ColumnConstraint::ForeignKey { clause, .. } => {
+                rewrite_fk_parent_cols_if_self_ref(clause, table, from, to);
+            }
+            ast::ColumnConstraint::Check(expr) => {
+                rewrite_check_expr_column_refs(expr, from, to);
+            }
+            _ => {}
         }
     }
 }
