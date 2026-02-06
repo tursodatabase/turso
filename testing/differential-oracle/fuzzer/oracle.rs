@@ -123,6 +123,11 @@ impl Oracle for DifferentialOracle {
             (QueryResult::Rows(rows), QueryResult::Ok) => {
                 if rows.is_empty() {
                     OracleResult::Pass
+                } else if has_unordered_limit {
+                    OracleResult::Warning(format!(
+                        "Turso returned {} rows but SQLite returned no rows for unordered LIMIT query (results may vary due to undefined order):\n  SQL: {stmt}",
+                        rows.len()
+                    ))
                 } else {
                     OracleResult::Fail(format!(
                         "Turso returned {} rows but SQLite returned no rows:\n  SQL: {stmt}",
@@ -133,6 +138,11 @@ impl Oracle for DifferentialOracle {
             (QueryResult::Ok, QueryResult::Rows(rows)) => {
                 if rows.is_empty() {
                     OracleResult::Pass
+                } else if has_unordered_limit {
+                    OracleResult::Warning(format!(
+                        "SQLite returned {} rows but Turso returned no rows for unordered LIMIT query (results may vary due to undefined order):\n  SQL: {stmt}",
+                        rows.len()
+                    ))
                 } else {
                     OracleResult::Fail(format!(
                         "SQLite returned {} rows but Turso returned no rows:\n  SQL: {stmt}",
