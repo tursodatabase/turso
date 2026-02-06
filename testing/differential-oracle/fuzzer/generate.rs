@@ -56,6 +56,13 @@ impl SqlGenBackend {
             .with_function_config(sql_gen::FunctionConfig::deterministic());
         policy.select_config.nulls_order_weights.first = 0;
         policy.select_config.nulls_order_weights.last = 0;
+        // Disable expression values and conflict clauses for now
+        policy.insert_config.expression_value_probability = 0.0;
+        policy.insert_config.or_replace_probability = 0.0;
+        policy.insert_config.or_ignore_probability = 0.0;
+        policy.update_config.expression_value_probability = 0.0;
+        policy.update_config.or_replace_probability = 0.0;
+        policy.update_config.or_ignore_probability = 0.0;
         Self { ctx, policy }
     }
 }
