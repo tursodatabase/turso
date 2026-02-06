@@ -1,5 +1,10 @@
-import { expect, test } from 'vitest'
+import { expect, test, afterAll } from 'vitest'
 import { Database, connect, DatabaseRowMutation, DatabaseRowTransformResult } from './promise-default.js'
+import { MainWorker } from './index-default.js'
+
+afterAll(() => {
+    MainWorker?.terminate();
+})
 
 const localeCompare = (a, b) => a.x.localeCompare(b.x);
 const intCompare = (a, b) => a.x - b.x;

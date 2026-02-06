@@ -1,5 +1,10 @@
-import { expect, test } from 'vitest'
+import { expect, test, afterAll } from 'vitest'
 import { connect, Database } from './promise-default.js'
+import { MainWorker } from './index-default.js'
+
+afterAll(() => {
+    MainWorker?.terminate();
+})
 
 test('vector-test', async () => {
     const db = await connect(":memory:");
