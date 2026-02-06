@@ -44,13 +44,16 @@ class TursoServer:
             self._db_url = f"http://localhost:{port}"
             self._host = ""
             # wait for server to be available
-            while True:
+            deadline = time.time() + 30
+            while time.time() < deadline:
                 try:
-                    requests.get(self._user_url)
+                    requests.get(self._user_url, timeout=5)
                     break
                 except Exception:
                     time.sleep(0.1)
-            return
+            else:
+                self._server.kill()
+                raise TimeoutError("sync server did not become available within 30s")
 
     def __enter__(self):
         return self
