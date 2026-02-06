@@ -203,7 +203,7 @@ pub fn translate_create_table(
         false
     };
 
-    let sql = create_table_body_to_str(&tbl_name, &body);
+    let sql = create_table_body_to_str(&tbl_name, &body)?;
 
     let parse_schema_label = program.allocate_label();
     // TODO: ReadCookie
@@ -471,7 +471,10 @@ fn collect_autoindexes(
     }
 }
 
-fn create_table_body_to_str(tbl_name: &ast::QualifiedName, body: &ast::CreateTableBody) -> String {
+fn create_table_body_to_str(
+    tbl_name: &ast::QualifiedName,
+    body: &ast::CreateTableBody,
+) -> crate::Result<String> {
     let mut sql = String::new();
     sql.push_str(format!("CREATE TABLE {} {}", tbl_name.name.as_ident(), body).as_str());
     match body {
@@ -480,9 +483,11 @@ fn create_table_body_to_str(tbl_name: &ast::QualifiedName, body: &ast::CreateTab
             constraints: _,
             options: _,
         } => {}
-        ast::CreateTableBody::AsSelect(_select) => todo!("as select not yet supported"),
+        ast::CreateTableBody::AsSelect(_select) => {
+            crate::bail_parse_error!("CREATE TABLE AS SELECT is not supported")
+        }
     }
-    sql
+    Ok(sql)
 }
 
 fn create_vtable_body_to_str(vtab: &ast::CreateVirtualTable, module: Arc<VTabImpl>) -> String {
@@ -955,7 +960,7 @@ pub fn translate_drop_table(
         program.emit_column_or_rowid(sqlite_schema_cursor_id_1, 0, schema_column_0_register);
         program.emit_column_or_rowid(sqlite_schema_cursor_id_1, 1, schema_column_1_register);
         program.emit_column_or_rowid(sqlite_schema_cursor_id_1, 2, schema_column_2_register);
-        let root_page = table.get_root_page();
+        let root_page = table.get_root_page()?;
         program.emit_insn(Insn::Integer {
             value: root_page,
             dest: moved_to_root_page_register,
