@@ -1517,6 +1517,8 @@ pub enum PragmaName {
     /// Use F_FULLFSYNC instead of fsync on macOS (only supported on macOS)
     #[cfg(target_vendor = "apple")]
     Fullfsync,
+    /// Returns the list of indexes associated with a table
+    IndexList,
     /// Run integrity check on the database file
     IntegrityCheck,
     /// `journal_mode` pragma
