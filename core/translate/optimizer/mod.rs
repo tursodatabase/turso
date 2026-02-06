@@ -1,6 +1,7 @@
 use crate::{
     function::Deterministic,
     index_method::IndexMethodCostEstimate,
+    numeric::Numeric,
     schema::{BTreeTable, Index, IndexColumn, Schema, Table, ROWID_SENTINEL},
     translate::{
         insert::ROWID_COLUMN,
@@ -2000,24 +2001,15 @@ impl Optimizable for ast::Expr {
                     Ok(None)
                 }
                 ast::Literal::String(s) => {
+                    // Use Numeric::from to match SQLite's string-to-numeric conversion,
+                    // which extracts leading numeric prefixes (e.g., '9S' -> 9, 'abc' -> 0)
                     let without_quotes = s.trim_matches('\'');
-                    if let Ok(int_value) = without_quotes.parse::<i64>() {
-                        return Ok(Some(if int_value == 0 {
-                            AlwaysTrueOrFalse::AlwaysFalse
-                        } else {
-                            AlwaysTrueOrFalse::AlwaysTrue
-                        }));
+                    let numeric = Numeric::from(without_quotes);
+                    match numeric.try_into_bool() {
+                        Some(true) => Ok(Some(AlwaysTrueOrFalse::AlwaysTrue)),
+                        Some(false) => Ok(Some(AlwaysTrueOrFalse::AlwaysFalse)),
+                        None => Ok(None),
                     }
-
-                    if let Ok(float_value) = without_quotes.parse::<f64>() {
-                        return Ok(Some(if float_value == 0.0 {
-                            AlwaysTrueOrFalse::AlwaysFalse
-                        } else {
-                            AlwaysTrueOrFalse::AlwaysTrue
-                        }));
-                    }
-
-                    Ok(Some(AlwaysTrueOrFalse::AlwaysFalse))
                 }
                 _ => Ok(None),
             },
