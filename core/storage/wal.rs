@@ -331,6 +331,9 @@ pub trait Wal: Debug + Send + Sync {
     /// Returns true if this WAL instance currently holds a read lock.
     fn holds_read_lock(&self) -> bool;
 
+    /// Returns true if this WAL instance currently holds the write lock.
+    fn holds_write_lock(&self) -> bool;
+
     /// Find the latest frame containing a page.
     ///
     /// optional frame_watermark parameter can be passed to force WAL to find frame not larger than watermark value
@@ -703,6 +706,7 @@ pub struct WalFile {
     buffer_pool: Arc<BufferPool>,
 
     syncing: Arc<AtomicBool>,
+    write_lock_held: AtomicBool,
 
     shared: Arc<RwLock<WalFileShared>>,
     ongoing_checkpoint: RwLock<OngoingCheckpoint>,
@@ -1201,6 +1205,10 @@ impl Wal for WalFile {
                 self.max_frame_read_lock_index.load(Ordering::Acquire) != NO_LOCK_HELD,
                 "must have a read transaction to begin a write transaction"
             );
+            turso_assert!(
+                !self.holds_write_lock(),
+                "write lock already held by this connection"
+            );
             if !shared.write_lock.write() {
                 return Err(LimboError::Busy);
             }
@@ -1217,6 +1225,17 @@ impl Wal for WalFile {
 
             Ok(())
         })?;
+        if self
+            .write_lock_held
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            self.with_shared(|shared| shared.write_lock.unlock());
+            turso_assert!(
+                false,
+                "begin_write_tx called while write lock already held according to connection state"
+            );
+        }
 
         let result = self.try_restart_log_before_write();
         if let Err(LimboError::Busy) | Ok(()) = &result {
@@ -1228,6 +1247,12 @@ impl Wal for WalFile {
         self.with_shared(|shared| {
             shared.write_lock.unlock();
         });
+        turso_assert!(
+            self.write_lock_held
+                .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok(),
+            "end_write_tx called while write lock not held according to connection state"
+        );
 
         Err(result.expect_err("Ok case handled above"))
     }
@@ -1236,12 +1261,23 @@ impl Wal for WalFile {
     #[instrument(skip_all, level = Level::DEBUG)]
     fn end_write_tx(&self) {
         tracing::debug!("end_write_txn");
+        turso_assert!(
+            self.write_lock_held
+                .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok(),
+            "end_write_tx called while write lock not held according to connection state"
+        );
         self.with_shared(|shared| shared.write_lock.unlock());
     }
 
     /// Returns true if this WAL instance currently holds a read lock.
     fn holds_read_lock(&self) -> bool {
         self.max_frame_read_lock_index.load(Ordering::Acquire) != NO_LOCK_HELD
+    }
+
+    /// Returns true if this WAL instance currently holds the write lock.
+    fn holds_write_lock(&self) -> bool {
+        self.write_lock_held.load(Ordering::Acquire)
     }
 
     /// Find the latest frame containing a page.
@@ -2105,6 +2141,7 @@ impl WalFile {
             buffer_pool,
             checkpoint_seq: AtomicU32::new(0),
             syncing: Arc::new(AtomicBool::new(false)),
+            write_lock_held: AtomicBool::new(false),
             min_frame: AtomicU64::new(0),
             transaction_count: AtomicU64::new(0),
             max_frame_read_lock_index: AtomicUsize::new(NO_LOCK_HELD),

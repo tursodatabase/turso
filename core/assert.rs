@@ -15,12 +15,18 @@ macro_rules! turso_assert {
 #[macro_export]
 macro_rules! turso_assert {
     ($cond:expr, $msg:literal, $($optional:tt)+) => {
-        antithesis_sdk::assert_always_or_unreachable!($cond, $msg);
-        assert!($cond, $msg, $($optional)+);
+        {
+            let __cond = $cond;
+            antithesis_sdk::assert_always_or_unreachable!(__cond, $msg);
+            assert!(__cond, $msg, $($optional)+);
+        }
     };
     ($cond:expr, $msg:literal) => {
-        antithesis_sdk::assert_always_or_unreachable!($cond, $msg);
-        assert!($cond, $msg);
+        {
+            let __cond = $cond;
+            antithesis_sdk::assert_always_or_unreachable!(__cond, $msg);
+            assert!(__cond, $msg);
+        }
     };
 }
 

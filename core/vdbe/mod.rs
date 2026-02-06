@@ -369,7 +369,6 @@ pub struct ProgramState {
     view_delta_state: ViewDeltaCommitState,
     /// Marker which tells about auto transaction cleanup necessary for that connection in case of reset
     /// This is used when statement in auto-commit mode reseted after previous uncomplete execution - in which case we may need to rollback transaction started on previous attempt
-    /// Note, that MVCC transactions are always explicit - so they do not update auto_txn_cleanup marker
     pub(crate) auto_txn_cleanup: TxnCleanup,
     /// Number of deferred foreign key violations when the statement started.
     /// When a statement subtransaction rolls back, the connection's deferred foreign key violations counter
@@ -1383,6 +1382,7 @@ impl Program {
                         assert!(state_machine.is_finalized());
                         conn.set_mv_tx(None);
                         conn.set_tx_state(TransactionState::None);
+                        pager.end_read_tx();
                         program_state.commit_state = CommitState::Ready;
                         return Ok(IOResult::Done(()));
                     }
@@ -1571,6 +1571,7 @@ impl Program {
                 self.connection.auto_commit.store(true, Ordering::SeqCst);
                 mv_store.rollback_tx(tx_id, pager.clone(), &self.connection);
             }
+            pager.end_read_tx();
         } else {
             pager.rollback_tx(&self.connection);
             self.connection.auto_commit.store(true, Ordering::SeqCst);

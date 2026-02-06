@@ -1014,10 +1014,20 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 Ok(TransitionResult::Done(()))
             }
             CommitState::Checkpoint { state_machine } => {
-                match state_machine.lock().step(&())? {
-                    IOResult::Done(_) => {}
-                    IOResult::IO(iocompletions) => {
+                let step_result = {
+                    let mut sm = state_machine.lock();
+                    sm.step(&())
+                };
+                match step_result {
+                    Ok(IOResult::Done(_)) => {}
+                    Ok(IOResult::IO(iocompletions)) => {
                         return Ok(TransitionResult::Io(iocompletions));
+                    }
+                    Err(err) => {
+                        // Auto-checkpoint errors should not surface to the committed statement.
+                        tracing::info!("MVCC auto-checkpoint failed: {err}");
+                        self.finalize(mvcc_store)?;
+                        return Ok(TransitionResult::Done(()));
                     }
                 }
                 self.finalize(mvcc_store)?;

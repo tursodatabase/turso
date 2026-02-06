@@ -1561,6 +1561,67 @@ fn test_insert_with_checkpoint() {
 }
 
 #[test]
+fn test_auto_checkpoint_busy_is_ignored() {
+    let db = MvccTestDb::new();
+    db.mvcc_store.set_checkpoint_threshold(0);
+
+    // Keep a second transaction open to hold the checkpoint read lock.
+    let tx1 = db
+        .mvcc_store
+        .begin_tx(db.conn.pager.load().clone())
+        .unwrap();
+    let tx2 = db
+        .mvcc_store
+        .begin_tx(db.conn.pager.load().clone())
+        .unwrap();
+
+    let row = generate_simple_string_row((-2).into(), 1, "Hello");
+    db.mvcc_store.insert(tx1, row).unwrap();
+
+    // Regression: auto-checkpoint returning Busy used to bubble up and cause
+    // statement abort/rollback after the tx was removed.
+    // Commit should succeed even if the auto-checkpoint is busy.
+    commit_tx(db.mvcc_store.clone(), &db.conn, tx1).unwrap();
+
+    // Cleanup: release the read lock held by tx2.
+    db.mvcc_store
+        .rollback_tx(tx2, db.conn.pager.load().clone(), &db.conn);
+}
+
+#[test]
+fn test_mvcc_read_tx_lifecycle() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+
+    conn.execute("CREATE TABLE t(x)").unwrap();
+    conn.execute("BEGIN").unwrap();
+    conn.execute("SELECT * FROM t").unwrap();
+
+    let pager = conn.pager.load();
+    let wal = pager.wal.as_ref().expect("wal should be enabled");
+    assert!(wal.holds_read_lock());
+
+    conn.execute("COMMIT").unwrap();
+    assert!(!wal.holds_read_lock());
+}
+
+#[test]
+fn test_mvcc_conn_drop_releases_read_tx() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+
+    conn.execute("CREATE TABLE t(x)").unwrap();
+
+    let pager = conn.pager.load();
+    pager.begin_read_tx().unwrap();
+    let wal = pager.wal.as_ref().expect("wal should be enabled").clone();
+    assert!(wal.holds_read_lock());
+
+    drop(conn);
+    assert!(!wal.holds_read_lock());
+}
+
+#[test]
 fn test_select_empty_table() {
     let db = MvccTestDbNoConn::new_with_random_db();
     let mv_store = db.get_mvcc_store();
