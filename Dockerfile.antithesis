@@ -101,8 +101,8 @@ RUN for f in sdk-kit/Cargo.toml sync/sdk-kit/Cargo.toml; do \
 
 RUN if [ "$antithesis" = "true" ]; then \
         cp /opt/antithesis/libvoidstar.so /usr/lib/libvoidstar.so && \
-        export RUSTFLAGS="--cfg=tokio_unstable -Ccodegen-units=1 -Cpasses=sancov-module -Cllvm-args=-sanitizer-coverage-level=3 -Cllvm-args=-sanitizer-coverage-trace-pc-guard -Clink-args=-Wl,--build-id -L/usr/lib/ -lvoidstar" && \
-        cargo build --bin turso_stress --features antithesis --profile antithesis; \
+        export RUSTFLAGS="--cfg=tokio_unstable --cfg=antithesis -Ccodegen-units=1 -Cpasses=sancov-module -Cllvm-args=-sanitizer-coverage-level=3 -Cllvm-args=-sanitizer-coverage-trace-pc-guard -Clink-args=-Wl,--build-id -L/usr/lib/ -lvoidstar" && \
+        cargo build --bin turso_stress --profile antithesis; \
     else \
         cargo build --bin turso_stress --release; \
     fi
