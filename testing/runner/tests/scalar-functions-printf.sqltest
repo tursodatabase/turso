@@ -651,3 +651,23 @@ expect {
     Number:   -042
 }
 
+test printf-i64-min-basic {
+    SELECT printf('%d', -9223372036854775808);
+}
+expect {
+    -9223372036854775808
+}
+
+test printf-i64-min-precision {
+    SELECT printf('%.25d', -9223372036854775808);
+}
+expect {
+    -0000009223372036854775808
+}
+
+test printf-i64-min-zero-pad {
+    SELECT printf('%025d', -9223372036854775808);
+}
+expect {
+    -000009223372036854775808
+}
