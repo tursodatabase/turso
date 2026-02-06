@@ -915,28 +915,52 @@ fn parse_table(
     let regular_view =
         connection.with_schema(database_id, |schema| schema.get_view(table_name.as_str()));
     if let Some(view) = regular_view {
-        // Views are essentially query aliases, so just Expand the view as a subquery
+        // Views are essentially query aliases, so expand the view as a subquery
         view.process()?;
         let view_select = view.select_stmt.clone();
-        let subselect = Box::new(view_select);
 
-        // Use the view name as alias if no explicit alias was provided
-        let view_alias = maybe_alias
-            .cloned()
-            .or_else(|| Some(ast::As::As(table_name.clone())));
+        // Extract explicit column names from the view definition
+        let view_columns: Vec<String> =
+            view.columns.iter().filter_map(|c| c.name.clone()).collect();
 
-        // Recursively call parse_from_clause_table with the view as a SELECT
-        let result = parse_from_clause_table(
-            ast::SelectTable::Select(*subselect, view_alias),
+        // Plan the view's SELECT statement
+        let subplan = prepare_select_plan(
+            view_select,
             resolver,
             program,
-            table_references,
-            vtab_predicates,
-            cte_definitions,
+            table_references.outer_query_refs(),
+            QueryDestination::placeholder_for_subquery(),
             connection,
         );
         view.done();
-        return result;
+
+        let subplan = subplan?;
+
+        // Use the view name as alias if no explicit alias was provided
+        let identifier = maybe_alias
+            .map(|a| match a {
+                ast::As::As(id) => normalize_ident(id.as_str()),
+                ast::As::Elided(id) => normalize_ident(id.as_str()),
+            })
+            .unwrap_or_else(|| normalize_ident(table_name.as_str()));
+
+        // Pass view's explicit column names to override derived column names
+        let explicit_cols = if view_columns.is_empty() {
+            None
+        } else {
+            Some(view_columns.as_slice())
+        };
+
+        table_references.add_joined_table(JoinedTable::new_subquery_from_plan(
+            identifier,
+            subplan,
+            None,
+            program.table_reference_counter.next(),
+            explicit_cols,
+            None,
+            false,
+        )?);
+        return Ok(());
     }
 
     let view = connection.with_schema(database_id, |schema| {

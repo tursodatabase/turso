@@ -272,3 +272,38 @@ expect error {
     view v is circularly defined
 }
 
+test view-explicit-column-names {
+    CREATE TABLE t(x INTEGER, z TEXT);
+    INSERT INTO t VALUES (1, 'hello'), (2, 'world');
+    CREATE VIEW v(a, b) AS SELECT * FROM t;
+    -- Verify column names are 'a' and 'b', not 'x' and 'z'
+    SELECT name FROM pragma_table_info('v') ORDER BY cid;
+}
+expect {
+    a
+    b
+}
+
+test view-explicit-column-names-select {
+    CREATE TABLE t(x INTEGER, z TEXT);
+    INSERT INTO t VALUES (1, 'hello'), (2, 'world');
+    CREATE VIEW v(a, b) AS SELECT * FROM t;
+    -- Verify we can select using the explicit column names
+    SELECT a, b FROM v ORDER BY a;
+}
+expect {
+    1|hello
+    2|world
+}
+
+test view-explicit-column-names-with-expressions {
+    CREATE TABLE nums(a INTEGER, b INTEGER);
+    INSERT INTO nums VALUES (10, 20), (30, 40);
+    CREATE VIEW v(sum_col, product_col) AS SELECT a + b, a * b FROM nums;
+    SELECT name FROM pragma_table_info('v') ORDER BY cid;
+}
+expect {
+    sum_col
+    product_col
+}
+
