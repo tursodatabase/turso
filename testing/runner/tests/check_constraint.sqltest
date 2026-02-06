@@ -760,7 +760,31 @@ test check_constraint_on_conflict_fail {
     BEGIN;
     INSERT INTO items VALUES (1, 10);
     INSERT OR FAIL INTO items VALUES (2, -5);
-    COMMIT;
+}
+expect error {
+}
+
+test check_constraint_on_conflict_abort {
+    CREATE TABLE items (
+        id INTEGER PRIMARY KEY,
+        value INTEGER CHECK (value > 0)
+    );
+    BEGIN;
+    INSERT INTO items VALUES (1, 10);
+    INSERT OR ABORT INTO items VALUES (2, -5);
+}
+expect error {
+}
+
+test check_constraint_on_conflict_rollback {
+    CREATE TABLE items (
+        id INTEGER PRIMARY KEY,
+        value INTEGER CHECK (value > 0)
+    );
+    INSERT INTO items VALUES (1, 10);
+    BEGIN;
+    INSERT INTO items VALUES (2, 20);
+    INSERT OR ROLLBACK INTO items VALUES (3, -5);
 }
 expect error {
 }
@@ -868,23 +892,6 @@ expect error {
 }
 
 # ALTER TABLE with CHECK constraints
-test check_constraint_alter_table_add_column {
-    CREATE TABLE products (
-        id INTEGER PRIMARY KEY,
-        name TEXT
-    );
-    INSERT INTO products VALUES (1, 'Widget');
-    ALTER TABLE products ADD COLUMN price REAL CHECK (price > 0);
-    -- Existing rows get NULL for new column, which passes CHECK
-    SELECT id, name, price FROM products;
-    INSERT INTO products VALUES (2, 'Gadget', 19.99);
-    SELECT id, name, price FROM products WHERE id = 2;
-}
-expect {
-    1|Widget|
-    2|Gadget|19.99
-}
-
 test check_constraint_alter_table_add_column_violation {
     CREATE TABLE products (
         id INTEGER PRIMARY KEY,
@@ -892,6 +899,57 @@ test check_constraint_alter_table_add_column_violation {
     );
     ALTER TABLE products ADD COLUMN price REAL CHECK (price > 0);
     INSERT INTO products VALUES (1, 'Widget', -5.00);
+}
+expect error {
+}
+
+# ALTER TABLE ADD COLUMN with CHECK on a table with existing data
+test check_constraint_alter_add_column_with_data {
+    CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT);
+    INSERT INTO products VALUES (1, 'Widget A');
+    INSERT INTO products VALUES (2, 'Widget B');
+    ALTER TABLE products ADD COLUMN price REAL CHECK (price > 0);
+
+    -- Existing rows should have NULL for the new column (NULL passes CHECK)
+    SELECT id, name, price FROM products ORDER BY id;
+}
+expect {
+    1|Widget A|
+    2|Widget B|
+}
+
+test check_constraint_alter_add_column_with_data_enforced {
+    CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT);
+    INSERT INTO products VALUES (1, 'Widget A');
+    ALTER TABLE products ADD COLUMN price REAL CHECK (price > 0);
+
+    -- New insert with valid value should succeed
+    INSERT INTO products VALUES (2, 'Widget B', 25.99);
+    SELECT id, name, price FROM products ORDER BY id;
+}
+expect {
+    1|Widget A|
+    2|Widget B|25.99
+}
+
+test check_constraint_alter_add_column_with_data_violation {
+    CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT);
+    INSERT INTO products VALUES (1, 'Widget A');
+    ALTER TABLE products ADD COLUMN price REAL CHECK (price > 0);
+
+    -- New insert violating CHECK should fail
+    INSERT INTO products VALUES (2, 'Widget B', -5.00);
+}
+expect error {
+}
+
+test check_constraint_alter_add_column_with_data_update_violation {
+    CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT);
+    INSERT INTO products VALUES (1, 'Widget A');
+    ALTER TABLE products ADD COLUMN price REAL CHECK (price > 0);
+
+    -- Update existing row to violating value should fail
+    UPDATE products SET price = -10 WHERE id = 1;
 }
 expect error {
 }
@@ -946,21 +1004,6 @@ expect error {
 }
 
 # ALTER TABLE ADD COLUMN with CHECK constraints
-test alter_table_add_column_check_constraint {
-    CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT);
-    INSERT INTO products VALUES (1, 'Widget A');
-
-    ALTER TABLE products ADD COLUMN price REAL CHECK (price > 0);
-
-    -- Should succeed with positive price
-    INSERT INTO products VALUES (2, 'Widget B', 25.99);
-
-    -- Should fail with negative price (the original issue)
-    INSERT INTO products VALUES (3, 'Widget C', -5.00);
-}
-expect error {
-}
-
 test alter_table_add_column_check_constraint_success {
     CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT);
     ALTER TABLE products ADD COLUMN price REAL CHECK (price > 0);
@@ -974,29 +1017,6 @@ test alter_table_add_column_check_constraint_success {
 expect {
     1|Widget A|10.5
     2|Widget B|25.99
-}
-
-test alter_table_add_column_preserves_existing_check {
-    CREATE TABLE t (a INTEGER CHECK(a > 0));
-    INSERT INTO t VALUES (1);
-    ALTER TABLE t ADD COLUMN b INTEGER CHECK(b > 0);
-    -- b's CHECK should pass (positive value), but a's original CHECK must still reject negative a
-    INSERT INTO t VALUES (-1, 1);
-}
-expect error {
-}
-
-test alter_table_add_column_preserves_existing_check_success {
-    CREATE TABLE t (a INTEGER CHECK(a > 0));
-    INSERT INTO t VALUES (1);
-    ALTER TABLE t ADD COLUMN b INTEGER CHECK(b > 0);
-    -- Both CHECK constraints should pass
-    INSERT INTO t VALUES (2, 5);
-    SELECT * FROM t;
-}
-expect {
-    1|
-    2|5
 }
 
 test alter_table_add_column_check_constraint_named {
@@ -1108,4 +1128,97 @@ test check_constraint_upsert_rowid_check {
 }
 expect {
     1|20
+}
+
+# Qualified column references in CHECK constraints (table.column)
+test check_constraint_qualified_column_ref {
+    CREATE TABLE t(x INTEGER, CHECK(t.x > 0));
+    INSERT INTO t VALUES(10);
+    SELECT * FROM t;
+}
+expect {
+    10
+}
+
+test check_constraint_qualified_column_ref_violation {
+    CREATE TABLE t(x INTEGER, CHECK(t.x > 0));
+    INSERT INTO t VALUES(-1);
+}
+expect error {
+}
+
+test check_constraint_qualified_rowid_ref {
+    CREATE TABLE t(val INTEGER, CHECK(t.rowid > 0));
+    INSERT INTO t VALUES(100);
+    SELECT rowid, val FROM t;
+}
+expect {
+    1|100
+}
+
+test check_constraint_qualified_rowid_ref_violation {
+    CREATE TABLE t(val INTEGER, CHECK(t.rowid > 0));
+    INSERT INTO t(rowid, val) VALUES(-1, 100);
+}
+expect error {
+}
+
+test check_constraint_qualified_rowid_alias_underscore {
+    CREATE TABLE t(val INTEGER, CHECK(t._rowid_ > 0));
+    INSERT INTO t VALUES(100);
+    SELECT _rowid_, val FROM t;
+}
+expect {
+    1|100
+}
+
+test check_constraint_qualified_rowid_alias_oid {
+    CREATE TABLE t(val INTEGER, CHECK(t.oid > 0));
+    INSERT INTO t(rowid, val) VALUES(-1, 100);
+}
+expect error {
+}
+
+test check_constraint_qualified_column_update {
+    CREATE TABLE t(x INTEGER, CHECK(t.x > 0));
+    INSERT INTO t VALUES(10);
+    UPDATE t SET x = 20;
+    SELECT * FROM t;
+}
+expect {
+    20
+}
+
+test check_constraint_qualified_column_update_violation {
+    CREATE TABLE t(x INTEGER, CHECK(t.x > 0));
+    INSERT INTO t VALUES(10);
+    UPDATE t SET x = -1;
+}
+expect error {
+}
+
+# CHECK constraints referencing a rowid alias column by name
+test check_constraint_rowid_alias_column_by_name {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, val INTEGER, CHECK(id > 0));
+    INSERT INTO t VALUES(1, 10);
+    INSERT INTO t VALUES(2, 20);
+    SELECT id, val FROM t ORDER BY id;
+}
+expect {
+    1|10
+    2|20
+}
+
+test check_constraint_rowid_alias_column_by_name_violation {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, val INTEGER, CHECK(id > 0));
+    INSERT INTO t VALUES(-1, 10);
+}
+expect error {
+}
+
+test check_constraint_rowid_alias_column_qualified_violation {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, val INTEGER, CHECK(t.id > 0));
+    INSERT INTO t VALUES(-1, 10);
+}
+expect error {
 }

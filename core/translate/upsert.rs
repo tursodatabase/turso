@@ -506,6 +506,7 @@ pub fn emit_upsert(
             program,
             &bt.check_constraints,
             resolver,
+            &bt.name,
             new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg),
             bt.columns
                 .iter()

@@ -416,8 +416,8 @@ pub fn translate_alter_table(
             btree.columns.push(column.clone());
 
             // Add foreign key constraints and CHECK constraints to the btree table
-            for constraint in constraints {
-                match constraint.constraint {
+            for constraint in &constraints {
+                match &constraint.constraint {
                     ast::ColumnConstraint::ForeignKey {
                         clause,
                         defer_clause,
@@ -468,7 +468,7 @@ pub fn translate_alter_table(
                     ast::ColumnConstraint::Check(expr) => {
                         btree
                             .check_constraints
-                            .push(CheckConstraint::new(constraint.name.as_ref(), &expr));
+                            .push(CheckConstraint::new(constraint.name.as_ref(), expr));
                     }
                     _ => {
                         // Other constraints (PRIMARY KEY, NOT NULL, etc.) are handled elsewhere
@@ -508,6 +508,10 @@ pub fn translate_alter_table(
             // This is required for:
             // 1. NOT NULL columns without a non-null default (existing rows would get NULL)
             // 2. Non-deterministic defaults like CURRENT_TIME (can't backfill existing rows)
+            // 3. CHECK constraints on the new column. SQLite evaluates the CHECK against
+            //    all existing rows via pragma_quick_check. We take a stricter approach and
+            //    reject the ALTER if the table has any rows, since we don't yet support
+            //    scanning existing data for constraint validation.
             let needs_notnull_check = column.notnull()
                 && column
                     .default

@@ -3185,6 +3185,35 @@ fn emit_update_insns<'a>(
         }
     }
 
+    // Evaluate STRICT type checks and CHECK constraints before any index mutations.
+    // This ensures that if a constraint fails, indexes remain consistent.
+    if let Some(btree_table) = target_table.table.btree() {
+        if btree_table.is_strict {
+            program.emit_insn(Insn::TypeCheck {
+                start_reg: start,
+                count: col_len,
+                check_generated: true,
+                table_reference: Arc::clone(&btree_table),
+            });
+        }
+
+        emit_check_constraints(
+            program,
+            &btree_table.check_constraints,
+            &mut t_ctx.resolver,
+            &btree_table.name,
+            rowid_set_clause_reg.unwrap_or(beg),
+            btree_table
+                .columns
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, col)| col.name.as_deref().map(|n| (n, start + idx))),
+            connection,
+            or_conflict,
+            skip_row_label,
+        )?;
+    }
+
     for (index, (idx_cursor_id, record_reg)) in indexes_to_update.iter().zip(index_cursors) {
         // We need to know whether or not the OLD values satisfied the predicate on the
         // partial index, so we can know whether or not to delete the old index entry,
@@ -3492,35 +3521,7 @@ fn emit_update_insns<'a>(
         }
     }
 
-    if let Some(btree_table) = target_table.table.btree() {
-        if btree_table.is_strict {
-            program.emit_insn(Insn::TypeCheck {
-                start_reg: start,
-                count: col_len,
-                check_generated: true,
-                table_reference: Arc::clone(&btree_table),
-            });
-        }
-        // Note: Affinity for non-STRICT tables is applied earlier,
-        // right after emit_update_column_values, before index operations.
-
-        // Evaluate CHECK constraints for the updated values.
-        // Use rowid_set_clause_reg if the user is updating the rowid, otherwise beg (old rowid).
-        emit_check_constraints(
-            program,
-            &btree_table.check_constraints,
-            &mut t_ctx.resolver,
-            rowid_set_clause_reg.unwrap_or(beg),
-            btree_table
-                .columns
-                .iter()
-                .enumerate()
-                .filter_map(|(idx, col)| col.name.as_deref().map(|n| (n, start + idx))),
-            connection,
-            or_conflict,
-            skip_row_label,
-        )?;
-
+    if target_table.table.btree().is_some() {
         if has_user_provided_rowid {
             let record_label = program.allocate_label();
             let target_reg = rowid_set_clause_reg.unwrap();
@@ -4416,6 +4417,7 @@ pub(crate) fn emit_check_constraints<'a>(
     program: &mut ProgramBuilder,
     check_constraints: &[CheckConstraint],
     resolver: &mut Resolver,
+    table_name: &str,
     rowid_reg: usize,
     column_mappings: impl Iterator<Item = (&'a str, usize)>,
     connection: &Arc<Connection>,
@@ -4428,20 +4430,36 @@ pub(crate) fn emit_check_constraints<'a>(
 
     let initial_cache_size = resolver.expr_to_reg_cache.len();
 
-    // Map rowid aliases to the actual rowid register
+    // Map rowid aliases to the actual rowid register.
+    // We cache both unqualified (Expr::Id) and qualified (Expr::Qualified) forms
+    // so that CHECK expressions like `CHECK(rowid > 0)` and `CHECK(t.rowid > 0)` both resolve.
     for rowid_name in ROWID_STRS {
         let rowid_expr = ast::Expr::Id(ast::Name::exact(rowid_name.to_string()));
         resolver
             .expr_to_reg_cache
             .push((Cow::Owned(rowid_expr), rowid_reg));
+        let qualified_expr = ast::Expr::Qualified(
+            ast::Name::exact(table_name.to_string()),
+            ast::Name::exact(rowid_name.to_string()),
+        );
+        resolver
+            .expr_to_reg_cache
+            .push((Cow::Owned(qualified_expr), rowid_reg));
     }
 
-    // Map each column to its register
+    // Map each column to its register (both unqualified and qualified forms).
     for (col_name, register) in column_mappings {
         let column_expr = ast::Expr::Id(ast::Name::exact(col_name.to_string()));
         resolver
             .expr_to_reg_cache
             .push((Cow::Owned(column_expr), register));
+        let qualified_expr = ast::Expr::Qualified(
+            ast::Name::exact(table_name.to_string()),
+            ast::Name::exact(col_name.to_string()),
+        );
+        resolver
+            .expr_to_reg_cache
+            .push((Cow::Owned(qualified_expr), register));
     }
 
     resolver.enable_expr_to_reg_cache();

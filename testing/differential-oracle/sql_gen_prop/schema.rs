@@ -42,6 +42,7 @@ pub struct ColumnDef {
     pub primary_key: bool,
     pub unique: bool,
     pub default: Option<String>,
+    pub check_constraint: Option<String>,
 }
 
 impl ColumnDef {
@@ -54,6 +55,7 @@ impl ColumnDef {
             primary_key: false,
             unique: false,
             default: None,
+            check_constraint: None,
         }
     }
 
@@ -101,6 +103,10 @@ impl fmt::Display for ColumnDef {
 
         if let Some(default) = &self.default {
             write!(f, " DEFAULT {default}")?;
+        }
+
+        if let Some(check) = &self.check_constraint {
+            write!(f, " CHECK ({check})")?;
         }
 
         Ok(())

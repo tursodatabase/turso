@@ -1979,9 +1979,7 @@ impl Optimizable for ast::Expr {
             }
             Expr::Cast { expr, .. } => expr.is_constant(resolver),
             Expr::Collate(expr, _) => expr.is_constant(resolver),
-            Expr::DoublyQualified(_, _, _) => {
-                panic!("DoublyQualified should have been rewritten as Column")
-            }
+            Expr::DoublyQualified(_, _, _) => false,
             Expr::Exists(_) => false,
             Expr::FunctionCall { args, name, .. } => {
                 let Some(func) = resolver.resolve_function(name.as_str(), args.len()) else {
@@ -2015,9 +2013,7 @@ impl Optimizable for ast::Expr {
             Expr::Name(_) => false,
             Expr::NotNull(expr) => expr.is_constant(resolver),
             Expr::Parenthesized(exprs) => exprs.iter().all(|expr| expr.is_constant(resolver)),
-            Expr::Qualified(_, _) => {
-                panic!("Qualified should have been rewritten as Column")
-            }
+            Expr::Qualified(_, _) => false,
             Expr::Raise(_, expr) => expr.as_ref().is_none_or(|expr| expr.is_constant(resolver)),
             Expr::Subquery(_) => false,
             Expr::Unary(_, expr) => expr.is_constant(resolver),
