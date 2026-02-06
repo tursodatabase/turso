@@ -232,17 +232,44 @@ impl fmt::Display for NullsOrder {
     }
 }
 
+/// Conflict resolution clause for INSERT/UPDATE (OR ABORT/FAIL/IGNORE/REPLACE/ROLLBACK).
+#[derive(Debug, Clone, Copy)]
+pub enum ConflictClause {
+    Abort,
+    Fail,
+    Ignore,
+    Replace,
+    Rollback,
+}
+
+impl fmt::Display for ConflictClause {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ConflictClause::Abort => write!(f, " OR ABORT"),
+            ConflictClause::Fail => write!(f, " OR FAIL"),
+            ConflictClause::Ignore => write!(f, " OR IGNORE"),
+            ConflictClause::Replace => write!(f, " OR REPLACE"),
+            ConflictClause::Rollback => write!(f, " OR ROLLBACK"),
+        }
+    }
+}
+
 /// An INSERT statement.
 #[derive(Debug, Clone)]
 pub struct InsertStmt {
     pub table: String,
     pub columns: Vec<String>,
     pub values: Vec<Vec<Expr>>,
+    pub conflict: Option<ConflictClause>,
 }
 
 impl fmt::Display for InsertStmt {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "INSERT INTO {}", self.table)?;
+        write!(f, "INSERT")?;
+        if let Some(conflict) = &self.conflict {
+            write!(f, "{conflict}")?;
+        }
+        write!(f, " INTO {}", self.table)?;
 
         if !self.columns.is_empty() {
             write!(f, " (")?;
@@ -280,11 +307,16 @@ pub struct UpdateStmt {
     pub table: String,
     pub sets: Vec<(String, Expr)>,
     pub where_clause: Option<Expr>,
+    pub conflict: Option<ConflictClause>,
 }
 
 impl fmt::Display for UpdateStmt {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "UPDATE {} SET ", self.table)?;
+        write!(f, "UPDATE")?;
+        if let Some(conflict) = &self.conflict {
+            write!(f, "{conflict}")?;
+        }
+        write!(f, " {} SET ", self.table)?;
 
         for (i, (col, val)) in self.sets.iter().enumerate() {
             if i > 0 {
@@ -1178,6 +1210,7 @@ mod tests {
                 Expr::literal(&mut ctx, Literal::Text("Alice".to_string())),
                 Expr::literal(&mut ctx, Literal::Integer(30)),
             ]],
+            conflict: None,
         };
 
         assert_eq!(

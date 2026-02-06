@@ -2,15 +2,15 @@
 
 use crate::SqlGen;
 use crate::ast::{
-    AlterTableAction, AlterTableActionKind, AlterTableStmt, ColumnDefStmt, CreateIndexStmt,
-    CreateTableStmt, CreateTriggerStmt, DeleteStmt, DropIndexStmt, DropTableStmt, DropTriggerStmt,
-    Expr, InsertStmt, Stmt, TriggerBodyStmtKind, TriggerEvent, TriggerEventKind, TriggerStmt,
-    TriggerTiming, UpdateStmt,
+    AlterTableAction, AlterTableActionKind, AlterTableStmt, ColumnDefStmt, ConflictClause,
+    CreateIndexStmt, CreateTableStmt, CreateTriggerStmt, DeleteStmt, DropIndexStmt, DropTableStmt,
+    DropTriggerStmt, Expr, InsertStmt, Stmt, TriggerBodyStmtKind, TriggerEvent, TriggerEventKind,
+    TriggerStmt, TriggerTiming, UpdateStmt,
 };
 use crate::capabilities::Capabilities;
 use crate::context::Context;
 use crate::error::GenError;
-use crate::generate::expr::generate_condition;
+use crate::generate::expr::{generate_condition, generate_expr};
 use crate::generate::literal::generate_literal;
 use crate::generate::select::generate_select;
 use crate::policy::AlterTableConfig;
@@ -133,9 +133,8 @@ fn filter_by_schema_validity<C: Capabilities>(
     let has_tables = !schema.tables.is_empty();
     let has_indexes = !schema.indexes.is_empty();
     let has_triggers = !schema.triggers.is_empty();
-    candidates.filter(move |kind| {
-        is_stmt_valid_for_schema(*kind, has_tables, has_indexes, has_triggers)
-    })
+    candidates
+        .filter(move |kind| is_stmt_valid_for_schema(*kind, has_tables, has_indexes, has_triggers))
 }
 
 /// Check if a statement kind is valid given the current schema state.
@@ -220,6 +219,13 @@ pub fn generate_insert<C: Capabilities>(
         return Err(GenError::exhausted("insert", "no columns to insert"));
     }
 
+    // Generate conflict clause
+    let conflict = generate_conflict_clause(
+        ctx,
+        insert_config.or_replace_probability,
+        insert_config.or_ignore_probability,
+    );
+
     // Generate values
     let values = generate_insert_values(generator, ctx, &table, &columns);
 
@@ -227,10 +233,15 @@ pub fn generate_insert<C: Capabilities>(
         table: table.name.clone(),
         columns,
         values,
+        conflict,
     }))
 }
 
 /// Generate the VALUES clause for an INSERT statement.
+///
+/// Each cell may be a literal or a full expression, controlled by
+/// `InsertConfig::expression_value_probability`. Expressions use `column_ref: 0`
+/// since INSERT VALUES has no implicit table scope for bare column refs.
 #[trace_gen(Origin::InsertValues)]
 fn generate_insert_values<C: Capabilities>(
     generator: &SqlGen<C>,
@@ -239,13 +250,34 @@ fn generate_insert_values<C: Capabilities>(
     columns: &[String],
 ) -> Vec<Vec<Expr>> {
     let insert_config = &generator.policy().insert_config;
+    let expr_prob = insert_config.expression_value_probability;
+    let expr_max_depth = insert_config.expression_value_max_depth;
     let num_rows = ctx.gen_range_inclusive(insert_config.min_rows, insert_config.max_rows);
     let mut values = Vec::with_capacity(num_rows);
+
+    // For INSERT expressions, create a generator with column_ref disabled
+    // since bare column refs are invalid in VALUES context.
+    let insert_expr_gen = if expr_prob > 0.0 {
+        let mut policy = generator.policy().clone();
+        policy.expr_weights.column_ref = 0;
+        policy.max_expr_depth = expr_max_depth;
+        Some(SqlGen::<C>::new(generator.schema().clone(), policy))
+    } else {
+        None
+    };
 
     for _ in 0..num_rows {
         let mut row = Vec::with_capacity(columns.len());
         for col_name in columns {
             let col = table.columns.iter().find(|c| &c.name == col_name).unwrap();
+            if let Some(ref expr_gen) = insert_expr_gen {
+                if ctx.gen_bool_with_prob(expr_prob) {
+                    if let Ok(expr) = generate_expr(expr_gen, ctx, table, 0) {
+                        row.push(expr);
+                        continue;
+                    }
+                }
+            }
             let lit = generate_literal(ctx, col.data_type, generator.policy());
             row.push(Expr::literal(ctx, lit));
         }
@@ -272,6 +304,13 @@ pub fn generate_update<C: Capabilities>(
         return Err(GenError::schema_empty("columns"));
     }
 
+    // Generate conflict clause
+    let conflict = generate_conflict_clause(
+        ctx,
+        update_config.or_replace_probability,
+        update_config.or_ignore_probability,
+    );
+
     // Generate SET clause
     let sets = generate_update_sets(generator, ctx, &table)?;
 
@@ -286,6 +325,7 @@ pub fn generate_update<C: Capabilities>(
         table: table.name.clone(),
         sets,
         where_clause,
+        conflict,
     }))
 }
 
@@ -293,6 +333,8 @@ pub fn generate_update<C: Capabilities>(
 ///
 /// All columns are eligible. Primary key columns are included with lower
 /// probability controlled by `UpdateConfig::primary_key_update_probability`.
+/// Each assignment value may be an expression (with column refs enabled, so
+/// `SET x = x + 1` is valid) controlled by `UpdateConfig::expression_value_probability`.
 #[trace_gen(Origin::UpdateSet)]
 fn generate_update_sets<C: Capabilities>(
     generator: &SqlGen<C>,
@@ -301,6 +343,8 @@ fn generate_update_sets<C: Capabilities>(
 ) -> Result<Vec<(String, Expr)>, GenError> {
     let update_config = &generator.policy().update_config;
     let pk_prob = update_config.primary_key_update_probability;
+    let expr_prob = update_config.expression_value_probability;
+    let expr_max_depth = update_config.expression_value_max_depth;
 
     // Build candidate columns: always include non-PK, include PK with probability
     let candidates: Vec<_> = table
@@ -321,13 +365,70 @@ fn generate_update_sets<C: Capabilities>(
     let num_sets = ctx.gen_range_inclusive(min_sets, max_sets);
     let mut sets = Vec::with_capacity(num_sets);
 
+    // For UPDATE expressions, create a generator with capped depth.
+    // Column refs are valid (e.g. SET x = x + 1).
+    let update_expr_gen = if expr_prob > 0.0 {
+        let mut policy = generator.policy().clone();
+        policy.max_expr_depth = expr_max_depth;
+        Some(SqlGen::<C>::new(generator.schema().clone(), policy))
+    } else {
+        None
+    };
+
     for _ in 0..num_sets {
         let col = ctx.choose(&candidates).unwrap();
+        if let Some(ref expr_gen) = update_expr_gen {
+            if ctx.gen_bool_with_prob(expr_prob) {
+                if let Ok(expr) = generate_expr(expr_gen, ctx, table, 0) {
+                    sets.push((col.name.clone(), expr));
+                    continue;
+                }
+            }
+        }
         let lit = generate_literal(ctx, col.data_type, generator.policy());
         sets.push((col.name.clone(), Expr::literal(ctx, lit)));
     }
 
     Ok(sets)
+}
+
+/// Generate an optional conflict clause (OR ABORT/FAIL/IGNORE/REPLACE/ROLLBACK).
+///
+/// Uses the existing `or_replace_probability` and `or_ignore_probability` from the config,
+/// plus equal weights for Abort, Fail, and Rollback. If neither or_replace nor or_ignore
+/// has any probability, no conflict clause is generated.
+fn generate_conflict_clause(
+    ctx: &mut Context,
+    or_replace_prob: f64,
+    or_ignore_prob: f64,
+) -> Option<ConflictClause> {
+    // Total probability of getting any conflict clause
+    let total_prob = or_replace_prob + or_ignore_prob;
+    if total_prob <= 0.0 {
+        return None;
+    }
+
+    // First decide whether to generate a conflict clause at all
+    if !ctx.gen_bool_with_prob(total_prob.min(1.0)) {
+        return None;
+    }
+
+    // Weighted selection among the five variants.
+    // Scale replace/ignore to integer weights, give abort/fail/rollback equal share of the remaining space.
+    let replace_w = (or_replace_prob * 100.0) as u32;
+    let ignore_w = (or_ignore_prob * 100.0) as u32;
+    let other_w = ((replace_w + ignore_w) / 3).max(1);
+
+    let items = [
+        (ConflictClause::Replace, replace_w),
+        (ConflictClause::Ignore, ignore_w),
+        (ConflictClause::Abort, other_w),
+        (ConflictClause::Fail, other_w),
+        (ConflictClause::Rollback, other_w),
+    ];
+
+    let weights: Vec<u32> = items.iter().map(|(_, w)| *w).collect();
+    ctx.weighted_index(&weights).map(|idx| items[idx].0)
 }
 
 /// Generate a DELETE statement.

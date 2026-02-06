@@ -811,8 +811,7 @@ mod tests {
                     if where_part.contains("EXISTS") {
                         found_exists_in_where = true;
                     }
-                    if where_part.contains("IN (SELECT") || where_part.contains("NOT IN (SELECT")
-                    {
+                    if where_part.contains("IN (SELECT") || where_part.contains("NOT IN (SELECT") {
                         found_in_select_in_where = true;
                     }
                 }

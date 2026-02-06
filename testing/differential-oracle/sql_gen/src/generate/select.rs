@@ -778,10 +778,7 @@ mod tests {
                 }
             }
         }
-        assert!(
-            found_grouped,
-            "Should generate subqueries with GROUP BY"
-        );
+        assert!(found_grouped, "Should generate subqueries with GROUP BY");
     }
 
     #[test]
