@@ -1044,6 +1044,12 @@ pub struct InsertConfig {
 
     /// Probability of using INSERT OR IGNORE.
     pub or_ignore_probability: f64,
+
+    /// Probability each cell in VALUES uses an expression instead of a literal.
+    pub expression_value_probability: f64,
+
+    /// Maximum expression nesting depth for VALUES expressions.
+    pub expression_value_max_depth: usize,
 }
 
 impl Default for InsertConfig {
@@ -1055,6 +1061,8 @@ impl Default for InsertConfig {
             default_probability: 0.1,
             or_replace_probability: 0.0,
             or_ignore_probability: 0.0,
+            expression_value_probability: 0.3,
+            expression_value_max_depth: 2,
         }
     }
 }
@@ -1103,6 +1111,12 @@ pub struct UpdateConfig {
 
     /// Probability of including a primary key column in SET clauses.
     pub primary_key_update_probability: f64,
+
+    /// Probability each SET assignment uses an expression instead of a literal.
+    pub expression_value_probability: f64,
+
+    /// Maximum expression nesting depth for SET expressions.
+    pub expression_value_max_depth: usize,
 }
 
 impl Default for UpdateConfig {
@@ -1114,6 +1128,8 @@ impl Default for UpdateConfig {
             or_replace_probability: 0.0,
             or_ignore_probability: 0.0,
             primary_key_update_probability: 0.1,
+            expression_value_probability: 0.4,
+            expression_value_max_depth: 2,
         }
     }
 }
