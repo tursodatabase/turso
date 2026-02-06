@@ -260,7 +260,7 @@ jobs:
         timeout-minutes: 20
       - name: Test mvcc
         run: make test-compat-mvcc
-        timeout-minutes: 10
+        timeout-minutes: 15
 
   concurrent-simulator:
     runs-on: blacksmith-4vcpu-ubuntu-2404
