@@ -3,7 +3,7 @@ use std::{
     sync::{Arc, Mutex, MutexGuard},
 };
 
-use turso_sdk_kit::rsapi::{turso_slice_from_bytes, turso_slice_null, TursoError};
+use turso_sdk_kit::rsapi::{TursoError, turso_slice_from_bytes, turso_slice_null};
 
 use crate::capi::c::{self};
 

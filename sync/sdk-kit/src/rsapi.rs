@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
-use parking_lot::Mutex;
-use turso_core::{MemoryIO, IO};
-use turso_sdk_kit::rsapi::{str_from_c_str, TursoError};
+use parking_lot::{Mutex, RwLock};
+use turso_core::{IO, MemoryIO};
+use turso_sdk_kit::rsapi::{TursoError, str_from_c_str};
 use turso_sync_engine::{
     database_sync_engine::{self, DatabaseSyncEngine},
     database_sync_engine_io::SyncEngineIo,
@@ -27,6 +27,8 @@ pub struct TursoDatabaseSyncConfig {
     pub partial_sync_opts: Option<turso_sync_engine::types::PartialSyncOpts>,
     /// Base64-encoded encryption key for the Turso Cloud encrypted database.
     pub remote_encryption_key: Option<String>,
+    /// Optional authorization token for HTTP requests to Turso Cloud.
+    pub auth_token: Option<String>,
 }
 
 pub type PartialSyncOpts = turso_sync_engine::types::PartialSyncOpts;
@@ -98,6 +100,11 @@ impl TursoDatabaseSyncConfig {
             } else {
                 Some(str_from_c_str(config.remote_encryption_key)?.to_string())
             },
+            auth_token: if config.auth_token.is_null() {
+                None
+            } else {
+                Some(str_from_c_str(config.auth_token)?.to_string())
+            },
         })
     }
 }
@@ -137,6 +144,17 @@ impl TursoDatabaseSyncChanges {
     }
 }
 
+/// Mutable lazy parameters that can be updated at runtime.
+/// These are stored separately from the immutable config to allow lazy initialization.
+struct LazyParams {
+    /// Remote URL for sync operations. Can be set lazily from None to Some.
+    remote_url: Option<String>,
+    /// Authorization token for HTTP requests. Can be changed at any time.
+    auth_token: Option<String>,
+    /// Encryption key for Turso Cloud. Can be set lazily from None to Some.
+    remote_encryption_key: Option<String>,
+}
+
 pub struct TursoDatabaseSync<TBytes: AsRef<[u8]> + Send + Sync + 'static> {
     db_config: turso_sdk_kit::rsapi::TursoDatabaseConfig,
     sync_config: TursoDatabaseSyncConfig,
@@ -144,6 +162,8 @@ pub struct TursoDatabaseSync<TBytes: AsRef<[u8]> + Send + Sync + 'static> {
     sync_engine_io_queue: SyncEngineIoStats<SyncEngineIoQueue<TBytes>>,
     sync_engine: Arc<Mutex<Option<DatabaseSyncEngine<SyncEngineIoQueue<TBytes>>>>>,
     db_io: Option<Arc<dyn IO>>,
+    /// Lazy parameters that can be updated at runtime
+    lazy_params: RwLock<LazyParams>,
 }
 
 #[allow(unused_variables)]
@@ -233,6 +253,11 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
             None
         };
         let sync_engine_io_queue = SyncEngineIoStats::new(SyncEngineIoQueue::new());
+        let lazy_params = LazyParams {
+            remote_url: sync_config.remote_url.clone(),
+            auth_token: sync_config.auth_token.clone(),
+            remote_encryption_key: sync_config.remote_encryption_key.clone(),
+        };
         Ok(Arc::new(Self {
             db_config,
             sync_config,
@@ -240,6 +265,7 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
             sync_engine_io_queue,
             sync_engine: Arc::new(Mutex::new(None)),
             db_io,
+            lazy_params: RwLock::new(lazy_params),
         }))
     }
     /// open the database which must be created earlier (e.g. through [Self::init])
@@ -480,6 +506,91 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
     /// run synced database extra callbacks after execution of IO operation on the caller side
     pub fn step_io_callbacks(&self) {
         self.sync_engine_io_queue.step_io_callbacks();
+    }
+
+    /// Set the remote URL for sync operations.
+    ///
+    /// This method allows lazy initialization of the remote URL. The URL can only be:
+    /// - Set from None to Some(value)
+    /// - Set to the same value as before
+    ///
+    /// Attempting to change from one URL to a different URL will return an error.
+    pub fn set_url(&self, url: Option<String>) -> Result<(), TursoError> {
+        let mut params = self.lazy_params.write();
+        match (&params.remote_url, &url) {
+            // Allow setting from None to Some
+            (None, Some(_)) => {
+                params.remote_url = url;
+                Ok(())
+            }
+            // Allow setting to the same value
+            (Some(current), Some(new)) if current == new => Ok(()),
+            // Allow setting None to None (no-op)
+            (None, None) => Ok(()),
+            // Allow setting Some to None only if already None (already handled above)
+            (Some(current), None) => Err(TursoError::Misuse(format!(
+                "cannot unset remote_url: current value is '{current}'"
+            ))),
+            // Disallow changing from one value to another
+            (Some(current), Some(new)) => Err(TursoError::Misuse(format!(
+                "cannot change remote_url from '{current}' to '{new}'"
+            ))),
+        }
+    }
+
+    /// Set the authorization token for HTTP requests.
+    ///
+    /// This method allows changing the auth token at any time. The token is used
+    /// for Authorization header in HTTP requests to Turso Cloud.
+    pub fn set_auth_token(&self, auth_token: Option<String>) {
+        let mut params = self.lazy_params.write();
+        params.auth_token = auth_token;
+    }
+
+    /// Set the encryption key for Turso Cloud encrypted databases.
+    ///
+    /// This method allows lazy initialization of the encryption key. The key can only be:
+    /// - Set from None to Some(value)
+    /// - Set to the same value as before
+    ///
+    /// Attempting to change from one key to a different key will return an error.
+    /// The key should be base64-encoded.
+    pub fn set_encryption_key(&self, key: Option<String>) -> Result<(), TursoError> {
+        let mut params = self.lazy_params.write();
+        match (&params.remote_encryption_key, &key) {
+            // Allow setting from None to Some
+            (None, Some(_)) => {
+                params.remote_encryption_key = key;
+                Ok(())
+            }
+            // Allow setting to the same value
+            (Some(current), Some(new)) if current == new => Ok(()),
+            // Allow setting None to None (no-op)
+            (None, None) => Ok(()),
+            // Disallow unsetting
+            (Some(_), None) => Err(TursoError::Misuse(
+                "cannot unset remote_encryption_key".to_string(),
+            )),
+            // Disallow changing from one value to another
+            (Some(_), Some(_)) => Err(TursoError::Misuse(
+                "cannot change remote_encryption_key to a different value".to_string(),
+            )),
+        }
+    }
+
+    /// Get the current remote URL.
+    pub fn get_url(&self) -> Option<String> {
+        self.lazy_params.read().remote_url.clone()
+    }
+
+    /// Get the current auth token.
+    pub fn get_auth_token(&self) -> Option<String> {
+        self.lazy_params.read().auth_token.clone()
+    }
+
+    /// Get the current encryption key.
+    pub fn get_encryption_key(&self) -> Option<String> {
+        self.lazy_params.read().remote_encryption_key.clone()
     }
 
     /// helper method to get C raw container to the TursoDatabaseSync instance

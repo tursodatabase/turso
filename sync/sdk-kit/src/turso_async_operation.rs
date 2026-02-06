@@ -2,7 +2,7 @@ use std::sync::{Arc, Mutex};
 
 use turso_sdk_kit::{
     capi::c::turso_slice_ref_t,
-    rsapi::{self, turso_slice_from_bytes, TursoError},
+    rsapi::{self, TursoError, turso_slice_from_bytes},
 };
 
 use crate::{
@@ -186,7 +186,7 @@ impl<F: std::future::Future<Output = turso_sync_engine::Result<()>>> TursoAsyncO
                     return Ok(TursoAsyncOperationStatus {
                         status: status.status,
                         result: None,
-                    })
+                    });
                 }
                 Err(err) => return Err(err.clone()),
             }
