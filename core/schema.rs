@@ -1680,14 +1680,18 @@ pub struct CheckConstraint {
     pub expr: ast::Expr,
     /// Original SQL for the CHECK constraint
     pub sql: String,
+    /// Column name if this is a column-level CHECK constraint (defined inline with the column).
+    /// None if this is a table-level CHECK constraint.
+    pub column: Option<String>,
 }
 
 impl CheckConstraint {
-    pub fn new(name: Option<&ast::Name>, expr: &ast::Expr) -> Self {
+    pub fn new(name: Option<&ast::Name>, expr: &ast::Expr, column: Option<&str>) -> Self {
         Self {
             name: name.map(|n| n.as_str().to_string()),
             expr: expr.clone(),
             sql: format!("CHECK ({expr})"),
+            column: column.map(|s| s.to_string()),
         }
     }
 }
@@ -2067,7 +2071,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                     };
                     foreign_keys.push(Arc::new(fk));
                 } else if let ast::TableConstraint::Check(expr) = &c.constraint {
-                    check_constraints.push(CheckConstraint::new(c.name.as_ref(), expr));
+                    check_constraints.push(CheckConstraint::new(c.name.as_ref(), expr, None));
                 }
             }
 
@@ -2116,7 +2120,11 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                 for c_def in constraints {
                     match &c_def.constraint {
                         ast::ColumnConstraint::Check(expr) => {
-                            check_constraints.push(CheckConstraint::new(c_def.name.as_ref(), expr));
+                            check_constraints.push(CheckConstraint::new(
+                                c_def.name.as_ref(),
+                                expr,
+                                Some(&name),
+                            ));
                         }
                         ast::ColumnConstraint::Generated { .. } => {
                             // todo(sivukhin): table_xinfo must be updated when generated columns will be supported in order to properly emit "hidden" column value

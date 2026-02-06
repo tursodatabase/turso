@@ -243,7 +243,40 @@ pub fn translate_alter_table(
                 }
             }
 
-            // TODO: check usage in CHECK constraint when implemented
+            // Handle CHECK constraints:
+            // - Column-level CHECK constraints for the dropped column are silently removed
+            // - Table-level CHECK constraints referencing the dropped column cause an error
+            for check in &btree.check_constraints {
+                if check.column.is_some() {
+                    // Column-level constraint: will be removed below
+                    continue;
+                }
+                // Table-level constraint: check if it references the dropped column
+                let mut references_column = false;
+                walk_expr(
+                    &check.expr,
+                    &mut |e: &ast::Expr| -> crate::Result<WalkControl> {
+                        if let ast::Expr::Id(name) = e {
+                            if normalize_ident(name.as_str()) == normalize_ident(column_name) {
+                                references_column = true;
+                                return Ok(WalkControl::SkipChildren);
+                            }
+                        }
+                        Ok(WalkControl::Continue)
+                    },
+                )?;
+                if references_column {
+                    return Err(LimboError::ParseError(format!(
+                        "error in table {table_name} after drop column: no such column: {column_name}"
+                    )));
+                }
+            }
+            // Remove column-level CHECK constraints for the dropped column
+            btree.check_constraints.retain(|c| {
+                c.column
+                    .as_ref()
+                    .is_none_or(|col| normalize_ident(col) != normalize_ident(column_name))
+            });
 
             // Check if column is used in a foreign key constraint (child side)
             // SQLite does not allow dropping a column that is part of a FK constraint
@@ -466,9 +499,11 @@ pub fn translate_alter_table(
                         btree.foreign_keys.push(Arc::new(fk));
                     }
                     ast::ColumnConstraint::Check(expr) => {
-                        btree
-                            .check_constraints
-                            .push(CheckConstraint::new(constraint.name.as_ref(), expr));
+                        btree.check_constraints.push(CheckConstraint::new(
+                            constraint.name.as_ref(),
+                            expr,
+                            Some(new_column_name),
+                        ));
                     }
                     _ => {
                         // Other constraints (PRIMARY KEY, NOT NULL, etc.) are handled elsewhere

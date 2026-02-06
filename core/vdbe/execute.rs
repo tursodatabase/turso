@@ -10240,7 +10240,14 @@ pub fn op_drop_column(
         };
 
         let btree = Arc::make_mut(btree);
-        btree.columns.remove(*column_index)
+        btree.columns.remove(*column_index);
+        // Remove column-level CHECK constraints for the dropped column
+        let col_name = column_name.clone();
+        btree.check_constraints.retain(|c| {
+            c.column
+                .as_ref()
+                .is_none_or(|col| normalize_ident(col) != normalize_ident(&col_name))
+        });
     });
 
     {
