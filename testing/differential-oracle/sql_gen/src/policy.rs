@@ -1214,8 +1214,11 @@ pub struct CreateTableConfig {
     /// Probability of NOT NULL constraint on a column.
     pub not_null_probability: f64,
 
-    /// Probability of UNIQUE constraint on a column (only if not NOT NULL).
+    /// Probability of UNIQUE constraint on a column.
     pub unique_probability: f64,
+
+    /// Probability of DEFAULT value on a column.
+    pub default_probability: f64,
 
     /// Probability of IF NOT EXISTS clause.
     pub if_not_exists_probability: f64,
@@ -1227,7 +1230,8 @@ impl Default for CreateTableConfig {
             min_columns: 2,
             max_columns: 6,
             not_null_probability: 0.3,
-            unique_probability: 0.1,
+            unique_probability: 0.15,
+            default_probability: 0.2,
             if_not_exists_probability: 0.5,
         }
     }

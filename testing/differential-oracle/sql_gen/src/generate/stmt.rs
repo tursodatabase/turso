@@ -397,7 +397,13 @@ pub fn generate_create_table<C: Capabilities>(
     for _ in 1..num_cols {
         let data_type = *ctx.choose(&types).unwrap();
         let not_null = ctx.gen_bool_with_prob(create_table_config.not_null_probability);
-        let unique = !not_null && ctx.gen_bool_with_prob(create_table_config.unique_probability);
+        let unique = ctx.gen_bool_with_prob(create_table_config.unique_probability);
+        let default = if ctx.gen_bool_with_prob(create_table_config.default_probability) {
+            let lit = generate_literal(ctx, data_type, generator.policy());
+            Some(Expr::literal(ctx, lit))
+        } else {
+            None
+        };
         let name = ctx.gen_unique_name("col", &col_names);
         col_names.insert(name.clone());
 
@@ -407,7 +413,7 @@ pub fn generate_create_table<C: Capabilities>(
             primary_key: false,
             not_null,
             unique,
-            default: None,
+            default,
         });
     }
 
