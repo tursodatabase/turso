@@ -1628,6 +1628,9 @@ test remainder-int-float {
     SELECT 38 % 10.35
 }
 expect {
+    8.0
+}
+expect @js {
     8
 }
 
@@ -1635,6 +1638,9 @@ test remainder-float-int {
     SELECT 38.43 % 13
 }
 expect {
+    12.0
+}
+expect @js {
     12
 }
 
@@ -1642,6 +1648,9 @@ test remainder-0-float {
     SELECT 0 % 12.0
 }
 expect {
+    0.0
+}
+expect @js {
     0
 }
 
@@ -1655,6 +1664,9 @@ test remainder-float-float {
     SELECT 23.14 % 12.0
 }
 expect {
+    11.0
+}
+expect @js {
     11
 }
 
@@ -2912,6 +2924,9 @@ test remainder-text-4 {
     SELECT 'a' % 11.0
 }
 expect {
+    0.0
+}
+expect @js {
     0
 }
 
@@ -2932,6 +2947,9 @@ test remainder-text-8 {
     SELECT '10.0' % '3'
 }
 expect {
+    1.0
+}
+expect @js {
     1
 }
 
@@ -2939,6 +2957,9 @@ test remainder-text-9 {
     SELECT '10.0' % -3
 }
 expect {
+    1.0
+}
+expect @js {
     1
 }
 
@@ -2961,27 +2982,33 @@ test remainder-overflow-3 {
     SELECT -9223372036854775809 % -1
 }
 expect {
+    0.0
+}
+expect @js {
     0
 }
 
-# Test that remainder after multiplication overflow returns integer
-# This was a bug where (overflow * overflow) % int returned Float,
-# causing "datatype mismatch" when inserted into an INTEGER column
+# Test that remainder after multiplication overflow returns real (matching SQLite)
+# The multiplication overflows to float, so the remainder also returns float
 test remainder-multiplication-overflow {
     SELECT 5949738080128696532 * 2434505998659733097 % -586451354473716618
 }
 expect {
-    426601719749026537
+    4.26601719749027e+17
+}
+expect @js {
+    426601719749026560
 }
 
 test remainder-multiplication-overflow-typeof {
     SELECT typeof(5949738080128696532 * 2434505998659733097 % -586451354473716618)
 }
 expect {
-    integer
+    real
 }
 
 # Test that INSERT with overflowing arithmetic in remainder works
+# SQLite allows whole-number floats to be inserted into INTEGER columns
 test remainder-multiplication-overflow-insert {
     CREATE TABLE test_overflow (id INTEGER PRIMARY KEY);
     INSERT INTO test_overflow (id) VALUES (5949738080128696532 * 2434505998659733097 % -586451354473716618);
@@ -2989,7 +3016,7 @@ test remainder-multiplication-overflow-insert {
     DROP TABLE test_overflow;
 }
 expect {
-    426601719749026537
+    426601719749026560
 }
 
 test is-nonnull-divide-by-zero {
