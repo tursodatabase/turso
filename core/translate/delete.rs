@@ -67,7 +67,13 @@ pub fn translate_delete(
         }
     }
 
-    optimize_plan(&mut program, &mut delete_plan, resolver.schema)?;
+    let auto_stats = connection.auto_analyze_stats_snapshot();
+    optimize_plan(
+        &mut program,
+        &mut delete_plan,
+        resolver.schema,
+        auto_stats.as_ref(),
+    )?;
     if let Plan::Delete(delete_plan_inner) = &mut delete_plan {
         // Rewrite the Delete plan after optimization whenever a RowSet is used (DELETE triggers
         // are present), so the joined table is treated as a plain table scan again.

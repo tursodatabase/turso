@@ -1,0 +1,118 @@
+---
+source: auto_analyze.sqltest
+expression: |-
+  SELECT t.val, s.id, m.id, l.id, h.id
+      FROM huge h
+      JOIN large l ON l.id = h.large_id
+      JOIN medium m ON m.id = l.medium_id
+      JOIN small s ON s.id = m.small_id
+      JOIN tiny t ON t.id = s.tiny_id;
+info:
+  statement_type: SELECT
+  tables:
+  - huge
+  - l.id
+  - large
+  - m.id
+  - medium
+  - s.id
+  - small
+  - t.id
+  - tiny
+  setup_blocks:
+  - extreme_schema
+  - extreme_data
+  - extreme_warmup
+  database: ':memory:'
+---
+QUERY PLAN
+|--SCAN huge AS h
+|--SEARCH l USING INTEGER PRIMARY KEY (rowid=?)
+|--SEARCH m USING INDEX ephemeral_medium_t3
+|--SEARCH s USING INDEX ephemeral_small_t4
+`--SEARCH t USING INDEX ephemeral_tiny_t5
+
+BYTECODE
+addr  opcode                p1  p2  p3  p4        p5  comment
+   0  Init                   0  80   0             0  Start at 80
+   1  OpenRead               0   6   0  k(2,B,B)   0  table=huge, root=6, iDb=0
+   2  OpenRead               1   5   0  k(2,B,B)   0  table=large, root=5, iDb=0
+   3  OpenRead               2   4   0  k(2,B,B)   0  table=medium, root=4, iDb=0
+   4  OpenRead               4   3   0  k(2,B,B)   0  table=small, root=3, iDb=0
+   5  OpenRead               6   2   0  k(2,B,B)   0  table=tiny, root=2, iDb=0
+   6  Rewind                 0  79   0             0  Rewind table huge
+   7    Column               0   1   6             0  r[6]=huge.large_id
+   8    SeekRowid            1   6  78             0  if (r[6]!=cursor 1 for table large.rowid) goto 78
+   9    Once                19   0   0             0  goto 19
+  10    OpenAutoindex        3   0   0             0  cursor=3
+  11    Rewind               2  12   0             0  Rewind table medium
+  12      RowId              2   7   0             0  r[7]=medium.rowid
+  13      Column             2   1   8             0  r[8]=medium.small_id
+  14      RowId              2   9   0             0  r[9]=medium.rowid
+  15      MakeRecord         7   3  10             0  r[10]=mkrec(r[7..9]); for ephemeral_medium_t3
+  16      FilterAdd          3   7   1             0  bloom_filter_add(r[7..8])
+  17      IdxInsert          3  10   7             0  key=r[10]
+  18    Next                 2  12   0             0
+  19    Column               1   1  11             0  r[11]=large.medium_id
+  20    IsNull              11  78   0             0  if (r[11]==NULL) goto 78
+  21    Affinity            11   1   0             0  r[11..12] = C
+  22    Filter               3  78  11             1  if !bloom_filter(r[11..12]) goto 78
+  23    SeekGE               3  78  11             0  key=[11..11]
+  24      IdxGT              3  78  11             0  key=[11..11]
+  25      DeferredSeek       3   2   0             0
+  26      IdxRowId           3  13   0             0  r[13]=cursor 3 for index ephemeral_medium_t3.rowid
+  27      Column             1   1  14             0  r[14]=large.medium_id
+  28      Ne                13  14  77  Binary     0  if r[13]!=r[14] goto 77
+  29      Once              39   0   0             0  goto 39
+  30      OpenAutoindex      5   0   0             0  cursor=5
+  31      Rewind             4  32   0             0  Rewind table small
+  32        RowId            4  15   0             0  r[15]=small.rowid
+  33        Column           4   1  16             0  r[16]=small.tiny_id
+  34        RowId            4  17   0             0  r[17]=small.rowid
+  35        MakeRecord      15   3  18             0  r[18]=mkrec(r[15..17]); for ephemeral_small_t4
+  36        FilterAdd        5  15   1             0  bloom_filter_add(r[15..16])
+  37        IdxInsert        5  18  15             0  key=r[18]
+  38      Next               4  32   0             0
+  39      Column             3   1  19             0  r[19]=ephemeral_medium_t3.small_id
+  40      IsNull            19  77   0             0  if (r[19]==NULL) goto 77
+  41      Affinity          19   1   0             0  r[19..20] = C
+  42      Filter             5  77  19             1  if !bloom_filter(r[19..20]) goto 77
+  43      SeekGE             5  77  19             0  key=[19..19]
+  44        IdxGT            5  77  19             0  key=[19..19]
+  45        DeferredSeek     5   4   0             0
+  46        IdxRowId         5  21   0             0  r[21]=cursor 5 for index ephemeral_small_t4.rowid
+  47        Column           3   1  22             0  r[22]=ephemeral_medium_t3.small_id
+  48        Ne              21  22  76  Binary     0  if r[21]!=r[22] goto 76
+  49        Once            59   0   0             0  goto 59
+  50        OpenAutoindex    7   0   0             0  cursor=7
+  51        Rewind           6  52   0             0  Rewind table tiny
+  52          RowId          6  23   0             0  r[23]=tiny.rowid
+  53          Column         6   1  24             0  r[24]=tiny.val
+  54          RowId          6  25   0             0  r[25]=tiny.rowid
+  55          MakeRecord    23   3  26             0  r[26]=mkrec(r[23..25]); for ephemeral_tiny_t5
+  56          FilterAdd      7  23   1             0  bloom_filter_add(r[23..24])
+  57          IdxInsert      7  26  23             0  key=r[26]
+  58        Next             6  52   0             0
+  59        Column           5   1  27             0  r[27]=ephemeral_small_t4.tiny_id
+  60        IsNull          27  76   0             0  if (r[27]==NULL) goto 76
+  61        Affinity        27   1   0             0  r[27..28] = C
+  62        Filter           7  76  27             1  if !bloom_filter(r[27..28]) goto 76
+  63        SeekGE           7  76  27             0  key=[27..27]
+  64          IdxGT          7  76  27             0  key=[27..27]
+  65          DeferredSeek   7   6   0             0
+  66          IdxRowId       7  29   0             0  r[29]=cursor 7 for index ephemeral_tiny_t5.rowid
+  67          Column         5   1  30             0  r[30]=ephemeral_small_t4.tiny_id
+  68          Ne            29  30  75  Binary     0  if r[29]!=r[30] goto 75
+  69          Column         7   1   1             0  r[1]=ephemeral_tiny_t5.val
+  70          IdxRowId       5   2   0             0  r[2]=cursor 5 for index ephemeral_small_t4.rowid
+  71          IdxRowId       3   3   0             0  r[3]=cursor 3 for index ephemeral_medium_t3.rowid
+  72          RowId          1   4   0             0  r[4]=large.rowid
+  73          RowId          0   5   0             0  r[5]=huge.rowid
+  74          ResultRow      1   5   0             0  output=r[1..5]
+  75        Next             7  64   0             0
+  76      Next               5  44   0             0
+  77    Next                 3  24   0             0
+  78  Next                   0   7   0             0
+  79  Halt                   0   0   0             0
+  80  Transaction            0   1   7             0  iDb=0 tx_mode=Read
+  81  Goto                   0   1   0             0
