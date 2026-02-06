@@ -16,6 +16,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use comfy_table::{Attribute, Cell, Color, ContentArrangement, Table};
+use parking_lot::Mutex;
 use rand::{RngCore, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use turso_core::Database;
@@ -164,6 +165,8 @@ pub struct Fuzzer {
     io: Arc<MemorySimIO>,
     /// Directory to save run artifacts
     pub out_dir: PathBuf,
+    /// Captures panic hook info (location + backtrace) for the last panic.
+    panic_context: Arc<Mutex<Option<String>>>,
 }
 
 impl RefUnwindSafe for Fuzzer {}
@@ -223,6 +226,7 @@ impl Fuzzer {
             turso_db,
             io,
             out_dir,
+            panic_context: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -305,8 +309,44 @@ impl Fuzzer {
                 tracing::info!("Statement {} [{}]: {}", i, stmt_type, stmt.sql);
             }
 
-            // Execute on both databases and check oracle
-            match check_differential(&self.turso_conn, &self.sqlite_conn, &stmt) {
+            // Execute on both databases and check oracle.
+            // catch_unwind so that a panic inside Turso still reports
+            // stats and the offending SQL instead of just a stack trace.
+            let ctx = Arc::clone(&self.panic_context);
+            let prev_hook = std::panic::take_hook();
+            std::panic::set_hook(Box::new(move |info| {
+                let bt = std::backtrace::Backtrace::force_capture();
+                *ctx.lock() = Some(format!("{info}\n{bt}"));
+            }));
+
+            let oracle_result = std::panic::catch_unwind(|| {
+                check_differential(&self.turso_conn, &self.sqlite_conn, &stmt)
+            });
+
+            std::panic::set_hook(prev_hook);
+
+            let oracle_result = match oracle_result {
+                Ok(result) => result,
+                Err(panic) => {
+                    let msg = panic
+                        .downcast_ref::<&str>()
+                        .map(|s| s.to_string())
+                        .or_else(|| panic.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "Unknown panic".to_string());
+                    let context = self.panic_context.lock().take().unwrap_or_default();
+                    executed_sql.push(format!("-- PANIC: {}", stmt.sql));
+                    stats.oracle_failures += 1;
+                    tracing::error!("Panic at statement {i}: {msg}");
+                    tracing::error!("Panicking SQL: {}", stmt.sql);
+                    tracing::error!("Backtrace:\n{context}");
+                    return Err(anyhow::anyhow!(
+                        "Panic during statement {i}: {msg}\n  SQL: {}\n{context}",
+                        stmt.sql
+                    ));
+                }
+            };
+
+            match oracle_result {
                 OracleResult::Pass => {
                     stats.statements_executed += 1;
                     executed_sql.push(stmt.sql.clone());
