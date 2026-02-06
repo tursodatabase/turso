@@ -281,8 +281,7 @@ impl ParsedNumber {
     }
 }
 
-pub fn try_for_float(text: &str) -> (NumericParseResult, ParsedNumber) {
-    let bytes = text.as_bytes();
+pub fn try_for_float(bytes: &[u8]) -> (NumericParseResult, ParsedNumber) {
     if bytes.is_empty() {
         return (NumericParseResult::NotNumeric, ParsedNumber::None);
     }
@@ -541,7 +540,7 @@ pub fn apply_numeric_affinity(val: ValueRef, try_for_int: bool) -> Option<ValueR
     };
 
     let text_str = text.as_str();
-    let (parse_result, parsed_value) = try_for_float(text_str);
+    let (parse_result, parsed_value) = try_for_float(text_str.as_bytes());
 
     // Only convert if we have a complete valid number (not just a prefix)
     match parse_result {
@@ -633,7 +632,7 @@ mod tests {
         // This test verifies that try_for_float uses high-precision arithmetic
         // to avoid rounding errors when computing significand * 10^exponent.
         // Naive f64 multiplication accumulates errors; Dekker double-double fixes this.
-        let (_, parsed) = try_for_float("12345678901234567e-5");
+        let (_, parsed) = try_for_float(b"12345678901234567e-5");
         let expected: f64 = "12345678901234567e-5".parse().unwrap();
         assert_eq!(
             parsed.as_float().unwrap().to_bits(),

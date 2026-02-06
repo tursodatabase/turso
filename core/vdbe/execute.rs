@@ -3858,18 +3858,15 @@ fn update_agg_payload(
             let val = match arg {
                 Value::Integer(i) => i as f64,
                 Value::Float(f) => f,
-                Value::Text(t) => match try_for_float(t.as_str()).1 {
+                Value::Text(t) => match try_for_float(t.as_str().as_bytes()).1 {
                     ParsedNumber::Integer(i) => i as f64,
                     ParsedNumber::Float(f) => f,
                     ParsedNumber::None => 0.0,
                 },
-                Value::Blob(b) => match std::str::from_utf8(&b) {
-                    Ok(s) => match try_for_float(s).1 {
-                        ParsedNumber::Integer(i) => i as f64,
-                        ParsedNumber::Float(f) => f,
-                        ParsedNumber::None => 0.0,
-                    },
-                    Err(_) => 0.0,
+                Value::Blob(b) => match try_for_float(&b).1 {
+                    ParsedNumber::Integer(i) => i as f64,
+                    ParsedNumber::Float(f) => f,
+                    ParsedNumber::None => 0.0,
                 },
                 Value::Null => unreachable!(),
             };
@@ -3955,21 +3952,12 @@ fn update_agg_payload(
                     _ => unreachable!("Sum/Total accumulator initialized to Null/Integer/Float"),
                 },
                 Value::Text(t) => {
-                    let (parse_result, parsed_number) = try_for_float(t.as_str());
+                    let (parse_result, parsed_number) = try_for_float(t.as_str().as_bytes());
                     handle_text_sum(acc, &mut sum_state, parsed_number, parse_result);
                 }
                 Value::Blob(b) => {
-                    if let Ok(s) = std::str::from_utf8(&b) {
-                        let (parse_result, parsed_number) = try_for_float(s);
-                        handle_text_sum(acc, &mut sum_state, parsed_number, parse_result);
-                    } else {
-                        handle_text_sum(
-                            acc,
-                            &mut sum_state,
-                            ParsedNumber::None,
-                            NumericParseResult::NotNumeric,
-                        );
-                    }
+                    let (parse_result, parsed_number) = try_for_float(&b);
+                    handle_text_sum(acc, &mut sum_state, parsed_number, parse_result);
                 }
             }
             *r_err = sum_state.r_err;
