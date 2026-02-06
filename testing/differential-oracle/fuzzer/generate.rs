@@ -53,7 +53,9 @@ impl SqlGenBackend {
                 drop_trigger: 0,
                 ..sql_gen::StmtWeights::default()
             })
-            .with_function_config(sql_gen::FunctionConfig::deterministic());
+            .with_function_config(
+                sql_gen::FunctionConfig::deterministic().disable(&["LIKELY", "UNLIKELY"]),
+            );
         policy.select_config.nulls_order_weights.first = 0;
         policy.select_config.nulls_order_weights.last = 0;
         // Disable expression values and conflict clauses for now

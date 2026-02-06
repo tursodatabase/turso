@@ -1689,6 +1689,16 @@ impl FunctionConfig {
         }
     }
 
+    /// Disable specific functions by name (sets their weight to 0).
+    pub fn disable(mut self, names: &[&str]) -> Self {
+        for (f, w) in &mut self.function_weights {
+            if names.contains(&f.name) {
+                *w = 0;
+            }
+        }
+        self
+    }
+
     /// Select a function based on weights.
     pub fn select_function(&self, ctx: &mut Context) -> Result<&'static FunctionDef, GenError> {
         let eligible: Vec<_> = self
