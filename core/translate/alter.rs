@@ -118,6 +118,7 @@ pub fn translate_alter_table(
                 table_name,
                 new_name_norm,
                 resolver,
+                connection,
             );
         }
     }
@@ -340,6 +341,16 @@ pub fn translate_alter_table(
                             index_name: None,
                             affinity_str: Some(affinity_str),
                         });
+
+                        // In MVCC mode, we need to delete before insert to properly
+                        // end the old version (Hekaton-style UPDATE = DELETE + INSERT)
+                        if connection.mvcc_enabled() {
+                            program.emit_insn(Insn::Delete {
+                                cursor_id,
+                                table_name: table_name.clone(),
+                                is_part_of_update: true,
+                            });
+                        }
 
                         program.emit_insn(Insn::Insert {
                             cursor: cursor_id,
@@ -628,6 +639,16 @@ pub fn translate_alter_table(
                     affinity_str: None,
                 });
 
+                // In MVCC mode, we need to delete before insert to properly
+                // end the old version (Hekaton-style UPDATE = DELETE + INSERT)
+                if connection.mvcc_enabled() {
+                    program.emit_insn(Insn::Delete {
+                        cursor_id,
+                        table_name: SQLITE_TABLEID.to_string(),
+                        is_part_of_update: true,
+                    });
+                }
+
                 program.emit_insn(Insn::Insert {
                     cursor: cursor_id,
                     key_reg: rowid,
@@ -902,6 +923,16 @@ pub fn translate_alter_table(
                     affinity_str: None,
                 });
 
+                // In MVCC mode, we need to delete before insert to properly
+                // end the old version (Hekaton-style UPDATE = DELETE + INSERT)
+                if connection.mvcc_enabled() {
+                    program.emit_insn(Insn::Delete {
+                        cursor_id,
+                        table_name: SQLITE_TABLEID.to_string(),
+                        is_part_of_update: true,
+                    });
+                }
+
                 program.emit_insn(Insn::Insert {
                     cursor: cursor_id,
                     key_reg: rowid,
@@ -968,6 +999,7 @@ fn translate_rename_virtual_table(
     old_name: &str,
     new_name_norm: String,
     resolver: &Resolver,
+    connection: &Arc<crate::Connection>,
 ) -> Result<ProgramBuilder> {
     program.begin_write_operation();
     let vtab_cur = program.alloc_cursor_id(CursorType::VirtualTable(vtab));
@@ -1030,6 +1062,16 @@ fn translate_rename_virtual_table(
             index_name: None,
             affinity_str: None,
         });
+
+        // In MVCC mode, we need to delete before insert to properly
+        // end the old version (Hekaton-style UPDATE = DELETE + INSERT)
+        if connection.mvcc_enabled() {
+            program.emit_insn(Insn::Delete {
+                cursor_id: schema_cur,
+                table_name: SQLITE_TABLEID.to_string(),
+                is_part_of_update: true,
+            });
+        }
 
         program.emit_insn(Insn::Insert {
             cursor: schema_cur,
