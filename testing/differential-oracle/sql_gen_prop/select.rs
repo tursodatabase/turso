@@ -225,12 +225,34 @@ pub struct SelectStatement {
 }
 
 impl SelectStatement {
-    /// Returns true if this SELECT has a LIMIT clause without an ORDER BY.
+    /// Returns true if this SELECT or any nested subquery has LIMIT without ORDER BY.
     ///
     /// Queries with LIMIT but no ORDER BY may return different rows between
-    /// database implementations since the order is undefined.
+    /// database implementations since the order is undefined. This check
+    /// recurses into subqueries within expressions (e.g., NOT IN (SELECT ... LIMIT 1)).
     pub fn has_unordered_limit(&self) -> bool {
-        self.limit.is_some() && self.order_by.is_empty()
+        if self.limit.is_some() && self.order_by.is_empty() {
+            return true;
+        }
+        // Check subqueries in SELECT columns
+        for col in &self.columns {
+            if col.has_unordered_limit() {
+                return true;
+            }
+        }
+        // Check WHERE clause
+        if let Some(w) = &self.where_clause {
+            if w.has_unordered_limit() {
+                return true;
+            }
+        }
+        // Check ORDER BY expressions
+        for item in &self.order_by {
+            if item.expr.has_unordered_limit() {
+                return true;
+            }
+        }
+        false
     }
 }
 

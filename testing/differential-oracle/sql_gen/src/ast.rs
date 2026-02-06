@@ -54,11 +54,95 @@ impl fmt::Display for Stmt {
 }
 
 impl Stmt {
-    /// Returns true if this is a SELECT with LIMIT but no ORDER BY.
+    /// Returns true if this statement contains any SELECT with LIMIT but no ORDER BY,
+    /// including in subqueries within expressions.
     pub fn has_unordered_limit(&self) -> bool {
         match self {
-            Stmt::Select(s) => s.limit.is_some() && s.order_by.is_empty(),
+            Stmt::Select(s) => s.has_unordered_limit(),
             _ => false,
+        }
+    }
+}
+
+impl SelectStmt {
+    /// Returns true if this SELECT or any nested subquery has LIMIT without ORDER BY.
+    pub fn has_unordered_limit(&self) -> bool {
+        if self.limit.is_some() && self.order_by.is_empty() {
+            return true;
+        }
+        // Check subqueries in SELECT columns
+        for col in &self.columns {
+            if col.expr.has_unordered_limit() {
+                return true;
+            }
+        }
+        // Check WHERE clause
+        if let Some(w) = &self.where_clause {
+            if w.has_unordered_limit() {
+                return true;
+            }
+        }
+        // Check GROUP BY / HAVING
+        if let Some(gb) = &self.group_by {
+            for expr in &gb.exprs {
+                if expr.has_unordered_limit() {
+                    return true;
+                }
+            }
+            if let Some(h) = &gb.having {
+                if h.has_unordered_limit() {
+                    return true;
+                }
+            }
+        }
+        // Check ORDER BY expressions
+        for item in &self.order_by {
+            if item.expr.has_unordered_limit() {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+impl Expr {
+    /// Returns true if this expression contains any subquery with LIMIT but no ORDER BY.
+    pub fn has_unordered_limit(&self) -> bool {
+        match self {
+            Expr::Subquery(s) => s.has_unordered_limit(),
+            Expr::InSubquery(i) => {
+                i.expr.has_unordered_limit() || i.subquery.has_unordered_limit()
+            }
+            Expr::Exists(e) => e.subquery.has_unordered_limit(),
+            Expr::BinaryOp(b) => {
+                b.left.has_unordered_limit() || b.right.has_unordered_limit()
+            }
+            Expr::UnaryOp(u) => u.operand.has_unordered_limit(),
+            Expr::FunctionCall(fc) => fc.args.iter().any(|a| a.has_unordered_limit()),
+            Expr::Case(c) => {
+                c.operand
+                    .as_ref()
+                    .is_some_and(|o| o.has_unordered_limit())
+                    || c.when_clauses
+                        .iter()
+                        .any(|(w, t)| w.has_unordered_limit() || t.has_unordered_limit())
+                    || c.else_clause
+                        .as_ref()
+                        .is_some_and(|e| e.has_unordered_limit())
+            }
+            Expr::Cast(c) => c.expr.has_unordered_limit(),
+            Expr::Between(b) => {
+                b.expr.has_unordered_limit()
+                    || b.low.has_unordered_limit()
+                    || b.high.has_unordered_limit()
+            }
+            Expr::InList(i) => {
+                i.expr.has_unordered_limit()
+                    || i.list.iter().any(|e| e.has_unordered_limit())
+            }
+            Expr::IsNull(i) => i.expr.has_unordered_limit(),
+            Expr::Parenthesized(e) => e.has_unordered_limit(),
+            Expr::ColumnRef(_) | Expr::Literal(_) => false,
         }
     }
 }
