@@ -12,8 +12,10 @@ use crate::{
         sqlite3_ondisk::{
             payload_overflows, read_u32, read_varint, write_varint, BTreeCell, DatabaseHeader,
             PageContent, PageSize, PageType, TableInteriorCell, TableLeafCell, CELL_PTR_SIZE_BYTES,
-            INTERIOR_PAGE_HEADER_SIZE_BYTES, LEAF_PAGE_HEADER_SIZE_BYTES,
-            LEFT_CHILD_PTR_SIZE_BYTES,
+            FREELIST_LEAF_PTR_SIZE, FREELIST_TRUNK_HEADER_SIZE,
+            FREELIST_TRUNK_OFFSET_FIRST_LEAF_PTR, FREELIST_TRUNK_OFFSET_LEAF_COUNT,
+            FREELIST_TRUNK_OFFSET_NEXT_TRUNK_PTR, INTERIOR_PAGE_HEADER_SIZE_BYTES,
+            LEAF_PAGE_HEADER_SIZE_BYTES, LEFT_CHILD_PTR_SIZE_BYTES,
         },
         state_machines::{
             AdvanceState, CountState, EmptyTableState, MoveToRightState, MoveToState, RewindState,
@@ -5821,6 +5823,16 @@ pub enum IntegrityCheckError {
     PageNeverUsed { page_id: i64 },
     #[error("Pending byte page {page_id} is being used")]
     PendingBytePageUsed { page_id: i64 },
+    #[error(
+        "Freelist trunk page {page_id} has invalid pointer count {page_pointers} (max {max_pointers})"
+    )]
+    FreelistTrunkCorrupt {
+        page_id: i64,
+        page_pointers: u32,
+        max_pointers: usize,
+    },
+    #[error("Freelist page pointer out of range: page {page_id} points to {pointer}")]
+    FreelistPointerOutOfRange { page_id: i64, pointer: i64 },
     #[error("wrong # of entries in index {index_name}")]
     IndexEntryCountMismatch {
         index_name: String,
@@ -6014,8 +6026,22 @@ pub fn integrity_check(
         let contents = page.get_contents();
         if page_category == PageCategory::FreeListTrunk {
             state.freelist_count.actual_count += 1;
-            let next_freelist_trunk_page = contents.read_u32_no_offset(0);
+            let next_freelist_trunk_page =
+                contents.read_u32_no_offset(FREELIST_TRUNK_OFFSET_NEXT_TRUNK_PTR);
             if next_freelist_trunk_page != 0 {
+                if next_freelist_trunk_page as usize > state.db_size {
+                    tracing::error!(
+                        "integrity_check: freelist trunk page {} has invalid next pointer {}. header_bytes={:02x?}",
+                        page.get().id,
+                        next_freelist_trunk_page,
+                        &contents.as_ptr()[0..16]
+                    );
+                    errors.push(IntegrityCheckError::FreelistPointerOutOfRange {
+                        page_id: page.get().id as i64,
+                        pointer: next_freelist_trunk_page as i64,
+                    });
+                    continue;
+                }
                 state.push_page(
                     IntegrityCheckPageEntry {
                         page_idx: next_freelist_trunk_page as i64,
@@ -6027,9 +6053,56 @@ pub fn integrity_check(
                     errors,
                 );
             }
-            let page_pointers = contents.read_u32_no_offset(4);
+            let page_pointers = contents.read_u32_no_offset(FREELIST_TRUNK_OFFSET_LEAF_COUNT);
+            let page_size = contents.as_ptr().len();
+            let max_pointers =
+                page_size.saturating_sub(FREELIST_TRUNK_HEADER_SIZE) / FREELIST_LEAF_PTR_SIZE;
+            if page_pointers as usize > max_pointers {
+                tracing::error!(
+                    "integrity_check: freelist trunk page {} has invalid leaf count {} (max {}). header_bytes={:02x?}",
+                    page.get().id,
+                    page_pointers,
+                    max_pointers,
+                    &contents.as_ptr()[0..16]
+                );
+                errors.push(IntegrityCheckError::FreelistTrunkCorrupt {
+                    page_id: page.get().id as i64,
+                    page_pointers,
+                    max_pointers,
+                });
+                continue;
+            }
             for i in 0..page_pointers {
-                let page_pointer = contents.read_u32_no_offset((8 + 4 * i) as usize);
+                let offset =
+                    FREELIST_TRUNK_OFFSET_FIRST_LEAF_PTR + FREELIST_LEAF_PTR_SIZE * i as usize;
+                if offset + FREELIST_LEAF_PTR_SIZE > page_size {
+                    tracing::error!(
+                        "integrity_check: freelist trunk page {} has invalid leaf offset {}. header_bytes={:02x?}",
+                        page.get().id,
+                        offset,
+                        &contents.as_ptr()[0..16]
+                    );
+                    errors.push(IntegrityCheckError::FreelistTrunkCorrupt {
+                        page_id: page.get().id as i64,
+                        page_pointers,
+                        max_pointers,
+                    });
+                    break;
+                }
+                let page_pointer = contents.read_u32_no_offset(offset);
+                if page_pointer as usize > state.db_size {
+                    tracing::error!(
+                        "integrity_check: freelist trunk page {} has invalid leaf pointer {}. header_bytes={:02x?}",
+                        page.get().id,
+                        page_pointer,
+                        &contents.as_ptr()[0..16]
+                    );
+                    errors.push(IntegrityCheckError::FreelistPointerOutOfRange {
+                        page_id: page.get().id as i64,
+                        pointer: page_pointer as i64,
+                    });
+                    continue;
+                }
                 state.push_page(
                     IntegrityCheckPageEntry {
                         page_idx: page_pointer as i64,
