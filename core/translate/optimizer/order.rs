@@ -1,3 +1,4 @@
+use crate::turso_assert_greater_than_or_equal;
 use crate::{
     translate::{
         collate::{get_collseq_from_expr, CollationSeq},
@@ -129,7 +130,7 @@ pub fn compute_order_target(
             // we know that we don't need ORDER BY sorting anyway, because the GROUP BY will sort the result since
             // it contains all the necessary columns required for the ORDER BY, and the GROUP BY columns are now in the correct order.
             // First, however, we need to make sure the GROUP BY sorter's column sort directions match the ORDER BY requirements.
-            assert!(group_by.exprs.len() >= order_by.len());
+            turso_assert_greater_than_or_equal!(group_by.exprs.len(), order_by.len());
             let sort_order = group_by
                 .sort_order
                 .as_mut()

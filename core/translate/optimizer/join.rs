@@ -1,12 +1,20 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
+use crate::{turso_assert_eq, turso_assert_greater_than};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use smallvec::SmallVec;
 
 use turso_parser::ast::{Expr, Operator, TableInternalId};
 
+use super::{
+    access_method::{find_best_access_method_for_join_order, AccessMethod},
+    constraints::TableConstraints,
+    cost_params::CostModelParams,
+    order::OrderTarget,
+    IndexMethodCandidate,
+};
 use crate::{
     schema::{Index, Schema},
     stats::AnalyzeStats,
@@ -27,14 +35,6 @@ use crate::{
         planner::TableMask,
     },
     LimboError, Result,
-};
-
-use super::{
-    access_method::{find_best_access_method_for_join_order, AccessMethod},
-    constraints::TableConstraints,
-    cost_params::CostModelParams,
-    order::OrderTarget,
-    IndexMethodCandidate,
 };
 
 // Upper bound on rowids to materialize for a hash build input.
@@ -1077,7 +1077,7 @@ pub fn compute_best_join_order<'a>(
             original_idx: i,
             is_outer: false,
         };
-        assert!(join_order.len() == 1);
+        turso_assert_eq!(join_order.len(), 1);
         let rel = join_lhs_and_rhs(
             None,
             table_ref,
@@ -1203,7 +1203,7 @@ pub fn compute_best_join_order<'a>(
                             .as_ref()
                             .is_some_and(|j| j.outer),
                     });
-                    assert!(join_order.len() == subset_size);
+                    turso_assert_eq!(join_order.len(), subset_size);
 
                     // Calculate the best way to join LHS with RHS.
                     let rel = join_lhs_and_rhs(
@@ -1596,7 +1596,7 @@ pub fn compute_naive_left_deep_plan<'a>(
     schema: &Schema,
 ) -> Result<Option<JoinN>> {
     let n = joined_tables.len();
-    assert!(n > 0);
+    turso_assert_greater_than!(n, 0);
 
     let join_order = joined_tables
         .iter()

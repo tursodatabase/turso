@@ -1,5 +1,6 @@
 // FIXME: remove this once we add recovery
 #![allow(dead_code)]
+
 use crate::io::FileSyncType;
 use crate::sync::Arc;
 use crate::sync::RwLock;
@@ -7,10 +8,11 @@ use crate::{
     io::ReadComplete,
     mvcc::database::{LogRecord, MVTableId, Row, RowID, RowKey, RowVersion, SortableIndexKey},
     storage::sqlite3_ondisk::{read_varint, write_varint_to_vec},
-    turso_assert,
     types::{ImmutableRecord, IndexInfo},
     Buffer, Completion, CompletionError, LimboError, Result,
 };
+use crate::{turso_assert, turso_assert_eq, turso_assert_less_than};
+use turso_macros::turso_assert_less_than_or_equal;
 
 use crate::File;
 
@@ -52,9 +54,10 @@ impl LogHeader {
 
         let header_size_before_padding = buffer.len() - buffer_size_start;
         let padding = 64 - header_size_before_padding;
-        debug_assert!(header_size_before_padding <= LOG_HEADER_MAX_SIZE);
+        #[cfg(debug_assertions)]
+        turso_assert_less_than_or_equal!(header_size_before_padding, LOG_HEADER_MAX_SIZE);
         buffer.extend_from_slice(&LOG_HEADER_PADDING[0..padding]);
-        assert_eq!(buffer.len() - buffer_size_start, LOG_HEADER_MAX_SIZE);
+        turso_assert_eq!(buffer.len() - buffer_size_start, LOG_HEADER_MAX_SIZE);
     }
 }
 
@@ -115,9 +118,10 @@ impl LogRecordType {
     ///   * key_data (bytes) - the SortableIndexKey.key.as_blob()
     fn serialize(&self, buffer: &mut Vec<u8>, row_version: &RowVersion) {
         let table_id_i64: i64 = row_version.row.id.table_id.into();
-        assert!(
-            table_id_i64 < 0,
-            "table_id_i64 should be negative, but got {table_id_i64}"
+        turso_assert_less_than!(
+            table_id_i64,
+            0,
+            "table_id must be negative in log serialization"
         );
         buffer.extend_from_slice(&table_id_i64.to_be_bytes());
 
