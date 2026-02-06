@@ -437,6 +437,10 @@ pub fn translate_condition_expr(
             // In a binary OR, never jump to the parent 'jump_target_when_false' label on the first condition, because
             // the second condition CAN also be true. Instead we instruct the child expression to jump to a local
             // false label.
+            //
+            // For NULL handling: In three-valued logic, NULL OR TRUE = TRUE, NULL OR FALSE = NULL.
+            // So when the LHS is NULL, we must also evaluate the RHS (same as when LHS is FALSE).
+            // Therefore, jump_target_when_null must also point to the local false label.
             let jump_target_when_false = program.allocate_label();
             translate_condition_expr(
                 program,
@@ -445,6 +449,7 @@ pub fn translate_condition_expr(
                 ConditionMetadata {
                     jump_if_condition_is_true: true,
                     jump_target_when_false,
+                    jump_target_when_null: jump_target_when_false,
                     ..condition_metadata
                 },
                 resolver,
@@ -3313,7 +3318,10 @@ fn emit_binary_condition_insn(
     };
 
     // Similarly, we "jump if NULL" only when we intend to jump if the condition is false.
-    let flags = if condition_metadata.jump_if_condition_is_true {
+    // Exception: IS and IS NOT operators never return NULL (they always return TRUE or FALSE),
+    // so they should never have jump_if_null set.
+    let is_or_is_not = matches!(op, ast::Operator::Is | ast::Operator::IsNot);
+    let flags = if condition_metadata.jump_if_condition_is_true || is_or_is_not {
         CmpInsFlags::default().with_affinity(affinity)
     } else {
         CmpInsFlags::default()

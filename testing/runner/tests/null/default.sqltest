@@ -42,3 +42,34 @@ expect {
     0
 }
 
+# Issue 5038: NULL OR TRUE in WHERE clause should pass all rows
+# NULL NOT IN NULL = NULL, and NULL OR TRUE = TRUE in three-valued logic
+test null-or-true-where-clause {
+    create table t6(c0 int, c1 int);
+    insert into t6 values (null, 1), (1, 2), (2, 3);
+    select count(*) from t6 where (((t6.c0 not in (t6.c0))) or (true)) and ((not false));
+    select sum(((((t6.c0 not in (t6.c0))) or (true)) and ((not false))) is true) from t6;
+}
+expect {
+    3
+    3
+}
+
+# IS NOT with NULL should return TRUE (NULL IS NOT X = TRUE when X is not NULL)
+test is-not-null-value {
+    select null is not 1, null is not 0, 1 is not 1, 1 is not 2;
+}
+expect {
+    1|1|0|1
+}
+
+# IS NOT in WHERE clause should correctly handle NULL
+test is-not-in-where {
+    create table t7(c0 int);
+    insert into t7 values (null), (1), (2);
+    select count(*) from t7 where c0 is not 1;
+}
+expect {
+    2
+}
+
