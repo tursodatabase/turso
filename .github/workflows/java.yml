@@ -44,8 +44,7 @@ jobs:
           prefix-key: "v1-rust"
           cache-on-failure: true
 
-      - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
+      - uses: "./.github/shared/setup-sccache"
 
       - name: Set up JDK
         uses: useblacksmith/setup-java@v5
@@ -54,7 +53,4 @@ jobs:
           java-version: '8'
 
       - name: Run Java tests
-        env:
-          SCCACHE_GHA_ENABLED: "true"
-          RUSTC_WRAPPER: "sccache"
         run: make test
