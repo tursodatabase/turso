@@ -538,6 +538,32 @@ impl Statement {
         self.busy
     }
 
+    /// Returns true if this prepared statement makes no direct changes to the database.
+    ///
+    /// This is similar to SQLite's `sqlite3_stmt_readonly()`:
+    /// - Returns `true` for SELECT and other read-only statements
+    /// - Returns `false` for INSERT, UPDATE, DELETE, CREATE INDEX, etc.
+    ///
+    /// Note: EXPLAIN and EXPLAIN QUERY PLAN statements return the same value
+    /// as the underlying statement without the EXPLAIN prefix.
+    pub fn is_readonly(&self) -> bool {
+        !self.program.change_cnt_on
+    }
+
+    /// Returns the EXPLAIN mode of this prepared statement.
+    ///
+    /// This is similar to SQLite's `sqlite3_stmt_isexplain()`:
+    /// - Returns `0` if the statement is not an EXPLAIN statement
+    /// - Returns `1` if the statement is an EXPLAIN statement
+    /// - Returns `2` if the statement is an EXPLAIN QUERY PLAN statement
+    pub fn is_explain(&self) -> i32 {
+        match self.query_mode {
+            QueryMode::Normal => 0,
+            QueryMode::Explain => 1,
+            QueryMode::ExplainQueryPlan => 2,
+        }
+    }
+
     /// Internal method to get IO from a statement.
     /// Used by select internal crate
     ///

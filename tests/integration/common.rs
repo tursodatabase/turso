@@ -953,4 +953,90 @@ mod tests {
 
         conn.execute("UPDATE plucky_maximilienne_680 SET creative_again_681 = 2 WHERE creative_again_681 = 1;").unwrap();
     }
+
+    #[test]
+    fn test_statement_is_readonly() -> anyhow::Result<()> {
+        let _ = env_logger::try_init();
+        let tmp_db = TempDatabase::new_with_rusqlite(
+            "CREATE TABLE test (id INTEGER PRIMARY KEY, name TEXT);",
+        );
+        let conn = tmp_db.connect_limbo();
+
+        // SELECT statements should be read-only
+        let stmt = conn.prepare("SELECT * FROM test")?;
+        assert!(stmt.is_readonly(), "SELECT should be read-only");
+
+        // SELECT with WHERE should be read-only
+        let stmt = conn.prepare("SELECT * FROM test WHERE id = 1")?;
+        assert!(stmt.is_readonly(), "SELECT with WHERE should be read-only");
+
+        // INSERT statements should NOT be read-only
+        let stmt = conn.prepare("INSERT INTO test (name) VALUES ('test')")?;
+        assert!(!stmt.is_readonly(), "INSERT should NOT be read-only");
+
+        // UPDATE statements should NOT be read-only
+        let stmt = conn.prepare("UPDATE test SET name = 'updated' WHERE id = 1")?;
+        assert!(!stmt.is_readonly(), "UPDATE should NOT be read-only");
+
+        // DELETE statements should NOT be read-only
+        let stmt = conn.prepare("DELETE FROM test WHERE id = 1")?;
+        assert!(!stmt.is_readonly(), "DELETE should NOT be read-only");
+
+        // CREATE INDEX should NOT be read-only
+        let stmt = conn.prepare("CREATE INDEX idx_test_name ON test (name)")?;
+        assert!(!stmt.is_readonly(), "CREATE INDEX should NOT be read-only");
+
+        // PRAGMA should be read-only
+        let stmt = conn.prepare("PRAGMA table_info(test)")?;
+        assert!(stmt.is_readonly(), "PRAGMA should be read-only");
+
+        // BEGIN should be read-only (doesn't modify database content)
+        let stmt = conn.prepare("BEGIN")?;
+        assert!(stmt.is_readonly(), "BEGIN should be read-only");
+
+        // COMMIT should be read-only
+        let stmt = conn.prepare("COMMIT")?;
+        assert!(stmt.is_readonly(), "COMMIT should be read-only");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_statement_is_explain() -> anyhow::Result<()> {
+        let _ = env_logger::try_init();
+        let tmp_db = TempDatabase::new_with_rusqlite(
+            "CREATE TABLE test (id INTEGER PRIMARY KEY, name TEXT);",
+        );
+        let conn = tmp_db.connect_limbo();
+
+        // Regular statement should return 0
+        let stmt = conn.prepare("SELECT * FROM test")?;
+        assert_eq!(stmt.is_explain(), 0, "Regular SELECT should return 0");
+
+        // EXPLAIN statement should return 1
+        let stmt = conn.prepare("EXPLAIN SELECT * FROM test")?;
+        assert_eq!(stmt.is_explain(), 1, "EXPLAIN SELECT should return 1");
+
+        // EXPLAIN QUERY PLAN statement should return 2
+        let stmt = conn.prepare("EXPLAIN QUERY PLAN SELECT * FROM test")?;
+        assert_eq!(
+            stmt.is_explain(),
+            2,
+            "EXPLAIN QUERY PLAN SELECT should return 2"
+        );
+
+        // EXPLAIN on INSERT should also return 1
+        let stmt = conn.prepare("EXPLAIN INSERT INTO test (name) VALUES ('test')")?;
+        assert_eq!(stmt.is_explain(), 1, "EXPLAIN INSERT should return 1");
+
+        // EXPLAIN QUERY PLAN on INSERT should return 2
+        let stmt = conn.prepare("EXPLAIN QUERY PLAN INSERT INTO test (name) VALUES ('test')")?;
+        assert_eq!(
+            stmt.is_explain(),
+            2,
+            "EXPLAIN QUERY PLAN INSERT should return 2"
+        );
+
+        Ok(())
+    }
 }
