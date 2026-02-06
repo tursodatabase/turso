@@ -33,8 +33,7 @@ jobs:
       with:
         prefix-key: "v1-rust"
         cache-on-failure: true
-    - name: Setup sccache
-      uses: mozilla-actions/sccache-action@v0.0.9
+    - uses: "./.github/shared/setup-sccache"
     - name: Install cargo-nextest
       uses: taiki-e/install-action@nextest
     - name: Set up Python 3.10
@@ -42,15 +41,10 @@ jobs:
       with:
         python-version: "3.10"
     - name: Build
-      env:
-        SCCACHE_GHA_ENABLED: "true"
-        RUSTC_WRAPPER: "sccache"
       run: cargo build --verbose --locked --all-features
     - name: Run fuzz tests
       env:
         RUST_BACKTRACE: 1
-        SCCACHE_GHA_ENABLED: "true"
-        RUSTC_WRAPPER: "sccache"
       run: cargo nextest run --locked --no-fail-fast -E 'test(/^fuzz_tests::/)' --failure-output=final
 
   run-long-fuzz-tests:
@@ -66,8 +60,7 @@ jobs:
       with:
         prefix-key: "v1-rust"
         cache-on-failure: true
-    - name: Setup sccache
-      uses: mozilla-actions/sccache-action@v0.0.9
+    - uses: "./.github/shared/setup-sccache"
     - name: Install cargo-nextest
       uses: taiki-e/install-action@nextest
     - name: Set up Python 3.10
@@ -75,15 +68,10 @@ jobs:
       with:
         python-version: "3.10"
     - name: Build
-      env:
-        SCCACHE_GHA_ENABLED: "true"
-        RUSTC_WRAPPER: "sccache"
       run: cargo build --verbose --locked --all-features
     - name: Run ignored long fuzz tests
       env:
         RUST_BACKTRACE: 1
-        SCCACHE_GHA_ENABLED: "true"
-        RUSTC_WRAPPER: "sccache"
       run: cargo nextest run --locked --no-fail-fast --run-ignored ignored-only -E 'test(/fuzz_long/)' --failure-output=final
 
   simple-stress-test:
@@ -98,22 +86,16 @@ jobs:
       with:
         prefix-key: "v1-rust"
         cache-on-failure: true
-    - name: Setup sccache
-      uses: mozilla-actions/sccache-action@v0.0.9
+    - uses: "./.github/shared/setup-sccache"
     - name: Set up Python 3.10
       uses: useblacksmith/setup-python@v6
       with:
         python-version: "3.10"
     - name: Build
-      env:
-        SCCACHE_GHA_ENABLED: "true"
-        RUSTC_WRAPPER: "sccache"
       run: cargo build --verbose --locked --all-features
     - name: Run ignored long tests
       env:
         RUST_BACKTRACE: 1
-        SCCACHE_GHA_ENABLED: "true"
-        RUSTC_WRAPPER: "sccache"
       run: RUSTFLAGS="--cfg shuttle" cargo run -p turso_stress --locked -- --nr-threads 3 --nr-iterations 300
 
   shuttle-stress-test:
@@ -128,14 +110,11 @@ jobs:
       with:
         prefix-key: "v1-rust-shuttle"
         cache-on-failure: true
-    - name: Setup sccache
-      uses: mozilla-actions/sccache-action@v0.0.9
+    - uses: "./.github/shared/setup-sccache"
     - name: Run shuttle stress test
       env:
         RUST_BACKTRACE: 1
         RUSTFLAGS: "--cfg=shuttle"
-        SCCACHE_GHA_ENABLED: "true"
-        RUSTC_WRAPPER: "sccache"
       run: cargo run -p turso_stress --locked -- --nr-threads 2 --nr-iterations 1000
 
   libfuzzer-scalar-func:

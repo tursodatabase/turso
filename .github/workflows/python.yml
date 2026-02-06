@@ -61,13 +61,9 @@ jobs:
           prefix-key: "v1-rust"
           cache-on-failure: true
 
-      - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
+      - uses: "./.github/shared/setup-sccache"
 
       - name: Build Rust (debug)
-        env:
-          SCCACHE_GHA_ENABLED: "true"
-          RUSTC_WRAPPER: "sccache"
         run: cargo build --verbose --locked
 
       - name: Set up Python ${{ matrix.python-version }}

@@ -66,8 +66,7 @@ jobs:
         with:
           prefix-key: "v1-rust"
           cache-on-failure: true
-      - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
+      - uses: "./.github/shared/setup-sccache"
       - name: Install cargo-nextest
         uses: taiki-e/install-action@nextest
       - name: Install cargo-llvm-cov
@@ -78,16 +77,11 @@ jobs:
         with:
           python-version: "3.10"
       - name: Build
-        env:
-          SCCACHE_GHA_ENABLED: "true"
-          RUSTC_WRAPPER: "sccache"
         run: cargo build --verbose --locked --all-features
       - name: Test (nextest with coverage)
         if: runner.os == 'Linux'
         env:
           RUST_LOG: ${{ runner.debug && 'turso_core::storage=trace' || '' }}
-          SCCACHE_GHA_ENABLED: "true"
-          RUSTC_WRAPPER: "sccache"
           LOCAL_SYNC_SERVER: "../../target/debug/tursodb"
         run: |
           cargo llvm-cov nextest --workspace --all-features --locked --no-fail-fast -E 'not test(/^fuzz_tests::/)' --failure-output=final --html --output-dir coverage
@@ -99,21 +93,14 @@ jobs:
         if: runner.os != 'Linux'
         env:
           RUST_LOG: ${{ runner.debug && 'turso_core::storage=trace' || '' }}
-          SCCACHE_GHA_ENABLED: "true"
-          RUSTC_WRAPPER: "sccache"
           LOCAL_SYNC_SERVER: "../../target/debug/tursodb"
         run: cargo nextest run --workspace --all-features --locked --no-fail-fast -E 'not test(/^fuzz_tests::/)' --failure-output=final
         timeout-minutes: ${{ matrix.os == 'windows-latest' && 60 || 20 }}
       - name: Test integrity_check corruption and short reads (no checksum feature because it interferes with the test)
-        env:
-          SCCACHE_GHA_ENABLED: "true"
-          RUSTC_WRAPPER: "sccache"
         run: cargo nextest run -p core_tester --locked --no-fail-fast -E 'test(integrity_check) | test(short_read)' --failure-output=final
         timeout-minutes: 5
       - name: Test doctests
         env:
-          SCCACHE_GHA_ENABLED: "true"
-          RUSTC_WRAPPER: "sccache"
           LOCAL_SYNC_SERVER: "../../target/debug/tursodb"
         run: cargo test --workspace --all-features --doc --locked
       - name: Upload coverage report
@@ -136,14 +123,10 @@ jobs:
         with:
           prefix-key: "v1-rust-shuttle"
           cache-on-failure: true
-      - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
+      - uses: "./.github/shared/setup-sccache"
       - name: Install cargo-nextest
         uses: taiki-e/install-action@nextest
       - name: Run shuttle tests
-        env:
-          SCCACHE_GHA_ENABLED: "true"
-          RUSTC_WRAPPER: "sccache"
         run: |
           make test-shuttle
 
@@ -159,12 +142,9 @@ jobs:
         with:
           prefix-key: "v1-rust-shuttle"
           cache-on-failure: true
-      - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
+      - uses: "./.github/shared/setup-sccache"
       - name: Check for uncontrolled nondeterminism
         env:
-          SCCACHE_GHA_ENABLED: "true"
-          RUSTC_WRAPPER: "sccache"
           RUSTFLAGS: "--cfg tokio_unstable --cfg shuttle"
         run: |
           cargo run -p turso_stress -- --check-uncontrolled-nondeterminism
@@ -221,14 +201,10 @@ jobs:
         with:
           prefix-key: "v1-rust"
           cache-on-failure: true
-      - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
+      - uses: "./.github/shared/setup-sccache"
       # Run these with for loops (instead of --loop flag in sim) so that each iteration gets a separate seed -- this produces much easier-to-debug traces when there's a failure since we don't have to potentially
       # run 10 iterations of the same seed to get to the failure
       - name: Simulator ${{ matrix.profile.name }}
-        env:
-          SCCACHE_GHA_ENABLED: "true"
-          RUSTC_WRAPPER: "sccache"
         run: |
           for i in $(seq 1 ${{ matrix.profile.iterations }}); do
             ./scripts/run-sim ${{ matrix.profile.args }} || exit 1
@@ -268,8 +244,7 @@ jobs:
         with:
           prefix-key: "v1-rust"
           cache-on-failure: true
-      - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
+      - uses: "./.github/shared/setup-sccache"
 
       - name: Install uv
         uses: useblacksmith/setup-uv@v4
@@ -281,15 +256,9 @@ jobs:
 
       - uses: "./.github/shared/install_sqlite"
       - name: Test
-        env:
-          SCCACHE_GHA_ENABLED: "true"
-          RUSTC_WRAPPER: "sccache"
         run: make test
         timeout-minutes: 20
       - name: Test mvcc
-        env:
-          SCCACHE_GHA_ENABLED: "true"
-          RUSTC_WRAPPER: "sccache"
         run: make test-compat-mvcc
         timeout-minutes: 10
 
@@ -305,12 +274,8 @@ jobs:
         with:
           prefix-key: "v1-rust"
           cache-on-failure: true
-      - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
+      - uses: "./.github/shared/setup-sccache"
       - name: Run turso_whopper
-        env:
-          SCCACHE_GHA_ENABLED: "true"
-          RUSTC_WRAPPER: "sccache"
         run: |
           cargo build -p turso_whopper
           for i in $(seq 1 100); do

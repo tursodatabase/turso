@@ -44,8 +44,7 @@ jobs:
         with:
           prefix-key: "v1-rust"
 
-      - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
+      - uses: "./.github/shared/setup-sccache"
 
       - name: Setup Java
         uses: actions/setup-java@v4
@@ -68,9 +67,6 @@ jobs:
           key: elle-cli-${{ runner.os }}-${{ hashFiles('.github/workflows/elle.yml') }}
 
       - name: Build simulator
-        env:
-          SCCACHE_GHA_ENABLED: "true"
-          RUSTC_WRAPPER: "sccache"
         run: cargo build -p turso_whopper
 
       - name: Run simulation with Elle

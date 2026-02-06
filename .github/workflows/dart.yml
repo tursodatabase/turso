@@ -44,8 +44,7 @@ jobs:
         with:
           prefix-key: "v1-rust"
           cache-on-failure: true
-      - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
+      - uses: "./.github/shared/setup-sccache"
       - name: Setup Dart
         uses: dart-lang/setup-dart@v1
       - name: Install Flutter
@@ -53,9 +52,6 @@ jobs:
       - name: Get flutter deps
         run: flutter pub get
       - name: Build test binaries
-        env:
-          SCCACHE_GHA_ENABLED: "true"
-          RUSTC_WRAPPER: "sccache"
         run: cargo build --package turso_dart --target-dir=rust/test_build --locked
       - name: Run tests
         run: flutter test
