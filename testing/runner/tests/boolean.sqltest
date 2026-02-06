@@ -286,3 +286,58 @@ test boolean-and-str0_0-null {
 expect {
     0
 }
+
+# WHERE clause string literal tests (issue #5039)
+# Strings with leading numeric prefixes should be evaluated correctly
+
+test where-string-numeric-prefix-1 {
+    SELECT 1 WHERE '9S';
+}
+expect {
+    1
+}
+
+test where-string-numeric-prefix-2 {
+    SELECT 1 WHERE '1abc';
+}
+expect {
+    1
+}
+
+test where-string-numeric-prefix-3 {
+    SELECT 1 WHERE '0S';
+}
+expect {
+}
+
+test where-string-non-numeric {
+    SELECT 1 WHERE 'abc';
+}
+expect {
+}
+
+test where-string-empty {
+    SELECT 1 WHERE '';
+}
+expect {
+}
+
+test where-string-numeric {
+    SELECT 1 WHERE '9';
+}
+expect {
+    1
+}
+
+test where-string-zero {
+    SELECT 1 WHERE '0';
+}
+expect {
+}
+
+test where-string-float-prefix {
+    SELECT 1 WHERE '3.14abc';
+}
+expect {
+    1
+}
