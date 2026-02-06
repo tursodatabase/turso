@@ -684,6 +684,177 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
             _phantom: PhantomData,
         }
     }
+
+    fn check_rowid_for_conflicts(
+        &self,
+        rowid: &RowID,
+        end_ts: u64,
+        tx: &Transaction,
+        mvcc_store: &Arc<MvStore<Clock>>,
+    ) -> Result<()> {
+        let row_versions = mvcc_store.rows.get(rowid);
+        if row_versions.is_none() {
+            return Ok(());
+        }
+
+        let row_versions = row_versions.unwrap();
+        let row_versions = row_versions.value();
+        let row_versions = row_versions.read();
+
+        // Check for conflicts - iterate in reverse for faster early termination
+        for version in row_versions.iter().rev() {
+            // Skip deleted versions
+            if version.end.is_some() {
+                continue;
+            }
+
+            match version.begin {
+                Some(TxTimestampOrID::TxID(other_tx_id)) => {
+                    // Skip our own version
+                    if other_tx_id == self.tx_id {
+                        continue;
+                    }
+                    // Another transaction's uncommitted version - check their state
+                    let other_tx = mvcc_store.txs.get(&other_tx_id);
+                    if let Some(other_tx) = other_tx {
+                        let other_tx = other_tx.value();
+                        match other_tx.state.load() {
+                            // Other tx already committed = conflict
+                            TransactionState::Committed(_) => {
+                                return Err(LimboError::WriteWriteConflict);
+                            }
+                            // Both preparing - compare end_ts (lower wins)
+                            TransactionState::Preparing(other_end_ts) => {
+                                if other_end_ts < end_ts {
+                                    // Other tx has lower end_ts, they win
+                                    return Err(LimboError::WriteWriteConflict);
+                                }
+                                // We have lower end_ts, we win - they'll abort when they validate
+                            }
+                            // Other tx still active - we're already Preparing so we're ahead
+                            // They'll see us in Preparing/Committed when they try to commit
+                            TransactionState::Active => {}
+                            // Other tx aborted - no conflict
+                            TransactionState::Aborted | TransactionState::Terminated => {}
+                        }
+                    }
+                }
+                Some(TxTimestampOrID::Timestamp(begin_ts)) => {
+                    // Committed version - check if it was inserted after we started
+                    if begin_ts >= tx.begin_ts {
+                        // Duplicate! A version was committed after we started
+                        return Err(LimboError::WriteWriteConflict);
+                    }
+                    turso_assert!(
+                        false,
+                        "there is another row insterted and not updated/deleted from before"
+                    );
+                }
+                None => {
+                    // Invalid version
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn check_index_for_conflicts(
+        &self,
+        rowid: &RowID,
+        end_ts: u64,
+        tx: &Transaction,
+        mvcc_store: &Arc<MvStore<Clock>>,
+    ) -> Result<()> {
+        let RowKey::Record(record) = &rowid.row_id else {
+            panic!("invalid index row_id type, should be Record")
+        };
+        if !record.metadata.is_unique {
+            // Skip indexes which are not unique or not primary key
+            return Ok(());
+        }
+        // Remove the rowid column from the index metadata so that we only compare records without rowid
+        // this way we can check if record is unique or not. Rowid should be checked on table insert?
+        let index_info = {
+            let mut index_info = record.metadata.as_ref().clone();
+            turso_assert!(index_info.has_rowid, "not supported yet without rowid");
+            index_info.num_cols -= 1;
+            Arc::new(index_info)
+        };
+        let sortable_key_index = Arc::new(SortableIndexKey {
+            key: record.key.clone(),
+            metadata: index_info.clone(),
+        });
+        let table_id = rowid.table_id;
+        let index_rows = mvcc_store
+            .index_rows
+            .get(&table_id)
+            .expect("expected index {table_id:?}");
+        let index_rows = index_rows.value();
+        let row_versions = index_rows.get(&sortable_key_index);
+        if row_versions.is_none() {
+            return Ok(());
+        }
+
+        let row_versions = row_versions.unwrap();
+        let row_versions = row_versions.value();
+        let row_versions = row_versions.read();
+
+        // Check for conflicts - iterate in reverse for faster early termination
+        for version in row_versions.iter().rev() {
+            // Skip deleted versions
+            if version.end.is_some() {
+                continue;
+            }
+
+            match version.begin {
+                Some(TxTimestampOrID::TxID(other_tx_id)) => {
+                    // Skip our own version
+                    if other_tx_id == self.tx_id {
+                        continue;
+                    }
+                    // Another transaction's uncommitted version - check their state
+                    let other_tx = mvcc_store.txs.get(&other_tx_id);
+                    if let Some(other_tx) = other_tx {
+                        let other_tx = other_tx.value();
+                        match other_tx.state.load() {
+                            // Other tx already committed = conflict
+                            TransactionState::Committed(_) => {
+                                return Err(LimboError::WriteWriteConflict);
+                            }
+                            // Both preparing - compare end_ts (lower wins)
+                            TransactionState::Preparing(other_end_ts) => {
+                                if other_end_ts < end_ts {
+                                    // Other tx has lower end_ts, they win
+                                    return Err(LimboError::WriteWriteConflict);
+                                }
+                                // We have lower end_ts, we win - they'll abort when they validate
+                            }
+                            // Other tx still active - we're already Preparing so we're ahead
+                            // They'll see us in Preparing/Committed when they try to commit
+                            TransactionState::Active => {}
+                            // Other tx aborted - no conflict
+                            TransactionState::Aborted | TransactionState::Terminated => {}
+                        }
+                    }
+                }
+                Some(TxTimestampOrID::Timestamp(begin_ts)) => {
+                    // Committed version - check if it was inserted after we started
+                    if begin_ts >= tx.begin_ts {
+                        // Duplicate! A version was committed after we started
+                        return Err(LimboError::WriteWriteConflict);
+                    }
+                    turso_assert!(
+                        false,
+                        "there is another row insterted and not updated/deleted from before"
+                    );
+                }
+                None => {
+                    // Invalid version
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 impl WriteRowStateMachine {
@@ -845,70 +1016,10 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
 
                 for id in &self.write_set {
                     // TODO: check for conflicts with indices, check for uniqueness too.
-                    if !id.row_id.is_int_key() {
-                        continue;
-                    }
-
-                    let row_versions = mvcc_store.rows.get(id);
-                    if row_versions.is_none() {
-                        continue;
-                    }
-
-                    let row_versions = row_versions.unwrap();
-                    let row_versions = row_versions.value();
-                    let row_versions = row_versions.read();
-
-                    // Check for conflicts - iterate in reverse for faster early termination
-                    for version in row_versions.iter().rev() {
-                        // Skip deleted versions
-                        if version.end.is_some() {
-                            continue;
-                        }
-
-                        match version.begin {
-                            Some(TxTimestampOrID::TxID(other_tx_id)) => {
-                                // Skip our own version
-                                if other_tx_id == self.tx_id {
-                                    continue;
-                                }
-                                // Another transaction's uncommitted version - check their state
-                                let other_tx = mvcc_store.txs.get(&other_tx_id);
-                                if let Some(other_tx) = other_tx {
-                                    let other_tx = other_tx.value();
-                                    match other_tx.state.load() {
-                                        // Other tx already committed = conflict
-                                        TransactionState::Committed(_) => {
-                                            return Err(LimboError::WriteWriteConflict);
-                                        }
-                                        // Both preparing - compare end_ts (lower wins)
-                                        TransactionState::Preparing(other_end_ts) => {
-                                            if other_end_ts < *end_ts {
-                                                // Other tx has lower end_ts, they win
-                                                return Err(LimboError::WriteWriteConflict);
-                                            }
-                                            // We have lower end_ts, we win - they'll abort when they validate
-                                        }
-                                        // Other tx still active - we're already Preparing so we're ahead
-                                        // They'll see us in Preparing/Committed when they try to commit
-                                        TransactionState::Active => {}
-                                        // Other tx aborted - no conflict
-                                        TransactionState::Aborted
-                                        | TransactionState::Terminated => {}
-                                    }
-                                }
-                            }
-                            Some(TxTimestampOrID::Timestamp(begin_ts)) => {
-                                // Committed version - check if it was inserted after we started
-                                if begin_ts >= tx.begin_ts {
-                                    // Duplicate! A version was committed after we started
-                                    return Err(LimboError::WriteWriteConflict);
-                                }
-                                turso_assert!(false, "there is another row insterted and not updated/deleted from before");
-                            }
-                            None => {
-                                // Invalid version
-                            }
-                        }
+                    if id.row_id.is_int_key() {
+                        self.check_rowid_for_conflicts(id, *end_ts, tx, mvcc_store)?;
+                    } else {
+                        self.check_index_for_conflicts(id, *end_ts, tx, mvcc_store)?;
                     }
                 }
 
