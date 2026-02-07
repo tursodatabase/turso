@@ -857,3 +857,29 @@ expect {
     3|15|25
     4|15|50
 }
+
+# Partial index with function call using qualified column reference (issue #5037)
+test partial-index-qualified-column-in-function {
+    CREATE TABLE t0(c0 INT, c1 INT, c2 BOOLEAN, c3 BOOLEAN, PRIMARY KEY(c0, c2));
+    CREATE UNIQUE INDEX t0i0 ON t0 (c1, c2) WHERE LENGTH(t0.c0);
+    INSERT INTO t0 VALUES (123, 1, 1, 0);
+    INSERT INTO t0 VALUES (456, 2, 0, 1);
+    SELECT c0, c1, c2, c3 FROM t0 ORDER BY c0;
+}
+expect {
+    123|1|1|0
+    456|2|0|1
+}
+
+# Partial index with doubly qualified column reference in function
+test partial-index-doubly-qualified-column-in-function {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val TEXT, flag INTEGER);
+    CREATE INDEX idx_t1 ON t1(val) WHERE LENGTH(main.t1.val) > 3;
+    INSERT INTO t1 VALUES (1, 'ab', 1);
+    INSERT INTO t1 VALUES (2, 'abcdef', 1);
+    SELECT id, val FROM t1 ORDER BY id;
+}
+expect {
+    1|ab
+    2|abcdef
+}

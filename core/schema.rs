@@ -6,7 +6,6 @@ use crate::sync::RwLock;
 use crate::translate::emitter::Resolver;
 use crate::translate::expr::{bind_and_rewrite_expr, walk_expr, BindingBehavior, WalkControl};
 use crate::translate::index::{resolve_index_method_parameters, resolve_sorted_columns};
-use crate::translate::optimizer::Optimizable;
 use crate::translate::planner::ROWID_STRS;
 use crate::types::IOResult;
 use crate::util::{exprs_are_equivalent, normalize_ident};
@@ -2999,7 +2998,7 @@ impl Index {
 
     /// Walk the where_clause Expr of a partial index and validate that it doesn't reference any other
     /// tables or use any disallowed constructs.
-    pub fn validate_where_expr(&self, table: &Table, resolver: &Resolver) -> bool {
+    pub fn validate_where_expr(&self, table: &Table, _resolver: &Resolver) -> bool {
         let Some(where_clause) = &self.where_clause else {
             return true;
         };
@@ -3051,15 +3050,13 @@ impl Index {
                         ok = false;
                     } else {
                         let argc = match e {
-                            Expr::FunctionCall { args, .. } => {
-                                if !args.iter().all(|a| a.is_constant(resolver)) {
-                                    ok = false;
-                                }
-                                args.len()
-                            }
+                            Expr::FunctionCall { args, .. } => args.len(),
                             Expr::FunctionCallStar { .. } => 0,
                             _ => unreachable!(),
                         };
+                        // Reject non-deterministic functions. Function arguments can reference
+                        // columns of the indexed table (e.g., LENGTH(t0.c0)), which will be
+                        // validated by the Expr::Id and Expr::Qualified cases during the walk.
                         if !is_deterministic_fn(name.as_str(), argc) {
                             ok = false;
                         }
