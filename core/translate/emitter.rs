@@ -4389,10 +4389,10 @@ fn emit_check_constraint_bytecode(
             jump_if_null: false,
         });
 
-        let constraint_name = check_constraint
-            .name
-            .as_deref()
-            .unwrap_or(&check_constraint.sql);
+        let constraint_name = match &check_constraint.name {
+            Some(name) => name.clone(),
+            None => format!("{}", check_constraint.expr),
+        };
 
         match or_conflict {
             ResolveType::Ignore => {

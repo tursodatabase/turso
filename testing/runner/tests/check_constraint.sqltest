@@ -1422,3 +1422,20 @@ test check_constraint_drop_column_qualified_ref {
 }
 expect error {
 }
+
+# Bug fix: Error message for unnamed CHECK should not include "CHECK (...)" wrapper
+test check_constraint_error_message_unnamed {
+    CREATE TABLE t(a INTEGER CHECK(a > 0));
+    INSERT INTO t VALUES(-1);
+}
+expect error {
+    CHECK constraint failed: a > 0
+}
+
+test check_constraint_error_message_named {
+    CREATE TABLE t(a INTEGER, CONSTRAINT my_check CHECK(a > 0));
+    INSERT INTO t VALUES(-1);
+}
+expect error {
+    CHECK constraint failed: my_check
+}
