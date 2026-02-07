@@ -4568,7 +4568,7 @@ mod path_operations_tests {
         assert!(result.is_err());
 
         if let Err(e) = result {
-            let error_str = format!("{:?}", e);
+            let error_str = format!("{e:?}");
             assert!(error_str.contains("overflow") || error_str.contains("Overflow"));
         }
     }
