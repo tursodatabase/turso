@@ -2178,6 +2178,12 @@ test json_remove_root {
 expect {
 }
 
+test jsonb_remove_root {
+    SELECT jsonb_remove('{"a": 1}', '$');
+}
+expect {
+}
+
 # Complex example tests
 test json_remove_complex_1 {
     SELECT json_remove(
