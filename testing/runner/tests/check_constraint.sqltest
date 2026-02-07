@@ -1573,3 +1573,52 @@ test check_constraint_alter_add_column_default_string_satisfies_check {
 expect {
     1|active
 }
+
+# UPDATE should only evaluate CHECK constraints referencing changed columns.
+# If a row was inserted while ignore_check_constraints was ON, updating an
+# unrelated column should succeed because the CHECK on x is not re-evaluated.
+test check_constraint_update_only_checks_changed_columns {
+    CREATE TABLE t1(x INTEGER CHECK(x > 0), y INTEGER);
+    PRAGMA ignore_check_constraints = ON;
+    INSERT INTO t1 VALUES(-5, 1);
+    PRAGMA ignore_check_constraints = OFF;
+    UPDATE t1 SET y = 999;
+    SELECT * FROM t1;
+}
+expect {
+    -5|999
+}
+
+# UPDATE touching a column with a CHECK should still enforce that CHECK.
+test check_constraint_update_enforces_check_on_changed_column {
+    CREATE TABLE t1(x INTEGER CHECK(x > 0), y INTEGER);
+    INSERT INTO t1 VALUES(1, 1);
+    UPDATE t1 SET x = -1;
+}
+expect error {
+    CHECK constraint failed
+}
+
+# Table-level CHECK referencing multiple columns: only triggered when at least
+# one referenced column is in the SET clause.
+test check_constraint_update_table_level_multi_column {
+    CREATE TABLE t1(a INTEGER, b INTEGER, c INTEGER, CHECK(a + b > 0));
+    PRAGMA ignore_check_constraints = ON;
+    INSERT INTO t1 VALUES(-10, -10, 5);
+    PRAGMA ignore_check_constraints = OFF;
+    UPDATE t1 SET c = 100;
+    SELECT * FROM t1;
+}
+expect {
+    -10|-10|100
+}
+
+# Same table-level CHECK but updating a referenced column should trigger it.
+test check_constraint_update_table_level_triggers_on_referenced_col {
+    CREATE TABLE t1(a INTEGER, b INTEGER, c INTEGER, CHECK(a + b > 0));
+    INSERT INTO t1 VALUES(5, 5, 1);
+    UPDATE t1 SET a = -100;
+}
+expect error {
+    CHECK constraint failed
+}

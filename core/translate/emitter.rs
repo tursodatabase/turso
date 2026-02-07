@@ -3197,9 +3197,43 @@ fn emit_update_insns<'a>(
             });
         }
 
+        // SQLite only evaluates CHECK constraints that reference at least one
+        // column in the SET clause. Build a set of updated column names to filter.
+        let mut updated_col_names: HashSet<String> = set_clauses
+            .iter()
+            .filter_map(|(col_idx, _)| {
+                btree_table
+                    .columns
+                    .get(*col_idx)
+                    .and_then(|c| c.name.as_deref())
+                    .map(normalize_ident)
+            })
+            .collect();
+
+        // If the rowid is being updated (either directly via ROWID_SENTINEL or
+        // through a rowid alias column), also include the rowid pseudo-column
+        // names so that CHECK(rowid > 0) etc. are properly triggered.
+        let rowid_updated =
+            set_clauses.iter().any(|(idx, _)| *idx == ROWID_SENTINEL)
+                || btree_table.columns.iter().enumerate().any(|(i, c)| {
+                    c.is_rowid_alias() && set_clauses.iter().any(|(idx, _)| *idx == i)
+                });
+        if rowid_updated {
+            for name in ROWID_STRS {
+                updated_col_names.insert(name.to_string());
+            }
+        }
+
+        let relevant_checks: Vec<_> = btree_table
+            .check_constraints
+            .iter()
+            .filter(|cc| check_expr_references_columns(&cc.expr, &updated_col_names))
+            .cloned()
+            .collect();
+
         emit_check_constraints(
             program,
-            &btree_table.check_constraints,
+            &relevant_checks,
             &mut t_ctx.resolver,
             &btree_table.name,
             rowid_set_clause_reg.unwrap_or(beg),
@@ -4416,6 +4450,39 @@ fn emit_check_constraint_bytecode(
         program.preassign_label_to_next_insn(constraint_passed_label);
     }
     Ok(())
+}
+
+/// Returns true if the CHECK constraint expression references any column whose
+/// normalized name is in `column_names`. This is used during UPDATE to skip
+/// CHECK constraints that only reference columns not in the SET clause, matching
+/// SQLite's optimization behavior.
+fn check_expr_references_columns(expr: &ast::Expr, column_names: &HashSet<String>) -> bool {
+    let mut found = false;
+    let _ = walk_expr(expr, &mut |e| {
+        match e {
+            ast::Expr::Id(name) | ast::Expr::Name(name) => {
+                if column_names.contains(&normalize_ident(name.as_str())) {
+                    found = true;
+                    return Ok(WalkControl::SkipChildren);
+                }
+            }
+            ast::Expr::Qualified(_, col_name) => {
+                if column_names.contains(&normalize_ident(col_name.as_str())) {
+                    found = true;
+                    return Ok(WalkControl::SkipChildren);
+                }
+            }
+            ast::Expr::DoublyQualified(_, _, col_name) => {
+                if column_names.contains(&normalize_ident(col_name.as_str())) {
+                    found = true;
+                    return Ok(WalkControl::SkipChildren);
+                }
+            }
+            _ => {}
+        }
+        Ok(WalkControl::Continue)
+    });
+    found
 }
 
 /// Emit CHECK constraint evaluation with resolver cache setup and teardown.
