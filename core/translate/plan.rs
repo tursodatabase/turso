@@ -721,6 +721,12 @@ pub struct OuterQueryReference {
     /// i.e., if the subquery depends on tables T and U,
     /// then both T and U need to be in scope for the subquery to be evaluated.
     pub col_used_mask: ColumnUsedMask,
+    /// Original CTE SELECT AST for re-planning. When a CTE is referenced
+    /// multiple times, each reference needs a fresh plan with unique
+    /// internal_ids to avoid cursor key collisions.
+    pub cte_select: Option<ast::Select>,
+    /// Explicit column names from WITH t(a, b) AS (...) syntax.
+    pub cte_explicit_columns: Vec<String>,
 }
 
 impl OuterQueryReference {
