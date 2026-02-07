@@ -618,6 +618,8 @@ pub struct SpilledPartition {
     current_chunk_idx: usize,
     /// Approximate memory used by the resident buckets for this partition
     resident_mem: usize,
+    /// Parallel to `buckets`: tracks which entries have been matched (for FULL OUTER JOIN).
+    matched_bits: Vec<Vec<bool>>,
 }
 
 impl SpilledPartition {
@@ -632,6 +634,7 @@ impl SpilledPartition {
             buckets: Vec::new(),
             current_chunk_idx: 0,
             resident_mem: 0,
+            matched_bits: Vec::new(),
         }
     }
 
@@ -722,6 +725,8 @@ pub struct HashTableConfig {
     pub collations: Vec<CollationSeq>,
     /// Only spill to a file when != TempStore::Memory
     pub temp_store: crate::TempStore,
+    /// Whether to track which entries have been matched during probing (for FULL OUTER JOIN).
+    pub track_matched: bool,
 }
 
 impl Default for HashTableConfig {
@@ -732,6 +737,7 @@ impl Default for HashTableConfig {
             num_keys: 1,
             collations: vec![CollationSeq::Binary],
             temp_store: crate::TempStore::Default,
+            track_matched: false,
         }
     }
 }
@@ -935,6 +941,16 @@ pub struct HashTable {
     loaded_partitions_mem: usize,
     /// Temp storage mode (memory vs file) for spilled data
     temp_store: crate::TempStore,
+    /// Whether to track matched entries (for FULL OUTER JOIN).
+    track_matched: bool,
+    /// Parallel to `buckets`: one Vec<bool> per bucket tracking which entries were matched.
+    matched_bits: Vec<Vec<bool>>,
+    /// Bucket index for iterating unmatched entries.
+    unmatched_scan_bucket: usize,
+    /// Entry index within bucket for iterating unmatched entries.
+    unmatched_scan_entry: usize,
+    /// Partition index for iterating unmatched entries in spilled mode.
+    unmatched_scan_partition: usize,
 }
 
 crate::assert::assert_send!(HashTable);
@@ -958,9 +974,13 @@ enum SpillAction {
 impl HashTable {
     /// Create a new hash table.
     pub fn new(config: HashTableConfig, io: Arc<dyn IO>) -> Self {
-        let buckets = (0..config.initial_buckets)
-            .map(|_| HashBucket::new())
-            .collect();
+        let num_buckets = config.initial_buckets;
+        let buckets = (0..num_buckets).map(|_| HashBucket::new()).collect();
+        let matched_bits = if config.track_matched {
+            (0..num_buckets).map(|_| Vec::new()).collect()
+        } else {
+            Vec::new()
+        };
         Self {
             initial_buckets: config.initial_buckets,
             buckets,
@@ -981,6 +1001,11 @@ impl HashTable {
             loaded_partitions_mem: 0,
             non_empty_buckets: Vec::new(),
             temp_store: config.temp_store,
+            track_matched: config.track_matched,
+            matched_bits,
+            unmatched_scan_bucket: 0,
+            unmatched_scan_entry: 0,
+            unmatched_scan_partition: 0,
         }
     }
 
@@ -1005,8 +1030,10 @@ impl HashTable {
             self.state
         );
 
-        // Skip rows with NULL join keys - they can never match anything since NULL != NULL in SQL
-        if has_null_key(&key_values) {
+        // Skip rows with NULL join keys - they can never match anything since NULL != NULL in SQL.
+        // However, when track_matched is enabled (outer joins), we must keep NULL-key entries
+        // so they appear as unmatched in the unmatched scan.
+        if has_null_key(&key_values) && !self.track_matched {
             return Ok(IOResult::Done(()));
         }
 
@@ -1056,6 +1083,9 @@ impl HashTable {
                 self.non_empty_buckets.push(bucket_idx);
             }
             self.buckets[bucket_idx].insert(entry);
+            if self.track_matched {
+                self.matched_bits[bucket_idx].push(false);
+            }
         }
 
         self.num_entries += 1;
@@ -1226,6 +1256,8 @@ impl HashTable {
                     .insert(entry);
             }
         }
+        // Clear in-memory matched bits; spilled partitions will have their own.
+        self.matched_bits.clear();
     }
 
     /// Return the next partition which should be spilled to disk, for simplicity,
@@ -1518,9 +1550,15 @@ impl HashTable {
             buckets[bucket_idx].insert(entry);
         }
 
+        let matched_bits = if self.track_matched {
+            buckets.iter().map(|b| vec![false; b.entries.len()]).collect()
+        } else {
+            Vec::new()
+        };
         let mut partition = SpilledPartition::new(partition_idx);
         partition.state = PartitionState::InMemory;
         partition.buckets = buckets;
+        partition.matched_bits = matched_bits;
         partition.resident_mem = 0;
         spill_state.partitions.push(partition);
     }
@@ -1704,6 +1742,102 @@ impl HashTable {
                     return Some(entry);
                 }
             }
+            None
+        }
+    }
+
+    /// Mark the current matched entry as "matched" (for FULL OUTER JOIN tracking).
+    /// Should be called after a successful probe/next_match when a condition passes.
+    pub fn mark_current_matched(&mut self) {
+        if !self.track_matched {
+            return;
+        }
+        let entry_idx = self
+            .probe_entry_idx
+            .checked_sub(1)
+            .expect("mark_current_matched called without prior probe match");
+        if let Some(spill_state) = &mut self.spill_state {
+            let partition_idx = self.current_spill_partition_idx;
+            if let Some(partition) = spill_state.find_partition_mut(partition_idx) {
+                if let Some(bits) = partition.matched_bits.get_mut(self.probe_bucket_idx) {
+                    if let Some(bit) = bits.get_mut(entry_idx) {
+                        *bit = true;
+                    }
+                }
+            }
+        } else if let Some(bits) = self.matched_bits.get_mut(self.probe_bucket_idx) {
+            if let Some(bit) = bits.get_mut(entry_idx) {
+                *bit = true;
+            }
+        }
+    }
+
+    /// Reset the unmatched scan state to the beginning.
+    pub fn begin_unmatched_scan(&mut self) {
+        self.unmatched_scan_bucket = 0;
+        self.unmatched_scan_entry = 0;
+        self.unmatched_scan_partition = 0;
+    }
+
+    /// Advance to the next unmatched entry in the hash table (non-spilled case).
+    /// Returns the entry if found, None when scan is complete.
+    pub fn next_unmatched(&mut self) -> Option<&HashEntry> {
+        if self.spill_state.is_some() {
+            return self.next_unmatched_spilled();
+        }
+        while self.unmatched_scan_bucket < self.buckets.len() {
+            let bucket = &self.buckets[self.unmatched_scan_bucket];
+            let matched = &self.matched_bits[self.unmatched_scan_bucket];
+            while self.unmatched_scan_entry < bucket.entries.len() {
+                let idx = self.unmatched_scan_entry;
+                self.unmatched_scan_entry += 1;
+                if !matched[idx] {
+                    return Some(&bucket.entries[idx]);
+                }
+            }
+            self.unmatched_scan_bucket += 1;
+            self.unmatched_scan_entry = 0;
+        }
+        None
+    }
+
+    /// Advance to the next unmatched entry across spilled partitions.
+    /// The caller must ensure the partition is loaded before calling this.
+    fn next_unmatched_spilled(&mut self) -> Option<&HashEntry> {
+        let spill_state = self.spill_state.as_ref()?;
+        while self.unmatched_scan_partition < spill_state.partitions.len() {
+            let partition = &spill_state.partitions[self.unmatched_scan_partition];
+            if !partition.is_loaded() {
+                // Partition not loaded yet — caller needs to load it.
+                // Return None to signal we need I/O; caller will re-enter.
+                return None;
+            }
+            while self.unmatched_scan_bucket < partition.buckets.len() {
+                let bucket = &partition.buckets[self.unmatched_scan_bucket];
+                let matched = &partition.matched_bits[self.unmatched_scan_bucket];
+                while self.unmatched_scan_entry < bucket.entries.len() {
+                    let idx = self.unmatched_scan_entry;
+                    self.unmatched_scan_entry += 1;
+                    if !matched[idx] {
+                        return Some(&bucket.entries[idx]);
+                    }
+                }
+                self.unmatched_scan_bucket += 1;
+                self.unmatched_scan_entry = 0;
+            }
+            self.unmatched_scan_partition += 1;
+            self.unmatched_scan_bucket = 0;
+            self.unmatched_scan_entry = 0;
+        }
+        None
+    }
+
+    /// Get the current partition index for unmatched scan (for spilled partition loading).
+    pub fn unmatched_scan_current_partition(&self) -> Option<usize> {
+        let spill_state = self.spill_state.as_ref()?;
+        if self.unmatched_scan_partition < spill_state.partitions.len() {
+            Some(spill_state.partitions[self.unmatched_scan_partition].partition_idx)
+        } else {
             None
         }
     }
@@ -1916,6 +2050,13 @@ impl HashTable {
             for entry in entries {
                 let bucket_idx = (entry.hash as usize) % bucket_count;
                 partition.buckets[bucket_idx].insert(entry);
+            }
+            if self.track_matched {
+                partition.matched_bits = partition
+                    .buckets
+                    .iter()
+                    .map(|b| vec![false; b.entries.len()])
+                    .collect();
             }
             partition.state = PartitionState::Loaded;
             partition.resident_mem = Self::partition_bucket_mem(&partition.buckets);
@@ -2173,6 +2314,7 @@ mod hashtests {
             num_keys: 1,
             collations: vec![CollationSeq::Binary],
             temp_store: crate::TempStore::Default,
+            track_matched: false,
         };
         let mut ht = HashTable::new(config, io);
 
@@ -2213,6 +2355,7 @@ mod hashtests {
             num_keys: 1,
             collations: vec![CollationSeq::Binary],
             temp_store: crate::TempStore::Default,
+            track_matched: false,
         };
         let mut ht = HashTable::new(config, io);
 
@@ -2243,6 +2386,7 @@ mod hashtests {
             num_keys: 1,
             collations: vec![CollationSeq::Binary],
             temp_store: crate::TempStore::Default,
+            track_matched: false,
         };
         let mut ht = HashTable::new(config, io);
 
@@ -2534,6 +2678,7 @@ mod hashtests {
             num_keys: 1,
             collations: vec![CollationSeq::Binary],
             temp_store: crate::TempStore::Default,
+            track_matched: false,
         };
         let mut ht = HashTable::new(config, io);
 
@@ -2574,6 +2719,7 @@ mod hashtests {
             num_keys: 1,
             collations: vec![CollationSeq::Binary],
             temp_store: crate::TempStore::Default,
+            track_matched: false,
         };
         let mut ht = HashTable::new(config, io);
 
@@ -2616,6 +2762,7 @@ mod hashtests {
             num_keys: 1,
             collations: vec![CollationSeq::Binary],
             temp_store: crate::TempStore::Default,
+            track_matched: false,
         };
         let mut ht = HashTable::new(config, io);
 
@@ -2661,6 +2808,7 @@ mod hashtests {
             num_keys: 1,
             collations: vec![CollationSeq::Binary],
             temp_store: crate::TempStore::Default,
+            track_matched: false,
         };
         let mut ht = HashTable::new(config, io);
 
@@ -2713,6 +2861,7 @@ mod hashtests {
             num_keys: 1,
             collations: vec![CollationSeq::Binary],
             temp_store: crate::TempStore::Default,
+            track_matched: false,
         };
         let mut ht = HashTable::new(config, io);
 
@@ -2743,6 +2892,7 @@ mod hashtests {
             num_keys: 2,
             collations: vec![CollationSeq::Binary, CollationSeq::Binary],
             temp_store: crate::TempStore::Default,
+            track_matched: false,
         };
         let mut ht = HashTable::new(config, io);
 
@@ -2786,6 +2936,7 @@ mod hashtests {
             num_keys: 1,
             collations: vec![CollationSeq::Binary],
             temp_store: crate::TempStore::Default,
+            track_matched: false,
         };
         let mut ht = HashTable::new(config, io);
 
@@ -2814,6 +2965,7 @@ mod hashtests {
             num_keys: 1,
             collations: vec![CollationSeq::Binary],
             temp_store: crate::TempStore::Default,
+            track_matched: false,
         };
         let mut ht = HashTable::new(config, io);
 
