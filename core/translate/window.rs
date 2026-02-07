@@ -493,7 +493,9 @@ pub fn init_window<'a>(
     let src_columns = src_table.columns().to_vec();
     let src_column_count = src_columns.len();
     let window_name = window.name.clone().expect("window name is missing");
-    let partition_by_len = window.partition_by.len();
+    let partition_by_len = window
+        .deduplicated_partition_by_len
+        .unwrap_or(window.partition_by.len());
     let order_by_len = window.order_by.len();
     let window_function_count = window.functions.len();
 
@@ -715,8 +717,16 @@ fn emit_flush_buffer_if_new_partition(
             .enumerate()
             .take(partition_by_len)
         {
-            let maybe_collation =
-                get_collseq_from_expr(&window.partition_by[i], &plan.table_references)?;
+            // After rewriting, partition_by entries are Expr::Column references to the
+            // subquery. Duplicates reference the same column index, so we find the entry
+            // that references column i (the i-th unique partition column) to get the
+            // correct collation.
+            let expr = window
+                .partition_by
+                .iter()
+                .find(|e| matches!(e, Expr::Column { column, .. } if *column == i))
+                .unwrap_or(&window.partition_by[i]);
+            let maybe_collation = get_collseq_from_expr(expr, &plan.table_references)?;
             c.collation = maybe_collation.unwrap_or_default();
         }
         program.emit_insn(Insn::Compare {
