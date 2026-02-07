@@ -14,7 +14,7 @@ use super::{
     optimizer::{constraints::BinaryExprSide, Optimizable},
     order_by::{order_by_sorter_insert, sorter_insert},
     plan::{
-        Aggregate, DistinctCtx, Distinctness, EvalAt, HashJoinOp, IterationDirection,
+        Aggregate, DistinctCtx, Distinctness, EvalAt, HashJoinOp, HashJoinType, IterationDirection,
         JoinOrderMember, JoinedTable, MultiIndexScanOp, NonFromClauseSubquery, Operation,
         QueryDestination, Scan, Search, SeekDef, SeekKey, SeekKeyComponent, SelectPlan,
         SetOperation, TableReferences, WhereTerm,
@@ -806,6 +806,10 @@ fn emit_hash_build_phase(
             collations,
             payload_start_reg,
             num_payload,
+            track_matched: matches!(
+                hash_join_op.join_type,
+                HashJoinType::LeftOuter | HashJoinType::FullOuter
+            ),
         }),
     });
     if use_bloom_filter {
@@ -1417,7 +1421,10 @@ pub fn open_loop(
                 }
             }
             Operation::HashJoin(hash_join_op) => {
-                // Get build table info for cursor resolution and hash table reference
+                // Get build table info for cursor resolution and hash table reference.
+                // The optimizer convention: build=LHS, probe=RHS (the current table).
+                // For outer joins, the hash table still contains the LHS rows.
+                // After the probe scan, unmatched LHS entries are emitted with NULLs.
                 let build_table = &table_references.joined_tables()[hash_join_op.build_table_idx];
                 let (build_cursor_id, _) = build_table.resolve_cursors(program, mode.clone())?;
                 let build_cursor_id = if let Some(cursor_id) = build_cursor_id {
@@ -1510,6 +1517,29 @@ pub fn open_loop(
                     None
                 };
 
+                // For FULL OUTER: initialize match flag per probe row.
+                // When a probe row has no build match, we emit probe + NULLs for build.
+                // For LEFT OUTER: not needed (unmatched probe rows are just skipped).
+                if matches!(hash_join_op.join_type, HashJoinType::FullOuter) {
+                    let probe_table_idx = hash_join_op.probe_table_idx;
+                    if let Some(lj_meta) = t_ctx.meta_left_joins[probe_table_idx].as_ref() {
+                        program.emit_insn(Insn::Integer {
+                            value: 0,
+                            dest: lj_meta.reg_match_flag,
+                        });
+                    }
+                }
+
+                // For FULL OUTER, probe miss → check_outer (emit probe + NULLs for build).
+                // For LEFT OUTER, probe miss → next (skip, unmatched probe rows don't appear).
+                // For inner, probe miss -> next.
+                let hash_probe_miss_label = if hash_join_op.join_type == HashJoinType::FullOuter {
+                    // This label will be resolved in close_loop via hash_ctx
+                    program.allocate_label()
+                } else {
+                    next
+                };
+
                 // Probe hash table with keys, store matched rowid and payload in registers
                 let match_reg = program.alloc_register();
                 program.emit_insn(Insn::HashProbe {
@@ -1517,7 +1547,7 @@ pub fn open_loop(
                     key_start_reg: to_u16(probe_key_start_reg),
                     num_keys: to_u16(num_keys),
                     dest_reg: to_u16(match_reg),
-                    target_pc: next,
+                    target_pc: hash_probe_miss_label,
                     payload_dest_reg: payload_dest_reg.map(to_u16),
                     num_payload: to_u16(num_payload),
                 });
@@ -1538,6 +1568,13 @@ pub fn open_loop(
                         hash_next_label,
                         payload_start_reg: payload_dest_reg,
                         payload_columns: payload_info.payload_columns,
+                        check_outer_label: if hash_join_op.join_type == HashJoinType::FullOuter {
+                            Some(hash_probe_miss_label)
+                        } else {
+                            None
+                        },
+                        build_cursor_id: Some(build_cursor_id),
+                        join_type: hash_join_op.join_type,
                     },
                 );
 
@@ -1644,14 +1681,46 @@ pub fn open_loop(
         // At this point of execution we are going to emit columns for the left table,
         // and either emit columns or NULLs for the right table, depending on whether the null_flag is set
         // for the right table's cursor.
+        // Skip for tables that are the probe side of an outer hash join — their outer
+        // semantics are handled by the hash join's unmatched build scan instead.
+        let is_outer_hj_probe = matches!(table.op, Operation::HashJoin(ref hj) if matches!(
+            hj.join_type,
+            HashJoinType::LeftOuter | HashJoinType::FullOuter
+        ));
         if let Some(join_info) = table.join_info.as_ref() {
-            if join_info.outer {
+            if join_info.outer && !is_outer_hj_probe {
                 let lj_meta = t_ctx.meta_left_joins[joined_table_index].as_ref().unwrap();
                 program.resolve_label(lj_meta.label_match_flag_set_true, program.offset());
                 program.emit_insn(Insn::Integer {
                     value: 1,
                     dest: lj_meta.reg_match_flag,
                 });
+            }
+        }
+
+        // For outer hash join probes: on match, mark the hash table entry as matched
+        // and set the match flag for FULL OUTER per-probe-row tracking.
+        if let Operation::HashJoin(ref hj) = table.op {
+            if matches!(
+                hj.join_type,
+                HashJoinType::LeftOuter | HashJoinType::FullOuter
+            ) {
+                let build_table = &table_references.joined_tables()[hj.build_table_idx];
+                let hash_table_id: usize = build_table.internal_id.into();
+                // Mark this hash table entry as matched (for unmatched build scan later)
+                program.emit_insn(Insn::HashMarkMatched { hash_table_id });
+
+                // For FULL OUTER: also set match flag to 1 (this probe row found a match)
+                if matches!(hj.join_type, HashJoinType::FullOuter) {
+                    let probe_idx = hj.probe_table_idx;
+                    if let Some(lj_meta) = t_ctx.meta_left_joins[probe_idx].as_ref() {
+                        program.resolve_label(lj_meta.label_match_flag_set_true, program.offset());
+                        program.emit_insn(Insn::Integer {
+                            value: 1,
+                            dest: lj_meta.reg_match_flag,
+                        });
+                    }
+                }
             }
         }
 
@@ -2094,6 +2163,7 @@ pub fn close_loop(
     tables: &TableReferences,
     join_order: &[JoinOrderMember],
     mode: OperationMode,
+    select_plan: Option<&SelectPlan>,
 ) -> Result<()> {
     // We close the loops for all tables in reverse order, i.e. innermost first.
     // OPEN t1
@@ -2247,8 +2317,18 @@ pub fn close_loop(
                     let hash_next_label = hash_ctx.hash_next_label;
                     let payload_dest_reg = hash_ctx.payload_start_reg;
                     let num_payload = hash_ctx.payload_columns.len();
-
+                    let check_outer_label = hash_ctx.check_outer_label;
+                    let build_cursor_id = hash_ctx.build_cursor_id;
+                    let join_type = hash_ctx.join_type;
                     let label_next_probe_row = program.allocate_label();
+
+                    // For FULL OUTER, HashNext exhaustion goes to check_outer.
+                    // For LEFT OUTER and inner, it goes to next_probe_row.
+                    let hash_next_target = if join_type == HashJoinType::FullOuter {
+                        check_outer_label.unwrap_or(label_next_probe_row)
+                    } else {
+                        label_next_probe_row
+                    };
 
                     // Resolve hash_next_label here, this is where conditions jump when they fail
                     // to try the next hash match before moving to the next probe row.
@@ -2256,11 +2336,11 @@ pub fn close_loop(
 
                     // Check for additional matches with same probe keys
                     // If found: store in match_reg (and payload if available) and continue
-                    // If not found: jump to next probe row
+                    // If not found: jump to check_outer (outer) or next_probe_row (inner)
                     program.emit_insn(Insn::HashNext {
                         hash_table_id: hash_table_reg,
                         dest_reg: match_reg,
-                        target_pc: label_next_probe_row,
+                        target_pc: hash_next_target,
                         payload_dest_reg,
                         num_payload,
                     });
@@ -2270,10 +2350,88 @@ pub fn close_loop(
                         target_pc: match_found_label,
                     });
 
+                    // For FULL OUTER, emit the check_outer block.
+                    // HashProbe miss and HashNext exhaustion both jump here.
+                    // For unmatched probe rows: emit probe + NULLs for build.
+                    if matches!(join_type, HashJoinType::FullOuter) {
+                        // The probe table (RHS) has join_info.outer and LeftJoinMetadata
+                        let probe_table_idx = hash_join_op.probe_table_idx;
+                        let lj_meta = t_ctx.meta_left_joins[probe_table_idx]
+                            .as_ref()
+                            .expect("FULL OUTER probe table must have left join metadata");
+                        let reg_match_flag = lj_meta.reg_match_flag;
+
+                        // Resolve check_outer_label here — both HashProbe miss and
+                        // HashNext exhaustion jump to this point.
+                        if let Some(col) = check_outer_label {
+                            program.resolve_label(col, program.offset());
+                        }
+                        // Also resolve the build table's label_match_flag_check_value here,
+                        // since we're handling the outer join check inline instead of in the
+                        // generic outer join block.
+                        program
+                            .resolve_label(lj_meta.label_match_flag_check_value, program.offset());
+
+                        // If match_flag is already set (a previous hash match passed conditions),
+                        // skip the NullRow emission.
+                        program.emit_insn(Insn::IfPos {
+                            reg: reg_match_flag,
+                            target_pc: label_next_probe_row,
+                            decrement_by: 0,
+                        });
+
+                        // No match — set NullRow on build cursor so Column returns NULL.
+                        if let Some(cursor_id) = build_cursor_id {
+                            program.emit_insn(Insn::NullRow { cursor_id });
+                        }
+
+                        // Null out payload registers if present
+                        if let Some(payload_reg) = payload_dest_reg {
+                            if num_payload > 0 {
+                                program.emit_insn(Insn::Null {
+                                    dest: payload_reg,
+                                    dest_end: Some(payload_reg + num_payload - 1),
+                                });
+                            }
+                        }
+
+                        // Evaluate WHERE conditions (not ON conditions) on the
+                        // unmatched probe row. Build columns are NULL (NullRow set).
+                        // If a condition fails, skip to next probe row.
+                        if let Some(plan) = select_plan {
+                            for cond in plan
+                                .where_clause
+                                .iter()
+                                .filter(|c| !c.consumed && c.from_outer_join.is_none())
+                            {
+                                let jump_target_when_true = program.allocate_label();
+                                let condition_metadata = ConditionMetadata {
+                                    jump_if_condition_is_true: false,
+                                    jump_target_when_true,
+                                    jump_target_when_false: label_next_probe_row,
+                                    jump_target_when_null: label_next_probe_row,
+                                };
+                                translate_condition_expr(
+                                    program,
+                                    &plan.table_references,
+                                    &cond.expr,
+                                    condition_metadata,
+                                    &t_ctx.resolver,
+                                )?;
+                                program.preassign_label_to_next_insn(jump_target_when_true);
+                            }
+
+                            // Emit result columns. Build cursor has NullRow set,
+                            // so build columns return NULL. Use emit_loop to route
+                            // through ORDER BY sorter when needed.
+                            emit_loop(program, t_ctx, plan)?;
+                        }
+                    }
+
                     program.preassign_label_to_next_insn(label_next_probe_row);
                 }
 
-                // Advance to next probe row (HashProbe jumps here if no match found)
+                // Advance to next probe row (HashProbe jumps here for inner, or after outer check)
                 program.resolve_label(loop_labels.next, program.offset());
                 let probe_cursor_id = table_cursor_id.expect("Probe table must have a cursor");
                 program.emit_insn(Insn::Next {
@@ -2281,6 +2439,98 @@ pub fn close_loop(
                     pc_if_next: loop_labels.loop_start,
                 });
                 program.preassign_label_to_next_insn(loop_labels.loop_end);
+
+                // For LEFT OUTER and FULL OUTER: after probe loop completes,
+                // scan unmatched build entries and emit them with NULLs for the probe side.
+                if matches!(
+                    hash_join_op.join_type,
+                    HashJoinType::LeftOuter | HashJoinType::FullOuter
+                ) {
+                    if let (Some(hash_ctx), Some(plan)) = (
+                        t_ctx.hash_table_contexts.get(&hash_join_op.build_table_idx),
+                        select_plan,
+                    ) {
+                        let hash_table_reg = hash_ctx.hash_table_reg;
+                        let match_reg = hash_ctx.match_reg;
+                        let payload_dest_reg = hash_ctx.payload_start_reg;
+                        let num_payload = hash_ctx.payload_columns.len();
+                        let build_cursor_id_fo = hash_ctx.build_cursor_id;
+
+                        let done_unmatched = program.allocate_label();
+
+                        // Set probe cursor to null mode — all probe columns return NULL
+                        program.emit_insn(Insn::NullRow {
+                            cursor_id: probe_cursor_id,
+                        });
+
+                        // Begin scanning unmatched build entries
+                        program.emit_insn(Insn::HashScanUnmatched {
+                            hash_table_id: hash_table_reg,
+                            dest_reg: match_reg,
+                            target_pc: done_unmatched,
+                            payload_dest_reg,
+                            num_payload,
+                        });
+
+                        let unmatched_loop = program.allocate_label();
+                        let label_next_unmatched = program.allocate_label();
+                        program.preassign_label_to_next_insn(unmatched_loop);
+
+                        // Position build cursor to the unmatched entry's rowid
+                        if let Some(cursor_id) = build_cursor_id_fo {
+                            program.emit_insn(Insn::SeekRowid {
+                                cursor_id,
+                                src_reg: match_reg,
+                                target_pc: done_unmatched,
+                            });
+                        }
+
+                        // Evaluate WHERE conditions (not ON conditions) on
+                        // the unmatched build row. Probe columns are NULL
+                        // (NullRow set). If a condition fails, skip this row.
+                        for cond in plan
+                            .where_clause
+                            .iter()
+                            .filter(|c| !c.consumed && c.from_outer_join.is_none())
+                        {
+                            let jump_target_when_true = program.allocate_label();
+                            let condition_metadata = ConditionMetadata {
+                                jump_if_condition_is_true: false,
+                                jump_target_when_true,
+                                jump_target_when_false: label_next_unmatched,
+                                jump_target_when_null: label_next_unmatched,
+                            };
+                            translate_condition_expr(
+                                program,
+                                &plan.table_references,
+                                &cond.expr,
+                                condition_metadata,
+                                &t_ctx.resolver,
+                            )?;
+                            program.preassign_label_to_next_insn(jump_target_when_true);
+                        }
+
+                        // Emit result columns independently — probe columns return NULL
+                        // (NullRow set), build columns come from the positioned build cursor.
+                        // Use emit_loop to route through ORDER BY sorter when needed.
+                        emit_loop(program, t_ctx, plan)?;
+
+                        // Try the next unmatched entry
+                        program.resolve_label(label_next_unmatched, program.offset());
+                        program.emit_insn(Insn::HashNextUnmatched {
+                            hash_table_id: hash_table_reg,
+                            dest_reg: match_reg,
+                            target_pc: done_unmatched,
+                            payload_dest_reg,
+                            num_payload,
+                        });
+                        program.emit_insn(Insn::Goto {
+                            target_pc: unmatched_loop,
+                        });
+
+                        program.preassign_label_to_next_insn(done_unmatched);
+                    }
+                }
             }
             Operation::MultiIndexScan(_) => {
                 // MultiIndexScan uses RowSetRead for iteration - the next is handled
@@ -2295,8 +2545,17 @@ pub fn close_loop(
 
         // Handle OUTER JOIN logic. The reason this comes after the "loop end" mark is that we may need to still jump back
         // and emit a row with NULLs for the right table, and then jump back to the next row of the left table.
+        // Skip this for tables that are the probe side of an outer hash join — their outer
+        // semantics are handled by the hash join's unmatched build scan.
+        let is_outer_hash_join_probe = matches!(
+            table.op,
+            Operation::HashJoin(ref hj) if matches!(
+                hj.join_type,
+                HashJoinType::LeftOuter | HashJoinType::FullOuter
+            )
+        );
         if let Some(join_info) = table.join_info.as_ref() {
-            if join_info.outer {
+            if join_info.outer && !is_outer_hash_join_probe {
                 let lj_meta = t_ctx.meta_left_joins[table_index].as_ref().unwrap();
                 // The left join match flag is set to 1 when there is any match on the right table
                 // (e.g. SELECT * FROM t1 LEFT JOIN t2 ON t1.a = t2.a).
