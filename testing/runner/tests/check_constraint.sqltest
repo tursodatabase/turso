@@ -1377,3 +1377,40 @@ test check_constraint_valid_function {
 expect {
     hello
 }
+
+# Bug fix: CHECK on INTEGER PRIMARY KEY enforced during UPDATE
+test check_constraint_ipk_update_violation {
+    CREATE TABLE t(id INTEGER PRIMARY KEY CHECK(id > 0));
+    INSERT INTO t VALUES(1);
+    UPDATE t SET id = -1;
+}
+expect error {
+}
+
+test check_constraint_ipk_update_valid {
+    CREATE TABLE t(id INTEGER PRIMARY KEY CHECK(id > 0));
+    INSERT INTO t VALUES(1);
+    UPDATE t SET id = 5;
+    SELECT * FROM t;
+}
+expect {
+    5
+}
+
+test check_constraint_ipk_referenced_in_table_check {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, val INTEGER, CHECK(id + val > 0));
+    INSERT INTO t VALUES(10, 5);
+    UPDATE t SET val = -20;
+}
+expect error {
+}
+
+test check_constraint_ipk_not_updated_but_referenced {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT, CHECK(id > 0));
+    INSERT INTO t VALUES(1, 'hello');
+    UPDATE t SET name = 'world';
+    SELECT * FROM t;
+}
+expect {
+    1|world
+}

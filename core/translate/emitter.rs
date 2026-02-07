@@ -3207,7 +3207,15 @@ fn emit_update_insns<'a>(
                 .columns
                 .iter()
                 .enumerate()
-                .filter_map(|(idx, col)| col.name.as_deref().map(|n| (n, start + idx))),
+                .filter_map(|(idx, col)| {
+                    col.name.as_deref().map(|n| {
+                        if col.is_rowid_alias() {
+                            (n, rowid_set_clause_reg.unwrap_or(beg))
+                        } else {
+                            (n, start + idx)
+                        }
+                    })
+                }),
             connection,
             or_conflict,
             skip_row_label,
