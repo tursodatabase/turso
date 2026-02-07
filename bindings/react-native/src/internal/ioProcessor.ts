@@ -120,18 +120,34 @@ function normalizeUrl(url: string): string {
 }
 
 /**
- * Get auth token from context (handles both string and function)
+ * Get auth token from context (handles both string and async function)
  */
-function getAuthToken(context: IoContext): string | null {
+async function getAuthToken(context: IoContext): Promise<string | null> {
   if (!context.authToken) {
     return null;
   }
 
   if (typeof context.authToken === 'function') {
-    return context.authToken() as unknown as string | null;
+    const result = await context.authToken();
+    return result ?? null;
   }
 
   return context.authToken;
+}
+
+/**
+ * Get base URL from context (handles both string and function)
+ */
+function getBaseUrl(context: IoContext): string | null {
+  if (!context.baseUrl) {
+    return null;
+  }
+
+  if (typeof context.baseUrl === 'function') {
+    return context.baseUrl() ?? null;
+  }
+
+  return context.baseUrl;
 }
 
 /**
@@ -143,31 +159,26 @@ function getAuthToken(context: IoContext): string | null {
 async function processHttpRequest(item: NativeSyncIoItem, context: IoContext): Promise<void> {
   const request = item.getHttpRequest();
 
-  // Build full URL
-  let fullUrl = '';
+  // Resolve base URL: prefer context.baseUrl (from opts), fall back to request.url
+  const rawBaseUrl = getBaseUrl(context) ?? request.url;
+  if (!rawBaseUrl) {
+    throw new Error('HTTP request missing URL: no URL in request and no baseUrl in context');
+  }
 
-  if (request.url) {
-    // Normalize URL (libsql:// -> https://)
-    let baseUrl = normalizeUrl(request.url);
+  // Normalize URL (libsql:// -> https://)
+  const baseUrl = normalizeUrl(rawBaseUrl);
 
-    // Combine base URL with path if path is provided
-    if (request.path) {
-      // Ensure proper URL formatting (avoid double slashes, ensure single slash)
-      if (baseUrl.endsWith('/') && request.path.startsWith('/')) {
-        fullUrl = baseUrl + request.path.substring(1);
-      } else if (!baseUrl.endsWith('/') && !request.path.startsWith('/')) {
-        fullUrl = baseUrl + '/' + request.path;
-      } else {
-        fullUrl = baseUrl + request.path;
-      }
+  // Build full URL by combining base URL with path
+  let fullUrl = baseUrl;
+  if (request.path) {
+    // Ensure proper URL formatting (avoid double slashes, ensure single slash)
+    if (baseUrl.endsWith('/') && request.path.startsWith('/')) {
+      fullUrl = baseUrl + request.path.substring(1);
+    } else if (!baseUrl.endsWith('/') && !request.path.startsWith('/')) {
+      fullUrl = baseUrl + '/' + request.path;
     } else {
-      fullUrl = baseUrl;
+      fullUrl = baseUrl + request.path;
     }
-  } else if (request.path) {
-    // Path without base URL - shouldn't happen
-    throw new Error('HTTP request missing base URL');
-  } else {
-    throw new Error('HTTP request missing URL and path');
   }
 
   // Build fetch options
@@ -177,7 +188,7 @@ async function processHttpRequest(item: NativeSyncIoItem, context: IoContext): P
   };
 
   // Inject Authorization header if auth token is available
-  const authToken = getAuthToken(context);
+  const authToken = await getAuthToken(context);
   if (authToken) {
     (options.headers as Record<string, string>)['Authorization'] = `Bearer ${authToken}`;
   }
