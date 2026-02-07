@@ -660,6 +660,8 @@ pub fn select_star(tables: &[JoinedTable], out_columns: &mut Vec<ResultSetColumn
 pub struct JoinInfo {
     /// Whether this is an OUTER JOIN.
     pub outer: bool,
+    /// Whether this is a FULL OUTER JOIN (implies outer = true).
+    pub full_outer: bool,
     /// The USING clause for the join, if any. NATURAL JOIN is transformed into USING (col1, col2, ...).
     pub using: Vec<ast::Name>,
 }
@@ -1183,6 +1185,17 @@ impl HashJoinKey {
     }
 }
 
+/// The type of hash join to perform.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HashJoinType {
+    /// Standard inner join — only matching rows emitted.
+    Inner,
+    /// Left outer join — probe rows always appear; unmatched probe → NULLs for build side.
+    LeftOuter,
+    /// Full outer join — LeftOuter + unmatched build rows emitted with NULLs for probe side.
+    FullOuter,
+}
+
 /// Hash join operation metadata
 #[derive(Debug, Clone)]
 pub struct HashJoinOp {
@@ -1199,6 +1212,8 @@ pub struct HashJoinOp {
     pub materialize_build_input: bool,
     /// Whether to use a bloom filter on the probe side.
     pub use_bloom_filter: bool,
+    /// The type of join semantics for this hash join.
+    pub join_type: HashJoinType,
 }
 
 /// Distinguishes union (OR) from intersection (AND) operations for multi-index scans.
