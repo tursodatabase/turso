@@ -913,6 +913,12 @@ pub struct SelectConfig {
 
     /// Probability of adding DISTINCT in scalar subqueries (non-grouped only).
     pub subquery_distinct_probability: f64,
+
+    /// When true, non-grouped SELECT result columns will not mix aggregate
+    /// functions with bare column references.  For example, this prevents
+    /// generating `SELECT COUNT(a) + b FROM t` which requires `b` to appear
+    /// in a GROUP BY clause.  Default: `true`.
+    pub restrict_mixed_aggregates: bool,
 }
 
 impl Default for SelectConfig {
@@ -942,6 +948,7 @@ impl Default for SelectConfig {
             subquery_order_by_probability: 0.3,
             subquery_group_by_probability: 0.2,
             subquery_distinct_probability: 0.15,
+            restrict_mixed_aggregates: true,
         }
     }
 }

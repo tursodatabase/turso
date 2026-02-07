@@ -143,7 +143,7 @@ fn generate_select_impl<C: Capabilities>(
     };
 
     // --- Columns ---
-    let columns = match mode {
+    let mut columns = match mode {
         SelectMode::Full => {
             if let Some(gb) = &group_by {
                 generate_grouped_select_columns(generator, ctx, table, &gb.exprs)?
@@ -169,6 +169,28 @@ fn generate_select_impl<C: Capabilities>(
             }
         }
     };
+
+    // When there is no GROUP BY and `restrict_mixed_aggregates` is enabled,
+    // the result column list must not mix aggregate and non-aggregate
+    // expressions (e.g. `SELECT COUNT(a), b FROM t` is invalid).
+    // If a mix is detected, replace all aggregate columns with column refs.
+    if group_by.is_none()
+        && select_config.restrict_mixed_aggregates
+        && !columns.is_empty()
+    {
+        let has_agg = columns.iter().any(|c| c.expr.contains_aggregate());
+        let has_non_agg = columns
+            .iter()
+            .any(|c| !c.expr.contains_aggregate());
+        if has_agg && has_non_agg {
+            for col in &mut columns {
+                if col.expr.contains_aggregate() {
+                    let replacement = ctx.choose(&table.columns).unwrap();
+                    col.expr = Expr::column_ref(ctx, None, replacement.name.clone());
+                }
+            }
+        }
+    }
 
     // --- WHERE ---
     let where_clause = if ctx.gen_bool_with_prob(where_prob) {
@@ -430,9 +452,23 @@ fn generate_select_columns<C: Capabilities>(
             let range = &select_config.expression_count_range;
             let num_cols = ctx.gen_range_inclusive((*range.start()).max(1), *range.end());
             let mut columns = Vec::with_capacity(num_cols);
+            let restrict = select_config.restrict_mixed_aggregates;
 
             for i in 0..num_cols {
                 let expr = generate_expr(generator, ctx, table, 0)?;
+                // When restricting mixed aggregates and there is no GROUP BY,
+                // an expression that mixes aggregate calls with bare column
+                // refs (e.g. `COUNT(a) + b`) is invalid SQL.  Replace it with
+                // a plain column reference.
+                let expr = if restrict
+                    && expr.contains_aggregate()
+                    && expr.contains_column_ref()
+                {
+                    let col = ctx.choose(&table.columns).unwrap();
+                    Expr::column_ref(ctx, None, col.name.clone())
+                } else {
+                    expr
+                };
                 columns.push(SelectColumn {
                     expr,
                     alias: if ident_config.generate_column_aliases {
@@ -807,5 +843,57 @@ mod tests {
             !sql.contains("HAVING"),
             "SQL should not contain HAVING without GROUP BY: {sql}"
         );
+    }
+
+    #[test]
+    fn test_restrict_mixed_aggregates_default_on() {
+        let config = crate::policy::SelectConfig::default();
+        assert!(
+            config.restrict_mixed_aggregates,
+            "restrict_mixed_aggregates should be true by default"
+        );
+    }
+
+    #[test]
+    fn test_no_mixed_aggregates_in_non_grouped_select() {
+        // Force expression-list strategy, disable GROUP BY
+        let policy = Policy::default().with_select_config(crate::policy::SelectConfig {
+            select_star_weight: 0,
+            column_list_weight: 0,
+            expression_list_weight: 100,
+            group_by_probability: 0.0,
+            restrict_mixed_aggregates: true,
+            ..Default::default()
+        });
+        let schema = SchemaBuilder::new()
+            .table(Table::new(
+                "t",
+                vec![
+                    ColumnDef::new("a", DataType::Integer).primary_key(),
+                    ColumnDef::new("b", DataType::Text),
+                    ColumnDef::new("c", DataType::Integer),
+                ],
+            ))
+            .build();
+        let generator: SqlGen<Full> = SqlGen::new(schema, policy);
+        let table = &generator.schema().tables[0];
+
+        for seed in 0..200 {
+            let mut ctx = Context::new_with_seed(seed);
+            if let Ok(select) = generate_select_for_table(&generator, &mut ctx, table) {
+                if select.group_by.is_some() {
+                    continue; // skip grouped (shouldn't happen with prob 0.0)
+                }
+                let has_agg = select.columns.iter().any(|c| c.expr.contains_aggregate());
+                let has_non_agg = select
+                    .columns
+                    .iter()
+                    .any(|c| !c.expr.contains_aggregate());
+                assert!(
+                    !(has_agg && has_non_agg),
+                    "seed {seed}: non-grouped SELECT mixes aggregates and non-aggregates: {select}"
+                );
+            }
+        }
     }
 }
