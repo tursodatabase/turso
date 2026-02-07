@@ -1748,11 +1748,7 @@ mod tests {
     fn test_compute_best_join_order_single_table_no_indexes() {
         let t1 = _create_btree_table("test_table", _create_column_list(&["id"], Type::Integer));
         let mut table_id_counter = TableRefIdCounter::new();
-        let joined_tables = vec![_create_table_reference(
-            t1.clone(),
-            None,
-            table_id_counter.next(),
-        )];
+        let joined_tables = vec![_create_table_reference(t1, None, table_id_counter.next())];
         let table_references = TableReferences::new(joined_tables, vec![]);
         let available_indexes = HashMap::default();
         let mut where_clause = vec![];
@@ -1797,11 +1793,7 @@ mod tests {
     fn test_compute_best_join_order_single_table_rowid_eq() {
         let t1 = _create_btree_table("test_table", vec![_create_column_rowid_alias("id")]);
         let mut table_id_counter = TableRefIdCounter::new();
-        let joined_tables = vec![_create_table_reference(
-            t1.clone(),
-            None,
-            table_id_counter.next(),
-        )];
+        let joined_tables = vec![_create_table_reference(t1, None, table_id_counter.next())];
 
         let mut where_clause = vec![_create_binary_expr(
             _create_column_expr(joined_tables[0].internal_id, 0, true), // table 0, column 0 (rowid)
@@ -1860,11 +1852,7 @@ mod tests {
             vec![_create_column_of_type("id", Type::Integer)],
         );
         let mut table_id_counter = TableRefIdCounter::new();
-        let joined_tables = vec![_create_table_reference(
-            t1.clone(),
-            None,
-            table_id_counter.next(),
-        )];
+        let joined_tables = vec![_create_table_reference(t1, None, table_id_counter.next())];
 
         let mut where_clause = vec![_create_binary_expr(
             _create_column_expr(joined_tables[0].internal_id, 0, false), // table 0, column 0 (id)
@@ -1943,9 +1931,9 @@ mod tests {
 
         let mut table_id_counter = TableRefIdCounter::new();
         let joined_tables = vec![
-            _create_table_reference(t1.clone(), None, table_id_counter.next()),
+            _create_table_reference(t1, None, table_id_counter.next()),
             _create_table_reference(
-                t2.clone(),
+                t2,
                 Some(JoinInfo {
                     outer: false,
                     using: vec![],
@@ -2062,9 +2050,9 @@ mod tests {
 
         let mut table_id_counter = TableRefIdCounter::new();
         let joined_tables = vec![
-            _create_table_reference(table_orders.clone(), None, table_id_counter.next()),
+            _create_table_reference(table_orders, None, table_id_counter.next()),
             _create_table_reference(
-                table_customers.clone(),
+                table_customers,
                 Some(JoinInfo {
                     outer: false,
                     using: vec![],
@@ -2072,7 +2060,7 @@ mod tests {
                 table_id_counter.next(),
             ),
             _create_table_reference(
-                table_order_items.clone(),
+                table_order_items,
                 Some(JoinInfo {
                     outer: false,
                     using: vec![],
@@ -2268,9 +2256,9 @@ mod tests {
 
         let mut table_id_counter = TableRefIdCounter::new();
         let joined_tables = vec![
-            _create_table_reference(t1.clone(), None, table_id_counter.next()),
+            _create_table_reference(t1, None, table_id_counter.next()),
             _create_table_reference(
-                t2.clone(),
+                t2,
                 Some(JoinInfo {
                     outer: false,
                     using: vec![],
@@ -2278,7 +2266,7 @@ mod tests {
                 table_id_counter.next(),
             ),
             _create_table_reference(
-                t3.clone(),
+                t3,
                 Some(JoinInfo {
                     outer: false,
                     using: vec![],
@@ -2398,7 +2386,7 @@ mod tests {
                 )
             }));
             refs.push(_create_table_reference(
-                fact_table.clone(),
+                fact_table,
                 Some(JoinInfo {
                     outer: false,
                     using: vec![],
@@ -3103,9 +3091,9 @@ mod tests {
 
         let mut table_id_counter = TableRefIdCounter::new();
         let joined_tables = vec![
-            _create_table_reference(t1.clone(), None, table_id_counter.next()),
+            _create_table_reference(t1, None, table_id_counter.next()),
             _create_table_reference(
-                t2.clone(),
+                t2,
                 Some(JoinInfo {
                     outer: false,
                     using: vec![],

@@ -120,7 +120,7 @@ impl<'a> Resolver<'a> {
             None => self
                 .symbol_table
                 .resolve_function(func_name, arg_count)
-                .map(|arg| Func::External(arg.clone())),
+                .map(|arg| Func::External(arg)),
         }
     }
 
@@ -2385,7 +2385,7 @@ fn emit_program_for_update(
         &mut t_ctx,
         &plan.table_references,
         &join_order,
-        mode.clone(),
+        mode,
     )?;
 
     program.preassign_label_to_next_insn(after_main_loop_label);
@@ -3890,7 +3890,7 @@ pub fn prepare_cdc_if_necessary(
     let Some(turso_cdc_table) = schema.get_table(cdc_table) else {
         crate::bail_parse_error!("no such table: {}", cdc_table);
     };
-    let Some(cdc_btree) = turso_cdc_table.btree().clone() else {
+    let Some(cdc_btree) = turso_cdc_table.btree() else {
         crate::bail_parse_error!("no such table: {}", cdc_table);
     };
     let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(cdc_btree.clone()));

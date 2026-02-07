@@ -131,9 +131,7 @@ pub fn emit_program_for_compound_select(
             .table_references
             .extend(plan.table_references.clone());
     }
-    program
-        .table_references
-        .extend(right_plan.table_references.clone());
+    program.table_references.extend(right_plan.table_references);
 
     emit_compound_select(
         program,
@@ -242,7 +240,7 @@ fn emit_compound_select(
                 let dedupe_index = match right_most.query_destination {
                     QueryDestination::EphemeralIndex {
                         cursor_id, index, ..
-                    } => (cursor_id, index.clone()),
+                    } => (cursor_id, index),
                     _ => {
                         new_dedupe_index = true;
                         create_dedupe_index(program, &plan, &right_most, schema)?
@@ -480,7 +478,7 @@ fn create_dedupe_index(
         cursor_id,
         is_table: false,
     });
-    Ok((cursor_id, dedupe_index.clone()))
+    Ok((cursor_id, dedupe_index))
 }
 
 /// Emits the bytecode for reading deduplicated rows from the ephemeral index created for

@@ -461,7 +461,7 @@ impl IncrementalView {
         // Skip CTEs - they're not real tables
         if !cte_names.contains(table_name) {
             if let Some(table) = schema.get_btree_table(table_name) {
-                table_map.insert(table_name.to_string(), table.clone());
+                table_map.insert(table_name.to_string(), table);
                 qualified_names.insert(table_name.to_string(), qualified_name);
 
                 // Store the alias mapping if there is an alias
@@ -2169,7 +2169,7 @@ mod tests {
             select.clone(),
             tables,
             aliases,
-            qualified_names.clone(),
+            qualified_names,
             table_conditions,
             extract_view_columns(&select, &schema).unwrap(),
             &schema,
@@ -2217,7 +2217,7 @@ mod tests {
             select.clone(),
             tables,
             aliases,
-            qualified_names.clone(),
+            qualified_names,
             table_conditions,
             extract_view_columns(&select, &schema).unwrap(),
             &schema,
@@ -2520,7 +2520,7 @@ mod tests {
         // Get the orders table twice (simulating what would happen with CTEs)
         let orders_table = schema.get_btree_table("orders").unwrap();
 
-        let referenced_tables = vec![orders_table.clone(), orders_table.clone()];
+        let referenced_tables = vec![orders_table.clone(), orders_table];
 
         // Create a SELECT that would have conflicting WHERE conditions
         let select = parse_select(

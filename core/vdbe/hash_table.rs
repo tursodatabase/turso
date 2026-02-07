@@ -2186,7 +2186,7 @@ mod hashtests {
         let _ = ht.finalize_build();
 
         // Probe for key1
-        let result = ht.probe(key1.clone());
+        let result = ht.probe(key1);
         assert!(result.is_some());
         let entry1 = result.unwrap();
         assert_eq!(entry1.key_values[0].as_ref(), ValueRef::Integer(1));
@@ -2255,7 +2255,7 @@ mod hashtests {
         let _ = ht.finalize_build();
 
         // Probe should return first match
-        let result = ht.probe(key.clone());
+        let result = ht.probe(key);
         assert!(result.is_some());
         assert_eq!(result.unwrap().rowid, 1000);
 
@@ -2671,7 +2671,7 @@ mod hashtests {
             Value::Integer(30),
             Value::Float(1000.50),
         ];
-        let _ = ht.insert(key1.clone(), 100, payload1.clone()).unwrap();
+        let _ = ht.insert(key1.clone(), 100, payload1).unwrap();
 
         let key2 = vec![Value::Integer(2)];
         let payload2 = vec![
@@ -2679,7 +2679,7 @@ mod hashtests {
             Value::Integer(25),
             Value::Float(2000.75),
         ];
-        let _ = ht.insert(key2.clone(), 200, payload2.clone()).unwrap();
+        let _ = ht.insert(key2.clone(), 200, payload2).unwrap();
 
         let _ = ht.finalize_build();
 

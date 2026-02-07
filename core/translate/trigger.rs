@@ -146,7 +146,7 @@ pub fn translate_create_trigger(
 
     // Open cursor to sqlite_schema table
     let table = resolver.schema.get_btree_table(SQLITE_TABLEID).unwrap();
-    let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
+    let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table));
     program.emit_insn(Insn::OpenWrite {
         cursor_id: sqlite_schema_cursor_id,
         root_page: 1i64.into(),
@@ -163,7 +163,7 @@ pub fn translate_create_trigger(
         &normalized_trigger_name,
         &normalized_table_name,
         0, // triggers don't have a root page
-        Some(sql.clone()),
+        Some(sql),
     )?;
 
     // Update schema version
@@ -219,7 +219,7 @@ pub fn translate_drop_trigger(
 
     // Open cursor to sqlite_schema table
     let table = schema.get_btree_table(SQLITE_TABLEID).unwrap();
-    let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
+    let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table));
     program.emit_insn(Insn::OpenWrite {
         cursor_id: sqlite_schema_cursor_id,
         root_page: 1i64.into(),
@@ -309,7 +309,7 @@ pub fn translate_drop_trigger(
 
     program.emit_insn(Insn::DropTrigger {
         db: 0,
-        trigger_name: normalized_trigger_name.clone(),
+        trigger_name: normalized_trigger_name,
     });
 
     Ok(program)

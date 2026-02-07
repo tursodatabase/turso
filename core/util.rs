@@ -1384,7 +1384,7 @@ pub fn extract_view_columns(
                         normalize_ident(qualified_name.name.as_str())
                     };
                     tables.push(ViewTable {
-                        name: table_name.clone(),
+                        name: table_name,
                         alias: alias.as_ref().map(|a| match a {
                             ast::As::As(name) => normalize_ident(name.as_str()),
                             ast::As::Elided(name) => normalize_ident(name.as_str()),

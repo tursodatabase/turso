@@ -3774,7 +3774,7 @@ pub fn unwrap_parens_owned(expr: ast::Expr) -> Result<(ast::Expr, usize)> {
         ast::Expr::Parenthesized(mut exprs) => match exprs.len() {
             1 => {
                 paren_count += 1;
-                let (expr, count) = unwrap_parens_owned(*exprs.pop().unwrap().clone())?;
+                let (expr, count) = unwrap_parens_owned(*exprs.pop().unwrap())?;
                 paren_count += count;
                 Ok((expr, paren_count))
             }

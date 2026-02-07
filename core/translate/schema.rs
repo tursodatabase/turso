@@ -165,7 +165,7 @@ pub fn translate_create_table(
 
     let schema_master_table = resolver.schema.get_btree_table(SQLITE_TABLEID).unwrap();
     let sqlite_schema_cursor_id =
-        program.alloc_cursor_id(CursorType::BTreeTable(schema_master_table.clone()));
+        program.alloc_cursor_id(CursorType::BTreeTable(schema_master_table));
     program.emit_insn(Insn::OpenWrite {
         cursor_id: sqlite_schema_cursor_id,
         root_page: 1i64.into(),
@@ -254,7 +254,7 @@ pub fn translate_create_table(
     }
 
     let table = resolver.schema.get_btree_table(SQLITE_TABLEID).unwrap();
-    let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
+    let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table));
     program.emit_insn(Insn::OpenWrite {
         cursor_id: sqlite_schema_cursor_id,
         root_page: 1i64.into(),
@@ -591,7 +591,7 @@ pub fn translate_create_virtual_table(
         args_reg,
     });
     let table = resolver.schema.get_btree_table(SQLITE_TABLEID).unwrap();
-    let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
+    let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table));
     program.emit_insn(Insn::OpenWrite {
         cursor_id: sqlite_schema_cursor_id,
         root_page: 1i64.into(),
@@ -680,8 +680,7 @@ pub fn translate_drop_table(
     let null_reg = program.alloc_register(); //  r1
     program.emit_null(null_reg, None);
     let table_name_and_root_page_register = program.alloc_register(); //  r2, this register is special because it's first used to track table name and then moved root page
-    let table_reg =
-        program.emit_string8_new_reg(normalize_ident(tbl_name.name.as_str()).to_string()); //  r3
+    let table_reg = program.emit_string8_new_reg(normalize_ident(tbl_name.name.as_str())); //  r3
     program.mark_last_insn_constant();
     let _table_type = program.emit_string8_new_reg("trigger".to_string()); //  r4
     program.mark_last_insn_constant();

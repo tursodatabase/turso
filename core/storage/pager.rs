@@ -1566,7 +1566,7 @@ impl Pager {
         let subjournal = self.subjournal.read();
         let subjournal = subjournal.as_ref().unwrap();
 
-        let c = subjournal.write_page(write_offset, page_size, buffer.clone(), c)?;
+        let c = subjournal.write_page(write_offset, page_size, buffer, c)?;
         assert!(c.succeeded(), "memory IO should complete immediately");
         Ok(())
     }

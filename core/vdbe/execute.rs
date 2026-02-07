@@ -936,7 +936,7 @@ pub fn op_open_read(
             let mv_cursor = crate::incremental::cursor::MaterializedViewCursor::new(
                 cursor,
                 view_mutex.clone(),
-                pager.clone(),
+                pager,
                 tx_state,
             )?;
 
@@ -948,7 +948,7 @@ pub fn op_open_read(
         CursorType::BTreeTable(_) => {
             // Regular table
             let btree_cursor = Box::new(BTreeCursor::new_table(
-                pager.clone(),
+                pager,
                 maybe_transform_root_page_to_positive(mv_store.as_ref(), *root_page),
                 num_columns,
             ));
@@ -960,7 +960,7 @@ pub fn op_open_read(
         }
         CursorType::BTreeIndex(index) => {
             let btree_cursor = Box::new(BTreeCursor::new_index(
-                pager.clone(),
+                pager,
                 *root_page,
                 index.as_ref(),
                 num_columns,
@@ -1047,7 +1047,7 @@ pub fn op_vcreate(
     let table =
         crate::VirtualTable::table(Some(&table_name), &module_name, args, &conn.syms.read())?;
     {
-        conn.syms.write().vtabs.insert(table_name, table.clone());
+        conn.syms.write().vtabs.insert(table_name, table);
     }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -5755,7 +5755,7 @@ pub fn op_function(
                     };
 
                     let new_tbl_name = if tbl_name == rename_from {
-                        rename_to.clone()
+                        rename_to
                     } else {
                         tbl_name
                     };
@@ -7677,7 +7677,7 @@ pub fn op_open_write(
         if let Some(index) = maybe_index {
             let num_columns = index.columns.len();
             let btree_cursor = Box::new(BTreeCursor::new_index(
-                pager.clone(),
+                pager,
                 maybe_transform_root_page_to_positive(mv_store.as_ref(), root_page),
                 index.as_ref(),
                 num_columns,
@@ -7699,7 +7699,7 @@ pub fn op_open_write(
             };
 
             let btree_cursor = Box::new(BTreeCursor::new_table(
-                pager.clone(),
+                pager,
                 maybe_transform_root_page_to_positive(mv_store.as_ref(), root_page),
                 num_columns,
             ));
@@ -8678,7 +8678,7 @@ pub fn op_open_ephemeral(
                 None,
                 db_file_io,
                 PageCache::default(),
-                buffer_pool.clone(),
+                buffer_pool,
                 Arc::new(Mutex::new(())),
                 ephemeral_init_page_1,
             )?);
@@ -8847,7 +8847,7 @@ pub fn op_open_dup(
     match cursor_type {
         CursorType::BTreeTable(table) => {
             let cursor = Box::new(BTreeCursor::new_table(
-                pager.clone(),
+                pager,
                 maybe_transform_root_page_to_positive(mv_store.as_ref(), root_page),
                 table.columns.len(),
             ));

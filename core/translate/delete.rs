@@ -145,9 +145,9 @@ pub fn prepare_delete_plan(
     let btree_table_for_triggers = table.btree();
 
     let table = if let Some(table) = table.virtual_table() {
-        Table::Virtual(table.clone())
+        Table::Virtual(table)
     } else if let Some(table) = table.btree() {
-        Table::BTree(table.clone())
+        Table::BTree(table)
     } else {
         crate::bail_parse_error!("Table is neither a virtual table nor a btree table");
     };

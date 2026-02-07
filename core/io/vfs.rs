@@ -150,12 +150,11 @@ impl File for VfsFileImpl {
         }
         let vfs = unsafe { &*self.vfs };
         let res = unsafe {
-            let buf = buffer.clone();
-            let len = buf.len();
+            let len = buffer.len();
             let cb = to_callback(c.clone());
             (vfs.write)(
                 self.file,
-                BufferRef::new(buf.as_ptr() as *mut u8, len),
+                BufferRef::new(buffer.as_ptr() as *mut u8, len),
                 pos as i64,
                 cb,
             )

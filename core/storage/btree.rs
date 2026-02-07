@@ -8457,7 +8457,7 @@ mod tests {
             }
         }
         if let Some(rightmost) = contents.rightmost_pointer().ok().flatten() {
-            child.push(format_btree(pager.clone(), rightmost as i64, depth + 2));
+            child.push(format_btree(pager, rightmost as i64, depth + 2));
         }
         let current = format!(
             "{}-page:{}, ptr(right):{:?}\n{}+cells:{}",
@@ -8529,7 +8529,7 @@ mod tests {
         let large_payload = vec![b'X'; large_payload_size];
 
         // Create a record with the large payload
-        let regs = &[Register::Value(Value::Blob(large_payload.clone()))];
+        let regs = &[Register::Value(Value::Blob(large_payload))];
         let large_record = ImmutableRecord::from_registers(regs, regs.len());
 
         // Create cursor for the table
@@ -8830,7 +8830,7 @@ mod tests {
                 if do_validate
                     && (!valid || matches!(validate_btree(pager.clone(), root_page), (_, false)))
                 {
-                    let btree_after = format_btree(pager.clone(), root_page, 0);
+                    let btree_after = format_btree(pager, root_page, 0);
                     println!("btree before:\n{btree_before}");
                     println!("btree after:\n{btree_after}");
                     panic!("invalid btree");

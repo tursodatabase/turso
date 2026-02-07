@@ -3270,7 +3270,7 @@ pub mod test {
         conn1
             .execute("create table test(id integer primary key, value text)")
             .unwrap();
-        bulk_inserts(&conn1.clone(), 15, 2);
+        bulk_inserts(&conn1, 15, 2);
         let IOResult::Done(completions) = conn1.pager.load().cacheflush().unwrap() else {
             panic!()
         };
@@ -3287,7 +3287,7 @@ pub mod test {
         };
 
         // generate more frames that the reader will not see.
-        bulk_inserts(&conn1.clone(), 15, 2);
+        bulk_inserts(&conn1, 15, 2);
         let IOResult::Done(completions) = conn1.pager.load().cacheflush().unwrap() else {
             panic!()
         };

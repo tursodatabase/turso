@@ -2464,7 +2464,7 @@ mod tests {
         let start = Value::build_text("not a time");
         let end = Value::build_text("12:00:00");
         let expected = Value::Null;
-        assert_eq!(exec_timediff(&[start, end.clone()]), expected);
+        assert_eq!(exec_timediff(&[start, end]), expected);
 
         // Test identical times - should return zero duration, not Null
         let start = Value::build_text("12:00:00");

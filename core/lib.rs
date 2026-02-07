@@ -458,7 +458,7 @@ impl Database {
             path: path.into(),
             wal_path: wal_path.into(),
             schema: Arc::new(Mutex::new(Arc::new(Schema::new()))),
-            _shared_page_cache: shared_page_cache.clone(),
+            _shared_page_cache: shared_page_cache,
             shared_wal,
             db_file,
             builtin_syms: parking_lot::RwLock::new(syms),
@@ -1350,7 +1350,7 @@ impl Database {
             pager_wal,
             self.io.clone(),
             PageCache::default(),
-            buffer_pool.clone(),
+            buffer_pool,
             self.init_lock.clone(),
             self.init_page_1.clone(),
         )?;

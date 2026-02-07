@@ -499,7 +499,7 @@ fn get_subquery_parser<'a>(
 
                 plan.query_destination = QueryDestination::EphemeralIndex {
                     cursor_id,
-                    index: ephemeral_index.clone(),
+                    index: ephemeral_index,
                     is_delete: false,
                 };
 
