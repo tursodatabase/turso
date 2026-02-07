@@ -3462,7 +3462,7 @@ impl BTreeCursor {
                         {
                             page_numbers[i] = page.as_ref().unwrap().get().id;
                         }
-                        page_numbers.sort();
+                        page_numbers.sort_unstable();
                         for (page, new_id) in pages_to_balance_new
                             .iter()
                             .take(sibling_count_new)
