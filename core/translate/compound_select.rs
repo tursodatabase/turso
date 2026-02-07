@@ -120,7 +120,7 @@ pub fn emit_program_for_compound_select(
     // This is inefficient, but emit_compound_select() takes ownership of 'plan' and we
     // must set the result columns to the leftmost subselect's result columns to be compatible
     // with SQLite.
-    program.result_columns = left[0].0.result_columns.clone();
+    program.result_columns.clone_from(&left[0].0.result_columns);
 
     // These must also be set because we make the decision to start a transaction based on whether
     // any tables are actually touched by the query. Previously this only used the rightmost subselect's

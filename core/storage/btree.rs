@@ -10066,7 +10066,6 @@ mod tests {
         let header_size = 8;
 
         let mut total_size = 0;
-        let mut cells = Vec::new();
         let usable_space = 4096;
         let mut i = 1000;
         for seed in [15292777653676891381, 9261043168681395159] {
@@ -10106,10 +10105,6 @@ mod tests {
                         insert_into_cell(page_contents, &payload, cell_idx, 4096).unwrap();
                         assert!(page_contents.overflow_cells.is_empty());
                         total_size += payload.len() + 2;
-                        cells.push(Cell {
-                            pos: i as usize,
-                            payload,
-                        });
                     }
                     1 => {
                         if page_contents.cell_count() == 0 {
@@ -10121,7 +10116,6 @@ mod tests {
                             .unwrap();
                         drop_cell(page_contents, cell_idx, usable_space).unwrap();
                         total_size -= len + 2;
-                        cells.remove(cell_idx);
                     }
                     2 => {
                         defragment_page(page_contents, usable_space, 4).unwrap();

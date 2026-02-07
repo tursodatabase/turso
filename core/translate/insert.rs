@@ -362,7 +362,7 @@ pub fn translate_insert(
 
     // Set up the program to return result columns if RETURNING is specified
     if !result_columns.is_empty() {
-        program.result_columns = result_columns.clone();
+        program.result_columns.clone_from(&result_columns);
     }
     let insertion = build_insertion(&mut program, &table, &columns, ctx.num_values)?;
 
