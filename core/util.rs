@@ -1611,26 +1611,29 @@ pub fn rewrite_check_expr_column_refs(expr: &mut ast::Expr, from: &str, to: &str
     );
 }
 
-/// Rewrite table name references in a CHECK constraint expression.
-/// Replaces `Qualified(old_tbl, col)` with `Qualified(new_tbl, col)`.
-pub fn rewrite_check_expr_table_refs(expr: &mut ast::Expr, from: &str, to: &str) {
-    let from_normalized = normalize_ident(from);
-    // The closure is infallible, so walk_expr_mut cannot fail.
-    let _ = walk_expr_mut(
-        expr,
-        &mut |e: &mut ast::Expr| -> crate::Result<WalkControl> {
-            if let ast::Expr::Qualified(ref tbl, _) = *e {
-                if normalize_ident(tbl.as_str()) == from_normalized {
-                    let ast::Expr::Qualified(_, ref col) = *e else {
-                        unreachable!()
-                    };
-                    let col = col.clone();
-                    *e = ast::Expr::Qualified(ast::Name::exact(to.to_owned()), col);
-                }
+/// Check if a CHECK constraint expression contains any table-qualified column
+/// references matching the given table name. Returns the first matching
+/// `(table_name, column_name)` pair if found. SQLite rejects RENAME TABLE when
+/// CHECK constraints contain such qualified refs.
+pub fn check_expr_has_table_qualified_refs(
+    expr: &ast::Expr,
+    table_name: &str,
+) -> Option<(String, String)> {
+    let normalized = normalize_ident(table_name);
+    let mut found: Option<(String, String)> = None;
+    let _ = walk_expr(expr, &mut |e: &ast::Expr| -> crate::Result<WalkControl> {
+        if found.is_some() {
+            return Ok(WalkControl::SkipChildren);
+        }
+        if let ast::Expr::Qualified(ref tbl, ref col) = *e {
+            if normalize_ident(tbl.as_str()) == normalized {
+                found = Some((tbl.as_str().to_string(), col.as_str().to_string()));
+                return Ok(WalkControl::SkipChildren);
             }
-            Ok(WalkControl::Continue)
-        },
-    );
+        }
+        Ok(WalkControl::Continue)
+    });
+    found
 }
 
 /// Update a column-level REFERENCES <tbl>(col,...) constraint
