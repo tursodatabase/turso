@@ -249,6 +249,8 @@ fn plan_subqueries_with_outer_query_access<'a>(
                 identifier: t.identifier.clone(),
                 internal_id: t.internal_id,
                 col_used_mask: ColumnUsedMask::default(),
+                cte_select: None,
+                cte_explicit_columns: vec![],
             })
             .chain(
                 referenced_tables
@@ -259,6 +261,8 @@ fn plan_subqueries_with_outer_query_access<'a>(
                         identifier: t.identifier.clone(),
                         internal_id: t.internal_id,
                         col_used_mask: ColumnUsedMask::default(),
+                        cte_select: t.cte_select.clone(),
+                        cte_explicit_columns: t.cte_explicit_columns.clone(),
                     }),
             )
             .collect::<Vec<_>>()

@@ -391,6 +391,8 @@ fn plan_cte(
             internal_id: referenced_table.internal_id,
             table: referenced_table.table.clone(),
             col_used_mask: ColumnUsedMask::default(),
+            cte_select: None,
+            cte_explicit_columns: vec![],
         });
     }
 
@@ -473,6 +475,9 @@ pub fn plan_ctes_as_outer_refs(
             );
         }
 
+        // Clone the CTE select AST before planning, so we can store it for re-planning
+        let cte_select_ast = cte.select.clone();
+
         // Plan the CTE SELECT
         let cte_plan = prepare_select_plan(
             cte.select,
@@ -508,6 +513,8 @@ pub fn plan_ctes_as_outer_refs(
             internal_id: joined_table.internal_id,
             table: joined_table.table,
             col_used_mask: ColumnUsedMask::default(),
+            cte_select: Some(cte_select_ast),
+            cte_explicit_columns: explicit_columns,
         });
     }
 
@@ -569,6 +576,8 @@ fn parse_from_clause_table(
                     internal_id: cte_table.internal_id,
                     table: cte_table.table,
                     col_used_mask: ColumnUsedMask::default(),
+                    cte_select: Some(cte_def.select.clone()),
+                    cte_explicit_columns: cte_def.explicit_columns.clone(),
                 });
             }
 
@@ -676,18 +685,56 @@ fn parse_table(
                 ast::As::Elided(id) => id,
             })
             .map(|a| normalize_ident(a.as_str()));
-        let internal_id = program.table_reference_counter.next();
-        table_references.add_joined_table(JoinedTable {
-            op: Operation::default_scan_for(&outer_ref.table),
-            table: outer_ref.table.clone(),
-            identifier: alias.unwrap_or(normalized_qualified_name),
-            internal_id,
-            join_info: None,
-            col_used_mask: ColumnUsedMask::default(),
-            column_use_counts: Vec::new(),
-            expression_index_usages: Vec::new(),
-            database_id,
-        });
+        // Clone fields we need before dropping the borrow on table_references.
+        let cte_select = outer_ref.cte_select.clone();
+        let cte_explicit_columns = outer_ref.cte_explicit_columns.clone();
+        let outer_table = outer_ref.table.clone();
+
+        if let Some(cte_ast) = cte_select {
+            // Re-plan the CTE from its original AST to get fresh internal_ids.
+            // This prevents cursor key collisions when the same CTE is
+            // referenced multiple times in the same scope.
+            let cte_plan = prepare_select_plan(
+                cte_ast,
+                resolver,
+                program,
+                table_references.outer_query_refs(),
+                QueryDestination::placeholder_for_subquery(),
+                connection,
+            )?;
+            let explicit_cols = if cte_explicit_columns.is_empty() {
+                None
+            } else {
+                Some(cte_explicit_columns.as_slice())
+            };
+            // Use the CTE name for the subquery name so query plans show
+            // "SCAN cte_name AS alias" instead of just "SCAN alias".
+            let mut jt = JoinedTable::new_subquery_from_plan(
+                normalized_qualified_name.clone(),
+                cte_plan,
+                None,
+                program.table_reference_counter.next(),
+                explicit_cols,
+            )?;
+            if let Some(alias) = alias {
+                jt.identifier = alias;
+            }
+            jt.database_id = database_id;
+            table_references.add_joined_table(jt);
+        } else {
+            let internal_id = program.table_reference_counter.next();
+            table_references.add_joined_table(JoinedTable {
+                op: Operation::default_scan_for(&outer_table),
+                table: outer_table,
+                identifier: alias.unwrap_or(normalized_qualified_name),
+                internal_id,
+                join_info: None,
+                col_used_mask: ColumnUsedMask::default(),
+                column_use_counts: Vec::new(),
+                expression_index_usages: Vec::new(),
+                database_id,
+            });
+        }
         return Ok(());
     }
 
@@ -1009,6 +1056,8 @@ pub fn parse_from(
                 internal_id: cte_table.internal_id,
                 table: cte_table.table,
                 col_used_mask: ColumnUsedMask::default(),
+                cte_select: Some(cte_def.select.clone()),
+                cte_explicit_columns: cte_def.explicit_columns.clone(),
             });
         }
     }
