@@ -1653,3 +1653,62 @@ expect {
     3|z
 }
 
+# Tests for float-to-integer conversion on INTEGER PRIMARY KEY columns
+# SQLite requires values to be STRICTLY between i64::MIN and i64::MAX
+
+# i64::MIN as float literal should fail (boundary value excluded)
+test insert-integer-pk-i64-min-float-error {
+    CREATE TABLE t (a INTEGER PRIMARY KEY);
+    INSERT INTO t VALUES (-9223372036854775808.0);
+}
+expect error {
+}
+
+# i64::MAX as float literal should fail (boundary value excluded)
+test insert-integer-pk-i64-max-float-error {
+    CREATE TABLE t (a INTEGER PRIMARY KEY);
+    INSERT INTO t VALUES (9223372036854775807.0);
+}
+expect error {
+}
+
+# Values strictly inside i64 range should work
+test insert-integer-pk-large-float-ok {
+    CREATE TABLE t (a INTEGER PRIMARY KEY);
+    INSERT INTO t VALUES (426601719749026560.0);
+    SELECT a, typeof(a) FROM t;
+}
+expect {
+    426601719749026560|integer
+}
+
+# Negative large float inside range should work
+test insert-integer-pk-large-negative-float-ok {
+    CREATE TABLE t (a INTEGER PRIMARY KEY);
+    INSERT INTO t VALUES (-426601719749026560.0);
+    SELECT a, typeof(a) FROM t;
+}
+expect {
+    -426601719749026560|integer
+}
+
+# Float near i64::MIN boundary (but inside) should work
+test insert-integer-pk-near-min-float-ok {
+    CREATE TABLE t (a INTEGER PRIMARY KEY);
+    INSERT INTO t VALUES (-9223372036854774784.0);
+    SELECT a, typeof(a) FROM t;
+}
+expect {
+    -9223372036854774784|integer
+}
+
+# Computed overflow that produces valid float should work
+test insert-integer-pk-computed-overflow-ok {
+    CREATE TABLE t (a INTEGER PRIMARY KEY);
+    INSERT INTO t VALUES (5949738080128696532 * 2434505998659733097 % -586451354473716618);
+    SELECT a, typeof(a) FROM t;
+}
+expect {
+    426601719749026560|integer
+}
+
