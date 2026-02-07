@@ -1641,6 +1641,10 @@ pub fn op_type_check(
             } else if col.is_rowid_alias() && matches!(reg.get_value(), Value::Null) {
                 // Handle INTEGER PRIMARY KEY for null as usual (Rowid will be auto-assigned)
                 return Ok(());
+            } else if matches!(reg.get_value(), Value::Null) {
+                // STRICT only enforces type affinity on non-NULL values.
+                // NULL is valid in any column without NOT NULL constraint.
+                return Ok(());
             }
             let col_affinity = col.affinity();
             let ty_str = &col.ty_str;
