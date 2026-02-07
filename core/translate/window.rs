@@ -704,7 +704,7 @@ fn emit_flush_buffer_if_new_partition(
             program.offset(),
             "compare partition keys to detect new partition",
         );
-        let mut compare_key_info = (0..window.partition_by.len())
+        let mut compare_key_info = (0..partition_by_len)
             .map(|_| KeyInfo {
                 sort_order: SortOrder::Asc,
                 collation: CollationSeq::default(),
@@ -713,7 +713,7 @@ fn emit_flush_buffer_if_new_partition(
         for (i, c) in compare_key_info
             .iter_mut()
             .enumerate()
-            .take(window.partition_by.len())
+            .take(partition_by_len)
         {
             let maybe_collation =
                 get_collseq_from_expr(&window.partition_by[i], &plan.table_references)?;
