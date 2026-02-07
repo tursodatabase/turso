@@ -741,7 +741,7 @@ fn parse_table(
 
         // Recursively call parse_from_clause_table with the view as a SELECT
         let result = parse_from_clause_table(
-            ast::SelectTable::Select(*subselect.clone(), view_alias),
+            ast::SelectTable::Select(*subselect, view_alias),
             resolver,
             program,
             table_references,

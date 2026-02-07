@@ -968,7 +968,7 @@ fn translate_rename_virtual_table(
     resolver: &Resolver,
 ) -> Result<ProgramBuilder> {
     program.begin_write_operation();
-    let vtab_cur = program.alloc_cursor_id(CursorType::VirtualTable(vtab.clone()));
+    let vtab_cur = program.alloc_cursor_id(CursorType::VirtualTable(vtab));
     program.emit_insn(Insn::VOpen {
         cursor_id: vtab_cur,
     });
@@ -1955,7 +1955,6 @@ fn rewrite_trigger_sql_for_column_rename(
     // Note: SQLite fails RENAME COLUMN if a trigger's WHEN clause references the column.
     // We check for this earlier and fail the operation immediately, matching SQLite.
     // If we reach here, the WHEN clause doesn't reference the column, so we keep it unchanged.
-    let new_when_clause = when_clause.clone();
 
     let mut new_commands = Vec::new();
     for cmd in commands {
@@ -1982,7 +1981,7 @@ fn rewrite_trigger_sql_for_column_rename(
         &new_event,
         &tbl_name,
         for_each_row,
-        new_when_clause.as_deref(),
+        when_clause.as_deref(),
         &new_commands,
     );
 

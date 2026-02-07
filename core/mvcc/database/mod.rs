@@ -1473,11 +1473,11 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                     row: row.clone(),
                     btree_resident: false,
                 };
-                let RowKey::Record(sortable_key) = row.id.row_id.clone() else {
+                let RowKey::Record(sortable_key) = row.id.row_id else {
                     panic!("Index writes must be to a record");
                 };
                 let sortable_key = self.get_or_create_index_key_arc(index_id, sortable_key);
-                tx.insert_to_write_set(id.clone());
+                tx.insert_to_write_set(id);
                 tx.record_created_index_version((index_id, sortable_key.clone()), version_id);
                 self.insert_index_version(index_id, sortable_key, row_version);
             }
@@ -1525,7 +1525,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         tx.insert_to_write_set(id.clone());
         match maybe_index_id {
             Some(index_id) => {
-                let RowKey::Record(sortable_key) = row.id.row_id.clone() else {
+                let RowKey::Record(sortable_key) = row.id.row_id else {
                     panic!("Index writes must be to a record");
                 };
                 let sortable_key = self.get_or_create_index_key_arc(index_id, sortable_key);
@@ -1572,11 +1572,11 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                     row: row.clone(),
                     btree_resident: true,
                 };
-                let RowKey::Record(sortable_key) = row.id.row_id.clone() else {
+                let RowKey::Record(sortable_key) = row.id.row_id else {
                     panic!("Index writes must be to a record");
                 };
                 let sortable_key = self.get_or_create_index_key_arc(index_id, sortable_key);
-                tx.insert_to_write_set(id.clone());
+                tx.insert_to_write_set(id);
                 tx.record_created_index_version((index_id, sortable_key.clone()), version_id);
                 self.insert_index_version(index_id, sortable_key, row_version);
             }
@@ -1716,7 +1716,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                             .get(&tx_id)
                             .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
                         let tx = tx.value();
-                        tx.insert_to_write_set(id.clone());
+                        tx.insert_to_write_set(id);
                         tx.record_deleted_index_version((index_id, arc_key), version_id);
                         return Ok(true);
                     }

@@ -275,9 +275,9 @@ mod tests {
         assert_eq!(
             nonconsumed_terms[0].expr,
             Expr::Binary(
-                Box::new(ast::Expr::Parenthesized(vec![x_expr.clone().into()])),
+                Box::new(ast::Expr::Parenthesized(vec![x_expr.into()])),
                 Operator::Or,
-                Box::new(ast::Expr::Parenthesized(vec![y_expr.clone().into()]))
+                Box::new(ast::Expr::Parenthesized(vec![y_expr.into()]))
             )
         );
         assert_eq!(nonconsumed_terms[1].expr, a_expr);
@@ -586,11 +586,7 @@ mod tests {
         let a_expr = exprs[0].clone();
         let b_expr = exprs[1].clone();
 
-        let a_and_b_expr = Expr::Binary(
-            Box::new(a_expr.clone()),
-            Operator::And,
-            Box::new(b_expr.clone()),
-        );
+        let a_and_b_expr = Expr::Binary(Box::new(a_expr.clone()), Operator::And, Box::new(b_expr));
 
         let or_expr = Expr::Binary(
             Box::new(a_and_b_expr),

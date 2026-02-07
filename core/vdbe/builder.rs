@@ -405,7 +405,7 @@ impl ProgramBuilder {
 
     /// Set the set of hash tables to keep open across subplans.
     pub fn set_hash_tables_to_keep_open(&mut self, tables: &HashSet<usize>) {
-        self.hash_tables_to_keep_open = tables.clone();
+        self.hash_tables_to_keep_open.clone_from(tables);
     }
 
     /// Reset the set of hash tables to keep open.

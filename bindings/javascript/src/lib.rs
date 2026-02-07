@@ -425,7 +425,7 @@ impl Database {
     #[napi]
     pub fn executor(&self, sql: String) -> napi::Result<BatchExecutor> {
         Ok(BatchExecutor {
-            conn: Some(self.conn()?.clone()),
+            conn: Some(self.conn()?),
             sql,
             position: 0,
             stmt: None,
@@ -586,7 +586,7 @@ impl Statement {
         })?;
 
         let stmt = self.stmt()?.borrow();
-        Ok(stmt.parameters().name(non_zero_idx).map(|s| s.to_string()))
+        Ok(stmt.parameters().name(non_zero_idx))
     }
 
     /// Binds a parameter at a specific 1-based index with explicit type.

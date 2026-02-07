@@ -882,11 +882,11 @@ mod tests {
         let page1_v1 = page_with_content(1);
         let page1_v2 = page1_v1.clone(); // Same Arc instance
 
-        assert!(cache.insert(key1, page1_v1.clone()).is_ok());
+        assert!(cache.insert(key1, page1_v1).is_ok());
         assert_eq!(cache.len(), 1);
 
         // Inserting same page instance should return KeyExists error
-        let result = cache.insert(key1, page1_v2.clone());
+        let result = cache.insert(key1, page1_v2);
         assert_eq!(result, Err(CacheError::KeyExists));
         assert_eq!(cache.len(), 1);
 
@@ -903,12 +903,12 @@ mod tests {
         let page1_v1 = page_with_content(1);
         let page1_v2 = page_with_content(1); // Different Arc instance
 
-        assert!(cache.insert(key1, page1_v1.clone()).is_ok());
+        assert!(cache.insert(key1, page1_v1).is_ok());
         assert_eq!(cache.len(), 1);
         cache.verify_cache_integrity();
 
         // This should panic because it's a different page instance
-        let _ = cache.insert(key1, page1_v2.clone());
+        let _ = cache.insert(key1, page1_v2);
     }
 
     #[test]

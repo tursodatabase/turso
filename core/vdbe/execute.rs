@@ -936,7 +936,7 @@ pub fn op_open_read(
             let mv_cursor = crate::incremental::cursor::MaterializedViewCursor::new(
                 cursor,
                 view_mutex.clone(),
-                pager.clone(),
+                pager,
                 tx_state,
             )?;
 
@@ -948,7 +948,7 @@ pub fn op_open_read(
         CursorType::BTreeTable(_) => {
             // Regular table
             let btree_cursor = Box::new(BTreeCursor::new_table(
-                pager.clone(),
+                pager,
                 maybe_transform_root_page_to_positive(mv_store.as_ref(), *root_page),
                 num_columns,
             ));
@@ -960,7 +960,7 @@ pub fn op_open_read(
         }
         CursorType::BTreeIndex(index) => {
             let btree_cursor = Box::new(BTreeCursor::new_index(
-                pager.clone(),
+                pager,
                 *root_page,
                 index.as_ref(),
                 num_columns,
@@ -1047,7 +1047,7 @@ pub fn op_vcreate(
     let table =
         crate::VirtualTable::table(Some(&table_name), &module_name, args, &conn.syms.read())?;
     {
-        conn.syms.write().vtabs.insert(table_name, table.clone());
+        conn.syms.write().vtabs.insert(table_name, table);
     }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -5759,7 +5759,7 @@ pub fn op_function(
                     };
 
                     let new_tbl_name = if tbl_name == rename_from {
-                        rename_to.clone()
+                        rename_to
                     } else {
                         tbl_name
                     };
@@ -7681,7 +7681,7 @@ pub fn op_open_write(
         if let Some(index) = maybe_index {
             let num_columns = index.columns.len();
             let btree_cursor = Box::new(BTreeCursor::new_index(
-                pager.clone(),
+                pager,
                 maybe_transform_root_page_to_positive(mv_store.as_ref(), root_page),
                 index.as_ref(),
                 num_columns,
@@ -7703,7 +7703,7 @@ pub fn op_open_write(
             };
 
             let btree_cursor = Box::new(BTreeCursor::new_table(
-                pager.clone(),
+                pager,
                 maybe_transform_root_page_to_positive(mv_store.as_ref(), root_page),
                 num_columns,
             ));
@@ -8682,7 +8682,7 @@ pub fn op_open_ephemeral(
                 None,
                 db_file_io,
                 PageCache::default(),
-                buffer_pool.clone(),
+                buffer_pool,
                 Arc::new(Mutex::new(())),
                 ephemeral_init_page_1,
             )?);
@@ -8851,7 +8851,7 @@ pub fn op_open_dup(
     match cursor_type {
         CursorType::BTreeTable(table) => {
             let cursor = Box::new(BTreeCursor::new_table(
-                pager.clone(),
+                pager,
                 maybe_transform_root_page_to_positive(mv_store.as_ref(), root_page),
                 table.columns.len(),
             ));
@@ -10138,7 +10138,7 @@ pub fn op_rename_table(
         if let Some(mut indexes) = schema.indexes.remove(&normalized_from) {
             indexes.iter_mut().for_each(|index| {
                 let index = Arc::make_mut(index);
-                index.table_name = normalized_to.to_owned();
+                normalized_to.clone_into(&mut index.table_name);
             });
 
             schema.indexes.insert(normalized_to.to_owned(), indexes);
@@ -10155,14 +10155,14 @@ pub fn op_rename_table(
                 for fk_arc in &mut btree.foreign_keys {
                     let fk = Arc::make_mut(fk_arc);
                     if normalize_ident(&fk.parent_table) == normalized_from {
-                        fk.parent_table = normalized_to.clone();
+                        fk.parent_table.clone_from(&normalized_to);
                     }
                 }
 
-                btree.name = normalized_to.to_owned();
+                normalized_to.clone_into(&mut btree.name);
             }
             Table::Virtual(vtab) => {
-                Arc::make_mut(vtab).name = normalized_to.clone();
+                Arc::make_mut(vtab).name.clone_from(&normalized_to);
             }
             _ => panic!("only btree and virtual tables can be renamed"),
         }
@@ -10179,7 +10179,7 @@ pub fn op_rename_table(
                 for fk_arc in &mut child_btree.foreign_keys {
                     if normalize_ident(&fk_arc.parent_table) == normalized_from {
                         let fk = Arc::make_mut(fk_arc);
-                        fk.parent_table = normalized_to.clone();
+                        fk.parent_table.clone_from(&normalized_to);
                     }
                 }
             }
@@ -10378,7 +10378,7 @@ pub fn op_alter_column(
                     if ic.name.eq_ignore_ascii_case(
                         col.name.as_ref().expect("btree column should be named"),
                     ) {
-                        ic.name = new_name.clone();
+                        ic.name.clone_from(&new_name);
                     }
                 }
             }
@@ -10392,7 +10392,7 @@ pub fn op_alter_column(
         // Keep primary_key_columns consistent (names may change on rename)
         for (pk_name, _ord) in &mut btree.primary_key_columns {
             if pk_name.eq_ignore_ascii_case(&old_column_name) {
-                *pk_name = new_name.clone();
+                pk_name.clone_from(&new_name);
             }
         }
 
@@ -10408,14 +10408,14 @@ pub fn op_alter_column(
             // child side: rename child column if it matches
             for cc in &mut fk.child_columns {
                 if cc.eq_ignore_ascii_case(&old_column_name) {
-                    *cc = new_name.clone();
+                    cc.clone_from(&new_name);
                 }
             }
             // parent side: if self-referencing, rename parent column too
             if normalize_ident(&fk.parent_table) == normalized_table_name {
                 for pc in &mut fk.parent_columns {
                     if pc.eq_ignore_ascii_case(&old_column_name) {
-                        *pc = new_name.clone();
+                        pc.clone_from(&new_name);
                     }
                 }
             }
@@ -10435,7 +10435,7 @@ pub fn op_alter_column(
                     let fk = Arc::make_mut(fk_arc);
                     for pc in &mut fk.parent_columns {
                         if pc.eq_ignore_ascii_case(&old_column_name) {
-                            *pc = new_name.clone();
+                            pc.clone_from(&new_name);
                         }
                     }
                 }

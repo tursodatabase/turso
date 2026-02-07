@@ -577,7 +577,7 @@ pub fn begin_read_page(
         } else {
             buf
         };
-        finish_read_page(page_idx, buffer, page.clone());
+        finish_read_page(page_idx, buffer, page);
         None
     });
     let c = Completion::new_read(buf, complete);
@@ -1318,7 +1318,7 @@ pub fn build_shared_wal(
     let reader = Arc::new(StreamingWalReader::new(
         file.clone(),
         wal_file_shared.clone(),
-        header.clone(),
+        header,
         size,
     ));
 
@@ -1812,7 +1812,7 @@ pub fn begin_write_wal_header<F: File + ?Sized>(io: &F, header: &WalHeader) -> R
     };
     #[allow(clippy::arc_with_non_send_sync)]
     let c = Completion::new_write(write_complete);
-    let c = io.pwrite(0, buffer.clone(), c.clone())?;
+    let c = io.pwrite(0, buffer, c)?;
     Ok(c)
 }
 

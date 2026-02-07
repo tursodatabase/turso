@@ -578,7 +578,7 @@ impl Schema {
         self.indexes
             .entry(table_name)
             .or_default()
-            .push_front(index.clone());
+            .push_front(index);
         Ok(())
     }
 
@@ -1180,7 +1180,7 @@ impl Schema {
                 };
                 self.add_trigger(
                     Trigger::new(
-                        trigger_name.clone(),
+                        trigger_name,
                         sql.to_string(),
                         tbl_name.name.to_string(),
                         time,
@@ -2058,7 +2058,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                 let ty_str = col_type
                     .as_ref()
                     .cloned()
-                    .map(|ast::Type { name, .. }| name.clone())
+                    .map(|ast::Type { name, .. }| name)
                     .unwrap_or_default();
 
                 let mut typename_exactly_integer = false;

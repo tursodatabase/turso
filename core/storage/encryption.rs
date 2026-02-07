@@ -1106,7 +1106,7 @@ mod tests {
         assert!(ctx.decrypt_page(&corrupted, 1).is_err());
 
         // test with wrong cipher ID
-        let mut wrong_cipher = encrypted.clone();
+        let mut wrong_cipher = encrypted;
         wrong_cipher[6] = 99; // invalid cipher ID
         assert!(ctx.decrypt_page(&wrong_cipher, 1).is_err());
     }
@@ -1121,7 +1121,7 @@ mod tests {
         let encrypted = ctx.encrypt_page(&page_data, 1).unwrap();
 
         // modify a byte in the preserved header portion (bytes 16-100)
-        let mut corrupted_ad = encrypted.clone();
+        let mut corrupted_ad = encrypted;
         corrupted_ad[50] ^= 1; // flip one bit in the associated data portion
 
         // this should fail decryption because associated data doesn't match
@@ -1141,7 +1141,7 @@ mod tests {
         let page_data = create_test_page_1();
         let encrypted = ctx.encrypt_page(&page_data, 1).unwrap();
 
-        let mut corrupted_turso_header = encrypted.clone();
+        let mut corrupted_turso_header = encrypted;
         corrupted_turso_header[7] ^= 1;
 
         let decrypt_result = ctx.decrypt_page(&corrupted_turso_header, 1);

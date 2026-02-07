@@ -179,7 +179,7 @@ impl Connection {
 
     pub fn start_trigger_compilation(&self, trigger: Arc<Trigger>) {
         tracing::debug!("Starting trigger compilation: {}", trigger.name);
-        self.compiling_triggers.write().push(trigger.clone());
+        self.compiling_triggers.write().push(trigger);
     }
 
     pub fn end_trigger_compilation(&self) {
@@ -202,7 +202,7 @@ impl Connection {
 
     pub fn start_trigger_execution(&self, trigger: Arc<Trigger>) {
         tracing::debug!("Starting trigger execution: {}", trigger.name);
-        self.executing_triggers.write().push(trigger.clone());
+        self.executing_triggers.write().push(trigger);
     }
 
     pub fn end_trigger_execution(&self) {
@@ -571,7 +571,7 @@ impl Connection {
             mode,
             input,
         )?;
-        let stmt = Statement::new(program, pager.clone(), mode);
+        let stmt = Statement::new(program, pager, mode);
         Ok(Some((stmt, parser.offset())))
     }
 
@@ -605,7 +605,7 @@ impl Connection {
             opts.vfs.as_ref(),
             flags,
             db_opts,
-            encryption_opts.clone(),
+            encryption_opts,
         )?;
         if let Some(modeof) = opts.modeof {
             let perms = std::fs::metadata(modeof)?;
@@ -1581,7 +1581,7 @@ impl Connection {
 
     pub fn set_encryption_key(&self, key: EncryptionKey) -> Result<()> {
         tracing::trace!("setting encryption key for connection");
-        *self.encryption_key.write() = Some(key.clone());
+        *self.encryption_key.write() = Some(key);
         self.set_encryption_context()
     }
 

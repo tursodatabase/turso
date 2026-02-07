@@ -586,7 +586,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         std::process::exit(1);
     }
 
-    rt.block_on(Box::pin(async_main(opts.clone())))
+    rt.block_on(Box::pin(async_main(opts)))
 }
 
 #[cfg(shuttle)]

@@ -25,7 +25,7 @@ struct BenchDb {
 
 fn bench_db() -> BenchDb {
     let io = Arc::new(MemoryIO::new());
-    let db = Database::open_file(io.clone(), ":memory:").unwrap();
+    let db = Database::open_file(io, ":memory:").unwrap();
     let conn = db.connect().unwrap();
     // Enable MVCC via PRAGMA
     conn.execute("PRAGMA journal_mode = 'experimental_mvcc'")
@@ -46,9 +46,8 @@ fn bench(c: &mut Criterion) {
         let db = bench_db();
         b.to_async(FuturesExecutor).iter(|| async {
             let conn = db.conn.clone();
-            let tx_id = db.mvcc_store.begin_tx(conn.get_pager().clone()).unwrap();
-            db.mvcc_store
-                .rollback_tx(tx_id, conn.get_pager().clone(), &conn);
+            let tx_id = db.mvcc_store.begin_tx(conn.get_pager()).unwrap();
+            db.mvcc_store.rollback_tx(tx_id, conn.get_pager(), &conn);
         })
     });
 
@@ -56,7 +55,7 @@ fn bench(c: &mut Criterion) {
     group.bench_function("begin_tx + commit_tx", |b| {
         b.to_async(FuturesExecutor).iter(|| async {
             let conn = &db.conn;
-            let tx_id = db.mvcc_store.begin_tx(conn.get_pager().clone()).unwrap();
+            let tx_id = db.mvcc_store.begin_tx(conn.get_pager()).unwrap();
             let mv_store = &db.mvcc_store;
             let mut sm = mv_store.commit_tx(tx_id, conn).unwrap();
             // TODO: sync IO hack
@@ -74,7 +73,7 @@ fn bench(c: &mut Criterion) {
     group.bench_function("begin_tx-read-commit_tx", |b| {
         b.to_async(FuturesExecutor).iter(|| async {
             let conn = &db.conn;
-            let tx_id = db.mvcc_store.begin_tx(conn.get_pager().clone()).unwrap();
+            let tx_id = db.mvcc_store.begin_tx(conn.get_pager()).unwrap();
             db.mvcc_store
                 .read(
                     tx_id,
@@ -103,7 +102,7 @@ fn bench(c: &mut Criterion) {
     group.bench_function("begin_tx-update-commit_tx", |b| {
         b.to_async(FuturesExecutor).iter(|| async {
             let conn = &db.conn;
-            let tx_id = db.mvcc_store.begin_tx(conn.get_pager().clone()).unwrap();
+            let tx_id = db.mvcc_store.begin_tx(conn.get_pager()).unwrap();
             db.mvcc_store
                 .update(
                     tx_id,
@@ -128,7 +127,7 @@ fn bench(c: &mut Criterion) {
     });
 
     let db = bench_db();
-    let tx_id = db.mvcc_store.begin_tx(db.conn.get_pager().clone()).unwrap();
+    let tx_id = db.mvcc_store.begin_tx(db.conn.get_pager()).unwrap();
     db.mvcc_store
         .insert(
             tx_id,
@@ -154,7 +153,7 @@ fn bench(c: &mut Criterion) {
     });
 
     let db = bench_db();
-    let tx_id = db.mvcc_store.begin_tx(db.conn.get_pager().clone()).unwrap();
+    let tx_id = db.mvcc_store.begin_tx(db.conn.get_pager()).unwrap();
     db.mvcc_store
         .insert(
             tx_id,

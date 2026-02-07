@@ -744,7 +744,7 @@ impl InPlaceJsonPath {
             .collect();
 
         Self {
-            string: path.to_owned(),
+            string: path,
             element_lengths,
             last_element,
         }

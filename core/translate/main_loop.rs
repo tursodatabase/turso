@@ -708,7 +708,7 @@ fn emit_hash_build_phase(
         (
             Some(payload_reg),
             HashBuildPayloadInfo {
-                payload_columns: payload_columns.clone(),
+                payload_columns,
                 key_affinities: key_affinities.clone(),
                 use_bloom_filter: false,
                 bloom_filter_cursor_id,

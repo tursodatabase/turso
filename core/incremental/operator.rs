@@ -1140,7 +1140,7 @@ mod tests {
         let mut agg = AggregateOperator::new(
             1, // operator_id for testing
             group_by,
-            aggregates.clone(),
+            aggregates,
             input_columns,
         )
         .unwrap();
@@ -1230,7 +1230,7 @@ mod tests {
         let mut agg = AggregateOperator::new(
             1, // operator_id for testing
             group_by,
-            aggregates.clone(),
+            aggregates,
             input_columns,
         )
         .unwrap();
@@ -1314,7 +1314,7 @@ mod tests {
         let mut agg = AggregateOperator::new(
             1, // operator_id for testing
             group_by,
-            aggregates.clone(),
+            aggregates,
             input_columns,
         )
         .unwrap();
@@ -1383,7 +1383,7 @@ mod tests {
         let mut agg = AggregateOperator::new(
             1, // operator_id for testing
             group_by,
-            aggregates.clone(),
+            aggregates,
             input_columns,
         )
         .unwrap();
@@ -2970,7 +2970,7 @@ mod tests {
             "First commit should produce 2 matches"
         );
 
-        let mut results: Vec<_> = result.changes.clone();
+        let mut results: Vec<_> = result.changes;
         results.sort_by_key(|r| r.0.values[0].clone());
 
         assert_eq!(results[0].0.values[0], Value::Integer(1));
@@ -3005,7 +3005,7 @@ mod tests {
         );
 
         // Verify the incremental results
-        let mut results2: Vec<_> = result2.changes.clone();
+        let mut results2: Vec<_> = result2.changes;
         results2.sort_by_key(|r| r.0.values[0].clone());
 
         // Check for customer 3 joined with Charlie (existing left + new right)
@@ -3690,8 +3690,7 @@ mod tests {
         let (_pager, table_root_page_id, index_root_page_id) = create_test_pager();
         let table_cursor = BTreeCursor::new_table(_pager.clone(), table_root_page_id, 5);
         let index_def = create_dbsp_state_index(index_root_page_id);
-        let index_cursor =
-            BTreeCursor::new_index(_pager.clone(), index_root_page_id, &index_def, 4);
+        let index_cursor = BTreeCursor::new_index(_pager, index_root_page_id, &index_def, 4);
         let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
         let mut merge_op = MergeOperator::new(
@@ -3751,8 +3750,7 @@ mod tests {
         let (_pager, table_root_page_id, index_root_page_id) = create_test_pager();
         let table_cursor = BTreeCursor::new_table(_pager.clone(), table_root_page_id, 5);
         let index_def = create_dbsp_state_index(index_root_page_id);
-        let index_cursor =
-            BTreeCursor::new_index(_pager.clone(), index_root_page_id, &index_def, 4);
+        let index_cursor = BTreeCursor::new_index(_pager, index_root_page_id, &index_def, 4);
         let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
         // Test that UNION (distinct) properly deduplicates across multiple operations
@@ -3825,8 +3823,7 @@ mod tests {
         let (_pager, table_root_page_id, index_root_page_id) = create_test_pager();
         let table_cursor = BTreeCursor::new_table(_pager.clone(), table_root_page_id, 5);
         let index_def = create_dbsp_state_index(index_root_page_id);
-        let index_cursor =
-            BTreeCursor::new_index(_pager.clone(), index_root_page_id, &index_def, 4);
+        let index_cursor = BTreeCursor::new_index(_pager, index_root_page_id, &index_def, 4);
         let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
         // Test UNION ALL with inputs coming from only one side at a time
@@ -3945,8 +3942,7 @@ mod tests {
         let (_pager, table_root_page_id, index_root_page_id) = create_test_pager();
         let table_cursor = BTreeCursor::new_table(_pager.clone(), table_root_page_id, 5);
         let index_def = create_dbsp_state_index(index_root_page_id);
-        let index_cursor =
-            BTreeCursor::new_index(_pager.clone(), index_root_page_id, &index_def, 4);
+        let index_cursor = BTreeCursor::new_index(_pager, index_root_page_id, &index_def, 4);
         let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
 
         // Test that both sides being empty works correctly

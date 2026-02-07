@@ -645,8 +645,7 @@ impl SortedChunk {
             let Ok((buf, bytes_read)) = res else {
                 return None;
             };
-            let read_buf_ref = buf.clone();
-            let read_buf = read_buf_ref.as_slice();
+            let read_buf = buf.as_slice();
 
             let bytes_read = bytes_read as usize;
             if bytes_read == 0 {

@@ -24,7 +24,7 @@ pub(crate) struct MvccTestDb {
 impl MvccTestDb {
     pub fn new() -> Self {
         let io = Arc::new(MemoryIO::new());
-        let db = Database::open_file(io.clone(), ":memory:").unwrap();
+        let db = Database::open_file(io, ":memory:").unwrap();
         let conn = db.connect().unwrap();
         // Enable MVCC via PRAGMA
         conn.execute("PRAGMA journal_mode = 'experimental_mvcc'")
@@ -41,7 +41,7 @@ impl MvccTestDb {
 impl MvccTestDbNoConn {
     pub fn new() -> Self {
         let io = Arc::new(MemoryIO::new());
-        let db = Database::open_file(io.clone(), ":memory:").unwrap();
+        let db = Database::open_file(io, ":memory:").unwrap();
         // Enable MVCC via PRAGMA
         let conn = db.connect().unwrap();
         conn.execute("PRAGMA journal_mode = 'experimental_mvcc'")
@@ -63,7 +63,7 @@ impl MvccTestDbNoConn {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let io = Arc::new(PlatformIO::new().unwrap());
         println!("path: {}", path.as_os_str().to_str().unwrap());
-        let db = Database::open_file(io.clone(), path.as_os_str().to_str().unwrap()).unwrap();
+        let db = Database::open_file(io, path.as_os_str().to_str().unwrap()).unwrap();
         // Enable MVCC via PRAGMA
         let conn = db.connect().unwrap();
         conn.execute("PRAGMA journal_mode = 'experimental_mvcc'")
@@ -88,7 +88,7 @@ impl MvccTestDbNoConn {
         // Now open again.
         let io = Arc::new(PlatformIO::new().unwrap());
         let path = self.path.as_ref().unwrap();
-        let db = Database::open_file(io.clone(), path).unwrap();
+        let db = Database::open_file(io, path).unwrap();
         self.db.replace(db);
     }
 
@@ -973,7 +973,7 @@ fn test_cursor_with_empty_table() {
     {
         // FIXME: force page 1 initialization
         let pager = db.conn.pager.load().clone();
-        let tx_id = db.mvcc_store.begin_tx(pager.clone()).unwrap();
+        let tx_id = db.mvcc_store.begin_tx(pager).unwrap();
         commit_tx(db.mvcc_store.clone(), &db.conn, tx_id).unwrap();
     }
     let tx_id = db
@@ -1241,7 +1241,7 @@ fn test_restart() {
         // now insert a row into table -2
         let row = generate_simple_string_row((-2).into(), 1, "foo");
         mvcc_store.insert(tx_id, row).unwrap();
-        commit_tx(mvcc_store.clone(), &conn, tx_id).unwrap();
+        commit_tx(mvcc_store, &conn, tx_id).unwrap();
         conn.close().unwrap();
     }
     db.restart();
@@ -1356,7 +1356,7 @@ fn test_commit_without_tx() {
     // expect error on trying to commit a non-existent interactive transaction
     let err = conn.execute("COMMIT").unwrap_err();
     if let LimboError::TxError(e) = err {
-        assert_eq!(e.to_string(), "cannot commit - no transaction is active");
+        assert_eq!(e, "cannot commit - no transaction is active");
     } else {
         panic!("Expected TxError");
     }

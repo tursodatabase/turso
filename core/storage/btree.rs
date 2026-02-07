@@ -3462,7 +3462,7 @@ impl BTreeCursor {
                         {
                             page_numbers[i] = page.as_ref().unwrap().get().id;
                         }
-                        page_numbers.sort();
+                        page_numbers.sort_unstable();
                         for (page, new_id) in pages_to_balance_new
                             .iter()
                             .take(sibling_count_new)
@@ -8457,7 +8457,7 @@ mod tests {
             }
         }
         if let Some(rightmost) = contents.rightmost_pointer().ok().flatten() {
-            child.push(format_btree(pager.clone(), rightmost as i64, depth + 2));
+            child.push(format_btree(pager, rightmost as i64, depth + 2));
         }
         let current = format!(
             "{}-page:{}, ptr(right):{:?}\n{}+cells:{}",
@@ -8529,7 +8529,7 @@ mod tests {
         let large_payload = vec![b'X'; large_payload_size];
 
         // Create a record with the large payload
-        let regs = &[Register::Value(Value::Blob(large_payload.clone()))];
+        let regs = &[Register::Value(Value::Blob(large_payload))];
         let large_record = ImmutableRecord::from_registers(regs, regs.len());
 
         // Create cursor for the table
@@ -8830,7 +8830,7 @@ mod tests {
                 if do_validate
                     && (!valid || matches!(validate_btree(pager.clone(), root_page), (_, false)))
                 {
-                    let btree_after = format_btree(pager.clone(), root_page, 0);
+                    let btree_after = format_btree(pager, root_page, 0);
                     println!("btree before:\n{btree_before}");
                     println!("btree after:\n{btree_after}");
                     panic!("invalid btree");
@@ -10066,7 +10066,6 @@ mod tests {
         let header_size = 8;
 
         let mut total_size = 0;
-        let mut cells = Vec::new();
         let usable_space = 4096;
         let mut i = 1000;
         for seed in [15292777653676891381, 9261043168681395159] {
@@ -10106,10 +10105,6 @@ mod tests {
                         insert_into_cell(page_contents, &payload, cell_idx, 4096).unwrap();
                         assert!(page_contents.overflow_cells.is_empty());
                         total_size += payload.len() + 2;
-                        cells.push(Cell {
-                            pos: i as usize,
-                            payload,
-                        });
                     }
                     1 => {
                         if page_contents.cell_count() == 0 {
@@ -10121,7 +10116,6 @@ mod tests {
                             .unwrap();
                         drop_cell(page_contents, cell_idx, usable_space).unwrap();
                         total_size -= len + 2;
-                        cells.remove(cell_idx);
                     }
                     2 => {
                         defragment_page(page_contents, usable_space, 4).unwrap();

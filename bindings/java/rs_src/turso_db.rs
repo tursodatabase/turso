@@ -73,7 +73,7 @@ pub extern "system" fn Java_tech_turso_core_TursoDB_openUtf8<'local>(
             }
         },
         Err(e) => {
-            set_err_msg_and_throw_exception(&mut env, obj, TURSO_ETC, e.to_string());
+            set_err_msg_and_throw_exception(&mut env, obj, TURSO_ETC, e);
             return -1;
         }
     };
@@ -121,7 +121,7 @@ pub extern "system" fn Java_tech_turso_core_TursoDB_openWithEncryptionUtf8<'loca
             }
         },
         Err(e) => {
-            set_err_msg_and_throw_exception(&mut env, obj, TURSO_ETC, e.to_string());
+            set_err_msg_and_throw_exception(&mut env, obj, TURSO_ETC, e);
             return -1;
         }
     };
