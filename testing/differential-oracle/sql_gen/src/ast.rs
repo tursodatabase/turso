@@ -4,6 +4,7 @@
 //! making tracing invisible to the generator code.
 
 use crate::context::Context;
+use crate::functions::AGGREGATE_FUNCTIONS;
 use crate::schema::DataType;
 use std::fmt;
 
@@ -110,19 +111,13 @@ impl Expr {
     pub fn has_unordered_limit(&self) -> bool {
         match self {
             Expr::Subquery(s) => s.has_unordered_limit(),
-            Expr::InSubquery(i) => {
-                i.expr.has_unordered_limit() || i.subquery.has_unordered_limit()
-            }
+            Expr::InSubquery(i) => i.expr.has_unordered_limit() || i.subquery.has_unordered_limit(),
             Expr::Exists(e) => e.subquery.has_unordered_limit(),
-            Expr::BinaryOp(b) => {
-                b.left.has_unordered_limit() || b.right.has_unordered_limit()
-            }
+            Expr::BinaryOp(b) => b.left.has_unordered_limit() || b.right.has_unordered_limit(),
             Expr::UnaryOp(u) => u.operand.has_unordered_limit(),
             Expr::FunctionCall(fc) => fc.args.iter().any(|a| a.has_unordered_limit()),
             Expr::Case(c) => {
-                c.operand
-                    .as_ref()
-                    .is_some_and(|o| o.has_unordered_limit())
+                c.operand.as_ref().is_some_and(|o| o.has_unordered_limit())
                     || c.when_clauses
                         .iter()
                         .any(|(w, t)| w.has_unordered_limit() || t.has_unordered_limit())
@@ -137,12 +132,90 @@ impl Expr {
                     || b.high.has_unordered_limit()
             }
             Expr::InList(i) => {
-                i.expr.has_unordered_limit()
-                    || i.list.iter().any(|e| e.has_unordered_limit())
+                i.expr.has_unordered_limit() || i.list.iter().any(|e| e.has_unordered_limit())
             }
             Expr::IsNull(i) => i.expr.has_unordered_limit(),
             Expr::Parenthesized(e) => e.has_unordered_limit(),
             Expr::ColumnRef(_) | Expr::Literal(_) => false,
+        }
+    }
+}
+
+impl Expr {
+    /// Returns true if this expression contains an aggregate function call
+    /// (COUNT, SUM, AVG, TOTAL, GROUP_CONCAT, MIN, MAX) at any nesting level,
+    /// excluding independent subqueries (which have their own scope).
+    pub fn contains_aggregate(&self) -> bool {
+        match self {
+            Expr::FunctionCall(fc) => {
+                let upper = fc.name.to_uppercase();
+                if AGGREGATE_FUNCTIONS
+                    .iter()
+                    .any(|func| func.name == upper.as_str())
+                {
+                    return true;
+                }
+                fc.args.iter().any(|a| a.contains_aggregate())
+            }
+            Expr::BinaryOp(b) => b.left.contains_aggregate() || b.right.contains_aggregate(),
+            Expr::UnaryOp(u) => u.operand.contains_aggregate(),
+            Expr::Cast(c) => c.expr.contains_aggregate(),
+            Expr::Between(b) => {
+                b.expr.contains_aggregate()
+                    || b.low.contains_aggregate()
+                    || b.high.contains_aggregate()
+            }
+            Expr::InList(i) => {
+                i.expr.contains_aggregate() || i.list.iter().any(|e| e.contains_aggregate())
+            }
+            Expr::IsNull(i) => i.expr.contains_aggregate(),
+            Expr::Parenthesized(e) => e.contains_aggregate(),
+            Expr::Case(c) => {
+                c.operand.as_ref().is_some_and(|o| o.contains_aggregate())
+                    || c.when_clauses
+                        .iter()
+                        .any(|(w, t)| w.contains_aggregate() || t.contains_aggregate())
+                    || c.else_clause
+                        .as_ref()
+                        .is_some_and(|e| e.contains_aggregate())
+            }
+            // Subqueries have their own scope — aggregates inside them don't
+            // affect the outer query's aggregate/non-aggregate classification.
+            Expr::Subquery(_) | Expr::InSubquery(_) | Expr::Exists(_) => false,
+            Expr::ColumnRef(_) | Expr::Literal(_) => false,
+        }
+    }
+
+    /// Returns true if this expression references a column (at any depth,
+    /// excluding independent subqueries).
+    pub fn contains_column_ref(&self) -> bool {
+        match self {
+            Expr::ColumnRef(_) => true,
+            Expr::FunctionCall(fc) => fc.args.iter().any(|a| a.contains_column_ref()),
+            Expr::BinaryOp(b) => b.left.contains_column_ref() || b.right.contains_column_ref(),
+            Expr::UnaryOp(u) => u.operand.contains_column_ref(),
+            Expr::Cast(c) => c.expr.contains_column_ref(),
+            Expr::Between(b) => {
+                b.expr.contains_column_ref()
+                    || b.low.contains_column_ref()
+                    || b.high.contains_column_ref()
+            }
+            Expr::InList(i) => {
+                i.expr.contains_column_ref() || i.list.iter().any(|e| e.contains_column_ref())
+            }
+            Expr::IsNull(i) => i.expr.contains_column_ref(),
+            Expr::Parenthesized(e) => e.contains_column_ref(),
+            Expr::Case(c) => {
+                c.operand.as_ref().is_some_and(|o| o.contains_column_ref())
+                    || c.when_clauses
+                        .iter()
+                        .any(|(w, t)| w.contains_column_ref() || t.contains_column_ref())
+                    || c.else_clause
+                        .as_ref()
+                        .is_some_and(|e| e.contains_column_ref())
+            }
+            Expr::Subquery(_) | Expr::InSubquery(_) | Expr::Exists(_) => false,
+            Expr::Literal(_) => false,
         }
     }
 }
