@@ -193,7 +193,13 @@ fn prepare_window_subquery(
         original_idx: 0,
         is_outer: false,
     }];
-    let new_table_references = TableReferences::new(vec![], vec![]);
+    // Preserve outer_query_refs so that the outer plan retains knowledge of
+    // correlated references to ancestor queries. Without this, the planner
+    // would incorrectly classify correlated WHERE conditions (e.g. EXISTS
+    // with a window function referencing an outer column) as evaluable before
+    // the main loop, producing wrong results.
+    let outer_refs = outer_plan.table_references.outer_query_refs().to_vec();
+    let new_table_references = TableReferences::new(vec![], outer_refs);
 
     let mut inner_plan = SelectPlan {
         join_order: mem::replace(&mut outer_plan.join_order, new_join_order),
