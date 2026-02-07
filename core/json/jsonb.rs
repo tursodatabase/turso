@@ -980,9 +980,17 @@ impl Jsonb {
         }
 
         let (header, header_offset) = self.read_header(start)?;
-        let payload_start = start + header_offset;
+        let payload_start = start.checked_add(header_offset).ok_or_else(|| {
+            LimboError::ParseError(
+                "Position overflow in validate_element (payload_start)".to_string(),
+            )
+        })?;
         let payload_size = header.payload_size();
-        let payload_end = payload_start + payload_size;
+        let payload_end = payload_start.checked_add(payload_size).ok_or_else(|| {
+            LimboError::ParseError(
+                "Position overflow in validate_element (payload_end)".to_string(),
+            )
+        })?;
 
         if payload_end != end {
             bail_parse_error!("Size mismatch");
@@ -1020,7 +1028,15 @@ impl Jsonb {
                         bail_parse_error!("Array element out of bounds");
                     }
                     let (elem_header, elem_header_size) = self.read_header(pos)?;
-                    let elem_end = pos + elem_header_size + elem_header.payload_size();
+                    let elem_end = pos
+                        .checked_add(elem_header_size)
+                        .and_then(|p| p.checked_add(elem_header.payload_size()))
+                        .ok_or_else(|| {
+                            LimboError::ParseError(
+                                "Position overflow in validate_element (array elem_end)"
+                                    .to_string(),
+                            )
+                        })?;
                     if elem_end > payload_end {
                         bail_parse_error!("Array element exceeds bounds");
                     }
@@ -1041,7 +1057,15 @@ impl Jsonb {
                         bail_parse_error!("Object key must be text");
                     }
 
-                    let elem_end = pos + elem_header_size + elem_header.payload_size();
+                    let elem_end = pos
+                        .checked_add(elem_header_size)
+                        .and_then(|p| p.checked_add(elem_header.payload_size()))
+                        .ok_or_else(|| {
+                            LimboError::ParseError(
+                                "Position overflow in validate_element (object elem_end)"
+                                    .to_string(),
+                            )
+                        })?;
                     if elem_end > payload_end {
                         bail_parse_error!("Object element exceeds bounds");
                     }
@@ -1135,7 +1159,11 @@ impl Jsonb {
         };
         while current_cursor < end_cursor {
             let (key_header, key_header_offset) = self.read_header(current_cursor)?;
-            current_cursor += key_header_offset;
+            current_cursor = current_cursor
+                .checked_add(key_header_offset)
+                .ok_or_else(|| {
+                    LimboError::ParseError("Position overflow in object serialization".to_string())
+                })?;
             let JsonbHeader(element_type, len) = key_header;
             if let JsonIndentation::Indentation(value) = indent {
                 for _ in 0..depth {
@@ -2972,7 +3000,12 @@ impl Jsonb {
 
     fn skip_element(&self, mut pos: usize) -> Result<usize> {
         let (header, skip_header) = self.read_header(pos)?;
-        pos += skip_header + header.1;
+        pos = pos
+            .checked_add(skip_header)
+            .and_then(|p| p.checked_add(header.1))
+            .ok_or_else(|| {
+                LimboError::ParseError("Position overflow in skip_element".to_string())
+            })?;
         Ok(pos)
     }
 
@@ -4514,5 +4547,45 @@ mod path_operations_tests {
 
         let updated_json = jsonb.to_string().unwrap();
         assert_eq!(updated_json, r#"{"name":"John","age":31,"surname":"Doe"}"#);
+    }
+
+    #[test]
+    fn test_overflow_protection_in_skip_element() {
+        // Regression test to check overflow panic in skip_element section
+        // malformed JSONB with extremely large payload size
+        let mut data = Vec::new();
+
+        // Header with size marker 15 (8-byte payload size) and element type OBJECT
+        data.push(0xF1); // 0xF = size marker 15, 0x1 = OBJECT
+
+        // add 8 bytes representing the usize::MAX as payload size (would cause overflow)
+        data.extend_from_slice(&usize::MAX.to_be_bytes());
+
+        let jsonb = Jsonb::new(0, Some(&data));
+
+        // This should return an error instead of panicking
+        let result = jsonb.skip_element(0);
+        assert!(result.is_err());
+
+        if let Err(e) = result {
+            let error_str = format!("{:?}", e);
+            assert!(error_str.contains("overflow") || error_str.contains("Overflow"));
+        }
+    }
+
+    #[test]
+    fn test_overflow_protection_in_validate_element() {
+        // Regression test for overflow panic in validate_element section
+        let mut data = Vec::new();
+
+        // same Header with large payload size
+        data.push(0xF1);
+        data.extend_from_slice(&usize::MAX.to_be_bytes());
+
+        let jsonb = Jsonb::new(0, Some(&data));
+
+        // should return an error rather than panicking
+        let result = jsonb.is_valid();
+        assert!(!result);
     }
 }
