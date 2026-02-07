@@ -1,6 +1,13 @@
 use crate::{error::Error, token::TokenType, Result};
 use turso_macros::match_ignore_ascii_case;
 
+/// Returns true if the given identifier (case-insensitive) is a SQL keyword.
+/// This is used to determine whether an identifier needs to be quoted when
+/// rendered back to SQL text.
+pub fn is_keyword(input: &[u8]) -> bool {
+    keyword_or_id_token(input) != TokenType::TK_ID
+}
+
 fn keyword_or_id_token(input: &[u8]) -> TokenType {
     match_ignore_ascii_case!(match input {
         b"ABORT" => TokenType::TK_ABORT,

@@ -1471,3 +1471,31 @@ test check_constraint_ddl_column_level_preserved {
 expect {
     CREATE TABLE t (a INTEGER CHECK (a > 0), b TEXT, c REAL CHECK (c > 0))
 }
+
+# Bug fix: RENAME COLUMN to SQL keyword should preserve quotes in CHECK DDL
+test check_constraint_rename_column_to_keyword_ddl {
+    CREATE TABLE t("value" INTEGER CHECK("value" > 0));
+    ALTER TABLE t RENAME COLUMN "value" TO "group";
+    SELECT sql FROM sqlite_master WHERE name = 't';
+}
+expect {
+    CREATE TABLE t ("group" INTEGER CHECK ("group" > 0))
+}
+
+test check_constraint_rename_column_to_keyword_still_works {
+    CREATE TABLE t("value" INTEGER CHECK("value" > 0));
+    ALTER TABLE t RENAME COLUMN "value" TO "group";
+    INSERT INTO t VALUES(1);
+    SELECT "group" FROM t;
+}
+expect {
+    1
+}
+
+test check_constraint_rename_column_to_keyword_violation {
+    CREATE TABLE t("value" INTEGER CHECK("value" > 0));
+    ALTER TABLE t RENAME COLUMN "value" TO "group";
+    INSERT INTO t VALUES(-1);
+}
+expect error {
+}
