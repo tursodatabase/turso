@@ -259,11 +259,20 @@ pub fn translate_alter_table(
                 walk_expr(
                     &check.expr,
                     &mut |e: &ast::Expr| -> crate::Result<WalkControl> {
-                        if let ast::Expr::Id(name) = e {
-                            if normalize_ident(name.as_str()) == normalize_ident(column_name) {
-                                references_column = true;
-                                return Ok(WalkControl::SkipChildren);
+                        match e {
+                            ast::Expr::Id(name) | ast::Expr::Name(name) => {
+                                if normalize_ident(name.as_str()) == normalize_ident(column_name) {
+                                    references_column = true;
+                                    return Ok(WalkControl::SkipChildren);
+                                }
                             }
+                            ast::Expr::Qualified(_, col) => {
+                                if normalize_ident(col.as_str()) == normalize_ident(column_name) {
+                                    references_column = true;
+                                    return Ok(WalkControl::SkipChildren);
+                                }
+                            }
+                            _ => {}
                         }
                         Ok(WalkControl::Continue)
                     },

@@ -1414,3 +1414,11 @@ test check_constraint_ipk_not_updated_but_referenced {
 expect {
     1|world
 }
+
+# Bug fix: DROP COLUMN with qualified CHECK reference should error
+test check_constraint_drop_column_qualified_ref {
+    CREATE TABLE t1(a INTEGER, b INTEGER, CHECK(t1.b > 0));
+    ALTER TABLE t1 DROP COLUMN b;
+}
+expect error {
+}
