@@ -8,6 +8,9 @@ test window-partition-by-duplicate-columns {
 expect {
     1.0
 }
+expect @js {
+    1
+}
 
 test window-partition-by-duplicate-columns-multi-row {
     CREATE TABLE t2 (a INTEGER, b INTEGER, c INTEGER);

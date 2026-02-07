@@ -722,8 +722,7 @@ fn emit_flush_buffer_if_new_partition(
                 .iter()
                 .find(|e| matches!(e, Expr::Column { column, .. } if *column == i))
                 .unwrap_or(&window.partition_by[i]);
-            let maybe_collation =
-                get_collseq_from_expr(expr, &plan.table_references)?;
+            let maybe_collation = get_collseq_from_expr(expr, &plan.table_references)?;
             c.collation = maybe_collation.unwrap_or_default();
         }
         program.emit_insn(Insn::Compare {
