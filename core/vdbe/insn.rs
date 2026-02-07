@@ -218,6 +218,8 @@ pub struct HashBuildData {
     pub payload_start_reg: Option<usize>,
     /// Number of payload columns to read
     pub num_payload: usize,
+    /// Whether to track which entries are matched (for FULL OUTER JOIN).
+    pub track_matched: bool,
 }
 
 /// Data for HashDistinct instruction (boxed to keep Insn small).
@@ -1449,6 +1451,33 @@ pub enum Insn {
         hash_table_id: usize,
     },
 
+    /// Mark the current hash table match entry as "matched" (for FULL OUTER JOIN).
+    HashMarkMatched {
+        hash_table_id: usize,
+    },
+
+    /// Begin scanning unmatched entries in the hash table (for FULL OUTER JOIN).
+    /// Writes the first unmatched entry's rowid to dest_reg and payload to payload_dest_reg.
+    /// If no unmatched entries exist, jumps to target_pc.
+    HashScanUnmatched {
+        hash_table_id: usize,
+        dest_reg: usize,
+        target_pc: BranchOffset,
+        payload_dest_reg: Option<usize>,
+        num_payload: usize,
+    },
+
+    /// Advance to the next unmatched entry in the hash table (for FULL OUTER JOIN).
+    /// If another unmatched entry is found, writes rowid to dest_reg and payload to payload_dest_reg.
+    /// If no more unmatched entries, jumps to target_pc.
+    HashNextUnmatched {
+        hash_table_id: usize,
+        dest_reg: usize,
+        target_pc: BranchOffset,
+        payload_dest_reg: Option<usize>,
+        num_payload: usize,
+    },
+
     /// VACUUM INTO - create a compacted copy of the database at the specified path.
     /// This copies all schema and data from the current database to a new file.
     VacuumInto {
@@ -1646,6 +1675,9 @@ impl InsnVariants {
             InsnVariants::HashNext => execute::op_hash_next,
             InsnVariants::HashClose => execute::op_hash_close,
             InsnVariants::HashClear => execute::op_hash_clear,
+            InsnVariants::HashMarkMatched => execute::op_hash_mark_matched,
+            InsnVariants::HashScanUnmatched => execute::op_hash_scan_unmatched,
+            InsnVariants::HashNextUnmatched => execute::op_hash_next_unmatched,
             InsnVariants::VacuumInto => execute::op_vacuum_into,
         }
     }
