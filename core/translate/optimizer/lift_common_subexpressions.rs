@@ -137,22 +137,34 @@ pub(crate) fn lift_common_subexpressions_from_binary_or_terms(
 
 /// Flatten an ast::Expr::Binary(lhs, OR, rhs) into a list of disjuncts.
 fn flatten_or_expr_owned(expr: Expr) -> Result<Vec<Expr>> {
-    let Expr::Binary(lhs, Operator::Or, rhs) = expr else {
-        return Ok(vec![expr]);
-    };
-    let mut flattened = flatten_or_expr_owned(*lhs)?;
-    flattened.extend(flatten_or_expr_owned(*rhs)?);
-    Ok(flattened)
+    let mut result = Vec::new();
+    let mut stack = vec![expr];
+    while let Some(e) = stack.pop() {
+        match e {
+            Expr::Binary(lhs, Operator::Or, rhs) => {
+                stack.push(*rhs);
+                stack.push(*lhs);
+            }
+            _ => result.push(e),
+        }
+    }
+    Ok(result)
 }
 
 /// Flatten an ast::Expr::Binary(lhs, AND, rhs) into a list of conjuncts.
 fn flatten_and_expr_owned(expr: Expr) -> Result<Vec<Expr>> {
-    let Expr::Binary(lhs, Operator::And, rhs) = expr else {
-        return Ok(vec![expr]);
-    };
-    let mut flattened = flatten_and_expr_owned(*lhs)?;
-    flattened.extend(flatten_and_expr_owned(*rhs)?);
-    Ok(flattened)
+    let mut result = Vec::new();
+    let mut stack = vec![expr];
+    while let Some(e) = stack.pop() {
+        match e {
+            Expr::Binary(lhs, Operator::And, rhs) => {
+                stack.push(*rhs);
+                stack.push(*lhs);
+            }
+            _ => result.push(e),
+        }
+    }
+    Ok(result)
 }
 
 /// Rebuild an ast::Expr::Binary(lhs, AND, rhs) for a list of conjuncts.
