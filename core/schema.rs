@@ -1791,6 +1791,19 @@ impl BTreeTable {
                 sql.push_str(&generated.to_string());
                 sql.push(')');
             }
+
+            // Add column-level CHECK constraints inline
+            for check_constraint in &self.check_constraints {
+                if check_constraint.column.as_deref() == Some(column_name) {
+                    sql.push(' ');
+                    if let Some(name) = &check_constraint.name {
+                        sql.push_str("CONSTRAINT ");
+                        sql.push_str(name);
+                        sql.push(' ');
+                    }
+                    sql.push_str(&check_constraint.sql);
+                }
+            }
         }
 
         let has_table_pk = !self.primary_key_columns.is_empty();
@@ -1851,8 +1864,11 @@ impl BTreeTable {
             }
         }
 
-        // Add table-level CHECK constraints
+        // Add table-level CHECK constraints (column-level ones were emitted inline above)
         for check_constraint in &self.check_constraints {
+            if check_constraint.column.is_some() {
+                continue;
+            }
             sql.push_str(", ");
             if let Some(name) = &check_constraint.name {
                 sql.push_str("CONSTRAINT ");

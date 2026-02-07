@@ -1461,3 +1461,13 @@ expect {
     5
     10
 }
+
+# Bug fix: Column-level CHECK should stay inline in DDL after ADD COLUMN
+test check_constraint_ddl_column_level_preserved {
+    CREATE TABLE t(a INTEGER CHECK(a > 0), b TEXT);
+    ALTER TABLE t ADD COLUMN c REAL CHECK(c > 0);
+    SELECT sql FROM sqlite_master WHERE name = 't';
+}
+expect {
+    CREATE TABLE t (a INTEGER CHECK (a > 0), b TEXT, c REAL CHECK (c > 0))
+}
