@@ -20,8 +20,8 @@ use super::main_loop::{
 };
 use super::order_by::{emit_order_by, init_order_by, SortMetadata};
 use super::plan::{
-    Distinctness, JoinOrderMember, Operation, Scan, SeekKeyComponent, SelectPlan, TableReferences,
-    UpdatePlan,
+    Distinctness, HashJoinType, JoinOrderMember, Operation, Scan, SeekKeyComponent, SelectPlan,
+    TableReferences, UpdatePlan,
 };
 use super::select::emit_simple_count;
 use super::subquery::emit_from_clause_subqueries;
@@ -241,6 +241,13 @@ pub struct HashCtx {
     /// These references may point at multiple tables when a build input was
     /// materialized from a join prefix.
     pub payload_columns: Vec<MaterializedColumnRef>,
+    /// For outer hash joins: label where HashProbe miss / HashNext exhaustion jump to
+    /// for the IfPos check_outer logic. None for inner hash joins.
+    pub check_outer_label: Option<BranchOffset>,
+    /// The cursor ID for the build table (needed for NullRow in outer hash joins).
+    pub build_cursor_id: Option<CursorID>,
+    /// The join type of this hash join.
+    pub join_type: HashJoinType,
 }
 
 /// The TranslateCtx struct holds various information and labels used during bytecode generation.
@@ -1288,6 +1295,7 @@ pub fn emit_query<'a>(
         &plan.table_references,
         &plan.join_order,
         OperationMode::SELECT,
+        Some(plan),
     )?;
 
     program.preassign_label_to_next_insn(after_main_loop_label);
@@ -1515,6 +1523,7 @@ fn emit_program_for_delete(
             &plan.table_references,
             &join_order,
             OperationMode::DELETE,
+            None,
         )?;
     }
     program.preassign_label_to_next_insn(after_main_loop_label);
@@ -2389,6 +2398,7 @@ fn emit_program_for_update(
         &plan.table_references,
         &join_order,
         mode,
+        None,
     )?;
 
     program.preassign_label_to_next_insn(after_main_loop_label);

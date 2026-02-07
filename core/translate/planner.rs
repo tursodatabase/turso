@@ -1485,12 +1485,12 @@ fn parse_join(
             let is_full = (is_left && is_right) || (is_outer && !is_left && !is_right);
 
             if is_right && !is_left && !is_full {
-                // RIGHT JOIN → swap last two table entries, treat as LEFT JOIN.
+                // RIGHT JOIN -> swap last two table entries, treat as LEFT JOIN.
                 // The rightmost table (just added) becomes the left side, and vice versa.
                 let len = table_references.joined_tables().len();
                 table_references.joined_tables_mut().swap(len - 2, len - 1);
                 // The outer flag goes on the table that was originally on the left
-                // (now in the rightmost position after swap) — this is correct because
+                // (now in the rightmost position after swap), this is correct because
                 // JoinInfo.outer marks the table whose columns become NULL on miss.
                 (true, is_natural, false)
             } else if is_full {
