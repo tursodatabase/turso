@@ -29,8 +29,8 @@ use crate::{
             order::plan_satisfies_order_target,
         },
         plan::{
-            HashJoinKey, JoinOrderMember, JoinedTable, NonFromClauseSubquery, TableReferences,
-            WhereTerm,
+            HashJoinKey, HashJoinType, JoinOrderMember, JoinedTable, NonFromClauseSubquery,
+            TableReferences, WhereTerm,
         },
         planner::TableMask,
     },
@@ -689,7 +689,17 @@ pub fn join_lhs_and_rhs<'a>(
                             );
                         }
                     }
-                    if hash_join_allowed && hash_join_method.cost < best_access_method.cost {
+                    // FULL OUTER JOIN requires hash join for unmatched build scanning
+                    let is_full_outer = matches!(
+                        &hash_join_method.params,
+                        AccessMethodParams::HashJoin {
+                            join_type: HashJoinType::FullOuter,
+                            ..
+                        }
+                    );
+                    if hash_join_allowed
+                        && (is_full_outer || hash_join_method.cost < best_access_method.cost)
+                    {
                         best_access_method = hash_join_method;
                     }
                 }
@@ -2032,6 +2042,7 @@ mod tests {
                 t2,
                 Some(JoinInfo {
                     outer: false,
+                    full_outer: false,
                     using: vec![],
                 }),
                 table_id_counter.next(),
@@ -2155,6 +2166,7 @@ mod tests {
                 table_customers,
                 Some(JoinInfo {
                     outer: false,
+                    full_outer: false,
                     using: vec![],
                 }),
                 table_id_counter.next(),
@@ -2163,6 +2175,7 @@ mod tests {
                 table_order_items,
                 Some(JoinInfo {
                     outer: false,
+                    full_outer: false,
                     using: vec![],
                 }),
                 table_id_counter.next(),
@@ -2365,6 +2378,7 @@ mod tests {
                 t2,
                 Some(JoinInfo {
                     outer: false,
+                    full_outer: false,
                     using: vec![],
                 }),
                 table_id_counter.next(),
@@ -2373,6 +2387,7 @@ mod tests {
                 t3,
                 Some(JoinInfo {
                     outer: false,
+                    full_outer: false,
                     using: vec![],
                 }),
                 table_id_counter.next(),
@@ -2488,6 +2503,7 @@ mod tests {
                     t.clone(),
                     Some(JoinInfo {
                         outer: false,
+                        full_outer: false,
                         using: vec![],
                     }),
                     table_id_counter.next(),
@@ -2497,6 +2513,7 @@ mod tests {
                 fact_table,
                 Some(JoinInfo {
                     outer: false,
+                    full_outer: false,
                     using: vec![],
                 }),
                 table_id_counter.next(),
@@ -3225,6 +3242,7 @@ mod tests {
                 t2,
                 Some(JoinInfo {
                     outer: false,
+                    full_outer: false,
                     using: vec![],
                 }),
                 table_id_counter.next(),
