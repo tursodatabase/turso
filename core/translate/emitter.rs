@@ -120,7 +120,7 @@ impl<'a> Resolver<'a> {
             None => self
                 .symbol_table
                 .resolve_function(func_name, arg_count)
-                .map(|arg| Func::External(arg)),
+                .map(Func::External),
         }
     }
 
