@@ -1279,3 +1279,101 @@ test check_constraint_rename_column_qualified_ref_violation {
 }
 expect error {
 }
+
+# CHECK constraint should still work after ALTER TABLE RENAME TABLE
+test check_constraint_rename_table {
+    CREATE TABLE t(a INTEGER, CHECK(a > 0));
+    ALTER TABLE t RENAME TO t2;
+    INSERT INTO t2 VALUES(10);
+    SELECT * FROM t2;
+}
+expect {
+    10
+}
+
+test check_constraint_rename_table_violation {
+    CREATE TABLE t(a INTEGER, CHECK(a > 0));
+    ALTER TABLE t RENAME TO t2;
+    INSERT INTO t2 VALUES(-1);
+}
+expect error {
+}
+
+# BUG 2: Non-existent table-qualified column ref should error at CREATE TABLE time
+test check_constraint_nonexistent_qualified_column {
+    CREATE TABLE t(a INTEGER, CHECK(other.a > 0));
+}
+expect error {
+}
+
+# BUG 3: Non-existent column reference should error at CREATE TABLE time
+test check_constraint_nonexistent_column {
+    CREATE TABLE t(a INTEGER CHECK(b > 0));
+}
+expect error {
+}
+
+test check_constraint_nonexistent_column_table_level {
+    CREATE TABLE t(a INTEGER, CHECK(b > 0));
+}
+expect error {
+}
+
+# BUG 4a: Non-existent function in CHECK should error at CREATE TABLE time
+test check_constraint_nonexistent_function {
+    CREATE TABLE t(a INTEGER CHECK(nope(a) > 0));
+}
+expect error {
+}
+
+# BUG 4b: Aggregate function in CHECK should error at CREATE TABLE time
+test check_constraint_aggregate_function {
+    CREATE TABLE t(a INTEGER, CHECK(a > count(*)));
+}
+expect error {
+}
+
+test check_constraint_aggregate_function_sum {
+    CREATE TABLE t(a INTEGER, CHECK(sum(a) > 0));
+}
+expect error {
+}
+
+# BUG 4c: Bind parameter in CHECK should error at CREATE TABLE time
+test check_constraint_bind_parameter {
+    CREATE TABLE t(a INTEGER CHECK(a > ?));
+}
+expect error {
+}
+
+# BUG 4d: Subquery in CHECK should error at CREATE TABLE time
+test check_constraint_subquery {
+    CREATE TABLE t(a INTEGER CHECK(a IN (SELECT 1)));
+}
+expect error {
+}
+
+# Validate CHECK in ALTER TABLE ADD COLUMN too
+test check_constraint_alter_add_column_nonexistent_column {
+    CREATE TABLE t(a INTEGER);
+    ALTER TABLE t ADD COLUMN b INTEGER CHECK(c > 0);
+}
+expect error {
+}
+
+test check_constraint_alter_add_column_aggregate {
+    CREATE TABLE t(a INTEGER);
+    ALTER TABLE t ADD COLUMN b INTEGER CHECK(count(*) > 0);
+}
+expect error {
+}
+
+# Valid CHECK with functions should still work (sanity)
+test check_constraint_valid_function {
+    CREATE TABLE t(a TEXT CHECK(length(a) > 0));
+    INSERT INTO t VALUES('hello');
+    SELECT * FROM t;
+}
+expect {
+    hello
+}

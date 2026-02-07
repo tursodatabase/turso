@@ -20,9 +20,10 @@ use crate::types::{
     ImmutableRecord, IndexInfo, SeekResult, Text,
 };
 use crate::util::{
-    normalize_ident, rewrite_check_expr_column_refs, rewrite_column_references_if_needed,
-    rewrite_fk_parent_cols_if_self_ref, rewrite_fk_parent_table_if_needed,
-    rewrite_inline_col_fk_target_if_needed, trim_ascii_whitespace,
+    normalize_ident, rewrite_check_expr_column_refs, rewrite_check_expr_table_refs,
+    rewrite_column_references_if_needed, rewrite_fk_parent_cols_if_self_ref,
+    rewrite_fk_parent_table_if_needed, rewrite_inline_col_fk_target_if_needed,
+    trim_ascii_whitespace,
 };
 use crate::vdbe::affinity::{apply_numeric_affinity, try_for_float, Affinity, ParsedNumber};
 use crate::vdbe::hash_table::{HashEntry, HashTable, HashTableConfig, DEFAULT_MEM_BUDGET};
@@ -5850,6 +5851,34 @@ pub fn op_function(
                                     );
                                 }
 
+                                // Rewrite table-qualified refs in CHECK constraints
+                                if this_table == rename_from {
+                                    for c in &mut constraints {
+                                        if let ast::TableConstraint::Check(ref mut expr) =
+                                            c.constraint
+                                        {
+                                            rewrite_check_expr_table_refs(
+                                                expr,
+                                                &rename_from,
+                                                original_rename_to.as_str(),
+                                            );
+                                        }
+                                    }
+                                    for col in &mut columns {
+                                        for cc in &mut col.constraints {
+                                            if let ast::ColumnConstraint::Check(ref mut expr) =
+                                                cc.constraint
+                                            {
+                                                rewrite_check_expr_table_refs(
+                                                    expr,
+                                                    &rename_from,
+                                                    original_rename_to.as_str(),
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+
                                 if this_table == rename_from {
                                     // Rebuild with new table identifier so SQL persists the new name.
                                     let new_stmt = ast::Stmt::CreateTable {
@@ -10167,6 +10196,16 @@ pub fn op_rename_table(
                     if normalize_ident(&fk.parent_table) == normalized_from {
                         fk.parent_table.clone_from(&normalized_to);
                     }
+                }
+
+                // Update table-qualified refs in CHECK constraint expressions
+                for check in &mut btree.check_constraints {
+                    rewrite_check_expr_table_refs(
+                        &mut check.expr,
+                        &normalized_from,
+                        &normalized_to,
+                    );
+                    check.sql = format!("CHECK({})", &check.expr);
                 }
 
                 normalized_to.clone_into(&mut btree.name);

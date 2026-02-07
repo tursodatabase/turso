@@ -1611,6 +1611,28 @@ pub fn rewrite_check_expr_column_refs(expr: &mut ast::Expr, from: &str, to: &str
     );
 }
 
+/// Rewrite table name references in a CHECK constraint expression.
+/// Replaces `Qualified(old_tbl, col)` with `Qualified(new_tbl, col)`.
+pub fn rewrite_check_expr_table_refs(expr: &mut ast::Expr, from: &str, to: &str) {
+    let from_normalized = normalize_ident(from);
+    // The closure is infallible, so walk_expr_mut cannot fail.
+    let _ = walk_expr_mut(
+        expr,
+        &mut |e: &mut ast::Expr| -> crate::Result<WalkControl> {
+            if let ast::Expr::Qualified(ref tbl, _) = *e {
+                if normalize_ident(tbl.as_str()) == from_normalized {
+                    let ast::Expr::Qualified(_, ref col) = *e else {
+                        unreachable!()
+                    };
+                    let col = col.clone();
+                    *e = ast::Expr::Qualified(ast::Name::exact(to.to_owned()), col);
+                }
+            }
+            Ok(WalkControl::Continue)
+        },
+    );
+}
+
 /// Update a column-level REFERENCES <tbl>(col,...) constraint
 pub fn rewrite_column_references_if_needed(
     col: &mut ast::ColumnDefinition,

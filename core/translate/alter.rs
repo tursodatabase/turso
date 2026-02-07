@@ -21,7 +21,10 @@ use crate::{
     LimboError, Result,
 };
 
-use super::{schema::SQLITE_TABLEID, update::translate_update_for_schema_change};
+use super::{
+    schema::{validate_check_expr, SQLITE_TABLEID},
+    update::translate_update_for_schema_change,
+};
 
 fn validate(alter_table: &ast::AlterTableBody, table_name: &str) -> Result<()> {
     // Check if someone is trying to ALTER a system table
@@ -499,6 +502,12 @@ pub fn translate_alter_table(
                         btree.foreign_keys.push(Arc::new(fk));
                     }
                     ast::ColumnConstraint::Check(expr) => {
+                        let column_names: Vec<&str> = btree
+                            .columns
+                            .iter()
+                            .filter_map(|c| c.name.as_deref())
+                            .collect();
+                        validate_check_expr(expr, &btree.name, &column_names, resolver)?;
                         btree.check_constraints.push(CheckConstraint::new(
                             constraint.name.as_ref(),
                             expr,
