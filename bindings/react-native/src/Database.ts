@@ -121,7 +121,7 @@ export class Database {
 
     const dbConfig = {
       path: this._opts.path,
-      async_io: true, // Always use async IO in React Native
+      async_io: false, // Always use async IO in React Native
     };
 
     // Create native database (path normalization happens in C++ JSI layer)
