@@ -1499,3 +1499,77 @@ test check_constraint_rename_column_to_keyword_violation {
 }
 expect error {
 }
+
+# Bug fix: ALTER TABLE ADD COLUMN with DEFAULT that violates CHECK should be rejected
+# when the table has existing rows (existing rows would get the DEFAULT value which
+# violates the CHECK constraint).
+test check_constraint_alter_add_column_default_violates_check {
+    CREATE TABLE t1(x INTEGER);
+    INSERT INTO t1 VALUES(1);
+    ALTER TABLE t1 ADD COLUMN y INTEGER DEFAULT -5 CHECK(y > 0);
+}
+expect error {
+}
+
+# Same scenario but with empty table should succeed (no existing rows to violate)
+test check_constraint_alter_add_column_default_violates_check_empty_table {
+    CREATE TABLE t1(x INTEGER);
+    ALTER TABLE t1 ADD COLUMN y INTEGER DEFAULT -5 CHECK(y > 0);
+    -- Table was empty, so ALTER succeeds. New inserts must still respect CHECK.
+    INSERT INTO t1 VALUES(1, 10);
+    SELECT * FROM t1;
+}
+expect {
+    1|10
+}
+
+# NULL default (no DEFAULT clause) should always pass CHECK, even with existing rows
+test check_constraint_alter_add_column_null_default_passes_check {
+    CREATE TABLE t1(x INTEGER);
+    INSERT INTO t1 VALUES(1);
+    ALTER TABLE t1 ADD COLUMN y INTEGER CHECK(y > 0);
+    SELECT x, y FROM t1;
+}
+expect {
+    1|
+}
+
+# DEFAULT value that satisfies CHECK should succeed even with existing rows
+test check_constraint_alter_add_column_default_satisfies_check {
+    CREATE TABLE t1(x INTEGER);
+    INSERT INTO t1 VALUES(1);
+    ALTER TABLE t1 ADD COLUMN y INTEGER DEFAULT 10 CHECK(y > 0);
+    SELECT x, y FROM t1;
+}
+expect {
+    1|10
+}
+
+# DEFAULT 0 violates CHECK(y > 0)
+test check_constraint_alter_add_column_default_zero_violates_check {
+    CREATE TABLE t1(x INTEGER);
+    INSERT INTO t1 VALUES(1);
+    ALTER TABLE t1 ADD COLUMN y INTEGER DEFAULT 0 CHECK(y > 0);
+}
+expect error {
+}
+
+# String DEFAULT that violates CHECK with IN clause
+test check_constraint_alter_add_column_default_string_violates_check {
+    CREATE TABLE t1(x INTEGER);
+    INSERT INTO t1 VALUES(1);
+    ALTER TABLE t1 ADD COLUMN status TEXT DEFAULT 'unknown' CHECK(status IN ('active', 'inactive'));
+}
+expect error {
+}
+
+# String DEFAULT that satisfies CHECK with IN clause
+test check_constraint_alter_add_column_default_string_satisfies_check {
+    CREATE TABLE t1(x INTEGER);
+    INSERT INTO t1 VALUES(1);
+    ALTER TABLE t1 ADD COLUMN status TEXT DEFAULT 'active' CHECK(status IN ('active', 'inactive'));
+    SELECT x, status FROM t1;
+}
+expect {
+    1|active
+}
