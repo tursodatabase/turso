@@ -3049,6 +3049,7 @@ fn emit_replace_delete_conflicting_row(
                 &table.columns,
                 main_cursor_id,
                 ctx.conflict_rowid_reg,
+                table.is_strict,
             ))
         } else {
             None

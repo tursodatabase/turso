@@ -867,6 +867,7 @@ pub fn translate_drop_table(
                 &schema_table.columns,
                 sqlite_schema_cursor_id_0,
                 row_id_reg,
+                schema_table.is_strict,
             ))
         } else {
             None
