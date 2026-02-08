@@ -958,6 +958,7 @@ pub fn emit_upsert(
                     table.columns(),
                     ctx.cursor_id,
                     ctx.conflict_rowid_reg,
+                    table.btree().is_some_and(|btree| btree.is_strict),
                 ))
             } else {
                 None
@@ -1011,6 +1012,7 @@ pub fn emit_upsert(
                     table.columns(),
                     ctx.cursor_id,
                     ctx.conflict_rowid_reg,
+                    table.btree().is_some_and(|btree| btree.is_strict),
                 ))
             } else {
                 None
