@@ -1488,7 +1488,7 @@ mod tests {
         );
         for (i, (lhs, rhs)) in inputs.iter().enumerate() {
             assert_eq!(
-                lhs.exec_add(rhs).into(),
+                Value::from(lhs.exec_add(rhs)),
                 outputs[i],
                 "Wrong ADD for lhs: {lhs}, rhs: {rhs}"
             );
@@ -1544,7 +1544,7 @@ mod tests {
         );
         for (i, (lhs, rhs)) in inputs.iter().enumerate() {
             assert_eq!(
-                lhs.exec_subtract(rhs),
+                Value::from(lhs.exec_subtract(rhs)),
                 outputs[i],
                 "Wrong subtract for lhs: {lhs}, rhs: {rhs}"
             );
@@ -1600,7 +1600,7 @@ mod tests {
         );
         for (i, (lhs, rhs)) in inputs.iter().enumerate() {
             assert_eq!(
-                lhs.exec_multiply(rhs),
+                Value::from(lhs.exec_multiply(rhs)),
                 outputs[i],
                 "Wrong multiply for lhs: {lhs}, rhs: {rhs}"
             );
@@ -1644,7 +1644,7 @@ mod tests {
         );
         for (i, (lhs, rhs)) in inputs.iter().enumerate() {
             assert_eq!(
-                lhs.exec_divide(rhs),
+                Value::from(lhs.exec_divide(rhs)),
                 outputs[i],
                 "Wrong divide for lhs: {lhs}, rhs: {rhs}"
             );
@@ -1710,7 +1710,7 @@ mod tests {
 
         for (i, (lhs, rhs)) in inputs.iter().enumerate() {
             assert_eq!(
-                lhs.exec_remainder(rhs),
+                Value::from(lhs.exec_remainder(rhs)),
                 outputs[i],
                 "Wrong remainder for lhs: {lhs}, rhs: {rhs}"
             );

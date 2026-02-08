@@ -239,7 +239,7 @@ impl SimValue {
         let not_null = !self.is_null() && !other.is_null();
         match operator {
             ast::Operator::Add => turso_core::Value::from(self.0.exec_add(&other.0)).into(),
-            ast::Operator::And => turso_core::Value::from(self.0.exec_and(&other.0)).into(),
+            ast::Operator::And => self.0.exec_and(&other.0).into(),
             ast::Operator::ArrowRight => todo!(),
             ast::Operator::ArrowRightShift => todo!(),
             ast::Operator::BitwiseAnd => {

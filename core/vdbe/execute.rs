@@ -3861,7 +3861,7 @@ fn update_agg_payload(
                     ParsedNumber::Float(f) => f,
                     ParsedNumber::None => 0.0,
                 },
-                Value::Blob(b) => match std::str::from_utf8(&b) {
+                Value::Blob(b) => match std::str::from_utf8(b) {
                     Ok(s) => match try_for_float(s).1 {
                         ParsedNumber::Integer(i) => i as f64,
                         ParsedNumber::Float(f) => f,
@@ -3957,7 +3957,7 @@ fn update_agg_payload(
                     handle_text_sum(acc, &mut sum_state, parsed_number);
                 }
                 Value::Blob(b) => {
-                    if let Ok(s) = std::str::from_utf8(&b) {
+                    if let Ok(s) = std::str::from_utf8(b) {
                         let (_, parsed_number) = try_for_float(s);
                         handle_text_sum(acc, &mut sum_state, parsed_number);
                     } else {
@@ -3979,7 +3979,7 @@ fn update_agg_payload(
             }
             use std::cmp::Ordering;
             // Borrow payload[0] only for comparison, then drop before assignment
-            let cmp = compare_with_collation(&arg, &payload[0], Some(collation));
+            let cmp = compare_with_collation(arg, &payload[0], Some(collation));
             let should_update = match func {
                 AggFunc::Max => cmp == Ordering::Greater,
                 AggFunc::Min => cmp == Ordering::Less,
@@ -4000,7 +4000,7 @@ fn update_agg_payload(
                 *acc = Value::build_text(arg.to_string());
             } else {
                 acc.exec_group_concat(&delimiter);
-                acc.exec_group_concat(&arg);
+                acc.exec_group_concat(arg);
             }
         }
         AggFunc::External(_) => {
@@ -4016,7 +4016,7 @@ fn update_agg_payload(
                     "JsonGroupObject/JsonbGroupObject: no value provided".to_string(),
                 ));
             };
-            let mut key_vec = convert_dbtype_to_raw_jsonb(&arg)?;
+            let mut key_vec = convert_dbtype_to_raw_jsonb(arg)?;
             let mut val_vec = convert_dbtype_to_raw_jsonb(&value)?;
             let Value::Blob(vec) = &mut payload[0] else {
                 return Err(LimboError::InternalError(
@@ -4033,7 +4033,7 @@ fn update_agg_payload(
         #[cfg(feature = "json")]
         AggFunc::JsonGroupArray | AggFunc::JsonbGroupArray => {
             // arg = value
-            let mut data = convert_dbtype_to_raw_jsonb(&arg)?;
+            let mut data = convert_dbtype_to_raw_jsonb(arg)?;
             let Value::Blob(vec) = &mut payload[0] else {
                 return Err(LimboError::InternalError(
                     "JsonGroupArray: payload[0] is not a blob".to_string(),
@@ -12387,7 +12387,7 @@ mod tests {
         let mut payload = vec![Value::Integer(5)];
         update_agg_payload(
             &AggFunc::Count,
-            Value::Null,
+            &Value::Null,
             None,
             &mut payload,
             CollationSeq::Binary,
@@ -12401,7 +12401,7 @@ mod tests {
         let mut payload = vec![Value::Integer(5)];
         update_agg_payload(
             &AggFunc::Count,
-            Value::Integer(42),
+            &Value::Integer(42),
             None,
             &mut payload,
             CollationSeq::Binary,
@@ -12420,7 +12420,7 @@ mod tests {
         ];
         update_agg_payload(
             &AggFunc::Sum,
-            Value::Integer(10),
+            &Value::Integer(10),
             None,
             &mut payload,
             CollationSeq::Binary,
@@ -12430,7 +12430,7 @@ mod tests {
 
         update_agg_payload(
             &AggFunc::Sum,
-            Value::Integer(5),
+            &Value::Integer(5),
             None,
             &mut payload,
             CollationSeq::Binary,
@@ -12449,7 +12449,7 @@ mod tests {
         ];
         update_agg_payload(
             &AggFunc::Sum,
-            Value::Null,
+            &Value::Null,
             None,
             &mut payload,
             CollationSeq::Binary,
@@ -12464,7 +12464,7 @@ mod tests {
         // First value sets the min/max
         update_agg_payload(
             &AggFunc::Min,
-            Value::Integer(5),
+            &Value::Integer(5),
             None,
             &mut payload,
             CollationSeq::Binary,
@@ -12475,7 +12475,7 @@ mod tests {
         // Smaller value updates min
         update_agg_payload(
             &AggFunc::Min,
-            Value::Integer(3),
+            &Value::Integer(3),
             None,
             &mut payload,
             CollationSeq::Binary,
@@ -12486,7 +12486,7 @@ mod tests {
         // Larger value doesn't update min
         update_agg_payload(
             &AggFunc::Min,
-            Value::Integer(10),
+            &Value::Integer(10),
             None,
             &mut payload,
             CollationSeq::Binary,
@@ -12501,7 +12501,7 @@ mod tests {
         let mut payload = vec![Value::Float(0.0), Value::Float(0.0), Value::Integer(0)];
         update_agg_payload(
             &AggFunc::Avg,
-            Value::Integer(10),
+            &Value::Integer(10),
             None,
             &mut payload,
             CollationSeq::Binary,
@@ -12512,7 +12512,7 @@ mod tests {
 
         update_agg_payload(
             &AggFunc::Avg,
-            Value::Integer(20),
+            &Value::Integer(20),
             None,
             &mut payload,
             CollationSeq::Binary,
