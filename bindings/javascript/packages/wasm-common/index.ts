@@ -265,10 +265,13 @@ class OpfsDirectory {
 }
 
 let workerRequestId = 0;
-function waitForWorkerResponse(worker: Worker, id: number): Promise<any> {
+function waitForWorkerResponse(worker: Worker, id: number, timeoutMs: number = 30_000): Promise<any> {
     let waitResolve, waitReject;
+    let settled = false;
     const callback = msg => {
         if (msg.data.__turso__ && msg.data.id == id) {
+            settled = true;
+            clearTimeout(stallTimer);
             if (msg.data.error != null) {
                 waitReject(msg.data.error)
             } else {
@@ -278,6 +281,13 @@ function waitForWorkerResponse(worker: Worker, id: number): Promise<any> {
         }
     };
     const cleanup = () => worker.removeEventListener("message", callback);
+    const stallTimer = setTimeout(() => {
+        if (!settled) {
+            settled = true;
+            cleanup();
+            waitReject(new Error(`[turso:worker] request id=${id} timed out after ${timeoutMs}ms`));
+        }
+    }, timeoutMs);
 
     worker.addEventListener("message", callback);
     const result = new Promise((resolve, reject) => {
@@ -445,8 +455,32 @@ async function setupMainThread(wasmFile: ArrayBuffer, factory: () => Worker): Pr
             }
         },
     });
-    completeOpfs = __napiModule.exports.completeOpfs;
+    const nativeCompleteOpfs = __napiModule.exports.completeOpfs;
+    completeOpfs = (c, res) => {
+        nativeCompleteOpfs(c, res);
+        ioNotifier.notify();
+    };
     return __napiModule;
 }
 
-export { OpfsDirectory, workerImports, mainImports as MainDummyImports, waitForWorkerResponse, registerFileAtWorker, unregisterFileAtWorker, isWebWorker, setupWebWorker, setupMainThread }
+class IONotifier {
+    private waiters: Array<() => void> = [];
+
+    waitForCompletion(): Promise<void> {
+        return new Promise(resolve => {
+            this.waiters.push(resolve);
+        });
+    }
+
+    notify() {
+        const waiters = this.waiters;
+        this.waiters = [];
+        for (const resolve of waiters) {
+            resolve();
+        }
+    }
+}
+
+const ioNotifier = new IONotifier();
+
+export { OpfsDirectory, workerImports, mainImports as MainDummyImports, waitForWorkerResponse, registerFileAtWorker, unregisterFileAtWorker, isWebWorker, setupWebWorker, setupMainThread, ioNotifier }

@@ -1,4 +1,4 @@
-import { registerFileAtWorker, unregisterFileAtWorker } from "@tursodatabase/database-wasm-common"
+import { registerFileAtWorker, unregisterFileAtWorker, ioNotifier } from "@tursodatabase/database-wasm-common"
 import { DatabasePromise } from "@tursodatabase/database-common"
 import { ProtocolIo, run, DatabaseOpts, EncryptionOpts, RunOpts, DatabaseRowMutation, DatabaseRowStatement, DatabaseRowTransformResult, DatabaseStats, SyncEngineGuards, Runner, runner } from "@tursodatabase/sync-common";
 import { SyncEngine, SyncEngineProtocolVersion, initThreadPool, MainWorker, Database as NativeDatabase } from "./index-vite-dev-hack.js";
@@ -46,7 +46,10 @@ class Database extends DatabasePromise {
     #worker: Worker | null;
     constructor(opts: DatabaseOpts) {
         if (opts.url == null) {
-            super(new NativeDatabase(opts.path, { tracing: opts.tracing }) as any);
+            super(
+                new NativeDatabase(opts.path, { tracing: opts.tracing }) as any,
+                () => ioNotifier.waitForCompletion(),
+            );
             this.#engine = null;
             return;
         }
