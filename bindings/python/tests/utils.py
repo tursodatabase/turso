@@ -46,14 +46,25 @@ class TursoServer:
             # wait for server to be available
             deadline = time.time() + 30
             while time.time() < deadline:
+                rc = self._server.poll()
+                if rc is not None:
+                    stderr = self._server.stderr.read().decode(errors="replace")
+                    raise RuntimeError(
+                        f"sync server exited with code {rc} before accepting connections\nstderr: {stderr}"
+                    )
                 try:
                     requests.get(self._user_url, timeout=5)
                     break
                 except Exception:
                     time.sleep(0.1)
             else:
+                stderr = ""
+                if self._server.poll() is not None:
+                    stderr = self._server.stderr.read().decode(errors="replace")
                 self._server.kill()
-                raise TimeoutError("sync server did not become available within 30s")
+                raise TimeoutError(
+                    f"sync server did not become available within 30s\nstderr: {stderr}"
+                )
 
     def __enter__(self):
         return self
