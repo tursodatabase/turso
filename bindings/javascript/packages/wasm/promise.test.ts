@@ -1,9 +1,19 @@
-import { expect, test, afterAll } from 'vitest'
+import { expect, test, afterAll, beforeEach, afterEach } from 'vitest'
 import { connect, Database } from './promise-default.js'
 import { MainWorker } from './index-default.js'
 
+beforeEach((ctx) => {
+    console.log(`[test:start] ${ctx.task.name}`);
+})
+
+afterEach((ctx) => {
+    console.log(`[test:end] ${ctx.task.name} (${ctx.task.result?.state})`);
+})
+
 afterAll(() => {
+    console.log('[afterAll] terminating MainWorker');
     MainWorker?.terminate();
+    console.log('[afterAll] MainWorker terminated');
 })
 
 test('vector-test', async () => {
@@ -172,7 +182,7 @@ test('on-disk db', async () => {
     expect(stmt2.columns()).toEqual([{ name: "x", column: null, database: null, table: null, type: null }]);
     const rows2 = await stmt2.all([1]);
     expect(rows2).toEqual([{ x: 1 }, { x: 3 }]);
-    db2.close();
+    await db2.close();
 })
 
 // attach is not supported in browser for now

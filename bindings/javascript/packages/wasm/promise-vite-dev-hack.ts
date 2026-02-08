@@ -1,5 +1,5 @@
 import { DatabasePromise, DatabaseOpts, SqliteError, } from "@tursodatabase/database-common"
-import { registerFileAtWorker, unregisterFileAtWorker } from "@tursodatabase/database-wasm-common";
+import { registerFileAtWorker, unregisterFileAtWorker, ioNotifier } from "@tursodatabase/database-wasm-common";
 import { initThreadPool, MainWorker, Database as NativeDatabase } from "./index-vite-dev-hack.js";
 
 async function init(): Promise<Worker> {
@@ -13,7 +13,10 @@ async function init(): Promise<Worker> {
 class Database extends DatabasePromise {
     #worker: Worker | null;
     constructor(path: string, opts: DatabaseOpts = {}) {
-        super(new NativeDatabase(path, opts) as unknown as any)
+        super(
+            new NativeDatabase(path, opts) as unknown as any,
+            () => ioNotifier.waitForCompletion(),
+        )
     }
     /**
      * connect database and pre-open necessary files in the OPFS
