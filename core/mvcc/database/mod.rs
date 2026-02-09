@@ -740,7 +740,7 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
         };
         let sortable_key_index = Arc::new(SortableIndexKey {
             key: record.key.clone(),
-            metadata: index_info.clone(),
+            metadata: index_info,
         });
         let table_id = rowid.table_id;
         let index_rows = mvcc_store
