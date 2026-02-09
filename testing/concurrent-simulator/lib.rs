@@ -18,6 +18,7 @@ use turso_core::{
 };
 use turso_parser::ast::{ColumnConstraint, SortOrder};
 
+pub mod elle;
 mod io;
 mod operations;
 pub mod properties;
@@ -202,6 +203,8 @@ pub struct WhopperOpts {
     pub enable_mvcc: bool,
     /// Enable database encryption with random cipher.
     pub enable_encryption: bool,
+    /// Enable Elle consistency checking (creates Elle tables at init).
+    pub elle_enabled: bool,
     /// Workloads with weights: (weight, workload). Higher weight = more likely.
     pub workloads: Vec<(u32, Box<dyn Workload>)>,
     /// Properties to check
@@ -218,6 +221,7 @@ impl Default for WhopperOpts {
             keep_files: false,
             enable_mvcc: false,
             enable_encryption: false,
+            elle_enabled: false,
             workloads: vec![],
             properties: vec![],
         }
@@ -285,6 +289,11 @@ impl WhopperOpts {
         self
     }
 
+    pub fn with_elle_enabled(mut self, enable: bool) -> Self {
+        self.elle_enabled = enable;
+        self
+    }
+
     pub fn with_workloads(mut self, workloads: Vec<(u32, Box<dyn Workload>)>) -> Self {
         self.workloads = workloads;
         self
@@ -338,6 +347,8 @@ pub struct SimulatorState {
     pub simple_tables: MergableMap<String, ()>,
     /// Sample of inserted keys per table for use in selects
     pub simple_tables_keys: HashMap<String, SamplesContainer<String>>,
+    /// Elle tables for consistency checking
+    pub elle_tables: MergableMap<String, ()>,
     /// Counter for generating unique execution IDs
     pub execution_id: u64,
     /// Counter for generating unique transaction IDs
@@ -359,6 +370,7 @@ impl SimulatorState {
             indexes: index_map,
             simple_tables: MergableMap::new(),
             simple_tables_keys: HashMap::new(),
+            elle_tables: MergableMap::new(),
             execution_id: 0,
             txn_id: 0,
         }
@@ -385,7 +397,7 @@ struct SimulatorContext {
 /// The Whopper deterministic simulator.
 pub struct Whopper {
     context: SimulatorContext,
-    io: Arc<dyn IO>,
+    io: Arc<SimulatorIO>,
     file_sizes: Arc<std::sync::Mutex<HashMap<String, u64>>>,
     db_path: String,
     wal_path: String,
@@ -419,9 +431,8 @@ impl Whopper {
             cosmic_ray_probability: opts.cosmic_ray_probability,
         };
 
-        let simulator_io = Arc::new(SimulatorIO::new(opts.keep_files, io_rng, fault_config));
-        let file_sizes = simulator_io.file_sizes();
-        let io = simulator_io as Arc<dyn IO>;
+        let io = Arc::new(SimulatorIO::new(opts.keep_files, io_rng, fault_config));
+        let file_sizes = io.file_sizes();
 
         let db_path = format!("whopper-{}-{}.db", seed, std::process::id());
         let wal_path = format!("{db_path}-wal");
@@ -476,6 +487,18 @@ impl Whopper {
             bootstrap_conn.execute(&sql)?;
         }
 
+        // Create Elle table if Elle mode is enabled
+        let mut elle_tables = Vec::new();
+        if opts.elle_enabled {
+            let table_name = "elle_lists".to_string();
+            let sql = format!(
+                "CREATE TABLE IF NOT EXISTS {table_name} (key TEXT PRIMARY KEY, vals TEXT DEFAULT '')"
+            );
+            debug!("{}", sql);
+            bootstrap_conn.execute(&sql)?;
+            elle_tables.push(table_name);
+        }
+
         bootstrap_conn.close()?;
 
         let indexes_vec: Vec<(String, String)> = indexes
@@ -483,9 +506,14 @@ impl Whopper {
             .map(|idx| (idx.table_name.clone(), idx.index_name.clone()))
             .collect();
 
+        let mut state = SimulatorState::new(tables, indexes_vec);
+        for table_name in elle_tables {
+            state.elle_tables.insert(table_name, ());
+        }
+
         let context = SimulatorContext {
             fibers: vec![],
-            state: SimulatorState::new(tables, indexes_vec),
+            state,
             enable_mvcc: opts.enable_mvcc,
         };
 
@@ -757,8 +785,15 @@ impl Whopper {
             if let Operation::Begin { .. } = &op {
                 self.context.fibers[fiber_idx].txn_id = Some(ctx.sim_state.gen_txn_id());
             }
+            let txn_id = self.context.fibers[fiber_idx].txn_id;
             self.context.fibers[fiber_idx].execution_id = Some(exec_id);
-            self.context.fibers[fiber_idx].current_op = Some(op);
+            self.context.fibers[fiber_idx].current_op = Some(op.clone());
+
+            // Notify properties that operation is starting
+            for property in &self.properties {
+                let mut property = property.lock().unwrap();
+                property.init_op(self.current_step, fiber_idx, txn_id, exec_id, &op)?;
+            }
         }
 
         Ok(())
@@ -772,6 +807,26 @@ impl Whopper {
                 StepResult::WalSizeLimitExceeded => break,
             }
         }
+        self.finalize_properties()?;
+        Ok(())
+    }
+
+    /// Finalize all properties (e.g., export Elle history).
+    pub fn finalize_properties(&self) -> anyhow::Result<()> {
+        for property in &self.properties {
+            let mut property = property.lock().unwrap();
+            property.finalize()?;
+        }
+        Ok(())
+    }
+
+    /// Dump database files to simulator-output directory.
+    pub fn dump_db_files(&self) -> anyhow::Result<()> {
+        let out_dir = std::path::PathBuf::from("simulator-output");
+        if !out_dir.exists() {
+            std::fs::create_dir_all(&out_dir)?;
+        }
+        self.io.dump_files(&out_dir)?;
         Ok(())
     }
 

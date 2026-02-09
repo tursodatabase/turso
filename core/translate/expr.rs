@@ -3774,7 +3774,7 @@ pub fn unwrap_parens_owned(expr: ast::Expr) -> Result<(ast::Expr, usize)> {
         ast::Expr::Parenthesized(mut exprs) => match exprs.len() {
             1 => {
                 paren_count += 1;
-                let (expr, count) = unwrap_parens_owned(*exprs.pop().unwrap().clone())?;
+                let (expr, count) = unwrap_parens_owned(*exprs.pop().unwrap())?;
                 paren_count += count;
                 Ok((expr, paren_count))
             }
@@ -5069,7 +5069,9 @@ pub fn expr_vector_size(expr: &Expr) -> Result<usize> {
         Expr::Parenthesized(exprs) => exprs.len(),
         Expr::Qualified(..) => 1,
         Expr::Raise(..) => crate::bail_parse_error!("RAISE is not supported"),
-        Expr::Subquery(_) => todo!(),
+        Expr::Subquery(_) => {
+            crate::bail_parse_error!("Scalar subquery is not supported in this context")
+        }
         Expr::Unary(unary_operator, expr) => {
             let evs_expr = expr_vector_size(expr)?;
             if evs_expr != 1 {

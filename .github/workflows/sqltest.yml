@@ -38,17 +38,10 @@ jobs:
       - uses: useblacksmith/rust-cache@v3
         with:
           prefix-key: "v1-rust"
-      - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
+      - uses: "./.github/shared/setup-sccache"
       - name: Build tursodb
-        env:
-          SCCACHE_GHA_ENABLED: "true"
-          RUSTC_WRAPPER: "sccache"
         run: make -C testing/runner build-tursodb
       - name: Build test runner
-        env:
-          SCCACHE_GHA_ENABLED: "true"
-          RUSTC_WRAPPER: "sccache"
         run: make -C testing/runner build-runner
       - name: Run tests
         run: make -C testing/runner run-cli
@@ -87,24 +80,17 @@ jobs:
         uses: useblacksmith/setup-node@v5
         with:
           node-version: 20
-      - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
+      - uses: "./.github/shared/setup-sccache"
       - name: Install JS dependencies
         run: yarn install
       - name: Build common package
         run: yarn workspace @tursodatabase/database-common build
       - name: Build native bindings
-        env:
-          SCCACHE_GHA_ENABLED: "true"
-          RUSTC_WRAPPER: "sccache"
         run: yarn workspace @tursodatabase/database napi-build --target x86_64-unknown-linux-gnu
       - name: Build TypeScript
         run: yarn workspace @tursodatabase/database tsc-build
       - name: Build test runner
         working-directory: testing/runner
-        env:
-          SCCACHE_GHA_ENABLED: "true"
-          RUSTC_WRAPPER: "sccache"
         run: cargo build --release
       - name: Run tests
         working-directory: testing/runner

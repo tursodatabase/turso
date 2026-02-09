@@ -361,7 +361,7 @@ fn update_pragma(
                         ast::CreateTableBody::ColumnsAndConstraints {
                             columns: turso_cdc_table_columns(),
                             constraints: vec![],
-                            options: ast::TableOptions::NONE,
+                            options: ast::TableOptions::empty(),
                         },
                         program,
                         &connection,

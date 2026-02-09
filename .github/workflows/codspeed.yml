@@ -35,8 +35,7 @@ jobs:
           prefix-key: "v1-rust-codspeed"
           cache-on-failure: true
 
-      - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
+      - uses: "./.github/shared/setup-sccache"
 
       - name: Install cargo-codspeed
         uses: taiki-e/install-action@v2
@@ -44,9 +43,6 @@ jobs:
           tool: cargo-codspeed
 
       - name: Build benchmarks (excluding TPC-H)
-        env:
-          SCCACHE_GHA_ENABLED: "true"
-          RUSTC_WRAPPER: "sccache"
         run: make codspeed-build-bench-exclude-tpc-h
 
       - name: Run benchmarks (excluding TPC-H)

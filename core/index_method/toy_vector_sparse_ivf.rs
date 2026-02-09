@@ -1335,7 +1335,7 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                                 "current must be present in Read state".to_string(),
                             ));
                         };
-                        current.sort();
+                        current.sort_unstable();
 
                         self.search_state = VectorSparseInvertedIndexSearchState::EvaluateSeek {
                             sum: *sum,
@@ -1390,7 +1390,7 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                                 "current must be present in Next state".to_string(),
                             ));
                         };
-                        current.sort();
+                        current.sort_unstable();
 
                         self.search_state = VectorSparseInvertedIndexSearchState::EvaluateSeek {
                             sum: *sum,

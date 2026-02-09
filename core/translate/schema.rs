@@ -29,11 +29,10 @@ fn validate(body: &ast::CreateTableBody, connection: &Connection) -> Result<()> 
         options, columns, ..
     } = &body
     {
-        if options.contains(ast::TableOptions::WITHOUT_ROWID) {
+        if options.contains_without_rowid() {
             bail_parse_error!("WITHOUT ROWID tables are not supported");
         }
-        if options.contains(ast::TableOptions::STRICT) && !connection.experimental_strict_enabled()
-        {
+        if options.contains_strict() && !connection.experimental_strict_enabled() {
             bail_parse_error!(
                 "STRICT tables are an experimental feature. Enable them with --experimental-strict flag"
             );
@@ -166,7 +165,7 @@ pub fn translate_create_table(
 
     let schema_master_table = resolver.schema.get_btree_table(SQLITE_TABLEID).unwrap();
     let sqlite_schema_cursor_id =
-        program.alloc_cursor_id(CursorType::BTreeTable(schema_master_table.clone()));
+        program.alloc_cursor_id(CursorType::BTreeTable(schema_master_table));
     program.emit_insn(Insn::OpenWrite {
         cursor_id: sqlite_schema_cursor_id,
         root_page: 1i64.into(),
@@ -204,7 +203,7 @@ pub fn translate_create_table(
         false
     };
 
-    let sql = create_table_body_to_str(&tbl_name, &body);
+    let sql = create_table_body_to_str(&tbl_name, &body)?;
 
     let parse_schema_label = program.allocate_label();
     // TODO: ReadCookie
@@ -255,7 +254,7 @@ pub fn translate_create_table(
     }
 
     let table = resolver.schema.get_btree_table(SQLITE_TABLEID).unwrap();
-    let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
+    let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table));
     program.emit_insn(Insn::OpenWrite {
         cursor_id: sqlite_schema_cursor_id,
         root_page: 1i64.into(),
@@ -472,7 +471,10 @@ fn collect_autoindexes(
     }
 }
 
-fn create_table_body_to_str(tbl_name: &ast::QualifiedName, body: &ast::CreateTableBody) -> String {
+fn create_table_body_to_str(
+    tbl_name: &ast::QualifiedName,
+    body: &ast::CreateTableBody,
+) -> crate::Result<String> {
     let mut sql = String::new();
     sql.push_str(format!("CREATE TABLE {} {}", tbl_name.name.as_ident(), body).as_str());
     match body {
@@ -481,9 +483,11 @@ fn create_table_body_to_str(tbl_name: &ast::QualifiedName, body: &ast::CreateTab
             constraints: _,
             options: _,
         } => {}
-        ast::CreateTableBody::AsSelect(_select) => todo!("as select not yet supported"),
+        ast::CreateTableBody::AsSelect(_select) => {
+            crate::bail_parse_error!("CREATE TABLE AS SELECT is not supported")
+        }
     }
-    sql
+    Ok(sql)
 }
 
 fn create_vtable_body_to_str(vtab: &ast::CreateVirtualTable, module: Arc<VTabImpl>) -> String {
@@ -592,7 +596,7 @@ pub fn translate_create_virtual_table(
         args_reg,
     });
     let table = resolver.schema.get_btree_table(SQLITE_TABLEID).unwrap();
-    let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
+    let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table));
     program.emit_insn(Insn::OpenWrite {
         cursor_id: sqlite_schema_cursor_id,
         root_page: 1i64.into(),
@@ -681,8 +685,7 @@ pub fn translate_drop_table(
     let null_reg = program.alloc_register(); //  r1
     program.emit_null(null_reg, None);
     let table_name_and_root_page_register = program.alloc_register(); //  r2, this register is special because it's first used to track table name and then moved root page
-    let table_reg =
-        program.emit_string8_new_reg(normalize_ident(tbl_name.name.as_str()).to_string()); //  r3
+    let table_reg = program.emit_string8_new_reg(normalize_ident(tbl_name.name.as_str())); //  r3
     program.mark_last_insn_constant();
     let _table_type = program.emit_string8_new_reg("trigger".to_string()); //  r4
     program.mark_last_insn_constant();
@@ -956,7 +959,7 @@ pub fn translate_drop_table(
         program.emit_column_or_rowid(sqlite_schema_cursor_id_1, 0, schema_column_0_register);
         program.emit_column_or_rowid(sqlite_schema_cursor_id_1, 1, schema_column_1_register);
         program.emit_column_or_rowid(sqlite_schema_cursor_id_1, 2, schema_column_2_register);
-        let root_page = table.get_root_page();
+        let root_page = table.get_root_page()?;
         program.emit_insn(Insn::Integer {
             value: root_page,
             dest: moved_to_root_page_register,

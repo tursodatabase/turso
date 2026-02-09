@@ -172,7 +172,7 @@ impl VirtualTable {
                 Ok(VirtualTableCursor::Pragma(Box::new(table.open(conn)?)))
             }
             VirtualTableType::External(table) => Ok(VirtualTableCursor::External(
-                table.open(conn.clone(), self.vtab_id)?,
+                table.open(conn, self.vtab_id)?,
             )),
             VirtualTableType::Internal(table) => {
                 Ok(VirtualTableCursor::Internal(table.read().open(conn)?))

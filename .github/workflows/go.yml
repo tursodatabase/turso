@@ -51,8 +51,7 @@ jobs:
         with:
           prefix-key: "v1-rust"
           cache-on-failure: true
-      - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
+      - uses: "./.github/shared/setup-sccache"
 
       - name: Setup Go
         uses: actions/setup-go@v5
@@ -62,9 +61,6 @@ jobs:
           cache-dependency-path: bindings/go/go.sum
 
       - name: Build Rust (debug)
-        env:
-          SCCACHE_GHA_ENABLED: "true"
-          RUSTC_WRAPPER: "sccache"
         run: cargo build --verbose --locked
 
       # Linux: use LD_LIBRARY_PATH to point to Rust target dir

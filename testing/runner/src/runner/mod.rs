@@ -38,6 +38,8 @@ pub struct RunOptions {
     pub backend_capabilities: HashSet<Capability>,
     /// Backend type (used by tests)
     pub backend_type: Backend,
+    /// Whether this is the sqlite CLI backend
+    pub backend_is_sqlite: bool,
     /// Snapshot update mode (used by snapshots)
     pub snapshot_update_mode: SnapshotUpdateMode,
 }
@@ -263,6 +265,7 @@ async fn run_single<B: SqlBackend, R: Runnable>(
             let should_skip = match &skip.condition {
                 None => true, // Unconditional skip
                 Some(SkipCondition::Mvcc) => options.mvcc,
+                Some(SkipCondition::Sqlite) => options.backend_is_sqlite,
             };
             if should_skip {
                 return TestResult {
@@ -745,6 +748,7 @@ impl<B: SqlBackend + 'static> TestRunner<B> {
                     global_requires: test_file.global_requires.clone(),
                     backend_capabilities: backend_capabilities.clone(),
                     backend_type,
+                    backend_is_sqlite: self.backend.is_sqlite(),
                     // Tests don't use snapshots, but we still need the field
                     snapshot_update_mode: SnapshotUpdateMode::No,
                 };
@@ -814,6 +818,7 @@ impl<B: SqlBackend + 'static> TestRunner<B> {
                     global_requires: test_file.global_requires.clone(),
                     backend_capabilities: backend_capabilities.clone(),
                     backend_type,
+                    backend_is_sqlite: self.backend.is_sqlite(),
                     snapshot_update_mode: self.config.snapshot_update_mode,
                 };
 

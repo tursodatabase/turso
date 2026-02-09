@@ -1007,7 +1007,7 @@ impl DbspCompiler {
                     // Now add the expression as a computed column
                     let temp_column_name = "__temp_filter_expr";
                     let computed_expr = Self::extract_expression_from_predicate(&filter.predicate)?;
-                    projection_exprs.push(computed_expr.clone());
+                    projection_exprs.push(computed_expr);
 
                     // Compile the projection expressions
                     let mut compiled_exprs = Vec::new();
@@ -1035,7 +1035,7 @@ impl DbspCompiler {
                         Box::new(ProjectOperator::from_compiled(
                             compiled_exprs.clone(),
                             aliases.clone(),
-                            input_column_names.clone(),
+                            input_column_names,
                             output_names.clone()
                         )?);
 
@@ -1285,7 +1285,7 @@ impl DbspCompiler {
                     operator_id,
                     group_by_indices.clone(),
                     aggregate_functions.clone(),
-                    input_column_names.clone(),
+                    input_column_names,
                 )?);
 
                 let result_node_id = self.circuit.add_node(
@@ -3326,7 +3326,7 @@ mod tests {
         let mut input_data = HashMap::default();
         input_data.insert("users".to_string(), input_delta);
 
-        let result = test_execute(&mut circuit, input_data, pager.clone()).unwrap();
+        let result = test_execute(&mut circuit, input_data, pager).unwrap();
 
         // Expected: new SUM(age + 2) = 96.0 + (40+2) = 138.0
         // HEX(138.0) = hex of "138.0" = "3133382E30"
@@ -3524,7 +3524,7 @@ mod tests {
             .unwrap();
 
         // Now if we execute again with no changes, we should see no delta
-        let empty_result = test_execute(&mut circuit, HashMap::default(), pager.clone()).unwrap();
+        let empty_result = test_execute(&mut circuit, HashMap::default(), pager).unwrap();
         assert_eq!(empty_result.changes.len(), 0, "No changes when no new data");
     }
 
@@ -3635,7 +3635,7 @@ mod tests {
         );
 
         // After commit, internal state should have only Alice and Charlie
-        let final_state = get_current_state(pager.clone(), &circuit).unwrap();
+        let final_state = get_current_state(pager, &circuit).unwrap();
         assert_eq!(
             final_state.changes.len(),
             2,
@@ -3755,7 +3755,7 @@ mod tests {
             .unwrap();
 
         // After committing, Bob should be in the view's state
-        let state = get_current_state(pager.clone(), &circuit).unwrap();
+        let state = get_current_state(pager, &circuit).unwrap();
         let mut consolidated_state = state;
         consolidated_state.consolidate();
 
@@ -3837,7 +3837,7 @@ mod tests {
         );
 
         // The view state should still only have Alice
-        let state = get_current_state(pager.clone(), &circuit).unwrap();
+        let state = get_current_state(pager, &circuit).unwrap();
         assert_eq!(state.changes.len(), 1, "View still has only Alice");
         assert_eq!(state.changes[0].0.values[1], Value::Text("Alice".into()));
     }
@@ -4003,7 +4003,7 @@ mod tests {
             .unwrap();
 
         // After all commits, execute with no changes should return empty delta
-        let empty_result = test_execute(&mut circuit, HashMap::default(), pager.clone()).unwrap();
+        let empty_result = test_execute(&mut circuit, HashMap::default(), pager).unwrap();
         assert_eq!(empty_result.changes.len(), 0, "No changes when no new data");
     }
 
@@ -4164,7 +4164,7 @@ mod tests {
             .unwrap();
 
         // After commit, verify final state
-        let final_state = get_current_state(pager.clone(), &circuit).unwrap();
+        let final_state = get_current_state(pager, &circuit).unwrap();
         assert_eq!(
             final_state.changes.len(),
             3,
@@ -4301,7 +4301,7 @@ mod tests {
         );
 
         // CRITICAL: Verify the operator state wasn't modified by uncommitted execution
-        let state_after_uncommitted = get_current_state(pager.clone(), &circuit).unwrap();
+        let state_after_uncommitted = get_current_state(pager, &circuit).unwrap();
         assert_eq!(
             state_after_uncommitted.len(),
             2,
@@ -4452,7 +4452,7 @@ mod tests {
         );
 
         // Verify internal state is unchanged (simulating rollback by not committing)
-        let state_after_rollback = get_current_state(pager.clone(), &circuit).unwrap();
+        let state_after_rollback = get_current_state(pager, &circuit).unwrap();
         assert_eq!(
             state_after_rollback.changes.len(),
             2,
@@ -4543,7 +4543,7 @@ mod tests {
             Box::new(filter_op),
         );
 
-        circuit.set_root(filter_id, schema.clone());
+        circuit.set_root(filter_id, schema);
 
         // Initialize with a row
         let mut init_data = HashMap::default();
@@ -4578,7 +4578,7 @@ mod tests {
             .unwrap();
 
         // The circuit should consolidate the state properly
-        let final_state = get_current_state(pager.clone(), &circuit).unwrap();
+        let final_state = get_current_state(pager, &circuit).unwrap();
         assert_eq!(
             final_state.changes.len(),
             1,
@@ -4643,7 +4643,7 @@ mod tests {
             .unwrap();
 
         // With proper DBSP: row still exists (weight 2 - 1 = 1)
-        let state = get_current_state(pager.clone(), &circuit).unwrap();
+        let state = get_current_state(pager, &circuit).unwrap();
         let mut consolidated = state;
         consolidated.consolidate();
         assert_eq!(
@@ -4725,7 +4725,7 @@ mod tests {
             ("orders".to_string(), orders_delta),
         ]);
 
-        let result = test_execute(&mut circuit, inputs.clone(), pager.clone()).unwrap();
+        let result = test_execute(&mut circuit, inputs, pager).unwrap();
 
         // Should have 2 results: Alice with total 10, Bob with total 7
         assert_eq!(
@@ -4841,7 +4841,7 @@ mod tests {
             ("orders".to_string(), orders_delta),
         ]);
 
-        let result = test_execute(&mut circuit, inputs.clone(), pager.clone()).unwrap();
+        let result = test_execute(&mut circuit, inputs, pager).unwrap();
 
         // Should only have results for Alice and Charlie (Bob filtered out due to age <= 18)
         assert_eq!(
@@ -4990,7 +4990,7 @@ mod tests {
         inputs.insert("orders".to_string(), orders_delta);
 
         // Execute the 3-way join with aggregation
-        let result = test_execute(&mut circuit, inputs.clone(), pager.clone()).unwrap();
+        let result = test_execute(&mut circuit, inputs.clone(), pager).unwrap();
 
         // We should get aggregated results for each user-product combination
         // Expected results:
@@ -5098,7 +5098,7 @@ mod tests {
         inputs.insert("orders".to_string(), orders_delta);
 
         // Execute the join
-        let result = test_execute(&mut circuit, inputs.clone(), pager.clone()).unwrap();
+        let result = test_execute(&mut circuit, inputs.clone(), pager).unwrap();
 
         // We should get 3 results (2 orders for Alice, 1 for Bob)
         assert_eq!(result.len(), 3, "Should have 3 join results");
@@ -5204,7 +5204,7 @@ mod tests {
             ("vendors".to_string(), vendors_delta),
         ]);
 
-        let result = test_execute(&mut circuit, inputs.clone(), pager.clone()).unwrap();
+        let result = test_execute(&mut circuit, inputs, pager).unwrap();
 
         // Expected results:
         // Alice|Gadget Inc|3|60    (3 units * 20 price = 60)
@@ -5296,7 +5296,7 @@ mod tests {
             ("vendors".to_string(), vendors_delta),
         ]);
 
-        let result = test_execute(&mut circuit, inputs.clone(), pager.clone()).unwrap();
+        let result = test_execute(&mut circuit, inputs, pager).unwrap();
 
         // Expected results:
         // For customer 1 (Alice) + vendor 1:
@@ -5306,7 +5306,7 @@ mod tests {
         //   - 1 * 10 = 10
         assert_eq!(result.len(), 3, "Should have 3 join results");
 
-        let mut results = result.changes.clone();
+        let mut results = result.changes;
         results.sort_by_key(|(row, _)| {
             // Sort by the product_value column for predictable ordering
             match &row.values[3] {
@@ -5425,12 +5425,12 @@ mod tests {
             ("products".to_string(), products_delta),
         ]);
 
-        let result = test_execute(&mut circuit, inputs.clone(), pager.clone()).unwrap();
+        let result = test_execute(&mut circuit, inputs, pager).unwrap();
 
         // Should have 2 results (orders with quantity > 2)
         assert_eq!(result.len(), 2, "Should have 2 results after filtering");
 
-        let mut results = result.changes.clone();
+        let mut results = result.changes;
         results.sort_by_key(|(row, _)| {
             match &row.values[2] {
                 // Sort by order_id
@@ -5507,7 +5507,7 @@ mod tests {
             ("orders".to_string(), orders_delta),
         ]);
 
-        let result = test_execute(&mut circuit, inputs.clone(), pager.clone()).unwrap();
+        let result = test_execute(&mut circuit, inputs, pager).unwrap();
 
         assert_eq!(result.len(), 2, "Should have 2 results for user 1");
 
@@ -5595,7 +5595,7 @@ mod tests {
         inputs.insert("orders".to_string(), orders_delta);
 
         // Execute the join with aggregation
-        let result = test_execute(&mut circuit, inputs.clone(), pager.clone()).unwrap();
+        let result = test_execute(&mut circuit, inputs.clone(), pager).unwrap();
 
         // We should get 2 aggregated results (one for Alice, one for Bob)
         assert_eq!(result.len(), 2, "Should have 2 aggregated results");
@@ -5692,7 +5692,7 @@ mod tests {
         inputs.insert("users".to_string(), users_delta);
         inputs.insert("customers".to_string(), customers_delta);
 
-        let result = test_execute(&mut circuit, inputs.clone(), pager.clone()).unwrap();
+        let result = test_execute(&mut circuit, inputs.clone(), pager).unwrap();
 
         // Should get rows where users.id > 1 AND customers.id < 100
         // - users.id=2 (> 1) AND customers.id=2 (< 100) ✓
@@ -5755,7 +5755,7 @@ mod tests {
         let mut inputs = HashMap::default();
         inputs.insert("users".to_string(), input_delta);
 
-        let result = test_execute(&mut circuit, inputs.clone(), pager.clone()).unwrap();
+        let result = test_execute(&mut circuit, inputs.clone(), pager).unwrap();
 
         // Should only have Alice and Charlie (age * 2 > 30)
         assert_eq!(

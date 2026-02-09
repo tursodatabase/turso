@@ -14,7 +14,9 @@ use crate::{
 
 use crate::File;
 
-pub const DEFAULT_LOG_CHECKPOINT_THRESHOLD: i64 = -1; // Disabled by default
+/// Logical log size in bytes at which a committing transaction will trigger a checkpoint.
+/// Default to the size of 1000 SQLite WAL frames; disable by setting a negative value.
+pub const DEFAULT_LOG_CHECKPOINT_THRESHOLD: i64 = 4120 * 1000;
 
 pub struct LogicalLog {
     pub file: Arc<dyn File>,
@@ -200,7 +202,6 @@ impl LogicalLog {
         // 5. Write to disk
         let buffer = Arc::new(Buffer::new(buffer));
         let c = Completion::new_write({
-            let buffer = buffer.clone();
             let buffer_len = buffer.len();
             move |res: Result<i32, CompletionError>| {
                 let Ok(bytes_written) = res else {
@@ -674,7 +675,7 @@ mod tests {
             let conn = db.connect();
             let pager = conn.pager.load().clone();
             let mvcc_store = db.get_mvcc_store();
-            let tx_id = mvcc_store.begin_tx(pager.clone()).unwrap();
+            let tx_id = mvcc_store.begin_tx(pager).unwrap();
             // insert table id -2 into sqlite_schema table (table_id -1)
             let data = ImmutableRecord::from_values(
                 &[
@@ -701,7 +702,7 @@ mod tests {
             // now insert a row into table -2
             let row = generate_simple_string_row((-2).into(), 1, "foo");
             mvcc_store.insert(tx_id, row).unwrap();
-            commit_tx(mvcc_store.clone(), &conn, tx_id).unwrap();
+            commit_tx(mvcc_store, &conn, tx_id).unwrap();
         }
 
         // Restart the database to trigger recovery
@@ -711,7 +712,7 @@ mod tests {
         let conn = db.connect();
         let pager = conn.pager.load().clone();
         let mvcc_store = db.get_mvcc_store();
-        let tx = mvcc_store.begin_tx(pager.clone()).unwrap();
+        let tx = mvcc_store.begin_tx(pager).unwrap();
         let row = mvcc_store
             .read(tx, RowID::new((-2).into(), RowKey::Int(1)))
             .unwrap()
@@ -921,7 +922,7 @@ mod tests {
         }
 
         // Check rowids that were deleted
-        let tx = mvcc_store.begin_tx(pager.clone()).unwrap();
+        let tx = mvcc_store.begin_tx(pager).unwrap();
         for present_rowid in non_present_rowids {
             let row = mvcc_store.read(tx, present_rowid.clone()).unwrap();
             assert!(
@@ -974,7 +975,7 @@ mod tests {
         let index_info = Arc::new(IndexInfo::new_from_index(index));
 
         // Verify table rows can be read
-        let tx = mvcc_store.begin_tx(pager.clone()).unwrap();
+        let tx = mvcc_store.begin_tx(pager).unwrap();
         for (row_id, expected_data) in [(1, "foo"), (2, "bar"), (3, "baz")] {
             let row = mvcc_store
                 .read(tx, RowID::new((-2).into(), RowKey::Int(row_id)))

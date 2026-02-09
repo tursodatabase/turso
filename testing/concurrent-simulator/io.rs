@@ -50,6 +50,37 @@ impl SimulatorIO {
     pub fn file_sizes(&self) -> Arc<Mutex<HashMap<String, u64>>> {
         self.file_sizes.clone()
     }
+
+    /// Dump all database files to the specified output directory.
+    /// Only copies the actual file content, not the full mmap size.
+    pub fn dump_files(&self, out_dir: &std::path::Path) -> anyhow::Result<()> {
+        let files = self.files.lock().unwrap();
+        let sizes = self.file_sizes.lock().unwrap();
+
+        for (path, file) in files.iter() {
+            // Only dump database-related files
+            if path.ends_with(".db") || path.ends_with("-wal") || path.ends_with("-log") {
+                let actual_size = sizes.get(path).copied().unwrap_or(0) as usize;
+
+                // Extract just the filename from the path
+                let filename = std::path::Path::new(path)
+                    .file_name()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_else(|| path.clone());
+
+                let dest_path = out_dir.join(&filename);
+                let mmap = file.mmap.lock().unwrap();
+                std::fs::write(&dest_path, &mmap[..actual_size])?;
+                println!(
+                    "Dumped {} ({} bytes) to {}",
+                    path,
+                    actual_size,
+                    dest_path.display()
+                );
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Drop for SimulatorIO {

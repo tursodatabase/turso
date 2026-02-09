@@ -132,6 +132,19 @@ crate::assert::assert_send_sync!(Connection);
 impl Drop for Connection {
     fn drop(&mut self) {
         if !self.is_closed() {
+            // Release any WAL locks the connection might be holding.
+            // This prevents deadlocks if a connection is dropped (e.g., due to a panic)
+            // while holding a read or write lock.
+            let pager = self.pager.load();
+            if let Some(wal) = &pager.wal {
+                if wal.holds_write_lock() {
+                    wal.end_write_tx();
+                }
+                if wal.holds_read_lock() {
+                    wal.end_read_tx();
+                }
+            }
+
             // if connection wasn't properly closed, decrement the connection counter
             self.db
                 .n_connections
@@ -166,7 +179,7 @@ impl Connection {
 
     pub fn start_trigger_compilation(&self, trigger: Arc<Trigger>) {
         tracing::debug!("Starting trigger compilation: {}", trigger.name);
-        self.compiling_triggers.write().push(trigger.clone());
+        self.compiling_triggers.write().push(trigger);
     }
 
     pub fn end_trigger_compilation(&self) {
@@ -189,7 +202,7 @@ impl Connection {
 
     pub fn start_trigger_execution(&self, trigger: Arc<Trigger>) {
         tracing::debug!("Starting trigger execution: {}", trigger.name);
-        self.executing_triggers.write().push(trigger.clone());
+        self.executing_triggers.write().push(trigger);
     }
 
     pub fn end_trigger_execution(&self) {
@@ -558,7 +571,7 @@ impl Connection {
             mode,
             input,
         )?;
-        let stmt = Statement::new(program, pager.clone(), mode);
+        let stmt = Statement::new(program, pager, mode);
         Ok(Some((stmt, parser.offset())))
     }
 
@@ -592,7 +605,7 @@ impl Connection {
             opts.vfs.as_ref(),
             flags,
             db_opts,
-            encryption_opts.clone(),
+            encryption_opts,
         )?;
         if let Some(modeof) = opts.modeof {
             let perms = std::fs::metadata(modeof)?;
@@ -892,14 +905,21 @@ impl Connection {
             return Ok(());
         }
         self.closed.store(true, Ordering::SeqCst);
+        let pager = self.pager.load();
 
         match self.get_tx_state() {
             TransactionState::None => {
                 // No active transaction
             }
             _ => {
-                if !self.mvcc_enabled() {
-                    let pager = self.pager.load();
+                if self.mvcc_enabled() {
+                    if let Some(mv_store) = self.mv_store().as_ref() {
+                        if let Some(tx_id) = self.get_mv_tx_id() {
+                            mv_store.rollback_tx(tx_id, pager.clone(), self);
+                        }
+                    }
+                    pager.end_read_tx();
+                } else {
                     pager.rollback_tx(self);
                 }
                 self.set_tx_state(TransactionState::None);
@@ -1044,26 +1064,85 @@ impl Connection {
         self.auto_commit.load(Ordering::SeqCst)
     }
 
-    pub fn parse_schema_rows(self: &Arc<Connection>) -> Result<()> {
+    pub fn reparse_schema_after_extension_load(self: &Arc<Connection>) -> Result<()> {
         if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
-        let rows = self
-            .query("SELECT * FROM sqlite_schema")?
-            .expect("query must be parsed to statement");
+        // Collect row data from the Statement first, then drop the Statement
+        // before taking the schema write lock. This prevents a deadlock in MVCC
+        // mode where Statement::drop -> abort -> rollback_tx -> schema.read()
+        // would deadlock against the schema write lock.
+        let mut rows_data: Vec<(String, String, String, i64, Option<String>)> = Vec::new();
+        {
+            let mut rows = self
+                .query("SELECT * FROM sqlite_schema")?
+                .expect("query must be parsed to statement");
+            rows.run_with_row_callback(|row| {
+                let ty = row.get::<&str>(0)?.to_string();
+                let name = row.get::<&str>(1)?.to_string();
+                let table_name = row.get::<&str>(2)?.to_string();
+                let root_page = row.get::<i64>(3)?;
+                let sql = row.get::<&str>(4).ok().map(|s| s.to_string());
+                rows_data.push((ty, name, table_name, root_page, sql));
+                Ok(())
+            })?;
+        } // Statement dropped here, before schema write lock
+
         let syms = self.syms.read();
         let enable_triggers = self.experimental_triggers_enabled();
-        self.with_schema_mut(|schema| {
-            let existing_views = schema.incremental_views.clone();
-            if let Err(LimboError::ExtensionError(e)) =
-                parse_schema_rows(rows, schema, &syms, None, existing_views, enable_triggers)
-            {
-                // this means that a vtab exists and we no longer have the module loaded. we print
-                // a warning to the user to load the module
-                eprintln!("Warning: {e}");
+        self.with_schema_mut(|schema| -> Result<()> {
+            // Incremental re-parse after extension loading. The schema already has
+            // tables/indices/views from initial parse. We only need to pick up
+            // entries that previously failed (e.g. virtual tables whose module
+            // wasn't loaded yet). "Already exists" errors are expected and skipped.
+            let mut from_sql_indexes = Vec::new();
+            let mut automatic_indices = HashMap::default();
+            let mut dbsp_state_roots = HashMap::default();
+            let mut dbsp_state_index_roots = HashMap::default();
+            let mut materialized_view_info = HashMap::default();
+
+            for (ty, name, table_name, root_page, sql) in &rows_data {
+                match schema.handle_schema_row(
+                    ty,
+                    name,
+                    table_name,
+                    *root_page,
+                    sql.as_deref(),
+                    &syms,
+                    &mut from_sql_indexes,
+                    &mut automatic_indices,
+                    &mut dbsp_state_roots,
+                    &mut dbsp_state_index_roots,
+                    &mut materialized_view_info,
+                    None,
+                    enable_triggers,
+                ) {
+                    Ok(()) => {}
+                    Err(LimboError::ParseError(msg)) if msg.contains("already exists") => {}
+                    Err(LimboError::ExtensionError(msg)) => {
+                        eprintln!("Warning: {msg}");
+                    }
+                    Err(e) => return Err(e),
+                }
             }
-        });
-        Ok(())
+
+            match schema.populate_indices(&syms, from_sql_indexes, automatic_indices, false) {
+                Ok(()) => {}
+                Err(LimboError::ParseError(msg)) if msg.contains("already exists") => {}
+                Err(LimboError::ExtensionError(msg)) => eprintln!("Warning: {msg}"),
+                Err(e) => return Err(e),
+            }
+            match schema.populate_materialized_views(
+                materialized_view_info,
+                dbsp_state_roots,
+                dbsp_state_index_roots,
+            ) {
+                Ok(()) => {}
+                Err(LimboError::ExtensionError(msg)) => eprintln!("Warning: {msg}"),
+                Err(e) => return Err(e),
+            }
+            Ok(())
+        })
     }
 
     // Clearly there is something to improve here, Vec<Vec<Value>> isn't a couple of tea
@@ -1502,7 +1581,7 @@ impl Connection {
 
     pub fn set_encryption_key(&self, key: EncryptionKey) -> Result<()> {
         tracing::trace!("setting encryption key for connection");
-        *self.encryption_key.write() = Some(key.clone());
+        *self.encryption_key.write() = Some(key);
         self.set_encryption_context()
     }
 

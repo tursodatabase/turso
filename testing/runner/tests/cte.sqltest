@@ -557,6 +557,33 @@ expect {
 }
 
 # =============================================================================
+# CTE referenced twice in subquery with indexed table (issue #5074)
+# =============================================================================
+
+test cte-dual-ref-indexed-subquery-empty {
+    CREATE TABLE t(a);
+    CREATE INDEX i ON t(a);
+    WITH c AS (SELECT 0 c0 FROM(SELECT*FROM t)x)
+    SELECT*FROM(SELECT*FROM c,c c2 JOIN(SELECT 1)u ON c2.c0=0)y;
+}
+expect {
+}
+
+test cte-dual-ref-indexed-subquery {
+    CREATE TABLE t(a);
+    CREATE INDEX i ON t(a);
+    INSERT INTO t VALUES (1),(2);
+    WITH c AS (SELECT 0 c0 FROM(SELECT*FROM t)x)
+    SELECT*FROM(SELECT*FROM c,c c2 JOIN(SELECT 1)u ON c2.c0=0)y;
+}
+expect {
+    0|0|1
+    0|0|1
+    0|0|1
+    0|0|1
+}
+
+# =============================================================================
 # Error cases
 # =============================================================================
 

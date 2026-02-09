@@ -785,6 +785,8 @@ fn count_required_cursors_for_simple_select(plan: &SelectPlan) -> usize {
             }
             Operation::IndexMethodQuery(_) => 1,
             Operation::HashJoin(_) => 2,
+            // One table cursor + one cursor per index branch
+            Operation::MultiIndexScan(multi_idx) => 1 + multi_idx.branches.len(),
         } + if let Table::FromClauseSubquery(from_clause_subquery) = &t.table {
             count_required_cursors_for_simple_or_compound_select(&from_clause_subquery.plan)
         } else {
@@ -828,6 +830,8 @@ fn estimate_num_instructions_for_simple_select(select: &SelectPlan) -> usize {
             Operation::Search(_) => 15,
             Operation::IndexMethodQuery(_) => 15,
             Operation::HashJoin(_) => 20,
+            // Multi-index scan: scan overhead per branch + deduplication + final rowid fetch
+            Operation::MultiIndexScan(multi_idx) => 15 * multi_idx.branches.len() + 10,
         } + if let Table::FromClauseSubquery(from_clause_subquery) = &t.table {
             10 + estimate_num_instructions_for_simple_or_compound_select(&from_clause_subquery.plan)
         } else {
@@ -871,6 +875,8 @@ fn estimate_num_labels_for_simple_select(select: &SelectPlan) -> usize {
             Operation::Search(_) => 3,
             Operation::IndexMethodQuery(_) => 3,
             Operation::HashJoin(_) => 3,
+            // Multi-index scan needs extra labels for each branch + rowset loop
+            Operation::MultiIndexScan(multi_idx) => 3 + multi_idx.branches.len() * 2,
         } + if let Table::FromClauseSubquery(from_clause_subquery) = &t.table {
             3 + estimate_num_labels_for_simple_or_compound_select(&from_clause_subquery.plan)
         } else {

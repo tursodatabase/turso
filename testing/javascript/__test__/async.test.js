@@ -4,7 +4,7 @@ import fs from 'fs';
 
 
 test.beforeEach(async (t) => {
-  const [db, path, errorType] = await connect();
+  const [db, path,errorType] = await connect();
   await db.exec(`
       DROP TABLE IF EXISTS users;
       CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, email TEXT)
@@ -84,8 +84,8 @@ test.serial("Database.exec() after close()", async (t) => {
   await t.throwsAsync(async () => {
     await db.exec("SELECT 1");
   }, {
-    instanceOf: Error,
-    message: "database must be connected"
+    instanceOf: TypeError,
+    message: "The database connection is not open"
   });
 });
 
@@ -111,8 +111,8 @@ test.serial("Database.prepare() after close()", async (t) => {
   await t.throwsAsync(async () => {
     await db.prepare("SELECT 1");
   }, {
-    instanceOf: Error,
-    message: "database must be connected"
+    instanceOf: TypeError,
+    message: "The database connection is not open"
   });
 });
 
@@ -136,8 +136,8 @@ test.serial("Database.pragma() after close()", async (t) => {
   await t.throwsAsync(async () => {
     await db.pragma("cache_size = 2000");
   }, {
-    instanceOf: Error,
-    message: "database must be connected"
+    instanceOf: TypeError,
+    message: "The database connection is not open"
   });
 });
 
@@ -246,9 +246,9 @@ test.serial("Statement.get() [positional]", async (t) => {
   t.is((await stmt.get(2)).name, "Bob");
 
   stmt = await db.prepare("SELECT * FROM users WHERE id = ?1");
-  t.is(await stmt.get({ 1: 0 }), undefined);
-  t.is((await stmt.get({ 1: 1 })).name, "Alice");
-  t.is((await stmt.get({ 1: 2 })).name, "Bob");
+  t.is(await stmt.get({1: 0}), undefined);
+  t.is((await stmt.get({1: 1})).name, "Alice");
+  t.is((await stmt.get({1: 2})).name, "Bob");
 });
 
 test.serial("Statement.get() [named]", async (t) => {
@@ -295,16 +295,16 @@ test.serial("Statement.get() [blob]", async (t) => {
 
   // Create table with blob column
   await db.exec("CREATE TABLE IF NOT EXISTS blobs (id INTEGER PRIMARY KEY, data BLOB)");
-
+  
   // Test inserting and retrieving blob data
   const binaryData = Buffer.from([0x48, 0x65, 0x6c, 0x6c, 0x6f, 0x20, 0x57, 0x6f, 0x72, 0x6c, 0x64]); // "Hello World"
   const insertStmt = await db.prepare("INSERT INTO blobs (data) VALUES (?)");
   await insertStmt.run([binaryData]);
-
+  
   // Retrieve the blob data
   const selectStmt = await db.prepare("SELECT data FROM blobs WHERE id = 1");
   const result = await selectStmt.get();
-
+  
   t.truthy(result, "Should return a result");
   t.true(Buffer.isBuffer(result.data), "Should return Buffer for blob data");
   t.deepEqual(result.data, binaryData, "Blob data should match original");
@@ -330,6 +330,34 @@ test.serial("Statement.iterate()", async (t) => {
   var idx = 0;
   for await (const row of await stmt.iterate()) {
     t.is(row.id, expected[idx++]);
+  }
+});
+
+test.serial("Statement.iterate() [expanded mode returns objects]", async (t) => {
+  const db = t.context.db;
+
+  const stmt = await db.prepare("SELECT * FROM users");
+  const expected = [
+    { id: 1, name: "Alice", email: "alice@example.org" },
+    { id: 2, name: "Bob", email: "bob@example.com" },
+  ];
+  var idx = 0;
+  for await (const row of await stmt.iterate()) {
+    t.deepEqual(row, expected[idx++]);
+  }
+});
+
+test.serial("Statement.iterate() [raw]", async (t) => {
+  const db = t.context.db;
+
+  const stmt = await db.prepare("SELECT * FROM users");
+  const expected = [
+    [1, "Alice", "alice@example.org"],
+    [2, "Bob", "bob@example.com"],
+  ];
+  var idx = 0;
+  for await (const row of await stmt.raw().iterate()) {
+    t.deepEqual(row, expected[idx++]);
   }
 });
 
@@ -425,16 +453,69 @@ test.serial("Statement.columns()", async (t) => {
   stmt = await db.prepare("SELECT * FROM users WHERE id = ?");
   const columns2 = stmt.columns();
   t.is(columns2.length, 3);
-
+  
   // Check column names and types only
   t.is(columns2[0].name, "id");
   t.is(columns2[0].type, "INTEGER");
-
-  t.is(columns2[1].name, "name");
+  
+  t.is(columns2[1].name, "name");  
   t.is(columns2[1].type, "TEXT");
-
+  
   t.is(columns2[2].name, "email");
   t.is(columns2[2].type, "TEXT");
+});
+
+// ==========================================================================
+// Statement.reader
+// ==========================================================================
+
+test.serial("Statement.reader [SELECT is true]", async (t) => {
+  const db = t.context.db;
+
+  const stmt = await db.prepare("SELECT * FROM users WHERE id = ?");
+  t.is(stmt.reader, true);
+});
+
+test.serial("Statement.reader [INSERT is false]", async (t) => {
+  const db = t.context.db;
+
+  const stmt = await db.prepare("INSERT INTO users (name, email) VALUES (?, ?)");
+  t.is(stmt.reader, false);
+});
+
+test.serial("Statement.reader [UPDATE is false]", async (t) => {
+  const db = t.context.db;
+
+  const stmt = await db.prepare("UPDATE users SET name = ? WHERE id = ?");
+  t.is(stmt.reader, false);
+});
+
+test.serial("Statement.reader [DELETE is false]", async (t) => {
+  const db = t.context.db;
+
+  const stmt = await db.prepare("DELETE FROM users WHERE id = ?");
+  t.is(stmt.reader, false);
+});
+
+test.serial("Statement.reader [INSERT RETURNING is true]", async (t) => {
+  const db = t.context.db;
+
+  const stmt = await db.prepare("INSERT INTO users (name, email) VALUES (?, ?) RETURNING *");
+  t.is(stmt.reader, true);
+});
+
+test.serial("Statement.reader [UPDATE RETURNING is true]", async (t) => {
+  const db = t.context.db;
+
+  const stmt = await db.prepare("UPDATE users SET name = ? WHERE id = ? RETURNING *");
+  t.is(stmt.reader, true);
+});
+
+test.serial("Statement.reader [DELETE RETURNING is true]", async (t) => {
+  const db = t.context.db;
+
+  const stmt = await db.prepare("DELETE FROM users WHERE id = ? RETURNING *");
+  t.is(stmt.reader, true);
 });
 
 // ==========================================================================
@@ -472,7 +553,7 @@ test.skip("Timeout option", async (t) => {
     const end = Date.now();
     const elapsed = end - start;
     // Allow some tolerance for the timeout.
-    t.is(elapsed > timeout / 2, true);
+    t.is(elapsed > timeout/2, true);
   }
   fs.unlinkSync(path);
 });

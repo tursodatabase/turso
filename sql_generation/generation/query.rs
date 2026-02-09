@@ -275,10 +275,13 @@ impl Arbitrary for Insert {
         // we keep this here for now, because gen_select does not generate subqueries, and they're
         // important for surfacing bugs.
         let gen_nested_self_insert = |rng: &mut R| {
+            // Skip tables that are already large to prevent exponential row growth from
+            // repeated self-inserts (INSERT INTO t SELECT * FROM t doubles the table).
+            let max_rows = opts.max_rows.get() as usize;
             let non_unique: Vec<_> = env
                 .tables()
                 .iter()
-                .filter(|t| !t.has_any_unique_column())
+                .filter(|t| !t.has_any_unique_column() && t.rows.len() <= max_rows)
                 .collect();
             non_unique.first()?;
             let table = *pick(&non_unique, rng);
@@ -317,11 +320,11 @@ impl Arbitrary for Insert {
         };
 
         let gen_select = |rng: &mut R| {
-            // Find a non-empty table without UNIQUE constraints
-            let select_table = env
-                .tables()
-                .iter()
-                .find(|t| !t.rows.is_empty() && !t.has_any_unique_column())?;
+            // Find a non-empty, not-too-large table without UNIQUE constraints
+            let max_rows = opts.max_rows.get() as usize;
+            let select_table = env.tables().iter().find(|t| {
+                !t.rows.is_empty() && !t.has_any_unique_column() && t.rows.len() <= max_rows
+            })?;
             let row = pick(&select_table.rows, rng);
             let predicate = Predicate::arbitrary_from(rng, env, (select_table, row));
             // TODO change for arbitrary_sized and insert from arbitrary tables

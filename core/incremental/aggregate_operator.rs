@@ -1254,10 +1254,7 @@ impl AggregateOperator {
 
         // Get the accumulated weight from the current batch (before this row)
         let batch_accumulated = if let Some(deltas) = group_distinct_deltas {
-            deltas
-                .get(&(col_idx, hashable_row.clone()))
-                .copied()
-                .unwrap_or(0)
+            deltas.get(&(col_idx, hashable_row)).copied().unwrap_or(0)
         } else {
             0
         };

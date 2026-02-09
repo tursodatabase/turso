@@ -1241,7 +1241,6 @@ fn subquery_expression_strategy(
     proptest::sample::select((*tables).clone())
         .prop_flat_map({
             let profile = inner_profile;
-            let schema = schema.clone();
             move |table| {
                 let schema = schema.clone();
                 // Scalar subqueries must return exactly 1 column
@@ -1291,7 +1290,6 @@ fn exists_expression_strategy(
     proptest::sample::select((*tables).clone())
         .prop_flat_map({
             let profile = inner_profile;
-            let schema = schema.clone();
             move |table| {
                 let schema = schema.clone();
                 crate::select::select_for_table(&table, &schema, &profile)
@@ -1335,7 +1333,6 @@ fn in_subquery_expression_strategy(
     )
         .prop_flat_map({
             let profile = inner_profile;
-            let schema = schema.clone();
             move |(col_name, table)| {
                 let schema = schema.clone();
                 // FIXME: SQL supports row-value IN like (a,b) IN (SELECT x,y ...) but Turso

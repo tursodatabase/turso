@@ -77,6 +77,16 @@ pub const INTERIOR_PAGE_HEADER_SIZE_BYTES: usize = 12;
 pub const LEAF_PAGE_HEADER_SIZE_BYTES: usize = 8;
 pub const LEFT_CHILD_PTR_SIZE_BYTES: usize = 4;
 
+// Freelist trunk page layout:
+// - Bytes 0-3: Page number of next freelist trunk page (0 if none)
+// - Bytes 4-7: Number of leaf page pointers on this trunk page
+// - Bytes 8+: Array of 4-byte leaf page pointers
+pub const FREELIST_TRUNK_OFFSET_NEXT_TRUNK_PTR: usize = 0;
+pub const FREELIST_TRUNK_OFFSET_LEAF_COUNT: usize = 4;
+pub const FREELIST_TRUNK_OFFSET_FIRST_LEAF_PTR: usize = 8;
+pub const FREELIST_TRUNK_HEADER_SIZE: usize = 8;
+pub const FREELIST_LEAF_PTR_SIZE: usize = 4;
+
 #[derive(PartialEq, Eq, Zeroable, Pod, Clone, Copy, Debug)]
 #[repr(transparent)]
 /// Read/Write file format version.
@@ -250,6 +260,7 @@ pub struct TextEncoding(U32BE);
 
 impl TextEncoding {
     #![allow(non_upper_case_globals)]
+    pub const Unset: Self = Self(U32BE::new(0));
     pub const Utf8: Self = Self(U32BE::new(1));
     pub const Utf16Le: Self = Self(U32BE::new(2));
     pub const Utf16Be: Self = Self(U32BE::new(3));
@@ -566,7 +577,7 @@ pub fn begin_read_page(
         } else {
             buf
         };
-        finish_read_page(page_idx, buffer, page.clone());
+        finish_read_page(page_idx, buffer, page);
         None
     });
     let c = Completion::new_read(buf, complete);
@@ -1307,7 +1318,7 @@ pub fn build_shared_wal(
     let reader = Arc::new(StreamingWalReader::new(
         file.clone(),
         wal_file_shared.clone(),
-        header.clone(),
+        header,
         size,
     ));
 
@@ -1801,7 +1812,7 @@ pub fn begin_write_wal_header<F: File + ?Sized>(io: &F, header: &WalHeader) -> R
     };
     #[allow(clippy::arc_with_non_send_sync)]
     let c = Completion::new_write(write_complete);
-    let c = io.pwrite(0, buffer.clone(), c.clone())?;
+    let c = io.pwrite(0, buffer, c)?;
     Ok(c)
 }
 

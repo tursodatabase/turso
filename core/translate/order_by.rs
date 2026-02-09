@@ -104,7 +104,7 @@ pub fn init_order_by(
             })
         }
         let index = Arc::new(Index {
-            name: index_name.clone(),
+            name: index_name,
             table_name: String::new(),
             ephemeral: true,
             root_page: 0,

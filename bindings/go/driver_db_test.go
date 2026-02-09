@@ -1431,3 +1431,214 @@ func TestTimeValueRoundtrip(t *testing.T) {
 		require.Equal(t, createdAt, originalTime.Format(time.RFC3339Nano))
 	})
 }
+
+// --- Busy Timeout Tests ---
+
+func TestBusyTimeoutDefault(t *testing.T) {
+	// Open a database without specifying busy timeout - should use default (5000ms)
+	db, err := sql.Open("turso", ":memory:")
+	require.NoError(t, err)
+	defer db.Close()
+
+	// Get the underlying connection and verify the timeout
+	conn, err := db.Conn(t.Context())
+	require.NoError(t, err)
+	defer conn.Close()
+
+	err = conn.Raw(func(driverConn any) error {
+		tc, ok := driverConn.(*tursoDbConnection)
+		require.True(t, ok, "expected *tursoDbConnection")
+		require.Equal(t, DefaultBusyTimeout, tc.GetBusyTimeout(),
+			"expected default busy timeout of %d, got %d", DefaultBusyTimeout, tc.GetBusyTimeout())
+		return nil
+	})
+	require.NoError(t, err)
+	fmt.Println("Default busy timeout test passed")
+}
+
+func TestBusyTimeoutDSN(t *testing.T) {
+	// Test that _busy_timeout in DSN overrides the default
+	db, err := sql.Open("turso", ":memory:?_busy_timeout=10000")
+	require.NoError(t, err)
+	defer db.Close()
+
+	conn, err := db.Conn(t.Context())
+	require.NoError(t, err)
+	defer conn.Close()
+
+	err = conn.Raw(func(driverConn any) error {
+		tc, ok := driverConn.(*tursoDbConnection)
+		require.True(t, ok)
+		require.Equal(t, 10000, tc.GetBusyTimeout(),
+			"expected busy timeout of 10000, got %d", tc.GetBusyTimeout())
+		return nil
+	})
+	require.NoError(t, err)
+	fmt.Println("Busy timeout DSN test passed")
+}
+
+func TestBusyTimeoutDisabled(t *testing.T) {
+	// Test that _busy_timeout=-1 disables the timeout
+	db, err := sql.Open("turso", ":memory:?_busy_timeout=-1")
+	require.NoError(t, err)
+	defer db.Close()
+
+	conn, err := db.Conn(t.Context())
+	require.NoError(t, err)
+	defer conn.Close()
+
+	err = conn.Raw(func(driverConn any) error {
+		tc, ok := driverConn.(*tursoDbConnection)
+		require.True(t, ok)
+		require.Equal(t, 0, tc.GetBusyTimeout(),
+			"expected busy timeout of 0 (disabled), got %d", tc.GetBusyTimeout())
+		return nil
+	})
+	fmt.Println("Busy timeout disabled test passed")
+	require.NoError(t, err)
+}
+
+func TestBusyTimeoutRuntimeChange(t *testing.T) {
+	db, err := sql.Open("turso", ":memory:")
+	require.NoError(t, err)
+	defer db.Close()
+
+	conn, err := db.Conn(t.Context())
+	require.NoError(t, err)
+	defer conn.Close()
+
+	err = conn.Raw(func(driverConn any) error {
+		tc, ok := driverConn.(*tursoDbConnection)
+		require.True(t, ok)
+
+		// Check initial default
+		require.Equal(t, DefaultBusyTimeout, tc.GetBusyTimeout())
+
+		// Change to custom value
+		err := tc.SetBusyTimeout(15000)
+		require.NoError(t, err)
+		require.Equal(t, 15000, tc.GetBusyTimeout())
+
+		// Disable timeout
+		err = tc.SetBusyTimeout(0)
+		require.NoError(t, err)
+		require.Equal(t, 0, tc.GetBusyTimeout())
+
+		return nil
+	})
+	fmt.Println("Busy timeout runtime change test passed")
+	require.NoError(t, err)
+}
+
+func TestBusyTimeoutConnector(t *testing.T) {
+	t.Run("default timeout via connector", func(t *testing.T) {
+		connector, err := NewConnector(":memory:")
+		require.NoError(t, err)
+
+		db := sql.OpenDB(connector)
+		defer db.Close()
+
+		conn, err := db.Conn(t.Context())
+		require.NoError(t, err)
+		defer conn.Close()
+
+		err = conn.Raw(func(driverConn any) error {
+			tc, ok := driverConn.(*tursoDbConnection)
+			require.True(t, ok)
+			require.Equal(t, DefaultBusyTimeout, tc.GetBusyTimeout())
+			return nil
+		})
+		require.NoError(t, err)
+	})
+
+	t.Run("custom timeout via connector", func(t *testing.T) {
+		connector, err := NewConnector(":memory:", WithBusyTimeout(20000))
+		require.NoError(t, err)
+
+		db := sql.OpenDB(connector)
+		defer db.Close()
+
+		conn, err := db.Conn(t.Context())
+		require.NoError(t, err)
+		defer conn.Close()
+
+		err = conn.Raw(func(driverConn any) error {
+			tc, ok := driverConn.(*tursoDbConnection)
+			require.True(t, ok)
+			require.Equal(t, 20000, tc.GetBusyTimeout())
+			return nil
+		})
+		require.NoError(t, err)
+	})
+
+	t.Run("disabled timeout via connector", func(t *testing.T) {
+		connector, err := NewConnector(":memory:", WithBusyTimeout(0))
+		require.NoError(t, err)
+
+		db := sql.OpenDB(connector)
+		defer db.Close()
+
+		conn, err := db.Conn(t.Context())
+		require.NoError(t, err)
+		defer conn.Close()
+
+		err = conn.Raw(func(driverConn any) error {
+			tc, ok := driverConn.(*tursoDbConnection)
+			require.True(t, ok)
+			require.Equal(t, 0, tc.GetBusyTimeout())
+			return nil
+		})
+		require.NoError(t, err)
+	})
+	fmt.Println("Busy timeout connector test passed")
+}
+
+func TestBusyTimeoutConcurrentWrites(t *testing.T) {
+	// This test verifies that with a busy timeout, concurrent writers succeed
+	// instead of immediately failing with SQLITE_BUSY
+	tmp := t.TempDir()
+	dbPath := path.Join(tmp, "concurrent.db")
+
+	// Open with default timeout
+	db, err := sql.Open("turso", dbPath)
+	require.NoError(t, err)
+	defer db.Close()
+
+	// Create table
+	_, err = db.Exec("CREATE TABLE counter (id INTEGER PRIMARY KEY, value INTEGER)")
+	require.NoError(t, err)
+	_, err = db.Exec("INSERT INTO counter (id, value) VALUES (1, 0)")
+	require.NoError(t, err)
+
+	// Run concurrent updates
+	const numGoroutines = 5
+	const numUpdates = 10
+	done := make(chan error, numGoroutines)
+
+	for i := range numGoroutines {
+		go func(workerID int) {
+			for j := range numUpdates {
+				_, err := db.Exec("UPDATE counter SET value = value + 1 WHERE id = 1")
+				if err != nil {
+					done <- fmt.Errorf("worker %d, update %d: %w", workerID, j, err)
+					return
+				}
+			}
+			done <- nil
+		}(i)
+	}
+
+	// Collect results
+	for range numGoroutines {
+		err := <-done
+		require.NoError(t, err, "concurrent update should succeed with busy timeout")
+	}
+
+	// Verify final count
+	var finalValue int
+	err = db.QueryRow("SELECT value FROM counter WHERE id = 1").Scan(&finalValue)
+	require.NoError(t, err)
+	require.Equal(t, numGoroutines*numUpdates, finalValue,
+		"expected %d updates, got %d", numGoroutines*numUpdates, finalValue)
+	fmt.Println("Busy timeout concurrent writes test passed")
+}

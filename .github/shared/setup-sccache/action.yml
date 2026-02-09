@@ -1,0 +1,19 @@
+name: "Setup sccache"
+description: "Installs sccache with graceful fallback if cache service is unavailable"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Install sccache
+      uses: mozilla-actions/sccache-action@v0.0.9
+    - name: Enable sccache
+      shell: bash
+      run: |
+        export SCCACHE_GHA_ENABLED=true
+        if sccache -s >/dev/null 2>&1; then
+          echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
+          echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+          echo "sccache is available and configured"
+        else
+          echo "::warning::sccache cache service is unavailable, building without cache"
+        fi

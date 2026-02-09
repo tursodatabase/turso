@@ -1,6 +1,6 @@
 //! Workload definitions for the simulator.
 
-use rand::Rng;
+use rand::{Rng, seq::IndexedRandom};
 use rand_chacha::ChaCha8Rng;
 use sql_generation::{
     generation::{Arbitrary, GenerationContext, Opts},
@@ -13,6 +13,7 @@ use sql_generation::{
     },
 };
 
+use crate::elle::{ELLE_KEY_COUNT, elle_key_name};
 use crate::operations::Operation;
 use crate::{FiberState, SimulatorState};
 
@@ -58,11 +59,9 @@ impl Workload for BeginWorkload {
             return None;
         }
         let mode = if ctx.enable_mvcc {
-            match rng.random_range(0..3) {
-                0 => "BEGIN DEFERRED",
-                1 => "BEGIN IMMEDIATE",
-                _ => "BEGIN CONCURRENT",
-            }
+            ["BEGIN DEFERRED", "BEGIN IMMEDIATE", "BEGIN CONCURRENT"]
+                .choose(rng)
+                .expect("array is not empty")
         } else {
             "BEGIN"
         };
@@ -238,12 +237,9 @@ impl Workload for WalCheckpointWorkload {
         if *ctx.fiber_state != FiberState::Idle {
             return None;
         }
-        let mode = match rng.random_range(0..4) {
-            0 => "PASSIVE",
-            1 => "FULL",
-            2 => "RESTART",
-            _ => "TRUNCATE",
-        };
+        let mode = ["PASSIVE", "FULL", "RESTART", "TRUNCATE"]
+            .choose(rng)
+            .expect("array is not empty");
         Some(Operation::WalCheckpoint {
             mode: mode.to_string(),
         })
@@ -271,5 +267,77 @@ impl Workload for RollbackWorkload {
             return None;
         }
         Some(Operation::Rollback)
+    }
+}
+
+// ============================================================================
+// Elle Workloads for Consistency Checking
+// ============================================================================
+
+/// Create Elle list table for consistency checking.
+pub struct CreateElleTableWorkload;
+
+impl Workload for CreateElleTableWorkload {
+    fn generate(&self, ctx: &WorkloadContext, rng: &mut ChaCha8Rng) -> Option<Operation> {
+        // Only create tables outside of transactions
+        if *ctx.fiber_state != FiberState::Idle {
+            return None;
+        }
+        let table_name = format!("elle_lists_{}", rng.random_range(0..100));
+        Some(Operation::CreateElleTable { table_name })
+    }
+}
+
+/// Append to a random key in an Elle table.
+pub struct ElleAppendWorkload {
+    /// Counter for generating unique append values
+    pub value_counter: std::sync::atomic::AtomicI64,
+}
+
+impl ElleAppendWorkload {
+    pub fn new() -> Self {
+        Self {
+            value_counter: std::sync::atomic::AtomicI64::new(1),
+        }
+    }
+}
+
+impl Default for ElleAppendWorkload {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Workload for ElleAppendWorkload {
+    fn generate(&self, ctx: &WorkloadContext, rng: &mut ChaCha8Rng) -> Option<Operation> {
+        if ctx.sim_state.elle_tables.is_empty() {
+            return None;
+        }
+        let table_name = ctx.sim_state.elle_tables.pick(rng)?.0.clone();
+        let key = elle_key_name(rng.random_range(0..ELLE_KEY_COUNT));
+        let value = self
+            .value_counter
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        Some(Operation::ElleAppend {
+            table_name,
+            key,
+            value,
+        })
+    }
+}
+
+/// Read a random key from an Elle table.
+pub struct ElleReadWorkload;
+
+impl Workload for ElleReadWorkload {
+    fn generate(&self, ctx: &WorkloadContext, rng: &mut ChaCha8Rng) -> Option<Operation> {
+        if ctx.sim_state.elle_tables.is_empty() {
+            return None;
+        }
+        let table_name = ctx.sim_state.elle_tables.pick(rng)?.0.clone();
+        let key = elle_key_name(rng.random_range(0..ELLE_KEY_COUNT));
+
+        Some(Operation::ElleRead { table_name, key })
     }
 }

@@ -120,7 +120,7 @@ impl<'a> Resolver<'a> {
             None => self
                 .symbol_table
                 .resolve_function(func_name, arg_count)
-                .map(|arg| Func::External(arg.clone())),
+                .map(Func::External),
         }
     }
 
@@ -1689,10 +1689,15 @@ fn emit_delete_insns<'a>(
             } => program.resolve_cursor_id(&CursorKey::index(internal_id, index.clone())),
         },
         Operation::IndexMethodQuery(_) => {
-            panic!("access through IndexMethod is not supported for delete statements")
+            return Err(crate::LimboError::InternalError(
+                "IndexMethod access is not supported for DELETE statements".to_string(),
+            ));
         }
         Operation::HashJoin(_) => {
             unreachable!("access through HashJoin is not supported for delete statements")
+        }
+        Operation::MultiIndexScan(_) => {
+            unreachable!("access through MultiIndexScan is not supported for delete statements")
         }
     };
     let btree_table = unsafe { &*table_reference }.btree();
@@ -2385,7 +2390,7 @@ fn emit_program_for_update(
         &mut t_ctx,
         &plan.table_references,
         &join_order,
-        mode.clone(),
+        mode,
     )?;
 
     program.preassign_label_to_next_insn(after_main_loop_label);
@@ -2678,10 +2683,15 @@ fn emit_update_insns<'a>(
             ),
         },
         Operation::IndexMethodQuery(_) => {
-            panic!("access through IndexMethod is not supported for update operations")
+            return Err(crate::LimboError::InternalError(
+                "IndexMethod access is not supported for UPDATE operations".to_string(),
+            ));
         }
         Operation::HashJoin(_) => {
             unreachable!("access through HashJoin is not supported for update operations")
+        }
+        Operation::MultiIndexScan(_) => {
+            unreachable!("access through MultiIndexScan is not supported for update operations")
         }
     };
 
@@ -3009,6 +3019,9 @@ fn emit_update_insns<'a>(
     // constraint violations BEFORE deleting any old index entries. This ensures that:
     // - IGNORE: We can skip the row without corrupting it by partially deleting index entries
     // - FAIL/ROLLBACK: We can halt without partial state (index deleted but not re-inserted)
+    // Note: ABORT is not included because the NotExists instruction used for rowid conflict
+    // checking repositions the table cursor, which would corrupt subsequent Column reads.
+    // ABORT halts the entire operation anyway, so preflight checking isn't strictly needed.
     if matches!(
         or_conflict,
         ResolveType::Ignore | ResolveType::Fail | ResolveType::Rollback
@@ -3302,6 +3315,28 @@ fn emit_update_insns<'a>(
             extra_amount: 0,
         });
 
+        // Apply affinity BEFORE MakeRecord so the index record has correctly converted values.
+        // This is needed for all indexes (not just unique) because the index should store
+        // values with proper affinity conversion.
+        let aff = index
+            .columns
+            .iter()
+            .map(|ic| {
+                if ic.expr.is_some() {
+                    Affinity::Blob.aff_mask()
+                } else {
+                    target_table.table.columns()[ic.pos_in_table]
+                        .affinity()
+                        .aff_mask()
+                }
+            })
+            .collect::<String>();
+        program.emit_insn(Insn::Affinity {
+            start_reg: idx_start_reg,
+            count: NonZeroUsize::new(num_cols).expect("nonzero col count"),
+            affinities: aff,
+        });
+
         program.emit_insn(Insn::MakeRecord {
             start_reg: to_u16(idx_start_reg),
             count: to_u16(num_cols + 1),
@@ -3312,24 +3347,6 @@ fn emit_update_insns<'a>(
 
         // Handle unique constraint
         if index.unique {
-            let aff = index
-                .columns
-                .iter()
-                .map(|ic| {
-                    if ic.expr.is_some() {
-                        Affinity::Blob.aff_mask()
-                    } else {
-                        target_table.table.columns()[ic.pos_in_table]
-                            .affinity()
-                            .aff_mask()
-                    }
-                })
-                .collect::<String>();
-            program.emit_insn(Insn::Affinity {
-                start_reg: idx_start_reg,
-                count: NonZeroUsize::new(num_cols).expect("nonzero col count"),
-                affinities: aff,
-            });
             let constraint_check = program.allocate_label();
             // check if the record already exists in the index for unique indexes and abort if so
             program.emit_insn(Insn::NoConflict {
@@ -3654,8 +3671,10 @@ fn emit_update_insns<'a>(
 
         // If we are updating the rowid, we cannot rely on overwrite on the
         // Insert instruction to update the cell. We need to first delete the current cell
-        // and later insert the updated record
-        if not_exists_check_required {
+        // and later insert the updated record.
+        // In MVCC mode, we also need DELETE+INSERT to properly version the row (Hekaton model).
+        let needs_delete = not_exists_check_required || connection.mvcc_enabled();
+        if needs_delete {
             program.emit_insn(Insn::Delete {
                 cursor_id: target_table_cursor_id,
                 table_name: table_name.to_string(),
@@ -3883,7 +3902,7 @@ pub fn prepare_cdc_if_necessary(
     let Some(turso_cdc_table) = schema.get_table(cdc_table) else {
         crate::bail_parse_error!("no such table: {}", cdc_table);
     };
-    let Some(cdc_btree) = turso_cdc_table.btree().clone() else {
+    let Some(cdc_btree) = turso_cdc_table.btree() else {
         crate::bail_parse_error!("no such table: {}", cdc_table);
     };
     let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(cdc_btree.clone()));

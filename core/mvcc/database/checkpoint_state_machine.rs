@@ -44,8 +44,6 @@ pub enum CheckpointState {
         index_write_set_index: usize,
     },
     CommitPagerTxn,
-    TruncateLogicalLog,
-    FsyncLogicalLog,
     CheckpointWal,
     /// Fsync the database file after checkpoint, before truncating WAL.
     /// This ensures durability: if we crash after WAL truncation but before DB fsync,
@@ -53,6 +51,8 @@ pub enum CheckpointState {
     SyncDbFile,
     /// Truncate the WAL file after DB file is safely synced (for TRUNCATE checkpoint mode)
     TruncateWal,
+    TruncateLogicalLog,
+    FsyncLogicalLog,
     Finalize,
 }
 
@@ -72,9 +72,10 @@ pub struct LockStates {
 /// 3. Begins a pager transaction
 /// 4. Writes all the selected row versions to the B-tree.
 /// 5. Commits the pager transaction, effectively flushing to the WAL
-/// 6. Truncates the logical log file
-/// 7. Immediately does a TRUNCATE checkpoint from the WAL to the DB
-/// 8. Releases the blocking_checkpoint_lock
+/// 6. Immediately does a TRUNCATE checkpoint from the WAL to the DB
+/// 7. Fsync the DB file, then truncate the WAL
+/// 8. Truncate + fsync the logical log
+/// 9. Releases the blocking_checkpoint_lock
 pub struct CheckpointStateMachine<Clock: LogicalClock> {
     /// The current state of the state machine
     state: CheckpointState,
@@ -565,8 +566,8 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 tracing::debug!("Collected {} index row changes", self.index_write_set.len());
 
                 if self.write_set.is_empty() && self.index_write_set.is_empty() {
-                    // Nothing to checkpoint, skip to truncate logical log
-                    self.state = CheckpointState::TruncateLogicalLog;
+                    // Nothing to checkpoint, skip pager txn and go straight to WAL checkpoint.
+                    self.state = CheckpointState::CheckpointWal;
                 } else {
                     self.state = CheckpointState::BeginPagerTxn;
                 }
@@ -575,8 +576,15 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
             CheckpointState::BeginPagerTxn => {
                 tracing::debug!("Beginning pager transaction");
                 // Start a pager transaction to write committed versions to B-tree
-                self.pager.begin_read_tx()?;
-                self.lock_states.pager_read_tx = true;
+                let read_tx_active = self
+                    .pager
+                    .wal
+                    .as_ref()
+                    .is_some_and(|wal| wal.holds_read_lock());
+                if !read_tx_active {
+                    self.pager.begin_read_tx()?;
+                    self.lock_states.pager_read_tx = true;
+                }
 
                 self.pager.io.block(|| self.pager.begin_write_tx())?;
                 if self.update_transaction_state {
@@ -1070,7 +1078,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                     .commit_tx(&self.connection, self.update_transaction_state)?;
                 match result {
                     IOResult::Done(_) => {
-                        self.state = CheckpointState::TruncateLogicalLog;
+                        self.state = CheckpointState::CheckpointWal;
                         self.lock_states.pager_read_tx = false;
                         self.lock_states.pager_write_tx = false;
                         let header = self.pager.io.block(|| {
@@ -1103,12 +1111,12 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 // Skip fsync when synchronous mode is off
                 if self.sync_mode == SyncMode::Off {
                     tracing::debug!("Skipping fsync of logical log file (synchronous=off)");
-                    self.state = CheckpointState::CheckpointWal;
+                    self.state = CheckpointState::Finalize;
                     return Ok(TransitionResult::Continue);
                 }
                 tracing::debug!("Fsyncing logical log file");
                 let c = self.fsync_logical_log()?;
-                self.state = CheckpointState::CheckpointWal;
+                self.state = CheckpointState::Finalize;
                 // if Completion Completed without errors we can continue
                 if c.succeeded() {
                     Ok(TransitionResult::Continue)
@@ -1178,7 +1186,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                     .expect("checkpoint_result should be set");
                 match wal.truncate_wal(checkpoint_result, self.pager.get_sync_type())? {
                     IOResult::Done(()) => {
-                        self.state = CheckpointState::Finalize;
+                        self.state = CheckpointState::TruncateLogicalLog;
                         Ok(TransitionResult::Continue)
                     }
                     IOResult::IO(io) => Ok(TransitionResult::Io(io)),

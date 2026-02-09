@@ -1,0 +1,156 @@
+name: Elle Consistency Check
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      max_steps:
+        description: "Maximum simulation steps"
+        required: false
+        default: "100000"
+      seed:
+        description: "Random seed (leave empty for random)"
+        required: false
+        default: ""
+  schedule:
+    # Run nightly at 3am UTC
+    - cron: "0 3 * * *"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  elle-check:
+    name: Elle check (${{ matrix.mvcc && 'MVCC' || 'default' }})
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        mvcc: [false, true]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: useblacksmith/rust-cache@v3
+        with:
+          prefix-key: "v1-rust"
+
+      - uses: "./.github/shared/setup-sccache"
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: "temurin"
+          java-version: "21"
+
+      - name: Cache Leiningen
+        uses: actions/cache@v4
+        with:
+          path: |
+            /tmp/lein
+            ~/.lein
+          key: lein-${{ runner.os }}
+
+      - name: Cache elle-cli
+        uses: actions/cache@v4
+        with:
+          path: /tmp/elle-cli
+          key: elle-cli-${{ runner.os }}-${{ hashFiles('.github/workflows/elle.yml') }}
+
+      - name: Build simulator
+        run: cargo build -p turso_whopper
+
+      - name: Run simulation with Elle
+        env:
+          SEED: ${{ github.event.inputs.seed }}
+        run: |
+          SEED_ARG=""
+          if [ -n "$SEED" ]; then
+            export SEED="$SEED"
+          fi
+          MAX_STEPS="${{ github.event.inputs.max_steps }}"
+          MAX_STEPS="${MAX_STEPS:-100000}"
+          MVCC_FLAG=""
+          if [ "${{ matrix.mvcc }}" = "true" ]; then
+            MVCC_FLAG="--enable-mvcc"
+          fi
+          if ./target/debug/turso_whopper \
+            --elle list-append \
+            --elle-output elle-history.edn \
+            --max-steps "$MAX_STEPS" \
+            $MVCC_FLAG; then
+            echo "SIMULATION_OK=true" >> "$GITHUB_ENV"
+          else
+            echo "::warning::Simulation failed (mvcc=${{ matrix.mvcc }})"
+            echo "SIMULATION_OK=false" >> "$GITHUB_ENV"
+            if [ "${{ matrix.mvcc }}" != "true" ]; then
+              exit 1
+            fi
+            echo "### ⚠️ MVCC simulation failed" >> "$GITHUB_STEP_SUMMARY"
+            echo "The MVCC Elle simulation failed. This is expected and non-blocking." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Setup Leiningen
+        run: |
+          if [ ! -x /tmp/lein/lein ]; then
+            mkdir -p /tmp/lein
+            curl -sL https://raw.githubusercontent.com/technomancy/leiningen/2.11.2/bin/lein -o /tmp/lein/lein
+            chmod +x /tmp/lein/lein
+            /tmp/lein/lein version
+          fi
+
+      - name: Build elle-cli
+        run: |
+          if [ ! -d /tmp/elle-cli ]; then
+            git clone --depth 1 https://github.com/ligurio/elle-cli.git /tmp/elle-cli
+          fi
+          cd /tmp/elle-cli
+          if [ ! -f target/*-standalone.jar ]; then
+            /tmp/lein/lein uberjar
+          fi
+
+      - name: Install Graphviz
+        run: sudo apt-get update && sudo apt-get install -y graphviz
+
+      - name: Run Elle analysis
+        if: env.SIMULATION_OK == 'true'
+        run: |
+          ELLE_JAR=$(ls -t /tmp/elle-cli/target/*-standalone.jar | head -1)
+          mkdir -p elle-results
+          echo "Using JAR: $ELLE_JAR"
+          echo "History file: $(pwd)/elle-history.edn"
+          echo "History size: $(wc -l < elle-history.edn) events"
+          echo ""
+          CONSISTENCY_FLAG="--consistency-models serializable"
+          if [ "${{ matrix.mvcc }}" = "true" ]; then
+            CONSISTENCY_FLAG="--consistency-models snapshot-isolation"
+          fi
+          if java -jar "$ELLE_JAR" --model list-append $CONSISTENCY_FLAG --verbose --directory elle-results elle-history.edn; then
+            echo "Elle analysis passed"
+          else
+            echo "::warning::Elle analysis found consistency violations (mvcc=${{ matrix.mvcc }})"
+            if [ "${{ matrix.mvcc }}" != "true" ]; then
+              exit 1
+            fi
+            echo "### ⚠️ MVCC Elle analysis found consistency violations" >> "$GITHUB_STEP_SUMMARY"
+            echo "This is expected and non-blocking." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload Elle results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: elle-results-${{ matrix.mvcc && 'mvcc' || 'default' }}
+          path: |
+            elle-history.edn
+            elle-results/
+          retention-days: 30

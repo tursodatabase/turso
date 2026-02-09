@@ -1522,3 +1522,99 @@ fn test_reserved_bytes_default(db: TempDatabase) {
         "Integrity check should pass with default reserved_bytes"
     );
 }
+
+// =============================================================================
+// REGRESSION TEST: Freelist trunk page reuse
+// =============================================================================
+
+/// Regression test for freelist trunk page reuse bug.
+///
+/// When a single page is freed into an empty freelist, it becomes the trunk page
+/// with no leaf pointers and no next trunk pointer. The trunk page ITSELF should
+/// be reusable for allocation.
+///
+/// The bug was that when allocating a page and finding a trunk with:
+/// - no leaf pointers (number_of_freelist_leaves == 0)
+/// - no next trunk (next_trunk_page_id == 0)
+///
+/// The old code would incorrectly treat this as "empty freelist" and allocate a
+/// new page at the end of the database file, leaving the trunk page permanently
+/// stuck in the freelist (never reused).
+///
+/// This test verifies that after:
+/// 1. Creating a table (allocates data page)
+/// 2. Dropping the table (frees data page -> becomes freelist trunk)
+/// 3. Creating another table (should reuse the freelist trunk)
+///
+/// The freelist_count should be 0 (trunk was properly reused), not 1.
+#[turso_macros::test]
+fn test_freelist_trunk_page_reuse(db: TempDatabase) {
+    let conn = db.connect_limbo();
+
+    // Create a table with some data to occupy a data page (page 2)
+    conn.execute("CREATE TABLE t1(x INTEGER PRIMARY KEY, y TEXT);")
+        .unwrap();
+    conn.execute("INSERT INTO t1 VALUES (1, 'some data to put in the table');")
+        .unwrap();
+
+    checkpoint_database(&conn);
+
+    // Verify initial state
+    let result = run_integrity_check(&conn);
+    assert_eq!(result, "ok", "Database should be valid after initial setup");
+
+    // Drop the table - this frees the data page into the freelist.
+    // The freed page becomes the trunk page (no leaves, no next trunk).
+    conn.execute("DROP TABLE t1;").unwrap();
+
+    checkpoint_database(&conn);
+
+    // After dropping, freelist should have exactly 1 page (the trunk)
+    let freelist_after_drop: Vec<Vec<turso_core::Value>> = conn
+        .pragma_query("freelist_count")
+        .expect("freelist_count should work");
+    let freelist_count_after_drop = match &freelist_after_drop[0][0] {
+        turso_core::Value::Integer(n) => *n,
+        _ => panic!("Expected integer from freelist_count"),
+    };
+    assert_eq!(
+        freelist_count_after_drop, 1,
+        "Freelist should have exactly 1 page after DROP TABLE"
+    );
+
+    let result = run_integrity_check(&conn);
+    assert_eq!(result, "ok", "Database should be valid after DROP TABLE");
+
+    // Create a new table and insert data.
+    // This should allocate a page from the freelist, reusing the trunk.
+    // BUG: Old code would skip the trunk (because next_trunk == 0) and allocate
+    // a new page at the end of the database, leaving freelist_count = 1.
+    conn.execute("CREATE TABLE t2(a INTEGER PRIMARY KEY, b TEXT);")
+        .unwrap();
+    conn.execute("INSERT INTO t2 VALUES (1, 'new data');")
+        .unwrap();
+
+    checkpoint_database(&conn);
+
+    // After creating t2, the freelist trunk should have been reused.
+    // With the fix: freelist_count = 0 (trunk reused).
+    // With the bug: freelist_count = 1 (trunk never reused).
+    let freelist_after_create: Vec<Vec<turso_core::Value>> = conn
+        .pragma_query("freelist_count")
+        .expect("freelist_count should work");
+    let freelist_count_after_create = match &freelist_after_create[0][0] {
+        turso_core::Value::Integer(n) => *n,
+        _ => panic!("Expected integer from freelist_count"),
+    };
+
+    assert_eq!(
+        freelist_count_after_create, 0,
+        "Freelist trunk page should have been reused for allocation"
+    );
+
+    let result = run_integrity_check(&conn);
+    assert_eq!(
+        result, "ok",
+        "Database should pass integrity check after freelist trunk reuse"
+    );
+}

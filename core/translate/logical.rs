@@ -609,7 +609,7 @@ impl<'a> LogicalPlanBuilder<'a> {
                 let table_schema = self.get_table_schema(&table_name, table_alias.as_deref())?;
                 Ok(LogicalPlan::TableScan(TableScan {
                     table_name,
-                    alias: table_alias.clone(),
+                    alias: table_alias,
                     schema: table_schema,
                     projection: None,
                 }))
@@ -4164,7 +4164,7 @@ mod tests {
         };
 
         let select_exprs = [aliased1, aliased2];
-        let group_exprs = [expr1.clone(), expr2.clone()];
+        let group_exprs = [expr1, expr2];
 
         // Verify that stripping aliases allows matching
         for (select_expr, group_expr) in select_exprs.iter().zip(group_exprs.iter()) {

@@ -118,6 +118,7 @@ pub fn translate_alter_table(
                 table_name,
                 new_name_norm,
                 resolver,
+                connection,
             );
         }
     }
@@ -203,6 +204,8 @@ pub fn translate_alter_table(
                             internal_id: TableInternalId::from(0),
                             table: Table::BTree(Arc::new(btree.clone())),
                             col_used_mask: ColumnUsedMask::default(),
+                            cte_select: None,
+                            cte_explicit_columns: vec![],
                         }],
                     );
                     let where_copy = index
@@ -338,6 +341,16 @@ pub fn translate_alter_table(
                             index_name: None,
                             affinity_str: Some(affinity_str),
                         });
+
+                        // In MVCC mode, we need to delete before insert to properly
+                        // end the old version (Hekaton-style UPDATE = DELETE + INSERT)
+                        if connection.mvcc_enabled() {
+                            program.emit_insn(Insn::Delete {
+                                cursor_id,
+                                table_name: table_name.clone(),
+                                is_part_of_update: true,
+                            });
+                        }
 
                         program.emit_insn(Insn::Insert {
                             cursor: cursor_id,
@@ -626,6 +639,16 @@ pub fn translate_alter_table(
                     affinity_str: None,
                 });
 
+                // In MVCC mode, we need to delete before insert to properly
+                // end the old version (Hekaton-style UPDATE = DELETE + INSERT)
+                if connection.mvcc_enabled() {
+                    program.emit_insn(Insn::Delete {
+                        cursor_id,
+                        table_name: SQLITE_TABLEID.to_string(),
+                        is_part_of_update: true,
+                    });
+                }
+
                 program.emit_insn(Insn::Insert {
                     cursor: cursor_id,
                     key_reg: rowid,
@@ -900,6 +923,16 @@ pub fn translate_alter_table(
                     affinity_str: None,
                 });
 
+                // In MVCC mode, we need to delete before insert to properly
+                // end the old version (Hekaton-style UPDATE = DELETE + INSERT)
+                if connection.mvcc_enabled() {
+                    program.emit_insn(Insn::Delete {
+                        cursor_id,
+                        table_name: SQLITE_TABLEID.to_string(),
+                        is_part_of_update: true,
+                    });
+                }
+
                 program.emit_insn(Insn::Insert {
                     cursor: cursor_id,
                     key_reg: rowid,
@@ -966,9 +999,10 @@ fn translate_rename_virtual_table(
     old_name: &str,
     new_name_norm: String,
     resolver: &Resolver,
+    connection: &Arc<crate::Connection>,
 ) -> Result<ProgramBuilder> {
     program.begin_write_operation();
-    let vtab_cur = program.alloc_cursor_id(CursorType::VirtualTable(vtab.clone()));
+    let vtab_cur = program.alloc_cursor_id(CursorType::VirtualTable(vtab));
     program.emit_insn(Insn::VOpen {
         cursor_id: vtab_cur,
     });
@@ -1028,6 +1062,16 @@ fn translate_rename_virtual_table(
             index_name: None,
             affinity_str: None,
         });
+
+        // In MVCC mode, we need to delete before insert to properly
+        // end the old version (Hekaton-style UPDATE = DELETE + INSERT)
+        if connection.mvcc_enabled() {
+            program.emit_insn(Insn::Delete {
+                cursor_id: schema_cur,
+                table_name: SQLITE_TABLEID.to_string(),
+                is_part_of_update: true,
+            });
+        }
 
         program.emit_insn(Insn::Insert {
             cursor: schema_cur,
@@ -1955,7 +1999,6 @@ fn rewrite_trigger_sql_for_column_rename(
     // Note: SQLite fails RENAME COLUMN if a trigger's WHEN clause references the column.
     // We check for this earlier and fail the operation immediately, matching SQLite.
     // If we reach here, the WHEN clause doesn't reference the column, so we keep it unchanged.
-    let new_when_clause = when_clause.clone();
 
     let mut new_commands = Vec::new();
     for cmd in commands {
@@ -1982,7 +2025,7 @@ fn rewrite_trigger_sql_for_column_rename(
         &new_event,
         &tbl_name,
         for_each_row,
-        new_when_clause.as_deref(),
+        when_clause.as_deref(),
         &new_commands,
     );
 

@@ -794,7 +794,7 @@ mod tests {
     fn test_statement_profile_with_profiles() {
         let select_profile = SelectProfile::default().complex();
         let profile = StatementProfile::default()
-            .with_select_profile(WeightedProfile::with_extra(50, select_profile.clone()))
+            .with_select_profile(WeightedProfile::with_extra(50, select_profile))
             .with_generation(GenerationProfile::default().minimal());
 
         assert_eq!(profile.select.weight, 50);

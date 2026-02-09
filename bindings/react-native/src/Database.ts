@@ -79,7 +79,7 @@ export class Database {
   private _extraIo?: () => Promise<void>;
   private _ioContext?: {
     authToken?: string | (() => string | Promise<string> | null);
-    baseUrl: string;
+    baseUrl?: string | (() => string | null);
   };
 
   /**
@@ -121,7 +121,7 @@ export class Database {
 
     const dbConfig = {
       path: this._opts.path,
-      async_io: true, // Always use async IO in React Native
+      async_io: false, // use blocking IO for local database
     };
 
     // Create native database (path normalization happens in C++ JSI layer)
@@ -150,14 +150,10 @@ export class Database {
       url = this._opts.url;
     }
 
-    if (!url) {
-      throw new Error('Sync database requires a URL');
-    }
-
     // Build dbConfig (path normalization happens in C++ JSI layer)
     const dbConfig = {
       path: this._opts.path,
-      async_io: true, // Always use async IO in React Native
+      async_io: true, // use async IO for synced database as we have network IO loop externally from the turso core
     };
 
     // Calculate reserved bytes from cipher
@@ -193,7 +189,7 @@ export class Database {
     // Create IO context with auth token and base URL
     this._ioContext = {
       authToken: this._opts.authToken,
-      baseUrl: url,
+      baseUrl: this._opts.url,
     };
 
     // Create extraIo callback for partial sync support

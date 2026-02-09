@@ -16,6 +16,6 @@
     "@tursodatabase/serverless": "../../packages/turso-serverless",
     "@tursodatabase/database": "../../bindings/javascript/packages/native",
     "better-sqlite3": "^11.9.1",
-    "libsql": "^0.6.0-pre.16"
+    "libsql": "^0.6.0-pre.29"
   }
 }

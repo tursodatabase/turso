@@ -362,7 +362,7 @@ pub fn translate_insert(
 
     // Set up the program to return result columns if RETURNING is specified
     if !result_columns.is_empty() {
-        program.result_columns = result_columns.clone();
+        program.result_columns.clone_from(&result_columns);
     }
     let insertion = build_insertion(&mut program, &table, &columns, ctx.num_values)?;
 
@@ -2371,7 +2371,7 @@ fn translate_virtual_table_insert(
         _ => crate::bail_parse_error!("Unsupported INSERT body for virtual tables"),
     };
     let table = Table::Virtual(virtual_table.clone());
-    let cursor_id = program.alloc_cursor_id(CursorType::VirtualTable(virtual_table.clone()));
+    let cursor_id = program.alloc_cursor_id(CursorType::VirtualTable(virtual_table));
     program.emit_insn(Insn::VOpen { cursor_id });
     program.emit_insn(Insn::VBegin { cursor_id });
     /* *

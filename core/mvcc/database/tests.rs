@@ -24,7 +24,7 @@ pub(crate) struct MvccTestDb {
 impl MvccTestDb {
     pub fn new() -> Self {
         let io = Arc::new(MemoryIO::new());
-        let db = Database::open_file(io.clone(), ":memory:").unwrap();
+        let db = Database::open_file(io, ":memory:").unwrap();
         let conn = db.connect().unwrap();
         // Enable MVCC via PRAGMA
         conn.execute("PRAGMA journal_mode = 'experimental_mvcc'")
@@ -41,7 +41,7 @@ impl MvccTestDb {
 impl MvccTestDbNoConn {
     pub fn new() -> Self {
         let io = Arc::new(MemoryIO::new());
-        let db = Database::open_file(io.clone(), ":memory:").unwrap();
+        let db = Database::open_file(io, ":memory:").unwrap();
         // Enable MVCC via PRAGMA
         let conn = db.connect().unwrap();
         conn.execute("PRAGMA journal_mode = 'experimental_mvcc'")
@@ -63,7 +63,7 @@ impl MvccTestDbNoConn {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let io = Arc::new(PlatformIO::new().unwrap());
         println!("path: {}", path.as_os_str().to_str().unwrap());
-        let db = Database::open_file(io.clone(), path.as_os_str().to_str().unwrap()).unwrap();
+        let db = Database::open_file(io, path.as_os_str().to_str().unwrap()).unwrap();
         // Enable MVCC via PRAGMA
         let conn = db.connect().unwrap();
         conn.execute("PRAGMA journal_mode = 'experimental_mvcc'")
@@ -88,7 +88,7 @@ impl MvccTestDbNoConn {
         // Now open again.
         let io = Arc::new(PlatformIO::new().unwrap());
         let path = self.path.as_ref().unwrap();
-        let db = Database::open_file(io.clone(), path).unwrap();
+        let db = Database::open_file(io, path).unwrap();
         self.db.replace(db);
     }
 
@@ -973,7 +973,7 @@ fn test_cursor_with_empty_table() {
     {
         // FIXME: force page 1 initialization
         let pager = db.conn.pager.load().clone();
-        let tx_id = db.mvcc_store.begin_tx(pager.clone()).unwrap();
+        let tx_id = db.mvcc_store.begin_tx(pager).unwrap();
         commit_tx(db.mvcc_store.clone(), &db.conn, tx_id).unwrap();
     }
     let tx_id = db
@@ -1118,12 +1118,12 @@ fn test_snapshot_isolation_tx_visible1() {
         (1, new_tx(1, 1, TransactionState::Committed(2))),
         (2, new_tx(2, 2, TransactionState::Committed(5))),
         (3, new_tx(3, 3, TransactionState::Aborted)),
-        (5, new_tx(5, 5, TransactionState::Preparing)),
+        (5, new_tx(5, 5, TransactionState::Preparing(8))),
         (6, new_tx(6, 6, TransactionState::Committed(10))),
         (7, new_tx(7, 7, TransactionState::Active)),
     ]);
 
-    let current_tx = new_tx(4, 4, TransactionState::Preparing);
+    let current_tx = new_tx(4, 4, TransactionState::Preparing(7));
 
     let rv_visible = |begin: Option<TxTimestampOrID>, end: Option<TxTimestampOrID>| {
         let row_version = RowVersion {
@@ -1241,7 +1241,7 @@ fn test_restart() {
         // now insert a row into table -2
         let row = generate_simple_string_row((-2).into(), 1, "foo");
         mvcc_store.insert(tx_id, row).unwrap();
-        commit_tx(mvcc_store.clone(), &conn, tx_id).unwrap();
+        commit_tx(mvcc_store, &conn, tx_id).unwrap();
         conn.close().unwrap();
     }
     db.restart();
@@ -1356,7 +1356,7 @@ fn test_commit_without_tx() {
     // expect error on trying to commit a non-existent interactive transaction
     let err = conn.execute("COMMIT").unwrap_err();
     if let LimboError::TxError(e) = err {
-        assert_eq!(e.to_string(), "cannot commit - no transaction is active");
+        assert_eq!(e, "cannot commit - no transaction is active");
     } else {
         panic!("Expected TxError");
     }
@@ -1504,7 +1504,7 @@ fn test_batch_writes() {
 
 #[test]
 fn transaction_display() {
-    let state = AtomicTransactionState::from(TransactionState::Preparing);
+    let state = AtomicTransactionState::from(TransactionState::Preparing(20250915));
     let tx_id = 42;
     let begin_ts = 20250914;
 
@@ -1526,7 +1526,7 @@ fn transaction_display() {
         savepoint_stack: RwLock::new(Vec::new()),
     };
 
-    let expected = "{ state: Preparing, id: 42, begin_ts: 20250914, write_set: [RowID { table_id: MVTableId(-2), row_id: Int(11) }, RowID { table_id: MVTableId(-2), row_id: Int(13) }], read_set: [RowID { table_id: MVTableId(-2), row_id: Int(17) }, RowID { table_id: MVTableId(-2), row_id: Int(19) }] }";
+    let expected = "{ state: Preparing(20250915), id: 42, begin_ts: 20250914, write_set: [RowID { table_id: MVTableId(-2), row_id: Int(11) }, RowID { table_id: MVTableId(-2), row_id: Int(13) }], read_set: [RowID { table_id: MVTableId(-2), row_id: Int(17) }, RowID { table_id: MVTableId(-2), row_id: Int(19) }] }";
     let output = format!("{tx}");
     assert_eq!(output, expected);
 }
@@ -1558,6 +1558,67 @@ fn test_insert_with_checkpoint() {
         Value::Integer(i) => assert_eq!(*i, 1),
         _ => unreachable!(),
     }
+}
+
+#[test]
+fn test_auto_checkpoint_busy_is_ignored() {
+    let db = MvccTestDb::new();
+    db.mvcc_store.set_checkpoint_threshold(0);
+
+    // Keep a second transaction open to hold the checkpoint read lock.
+    let tx1 = db
+        .mvcc_store
+        .begin_tx(db.conn.pager.load().clone())
+        .unwrap();
+    let tx2 = db
+        .mvcc_store
+        .begin_tx(db.conn.pager.load().clone())
+        .unwrap();
+
+    let row = generate_simple_string_row((-2).into(), 1, "Hello");
+    db.mvcc_store.insert(tx1, row).unwrap();
+
+    // Regression: auto-checkpoint returning Busy used to bubble up and cause
+    // statement abort/rollback after the tx was removed.
+    // Commit should succeed even if the auto-checkpoint is busy.
+    commit_tx(db.mvcc_store.clone(), &db.conn, tx1).unwrap();
+
+    // Cleanup: release the read lock held by tx2.
+    db.mvcc_store
+        .rollback_tx(tx2, db.conn.pager.load().clone(), &db.conn);
+}
+
+#[test]
+fn test_mvcc_read_tx_lifecycle() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+
+    conn.execute("CREATE TABLE t(x)").unwrap();
+    conn.execute("BEGIN").unwrap();
+    conn.execute("SELECT * FROM t").unwrap();
+
+    let pager = conn.pager.load();
+    let wal = pager.wal.as_ref().expect("wal should be enabled");
+    assert!(wal.holds_read_lock());
+
+    conn.execute("COMMIT").unwrap();
+    assert!(!wal.holds_read_lock());
+}
+
+#[test]
+fn test_mvcc_conn_drop_releases_read_tx() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+
+    conn.execute("CREATE TABLE t(x)").unwrap();
+
+    let pager = conn.pager.load();
+    pager.begin_read_tx().unwrap();
+    let wal = pager.wal.as_ref().expect("wal should be enabled").clone();
+    assert!(wal.holds_read_lock());
+
+    drop(conn);
+    assert!(!wal.holds_read_lock());
 }
 
 #[test]
@@ -2676,4 +2737,54 @@ fn test_checkpoint_drop_table() {
     let rows = get_rows(&conn, "PRAGMA integrity_check");
     assert_eq!(rows.len(), 1);
     assert_eq!(&rows[0][0].to_string(), "ok");
+}
+
+/// Test that inserting a duplicate primary key fails when the existing row
+/// was committed before this transaction started (and thus is visible).
+#[test]
+fn test_mvcc_same_primary_key() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+        .unwrap();
+    let conn2 = db.connect();
+
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    conn.execute("INSERT INTO t VALUES (666)").unwrap();
+    conn.execute("COMMIT").unwrap();
+
+    // conn2 starts AFTER conn1 committed, so conn2 can see the committed row.
+    // INSERT should fail with UNIQUE constraint because the row is visible.
+    conn2.execute("BEGIN CONCURRENT").unwrap();
+    conn2
+        .execute("INSERT INTO t VALUES (666)")
+        .expect_err("duplicate key - visible committed row");
+}
+
+#[test]
+fn test_mvcc_same_primary_key_concurrent() {
+    // Pure optimistic concurrency: both transactions can INSERT the same rowid,
+    // but only one can commit (first-committer-wins based on end_ts comparison).
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+        .unwrap();
+    let conn2 = db.connect();
+
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    conn.execute("INSERT INTO t VALUES (666)").unwrap();
+
+    conn2.execute("BEGIN CONCURRENT").unwrap();
+    // With pure optimistic CC, INSERT succeeds - conflict detected at commit time
+    conn2.execute("INSERT INTO t VALUES (666)").unwrap();
+
+    // First transaction commits successfully (gets lower end_ts)
+    conn.execute("COMMIT").unwrap();
+
+    // Second transaction fails at commit time (first-committer-wins)
+    conn2
+        .execute("COMMIT")
+        .expect_err("duplicate key - first committer wins");
 }

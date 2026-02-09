@@ -181,7 +181,7 @@ def test_partial_sync_prefetch():
 
 
 def run_full(path: str, remote_url: str, barrier: any):
-    barrier.wait()
+    barrier.wait(timeout=60)
     try:
         print(turso.sync.connect(path, remote_url=remote_url))
     except Exception as e:
@@ -205,11 +205,18 @@ def test_bootstrap_concurrency():
             t1.start()
             t2.start()
 
-            t1.join()
-            t2.join()
+            t1.join(timeout=120)
+            t2.join(timeout=120)
 
-            assert t1.exitcode == 0
-            assert t2.exitcode == 0
+            if t1.is_alive():
+                t1.kill()
+                t1.join()
+            if t2.is_alive():
+                t2.kill()
+                t2.join()
+
+            assert t1.exitcode == 0, f"t1 exitcode: {t1.exitcode}"
+            assert t2.exitcode == 0, f"t2 exitcode: {t2.exitcode}"
 
 
 def test_configuration_persistence():

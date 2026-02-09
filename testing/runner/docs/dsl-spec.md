@@ -208,6 +208,7 @@ The `@skip-if` decorator supports the following conditions:
 | Condition | Description |
 |-----------|-------------|
 | `mvcc` | Skip when MVCC mode is enabled (`--mvcc` flag) |
+| `sqlite` | Skip when running with the sqlite CLI backend |
 
 #### Capabilities
 
@@ -450,6 +451,7 @@ decorator       = "@setup" IDENTIFIER NEWLINE
                 | "@requires" capability STRING NEWLINE
 
 skip_condition  = "mvcc"
+                | "sqlite"
 
 capability      = "trigger" | "strict" | "materialized_views"
 
@@ -558,7 +560,7 @@ The lexer uses the [Logos](https://docs.rs/logos) crate (v0.16) for tokenization
 - **Tokens**: The lexer produces these token types:
   - Keywords: `@database`, `@setup`, `@skip`, `@skip-if`, `@skip-file`, `@skip-file-if`, `@requires`, `@requires-file`, `@backend`, `setup`, `test`, `expect`, `snapshot`
   - Modifiers: `error`, `pattern`, `unordered`, `readonly`, `raw`
-  - Skip conditions: `mvcc`
+  - Skip conditions: `mvcc`, `sqlite`
   - Capabilities: `trigger`, `strict`, `materialized_views`
   - Database types: `:memory:`, `:temp:`, `:default:`, `:default-no-rowidalias:`
   - Block content: `{...}` (content between braces)
@@ -612,6 +614,7 @@ pub struct Skip {
 
 pub enum SkipCondition {
     Mvcc,  // Skip when MVCC mode is enabled
+    Sqlite, // Skip when running against sqlite CLI backend
 }
 
 pub enum Capability {

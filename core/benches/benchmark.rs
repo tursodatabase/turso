@@ -65,7 +65,7 @@ fn bench_open(criterion: &mut Criterion) {
     if !std::fs::exists("../testing/system/schema_5k.db").unwrap() {
         #[allow(clippy::arc_with_non_send_sync)]
         let io = Arc::new(PlatformIO::new().unwrap());
-        let db = Database::open_file(io.clone(), "../testing/system/schema_5k.db").unwrap();
+        let db = Database::open_file(io, "../testing/system/schema_5k.db").unwrap();
         let conn = db.connect().unwrap();
 
         for i in 0..5000 {
@@ -81,7 +81,7 @@ fn bench_open(criterion: &mut Criterion) {
         b.iter(|| {
             #[allow(clippy::arc_with_non_send_sync)]
             let io = Arc::new(PlatformIO::new().unwrap());
-            let db = Database::open_file(io.clone(), "../testing/system/schema_5k.db").unwrap();
+            let db = Database::open_file(io, "../testing/system/schema_5k.db").unwrap();
             let conn = db.connect().unwrap();
             conn.execute("SELECT * FROM table_0").unwrap();
         });
@@ -107,7 +107,7 @@ fn bench_alter(criterion: &mut Criterion) {
     if !std::fs::exists("../testing/system/schema_5k.db").unwrap() {
         #[allow(clippy::arc_with_non_send_sync)]
         let io = Arc::new(PlatformIO::new().unwrap());
-        let db = Database::open_file(io.clone(), "../testing/system/schema_5k.db").unwrap();
+        let db = Database::open_file(io, "../testing/system/schema_5k.db").unwrap();
         let conn = db.connect().unwrap();
 
         for i in 0..5000 {
@@ -122,7 +122,7 @@ fn bench_alter(criterion: &mut Criterion) {
     group.bench_function(BenchmarkId::new("limbo_rename_table", ""), |b| {
         #[allow(clippy::arc_with_non_send_sync)]
         let io = Arc::new(PlatformIO::new().unwrap());
-        let db = Database::open_file(io.clone(), "../testing/system/schema_5k.db").unwrap();
+        let db = Database::open_file(io, "../testing/system/schema_5k.db").unwrap();
         let conn = db.connect().unwrap();
         b.iter_custom(|iters| {
             (0..iters)
@@ -167,7 +167,7 @@ fn bench_alter(criterion: &mut Criterion) {
     group.bench_function(BenchmarkId::new("limbo_rename_column", ""), |b| {
         #[allow(clippy::arc_with_non_send_sync)]
         let io = Arc::new(PlatformIO::new().unwrap());
-        let db = Database::open_file(io.clone(), "../testing/system/schema_5k.db").unwrap();
+        let db = Database::open_file(io, "../testing/system/schema_5k.db").unwrap();
         let conn = db.connect().unwrap();
         b.iter_custom(|iters| {
             (0..iters)
@@ -213,7 +213,7 @@ fn bench_alter(criterion: &mut Criterion) {
     group.bench_function(BenchmarkId::new("limbo_add_column", ""), |b| {
         #[allow(clippy::arc_with_non_send_sync)]
         let io = Arc::new(PlatformIO::new().unwrap());
-        let db = Database::open_file(io.clone(), "../testing/system/schema_5k.db").unwrap();
+        let db = Database::open_file(io, "../testing/system/schema_5k.db").unwrap();
         let conn = db.connect().unwrap();
         b.iter_custom(|iters| {
             (0..iters)
@@ -258,7 +258,7 @@ fn bench_alter(criterion: &mut Criterion) {
     group.bench_function(BenchmarkId::new("limbo_drop_column", ""), |b| {
         #[allow(clippy::arc_with_non_send_sync)]
         let io = Arc::new(PlatformIO::new().unwrap());
-        let db = Database::open_file(io.clone(), "../testing/system/schema_5k.db").unwrap();
+        let db = Database::open_file(io, "../testing/system/schema_5k.db").unwrap();
         let conn = db.connect().unwrap();
         b.iter_custom(|iters| {
             (0..iters)
@@ -306,7 +306,7 @@ fn bench_prepare_query(criterion: &mut Criterion) {
 
     #[allow(clippy::arc_with_non_send_sync)]
     let io = Arc::new(PlatformIO::new().unwrap());
-    let db = Database::open_file(io.clone(), "../testing/system/testing.db").unwrap();
+    let db = Database::open_file(io, "../testing/system/testing.db").unwrap();
     let limbo_conn = db.connect().unwrap();
 
     let queries = [
@@ -388,7 +388,7 @@ fn bench_execute_select_rows(criterion: &mut Criterion) {
 
     #[allow(clippy::arc_with_non_send_sync)]
     let io = Arc::new(PlatformIO::new().unwrap());
-    let db = Database::open_file(io.clone(), "../testing/system/testing.db").unwrap();
+    let db = Database::open_file(io, "../testing/system/testing.db").unwrap();
     let limbo_conn = db.connect().unwrap();
 
     let mut group = criterion.benchmark_group("Execute `SELECT * FROM users LIMIT ?`");
@@ -456,7 +456,7 @@ fn bench_execute_select_1(criterion: &mut Criterion) {
 
     #[allow(clippy::arc_with_non_send_sync)]
     let io = Arc::new(PlatformIO::new().unwrap());
-    let db = Database::open_file(io.clone(), "../testing/system/testing.db").unwrap();
+    let db = Database::open_file(io, "../testing/system/testing.db").unwrap();
     let limbo_conn = db.connect().unwrap();
 
     let mut group = criterion.benchmark_group("Execute `SELECT 1`");
@@ -508,7 +508,7 @@ fn bench_execute_select_count(criterion: &mut Criterion) {
 
     #[allow(clippy::arc_with_non_send_sync)]
     let io = Arc::new(PlatformIO::new().unwrap());
-    let db = Database::open_file(io.clone(), "../testing/system/testing.db").unwrap();
+    let db = Database::open_file(io, "../testing/system/testing.db").unwrap();
     let limbo_conn = db.connect().unwrap();
 
     let mut group = criterion.benchmark_group("Execute `SELECT count() FROM users`");
@@ -690,7 +690,7 @@ fn bench_limbo(
     let io = Arc::new(PlatformIO::new().unwrap());
     let temp_dir = tempfile::tempdir().unwrap();
     let path = temp_dir.path().join("bench.db");
-    let db = Database::open_file(io.clone(), path.to_str().unwrap()).unwrap();
+    let db = Database::open_file(io, path.to_str().unwrap()).unwrap();
     let mut connecitons = Vec::new();
     {
         let conn = db.connect().unwrap();
@@ -777,7 +777,7 @@ fn bench_limbo_mvcc(
     let io = Arc::new(PlatformIO::new().unwrap());
     let temp_dir = tempfile::tempdir().unwrap();
     let path = temp_dir.path().join("bench.db");
-    let db = Database::open_file(io.clone(), path.to_str().unwrap()).unwrap();
+    let db = Database::open_file(io, path.to_str().unwrap()).unwrap();
     let mut connecitons = Vec::new();
     let conn0 = db.connect().unwrap();
     if mvcc {

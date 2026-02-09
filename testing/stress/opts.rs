@@ -26,17 +26,9 @@ impl fmt::Display for TxMode {
 #[command(name = "turso_stress")]
 #[command(author, version, about, long_about = None)]
 pub struct Opts {
-    /// Verbose mode
-    #[clap(short = 'v', long, help = "verbose mode")]
-    pub verbose: bool,
-
     /// Transaction mode
     #[clap(long, help = "transaction mode", default_value_t = TxMode::SQLite)]
     pub tx_mode: TxMode,
-
-    /// Silent mode
-    #[clap(long, help = "silent mode")]
-    pub silent: bool,
 
     /// Number of threads to run
     #[clap(short = 't', long, help = "the number of threads", default_value_t = 1)]

@@ -1,5 +1,7 @@
 use branches::mark_unlikely;
-use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use rustc_hash::FxHashMap as HashMap;
+#[cfg(debug_assertions)]
+use rustc_hash::FxHashSet as HashSet;
 use smallvec::SmallVec;
 use tracing::{instrument, Level};
 
@@ -12,8 +14,10 @@ use crate::{
         sqlite3_ondisk::{
             payload_overflows, read_u32, read_varint, write_varint, BTreeCell, DatabaseHeader,
             PageContent, PageSize, PageType, TableInteriorCell, TableLeafCell, CELL_PTR_SIZE_BYTES,
-            INTERIOR_PAGE_HEADER_SIZE_BYTES, LEAF_PAGE_HEADER_SIZE_BYTES,
-            LEFT_CHILD_PTR_SIZE_BYTES,
+            FREELIST_LEAF_PTR_SIZE, FREELIST_TRUNK_HEADER_SIZE,
+            FREELIST_TRUNK_OFFSET_FIRST_LEAF_PTR, FREELIST_TRUNK_OFFSET_LEAF_COUNT,
+            FREELIST_TRUNK_OFFSET_NEXT_TRUNK_PTR, INTERIOR_PAGE_HEADER_SIZE_BYTES,
+            LEAF_PAGE_HEADER_SIZE_BYTES, LEFT_CHILD_PTR_SIZE_BYTES,
         },
         state_machines::{
             AdvanceState, CountState, EmptyTableState, MoveToRightState, MoveToState, RewindState,
@@ -3460,7 +3464,7 @@ impl BTreeCursor {
                         {
                             page_numbers[i] = page.as_ref().unwrap().get().id;
                         }
-                        page_numbers.sort();
+                        page_numbers.sort_unstable();
                         for (page, new_id) in pages_to_balance_new
                             .iter()
                             .take(sibling_count_new)
@@ -5821,6 +5825,16 @@ pub enum IntegrityCheckError {
     PageNeverUsed { page_id: i64 },
     #[error("Pending byte page {page_id} is being used")]
     PendingBytePageUsed { page_id: i64 },
+    #[error(
+        "Freelist trunk page {page_id} has invalid pointer count {page_pointers} (max {max_pointers})"
+    )]
+    FreelistTrunkCorrupt {
+        page_id: i64,
+        page_pointers: u32,
+        max_pointers: usize,
+    },
+    #[error("Freelist page pointer out of range: page {page_id} points to {pointer}")]
+    FreelistPointerOutOfRange { page_id: i64, pointer: i64 },
     #[error("wrong # of entries in index {index_name}")]
     IndexEntryCountMismatch {
         index_name: String,
@@ -6014,8 +6028,22 @@ pub fn integrity_check(
         let contents = page.get_contents();
         if page_category == PageCategory::FreeListTrunk {
             state.freelist_count.actual_count += 1;
-            let next_freelist_trunk_page = contents.read_u32_no_offset(0);
+            let next_freelist_trunk_page =
+                contents.read_u32_no_offset(FREELIST_TRUNK_OFFSET_NEXT_TRUNK_PTR);
             if next_freelist_trunk_page != 0 {
+                if next_freelist_trunk_page as usize > state.db_size {
+                    tracing::error!(
+                        "integrity_check: freelist trunk page {} has invalid next pointer {}. header_bytes={:02x?}",
+                        page.get().id,
+                        next_freelist_trunk_page,
+                        &contents.as_ptr()[0..16]
+                    );
+                    errors.push(IntegrityCheckError::FreelistPointerOutOfRange {
+                        page_id: page.get().id as i64,
+                        pointer: next_freelist_trunk_page as i64,
+                    });
+                    continue;
+                }
                 state.push_page(
                     IntegrityCheckPageEntry {
                         page_idx: next_freelist_trunk_page as i64,
@@ -6027,9 +6055,56 @@ pub fn integrity_check(
                     errors,
                 );
             }
-            let page_pointers = contents.read_u32_no_offset(4);
+            let page_pointers = contents.read_u32_no_offset(FREELIST_TRUNK_OFFSET_LEAF_COUNT);
+            let page_size = contents.as_ptr().len();
+            let max_pointers =
+                page_size.saturating_sub(FREELIST_TRUNK_HEADER_SIZE) / FREELIST_LEAF_PTR_SIZE;
+            if page_pointers as usize > max_pointers {
+                tracing::error!(
+                    "integrity_check: freelist trunk page {} has invalid leaf count {} (max {}). header_bytes={:02x?}",
+                    page.get().id,
+                    page_pointers,
+                    max_pointers,
+                    &contents.as_ptr()[0..16]
+                );
+                errors.push(IntegrityCheckError::FreelistTrunkCorrupt {
+                    page_id: page.get().id as i64,
+                    page_pointers,
+                    max_pointers,
+                });
+                continue;
+            }
             for i in 0..page_pointers {
-                let page_pointer = contents.read_u32_no_offset((8 + 4 * i) as usize);
+                let offset =
+                    FREELIST_TRUNK_OFFSET_FIRST_LEAF_PTR + FREELIST_LEAF_PTR_SIZE * i as usize;
+                if offset + FREELIST_LEAF_PTR_SIZE > page_size {
+                    tracing::error!(
+                        "integrity_check: freelist trunk page {} has invalid leaf offset {}. header_bytes={:02x?}",
+                        page.get().id,
+                        offset,
+                        &contents.as_ptr()[0..16]
+                    );
+                    errors.push(IntegrityCheckError::FreelistTrunkCorrupt {
+                        page_id: page.get().id as i64,
+                        page_pointers,
+                        max_pointers,
+                    });
+                    break;
+                }
+                let page_pointer = contents.read_u32_no_offset(offset);
+                if page_pointer as usize > state.db_size {
+                    tracing::error!(
+                        "integrity_check: freelist trunk page {} has invalid leaf pointer {}. header_bytes={:02x?}",
+                        page.get().id,
+                        page_pointer,
+                        &contents.as_ptr()[0..16]
+                    );
+                    errors.push(IntegrityCheckError::FreelistPointerOutOfRange {
+                        page_id: page.get().id as i64,
+                        pointer: page_pointer as i64,
+                    });
+                    continue;
+                }
                 state.push_page(
                     IntegrityCheckPageEntry {
                         page_idx: page_pointer as i64,
@@ -8384,7 +8459,7 @@ mod tests {
             }
         }
         if let Some(rightmost) = contents.rightmost_pointer().ok().flatten() {
-            child.push(format_btree(pager.clone(), rightmost as i64, depth + 2));
+            child.push(format_btree(pager, rightmost as i64, depth + 2));
         }
         let current = format!(
             "{}-page:{}, ptr(right):{:?}\n{}+cells:{}",
@@ -8456,7 +8531,7 @@ mod tests {
         let large_payload = vec![b'X'; large_payload_size];
 
         // Create a record with the large payload
-        let regs = &[Register::Value(Value::Blob(large_payload.clone()))];
+        let regs = &[Register::Value(Value::Blob(large_payload))];
         let large_record = ImmutableRecord::from_registers(regs, regs.len());
 
         // Create cursor for the table
@@ -8757,7 +8832,7 @@ mod tests {
                 if do_validate
                     && (!valid || matches!(validate_btree(pager.clone(), root_page), (_, false)))
                 {
-                    let btree_after = format_btree(pager.clone(), root_page, 0);
+                    let btree_after = format_btree(pager, root_page, 0);
                     println!("btree before:\n{btree_before}");
                     println!("btree after:\n{btree_after}");
                     panic!("invalid btree");
@@ -9993,7 +10068,6 @@ mod tests {
         let header_size = 8;
 
         let mut total_size = 0;
-        let mut cells = Vec::new();
         let usable_space = 4096;
         let mut i = 1000;
         for seed in [15292777653676891381, 9261043168681395159] {
@@ -10033,10 +10107,6 @@ mod tests {
                         insert_into_cell(page_contents, &payload, cell_idx, 4096).unwrap();
                         assert!(page_contents.overflow_cells.is_empty());
                         total_size += payload.len() + 2;
-                        cells.push(Cell {
-                            pos: i as usize,
-                            payload,
-                        });
                     }
                     1 => {
                         if page_contents.cell_count() == 0 {
@@ -10048,7 +10118,6 @@ mod tests {
                             .unwrap();
                         drop_cell(page_contents, cell_idx, usable_space).unwrap();
                         total_size -= len + 2;
-                        cells.remove(cell_idx);
                     }
                     2 => {
                         defragment_page(page_contents, usable_space, 4).unwrap();

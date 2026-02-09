@@ -152,7 +152,7 @@ impl<T: AnyText> Extendable<T> for Text {
                         s.as_mut_vec().set_len(needed);
                     }
                 } else {
-                    *s = other_str.to_owned();
+                    other_str.clone_into(s);
                 }
             }
             Cow::Borrowed(_) => {

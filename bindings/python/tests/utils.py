@@ -34,23 +34,51 @@ class TursoServer:
             self._host = f"{name}--{name}--{name}.localhost"
             self._server = None
         else:
-            port = random.randint(10_000, 65535)
-            self._server = subprocess.Popen(
-                [os.environ["LOCAL_SYNC_SERVER"], "--sync-server", f"0.0.0.0:{port}"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-            )
-            self._user_url = f"http://localhost:{port}"
-            self._db_url = f"http://localhost:{port}"
-            self._host = ""
-            # wait for server to be available
-            while True:
-                try:
-                    requests.get(self._user_url)
-                    break
-                except Exception:
-                    time.sleep(0.1)
-            return
+            # Retry with different ports in case the chosen port is
+            # unavailable (common on Windows where OS reserves port ranges).
+            max_attempts = 5
+            for attempt in range(max_attempts):
+                port = random.randint(10_000, 65535)
+                self._server = subprocess.Popen(
+                    [os.environ["LOCAL_SYNC_SERVER"], "--sync-server", f"0.0.0.0:{port}"],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+                self._user_url = f"http://localhost:{port}"
+                self._db_url = f"http://localhost:{port}"
+                self._host = ""
+                # wait for server to be available
+                deadline = time.time() + 30
+                while time.time() < deadline:
+                    rc = self._server.poll()
+                    if rc is not None:
+                        stderr = self._server.stderr.read().decode(errors="replace")
+                        if "os error 10013" in stderr or "address already in use" in stderr.lower():
+                            break  # retry with a different port
+                        raise RuntimeError(
+                            f"sync server exited with code {rc} before accepting connections\nstderr: {stderr}"
+                        )
+                    try:
+                        requests.get(self._user_url, timeout=5)
+                        break
+                    except Exception:
+                        time.sleep(0.1)
+                else:
+                    stderr = ""
+                    if self._server.poll() is not None:
+                        stderr = self._server.stderr.read().decode(errors="replace")
+                    self._server.kill()
+                    raise TimeoutError(
+                        f"sync server did not become available within 30s\nstderr: {stderr}"
+                    )
+                # If the inner loop broke out due to a port conflict, retry
+                if self._server.poll() is not None:
+                    if attempt == max_attempts - 1:
+                        raise RuntimeError(
+                            f"sync server failed to bind after {max_attempts} port attempts"
+                        )
+                    continue
+                break  # server is up
 
     def __enter__(self):
         return self

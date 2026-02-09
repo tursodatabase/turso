@@ -4013,7 +4013,7 @@ world""#,
         // Test that binary data can be round-tripped through the JSONB format
         let original = r#"{"test":"value","array":[1,2,3]}"#;
         let parsed = Jsonb::from_str(original).unwrap();
-        let binary_data = parsed.data.clone();
+        let binary_data = parsed.data;
 
         // Create a new Jsonb from the binary data
         let from_binary = Jsonb::new(0, Some(&binary_data));
@@ -4044,7 +4044,7 @@ world""#,
         assert!(jsonb.element_type().is_ok());
 
         // Invalid JSONB (manually corrupted)
-        let mut invalid = jsonb.data.clone();
+        let mut invalid = jsonb.data;
         if !invalid.is_empty() {
             invalid[0] = 0xFF; // Invalid element type
             let jsonb = Jsonb::new(0, Some(&invalid));

@@ -1,6 +1,7 @@
 use crate::{
     function::Deterministic,
     index_method::IndexMethodCostEstimate,
+    numeric::Numeric,
     schema::{BTreeTable, Index, IndexColumn, Schema, Table, ROWID_SENTINEL},
     translate::{
         insert::ROWID_COLUMN,
@@ -43,8 +44,9 @@ use turso_parser::ast::{self, Expr, SortOrder, TriggerEvent};
 use super::{
     emitter::Resolver,
     plan::{
-        DeletePlan, GroupBy, IterationDirection, JoinOrderMember, JoinedTable, Operation, Plan,
-        Search, SeekDef, SeekKey, SelectPlan, TableReferences, UpdatePlan, WhereTerm,
+        DeletePlan, GroupBy, IterationDirection, JoinOrderMember, JoinedTable, MultiIndexBranch,
+        MultiIndexScanOp, Operation, Plan, Search, SeekDef, SeekKey, SelectPlan, TableReferences,
+        UpdatePlan, WhereTerm,
     },
     planner::TableMask,
 };
@@ -706,6 +708,8 @@ fn add_ephemeral_table_to_update_plan(
                 internal_id: table.internal_id,
                 table: table.table.clone(),
                 col_used_mask: table.col_used_mask.clone(),
+                cte_select: None,
+                cte_explicit_columns: vec![],
             });
     }
 
@@ -1138,7 +1142,7 @@ fn optimize_table_access(
     }
 
     let Some(best_join_order_result) = compute_best_join_order(
-        table_references.joined_tables_mut(),
+        table_references.joined_tables(),
         maybe_order_target.as_ref(),
         &constraints_per_table,
         &base_table_rows,
@@ -1148,6 +1152,9 @@ fn optimize_table_access(
         &index_method_candidates,
         params,
         &schema.analyze_stats,
+        available_indexes,
+        table_references,
+        schema,
     )?
     else {
         return Ok(None);
@@ -1566,6 +1573,46 @@ fn optimize_table_access(
                 // Set up the index method query operation
                 table_references.joined_tables_mut()[table_idx].op =
                     Operation::IndexMethodQuery(query.clone());
+            }
+            AccessMethodParams::MultiIndexScan {
+                branches,
+                where_term_idx,
+                set_op,
+                additional_consumed_terms,
+            } => {
+                // Mark the primary WHERE clause term as consumed
+                where_clause[*where_term_idx].consumed = true;
+                // For intersection, also mark additional consumed terms
+                for term_idx in additional_consumed_terms.iter() {
+                    where_clause[*term_idx].consumed = true;
+                }
+
+                // Build the MultiIndexScanOp from the branch parameters
+                let mut multi_idx_branches: Vec<MultiIndexBranch> = Vec::new();
+                for branch in branches.iter() {
+                    // Build seek_def from constraint_refs using the branch's own constraint
+                    // (not constraints_per_table, since the branch constraint was created separately)
+                    let seek_def = build_seek_def_from_constraints(
+                        &[branch.constraint.clone()],
+                        &branch.constraint_refs,
+                        IterationDirection::Forwards, // Multi-index always scans forward
+                        where_clause,
+                        Some(table_references),
+                    )?;
+                    multi_idx_branches.push(MultiIndexBranch {
+                        index: branch.index.clone(),
+                        seek_def,
+                        estimated_rows: branch.estimated_rows,
+                    });
+                }
+
+                table_references.joined_tables_mut()[table_idx].op =
+                    Operation::MultiIndexScan(MultiIndexScanOp {
+                        branches: multi_idx_branches,
+                        where_term_idx: *where_term_idx,
+                        set_op: *set_op,
+                        additional_consumed_terms: additional_consumed_terms.clone(),
+                    });
             }
         }
     }
@@ -2000,24 +2047,15 @@ impl Optimizable for ast::Expr {
                     Ok(None)
                 }
                 ast::Literal::String(s) => {
+                    // Use Numeric::from to match SQLite's string-to-numeric conversion,
+                    // which extracts leading numeric prefixes (e.g., '9S' -> 9, 'abc' -> 0)
                     let without_quotes = s.trim_matches('\'');
-                    if let Ok(int_value) = without_quotes.parse::<i64>() {
-                        return Ok(Some(if int_value == 0 {
-                            AlwaysTrueOrFalse::AlwaysFalse
-                        } else {
-                            AlwaysTrueOrFalse::AlwaysTrue
-                        }));
+                    let numeric = Numeric::from(without_quotes);
+                    match numeric.try_into_bool() {
+                        Some(true) => Ok(Some(AlwaysTrueOrFalse::AlwaysTrue)),
+                        Some(false) => Ok(Some(AlwaysTrueOrFalse::AlwaysFalse)),
+                        None => Ok(None),
                     }
-
-                    if let Ok(float_value) = without_quotes.parse::<f64>() {
-                        return Ok(Some(if float_value == 0.0 {
-                            AlwaysTrueOrFalse::AlwaysFalse
-                        } else {
-                            AlwaysTrueOrFalse::AlwaysTrue
-                        }));
-                    }
-
-                    Ok(Some(AlwaysTrueOrFalse::AlwaysFalse))
                 }
                 _ => Ok(None),
             },

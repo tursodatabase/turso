@@ -6,7 +6,6 @@ use crate::sync::RwLock;
 use crate::translate::emitter::Resolver;
 use crate::translate::expr::{bind_and_rewrite_expr, walk_expr, BindingBehavior, WalkControl};
 use crate::translate::index::{resolve_index_method_parameters, resolve_sorted_columns};
-use crate::translate::optimizer::Optimizable;
 use crate::translate::planner::ROWID_STRS;
 use crate::types::IOResult;
 use crate::util::{exprs_are_equivalent, normalize_ident};
@@ -140,7 +139,7 @@ use std::collections::VecDeque;
 use std::ops::Deref;
 use tracing::trace;
 use turso_parser::ast::{
-    self, ColumnDefinition, Expr, InitDeferredPred, Literal, RefAct, SortOrder, TableOptions,
+    self, ColumnDefinition, Expr, InitDeferredPred, Literal, RefAct, SortOrder,
 };
 use turso_parser::{
     ast::{Cmd, CreateTableBody, ResultColumn, Stmt},
@@ -579,7 +578,7 @@ impl Schema {
         self.indexes
             .entry(table_name)
             .or_default()
-            .push_front(index.clone());
+            .push_front(index);
         Ok(())
     }
 
@@ -1181,7 +1180,7 @@ impl Schema {
                 };
                 self.add_trigger(
                     Trigger::new(
-                        trigger_name.clone(),
+                        trigger_name,
                         sql.to_string(),
                         tbl_name.name.to_string(),
                         time,
@@ -1581,11 +1580,15 @@ pub enum Table {
 }
 
 impl Table {
-    pub fn get_root_page(&self) -> i64 {
+    pub fn get_root_page(&self) -> crate::Result<i64> {
         match self {
-            Table::BTree(table) => table.root_page,
-            Table::Virtual(_) => unimplemented!(),
-            Table::FromClauseSubquery(_) => unimplemented!(),
+            Table::BTree(table) => Ok(table.root_page),
+            Table::Virtual(_) => Err(crate::LimboError::InternalError(
+                "Virtual tables do not have a root page".to_string(),
+            )),
+            Table::FromClauseSubquery(_) => Err(crate::LimboError::InternalError(
+                "FROM clause subqueries do not have a root page".to_string(),
+            )),
         }
     }
 
@@ -1827,6 +1830,12 @@ impl BTreeTable {
             }
         }
         sql.push(')');
+
+        // Add STRICT keyword if this is a STRICT table
+        if self.is_strict {
+            sql.push_str(" STRICT");
+        }
+
         sql
     }
 
@@ -1891,7 +1900,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
             constraints,
             options,
         } => {
-            is_strict = options.contains(TableOptions::STRICT);
+            is_strict = options.contains_strict();
 
             // we need to preserve order of unique sets definition
             // but also, we analyze constraints first in order to check PRIMARY KEY constraint and recognize rowid alias properly
@@ -2053,7 +2062,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                 let ty_str = col_type
                     .as_ref()
                     .cloned()
-                    .map(|ast::Type { name, .. }| name.clone())
+                    .map(|ast::Type { name, .. }| name)
                     .unwrap_or_default();
 
                 let mut typename_exactly_integer = false;
@@ -2225,11 +2234,13 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                 ));
             }
 
-            if options.contains(TableOptions::WITHOUT_ROWID) {
+            if options.contains_without_rowid() {
                 has_rowid = false;
             }
         }
-        CreateTableBody::AsSelect(_) => todo!(),
+        CreateTableBody::AsSelect(_) => {
+            crate::bail_parse_error!("CREATE TABLE AS SELECT is not supported")
+        }
     };
 
     // flip is_rowid_alias back to false if the table has multiple primary key columns
@@ -2993,7 +3004,7 @@ impl Index {
 
     /// Walk the where_clause Expr of a partial index and validate that it doesn't reference any other
     /// tables or use any disallowed constructs.
-    pub fn validate_where_expr(&self, table: &Table, resolver: &Resolver) -> bool {
+    pub fn validate_where_expr(&self, table: &Table, _resolver: &Resolver) -> bool {
         let Some(where_clause) = &self.where_clause else {
             return true;
         };
@@ -3045,15 +3056,13 @@ impl Index {
                         ok = false;
                     } else {
                         let argc = match e {
-                            Expr::FunctionCall { args, .. } => {
-                                if !args.iter().all(|a| a.is_constant(resolver)) {
-                                    ok = false;
-                                }
-                                args.len()
-                            }
+                            Expr::FunctionCall { args, .. } => args.len(),
                             Expr::FunctionCallStar { .. } => 0,
                             _ => unreachable!(),
                         };
+                        // Reject non-deterministic functions. Function arguments can reference
+                        // columns of the indexed table (e.g., LENGTH(t0.c0)), which will be
+                        // validated by the Expr::Id and Expr::Qualified cases during the walk.
                         if !is_deterministic_fn(name.as_str(), argc) {
                             ok = false;
                         }
@@ -3618,6 +3627,50 @@ mod tests {
         assert_eq!(index.columns[0].name, "a");
         assert_eq!(index.columns[1].name, "b");
         assert!(matches!(index.columns[0].order, SortOrder::Asc));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_strict_table_to_sql() -> Result<()> {
+        let sql = r#"CREATE TABLE test_strict (id INTEGER, name TEXT) STRICT"#;
+        let table = BTreeTable::from_sql(sql, 0)?;
+
+        // Verify the table is marked as strict
+        assert!(table.is_strict);
+
+        // Verify that to_sql() includes the STRICT keyword
+        let reconstructed_sql = table.to_sql();
+        assert!(
+            reconstructed_sql.contains("STRICT"),
+            "Reconstructed SQL should contain STRICT keyword: {reconstructed_sql}"
+        );
+        assert_eq!(
+            reconstructed_sql,
+            "CREATE TABLE test_strict (id INTEGER, name TEXT) STRICT"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_non_strict_table_to_sql() -> Result<()> {
+        let sql = r#"CREATE TABLE test_normal (id INTEGER, name TEXT)"#;
+        let table = BTreeTable::from_sql(sql, 0)?;
+
+        // Verify the table is NOT marked as strict
+        assert!(!table.is_strict);
+
+        // Verify that to_sql() does NOT include the STRICT keyword
+        let reconstructed_sql = table.to_sql();
+        assert!(
+            !reconstructed_sql.contains("STRICT"),
+            "Non-strict table SQL should not contain STRICT keyword: {reconstructed_sql}"
+        );
+        assert_eq!(
+            reconstructed_sql,
+            "CREATE TABLE test_normal (id INTEGER, name TEXT)"
+        );
 
         Ok(())
     }

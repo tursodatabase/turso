@@ -70,6 +70,11 @@ class Database {
    * @param {string} sql - The SQL statement string to prepare.
    */
   prepare(sql) {
+    // Only throw if we connected before but now the database is closed
+    // Allow implicit connection if not connected yet
+    if (this.connected && !this.open) {
+      throw new TypeError("The database connection is not open");
+    }
     if (!sql) {
       throw new RangeError("The supplied SQL string contains no statements");
     }
@@ -180,6 +185,9 @@ class Database {
    * @param {string} sql - The string containing SQL statements to execute
    */
   async exec(sql) {
+    if (!this.open) {
+      throw new TypeError("The database connection is not open");
+    }
     await this.execLock.acquire();
     const exec = this.db.executor(sql);
     try {
@@ -227,9 +235,9 @@ class Database {
   }
 
   async io() {
-    // we do not spin this.db.ioLoopAsync() 
-    // because all IO we use in JS SDK (MemoryIO, PlatformIO) are synchronous 
-    // so this call will only degrade performance for no reason
+    // For WASM browser builds, ioStep awaits a promise that resolves when
+    // the OPFS Worker completes the I/O (via IONotifier in wasm-common).
+    // For in-memory / Node.js builds, ioStep is a no-op since I/O is synchronous.
     await this.ioStep();
   }
 }
@@ -341,8 +349,8 @@ class Statement {
     throw new Error("not implemented");
   }
 
-  get reader() {
-    throw new Error("not implemented");
+  get reader(): boolean {
+    return this.stmt.must().columns().length > 0;
   }
 
   get database() {
@@ -485,9 +493,6 @@ class Statement {
   }
 
   async io() {
-    // we do not spin this.db.ioLoopAsync() 
-    // because all IO we use in JS SDK (MemoryIO, PlatformIO) are synchronous 
-    // so this call will only degrade performance for no reason
     await this.ioStep();
   }
 

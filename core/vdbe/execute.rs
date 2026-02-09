@@ -936,7 +936,7 @@ pub fn op_open_read(
             let mv_cursor = crate::incremental::cursor::MaterializedViewCursor::new(
                 cursor,
                 view_mutex.clone(),
-                pager.clone(),
+                pager,
                 tx_state,
             )?;
 
@@ -948,7 +948,7 @@ pub fn op_open_read(
         CursorType::BTreeTable(_) => {
             // Regular table
             let btree_cursor = Box::new(BTreeCursor::new_table(
-                pager.clone(),
+                pager,
                 maybe_transform_root_page_to_positive(mv_store.as_ref(), *root_page),
                 num_columns,
             ));
@@ -960,7 +960,7 @@ pub fn op_open_read(
         }
         CursorType::BTreeIndex(index) => {
             let btree_cursor = Box::new(BTreeCursor::new_index(
-                pager.clone(),
+                pager,
                 *root_page,
                 index.as_ref(),
                 num_columns,
@@ -1047,7 +1047,7 @@ pub fn op_vcreate(
     let table =
         crate::VirtualTable::table(Some(&table_name), &module_name, args, &conn.syms.read())?;
     {
-        conn.syms.write().vtabs.insert(table_name, table.clone());
+        conn.syms.write().vtabs.insert(table_name, table);
     }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -1641,6 +1641,10 @@ pub fn op_type_check(
             } else if col.is_rowid_alias() && matches!(reg.get_value(), Value::Null) {
                 // Handle INTEGER PRIMARY KEY for null as usual (Rowid will be auto-assigned)
                 return Ok(());
+            } else if matches!(reg.get_value(), Value::Null) {
+                // STRICT only enforces type affinity on non-NULL values.
+                // NULL is valid in any column without NOT NULL constraint.
+                return Ok(());
             }
             let col_affinity = col.affinity();
             let ty_str = &col.ty_str;
@@ -2173,6 +2177,16 @@ pub fn op_transaction_inner(
 
                 // 2. Start transaction if needed
                 if let Some(mv_store) = mv_store.as_ref() {
+                    let started_read_tx =
+                        updated && matches!(current_state, TransactionState::None);
+                    if started_read_tx {
+                        turso_assert!(
+                            !conn.is_nested_stmt(),
+                            "nested stmt should not begin a new read transaction"
+                        );
+                        pager.begin_read_tx()?;
+                        state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
+                    }
                     // MVCC reads must refresh WAL change counters to avoid stale page-cache reads.
                     pager.mvcc_refresh_if_db_changed();
                     // In MVCC we don't have write exclusivity, therefore we just need to start a transaction if needed.
@@ -2193,12 +2207,24 @@ pub fn op_transaction_inner(
                         let tx_id = match tx_mode {
                             TransactionMode::None
                             | TransactionMode::Read
-                            | TransactionMode::Concurrent => mv_store.begin_tx(pager.clone())?,
+                            | TransactionMode::Concurrent => mv_store.begin_tx(pager.clone()),
                             TransactionMode::Write => {
-                                mv_store.begin_exclusive_tx(pager.clone(), None)?
+                                mv_store.begin_exclusive_tx(pager.clone(), None)
                             }
                         };
-                        program.connection.set_mv_tx(Some((tx_id, *tx_mode)));
+                        match tx_id {
+                            Ok(tx_id) => {
+                                program.connection.set_mv_tx(Some((tx_id, *tx_mode)));
+                            }
+                            Err(err) => {
+                                if started_read_tx {
+                                    pager.end_read_tx();
+                                    conn.set_tx_state(TransactionState::None);
+                                    state.auto_txn_cleanup = TxnCleanup::None;
+                                }
+                                return Err(err);
+                            }
+                        }
                     } else if updated {
                         // TODO: fix tx_mode in Insn::Transaction, now each statement overrides it even if there's already a CONCURRENT Tx in progress, for example
                         let (tx_id, mv_tx_mode) = current_mv_tx
@@ -2211,7 +2237,16 @@ pub fn op_transaction_inner(
                         if matches!(new_transaction_state, TransactionState::Write { .. })
                             && matches!(actual_tx_mode, TransactionMode::Write)
                         {
-                            mv_store.begin_exclusive_tx(pager.clone(), Some(tx_id))?;
+                            if let Err(err) =
+                                mv_store.begin_exclusive_tx(pager.clone(), Some(tx_id))
+                            {
+                                if started_read_tx {
+                                    pager.end_read_tx();
+                                    conn.set_tx_state(TransactionState::None);
+                                    state.auto_txn_cleanup = TxnCleanup::None;
+                                }
+                                return Err(err);
+                            }
                         }
                     }
                 } else {
@@ -2390,6 +2425,7 @@ pub fn op_auto_commit(
                 if let Some(tx_id) = conn.get_mv_tx_id() {
                     mv_store.rollback_tx(tx_id, pager.clone(), &conn);
                 }
+                pager.end_read_tx();
             } else {
                 pager.rollback_tx(&conn);
             }
@@ -5723,7 +5759,7 @@ pub fn op_function(
                     };
 
                     let new_tbl_name = if tbl_name == rename_from {
-                        rename_to.clone()
+                        rename_to
                     } else {
                         tbl_name
                     };
@@ -5737,7 +5773,10 @@ pub fn op_function(
                         let ast::Cmd::Stmt(stmt) =
                             parser.next().expect("parser should have next item")?
                         else {
-                            todo!()
+                            return Err(LimboError::InternalError(
+                                "Unexpected command during ALTER TABLE RENAME processing"
+                                    .to_string(),
+                            ));
                         };
 
                         match stmt {
@@ -5785,7 +5824,10 @@ pub fn op_function(
                                     options,
                                 } = body
                                 else {
-                                    todo!()
+                                    return Err(LimboError::InternalError(
+                                        "CREATE TABLE AS SELECT schemas cannot be altered"
+                                            .to_string(),
+                                    ));
                                 };
 
                                 let mut any_change = false;
@@ -5916,7 +5958,10 @@ pub fn op_function(
                         let ast::Cmd::Stmt(stmt) =
                             parser.next().expect("parser should have next item")?
                         else {
-                            todo!()
+                            return Err(LimboError::InternalError(
+                                "Unexpected command during ALTER TABLE RENAME COLUMN processing"
+                                    .to_string(),
+                            ));
                         };
 
                         match stmt {
@@ -5973,7 +6018,10 @@ pub fn op_function(
                                     options,
                                 } = body
                                 else {
-                                    todo!()
+                                    return Err(LimboError::InternalError(
+                                        "CREATE TABLE AS SELECT schemas cannot be altered"
+                                            .to_string(),
+                                    ));
                                 };
 
                                 let normalized_tbl_name = normalize_ident(tbl_name.name.as_str());
@@ -7645,7 +7693,7 @@ pub fn op_open_write(
         if let Some(index) = maybe_index {
             let num_columns = index.columns.len();
             let btree_cursor = Box::new(BTreeCursor::new_index(
-                pager.clone(),
+                pager,
                 maybe_transform_root_page_to_positive(mv_store.as_ref(), root_page),
                 index.as_ref(),
                 num_columns,
@@ -7667,7 +7715,7 @@ pub fn op_open_write(
             };
 
             let btree_cursor = Box::new(BTreeCursor::new_table(
-                pager.clone(),
+                pager,
                 maybe_transform_root_page_to_positive(mv_store.as_ref(), root_page),
                 num_columns,
             ));
@@ -7936,9 +7984,15 @@ pub fn op_reset_sorter(
             return_if_io!(cursor.clear_btree());
         }
         CursorType::Sorter => {
-            unimplemented!("ResetSorter is not supported for sorter cursors yet")
+            return Err(LimboError::InternalError(
+                "ResetSorter is not supported for sorter cursors".to_string(),
+            ));
         }
-        _ => panic!("ResetSorter is not supported for {cursor_type:?}"),
+        _ => {
+            return Err(LimboError::InternalError(format!(
+                "ResetSorter is not supported for {cursor_type:?}"
+            )));
+        }
     }
 
     state.pc += 1;
@@ -7953,7 +8007,9 @@ pub fn op_drop_table(
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(DropTable { db, table_name, .. }, insn);
     if *db > 0 {
-        todo!("temp databases not implemented yet");
+        return Err(LimboError::InternalError(
+            "Temporary databases are not implemented".to_string(),
+        ));
     }
     let conn = program.connection.clone();
     let is_mvcc = conn.mv_store().is_some();
@@ -8646,7 +8702,7 @@ pub fn op_open_ephemeral(
                 None,
                 db_file_io,
                 PageCache::default(),
-                buffer_pool.clone(),
+                buffer_pool,
                 Arc::new(Mutex::new(())),
                 ephemeral_init_page_1,
             )?);
@@ -8815,7 +8871,7 @@ pub fn op_open_dup(
     match cursor_type {
         CursorType::BTreeTable(table) => {
             let cursor = Box::new(BTreeCursor::new_table(
-                pager.clone(),
+                pager,
                 maybe_transform_root_page_to_positive(mv_store.as_ref(), root_page),
                 table.columns.len(),
             ));
@@ -8848,9 +8904,15 @@ pub fn op_open_dup(
             // In principle, we could implement OpenDup for BTreeIndex,
             // but doing so now would create dead code since we have no use case,
             // and it wouldn't be possible to test it.
-            unimplemented!("OpenDup is not supported for BTreeIndex yet")
+            return Err(LimboError::InternalError(
+                "OpenDup is not supported for BTreeIndex".to_string(),
+            ));
         }
-        _ => panic!("OpenDup is not supported for {cursor_type:?}"),
+        _ => {
+            return Err(LimboError::InternalError(format!(
+                "OpenDup is not supported for {cursor_type:?}"
+            )));
+        }
     }
 
     state.pc += 1;
@@ -10102,7 +10164,7 @@ pub fn op_rename_table(
         if let Some(mut indexes) = schema.indexes.remove(&normalized_from) {
             indexes.iter_mut().for_each(|index| {
                 let index = Arc::make_mut(index);
-                index.table_name = normalized_to.to_owned();
+                normalized_to.clone_into(&mut index.table_name);
             });
 
             schema.indexes.insert(normalized_to.to_owned(), indexes);
@@ -10119,14 +10181,14 @@ pub fn op_rename_table(
                 for fk_arc in &mut btree.foreign_keys {
                     let fk = Arc::make_mut(fk_arc);
                     if normalize_ident(&fk.parent_table) == normalized_from {
-                        fk.parent_table = normalized_to.clone();
+                        fk.parent_table.clone_from(&normalized_to);
                     }
                 }
 
-                btree.name = normalized_to.to_owned();
+                normalized_to.clone_into(&mut btree.name);
             }
             Table::Virtual(vtab) => {
-                Arc::make_mut(vtab).name = normalized_to.clone();
+                Arc::make_mut(vtab).name.clone_from(&normalized_to);
             }
             _ => panic!("only btree and virtual tables can be renamed"),
         }
@@ -10143,7 +10205,7 @@ pub fn op_rename_table(
                 for fk_arc in &mut child_btree.foreign_keys {
                     if normalize_ident(&fk_arc.parent_table) == normalized_from {
                         let fk = Arc::make_mut(fk_arc);
-                        fk.parent_table = normalized_to.clone();
+                        fk.parent_table.clone_from(&normalized_to);
                     }
                 }
             }
@@ -10342,7 +10404,7 @@ pub fn op_alter_column(
                     if ic.name.eq_ignore_ascii_case(
                         col.name.as_ref().expect("btree column should be named"),
                     ) {
-                        ic.name = new_name.clone();
+                        ic.name.clone_from(&new_name);
                     }
                 }
             }
@@ -10356,7 +10418,7 @@ pub fn op_alter_column(
         // Keep primary_key_columns consistent (names may change on rename)
         for (pk_name, _ord) in &mut btree.primary_key_columns {
             if pk_name.eq_ignore_ascii_case(&old_column_name) {
-                *pk_name = new_name.clone();
+                pk_name.clone_from(&new_name);
             }
         }
 
@@ -10372,14 +10434,14 @@ pub fn op_alter_column(
             // child side: rename child column if it matches
             for cc in &mut fk.child_columns {
                 if cc.eq_ignore_ascii_case(&old_column_name) {
-                    *cc = new_name.clone();
+                    cc.clone_from(&new_name);
                 }
             }
             // parent side: if self-referencing, rename parent column too
             if normalize_ident(&fk.parent_table) == normalized_table_name {
                 for pc in &mut fk.parent_columns {
                     if pc.eq_ignore_ascii_case(&old_column_name) {
-                        *pc = new_name.clone();
+                        pc.clone_from(&new_name);
                     }
                 }
             }
@@ -10399,7 +10461,7 @@ pub fn op_alter_column(
                     let fk = Arc::make_mut(fk_arc);
                     for pc in &mut fk.parent_columns {
                         if pc.eq_ignore_ascii_case(&old_column_name) {
-                            *pc = new_name.clone();
+                            pc.clone_from(&new_name);
                         }
                     }
                 }
