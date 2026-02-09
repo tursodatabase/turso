@@ -192,7 +192,7 @@ pub fn op_add(
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(Add { lhs, rhs, dest }, insn);
-    state.registers[*dest] = Register::Value(
+    state.registers[*dest].set_numeric(
         state.registers[*lhs]
             .get_value()
             .exec_add(state.registers[*rhs].get_value()),
@@ -208,7 +208,7 @@ pub fn op_subtract(
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(Subtract { lhs, rhs, dest }, insn);
-    state.registers[*dest] = Register::Value(
+    state.registers[*dest].set_numeric(
         state.registers[*lhs]
             .get_value()
             .exec_subtract(state.registers[*rhs].get_value()),
@@ -224,7 +224,7 @@ pub fn op_multiply(
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(Multiply { lhs, rhs, dest }, insn);
-    state.registers[*dest] = Register::Value(
+    state.registers[*dest].set_numeric(
         state.registers[*lhs]
             .get_value()
             .exec_multiply(state.registers[*rhs].get_value()),
@@ -240,7 +240,7 @@ pub fn op_divide(
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(Divide { lhs, rhs, dest }, insn);
-    state.registers[*dest] = Register::Value(
+    state.registers[*dest].set_numeric(
         state.registers[*lhs]
             .get_value()
             .exec_divide(state.registers[*rhs].get_value()),
@@ -278,7 +278,7 @@ pub fn op_remainder(
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(Remainder { lhs, rhs, dest }, insn);
-    state.registers[*dest] = Register::Value(
+    state.registers[*dest].set_numeric(
         state.registers[*lhs]
             .get_value()
             .exec_remainder(state.registers[*rhs].get_value()),
@@ -294,7 +294,7 @@ pub fn op_bit_and(
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(BitAnd { lhs, rhs, dest }, insn);
-    state.registers[*dest] = Register::Value(
+    state.registers[*dest].set_nullable_integer(
         state.registers[*lhs]
             .get_value()
             .exec_bit_and(state.registers[*rhs].get_value()),
@@ -310,7 +310,7 @@ pub fn op_bit_or(
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(BitOr { lhs, rhs, dest }, insn);
-    state.registers[*dest] = Register::Value(
+    state.registers[*dest].set_nullable_integer(
         state.registers[*lhs]
             .get_value()
             .exec_bit_or(state.registers[*rhs].get_value()),
@@ -326,7 +326,7 @@ pub fn op_bit_not(
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(BitNot { reg, dest }, insn);
-    state.registers[*dest] = Register::Value(state.registers[*reg].get_value().exec_bit_not());
+    state.registers[*dest].set_nullable_integer(state.registers[*reg].get_value().exec_bit_not());
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -3805,7 +3805,7 @@ fn init_agg_payload(func: &AggFunc, payload: &mut Vec<Value>) -> Result<()> {
 /// - **JsonGroup***: `[raw_jsonb: Blob]` - accumulated raw JSONB bytes
 fn update_agg_payload(
     func: &AggFunc,
-    arg: Value,                // most agg functions take one argument
+    arg: &Value,               // most agg functions take one argument
     maybe_arg2: Option<Value>, // for GroupConcat/StringAgg, JsonGroupObject/JsonbGroupObject,
     payload: &mut [Value],
     collation: CollationSeq,
@@ -3854,14 +3854,14 @@ fn update_agg_payload(
                 ));
             };
             let val = match arg {
-                Value::Integer(i) => i as f64,
-                Value::Float(f) => f,
+                Value::Integer(i) => *i as f64,
+                Value::Float(f) => *f,
                 Value::Text(t) => match try_for_float(t.as_str()).1 {
                     ParsedNumber::Integer(i) => i as f64,
                     ParsedNumber::Float(f) => f,
                     ParsedNumber::None => 0.0,
                 },
-                Value::Blob(b) => match std::str::from_utf8(&b) {
+                Value::Blob(b) => match std::str::from_utf8(b) {
                     Ok(s) => match try_for_float(s).1 {
                         ParsedNumber::Integer(i) => i as f64,
                         ParsedNumber::Float(f) => f,
@@ -3915,9 +3915,9 @@ fn update_agg_payload(
                 Value::Null => {}
                 Value::Integer(i) => match acc {
                     Value::Null => {
-                        *acc = Value::Integer(i);
+                        *acc = Value::Integer(*i);
                     }
-                    Value::Integer(acc_i) => match acc_i.checked_add(i) {
+                    Value::Integer(acc_i) => match acc_i.checked_add(*i) {
                         Some(sum) => *acc_i = sum,
                         None => {
                             if matches!(func, AggFunc::Total) {
@@ -3925,30 +3925,30 @@ fn update_agg_payload(
                                 *acc = Value::Float(acc_f);
                                 sum_state.approx = true;
                                 sum_state.ovrfl = true;
-                                apply_kbn_step_int(acc, i, &mut sum_state);
+                                apply_kbn_step_int(acc, *i, &mut sum_state);
                             } else {
                                 return Err(LimboError::IntegerOverflow);
                             }
                         }
                     },
                     Value::Float(_) => {
-                        apply_kbn_step_int(acc, i, &mut sum_state);
+                        apply_kbn_step_int(acc, *i, &mut sum_state);
                     }
                     _ => unreachable!("Sum/Total accumulator initialized to Null/Integer/Float"),
                 },
                 Value::Float(f) => match acc {
                     Value::Null => {
-                        *acc = Value::Float(f);
+                        *acc = Value::Float(*f);
                         sum_state.approx = true;
                     }
                     Value::Integer(i) => {
                         *acc = Value::Float(*i as f64);
                         sum_state.approx = true;
-                        apply_kbn_step(acc, f, &mut sum_state);
+                        apply_kbn_step(acc, *f, &mut sum_state);
                     }
                     Value::Float(_) => {
                         sum_state.approx = true;
-                        apply_kbn_step(acc, f, &mut sum_state);
+                        apply_kbn_step(acc, *f, &mut sum_state);
                     }
                     _ => unreachable!("Sum/Total accumulator initialized to Null/Integer/Float"),
                 },
@@ -3957,7 +3957,7 @@ fn update_agg_payload(
                     handle_text_sum(acc, &mut sum_state, parsed_number);
                 }
                 Value::Blob(b) => {
-                    if let Ok(s) = std::str::from_utf8(&b) {
+                    if let Ok(s) = std::str::from_utf8(b) {
                         let (_, parsed_number) = try_for_float(s);
                         handle_text_sum(acc, &mut sum_state, parsed_number);
                     } else {
@@ -3974,19 +3974,19 @@ fn update_agg_payload(
                 return Ok(());
             }
             if matches!(payload[0], Value::Null) {
-                payload[0] = arg;
+                payload[0] = arg.clone();
                 return Ok(());
             }
             use std::cmp::Ordering;
             // Borrow payload[0] only for comparison, then drop before assignment
-            let cmp = compare_with_collation(&arg, &payload[0], Some(collation));
+            let cmp = compare_with_collation(arg, &payload[0], Some(collation));
             let should_update = match func {
                 AggFunc::Max => cmp == Ordering::Greater,
                 AggFunc::Min => cmp == Ordering::Less,
                 _ => false,
             };
             if should_update {
-                payload[0] = arg;
+                payload[0] = arg.clone();
             }
         }
         AggFunc::GroupConcat | AggFunc::StringAgg => {
@@ -4000,7 +4000,7 @@ fn update_agg_payload(
                 *acc = Value::build_text(arg.to_string());
             } else {
                 acc.exec_group_concat(&delimiter);
-                acc.exec_group_concat(&arg);
+                acc.exec_group_concat(arg);
             }
         }
         AggFunc::External(_) => {
@@ -4016,7 +4016,7 @@ fn update_agg_payload(
                     "JsonGroupObject/JsonbGroupObject: no value provided".to_string(),
                 ));
             };
-            let mut key_vec = convert_dbtype_to_raw_jsonb(&arg)?;
+            let mut key_vec = convert_dbtype_to_raw_jsonb(arg)?;
             let mut val_vec = convert_dbtype_to_raw_jsonb(&value)?;
             let Value::Blob(vec) = &mut payload[0] else {
                 return Err(LimboError::InternalError(
@@ -4033,7 +4033,7 @@ fn update_agg_payload(
         #[cfg(feature = "json")]
         AggFunc::JsonGroupArray | AggFunc::JsonbGroupArray => {
             // arg = value
-            let mut data = convert_dbtype_to_raw_jsonb(&arg)?;
+            let mut data = convert_dbtype_to_raw_jsonb(arg)?;
             let Value::Blob(vec) = &mut payload[0] else {
                 return Err(LimboError::InternalError(
                     "JsonGroupArray: payload[0] is not a blob".to_string(),
@@ -4213,8 +4213,6 @@ pub fn op_agg_step(
             }
         }
         _ => {
-            let arg = state.registers[*col].get_value().clone();
-            // Only a subset of aggregate functions take two arguments
             let maybe_arg2 = match func {
                 AggFunc::GroupConcat | AggFunc::StringAgg => {
                     Some(state.registers[*delimiter].get_value().clone())
@@ -4225,10 +4223,17 @@ pub fn op_agg_step(
                 }
                 _ => None,
             };
+
+            let [arg, agg] = state
+                .registers
+                .get_disjoint_mut([*col, *acc_reg])
+                .expect("register indices must be disjoint");
+            let arg = arg.get_value();
+            // Only a subset of aggregate functions take two arguments
             let collation = state.current_collation.unwrap_or(CollationSeq::Binary);
 
             // Now get mutable borrow on payload
-            let Register::Aggregate(agg) = &mut state.registers[*acc_reg] else {
+            let Register::Aggregate(agg) = agg else {
                 panic!(
                     "Unexpected value {:?} in AggStep at register {}",
                     state.registers[*acc_reg], *acc_reg
@@ -5123,25 +5128,24 @@ pub fn op_function(
             | ScalarFunc::Sign
             | ScalarFunc::Soundex
             | ScalarFunc::ZeroBlob => {
-                let reg_value = state.registers[*start_reg].borrow_mut().get_value();
-                let result = match scalar_func {
-                    ScalarFunc::Sign => reg_value.exec_sign(),
-                    ScalarFunc::Abs => Some(reg_value.exec_abs()?),
-                    ScalarFunc::Lower => reg_value.exec_lower(),
-                    ScalarFunc::Upper => reg_value.exec_upper(),
-                    ScalarFunc::Length => Some(reg_value.exec_length()),
-                    ScalarFunc::OctetLength => Some(reg_value.exec_octet_length()),
-                    ScalarFunc::Typeof => Some(reg_value.exec_typeof()),
-                    ScalarFunc::Unicode => Some(reg_value.exec_unicode()),
-                    ScalarFunc::Quote => Some(reg_value.exec_quote()),
+                let reg_value = state.registers[*start_reg].get_value();
+                state.registers[*dest].set(match scalar_func {
+                    ScalarFunc::Sign => reg_value.exec_sign().unwrap_or(Value::Null),
+                    ScalarFunc::Abs => reg_value.exec_abs()?,
+                    ScalarFunc::Lower => reg_value.exec_lower().unwrap_or(Value::Null),
+                    ScalarFunc::Upper => reg_value.exec_upper().unwrap_or(Value::Null),
+                    ScalarFunc::Length => reg_value.exec_length(),
+                    ScalarFunc::OctetLength => reg_value.exec_octet_length(),
+                    ScalarFunc::Typeof => reg_value.exec_typeof(),
+                    ScalarFunc::Unicode => reg_value.exec_unicode(),
+                    ScalarFunc::Quote => reg_value.exec_quote(),
                     ScalarFunc::RandomBlob => {
-                        Some(reg_value.exec_randomblob(|dest| pager.io.fill_bytes(dest))?)
+                        reg_value.exec_randomblob(|dest| pager.io.fill_bytes(dest))?
                     }
-                    ScalarFunc::ZeroBlob => Some(reg_value.exec_zeroblob()?),
-                    ScalarFunc::Soundex => Some(reg_value.exec_soundex()),
+                    ScalarFunc::ZeroBlob => reg_value.exec_zeroblob()?,
+                    ScalarFunc::Soundex => reg_value.exec_soundex(),
                     _ => unreachable!(),
-                };
-                state.registers[*dest] = Register::Value(result.unwrap_or(Value::Null));
+                });
             }
             ScalarFunc::Hex => {
                 let reg_value = state.registers[*start_reg].borrow_mut();
@@ -8383,7 +8387,7 @@ pub fn op_shift_right(
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(ShiftRight { lhs, rhs, dest }, insn);
-    state.registers[*dest] = Register::Value(
+    state.registers[*dest].set_nullable_integer(
         state.registers[*lhs]
             .get_value()
             .exec_shift_right(state.registers[*rhs].get_value()),
@@ -8399,7 +8403,7 @@ pub fn op_shift_left(
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(ShiftLeft { lhs, rhs, dest }, insn);
-    state.registers[*dest] = Register::Value(
+    state.registers[*dest].set_nullable_integer(
         state.registers[*lhs]
             .get_value()
             .exec_shift_left(state.registers[*rhs].get_value()),
@@ -8471,7 +8475,8 @@ pub fn op_not(
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(Not { reg, dest }, insn);
-    state.registers[*dest] = Register::Value(state.registers[*reg].get_value().exec_boolean_not());
+    state.registers[*dest]
+        .set_nullable_integer(state.registers[*reg].get_value().exec_boolean_not());
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -12382,7 +12387,7 @@ mod tests {
         let mut payload = vec![Value::Integer(5)];
         update_agg_payload(
             &AggFunc::Count,
-            Value::Null,
+            &Value::Null,
             None,
             &mut payload,
             CollationSeq::Binary,
@@ -12396,7 +12401,7 @@ mod tests {
         let mut payload = vec![Value::Integer(5)];
         update_agg_payload(
             &AggFunc::Count,
-            Value::Integer(42),
+            &Value::Integer(42),
             None,
             &mut payload,
             CollationSeq::Binary,
@@ -12415,7 +12420,7 @@ mod tests {
         ];
         update_agg_payload(
             &AggFunc::Sum,
-            Value::Integer(10),
+            &Value::Integer(10),
             None,
             &mut payload,
             CollationSeq::Binary,
@@ -12425,7 +12430,7 @@ mod tests {
 
         update_agg_payload(
             &AggFunc::Sum,
-            Value::Integer(5),
+            &Value::Integer(5),
             None,
             &mut payload,
             CollationSeq::Binary,
@@ -12444,7 +12449,7 @@ mod tests {
         ];
         update_agg_payload(
             &AggFunc::Sum,
-            Value::Null,
+            &Value::Null,
             None,
             &mut payload,
             CollationSeq::Binary,
@@ -12459,7 +12464,7 @@ mod tests {
         // First value sets the min/max
         update_agg_payload(
             &AggFunc::Min,
-            Value::Integer(5),
+            &Value::Integer(5),
             None,
             &mut payload,
             CollationSeq::Binary,
@@ -12470,7 +12475,7 @@ mod tests {
         // Smaller value updates min
         update_agg_payload(
             &AggFunc::Min,
-            Value::Integer(3),
+            &Value::Integer(3),
             None,
             &mut payload,
             CollationSeq::Binary,
@@ -12481,7 +12486,7 @@ mod tests {
         // Larger value doesn't update min
         update_agg_payload(
             &AggFunc::Min,
-            Value::Integer(10),
+            &Value::Integer(10),
             None,
             &mut payload,
             CollationSeq::Binary,
@@ -12496,7 +12501,7 @@ mod tests {
         let mut payload = vec![Value::Float(0.0), Value::Float(0.0), Value::Integer(0)];
         update_agg_payload(
             &AggFunc::Avg,
-            Value::Integer(10),
+            &Value::Integer(10),
             None,
             &mut payload,
             CollationSeq::Binary,
@@ -12507,7 +12512,7 @@ mod tests {
 
         update_agg_payload(
             &AggFunc::Avg,
-            Value::Integer(20),
+            &Value::Integer(20),
             None,
             &mut payload,
             CollationSeq::Binary,

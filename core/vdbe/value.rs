@@ -1,6 +1,6 @@
 use crate::{
     function::MathFunc,
-    numeric::{format_float, NullableInteger, Numeric},
+    numeric::{format_float, nonnan::NonNan, NullableInteger, Numeric},
     translate::collate::CollationSeq,
     types::{compare_immutable_single, AsValueRef, SeekOp},
     vdbe::affinity::Affinity,
@@ -919,62 +919,62 @@ impl Value {
         Value::Float(result)
     }
 
-    pub fn exec_add(&self, rhs: &Value) -> Value {
-        (Numeric::from(self) + Numeric::from(rhs)).into()
+    pub fn exec_add(&self, rhs: &Value) -> Numeric {
+        Numeric::from(self) + Numeric::from(rhs)
     }
 
-    pub fn exec_subtract(&self, rhs: &Value) -> Value {
-        (Numeric::from(self) - Numeric::from(rhs)).into()
+    pub fn exec_subtract(&self, rhs: &Value) -> Numeric {
+        Numeric::from(self) - Numeric::from(rhs)
     }
 
-    pub fn exec_multiply(&self, rhs: &Value) -> Value {
-        (Numeric::from(self) * Numeric::from(rhs)).into()
+    pub fn exec_multiply(&self, rhs: &Value) -> Numeric {
+        Numeric::from(self) * Numeric::from(rhs)
     }
 
-    pub fn exec_divide(&self, rhs: &Value) -> Value {
-        (Numeric::from(self) / Numeric::from(rhs)).into()
+    pub fn exec_divide(&self, rhs: &Value) -> Numeric {
+        Numeric::from(self) / Numeric::from(rhs)
     }
 
-    pub fn exec_bit_and(&self, rhs: &Value) -> Value {
-        (NullableInteger::from(self) & NullableInteger::from(rhs)).into()
+    pub fn exec_bit_and(&self, rhs: &Value) -> NullableInteger {
+        NullableInteger::from(self) & NullableInteger::from(rhs)
     }
 
-    pub fn exec_bit_or(&self, rhs: &Value) -> Value {
-        (NullableInteger::from(self) | NullableInteger::from(rhs)).into()
+    pub fn exec_bit_or(&self, rhs: &Value) -> NullableInteger {
+        NullableInteger::from(self) | NullableInteger::from(rhs)
     }
 
-    pub fn exec_remainder(&self, rhs: &Value) -> Value {
+    pub fn exec_remainder(&self, rhs: &Value) -> Numeric {
         let convert_to_float = matches!(Numeric::from(self), Numeric::Float(_))
             || matches!(Numeric::from(rhs), Numeric::Float(_));
 
         match NullableInteger::from(self) % NullableInteger::from(rhs) {
-            NullableInteger::Null => Value::Null,
+            NullableInteger::Null => Numeric::Null,
             NullableInteger::Integer(v) => {
                 if convert_to_float {
-                    Value::Float(v as f64)
+                    Numeric::Float(NonNan::new_non_nan(v as f64))
                 } else {
-                    Value::Integer(v)
+                    Numeric::Integer(v)
                 }
             }
         }
     }
 
-    pub fn exec_bit_not(&self) -> Value {
-        (!NullableInteger::from(self)).into()
+    pub fn exec_bit_not(&self) -> NullableInteger {
+        !NullableInteger::from(self)
     }
 
-    pub fn exec_shift_left(&self, rhs: &Value) -> Value {
-        (NullableInteger::from(self) << NullableInteger::from(rhs)).into()
+    pub fn exec_shift_left(&self, rhs: &Value) -> NullableInteger {
+        NullableInteger::from(self) << NullableInteger::from(rhs)
     }
 
-    pub fn exec_shift_right(&self, rhs: &Value) -> Value {
-        (NullableInteger::from(self) >> NullableInteger::from(rhs)).into()
+    pub fn exec_shift_right(&self, rhs: &Value) -> NullableInteger {
+        NullableInteger::from(self) >> NullableInteger::from(rhs)
     }
 
-    pub fn exec_boolean_not(&self) -> Value {
+    pub fn exec_boolean_not(&self) -> NullableInteger {
         match Numeric::from(self).try_into_bool() {
-            None => Value::Null,
-            Some(v) => Value::Integer(!v as i64),
+            None => NullableInteger::Null,
+            Some(v) => NullableInteger::Integer(!v as i64),
         }
     }
 
@@ -1488,7 +1488,7 @@ mod tests {
         );
         for (i, (lhs, rhs)) in inputs.iter().enumerate() {
             assert_eq!(
-                lhs.exec_add(rhs),
+                Value::from(lhs.exec_add(rhs)),
                 outputs[i],
                 "Wrong ADD for lhs: {lhs}, rhs: {rhs}"
             );
@@ -1544,7 +1544,7 @@ mod tests {
         );
         for (i, (lhs, rhs)) in inputs.iter().enumerate() {
             assert_eq!(
-                lhs.exec_subtract(rhs),
+                Value::from(lhs.exec_subtract(rhs)),
                 outputs[i],
                 "Wrong subtract for lhs: {lhs}, rhs: {rhs}"
             );
@@ -1600,7 +1600,7 @@ mod tests {
         );
         for (i, (lhs, rhs)) in inputs.iter().enumerate() {
             assert_eq!(
-                lhs.exec_multiply(rhs),
+                Value::from(lhs.exec_multiply(rhs)),
                 outputs[i],
                 "Wrong multiply for lhs: {lhs}, rhs: {rhs}"
             );
@@ -1644,7 +1644,7 @@ mod tests {
         );
         for (i, (lhs, rhs)) in inputs.iter().enumerate() {
             assert_eq!(
-                lhs.exec_divide(rhs),
+                Value::from(lhs.exec_divide(rhs)),
                 outputs[i],
                 "Wrong divide for lhs: {lhs}, rhs: {rhs}"
             );
@@ -1710,7 +1710,7 @@ mod tests {
 
         for (i, (lhs, rhs)) in inputs.iter().enumerate() {
             assert_eq!(
-                lhs.exec_remainder(rhs),
+                Value::from(lhs.exec_remainder(rhs)),
                 outputs[i],
                 "Wrong remainder for lhs: {lhs}, rhs: {rhs}"
             );

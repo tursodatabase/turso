@@ -238,16 +238,20 @@ impl SimValue {
     pub fn binary_compare(&self, other: &Self, operator: ast::Operator) -> SimValue {
         let not_null = !self.is_null() && !other.is_null();
         match operator {
-            ast::Operator::Add => self.0.exec_add(&other.0).into(),
+            ast::Operator::Add => turso_core::Value::from(self.0.exec_add(&other.0)).into(),
             ast::Operator::And => self.0.exec_and(&other.0).into(),
             ast::Operator::ArrowRight => todo!(),
             ast::Operator::ArrowRightShift => todo!(),
-            ast::Operator::BitwiseAnd => self.0.exec_bit_and(&other.0).into(),
-            ast::Operator::BitwiseOr => self.0.exec_bit_or(&other.0).into(),
+            ast::Operator::BitwiseAnd => {
+                turso_core::Value::from(self.0.exec_bit_and(&other.0)).into()
+            }
+            ast::Operator::BitwiseOr => {
+                turso_core::Value::from(self.0.exec_bit_or(&other.0)).into()
+            }
             ast::Operator::BitwiseNot => todo!(), // TODO: Do not see any function usage of this operator in Core
             ast::Operator::Concat => self.0.exec_concat(&other.0).into(),
             ast::Operator::Equals => not_null.then(|| self == other).into(),
-            ast::Operator::Divide => self.0.exec_divide(&other.0).into(),
+            ast::Operator::Divide => turso_core::Value::from(self.0.exec_divide(&other.0)).into(),
             ast::Operator::Greater => not_null.then(|| self > other).into(),
             ast::Operator::GreaterEquals => not_null.then(|| self >= other).into(),
             // TODO: Test these implementations
@@ -260,15 +264,25 @@ impl SimValue {
             ast::Operator::IsNot => self
                 .binary_compare(other, ast::Operator::Is)
                 .unary_exec(ast::UnaryOperator::Not),
-            ast::Operator::LeftShift => self.0.exec_shift_left(&other.0).into(),
+            ast::Operator::LeftShift => {
+                turso_core::Value::from(self.0.exec_shift_left(&other.0)).into()
+            }
             ast::Operator::Less => not_null.then(|| self < other).into(),
             ast::Operator::LessEquals => not_null.then(|| self <= other).into(),
-            ast::Operator::Modulus => self.0.exec_remainder(&other.0).into(),
-            ast::Operator::Multiply => self.0.exec_multiply(&other.0).into(),
+            ast::Operator::Modulus => {
+                turso_core::Value::from(self.0.exec_remainder(&other.0)).into()
+            }
+            ast::Operator::Multiply => {
+                turso_core::Value::from(self.0.exec_multiply(&other.0)).into()
+            }
             ast::Operator::NotEquals => not_null.then(|| self != other).into(),
             ast::Operator::Or => self.0.exec_or(&other.0).into(),
-            ast::Operator::RightShift => self.0.exec_shift_right(&other.0).into(),
-            ast::Operator::Subtract => self.0.exec_subtract(&other.0).into(),
+            ast::Operator::RightShift => {
+                turso_core::Value::from(self.0.exec_shift_right(&other.0)).into()
+            }
+            ast::Operator::Subtract => {
+                turso_core::Value::from(self.0.exec_subtract(&other.0)).into()
+            }
         }
     }
 
@@ -296,13 +310,13 @@ impl SimValue {
 
     pub fn unary_exec(&self, operator: ast::UnaryOperator) -> SimValue {
         let new_value = match operator {
-            ast::UnaryOperator::BitwiseNot => self.0.exec_bit_not(),
+            ast::UnaryOperator::BitwiseNot => turso_core::Value::from(self.0.exec_bit_not()),
             ast::UnaryOperator::Negative => {
                 SimValue(types::Value::Integer(0))
                     .binary_compare(self, ast::Operator::Subtract)
                     .0
             }
-            ast::UnaryOperator::Not => self.0.exec_boolean_not(),
+            ast::UnaryOperator::Not => turso_core::Value::from(self.0.exec_boolean_not()),
             ast::UnaryOperator::Positive => self.0.clone(),
         };
         Self(new_value)

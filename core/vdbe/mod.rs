@@ -35,6 +35,7 @@ use crate::{
     error::LimboError,
     function::{AggFunc, FuncCtx},
     mvcc::{database::CommitStateMachine, LocalClock},
+    numeric::{NullableInteger, Numeric},
     return_if_io,
     schema::Trigger,
     state_machine::StateMachine,
@@ -241,6 +242,28 @@ impl Register {
             _ => {
                 *self = Register::Value(Value::Integer(val));
             }
+        }
+    }
+    pub fn set(&mut self, value: Value) {
+        match (self, value) {
+            (Register::Value(Value::Integer(x)), Value::Integer(y)) => *x = y,
+            (Register::Value(Value::Float(x)), Value::Float(y)) => *x = y,
+            (x, y) => *x = Self::Value(y),
+        }
+    }
+    pub fn set_numeric(&mut self, value: Numeric) {
+        match (self, value) {
+            (Register::Value(Value::Integer(x)), Numeric::Integer(y)) => *x = y,
+            (Register::Value(Value::Float(x)), Numeric::Float(y)) => *x = y.into(),
+            (Register::Value(Value::Null), Numeric::Null) => {}
+            (x, y) => *x = Self::Value(y.into()),
+        }
+    }
+    pub fn set_nullable_integer(&mut self, value: NullableInteger) {
+        match (self, value) {
+            (Register::Value(Value::Integer(x)), NullableInteger::Integer(y)) => *x = y,
+            (Register::Value(Value::Null), NullableInteger::Null) => {}
+            (x, y) => *x = Self::Value(y.into()),
         }
     }
 }

@@ -7,8 +7,10 @@ impl NonNan {
         if value.is_nan() {
             return None;
         }
-
-        Some(NonNan(value))
+        Some(Self(value))
+    }
+    pub fn new_non_nan(value: f64) -> Self {
+        Self(value)
     }
 }
 
