@@ -738,6 +738,32 @@ pub fn join_lhs_and_rhs<'a>(
         }
     }
 
+    // FULL OUTER JOIN requires a hash join to correctly emit unmatched build rows.
+    // If the optimizer couldn't select a hash join (e.g. no equi-join condition,
+    // USING clause, or other restrictions), return an error rather than silently
+    // producing incorrect results.
+    // Only check when there's an LHS — the first table in join order has no LHS
+    // and can't be a hash join target.
+    if lhs.is_some() {
+        let is_full_outer = rhs_table_reference
+            .join_info
+            .as_ref()
+            .is_some_and(|ji| ji.full_outer);
+        if is_full_outer
+            && !matches!(
+                best_access_method.params,
+                AccessMethodParams::HashJoin {
+                    join_type: HashJoinType::FullOuter,
+                    ..
+                }
+            )
+        {
+            return Err(crate::LimboError::ParseError(
+                "FULL OUTER JOIN requires an equality condition in the ON clause".to_string(),
+            ));
+        }
+    }
+
     let cost = lhs_cost + best_access_method.cost;
 
     if cost > cost_upper_bound {

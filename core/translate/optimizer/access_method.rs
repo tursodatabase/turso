@@ -819,13 +819,23 @@ pub fn try_hash_join_access_method(
     {
         HashJoinType::FullOuter
     } else if probe_table.join_info.as_ref().is_some_and(|ji| ji.outer) {
-        // LEFT OUTER hash join is not yet supported — the unmatched build scan
-        // does not re-open inner loops for tables nested inside the probe loop,
-        // which causes incorrect results for multi-table LEFT JOINs.
-        return None;
+        HashJoinType::LeftOuter
     } else {
         HashJoinType::Inner
     };
+
+    // Don't build a hash table from a table that can be NullRow'd by an outer
+    // join. The hash table would contain real data even when the cursor is
+    // NullRow'd, causing incorrect matches during the outer join's unmatched
+    // emission. This affects both inner and outer hash joins whose build table
+    // is part of a LEFT/FULL OUTER JOIN.
+    if build_table
+        .join_info
+        .as_ref()
+        .is_some_and(|ji| ji.outer || ji.full_outer)
+    {
+        return None;
+    }
 
     //skip hash join for now on USING/NATURAL joins
     if build_table
