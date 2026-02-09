@@ -140,7 +140,8 @@ pub fn exec_printf(values: &[Register]) -> crate::Result<Value> {
 
                 let mut formatted = if let Some(p) = precision {
                     if int_value < 0 {
-                        format!("-{:0p$}", (-int_value))
+                        let abs_value = int_value.unsigned_abs();
+                        format!("-{abs_value:0p$}")
                     } else {
                         format!("{int_value:0p$}")
                     }
@@ -152,9 +153,9 @@ pub fn exec_printf(values: &[Register]) -> crate::Result<Value> {
                     if w > formatted.len() {
                         if zero_pad && precision.is_none() {
                             if int_value < 0 {
-                                let neg_value = -int_value;
+                                let abs_value = int_value.unsigned_abs();
                                 let pad_width = w - 1;
-                                formatted = format!("-{neg_value:0pad_width$}");
+                                formatted = format!("-{abs_value:0pad_width$}");
                             } else {
                                 formatted = format!("{int_value:0w$}");
                             }
