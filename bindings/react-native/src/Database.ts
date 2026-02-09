@@ -244,8 +244,8 @@ export class Database {
     while (remaining.length > 0) {
       const result = this._connection.prepareFirst(remaining);
 
-      if (!result.statement) {
-        break; // No more statements
+      if (!result) {
+        break; // No more statements (C++ returns null when nothing to parse)
       }
 
       // Wrap in Statement to get IO handling

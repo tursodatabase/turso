@@ -25,7 +25,7 @@ export interface NativeDatabase {
  */
 export interface NativeConnection {
   prepareSingle(sql: string): NativeStatement;
-  prepareFirst(sql: string): { statement: NativeStatement | null; tailIdx: number };
+  prepareFirst(sql: string): { statement: NativeStatement; tailIdx: number } | null;
   lastInsertRowid(): number;
   getAutocommit(): boolean;
   setBusyTimeout(timeoutMs: number): void;
