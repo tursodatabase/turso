@@ -1,15 +1,10 @@
-<<<<<<< HEAD
-import { expect, test, describe } from 'vitest';
+import { expect, test, describe, afterAll } from 'vitest';
 import { connect, Database, DatabaseRowMutation, DatabaseRowTransformResult } from './promise-default.js';
-=======
-import { expect, test, afterAll } from 'vitest'
-import { Database, connect, DatabaseRowMutation, DatabaseRowTransformResult } from './promise-default.js'
 import { MainWorker } from './index-default.js'
 
 afterAll(() => {
     MainWorker?.terminate();
 })
->>>>>>> main
 
 const localeCompare = (a: any, b: any) => a.x.localeCompare(b.x);
 
