@@ -36,7 +36,49 @@ def get_issues(milestone_number, state):
     )
 
 
-def format_issue(issue):
+def get_linked_prs(issue_numbers):
+    """Batch-fetch linked PRs for issues using GitHub GraphQL API."""
+    result = {}
+    # GraphQL queries are limited in size, batch in chunks of 50
+    for i in range(0, len(issue_numbers), 50):
+        chunk = issue_numbers[i:i + 50]
+        fields = "\n".join(
+            f'i{n}: issue(number: {n}) {{'
+            f'  number'
+            f'  timelineItems(itemTypes: [CROSS_REFERENCED_EVENT], first: 10) {{'
+            f'    nodes {{'
+            f'      ... on CrossReferencedEvent {{'
+            f'        source {{'
+            f'          ... on PullRequest {{ number url state }}'
+            f'        }}'
+            f'      }}'
+            f'    }}'
+            f'  }}'
+            f'}}'
+            for n in chunk
+        )
+        query = f'{{ repository(owner: "tursodatabase", name: "turso") {{ {fields} }} }}'
+        proc = subprocess.run(
+            ["gh", "api", "graphql", "-f", f"query={query}"],
+            capture_output=True, text=True
+        )
+        if proc.returncode != 0:
+            print(f"Warning: GraphQL query failed: {proc.stderr.strip()}", file=sys.stderr)
+            continue
+        data = json.loads(proc.stdout).get("data", {}).get("repository", {})
+        for key, issue_data in data.items():
+            issue_num = issue_data["number"]
+            prs = []
+            for node in issue_data["timelineItems"]["nodes"]:
+                source = node.get("source", {})
+                if source.get("number"):
+                    prs.append(source)
+            if prs:
+                result[issue_num] = prs
+    return result
+
+
+def format_issue(issue, linked_prs):
     labels = [l["name"] for l in issue["labels"]]
     assignees = [a["login"] for a in issue["assignees"]]
 
@@ -44,6 +86,10 @@ def format_issue(issue):
     parts = [f"{issue['title']} (<{url}|#{issue['number']}>)"]
     if assignees:
         parts.append(f"({', '.join(assignees)})")
+    prs = linked_prs.get(issue["number"], [])
+    if prs:
+        pr = prs[0]  # show the most recent/first linked PR
+        parts.append(f"→ <{pr['url']}|PR #{pr['number']}>")
     if "high priority" in labels:
         parts.append("[HIGH]")
     return "• " + " ".join(parts)
@@ -117,23 +163,28 @@ def main():
         else:
             other.append(issue)
 
-    # Unassigned / assigned
-    unassigned = [i for i in open_issues if not i["assignees"]]
-    assigned = [i for i in open_issues if i["assignees"]]
+    # Fetch linked PRs for all open issues
+    all_issue_numbers = [i["number"] for i in open_issues]
+    print("Fetching linked PRs...", file=sys.stderr)
+    linked_prs = get_linked_prs(all_issue_numbers)
+
+    # Has PR / no PR
+    has_pr = [i for i in open_issues if i["number"] in linked_prs]
+    no_pr = [i for i in open_issues if i["number"] not in linked_prs]
 
     # Progress bar
     total = len(open_issues) + len(closed_issues) if args.closed else milestone["open_issues"] + milestone["closed_issues"]
     n_closed = milestone["closed_issues"]
-    n_assigned = len(assigned)
-    n_unassigned = len(unassigned)
+    n_has_pr = len(has_pr)
+    n_no_pr = len(no_pr)
     bar_len = 10
     closed_blocks = round(n_closed / total * bar_len) if total else 0
-    assigned_blocks = round(n_assigned / total * bar_len) if total else 0
-    unassigned_blocks = bar_len - closed_blocks - assigned_blocks
+    pr_blocks = round(n_has_pr / total * bar_len) if total else 0
+    no_pr_blocks = bar_len - closed_blocks - pr_blocks
     progress_bar = (
         ":large_green_square:" * closed_blocks
-        + ":large_yellow_square:" * assigned_blocks
-        + ":white_large_square:" * unassigned_blocks
+        + ":large_yellow_square:" * pr_blocks
+        + ":white_large_square:" * no_pr_blocks
     )
     pct = round(n_closed / total * 100) if total else 0
 
@@ -144,8 +195,8 @@ def main():
     header_lines.append(f"{progress_bar} {pct}%")
     header_lines.append("")
     header_lines.append(f":large_green_square: Closed: {n_closed}")
-    header_lines.append(f":large_yellow_square: Assigned: {n_assigned}")
-    header_lines.append(f":white_large_square: Unassigned: {n_unassigned}")
+    header_lines.append(f":large_yellow_square: Has PR: {n_has_pr}")
+    header_lines.append(f":white_large_square: No PR: {n_no_pr}")
     if milestone.get("due_on"):
         header_lines.append(f"Due: {milestone['due_on'][:10]}")
     header = "\n".join(header_lines)
@@ -155,31 +206,31 @@ def main():
     if high_priority:
         lines = [f":rotating_light: *High Priority ({len(high_priority)})*"]
         for issue in high_priority:
-            lines.append(format_issue(issue))
+            lines.append(format_issue(issue, linked_prs))
         categories.append("\n".join(lines))
 
     if bugs:
         lines = [f":bug: *Bugs ({len(bugs)})*"]
         for issue in bugs:
-            lines.append(format_issue(issue))
+            lines.append(format_issue(issue, linked_prs))
         categories.append("\n".join(lines))
 
     if features:
         lines = [f":sparkles: *Features/Enhancements ({len(features)})*"]
         for issue in features:
-            lines.append(format_issue(issue))
+            lines.append(format_issue(issue, linked_prs))
         categories.append("\n".join(lines))
 
     if other:
         lines = [f":clipboard: *Other ({len(other)})*"]
         for issue in other:
-            lines.append(format_issue(issue))
+            lines.append(format_issue(issue, linked_prs))
         categories.append("\n".join(lines))
 
     if args.closed and closed_issues:
         lines = [f":white_check_mark: *Closed ({len(closed_issues)})*"]
         for issue in closed_issues:
-            lines.append(format_issue(issue))
+            lines.append(format_issue(issue, linked_prs))
         categories.append("\n".join(lines))
 
     if args.post:
