@@ -53,6 +53,11 @@ pub enum TxOperation {
         table_name: String,
         row: Vec<SimValue>,
     },
+    Update {
+        table_name: String,
+        old_row: Vec<SimValue>,
+        new_row: Vec<SimValue>,
+    },
     Delete {
         table_name: String,
         row: Vec<SimValue>,
@@ -162,6 +167,22 @@ impl TransactionTables {
         self.expect_snapshot_mut()
             .operations
             .push(TxOperation::Insert { table_name, row });
+    }
+
+    #[inline]
+    pub fn record_update(
+        &mut self,
+        table_name: String,
+        old_row: Vec<SimValue>,
+        new_row: Vec<SimValue>,
+    ) {
+        self.expect_snapshot_mut()
+            .operations
+            .push(TxOperation::Update {
+                table_name,
+                old_row,
+                new_row,
+            });
     }
 
     #[inline]
@@ -305,6 +326,17 @@ where
     pub fn record_insert(&mut self, table_name: String, row: Vec<SimValue>) {
         if let Some(txn) = &mut *self.transaction_tables {
             txn.record_insert(table_name, row);
+        }
+    }
+
+    pub fn record_update(
+        &mut self,
+        table_name: String,
+        old_row: Vec<SimValue>,
+        new_row: Vec<SimValue>,
+    ) {
+        if let Some(txn) = &mut *self.transaction_tables {
+            txn.record_update(table_name, old_row, new_row);
         }
     }
 
@@ -473,6 +505,27 @@ where
                             .find(|t| &t.name == table_name)
                             .expect("Table should exist in committed tables");
                         committed.rows.push(row.clone());
+                    }
+                    TxOperation::Update {
+                        table_name,
+                        old_row,
+                        new_row,
+                    } => {
+                        let committed = self
+                            .commited_tables
+                            .iter_mut()
+                            .find(|t| &t.name == table_name)
+                            .expect("Table should exist in committed tables");
+
+                        let Some(pos) = committed.rows.iter().position(|r| r == old_row) else {
+                            panic!(
+                                "failed to apply UPDATE to table '{}': row not found (old_row={:?}, committed_rows={})",
+                                table_name,
+                                old_row,
+                                committed.rows.len()
+                            );
+                        };
+                        committed.rows[pos] = new_row.clone();
                     }
                     TxOperation::Delete { table_name, row } => {
                         let committed = self
