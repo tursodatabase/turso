@@ -1656,7 +1656,29 @@ pub fn op_type_check(
             let _applied = apply_affinity_char(reg, col_affinity);
             let value_type = reg.get_value().value_type();
             match_ignore_ascii_case!(match ty_bytes {
-                b"INTEGER" | b"INT" if value_type == ValueType::Integer => {}
+                b"INTEGER" | b"INT"
+                    if value_type == ValueType::Integer || value_type == ValueType::Float =>
+                {
+                    if value_type == ValueType::Float {
+                        if let Register::Value(value) = reg {
+                            if let Value::Float(f) = *value {
+                                let i = f as i64;
+                                if (i as f64) == f {
+                                    *value = Value::Integer(i);
+                                } else {
+                                    bail_constraint_error!(
+                                        "cannot store {} value in {} column {}.{} ({})",
+                                        value_type,
+                                        ty_str,
+                                        &table_reference.name,
+                                        col.name.as_deref().unwrap_or(""),
+                                        SQLITE_CONSTRAINT
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
                 b"REAL" if value_type == ValueType::Float => {}
                 b"BLOB" if value_type == ValueType::Blob => {}
                 b"TEXT" if value_type == ValueType::Text => {}

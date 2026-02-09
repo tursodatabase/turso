@@ -263,6 +263,54 @@ expect {
     1|90.0
 }
 
+@requires strict "uses STRICT tables"
+test strict-text-float-to-integer-basic {
+    CREATE TABLE t(a INTEGER) STRICT;
+    INSERT INTO t VALUES('42.0');
+    SELECT a, typeof(a) FROM t;
+}
+expect {
+    42|integer
+}
+
+@requires strict "uses STRICT tables"
+test strict-text-float-to-integer-zero {
+    CREATE TABLE t(a INTEGER) STRICT;
+    INSERT INTO t VALUES('0.0');
+    SELECT a, typeof(a) FROM t;
+}
+expect {
+    0|integer
+}
+
+@requires strict "uses STRICT tables"
+test strict-text-float-to-integer-negative {
+    CREATE TABLE t(a INTEGER) STRICT;
+    INSERT INTO t VALUES('-5.0');
+    SELECT a, typeof(a) FROM t;
+}
+expect {
+    -5|integer
+}
+
+@requires strict "uses STRICT tables"
+test strict-text-float-to-integer-scientific {
+    CREATE TABLE t(a INTEGER) STRICT;
+    INSERT INTO t VALUES('1e2');
+    SELECT a, typeof(a) FROM t;
+}
+expect {
+    100|integer
+}
+
+@requires strict "uses STRICT tables"
+test strict-text-float-to-integer-fractional-error {
+    CREATE TABLE t(a INTEGER) STRICT;
+    INSERT INTO t VALUES('1.5');
+}
+expect error {
+}
+
 test duplicate-set {
     CREATE TABLE t (x, y);
     INSERT INTO t VALUES(1, 'A');
