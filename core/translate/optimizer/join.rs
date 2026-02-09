@@ -739,7 +739,7 @@ pub fn join_lhs_and_rhs<'a>(
     }
 
     // FULL OUTER requires hash join for unmatched build scanning. Error if the
-    // optimizer couldn't select one (no equi-join, USING clause, etc.).
+    // optimizer couldn't select one (no equi-join, USING clause, chaining, etc.).
     if lhs.is_some() {
         let is_full_outer = rhs_table_reference
             .join_info
@@ -754,9 +754,19 @@ pub fn join_lhs_and_rhs<'a>(
                 }
             )
         {
-            return Err(crate::LimboError::ParseError(
-                "FULL OUTER JOIN requires an equality condition in the ON clause".to_string(),
-            ));
+            // Distinguish chaining (build table already participates in an outer
+            // join) from a missing equi-join condition.
+            let build_table_idx = join_order[join_order.len() - 2].original_idx;
+            let build_is_outer = joined_tables[build_table_idx]
+                .join_info
+                .as_ref()
+                .is_some_and(|ji| ji.outer || ji.full_outer);
+            let msg = if build_is_outer {
+                "FULL OUTER JOIN chaining is not yet supported"
+            } else {
+                "FULL OUTER JOIN requires an equality condition in the ON clause"
+            };
+            return Err(crate::LimboError::ParseError(msg.to_string()));
         }
     }
 

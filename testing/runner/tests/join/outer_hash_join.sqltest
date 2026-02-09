@@ -983,7 +983,7 @@ test three-way-full-outer-join-errors {
     FULL OUTER JOIN t3 ON t2.b = t3.c;
 }
 expect error {
-    FULL OUTER JOIN requires an equality condition in the ON clause
+    FULL OUTER JOIN chaining is not yet supported
 }
 
 # FULL OUTER with a large number of matched and unmatched rows to stress-test
