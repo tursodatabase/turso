@@ -712,60 +712,7 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
         let row_versions = row_versions.value();
         let row_versions = row_versions.read();
 
-        // Check for conflicts - iterate in reverse for faster early termination
-        for version in row_versions.iter().rev() {
-            // Skip deleted versions
-            if version.end.is_some() {
-                continue;
-            }
-
-            match version.begin {
-                Some(TxTimestampOrID::TxID(other_tx_id)) => {
-                    // Skip our own version
-                    if other_tx_id == self.tx_id {
-                        continue;
-                    }
-                    // Another transaction's uncommitted version - check their state
-                    let other_tx = mvcc_store.txs.get(&other_tx_id);
-                    if let Some(other_tx) = other_tx {
-                        let other_tx = other_tx.value();
-                        match other_tx.state.load() {
-                            // Other tx already committed = conflict
-                            TransactionState::Committed(_) => {
-                                return Err(LimboError::WriteWriteConflict);
-                            }
-                            // Both preparing - compare end_ts (lower wins)
-                            TransactionState::Preparing(other_end_ts) => {
-                                if other_end_ts < end_ts {
-                                    // Other tx has lower end_ts, they win
-                                    return Err(LimboError::WriteWriteConflict);
-                                }
-                                // We have lower end_ts, we win - they'll abort when they validate
-                            }
-                            // Other tx still active - we're already Preparing so we're ahead
-                            // They'll see us in Preparing/Committed when they try to commit
-                            TransactionState::Active => {}
-                            // Other tx aborted - no conflict
-                            TransactionState::Aborted | TransactionState::Terminated => {}
-                        }
-                    }
-                }
-                Some(TxTimestampOrID::Timestamp(begin_ts)) => {
-                    // Committed version - check if it was inserted after we started
-                    if begin_ts >= tx.begin_ts {
-                        // Duplicate! A version was committed after we started
-                        return Err(LimboError::WriteWriteConflict);
-                    }
-                    turso_assert!(
-                        false,
-                        "there is another row insterted and not updated/deleted from before"
-                    );
-                }
-                None => {
-                    // Invalid version
-                }
-            }
-        }
+        self.check_version_conflicts(end_ts, tx, mvcc_store, &row_versions)?;
         Ok(())
     }
 
@@ -810,6 +757,17 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
         let row_versions = row_versions.value();
         let row_versions = row_versions.read();
 
+        self.check_version_conflicts(end_ts, tx, mvcc_store, &row_versions)?;
+        Ok(())
+    }
+
+    fn check_version_conflicts(
+        &self,
+        end_ts: u64,
+        tx: &Transaction,
+        mvcc_store: &Arc<MvStore<Clock>>,
+        row_versions: &[RowVersion],
+    ) -> Result<()> {
         // Check for conflicts - iterate in reverse for faster early termination
         for version in row_versions.iter().rev() {
             // Skip deleted versions
