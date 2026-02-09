@@ -3661,8 +3661,10 @@ fn emit_update_insns<'a>(
 
         // If we are updating the rowid, we cannot rely on overwrite on the
         // Insert instruction to update the cell. We need to first delete the current cell
-        // and later insert the updated record
-        if not_exists_check_required {
+        // and later insert the updated record.
+        // In MVCC mode, we also need DELETE+INSERT to properly version the row (Hekaton model).
+        let needs_delete = not_exists_check_required || connection.mvcc_enabled();
+        if needs_delete {
             program.emit_insn(Insn::Delete {
                 cursor_id: target_table_cursor_id,
                 table_name: table_name.to_string(),
