@@ -6,6 +6,7 @@
  */
 
 import type {
+  NativeConnection,
   NativeStatement,
   SQLiteValue,
   BindParams,
@@ -19,11 +20,13 @@ import { TursoStatus, TursoType } from './types';
  */
 export class Statement {
   private _statement: NativeStatement;
+  private _connection: NativeConnection | null;
   private _finalized = false;
   private _extraIo?: () => Promise<void>;
 
-  constructor(statement: NativeStatement, extraIo?: () => Promise<void>) {
+  constructor(statement: NativeStatement, connection?: NativeConnection | null, extraIo?: () => Promise<void>) {
     this._statement = statement;
+    this._connection = connection ?? null;
     this._extraIo = extraIo;
   }
 
@@ -137,7 +140,7 @@ export class Statement {
 
     return {
       changes: result.rowsChanged,
-      lastInsertRowid: 0, // Not available from execute, would need connection
+      lastInsertRowid: this._connection ? this._connection.lastInsertRowid() : 0,
     };
   }
 

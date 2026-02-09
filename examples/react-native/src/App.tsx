@@ -80,13 +80,17 @@ export default function App() {
       testResults.push({ name: 'CREATE TABLE', passed: false, error: String(e) });
     }
 
-    // Test: Insert data
+    // Test: Insert data and verify lastInsertRowid
     try {
-      await db.run('INSERT INTO users (name, age) VALUES (?, ?)', 'Alice', 30);
-      await db.run('INSERT INTO users (name, age) VALUES (?, ?)', 'Bob', 25);
-      testResults.push({ name: 'INSERT data', passed: true });
+      const res1 = await db.run('INSERT INTO users (name, age) VALUES (?, ?)', 'Alice', 30);
+      const res2 = await db.run('INSERT INTO users (name, age) VALUES (?, ?)', 'Bob', 25);
+      if (res1.lastInsertRowid > 0 && res2.lastInsertRowid > res1.lastInsertRowid) {
+        testResults.push({ name: 'INSERT data + lastInsertRowid', passed: true });
+      } else {
+        testResults.push({ name: 'INSERT data + lastInsertRowid', passed: false, error: `Expected increasing rowids, got ${res1.lastInsertRowid} and ${res2.lastInsertRowid}` });
+      }
     } catch (e) {
-      testResults.push({ name: 'INSERT data', passed: false, error: String(e) });
+      testResults.push({ name: 'INSERT data + lastInsertRowid', passed: false, error: String(e) });
     }
 
     // Test: Query single row
