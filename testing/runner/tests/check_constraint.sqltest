@@ -1463,23 +1463,26 @@ expect {
 }
 
 # Bug fix: Column-level CHECK should stay inline in DDL after ADD COLUMN
+# Use LIKE to avoid exact DDL formatting differences between SQLite and Turso
+# (Turso adds a space after table name due to 022f679f; SQLite preserves original)
 test check_constraint_ddl_column_level_preserved {
     CREATE TABLE t(a INTEGER CHECK(a > 0), b TEXT);
     ALTER TABLE t ADD COLUMN c REAL CHECK(c > 0);
-    SELECT sql FROM sqlite_master WHERE name = 't';
+    SELECT count(*) FROM sqlite_master WHERE name = 't' AND sql LIKE '%a INTEGER CHECK%(a > 0)%c REAL CHECK%(c > 0)%';
 }
 expect {
-    CREATE TABLE t (a INTEGER CHECK (a > 0), b TEXT, c REAL CHECK (c > 0))
+    1
 }
 
 # Bug fix: RENAME COLUMN to SQL keyword should preserve quotes in CHECK DDL
+# Use LIKE to avoid exact DDL formatting differences (022f679f)
 test check_constraint_rename_column_to_keyword_ddl {
     CREATE TABLE t("value" INTEGER CHECK("value" > 0));
     ALTER TABLE t RENAME COLUMN "value" TO "group";
-    SELECT sql FROM sqlite_master WHERE name = 't';
+    SELECT count(*) FROM sqlite_master WHERE name = 't' AND sql LIKE '%"group" INTEGER CHECK%("group" > 0)%';
 }
 expect {
-    CREATE TABLE t ("group" INTEGER CHECK ("group" > 0))
+    1
 }
 
 test check_constraint_rename_column_to_keyword_still_works {
@@ -1625,11 +1628,12 @@ expect error {
 
 # Constraint names that are SQL keywords must preserve quoting in regenerated DDL
 # after ALTER TABLE operations (e.g., DROP COLUMN).
+# Use LIKE to avoid exact DDL formatting differences (022f679f)
 test check_constraint_keyword_constraint_name_quoting_after_alter {
     CREATE TABLE t1(x INTEGER CONSTRAINT "select" CHECK(x > 0), y TEXT);
     ALTER TABLE t1 DROP COLUMN y;
-    SELECT sql FROM sqlite_master WHERE name='t1';
+    SELECT count(*) FROM sqlite_master WHERE name='t1' AND sql LIKE '%CONSTRAINT "select" CHECK%(x > 0)%';
 }
 expect {
-    CREATE TABLE t1 (x INTEGER CONSTRAINT "select" CHECK (x > 0))
+    1
 }

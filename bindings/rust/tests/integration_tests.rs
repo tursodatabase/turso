@@ -1288,7 +1288,6 @@ async fn test_experimental_strict_tables() {
     .await
     .unwrap();
 
-
     // Insert valid data
     conn.execute("INSERT INTO users VALUES (1, 'Alice')", ())
         .await
