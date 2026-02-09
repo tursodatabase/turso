@@ -185,4 +185,12 @@ impl IncrementalOperator for MergeOperator {
     fn set_tracker(&mut self, _tracker: Arc<Mutex<ComputationTracker>>) {
         // Merge operator doesn't need tracking for now
     }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
 }
