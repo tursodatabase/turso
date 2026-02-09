@@ -1,18 +1,17 @@
-//! Generation context with RNG, trace, and coverage.
+//! Generation context with RNG and coverage.
 
 use anarchist_readable_name_generator_lib::readable_name_custom;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
-use crate::trace::{Coverage, ExprKind, Origin, OriginPath, StmtKind, Trace, TraceBuilder};
+use crate::trace::{Coverage, ExprKind, Origin, OriginPath, StmtKind};
 
 /// Context for SQL generation.
 ///
-/// The context holds the RNG, trace builder, coverage tracker, and current
+/// The context holds the RNG, coverage tracker, and current
 /// scope information. It is passed to all generation functions.
 pub struct Context {
     rng: StdRng,
-    trace_builder: TraceBuilder,
     coverage: Coverage,
     origin_stack: OriginPath,
     depth: usize,
@@ -29,7 +28,6 @@ impl Context {
     pub fn new_with_seed(seed: u64) -> Self {
         Self {
             rng: StdRng::seed_from_u64(seed),
-            trace_builder: TraceBuilder::new(),
             coverage: Coverage::new(),
             origin_stack: OriginPath::new(),
             depth: 0,
@@ -87,13 +85,11 @@ impl Context {
     /// Record an expression kind (automatically tracked by origin).
     pub fn record(&mut self, kind: ExprKind) {
         self.coverage.record_expr(&self.origin_stack, kind);
-        self.trace_builder.add_expr(kind);
     }
 
     /// Record a statement kind.
     pub fn record_stmt(&mut self, kind: StmtKind) {
         self.coverage.record_stmt(kind);
-        self.trace_builder.add_stmt(kind);
     }
 
     /// Run the closure under the given scope. Should only be used for generation
@@ -108,7 +104,6 @@ impl Context {
     fn enter_scope(&mut self, origin: Origin) {
         self.origin_stack.push(origin);
         self.depth += 1;
-        self.trace_builder.push_scope(origin);
         self.coverage.record_scope(&self.origin_stack);
 
         if matches!(origin, Origin::Subquery) {
@@ -125,7 +120,6 @@ impl Context {
 
         self.origin_stack.pop();
         self.depth = self.depth.saturating_sub(1);
-        self.trace_builder.pop_scope();
     }
 
     /// Get a reference to the coverage data.
@@ -136,11 +130,6 @@ impl Context {
     /// Take the coverage data, leaving an empty Coverage in place.
     pub fn take_coverage(&mut self) -> Coverage {
         std::mem::take(&mut self.coverage)
-    }
-
-    /// Build the trace tree.
-    pub fn into_trace(self) -> Trace {
-        self.trace_builder.build()
     }
 
     // RNG methods

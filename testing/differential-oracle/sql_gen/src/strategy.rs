@@ -10,17 +10,15 @@ use crate::SqlGen;
 use crate::ast::Stmt;
 use crate::capabilities::Capabilities;
 use crate::context::Context;
-use crate::trace::{Coverage, Trace};
+use crate::trace::Coverage;
 
-/// The generated output containing SQL, AST, trace, and coverage.
+/// The generated output containing SQL, AST, and coverage.
 #[derive(Clone, Debug)]
 pub struct GeneratedSql {
     /// The generated SQL string.
     pub sql: String,
     /// The AST of the generated statement.
     pub ast: Stmt,
-    /// The trace of generated constructs.
-    pub trace: Trace,
     /// Coverage statistics.
     pub coverage: Coverage,
 }
@@ -58,13 +56,11 @@ impl<C: Capabilities + Clone> Strategy for SqlStrategy<C> {
             Ok(stmt) => {
                 let sql = stmt.to_string();
                 let coverage = ctx.take_coverage();
-                let trace = ctx.into_trace();
 
                 Ok(SqlValueTree {
                     current: GeneratedSql {
                         sql,
                         ast: stmt,
-                        trace,
                         coverage,
                     },
                     shrink_state: ShrinkState::default(),
