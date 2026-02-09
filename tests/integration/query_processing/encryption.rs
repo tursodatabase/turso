@@ -1,6 +1,5 @@
 use crate::common::{do_flush, run_query, run_query_on_row, TempDatabase};
 use rand::{rng, RngCore};
-use std::panic;
 use std::sync::Arc;
 use turso_core::{Database, DatabaseOpts, EncryptionOpts, OpenFlags, PlatformIO, Row, IO};
 
@@ -93,29 +92,25 @@ fn test_per_page_encryption(tmp_db: TempDatabase) -> anyhow::Result<()> {
         do_flush(&conn, &tmp_db)?;
     }
     {
-        // test connecting to encrypted db using wrong key(key is ending with 77.The correct key is ending with 27).This should panic.
+        // test connecting to encrypted db using wrong key (key ends with 77, correct key ends with 27).
         let uri = format!(
             "file:{}?cipher=aegis256&hexkey=b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76377",
             db_path.to_str().unwrap()
         );
         let (_io, conn) = turso_core::Connection::from_uri(&uri, opts)?;
-        let should_panic = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-            run_query_on_row(&tmp_db, &conn, "SELECT * FROM test", |_row: &Row| {}).unwrap();
-        }));
+        let result = run_query_on_row(&tmp_db, &conn, "SELECT * FROM test", |_row: &Row| {});
         assert!(
-            should_panic.is_err(),
-            "should panic when accessing encrypted DB with wrong key"
+            result.is_err(),
+            "should return error when accessing encrypted DB with wrong key"
         );
     }
     {
-        //test connecting to encrypted db using insufficient encryption parameters in URI.This should panic.
+        // test connecting to encrypted db using insufficient encryption parameters in URI.
         let uri = format!("file:{}?cipher=aegis256", db_path.to_str().unwrap());
-        let should_panic = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-            turso_core::Connection::from_uri(&uri, opts).unwrap();
-        }));
+        let result = turso_core::Connection::from_uri(&uri, opts);
         assert!(
-            should_panic.is_err(),
-            "should panic when accessing encrypted DB without passing hexkey in URI"
+            result.is_err(),
+            "should return error when accessing encrypted DB without passing hexkey in URI"
         );
     }
     {
@@ -123,23 +118,19 @@ fn test_per_page_encryption(tmp_db: TempDatabase) -> anyhow::Result<()> {
             "file:{}?hexkey=b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327",
             db_path.to_str().unwrap()
         );
-        let should_panic = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-            turso_core::Connection::from_uri(&uri, opts).unwrap();
-        }));
+        let result = turso_core::Connection::from_uri(&uri, opts);
         assert!(
-            should_panic.is_err(),
-            "should panic when accessing encrypted DB without passing cipher in URI"
+            result.is_err(),
+            "should return error when accessing encrypted DB without passing cipher in URI"
         );
     }
     {
-        // Testing connecting to db without using URI.This should panic.
+        // test connecting to encrypted db without using URI.
         let conn = tmp_db.connect_limbo();
-        let should_panic = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-            run_query_on_row(&tmp_db, &conn, "SELECT * FROM test", |_row: &Row| {}).unwrap();
-        }));
+        let result = run_query_on_row(&tmp_db, &conn, "SELECT * FROM test", |_row: &Row| {});
         assert!(
-            should_panic.is_err(),
-            "should panic when accessing encrypted DB without using URI"
+            result.is_err(),
+            "should return error when accessing encrypted DB without using URI"
         );
     }
 
@@ -334,19 +325,18 @@ fn test_corruption_associated_data_bytes(tmp_db: TempDatabase) -> anyhow::Result
                 test_db_path.to_str().unwrap()
             );
 
-            let should_panic = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+            let result = (|| -> anyhow::Result<()> {
                 let (_io, conn) = turso_core::Connection::from_uri(
                     &uri,
                     DatabaseOpts::new().with_encryption(ENABLE_ENCRYPTION),
-                )
-                .unwrap();
-                run_query_on_row(&test_tmp_db, &conn, "SELECT * FROM test", |_row: &Row| {})
-                    .unwrap();
-            }));
+                )?;
+                run_query_on_row(&test_tmp_db, &conn, "SELECT * FROM test", |_row: &Row| {})?;
+                Ok(())
+            })();
 
             assert!(
-                should_panic.is_err(),
-                "should panic when accessing encrypted DB with corrupted associated data at position {corrupt_pos}",
+                result.is_err(),
+                "should return error when accessing encrypted DB with corrupted associated data at position {corrupt_pos}",
             );
         }
     }
@@ -576,28 +566,20 @@ fn test_encryption_key_validation_with_cached_database(_db: TempDatabase) -> any
         conn.set_encryption_cipher(turso_core::CipherMode::Aegis256)?;
         conn.set_encryption_key(wrong_encryption_key)?;
 
-        // Reading data should fail (either with error or panic due to decryption failure)
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let query_result = conn.query("SELECT * FROM secret_data");
-            match query_result {
-                Err(_) => true, // error returned - read failed as expected
-                Ok(Some(mut rows)) => loop {
-                    match rows.step() {
-                        Err(_) => break true,                            // Error - read failed
-                        Ok(turso_core::StepResult::Done) => break false, // Completed without error
-                        Ok(turso_core::StepResult::Interrupt) => break false,
-                        Ok(turso_core::StepResult::Row) => break false, // Got data - unexpected!!
-                        Ok(turso_core::StepResult::Busy) | Ok(turso_core::StepResult::IO) => {
-                            continue
-                        }
-                    }
-                },
-                Ok(None) => false,
-            }
-        }));
-
-        // Either returned error (Ok(true)), or panicked (Err) - both indicate decryption failed
-        let read_failed = result.unwrap_or(true);
+        // Reading data should fail with a decryption error
+        let read_failed = match conn.query("SELECT * FROM secret_data") {
+            Err(_) => true,
+            Ok(Some(mut rows)) => loop {
+                match rows.step() {
+                    Err(_) => break true,                            // Error - read failed
+                    Ok(turso_core::StepResult::Done) => break false, // Completed without error
+                    Ok(turso_core::StepResult::Interrupt) => break false,
+                    Ok(turso_core::StepResult::Row) => break false, // Got data - unexpected!!
+                    Ok(turso_core::StepResult::Busy) | Ok(turso_core::StepResult::IO) => continue,
+                }
+            },
+            Ok(None) => false,
+        };
         assert!(
             read_failed,
             "Reading data with wrong key should fail with decryption error"
