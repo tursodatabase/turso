@@ -1244,12 +1244,12 @@ impl HashJoinKey {
 /// Probe = RHS (the table scanned to look up matches in the hash table).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HashJoinType {
-    /// Standard inner join — only matching rows emitted.
+    /// Standard inner join: only matching rows emitted.
     Inner,
-    /// Left outer join — all build rows appear in output; unmatched build
+    /// Left outer join: all build rows appear in output; unmatched build
     /// entries are emitted with NULLs for the probe side.
     LeftOuter,
-    /// Full outer join — like LeftOuter (unmatched build → NULLs for probe),
+    /// Full outer join: like LeftOuter (unmatched build -> NULLs for probe),
     /// plus unmatched probe rows are emitted with NULLs for the build side.
     FullOuter,
 }

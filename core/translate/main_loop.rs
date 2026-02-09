@@ -1500,7 +1500,12 @@ pub fn open_loop(
                     });
                 }
 
-                if payload_info.use_bloom_filter {
+                // Bloom filter skips probe rows that definitely won't match. For
+                // FULL OUTER joins those rows still need to be emitted with NULLs
+                // for the build side, so we must not short-circuit to `next`.
+                if payload_info.use_bloom_filter
+                    && hash_join_op.join_type != HashJoinType::FullOuter
+                {
                     program.emit_insn(Insn::Filter {
                         cursor_id: payload_info.bloom_filter_cursor_id,
                         target_pc: next,
@@ -2404,8 +2409,7 @@ pub fn close_loop(
                             .expect("FULL OUTER probe table must have left join metadata");
                         let reg_match_flag = lj_meta.reg_match_flag;
 
-                        // Resolve check_outer_label here — both HashProbe miss and
-                        // HashNext exhaustion jump to this point.
+                        // Resolve check_outer_label: both HashProbe miss and HashNext exhaustion jump to this point.
                         if let Some(col) = check_outer_label {
                             program.resolve_label(col, program.offset());
                         }
@@ -2421,7 +2425,7 @@ pub fn close_loop(
                             decrement_by: 0,
                         });
 
-                        // No match — NullRow the build cursor so Column reads return NULL.
+                        // No match: NullRow the build cursor so Column reads return NULL.
                         if let Some(cursor_id) = build_cursor_id {
                             program.emit_insn(Insn::NullRow { cursor_id });
                         }
@@ -2623,9 +2627,9 @@ pub fn close_loop(
             }
         }
 
-        // Handle OUTER JOIN logic after loop end — may need to jump back
+        // Handle OUTER JOIN logic after loop end: may need to jump back
         // and emit NULLs for the right table before advancing the left table.
-        // Skip for outer hash join probe tables — handled by check_outer / unmatched build scan.
+        // Skip for outer hash join probe tables: handled by check_outer / unmatched build scan.
         let is_outer_hash_join_probe = matches!(
             table.op,
             Operation::HashJoin(ref hj) if matches!(
