@@ -133,3 +133,108 @@ test group_by_where_false {
 expect {
 }
 
+# Regression test for issue #2923: ORDER BY aggregate not in SELECT
+# The ORDER BY expression uses an aggregate (max(email)) that is not mentioned
+# in the SELECT clause. This requires correct expression matching between
+# the ORDER BY aggregate and the computed aggregate value.
+test groupby_orderby_agg_not_in_select {
+    CREATE TABLE t2923 (name TEXT, value INT, email TEXT);
+    INSERT INTO t2923 VALUES ('Alice', 10, 'z@example.com');
+    INSERT INTO t2923 VALUES ('Alice', 20, 'a@example.com');
+    INSERT INTO t2923 VALUES ('Bob', 30, 'y@example.com');
+    INSERT INTO t2923 VALUES ('Bob', 40, 'b@example.com');
+    SELECT name, sum(value) FROM t2923 GROUP BY name ORDER BY max(email) DESC;
+}
+expect {
+    Alice|30
+    Bob|70
+}
+
+# Regression test for issue #2923: Multiple GROUP BY and ORDER BY keys
+# Tests that sort directions are copied position-by-position when GROUP BY
+# and ORDER BY have the same number of expressions.
+test groupby_orderby_multiple_keys {
+    CREATE TABLE t2923b (a TEXT, b TEXT, value INT, email TEXT);
+    INSERT INTO t2923b VALUES
+        ('X', 'P', 10, 'z@test.com'),
+        ('X', 'P', 20, 'a@test.com'),
+        ('X', 'Q', 30, 'y@test.com'),
+        ('Y', 'P', 40, 'x@test.com'),
+        ('Y', 'Q', 50, 'w@test.com');
+    SELECT a, b, sum(value) FROM t2923b GROUP BY a, b ORDER BY max(email) DESC, min(email) ASC;
+}
+expect {
+    X|P|30
+    X|Q|30
+    Y|P|40
+    Y|Q|50
+}
+
+# Regression test for issue #2923: Different number of GROUP BY vs ORDER BY keys
+# When GROUP BY has more expressions than ORDER BY, the remaining keys
+# should default to ascending order.
+test groupby_orderby_different_key_counts {
+    CREATE TABLE t2923c (a TEXT, b TEXT, value INT);
+    INSERT INTO t2923c VALUES
+        ('X', 'P', 10),
+        ('X', 'Q', 20),
+        ('Y', 'P', 30),
+        ('Y', 'Q', 40);
+    SELECT a, b, sum(value) FROM t2923c GROUP BY a, b ORDER BY a DESC;
+}
+expect {
+    Y|P|30
+    Y|Q|40
+    X|P|10
+    X|Q|20
+}
+
+# Regression test for issue #2923: Multiple keys with LIMIT
+# Ensures correct results when LIMIT is applied with multiple GROUP BY
+# and ORDER BY keys.
+test groupby_orderby_multiple_keys_limit {
+    CREATE TABLE t2923d (a TEXT, b TEXT, value INT, email TEXT);
+    INSERT INTO t2923d VALUES
+        ('X', 'P', 10, 'z@test.com'),
+        ('X', 'P', 20, 'a@test.com'),
+        ('X', 'Q', 30, 'y@test.com'),
+        ('Y', 'P', 40, 'x@test.com'),
+        ('Y', 'Q', 50, 'w@test.com');
+    SELECT a, b, sum(value) FROM t2923d GROUP BY a, b ORDER BY max(email) DESC, min(email) ASC LIMIT 2;
+}
+expect {
+    X|P|30
+    X|Q|30
+}
+
+# Regression test for issue #2923: ORDER BY has more expressions than GROUP BY
+# When counts differ, falls through to expression-matching logic.
+test groupby_orderby_more_orderby_keys {
+    CREATE TABLE t2923e (a TEXT, value INT, email TEXT);
+    INSERT INTO t2923e VALUES
+        ('X', 10, 'z@test.com'),
+        ('X', 20, 'a@test.com'),
+        ('Y', 30, 'y@test.com'),
+        ('Y', 40, 'b@test.com');
+    SELECT a, sum(value) FROM t2923e GROUP BY a ORDER BY max(email) DESC, min(email) ASC;
+}
+expect {
+    X|30
+    Y|70
+}
+
+# Regression test for issue #2923: Same column in both GROUP BY and ORDER BY
+# Tests position-by-position copying when GROUP BY column also appears in ORDER BY.
+test groupby_orderby_same_column_in_both {
+    CREATE TABLE t2923f (a TEXT, value INT, email TEXT);
+    INSERT INTO t2923f VALUES
+        ('X', 10, 'z@test.com'),
+        ('X', 20, 'a@test.com'),
+        ('Y', 30, 'y@test.com'),
+        ('Y', 40, 'b@test.com');
+    SELECT a, sum(value) FROM t2923f GROUP BY a ORDER BY a DESC, max(email) DESC;
+}
+expect {
+    Y|70
+    X|30
+}
