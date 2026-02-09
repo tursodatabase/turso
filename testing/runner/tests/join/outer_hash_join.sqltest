@@ -433,6 +433,7 @@ expect {
     4|y|a
 }
 
+@skip-if sqlite "supported in sqlite"
 test full-outer-join-non-equi-errors {
     CREATE TABLE t1(a);
     CREATE TABLE t2(b);
@@ -885,6 +886,7 @@ expect {
 }
 
 # Self-join with FULL OUTER is unsupported (same root page).
+@skip-if sqlite "supported in sqlite"
 test full-outer-self-join-errors {
     CREATE TABLE t1(a, b);
     SELECT a.a, b.a FROM t1 a FULL OUTER JOIN t1 b ON a.a = b.a;
