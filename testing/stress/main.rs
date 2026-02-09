@@ -800,8 +800,7 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
             let mut rng = ThreadRng::new(global_seed.wrapping_add(thread as u64));
 
             for i in 0..nr_iterations {
-                if gen_bool(&mut rng, 0.0) {
-                    // disabled
+                if gen_bool(&mut rng, 0.01) {
                     // Reopen the database
                     let mut db_guard = db.lock().await;
                     let mut builder = Builder::new_local(&db_file);
@@ -811,8 +810,7 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
                     *db_guard = builder.build().await?;
                     conn = db_guard.connect()?;
                     conn.busy_timeout(std::time::Duration::from_millis(busy_timeout))?;
-                } else if gen_bool(&mut rng, 0.0) {
-                    // disabled
+                } else if gen_bool(&mut rng, 0.02) {
                     // Reconnect to the database
                     let db_guard = db.lock().await;
                     conn = db_guard.connect()?;
