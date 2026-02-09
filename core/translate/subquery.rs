@@ -14,7 +14,7 @@ use crate::{
         optimizer::optimize_select_plan,
         plan::{
             ColumnUsedMask, JoinOrderMember, NonFromClauseSubquery, OuterQueryReference, Plan,
-            SubqueryPosition, SubqueryState, TableReferences, WhereTerm,
+            SetOperation, SubqueryPosition, SubqueryState, TableReferences, WhereTerm,
         },
         select::prepare_select_plan,
     },
@@ -746,6 +746,27 @@ pub fn emit_from_clause_subqueries(
                             )
                         };
                     format!("HASH JOIN {table_name}")
+                }
+                Operation::MultiIndexScan(multi_idx) => {
+                    let index_names: Vec<&str> = multi_idx
+                        .branches
+                        .iter()
+                        .map(|b| {
+                            b.index
+                                .as_ref()
+                                .map(|i| i.name.as_str())
+                                .unwrap_or("PRIMARY KEY")
+                        })
+                        .collect();
+                    format!(
+                        "MULTI-INDEX {} {} ({})",
+                        match multi_idx.set_op {
+                            SetOperation::Union => "OR",
+                            SetOperation::Intersection => "AND",
+                        },
+                        table_reference.identifier,
+                        index_names.join(", ")
+                    )
                 }
             }
         );

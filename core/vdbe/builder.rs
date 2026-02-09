@@ -1046,6 +1046,7 @@ impl ProgramBuilder {
                 Insn::VNext { pc_if_next, .. } => resolve(pc_if_next, "VNext")?,
                 Insn::VFilter { pc_if_empty, .. } => resolve(pc_if_empty, "VFilter")?,
                 Insn::RowSetRead { pc_if_empty, .. } => resolve(pc_if_empty, "RowSetRead")?,
+                Insn::RowSetTest { pc_if_found, .. } => resolve(pc_if_found, "RowSetTest")?,
                 Insn::NoConflict { target_pc, .. } => resolve(target_pc, "NoConflict")?,
                 Insn::Found { target_pc, .. } => resolve(target_pc, "Found")?,
                 Insn::NotFound { target_pc, .. } => resolve(target_pc, "NotFound")?,

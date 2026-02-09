@@ -44,8 +44,9 @@ use turso_parser::ast::{self, Expr, SortOrder, TriggerEvent};
 use super::{
     emitter::Resolver,
     plan::{
-        DeletePlan, GroupBy, IterationDirection, JoinOrderMember, JoinedTable, Operation, Plan,
-        Search, SeekDef, SeekKey, SelectPlan, TableReferences, UpdatePlan, WhereTerm,
+        DeletePlan, GroupBy, IterationDirection, JoinOrderMember, JoinedTable, MultiIndexBranch,
+        MultiIndexScanOp, Operation, Plan, Search, SeekDef, SeekKey, SelectPlan, TableReferences,
+        UpdatePlan, WhereTerm,
     },
     planner::TableMask,
 };
@@ -1141,7 +1142,7 @@ fn optimize_table_access(
     }
 
     let Some(best_join_order_result) = compute_best_join_order(
-        table_references.joined_tables_mut(),
+        table_references.joined_tables(),
         maybe_order_target.as_ref(),
         &constraints_per_table,
         &base_table_rows,
@@ -1151,6 +1152,9 @@ fn optimize_table_access(
         &index_method_candidates,
         params,
         &schema.analyze_stats,
+        available_indexes,
+        table_references,
+        schema,
     )?
     else {
         return Ok(None);
@@ -1569,6 +1573,46 @@ fn optimize_table_access(
                 // Set up the index method query operation
                 table_references.joined_tables_mut()[table_idx].op =
                     Operation::IndexMethodQuery(query.clone());
+            }
+            AccessMethodParams::MultiIndexScan {
+                branches,
+                where_term_idx,
+                set_op,
+                additional_consumed_terms,
+            } => {
+                // Mark the primary WHERE clause term as consumed
+                where_clause[*where_term_idx].consumed = true;
+                // For intersection, also mark additional consumed terms
+                for term_idx in additional_consumed_terms.iter() {
+                    where_clause[*term_idx].consumed = true;
+                }
+
+                // Build the MultiIndexScanOp from the branch parameters
+                let mut multi_idx_branches: Vec<MultiIndexBranch> = Vec::new();
+                for branch in branches.iter() {
+                    // Build seek_def from constraint_refs using the branch's own constraint
+                    // (not constraints_per_table, since the branch constraint was created separately)
+                    let seek_def = build_seek_def_from_constraints(
+                        &[branch.constraint.clone()],
+                        &branch.constraint_refs,
+                        IterationDirection::Forwards, // Multi-index always scans forward
+                        where_clause,
+                        Some(table_references),
+                    )?;
+                    multi_idx_branches.push(MultiIndexBranch {
+                        index: branch.index.clone(),
+                        seek_def,
+                        estimated_rows: branch.estimated_rows,
+                    });
+                }
+
+                table_references.joined_tables_mut()[table_idx].op =
+                    Operation::MultiIndexScan(MultiIndexScanOp {
+                        branches: multi_idx_branches,
+                        where_term_idx: *where_term_idx,
+                        set_op: *set_op,
+                        additional_consumed_terms: additional_consumed_terms.clone(),
+                    });
             }
         }
     }
