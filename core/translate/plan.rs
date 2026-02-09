@@ -1239,13 +1239,18 @@ impl HashJoinKey {
 }
 
 /// The type of hash join to perform.
+///
+/// Build = LHS (the table whose rows populate the hash table).
+/// Probe = RHS (the table scanned to look up matches in the hash table).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HashJoinType {
     /// Standard inner join — only matching rows emitted.
     Inner,
-    /// Left outer join — probe rows always appear; unmatched probe → NULLs for build side.
+    /// Left outer join — all build rows appear in output; unmatched build
+    /// entries are emitted with NULLs for the probe side.
     LeftOuter,
-    /// Full outer join — LeftOuter + unmatched build rows emitted with NULLs for probe side.
+    /// Full outer join — like LeftOuter (unmatched build → NULLs for probe),
+    /// plus unmatched probe rows are emitted with NULLs for the build side.
     FullOuter,
 }
 

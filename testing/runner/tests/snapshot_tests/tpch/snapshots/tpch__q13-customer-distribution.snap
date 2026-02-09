@@ -34,6 +34,6 @@ info:
 QUERY PLAN
 |--SCAN c_orders
 |  |--SCAN customer
-|  `--SEARCH orders USING INDEX ephemeral_orders_t2
-|--USE SORTER FOR GROUP BY
-`--USE SORTER FOR ORDER BY
+|  `--HASH JOIN orders
+`--USE TEMP B-TREE FOR ORDER BY
+

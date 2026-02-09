@@ -4,8 +4,8 @@ use crate::schema::ColDef;
 use crate::sync::Mutex;
 use crate::translate::emitter::TransactionMode;
 use crate::translate::expr::{walk_expr, walk_expr_mut, WalkControl};
-use crate::translate::plan::JoinedTable;
-use crate::translate::planner::parse_row_id;
+use crate::translate::plan::{JoinedTable, TableReferences};
+use crate::translate::planner::{parse_row_id, TableMask};
 use crate::types::IOResult;
 use crate::IO;
 use crate::{

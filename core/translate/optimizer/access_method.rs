@@ -806,12 +806,10 @@ pub fn try_hash_join_access_method(
     if build_root_page == probe_root_page {
         return None;
     }
-    // Determine hash join type based on outer join info.
-    // The caller passes build=LHS, probe=RHS (the optimizer's convention).
-    // For LEFT JOIN, the RHS (probe_table) has join_info.outer = true.
-    // For FULL OUTER, the RHS has join_info.full_outer = true.
-    // The code gen handles role reversal: for outer joins, the hash table is
-    // built from the RHS (the table that can produce NULLs), and the LHS scans.
+    // Determine hash join type from the probe table's join_info.
+    // Convention: build=LHS (hash table), probe=RHS (scanned).
+    // For LEFT JOIN: probe has join_info.outer = true.
+    // For FULL OUTER: probe has join_info.full_outer = true.
     let hash_join_type = if probe_table
         .join_info
         .as_ref()
@@ -824,11 +822,8 @@ pub fn try_hash_join_access_method(
         HashJoinType::Inner
     };
 
-    // Don't build a hash table from a table that can be NullRow'd by an outer
-    // join. The hash table would contain real data even when the cursor is
-    // NullRow'd, causing incorrect matches during the outer join's unmatched
-    // emission. This affects both inner and outer hash joins whose build table
-    // is part of a LEFT/FULL OUTER JOIN.
+    // Don't build from a table that can be NullRow'd by an outer join — the
+    // hash table would contain real data even when the cursor is in NullRow mode.
     if build_table
         .join_info
         .as_ref()
