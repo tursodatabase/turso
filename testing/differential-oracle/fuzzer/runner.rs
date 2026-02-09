@@ -22,10 +22,10 @@ use rand_chacha::ChaCha8Rng;
 use turso_core::Database;
 
 use crate::generate::{GeneratorKind, PropTestBackend, SqlGenBackend, SqlGenerator};
-pub use sql_gen::TreeMode;
 use crate::memory::{MemorySimIO, SimIO};
 use crate::oracle::{OracleResult, check_differential};
 use crate::schema::SchemaIntrospector;
+pub use sql_gen::TreeMode;
 
 /// Configuration for the simulator.
 #[derive(Debug, Clone)]

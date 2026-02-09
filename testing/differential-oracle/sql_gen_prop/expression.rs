@@ -424,17 +424,13 @@ impl Expression {
             }
             Expression::UnaryOp { operand, .. } => operand.has_unordered_limit(),
             Expression::Parenthesized(e) => e.has_unordered_limit(),
-            Expression::FunctionCall { args, .. } => {
-                args.iter().any(|a| a.has_unordered_limit())
-            }
+            Expression::FunctionCall { args, .. } => args.iter().any(|a| a.has_unordered_limit()),
             Expression::Case {
                 operand,
                 when_clauses,
                 else_clause,
             } => {
-                operand
-                    .as_ref()
-                    .is_some_and(|o| o.has_unordered_limit())
+                operand.as_ref().is_some_and(|o| o.has_unordered_limit())
                     || when_clauses
                         .iter()
                         .any(|(w, t)| w.has_unordered_limit() || t.has_unordered_limit())

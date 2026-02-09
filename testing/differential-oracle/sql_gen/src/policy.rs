@@ -902,6 +902,62 @@ impl Default for LiteralTypeWeights {
 }
 
 // =============================================================================
+// JOIN Configuration
+// =============================================================================
+
+/// Configuration for JOIN generation in SELECT statements.
+#[derive(Debug, Clone)]
+pub struct JoinConfig {
+    /// Probability of generating JOINs in a SELECT [0.0, 1.0].
+    pub join_probability: f64,
+
+    /// Maximum number of JOINs per SELECT.
+    pub max_joins: usize,
+
+    /// Weights for choosing which type of JOIN to generate.
+    pub join_type_weights: JoinTypeWeights,
+
+    /// Probability that a JOIN ON condition uses an equi-join
+    /// (`left.col = right.col`) rather than a general expression.
+    pub equi_join_probability: f64,
+
+    /// Probability of joining the same table again (self-join).
+    pub self_join_probability: f64,
+}
+
+impl Default for JoinConfig {
+    fn default() -> Self {
+        Self {
+            join_probability: 0.0,
+            max_joins: 2,
+            join_type_weights: JoinTypeWeights::default(),
+            equi_join_probability: 0.7,
+            self_join_probability: 0.15,
+        }
+    }
+}
+
+/// Weights for choosing JOIN types.
+#[derive(Debug, Clone)]
+pub struct JoinTypeWeights {
+    pub inner: u32,
+    pub left: u32,
+    pub cross: u32,
+    pub natural: u32,
+}
+
+impl Default for JoinTypeWeights {
+    fn default() -> Self {
+        Self {
+            inner: 40,
+            left: 30,
+            cross: 15,
+            natural: 15,
+        }
+    }
+}
+
+// =============================================================================
 // SELECT Configuration
 // =============================================================================
 
@@ -986,10 +1042,10 @@ pub struct SelectConfig {
     /// in a GROUP BY clause.  Default: `true`.
     pub restrict_mixed_aggregates: bool,
 
-    // Stubs (not yet implemented, probability 0.0)
-    /// Probability of generating a JOIN.
-    pub join_probability: f64,
+    /// Configuration for JOIN generation.
+    pub join_config: JoinConfig,
 
+    // Stubs (not yet implemented, probability 0.0)
     /// Probability of generating a compound SELECT (UNION/INTERSECT/EXCEPT).
     pub compound_probability: f64,
 
@@ -1028,8 +1084,8 @@ impl Default for SelectConfig {
             subquery_group_by_probability: 0.2,
             subquery_distinct_probability: 0.15,
             restrict_mixed_aggregates: true,
+            join_config: JoinConfig::default(),
             // Stubs
-            join_probability: 0.0,
             compound_probability: 0.0,
             cte_probability: 0.0,
             derived_table_probability: 0.0,
