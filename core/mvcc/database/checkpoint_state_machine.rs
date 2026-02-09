@@ -1256,8 +1256,21 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                         .get(&key)
                         .expect("sqlite_schema row not found");
                     let mut row_versions = sqlite_schema_row.value().write();
-                    self.mvstore
-                        .insert_version_raw(&mut row_versions, row_version);
+                    // row_version is a clone of the original with only the root
+                    // page column patched, so it shares the same version id. We
+                    // must replace the original in-place rather than append,
+                    // otherwise the version chain ends up with two entries that
+                    // have identical (id, begin, end). A later DELETE only marks
+                    // one of them as ended (it returns after the first match),
+                    // leaving the other as a phantom current version that causes
+                    // spurious write-write conflicts at commit time.
+                    let vid = row_version.id;
+                    if let Some(existing) = row_versions.iter_mut().find(|rv| rv.id == vid) {
+                        *existing = row_version;
+                    } else {
+                        self.mvstore
+                            .insert_version_raw(&mut row_versions, row_version);
+                    }
                 }
 
                 // Patch in-memory schema to do the same
