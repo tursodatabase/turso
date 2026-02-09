@@ -317,6 +317,9 @@ pub struct Savepoint {
     /// On rollback: clear end timestamp to restore visibility.
     deleted_table_versions: Vec<(RowID, u64)>,
     deleted_index_versions: Vec<((MVTableId, Arc<SortableIndexKey>), u64)>,
+    /// RowIDs that were NEWLY added to write_set by this savepoint.
+    /// On rollback: only these should be removed from write_set.
+    newly_added_to_write_set: Vec<RowID>,
 }
 
 /// Transaction
@@ -357,7 +360,15 @@ impl Transaction {
     }
 
     fn insert_to_write_set(&self, id: RowID) {
-        self.write_set.insert(id);
+        // Check if this is a new addition to write_set
+        let is_new = !self.write_set.contains(&id);
+        self.write_set.insert(id.clone());
+        // If new, record in the current savepoint so we can remove on rollback
+        if is_new {
+            if let Some(savepoint) = self.savepoint_stack.write().last_mut() {
+                savepoint.newly_added_to_write_set.push(id);
+            }
+        }
     }
 
     /// Begin a new savepoint for statement-level tracking.
@@ -845,7 +856,7 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
                     }
                     turso_assert!(
                         false,
-                        "there is another row insterted and not updated/deleted from before"
+                        "there is another index row insterted and not updated/deleted from before"
                     );
                 }
                 None => {
@@ -2759,10 +2770,10 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             let mut affected_table_rowids: BTreeSet<RowID> = BTreeSet::new();
 
             // Remove created table versions
-            for (rowid, version_id) in savepoint.created_table_versions {
-                if let Some(entry) = self.rows.get(&rowid) {
+            for (rowid, version_id) in &savepoint.created_table_versions {
+                if let Some(entry) = self.rows.get(rowid) {
                     let mut versions = entry.value().write();
-                    versions.retain(|rv| rv.id != version_id);
+                    versions.retain(|rv| rv.id != *version_id);
                     tracing::debug!("rollback_savepoint: removed table version(table_id={}, row_id={}, version_id={})",
                         rowid.table_id, rowid.row_id, version_id);
                 }
@@ -2770,11 +2781,11 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             }
 
             // Remove created index versions
-            for ((table_id, key), version_id) in savepoint.created_index_versions {
-                if let Some(index) = self.index_rows.get(&table_id) {
-                    if let Some(entry) = index.value().get(&key) {
+            for ((table_id, key), version_id) in &savepoint.created_index_versions {
+                if let Some(index) = self.index_rows.get(table_id) {
+                    if let Some(entry) = index.value().get(key) {
                         let mut versions = entry.value().write();
-                        versions.retain(|rv| rv.id != version_id);
+                        versions.retain(|rv| rv.id != *version_id);
                         tracing::debug!(
                             "rollback_savepoint: removed index version(table_id={}, version_id={})",
                             table_id,
@@ -2785,11 +2796,11 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             }
 
             // Restore deleted table versions (clear end timestamp)
-            for (rowid, version_id) in savepoint.deleted_table_versions {
-                if let Some(entry) = self.rows.get(&rowid) {
+            for (rowid, version_id) in &savepoint.deleted_table_versions {
+                if let Some(entry) = self.rows.get(rowid) {
                     let mut versions = entry.value().write();
                     for rv in versions.iter_mut() {
-                        if rv.id == version_id {
+                        if rv.id == *version_id {
                             rv.end = None;
                             tracing::debug!("rollback_savepoint: restored table version(table_id={}, row_id={}, version_id={})",
                                 rowid.table_id, rowid.row_id, version_id);
@@ -2801,12 +2812,12 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             }
 
             // Restore deleted index versions
-            for ((table_id, key), version_id) in savepoint.deleted_index_versions {
-                if let Some(index) = self.index_rows.get(&table_id) {
-                    if let Some(entry) = index.value().get(&key) {
+            for ((table_id, key), version_id) in &savepoint.deleted_index_versions {
+                if let Some(index) = self.index_rows.get(table_id) {
+                    if let Some(entry) = index.value().get(key) {
                         let mut versions = entry.value().write();
                         for rv in versions.iter_mut() {
-                            if rv.id == version_id {
+                            if rv.id == *version_id {
                                 rv.end = None;
                                 tracing::debug!("rollback_savepoint: restored index version(table_id={}, version_id={})",
                                     table_id, version_id);
@@ -2834,6 +2845,15 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 if !has_tx_version {
                     tx.write_set.remove(rowid);
                 }
+            }
+            // Remove from write_set only the rowids that were NEWLY added by this savepoint
+            for rowid in &savepoint.newly_added_to_write_set {
+                tx.write_set.remove(rowid);
+                tracing::debug!(
+                    "rollback_savepoint: removed from write_set(table_id={}, row_id={})",
+                    rowid.table_id,
+                    rowid.row_id
+                );
             }
 
             Ok(true)
