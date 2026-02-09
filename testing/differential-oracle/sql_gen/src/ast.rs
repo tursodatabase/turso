@@ -112,6 +112,14 @@ impl SelectStmt {
                 return true;
             }
         }
+        // Check JOIN ON conditions
+        for join in &self.joins {
+            if let Some(JoinConstraint::On(expr)) = &join.constraint {
+                if expr.has_unordered_limit() {
+                    return true;
+                }
+            }
+        }
         // Check WHERE clause
         if let Some(w) = &self.where_clause {
             if w.has_unordered_limit() {
@@ -279,14 +287,45 @@ impl StmtKind {
     }
 }
 
+/// The FROM clause of a SELECT statement.
+#[derive(Debug, Clone)]
+pub struct FromClause {
+    pub table: String,
+    pub alias: Option<String>,
+}
+
+/// A JOIN clause.
+#[derive(Debug, Clone)]
+pub struct JoinClause {
+    pub join_type: JoinType,
+    pub table: String,
+    pub alias: Option<String>,
+    pub constraint: Option<JoinConstraint>,
+}
+
+/// The type of JOIN.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinType {
+    Inner,
+    Left,
+    Cross,
+    Natural,
+}
+
+/// A JOIN constraint (ON condition).
+#[derive(Debug, Clone)]
+pub enum JoinConstraint {
+    On(Expr),
+}
+
 /// A SELECT statement.
 #[derive(Debug, Clone)]
 pub struct SelectStmt {
     pub distinct: bool,
     pub columns: Vec<SelectColumn>,
-    /// The FROM table. None for table-less SELECTs (e.g. `SELECT 1+2`).
-    pub from: Option<String>,
-    pub from_alias: Option<String>,
+    /// The FROM clause. None for table-less SELECTs (e.g. `SELECT 1+2`).
+    pub from: Option<FromClause>,
+    pub joins: Vec<JoinClause>,
     pub where_clause: Option<Expr>,
     pub group_by: Option<GroupByClause>,
     pub order_by: Vec<OrderByItem>,
@@ -320,9 +359,24 @@ impl fmt::Display for SelectStmt {
         }
 
         if let Some(from) = &self.from {
-            write!(f, " FROM {from}")?;
-            if let Some(alias) = &self.from_alias {
+            write!(f, " FROM {}", from.table)?;
+            if let Some(alias) = &from.alias {
                 write!(f, " AS {alias}")?;
+            }
+        }
+
+        for join in &self.joins {
+            match join.join_type {
+                JoinType::Inner => write!(f, " JOIN {}", join.table)?,
+                JoinType::Left => write!(f, " LEFT JOIN {}", join.table)?,
+                JoinType::Cross => write!(f, " CROSS JOIN {}", join.table)?,
+                JoinType::Natural => write!(f, " NATURAL JOIN {}", join.table)?,
+            }
+            if let Some(alias) = &join.alias {
+                write!(f, " AS {alias}")?;
+            }
+            if let Some(JoinConstraint::On(expr)) = &join.constraint {
+                write!(f, " ON {expr}")?;
             }
         }
 
@@ -1445,8 +1499,11 @@ mod tests {
                 }),
                 alias: None,
             }],
-            from: Some("users".to_string()),
-            from_alias: None,
+            from: Some(FromClause {
+                table: "users".to_string(),
+                alias: None,
+            }),
+            joins: vec![],
             where_clause: None,
             group_by: None,
             order_by: vec![],
@@ -1468,8 +1525,11 @@ mod tests {
                 }),
                 alias: None,
             }],
-            from: Some("users".to_string()),
-            from_alias: None,
+            from: Some(FromClause {
+                table: "users".to_string(),
+                alias: None,
+            }),
+            joins: vec![],
             where_clause: None,
             group_by: None,
             order_by: vec![],
@@ -1478,6 +1538,37 @@ mod tests {
         };
 
         assert_eq!(select.to_string(), "SELECT DISTINCT name FROM users");
+    }
+
+    #[test]
+    fn test_select_with_join_display() {
+        let select = SelectStmt {
+            distinct: false,
+            columns: vec![],
+            from: Some(FromClause {
+                table: "users".to_string(),
+                alias: Some("u".to_string()),
+            }),
+            joins: vec![JoinClause {
+                join_type: JoinType::Inner,
+                table: "orders".to_string(),
+                alias: Some("o".to_string()),
+                constraint: Some(JoinConstraint::On(Expr::ColumnRef(ColumnRef {
+                    table: Some("u".to_string()),
+                    column: "id".to_string(),
+                }))),
+            }],
+            where_clause: None,
+            group_by: None,
+            order_by: vec![],
+            limit: None,
+            offset: None,
+        };
+
+        assert_eq!(
+            select.to_string(),
+            "SELECT * FROM users AS u JOIN orders AS o ON u.id"
+        );
     }
 
     #[test]

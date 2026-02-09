@@ -262,8 +262,10 @@ pub fn generate_insert<C: Capabilities>(
         insert_config.or_ignore_probability,
     );
 
-    // Generate values
-    let values = generate_insert_values(generator, ctx, &table, &columns);
+    // Generate values (push table into scope for expression generation)
+    let values = ctx.with_table_scope([(table.clone(), None)], |ctx| {
+        generate_insert_values(generator, ctx, &columns)
+    });
 
     // --- INSERT ... SELECT (not yet implemented) ---
     if ctx.gen_bool_with_prob(insert_config.insert_select_probability) {
@@ -286,7 +288,7 @@ pub fn generate_insert<C: Capabilities>(
     }
 
     Ok(Stmt::Insert(InsertStmt {
-        table: table.name.clone(),
+        table: table.name,
         columns,
         values,
         conflict,
@@ -302,7 +304,6 @@ pub fn generate_insert<C: Capabilities>(
 fn generate_insert_values<C: Capabilities>(
     generator: &SqlGen<C>,
     ctx: &mut Context,
-    table: &crate::schema::Table,
     columns: &[String],
 ) -> Vec<Vec<Expr>> {
     let insert_config = &generator.policy().insert_config;
@@ -322,13 +323,16 @@ fn generate_insert_values<C: Capabilities>(
         None
     };
 
+    // Read table columns from scope
+    let table_columns = ctx.tables_in_scope()[0].table.columns.clone();
+
     for _ in 0..num_rows {
         let mut row = Vec::with_capacity(columns.len());
         for col_name in columns {
-            let col = table.columns.iter().find(|c| &c.name == col_name).unwrap();
+            let col = table_columns.iter().find(|c| &c.name == col_name).unwrap();
             if let Some(ref expr_gen) = insert_expr_gen {
                 if ctx.gen_bool_with_prob(expr_prob) {
-                    if let Ok(expr) = generate_expr(expr_gen, ctx, table, 0) {
+                    if let Ok(expr) = generate_expr(expr_gen, ctx, 0) {
                         row.push(expr);
                         continue;
                     }
@@ -360,39 +364,41 @@ pub fn generate_update<C: Capabilities>(
         return Err(GenError::schema_empty("columns"));
     }
 
-    // Generate conflict clause
-    let conflict = generate_conflict_clause(
-        ctx,
-        update_config.or_replace_probability,
-        update_config.or_ignore_probability,
-    );
+    ctx.with_table_scope([(table.clone(), None)], |ctx| {
+        // Generate conflict clause
+        let conflict = generate_conflict_clause(
+            ctx,
+            update_config.or_replace_probability,
+            update_config.or_ignore_probability,
+        );
 
-    // Generate SET clause
-    let sets = generate_update_sets(generator, ctx, &table)?;
+        // Generate SET clause
+        let sets = generate_update_sets(generator, ctx)?;
 
-    // Generate optional WHERE clause
-    let where_clause = if ctx.gen_bool_with_prob(update_config.where_probability) {
-        Some(generate_condition(generator, ctx, &table)?)
-    } else {
-        None
-    };
+        // Generate optional WHERE clause
+        let where_clause = if ctx.gen_bool_with_prob(update_config.where_probability) {
+            Some(generate_condition(generator, ctx)?)
+        } else {
+            None
+        };
 
-    // --- UPDATE ... FROM (not yet implemented) ---
-    if ctx.gen_bool_with_prob(update_config.from_probability) {
-        let _ = generate_update_from(generator, ctx);
-    }
+        // --- UPDATE ... FROM (not yet implemented) ---
+        if ctx.gen_bool_with_prob(update_config.from_probability) {
+            let _ = generate_update_from(generator, ctx);
+        }
 
-    // --- RETURNING (not yet implemented) ---
-    if ctx.gen_bool_with_prob(update_config.returning_probability) {
-        let _ = generate_update_returning(generator, ctx);
-    }
+        // --- RETURNING (not yet implemented) ---
+        if ctx.gen_bool_with_prob(update_config.returning_probability) {
+            let _ = generate_update_returning(generator, ctx);
+        }
 
-    Ok(Stmt::Update(UpdateStmt {
-        table: table.name.clone(),
-        sets,
-        where_clause,
-        conflict,
-    }))
+        Ok(Stmt::Update(UpdateStmt {
+            table: table.name.clone(),
+            sets,
+            where_clause,
+            conflict,
+        }))
+    })
 }
 
 /// Generate the SET clause for an UPDATE statement.
@@ -405,23 +411,25 @@ pub fn generate_update<C: Capabilities>(
 fn generate_update_sets<C: Capabilities>(
     generator: &SqlGen<C>,
     ctx: &mut Context,
-    table: &crate::schema::Table,
 ) -> Result<Vec<(String, Expr)>, GenError> {
     let update_config = &generator.policy().update_config;
     let pk_prob = update_config.primary_key_update_probability;
     let expr_prob = update_config.expression_value_probability;
     let expr_max_depth = update_config.expression_value_max_depth;
 
+    // Read table columns from scope
+    let table_columns = ctx.tables_in_scope()[0].table.columns.clone();
+
     // Build candidate columns: always include non-PK, include PK with probability
-    let candidates: Vec<_> = table
-        .columns
+    let candidates: Vec<_> = table_columns
         .iter()
         .filter(|c| !c.primary_key || ctx.gen_bool_with_prob(pk_prob))
+        .cloned()
         .collect();
 
     // If all PK columns were filtered out and there are no others, fall back to all columns
     let candidates = if candidates.is_empty() {
-        table.columns.iter().collect::<Vec<_>>()
+        table_columns
     } else {
         candidates
     };
@@ -445,7 +453,7 @@ fn generate_update_sets<C: Capabilities>(
         let col = ctx.choose(&candidates).unwrap();
         if let Some(ref expr_gen) = update_expr_gen {
             if ctx.gen_bool_with_prob(expr_prob) {
-                if let Ok(expr) = generate_expr(expr_gen, ctx, table, 0) {
+                if let Ok(expr) = generate_expr(expr_gen, ctx, 0) {
                     sets.push((col.name.clone(), expr));
                     continue;
                 }
@@ -510,22 +518,24 @@ pub fn generate_delete<C: Capabilities>(
         .ok_or_else(|| GenError::schema_empty("tables"))?
         .clone();
 
-    // Generate optional WHERE clause (almost always have one to avoid deleting everything)
-    let where_clause = if ctx.gen_bool_with_prob(delete_config.where_probability) {
-        Some(generate_condition(generator, ctx, &table)?)
-    } else {
-        None
-    };
+    ctx.with_table_scope([(table.clone(), None)], |ctx| {
+        // Generate optional WHERE clause (almost always have one to avoid deleting everything)
+        let where_clause = if ctx.gen_bool_with_prob(delete_config.where_probability) {
+            Some(generate_condition(generator, ctx)?)
+        } else {
+            None
+        };
 
-    // --- RETURNING (not yet implemented) ---
-    if ctx.gen_bool_with_prob(delete_config.returning_probability) {
-        let _ = generate_delete_returning(generator, ctx);
-    }
+        // --- RETURNING (not yet implemented) ---
+        if ctx.gen_bool_with_prob(delete_config.returning_probability) {
+            let _ = generate_delete_returning(generator, ctx);
+        }
 
-    Ok(Stmt::Delete(DeleteStmt {
-        table: table.name.clone(),
-        where_clause,
-    }))
+        Ok(Stmt::Delete(DeleteStmt {
+            table: table.name.clone(),
+            where_clause,
+        }))
+    })
 }
 
 /// Generate a CREATE TABLE statement.
@@ -838,7 +848,9 @@ pub fn generate_create_trigger<C: Capabilities>(
 
     // Generate optional WHEN clause
     let when_clause = if ctx.gen_bool_with_prob(trigger_config.when_probability) {
-        Some(generate_trigger_when(generator, ctx, &table)?)
+        Some(ctx.with_table_scope([(table.clone(), None)], |ctx| {
+            generate_trigger_when(generator, ctx)
+        })?)
     } else {
         None
     };
@@ -929,10 +941,9 @@ fn generate_trigger_event<C: Capabilities>(
 fn generate_trigger_when<C: Capabilities>(
     generator: &SqlGen<C>,
     ctx: &mut Context,
-    table: &crate::schema::Table,
 ) -> Result<Expr, GenError> {
     // Generate a simple condition using NEW or OLD references
-    generate_condition(generator, ctx, table)
+    generate_condition(generator, ctx)
 }
 
 /// Generate the body of a trigger.

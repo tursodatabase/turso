@@ -4,7 +4,17 @@ use anarchist_readable_name_generator_lib::readable_name_custom;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
+use crate::schema::Table;
 use crate::trace::{Coverage, ExprKind, Origin, OriginPath, StmtKind};
+
+/// A table in the current query scope, with its qualifier for column references.
+#[derive(Debug, Clone)]
+pub struct ScopedTable {
+    pub table: Table,
+    /// The qualifier used to prefix column references: either an alias (e.g. "t0")
+    /// or the table name when no alias is assigned.
+    pub qualifier: String,
+}
 
 /// Context for SQL generation.
 ///
@@ -16,6 +26,11 @@ pub struct Context {
     origin_stack: OriginPath,
     depth: usize,
     subquery_depth: usize,
+    /// Stack of table scope frames. Each frame contains the tables visible
+    /// in the current SELECT/UPDATE/DELETE. Subqueries push a new frame.
+    table_scope: Vec<Vec<ScopedTable>>,
+    /// Counter for generating unique table aliases (t0, t1, t2, ...).
+    alias_counter: usize,
 }
 
 impl Context {
@@ -32,6 +47,8 @@ impl Context {
             origin_stack: OriginPath::new(),
             depth: 0,
             subquery_depth: 0,
+            table_scope: Vec::new(),
+            alias_counter: 0,
         }
     }
 
@@ -148,6 +165,67 @@ impl Context {
 
         self.origin_stack.pop();
         self.depth = self.depth.saturating_sub(1);
+    }
+
+    // =========================================================================
+    // Table scope methods
+    // =========================================================================
+
+    /// Run `func` inside a new table scope frame. The frame is pushed before
+    /// and popped after, ensuring balanced scoping even if `func` returns early.
+    ///
+    /// `tables` is an iterator of `(Table, Option<String>)` pairs that are
+    /// pushed into the new frame before `func` runs. Pass `[]` for an empty frame.
+    pub fn with_table_scope<T>(
+        &mut self,
+        tables: impl IntoIterator<Item = (Table, Option<String>)>,
+        func: impl FnOnce(&mut Self) -> T,
+    ) -> T {
+        self.table_scope.push(Vec::new());
+        for (table, alias) in tables {
+            self.push_table(table, alias);
+        }
+        let t = func(self);
+        self.table_scope.pop();
+        t
+    }
+
+    /// Push a table into the current (topmost) scope frame.
+    ///
+    /// `alias` is used as the qualifier when present; otherwise the table name is used.
+    pub fn push_table(&mut self, table: Table, alias: Option<String>) {
+        let qualifier = alias.unwrap_or_else(|| table.name.clone());
+        let scoped = ScopedTable { table, qualifier };
+        if let Some(frame) = self.table_scope.last_mut() {
+            frame.push(scoped);
+        }
+    }
+
+    /// Returns the tables visible in the current (topmost) scope frame.
+    pub fn tables_in_scope(&self) -> &[ScopedTable] {
+        self.table_scope.last().map_or(&[], |f| f.as_slice())
+    }
+
+    /// Returns true if more than one table is in the current scope (i.e. a join).
+    pub fn has_multiple_tables(&self) -> bool {
+        self.tables_in_scope().len() > 1
+    }
+
+    /// Generate the next unique table alias (t0, t1, t2, ...).
+    pub fn next_table_alias(&mut self) -> String {
+        let alias = format!("t{}", self.alias_counter);
+        self.alias_counter += 1;
+        alias
+    }
+
+    /// Returns the tables from the outer scope frame (one level up), if any.
+    /// Useful for future correlated subquery support.
+    pub fn outer_tables(&self) -> Option<&[ScopedTable]> {
+        if self.table_scope.len() >= 2 {
+            Some(&self.table_scope[self.table_scope.len() - 2])
+        } else {
+            None
+        }
     }
 
     /// Get a reference to the coverage data.

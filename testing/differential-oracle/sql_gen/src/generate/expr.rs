@@ -7,7 +7,7 @@ use crate::error::GenError;
 use crate::functions::FunctionDef;
 use crate::generate::literal::generate_literal;
 use crate::generate::select::{generate_select, generate_simple_select};
-use crate::schema::{DataType, Table};
+use crate::schema::DataType;
 use crate::trace::{ExprKind, Origin};
 use crate::{SqlGen, Stmt};
 use sql_gen_macros::trace_gen;
@@ -16,7 +16,6 @@ use sql_gen_macros::trace_gen;
 pub fn generate_expr<C: Capabilities>(
     generator: &SqlGen<C>,
     ctx: &mut Context,
-    table: &Table,
     depth: usize,
 ) -> Result<Expr, GenError> {
     let candidates = build_expr_candidates::<C>(generator, ctx, depth)?;
@@ -26,7 +25,7 @@ pub fn generate_expr<C: Capabilities>(
         .select_weighted(ctx, &candidates)
         .map_err(|e| e.with_context("generating expression"))?;
 
-    dispatch_expr_generation(generator, ctx, table, depth, expr_type)
+    dispatch_expr_generation(generator, ctx, depth, expr_type)
 }
 
 /// Build list of allowed expression kinds based on capabilities, policy weights, and depth validity.
@@ -178,23 +177,22 @@ fn is_expr_valid_for_depth(
 fn dispatch_expr_generation<C: Capabilities>(
     generator: &SqlGen<C>,
     ctx: &mut Context,
-    table: &Table,
     depth: usize,
     expr_type: ExprKind,
 ) -> Result<Expr, GenError> {
     match expr_type {
-        ExprKind::ColumnRef => generate_column_ref(ctx, table),
-        ExprKind::Literal => generate_literal_expr(generator, ctx, table),
-        ExprKind::BinaryOp => generate_binary_op(generator, ctx, table, depth),
-        ExprKind::UnaryOp => generate_unary_op(generator, ctx, table, depth),
-        ExprKind::FunctionCall => generate_function_call(generator, ctx, table, depth),
-        ExprKind::IsNull => generate_is_null(generator, ctx, table, depth),
-        ExprKind::Between => generate_between(generator, ctx, table, depth),
-        ExprKind::InList => generate_in_list(generator, ctx, table, depth),
-        ExprKind::InSubquery => generate_in_subquery(generator, ctx, table, depth),
-        ExprKind::Case => generate_case(generator, ctx, table, depth),
-        ExprKind::Cast => generate_cast(generator, ctx, table, depth),
-        ExprKind::Subquery => generate_subquery_expr(generator, ctx, table),
+        ExprKind::ColumnRef => generate_column_ref(ctx),
+        ExprKind::Literal => generate_literal_expr(generator, ctx),
+        ExprKind::BinaryOp => generate_binary_op(generator, ctx, depth),
+        ExprKind::UnaryOp => generate_unary_op(generator, ctx, depth),
+        ExprKind::FunctionCall => generate_function_call(generator, ctx, depth),
+        ExprKind::IsNull => generate_is_null(generator, ctx, depth),
+        ExprKind::Between => generate_between(generator, ctx, depth),
+        ExprKind::InList => generate_in_list(generator, ctx, depth),
+        ExprKind::InSubquery => generate_in_subquery(generator, ctx, depth),
+        ExprKind::Case => generate_case(generator, ctx, depth),
+        ExprKind::Cast => generate_cast(generator, ctx, depth),
+        ExprKind::Subquery => generate_subquery_expr(generator, ctx),
         ExprKind::Exists => generate_exists(generator, ctx),
         // Parenthesized is not generated directly - it's just for grouping
         ExprKind::Parenthesized => unreachable!("parenthesized is not generated directly"),
@@ -206,28 +204,71 @@ fn dispatch_expr_generation<C: Capabilities>(
 }
 
 /// Generate a column reference.
-fn generate_column_ref(ctx: &mut Context, table: &Table) -> Result<Expr, GenError> {
-    let cols: Vec<_> = table.filterable_columns().collect();
-    if cols.is_empty() {
-        return Err(GenError::exhausted("column_ref", "no filterable columns"));
+///
+/// If multiple tables are in scope (i.e. a join), picks a random scoped table
+/// and qualifies the column reference with the table's qualifier. Otherwise
+/// generates an unqualified reference from the single table in scope.
+fn generate_column_ref(ctx: &mut Context) -> Result<Expr, GenError> {
+    let scope_len = ctx.tables_in_scope().len();
+    if scope_len > 1 {
+        // Multi-table scope: pick a random scoped table, qualify the column ref
+        let idx = ctx.gen_range(scope_len);
+        let qualifier = ctx.tables_in_scope()[idx].qualifier.clone();
+        let col_names: Vec<String> = ctx.tables_in_scope()[idx]
+            .table
+            .filterable_columns()
+            .map(|c| c.name.clone())
+            .collect();
+        if col_names.is_empty() {
+            return Err(GenError::exhausted("column_ref", "no filterable columns"));
+        }
+        let col_name = ctx.choose(&col_names).unwrap().clone();
+        Ok(Expr::column_ref(ctx, Some(qualifier), col_name))
+    } else if scope_len == 1 {
+        // Single scoped table: use it, optionally qualify
+        let qualifier = ctx.tables_in_scope()[0].qualifier.clone();
+        let table_name = ctx.tables_in_scope()[0].table.name.clone();
+        let col_names: Vec<String> = ctx.tables_in_scope()[0]
+            .table
+            .filterable_columns()
+            .map(|c| c.name.clone())
+            .collect();
+        if col_names.is_empty() {
+            return Err(GenError::exhausted("column_ref", "no filterable columns"));
+        }
+        let col_name = ctx.choose(&col_names).unwrap().clone();
+        // Only qualify if the table has an alias different from its name
+        let qualifier = if qualifier != table_name {
+            Some(qualifier)
+        } else {
+            None
+        };
+        Ok(Expr::column_ref(ctx, qualifier, col_name))
+    } else {
+        Err(GenError::exhausted(
+            "column_ref",
+            "no tables in scope (generation bug)",
+        ))
     }
-
-    let col = ctx.choose(&cols).unwrap();
-    Ok(Expr::column_ref(ctx, None, col.name.clone()))
 }
 
 /// Generate a literal expression.
+///
+/// Picks a data type from the columns of scoped tables.
 fn generate_literal_expr<C: Capabilities>(
     generator: &SqlGen<C>,
     ctx: &mut Context,
-    table: &Table,
 ) -> Result<Expr, GenError> {
-    // Pick a random data type from the table's columns, or default to Integer
-    let data_type = if !table.columns.is_empty() {
-        let col = ctx.choose(&table.columns).unwrap();
-        col.data_type
-    } else {
+    let all_cols: Vec<_> = ctx
+        .tables_in_scope()
+        .iter()
+        .flat_map(|st| st.table.columns.iter())
+        .map(|c| c.data_type)
+        .collect();
+    let data_type = if all_cols.is_empty() {
         DataType::Integer
+    } else {
+        *ctx.choose(&all_cols).unwrap()
     };
 
     let lit = generate_literal(ctx, data_type, generator.policy());
@@ -238,7 +279,6 @@ fn generate_literal_expr<C: Capabilities>(
 fn generate_binary_op<C: Capabilities>(
     generator: &SqlGen<C>,
     ctx: &mut Context,
-    table: &Table,
     depth: usize,
 ) -> Result<Expr, GenError> {
     let expr_config = &generator.policy().expr_config;
@@ -263,14 +303,14 @@ fn generate_binary_op<C: Capabilities>(
         .choose(ops)
         .ok_or_else(|| GenError::exhausted("binary_op", "no operators available"))?;
 
-    let left = generate_binop_left(generator, ctx, table, depth)?;
-    let right = generate_binop_right(generator, ctx, table, depth)?;
+    let left = generate_binop_left(generator, ctx, depth)?;
+    let right = generate_binop_right(generator, ctx, depth)?;
 
     // --- LIKE ... ESCAPE (not yet implemented) ---
     if matches!(op, BinOp::Like)
         && ctx.gen_bool_with_prob(generator.policy().expr_config.like_escape_probability)
     {
-        return generate_like_escape(generator, ctx, table, depth);
+        return generate_like_escape(generator, ctx, depth);
     }
 
     Ok(Expr::binary_op(ctx, left, op, right))
@@ -281,10 +321,9 @@ fn generate_binary_op<C: Capabilities>(
 fn generate_binop_left<C: Capabilities>(
     generator: &SqlGen<C>,
     ctx: &mut Context,
-    table: &Table,
     depth: usize,
 ) -> Result<Expr, GenError> {
-    generate_expr(generator, ctx, table, depth + 1)
+    generate_expr(generator, ctx, depth + 1)
 }
 
 /// Generate the right operand of a binary operation.
@@ -292,10 +331,9 @@ fn generate_binop_left<C: Capabilities>(
 fn generate_binop_right<C: Capabilities>(
     generator: &SqlGen<C>,
     ctx: &mut Context,
-    table: &Table,
     depth: usize,
 ) -> Result<Expr, GenError> {
-    generate_expr(generator, ctx, table, depth + 1)
+    generate_expr(generator, ctx, depth + 1)
 }
 
 #[derive(Clone, Copy)]
@@ -309,13 +347,12 @@ enum OpType {
 fn generate_unary_op<C: Capabilities>(
     generator: &SqlGen<C>,
     ctx: &mut Context,
-    table: &Table,
     depth: usize,
 ) -> Result<Expr, GenError> {
     let ops = [UnaryOp::Neg, UnaryOp::Not, UnaryOp::BitNot];
     let op = *ctx.choose(&ops).unwrap();
 
-    let operand = generate_expr(generator, ctx, table, depth + 1)?;
+    let operand = generate_expr(generator, ctx, depth + 1)?;
     Ok(Expr::unary_op(ctx, op, operand))
 }
 
@@ -323,13 +360,12 @@ fn generate_unary_op<C: Capabilities>(
 fn generate_function_call<C: Capabilities>(
     generator: &SqlGen<C>,
     ctx: &mut Context,
-    table: &Table,
     depth: usize,
 ) -> Result<Expr, GenError> {
     let func_config = &generator.policy().function_config;
     let func = func_config.select_function(ctx)?;
 
-    let args = generate_function_args(generator, ctx, table, depth, func)?;
+    let args = generate_function_args(generator, ctx, depth, func)?;
 
     Ok(Expr::function_call(ctx, func.name.to_string(), args))
 }
@@ -339,7 +375,6 @@ fn generate_function_call<C: Capabilities>(
 fn generate_function_args<C: Capabilities>(
     generator: &SqlGen<C>,
     ctx: &mut Context,
-    table: &Table,
     depth: usize,
     func: &FunctionDef,
 ) -> Result<Vec<Expr>, GenError> {
@@ -347,7 +382,7 @@ fn generate_function_args<C: Capabilities>(
     let mut args = Vec::with_capacity(arg_count);
 
     for i in 0..arg_count {
-        let arg = generate_function_arg(generator, ctx, table, depth, func, i)?;
+        let arg = generate_function_arg(generator, ctx, depth, func, i)?;
         args.push(arg);
     }
 
@@ -358,7 +393,6 @@ fn generate_function_args<C: Capabilities>(
 fn generate_function_arg<C: Capabilities>(
     generator: &SqlGen<C>,
     ctx: &mut Context,
-    table: &Table,
     depth: usize,
     func: &FunctionDef,
     arg_index: usize,
@@ -387,19 +421,18 @@ fn generate_function_arg<C: Capabilities>(
     }
 
     // Otherwise, generate a general expression
-    generate_expr(generator, ctx, table, depth + 1)
+    generate_expr(generator, ctx, depth + 1)
 }
 
 /// Generate an IS NULL / IS NOT NULL expression.
 fn generate_is_null<C: Capabilities>(
     generator: &SqlGen<C>,
     ctx: &mut Context,
-    table: &Table,
     depth: usize,
 ) -> Result<Expr, GenError> {
     let expr_config = &generator.policy().expr_config;
     let negated = ctx.gen_bool_with_prob(expr_config.is_null_negation_probability);
-    let expr = generate_expr(generator, ctx, table, depth + 1)?;
+    let expr = generate_expr(generator, ctx, depth + 1)?;
     Ok(Expr::is_null(ctx, expr, negated))
 }
 
@@ -407,14 +440,13 @@ fn generate_is_null<C: Capabilities>(
 fn generate_between<C: Capabilities>(
     generator: &SqlGen<C>,
     ctx: &mut Context,
-    table: &Table,
     depth: usize,
 ) -> Result<Expr, GenError> {
     let expr_config = &generator.policy().expr_config;
     let negated = ctx.gen_bool_with_prob(expr_config.between_negation_probability);
-    let expr = generate_expr(generator, ctx, table, depth + 1)?;
-    let low = generate_expr(generator, ctx, table, depth + 1)?;
-    let high = generate_expr(generator, ctx, table, depth + 1)?;
+    let expr = generate_expr(generator, ctx, depth + 1)?;
+    let low = generate_expr(generator, ctx, depth + 1)?;
+    let high = generate_expr(generator, ctx, depth + 1)?;
     Ok(Expr::between(ctx, expr, low, high, negated))
 }
 
@@ -422,17 +454,16 @@ fn generate_between<C: Capabilities>(
 fn generate_in_list<C: Capabilities>(
     generator: &SqlGen<C>,
     ctx: &mut Context,
-    table: &Table,
     depth: usize,
 ) -> Result<Expr, GenError> {
     let expr_config = &generator.policy().expr_config;
     let negated = ctx.gen_bool_with_prob(expr_config.in_list_negation_probability);
-    let expr = generate_expr(generator, ctx, table, depth + 1)?;
+    let expr = generate_expr(generator, ctx, depth + 1)?;
 
     let list_size = ctx.gen_range_inclusive(1, generator.policy().max_in_list_size.min(5));
     let mut list = Vec::with_capacity(list_size);
     for _ in 0..list_size {
-        list.push(generate_expr(generator, ctx, table, depth)?);
+        list.push(generate_expr(generator, ctx, depth)?);
     }
 
     Ok(Expr::in_list(ctx, expr, list, negated))
@@ -442,7 +473,6 @@ fn generate_in_list<C: Capabilities>(
 fn generate_case<C: Capabilities>(
     generator: &SqlGen<C>,
     ctx: &mut Context,
-    table: &Table,
     depth: usize,
 ) -> Result<Expr, GenError> {
     let expr_config = &generator.policy().expr_config;
@@ -453,13 +483,13 @@ fn generate_case<C: Capabilities>(
     let mut when_clauses = Vec::with_capacity(num_when);
 
     for _ in 0..num_when {
-        let when_expr = generate_case_when(generator, ctx, table, depth)?;
-        let then_expr = generate_case_then(generator, ctx, table, depth)?;
+        let when_expr = generate_case_when(generator, ctx, depth)?;
+        let then_expr = generate_case_then(generator, ctx, depth)?;
         when_clauses.push((when_expr, then_expr));
     }
 
     let else_clause = if ctx.gen_bool_with_prob(expr_config.case_else_probability) {
-        Some(generate_case_else(generator, ctx, table, depth)?)
+        Some(generate_case_else(generator, ctx, depth)?)
     } else {
         None
     };
@@ -472,10 +502,9 @@ fn generate_case<C: Capabilities>(
 fn generate_case_when<C: Capabilities>(
     generator: &SqlGen<C>,
     ctx: &mut Context,
-    table: &Table,
     depth: usize,
 ) -> Result<Expr, GenError> {
-    generate_expr(generator, ctx, table, depth + 1)
+    generate_expr(generator, ctx, depth + 1)
 }
 
 /// Generate the THEN result of a CASE expression.
@@ -483,10 +512,9 @@ fn generate_case_when<C: Capabilities>(
 fn generate_case_then<C: Capabilities>(
     generator: &SqlGen<C>,
     ctx: &mut Context,
-    table: &Table,
     depth: usize,
 ) -> Result<Expr, GenError> {
-    generate_expr(generator, ctx, table, depth + 1)
+    generate_expr(generator, ctx, depth + 1)
 }
 
 /// Generate the ELSE result of a CASE expression.
@@ -494,23 +522,21 @@ fn generate_case_then<C: Capabilities>(
 fn generate_case_else<C: Capabilities>(
     generator: &SqlGen<C>,
     ctx: &mut Context,
-    table: &Table,
     depth: usize,
 ) -> Result<Expr, GenError> {
-    generate_expr(generator, ctx, table, depth + 1)
+    generate_expr(generator, ctx, depth + 1)
 }
 
 /// Generate a CAST expression.
 fn generate_cast<C: Capabilities>(
     generator: &SqlGen<C>,
     ctx: &mut Context,
-    table: &Table,
     depth: usize,
 ) -> Result<Expr, GenError> {
     let types = [DataType::Integer, DataType::Real, DataType::Text];
     let target_type = *ctx.choose(&types).unwrap();
 
-    let expr = generate_expr(generator, ctx, table, depth + 1)?;
+    let expr = generate_expr(generator, ctx, depth + 1)?;
     Ok(Expr::cast(ctx, expr, target_type))
 }
 
@@ -519,9 +545,8 @@ fn generate_cast<C: Capabilities>(
 fn generate_subquery_expr<C: Capabilities>(
     generator: &SqlGen<C>,
     ctx: &mut Context,
-    table: &Table,
 ) -> Result<Expr, GenError> {
-    let select = generate_simple_select(generator, ctx, table)?;
+    let select = generate_simple_select(generator, ctx)?;
     Ok(Expr::subquery(ctx, select))
 }
 
@@ -543,17 +568,16 @@ fn generate_subquery_select<C: Capabilities>(
 fn generate_in_subquery<C: Capabilities>(
     generator: &SqlGen<C>,
     ctx: &mut Context,
-    table: &Table,
     depth: usize,
 ) -> Result<Expr, GenError> {
     let expr_config = &generator.policy().expr_config;
     let negated = ctx.gen_bool_with_prob(expr_config.in_subquery_negation_probability);
 
     // Generate the left-hand expression (typically a column or simple expression)
-    let expr = generate_expr(generator, ctx, table, depth + 1)?;
+    let expr = generate_expr(generator, ctx, depth + 1)?;
 
     // IN subqueries must return exactly 1 column
-    let subquery = generate_simple_select(generator, ctx, table)?;
+    let subquery = generate_simple_select(generator, ctx)?;
 
     Ok(Expr::in_subquery(ctx, expr, subquery, negated))
 }
@@ -577,9 +601,8 @@ fn generate_exists<C: Capabilities>(
 pub fn generate_condition<C: Capabilities>(
     generator: &SqlGen<C>,
     ctx: &mut Context,
-    table: &Table,
 ) -> Result<Expr, GenError> {
-    generate_expr(generator, ctx, table, 0)
+    generate_expr(generator, ctx, 0)
 }
 
 /// Generate a LIKE ... ESCAPE expression (stub).
@@ -587,7 +610,6 @@ pub fn generate_condition<C: Capabilities>(
 fn generate_like_escape<C: Capabilities>(
     _generator: &SqlGen<C>,
     _ctx: &mut Context,
-    _table: &Table,
     _depth: usize,
 ) -> Result<Expr, GenError> {
     todo!("LIKE ... ESCAPE expression generation")
@@ -618,31 +640,31 @@ mod tests {
     #[test]
     fn test_generate_expr() {
         let generator = test_generator();
-        let table = &generator.schema().tables[0];
+        let table = generator.schema().tables[0].clone();
         let mut ctx = Context::new_with_seed(42);
 
-        let expr = generate_expr(&generator, &mut ctx, table, 0);
+        let expr = ctx.with_table_scope([(table, None)], |ctx| generate_expr(&generator, ctx, 0));
         assert!(expr.is_ok());
     }
 
     #[test]
     fn test_generate_condition() {
         let generator = test_generator();
-        let table = &generator.schema().tables[0];
+        let table = generator.schema().tables[0].clone();
         let mut ctx = Context::new_with_seed(42);
 
-        let cond = generate_condition(&generator, &mut ctx, table);
+        let cond = ctx.with_table_scope([(table, None)], |ctx| generate_condition(&generator, ctx));
         assert!(cond.is_ok());
     }
 
     #[test]
     fn test_depth_limiting() {
         let generator = test_generator();
-        let table = &generator.schema().tables[0];
+        let table = generator.schema().tables[0].clone();
         let mut ctx = Context::new_with_seed(42);
 
         // At max depth, should only generate simple expressions
-        let expr = generate_expr(&generator, &mut ctx, table, 10);
+        let expr = ctx.with_table_scope([(table, None)], |ctx| generate_expr(&generator, ctx, 10));
         assert!(expr.is_ok());
     }
 
@@ -682,10 +704,12 @@ mod tests {
         });
 
         let generator: SqlGen<Full> = SqlGen::new(schema, policy);
-        let table = &generator.schema().tables[0];
+        let table = generator.schema().tables[0].clone();
         let mut ctx = Context::new_with_seed(42);
 
-        let expr = generate_function_call(&generator, &mut ctx, table, 0);
+        let expr = ctx.with_table_scope([(table, None)], |ctx| {
+            generate_function_call(&generator, ctx, 0)
+        });
         assert!(expr.is_ok());
 
         let expr_str = expr.unwrap().to_string();
