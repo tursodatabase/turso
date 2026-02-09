@@ -61,6 +61,5 @@ pub trait SimIO: turso_core::IO {
         Vec::new()
     }
 
-    
     fn simulate_power_loss(&self) {}
 }

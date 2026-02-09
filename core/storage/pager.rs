@@ -4070,7 +4070,7 @@ impl Pager {
             }
             AllocatePage1State::Syncing { page, completion } => {
                 if !completion.finished() {
-                    io_yield_one!(completion.clone());
+                    io_yield_one!(completion);
                 }
                 if !completion.succeeded() {
                     let err = completion

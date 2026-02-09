@@ -1255,9 +1255,7 @@ impl SimulatorEnv {
             .for_each(|conn| *conn = SimConnection::Disconnected);
 
         match self.type_ {
-            SimulationType::Differential => {
-                Ok(())
-            }
+            SimulationType::Differential => Ok(()),
             SimulationType::Default | SimulationType::Doublecheck => {
                 let db_path = self.get_db_path();
                 let db = Database::open_file_with_flags(
