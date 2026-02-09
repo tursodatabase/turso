@@ -9,6 +9,10 @@ use std::fmt;
 use strum::IntoEnumIterator;
 
 /// Origin of a generated construct (where in the SQL it appears).
+///
+/// This enum also includes variants for SQL features that are not yet
+/// implemented in the generator. These show up as "not hit" in coverage
+/// reports, making gaps visible.
 #[derive(Clone, Copy, Debug, Hash, Eq, PartialEq, strum::EnumIter, strum::Display)]
 pub enum Origin {
     Root,
@@ -36,6 +40,48 @@ pub enum Origin {
     CreateTrigger,
     TriggerWhen,
     TriggerBody,
+
+    // ---- SELECT / FROM features (not yet generated) ----
+    Join,
+    LeftJoin,
+    CrossJoin,
+    NaturalJoin,
+    CompoundUnion,
+    CompoundUnionAll,
+    CompoundIntersect,
+    CompoundExcept,
+    Cte,
+    RecursiveCte,
+    DerivedTable,
+
+    // ---- INSERT features (not yet generated) ----
+    InsertSelect,
+    Upsert,
+    InsertDefaultValues,
+    InsertReturning,
+
+    // ---- UPDATE / DELETE features (not yet generated) ----
+    UpdateFrom,
+    UpdateReturning,
+    DeleteReturning,
+
+    // ---- Aggregate features (not yet generated) ----
+    AggregateDistinct,
+    AggregateFilter,
+
+    // ---- CREATE TABLE features (not yet generated) ----
+    CheckConstraint,
+    ForeignKey,
+    Autoincrement,
+    GeneratedColumn,
+    CreateTableAsSelect,
+
+    // ---- Index features (not yet generated) ----
+    PartialIndex,
+    ExpressionIndex,
+
+    // ---- Expression features (not yet generated) ----
+    LikeEscape,
 }
 
 // ExprKind and StmtKind are derived from Expr and Stmt in ast.rs via EnumDiscriminants
@@ -382,13 +428,13 @@ impl CoverageReport {
     pub fn missing_expr_kinds(&self) -> Vec<ExprKind> {
         let counts = self.coverage.expr_counts();
         ExprKind::iter()
-            .filter(|k| !counts.get(k).is_some_and(|c| *c > 0))
+            .filter(|k| counts.get(k).is_none_or(|c| *c == 0))
             .collect()
     }
 
     pub fn missing_stmt_kinds(&self) -> Vec<StmtKind> {
         StmtKind::iter()
-            .filter(|k| !self.coverage.stmt_counts.get(k).is_some_and(|c| *c > 0))
+            .filter(|k| self.coverage.stmt_counts.get(k).is_none_or(|c| *c == 0))
             .collect()
     }
 }
@@ -494,8 +540,7 @@ impl fmt::Display for CoverageReport {
                         }
                     }
                     for (child_name, child) in &node.children {
-                        let child_origin =
-                            Origin::iter().find(|o| o.to_string() == *child_name);
+                        let child_origin = Origin::iter().find(|o| o.to_string() == *child_name);
                         collect_origins(child_origin, child, acc);
                     }
                 }
@@ -622,9 +667,6 @@ mod tests {
         coverage1.merge(&coverage2);
 
         assert_eq!(coverage1.total_exprs(), 3);
-        assert_eq!(
-            coverage1.expr_counts().get(&ExprKind::ColumnRef),
-            Some(&2)
-        );
+        assert_eq!(coverage1.expr_counts().get(&ExprKind::ColumnRef), Some(&2));
     }
 }

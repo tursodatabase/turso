@@ -108,6 +108,11 @@ fn generate_select_impl<C: Capabilities>(
     let select_config = &generator.policy().select_config;
     let ident_config = &generator.policy().identifier_config;
 
+    // --- CTE (not yet implemented) ---
+    if ctx.gen_bool_with_prob(select_config.cte_probability) {
+        generate_cte(generator, ctx)?;
+    }
+
     let gb_prob = match mode {
         SelectMode::Full => select_config.group_by_probability,
         SelectMode::Scalar => select_config.subquery_group_by_probability,
@@ -132,7 +137,7 @@ fn generate_select_impl<C: Capabilities>(
                     .ok_or_else(|| GenError::schema_empty("columns"))?
                     .clone();
                 Some(GroupByClause {
-                    exprs: vec![Expr::column_ref(ctx, None, gb_col.name.clone())],
+                    exprs: vec![Expr::column_ref(ctx, None, gb_col.name)],
                     having: None,
                 })
             }
@@ -174,14 +179,9 @@ fn generate_select_impl<C: Capabilities>(
     // the result column list must not mix aggregate and non-aggregate
     // expressions (e.g. `SELECT COUNT(a), b FROM t` is invalid).
     // If a mix is detected, replace all aggregate columns with column refs.
-    if group_by.is_none()
-        && select_config.restrict_mixed_aggregates
-        && !columns.is_empty()
-    {
+    if group_by.is_none() && select_config.restrict_mixed_aggregates && !columns.is_empty() {
         let has_agg = columns.iter().any(|c| c.expr.contains_aggregate());
-        let has_non_agg = columns
-            .iter()
-            .any(|c| !c.expr.contains_aggregate());
+        let has_non_agg = columns.iter().any(|c| !c.expr.contains_aggregate());
         if has_agg && has_non_agg {
             for col in &mut columns {
                 if col.expr.contains_aggregate() {
@@ -242,6 +242,21 @@ fn generate_select_impl<C: Capabilities>(
 
     let from = ctx.scope(Origin::From, |_ctx| Some(table.name.clone()));
 
+    // --- Derived table (not yet implemented) ---
+    if ctx.gen_bool_with_prob(select_config.derived_table_probability) {
+        let _ = generate_derived_table(generator, ctx, table);
+    }
+
+    // --- JOIN (not yet implemented) ---
+    if ctx.gen_bool_with_prob(select_config.join_probability) {
+        let _ = generate_join(generator, ctx, table);
+    }
+
+    // --- Compound (not yet implemented) ---
+    if ctx.gen_bool_with_prob(select_config.compound_probability) {
+        let _ = generate_compound_union(generator, ctx, table);
+    }
+
     Ok(SelectStmt {
         distinct,
         columns,
@@ -272,7 +287,7 @@ fn generate_group_by_clause<C: Capabilities>(
     let cols = ctx.subsequence(&table.columns, 1..=max);
     let exprs: Vec<Expr> = cols
         .into_iter()
-        .map(|col| Expr::column_ref(ctx, None, col.name.clone()))
+        .map(|col| Expr::column_ref(ctx, None, col.name))
         .collect();
 
     // Optionally generate HAVING
@@ -432,7 +447,7 @@ fn generate_select_columns<C: Capabilities>(
             Ok(cols
                 .into_iter()
                 .map(|col| SelectColumn {
-                    expr: Expr::column_ref(ctx, None, col.name.clone()),
+                    expr: Expr::column_ref(ctx, None, col.name),
                     alias: None,
                 })
                 .collect())
@@ -450,10 +465,7 @@ fn generate_select_columns<C: Capabilities>(
                 // an expression that mixes aggregate calls with bare column
                 // refs (e.g. `COUNT(a) + b`) is invalid SQL.  Replace it with
                 // a plain column reference.
-                let expr = if restrict
-                    && expr.contains_aggregate()
-                    && expr.contains_column_ref()
-                {
+                let expr = if restrict && expr.contains_aggregate() && expr.contains_column_ref() {
                     let col = ctx.choose(&table.columns).unwrap();
                     Expr::column_ref(ctx, None, col.name.clone())
                 } else {
@@ -580,6 +592,126 @@ fn select_nulls_order(
         Some(1) => Some(NullsOrder::Last),
         _ => None,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Stub generation functions for SELECT-related features (not yet implemented).
+// These appear as "not hit" in coverage reports, making gaps visible.
+// ---------------------------------------------------------------------------
+
+#[trace_gen(Origin::Join)]
+fn generate_join<C: Capabilities>(
+    _generator: &SqlGen<C>,
+    _ctx: &mut Context,
+    _table: &Table,
+) -> Result<(), GenError> {
+    todo!("INNER JOIN generation")
+}
+
+#[trace_gen(Origin::LeftJoin)]
+fn generate_left_join<C: Capabilities>(
+    _generator: &SqlGen<C>,
+    _ctx: &mut Context,
+    _table: &Table,
+) -> Result<(), GenError> {
+    todo!("LEFT JOIN generation")
+}
+
+#[trace_gen(Origin::CrossJoin)]
+fn generate_cross_join<C: Capabilities>(
+    _generator: &SqlGen<C>,
+    _ctx: &mut Context,
+    _table: &Table,
+) -> Result<(), GenError> {
+    todo!("CROSS JOIN generation")
+}
+
+#[trace_gen(Origin::NaturalJoin)]
+fn generate_natural_join<C: Capabilities>(
+    _generator: &SqlGen<C>,
+    _ctx: &mut Context,
+    _table: &Table,
+) -> Result<(), GenError> {
+    todo!("NATURAL JOIN generation")
+}
+
+#[trace_gen(Origin::CompoundUnion)]
+fn generate_compound_union<C: Capabilities>(
+    _generator: &SqlGen<C>,
+    _ctx: &mut Context,
+    _table: &Table,
+) -> Result<SelectStmt, GenError> {
+    todo!("UNION generation")
+}
+
+#[trace_gen(Origin::CompoundUnionAll)]
+fn generate_compound_union_all<C: Capabilities>(
+    _generator: &SqlGen<C>,
+    _ctx: &mut Context,
+    _table: &Table,
+) -> Result<SelectStmt, GenError> {
+    todo!("UNION ALL generation")
+}
+
+#[trace_gen(Origin::CompoundIntersect)]
+fn generate_compound_intersect<C: Capabilities>(
+    _generator: &SqlGen<C>,
+    _ctx: &mut Context,
+    _table: &Table,
+) -> Result<SelectStmt, GenError> {
+    todo!("INTERSECT generation")
+}
+
+#[trace_gen(Origin::CompoundExcept)]
+fn generate_compound_except<C: Capabilities>(
+    _generator: &SqlGen<C>,
+    _ctx: &mut Context,
+    _table: &Table,
+) -> Result<SelectStmt, GenError> {
+    todo!("EXCEPT generation")
+}
+
+#[trace_gen(Origin::Cte)]
+fn generate_cte<C: Capabilities>(
+    _generator: &SqlGen<C>,
+    _ctx: &mut Context,
+) -> Result<(), GenError> {
+    todo!("CTE generation")
+}
+
+#[trace_gen(Origin::RecursiveCte)]
+fn generate_recursive_cte<C: Capabilities>(
+    _generator: &SqlGen<C>,
+    _ctx: &mut Context,
+) -> Result<(), GenError> {
+    todo!("recursive CTE generation")
+}
+
+#[trace_gen(Origin::DerivedTable)]
+fn generate_derived_table<C: Capabilities>(
+    _generator: &SqlGen<C>,
+    _ctx: &mut Context,
+    _table: &Table,
+) -> Result<(), GenError> {
+    todo!("derived table generation")
+}
+
+#[trace_gen(Origin::AggregateDistinct)]
+fn generate_aggregate_distinct<C: Capabilities>(
+    _generator: &SqlGen<C>,
+    _ctx: &mut Context,
+    _table: &Table,
+) -> Result<Expr, GenError> {
+    todo!("aggregate DISTINCT generation")
+}
+
+#[trace_gen(Origin::AggregateFilter)]
+fn generate_aggregate_filter<C: Capabilities>(
+    _generator: &SqlGen<C>,
+    _ctx: &mut Context,
+    _table: &Table,
+) -> Result<Expr, GenError> {
+    todo!("aggregate FILTER generation")
 }
 
 #[cfg(test)]
@@ -896,10 +1028,7 @@ mod tests {
                     continue; // skip grouped (shouldn't happen with prob 0.0)
                 }
                 let has_agg = select.columns.iter().any(|c| c.expr.contains_aggregate());
-                let has_non_agg = select
-                    .columns
-                    .iter()
-                    .any(|c| !c.expr.contains_aggregate());
+                let has_non_agg = select.columns.iter().any(|c| !c.expr.contains_aggregate());
                 assert!(
                     !(has_agg && has_non_agg),
                     "seed {seed}: non-grouped SELECT mixes aggregates and non-aggregates: {select}"

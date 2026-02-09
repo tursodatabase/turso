@@ -49,6 +49,15 @@ pub trait Capabilities: 'static + Clone {
     const AGGREGATE: bool;
     const WINDOW_FN: bool;
     const CTE: bool;
+
+    // Stubs (not yet implemented)
+    const CREATE_VIEW: bool;
+    const DROP_VIEW: bool;
+    const VACUUM: bool;
+    const REINDEX: bool;
+    const ANALYZE: bool;
+    const SAVEPOINT: bool;
+    const RELEASE: bool;
 }
 
 // =============================================================================
@@ -106,6 +115,13 @@ impl Capabilities for Full {
     const AGGREGATE: bool = true;
     const WINDOW_FN: bool = true;
     const CTE: bool = true;
+    const CREATE_VIEW: bool = true;
+    const DROP_VIEW: bool = true;
+    const VACUUM: bool = true;
+    const REINDEX: bool = true;
+    const ANALYZE: bool = true;
+    const SAVEPOINT: bool = true;
+    const RELEASE: bool = true;
 }
 
 impl CanSelect for Full {}
@@ -140,6 +156,13 @@ impl Capabilities for DmlOnly {
     const AGGREGATE: bool = true;
     const WINDOW_FN: bool = true;
     const CTE: bool = true;
+    const CREATE_VIEW: bool = false;
+    const DROP_VIEW: bool = false;
+    const VACUUM: bool = false;
+    const REINDEX: bool = false;
+    const ANALYZE: bool = false;
+    const SAVEPOINT: bool = false;
+    const RELEASE: bool = false;
 }
 
 impl CanSelect for DmlOnly {}
@@ -174,6 +197,13 @@ impl Capabilities for SelectOnly {
     const AGGREGATE: bool = true;
     const WINDOW_FN: bool = true;
     const CTE: bool = true;
+    const CREATE_VIEW: bool = false;
+    const DROP_VIEW: bool = false;
+    const VACUUM: bool = false;
+    const REINDEX: bool = false;
+    const ANALYZE: bool = false;
+    const SAVEPOINT: bool = false;
+    const RELEASE: bool = false;
 }
 
 impl CanSelect for SelectOnly {}
@@ -205,6 +235,13 @@ impl Capabilities for NoSubquery {
     const AGGREGATE: bool = true;
     const WINDOW_FN: bool = false;
     const CTE: bool = false;
+    const CREATE_VIEW: bool = true;
+    const DROP_VIEW: bool = true;
+    const VACUUM: bool = true;
+    const REINDEX: bool = true;
+    const ANALYZE: bool = true;
+    const SAVEPOINT: bool = true;
+    const RELEASE: bool = true;
 }
 
 impl CanSelect for NoSubquery {}

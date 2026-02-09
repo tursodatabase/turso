@@ -361,6 +361,15 @@ pub struct StmtWeights {
     pub begin: u32,
     pub commit: u32,
     pub rollback: u32,
+
+    // Stubs (not yet implemented, weight 0)
+    pub create_view: u32,
+    pub drop_view: u32,
+    pub vacuum: u32,
+    pub reindex: u32,
+    pub analyze: u32,
+    pub savepoint: u32,
+    pub release: u32,
 }
 
 impl Default for StmtWeights {
@@ -383,6 +392,14 @@ impl Default for StmtWeights {
             begin: 0,
             commit: 0,
             rollback: 0,
+            // Stubs (not yet implemented)
+            create_view: 0,
+            drop_view: 0,
+            vacuum: 0,
+            reindex: 0,
+            analyze: 0,
+            savepoint: 0,
+            release: 0,
         }
     }
 }
@@ -395,16 +412,7 @@ impl StmtWeights {
             insert: 30,
             update: 20,
             delete: 10,
-            create_table: 0,
-            drop_table: 0,
-            alter_table: 0,
-            create_index: 0,
-            drop_index: 0,
-            create_trigger: 0,
-            drop_trigger: 0,
-            begin: 0,
-            commit: 0,
-            rollback: 0,
+            ..Self::all_zero()
         }
     }
 
@@ -412,6 +420,14 @@ impl StmtWeights {
     pub fn select_only() -> Self {
         Self {
             select: 100,
+            ..Self::all_zero()
+        }
+    }
+
+    /// All weights set to zero.
+    fn all_zero() -> Self {
+        Self {
+            select: 0,
             insert: 0,
             update: 0,
             delete: 0,
@@ -425,6 +441,13 @@ impl StmtWeights {
             begin: 0,
             commit: 0,
             rollback: 0,
+            create_view: 0,
+            drop_view: 0,
+            vacuum: 0,
+            reindex: 0,
+            analyze: 0,
+            savepoint: 0,
+            release: 0,
         }
     }
 
@@ -445,6 +468,14 @@ impl StmtWeights {
             StmtKind::Begin => self.begin,
             StmtKind::Commit => self.commit,
             StmtKind::Rollback => self.rollback,
+            // Stubs
+            StmtKind::CreateView => self.create_view,
+            StmtKind::DropView => self.drop_view,
+            StmtKind::Vacuum => self.vacuum,
+            StmtKind::Reindex => self.reindex,
+            StmtKind::Analyze => self.analyze,
+            StmtKind::Savepoint => self.savepoint,
+            StmtKind::Release => self.release,
         }
     }
 
@@ -465,6 +496,14 @@ impl StmtWeights {
             (StmtKind::Begin, self.begin),
             (StmtKind::Commit, self.commit),
             (StmtKind::Rollback, self.rollback),
+            // Stubs
+            (StmtKind::CreateView, self.create_view),
+            (StmtKind::DropView, self.drop_view),
+            (StmtKind::Vacuum, self.vacuum),
+            (StmtKind::Reindex, self.reindex),
+            (StmtKind::Analyze, self.analyze),
+            (StmtKind::Savepoint, self.savepoint),
+            (StmtKind::Release, self.release),
         ]
         .into_iter()
         .filter(|(_, w)| *w > 0)
@@ -491,6 +530,10 @@ pub struct ExprWeights {
     pub in_subquery: u32,
     pub is_null: u32,
     pub exists: u32,
+    // Stubs (not yet implemented, weight 0)
+    pub window_function: u32,
+    pub collate: u32,
+    pub raise: u32,
 }
 
 impl Default for ExprWeights {
@@ -509,6 +552,10 @@ impl Default for ExprWeights {
             in_subquery: 5,
             is_null: 1,
             exists: 5,
+            // Stubs
+            window_function: 0,
+            collate: 0,
+            raise: 0,
         }
     }
 }
@@ -532,6 +579,10 @@ impl ExprWeights {
             ExprKind::IsNull => self.is_null,
             ExprKind::Exists => self.exists,
             ExprKind::Parenthesized => 0, // Never generated directly
+            // Stubs
+            ExprKind::WindowFunction => self.window_function,
+            ExprKind::Collate => self.collate,
+            ExprKind::Raise => self.raise,
         }
     }
 
@@ -540,17 +591,7 @@ impl ExprWeights {
         Self {
             column_ref: 50,
             literal: 50,
-            binary_op: 0,
-            unary_op: 0,
-            function_call: 0,
-            subquery: 0,
-            case_expr: 0,
-            cast: 0,
-            between: 0,
-            in_list: 0,
-            in_subquery: 0,
-            is_null: 0,
-            exists: 0,
+            ..Self::all_zero()
         }
     }
 
@@ -570,6 +611,31 @@ impl ExprWeights {
             in_subquery: 8,
             is_null: 1,
             exists: 8,
+            window_function: 0,
+            collate: 0,
+            raise: 0,
+        }
+    }
+
+    /// All weights set to zero.
+    fn all_zero() -> Self {
+        Self {
+            column_ref: 0,
+            literal: 0,
+            binary_op: 0,
+            unary_op: 0,
+            function_call: 0,
+            subquery: 0,
+            case_expr: 0,
+            cast: 0,
+            between: 0,
+            in_list: 0,
+            in_subquery: 0,
+            is_null: 0,
+            exists: 0,
+            window_function: 0,
+            collate: 0,
+            raise: 0,
         }
     }
 }
@@ -919,6 +985,19 @@ pub struct SelectConfig {
     /// generating `SELECT COUNT(a) + b FROM t` which requires `b` to appear
     /// in a GROUP BY clause.  Default: `true`.
     pub restrict_mixed_aggregates: bool,
+
+    // Stubs (not yet implemented, probability 0.0)
+    /// Probability of generating a JOIN.
+    pub join_probability: f64,
+
+    /// Probability of generating a compound SELECT (UNION/INTERSECT/EXCEPT).
+    pub compound_probability: f64,
+
+    /// Probability of generating a CTE (WITH clause).
+    pub cte_probability: f64,
+
+    /// Probability of generating a derived table (subquery in FROM).
+    pub derived_table_probability: f64,
 }
 
 impl Default for SelectConfig {
@@ -949,6 +1028,11 @@ impl Default for SelectConfig {
             subquery_group_by_probability: 0.2,
             subquery_distinct_probability: 0.15,
             restrict_mixed_aggregates: true,
+            // Stubs
+            join_probability: 0.0,
+            compound_probability: 0.0,
+            cte_probability: 0.0,
+            derived_table_probability: 0.0,
         }
     }
 }
@@ -1057,6 +1141,19 @@ pub struct InsertConfig {
 
     /// Maximum expression nesting depth for VALUES expressions.
     pub expression_value_max_depth: usize,
+
+    // Stubs (not yet implemented, probability 0.0)
+    /// Probability of INSERT ... SELECT instead of VALUES.
+    pub insert_select_probability: f64,
+
+    /// Probability of ON CONFLICT clause.
+    pub upsert_probability: f64,
+
+    /// Probability of DEFAULT VALUES.
+    pub default_values_probability: f64,
+
+    /// Probability of RETURNING clause.
+    pub returning_probability: f64,
 }
 
 impl Default for InsertConfig {
@@ -1070,6 +1167,11 @@ impl Default for InsertConfig {
             or_ignore_probability: 0.0,
             expression_value_probability: 0.3,
             expression_value_max_depth: 2,
+            // Stubs
+            insert_select_probability: 0.0,
+            upsert_probability: 0.0,
+            default_values_probability: 0.0,
+            returning_probability: 0.0,
         }
     }
 }
@@ -1124,6 +1226,13 @@ pub struct UpdateConfig {
 
     /// Maximum expression nesting depth for SET expressions.
     pub expression_value_max_depth: usize,
+
+    // Stubs (not yet implemented, probability 0.0)
+    /// Probability of UPDATE ... FROM.
+    pub from_probability: f64,
+
+    /// Probability of RETURNING clause.
+    pub returning_probability: f64,
 }
 
 impl Default for UpdateConfig {
@@ -1137,6 +1246,9 @@ impl Default for UpdateConfig {
             primary_key_update_probability: 0.1,
             expression_value_probability: 0.4,
             expression_value_max_depth: 2,
+            // Stubs
+            from_probability: 0.0,
+            returning_probability: 0.0,
         }
     }
 }
@@ -1156,6 +1268,10 @@ pub struct DeleteConfig {
 
     /// Maximum LIMIT value for DELETE.
     pub max_limit: u64,
+
+    // Stubs (not yet implemented, probability 0.0)
+    /// Probability of RETURNING clause.
+    pub returning_probability: f64,
 }
 
 impl Default for DeleteConfig {
@@ -1164,6 +1280,8 @@ impl Default for DeleteConfig {
             where_probability: 0.95,
             limit_probability: 0.1,
             max_limit: 100,
+            // Stubs
+            returning_probability: 0.0,
         }
     }
 }
@@ -1245,6 +1363,22 @@ pub struct CreateTableConfig {
 
     /// Probability of IF NOT EXISTS clause.
     pub if_not_exists_probability: f64,
+
+    // Stubs (not yet implemented, probability 0.0)
+    /// Probability of CHECK constraint.
+    pub check_constraint_probability: f64,
+
+    /// Probability of FOREIGN KEY.
+    pub foreign_key_probability: f64,
+
+    /// Probability of AUTOINCREMENT.
+    pub autoincrement_probability: f64,
+
+    /// Probability of generated column.
+    pub generated_column_probability: f64,
+
+    /// Probability of CREATE TABLE ... AS SELECT.
+    pub as_select_probability: f64,
 }
 
 impl Default for CreateTableConfig {
@@ -1256,6 +1390,12 @@ impl Default for CreateTableConfig {
             unique_probability: 0.15,
             default_probability: 0.2,
             if_not_exists_probability: 0.5,
+            // Stubs
+            check_constraint_probability: 0.0,
+            foreign_key_probability: 0.0,
+            autoincrement_probability: 0.0,
+            generated_column_probability: 0.0,
+            as_select_probability: 0.0,
         }
     }
 }
@@ -1294,6 +1434,13 @@ pub struct CreateIndexConfig {
 
     /// Probability of IF NOT EXISTS clause.
     pub if_not_exists_probability: f64,
+
+    // Stubs (not yet implemented, probability 0.0)
+    /// Probability of WHERE clause on index.
+    pub partial_index_probability: f64,
+
+    /// Probability of expression in index columns.
+    pub expression_index_probability: f64,
 }
 
 impl Default for CreateIndexConfig {
@@ -1302,6 +1449,9 @@ impl Default for CreateIndexConfig {
             max_columns: 3,
             unique_probability: 0.2,
             if_not_exists_probability: 0.5,
+            // Stubs
+            partial_index_probability: 0.0,
+            expression_index_probability: 0.0,
         }
     }
 }
@@ -1534,6 +1684,16 @@ pub struct ExprConfig {
 
     /// Weights for compound condition operators (AND vs OR).
     pub compound_op_weights: CompoundOpWeights,
+
+    // Stubs (not yet implemented, probability 0.0)
+    /// Probability of LIKE ... ESCAPE.
+    pub like_escape_probability: f64,
+
+    /// Probability of COUNT(DISTINCT ...).
+    pub aggregate_distinct_probability: f64,
+
+    /// Probability of aggregate FILTER clause.
+    pub aggregate_filter_probability: f64,
 }
 
 impl Default for ExprConfig {
@@ -1549,6 +1709,10 @@ impl Default for ExprConfig {
             max_compound_condition_depth: 3,
             binop_category_weights: BinOpCategoryWeights::default(),
             compound_op_weights: CompoundOpWeights::default(),
+            // Stubs
+            like_escape_probability: 0.0,
+            aggregate_distinct_probability: 0.0,
+            aggregate_filter_probability: 0.0,
         }
     }
 }
