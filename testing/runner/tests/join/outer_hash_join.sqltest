@@ -1,0 +1,324 @@
+@database :memory:
+
+# Tests for LEFT OUTER and FULL OUTER hash joins.
+# Tables are created without indexes on join columns to encourage hash join selection.
+
+# ============================================================
+# LEFT JOIN with hash join
+# ============================================================
+
+test left-hash-join-basic {
+    CREATE TABLE t1(a, b);
+    CREATE TABLE t2(c, d);
+    INSERT INTO t1 VALUES (1, 'x'), (2, 'y'), (3, 'z');
+    INSERT INTO t2 VALUES (1, 'a'), (2, 'b');
+    SELECT t1.a, t1.b, t2.c, t2.d FROM t1 LEFT JOIN t2 ON t1.a = t2.c ORDER BY t1.a;
+}
+expect {
+    1|x|1|a
+    2|y|2|b
+    3|z||
+}
+
+test left-hash-join-no-matches {
+    CREATE TABLE t1(a, b);
+    CREATE TABLE t2(c, d);
+    INSERT INTO t1 VALUES (1, 'x'), (2, 'y');
+    INSERT INTO t2 VALUES (10, 'a'), (20, 'b');
+    SELECT t1.a, t1.b, t2.c, t2.d FROM t1 LEFT JOIN t2 ON t1.a = t2.c ORDER BY t1.a;
+}
+expect {
+    1|x||
+    2|y||
+}
+
+test left-hash-join-all-match {
+    CREATE TABLE t1(a, b);
+    CREATE TABLE t2(c, d);
+    INSERT INTO t1 VALUES (1, 'x'), (2, 'y');
+    INSERT INTO t2 VALUES (1, 'a'), (2, 'b');
+    SELECT t1.a, t1.b, t2.c, t2.d FROM t1 LEFT JOIN t2 ON t1.a = t2.c ORDER BY t1.a;
+}
+expect {
+    1|x|1|a
+    2|y|2|b
+}
+
+test left-hash-join-duplicate-keys {
+    CREATE TABLE t1(a, b);
+    CREATE TABLE t2(c, d);
+    INSERT INTO t1 VALUES (1, 'x'), (2, 'y'), (3, 'z');
+    INSERT INTO t2 VALUES (1, 'a'), (1, 'b'), (2, 'c');
+    SELECT t1.a, t1.b, t2.c, t2.d FROM t1 LEFT JOIN t2 ON t1.a = t2.c ORDER BY t1.a, t2.d;
+}
+expect {
+    1|x|1|a
+    1|x|1|b
+    2|y|2|c
+    3|z||
+}
+
+test left-hash-join-empty-right {
+    CREATE TABLE t1(a, b);
+    CREATE TABLE t2(c, d);
+    INSERT INTO t1 VALUES (1, 'x'), (2, 'y');
+    SELECT t1.a, t1.b, t2.c, t2.d FROM t1 LEFT JOIN t2 ON t1.a = t2.c ORDER BY t1.a;
+}
+expect {
+    1|x||
+    2|y||
+}
+
+test left-hash-join-with-where {
+    CREATE TABLE t1(a, b);
+    CREATE TABLE t2(c, d);
+    INSERT INTO t1 VALUES (1, 'x'), (2, 'y'), (3, 'z'), (4, 'w');
+    INSERT INTO t2 VALUES (1, 'a'), (3, 'b');
+    SELECT t1.a, t2.d FROM t1 LEFT JOIN t2 ON t1.a = t2.c WHERE t1.a < 4 ORDER BY t1.a;
+}
+expect {
+    1|a
+    2|
+    3|b
+}
+
+test left-hash-join-count-with-nulls {
+    CREATE TABLE t1(a, b);
+    CREATE TABLE t2(c, d);
+    INSERT INTO t1 VALUES (1, 'x'), (2, 'y'), (3, 'z');
+    INSERT INTO t2 VALUES (1, 'a');
+    SELECT count(*), count(t2.c) FROM t1 LEFT JOIN t2 ON t1.a = t2.c;
+}
+expect {
+    3|1
+}
+
+# ============================================================
+# RIGHT JOIN (rewritten as LEFT JOIN)
+# ============================================================
+
+test right-join-basic {
+    CREATE TABLE t1(a, b);
+    CREATE TABLE t2(c, d);
+    INSERT INTO t1 VALUES (1, 'x'), (2, 'y');
+    INSERT INTO t2 VALUES (2, 'a'), (3, 'b');
+    SELECT t1.a, t1.b, t2.c, t2.d FROM t1 RIGHT JOIN t2 ON t1.a = t2.c ORDER BY t2.c;
+}
+expect {
+    2|y|2|a
+    ||3|b
+}
+
+test right-join-no-matches {
+    CREATE TABLE t1(a, b);
+    CREATE TABLE t2(c, d);
+    INSERT INTO t1 VALUES (10, 'x'), (20, 'y');
+    INSERT INTO t2 VALUES (1, 'a'), (2, 'b');
+    SELECT t1.a, t1.b, t2.c, t2.d FROM t1 RIGHT JOIN t2 ON t1.a = t2.c ORDER BY t2.c;
+}
+expect {
+    ||1|a
+    ||2|b
+}
+
+test right-join-all-match {
+    CREATE TABLE t1(a, b);
+    CREATE TABLE t2(c, d);
+    INSERT INTO t1 VALUES (1, 'x'), (2, 'y');
+    INSERT INTO t2 VALUES (1, 'a'), (2, 'b');
+    SELECT t1.a, t1.b, t2.c, t2.d FROM t1 RIGHT JOIN t2 ON t1.a = t2.c ORDER BY t2.c;
+}
+expect {
+    1|x|1|a
+    2|y|2|b
+}
+
+# ============================================================
+# FULL OUTER JOIN
+# ============================================================
+
+test full-outer-join-basic {
+    CREATE TABLE t1(a, b);
+    CREATE TABLE t2(c, d);
+    INSERT INTO t1 VALUES (1, 'x'), (2, 'y'), (3, 'z');
+    INSERT INTO t2 VALUES (2, 'a'), (4, 'b');
+    SELECT t1.a, t1.b, t2.c, t2.d FROM t1 FULL OUTER JOIN t2 ON t1.a = t2.c ORDER BY coalesce(t1.a, t2.c);
+}
+expect {
+    1|x||
+    2|y|2|a
+    3|z||
+    ||4|b
+}
+
+test full-outer-join-no-matches {
+    CREATE TABLE t1(a, b);
+    CREATE TABLE t2(c, d);
+    INSERT INTO t1 VALUES (1, 'x'), (2, 'y');
+    INSERT INTO t2 VALUES (3, 'a'), (4, 'b');
+    SELECT t1.a, t1.b, t2.c, t2.d FROM t1 FULL OUTER JOIN t2 ON t1.a = t2.c ORDER BY coalesce(t1.a, t2.c);
+}
+expect {
+    1|x||
+    2|y||
+    ||3|a
+    ||4|b
+}
+
+test full-outer-join-all-match {
+    CREATE TABLE t1(a, b);
+    CREATE TABLE t2(c, d);
+    INSERT INTO t1 VALUES (1, 'x'), (2, 'y');
+    INSERT INTO t2 VALUES (1, 'a'), (2, 'b');
+    SELECT t1.a, t1.b, t2.c, t2.d FROM t1 FULL OUTER JOIN t2 ON t1.a = t2.c ORDER BY t1.a;
+}
+expect {
+    1|x|1|a
+    2|y|2|b
+}
+
+test full-outer-join-duplicates {
+    CREATE TABLE t1(a, b);
+    CREATE TABLE t2(c, d);
+    INSERT INTO t1 VALUES (1, 'x'), (1, 'y'), (2, 'z');
+    INSERT INTO t2 VALUES (1, 'a'), (3, 'b');
+    SELECT t1.a, t1.b, t2.c, t2.d FROM t1 FULL OUTER JOIN t2 ON t1.a = t2.c ORDER BY coalesce(t1.a, t2.c), t1.b, t2.d;
+}
+expect {
+    1|x|1|a
+    1|y|1|a
+    2|z||
+    ||3|b
+}
+
+test full-outer-join-empty-left {
+    CREATE TABLE t1(a, b);
+    CREATE TABLE t2(c, d);
+    INSERT INTO t2 VALUES (1, 'a'), (2, 'b');
+    SELECT t1.a, t1.b, t2.c, t2.d FROM t1 FULL OUTER JOIN t2 ON t1.a = t2.c ORDER BY t2.c;
+}
+expect {
+    ||1|a
+    ||2|b
+}
+
+test full-outer-join-empty-right {
+    CREATE TABLE t1(a, b);
+    CREATE TABLE t2(c, d);
+    INSERT INTO t1 VALUES (1, 'x'), (2, 'y');
+    SELECT t1.a, t1.b, t2.c, t2.d FROM t1 FULL OUTER JOIN t2 ON t1.a = t2.c ORDER BY t1.a;
+}
+expect {
+    1|x||
+    2|y||
+}
+
+test full-outer-join-count {
+    CREATE TABLE t1(a, b);
+    CREATE TABLE t2(c, d);
+    INSERT INTO t1 VALUES (1, 'x'), (2, 'y'), (3, 'z');
+    INSERT INTO t2 VALUES (2, 'a'), (4, 'b');
+    SELECT count(*), count(t1.a), count(t2.c) FROM t1 FULL OUTER JOIN t2 ON t1.a = t2.c;
+}
+expect {
+    4|3|2
+}
+
+test full-outer-join-with-where {
+    CREATE TABLE t1(a, b);
+    CREATE TABLE t2(c, d);
+    INSERT INTO t1 VALUES (1, 'x'), (2, 'y'), (3, 'z');
+    INSERT INTO t2 VALUES (2, 'a'), (4, 'b'), (5, 'c');
+    SELECT t1.a, t2.c FROM t1 FULL OUTER JOIN t2 ON t1.a = t2.c WHERE coalesce(t1.a, t2.c) < 4 ORDER BY coalesce(t1.a, t2.c);
+}
+expect {
+    1|
+    2|2
+    3|
+}
+
+test full-outer-join-coalesce {
+    CREATE TABLE t1(a, b);
+    CREATE TABLE t2(c, d);
+    INSERT INTO t1 VALUES (1, 'x'), (2, 'y');
+    INSERT INTO t2 VALUES (2, 'a'), (3, 'b');
+    SELECT coalesce(t1.a, t2.c) as id, t1.b, t2.d FROM t1 FULL OUTER JOIN t2 ON t1.a = t2.c ORDER BY id;
+}
+expect {
+    1|x|
+    2|y|a
+    3||b
+}
+
+# ============================================================
+# Larger tables to strongly favor hash join
+# ============================================================
+
+test left-hash-join-larger {
+    CREATE TABLE big1(a, b);
+    CREATE TABLE big2(c, d);
+    INSERT INTO big1 SELECT value, 'left-' || value FROM generate_series(1, 100);
+    INSERT INTO big2 SELECT value, 'right-' || value FROM generate_series(50, 120);
+    SELECT count(*) FROM big1 LEFT JOIN big2 ON big1.a = big2.c;
+}
+expect {
+    100
+}
+
+test left-hash-join-larger-null-count {
+    CREATE TABLE big1(a, b);
+    CREATE TABLE big2(c, d);
+    INSERT INTO big1 SELECT value, 'left-' || value FROM generate_series(1, 100);
+    INSERT INTO big2 SELECT value, 'right-' || value FROM generate_series(50, 120);
+    SELECT count(*), count(big2.c) FROM big1 LEFT JOIN big2 ON big1.a = big2.c;
+}
+expect {
+    100|51
+}
+
+test right-join-larger {
+    CREATE TABLE big1(a, b);
+    CREATE TABLE big2(c, d);
+    INSERT INTO big1 SELECT value, 'left-' || value FROM generate_series(1, 50);
+    INSERT INTO big2 SELECT value, 'right-' || value FROM generate_series(30, 80);
+    SELECT count(*), count(big1.a), count(big2.c) FROM big1 RIGHT JOIN big2 ON big1.a = big2.c;
+}
+expect {
+    51|21|51
+}
+
+test full-outer-join-larger {
+    CREATE TABLE big1(a, b);
+    CREATE TABLE big2(c, d);
+    INSERT INTO big1 SELECT value, 'left-' || value FROM generate_series(1, 100);
+    INSERT INTO big2 SELECT value, 'right-' || value FROM generate_series(50, 120);
+    SELECT count(*), count(big1.a), count(big2.c) FROM big1 FULL OUTER JOIN big2 ON big1.a = big2.c;
+}
+expect {
+    120|100|71
+}
+
+test full-outer-join-larger-verify-rows {
+    CREATE TABLE big1(a, b);
+    CREATE TABLE big2(c, d);
+    INSERT INTO big1 SELECT value, 'left-' || value FROM generate_series(1, 10);
+    INSERT INTO big2 SELECT value, 'right-' || value FROM generate_series(8, 15);
+    SELECT big1.a, big2.c FROM big1 FULL OUTER JOIN big2 ON big1.a = big2.c ORDER BY coalesce(big1.a, big2.c);
+}
+expect {
+    1|
+    2|
+    3|
+    4|
+    5|
+    6|
+    7|
+    8|8
+    9|9
+    10|10
+    |11
+    |12
+    |13
+    |14
+    |15
+}
