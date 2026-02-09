@@ -139,7 +139,7 @@ use std::collections::VecDeque;
 use std::ops::Deref;
 use tracing::trace;
 use turso_parser::ast::{
-    self, ColumnDefinition, Expr, InitDeferredPred, Literal, RefAct, SortOrder,
+    self, ColumnDefinition, Expr, InitDeferredPred, Literal, Name, RefAct, SortOrder,
 };
 use turso_parser::{
     ast::{Cmd, CreateTableBody, ResultColumn, Stmt},
@@ -1798,7 +1798,7 @@ impl BTreeTable {
                     sql.push(' ');
                     if let Some(name) = &check_constraint.name {
                         sql.push_str("CONSTRAINT ");
-                        sql.push_str(name);
+                        sql.push_str(&Name::exact(name.clone()).as_ident());
                         sql.push(' ');
                     }
                     sql.push_str(&check_constraint.sql);
@@ -1872,7 +1872,7 @@ impl BTreeTable {
             sql.push_str(", ");
             if let Some(name) = &check_constraint.name {
                 sql.push_str("CONSTRAINT ");
-                sql.push_str(name);
+                sql.push_str(&Name::exact(name.clone()).as_ident());
                 sql.push(' ');
             }
             sql.push_str(&check_constraint.sql);

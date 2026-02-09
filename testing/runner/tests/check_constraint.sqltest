@@ -1622,3 +1622,14 @@ test check_constraint_update_table_level_triggers_on_referenced_col {
 expect error {
     CHECK constraint failed
 }
+
+# Constraint names that are SQL keywords must preserve quoting in regenerated DDL
+# after ALTER TABLE operations (e.g., DROP COLUMN).
+test check_constraint_keyword_constraint_name_quoting_after_alter {
+    CREATE TABLE t1(x INTEGER CONSTRAINT "select" CHECK(x > 0), y TEXT);
+    ALTER TABLE t1 DROP COLUMN y;
+    SELECT sql FROM sqlite_master WHERE name='t1';
+}
+expect {
+    CREATE TABLE t1 (x INTEGER CONSTRAINT "select" CHECK (x > 0))
+}
