@@ -31,6 +31,14 @@ pub enum Stmt {
     Begin,
     Commit,
     Rollback,
+    // Stubs: not yet generated (weight 0), shown in coverage report
+    CreateView,
+    DropView,
+    Vacuum,
+    Reindex,
+    Analyze,
+    Savepoint(String),
+    Release(String),
 }
 
 impl fmt::Display for Stmt {
@@ -50,6 +58,14 @@ impl fmt::Display for Stmt {
             Stmt::Begin => write!(f, "BEGIN"),
             Stmt::Commit => write!(f, "COMMIT"),
             Stmt::Rollback => write!(f, "ROLLBACK"),
+            // Stubs
+            Stmt::CreateView => todo!("CREATE VIEW generation"),
+            Stmt::DropView => todo!("DROP VIEW generation"),
+            Stmt::Vacuum => todo!("VACUUM generation"),
+            Stmt::Reindex => todo!("REINDEX generation"),
+            Stmt::Analyze => todo!("ANALYZE generation"),
+            Stmt::Savepoint(_) => todo!("SAVEPOINT generation"),
+            Stmt::Release(_) => todo!("RELEASE generation"),
         }
     }
 }
@@ -60,7 +76,26 @@ impl Stmt {
     pub fn has_unordered_limit(&self) -> bool {
         match self {
             Stmt::Select(s) => s.has_unordered_limit(),
-            _ => false,
+            Stmt::Insert(_)
+            | Stmt::Update(_)
+            | Stmt::Delete(_)
+            | Stmt::CreateTable(_)
+            | Stmt::DropTable(_)
+            | Stmt::AlterTable(_)
+            | Stmt::CreateIndex(_)
+            | Stmt::DropIndex(_)
+            | Stmt::CreateTrigger(_)
+            | Stmt::DropTrigger(_)
+            | Stmt::Begin
+            | Stmt::Commit
+            | Stmt::Rollback
+            | Stmt::CreateView
+            | Stmt::DropView
+            | Stmt::Vacuum
+            | Stmt::Reindex
+            | Stmt::Analyze
+            | Stmt::Savepoint(_)
+            | Stmt::Release(_) => false,
         }
     }
 }
@@ -137,6 +172,8 @@ impl Expr {
             Expr::IsNull(i) => i.expr.has_unordered_limit(),
             Expr::Parenthesized(e) => e.has_unordered_limit(),
             Expr::ColumnRef(_) | Expr::Literal(_) => false,
+            // Stubs: never instantiated
+            Expr::WindowFunction(_) | Expr::Collate(_) | Expr::Raise(_) => false,
         }
     }
 }
@@ -183,6 +220,8 @@ impl Expr {
             // affect the outer query's aggregate/non-aggregate classification.
             Expr::Subquery(_) | Expr::InSubquery(_) | Expr::Exists(_) => false,
             Expr::ColumnRef(_) | Expr::Literal(_) => false,
+            // Stubs: never instantiated
+            Expr::WindowFunction(_) | Expr::Collate(_) | Expr::Raise(_) => false,
         }
     }
 
@@ -216,6 +255,8 @@ impl Expr {
             }
             Expr::Subquery(_) | Expr::InSubquery(_) | Expr::Exists(_) => false,
             Expr::Literal(_) => false,
+            // Stubs: never instantiated
+            Expr::WindowFunction(_) | Expr::Collate(_) | Expr::Raise(_) => false,
         }
     }
 }
@@ -232,6 +273,8 @@ impl StmtKind {
                 | StmtKind::DropIndex
                 | StmtKind::CreateTrigger
                 | StmtKind::DropTrigger
+                | StmtKind::CreateView
+                | StmtKind::DropView
         )
     }
 }
@@ -830,6 +873,13 @@ pub enum Expr {
     IsNull(Box<IsNullExpr>),
     Exists(Box<ExistsExpr>),
     Parenthesized(Box<Expr>),
+    // Stubs: not yet generated (weight 0), shown in coverage report
+    /// expr OVER (PARTITION BY ... ORDER BY ... ROWS/RANGE ...)
+    WindowFunction(Box<WindowFunctionExpr>),
+    /// expr COLLATE collation_name
+    Collate(Box<CollateExpr>),
+    /// RAISE(ABORT|FAIL|IGNORE|ROLLBACK, error_message) — triggers only
+    Raise(Box<RaiseExpr>),
 }
 
 impl fmt::Display for Expr {
@@ -849,6 +899,10 @@ impl fmt::Display for Expr {
             Expr::IsNull(i) => write!(f, "{i}"),
             Expr::Exists(e) => write!(f, "{e}"),
             Expr::Parenthesized(e) => write!(f, "({e})"),
+            // Stubs
+            Expr::WindowFunction(_) => todo!("window function generation"),
+            Expr::Collate(_) => todo!("COLLATE expression generation"),
+            Expr::Raise(_) => todo!("RAISE expression generation"),
         }
     }
 }
@@ -959,6 +1013,24 @@ impl Expr {
     pub fn parenthesized(expr: Expr) -> Self {
         Expr::Parenthesized(Box::new(expr))
     }
+
+    /// Create a window function expression (stub — records to context).
+    pub fn window_function(ctx: &mut Context) -> Self {
+        ctx.record(ExprKind::WindowFunction);
+        todo!("window function generation")
+    }
+
+    /// Create a COLLATE expression (stub — records to context).
+    pub fn collate(ctx: &mut Context) -> Self {
+        ctx.record(ExprKind::Collate);
+        todo!("COLLATE expression generation")
+    }
+
+    /// Create a RAISE expression (stub — records to context).
+    pub fn raise(ctx: &mut Context) -> Self {
+        ctx.record(ExprKind::Raise);
+        todo!("RAISE expression generation")
+    }
 }
 
 /// A column reference.
@@ -1052,6 +1124,16 @@ pub enum BinOp {
     Concat,
     Like,
     Glob,
+    // Bitwise (stubs — weight 0)
+    BitAnd,
+    BitOr,
+    LeftShift,
+    RightShift,
+    // Null-safe comparison (stubs — weight 0)
+    Is,
+    IsNot,
+    // Pattern matching (stub — weight 0)
+    Regexp,
 }
 
 impl fmt::Display for BinOp {
@@ -1073,6 +1155,14 @@ impl fmt::Display for BinOp {
             BinOp::Concat => write!(f, "||"),
             BinOp::Like => write!(f, "LIKE"),
             BinOp::Glob => write!(f, "GLOB"),
+            // Stubs
+            BinOp::BitAnd => write!(f, "&"),
+            BinOp::BitOr => write!(f, "|"),
+            BinOp::LeftShift => write!(f, "<<"),
+            BinOp::RightShift => write!(f, ">>"),
+            BinOp::Is => write!(f, "IS"),
+            BinOp::IsNot => write!(f, "IS NOT"),
+            BinOp::Regexp => write!(f, "REGEXP"),
         }
     }
 }
@@ -1105,11 +1195,28 @@ impl BinOp {
         &[BinOp::Concat, BinOp::Like, BinOp::Glob]
     }
 
+    /// Returns bitwise operators.
+    pub fn bitwise() -> &'static [BinOp] {
+        &[
+            BinOp::BitAnd,
+            BinOp::BitOr,
+            BinOp::LeftShift,
+            BinOp::RightShift,
+        ]
+    }
+
     /// Returns true if this is a comparison operator.
     pub fn is_comparison(&self) -> bool {
         matches!(
             self,
-            BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
+            BinOp::Eq
+                | BinOp::Ne
+                | BinOp::Lt
+                | BinOp::Le
+                | BinOp::Gt
+                | BinOp::Ge
+                | BinOp::Is
+                | BinOp::IsNot
         )
     }
 
@@ -1286,6 +1393,22 @@ pub struct InSubqueryExpr {
     pub subquery: SelectStmt,
     pub negated: bool,
 }
+
+// =============================================================================
+// Stub expression types (not yet generated)
+// =============================================================================
+
+/// A window function expression (stub).
+#[derive(Debug, Clone)]
+pub struct WindowFunctionExpr;
+
+/// A COLLATE expression (stub).
+#[derive(Debug, Clone)]
+pub struct CollateExpr;
+
+/// A RAISE expression for triggers (stub).
+#[derive(Debug, Clone)]
+pub struct RaiseExpr;
 
 impl fmt::Display for InSubqueryExpr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

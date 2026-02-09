@@ -107,6 +107,28 @@ fn collect_capability_allowed_stmts<C: Capabilities>() -> Vec<StmtKind> {
     if C::DROP_TRIGGER {
         candidates.push(StmtKind::DropTrigger);
     }
+    // Stubs
+    if C::CREATE_VIEW {
+        candidates.push(StmtKind::CreateView);
+    }
+    if C::DROP_VIEW {
+        candidates.push(StmtKind::DropView);
+    }
+    if C::VACUUM {
+        candidates.push(StmtKind::Vacuum);
+    }
+    if C::REINDEX {
+        candidates.push(StmtKind::Reindex);
+    }
+    if C::ANALYZE {
+        candidates.push(StmtKind::Analyze);
+    }
+    if C::SAVEPOINT {
+        candidates.push(StmtKind::Savepoint);
+    }
+    if C::RELEASE {
+        candidates.push(StmtKind::Release);
+    }
 
     candidates
 }
@@ -160,6 +182,12 @@ fn is_stmt_valid_for_schema(
         StmtKind::DropTrigger => has_triggers,
         // These are always valid
         StmtKind::CreateTable | StmtKind::Begin | StmtKind::Commit | StmtKind::Rollback => true,
+        // Stubs — always valid (would require tables for views but weight is 0 anyway)
+        StmtKind::CreateView => has_tables,
+        StmtKind::DropView => true,
+        StmtKind::Vacuum | StmtKind::Analyze => true,
+        StmtKind::Reindex => has_tables || has_indexes,
+        StmtKind::Savepoint | StmtKind::Release => true,
     }
 }
 
@@ -184,6 +212,14 @@ fn dispatch_stmt_generation<C: Capabilities>(
         StmtKind::Rollback => Ok(Stmt::Rollback),
         StmtKind::CreateTrigger => generate_create_trigger(generator, ctx),
         StmtKind::DropTrigger => generate_drop_trigger(generator, ctx),
+        // Stubs
+        StmtKind::CreateView => todo!("CREATE VIEW generation"),
+        StmtKind::DropView => todo!("DROP VIEW generation"),
+        StmtKind::Vacuum => todo!("VACUUM generation"),
+        StmtKind::Reindex => todo!("REINDEX generation"),
+        StmtKind::Analyze => todo!("ANALYZE generation"),
+        StmtKind::Savepoint => todo!("SAVEPOINT generation"),
+        StmtKind::Release => todo!("RELEASE generation"),
     }
 }
 
@@ -228,6 +264,26 @@ pub fn generate_insert<C: Capabilities>(
 
     // Generate values
     let values = generate_insert_values(generator, ctx, &table, &columns);
+
+    // --- INSERT ... SELECT (not yet implemented) ---
+    if ctx.gen_bool_with_prob(insert_config.insert_select_probability) {
+        return generate_insert_select(generator, ctx).map(|_| unreachable!());
+    }
+
+    // --- Upsert (not yet implemented) ---
+    if ctx.gen_bool_with_prob(insert_config.upsert_probability) {
+        let _ = generate_upsert(generator, ctx);
+    }
+
+    // --- DEFAULT VALUES (not yet implemented) ---
+    if ctx.gen_bool_with_prob(insert_config.default_values_probability) {
+        return generate_insert_default_values(generator, ctx);
+    }
+
+    // --- RETURNING (not yet implemented) ---
+    if ctx.gen_bool_with_prob(insert_config.returning_probability) {
+        let _ = generate_insert_returning(generator, ctx);
+    }
 
     Ok(Stmt::Insert(InsertStmt {
         table: table.name.clone(),
@@ -320,6 +376,16 @@ pub fn generate_update<C: Capabilities>(
     } else {
         None
     };
+
+    // --- UPDATE ... FROM (not yet implemented) ---
+    if ctx.gen_bool_with_prob(update_config.from_probability) {
+        let _ = generate_update_from(generator, ctx);
+    }
+
+    // --- RETURNING (not yet implemented) ---
+    if ctx.gen_bool_with_prob(update_config.returning_probability) {
+        let _ = generate_update_returning(generator, ctx);
+    }
 
     Ok(Stmt::Update(UpdateStmt {
         table: table.name.clone(),
@@ -451,6 +517,11 @@ pub fn generate_delete<C: Capabilities>(
         None
     };
 
+    // --- RETURNING (not yet implemented) ---
+    if ctx.gen_bool_with_prob(delete_config.returning_probability) {
+        let _ = generate_delete_returning(generator, ctx);
+    }
+
     Ok(Stmt::Delete(DeleteStmt {
         table: table.name.clone(),
         where_clause,
@@ -516,6 +587,19 @@ pub fn generate_create_table<C: Capabilities>(
             unique,
             default,
         });
+    }
+
+    // --- CREATE TABLE ... AS SELECT (not yet implemented) ---
+    if ctx.gen_bool_with_prob(create_table_config.as_select_probability) {
+        return generate_create_table_as_select(generator, ctx);
+    }
+
+    // --- Table-level constraints (not yet implemented) ---
+    if ctx.gen_bool_with_prob(create_table_config.check_constraint_probability) {
+        let _ = generate_check_constraint(generator, ctx);
+    }
+    if ctx.gen_bool_with_prob(create_table_config.foreign_key_probability) {
+        let _ = generate_foreign_key(generator, ctx);
     }
 
     Ok(Stmt::CreateTable(CreateTableStmt {
@@ -682,9 +766,19 @@ pub fn generate_create_index<C: Capabilities>(
         return Err(GenError::exhausted("create_index", "no columns for index"));
     }
 
+    // --- Partial index (not yet implemented) ---
+    if ctx.gen_bool_with_prob(create_index_config.partial_index_probability) {
+        let _ = generate_partial_index(generator, ctx);
+    }
+
+    // --- Expression index (not yet implemented) ---
+    if ctx.gen_bool_with_prob(create_index_config.expression_index_probability) {
+        let _ = generate_expression_index(generator, ctx);
+    }
+
     Ok(Stmt::CreateIndex(CreateIndexStmt {
         name: index_name,
-        table: table.name.clone(),
+        table: table.name,
         columns,
         unique: ctx.gen_bool_with_prob(create_index_config.unique_probability),
         if_not_exists: ctx.gen_bool_with_prob(create_index_config.if_not_exists_probability),
@@ -925,6 +1019,128 @@ pub fn generate_drop_trigger<C: Capabilities>(
         name: trigger_name,
         if_exists: ctx.gen_bool_with_prob(trigger_config.if_exists_probability),
     }))
+}
+
+// ---- INSERT features ----
+
+#[trace_gen(Origin::InsertSelect)]
+fn generate_insert_select<C: Capabilities>(
+    _generator: &SqlGen<C>,
+    _ctx: &mut Context,
+) -> Result<Vec<Vec<Expr>>, GenError> {
+    todo!("INSERT ... SELECT generation")
+}
+
+#[trace_gen(Origin::Upsert)]
+fn generate_upsert<C: Capabilities>(
+    _generator: &SqlGen<C>,
+    _ctx: &mut Context,
+) -> Result<(), GenError> {
+    todo!("ON CONFLICT (upsert) generation")
+}
+
+#[trace_gen(Origin::InsertDefaultValues)]
+fn generate_insert_default_values<C: Capabilities>(
+    _generator: &SqlGen<C>,
+    _ctx: &mut Context,
+) -> Result<Stmt, GenError> {
+    todo!("INSERT ... DEFAULT VALUES generation")
+}
+
+#[trace_gen(Origin::InsertReturning)]
+fn generate_insert_returning<C: Capabilities>(
+    _generator: &SqlGen<C>,
+    _ctx: &mut Context,
+) -> Result<Vec<Expr>, GenError> {
+    todo!("INSERT ... RETURNING generation")
+}
+
+// ---- UPDATE features ----
+
+#[trace_gen(Origin::UpdateFrom)]
+fn generate_update_from<C: Capabilities>(
+    _generator: &SqlGen<C>,
+    _ctx: &mut Context,
+) -> Result<(), GenError> {
+    todo!("UPDATE ... FROM generation")
+}
+
+#[trace_gen(Origin::UpdateReturning)]
+fn generate_update_returning<C: Capabilities>(
+    _generator: &SqlGen<C>,
+    _ctx: &mut Context,
+) -> Result<Vec<Expr>, GenError> {
+    todo!("UPDATE ... RETURNING generation")
+}
+
+// ---- DELETE features ----
+
+#[trace_gen(Origin::DeleteReturning)]
+fn generate_delete_returning<C: Capabilities>(
+    _generator: &SqlGen<C>,
+    _ctx: &mut Context,
+) -> Result<Vec<Expr>, GenError> {
+    todo!("DELETE ... RETURNING generation")
+}
+
+// ---- CREATE TABLE features ----
+
+#[trace_gen(Origin::CheckConstraint)]
+fn generate_check_constraint<C: Capabilities>(
+    _generator: &SqlGen<C>,
+    _ctx: &mut Context,
+) -> Result<Expr, GenError> {
+    todo!("CHECK constraint generation")
+}
+
+#[trace_gen(Origin::ForeignKey)]
+fn generate_foreign_key<C: Capabilities>(
+    _generator: &SqlGen<C>,
+    _ctx: &mut Context,
+) -> Result<(), GenError> {
+    todo!("FOREIGN KEY generation")
+}
+
+#[trace_gen(Origin::Autoincrement)]
+fn generate_autoincrement<C: Capabilities>(
+    _generator: &SqlGen<C>,
+    _ctx: &mut Context,
+) -> Result<(), GenError> {
+    todo!("AUTOINCREMENT generation")
+}
+
+#[trace_gen(Origin::GeneratedColumn)]
+fn generate_generated_column<C: Capabilities>(
+    _generator: &SqlGen<C>,
+    _ctx: &mut Context,
+) -> Result<(), GenError> {
+    todo!("generated column generation")
+}
+
+#[trace_gen(Origin::CreateTableAsSelect)]
+fn generate_create_table_as_select<C: Capabilities>(
+    _generator: &SqlGen<C>,
+    _ctx: &mut Context,
+) -> Result<Stmt, GenError> {
+    todo!("CREATE TABLE ... AS SELECT generation")
+}
+
+// ---- Index features ----
+
+#[trace_gen(Origin::PartialIndex)]
+fn generate_partial_index<C: Capabilities>(
+    _generator: &SqlGen<C>,
+    _ctx: &mut Context,
+) -> Result<Expr, GenError> {
+    todo!("partial index WHERE generation")
+}
+
+#[trace_gen(Origin::ExpressionIndex)]
+fn generate_expression_index<C: Capabilities>(
+    _generator: &SqlGen<C>,
+    _ctx: &mut Context,
+) -> Result<Expr, GenError> {
+    todo!("expression index generation")
 }
 
 #[cfg(test)]

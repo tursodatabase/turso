@@ -83,6 +83,15 @@ fn collect_capability_allowed_exprs<C: Capabilities>() -> Vec<ExprKind> {
         candidates.push(ExprKind::Exists);
     }
 
+    // Window functions require capability
+    if C::WINDOW_FN {
+        candidates.push(ExprKind::WindowFunction);
+    }
+
+    // Always available (but weight 0)
+    candidates.push(ExprKind::Collate);
+    candidates.push(ExprKind::Raise);
+
     candidates
 }
 
@@ -156,6 +165,12 @@ fn is_expr_valid_for_depth(
 
         // Parenthesized is not generated directly
         ExprKind::Parenthesized => false,
+
+        // Window functions require depth budget and subquery budget (they contain nested SELECTs conceptually)
+        ExprKind::WindowFunction => depth < max_expr_depth,
+
+        // Collate and Raise require depth budget
+        ExprKind::Collate | ExprKind::Raise => depth < max_expr_depth,
     }
 }
 
@@ -183,6 +198,10 @@ fn dispatch_expr_generation<C: Capabilities>(
         ExprKind::Exists => generate_exists(generator, ctx),
         // Parenthesized is not generated directly - it's just for grouping
         ExprKind::Parenthesized => unreachable!("parenthesized is not generated directly"),
+        // Stubs
+        ExprKind::WindowFunction => todo!("window function generation"),
+        ExprKind::Collate => todo!("COLLATE expression generation"),
+        ExprKind::Raise => todo!("RAISE expression generation"),
     }
 }
 
@@ -246,6 +265,13 @@ fn generate_binary_op<C: Capabilities>(
 
     let left = generate_binop_left(generator, ctx, table, depth)?;
     let right = generate_binop_right(generator, ctx, table, depth)?;
+
+    // --- LIKE ... ESCAPE (not yet implemented) ---
+    if matches!(op, BinOp::Like)
+        && ctx.gen_bool_with_prob(generator.policy().expr_config.like_escape_probability)
+    {
+        return generate_like_escape(generator, ctx, table, depth);
+    }
 
     Ok(Expr::binary_op(ctx, left, op, right))
 }
@@ -556,6 +582,17 @@ pub fn generate_condition<C: Capabilities>(
     generate_expr(generator, ctx, table, 0)
 }
 
+/// Generate a LIKE ... ESCAPE expression (stub).
+#[trace_gen(Origin::LikeEscape)]
+fn generate_like_escape<C: Capabilities>(
+    _generator: &SqlGen<C>,
+    _ctx: &mut Context,
+    _table: &Table,
+    _depth: usize,
+) -> Result<Expr, GenError> {
+    todo!("LIKE ... ESCAPE expression generation")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -639,6 +676,9 @@ mod tests {
             in_subquery: 0,
             is_null: 0,
             exists: 0,
+            window_function: 0,
+            collate: 0,
+            raise: 0,
         });
 
         let generator: SqlGen<Full> = SqlGen::new(schema, policy);
@@ -682,6 +722,9 @@ mod tests {
             in_subquery: 0,
             is_null: 0,
             exists: 0,
+            window_function: 0,
+            collate: 0,
+            raise: 0,
         });
 
         let generator: SqlGen<Full> = SqlGen::new(schema, policy);
@@ -738,6 +781,9 @@ mod tests {
             in_subquery: 0,
             is_null: 0,
             exists: 0,
+            window_function: 0,
+            collate: 0,
+            raise: 0,
         });
 
         let generator: SqlGen<Full> = SqlGen::new(schema, policy);
@@ -792,6 +838,9 @@ mod tests {
                 in_subquery: 30,
                 is_null: 0,
                 exists: 30,
+                window_function: 0,
+                collate: 0,
+                raise: 0,
             })
             .with_select_config(SelectConfig {
                 where_probability: 1.0,
@@ -863,6 +912,9 @@ mod tests {
             in_subquery: 40,
             is_null: 0,
             exists: 40,
+            window_function: 0,
+            collate: 0,
+            raise: 0,
         });
 
         let generator: SqlGen<Full> = SqlGen::new(schema, policy);
