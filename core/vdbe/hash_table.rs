@@ -1551,7 +1551,10 @@ impl HashTable {
         }
 
         let matched_bits = if self.track_matched {
-            buckets.iter().map(|b| vec![false; b.entries.len()]).collect()
+            buckets
+                .iter()
+                .map(|b| vec![false; b.entries.len()])
+                .collect()
         } else {
             Vec::new()
         };
@@ -1746,8 +1749,8 @@ impl HashTable {
         }
     }
 
-    /// Mark the current matched entry as "matched" (for FULL OUTER JOIN tracking).
-    /// Should be called after a successful probe/next_match when a condition passes.
+    /// Mark the current matched entry as "matched" for outer join tracking.
+    /// Must be called after a successful probe/next_match.
     pub fn mark_current_matched(&mut self) {
         if !self.track_matched {
             return;
@@ -1756,19 +1759,15 @@ impl HashTable {
             .probe_entry_idx
             .checked_sub(1)
             .expect("mark_current_matched called without prior probe match");
+        let bucket_idx = self.probe_bucket_idx;
         if let Some(spill_state) = &mut self.spill_state {
             let partition_idx = self.current_spill_partition_idx;
-            if let Some(partition) = spill_state.find_partition_mut(partition_idx) {
-                if let Some(bits) = partition.matched_bits.get_mut(self.probe_bucket_idx) {
-                    if let Some(bit) = bits.get_mut(entry_idx) {
-                        *bit = true;
-                    }
-                }
-            }
-        } else if let Some(bits) = self.matched_bits.get_mut(self.probe_bucket_idx) {
-            if let Some(bit) = bits.get_mut(entry_idx) {
-                *bit = true;
-            }
+            let partition = spill_state
+                .find_partition_mut(partition_idx)
+                .expect("spilled partition missing during mark_current_matched");
+            partition.matched_bits[bucket_idx][entry_idx] = true;
+        } else {
+            self.matched_bits[bucket_idx][entry_idx] = true;
         }
     }
 
@@ -1779,8 +1778,9 @@ impl HashTable {
         self.unmatched_scan_partition = 0;
     }
 
-    /// Advance to the next unmatched entry in the hash table (non-spilled case).
-    /// Returns the entry if found, None when scan is complete.
+    /// Advance to the next unmatched entry in the hash table.
+    /// Returns the entry if found, or None when the scan is complete
+    /// (or a spilled partition needs loading).
     pub fn next_unmatched(&mut self) -> Option<&HashEntry> {
         if self.spill_state.is_some() {
             return self.next_unmatched_spilled();
@@ -1802,7 +1802,7 @@ impl HashTable {
     }
 
     /// Advance to the next unmatched entry across spilled partitions.
-    /// The caller must ensure the partition is loaded before calling this.
+    /// Returns None when a partition needs loading (caller must load and retry).
     fn next_unmatched_spilled(&mut self) -> Option<&HashEntry> {
         let spill_state = self.spill_state.as_ref()?;
         while self.unmatched_scan_partition < spill_state.partitions.len() {

@@ -1607,10 +1607,9 @@ pub fn open_loop(
                 }
             }
             Operation::HashJoin(hash_join_op) => {
-                // Get build table info for cursor resolution and hash table reference.
-                // The optimizer convention: build=LHS, probe=RHS (the current table).
-                // For outer joins, the hash table still contains the LHS rows.
-                // After the probe scan, unmatched LHS entries are emitted with NULLs.
+                // Build=LHS (populates the hash table), probe=RHS (current table being scanned).
+                // For outer joins, the hash table tracks which build entries were matched.
+                // After the probe scan, unmatched build entries are emitted with NULLs.
                 let build_table = &table_references.joined_tables()[hash_join_op.build_table_idx];
                 let (build_cursor_id, _) = build_table.resolve_cursors(program, mode.clone())?;
                 let build_cursor_id = if let Some(cursor_id) = build_cursor_id {
@@ -1703,9 +1702,10 @@ pub fn open_loop(
                     None
                 };
 
-                // For FULL OUTER: initialize match flag per probe row.
-                // When a probe row has no build match, we emit probe + NULLs for build.
-                // For LEFT OUTER: not needed (unmatched probe rows are just skipped).
+                // For FULL OUTER: reset match flag to 0 before each probe row.
+                // When a probe row finds no build match, this flag stays 0 and we
+                // emit the probe row with NULLs for the build side (check_outer block).
+                // LEFT OUTER doesn't need this, unmatched probe rows are simply skipped.
                 if matches!(hash_join_op.join_type, HashJoinType::FullOuter) {
                     let probe_table_idx = hash_join_op.probe_table_idx;
                     if let Some(lj_meta) = t_ctx.meta_left_joins[probe_table_idx].as_ref() {
@@ -1716,9 +1716,10 @@ pub fn open_loop(
                     }
                 }
 
-                // For FULL OUTER, probe miss → check_outer (emit probe + NULLs for build).
-                // For LEFT OUTER, probe miss → next (skip, unmatched probe rows don't appear).
-                // For inner, probe miss -> next.
+                // On probe miss (no build match found):
+                //   FULL OUTER  -> check_outer (emit probe row with NULLs for build side)
+                //   LEFT OUTER  -> next (skip; only build rows need unmatched emission)
+                //   Inner       -> next (skip)
                 let hash_probe_miss_label = if hash_join_op.join_type == HashJoinType::FullOuter {
                     // This label will be resolved in close_loop via hash_ctx
                     program.allocate_label()
@@ -1743,7 +1744,6 @@ pub fn open_loop(
                 program.preassign_label_to_next_insn(match_found_label);
                 let hash_next_label = program.allocate_label();
 
-                // Store hash context for later use
                 let payload_columns = payload_info.payload_columns.clone();
                 t_ctx.hash_table_contexts.insert(
                     hash_join_op.build_table_idx,
@@ -1870,12 +1870,9 @@ pub fn open_loop(
             SubqueryRefFilter::All,
         )?;
 
-        // Set the match flag to true if this is a LEFT JOIN.
-        // At this point of execution we are going to emit columns for the left table,
-        // and either emit columns or NULLs for the right table, depending on whether the null_flag is set
-        // for the right table's cursor.
-        // Skip for tables that are the probe side of an outer hash join — their outer
-        // semantics are handled by the hash join's unmatched build scan instead.
+        // Set the match flag for this LEFT JOIN table.
+        // Skip for outer hash join probe tables, their match semantics are handled
+        // by HashMarkMatched and the check_outer / unmatched build scan paths.
         let is_outer_hj_probe = matches!(table.op, Operation::HashJoin(ref hj) if matches!(
             hj.join_type,
             HashJoinType::LeftOuter | HashJoinType::FullOuter
@@ -1891,8 +1888,7 @@ pub fn open_loop(
             }
         }
 
-        // For outer hash join probes: on match, mark the hash table entry as matched
-        // and set the match flag for FULL OUTER per-probe-row tracking.
+        // Outer hash joins: mark hash entry as matched, set FULL OUTER match flag.
         if let Operation::HashJoin(ref hj) = table.op {
             if matches!(
                 hj.join_type,
@@ -1900,10 +1896,9 @@ pub fn open_loop(
             ) {
                 let build_table = &table_references.joined_tables()[hj.build_table_idx];
                 let hash_table_id: usize = build_table.internal_id.into();
-                // Mark this hash table entry as matched (for unmatched build scan later)
                 program.emit_insn(Insn::HashMarkMatched { hash_table_id });
 
-                // For FULL OUTER: also set match flag to 1 (this probe row found a match)
+                // FULL OUTER: set match flag so check_outer knows this probe row matched
                 if matches!(hj.join_type, HashJoinType::FullOuter) {
                     let probe_idx = hj.probe_table_idx;
                     if let Some(lj_meta) = t_ctx.meta_left_joins[probe_idx].as_ref() {
@@ -1965,10 +1960,9 @@ pub fn open_loop(
             SubqueryRefFilter::WithSubqueryRefs,
         )?;
 
-        // For outer hash joins: wrap inner table loops in a Gosub/Return subroutine.
-        // This allows unmatched emission paths (check_outer, unmatched build scan) to
-        // re-enter inner loops via Gosub, ensuring inner table cursors are properly
-        // Rewind'd and iterated for every emitted row.
+        // Outer hash joins wrap subsequent inner table loops in a Gosub/Return
+        // subroutine so unmatched emission paths can re-enter them via Gosub,
+        // ensuring inner cursors are properly Rewind'd for each emitted row.
         if let Operation::HashJoin(ref hj) = table.op {
             if matches!(
                 hj.join_type,
@@ -1978,20 +1972,16 @@ pub fn open_loop(
                 let gosub_label = program.allocate_label();
                 let skip_label = program.allocate_label();
 
-                // Call inner loop subroutine
                 program.emit_insn(Insn::Gosub {
                     target_pc: gosub_label,
                     return_reg,
                 });
-                // After Return, skip over the subroutine body to HashNext
                 program.emit_insn(Insn::Goto {
                     target_pc: skip_label,
                 });
-                // Resolve gosub_label to the next instruction — this is where the
-                // inner table open_loops (or emit if no inner tables) will be emitted.
+                // Subroutine body starts here (inner loops follow)
                 program.preassign_label_to_next_insn(gosub_label);
 
-                // Update hash context with gosub info
                 if let Some(hash_ctx) = t_ctx.hash_table_contexts.get_mut(&hj.build_table_idx) {
                     hash_ctx.inner_loop_gosub_reg = Some(return_reg);
                     hash_ctx.inner_loop_gosub_label = Some(gosub_label);
@@ -2487,15 +2477,12 @@ pub fn close_loop(
                     let inner_loop_skip_label = hash_ctx.inner_loop_skip_label;
                     let label_next_probe_row = program.allocate_label();
 
-                    // End the inner loop subroutine with Return if Gosub wrapping is active.
-                    // This comes before HashNext — the subroutine body is everything
-                    // between the Gosub label (resolved in open_loop) and this Return.
+                    // Close the inner loop subroutine (body spans from gosub_label to here).
                     if let Some(gosub_reg) = inner_loop_gosub_reg {
                         program.emit_insn(Insn::Return {
                             return_reg: gosub_reg,
                             can_fallthrough: false,
                         });
-                        // Resolve skip_label to the next instruction (HashNext follows)
                         if let Some(skip_label) = inner_loop_skip_label {
                             program.preassign_label_to_next_insn(skip_label);
                         }
@@ -2509,13 +2496,9 @@ pub fn close_loop(
                         label_next_probe_row
                     };
 
-                    // Resolve hash_next_label here, this is where conditions jump when they fail
-                    // to try the next hash match before moving to the next probe row.
                     program.resolve_label(hash_next_label, program.offset());
 
-                    // Check for additional matches with same probe keys
-                    // If found: store in match_reg (and payload if available) and continue
-                    // If not found: jump to check_outer (outer) or next_probe_row (inner)
+                    // Try next hash match; on exhaustion jump to hash_next_target
                     program.emit_insn(Insn::HashNext {
                         hash_table_id: hash_table_reg,
                         dest_reg: match_reg,
@@ -2524,16 +2507,16 @@ pub fn close_loop(
                         num_payload,
                     });
 
-                    // Jump to match processing, skips HashProbe to preserve iteration state.
+                    // Jump back to match processing (skips HashProbe to preserve state).
                     program.emit_insn(Insn::Goto {
                         target_pc: match_found_label,
                     });
 
-                    // For FULL OUTER, emit the check_outer block.
-                    // HashProbe miss and HashNext exhaustion both jump here.
-                    // For unmatched probe rows: emit probe + NULLs for build.
+                    // FULL OUTER check_outer block: emits unmatched probe rows with
+                    // NULLs for the build side. Reached on HashProbe miss and
+                    // HashNext exhaustion (when no build match passed conditions).
                     if matches!(join_type, HashJoinType::FullOuter) {
-                        // The probe table (RHS) has join_info.outer and LeftJoinMetadata
+                        // The probe table (RHS) has join_info.outer=true → LeftJoinMetadata
                         let probe_table_idx = hash_join_op.probe_table_idx;
                         let lj_meta = t_ctx.meta_left_joins[probe_table_idx]
                             .as_ref()
@@ -2545,26 +2528,24 @@ pub fn close_loop(
                         if let Some(col) = check_outer_label {
                             program.resolve_label(col, program.offset());
                         }
-                        // Also resolve the build table's label_match_flag_check_value here,
-                        // since we're handling the outer join check inline instead of in the
-                        // generic outer join block.
+                        // Resolve label_match_flag_check_value here instead of in the
+                        // generic outer join block (which is skipped for hash join probes).
                         program
                             .resolve_label(lj_meta.label_match_flag_check_value, program.offset());
 
-                        // If match_flag is already set (a previous hash match passed conditions),
-                        // skip the NullRow emission.
+                        // Skip NullRow emission if a previous hash match already set the flag.
                         program.emit_insn(Insn::IfPos {
                             reg: reg_match_flag,
                             target_pc: label_next_probe_row,
                             decrement_by: 0,
                         });
 
-                        // No match — set NullRow on build cursor so Column returns NULL.
+                        // No match — NullRow the build cursor so Column reads return NULL.
                         if let Some(cursor_id) = build_cursor_id {
                             program.emit_insn(Insn::NullRow { cursor_id });
                         }
 
-                        // Null out payload registers if present
+                        // Also null out cached payload registers
                         if let Some(payload_reg) = payload_dest_reg {
                             if num_payload > 0 {
                                 program.emit_insn(Insn::Null {
@@ -2574,16 +2555,14 @@ pub fn close_loop(
                             }
                         }
 
-                        // Evaluate WHERE conditions (not ON conditions) on the
-                        // unmatched probe row. Build columns are NULL (NullRow set).
-                        // If a condition fails, skip to next probe row.
-                        //
-                        // Same as the unmatched build scan: only evaluate conditions
-                        // on build/probe when a Gosub handles inner loops.
+                        // Evaluate true WHERE conditions (not ON) on the unmatched
+                        // probe row. When a Gosub wraps inner loops, only evaluate
+                        // conditions referencing build/probe tables (inner table
+                        // cursors are not yet open).
                         if let Some(plan) = select_plan {
-                            let has_gosub_co =
+                            let has_gosub =
                                 inner_loop_gosub_reg.is_some() && inner_loop_gosub_label.is_some();
-                            let allowed_tables_co = {
+                            let allowed_tables = {
                                 let mut m = TableMask::new();
                                 m.add_table(hash_join_op.build_table_idx);
                                 m.add_table(table_index);
@@ -2594,11 +2573,11 @@ pub fn close_loop(
                                 .iter()
                                 .filter(|c| !c.consumed && c.from_outer_join.is_none())
                                 .filter(|c| {
-                                    !has_gosub_co
+                                    !has_gosub
                                         || expr_tables_subset_of(
                                             &c.expr,
                                             &plan.table_references,
-                                            &allowed_tables_co,
+                                            &allowed_tables,
                                         )
                                 })
                             {
@@ -2619,8 +2598,6 @@ pub fn close_loop(
                                 program.preassign_label_to_next_insn(jump_target_when_true);
                             }
 
-                            // Emit via Gosub to re-enter inner loops (which properly
-                            // Rewind inner table cursors). Build cursor has NullRow set.
                             if let (Some(gosub_reg), Some(gosub_label)) =
                                 (inner_loop_gosub_reg, inner_loop_gosub_label)
                             {
@@ -2637,7 +2614,7 @@ pub fn close_loop(
                     program.preassign_label_to_next_insn(label_next_probe_row);
                 }
 
-                // Advance to next probe row (HashProbe jumps here for inner, or after outer check)
+                // Next probe row
                 program.resolve_label(loop_labels.next, program.offset());
                 let probe_cursor_id = table_cursor_id.expect("Probe table must have a cursor");
                 program.emit_insn(Insn::Next {
@@ -2646,8 +2623,7 @@ pub fn close_loop(
                 });
                 program.preassign_label_to_next_insn(loop_labels.loop_end);
 
-                // For LEFT OUTER and FULL OUTER: after probe loop completes,
-                // scan unmatched build entries and emit them with NULLs for the probe side.
+                // Outer joins: scan unmatched build entries, emit with NULLs for probe side.
                 if matches!(
                     hash_join_op.join_type,
                     HashJoinType::LeftOuter | HashJoinType::FullOuter
@@ -2660,16 +2636,14 @@ pub fn close_loop(
                         let match_reg = hash_ctx.match_reg;
                         let payload_dest_reg = hash_ctx.payload_start_reg;
                         let num_payload = hash_ctx.payload_columns.len();
-                        let build_cursor_id_fo = hash_ctx.build_cursor_id;
+                        let build_cursor_id = hash_ctx.build_cursor_id;
 
                         let done_unmatched = program.allocate_label();
 
-                        // Set probe cursor to null mode — all probe columns return NULL
                         program.emit_insn(Insn::NullRow {
                             cursor_id: probe_cursor_id,
                         });
 
-                        // Begin scanning unmatched build entries
                         program.emit_insn(Insn::HashScanUnmatched {
                             hash_table_id: hash_table_reg,
                             dest_reg: match_reg,
@@ -2682,8 +2656,7 @@ pub fn close_loop(
                         let label_next_unmatched = program.allocate_label();
                         program.preassign_label_to_next_insn(unmatched_loop);
 
-                        // Position build cursor to the unmatched entry's rowid
-                        if let Some(cursor_id) = build_cursor_id_fo {
+                        if let Some(cursor_id) = build_cursor_id {
                             program.emit_insn(Insn::SeekRowid {
                                 cursor_id,
                                 src_reg: match_reg,
@@ -2691,16 +2664,9 @@ pub fn close_loop(
                             });
                         }
 
-                        // Evaluate WHERE conditions (not ON conditions) on
-                        // the unmatched build row. Probe columns are NULL
-                        // (NullRow set). If a condition fails, skip this row.
-                        //
-                        // When a Gosub handles inner loops, only evaluate
-                        // conditions whose table references are limited to
-                        // build + probe (whose cursors are open). Conditions
-                        // referencing inner tables are handled by the Gosub
-                        // subroutine — evaluating them here would read from
-                        // cursors that may not be open yet.
+                        // Evaluate true WHERE conditions (not ON) on the unmatched
+                        // build row. When a Gosub wraps inner loops, only evaluate
+                        // conditions referencing build/probe tables.
                         let gosub_reg = hash_ctx.inner_loop_gosub_reg;
                         let gosub_label = hash_ctx.inner_loop_gosub_label;
                         let has_gosub = gosub_reg.is_some() && gosub_label.is_some();
@@ -2740,9 +2706,6 @@ pub fn close_loop(
                             program.preassign_label_to_next_insn(jump_target_when_true);
                         }
 
-                        // Emit via Gosub to re-enter inner loops (which properly
-                        // Rewind inner table cursors). Probe cursor has NullRow set,
-                        // build cursor is positioned via SeekRowid.
                         if let (Some(gosub_reg), Some(gosub_label)) = (gosub_reg, gosub_label) {
                             program.emit_insn(Insn::Gosub {
                                 target_pc: gosub_label,
@@ -2752,7 +2715,6 @@ pub fn close_loop(
                             emit_loop(program, t_ctx, plan)?;
                         }
 
-                        // Try the next unmatched entry
                         program.resolve_label(label_next_unmatched, program.offset());
                         program.emit_insn(Insn::HashNextUnmatched {
                             hash_table_id: hash_table_reg,
@@ -2780,10 +2742,9 @@ pub fn close_loop(
             }
         }
 
-        // Handle OUTER JOIN logic. The reason this comes after the "loop end" mark is that we may need to still jump back
-        // and emit a row with NULLs for the right table, and then jump back to the next row of the left table.
-        // Skip this for tables that are the probe side of an outer hash join — their outer
-        // semantics are handled by the hash join's unmatched build scan.
+        // Handle OUTER JOIN logic after loop end — may need to jump back
+        // and emit NULLs for the right table before advancing the left table.
+        // Skip for outer hash join probe tables — handled by check_outer / unmatched build scan.
         let is_outer_hash_join_probe = matches!(
             table.op,
             Operation::HashJoin(ref hj) if matches!(

@@ -322,3 +322,678 @@ expect {
     |14
     |15
 }
+
+# ============================================================
+# Adversarial / edge-case tests
+# ============================================================
+
+test full-outer-join-null-keys-both-sides {
+    CREATE TABLE t1(a, b);
+    CREATE TABLE t2(c, d);
+    INSERT INTO t1 VALUES (1, 'x'), (NULL, 'y'), (3, 'z');
+    INSERT INTO t2 VALUES (1, 'a'), (NULL, 'b'), (4, 'c');
+    SELECT t1.a, t1.b, t2.c, t2.d FROM t1 FULL OUTER JOIN t2 ON t1.a = t2.c ORDER BY coalesce(t1.a, t2.c), t1.b, t2.d;
+}
+expect {
+    |||b
+    |y||
+    1|x|1|a
+    3|z||
+    ||4|c
+}
+
+test full-outer-join-all-nulls {
+    CREATE TABLE t1(a, b);
+    CREATE TABLE t2(c, d);
+    INSERT INTO t1 VALUES (NULL, 'x'), (NULL, 'y');
+    INSERT INTO t2 VALUES (NULL, 'a'), (NULL, 'b');
+    SELECT t1.a, t1.b, t2.c, t2.d FROM t1 FULL OUTER JOIN t2 ON t1.a = t2.c ORDER BY t1.b, t2.d;
+}
+expect {
+    |||a
+    |||b
+    |x||
+    |y||
+}
+
+test full-outer-join-single-row-each {
+    CREATE TABLE t1(a, b);
+    CREATE TABLE t2(c, d);
+    INSERT INTO t1 VALUES (1, 'x');
+    INSERT INTO t2 VALUES (1, 'a');
+    SELECT t1.a, t2.c FROM t1 FULL OUTER JOIN t2 ON t1.a = t2.c;
+}
+expect {
+    1|1
+}
+
+test full-outer-join-single-row-no-match {
+    CREATE TABLE t1(a, b);
+    CREATE TABLE t2(c, d);
+    INSERT INTO t1 VALUES (1, 'x');
+    INSERT INTO t2 VALUES (2, 'a');
+    SELECT t1.a, t2.c FROM t1 FULL OUTER JOIN t2 ON t1.a = t2.c ORDER BY coalesce(t1.a, t2.c);
+}
+expect {
+    1|
+    |2
+}
+
+test full-outer-join-duplicate-keys-both-sides {
+    CREATE TABLE t1(a, b);
+    CREATE TABLE t2(c, d);
+    INSERT INTO t1 VALUES (1, 'x'), (1, 'y');
+    INSERT INTO t2 VALUES (1, 'a'), (1, 'b');
+    SELECT t1.a, t1.b, t2.c, t2.d FROM t1 FULL OUTER JOIN t2 ON t1.a = t2.c ORDER BY t1.b, t2.d;
+}
+expect {
+    1|x|1|a
+    1|x|1|b
+    1|y|1|a
+    1|y|1|b
+}
+
+test full-outer-join-mixed-types {
+    CREATE TABLE t1(a INTEGER, b TEXT);
+    CREATE TABLE t2(c REAL, d TEXT);
+    INSERT INTO t1 VALUES (1, 'x'), (2, 'y'), (3, 'z');
+    INSERT INTO t2 VALUES (2.0, 'a'), (4.0, 'b');
+    SELECT t1.a, t2.c FROM t1 FULL OUTER JOIN t2 ON t1.a = t2.c ORDER BY coalesce(t1.a, t2.c);
+}
+expect {
+    1|
+    2|2.0
+    3|
+    |4.0
+}
+
+test full-outer-join-where-filters-both-sides {
+    CREATE TABLE t1(a, b);
+    CREATE TABLE t2(c, d);
+    INSERT INTO t1 VALUES (1, 'x'), (2, 'y'), (3, 'z');
+    INSERT INTO t2 VALUES (2, 'a'), (4, 'b'), (5, 'c');
+    SELECT t1.a, t2.c FROM t1 FULL OUTER JOIN t2 ON t1.a = t2.c WHERE coalesce(t1.a, t2.c) BETWEEN 2 AND 4 ORDER BY coalesce(t1.a, t2.c);
+}
+expect {
+    2|2
+    3|
+    |4
+}
+
+test full-outer-join-with-expressions-in-select {
+    CREATE TABLE t1(a, b);
+    CREATE TABLE t2(c, d);
+    INSERT INTO t1 VALUES (1, 'x'), (2, 'y');
+    INSERT INTO t2 VALUES (2, 'a'), (3, 'b');
+    SELECT coalesce(t1.a, 0) + coalesce(t2.c, 0) as sum_keys, t1.b, t2.d FROM t1 FULL OUTER JOIN t2 ON t1.a = t2.c ORDER BY sum_keys;
+}
+expect {
+    1|x|
+    3||b
+    4|y|a
+}
+
+test full-outer-join-non-equi-errors {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b);
+    SELECT * FROM t1 FULL OUTER JOIN t2 ON t1.a > t2.b;
+}
+expect error {
+    FULL OUTER JOIN requires an equality condition in the ON clause
+}
+
+@skip-if sqlite "supported in sqlite"
+test full-outer-join-using-errors {
+    CREATE TABLE t1(id, name);
+    CREATE TABLE t2(id, val);
+    SELECT * FROM t1 FULL OUTER JOIN t2 USING(id);
+}
+expect error {
+    FULL OUTER JOIN requires an equality condition in the ON clause
+}
+
+@skip-if sqlite "supported in sqlite"
+test full-outer-join-no-on-clause-errors {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b);
+    SELECT * FROM t1 FULL OUTER JOIN t2;
+}
+expect error {
+    FULL OUTER JOIN requires an equality condition in the ON clause
+}
+
+test right-join-duplicate-keys {
+    CREATE TABLE t1(a, b);
+    CREATE TABLE t2(c, d);
+    INSERT INTO t1 VALUES (1, 'x'), (1, 'y');
+    INSERT INTO t2 VALUES (1, 'a'), (2, 'b');
+    SELECT t1.a, t1.b, t2.c, t2.d FROM t1 RIGHT JOIN t2 ON t1.a = t2.c ORDER BY t2.c, t2.d, t1.b;
+}
+expect {
+    1|x|1|a
+    1|y|1|a
+    ||2|b
+}
+
+test right-join-with-where {
+    CREATE TABLE t1(a, b);
+    CREATE TABLE t2(c, d);
+    INSERT INTO t1 VALUES (1, 'x'), (2, 'y'), (3, 'z');
+    INSERT INTO t2 VALUES (2, 'a'), (4, 'b'), (5, 'c');
+    SELECT t1.a, t2.c FROM t1 RIGHT JOIN t2 ON t1.a = t2.c WHERE t2.c < 5 ORDER BY t2.c;
+}
+expect {
+    2|2
+    |4
+}
+
+test full-outer-join-with-group-by {
+    CREATE TABLE t1(a, b);
+    CREATE TABLE t2(c, d);
+    INSERT INTO t1 VALUES (1, 'x'), (2, 'y'), (3, 'z');
+    INSERT INTO t2 VALUES (2, 'a'), (4, 'b');
+    SELECT coalesce(t1.a, t2.c) as key, count(*) as cnt FROM t1 FULL OUTER JOIN t2 ON t1.a = t2.c GROUP BY key ORDER BY key;
+}
+expect {
+    1|1
+    2|1
+    3|1
+    4|1
+}
+
+test full-outer-join-with-aggregate-no-group-by {
+    CREATE TABLE t1(a, b);
+    CREATE TABLE t2(c, d);
+    INSERT INTO t1 VALUES (1, 'x'), (2, 'y'), (3, 'z');
+    INSERT INTO t2 VALUES (2, 'a'), (4, 'b');
+    SELECT count(*), sum(t1.a), sum(t2.c) FROM t1 FULL OUTER JOIN t2 ON t1.a = t2.c;
+}
+expect {
+    4|6|6
+}
+
+# ============================================================
+# Multi-table chained outer hash join tests (Gosub pattern)
+# These exercise the case where inner table loops must be
+# re-entered via Gosub for unmatched build/probe rows.
+# ============================================================
+
+# Three-way LEFT JOIN chain: when t2 doesn't match, t3 should also be NULL.
+# No indexes on join columns → hash join.
+test multi-table-left-join-chain {
+    CREATE TABLE t1(a, b);
+    CREATE TABLE t2(c, d);
+    CREATE TABLE t3(e, f);
+    INSERT INTO t1 VALUES (1, 'x'), (2, 'y'), (3, 'z');
+    INSERT INTO t2 VALUES (1, 'a'), (3, 'c');
+    INSERT INTO t3 VALUES (1, 'p'), (2, 'q'), (3, 'r');
+    SELECT t1.a, t2.d, t3.f
+    FROM t1
+    LEFT JOIN t2 ON t1.a = t2.c
+    LEFT JOIN t3 ON t1.a = t3.e
+    ORDER BY t1.a;
+}
+expect {
+    1|a|p
+    2||q
+    3|c|r
+}
+
+# Three-way chain where t3 depends on t2 (not t1).
+# When t2 is NULL, t3 join condition can't match.
+test multi-table-left-join-t3-depends-on-t2 {
+    CREATE TABLE t1(a, b);
+    CREATE TABLE t2(c, d);
+    CREATE TABLE t3(e, f);
+    INSERT INTO t1 VALUES (1, 'x'), (2, 'y'), (3, 'z');
+    INSERT INTO t2 VALUES (1, 'a'), (3, 'c');
+    INSERT INTO t3 VALUES (1, 'p'), (3, 'r');
+    SELECT t1.a, t2.c, t3.e
+    FROM t1
+    LEFT JOIN t2 ON t1.a = t2.c
+    LEFT JOIN t3 ON t2.c = t3.e
+    ORDER BY t1.a;
+}
+expect {
+    1|1|1
+    2||
+    3|3|3
+}
+
+# Four-way LEFT JOIN chain with partial matches at each level.
+test four-way-left-join-chain {
+    CREATE TABLE t1(a, b);
+    CREATE TABLE t2(c, d);
+    CREATE TABLE t3(e, f);
+    CREATE TABLE t4(g, h);
+    INSERT INTO t1 VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd');
+    INSERT INTO t2 VALUES (1, 'w'), (3, 'y');
+    INSERT INTO t3 VALUES (2, 'm'), (3, 'n');
+    INSERT INTO t4 VALUES (1, 'p'), (4, 's');
+    SELECT t1.a, t2.d, t3.f, t4.h
+    FROM t1
+    LEFT JOIN t2 ON t1.a = t2.c
+    LEFT JOIN t3 ON t1.a = t3.e
+    LEFT JOIN t4 ON t1.a = t4.g
+    ORDER BY t1.a;
+}
+expect {
+    1|w||p
+    2||m|
+    3|y|n|
+    4|||s
+}
+
+# Multi-table LEFT JOIN where all build rows are unmatched.
+# Forces the unmatched scan to iterate through inner loops via Gosub.
+test multi-table-left-join-all-unmatched {
+    CREATE TABLE t1(a, b);
+    CREATE TABLE t2(c, d);
+    CREATE TABLE t3(e, f);
+    INSERT INTO t1 VALUES (1, 'x'), (2, 'y'), (3, 'z');
+    INSERT INTO t2 VALUES (10, 'a'), (20, 'b');
+    INSERT INTO t3 VALUES (100, 'p'), (200, 'q');
+    SELECT t1.a, t2.c, t3.e
+    FROM t1
+    LEFT JOIN t2 ON t1.a = t2.c
+    LEFT JOIN t3 ON t1.a = t3.e
+    ORDER BY t1.a;
+}
+expect {
+    1||
+    2||
+    3||
+}
+
+# Multi-table LEFT JOIN with duplicates in the hash join table.
+test multi-table-left-join-duplicate-hash-keys {
+    CREATE TABLE t1(a, b);
+    CREATE TABLE t2(c, d);
+    CREATE TABLE t3(e, f);
+    INSERT INTO t1 VALUES (1, 'x'), (2, 'y');
+    INSERT INTO t2 VALUES (1, 'a'), (1, 'b'), (2, 'c');
+    INSERT INTO t3 VALUES (1, 'p'), (2, 'q');
+    SELECT t1.a, t2.d, t3.f
+    FROM t1
+    LEFT JOIN t2 ON t1.a = t2.c
+    LEFT JOIN t3 ON t1.a = t3.e
+    ORDER BY t1.a, t2.d;
+}
+expect {
+    1|a|p
+    1|b|p
+    2|c|q
+}
+
+# FULL OUTER JOIN followed by LEFT JOIN (mixed join types).
+test full-outer-then-left-join {
+    CREATE TABLE t1(a, b);
+    CREATE TABLE t2(c, d);
+    CREATE TABLE t3(e, f);
+    INSERT INTO t1 VALUES (1, 'x'), (2, 'y');
+    INSERT INTO t2 VALUES (2, 'a'), (3, 'b');
+    INSERT INTO t3 VALUES (1, 'p'), (2, 'q'), (3, 'r');
+    SELECT t1.a, t2.c, t3.f
+    FROM t1
+    FULL OUTER JOIN t2 ON t1.a = t2.c
+    LEFT JOIN t3 ON coalesce(t1.a, t2.c) = t3.e
+    ORDER BY coalesce(t1.a, t2.c);
+}
+expect {
+    1||p
+    2|2|q
+    |3|r
+}
+
+# LEFT JOIN with hash join where ON condition has multiple predicates.
+# Some probes match the hash key but fail the extra condition → should still emit NULLs.
+test left-hash-join-multi-predicate {
+    CREATE TABLE t1(a, b);
+    CREATE TABLE t2(c, d);
+    INSERT INTO t1 VALUES (1, 'x'), (2, 'y'), (3, 'z');
+    INSERT INTO t2 VALUES (1, 'X'), (2, 'y'), (3, 'w');
+    SELECT t1.a, t1.b, t2.d
+    FROM t1 LEFT JOIN t2 ON t1.a = t2.c AND t1.b = t2.d
+    ORDER BY t1.a;
+}
+expect {
+    1|x|
+    2|y|y
+    3|z|
+}
+
+# LEFT JOIN with spilling hash table (large build table).
+# This tests that the unmatched scan correctly iterates all spilled partitions.
+test left-hash-join-spill-unmatched {
+    CREATE TABLE big_left(a, b);
+    CREATE TABLE small_right(c, d);
+    INSERT INTO big_left SELECT value, 'val-' || value FROM generate_series(1, 500);
+    INSERT INTO small_right VALUES (100, 'match1'), (200, 'match2'), (300, 'match3');
+    SELECT count(*), count(small_right.c)
+    FROM big_left LEFT JOIN small_right ON big_left.a = small_right.c;
+}
+expect {
+    500|3
+}
+
+# LEFT JOIN spill: verify the unmatched rows are correct, not just count.
+test left-hash-join-spill-verify-order {
+    CREATE TABLE big_left(a, b);
+    CREATE TABLE small_right(c, d);
+    INSERT INTO big_left SELECT value, 'v' || value FROM generate_series(1, 500);
+    INSERT INTO small_right VALUES (250, 'mid');
+    SELECT big_left.a, small_right.d
+    FROM big_left LEFT JOIN small_right ON big_left.a = small_right.c
+    ORDER BY big_left.a
+    LIMIT 5;
+}
+expect {
+    1|
+    2|
+    3|
+    4|
+    5|
+}
+
+# FULL OUTER JOIN with spilling hash table.
+test full-outer-join-spill {
+    CREATE TABLE big1(a, b);
+    CREATE TABLE big2(c, d);
+    INSERT INTO big1 SELECT value, 'left-' || value FROM generate_series(1, 500);
+    INSERT INTO big2 SELECT value, 'right-' || value FROM generate_series(400, 600);
+    SELECT count(*), count(big1.a), count(big2.c)
+    FROM big1 FULL OUTER JOIN big2 ON big1.a = big2.c;
+}
+expect {
+    600|500|201
+}
+
+# Multi-table LEFT JOIN with spill: inner loop must be iterated via Gosub
+# for each unmatched row across all spilled partitions.
+test multi-table-left-join-spill-with-inner {
+    CREATE TABLE big_t1(a, b);
+    CREATE TABLE big_t2(c, d);
+    CREATE TABLE small_t3(e, f);
+    INSERT INTO big_t1 SELECT value, 'v' || value FROM generate_series(1, 500);
+    INSERT INTO big_t2 VALUES (250, 'mid'), (500, 'end');
+    INSERT INTO small_t3 VALUES (1, 'first'), (250, 'mid'), (500, 'last');
+    SELECT count(*), count(big_t2.c), count(small_t3.e)
+    FROM big_t1
+    LEFT JOIN big_t2 ON big_t1.a = big_t2.c
+    LEFT JOIN small_t3 ON big_t1.a = small_t3.e;
+}
+expect {
+    500|2|3
+}
+
+# RIGHT JOIN with multi-table chain (RIGHT is rewritten as LEFT).
+test right-join-with-inner-join {
+    CREATE TABLE t1(a, b);
+    CREATE TABLE t2(c, d);
+    CREATE TABLE t3(e, f);
+    INSERT INTO t1 VALUES (1, 'x'), (2, 'y');
+    INSERT INTO t2 VALUES (2, 'a'), (3, 'b'), (4, 'c');
+    INSERT INTO t3 VALUES (2, 'p'), (3, 'q'), (4, 'r');
+    SELECT t1.a, t2.c, t3.f
+    FROM t1
+    RIGHT JOIN t2 ON t1.a = t2.c
+    JOIN t3 ON t2.c = t3.e
+    ORDER BY t2.c;
+}
+expect {
+    2|2|p
+    |3|q
+    |4|r
+}
+
+# LEFT JOIN where WHERE clause filters NULLs from right table.
+# This effectively converts the LEFT JOIN to an INNER JOIN.
+test left-join-where-filters-to-inner {
+    CREATE TABLE t1(a, b);
+    CREATE TABLE t2(c, d);
+    INSERT INTO t1 VALUES (1, 'x'), (2, 'y'), (3, 'z');
+    INSERT INTO t2 VALUES (1, 'a'), (3, 'c');
+    SELECT t1.a, t2.d
+    FROM t1 LEFT JOIN t2 ON t1.a = t2.c
+    WHERE t2.d IS NOT NULL
+    ORDER BY t1.a;
+}
+expect {
+    1|a
+    3|c
+}
+
+# LEFT JOIN with ORDER BY on the nullable (right) table column.
+# NULLs should sort first in ASC order.
+test left-join-order-by-nullable-column {
+    CREATE TABLE t1(a, b);
+    CREATE TABLE t2(c, d);
+    INSERT INTO t1 VALUES (1, 'x'), (2, 'y'), (3, 'z');
+    INSERT INTO t2 VALUES (1, 'alpha'), (3, 'gamma');
+    SELECT t1.a, t2.d
+    FROM t1 LEFT JOIN t2 ON t1.a = t2.c
+    ORDER BY t2.d;
+}
+expect {
+    2|
+    1|alpha
+    3|gamma
+}
+
+# Both tables completely empty.
+test full-outer-join-both-empty {
+    CREATE TABLE t1(a, b);
+    CREATE TABLE t2(c, d);
+    SELECT t1.a, t2.c FROM t1 FULL OUTER JOIN t2 ON t1.a = t2.c;
+}
+expect {
+}
+
+# FULL OUTER with LIMIT — ensures unmatched scan respects LIMIT.
+test full-outer-join-with-limit {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b);
+    INSERT INTO t1 VALUES (1), (2), (3), (4), (5);
+    INSERT INTO t2 VALUES (3), (6), (7), (8), (9);
+    SELECT coalesce(t1.a, t2.b) as k FROM t1 FULL OUTER JOIN t2 ON t1.a = t2.b ORDER BY k LIMIT 3;
+}
+expect {
+    1
+    2
+    3
+}
+
+# Composite join keys with partial NULLs — only full key match should join.
+test full-outer-join-composite-keys {
+    CREATE TABLE t1(a, b, v);
+    CREATE TABLE t2(c, d, w);
+    INSERT INTO t1 VALUES (1, 10, 'x'), (2, NULL, 'y'), (3, 30, 'z');
+    INSERT INTO t2 VALUES (1, 10, 'a'), (2, 20, 'b'), (3, NULL, 'c');
+    SELECT t1.a, t1.b, t2.c, t2.d
+    FROM t1 FULL OUTER JOIN t2 ON t1.a = t2.c AND t1.b = t2.d
+    ORDER BY coalesce(t1.a, t2.c), coalesce(t1.b, t2.d);
+}
+expect {
+    1|10|1|10
+    2|||
+    ||2|20
+    ||3|
+    3|30||
+}
+
+# Expression in ON clause (not just column = column).
+test full-outer-join-expression-in-on {
+    CREATE TABLE t1(a, b);
+    CREATE TABLE t2(c, d);
+    INSERT INTO t1 VALUES (1, 'x'), (2, 'y'), (3, 'z');
+    INSERT INTO t2 VALUES (2, 'a'), (4, 'b');
+    SELECT t1.a, t2.c FROM t1 FULL OUTER JOIN t2 ON t1.a + 1 = t2.c + 0
+    ORDER BY coalesce(t1.a, t2.c);
+}
+expect {
+    1|2
+    2|
+    3|4
+}
+
+# NULL key on probe side only — should appear as unmatched probe row.
+test full-outer-join-null-probe-key {
+    CREATE TABLE t1(a, b);
+    CREATE TABLE t2(c, d);
+    INSERT INTO t1 VALUES (1, 'x'), (2, 'y');
+    INSERT INTO t2 VALUES (1, 'a'), (NULL, 'b');
+    SELECT t1.a, t2.c, t2.d FROM t1 FULL OUTER JOIN t2 ON t1.a = t2.c
+    ORDER BY coalesce(t1.a, 999), t2.d;
+}
+expect {
+    1|1|a
+    2||
+    ||b
+}
+
+# Large duplicate keys on both sides — stress test for matched_bits.
+test full-outer-join-many-duplicates {
+    CREATE TABLE t1(a, b);
+    CREATE TABLE t2(c, d);
+    INSERT INTO t1 SELECT 1, 'L' || value FROM generate_series(1, 20);
+    INSERT INTO t2 SELECT 1, 'R' || value FROM generate_series(1, 20);
+    INSERT INTO t1 VALUES (2, 'solo-left');
+    INSERT INTO t2 VALUES (3, 'solo-right');
+    SELECT count(*), count(t2.c), count(t1.a) FROM t1 FULL OUTER JOIN t2 ON t1.a = t2.c;
+}
+expect {
+    402|401|401
+}
+
+# WHERE clause references both build and probe columns on unmatched rows.
+# Unmatched build rows have NULL probe; WHERE must evaluate correctly.
+test full-outer-join-where-references-both {
+    CREATE TABLE t1(a, b);
+    CREATE TABLE t2(c, d);
+    INSERT INTO t1 VALUES (1, 'x'), (2, 'y'), (3, 'z');
+    INSERT INTO t2 VALUES (2, 'a'), (4, 'b'), (5, 'c');
+    SELECT t1.a, t2.c
+    FROM t1 FULL OUTER JOIN t2 ON t1.a = t2.c
+    WHERE coalesce(t1.a, 0) + coalesce(t2.c, 0) <= 4
+    ORDER BY coalesce(t1.a, t2.c);
+}
+expect {
+    1|
+    2|2
+    3|
+    |4
+}
+
+# Self-join with FULL OUTER is unsupported (same root page).
+test full-outer-self-join-errors {
+    CREATE TABLE t1(a, b);
+    SELECT a.a, b.a FROM t1 a FULL OUTER JOIN t1 b ON a.a = b.a;
+}
+expect error {
+    FULL OUTER JOIN requires an equality condition in the ON clause
+}
+
+# FULL OUTER with GROUP BY and HAVING.
+test full-outer-join-group-by-having {
+    CREATE TABLE t1(a, v);
+    CREATE TABLE t2(b, w);
+    INSERT INTO t1 VALUES (1, 10), (1, 20), (2, 30), (3, 40);
+    INSERT INTO t2 VALUES (1, 100), (4, 200), (4, 300);
+    SELECT coalesce(t1.a, t2.b) as key, count(*) as cnt, sum(coalesce(t1.v, 0)) as sv
+    FROM t1 FULL OUTER JOIN t2 ON t1.a = t2.b
+    GROUP BY key
+    HAVING cnt > 1
+    ORDER BY key;
+}
+expect {
+    1|2|30
+    4|2|0
+}
+
+# FULL OUTER with aggregate functions that differentiate NULL from no-row.
+test full-outer-join-sum-with-nulls {
+    CREATE TABLE t1(a, val);
+    CREATE TABLE t2(b, val);
+    INSERT INTO t1 VALUES (1, 10), (2, 20), (3, 30);
+    INSERT INTO t2 VALUES (2, 200), (4, 400);
+    SELECT sum(t1.val) as s1, sum(t2.val) as s2,
+           sum(coalesce(t1.val, 0) + coalesce(t2.val, 0)) as combined
+    FROM t1 FULL OUTER JOIN t2 ON t1.a = t2.b;
+}
+expect {
+    60|600|660
+}
+
+# RIGHT JOIN with NULL keys — NULLs should appear on the preserved side.
+test right-join-null-keys {
+    CREATE TABLE t1(a, b);
+    CREATE TABLE t2(c, d);
+    INSERT INTO t1 VALUES (1, 'x'), (NULL, 'y');
+    INSERT INTO t2 VALUES (1, 'a'), (2, 'b'), (NULL, 'c');
+    SELECT t1.a, t1.b, t2.c, t2.d
+    FROM t1 RIGHT JOIN t2 ON t1.a = t2.c
+    ORDER BY t2.c, t2.d;
+}
+expect {
+    |||c
+    1|x|1|a
+    ||2|b
+}
+
+# Verify FULL OUTER correctness: count should equal
+# left_count + unmatched_right_count.
+test full-outer-join-count-verification {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b);
+    INSERT INTO t1 SELECT value FROM generate_series(1, 50);
+    INSERT INTO t2 SELECT value FROM generate_series(30, 70);
+    SELECT count(*), count(t1.a), count(t2.b)
+    FROM t1 FULL OUTER JOIN t2 ON t1.a = t2.b;
+}
+expect {
+    70|50|41
+}
+
+# FULL OUTER with OFFSET (not just LIMIT).
+test full-outer-join-with-offset {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b);
+    INSERT INTO t1 VALUES (1), (2), (3);
+    INSERT INTO t2 VALUES (2), (4), (5);
+    SELECT coalesce(t1.a, t2.b) as k FROM t1 FULL OUTER JOIN t2 ON t1.a = t2.b ORDER BY k LIMIT 2 OFFSET 2;
+}
+expect {
+    3
+    4
+}
+
+# Three-way FULL OUTER JOIN chain is not yet supported — the second
+# FULL OUTER's build table has join_info.outer from the first join,
+# which we currently disallow. Verify we return a useful error.
+@skip-if sqlite "supported in sqlite"
+test three-way-full-outer-join-errors {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b);
+    CREATE TABLE t3(c);
+    SELECT t1.a, t2.b, t3.c
+    FROM t1
+    FULL OUTER JOIN t2 ON t1.a = t2.b
+    FULL OUTER JOIN t3 ON t2.b = t3.c;
+}
+expect error {
+    FULL OUTER JOIN requires an equality condition in the ON clause
+}
+
+# FULL OUTER with a large number of matched and unmatched rows to stress-test
+# that matched_bits tracking survives across many entries.
+test full-outer-join-stress-matched-bits {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b);
+    INSERT INTO t1 SELECT value FROM generate_series(1, 200);
+    INSERT INTO t2 SELECT value * 2 FROM generate_series(1, 200);
+    SELECT count(*), count(t1.a), count(t2.b)
+    FROM t1 FULL OUTER JOIN t2 ON t1.a = t2.b;
+}
+expect {
+    300|200|200
+}
