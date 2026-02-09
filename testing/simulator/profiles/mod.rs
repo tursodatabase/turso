@@ -70,6 +70,7 @@ impl Profile {
                         insert: InsertOpts {
                             min_rows: NonZeroU32::new(5).unwrap(),
                             max_rows: NonZeroU32::new(11).unwrap(),
+                            ..Default::default()
                         },
                         ..Default::default()
                     },
@@ -107,6 +108,7 @@ impl Profile {
                         insert: InsertOpts {
                             min_rows: NonZeroU32::new(50).unwrap(),
                             max_rows: NonZeroU32::new(200).unwrap(),
+                            ..Default::default()
                         },
                         update: UpdateOpts {
                             padding_size: Some(20_000),
