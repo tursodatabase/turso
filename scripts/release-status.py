@@ -2,12 +2,12 @@
 """Generate a Slack-friendly release status summary for a GitHub milestone."""
 
 import argparse
-from datetime import date
 import json
 import os
 import subprocess
 import sys
-from urllib.request import urlopen, Request
+from datetime import date
+from urllib.request import Request, urlopen
 
 
 def gh_api(endpoint):
@@ -43,18 +43,18 @@ def get_linked_prs(issue_numbers):
     for i in range(0, len(issue_numbers), 50):
         chunk = issue_numbers[i:i + 50]
         fields = "\n".join(
-            f'i{n}: issue(number: {n}) {{'
-            f'  number'
-            f'  timelineItems(itemTypes: [CROSS_REFERENCED_EVENT], first: 10) {{'
-            f'    nodes {{'
-            f'      ... on CrossReferencedEvent {{'
-            f'        source {{'
-            f'          ... on PullRequest {{ number url state }}'
-            f'        }}'
-            f'      }}'
-            f'    }}'
-            f'  }}'
-            f'}}'
+            f"i{n}: issue(number: {n}) {{"
+            f"  number"
+            f"  timelineItems(itemTypes: [CROSS_REFERENCED_EVENT], first: 10) {{"
+            f"    nodes {{"
+            f"      ... on CrossReferencedEvent {{"
+            f"        source {{"
+            f"          ... on PullRequest {{ number url state }}"
+            f"        }}"
+            f"      }}"
+            f"    }}"
+            f"  }}"
+            f"}}"
             for n in chunk
         )
         query = f'{{ repository(owner: "tursodatabase", name: "turso") {{ {fields} }} }}'
@@ -79,7 +79,7 @@ def get_linked_prs(issue_numbers):
 
 
 def format_issue(issue, linked_prs):
-    labels = [l["name"] for l in issue["labels"]]
+    labels = [lbl["name"] for lbl in issue["labels"]]
     assignees = [a["login"] for a in issue["assignees"]]
 
     url = issue["html_url"]
@@ -117,6 +117,47 @@ def post_message(token, channel, text, thread_ts=None):
     return slack_api(token, "chat.postMessage", payload)
 
 
+def categorize_issues(open_issues):
+    high_priority = []
+    bugs = []
+    features = []
+    other = []
+    for issue in open_issues:
+        labels = {lbl["name"] for lbl in issue["labels"]}
+        if "high priority" in labels:
+            high_priority.append(issue)
+        elif "bug" in labels:
+            bugs.append(issue)
+        elif "enhancement" in labels or "feature" in labels:
+            features.append(issue)
+        else:
+            other.append(issue)
+    return high_priority, bugs, features, other
+
+
+def build_category_messages(high_priority, bugs, features, other,
+                            closed_issues, show_closed, linked_prs):
+    categories = []
+    groups = [
+        (high_priority, ":rotating_light: *High Priority"),
+        (bugs, ":bug: *Bugs"),
+        (features, ":sparkles: *Features/Enhancements"),
+        (other, ":clipboard: *Other"),
+    ]
+    for items, label in groups:
+        if items:
+            lines = [f"{label} ({len(items)})*"]
+            for issue in items:
+                lines.append(format_issue(issue, linked_prs))
+            categories.append("\n".join(lines))
+    if show_closed and closed_issues:
+        lines = [f":white_check_mark: *Closed ({len(closed_issues)})*"]
+        for issue in closed_issues:
+            lines.append(format_issue(issue, linked_prs))
+        categories.append("\n".join(lines))
+    return categories
+
+
 def main():
     parser = argparse.ArgumentParser(description="Release status for a GitHub milestone")
     parser.add_argument("milestone", help="Milestone title (e.g. '0.5')")
@@ -146,22 +187,7 @@ def main():
     open_issues = [i for i in open_issues if "pull_request" not in i]
     closed_issues = [i for i in closed_issues if "pull_request" not in i]
 
-    # Group open issues by label
-    high_priority = []
-    bugs = []
-    features = []
-    other = []
-
-    for issue in open_issues:
-        labels = {l["name"] for l in issue["labels"]}
-        if "high priority" in labels:
-            high_priority.append(issue)
-        elif "bug" in labels:
-            bugs.append(issue)
-        elif "enhancement" in labels or "feature" in labels:
-            features.append(issue)
-        else:
-            other.append(issue)
+    high_priority, bugs, features, other = categorize_issues(open_issues)
 
     # Fetch linked PRs for all open issues
     all_issue_numbers = [i["number"] for i in open_issues]
@@ -173,7 +199,10 @@ def main():
     no_pr = [i for i in open_issues if i["number"] not in linked_prs]
 
     # Progress bar
-    total = len(open_issues) + len(closed_issues) if args.closed else milestone["open_issues"] + milestone["closed_issues"]
+    if args.closed:
+        total = len(open_issues) + len(closed_issues)
+    else:
+        total = milestone["open_issues"] + milestone["closed_issues"]
     n_closed = milestone["closed_issues"]
     n_has_pr = len(has_pr)
     n_no_pr = len(no_pr)
@@ -201,37 +230,10 @@ def main():
         header_lines.append(f"Due: {milestone['due_on'][:10]}")
     header = "\n".join(header_lines)
 
-    # Build category messages (thread replies)
-    categories = []
-    if high_priority:
-        lines = [f":rotating_light: *High Priority ({len(high_priority)})*"]
-        for issue in high_priority:
-            lines.append(format_issue(issue, linked_prs))
-        categories.append("\n".join(lines))
-
-    if bugs:
-        lines = [f":bug: *Bugs ({len(bugs)})*"]
-        for issue in bugs:
-            lines.append(format_issue(issue, linked_prs))
-        categories.append("\n".join(lines))
-
-    if features:
-        lines = [f":sparkles: *Features/Enhancements ({len(features)})*"]
-        for issue in features:
-            lines.append(format_issue(issue, linked_prs))
-        categories.append("\n".join(lines))
-
-    if other:
-        lines = [f":clipboard: *Other ({len(other)})*"]
-        for issue in other:
-            lines.append(format_issue(issue, linked_prs))
-        categories.append("\n".join(lines))
-
-    if args.closed and closed_issues:
-        lines = [f":white_check_mark: *Closed ({len(closed_issues)})*"]
-        for issue in closed_issues:
-            lines.append(format_issue(issue, linked_prs))
-        categories.append("\n".join(lines))
+    categories = build_category_messages(
+        high_priority, bugs, features, other,
+        closed_issues, args.closed, linked_prs
+    )
 
     if args.post:
         resp = post_message(token, channel, header)
