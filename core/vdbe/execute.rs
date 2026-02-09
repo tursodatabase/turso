@@ -5764,7 +5764,7 @@ pub fn op_function(
                     };
 
                     let new_tbl_name = if tbl_name == rename_from {
-                        rename_to
+                        rename_to.clone()
                     } else {
                         tbl_name
                     };
@@ -10234,16 +10234,6 @@ pub fn op_rename_table(
                     }
                 }
 
-                // Update table-qualified refs in CHECK constraint expressions
-                for check in &mut btree.check_constraints {
-                    rewrite_check_expr_table_refs(
-                        &mut check.expr,
-                        &normalized_from,
-                        &normalized_to,
-                    );
-                    check.sql = format!("CHECK({})", &check.expr);
-                }
-
                 normalized_to.clone_into(&mut btree.name);
             }
             Table::Virtual(vtab) => {
@@ -10414,7 +10404,7 @@ pub fn op_add_column(
         let btree = Arc::make_mut(btree);
         btree.columns.push((**column).clone());
         // Update CHECK constraints to include any constraints from the new column
-        btree.check_constraints = check_constraints.clone();
+        btree.check_constraints.clone_from(check_constraints);
     });
 
     state.pc += 1;
@@ -10503,10 +10493,10 @@ pub fn op_alter_column(
         let old_col_normalized = normalize_ident(&old_column_name);
         for check in &mut btree.check_constraints {
             rewrite_check_expr_column_refs(&mut check.expr, &old_col_normalized, &new_name);
-            check.sql = format!("CHECK ({})", check.expr);
+            check.sql = format!("CHECK({})", check.expr);
             if let Some(ref mut col) = check.column {
                 if col.eq_ignore_ascii_case(&old_column_name) {
-                    *col = new_name.clone();
+                    col.clone_from(&new_name);
                 }
             }
         }
