@@ -163,7 +163,7 @@ namespace turso
                 sync_config.path = normalizedPath.c_str();
 
                 // remoteUrl (optional)
-                static std::string remoteUrl;
+                std::string remoteUrl;
                 if (syncConfigObj.hasProperty(rt, "remoteUrl"))
                 {
                     jsi::Value remoteUrlVal = syncConfigObj.getProperty(rt, "remoteUrl");
@@ -183,7 +183,7 @@ namespace turso
                 }
 
                 // clientName (optional)
-                static std::string clientName;
+                std::string clientName;
                 if (syncConfigObj.hasProperty(rt, "clientName"))
                 {
                     jsi::Value clientNameVal = syncConfigObj.getProperty(rt, "clientName");
@@ -274,7 +274,7 @@ namespace turso
                     sync_config.partial_bootstrap_strategy_prefix = 0;
                 }
 
-                static std::string partialBootstrapStrategyQuery;
+                std::string partialBootstrapStrategyQuery;
                 if (syncConfigObj.hasProperty(rt, "partialBootstrapStrategyQuery"))
                 {
                     jsi::Value queryVal = syncConfigObj.getProperty(rt, "partialBootstrapStrategyQuery");
@@ -328,7 +328,7 @@ namespace turso
                 }
 
                 // Remote encryption options
-                static std::string remoteEncryptionKey;
+                std::string remoteEncryptionKey;
                 if (syncConfigObj.hasProperty(rt, "remoteEncryptionKey"))
                 {
                     jsi::Value keyVal = syncConfigObj.getProperty(rt, "remoteEncryptionKey");
@@ -347,7 +347,7 @@ namespace turso
                     sync_config.remote_encryption_key = nullptr;
                 }
 
-                static std::string remoteEncryptionCipher;
+                std::string remoteEncryptionCipher;
                 if (syncConfigObj.hasProperty(rt, "remoteEncryptionCipher"))
                 {
                     jsi::Value cipherVal = syncConfigObj.getProperty(rt, "remoteEncryptionCipher");
@@ -409,8 +409,7 @@ namespace turso
 
                 jsi::Object options = args[0].asObject(rt);
 
-                // Store log level in a static variable to ensure lifetime
-                static std::string logLevelStr;
+                std::string logLevelStr;
 
                 // Get log level if provided
                 if (options.hasProperty(rt, "logLevel"))
