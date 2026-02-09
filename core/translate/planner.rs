@@ -1488,6 +1488,16 @@ fn parse_join(
                 // RIGHT JOIN -> swap last two table entries, treat as LEFT JOIN.
                 // The rightmost table (just added) becomes the left side, and vice versa.
                 let len = table_references.joined_tables().len();
+                // The swap is only correct when the two tables being swapped are
+                // the only tables in the FROM clause. When prior joins exist
+                // (len > 2), swapping would move tables to positions where their
+                // ON clause conditions reference tables that haven't been scanned.
+                if len > 2 {
+                    crate::bail_parse_error!(
+                        "RIGHT JOIN following another join is not yet supported. \
+                         Try rewriting as LEFT JOIN or using a subquery."
+                    );
+                }
                 table_references.joined_tables_mut().swap(len - 2, len - 1);
                 // The outer flag goes on the table that was originally on the left
                 // (now in the rightmost position after swap), this is correct because

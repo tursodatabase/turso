@@ -1685,7 +1685,12 @@ pub fn open_loop(
                     });
                 }
 
-                if payload_info.use_bloom_filter {
+                // Bloom filter skips probe rows that definitely won't match. For
+                // FULL OUTER joins those rows still need to be emitted with NULLs
+                // for the build side, so we must not short-circuit to `next`.
+                if payload_info.use_bloom_filter
+                    && hash_join_op.join_type != HashJoinType::FullOuter
+                {
                     program.emit_insn(Insn::Filter {
                         cursor_id: payload_info.bloom_filter_cursor_id,
                         target_pc: next,
