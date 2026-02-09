@@ -12,8 +12,33 @@ runs:
         export SCCACHE_GHA_ENABLED=true
         if sccache -s >/dev/null 2>&1; then
           echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
-          echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
-          echo "sccache is available and configured"
+
+          # Use a wrapper script instead of sccache directly as RUSTC_WRAPPER.
+          # This handles transient network failures (e.g. DNS errors to Azure
+          # Blob Storage) that occur *during* the build, after the health check
+          # above has already passed. If sccache fails, the wrapper falls back
+          # to invoking rustc directly so the build still succeeds.
+          WRAPPER="${RUNNER_TEMP}/sccache-wrapper.sh"
+          cat > "$WRAPPER" << 'SCRIPT'
+#!/usr/bin/env bash
+sccache "$@"
+ret=$?
+if [ $ret -eq 0 ]; then
+  exit 0
+fi
+# sccache wraps rustc and forwards its exit code on compilation errors,
+# so a non-zero exit may be a real rustc error, not an sccache issue.
+# We only retry without sccache if the server itself failed to start
+# (exit code 2 from sccache).
+if [ $ret -eq 2 ]; then
+  echo "::warning::sccache server failed, falling back to direct rustc" >&2
+  exec "$@"
+fi
+exit $ret
+SCRIPT
+          chmod +x "$WRAPPER"
+          echo "RUSTC_WRAPPER=${WRAPPER}" >> "$GITHUB_ENV"
+          echo "sccache is available and configured (with fallback wrapper)"
         else
           echo "::warning::sccache cache service is unavailable, building without cache"
         fi
