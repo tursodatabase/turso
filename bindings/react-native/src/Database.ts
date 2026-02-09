@@ -121,7 +121,7 @@ export class Database {
 
     const dbConfig = {
       path: this._opts.path,
-      async_io: true, // Always use async IO in React Native
+      async_io: false, // use blocking IO for local database
     };
 
     // Create native database (path normalization happens in C++ JSI layer)
@@ -153,7 +153,7 @@ export class Database {
     // Build dbConfig (path normalization happens in C++ JSI layer)
     const dbConfig = {
       path: this._opts.path,
-      async_io: true, // Always use async IO in React Native
+      async_io: true, // use async IO for synced database as we have network IO loop externally from the turso core
     };
 
     // Calculate reserved bytes from cipher
