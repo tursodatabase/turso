@@ -999,3 +999,209 @@ test full-outer-join-stress-matched-bits {
 expect {
     300|200|200
 }
+
+# ============================================================
+# Mixed join type chains and additional complex patterns
+# ============================================================
+
+# RIGHT JOIN followed by LEFT JOIN chain.
+test right-then-left-chain {
+    CREATE TABLE t1(a, b);
+    CREATE TABLE t2(c, d);
+    CREATE TABLE t3(e, f);
+    INSERT INTO t1 VALUES (1, 'x'), (2, 'y');
+    INSERT INTO t2 VALUES (2, 'a'), (3, 'b');
+    INSERT INTO t3 VALUES (1, 'p'), (3, 'q');
+    SELECT t1.a, t2.c, t3.e
+    FROM t1
+    RIGHT JOIN t2 ON t1.a = t2.c
+    LEFT JOIN t3 ON t2.c = t3.e
+    ORDER BY t2.c;
+}
+expect {
+    2|2|
+    |3|3
+}
+
+# LEFT JOIN then FULL OUTER should error — build table has join_info.outer
+# from the LEFT JOIN.
+@skip-if sqlite "supported in sqlite"
+test left-then-full-outer-chain-errors {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b);
+    CREATE TABLE t3(c);
+    SELECT t1.a, t2.b, t3.c
+    FROM t1
+    LEFT JOIN t2 ON t1.a = t2.b
+    FULL OUTER JOIN t3 ON t2.b = t3.c;
+}
+expect error {
+    FULL OUTER JOIN chaining is not yet supported
+}
+
+# RIGHT JOIN then FULL OUTER should also error — after RIGHT is rewritten
+# as LEFT, the build table has join_info.outer.
+@skip-if sqlite "supported in sqlite"
+test right-then-full-outer-chain-errors {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b);
+    CREATE TABLE t3(c);
+    SELECT t1.a, t2.b, t3.c
+    FROM t1
+    RIGHT JOIN t2 ON t1.a = t2.b
+    FULL OUTER JOIN t3 ON t2.b = t3.c;
+}
+expect error {
+    FULL OUTER JOIN chaining is not yet supported
+}
+
+# RIGHT JOIN with aggregate functions and NULL propagation.
+test right-join-aggregate-counts {
+    CREATE TABLE t1(a, v);
+    CREATE TABLE t2(b, w);
+    INSERT INTO t1 VALUES (1, 10), (2, 20), (3, 30);
+    INSERT INTO t2 VALUES (2, 200), (4, 400), (5, 500);
+    SELECT count(*), count(t1.a), count(t2.b), sum(coalesce(t1.v, 0)), sum(t2.w)
+    FROM t1 RIGHT JOIN t2 ON t1.a = t2.b;
+}
+expect {
+    3|1|3|20|1100
+}
+
+# FULL OUTER with CASE WHEN expressions in select list.
+test full-outer-case-expressions {
+    CREATE TABLE t1(a, b);
+    CREATE TABLE t2(c, d);
+    INSERT INTO t1 VALUES (1, 'x'), (2, 'y'), (3, 'z');
+    INSERT INTO t2 VALUES (2, 'a'), (4, 'b');
+    SELECT
+        CASE WHEN t1.a IS NOT NULL AND t2.c IS NOT NULL THEN 'both'
+             WHEN t1.a IS NOT NULL THEN 'left-only'
+             ELSE 'right-only' END as side,
+        coalesce(t1.a, t2.c) as key
+    FROM t1 FULL OUTER JOIN t2 ON t1.a = t2.c
+    ORDER BY key;
+}
+expect {
+    left-only|1
+    both|2
+    left-only|3
+    right-only|4
+}
+
+# FULL OUTER with DISTINCT.
+test full-outer-join-distinct {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b);
+    INSERT INTO t1 VALUES (1), (2), (2), (3);
+    INSERT INTO t2 VALUES (2), (4), (4);
+    SELECT DISTINCT coalesce(t1.a, t2.b) as k
+    FROM t1 FULL OUTER JOIN t2 ON t1.a = t2.b
+    ORDER BY k;
+}
+expect {
+    1
+    2
+    3
+    4
+}
+
+# RIGHT JOIN with WHERE filtering NULL rows from left side —
+# effectively converts to INNER JOIN.
+test right-join-where-filters-nulls {
+    CREATE TABLE t1(a, b);
+    CREATE TABLE t2(c, d);
+    INSERT INTO t1 VALUES (1, 'x'), (2, 'y');
+    INSERT INTO t2 VALUES (2, 'a'), (3, 'b'), (4, 'c');
+    SELECT t1.a, t2.c, t2.d
+    FROM t1 RIGHT JOIN t2 ON t1.a = t2.c
+    WHERE t1.a IS NOT NULL
+    ORDER BY t2.c;
+}
+expect {
+    2|2|a
+}
+
+# INNER JOIN then FULL OUTER JOIN — the optimizer must find a valid ordering
+# where the build table for the FULL OUTER has an equi-join with the probe.
+test inner-then-full-outer-join {
+    CREATE TABLE t1(a, b);
+    CREATE TABLE t2(c, d);
+    CREATE TABLE t3(e, f);
+    INSERT INTO t1 VALUES (1, 'x'), (2, 'y'), (3, 'z');
+    INSERT INTO t2 VALUES (1, 'a'), (2, 'b');
+    INSERT INTO t3 VALUES (2, 'p'), (4, 'q');
+    SELECT t1.a, t2.c, t3.e
+    FROM t1
+    JOIN t2 ON t1.a = t2.c
+    FULL OUTER JOIN t3 ON t2.c = t3.e
+    ORDER BY coalesce(t2.c, t3.e);
+}
+expect {
+    1|1|
+    2|2|2
+    ||4
+}
+
+# RIGHT JOIN following another join is not supported — the table swap
+# would corrupt prior ON clause references.
+@skip-if sqlite "supported in sqlite"
+test left-then-right-join-chain-errors {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b);
+    CREATE TABLE t3(c);
+    SELECT t1.a, t2.b, t3.c
+    FROM t1
+    LEFT JOIN t2 ON t1.a = t2.b
+    RIGHT JOIN t3 ON t2.b = t3.c;
+}
+expect error {
+    RIGHT JOIN following another join is not yet supported
+}
+
+@skip-if sqlite "supported in sqlite"
+test right-then-right-join-chain-errors {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b);
+    CREATE TABLE t3(c);
+    SELECT t1.a, t2.b, t3.c
+    FROM t1
+    RIGHT JOIN t2 ON t1.a = t2.b
+    RIGHT JOIN t3 ON t2.b = t3.c;
+}
+expect error {
+    RIGHT JOIN following another join is not yet supported
+}
+
+# FULL OUTER then RIGHT JOIN should also error — RIGHT after FULL OUTER
+# means len > 2 at the time of the RIGHT JOIN swap.
+@skip-if sqlite "supported in sqlite"
+test full-outer-then-right-join-errors {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b);
+    CREATE TABLE t3(c);
+    SELECT t1.a, t2.b, t3.c
+    FROM t1
+    FULL OUTER JOIN t2 ON t1.a = t2.b
+    RIGHT JOIN t3 ON t2.b = t3.c;
+}
+expect error {
+    RIGHT JOIN following another join is not yet supported
+}
+
+# FULL OUTER where ON condition uses expressions on both sides.
+test full-outer-join-expr-both-sides-on {
+    CREATE TABLE t1(a, b);
+    CREATE TABLE t2(c, d);
+    INSERT INTO t1 VALUES (1, 10), (2, 20), (3, 30);
+    INSERT INTO t2 VALUES (12, 'x'), (22, 'y'), (50, 'z');
+    SELECT t1.a, t2.c
+    FROM t1 FULL OUTER JOIN t2 ON t1.a * 10 + 2 = t2.c
+    ORDER BY coalesce(t1.a, 0), coalesce(t2.c, 0);
+}
+expect {
+    |50
+    1|12
+    2|22
+    3|
+}
