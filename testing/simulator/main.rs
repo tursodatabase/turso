@@ -201,43 +201,6 @@ fn run_simulator(
     env.clear_poison();
     plan.clear_poison();
 
-    // Check for crash recovery before processing the result
-    let result = {
-        let mut env_guard = env.lock().unwrap();
-        if matches!(&result, SandboxedResult::Panicked { .. }) && env_guard.has_crashed() {
-            if cli_opts.crash_dump {
-                tracing::info!(
-                    "Crash detected, dumping db/wal files for inspection (--crash-dump)..."
-                );
-                env_guard.persist_crash_files().unwrap_or_else(|e| {
-                    tracing::error!("Failed to persist crash files: {}", e);
-                });
-                std::process::exit(0);
-            }
-            tracing::info!("Panic was caused by crash injection, attempting recovery...");
-            match env_guard.attempt_crash_recovery() {
-                Ok(()) => {
-                    tracing::info!("Crash recovery succeeded!");
-                    println!("Crash recovery: integrity_check passed");
-                    SandboxedResult::Correct
-                }
-                Err(e) => {
-                    tracing::error!("Crash recovery failed: {}", e);
-                    // Keep original panic result with recovery failure info
-                    SandboxedResult::Panicked {
-                        error: e.to_string(),
-                        last_execution: match &result {
-                            SandboxedResult::Panicked { last_execution, .. } => *last_execution,
-                            _ => unreachable!(),
-                        },
-                    }
-                }
-            }
-        } else {
-            result
-        }
-    };
-
     let env = env.lock().unwrap();
     let plan = plan.lock().unwrap();
 

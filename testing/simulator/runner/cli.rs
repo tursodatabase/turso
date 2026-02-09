@@ -143,6 +143,12 @@ pub struct SimulatorCLI {
     pub disable_union_all_preserves_cardinality: bool,
     #[clap(long, help = "disable FsyncNoWait Property", default_value_t = true)]
     pub disable_fsync_no_wait: bool,
+    #[clap(
+        long,
+        help = "disable CrashAfterWalSyncDoesNotLoseData Property",
+        default_value_t = false
+    )]
+    pub disable_crash_after_wal_sync: bool,
     #[clap(long, help = "disable FaultyQuery Property")]
     pub disable_faulty_query: bool,
     #[clap(long, help = "disable Reopen-Database fault")]
@@ -163,12 +169,6 @@ pub struct SimulatorCLI {
     pub keep_files: bool,
     #[clap(
         long,
-        help = "On crash, persist db/wal files and exit without recovery (for manual inspection)",
-        default_value_t = false
-    )]
-    pub crash_dump: bool,
-    #[clap(
-        long,
         help = "Disable the SQLite integrity check at the end of a simulation",
         default_value_t = normal_or_miri(false, true)
     )]
@@ -183,10 +183,6 @@ pub struct SimulatorCLI {
     #[clap(long, default_value_t = ProfileType::Default)]
     /// Profile selector for Simulation run
     pub profile: ProfileType,
-
-    #[clap(long)]
-    #[serde(default)]
-    pub crash_fuzz: bool,
 }
 
 #[derive(Parser, Debug, Clone, Serialize, Deserialize, PartialEq, PartialOrd, Eq, Ord)]

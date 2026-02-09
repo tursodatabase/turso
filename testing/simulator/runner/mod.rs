@@ -18,17 +18,12 @@ pub const FAULT_ERROR_MSG: &str = "Injected Fault";
 pub enum DurableIOEvent {
     Sync {
         file_path: String,
-        /// True if file had content before sync (for WAL: had frames). else false.
-        had_content: bool,
-        durable_size: usize,
-    },
-    TruncateSynced {
-        file_path: String,
-        new_len: usize,
+        /// Durable size before the sync.
+        prev_durable_size: usize,
+        /// Durable size after the sync.
+        new_durable_size: usize,
     },
 }
-
-pub const WAL_HEADER_SIZE: usize = 32;
 
 /// turso have no shm - todo when we support it
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,15 +56,11 @@ pub trait SimIO: turso_core::IO {
 
     fn persist_files(&self) -> anyhow::Result<()>;
 
-    fn has_crashed(&self) -> bool {
-        false
-    }
-
-    /// after this, only durable data remains. Default: no-op.
-    fn discard_all_pending(&self) {}
-
     /// this provides precise tracking of what data is durable after each IO operation.
     fn take_durable_events(&self) -> Vec<DurableIOEvent> {
         Vec::new()
     }
+
+    
+    fn simulate_power_loss(&self) {}
 }

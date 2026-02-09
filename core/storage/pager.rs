@@ -1436,8 +1436,11 @@ impl Pager {
         self.init_page_1.clone()
     }
 
-    /// Sync main database file to disk after writing page 1.
-    pub fn sync_db_file(&self) -> Result<Completion> {
+    /// Begin syncing the main database file to disk.
+    ///
+    /// This is used for durability invariants where we must ensure the DB file
+    /// is durable before proceeding (e.g. after writing page 1 during initialization).
+    fn begin_sync_db_file(&self) -> Result<Completion> {
         sqlite3_ondisk::begin_sync(
             self.db_file.as_ref(),
             self.syncing.clone(),
@@ -4051,7 +4054,14 @@ impl Pager {
             AllocatePage1State::Writing { page } => {
                 turso_assert!(page.is_loaded(), "page should be loaded");
                 tracing::trace!("allocate_page1(Writing done, starting sync)");
-                let c = self.sync_db_file()?;
+                let c = match self.begin_sync_db_file() {
+                    Ok(c) => c,
+                    Err(e) => {
+                        page.unpin();
+                        *self.allocate_page1_state.write() = AllocatePage1State::Done;
+                        return Err(e);
+                    }
+                };
                 *self.allocate_page1_state.write() = AllocatePage1State::Syncing {
                     page,
                     completion: c.clone(),
@@ -4059,7 +4069,13 @@ impl Pager {
                 io_yield_one!(c);
             }
             AllocatePage1State::Syncing { page, completion } => {
-                if let Some(err) = completion.get_error() {
+                if !completion.finished() {
+                    io_yield_one!(completion.clone());
+                }
+                if !completion.succeeded() {
+                    let err = completion
+                        .get_error()
+                        .expect("failed completion must have an error");
                     page.unpin();
                     *self.allocate_page1_state.write() = AllocatePage1State::Done;
                     return Err(err.into());

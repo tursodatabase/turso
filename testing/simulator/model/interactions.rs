@@ -428,6 +428,10 @@ impl Assertion {
 pub enum Fault {
     Disconnect,
     ReopenDatabase,
+    /// Simulate power loss/crash and verify durability.
+    ///
+    /// This is only for IO backends that implement `SimIO::simulate_power_loss`.
+    PowerLossRecoverAndVerify,
 }
 
 impl Display for Fault {
@@ -435,6 +439,7 @@ impl Display for Fault {
         match self {
             Fault::Disconnect => write!(f, "DISCONNECT"),
             Fault::ReopenDatabase => write!(f, "REOPEN_DATABASE"),
+            Fault::PowerLossRecoverAndVerify => write!(f, "POWER_LOSS_RECOVER_AND_VERIFY"),
         }
     }
 }
@@ -697,6 +702,16 @@ impl InteractionType {
                     }
                     Fault::ReopenDatabase => {
                         reopen_database(env);
+                    }
+                    Fault::PowerLossRecoverAndVerify => {
+                        if env.conn_in_transaction(conn_index) {
+                            env.rollback_conn(conn_index);
+                        }
+                        env.power_loss_recover_and_verify().map_err(|e| {
+                            turso_core::LimboError::InternalError(format!(
+                                "power loss recovery failed: {e}"
+                            ))
+                        })?;
                     }
                 }
                 Ok(())

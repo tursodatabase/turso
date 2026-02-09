@@ -22,7 +22,7 @@ use crate::profiles::Profile;
 use crate::runner::cli::IoBackend;
 use crate::runner::io::SimulatorIO;
 use crate::runner::memory::io::MemorySimIO;
-use crate::runner::{DurableIOEvent, FileType, SimIO, WAL_HEADER_SIZE};
+use crate::runner::{DurableIOEvent, FileType, SimIO};
 const DEFAULT_CACHE_SIZE: usize = 2000;
 use super::cli::SimulatorCLI;
 
@@ -66,18 +66,21 @@ impl DurabilityState {
         committed: &[Table],
         pending_renames: &[(String, String)],
     ) -> bool {
+        let wal_header_size = turso_core::storage::sqlite3_ondisk::WAL_HEADER_SIZE;
         let file_type = match event {
             DurableIOEvent::Sync { file_path, .. } => FileType::from_path(file_path),
-            DurableIOEvent::TruncateSynced { file_path, .. } => FileType::from_path(file_path),
         };
 
         match event {
             DurableIOEvent::Sync {
-                had_content,
-                durable_size,
+                prev_durable_size,
+                new_durable_size,
                 ..
             } => {
-                if file_type == FileType::Wal && *had_content && *durable_size > WAL_HEADER_SIZE {
+                if file_type == FileType::Wal
+                    && *new_durable_size > wal_header_size
+                    && new_durable_size != prev_durable_size
+                {
                     self.wal_durable = committed.to_vec();
                     for (old_name, new_name) in pending_renames {
                         self.renamed_tables
@@ -88,19 +91,32 @@ impl DurabilityState {
                     self.db_durable
                         .retain(|t| committed_names.contains(&t.name));
 
+                    let db_durable_names: std::collections::HashSet<_> =
+                        self.db_durable.iter().map(|t| &t.name).collect();
+                    self.renamed_tables
+                        .retain(|old_name, _| db_durable_names.contains(old_name));
+
                     tracing::info!(
                         "DURABILITY: WAL sync - {} tables WAL-durable",
                         self.wal_durable.len()
                     );
                     return true;
                 }
-            }
-            DurableIOEvent::TruncateSynced { new_len, .. } => {
-                if file_type == FileType::Wal && *new_len == 0 && !self.wal_durable.is_empty() {
+
+                // If the WAL is durably truncated to the header (or 0), treat it as a completed
+                // checkpoint. The committed state is now recoverable from the DB file alone.
+                if file_type == FileType::Wal
+                    && *prev_durable_size > wal_header_size
+                    && *new_durable_size <= wal_header_size
+                    && !self.wal_durable.is_empty()
+                {
                     let count = self.wal_durable.len();
                     self.db_durable = std::mem::take(&mut self.wal_durable);
+                    self.renamed_tables.clear();
                     tracing::info!(
-                        "DURABILITY: checkpoint complete - {} tables DB-durable",
+                        "DURABILITY: checkpoint complete (wal_durable_size={} -> {}) - {} tables DB-durable",
+                        prev_durable_size,
+                        new_durable_size,
                         count
                     );
                 }
@@ -110,7 +126,6 @@ impl DurabilityState {
     }
 
     /// Returns tables that should be recoverable after crash/power-loss.
-    /// On recovery, WAL frames are replayed over DB.
     pub fn expected_recoverable(&self) -> Vec<Table> {
         use std::collections::HashSet;
 
@@ -822,12 +837,7 @@ impl SimulatorEnv {
         self.rng = ChaCha8Rng::seed_from_u64(self.opts.seed);
 
         let latency_prof = &self.profile.io.latency;
-        let crash_config = (self.opts.crash_at_io_op > 0).then_some(self.opts.crash_at_io_op);
-        let latency = if crash_config.is_some() {
-            0
-        } else {
-            latency_prof.latency_probability
-        };
+        let latency = latency_prof.latency_probability;
         let io: Arc<dyn SimIO> = match self.io_backend {
             IoBackend::Memory => Arc::new(MemorySimIO::new(
                 self.opts.seed,
@@ -835,7 +845,6 @@ impl SimulatorEnv {
                 latency,
                 latency_prof.min_tick,
                 latency_prof.max_tick,
-                crash_config,
             )),
             _ => Arc::new(
                 SimulatorIO::new(
@@ -937,6 +946,7 @@ impl SimulatorEnv {
             disable_union_all_preserves_cardinality: cli_opts
                 .disable_union_all_preserves_cardinality,
             disable_fsync_no_wait: cli_opts.disable_fsync_no_wait,
+            disable_crash_after_wal_sync: cli_opts.disable_crash_after_wal_sync,
             disable_faulty_query: cli_opts.disable_faulty_query,
             page_size: 4096, // TODO: randomize this too
             max_interactions: rng.random_range(cli_opts.minimum_tests..=cli_opts.maximum_tests),
@@ -944,16 +954,7 @@ impl SimulatorEnv {
             disable_reopen_database: cli_opts.disable_reopen_database,
             disable_integrity_check: cli_opts.disable_integrity_check,
             cache_size: profile.cache_size_pages.unwrap_or(DEFAULT_CACHE_SIZE),
-            crash_at_io_op: if cli_opts.crash_fuzz {
-                rng.random_range(1..=200) // this number is..just picked randomly.
-            } else {
-                0
-            },
         };
-
-        if opts.crash_at_io_op > 0 {
-            tracing::info!("crash_at_io_op={}", opts.crash_at_io_op);
-        }
 
         // Remove existing database file if it exists
         let db_path = paths.db(&simulation_type, &SimulationPhase::Test);
@@ -995,12 +996,7 @@ impl SimulatorEnv {
 
         let latency_prof = &profile.io.latency;
         let io_backend = cli_opts.io_backend;
-        let crash_config = (opts.crash_at_io_op > 0).then_some(opts.crash_at_io_op);
-        let latency = if crash_config.is_some() {
-            0
-        } else {
-            latency_prof.latency_probability
-        };
+        let latency = latency_prof.latency_probability;
         let io: Arc<dyn SimIO> = match io_backend {
             IoBackend::Memory => Arc::new(MemorySimIO::new(
                 opts.seed,
@@ -1008,7 +1004,6 @@ impl SimulatorEnv {
                 latency,
                 latency_prof.min_tick,
                 latency_prof.max_tick,
-                crash_config,
             )),
             _ => Arc::new(
                 SimulatorIO::new(
@@ -1191,39 +1186,34 @@ impl SimulatorEnv {
         }
     }
 
-    /// Check if a crash was triggered during the simulation
-    pub fn has_crashed(&self) -> bool {
-        self.io.has_crashed()
-    }
-
-    pub fn persist_crash_files(&mut self) -> Result<(), String> {
-        self.io.close_files();
-        for conn in &mut self.connections {
-            conn.disconnect();
+    /// Simulate power loss, reopen the database, and verify that all expected durable data
+    /// is still present.
+    pub fn power_loss_recover_and_verify(&mut self) -> Result<(), String> {
+        if self.io_backend != IoBackend::Memory {
+            return Err(
+                "power loss simulation is only supported with --io-backend=memory".to_string(),
+            );
         }
-        self.db = None;
-        self.io.discard_all_pending();
-        self.io.persist_files().map_err(|e| format!("failed: {e}"))
-    }
 
-    /// Attempt crash recovery: reopen database, run integrity_check, verify durable data.
-    pub fn attempt_crash_recovery(&mut self) -> Result<(), String> {
+        self.update_durability();
+
         let expected_tables = self.durability.expected_recoverable();
-
         tracing::info!(
-            "CRASH RECOVERY: committed={} wal_durable={} db_durable={} expected={}",
+            "POWER LOSS: committed={} wal_durable={} db_durable={} expected={}",
             self.committed_tables.len(),
             self.durability.wal_durable.len(),
             self.durability.db_durable.len(),
             expected_tables.len()
         );
 
+        // close all connections and drop the database handle.
         self.io.close_files();
         for conn in &mut self.connections {
             conn.disconnect();
         }
         self.db = None;
-        self.io.discard_all_pending();
+
+        self.io.simulate_power_loss();
 
         self.io
             .persist_files()
@@ -1232,18 +1222,65 @@ impl SimulatorEnv {
         let db_path = self.get_db_path();
         let sqlite_conn =
             rusqlite::Connection::open(&db_path).map_err(|e| format!("reopen failed: {e}"))?;
-
         let integrity: String = sqlite_conn
             .query_row("PRAGMA integrity_check", [], |row| row.get(0))
             .map_err(|e| format!("integrity_check failed: {e}"))?;
-
         if integrity != "ok" {
             return Err(format!("integrity_check: {integrity}"));
         }
-
         self.verify_committed_data(&sqlite_conn, &expected_tables)?;
-        tracing::info!("CRASH RECOVERY: success");
+
+        // Reopen the database in the simulator so subsequent interactions observe the post-crash state.
+        self.reopen_database()?;
+
+        // Reset simulator model to match recovered durability.
+        self.clear_tables();
+        self.committed_tables = expected_tables;
+
+        let wal_header_size = turso_core::storage::sqlite3_ondisk::WAL_HEADER_SIZE as u64;
+        let wal_path = self.get_db_path().with_extension("db-wal");
+        let wal_size = std::fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
+        if wal_size > wal_header_size {
+            self.durability.wal_durable = self.committed_tables.clone();
+        } else {
+            self.durability.db_durable = self.committed_tables.clone();
+        }
+
         Ok(())
+    }
+
+    fn reopen_database(&mut self) -> Result<(), String> {
+        self.connections
+            .iter_mut()
+            .for_each(|conn| *conn = SimConnection::Disconnected);
+
+        match self.type_ {
+            SimulationType::Differential => {
+                Ok(())
+            }
+            SimulationType::Default | SimulationType::Doublecheck => {
+                let db_path = self.get_db_path();
+                let db = Database::open_file_with_flags(
+                    self.io.clone(),
+                    db_path.to_str().expect("db path should be valid UTF-8"),
+                    turso_core::OpenFlags::default(),
+                    turso_core::DatabaseOpts::new().with_autovacuum(true),
+                    None,
+                )
+                .map_err(|e| format!("Failed to reopen database: {e:?}"))?;
+
+                if self.profile.experimental_mvcc {
+                    let conn = db
+                        .connect()
+                        .map_err(|e| format!("connect failed during MVCC setup: {e:?}"))?;
+                    conn.execute("PRAGMA journal_mode = 'experimental_mvcc'")
+                        .map_err(|e| format!("enable mvcc failed: {e:?}"))?;
+                }
+
+                self.db = Some(db);
+                Ok(())
+            }
+        }
     }
 
     /// Verify that all committed data is present in the recovered database
@@ -1371,6 +1408,7 @@ pub(crate) struct SimulatorOpts {
     pub(crate) disable_where_true_false_null: bool,
     pub(crate) disable_union_all_preserves_cardinality: bool,
     pub(crate) disable_fsync_no_wait: bool,
+    pub(crate) disable_crash_after_wal_sync: bool,
     pub(crate) disable_faulty_query: bool,
     pub(crate) disable_reopen_database: bool,
     pub(crate) disable_integrity_check: bool,
@@ -1379,9 +1417,6 @@ pub(crate) struct SimulatorOpts {
     pub(crate) page_size: usize,
     pub(crate) cache_size: usize,
     pub(crate) max_time_simulation: usize,
-
-    /// Crash at IO op N (0 = disabled)
-    pub(crate) crash_at_io_op: u64,
 }
 
 #[derive(Debug, Clone)]
