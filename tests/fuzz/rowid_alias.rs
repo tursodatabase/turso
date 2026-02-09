@@ -28,6 +28,7 @@ fn rng_from_time_or_env() -> (ChaCha8Rng, u64) {
 struct FuzzTestContext {
     opts: Opts,
     tables: Vec<Table>,
+    views: Vec<sql_generation::model::view::View>,
 }
 
 impl FuzzTestContext {
@@ -35,6 +36,7 @@ impl FuzzTestContext {
         Self {
             opts: Opts::default(),
             tables: Vec::new(),
+            views: Vec::new(),
         }
     }
 
@@ -46,6 +48,10 @@ impl FuzzTestContext {
 impl GenerationContext for FuzzTestContext {
     fn tables(&self) -> &Vec<Table> {
         &self.tables
+    }
+
+    fn views(&self) -> &Vec<sql_generation::model::view::View> {
+        &self.views
     }
 
     fn opts(&self) -> &Opts {
@@ -158,6 +164,7 @@ pub fn rowid_alias_differential_fuzz() {
                     if let Insert::Values {
                         table: table_name,
                         values,
+                        ..
                     } = &insert
                     {
                         for table in &mut context.tables {

@@ -3,6 +3,7 @@ use crate::generation::{
     ArbitrarySized, GenerationContext,
 };
 use crate::model::query::alter_table::{AlterTable, AlterTableType, AlterTableTypeDiscriminants};
+use crate::model::query::insert::ConflictAction;
 use crate::model::query::predicate::Predicate;
 use crate::model::query::select::{
     CompoundOperator, CompoundSelect, Distinctness, FromClause, OrderBy, ResultColumn, SelectBody,
@@ -57,15 +58,23 @@ impl Arbitrary for FromClause {
                 }
 
                 let predicate = Predicate::arbitrary_from(rng, context, &table);
+                // Randomly select join type, with higher probability for INNER (most common)
+                let join_type = match rng.random_range(0..10u8) {
+                    0..=6 => JoinType::Inner, // 70%
+                    7..=8 => JoinType::Left,  // 20%
+                    9 => JoinType::Cross,     // 10%
+                    _ => JoinType::Inner,
+                };
                 Some(JoinedTable {
                     table: joined_table_name,
-                    join_type: JoinType::Inner,
+                    alias: None,
+                    join_type,
                     on: predicate,
                 })
             })
             .collect();
         FromClause {
-            table: SelectTable::Table(table.name.clone()),
+            table: SelectTable::Table(table.name.clone(), None),
             joins,
         }
     }
@@ -224,6 +233,7 @@ impl Arbitrary for Select {
         }
 
         Self {
+            with: None,
             body: SelectBody {
                 select: Box::new(first),
                 compounds: rest
@@ -236,6 +246,21 @@ impl Arbitrary for Select {
             },
             limit: None,
         }
+    }
+}
+
+/// Generate an optional conflict action with ~20% probability.
+/// Only generates REPLACE or IGNORE as these are the most commonly used.
+fn maybe_conflict_action<R: Rng + ?Sized>(rng: &mut R) -> Option<ConflictAction> {
+    if rng.random_bool(0.2) {
+        // Prefer REPLACE (for IVM bug testing) but also generate IGNORE
+        Some(if rng.random_bool(0.7) {
+            ConflictAction::Replace
+        } else {
+            ConflictAction::Ignore
+        })
+    } else {
+        None
     }
 }
 
@@ -269,6 +294,7 @@ impl Arbitrary for Insert {
             Some(Insert::Values {
                 table: table.name.clone(),
                 values,
+                conflict: maybe_conflict_action(rng),
             })
         };
 
@@ -296,6 +322,7 @@ impl Arbitrary for Insert {
 
             for _ in 1..nesting_depth {
                 select = Select {
+                    with: None,
                     body: SelectBody {
                         select: Box::new(SelectInner {
                             distinctness: Distinctness::All,
@@ -316,6 +343,7 @@ impl Arbitrary for Insert {
             Some(Insert::Select {
                 table: table.name.clone(),
                 select: Box::new(select),
+                conflict: maybe_conflict_action(rng),
             })
         };
 
@@ -333,6 +361,7 @@ impl Arbitrary for Insert {
             Some(Insert::Select {
                 table: select_table.name.clone(),
                 select: Box::new(select),
+                conflict: maybe_conflict_action(rng),
             })
         };
 
