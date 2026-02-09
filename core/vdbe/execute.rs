@@ -11238,7 +11238,14 @@ fn apply_affinity_char(target: &mut Register, affinity: Affinity) -> bool {
                         return false;
                     }
                     if let Ok(num) = checked_cast_text_to_numeric(s, false) {
-                        *value = num;
+                        match num {
+                            Value::Integer(i) => {
+                                *value = Value::Float(i as f64);
+                            }
+                            other => {
+                                *value = other;
+                            }
+                        }
                         return true;
                     } else {
                         return false;
