@@ -20,13 +20,13 @@ import { TursoStatus, TursoType } from './types';
  */
 export class Statement {
   private _statement: NativeStatement;
-  private _connection: NativeConnection | null;
+  private _connection: NativeConnection;
   private _finalized = false;
   private _extraIo?: () => Promise<void>;
 
-  constructor(statement: NativeStatement, connection?: NativeConnection | null, extraIo?: () => Promise<void>) {
+  constructor(statement: NativeStatement, connection: NativeConnection, extraIo?: () => Promise<void>) {
     this._statement = statement;
-    this._connection = connection ?? null;
+    this._connection = connection;
     this._extraIo = extraIo;
   }
 

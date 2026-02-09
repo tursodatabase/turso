@@ -223,7 +223,7 @@ export class Database {
     }
 
     const nativeStmt = this._connection.prepareSingle(sql);
-    return new Statement(nativeStmt, this._connection, this._extraIo);
+    return new Statement(nativeStmt, this._connection!, this._extraIo);
   }
 
   /**
@@ -249,7 +249,7 @@ export class Database {
       }
 
       // Wrap in Statement to get IO handling
-      const stmt = new Statement(result.statement, this._connection, this._extraIo);
+      const stmt = new Statement(result.statement, this._connection!, this._extraIo);
       try {
         // Execute - will handle IO if needed
         await stmt.run();
