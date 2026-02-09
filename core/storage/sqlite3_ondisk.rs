@@ -1684,7 +1684,9 @@ pub fn begin_read_wal_frame<F: File + ?Sized>(
                             tracing::error!(
                                 "Failed to decrypt WAL frame data for page_idx={page_idx}: {e}"
                             );
-                            original_complete(Err(CompletionError::DecryptionError { page_idx }))
+                            let err = CompletionError::DecryptionError { page_idx };
+                            original_complete(Err(err));
+                            Some(err)
                         }
                     }
                 });
@@ -1711,7 +1713,8 @@ pub fn begin_read_wal_frame<F: File + ?Sized>(
                             tracing::error!(
                                 "Failed to verify checksum for page_id={page_idx}: {e}"
                             );
-                            original_c(Err(e))
+                            original_c(Err(e));
+                            Some(e)
                         }
                     }
                 });
