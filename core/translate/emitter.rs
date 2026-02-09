@@ -1689,7 +1689,9 @@ fn emit_delete_insns<'a>(
             } => program.resolve_cursor_id(&CursorKey::index(internal_id, index.clone())),
         },
         Operation::IndexMethodQuery(_) => {
-            panic!("access through IndexMethod is not supported for delete statements")
+            return Err(crate::LimboError::InternalError(
+                "IndexMethod access is not supported for DELETE statements".to_string(),
+            ));
         }
         Operation::HashJoin(_) => {
             unreachable!("access through HashJoin is not supported for delete statements")
@@ -2681,7 +2683,9 @@ fn emit_update_insns<'a>(
             ),
         },
         Operation::IndexMethodQuery(_) => {
-            panic!("access through IndexMethod is not supported for update operations")
+            return Err(crate::LimboError::InternalError(
+                "IndexMethod access is not supported for UPDATE operations".to_string(),
+            ));
         }
         Operation::HashJoin(_) => {
             unreachable!("access through HashJoin is not supported for update operations")

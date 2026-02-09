@@ -1580,11 +1580,15 @@ pub enum Table {
 }
 
 impl Table {
-    pub fn get_root_page(&self) -> i64 {
+    pub fn get_root_page(&self) -> crate::Result<i64> {
         match self {
-            Table::BTree(table) => table.root_page,
-            Table::Virtual(_) => unimplemented!(),
-            Table::FromClauseSubquery(_) => unimplemented!(),
+            Table::BTree(table) => Ok(table.root_page),
+            Table::Virtual(_) => Err(crate::LimboError::InternalError(
+                "Virtual tables do not have a root page".to_string(),
+            )),
+            Table::FromClauseSubquery(_) => Err(crate::LimboError::InternalError(
+                "FROM clause subqueries do not have a root page".to_string(),
+            )),
         }
     }
 
@@ -2234,7 +2238,9 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                 has_rowid = false;
             }
         }
-        CreateTableBody::AsSelect(_) => todo!(),
+        CreateTableBody::AsSelect(_) => {
+            crate::bail_parse_error!("CREATE TABLE AS SELECT is not supported")
+        }
     };
 
     // flip is_rowid_alias back to false if the table has multiple primary key columns

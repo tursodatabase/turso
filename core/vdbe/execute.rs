@@ -5773,7 +5773,10 @@ pub fn op_function(
                         let ast::Cmd::Stmt(stmt) =
                             parser.next().expect("parser should have next item")?
                         else {
-                            todo!()
+                            return Err(LimboError::InternalError(
+                                "Unexpected command during ALTER TABLE RENAME processing"
+                                    .to_string(),
+                            ));
                         };
 
                         match stmt {
@@ -5821,7 +5824,10 @@ pub fn op_function(
                                     options,
                                 } = body
                                 else {
-                                    todo!()
+                                    return Err(LimboError::InternalError(
+                                        "CREATE TABLE AS SELECT schemas cannot be altered"
+                                            .to_string(),
+                                    ));
                                 };
 
                                 let mut any_change = false;
@@ -5952,7 +5958,10 @@ pub fn op_function(
                         let ast::Cmd::Stmt(stmt) =
                             parser.next().expect("parser should have next item")?
                         else {
-                            todo!()
+                            return Err(LimboError::InternalError(
+                                "Unexpected command during ALTER TABLE RENAME COLUMN processing"
+                                    .to_string(),
+                            ));
                         };
 
                         match stmt {
@@ -6009,7 +6018,10 @@ pub fn op_function(
                                     options,
                                 } = body
                                 else {
-                                    todo!()
+                                    return Err(LimboError::InternalError(
+                                        "CREATE TABLE AS SELECT schemas cannot be altered"
+                                            .to_string(),
+                                    ));
                                 };
 
                                 let normalized_tbl_name = normalize_ident(tbl_name.name.as_str());
@@ -7972,9 +7984,15 @@ pub fn op_reset_sorter(
             return_if_io!(cursor.clear_btree());
         }
         CursorType::Sorter => {
-            unimplemented!("ResetSorter is not supported for sorter cursors yet")
+            return Err(LimboError::InternalError(
+                "ResetSorter is not supported for sorter cursors".to_string(),
+            ));
         }
-        _ => panic!("ResetSorter is not supported for {cursor_type:?}"),
+        _ => {
+            return Err(LimboError::InternalError(format!(
+                "ResetSorter is not supported for {cursor_type:?}"
+            )));
+        }
     }
 
     state.pc += 1;
@@ -7989,7 +8007,9 @@ pub fn op_drop_table(
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(DropTable { db, table_name, .. }, insn);
     if *db > 0 {
-        todo!("temp databases not implemented yet");
+        return Err(LimboError::InternalError(
+            "Temporary databases are not implemented".to_string(),
+        ));
     }
     let conn = program.connection.clone();
     let is_mvcc = conn.mv_store().is_some();
@@ -8884,9 +8904,15 @@ pub fn op_open_dup(
             // In principle, we could implement OpenDup for BTreeIndex,
             // but doing so now would create dead code since we have no use case,
             // and it wouldn't be possible to test it.
-            unimplemented!("OpenDup is not supported for BTreeIndex yet")
+            return Err(LimboError::InternalError(
+                "OpenDup is not supported for BTreeIndex".to_string(),
+            ));
         }
-        _ => panic!("OpenDup is not supported for {cursor_type:?}"),
+        _ => {
+            return Err(LimboError::InternalError(format!(
+                "OpenDup is not supported for {cursor_type:?}"
+            )));
+        }
     }
 
     state.pc += 1;

@@ -625,7 +625,9 @@ fn parse_from_clause_table(
             &args,
             connection,
         ),
-        _ => todo!(),
+        ast::SelectTable::Sub(..) => {
+            crate::bail_parse_error!("Parenthesized FROM clause subqueries are not supported")
+        }
     }
 }
 
