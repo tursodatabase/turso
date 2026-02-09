@@ -1440,11 +1440,25 @@ expect error {
     CHECK constraint failed: my_check
 }
 
-# Bug fix: RENAME TABLE should fail when CHECK has table-qualified column refs
+# RENAME TABLE should rewrite table-qualified refs in CHECK constraints
+# (e.g. t1.a > 0 becomes t2.a > 0). Matches SQLite 3.49.1+ behavior.
 test check_constraint_rename_table_qualified_ref {
     CREATE TABLE t1(a INTEGER, CHECK(t1.a > 0));
     INSERT INTO t1 VALUES(5);
     ALTER TABLE t1 RENAME TO t2;
+    INSERT INTO t2 VALUES(10);
+    SELECT * FROM t2 ORDER BY a;
+}
+expect {
+    5
+    10
+}
+
+test check_constraint_rename_table_qualified_ref_still_enforced {
+    CREATE TABLE t1(a INTEGER, CHECK(t1.a > 0));
+    INSERT INTO t1 VALUES(5);
+    ALTER TABLE t1 RENAME TO t2;
+    INSERT INTO t2 VALUES(-1);
 }
 expect error {
 }

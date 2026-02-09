@@ -1611,29 +1611,27 @@ pub fn rewrite_check_expr_column_refs(expr: &mut ast::Expr, from: &str, to: &str
     );
 }
 
-/// Check if a CHECK constraint expression contains any table-qualified column
-/// references matching the given table name. Returns the first matching
-/// `(table_name, column_name)` pair if found. SQLite rejects RENAME TABLE when
-/// CHECK constraints contain such qualified refs.
-pub fn check_expr_has_table_qualified_refs(
-    expr: &ast::Expr,
-    table_name: &str,
-) -> Option<(String, String)> {
-    let normalized = normalize_ident(table_name);
-    let mut found: Option<(String, String)> = None;
-    let _ = walk_expr(expr, &mut |e: &ast::Expr| -> crate::Result<WalkControl> {
-        if found.is_some() {
-            return Ok(WalkControl::SkipChildren);
-        }
-        if let ast::Expr::Qualified(ref tbl, ref col) = *e {
-            if normalize_ident(tbl.as_str()) == normalized {
-                found = Some((tbl.as_str().to_string(), col.as_str().to_string()));
-                return Ok(WalkControl::SkipChildren);
+/// Rewrite table-qualified column references in a CHECK constraint expression,
+/// replacing the table name from `from` to `to`. For example, `t1.a > 0` becomes
+/// `t2.a > 0` when renaming t1 to t2. This matches SQLite 3.49.1+ behavior which
+/// rewrites qualified refs during ALTER TABLE RENAME instead of rejecting them.
+pub fn rewrite_check_expr_table_refs(expr: &mut ast::Expr, from: &str, to: &str) {
+    let from_normalized = normalize_ident(from);
+    let _ = walk_expr_mut(
+        expr,
+        &mut |e: &mut ast::Expr| -> crate::Result<WalkControl> {
+            if let ast::Expr::Qualified(ref tbl, _) = *e {
+                if normalize_ident(tbl.as_str()) == from_normalized {
+                    let ast::Expr::Qualified(_, ref col) = *e else {
+                        unreachable!()
+                    };
+                    let col = col.clone();
+                    *e = ast::Expr::Qualified(ast::Name::exact(to.to_owned()), col);
+                }
             }
-        }
-        Ok(WalkControl::Continue)
-    });
-    found
+            Ok(WalkControl::Continue)
+        },
+    );
 }
 
 /// Update a column-level REFERENCES <tbl>(col,...) constraint

@@ -20,7 +20,7 @@ use crate::types::{
     ImmutableRecord, IndexInfo, SeekResult, Text,
 };
 use crate::util::{
-    check_expr_has_table_qualified_refs, normalize_ident, rewrite_check_expr_column_refs,
+    normalize_ident, rewrite_check_expr_column_refs, rewrite_check_expr_table_refs,
     rewrite_column_references_if_needed, rewrite_fk_parent_cols_if_self_ref,
     rewrite_fk_parent_table_if_needed, rewrite_inline_col_fk_target_if_needed,
     trim_ascii_whitespace,
@@ -5851,46 +5851,30 @@ pub fn op_function(
                                     );
                                 }
 
-                                // Reject RENAME TABLE if CHECK constraints have
-                                // table-qualified column refs. SQLite does not
-                                // rewrite these and instead returns an error.
+                                // Rewrite table-qualified refs in CHECK constraints
+                                // (e.g. t1.a > 0 → t2.a > 0)
                                 if this_table == rename_from {
-                                    for c in &constraints {
-                                        if let ast::TableConstraint::Check(ref expr) = c.constraint
+                                    for c in &mut constraints {
+                                        if let ast::TableConstraint::Check(ref mut expr) =
+                                            c.constraint
                                         {
-                                            if let Some((old_tbl, col)) =
-                                                check_expr_has_table_qualified_refs(
-                                                    expr,
-                                                    &rename_from,
-                                                )
-                                            {
-                                                crate::bail_parse_error!(
-                                                    "error in table {} after rename: no such column: {}.{}",
-                                                    rename_to,
-                                                    old_tbl,
-                                                    col
-                                                );
-                                            }
+                                            rewrite_check_expr_table_refs(
+                                                expr,
+                                                &rename_from,
+                                                &rename_to,
+                                            );
                                         }
                                     }
-                                    for col in &columns {
-                                        for cc in &col.constraints {
-                                            if let ast::ColumnConstraint::Check(ref expr) =
+                                    for col in &mut columns {
+                                        for cc in &mut col.constraints {
+                                            if let ast::ColumnConstraint::Check(ref mut expr) =
                                                 cc.constraint
                                             {
-                                                if let Some((old_tbl, col_name)) =
-                                                    check_expr_has_table_qualified_refs(
-                                                        expr,
-                                                        &rename_from,
-                                                    )
-                                                {
-                                                    crate::bail_parse_error!(
-                                                        "error in table {} after rename: no such column: {}.{}",
-                                                        rename_to,
-                                                        old_tbl,
-                                                        col_name
-                                                    );
-                                                }
+                                                rewrite_check_expr_table_refs(
+                                                    expr,
+                                                    &rename_from,
+                                                    &rename_to,
+                                                );
                                             }
                                         }
                                     }
@@ -10190,26 +10174,7 @@ pub fn op_rename_table(
 
     let conn = program.connection.clone();
 
-    conn.with_schema_mut(|schema| {
-        // Reject RENAME TABLE if any CHECK constraint has table-qualified refs.
-        // SQLite does not rewrite these and instead returns an error.
-        if let Some(table_arc) = schema.tables.get(&normalized_from) {
-            if let Table::BTree(btree) = table_arc.as_ref() {
-                for check in &btree.check_constraints {
-                    if let Some((old_tbl, col)) =
-                        check_expr_has_table_qualified_refs(&check.expr, &normalized_from)
-                    {
-                        crate::bail_parse_error!(
-                            "error in table {} after rename: no such column: {}.{}",
-                            normalized_to,
-                            old_tbl,
-                            col
-                        );
-                    }
-                }
-            }
-        }
-
+    conn.with_schema_mut(|schema| -> crate::Result<()> {
         if let Some(mut indexes) = schema.indexes.remove(&normalized_from) {
             indexes.iter_mut().for_each(|index| {
                 let index = Arc::make_mut(index);
@@ -10232,6 +10197,16 @@ pub fn op_rename_table(
                     if normalize_ident(&fk.parent_table) == normalized_from {
                         fk.parent_table.clone_from(&normalized_to);
                     }
+                }
+
+                // Rewrite table-qualified refs in CHECK constraints
+                for check in &mut btree.check_constraints {
+                    rewrite_check_expr_table_refs(
+                        &mut check.expr,
+                        &normalized_from,
+                        &normalized_to,
+                    );
+                    check.sql = format!("CHECK({})", &check.expr);
                 }
 
                 normalized_to.clone_into(&mut btree.name);
