@@ -4,6 +4,9 @@
 
 #include <cstdio>   // For FILE, fopen, fread, fwrite, fclose, fseek, ftell, remove, rename
 #include <cstdlib>  // For additional standard library functions
+#include <cstring>  // For strrchr
+#include <unistd.h> // For fsync, close
+#include <fcntl.h>  // For open, O_RDONLY
 
 extern "C" {
 #include <turso.h>
@@ -12,6 +15,20 @@ extern "C" {
 
 namespace turso
 {
+
+    /**
+     * Durable fsync: on Apple, fsync() only flushes to disk cache,
+     * so we need F_FULLFSYNC for true persistence. On Linux/Android,
+     * plain fsync() is sufficient.
+     */
+    static int durable_fsync(int fd)
+    {
+#ifdef __APPLE__
+        return fcntl(fd, F_FULLFSYNC);
+#else
+        return fsync(fd);
+#endif
+    }
 
     using namespace facebook;
 
@@ -503,39 +520,55 @@ namespace turso
                 std::string path = args[0].asString(rt).utf8(rt);
                 jsi::ArrayBuffer buffer = args[1].asObject(rt).getArrayBuffer(rt);
 
-                // Write atomically using temporary file + rename
+                // Write atomically: write to temp, fsync, rename, fsync dir
                 std::string tempPath = path + ".tmp";
 
-                // Open temp file for writing
                 FILE* file = fopen(tempPath.c_str(), "wb");
                 if (!file)
                 {
                     throw jsi::JSError(rt, "Failed to open file for writing");
                 }
 
-                // Write data
                 size_t size = buffer.size(rt);
                 if (size > 0)
                 {
                     size_t written = fwrite(buffer.data(rt), 1, size, file);
-                    fclose(file);
-
                     if (written != size)
                     {
+                        fclose(file);
                         remove(tempPath.c_str());
                         throw jsi::JSError(rt, "Failed to write complete file");
                     }
                 }
-                else
+
+                // Flush to OS and sync to disk before rename
+                if (fflush(file) != 0 || durable_fsync(fileno(file)) != 0)
                 {
                     fclose(file);
+                    remove(tempPath.c_str());
+                    throw jsi::JSError(rt, "Failed to sync file to disk");
                 }
+                fclose(file);
 
                 // Atomic rename (replaces old file)
                 if (rename(tempPath.c_str(), path.c_str()) != 0)
                 {
                     remove(tempPath.c_str());
                     throw jsi::JSError(rt, "Failed to rename temp file");
+                }
+
+                // Fsync parent directory to ensure rename is durable
+                std::string dirPath = path;
+                auto lastSlash = dirPath.rfind('/');
+                if (lastSlash != std::string::npos)
+                {
+                    dirPath.resize(lastSlash);
+                    int dirFd = open(dirPath.c_str(), O_RDONLY);
+                    if (dirFd >= 0)
+                    {
+                        durable_fsync(dirFd);
+                        close(dirFd);
+                    }
                 }
 
                 return jsi::Value::undefined();
