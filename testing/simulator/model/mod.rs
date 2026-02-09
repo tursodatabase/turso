@@ -62,7 +62,7 @@ fn check_unique_row(
         let conflict = rows
             .iter()
             .enumerate()
-            .filter(|(i, _)| except_row.map_or(true, |except| *i != except))
+            .filter(|(i, _)| except_row != Some(*i))
             .any(|(_, r)| r[col_idx] == candidate_row[col_idx]);
         if conflict {
             return Err(anyhow::anyhow!(

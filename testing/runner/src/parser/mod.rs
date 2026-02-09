@@ -1120,7 +1120,6 @@ expect {
         assert!(file.tests[0].modifiers.skip.is_none());
     }
 
-
     #[test]
     fn test_parse_backend_specific_expectations() {
         let input = r#"
