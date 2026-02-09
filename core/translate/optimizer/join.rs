@@ -754,19 +754,10 @@ pub fn join_lhs_and_rhs<'a>(
                 }
             )
         {
-            // Distinguish chaining (build table already participates in an outer
-            // join) from a missing equi-join condition.
-            let build_table_idx = join_order[join_order.len() - 2].original_idx;
-            let build_is_outer = joined_tables[build_table_idx]
-                .join_info
-                .as_ref()
-                .is_some_and(|ji| ji.outer || ji.full_outer);
-            let msg = if build_is_outer {
-                "FULL OUTER JOIN chaining is not yet supported"
-            } else {
-                "FULL OUTER JOIN requires an equality condition in the ON clause"
-            };
-            return Err(crate::LimboError::ParseError(msg.to_string()));
+            // This ordering doesn't support FULL OUTER (no equi-join or
+            // chaining issue). Return Ok(None) so the DP/greedy planner can
+            // try other orderings — the naive left-to-right plan may work.
+            return Ok(None);
         }
     }
 
@@ -1353,9 +1344,40 @@ pub fn compute_best_join_order<'a>(
                 best_ordered_plan
             },
         })),
-        None => Err(LimboError::PlanningError(
-            "No valid query plan found".to_string(),
-        )),
+        None => {
+            // If any table uses FULL OUTER JOIN, produce a specific error
+            // explaining why no plan was found.
+            let has_full_outer = joined_tables
+                .iter()
+                .any(|t| t.join_info.as_ref().is_some_and(|ji| ji.full_outer));
+            if has_full_outer {
+                // Distinguish chaining from missing equi-join.
+                let build_is_outer = joined_tables.iter().any(|t| {
+                    let is_full = t.join_info.as_ref().is_some_and(|ji| ji.full_outer);
+                    if !is_full {
+                        return false;
+                    }
+                    // Check if any earlier table (potential build) has outer/full_outer.
+                    joined_tables.iter().any(|other| {
+                        !std::ptr::eq(t, other)
+                            && other
+                                .join_info
+                                .as_ref()
+                                .is_some_and(|ji| ji.outer || ji.full_outer)
+                    })
+                });
+                let msg = if build_is_outer {
+                    "FULL OUTER JOIN chaining is not yet supported"
+                } else {
+                    "FULL OUTER JOIN requires an equality condition in the ON clause"
+                };
+                Err(LimboError::ParseError(msg.to_string()))
+            } else {
+                Err(LimboError::PlanningError(
+                    "No valid query plan found".to_string(),
+                ))
+            }
+        }
     }
 }
 
