@@ -1132,7 +1132,7 @@ checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
 name = "core_tester"
-version = "0.5.0-pre.7"
+version = "0.5.0-pre.9"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -1599,7 +1599,7 @@ checksum = "56254986775e3233ffa9c4d7d3faaf6d36a2c09d30b20687e9f88bc8bafc16c8"
 
 [[package]]
 name = "differential-fuzzer"
-version = "0.5.0-pre.7"
+version = "0.5.0-pre.9"
 dependencies = [
  "anyhow",
  "clap",
@@ -3099,7 +3099,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_completion"
-version = "0.5.0-pre.7"
+version = "0.5.0-pre.9"
 dependencies = [
  "mimalloc",
  "turso_ext",
@@ -3107,7 +3107,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_crypto"
-version = "0.5.0-pre.7"
+version = "0.5.0-pre.9"
 dependencies = [
  "blake3",
  "data-encoding",
@@ -3120,7 +3120,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_csv"
-version = "0.5.0-pre.7"
+version = "0.5.0-pre.9"
 dependencies = [
  "csv",
  "mimalloc",
@@ -3130,7 +3130,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_fuzzy"
-version = "0.5.0-pre.7"
+version = "0.5.0-pre.9"
 dependencies = [
  "mimalloc",
  "turso_ext",
@@ -3138,7 +3138,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_ipaddr"
-version = "0.5.0-pre.7"
+version = "0.5.0-pre.9"
 dependencies = [
  "ipnetwork",
  "mimalloc",
@@ -3147,7 +3147,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_percentile"
-version = "0.5.0-pre.7"
+version = "0.5.0-pre.9"
 dependencies = [
  "mimalloc",
  "turso_ext",
@@ -3155,7 +3155,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_regexp"
-version = "0.5.0-pre.7"
+version = "0.5.0-pre.9"
 dependencies = [
  "mimalloc",
  "regex",
@@ -3164,7 +3164,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_sim"
-version = "0.5.0-pre.7"
+version = "0.5.0-pre.9"
 dependencies = [
  "anyhow",
  "bitflags 2.9.4",
@@ -3201,7 +3201,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_sqlite_test_ext"
-version = "0.5.0-pre.7"
+version = "0.5.0-pre.9"
 dependencies = [
  "cc",
 ]
@@ -4240,7 +4240,7 @@ dependencies = [
 
 [[package]]
 name = "py-turso"
-version = "0.5.0-pre.7"
+version = "0.5.0-pre.9"
 dependencies = [
  "anyhow",
  "pyo3",
@@ -5277,7 +5277,7 @@ checksum = "d372029cb5195f9ab4e4b9aef550787dce78b124fcaee8d82519925defcd6f0d"
 
 [[package]]
 name = "sql_gen_prop"
-version = "0.5.0-pre.7"
+version = "0.5.0-pre.9"
 dependencies = [
  "anarchist-readable-name-generator-lib",
  "proptest",
@@ -5287,7 +5287,7 @@ dependencies = [
 
 [[package]]
 name = "sql_generation"
-version = "0.5.0-pre.7"
+version = "0.5.0-pre.9"
 dependencies = [
  "anarchist-readable-name-generator-lib",
  "anyhow",
@@ -6228,7 +6228,7 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "turso"
-version = "0.5.0-pre.7"
+version = "0.5.0-pre.9"
 dependencies = [
  "anyhow",
  "bytes",
@@ -6252,7 +6252,7 @@ dependencies = [
 
 [[package]]
 name = "turso-dbhash"
-version = "0.5.0-pre.7"
+version = "0.5.0-pre.9"
 dependencies = [
  "clap",
  "hex",
@@ -6263,14 +6263,14 @@ dependencies = [
 
 [[package]]
 name = "turso-dotnet"
-version = "0.5.0-pre.7"
+version = "0.5.0-pre.9"
 dependencies = [
  "turso_core",
 ]
 
 [[package]]
 name = "turso-java"
-version = "0.5.0-pre.7"
+version = "0.5.0-pre.9"
 dependencies = [
  "jni",
  "thiserror 2.0.16",
@@ -6279,7 +6279,7 @@ dependencies = [
 
 [[package]]
 name = "turso_cli"
-version = "0.5.0-pre.7"
+version = "0.5.0-pre.9"
 dependencies = [
  "anyhow",
  "bytes",
@@ -6320,7 +6320,7 @@ dependencies = [
 
 [[package]]
 name = "turso_core"
-version = "0.5.0-pre.7"
+version = "0.5.0-pre.9"
 dependencies = [
  "aegis",
  "aes",
@@ -6394,7 +6394,7 @@ dependencies = [
 
 [[package]]
 name = "turso_dart"
-version = "0.5.0-pre.7"
+version = "0.5.0-pre.9"
 dependencies = [
  "flutter_rust_bridge",
  "turso_core",
@@ -6402,7 +6402,7 @@ dependencies = [
 
 [[package]]
 name = "turso_ext"
-version = "0.5.0-pre.7"
+version = "0.5.0-pre.9"
 dependencies = [
  "chrono",
  "getrandom 0.3.2",
@@ -6411,7 +6411,7 @@ dependencies = [
 
 [[package]]
 name = "turso_ext_tests"
-version = "0.5.0-pre.7"
+version = "0.5.0-pre.9"
 dependencies = [
  "env_logger 0.11.7",
  "lazy_static",
@@ -6422,7 +6422,7 @@ dependencies = [
 
 [[package]]
 name = "turso_macros"
-version = "0.5.0-pre.7"
+version = "0.5.0-pre.9"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -6431,7 +6431,7 @@ dependencies = [
 
 [[package]]
 name = "turso_node"
-version = "0.5.0-pre.7"
+version = "0.5.0-pre.9"
 dependencies = [
  "chrono",
  "napi",
@@ -6444,7 +6444,7 @@ dependencies = [
 
 [[package]]
 name = "turso_parser"
-version = "0.5.0-pre.7"
+version = "0.5.0-pre.9"
 dependencies = [
  "bitflags 2.9.4",
  "codspeed-criterion-compat",
@@ -6462,7 +6462,7 @@ dependencies = [
 
 [[package]]
 name = "turso_sdk_kit"
-version = "0.5.0-pre.7"
+version = "0.5.0-pre.9"
 dependencies = [
  "bindgen",
  "env_logger 0.11.7",
@@ -6477,7 +6477,7 @@ dependencies = [
 
 [[package]]
 name = "turso_sdk_kit_macros"
-version = "0.5.0-pre.7"
+version = "0.5.0-pre.9"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -6486,7 +6486,7 @@ dependencies = [
 
 [[package]]
 name = "turso_sqlite3"
-version = "0.5.0-pre.7"
+version = "0.5.0-pre.9"
 dependencies = [
  "env_logger 0.11.7",
  "libc",
@@ -6499,7 +6499,7 @@ dependencies = [
 
 [[package]]
 name = "turso_stress"
-version = "0.5.0-pre.7"
+version = "0.5.0-pre.9"
 dependencies = [
  "antithesis_sdk",
  "clap",
@@ -6517,7 +6517,7 @@ dependencies = [
 
 [[package]]
 name = "turso_sync_engine"
-version = "0.5.0-pre.7"
+version = "0.5.0-pre.9"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -6544,7 +6544,7 @@ dependencies = [
 
 [[package]]
 name = "turso_sync_js"
-version = "0.5.0-pre.7"
+version = "0.5.0-pre.9"
 dependencies = [
  "genawaiter",
  "napi",
@@ -6559,7 +6559,7 @@ dependencies = [
 
 [[package]]
 name = "turso_sync_sdk_kit"
-version = "0.5.0-pre.7"
+version = "0.5.0-pre.9"
 dependencies = [
  "bindgen",
  "env_logger 0.11.7",
@@ -6576,7 +6576,7 @@ dependencies = [
 
 [[package]]
 name = "turso_whopper"
-version = "0.5.0-pre.7"
+version = "0.5.0-pre.9"
 dependencies = [
  "anyhow",
  "clap",
