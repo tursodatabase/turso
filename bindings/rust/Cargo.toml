@@ -14,7 +14,6 @@ workspace = true
 
 [features]
 default = ["mimalloc"]
-antithesis = ["turso_sdk_kit/antithesis"]
 mimalloc = ["dep:mimalloc"]
 sync = [
     "dep:hyper",

@@ -3,9 +3,9 @@ mod opts;
 use clap::Parser;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use opts::{Opts, TxMode};
-#[cfg(not(feature = "antithesis"))]
+#[cfg(not(antithesis))]
 use rand::rngs::StdRng;
-#[cfg(not(feature = "antithesis"))]
+#[cfg(not(antithesis))]
 use rand::{Rng, SeedableRng};
 #[cfg(shuttle)]
 use shuttle::scheduler::Scheduler;
@@ -87,12 +87,12 @@ const NOUNS: &[&str] = &[
 ];
 
 /// RNG wrapper that works with both Shuttle and Antithesis
-#[cfg(not(feature = "antithesis"))]
+#[cfg(not(antithesis))]
 struct ThreadRng {
     rng: StdRng,
 }
 
-#[cfg(not(feature = "antithesis"))]
+#[cfg(not(antithesis))]
 impl ThreadRng {
     fn new(seed: u64) -> Self {
         Self {
@@ -105,10 +105,10 @@ impl ThreadRng {
     }
 }
 
-#[cfg(feature = "antithesis")]
+#[cfg(antithesis)]
 struct ThreadRng;
 
-#[cfg(feature = "antithesis")]
+#[cfg(antithesis)]
 impl ThreadRng {
     fn new(_seed: u64) -> Self {
         // Antithesis uses its own RNG, seed is ignored
@@ -618,7 +618,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 }
 
 async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    #[cfg(feature = "antithesis")]
+    #[cfg(antithesis)]
     let global_seed: u64 = {
         if opts.seed.is_some() {
             eprintln!("Error: --seed is not supported under Antithesis");
@@ -628,7 +628,7 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
         0 // Antithesis doesn't use seed-based RNG
     };
 
-    #[cfg(not(feature = "antithesis"))]
+    #[cfg(not(antithesis))]
     let global_seed: u64 = {
         // Under shuttle, opts.seed is already resolved in main()
         let seed = opts.seed.unwrap_or_else(rand::random);
