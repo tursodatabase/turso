@@ -2518,6 +2518,12 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         }
         connection.auto_commit.store(true, Ordering::SeqCst);
         connection.set_mv_tx(None);
+        // Remove the recovery transaction from the active transaction set.
+        // Without this, compute_lwm() returns 0 (the recovery tx's begin_ts),
+        // which pins the low-water mark and effectively disables GC.
+        // We don't call remove_tx() because that also unlocks blocking_checkpoint_lock
+        // which the recovery tx never acquired.
+        self.txs.remove(&tx_id);
     }
 
     /// Rolls back a transaction with the specified ID.
@@ -2763,62 +2769,141 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         self.clock.get_timestamp()
     }
 
-    /// Removes unused row  versions with very loose heuristics,
-    /// which sometimes leaves versions intact for too long.
+    /// Compute the low-water mark: the minimum begin_ts of all active or
+    /// preparing transactions. Returns u64::MAX if no transactions are active.
+    /// Used by GC to determine which row versions are safe to reclaim.
+    pub fn compute_lwm(&self) -> u64 {
+        self.txs
+            .iter()
+            .filter_map(|entry| {
+                let tx = entry.value();
+                match tx.state.load() {
+                    TransactionState::Active | TransactionState::Preparing(_) => Some(tx.begin_ts),
+                    _ => None,
+                }
+            })
+            .min()
+            .unwrap_or(u64::MAX)
+    }
+
+    /// Garbage-collects row versions that are invisible to all active transactions.
+    /// Uses the low-water mark (LWM) to determine reclaimability in O(1) per version.
+    /// Covers both table rows (`self.rows`) and index rows (`self.index_rows`).
     /// Returns the number of removed versions.
     pub fn drop_unused_row_versions(&self) -> usize {
+        let lwm = self.compute_lwm();
+        let ckpt_max = self.checkpointed_txid_max.load(Ordering::SeqCst);
+
+        let dropped =
+            self.gc_table_row_versions(lwm, ckpt_max) + self.gc_index_row_versions(lwm, ckpt_max);
+
         tracing::trace!(
-            "drop_unused_row_versions() -> txs: {}; rows: {}",
+            "drop_unused_row_versions() -> dropped {dropped}, txs: {}, rows: {}",
             self.txs.len(),
             self.rows.len()
         );
+        dropped
+    }
+
+    fn gc_table_row_versions(&self, lwm: u64, ckpt_max: u64) -> usize {
         let mut dropped = 0;
-        let mut to_remove = Vec::new();
+
         for entry in self.rows.iter() {
-            let mut row_versions = entry.value().write();
-            row_versions.retain(|rv| {
-                // FIXME: should take rv.begin into account as well
-                let should_stay = match rv.end {
-                    Some(TxTimestampOrID::Timestamp(version_end_ts)) => {
-                        // a transaction started before this row version ended, ergo row version is needed
-                        // NOTICE: O(row_versions x transactions), but also lock-free, so sounds acceptable
-                        self.txs.iter().any(|tx| {
-                            let tx = tx.value();
-                            // FIXME: verify!
-                            match tx.state.load() {
-                                TransactionState::Active | TransactionState::Preparing(_) => {
-                                    version_end_ts > tx.begin_ts
-                                }
-                                _ => false,
-                            }
-                        })
-                    }
-                    // Let's skip potentially complex logic if the transafction is still
-                    // active/tracked. We will drop the row version when the transaction
-                    // gets garbage-collected itself, it will always happen eventually.
-                    Some(TxTimestampOrID::TxID(tx_id)) => !self.txs.contains_key(&tx_id),
-                    // this row version is current, ergo visible
-                    None => true,
-                };
-                if !should_stay {
-                    dropped += 1;
-                    tracing::trace!(
-                        "Dropping row version {:?} {:?}-{:?}",
-                        entry.key(),
-                        rv.begin,
-                        rv.end
-                    );
-                }
-                should_stay
-            });
-            if row_versions.is_empty() {
-                to_remove.push(entry.key().clone());
-            }
-        }
-        for id in to_remove {
-            self.rows.remove(&id);
+            let mut versions = entry.value().write();
+            dropped += Self::gc_version_chain(&mut versions, lwm, ckpt_max);
+            // Empty entries are left in the SkipMap (lazy removal). This avoids
+            // a TOCTOU race where a concurrent writer inserts a version between
+            // the emptiness check and SkipMap::remove(). Empty entries are reused
+            // by get_or_insert_with on subsequent inserts and cleaned up by
+            // checkpoint-time GC which runs under the blocking lock.
         }
         dropped
+    }
+
+    fn gc_index_row_versions(&self, lwm: u64, ckpt_max: u64) -> usize {
+        let mut dropped = 0;
+
+        for outer_entry in self.index_rows.iter() {
+            let inner_map = outer_entry.value();
+
+            for inner_entry in inner_map.iter() {
+                let mut versions = inner_entry.value().write();
+                dropped += Self::gc_version_chain(&mut versions, lwm, ckpt_max);
+            }
+            // Empty entries left in place — same TOCTOU rationale as table rows.
+        }
+        dropped
+    }
+
+    /// Apply GC rules to a single version chain. Returns number of versions removed.
+    ///
+    /// Rule 1: Aborted garbage (begin=None, end=None) — always remove.
+    /// Rule 2: Superseded (end=Timestamp(e), e <= lwm) — remove unless it's a
+    ///         tombstone (no committed current version) whose deletion hasn't
+    ///         been checkpointed (e > ckpt_max).
+    /// Rule 3: Current checkpointed sole-survivor (end=None, b <= ckpt_max,
+    ///         b < lwm, no other versions remain) — remove.
+    ///
+    /// Recovery versions (timestamp 0) are protected by the fact that they don't
+    /// advance checkpointed_txid_max (NonZeroU64). Before any real transaction is
+    /// checkpointed, ckpt_max == 0, and the guards `e > ckpt_max` (Rule 2) and
+    /// `b <= ckpt_max` (Rule 3) naturally protect them. After ckpt_max > 0, the
+    /// first real checkpoint has processed recovery data alongside the real
+    /// transaction, so recovery versions are safe to collect.
+    fn gc_version_chain(versions: &mut Vec<RowVersion>, lwm: u64, ckpt_max: u64) -> usize {
+        let before = versions.len();
+
+        // Rule 1: aborted garbage
+        versions.retain(|rv| !matches!((&rv.begin, &rv.end), (None, None)));
+
+        // Rule 2: superseded versions below LWM, with tombstone guard.
+        // A superseded version with e <= lwm is invisible to all readers and
+        // removable — UNLESS it's a tombstone (sole version, no committed
+        // current version) whose deletion hasn't been checkpointed to B-tree
+        // yet. In that case removing it would let the dual cursor fall through
+        // to a stale B-tree row.
+        //
+        // has_current only counts committed current versions (begin=Timestamp).
+        // Pending inserts (begin=TxID) don't count — they might roll back,
+        // which would resurrect the B-tree row if the tombstone was removed.
+        let has_current = versions
+            .iter()
+            .any(|rv| rv.end.is_none() && matches!(&rv.begin, Some(TxTimestampOrID::Timestamp(_))));
+        versions.retain(|rv| match &rv.end {
+            Some(TxTimestampOrID::Timestamp(e)) if *e <= lwm => {
+                // Retain only if this is a tombstone AND not yet checkpointed.
+                // For recovery tombstones (e=0): when ckpt_max == 0, no
+                // checkpoint has processed real transactions, so 0 > 0 = false
+                // makes the retain condition `!has_current && false` = false,
+                // i.e., REMOVED. But we need them retained before their first
+                // checkpoint. Since recovery timestamps are 0 and ckpt_max
+                // starts at 0, `e > ckpt_max` is `0 > 0` = false. Combined
+                // with `ckpt_max == 0` meaning "no real checkpoint yet", we
+                // add the second guard: retain if e == 0 AND ckpt_max == 0
+                // (recovery data not yet checkpointed).
+                !has_current && (*e > ckpt_max || (*e == 0 && ckpt_max == 0))
+            }
+            _ => true,
+        });
+
+        // Rule 3: checkpointed sole-survivor current version.
+        // Safe to remove only when the B-tree has the data (b <= ckpt_max),
+        // no reader needs the MVCC copy (b < lwm), and no superseded versions
+        // remain that would poison is_btree_invalidating_version.
+        // Recovery versions (b=0): when ckpt_max == 0, `b <= ckpt_max` is true
+        // but no real checkpoint has run. The `ckpt_max > 0` part of the guard
+        // ensures we only collect b=0 versions after a real checkpoint.
+        if versions.len() == 1 {
+            if let (Some(TxTimestampOrID::Timestamp(b)), None) =
+                (&versions[0].begin, &versions[0].end)
+            {
+                if (*b > 0 || ckpt_max > 0) && *b <= ckpt_max && *b < lwm {
+                    versions.clear();
+                }
+            }
+        }
+
+        before - versions.len()
     }
 
     pub fn recover(&self) -> Result<()> {

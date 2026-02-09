@@ -549,6 +549,54 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
         }
     }
 
+    /// Garbage-collect row versions for rows that were just checkpointed.
+    /// Must be called AFTER checkpointed_txid_max is updated and BEFORE the
+    /// checkpoint lock is released (no concurrent writers under blocking lock).
+    fn gc_checkpointed_versions(&self) {
+        let lwm = self.mvstore.compute_lwm();
+        let ckpt_max = self.checkpointed_txid_max_new;
+
+        for (row_version, _special_write) in &self.write_set {
+            let row_id = &row_version.row.id;
+            let is_now_empty = {
+                let entry = self
+                    .mvstore
+                    .rows
+                    .get(row_id)
+                    .expect("write set row must exist in SkipMap");
+                let mut versions = entry.value().write();
+                MvStore::<Clock>::gc_version_chain(&mut versions, lwm, ckpt_max);
+                versions.is_empty()
+            };
+            if is_now_empty {
+                self.mvstore.rows.remove(row_id);
+            }
+        }
+
+        for (index_id, row_version, _is_delete) in &self.index_write_set {
+            let RowKey::Record(sortable_key) = &row_version.row.id.row_id else {
+                unreachable!("index row versions always have Record keys");
+            };
+            let outer_entry = self
+                .mvstore
+                .index_rows
+                .get(index_id)
+                .expect("index_id from write set must exist in index_rows");
+            let inner_map = outer_entry.value();
+            let is_now_empty = {
+                let inner_entry = inner_map
+                    .get(sortable_key)
+                    .expect("index row from write set must exist in inner map");
+                let mut versions = inner_entry.value().write();
+                MvStore::<Clock>::gc_version_chain(&mut versions, lwm, ckpt_max);
+                versions.is_empty()
+            };
+            if is_now_empty {
+                inner_map.remove(sortable_key);
+            }
+        }
+    }
+
     fn step_inner(&mut self, _context: &()) -> Result<TransitionResult<CheckpointResult>> {
         match &self.state {
             CheckpointState::AcquireLock => {
@@ -1269,6 +1317,8 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 self.mvstore
                     .checkpointed_txid_max
                     .store(self.checkpointed_txid_max_new, Ordering::SeqCst);
+                self.gc_checkpointed_versions();
+                self.mvstore.drop_unused_row_versions();
                 self.checkpoint_lock.unlock();
                 self.finalize(&())?;
                 Ok(TransitionResult::Done(
