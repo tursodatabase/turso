@@ -554,6 +554,26 @@ pub fn translate_alter_table(
                 ));
             }
 
+            if btree.is_strict {
+                let ty = column.ty_str.as_str();
+                if ty.is_empty() {
+                    return Err(LimboError::ParseError(format!(
+                        "missing datatype for {table_name}.{new_column_name}"
+                    )));
+                }
+                if !ty.eq_ignore_ascii_case("INT")
+                    && !ty.eq_ignore_ascii_case("INTEGER")
+                    && !ty.eq_ignore_ascii_case("REAL")
+                    && !ty.eq_ignore_ascii_case("TEXT")
+                    && !ty.eq_ignore_ascii_case("BLOB")
+                    && !ty.eq_ignore_ascii_case("ANY")
+                {
+                    return Err(LimboError::ParseError(format!(
+                        "unknown datatype for {table_name}.{new_column_name}: \"{ty}\""
+                    )));
+                }
+            }
+
             // TODO: All quoted ids will be quoted with `[]`, we should store some info from the parsed AST
             btree.columns.push(column.clone());
 
