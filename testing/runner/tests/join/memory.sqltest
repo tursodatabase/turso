@@ -369,3 +369,13 @@ expect {
     2|2.0
 }
 
+@skip-if sqlite "sqlite supports full outer joins"
+test full-outer-join {
+	create table t(a);
+	create table u(a);
+	insert into t values (1), (2);
+	insert into u values (2), (3);
+	select coalesce(t.a, u.a) as a from t full outer join u using(a) order by a;
+}
+expect error {
+}

@@ -94,6 +94,10 @@ pub enum Token {
     #[token("mvcc")]
     Mvcc,
 
+    /// `sqlite` keyword (for skip conditions)
+    #[token("sqlite")]
+    Sqlite,
+
     /// `@requires`
     #[token("@requires")]
     AtRequires,
@@ -218,6 +222,7 @@ impl fmt::Display for Token {
             Token::AtSkipFile => write!(f, "@skip-file"),
             Token::AtSkipFileIf => write!(f, "@skip-file-if"),
             Token::Mvcc => write!(f, "mvcc"),
+            Token::Sqlite => write!(f, "sqlite"),
             Token::AtRequires => write!(f, "@requires"),
             Token::AtRequiresFile => write!(f, "@requires-file"),
             Token::Trigger => write!(f, "trigger"),

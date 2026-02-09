@@ -26,6 +26,7 @@ Syntax highlighting for Turso's `.sqltest` test files.
 ```sqltest
 @skip-file "reason to skip all tests"
 @skip-file-if mvcc "reason to skip in MVCC mode"
+@skip-file-if sqlite "reason to skip on sqlite backend"
 @requires-file trigger "all tests need trigger support"
 ```
 
@@ -43,6 +44,7 @@ setup schema {
 @setup schema
 @skip "known bug"
 @skip-if mvcc "not supported in MVCC"
+@skip-if sqlite "sqlite has different behavior"
 @backend rust
 @requires trigger "needs trigger support"
 test my-test {
@@ -80,6 +82,6 @@ expect @rust { ... }     # Backend-specific expectation
 - Full SQL syntax highlighting inside `setup`, `test`, and `snapshot` blocks (via embedded SQL grammar)
 - Keyword highlighting for `@database`, `@setup`, `@skip`, `@skip-if`, `@backend`, `@requires`, `test`, `expect`, `snapshot`
 - Constant highlighting for database types (`:memory:`, `:temp:`, etc.)
-- Constant highlighting for skip conditions (`mvcc`) and capabilities (`trigger`, `strict`, `materialized_views`)
+- Constant highlighting for skip conditions (`mvcc`, `sqlite`) and capabilities (`trigger`, `strict`, `materialized_views`)
 - String highlighting for skip/requires reasons
 - Comment highlighting (`# comment`)

@@ -185,6 +185,8 @@ pub struct Skip {
 pub enum SkipCondition {
     /// Skip when MVCC mode is enabled
     Mvcc,
+    /// Skip when running against the sqlite CLI backend
+    Sqlite,
 }
 
 /// What we expect from executing the SQL
