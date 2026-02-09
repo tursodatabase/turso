@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 import { StyleSheet, Text, View, ScrollView } from 'react-native';
-import { connect, setup, Database } from '@tursodatabase/sync-react-native';
+import { connect, setup, Database, TursoLog } from '@tursodatabase/sync-react-native';
 
 type TestResult = {
   name: string;
@@ -38,7 +38,12 @@ export default function App() {
 
     // Configure logging
     try {
-      setup({ logLevel: 'debug' });
+      setup({
+        logLevel: 'debug',
+        logger: (log: TursoLog) => {
+          console.log(`[turso:${log.level}] ${log.target}: ${log.message}`);
+        },
+      });
       testResults.push({ name: 'Setup logging', passed: true });
     } catch (e) {
       testResults.push({ name: 'Setup logging', passed: false, error: String(e) });

@@ -7,6 +7,7 @@
 #include <cstring>  // For strrchr
 #include <unistd.h> // For fsync, close
 #include <fcntl.h>  // For open, O_RDONLY
+#include <mutex>    // For std::mutex, std::lock_guard
 
 extern "C" {
 #include <turso.h>
@@ -34,6 +35,13 @@ namespace turso
 
     // Global base path for database files
     static std::string g_basePath;
+
+    // Logger callback state — the Rust tracing subscriber may fire from any thread,
+    // so we copy log data in the C callback and schedule JS execution via CallInvoker.
+    static jsi::Runtime* g_runtime = nullptr;
+    static std::shared_ptr<react::CallInvoker> g_callInvoker;
+    static std::shared_ptr<jsi::Function> g_loggerFn;
+    static std::mutex g_loggerMutex;
 
     /**
      * Normalize a database path:
@@ -66,12 +74,79 @@ namespace turso
         }
     }
 
+    /**
+     * Map turso_tracing_level_t enum to JS-friendly string.
+     */
+    static const char* tracingLevelToString(turso_tracing_level_t level)
+    {
+        switch (level)
+        {
+            case TURSO_TRACING_LEVEL_ERROR: return "error";
+            case TURSO_TRACING_LEVEL_WARN:  return "warn";
+            case TURSO_TRACING_LEVEL_INFO:  return "info";
+            case TURSO_TRACING_LEVEL_DEBUG: return "debug";
+            case TURSO_TRACING_LEVEL_TRACE: return "trace";
+            default:                        return "error";
+        }
+    }
+
+    /**
+     * C callback invoked by the Rust tracing subscriber (possibly from any thread).
+     * Copies all string data synchronously, then schedules a JS call on the JS thread.
+     */
+    static void turso_logger_callback(const turso_log_t *log)
+    {
+        std::lock_guard<std::mutex> lock(g_loggerMutex);
+        if (!g_loggerFn || !g_callInvoker || !g_runtime)
+        {
+            return;
+        }
+
+        // Copy all data — the turso_log_t fields are only valid during this callback.
+        std::string message = log->message ? log->message : "";
+        std::string target  = log->target  ? log->target  : "";
+        std::string file    = log->file    ? log->file    : "";
+        uint64_t timestamp  = log->timestamp;
+        size_t line         = log->line;
+        const char* level   = tracingLevelToString(log->level);
+        std::string levelStr(level);
+
+        // Prevent captures from preventing cleanup — capture shared_ptr copies
+        auto callInvoker = g_callInvoker;
+        auto loggerFn    = g_loggerFn;
+
+        callInvoker->invokeAsync(
+            [loggerFn, message = std::move(message), target = std::move(target),
+             file = std::move(file), timestamp, line, levelStr = std::move(levelStr)]
+            (jsi::Runtime &rt)
+            {
+                try
+                {
+                    jsi::Object logObj(rt);
+                    logObj.setProperty(rt, "message",   jsi::String::createFromUtf8(rt, message));
+                    logObj.setProperty(rt, "target",    jsi::String::createFromUtf8(rt, target));
+                    logObj.setProperty(rt, "file",      jsi::String::createFromUtf8(rt, file));
+                    logObj.setProperty(rt, "timestamp", static_cast<double>(timestamp));
+                    logObj.setProperty(rt, "line",      static_cast<double>(line));
+                    logObj.setProperty(rt, "level",     jsi::String::createFromUtf8(rt, levelStr));
+
+                    loggerFn->call(rt, logObj);
+                }
+                catch (...)
+                {
+                    // Logger must never crash the app — swallow all exceptions.
+                }
+            });
+    }
+
     void install(
         jsi::Runtime &rt,
         const std::shared_ptr<react::CallInvoker> &invoker,
         const char *basePath)
     {
         g_basePath = basePath ? basePath : "";
+        g_runtime = &rt;
+        g_callInvoker = invoker;
 
         // Create the module object
         jsi::Object module(rt);
@@ -440,6 +515,21 @@ namespace turso
 
                 turso_config_t config = {nullptr, logLevelStr.empty() ? nullptr : logLevelStr.c_str()};
 
+                // Wire up logger callback if provided
+                if (options.hasProperty(rt, "logger"))
+                {
+                    jsi::Value loggerVal = options.getProperty(rt, "logger");
+                    if (loggerVal.isObject() && loggerVal.asObject(rt).isFunction(rt))
+                    {
+                        {
+                            std::lock_guard<std::mutex> lock(g_loggerMutex);
+                            g_loggerFn = std::make_shared<jsi::Function>(
+                                loggerVal.asObject(rt).asFunction(rt));
+                        }
+                        config.logger = turso_logger_callback;
+                    }
+                }
+
                 // Call turso_setup
                 const char *error = nullptr;
                 turso_status_code_t status = turso_setup(&config, &error);
@@ -587,7 +677,10 @@ namespace turso
 
     void invalidate()
     {
-        // Cleanup if needed
+        std::lock_guard<std::mutex> lock(g_loggerMutex);
+        g_loggerFn.reset();
+        g_callInvoker.reset();
+        g_runtime = nullptr;
     }
 
 } // namespace turso

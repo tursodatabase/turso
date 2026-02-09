@@ -8,6 +8,7 @@ import { NativeModules } from 'react-native';
 import { Database } from './Database';
 import type {
   DatabaseOpts,
+  TursoLoggerFn,
   TursoNativeModule,
   TursoProxy as TursoProxyType,
 } from './types';
@@ -27,6 +28,11 @@ export type {
 
   // Sync types
   SyncStats,
+
+  // Logging
+  TursoLog,
+  TursoLoggerFn,
+  TursoTracingLevel,
 
   // Enums
   TursoStatus,
@@ -165,10 +171,15 @@ export function version(): string {
  * ```ts
  * import { setup } from '@tursodatabase/sync-react-native';
  *
- * setup({ logLevel: 'debug' });
+ * setup({
+ *   logLevel: 'debug',
+ *   logger: (log) => {
+ *     console.log(`[${log.level}] ${log.target}: ${log.message}`);
+ *   },
+ * });
  * ```
  */
-export function setup(options: {logLevel?: string}): void {
+export function setup(options: {logLevel?: string; logger?: TursoLoggerFn}): void {
   TursoProxy.setup(options);
 }
 
