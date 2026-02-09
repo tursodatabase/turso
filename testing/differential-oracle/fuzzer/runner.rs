@@ -22,6 +22,7 @@ use rand_chacha::ChaCha8Rng;
 use turso_core::Database;
 
 use crate::generate::{GeneratorKind, PropTestBackend, SqlGenBackend, SqlGenerator};
+pub use sql_gen::TreeMode;
 use crate::memory::{MemorySimIO, SimIO};
 use crate::oracle::{OracleResult, check_differential};
 use crate::schema::SchemaIntrospector;
@@ -43,6 +44,8 @@ pub struct SimConfig {
     pub keep_files: bool,
     /// Which SQL generator backend to use.
     pub generator: GeneratorKind,
+    /// Coverage report tree mode.
+    pub tree_mode: TreeMode,
 }
 
 impl Default for SimConfig {
@@ -55,6 +58,7 @@ impl Default for SimConfig {
             verbose: false,
             keep_files: false,
             generator: GeneratorKind::default(),
+            tree_mode: TreeMode::default(),
         }
     }
 }
@@ -248,16 +252,31 @@ impl Fuzzer {
     pub fn run(&self) -> Result<SimStats> {
         let mut stats = SimStats::default();
         let mut executed_sql = Vec::new();
+        let mut coverage = None;
 
-        let result = self.run_inner(&mut stats, &mut executed_sql);
+        let result = self.run_inner(&mut stats, &mut executed_sql, &mut coverage);
 
         // Always write SQL file and print stats, even on error
         if let Err(e) = self.write_sql_file(&executed_sql) {
             tracing::warn!("Failed to write test.sql: {e}");
         }
+        if let Some(cov) = coverage {
+            if let Err(e) = self.write_coverage_report(&cov) {
+                tracing::warn!("Failed to write coverage report: {e}");
+            }
+        }
         stats.print_table(&self.config);
 
         result.map(|()| stats)
+    }
+
+    /// Write the coverage report to simulator-output/coverage.txt
+    fn write_coverage_report(&self, coverage: &sql_gen::Coverage) -> Result<()> {
+        let report = coverage.report_with_mode(self.config.tree_mode);
+        let full_path = self.out_dir.join("coverage.txt");
+        std::fs::write(&full_path, report.to_string())?;
+        tracing::info!("Wrote coverage report to {}", full_path.display());
+        Ok(())
     }
 
     /// Write all executed SQL statements to test.sql
@@ -275,7 +294,12 @@ impl Fuzzer {
         Ok(())
     }
 
-    fn run_inner(&self, stats: &mut SimStats, executed_sql: &mut Vec<String>) -> Result<()> {
+    fn run_inner(
+        &self,
+        stats: &mut SimStats,
+        executed_sql: &mut Vec<String>,
+        coverage_out: &mut Option<sql_gen::Coverage>,
+    ) -> Result<()> {
         tracing::info!(
             "Starting simulation with seed={}, tables={}, statements={}, generator={:?}",
             self.config.seed,
@@ -383,6 +407,8 @@ impl Fuzzer {
             }
         }
 
+        *coverage_out = generator.take_coverage();
+
         Ok(())
     }
 
@@ -463,6 +489,7 @@ mod tests {
             verbose: false,
             keep_files: false,
             generator: GeneratorKind::default(),
+            tree_mode: TreeMode::default(),
         };
         let sim = Fuzzer::new(config);
         assert!(sim.is_ok());

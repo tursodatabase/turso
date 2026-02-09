@@ -109,6 +109,7 @@ impl Context {
         self.origin_stack.push(origin);
         self.depth += 1;
         self.trace_builder.push_scope(origin);
+        self.coverage.record_scope(&self.origin_stack);
 
         if matches!(origin, Origin::Subquery) {
             self.subquery_depth += 1;

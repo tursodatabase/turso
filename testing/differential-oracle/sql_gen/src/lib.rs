@@ -68,7 +68,7 @@ pub use policy::{
 pub use schema::{ColumnDef, DataType, Index, Schema, SchemaBuilder, Table};
 pub use strategy::{GeneratedSql, SqlStrategy};
 pub use trace::{
-    Coverage, CoverageReport, ExprKind, Origin, OriginPath, StmtKind, Trace, TraceNode,
+    Coverage, CoverageReport, ExprKind, Origin, OriginPath, StmtKind, Trace, TraceNode, TreeMode,
 };
 
 // Re-export procedural macros
