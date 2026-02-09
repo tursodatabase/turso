@@ -39,10 +39,8 @@ export default function App() {
     // Configure logging
     try {
       setup({
-        logLevel: 'debug',
-        logger: (log: TursoLog) => {
-          console.log(`[turso:${log.level}] ${log.target}: ${log.message}`);
-        },
+        logLevel: 'info',
+        logger: (log) => console.log(`[turso:${log.level}] ${log.target}: ${log.message}`),
       });
       testResults.push({ name: 'Setup logging', passed: true });
     } catch (e) {
@@ -53,7 +51,7 @@ export default function App() {
     let db: Database | null = null;
     try {
       const start = performance.now();
-      db = await connect({ path: 'test.db' });
+      db = await connect({ path: `test-${Date.now()}.db` });
       setOpenTime(performance.now() - start);
       testResults.push({ name: 'Open database', passed: true });
     } catch (e) {
@@ -180,7 +178,7 @@ export default function App() {
       // Test: Connect to sync database
       try {
         syncDb = await connect({
-          path: 'sync-test.db',
+          path: `sync-test-${Date.now()}.db`,
           url: TURSO_DATABASE_URL,
           authToken: TURSO_AUTH_TOKEN,
         });
@@ -256,7 +254,7 @@ export default function App() {
       // Test: Connect with encryption
       try {
         encDb = await connect({
-          path: 'encrypted-test.db',
+          path: `encrypted-test-${Date.now()}.db`,
           url: TURSO_DATABASE_URL,
           authToken: TURSO_AUTH_TOKEN,
           remoteEncryption: {
