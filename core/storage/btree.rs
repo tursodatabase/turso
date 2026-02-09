@@ -1,5 +1,7 @@
 use branches::mark_unlikely;
-use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use rustc_hash::FxHashMap as HashMap;
+#[cfg(debug_assertions)]
+use rustc_hash::FxHashSet as HashSet;
 use smallvec::SmallVec;
 use tracing::{instrument, Level};
 
