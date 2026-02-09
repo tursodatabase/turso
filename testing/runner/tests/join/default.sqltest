@@ -166,7 +166,7 @@ expect {
 }
 
 test left-join-row-id {
-    select u.rowid, p.rowid from users u left join products as p on u.rowid = p.rowid where u.rowid >= 10 limit 5;
+    select u.rowid, p.rowid from users u left join products as p on u.rowid = p.rowid where u.rowid >= 10 order by u.rowid limit 5;
 }
 expect {
     10|10
@@ -197,7 +197,7 @@ expect {
 }
 
 test left-join-non-pk {
-    select users.first_name as user_name, products.name as product_name from users left join products on users.first_name = products.name limit 3;
+    select users.first_name as user_name, products.name as product_name from users left join products on users.first_name = products.name order by users.id limit 3;
 }
 expect {
     Dan|
