@@ -36,6 +36,11 @@ pub enum GeneratorKind {
 pub trait SqlGenerator {
     /// Generate the next SQL statement given the current schema.
     fn generate(&mut self, schema: &sql_gen::Schema) -> Result<GeneratedStatement>;
+
+    /// Take accumulated coverage data, if the backend supports it.
+    fn take_coverage(&mut self) -> Option<sql_gen::Coverage> {
+        None
+    }
 }
 
 /// sql_gen (type-state) backend.
@@ -83,6 +88,10 @@ impl SqlGenerator for SqlGenBackend {
             is_ddl,
             has_unordered_limit,
         })
+    }
+
+    fn take_coverage(&mut self) -> Option<sql_gen::Coverage> {
+        Some(self.ctx.take_coverage())
     }
 }
 

@@ -12,5 +12,5 @@ pub mod schema;
 pub use generate::{GeneratedStatement, GeneratorKind, SqlGenerator};
 pub use memory::{MemorySimFile, MemorySimIO, SimIO};
 pub use oracle::{DifferentialOracle, Oracle, OracleResult, check_differential};
-pub use runner::{Fuzzer, SimConfig, SimStats};
+pub use runner::{Fuzzer, SimConfig, SimStats, TreeMode};
 pub use schema::SchemaIntrospector;

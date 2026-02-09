@@ -222,20 +222,7 @@ fn generate_select_impl<C: Capabilities>(
 
     // --- LIMIT / OFFSET ---
     let (limit, offset) = match mode {
-        SelectMode::Full => {
-            let limit = if ctx.gen_bool_with_prob(select_config.limit_probability) {
-                Some(ctx.gen_range_inclusive(1, generator.policy().max_limit as usize) as u64)
-            } else {
-                None
-            };
-            let offset =
-                if limit.is_some() && ctx.gen_bool_with_prob(select_config.offset_probability) {
-                    Some(ctx.gen_range_inclusive(0, select_config.max_offset as usize) as u64)
-                } else {
-                    None
-                };
-            (limit, offset)
-        }
+        SelectMode::Full => generate_limit_offset(generator, ctx),
         SelectMode::Scalar => (Some(1), None),
     };
 
@@ -253,10 +240,12 @@ fn generate_select_impl<C: Capabilities>(
         None
     };
 
+    let from = ctx.scope(Origin::From, |_ctx| Some(table.name.clone()));
+
     Ok(SelectStmt {
         distinct,
         columns,
-        from: Some(table.name.clone()),
+        from,
         from_alias,
         where_clause,
         group_by,
@@ -381,6 +370,7 @@ fn generate_having<C: Capabilities>(
 /// Generate ORDER BY clause for a grouped query.
 ///
 /// Only orders by columns that appear in GROUP BY.
+#[trace_gen(Origin::OrderBy)]
 fn generate_grouped_order_by<C: Capabilities>(
     generator: &SqlGen<C>,
     ctx: &mut Context,
@@ -484,6 +474,7 @@ fn generate_select_columns<C: Capabilities>(
 }
 
 /// Generate ORDER BY clause.
+#[trace_gen(Origin::OrderBy)]
 fn generate_order_by<C: Capabilities>(
     generator: &SqlGen<C>,
     ctx: &mut Context,
@@ -529,6 +520,26 @@ fn generate_order_by<C: Capabilities>(
     }
 
     Ok(items)
+}
+
+/// Generate LIMIT / OFFSET values.
+#[trace_gen(Origin::Limit)]
+fn generate_limit_offset<C: Capabilities>(
+    generator: &SqlGen<C>,
+    ctx: &mut Context,
+) -> (Option<u64>, Option<u64>) {
+    let select_config = &generator.policy().select_config;
+    let limit = if ctx.gen_bool_with_prob(select_config.limit_probability) {
+        Some(ctx.gen_range_inclusive(1, generator.policy().max_limit as usize) as u64)
+    } else {
+        None
+    };
+    let offset = if limit.is_some() && ctx.gen_bool_with_prob(select_config.offset_probability) {
+        Some(ctx.gen_range_inclusive(0, select_config.max_offset as usize) as u64)
+    } else {
+        None
+    };
+    (limit, offset)
 }
 
 /// Check whether an expression is a bare literal or a unary op wrapping one

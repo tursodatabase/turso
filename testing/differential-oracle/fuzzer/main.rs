@@ -7,7 +7,7 @@ use std::io::{IsTerminal, stdin};
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use differential_fuzzer::{Fuzzer, GeneratorKind, SimConfig};
+use differential_fuzzer::{Fuzzer, GeneratorKind, SimConfig, TreeMode};
 use rand::RngCore;
 
 /// SQLancer-style differential testing fuzzer for Turso.
@@ -44,6 +44,10 @@ struct Args {
     /// SQL generator backend to use.
     #[arg(short = 'g', long, default_value = "sql-gen", value_enum)]
     generator: GeneratorKind,
+
+    /// Use full hierarchical tree in the coverage report instead of simplified flat view.
+    #[arg(long)]
+    full_tree: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -99,6 +103,11 @@ fn run_single(args: &Args) -> Result<()> {
         verbose: args.verbose,
         keep_files: args.keep_files,
         generator: args.generator,
+        tree_mode: if args.full_tree {
+            TreeMode::Full
+        } else {
+            TreeMode::Simplified
+        },
     };
 
     tracing::info!("Starting differential_fuzzer with config: {:?}", config);
