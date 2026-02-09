@@ -166,8 +166,13 @@ jsi::Value TursoConnectionHostObject::setBusyTimeout(jsi::Runtime &rt, const jsi
 }
 
 jsi::Value TursoConnectionHostObject::close(jsi::Runtime &rt) {
+    if (!conn_) {
+        return jsi::Value::undefined();
+    }
+
     const char* error = nullptr;
     turso_status_code_t status = turso_connection_close(conn_, &error);
+    conn_ = nullptr; // Prevent destructor from calling deinit on closed connection
 
     if (status != TURSO_OK) {
         throwError(rt, error);
