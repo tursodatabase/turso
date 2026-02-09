@@ -2,7 +2,7 @@ use crate::{
     translate::{
         collate::{get_collseq_from_expr, CollationSeq},
         optimizer::access_method::AccessMethodParams,
-        plan::{GroupBy, IterationDirection, JoinedTable, TableReferences},
+        plan::{GroupBy, HashJoinType, IterationDirection, JoinedTable, TableReferences},
         planner::table_mask_from_expr,
     },
     util::exprs_are_equivalent,
@@ -167,6 +167,17 @@ pub fn plan_satisfies_order_target(
     joined_tables: &[JoinedTable],
     order_target: &OrderTarget,
 ) -> bool {
+    // Cannot eliminate sort when an outer hash join is present — the unmatched
+    // build scan produces rows in hash bucket order, not scan order.
+    for (_, access_method_index) in plan.data.iter() {
+        let access_method = &access_methods_arena[*access_method_index];
+        if let AccessMethodParams::HashJoin { join_type, .. } = &access_method.params {
+            if matches!(join_type, HashJoinType::LeftOuter | HashJoinType::FullOuter) {
+                return false;
+            }
+        }
+    }
+
     let mut target_col_idx = 0;
     let num_cols_in_order_target = order_target.0.len();
     for (table_index, access_method_index) in plan.data.iter() {

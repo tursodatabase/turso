@@ -35,6 +35,7 @@ use crate::{
     },
     turso_assert,
     types::SeekOp,
+    util::expr_tables_subset_of,
     vdbe::{
         affinity::{self, Affinity},
         builder::{
@@ -1758,8 +1759,15 @@ pub fn open_loop(
                         } else {
                             None
                         },
-                        build_cursor_id: Some(build_cursor_id),
+                        build_cursor_id: if payload_info.allow_seek {
+                            Some(build_cursor_id)
+                        } else {
+                            None
+                        },
                         join_type: hash_join_op.join_type,
+                        inner_loop_gosub_reg: None,
+                        inner_loop_gosub_label: None,
+                        inner_loop_skip_label: None,
                     },
                 );
 
@@ -1956,6 +1964,41 @@ pub fn open_loop(
             subqueries,
             SubqueryRefFilter::WithSubqueryRefs,
         )?;
+
+        // For outer hash joins: wrap inner table loops in a Gosub/Return subroutine.
+        // This allows unmatched emission paths (check_outer, unmatched build scan) to
+        // re-enter inner loops via Gosub, ensuring inner table cursors are properly
+        // Rewind'd and iterated for every emitted row.
+        if let Operation::HashJoin(ref hj) = table.op {
+            if matches!(
+                hj.join_type,
+                HashJoinType::LeftOuter | HashJoinType::FullOuter
+            ) {
+                let return_reg = program.alloc_register();
+                let gosub_label = program.allocate_label();
+                let skip_label = program.allocate_label();
+
+                // Call inner loop subroutine
+                program.emit_insn(Insn::Gosub {
+                    target_pc: gosub_label,
+                    return_reg,
+                });
+                // After Return, skip over the subroutine body to HashNext
+                program.emit_insn(Insn::Goto {
+                    target_pc: skip_label,
+                });
+                // Resolve gosub_label to the next instruction — this is where the
+                // inner table open_loops (or emit if no inner tables) will be emitted.
+                program.preassign_label_to_next_insn(gosub_label);
+
+                // Update hash context with gosub info
+                if let Some(hash_ctx) = t_ctx.hash_table_contexts.get_mut(&hj.build_table_idx) {
+                    hash_ctx.inner_loop_gosub_reg = Some(return_reg);
+                    hash_ctx.inner_loop_gosub_label = Some(gosub_label);
+                    hash_ctx.inner_loop_skip_label = Some(skip_label);
+                }
+            }
+        }
     }
 
     if subqueries.iter().any(|s| !s.has_been_evaluated()) {
@@ -2439,7 +2482,24 @@ pub fn close_loop(
                     let check_outer_label = hash_ctx.check_outer_label;
                     let build_cursor_id = hash_ctx.build_cursor_id;
                     let join_type = hash_ctx.join_type;
+                    let inner_loop_gosub_reg = hash_ctx.inner_loop_gosub_reg;
+                    let inner_loop_gosub_label = hash_ctx.inner_loop_gosub_label;
+                    let inner_loop_skip_label = hash_ctx.inner_loop_skip_label;
                     let label_next_probe_row = program.allocate_label();
+
+                    // End the inner loop subroutine with Return if Gosub wrapping is active.
+                    // This comes before HashNext — the subroutine body is everything
+                    // between the Gosub label (resolved in open_loop) and this Return.
+                    if let Some(gosub_reg) = inner_loop_gosub_reg {
+                        program.emit_insn(Insn::Return {
+                            return_reg: gosub_reg,
+                            can_fallthrough: false,
+                        });
+                        // Resolve skip_label to the next instruction (HashNext follows)
+                        if let Some(skip_label) = inner_loop_skip_label {
+                            program.preassign_label_to_next_insn(skip_label);
+                        }
+                    }
 
                     // For FULL OUTER, HashNext exhaustion goes to check_outer.
                     // For LEFT OUTER and inner, it goes to next_probe_row.
@@ -2517,11 +2577,30 @@ pub fn close_loop(
                         // Evaluate WHERE conditions (not ON conditions) on the
                         // unmatched probe row. Build columns are NULL (NullRow set).
                         // If a condition fails, skip to next probe row.
+                        //
+                        // Same as the unmatched build scan: only evaluate conditions
+                        // on build/probe when a Gosub handles inner loops.
                         if let Some(plan) = select_plan {
+                            let has_gosub_co =
+                                inner_loop_gosub_reg.is_some() && inner_loop_gosub_label.is_some();
+                            let allowed_tables_co = {
+                                let mut m = TableMask::new();
+                                m.add_table(hash_join_op.build_table_idx);
+                                m.add_table(table_index);
+                                m
+                            };
                             for cond in plan
                                 .where_clause
                                 .iter()
                                 .filter(|c| !c.consumed && c.from_outer_join.is_none())
+                                .filter(|c| {
+                                    !has_gosub_co
+                                        || expr_tables_subset_of(
+                                            &c.expr,
+                                            &plan.table_references,
+                                            &allowed_tables_co,
+                                        )
+                                })
                             {
                                 let jump_target_when_true = program.allocate_label();
                                 let condition_metadata = ConditionMetadata {
@@ -2540,10 +2619,18 @@ pub fn close_loop(
                                 program.preassign_label_to_next_insn(jump_target_when_true);
                             }
 
-                            // Emit result columns. Build cursor has NullRow set,
-                            // so build columns return NULL. Use emit_loop to route
-                            // through ORDER BY sorter when needed.
-                            emit_loop(program, t_ctx, plan)?;
+                            // Emit via Gosub to re-enter inner loops (which properly
+                            // Rewind inner table cursors). Build cursor has NullRow set.
+                            if let (Some(gosub_reg), Some(gosub_label)) =
+                                (inner_loop_gosub_reg, inner_loop_gosub_label)
+                            {
+                                program.emit_insn(Insn::Gosub {
+                                    target_pc: gosub_label,
+                                    return_reg: gosub_reg,
+                                });
+                            } else {
+                                emit_loop(program, t_ctx, plan)?;
+                            }
                         }
                     }
 
@@ -2607,10 +2694,34 @@ pub fn close_loop(
                         // Evaluate WHERE conditions (not ON conditions) on
                         // the unmatched build row. Probe columns are NULL
                         // (NullRow set). If a condition fails, skip this row.
+                        //
+                        // When a Gosub handles inner loops, only evaluate
+                        // conditions whose table references are limited to
+                        // build + probe (whose cursors are open). Conditions
+                        // referencing inner tables are handled by the Gosub
+                        // subroutine — evaluating them here would read from
+                        // cursors that may not be open yet.
+                        let gosub_reg = hash_ctx.inner_loop_gosub_reg;
+                        let gosub_label = hash_ctx.inner_loop_gosub_label;
+                        let has_gosub = gosub_reg.is_some() && gosub_label.is_some();
+                        let allowed_tables = {
+                            let mut m = TableMask::new();
+                            m.add_table(hash_join_op.build_table_idx);
+                            m.add_table(table_index);
+                            m
+                        };
                         for cond in plan
                             .where_clause
                             .iter()
                             .filter(|c| !c.consumed && c.from_outer_join.is_none())
+                            .filter(|c| {
+                                !has_gosub
+                                    || expr_tables_subset_of(
+                                        &c.expr,
+                                        &plan.table_references,
+                                        &allowed_tables,
+                                    )
+                            })
                         {
                             let jump_target_when_true = program.allocate_label();
                             let condition_metadata = ConditionMetadata {
@@ -2629,10 +2740,17 @@ pub fn close_loop(
                             program.preassign_label_to_next_insn(jump_target_when_true);
                         }
 
-                        // Emit result columns independently — probe columns return NULL
-                        // (NullRow set), build columns come from the positioned build cursor.
-                        // Use emit_loop to route through ORDER BY sorter when needed.
-                        emit_loop(program, t_ctx, plan)?;
+                        // Emit via Gosub to re-enter inner loops (which properly
+                        // Rewind inner table cursors). Probe cursor has NullRow set,
+                        // build cursor is positioned via SeekRowid.
+                        if let (Some(gosub_reg), Some(gosub_label)) = (gosub_reg, gosub_label) {
+                            program.emit_insn(Insn::Gosub {
+                                target_pc: gosub_label,
+                                return_reg: gosub_reg,
+                            });
+                        } else {
+                            emit_loop(program, t_ctx, plan)?;
+                        }
 
                         // Try the next unmatched entry
                         program.resolve_label(label_next_unmatched, program.offset());

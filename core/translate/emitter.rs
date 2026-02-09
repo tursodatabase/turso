@@ -248,6 +248,14 @@ pub struct HashCtx {
     pub build_cursor_id: Option<CursorID>,
     /// The join type of this hash join.
     pub join_type: HashJoinType,
+    /// Register for Gosub/Return when inner loops are wrapped in a subroutine.
+    /// For outer hash joins, inner table loops are wrapped so unmatched emission
+    /// paths can re-enter them via Gosub.
+    pub inner_loop_gosub_reg: Option<usize>,
+    /// Label for the inner loop subroutine entry point.
+    pub inner_loop_gosub_label: Option<BranchOffset>,
+    /// Label to skip over the inner loop subroutine body (resolved after Return).
+    pub inner_loop_skip_label: Option<BranchOffset>,
 }
 
 /// The TranslateCtx struct holds various information and labels used during bytecode generation.
