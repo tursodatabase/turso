@@ -91,6 +91,10 @@ impl SqlBackend for CliBackend {
         Capability::all_set()
     }
 
+    fn is_sqlite(&self) -> bool {
+        self.is_sqlite
+    }
+
     async fn create_database(
         &self,
         config: &DatabaseConfig,
