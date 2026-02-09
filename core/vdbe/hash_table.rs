@@ -2051,7 +2051,10 @@ impl HashTable {
                 let bucket_idx = (entry.hash as usize) % bucket_count;
                 partition.buckets[bucket_idx].insert(entry);
             }
-            if self.track_matched {
+            if self.track_matched && partition.matched_bits.is_empty() {
+                // Only initialize matched_bits on the first load. On subsequent
+                // reloads (after eviction), the existing bits are preserved so that
+                // probe marks set during earlier passes are not lost.
                 partition.matched_bits = partition
                     .buckets
                     .iter()
