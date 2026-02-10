@@ -549,6 +549,63 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
         }
     }
 
+    /// Garbage-collect row versions for rows that were just checkpointed.
+    /// Must be called AFTER checkpointed_txid_max is updated and BEFORE the
+    /// checkpoint lock is released (no concurrent writers under blocking lock).
+    fn gc_checkpointed_versions(&self) {
+        // Safety: entry removal after dropping the version-chain write lock has a
+        // TOCTOU gap — a concurrent writer could insert between the two. This is
+        // only safe because the blocking checkpoint lock prevents concurrent writers.
+        // If we ever move to a non-blocking checkpoint, this must switch to lazy
+        // removal (like background GC) or hold the write lock across the remove().
+        debug_assert!(
+            self.lock_states.blocking_checkpoint_lock_held,
+            "gc_checkpointed_versions requires the blocking checkpoint lock"
+        );
+        let lwm = self.mvstore.compute_lwm();
+        let ckpt_max = self.checkpointed_txid_max_new;
+
+        for (row_version, _special_write) in &self.write_set {
+            let row_id = &row_version.row.id;
+            let is_now_empty = {
+                let entry = self
+                    .mvstore
+                    .rows
+                    .get(row_id)
+                    .expect("write set row must exist in SkipMap");
+                let mut versions = entry.value().write();
+                MvStore::<Clock>::gc_version_chain(&mut versions, lwm, ckpt_max);
+                versions.is_empty()
+            };
+            if is_now_empty {
+                self.mvstore.rows.remove(row_id);
+            }
+        }
+
+        for (index_id, row_version, _is_delete) in &self.index_write_set {
+            let RowKey::Record(sortable_key) = &row_version.row.id.row_id else {
+                unreachable!("index row versions always have Record keys");
+            };
+            let outer_entry = self
+                .mvstore
+                .index_rows
+                .get(index_id)
+                .expect("index_id from write set must exist in index_rows");
+            let inner_map = outer_entry.value();
+            let is_now_empty = {
+                let inner_entry = inner_map
+                    .get(sortable_key)
+                    .expect("index row from write set must exist in inner map");
+                let mut versions = inner_entry.value().write();
+                MvStore::<Clock>::gc_version_chain(&mut versions, lwm, ckpt_max);
+                versions.is_empty()
+            };
+            if is_now_empty {
+                inner_map.remove(sortable_key);
+            }
+        }
+    }
+
     fn step_inner(&mut self, _context: &()) -> Result<TransitionResult<CheckpointResult>> {
         match &self.state {
             CheckpointState::AcquireLock => {
@@ -1208,8 +1265,21 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                         .get(&key)
                         .expect("sqlite_schema row not found");
                     let mut row_versions = sqlite_schema_row.value().write();
-                    self.mvstore
-                        .insert_version_raw(&mut row_versions, row_version);
+                    // row_version is a clone of the original with only the root
+                    // page column patched, so it shares the same version id. We
+                    // must replace the original in-place rather than append,
+                    // otherwise the version chain ends up with two entries that
+                    // have identical (id, begin, end). A later DELETE only marks
+                    // one of them as ended (it returns after the first match),
+                    // leaving the other as a phantom current version that causes
+                    // spurious write-write conflicts at commit time.
+                    let vid = row_version.id;
+                    if let Some(existing) = row_versions.iter_mut().find(|rv| rv.id == vid) {
+                        *existing = row_version;
+                    } else {
+                        self.mvstore
+                            .insert_version_raw(&mut row_versions, row_version);
+                    }
                 }
 
                 // Patch in-memory schema to do the same
@@ -1269,6 +1339,8 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 self.mvstore
                     .checkpointed_txid_max
                     .store(self.checkpointed_txid_max_new, Ordering::SeqCst);
+                self.gc_checkpointed_versions();
+                self.mvstore.drop_unused_row_versions();
                 self.checkpoint_lock.unlock();
                 self.finalize(&())?;
                 Ok(TransitionResult::Done(

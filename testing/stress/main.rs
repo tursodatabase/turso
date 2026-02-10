@@ -770,7 +770,9 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
                 break;
             }
             if retry_counter == 10 {
-                panic!("Could not execute statement [{stmt}] after {retry_counter} attempts.");
+                eprintln!(
+                    "WARNING: Could not execute statement [{stmt}] after {retry_counter} attempts."
+                );
             }
         }
 
