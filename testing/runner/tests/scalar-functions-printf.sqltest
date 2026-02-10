@@ -651,6 +651,63 @@ expect {
     Number:   -042
 }
 
+test printf-huge-width-no-crash {
+    SELECT printf('%999999999999d', 42) IS NULL;
+}
+expect {
+    1
+}
+
+test printf-huge-precision-no-crash {
+    SELECT printf('%.999999999999d', 42) IS NULL;
+}
+expect {
+    1
+}
+
+# Width/precision for non-%d specifiers
+test printf-width-string {
+    SELECT printf('[%5s]', 'hi');
+}
+expect {
+    [   hi]
+}
+
+test printf-width-float {
+    SELECT printf('[%10f]', 3.14);
+}
+expect {
+    [  3.140000]
+}
+
+test printf-precision-float {
+    SELECT printf('[%.2f]', 3.14);
+}
+expect {
+    [3.14]
+}
+
+test printf-width-precision-float {
+    SELECT printf('[%10.2f]', 3.14);
+}
+expect {
+    [      3.14]
+}
+
+test printf-width-hex {
+    SELECT printf('[%5x]', 255);
+}
+expect {
+    [   ff]
+}
+
+test printf-width-octal {
+    SELECT printf('[%5o]', 8);
+}
+expect {
+    [   10]
+}
+
 test printf-i64-min-basic {
     SELECT printf('%d', -9223372036854775808);
 }

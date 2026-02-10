@@ -105,7 +105,10 @@ pub fn exec_printf(values: &[Register]) -> crate::Result<Value> {
             }
         }
         if !width_str.is_empty() {
-            width = width_str.parse().ok();
+            match width_str.parse::<i32>() {
+                Ok(w) => width = Some(w as usize),
+                Err(_) => return Ok(Value::Null),
+            }
         }
 
         if let Some(&'.') = chars.peek() {
@@ -122,7 +125,10 @@ pub fn exec_printf(values: &[Register]) -> crate::Result<Value> {
             precision = if precision_str.is_empty() {
                 Some(0)
             } else {
-                precision_str.parse().ok()
+                match precision_str.parse::<i32>() {
+                    Ok(p) => Some(p as usize),
+                    Err(_) => return Ok(Value::Null),
+                }
             };
         }
 
@@ -187,12 +193,20 @@ pub fn exec_printf(values: &[Register]) -> crate::Result<Value> {
                 if args_index >= values.len() {
                     return Err(LimboError::InvalidArgument("not enough arguments".into()));
                 }
-                match &values[args_index].get_value() {
-                    Value::Text(t) => result.push_str(t.as_str()),
-                    Value::Null => (),
-                    v => write!(result, "{v}")
-                        .expect("write! to a String cannot fail; it panics on OOM"),
+                let mut formatted = match &values[args_index].get_value() {
+                    Value::Text(t) => t.as_str().to_string(),
+                    Value::Null => String::new(),
+                    v => format!("{v}"),
+                };
+                if let Some(p) = precision {
+                    formatted.truncate(p);
                 }
+                if let Some(w) = width {
+                    if w > formatted.len() {
+                        formatted = format!("{formatted:>w$}");
+                    }
+                }
+                result.push_str(&formatted);
                 args_index += 1;
             }
             Some('f') => {
@@ -200,13 +214,29 @@ pub fn exec_printf(values: &[Register]) -> crate::Result<Value> {
                     return Err(LimboError::InvalidArgument("not enough arguments".into()));
                 }
                 let value = &values[args_index].get_value();
-                match value {
-                    Value::Numeric(Numeric::Float(f)) => write!(result, "{:.6}", f64::from(*f))
-                        .expect("write! to a String cannot fail; it panics on OOM"),
-                    Value::Numeric(Numeric::Integer(i)) => write!(result, "{:.6}", *i as f64)
-                        .expect("write! to a String cannot fail; it panics on OOM"),
-                    _ => result.push_str("0.000000"),
+                let f_val = match value {
+                    Value::Numeric(Numeric::Float(f)) => f64::from(*f),
+                    Value::Numeric(Numeric::Integer(i)) => *i as f64,
+                    _ => 0.0,
+                };
+                let p = precision.unwrap_or(6);
+                let mut formatted = format!("{f_val:.p$}");
+                if let Some(w) = width {
+                    if w > formatted.len() {
+                        if zero_pad {
+                            if f_val.is_sign_negative() && f_val != 0.0 {
+                                let abs_formatted = format!("{:.p$}", f_val.abs());
+                                let pad_width = w - 1;
+                                formatted = format!("-{abs_formatted:0>pad_width$}");
+                            } else {
+                                formatted = format!("{formatted:0>w$}");
+                            }
+                        } else {
+                            formatted = format!("{formatted:>w$}");
+                        }
+                    }
                 }
+                result.push_str(&formatted);
                 args_index += 1;
             }
             Some('e') => {
@@ -303,20 +333,25 @@ pub fn exec_printf(values: &[Register]) -> crate::Result<Value> {
                     return Err(LimboError::InvalidArgument("not enough arguments".into()));
                 }
                 let value = &values[args_index].get_value();
-                match value {
-                    Value::Numeric(Numeric::Float(f)) => {
-                        write!(result, "{:x}", f64::from(*f) as i64)
-                            .expect("write! to a String cannot fail; it panics on OOM")
-                    }
-                    Value::Numeric(Numeric::Integer(i)) => write!(result, "{i:x}")
-                        .expect("write! to a String cannot fail; it panics on OOM"),
+                let mut formatted = match value {
+                    Value::Numeric(Numeric::Float(f)) => format!("{:x}", f64::from(*f) as i64),
+                    Value::Numeric(Numeric::Integer(i)) => format!("{i:x}"),
                     Value::Text(s) => {
                         let i: i64 = s.as_str().parse::<i64>().unwrap_or(0);
-                        write!(result, "{i:x}")
-                            .expect("write! to a String cannot fail; it panics on OOM")
+                        format!("{i:x}")
                     }
-                    _ => result.push('0'),
+                    _ => "0".to_string(),
+                };
+                if let Some(w) = width {
+                    if w > formatted.len() {
+                        if zero_pad {
+                            formatted = format!("{formatted:0>w$}");
+                        } else {
+                            formatted = format!("{formatted:>w$}");
+                        }
+                    }
                 }
+                result.push_str(&formatted);
                 args_index += 1;
             }
             Some('X') => {
@@ -324,20 +359,25 @@ pub fn exec_printf(values: &[Register]) -> crate::Result<Value> {
                     return Err(LimboError::InvalidArgument("not enough arguments".into()));
                 }
                 let value = &values[args_index].get_value();
-                match value {
-                    Value::Numeric(Numeric::Float(f)) => {
-                        write!(result, "{:X}", f64::from(*f) as i64)
-                            .expect("write! to a String cannot fail; it panics on OOM")
-                    }
-                    Value::Numeric(Numeric::Integer(i)) => write!(result, "{i:X}")
-                        .expect("write! to a String cannot fail; it panics on OOM"),
+                let mut formatted = match value {
+                    Value::Numeric(Numeric::Float(f)) => format!("{:X}", f64::from(*f) as i64),
+                    Value::Numeric(Numeric::Integer(i)) => format!("{i:X}"),
                     Value::Text(s) => {
                         let i: i64 = s.as_str().parse::<i64>().unwrap_or(0);
-                        write!(result, "{i:X}")
-                            .expect("write! to a String cannot fail; it panics on OOM");
+                        format!("{i:X}")
                     }
-                    _ => result.push('0'),
+                    _ => "0".to_string(),
+                };
+                if let Some(w) = width {
+                    if w > formatted.len() {
+                        if zero_pad {
+                            formatted = format!("{formatted:0>w$}");
+                        } else {
+                            formatted = format!("{formatted:>w$}");
+                        }
+                    }
                 }
+                result.push_str(&formatted);
                 args_index += 1;
             }
             Some('o') => {
@@ -345,20 +385,25 @@ pub fn exec_printf(values: &[Register]) -> crate::Result<Value> {
                     return Err(LimboError::InvalidArgument("not enough arguments".into()));
                 }
                 let value = &values[args_index].get_value();
-                match value {
-                    Value::Numeric(Numeric::Float(f)) => {
-                        write!(result, "{:o}", f64::from(*f) as i64)
-                            .expect("write! to a String cannot fail; it panics on OOM")
-                    }
-                    Value::Numeric(Numeric::Integer(i)) => write!(result, "{i:o}")
-                        .expect("write! to a String cannot fail; it panics on OOM"),
+                let mut formatted = match value {
+                    Value::Numeric(Numeric::Float(f)) => format!("{:o}", f64::from(*f) as i64),
+                    Value::Numeric(Numeric::Integer(i)) => format!("{i:o}"),
                     Value::Text(s) => {
                         let i: i64 = s.as_str().parse::<i64>().unwrap_or(0);
-                        write!(result, "{i:o}")
-                            .expect("write! to a String cannot fail; it panics on OOM");
+                        format!("{i:o}")
                     }
-                    _ => result.push('0'),
+                    _ => "0".to_string(),
+                };
+                if let Some(w) = width {
+                    if w > formatted.len() {
+                        if zero_pad {
+                            formatted = format!("{formatted:0>w$}");
+                        } else {
+                            formatted = format!("{formatted:>w$}");
+                        }
+                    }
                 }
+                result.push_str(&formatted);
                 args_index += 1;
             }
             None => {
