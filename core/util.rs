@@ -1595,12 +1595,9 @@ pub fn rewrite_check_expr_column_refs(expr: &mut ast::Expr, from: &str, to: &str
                 {
                     *e = ast::Expr::Id(ast::Name::exact(to.to_owned()));
                 }
-                ast::Expr::Qualified(_, ref col_name)
+                ast::Expr::Qualified(ref tbl, ref col_name)
                     if normalize_ident(col_name.as_str()) == from_normalized =>
                 {
-                    let ast::Expr::Qualified(ref tbl, _) = *e else {
-                        unreachable!()
-                    };
                     let tbl = tbl.clone();
                     *e = ast::Expr::Qualified(tbl, ast::Name::exact(to.to_owned()));
                 }
@@ -1620,11 +1617,8 @@ pub fn rewrite_check_expr_table_refs(expr: &mut ast::Expr, from: &str, to: &str)
     let _ = walk_expr_mut(
         expr,
         &mut |e: &mut ast::Expr| -> crate::Result<WalkControl> {
-            if let ast::Expr::Qualified(ref tbl, _) = *e {
+            if let ast::Expr::Qualified(ref tbl, ref col) = *e {
                 if normalize_ident(tbl.as_str()) == from_normalized {
-                    let ast::Expr::Qualified(_, ref col) = *e else {
-                        unreachable!()
-                    };
                     let col = col.clone();
                     *e = ast::Expr::Qualified(ast::Name::exact(to.to_owned()), col);
                 }
