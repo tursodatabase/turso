@@ -229,7 +229,7 @@ fn generate_select_impl_inner<C: Capabilities>(
     };
 
     // --- ORDER BY ---
-    let order_by = if ctx.gen_bool_with_prob(order_by_prob) {
+    let mut order_by = if ctx.gen_bool_with_prob(order_by_prob) {
         if let Some(gb) = &group_by {
             generate_grouped_order_by(generator, ctx, &gb.exprs)?
         } else {
@@ -254,6 +254,15 @@ fn generate_select_impl_inner<C: Capabilities>(
         SelectMode::Full => generate_limit_offset(generator, ctx),
         SelectMode::Scalar => (Some(1), None),
     };
+
+    // Enforce deterministic LIMIT semantics when configured.
+    if limit.is_some() && order_by.is_empty() && select_config.require_order_by_with_limit {
+        order_by = if let Some(gb) = &group_by {
+            generate_grouped_order_by(generator, ctx, &gb.exprs)?
+        } else {
+            generate_order_by(generator, ctx)?
+        };
+    }
 
     let from = {
         let primary_name = ctx.tables_in_scope()[0].table.name.clone();
@@ -1440,6 +1449,37 @@ mod tests {
                     "seed {seed}: non-grouped SELECT mixes aggregates and non-aggregates: {select}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn test_require_order_by_with_limit_policy() {
+        let policy = Policy::default().with_select_config(crate::policy::SelectConfig {
+            limit_probability: 1.0,
+            order_by_probability: 0.0,
+            require_order_by_with_limit: true,
+            ..Default::default()
+        });
+        let schema = SchemaBuilder::new()
+            .table(Table::new(
+                "users",
+                vec![
+                    ColumnDef::new("id", DataType::Integer).primary_key(),
+                    ColumnDef::new("name", DataType::Text),
+                    ColumnDef::new("age", DataType::Integer),
+                ],
+            ))
+            .build();
+        let generator: SqlGen<Full> = SqlGen::new(schema, policy);
+
+        for seed in 0..50 {
+            let mut ctx = Context::new_with_seed(seed);
+            let select = generate_select_impl(&generator, &mut ctx, SelectMode::Full).unwrap();
+            assert!(select.limit.is_some(), "Expected LIMIT to be present");
+            assert!(
+                !select.order_by.is_empty(),
+                "Expected ORDER BY when LIMIT is present with require_order_by_with_limit=true"
+            );
         }
     }
 }

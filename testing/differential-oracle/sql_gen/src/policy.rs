@@ -991,6 +991,10 @@ pub struct SelectConfig {
     /// Probability of generating LIMIT clause.
     pub limit_probability: f64,
 
+    /// When true, any SELECT that has a LIMIT will also include ORDER BY.
+    /// This avoids undefined row-order behavior from unordered LIMIT queries.
+    pub require_order_by_with_limit: bool,
+
     /// Probability of generating OFFSET clause (only if LIMIT exists).
     pub offset_probability: f64,
 
@@ -1068,6 +1072,7 @@ impl Default for SelectConfig {
             where_probability: 0.9,
             order_by_probability: 0.7,
             limit_probability: 0.6,
+            require_order_by_with_limit: false,
             offset_probability: 0.4,
             group_by_probability: 0.3,
             having_probability: 0.5,
@@ -1100,6 +1105,7 @@ impl SelectConfig {
             where_probability: 0.0,
             order_by_probability: 0.0,
             limit_probability: 0.0,
+            require_order_by_with_limit: false,
             offset_probability: 0.0,
             group_by_probability: 0.0,
             having_probability: 0.0,
@@ -1117,6 +1123,7 @@ impl SelectConfig {
             where_probability: 0.95,
             order_by_probability: 0.8,
             limit_probability: 0.7,
+            require_order_by_with_limit: false,
             offset_probability: 0.5,
             group_by_probability: 0.5,
             having_probability: 0.6,
@@ -2040,9 +2047,11 @@ mod tests {
         let config = SelectConfig::simple();
         assert_eq!(config.where_probability, 0.0);
         assert_eq!(config.order_by_probability, 0.0);
+        assert!(!config.require_order_by_with_limit);
 
         let complex = SelectConfig::complex();
         assert!(complex.where_probability > 0.5);
+        assert!(!complex.require_order_by_with_limit);
     }
 
     #[test]
