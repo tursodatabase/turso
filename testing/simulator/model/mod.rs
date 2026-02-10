@@ -189,6 +189,52 @@ fn normalize_integer_pk_row(
     Ok(out)
 }
 
+fn validate_integer_pk_row_non_null(
+    table_name: &str,
+    columns: &[Column],
+    pk_idx: usize,
+    row: &[SimValue],
+) -> anyhow::Result<()> {
+    ensure_row_width(table_name, columns, row)?;
+    match row[pk_idx].0 {
+        Value::Integer(_) => Ok(()),
+        Value::Null => Err(anyhow::anyhow!(
+            "datatype mismatch: table '{}' INTEGER PRIMARY KEY column '{}' cannot be NULL",
+            table_name,
+            columns[pk_idx].name
+        )),
+        _ => Err(anyhow::anyhow!(
+            "datatype mismatch: table '{}' INTEGER PRIMARY KEY column '{}' must be an integer",
+            table_name,
+            columns[pk_idx].name
+        )),
+    }
+}
+
+fn prepare_insert_rows(
+    table_name: &str,
+    columns: &[Column],
+    existing_rows: &[Vec<SimValue>],
+    input_rows: &[Vec<SimValue>],
+) -> anyhow::Result<Vec<Vec<SimValue>>> {
+    let mut new_rows = input_rows.to_vec();
+
+    if let Some(pk_idx) = integer_pk_index(columns) {
+        let mut alloc = RowidAllocator::new(existing_rows, pk_idx);
+        new_rows = new_rows
+            .iter()
+            .map(|r| normalize_integer_pk_row(table_name, columns, pk_idx, &mut alloc, r))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+    } else {
+        for r in &new_rows {
+            ensure_row_width(table_name, columns, r)?;
+        }
+    }
+
+    check_unique_batch(table_name, columns, existing_rows, &new_rows)?;
+    Ok(new_rows)
+}
+
 pub mod interactions;
 pub mod metrics;
 pub mod property;
@@ -544,7 +590,7 @@ impl Shadow for Insert {
         match self {
             Insert::Select { table, select } => {
                 let table_name = table.clone();
-                let mut rows = select.shadow(tables)?;
+                let raw_rows = select.shadow(tables)?;
 
                 let table_pos = tables
                     .iter()
@@ -552,22 +598,8 @@ impl Shadow for Insert {
                     .ok_or_else(|| anyhow::anyhow!("Table {} does not exist", table_name))?;
 
                 let columns = tables[table_pos].columns.clone();
-                if let Some(pk_idx) = integer_pk_index(&columns) {
-                    let mut alloc = RowidAllocator::new(&tables[table_pos].rows, pk_idx);
-                    rows = rows
-                        .iter()
-                        .map(|r| {
-                            normalize_integer_pk_row(&table_name, &columns, pk_idx, &mut alloc, r)
-                        })
-                        .collect::<anyhow::Result<Vec<_>>>()?;
-                } else {
-                    // Still validate widths early.
-                    for r in &rows {
-                        ensure_row_width(&table_name, &columns, r)?;
-                    }
-                }
-
-                check_unique_batch(&table_name, &columns, &tables[table_pos].rows, &rows)?;
+                let rows =
+                    prepare_insert_rows(&table_name, &columns, &tables[table_pos].rows, &raw_rows)?;
 
                 for row in &rows {
                     tables.record_insert(table_name.clone(), row.clone());
@@ -591,33 +623,11 @@ impl Shadow for Insert {
 
                 match on_conflict {
                     None => {
-                        let mut new_rows = values.clone();
-
-                        if let Some(pk_idx) = integer_pk_index(&columns) {
-                            let mut alloc = RowidAllocator::new(&tables[table_pos].rows, pk_idx);
-                            new_rows = new_rows
-                                .iter()
-                                .map(|r| {
-                                    normalize_integer_pk_row(
-                                        &table_name,
-                                        &columns,
-                                        pk_idx,
-                                        &mut alloc,
-                                        r,
-                                    )
-                                })
-                                .collect::<anyhow::Result<Vec<_>>>()?;
-                        } else {
-                            for r in &new_rows {
-                                ensure_row_width(&table_name, &columns, r)?;
-                            }
-                        }
-
-                        check_unique_batch(
+                        let new_rows = prepare_insert_rows(
                             &table_name,
                             &columns,
                             &tables[table_pos].rows,
-                            &new_rows,
+                            values,
                         )?;
 
                         for row in &new_rows {
@@ -747,24 +757,14 @@ impl Shadow for Insert {
                                     if let (Some(pk_idx), Some(alloc)) =
                                         (pk_idx_opt, alloc_opt.as_mut())
                                     {
-                                        match new_row[pk_idx].0 {
-                                            turso_core::Value::Integer(i) => {
-                                                alloc.observe(i);
-                                            }
-                                            turso_core::Value::Null => {
-                                                return Err(anyhow::anyhow!(
-                                                    "datatype mismatch: table '{}' INTEGER PRIMARY KEY column '{}' cannot be NULL",
-                                                    table_name,
-                                                    columns[pk_idx].name
-                                                ));
-                                            }
-                                            _ => {
-                                                return Err(anyhow::anyhow!(
-                                                    "datatype mismatch: table '{}' INTEGER PRIMARY KEY column '{}' must be an integer",
-                                                    table_name,
-                                                    columns[pk_idx].name
-                                                ));
-                                            }
+                                        validate_integer_pk_row_non_null(
+                                            &table_name,
+                                            &columns,
+                                            pk_idx,
+                                            &new_row,
+                                        )?;
+                                        if let Value::Integer(i) = new_row[pk_idx].0 {
+                                            alloc.observe(i);
                                         }
                                     }
 
@@ -1052,23 +1052,7 @@ impl Shadow for Update {
 
         if let Some(pk_idx) = integer_pk_index(&columns) {
             for (_, _, new_row) in &updates {
-                match new_row[pk_idx].0 {
-                    Value::Integer(_) => {}
-                    Value::Null => {
-                        return Err(anyhow::anyhow!(
-                            "datatype mismatch: table '{}' INTEGER PRIMARY KEY column '{}' cannot be NULL",
-                            self.table,
-                            columns[pk_idx].name
-                        ));
-                    }
-                    _ => {
-                        return Err(anyhow::anyhow!(
-                            "datatype mismatch: table '{}' INTEGER PRIMARY KEY column '{}' must be an integer",
-                            self.table,
-                            columns[pk_idx].name
-                        ));
-                    }
-                }
+                validate_integer_pk_row_non_null(&self.table, &columns, pk_idx, new_row)?;
             }
         }
 
