@@ -8,6 +8,7 @@ import { NativeModules } from 'react-native';
 import { Database } from './Database';
 import type {
   DatabaseOpts,
+  TursoLoggerFn,
   TursoNativeModule,
   TursoProxy as TursoProxyType,
 } from './types';
@@ -27,6 +28,11 @@ export type {
 
   // Sync types
   SyncStats,
+
+  // Logging
+  TursoLog,
+  TursoLoggerFn,
+  TursoTracingLevel,
 
   // Enums
   TursoStatus,
@@ -72,10 +78,8 @@ if (!TursoProxy) {
 
 /**
  * Helper function to construct a database path in a writable directory.
- * On mobile platforms, you must use writable directories (not relative paths).
  *
  * @param filename - Database filename (e.g., 'mydb.db')
- * @param directory - Directory to use ('documents', 'database', or 'library')
  * @returns Absolute path to the database file
  *
  * @example
@@ -86,11 +90,11 @@ if (!TursoProxy) {
  * const db = await connect({ path: dbPath });
  * ```
  */
-export function getDbPath(filename: string, directory: 'documents' | 'database' | 'library' = 'documents'): string {
-  const basePath = paths[directory];
+export function getDbPath(filename: string): string {
+  const basePath = paths.database;
   if (!basePath || basePath === '.') {
     throw new Error(
-      `Unable to get ${directory} path for this platform. ` +
+      'Unable to get database path for this platform. ' +
       'Make sure the native module is properly loaded.'
     );
   }
@@ -142,7 +146,7 @@ export function getDbPath(filename: string, directory: 'documents' | 'database' 
  * ```ts
  * import { connect, paths } from '@tursodatabase/sync-react-native';
  *
- * const db = await connect({ path: `${paths.documents}/mydb.db` });
+ * const db = await connect({ path: `${paths.database}/mydb.db` });
  * ```
  */
 export async function connect(opts: DatabaseOpts): Promise<Database> {
@@ -167,16 +171,20 @@ export function version(): string {
  * ```ts
  * import { setup } from '@tursodatabase/sync-react-native';
  *
- * setup({ logLevel: 'debug' });
+ * setup({
+ *   logLevel: 'debug',
+ *   logger: (log) => {
+ *     console.log(`[${log.level}] ${log.target}: ${log.message}`);
+ *   },
+ * });
  * ```
  */
-export function setup(options: {logLevel?: string}): void {
+export function setup(options: {logLevel?: string; logger?: TursoLoggerFn}): void {
   TursoProxy.setup(options);
 }
 
 /**
- * Platform-specific writable directory paths.
- * Use these to construct absolute paths for database files.
+ * Platform-specific writable directory path for database files.
  *
  * NOTE: With automatic path normalization, you typically don't need this.
  * Just pass relative paths like 'mydb.db' and they'll be placed in the correct directory.
@@ -185,46 +193,18 @@ export function setup(options: {logLevel?: string}): void {
  * ```ts
  * import { paths, connect } from '@tursodatabase/sync-react-native';
  *
- * // Create database in app's documents/files directory
- * const dbPath = `${paths.documents}/mydb.db`;
+ * const dbPath = `${paths.database}/mydb.db`;
  * const db = await connect({ path: dbPath });
  * ```
  */
 export const paths = {
   /**
-   * Primary documents/database directory (writable)
-   * - iOS: App's Documents directory (absolute path)
-   * - Android: App's database directory (absolute path) - preferred for databases
-   */
-  get documents(): string {
-    return TursoNative?.IOS_DOCUMENT_PATH || TursoNative?.ANDROID_DATABASE_PATH || '.';
-  },
-
-  /**
-   * Database-specific directory (writable)
-   * - iOS: Same as documents
-   * - Android: Database directory (absolute path)
+   * Writable directory for database files.
+   * - iOS: App's Documents directory
+   * - Android: App's database directory
    */
   get database(): string {
     return TursoNative?.IOS_DOCUMENT_PATH || TursoNative?.ANDROID_DATABASE_PATH || '.';
-  },
-
-  /**
-   * Files directory (writable)
-   * - iOS: Same as documents
-   * - Android: App's files directory (absolute path)
-   */
-  get files(): string {
-    return TursoNative?.IOS_DOCUMENT_PATH || TursoNative?.ANDROID_FILES_PATH || '.';
-  },
-
-  /**
-   * Library directory (iOS only, writable)
-   * - iOS: App's Library directory (absolute path)
-   * - Android: Same as files
-   */
-  get library(): string {
-    return TursoNative?.IOS_LIBRARY_PATH || TursoNative?.ANDROID_FILES_PATH || '.';
   },
 };
 

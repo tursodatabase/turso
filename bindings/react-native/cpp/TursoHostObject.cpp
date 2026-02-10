@@ -4,6 +4,10 @@
 
 #include <cstdio>   // For FILE, fopen, fread, fwrite, fclose, fseek, ftell, remove, rename
 #include <cstdlib>  // For additional standard library functions
+#include <cstring>  // For strrchr
+#include <unistd.h> // For fsync, close
+#include <fcntl.h>  // For open, O_RDONLY
+#include <mutex>    // For std::mutex, std::lock_guard
 
 extern "C" {
 #include <turso.h>
@@ -13,10 +17,31 @@ extern "C" {
 namespace turso
 {
 
+    /**
+     * Durable fsync: on Apple, fsync() only flushes to disk cache,
+     * so we need F_FULLFSYNC for true persistence. On Linux/Android,
+     * plain fsync() is sufficient.
+     */
+    static int durable_fsync(int fd)
+    {
+#ifdef __APPLE__
+        return fcntl(fd, F_FULLFSYNC);
+#else
+        return fsync(fd);
+#endif
+    }
+
     using namespace facebook;
 
     // Global base path for database files
     static std::string g_basePath;
+
+    // Logger callback state — the Rust tracing subscriber may fire from any thread,
+    // so we copy log data in the C callback and schedule JS execution via CallInvoker.
+    static jsi::Runtime* g_runtime = nullptr;
+    static std::shared_ptr<react::CallInvoker> g_callInvoker;
+    static std::shared_ptr<jsi::Function> g_loggerFn;
+    static std::mutex g_loggerMutex;
 
     /**
      * Normalize a database path:
@@ -49,12 +74,79 @@ namespace turso
         }
     }
 
+    /**
+     * Map turso_tracing_level_t enum to JS-friendly string.
+     */
+    static const char* tracingLevelToString(turso_tracing_level_t level)
+    {
+        switch (level)
+        {
+            case TURSO_TRACING_LEVEL_ERROR: return "error";
+            case TURSO_TRACING_LEVEL_WARN:  return "warn";
+            case TURSO_TRACING_LEVEL_INFO:  return "info";
+            case TURSO_TRACING_LEVEL_DEBUG: return "debug";
+            case TURSO_TRACING_LEVEL_TRACE: return "trace";
+            default:                        return "error";
+        }
+    }
+
+    /**
+     * C callback invoked by the Rust tracing subscriber (possibly from any thread).
+     * Copies all string data synchronously, then schedules a JS call on the JS thread.
+     */
+    static void turso_logger_callback(const turso_log_t *log)
+    {
+        std::lock_guard<std::mutex> lock(g_loggerMutex);
+        if (!g_loggerFn || !g_callInvoker || !g_runtime)
+        {
+            return;
+        }
+
+        // Copy all data — the turso_log_t fields are only valid during this callback.
+        std::string message = log->message ? log->message : "";
+        std::string target  = log->target  ? log->target  : "";
+        std::string file    = log->file    ? log->file    : "";
+        uint64_t timestamp  = log->timestamp;
+        size_t line         = log->line;
+        const char* level   = tracingLevelToString(log->level);
+        std::string levelStr(level);
+
+        // Prevent captures from preventing cleanup — capture shared_ptr copies
+        auto callInvoker = g_callInvoker;
+        auto loggerFn    = g_loggerFn;
+
+        callInvoker->invokeAsync(
+            [loggerFn, message = std::move(message), target = std::move(target),
+             file = std::move(file), timestamp, line, levelStr = std::move(levelStr)]
+            (jsi::Runtime &rt)
+            {
+                try
+                {
+                    jsi::Object logObj(rt);
+                    logObj.setProperty(rt, "message",   jsi::String::createFromUtf8(rt, message));
+                    logObj.setProperty(rt, "target",    jsi::String::createFromUtf8(rt, target));
+                    logObj.setProperty(rt, "file",      jsi::String::createFromUtf8(rt, file));
+                    logObj.setProperty(rt, "timestamp", static_cast<double>(timestamp));
+                    logObj.setProperty(rt, "line",      static_cast<double>(line));
+                    logObj.setProperty(rt, "level",     jsi::String::createFromUtf8(rt, levelStr));
+
+                    loggerFn->call(rt, logObj);
+                }
+                catch (...)
+                {
+                    // Logger must never crash the app — swallow all exceptions.
+                }
+            });
+    }
+
     void install(
         jsi::Runtime &rt,
         const std::shared_ptr<react::CallInvoker> &invoker,
         const char *basePath)
     {
         g_basePath = basePath ? basePath : "";
+        g_runtime = &rt;
+        g_callInvoker = invoker;
 
         // Create the module object
         jsi::Object module(rt);
@@ -163,7 +255,7 @@ namespace turso
                 sync_config.path = normalizedPath.c_str();
 
                 // remoteUrl (optional)
-                static std::string remoteUrl;
+                std::string remoteUrl;
                 if (syncConfigObj.hasProperty(rt, "remoteUrl"))
                 {
                     jsi::Value remoteUrlVal = syncConfigObj.getProperty(rt, "remoteUrl");
@@ -183,7 +275,7 @@ namespace turso
                 }
 
                 // clientName (optional)
-                static std::string clientName;
+                std::string clientName;
                 if (syncConfigObj.hasProperty(rt, "clientName"))
                 {
                     jsi::Value clientNameVal = syncConfigObj.getProperty(rt, "clientName");
@@ -274,7 +366,7 @@ namespace turso
                     sync_config.partial_bootstrap_strategy_prefix = 0;
                 }
 
-                static std::string partialBootstrapStrategyQuery;
+                std::string partialBootstrapStrategyQuery;
                 if (syncConfigObj.hasProperty(rt, "partialBootstrapStrategyQuery"))
                 {
                     jsi::Value queryVal = syncConfigObj.getProperty(rt, "partialBootstrapStrategyQuery");
@@ -328,7 +420,7 @@ namespace turso
                 }
 
                 // Remote encryption options
-                static std::string remoteEncryptionKey;
+                std::string remoteEncryptionKey;
                 if (syncConfigObj.hasProperty(rt, "remoteEncryptionKey"))
                 {
                     jsi::Value keyVal = syncConfigObj.getProperty(rt, "remoteEncryptionKey");
@@ -347,7 +439,7 @@ namespace turso
                     sync_config.remote_encryption_key = nullptr;
                 }
 
-                static std::string remoteEncryptionCipher;
+                std::string remoteEncryptionCipher;
                 if (syncConfigObj.hasProperty(rt, "remoteEncryptionCipher"))
                 {
                     jsi::Value cipherVal = syncConfigObj.getProperty(rt, "remoteEncryptionCipher");
@@ -409,8 +501,7 @@ namespace turso
 
                 jsi::Object options = args[0].asObject(rt);
 
-                // Store log level in a static variable to ensure lifetime
-                static std::string logLevelStr;
+                std::string logLevelStr;
 
                 // Get log level if provided
                 if (options.hasProperty(rt, "logLevel"))
@@ -423,6 +514,21 @@ namespace turso
                 }
 
                 turso_config_t config = {nullptr, logLevelStr.empty() ? nullptr : logLevelStr.c_str()};
+
+                // Wire up logger callback if provided
+                if (options.hasProperty(rt, "logger"))
+                {
+                    jsi::Value loggerVal = options.getProperty(rt, "logger");
+                    if (loggerVal.isObject() && loggerVal.asObject(rt).isFunction(rt))
+                    {
+                        {
+                            std::lock_guard<std::mutex> lock(g_loggerMutex);
+                            g_loggerFn = std::make_shared<jsi::Function>(
+                                loggerVal.asObject(rt).asFunction(rt));
+                        }
+                        config.logger = turso_logger_callback;
+                    }
+                }
 
                 // Call turso_setup
                 const char *error = nullptr;
@@ -504,39 +610,55 @@ namespace turso
                 std::string path = args[0].asString(rt).utf8(rt);
                 jsi::ArrayBuffer buffer = args[1].asObject(rt).getArrayBuffer(rt);
 
-                // Write atomically using temporary file + rename
+                // Write atomically: write to temp, fsync, rename, fsync dir
                 std::string tempPath = path + ".tmp";
 
-                // Open temp file for writing
                 FILE* file = fopen(tempPath.c_str(), "wb");
                 if (!file)
                 {
                     throw jsi::JSError(rt, "Failed to open file for writing");
                 }
 
-                // Write data
                 size_t size = buffer.size(rt);
                 if (size > 0)
                 {
                     size_t written = fwrite(buffer.data(rt), 1, size, file);
-                    fclose(file);
-
                     if (written != size)
                     {
+                        fclose(file);
                         remove(tempPath.c_str());
                         throw jsi::JSError(rt, "Failed to write complete file");
                     }
                 }
-                else
+
+                // Flush to OS and sync to disk before rename
+                if (fflush(file) != 0 || durable_fsync(fileno(file)) != 0)
                 {
                     fclose(file);
+                    remove(tempPath.c_str());
+                    throw jsi::JSError(rt, "Failed to sync file to disk");
                 }
+                fclose(file);
 
                 // Atomic rename (replaces old file)
                 if (rename(tempPath.c_str(), path.c_str()) != 0)
                 {
                     remove(tempPath.c_str());
                     throw jsi::JSError(rt, "Failed to rename temp file");
+                }
+
+                // Fsync parent directory to ensure rename is durable
+                std::string dirPath = path;
+                auto lastSlash = dirPath.rfind('/');
+                if (lastSlash != std::string::npos)
+                {
+                    dirPath.resize(lastSlash);
+                    int dirFd = open(dirPath.c_str(), O_RDONLY);
+                    if (dirFd >= 0)
+                    {
+                        durable_fsync(dirFd);
+                        close(dirFd);
+                    }
                 }
 
                 return jsi::Value::undefined();
@@ -555,7 +677,10 @@ namespace turso
 
     void invalidate()
     {
-        // Cleanup if needed
+        std::lock_guard<std::mutex> lock(g_loggerMutex);
+        g_loggerFn.reset();
+        g_callInvoker.reset();
+        g_runtime = nullptr;
     }
 
 } // namespace turso

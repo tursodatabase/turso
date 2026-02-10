@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 import { StyleSheet, Text, View, ScrollView } from 'react-native';
-import { connect, setup, Database } from '@tursodatabase/sync-react-native';
+import { connect, setup, Database, TursoLog } from '@tursodatabase/sync-react-native';
 
 type TestResult = {
   name: string;
@@ -38,7 +38,10 @@ export default function App() {
 
     // Configure logging
     try {
-      setup({ logLevel: 'debug' });
+      setup({
+        logLevel: 'info',
+        logger: (log) => console.log(`[turso:${log.level}] ${log.target}: ${log.message}`),
+      });
       testResults.push({ name: 'Setup logging', passed: true });
     } catch (e) {
       testResults.push({ name: 'Setup logging', passed: false, error: String(e) });
@@ -48,7 +51,7 @@ export default function App() {
     let db: Database | null = null;
     try {
       const start = performance.now();
-      db = await connect({ path: 'test.db' });
+      db = await connect({ path: `test-${Date.now()}.db` });
       setOpenTime(performance.now() - start);
       testResults.push({ name: 'Open database', passed: true });
     } catch (e) {
@@ -80,13 +83,17 @@ export default function App() {
       testResults.push({ name: 'CREATE TABLE', passed: false, error: String(e) });
     }
 
-    // Test: Insert data
+    // Test: Insert data and verify lastInsertRowid
     try {
-      await db.run('INSERT INTO users (name, age) VALUES (?, ?)', 'Alice', 30);
-      await db.run('INSERT INTO users (name, age) VALUES (?, ?)', 'Bob', 25);
-      testResults.push({ name: 'INSERT data', passed: true });
+      const res1 = await db.run('INSERT INTO users (name, age) VALUES (?, ?)', 'Alice', 30);
+      const res2 = await db.run('INSERT INTO users (name, age) VALUES (?, ?)', 'Bob', 25);
+      if (res1.lastInsertRowid > 0 && res2.lastInsertRowid > res1.lastInsertRowid) {
+        testResults.push({ name: 'INSERT data + lastInsertRowid', passed: true });
+      } else {
+        testResults.push({ name: 'INSERT data + lastInsertRowid', passed: false, error: `Expected increasing rowids, got ${res1.lastInsertRowid} and ${res2.lastInsertRowid}` });
+      }
     } catch (e) {
-      testResults.push({ name: 'INSERT data', passed: false, error: String(e) });
+      testResults.push({ name: 'INSERT data + lastInsertRowid', passed: false, error: String(e) });
     }
 
     // Test: Query single row
@@ -171,7 +178,7 @@ export default function App() {
       // Test: Connect to sync database
       try {
         syncDb = await connect({
-          path: 'sync-test.db',
+          path: `sync-test-${Date.now()}.db`,
           url: TURSO_DATABASE_URL,
           authToken: TURSO_AUTH_TOKEN,
         });
@@ -247,7 +254,7 @@ export default function App() {
       // Test: Connect with encryption
       try {
         encDb = await connect({
-          path: 'encrypted-test.db',
+          path: `encrypted-test-${Date.now()}.db`,
           url: TURSO_DATABASE_URL,
           authToken: TURSO_AUTH_TOKEN,
           remoteEncryption: {

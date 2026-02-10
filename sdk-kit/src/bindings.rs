@@ -291,7 +291,7 @@ unsafe extern "C" {
     pub fn turso_statement_row_value_double(self_: *const turso_statement_t, index: usize) -> f64;
 }
 unsafe extern "C" {
-    #[doc = " Return named argument position in a statement"]
+    #[doc = " Return named argument position in a statement\nReturn positive integer with 1-indexed position if named parameter was found\nReturn -1 if parameter was not found"]
     pub fn turso_statement_named_position(
         self_: *const turso_statement_t,
         name: *const ::std::os::raw::c_char,

@@ -286,8 +286,16 @@ jsi::Value TursoStatementHostObject::reset(jsi::Runtime &rt) {
 }
 
 jsi::Value TursoStatementHostObject::finalize(jsi::Runtime &rt) {
+    if (!stmt_) {
+        return jsi::Value(static_cast<int>(TURSO_DONE));
+    }
+
     const char* error = nullptr;
     turso_status_code_t status = turso_statement_finalize(stmt_, &error);
+
+    if (status == TURSO_DONE) {
+        stmt_ = nullptr; // Prevent destructor from calling deinit on finalized statement
+    }
 
     if (status != TURSO_DONE && status != TURSO_IO) {
         throwError(rt, error);

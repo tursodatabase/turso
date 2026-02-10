@@ -198,15 +198,6 @@ async function processHttpRequest(item: NativeSyncIoItem, context: IoContext): P
     options.body = request.body;
   }
 
-  // Debug logging for HTTP requests
-  console.log('[Turso HTTP] Request:', {
-    method: request.method,
-    url: fullUrl,
-    hasBody: !!request.body,
-    bodySize: request.body ? request.body.byteLength : 0,
-    headers: options.headers,
-  });
-
   // Make the HTTP request
   let response;
   try {
