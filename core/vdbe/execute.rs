@@ -24,7 +24,9 @@ use crate::util::{
     rewrite_fk_parent_table_if_needed, rewrite_inline_col_fk_target_if_needed,
     trim_ascii_whitespace,
 };
-use crate::vdbe::affinity::{apply_numeric_affinity, try_for_float, Affinity, ParsedNumber};
+use crate::vdbe::affinity::{
+    apply_numeric_affinity, try_for_float, Affinity, NumericParseResult, ParsedNumber,
+};
 use crate::vdbe::hash_table::{HashEntry, HashTable, HashTableConfig, DEFAULT_MEM_BUDGET};
 use crate::vdbe::insn::InsertFlags;
 use crate::vdbe::value::ComparisonOp;
@@ -3953,15 +3955,20 @@ fn update_agg_payload(
                     _ => unreachable!("Sum/Total accumulator initialized to Null/Integer/Float"),
                 },
                 Value::Text(t) => {
-                    let (_, parsed_number) = try_for_float(t.as_str());
-                    handle_text_sum(acc, &mut sum_state, parsed_number);
+                    let (parse_result, parsed_number) = try_for_float(t.as_str());
+                    handle_text_sum(acc, &mut sum_state, parsed_number, parse_result);
                 }
                 Value::Blob(b) => {
                     if let Ok(s) = std::str::from_utf8(&b) {
-                        let (_, parsed_number) = try_for_float(s);
-                        handle_text_sum(acc, &mut sum_state, parsed_number);
+                        let (parse_result, parsed_number) = try_for_float(s);
+                        handle_text_sum(acc, &mut sum_state, parsed_number, parse_result);
                     } else {
-                        handle_text_sum(acc, &mut sum_state, ParsedNumber::None);
+                        handle_text_sum(
+                            acc,
+                            &mut sum_state,
+                            ParsedNumber::None,
+                            NumericParseResult::NotNumeric,
+                        );
                     }
                 }
             }
@@ -10520,27 +10527,54 @@ pub fn op_if_neg(
     Ok(InsnFunctionStepResult::Step)
 }
 
-fn handle_text_sum(acc: &mut Value, sum_state: &mut SumAggState, parsed_number: ParsedNumber) {
+fn handle_text_sum(
+    acc: &mut Value,
+    sum_state: &mut SumAggState,
+    parsed_number: ParsedNumber,
+    parse_result: NumericParseResult,
+) {
+    // SQLite treats text that only partially parses as numeric (ValidPrefixOnly)
+    // as approximate, so SUM returns real instead of integer.
+    let is_approx = matches!(parse_result, NumericParseResult::ValidPrefixOnly);
     match parsed_number {
-        ParsedNumber::Integer(i) => match acc {
-            Value::Null => {
-                *acc = Value::Integer(i);
-            }
-            Value::Integer(acc_i) => match acc_i.checked_add(i) {
-                Some(sum) => *acc = Value::Integer(sum),
-                None => {
-                    let acc_f = *acc_i as f64;
-                    *acc = Value::Float(acc_f);
-                    sum_state.approx = true;
-                    sum_state.ovrfl = true;
-                    apply_kbn_step_int(acc, i, sum_state);
+        ParsedNumber::Integer(i) => {
+            if is_approx {
+                sum_state.approx = true;
+                match acc {
+                    Value::Null => {
+                        *acc = Value::Float(i as f64);
+                    }
+                    Value::Integer(acc_i) => {
+                        *acc = Value::Float(*acc_i as f64);
+                        apply_kbn_step_int(acc, i, sum_state);
+                    }
+                    Value::Float(_) => {
+                        apply_kbn_step_int(acc, i, sum_state);
+                    }
+                    _ => unreachable!(),
                 }
-            },
-            Value::Float(_) => {
-                apply_kbn_step_int(acc, i, sum_state);
+            } else {
+                match acc {
+                    Value::Null => {
+                        *acc = Value::Integer(i);
+                    }
+                    Value::Integer(acc_i) => match acc_i.checked_add(i) {
+                        Some(sum) => *acc = Value::Integer(sum),
+                        None => {
+                            let acc_f = *acc_i as f64;
+                            *acc = Value::Float(acc_f);
+                            sum_state.approx = true;
+                            sum_state.ovrfl = true;
+                            apply_kbn_step_int(acc, i, sum_state);
+                        }
+                    },
+                    Value::Float(_) => {
+                        apply_kbn_step_int(acc, i, sum_state);
+                    }
+                    _ => unreachable!(),
+                }
             }
-            _ => unreachable!(),
-        },
+        }
         ParsedNumber::Float(f) => {
             if !sum_state.approx {
                 if let Value::Integer(current_sum) = *acc {

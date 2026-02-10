@@ -1,0 +1,68 @@
+@database :memory:
+
+# SUM of text values that are valid integer prefixes should return real,
+# matching SQLite behavior. Text like '4abc' partially parses as integer 4,
+# but because it's not a pure integer string, SUM treats it as approximate.
+
+test sum-partial-integer-text-returns-real {
+    CREATE TABLE t1 (a TEXT);
+    INSERT INTO t1 VALUES ('4abc');
+    INSERT INTO t1 VALUES ('3def');
+    SELECT typeof(SUM(a)), SUM(a) FROM t1;
+}
+expect {
+    real|7.0
+}
+expect @js {
+    real|7
+}
+
+test sum-pure-integer-text-returns-integer {
+    CREATE TABLE t2 (a TEXT);
+    INSERT INTO t2 VALUES ('4');
+    INSERT INTO t2 VALUES ('3');
+    SELECT typeof(SUM(a)), SUM(a) FROM t2;
+}
+expect {
+    integer|7
+}
+
+test sum-non-numeric-text-returns-real {
+    CREATE TABLE t3 (a TEXT);
+    INSERT INTO t3 VALUES ('abc');
+    SELECT typeof(SUM(a)), SUM(a) FROM t3;
+}
+expect {
+    real|0.0
+}
+expect @js {
+    real|0
+}
+
+test sum-mixed-pure-and-partial-text-returns-real {
+    CREATE TABLE t4 (a TEXT);
+    INSERT INTO t4 VALUES ('4');
+    INSERT INTO t4 VALUES ('3abc');
+    SELECT typeof(SUM(a)), SUM(a) FROM t4;
+}
+expect {
+    real|7.0
+}
+expect @js {
+    real|7
+}
+
+
+test sum-text-default-partial-numeric {
+    CREATE TABLE t5 (a INTEGER PRIMARY KEY, b TEXT DEFAULT ('4dMH'));
+    INSERT INTO t5 (a) VALUES (1);
+    INSERT INTO t5 (a) VALUES (2);
+    INSERT INTO t5 (a) VALUES (3);
+    SELECT typeof(SUM(b)), SUM(b) FROM t5;
+}
+expect {
+    real|12.0
+}
+expect @js {
+    real|12
+}
