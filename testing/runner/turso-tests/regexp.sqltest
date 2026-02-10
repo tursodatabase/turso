@@ -1,0 +1,120 @@
+@database :memory:
+
+test regexp_operator_basic_match {
+    SELECT 'hello' REGEXP 'h.*o';
+}
+expect {
+    1
+}
+
+test regexp_operator_no_match {
+    SELECT 'hello' REGEXP '^world$';
+}
+expect {
+    0
+}
+
+test regexp_not_operator {
+    SELECT 'hello' NOT REGEXP 'h.*o';
+    SELECT 'hello' NOT REGEXP '^world$';
+}
+expect {
+    0
+    1
+}
+
+test regexp_function_call {
+    SELECT regexp('h.*o', 'hello');
+    SELECT regexp('^world$', 'hello');
+}
+expect {
+    1
+    0
+}
+
+test regexp_in_where {
+    CREATE TABLE t1(a TEXT, b INTEGER);
+    INSERT INTO t1 VALUES ('abc', 1), ('def', 2), ('abcdef', 3), ('xyz', 4);
+    SELECT b FROM t1 WHERE a REGEXP '^abc';
+}
+expect {
+    1
+    3
+}
+
+test regexp_not_in_where {
+    CREATE TABLE t2(a TEXT, b INTEGER);
+    INSERT INTO t2 VALUES ('abc', 1), ('def', 2), ('abcdef', 3), ('xyz', 4);
+    SELECT b FROM t2 WHERE a NOT REGEXP '^abc';
+}
+expect {
+    2
+    4
+}
+
+test regexp_in_select {
+    CREATE TABLE t3(a TEXT, b INTEGER);
+    INSERT INTO t3 VALUES ('abc', 1), ('def', 2), ('abcdef', 3), ('xyz', 4);
+    SELECT a, a REGEXP 'def$' FROM t3;
+}
+expect {
+    abc|0
+    def|1
+    abcdef|1
+    xyz|0
+}
+
+test regexp_in_case {
+    CREATE TABLE t4(a TEXT);
+    INSERT INTO t4 VALUES ('abc'), ('def'), ('abcdef'), ('xyz');
+    SELECT CASE WHEN a REGEXP '^a' THEN 'starts_a' ELSE 'other' END FROM t4;
+}
+expect {
+    starts_a
+    other
+    starts_a
+    other
+}
+
+test regexp_null_handling {
+    SELECT NULL REGEXP 'abc';
+    SELECT 'abc' REGEXP NULL;
+    SELECT regexp(NULL, 'abc');
+    SELECT regexp('abc', NULL);
+}
+expect {
+
+
+
+
+}
+
+test regexp_integer_operands {
+    SELECT 123 REGEXP '1.*3';
+    SELECT 456 REGEXP '1.*3';
+}
+expect {
+
+
+}
+
+test regexp_complex_patterns {
+    SELECT 'test@example.com' REGEXP '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$';
+    SELECT '2024-01-15' REGEXP '^\d{4}-\d{2}-\d{2}$';
+    SELECT 'hello world' REGEXP '\bworld\b';
+}
+expect {
+    1
+    1
+    1
+}
+
+test regexp_in_subquery {
+    CREATE TABLE t5(a TEXT);
+    INSERT INTO t5 VALUES ('abc'), ('def'), ('abcdef'), ('xyz');
+    SELECT * FROM (SELECT a, a REGEXP 'def' AS matches FROM t5) sub WHERE matches = 1;
+}
+expect {
+    def|1
+    abcdef|1
+}
