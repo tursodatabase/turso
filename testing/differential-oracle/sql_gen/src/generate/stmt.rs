@@ -2,10 +2,10 @@
 
 use crate::SqlGen;
 use crate::ast::{
-    AlterTableAction, AlterTableActionKind, AlterTableStmt, ColumnDefStmt, ConflictClause,
+    AlterTableAction, AlterTableActionKind, AlterTableStmt, BinOp, ColumnDefStmt, ConflictClause,
     CreateIndexStmt, CreateTableStmt, CreateTriggerStmt, DeleteStmt, DropIndexStmt, DropTableStmt,
-    DropTriggerStmt, Expr, InsertStmt, Stmt, TriggerBodyStmtKind, TriggerEvent, TriggerEventKind,
-    TriggerStmt, TriggerTiming, UpdateStmt,
+    DropTriggerStmt, Expr, InsertStmt, Literal, Stmt, TriggerBodyStmtKind, TriggerEvent,
+    TriggerEventKind, TriggerStmt, TriggerTiming, UpdateStmt,
 };
 use crate::capabilities::Capabilities;
 use crate::context::Context;
@@ -567,6 +567,7 @@ pub fn generate_create_table<C: Capabilities>(
         not_null: true,
         unique: false,
         default: None,
+        check: None,
     });
 
     // Generate additional columns
@@ -589,6 +590,12 @@ pub fn generate_create_table<C: Capabilities>(
         let name = ctx.gen_unique_name("col", &col_names);
         col_names.insert(name.clone());
 
+        let check = if ctx.gen_bool_with_prob(create_table_config.check_constraint_probability) {
+            generate_check_constraint(generator, ctx, &name, data_type)?
+        } else {
+            None
+        };
+
         columns.push(ColumnDefStmt {
             name,
             data_type,
@@ -596,6 +603,7 @@ pub fn generate_create_table<C: Capabilities>(
             not_null,
             unique,
             default,
+            check,
         });
     }
 
@@ -605,9 +613,6 @@ pub fn generate_create_table<C: Capabilities>(
     }
 
     // --- Table-level constraints (not yet implemented) ---
-    if ctx.gen_bool_with_prob(create_table_config.check_constraint_probability) {
-        let _ = generate_check_constraint(generator, ctx);
-    }
     if ctx.gen_bool_with_prob(create_table_config.foreign_key_probability) {
         let _ = generate_foreign_key(generator, ctx);
     }
@@ -730,6 +735,7 @@ fn generate_alter_table_action<C: Capabilities>(
                 not_null,
                 unique: false,
                 default: None,
+                check: None,
             }))
         }
         AlterTableActionKind::DropColumn => {
@@ -1096,12 +1102,108 @@ fn generate_delete_returning<C: Capabilities>(
 
 // ---- CREATE TABLE features ----
 
+/// Generate a CHECK constraint expression for a column, based on its data type.
+/// Mirrors the approach from sql_gen_prop: simple, deterministic, type-appropriate constraints.
 #[trace_gen(Origin::CheckConstraint)]
 fn generate_check_constraint<C: Capabilities>(
     _generator: &SqlGen<C>,
-    _ctx: &mut Context,
-) -> Result<Expr, GenError> {
-    todo!("CHECK constraint generation")
+    ctx: &mut Context,
+    col_name: &str,
+    data_type: DataType,
+) -> Result<Option<Expr>, GenError> {
+    match data_type {
+        DataType::Integer => {
+            let variant = ctx.gen_range(5);
+            let expr = match variant {
+                // col >= 0
+                0 => {
+                    let col = Expr::column_ref(ctx, None, col_name.to_string());
+                    let rhs = Expr::literal(ctx, Literal::Integer(0));
+                    Expr::binary_op(ctx, col, BinOp::Ge, rhs)
+                }
+                // col > 0
+                1 => {
+                    let col = Expr::column_ref(ctx, None, col_name.to_string());
+                    let rhs = Expr::literal(ctx, Literal::Integer(0));
+                    Expr::binary_op(ctx, col, BinOp::Gt, rhs)
+                }
+                // col BETWEEN 0 AND 1000
+                2 => {
+                    let col = Expr::column_ref(ctx, None, col_name.to_string());
+                    let low = Expr::literal(ctx, Literal::Integer(0));
+                    let high = Expr::literal(ctx, Literal::Integer(1000));
+                    Expr::between(ctx, col, low, high, false)
+                }
+                // col != 0
+                3 => {
+                    let col = Expr::column_ref(ctx, None, col_name.to_string());
+                    let rhs = Expr::literal(ctx, Literal::Integer(0));
+                    Expr::binary_op(ctx, col, BinOp::Ne, rhs)
+                }
+                // col >= N (random N in 1..100)
+                _ => {
+                    let n = ctx.gen_range_inclusive(1, 99) as i64;
+                    let col = Expr::column_ref(ctx, None, col_name.to_string());
+                    let rhs = Expr::literal(ctx, Literal::Integer(n));
+                    Expr::binary_op(ctx, col, BinOp::Ge, rhs)
+                }
+            };
+            Ok(Some(expr))
+        }
+        DataType::Real => {
+            let variant = ctx.gen_range(3);
+            let expr = match variant {
+                // col >= 0.0
+                0 => {
+                    let col = Expr::column_ref(ctx, None, col_name.to_string());
+                    let rhs = Expr::literal(ctx, Literal::Real(0.0));
+                    Expr::binary_op(ctx, col, BinOp::Ge, rhs)
+                }
+                // col > 0.0
+                1 => {
+                    let col = Expr::column_ref(ctx, None, col_name.to_string());
+                    let rhs = Expr::literal(ctx, Literal::Real(0.0));
+                    Expr::binary_op(ctx, col, BinOp::Gt, rhs)
+                }
+                // col BETWEEN 0.0 AND 1000.0
+                _ => {
+                    let col = Expr::column_ref(ctx, None, col_name.to_string());
+                    let low = Expr::literal(ctx, Literal::Real(0.0));
+                    let high = Expr::literal(ctx, Literal::Real(1000.0));
+                    Expr::between(ctx, col, low, high, false)
+                }
+            };
+            Ok(Some(expr))
+        }
+        DataType::Text => {
+            let variant = ctx.gen_range(3);
+            let expr = match variant {
+                // length(col) > 0
+                0 => {
+                    let col = Expr::column_ref(ctx, None, col_name.to_string());
+                    let len = Expr::function_call(ctx, "length".to_string(), vec![col]);
+                    let rhs = Expr::literal(ctx, Literal::Integer(0));
+                    Expr::binary_op(ctx, len, BinOp::Gt, rhs)
+                }
+                // length(col) <= 100
+                1 => {
+                    let col = Expr::column_ref(ctx, None, col_name.to_string());
+                    let len = Expr::function_call(ctx, "length".to_string(), vec![col]);
+                    let rhs = Expr::literal(ctx, Literal::Integer(100));
+                    Expr::binary_op(ctx, len, BinOp::Le, rhs)
+                }
+                // col != ''
+                _ => {
+                    let col = Expr::column_ref(ctx, None, col_name.to_string());
+                    let rhs = Expr::literal(ctx, Literal::Text(String::new()));
+                    Expr::binary_op(ctx, col, BinOp::Ne, rhs)
+                }
+            };
+            Ok(Some(expr))
+        }
+        // Blob and Null types don't have useful check constraints
+        DataType::Blob | DataType::Null => Ok(None),
+    }
 }
 
 #[trace_gen(Origin::ForeignKey)]
