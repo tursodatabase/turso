@@ -91,3 +91,9 @@ test json-malformed-leading-zero-digit {
 expect error {
 }
 
+# Malformed JSONB blob must error (no panic)
+test jsonb-malformed-overflow-header {
+    SELECT jsonb(x'F1FFFFFFFFFFFFFFFF');
+}
+expect error {
+}
