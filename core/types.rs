@@ -484,8 +484,8 @@ pub struct ExternalAggState {
 /// format!("{}", value);
 /// ---BAD---
 /// match value {
-///   Value::from_i64(i) => *i.as_str(),
-///   Value::from_f64(f) => *f.as_str(),
+///   Value::Numeric(Numeric::Integer(i)) => i.to_string(),
+///   Value::Numeric(Numeric::Float(f)) => f64::from(*f).to_string(),
 ///   ....
 /// }
 impl Display for Value {
