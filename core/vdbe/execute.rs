@@ -12146,9 +12146,8 @@ fn op_vacuum_into_inner(
                 let schema_rows_len = vacuum_state.schema_rows.len();
                 turso_assert!(
                     idx <= schema_rows_len,
-                    "idx {} incremented past end of schema_rows (len {})",
-                    idx,
-                    schema_rows_len
+                    "idx incremented past end of schema_rows",
+                    { "idx": idx, "schema_rows_len": schema_rows_len }
                 );
                 if idx == schema_rows_len {
                     // Done creating schema, start copying data
@@ -12162,8 +12161,8 @@ fn op_vacuum_into_inner(
                 let row = &vacuum_state.schema_rows[idx];
                 turso_assert!(
                     row.len() == 4,
-                    "schema row should have exactly 4 columns (type, name, tbl_name, sql), got {}",
-                    row.len()
+                    "schema row should have exactly 4 columns (type, name, tbl_name, sql)",
+                    { "row_len": row.len() }
                 );
 
                 // Skip triggers and views - they'll be created after data copy
@@ -12248,9 +12247,8 @@ fn op_vacuum_into_inner(
                 let table_names_len = vacuum_state.table_names.len();
                 turso_assert!(
                     table_idx <= table_names_len,
-                    "table_idx {} incremented past end of table_names (len {})",
-                    table_idx,
-                    table_names_len
+                    "table_idx incremented past end of table_names",
+                    { "table_idx": table_idx, "table_names_len": table_names_len }
                 );
                 if table_idx == table_names_len {
                     // Done copying all tables, now copy meta values
@@ -12459,9 +12457,8 @@ fn op_vacuum_into_inner(
                 let schema_rows_len = vacuum_state.schema_rows.len();
                 turso_assert!(
                     idx <= schema_rows_len,
-                    "idx {} incremented past end of schema_rows (len {})",
-                    idx,
-                    schema_rows_len
+                    "idx incremented past end of schema_rows",
+                    { "idx": idx, "schema_rows_len": schema_rows_len }
                 );
                 if idx == schema_rows_len {
                     // Done creating triggers and views

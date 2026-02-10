@@ -727,8 +727,8 @@ impl Page {
         let inner = self.get();
         debug_assert!(
             inner.buffer.is_some(),
-            "page {} buffer not loaded",
-            inner.id
+            "page buffer not loaded",
+            { "page_id": inner.id }
         );
         inner
     }
@@ -836,8 +836,8 @@ impl Page {
 
         turso_assert!(
             was_pinned,
-            "Attempted to unpin page {} that was not pinned",
-            self.get().id
+            "Attempted to unpin page that was not pinned",
+            { "page_id": self.get().id }
         );
     }
 
@@ -1619,8 +1619,8 @@ impl Pager {
         let mut savepoints = self.savepoints.write();
         turso_assert!(
             savepoints.is_empty(),
-            "savepoints should be empty, but had {} savepoints open",
-            savepoints.len()
+            "savepoints should be empty",
+            { "savepoints_count": savepoints.len() }
         );
         savepoints.push(savepoint);
         Ok(())
@@ -2479,8 +2479,8 @@ impl Pager {
             if let Some(page) = page_cache.get(&page_key)? {
                 turso_assert!(
                     page_idx as usize == page.get().id,
-                    "attempted to read page {page_idx} but got page {}",
-                    page.get().id
+                    "attempted to read page but got different page",
+                    { "expected_page": page_idx, "actual_page": page.get().id }
                 );
                 return Ok((page, None));
             }
@@ -2603,8 +2603,8 @@ impl Pager {
     pub fn add_dirty(&self, page: &Page) -> Result<()> {
         turso_assert!(
             page.is_loaded(),
-            "page {} must be loaded in add_dirty() so its contents can be subjournaled",
-            page.get().id
+            "page must be loaded in add_dirty() so its contents can be subjournaled",
+            { "page_id": page.get().id }
         );
         self.subjournal_page_if_required(page)?;
         let mut dirty_pages = self.dirty_pages.write();
@@ -4143,8 +4143,8 @@ impl Pager {
                 AllocatePageState::SearchAvailableFreeListLeaf { trunk_page } => {
                     turso_assert!(
                         trunk_page.is_loaded(),
-                        "Freelist trunk page {} is not loaded",
-                        trunk_page.get().id
+                        "Freelist trunk page is not loaded",
+                        { "page_id": trunk_page.get().id }
                     );
                     let page_contents = trunk_page.get_contents();
                     let next_trunk_page_id =
@@ -4162,8 +4162,8 @@ impl Pager {
 
                         turso_assert!(
                             number_of_freelist_leaves > 0,
-                            "Freelist trunk page {} has no leaves",
-                            trunk_page.get().id
+                            "Freelist trunk page has no leaves",
+                            { "page_id": trunk_page.get().id }
                         );
 
                         // Pin leaf_page to prevent eviction while stored in state machine
@@ -4190,8 +4190,8 @@ impl Pager {
                     // zero out the page
                     turso_assert!(
                         trunk_page.get_contents().overflow_cells.is_empty(),
-                        "Freelist leaf page {} has overflow cells",
-                        trunk_page.get().id
+                        "Freelist trunk page has overflow cells",
+                        { "page_id": trunk_page.get().id }
                     );
                     trunk_page.get_contents().as_ptr().fill(0);
                     let page_key = PageCacheKey::new(trunk_page.get().id);
@@ -4199,8 +4199,8 @@ impl Pager {
                         let page_cache = self.page_cache.read();
                         turso_assert!(
                             page_cache.contains_key(&page_key),
-                            "page {} is not in cache",
-                            trunk_page.get().id
+                            "page is not in cache",
+                            { "page_id": trunk_page.get().id }
                         );
                     }
                     // Unpin trunk_page before returning - caller takes ownership
@@ -4216,16 +4216,16 @@ impl Pager {
                 } => {
                     turso_assert!(
                         leaf_page.is_loaded(),
-                        "Leaf page {} is not loaded",
-                        leaf_page.get().id
+                        "Leaf page is not loaded",
+                        { "page_id": leaf_page.get().id }
                     );
                     let page_contents = trunk_page.get_contents();
                     self.add_dirty(leaf_page)?;
                     // zero out the page
                     turso_assert!(
                         leaf_page.get_contents().overflow_cells.is_empty(),
-                        "Freelist leaf page {} has overflow cells",
-                        leaf_page.get().id
+                        "Freelist leaf page has overflow cells",
+                        { "page_id": leaf_page.get().id }
                     );
                     leaf_page.get_contents().as_ptr().fill(0);
                     let page_key = PageCacheKey::new(leaf_page.get().id);
@@ -4233,8 +4233,8 @@ impl Pager {
                         let page_cache = self.page_cache.read();
                         turso_assert!(
                             page_cache.contains_key(&page_key),
-                            "page {} is not in cache",
-                            leaf_page.get().id
+                            "page is not in cache",
+                            { "page_id": leaf_page.get().id }
                         );
                     }
 

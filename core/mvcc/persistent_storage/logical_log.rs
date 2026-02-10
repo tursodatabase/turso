@@ -1164,8 +1164,8 @@ impl StreamingLogicalLogReader {
             let buffer_size_before_read = self.buffer.read().len();
             turso_assert!(
                 buffer_size_before_read >= self.buffer_offset,
-                "buffer_size_before_read={buffer_size_before_read} < buffer_offset={}",
-                self.buffer_offset
+                "buffer_size_before_read < buffer_offset",
+                { "buffer_size_before_read": buffer_size_before_read, "buffer_offset": self.buffer_offset }
             );
             let bytes_available_in_buffer = buffer_size_before_read - self.buffer_offset;
             let still_need = need.saturating_sub(bytes_available_in_buffer);
@@ -1176,9 +1176,8 @@ impl StreamingLogicalLogReader {
 
             turso_assert!(
                 self.file_size >= self.offset,
-                "file_size={} < offset={}",
-                self.file_size,
-                self.offset
+                "file_size < offset",
+                { "file_size": self.file_size, "offset": self.offset }
             );
             let to_read = 4096.max(still_need).min(self.file_size - self.offset);
 

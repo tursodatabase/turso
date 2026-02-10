@@ -145,9 +145,8 @@ impl BufferPool {
     fn new(arena_size: usize) -> Self {
         turso_assert!(
             (Self::MIN_ARENA_SIZE..Self::MAX_ARENA_SIZE).contains(&arena_size),
-            "Arena size needs to be between {}..{} bytes",
-            Self::MIN_ARENA_SIZE,
-            Self::MAX_ARENA_SIZE
+            "Arena size out of valid range",
+            { "arena_size": arena_size, "min": Self::MIN_ARENA_SIZE, "max": Self::MAX_ARENA_SIZE }
         );
         Self {
             inner: UnsafeCell::new(PoolInner {

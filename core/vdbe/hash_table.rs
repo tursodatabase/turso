@@ -1,3 +1,4 @@
+use crate::turso_assert;
 use crate::{
     error::LimboError,
     io::{Buffer, Completion, TempFile, IO},
@@ -1000,8 +1001,8 @@ impl HashTable {
     ) -> Result<IOResult<()>> {
         turso_assert!(
             self.state == HashTableState::Building || self.state == HashTableState::Spilled,
-            "Cannot insert into hash table in state {:?}",
-            self.state
+            "Cannot insert into hash table in unexpected state",
+            { "state": format!("{:?}", self.state) }
         );
 
         // Skip rows with NULL join keys - they can never match anything since NULL != NULL in SQL
@@ -1073,8 +1074,8 @@ impl HashTable {
     ) -> Result<IOResult<bool>> {
         turso_assert!(
             self.state == HashTableState::Building || self.state == HashTableState::Spilled,
-            "Cannot insert into hash table in state {:?}",
-            self.state
+            "Cannot insert_distinct into hash table in unexpected state",
+            { "state": format!("{:?}", self.state) }
         );
 
         let hash = hash_join_key(key_refs, &self.collations);
@@ -1529,8 +1530,8 @@ impl HashTable {
     pub fn finalize_build(&mut self) -> Result<IOResult<()>> {
         turso_assert!(
             self.state == HashTableState::Building || self.state == HashTableState::Spilled,
-            "Cannot finalize build in state {:?}",
-            self.state
+            "Cannot finalize build in unexpected state",
+            { "state": format!("{:?}", self.state) }
         );
 
         if self.spill_state.is_some() {
@@ -1584,8 +1585,8 @@ impl HashTable {
     pub fn probe(&mut self, probe_keys: Vec<Value>) -> Option<&HashEntry> {
         turso_assert!(
             self.state == HashTableState::Probing,
-            "Cannot probe hash table in state {:?}",
-            self.state
+            "Cannot probe hash table in unexpected state",
+            { "state": format!("{:?}", self.state) }
         );
 
         // Skip probing if any key is NULL - NULL can never match anything in SQL
@@ -1655,8 +1656,8 @@ impl HashTable {
     pub fn next_match(&mut self) -> Option<&HashEntry> {
         turso_assert!(
             self.state == HashTableState::Probing,
-            "Cannot get next match in state {:?}",
-            self.state
+            "Cannot get next match in unexpected state",
+            { "state": format!("{:?}", self.state) }
         );
 
         turso_assert!(self.current_probe_keys.is_some(), "probe keys must be set");

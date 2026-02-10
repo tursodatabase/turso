@@ -1075,13 +1075,10 @@ impl BTreeCursor {
                 }
 
                 turso_assert!(
-                cell_idx < cell_count,
-                "cell index out of bounds: cell_idx={}, cell_count={}, page_type={:?} page_id={}",
-                cell_idx,
-                cell_count,
-                contents.page_type().ok(),
-                mem_page.get().id
-            );
+                    cell_idx < cell_count,
+                    "cell index out of bounds",
+                    { "cell_idx": cell_idx, "cell_count": cell_count, "page_type": contents.page_type().ok(), "page_id": mem_page.get().id }
+                );
 
                 if is_leaf {
                     return Ok(IOResult::Done(true));
@@ -1568,9 +1565,8 @@ impl BTreeCursor {
                 let page = self.stack.get_page_at_level(old_top_idx).unwrap();
                 turso_assert!(
                     page.get().id != *left_child_page as usize,
-                    "corrupt: current page and left child page of cell {} are both {}",
-                    leftmost_matching_cell,
-                    page.get().id
+                    "corrupt: current page and left child page are the same",
+                    { "cell": leftmost_matching_cell, "page_id": page.get().id }
                 );
             }
 
@@ -2325,7 +2321,7 @@ impl BTreeCursor {
                     cell_idx,
                     ref mut state,
                 } => {
-                    turso_assert!(page.is_loaded(), "page {}is not loaded", page.get().id);
+                    turso_assert!(page.is_loaded(), "page is not loaded", { "page_id": page.get().id });
                     let page = page.clone();
 
                     // Currently it's necessary to .take() here to prevent double-borrow of `self` in `overwrite_cell`.
@@ -2532,8 +2528,8 @@ impl BTreeCursor {
         let old_rightmost_leaf_contents = old_rightmost_leaf.get_contents();
         turso_assert!(
             old_rightmost_leaf_contents.overflow_cells.len() == 1,
-            "expected 1 overflow cell, got {}",
-            old_rightmost_leaf_contents.overflow_cells.len()
+            "expected 1 overflow cell",
+            { "overflow_cell_count": old_rightmost_leaf_contents.overflow_cells.len() }
         );
 
         let parent = self
@@ -2648,16 +2644,15 @@ impl BTreeCursor {
                         if matches!(page_type, PageType::IndexInterior) {
                             turso_assert!(parent_contents.overflow_cells.len() == 1, "index interior page must have no more than 1 overflow cell, as a result of InteriorNodeReplacement");
                         } else {
-                            turso_assert!(false, "{page_type:?} must have no overflow cells");
+                            turso_assert!(false, "page type must have no overflow cells", { "page_type": page_type });
                         }
                         let overflow_cell = parent_contents.overflow_cells.first().unwrap();
                         let parent_page_cell_idx = self.stack.current_cell_index() as usize;
                         // Parent page must be positioned at the divider cell that overflowed due to the replacement.
                         turso_assert!(
                             overflow_cell.index == parent_page_cell_idx,
-                            "overflow cell index must be the result of InteriorNodeReplacement that leaves both child and parent (id={}) unbalanced, and hence parent page's position must = overflow_cell.index. Instead got: parent_page_cell_idx={parent_page_cell_idx} overflow_cell.index={}",
-                            parent_page.get().id,
-                            overflow_cell.index
+                            "overflow cell index must be the result of InteriorNodeReplacement that leaves both child and parent unbalanced, and hence parent page's position must equal overflow_cell.index",
+                            { "parent_page_id": parent_page.get().id, "parent_page_cell_idx": parent_page_cell_idx, "overflow_cell_index": overflow_cell.index }
                         );
                     }
                     self.pager.add_dirty(parent_page)?;
@@ -2782,8 +2777,8 @@ impl BTreeCursor {
                                     parent_contents.page_type().ok(),
                                     Some(PageType::IndexInterior)
                                 ),
-                                "expected index interior page, got {:?}",
-                                parent_contents.page_type().ok()
+                                "expected index interior page",
+                                { "page_type": parent_contents.page_type().ok() }
                             );
                             turso_assert!(
                                 parent_contents.overflow_cells.len() == 1,
@@ -2909,8 +2904,8 @@ impl BTreeCursor {
                                     parent_contents.page_type().ok(),
                                     Some(PageType::IndexInterior)
                                 ),
-                                "expected index interior page, got {:?}",
-                                parent_contents.page_type().ok()
+                                "expected index interior page",
+                                { "page_type": parent_contents.page_type().ok() }
                             );
                             turso_assert!(
                                 parent_contents.overflow_cells.len() == 1,
@@ -3089,22 +3084,13 @@ impl BTreeCursor {
                         total_cells_to_redistribute - dividers_in_parent_only;
                     turso_assert!(
                         cell_array.cell_payloads.len() == expected_cells_in_array,
-                        "cell count mismatch after collection: collected {} cells but expected {} \
-                        (total_cells_to_redistribute={}, dividers_in_parent_only={}, is_table_leaf={})",
-                        cell_array.cell_payloads.len(),
-                        expected_cells_in_array,
-                        total_cells_to_redistribute,
-                        dividers_in_parent_only,
-                        is_table_leaf
+                        "cell count mismatch after collection",
+                        { "collected": cell_array.cell_payloads.len(), "expected": expected_cells_in_array, "total_cells_to_redistribute": total_cells_to_redistribute, "dividers_in_parent_only": dividers_in_parent_only, "is_table_leaf": is_table_leaf }
                     );
                     turso_assert!(
                         total_cells_inserted == expected_cells_in_array,
-                        "cell count mismatch: total_cells_inserted={} but expected_cells_in_array={} \
-                        (total_cells_to_redistribute={}, dividers_in_parent_only={})",
-                        total_cells_inserted,
-                        expected_cells_in_array,
-                        total_cells_to_redistribute,
-                        dividers_in_parent_only
+                        "cell count mismatch between total cells inserted and expected",
+                        { "total_cells_inserted": total_cells_inserted, "expected_cells_in_array": expected_cells_in_array, "total_cells_to_redistribute": total_cells_to_redistribute, "dividers_in_parent_only": dividers_in_parent_only }
                     );
 
                     // Let's copy all cells for later checks
@@ -3633,9 +3619,8 @@ impl BTreeCursor {
                             .get();
                         turso_assert!(
                             left_pointer <= database_size,
-                            "invalid page number divider left pointer {} > database number of pages {}",
-                            left_pointer,
-                            database_size
+                            "invalid page number divider left pointer exceeds database number of pages",
+                            { "left_pointer": left_pointer, "database_size": database_size }
                         );
                         let divider_cell_insert_idx_in_parent =
                             first_divider_cell_cached + sibling_page_idx;
@@ -4744,7 +4729,7 @@ impl BTreeCursor {
         state: &mut OverwriteCellState,
     ) -> Result<IOResult<()>> {
         loop {
-            turso_assert!(page.is_loaded(), "page {} is not loaded", page.get().id);
+            turso_assert!(page.is_loaded(), "page is not loaded", { "page_id": page.get().id });
             match state {
                 OverwriteCellState::AllocatePayload => {
                     let serial_types_len = record.column_count();
@@ -5330,9 +5315,8 @@ impl CursorTrait for BTreeCursor {
                         );
                         turso_assert!(
                             left_child_page as usize != parent_page_id,
-                            "corrupt: current page and left child page of cell {} are both {}",
-                            left_child_page,
-                            parent_page_id
+                            "corrupt: current page and left child page are the same",
+                            { "left_child_page": left_child_page, "parent_page_id": parent_page_id }
                         );
 
                         // First, drop the old cell that is being replaced.
@@ -6472,8 +6456,8 @@ impl PageStack {
             if let Some(current_top) = current_top {
                 turso_assert!(
                     current_top.get().id != page.get().id,
-                    "about to push page {} twice",
-                    page.get().id
+                    "about to push page twice",
+                    { "page_id": page.get().id }
                 );
             }
         }
@@ -6511,13 +6495,13 @@ impl PageStack {
         let page = self.stack[current].as_ref().unwrap();
         turso_assert!(
             page.is_pinned(),
-            "parent page {} is not pinned",
-            page.get().id
+            "parent page is not pinned",
+            { "page_id": page.get().id }
         );
         turso_assert!(
             page.is_loaded(),
-            "parent page {} is not loaded",
-            page.get().id
+            "parent page is not loaded",
+            { "page_id": page.get().id }
         );
         let contents = page.get_contents();
         let cell_count = contents.cell_count() as i32;
@@ -7131,13 +7115,8 @@ fn page_insert_array(
 
     turso_assert!(
         new_unallocated_start <= new_cell_content_area,
-        "page_insert_array: not enough space: need {} bytes for pointers + {} bytes for payloads, \
-         unallocated region is {}..{} ({} bytes)",
-        total_ptr_space,
-        total_payload_size,
-        unallocated_start,
-        cell_content_area,
-        cell_content_area - unallocated_start
+        "page_insert_array: not enough space for pointers and payloads in unallocated region",
+        { "total_ptr_space": total_ptr_space, "total_payload_size": total_payload_size, "unallocated_start": unallocated_start, "cell_content_area": cell_content_area, "unallocated_region_size": cell_content_area - unallocated_start }
     );
 
     let buf = page.as_ptr();
@@ -7377,11 +7356,11 @@ fn defragment_page_fast(
 ) -> Result<()> {
     turso_assert!(freeblock_1st != 0, "no free blocks");
     if freeblock_2nd > 0 {
-        turso_assert!(freeblock_1st < freeblock_2nd, "1st freeblock is not before 2nd freeblock: freeblock_1st={freeblock_1st} freeblock_2nd={freeblock_2nd}");
+        turso_assert!(freeblock_1st < freeblock_2nd, "1st freeblock is not before 2nd freeblock", { "freeblock_1st": freeblock_1st, "freeblock_2nd": freeblock_2nd });
     }
     const FREEBLOCK_SIZE_MIN: usize = 4;
-    turso_assert!(freeblock_1st <= usable_space - FREEBLOCK_SIZE_MIN, "1st freeblock beyond usable space: freeblock_1st={freeblock_1st} usable_space={usable_space}");
-    turso_assert!(freeblock_2nd <= usable_space - FREEBLOCK_SIZE_MIN, "2nd freeblock beyond usable space: freeblock_2nd={freeblock_2nd} usable_space={usable_space}");
+    turso_assert!(freeblock_1st <= usable_space - FREEBLOCK_SIZE_MIN, "1st freeblock beyond usable space", { "freeblock_1st": freeblock_1st, "usable_space": usable_space });
+    turso_assert!(freeblock_2nd <= usable_space - FREEBLOCK_SIZE_MIN, "2nd freeblock beyond usable space", { "freeblock_2nd": freeblock_2nd, "usable_space": usable_space });
 
     let freeblock_1st_size = page.read_u16_no_offset(freeblock_1st + 2) as usize;
     let freeblock_2nd_size = if freeblock_2nd > 0 {
@@ -7395,9 +7374,9 @@ fn defragment_page_fast(
 
     if freeblock_2nd > 0 {
         // If there's 2 freeblocks, merge them into one first.
-        turso_assert!(freeblock_1st + freeblock_1st_size <= freeblock_2nd, "overlapping freeblocks: freeblock_1st={freeblock_1st} freeblock_1st_size={freeblock_1st_size} freeblock_2nd={freeblock_2nd}");
+        turso_assert!(freeblock_1st + freeblock_1st_size <= freeblock_2nd, "overlapping freeblocks", { "freeblock_1st": freeblock_1st, "freeblock_1st_size": freeblock_1st_size, "freeblock_2nd": freeblock_2nd });
         if freeblock_2nd + freeblock_2nd_size > usable_space {
-            turso_assert!(false, "Second freeblock extends beyond usable space: freeblock_2nd={freeblock_2nd} freeblock_2nd_size={freeblock_2nd_size} usable_space={usable_space}");
+            turso_assert!(false, "second freeblock extends beyond usable space", { "freeblock_2nd": freeblock_2nd, "freeblock_2nd_size": freeblock_2nd_size, "usable_space": usable_space });
         }
         let buf = page.as_ptr();
         // Effectively moves everything in between the two freeblocks rightwards by the length of the 2nd freeblock,
@@ -7414,7 +7393,7 @@ fn defragment_page_fast(
             freeblock_1st + freeblocks_total_size,
         );
     } else if freeblock_1st + freeblock_1st_size > usable_space {
-        turso_assert!(false, "First freeblock extends beyond usable space: freeblock_1st={freeblock_1st} freeblock_1st_size={freeblock_1st_size} usable_space={usable_space}");
+        turso_assert!(false, "first freeblock extends beyond usable space", { "freeblock_1st": freeblock_1st, "freeblock_1st_size": freeblock_1st_size, "usable_space": usable_space });
     }
 
     // Now we have one freeblock somewhere in the middle of the content area, e.g.:
@@ -7423,7 +7402,7 @@ fn defragment_page_fast(
     // meaning, it's no longer a freeblock, it's just plain old free space.
     // content area start | free space | ----------- cells ----------|
     let new_cell_content_area = cell_content_area + freeblocks_total_size;
-    turso_assert!(new_cell_content_area + (freeblock_1st - cell_content_area) <= usable_space, "new cell content area offset extends beyond usable space: new_cell_content_area={new_cell_content_area} freeblock_1st={freeblock_1st} cell_content_area={cell_content_area} usable_space={usable_space}");
+    turso_assert!(new_cell_content_area + (freeblock_1st - cell_content_area) <= usable_space, "new cell content area offset extends beyond usable space", { "new_cell_content_area": new_cell_content_area, "freeblock_1st": freeblock_1st, "cell_content_area": cell_content_area, "usable_space": usable_space });
 
     let copy_amount = freeblock_1st - cell_content_area; // cells to the left of the first freeblock
     let buf = page.as_ptr();
@@ -7442,13 +7421,13 @@ fn defragment_page_fast(
             // If the cell pointer was located before the first freeblock, we need to shift it right by the size of the merged freeblock
             // since the space occupied by both the 1st and 2nd freeblocks was now moved to its left.
             let new_offset = cell_ptr + freeblocks_total_size;
-            turso_assert!(new_offset <= usable_space, "new offset beyond usable space: new_offset={new_offset} usable_space={usable_space}");
+            turso_assert!(new_offset <= usable_space, "new offset beyond usable space", { "new_offset": new_offset, "usable_space": usable_space });
             page.write_u16_no_offset(ptr_offset, (cell_ptr + freeblocks_total_size) as u16);
         } else if freeblock_2nd > 0 && cell_ptr < freeblock_2nd {
             // If the cell pointer was located between the first and second freeblock, we need to shift it right by the size of only the second freeblock,
             // since the first one was already on its left.
             let new_offset = cell_ptr + freeblock_2nd_size;
-            turso_assert!(new_offset <= usable_space, "new offset beyond usable space: new_offset={new_offset} usable_space={usable_space}");
+            turso_assert!(new_offset <= usable_space, "new offset beyond usable space", { "new_offset": new_offset, "usable_space": usable_space });
             page.write_u16_no_offset(ptr_offset, (cell_ptr + freeblock_2nd_size) as u16);
         }
     }
@@ -7560,8 +7539,8 @@ fn defragment_page(page: &PageContent, usable_space: usize, max_frag_bytes: isiz
             // Basic corruption check
             turso_assert!(
                 new_offset >= first_cell_content_byte && old_offset + cell.size as usize <= usable_space,
-                "corrupt page detected during defragmentation: new_offset={new_offset} first_cell_content_byte={first_cell_content_byte} old_offset={old_offset} cell.size={} usable_space={usable_space}",
-                cell.size
+                "corrupt page detected during defragmentation",
+                { "new_offset": new_offset, "first_cell_content_byte": first_cell_content_byte, "old_offset": old_offset, "cell_size": cell.size, "usable_space": usable_space }
             );
 
             // Move the cell data. `copy_within` is the idiomatic and safe
@@ -7575,8 +7554,8 @@ fn defragment_page(page: &PageContent, usable_space: usize, max_frag_bytes: isiz
             let pointer_location = cell_pointer_area_offset + (cell.pointer_index * 2);
             turso_assert!(
                 new_offset < PageSize::MAX as usize,
-                "new_offset={new_offset} PageSize::MAX={}",
-                PageSize::MAX
+                "new_offset exceeds PageSize::MAX",
+                { "new_offset": new_offset, "page_size_max": PageSize::MAX }
             );
             page.write_u16_no_offset(pointer_location, new_offset as u16);
         }
@@ -7970,7 +7949,7 @@ fn fill_cell_payload(
             } => {
                 match state {
                     CopyDataState::Copy => {
-                        turso_assert!(*src_data_offset < record_buf.len(), "trying to read past end of record buffer: record_offset={} < record_buf.len()={}", src_data_offset, record_buf.len());
+                        turso_assert!(*src_data_offset < record_buf.len(), "trying to read past end of record buffer", { "src_data_offset": src_data_offset, "record_buf_len": record_buf.len() });
                         let record_offset_slice = &record_buf[*src_data_offset..];
                         let amount_to_copy =
                             (*space_left_on_cur_page).min(record_offset_slice.len());
@@ -7981,7 +7960,7 @@ fn fill_cell_payload(
                                 cur_page.is_loaded(),
                                 "current overflow page is not loaded"
                             );
-                            turso_assert!(*dst_data_offset == overflow_page_pointer_size, "data must be copied to offset {overflow_page_pointer_size} on overflow pages, instead tried to copy to offset {dst_data_offset}");
+                            turso_assert!(*dst_data_offset == overflow_page_pointer_size, "data must be copied to overflow page pointer offset on overflow pages", { "dst_data_offset": dst_data_offset, "overflow_page_pointer_size": overflow_page_pointer_size });
                             let contents = cur_page.get_contents();
                             let buf = &mut contents.as_ptr()
                                 [*dst_data_offset..*dst_data_offset + amount_to_copy];
