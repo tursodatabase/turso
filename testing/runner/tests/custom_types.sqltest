@@ -144,3 +144,42 @@ test multiple-custom-types {
 expect {
     42|hello
 }
+
+@requires strict "uses STRICT tables"
+test type-default-literal {
+    CREATE TYPE test_uint BASE text ENCODE test_uint_encode DECODE test_uint_decode DEFAULT 0;
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint) STRICT;
+    INSERT INTO t1(id) VALUES (1);
+    INSERT INTO t1(id) VALUES (2);
+    INSERT INTO t1 VALUES (3, 99);
+    SELECT id, val FROM t1;
+}
+expect {
+    1|0
+    2|0
+    3|99
+}
+
+@requires strict "uses STRICT tables"
+test type-default-function {
+    CREATE TYPE test_reverse BASE text ENCODE test_reverse_encode DECODE test_reverse_decode DEFAULT test_reverse_encode('auto');
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_reverse) STRICT;
+    INSERT INTO t1(id) VALUES (1);
+    INSERT INTO t1 VALUES (2, 'hello');
+    SELECT id, val FROM t1;
+}
+expect {
+    1|otua
+    2|hello
+}
+
+@requires strict "uses STRICT tables"
+test type-default-column-override {
+    CREATE TYPE test_uint BASE text ENCODE test_uint_encode DECODE test_uint_decode DEFAULT 0;
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint DEFAULT 42) STRICT;
+    INSERT INTO t1(id) VALUES (1);
+    SELECT id, val FROM t1;
+}
+expect {
+    1|42
+}

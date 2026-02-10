@@ -169,6 +169,7 @@ pub struct TypeDef {
     pub encode: Option<String>,
     pub decode: Option<String>,
     pub operators: Vec<TypeOperatorDef>,
+    pub default: Option<Box<turso_parser::ast::Expr>>,
 }
 
 /// Accumulators for schema loading - kept separate to avoid moving through state variants
@@ -1257,6 +1258,7 @@ impl Schema {
                             func_name: op.func_name.clone(),
                         })
                         .collect(),
+                    default: body.default.clone(),
                 };
                 self.type_registry
                     .insert(type_name.to_lowercase(), Arc::new(type_def));
