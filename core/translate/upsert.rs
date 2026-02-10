@@ -898,7 +898,8 @@ pub fn emit_upsert(
         });
         program.preassign_label_to_next_insn(ok);
 
-        // re-seek to conflicting row before delete/insert
+        // important: the cursor was repositioned in the previous conflict check via NotExists,
+        // so if we didn't conflict+halt above, we need to re-seek to the row under update.
         program.emit_insn(Insn::SeekRowid {
             cursor_id: ctx.cursor_id,
             src_reg: ctx.conflict_rowid_reg,
