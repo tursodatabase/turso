@@ -242,6 +242,73 @@ impl std::ops::Neg for Numeric {
     }
 }
 
+impl PartialEq for Numeric {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other).is_eq()
+    }
+}
+
+impl Eq for Numeric {}
+
+impl PartialOrd for Numeric {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Numeric {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        match (self, other) {
+            (Numeric::Integer(a), Numeric::Integer(b)) => a.cmp(b),
+            (Numeric::Float(a), Numeric::Float(b)) => {
+                let fa: f64 = (*a).into();
+                let fb: f64 = (*b).into();
+                // NonNan guarantees no NaN, so partial_cmp always returns Some.
+                // SQLite's float-vs-float uses raw IEEE 754 < and > operators,
+                // which both return false for NaN, resulting in "equal".
+                fa.partial_cmp(&fb).unwrap_or(std::cmp::Ordering::Equal)
+            }
+            (Numeric::Integer(int), Numeric::Float(float)) => {
+                sqlite_int_float_cmp(*int, f64::from(*float))
+            }
+            (Numeric::Float(float), Numeric::Integer(int)) => {
+                sqlite_int_float_cmp(*int, f64::from(*float)).reverse()
+            }
+        }
+    }
+}
+
+/// Compare an integer and a float following SQLite semantics.
+///
+/// SQLite treats NaN as NULL, so int > NaN. In practice, NonNan prevents NaN
+/// from appearing in Numeric::Float, but we check defensively.
+///
+/// See sqlite3IntFloatCompare in src/vdbeaux.c.
+fn sqlite_int_float_cmp(int_val: i64, float_val: f64) -> std::cmp::Ordering {
+    if float_val.is_nan() {
+        // NaN is treated as NULL; all integers are greater than NULL
+        return std::cmp::Ordering::Greater;
+    }
+
+    if float_val < -9_223_372_036_854_775_808.0 {
+        return std::cmp::Ordering::Greater;
+    }
+    if float_val >= 9_223_372_036_854_775_808.0 {
+        return std::cmp::Ordering::Less;
+    }
+
+    let float_as_int = float_val as i64;
+    match int_val.cmp(&float_as_int) {
+        std::cmp::Ordering::Equal => {
+            let int_as_float = int_val as f64;
+            int_as_float
+                .partial_cmp(&float_val)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        }
+        other => other,
+    }
+}
+
 #[derive(Debug)]
 pub enum NullableInteger {
     Null,

@@ -1719,19 +1719,12 @@ impl Display for ValueRef<'_> {
 impl<'a> PartialEq<ValueRef<'a>> for ValueRef<'a> {
     fn eq(&self, other: &ValueRef<'a>) -> bool {
         match (self, other) {
-            (Self::Numeric(Numeric::Integer(a)), Self::Numeric(Numeric::Integer(b))) => a == b,
-            (Self::Numeric(Numeric::Integer(int)), Self::Numeric(Numeric::Float(float)))
-            | (Self::Numeric(Numeric::Float(float)), Self::Numeric(Numeric::Integer(int))) => {
-                sqlite_int_float_compare(*int, f64::from(*float)).is_eq()
-            }
-            (Self::Numeric(Numeric::Float(a)), Self::Numeric(Numeric::Float(b))) => a == b,
-            (Self::Numeric(_), Self::Text(_) | Self::Blob(_)) => false,
-            (Self::Text(_) | Self::Blob(_), Self::Numeric(_)) => false,
+            (Self::Null, Self::Null) => true,
+            (Self::Numeric(a), Self::Numeric(b)) => a == b,
             (Self::Text(text_left), Self::Text(text_right)) => {
                 text_left.value.as_bytes() == text_right.value.as_bytes()
             }
             (Self::Blob(blob_left), Self::Blob(blob_right)) => blob_left.eq(blob_right),
-            (Self::Null, Self::Null) => true,
             _ => false,
         }
     }
@@ -1746,71 +1739,33 @@ impl<'a> PartialEq<Value> for ValueRef<'a> {
 
 impl<'a> Eq for ValueRef<'a> {}
 
-#[expect(clippy::non_canonical_partial_ord_impl)]
 impl<'a> PartialOrd<ValueRef<'a>> for ValueRef<'a> {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        match (self, other) {
-            (Self::Numeric(Numeric::Integer(a)), Self::Numeric(Numeric::Integer(b))) => {
-                a.partial_cmp(b)
-            }
-            (Self::Numeric(Numeric::Integer(int)), Self::Numeric(Numeric::Float(float))) => {
-                Some(sqlite_int_float_compare(*int, f64::from(*float)))
-            }
-            (Self::Numeric(Numeric::Float(float)), Self::Numeric(Numeric::Integer(int))) => {
-                Some(sqlite_int_float_compare(*int, f64::from(*float)).reverse())
-            }
-            (Self::Numeric(Numeric::Float(a)), Self::Numeric(Numeric::Float(b))) => {
-                let fa: f64 = (*a).into();
-                let fb: f64 = (*b).into();
-                fa.partial_cmp(&fb)
-            }
-            // Numeric vs Text/Blob
-            (Self::Numeric(_), Self::Text(_) | Self::Blob(_)) => Some(std::cmp::Ordering::Less),
-            (Self::Text(_) | Self::Blob(_), Self::Numeric(_)) => Some(std::cmp::Ordering::Greater),
-
-            (Self::Text(text_left), Self::Text(text_right)) => text_left
-                .value
-                .as_bytes()
-                .partial_cmp(text_right.value.as_bytes()),
-            // Text vs Blob
-            (Self::Text(_), Self::Blob(_)) => Some(std::cmp::Ordering::Less),
-            (Self::Blob(_), Self::Text(_)) => Some(std::cmp::Ordering::Greater),
-
-            (Self::Blob(blob_left), Self::Blob(blob_right)) => blob_left.partial_cmp(blob_right),
-            (Self::Null, Self::Null) => Some(std::cmp::Ordering::Equal),
-            (Self::Null, _) => Some(std::cmp::Ordering::Less),
-            (_, Self::Null) => Some(std::cmp::Ordering::Greater),
-        }
+        Some(self.cmp(other))
     }
 }
 
 impl<'a> Ord for ValueRef<'a> {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.partial_cmp(other).unwrap()
-    }
-}
+        match (self, other) {
+            (Self::Null, Self::Null) => std::cmp::Ordering::Equal,
+            (Self::Null, _) => std::cmp::Ordering::Less,
+            (_, Self::Null) => std::cmp::Ordering::Greater,
 
-fn sqlite_int_float_compare(int_val: i64, float_val: f64) -> std::cmp::Ordering {
-    if float_val.is_nan() {
-        return std::cmp::Ordering::Greater;
-    }
+            (Self::Numeric(a), Self::Numeric(b)) => a.cmp(b),
 
-    if float_val < -9223372036854775808.0 {
-        return std::cmp::Ordering::Greater;
-    }
-    if float_val >= 9223372036854775808.0 {
-        return std::cmp::Ordering::Less;
-    }
+            // Numeric < Text < Blob
+            (Self::Numeric(_), _) => std::cmp::Ordering::Less,
+            (_, Self::Numeric(_)) => std::cmp::Ordering::Greater,
 
-    let float_as_int = float_val as i64;
-    match int_val.cmp(&float_as_int) {
-        std::cmp::Ordering::Equal => {
-            let int_as_float = int_val as f64;
-            int_as_float
-                .partial_cmp(&float_val)
-                .unwrap_or(std::cmp::Ordering::Equal)
+            (Self::Text(text_left), Self::Text(text_right)) => {
+                text_left.value.as_bytes().cmp(text_right.value.as_bytes())
+            }
+            (Self::Text(_), Self::Blob(_)) => std::cmp::Ordering::Less,
+            (Self::Blob(_), Self::Text(_)) => std::cmp::Ordering::Greater,
+
+            (Self::Blob(blob_left), Self::Blob(blob_right)) => blob_left.cmp(blob_right),
         }
-        other => other,
     }
 }
 
@@ -1953,7 +1908,7 @@ where
     let r = r.as_value_ref();
     match (l, r) {
         (ValueRef::Text(left), ValueRef::Text(right)) => collation.compare_strings(&left, &right),
-        _ => l.partial_cmp(&r).unwrap(),
+        _ => l.cmp(&r),
     }
 }
 
@@ -2345,17 +2300,7 @@ where
                 .collation
                 .compare_strings(lhs_text, rhs_text),
 
-            (
-                ValueRef::Numeric(Numeric::Integer(lhs_int)),
-                ValueRef::Numeric(Numeric::Float(rhs_float)),
-            ) => sqlite_int_float_compare(*lhs_int, f64::from(*rhs_float)),
-
-            (
-                ValueRef::Numeric(Numeric::Float(lhs_float)),
-                ValueRef::Numeric(Numeric::Integer(rhs_int)),
-            ) => sqlite_int_float_compare(*rhs_int, f64::from(*lhs_float)).reverse(),
-
-            _ => lhs_value.partial_cmp(rhs_value).unwrap(),
+            _ => lhs_value.cmp(rhs_value),
         };
 
         let final_comparison = match index_info.key_info[field_idx].sort_order {
