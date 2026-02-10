@@ -113,6 +113,17 @@ expect {
     3
 }
 
+# Regression: OFFSET must be applied after DISTINCT deduplication.
+# This query projects all input rows to the same value (0), so DISTINCT yields
+# exactly one row. OFFSET 2 should therefore skip that one row and return empty.
+test distinct-offset-applies-after-dedup {
+    CREATE TABLE distinct_offset_order (a INTEGER PRIMARY KEY, b TEXT);
+    INSERT INTO distinct_offset_order VALUES (1, 'x'), (2, 'y'), (3, 'z'), (4, 'w');
+    SELECT DISTINCT 0 FROM distinct_offset_order ORDER BY a LIMIT 100 OFFSET 2;
+}
+expect {
+}
+
 test distinct-where {
     CREATE TABLE distinct_where (x);
     INSERT INTO distinct_where VALUES (NULL), (1), (2), (2), (3);
