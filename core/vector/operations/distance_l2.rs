@@ -202,12 +202,9 @@ mod tests {
         v1: ArbitraryVector<100>,
         v2: ArbitraryVector<100>,
     ) -> bool {
-        // No-one is sure why yet, but on windows this test occasionally fails with 1e-6 error tolerance.
-        // FIXME: this is just here to stop CI from yelling
-        #[cfg(target_os = "windows")]
+        // Dense uses simsimd, sparse uses rust impl. They can differ by up to 1e-4
+        // due to numerical precision differences (same as prop_vector_distance_l2_rust_vs_simsimd_f32).
         let tolerance = 1e-4;
-        #[cfg(not(target_os = "windows"))]
-        let tolerance = 1e-6;
         let v1 = vector_convert(v1.into(), VectorType::Float32Dense).unwrap();
         let v2 = vector_convert(v2.into(), VectorType::Float32Dense).unwrap();
         let d1 = vector_distance_l2(&v1, &v2).unwrap();
