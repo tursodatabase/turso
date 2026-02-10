@@ -1,6 +1,6 @@
 use crate::{
-    LimboError, Result,
     vector::vector_types::{Vector, VectorSparse, VectorType},
+    LimboError, Result,
 };
 use simsimd::SpatialSimilarity;
 
