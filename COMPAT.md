@@ -79,8 +79,8 @@ Turso aims to be fully compatible with SQLite, with opt-in features not supporte
 | ALTER TABLE               | ✅ Yes     |                                                                                   |
 | ANALYZE                   | ✅ Yes     |                                                                                   |
 | ATTACH DATABASE           | 🚧 Partial | Only for reads. All modifications will currently fail to find the table           |
-| BEGIN TRANSACTION         | 🚧 Partial | Transaction names are not supported.                                              |
-| COMMIT TRANSACTION        | 🚧 Partial | Transaction names are not supported.                                              |
+| BEGIN TRANSACTION         | ✅ Yes     |                                                                                   |
+| COMMIT TRANSACTION        | ✅ Yes     |                                                                                   |
 | CHECK                     | ✅ Yes     |                                                                                   |
 | CREATE INDEX              | ✅ Yes     |                                                                                   |
 | CREATE TABLE              | ✅ Yes     |                                                                                   |
@@ -94,7 +94,7 @@ Turso aims to be fully compatible with SQLite, with opt-in features not supporte
 | DROP TABLE                | ✅ Yes     |                                                                                   |
 | DROP TRIGGER              | ✅ Yes     |                                                                                   |
 | DROP VIEW                 | ✅ Yes     |                                                                                   |
-| END TRANSACTION           | 🚧 Partial | Alias for `COMMIT TRANSACTION`                                                    |
+| END TRANSACTION           | ✅ Yes     |                                                                                   |
 | EXPLAIN                   | ✅ Yes     |                                                                                   |
 | INDEXED BY                | ❌ No      |                                                                                   |
 | INSERT                    | ✅ Yes     |                                                                                   |
