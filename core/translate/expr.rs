@@ -4194,12 +4194,14 @@ pub fn bind_and_rewrite_expr<'a>(
                             .as_ref()
                             .is_some_and(|name| name.eq_ignore_ascii_case(&normalized_id))
                     });
-                    if let Some(row_id_expr) = parse_row_id(&normalized_id, tbl_id, || false)? {
-                        *expr = row_id_expr;
-
-                        return Ok(WalkControl::Continue);
-                    }
+                    // User-defined columns take precedence over rowid aliases
+                    // (oid, rowid, _rowid_). Only fall back to parse_row_id()
+                    // when no matching user column exists.
                     let Some(col_idx) = col_idx else {
+                        if let Some(row_id_expr) = parse_row_id(&normalized_id, tbl_id, || false)? {
+                            *expr = row_id_expr;
+                            return Ok(WalkControl::Continue);
+                        }
                         crate::bail_parse_error!("no such column: {}", normalized_id);
                     };
                     let col = tbl.columns().get(col_idx).unwrap();
