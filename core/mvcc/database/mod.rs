@@ -143,6 +143,21 @@ impl SortableIndexKey {
 
         Ok(std::cmp::Ordering::Equal)
     }
+
+    /// Check if the index key contains any NULL values (excluding the rowid column).
+    /// In SQLite, NULLs don't violate UNIQUE constraints, so we skip conflict checks for NULL keys.
+    pub fn contains_null(&self, num_indexed_cols: usize) -> Result<bool> {
+        let mut iter = self.key.iter()?;
+        // Only check the indexed columns, not the rowid at the end
+        for _ in 0..num_indexed_cols {
+            if let Some(value) = iter.next() {
+                if matches!(value?, crate::types::ValueRef::Null) {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
 }
 
 impl PartialEq for SortableIndexKey {
@@ -728,6 +743,11 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
         };
         if !record.metadata.is_unique {
             // Skip indexes which are not unique or not primary key
+            return Ok(());
+        }
+        // In SQLite, NULLs don't violate UNIQUE constraints - skip conflict check for keys containing NULL
+        let num_indexed_cols = record.metadata.num_cols.saturating_sub(1); // exclude rowid column
+        if record.contains_null(num_indexed_cols)? {
             return Ok(());
         }
         // Remove the rowid column from the index metadata so that we only compare records without rowid
