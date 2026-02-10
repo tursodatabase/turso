@@ -2,6 +2,7 @@ use fastbloom::BloomFilter as BloomFilterInner;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 
+use crate::numeric::Numeric;
 use crate::types::{Value, ValueRef};
 
 /// Default number of expected items for bloom filter sizing.
@@ -143,7 +144,7 @@ fn hash_value<H: Hasher>(hasher: &mut H, value: &ValueRef) {
     match value {
         // do nothing for NULLs as we will always return false for set membership
         ValueRef::Null => {}
-        ValueRef::Integer(i) => {
+        ValueRef::Numeric(Numeric::Integer(i)) => {
             // Hash integers in the same bucket as numerically equivalent REALs so
             // bloom-filter membership can never return a false-negative for e.g. 10 vs 10.0.
             let f = *i as f64;
@@ -155,9 +156,10 @@ fn hash_value<H: Hasher>(hasher: &mut H, value: &ValueRef) {
                 i.hash(hasher);
             }
         }
-        ValueRef::Float(f) => {
-            hash_numeric(hasher, *f);
+        ValueRef::Numeric(Numeric::Float(f)) => {
+            hash_numeric(hasher, f64::from(*f));
         }
+        ValueRef::Numeric(Numeric::Null) => {}
         ValueRef::Text(s) => {
             3u8.hash(hasher);
             s.as_str().hash(hasher);
@@ -210,7 +212,7 @@ mod bloomtests {
     fn test_bloom_filter_values() {
         let mut bf = BloomFilter::new();
 
-        let int_val = Value::Integer(42);
+        let int_val = Value::from_i64(42);
         let text_val = Value::Text(Text::new("hello".to_string()));
         let null_val = Value::Null;
 
@@ -253,23 +255,23 @@ mod bloomtests {
         let mut bf = BloomFilter::new();
 
         // Zero variants should all be found regardless of sign or int/float representation
-        let zero_float = Value::Float(0.0);
-        let zero_neg_float = Value::Float(-0.0);
-        let zero_int = Value::Integer(0);
+        let zero_float = Value::from_f64(0.0);
+        let zero_neg_float = Value::from_f64(-0.0);
+        let zero_int = Value::from_i64(0);
         bf.insert_value(&zero_float);
         assert!(bf.contains_value(&zero_float));
         assert!(bf.contains_value(&zero_neg_float));
         assert!(bf.contains_value(&zero_int));
 
         // Integer/float representations of the same numeric value should match
-        let ten_int = Value::Integer(10);
-        let ten_float = Value::Float(10.0);
+        let ten_int = Value::from_i64(10);
+        let ten_float = Value::from_f64(10.0);
         bf.insert_value(&ten_int);
         assert!(bf.contains_value(&ten_int));
         assert!(bf.contains_value(&ten_float));
 
-        let neg_ten_float = Value::Float(-10.0);
-        let neg_ten_int = Value::Integer(-10);
+        let neg_ten_float = Value::from_f64(-10.0);
+        let neg_ten_int = Value::from_i64(-10);
         bf.insert_value(&neg_ten_float);
         assert!(bf.contains_value(&neg_ten_float));
         assert!(bf.contains_value(&neg_ten_int));

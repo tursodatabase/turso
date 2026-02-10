@@ -735,7 +735,7 @@ pub fn insn_to_row(
                 "Program",
                 // First register that contains a param
                 params.first().map(|v| match v {
-                    crate::types::Value::Integer(i) if *i < 0 => -i - 1,
+                    crate::types::Value::Numeric(crate::numeric::Numeric::Integer(i)) if *i < 0 => -i - 1,
                     _ => 0,
                 }).unwrap_or(0),
                 // Number of registers that contain params
@@ -750,7 +750,7 @@ pub fn insn_to_row(
                 0,
                 *dest as i64,
                 0,
-                Value::Float(*value),
+                Value::from_f64(*value),
                 0,
                 format!("r[{dest}]={value}"),
             ),
@@ -1053,7 +1053,7 @@ pub fn insn_to_row(
                 *cursor_id as i64,
                 *record_reg as i64,
                 0,
-                Value::Integer(0),
+                Value::from_i64(0),
                 0,
                 format!("key=r[{record_reg}]"),
             ),
@@ -1806,7 +1806,7 @@ pub fn insn_to_row(
                 0,
                 *out_reg as i64,
                 0,
-                Value::Integer(*value),
+                Value::from_i64(*value),
                 0,
                 format!("r[{}]={}", *out_reg, *value),
             ),

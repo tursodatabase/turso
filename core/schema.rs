@@ -733,7 +733,9 @@ impl Schema {
                         return Err(LimboError::ConversionError("Expected text value".into()));
                     };
                     let root_page_value = row.get_value(3)?;
-                    let ValueRef::Integer(root_page) = root_page_value else {
+                    let ValueRef::Numeric(crate::numeric::Numeric::Integer(root_page)) =
+                        root_page_value
+                    else {
                         return Err(LimboError::ConversionError("Expected integer value".into()));
                     };
                     let sql_value = row.get_value(4)?;

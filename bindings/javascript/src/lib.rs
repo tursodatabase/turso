@@ -607,9 +607,9 @@ impl Statement {
             ValueType::Number => {
                 let n: f64 = unsafe { value.cast()? };
                 if n.fract() == 0.0 && n >= i64::MIN as f64 && n <= i64::MAX as f64 {
-                    turso_core::Value::Integer(n as i64)
+                    turso_core::Value::from_i64(n as i64)
                 } else {
-                    turso_core::Value::Float(n)
+                    turso_core::Value::from_f64(n)
                 }
             }
             ValueType::BigInt => {
@@ -617,7 +617,7 @@ impl Statement {
                 let bigint_value = bigint_str
                     .parse::<i64>()
                     .map_err(|e| to_error(Status::NumberExpected, "failed to parse BigInt", e))?;
-                turso_core::Value::Integer(bigint_value)
+                turso_core::Value::from_i64(bigint_value)
             }
             ValueType::String => {
                 let s = value.coerce_to_string()?.into_utf8()?;
@@ -625,7 +625,7 @@ impl Statement {
             }
             ValueType::Boolean => {
                 let b: bool = unsafe { value.cast()? };
-                turso_core::Value::Integer(if b { 1 } else { 0 })
+                turso_core::Value::from_i64(if b { 1 } else { 0 })
             }
             ValueType::Object => {
                 let obj = value.coerce_to_object()?;
@@ -808,7 +808,7 @@ fn to_js_value<'a>(
 ) -> napi::Result<Unknown<'a>> {
     match value {
         turso_core::Value::Null => ToNapiValue::into_unknown(Null, env),
-        turso_core::Value::Integer(i) => {
+        turso_core::Value::Numeric(turso_core::Numeric::Integer(i)) => {
             if safe_integers {
                 let bigint = BigInt::from(*i);
                 ToNapiValue::into_unknown(bigint, env)
@@ -816,7 +816,12 @@ fn to_js_value<'a>(
                 ToNapiValue::into_unknown(*i as f64, env)
             }
         }
-        turso_core::Value::Float(f) => ToNapiValue::into_unknown(*f, env),
+        turso_core::Value::Numeric(turso_core::Numeric::Float(f)) => {
+            ToNapiValue::into_unknown(f64::from(*f), env)
+        }
+        turso_core::Value::Numeric(turso_core::Numeric::Null) => {
+            ToNapiValue::into_unknown(Null, env)
+        }
         turso_core::Value::Text(s) => ToNapiValue::into_unknown(s.as_str(), env),
         turso_core::Value::Blob(b) => {
             #[cfg(not(feature = "browser"))]

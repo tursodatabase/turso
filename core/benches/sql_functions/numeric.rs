@@ -205,13 +205,13 @@ fn format_float_precision_edge(bencher: Bencher) {
 
 #[divan::bench]
 fn numeric_from_integer_value(bencher: Bencher) {
-    let value = Value::Integer(12345);
+    let value = Value::from_i64(12345);
     bencher.bench_local(|| black_box(Numeric::from(black_box(&value))));
 }
 
 #[divan::bench]
 fn numeric_from_float_value(bencher: Bencher) {
-    let value = Value::Float(123.456);
+    let value = Value::from_f64(123.456);
     bencher.bench_local(|| black_box(Numeric::from(black_box(&value))));
 }
 
@@ -316,13 +316,13 @@ fn numeric_add_overflow(bencher: Bencher) {
 
 #[divan::bench]
 fn numeric_strict_from_integer(bencher: Bencher) {
-    let value = Value::Integer(12345);
+    let value = Value::from_i64(12345);
     bencher.bench_local(|| black_box(Numeric::from_value_strict(black_box(&value))));
 }
 
 #[divan::bench]
 fn numeric_strict_from_float(bencher: Bencher) {
-    let value = Value::Float(123.456);
+    let value = Value::from_f64(123.456);
     bencher.bench_local(|| black_box(Numeric::from_value_strict(black_box(&value))));
 }
 

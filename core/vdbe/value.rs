@@ -177,22 +177,22 @@ impl Value {
                     || s.chars().count(),
                     |null_pos| s[..null_pos].chars().count(),
                 );
-                Value::Integer(len_before_null as i64)
+                Value::from_i64(len_before_null as i64)
             }
-            Value::Integer(_) | Value::Float(_) => {
+            Value::Numeric(_) => {
                 // For numbers, SQLite returns the length of the string representation
-                Value::Integer(self.to_string().chars().count() as i64)
+                Value::from_i64(self.to_string().chars().count() as i64)
             }
-            Value::Blob(blob) => Value::Integer(blob.len() as i64),
+            Value::Blob(blob) => Value::from_i64(blob.len() as i64),
             _ => self.to_owned(),
         }
     }
 
     pub fn exec_octet_length(&self) -> Self {
         match self {
-            Value::Text(s) => Value::Integer(s.as_str().len() as i64),
-            Value::Blob(blob) => Value::Integer(blob.len() as i64),
-            Value::Integer(_) | Value::Float(_) => Value::Integer(self.to_string().len() as i64),
+            Value::Text(s) => Value::from_i64(s.as_str().len() as i64),
+            Value::Blob(blob) => Value::from_i64(blob.len() as i64),
+            Value::Numeric(_) => Value::from_i64(self.to_string().len() as i64),
             _ => self.to_owned(),
         }
     }
@@ -205,7 +205,7 @@ impl Value {
     pub fn exec_sign(&self) -> Option<Value> {
         let v = Numeric::from_value_strict(self).try_into_f64()?;
 
-        Some(Value::Integer(if v > 0.0 {
+        Some(Value::from_i64(if v > 0.0 {
             1
         } else if v < 0.0 {
             -1
@@ -279,10 +279,11 @@ impl Value {
     pub fn exec_abs(&self) -> Result<Self> {
         Ok(match self {
             Value::Null => Value::Null,
-            Value::Integer(v) => {
-                Value::Integer(v.checked_abs().ok_or(LimboError::IntegerOverflow)?)
+            Value::Numeric(Numeric::Integer(v)) => {
+                Value::from_i64(v.checked_abs().ok_or(LimboError::IntegerOverflow)?)
             }
-            Value::Float(non_nan) => Value::Float(non_nan.abs()),
+            Value::Numeric(Numeric::Float(non_nan)) => Value::from_f64(f64::from(*non_nan).abs()),
+            Value::Numeric(Numeric::Null) => Value::Null,
             _ => {
                 let s = match self {
                     Value::Text(text) => text.to_string(),
@@ -291,8 +292,8 @@ impl Value {
                 };
 
                 crate::numeric::str_to_f64(s)
-                    .map(|v| Value::Float(f64::from(v).abs()))
-                    .unwrap_or(Value::Float(0.0))
+                    .map(|v| Value::from_f64(f64::from(v).abs()))
+                    .unwrap_or_else(|| Value::from_f64(0.0))
             }
         })
     }
@@ -301,7 +302,7 @@ impl Value {
     where
         F: Fn() -> i64,
     {
-        Value::Integer(generate_random_number())
+        Value::from_i64(generate_random_number())
     }
 
     /// SQLite default max blob/string size (1GB)
@@ -312,8 +313,8 @@ impl Value {
         F: Fn(&mut [u8]),
     {
         let length = match self {
-            Value::Integer(i) => *i,
-            Value::Float(f) => *f as i64,
+            Value::Numeric(Numeric::Integer(i)) => *i,
+            Value::Numeric(Numeric::Float(f)) => f64::from(*f) as i64,
             Value::Text(t) => t.as_str().parse().unwrap_or(1),
             _ => 1,
         }
@@ -332,7 +333,7 @@ impl Value {
         use std::fmt::Write;
         match self {
             Value::Null => Value::build_text("NULL"),
-            Value::Integer(_) | Value::Float(_) => Value::build_text(self.to_string()),
+            Value::Numeric(_) => Value::build_text(self.to_string()),
             Value::Blob(b) => {
                 // SQLite returns X'hexdigits' for blobs
                 let mut quoted = String::with_capacity(3 + b.len() * 2);
@@ -410,7 +411,7 @@ impl Value {
         ) -> (usize, usize) {
             let len = len as i64;
             let mut p2 = match length_value {
-                Some(Value::Integer(length)) => *length,
+                Some(Value::Numeric(Numeric::Integer(length))) => *length,
                 // SQLite uses SQLITE_LIMIT_LENGTH (default 1 billion) when no explicit length.
                 // Using len causes wrong results when p1 is large negative number.
                 _ => Value::MAX_BLOB_LENGTH,
@@ -460,11 +461,11 @@ impl Value {
         }
 
         match (value, start_value) {
-            (Value::Blob(b), Value::Integer(start)) => {
+            (Value::Blob(b), Value::Numeric(Numeric::Integer(start))) => {
                 let (start, end) = calculate_postions(start, b.len(), length_value.as_ref());
                 Value::from_blob(b[start..end].to_vec())
             }
-            (value, Value::Integer(start)) => {
+            (value, Value::Numeric(Numeric::Integer(start))) => {
                 if let Some(text) = value.cast_text() {
                     let (mut start, mut end) =
                         calculate_postions(start, text.len(), length_value.as_ref());
@@ -499,13 +500,13 @@ impl Value {
         if let (Value::Blob(reg), Value::Blob(pattern)) = (self, pattern) {
             // SQLite returns 1 for empty pattern (found at position 1)
             if pattern.is_empty() {
-                return Value::Integer(1);
+                return Value::from_i64(1);
             }
             let result = reg
                 .windows(pattern.len())
                 .position(|window| window == *pattern)
                 .map_or(0, |i| i + 1);
-            return Value::Integer(result as i64);
+            return Value::from_i64(result as i64);
         }
 
         let reg_str;
@@ -530,17 +531,18 @@ impl Value {
             Some(byte_pos) => {
                 // Convert byte position to character position (1-indexed)
                 let char_pos = reg[..byte_pos].chars().count() + 1;
-                Value::Integer(char_pos as i64)
+                Value::from_i64(char_pos as i64)
             }
-            None => Value::Integer(0),
+            None => Value::from_i64(0),
         }
     }
 
     pub fn exec_typeof(&self) -> Value {
         match self {
             Value::Null => Value::build_text("null"),
-            Value::Integer(_) => Value::build_text("integer"),
-            Value::Float(_) => Value::build_text("real"),
+            Value::Numeric(Numeric::Integer(_)) => Value::build_text("integer"),
+            Value::Numeric(Numeric::Float(_)) => Value::build_text("real"),
+            Value::Numeric(Numeric::Null) => Value::build_text("null"),
             Value::Text(_) => Value::build_text("text"),
             Value::Blob(_) => Value::build_text("blob"),
         }
@@ -548,7 +550,7 @@ impl Value {
 
     pub fn exec_hex(&self) -> Value {
         match self {
-            Value::Text(_) | Value::Integer(_) | Value::Float(_) => {
+            Value::Text(_) | Value::Numeric(_) => {
                 let text = self.to_string();
                 Value::build_text(hex::encode_upper(text))
             }
@@ -589,10 +591,10 @@ impl Value {
 
     pub fn exec_unicode(&self) -> Value {
         match self {
-            Value::Text(_) | Value::Integer(_) | Value::Float(_) | Value::Blob(_) => {
+            Value::Text(_) | Value::Numeric(_) | Value::Blob(_) => {
                 let text = self.to_string();
                 if let Some(first_char) = text.chars().next() {
-                    Value::Integer(first_char as u32 as i64)
+                    Value::from_i64(first_char as u32 as i64)
                 } else {
                     Value::Null
                 }
@@ -613,21 +615,21 @@ impl Value {
         };
 
         if !(-4503599627370496.0..=4503599627370496.0).contains(&f) {
-            return Value::Float(f);
+            return Value::from_f64(f);
         }
 
         let precision = if precision < 1.0 { 0.0 } else { precision };
         let precision = precision.clamp(0.0, 30.0) as usize;
 
         if precision == 0 {
-            return Value::Float(((f + if f < 0.0 { -0.5 } else { 0.5 }) as i64) as f64);
+            return Value::from_f64(((f + if f < 0.0 { -0.5 } else { 0.5 }) as i64) as f64);
         }
 
         let f: f64 = crate::numeric::str_to_f64(format!("{f:.precision$}"))
             .expect("formatted float should always parse successfully")
             .into();
 
-        Value::Float(f)
+        Value::from_f64(f)
     }
 
     fn _exec_trim(&self, pattern: Option<&Value>, trim_type: TrimType) -> Value {
@@ -677,8 +679,8 @@ impl Value {
 
     pub fn exec_zeroblob(&self) -> Result<Value> {
         let length: i64 = match self {
-            Value::Integer(i) => *i,
-            Value::Float(f) => *f as i64,
+            Value::Numeric(Numeric::Integer(i)) => *i,
+            Value::Numeric(Numeric::Float(f)) => f64::from(*f) as i64,
             Value::Text(s) => s.as_str().parse().unwrap_or(0),
             _ => 0,
         }
@@ -722,47 +724,47 @@ impl Value {
             Affinity::Real => match self {
                 Value::Blob(b) => {
                     let text = String::from_utf8_lossy(b);
-                    Value::Float(
+                    Value::from_f64(
                         crate::numeric::str_to_f64(&text)
                             .map(f64::from)
                             .unwrap_or(0.0),
                     )
                 }
                 Value::Text(t) => {
-                    Value::Float(crate::numeric::str_to_f64(t).map(f64::from).unwrap_or(0.0))
+                    Value::from_f64(crate::numeric::str_to_f64(t).map(f64::from).unwrap_or(0.0))
                 }
-                Value::Integer(i) => Value::Float(*i as f64),
-                Value::Float(f) => Value::Float(*f),
-                _ => Value::Float(0.0),
+                Value::Numeric(Numeric::Integer(i)) => Value::from_f64(*i as f64),
+                Value::Numeric(Numeric::Float(f)) => Value::Numeric(Numeric::Float(*f)),
+                _ => Value::from_f64(0.0),
             },
             Affinity::Integer => match self {
                 Value::Blob(b) => {
                     // Convert BLOB to TEXT first
                     let text = String::from_utf8_lossy(b);
-                    Value::Integer(crate::numeric::str_to_i64(&text).unwrap_or(0))
+                    Value::from_i64(crate::numeric::str_to_i64(&text).unwrap_or(0))
                 }
-                Value::Text(t) => Value::Integer(crate::numeric::str_to_i64(t).unwrap_or(0)),
-                Value::Integer(i) => Value::Integer(*i),
+                Value::Text(t) => Value::from_i64(crate::numeric::str_to_i64(t).unwrap_or(0)),
+                Value::Numeric(Numeric::Integer(i)) => Value::from_i64(*i),
                 // A cast of a REAL value into an INTEGER results in the integer between the REAL value and zero
                 // that is closest to the REAL value. If a REAL is greater than the greatest possible signed integer (+9223372036854775807)
                 // then the result is the greatest possible signed integer and if the REAL is less than the least possible signed integer (-9223372036854775808)
                 // then the result is the least possible signed integer.
-                Value::Float(f) => {
-                    let i = f.trunc() as i128;
+                Value::Numeric(Numeric::Float(f)) => {
+                    let i = f64::from(*f).trunc() as i128;
                     if i > i64::MAX as i128 {
-                        Value::Integer(i64::MAX)
+                        Value::from_i64(i64::MAX)
                     } else if i < i64::MIN as i128 {
-                        Value::Integer(i64::MIN)
+                        Value::from_i64(i64::MIN)
                     } else {
-                        Value::Integer(i as i64)
+                        Value::from_i64(i as i64)
                     }
                 }
-                _ => Value::Integer(0),
+                _ => Value::from_i64(0),
             },
             Affinity::Numeric => match self {
                 Value::Null => Value::Null,
-                Value::Integer(v) => Value::Integer(*v),
-                Value::Float(v) => Self::Float(*v),
+                Value::Numeric(Numeric::Integer(v)) => Value::from_i64(*v),
+                Value::Numeric(Numeric::Float(v)) => Value::Numeric(Numeric::Float(*v)),
                 _ => {
                     let s = match self {
                         Value::Text(text) => text.as_str().into(),
@@ -771,7 +773,7 @@ impl Value {
                     };
                     crate::util::checked_cast_text_to_numeric(&s, false)
                         .ok()
-                        .unwrap_or(Value::Integer(0))
+                        .unwrap_or_else(|| Value::from_i64(0))
                 }
             },
         }
@@ -817,7 +819,7 @@ impl Value {
         if let Numeric::Integer(i) = v {
             if matches! { function, MathFunc::Ceil | MathFunc::Ceiling | MathFunc::Floor | MathFunc::Trunc }
             {
-                return Value::Integer(i);
+                return Value::from_i64(i);
             }
         }
 
@@ -859,7 +861,7 @@ impl Value {
         if result.is_nan() {
             Value::Null
         } else {
-            Value::Float(result)
+            Value::from_f64(result)
         }
     }
 
@@ -883,7 +885,7 @@ impl Value {
         if result.is_nan() {
             Value::Null
         } else {
-            Value::Float(result)
+            Value::from_f64(result)
         }
     }
 
@@ -903,9 +905,9 @@ impl Value {
         }
 
         if base == 2.0 {
-            return Value::Float(libm::log2(f));
+            return Value::from_f64(libm::log2(f));
         } else if base == 10.0 {
-            return Value::Float(libm::log10(f));
+            return Value::from_f64(libm::log10(f));
         };
 
         let log_x = libm::log(f);
@@ -916,7 +918,7 @@ impl Value {
         }
 
         let result = log_x / log_base;
-        Value::Float(result)
+        Value::from_f64(result)
     }
 
     pub fn exec_add(&self, rhs: &Value) -> Value {
@@ -951,9 +953,9 @@ impl Value {
             NullableInteger::Null => Value::Null,
             NullableInteger::Integer(v) => {
                 if convert_to_float {
-                    Value::Float(v as f64)
+                    Value::from_f64(v as f64)
                 } else {
-                    Value::Integer(v)
+                    Value::from_i64(v)
                 }
             }
         }
@@ -974,7 +976,7 @@ impl Value {
     pub fn exec_boolean_not(&self) -> Value {
         match Numeric::from(self).try_into_bool() {
             None => Value::Null,
-            Some(v) => Value::Integer(!v as i64),
+            Some(v) => Value::from_i64(!v as i64),
         }
     }
 
@@ -999,9 +1001,9 @@ impl Value {
             Numeric::from(self).try_into_bool(),
             Numeric::from(rhs).try_into_bool(),
         ) {
-            (Some(false), _) | (_, Some(false)) => Value::Integer(0),
+            (Some(false), _) | (_, Some(false)) => Value::from_i64(0),
             (None, _) | (_, None) => Value::Null,
-            _ => Value::Integer(1),
+            _ => Value::from_i64(1),
         }
     }
 
@@ -1010,9 +1012,9 @@ impl Value {
             Numeric::from(self).try_into_bool(),
             Numeric::from(rhs).try_into_bool(),
         ) {
-            (Some(true), _) | (_, Some(true)) => Value::Integer(1),
+            (Some(true), _) | (_, Some(true)) => Value::from_i64(1),
             (None, _) | (_, None) => Value::Null,
-            _ => Value::Integer(0),
+            _ => Value::from_i64(0),
         }
     }
 
@@ -1142,8 +1144,9 @@ impl Value {
                 Value::Null => continue,
                 Value::Text(s) => result.push_str(s.as_str()),
                 Value::Blob(b) => result.push_str(&String::from_utf8_lossy(b)),
-                Value::Integer(i) => result.push_str(&i.to_string()),
-                Value::Float(f) => result.push_str(&format_float(*f)),
+                Value::Numeric(Numeric::Integer(i)) => result.push_str(&i.to_string()),
+                Value::Numeric(Numeric::Float(f)) => result.push_str(&format_float(f64::from(*f))),
+                Value::Numeric(Numeric::Null) => continue,
             }
         }
         Value::build_text(result)
@@ -1163,7 +1166,7 @@ impl Value {
         };
 
         let parts = registers.filter_map(|val| match val {
-            Value::Text(_) | Value::Integer(_) | Value::Float(_) => Some(format!("{val}")),
+            Value::Text(_) | Value::Numeric(_) => Some(format!("{val}")),
             _ => None,
         });
 
@@ -1174,7 +1177,7 @@ impl Value {
     pub fn exec_char<'a, T: Iterator<Item = &'a Self>>(values: T) -> Self {
         let result: String = values
             .filter_map(|x| match x {
-                Value::Integer(i) => {
+                Value::Numeric(Numeric::Integer(i)) => {
                     // Convert integer to Unicode codepoint.
                     // For invalid codepoints (negative, surrogates, or > U+10FFFF),
                     // output U+FFFD (replacement character) to match SQLite behavior.
@@ -1434,6 +1437,7 @@ fn compare_chars(p: char, t: char, no_case: bool) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use crate::numeric::Numeric;
     use crate::types::Value;
     use crate::vdbe::Register;
 
@@ -1442,30 +1446,30 @@ mod tests {
     #[test]
     fn test_exec_add() {
         let inputs = vec![
-            (Value::Integer(3), Value::Integer(1)),
-            (Value::Float(3.0), Value::Float(1.0)),
-            (Value::Float(3.0), Value::Integer(1)),
-            (Value::Integer(3), Value::Float(1.0)),
+            (Value::from_i64(3), Value::from_i64(1)),
+            (Value::from_f64(3.0), Value::from_f64(1.0)),
+            (Value::from_f64(3.0), Value::from_i64(1)),
+            (Value::from_i64(3), Value::from_f64(1.0)),
             (Value::Null, Value::Null),
-            (Value::Null, Value::Integer(1)),
-            (Value::Null, Value::Float(1.0)),
+            (Value::Null, Value::from_i64(1)),
+            (Value::Null, Value::from_f64(1.0)),
             (Value::Null, Value::Text("2".into())),
-            (Value::Integer(1), Value::Null),
-            (Value::Float(1.0), Value::Null),
+            (Value::from_i64(1), Value::Null),
+            (Value::from_f64(1.0), Value::Null),
             (Value::Text("1".into()), Value::Null),
             (Value::Text("1".into()), Value::Text("3".into())),
             (Value::Text("1.0".into()), Value::Text("3.0".into())),
-            (Value::Text("1.0".into()), Value::Float(3.0)),
-            (Value::Text("1.0".into()), Value::Integer(3)),
-            (Value::Float(1.0), Value::Text("3.0".into())),
-            (Value::Integer(1), Value::Text("3".into())),
+            (Value::Text("1.0".into()), Value::from_f64(3.0)),
+            (Value::Text("1.0".into()), Value::from_i64(3)),
+            (Value::from_f64(1.0), Value::Text("3.0".into())),
+            (Value::from_i64(1), Value::Text("3".into())),
         ];
 
         let outputs = [
-            Value::Integer(4),
-            Value::Float(4.0),
-            Value::Float(4.0),
-            Value::Float(4.0),
+            Value::from_i64(4),
+            Value::from_f64(4.0),
+            Value::from_f64(4.0),
+            Value::from_f64(4.0),
             Value::Null,
             Value::Null,
             Value::Null,
@@ -1473,12 +1477,12 @@ mod tests {
             Value::Null,
             Value::Null,
             Value::Null,
-            Value::Integer(4),
-            Value::Float(4.0),
-            Value::Float(4.0),
-            Value::Float(4.0),
-            Value::Float(4.0),
-            Value::Float(4.0),
+            Value::from_i64(4),
+            Value::from_f64(4.0),
+            Value::from_f64(4.0),
+            Value::from_f64(4.0),
+            Value::from_f64(4.0),
+            Value::from_f64(4.0),
         ];
 
         assert_eq!(
@@ -1498,30 +1502,30 @@ mod tests {
     #[test]
     fn test_exec_subtract() {
         let inputs = vec![
-            (Value::Integer(3), Value::Integer(1)),
-            (Value::Float(3.0), Value::Float(1.0)),
-            (Value::Float(3.0), Value::Integer(1)),
-            (Value::Integer(3), Value::Float(1.0)),
+            (Value::from_i64(3), Value::from_i64(1)),
+            (Value::from_f64(3.0), Value::from_f64(1.0)),
+            (Value::from_f64(3.0), Value::from_i64(1)),
+            (Value::from_i64(3), Value::from_f64(1.0)),
             (Value::Null, Value::Null),
-            (Value::Null, Value::Integer(1)),
-            (Value::Null, Value::Float(1.0)),
+            (Value::Null, Value::from_i64(1)),
+            (Value::Null, Value::from_f64(1.0)),
             (Value::Null, Value::Text("1".into())),
-            (Value::Integer(1), Value::Null),
-            (Value::Float(1.0), Value::Null),
+            (Value::from_i64(1), Value::Null),
+            (Value::from_f64(1.0), Value::Null),
             (Value::Text("4".into()), Value::Null),
             (Value::Text("1".into()), Value::Text("3".into())),
             (Value::Text("1.0".into()), Value::Text("3.0".into())),
-            (Value::Text("1.0".into()), Value::Float(3.0)),
-            (Value::Text("1.0".into()), Value::Integer(3)),
-            (Value::Float(1.0), Value::Text("3.0".into())),
-            (Value::Integer(1), Value::Text("3".into())),
+            (Value::Text("1.0".into()), Value::from_f64(3.0)),
+            (Value::Text("1.0".into()), Value::from_i64(3)),
+            (Value::from_f64(1.0), Value::Text("3.0".into())),
+            (Value::from_i64(1), Value::Text("3".into())),
         ];
 
         let outputs = [
-            Value::Integer(2),
-            Value::Float(2.0),
-            Value::Float(2.0),
-            Value::Float(2.0),
+            Value::from_i64(2),
+            Value::from_f64(2.0),
+            Value::from_f64(2.0),
+            Value::from_f64(2.0),
             Value::Null,
             Value::Null,
             Value::Null,
@@ -1529,12 +1533,12 @@ mod tests {
             Value::Null,
             Value::Null,
             Value::Null,
-            Value::Integer(-2),
-            Value::Float(-2.0),
-            Value::Float(-2.0),
-            Value::Float(-2.0),
-            Value::Float(-2.0),
-            Value::Float(-2.0),
+            Value::from_i64(-2),
+            Value::from_f64(-2.0),
+            Value::from_f64(-2.0),
+            Value::from_f64(-2.0),
+            Value::from_f64(-2.0),
+            Value::from_f64(-2.0),
         ];
 
         assert_eq!(
@@ -1554,30 +1558,30 @@ mod tests {
     #[test]
     fn test_exec_multiply() {
         let inputs = vec![
-            (Value::Integer(3), Value::Integer(2)),
-            (Value::Float(3.0), Value::Float(2.0)),
-            (Value::Float(3.0), Value::Integer(2)),
-            (Value::Integer(3), Value::Float(2.0)),
+            (Value::from_i64(3), Value::from_i64(2)),
+            (Value::from_f64(3.0), Value::from_f64(2.0)),
+            (Value::from_f64(3.0), Value::from_i64(2)),
+            (Value::from_i64(3), Value::from_f64(2.0)),
             (Value::Null, Value::Null),
-            (Value::Null, Value::Integer(1)),
-            (Value::Null, Value::Float(1.0)),
+            (Value::Null, Value::from_i64(1)),
+            (Value::Null, Value::from_f64(1.0)),
             (Value::Null, Value::Text("1".into())),
-            (Value::Integer(1), Value::Null),
-            (Value::Float(1.0), Value::Null),
+            (Value::from_i64(1), Value::Null),
+            (Value::from_f64(1.0), Value::Null),
             (Value::Text("4".into()), Value::Null),
             (Value::Text("2".into()), Value::Text("3".into())),
             (Value::Text("2.0".into()), Value::Text("3.0".into())),
-            (Value::Text("2.0".into()), Value::Float(3.0)),
-            (Value::Text("2.0".into()), Value::Integer(3)),
-            (Value::Float(2.0), Value::Text("3.0".into())),
-            (Value::Integer(2), Value::Text("3.0".into())),
+            (Value::Text("2.0".into()), Value::from_f64(3.0)),
+            (Value::Text("2.0".into()), Value::from_i64(3)),
+            (Value::from_f64(2.0), Value::Text("3.0".into())),
+            (Value::from_i64(2), Value::Text("3.0".into())),
         ];
 
         let outputs = [
-            Value::Integer(6),
-            Value::Float(6.0),
-            Value::Float(6.0),
-            Value::Float(6.0),
+            Value::from_i64(6),
+            Value::from_f64(6.0),
+            Value::from_f64(6.0),
+            Value::from_f64(6.0),
             Value::Null,
             Value::Null,
             Value::Null,
@@ -1585,12 +1589,12 @@ mod tests {
             Value::Null,
             Value::Null,
             Value::Null,
-            Value::Integer(6),
-            Value::Float(6.0),
-            Value::Float(6.0),
-            Value::Float(6.0),
-            Value::Float(6.0),
-            Value::Float(6.0),
+            Value::from_i64(6),
+            Value::from_f64(6.0),
+            Value::from_f64(6.0),
+            Value::from_f64(6.0),
+            Value::from_f64(6.0),
+            Value::from_f64(6.0),
         ];
 
         assert_eq!(
@@ -1610,31 +1614,31 @@ mod tests {
     #[test]
     fn test_exec_divide() {
         let inputs = vec![
-            (Value::Integer(1), Value::Integer(0)),
-            (Value::Float(1.0), Value::Float(0.0)),
-            (Value::Integer(i64::MIN), Value::Integer(-1)),
-            (Value::Float(6.0), Value::Float(2.0)),
-            (Value::Float(6.0), Value::Integer(2)),
-            (Value::Integer(6), Value::Integer(2)),
-            (Value::Null, Value::Integer(2)),
-            (Value::Integer(2), Value::Null),
+            (Value::from_i64(1), Value::from_i64(0)),
+            (Value::from_f64(1.0), Value::from_f64(0.0)),
+            (Value::from_i64(i64::MIN), Value::from_i64(-1)),
+            (Value::from_f64(6.0), Value::from_f64(2.0)),
+            (Value::from_f64(6.0), Value::from_i64(2)),
+            (Value::from_i64(6), Value::from_i64(2)),
+            (Value::Null, Value::from_i64(2)),
+            (Value::from_i64(2), Value::Null),
             (Value::Null, Value::Null),
             (Value::Text("6".into()), Value::Text("2".into())),
-            (Value::Text("6".into()), Value::Integer(2)),
+            (Value::Text("6".into()), Value::from_i64(2)),
         ];
 
         let outputs = [
             Value::Null,
             Value::Null,
-            Value::Float(9.223372036854776e18),
-            Value::Float(3.0),
-            Value::Float(3.0),
-            Value::Float(3.0),
+            Value::from_f64(9.223372036854776e18),
+            Value::from_f64(3.0),
+            Value::from_f64(3.0),
+            Value::from_f64(3.0),
             Value::Null,
             Value::Null,
             Value::Null,
-            Value::Float(3.0),
-            Value::Float(3.0),
+            Value::from_f64(3.0),
+            Value::from_f64(3.0),
         ];
 
         assert_eq!(
@@ -1655,27 +1659,27 @@ mod tests {
     fn test_exec_remainder() {
         let inputs = vec![
             (Value::Null, Value::Null),
-            (Value::Null, Value::Float(1.0)),
-            (Value::Null, Value::Integer(1)),
+            (Value::Null, Value::from_f64(1.0)),
+            (Value::Null, Value::from_i64(1)),
             (Value::Null, Value::Text("1".into())),
-            (Value::Float(1.0), Value::Null),
-            (Value::Integer(1), Value::Null),
-            (Value::Integer(12), Value::Integer(0)),
-            (Value::Float(12.0), Value::Float(0.0)),
-            (Value::Float(12.0), Value::Integer(0)),
-            (Value::Integer(12), Value::Float(0.0)),
-            (Value::Integer(i64::MIN), Value::Integer(-1)),
-            (Value::Integer(12), Value::Integer(3)),
-            (Value::Float(12.0), Value::Float(3.0)),
-            (Value::Float(12.0), Value::Integer(3)),
-            (Value::Integer(12), Value::Float(3.0)),
-            (Value::Integer(12), Value::Integer(-3)),
-            (Value::Float(12.0), Value::Float(-3.0)),
-            (Value::Float(12.0), Value::Integer(-3)),
-            (Value::Integer(12), Value::Float(-3.0)),
+            (Value::from_f64(1.0), Value::Null),
+            (Value::from_i64(1), Value::Null),
+            (Value::from_i64(12), Value::from_i64(0)),
+            (Value::from_f64(12.0), Value::from_f64(0.0)),
+            (Value::from_f64(12.0), Value::from_i64(0)),
+            (Value::from_i64(12), Value::from_f64(0.0)),
+            (Value::from_i64(i64::MIN), Value::from_i64(-1)),
+            (Value::from_i64(12), Value::from_i64(3)),
+            (Value::from_f64(12.0), Value::from_f64(3.0)),
+            (Value::from_f64(12.0), Value::from_i64(3)),
+            (Value::from_i64(12), Value::from_f64(3.0)),
+            (Value::from_i64(12), Value::from_i64(-3)),
+            (Value::from_f64(12.0), Value::from_f64(-3.0)),
+            (Value::from_f64(12.0), Value::from_i64(-3)),
+            (Value::from_i64(12), Value::from_f64(-3.0)),
             (Value::Text("12.0".into()), Value::Text("3.0".into())),
-            (Value::Text("12.0".into()), Value::Float(3.0)),
-            (Value::Float(12.0), Value::Text("3.0".into())),
+            (Value::Text("12.0".into()), Value::from_f64(3.0)),
+            (Value::from_f64(12.0), Value::Text("3.0".into())),
         ];
         let outputs = vec![
             Value::Null,
@@ -1688,18 +1692,18 @@ mod tests {
             Value::Null,
             Value::Null,
             Value::Null,
-            Value::Float(0.0),
-            Value::Integer(0),
-            Value::Float(0.0),
-            Value::Float(0.0),
-            Value::Float(0.0),
-            Value::Integer(0),
-            Value::Float(0.0),
-            Value::Float(0.0),
-            Value::Float(0.0),
-            Value::Float(0.0),
-            Value::Float(0.0),
-            Value::Float(0.0),
+            Value::from_f64(0.0),
+            Value::from_i64(0),
+            Value::from_f64(0.0),
+            Value::from_f64(0.0),
+            Value::from_f64(0.0),
+            Value::from_i64(0),
+            Value::from_f64(0.0),
+            Value::from_f64(0.0),
+            Value::from_f64(0.0),
+            Value::from_f64(0.0),
+            Value::from_f64(0.0),
+            Value::from_f64(0.0),
         ];
 
         assert_eq!(
@@ -1720,24 +1724,24 @@ mod tests {
     #[test]
     fn test_exec_and() {
         let inputs = vec![
-            (Value::Integer(0), Value::Null),
-            (Value::Null, Value::Integer(1)),
+            (Value::from_i64(0), Value::Null),
+            (Value::Null, Value::from_i64(1)),
             (Value::Null, Value::Null),
-            (Value::Float(0.0), Value::Null),
-            (Value::Integer(1), Value::Float(2.2)),
-            (Value::Integer(0), Value::Text("string".into())),
-            (Value::Integer(0), Value::Text("1".into())),
-            (Value::Integer(1), Value::Text("1".into())),
+            (Value::from_f64(0.0), Value::Null),
+            (Value::from_i64(1), Value::from_f64(2.2)),
+            (Value::from_i64(0), Value::Text("string".into())),
+            (Value::from_i64(0), Value::Text("1".into())),
+            (Value::from_i64(1), Value::Text("1".into())),
         ];
         let outputs = [
-            Value::Integer(0),
+            Value::from_i64(0),
             Value::Null,
             Value::Null,
-            Value::Integer(0),
-            Value::Integer(1),
-            Value::Integer(0),
-            Value::Integer(0),
-            Value::Integer(1),
+            Value::from_i64(0),
+            Value::from_i64(1),
+            Value::from_i64(0),
+            Value::from_i64(0),
+            Value::from_i64(1),
         ];
 
         assert_eq!(
@@ -1757,26 +1761,26 @@ mod tests {
     #[test]
     fn test_exec_or() {
         let inputs = vec![
-            (Value::Integer(0), Value::Null),
-            (Value::Null, Value::Integer(1)),
+            (Value::from_i64(0), Value::Null),
+            (Value::Null, Value::from_i64(1)),
             (Value::Null, Value::Null),
-            (Value::Float(0.0), Value::Null),
-            (Value::Integer(1), Value::Float(2.2)),
-            (Value::Float(0.0), Value::Integer(0)),
-            (Value::Integer(0), Value::Text("string".into())),
-            (Value::Integer(0), Value::Text("1".into())),
-            (Value::Integer(0), Value::Text("".into())),
+            (Value::from_f64(0.0), Value::Null),
+            (Value::from_i64(1), Value::from_f64(2.2)),
+            (Value::from_f64(0.0), Value::from_i64(0)),
+            (Value::from_i64(0), Value::Text("string".into())),
+            (Value::from_i64(0), Value::Text("1".into())),
+            (Value::from_i64(0), Value::Text("".into())),
         ];
         let outputs = [
             Value::Null,
-            Value::Integer(1),
+            Value::from_i64(1),
             Value::Null,
             Value::Null,
-            Value::Integer(1),
-            Value::Integer(0),
-            Value::Integer(0),
-            Value::Integer(1),
-            Value::Integer(0),
+            Value::from_i64(1),
+            Value::from_i64(0),
+            Value::from_i64(0),
+            Value::from_i64(1),
+            Value::from_i64(0),
         ];
 
         assert_eq!(
@@ -1796,19 +1800,19 @@ mod tests {
     #[test]
     fn test_length() {
         let input_str = Value::build_text("bob");
-        let expected_len = Value::Integer(3);
+        let expected_len = Value::from_i64(3);
         assert_eq!(input_str.exec_length(), expected_len);
 
-        let input_integer = Value::Integer(123);
-        let expected_len = Value::Integer(3);
+        let input_integer = Value::from_i64(123);
+        let expected_len = Value::from_i64(3);
         assert_eq!(input_integer.exec_length(), expected_len);
 
-        let input_float = Value::Float(123.456);
-        let expected_len = Value::Integer(7);
+        let input_float = Value::from_f64(123.456);
+        let expected_len = Value::from_i64(7);
         assert_eq!(input_float.exec_length(), expected_len);
 
         let expected_blob = Value::Blob("example".as_bytes().to_vec());
-        let expected_len = Value::Integer(7);
+        let expected_len = Value::from_i64(7);
         assert_eq!(expected_blob.exec_length(), expected_len);
     }
 
@@ -1818,11 +1822,11 @@ mod tests {
         let expected = Value::build_text("'abc'");
         assert_eq!(input.exec_quote(), expected);
 
-        let input = Value::Integer(123);
+        let input = Value::from_i64(123);
         let expected = Value::build_text("123");
         assert_eq!(input.exec_quote(), expected);
 
-        let input = Value::Float(12.34);
+        let input = Value::from_f64(12.34);
         let expected = Value::build_text("12.34");
         assert_eq!(input.exec_quote(), expected);
 
@@ -1837,11 +1841,11 @@ mod tests {
         let expected: Value = Value::build_text("null");
         assert_eq!(input.exec_typeof(), expected);
 
-        let input = Value::Integer(123);
+        let input = Value::from_i64(123);
         let expected: Value = Value::build_text("integer");
         assert_eq!(input.exec_typeof(), expected);
 
-        let input = Value::Float(123.456);
+        let input = Value::from_f64(123.456);
         let expected: Value = Value::build_text("real");
         assert_eq!(input.exec_typeof(), expected);
 
@@ -1856,36 +1860,36 @@ mod tests {
 
     #[test]
     fn test_unicode() {
-        assert_eq!(Value::build_text("a").exec_unicode(), Value::Integer(97));
+        assert_eq!(Value::build_text("a").exec_unicode(), Value::from_i64(97));
         assert_eq!(
             Value::build_text("😊").exec_unicode(),
-            Value::Integer(128522)
+            Value::from_i64(128522)
         );
         assert_eq!(Value::build_text("").exec_unicode(), Value::Null);
-        assert_eq!(Value::Integer(23).exec_unicode(), Value::Integer(50));
-        assert_eq!(Value::Integer(0).exec_unicode(), Value::Integer(48));
-        assert_eq!(Value::Float(0.0).exec_unicode(), Value::Integer(48));
-        assert_eq!(Value::Float(23.45).exec_unicode(), Value::Integer(50));
+        assert_eq!(Value::from_i64(23).exec_unicode(), Value::from_i64(50));
+        assert_eq!(Value::from_i64(0).exec_unicode(), Value::from_i64(48));
+        assert_eq!(Value::from_f64(0.0).exec_unicode(), Value::from_i64(48));
+        assert_eq!(Value::from_f64(23.45).exec_unicode(), Value::from_i64(50));
         assert_eq!(Value::Null.exec_unicode(), Value::Null);
         assert_eq!(
             Value::Blob("example".as_bytes().to_vec()).exec_unicode(),
-            Value::Integer(101)
+            Value::from_i64(101)
         );
     }
 
     #[test]
     fn test_min_max() {
         let input_int_vec = [
-            Register::Value(Value::Integer(-1)),
-            Register::Value(Value::Integer(10)),
+            Register::Value(Value::from_i64(-1)),
+            Register::Value(Value::from_i64(10)),
         ];
         assert_eq!(
             Value::exec_min(input_int_vec.iter().map(|v| v.get_value())),
-            Value::Integer(-1)
+            Value::from_i64(-1)
         );
         assert_eq!(
             Value::exec_max(input_int_vec.iter().map(|v| v.get_value())),
-            Value::Integer(10)
+            Value::from_i64(10)
         );
 
         let str1 = Register::Value(Value::build_text("A"));
@@ -1910,10 +1914,10 @@ mod tests {
             Value::Null
         );
 
-        let input_mixed_vec = [Register::Value(Value::Integer(10)), str1];
+        let input_mixed_vec = [Register::Value(Value::from_i64(10)), str1];
         assert_eq!(
             Value::exec_min(input_mixed_vec.iter().map(|v| v.get_value())),
-            Value::Integer(10)
+            Value::from_i64(10)
         );
         assert_eq!(
             Value::exec_max(input_mixed_vec.iter().map(|v| v.get_value())),
@@ -1922,7 +1926,7 @@ mod tests {
 
         // SQLite: multi-arg min/max returns NULL if ANY argument is NULL
         let input_with_null = [
-            Register::Value(Value::Integer(1)),
+            Register::Value(Value::from_i64(1)),
             Register::Value(Value::Null),
         ];
         assert_eq!(
@@ -1955,12 +1959,12 @@ mod tests {
         assert_eq!(input_str.exec_trim(None), expected_str);
 
         // TRIM on Integer should return TEXT (SQLite compatibility)
-        let input_int = Value::Integer(12345);
+        let input_int = Value::from_i64(12345);
         let expected_text = Value::build_text("12345");
         assert_eq!(input_int.exec_trim(None), expected_text);
 
         // TRIM on Float should return TEXT (SQLite compatibility)
-        let input_float = Value::Float(123.5);
+        let input_float = Value::from_f64(123.5);
         let expected_text = Value::build_text("123.5");
         assert_eq!(input_float.exec_trim(None), expected_text);
     }
@@ -2047,7 +2051,7 @@ mod tests {
         let expected_str = Value::build_text("LIMBO");
         assert_eq!(input_str.exec_upper().unwrap(), expected_str);
 
-        let input_int = Value::Integer(10);
+        let input_int = Value::from_i64(10);
         assert_eq!(input_int.exec_upper().unwrap(), Value::build_text("10"));
         assert_eq!(Value::Null.exec_upper(), None)
     }
@@ -2058,7 +2062,7 @@ mod tests {
         let expected_str = Value::build_text("limbo");
         assert_eq!(input_str.exec_lower().unwrap(), expected_str);
 
-        let input_int = Value::Integer(10);
+        let input_int = Value::from_i64(10);
         assert_eq!(input_int.exec_lower().unwrap(), Value::build_text("10"));
         assert_eq!(Value::Null.exec_lower(), None)
     }
@@ -2069,11 +2073,11 @@ mod tests {
         let expected_val = Value::build_text("6C696D626F");
         assert_eq!(input_str.exec_hex(), expected_val);
 
-        let input_int = Value::Integer(100);
+        let input_int = Value::from_i64(100);
         let expected_val = Value::build_text("313030");
         assert_eq!(input_int.exec_hex(), expected_val);
 
-        let input_float = Value::Float(12.34);
+        let input_float = Value::from_f64(12.34);
         let expected_val = Value::build_text("31322E3334");
         assert_eq!(input_float.exec_hex(), expected_val);
 
@@ -2111,24 +2115,24 @@ mod tests {
 
     #[test]
     fn test_abs() {
-        let int_positive_reg = Value::Integer(10);
-        let int_negative_reg = Value::Integer(-10);
+        let int_positive_reg = Value::from_i64(10);
+        let int_negative_reg = Value::from_i64(-10);
         assert_eq!(int_positive_reg.exec_abs().unwrap(), int_positive_reg);
         assert_eq!(int_negative_reg.exec_abs().unwrap(), int_positive_reg);
 
-        let float_positive_reg = Value::Integer(10);
-        let float_negative_reg = Value::Integer(-10);
+        let float_positive_reg = Value::from_i64(10);
+        let float_negative_reg = Value::from_i64(-10);
         assert_eq!(float_positive_reg.exec_abs().unwrap(), float_positive_reg);
         assert_eq!(float_negative_reg.exec_abs().unwrap(), float_positive_reg);
 
         assert_eq!(
             Value::build_text("a").exec_abs().unwrap(),
-            Value::Float(0.0)
+            Value::from_f64(0.0)
         );
         assert_eq!(Value::Null.exec_abs().unwrap(), Value::Null);
 
         // ABS(i64::MIN) should return RuntimeError
-        assert!(Value::Integer(i64::MIN).exec_abs().is_err());
+        assert!(Value::from_i64(i64::MIN).exec_abs().is_err());
     }
 
     #[test]
@@ -2136,8 +2140,8 @@ mod tests {
         assert_eq!(
             Value::exec_char(
                 [
-                    Register::Value(Value::Integer(108)),
-                    Register::Value(Value::Integer(105))
+                    Register::Value(Value::from_i64(108)),
+                    Register::Value(Value::from_i64(105))
                 ]
                 .iter()
                 .map(|reg| reg.get_value())
@@ -2213,7 +2217,7 @@ mod tests {
     #[test]
     fn test_random() {
         match Value::exec_random(|| rand::rng().random()) {
-            Value::Integer(value) => {
+            Value::Numeric(Numeric::Integer(value)) => {
                 // Check that the value is within the range of i64
                 assert!(
                     (i64::MIN..=i64::MAX).contains(&value),
@@ -2233,15 +2237,15 @@ mod tests {
 
         let test_cases = vec![
             TestCase {
-                input: Value::Integer(5),
+                input: Value::from_i64(5),
                 expected_len: 5,
             },
             TestCase {
-                input: Value::Integer(0),
+                input: Value::from_i64(0),
                 expected_len: 1,
             },
             TestCase {
-                input: Value::Integer(-1),
+                input: Value::from_i64(-1),
                 expected_len: 1,
             },
             TestCase {
@@ -2261,11 +2265,11 @@ mod tests {
                 expected_len: 1,
             },
             TestCase {
-                input: Value::Float(2.9),
+                input: Value::from_f64(2.9),
                 expected_len: 2,
             },
             TestCase {
-                input: Value::Float(-3.15),
+                input: Value::from_f64(-3.15),
                 expected_len: 1,
             },
             TestCase {
@@ -2290,52 +2294,52 @@ mod tests {
         }
 
         // Test TooBig error
-        let input = Value::Integer(Value::MAX_BLOB_LENGTH + 1);
+        let input = Value::from_i64(Value::MAX_BLOB_LENGTH + 1);
         assert!(input.exec_randomblob(|_| {}).is_err());
     }
 
     #[test]
     fn test_exec_round() {
-        let input_val = Value::Float(123.456);
-        let expected_val = Value::Float(123.0);
+        let input_val = Value::from_f64(123.456);
+        let expected_val = Value::from_f64(123.0);
         assert_eq!(input_val.exec_round(None), expected_val);
 
-        let input_val = Value::Float(123.456);
-        let precision_val = Value::Integer(2);
-        let expected_val = Value::Float(123.46);
+        let input_val = Value::from_f64(123.456);
+        let precision_val = Value::from_i64(2);
+        let expected_val = Value::from_f64(123.46);
         assert_eq!(input_val.exec_round(Some(&precision_val)), expected_val);
 
-        let input_val = Value::Float(123.456);
+        let input_val = Value::from_f64(123.456);
         let precision_val = Value::build_text("1");
-        let expected_val = Value::Float(123.5);
+        let expected_val = Value::from_f64(123.5);
         assert_eq!(input_val.exec_round(Some(&precision_val)), expected_val);
 
         let input_val = Value::build_text("123.456");
-        let precision_val = Value::Integer(2);
-        let expected_val = Value::Float(123.46);
+        let precision_val = Value::from_i64(2);
+        let expected_val = Value::from_f64(123.46);
         assert_eq!(input_val.exec_round(Some(&precision_val)), expected_val);
 
-        let input_val = Value::Integer(123);
-        let precision_val = Value::Integer(1);
-        let expected_val = Value::Float(123.0);
+        let input_val = Value::from_i64(123);
+        let precision_val = Value::from_i64(1);
+        let expected_val = Value::from_f64(123.0);
         assert_eq!(input_val.exec_round(Some(&precision_val)), expected_val);
 
-        let input_val = Value::Float(100.123);
-        let expected_val = Value::Float(100.0);
+        let input_val = Value::from_f64(100.123);
+        let expected_val = Value::from_f64(100.0);
         assert_eq!(input_val.exec_round(None), expected_val);
 
-        let input_val = Value::Float(100.123);
+        let input_val = Value::from_f64(100.123);
         let expected_val = Value::Null;
         assert_eq!(input_val.exec_round(Some(&Value::Null)), expected_val);
     }
 
     #[test]
     fn test_exec_if() {
-        let reg = Value::Integer(0);
+        let reg = Value::from_i64(0);
         assert!(!reg.exec_if(false, false));
         assert!(reg.exec_if(false, true));
 
-        let reg = Value::Integer(1);
+        let reg = Value::from_i64(1);
         assert!(reg.exec_if(false, false));
         assert!(!reg.exec_if(false, true));
 
@@ -2355,11 +2359,11 @@ mod tests {
     #[test]
     fn test_nullif() {
         assert_eq!(
-            Value::Integer(1).exec_nullif(&Value::Integer(1)),
+            Value::from_i64(1).exec_nullif(&Value::from_i64(1)),
             Value::Null
         );
         assert_eq!(
-            Value::Float(1.1).exec_nullif(&Value::Float(1.1)),
+            Value::from_f64(1.1).exec_nullif(&Value::from_f64(1.1)),
             Value::Null
         );
         assert_eq!(
@@ -2368,12 +2372,12 @@ mod tests {
         );
 
         assert_eq!(
-            Value::Integer(1).exec_nullif(&Value::Integer(2)),
-            Value::Integer(1)
+            Value::from_i64(1).exec_nullif(&Value::from_i64(2)),
+            Value::from_i64(1)
         );
         assert_eq!(
-            Value::Float(1.1).exec_nullif(&Value::Float(1.2)),
-            Value::Float(1.1)
+            Value::from_f64(1.1).exec_nullif(&Value::from_f64(1.2)),
+            Value::from_f64(1.1)
         );
         assert_eq!(
             Value::build_text("limbo").exec_nullif(&Value::build_text("limb")),
@@ -2384,8 +2388,8 @@ mod tests {
     #[test]
     fn test_substring() {
         let str_value = Value::build_text("limbo");
-        let start_value = Value::Integer(1);
-        let length_value = Value::Integer(3);
+        let start_value = Value::from_i64(1);
+        let length_value = Value::from_i64(3);
         let expected_val = Value::build_text("lim");
         assert_eq!(
             Value::exec_substring(&str_value, &start_value, Some(&length_value)),
@@ -2393,8 +2397,8 @@ mod tests {
         );
 
         let str_value = Value::build_text("limbo");
-        let start_value = Value::Integer(1);
-        let length_value = Value::Integer(10);
+        let start_value = Value::from_i64(1);
+        let length_value = Value::from_i64(10);
         let expected_val = Value::build_text("limbo");
         assert_eq!(
             Value::exec_substring(&str_value, &start_value, Some(&length_value)),
@@ -2402,8 +2406,8 @@ mod tests {
         );
 
         let str_value = Value::build_text("limbo");
-        let start_value = Value::Integer(10);
-        let length_value = Value::Integer(3);
+        let start_value = Value::from_i64(10);
+        let length_value = Value::from_i64(3);
         let expected_val = Value::build_text("");
         assert_eq!(
             Value::exec_substring(&str_value, &start_value, Some(&length_value)),
@@ -2411,7 +2415,7 @@ mod tests {
         );
 
         let str_value = Value::build_text("limbo");
-        let start_value = Value::Integer(3);
+        let start_value = Value::from_i64(3);
         let length_value = Value::Null;
         let expected_val = Value::Null;
         assert_eq!(
@@ -2420,7 +2424,7 @@ mod tests {
         );
 
         let str_value = Value::build_text("limbo");
-        let start_value = Value::Integer(10);
+        let start_value = Value::from_i64(10);
         let length_value = Value::Null;
         let expected_val = Value::Null;
         assert_eq!(
@@ -2433,42 +2437,42 @@ mod tests {
     fn test_exec_instr() {
         let input = Value::build_text("limbo");
         let pattern = Value::build_text("im");
-        let expected = Value::Integer(2);
+        let expected = Value::from_i64(2);
         assert_eq!(input.exec_instr(&pattern), expected);
 
         let input = Value::build_text("limbo");
         let pattern = Value::build_text("limbo");
-        let expected = Value::Integer(1);
+        let expected = Value::from_i64(1);
         assert_eq!(input.exec_instr(&pattern), expected);
 
         let input = Value::build_text("limbo");
         let pattern = Value::build_text("o");
-        let expected = Value::Integer(5);
+        let expected = Value::from_i64(5);
         assert_eq!(input.exec_instr(&pattern), expected);
 
         let input = Value::build_text("liiiiimbo");
         let pattern = Value::build_text("ii");
-        let expected = Value::Integer(2);
+        let expected = Value::from_i64(2);
         assert_eq!(input.exec_instr(&pattern), expected);
 
         let input = Value::build_text("limbo");
         let pattern = Value::build_text("limboX");
-        let expected = Value::Integer(0);
+        let expected = Value::from_i64(0);
         assert_eq!(input.exec_instr(&pattern), expected);
 
         let input = Value::build_text("limbo");
         let pattern = Value::build_text("");
-        let expected = Value::Integer(1);
+        let expected = Value::from_i64(1);
         assert_eq!(input.exec_instr(&pattern), expected);
 
         let input = Value::build_text("");
         let pattern = Value::build_text("limbo");
-        let expected = Value::Integer(0);
+        let expected = Value::from_i64(0);
         assert_eq!(input.exec_instr(&pattern), expected);
 
         let input = Value::build_text("");
         let pattern = Value::build_text("");
-        let expected = Value::Integer(1);
+        let expected = Value::from_i64(1);
         assert_eq!(input.exec_instr(&pattern), expected);
 
         let input = Value::Null;
@@ -2486,85 +2490,85 @@ mod tests {
         let expected = Value::Null;
         assert_eq!(input.exec_instr(&pattern), expected);
 
-        let input = Value::Integer(123);
-        let pattern = Value::Integer(2);
-        let expected = Value::Integer(2);
+        let input = Value::from_i64(123);
+        let pattern = Value::from_i64(2);
+        let expected = Value::from_i64(2);
         assert_eq!(input.exec_instr(&pattern), expected);
 
-        let input = Value::Integer(123);
-        let pattern = Value::Integer(5);
-        let expected = Value::Integer(0);
+        let input = Value::from_i64(123);
+        let pattern = Value::from_i64(5);
+        let expected = Value::from_i64(0);
         assert_eq!(input.exec_instr(&pattern), expected);
 
-        let input = Value::Float(12.34);
-        let pattern = Value::Float(2.3);
-        let expected = Value::Integer(2);
+        let input = Value::from_f64(12.34);
+        let pattern = Value::from_f64(2.3);
+        let expected = Value::from_i64(2);
         assert_eq!(input.exec_instr(&pattern), expected);
 
-        let input = Value::Float(12.34);
-        let pattern = Value::Float(5.6);
-        let expected = Value::Integer(0);
+        let input = Value::from_f64(12.34);
+        let pattern = Value::from_f64(5.6);
+        let expected = Value::from_i64(0);
         assert_eq!(input.exec_instr(&pattern), expected);
 
-        let input = Value::Float(12.34);
+        let input = Value::from_f64(12.34);
         let pattern = Value::build_text(".");
-        let expected = Value::Integer(3);
+        let expected = Value::from_i64(3);
         assert_eq!(input.exec_instr(&pattern), expected);
 
         let input = Value::Blob(vec![1, 2, 3, 4, 5]);
         let pattern = Value::Blob(vec![3, 4]);
-        let expected = Value::Integer(3);
+        let expected = Value::from_i64(3);
         assert_eq!(input.exec_instr(&pattern), expected);
 
         let input = Value::Blob(vec![1, 2, 3, 4, 5]);
         let pattern = Value::Blob(vec![3, 2]);
-        let expected = Value::Integer(0);
+        let expected = Value::from_i64(0);
         assert_eq!(input.exec_instr(&pattern), expected);
 
         let input = Value::Blob(vec![0x61, 0x62, 0x63, 0x64, 0x65]);
         let pattern = Value::build_text("cd");
-        let expected = Value::Integer(3);
+        let expected = Value::from_i64(3);
         assert_eq!(input.exec_instr(&pattern), expected);
 
         let input = Value::build_text("abcde");
         let pattern = Value::Blob(vec![0x63, 0x64]);
-        let expected = Value::Integer(3);
+        let expected = Value::from_i64(3);
         assert_eq!(input.exec_instr(&pattern), expected);
 
         let input = Value::build_text("abcde");
         let pattern = Value::build_text("");
-        let expected = Value::Integer(1);
+        let expected = Value::from_i64(1);
         assert_eq!(input.exec_instr(&pattern), expected);
     }
 
     #[test]
     fn test_exec_sign() {
-        let input = Value::Integer(42);
-        let expected = Some(Value::Integer(1));
+        let input = Value::from_i64(42);
+        let expected = Some(Value::from_i64(1));
         assert_eq!(input.exec_sign(), expected);
 
-        let input = Value::Integer(-42);
-        let expected = Some(Value::Integer(-1));
+        let input = Value::from_i64(-42);
+        let expected = Some(Value::from_i64(-1));
         assert_eq!(input.exec_sign(), expected);
 
-        let input = Value::Integer(0);
-        let expected = Some(Value::Integer(0));
+        let input = Value::from_i64(0);
+        let expected = Some(Value::from_i64(0));
         assert_eq!(input.exec_sign(), expected);
 
-        let input = Value::Float(0.0);
-        let expected = Some(Value::Integer(0));
+        let input = Value::from_f64(0.0);
+        let expected = Some(Value::from_i64(0));
         assert_eq!(input.exec_sign(), expected);
 
-        let input = Value::Float(0.1);
-        let expected = Some(Value::Integer(1));
+        let input = Value::from_f64(0.1);
+        let expected = Some(Value::from_i64(1));
         assert_eq!(input.exec_sign(), expected);
 
-        let input = Value::Float(42.0);
-        let expected = Some(Value::Integer(1));
+        let input = Value::from_f64(42.0);
+        let expected = Some(Value::from_i64(1));
         assert_eq!(input.exec_sign(), expected);
 
-        let input = Value::Float(-42.0);
-        let expected = Some(Value::Integer(-1));
+        let input = Value::from_f64(-42.0);
+        let expected = Some(Value::from_i64(-1));
         assert_eq!(input.exec_sign(), expected);
 
         let input = Value::build_text("abc");
@@ -2572,15 +2576,15 @@ mod tests {
         assert_eq!(input.exec_sign(), expected);
 
         let input = Value::build_text("42");
-        let expected = Some(Value::Integer(1));
+        let expected = Some(Value::from_i64(1));
         assert_eq!(input.exec_sign(), expected);
 
         let input = Value::build_text("-42");
-        let expected = Some(Value::Integer(-1));
+        let expected = Some(Value::from_i64(-1));
         assert_eq!(input.exec_sign(), expected);
 
         let input = Value::build_text("0");
-        let expected = Some(Value::Integer(0));
+        let expected = Some(Value::from_i64(0));
         assert_eq!(input.exec_sign(), expected);
 
         let input = Value::Blob(b"abc".to_vec());
@@ -2606,7 +2610,7 @@ mod tests {
 
     #[test]
     fn test_exec_zeroblob() {
-        let input = Value::Integer(0);
+        let input = Value::from_i64(0);
         let expected = Value::Blob(vec![]);
         assert_eq!(input.exec_zeroblob().unwrap(), expected);
 
@@ -2614,11 +2618,11 @@ mod tests {
         let expected = Value::Blob(vec![]);
         assert_eq!(input.exec_zeroblob().unwrap(), expected);
 
-        let input = Value::Integer(4);
+        let input = Value::from_i64(4);
         let expected = Value::Blob(vec![0; 4]);
         assert_eq!(input.exec_zeroblob().unwrap(), expected);
 
-        let input = Value::Integer(-1);
+        let input = Value::from_i64(-1);
         let expected = Value::Blob(vec![]);
         assert_eq!(input.exec_zeroblob().unwrap(), expected);
 
@@ -2634,7 +2638,7 @@ mod tests {
         let expected = Value::Blob(vec![]);
         assert_eq!(input.exec_zeroblob().unwrap(), expected);
 
-        let input = Value::Float(2.6);
+        let input = Value::from_f64(2.6);
         let expected = Value::Blob(vec![0; 2]);
         assert_eq!(input.exec_zeroblob().unwrap(), expected);
 
@@ -2643,7 +2647,7 @@ mod tests {
         assert_eq!(input.exec_zeroblob().unwrap(), expected);
 
         // Test TooBig error
-        let input = Value::Integer(Value::MAX_BLOB_LENGTH + 1);
+        let input = Value::from_i64(Value::MAX_BLOB_LENGTH + 1);
         assert!(input.exec_zeroblob().is_err());
     }
 
@@ -2704,7 +2708,7 @@ mod tests {
         );
 
         let input_str = Value::build_text("bo5");
-        let pattern_str = Value::Integer(5);
+        let pattern_str = Value::from_i64(5);
         let replace_str = Value::build_text("a");
         let expected_str = Value::build_text("boa");
         assert_eq!(
@@ -2713,7 +2717,7 @@ mod tests {
         );
 
         let input_str = Value::build_text("bo5.0");
-        let pattern_str = Value::Float(5.0);
+        let pattern_str = Value::from_f64(5.0);
         let replace_str = Value::build_text("a");
         let expected_str = Value::build_text("boa");
         assert_eq!(
@@ -2722,7 +2726,7 @@ mod tests {
         );
 
         let input_str = Value::build_text("bo5");
-        let pattern_str = Value::Float(5.0);
+        let pattern_str = Value::from_f64(5.0);
         let replace_str = Value::build_text("a");
         let expected_str = Value::build_text("bo5");
         assert_eq!(
@@ -2731,8 +2735,8 @@ mod tests {
         );
 
         let input_str = Value::build_text("bo5.0");
-        let pattern_str = Value::Float(5.0);
-        let replace_str = Value::Float(6.0);
+        let pattern_str = Value::from_f64(5.0);
+        let replace_str = Value::from_f64(6.0);
         let expected_str = Value::build_text("bo6.0");
         assert_eq!(
             Value::exec_replace(&input_str, &pattern_str, &replace_str),
@@ -2741,8 +2745,8 @@ mod tests {
 
         // todo: change this test to use (0.1 + 0.2) instead of 0.3 when decimals are implemented.
         let input_str = Value::build_text("tes3");
-        let pattern_str = Value::Integer(3);
-        let replace_str = Value::Float(0.3);
+        let pattern_str = Value::from_i64(3);
+        let replace_str = Value::from_f64(0.3);
         let expected_str = Value::build_text("tes0.3");
         assert_eq!(
             Value::exec_replace(&input_str, &pattern_str, &replace_str),

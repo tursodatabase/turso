@@ -34,7 +34,7 @@ fn create_hash_table(mem_budget: usize) -> HashTable {
 /// Insert entries with integer keys and no payload
 fn insert_integer_entries(ht: &mut HashTable, count: usize) {
     for i in 0..count {
-        let key = vec![Value::Integer(i as i64)];
+        let key = vec![Value::from_i64(i as i64)];
         let _ = ht.insert(key, i as i64, vec![]);
     }
 }
@@ -43,7 +43,7 @@ fn insert_integer_entries(ht: &mut HashTable, count: usize) {
 fn insert_entries_with_text_payload(ht: &mut HashTable, count: usize, text_size: usize) {
     let payload_text: String = "x".repeat(text_size);
     for i in 0..count {
-        let key = vec![Value::Integer(i as i64)];
+        let key = vec![Value::from_i64(i as i64)];
         let payload = vec![Value::Text(payload_text.clone().into())];
         let _ = ht.insert(key, i as i64, payload);
     }
@@ -155,7 +155,7 @@ fn bench_build_and_probe(c: &mut Criterion) {
                     // Probe phase - look up every key
                     let mut found = 0;
                     for i in 0..count {
-                        let key = vec![Value::Integer(i as i64)];
+                        let key = vec![Value::from_i64(i as i64)];
                         let partition_idx = ht.partition_for_keys(&key);
 
                         // Load partition if spilled
@@ -185,7 +185,7 @@ fn bench_build_and_probe(c: &mut Criterion) {
                     // Probe phase
                     let mut found = 0;
                     for i in 0..count {
-                        let key = vec![Value::Integer(i as i64)];
+                        let key = vec![Value::from_i64(i as i64)];
                         let partition_idx = ht.partition_for_keys(&key);
 
                         if ht.has_spilled() && !ht.is_partition_loaded(partition_idx) {

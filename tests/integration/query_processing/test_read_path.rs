@@ -1,5 +1,5 @@
 use crate::common::{ExecRows, TempDatabase};
-use turso_core::{LimboError, StepResult, Value};
+use turso_core::{LimboError, Numeric, StepResult, Value};
 
 #[turso_macros::test(mvcc, init_sql = "create table test (i integer);")]
 fn test_statement_reset_bind(tmp_db: TempDatabase) -> anyhow::Result<()> {
@@ -7,11 +7,11 @@ fn test_statement_reset_bind(tmp_db: TempDatabase) -> anyhow::Result<()> {
 
     let mut stmt = conn.prepare("select ?")?;
 
-    stmt.bind_at(1.try_into()?, Value::Integer(1));
+    stmt.bind_at(1.try_into()?, Value::from_i64(1));
     stmt.run_with_row_callback(|row| {
         assert_eq!(
             *row.get::<&Value>(0).unwrap(),
-            turso_core::Value::Integer(1)
+            turso_core::Value::from_i64(1)
         );
         Ok(())
     })
@@ -19,12 +19,12 @@ fn test_statement_reset_bind(tmp_db: TempDatabase) -> anyhow::Result<()> {
 
     stmt.reset();
 
-    stmt.bind_at(1.try_into()?, Value::Integer(2));
+    stmt.bind_at(1.try_into()?, Value::from_i64(2));
 
     stmt.run_with_row_callback(|row| {
         assert_eq!(
             *row.get::<&Value>(0).unwrap(),
-            turso_core::Value::Integer(2)
+            turso_core::Value::from_i64(2)
         );
         Ok(())
     })
@@ -42,11 +42,11 @@ fn test_statement_bind(tmp_db: TempDatabase) -> anyhow::Result<()> {
     stmt.bind_at(1.try_into()?, Value::build_text("hello"));
 
     let i = stmt.parameters().index(":named").unwrap();
-    stmt.bind_at(i, Value::Integer(42));
+    stmt.bind_at(i, Value::from_i64(42));
 
     stmt.bind_at(3.try_into()?, Value::from_blob(vec![0x1, 0x2, 0x3]));
 
-    stmt.bind_at(4.try_into()?, Value::Float(0.5));
+    stmt.bind_at(4.try_into()?, Value::from_f64(0.5));
 
     assert_eq!(stmt.parameters().count(), 4);
 
@@ -59,7 +59,7 @@ fn test_statement_bind(tmp_db: TempDatabase) -> anyhow::Result<()> {
             assert_eq!(s.as_str(), "hello")
         }
 
-        if let turso_core::Value::Integer(i) = row.get::<&Value>(2).unwrap() {
+        if let turso_core::Value::Numeric(Numeric::Integer(i)) = row.get::<&Value>(2).unwrap() {
             assert_eq!(*i, 42)
         }
 
@@ -67,8 +67,8 @@ fn test_statement_bind(tmp_db: TempDatabase) -> anyhow::Result<()> {
             assert_eq!(v.as_slice(), &vec![0x1_u8, 0x2, 0x3])
         }
 
-        if let turso_core::Value::Float(f) = row.get::<&Value>(4).unwrap() {
-            assert_eq!(*f, 0.5)
+        if let turso_core::Value::Numeric(Numeric::Float(f)) = row.get::<&Value>(4).unwrap() {
+            assert_eq!(f64::from(*f), 0.5)
         }
         Ok(())
     })
@@ -96,7 +96,7 @@ fn test_insert_parameter_remap(tmp_db: TempDatabase) -> anyhow::Result<()> {
 
     // prepare INSERT with re-ordered columns and constants
     let mut ins = conn.prepare("insert into test (d, c, a, b) values (22, ?, 7, ?);")?;
-    let args = [Value::Integer(111), Value::Integer(222)];
+    let args = [Value::from_i64(111), Value::from_i64(222)];
     for (i, arg) in args.iter().enumerate() {
         let idx = i + 1;
         ins.bind_at(idx.try_into()?, arg.clone());
@@ -107,16 +107,16 @@ fn test_insert_parameter_remap(tmp_db: TempDatabase) -> anyhow::Result<()> {
     sel.run_with_row_callback(|row| {
         // insert_index = 3
         // A = 7
-        assert_eq!(row.get::<&Value>(0).unwrap(), &Value::Integer(7));
+        assert_eq!(row.get::<&Value>(0).unwrap(), &Value::from_i64(7));
         // insert_index = 4
         // B = 222
-        assert_eq!(row.get::<&Value>(1).unwrap(), &Value::Integer(222));
+        assert_eq!(row.get::<&Value>(1).unwrap(), &Value::from_i64(222));
         // insert_index = 2
         // C = 111
-        assert_eq!(row.get::<&Value>(2).unwrap(), &Value::Integer(111));
+        assert_eq!(row.get::<&Value>(2).unwrap(), &Value::from_i64(111));
         // insert_index = 1
         // D = 22
-        assert_eq!(row.get::<&Value>(3).unwrap(), &Value::Integer(22));
+        assert_eq!(row.get::<&Value>(3).unwrap(), &Value::from_i64(22));
         Ok(())
     })?;
 
@@ -146,10 +146,10 @@ fn test_insert_parameter_remap_all_params(tmp_db: TempDatabase) -> anyhow::Resul
     let mut ins = conn.prepare("insert into test (d, a, c, b) values (?, ?, ?, ?);")?;
 
     let values = [
-        Value::Integer(999), // ?1 → d
-        Value::Integer(111), // ?2 → a
-        Value::Integer(333), // ?3 → c
-        Value::Integer(444), // ?4 → b
+        Value::from_i64(999), // ?1 → d
+        Value::from_i64(111), // ?2 → a
+        Value::from_i64(333), // ?3 → c
+        Value::from_i64(444), // ?4 → b
     ];
     for (i, value) in values.iter().enumerate() {
         let idx = i + 1;
@@ -163,16 +163,16 @@ fn test_insert_parameter_remap_all_params(tmp_db: TempDatabase) -> anyhow::Resul
     sel.run_with_row_callback(|row| {
         // insert_index = 2
         // A = 111
-        assert_eq!(row.get::<&Value>(0).unwrap(), &Value::Integer(111));
+        assert_eq!(row.get::<&Value>(0).unwrap(), &Value::from_i64(111));
         // insert_index = 4
         // B = 444
-        assert_eq!(row.get::<&Value>(1).unwrap(), &Value::Integer(444));
+        assert_eq!(row.get::<&Value>(1).unwrap(), &Value::from_i64(444));
         // insert_index = 3
         // C = 333
-        assert_eq!(row.get::<&Value>(2).unwrap(), &Value::Integer(333));
+        assert_eq!(row.get::<&Value>(2).unwrap(), &Value::from_i64(333));
         // insert_index = 1
         // D = 999
-        assert_eq!(row.get::<&Value>(3).unwrap(), &Value::Integer(999));
+        assert_eq!(row.get::<&Value>(3).unwrap(), &Value::from_i64(999));
         Ok(())
     })?;
 
@@ -199,10 +199,10 @@ fn test_insert_parameter_multiple_remap_backwards(tmp_db: TempDatabase) -> anyho
     let mut ins = conn.prepare("insert into test (d,c,b,a) values (?, ?, ?, ?);")?;
 
     let values = [
-        Value::Integer(444), // ?1 → d
-        Value::Integer(333), // ?2 → c
-        Value::Integer(222), // ?3 → b
-        Value::Integer(111), // ?4 → a
+        Value::from_i64(444), // ?1 → d
+        Value::from_i64(333), // ?2 → c
+        Value::from_i64(222), // ?3 → b
+        Value::from_i64(111), // ?4 → a
     ];
     for (i, value) in values.iter().enumerate() {
         let idx = i + 1;
@@ -216,16 +216,16 @@ fn test_insert_parameter_multiple_remap_backwards(tmp_db: TempDatabase) -> anyho
     sel.run_with_row_callback(|row| {
         // insert_index = 2
         // A = 111
-        assert_eq!(row.get::<&Value>(0).unwrap(), &Value::Integer(111));
+        assert_eq!(row.get::<&Value>(0).unwrap(), &Value::from_i64(111));
         // insert_index = 4
         // B = 444
-        assert_eq!(row.get::<&Value>(1).unwrap(), &Value::Integer(222));
+        assert_eq!(row.get::<&Value>(1).unwrap(), &Value::from_i64(222));
         // insert_index = 3
         // C = 333
-        assert_eq!(row.get::<&Value>(2).unwrap(), &Value::Integer(333));
+        assert_eq!(row.get::<&Value>(2).unwrap(), &Value::from_i64(333));
         // insert_index = 1
         // D = 999
-        assert_eq!(row.get::<&Value>(3).unwrap(), &Value::Integer(444));
+        assert_eq!(row.get::<&Value>(3).unwrap(), &Value::from_i64(444));
         Ok(())
     })?;
 
@@ -252,10 +252,10 @@ fn test_insert_parameter_multiple_no_remap(tmp_db: TempDatabase) -> anyhow::Resu
     let mut ins = conn.prepare("insert into test (a,b,c,d) values (?, ?, ?, ?);")?;
 
     let values = [
-        Value::Integer(111), // ?1 → a
-        Value::Integer(222), // ?2 → b
-        Value::Integer(333), // ?3 → c
-        Value::Integer(444), // ?4 → d
+        Value::from_i64(111), // ?1 → a
+        Value::from_i64(222), // ?2 → b
+        Value::from_i64(333), // ?3 → c
+        Value::from_i64(444), // ?4 → d
     ];
     for (i, value) in values.iter().enumerate() {
         let idx = i + 1;
@@ -269,16 +269,16 @@ fn test_insert_parameter_multiple_no_remap(tmp_db: TempDatabase) -> anyhow::Resu
     sel.run_with_row_callback(|row| {
         // insert_index = 2
         // A = 111
-        assert_eq!(row.get::<&Value>(0).unwrap(), &Value::Integer(111));
+        assert_eq!(row.get::<&Value>(0).unwrap(), &Value::from_i64(111));
         // insert_index = 4
         // B = 444
-        assert_eq!(row.get::<&Value>(1).unwrap(), &Value::Integer(222));
+        assert_eq!(row.get::<&Value>(1).unwrap(), &Value::from_i64(222));
         // insert_index = 3
         // C = 333
-        assert_eq!(row.get::<&Value>(2).unwrap(), &Value::Integer(333));
+        assert_eq!(row.get::<&Value>(2).unwrap(), &Value::from_i64(333));
         // insert_index = 1
         // D = 999
-        assert_eq!(row.get::<&Value>(3).unwrap(), &Value::Integer(444));
+        assert_eq!(row.get::<&Value>(3).unwrap(), &Value::from_i64(444));
         Ok(())
     })?;
     assert_eq!(ins.parameters().count(), 4);
@@ -303,14 +303,14 @@ fn test_insert_parameter_multiple_row(tmp_db: TempDatabase) -> anyhow::Result<()
     let mut ins = conn.prepare("insert into test (b,a,d,c) values (?, ?, ?, ?), (?, ?, ?, ?);")?;
 
     let values = [
-        Value::Integer(222), // ?1 → b
-        Value::Integer(111), // ?2 → a
-        Value::Integer(444), // ?3 → d
-        Value::Integer(333), // ?4 → c
-        Value::Integer(666), // ?1 → b
-        Value::Integer(555), // ?2 → a
-        Value::Integer(888), // ?3 → d
-        Value::Integer(777), // ?4 → c
+        Value::from_i64(222), // ?1 → b
+        Value::from_i64(111), // ?2 → a
+        Value::from_i64(444), // ?3 → d
+        Value::from_i64(333), // ?4 → c
+        Value::from_i64(666), // ?1 → b
+        Value::from_i64(555), // ?2 → a
+        Value::from_i64(888), // ?3 → d
+        Value::from_i64(777), // ?4 → c
     ];
     for (i, value) in values.iter().enumerate() {
         let idx = i + 1;
@@ -325,19 +325,19 @@ fn test_insert_parameter_multiple_row(tmp_db: TempDatabase) -> anyhow::Result<()
     sel.run_with_row_callback(|row| {
         assert_eq!(
             row.get::<&Value>(0).unwrap(),
-            &Value::Integer(if i == 0 { 111 } else { 555 })
+            &Value::from_i64(if i == 0 { 111 } else { 555 })
         );
         assert_eq!(
             row.get::<&Value>(1).unwrap(),
-            &Value::Integer(if i == 0 { 222 } else { 666 })
+            &Value::from_i64(if i == 0 { 222 } else { 666 })
         );
         assert_eq!(
             row.get::<&Value>(2).unwrap(),
-            &Value::Integer(if i == 0 { 333 } else { 777 })
+            &Value::from_i64(if i == 0 { 333 } else { 777 })
         );
         assert_eq!(
             row.get::<&Value>(3).unwrap(),
-            &Value::Integer(if i == 0 { 444 } else { 888 })
+            &Value::from_i64(if i == 0 { 444 } else { 888 })
         );
         i += 1;
         Ok(())
@@ -353,14 +353,14 @@ fn test_bind_parameters_update_query(tmp_db: TempDatabase) -> anyhow::Result<()>
     ins.run_with_row_callback(|_| panic!("unexpected row"))?;
 
     let mut ins = conn.prepare("update test set a = ? where b = ?;")?;
-    ins.bind_at(1.try_into()?, Value::Integer(222));
+    ins.bind_at(1.try_into()?, Value::from_i64(222));
     ins.bind_at(2.try_into()?, Value::build_text("test1"));
 
     ins.run_with_row_callback(|_| panic!("unexpected row"))?;
 
     let mut sel = conn.prepare("select a, b from test;")?;
     sel.run_with_row_callback(|row| {
-        assert_eq!(row.get::<&Value>(0).unwrap(), &Value::Integer(222));
+        assert_eq!(row.get::<&Value>(0).unwrap(), &Value::from_i64(222));
         assert_eq!(row.get::<&Value>(1).unwrap(), &Value::build_text("test1"),);
         Ok(())
     })?;
@@ -378,17 +378,17 @@ fn test_bind_parameters_update_query_multiple_where(tmp_db: TempDatabase) -> any
     ins.run_with_row_callback(|_| panic!("unexpected row"))?;
 
     let mut ins = conn.prepare("update test set a = ? where b = ? and c = 4 and d = ?;")?;
-    ins.bind_at(1.try_into()?, Value::Integer(222));
+    ins.bind_at(1.try_into()?, Value::from_i64(222));
     ins.bind_at(2.try_into()?, Value::build_text("test1"));
-    ins.bind_at(3.try_into()?, Value::Integer(5));
+    ins.bind_at(3.try_into()?, Value::from_i64(5));
     ins.run_with_row_callback(|_| panic!("unexpected row"))?;
 
     let mut sel = conn.prepare("select a, b, c, d from test;")?;
     sel.run_with_row_callback(|row| {
-        assert_eq!(row.get::<&Value>(0).unwrap(), &Value::Integer(222));
+        assert_eq!(row.get::<&Value>(0).unwrap(), &Value::from_i64(222));
         assert_eq!(row.get::<&Value>(1).unwrap(), &Value::build_text("test1"),);
-        assert_eq!(row.get::<&Value>(2).unwrap(), &Value::Integer(4));
-        assert_eq!(row.get::<&Value>(3).unwrap(), &Value::Integer(5));
+        assert_eq!(row.get::<&Value>(2).unwrap(), &Value::from_i64(4));
+        assert_eq!(row.get::<&Value>(3).unwrap(), &Value::from_i64(5));
         Ok(())
     })?;
     assert_eq!(ins.parameters().count(), 3);
@@ -406,19 +406,19 @@ fn test_bind_parameters_update_rowid_alias(tmp_db: TempDatabase) -> anyhow::Resu
 
     let mut sel = conn.prepare("select id, name from test;")?;
     sel.run_with_row_callback(|row| {
-        assert_eq!(row.get::<&Value>(0).unwrap(), &Value::Integer(1));
+        assert_eq!(row.get::<&Value>(0).unwrap(), &Value::from_i64(1));
         assert_eq!(row.get::<&Value>(1).unwrap(), &Value::build_text("test"),);
         Ok(())
     })?;
 
     let mut ins = conn.prepare("update test set name = ? where id = ?;")?;
     ins.bind_at(1.try_into()?, Value::build_text("updated"));
-    ins.bind_at(2.try_into()?, Value::Integer(1));
+    ins.bind_at(2.try_into()?, Value::from_i64(1));
     ins.run_with_row_callback(|_| panic!("unexpected row"))?;
 
     let mut sel = conn.prepare("select id, name from test;")?;
     sel.run_with_row_callback(|row| {
-        assert_eq!(row.get::<&Value>(0).unwrap(), &Value::Integer(1));
+        assert_eq!(row.get::<&Value>(0).unwrap(), &Value::from_i64(1));
         assert_eq!(row.get::<&Value>(1).unwrap(), &Value::build_text("updated"),);
         Ok(())
     })?;
@@ -440,12 +440,12 @@ fn test_bind_parameters_update_rowid_alias_seek_rowid(tmp_db: TempDatabase) -> a
     sel.run_with_row_callback(|row| {
         assert_eq!(
             row.get::<&Value>(0).unwrap(),
-            &Value::Integer(if i == 0 { 1 } else { 2 })
+            &Value::from_i64(if i == 0 { 1 } else { 2 })
         );
         assert_eq!(row.get::<&Value>(1).unwrap(), &Value::build_text("test"),);
         assert_eq!(
             row.get::<&Value>(2).unwrap(),
-            &Value::Integer(if i == 0 { 4 } else { 11 })
+            &Value::from_i64(if i == 0 { 4 } else { 11 })
         );
         i += 1;
         Ok(())
@@ -453,9 +453,9 @@ fn test_bind_parameters_update_rowid_alias_seek_rowid(tmp_db: TempDatabase) -> a
 
     let mut ins = conn.prepare("update test set name = ? where id < ? AND age between ? and ?;")?;
     ins.bind_at(1.try_into()?, Value::build_text("updated"));
-    ins.bind_at(2.try_into()?, Value::Integer(2));
-    ins.bind_at(3.try_into()?, Value::Integer(3));
-    ins.bind_at(4.try_into()?, Value::Integer(5));
+    ins.bind_at(2.try_into()?, Value::from_i64(2));
+    ins.bind_at(3.try_into()?, Value::from_i64(3));
+    ins.bind_at(4.try_into()?, Value::from_i64(5));
     ins.run_with_row_callback(|_| panic!("unexpected row"))?;
 
     let mut sel = conn.prepare("select name from test;")?;
@@ -486,9 +486,9 @@ fn test_bind_parameters_delete_rowid_alias_seek_out_of_order(
 
     let mut ins =
         conn.prepare("delete from test where age between ? and ? AND id > ? AND name = ?;")?;
-    ins.bind_at(1.try_into()?, Value::Integer(10));
-    ins.bind_at(2.try_into()?, Value::Integer(12));
-    ins.bind_at(3.try_into()?, Value::Integer(4));
+    ins.bind_at(1.try_into()?, Value::from_i64(10));
+    ins.bind_at(2.try_into()?, Value::from_i64(12));
+    ins.bind_at(3.try_into()?, Value::from_i64(4));
     ins.bind_at(4.try_into()?, Value::build_text("test"));
     ins.run_with_row_callback(|_| panic!("unexpected row"))?;
 
@@ -518,14 +518,14 @@ fn test_cte_alias(tmp_db: TempDatabase) -> anyhow::Result<()> {
         "WITH a1 AS (SELECT id FROM test WHERE name = 'Limbo') SELECT a2.id FROM a1 AS a2",
     )?;
     stmt1.run_with_row_callback(|row| {
-        assert_eq!(row.get::<&Value>(0).unwrap(), &Value::Integer(1));
+        assert_eq!(row.get::<&Value>(0).unwrap(), &Value::from_i64(1));
         Ok(())
     })?;
 
     let mut stmt2 = conn
         .prepare("WITH a1 AS (SELECT id FROM test WHERE name = 'Turso') SELECT a2.id FROM a1 a2")?;
     stmt2.run_with_row_callback(|row| {
-        assert_eq!(row.get::<&Value>(0).unwrap(), &Value::Integer(2));
+        assert_eq!(row.get::<&Value>(0).unwrap(), &Value::from_i64(2));
         Ok(())
     })?;
     Ok(())
@@ -551,8 +551,8 @@ fn test_cte_with_union(tmp_db: TempDatabase) -> anyhow::Result<()> {
     })?;
 
     assert_eq!(rows.len(), 2);
-    assert_eq!(rows[0][0], Value::Integer(1));
-    assert_eq!(rows[1][0], Value::Integer(99));
+    assert_eq!(rows[0][0], Value::from_i64(1));
+    assert_eq!(rows[1][0], Value::from_i64(99));
 
     // Test 2: CTE with UNION (not UNION ALL)
     let mut stmt = conn.prepare("WITH t AS (SELECT 1 as x) SELECT * FROM t UNION SELECT 2 as x")?;
@@ -576,8 +576,8 @@ fn test_cte_with_union(tmp_db: TempDatabase) -> anyhow::Result<()> {
     })?;
 
     assert_eq!(rows.len(), 2);
-    assert_eq!(rows[0][0], Value::Integer(1));
-    assert_eq!(rows[1][0], Value::Integer(2));
+    assert_eq!(rows[0][0], Value::from_i64(1));
+    assert_eq!(rows[1][0], Value::from_i64(2));
 
     Ok(())
 }
@@ -600,7 +600,7 @@ fn test_avg_agg(tmp_db: TempDatabase) -> anyhow::Result<()> {
     assert_eq!(
         rows,
         vec![vec![
-            turso_core::Value::Float((1.0 + 2.0 + 3.0 + 4.0) / (4.0)),
+            turso_core::Value::from_f64((1.0 + 2.0 + 3.0 + 4.0) / (4.0)),
             turso_core::Value::Null
         ]]
     );
@@ -619,18 +619,18 @@ fn test_offset_limit_bind(tmp_db: TempDatabase) -> anyhow::Result<()> {
             2,
             1,
             vec![
-                vec![turso_core::Value::Integer(4)],
-                vec![turso_core::Value::Integer(3)],
+                vec![turso_core::Value::from_i64(4)],
+                vec![turso_core::Value::from_i64(3)],
             ],
         ),
         (0, 0, vec![]),
-        (1, 0, vec![vec![turso_core::Value::Integer(5)]]),
+        (1, 0, vec![vec![turso_core::Value::from_i64(5)]]),
         (0, 1, vec![]),
-        (1, 1, vec![vec![turso_core::Value::Integer(4)]]),
+        (1, 1, vec![vec![turso_core::Value::from_i64(4)]]),
     ] {
         let mut stmt = conn.prepare("SELECT * FROM test LIMIT ? OFFSET ?")?;
-        stmt.bind_at(1.try_into()?, Value::Integer(limit));
-        stmt.bind_at(2.try_into()?, Value::Integer(offset));
+        stmt.bind_at(1.try_into()?, Value::from_i64(limit));
+        stmt.bind_at(2.try_into()?, Value::from_i64(offset));
 
         let mut rows = Vec::new();
         stmt.run_with_row_callback(|row| {
@@ -654,11 +654,11 @@ fn test_upsert_parameters_order(tmp_db: TempDatabase) -> anyhow::Result<()> {
     conn.execute("INSERT INTO test VALUES (1, 2), (3, 4)")?;
     let mut stmt =
         conn.prepare("INSERT INTO test VALUES (?, ?), (?, ?) ON CONFLICT DO UPDATE SET v = ?")?;
-    stmt.bind_at(1.try_into()?, Value::Integer(1));
-    stmt.bind_at(2.try_into()?, Value::Integer(20));
-    stmt.bind_at(3.try_into()?, Value::Integer(3));
-    stmt.bind_at(4.try_into()?, Value::Integer(40));
-    stmt.bind_at(5.try_into()?, Value::Integer(66));
+    stmt.bind_at(1.try_into()?, Value::from_i64(1));
+    stmt.bind_at(2.try_into()?, Value::from_i64(20));
+    stmt.bind_at(3.try_into()?, Value::from_i64(3));
+    stmt.bind_at(4.try_into()?, Value::from_i64(40));
+    stmt.bind_at(5.try_into()?, Value::from_i64(66));
     stmt.run_with_row_callback(|_| panic!("unexpected row"))?;
 
     let mut rows = Vec::new();
@@ -672,12 +672,12 @@ fn test_upsert_parameters_order(tmp_db: TempDatabase) -> anyhow::Result<()> {
         rows,
         vec![
             vec![
-                turso_core::Value::Integer(1),
-                turso_core::Value::Integer(66)
+                turso_core::Value::from_i64(1),
+                turso_core::Value::from_i64(66)
             ],
             vec![
-                turso_core::Value::Integer(3),
-                turso_core::Value::Integer(66)
+                turso_core::Value::from_i64(3),
+                turso_core::Value::from_i64(66)
             ]
         ]
     );
@@ -812,16 +812,16 @@ fn test_many_columns(tmp_db: TempDatabase) {
     assert_eq!(
         rows,
         vec![vec![
-            turso_core::Value::Integer(0),
-            turso_core::Value::Integer(100),
-            turso_core::Value::Integer(200),
-            turso_core::Value::Integer(300),
-            turso_core::Value::Integer(400),
-            turso_core::Value::Integer(500),
-            turso_core::Value::Integer(600),
-            turso_core::Value::Integer(700),
-            turso_core::Value::Integer(800),
-            turso_core::Value::Integer(900),
+            turso_core::Value::from_i64(0),
+            turso_core::Value::from_i64(100),
+            turso_core::Value::from_i64(200),
+            turso_core::Value::from_i64(300),
+            turso_core::Value::from_i64(400),
+            turso_core::Value::from_i64(500),
+            turso_core::Value::from_i64(600),
+            turso_core::Value::from_i64(700),
+            turso_core::Value::from_i64(800),
+            turso_core::Value::from_i64(900),
         ]]
     );
 }
@@ -838,16 +838,16 @@ fn test_eval_param_only_once(tmp_db: TempDatabase) {
         .unwrap();
     stmt.bind_at(
         1.try_into().unwrap(),
-        turso_core::Value::Integer(100_000_000),
+        turso_core::Value::from_i64(100_000_000),
     );
     stmt.bind_at(
         2.try_into().unwrap(),
-        turso_core::Value::Integer(100_000_000),
+        turso_core::Value::from_i64(100_000_000),
     );
     let start_time = std::time::Instant::now();
     stmt.run_with_row_callback(|row| {
         let values = row.get_values().cloned().collect::<Vec<_>>();
-        assert_eq!(values, vec![turso_core::Value::Integer(10000)]);
+        assert_eq!(values, vec![turso_core::Value::from_i64(10000)]);
         Ok(())
     })
     .unwrap();

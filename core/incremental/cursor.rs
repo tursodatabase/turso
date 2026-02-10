@@ -1,3 +1,4 @@
+use crate::numeric::Numeric;
 use crate::sync::Arc;
 use crate::sync::Mutex;
 use crate::{
@@ -134,7 +135,7 @@ impl MaterializedViewCursor {
 
         // Convert the Value to isize weight
         let weight = match weight_value {
-            Value::Integer(w) => w as isize,
+            Value::Numeric(Numeric::Integer(w)) => w as isize,
             _ => {
                 return Err(crate::LimboError::InternalError(format!(
                     "Invalid data in materialized view: expected integer weight, found {weight_value:?}"
@@ -460,8 +461,8 @@ mod tests {
         apply_changes_to_tx_state(
             &tx_state,
             vec![
-                (3, vec![Value::Integer(3), Value::Integer(30)], 1), // Insert row 3
-                (6, vec![Value::Integer(6), Value::Integer(60)], 1), // Insert row 6
+                (3, vec![Value::from_i64(3), Value::from_i64(30)], 1), // Insert row 3
+                (6, vec![Value::from_i64(6), Value::from_i64(60)], 1), // Insert row 6
             ],
         );
 
@@ -471,7 +472,7 @@ mod tests {
             .block(|| cursor.seek(SeekKey::TableRowId(3), SeekOp::GE { eq_only: true }))?;
         assert_eq!(result, SeekResult::Found);
         assert_eq!(pager.io.block(|| cursor.rowid())?, Some(3));
-        assert_eq!(pager.io.block(|| cursor.column(1))?, Value::Integer(30));
+        assert_eq!(pager.io.block(|| cursor.column(1))?, Value::from_i64(30));
 
         // Test 2: Seek GE for row 2 should find uncommitted row 3
         let result = pager
@@ -486,7 +487,7 @@ mod tests {
             .block(|| cursor.seek(SeekKey::TableRowId(5), SeekOp::GT))?;
         assert_eq!(result, SeekResult::Found);
         assert_eq!(pager.io.block(|| cursor.rowid())?, Some(6));
-        assert_eq!(pager.io.block(|| cursor.column(1))?, Value::Integer(60));
+        assert_eq!(pager.io.block(|| cursor.column(1))?, Value::from_i64(60));
 
         // Test 4: Seek LE for row 6 should find uncommitted row 6
         let result = pager
@@ -512,8 +513,8 @@ mod tests {
         apply_changes_to_tx_state(
             &tx_state,
             vec![
-                (3, vec![Value::Integer(3), Value::Integer(30)], -1), // Delete row 3
-                (5, vec![Value::Integer(5), Value::Integer(50)], -1), // Delete row 5
+                (3, vec![Value::from_i64(3), Value::from_i64(30)], -1), // Delete row 3
+                (5, vec![Value::from_i64(5), Value::from_i64(50)], -1), // Delete row 5
             ],
         );
 
@@ -561,8 +562,8 @@ mod tests {
         apply_changes_to_tx_state(
             &tx_state,
             vec![
-                (3, vec![Value::Integer(3), Value::Integer(30)], -1), // Delete old row 3
-                (3, vec![Value::Integer(3), Value::Integer(35)], 1),  // Insert new row 3
+                (3, vec![Value::from_i64(3), Value::from_i64(30)], -1), // Delete old row 3
+                (3, vec![Value::from_i64(3), Value::from_i64(35)], 1),  // Insert new row 3
             ],
         );
 
@@ -573,7 +574,7 @@ mod tests {
         assert_eq!(result, SeekResult::Found);
         assert_eq!(pager.io.block(|| cursor.rowid())?, Some(3));
         // The values should be from the uncommitted set (35 instead of 30)
-        assert_eq!(pager.io.block(|| cursor.column(1))?, Value::Integer(35));
+        assert_eq!(pager.io.block(|| cursor.column(1))?, Value::from_i64(35));
 
         Ok(())
     }
@@ -625,11 +626,11 @@ mod tests {
         apply_changes_to_tx_state(
             &tx_state,
             vec![
-                (5, vec![Value::Integer(5), Value::Integer(50)], -1), // Delete original
-                (5, vec![Value::Integer(5), Value::Integer(51)], 1),  // Insert update 1
-                (5, vec![Value::Integer(5), Value::Integer(51)], -1), // Delete update 1
-                (5, vec![Value::Integer(5), Value::Integer(52)], 1),  // Insert update 2
-                                                                      // Net effect: row 5 exists with value 52
+                (5, vec![Value::from_i64(5), Value::from_i64(50)], -1), // Delete original
+                (5, vec![Value::from_i64(5), Value::from_i64(51)], 1),  // Insert update 1
+                (5, vec![Value::from_i64(5), Value::from_i64(51)], -1), // Delete update 1
+                (5, vec![Value::from_i64(5), Value::from_i64(52)], 1),  // Insert update 2
+                                                                        // Net effect: row 5 exists with value 52
             ],
         );
 
@@ -640,7 +641,7 @@ mod tests {
         assert_eq!(result, SeekResult::Found);
         assert_eq!(pager.io.block(|| cursor.rowid())?, Some(5));
         // The final value should be 52 from the last update
-        assert_eq!(pager.io.block(|| cursor.column(1))?, Value::Integer(52));
+        assert_eq!(pager.io.block(|| cursor.column(1))?, Value::from_i64(52));
 
         Ok(())
     }
@@ -662,7 +663,11 @@ mod tests {
         assert_eq!(result, SeekResult::NotFound);
 
         // Add row 2 to uncommitted
-        tx_state.insert("test_table", 2, vec![Value::Integer(2), Value::Integer(20)]);
+        tx_state.insert(
+            "test_table",
+            2,
+            vec![Value::from_i64(2), Value::from_i64(20)],
+        );
 
         // Now seek for row 2 finds it
         let result = pager
@@ -670,7 +675,7 @@ mod tests {
             .block(|| cursor.seek(SeekKey::TableRowId(2), SeekOp::GE { eq_only: true }))?;
         assert_eq!(result, SeekResult::Found);
         assert_eq!(pager.io.block(|| cursor.rowid())?, Some(2));
-        assert_eq!(pager.io.block(|| cursor.column(1))?, Value::Integer(20));
+        assert_eq!(pager.io.block(|| cursor.column(1))?, Value::from_i64(20));
 
         Ok(())
     }
@@ -689,8 +694,8 @@ mod tests {
         apply_changes_to_tx_state(
             &tx_state,
             vec![
-                (8, vec![Value::Integer(8), Value::Integer(80)], 1),
-                (10, vec![Value::Integer(10), Value::Integer(100)], 1),
+                (8, vec![Value::from_i64(8), Value::from_i64(80)], 1),
+                (10, vec![Value::from_i64(10), Value::from_i64(100)], 1),
             ],
         );
 
@@ -718,14 +723,14 @@ mod tests {
         // Add uncommitted row 2 (smaller than any btree row)
         apply_changes_to_tx_state(
             &tx_state,
-            vec![(2, vec![Value::Integer(2), Value::Integer(20)], 1)],
+            vec![(2, vec![Value::from_i64(2), Value::from_i64(20)], 1)],
         );
 
         // Rewind should position at row 2 (uncommitted)
         pager.io.block(|| cursor.rewind())?;
         assert!(cursor.is_valid()?);
         assert_eq!(pager.io.block(|| cursor.rowid())?, Some(2));
-        assert_eq!(pager.io.block(|| cursor.column(1))?, Value::Integer(20));
+        assert_eq!(pager.io.block(|| cursor.column(1))?, Value::from_i64(20));
 
         Ok(())
     }
@@ -743,7 +748,7 @@ mod tests {
         // Delete row 1 in uncommitted
         apply_changes_to_tx_state(
             &tx_state,
-            vec![(1, vec![Value::Integer(1), Value::Integer(10)], -1)],
+            vec![(1, vec![Value::from_i64(1), Value::from_i64(10)], -1)],
         );
 
         // Rewind should skip deleted row 1 and position at row 3
@@ -765,8 +770,8 @@ mod tests {
         apply_changes_to_tx_state(
             &tx_state,
             vec![
-                (3, vec![Value::Integer(3), Value::Integer(30)], 1),
-                (7, vec![Value::Integer(7), Value::Integer(70)], 1),
+                (3, vec![Value::from_i64(3), Value::from_i64(30)], 1),
+                (7, vec![Value::from_i64(7), Value::from_i64(70)], 1),
             ],
         );
 
@@ -774,7 +779,7 @@ mod tests {
         pager.io.block(|| cursor.rewind())?;
         assert!(cursor.is_valid()?);
         assert_eq!(pager.io.block(|| cursor.rowid())?, Some(3));
-        assert_eq!(pager.io.block(|| cursor.column(1))?, Value::Integer(30));
+        assert_eq!(pager.io.block(|| cursor.column(1))?, Value::from_i64(30));
 
         Ok(())
     }
@@ -793,8 +798,8 @@ mod tests {
         apply_changes_to_tx_state(
             &tx_state,
             vec![
-                (2, vec![Value::Integer(2), Value::Integer(20)], -1),
-                (4, vec![Value::Integer(4), Value::Integer(40)], -1),
+                (2, vec![Value::from_i64(2), Value::from_i64(20)], -1),
+                (4, vec![Value::from_i64(4), Value::from_i64(40)], -1),
             ],
         );
 
@@ -820,8 +825,8 @@ mod tests {
         apply_changes_to_tx_state(
             &tx_state,
             vec![
-                (1, vec![Value::Integer(1), Value::Integer(10)], -1),
-                (1, vec![Value::Integer(1), Value::Integer(15)], 1),
+                (1, vec![Value::from_i64(1), Value::from_i64(10)], -1),
+                (1, vec![Value::from_i64(1), Value::from_i64(15)], 1),
             ],
         );
 
@@ -829,7 +834,7 @@ mod tests {
         pager.io.block(|| cursor.rewind())?;
         assert!(cursor.is_valid()?);
         assert_eq!(pager.io.block(|| cursor.rowid())?, Some(1));
-        assert_eq!(pager.io.block(|| cursor.column(1))?, Value::Integer(15));
+        assert_eq!(pager.io.block(|| cursor.column(1))?, Value::from_i64(15));
 
         Ok(())
     }
@@ -880,9 +885,9 @@ mod tests {
         apply_changes_to_tx_state(
             &tx_state,
             vec![
-                (2, vec![Value::Integer(2), Value::Integer(20)], 1),
-                (4, vec![Value::Integer(4), Value::Integer(40)], 1),
-                (6, vec![Value::Integer(6), Value::Integer(60)], 1),
+                (2, vec![Value::from_i64(2), Value::from_i64(20)], 1),
+                (4, vec![Value::from_i64(4), Value::from_i64(40)], 1),
+                (6, vec![Value::from_i64(6), Value::from_i64(60)], 1),
             ],
         );
 
@@ -919,8 +924,8 @@ mod tests {
         apply_changes_to_tx_state(
             &tx_state,
             vec![
-                (3, vec![Value::Integer(3), Value::Integer(30)], 1),
-                (7, vec![Value::Integer(7), Value::Integer(70)], 1),
+                (3, vec![Value::from_i64(3), Value::from_i64(30)], 1),
+                (7, vec![Value::from_i64(7), Value::from_i64(70)], 1),
             ],
         );
 
@@ -960,8 +965,8 @@ mod tests {
         apply_changes_to_tx_state(
             &tx_state,
             vec![
-                (2, vec![Value::Integer(2), Value::Integer(20)], -1),
-                (4, vec![Value::Integer(4), Value::Integer(40)], -1),
+                (2, vec![Value::from_i64(2), Value::from_i64(20)], -1),
+                (4, vec![Value::from_i64(4), Value::from_i64(40)], -1),
             ],
         );
 
@@ -995,8 +1000,8 @@ mod tests {
         apply_changes_to_tx_state(
             &tx_state,
             vec![
-                (3, vec![Value::Integer(3), Value::Integer(30)], -1),
-                (3, vec![Value::Integer(3), Value::Integer(35)], 1),
+                (3, vec![Value::from_i64(3), Value::from_i64(30)], -1),
+                (3, vec![Value::from_i64(3), Value::from_i64(35)], 1),
             ],
         );
 
@@ -1006,7 +1011,7 @@ mod tests {
 
         assert!(pager.io.block(|| cursor.next())?);
         assert_eq!(pager.io.block(|| cursor.rowid())?, Some(3));
-        assert_eq!(pager.io.block(|| cursor.column(1))?, Value::Integer(35)); // Updated value
+        assert_eq!(pager.io.block(|| cursor.column(1))?, Value::from_i64(35)); // Updated value
 
         assert!(pager.io.block(|| cursor.next())?);
         assert_eq!(pager.io.block(|| cursor.rowid())?, Some(5));
@@ -1074,9 +1079,9 @@ mod tests {
         apply_changes_to_tx_state(
             &tx_state,
             vec![
-                (1, vec![Value::Integer(1), Value::Integer(10)], -1),
-                (2, vec![Value::Integer(2), Value::Integer(20)], -1),
-                (3, vec![Value::Integer(3), Value::Integer(30)], -1),
+                (1, vec![Value::from_i64(1), Value::from_i64(10)], -1),
+                (2, vec![Value::from_i64(2), Value::from_i64(20)], -1),
+                (3, vec![Value::from_i64(3), Value::from_i64(30)], -1),
             ],
         );
 
@@ -1110,15 +1115,15 @@ mod tests {
         apply_changes_to_tx_state(
             &tx_state,
             vec![
-                (1, vec![Value::Integer(1), Value::Integer(10)], 1), // Insert 1
-                (2, vec![Value::Integer(2), Value::Integer(20)], -1), // Delete 2
-                (3, vec![Value::Integer(3), Value::Integer(30)], 1), // Insert 3
-                (4, vec![Value::Integer(4), Value::Integer(40)], -1), // Delete old 4
-                (4, vec![Value::Integer(4), Value::Integer(45)], 1), // Insert new 4
-                (5, vec![Value::Integer(5), Value::Integer(50)], 1), // Insert 5
-                (6, vec![Value::Integer(6), Value::Integer(60)], -1), // Delete 6
-                (7, vec![Value::Integer(7), Value::Integer(70)], 1), // Insert 7
-                (9, vec![Value::Integer(9), Value::Integer(90)], 1), // Insert 9
+                (1, vec![Value::from_i64(1), Value::from_i64(10)], 1), // Insert 1
+                (2, vec![Value::from_i64(2), Value::from_i64(20)], -1), // Delete 2
+                (3, vec![Value::from_i64(3), Value::from_i64(30)], 1), // Insert 3
+                (4, vec![Value::from_i64(4), Value::from_i64(40)], -1), // Delete old 4
+                (4, vec![Value::from_i64(4), Value::from_i64(45)], 1), // Insert new 4
+                (5, vec![Value::from_i64(5), Value::from_i64(50)], 1), // Insert 5
+                (6, vec![Value::from_i64(6), Value::from_i64(60)], -1), // Delete 6
+                (7, vec![Value::from_i64(7), Value::from_i64(70)], 1), // Insert 7
+                (9, vec![Value::from_i64(9), Value::from_i64(90)], 1), // Insert 9
             ],
         );
 
@@ -1131,7 +1136,7 @@ mod tests {
 
         assert!(pager.io.block(|| cursor.next())?);
         assert_eq!(pager.io.block(|| cursor.rowid())?, Some(4));
-        assert_eq!(pager.io.block(|| cursor.column(1))?, Value::Integer(45)); // Updated value
+        assert_eq!(pager.io.block(|| cursor.column(1))?, Value::from_i64(45)); // Updated value
 
         assert!(pager.io.block(|| cursor.next())?);
         assert_eq!(pager.io.block(|| cursor.rowid())?, Some(5));
@@ -1196,12 +1201,12 @@ mod tests {
         apply_changes_to_tx_state(
             &tx_state,
             vec![
-                (1, vec![Value::Integer(1), Value::Integer(10)], -1), // Delete original
-                (1, vec![Value::Integer(1), Value::Integer(11)], 1),  // Insert v1
-                (1, vec![Value::Integer(1), Value::Integer(11)], -1), // Delete v1
-                (1, vec![Value::Integer(1), Value::Integer(12)], 1),  // Insert v2
-                (1, vec![Value::Integer(1), Value::Integer(12)], -1), // Delete v2
-                                                                      // Net weight: 1 (btree) - 1 + 1 - 1 + 1 - 1 = 0 (row deleted)
+                (1, vec![Value::from_i64(1), Value::from_i64(10)], -1), // Delete original
+                (1, vec![Value::from_i64(1), Value::from_i64(11)], 1),  // Insert v1
+                (1, vec![Value::from_i64(1), Value::from_i64(11)], -1), // Delete v1
+                (1, vec![Value::from_i64(1), Value::from_i64(12)], 1),  // Insert v2
+                (1, vec![Value::from_i64(1), Value::from_i64(12)], -1), // Delete v2
+                                                                        // Net weight: 1 (btree) - 1 + 1 - 1 + 1 - 1 = 0 (row deleted)
             ],
         );
 
@@ -1223,9 +1228,9 @@ mod tests {
         apply_changes_to_tx_state(
             &tx_state,
             vec![
-                (100, vec![Value::Integer(100), Value::Integer(1000)], 1),
-                (500, vec![Value::Integer(500), Value::Integer(5000)], 1),
-                (999, vec![Value::Integer(999), Value::Integer(9990)], 1),
+                (100, vec![Value::from_i64(100), Value::from_i64(1000)], 1),
+                (500, vec![Value::from_i64(500), Value::from_i64(5000)], 1),
+                (999, vec![Value::from_i64(999), Value::from_i64(9990)], 1),
             ],
         );
 
@@ -1259,12 +1264,12 @@ mod tests {
         apply_changes_to_tx_state(
             &tx_state,
             vec![
-                (2, vec![Value::Integer(2), Value::Integer(20)], -1), // Delete original
-                (2, vec![Value::Integer(2), Value::Integer(25)], 1),  // First update
-                (2, vec![Value::Integer(2), Value::Integer(25)], -1), // Delete first update
-                (2, vec![Value::Integer(2), Value::Integer(28)], 1),  // Second update
-                (2, vec![Value::Integer(2), Value::Integer(28)], -1), // Delete second update
-                (2, vec![Value::Integer(2), Value::Integer(32)], 1),  // Final update
+                (2, vec![Value::from_i64(2), Value::from_i64(20)], -1), // Delete original
+                (2, vec![Value::from_i64(2), Value::from_i64(25)], 1),  // First update
+                (2, vec![Value::from_i64(2), Value::from_i64(25)], -1), // Delete first update
+                (2, vec![Value::from_i64(2), Value::from_i64(28)], 1),  // Second update
+                (2, vec![Value::from_i64(2), Value::from_i64(28)], -1), // Delete second update
+                (2, vec![Value::from_i64(2), Value::from_i64(32)], 1),  // Final update
             ],
         );
 
@@ -1274,20 +1279,20 @@ mod tests {
             .block(|| cursor.seek(SeekKey::TableRowId(2), SeekOp::GE { eq_only: true }))?;
         assert_eq!(result, SeekResult::Found);
         assert_eq!(pager.io.block(|| cursor.rowid())?, Some(2));
-        assert_eq!(pager.io.block(|| cursor.column(1))?, Value::Integer(32));
+        assert_eq!(pager.io.block(|| cursor.column(1))?, Value::from_i64(32));
 
         // Next through all rows to verify only final values are seen
         pager.io.block(|| cursor.rewind())?;
         assert_eq!(pager.io.block(|| cursor.rowid())?, Some(1));
-        assert_eq!(pager.io.block(|| cursor.column(1))?, Value::Integer(10));
+        assert_eq!(pager.io.block(|| cursor.column(1))?, Value::from_i64(10));
 
         assert!(pager.io.block(|| cursor.next())?);
         assert_eq!(pager.io.block(|| cursor.rowid())?, Some(2));
-        assert_eq!(pager.io.block(|| cursor.column(1))?, Value::Integer(32)); // Final value
+        assert_eq!(pager.io.block(|| cursor.column(1))?, Value::from_i64(32)); // Final value
 
         assert!(pager.io.block(|| cursor.next())?);
         assert_eq!(pager.io.block(|| cursor.rowid())?, Some(3));
-        assert_eq!(pager.io.block(|| cursor.column(1))?, Value::Integer(30));
+        assert_eq!(pager.io.block(|| cursor.column(1))?, Value::from_i64(30));
 
         assert!(!pager.io.block(|| cursor.next())?);
 
@@ -1308,9 +1313,9 @@ mod tests {
         apply_changes_to_tx_state(
             &tx_state,
             vec![
-                (5, vec![Value::Integer(5), Value::Integer(50)], 1),
-                (10, vec![Value::Integer(10), Value::Integer(100)], 1),
-                (15, vec![Value::Integer(15), Value::Integer(150)], 1),
+                (5, vec![Value::from_i64(5), Value::from_i64(50)], 1),
+                (10, vec![Value::from_i64(10), Value::from_i64(100)], 1),
+                (15, vec![Value::from_i64(15), Value::from_i64(150)], 1),
             ],
         );
 
@@ -1358,7 +1363,7 @@ mod tests {
         apply_changes_to_tx_state(
             &tx_state,
             vec![
-                (3, vec![Value::Integer(3), Value::Integer(35)], 1), // New version with positive weight
+                (3, vec![Value::from_i64(3), Value::from_i64(35)], 1), // New version with positive weight
             ],
         );
 
@@ -1394,12 +1399,12 @@ mod tests {
             vec![
                 (
                     i64::MIN + 1,
-                    vec![Value::Integer(i64::MIN + 1), Value::Integer(-999)],
+                    vec![Value::from_i64(i64::MIN + 1), Value::from_i64(-999)],
                     1,
                 ),
                 (
                     i64::MAX - 1,
-                    vec![Value::Integer(i64::MAX - 1), Value::Integer(999)],
+                    vec![Value::from_i64(i64::MAX - 1), Value::from_i64(999)],
                     1,
                 ),
             ],
@@ -1468,9 +1473,9 @@ mod tests {
         apply_changes_to_tx_state(
             &tx_state,
             vec![
-                (2, vec![Value::Integer(2), Value::Integer(20)], -1), // Delete btree row 2
-                (2, vec![Value::Integer(2), Value::Integer(25)], 1),  // Replace with new value
-                (4, vec![Value::Integer(4), Value::Integer(40)], -1), // Delete btree row 4
+                (2, vec![Value::from_i64(2), Value::from_i64(20)], -1), // Delete btree row 2
+                (2, vec![Value::from_i64(2), Value::from_i64(25)], 1),  // Replace with new value
+                (4, vec![Value::from_i64(4), Value::from_i64(40)], -1), // Delete btree row 4
             ],
         );
 
@@ -1480,7 +1485,7 @@ mod tests {
 
         assert!(pager.io.block(|| cursor.next())?);
         assert_eq!(pager.io.block(|| cursor.rowid())?, Some(2));
-        assert_eq!(pager.io.block(|| cursor.column(1))?, Value::Integer(25)); // New value
+        assert_eq!(pager.io.block(|| cursor.column(1))?, Value::from_i64(25)); // New value
 
         assert!(pager.io.block(|| cursor.next())?);
         assert_eq!(pager.io.block(|| cursor.rowid())?, Some(3));
@@ -1515,9 +1520,9 @@ mod tests {
         apply_changes_to_tx_state(
             &tx_state,
             vec![
-                (2, vec![Value::Integer(2), Value::Integer(20)], 1), // Insert before current
-                (4, vec![Value::Integer(4), Value::Integer(40)], 1), // Insert after current
-                (6, vec![Value::Integer(6), Value::Integer(60)], 1), // Insert at end
+                (2, vec![Value::from_i64(2), Value::from_i64(20)], 1), // Insert before current
+                (4, vec![Value::from_i64(4), Value::from_i64(40)], 1), // Insert after current
+                (6, vec![Value::from_i64(6), Value::from_i64(60)], 1), // Insert at end
             ],
         );
 
@@ -1566,7 +1571,7 @@ mod tests {
         // Add uncommitted row 2
         apply_changes_to_tx_state(
             &tx_state,
-            vec![(2, vec![Value::Integer(2), Value::Integer(20)], 1)],
+            vec![(2, vec![Value::from_i64(2), Value::from_i64(20)], 1)],
         );
 
         // Seek to non-existent row 4 with exact match

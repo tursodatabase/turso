@@ -87,6 +87,8 @@ pub use io::{
     Buffer, Completion, CompletionType, File, GroupCompletion, MemoryIO, OpenFlags, PlatformIO,
     SyscallIO, WriteCompletion, IO,
 };
+pub use numeric::nonnan::NonNan;
+pub use numeric::Numeric;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use schema::Schema;
 pub use statement::Statement;

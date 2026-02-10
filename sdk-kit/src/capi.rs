@@ -360,8 +360,15 @@ pub extern "C" fn turso_statement_row_value_kind(
     let value = statement.row_value(index);
     match value {
         Ok(turso_core::ValueRef::Null) => c::turso_type_t::TURSO_TYPE_NULL,
-        Ok(turso_core::ValueRef::Integer(..)) => c::turso_type_t::TURSO_TYPE_INTEGER,
-        Ok(turso_core::ValueRef::Float(..)) => c::turso_type_t::TURSO_TYPE_REAL,
+        Ok(turso_core::ValueRef::Numeric(turso_core::Numeric::Integer(..))) => {
+            c::turso_type_t::TURSO_TYPE_INTEGER
+        }
+        Ok(turso_core::ValueRef::Numeric(turso_core::Numeric::Float(..))) => {
+            c::turso_type_t::TURSO_TYPE_REAL
+        }
+        Ok(turso_core::ValueRef::Numeric(turso_core::Numeric::Null)) => {
+            c::turso_type_t::TURSO_TYPE_NULL
+        }
         Ok(turso_core::ValueRef::Text(..)) => c::turso_type_t::TURSO_TYPE_TEXT,
         Ok(turso_core::ValueRef::Blob(..)) => c::turso_type_t::TURSO_TYPE_BLOB,
         Err(_) => c::turso_type_t::TURSO_TYPE_UNKNOWN,
@@ -416,7 +423,7 @@ pub extern "C" fn turso_statement_row_value_int(
     };
     let value = statement.row_value(index);
     match value {
-        Ok(turso_core::ValueRef::Integer(value)) => value,
+        Ok(turso_core::ValueRef::Numeric(turso_core::Numeric::Integer(value))) => value,
         _ => 0,
     }
 }
@@ -433,7 +440,7 @@ pub extern "C" fn turso_statement_row_value_double(
     };
     let value = statement.row_value(index);
     match value {
-        Ok(turso_core::ValueRef::Float(value)) => value,
+        Ok(turso_core::ValueRef::Numeric(turso_core::Numeric::Float(value))) => f64::from(value),
         _ => 0.0,
     }
 }
@@ -495,7 +502,7 @@ pub extern "C" fn turso_statement_bind_positional_int(
         Ok(statement) => statement,
         Err(err) => return unsafe { err.to_capi(std::ptr::null_mut()) },
     };
-    match statement.bind_positional(position, turso_core::Value::Integer(value)) {
+    match statement.bind_positional(position, turso_core::Value::from_i64(value)) {
         Ok(()) => c::turso_status_code_t::TURSO_OK,
         Err(err) => unsafe { err.to_capi(std::ptr::null_mut()) },
     }
@@ -512,7 +519,7 @@ pub extern "C" fn turso_statement_bind_positional_double(
         Ok(statement) => statement,
         Err(err) => return unsafe { err.to_capi(std::ptr::null_mut()) },
     };
-    match statement.bind_positional(position, turso_core::Value::Float(value)) {
+    match statement.bind_positional(position, turso_core::Value::from_f64(value)) {
         Ok(()) => c::turso_status_code_t::TURSO_OK,
         Err(err) => unsafe { err.to_capi(std::ptr::null_mut()) },
     }
@@ -605,10 +612,10 @@ pub fn value_from_c_value(stmt: *mut c::turso_statement_t, index: usize) -> turs
             c::turso_type_t::TURSO_TYPE_UNKNOWN => panic!("unknown value kind"),
             c::turso_type_t::TURSO_TYPE_NULL => turso_core::Value::Null,
             c::turso_type_t::TURSO_TYPE_INTEGER => {
-                turso_core::Value::Integer(turso_statement_row_value_int(stmt, index))
+                turso_core::Value::from_i64(turso_statement_row_value_int(stmt, index))
             }
             c::turso_type_t::TURSO_TYPE_REAL => {
-                turso_core::Value::Float(turso_statement_row_value_double(stmt, index))
+                turso_core::Value::from_f64(turso_statement_row_value_double(stmt, index))
             }
             c::turso_type_t::TURSO_TYPE_TEXT => {
                 let ptr = turso_statement_row_value_bytes_ptr(stmt, index);
@@ -1003,8 +1010,8 @@ mod tests {
                 collected,
                 vec![
                     turso_core::Value::Null,
-                    turso_core::Value::Integer(2),
-                    turso_core::Value::Float(2.71),
+                    turso_core::Value::from_i64(2),
+                    turso_core::Value::from_f64(2.71),
                     turso_core::Value::Text(Text::new("5")),
                     turso_core::Value::Blob(vec![6]),
                 ]
@@ -1099,8 +1106,8 @@ mod tests {
                 collected,
                 vec![
                     turso_core::Value::Null,
-                    turso_core::Value::Integer(2),
-                    turso_core::Value::Float(2.71),
+                    turso_core::Value::from_i64(2),
+                    turso_core::Value::from_f64(2.71),
                     turso_core::Value::Text(Text::new("5")),
                     turso_core::Value::Blob(vec![6]),
                 ]
@@ -1211,8 +1218,8 @@ mod tests {
                 collected,
                 vec![
                     turso_core::Value::Null,
-                    turso_core::Value::Integer(2),
-                    turso_core::Value::Float(2.71),
+                    turso_core::Value::from_i64(2),
+                    turso_core::Value::from_f64(2.71),
                     turso_core::Value::Text(Text::new("5")),
                     turso_core::Value::Blob(vec![6]),
                 ]

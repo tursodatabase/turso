@@ -19,7 +19,7 @@ fn lower_long_string(bencher: Bencher) {
 
 #[divan::bench]
 fn lower_integer(bencher: Bencher) {
-    let value = Value::Integer(12345);
+    let value = Value::from_i64(12345);
     bencher.bench_local(|| black_box(black_box(&value).exec_lower()));
 }
 
@@ -37,7 +37,7 @@ fn upper_long_string(bencher: Bencher) {
 
 #[divan::bench]
 fn upper_integer(bencher: Bencher) {
-    let value = Value::Integer(12345);
+    let value = Value::from_i64(12345);
     bencher.bench_local(|| black_box(black_box(&value).exec_upper()));
 }
 
@@ -65,13 +65,13 @@ fn length_unicode_text(bencher: Bencher) {
 
 #[divan::bench]
 fn length_integer(bencher: Bencher) {
-    let value = Value::Integer(123456789);
+    let value = Value::from_i64(123456789);
     bencher.bench_local(|| black_box(black_box(&value).exec_length()));
 }
 
 #[divan::bench]
 fn length_float(bencher: Bencher) {
-    let value = Value::Float(123.456789);
+    let value = Value::from_f64(123.456789);
     bencher.bench_local(|| black_box(black_box(&value).exec_length()));
 }
 
@@ -143,8 +143,8 @@ fn rtrim_with_pattern(bencher: Bencher) {
 #[divan::bench]
 fn substring_simple(bencher: Bencher) {
     let value = Value::build_text("hello world");
-    let start = Value::Integer(1);
-    let length = Value::Integer(5);
+    let start = Value::from_i64(1);
+    let length = Value::from_i64(5);
     bencher.bench_local(|| {
         black_box(Value::exec_substring(
             black_box(&value),
@@ -157,8 +157,8 @@ fn substring_simple(bencher: Bencher) {
 #[divan::bench]
 fn substring_long_text(bencher: Bencher) {
     let value = Value::build_text("the quick brown fox jumps over the lazy dog");
-    let start = Value::Integer(5);
-    let length = Value::Integer(15);
+    let start = Value::from_i64(5);
+    let length = Value::from_i64(15);
     bencher.bench_local(|| {
         black_box(Value::exec_substring(
             black_box(&value),
@@ -171,8 +171,8 @@ fn substring_long_text(bencher: Bencher) {
 #[divan::bench]
 fn substring_unicode(bencher: Bencher) {
     let value = Value::build_text("héllo wörld 你好");
-    let start = Value::Integer(1);
-    let length = Value::Integer(10);
+    let start = Value::from_i64(1);
+    let length = Value::from_i64(10);
     bencher.bench_local(|| {
         black_box(Value::exec_substring(
             black_box(&value),
@@ -185,8 +185,8 @@ fn substring_unicode(bencher: Bencher) {
 #[divan::bench]
 fn substring_negative_start(bencher: Bencher) {
     let value = Value::build_text("hello world");
-    let start = Value::Integer(-5);
-    let length = Value::Integer(5);
+    let start = Value::from_i64(-5);
+    let length = Value::from_i64(5);
     bencher.bench_local(|| {
         black_box(Value::exec_substring(
             black_box(&value),
@@ -199,8 +199,8 @@ fn substring_negative_start(bencher: Bencher) {
 #[divan::bench]
 fn substring_blob(bencher: Bencher) {
     let value = Value::Blob(b"hello world".to_vec());
-    let start = Value::Integer(1);
-    let length = Value::Integer(5);
+    let start = Value::from_i64(1);
+    let length = Value::from_i64(5);
     bencher.bench_local(|| {
         black_box(Value::exec_substring(
             black_box(&value),
@@ -306,7 +306,7 @@ fn quote_text_with_quotes(bencher: Bencher) {
 
 #[divan::bench]
 fn quote_integer(bencher: Bencher) {
-    let value = Value::Integer(12345);
+    let value = Value::from_i64(12345);
     bencher.bench_local(|| black_box(black_box(&value).exec_quote()));
 }
 
@@ -350,13 +350,13 @@ fn soundex_non_ascii(bencher: Bencher) {
 
 #[divan::bench]
 fn typeof_integer(bencher: Bencher) {
-    let value = Value::Integer(12345);
+    let value = Value::from_i64(12345);
     bencher.bench_local(|| black_box(black_box(&value).exec_typeof()));
 }
 
 #[divan::bench]
 fn typeof_float(bencher: Bencher) {
-    let value = Value::Float(123.456);
+    let value = Value::from_f64(123.456);
     bencher.bench_local(|| black_box(black_box(&value).exec_typeof()));
 }
 
@@ -384,13 +384,13 @@ fn typeof_null(bencher: Bencher) {
 
 #[divan::bench]
 fn cast_integer_to_text(bencher: Bencher) {
-    let value = Value::Integer(12345);
+    let value = Value::from_i64(12345);
     bencher.bench_local(|| black_box(black_box(&value).exec_cast("TEXT")));
 }
 
 #[divan::bench]
 fn cast_float_to_integer(bencher: Bencher) {
-    let value = Value::Float(123.456);
+    let value = Value::from_f64(123.456);
     bencher.bench_local(|| black_box(black_box(&value).exec_cast("INT")));
 }
 
@@ -436,7 +436,7 @@ fn hex_blob(bencher: Bencher) {
 
 #[divan::bench]
 fn hex_integer(bencher: Bencher) {
-    let value = Value::Integer(255);
+    let value = Value::from_i64(255);
     bencher.bench_local(|| black_box(black_box(&value).exec_hex()));
 }
 
@@ -481,19 +481,19 @@ fn unicode_cjk(bencher: Bencher) {
 
 #[divan::bench]
 fn abs_positive_integer(bencher: Bencher) {
-    let value = Value::Integer(12345);
+    let value = Value::from_i64(12345);
     bencher.bench_local(|| black_box(black_box(&value).exec_abs()));
 }
 
 #[divan::bench]
 fn abs_negative_integer(bencher: Bencher) {
-    let value = Value::Integer(-12345);
+    let value = Value::from_i64(-12345);
     bencher.bench_local(|| black_box(black_box(&value).exec_abs()));
 }
 
 #[divan::bench]
 fn abs_float(bencher: Bencher) {
-    let value = Value::Float(-123.456);
+    let value = Value::from_f64(-123.456);
     bencher.bench_local(|| black_box(black_box(&value).exec_abs()));
 }
 
@@ -505,25 +505,25 @@ fn abs_text_numeric(bencher: Bencher) {
 
 #[divan::bench]
 fn sign_positive(bencher: Bencher) {
-    let value = Value::Integer(42);
+    let value = Value::from_i64(42);
     bencher.bench_local(|| black_box(black_box(&value).exec_sign()));
 }
 
 #[divan::bench]
 fn sign_negative(bencher: Bencher) {
-    let value = Value::Integer(-42);
+    let value = Value::from_i64(-42);
     bencher.bench_local(|| black_box(black_box(&value).exec_sign()));
 }
 
 #[divan::bench]
 fn sign_zero(bencher: Bencher) {
-    let value = Value::Integer(0);
+    let value = Value::from_i64(0);
     bencher.bench_local(|| black_box(black_box(&value).exec_sign()));
 }
 
 #[divan::bench]
 fn sign_float(bencher: Bencher) {
-    let value = Value::Float(-42.5);
+    let value = Value::from_f64(-42.5);
     bencher.bench_local(|| black_box(black_box(&value).exec_sign()));
 }
 
@@ -533,21 +533,21 @@ fn sign_float(bencher: Bencher) {
 
 #[divan::bench]
 fn round_no_precision(bencher: Bencher) {
-    let value = Value::Float(123.456);
+    let value = Value::from_f64(123.456);
     bencher.bench_local(|| black_box(black_box(&value).exec_round(None)));
 }
 
 #[divan::bench]
 fn round_with_precision(bencher: Bencher) {
-    let value = Value::Float(123.456789);
-    let precision = Value::Integer(2);
+    let value = Value::from_f64(123.456789);
+    let precision = Value::from_i64(2);
     bencher.bench_local(|| black_box(black_box(&value).exec_round(Some(black_box(&precision)))));
 }
 
 #[divan::bench]
 fn round_high_precision(bencher: Bencher) {
-    let value = Value::Float(std::f64::consts::PI);
-    let precision = Value::Integer(10);
+    let value = Value::from_f64(std::f64::consts::PI);
+    let precision = Value::from_i64(10);
     bencher.bench_local(|| black_box(black_box(&value).exec_round(Some(black_box(&precision)))));
 }
 
@@ -557,21 +557,21 @@ fn round_high_precision(bencher: Bencher) {
 
 #[divan::bench]
 fn log_base_10(bencher: Bencher) {
-    let value = Value::Float(100.0);
+    let value = Value::from_f64(100.0);
     bencher.bench_local(|| black_box(black_box(&value).exec_math_log(None)));
 }
 
 #[divan::bench]
 fn log_base_2(bencher: Bencher) {
-    let value = Value::Float(8.0);
-    let base = Value::Float(2.0);
+    let value = Value::from_f64(8.0);
+    let base = Value::from_f64(2.0);
     bencher.bench_local(|| black_box(black_box(&value).exec_math_log(Some(black_box(&base)))));
 }
 
 #[divan::bench]
 fn log_arbitrary_base(bencher: Bencher) {
-    let value = Value::Float(100.0);
-    let base = Value::Float(7.0);
+    let value = Value::from_f64(100.0);
+    let base = Value::from_f64(7.0);
     bencher.bench_local(|| black_box(black_box(&value).exec_math_log(Some(black_box(&base)))));
 }
 
@@ -581,50 +581,50 @@ fn log_arbitrary_base(bencher: Bencher) {
 
 #[divan::bench]
 fn add_integers(bencher: Bencher) {
-    let a = Value::Integer(1000);
-    let b = Value::Integer(2000);
+    let a = Value::from_i64(1000);
+    let b = Value::from_i64(2000);
     bencher.bench_local(|| black_box(black_box(&a).exec_add(black_box(&b))));
 }
 
 #[divan::bench]
 fn add_floats(bencher: Bencher) {
-    let a = Value::Float(100.5);
-    let b = Value::Float(200.5);
+    let a = Value::from_f64(100.5);
+    let b = Value::from_f64(200.5);
     bencher.bench_local(|| black_box(black_box(&a).exec_add(black_box(&b))));
 }
 
 #[divan::bench]
 fn add_mixed(bencher: Bencher) {
-    let a = Value::Integer(100);
-    let b = Value::Float(200.5);
+    let a = Value::from_i64(100);
+    let b = Value::from_f64(200.5);
     bencher.bench_local(|| black_box(black_box(&a).exec_add(black_box(&b))));
 }
 
 #[divan::bench]
 fn subtract_integers(bencher: Bencher) {
-    let a = Value::Integer(2000);
-    let b = Value::Integer(1000);
+    let a = Value::from_i64(2000);
+    let b = Value::from_i64(1000);
     bencher.bench_local(|| black_box(black_box(&a).exec_subtract(black_box(&b))));
 }
 
 #[divan::bench]
 fn multiply_integers(bencher: Bencher) {
-    let a = Value::Integer(100);
-    let b = Value::Integer(200);
+    let a = Value::from_i64(100);
+    let b = Value::from_i64(200);
     bencher.bench_local(|| black_box(black_box(&a).exec_multiply(black_box(&b))));
 }
 
 #[divan::bench]
 fn divide_integers(bencher: Bencher) {
-    let a = Value::Integer(1000);
-    let b = Value::Integer(10);
+    let a = Value::from_i64(1000);
+    let b = Value::from_i64(10);
     bencher.bench_local(|| black_box(black_box(&a).exec_divide(black_box(&b))));
 }
 
 #[divan::bench]
 fn remainder_integers(bencher: Bencher) {
-    let a = Value::Integer(17);
-    let b = Value::Integer(5);
+    let a = Value::from_i64(17);
+    let b = Value::from_i64(5);
     bencher.bench_local(|| black_box(black_box(&a).exec_remainder(black_box(&b))));
 }
 
@@ -634,35 +634,35 @@ fn remainder_integers(bencher: Bencher) {
 
 #[divan::bench]
 fn bit_and(bencher: Bencher) {
-    let a = Value::Integer(0b11110000);
-    let b = Value::Integer(0b10101010);
+    let a = Value::from_i64(0b11110000);
+    let b = Value::from_i64(0b10101010);
     bencher.bench_local(|| black_box(black_box(&a).exec_bit_and(black_box(&b))));
 }
 
 #[divan::bench]
 fn bit_or(bencher: Bencher) {
-    let a = Value::Integer(0b11110000);
-    let b = Value::Integer(0b00001111);
+    let a = Value::from_i64(0b11110000);
+    let b = Value::from_i64(0b00001111);
     bencher.bench_local(|| black_box(black_box(&a).exec_bit_or(black_box(&b))));
 }
 
 #[divan::bench]
 fn bit_not(bencher: Bencher) {
-    let a = Value::Integer(0b11110000);
+    let a = Value::from_i64(0b11110000);
     bencher.bench_local(|| black_box(black_box(&a).exec_bit_not()));
 }
 
 #[divan::bench]
 fn shift_left(bencher: Bencher) {
-    let a = Value::Integer(1);
-    let b = Value::Integer(8);
+    let a = Value::from_i64(1);
+    let b = Value::from_i64(8);
     bencher.bench_local(|| black_box(black_box(&a).exec_shift_left(black_box(&b))));
 }
 
 #[divan::bench]
 fn shift_right(bencher: Bencher) {
-    let a = Value::Integer(256);
-    let b = Value::Integer(4);
+    let a = Value::from_i64(256);
+    let b = Value::from_i64(4);
     bencher.bench_local(|| black_box(black_box(&a).exec_shift_right(black_box(&b))));
 }
 
@@ -672,41 +672,41 @@ fn shift_right(bencher: Bencher) {
 
 #[divan::bench]
 fn boolean_not_true(bencher: Bencher) {
-    let value = Value::Integer(1);
+    let value = Value::from_i64(1);
     bencher.bench_local(|| black_box(black_box(&value).exec_boolean_not()));
 }
 
 #[divan::bench]
 fn boolean_not_false(bencher: Bencher) {
-    let value = Value::Integer(0);
+    let value = Value::from_i64(0);
     bencher.bench_local(|| black_box(black_box(&value).exec_boolean_not()));
 }
 
 #[divan::bench]
 fn and_true_true(bencher: Bencher) {
-    let a = Value::Integer(1);
-    let b = Value::Integer(1);
+    let a = Value::from_i64(1);
+    let b = Value::from_i64(1);
     bencher.bench_local(|| black_box(black_box(&a).exec_and(black_box(&b))));
 }
 
 #[divan::bench]
 fn and_true_false(bencher: Bencher) {
-    let a = Value::Integer(1);
-    let b = Value::Integer(0);
+    let a = Value::from_i64(1);
+    let b = Value::from_i64(0);
     bencher.bench_local(|| black_box(black_box(&a).exec_and(black_box(&b))));
 }
 
 #[divan::bench]
 fn or_false_false(bencher: Bencher) {
-    let a = Value::Integer(0);
-    let b = Value::Integer(0);
+    let a = Value::from_i64(0);
+    let b = Value::from_i64(0);
     bencher.bench_local(|| black_box(black_box(&a).exec_or(black_box(&b))));
 }
 
 #[divan::bench]
 fn or_true_false(bencher: Bencher) {
-    let a = Value::Integer(1);
-    let b = Value::Integer(0);
+    let a = Value::from_i64(1);
+    let b = Value::from_i64(0);
     bencher.bench_local(|| black_box(black_box(&a).exec_or(black_box(&b))));
 }
 
@@ -724,7 +724,7 @@ fn concat_two_strings(bencher: Bencher) {
 #[divan::bench]
 fn concat_string_integer(bencher: Bencher) {
     let a = Value::build_text("count: ");
-    let b = Value::Integer(42);
+    let b = Value::from_i64(42);
     bencher.bench_local(|| black_box(black_box(&a).exec_concat(black_box(&b))));
 }
 
@@ -763,18 +763,18 @@ fn concat_ws_strings(bencher: Bencher) {
 
 #[divan::bench]
 fn char_single(bencher: Bencher) {
-    let values = [Value::Integer(65)];
+    let values = [Value::from_i64(65)];
     bencher.bench_local(|| black_box(Value::exec_char(black_box(values.iter()))));
 }
 
 #[divan::bench]
 fn char_multiple(bencher: Bencher) {
     let values = [
-        Value::Integer(72),
-        Value::Integer(101),
-        Value::Integer(108),
-        Value::Integer(108),
-        Value::Integer(111),
+        Value::from_i64(72),
+        Value::from_i64(101),
+        Value::from_i64(108),
+        Value::from_i64(108),
+        Value::from_i64(111),
     ];
     bencher.bench_local(|| black_box(Value::exec_char(black_box(values.iter()))));
 }
@@ -786,11 +786,11 @@ fn char_multiple(bencher: Bencher) {
 #[divan::bench]
 fn min_integers(bencher: Bencher) {
     let values = [
-        Value::Integer(5),
-        Value::Integer(3),
-        Value::Integer(8),
-        Value::Integer(1),
-        Value::Integer(9),
+        Value::from_i64(5),
+        Value::from_i64(3),
+        Value::from_i64(8),
+        Value::from_i64(1),
+        Value::from_i64(9),
     ];
     bencher.bench_local(|| black_box(Value::exec_min(black_box(values.iter()))));
 }
@@ -798,11 +798,11 @@ fn min_integers(bencher: Bencher) {
 #[divan::bench]
 fn max_integers(bencher: Bencher) {
     let values = [
-        Value::Integer(5),
-        Value::Integer(3),
-        Value::Integer(8),
-        Value::Integer(1),
-        Value::Integer(9),
+        Value::from_i64(5),
+        Value::from_i64(3),
+        Value::from_i64(8),
+        Value::from_i64(1),
+        Value::from_i64(9),
     ];
     bencher.bench_local(|| black_box(Value::exec_max(black_box(values.iter()))));
 }
@@ -833,15 +833,15 @@ fn max_strings(bencher: Bencher) {
 
 #[divan::bench]
 fn nullif_equal(bencher: Bencher) {
-    let a = Value::Integer(42);
-    let b = Value::Integer(42);
+    let a = Value::from_i64(42);
+    let b = Value::from_i64(42);
     bencher.bench_local(|| black_box(black_box(&a).exec_nullif(black_box(&b))));
 }
 
 #[divan::bench]
 fn nullif_not_equal(bencher: Bencher) {
-    let a = Value::Integer(42);
-    let b = Value::Integer(100);
+    let a = Value::from_i64(42);
+    let b = Value::from_i64(100);
     bencher.bench_local(|| black_box(black_box(&a).exec_nullif(black_box(&b))));
 }
 
@@ -858,19 +858,19 @@ fn nullif_strings(bencher: Bencher) {
 
 #[divan::bench]
 fn zeroblob_small(bencher: Bencher) {
-    let value = Value::Integer(10);
+    let value = Value::from_i64(10);
     bencher.bench_local(|| black_box(black_box(&value).exec_zeroblob().unwrap()));
 }
 
 #[divan::bench]
 fn zeroblob_medium(bencher: Bencher) {
-    let value = Value::Integer(1000);
+    let value = Value::from_i64(1000);
     bencher.bench_local(|| black_box(black_box(&value).exec_zeroblob().unwrap()));
 }
 
 #[divan::bench]
 fn zeroblob_large(bencher: Bencher) {
-    let value = Value::Integer(10000);
+    let value = Value::from_i64(10000);
     bencher.bench_local(|| black_box(black_box(&value).exec_zeroblob().unwrap()));
 }
 
@@ -880,13 +880,13 @@ fn zeroblob_large(bencher: Bencher) {
 
 #[divan::bench]
 fn exec_if_true(bencher: Bencher) {
-    let value = Value::Integer(1);
+    let value = Value::from_i64(1);
     bencher.bench_local(|| black_box(black_box(&value).exec_if(false, false)));
 }
 
 #[divan::bench]
 fn exec_if_false(bencher: Bencher) {
-    let value = Value::Integer(0);
+    let value = Value::from_i64(0);
     bencher.bench_local(|| black_box(black_box(&value).exec_if(false, false)));
 }
 
@@ -898,7 +898,7 @@ fn exec_if_null(bencher: Bencher) {
 
 #[divan::bench]
 fn exec_if_not(bencher: Bencher) {
-    let value = Value::Integer(1);
+    let value = Value::from_i64(1);
     bencher.bench_local(|| black_box(black_box(&value).exec_if(false, true)));
 }
 
@@ -965,7 +965,7 @@ fn exec_random(bencher: Bencher) {
 
 #[divan::bench]
 fn exec_randomblob_small(bencher: Bencher) {
-    let length = Value::Integer(10);
+    let length = Value::from_i64(10);
     bencher.bench_local(|| {
         black_box(
             black_box(&length)
@@ -977,7 +977,7 @@ fn exec_randomblob_small(bencher: Bencher) {
 
 #[divan::bench]
 fn exec_randomblob_medium(bencher: Bencher) {
-    let length = Value::Integer(100);
+    let length = Value::from_i64(100);
     bencher.bench_local(|| {
         black_box(
             black_box(&length)
@@ -989,7 +989,7 @@ fn exec_randomblob_medium(bencher: Bencher) {
 
 #[divan::bench]
 fn exec_randomblob_large(bencher: Bencher) {
-    let length = Value::Integer(1000);
+    let length = Value::from_i64(1000);
     bencher.bench_local(|| {
         black_box(
             black_box(&length)

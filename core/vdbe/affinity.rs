@@ -2,7 +2,7 @@ use either::Either;
 use turso_parser::ast::{Expr, Literal};
 
 use crate::{
-    numeric::{format_float, DoubleDouble},
+    numeric::{format_float, DoubleDouble, Numeric},
     types::AsValueRef,
     Value, ValueRef,
 };
@@ -188,8 +188,12 @@ impl Affinity {
             Affinity::Text => {
                 // TEXT affinity: Convert numeric values to their text representation
                 match val {
-                    ValueRef::Integer(i) => Some(Either::Right(Value::Text(i.to_string().into()))),
-                    ValueRef::Float(f) => Some(Either::Right(Value::Text(format_float(f).into()))),
+                    ValueRef::Numeric(Numeric::Integer(i)) => {
+                        Some(Either::Right(Value::Text(i.to_string().into())))
+                    }
+                    ValueRef::Numeric(Numeric::Float(f)) => Some(Either::Right(Value::Text(
+                        format_float(f64::from(f)).into(),
+                    ))),
                     ValueRef::Text(_) => {
                         // If it's already text but looks numeric, ensure it's in canonical text form
                         if is_numeric_value(val) {
@@ -207,8 +211,8 @@ impl Affinity {
                     .then(|| apply_numeric_affinity(val, false))
                     .flatten();
 
-                if let ValueRef::Integer(i) = left.unwrap_or(val) {
-                    left = Some(ValueRef::Float(i as f64));
+                if let ValueRef::Numeric(Numeric::Integer(i)) = left.unwrap_or(val) {
+                    left = Some(ValueRef::from_f64(i as f64));
                 }
 
                 left.map(Either::Left)
@@ -516,15 +520,16 @@ fn real_to_i64(r: f64) -> i64 {
 }
 
 fn apply_integer_affinity(val: ValueRef) -> Option<ValueRef> {
-    let ValueRef::Float(f) = val else {
+    let ValueRef::Numeric(Numeric::Float(nn)) = val else {
         return None;
     };
 
+    let f: f64 = nn.into();
     let ix = real_to_i64(f);
 
     // Only convert if round-trip is exact and not at extreme values
     if f == (ix as f64) && ix > i64::MIN && ix < i64::MAX {
-        Some(ValueRef::Integer(ix))
+        Some(ValueRef::Numeric(Numeric::Integer(ix)))
     } else {
         None
     }
@@ -549,9 +554,9 @@ pub fn apply_numeric_affinity(val: ValueRef, try_for_int: bool) -> Option<ValueR
         }
         NumericParseResult::PureInteger => {
             if let Some(int_val) = parsed_value.as_integer() {
-                Some(ValueRef::Integer(int_val))
+                Some(ValueRef::Numeric(Numeric::Integer(int_val)))
             } else if let Some(float_val) = parsed_value.as_float() {
-                let res = ValueRef::Float(float_val);
+                let res = ValueRef::from_f64(float_val);
                 if try_for_int {
                     apply_integer_affinity(res)
                 } else {
@@ -563,7 +568,7 @@ pub fn apply_numeric_affinity(val: ValueRef, try_for_int: bool) -> Option<ValueR
         }
         NumericParseResult::HasDecimalOrExp => {
             if let Some(float_val) = parsed_value.as_float() {
-                let res = ValueRef::Float(float_val);
+                let res = ValueRef::from_f64(float_val);
                 // If try_for_int is true, try to convert float to int if exact
                 if try_for_int {
                     apply_integer_affinity(res)
@@ -578,14 +583,14 @@ pub fn apply_numeric_affinity(val: ValueRef, try_for_int: bool) -> Option<ValueR
 }
 
 fn is_numeric_value(val: ValueRef) -> bool {
-    matches!(val, ValueRef::Integer(_) | ValueRef::Float(_))
+    matches!(val, ValueRef::Numeric(_))
 }
 
 fn stringify_register(val: ValueRef) -> Option<Value> {
     match val {
-        ValueRef::Integer(i) => Some(Value::build_text(i.to_string())),
-        ValueRef::Float(f) => Some(Value::build_text(f.to_string())),
-        ValueRef::Text(_) | ValueRef::Null | ValueRef::Blob(_) => None,
+        ValueRef::Numeric(Numeric::Integer(i)) => Some(Value::build_text(i.to_string())),
+        ValueRef::Numeric(Numeric::Float(f)) => Some(Value::build_text(f64::from(f).to_string())),
+        _ => None,
     }
 }
 
@@ -612,19 +617,19 @@ mod tests {
     fn test_apply_numeric_affinity_complete_numbers() {
         let val = Value::Text("123".into());
         let res = apply_numeric_affinity(val.as_value_ref(), false);
-        assert_eq!(res, Some(ValueRef::Integer(123)));
+        assert_eq!(res, Some(ValueRef::Numeric(Numeric::Integer(123))));
 
         let val = Value::Text("123.45".into());
         let res = apply_numeric_affinity(val.as_value_ref(), false);
-        assert_eq!(res, Some(ValueRef::Float(123.45)));
+        assert_eq!(res, Some(ValueRef::from_f64(123.45)));
 
         let val = Value::Text("  -456  ".into());
         let res = apply_numeric_affinity(val.as_value_ref(), false);
-        assert_eq!(res, Some(ValueRef::Integer(-456)));
+        assert_eq!(res, Some(ValueRef::Numeric(Numeric::Integer(-456))));
 
         let val = Value::Text("0".into());
         let res = apply_numeric_affinity(val.as_value_ref(), false);
-        assert_eq!(res, Some(ValueRef::Integer(0)));
+        assert_eq!(res, Some(ValueRef::Numeric(Numeric::Integer(0))));
     }
 
     #[test]

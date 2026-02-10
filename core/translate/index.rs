@@ -717,8 +717,8 @@ pub fn resolve_index_method_parameters(
             Expr::Literal(literal) => match literal {
                 ast::Literal::Numeric(s) => match Numeric::from(s) {
                     Numeric::Null => crate::Value::Null,
-                    Numeric::Integer(v) => crate::Value::Integer(v),
-                    Numeric::Float(v) => crate::Value::Float(v.into()),
+                    Numeric::Integer(v) => crate::Value::Numeric(Numeric::Integer(v)),
+                    Numeric::Float(v) => crate::Value::Numeric(Numeric::Float(v)),
                 },
                 ast::Literal::Null => crate::Value::Null,
                 ast::Literal::String(s) => crate::Value::Text(s.into()),

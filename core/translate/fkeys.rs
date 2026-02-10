@@ -1251,7 +1251,7 @@ fn emit_fk_action_subprogram(
         .old_key_registers
         .iter()
         .copied()
-        .map(|reg_idx| Value::Integer(reg_idx as i64))
+        .map(|reg_idx| Value::from_i64(reg_idx as i64))
         .collect();
 
     if let Some(new_regs) = &ctx.new_key_registers {
@@ -1259,7 +1259,7 @@ fn emit_fk_action_subprogram(
             new_regs
                 .iter()
                 .copied()
-                .map(|reg_idx| Value::Integer(reg_idx as i64)),
+                .map(|reg_idx| Value::from_i64(reg_idx as i64)),
         );
     }
 

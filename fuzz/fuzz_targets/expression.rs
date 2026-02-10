@@ -74,14 +74,8 @@ impl From<Value> for turso_core::Value {
     fn from(value: Value) -> turso_core::Value {
         match value {
             Value::Null => turso_core::Value::Null,
-            Value::Integer(v) => turso_core::Value::Integer(v),
-            Value::Real(v) => {
-                if v.is_nan() {
-                    turso_core::Value::Null
-                } else {
-                    turso_core::Value::Float(v)
-                }
-            }
+            Value::Integer(v) => turso_core::Value::from_i64(v),
+            Value::Real(v) => turso_core::Value::from_f64(v),
             Value::Text(v) => turso_core::Value::from_text(&v),
             Value::Blob(v) => turso_core::Value::from_blob(v.to_owned()),
         }

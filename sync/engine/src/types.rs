@@ -473,7 +473,7 @@ impl std::fmt::Debug for DatabaseTapeRowChangeType {
 
 fn get_core_value_i64(row: &turso_core::Row, index: usize) -> Result<i64> {
     match row.get_value(index) {
-        turso_core::Value::Integer(v) => Ok(*v),
+        turso_core::Value::Numeric(turso_core::Numeric::Integer(v)) => Ok(*v),
         v => Err(Error::DatabaseTapeError(format!(
             "column {index} type mismatch: expected integer, got '{v:?}'"
         ))),

@@ -1,6 +1,7 @@
 use core::f64;
 use std::fmt::Write;
 
+use crate::numeric::Numeric;
 use crate::types::Value;
 use crate::vdbe::Register;
 use crate::LimboError;
@@ -52,14 +53,15 @@ pub fn exec_printf(values: &[Register]) -> crate::Result<Value> {
     let format_str = match &format_value {
         Value::Text(t) => t.as_str(),
         Value::Null => return Ok(Value::Null),
-        Value::Integer(i) => {
+        Value::Numeric(Numeric::Integer(i)) => {
             format_string = i.to_string();
             format_string.as_str()
         }
-        Value::Float(f) => {
-            format_string = f.to_string();
+        Value::Numeric(Numeric::Float(f)) => {
+            format_string = f64::from(*f).to_string();
             format_string.as_str()
         }
+        Value::Numeric(Numeric::Null) => return Ok(Value::Null),
         Value::Blob(b) => {
             // Blob to string - use lossy UTF-8 conversion like SQLite
             format_string = String::from_utf8_lossy(b).to_string();
@@ -88,9 +90,9 @@ pub fn exec_printf(values: &[Register]) -> crate::Result<Value> {
                 }
                 let value = &values[args_index].get_value();
                 match value {
-                    Value::Integer(i) => result.push_str(&i.to_string()),
-                    Value::Float(f) => {
-                        let truncated_val = *f as i64;
+                    Value::Numeric(Numeric::Integer(i)) => result.push_str(&i.to_string()),
+                    Value::Numeric(Numeric::Float(f)) => {
+                        let truncated_val = f64::from(*f) as i64;
                         result.push_str(&truncated_val.to_string());
                     }
                     _ => result.push('0'),
@@ -103,7 +105,7 @@ pub fn exec_printf(values: &[Register]) -> crate::Result<Value> {
                 }
                 let value = &values[args_index].get_value();
                 match value {
-                    Value::Integer(_) => {
+                    Value::Numeric(Numeric::Integer(_)) => {
                         let converted_value = value.as_uint();
                         write!(result, "{converted_value}")
                             .expect("write! to a String cannot fail; it panics on OOM");
@@ -130,9 +132,9 @@ pub fn exec_printf(values: &[Register]) -> crate::Result<Value> {
                 }
                 let value = &values[args_index].get_value();
                 match value {
-                    Value::Float(f) => write!(result, "{:.6}", *f)
+                    Value::Numeric(Numeric::Float(f)) => write!(result, "{:.6}", f64::from(*f))
                         .expect("write! to a String cannot fail; it panics on OOM"),
-                    Value::Integer(i) => write!(result, "{:.6}", *i as f64)
+                    Value::Numeric(Numeric::Integer(i)) => write!(result, "{:.6}", *i as f64)
                         .expect("write! to a String cannot fail; it panics on OOM"),
                     _ => result.push_str("0.000000"),
                 }
@@ -144,11 +146,14 @@ pub fn exec_printf(values: &[Register]) -> crate::Result<Value> {
                 }
                 let value = &values[args_index].get_value();
                 match value {
-                    Value::Float(f) => match get_exponential_formatted_str(f, false) {
-                        Ok(str) => result.push_str(&str),
-                        Err(e) => return Err(e),
-                    },
-                    Value::Integer(i) => {
+                    Value::Numeric(Numeric::Float(f)) => {
+                        let f = f64::from(*f);
+                        match get_exponential_formatted_str(&f, false) {
+                            Ok(str) => result.push_str(&str),
+                            Err(e) => return Err(e),
+                        }
+                    }
+                    Value::Numeric(Numeric::Integer(i)) => {
                         let f = *i as f64;
                         match get_exponential_formatted_str(&f, false) {
                             Ok(str) => result.push_str(&str),
@@ -177,11 +182,14 @@ pub fn exec_printf(values: &[Register]) -> crate::Result<Value> {
                 }
                 let value = &values[args_index].get_value();
                 match value {
-                    Value::Float(f) => match get_exponential_formatted_str(f, true) {
-                        Ok(str) => result.push_str(&str),
-                        Err(e) => return Err(e),
-                    },
-                    Value::Integer(i) => {
+                    Value::Numeric(Numeric::Float(f)) => {
+                        let f = f64::from(*f);
+                        match get_exponential_formatted_str(&f, true) {
+                            Ok(str) => result.push_str(&str),
+                            Err(e) => return Err(e),
+                        }
+                    }
+                    Value::Numeric(Numeric::Integer(i)) => {
                         let f = *i as f64;
                         match get_exponential_formatted_str(&f, true) {
                             Ok(str) => result.push_str(&str),
@@ -227,9 +235,11 @@ pub fn exec_printf(values: &[Register]) -> crate::Result<Value> {
                 }
                 let value = &values[args_index].get_value();
                 match value {
-                    Value::Float(f) => write!(result, "{:x}", *f as i64)
-                        .expect("write! to a String cannot fail; it panics on OOM"),
-                    Value::Integer(i) => write!(result, "{i:x}")
+                    Value::Numeric(Numeric::Float(f)) => {
+                        write!(result, "{:x}", f64::from(*f) as i64)
+                            .expect("write! to a String cannot fail; it panics on OOM")
+                    }
+                    Value::Numeric(Numeric::Integer(i)) => write!(result, "{i:x}")
                         .expect("write! to a String cannot fail; it panics on OOM"),
                     Value::Text(s) => {
                         let i: i64 = s.as_str().parse::<i64>().unwrap_or(0);
@@ -246,9 +256,11 @@ pub fn exec_printf(values: &[Register]) -> crate::Result<Value> {
                 }
                 let value = &values[args_index].get_value();
                 match value {
-                    Value::Float(f) => write!(result, "{:X}", *f as i64)
-                        .expect("write! to a String cannot fail; it panics on OOM"),
-                    Value::Integer(i) => write!(result, "{i:X}")
+                    Value::Numeric(Numeric::Float(f)) => {
+                        write!(result, "{:X}", f64::from(*f) as i64)
+                            .expect("write! to a String cannot fail; it panics on OOM")
+                    }
+                    Value::Numeric(Numeric::Integer(i)) => write!(result, "{i:X}")
                         .expect("write! to a String cannot fail; it panics on OOM"),
                     Value::Text(s) => {
                         let i: i64 = s.as_str().parse::<i64>().unwrap_or(0);
@@ -265,9 +277,11 @@ pub fn exec_printf(values: &[Register]) -> crate::Result<Value> {
                 }
                 let value = &values[args_index].get_value();
                 match value {
-                    Value::Float(f) => write!(result, "{:o}", *f as i64)
-                        .expect("write! to a String cannot fail; it panics on OOM"),
-                    Value::Integer(i) => write!(result, "{i:o}")
+                    Value::Numeric(Numeric::Float(f)) => {
+                        write!(result, "{:o}", f64::from(*f) as i64)
+                            .expect("write! to a String cannot fail; it panics on OOM")
+                    }
+                    Value::Numeric(Numeric::Integer(i)) => write!(result, "{i:o}")
                         .expect("write! to a String cannot fail; it panics on OOM"),
                     Value::Text(s) => {
                         let i: i64 = s.as_str().parse::<i64>().unwrap_or(0);
@@ -302,11 +316,11 @@ mod tests {
     }
 
     fn integer(value: i64) -> Register {
-        Register::Value(Value::Integer(value))
+        Register::Value(Value::from_i64(value))
     }
 
     fn float(value: f64) -> Register {
-        Register::Value(Value::Float(value))
+        Register::Value(Value::from_f64(value))
     }
 
     #[test]

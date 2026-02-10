@@ -92,7 +92,7 @@ impl DatabaseReplayGenerator {
         let columns_cnt = updates.len() / 2;
         for (i, value) in updates.iter().take(columns_cnt).enumerate() {
             let updated = match value {
-                turso_core::Value::Integer(x @ (1 | 0)) => *x > 0,
+                turso_core::Value::Numeric(turso_core::Numeric::Integer(x @ (1 | 0))) => *x > 0,
                 _ => {
                     panic!("unexpected 'changes' binary record first-half component: {value:?}")
                 }
@@ -121,7 +121,7 @@ impl DatabaseReplayGenerator {
         match change {
             DatabaseChangeType::Delete => {
                 if self.opts.use_implicit_rowid || info.pk_column_indices.is_none() {
-                    vec![turso_core::Value::Integer(id)]
+                    vec![turso_core::Value::from_i64(id)]
                 } else {
                     let mut values = Vec::new();
                     let pk_column_indices = info.pk_column_indices.as_ref().unwrap();
@@ -134,7 +134,7 @@ impl DatabaseReplayGenerator {
             }
             DatabaseChangeType::Insert => {
                 if self.opts.use_implicit_rowid {
-                    record.push(turso_core::Value::Integer(id));
+                    record.push(turso_core::Value::from_i64(id));
                 }
                 record
             }
@@ -145,7 +145,9 @@ impl DatabaseReplayGenerator {
                 let mut values = Vec::with_capacity(columns_cnt + 1);
                 for i in 0..columns_cnt {
                     let changed = match updates[i] {
-                        turso_core::Value::Integer(x @ (1 | 0)) => x > 0,
+                        turso_core::Value::Numeric(turso_core::Numeric::Integer(x @ (1 | 0))) => {
+                            x > 0
+                        }
                         _ => panic!(
                             "unexpected 'changes' binary record first-half component: {:?}",
                             updates[i]
@@ -164,7 +166,7 @@ impl DatabaseReplayGenerator {
                         values.push(value);
                     }
                 } else {
-                    values.push(turso_core::Value::Integer(id));
+                    values.push(turso_core::Value::from_i64(id));
                 }
                 values
             }
@@ -293,7 +295,7 @@ impl DatabaseReplayGenerator {
                         let mut columns = Vec::with_capacity(columns_cnt);
                         for value in updates.iter().take(columns_cnt) {
                             columns.push(match value {
-                                turso_core::Value::Integer(x @ (1 | 0)) => *x > 0,
+                                turso_core::Value::Numeric(turso_core::Numeric::Integer(x @ (1 | 0))) => *x > 0,
                                 _ => panic!("unexpected 'changes' binary record first-half component: {value:?}")
                             });
                         }
@@ -452,7 +454,9 @@ impl DatabaseReplayGenerator {
         let mut pk_column_indices = Vec::with_capacity(1);
         let mut column_names = Vec::new();
         while let Some(column) = run_stmt_once(coro, &mut table_info_stmt).await? {
-            let turso_core::Value::Integer(column_id) = column.get_value(0) else {
+            let turso_core::Value::Numeric(turso_core::Numeric::Integer(column_id)) =
+                column.get_value(0)
+            else {
                 return Err(Error::DatabaseTapeError(
                     "unexpected column type for pragma_table_info query".to_string(),
                 ));
@@ -462,7 +466,8 @@ impl DatabaseReplayGenerator {
                     "unexpected column type for pragma_table_info query".to_string(),
                 ));
             };
-            let turso_core::Value::Integer(pk) = column.get_value(2) else {
+            let turso_core::Value::Numeric(turso_core::Numeric::Integer(pk)) = column.get_value(2)
+            else {
                 return Err(Error::DatabaseTapeError(
                     "unexpected column type for pragma_table_info query".to_string(),
                 ));

@@ -633,8 +633,8 @@ fn encode_length_delimited(output: &mut Vec<u8>, data: &[u8]) {
 fn convert_value_to_core(value: &Value) -> CoreValue {
     match value {
         Value::None | Value::Null => CoreValue::Null,
-        Value::Integer { value } => CoreValue::Integer(*value),
-        Value::Float { value } => CoreValue::Float(*value),
+        Value::Integer { value } => CoreValue::from_i64(*value),
+        Value::Float { value } => CoreValue::from_f64(*value),
         Value::Text { value } => CoreValue::Text(turso_core::types::Text {
             value: std::borrow::Cow::Owned(value.clone()),
             subtype: turso_core::types::TextSubtype::Text,
@@ -646,8 +646,11 @@ fn convert_value_to_core(value: &Value) -> CoreValue {
 fn convert_core_to_value(value: CoreValue) -> Value {
     match value {
         CoreValue::Null => Value::Null,
-        CoreValue::Integer(v) => Value::Integer { value: v },
-        CoreValue::Float(v) => Value::Float { value: v },
+        CoreValue::Numeric(turso_core::Numeric::Integer(v)) => Value::Integer { value: v },
+        CoreValue::Numeric(turso_core::Numeric::Float(v)) => Value::Float {
+            value: f64::from(v),
+        },
+        CoreValue::Numeric(turso_core::Numeric::Null) => Value::Null,
         CoreValue::Text(t) => Value::Text {
             value: t.value.to_string(),
         },

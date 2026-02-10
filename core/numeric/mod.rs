@@ -39,6 +39,7 @@ impl SaturatingShr for i64 {
 }
 
 #[derive(Debug, Clone, Copy)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Numeric {
     Null,
     Integer(i64),
@@ -49,11 +50,7 @@ impl Numeric {
     pub fn from_value_strict(value: &Value) -> Numeric {
         match value {
             Value::Null | Value::Blob(_) => Self::Null,
-            Value::Integer(v) => Self::Integer(*v),
-            Value::Float(v) => match NonNan::new(*v) {
-                Some(v) => Self::Float(v),
-                None => Self::Null,
-            },
+            Value::Numeric(n) => *n,
             Value::Text(text) => {
                 let s = text.as_str();
 
@@ -108,8 +105,7 @@ impl From<Numeric> for Value {
     fn from(value: Numeric) -> Self {
         match value {
             Numeric::Null => Value::Null,
-            Numeric::Integer(v) => Value::Integer(v),
-            Numeric::Float(v) => Value::Float(v.into()),
+            _ => Value::Numeric(value),
         }
     }
 }
@@ -145,11 +141,7 @@ impl From<&Value> for Numeric {
     fn from(value: &Value) -> Self {
         match value {
             Value::Null => Self::Null,
-            Value::Integer(v) => Self::Integer(*v),
-            Value::Float(v) => match NonNan::new(*v) {
-                Some(v) => Self::Float(v),
-                None => Self::Null,
-            },
+            Value::Numeric(n) => *n,
             Value::Text(text) => Numeric::from(text.as_str()),
             Value::Blob(blob) => {
                 let text = String::from_utf8_lossy(blob.as_slice());
@@ -264,7 +256,7 @@ impl From<NullableInteger> for Value {
     fn from(value: NullableInteger) -> Self {
         match value {
             NullableInteger::Null => Value::Null,
-            NullableInteger::Integer(v) => Value::Integer(v),
+            NullableInteger::Integer(v) => Value::from_i64(v),
         }
     }
 }
@@ -285,8 +277,9 @@ impl From<&Value> for NullableInteger {
     fn from(value: &Value) -> Self {
         match value {
             Value::Null => Self::Null,
-            Value::Integer(v) => Self::Integer(*v),
-            Value::Float(v) => Self::Integer(*v as i64),
+            Value::Numeric(Numeric::Integer(v)) => Self::Integer(*v),
+            Value::Numeric(Numeric::Float(v)) => Self::Integer(f64::from(*v) as i64),
+            Value::Numeric(Numeric::Null) => Self::Null,
             Value::Text(text) => Self::from(text.as_str()),
             Value::Blob(blob) => {
                 let text = String::from_utf8_lossy(blob.as_slice());

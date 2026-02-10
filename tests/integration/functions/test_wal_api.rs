@@ -483,11 +483,11 @@ fn test_wal_upper_bound_passive(db: TempDatabase) {
     let watermark2 = writer.wal_state().unwrap().max_frame;
     let expected = [
         vec![
-            turso_core::types::Value::Integer(1),
+            turso_core::types::Value::from_i64(1),
             turso_core::types::Value::Text(turso_core::types::Text::new("hello")),
         ],
         vec![
-            turso_core::types::Value::Integer(2),
+            turso_core::types::Value::from_i64(2),
             turso_core::types::Value::Text(turso_core::types::Text::new("turso")),
         ],
     ];
@@ -711,11 +711,11 @@ fn test_wal_api_exec_commit(db: TempDatabase) {
         rows,
         vec![
             vec![
-                turso_core::types::Value::Integer(1),
+                turso_core::types::Value::from_i64(1),
                 turso_core::types::Value::Text(turso_core::types::Text::new("hello")),
             ],
             vec![
-                turso_core::types::Value::Integer(2),
+                turso_core::types::Value::from_i64(2),
                 turso_core::types::Value::Text(turso_core::types::Text::new("turso")),
             ],
         ]
@@ -821,12 +821,12 @@ fn test_wal_api_insert_exec_mix(db: TempDatabase) {
         rows,
         vec![
             vec![
-                turso_core::types::Value::Integer(1),
-                turso_core::types::Value::Integer(4096),
+                turso_core::types::Value::from_i64(1),
+                turso_core::types::Value::from_i64(4096),
             ],
             vec![
-                turso_core::types::Value::Integer(3),
-                turso_core::types::Value::Integer(3 * 4096),
+                turso_core::types::Value::from_i64(3),
+                turso_core::types::Value::from_i64(3 * 4096),
             ],
         ]
     );
@@ -846,8 +846,8 @@ fn test_wal_api_insert_exec_mix(db: TempDatabase) {
     assert_eq!(
         rows,
         vec![vec![
-            turso_core::types::Value::Integer(4),
-            turso_core::types::Value::Integer(4 * 4096),
+            turso_core::types::Value::from_i64(4),
+            turso_core::types::Value::from_i64(4 * 4096),
         ]]
     );
 }
@@ -918,8 +918,8 @@ fn test_db_share_same_file() {
     assert_eq!(
         rows,
         vec![vec![
-            turso_core::types::Value::Integer(1),
-            turso_core::types::Value::Integer(4096),
+            turso_core::types::Value::from_i64(1),
+            turso_core::types::Value::from_i64(4096),
         ]]
     );
 }

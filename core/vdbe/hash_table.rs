@@ -1,7 +1,9 @@
 use crate::{
     error::LimboError,
     io::{Buffer, Completion, TempFile, IO},
-    io_yield_one, return_if_io,
+    io_yield_one,
+    numeric::Numeric,
+    return_if_io,
     storage::sqlite3_ondisk::{read_varint, varint_len, write_varint},
     sync::{
         atomic::{self, AtomicUsize},
@@ -55,10 +57,10 @@ fn hash_join_key(key_values: &[ValueRef], collations: &[CollationSeq]) -> u64 {
 
     for (idx, value) in key_values.iter().enumerate() {
         match value {
-            ValueRef::Null => {
+            ValueRef::Null | ValueRef::Numeric(Numeric::Null) => {
                 hasher.write_u8(NULL_HASH);
             }
-            ValueRef::Integer(i) => {
+            ValueRef::Numeric(Numeric::Integer(i)) => {
                 // Hash integers in the same bucket as numerically equivalent REALs so e.g. 10 and 10.0 have the same hash.
                 let f = *i as f64;
                 if (f as i64) == *i && f.is_finite() {
@@ -71,9 +73,9 @@ fn hash_join_key(key_values: &[ValueRef], collations: &[CollationSeq]) -> u64 {
                     hasher.write_i64(*i);
                 }
             }
-            ValueRef::Float(f) => {
+            ValueRef::Numeric(Numeric::Float(f)) => {
                 hasher.write_u8(FLOAT_HASH);
-                let bits = normalized_f64_bits(*f);
+                let bits = normalized_f64_bits(f64::from(*f));
                 hasher.write(&bits.to_le_bytes());
             }
             ValueRef::Text(text) => {
@@ -142,10 +144,9 @@ fn values_equal(v1: ValueRef, v2: ValueRef, collation: CollationSeq) -> bool {
     match (v1, v2) {
         // NULL = NULL is false in SQL (actually NULL, which is falsy)
         (ValueRef::Null, _) | (_, ValueRef::Null) => false,
-        (ValueRef::Integer(i1), ValueRef::Integer(i2)) => i1 == i2,
-        (ValueRef::Float(f1), ValueRef::Float(f2)) => f1 == f2,
-        (ValueRef::Integer(i), ValueRef::Float(f)) | (ValueRef::Float(f), ValueRef::Integer(i)) => {
-            ValueRef::Integer(i) == ValueRef::Float(f)
+        (ValueRef::Numeric(Numeric::Null), _) | (_, ValueRef::Numeric(Numeric::Null)) => false,
+        (ValueRef::Numeric(n1), ValueRef::Numeric(n2)) => {
+            ValueRef::Numeric(n1) == ValueRef::Numeric(n2)
         }
         (ValueRef::Blob(b1), ValueRef::Blob(b2)) => b1 == b2,
         (ValueRef::Text(t1), ValueRef::Text(t2)) => {
@@ -243,8 +244,7 @@ impl HashEntry {
     fn size_from_values(key_values: &[Value], payload_values: &[Value]) -> usize {
         let value_size = |v: &Value| match v {
             Value::Null => 1,
-            Value::Integer(_) => 8,
-            Value::Float(_) => 8,
+            Value::Numeric(_) => 8,
             Value::Text(t) => t.as_str().len(),
             Value::Blob(b) => b.len(),
         };
@@ -258,7 +258,7 @@ impl HashEntry {
     fn value_serialized_size(v: &Value) -> usize {
         1 + match v {
             Value::Null => 0,
-            Value::Integer(_) | Value::Float(_) => 8,
+            Value::Numeric(_) => 8,
             Value::Text(t) => {
                 let len = t.as_str().len();
                 varint_len(len as u64) + len
@@ -311,17 +311,21 @@ impl HashEntry {
                 buf[offset] = NULL_HASH;
                 offset += 1;
             }
-            Value::Integer(i) => {
+            Value::Numeric(Numeric::Integer(i)) => {
                 buf[offset] = INT_HASH;
                 offset += 1;
                 buf[offset..offset + 8].copy_from_slice(&i.to_le_bytes());
                 offset += 8;
             }
-            Value::Float(f) => {
+            Value::Numeric(Numeric::Float(f)) => {
                 buf[offset] = FLOAT_HASH;
                 offset += 1;
-                buf[offset..offset + 8].copy_from_slice(&f.to_le_bytes());
+                buf[offset..offset + 8].copy_from_slice(&f64::from(*f).to_le_bytes());
                 offset += 8;
+            }
+            Value::Numeric(Numeric::Null) => {
+                buf[offset] = NULL_HASH;
+                offset += 1;
             }
             Value::Text(t) => {
                 buf[offset] = TEXT_HASH;
@@ -371,13 +375,16 @@ impl HashEntry {
             Value::Null => {
                 buf.push(NULL_HASH);
             }
-            Value::Integer(i) => {
+            Value::Numeric(Numeric::Integer(i)) => {
                 buf.push(INT_HASH);
                 buf.extend_from_slice(&i.to_le_bytes());
             }
-            Value::Float(f) => {
+            Value::Numeric(Numeric::Float(f)) => {
                 buf.push(FLOAT_HASH);
-                buf.extend_from_slice(&f.to_le_bytes());
+                buf.extend_from_slice(&f64::from(*f).to_le_bytes());
+            }
+            Value::Numeric(Numeric::Null) => {
+                buf.push(NULL_HASH);
             }
             Value::Text(t) => {
                 buf.push(TEXT_HASH);
@@ -463,7 +470,7 @@ impl HashEntry {
                 let i =
                     i64::from_le_bytes(buf[offset..offset + 8].try_into().expect("expect 8 bytes"));
                 offset += 8;
-                Value::Integer(i)
+                Value::from_i64(i)
             }
             FLOAT_HASH => {
                 if offset + 8 > buf.len() {
@@ -474,7 +481,7 @@ impl HashEntry {
                 let f =
                     f64::from_le_bytes(buf[offset..offset + 8].try_into().expect("expect 8 bytes"));
                 offset += 8;
-                Value::Float(f)
+                Value::from_f64(f)
             }
             TEXT_HASH => {
                 let (str_len, varint_len) = read_varint(&buf[offset..])?;
@@ -2087,21 +2094,21 @@ mod hashtests {
     fn test_hash_function_consistency() {
         // Test that the same keys produce the same hash
         let keys1 = vec![
-            ValueRef::Integer(42),
+            ValueRef::from_i64(42),
             ValueRef::Text(crate::types::TextRef::new(
                 "hello",
                 crate::types::TextSubtype::Text,
             )),
         ];
         let keys2 = vec![
-            ValueRef::Integer(42),
+            ValueRef::from_i64(42),
             ValueRef::Text(crate::types::TextRef::new(
                 "hello",
                 crate::types::TextSubtype::Text,
             )),
         ];
         let keys3 = vec![
-            ValueRef::Integer(43),
+            ValueRef::from_i64(43),
             ValueRef::Text(crate::types::TextRef::new(
                 "hello",
                 crate::types::TextSubtype::Text,
@@ -2122,19 +2129,19 @@ mod hashtests {
         let collations = vec![CollationSeq::Binary];
 
         // Zero variants should hash identically
-        let h_zero = hash_join_key(&[ValueRef::Float(0.0)], &collations);
-        let h_neg_zero = hash_join_key(&[ValueRef::Float(-0.0)], &collations);
-        let h_int_zero = hash_join_key(&[ValueRef::Integer(0)], &collations);
+        let h_zero = hash_join_key(&[ValueRef::from_f64(0.0)], &collations);
+        let h_neg_zero = hash_join_key(&[ValueRef::from_f64(-0.0)], &collations);
+        let h_int_zero = hash_join_key(&[ValueRef::from_i64(0)], &collations);
         assert_eq!(h_zero, h_neg_zero);
         assert_eq!(h_zero, h_int_zero);
 
         // Integer/float representations of the same numeric value should match
-        let h_ten_int = hash_join_key(&[ValueRef::Integer(10)], &collations);
-        let h_ten_float = hash_join_key(&[ValueRef::Float(10.0)], &collations);
+        let h_ten_int = hash_join_key(&[ValueRef::from_i64(10)], &collations);
+        let h_ten_float = hash_join_key(&[ValueRef::from_f64(10.0)], &collations);
         assert_eq!(h_ten_int, h_ten_float);
 
-        let h_neg_ten_int = hash_join_key(&[ValueRef::Integer(-10)], &collations);
-        let h_neg_ten_float = hash_join_key(&[ValueRef::Float(-10.0)], &collations);
+        let h_neg_ten_int = hash_join_key(&[ValueRef::from_i64(-10)], &collations);
+        let h_neg_ten_float = hash_join_key(&[ValueRef::from_f64(-10.0)], &collations);
         assert_eq!(h_neg_ten_int, h_neg_ten_float);
 
         // Positive/negative values should still differ
@@ -2143,16 +2150,16 @@ mod hashtests {
 
     #[test]
     fn test_keys_equal() {
-        let key1 = vec![Value::Integer(42), Value::Text("hello".to_string().into())];
+        let key1 = vec![Value::from_i64(42), Value::Text("hello".to_string().into())];
         let key2 = vec![
-            ValueRef::Integer(42),
+            ValueRef::from_i64(42),
             ValueRef::Text(crate::types::TextRef::new(
                 "hello",
                 crate::types::TextSubtype::Text,
             )),
         ];
         let key3 = vec![
-            ValueRef::Integer(43),
+            ValueRef::from_i64(43),
             ValueRef::Text(crate::types::TextRef::new(
                 "hello",
                 crate::types::TextSubtype::Text,
@@ -2177,10 +2184,10 @@ mod hashtests {
         let mut ht = HashTable::new(config, io);
 
         // Insert some entries (late materialization - only store rowids)
-        let key1 = vec![Value::Integer(1)];
+        let key1 = vec![Value::from_i64(1)];
         let _ = ht.insert(key1.clone(), 100, vec![]).unwrap();
 
-        let key2 = vec![Value::Integer(2)];
+        let key2 = vec![Value::from_i64(2)];
         let _ = ht.insert(key2.clone(), 200, vec![]).unwrap();
 
         let _ = ht.finalize_build();
@@ -2189,18 +2196,18 @@ mod hashtests {
         let result = ht.probe(key1);
         assert!(result.is_some());
         let entry1 = result.unwrap();
-        assert_eq!(entry1.key_values[0].as_ref(), ValueRef::Integer(1));
+        assert_eq!(entry1.key_values[0].as_ref(), ValueRef::from_i64(1));
         assert_eq!(entry1.rowid, 100);
 
         // Probe for key2
         let result = ht.probe(key2);
         assert!(result.is_some());
         let entry2 = result.unwrap();
-        assert_eq!(entry2.key_values[0].as_ref(), ValueRef::Integer(2));
+        assert_eq!(entry2.key_values[0].as_ref(), ValueRef::from_i64(2));
         assert_eq!(entry2.rowid, 200);
 
         // Probe for non-existent key
-        let result = ht.probe(vec![Value::Integer(999)]);
+        let result = ht.probe(vec![Value::from_i64(999)]);
         assert!(result.is_none());
     }
 
@@ -2218,7 +2225,7 @@ mod hashtests {
 
         // Insert multiple entries (late materialization - only store rowids)
         for i in 0..10 {
-            let key = vec![Value::Integer(i)];
+            let key = vec![Value::from_i64(i)];
             let _ = ht.insert(key, i * 100, vec![]).unwrap();
         }
 
@@ -2226,10 +2233,10 @@ mod hashtests {
 
         // Verify all entries can be found
         for i in 0..10 {
-            let result = ht.probe(vec![Value::Integer(i)]);
+            let result = ht.probe(vec![Value::from_i64(i)]);
             assert!(result.is_some());
             let entry = result.unwrap();
-            assert_eq!(entry.key_values[0].as_ref(), ValueRef::Integer(i));
+            assert_eq!(entry.key_values[0].as_ref(), ValueRef::from_i64(i));
             assert_eq!(entry.rowid, i * 100);
         }
     }
@@ -2247,7 +2254,7 @@ mod hashtests {
         let mut ht = HashTable::new(config, io);
 
         // Insert multiple entries with the same key
-        let key = vec![Value::Integer(42)];
+        let key = vec![Value::from_i64(42)];
         for i in 0..3 {
             let _ = ht.insert(key.clone(), 1000 + i, vec![]).unwrap();
         }
@@ -2279,10 +2286,10 @@ mod hashtests {
         let entry = HashEntry::new(
             12345,
             vec![
-                Value::Integer(42),
+                Value::from_i64(42),
                 Value::Text("hello".to_string().into()),
                 Value::Null,
-                Value::Float(std::f64::consts::PI),
+                Value::from_f64(std::f64::consts::PI),
             ],
             100,
         );
@@ -2298,9 +2305,13 @@ mod hashtests {
 
         for (v1, v2) in deserialized.key_values.iter().zip(entry.key_values.iter()) {
             match (v1, v2) {
-                (Value::Integer(i1), Value::Integer(i2)) => assert_eq!(i1, i2),
+                (Value::Numeric(Numeric::Integer(i1)), Value::Numeric(Numeric::Integer(i2))) => {
+                    assert_eq!(i1, i2)
+                }
                 (Value::Text(t1), Value::Text(t2)) => assert_eq!(t1.as_str(), t2.as_str()),
-                (Value::Float(f1), Value::Float(f2)) => assert!((f1 - f2).abs() < 1e-10),
+                (Value::Numeric(Numeric::Float(f1)), Value::Numeric(Numeric::Float(f2))) => {
+                    assert!((f64::from(*f1) - f64::from(*f2)).abs() < 1e-10)
+                }
                 (Value::Null, Value::Null) => {}
                 _ => panic!("Value type mismatch"),
             }
@@ -2313,13 +2324,13 @@ mod hashtests {
         let entry = HashEntry::new_with_payload(
             12345,
             vec![
-                Value::Integer(42),
+                Value::from_i64(42),
                 Value::Text("hello world".to_string().into()),
                 Value::Null,
-                Value::Float(std::f64::consts::PI),
+                Value::from_f64(std::f64::consts::PI),
             ],
             100,
-            vec![Value::Blob(vec![1, 2, 3, 4, 5]), Value::Integer(-999)],
+            vec![Value::Blob(vec![1, 2, 3, 4, 5]), Value::from_i64(-999)],
         );
 
         // Serialize using the Vec-based method
@@ -2479,7 +2490,7 @@ mod hashtests {
 
     #[test]
     fn test_hash_entry_deserialization_truncated() {
-        let entry = HashEntry::new(123, vec![Value::Integer(1), Value::Text("abc".into())], 42);
+        let entry = HashEntry::new(123, vec![Value::from_i64(1), Value::Text("abc".into())], 42);
 
         let mut buf = Vec::new();
         entry.serialize(&mut buf);
@@ -2496,7 +2507,7 @@ mod hashtests {
 
     #[test]
     fn test_hash_entry_deserialization_garbage_type_tag() {
-        let entry = HashEntry::new(1, vec![Value::Integer(10)], 7);
+        let entry = HashEntry::new(1, vec![Value::from_i64(10)], 7);
         let mut buf = Vec::new();
         entry.serialize(&mut buf);
 
@@ -2519,7 +2530,7 @@ mod hashtests {
     fn insert_many_force_spill(ht: &mut HashTable, start: i64, count: i64) {
         for i in 0..count {
             let rowid = start + i;
-            let key = vec![Value::Integer(rowid)];
+            let key = vec![Value::from_i64(rowid)];
             let _ = ht.insert(key, rowid, vec![]);
         }
     }
@@ -2544,7 +2555,7 @@ mod hashtests {
         assert!(ht.has_spilled(), "hash table should have spilled");
 
         // Pick a key and find its partition
-        let probe_key = vec![Value::Integer(10)];
+        let probe_key = vec![Value::from_i64(10)];
         let partition_idx = ht.partition_for_keys(&probe_key);
 
         // Load that partition into memory
@@ -2584,8 +2595,8 @@ mod hashtests {
         let _ = ht.finalize_build().unwrap();
         assert!(ht.has_spilled());
 
-        let key_a = vec![Value::Integer(1)];
-        let key_b = vec![Value::Integer(10_001)];
+        let key_a = vec![Value::from_i64(1)];
+        let key_b = vec![Value::from_i64(10_001)];
         let pa = ht.partition_for_keys(&key_a);
         let pb = ht.partition_for_keys(&key_b);
         assert_ne!(pa, pb);
@@ -2619,7 +2630,7 @@ mod hashtests {
         };
         let mut ht = HashTable::new(config, io);
 
-        let key = vec![Value::Integer(42)];
+        let key = vec![Value::from_i64(42)];
         for i in 0..1024 {
             match ht.insert(key.clone(), 1000 + i, vec![]).unwrap() {
                 IOResult::Done(()) => {}
@@ -2665,19 +2676,19 @@ mod hashtests {
         let mut ht = HashTable::new(config, io);
 
         // Insert entries with payload values (simulating cached result columns)
-        let key1 = vec![Value::Integer(1)];
+        let key1 = vec![Value::from_i64(1)];
         let payload1 = vec![
             Value::Text("Alice".into()),
-            Value::Integer(30),
-            Value::Float(1000.50),
+            Value::from_i64(30),
+            Value::from_f64(1000.50),
         ];
         let _ = ht.insert(key1.clone(), 100, payload1).unwrap();
 
-        let key2 = vec![Value::Integer(2)];
+        let key2 = vec![Value::from_i64(2)];
         let payload2 = vec![
             Value::Text("Bob".into()),
-            Value::Integer(25),
-            Value::Float(2000.75),
+            Value::from_i64(25),
+            Value::from_f64(2000.75),
         ];
         let _ = ht.insert(key2.clone(), 200, payload2).unwrap();
 
@@ -2691,8 +2702,8 @@ mod hashtests {
         assert!(entry1.has_payload());
         assert_eq!(entry1.payload_values.len(), 3);
         assert_eq!(entry1.payload_values[0], Value::Text("Alice".into()));
-        assert_eq!(entry1.payload_values[1], Value::Integer(30));
-        assert_eq!(entry1.payload_values[2], Value::Float(1000.50));
+        assert_eq!(entry1.payload_values[1], Value::from_i64(30));
+        assert_eq!(entry1.payload_values[2], Value::from_f64(1000.50));
 
         let result = ht.probe(key2);
         assert!(result.is_some());
@@ -2700,8 +2711,8 @@ mod hashtests {
         assert_eq!(entry2.rowid, 200);
         assert!(entry2.has_payload());
         assert_eq!(entry2.payload_values[0], Value::Text("Bob".into()));
-        assert_eq!(entry2.payload_values[1], Value::Integer(25));
-        assert_eq!(entry2.payload_values[2], Value::Float(2000.75));
+        assert_eq!(entry2.payload_values[1], Value::from_i64(25));
+        assert_eq!(entry2.payload_values[2], Value::from_f64(2000.75));
     }
 
     #[test]
@@ -2717,7 +2728,7 @@ mod hashtests {
         let mut ht = HashTable::new(config, io);
 
         // Insert entry with NULL values in payload
-        let key = vec![Value::Integer(1)];
+        let key = vec![Value::from_i64(1)];
         let payload = vec![Value::Null, Value::Text("test".into()), Value::Null];
         let _ = ht.insert(key.clone(), 100, payload).unwrap();
 
@@ -2747,15 +2758,15 @@ mod hashtests {
         let mut ht = HashTable::new(config, io);
 
         // Insert entry with NULL key - should be silently skipped
-        let null_key = vec![Value::Null, Value::Integer(1)];
+        let null_key = vec![Value::Null, Value::from_i64(1)];
         let _ = ht.insert(null_key.clone(), 100, vec![]).unwrap();
 
         // Insert entry with non-NULL keys
-        let valid_key = vec![Value::Integer(1), Value::Integer(2)];
+        let valid_key = vec![Value::from_i64(1), Value::from_i64(2)];
         let _ = ht.insert(valid_key.clone(), 200, vec![]).unwrap();
 
         // Insert another entry where second key is NULL
-        let null_key2 = vec![Value::Integer(1), Value::Null];
+        let null_key2 = vec![Value::from_i64(1), Value::Null];
         let _ = ht.insert(null_key2.clone(), 300, vec![]).unwrap();
 
         let _ = ht.finalize_build();
@@ -2790,9 +2801,9 @@ mod hashtests {
         let mut ht = HashTable::new(config, io);
 
         // Insert entry with blob payload
-        let key = vec![Value::Integer(1)];
+        let key = vec![Value::from_i64(1)];
         let blob_data = vec![0xDE, 0xAD, 0xBE, 0xEF];
-        let payload = vec![Value::Blob(blob_data.clone()), Value::Integer(42)];
+        let payload = vec![Value::Blob(blob_data.clone()), Value::from_i64(42)];
         let _ = ht.insert(key.clone(), 100, payload).unwrap();
 
         let _ = ht.finalize_build();
@@ -2802,7 +2813,7 @@ mod hashtests {
         let entry = result.unwrap();
         assert_eq!(entry.payload_values.len(), 2);
         assert_eq!(entry.payload_values[0], Value::Blob(blob_data));
-        assert_eq!(entry.payload_values[1], Value::Integer(42));
+        assert_eq!(entry.payload_values[1], Value::from_i64(42));
     }
 
     #[test]
@@ -2818,26 +2829,26 @@ mod hashtests {
         let mut ht = HashTable::new(config, io);
 
         // Insert multiple entries with the same key but different payloads
-        let key = vec![Value::Integer(42)];
+        let key = vec![Value::from_i64(42)];
         let _ = ht
             .insert(
                 key.clone(),
                 100,
-                vec![Value::Text("first".into()), Value::Integer(1)],
+                vec![Value::Text("first".into()), Value::from_i64(1)],
             )
             .unwrap();
         let _ = ht
             .insert(
                 key.clone(),
                 200,
-                vec![Value::Text("second".into()), Value::Integer(2)],
+                vec![Value::Text("second".into()), Value::from_i64(2)],
             )
             .unwrap();
         let _ = ht
             .insert(
                 key.clone(),
                 300,
-                vec![Value::Text("third".into()), Value::Integer(3)],
+                vec![Value::Text("third".into()), Value::from_i64(3)],
             )
             .unwrap();
 
@@ -2849,18 +2860,18 @@ mod hashtests {
         let entry1 = result.unwrap();
         assert_eq!(entry1.rowid, 100);
         assert_eq!(entry1.payload_values[0], Value::Text("first".into()));
-        assert_eq!(entry1.payload_values[1], Value::Integer(1));
+        assert_eq!(entry1.payload_values[1], Value::from_i64(1));
 
         // next_match should return subsequent matches with their payloads
         let entry2 = ht.next_match().unwrap();
         assert_eq!(entry2.rowid, 200);
         assert_eq!(entry2.payload_values[0], Value::Text("second".into()));
-        assert_eq!(entry2.payload_values[1], Value::Integer(2));
+        assert_eq!(entry2.payload_values[1], Value::from_i64(2));
 
         let entry3 = ht.next_match().unwrap();
         assert_eq!(entry3.rowid, 300);
         assert_eq!(entry3.payload_values[0], Value::Text("third".into()));
-        assert_eq!(entry3.payload_values[1], Value::Integer(3));
+        assert_eq!(entry3.payload_values[1], Value::from_i64(3));
 
         // No more matches
         assert!(ht.next_match().is_none());
@@ -2871,12 +2882,12 @@ mod hashtests {
         // Test that payload values survive serialization/deserialization
         let entry = HashEntry::new_with_payload(
             12345,
-            vec![Value::Integer(1), Value::Text("key".into())],
+            vec![Value::from_i64(1), Value::Text("key".into())],
             100,
             vec![
                 Value::Text("payload_text".into()),
-                Value::Integer(999),
-                Value::Float(std::f64::consts::PI),
+                Value::from_i64(999),
+                Value::from_f64(std::f64::consts::PI),
                 Value::Null,
                 Value::Blob(vec![1, 2, 3, 4]),
             ],
@@ -2892,7 +2903,7 @@ mod hashtests {
         assert_eq!(deserialized.hash, entry.hash);
         assert_eq!(deserialized.rowid, entry.rowid);
         assert_eq!(deserialized.key_values.len(), 2);
-        assert_eq!(deserialized.key_values[0], Value::Integer(1));
+        assert_eq!(deserialized.key_values[0], Value::from_i64(1));
         assert_eq!(deserialized.key_values[1], Value::Text("key".into()));
 
         // Verify payload values
@@ -2901,10 +2912,10 @@ mod hashtests {
             deserialized.payload_values[0],
             Value::Text("payload_text".into())
         );
-        assert_eq!(deserialized.payload_values[1], Value::Integer(999));
+        assert_eq!(deserialized.payload_values[1], Value::from_i64(999));
         assert_eq!(
             deserialized.payload_values[2],
-            Value::Float(std::f64::consts::PI)
+            Value::from_f64(std::f64::consts::PI)
         );
         assert_eq!(deserialized.payload_values[3], Value::Null);
         assert_eq!(
@@ -2916,7 +2927,7 @@ mod hashtests {
     #[test]
     fn test_hash_entry_empty_payload() {
         // Test that entries without payload work correctly
-        let entry = HashEntry::new(12345, vec![Value::Integer(1)], 100);
+        let entry = HashEntry::new(12345, vec![Value::from_i64(1)], 100);
 
         assert!(!entry.has_payload());
         assert!(entry.payload_values.is_empty());
@@ -2933,15 +2944,15 @@ mod hashtests {
 
     #[test]
     fn test_hash_entry_size_includes_payload() {
-        let entry_no_payload = HashEntry::new(12345, vec![Value::Integer(1)], 100);
+        let entry_no_payload = HashEntry::new(12345, vec![Value::from_i64(1)], 100);
 
         let entry_with_payload = HashEntry::new_with_payload(
             12345,
-            vec![Value::Integer(1)],
+            vec![Value::from_i64(1)],
             100,
             vec![
                 Value::Text("a]long payload string".into()),
-                Value::Integer(42),
+                Value::from_i64(42),
             ],
         );
 

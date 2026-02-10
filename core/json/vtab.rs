@@ -425,7 +425,7 @@ impl InternalVirtualTableCursor for JsonEachCursor {
             COL_VALUE => self.columns.value()?,
             COL_TYPE => self.columns.ttype(),
             COL_ATOM => self.columns.atom()?,
-            COL_ID => Value::Integer(self.rowid),
+            COL_ID => Value::from_i64(self.rowid),
             COL_PARENT => self.columns.parent(),
             COL_FULLKEY => self.columns.fullkey(),
             COL_PATH => self.columns.path(),
@@ -503,7 +503,7 @@ mod columns {
 
         fn key_representation(&self) -> Value {
             match self {
-                Key::Integer(ref i) => Value::Integer(*i),
+                Key::Integer(ref i) => Value::from_i64(*i),
                 Key::String(ref s) => Value::Text(Text::new(s.to_owned().replace("\\\"", "\""))),
                 Key::None => Value::Null,
             }
@@ -569,8 +569,8 @@ mod columns {
             let element_type = value.element_type().expect("invalid value");
             let string: Result<Value, LimboError> = match element_type {
                 jsonb::ElementType::NULL => Ok(Value::Null),
-                jsonb::ElementType::TRUE => Ok(Value::Integer(1)),
-                jsonb::ElementType::FALSE => Ok(Value::Integer(0)),
+                jsonb::ElementType::TRUE => Ok(Value::from_i64(1)),
+                jsonb::ElementType::FALSE => Ok(Value::from_i64(0)),
                 jsonb::ElementType::INT | jsonb::ElementType::INT5 => Self::jsonb_to_integer(value),
                 jsonb::ElementType::FLOAT | jsonb::ElementType::FLOAT5 => {
                     Self::jsonb_to_float(value)
@@ -601,14 +601,14 @@ mod columns {
             let string = value.to_string()?;
             let int = string.parse::<i64>()?;
 
-            Ok(Value::Integer(int))
+            Ok(Value::from_i64(int))
         }
 
         fn jsonb_to_float(value: &Jsonb) -> Result<Value, LimboError> {
             let string = value.to_string()?;
             let float = string.parse::<f64>()?;
 
-            Ok(Value::Float(float))
+            Ok(Value::from_f64(float))
         }
 
         pub(super) fn fullkey(&self) -> Value {
@@ -621,7 +621,7 @@ mod columns {
 
         pub(super) fn parent(&self) -> Value {
             match self.parent_id {
-                Some(id) => Value::Integer(id),
+                Some(id) => Value::from_i64(id),
                 None => Value::Null,
             }
         }

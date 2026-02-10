@@ -33,7 +33,9 @@ use std::{
 
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
-use turso_core::{Connection, Database, LimboError, OpenFlags, QueryMode, Statement, Value};
+use turso_core::{
+    Connection, Database, LimboError, Numeric, OpenFlags, QueryMode, Statement, Value,
+};
 
 #[derive(Parser, Debug)]
 #[command(name = "Turso")]
@@ -1106,8 +1108,7 @@ impl Limbo {
                     for (idx, value) in row.get_values().enumerate() {
                         let (content, alignment) = match value {
                             Value::Null => (null_value.clone(), CellAlignment::Left),
-                            Value::Integer(_) => (format!("{value}"), CellAlignment::Right),
-                            Value::Float(_) => (format!("{value}"), CellAlignment::Right),
+                            Value::Numeric(_) => (format!("{value}"), CellAlignment::Right),
                             Value::Text(_) => (format!("{value}"), CellAlignment::Left),
                             Value::Blob(_) => (format!("{value}"), CellAlignment::Left),
                         };
@@ -1559,7 +1560,11 @@ impl Limbo {
         let conn = self.conn.clone();
         let mut databases = Vec::new();
         self.handle_row(sql, |row| {
-            if let (Ok(Value::Integer(seq)), Ok(Value::Text(name)), Ok(file_value)) = (
+            if let (
+                Ok(Value::Numeric(Numeric::Integer(seq))),
+                Ok(Value::Text(name)),
+                Ok(file_value),
+            ) = (
                 row.get::<&Value>(0),
                 row.get::<&Value>(1),
                 row.get::<&Value>(2),
@@ -1777,8 +1782,9 @@ impl Limbo {
     fn write_sql_value_from_value<W: Write>(out: &mut W, v: &Value) -> io::Result<()> {
         match v {
             Value::Null => out.write_all(b"NULL"),
-            Value::Integer(i) => out.write_all(format!("{i}").as_bytes()),
-            Value::Float(f) => write!(out, "{f}").map(|_| ()),
+            Value::Numeric(Numeric::Integer(i)) => out.write_all(format!("{i}").as_bytes()),
+            Value::Numeric(Numeric::Float(f)) => write!(out, "{}", f64::from(*f)).map(|_| ()),
+            Value::Numeric(Numeric::Null) => out.write_all(b"NULL"),
             Value::Text(s) => {
                 out.write_all(b"'")?;
                 let bytes = s.value.as_bytes();

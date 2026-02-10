@@ -6,6 +6,7 @@ use crate::incremental::operator::{
     generate_storage_id, ComputationTracker, DbspStateCursors, EvalState, IncrementalOperator,
 };
 use crate::incremental::persistence::WriteRow;
+use crate::numeric::Numeric;
 use crate::storage::btree::CursorTrait;
 use crate::sync::Arc;
 use crate::sync::Mutex;
@@ -35,12 +36,12 @@ fn read_next_join_row(
     // For iteration, use the last element hash if we have one, or NULL to start
     let index_key_values = match last_element_hash {
         Some(last_hash) => vec![
-            Value::Integer(storage_id),
+            Value::from_i64(storage_id),
             zset_hash.to_value(),
             last_hash.to_value(),
         ],
         None => vec![
-            Value::Integer(storage_id),
+            Value::from_i64(storage_id),
             zset_hash.to_value(),
             Value::Null, // Start iteration from beginning
         ],
@@ -73,7 +74,7 @@ fn read_next_join_row(
         // Index has 4 values: storage_id, zset_id, element_id, rowid (appended by WriteRow)
         if let Ok((v0, v1, v2)) = values {
             let found_storage_id = match &v0.to_owned() {
-                Value::Integer(id) => *id,
+                Value::Numeric(Numeric::Integer(id)) => *id,
                 _ => return Ok(IOResult::Done(None)),
             };
             let found_zset_hash = match &v1.to_owned() {
@@ -128,7 +129,7 @@ fn read_next_join_row(
                 let row = deserialize_hashable_row(blob)?;
 
                 let weight = match &value_at_4.to_owned() {
-                    Value::Integer(w) => *w as isize,
+                    Value::Numeric(Numeric::Integer(w)) => *w as isize,
                     _ => return Ok(IOResult::Done(None)),
                 };
 
@@ -557,7 +558,7 @@ fn deserialize_hashable_row(blob: &[u8]) -> Result<HashableRow> {
 
     // First value is the rowid
     let rowid = match &all_values[0] {
-        Value::Integer(i) => *i,
+        Value::Numeric(Numeric::Integer(i)) => *i,
         _ => {
             return Err(crate::LimboError::InternalError(
                 "First value must be rowid (integer)".to_string(),
@@ -575,7 +576,7 @@ fn serialize_hashable_row(row: &HashableRow) -> Vec<u8> {
     use crate::types::ImmutableRecord;
 
     let mut all_values = Vec::with_capacity(row.values.len() + 1);
-    all_values.push(Value::Integer(row.rowid));
+    all_values.push(Value::from_i64(row.rowid));
     all_values.extend_from_slice(&row.values);
 
     let record = ImmutableRecord::from_values(&all_values, all_values.len());
@@ -644,7 +645,7 @@ impl IncrementalOperator for JoinOperator {
                     let zset_hash = join_key.cached_hash();
                     let element_hash = row.cached_hash();
                     let index_key = vec![
-                        Value::Integer(storage_id),
+                        Value::from_i64(storage_id),
                         zset_hash.to_value(),
                         element_hash.to_value(),
                     ];
@@ -652,7 +653,7 @@ impl IncrementalOperator for JoinOperator {
                     // The record values: we'll store the serialized row as a blob
                     let row_blob = serialize_hashable_row(row);
                     let record_values = vec![
-                        Value::Integer(self.left_storage_id()),
+                        Value::from_i64(self.left_storage_id()),
                         zset_hash.to_value(),
                         element_hash.to_value(),
                         Value::Blob(row_blob),
@@ -692,7 +693,7 @@ impl IncrementalOperator for JoinOperator {
                     let zset_hash = join_key.cached_hash();
                     let element_hash = row.cached_hash();
                     let index_key = vec![
-                        Value::Integer(self.right_storage_id()),
+                        Value::from_i64(self.right_storage_id()),
                         zset_hash.to_value(),
                         element_hash.to_value(),
                     ];
@@ -700,7 +701,7 @@ impl IncrementalOperator for JoinOperator {
                     // The record values: we'll store the serialized row as a blob
                     let row_blob = serialize_hashable_row(row);
                     let record_values = vec![
-                        Value::Integer(self.right_storage_id()),
+                        Value::from_i64(self.right_storage_id()),
                         zset_hash.to_value(),
                         element_hash.to_value(),
                         Value::Blob(row_blob),

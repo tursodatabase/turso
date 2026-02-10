@@ -1,3 +1,4 @@
+use crate::numeric::Numeric;
 use crate::types::AsValueRef;
 use crate::types::Value;
 use crate::LimboError::InvalidModifier;
@@ -874,7 +875,7 @@ where
                     return Value::Null;
                 }
             }
-            ValueRef::Integer(i) => {
+            ValueRef::Numeric(Numeric::Integer(i)) => {
                 p.s = i as f64;
                 p.raw_s = true;
                 if p.s >= 0.0 && p.s < 5373484.5 {
@@ -882,8 +883,8 @@ where
                     p.valid_jd = true;
                 }
             }
-            ValueRef::Float(f) => {
-                p.s = f;
+            ValueRef::Numeric(Numeric::Float(f)) => {
+                p.s = f64::from(f);
                 p.raw_s = true;
                 if p.s >= 0.0 && p.s < 5373484.5 {
                     p.i_jd = (p.s * JD_TO_MS as f64 + 0.5) as i64;
@@ -915,14 +916,14 @@ where
     }
 
     match func_type {
-        "julianday" => Value::Float(p.i_jd as f64 / 86400000.0),
+        "julianday" => Value::from_f64(p.i_jd as f64 / 86400000.0),
         "unixepoch" => {
             let unix = (p.i_jd - 210866760000000) / 1000;
             if p.use_subsec {
                 let ms = (p.i_jd - 210866760000000) as f64 / 1000.0;
-                Value::Float(ms)
+                Value::from_f64(ms)
             } else {
-                Value::Integer(unix)
+                Value::from_i64(unix)
             }
         }
         _ => {
@@ -1044,7 +1045,7 @@ where
                 return Value::Null;
             }
         }
-        ValueRef::Integer(i) => {
+        ValueRef::Numeric(Numeric::Integer(i)) => {
             d1.s = i as f64;
             d1.raw_s = true;
             if d1.s >= 0.0 && d1.s < 5373484.5 {
@@ -1052,8 +1053,8 @@ where
                 d1.valid_jd = true;
             }
         }
-        ValueRef::Float(f) => {
-            d1.s = f;
+        ValueRef::Numeric(Numeric::Float(f)) => {
+            d1.s = f64::from(f);
             d1.raw_s = true;
             if d1.s >= 0.0 && d1.s < 5373484.5 {
                 d1.i_jd = (d1.s * JD_TO_MS as f64 + 0.5) as i64;
@@ -1071,7 +1072,7 @@ where
                 return Value::Null;
             }
         }
-        ValueRef::Integer(i) => {
+        ValueRef::Numeric(Numeric::Integer(i)) => {
             d2.s = i as f64;
             d2.raw_s = true;
             if d2.s >= 0.0 && d2.s < 5373484.5 {
@@ -1079,8 +1080,8 @@ where
                 d2.valid_jd = true;
             }
         }
-        ValueRef::Float(f) => {
-            d2.s = f;
+        ValueRef::Numeric(Numeric::Float(f)) => {
+            d2.s = f64::from(f);
             d2.raw_s = true;
             if d2.s >= 0.0 && d2.s < 5373484.5 {
                 d2.i_jd = (d2.s * JD_TO_MS as f64 + 0.5) as i64;
@@ -1219,7 +1220,7 @@ where
                     }
                 }
             }
-            ValueRef::Integer(i) => {
+            ValueRef::Numeric(Numeric::Integer(i)) => {
                 p.s = i as f64;
                 p.raw_s = true;
                 if p.s >= 0.0 && p.s < 5373484.5 {
@@ -1227,8 +1228,8 @@ where
                     p.valid_jd = true;
                 }
             }
-            ValueRef::Float(f) => {
-                p.s = f;
+            ValueRef::Numeric(Numeric::Float(f)) => {
+                p.s = f64::from(f);
                 p.raw_s = true;
                 if p.s >= 0.0 && p.s < 5373484.5 {
                     p.i_jd = (p.s * JD_TO_MS as f64 + 0.5) as i64;
@@ -1495,8 +1496,8 @@ mod tests {
             // Test Format 11: 'now'
             (Value::build_text("now"), &now),
             // Format 12: DDDDDDDDDD (Julian date as float or integer)
-            (Value::Float(2460512.5), test_date_str),
-            (Value::Integer(2460513), test_date_str),
+            (Value::from_f64(2460512.5), test_date_str),
+            (Value::from_i64(2460513), test_date_str),
         ];
 
         for (input, expected) in test_cases {
@@ -1520,12 +1521,12 @@ mod tests {
             Value::build_text("2024-13-01"),   // Invalid month
             Value::build_text("invalid_date"), // Completely invalid string
             Value::build_text(""),             // Empty string
-            Value::Integer(i64::MAX),          // Large Julian day
-            Value::Integer(-1),                // Negative Julian day
-            Value::Float(f64::MAX),            // Large float
-            Value::Float(-1.0),                // Negative Julian day as float
-            Value::Float(f64::NAN),            // NaN
-            Value::Float(f64::INFINITY),       // Infinity
+            Value::from_i64(i64::MAX),         // Large Julian day
+            Value::from_i64(-1),               // Negative Julian day
+            Value::from_f64(f64::MAX),         // Large float
+            Value::from_f64(-1.0),             // Negative Julian day as float
+            Value::from_f64(f64::NAN),         // NaN
+            Value::from_f64(f64::INFINITY),    // Infinity
             Value::Null,                       // Null value
             Value::Blob(vec![1, 2, 3]),        // Blob (unsupported type)
             // Invalid timezone tests
@@ -1624,8 +1625,8 @@ mod tests {
             (Value::build_text("22:30:45.123-05:00"), next_time_str),
             (Value::build_text("22:30:45.123Z"), test_time_str),
             // Format 12: DDDDDDDDDD (Julian date as float or integer)
-            (Value::Float(2460082.1), "14:24:00"),
-            (Value::Integer(2460082), "12:00:00"),
+            (Value::from_f64(2460082.1), "14:24:00"),
+            (Value::from_i64(2460082), "12:00:00"),
         ];
 
         for (input, expected) in test_cases {
@@ -1649,12 +1650,12 @@ mod tests {
             Value::build_text("2024-13-01"),   // Invalid month
             Value::build_text("invalid_date"), // Completely invalid string
             Value::build_text(""),             // Empty string
-            Value::Integer(i64::MAX),          // Large Julian day
-            Value::Integer(-1),                // Negative Julian day
-            Value::Float(f64::MAX),            // Large float
-            Value::Float(-1.0),                // Negative Julian day as float
-            Value::Float(f64::NAN),            // NaN
-            Value::Float(f64::INFINITY),       // Infinity
+            Value::from_i64(i64::MAX),         // Large Julian day
+            Value::from_i64(-1),               // Negative Julian day
+            Value::from_f64(f64::MAX),         // Large float
+            Value::from_f64(-1.0),             // Negative Julian day as float
+            Value::from_f64(f64::NAN),         // NaN
+            Value::from_f64(f64::INFINITY),    // Infinity
             Value::Null,                       // Null value
             Value::Blob(vec![1, 2, 3]),        // Blob (unsupported type)
             // Invalid timezone tests
@@ -2564,60 +2565,60 @@ mod tests {
     #[test]
     fn test_unixepoch_basic_usage() {
         let result = exec_unixepoch(vec![Value::build_text("1970-01-01 00:00:00".to_string())]);
-        assert_eq!(result, Value::Integer(0));
+        assert_eq!(result, Value::from_i64(0));
 
         let result = exec_unixepoch(vec![Value::build_text("2023-01-01 00:00:00".to_string())]);
-        assert_eq!(result, Value::Integer(1672531200));
+        assert_eq!(result, Value::from_i64(1672531200));
 
         let result = exec_unixepoch(vec![Value::build_text("1969-12-31 23:59:59".to_string())]);
-        assert_eq!(result, Value::Integer(-1));
+        assert_eq!(result, Value::from_i64(-1));
 
-        let result = exec_unixepoch(vec![Value::Float(2440587.5)]);
-        assert_eq!(result, Value::Integer(0));
+        let result = exec_unixepoch(vec![Value::from_f64(2440587.5)]);
+        assert_eq!(result, Value::from_i64(0));
     }
 
     #[test]
     fn test_unixepoch_numeric_modifiers_unixepoch() {
         let res1 = exec_unixepoch(vec![
-            Value::Integer(1672531200),
+            Value::from_i64(1672531200),
             Value::build_text("unixepoch".to_string()),
         ]);
-        assert_eq!(res1, Value::Integer(1672531200));
+        assert_eq!(res1, Value::from_i64(1672531200));
 
         let res2 = exec_unixepoch(vec![
-            Value::Integer(0),
+            Value::from_i64(0),
             Value::build_text("unixepoch".to_string()),
         ]);
-        assert_eq!(res2, Value::Integer(0));
+        assert_eq!(res2, Value::from_i64(0));
 
         let res3 = exec_unixepoch(vec![
-            Value::Integer(1672531200),
+            Value::from_i64(1672531200),
             Value::build_text("unixepoch".to_string()),
             Value::build_text("start of year".to_string()),
         ]);
-        assert_eq!(res3, Value::Integer(1672531200));
+        assert_eq!(res3, Value::from_i64(1672531200));
     }
 
     #[test]
     fn test_unixepoch_numeric_modifiers_julianday() {
         let res1 = exec_unixepoch(vec![
-            Value::Float(2440587.5),
+            Value::from_f64(2440587.5),
             Value::build_text("julianday".to_string()),
         ]);
-        assert_eq!(res1, Value::Integer(0));
+        assert_eq!(res1, Value::from_i64(0));
 
         let res2 = exec_unixepoch(vec![
-            Value::Float(2460311.5),
+            Value::from_f64(2460311.5),
             Value::build_text("julianday".to_string()),
         ]);
-        assert_eq!(res2, Value::Integer(1704153600));
+        assert_eq!(res2, Value::from_i64(1704153600));
 
         let res3 = exec_unixepoch(vec![
-            Value::Float(0.0),
+            Value::from_f64(0.0),
             Value::build_text("julianday".to_string()),
         ]);
         match res3 {
-            Value::Integer(i) => assert_eq!(i, -210866760000),
+            Value::Numeric(Numeric::Integer(i)) => assert_eq!(i, -210866760000),
             _ => panic!("Expected Integer result for JD 0"),
         }
     }
@@ -2625,23 +2626,23 @@ mod tests {
     #[test]
     fn test_unixepoch_numeric_modifiers_auto() {
         let res1 = exec_unixepoch(vec![
-            Value::Float(2440587.5),
+            Value::from_f64(2440587.5),
             Value::build_text("auto".to_string()),
         ]);
-        assert_eq!(res1, Value::Integer(0));
+        assert_eq!(res1, Value::from_i64(0));
 
         let res2 = exec_unixepoch(vec![
-            Value::Integer(1672531200),
+            Value::from_i64(1672531200),
             Value::build_text("auto".to_string()),
         ]);
-        assert_eq!(res2, Value::Integer(1672531200));
+        assert_eq!(res2, Value::from_i64(1672531200));
 
         let res3 = exec_unixepoch(vec![
-            Value::Float(0.0),
+            Value::from_f64(0.0),
             Value::build_text("auto".to_string()),
         ]);
         match res3 {
-            Value::Integer(i) => assert!(i < 0),
+            Value::Numeric(Numeric::Integer(i)) => assert!(i < 0),
             _ => panic!("Expected Integer result"),
         }
     }
@@ -2649,7 +2650,7 @@ mod tests {
     #[test]
     fn test_unixepoch_invalid_usage() {
         let res1 = exec_unixepoch(vec![
-            Value::Integer(0),
+            Value::from_i64(0),
             Value::build_text("start of year".to_string()),
             Value::build_text("unixepoch".to_string()),
         ]);
@@ -2662,7 +2663,7 @@ mod tests {
         assert_eq!(res2, Value::Null);
 
         let res3 = exec_unixepoch(vec![
-            Value::Integer(0),
+            Value::from_i64(0),
             Value::build_text("unixepoch".to_string()),
             Value::build_text("julianday".to_string()),
         ]);
@@ -2672,19 +2673,19 @@ mod tests {
     #[test]
     fn test_unixepoch_complex_calculations() {
         let res1 = exec_unixepoch(vec![
-            Value::Float(2440587.5),
+            Value::from_f64(2440587.5),
             Value::build_text("julianday".to_string()),
             Value::build_text("+1 day".to_string()),
         ]);
-        assert_eq!(res1, Value::Integer(86400));
+        assert_eq!(res1, Value::from_i64(86400));
 
         let res2 = exec_unixepoch(vec![
-            Value::Float(2460311.5),
+            Value::from_f64(2460311.5),
             Value::build_text("auto".to_string()),
             Value::build_text("start of month".to_string()),
             Value::build_text("+1 month".to_string()),
         ]);
-        assert_eq!(res2, Value::Integer(1706745600));
+        assert_eq!(res2, Value::from_i64(1706745600));
     }
 
     #[test]
@@ -2694,7 +2695,9 @@ mod tests {
             Value::build_text("subsec".to_string()),
         ]);
         match res1 {
-            Value::Float(f) => assert!((f - 0.001).abs() < f64::EPSILON),
+            Value::Numeric(Numeric::Float(f)) => {
+                assert!((f64::from(f) - 0.001).abs() < f64::EPSILON)
+            }
             _ => panic!("Expected Float result"),
         }
 
@@ -2703,7 +2706,9 @@ mod tests {
             Value::build_text("subsec".to_string()),
         ]);
         match res2 {
-            Value::Float(f) => assert!((f - 0.999).abs() < f64::EPSILON),
+            Value::Numeric(Numeric::Float(f)) => {
+                assert!((f64::from(f) - 0.999).abs() < f64::EPSILON)
+            }
             _ => panic!("Expected Float result"),
         }
     }
@@ -3026,7 +3031,7 @@ mod tests {
         let modifier_with_multibyte = "swww\0\u{1}\t\0\u{fffd}\u{fffd}\u{f}W";
         let args = &[
             Value::build_text("".to_string()),
-            Value::Float(-1.8041807844761696e230),
+            Value::from_f64(-1.8041807844761696e230),
             Value::build_text(modifier_with_multibyte.to_string()),
         ];
         // Should not panic, just return an error or null
@@ -3036,7 +3041,7 @@ mod tests {
         let weekday_modifier = "weekda\u{fffd}\u{fffd}";
         let args2 = &[
             Value::build_text("".to_string()),
-            Value::Float(0.0),
+            Value::from_f64(0.0),
             Value::build_text(weekday_modifier.to_string()),
         ];
         let _ = exec_strftime(args2.iter());

@@ -3,7 +3,9 @@ use pyo3::{
     types::{PyBytes, PyTuple},
 };
 use std::sync::Arc;
-use turso_sdk_kit::rsapi::{self, EncryptionOpts, TursoError, TursoStatusCode, Value, ValueRef};
+use turso_sdk_kit::rsapi::{
+    self, EncryptionOpts, Numeric, TursoError, TursoStatusCode, Value, ValueRef,
+};
 
 use pyo3::create_exception;
 use pyo3::exceptions::PyException;
@@ -360,8 +362,9 @@ impl PyTursoStatement {
 fn db_value_to_py(py: Python, value: rsapi::ValueRef) -> PyResult<Py<PyAny>> {
     match value {
         ValueRef::Null => Ok(py.None()),
-        ValueRef::Integer(i) => Ok(i.into_pyobject(py)?.into()),
-        ValueRef::Float(f) => Ok(f.into_pyobject(py)?.into()),
+        ValueRef::Numeric(Numeric::Integer(i)) => Ok(i.into_pyobject(py)?.into()),
+        ValueRef::Numeric(Numeric::Float(f)) => Ok(f64::from(f).into_pyobject(py)?.into()),
+        ValueRef::Numeric(Numeric::Null) => Ok(py.None()),
         ValueRef::Text(s) => Ok(s.as_str().into_pyobject(py)?.into()),
         ValueRef::Blob(b) => Ok(PyBytes::new(py, b).into()),
     }
@@ -372,9 +375,9 @@ fn py_to_db_value(obj: Bound<PyAny>) -> PyResult<Value> {
     if obj.is_none() {
         Ok(Value::Null)
     } else if let Ok(integer) = obj.extract::<i64>() {
-        Ok(Value::Integer(integer))
+        Ok(Value::from_i64(integer))
     } else if let Ok(float) = obj.extract::<f64>() {
-        Ok(Value::Float(float))
+        Ok(Value::from_f64(float))
     } else if let Ok(string) = obj.extract::<String>() {
         Ok(Value::Text(string.into()))
     } else if let Ok(bytes) = obj.cast::<PyBytes>() {

@@ -36,6 +36,8 @@ pub type Value = turso_core::Value;
 pub type ValueRef<'a> = turso_core::types::ValueRef<'a>;
 pub type Text = turso_core::types::Text;
 pub type TextRef<'a> = turso_core::types::TextRef<'a>;
+pub type Numeric = turso_core::Numeric;
+pub type NonNan = turso_core::NonNan;
 
 pub struct TursoLog<'a> {
     pub message: &'a str,
@@ -1219,7 +1221,7 @@ mod tests {
 
         fn assert_integer(value: ValueRef, expected: i64) {
             match value {
-                ValueRef::Integer(i) => assert_eq!(i, expected),
+                ValueRef::Numeric(turso_core::Numeric::Integer(i)) => assert_eq!(i, expected),
                 _ => panic!("Expected integer {expected}, got {value:?}"),
             }
         }

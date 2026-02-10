@@ -678,8 +678,13 @@ fn convert_to_args(values: Vec<turso_core::Value>) -> Vec<server_proto::Value> {
         .into_iter()
         .map(|value| match value {
             Value::Null => server_proto::Value::Null,
-            Value::Integer(value) => server_proto::Value::Integer { value },
-            Value::Float(value) => server_proto::Value::Float { value },
+            Value::Numeric(turso_core::Numeric::Integer(value)) => {
+                server_proto::Value::Integer { value }
+            }
+            Value::Numeric(turso_core::Numeric::Float(value)) => server_proto::Value::Float {
+                value: f64::from(value),
+            },
+            Value::Numeric(turso_core::Numeric::Null) => server_proto::Value::Null,
             Value::Text(value) => server_proto::Value::Text {
                 value: value.as_str().to_string(),
             },
@@ -717,7 +722,7 @@ pub async fn count_local_changes<Ctx>(
     change_id: i64,
 ) -> Result<i64> {
     let mut stmt = conn.prepare("SELECT COUNT(*) FROM turso_cdc WHERE change_id > ?")?;
-    stmt.bind_at(1.try_into().unwrap(), Value::Integer(change_id));
+    stmt.bind_at(1.try_into().unwrap(), Value::from_i64(change_id));
 
     let count = match run_stmt_expect_one_row(coro, &mut stmt).await? {
         Some(row) => row[0]
@@ -750,8 +755,11 @@ pub async fn update_last_change_id<Ctx>(
 
     if row.is_some() {
         let mut update_stmt = conn.prepare(TURSO_SYNC_UPDATE_LAST_CHANGE_ID)?;
-        update_stmt.bind_at(1.try_into().unwrap(), turso_core::Value::Integer(pull_gen));
-        update_stmt.bind_at(2.try_into().unwrap(), turso_core::Value::Integer(change_id));
+        update_stmt.bind_at(1.try_into().unwrap(), turso_core::Value::from_i64(pull_gen));
+        update_stmt.bind_at(
+            2.try_into().unwrap(),
+            turso_core::Value::from_i64(change_id),
+        );
         update_stmt.bind_at(
             3.try_into().unwrap(),
             turso_core::Value::Text(turso_core::types::Text::new(client_id.to_string())),
@@ -764,8 +772,11 @@ pub async fn update_last_change_id<Ctx>(
             1.try_into().unwrap(),
             turso_core::Value::Text(turso_core::types::Text::new(client_id.to_string())),
         );
-        update_stmt.bind_at(2.try_into().unwrap(), turso_core::Value::Integer(pull_gen));
-        update_stmt.bind_at(3.try_into().unwrap(), turso_core::Value::Integer(change_id));
+        update_stmt.bind_at(2.try_into().unwrap(), turso_core::Value::from_i64(pull_gen));
+        update_stmt.bind_at(
+            3.try_into().unwrap(),
+            turso_core::Value::from_i64(change_id),
+        );
         run_stmt_ignore_rows(coro, &mut update_stmt).await?;
         tracing::info!(
             "update_last_change_id(client_id={client_id}): inserted new row for the client"

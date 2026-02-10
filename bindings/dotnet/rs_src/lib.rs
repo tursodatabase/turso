@@ -71,8 +71,8 @@ pub fn to_value(value: TursoValue) -> Value {
     match value.value_type {
         ValueType::Empty => Value::Null,
         ValueType::Null => Value::Null,
-        ValueType::Integer => Value::Integer(unsafe { value.value.int_val }),
-        ValueType::Float => Value::Float(unsafe { value.value.real_val }),
+        ValueType::Integer => Value::from_i64(unsafe { value.value.int_val }),
+        ValueType::Float => Value::from_f64(unsafe { value.value.real_val }),
         ValueType::Blob => Value::Blob(to_vec(unsafe { value.value.blob })),
         ValueType::Text => {
             let slice =
@@ -418,15 +418,19 @@ pub unsafe extern "C" fn db_statement_get_value(
                 value_type: ValueType::Null,
                 value: TursoValueUnion { int_val: 0 },
             },
-            Value::Integer(int_val) => TursoValue {
+            Value::Numeric(turso_core::Numeric::Integer(int_val)) => TursoValue {
                 value_type: ValueType::Integer,
                 value: TursoValueUnion { int_val: *int_val },
             },
-            Value::Float(float_value) => TursoValue {
+            Value::Numeric(turso_core::Numeric::Float(float_value)) => TursoValue {
                 value_type: ValueType::Float,
                 value: TursoValueUnion {
-                    real_val: *float_value,
+                    real_val: f64::from(*float_value),
                 },
+            },
+            Value::Numeric(turso_core::Numeric::Null) => TursoValue {
+                value_type: ValueType::Null,
+                value: TursoValueUnion { int_val: 0 },
             },
             Value::Text(text) => {
                 let array = Array {

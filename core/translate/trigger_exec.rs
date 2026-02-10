@@ -591,7 +591,7 @@ fn execute_trigger_commands(
             new_regs
                 .iter()
                 .copied()
-                .map(|reg_idx| crate::types::Value::Integer(reg_idx as i64)),
+                .map(|reg_idx| crate::types::Value::from_i64(reg_idx as i64)),
         );
     }
     if let Some(old_regs) = &ctx.old_registers {
@@ -599,7 +599,7 @@ fn execute_trigger_commands(
             old_regs
                 .iter()
                 .copied()
-                .map(|reg_idx| crate::types::Value::Integer(reg_idx as i64)),
+                .map(|reg_idx| crate::types::Value::from_i64(reg_idx as i64)),
         );
     }
 
