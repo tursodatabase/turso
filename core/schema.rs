@@ -1769,6 +1769,11 @@ impl BTreeTable {
                 sql.push_str(" AS (");
                 sql.push_str(&generated.to_string());
                 sql.push(')');
+                if column.is_generated_stored() {
+                    sql.push_str(" STORED");
+                } else {
+                    sql.push_str(" VIRTUAL");
+                }
             }
         }
 
@@ -2076,6 +2081,8 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                 };
 
                 let mut default = None;
+                let mut generated = None;
+                let mut generated_stored = false;
                 let mut primary_key = false;
                 let mut notnull = false;
                 let mut order = SortOrder::Asc;
@@ -2086,9 +2093,14 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                         ast::ColumnConstraint::Check { .. } => {
                             crate::bail_parse_error!("CHECK constraints are not yet supported");
                         }
-                        ast::ColumnConstraint::Generated { .. } => {
-                            // todo(sivukhin): table_xinfo must be updated when generated columns will be supported in order to properly emit "hidden" column value
-                            crate::bail_parse_error!("GENERATED columns are not yet supported");
+                        ast::ColumnConstraint::Generated { expr, typ } => {
+                            // Generated columns are now supported
+                            // Note: table_xinfo will need to be updated to properly emit "hidden" column value
+                            generated = Some(expr.clone());
+                            generated_stored = typ
+                                .as_ref()
+                                .map(|t| t.as_str().eq_ignore_ascii_case("STORED"))
+                                .unwrap_or(false);
                         }
                         ast::ColumnConstraint::PrimaryKey {
                             order: o,
@@ -2219,7 +2231,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                     Some(normalize_ident(&name)),
                     ty_str,
                     default,
-                    None,
+                    generated,
                     ty,
                     collation,
                     ColDef {
@@ -2230,6 +2242,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                         notnull,
                         unique,
                         hidden: false,
+                        generated_stored,
                     },
                 ));
             }
@@ -2471,6 +2484,7 @@ pub struct ColDef {
     pub notnull: bool,
     pub unique: bool,
     pub hidden: bool,
+    pub generated_stored: bool,
 }
 
 // flags
@@ -2479,9 +2493,10 @@ const F_ROWID_ALIAS: u16 = 2;
 const F_NOTNULL: u16 = 4;
 const F_UNIQUE: u16 = 8;
 const F_HIDDEN: u16 = 16;
+const F_GENERATED_STORED: u16 = 32;
 
 // pack Type and Collation in the remaining bits
-const TYPE_SHIFT: u16 = 5;
+const TYPE_SHIFT: u16 = 6;
 const TYPE_MASK: u16 = 0b111 << TYPE_SHIFT;
 const COLL_SHIFT: u16 = TYPE_SHIFT + 3;
 const COLL_MASK: u16 = 0b11 << COLL_SHIFT;
@@ -2549,6 +2564,9 @@ impl Column {
         }
         if coldef.hidden {
             raw |= F_HIDDEN
+        }
+        if coldef.generated_stored {
+            raw |= F_GENERATED_STORED
         }
         Self {
             name,
@@ -2619,6 +2637,21 @@ impl Column {
     }
 
     #[inline]
+    pub const fn is_generated(&self) -> bool {
+        self.generated.is_some()
+    }
+
+    #[inline]
+    pub const fn is_generated_stored(&self) -> bool {
+        self.raw & F_GENERATED_STORED != 0
+    }
+
+    #[inline]
+    pub const fn is_generated_virtual(&self) -> bool {
+        self.is_generated() && !self.is_generated_stored()
+    }
+
+    #[inline]
     pub const fn set_primary_key(&mut self, v: bool) {
         self.set_flag(F_PRIMARY_KEY, v);
     }
@@ -2640,6 +2673,11 @@ impl Column {
     }
 
     #[inline]
+    pub const fn set_generated_stored(&mut self, v: bool) {
+        self.set_flag(F_GENERATED_STORED, v);
+    }
+
+    #[inline]
     const fn set_flag(&mut self, mask: u16, val: bool) {
         if val {
             self.raw |= mask
@@ -2656,6 +2694,7 @@ impl From<&ColumnDefinition> for Column {
 
         let mut default = None;
         let mut generated = None;
+        let mut generated_stored = false;
         let mut notnull = false;
         let mut primary_key = false;
         let mut unique = false;
@@ -2677,8 +2716,13 @@ impl From<&ColumnDefinition> for Column {
                             .expect("collation should have been set correctly in create table"),
                     );
                 }
-                ast::ColumnConstraint::Generated { expr, .. } => {
+                ast::ColumnConstraint::Generated { expr, typ } => {
                     generated = Some(expr.clone());
+                    // Default to VIRTUAL if not specified, or if explicitly STORED
+                    generated_stored = typ
+                        .as_ref()
+                        .map(|t| t.as_str().eq_ignore_ascii_case("STORED"))
+                        .unwrap_or(false);
                 }
                 _ => {}
             };
@@ -2710,6 +2754,7 @@ impl From<&ColumnDefinition> for Column {
                 notnull,
                 unique,
                 hidden,
+                generated_stored,
             },
         )
     }

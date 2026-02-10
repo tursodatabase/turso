@@ -499,6 +499,7 @@ mod tests {
                         notnull: false,
                         unique: true,
                         hidden: false,
+                        generated_stored: false,
                     },
                 )],
                 unique_sets: vec![],

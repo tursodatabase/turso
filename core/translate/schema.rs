@@ -45,9 +45,6 @@ fn validate(body: &ast::CreateTableBody, connection: &Connection) -> Result<()> 
                     ast::ColumnConstraint::Check { .. } => {
                         bail_parse_error!("CHECK constraints are not supported yet");
                     }
-                    ast::ColumnConstraint::Generated { .. } => {
-                        bail_parse_error!("GENERATED columns are not supported yet");
-                    }
                     ast::ColumnConstraint::NotNull {
                         conflict_clause, ..
                     }
@@ -71,7 +68,62 @@ fn validate(body: &ast::CreateTableBody, connection: &Connection) -> Result<()> 
                 }
             }
         }
+
+        // Validate generated columns
+        validate_generated_columns(columns)?;
     }
+    Ok(())
+}
+
+fn validate_generated_columns(columns: &[ast::ColumnDefinition]) -> Result<()> {
+    let mut has_non_generated = false;
+
+    for col in columns {
+        let mut has_generated = false;
+        let mut has_default = false;
+        let mut is_primary_key = false;
+
+        for constraint in &col.constraints {
+            match &constraint.constraint {
+                ast::ColumnConstraint::Generated { .. } => {
+                    has_generated = true;
+                }
+                ast::ColumnConstraint::Default(_) => {
+                    has_default = true;
+                }
+                ast::ColumnConstraint::PrimaryKey { .. } => {
+                    is_primary_key = true;
+                }
+                _ => {}
+            }
+        }
+
+        // Generated columns cannot have DEFAULT
+        if has_generated && has_default {
+            bail_parse_error!(
+                "generated column \"{}\" cannot have a default value",
+                col.col_name.as_str()
+            );
+        }
+
+        // Generated columns cannot be PRIMARY KEY (SQLite restriction)
+        if has_generated && is_primary_key {
+            bail_parse_error!(
+                "generated column \"{}\" cannot be part of the primary key",
+                col.col_name.as_str()
+            );
+        }
+
+        if !has_generated {
+            has_non_generated = true;
+        }
+    }
+
+    // Every table must have at least one non-generated column
+    if !has_non_generated {
+        bail_parse_error!("every table must have at least one non-generated column");
+    }
+
     Ok(())
 }
 
