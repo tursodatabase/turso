@@ -76,6 +76,7 @@ pub fn translate_pragma(
             // These pragmas take a parameter but are queries, not setters
             PragmaName::TableInfo
             | PragmaName::TableXinfo
+            | PragmaName::IndexList
             | PragmaName::IntegrityCheck
             | PragmaName::QuickCheck => {
                 query_pragma(pragma, resolver, Some(*value), pager, connection, program)?
@@ -342,6 +343,7 @@ fn update_pragma(
         }
         PragmaName::IntegrityCheck => unreachable!("integrity_check cannot be set"),
         PragmaName::QuickCheck => unreachable!("quick_check cannot be set"),
+        PragmaName::IndexList => unreachable!("index_list cannot be set"),
         PragmaName::UnstableCaptureDataChangesConn => {
             let value = parse_string(&value)?;
             // todo(sivukhin): ideally, we should consistently update capture_data_changes connection flag only after successfull execution of schema change statement
@@ -686,6 +688,71 @@ fn query_pragma(
                 "pk",
                 "hidden",
             ];
+            for name in col_names {
+                program.add_pragma_result_column(name.into());
+            }
+            Ok((program, TransactionMode::None))
+        }
+        PragmaName::IndexList => {
+            let table_name = match value {
+                Some(ast::Expr::Name(name)) => Some(normalize_ident(name.as_str())),
+                _ => None,
+            };
+
+            let base_reg = register;
+            // we need 5 registers for seq, name, unique, origin, partial
+            // first register was allocated at the beginning of the "query_pragma" function
+            program.alloc_registers(4);
+
+            if let Some(table_name) = table_name {
+                // Get indexes for the table, filter out backing btree indexes
+                for (seq, index) in schema.get_indices(&table_name).enumerate() {
+                    // seq
+                    program.emit_int(seq as i64, base_reg);
+
+                    // name
+                    program.emit_string8(index.name.clone(), base_reg + 1);
+
+                    // unique (1 if unique, 0 otherwise)
+                    program.emit_int(if index.unique { 1 } else { 0 }, base_reg + 2);
+
+                    // origin: "c" = CREATE INDEX, "u" = UNIQUE constraint, "pk" = PRIMARY KEY
+                    let origin = if index.name.starts_with("sqlite_autoindex_") {
+                        // Check if this is a primary key index
+                        // Primary key indexes are created by automatic_from_primary_key
+                        // We can detect this by checking if the index columns match the table's primary key columns
+                        if let Some(table) = schema.get_btree_table(&table_name) {
+                            let pk_cols: Vec<&str> = table
+                                .primary_key_columns
+                                .iter()
+                                .map(|(name, _)| name.as_str())
+                                .collect();
+                            let idx_cols: Vec<&str> =
+                                index.columns.iter().map(|c| c.name.as_str()).collect();
+                            if pk_cols == idx_cols {
+                                "pk"
+                            } else {
+                                "u"
+                            }
+                        } else {
+                            "u"
+                        }
+                    } else {
+                        "c"
+                    };
+                    program.emit_string8(origin.to_string(), base_reg + 3);
+
+                    // partial (1 if partial index, 0 otherwise)
+                    program.emit_int(
+                        if index.where_clause.is_some() { 1 } else { 0 },
+                        base_reg + 4,
+                    );
+
+                    program.emit_result_row(base_reg, 5);
+                }
+            }
+
+            let col_names = ["seq", "name", "unique", "origin", "partial"];
             for name in col_names {
                 program.add_pragma_result_column(name.into());
             }

@@ -284,4 +284,91 @@ expect {
     1024
 }
 
+test pragma-index-list-empty {
+    CREATE TABLE t1 (a, b);
+    PRAGMA index_list(t1);
+}
+expect {
+}
+
+test pragma-index-list-create-index {
+    CREATE TABLE t2 (a, b);
+    CREATE INDEX t2_idx ON t2(a);
+    PRAGMA index_list(t2);
+}
+expect {
+    0|t2_idx|0|c|0
+}
+
+test pragma-index-list-unique-index {
+    CREATE TABLE t3 (a, b);
+    CREATE UNIQUE INDEX t3_idx ON t3(a);
+    PRAGMA index_list(t3);
+}
+expect {
+    0|t3_idx|1|c|0
+}
+
+test pragma-index-list-primary-key {
+    CREATE TABLE t4 (a PRIMARY KEY, b);
+    PRAGMA index_list(t4);
+}
+expect {
+    0|sqlite_autoindex_t4_1|1|pk|0
+}
+
+test pragma-index-list-unique-constraint {
+    CREATE TABLE t5 (a UNIQUE, b);
+    PRAGMA index_list(t5);
+}
+expect {
+    0|sqlite_autoindex_t5_1|1|u|0
+}
+
+test pragma-index-list-multiple-indexes {
+    CREATE TABLE t6 (a, b, c);
+    CREATE INDEX t6_idx_a ON t6(a);
+    CREATE INDEX t6_idx_b ON t6(b);
+    PRAGMA index_list(t6);
+}
+expect {
+    0|t6_idx_b|0|c|0
+    1|t6_idx_a|0|c|0
+}
+
+test pragma-index-list-mixed-origins {
+    CREATE TABLE t7 (a PRIMARY KEY, b UNIQUE, c);
+    CREATE INDEX t7_idx ON t7(c);
+    PRAGMA index_list(t7);
+}
+expect {
+    0|t7_idx|0|c|0
+    1|sqlite_autoindex_t7_2|1|u|0
+    2|sqlite_autoindex_t7_1|1|pk|0
+}
+
+test pragma-index-list-equal-syntax {
+    CREATE TABLE t8 (a, b);
+    CREATE INDEX t8_idx ON t8(a);
+    PRAGMA index_list=t8;
+}
+expect {
+    0|t8_idx|0|c|0
+}
+
+test pragma-index-list-nonexistent-table {
+    PRAGMA index_list(nonexistent_table);
+}
+expect {
+}
+
+test pragma-index-list-partial-index {
+    CREATE TABLE t9 (a, b);
+    CREATE INDEX t9_idx ON t9(a) WHERE a > 10;
+    PRAGMA index_list(t9);
+}
+expect {
+    0|t9_idx|0|c|1
+}
+
 
