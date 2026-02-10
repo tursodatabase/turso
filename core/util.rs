@@ -1200,20 +1200,35 @@ fn parse_numeric_str(text: &str) -> Result<(ValueType, &str), ()> {
     ))
 }
 
-// Check if float can be losslessly converted to 51-bit integer
+// Check if float can be converted to integer for INTEGER PRIMARY KEY columns.
+// SQLite uses sqlite3VdbeIntegerAffinity which requires:
+// 1. The float must round-trip correctly (float -> int -> float gives same value)
+// 2. The integer must be strictly between i64::MIN and i64::MAX (exclusive)
+//
+// This matches SQLite's check: ix > SMALLEST_INT64 && ix < LARGEST_INT64
 pub fn cast_real_to_integer(float: f64) -> std::result::Result<i64, ()> {
+    // Must be finite and a whole number (no fractional part)
     if !float.is_finite() || float.trunc() != float {
         return Err(());
     }
 
-    let limit = (1i64 << 51) as f64;
-    let truncated = float.trunc();
+    // Convert to i64, clamping to i64 range if necessary
+    // Note: Rust's f64 as i64 saturates to i64::MIN/MAX for out-of-range values
+    let int_val = float as i64;
 
-    if truncated.abs() >= limit {
+    // SQLite requires the value to be STRICTLY between i64::MIN and i64::MAX
+    // (i.e., ix > SMALLEST_INT64 && ix < LARGEST_INT64)
+    if int_val == i64::MIN || int_val == i64::MAX {
         return Err(());
     }
 
-    Ok(truncated as i64)
+    // Verify round-trip: converting back to f64 must give the same value
+    // This matches SQLite's check: pMem->u.r == ix
+    if (int_val as f64) != float {
+        return Err(());
+    }
+
+    Ok(int_val)
 }
 
 // we don't need to verify the numeric literal here, as it is already verified by the parser
@@ -2916,11 +2931,42 @@ pub mod tests {
 
     #[test]
     fn test_cast_real_to_integer_limits() {
+        // Values that are exactly representable in f64 and strictly within i64 range
         let max_exact = ((1i64 << 51) - 1) as f64;
         assert_eq!(cast_real_to_integer(max_exact), Ok((1i64 << 51) - 1));
         assert_eq!(cast_real_to_integer(-max_exact), Ok(-((1i64 << 51) - 1)));
 
-        assert_eq!(cast_real_to_integer((1i64 << 51) as f64), Err(()));
+        // Values beyond 2^51 are valid if they round-trip correctly and are strictly within bounds
+        assert_eq!(cast_real_to_integer((1i64 << 51) as f64), Ok(1i64 << 51));
+        assert_eq!(cast_real_to_integer((1i64 << 52) as f64), Ok(1i64 << 52));
+
+        // 2^62 round-trips correctly and is strictly between i64::MIN and i64::MAX
+        assert_eq!(cast_real_to_integer((1i64 << 62) as f64), Ok(1i64 << 62));
+
+        // The original bug's value: 426601719749026560 should work
+        assert_eq!(
+            cast_real_to_integer(426601719749026560.0),
+            Ok(426601719749026560)
+        );
+
+        // SQLite rejects boundary values: i64::MIN and i64::MAX exactly
+        // (ix > SMALLEST_INT64 && ix < LARGEST_INT64 requires STRICT inequality)
         assert_eq!(cast_real_to_integer(i64::MIN as f64), Err(()));
+        assert_eq!(cast_real_to_integer(i64::MAX as f64), Err(()));
+
+        // Values at or beyond i64::MAX + 1 (2^63) should fail
+        assert_eq!(cast_real_to_integer(9223372036854775808.0), Err(()));
+
+        // Values below i64::MIN should fail
+        assert_eq!(cast_real_to_integer(-9223372036854777856.0), Err(()));
+
+        // Non-whole numbers should fail
+        assert_eq!(cast_real_to_integer(1.5), Err(()));
+        assert_eq!(cast_real_to_integer(-1.5), Err(()));
+
+        // Non-finite values should fail
+        assert_eq!(cast_real_to_integer(f64::INFINITY), Err(()));
+        assert_eq!(cast_real_to_integer(f64::NEG_INFINITY), Err(()));
+        assert_eq!(cast_real_to_integer(f64::NAN), Err(()));
     }
 }
