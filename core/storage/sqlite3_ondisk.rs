@@ -1246,7 +1246,7 @@ pub fn varint_len(value: u64) -> usize {
     // (bits + 6) / 7 is the ceiling of bits / 7.
     let len = bits.div_ceil(7);
 
-    len.max(1)
+    len.clamp(1, 9)
 }
 
 pub fn write_varint(buf: &mut [u8], value: u64) -> usize {
@@ -2035,6 +2035,14 @@ mod tests {
     #[case(&[0x80; 9])] // bits set without end
     fn test_read_varint_malformed_inputs(#[case] buf: &[u8]) {
         assert!(read_varint(buf).is_err());
+    }
+
+    #[test]
+    fn test_varint_len_capped_to_nine_bytes() {
+        assert_eq!(varint_len(0), 1);
+        assert_eq!(varint_len((1u64 << 63) - 1), 9);
+        assert_eq!(varint_len(1u64 << 63), 9);
+        assert_eq!(varint_len(u64::MAX), 9);
     }
 
     #[test]

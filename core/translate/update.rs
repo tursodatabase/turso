@@ -143,6 +143,7 @@ fn validate_update(
     // Check if this is a system table that should be protected from direct writes
     if !is_internal_schema_change
         && !conn.is_nested_stmt()
+        && !conn.is_mvcc_bootstrap_connection()
         && !crate::schema::can_write_to_table(table_name)
     {
         crate::bail_parse_error!("table {} may not be modified", table_name);
