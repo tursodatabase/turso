@@ -854,3 +854,24 @@ expect {
     2|b
     3|c
 }
+
+test update-or-ignore-rowid-change-preserves-index {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, u INTEGER);
+    CREATE UNIQUE INDEX t_u ON t(u);
+    INSERT INTO t VALUES(1, 111);
+    INSERT INTO t VALUES(1000, 222);
+
+    UPDATE OR IGNORE t SET id = 2 WHERE id = 1;
+
+    INSERT OR IGNORE INTO t(id, u) VALUES(2000, 222);
+
+    SELECT id,u FROM t ORDER BY id;
+    SELECT count(*) FROM t WHERE u = 222;
+    PRAGMA integrity_check;
+}
+expect {
+    2|111
+    1000|222
+    1
+    ok
+}

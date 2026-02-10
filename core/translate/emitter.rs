@@ -3181,6 +3181,16 @@ fn emit_update_insns<'a>(
 
             program.preassign_label_to_next_insn(no_rowid_conflict_label);
         }
+
+        if has_user_provided_rowid {
+            if let Some(label) = check_rowid_not_exists_label {
+                program.emit_insn(Insn::NotExists {
+                    cursor: target_table_cursor_id,
+                    rowid_reg: beg,
+                    target_pc: label,
+                });
+            }
+        }
     }
 
     for (index, (idx_cursor_id, record_reg)) in indexes_to_update.iter().zip(index_cursors) {
