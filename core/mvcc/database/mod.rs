@@ -47,6 +47,8 @@ use super::persistent_storage::logical_log::StreamingLogicalLogReader;
 use super::persistent_storage::logical_log::StreamingResult;
 
 #[cfg(test)]
+pub mod hermitage_tests;
+#[cfg(test)]
 pub mod tests;
 
 /// Sentinel value for `MvStore::exclusive_tx` indicating no exclusive transaction is active.
