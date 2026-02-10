@@ -959,9 +959,8 @@ impl WalFile {
             self.max_frame_read_lock_index
                 .load(Ordering::Acquire)
                 .eq(&NO_LOCK_HELD),
-            "cannot start a new read tx without ending an existing one, lock_value={}, expected={}",
-            self.max_frame_read_lock_index.load(Ordering::Acquire),
-            NO_LOCK_HELD
+            "cannot start a new read tx without ending an existing one",
+            { "lock_value": self.max_frame_read_lock_index.load(Ordering::Acquire), "expected": NO_LOCK_HELD }
         );
 
         // Snapshot the shared WAL state. We haven't taken a read lock yet, so we need
@@ -1302,7 +1301,8 @@ impl Wal for WalFile {
             let nbackfills = shared.nbackfills.load(Ordering::Acquire);
             turso_assert!(
                 frame_watermark.is_none() || frame_watermark.unwrap() >= nbackfills,
-                "frame_watermark must be >= than current WAL backfill amount: frame_watermark={:?}, nBackfill={}", frame_watermark, nbackfills
+                "frame_watermark must be >= than current WAL backfill amount",
+                { "frame_watermark": frame_watermark, "nbackfills": nbackfills }
             );
         });
 
@@ -1469,9 +1469,8 @@ impl Wal for WalFile {
                     Ok(decrypted_data) => {
                         turso_assert!(
                             (frame_len - WAL_FRAME_HEADER_SIZE) == decrypted_data.len(),
-                            "frame_len - header_size({}) != expected({})",
-                            frame_len - WAL_FRAME_HEADER_SIZE,
-                            decrypted_data.len()
+                            "frame_len minus header_size does not equal expected decrypted data length",
+                            { "frame_len_minus_header": frame_len - WAL_FRAME_HEADER_SIZE, "decrypted_data_len": decrypted_data.len() }
                         );
                         frame_ref[WAL_FRAME_HEADER_SIZE..].copy_from_slice(&decrypted_data);
                     }
@@ -1742,9 +1741,8 @@ impl Wal for WalFile {
         let mut seen = FxHashSet::default();
         turso_assert!(
             frame_count >= frame_watermark,
-            "frame_count must be not less than frame_watermark: {} vs {}",
-            frame_count,
-            frame_watermark
+            "frame_count must be not less than frame_watermark",
+            { "frame_count": frame_count, "frame_watermark": frame_watermark }
         );
         let mut pages = Vec::with_capacity((frame_count - frame_watermark) as usize);
         for frame_no in frame_watermark + 1..=frame_count {
@@ -1859,9 +1857,8 @@ impl Wal for WalFile {
 
         turso_assert!(
             header.page_size == page_sz.get(),
-            "page size mismatch: header={}, requested={}",
-            header.page_size,
-            page_sz.get()
+            "page size mismatch between header and requested",
+            { "header_page_size": header.page_size, "requested_page_size": page_sz.get() }
         );
 
         // Either chain from previous batch of PreparedFrames or use committed WAL state
@@ -1994,8 +1991,8 @@ impl Wal for WalFile {
         });
         turso_assert!(
             shared_page_size == page_sz.get(),
-            "page size mismatch, tried to change page size after WAL header was already initialized: shared.page_size={shared_page_size}, page_size={}",
-            page_sz.get()
+            "page size mismatch, tried to change page size after WAL header was already initialized",
+            { "shared_page_size": shared_page_size, "page_size": page_sz.get() }
         );
 
         // Prepare write buffers and bookkeeping
@@ -2059,7 +2056,8 @@ impl Wal for WalFile {
             };
             turso_assert!(
                 bytes_written == total_len,
-                "pwritev wrote {bytes_written} bytes, expected {total_len}"
+                "pwritev wrote unexpected number of bytes",
+                { "bytes_written": bytes_written, "expected": total_len }
             );
 
             for (page, fid, _csum) in &page_frame_for_cb {
@@ -2411,7 +2409,7 @@ impl WalFile {
                                 )?;
                                 let (_, wal_page) = sqlite3_ondisk::parse_wal_frame_header(&raw);
                                 let cached = buffer.as_slice();
-                                turso_assert!(wal_page == cached, "cached page content differs from WAL read for page_id={page_id}, frame_id={target_frame}");
+                                turso_assert!(wal_page == cached, "cached page content differs from WAL read", { "page_id": page_id, "frame_id": target_frame });
                             }
                             {
                                 ongoing_chkpt
@@ -2508,8 +2506,8 @@ impl WalFile {
                                 *self.checkpoint_guard.read(),
                                 Some(CheckpointLocks::Writer { .. })
                             ),
-                            "We must hold writer and checkpoint locks to restart the log, found: {:?}",
-                            *self.checkpoint_guard.read()
+                            "We must hold writer and checkpoint locks to restart the log",
+                            { "checkpoint_guard": *self.checkpoint_guard.read() }
                         );
                         self.restart_log()?;
                     }
@@ -2811,7 +2809,8 @@ impl WalFile {
                 let buf_len = buf.len();
                 turso_assert!(
                     read == buf_len as i32,
-                    "read({read}) != expected({buf_len}): frame_id={frame_id}"
+                    "read bytes does not match expected buffer length",
+                    { "read": read, "expected": buf_len, "frame_id": frame_id }
                 );
                 *buf_slot.lock() = Some(buf);
                 None
