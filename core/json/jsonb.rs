@@ -2385,9 +2385,12 @@ impl Jsonb {
             return Ok(0);
         }
 
+        let end = header_skip
+            .checked_add(header.1)
+            .ok_or_else(|| LimboError::ParseError("malformed JSON".to_string()))?;
         let mut count = 0;
         let mut pos = header_skip;
-        while pos < header_skip + header.1 {
+        while pos < end {
             pos = self.skip_element(pos)?;
             count += 1;
         }
@@ -2970,10 +2973,11 @@ impl Jsonb {
         Err(LimboError::ParseError("Not found".to_string()))
     }
 
-    fn skip_element(&self, mut pos: usize) -> Result<usize> {
+    fn skip_element(&self, pos: usize) -> Result<usize> {
         let (header, skip_header) = self.read_header(pos)?;
-        pos += skip_header + header.1;
-        Ok(pos)
+        pos.checked_add(skip_header)
+            .and_then(|p| p.checked_add(header.1))
+            .ok_or_else(|| LimboError::ParseError("malformed JSON".to_string()))
     }
 
     // TODO Primitive implementation could be optimized.
@@ -4514,5 +4518,23 @@ mod path_operations_tests {
 
         let updated_json = jsonb.to_string().unwrap();
         assert_eq!(updated_json, r#"{"name":"John","age":31,"surname":"Doe"}"#);
+    }
+
+    #[test]
+    fn test_array_len_malformed_overflow() {
+        // Test that malformed JSONB with huge payload size doesn't panic.
+        // This blob has an 8-byte payload size header (header_size = 15) with
+        // a value that would cause overflow when added to the position.
+        // Header byte: 0xFB = element type ARRAY (11) + size marker 15 (8-byte size)
+        // Followed by 8 bytes of near-max u64 value.
+        let malformed: Vec<u8> = vec![
+            0xFB, // ARRAY type (11) with 8-byte payload size marker (15 << 4)
+            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x0F, // huge payload size
+        ];
+        let jsonb = Jsonb { data: malformed };
+
+        // Should return an error instead of panicking with overflow
+        let result = jsonb.array_len();
+        assert!(result.is_err());
     }
 }
