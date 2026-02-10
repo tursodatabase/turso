@@ -23,6 +23,7 @@ pub mod mvcc;
 mod parameters;
 mod pragma;
 mod pseudo;
+mod regexp;
 pub mod schema;
 #[cfg(feature = "series")]
 mod series;

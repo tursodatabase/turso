@@ -222,7 +222,7 @@ Feature support of [sqlite expr syntax](https://www.sqlite.org/lang_expr.html).
 | COLLATE                   | 🚧 Partial | Custom Collations not supported          |
 | (NOT) LIKE                | ✅ Yes     |                                          |
 | (NOT) GLOB                | ✅ Yes     |                                          |
-| (NOT) REGEXP              | ❌ No      |                                          |
+| (NOT) REGEXP              | ✅ Yes     |                                          |
 | (NOT) MATCH               | ❌ No      |                                          |
 | IS (NOT)                  | ✅ Yes     |                                          |
 | IS (NOT) DISTINCT FROM    | ✅ Yes     |                                          |

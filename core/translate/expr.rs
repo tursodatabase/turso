@@ -3628,7 +3628,26 @@ fn translate_like_base(
         ast::LikeOperator::Match => {
             crate::bail_parse_error!("MATCH requires the 'fts' feature to be enabled")
         }
-        ast::LikeOperator::Regexp => crate::bail_parse_error!("REGEXP in LIKE is not supported"),
+        ast::LikeOperator::Regexp => {
+            if escape.is_some() {
+                crate::bail_parse_error!("wrong number of arguments to function regexp()");
+            }
+            let func = resolver.resolve_function("regexp", 2);
+            let Some(func) = func else {
+                crate::bail_parse_error!("no such function: regexp");
+            };
+            let arg_count = 2;
+            let start_reg = program.alloc_registers(arg_count);
+            // regexp(pattern, haystack) — pattern is rhs, haystack is lhs
+            translate_expr(program, referenced_tables, rhs, start_reg, resolver)?;
+            translate_expr(program, referenced_tables, lhs, start_reg + 1, resolver)?;
+            program.emit_insn(Insn::Function {
+                constant_mask: 0,
+                start_reg,
+                dest: target_register,
+                func: FuncCtx { func, arg_count },
+            });
+        }
     }
 
     Ok(target_register)
