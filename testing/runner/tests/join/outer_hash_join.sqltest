@@ -398,7 +398,7 @@ test full-outer-join-mixed-types {
     CREATE TABLE t2(c REAL, d TEXT);
     INSERT INTO t1 VALUES (1, 'x'), (2, 'y'), (3, 'z');
     INSERT INTO t2 VALUES (2.0, 'a'), (4.0, 'b');
-    SELECT t1.a, t2.c FROM t1 FULL OUTER JOIN t2 ON t1.a = t2.c ORDER BY coalesce(t1.a, t2.c);
+    SELECT t1.a, CAST(t2.c AS TEXT) FROM t1 FULL OUTER JOIN t2 ON t1.a = t2.c ORDER BY coalesce(t1.a, t2.c);
 }
 expect {
     1|
