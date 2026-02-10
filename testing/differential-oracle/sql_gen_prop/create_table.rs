@@ -98,6 +98,8 @@ pub struct ColumnProfile {
     pub unique_probability: u8,
     /// Probability (0-100) that a column has a DEFAULT value.
     pub default_probability: u8,
+    /// Probability (0-100) that a column has a CHECK constraint.
+    pub check_constraint_probability: u8,
     /// Weights for data type generation.
     pub data_type_weights: DataTypeWeights,
 }
@@ -108,6 +110,7 @@ impl Default for ColumnProfile {
             not_null_probability: 30,
             unique_probability: 10,
             default_probability: 15,
+            check_constraint_probability: 15,
             data_type_weights: DataTypeWeights::default(),
         }
     }
@@ -120,6 +123,7 @@ impl ColumnProfile {
             not_null_probability: 0,
             unique_probability: 0,
             default_probability: 0,
+            check_constraint_probability: 0,
             data_type_weights: self.data_type_weights,
         }
     }
@@ -130,6 +134,7 @@ impl ColumnProfile {
             not_null_probability: 70,
             unique_probability: 30,
             default_probability: 20,
+            check_constraint_probability: 20,
             data_type_weights: self.data_type_weights,
         }
     }
@@ -140,6 +145,7 @@ impl ColumnProfile {
             not_null_probability: 100,
             unique_probability: 50,
             default_probability: 40,
+            check_constraint_probability: 40,
             data_type_weights: self.data_type_weights,
         }
     }
@@ -159,6 +165,12 @@ impl ColumnProfile {
     /// Builder method to set DEFAULT probability.
     pub fn with_default_probability(mut self, probability: u8) -> Self {
         self.default_probability = probability.min(100);
+        self
+    }
+
+    /// Builder method to set CHECK constraint probability.
+    pub fn with_check_constraint_probability(mut self, probability: u8) -> Self {
+        self.check_constraint_probability = probability.min(100);
         self
     }
 
@@ -495,11 +507,41 @@ fn default_value_for_type(data_type: DataType) -> BoxedStrategy<Option<String>> 
     }
 }
 
+/// Generate a CHECK constraint expression for a given column name and data type.
+fn check_constraint_for_column(name: &str, data_type: DataType) -> BoxedStrategy<Option<String>> {
+    let name = name.to_string();
+    match data_type {
+        DataType::Integer => prop_oneof![
+            Just(Some(format!("{name} >= 0"))),
+            Just(Some(format!("{name} > 0"))),
+            Just(Some(format!("{name} BETWEEN 0 AND 1000"))),
+            Just(Some(format!("{name} != 0"))),
+            (1i64..100).prop_map(move |n| Some(format!("{name} >= {n}"))),
+        ]
+        .boxed(),
+        DataType::Real => prop_oneof![
+            Just(Some(format!("{name} >= 0.0"))),
+            Just(Some(format!("{name} > 0.0"))),
+            Just(Some(format!("{name} BETWEEN 0.0 AND 1000.0"))),
+        ]
+        .boxed(),
+        DataType::Text => prop_oneof![
+            Just(Some(format!("length({name}) > 0"))),
+            Just(Some(format!("length({name}) <= 100"))),
+            Just(Some(format!("{name} != ''"))),
+        ]
+        .boxed(),
+        // Skip CHECK for BLOB and NULL types — they don't have useful comparisons
+        DataType::Blob | DataType::Null => Just(None).boxed(),
+    }
+}
+
 /// Generate a column definition with profile-controlled constraints.
 pub fn column_def_with_profile(profile: &ColumnProfile) -> BoxedStrategy<ColumnDef> {
     let not_null_prob = profile.not_null_probability;
     let unique_prob = profile.unique_probability;
     let default_prob = profile.default_probability;
+    let check_prob = profile.check_constraint_probability;
     let data_type_weights = profile.data_type_weights.clone();
 
     (
@@ -508,12 +550,14 @@ pub fn column_def_with_profile(profile: &ColumnProfile) -> BoxedStrategy<ColumnD
         0u8..100, // for NOT NULL decision
         0u8..100, // for UNIQUE decision
         0u8..100, // for DEFAULT decision
+        0u8..100, // for CHECK decision
     )
         .prop_flat_map(
-            move |(name, dt, not_null_roll, unique_roll, default_roll)| {
+            move |(name, dt, not_null_roll, unique_roll, default_roll, check_roll)| {
                 let nullable = not_null_roll >= not_null_prob;
                 let unique = unique_roll < unique_prob;
                 let has_default = default_roll < default_prob;
+                let has_check = check_roll < check_prob;
 
                 let default_strategy = if has_default {
                     default_value_for_type(dt)
@@ -521,13 +565,22 @@ pub fn column_def_with_profile(profile: &ColumnProfile) -> BoxedStrategy<ColumnD
                     Just(None).boxed()
                 };
 
-                default_strategy.prop_map(move |default| ColumnDef {
-                    name: name.clone(),
-                    data_type: dt,
-                    nullable,
-                    primary_key: false,
-                    unique,
-                    default,
+                let check_strategy = if has_check {
+                    check_constraint_for_column(&name, dt)
+                } else {
+                    Just(None).boxed()
+                };
+
+                (default_strategy, check_strategy).prop_map(move |(default, check_constraint)| {
+                    ColumnDef {
+                        name: name.clone(),
+                        data_type: dt,
+                        nullable,
+                        primary_key: false,
+                        unique,
+                        default,
+                        check_constraint,
+                    }
                 })
             },
         )
@@ -553,6 +606,7 @@ pub fn primary_key_column_def_with_profile(
             primary_key: true,
             unique: false,
             default: None,
+            check_constraint: None,
         })
         .boxed()
 }
@@ -626,6 +680,7 @@ pub fn create_table(
                     primary_key: true,
                     unique: false,
                     default: None,
+                    check_constraint: None,
                 });
             }
 
@@ -661,6 +716,7 @@ mod tests {
                     primary_key: true,
                     unique: false,
                     default: None,
+                    check_constraint: None,
                 },
                 ColumnDef {
                     name: "name".to_string(),
@@ -669,6 +725,7 @@ mod tests {
                     primary_key: false,
                     unique: false,
                     default: None,
+                    check_constraint: None,
                 },
                 ColumnDef {
                     name: "email".to_string(),
@@ -677,6 +734,7 @@ mod tests {
                     primary_key: false,
                     unique: true,
                     default: None,
+                    check_constraint: None,
                 },
             ],
             if_not_exists: false,
@@ -699,6 +757,7 @@ mod tests {
                 primary_key: true,
                 unique: false,
                 default: None,
+                check_constraint: None,
             }],
             if_not_exists: true,
         };

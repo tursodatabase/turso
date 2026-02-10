@@ -1210,6 +1210,7 @@ impl Database {
             is_mvcc_bootstrap_connection: AtomicBool::new(is_mvcc_bootstrap_connection),
             fk_pragma: AtomicBool::new(false),
             fk_deferred_violations: AtomicIsize::new(0),
+            check_constraints_pragma: AtomicBool::new(false),
             vtab_txn_states: RwLock::new(HashSet::default()),
         });
         self.n_connections

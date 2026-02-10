@@ -2414,6 +2414,7 @@ mod tests {
             root_page: 2,
             primary_key_columns: vec![("id".to_string(), turso_parser::ast::SortOrder::Asc)],
             foreign_keys: vec![],
+            check_constraints: vec![],
             columns: vec![
                 SchemaColumn::new(
                     Some("id".to_string()),
@@ -2491,6 +2492,7 @@ mod tests {
             has_autoincrement: false,
             unique_sets: vec![],
             foreign_keys: vec![],
+            check_constraints: vec![],
         };
         schema
             .add_btree_table(Arc::new(orders_table))
@@ -2537,6 +2539,7 @@ mod tests {
             has_autoincrement: false,
             unique_sets: vec![],
             foreign_keys: vec![],
+            check_constraints: vec![],
         };
         schema
             .add_btree_table(Arc::new(products_table))

@@ -1864,7 +1864,7 @@ pub fn insn_to_row(
                 0,
                 format!("drop_column({table}, {column_index})"),
             ),
-            Insn::AddColumn { table, column } => (
+            Insn::AddColumn { table, column, .. } => (
                 "AddColumn",
                 0,
                 0,

@@ -5,14 +5,15 @@ use turso_parser::{
 };
 
 use crate::{
+    error::SQLITE_CONSTRAINT_CHECK,
     function::{AlterTableFunc, Func},
-    schema::{Column, ForeignKey, Table, RESERVED_TABLE_PREFIXES},
+    schema::{CheckConstraint, Column, ForeignKey, Table, RESERVED_TABLE_PREFIXES},
     translate::{
         emitter::Resolver,
-        expr::{walk_expr, WalkControl},
+        expr::{rewrite_between_expr, translate_expr, walk_expr, walk_expr_mut, WalkControl},
         plan::{ColumnUsedMask, OuterQueryReference, TableReferences},
     },
-    util::normalize_ident,
+    util::{check_expr_references_column, normalize_ident},
     vdbe::{
         builder::{CursorType, ProgramBuilder},
         insn::{to_u16, Cookie, Insn, RegisterOrLiteral},
@@ -21,7 +22,10 @@ use crate::{
     LimboError, Result,
 };
 
-use super::{schema::SQLITE_TABLEID, update::translate_update_for_schema_change};
+use super::{
+    schema::{validate_check_expr, SQLITE_TABLEID},
+    update::translate_update_for_schema_change,
+};
 
 fn validate(alter_table: &ast::AlterTableBody, table_name: &str) -> Result<()> {
     // Check if someone is trying to ALTER a system table
@@ -85,6 +89,123 @@ fn default_requires_empty_table(expr: &ast::Expr) -> bool {
         }
         _ => false,
     }
+}
+
+/// Validate CHECK constraints on a newly added column against the column's DEFAULT value.
+///
+/// When a table has existing rows, the new column gets the DEFAULT value (or NULL).
+/// If that value would violate a CHECK constraint, the ALTER TABLE must be rejected.
+/// This emits bytecode that:
+/// 1. Checks if the table has any rows (Rewind)
+/// 2. Evaluates the CHECK expression with the column reference substituted by the DEFAULT
+/// 3. Halts with a CHECK constraint error if the result is false
+fn emit_add_column_check_validation(
+    program: &mut ProgramBuilder,
+    btree: &crate::schema::BTreeTable,
+    original_btree: &Arc<crate::schema::BTreeTable>,
+    new_column_name: &str,
+    column: &Column,
+    constraints: &[ast::NamedColumnConstraint],
+    resolver: &Resolver,
+) -> Result<()> {
+    // Determine the effective default value. If no DEFAULT, existing rows get NULL,
+    // which always passes CHECK per SQL standard (NULL is not false).
+    let default_expr = match &column.default {
+        Some(expr) if !crate::util::expr_contains_null(expr) => *expr.clone(),
+        _ => return Ok(()),
+    };
+
+    // Collect CHECK constraints from the column constraints being added.
+    let check_exprs: Vec<(&Option<ast::Name>, &Box<ast::Expr>)> = constraints
+        .iter()
+        .filter_map(|c| {
+            if let ast::ColumnConstraint::Check(expr) = &c.constraint {
+                Some((&c.name, expr))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    if check_exprs.is_empty() {
+        return Ok(());
+    }
+
+    let table_name = &btree.name;
+    let col_name_lower = normalize_ident(new_column_name);
+
+    // Open the table to check if it has rows.
+    let check_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(original_btree.clone()));
+    program.emit_insn(Insn::OpenRead {
+        cursor_id: check_cursor_id,
+        root_page: original_btree.root_page,
+        db: 0,
+    });
+
+    let skip_check_label = program.allocate_label();
+    program.emit_insn(Insn::Rewind {
+        cursor_id: check_cursor_id,
+        pc_if_empty: skip_check_label,
+    });
+
+    // Table has rows -- evaluate each CHECK constraint with the default value substituted.
+    for (constraint_name, check_expr) in &check_exprs {
+        let mut substituted = (*check_expr).clone();
+        rewrite_between_expr(&mut substituted);
+
+        // Replace references to the new column with the default value expression.
+        let _ = walk_expr_mut(
+            &mut substituted,
+            &mut |e: &mut ast::Expr| -> Result<WalkControl> {
+                match e {
+                    ast::Expr::Id(name) if normalize_ident(name.as_str()) == col_name_lower => {
+                        *e = default_expr.clone();
+                        Ok(WalkControl::SkipChildren)
+                    }
+                    ast::Expr::Qualified(tbl, col)
+                        if normalize_ident(tbl.as_str()) == normalize_ident(table_name)
+                            && normalize_ident(col.as_str()) == col_name_lower =>
+                    {
+                        *e = default_expr.clone();
+                        Ok(WalkControl::SkipChildren)
+                    }
+                    _ => Ok(WalkControl::Continue),
+                }
+            },
+        );
+
+        let result_reg = program.alloc_register();
+        translate_expr(program, None, &substituted, result_reg, resolver)?;
+
+        // CHECK passes if the result is NULL or non-zero (truthy).
+        let check_passed_label = program.allocate_label();
+
+        program.emit_insn(Insn::IsNull {
+            reg: result_reg,
+            target_pc: check_passed_label,
+        });
+
+        program.emit_insn(Insn::If {
+            reg: result_reg,
+            target_pc: check_passed_label,
+            jump_if_null: false,
+        });
+
+        // CHECK failed -- halt with constraint error.
+        let name = match constraint_name {
+            Some(name) => name.as_str().to_string(),
+            None => format!("{check_expr}"),
+        };
+        program.emit_insn(Insn::Halt {
+            err_code: SQLITE_CONSTRAINT_CHECK,
+            description: name,
+        });
+
+        program.preassign_label_to_next_insn(check_passed_label);
+    }
+
+    program.resolve_label(skip_check_label, program.offset());
+    Ok(())
 }
 
 pub fn translate_alter_table(
@@ -243,7 +364,28 @@ pub fn translate_alter_table(
                 }
             }
 
-            // TODO: check usage in CHECK constraint when implemented
+            // Handle CHECK constraints:
+            // - Column-level CHECK constraints for the dropped column are silently removed
+            // - Table-level CHECK constraints referencing the dropped column cause an error
+            let col_normalized = normalize_ident(column_name);
+            for check in &btree.check_constraints {
+                if check.column.is_some() {
+                    // Column-level constraint: will be removed below
+                    continue;
+                }
+                // Table-level constraint: check if it references the dropped column
+                if check_expr_references_column(&check.expr, &col_normalized) {
+                    return Err(LimboError::ParseError(format!(
+                        "error in table {table_name} after drop column: no such column: {column_name}"
+                    )));
+                }
+            }
+            // Remove column-level CHECK constraints for the dropped column
+            btree.check_constraints.retain(|c| {
+                c.column
+                    .as_ref()
+                    .is_none_or(|col| normalize_ident(col) != normalize_ident(column_name))
+            });
 
             // Check if column is used in a foreign key constraint (child side)
             // SQLite does not allow dropping a column that is part of a FK constraint
@@ -415,55 +557,72 @@ pub fn translate_alter_table(
             // TODO: All quoted ids will be quoted with `[]`, we should store some info from the parsed AST
             btree.columns.push(column.clone());
 
-            // Add foreign key constraints to the btree table
-            for constraint in constraints {
-                if let ast::ColumnConstraint::ForeignKey {
-                    clause,
-                    defer_clause,
-                } = constraint.constraint
-                {
-                    let fk = ForeignKey {
-                        parent_table: normalize_ident(clause.tbl_name.as_str()),
-                        parent_columns: clause
+            // Add foreign key constraints and CHECK constraints to the btree table
+            for constraint in &constraints {
+                match &constraint.constraint {
+                    ast::ColumnConstraint::ForeignKey {
+                        clause,
+                        defer_clause,
+                    } => {
+                        let fk = ForeignKey {
+                            parent_table: normalize_ident(clause.tbl_name.as_str()),
+                            parent_columns: clause
+                                .columns
+                                .iter()
+                                .map(|c| normalize_ident(c.col_name.as_str()))
+                                .collect(),
+                            on_delete: clause
+                                .args
+                                .iter()
+                                .find_map(|arg| {
+                                    if let ast::RefArg::OnDelete(act) = arg {
+                                        Some(*act)
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .unwrap_or(ast::RefAct::NoAction),
+                            on_update: clause
+                                .args
+                                .iter()
+                                .find_map(|arg| {
+                                    if let ast::RefArg::OnUpdate(act) = arg {
+                                        Some(*act)
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .unwrap_or(ast::RefAct::NoAction),
+                            child_columns: vec![new_column_name.to_string()],
+                            deferred: match defer_clause {
+                                Some(d) => {
+                                    d.deferrable
+                                        && matches!(
+                                            d.init_deferred,
+                                            Some(ast::InitDeferredPred::InitiallyDeferred)
+                                        )
+                                }
+                                None => false,
+                            },
+                        };
+                        btree.foreign_keys.push(Arc::new(fk));
+                    }
+                    ast::ColumnConstraint::Check(expr) => {
+                        let column_names: Vec<&str> = btree
                             .columns
                             .iter()
-                            .map(|c| normalize_ident(c.col_name.as_str()))
-                            .collect(),
-                        on_delete: clause
-                            .args
-                            .iter()
-                            .find_map(|arg| {
-                                if let ast::RefArg::OnDelete(act) = arg {
-                                    Some(*act)
-                                } else {
-                                    None
-                                }
-                            })
-                            .unwrap_or(ast::RefAct::NoAction),
-                        on_update: clause
-                            .args
-                            .iter()
-                            .find_map(|arg| {
-                                if let ast::RefArg::OnUpdate(act) = arg {
-                                    Some(*act)
-                                } else {
-                                    None
-                                }
-                            })
-                            .unwrap_or(ast::RefAct::NoAction),
-                        child_columns: vec![new_column_name.to_string()],
-                        deferred: match defer_clause {
-                            Some(d) => {
-                                d.deferrable
-                                    && matches!(
-                                        d.init_deferred,
-                                        Some(ast::InitDeferredPred::InitiallyDeferred)
-                                    )
-                            }
-                            None => false,
-                        },
-                    };
-                    btree.foreign_keys.push(Arc::new(fk));
+                            .filter_map(|c| c.name.as_deref())
+                            .collect();
+                        validate_check_expr(expr, &btree.name, &column_names, resolver)?;
+                        btree.check_constraints.push(CheckConstraint::new(
+                            constraint.name.as_ref(),
+                            expr,
+                            Some(new_column_name),
+                        ));
+                    }
+                    _ => {
+                        // Other constraints (PRIMARY KEY, NOT NULL, etc.) are handled elsewhere
+                    }
                 }
             }
 
@@ -499,6 +658,10 @@ pub fn translate_alter_table(
             // This is required for:
             // 1. NOT NULL columns without a non-null default (existing rows would get NULL)
             // 2. Non-deterministic defaults like CURRENT_TIME (can't backfill existing rows)
+            // 3. CHECK constraints on the new column. SQLite evaluates the CHECK against
+            //    all existing rows via pragma_quick_check. We take a stricter approach and
+            //    reject the ALTER if the table has any rows, since we don't yet support
+            //    scanning existing data for constraint validation.
             let needs_notnull_check = column.notnull()
                 && column
                     .default
@@ -547,6 +710,22 @@ pub fn translate_alter_table(
                 program.resolve_label(skip_error_label, program.offset());
             }
 
+            // Validate CHECK constraints against the DEFAULT value for existing rows.
+            // When a column with a CHECK constraint is added and the table has rows,
+            // the default value (or NULL if no DEFAULT) must satisfy the CHECK.
+            // We substitute column references in the CHECK expression with the default
+            // value and evaluate it. If the result is false, we reject the ALTER when
+            // the table has rows.
+            emit_add_column_check_validation(
+                &mut program,
+                &btree,
+                &original_btree,
+                new_column_name,
+                &column,
+                &constraints,
+                resolver,
+            )?;
+
             translate_update_for_schema_change(
                 update,
                 resolver,
@@ -563,6 +742,7 @@ pub fn translate_alter_table(
                     program.emit_insn(Insn::AddColumn {
                         table: table_name.to_owned(),
                         column: Box::new(column),
+                        check_constraints: btree.check_constraints.clone(),
                     });
                 },
             )?

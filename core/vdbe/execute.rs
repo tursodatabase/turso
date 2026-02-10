@@ -20,7 +20,8 @@ use crate::types::{
     ImmutableRecord, IndexInfo, SeekResult, Text,
 };
 use crate::util::{
-    normalize_ident, rewrite_column_references_if_needed, rewrite_fk_parent_cols_if_self_ref,
+    normalize_ident, rewrite_check_expr_column_refs, rewrite_check_expr_table_refs,
+    rewrite_column_references_if_needed, rewrite_fk_parent_cols_if_self_ref,
     rewrite_fk_parent_table_if_needed, rewrite_inline_col_fk_target_if_needed,
     trim_ascii_whitespace,
 };
@@ -40,7 +41,8 @@ use crate::vector::{
 };
 use crate::{
     error::{
-        LimboError, SQLITE_CONSTRAINT, SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY,
+        LimboError, SQLITE_CONSTRAINT, SQLITE_CONSTRAINT_CHECK, SQLITE_CONSTRAINT_NOTNULL,
+        SQLITE_CONSTRAINT_PRIMARYKEY,
     },
     ext::ExtValue,
     function::{AggFunc, ExtFunc, MathFunc, MathFuncArity, ScalarFunc, VectorFunc},
@@ -1881,6 +1883,9 @@ pub fn halt(
         0 => None,
         SQLITE_CONSTRAINT_PRIMARYKEY => Some(LimboError::Constraint(format!(
             "UNIQUE constraint failed: {description} (19)"
+        ))),
+        SQLITE_CONSTRAINT_CHECK => Some(LimboError::Constraint(format!(
+            "CHECK constraint failed: {description} (19)"
         ))),
         SQLITE_CONSTRAINT_NOTNULL => Some(LimboError::Constraint(format!(
             "NOT NULL constraint failed: {description} (19)"
@@ -5754,7 +5759,7 @@ pub fn op_function(
                     };
 
                     let new_tbl_name = if tbl_name == rename_from {
-                        rename_to
+                        rename_to.clone()
                     } else {
                         tbl_name
                     };
@@ -5845,6 +5850,35 @@ pub fn op_function(
                                         &rename_from,
                                         original_rename_to.as_str(),
                                     );
+                                }
+
+                                // Rewrite table-qualified refs in CHECK constraints
+                                // (e.g. t1.a > 0 → t2.a > 0)
+                                if this_table == rename_from {
+                                    for c in &mut constraints {
+                                        if let ast::TableConstraint::Check(ref mut expr) =
+                                            c.constraint
+                                        {
+                                            rewrite_check_expr_table_refs(
+                                                expr,
+                                                &rename_from,
+                                                &rename_to,
+                                            );
+                                        }
+                                    }
+                                    for col in &mut columns {
+                                        for cc in &mut col.constraints {
+                                            if let ast::ColumnConstraint::Check(ref mut expr) =
+                                                cc.constraint
+                                            {
+                                                rewrite_check_expr_table_refs(
+                                                    expr,
+                                                    &rename_from,
+                                                    &rename_to,
+                                                );
+                                            }
+                                        }
+                                    }
                                 }
 
                                 if this_table == rename_from {
@@ -6100,17 +6134,23 @@ pub fn op_function(
                                                     column_def.col_name.as_str(),
                                                 );
                                             }
-                                            _ => {}
+                                            ast::TableConstraint::Check(ref mut expr) => {
+                                                rewrite_check_expr_column_refs(
+                                                    expr,
+                                                    &rename_from,
+                                                    column_def.col_name.as_str(),
+                                                );
+                                            }
                                         }
+                                    }
 
-                                        for col in &mut columns {
-                                            rewrite_column_references_if_needed(
-                                                col,
-                                                &normalized_tbl_name,
-                                                &rename_from,
-                                                column_def.col_name.as_str(),
-                                            );
-                                        }
+                                    for col in &mut columns {
+                                        rewrite_column_references_if_needed(
+                                            col,
+                                            &normalized_tbl_name,
+                                            &rename_from,
+                                            column_def.col_name.as_str(),
+                                        );
                                     }
                                 } else {
                                     // This is a different table, check if it has FKs referencing the renamed column
@@ -10155,7 +10195,7 @@ pub fn op_rename_table(
 
     let conn = program.connection.clone();
 
-    conn.with_schema_mut(|schema| {
+    conn.with_schema_mut(|schema| -> crate::Result<()> {
         if let Some(mut indexes) = schema.indexes.remove(&normalized_from) {
             indexes.iter_mut().for_each(|index| {
                 let index = Arc::make_mut(index);
@@ -10178,6 +10218,15 @@ pub fn op_rename_table(
                     if normalize_ident(&fk.parent_table) == normalized_from {
                         fk.parent_table.clone_from(&normalized_to);
                     }
+                }
+
+                // Rewrite table-qualified refs in CHECK constraints
+                for check in &mut btree.check_constraints {
+                    rewrite_check_expr_table_refs(
+                        &mut check.expr,
+                        &normalized_from,
+                        &normalized_to,
+                    );
                 }
 
                 normalized_to.clone_into(&mut btree.name);
@@ -10205,7 +10254,9 @@ pub fn op_rename_table(
                 }
             }
         }
-    });
+
+        Ok(())
+    })?;
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -10257,7 +10308,14 @@ pub fn op_drop_column(
         };
 
         let btree = Arc::make_mut(btree);
-        btree.columns.remove(*column_index)
+        btree.columns.remove(*column_index);
+        // Remove column-level CHECK constraints for the dropped column
+        let col_name = column_name.clone();
+        btree.check_constraints.retain(|c| {
+            c.column
+                .as_ref()
+                .is_none_or(|col| normalize_ident(col) != normalize_ident(&col_name))
+        });
     });
 
     {
@@ -10315,24 +10373,33 @@ pub fn op_add_column(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
-    load_insn!(AddColumn { table, column }, insn);
+    load_insn!(
+        AddColumn {
+            table,
+            column,
+            check_constraints
+        },
+        insn
+    );
 
     let conn = program.connection.clone();
 
     conn.with_schema_mut(|schema| {
-        let table = schema
+        let table_ref = schema
             .tables
             .get_mut(table)
             .expect("table being altered should be in schema");
 
-        let table = Arc::make_mut(table);
+        let table_ref = Arc::make_mut(table_ref);
 
-        let Table::BTree(btree) = table else {
+        let crate::schema::Table::BTree(btree) = table_ref else {
             panic!("only btree tables can have columns added");
         };
 
         let btree = Arc::make_mut(btree);
-        btree.columns.push((**column).clone())
+        btree.columns.push((**column).clone());
+        // Update CHECK constraints to include any constraints from the new column
+        btree.check_constraints.clone_from(check_constraints);
     });
 
     state.pc += 1;
@@ -10417,13 +10484,24 @@ pub fn op_alter_column(
             }
         }
 
+        // Update CHECK constraint expressions to reference the new column name
+        let old_col_normalized = normalize_ident(&old_column_name);
+        for check in &mut btree.check_constraints {
+            rewrite_check_expr_column_refs(&mut check.expr, &old_col_normalized, &new_name);
+            if let Some(ref mut col) = check.column {
+                if col.eq_ignore_ascii_case(&old_column_name) {
+                    col.clone_from(&new_name);
+                }
+            }
+        }
+
         // Maintain rowid-alias bit after change/rename (INTEGER PRIMARY KEY)
         if !*rename {
             // recompute alias from `new_column`
             btree.columns[*column_index].set_rowid_alias(new_column.is_rowid_alias());
         }
 
-        // Update this table’s OWN foreign keys
+        // Update this table's OWN foreign keys
         for fk_arc in &mut btree.foreign_keys {
             let fk = Arc::make_mut(fk_arc);
             // child side: rename child column if it matches

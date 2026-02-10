@@ -1435,6 +1435,7 @@ mod tests {
             is_strict: false,
             unique_sets: vec![],
             foreign_keys: vec![],
+            check_constraints: vec![],
             has_autoincrement: false,
         };
 
@@ -1478,6 +1479,7 @@ mod tests {
             is_strict: false,
             has_autoincrement: false,
             foreign_keys: vec![],
+            check_constraints: vec![],
             unique_sets: vec![],
         };
 
@@ -1517,6 +1519,7 @@ mod tests {
             is_strict: false,
             has_autoincrement: false,
             foreign_keys: vec![],
+            check_constraints: vec![],
             unique_sets: vec![],
         };
 
@@ -1550,6 +1553,7 @@ mod tests {
             is_strict: false,
             has_autoincrement: false,
             foreign_keys: vec![],
+            check_constraints: vec![],
             unique_sets: vec![],
         };
 

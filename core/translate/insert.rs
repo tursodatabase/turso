@@ -4,8 +4,8 @@ use crate::{
     sync::Arc,
     translate::{
         emitter::{
-            emit_cdc_full_record, emit_cdc_insns, emit_cdc_patch_record, prepare_cdc_if_necessary,
-            OperationMode, Resolver,
+            emit_cdc_full_record, emit_cdc_insns, emit_cdc_patch_record, emit_check_constraints,
+            prepare_cdc_if_necessary, OperationMode, Resolver,
         },
         expr::{
             bind_and_rewrite_expr, emit_returning_results, process_returning_clause,
@@ -515,6 +515,30 @@ pub fn translate_insert(
             }
         }
     }
+
+    // Evaluate CHECK constraints after type affinity/TypeCheck but before other constraints
+    emit_check_constraints(
+        &mut program,
+        &ctx.table.check_constraints,
+        resolver,
+        &ctx.table.name,
+        insertion.key_register(),
+        insertion.col_mappings.iter().filter_map(|m| {
+            m.column.name.as_deref().map(|n| {
+                // Rowid alias columns have NULL in their register (the real value
+                // lives in the key register), so point CHECK to the key register.
+                let reg = if m.column.is_rowid_alias() {
+                    insertion.key_register()
+                } else {
+                    m.register
+                };
+                (n, reg)
+            })
+        }),
+        connection,
+        ctx.on_conflict,
+        ctx.loop_labels.row_done,
+    )?;
 
     // Build a list of upsert constraints/indexes we need to run preflight
     // checks against, in the proper order of evaluation,

@@ -669,6 +669,7 @@ fn add_ephemeral_table_to_update_plan(
         is_strict: false,
         unique_sets: vec![],
         foreign_keys: vec![],
+        check_constraints: vec![],
     });
 
     let temp_cursor_id = program.alloc_cursor_id_keyed(
@@ -1978,9 +1979,10 @@ impl Optimizable for ast::Expr {
             }
             Expr::Cast { expr, .. } => expr.is_constant(resolver),
             Expr::Collate(expr, _) => expr.is_constant(resolver),
-            Expr::DoublyQualified(_, _, _) => {
-                panic!("DoublyQualified should have been rewritten as Column")
-            }
+            // Not constant. Normally rewritten to Expr::Column by the optimizer,
+            // but CHECK constraints bypass the rewrite pass and legitimately
+            // contain DoublyQualified nodes.
+            Expr::DoublyQualified(_, _, _) => false,
             Expr::Exists(_) => false,
             Expr::FunctionCall { args, name, .. } => {
                 let Some(func) = resolver.resolve_function(name.as_str(), args.len()) else {
@@ -2014,9 +2016,10 @@ impl Optimizable for ast::Expr {
             Expr::Name(_) => false,
             Expr::NotNull(expr) => expr.is_constant(resolver),
             Expr::Parenthesized(exprs) => exprs.iter().all(|expr| expr.is_constant(resolver)),
-            Expr::Qualified(_, _) => {
-                panic!("Qualified should have been rewritten as Column")
-            }
+            // Not constant. Normally rewritten to Expr::Column by the optimizer,
+            // but CHECK constraints bypass the rewrite pass and legitimately
+            // contain Qualified nodes.
+            Expr::Qualified(_, _) => false,
             Expr::Raise(_, expr) => expr.as_ref().is_none_or(|expr| expr.is_constant(resolver)),
             Expr::Subquery(_) => false,
             Expr::Unary(_, expr) => expr.is_constant(resolver),

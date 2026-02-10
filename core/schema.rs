@@ -139,7 +139,7 @@ use std::collections::VecDeque;
 use std::ops::Deref;
 use tracing::trace;
 use turso_parser::ast::{
-    self, ColumnDefinition, Expr, InitDeferredPred, Literal, RefAct, SortOrder,
+    self, ColumnDefinition, Expr, InitDeferredPred, Literal, Name, RefAct, SortOrder,
 };
 use turso_parser::{
     ast::{Cmd, CreateTableBody, ResultColumn, Stmt},
@@ -956,7 +956,7 @@ impl Schema {
                 is_strict: false,
                 has_autoincrement: false,
                 foreign_keys: vec![],
-
+                check_constraints: vec![],
                 unique_sets: vec![],
             })));
 
@@ -1677,6 +1677,32 @@ pub struct UniqueSet {
 }
 
 #[derive(Clone, Debug)]
+pub struct CheckConstraint {
+    /// Optional constraint name
+    pub name: Option<String>,
+    /// CHECK expression
+    pub expr: ast::Expr,
+    /// Column name if this is a column-level CHECK constraint (defined inline with the column).
+    /// None if this is a table-level CHECK constraint.
+    pub column: Option<String>,
+}
+
+impl CheckConstraint {
+    pub fn new(name: Option<&ast::Name>, expr: &ast::Expr, column: Option<&str>) -> Self {
+        Self {
+            name: name.map(|n| n.as_str().to_string()),
+            expr: expr.clone(),
+            column: column.map(|s| s.to_string()),
+        }
+    }
+
+    /// Returns the SQL representation of this CHECK constraint (e.g. `CHECK(x > 0)`).
+    pub fn sql(&self) -> String {
+        format!("CHECK({})", self.expr)
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct BTreeTable {
     pub root_page: i64,
     pub name: String,
@@ -1687,6 +1713,7 @@ pub struct BTreeTable {
     pub has_autoincrement: bool,
     pub unique_sets: Vec<UniqueSet>,
     pub foreign_keys: Vec<Arc<ForeignKey>>,
+    pub check_constraints: Vec<CheckConstraint>,
 }
 
 impl BTreeTable {
@@ -1770,6 +1797,19 @@ impl BTreeTable {
                 sql.push_str(&generated.to_string());
                 sql.push(')');
             }
+
+            // Add column-level CHECK constraints inline
+            for check_constraint in &self.check_constraints {
+                if check_constraint.column.as_deref() == Some(column_name) {
+                    sql.push(' ');
+                    if let Some(name) = &check_constraint.name {
+                        sql.push_str("CONSTRAINT ");
+                        sql.push_str(&Name::exact(name.clone()).as_ident());
+                        sql.push(' ');
+                    }
+                    sql.push_str(&check_constraint.sql());
+                }
+            }
         }
 
         let has_table_pk = !self.primary_key_columns.is_empty();
@@ -1829,6 +1869,21 @@ impl BTreeTable {
                 sql.push_str(" DEFERRABLE INITIALLY DEFERRED");
             }
         }
+
+        // Add table-level CHECK constraints (column-level ones were emitted inline above)
+        for check_constraint in &self.check_constraints {
+            if check_constraint.column.is_some() {
+                continue;
+            }
+            sql.push_str(", ");
+            if let Some(name) = &check_constraint.name {
+                sql.push_str("CONSTRAINT ");
+                sql.push_str(&Name::exact(name.clone()).as_ident());
+                sql.push(' ');
+            }
+            sql.push_str(&check_constraint.sql());
+        }
+
         sql.push(')');
 
         // Add STRICT keyword if this is a STRICT table
@@ -1890,6 +1945,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
     let mut has_autoincrement = false;
     let mut primary_key_columns = vec![];
     let mut foreign_keys = vec![];
+    let mut check_constraints = vec![];
     let mut cols = vec![];
     let is_strict: bool;
     let mut unique_sets_columns: Vec<UniqueSet> = vec![];
@@ -2036,6 +2092,8 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                         deferred,
                     };
                     foreign_keys.push(Arc::new(fk));
+                } else if let ast::TableConstraint::Check(expr) = &c.constraint {
+                    check_constraints.push(CheckConstraint::new(c.name.as_ref(), expr, None));
                 }
             }
 
@@ -2083,8 +2141,12 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                 let mut collation = None;
                 for c_def in constraints {
                     match &c_def.constraint {
-                        ast::ColumnConstraint::Check { .. } => {
-                            crate::bail_parse_error!("CHECK constraints are not yet supported");
+                        ast::ColumnConstraint::Check(expr) => {
+                            check_constraints.push(CheckConstraint::new(
+                                c_def.name.as_ref(),
+                                expr,
+                                Some(&name),
+                            ));
                         }
                         ast::ColumnConstraint::Generated { .. } => {
                             // todo(sivukhin): table_xinfo must be updated when generated columns will be supported in order to properly emit "hidden" column value
@@ -2324,6 +2386,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
             }
             unique_sets
         },
+        check_constraints,
     })
 }
 
@@ -2771,6 +2834,7 @@ pub fn sqlite_schema_table() -> BTreeTable {
             Column::new_default_text(Some("sql".to_string()), "TEXT".to_string(), None),
         ],
         foreign_keys: vec![],
+        check_constraints: vec![],
         unique_sets: vec![],
     }
 }
@@ -3462,6 +3526,7 @@ mod tests {
             )],
             unique_sets: vec![],
             foreign_keys: vec![],
+            check_constraints: vec![],
         };
 
         let result =

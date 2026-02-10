@@ -114,6 +114,8 @@ pub struct Connection {
     /// Whether pragma foreign_keys=ON for this connection
     pub(super) fk_pragma: AtomicBool,
     pub(crate) fk_deferred_violations: AtomicIsize,
+    /// Whether pragma ignore_check_constraints=ON for this connection
+    pub(super) check_constraints_pragma: AtomicBool,
     /// Track when each virtual table instance is currently in transaction.
     pub(crate) vtab_txn_states: RwLock<HashSet<u64>>,
 }
@@ -649,6 +651,16 @@ impl Connection {
     pub fn foreign_keys_enabled(&self) -> bool {
         self.fk_pragma.load(Ordering::Acquire)
     }
+
+    pub fn set_check_constraints_ignored(&self, ignore: bool) {
+        self.check_constraints_pragma
+            .store(ignore, Ordering::Release);
+    }
+
+    pub fn check_constraints_ignored(&self) -> bool {
+        self.check_constraints_pragma.load(Ordering::Acquire)
+    }
+
     pub(crate) fn clear_deferred_foreign_key_violations(&self) -> isize {
         self.fk_deferred_violations.swap(0, Ordering::Release)
     }

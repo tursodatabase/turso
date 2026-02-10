@@ -1595,6 +1595,83 @@ pub fn rewrite_fk_parent_cols_if_self_ref(
     }
 }
 
+/// Returns true if the expression tree references a column whose normalized
+/// name equals `col_name_normalized`.
+pub fn check_expr_references_column(expr: &ast::Expr, col_name_normalized: &str) -> bool {
+    let mut found = false;
+    // The closure is infallible, so walk_expr cannot fail.
+    let _ = walk_expr(expr, &mut |e| {
+        if found {
+            return Ok(WalkControl::SkipChildren);
+        }
+        match e {
+            ast::Expr::Id(name) | ast::Expr::Name(name) => {
+                if normalize_ident(name.as_str()) == col_name_normalized {
+                    found = true;
+                    return Ok(WalkControl::SkipChildren);
+                }
+            }
+            ast::Expr::Qualified(_, col) | ast::Expr::DoublyQualified(_, _, col) => {
+                if normalize_ident(col.as_str()) == col_name_normalized {
+                    found = true;
+                    return Ok(WalkControl::SkipChildren);
+                }
+            }
+            _ => {}
+        }
+        Ok(WalkControl::Continue)
+    });
+    found
+}
+
+/// Rewrite column name references in a CHECK constraint expression.
+/// Replaces `Id(old)` and `Name(old)` with `Id(new)`, and updates the
+/// column name in `Qualified(tbl, old)` references.
+pub fn rewrite_check_expr_column_refs(expr: &mut ast::Expr, from: &str, to: &str) {
+    let from_normalized = normalize_ident(from);
+    // The closure is infallible, so walk_expr_mut cannot fail.
+    let _ = walk_expr_mut(
+        expr,
+        &mut |e: &mut ast::Expr| -> crate::Result<WalkControl> {
+            match e {
+                ast::Expr::Id(ref name) | ast::Expr::Name(ref name)
+                    if normalize_ident(name.as_str()) == from_normalized =>
+                {
+                    *e = ast::Expr::Id(ast::Name::exact(to.to_owned()));
+                }
+                ast::Expr::Qualified(ref tbl, ref col_name)
+                    if normalize_ident(col_name.as_str()) == from_normalized =>
+                {
+                    let tbl = tbl.clone();
+                    *e = ast::Expr::Qualified(tbl, ast::Name::exact(to.to_owned()));
+                }
+                _ => {}
+            }
+            Ok(WalkControl::Continue)
+        },
+    );
+}
+
+/// Rewrite table-qualified column references in a CHECK constraint expression,
+/// replacing the table name from `from` to `to`. For example, `t1.a > 0` becomes
+/// `t2.a > 0` when renaming t1 to t2. This matches SQLite 3.49.1+ behavior which
+/// rewrites qualified refs during ALTER TABLE RENAME instead of rejecting them.
+pub fn rewrite_check_expr_table_refs(expr: &mut ast::Expr, from: &str, to: &str) {
+    let from_normalized = normalize_ident(from);
+    let _ = walk_expr_mut(
+        expr,
+        &mut |e: &mut ast::Expr| -> crate::Result<WalkControl> {
+            if let ast::Expr::Qualified(ref tbl, ref col) = *e {
+                if normalize_ident(tbl.as_str()) == from_normalized {
+                    let col = col.clone();
+                    *e = ast::Expr::Qualified(ast::Name::exact(to.to_owned()), col);
+                }
+            }
+            Ok(WalkControl::Continue)
+        },
+    );
+}
+
 /// Update a column-level REFERENCES <tbl>(col,...) constraint
 pub fn rewrite_column_references_if_needed(
     col: &mut ast::ColumnDefinition,
@@ -1603,12 +1680,14 @@ pub fn rewrite_column_references_if_needed(
     to: &str,
 ) {
     for cc in &mut col.constraints {
-        if let ast::NamedColumnConstraint {
-            constraint: ast::ColumnConstraint::ForeignKey { clause, .. },
-            ..
-        } = cc
-        {
-            rewrite_fk_parent_cols_if_self_ref(clause, table, from, to);
+        match &mut cc.constraint {
+            ast::ColumnConstraint::ForeignKey { clause, .. } => {
+                rewrite_fk_parent_cols_if_self_ref(clause, table, from, to);
+            }
+            ast::ColumnConstraint::Check(expr) => {
+                rewrite_check_expr_column_refs(expr, from, to);
+            }
+            _ => {}
         }
     }
 }

@@ -261,3 +261,23 @@ expect {
     20|2
 }
 
+test drop-column-removes-check-constraint {
+    CREATE TABLE t_check (a INTEGER PRIMARY KEY, b REAL CHECK (b BETWEEN 0.0 AND 1000.0), c INTEGER NOT NULL);
+    INSERT INTO t_check VALUES (1, 500.0, 42);
+    ALTER TABLE t_check DROP COLUMN b;
+    INSERT INTO t_check VALUES (2, 99);
+    SELECT * FROM t_check;
+}
+expect {
+    1|42
+    2|99
+}
+
+test fail-drop-column-table-level-check-constraint {
+    CREATE TABLE t_check2 (a INTEGER PRIMARY KEY, b INTEGER, c TEXT, CHECK (b > 0));
+    ALTER TABLE t_check2 DROP COLUMN b;
+}
+expect error {
+    error in table t_check2 after drop column: no such column: b
+}
+
