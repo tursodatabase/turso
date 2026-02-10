@@ -4519,16 +4519,17 @@ pub(crate) fn emit_check_constraints<'a>(
 
     resolver.enable_expr_to_reg_cache();
 
-    emit_check_constraint_bytecode(
+    let result = emit_check_constraint_bytecode(
         program,
         check_constraints,
         resolver,
         or_conflict,
         skip_row_label,
-    )?;
+    );
 
+    // Always restore resolver state, even on error.
     resolver.expr_to_reg_cache.truncate(initial_cache_size);
     resolver.expr_to_reg_cache_enabled = false;
 
-    Ok(())
+    result
 }
