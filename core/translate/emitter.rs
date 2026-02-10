@@ -57,7 +57,9 @@ use crate::translate::trigger_exec::{
 };
 use crate::translate::values::emit_values;
 use crate::translate::window::{emit_window_results, init_window, WindowMetadata};
-use crate::util::{exprs_are_equivalent, normalize_ident, parse_numeric_literal};
+use crate::util::{
+    check_expr_references_column, exprs_are_equivalent, normalize_ident, parse_numeric_literal,
+};
 use crate::vdbe::affinity::Affinity;
 use crate::vdbe::builder::{CursorKey, CursorType, ProgramBuilder};
 use crate::vdbe::insn::{
@@ -4457,32 +4459,9 @@ fn emit_check_constraint_bytecode(
 /// CHECK constraints that only reference columns not in the SET clause, matching
 /// SQLite's optimization behavior.
 fn check_expr_references_columns(expr: &ast::Expr, column_names: &HashSet<String>) -> bool {
-    let mut found = false;
-    let _ = walk_expr(expr, &mut |e| {
-        match e {
-            ast::Expr::Id(name) | ast::Expr::Name(name) => {
-                if column_names.contains(&normalize_ident(name.as_str())) {
-                    found = true;
-                    return Ok(WalkControl::SkipChildren);
-                }
-            }
-            ast::Expr::Qualified(_, col_name) => {
-                if column_names.contains(&normalize_ident(col_name.as_str())) {
-                    found = true;
-                    return Ok(WalkControl::SkipChildren);
-                }
-            }
-            ast::Expr::DoublyQualified(_, _, col_name) => {
-                if column_names.contains(&normalize_ident(col_name.as_str())) {
-                    found = true;
-                    return Ok(WalkControl::SkipChildren);
-                }
-            }
-            _ => {}
-        }
-        Ok(WalkControl::Continue)
-    });
-    found
+    column_names
+        .iter()
+        .any(|name| check_expr_references_column(expr, name))
 }
 
 /// Emit CHECK constraint evaluation with resolver cache setup and teardown.

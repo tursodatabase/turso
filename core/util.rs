@@ -1580,6 +1580,35 @@ pub fn rewrite_fk_parent_cols_if_self_ref(
     }
 }
 
+/// Returns true if the expression tree references a column whose normalized
+/// name equals `col_name_normalized`.
+pub fn check_expr_references_column(expr: &ast::Expr, col_name_normalized: &str) -> bool {
+    let mut found = false;
+    // The closure is infallible, so walk_expr cannot fail.
+    let _ = walk_expr(expr, &mut |e| {
+        if found {
+            return Ok(WalkControl::SkipChildren);
+        }
+        match e {
+            ast::Expr::Id(name) | ast::Expr::Name(name) => {
+                if normalize_ident(name.as_str()) == col_name_normalized {
+                    found = true;
+                    return Ok(WalkControl::SkipChildren);
+                }
+            }
+            ast::Expr::Qualified(_, col) | ast::Expr::DoublyQualified(_, _, col) => {
+                if normalize_ident(col.as_str()) == col_name_normalized {
+                    found = true;
+                    return Ok(WalkControl::SkipChildren);
+                }
+            }
+            _ => {}
+        }
+        Ok(WalkControl::Continue)
+    });
+    found
+}
+
 /// Rewrite column name references in a CHECK constraint expression.
 /// Replaces `Id(old)` and `Name(old)` with `Id(new)`, and updates the
 /// column name in `Qualified(tbl, old)` references.

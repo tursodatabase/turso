@@ -13,7 +13,7 @@ use crate::{
         expr::{rewrite_between_expr, translate_expr, walk_expr, walk_expr_mut, WalkControl},
         plan::{ColumnUsedMask, OuterQueryReference, TableReferences},
     },
-    util::normalize_ident,
+    util::{check_expr_references_column, normalize_ident},
     vdbe::{
         builder::{CursorType, ProgramBuilder},
         insn::{to_u16, Cookie, Insn, RegisterOrLiteral},
@@ -367,35 +367,14 @@ pub fn translate_alter_table(
             // Handle CHECK constraints:
             // - Column-level CHECK constraints for the dropped column are silently removed
             // - Table-level CHECK constraints referencing the dropped column cause an error
+            let col_normalized = normalize_ident(column_name);
             for check in &btree.check_constraints {
                 if check.column.is_some() {
                     // Column-level constraint: will be removed below
                     continue;
                 }
                 // Table-level constraint: check if it references the dropped column
-                let mut references_column = false;
-                walk_expr(
-                    &check.expr,
-                    &mut |e: &ast::Expr| -> crate::Result<WalkControl> {
-                        match e {
-                            ast::Expr::Id(name) | ast::Expr::Name(name) => {
-                                if normalize_ident(name.as_str()) == normalize_ident(column_name) {
-                                    references_column = true;
-                                    return Ok(WalkControl::SkipChildren);
-                                }
-                            }
-                            ast::Expr::Qualified(_, col) => {
-                                if normalize_ident(col.as_str()) == normalize_ident(column_name) {
-                                    references_column = true;
-                                    return Ok(WalkControl::SkipChildren);
-                                }
-                            }
-                            _ => {}
-                        }
-                        Ok(WalkControl::Continue)
-                    },
-                )?;
-                if references_column {
+                if check_expr_references_column(&check.expr, &col_normalized) {
                     return Err(LimboError::ParseError(format!(
                         "error in table {table_name} after drop column: no such column: {column_name}"
                     )));
