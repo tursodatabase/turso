@@ -12,7 +12,6 @@ WORKDIR /app
 FROM chef AS planner
 COPY ./Cargo.lock ./Cargo.lock
 COPY ./Cargo.toml ./Cargo.toml
-COPY ./bindings/dart ./bindings/dart/
 COPY ./bindings/dotnet ./bindings/dotnet/
 COPY ./bindings/java ./bindings/java/
 COPY ./bindings/javascript ./bindings/javascript/
@@ -60,7 +59,6 @@ ADD https://antithesis.com/assets/instrumentation/libvoidstar.so /opt/antithesis
 COPY --from=planner /app/recipe.json recipe.json
 RUN cargo chef cook --bin turso_stress --release --recipe-path recipe.json
 COPY --from=planner /app/Cargo.toml /app/Cargo.lock ./
-COPY --from=planner /app/bindings/dart ./bindings/dart/
 COPY --from=planner /app/bindings/dotnet ./bindings/dotnet/
 COPY --from=planner /app/bindings/java ./bindings/java/
 COPY --from=planner /app/bindings/javascript ./bindings/javascript/
