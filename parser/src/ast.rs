@@ -1195,6 +1195,8 @@ pub struct CreateTypeBody {
     pub decode: Option<String>,
     /// operator-to-function mappings
     pub operators: Vec<TypeOperator>,
+    /// default expression for columns of this type
+    pub default: Option<Box<Expr>>,
 }
 
 /// `CREATE TABLE` body

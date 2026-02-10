@@ -729,6 +729,11 @@ impl ToTokens for Stmt {
                     s.append(TK_ID, Some("DECODE"))?;
                     s.append(TK_ID, Some(decode))?;
                 }
+                // DEFAULT
+                if let Some(ref default) = body.default {
+                    s.append(TK_ID, Some("DEFAULT"))?;
+                    default.to_tokens(s, context)?;
+                }
                 // OPERATOR clauses
                 for op in &body.operators {
                     s.append(TK_ID, Some("OPERATOR"))?;

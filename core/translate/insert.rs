@@ -2146,6 +2146,15 @@ fn translate_column(
         });
     } else if let Some(default_expr) = column.default.as_ref() {
         translate_expr(program, None, default_expr, column_register, resolver)?;
+    } else if let Some(type_def) = resolver.schema.get_type_def(&column.ty_str) {
+        if let Some(ref default_expr) = type_def.default {
+            translate_expr(program, None, default_expr, column_register, resolver)?;
+        } else {
+            program.emit_insn(Insn::Null {
+                dest: column_register,
+                dest_end: None,
+            });
+        }
     } else {
         let nullable = !column.notnull() && !column.primary_key();
         if !nullable {

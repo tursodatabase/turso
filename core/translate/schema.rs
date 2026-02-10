@@ -1296,6 +1296,9 @@ pub fn translate_create_type(
     if let Some(ref decode) = body.decode {
         sql.push_str(&format!(" DECODE {decode}"));
     }
+    if let Some(ref default) = body.default {
+        sql.push_str(&format!(" DEFAULT {default}"));
+    }
     for op in &body.operators {
         sql.push_str(&format!(
             " OPERATOR '{}' ({}) -> {}",

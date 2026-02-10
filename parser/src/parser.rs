@@ -4069,6 +4069,7 @@ impl<'a> Parser<'a> {
 
         let mut encode = None;
         let mut decode = None;
+        let mut default = None;
         let mut operators = Vec::new();
 
         // Parse optional clauses: ENCODE, DECODE, OPERATOR
@@ -4145,6 +4146,11 @@ impl<'a> Parser<'a> {
                         _ => break,
                     }
                 }
+                Some(tok) if tok.token_type == TK_DEFAULT => {
+                    eat_assert!(self, TK_DEFAULT);
+                    let expr = self.parse_expr(0)?;
+                    default = Some(expr);
+                }
                 _ => break,
             }
         }
@@ -4157,6 +4163,7 @@ impl<'a> Parser<'a> {
                 encode,
                 decode,
                 operators,
+                default,
             },
         })
     }
