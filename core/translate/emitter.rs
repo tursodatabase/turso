@@ -3199,63 +3199,64 @@ fn emit_update_insns<'a>(
             });
         }
 
-        // SQLite only evaluates CHECK constraints that reference at least one
-        // column in the SET clause. Build a set of updated column names to filter.
-        let mut updated_col_names: HashSet<String> = set_clauses
-            .iter()
-            .filter_map(|(col_idx, _)| {
-                btree_table
-                    .columns
-                    .get(*col_idx)
-                    .and_then(|c| c.name.as_deref())
-                    .map(normalize_ident)
-            })
-            .collect();
+        if !btree_table.check_constraints.is_empty() {
+            // SQLite only evaluates CHECK constraints that reference at least one
+            // column in the SET clause. Build a set of updated column names to filter.
+            let mut updated_col_names: HashSet<String> = set_clauses
+                .iter()
+                .filter_map(|(col_idx, _)| {
+                    btree_table
+                        .columns
+                        .get(*col_idx)
+                        .and_then(|c| c.name.as_deref())
+                        .map(normalize_ident)
+                })
+                .collect();
 
-        // If the rowid is being updated (either directly via ROWID_SENTINEL or
-        // through a rowid alias column), also include the rowid pseudo-column
-        // names so that CHECK(rowid > 0) etc. are properly triggered.
-        let rowid_updated =
-            set_clauses.iter().any(|(idx, _)| *idx == ROWID_SENTINEL)
+            // If the rowid is being updated (either directly via ROWID_SENTINEL or
+            // through a rowid alias column), also include the rowid pseudo-column
+            // names so that CHECK(rowid > 0) etc. are properly triggered.
+            let rowid_updated = set_clauses.iter().any(|(idx, _)| *idx == ROWID_SENTINEL)
                 || btree_table.columns.iter().enumerate().any(|(i, c)| {
                     c.is_rowid_alias() && set_clauses.iter().any(|(idx, _)| *idx == i)
                 });
-        if rowid_updated {
-            for name in ROWID_STRS {
-                updated_col_names.insert(name.to_string());
+            if rowid_updated {
+                for name in ROWID_STRS {
+                    updated_col_names.insert(name.to_string());
+                }
             }
-        }
 
-        let relevant_checks: Vec<_> = btree_table
-            .check_constraints
-            .iter()
-            .filter(|cc| check_expr_references_columns(&cc.expr, &updated_col_names))
-            .cloned()
-            .collect();
-
-        emit_check_constraints(
-            program,
-            &relevant_checks,
-            &mut t_ctx.resolver,
-            &btree_table.name,
-            rowid_set_clause_reg.unwrap_or(beg),
-            btree_table
-                .columns
+            let relevant_checks: Vec<CheckConstraint> = btree_table
+                .check_constraints
                 .iter()
-                .enumerate()
-                .filter_map(|(idx, col)| {
-                    col.name.as_deref().map(|n| {
-                        if col.is_rowid_alias() {
-                            (n, rowid_set_clause_reg.unwrap_or(beg))
-                        } else {
-                            (n, start + idx)
-                        }
-                    })
-                }),
-            connection,
-            or_conflict,
-            skip_row_label,
-        )?;
+                .filter(|cc| check_expr_references_columns(&cc.expr, &updated_col_names))
+                .cloned()
+                .collect();
+
+            emit_check_constraints(
+                program,
+                &relevant_checks,
+                &mut t_ctx.resolver,
+                &btree_table.name,
+                rowid_set_clause_reg.unwrap_or(beg),
+                btree_table
+                    .columns
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(idx, col)| {
+                        col.name.as_deref().map(|n| {
+                            if col.is_rowid_alias() {
+                                (n, rowid_set_clause_reg.unwrap_or(beg))
+                            } else {
+                                (n, start + idx)
+                            }
+                        })
+                    }),
+                connection,
+                or_conflict,
+                skip_row_label,
+            )?;
+        }
     }
 
     for (index, (idx_cursor_id, record_reg)) in indexes_to_update.iter().zip(index_cursors) {
