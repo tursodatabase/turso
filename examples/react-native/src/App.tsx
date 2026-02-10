@@ -159,6 +159,101 @@ export default function App() {
       testResults.push({ name: 'Performance (1000 queries)', passed: false, error: String(e) });
     }
 
+    // ========================================
+    // CONCURRENCY TESTS (AsyncLock smoke tests)
+    // ========================================
+    testResults.push({ name: '--- Concurrency Tests ---', passed: true });
+
+    // Test: Concurrent counter increments
+    // Fire N concurrent INSERTs via Promise.all — the lock must serialize them
+    // so we get exactly N rows.
+    try {
+      await db.exec('CREATE TABLE IF NOT EXISTS conc_counter (id INTEGER PRIMARY KEY AUTOINCREMENT, v INTEGER)');
+      const N = 50;
+      const promises: Promise<void>[] = [];
+      for (let i = 0; i < N; i++) {
+        promises.push(db.run('INSERT INTO conc_counter (v) VALUES (?)', i).then(() => {}));
+      }
+      await Promise.all(promises);
+
+      const row = await db.get('SELECT COUNT(*) as cnt FROM conc_counter');
+      if (row?.cnt === N) {
+        testResults.push({ name: `Concurrent inserts (${N})`, passed: true });
+      } else {
+        testResults.push({ name: `Concurrent inserts (${N})`, passed: false, error: `Expected ${N} rows, got ${row?.cnt}` });
+      }
+    } catch (e) {
+      testResults.push({ name: 'Concurrent inserts', passed: false, error: String(e) });
+    }
+
+    // Test: Concurrent reads + writes
+    // Mix reads and writes fired concurrently — must not crash and reads
+    // must return consistent data.
+    try {
+      await db.exec('CREATE TABLE IF NOT EXISTS conc_rw (id INTEGER PRIMARY KEY, val TEXT)');
+      await db.run('INSERT OR REPLACE INTO conc_rw (id, val) VALUES (1, ?)', 'initial');
+
+      const mixed: Promise<any>[] = [];
+      for (let i = 0; i < 20; i++) {
+        // interleave writes and reads
+        mixed.push(db.run('UPDATE conc_rw SET val = ? WHERE id = 1', `v${i}`));
+        mixed.push(db.get('SELECT val FROM conc_rw WHERE id = 1'));
+      }
+      const mixedResults = await Promise.all(mixed);
+
+      // All promises must have resolved (no undefined from crashes)
+      const allResolved = mixedResults.every(r => r !== undefined);
+      if (allResolved) {
+        testResults.push({ name: 'Concurrent reads + writes', passed: true });
+      } else {
+        testResults.push({ name: 'Concurrent reads + writes', passed: false, error: 'Some operations returned undefined' });
+      }
+    } catch (e) {
+      testResults.push({ name: 'Concurrent reads + writes', passed: false, error: String(e) });
+    }
+
+    // Test: Concurrent exec() calls
+    // Multiple exec() calls (multi-statement) fired concurrently.
+    try {
+      await db.exec('CREATE TABLE IF NOT EXISTS conc_exec (id INTEGER PRIMARY KEY AUTOINCREMENT, v INTEGER)');
+      const execPromises: Promise<void>[] = [];
+      for (let i = 0; i < 20; i++) {
+        execPromises.push(db.exec(`INSERT INTO conc_exec (v) VALUES (${i})`));
+      }
+      await Promise.all(execPromises);
+
+      const row = await db.get('SELECT COUNT(*) as cnt FROM conc_exec');
+      if (row?.cnt === 20) {
+        testResults.push({ name: 'Concurrent exec()', passed: true });
+      } else {
+        testResults.push({ name: 'Concurrent exec()', passed: false, error: `Expected 20 rows, got ${row?.cnt}` });
+      }
+    } catch (e) {
+      testResults.push({ name: 'Concurrent exec()', passed: false, error: String(e) });
+    }
+
+    // Test: Concurrent all() queries
+    // Multiple all() queries fired at the same time must each return
+    // consistent snapshots.
+    try {
+      const allPromises: Promise<any[]>[] = [];
+      for (let i = 0; i < 10; i++) {
+        allPromises.push(db.all('SELECT * FROM conc_counter ORDER BY id'));
+      }
+      const allResults = await Promise.all(allPromises);
+
+      // Each query should return the same number of rows (table is not being modified)
+      const lengths = allResults.map(r => r.length);
+      const allSame = lengths.every(l => l === lengths[0]);
+      if (allSame && lengths[0]! > 0) {
+        testResults.push({ name: 'Concurrent all() queries', passed: true });
+      } else {
+        testResults.push({ name: 'Concurrent all() queries', passed: false, error: `Row counts: ${JSON.stringify(lengths)}` });
+      }
+    } catch (e) {
+      testResults.push({ name: 'Concurrent all() queries', passed: false, error: String(e) });
+    }
+
     // Cleanup local database
     try {
       db.close();
