@@ -5,6 +5,7 @@
  * Handles parameter binding, row conversion, and result collection.
  */
 
+import type { AsyncLock } from './AsyncLock';
 import type {
   NativeConnection,
   NativeStatement,
@@ -21,12 +22,14 @@ import { TursoStatus, TursoType } from './types';
 export class Statement {
   private _statement: NativeStatement;
   private _connection: NativeConnection;
+  private _execLock: AsyncLock | null;
   private _finalized = false;
   private _extraIo?: () => Promise<void>;
 
-  constructor(statement: NativeStatement, connection: NativeConnection, extraIo?: () => Promise<void>) {
+  constructor(statement: NativeStatement, connection: NativeConnection, execLock: AsyncLock | null, extraIo?: () => Promise<void>) {
     this._statement = statement;
     this._connection = connection;
+    this._execLock = execLock;
     this._extraIo = extraIo;
   }
 
@@ -132,11 +135,38 @@ export class Statement {
       this.bind(...params);
     }
 
+    if (this._execLock) {
+      await this._execLock.acquire();
+    }
+    try {
+      return await this._runInner();
+    } finally {
+      this._statement.reset();
+      if (this._execLock) {
+        this._execLock.release();
+      }
+    }
+  }
+
+  /**
+   * Execute without acquiring the lock (caller already holds it).
+   * Used by Database.exec() which acquires the lock once for all statements.
+   */
+  async rawRun(): Promise<RunResult> {
+    if (this._finalized) {
+      throw new Error('Statement has been finalized');
+    }
+
+    try {
+      return await this._runInner();
+    } finally {
+      this._statement.reset();
+    }
+  }
+
+  private async _runInner(): Promise<RunResult> {
     // Execute statement with IO handling
     const result = await this.executeWithIo();
-
-    // Reset for next execution
-    this._statement.reset();
 
     return {
       changes: result.rowsChanged,
@@ -216,21 +246,29 @@ export class Statement {
       this.bind(...params);
     }
 
-    // Step once with async IO handling
-    const status = await this.stepWithIo();
-
-    if (status === TursoStatus.ROW) {
-      const row = this.readRow();
-      this._statement.reset();
-      return row;
+    if (this._execLock) {
+      await this._execLock.acquire();
     }
+    try {
+      // Step once with async IO handling
+      const status = await this.stepWithIo();
 
-    if (status === TursoStatus.DONE) {
+      if (status === TursoStatus.ROW) {
+        const row = this.readRow();
+        return row;
+      }
+
+      if (status === TursoStatus.DONE) {
+        return undefined;
+      }
+
+      throw new Error(`Statement step failed with status: ${status}`);
+    } finally {
       this._statement.reset();
-      return undefined;
+      if (this._execLock) {
+        this._execLock.release();
+      }
     }
-
-    throw new Error(`Statement step failed with status: ${status}`);
   }
 
   /**
@@ -249,23 +287,32 @@ export class Statement {
       this.bind(...params);
     }
 
-    const rows: Row[] = [];
+    if (this._execLock) {
+      await this._execLock.acquire();
+    }
+    try {
+      const rows: Row[] = [];
 
-    // Step through all rows with async IO handling
-    while (true) {
-      const status = await this.stepWithIo();
+      // Step through all rows with async IO handling
+      while (true) {
+        const status = await this.stepWithIo();
 
-      if (status === TursoStatus.ROW) {
-        rows.push(this.readRow());
-      } else if (status === TursoStatus.DONE) {
-        break;
-      } else {
-        throw new Error(`Statement step failed with status: ${status}`);
+        if (status === TursoStatus.ROW) {
+          rows.push(this.readRow());
+        } else if (status === TursoStatus.DONE) {
+          break;
+        } else {
+          throw new Error(`Statement step failed with status: ${status}`);
+        }
+      }
+
+      return rows;
+    } finally {
+      this._statement.reset();
+      if (this._execLock) {
+        this._execLock.release();
       }
     }
-
-    this._statement.reset();
-    return rows;
   }
 
   /**
