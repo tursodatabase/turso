@@ -20,7 +20,13 @@ impl SchemaIntrospector {
         for table_name in table_names {
             let columns = Self::get_columns_turso(conn, &table_name)?;
             if !columns.is_empty() {
-                builder = builder.add_table(Table::new(table_name, columns));
+                let strict = Self::is_strict_table_turso(conn, &table_name)?;
+                let table = if strict {
+                    Table::new_strict(table_name, columns)
+                } else {
+                    Table::new(table_name, columns)
+                };
+                builder = builder.add_table(table);
             }
         }
 
@@ -35,7 +41,13 @@ impl SchemaIntrospector {
         for table_name in table_names {
             let columns = Self::get_columns_sqlite(conn, &table_name)?;
             if !columns.is_empty() {
-                builder = builder.add_table(Table::new(table_name, columns));
+                let strict = Self::is_strict_table_sqlite(conn, &table_name)?;
+                let table = if strict {
+                    Table::new_strict(table_name, columns)
+                } else {
+                    Table::new(table_name, columns)
+                };
+                builder = builder.add_table(table);
             }
         }
 
@@ -182,6 +194,56 @@ impl SchemaIntrospector {
             // TEXT affinity for everything else (CHAR, CLOB, TEXT, VARCHAR, etc.)
             DataType::Text
         }
+    }
+
+    /// Check if a table is STRICT by querying sqlite_master for its CREATE TABLE SQL (Turso).
+    fn is_strict_table_turso(conn: &Arc<turso_core::Connection>, table_name: &str) -> Result<bool> {
+        let query =
+            format!("SELECT sql FROM sqlite_master WHERE type='table' AND name='{table_name}'");
+        let mut is_strict = false;
+        let mut rows = conn
+            .query(&query)
+            .context("Failed to query sqlite_master for STRICT")?
+            .context("Expected rows from query")?;
+
+        rows.run_with_row_callback(|row| {
+            if let turso_core::Value::Text(sql) = row.get_value(0) {
+                let sql_upper = sql.as_str().to_uppercase();
+                let trimmed = sql_upper.trim_end();
+                is_strict = trimmed.ends_with("STRICT") || trimmed.ends_with("STRICT)");
+                // Handle "CREATE TABLE ... (...) STRICT" pattern
+                // The SQL may end with ") STRICT" or just "STRICT" after the closing paren
+                if !is_strict {
+                    // Check for the pattern where STRICT follows the closing paren
+                    if let Some(pos) = trimmed.rfind(')') {
+                        let after_paren = trimmed[pos + 1..].trim();
+                        is_strict = after_paren == "STRICT";
+                    }
+                }
+            }
+            Ok(())
+        })
+        .context("Failed to iterate sqlite_master")?;
+
+        Ok(is_strict)
+    }
+
+    /// Check if a table is STRICT by querying sqlite_master for its CREATE TABLE SQL (SQLite).
+    fn is_strict_table_sqlite(conn: &rusqlite::Connection, table_name: &str) -> Result<bool> {
+        let query =
+            format!("SELECT sql FROM sqlite_master WHERE type='table' AND name='{table_name}'");
+        let sql: Option<String> = conn.query_row(&query, [], |row| row.get(0)).ok();
+
+        if let Some(sql) = sql {
+            let trimmed = sql.trim_end().to_uppercase();
+            if trimmed.ends_with("STRICT") {
+                if let Some(pos) = trimmed.rfind(')') {
+                    let after_paren = trimmed[pos + 1..].trim();
+                    return Ok(after_paren == "STRICT");
+                }
+            }
+        }
+        Ok(false)
     }
 }
 

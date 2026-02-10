@@ -118,6 +118,7 @@ impl fmt::Display for ColumnDef {
 pub struct Table {
     pub name: String,
     pub columns: Vec<ColumnDef>,
+    pub strict: bool,
 }
 
 impl Table {
@@ -125,6 +126,15 @@ impl Table {
         Self {
             name: name.into(),
             columns,
+            strict: false,
+        }
+    }
+
+    pub fn new_strict(name: impl Into<String>, columns: Vec<ColumnDef>) -> Self {
+        Self {
+            name: name.into(),
+            columns,
+            strict: true,
         }
     }
 
