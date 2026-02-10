@@ -199,7 +199,15 @@ pub fn exec_printf(values: &[Register]) -> crate::Result<Value> {
                     v => format!("{v}"),
                 };
                 if let Some(p) = precision {
-                    formatted.truncate(p);
+                    if p < formatted.len() {
+                        // Find the largest char boundary <= p to avoid
+                        // panicking on multi-byte UTF-8 characters.
+                        let mut boundary = p;
+                        while boundary > 0 && !formatted.is_char_boundary(boundary) {
+                            boundary -= 1;
+                        }
+                        formatted.truncate(boundary);
+                    }
                 }
                 if let Some(w) = width {
                     if w > formatted.len() {

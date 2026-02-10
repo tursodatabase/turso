@@ -728,3 +728,17 @@ test printf-i64-min-zero-pad {
 expect {
     -000009223372036854775808
 }
+
+test printf-precision-string-multibyte-char-boundary {
+    SELECT printf('%.3s', 'héllo');
+}
+expect {
+    hé
+}
+
+test printf-precision-string-multibyte-mid-boundary {
+    SELECT typeof(printf('%.2s', 'héllo'));
+}
+expect {
+    text
+}
