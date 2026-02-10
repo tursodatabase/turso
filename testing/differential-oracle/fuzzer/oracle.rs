@@ -92,11 +92,12 @@ impl Oracle for DifferentialOracle {
             (QueryResult::Rows(turso_rows), QueryResult::Rows(sqlite_rows)) => {
                 let diff = diff_results(turso_rows, sqlite_rows);
                 if !diff.is_empty() {
-                    // For LIMIT without ORDER BY, the result set may legitimately differ
-                    // since the order is undefined. Return a warning instead of failure.
+                    // For non-deterministic LIMIT queries, the result set may legitimately differ
+                    // since the chosen rows are not stable across engines. Return a warning instead
+                    // of failure.
                     if has_unordered_limit {
                         return OracleResult::Warning(format!(
-                            "Row set mismatch for unordered LIMIT query (results may vary due to undefined order):\n  SQL: {stmt}\n  Only in Turso: {:?}\n  Only in SQLite: {:?}",
+                            "Row set mismatch for non-deterministic LIMIT query (results may vary due to undefined row selection/order):\n  SQL: {stmt}\n  Only in Turso: {:?}\n  Only in SQLite: {:?}",
                             diff.only_in_first, diff.only_in_second
                         ));
                     }
@@ -125,7 +126,7 @@ impl Oracle for DifferentialOracle {
                     OracleResult::Pass
                 } else if has_unordered_limit {
                     OracleResult::Warning(format!(
-                        "Turso returned {} rows but SQLite returned no rows for unordered LIMIT query (results may vary due to undefined order):\n  SQL: {stmt}",
+                        "Turso returned {} rows but SQLite returned no rows for non-deterministic LIMIT query (results may vary due to undefined row selection/order):\n  SQL: {stmt}",
                         rows.len()
                     ))
                 } else {
@@ -140,7 +141,7 @@ impl Oracle for DifferentialOracle {
                     OracleResult::Pass
                 } else if has_unordered_limit {
                     OracleResult::Warning(format!(
-                        "SQLite returned {} rows but Turso returned no rows for unordered LIMIT query (results may vary due to undefined order):\n  SQL: {stmt}",
+                        "SQLite returned {} rows but Turso returned no rows for non-deterministic LIMIT query (results may vary due to undefined row selection/order):\n  SQL: {stmt}",
                         rows.len()
                     ))
                 } else {

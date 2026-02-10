@@ -101,10 +101,26 @@ impl Stmt {
 }
 
 impl SelectStmt {
-    /// Returns true if this SELECT or any nested subquery has LIMIT without ORDER BY.
+    /// Returns true if this SELECT or any nested subquery has a potentially
+    /// non-deterministic LIMIT result set.
+    ///
+    /// This includes:
+    /// - `LIMIT` without `ORDER BY`
+    /// - `LIMIT` with `ORDER BY` terms that are all constant expressions
+    ///   (for example `ORDER BY ZEROBLOB(10)`), which leaves row ordering undefined
+    ///   among ties.
     pub fn has_unordered_limit(&self) -> bool {
-        if self.limit.is_some() && self.order_by.is_empty() {
-            return true;
+        if self.limit.is_some() {
+            if self.order_by.is_empty() {
+                return true;
+            }
+            if self
+                .order_by
+                .iter()
+                .all(|item| !item.expr.contains_column_ref())
+            {
+                return true;
+            }
         }
         // Check subqueries in SELECT columns
         for col in &self.columns {
@@ -1619,5 +1635,65 @@ mod tests {
         );
 
         assert_eq!(case.to_string(), "CASE WHEN 1 THEN 'one' ELSE 'other' END");
+    }
+
+    #[test]
+    fn test_has_unordered_limit_for_constant_order_by() {
+        let select = SelectStmt {
+            distinct: false,
+            columns: vec![SelectColumn {
+                expr: Expr::Literal(Literal::Integer(1)),
+                alias: None,
+            }],
+            from: Some(FromClause {
+                table: "t".to_string(),
+                alias: None,
+            }),
+            joins: vec![],
+            where_clause: None,
+            group_by: None,
+            order_by: vec![OrderByItem {
+                expr: Expr::Literal(Literal::Integer(1)),
+                direction: OrderDirection::Asc,
+                nulls: None,
+            }],
+            limit: Some(1),
+            offset: None,
+        };
+
+        assert!(select.has_unordered_limit());
+    }
+
+    #[test]
+    fn test_has_unordered_limit_false_for_column_order_by() {
+        let select = SelectStmt {
+            distinct: false,
+            columns: vec![SelectColumn {
+                expr: Expr::ColumnRef(ColumnRef {
+                    table: None,
+                    column: "id".to_string(),
+                }),
+                alias: None,
+            }],
+            from: Some(FromClause {
+                table: "t".to_string(),
+                alias: None,
+            }),
+            joins: vec![],
+            where_clause: None,
+            group_by: None,
+            order_by: vec![OrderByItem {
+                expr: Expr::ColumnRef(ColumnRef {
+                    table: None,
+                    column: "id".to_string(),
+                }),
+                direction: OrderDirection::Asc,
+                nulls: None,
+            }],
+            limit: Some(1),
+            offset: None,
+        };
+
+        assert!(!select.has_unordered_limit());
     }
 }

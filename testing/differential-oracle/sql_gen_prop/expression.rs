@@ -408,6 +408,44 @@ impl Expression {
         }
     }
 
+    /// Returns true if this expression references a column (at any depth,
+    /// excluding independent subqueries).
+    pub fn contains_column_ref(&self) -> bool {
+        match self {
+            Expression::Column(_) => true,
+            Expression::FunctionCall { args, .. } => args.iter().any(|a| a.contains_column_ref()),
+            Expression::BinaryOp { left, right, .. } => {
+                left.contains_column_ref() || right.contains_column_ref()
+            }
+            Expression::UnaryOp { operand, .. } => operand.contains_column_ref(),
+            Expression::Parenthesized(e) => e.contains_column_ref(),
+            Expression::Case {
+                operand,
+                when_clauses,
+                else_clause,
+            } => {
+                operand.as_ref().is_some_and(|o| o.contains_column_ref())
+                    || when_clauses
+                        .iter()
+                        .any(|(w, t)| w.contains_column_ref() || t.contains_column_ref())
+                    || else_clause
+                        .as_ref()
+                        .is_some_and(|e| e.contains_column_ref())
+            }
+            Expression::Cast { expr, .. } => expr.contains_column_ref(),
+            Expression::IsNull { expr } | Expression::IsNotNull { expr } => {
+                expr.contains_column_ref()
+            }
+            // Subqueries have independent scope.
+            Expression::Subquery(_)
+            | Expression::Exists { .. }
+            | Expression::NotExists { .. }
+            | Expression::InSubquery { .. }
+            | Expression::NotInSubquery { .. }
+            | Expression::Value(_) => false,
+        }
+    }
+
     /// Returns true if this expression contains any subquery with LIMIT but no ORDER BY.
     pub fn has_unordered_limit(&self) -> bool {
         match self {
@@ -1522,6 +1560,28 @@ mod tests {
     fn test_cast_expression_display() {
         let expr = Expression::cast(Expression::Column("value".to_string()), DataType::Integer);
         assert_eq!(expr.to_string(), "CAST(value AS INTEGER)");
+    }
+
+    #[test]
+    fn test_contains_column_ref() {
+        assert!(!Expression::Value(SqlValue::Integer(1)).contains_column_ref());
+        assert!(Expression::Column("id".to_string()).contains_column_ref());
+        assert!(
+            Expression::function_call("ABS", vec![Expression::Column("x".to_string())])
+                .contains_column_ref()
+        );
+        assert!(
+            !Expression::Subquery(Box::new(crate::select::SelectStatement {
+                with_clause: None,
+                table: "t".to_string(),
+                columns: vec![Expression::Value(SqlValue::Integer(1))],
+                where_clause: None,
+                order_by: vec![],
+                limit: Some(1),
+                offset: None,
+            }))
+            .contains_column_ref()
+        );
     }
 
     #[test]

@@ -225,14 +225,28 @@ pub struct SelectStatement {
 }
 
 impl SelectStatement {
-    /// Returns true if this SELECT or any nested subquery has LIMIT without ORDER BY.
+    /// Returns true if this SELECT or any nested subquery has a potentially
+    /// non-deterministic LIMIT result set.
     ///
-    /// Queries with LIMIT but no ORDER BY may return different rows between
-    /// database implementations since the order is undefined. This check
-    /// recurses into subqueries within expressions (e.g., NOT IN (SELECT ... LIMIT 1)).
+    /// This includes:
+    /// - `LIMIT` without `ORDER BY`
+    /// - `LIMIT` with `ORDER BY` terms that are all constant expressions
+    ///   (for example `ORDER BY ZEROBLOB(10)`), which leaves row ordering undefined
+    ///   among ties.
+    ///
+    /// The check recurses into subqueries within expressions (e.g., `NOT IN (SELECT ... LIMIT 1)`).
     pub fn has_unordered_limit(&self) -> bool {
-        if self.limit.is_some() && self.order_by.is_empty() {
-            return true;
+        if self.limit.is_some() {
+            if self.order_by.is_empty() {
+                return true;
+            }
+            if self
+                .order_by
+                .iter()
+                .all(|item| !item.expr.contains_column_ref())
+            {
+                return true;
+            }
         }
         // Check subqueries in SELECT columns
         for col in &self.columns {
@@ -682,6 +696,42 @@ mod tests {
 
         let sql = stmt.to_string();
         assert_eq!(sql, "SELECT id, UPPER(name) FROM users");
+    }
+
+    #[test]
+    fn test_has_unordered_limit_for_constant_order_by() {
+        let stmt = SelectStatement {
+            with_clause: None,
+            table: "users".to_string(),
+            columns: vec![Expression::Column("id".to_string())],
+            where_clause: None,
+            order_by: vec![OrderByItem {
+                expr: Expression::Value(SqlValue::Integer(1)),
+                direction: OrderDirection::Asc,
+            }],
+            limit: Some(1),
+            offset: None,
+        };
+
+        assert!(stmt.has_unordered_limit());
+    }
+
+    #[test]
+    fn test_has_unordered_limit_false_for_column_order_by() {
+        let stmt = SelectStatement {
+            with_clause: None,
+            table: "users".to_string(),
+            columns: vec![Expression::Column("id".to_string())],
+            where_clause: None,
+            order_by: vec![OrderByItem {
+                expr: Expression::Column("id".to_string()),
+                direction: OrderDirection::Asc,
+            }],
+            limit: Some(1),
+            offset: None,
+        };
+
+        assert!(!stmt.has_unordered_limit());
     }
 
     proptest::proptest! {
