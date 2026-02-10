@@ -2522,10 +2522,10 @@ mod hashtests {
         let mut ht = HashTable::new(config, io);
 
         // Insert some entries (late materialization - only store rowids)
-        let key1 = vec![Value::Integer(1)];
+        let key1 = vec![Value::from_i64(1)];
         let _ = ht.insert(key1.clone(), 100, vec![], None).unwrap();
 
-        let key2 = vec![Value::Integer(2)];
+        let key2 = vec![Value::from_i64(2)];
         let _ = ht.insert(key2.clone(), 200, vec![], None).unwrap();
 
         let _ = ht.finalize_build(None);
@@ -2545,7 +2545,7 @@ mod hashtests {
         assert_eq!(entry2.rowid, 200);
 
         // Probe for non-existent key
-        let result = ht.probe(vec![Value::Integer(999)], None);
+        let result = ht.probe(vec![Value::from_i64(999)], None);
         assert!(result.is_none());
     }
 
@@ -2565,7 +2565,7 @@ mod hashtests {
 
         // Insert multiple entries (late materialization - only store rowids)
         for i in 0..10 {
-            let key = vec![Value::Integer(i)];
+            let key = vec![Value::from_i64(i)];
             let _ = ht.insert(key, i * 100, vec![], None).unwrap();
         }
 
@@ -2573,7 +2573,7 @@ mod hashtests {
 
         // Verify all entries can be found
         for i in 0..10 {
-            let result = ht.probe(vec![Value::Integer(i)], None);
+            let result = ht.probe(vec![Value::from_i64(i)], None);
             assert!(result.is_some());
             let entry = result.unwrap();
             assert_eq!(entry.key_values[0].as_ref(), ValueRef::from_i64(i));
@@ -2814,7 +2814,7 @@ mod hashtests {
         };
         let mut ht = HashTable::new(config, io);
 
-        let key = vec![Value::Integer(1)];
+        let key = vec![Value::from_i64(1)];
         for i in 0..2048 {
             match ht.insert(key.clone(), i, vec![], None).unwrap() {
                 IOResult::Done(()) => {}
@@ -2899,7 +2899,7 @@ mod hashtests {
         };
         let mut ht = HashTable::new(config, io.clone());
 
-        let entry = HashEntry::new(1, vec![Value::Integer(1)], 7);
+        let entry = HashEntry::new(1, vec![Value::from_i64(1)], 7);
         let mut buf = Vec::new();
         entry.serialize(&mut buf);
         let truncated = &buf[..buf.len() - 1];
@@ -3063,7 +3063,7 @@ mod hashtests {
     fn insert_many_force_spill(ht: &mut HashTable, start: i64, count: i64) {
         for i in 0..count {
             let rowid = start + i;
-            let key = vec![Value::Integer(rowid)];
+            let key = vec![Value::from_i64(rowid)];
             let _ = ht.insert(key, rowid, vec![], None);
         }
     }
@@ -3307,15 +3307,15 @@ mod hashtests {
         let mut ht = HashTable::new(config, io);
 
         // Insert entry with NULL key - should be silently skipped
-        let null_key = vec![Value::Null, Value::Integer(1)];
+        let null_key = vec![Value::Null, Value::from_i64(1)];
         let _ = ht.insert(null_key.clone(), 100, vec![], None).unwrap();
 
         // Insert entry with non-NULL keys
-        let valid_key = vec![Value::Integer(1), Value::Integer(2)];
+        let valid_key = vec![Value::from_i64(1), Value::from_i64(2)];
         let _ = ht.insert(valid_key.clone(), 200, vec![], None).unwrap();
 
         // Insert another entry where second key is NULL
-        let null_key2 = vec![Value::Integer(1), Value::Null];
+        let null_key2 = vec![Value::from_i64(1), Value::Null];
         let _ = ht.insert(null_key2.clone(), 300, vec![], None).unwrap();
 
         let _ = ht.finalize_build(None);
@@ -3354,7 +3354,7 @@ mod hashtests {
         // Insert entry with blob payload
         let key = vec![Value::from_i64(1)];
         let blob_data = vec![0xDE, 0xAD, 0xBE, 0xEF];
-        let payload = vec![Value::Blob(blob_data.clone()), Value::Integer(42)];
+        let payload = vec![Value::Blob(blob_data.clone()), Value::from_i64(42)];
         let _ = ht.insert(key.clone(), 100, payload, None).unwrap();
 
         let _ = ht.finalize_build(None);
@@ -3387,7 +3387,7 @@ mod hashtests {
             .insert(
                 key.clone(),
                 100,
-                vec![Value::Text("first".into()), Value::Integer(1)],
+                vec![Value::Text("first".into()), Value::from_i64(1)],
                 None,
             )
             .unwrap();
@@ -3395,7 +3395,7 @@ mod hashtests {
             .insert(
                 key.clone(),
                 200,
-                vec![Value::Text("second".into()), Value::Integer(2)],
+                vec![Value::Text("second".into()), Value::from_i64(2)],
                 None,
             )
             .unwrap();
@@ -3403,7 +3403,7 @@ mod hashtests {
             .insert(
                 key.clone(),
                 300,
-                vec![Value::Text("third".into()), Value::Integer(3)],
+                vec![Value::Text("third".into()), Value::from_i64(3)],
                 None,
             )
             .unwrap();
