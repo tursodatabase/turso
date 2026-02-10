@@ -159,7 +159,6 @@ fn hash_value<H: Hasher>(hasher: &mut H, value: &ValueRef) {
         ValueRef::Numeric(Numeric::Float(f)) => {
             hash_numeric(hasher, f64::from(*f));
         }
-        ValueRef::Numeric(Numeric::Null) => {}
         ValueRef::Text(s) => {
             3u8.hash(hasher);
             s.as_str().hash(hasher);

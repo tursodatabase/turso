@@ -366,9 +366,6 @@ pub extern "C" fn turso_statement_row_value_kind(
         Ok(turso_core::ValueRef::Numeric(turso_core::Numeric::Float(..))) => {
             c::turso_type_t::TURSO_TYPE_REAL
         }
-        Ok(turso_core::ValueRef::Numeric(turso_core::Numeric::Null)) => {
-            c::turso_type_t::TURSO_TYPE_NULL
-        }
         Ok(turso_core::ValueRef::Text(..)) => c::turso_type_t::TURSO_TYPE_TEXT,
         Ok(turso_core::ValueRef::Blob(..)) => c::turso_type_t::TURSO_TYPE_BLOB,
         Err(_) => c::turso_type_t::TURSO_TYPE_UNKNOWN,

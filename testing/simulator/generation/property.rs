@@ -1829,7 +1829,6 @@ fn print_row(row: &[SimValue]) -> String {
             types::Value::Null => "NULL".to_string(),
             types::Value::Numeric(Numeric::Integer(i)) => i.to_string(),
             types::Value::Numeric(Numeric::Float(f)) => f.to_string(),
-            types::Value::Numeric(Numeric::Null) => "NULL".to_string(),
             types::Value::Text(t) => t.to_string(),
             types::Value::Blob(b) => format!(
                 "X'{}'",

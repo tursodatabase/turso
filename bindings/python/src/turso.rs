@@ -364,7 +364,6 @@ fn db_value_to_py(py: Python, value: rsapi::ValueRef) -> PyResult<Py<PyAny>> {
         ValueRef::Null => Ok(py.None()),
         ValueRef::Numeric(Numeric::Integer(i)) => Ok(i.into_pyobject(py)?.into()),
         ValueRef::Numeric(Numeric::Float(f)) => Ok(f64::from(f).into_pyobject(py)?.into()),
-        ValueRef::Numeric(Numeric::Null) => Ok(py.None()),
         ValueRef::Text(s) => Ok(s.as_str().into_pyobject(py)?.into()),
         ValueRef::Blob(b) => Ok(PyBytes::new(py, b).into()),
     }

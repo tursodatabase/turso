@@ -20,7 +20,6 @@ impl ArbitraryFrom<(&SimValue, ColumnType)> for LTValue {
             Value::Numeric(Numeric::Float(f)) => {
                 Value::from_f64(f64::from(*f) - rng.random_range(0.0..1e10))
             }
-            Value::Numeric(Numeric::Null) => Value::Null,
             value @ Value::Text(..) => {
                 // Either shorten the string, or make at least one character smaller and mutate the rest
                 let mut t = value.to_string();
@@ -66,10 +65,6 @@ impl ArbitraryFrom<(&SimValue, ColumnType)> for GTValue {
             Value::Numeric(Numeric::Integer(i)) => Value::from_i64(rng.random_range(*i..i64::MAX)),
             Value::Numeric(Numeric::Float(f)) => {
                 Value::from_f64(rng.random_range(f64::from(*f)..1e10))
-            }
-            Value::Numeric(Numeric::Null) => {
-                // Any value is greater than NULL, except NULL
-                SimValue::arbitrary_from(rng, context, col_type).0
             }
             value @ Value::Text(..) => {
                 // Either lengthen the string, or make at least one character smaller and mutate the rest

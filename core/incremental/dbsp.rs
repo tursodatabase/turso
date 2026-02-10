@@ -58,7 +58,6 @@ impl Hash128 {
                     // Use to_bits to ensure consistent representation
                     s.push_str(&f64::from(*f).to_bits().to_string());
                 }
-                Value::Numeric(Numeric::Null) => s.push_str("N:"),
                 Value::Text(t) => {
                     s.push_str("T:");
                     s.push_str(t.as_str());

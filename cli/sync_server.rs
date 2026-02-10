@@ -650,7 +650,6 @@ fn convert_core_to_value(value: CoreValue) -> Value {
         CoreValue::Numeric(turso_core::Numeric::Float(v)) => Value::Float {
             value: f64::from(v),
         },
-        CoreValue::Numeric(turso_core::Numeric::Null) => Value::Null,
         CoreValue::Text(t) => Value::Text {
             value: t.value.to_string(),
         },

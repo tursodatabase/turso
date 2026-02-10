@@ -206,43 +206,43 @@ fn format_float_precision_edge(bencher: Bencher) {
 #[divan::bench]
 fn numeric_from_integer_value(bencher: Bencher) {
     let value = Value::from_i64(12345);
-    bencher.bench_local(|| black_box(Numeric::from(black_box(&value))));
+    bencher.bench_local(|| black_box(Numeric::from_value(black_box(&value))));
 }
 
 #[divan::bench]
 fn numeric_from_float_value(bencher: Bencher) {
     let value = Value::from_f64(123.456);
-    bencher.bench_local(|| black_box(Numeric::from(black_box(&value))));
+    bencher.bench_local(|| black_box(Numeric::from_value(black_box(&value))));
 }
 
 #[divan::bench]
 fn numeric_from_text_integer(bencher: Bencher) {
     let value = Value::build_text("12345");
-    bencher.bench_local(|| black_box(Numeric::from(black_box(&value))));
+    bencher.bench_local(|| black_box(Numeric::from_value(black_box(&value))));
 }
 
 #[divan::bench]
 fn numeric_from_text_float(bencher: Bencher) {
     let value = Value::build_text("123.456");
-    bencher.bench_local(|| black_box(Numeric::from(black_box(&value))));
+    bencher.bench_local(|| black_box(Numeric::from_value(black_box(&value))));
 }
 
 #[divan::bench]
 fn numeric_from_text_scientific(bencher: Bencher) {
     let value = Value::build_text("1.23e10");
-    bencher.bench_local(|| black_box(Numeric::from(black_box(&value))));
+    bencher.bench_local(|| black_box(Numeric::from_value(black_box(&value))));
 }
 
 #[divan::bench]
 fn numeric_from_null(bencher: Bencher) {
     let value = Value::Null;
-    bencher.bench_local(|| black_box(Numeric::from(black_box(&value))));
+    bencher.bench_local(|| black_box(Numeric::from_value(black_box(&value))));
 }
 
 #[divan::bench]
 fn numeric_from_blob(bencher: Bencher) {
     let value = Value::Blob(b"12345".to_vec());
-    bencher.bench_local(|| black_box(Numeric::from(black_box(&value))));
+    bencher.bench_local(|| black_box(Numeric::from_value(black_box(&value))));
 }
 
 #[divan::bench]
@@ -258,42 +258,42 @@ fn numeric_from_string_ref(bencher: Bencher) {
 fn numeric_add_integers(bencher: Bencher) {
     let a = Numeric::Integer(1000);
     let b = Numeric::Integer(2000);
-    bencher.bench_local(|| black_box(black_box(a) + black_box(b)));
+    bencher.bench_local(|| black_box(black_box(a).checked_add(black_box(b))));
 }
 
 #[divan::bench]
 fn numeric_add_floats(bencher: Bencher) {
     let a = Numeric::from("100.5");
     let b = Numeric::from("200.5");
-    bencher.bench_local(|| black_box(black_box(a) + black_box(b)));
+    bencher.bench_local(|| black_box(black_box(a).checked_add(black_box(b))));
 }
 
 #[divan::bench]
 fn numeric_add_mixed(bencher: Bencher) {
     let a = Numeric::Integer(100);
     let b = Numeric::from("200.5");
-    bencher.bench_local(|| black_box(black_box(a) + black_box(b)));
+    bencher.bench_local(|| black_box(black_box(a).checked_add(black_box(b))));
 }
 
 #[divan::bench]
 fn numeric_sub_integers(bencher: Bencher) {
     let a = Numeric::Integer(2000);
     let b = Numeric::Integer(1000);
-    bencher.bench_local(|| black_box(black_box(a) - black_box(b)));
+    bencher.bench_local(|| black_box(black_box(a).checked_sub(black_box(b))));
 }
 
 #[divan::bench]
 fn numeric_mul_integers(bencher: Bencher) {
     let a = Numeric::Integer(100);
     let b = Numeric::Integer(200);
-    bencher.bench_local(|| black_box(black_box(a) * black_box(b)));
+    bencher.bench_local(|| black_box(black_box(a).checked_mul(black_box(b))));
 }
 
 #[divan::bench]
 fn numeric_div_integers(bencher: Bencher) {
     let a = Numeric::Integer(1000);
     let b = Numeric::Integer(10);
-    bencher.bench_local(|| black_box(black_box(a) / black_box(b)));
+    bencher.bench_local(|| black_box(black_box(a).checked_div(black_box(b))));
 }
 
 #[divan::bench]
@@ -307,7 +307,7 @@ fn numeric_add_overflow(bencher: Bencher) {
     // Should overflow to float
     let a = Numeric::Integer(i64::MAX);
     let b = Numeric::Integer(1);
-    bencher.bench_local(|| black_box(black_box(a) + black_box(b)));
+    bencher.bench_local(|| black_box(black_box(a).checked_add(black_box(b))));
 }
 
 // =============================================================================

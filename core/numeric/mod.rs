@@ -1,4 +1,4 @@
-use crate::Value;
+use crate::{types::AsValueRef, Value, ValueRef};
 
 pub mod nonnan;
 
@@ -41,60 +41,133 @@ impl SaturatingShr for i64 {
 #[derive(Debug, Clone, Copy)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Numeric {
-    Null,
     Integer(i64),
     Float(NonNan),
 }
 
 impl Numeric {
-    pub fn from_value_strict(value: &Value) -> Numeric {
+    pub fn from_value<T: AsValueRef>(value: T) -> Option<Self> {
+        let value = value.as_value_ref();
+
         match value {
-            Value::Null | Value::Blob(_) => Self::Null,
-            Value::Numeric(n) => *n,
+            ValueRef::Null => None,
+            ValueRef::Numeric(v) => Some(v),
+            ValueRef::Text(text) => Some(Numeric::from(text.as_str())),
+            ValueRef::Blob(blob) => {
+                let text = String::from_utf8_lossy(blob);
+                Some(Numeric::from(&text))
+            }
+        }
+    }
+
+    #[inline]
+    pub fn from_value_strict(value: &Value) -> Option<Self> {
+        match value {
+            Value::Null | Value::Blob(_) => None,
+            Value::Numeric(n) => Some(*n),
             Value::Text(text) => {
                 let s = text.as_str();
 
                 match str_to_f64(s) {
                     None
                     | Some(StrToF64::FractionalPrefix(_))
-                    | Some(StrToF64::DecimalPrefix(_)) => Self::Null,
-                    Some(StrToF64::Fractional(value)) => Self::Float(value),
+                    | Some(StrToF64::DecimalPrefix(_)) => None,
+                    Some(StrToF64::Fractional(value)) => Some(Self::Float(value)),
                     Some(StrToF64::Decimal(real)) => {
                         let integer = str_to_i64(s).unwrap_or(0);
 
-                        if real == integer as f64 {
+                        Some(if real == integer as f64 {
                             Self::Integer(integer)
                         } else {
                             Self::Float(real)
-                        }
+                        })
                     }
                 }
             }
         }
     }
 
-    pub fn try_into_f64(&self) -> Option<f64> {
+    #[inline]
+    pub fn to_f64(&self) -> f64 {
         match self {
-            Numeric::Null => None,
-            Numeric::Integer(v) => Some(*v as _),
-            Numeric::Float(v) => Some((*v).into()),
+            Numeric::Integer(v) => *v as _,
+            Numeric::Float(v) => (*v).into(),
         }
     }
 
-    pub fn try_into_bool(&self) -> Option<bool> {
+    #[inline]
+    pub fn to_bool(&self) -> bool {
         match self {
-            Numeric::Null => None,
-            Numeric::Integer(0) => Some(false),
-            Numeric::Float(non_nan) if *non_nan == 0.0 => Some(false),
-            _ => Some(true),
+            Numeric::Integer(0) => false,
+            Numeric::Float(non_nan) if *non_nan == 0.0 => false,
+            _ => true,
+        }
+    }
+
+    #[inline]
+    pub fn checked_add(self, rhs: Self) -> Option<Self> {
+        match (self, rhs) {
+            (Numeric::Integer(lhs), Numeric::Integer(rhs)) => match lhs.checked_add(rhs) {
+                None => Numeric::Float(lhs.into()).checked_add(Numeric::Float(rhs.into())),
+                Some(i) => Some(Numeric::Integer(i)),
+            },
+            (Numeric::Float(lhs), Numeric::Float(rhs)) => (lhs + rhs).map(Numeric::Float),
+            (f @ Numeric::Float(_), Numeric::Integer(i))
+            | (Numeric::Integer(i), f @ Numeric::Float(_)) => {
+                f.checked_add(Numeric::Float(i.into()))
+            }
+        }
+    }
+
+    #[inline]
+    pub fn checked_sub(self, rhs: Self) -> Option<Self> {
+        match (self, rhs) {
+            (Numeric::Float(lhs), Numeric::Float(rhs)) => (lhs - rhs).map(Numeric::Float),
+            (Numeric::Integer(lhs), Numeric::Integer(rhs)) => match lhs.checked_sub(rhs) {
+                None => Numeric::Float(lhs.into()).checked_sub(Numeric::Float(rhs.into())),
+                Some(i) => Some(Numeric::Integer(i)),
+            },
+            (f @ Numeric::Float(_), Numeric::Integer(i)) => f.checked_sub(Numeric::Float(i.into())),
+            (Numeric::Integer(i), f @ Numeric::Float(_)) => Numeric::Float(i.into()).checked_sub(f),
+        }
+    }
+
+    #[inline]
+    pub fn checked_mul(self, rhs: Self) -> Option<Self> {
+        match (self, rhs) {
+            (Numeric::Float(lhs), Numeric::Float(rhs)) => (lhs * rhs).map(Numeric::Float),
+            (Numeric::Integer(lhs), Numeric::Integer(rhs)) => match lhs.checked_mul(rhs) {
+                None => Numeric::Float(lhs.into()).checked_mul(Numeric::Float(rhs.into())),
+                Some(i) => Some(Numeric::Integer(i)),
+            },
+            (f @ Numeric::Float(_), Numeric::Integer(i))
+            | (Numeric::Integer(i), f @ Numeric::Float(_)) => {
+                f.checked_mul(Numeric::Float(i.into()))
+            }
+        }
+    }
+
+    #[inline]
+    pub fn checked_div(self, rhs: Self) -> Option<Self> {
+        match (self, rhs) {
+            (Numeric::Float(lhs), Numeric::Float(rhs)) => match lhs / rhs {
+                Some(v) if rhs != 0.0 => Some(Numeric::Float(v)),
+                _ => None,
+            },
+            (Numeric::Integer(lhs), Numeric::Integer(rhs)) => match lhs.checked_div(rhs) {
+                None => Numeric::Float(lhs.into()).checked_div(Numeric::Float(rhs.into())),
+                Some(v) => Some(Numeric::Integer(v)),
+            },
+            (f @ Numeric::Float(_), Numeric::Integer(i)) => f.checked_div(Numeric::Float(i.into())),
+            (Numeric::Integer(i), f @ Numeric::Float(_)) => Numeric::Float(i.into()).checked_div(f),
         }
     }
 }
 
 impl From<Numeric> for NullableInteger {
+    #[inline]
     fn from(value: Numeric) -> Self {
         match value {
-            Numeric::Null => NullableInteger::Null,
             Numeric::Integer(v) => NullableInteger::Integer(v),
             Numeric::Float(v) => NullableInteger::Integer(f64::from(v) as i64),
         }
@@ -102,11 +175,15 @@ impl From<Numeric> for NullableInteger {
 }
 
 impl From<Numeric> for Value {
+    #[inline]
     fn from(value: Numeric) -> Self {
-        match value {
-            Numeric::Null => Value::Null,
-            _ => Value::Numeric(value),
-        }
+        Value::Numeric(value)
+    }
+}
+
+impl From<Option<Numeric>> for Value {
+    fn from(value: Option<Numeric>) -> Self {
+        value.map_or_else(|| Value::Null, Value::from)
     }
 }
 
@@ -132,101 +209,21 @@ impl<T: AsRef<str>> From<T> for Numeric {
     }
 }
 
-impl From<Value> for Numeric {
+impl From<Value> for Option<Numeric> {
     fn from(value: Value) -> Self {
         Self::from(&value)
     }
 }
-impl From<&Value> for Numeric {
+impl From<&Value> for Option<Numeric> {
     fn from(value: &Value) -> Self {
         match value {
-            Value::Null => Self::Null,
-            Value::Numeric(n) => *n,
-            Value::Text(text) => Numeric::from(text.as_str()),
+            Value::Null => None,
+            Value::Numeric(n) => Some(*n),
+            Value::Text(text) => Some(Numeric::from(text.as_str())),
             Value::Blob(blob) => {
                 let text = String::from_utf8_lossy(blob.as_slice());
-                Numeric::from(&text)
+                Some(Numeric::from(&text))
             }
-        }
-    }
-}
-
-impl std::ops::Add for Numeric {
-    type Output = Self;
-
-    fn add(self, rhs: Self) -> Self::Output {
-        match (self, rhs) {
-            (Numeric::Null, _) | (_, Numeric::Null) => Numeric::Null,
-            (Numeric::Integer(lhs), Numeric::Integer(rhs)) => match lhs.checked_add(rhs) {
-                None => Numeric::Float(lhs.into()) + Numeric::Float(rhs.into()),
-                Some(i) => Numeric::Integer(i),
-            },
-            (Numeric::Float(lhs), Numeric::Float(rhs)) => match lhs + rhs {
-                Some(v) => Numeric::Float(v),
-                None => Numeric::Null,
-            },
-            (f @ Numeric::Float(_), Numeric::Integer(i))
-            | (Numeric::Integer(i), f @ Numeric::Float(_)) => f + Numeric::Float(i.into()),
-        }
-    }
-}
-
-impl std::ops::Sub for Numeric {
-    type Output = Self;
-
-    fn sub(self, rhs: Self) -> Self::Output {
-        match (self, rhs) {
-            (Numeric::Null, _) | (_, Numeric::Null) => Numeric::Null,
-            (Numeric::Float(lhs), Numeric::Float(rhs)) => match lhs - rhs {
-                Some(v) => Numeric::Float(v),
-                None => Numeric::Null,
-            },
-            (Numeric::Integer(lhs), Numeric::Integer(rhs)) => match lhs.checked_sub(rhs) {
-                None => Numeric::Float(lhs.into()) - Numeric::Float(rhs.into()),
-                Some(i) => Numeric::Integer(i),
-            },
-            (f @ Numeric::Float(_), Numeric::Integer(i)) => f - Numeric::Float(i.into()),
-            (Numeric::Integer(i), f @ Numeric::Float(_)) => Numeric::Float(i.into()) - f,
-        }
-    }
-}
-
-impl std::ops::Mul for Numeric {
-    type Output = Self;
-
-    fn mul(self, rhs: Self) -> Self::Output {
-        match (self, rhs) {
-            (Numeric::Null, _) | (_, Numeric::Null) => Numeric::Null,
-            (Numeric::Float(lhs), Numeric::Float(rhs)) => match lhs * rhs {
-                Some(v) => Numeric::Float(v),
-                None => Numeric::Null,
-            },
-            (Numeric::Integer(lhs), Numeric::Integer(rhs)) => match lhs.checked_mul(rhs) {
-                None => Numeric::Float(lhs.into()) * Numeric::Float(rhs.into()),
-                Some(i) => Numeric::Integer(i),
-            },
-            (f @ Numeric::Float(_), Numeric::Integer(i))
-            | (Numeric::Integer(i), f @ Numeric::Float(_)) => f * Numeric::Float(i.into()),
-        }
-    }
-}
-
-impl std::ops::Div for Numeric {
-    type Output = Self;
-
-    fn div(self, rhs: Self) -> Self::Output {
-        match (self, rhs) {
-            (Numeric::Null, _) | (_, Numeric::Null) => Numeric::Null,
-            (Numeric::Float(lhs), Numeric::Float(rhs)) => match lhs / rhs {
-                Some(v) if rhs != 0.0 => Numeric::Float(v),
-                _ => Numeric::Null,
-            },
-            (Numeric::Integer(lhs), Numeric::Integer(rhs)) => match lhs.checked_div(rhs) {
-                None => Numeric::Float(lhs.into()) / Numeric::Float(rhs.into()),
-                Some(v) => Numeric::Integer(v),
-            },
-            (f @ Numeric::Float(_), Numeric::Integer(i)) => f / Numeric::Float(i.into()),
-            (Numeric::Integer(i), f @ Numeric::Float(_)) => Numeric::Float(i.into()) / f,
         }
     }
 }
@@ -236,7 +233,6 @@ impl std::ops::Neg for Numeric {
 
     fn neg(self) -> Self::Output {
         match self {
-            Numeric::Null => Numeric::Null,
             Numeric::Integer(v) => match v.checked_neg() {
                 None => -Numeric::Float(v.into()),
                 Some(i) => Numeric::Integer(i),
@@ -279,7 +275,6 @@ impl From<&Value> for NullableInteger {
             Value::Null => Self::Null,
             Value::Numeric(Numeric::Integer(v)) => Self::Integer(*v),
             Value::Numeric(Numeric::Float(v)) => Self::Integer(f64::from(*v) as i64),
-            Value::Numeric(Numeric::Null) => Self::Null,
             Value::Text(text) => Self::from(text.as_str()),
             Value::Blob(blob) => {
                 let text = String::from_utf8_lossy(blob.as_slice());

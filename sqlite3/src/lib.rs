@@ -1377,7 +1377,6 @@ pub unsafe extern "C" fn sqlite3_value_type(value: *mut ffi::c_void) -> ffi::c_i
         turso_core::Value::Null => 0,
         turso_core::Value::Numeric(turso_core::Numeric::Integer(_)) => 1,
         turso_core::Value::Numeric(turso_core::Numeric::Float(_)) => 2,
-        turso_core::Value::Numeric(turso_core::Numeric::Null) => 0,
         turso_core::Value::Text(_) => 3,
         turso_core::Value::Blob(_) => 4,
     }

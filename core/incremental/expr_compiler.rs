@@ -228,7 +228,6 @@ impl CompiledExpression {
             TrivialExpression::Immediate(val) => match val {
                 Value::Numeric(Numeric::Integer(_)) => Some(TrivialType::Integer),
                 Value::Numeric(Numeric::Float(_)) => Some(TrivialType::Float),
-                Value::Numeric(Numeric::Null) => Some(TrivialType::Null),
                 Value::Text(_) => Some(TrivialType::Text),
                 Value::Null => Some(TrivialType::Null),
                 _ => None,

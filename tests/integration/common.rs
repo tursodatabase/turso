@@ -375,9 +375,6 @@ pub fn limbo_exec_rows(
                 turso_core::Value::Numeric(turso_core::Numeric::Float(x)) => {
                     rusqlite::types::Value::Real(f64::from(*x))
                 }
-                turso_core::Value::Numeric(turso_core::Numeric::Null) => {
-                    rusqlite::types::Value::Null
-                }
                 turso_core::Value::Text(x) => rusqlite::types::Value::Text(x.as_str().to_string()),
                 turso_core::Value::Blob(x) => rusqlite::types::Value::Blob(x.to_vec()),
             })
@@ -410,9 +407,6 @@ pub fn try_limbo_exec_rows(
                 }
                 turso_core::Value::Numeric(turso_core::Numeric::Float(x)) => {
                     rusqlite::types::Value::Real(f64::from(*x))
-                }
-                turso_core::Value::Numeric(turso_core::Numeric::Null) => {
-                    rusqlite::types::Value::Null
                 }
                 turso_core::Value::Text(x) => rusqlite::types::Value::Text(x.as_str().to_string()),
                 turso_core::Value::Blob(x) => rusqlite::types::Value::Blob(x.to_vec()),
@@ -457,9 +451,6 @@ pub fn limbo_exec_rows_fallible(
                 }
                 turso_core::Value::Numeric(turso_core::Numeric::Float(x)) => {
                     rusqlite::types::Value::Real(f64::from(*x))
-                }
-                turso_core::Value::Numeric(turso_core::Numeric::Null) => {
-                    rusqlite::types::Value::Null
                 }
                 turso_core::Value::Text(x) => rusqlite::types::Value::Text(x.as_str().to_string()),
                 turso_core::Value::Blob(x) => rusqlite::types::Value::Blob(x.to_vec()),

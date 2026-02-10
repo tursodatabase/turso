@@ -1686,7 +1686,6 @@ impl DbspCompiler {
                     Value::Numeric(Numeric::Float(f)) => {
                         ast::Literal::Numeric(f64::from(*f).to_string())
                     }
-                    Value::Numeric(Numeric::Null) => ast::Literal::Null,
                     Value::Text(t) => {
                         // Add quotes for string literals as translate_expr expects them
                         // Also escape any single quotes in the string

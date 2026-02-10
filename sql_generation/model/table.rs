@@ -191,7 +191,6 @@ impl Display for SimValue {
             types::Value::Null => write!(f, "NULL"),
             types::Value::Numeric(Numeric::Integer(i)) => write!(f, "{i}"),
             types::Value::Numeric(Numeric::Float(fl)) => write!(f, "{fl}"),
-            types::Value::Numeric(Numeric::Null) => write!(f, "NULL"),
             value @ types::Value::Text(..) => write!(f, "'{value}'"),
             types::Value::Blob(b) => write!(f, "{}", to_sqlite_blob(b)),
         }
@@ -204,7 +203,9 @@ impl SimValue {
     pub const NULL: Self = SimValue(types::Value::Null);
 
     pub fn as_bool(&self) -> bool {
-        Numeric::from(&self.0).try_into_bool().unwrap_or_default()
+        Numeric::from_value(&self.0)
+            .map(|v| v.to_bool())
+            .unwrap_or_default()
     }
 
     #[inline]
@@ -409,7 +410,6 @@ impl From<&SimValue> for ast::Literal {
             types::Value::Null => Self::Null,
             types::Value::Numeric(Numeric::Integer(i)) => Self::Numeric(i.to_string()),
             types::Value::Numeric(Numeric::Float(f)) => Self::Numeric(f.to_string()),
-            types::Value::Numeric(Numeric::Null) => Self::Null,
             text @ types::Value::Text(..) => Self::String(escape_singlequotes(&text.to_string())),
             types::Value::Blob(blob) => Self::Blob(hex::encode(blob)),
         }

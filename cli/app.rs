@@ -1784,7 +1784,6 @@ impl Limbo {
             Value::Null => out.write_all(b"NULL"),
             Value::Numeric(Numeric::Integer(i)) => out.write_all(format!("{i}").as_bytes()),
             Value::Numeric(Numeric::Float(f)) => write!(out, "{}", f64::from(*f)).map(|_| ()),
-            Value::Numeric(Numeric::Null) => out.write_all(b"NULL"),
             Value::Text(s) => {
                 out.write_all(b"'")?;
                 let bytes = s.value.as_bytes();

@@ -120,9 +120,6 @@ impl From<turso_sdk_kit::rsapi::Value> for Value {
             turso_sdk_kit::rsapi::Value::Numeric(turso_sdk_kit::rsapi::Numeric::Float(n)) => {
                 Value::Real(f64::from(n))
             }
-            turso_sdk_kit::rsapi::Value::Numeric(turso_sdk_kit::rsapi::Numeric::Null) => {
-                Value::Null
-            }
             turso_sdk_kit::rsapi::Value::Text(t) => Value::Text(t.into()),
             turso_sdk_kit::rsapi::Value::Blob(items) => Value::Blob(items),
         }

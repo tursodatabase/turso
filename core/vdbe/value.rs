@@ -203,7 +203,7 @@ impl Value {
     }
 
     pub fn exec_sign(&self) -> Option<Value> {
-        let v = Numeric::from_value_strict(self).try_into_f64()?;
+        let v = Numeric::from_value_strict(self).map(|value| value.to_f64())?;
 
         Some(Value::from_i64(if v > 0.0 {
             1
@@ -283,7 +283,6 @@ impl Value {
                 Value::from_i64(v.checked_abs().ok_or(LimboError::IntegerOverflow)?)
             }
             Value::Numeric(Numeric::Float(non_nan)) => Value::from_f64(f64::from(*non_nan).abs()),
-            Value::Numeric(Numeric::Null) => Value::Null,
             _ => {
                 let s = match self {
                     Value::Text(text) => text.to_string(),
@@ -542,7 +541,6 @@ impl Value {
             Value::Null => Value::build_text("null"),
             Value::Numeric(Numeric::Integer(_)) => Value::build_text("integer"),
             Value::Numeric(Numeric::Float(_)) => Value::build_text("real"),
-            Value::Numeric(Numeric::Null) => Value::build_text("null"),
             Value::Text(_) => Value::build_text("text"),
             Value::Blob(_) => Value::build_text("blob"),
         }
@@ -604,11 +602,11 @@ impl Value {
     }
 
     pub fn exec_round(&self, precision: Option<&Value>) -> Value {
-        let Some(f) = Numeric::from(self).try_into_f64() else {
+        let Some(f) = Numeric::from_value(self).map(|v| v.to_f64()) else {
             return Value::Null;
         };
 
-        let precision = match precision.map(|v| Numeric::from(v).try_into_f64()) {
+        let precision = match precision.map(|v| Numeric::from_value(v).map(|v| v.to_f64())) {
             None => 0.0,
             Some(Some(v)) => v,
             Some(None) => return Value::Null,
@@ -695,8 +693,8 @@ impl Value {
 
     // exec_if returns whether you should jump
     pub fn exec_if(&self, jump_if_null: bool, not: bool) -> bool {
-        Numeric::from(self)
-            .try_into_bool()
+        Numeric::from_value(self)
+            .map(|v| v.to_bool())
             .map(|jump| if not { !jump } else { jump })
             .unwrap_or(jump_if_null)
     }
@@ -816,14 +814,14 @@ impl Value {
         let v = Numeric::from_value_strict(self);
 
         // In case of some functions and integer input, return the input as is
-        if let Numeric::Integer(i) = v {
+        if let Some(Numeric::Integer(i)) = v {
             if matches! { function, MathFunc::Ceil | MathFunc::Ceiling | MathFunc::Floor | MathFunc::Trunc }
             {
                 return Value::from_i64(i);
             }
         }
 
-        let Some(f) = v.try_into_f64() else {
+        let Some(f) = v.map(|v| v.to_f64()) else {
             return Value::Null;
         };
 
@@ -866,11 +864,11 @@ impl Value {
     }
 
     pub fn exec_math_binary(&self, rhs: &Value, function: &MathFunc) -> Value {
-        let Some(lhs) = Numeric::from_value_strict(self).try_into_f64() else {
+        let Some(lhs) = Numeric::from_value_strict(self).map(|v| v.to_f64()) else {
             return Value::Null;
         };
 
-        let Some(rhs) = Numeric::from_value_strict(rhs).try_into_f64() else {
+        let Some(rhs) = Numeric::from_value_strict(rhs).map(|v| v.to_f64()) else {
             return Value::Null;
         };
 
@@ -890,11 +888,11 @@ impl Value {
     }
 
     pub fn exec_math_log(&self, base: Option<&Value>) -> Value {
-        let Some(f) = Numeric::from_value_strict(self).try_into_f64() else {
+        let Some(f) = Numeric::from_value_strict(self).map(|v| v.to_f64()) else {
             return Value::Null;
         };
 
-        let base = match base.map(|value| Numeric::from_value_strict(value).try_into_f64()) {
+        let base = match base.map(|value| Numeric::from_value_strict(value).map(|v| v.to_f64())) {
             Some(Some(f)) => f,
             Some(None) => return Value::Null,
             None => 10.0,
@@ -922,19 +920,19 @@ impl Value {
     }
 
     pub fn exec_add(&self, rhs: &Value) -> Value {
-        (Numeric::from(self) + Numeric::from(rhs)).into()
+        (|| Numeric::from_value(self)?.checked_add(Numeric::from_value(rhs)?))().into()
     }
 
     pub fn exec_subtract(&self, rhs: &Value) -> Value {
-        (Numeric::from(self) - Numeric::from(rhs)).into()
+        (|| (Numeric::from_value(self)?.checked_sub(Numeric::from_value(rhs)?)))().into()
     }
 
     pub fn exec_multiply(&self, rhs: &Value) -> Value {
-        (Numeric::from(self) * Numeric::from(rhs)).into()
+        (|| (Numeric::from_value(self)?.checked_mul(Numeric::from_value(rhs)?)))().into()
     }
 
     pub fn exec_divide(&self, rhs: &Value) -> Value {
-        (Numeric::from(self) / Numeric::from(rhs)).into()
+        (|| (Numeric::from_value(self)?.checked_div(Numeric::from_value(rhs)?)))().into()
     }
 
     pub fn exec_bit_and(&self, rhs: &Value) -> Value {
@@ -946,8 +944,8 @@ impl Value {
     }
 
     pub fn exec_remainder(&self, rhs: &Value) -> Value {
-        let convert_to_float = matches!(Numeric::from(self), Numeric::Float(_))
-            || matches!(Numeric::from(rhs), Numeric::Float(_));
+        let convert_to_float = matches!(Numeric::from_value(self), Some(Numeric::Float(_)))
+            || matches!(Numeric::from_value(rhs), Some(Numeric::Float(_)));
 
         match NullableInteger::from(self) % NullableInteger::from(rhs) {
             NullableInteger::Null => Value::Null,
@@ -974,7 +972,7 @@ impl Value {
     }
 
     pub fn exec_boolean_not(&self) -> Value {
-        match Numeric::from(self).try_into_bool() {
+        match Numeric::from_value(self).map(|v| v.to_bool()) {
             None => Value::Null,
             Some(v) => Value::from_i64(!v as i64),
         }
@@ -998,8 +996,8 @@ impl Value {
 
     pub fn exec_and(&self, rhs: &Value) -> Value {
         match (
-            Numeric::from(self).try_into_bool(),
-            Numeric::from(rhs).try_into_bool(),
+            Numeric::from_value(self).map(|v| v.to_bool()),
+            Numeric::from_value(rhs).map(|v| v.to_bool()),
         ) {
             (Some(false), _) | (_, Some(false)) => Value::from_i64(0),
             (None, _) | (_, None) => Value::Null,
@@ -1009,8 +1007,8 @@ impl Value {
 
     pub fn exec_or(&self, rhs: &Value) -> Value {
         match (
-            Numeric::from(self).try_into_bool(),
-            Numeric::from(rhs).try_into_bool(),
+            Numeric::from_value(self).map(|v| v.to_bool()),
+            Numeric::from_value(rhs).map(|v| v.to_bool()),
         ) {
             (Some(true), _) | (_, Some(true)) => Value::from_i64(1),
             (None, _) | (_, None) => Value::Null,
@@ -1146,7 +1144,6 @@ impl Value {
                 Value::Blob(b) => result.push_str(&String::from_utf8_lossy(b)),
                 Value::Numeric(Numeric::Integer(i)) => result.push_str(&i.to_string()),
                 Value::Numeric(Numeric::Float(f)) => result.push_str(&format_float(f64::from(*f))),
-                Value::Numeric(Numeric::Null) => continue,
             }
         }
         Value::build_text(result)

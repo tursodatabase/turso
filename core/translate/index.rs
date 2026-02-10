@@ -716,7 +716,6 @@ pub fn resolve_index_method_parameters(
         let value = match *value {
             Expr::Literal(literal) => match literal {
                 ast::Literal::Numeric(s) => match Numeric::from(s) {
-                    Numeric::Null => crate::Value::Null,
                     Numeric::Integer(v) => crate::Value::Numeric(Numeric::Integer(v)),
                     Numeric::Float(v) => crate::Value::Numeric(Numeric::Float(v)),
                 },

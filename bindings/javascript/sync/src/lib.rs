@@ -74,9 +74,6 @@ fn core_value_to_js(value: turso_core::Value) -> Either5<Null, i64, f64, String,
         turso_core::Value::Numeric(turso_core::Numeric::Float(value)) => {
             Either5::<Null, i64, f64, String, Vec<u8>>::C(f64::from(value))
         }
-        turso_core::Value::Numeric(turso_core::Numeric::Null) => {
-            Either5::<Null, i64, f64, String, Vec<u8>>::A(Null)
-        }
         turso_core::Value::Text(value) => {
             Either5::<Null, i64, f64, String, Vec<u8>>::D(value.as_str().to_string())
         }

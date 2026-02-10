@@ -428,10 +428,6 @@ pub unsafe extern "C" fn db_statement_get_value(
                     real_val: f64::from(*float_value),
                 },
             },
-            Value::Numeric(turso_core::Numeric::Null) => TursoValue {
-                value_type: ValueType::Null,
-                value: TursoValueUnion { int_val: 0 },
-            },
             Value::Text(text) => {
                 let array = Array {
                     ptr: text.value.as_ptr(),

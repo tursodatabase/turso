@@ -27,9 +27,6 @@ pub fn encode_value(value: &Value, output: &mut Vec<u8>) {
             output.push(b'2');
             output.extend_from_slice(&f64::from(*v).to_bits().to_be_bytes());
         }
-        Value::Numeric(Numeric::Null) => {
-            output.push(b'0');
-        }
         Value::Text(text) => {
             output.push(b'3');
             output.extend_from_slice(text.as_str().as_bytes());

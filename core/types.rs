@@ -274,7 +274,6 @@ impl Debug for ValueRef<'_> {
                 let fval: f64 = (*float).into();
                 f.debug_tuple("Float").field(&fval).finish()
             }
-            ValueRef::Numeric(Numeric::Null) => write!(f, "Null"),
             ValueRef::Text(text_ref) => {
                 // truncate string to at most 256 chars
                 let text = text_ref.as_str();
@@ -434,7 +433,6 @@ impl Value {
             Value::Null => ValueType::Null,
             Value::Numeric(Numeric::Integer(_)) => ValueType::Integer,
             Value::Numeric(Numeric::Float(_)) => ValueType::Float,
-            Value::Numeric(Numeric::Null) => ValueType::Null,
             Value::Text(_) => ValueType::Text,
             Value::Blob(_) => ValueType::Blob,
         }
@@ -458,7 +456,6 @@ impl Value {
                 let fval: f64 = (*f).into();
                 out.extend_from_slice(&fval.to_be_bytes());
             }
-            Value::Numeric(Numeric::Null) => {}
             Value::Text(t) => out.extend_from_slice(t.value.as_bytes()),
             Value::Blob(b) => out.extend_from_slice(b),
         };
@@ -497,7 +494,6 @@ impl Display for Value {
             Self::Null => write!(f, ""),
             Self::Numeric(Numeric::Integer(i)) => write!(f, "{i}"),
             Self::Numeric(Numeric::Float(fl)) => f.write_str(&format_float(f64::from(*fl))),
-            Self::Numeric(Numeric::Null) => write!(f, ""),
             Self::Text(s) => write!(f, "{}", s.as_str()),
             Self::Blob(b) => write!(f, "{}", String::from_utf8_lossy(b)),
         }
@@ -510,7 +506,6 @@ impl Value {
             Self::Null => ExtValue::null(),
             Self::Numeric(Numeric::Integer(i)) => ExtValue::from_integer(*i),
             Self::Numeric(Numeric::Float(fl)) => ExtValue::from_float(f64::from(*fl)),
-            Self::Numeric(Numeric::Null) => ExtValue::null(),
             Self::Text(text) => ExtValue::from_text(text.as_str().to_string()),
             Self::Blob(blob) => ExtValue::from_blob(blob.to_vec()),
         }
@@ -797,9 +792,12 @@ impl std::ops::AddAssign for Value {
     fn add_assign(mut self: &mut Self, rhs: Self) {
         match (&mut self, &rhs) {
             (Self::Numeric(_), Self::Numeric(_)) => {
-                let lhs_num = Numeric::from(&*self);
-                let rhs_num = Numeric::from(&rhs);
-                *self = Value::from(lhs_num + rhs_num);
+                let sum = (|| {
+                    let lhs_num = Numeric::from_value(&self)?;
+                    let rhs_num = Numeric::from_value(&rhs)?;
+                    lhs_num.checked_add(rhs_num)
+                })();
+                *self = sum.into();
             }
             (Self::Text(string_left), Self::Text(string_right)) => {
                 string_left.value.to_mut().push_str(&string_right.value);
@@ -832,20 +830,24 @@ impl std::ops::AddAssign for Value {
 
 impl std::ops::AddAssign<i64> for Value {
     fn add_assign(&mut self, rhs: i64) {
-        let lhs_num = Numeric::from(&*self);
-        let rhs_num = Numeric::Integer(rhs);
-        *self = Value::from(lhs_num + rhs_num);
+        let sum = (|| {
+            let lhs_num = Numeric::from_value(&self)?;
+            let rhs_num = Numeric::Integer(rhs);
+            lhs_num.checked_add(rhs_num)
+        })();
+        *self = sum.into();
     }
 }
 
 impl std::ops::AddAssign<f64> for Value {
     fn add_assign(&mut self, rhs: f64) {
-        let lhs_num = Numeric::from(&*self);
-        let rhs_num = match NonNan::new(rhs) {
-            Some(nn) => Numeric::Float(nn),
-            None => Numeric::Null,
-        };
-        *self = Value::from(lhs_num + rhs_num);
+        let sum = (|| {
+            let lhs_num = Numeric::from_value(&self)?;
+            let rhs_num = NonNan::new(rhs).map(Numeric::Float)?;
+            lhs_num.checked_add(rhs_num)
+        })();
+
+        *self = sum.into();
     }
 }
 
@@ -853,9 +855,12 @@ impl std::ops::Div<Value> for Value {
     type Output = Value;
 
     fn div(self, rhs: Value) -> Self::Output {
-        let lhs_num = Numeric::from(&self);
-        let rhs_num = Numeric::from(&rhs);
-        Value::from(lhs_num / rhs_num)
+        let div = (|| {
+            let lhs_num = Numeric::from_value(self)?;
+            let rhs_num = Numeric::from_value(rhs)?;
+            lhs_num.checked_div(rhs_num)
+        })();
+        div.into()
     }
 }
 
@@ -1230,7 +1235,6 @@ impl ImmutableRecord {
                     let fval: f64 = f.into();
                     writer.extend_from_slice(&fval.to_be_bytes());
                 }
-                ValueRef::Numeric(Numeric::Null) => {}
                 ValueRef::Text(t) => {
                     writer.extend_from_slice(t.value.as_bytes());
                 }
@@ -1626,7 +1630,6 @@ impl<'a> ValueRef<'a> {
             Self::Null => ExtValue::null(),
             Self::Numeric(Numeric::Integer(i)) => ExtValue::from_integer(*i),
             Self::Numeric(Numeric::Float(fl)) => ExtValue::from_float(f64::from(*fl)),
-            Self::Numeric(Numeric::Null) => ExtValue::null(),
             Self::Text(text) => ExtValue::from_text(text.as_str().to_string()),
             Self::Blob(blob) => ExtValue::from_blob(blob.to_vec()),
         }
@@ -1692,7 +1695,6 @@ impl<'a> ValueRef<'a> {
             Self::Null => ValueType::Null,
             Self::Numeric(Numeric::Integer(_)) => ValueType::Integer,
             Self::Numeric(Numeric::Float(_)) => ValueType::Float,
-            Self::Numeric(Numeric::Null) => ValueType::Null,
             Self::Text(_) => ValueType::Text,
             Self::Blob(_) => ValueType::Blob,
         }
@@ -1708,7 +1710,6 @@ impl Display for ValueRef<'_> {
                 let fval: f64 = (*fl).into();
                 write!(f, "{fval:?}")
             }
-            Self::Numeric(Numeric::Null) => write!(f, "NULL"),
             Self::Text(s) => write!(f, "{}", s.as_str()),
             Self::Blob(b) => write!(f, "{}", String::from_utf8_lossy(b)),
         }
@@ -1749,17 +1750,6 @@ impl<'a> Eq for ValueRef<'a> {}
 impl<'a> PartialOrd<ValueRef<'a>> for ValueRef<'a> {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         match (self, other) {
-            // Numeric::Null is treated the same as Value::Null for ordering
-            (Self::Numeric(Numeric::Null), _) | (Self::Null, _)
-                if matches!(other, Self::Null | Self::Numeric(Numeric::Null)) =>
-            {
-                Some(std::cmp::Ordering::Equal)
-            }
-            (Self::Numeric(Numeric::Null), _) | (Self::Null, _) => Some(std::cmp::Ordering::Less),
-            (_, Self::Numeric(Numeric::Null)) | (_, Self::Null) => {
-                Some(std::cmp::Ordering::Greater)
-            }
-
             (Self::Numeric(Numeric::Integer(a)), Self::Numeric(Numeric::Integer(b))) => {
                 a.partial_cmp(b)
             }
@@ -1787,6 +1777,9 @@ impl<'a> PartialOrd<ValueRef<'a>> for ValueRef<'a> {
             (Self::Blob(_), Self::Text(_)) => Some(std::cmp::Ordering::Greater),
 
             (Self::Blob(blob_left), Self::Blob(blob_right)) => blob_left.partial_cmp(blob_right),
+            (Self::Null, Self::Null) => Some(std::cmp::Ordering::Equal),
+            (Self::Null, _) => Some(std::cmp::Ordering::Less),
+            (_, Self::Null) => Some(std::cmp::Ordering::Greater),
         }
     }
 }
@@ -2555,7 +2548,6 @@ impl<T: AsValueRef> From<T> for SerialType {
                 _ => SerialType::i64(),
             },
             ValueRef::Numeric(Numeric::Float(_)) => SerialType::f64(),
-            ValueRef::Numeric(Numeric::Null) => SerialType::null(),
             ValueRef::Text(t) => SerialType::text(t.value.len() as u64),
             ValueRef::Blob(b) => SerialType::blob(b.len() as u64),
         }
@@ -2651,7 +2643,6 @@ impl Record {
                 Value::Numeric(Numeric::Float(f)) => {
                     buf.extend_from_slice(&f64::from(*f).to_be_bytes())
                 }
-                Value::Numeric(Numeric::Null) => {}
                 Value::Text(t) => buf.extend_from_slice(t.value.as_bytes()),
                 Value::Blob(b) => buf.extend_from_slice(b),
             };

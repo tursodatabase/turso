@@ -61,7 +61,6 @@ pub fn exec_printf(values: &[Register]) -> crate::Result<Value> {
             format_string = f64::from(*f).to_string();
             format_string.as_str()
         }
-        Value::Numeric(Numeric::Null) => return Ok(Value::Null),
         Value::Blob(b) => {
             // Blob to string - use lossy UTF-8 conversion like SQLite
             format_string = String::from_utf8_lossy(b).to_string();

@@ -684,7 +684,6 @@ fn convert_to_args(values: Vec<turso_core::Value>) -> Vec<server_proto::Value> {
             Value::Numeric(turso_core::Numeric::Float(value)) => server_proto::Value::Float {
                 value: f64::from(value),
             },
-            Value::Numeric(turso_core::Numeric::Null) => server_proto::Value::Null,
             Value::Text(value) => server_proto::Value::Text {
                 value: value.as_str().to_string(),
             },

@@ -819,9 +819,6 @@ fn to_js_value<'a>(
         turso_core::Value::Numeric(turso_core::Numeric::Float(f)) => {
             ToNapiValue::into_unknown(f64::from(*f), env)
         }
-        turso_core::Value::Numeric(turso_core::Numeric::Null) => {
-            ToNapiValue::into_unknown(Null, env)
-        }
         turso_core::Value::Text(s) => ToNapiValue::into_unknown(s.as_str(), env),
         turso_core::Value::Blob(b) => {
             #[cfg(not(feature = "browser"))]

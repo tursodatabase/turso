@@ -197,9 +197,6 @@ pub fn convert_ref_dbtype_to_jsonb(val: ValueRef<'_>, strict: Conv) -> crate::Re
         }
         ValueRef::Numeric(Numeric::Integer(int)) => Jsonb::from_str(&int.to_string())
             .map_err(|_| LimboError::ParseError("malformed JSON".to_string())),
-        ValueRef::Numeric(Numeric::Null) => Ok(Jsonb::from_raw_data(
-            JsonbHeader::make_null().into_bytes().as_bytes(),
-        )),
     }
 }
 
@@ -680,7 +677,6 @@ fn json_path_from_db_value<'a>(
                     PathElement::Key(Cow::Owned(f64::from(f).to_string()), false),
                 ],
             },
-            ValueRef::Numeric(Numeric::Null) => return Ok(None),
             _ => crate::bail_constraint_error!("JSON path error near: {:?}", path.to_string()),
         }
     };
@@ -835,7 +831,6 @@ pub fn json_quote(value: impl AsValueRef) -> crate::Result<Value> {
         }
         // Numbers are unquoted in json
         ValueRef::Numeric(n @ (Numeric::Integer(_) | Numeric::Float(_))) => Ok(Value::Numeric(n)),
-        ValueRef::Numeric(Numeric::Null) => Ok(Value::build_text("null")),
         ValueRef::Blob(_) => crate::bail_constraint_error!("JSON cannot hold BLOB values"),
         ValueRef::Null => Ok(Value::build_text("null")),
     }

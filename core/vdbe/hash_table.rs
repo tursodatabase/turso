@@ -57,7 +57,7 @@ fn hash_join_key(key_values: &[ValueRef], collations: &[CollationSeq]) -> u64 {
 
     for (idx, value) in key_values.iter().enumerate() {
         match value {
-            ValueRef::Null | ValueRef::Numeric(Numeric::Null) => {
+            ValueRef::Null => {
                 hasher.write_u8(NULL_HASH);
             }
             ValueRef::Numeric(Numeric::Integer(i)) => {
@@ -144,7 +144,6 @@ fn values_equal(v1: ValueRef, v2: ValueRef, collation: CollationSeq) -> bool {
     match (v1, v2) {
         // NULL = NULL is false in SQL (actually NULL, which is falsy)
         (ValueRef::Null, _) | (_, ValueRef::Null) => false,
-        (ValueRef::Numeric(Numeric::Null), _) | (_, ValueRef::Numeric(Numeric::Null)) => false,
         (ValueRef::Numeric(n1), ValueRef::Numeric(n2)) => {
             ValueRef::Numeric(n1) == ValueRef::Numeric(n2)
         }
@@ -323,10 +322,6 @@ impl HashEntry {
                 buf[offset..offset + 8].copy_from_slice(&f64::from(*f).to_le_bytes());
                 offset += 8;
             }
-            Value::Numeric(Numeric::Null) => {
-                buf[offset] = NULL_HASH;
-                offset += 1;
-            }
             Value::Text(t) => {
                 buf[offset] = TEXT_HASH;
                 offset += 1;
@@ -382,9 +377,6 @@ impl HashEntry {
             Value::Numeric(Numeric::Float(f)) => {
                 buf.push(FLOAT_HASH);
                 buf.extend_from_slice(&f64::from(*f).to_le_bytes());
-            }
-            Value::Numeric(Numeric::Null) => {
-                buf.push(NULL_HASH);
             }
             Value::Text(t) => {
                 buf.push(TEXT_HASH);

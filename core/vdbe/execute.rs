@@ -3910,7 +3910,7 @@ fn update_agg_payload(
                 ovrfl: *ovrfl_i != 0,
             };
             match arg {
-                Value::Null | Value::Numeric(Numeric::Null) => {}
+                Value::Null => {}
                 Value::Numeric(Numeric::Integer(i)) => match acc {
                     Value::Null => {
                         *acc = Value::from_i64(i);
@@ -8480,7 +8480,7 @@ pub fn op_add_imm(
         Value::Numeric(Numeric::Float(f)) => (f64::from(*f) as i64) + value,
         Value::Text(s) => s.as_str().parse::<i64>().unwrap_or(0) + value,
         Value::Blob(_) => *value, // BLOB becomes the added value
-        Value::Null | Value::Numeric(Numeric::Null) => *value, // NULL becomes the added value
+        Value::Null => *value,    // NULL becomes the added value
     };
 
     state.registers[*register] = Register::Value(Value::from_i64(int_val));
@@ -8549,7 +8549,7 @@ pub fn op_is_true(
     );
     let value = state.registers[*reg].get_value();
     // Use Numeric::try_into_bool which handles the conversion of text/blob to numbers
-    let final_result = match Numeric::from(value).try_into_bool() {
+    let final_result = match Numeric::from_value(value).map(|val| val.to_bool()) {
         // For NULL, store null_value directly (no inversion)
         None => {
             if *null_value {
@@ -11284,7 +11284,7 @@ pub fn extract_int_value<V: AsValueRef>(value: V) -> i64 {
                 0
             }
         }
-        ValueRef::Numeric(Numeric::Null) | ValueRef::Null => 0,
+        ValueRef::Null => 0,
     }
 }
 
