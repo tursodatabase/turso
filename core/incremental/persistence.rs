@@ -1,4 +1,5 @@
 use crate::incremental::operator::{AggregateState, DbspStateCursors};
+use crate::numeric::Numeric;
 use crate::storage::btree::{BTreeCursor, BTreeKey, CursorTrait};
 use crate::types::{IOResult, ImmutableRecord, SeekKey, SeekOp, SeekResult};
 use crate::{return_if_io, LimboError, Result, Value};
@@ -155,7 +156,7 @@ impl WriteRow {
                         // Weight is always the last value (column 4 in our 5-column structure)
                         let existing_weight = match weight_opt {
                             Some(val) => match val.to_owned() {
-                                Value::Integer(w) => w as isize,
+                                Value::Numeric(Numeric::Integer(w)) => w as isize,
                                 _ => {
                                     return Err(LimboError::InternalError(
                                         "Invalid weight value in storage".to_string(),
@@ -236,7 +237,7 @@ impl WriteRow {
                     // Build the complete record with weight
                     // Use the function parameter record_values directly
                     let mut complete_record = record_values.clone();
-                    complete_record.push(Value::Integer(final_weight_val as i64));
+                    complete_record.push(Value::from_i64(final_weight_val as i64));
 
                     // Create an ImmutableRecord from the values
                     let immutable_record =
@@ -251,7 +252,7 @@ impl WriteRow {
                     // For has_rowid indexes, we need to append the rowid to the index key
                     // Use the function parameter index_key directly
                     let mut index_values = index_key.clone();
-                    index_values.push(Value::Integer(*rowid));
+                    index_values.push(Value::from_i64(*rowid));
 
                     // Create the index record with the rowid appended
                     let index_record =
@@ -268,7 +269,7 @@ impl WriteRow {
                 } => {
                     // Build the complete record with weight
                     let mut complete_record = record_values.clone();
-                    complete_record.push(Value::Integer(*final_weight as i64));
+                    complete_record.push(Value::from_i64(*final_weight as i64));
 
                     // Create an ImmutableRecord from the values
                     let immutable_record =

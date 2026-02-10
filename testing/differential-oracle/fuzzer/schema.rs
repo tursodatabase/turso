@@ -99,12 +99,12 @@ impl SchemaIntrospector {
             };
 
             let notnull = match row.get_value(3) {
-                turso_core::Value::Integer(i) => *i != 0,
+                turso_core::Value::Numeric(turso_core::Numeric::Integer(i)) => *i != 0,
                 _ => false,
             };
 
             let pk = match row.get_value(5) {
-                turso_core::Value::Integer(i) => *i != 0,
+                turso_core::Value::Numeric(turso_core::Numeric::Integer(i)) => *i != 0,
                 _ => false,
             };
 

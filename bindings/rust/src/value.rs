@@ -114,8 +114,12 @@ impl From<turso_sdk_kit::rsapi::Value> for Value {
     fn from(val: turso_sdk_kit::rsapi::Value) -> Self {
         match val {
             turso_sdk_kit::rsapi::Value::Null => Value::Null,
-            turso_sdk_kit::rsapi::Value::Integer(n) => Value::Integer(n),
-            turso_sdk_kit::rsapi::Value::Float(n) => Value::Real(n),
+            turso_sdk_kit::rsapi::Value::Numeric(turso_sdk_kit::rsapi::Numeric::Integer(n)) => {
+                Value::Integer(n)
+            }
+            turso_sdk_kit::rsapi::Value::Numeric(turso_sdk_kit::rsapi::Numeric::Float(n)) => {
+                Value::Real(f64::from(n))
+            }
             turso_sdk_kit::rsapi::Value::Text(t) => Value::Text(t.into()),
             turso_sdk_kit::rsapi::Value::Blob(items) => Value::Blob(items),
         }
@@ -126,8 +130,8 @@ impl From<Value> for turso_sdk_kit::rsapi::Value {
     fn from(val: Value) -> Self {
         match val {
             Value::Null => turso_sdk_kit::rsapi::Value::Null,
-            Value::Integer(n) => turso_sdk_kit::rsapi::Value::Integer(n),
-            Value::Real(n) => turso_sdk_kit::rsapi::Value::Float(n),
+            Value::Integer(n) => turso_sdk_kit::rsapi::Value::from_i64(n),
+            Value::Real(n) => turso_sdk_kit::rsapi::Value::from_f64(n),
             Value::Text(t) => turso_sdk_kit::rsapi::Value::from_text(t),
             Value::Blob(items) => turso_sdk_kit::rsapi::Value::from_blob(items),
         }

@@ -10,7 +10,7 @@ use anyhow::Result;
 use sql_gen_prop::SqlStatement;
 use sql_gen_prop::SqlValue;
 use sql_gen_prop::result::diff_results;
-use turso_core::Value;
+use turso_core::{Numeric, Value};
 
 /// Result of an oracle check.
 #[derive(Debug, Clone)]
@@ -214,8 +214,8 @@ impl DifferentialOracle {
     fn convert_turso_value(value: Value) -> SqlValue {
         match value {
             Value::Null => SqlValue::Null,
-            Value::Integer(i) => SqlValue::Integer(i),
-            Value::Float(f) => SqlValue::Real(f),
+            Value::Numeric(Numeric::Integer(i)) => SqlValue::Integer(i),
+            Value::Numeric(Numeric::Float(f)) => SqlValue::Real(f64::from(f)),
             Value::Text(s) => SqlValue::Text(s.as_str().to_string()),
             Value::Blob(b) => SqlValue::Blob(b),
         }

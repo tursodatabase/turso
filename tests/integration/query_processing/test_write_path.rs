@@ -6,7 +6,7 @@ use log::debug;
 use std::io::{Read, Seek, Write};
 use std::sync::Arc;
 use turso_core::vdbe::StepResult;
-use turso_core::{CheckpointMode, Connection, LimboError, Row, Statement, Value};
+use turso_core::{CheckpointMode, Connection, LimboError, Numeric, Row, Statement, Value};
 
 const WAL_HEADER_SIZE: usize = 32;
 const WAL_FRAME_HEADER_SIZE: usize = 24;
@@ -125,8 +125,8 @@ fn test_sequential_write(tmp_db: TempDatabase) -> anyhow::Result<()> {
         common::run_query_on_row(&tmp_db, &conn, list_query, |row: &Row| {
             let first_value = row.get::<&Value>(0).expect("missing id");
             let id = match first_value {
-                turso_core::Value::Integer(i) => *i as i32,
-                turso_core::Value::Float(f) => *f as i32,
+                turso_core::Value::Numeric(Numeric::Integer(i)) => *i as i32,
+                turso_core::Value::Numeric(Numeric::Float(f)) => f64::from(*f) as i32,
                 _ => unreachable!(),
             };
             assert_eq!(current_read_index, id);
@@ -157,7 +157,7 @@ fn test_regression_multi_row_insert(tmp_db: TempDatabase) -> anyhow::Result<()> 
     common::run_query_on_row(&tmp_db, &conn, list_query, |row: &Row| {
         let first_value = row.get::<&Value>(0).expect("missing id");
         let id = match first_value {
-            Value::Float(f) => *f as i32,
+            Value::Numeric(Numeric::Float(f)) => f64::from(*f) as i32,
             _ => panic!("expected float"),
         };
         actual_ids.push(id);
@@ -186,7 +186,7 @@ fn test_statement_reset(tmp_db: TempDatabase) -> anyhow::Result<()> {
                 let row = stmt.row().unwrap();
                 assert_eq!(
                     *row.get::<&Value>(0).unwrap(),
-                    turso_core::Value::Integer(1)
+                    turso_core::Value::from_i64(1)
                 );
                 break;
             }
@@ -203,7 +203,7 @@ fn test_statement_reset(tmp_db: TempDatabase) -> anyhow::Result<()> {
                 let row = stmt.row().unwrap();
                 assert_eq!(
                     *row.get::<&Value>(0).unwrap(),
-                    turso_core::Value::Integer(1)
+                    turso_core::Value::from_i64(1)
                 );
                 break;
             }
@@ -329,8 +329,8 @@ fn test_write_delete_with_index(tmp_db: TempDatabase) -> anyhow::Result<()> {
         common::run_query_on_row(&tmp_db, &conn, list_query, |row: &Row| {
             let first_value = row.get::<&Value>(0).expect("missing id");
             let id = match first_value {
-                turso_core::Value::Integer(i) => *i as i32,
-                turso_core::Value::Float(f) => *f as i32,
+                turso_core::Value::Numeric(Numeric::Integer(i)) => *i as i32,
+                turso_core::Value::Numeric(Numeric::Float(f)) => f64::from(*f) as i32,
                 _ => unreachable!(),
             };
             assert_eq!(current_read_index, id);
@@ -345,8 +345,8 @@ fn test_write_delete_with_index(tmp_db: TempDatabase) -> anyhow::Result<()> {
                 |row| {
                     let first_value = row.get::<&Value>(0).expect("missing id");
                     let id = match first_value {
-                        turso_core::Value::Integer(i) => *i as i32,
-                        turso_core::Value::Float(f) => *f as i32,
+                        turso_core::Value::Numeric(Numeric::Integer(i)) => *i as i32,
+                        turso_core::Value::Numeric(Numeric::Float(f)) => f64::from(*f) as i32,
                         _ => unreachable!(),
                     };
                     assert_eq!(i, id);

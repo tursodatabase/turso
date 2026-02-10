@@ -132,7 +132,9 @@ impl InternalVirtualTableCursor for DbPageCursor {
         let mut arg_idx = 0;
 
         if (idx_num & 1) != 0 {
-            let pgno = if let Some(Value::Integer(val)) = args.get(arg_idx) {
+            let pgno = if let Some(Value::Numeric(crate::numeric::Numeric::Integer(val))) =
+                args.get(arg_idx)
+            {
                 *val
             } else {
                 0
@@ -171,7 +173,7 @@ impl InternalVirtualTableCursor for DbPageCursor {
 
     fn column(&self, column: usize) -> Result<Value> {
         match column {
-            0 => Ok(Value::Integer(self.pgno)),
+            0 => Ok(Value::from_i64(self.pgno)),
             1 => {
                 // check for the pending byte page  - this only needs when db is more than 1 gb.
                 if let Some(pending_page) = self.pager.pending_byte_page_id() {

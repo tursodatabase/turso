@@ -8,7 +8,7 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
-use turso_core::{Connection, Database, DatabaseOpts, OpenFlags, Value as DbValue};
+use turso_core::{Connection, Database, DatabaseOpts, Numeric, OpenFlags, Value as DbValue};
 
 #[derive(Debug, Serialize, Deserialize)]
 struct JsonRpcRequest {
@@ -505,13 +505,13 @@ impl TursoMcpServer {
                                 "{} {} {} {} {}",
                                 col_name,
                                 col_type,
-                                if matches!(not_null, DbValue::Integer(1)) {
+                                if matches!(not_null, DbValue::Numeric(Numeric::Integer(1))) {
                                     "NOT NULL"
                                 } else {
                                     "NULL"
                                 },
                                 default_str,
-                                if matches!(pk, DbValue::Integer(1)) {
+                                if matches!(pk, DbValue::Numeric(Numeric::Integer(1))) {
                                     "PRIMARY KEY"
                                 } else {
                                     ""

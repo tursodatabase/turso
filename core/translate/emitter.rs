@@ -4181,16 +4181,16 @@ fn init_limit(
         if let Some(expr) = limit {
             match expr.as_ref() {
                 Expr::Literal(Literal::Numeric(n)) => match parse_numeric_literal(n)? {
-                    crate::types::Value::Integer(value) => {
+                    crate::types::Value::Numeric(crate::Numeric::Integer(value)) => {
                         program.add_comment(program.offset(), "LIMIT counter");
                         program.emit_insn(Insn::Integer {
                             value,
                             dest: limit_ctx.reg_limit,
                         });
                     }
-                    crate::types::Value::Float(value) => {
+                    crate::types::Value::Numeric(crate::Numeric::Float(value)) => {
                         program.emit_insn(Insn::Real {
-                            value,
+                            value: value.into(),
                             dest: limit_ctx.reg_limit,
                         });
                         program.add_comment(program.offset(), "LIMIT counter");
@@ -4216,15 +4216,15 @@ fn init_limit(
             t_ctx.reg_offset = Some(offset_reg);
             match expr.as_ref() {
                 Expr::Literal(Literal::Numeric(n)) => match parse_numeric_literal(n)? {
-                    crate::types::Value::Integer(value) => {
+                    crate::types::Value::Numeric(crate::Numeric::Integer(value)) => {
                         program.emit_insn(Insn::Integer {
                             value,
                             dest: offset_reg,
                         });
                     }
-                    crate::types::Value::Float(value) => {
+                    crate::types::Value::Numeric(crate::Numeric::Float(value)) => {
                         program.emit_insn(Insn::Real {
-                            value,
+                            value: value.into(),
                             dest: offset_reg,
                         });
                         program.emit_insn(Insn::MustBeInt { reg: offset_reg });

@@ -1079,7 +1079,7 @@ pub unsafe extern "C" fn sqlite3_bind_int64(
     let stmt = &mut *stmt;
 
     stmt.stmt
-        .bind_at(NonZero::new_unchecked(idx as usize), Value::Integer(val));
+        .bind_at(NonZero::new_unchecked(idx as usize), Value::from_i64(val));
 
     SQLITE_OK
 }
@@ -1099,7 +1099,7 @@ pub unsafe extern "C" fn sqlite3_bind_double(
     let stmt = &mut *stmt;
 
     stmt.stmt
-        .bind_at(NonZero::new_unchecked(idx as usize), Value::Float(val));
+        .bind_at(NonZero::new_unchecked(idx as usize), Value::from_f64(val));
 
     SQLITE_OK
 }
@@ -1235,9 +1235,9 @@ pub unsafe extern "C" fn sqlite3_column_type(
         .expect("Function should only be called after `SQLITE_ROW`");
 
     match row.get::<&Value>(idx as usize) {
-        Ok(turso_core::Value::Integer(_)) => SQLITE_INTEGER,
+        Ok(turso_core::Value::Numeric(turso_core::Numeric::Integer(_))) => SQLITE_INTEGER,
         Ok(turso_core::Value::Text(_)) => SQLITE_TEXT,
-        Ok(turso_core::Value::Float(_)) => SQLITE_FLOAT,
+        Ok(turso_core::Value::Numeric(turso_core::Numeric::Float(_))) => SQLITE_FLOAT,
         Ok(turso_core::Value::Blob(_)) => SQLITE_BLOB,
         _ => SQLITE_NULL,
     }
@@ -1375,8 +1375,8 @@ pub unsafe extern "C" fn sqlite3_value_type(value: *mut ffi::c_void) -> ffi::c_i
     let value = &*value;
     match value {
         turso_core::Value::Null => 0,
-        turso_core::Value::Integer(_) => 1,
-        turso_core::Value::Float(_) => 2,
+        turso_core::Value::Numeric(turso_core::Numeric::Integer(_)) => 1,
+        turso_core::Value::Numeric(turso_core::Numeric::Float(_)) => 2,
         turso_core::Value::Text(_) => 3,
         turso_core::Value::Blob(_) => 4,
     }
@@ -1387,7 +1387,7 @@ pub unsafe extern "C" fn sqlite3_value_int64(value: *mut ffi::c_void) -> i64 {
     let value = value as *mut turso_core::Value;
     let value = &*value;
     match value {
-        turso_core::Value::Integer(i) => *i,
+        turso_core::Value::Numeric(turso_core::Numeric::Integer(i)) => *i,
         _ => 0,
     }
 }
@@ -1397,7 +1397,7 @@ pub unsafe extern "C" fn sqlite3_value_double(value: *mut ffi::c_void) -> f64 {
     let value = value as *mut turso_core::Value;
     let value = &*value;
     match value {
-        turso_core::Value::Float(f) => *f,
+        turso_core::Value::Numeric(turso_core::Numeric::Float(f)) => f64::from(*f),
         _ => 0.0,
     }
 }

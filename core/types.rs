@@ -1,7 +1,5 @@
 use branches::{mark_unlikely, unlikely};
 use either::Either;
-#[cfg(feature = "serde")]
-use serde::Deserialize;
 use turso_ext::{AggCtx, FinalizeFunction, StepFunction};
 use turso_parser::ast::SortOrder;
 
@@ -9,6 +7,8 @@ use crate::error::LimboError;
 use crate::ext::{ExtValue, ExtValueType};
 use crate::index_method::IndexMethodCursor;
 use crate::numeric::format_float;
+use crate::numeric::nonnan::NonNan;
+use crate::numeric::Numeric;
 use crate::pseudo::PseudoCursor;
 use crate::schema::Index;
 use crate::storage::btree::CursorTrait;
@@ -248,40 +248,11 @@ impl From<Text> for String {
     }
 }
 
-#[cfg(feature = "serde")]
-fn float_to_string<S>(float: &f64, serializer: S) -> Result<S::Ok, S::Error>
-where
-    S: serde::Serializer,
-{
-    serializer.serialize_str(&format!("{float}"))
-}
-
-#[cfg(feature = "serde")]
-fn string_to_float<'de, D>(deserializer: D) -> Result<f64, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let s = String::deserialize(deserializer)?;
-    match crate::numeric::str_to_f64(s) {
-        Some(result) => Ok(result.into()),
-        None => Err(serde::de::Error::custom("")),
-    }
-}
-
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Value {
     Null,
-    Integer(i64),
-    // we use custom serialization to preserve float precision
-    #[cfg_attr(
-        feature = "serde",
-        serde(
-            serialize_with = "float_to_string",
-            deserialize_with = "string_to_float"
-        )
-    )]
-    Float(f64),
+    Numeric(Numeric),
     Text(Text),
     Blob(Vec<u8>),
 }
@@ -289,8 +260,7 @@ pub enum Value {
 #[derive(Clone, Copy)]
 pub enum ValueRef<'a> {
     Null,
-    Integer(i64),
-    Float(f64),
+    Numeric(Numeric),
     Text(TextRef<'a>),
     Blob(&'a [u8]),
 }
@@ -299,8 +269,11 @@ impl Debug for ValueRef<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ValueRef::Null => write!(f, "Null"),
-            ValueRef::Integer(i) => f.debug_tuple("Integer").field(i).finish(),
-            ValueRef::Float(float) => f.debug_tuple("Float").field(float).finish(),
+            ValueRef::Numeric(Numeric::Integer(i)) => f.debug_tuple("Integer").field(i).finish(),
+            ValueRef::Numeric(Numeric::Float(float)) => {
+                let fval: f64 = (*float).into();
+                f.debug_tuple("Float").field(&fval).finish()
+            }
             ValueRef::Text(text_ref) => {
                 // truncate string to at most 256 chars
                 let text = text_ref.as_str();
@@ -370,11 +343,21 @@ impl<V: AsValueRef> AsValueRef for &V {
 }
 
 impl Value {
+    pub fn from_f64(f: f64) -> Self {
+        match NonNan::new(f) {
+            Some(nn) => Self::Numeric(Numeric::Float(nn)),
+            None => Self::Null,
+        }
+    }
+
+    pub fn from_i64(i: i64) -> Self {
+        Self::Numeric(Numeric::Integer(i))
+    }
+
     pub fn as_ref<'a>(&'a self) -> ValueRef<'a> {
         match self {
             Value::Null => ValueRef::Null,
-            Value::Integer(v) => ValueRef::Integer(*v),
-            Value::Float(v) => ValueRef::Float(*v),
+            Value::Numeric(n) => ValueRef::Numeric(*n),
             Value::Text(v) => ValueRef::Text(TextRef {
                 value: &v.value,
                 subtype: v.subtype,
@@ -421,22 +404,22 @@ impl Value {
     }
     pub fn as_float(&self) -> f64 {
         match self {
-            Value::Float(f) => *f,
-            Value::Integer(i) => *i as f64,
-            _ => panic!("as_float must be called only for Value::Float or Value::Integer"),
+            Value::Numeric(Numeric::Float(f)) => f64::from(*f),
+            Value::Numeric(Numeric::Integer(i)) => *i as f64,
+            _ => panic!("as_float must be called only for Value::Numeric"),
         }
     }
 
     pub fn as_int(&self) -> Option<i64> {
         match self {
-            Value::Integer(i) => Some(*i),
+            Value::Numeric(Numeric::Integer(i)) => Some(*i),
             _ => None,
         }
     }
 
     pub fn as_uint(&self) -> u64 {
         match self {
-            Value::Integer(i) => (*i).cast_unsigned(),
+            Value::Numeric(Numeric::Integer(i)) => (*i).cast_unsigned(),
             _ => 0,
         }
     }
@@ -448,8 +431,8 @@ impl Value {
     pub fn value_type(&self) -> ValueType {
         match self {
             Value::Null => ValueType::Null,
-            Value::Integer(_) => ValueType::Integer,
-            Value::Float(_) => ValueType::Float,
+            Value::Numeric(Numeric::Integer(_)) => ValueType::Integer,
+            Value::Numeric(Numeric::Float(_)) => ValueType::Float,
             Value::Text(_) => ValueType::Text,
             Value::Blob(_) => ValueType::Blob,
         }
@@ -457,7 +440,7 @@ impl Value {
     pub fn serialize_serial(&self, out: &mut Vec<u8>) {
         match self {
             Value::Null => {}
-            Value::Integer(i) => {
+            Value::Numeric(Numeric::Integer(i)) => {
                 let serial_type = SerialType::from(self);
                 match serial_type.kind() {
                     SerialTypeKind::I8 => out.extend_from_slice(&(*i as i8).to_be_bytes()),
@@ -469,7 +452,10 @@ impl Value {
                     _ => unreachable!(),
                 }
             }
-            Value::Float(f) => out.extend_from_slice(&f.to_be_bytes()),
+            Value::Numeric(Numeric::Float(f)) => {
+                let fval: f64 = (*f).into();
+                out.extend_from_slice(&fval.to_be_bytes());
+            }
             Value::Text(t) => out.extend_from_slice(t.value.as_bytes()),
             Value::Blob(b) => out.extend_from_slice(b),
         };
@@ -498,21 +484,17 @@ pub struct ExternalAggState {
 /// format!("{}", value);
 /// ---BAD---
 /// match value {
-///   Value::Integer(i) => *i.as_str(),
-///   Value::Float(f) => *f.as_str(),
+///   Value::Numeric(Numeric::Integer(i)) => i.to_string(),
+///   Value::Numeric(Numeric::Float(f)) => f64::from(*f).to_string(),
 ///   ....
 /// }
 impl Display for Value {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Null => write!(f, ""),
-            Self::Integer(i) => {
-                write!(f, "{i}")
-            }
-            Self::Float(fl) => f.write_str(&format_float(*fl)),
-            Self::Text(s) => {
-                write!(f, "{}", s.as_str())
-            }
+            Self::Numeric(Numeric::Integer(i)) => write!(f, "{i}"),
+            Self::Numeric(Numeric::Float(fl)) => f.write_str(&format_float(f64::from(*fl))),
+            Self::Text(s) => write!(f, "{}", s.as_str()),
             Self::Blob(b) => write!(f, "{}", String::from_utf8_lossy(b)),
         }
     }
@@ -522,8 +504,8 @@ impl Value {
     pub fn to_ffi(&self) -> ExtValue {
         match self {
             Self::Null => ExtValue::null(),
-            Self::Integer(i) => ExtValue::from_integer(*i),
-            Self::Float(fl) => ExtValue::from_float(*fl),
+            Self::Numeric(Numeric::Integer(i)) => ExtValue::from_integer(*i),
+            Self::Numeric(Numeric::Float(fl)) => ExtValue::from_float(f64::from(*fl)),
             Self::Text(text) => ExtValue::from_text(text.as_str().to_string()),
             Self::Blob(blob) => ExtValue::from_blob(blob.to_vec()),
         }
@@ -536,13 +518,13 @@ impl Value {
                 let Some(int) = v.to_integer() else {
                     return Ok(Value::Null);
                 };
-                Ok(Value::Integer(int))
+                Ok(Value::from_i64(int))
             }
             ExtValueType::Float => {
                 let Some(float) = v.to_float() else {
                     return Ok(Value::Null);
                 };
-                Ok(Value::Float(float))
+                Ok(Value::from_f64(float))
             }
             ExtValueType::Text => {
                 let Some(text) = v.to_text() else {
@@ -595,7 +577,7 @@ macro_rules! impl_int_from_value {
             fn from_sql(val: Value) -> Result<Self> {
                 match val {
                     Value::Null => Err(LimboError::NullValue),
-                    Value::Integer(i) => Ok($cast(i)),
+                    Value::Numeric(Numeric::Integer(i)) => Ok($cast(i)),
                     _ => unreachable!("invalid value type"),
                 }
             }
@@ -614,7 +596,7 @@ impl FromValue for f64 {
     fn from_sql(val: Value) -> Result<Self> {
         match val {
             Value::Null => Err(LimboError::NullValue),
-            Value::Float(f) => Ok(f),
+            Value::Numeric(Numeric::Float(f)) => Ok(f64::from(f)),
             _ => unreachable!("invalid value type"),
         }
     }
@@ -658,7 +640,7 @@ impl FromValue for bool {
     fn from_sql(val: Value) -> Result<Self> {
         match val {
             Value::Null => Err(LimboError::NullValue),
-            Value::Integer(i) => match i {
+            Value::Numeric(Numeric::Integer(i)) => match i {
                 0 => Ok(false),
                 1 => Ok(true),
                 _ => Err(LimboError::InvalidColumnType),
@@ -808,63 +790,64 @@ impl std::ops::Add<i64> for Value {
 
 impl std::ops::AddAssign for Value {
     fn add_assign(mut self: &mut Self, rhs: Self) {
-        match (&mut self, rhs) {
-            (Self::Integer(int_left), Self::Integer(int_right)) => *int_left += int_right,
-            (Self::Integer(int_left), Self::Float(float_right)) => {
-                *self = Self::Float(*int_left as f64 + float_right)
-            }
-            (Self::Float(float_left), Self::Integer(int_right)) => {
-                *self = Self::Float(*float_left + int_right as f64)
-            }
-            (Self::Float(float_left), Self::Float(float_right)) => {
-                *float_left += float_right;
+        match (&mut self, &rhs) {
+            (Self::Numeric(_), Self::Numeric(_)) => {
+                let sum = (|| {
+                    let lhs_num = Numeric::from_value(&self)?;
+                    let rhs_num = Numeric::from_value(&rhs)?;
+                    lhs_num.checked_add(rhs_num)
+                })();
+                *self = sum.into();
             }
             (Self::Text(string_left), Self::Text(string_right)) => {
                 string_left.value.to_mut().push_str(&string_right.value);
                 string_left.subtype = TextSubtype::Text;
             }
-            (Self::Text(string_left), Self::Integer(int_right)) => {
+            (Self::Text(string_left), Self::Numeric(Numeric::Integer(int_right))) => {
                 let string_right = int_right.to_string();
                 string_left.value.to_mut().push_str(&string_right);
                 string_left.subtype = TextSubtype::Text;
             }
-            (Self::Integer(int_left), Self::Text(string_right)) => {
+            (Self::Numeric(Numeric::Integer(int_left)), Self::Text(string_right)) => {
                 let string_left = int_left.to_string();
                 *self = Self::build_text(string_left + string_right.as_str());
             }
-            (Self::Text(string_left), Self::Float(float_right)) => {
-                let string_right = Self::Float(float_right).to_string();
+            (Self::Text(string_left), Self::Numeric(Numeric::Float(_))) => {
+                let string_right = rhs.to_string();
                 string_left.value.to_mut().push_str(&string_right);
                 string_left.subtype = TextSubtype::Text;
             }
-            (Self::Float(float_left), Self::Text(string_right)) => {
-                let string_left = Self::Float(*float_left).to_string();
+            (Self::Numeric(Numeric::Float(_)), Self::Text(string_right)) => {
+                let string_left = self.to_string();
                 *self = Self::build_text(string_left + string_right.as_str());
             }
             (_, Self::Null) => {}
-            (Self::Null, rhs) => *self = rhs,
-            _ => *self = Self::Float(0.0),
+            (Self::Null, _) => *self = rhs,
+            _ => *self = Self::from_f64(0.0),
         }
     }
 }
 
 impl std::ops::AddAssign<i64> for Value {
     fn add_assign(&mut self, rhs: i64) {
-        match self {
-            Self::Integer(int_left) => *int_left += rhs,
-            Self::Float(float_left) => *float_left += rhs as f64,
-            _ => unreachable!(),
-        }
+        let sum = (|| {
+            let lhs_num = Numeric::from_value(&self)?;
+            let rhs_num = Numeric::Integer(rhs);
+            lhs_num.checked_add(rhs_num)
+        })();
+        *self = sum.into();
     }
 }
 
 impl std::ops::AddAssign<f64> for Value {
     fn add_assign(&mut self, rhs: f64) {
-        match self {
-            Self::Integer(int_left) => *self = Self::Float(*int_left as f64 + rhs),
-            Self::Float(float_left) => *float_left += rhs,
-            _ => unreachable!(),
-        }
+        let sum = (|| {
+            let lhs_num = Numeric::from_value(&self)?;
+            let rhs_num = NonNan::new(rhs).map(Numeric::Float)?;
+            lhs_num.checked_add(rhs_num)
+        })();
+
+        *self = sum.into();
     }
 }
 
@@ -872,21 +855,12 @@ impl std::ops::Div<Value> for Value {
     type Output = Value;
 
     fn div(self, rhs: Value) -> Self::Output {
-        match (self, rhs) {
-            (Self::Integer(int_left), Self::Integer(int_right)) => {
-                Self::Integer(int_left / int_right)
-            }
-            (Self::Integer(int_left), Self::Float(float_right)) => {
-                Self::Float(int_left as f64 / float_right)
-            }
-            (Self::Float(float_left), Self::Integer(int_right)) => {
-                Self::Float(float_left / int_right as f64)
-            }
-            (Self::Float(float_left), Self::Float(float_right)) => {
-                Self::Float(float_left / float_right)
-            }
-            _ => Self::Float(0.0),
-        }
+        let div = (|| {
+            let lhs_num = Numeric::from_value(self)?;
+            let rhs_num = Numeric::from_value(rhs)?;
+            lhs_num.checked_div(rhs_num)
+        })();
+        div.into()
     }
 }
 
@@ -901,7 +875,7 @@ impl TryFrom<ValueRef<'_>> for i64 {
 
     fn try_from(value: ValueRef<'_>) -> Result<Self, Self::Error> {
         match value {
-            ValueRef::Integer(i) => Ok(i),
+            ValueRef::Numeric(Numeric::Integer(i)) => Ok(i),
             _ => Err(LimboError::ConversionError("Expected integer value".into())),
         }
     }
@@ -1242,7 +1216,7 @@ impl ImmutableRecord {
             let value = value.as_value_ref();
             match value {
                 ValueRef::Null => {}
-                ValueRef::Integer(i) => {
+                ValueRef::Numeric(Numeric::Integer(i)) => {
                     let serial_type = SerialType::from(value);
                     match serial_type.kind() {
                         SerialTypeKind::ConstInt0 | SerialTypeKind::ConstInt1 => {}
@@ -1257,7 +1231,10 @@ impl ImmutableRecord {
                         other => panic!("Serial type is not an integer: {other:?}"),
                     }
                 }
-                ValueRef::Float(f) => writer.extend_from_slice(&f.to_be_bytes()),
+                ValueRef::Numeric(Numeric::Float(f)) => {
+                    let fval: f64 = f.into();
+                    writer.extend_from_slice(&fval.to_be_bytes());
+                }
                 ValueRef::Text(t) => {
                     writer.extend_from_slice(t.value.as_bytes());
                 }
@@ -1637,11 +1614,22 @@ impl<'a> Clone for ValueIterator<'a> {
 }
 
 impl<'a> ValueRef<'a> {
+    pub fn from_f64(f: f64) -> Self {
+        match NonNan::new(f) {
+            Some(nn) => Self::Numeric(Numeric::Float(nn)),
+            None => Self::Null,
+        }
+    }
+
+    pub fn from_i64(i: i64) -> Self {
+        Self::Numeric(Numeric::Integer(i))
+    }
+
     pub fn to_ffi(&self) -> ExtValue {
         match self {
             Self::Null => ExtValue::null(),
-            Self::Integer(i) => ExtValue::from_integer(*i),
-            Self::Float(fl) => ExtValue::from_float(*fl),
+            Self::Numeric(Numeric::Integer(i)) => ExtValue::from_integer(*i),
+            Self::Numeric(Numeric::Float(fl)) => ExtValue::from_float(f64::from(*fl)),
             Self::Text(text) => ExtValue::from_text(text.as_str().to_string()),
             Self::Blob(blob) => ExtValue::from_blob(blob.to_vec()),
         }
@@ -1670,22 +1658,22 @@ impl<'a> ValueRef<'a> {
 
     pub fn as_float(&self) -> f64 {
         match self {
-            Self::Float(f) => *f,
-            Self::Integer(i) => *i as f64,
-            _ => panic!("as_float must be called only for Value::Float or Value::Integer"),
+            Self::Numeric(Numeric::Float(f)) => f64::from(*f),
+            Self::Numeric(Numeric::Integer(i)) => *i as f64,
+            _ => panic!("as_float must be called only for ValueRef::Numeric"),
         }
     }
 
     pub fn as_int(&self) -> Option<i64> {
         match self {
-            Self::Integer(i) => Some(*i),
+            Self::Numeric(Numeric::Integer(i)) => Some(*i),
             _ => None,
         }
     }
 
     pub fn as_uint(&self) -> u64 {
         match self {
-            Self::Integer(i) => (*i).cast_unsigned(),
+            Self::Numeric(Numeric::Integer(i)) => (*i).cast_unsigned(),
             _ => 0,
         }
     }
@@ -1693,8 +1681,7 @@ impl<'a> ValueRef<'a> {
     pub fn to_owned(&self) -> Value {
         match self {
             ValueRef::Null => Value::Null,
-            ValueRef::Integer(i) => Value::Integer(*i),
-            ValueRef::Float(f) => Value::Float(*f),
+            ValueRef::Numeric(n) => Value::from(*n),
             ValueRef::Text(text) => Value::Text(Text {
                 value: text.value.to_string().into(),
                 subtype: text.subtype,
@@ -1706,8 +1693,8 @@ impl<'a> ValueRef<'a> {
     pub fn value_type(&self) -> ValueType {
         match self {
             Self::Null => ValueType::Null,
-            Self::Integer(_) => ValueType::Integer,
-            Self::Float(_) => ValueType::Float,
+            Self::Numeric(Numeric::Integer(_)) => ValueType::Integer,
+            Self::Numeric(Numeric::Float(_)) => ValueType::Float,
             Self::Text(_) => ValueType::Text,
             Self::Blob(_) => ValueType::Blob,
         }
@@ -1718,8 +1705,11 @@ impl Display for ValueRef<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Null => write!(f, "NULL"),
-            Self::Integer(i) => write!(f, "{i}"),
-            Self::Float(fl) => write!(f, "{fl:?}"),
+            Self::Numeric(Numeric::Integer(i)) => write!(f, "{i}"),
+            Self::Numeric(Numeric::Float(fl)) => {
+                let fval: f64 = (*fl).into();
+                write!(f, "{fval:?}")
+            }
             Self::Text(s) => write!(f, "{}", s.as_str()),
             Self::Blob(b) => write!(f, "{}", String::from_utf8_lossy(b)),
         }
@@ -1729,18 +1719,12 @@ impl Display for ValueRef<'_> {
 impl<'a> PartialEq<ValueRef<'a>> for ValueRef<'a> {
     fn eq(&self, other: &ValueRef<'a>) -> bool {
         match (self, other) {
-            (Self::Integer(int_left), Self::Integer(int_right)) => int_left == int_right,
-            (Self::Integer(int), Self::Float(float)) | (Self::Float(float), Self::Integer(int)) => {
-                sqlite_int_float_compare(*int, *float).is_eq()
-            }
-            (Self::Float(float_left), Self::Float(float_right)) => float_left == float_right,
-            (Self::Integer(_) | Self::Float(_), Self::Text(_) | Self::Blob(_)) => false,
-            (Self::Text(_) | Self::Blob(_), Self::Integer(_) | Self::Float(_)) => false,
+            (Self::Null, Self::Null) => true,
+            (Self::Numeric(a), Self::Numeric(b)) => a == b,
             (Self::Text(text_left), Self::Text(text_right)) => {
                 text_left.value.as_bytes() == text_right.value.as_bytes()
             }
             (Self::Blob(blob_left), Self::Blob(blob_right)) => blob_left.eq(blob_right),
-            (Self::Null, Self::Null) => true,
             _ => false,
         }
     }
@@ -1755,71 +1739,33 @@ impl<'a> PartialEq<Value> for ValueRef<'a> {
 
 impl<'a> Eq for ValueRef<'a> {}
 
-#[expect(clippy::non_canonical_partial_ord_impl)]
 impl<'a> PartialOrd<ValueRef<'a>> for ValueRef<'a> {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        match (self, other) {
-            (Self::Integer(int_left), Self::Integer(int_right)) => int_left.partial_cmp(int_right),
-            (Self::Integer(int_left), Self::Float(float_right)) => {
-                Some(sqlite_int_float_compare(*int_left, *float_right))
-            }
-            (Self::Float(float_left), Self::Integer(int_right)) => {
-                Some(sqlite_int_float_compare(*int_right, *float_left).reverse())
-            }
-            (Self::Float(float_left), Self::Float(float_right)) => {
-                float_left.partial_cmp(float_right)
-            }
-            // Numeric vs Text/Blob
-            (Self::Integer(_) | Self::Float(_), Self::Text(_) | Self::Blob(_)) => {
-                Some(std::cmp::Ordering::Less)
-            }
-            (Self::Text(_) | Self::Blob(_), Self::Integer(_) | Self::Float(_)) => {
-                Some(std::cmp::Ordering::Greater)
-            }
-
-            (Self::Text(text_left), Self::Text(text_right)) => text_left
-                .value
-                .as_bytes()
-                .partial_cmp(text_right.value.as_bytes()),
-            // Text vs Blob
-            (Self::Text(_), Self::Blob(_)) => Some(std::cmp::Ordering::Less),
-            (Self::Blob(_), Self::Text(_)) => Some(std::cmp::Ordering::Greater),
-
-            (Self::Blob(blob_left), Self::Blob(blob_right)) => blob_left.partial_cmp(blob_right),
-            (Self::Null, Self::Null) => Some(std::cmp::Ordering::Equal),
-            (Self::Null, _) => Some(std::cmp::Ordering::Less),
-            (_, Self::Null) => Some(std::cmp::Ordering::Greater),
-        }
+        Some(self.cmp(other))
     }
 }
 
 impl<'a> Ord for ValueRef<'a> {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.partial_cmp(other).unwrap()
-    }
-}
+        match (self, other) {
+            (Self::Null, Self::Null) => std::cmp::Ordering::Equal,
+            (Self::Null, _) => std::cmp::Ordering::Less,
+            (_, Self::Null) => std::cmp::Ordering::Greater,
 
-fn sqlite_int_float_compare(int_val: i64, float_val: f64) -> std::cmp::Ordering {
-    if float_val.is_nan() {
-        return std::cmp::Ordering::Greater;
-    }
+            (Self::Numeric(a), Self::Numeric(b)) => a.cmp(b),
 
-    if float_val < -9223372036854775808.0 {
-        return std::cmp::Ordering::Greater;
-    }
-    if float_val >= 9223372036854775808.0 {
-        return std::cmp::Ordering::Less;
-    }
+            // Numeric < Text < Blob
+            (Self::Numeric(_), _) => std::cmp::Ordering::Less,
+            (_, Self::Numeric(_)) => std::cmp::Ordering::Greater,
 
-    let float_as_int = float_val as i64;
-    match int_val.cmp(&float_as_int) {
-        std::cmp::Ordering::Equal => {
-            let int_as_float = int_val as f64;
-            int_as_float
-                .partial_cmp(&float_val)
-                .unwrap_or(std::cmp::Ordering::Equal)
+            (Self::Text(text_left), Self::Text(text_right)) => {
+                text_left.value.as_bytes().cmp(text_right.value.as_bytes())
+            }
+            (Self::Text(_), Self::Blob(_)) => std::cmp::Ordering::Less,
+            (Self::Blob(_), Self::Text(_)) => std::cmp::Ordering::Greater,
+
+            (Self::Blob(blob_left), Self::Blob(blob_right)) => blob_left.cmp(blob_right),
         }
-        other => other,
     }
 }
 
@@ -1962,7 +1908,7 @@ where
     let r = r.as_value_ref();
     match (l, r) {
         (ValueRef::Text(left), ValueRef::Text(right)) => collation.compare_strings(&left, &right),
-        _ => l.partial_cmp(&r).unwrap(),
+        _ => l.cmp(&r),
     }
 }
 
@@ -2012,7 +1958,7 @@ where
     if unpacked.len() != 0 && index_info.num_cols <= 13 {
         let val = unpacked.peek().unwrap();
         match val.as_value_ref() {
-            ValueRef::Integer(_) => RecordCompare::Int,
+            ValueRef::Numeric(Numeric::Integer(_)) => RecordCompare::Int,
             ValueRef::Text(_) if index_info.key_info[0].collation == CollationSeq::Binary => {
                 RecordCompare::String
             }
@@ -2055,7 +2001,7 @@ pub fn get_tie_breaker_from_seek_op(seek_op: SeekOp) -> std::cmp::Ordering {
 /// The function uses the optimized path when ALL of these conditions are met:
 /// - Payload is at least 2 bytes (header size + first serial type)
 /// - First serial type indicates integer (`1-6`, `8`, or `9`)
-/// - First unpacked field is a `RefValue::Integer`
+/// - First unpacked field is a `ValueRef::Numeric(Numeric::Integer)`
 ///
 /// If any condition fails, it falls back to `compare_records_generic()`.
 ///
@@ -2115,7 +2061,8 @@ where
     let lhs_int = read_integer(&payload[data_start..], first_serial_type as u8)?;
     let mut unpacked = unpacked.peekable();
     // Do not consume iterator here
-    let ValueRef::Integer(rhs_int) = unpacked.peek().unwrap().as_value_ref() else {
+    let ValueRef::Numeric(Numeric::Integer(rhs_int)) = unpacked.peek().unwrap().as_value_ref()
+    else {
         return compare_records_generic(serialized, unpacked, index_info, 0, tie_breaker);
     };
     let comparison = match index_info.key_info[0].sort_order {
@@ -2338,8 +2285,8 @@ where
         let serial_type = SerialType::try_from(serial_type_raw)?;
 
         let lhs_value = match serial_type.kind() {
-            SerialTypeKind::ConstInt0 => ValueRef::Integer(0),
-            SerialTypeKind::ConstInt1 => ValueRef::Integer(1),
+            SerialTypeKind::ConstInt0 => ValueRef::Numeric(Numeric::Integer(0)),
+            SerialTypeKind::ConstInt1 => ValueRef::Numeric(Numeric::Integer(1)),
             SerialTypeKind::Null => ValueRef::Null,
             _ => {
                 let (value, field_size) = read_value(&payload[data_pos..], serial_type)?;
@@ -2353,15 +2300,7 @@ where
                 .collation
                 .compare_strings(lhs_text, rhs_text),
 
-            (ValueRef::Integer(lhs_int), ValueRef::Float(rhs_float)) => {
-                sqlite_int_float_compare(*lhs_int, *rhs_float)
-            }
-
-            (ValueRef::Float(lhs_float), ValueRef::Integer(rhs_int)) => {
-                sqlite_int_float_compare(*rhs_int, *lhs_float).reverse()
-            }
-
-            _ => lhs_value.partial_cmp(rhs_value).unwrap(),
+            _ => lhs_value.cmp(rhs_value),
         };
 
         let final_comparison = match index_info.key_info[field_idx].sort_order {
@@ -2543,7 +2482,7 @@ impl<T: AsValueRef> From<T> for SerialType {
         let value = value.as_value_ref();
         match value {
             ValueRef::Null => SerialType::null(),
-            ValueRef::Integer(i) => match i {
+            ValueRef::Numeric(Numeric::Integer(i)) => match i {
                 0 => SerialType::const_int0(),
                 1 => SerialType::const_int1(),
                 i if (I8_LOW..=I8_HIGH).contains(&i) => SerialType::i8(),
@@ -2553,7 +2492,7 @@ impl<T: AsValueRef> From<T> for SerialType {
                 i if (I48_LOW..=I48_HIGH).contains(&i) => SerialType::i48(),
                 _ => SerialType::i64(),
             },
-            ValueRef::Float(_) => SerialType::f64(),
+            ValueRef::Numeric(Numeric::Float(_)) => SerialType::f64(),
             ValueRef::Text(t) => SerialType::text(t.value.len() as u64),
             ValueRef::Blob(b) => SerialType::blob(b.len() as u64),
         }
@@ -2631,7 +2570,7 @@ impl Record {
         for value in &self.values {
             match value {
                 Value::Null => {}
-                Value::Integer(i) => {
+                Value::Numeric(Numeric::Integer(i)) => {
                     let serial_type = SerialType::from(value);
                     match serial_type.kind() {
                         SerialTypeKind::ConstInt0 | SerialTypeKind::ConstInt1 => {}
@@ -2646,7 +2585,9 @@ impl Record {
                         _ => unreachable!(),
                     }
                 }
-                Value::Float(f) => buf.extend_from_slice(&f.to_be_bytes()),
+                Value::Numeric(Numeric::Float(f)) => {
+                    buf.extend_from_slice(&f64::from(*f).to_be_bytes())
+                }
                 Value::Text(t) => buf.extend_from_slice(t.value.as_bytes()),
                 Value::Blob(b) => buf.extend_from_slice(b),
             };
@@ -2966,7 +2907,7 @@ mod tests {
     #[test]
     fn test_value_iterator_simple() {
         let mut buf = Vec::new();
-        let record = Record::new(vec![Value::Integer(42), Value::Text(Text::new("hello"))]);
+        let record = Record::new(vec![Value::from_i64(42), Value::Text(Text::new("hello"))]);
         record.serialize(&mut buf);
 
         let iter = ValueIterator::new(&buf).unwrap();
@@ -2976,7 +2917,7 @@ mod tests {
         let mut iter = ValueIterator::new(&buf).unwrap();
 
         let val = iter.next().unwrap().unwrap();
-        assert_eq!(val, ValueRef::Integer(42));
+        assert_eq!(val, ValueRef::from_i64(42));
 
         let val = iter.next().unwrap().unwrap();
         assert_eq!(
@@ -3005,12 +2946,12 @@ mod tests {
         let mut buf = Vec::new();
         let record = Record::new(vec![
             Value::Null,
-            Value::Integer(100),
-            Value::Float(std::f64::consts::PI),
+            Value::from_i64(100),
+            Value::from_f64(std::f64::consts::PI),
             Value::Text(Text::new("test")),
             Value::Blob(vec![1, 2, 3]),
-            Value::Integer(0),
-            Value::Integer(1),
+            Value::from_i64(0),
+            Value::from_i64(1),
         ]);
         record.serialize(&mut buf);
 
@@ -3018,21 +2959,21 @@ mod tests {
         let values: Vec<_> = iter.collect::<Result<Vec<_>>>().unwrap();
 
         assert_eq!(values[0], ValueRef::Null);
-        assert_eq!(values[1], ValueRef::Integer(100));
-        assert_eq!(values[2], ValueRef::Float(std::f64::consts::PI));
+        assert_eq!(values[1], ValueRef::from_i64(100));
+        assert_eq!(values[2], ValueRef::from_f64(std::f64::consts::PI));
         assert_eq!(
             values[3],
             ValueRef::Text(TextRef::new("test", TextSubtype::Text))
         );
         assert_eq!(values[4], ValueRef::Blob(&[1, 2, 3]));
-        assert_eq!(values[5], ValueRef::Integer(0));
-        assert_eq!(values[6], ValueRef::Integer(1));
+        assert_eq!(values[5], ValueRef::from_i64(0));
+        assert_eq!(values[6], ValueRef::from_i64(1));
     }
 
     #[test]
     fn test_value_iterator_large_record() {
         let mut buf = Vec::new();
-        let values: Vec<Value> = (0..20).map(|i| Value::Integer(i as i64)).collect();
+        let values: Vec<Value> = (0..20).map(|i| Value::from_i64(i as i64)).collect();
         let record = Record::new(values);
         record.serialize(&mut buf);
 
@@ -3041,14 +2982,14 @@ mod tests {
 
         let iter = ValueIterator::new(&buf).unwrap();
         for (i, val) in iter.enumerate() {
-            assert_eq!(val.unwrap(), ValueRef::Integer(i as i64));
+            assert_eq!(val.unwrap(), ValueRef::from_i64(i as i64));
         }
     }
 
     #[test]
     fn test_value_iterator_zero_allocation() {
         let mut buf = Vec::new();
-        let values: Vec<Value> = (0..5).map(|i| Value::Integer(i as i64)).collect();
+        let values: Vec<Value> = (0..5).map(|i| Value::from_i64(i as i64)).collect();
         let record = Record::new(values);
         record.serialize(&mut buf);
 
@@ -3223,52 +3164,52 @@ mod tests {
 
         let test_cases = vec![
             (
-                vec![Value::Integer(42)],
-                vec![ValueRef::Integer(42)],
+                vec![Value::from_i64(42)],
+                vec![ValueRef::from_i64(42)],
                 "equal_integers",
             ),
             (
-                vec![Value::Integer(10)],
-                vec![ValueRef::Integer(20)],
+                vec![Value::from_i64(10)],
+                vec![ValueRef::from_i64(20)],
                 "less_than_integers",
             ),
             (
-                vec![Value::Integer(30)],
-                vec![ValueRef::Integer(20)],
+                vec![Value::from_i64(30)],
+                vec![ValueRef::from_i64(20)],
                 "greater_than_integers",
             ),
             (
-                vec![Value::Integer(0)],
-                vec![ValueRef::Integer(0)],
+                vec![Value::from_i64(0)],
+                vec![ValueRef::from_i64(0)],
                 "zero_integers",
             ),
             (
-                vec![Value::Integer(-5)],
-                vec![ValueRef::Integer(-5)],
+                vec![Value::from_i64(-5)],
+                vec![ValueRef::from_i64(-5)],
                 "negative_integers",
             ),
             (
-                vec![Value::Integer(i64::MAX)],
-                vec![ValueRef::Integer(i64::MAX)],
+                vec![Value::from_i64(i64::MAX)],
+                vec![ValueRef::from_i64(i64::MAX)],
                 "max_integers",
             ),
             (
-                vec![Value::Integer(i64::MIN)],
-                vec![ValueRef::Integer(i64::MIN)],
+                vec![Value::from_i64(i64::MIN)],
+                vec![ValueRef::from_i64(i64::MIN)],
                 "min_integers",
             ),
             (
-                vec![Value::Integer(42), Value::Text(Text::new("hello"))],
+                vec![Value::from_i64(42), Value::Text(Text::new("hello"))],
                 vec![
-                    ValueRef::Integer(42),
+                    ValueRef::from_i64(42),
                     ValueRef::Text(TextRef::new("hello", TextSubtype::Text)),
                 ],
                 "integer_text_equal",
             ),
             (
-                vec![Value::Integer(42), Value::Text(Text::new("hello"))],
+                vec![Value::from_i64(42), Value::Text(Text::new("hello"))],
                 vec![
-                    ValueRef::Integer(42),
+                    ValueRef::from_i64(42),
                     ValueRef::Text(TextRef::new("world", TextSubtype::Text)),
                 ],
                 "integer_equal_text_different",
@@ -3324,18 +3265,18 @@ mod tests {
             ),
             // Multi-field with string first
             (
-                vec![Value::Text(Text::new("hello")), Value::Integer(42)],
+                vec![Value::Text(Text::new("hello")), Value::from_i64(42)],
                 vec![
                     ValueRef::Text(TextRef::new("hello", TextSubtype::Text)),
-                    ValueRef::Integer(42),
+                    ValueRef::from_i64(42),
                 ],
                 "string_integer_equal",
             ),
             (
-                vec![Value::Text(Text::new("hello")), Value::Integer(42)],
+                vec![Value::Text(Text::new("hello")), Value::from_i64(42)],
                 vec![
                     ValueRef::Text(TextRef::new("hello", TextSubtype::Text)),
-                    ValueRef::Integer(99),
+                    ValueRef::from_i64(99),
                 ],
                 "string_equal_integer_different",
             ),
@@ -3360,12 +3301,12 @@ mod tests {
             // NULL vs others
             (
                 vec![Value::Null],
-                vec![ValueRef::Integer(42)],
+                vec![ValueRef::from_i64(42)],
                 "null_vs_integer",
             ),
             (
                 vec![Value::Null],
-                vec![ValueRef::Float(64.4)],
+                vec![ValueRef::from_f64(64.4)],
                 "null_vs_float",
             ),
             (
@@ -3380,22 +3321,22 @@ mod tests {
             ),
             // Numbers vs Text/Blob
             (
-                vec![Value::Integer(42)],
+                vec![Value::from_i64(42)],
                 vec![ValueRef::Text(TextRef::new("hello", TextSubtype::Text))],
                 "integer_vs_text",
             ),
             (
-                vec![Value::Float(64.4)],
+                vec![Value::from_f64(64.4)],
                 vec![ValueRef::Text(TextRef::new("hello", TextSubtype::Text))],
                 "float_vs_text",
             ),
             (
-                vec![Value::Integer(42)],
+                vec![Value::from_i64(42)],
                 vec![ValueRef::Blob(b"blob")],
                 "integer_vs_blob",
             ),
             (
-                vec![Value::Float(64.4)],
+                vec![Value::from_f64(64.4)],
                 vec![ValueRef::Blob(b"blob")],
                 "float_vs_blob",
             ),
@@ -3407,18 +3348,18 @@ mod tests {
             ),
             // Integer vs Float (affinity conversion)
             (
-                vec![Value::Integer(42)],
-                vec![ValueRef::Float(42.0)],
+                vec![Value::from_i64(42)],
+                vec![ValueRef::from_f64(42.0)],
                 "integer_vs_equal_float",
             ),
             (
-                vec![Value::Integer(42)],
-                vec![ValueRef::Float(42.5)],
+                vec![Value::from_i64(42)],
+                vec![ValueRef::from_f64(42.5)],
                 "integer_vs_different_float",
             ),
             (
-                vec![Value::Float(42.5)],
-                vec![ValueRef::Integer(42)],
+                vec![Value::from_f64(42.5)],
+                vec![ValueRef::from_i64(42)],
                 "float_vs_integer",
             ),
         ];
@@ -3444,8 +3385,8 @@ mod tests {
         let test_cases = vec![
             // DESC order should reverse first field comparison
             (
-                vec![Value::Integer(10)],
-                vec![ValueRef::Integer(20)],
+                vec![Value::from_i64(10)],
+                vec![ValueRef::from_i64(20)],
                 "desc_integer_reversed",
             ),
             (
@@ -3455,9 +3396,9 @@ mod tests {
             ),
             // Mixed sort orders
             (
-                vec![Value::Integer(10), Value::Text(Text::new("hello"))],
+                vec![Value::from_i64(10), Value::Text(Text::new("hello"))],
                 vec![
-                    ValueRef::Integer(20),
+                    ValueRef::from_i64(20),
                     ValueRef::Text(TextRef::new("hello", TextSubtype::Text)),
                 ],
                 "desc_first_asc_second",
@@ -3481,23 +3422,23 @@ mod tests {
 
         let test_cases = vec![
             (
-                vec![Value::Integer(42)],
+                vec![Value::from_i64(42)],
                 vec![
-                    ValueRef::Integer(42),
+                    ValueRef::from_i64(42),
                     ValueRef::Text(TextRef::new("extra", TextSubtype::Text)),
                 ],
                 "fewer_serialized_fields",
             ),
             (
-                vec![Value::Integer(42), Value::Text(Text::new("extra"))],
-                vec![ValueRef::Integer(42)],
+                vec![Value::from_i64(42), Value::Text(Text::new("extra"))],
+                vec![ValueRef::from_i64(42)],
                 "fewer_unpacked_fields",
             ),
             (vec![], vec![], "both_empty"),
-            (vec![], vec![ValueRef::Integer(42)], "empty_serialized"),
+            (vec![], vec![ValueRef::from_i64(42)], "empty_serialized"),
             (
-                (0..15).map(Value::Integer).collect(),
-                (0..15).map(ValueRef::Integer).collect(),
+                (0..15).map(Value::from_i64).collect(),
+                (0..15).map(ValueRef::from_i64).collect(),
                 "large_field_count",
             ),
             (
@@ -3506,15 +3447,15 @@ mod tests {
                 "blob_first_field",
             ),
             (
-                vec![Value::Text(Text::new("hello")), Value::Integer(5)],
+                vec![Value::Text(Text::new("hello")), Value::from_i64(5)],
                 vec![ValueRef::Text(TextRef::new("hello", TextSubtype::Text))],
                 "equal_text_prefix_but_more_serialized_fields",
             ),
             (
-                vec![Value::Text(Text::new("same")), Value::Integer(5)],
+                vec![Value::Text(Text::new("same")), Value::from_i64(5)],
                 vec![
                     ValueRef::Text(TextRef::new("same", TextSubtype::Text)),
-                    ValueRef::Integer(5),
+                    ValueRef::from_i64(5),
                 ],
                 "equal_text_then_equal_int",
             ),
@@ -3539,14 +3480,14 @@ mod tests {
         );
 
         let serialized = create_record(vec![
-            Value::Integer(1),
-            Value::Integer(2),
-            Value::Integer(3),
+            Value::from_i64(1),
+            Value::from_i64(2),
+            Value::from_i64(3),
         ]);
         let unpacked = [
-            ValueRef::Integer(1),
-            ValueRef::Integer(99),
-            ValueRef::Integer(3),
+            ValueRef::from_i64(1),
+            ValueRef::from_i64(99),
+            ValueRef::from_i64(3),
         ];
 
         let tie_breaker = std::cmp::Ordering::Equal;
@@ -3574,7 +3515,7 @@ mod tests {
         let index_info_large = create_index_info(15, vec![SortOrder::Asc; 15], collations_large);
 
         let int_values = [
-            ValueRef::Integer(42),
+            ValueRef::from_i64(42),
             ValueRef::Text(TextRef::new("hello", TextSubtype::Text)),
         ];
         assert!(matches!(
@@ -3584,14 +3525,14 @@ mod tests {
 
         let string_values = [
             ValueRef::Text(TextRef::new("hello", TextSubtype::Text)),
-            ValueRef::Integer(42),
+            ValueRef::from_i64(42),
         ];
         assert!(matches!(
             find_compare(string_values.iter().peekable(), &index_info_small),
             RecordCompare::String
         ));
 
-        let large_values: Vec<ValueRef> = (0..15).map(ValueRef::Integer).collect();
+        let large_values: Vec<ValueRef> = (0..15).map(ValueRef::from_i64).collect();
         assert!(matches!(
             find_compare(large_values.iter().peekable(), &index_info_large),
             RecordCompare::Generic
@@ -3623,14 +3564,14 @@ mod tests {
     #[test]
     fn test_serialize_integers() {
         let record = Record::new(vec![
-            Value::Integer(0),                 // Should use ConstInt0
-            Value::Integer(1),                 // Should use ConstInt1
-            Value::Integer(42),                // Should use SERIAL_TYPE_I8
-            Value::Integer(1000),              // Should use SERIAL_TYPE_I16
-            Value::Integer(1_000_000),         // Should use SERIAL_TYPE_I24
-            Value::Integer(1_000_000_000),     // Should use SERIAL_TYPE_I32
-            Value::Integer(1_000_000_000_000), // Should use SERIAL_TYPE_I48
-            Value::Integer(i64::MAX),          // Should use SERIAL_TYPE_I64
+            Value::from_i64(0),                 // Should use ConstInt0
+            Value::from_i64(1),                 // Should use ConstInt1
+            Value::from_i64(42),                // Should use SERIAL_TYPE_I8
+            Value::from_i64(1000),              // Should use SERIAL_TYPE_I16
+            Value::from_i64(1_000_000),         // Should use SERIAL_TYPE_I24
+            Value::from_i64(1_000_000_000),     // Should use SERIAL_TYPE_I32
+            Value::from_i64(1_000_000_000_000), // Should use SERIAL_TYPE_I48
+            Value::from_i64(i64::MAX),          // Should use SERIAL_TYPE_I64
         ]);
         let mut buf = Vec::new();
         record.serialize(&mut buf);
@@ -3653,30 +3594,30 @@ mod tests {
         // test that the bytes after the header can be interpreted as the correct values
         let mut cur_offset = header_length;
 
-        // Value::Integer(0) - ConstInt0: NO PAYLOAD BYTES
-        // Value::Integer(1) - ConstInt1: NO PAYLOAD BYTES
+        // Value::from_i64(0) - ConstInt0: NO PAYLOAD BYTES
+        // Value::from_i64(1) - ConstInt1: NO PAYLOAD BYTES
 
-        // Value::Integer(42) - I8: 1 byte
+        // Value::from_i64(42) - I8: 1 byte
         let i8_bytes = &buf[cur_offset..cur_offset + size_of::<i8>()];
         cur_offset += size_of::<i8>();
 
-        // Value::Integer(1000) - I16: 2 bytes
+        // Value::from_i64(1000) - I16: 2 bytes
         let i16_bytes = &buf[cur_offset..cur_offset + size_of::<i16>()];
         cur_offset += size_of::<i16>();
 
-        // Value::Integer(1_000_000) - I24: 3 bytes
+        // Value::from_i64(1_000_000) - I24: 3 bytes
         let i24_bytes = &buf[cur_offset..cur_offset + 3];
         cur_offset += 3;
 
-        // Value::Integer(1_000_000_000) - I32: 4 bytes
+        // Value::from_i64(1_000_000_000) - I32: 4 bytes
         let i32_bytes = &buf[cur_offset..cur_offset + size_of::<i32>()];
         cur_offset += size_of::<i32>();
 
-        // Value::Integer(1_000_000_000_000) - I48: 6 bytes
+        // Value::from_i64(1_000_000_000_000) - I48: 6 bytes
         let i48_bytes = &buf[cur_offset..cur_offset + 6];
         cur_offset += 6;
 
-        // Value::Integer(i64::MAX) - I64: 8 bytes
+        // Value::from_i64(i64::MAX) - I64: 8 bytes
         let i64_bytes = &buf[cur_offset..cur_offset + size_of::<i64>()];
 
         // Verify the payload values
@@ -3718,7 +3659,7 @@ mod tests {
 
     #[test]
     fn test_serialize_const_integers() {
-        let record = Record::new(vec![Value::Integer(0), Value::Integer(1)]);
+        let record = Record::new(vec![Value::from_i64(0), Value::from_i64(1)]);
         let mut buf = Vec::new();
         record.serialize(&mut buf);
 
@@ -3739,7 +3680,7 @@ mod tests {
 
     #[test]
     fn test_serialize_single_const_int0() {
-        let record = Record::new(vec![Value::Integer(0)]);
+        let record = Record::new(vec![Value::from_i64(0)]);
         let mut buf = Vec::new();
         record.serialize(&mut buf);
 
@@ -3752,7 +3693,7 @@ mod tests {
     #[test]
     fn test_serialize_float() {
         #[warn(clippy::approx_constant)]
-        let record = Record::new(vec![Value::Float(3.15555)]);
+        let record = Record::new(vec![Value::from_f64(3.15555)]);
         let mut buf = Vec::new();
         record.serialize(&mut buf);
 
@@ -3812,8 +3753,8 @@ mod tests {
         let text = "test";
         let record = Record::new(vec![
             Value::Null,
-            Value::Integer(42),
-            Value::Float(3.15),
+            Value::from_i64(42),
+            Value::from_f64(3.15),
             Value::Text(Text::new(text)),
         ]);
         let mut buf = Vec::new();
@@ -3855,11 +3796,85 @@ mod tests {
         );
     }
 
+    /// Before the Numeric refactor, ValueRef had separate Float(f64) and Integer(i64)
+    /// variants. A raw f64::NAN could be stored in Float, and comparing two NaN floats
+    /// via partial_cmp returned None. The .unwrap() in Ord::cmp and
+    /// compare_immutable_single would then panic.
+    ///
+    /// Now Numeric::Float wraps NonNan, which rejects NaN at construction time.
+    /// This makes it impossible to represent NaN in a ValueRef, so partial_cmp
+    /// is total and can never return None for any representable value.
+    #[test]
+    fn test_valueref_partial_cmp_no_panic_on_nan() {
+        use crate::numeric::nonnan::NonNan;
+
+        // NonNan::new rejects NaN — this is the type-level guarantee that
+        // prevents the old panic. No ValueRef::Float(NAN) can be constructed.
+        assert!(NonNan::new(f64::NAN).is_none());
+
+        // from_f64(NAN) falls back to Null instead of storing a NaN float.
+        assert_eq!(ValueRef::from_f64(f64::NAN), ValueRef::Null);
+
+        // Exercise every representable float edge case through partial_cmp,
+        // Ord::cmp, and compare_immutable_single — none of these can panic now.
+        let values: Vec<ValueRef> = vec![
+            ValueRef::Null,
+            ValueRef::from_i64(0),
+            ValueRef::from_i64(-1),
+            ValueRef::from_i64(i64::MAX),
+            ValueRef::from_i64(i64::MIN),
+            ValueRef::from_f64(0.0),
+            ValueRef::from_f64(-0.0),
+            ValueRef::from_f64(1.5),
+            ValueRef::from_f64(-1.5),
+            ValueRef::from_f64(f64::MAX),
+            ValueRef::from_f64(f64::MIN),
+            ValueRef::from_f64(f64::MIN_POSITIVE),
+            ValueRef::from_f64(f64::INFINITY),
+            ValueRef::from_f64(f64::NEG_INFINITY),
+            ValueRef::from_f64(f64::NAN), // becomes Null
+            ValueRef::Text(TextRef::new("hello", TextSubtype::Text)),
+            ValueRef::Text(TextRef::new("", TextSubtype::Text)),
+            ValueRef::Blob(&[1, 2, 3]),
+            ValueRef::Blob(&[]),
+        ];
+
+        // partial_cmp must return Some for every pair — the old code panicked
+        // here when either side was Float(NAN).
+        for (i, a) in values.iter().enumerate() {
+            for (j, b) in values.iter().enumerate() {
+                let result = a.partial_cmp(b);
+                assert!(
+                    result.is_some(),
+                    "partial_cmp returned None for values[{i}]={a:?} vs values[{j}]={b:?}"
+                );
+                // Ord::cmp (which previously called partial_cmp().unwrap()) must agree.
+                assert_eq!(result.unwrap(), a.cmp(b));
+            }
+        }
+
+        // compare_immutable_single is where the unwrap panic originally surfaced.
+        for a in &values {
+            for b in &values {
+                let _ = compare_immutable_single(*a, *b, CollationSeq::Binary);
+            }
+        }
+
+        // Antisymmetry holds for all pairs.
+        for a in &values {
+            for b in &values {
+                let ab = a.cmp(b);
+                let ba = b.cmp(a);
+                assert_eq!(ab, ba.reverse(), "antisymmetry failed for {a:?} vs {b:?}");
+            }
+        }
+    }
+
     #[test]
     fn test_column_count_matches_values_written() {
         // Test with different numbers of values
         for num_values in 1..=10 {
-            let values: Vec<Value> = (0..num_values).map(|i| Value::Integer(i as i64)).collect();
+            let values: Vec<Value> = (0..num_values).map(|i| Value::from_i64(i as i64)).collect();
 
             let record = ImmutableRecord::from_values(&values, values.len());
             let cnt = record.column_count();

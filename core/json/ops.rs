@@ -455,7 +455,7 @@ mod tests {
     fn test_json_remove_invalid_path() {
         let args = [
             create_json(r#"{"a": 1}"#),
-            Value::Integer(42), // Invalid path type
+            Value::from_i64(42), // Invalid path type
         ];
 
         let json_cache = JsonCacheCell::new();

@@ -1,7 +1,7 @@
 use crate::common::TempDatabase;
 #[cfg(not(target_vendor = "apple"))]
 use turso_core::LimboError;
-use turso_core::{StepResult, Value};
+use turso_core::{Numeric, StepResult, Value};
 
 #[turso_macros::test(mvcc)]
 fn test_pragma_module_list_returns_list(db: TempDatabase) {
@@ -37,7 +37,7 @@ fn test_pragma_module_list_generate_series(db: TempDatabase) {
 
     assert_eq!(
         values,
-        vec![Value::Integer(1), Value::Integer(2), Value::Integer(3),]
+        vec![Value::from_i64(1), Value::from_i64(2), Value::from_i64(3),]
     );
 
     let mut module_list = conn.query("PRAGMA module_list;").unwrap();
@@ -79,7 +79,7 @@ fn test_pragma_page_sizes_without_writes_persists(db: TempDatabase) {
             panic!("expected row");
         };
         let row = rows.row().unwrap();
-        let Value::Integer(page_size) = row.get_value(0) else {
+        let Value::Numeric(Numeric::Integer(page_size)) = row.get_value(0) else {
             panic!("expected integer value");
         };
         assert_eq!(*page_size, test_page_size);
@@ -92,7 +92,7 @@ fn test_pragma_page_sizes_without_writes_persists(db: TempDatabase) {
             panic!("expected row");
         };
         let row = rows.row().unwrap();
-        let Value::Integer(page_size) = row.get_value(0) else {
+        let Value::Numeric(Numeric::Integer(page_size)) = row.get_value(0) else {
             panic!("expected integer value");
         };
         assert_eq!(*page_size, test_page_size);
@@ -124,7 +124,7 @@ fn test_pragma_page_sizes_with_writes_persists(db: TempDatabase) {
                 let mut page_size = conn.pragma_query("page_size").unwrap();
                 let mut page_size = page_size.pop().unwrap();
                 let page_size = page_size.pop().unwrap();
-                let Value::Integer(page_size) = page_size else {
+                let Value::Numeric(Numeric::Integer(page_size)) = page_size else {
                     panic!("expected integer value");
                 };
                 assert_eq!(page_size, test_page_size);
@@ -137,7 +137,7 @@ fn test_pragma_page_sizes_with_writes_persists(db: TempDatabase) {
             let mut page_size = conn.pragma_query("page_size").unwrap();
             let mut page_size = page_size.pop().unwrap();
             let page_size = page_size.pop().unwrap();
-            let Value::Integer(page_size) = page_size else {
+            let Value::Numeric(Numeric::Integer(page_size)) = page_size else {
                 panic!("expected integer value");
             };
             assert_eq!(page_size, test_page_size);
@@ -163,7 +163,7 @@ fn test_pragma_page_sizes_with_writes_persists(db: TempDatabase) {
         let mut page_size = conn.pragma_query("page_size").unwrap();
         let mut page_size = page_size.pop().unwrap();
         let page_size = page_size.pop().unwrap();
-        let Value::Integer(page_size) = page_size else {
+        let Value::Numeric(Numeric::Integer(page_size)) = page_size else {
             panic!("expected integer value");
         };
         assert_eq!(page_size, test_page_size);
@@ -185,7 +185,7 @@ fn test_pragma_fullfsync(db: TempDatabase) {
         panic!("expected row");
     };
     let row = rows.row().unwrap();
-    let Value::Integer(value) = row.get_value(0) else {
+    let Value::Numeric(Numeric::Integer(value)) = row.get_value(0) else {
         panic!("expected integer value");
     };
     assert_eq!(*value, 0, "fullfsync should default to 0");
@@ -200,7 +200,7 @@ fn test_pragma_fullfsync(db: TempDatabase) {
         panic!("expected row");
     };
     let row = rows.row().unwrap();
-    let Value::Integer(value) = row.get_value(0) else {
+    let Value::Numeric(Numeric::Integer(value)) = row.get_value(0) else {
         panic!("expected integer value");
     };
     assert_eq!(*value, 1, "fullfsync should be enabled");
@@ -216,7 +216,7 @@ fn test_pragma_fullfsync(db: TempDatabase) {
         panic!("expected row");
     };
     let row = rows.row().unwrap();
-    let Value::Integer(value) = row.get_value(0) else {
+    let Value::Numeric(Numeric::Integer(value)) = row.get_value(0) else {
         panic!("expected integer value");
     };
     assert_eq!(*value, 1, "fullfsync should still be enabled after insert");
@@ -231,7 +231,7 @@ fn test_pragma_fullfsync(db: TempDatabase) {
         panic!("expected row");
     };
     let row = rows.row().unwrap();
-    let Value::Integer(value) = row.get_value(0) else {
+    let Value::Numeric(Numeric::Integer(value)) = row.get_value(0) else {
         panic!("expected integer value");
     };
     assert_eq!(*value, 0, "fullfsync should be disabled");
@@ -247,7 +247,7 @@ fn test_pragma_fullfsync(db: TempDatabase) {
         panic!("expected row");
     };
     let row = rows.row().unwrap();
-    let Value::Integer(value) = row.get_value(0) else {
+    let Value::Numeric(Numeric::Integer(value)) = row.get_value(0) else {
         panic!("expected integer value");
     };
     assert_eq!(*value, 0, "fullfsync should still be disabled after insert");
@@ -259,7 +259,7 @@ fn test_pragma_fullfsync(db: TempDatabase) {
         panic!("expected row");
     };
     let row = rows.row().unwrap();
-    let Value::Integer(count) = row.get_value(0) else {
+    let Value::Numeric(Numeric::Integer(count)) = row.get_value(0) else {
         panic!("expected integer value");
     };
     assert_eq!(*count, 2, "both inserts should have succeeded");
@@ -308,7 +308,7 @@ fn test_pragma_synchronous_normal(db: TempDatabase) {
         panic!("expected row");
     };
     let row = rows.row().unwrap();
-    let Value::Integer(count) = row.get_value(0) else {
+    let Value::Numeric(Numeric::Integer(count)) = row.get_value(0) else {
         panic!("expected integer value");
     };
     assert_eq!(*count, 2, "both inserts should have succeeded");
@@ -325,7 +325,7 @@ fn test_pragma_synchronous_normal(db: TempDatabase) {
         panic!("expected row");
     };
     let row = rows.row().unwrap();
-    let Value::Integer(count) = row.get_value(0) else {
+    let Value::Numeric(Numeric::Integer(count)) = row.get_value(0) else {
         panic!("expected integer value");
     };
     assert_eq!(*count, 3, "all inserts should have succeeded");
@@ -342,7 +342,7 @@ fn test_pragma_synchronous_normal(db: TempDatabase) {
         panic!("expected row");
     };
     let row = rows.row().unwrap();
-    let Value::Integer(count) = row.get_value(0) else {
+    let Value::Numeric(Numeric::Integer(count)) = row.get_value(0) else {
         panic!("expected integer value");
     };
     assert_eq!(*count, 4, "all inserts should have succeeded");
@@ -363,7 +363,7 @@ fn test_pragma_synchronous_normal(db: TempDatabase) {
         panic!("expected row");
     };
     let row = rows.row().unwrap();
-    let Value::Integer(count) = row.get_value(0) else {
+    let Value::Numeric(Numeric::Integer(count)) = row.get_value(0) else {
         panic!("expected integer value");
     };
     assert_eq!(*count, 7, "all inserts should have succeeded");

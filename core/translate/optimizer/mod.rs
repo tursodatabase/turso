@@ -2054,10 +2054,9 @@ impl Optimizable for ast::Expr {
                     // which extracts leading numeric prefixes (e.g., '9S' -> 9, 'abc' -> 0)
                     let without_quotes = s.trim_matches('\'');
                     let numeric = Numeric::from(without_quotes);
-                    match numeric.try_into_bool() {
-                        Some(true) => Ok(Some(AlwaysTrueOrFalse::AlwaysTrue)),
-                        Some(false) => Ok(Some(AlwaysTrueOrFalse::AlwaysFalse)),
-                        None => Ok(None),
+                    match numeric.to_bool() {
+                        true => Ok(Some(AlwaysTrueOrFalse::AlwaysTrue)),
+                        false => Ok(Some(AlwaysTrueOrFalse::AlwaysFalse)),
                     }
                 }
                 _ => Ok(None),

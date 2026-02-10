@@ -682,7 +682,7 @@ mod tests {
                     Value::Text(Text::new("table")), // type
                     Value::Text(Text::new("test")),  // name
                     Value::Text(Text::new("test")),  // tbl_name
-                    Value::Integer(-2),              // rootpage
+                    Value::from_i64(-2),             // rootpage
                     Value::Text(Text::new(
                         "CREATE TABLE test(id INTEGER PRIMARY KEY, data TEXT)",
                     )), // sql
@@ -749,7 +749,7 @@ mod tests {
                     Value::Text(Text::new("table")), // type
                     Value::Text(Text::new("test")),  // name
                     Value::Text(Text::new("test")),  // tbl_name
-                    Value::Integer(-2),              // rootpage
+                    Value::from_i64(-2),             // rootpage
                     Value::Text(Text::new(
                         "CREATE TABLE test(id INTEGER PRIMARY KEY, data TEXT)",
                     )), // sql
@@ -858,7 +858,7 @@ mod tests {
                     Value::Text(Text::new("table")), // type
                     Value::Text(Text::new("test")),  // name
                     Value::Text(Text::new("test")),  // tbl_name
-                    Value::Integer(-2),              // rootpage
+                    Value::from_i64(-2),             // rootpage
                     Value::Text(Text::new(
                         "CREATE TABLE test(id INTEGER PRIMARY KEY, data TEXT)",
                     )), // sql
@@ -999,7 +999,7 @@ mod tests {
             let key_record = ImmutableRecord::from_values(
                 &[
                     Value::Text(Text::new(data_value.to_string())),
-                    Value::Integer(row_id),
+                    Value::from_i64(row_id),
                 ],
                 2,
             );
@@ -1033,7 +1033,8 @@ mod tests {
                 panic!("First index column should be text");
             };
             assert_eq!(index_data.as_str(), data_value, "Index data should match");
-            let ValueRef::Integer(index_rowid_val) = values[1] else {
+            let ValueRef::Numeric(crate::numeric::Numeric::Integer(index_rowid_val)) = values[1]
+            else {
                 panic!("Second index column should be integer (rowid)");
             };
             assert_eq!(index_rowid_val, row_id, "Index rowid should match");

@@ -13,7 +13,7 @@ use crate::sync::Arc;
 use crate::sync::RwLock;
 use crate::types::{IOCompletions, IOResult, ImmutableRecord};
 use crate::{
-    CheckpointResult, Completion, Connection, IOExt, LimboError, Pager, Result, SyncMode,
+    CheckpointResult, Completion, Connection, IOExt, LimboError, Numeric, Pager, Result, SyncMode,
     TransactionState, Value, ValueRef,
 };
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
@@ -336,7 +336,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                         panic!("sqlite_schema.type column must be TEXT, got {col0:?}");
                     };
 
-                    if let ValueRef::Integer(root_page) = col3 {
+                    if let ValueRef::Numeric(Numeric::Integer(root_page)) = col3 {
                         if type_str.as_str() == "index" {
                             // This is an index schema change
                             if is_delete {
@@ -851,7 +851,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                             ImmutableRecord::from_bin_record(row_version.row.payload().to_vec());
 
                         let mut values = record.get_values_owned()?;
-                        values[3] = Value::Integer(root_page as i64);
+                        values[3] = Value::from_i64(root_page as i64);
                         let record = ImmutableRecord::from_values(&values, values.len());
                         row_version.row.data = Some(record.get_payload().to_owned());
                         row_version.clone()
@@ -885,7 +885,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                         let record =
                             ImmutableRecord::from_bin_record(row_version.row.payload().to_vec());
                         let mut values = record.get_values_owned()?;
-                        values[3] = Value::Integer(root_page as i64);
+                        values[3] = Value::from_i64(root_page as i64);
                         let record = ImmutableRecord::from_values(&values, values.len());
                         row_version.row.data = Some(record.get_payload().to_owned());
                         row_version.clone()

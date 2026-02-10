@@ -1,4 +1,4 @@
-use turso_core::Value;
+use turso_core::{Numeric, Value};
 
 use crate::{
     generation::{ArbitraryFrom, GenerationContext},
@@ -14,8 +14,12 @@ impl ArbitraryFrom<(&SimValue, ColumnType)> for LTValue {
         (value, _col_type): (&SimValue, ColumnType),
     ) -> Self {
         let new_value = match &value.0 {
-            Value::Integer(i) => Value::Integer(rng.random_range(i64::MIN..*i - 1)),
-            Value::Float(f) => Value::Float(f - rng.random_range(0.0..1e10)),
+            Value::Numeric(Numeric::Integer(i)) => {
+                Value::from_i64(rng.random_range(i64::MIN..*i - 1))
+            }
+            Value::Numeric(Numeric::Float(f)) => {
+                Value::from_f64(f64::from(*f) - rng.random_range(0.0..1e10))
+            }
             value @ Value::Text(..) => {
                 // Either shorten the string, or make at least one character smaller and mutate the rest
                 let mut t = value.to_string();
@@ -58,8 +62,10 @@ impl ArbitraryFrom<(&SimValue, ColumnType)> for GTValue {
         (value, col_type): (&SimValue, ColumnType),
     ) -> Self {
         let new_value = match &value.0 {
-            Value::Integer(i) => Value::Integer(rng.random_range(*i..i64::MAX)),
-            Value::Float(f) => Value::Float(rng.random_range(*f..1e10)),
+            Value::Numeric(Numeric::Integer(i)) => Value::from_i64(rng.random_range(*i..i64::MAX)),
+            Value::Numeric(Numeric::Float(f)) => {
+                Value::from_f64(rng.random_range(f64::from(*f)..1e10))
+            }
             value @ Value::Text(..) => {
                 // Either lengthen the string, or make at least one character smaller and mutate the rest
                 let mut t = value.to_string();

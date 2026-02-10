@@ -1223,7 +1223,7 @@ fn test_restart() {
                 Value::Text(Text::new("table")), // type
                 Value::Text(Text::new("test")),  // name
                 Value::Text(Text::new("test")),  // tbl_name
-                Value::Integer(-2),              // rootpage
+                Value::from_i64(-2),             // rootpage
                 Value::Text(Text::new(
                     "CREATE TABLE test(id INTEGER PRIMARY KEY, data TEXT)",
                 )), // sql
@@ -1344,7 +1344,10 @@ fn test_interactive_transaction() {
 
     // expect other transaction to see the changes
     let rows = get_rows(&conn, "SELECT * FROM test");
-    assert_eq!(rows, vec![vec![Value::Integer(1)], vec![Value::Integer(2)]]);
+    assert_eq!(
+        rows,
+        vec![vec![Value::from_i64(1)], vec![Value::from_i64(2)]]
+    );
 }
 
 #[test]
@@ -1557,7 +1560,7 @@ fn test_insert_with_checkpoint() {
     assert_eq!(row.len(), 1);
     let value = row.first().unwrap();
     match value {
-        Value::Integer(i) => assert_eq!(*i, 1),
+        Value::Numeric(crate::numeric::Numeric::Integer(i)) => assert_eq!(*i, 1),
         _ => unreachable!(),
     }
 }
@@ -1654,8 +1657,8 @@ fn test_cursor_with_btree_and_mvcc() {
     println!("getting rows");
     let rows = get_rows(&conn, "SELECT * FROM t");
     assert_eq!(rows.len(), 2);
-    assert_eq!(rows[0], vec![Value::Integer(1)]);
-    assert_eq!(rows[1], vec![Value::Integer(2)]);
+    assert_eq!(rows[0], vec![Value::from_i64(1)]);
+    assert_eq!(rows[1], vec![Value::from_i64(2)]);
 }
 
 #[test]
@@ -1679,9 +1682,9 @@ fn test_cursor_with_btree_and_mvcc_2() {
     let rows = get_rows(&conn, "SELECT * FROM t");
     dbg!(&rows);
     assert_eq!(rows.len(), 3);
-    assert_eq!(rows[0], vec![Value::Integer(1)]);
-    assert_eq!(rows[1], vec![Value::Integer(2)]);
-    assert_eq!(rows[2], vec![Value::Integer(3)]);
+    assert_eq!(rows[0], vec![Value::from_i64(1)]);
+    assert_eq!(rows[1], vec![Value::from_i64(2)]);
+    assert_eq!(rows[2], vec![Value::from_i64(3)]);
 }
 
 #[test]
@@ -1704,9 +1707,9 @@ fn test_cursor_with_btree_and_mvcc_with_backward_cursor() {
     let rows = get_rows(&conn, "SELECT * FROM t order by x desc");
     dbg!(&rows);
     assert_eq!(rows.len(), 3);
-    assert_eq!(rows[0], vec![Value::Integer(3)]);
-    assert_eq!(rows[1], vec![Value::Integer(2)]);
-    assert_eq!(rows[2], vec![Value::Integer(1)]);
+    assert_eq!(rows[0], vec![Value::from_i64(3)]);
+    assert_eq!(rows[1], vec![Value::from_i64(2)]);
+    assert_eq!(rows[2], vec![Value::from_i64(1)]);
 }
 
 #[test]
@@ -1733,10 +1736,10 @@ fn test_cursor_with_btree_and_mvcc_with_backward_cursor_with_delete() {
     let rows = get_rows(&conn, "SELECT * FROM t order by x desc");
     dbg!(&rows);
     assert_eq!(rows.len(), 4);
-    assert_eq!(rows[0], vec![Value::Integer(5)]);
-    assert_eq!(rows[1], vec![Value::Integer(4)]);
-    assert_eq!(rows[2], vec![Value::Integer(3)]);
-    assert_eq!(rows[3], vec![Value::Integer(1)]);
+    assert_eq!(rows[0], vec![Value::from_i64(5)]);
+    assert_eq!(rows[1], vec![Value::from_i64(4)]);
+    assert_eq!(rows[2], vec![Value::from_i64(3)]);
+    assert_eq!(rows[3], vec![Value::from_i64(1)]);
 }
 
 #[test]

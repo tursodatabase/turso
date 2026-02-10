@@ -35,6 +35,7 @@ use crate::{
     error::LimboError,
     function::{AggFunc, FuncCtx},
     mvcc::{database::CommitStateMachine, LocalClock},
+    numeric::Numeric,
     return_if_io,
     schema::Trigger,
     state_machine::StateMachine,
@@ -231,15 +232,15 @@ impl Register {
 
     #[inline(always)]
     /// Sets the value of the register to an integer,
-    /// reusing the existing Register::Value(Value::Integer(_)) if possible,
+    /// reusing the existing Register::Value(Value::Numeric(Numeric::Integer(_))) if possible,
     /// which is faster than always creating a new one.
     pub fn set_int(&mut self, val: i64) {
         match self {
-            Register::Value(Value::Integer(existing)) => {
+            Register::Value(Value::Numeric(Numeric::Integer(existing))) => {
                 *existing = val;
             }
             _ => {
-                *self = Register::Value(Value::Integer(val));
+                *self = Register::Value(Value::from_i64(val));
             }
         }
     }
@@ -1067,13 +1068,13 @@ impl Program {
                 .copied(),
         );
 
-        state.registers[0] = Register::Value(Value::Integer(state.pc as i64));
+        state.registers[0] = Register::Value(Value::from_i64(state.pc as i64));
         state.registers[1] = Register::Value(Value::from_text(opcode));
-        state.registers[2] = Register::Value(Value::Integer(p1));
-        state.registers[3] = Register::Value(Value::Integer(p2));
-        state.registers[4] = Register::Value(Value::Integer(p3));
+        state.registers[2] = Register::Value(Value::from_i64(p1));
+        state.registers[3] = Register::Value(Value::from_i64(p2));
+        state.registers[4] = Register::Value(Value::from_i64(p3));
         state.registers[5] = Register::Value(p4);
-        state.registers[6] = Register::Value(Value::Integer(p5));
+        state.registers[6] = Register::Value(Value::from_i64(p5));
         state.registers[7] = Register::Value(Value::from_text(comment));
         state.result_row = Some(Row {
             values: &state.registers[0] as *const Register,
@@ -1115,10 +1116,10 @@ impl Program {
                 continue;
             };
 
-            state.registers[0] = Register::Value(Value::Integer(*p1 as i64));
+            state.registers[0] = Register::Value(Value::from_i64(*p1 as i64));
             state.registers[1] =
-                Register::Value(Value::Integer(p2.as_ref().map(|p| *p).unwrap_or(0) as i64));
-            state.registers[2] = Register::Value(Value::Integer(0));
+                Register::Value(Value::from_i64(p2.as_ref().map(|p| *p).unwrap_or(0) as i64));
+            state.registers[2] = Register::Value(Value::from_i64(0));
             state.registers[3] = Register::Value(Value::from_text(detail.clone()));
             state.result_row = Some(Row {
                 values: &state.registers[0] as *const Register,
@@ -1635,7 +1636,7 @@ pub trait FromValueRow<'a> {
 impl<'a> FromValueRow<'a> for i64 {
     fn from_value(value: &'a Value) -> Result<Self> {
         match value {
-            Value::Integer(i) => Ok(*i),
+            Value::Numeric(Numeric::Integer(i)) => Ok(*i),
             _ => Err(LimboError::ConversionError("Expected integer value".into())),
         }
     }
@@ -1644,7 +1645,7 @@ impl<'a> FromValueRow<'a> for i64 {
 impl<'a> FromValueRow<'a> for f64 {
     fn from_value(value: &'a Value) -> Result<Self> {
         match value {
-            Value::Float(f) => Ok(*f),
+            Value::Numeric(Numeric::Float(f)) => Ok(f64::from(*f)),
             _ => Err(LimboError::ConversionError("Expected integer value".into())),
         }
     }
@@ -1855,11 +1856,15 @@ impl<'a> ValueIteratorExt for crate::types::ValueIterator<'a> {
                     data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
                 ]);
                 match dest {
-                    Register::Value(Value::Float(existing)) => {
-                        *existing = val;
+                    Register::Value(Value::Numeric(Numeric::Float(existing))) => {
+                        if let Some(nn) = crate::numeric::nonnan::NonNan::new(val) {
+                            *existing = nn;
+                        } else {
+                            *dest = Register::Value(Value::Null);
+                        }
                     }
                     _ => {
-                        *dest = Register::Value(Value::Float(val));
+                        *dest = Register::Value(Value::from_f64(val));
                     }
                 }
             }
@@ -1969,7 +1974,7 @@ mod shuttle_tests {
                 let mut state = create_test_state(10, 2);
 
                 // Write some data to registers
-                state.registers[0] = Register::Value(Value::Integer(42));
+                state.registers[0] = Register::Value(Value::from_i64(42));
                 state.registers[1] = Register::Value(Value::from_text("test".to_string()));
 
                 // Send state to another thread
@@ -1977,7 +1982,7 @@ mod shuttle_tests {
                     // Verify data is intact after send
                     assert!(matches!(
                         &state.registers[0],
-                        Register::Value(Value::Integer(42))
+                        Register::Value(Value::Numeric(Numeric::Integer(42)))
                     ));
                     if let Register::Value(Value::Text(t)) = &state.registers[1] {
                         assert_eq!(t.as_str(), "test");
@@ -1986,14 +1991,14 @@ mod shuttle_tests {
                     }
 
                     // Modify in new thread
-                    state.registers[2] = Register::Value(Value::Integer(100));
+                    state.registers[2] = Register::Value(Value::from_i64(100));
                     state
                 });
 
                 let state = handle.join().unwrap();
                 assert!(matches!(
                     &state.registers[2],
-                    Register::Value(Value::Integer(100))
+                    Register::Value(Value::Numeric(Numeric::Integer(100)))
                 ));
             },
             1000,
@@ -2009,9 +2014,9 @@ mod shuttle_tests {
                 let mut state = create_test_state(10, 2);
 
                 // Set up registers with test data
-                state.registers[0] = Register::Value(Value::Integer(1));
-                state.registers[1] = Register::Value(Value::Integer(2));
-                state.registers[2] = Register::Value(Value::Integer(3));
+                state.registers[0] = Register::Value(Value::from_i64(1));
+                state.registers[1] = Register::Value(Value::from_i64(2));
+                state.registers[2] = Register::Value(Value::from_i64(3));
 
                 // Create a result_row pointing to registers
                 state.result_row = Some(Row {
@@ -2053,8 +2058,8 @@ mod shuttle_tests {
                 let mut state = create_test_state(10, 2);
 
                 // Set up registers
-                state.registers[0] = Register::Value(Value::Integer(42));
-                state.registers[1] = Register::Value(Value::Integer(43));
+                state.registers[0] = Register::Value(Value::from_i64(42));
+                state.registers[1] = Register::Value(Value::from_i64(43));
 
                 // Create result_row
                 state.result_row = Some(Row {
@@ -2105,7 +2110,7 @@ mod shuttle_tests {
 
                 // Set up registers with distinct values
                 for i in 0..5 {
-                    state.registers[i] = Register::Value(Value::Integer(i as i64 * 10));
+                    state.registers[i] = Register::Value(Value::from_i64(i as i64 * 10));
                 }
 
                 state.result_row = Some(Row {
@@ -2147,7 +2152,7 @@ mod shuttle_tests {
             || {
                 let mut state = create_test_state(10, 2);
 
-                state.registers[0] = Register::Value(Value::Integer(100));
+                state.registers[0] = Register::Value(Value::from_i64(100));
                 state.result_row = Some(Row {
                     values: &state.registers[0] as *const Register,
                     count: 1,
@@ -2178,7 +2183,7 @@ mod shuttle_tests {
             || {
                 let mut state = create_test_state(10, 2);
 
-                state.registers[0] = Register::Value(Value::Integer(1));
+                state.registers[0] = Register::Value(Value::from_i64(1));
                 state.result_row = Some(Row {
                     values: &state.registers[0] as *const Register,
                     count: 1,
@@ -2188,7 +2193,7 @@ mod shuttle_tests {
                 let _ = state.result_row.take();
 
                 // Now safe to modify registers
-                state.registers[0] = Register::Value(Value::Integer(999));
+                state.registers[0] = Register::Value(Value::from_i64(999));
 
                 // Create new row pointing to modified registers
                 state.result_row = Some(Row {
@@ -2213,12 +2218,14 @@ mod shuttle_tests {
         shuttle::check_random(
             || {
                 let mut state = create_test_state(10, 2);
-                state.registers[0] = Register::Value(Value::Integer(0));
+                state.registers[0] = Register::Value(Value::from_i64(0));
 
                 // Thread 1: increment
                 let h1 = thread::spawn(move || {
-                    if let Register::Value(Value::Integer(v)) = &state.registers[0] {
-                        state.registers[0] = Register::Value(Value::Integer(v + 1));
+                    if let Register::Value(Value::Numeric(Numeric::Integer(v))) =
+                        &state.registers[0]
+                    {
+                        state.registers[0] = Register::Value(Value::from_i64(v + 1));
                     }
                     state
                 });
@@ -2227,8 +2234,10 @@ mod shuttle_tests {
 
                 // Thread 2: increment
                 let h2 = thread::spawn(move || {
-                    if let Register::Value(Value::Integer(v)) = &state.registers[0] {
-                        state.registers[0] = Register::Value(Value::Integer(v + 1));
+                    if let Register::Value(Value::Numeric(Numeric::Integer(v))) =
+                        &state.registers[0]
+                    {
+                        state.registers[0] = Register::Value(Value::from_i64(v + 1));
                     }
                     state
                 });
@@ -2237,8 +2246,10 @@ mod shuttle_tests {
 
                 // Thread 3: increment
                 let h3 = thread::spawn(move || {
-                    if let Register::Value(Value::Integer(v)) = &state.registers[0] {
-                        state.registers[0] = Register::Value(Value::Integer(v + 1));
+                    if let Register::Value(Value::Numeric(Numeric::Integer(v))) =
+                        &state.registers[0]
+                    {
+                        state.registers[0] = Register::Value(Value::from_i64(v + 1));
                     }
                     state
                 });
@@ -2248,7 +2259,7 @@ mod shuttle_tests {
                 // Final value should be 3
                 assert!(matches!(
                     &state.registers[0],
-                    Register::Value(Value::Integer(3))
+                    Register::Value(Value::Numeric(Numeric::Integer(3)))
                 ));
             },
             1000,
@@ -2265,7 +2276,7 @@ mod shuttle_tests {
 
                 // Initialize with test data
                 for i in 0..5 {
-                    state.registers[i] = Register::Value(Value::Integer(i as i64));
+                    state.registers[i] = Register::Value(Value::from_i64(i as i64));
                 }
 
                 let state = Arc::new(state);
@@ -2277,7 +2288,9 @@ mod shuttle_tests {
                     let h = thread::spawn(move || {
                         // Each thread reads all registers
                         for i in 0..5 {
-                            if let Register::Value(Value::Integer(v)) = &state_clone.registers[i] {
+                            if let Register::Value(Value::Numeric(Numeric::Integer(v))) =
+                                &state_clone.registers[i]
+                            {
                                 assert_eq!(*v, i as i64);
                             }
                         }
@@ -2301,9 +2314,9 @@ mod shuttle_tests {
             || {
                 let mut state = create_test_state(10, 2);
 
-                state.registers[0] = Register::Value(Value::Integer(10));
-                state.registers[1] = Register::Value(Value::Integer(20));
-                state.registers[2] = Register::Value(Value::Integer(30));
+                state.registers[0] = Register::Value(Value::from_i64(10));
+                state.registers[1] = Register::Value(Value::from_i64(20));
+                state.registers[2] = Register::Value(Value::from_i64(30));
 
                 state.result_row = Some(Row {
                     values: &state.registers[0] as *const Register,
@@ -2324,7 +2337,7 @@ mod shuttle_tests {
                     if let Some(row) = &state2.result_row {
                         let mut sum = 0i64;
                         for val in row.get_values() {
-                            if let Value::Integer(i) = val {
+                            if let Value::Numeric(Numeric::Integer(i)) = val {
                                 sum += i;
                             }
                         }
@@ -2348,7 +2361,7 @@ mod shuttle_tests {
 
                 // Fill registers with identifiable data
                 for i in 0..20 {
-                    state.registers[i] = Register::Value(Value::Integer(i as i64 * 100));
+                    state.registers[i] = Register::Value(Value::from_i64(i as i64 * 100));
                 }
 
                 state.result_row = Some(Row {

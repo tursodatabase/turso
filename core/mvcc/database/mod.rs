@@ -3190,7 +3190,8 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                                 ));
                             }
                         };
-                        let ValueRef::Integer(root_page) = val else {
+                        let ValueRef::Numeric(crate::numeric::Numeric::Integer(root_page)) = val
+                        else {
                             panic!("Expected integer value for root page, got {val:?}");
                         };
                         if root_page < 0 {

@@ -125,7 +125,7 @@ pub(crate) fn execute_and_get_ints(conn: &Arc<Connection>, sql: &str) -> Result<
     stmt.run_with_row_callback(|row| {
         for value in row.get_values() {
             let out = match value {
-                turso_core::Value::Integer(i) => i,
+                turso_core::Value::Numeric(turso_core::Numeric::Integer(i)) => i,
                 _ => {
                     return Err(LimboError::ConversionError(format!(
                         "cannot convert {value} to int"
@@ -168,9 +168,9 @@ fn test_wal_read_lock_released_on_conn_drop() {
     // TRUNCATE checkpoint requires that there be no readers - this would hang/fail if read lock wasn't released
     let res = conn2.pragma_update("wal_checkpoint", "TRUNCATE").unwrap();
     let row = res.first().unwrap();
-    let truncate_succeeded = row.first().unwrap() == &turso_core::Value::Integer(0)
-        && row.get(1).unwrap() == &turso_core::Value::Integer(0)
-        && row.get(2).unwrap() == &turso_core::Value::Integer(0);
+    let truncate_succeeded = row.first().unwrap() == &turso_core::Value::from_i64(0)
+        && row.get(1).unwrap() == &turso_core::Value::from_i64(0)
+        && row.get(2).unwrap() == &turso_core::Value::from_i64(0);
 
     // Expect full truncate, i.e. 0 0 0 result.
     assert!(

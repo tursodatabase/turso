@@ -28,7 +28,7 @@ use crate::vdbe::{
     insn::{CmpInsFlags, Insn},
     BranchOffset,
 };
-use crate::{turso_assert, Result, Value};
+use crate::{turso_assert, Numeric, Result, Value};
 
 use super::collate::CollationSeq;
 
@@ -2810,15 +2810,15 @@ pub fn translate_expr(
             (UnaryOperator::Negative, ast::Expr::Literal(ast::Literal::Numeric(numeric_value))) => {
                 let numeric_value = "-".to_owned() + numeric_value;
                 match parse_numeric_literal(&numeric_value)? {
-                    Value::Integer(int_value) => {
+                    Value::Numeric(Numeric::Integer(int_value)) => {
                         program.emit_insn(Insn::Integer {
                             value: int_value,
                             dest: target_register,
                         });
                     }
-                    Value::Float(real_value) => {
+                    Value::Numeric(Numeric::Float(real_value)) => {
                         program.emit_insn(Insn::Real {
-                            value: real_value,
+                            value: real_value.into(),
                             dest: target_register,
                         });
                     }
@@ -2846,15 +2846,15 @@ pub fn translate_expr(
             }
             (UnaryOperator::BitwiseNot, ast::Expr::Literal(ast::Literal::Numeric(num_val))) => {
                 match parse_numeric_literal(num_val)? {
-                    Value::Integer(int_value) => {
+                    Value::Numeric(Numeric::Integer(int_value)) => {
                         program.emit_insn(Insn::Integer {
                             value: !int_value,
                             dest: target_register,
                         });
                     }
-                    Value::Float(real_value) => {
+                    Value::Numeric(Numeric::Float(real_value)) => {
                         program.emit_insn(Insn::Integer {
-                            value: !(real_value as i64),
+                            value: !(f64::from(real_value) as i64),
                             dest: target_register,
                         });
                     }
@@ -4661,15 +4661,15 @@ pub fn emit_literal(
     match literal {
         ast::Literal::Numeric(val) => {
             match parse_numeric_literal(val)? {
-                Value::Integer(int_value) => {
+                Value::Numeric(Numeric::Integer(int_value)) => {
                     program.emit_insn(Insn::Integer {
                         value: int_value,
                         dest: target_register,
                     });
                 }
-                Value::Float(real_value) => {
+                Value::Numeric(Numeric::Float(real_value)) => {
                     program.emit_insn(Insn::Real {
-                        value: real_value,
+                        value: real_value.into(),
                         dest: target_register,
                     });
                 }

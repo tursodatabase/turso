@@ -189,8 +189,8 @@ impl Display for SimValue {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self.0 {
             types::Value::Null => write!(f, "NULL"),
-            types::Value::Integer(i) => write!(f, "{i}"),
-            types::Value::Float(fl) => write!(f, "{fl}"),
+            types::Value::Numeric(Numeric::Integer(i)) => write!(f, "{i}"),
+            types::Value::Numeric(Numeric::Float(fl)) => write!(f, "{fl}"),
             value @ types::Value::Text(..) => write!(f, "'{value}'"),
             types::Value::Blob(b) => write!(f, "{}", to_sqlite_blob(b)),
         }
@@ -198,12 +198,14 @@ impl Display for SimValue {
 }
 
 impl SimValue {
-    pub const FALSE: Self = SimValue(types::Value::Integer(0));
-    pub const TRUE: Self = SimValue(types::Value::Integer(1));
+    pub const FALSE: Self = SimValue(types::Value::Numeric(Numeric::Integer(0)));
+    pub const TRUE: Self = SimValue(types::Value::Numeric(Numeric::Integer(1)));
     pub const NULL: Self = SimValue(types::Value::Null);
 
     pub fn as_bool(&self) -> bool {
-        Numeric::from(&self.0).try_into_bool().unwrap_or_default()
+        Numeric::from_value(&self.0)
+            .map(|v| v.to_bool())
+            .unwrap_or_default()
     }
 
     #[inline]
@@ -213,8 +215,8 @@ impl SimValue {
 
     pub fn unique_for_type(column_type: &ColumnType, offset: i64) -> Self {
         match column_type {
-            ColumnType::Integer => SimValue(types::Value::Integer(offset)),
-            ColumnType::Float => SimValue(types::Value::Float(offset as f64)),
+            ColumnType::Integer => SimValue(types::Value::from_i64(offset)),
+            ColumnType::Float => SimValue(types::Value::from_f64(offset as f64)),
             ColumnType::Text => SimValue(types::Value::Text(format!("u{offset}").into())),
             ColumnType::Blob => SimValue(types::Value::Blob(format!("u{offset}").into_bytes())),
         }
@@ -298,7 +300,7 @@ impl SimValue {
         let new_value = match operator {
             ast::UnaryOperator::BitwiseNot => self.0.exec_bit_not(),
             ast::UnaryOperator::Negative => {
-                SimValue(types::Value::Integer(0))
+                SimValue(types::Value::from_i64(0))
                     .binary_compare(self, ast::Operator::Subtract)
                     .0
             }
@@ -385,8 +387,8 @@ impl From<&ast::Literal> for SimValue {
                     .collect(),
             ),
             ast::Literal::Keyword(keyword) => match keyword.to_uppercase().as_str() {
-                "TRUE" => types::Value::Integer(1),
-                "FALSE" => types::Value::Integer(0),
+                "TRUE" => types::Value::from_i64(1),
+                "FALSE" => types::Value::from_i64(0),
                 "NULL" => types::Value::Null,
                 _ => unimplemented!("Unsupported keyword literal: {}", keyword),
             },
@@ -406,8 +408,8 @@ impl From<&SimValue> for ast::Literal {
     fn from(value: &SimValue) -> Self {
         match &value.0 {
             types::Value::Null => Self::Null,
-            types::Value::Integer(i) => Self::Numeric(i.to_string()),
-            types::Value::Float(f) => Self::Numeric(f.to_string()),
+            types::Value::Numeric(Numeric::Integer(i)) => Self::Numeric(i.to_string()),
+            types::Value::Numeric(Numeric::Float(f)) => Self::Numeric(f.to_string()),
             text @ types::Value::Text(..) => Self::String(escape_singlequotes(&text.to_string())),
             types::Value::Blob(blob) => Self::Blob(hex::encode(blob)),
         }

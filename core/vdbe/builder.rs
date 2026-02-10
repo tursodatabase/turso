@@ -1326,11 +1326,7 @@ impl ProgramBuilder {
             };
 
             Some(match literal {
-                ast::Literal::Numeric(s) => match Numeric::from(s) {
-                    Numeric::Null => Value::Null,
-                    Numeric::Integer(v) => Value::Integer(v),
-                    Numeric::Float(v) => Value::Float(v.into()),
-                },
+                ast::Literal::Numeric(s) => Value::Numeric(Numeric::from(s)),
                 ast::Literal::Null => Value::Null,
                 ast::Literal::String(s) => Value::Text(sanitize_string(s).into()),
                 ast::Literal::Blob(s) => Value::Blob(

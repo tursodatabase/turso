@@ -462,8 +462,8 @@ fn execute_query_rusqlite(
                     };
                     let value = match value {
                         rusqlite::types::Value::Null => Value::Null,
-                        rusqlite::types::Value::Integer(i) => Value::Integer(i),
-                        rusqlite::types::Value::Real(f) => Value::Float(f),
+                        rusqlite::types::Value::Integer(i) => Value::from_i64(i),
+                        rusqlite::types::Value::Real(f) => Value::from_f64(f),
                         rusqlite::types::Value::Text(s) => Value::build_text(s),
                         rusqlite::types::Value::Blob(b) => Value::Blob(b),
                     };

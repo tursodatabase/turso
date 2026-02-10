@@ -40,7 +40,7 @@ fn test_schema_update_reprepares_statement(tmp_db: TempDatabase) -> Result<()> {
     stmt.run_with_row_callback(|row| {
         let a = row.get::<&Value>(0).unwrap();
         let b = row.get::<&Value>(1).unwrap();
-        assert_eq!(*a, Value::Integer(1));
+        assert_eq!(*a, Value::from_i64(1));
         assert_eq!(*b, Value::build_text("first"));
         found_row = true;
         Ok(())
@@ -54,7 +54,7 @@ fn test_schema_update_reprepares_statement(tmp_db: TempDatabase) -> Result<()> {
     let mut stmt2 = conn1.prepare("SELECT COUNT(*) FROM t")?;
     stmt2.run_with_row_callback(|row| {
         let count = row.get::<&Value>(0).unwrap();
-        assert_eq!(*count, Value::Integer(3));
+        assert_eq!(*count, Value::from_i64(3));
         Ok(())
     })?;
 
@@ -65,7 +65,7 @@ fn test_schema_update_reprepares_statement(tmp_db: TempDatabase) -> Result<()> {
     let mut stmt3 = conn1.prepare("SELECT COUNT(*) FROM t")?;
     stmt3.run_with_row_callback(|row| {
         let count = row.get::<&Value>(0).unwrap();
-        assert_eq!(*count, Value::Integer(3));
+        assert_eq!(*count, Value::from_i64(3));
         Ok(())
     })?;
 
