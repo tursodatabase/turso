@@ -1017,6 +1017,43 @@ expect {
     2|2|2|2|2|2|2|2|2|2|2|2
 }
 
+# User-defined columns named oid/rowid/_rowid_ take precedence over rowid aliases
+test oid-column-overrides-rowid-alias {
+    CREATE TABLE t1 (oid TEXT, name TEXT);
+    INSERT INTO t1 VALUES ('my-oid', 'alice');
+    SELECT t1.oid FROM t1;
+}
+expect {
+    my-oid
+}
+
+test rowid-column-overrides-rowid-alias {
+    CREATE TABLE t2 (rowid TEXT, val INTEGER);
+    INSERT INTO t2 VALUES ('custom-rowid', 42);
+    SELECT t2.rowid FROM t2;
+}
+expect {
+    custom-rowid
+}
+
+test _rowid_-column-overrides-rowid-alias {
+    CREATE TABLE t3 (_rowid_ TEXT, val INTEGER);
+    INSERT INTO t3 VALUES ('custom', 42);
+    SELECT t3._rowid_ FROM t3;
+}
+expect {
+    custom
+}
+
+test rowid-alias-still-works-without-user-column {
+    CREATE TABLE t4 (a INTEGER PRIMARY KEY, b TEXT);
+    INSERT INTO t4 VALUES (100, 'hello');
+    SELECT t4.oid FROM t4;
+}
+expect {
+    100
+}
+
 test null-in-search {
     CREATE TABLE t_x_asc (id INTEGER PRIMARY KEY, x);
     CREATE INDEX t_x_asc_idx ON t_x_asc(x ASC);
