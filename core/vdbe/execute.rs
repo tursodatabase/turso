@@ -442,17 +442,13 @@ pub fn op_null(
 }
 
 pub fn op_null_row(
-    program: &Program,
+    _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(NullRow { cursor_id }, insn);
-    {
-        let cursor = must_be_btree_cursor!(*cursor_id, program.cursor_ref, state, "NullRow");
-        let cursor = cursor.as_btree_mut();
-        cursor.set_null_flag(true);
-    }
+    state.get_cursor(*cursor_id).set_null_flag(true);
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }

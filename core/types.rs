@@ -2745,6 +2745,14 @@ impl Cursor {
             _ => panic!("Cursor is not an IndexMethod cursor"),
         }
     }
+
+    pub fn set_null_flag(&mut self, flag: bool) {
+        match self {
+            Self::BTree(cursor) => cursor.set_null_flag(flag),
+            Self::Virtual(cursor) => cursor.set_null_flag(flag),
+            _ => panic!("set_null_flag on unexpected cursor type"),
+        }
+    }
 }
 
 #[derive(Debug)]

@@ -715,13 +715,38 @@ fn add_vtab_predicates_to_where_clause(
         )?;
     }
     for expr in vtab_predicates.drain(..) {
+        // Virtual table argument predicates (e.g. the 't2' in pragma_table_info('t2'))
+        // must be associated with the virtual table's outer join context if the table is
+        // the RHS of a LEFT JOIN. Otherwise the optimizer may incorrectly simplify the
+        // LEFT JOIN into an INNER JOIN, breaking NULL row emission for unmatched rows.
+        let from_outer_join = vtab_predicate_table_id(&expr).and_then(|table_id| {
+            plan.table_references
+                .find_joined_table_by_internal_id(table_id)
+                .and_then(|t| {
+                    t.join_info
+                        .as_ref()
+                        .and_then(|ji| ji.outer.then_some(table_id))
+                })
+        });
         plan.where_clause.push(WhereTerm {
             expr,
-            from_outer_join: None,
+            from_outer_join,
             consumed: false,
         });
     }
     Ok(())
+}
+
+/// Extract the table internal_id from a virtual table argument predicate.
+/// These are always of the form `Column { table, .. } = literal` or `IsNull(Column { table, .. })`.
+fn vtab_predicate_table_id(expr: &Expr) -> Option<ast::TableInternalId> {
+    match expr {
+        Expr::Binary(lhs, _, _) | Expr::IsNull(lhs) => match lhs.as_ref() {
+            Expr::Column { table, .. } => Some(*table),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 /// Replaces a column number in an ORDER BY or GROUP BY expression with a copy of the column expression.
