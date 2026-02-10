@@ -263,6 +263,102 @@ expect {
     1|90.0
 }
 
+@requires strict "uses STRICT tables"
+test strict-text-float-to-integer-basic {
+    CREATE TABLE t(a INTEGER) STRICT;
+    INSERT INTO t VALUES('42.0');
+    SELECT a, typeof(a) FROM t;
+}
+expect {
+    42|integer
+}
+
+@requires strict "uses STRICT tables"
+test strict-text-float-to-integer-zero {
+    CREATE TABLE t(a INTEGER) STRICT;
+    INSERT INTO t VALUES('0.0');
+    SELECT a, typeof(a) FROM t;
+}
+expect {
+    0|integer
+}
+
+@requires strict "uses STRICT tables"
+test strict-text-float-to-integer-negative {
+    CREATE TABLE t(a INTEGER) STRICT;
+    INSERT INTO t VALUES('-5.0');
+    SELECT a, typeof(a) FROM t;
+}
+expect {
+    -5|integer
+}
+
+@requires strict "uses STRICT tables"
+test strict-text-float-to-integer-scientific {
+    CREATE TABLE t(a INTEGER) STRICT;
+    INSERT INTO t VALUES('1e2');
+    SELECT a, typeof(a) FROM t;
+}
+expect {
+    100|integer
+}
+
+@requires strict "uses STRICT tables"
+test strict-text-float-to-integer-fractional-error {
+    CREATE TABLE t(a INTEGER) STRICT;
+    INSERT INTO t VALUES('1.5');
+}
+expect error {
+}
+
+@requires strict "uses STRICT tables"
+test strict-text-integer-to-real-basic {
+    CREATE TABLE t(a REAL) STRICT;
+    INSERT INTO t VALUES('42');
+    SELECT a, typeof(a) FROM t;
+}
+expect {
+    42.0|real
+}
+
+@requires strict "uses STRICT tables"
+test strict-text-integer-to-real-negative {
+    CREATE TABLE t(a REAL) STRICT;
+    INSERT INTO t VALUES('-7');
+    SELECT a, typeof(a) FROM t;
+}
+expect {
+    -7.0|real
+}
+
+@requires strict "uses STRICT tables"
+test strict-text-integer-to-real-zero {
+    CREATE TABLE t(a REAL) STRICT;
+    INSERT INTO t VALUES('0');
+    SELECT a, typeof(a) FROM t;
+}
+expect {
+    0.0|real
+}
+
+@requires strict "uses STRICT tables"
+test strict-text-float-to-real {
+    CREATE TABLE t(a REAL) STRICT;
+    INSERT INTO t VALUES('3.14');
+    SELECT a, typeof(a) FROM t;
+}
+expect {
+    3.14|real
+}
+
+@requires strict "uses STRICT tables"
+test strict-text-string-to-real-error {
+    CREATE TABLE t(a REAL) STRICT;
+    INSERT INTO t VALUES('hello');
+}
+expect error {
+}
+
 test duplicate-set {
     CREATE TABLE t (x, y);
     INSERT INTO t VALUES(1, 'A');
