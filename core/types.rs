@@ -3796,6 +3796,80 @@ mod tests {
         );
     }
 
+    /// Before the Numeric refactor, ValueRef had separate Float(f64) and Integer(i64)
+    /// variants. A raw f64::NAN could be stored in Float, and comparing two NaN floats
+    /// via partial_cmp returned None. The .unwrap() in Ord::cmp and
+    /// compare_immutable_single would then panic.
+    ///
+    /// Now Numeric::Float wraps NonNan, which rejects NaN at construction time.
+    /// This makes it impossible to represent NaN in a ValueRef, so partial_cmp
+    /// is total and can never return None for any representable value.
+    #[test]
+    fn test_valueref_partial_cmp_no_panic_on_nan() {
+        use crate::numeric::nonnan::NonNan;
+
+        // NonNan::new rejects NaN — this is the type-level guarantee that
+        // prevents the old panic. No ValueRef::Float(NAN) can be constructed.
+        assert!(NonNan::new(f64::NAN).is_none());
+
+        // from_f64(NAN) falls back to Null instead of storing a NaN float.
+        assert_eq!(ValueRef::from_f64(f64::NAN), ValueRef::Null);
+
+        // Exercise every representable float edge case through partial_cmp,
+        // Ord::cmp, and compare_immutable_single — none of these can panic now.
+        let values: Vec<ValueRef> = vec![
+            ValueRef::Null,
+            ValueRef::from_i64(0),
+            ValueRef::from_i64(-1),
+            ValueRef::from_i64(i64::MAX),
+            ValueRef::from_i64(i64::MIN),
+            ValueRef::from_f64(0.0),
+            ValueRef::from_f64(-0.0),
+            ValueRef::from_f64(1.5),
+            ValueRef::from_f64(-1.5),
+            ValueRef::from_f64(f64::MAX),
+            ValueRef::from_f64(f64::MIN),
+            ValueRef::from_f64(f64::MIN_POSITIVE),
+            ValueRef::from_f64(f64::INFINITY),
+            ValueRef::from_f64(f64::NEG_INFINITY),
+            ValueRef::from_f64(f64::NAN), // becomes Null
+            ValueRef::Text(TextRef::new("hello", TextSubtype::Text)),
+            ValueRef::Text(TextRef::new("", TextSubtype::Text)),
+            ValueRef::Blob(&[1, 2, 3]),
+            ValueRef::Blob(&[]),
+        ];
+
+        // partial_cmp must return Some for every pair — the old code panicked
+        // here when either side was Float(NAN).
+        for (i, a) in values.iter().enumerate() {
+            for (j, b) in values.iter().enumerate() {
+                let result = a.partial_cmp(b);
+                assert!(
+                    result.is_some(),
+                    "partial_cmp returned None for values[{i}]={a:?} vs values[{j}]={b:?}"
+                );
+                // Ord::cmp (which previously called partial_cmp().unwrap()) must agree.
+                assert_eq!(result.unwrap(), a.cmp(b));
+            }
+        }
+
+        // compare_immutable_single is where the unwrap panic originally surfaced.
+        for a in &values {
+            for b in &values {
+                let _ = compare_immutable_single(*a, *b, CollationSeq::Binary);
+            }
+        }
+
+        // Antisymmetry holds for all pairs.
+        for a in &values {
+            for b in &values {
+                let ab = a.cmp(b);
+                let ba = b.cmp(a);
+                assert_eq!(ab, ba.reverse(), "antisymmetry failed for {a:?} vs {b:?}");
+            }
+        }
+    }
+
     #[test]
     fn test_column_count_matches_values_written() {
         // Test with different numbers of values
