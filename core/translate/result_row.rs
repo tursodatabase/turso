@@ -29,8 +29,11 @@ pub fn emit_select_result(
     reg_result_cols_start: usize,
     limit_ctx: Option<LimitCtx>,
 ) -> Result<()> {
-    if let (Some(jump_to), Some(_)) = (offset_jump_to, label_on_limit_reached) {
-        emit_offset(program, jump_to, reg_offset);
+    let has_distinct = matches!(plan.distinctness, Distinctness::Distinct { .. });
+    if !has_distinct {
+        if let (Some(jump_to), Some(_)) = (offset_jump_to, label_on_limit_reached) {
+            emit_offset(program, jump_to, reg_offset);
+        }
     }
 
     let start_reg = reg_result_cols_start;
@@ -94,6 +97,12 @@ pub fn emit_select_result(
         let distinct_ctx = ctx.as_ref().expect("distinct context must exist");
         let num_regs = plan.result_columns.len();
         distinct_ctx.emit_deduplication_insns(program, num_regs, start_reg);
+    }
+
+    if has_distinct {
+        if let (Some(jump_to), Some(_)) = (offset_jump_to, label_on_limit_reached) {
+            emit_offset(program, jump_to, reg_offset);
+        }
     }
 
     emit_result_row_and_limit(program, plan, start_reg, limit_ctx, label_on_limit_reached)?;
