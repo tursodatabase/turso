@@ -553,6 +553,15 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
     /// Must be called AFTER checkpointed_txid_max is updated and BEFORE the
     /// checkpoint lock is released (no concurrent writers under blocking lock).
     fn gc_checkpointed_versions(&self) {
+        // Safety: entry removal after dropping the version-chain write lock has a
+        // TOCTOU gap — a concurrent writer could insert between the two. This is
+        // only safe because the blocking checkpoint lock prevents concurrent writers.
+        // If we ever move to a non-blocking checkpoint, this must switch to lazy
+        // removal (like background GC) or hold the write lock across the remove().
+        debug_assert!(
+            self.lock_states.blocking_checkpoint_lock_held,
+            "gc_checkpointed_versions requires the blocking checkpoint lock"
+        );
         let lwm = self.mvstore.compute_lwm();
         let ckpt_max = self.checkpointed_txid_max_new;
 
