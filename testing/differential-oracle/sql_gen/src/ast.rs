@@ -642,6 +642,7 @@ pub struct ColumnDefStmt {
     pub not_null: bool,
     pub unique: bool,
     pub default: Option<Expr>,
+    pub check: Option<Expr>,
 }
 
 impl fmt::Display for ColumnDefStmt {
@@ -662,6 +663,10 @@ impl fmt::Display for ColumnDefStmt {
 
         if let Some(default) = &self.default {
             write!(f, " DEFAULT ({default})")?;
+        }
+
+        if let Some(check) = &self.check {
+            write!(f, " CHECK ({check})")?;
         }
 
         Ok(())
