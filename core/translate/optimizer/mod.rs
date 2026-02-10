@@ -1979,6 +1979,9 @@ impl Optimizable for ast::Expr {
             }
             Expr::Cast { expr, .. } => expr.is_constant(resolver),
             Expr::Collate(expr, _) => expr.is_constant(resolver),
+            // Not constant. Normally rewritten to Expr::Column by the optimizer,
+            // but CHECK constraints bypass the rewrite pass and legitimately
+            // contain DoublyQualified nodes.
             Expr::DoublyQualified(_, _, _) => false,
             Expr::Exists(_) => false,
             Expr::FunctionCall { args, name, .. } => {
@@ -2013,6 +2016,9 @@ impl Optimizable for ast::Expr {
             Expr::Name(_) => false,
             Expr::NotNull(expr) => expr.is_constant(resolver),
             Expr::Parenthesized(exprs) => exprs.iter().all(|expr| expr.is_constant(resolver)),
+            // Not constant. Normally rewritten to Expr::Column by the optimizer,
+            // but CHECK constraints bypass the rewrite pass and legitimately
+            // contain Qualified nodes.
             Expr::Qualified(_, _) => false,
             Expr::Raise(_, expr) => expr.as_ref().is_none_or(|expr| expr.is_constant(resolver)),
             Expr::Subquery(_) => false,
