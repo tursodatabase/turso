@@ -1,0 +1,146 @@
+@database :memory:
+
+@requires strict "uses STRICT tables"
+test create-type-basic {
+    CREATE TYPE test_uint BASE text
+        ENCODE test_uint_encode
+        DECODE test_uint_decode
+        OPERATOR '+' (test_uint) -> test_uint_add
+        OPERATOR '<' (test_uint) -> test_uint_lt
+        OPERATOR '=' (test_uint) -> test_uint_eq;
+    SELECT type, name FROM sqlite_schema WHERE type = 'type';
+}
+expect {
+    type|test_uint
+}
+
+@requires strict "uses STRICT tables"
+test create-type-if-not-exists {
+    CREATE TYPE test_uint BASE text ENCODE test_uint_encode DECODE test_uint_decode;
+    CREATE TYPE IF NOT EXISTS test_uint BASE text ENCODE test_uint_encode DECODE test_uint_decode;
+    SELECT count(*) FROM sqlite_schema WHERE type = 'type' AND name = 'test_uint';
+}
+expect {
+    1
+}
+
+@requires strict "uses STRICT tables"
+test drop-type-basic {
+    CREATE TYPE test_uint BASE text ENCODE test_uint_encode DECODE test_uint_decode;
+    DROP TYPE test_uint;
+    SELECT count(*) FROM sqlite_schema WHERE type = 'type';
+}
+expect {
+    0
+}
+
+@requires strict "uses STRICT tables"
+test drop-type-if-exists {
+    DROP TYPE IF EXISTS nonexistent;
+    SELECT 'ok';
+}
+expect {
+    ok
+}
+
+@requires strict "uses STRICT tables"
+test strict-table-with-custom-type {
+    CREATE TYPE test_uint BASE text ENCODE test_uint_encode DECODE test_uint_decode;
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint) STRICT;
+    INSERT INTO t1 VALUES (1, 42);
+    INSERT INTO t1 VALUES (2, 100);
+    SELECT id, val FROM t1;
+}
+expect {
+    1|42
+    2|100
+}
+
+@requires strict "uses STRICT tables"
+test encode-decode-round-trip {
+    CREATE TYPE test_reverse BASE text ENCODE test_reverse_encode DECODE test_reverse_decode;
+    CREATE TABLE t1(val test_reverse) STRICT;
+    INSERT INTO t1 VALUES ('hello');
+    INSERT INTO t1 VALUES ('world');
+    SELECT val FROM t1;
+}
+expect {
+    hello
+    world
+}
+
+@requires strict "uses STRICT tables"
+test uint-addition {
+    CREATE TYPE test_uint BASE text
+        ENCODE test_uint_encode DECODE test_uint_decode
+        OPERATOR '+' (test_uint) -> test_uint_add;
+    CREATE TABLE t1(val test_uint) STRICT;
+    INSERT INTO t1 VALUES (20);
+    INSERT INTO t1 VALUES (30);
+    SELECT val + val FROM t1;
+}
+expect {
+    40
+    60
+}
+
+@requires strict "uses STRICT tables"
+test uint-comparison-less-than {
+    CREATE TYPE test_uint BASE text
+        ENCODE test_uint_encode DECODE test_uint_decode
+        OPERATOR '<' (test_uint) -> test_uint_lt;
+    CREATE TABLE t1(val test_uint) STRICT;
+    INSERT INTO t1 VALUES (9);
+    INSERT INTO t1 VALUES (10);
+    INSERT INTO t1 VALUES (100);
+    SELECT val FROM t1 WHERE val < 10;
+}
+expect {
+    9
+}
+
+@requires strict "uses STRICT tables"
+test uint-comparison-equals {
+    CREATE TYPE test_uint BASE text
+        ENCODE test_uint_encode DECODE test_uint_decode
+        OPERATOR '=' (test_uint) -> test_uint_eq;
+    CREATE TABLE t1(val test_uint) STRICT;
+    INSERT INTO t1 VALUES (42);
+    INSERT INTO t1 VALUES (99);
+    SELECT val FROM t1 WHERE val = 42;
+}
+expect {
+    42
+}
+
+@requires strict "uses STRICT tables"
+test cast-to-custom-type {
+    CREATE TYPE test_reverse BASE text ENCODE test_reverse_encode DECODE test_reverse_decode;
+    SELECT CAST('hello' AS test_reverse);
+}
+expect {
+    olleh
+}
+
+@requires strict "uses STRICT tables"
+test null-handling {
+    CREATE TYPE test_uint BASE text ENCODE test_uint_encode DECODE test_uint_decode;
+    CREATE TABLE t1(val test_uint) STRICT;
+    INSERT INTO t1 VALUES (NULL);
+    SELECT COALESCE(val, 'IS_NULL') FROM t1;
+}
+expect {
+    IS_NULL
+}
+
+@requires strict "uses STRICT tables"
+test multiple-custom-types {
+    CREATE TYPE test_uint BASE text ENCODE test_uint_encode DECODE test_uint_decode;
+    CREATE TYPE test_reverse BASE text ENCODE test_reverse_encode DECODE test_reverse_decode;
+    CREATE TABLE t1(a test_uint, b test_reverse) STRICT;
+    INSERT INTO t1 VALUES (42, 'hello');
+    SELECT a, b FROM t1;
+}
+expect {
+    42|hello
+}

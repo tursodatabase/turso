@@ -703,6 +703,57 @@ impl ToTokens for Stmt {
                 }
                 Ok(())
             }
+            Self::CreateType {
+                if_not_exists,
+                type_name,
+                body,
+            } => {
+                s.append(TK_CREATE, None)?;
+                s.append(TK_TYPE, None)?;
+                if *if_not_exists {
+                    s.append(TK_IF, None)?;
+                    s.append(TK_NOT, None)?;
+                    s.append(TK_EXISTS, None)?;
+                }
+                s.append(TK_ID, Some(type_name))?;
+                // BASE
+                s.append(TK_ID, Some("BASE"))?;
+                s.append(TK_ID, Some(&body.base))?;
+                // ENCODE
+                if let Some(ref encode) = body.encode {
+                    s.append(TK_ID, Some("ENCODE"))?;
+                    s.append(TK_ID, Some(encode))?;
+                }
+                // DECODE
+                if let Some(ref decode) = body.decode {
+                    s.append(TK_ID, Some("DECODE"))?;
+                    s.append(TK_ID, Some(decode))?;
+                }
+                // OPERATOR clauses
+                for op in &body.operators {
+                    s.append(TK_ID, Some("OPERATOR"))?;
+                    s.append(TK_STRING, Some(&format!("'{}'", op.op)))?;
+                    s.append(TK_LP, None)?;
+                    s.append(TK_ID, Some(&op.right_type))?;
+                    s.append(TK_RP, None)?;
+                    s.append(TK_ID, Some("->"))?;
+                    s.append(TK_ID, Some(&op.func_name))?;
+                }
+                Ok(())
+            }
+            Self::DropType {
+                if_exists,
+                type_name,
+            } => {
+                s.append(TK_DROP, None)?;
+                s.append(TK_TYPE, None)?;
+                if *if_exists {
+                    s.append(TK_IF, None)?;
+                    s.append(TK_EXISTS, None)?;
+                }
+                s.append(TK_ID, Some(type_name))?;
+                Ok(())
+            }
         }
     }
 }
