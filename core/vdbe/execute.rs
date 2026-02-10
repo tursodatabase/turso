@@ -10206,7 +10206,6 @@ pub fn op_rename_table(
                         &normalized_from,
                         &normalized_to,
                     );
-                    check.sql = format!("CHECK({})", &check.expr);
                 }
 
                 normalized_to.clone_into(&mut btree.name);
@@ -10468,7 +10467,6 @@ pub fn op_alter_column(
         let old_col_normalized = normalize_ident(&old_column_name);
         for check in &mut btree.check_constraints {
             rewrite_check_expr_column_refs(&mut check.expr, &old_col_normalized, &new_name);
-            check.sql = format!("CHECK({})", check.expr);
             if let Some(ref mut col) = check.column {
                 if col.eq_ignore_ascii_case(&old_column_name) {
                     col.clone_from(&new_name);

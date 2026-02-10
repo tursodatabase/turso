@@ -1678,8 +1678,6 @@ pub struct CheckConstraint {
     pub name: Option<String>,
     /// CHECK expression
     pub expr: ast::Expr,
-    /// Original SQL for the CHECK constraint
-    pub sql: String,
     /// Column name if this is a column-level CHECK constraint (defined inline with the column).
     /// None if this is a table-level CHECK constraint.
     pub column: Option<String>,
@@ -1690,9 +1688,13 @@ impl CheckConstraint {
         Self {
             name: name.map(|n| n.as_str().to_string()),
             expr: expr.clone(),
-            sql: format!("CHECK ({expr})"),
             column: column.map(|s| s.to_string()),
         }
+    }
+
+    /// Returns the SQL representation of this CHECK constraint (e.g. `CHECK(x > 0)`).
+    pub fn sql(&self) -> String {
+        format!("CHECK({})", self.expr)
     }
 }
 
@@ -1801,7 +1803,7 @@ impl BTreeTable {
                         sql.push_str(&Name::exact(name.clone()).as_ident());
                         sql.push(' ');
                     }
-                    sql.push_str(&check_constraint.sql);
+                    sql.push_str(&check_constraint.sql());
                 }
             }
         }
@@ -1875,7 +1877,7 @@ impl BTreeTable {
                 sql.push_str(&Name::exact(name.clone()).as_ident());
                 sql.push(' ');
             }
-            sql.push_str(&check_constraint.sql);
+            sql.push_str(&check_constraint.sql());
         }
 
         sql.push(')');
