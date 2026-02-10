@@ -55,11 +55,6 @@ impl From<Version> for JournalMode {
     }
 }
 
-pub fn wal_exists(wal_path: impl AsRef<std::path::Path>) -> bool {
-    let wal_path = wal_path.as_ref();
-    std::path::Path::exists(wal_path) && wal_path.metadata().unwrap().len() > 0
-}
-
 pub fn logical_log_exists(db_path: impl AsRef<std::path::Path>) -> bool {
     let db_path = db_path.as_ref();
     let log_path = db_path.with_extension("db-log");

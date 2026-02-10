@@ -102,11 +102,11 @@ fn journal_mode_delete_lost_on_switch() {
 ///    the checkpoint logic didn't know the row existed in B-tree
 ///
 /// The bug occurs because:
-/// - After WAL->MVCC switch, `checkpointed_txid_max_old` is None (fresh MvStore)
+/// - After WAL->MVCC switch, `durable_txid_max_old` is None (fresh MvStore)
 /// - The UPDATE creates an MVCC version with `begin_ts > 0`
-/// - The checkpoint logic with `is_some_and` requires `begin_ts <= checkpointed_txid_max_old`
+/// - The checkpoint logic with `is_some_and` requires `begin_ts <= durable_txid_max_old`
 ///   to recognize the row as existing in B-tree, but that check fails when
-///   `checkpointed_txid_max_old` is None
+///   `durable_txid_max_old` is None
 /// - Result: the delete is not checkpointed, and the row "reappears" with its old value
 ///
 /// The fix adds a `btree_resident` flag to RowVersion that's set when updating
@@ -149,7 +149,7 @@ fn journal_mode_update_then_delete_btree_resident() {
 
     // Step 3: Switch back to MVCC (creates new MvStore, row only in B-tree)
     // This is the key step - after this, the row ONLY exists in B-tree,
-    // and checkpointed_txid_max will be 0 (None when converted to NonZeroU64)
+    // and durable_txid_max will be 0 (None when converted to NonZeroU64)
     let result = conn
         .pragma_update("journal_mode", "'experimental_mvcc'")
         .expect("switch to mvcc");

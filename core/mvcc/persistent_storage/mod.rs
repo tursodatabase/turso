@@ -21,8 +21,8 @@ impl Storage {
 }
 
 impl Storage {
-    pub fn log_tx(&self, m: &LogRecord) -> Result<Completion> {
-        self.logical_log.write().log_tx(m)
+    pub fn log_tx(&self, m: &LogRecord) -> Result<(Completion, u64)> {
+        self.logical_log.write().log_tx_deferred_offset(m)
     }
 
     pub fn read_tx_log(&self) -> Result<Vec<LogRecord>> {
@@ -31,6 +31,10 @@ impl Storage {
 
     pub fn sync(&self, sync_type: FileSyncType) -> Result<Completion> {
         self.logical_log.write().sync(sync_type)
+    }
+
+    pub fn update_header(&self) -> Result<Completion> {
+        self.logical_log.write().update_header()
     }
 
     pub fn truncate(&self) -> Result<Completion> {
@@ -51,6 +55,10 @@ impl Storage {
 
     pub fn checkpoint_threshold(&self) -> i64 {
         self.logical_log.read().checkpoint_threshold()
+    }
+
+    pub fn advance_logical_log_offset_after_success(&self, bytes: u64) {
+        self.logical_log.write().advance_offset_after_success(bytes)
     }
 }
 

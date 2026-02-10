@@ -2041,6 +2041,14 @@ mod tests {
     }
 
     #[test]
+    fn test_varint_len_capped_to_nine_bytes() {
+        assert_eq!(varint_len(0), 1);
+        assert_eq!(varint_len((1u64 << 63) - 1), 9);
+        assert_eq!(varint_len(1u64 << 63), 9);
+        assert_eq!(varint_len(u64::MAX), 9);
+    }
+
+    #[test]
     fn streaming_reader_ignores_uncommitted_checksums() {
         let io: Arc<dyn crate::IO> = Arc::new(crate::MemoryIO::new());
         let file = io

@@ -4392,6 +4392,10 @@ impl Pager {
         self.io_ctx.write().encryption_context().is_some()
     }
 
+    pub fn is_encryption_enabled(&self) -> bool {
+        self.enable_encryption.load(Ordering::SeqCst)
+    }
+
     pub fn set_encryption_context(
         &self,
         cipher_mode: CipherMode,

@@ -961,7 +961,6 @@ impl Database {
     ///
     /// Will also open MVStore and WAL if needed
     fn header_validation(&mut self, encryption_key: Option<&EncryptionKey>) -> Result<Arc<Pager>> {
-        let wal_exists = journal_mode::wal_exists(std::path::Path::new(&self.wal_path));
         let log_exists = journal_mode::logical_log_exists(std::path::Path::new(&self.path));
         let is_readonly = self.open_flags.contains(OpenFlags::ReadOnly);
 
@@ -1092,33 +1091,15 @@ impl Database {
             Version::Mvcc => false,
         };
 
-        // Check for inconsistent state between database header and log files
-        match (wal_exists, log_exists) {
-            (true, true) => {
-                return Err(LimboError::Corrupt(
-                    "Both WAL and MVCC logical log file exist".to_string(),
-                ));
-            }
-            (true, false) => {
-                // If a WAL file exists but header says MVCC, that's an inconsistent state
-                if open_mv_store {
-                    return Err(LimboError::Corrupt(format!(
-                        "WAL file exists for database {}, but database header indicates MVCC mode. Run PRAGMA wal_checkpoint(TRUNCATE) to truncate the WAL.",
-                        self.path
-                    )));
-                }
-            }
-            (false, true) => {
-                // If an MVCC log file exists but header says WAL, that's an inconsistent state
-                if !open_mv_store {
-                    return Err(LimboError::Corrupt(format!(
-                        "MVCC logical log file exists for database {}, but database header indicates WAL mode. The database may be corrupted.",
-                        self.path
-                    )));
-                }
-            }
-            (false, false) => {}
-        };
+        // In WAL mode, a logical log is always unexpected.
+        // In MVCC mode, WAL and logical-log coexistence can happen across interrupted checkpoint
+        // recovery and is reconciled in MvStore::bootstrap().
+        if !open_mv_store && log_exists {
+            return Err(LimboError::Corrupt(format!(
+                "MVCC logical log file exists for database {}, but database header indicates WAL mode. The database may be corrupted.",
+                self.path
+            )));
+        }
 
         // If header was modified, write it directly to disk before we clear the cache
         // This must happen before WAL is attached since we need to write directly to the DB file

@@ -51,10 +51,13 @@ fn test_vacuum_into_basic(tmp_db: TempDatabase) -> anyhow::Result<()> {
     );
 
     let dest_hash = compute_dbhash(&dest_db);
-    assert_eq!(
-        source_hash.hash, dest_hash.hash,
-        "Source and destination databases should have the same content hash"
-    );
+    if !tmp_db.enable_mvcc {
+        // MVCC meta table is removed so content wont match
+        assert_eq!(
+            source_hash.hash, dest_hash.hash,
+            "Source and destination databases should have the same content hash"
+        );
+    }
 
     // let's verify the data anyways (to alleviate any bugs in dbhash)
     let rows: Vec<(i64, String)> = dest_conn.exec_rows("SELECT a, b FROM t ORDER BY a, b");
@@ -165,10 +168,12 @@ fn test_vacuum_into_multiple_tables(tmp_db: TempDatabase) -> anyhow::Result<()> 
         "Destination database should pass integrity check"
     );
     let dest_hash = compute_dbhash(&dest_db);
-    assert_eq!(
-        source_hash.hash, dest_hash.hash,
-        "Source and destination databases should have the same content hash"
-    );
+    if !tmp_db.enable_mvcc {
+        assert_eq!(
+            source_hash.hash, dest_hash.hash,
+            "Source and destination databases should have the same content hash"
+        );
+    }
 
     let rows_t1: Vec<(i64,)> = dest_conn.exec_rows("SELECT a FROM t1 ORDER BY a");
     assert_eq!(rows_t1, vec![(1,), (2,), (3,)]);
@@ -203,10 +208,12 @@ fn test_vacuum_into_with_index(tmp_db: TempDatabase) -> anyhow::Result<()> {
         "Destination database with index should pass integrity check"
     );
     let dest_hash = compute_dbhash(&dest_db);
-    assert_eq!(
-        source_hash.hash, dest_hash.hash,
-        "Source and destination databases should have the same content hash"
-    );
+    if !tmp_db.enable_mvcc {
+        assert_eq!(
+            source_hash.hash, dest_hash.hash,
+            "Source and destination databases should have the same content hash"
+        );
+    }
 
     // lets verify that the index exists in the schema
     let schema: Vec<(String, String)> =
@@ -257,7 +264,9 @@ fn test_vacuum_into_with_views(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let dest_conn = dest_db.connect_limbo();
 
     assert_eq!(run_integrity_check(&dest_conn), "ok");
-    assert_eq!(source_hash.hash, compute_dbhash(&dest_db).hash);
+    if !tmp_db.enable_mvcc {
+        assert_eq!(source_hash.hash, compute_dbhash(&dest_db).hash);
+    }
 
     // verify that all views exist
     let views: Vec<(String,)> =
@@ -542,7 +551,9 @@ fn test_vacuum_into_empty_edge_cases(tmp_db: TempDatabase) -> anyhow::Result<()>
         let dest_conn = dest_db.connect_limbo();
 
         assert_eq!(run_integrity_check(&dest_conn), "ok");
-        assert_eq!(source_hash.hash, compute_dbhash(&dest_db).hash);
+        if !tmp_db.enable_mvcc {
+            assert_eq!(source_hash.hash, compute_dbhash(&dest_db).hash);
+        }
         let cnt: Vec<(i64,)> = dest_conn.exec_rows("SELECT COUNT(*) FROM t1");
         assert_eq!(cnt, vec![(0,)]);
 
@@ -597,7 +608,9 @@ fn test_vacuum_into_preserves_autoincrement(tmp_db: TempDatabase) -> anyhow::Res
 
     // verify integrity and dbhash (before modifying destination)
     assert_eq!(run_integrity_check(&dest_conn), "ok");
-    assert_eq!(source_hash.hash, compute_dbhash(&dest_db).hash);
+    if !tmp_db.enable_mvcc {
+        assert_eq!(source_hash.hash, compute_dbhash(&dest_db).hash);
+    }
 
     // verify sqlite_sequence was copied
     let seq_after: Vec<(String, i64)> =
@@ -648,11 +661,13 @@ fn test_vacuum_into_table_with_sqlite_sequence_in_sql(tmp_db: TempDatabase) -> a
     let dest_conn = dest_db.connect_limbo();
 
     assert_eq!(run_integrity_check(&dest_conn), "ok");
-    assert_eq!(
-        source_hash.hash,
-        compute_dbhash(&dest_db).hash,
-        "Source and destination databases should have the same content hash"
-    );
+    if !tmp_db.enable_mvcc {
+        assert_eq!(
+            source_hash.hash,
+            compute_dbhash(&dest_db).hash,
+            "Source and destination databases should have the same content hash"
+        );
+    }
 
     // verify the table was created and data was copied
     let rows: Vec<(i64, String)> = dest_conn.exec_rows("SELECT id, content FROM notes ORDER BY id");
@@ -713,11 +728,13 @@ fn test_vacuum_into_special_table_names(tmp_db: TempDatabase) -> anyhow::Result<
         "ok",
         "Destination should pass integrity check"
     );
-    assert_eq!(
-        source_hash.hash,
-        compute_dbhash(&dest_db).hash,
-        "Source and destination databases should have the same content hash"
-    );
+    if !tmp_db.enable_mvcc {
+        assert_eq!(
+            source_hash.hash,
+            compute_dbhash(&dest_db).hash,
+            "Source and destination databases should have the same content hash"
+        );
+    }
 
     // verify all tables were copied correctly
     let r1: Vec<(i64, String)> = dest_conn.exec_rows(r#"SELECT * FROM "table with spaces""#);
@@ -786,11 +803,13 @@ fn test_vacuum_into_preserves_float_precision(tmp_db: TempDatabase) -> anyhow::R
     let dest_db = TempDatabase::new_with_existent(&dest_path);
     let dest_conn = dest_db.connect_limbo();
     assert_eq!(run_integrity_check(&dest_conn), "ok");
-    assert_eq!(
-        source_hash.hash,
-        compute_dbhash(&dest_db).hash,
-        "Source and destination databases should have the same content hash"
-    );
+    if !tmp_db.enable_mvcc {
+        assert_eq!(
+            source_hash.hash,
+            compute_dbhash(&dest_db).hash,
+            "Source and destination databases should have the same content hash"
+        );
+    }
 
     // verify float precision is preserved
     let rows: Vec<(i64, f64)> = dest_conn.exec_rows("SELECT id, value FROM floats ORDER BY id");
@@ -852,11 +871,13 @@ fn test_vacuum_into_special_column_names(tmp_db: TempDatabase) -> anyhow::Result
         "ok",
         "Destination should pass integrity check"
     );
-    assert_eq!(
-        source_hash.hash,
-        compute_dbhash(&dest_db).hash,
-        "Source and destination databases should have the same content hash"
-    );
+    if !tmp_db.enable_mvcc {
+        assert_eq!(
+            source_hash.hash,
+            compute_dbhash(&dest_db).hash,
+            "Source and destination databases should have the same content hash"
+        );
+    }
 
     // verify all column data was copied correctly
     let rows: Vec<(i64, String, i64, String, f64, i64, String)> = dest_conn.exec_rows(
@@ -940,11 +961,13 @@ fn test_vacuum_into_large_data_multi_page(tmp_db: TempDatabase) -> anyhow::Resul
         "ok",
         "Large database should pass integrity check"
     );
-    assert_eq!(
-        source_hash.hash,
-        compute_dbhash(&dest_db).hash,
-        "Source and destination should have same content hash"
-    );
+    if !tmp_db.enable_mvcc {
+        assert_eq!(
+            source_hash.hash,
+            compute_dbhash(&dest_db).hash,
+            "Source and destination should have same content hash"
+        );
+    }
 
     // Verify row count
     let count: Vec<(i64,)> = dest_conn.exec_rows("SELECT COUNT(*) FROM large_data");
@@ -988,7 +1011,9 @@ fn test_vacuum_into_with_foreign_keys(tmp_db: TempDatabase) -> anyhow::Result<()
     let dest_conn = dest_db.connect_limbo();
 
     assert_eq!(run_integrity_check(&dest_conn), "ok");
-    assert_eq!(source_hash.hash, compute_dbhash(&dest_db).hash);
+    if !tmp_db.enable_mvcc {
+        assert_eq!(source_hash.hash, compute_dbhash(&dest_db).hash);
+    }
 
     // verify schema includes foreign key
     let products_sql: Vec<(String,)> =
@@ -1067,7 +1092,9 @@ fn test_vacuum_into_with_composite_primary_key(tmp_db: TempDatabase) -> anyhow::
     let dest_conn = dest_db.connect_limbo();
 
     assert_eq!(run_integrity_check(&dest_conn), "ok");
-    assert_eq!(source_hash.hash, compute_dbhash(&dest_db).hash);
+    if !tmp_db.enable_mvcc {
+        assert_eq!(source_hash.hash, compute_dbhash(&dest_db).hash);
+    }
 
     let order_items_sql: Vec<(String,)> =
         dest_conn.exec_rows("SELECT sql FROM sqlite_schema WHERE name = 'order_items'");
@@ -1139,7 +1166,9 @@ fn test_vacuum_into_with_table_valued_functions(tmp_db: TempDatabase) -> anyhow:
     let dest_conn = dest_db.connect_limbo();
 
     assert_eq!(run_integrity_check(&dest_conn), "ok");
-    assert_eq!(source_hash.hash, compute_dbhash(&dest_db).hash);
+    if !tmp_db.enable_mvcc {
+        assert_eq!(source_hash.hash, compute_dbhash(&dest_db).hash);
+    }
 
     // verify generate_series data
     let count: Vec<(i64,)> = dest_conn.exec_rows("SELECT COUNT(*) FROM numbers");
@@ -1208,11 +1237,13 @@ fn test_vacuum_into_preserves_reserved_space(tmp_db: TempDatabase) -> anyhow::Re
     let dest_conn = dest_db.connect_limbo();
 
     assert_eq!(run_integrity_check(&dest_conn), "ok");
-    assert_eq!(
-        source_hash.hash,
-        compute_dbhash(&dest_db).hash,
-        "Source and destination should have same content hash"
-    );
+    if !tmp_db.enable_mvcc {
+        assert_eq!(
+            source_hash.hash,
+            compute_dbhash(&dest_db).hash,
+            "Source and destination should have same content hash"
+        );
+    }
 
     assert_eq!(
         dest_conn.get_reserved_bytes(),
@@ -1290,7 +1321,9 @@ fn test_vacuum_into_with_partial_indexes(tmp_db: TempDatabase) -> anyhow::Result
 
     // assert_eq!(run_integrity_check(&dest_conn), "ok");
 
-    assert_eq!(source_hash.hash, compute_dbhash(&dest_db).hash);
+    if !tmp_db.enable_mvcc {
+        assert_eq!(source_hash.hash, compute_dbhash(&dest_db).hash);
+    }
 
     // verify partial indexes exist with WHERE clause in schema
     let indexes: Vec<(String, String)> = dest_conn.exec_rows(
@@ -1479,7 +1512,9 @@ fn test_vacuum_into_with_check_constraints(tmp_db: TempDatabase) -> anyhow::Resu
     let dest_conn = dest_db.connect_limbo();
 
     assert_eq!(run_integrity_check(&dest_conn), "ok");
-    assert_eq!(source_hash.hash, compute_dbhash(&dest_db).hash);
+    if !tmp_db.enable_mvcc {
+        assert_eq!(source_hash.hash, compute_dbhash(&dest_db).hash);
+    }
 
     // Verify schema includes CHECK constraints
     let employees_sql: Vec<(String,)> =
