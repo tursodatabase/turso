@@ -158,6 +158,37 @@ impl SortableIndexKey {
         }
         Ok(false)
     }
+
+    /// Check if the first `num_cols` columns of this key match another key.
+    /// Used for UNIQUE index conflict detection where we need to compare only
+    /// the indexed columns, not the rowid suffix.
+    pub fn matches_prefix(&self, other: &Self, num_cols: usize) -> Result<bool> {
+        let mut lhs = self.key.iter()?;
+        let mut rhs = other.key.iter()?;
+
+        for i in 0..num_cols {
+            let lhs_value = match lhs.next() {
+                Some(v) => v?,
+                None => return Ok(false),
+            };
+            let rhs_value = match rhs.next() {
+                Some(v) => v?,
+                None => return Ok(false),
+            };
+
+            let cmp = compare_immutable(
+                std::iter::once(&lhs_value),
+                std::iter::once(&rhs_value),
+                &self.metadata.key_info[i..i + 1],
+            );
+
+            if cmp != std::cmp::Ordering::Equal {
+                return Ok(false);
+            }
+        }
+
+        Ok(true)
+    }
 }
 
 impl PartialEq for SortableIndexKey {
@@ -750,34 +781,41 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
         if record.contains_null(num_indexed_cols)? {
             return Ok(());
         }
-        // Remove the rowid column from the index metadata so that we only compare records without rowid
-        // this way we can check if record is unique or not. Rowid should be checked on table insert?
-        let index_info = {
+
+        // Create a prefix key with num_cols - 1 for range lookup.
+        // Due to SortableIndexKey's Ord using min(num_cols), this key compares Equal
+        // to all entries with the same indexed columns (regardless of rowid).
+        let prefix_key = {
             let mut index_info = record.metadata.as_ref().clone();
             turso_assert!(index_info.has_rowid, "not supported yet without rowid");
             index_info.num_cols -= 1;
-            Arc::new(index_info)
+            SortableIndexKey {
+                key: record.key.clone(),
+                metadata: Arc::new(index_info),
+            }
         };
-        let sortable_key_index = Arc::new(SortableIndexKey {
-            key: record.key.clone(),
-            metadata: index_info,
-        });
+
         let table_id = rowid.table_id;
         let index_rows = mvcc_store
             .index_rows
             .get(&table_id)
             .expect("expected index {table_id:?}");
         let index_rows = index_rows.value();
-        let row_versions = index_rows.get(&sortable_key_index);
-        if row_versions.is_none() {
-            return Ok(());
+
+        // Use range to efficiently find all entries that match the prefix.
+        // Since entries are ordered by Ord, all entries with the same indexed columns
+        // are contiguous. We start from the prefix_key and stop when prefix no longer matches.
+        for entry in index_rows.range::<SortableIndexKey, _>(&prefix_key..) {
+            let other_key = entry.key();
+            // Check if prefix still matches - if not, we've passed all matching entries
+            if !record.matches_prefix(other_key, num_indexed_cols)? {
+                break;
+            }
+            let row_versions = entry.value();
+            let row_versions = row_versions.read();
+            self.check_version_conflicts(end_ts, tx, mvcc_store, &row_versions)?;
         }
 
-        let row_versions = row_versions.unwrap();
-        let row_versions = row_versions.value();
-        let row_versions = row_versions.read();
-
-        self.check_version_conflicts(end_ts, tx, mvcc_store, &row_versions)?;
         Ok(())
     }
 
