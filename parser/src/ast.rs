@@ -185,6 +185,15 @@ pub enum Stmt {
 
     /// `CREATE VIRTUAL TABLE`
     CreateVirtualTable(CreateVirtualTable),
+    /// `CREATE TYPE`
+    CreateType {
+        /// `IF NOT EXISTS`
+        if_not_exists: bool,
+        /// type name
+        type_name: String,
+        /// type body
+        body: CreateTypeBody,
+    },
     /// `DELETE`
     Delete {
         /// CTE
@@ -234,6 +243,13 @@ pub enum Stmt {
         if_exists: bool,
         /// view name
         view_name: QualifiedName,
+    },
+    /// `DROP TYPE`
+    DropType {
+        /// `IF EXISTS`
+        if_exists: bool,
+        /// type name
+        type_name: String,
     },
     /// `INSERT`
     Insert {
@@ -1153,6 +1169,32 @@ pub enum AlterTableBody {
     },
     /// `DROP COLUMN`
     DropColumn(Name), // TODO distinction between DROP and DROP COLUMN
+}
+
+/// Operator mapping in a `CREATE TYPE` body
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct TypeOperator {
+    /// operator symbol: "+", "-", "*", "/", "<", "=", etc.
+    pub op: String,
+    /// type name of right operand
+    pub right_type: String,
+    /// function name to call
+    pub func_name: String,
+}
+
+/// Body of a `CREATE TYPE` statement
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct CreateTypeBody {
+    /// base storage type: "text", "integer", "real", "blob"
+    pub base: String,
+    /// encode function name (called on write)
+    pub encode: Option<String>,
+    /// decode function name (called on read)
+    pub decode: Option<String>,
+    /// operator-to-function mappings
+    pub operators: Vec<TypeOperator>,
 }
 
 /// `CREATE TABLE` body

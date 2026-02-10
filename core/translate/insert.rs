@@ -1,6 +1,7 @@
 use crate::{
     error::{SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE},
-    schema::{self, BTreeTable, ColDef, Column, Index, IndexColumn, ResolvedFkRef, Table},
+    function::FuncCtx,
+    schema::{self, BTreeTable, ColDef, Column, Index, IndexColumn, ResolvedFkRef, Schema, Table},
     sync::Arc,
     translate::{
         emitter::{
@@ -544,6 +545,9 @@ pub fn translate_insert(
             check_generated: true,
             table_reference: Arc::clone(ctx.table),
         });
+
+        // Encode values for columns with custom types
+        emit_custom_type_encode(&mut program, resolver, &insertion)?;
     } else {
         // For non-STRICT tables, apply column affinity to the values.
         // This must happen early so that both index records and the table record
@@ -3515,6 +3519,58 @@ pub fn emit_parent_side_fk_decrement_on_insert(
             program.resolve_label(done, program.offset());
             program.emit_insn(Insn::Close { cursor_id: ccur });
         }
+    }
+    Ok(())
+}
+
+/// Emit encode function calls for columns with custom types.
+/// For each column that has a custom type with an encode function,
+/// emit a Function instruction that transforms the value in-place.
+fn emit_custom_type_encode(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    insertion: &Insertion,
+) -> Result<()> {
+    for col_mapping in &insertion.col_mappings {
+        let type_name = &col_mapping.column.ty_str;
+        if type_name.is_empty() {
+            continue;
+        }
+        let Some(type_def) = resolver.schema.get_type_def(type_name) else {
+            continue;
+        };
+        let Some(ref encode_fn) = type_def.encode else {
+            continue;
+        };
+        let func = resolver.resolve_function(encode_fn, 1).ok_or_else(|| {
+            crate::LimboError::InternalError(format!("encode function not found: {encode_fn}"))
+        })?;
+
+        // Skip NULL values: jump over encode if NULL
+        let skip_label = program.allocate_label();
+        program.emit_insn(Insn::IsNull {
+            reg: col_mapping.register,
+            target_pc: skip_label,
+        });
+
+        // Emit encode function call: read from register, write back to same register
+        let arg_reg = program.alloc_register();
+        program.emit_insn(Insn::Copy {
+            src_reg: col_mapping.register,
+            dst_reg: arg_reg,
+            extra_amount: 0,
+        });
+        program.emit_insn(Insn::Function {
+            constant_mask: 0,
+            start_reg: arg_reg,
+            dest: col_mapping.register,
+            func: FuncCtx {
+                func,
+                arg_count: 1,
+            },
+        });
+
+        program.resolve_label(skip_label, program.offset());
     }
     Ok(())
 }

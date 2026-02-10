@@ -467,6 +467,17 @@ pub enum ScalarFunc {
     StatGet,
     ConnTxnId,
     IsAutocommit,
+    // Test type functions (for custom type system testing)
+    TestUintEncode,
+    TestUintDecode,
+    TestUintAdd,
+    TestUintSub,
+    TestUintMul,
+    TestUintDiv,
+    TestUintLt,
+    TestUintEq,
+    TestReverseEncode,
+    TestReverseDecode,
 }
 
 impl Deterministic for ScalarFunc {
@@ -536,6 +547,16 @@ impl Deterministic for ScalarFunc {
             ScalarFunc::StatGet => false,  // internal ANALYZE function
             ScalarFunc::ConnTxnId => false, // depends on connection state
             ScalarFunc::IsAutocommit => false, // depends on connection state
+            ScalarFunc::TestUintEncode
+            | ScalarFunc::TestUintDecode
+            | ScalarFunc::TestUintAdd
+            | ScalarFunc::TestUintSub
+            | ScalarFunc::TestUintMul
+            | ScalarFunc::TestUintDiv
+            | ScalarFunc::TestUintLt
+            | ScalarFunc::TestUintEq
+            | ScalarFunc::TestReverseEncode
+            | ScalarFunc::TestReverseDecode => true,
         }
     }
 }
@@ -607,6 +628,16 @@ impl Display for ScalarFunc {
             Self::StatGet => "stat_get",
             Self::ConnTxnId => "conn_txn_id",
             Self::IsAutocommit => "is_autocommit",
+            Self::TestUintEncode => "test_uint_encode",
+            Self::TestUintDecode => "test_uint_decode",
+            Self::TestUintAdd => "test_uint_add",
+            Self::TestUintSub => "test_uint_sub",
+            Self::TestUintMul => "test_uint_mul",
+            Self::TestUintDiv => "test_uint_div",
+            Self::TestUintLt => "test_uint_lt",
+            Self::TestUintEq => "test_uint_eq",
+            Self::TestReverseEncode => "test_reverse_encode",
+            Self::TestReverseDecode => "test_reverse_decode",
         };
         write!(f, "{str}")
     }
@@ -700,6 +731,17 @@ impl ScalarFunc {
             | Self::IsAutocommit => &[0],
             // Scalar max/min (multi-arg)
             Self::Max | Self::Min => &[-1],
+            // Test functions for custom types (1-arg encode/decode, 2-arg operators)
+            Self::TestUintEncode
+            | Self::TestUintDecode
+            | Self::TestReverseEncode
+            | Self::TestReverseDecode => &[1],
+            Self::TestUintAdd
+            | Self::TestUintSub
+            | Self::TestUintMul
+            | Self::TestUintDiv
+            | Self::TestUintLt
+            | Self::TestUintEq => &[2],
         }
     }
 
@@ -1186,6 +1228,17 @@ impl Func {
             "fts_match" => Ok(Self::Fts(FtsFunc::Match)),
             #[cfg(all(feature = "fts", not(target_family = "wasm")))]
             "fts_highlight" => Ok(Self::Fts(FtsFunc::Highlight)),
+            // Test type functions (for custom type system testing)
+            "test_uint_encode" => Ok(Self::Scalar(ScalarFunc::TestUintEncode)),
+            "test_uint_decode" => Ok(Self::Scalar(ScalarFunc::TestUintDecode)),
+            "test_uint_add" => Ok(Self::Scalar(ScalarFunc::TestUintAdd)),
+            "test_uint_sub" => Ok(Self::Scalar(ScalarFunc::TestUintSub)),
+            "test_uint_mul" => Ok(Self::Scalar(ScalarFunc::TestUintMul)),
+            "test_uint_div" => Ok(Self::Scalar(ScalarFunc::TestUintDiv)),
+            "test_uint_lt" => Ok(Self::Scalar(ScalarFunc::TestUintLt)),
+            "test_uint_eq" => Ok(Self::Scalar(ScalarFunc::TestUintEq)),
+            "test_reverse_encode" => Ok(Self::Scalar(ScalarFunc::TestReverseEncode)),
+            "test_reverse_decode" => Ok(Self::Scalar(ScalarFunc::TestReverseDecode)),
             _ => crate::bail_parse_error!("no such function: {}", name),
         }
     }

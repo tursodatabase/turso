@@ -150,8 +150,27 @@ use turso_parser::{
 const SCHEMA_TABLE_NAME: &str = "sqlite_schema";
 const SCHEMA_TABLE_NAME_ALT: &str = "sqlite_master";
 pub const SQLITE_SEQUENCE_TABLE_NAME: &str = "sqlite_sequence";
+pub const TURSO_TYPES_TABLE_NAME: &str = "sqlite_turso_types";
 pub const DBSP_TABLE_PREFIX: &str = "__turso_internal_dbsp_state_v";
 pub const TURSO_INTERNAL_PREFIX: &str = "__turso_internal_";
+
+/// Operator-to-function mapping in a custom type definition
+#[derive(Debug, Clone)]
+pub struct TypeOperatorDef {
+    pub op: String,
+    pub right_type: String,
+    pub func_name: String,
+}
+
+/// Custom type definition, loaded from sqlite_turso_types
+#[derive(Debug, Clone)]
+pub struct TypeDef {
+    pub name: String,
+    pub base: String,
+    pub encode: Option<String>,
+    pub decode: Option<String>,
+    pub operators: Vec<TypeOperatorDef>,
+}
 
 /// Accumulators for schema loading - kept separate to avoid moving through state variants
 struct MakeFromBtreeAccumulators {
@@ -275,6 +294,9 @@ pub struct Schema {
     /// In MVCC mode, when a table is dropped, the btree pages are not freed until checkpoint.
     /// integrity_check needs to know about these pages to avoid false positives about "page never used".
     pub dropped_root_pages: HashSet<i64>,
+
+    /// Custom type registry, loaded from sqlite_turso_types
+    pub type_registry: HashMap<String, Arc<TypeDef>>,
 }
 
 impl Default for Schema {
@@ -320,7 +342,16 @@ impl Schema {
             table_to_materialized_views,
             incompatible_views,
             dropped_root_pages: HashSet::default(),
+            type_registry: HashMap::default(),
         }
+    }
+
+    pub fn get_type_def(&self, type_name: &str) -> Option<&Arc<TypeDef>> {
+        self.type_registry.get(&type_name.to_lowercase())
+    }
+
+    pub fn remove_type(&mut self, type_name: &str) {
+        self.type_registry.remove(&type_name.to_lowercase());
     }
 
     pub fn is_unique_idx_name(&self, name: &str) -> bool {
@@ -1218,6 +1249,41 @@ impl Schema {
                     tbl_name.name.as_str(),
                 )?;
             }
+            "type" => {
+                use turso_parser::ast::{Cmd, Stmt};
+                use turso_parser::parser::Parser;
+
+                let sql = maybe_sql.expect("sql should be present for type");
+                let mut parser = Parser::new(sql.as_bytes());
+                let Ok(Some(Cmd::Stmt(Stmt::CreateType {
+                    if_not_exists: _,
+                    type_name,
+                    body,
+                }))) = parser.next_cmd()
+                else {
+                    return Err(crate::LimboError::ParseError(format!(
+                        "invalid type sql: {sql}"
+                    )));
+                };
+
+                let type_def = TypeDef {
+                    name: type_name.clone(),
+                    base: body.base.clone(),
+                    encode: body.encode.clone(),
+                    decode: body.decode.clone(),
+                    operators: body
+                        .operators
+                        .iter()
+                        .map(|op| TypeOperatorDef {
+                            op: op.op.clone(),
+                            right_type: op.right_type.clone(),
+                            func_name: op.func_name.clone(),
+                        })
+                        .collect(),
+                };
+                self.type_registry
+                    .insert(type_name.to_lowercase(), Arc::new(type_def));
+            }
             _ => {}
         };
 
@@ -1595,6 +1661,7 @@ impl Clone for Schema {
             table_to_materialized_views: self.table_to_materialized_views.clone(),
             incompatible_views,
             dropped_root_pages: self.dropped_root_pages.clone(),
+            type_registry: self.type_registry.clone(),
         }
     }
 }

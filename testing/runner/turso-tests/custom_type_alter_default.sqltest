@@ -1,0 +1,72 @@
+@database :memory:
+
+@requires strict "uses STRICT tables"
+@requires custom_types "uses custom types"
+test alter-add-notnull-with-type-default {
+    -- Type has DEFAULT 50, column has no explicit DEFAULT.
+    -- ALTER TABLE ADD COLUMN NOT NULL should use the type-level default.
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100 DEFAULT 50;
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, name TEXT) STRICT;
+    INSERT INTO t1 VALUES (1, 'Alice'), (2, 'Bob');
+    ALTER TABLE t1 ADD COLUMN amount cents NOT NULL;
+    SELECT * FROM t1 ORDER BY id;
+}
+expect {
+    1|Alice|50
+    2|Bob|50
+}
+
+@requires strict "uses STRICT tables"
+@requires custom_types "uses custom types"
+test alter-add-notnull-explicit-default-takes-precedence {
+    -- Column-level DEFAULT should override type-level DEFAULT.
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100 DEFAULT 50;
+    CREATE TABLE t2(id INTEGER PRIMARY KEY, name TEXT) STRICT;
+    INSERT INTO t2 VALUES (1, 'Alice');
+    ALTER TABLE t2 ADD COLUMN amount cents NOT NULL DEFAULT 99;
+    SELECT * FROM t2;
+}
+expect {
+    1|Alice|99
+}
+
+@requires strict "uses STRICT tables"
+@requires custom_types "uses custom types"
+test alter-add-nullable-with-type-default {
+    -- Nullable column with type default: existing rows get the type default.
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100 DEFAULT 50;
+    CREATE TABLE t3(id INTEGER PRIMARY KEY, name TEXT) STRICT;
+    INSERT INTO t3 VALUES (1, 'Alice');
+    ALTER TABLE t3 ADD COLUMN amount cents;
+    SELECT * FROM t3;
+}
+expect {
+    1|Alice|50
+}
+
+@requires strict "uses STRICT tables"
+@requires custom_types "uses custom types"
+test alter-add-notnull-no-default-rejects {
+    -- No column or type default: should reject on non-empty table.
+    CREATE TYPE simple BASE integer ENCODE value DECODE value;
+    CREATE TABLE t4(id INTEGER PRIMARY KEY, name TEXT) STRICT;
+    INSERT INTO t4 VALUES (1, 'Alice');
+    ALTER TABLE t4 ADD COLUMN val simple NOT NULL;
+}
+expect error {
+    Cannot add a NOT NULL column with default value NULL
+}
+
+@requires strict "uses STRICT tables"
+@requires custom_types "uses custom types"
+test alter-add-notnull-type-default-empty-table {
+    -- Empty table: should always succeed regardless of defaults.
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100 DEFAULT 50;
+    CREATE TABLE t5(id INTEGER PRIMARY KEY, name TEXT) STRICT;
+    ALTER TABLE t5 ADD COLUMN amount cents NOT NULL;
+    INSERT INTO t5 VALUES (1, 'Alice', 75);
+    SELECT * FROM t5;
+}
+expect {
+    1|Alice|75
+}

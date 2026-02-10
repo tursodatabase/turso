@@ -1676,25 +1676,8 @@ pub fn op_type_check(
             let ty_bytes = ty_str.as_bytes();
             match_ignore_ascii_case!(match ty_bytes {
                 b"ANY" => {}
-                _ => {
-                    let col_affinity = col.affinity();
-                    let _applied = apply_affinity_char(reg, col_affinity);
-                    let value_type = reg.get_value().value_type();
-                    match_ignore_ascii_case!(match ty_bytes {
-                        b"INTEGER" | b"INT" if value_type == ValueType::Integer => {}
-                        b"REAL" if value_type == ValueType::Float => {}
-                        b"BLOB" if value_type == ValueType::Blob => {}
-                        b"TEXT" if value_type == ValueType::Text => {}
-                        _ => bail_constraint_error!(
-                            "cannot store {} value in {} column {}.{} ({})",
-                            value_type,
-                            ty_str,
-                            &table_reference.name,
-                            col.name.as_deref().unwrap_or(""),
-                            SQLITE_CONSTRAINT
-                        ),
-                    });
-                }
+                // Custom types: skip type check here, encode function will validate
+                _ => {}
             });
             Ok(())
         })?;
@@ -5956,6 +5939,122 @@ pub fn op_function(
                 state.registers[*dest] =
                     Register::Value(Value::from_i64(if auto_commit { 1 } else { 0 }));
             }
+            ScalarFunc::TestUintEncode => {
+                assert!(arg_count == 1);
+                let val = &state.registers[*start_reg];
+                let result = match val.get_value() {
+                    Value::Null => Value::Null,
+                    Value::Integer(i) => {
+                        if *i < 0 {
+                            return Err(LimboError::InternalError(
+                                "test_uint_encode: negative value".to_string(),
+                            ));
+                        }
+                        Value::build_text(i.to_string())
+                    }
+                    Value::Float(f) => {
+                        if *f < 0.0 || f.fract() != 0.0 {
+                            return Err(LimboError::InternalError(
+                                "test_uint_encode: not a non-negative integer".to_string(),
+                            ));
+                        }
+                        Value::build_text((*f as u64).to_string())
+                    }
+                    Value::Text(t) => {
+                        let s = t.to_string();
+                        s.parse::<u64>().map_err(|_| {
+                            LimboError::InternalError(format!(
+                                "test_uint_encode: invalid uint: {s}"
+                            ))
+                        })?;
+                        Value::build_text(s)
+                    }
+                    _ => {
+                        return Err(LimboError::InternalError(
+                            "test_uint_encode: unsupported type".to_string(),
+                        ));
+                    }
+                };
+                state.registers[*dest] = Register::Value(result);
+            }
+            ScalarFunc::TestUintDecode => {
+                assert!(arg_count == 1);
+                let val = &state.registers[*start_reg];
+                let result = match val.get_value() {
+                    Value::Null => Value::Null,
+                    other => other.clone(),
+                };
+                state.registers[*dest] = Register::Value(result);
+            }
+            ScalarFunc::TestUintAdd
+            | ScalarFunc::TestUintSub
+            | ScalarFunc::TestUintMul
+            | ScalarFunc::TestUintDiv => {
+                assert!(arg_count == 2);
+                let a = parse_test_uint(&state.registers[*start_reg])?;
+                let b = parse_test_uint(&state.registers[*start_reg + 1])?;
+                let result = match (a, b) {
+                    (Some(a), Some(b)) => {
+                        let r = match scalar_func {
+                            ScalarFunc::TestUintAdd => a.checked_add(b),
+                            ScalarFunc::TestUintSub => a.checked_sub(b),
+                            ScalarFunc::TestUintMul => a.checked_mul(b),
+                            ScalarFunc::TestUintDiv => {
+                                if b == 0 {
+                                    None
+                                } else {
+                                    Some(a / b)
+                                }
+                            }
+                            _ => unreachable!(),
+                        };
+                        match r {
+                            Some(v) => Value::build_text(v.to_string()),
+                            None => {
+                                return Err(LimboError::InternalError(
+                                    "test_uint arithmetic overflow/underflow".to_string(),
+                                ));
+                            }
+                        }
+                    }
+                    _ => Value::Null,
+                };
+                state.registers[*dest] = Register::Value(result);
+            }
+            ScalarFunc::TestUintLt | ScalarFunc::TestUintEq => {
+                assert!(arg_count == 2);
+                let a = parse_test_uint(&state.registers[*start_reg])?;
+                let b = parse_test_uint(&state.registers[*start_reg + 1])?;
+                let result = match (a, b) {
+                    (Some(a), Some(b)) => {
+                        let cmp = match scalar_func {
+                            ScalarFunc::TestUintLt => a < b,
+                            ScalarFunc::TestUintEq => a == b,
+                            _ => unreachable!(),
+                        };
+                        Value::Integer(if cmp { 1 } else { 0 })
+                    }
+                    _ => Value::Null,
+                };
+                state.registers[*dest] = Register::Value(result);
+            }
+            ScalarFunc::TestReverseEncode | ScalarFunc::TestReverseDecode => {
+                assert!(arg_count == 1);
+                let val = &state.registers[*start_reg];
+                let result = match val.get_value() {
+                    Value::Null => Value::Null,
+                    Value::Text(t) => {
+                        let reversed: String = t.to_string().chars().rev().collect();
+                        Value::build_text(reversed)
+                    }
+                    other => {
+                        let s = other.to_string();
+                        let reversed: String = s.chars().rev().collect();
+                        Value::build_text(reversed)
+                    }
+                };
+                state.registers[*dest] = Register::Value(result);
+            }
         },
         crate::function::Func::Vector(vector_func) => {
             let args = &state.registers[*start_reg..*start_reg + arg_count];
@@ -8510,6 +8609,25 @@ pub fn op_drop_view(
     conn.with_database_schema_mut(*db, |schema| {
         schema.remove_view(view_name).ok();
     });
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+pub fn op_drop_type(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(DropType { db, type_name }, insn);
+    if *db > 0 {
+        todo!("temp databases not implemented yet");
+    }
+    let conn = program.connection.clone();
+    conn.with_schema_mut(|schema| {
+        schema.remove_type(type_name);
+        Ok::<(), crate::LimboError>(())
+    })?;
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -11077,6 +11195,31 @@ fn try_float_to_integer_affinity(value: &mut Value, fl: f64) -> bool {
     // but return false to indicate the conversion wasn't "complete"
     *value = Value::from_f64(fl);
     false
+}
+
+fn parse_test_uint(reg: &Register) -> Result<Option<u64>> {
+    match reg.get_value() {
+        Value::Null => Ok(None),
+        Value::Integer(i) => {
+            if *i < 0 {
+                Err(LimboError::InternalError(
+                    "test_uint: negative value".to_string(),
+                ))
+            } else {
+                Ok(Some(*i as u64))
+            }
+        }
+        Value::Text(t) => {
+            let s = t.to_string();
+            let v = s.parse::<u64>().map_err(|_| {
+                LimboError::InternalError(format!("test_uint: invalid uint: {s}"))
+            })?;
+            Ok(Some(v))
+        }
+        _ => Err(LimboError::InternalError(
+            "test_uint: unsupported type".to_string(),
+        )),
+    }
 }
 
 // Compat for applications that test for SQLite.

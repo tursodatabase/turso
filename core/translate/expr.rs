@@ -608,17 +608,52 @@ pub fn translate_condition_expr(
             }
         }
         ast::Expr::Binary(e1, op, e2) => {
-            let result_reg = program.alloc_register();
-            binary_expr_shared(
-                program,
-                Some(referenced_tables),
-                e1,
-                e2,
-                op,
-                result_reg,
-                resolver,
-                BinaryEmitMode::Condition(condition_metadata),
-            )?;
+            // Check if either operand has a custom type with a matching operator
+            if let Some(func_name) =
+                find_custom_type_operator(e1, e2, op, Some(referenced_tables), resolver)
+            {
+                let func = resolver.resolve_function(&func_name, 2).ok_or_else(|| {
+                    crate::LimboError::InternalError(format!("function not found: {func_name}"))
+                })?;
+                let arg_reg = program.alloc_registers(2);
+                translate_expr(
+                    program,
+                    Some(referenced_tables),
+                    e1,
+                    arg_reg,
+                    resolver,
+                )?;
+                translate_expr(
+                    program,
+                    Some(referenced_tables),
+                    e2,
+                    arg_reg + 1,
+                    resolver,
+                )?;
+                let result_reg = program.alloc_register();
+                program.emit_insn(Insn::Function {
+                    constant_mask: 0,
+                    start_reg: arg_reg,
+                    dest: result_reg,
+                    func: crate::function::FuncCtx {
+                        func,
+                        arg_count: 2,
+                    },
+                });
+                emit_cond_jump(program, condition_metadata, result_reg);
+            } else {
+                let result_reg = program.alloc_register();
+                binary_expr_shared(
+                    program,
+                    Some(referenced_tables),
+                    e1,
+                    e2,
+                    op,
+                    result_reg,
+                    resolver,
+                    BinaryEmitMode::Condition(condition_metadata),
+                )?;
+            }
         }
         ast::Expr::Literal(_)
         | ast::Expr::Cast { .. }
@@ -1072,6 +1107,28 @@ pub fn translate_expr(
                 return Ok(target_register);
             }
 
+            // Check if either operand has a custom type with a matching operator
+            if let Some(func_name) =
+                find_custom_type_operator(e1, e2, op, referenced_tables, resolver)
+            {
+                let func = resolver.resolve_function(&func_name, 2).ok_or_else(|| {
+                    crate::LimboError::InternalError(format!("function not found: {func_name}"))
+                })?;
+                let arg_reg = program.alloc_registers(2);
+                translate_expr(program, referenced_tables, e1, arg_reg, resolver)?;
+                translate_expr(program, referenced_tables, e2, arg_reg + 1, resolver)?;
+                program.emit_insn(Insn::Function {
+                    constant_mask: 0,
+                    start_reg: arg_reg,
+                    dest: target_register,
+                    func: crate::function::FuncCtx {
+                        func,
+                        arg_count: 2,
+                    },
+                });
+                return Ok(target_register);
+            }
+
             binary_expr_shared(
                 program,
                 referenced_tables,
@@ -1179,6 +1236,36 @@ pub fn translate_expr(
         }
         ast::Expr::Cast { expr, type_name } => {
             translate_expr(program, referenced_tables, expr, target_register, resolver)?;
+
+            // Check if casting to a custom type
+            if let Some(ref tn) = type_name {
+                if let Some(type_def) = resolver.schema.get_type_def(&tn.name) {
+                    if let Some(ref encode_fn) = type_def.encode {
+                        let func = resolver.resolve_function(encode_fn, 1).ok_or_else(|| {
+                            crate::LimboError::InternalError(format!(
+                                "encode function not found: {encode_fn}"
+                            ))
+                        })?;
+                        let arg_reg = program.alloc_register();
+                        program.emit_insn(Insn::Copy {
+                            src_reg: target_register,
+                            dst_reg: arg_reg,
+                            extra_amount: 0,
+                        });
+                        program.emit_insn(Insn::Function {
+                            constant_mask: 0,
+                            start_reg: arg_reg,
+                            dest: target_register,
+                            func: crate::function::FuncCtx {
+                                func,
+                                arg_count: 1,
+                            },
+                        });
+                    }
+                    return Ok(target_register);
+                }
+            }
+
             // SQLite allows CAST(x AS) without a type name, treating it as NUMERIC affinity
             let type_affinity = type_name
                 .as_ref()
@@ -2312,6 +2399,23 @@ pub fn translate_expr(
                         ScalarFunc::ConnTxnId | ScalarFunc::IsAutocommit => {
                             crate::bail_parse_error!("{} is an internal function used by CDC", srf);
                         }
+                        ScalarFunc::TestUintEncode
+                        | ScalarFunc::TestUintDecode
+                        | ScalarFunc::TestUintAdd
+                        | ScalarFunc::TestUintSub
+                        | ScalarFunc::TestUintMul
+                        | ScalarFunc::TestUintDiv
+                        | ScalarFunc::TestUintLt
+                        | ScalarFunc::TestUintEq
+                        | ScalarFunc::TestReverseEncode
+                        | ScalarFunc::TestReverseDecode => translate_function(
+                            program,
+                            args,
+                            referenced_tables,
+                            resolver,
+                            target_register,
+                            func_ctx,
+                        ),
                     }
                 }
                 Func::Math(math_func) => match math_func.arity() {
@@ -2712,6 +2816,39 @@ pub fn translate_expr(
                             crate::bail_parse_error!("column index out of bounds");
                         };
                         maybe_apply_affinity(column.ty(), target_register, program);
+
+                        // Decode custom type columns
+                        if let Some(type_def) = resolver.schema.get_type_def(&column.ty_str) {
+                            if let Some(ref decode_fn) = type_def.decode {
+                                let func =
+                                    resolver.resolve_function(decode_fn, 1).ok_or_else(|| {
+                                        crate::LimboError::InternalError(format!(
+                                            "decode function not found: {decode_fn}"
+                                        ))
+                                    })?;
+                                let arg_reg = program.alloc_register();
+                                let skip_label = program.allocate_label();
+                                program.emit_insn(Insn::IsNull {
+                                    reg: target_register,
+                                    target_pc: skip_label,
+                                });
+                                program.emit_insn(Insn::Copy {
+                                    src_reg: target_register,
+                                    dst_reg: arg_reg,
+                                    extra_amount: 0,
+                                });
+                                program.emit_insn(Insn::Function {
+                                    constant_mask: 0,
+                                    start_reg: arg_reg,
+                                    dest: target_register,
+                                    func: crate::function::FuncCtx {
+                                        func,
+                                        arg_count: 1,
+                                    },
+                                });
+                                program.resolve_label(skip_label, program.offset());
+                            }
+                        }
                     }
                     Ok(target_register)
                 }
@@ -5878,4 +6015,83 @@ pub fn expr_vector_size(expr: &Expr) -> Result<usize> {
             SubqueryType::RowValue { num_regs, .. } => *num_regs,
         },
     })
+}
+
+/// Map an AST operator to the string representation used in custom type operator definitions.
+fn operator_to_str(op: &ast::Operator) -> Option<&'static str> {
+    match op {
+        ast::Operator::Add => Some("+"),
+        ast::Operator::Subtract => Some("-"),
+        ast::Operator::Multiply => Some("*"),
+        ast::Operator::Divide => Some("/"),
+        ast::Operator::Modulus => Some("%"),
+        ast::Operator::Less => Some("<"),
+        ast::Operator::LessEquals => Some("<="),
+        ast::Operator::Greater => Some(">"),
+        ast::Operator::GreaterEquals => Some(">="),
+        ast::Operator::Equals => Some("="),
+        ast::Operator::NotEquals => Some("!="),
+        _ => None,
+    }
+}
+
+/// Get the custom type name of an expression, if it's a column with a custom type.
+fn expr_custom_type_name<'a>(
+    expr: &ast::Expr,
+    referenced_tables: Option<&'a TableReferences>,
+    resolver: &'a Resolver,
+) -> Option<String> {
+    if let ast::Expr::Column {
+        table: table_ref_id,
+        column,
+        ..
+    } = expr
+    {
+        let tables = referenced_tables?;
+        let (_, table) = tables.find_table_by_internal_id(*table_ref_id)?;
+        let col = table.get_column_at(*column)?;
+        let type_name = &col.ty_str;
+        if resolver.schema.get_type_def(type_name).is_some() {
+            return Some(type_name.to_lowercase());
+        }
+    }
+    None
+}
+
+/// Find a custom type operator function for a binary expression.
+/// Returns the function name if either operand has a custom type with a matching operator.
+fn find_custom_type_operator(
+    e1: &ast::Expr,
+    e2: &ast::Expr,
+    op: &ast::Operator,
+    referenced_tables: Option<&TableReferences>,
+    resolver: &Resolver,
+) -> Option<String> {
+    let op_str = operator_to_str(op)?;
+    let lhs_type = expr_custom_type_name(e1, referenced_tables, resolver);
+    let rhs_type = expr_custom_type_name(e2, referenced_tables, resolver);
+
+    // Try to find operator on lhs type first
+    if let Some(ref lhs_ty) = lhs_type {
+        let type_def = resolver.schema.get_type_def(lhs_ty)?;
+        let rhs_ty = rhs_type.as_deref().unwrap_or(lhs_ty);
+        for op_def in &type_def.operators {
+            if op_def.op == op_str && op_def.right_type.to_lowercase() == rhs_ty.to_lowercase() {
+                return Some(op_def.func_name.clone());
+            }
+        }
+    }
+
+    // Try rhs type
+    if let Some(ref rhs_ty) = rhs_type {
+        let type_def = resolver.schema.get_type_def(rhs_ty)?;
+        let lhs_ty = lhs_type.as_deref().unwrap_or(rhs_ty);
+        for op_def in &type_def.operators {
+            if op_def.op == op_str && op_def.right_type.to_lowercase() == lhs_ty.to_lowercase() {
+                return Some(op_def.func_name.clone());
+            }
+        }
+    }
+
+    None
 }

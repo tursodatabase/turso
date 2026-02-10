@@ -1,0 +1,100 @@
+@database :memory:
+
+@requires strict "uses STRICT tables"
+@requires custom_types "uses custom types"
+test notnull-decode-rejects-ghost-null {
+    -- ENCODE is identity, but DECODE maps 42 → NULL.
+    -- A NOT NULL column must reject inserts that would decode to NULL.
+    CREATE TYPE tricky BASE integer
+        ENCODE value
+        DECODE CASE WHEN value = 42 THEN NULL ELSE value END;
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val tricky NOT NULL) STRICT;
+    INSERT INTO t1 VALUES (1, 10);
+}
+expect {
+}
+
+@requires strict "uses STRICT tables"
+@requires custom_types "uses custom types"
+test notnull-decode-ghost-null-rejected {
+    CREATE TYPE tricky BASE integer
+        ENCODE value
+        DECODE CASE WHEN value = 42 THEN NULL ELSE value END;
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val tricky NOT NULL) STRICT;
+    INSERT INTO t1 VALUES (1, 42);
+}
+expect error {
+    NOT NULL constraint failed: t1.val
+}
+
+@requires strict "uses STRICT tables"
+@requires custom_types "uses custom types"
+test notnull-decode-normal-values-ok {
+    -- Non-NULL decoded values should pass.
+    CREATE TYPE tricky BASE integer
+        ENCODE value
+        DECODE CASE WHEN value = 42 THEN NULL ELSE value END;
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val tricky NOT NULL) STRICT;
+    INSERT INTO t1 VALUES (1, 10);
+    INSERT INTO t1 VALUES (2, 99);
+    SELECT id, val FROM t1 ORDER BY id;
+}
+expect {
+    1|10
+    2|99
+}
+
+@requires strict "uses STRICT tables"
+@requires custom_types "uses custom types"
+test notnull-decode-actual-null-still-rejected {
+    -- Actual NULL input should still be rejected by NOT NULL.
+    CREATE TYPE tricky BASE integer
+        ENCODE value
+        DECODE CASE WHEN value = 42 THEN NULL ELSE value END;
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val tricky NOT NULL) STRICT;
+    INSERT INTO t1 VALUES (1, NULL);
+}
+expect error {
+    NOT NULL constraint failed: t1.val
+}
+
+@requires strict "uses STRICT tables"
+@requires custom_types "uses custom types"
+test notnull-decode-positive-only {
+    -- Practical example: type that decodes non-positive values to NULL.
+    CREATE TYPE positive_only BASE integer
+        ENCODE value
+        DECODE CASE WHEN value > 0 THEN value ELSE NULL END;
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val positive_only NOT NULL) STRICT;
+    INSERT INTO t1 VALUES (1, 5);
+    SELECT id, val FROM t1;
+}
+expect {
+    1|5
+}
+
+@requires strict "uses STRICT tables"
+@requires custom_types "uses custom types"
+test notnull-decode-positive-only-zero-rejected {
+    CREATE TYPE positive_only BASE integer
+        ENCODE value
+        DECODE CASE WHEN value > 0 THEN value ELSE NULL END;
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val positive_only NOT NULL) STRICT;
+    INSERT INTO t1 VALUES (1, 0);
+}
+expect error {
+    NOT NULL constraint failed: t1.val
+}
+
+@requires strict "uses STRICT tables"
+@requires custom_types "uses custom types"
+test notnull-decode-positive-only-negative-rejected {
+    CREATE TYPE positive_only BASE integer
+        ENCODE value
+        DECODE CASE WHEN value > 0 THEN value ELSE NULL END;
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val positive_only NOT NULL) STRICT;
+    INSERT INTO t1 VALUES (1, -5);
+}
+expect error {
+    NOT NULL constraint failed: t1.val
+}

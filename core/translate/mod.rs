@@ -144,9 +144,11 @@ pub fn translate_inner(
             | ast::Stmt::CreateView { .. }
             | ast::Stmt::CreateMaterializedView { .. }
             | ast::Stmt::CreateVirtualTable(..)
+            | ast::Stmt::CreateType { .. }
             | ast::Stmt::Delete { .. }
             | ast::Stmt::DropIndex { .. }
             | ast::Stmt::DropTable { .. }
+            | ast::Stmt::DropType { .. }
             | ast::Stmt::DropView { .. }
             | ast::Stmt::Reindex { .. }
             | ast::Stmt::Optimize { .. }
@@ -297,6 +299,21 @@ pub fn translate_inner(
             if_exists,
             view_name,
         } => view::translate_drop_view(resolver, &view_name, if_exists, program)?,
+        ast::Stmt::CreateType {
+            if_not_exists,
+            type_name,
+            body,
+        } => schema::translate_create_type(
+            &type_name,
+            &body,
+            if_not_exists,
+            resolver,
+            program,
+        )?,
+        ast::Stmt::DropType {
+            if_exists,
+            type_name,
+        } => schema::translate_drop_type(&type_name, if_exists, resolver, program)?,
         ast::Stmt::Pragma { .. } => {
             bail_parse_error!("PRAGMA statement cannot be evaluated in a nested context")
         }

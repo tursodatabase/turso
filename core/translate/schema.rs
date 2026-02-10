@@ -168,6 +168,29 @@ fn validate(
                 validate_check_expr(expr, table_name, &column_names, resolver)?;
             }
         }
+
+        // Validate strict column types (moved from parser so we can check the type registry)
+        if options.contains_strict() {
+            for c in columns {
+                if let Some(ref col_type) = c.col_type {
+                    let name_bytes = col_type.name.as_bytes();
+                    let is_builtin = turso_macros::match_ignore_ascii_case!(match name_bytes {
+                        b"INT" | b"INTEGER" | b"REAL" | b"TEXT" | b"BLOB" | b"ANY" => true,
+                        _ => false,
+                    });
+                    if !is_builtin
+                        && resolver.schema.get_type_def(&col_type.name).is_none()
+                    {
+                        bail_parse_error!(
+                            "unknown datatype for {}.{}: \"{}\"",
+                            table_name,
+                            c.col_name,
+                            col_type.name
+                        );
+                    }
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -430,6 +453,7 @@ pub enum SchemaEntryType {
     Index,
     View,
     Trigger,
+    Type,
 }
 
 impl SchemaEntryType {
@@ -439,6 +463,7 @@ impl SchemaEntryType {
             SchemaEntryType::Index => "index",
             SchemaEntryType::View => "view",
             SchemaEntryType::Trigger => "trigger",
+            SchemaEntryType::Type => "type",
         }
     }
 }
@@ -1244,4 +1269,179 @@ pub fn translate_drop_table(
     });
 
     Ok(())
+}
+
+pub fn translate_create_type(
+    type_name: &str,
+    body: &ast::CreateTypeBody,
+    if_not_exists: bool,
+    resolver: &Resolver,
+    mut program: ProgramBuilder,
+) -> Result<ProgramBuilder> {
+    let normalized_name = normalize_ident(type_name);
+
+    // Check if type already exists
+    if resolver.schema.get_type_def(&normalized_name).is_some() {
+        if if_not_exists {
+            return Ok(program);
+        }
+        bail_parse_error!("type {normalized_name} already exists");
+    }
+
+    // Reconstruct the SQL string (without IF NOT EXISTS)
+    let mut sql = format!("CREATE TYPE {} BASE {}", normalized_name, body.base);
+    if let Some(ref encode) = body.encode {
+        sql.push_str(&format!(" ENCODE {encode}"));
+    }
+    if let Some(ref decode) = body.decode {
+        sql.push_str(&format!(" DECODE {decode}"));
+    }
+    for op in &body.operators {
+        sql.push_str(&format!(
+            " OPERATOR '{}' ({}) -> {}",
+            op.op, op.right_type, op.func_name
+        ));
+    }
+
+    // Open cursor to sqlite_schema table
+    let table = resolver.schema.get_btree_table(SQLITE_TABLEID).unwrap();
+    let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table));
+    program.emit_insn(Insn::OpenWrite {
+        cursor_id: sqlite_schema_cursor_id,
+        root_page: 1i64.into(),
+        db: 0,
+    });
+
+    // Add the type entry to sqlite_schema (rootpage=0, no btree)
+    emit_schema_entry(
+        &mut program,
+        resolver,
+        sqlite_schema_cursor_id,
+        None,
+        SchemaEntryType::Type,
+        &normalized_name,
+        &normalized_name,
+        0,
+        Some(sql),
+    )?;
+
+    // Parse schema to load the new type into the in-memory registry
+    program.emit_insn(Insn::ParseSchema {
+        db: sqlite_schema_cursor_id,
+        where_clause: Some(format!("type = 'type' AND name = '{normalized_name}'")),
+    });
+
+    program.emit_insn(Insn::SetCookie {
+        db: 0,
+        cookie: Cookie::SchemaVersion,
+        value: (resolver.schema.schema_version + 1) as i32,
+        p5: 0,
+    });
+
+    Ok(program)
+}
+
+pub fn translate_drop_type(
+    type_name: &str,
+    if_exists: bool,
+    resolver: &Resolver,
+    mut program: ProgramBuilder,
+) -> Result<ProgramBuilder> {
+    let normalized_name = normalize_ident(type_name);
+
+    // Check if type exists
+    if resolver.schema.get_type_def(&normalized_name).is_none() {
+        if if_exists {
+            return Ok(program);
+        }
+        bail_parse_error!("no such type: {normalized_name}");
+    }
+
+    // Open cursor to sqlite_schema table
+    let schema_table = resolver.schema.get_btree_table(SQLITE_TABLEID).unwrap();
+    let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(schema_table));
+    program.emit_insn(Insn::OpenWrite {
+        cursor_id: sqlite_schema_cursor_id,
+        root_page: 1i64.into(),
+        db: 0,
+    });
+
+    // Search for matching row: type='type' AND name=type_name
+    let type_reg = program.alloc_register();
+    let name_reg = program.alloc_register();
+
+    program.emit_insn(Insn::String8 {
+        dest: type_reg,
+        value: "type".to_string(),
+    });
+    program.emit_insn(Insn::String8 {
+        dest: name_reg,
+        value: normalized_name.clone(),
+    });
+
+    let end_loop_label = program.allocate_label();
+    let loop_start_label = program.allocate_label();
+
+    program.emit_insn(Insn::Rewind {
+        cursor_id: sqlite_schema_cursor_id,
+        pc_if_empty: end_loop_label,
+    });
+    program.preassign_label_to_next_insn(loop_start_label);
+
+    // Read type (col 0) and name (col 1)
+    let col0_reg = program.alloc_register();
+    let col1_reg = program.alloc_register();
+
+    program.emit_column_or_rowid(sqlite_schema_cursor_id, 0, col0_reg);
+    program.emit_column_or_rowid(sqlite_schema_cursor_id, 1, col1_reg);
+
+    let skip_delete_label = program.allocate_label();
+
+    // Check type='type'
+    program.emit_insn(Insn::Ne {
+        lhs: col0_reg,
+        rhs: type_reg,
+        target_pc: skip_delete_label,
+        flags: CmpInsFlags::default(),
+        collation: program.curr_collation(),
+    });
+    // Check name=type_name
+    program.emit_insn(Insn::Ne {
+        lhs: col1_reg,
+        rhs: name_reg,
+        target_pc: skip_delete_label,
+        flags: CmpInsFlags::default(),
+        collation: program.curr_collation(),
+    });
+
+    // Delete matching row
+    program.emit_insn(Insn::Delete {
+        cursor_id: sqlite_schema_cursor_id,
+        table_name: "sqlite_schema".to_string(),
+        is_part_of_update: false,
+    });
+
+    program.resolve_label(skip_delete_label, program.offset());
+
+    program.emit_insn(Insn::Next {
+        cursor_id: sqlite_schema_cursor_id,
+        pc_if_next: loop_start_label,
+    });
+
+    program.preassign_label_to_next_insn(end_loop_label);
+
+    // Remove from in-memory schema
+    program.emit_insn(Insn::DropType {
+        db: 0,
+        type_name: normalized_name,
+    });
+
+    program.emit_insn(Insn::SetCookie {
+        db: 0,
+        cookie: Cookie::SchemaVersion,
+        value: (resolver.schema.schema_version + 1) as i32,
+        p5: 0,
+    });
+
+    Ok(program)
 }

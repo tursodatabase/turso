@@ -1,0 +1,185 @@
+@database :memory:
+
+# FK CASCADE operations with custom type columns.
+# Tests that ON UPDATE CASCADE, ON DELETE CASCADE, SET NULL, and SET DEFAULT
+# work correctly when FK columns use custom types.
+
+# ============================================================================
+# ON UPDATE CASCADE
+# ============================================================================
+
+@requires strict "uses STRICT tables"
+@requires custom_types "uses custom types"
+test cascade-update-basic {
+    PRAGMA foreign_keys = ON;
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE parent(id cents PRIMARY KEY) STRICT;
+    CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id cents
+        REFERENCES parent(id) ON UPDATE CASCADE) STRICT;
+
+    INSERT INTO parent VALUES (1);
+    INSERT INTO child VALUES (1, 1);
+
+    UPDATE parent SET id = 2 WHERE id = 1;
+    SELECT parent_id FROM child;
+}
+expect {
+    2
+}
+
+@requires strict "uses STRICT tables"
+@requires custom_types "uses custom types"
+test cascade-update-multiple-children {
+    PRAGMA foreign_keys = ON;
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE parent(id cents PRIMARY KEY) STRICT;
+    CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id cents
+        REFERENCES parent(id) ON UPDATE CASCADE) STRICT;
+
+    INSERT INTO parent VALUES (10);
+    INSERT INTO child VALUES (1, 10);
+    INSERT INTO child VALUES (2, 10);
+    INSERT INTO child VALUES (3, 10);
+
+    UPDATE parent SET id = 20 WHERE id = 10;
+    SELECT id, parent_id FROM child ORDER BY id;
+}
+expect {
+    1|20
+    2|20
+    3|20
+}
+
+# ============================================================================
+# ON DELETE CASCADE
+# ============================================================================
+
+@requires strict "uses STRICT tables"
+@requires custom_types "uses custom types"
+test cascade-delete-basic {
+    PRAGMA foreign_keys = ON;
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE parent(id cents PRIMARY KEY) STRICT;
+    CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id cents
+        REFERENCES parent(id) ON DELETE CASCADE) STRICT;
+
+    INSERT INTO parent VALUES (1);
+    INSERT INTO child VALUES (1, 1);
+
+    DELETE FROM parent WHERE id = 1;
+    SELECT COUNT(*) FROM child;
+}
+expect {
+    0
+}
+
+@requires strict "uses STRICT tables"
+@requires custom_types "uses custom types"
+test cascade-delete-multiple-children {
+    PRAGMA foreign_keys = ON;
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE parent(id cents PRIMARY KEY) STRICT;
+    CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id cents
+        REFERENCES parent(id) ON DELETE CASCADE) STRICT;
+
+    INSERT INTO parent VALUES (5);
+    INSERT INTO child VALUES (1, 5);
+    INSERT INTO child VALUES (2, 5);
+
+    DELETE FROM parent WHERE id = 5;
+    SELECT COUNT(*) FROM child;
+}
+expect {
+    0
+}
+
+# ============================================================================
+# ON DELETE SET NULL
+# ============================================================================
+
+@requires strict "uses STRICT tables"
+@requires custom_types "uses custom types"
+test set-null-delete {
+    PRAGMA foreign_keys = ON;
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE parent(id cents PRIMARY KEY) STRICT;
+    CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id cents
+        REFERENCES parent(id) ON DELETE SET NULL) STRICT;
+
+    INSERT INTO parent VALUES (1);
+    INSERT INTO child VALUES (1, 1);
+
+    DELETE FROM parent WHERE id = 1;
+    SELECT id, COALESCE(parent_id, 'NULL') FROM child;
+}
+expect {
+    1|NULL
+}
+
+# ============================================================================
+# Combined UPDATE CASCADE + DELETE CASCADE
+# ============================================================================
+
+@requires strict "uses STRICT tables"
+@requires custom_types "uses custom types"
+test cascade-update-then-delete {
+    PRAGMA foreign_keys = ON;
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE parent(id cents PRIMARY KEY) STRICT;
+    CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id cents
+        REFERENCES parent(id) ON UPDATE CASCADE ON DELETE CASCADE) STRICT;
+
+    INSERT INTO parent VALUES (1);
+    INSERT INTO child VALUES (1, 1);
+
+    -- Update cascades
+    UPDATE parent SET id = 2 WHERE id = 1;
+    SELECT parent_id FROM child;
+}
+expect {
+    2
+}
+
+@requires strict "uses STRICT tables"
+@requires custom_types "uses custom types"
+test cascade-update-then-delete-part2 {
+    PRAGMA foreign_keys = ON;
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE parent(id cents PRIMARY KEY) STRICT;
+    CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id cents
+        REFERENCES parent(id) ON UPDATE CASCADE ON DELETE CASCADE) STRICT;
+
+    INSERT INTO parent VALUES (1);
+    INSERT INTO child VALUES (1, 1);
+    UPDATE parent SET id = 2 WHERE id = 1;
+
+    -- Delete cascades
+    DELETE FROM parent WHERE id = 2;
+    SELECT COUNT(*) FROM child;
+}
+expect {
+    0
+}
+
+# ============================================================================
+# Non-integer custom type (text-based)
+# ============================================================================
+
+@requires strict "uses STRICT tables"
+@requires custom_types "uses custom types"
+test cascade-text-based-type {
+    PRAGMA foreign_keys = ON;
+    CREATE TYPE upper_text BASE text ENCODE upper(value) DECODE value;
+    CREATE TABLE parent(id upper_text PRIMARY KEY) STRICT;
+    CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id upper_text
+        REFERENCES parent(id) ON UPDATE CASCADE ON DELETE CASCADE) STRICT;
+
+    INSERT INTO parent VALUES ('hello');
+    INSERT INTO child VALUES (1, 'hello');
+
+    UPDATE parent SET id = 'world' WHERE id = 'hello';
+    SELECT parent_id FROM child;
+}
+expect {
+    WORLD
+}
