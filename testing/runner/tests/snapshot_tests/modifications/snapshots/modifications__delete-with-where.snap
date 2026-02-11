@@ -1,13 +1,16 @@
 ---
 source: modifications.sqltest
-expression: "DELETE FROM orders\n    WHERE total_price < 10.00\n    AND created_at < '2024-01-01';"
+expression: |-
+  DELETE FROM orders
+      WHERE total_price < 10.00
+      AND created_at < '2024-01-01';
 info:
   statement_type: DELETE
   tables:
-    - orders
+  - orders
   setup_blocks:
-    - schema
-  database: ":memory:"
+  - schema
+  database: ':memory:'
 ---
 QUERY PLAN
 
@@ -16,8 +19,8 @@ BYTECODE
 addr  opcode          p1  p2  p3  p4          p5  comment
    0  Init             0  20   0               0  Start at 20
    1  OpenWrite        0   5   0               0  root=5; iDb=0
-   2  OpenWrite        1  10   0               0  root=10; iDb=0
-   3  OpenWrite        2   9   0               0  root=9; iDb=0
+   2  OpenWrite        1  13   0               0  root=13; iDb=0
+   3  OpenWrite        2  12   0               0  root=12; iDb=0
    4  Rewind           0  19   0               0  Rewind table orders
    5    Column         0   4   2               0  r[2]=orders.total_price
    6    RealAffinity   2   0   0               0
@@ -34,7 +37,7 @@ addr  opcode          p1  p2  p3  p4          p5  comment
   17    Delete         0   0   0  orders       0
   18  Next             0   5   0               0
   19  Halt             0   0   0               0
-  20  Transaction      0   2   9               0  iDb=0 tx_mode=Write
+  20  Transaction      0   2  10               0  iDb=0 tx_mode=Write
   21  Real             0   3   0  10.0         0  r[3]=10
   22  String8          0   6   0  2024-01-01   0  r[6]='2024-01-01'
   23  Goto             0   1   0               0
