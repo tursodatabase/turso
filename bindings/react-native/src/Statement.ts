@@ -130,15 +130,14 @@ export class Statement {
       throw new Error('Statement has been finalized');
     }
 
-    // Bind parameters if provided
-    if (params.length > 0) {
-      this.bind(...params);
-    }
-
     if (this._execLock) {
       await this._execLock.acquire();
     }
     try {
+      // Bind parameters inside the lock to prevent concurrent bind/execute races
+      if (params.length > 0) {
+        this.bind(...params);
+      }
       return await this._runInner();
     } finally {
       this._statement.reset();
@@ -150,7 +149,7 @@ export class Statement {
 
   /**
    * Execute without acquiring the lock (caller already holds it).
-   * Used by Database.exec() which acquires the lock once for all statements.
+   * Used by Database.exec() and Transaction which acquire the lock once.
    */
   async rawRun(): Promise<RunResult> {
     if (this._finalized) {
@@ -241,15 +240,15 @@ export class Statement {
       throw new Error('Statement has been finalized');
     }
 
-    // Bind parameters if provided
-    if (params.length > 0) {
-      this.bind(...params);
-    }
-
     if (this._execLock) {
       await this._execLock.acquire();
     }
     try {
+      // Bind parameters inside the lock to prevent concurrent bind/execute races
+      if (params.length > 0) {
+        this.bind(...params);
+      }
+
       // Step once with async IO handling
       const status = await this.stepWithIo();
 
@@ -282,15 +281,15 @@ export class Statement {
       throw new Error('Statement has been finalized');
     }
 
-    // Bind parameters if provided
-    if (params.length > 0) {
-      this.bind(...params);
-    }
-
     if (this._execLock) {
       await this._execLock.acquire();
     }
     try {
+      // Bind parameters inside the lock to prevent concurrent bind/execute races
+      if (params.length > 0) {
+        this.bind(...params);
+      }
+
       const rows: Row[] = [];
 
       // Step through all rows with async IO handling
@@ -390,27 +389,36 @@ export class Statement {
       return;
     }
 
-    while (true) {
-      const status = this._statement.finalize();
+    if (this._execLock) {
+      await this._execLock.acquire();
+    }
+    try {
+      while (true) {
+        const status = this._statement.finalize();
 
-      if (status === TursoStatus.IO) {
-        // Statement needs IO (e.g., loading missing pages with partial sync)
-        this._statement.runIo();
+        if (status === TursoStatus.IO) {
+          // Statement needs IO (e.g., loading missing pages with partial sync)
+          this._statement.runIo();
 
-        // Drain sync engine IO queue
-        if (this._extraIo) {
-          await this._extraIo();
+          // Drain sync engine IO queue
+          if (this._extraIo) {
+            await this._extraIo();
+          }
+
+          continue;
         }
 
-        continue;
+        if (status !== TursoStatus.DONE) {
+          throw new Error(`Statement finalization failed with status: ${status}`);
+        }
+        break;
       }
-
-      if (status !== TursoStatus.DONE) {
-        throw new Error(`Statement finalization failed with status: ${status}`);
+      this._finalized = true;
+    } finally {
+      if (this._execLock) {
+        this._execLock.release();
       }
-      break;
     }
-    this._finalized = true;
   }
 
   /**
