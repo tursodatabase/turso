@@ -2320,8 +2320,13 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
         if primary_key_columns.len() != 1 {
             crate::bail_parse_error!("AUTOINCREMENT is only allowed on an INTEGER PRIMARY KEY");
         }
+
         let pk_col_name = &primary_key_columns[0].0;
-        let pk_col = cols.iter().find(|c| c.name.as_deref() == Some(pk_col_name));
+        let pk_col = cols.iter().find(|c| {
+            c.name
+                .as_deref()
+                .is_some_and(|n| n.eq_ignore_ascii_case(pk_col_name))
+        });
 
         if let Some(col) = pk_col {
             if col.ty() != Type::Integer {
