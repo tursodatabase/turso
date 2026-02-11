@@ -872,7 +872,7 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
                     }
                     turso_assert!(
                         false,
-                        "there is another index row insterted and not updated/deleted from before"
+                        "there is another row insterted and not updated/deleted from before"
                     );
                 }
                 None => {
