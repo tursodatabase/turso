@@ -256,3 +256,11 @@ expect {
     t|3
 }
 
+# https://github.com/tursodatabase/turso/issues/5097
+# Ensure AUTOINCREMENT validation still rejects non-INTEGER PK when the PK
+# column reference uses a mixed-case quoted string name.
+test autoinc-fail-on-non-integer-pk-mixed-case-string-name {
+    CREATE TABLE t("Id" TEXT, PRIMARY KEY('ID' AUTOINCREMENT));
+}
+expect error {
+}
