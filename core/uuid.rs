@@ -108,6 +108,9 @@ fn uuid7_ts(args: &[Value]) -> Value {
             let unix = uuid_to_unix(uuid.as_bytes());
             Value::from_integer(unix as i64)
         }
+        None => Value::error_with_message(
+            "wrong number of arguments to function uuid7_timestamp_ms()".into(),
+        ),
         _ => Value::null(),
     }
 }
@@ -115,7 +118,9 @@ fn uuid7_ts(args: &[Value]) -> Value {
 #[scalar(name = "uuid_str")]
 fn uuid_str(args: &[Value]) -> Value {
     let Some(blob) = args.first().and_then(|a| a.to_blob()) else {
-        return Value::null();
+        return Value::error_with_message(
+            "wrong number of arguments to function uuid_str()".into(),
+        );
     };
     let parsed = uuid::Uuid::from_slice(blob.as_slice())
         .ok()
@@ -129,7 +134,9 @@ fn uuid_str(args: &[Value]) -> Value {
 #[scalar(name = "uuid_blob")]
 fn uuid_blob(&self, args: &[Value]) -> Value {
     let Some(text) = args.first().and_then(|a| a.to_text()) else {
-        return Value::null();
+        return Value::error_with_message(
+            "wrong number of arguments to function uuid_blob()".into(),
+        );
     };
     match uuid::Uuid::parse_str(text) {
         Ok(uuid) => Value::from_blob(uuid.as_bytes().to_vec()),
