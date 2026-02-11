@@ -258,3 +258,13 @@ expect {
     ANY|||||
     test_uint|text|test_uint_encode (value)|test_uint_decode (value)|0|+(test_uint) -> test_uint_add
 }
+
+@requires strict "uses STRICT tables"
+test encode-null-rejects-primary-key {
+    CREATE TYPE my_uuid BASE text ENCODE uuid_blob(value) DECODE uuid_str(value);
+    CREATE TABLE t1(id my_uuid PRIMARY KEY, name TEXT) STRICT;
+    INSERT INTO t1 VALUES ('019509a2', 'bad');
+}
+expect error {
+    NOT NULL constraint failed
+}

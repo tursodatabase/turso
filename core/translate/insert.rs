@@ -538,15 +538,17 @@ pub fn translate_insert(
     program.preassign_label_to_next_insn(ctx.key_labels.key_ready_for_check);
 
     if ctx.table.is_strict {
+        // Encode values for columns with custom types before TypeCheck,
+        // so that constraints (NOT NULL, type correctness) are validated
+        // on the encoded result, not the pre-encode input.
+        emit_custom_type_encode(&mut program, resolver, &insertion)?;
+
         program.emit_insn(Insn::TypeCheck {
             start_reg: insertion.first_col_register(),
             count: insertion.col_mappings.len(),
             check_generated: true,
             table_reference: Arc::clone(ctx.table),
         });
-
-        // Encode values for columns with custom types
-        emit_custom_type_encode(&mut program, resolver, &insertion)?;
     } else {
         // For non-STRICT tables, apply column affinity to the values.
         // This must happen early so that both index records and the table record
