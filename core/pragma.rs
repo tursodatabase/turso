@@ -93,6 +93,10 @@ pub fn pragma_for(pragma: &PragmaName) -> Pragma {
             PragmaFlags::NoColumns1 | PragmaFlags::Result0,
             &["temp_store"],
         ),
+        IndexList => Pragma::new(
+            PragmaFlags::NeedSchema | PragmaFlags::Result1 | PragmaFlags::SchemaOpt,
+            &["seq", "name", "unique", "origin", "partial"],
+        ),
         TableList => Pragma::new(
             PragmaFlags::NeedSchema | PragmaFlags::Result0 | PragmaFlags::Result1,
             &["schema", "name", "type", "ncol", "wr", "strict"],

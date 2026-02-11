@@ -74,7 +74,8 @@ pub fn translate_pragma(
         None => query_pragma(pragma, resolver, None, pager, connection, program)?,
         Some(ast::PragmaBody::Equals(value) | ast::PragmaBody::Call(value)) => match pragma {
             // These pragmas take a parameter but are queries, not setters
-            PragmaName::TableList
+            PragmaName::IndexList
+            | PragmaName::TableList
             | PragmaName::TableInfo
             | PragmaName::TableXinfo
             | PragmaName::IntegrityCheck
@@ -373,6 +374,7 @@ fn update_pragma(
             Ok((program, TransactionMode::Write))
         }
         PragmaName::DatabaseList => unreachable!("database_list cannot be set"),
+        PragmaName::IndexList => unreachable!("index_list cannot be set"),
         PragmaName::TableList => unreachable!("table_list cannot be set"),
         PragmaName::QueryOnly => query_pragma(
             PragmaName::QueryOnly,
@@ -637,6 +639,62 @@ fn query_pragma(
             program.emit_result_row(register, 1);
             program.add_pragma_result_column(pragma.to_string());
             Ok((program, TransactionMode::Read))
+        }
+        PragmaName::IndexList => {
+            let table_name = match value {
+                Some(ast::Expr::Name(name)) => Some(normalize_ident(name.as_str())),
+                _ => None,
+            };
+
+            let base_reg = register;
+            // 5 columns: seq, name, unique, origin, partial
+            program.alloc_registers(4);
+
+            if let Some(table_name) = table_name {
+                if let Some(table) = schema.get_table(&table_name) {
+                    let pk_cols: Vec<String> = table
+                        .btree()
+                        .map(|bt| {
+                            bt.primary_key_columns
+                                .iter()
+                                .map(|(name, _)| name.clone())
+                                .collect()
+                        })
+                        .unwrap_or_default();
+
+                    for (seq, index) in schema.get_indices(&table_name).enumerate() {
+                        let origin = if index.name.starts_with("sqlite_autoindex_") {
+                            let idx_cols: Vec<&str> =
+                                index.columns.iter().map(|c| c.name.as_str()).collect();
+                            if idx_cols.len() == pk_cols.len()
+                                && idx_cols
+                                    .iter()
+                                    .zip(pk_cols.iter())
+                                    .all(|(a, b)| a.eq_ignore_ascii_case(b))
+                            {
+                                "pk"
+                            } else {
+                                "u"
+                            }
+                        } else {
+                            "c"
+                        };
+
+                        program.emit_int(seq as i64, base_reg);
+                        program.emit_string8(index.name.clone(), base_reg + 1);
+                        program.emit_int(index.unique as i64, base_reg + 2);
+                        program.emit_string8(origin.to_string(), base_reg + 3);
+                        program.emit_int(index.where_clause.is_some() as i64, base_reg + 4);
+                        program.emit_result_row(base_reg, 5);
+                    }
+                }
+            }
+
+            let pragma_meta = pragma_for(&pragma);
+            for col_name in pragma_meta.columns.iter() {
+                program.add_pragma_result_column(col_name.to_string());
+            }
+            Ok((program, TransactionMode::None))
         }
         PragmaName::TableList => {
             let name = match value {

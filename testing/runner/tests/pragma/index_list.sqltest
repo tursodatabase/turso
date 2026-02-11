@@ -1,0 +1,88 @@
+@database :memory:
+
+test pragma-index-list-single-index {
+    CREATE TABLE t1(a, b, c);
+    CREATE INDEX idx1 ON t1(a);
+    PRAGMA index_list('t1');
+}
+expect {
+    0|idx1|0|c|0
+}
+
+test pragma-index-list-equals-syntax {
+    CREATE TABLE t1(a, b, c);
+    CREATE INDEX idx1 ON t1(a);
+    PRAGMA index_list=t1;
+}
+expect {
+    0|idx1|0|c|0
+}
+
+test pragma-index-list-multiple-indexes {
+    CREATE TABLE t1(a, b, c);
+    CREATE INDEX idx1 ON t1(a);
+    CREATE UNIQUE INDEX idx2 ON t1(b, c);
+    SELECT name, "unique", origin, partial FROM pragma_index_list('t1') ORDER BY name;
+}
+expect {
+    idx1|0|c|0
+    idx2|1|c|0
+}
+
+test pragma-index-list-autoindex-unique {
+    CREATE TABLE t1(a, b UNIQUE, c);
+    PRAGMA index_list('t1');
+}
+expect {
+    0|sqlite_autoindex_t1_1|1|u|0
+}
+
+test pragma-index-list-autoindex-pk {
+    CREATE TABLE t1(a PRIMARY KEY, b, c);
+    PRAGMA index_list('t1');
+}
+expect {
+    0|sqlite_autoindex_t1_1|1|pk|0
+}
+
+test pragma-index-list-mixed-origins {
+    CREATE TABLE t1(a PRIMARY KEY, b UNIQUE, c);
+    CREATE INDEX idx1 ON t1(c);
+    SELECT name, "unique", origin, partial FROM pragma_index_list('t1') ORDER BY name;
+}
+expect {
+    idx1|0|c|0
+    sqlite_autoindex_t1_1|1|pk|0
+    sqlite_autoindex_t1_2|1|u|0
+}
+
+test pragma-index-list-partial-index {
+    CREATE TABLE t1(a, b, c);
+    CREATE INDEX idx_partial ON t1(a) WHERE b > 0;
+    PRAGMA index_list('t1');
+}
+expect {
+    0|idx_partial|0|c|1
+}
+
+test pragma-index-list-no-indexes {
+    CREATE TABLE t1(a, b, c);
+    PRAGMA index_list('t1');
+}
+expect {
+}
+
+test pragma-index-list-nonexistent-table {
+    PRAGMA index_list('nonexistent');
+}
+expect {
+}
+
+test pragma-index-list-function-syntax {
+    CREATE TABLE t1(a, b, c);
+    CREATE INDEX idx1 ON t1(a);
+    SELECT * FROM pragma_index_list('t1');
+}
+expect {
+    0|idx1|0|c|0
+}

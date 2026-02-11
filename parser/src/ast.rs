@@ -1564,6 +1564,8 @@ pub enum PragmaName {
     Synchronous,
     /// Control where temporary tables and indices are stored (DEFAULT=0, FILE=1, MEMORY=2)
     TempStore,
+    /// returns the list of indexes for a table
+    IndexList,
     /// returns information about all tables and views
     TableList,
     /// returns information about the columns of a table
