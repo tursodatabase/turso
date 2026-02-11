@@ -3495,13 +3495,13 @@ fn is_end_visible(
                 // transaction can see a row version if the end is a TXId only if it isn't the same transaction.
                 // Source: https://avi.im/blag/2023/hekaton-paper-typo/
                 TransactionState::Active => current_tx.tx_id != other_tx.tx_id,
-                TransactionState::Preparing(_) => false, // NOTICE: makes sense for snapshot isolation, not so much for serializable!
+                // Table 2 (Hekaton): If TS > RT, V is visible. If TS < RT, T speculatively ignores V.
+                TransactionState::Preparing(end_ts) => current_tx.begin_ts < end_ts,
                 TransactionState::Committed(committed_ts) => current_tx.begin_ts < committed_ts,
-                TransactionState::Aborted => false,
-                TransactionState::Terminated => {
-                    tracing::debug!("TODO: should reread rv's end field - it should have updated the timestamp in the row version by now");
-                    false
-                }
+                TransactionState::Aborted => true,
+                // Table 2 (Hekaton): Reread V's End field. In this codebase Terminated is only
+                // reachable from Aborted, and abort rollback resets end to None → visible.
+                TransactionState::Terminated => true,
             };
             tracing::trace!(
                 "is_end_visible: tx={current_tx}, te={other_tx} rv = {:?}-{:?}  visible = {visible}",

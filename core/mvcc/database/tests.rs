@@ -1164,8 +1164,8 @@ fn test_snapshot_isolation_tx_visible1() {
     ));
 
     // begin visible:   timestamp < current_tx.begin_ts
-    // end invisible:   transaction aborted
-    assert!(!rv_visible(
+    // end visible:     transaction aborted, delete never happened (Table 2)
+    assert!(rv_visible(
         Some(TxTimestampOrID::Timestamp(0)),
         Some(TxTimestampOrID::TxID(3))
     ));
@@ -1186,8 +1186,8 @@ fn test_snapshot_isolation_tx_visible1() {
     assert!(!rv_visible(Some(TxTimestampOrID::TxID(7)), None));
 
     // begin visible:   timestamp < current_tx.begin_ts
-    // end invisible:     transaction preparing
-    assert!(!rv_visible(
+    // end visible:     transaction preparing with TS(8) > RT(4) (Table 2)
+    assert!(rv_visible(
         Some(TxTimestampOrID::Timestamp(0)),
         Some(TxTimestampOrID::TxID(5))
     ));
