@@ -74,7 +74,8 @@ pub fn translate_pragma(
         None => query_pragma(pragma, resolver, None, pager, connection, program)?,
         Some(ast::PragmaBody::Equals(value) | ast::PragmaBody::Call(value)) => match pragma {
             // These pragmas take a parameter but are queries, not setters
-            PragmaName::IndexList
+            PragmaName::IndexInfo
+            | PragmaName::IndexList
             | PragmaName::TableList
             | PragmaName::TableInfo
             | PragmaName::TableXinfo
@@ -374,6 +375,7 @@ fn update_pragma(
             Ok((program, TransactionMode::Write))
         }
         PragmaName::DatabaseList => unreachable!("database_list cannot be set"),
+        PragmaName::IndexInfo => unreachable!("index_info cannot be set"),
         PragmaName::IndexList => unreachable!("index_list cannot be set"),
         PragmaName::TableList => unreachable!("table_list cannot be set"),
         PragmaName::QueryOnly => query_pragma(
@@ -639,6 +641,39 @@ fn query_pragma(
             program.emit_result_row(register, 1);
             program.add_pragma_result_column(pragma.to_string());
             Ok((program, TransactionMode::Read))
+        }
+        PragmaName::IndexInfo => {
+            let index_name = match value {
+                Some(ast::Expr::Name(name)) => Some(normalize_ident(name.as_str())),
+                _ => None,
+            };
+
+            let base_reg = register;
+            // 3 columns: seqno, cid, name
+            program.alloc_registers(2);
+
+            if let Some(index_name) = index_name {
+                let index = schema
+                    .indexes
+                    .values()
+                    .flatten()
+                    .find(|idx| idx.name.eq_ignore_ascii_case(&index_name));
+
+                if let Some(index) = index {
+                    for (seqno, col) in index.columns.iter().enumerate() {
+                        program.emit_int(seqno as i64, base_reg);
+                        program.emit_int(col.pos_in_table as i64, base_reg + 1);
+                        program.emit_string8(col.name.clone(), base_reg + 2);
+                        program.emit_result_row(base_reg, 3);
+                    }
+                }
+            }
+
+            let pragma_meta = pragma_for(&pragma);
+            for col_name in pragma_meta.columns.iter() {
+                program.add_pragma_result_column(col_name.to_string());
+            }
+            Ok((program, TransactionMode::None))
         }
         PragmaName::IndexList => {
             let table_name = match value {
