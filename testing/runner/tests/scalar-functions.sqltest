@@ -2017,6 +2017,33 @@ expect {
     3963
 }
 
+# regression test for https://github.com/tursodatabase/turso/issues/5122
+@skip-if sqlite "different error message"
+test uuid-str-empty {
+		select uuid_str();
+}
+expect error {
+	wrong number of arguments to function uuid_str()
+}
+
+# regression test for https://github.com/tursodatabase/turso/issues/5122
+@skip-if sqlite "different error message"
+test uuid-blob-empty {
+	select uuid_blob();
+}
+expect error {
+	wrong number of arguments to function uuid_blob()
+}
+
+# regression test for https://github.com/tursodatabase/turso/issues/5122
+@skip-if sqlite "different error message"
+test uuid7-timestamp-ms-empty {
+	select uuid7_timestamp_ms();
+}
+expect error {
+	wrong number of arguments to function uuid7_timestamp_ms()
+}
+
 # TODO: sqlite seems not enable soundex() by default unless build it with SQLITE_SOUNDEX enabled.
 # do_execsql_test soundex-text {
 #  select soundex('Pfister'), soundex('husobee'), soundex('Tymczak'), soundex('Ashcraft'), soundex('Robert'), soundex('Rupert'), soundex('Rubin'), soundex('Kant'), soundex('Knuth'), soundex('x'), soundex('');
