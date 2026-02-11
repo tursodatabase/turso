@@ -169,21 +169,31 @@ fn validate(
             }
         }
 
-        // Validate strict column types (moved from parser so we can check the type registry)
-        if options.contains_strict() {
-            for c in columns {
-                if let Some(ref col_type) = c.col_type {
-                    let name_bytes = col_type.name.as_bytes();
-                    let is_builtin = turso_macros::match_ignore_ascii_case!(match name_bytes {
-                        b"INT" | b"INTEGER" | b"REAL" | b"TEXT" | b"BLOB" | b"ANY" => true,
-                        _ => false,
-                    });
-                    if !is_builtin && resolver.schema.get_type_def(&col_type.name).is_none() {
+        let is_strict = options.contains_strict();
+
+        for c in columns {
+            if let Some(ref col_type) = c.col_type {
+                let type_name = &col_type.name;
+                let name_bytes = type_name.as_bytes();
+                let is_builtin = turso_macros::match_ignore_ascii_case!(match name_bytes {
+                    b"INT" | b"INTEGER" | b"REAL" | b"TEXT" | b"BLOB" | b"ANY" => true,
+                    _ => false,
+                });
+
+                if !is_builtin {
+                    let is_custom = resolver.schema.get_type_def(type_name).is_some();
+                    if is_custom && !is_strict {
+                        bail_parse_error!(
+                            "custom type \"{}\" requires a STRICT table",
+                            type_name
+                        );
+                    }
+                    if is_strict && !is_custom {
                         bail_parse_error!(
                             "unknown datatype for {}.{}: \"{}\"",
                             table_name,
                             c.col_name,
-                            col_type.name
+                            type_name
                         );
                     }
                 }

@@ -291,3 +291,11 @@ expect {
     1|42
     2|100
 }
+
+@requires strict "uses STRICT tables"
+test custom-type-requires-strict {
+    CREATE TYPE test_uint BASE text ENCODE test_uint_encode(value) DECODE test_uint_decode(value);
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint);
+}
+expect error {
+}
