@@ -75,6 +75,7 @@ pub fn translate_pragma(
         Some(ast::PragmaBody::Equals(value) | ast::PragmaBody::Call(value)) => match pragma {
             // These pragmas take a parameter but are queries, not setters
             PragmaName::IndexInfo
+            | PragmaName::IndexXinfo
             | PragmaName::IndexList
             | PragmaName::TableList
             | PragmaName::TableInfo
@@ -376,6 +377,7 @@ fn update_pragma(
         }
         PragmaName::DatabaseList => unreachable!("database_list cannot be set"),
         PragmaName::IndexInfo => unreachable!("index_info cannot be set"),
+        PragmaName::IndexXinfo => unreachable!("index_xinfo cannot be set"),
         PragmaName::IndexList => unreachable!("index_list cannot be set"),
         PragmaName::TableList => unreachable!("table_list cannot be set"),
         PragmaName::QueryOnly => query_pragma(
@@ -665,6 +667,60 @@ fn query_pragma(
                         program.emit_int(col.pos_in_table as i64, base_reg + 1);
                         program.emit_string8(col.name.clone(), base_reg + 2);
                         program.emit_result_row(base_reg, 3);
+                    }
+                }
+            }
+
+            let pragma_meta = pragma_for(&pragma);
+            for col_name in pragma_meta.columns.iter() {
+                program.add_pragma_result_column(col_name.to_string());
+            }
+            Ok((program, TransactionMode::None))
+        }
+        PragmaName::IndexXinfo => {
+            let index_name = match value {
+                Some(ast::Expr::Name(name)) => Some(normalize_ident(name.as_str())),
+                _ => None,
+            };
+
+            let base_reg = register;
+            // 6 columns: seqno, cid, name, desc, coll, key
+            program.alloc_registers(5);
+
+            if let Some(index_name) = index_name {
+                let index = schema
+                    .indexes
+                    .values()
+                    .flatten()
+                    .find(|idx| idx.name.eq_ignore_ascii_case(&index_name));
+
+                if let Some(index) = index {
+                    for (seqno, col) in index.columns.iter().enumerate() {
+                        let desc = matches!(col.order, ast::SortOrder::Desc);
+                        let coll = col
+                            .collation
+                            .map(|c| c.to_string().to_uppercase())
+                            .unwrap_or_else(|| "BINARY".to_string());
+
+                        program.emit_int(seqno as i64, base_reg);
+                        program.emit_int(col.pos_in_table as i64, base_reg + 1);
+                        program.emit_string8(col.name.clone(), base_reg + 2);
+                        program.emit_int(desc as i64, base_reg + 3);
+                        program.emit_string8(coll, base_reg + 4);
+                        program.emit_int(1, base_reg + 5); // key column
+                        program.emit_result_row(base_reg, 6);
+                    }
+
+                    // Emit trailing rowid row if the index has one
+                    if index.has_rowid {
+                        let seqno = index.columns.len();
+                        program.emit_int(seqno as i64, base_reg);
+                        program.emit_int(-1, base_reg + 1);
+                        program.emit_string8(String::new(), base_reg + 2);
+                        program.emit_int(0, base_reg + 3);
+                        program.emit_string8("BINARY".to_string(), base_reg + 4);
+                        program.emit_int(0, base_reg + 5); // not a key column
+                        program.emit_result_row(base_reg, 6);
                     }
                 }
             }

@@ -1,0 +1,78 @@
+@database :memory:
+
+test pragma-index-xinfo-single-column {
+    CREATE TABLE t1(a, b, c);
+    CREATE INDEX idx1 ON t1(a);
+    PRAGMA index_xinfo('idx1');
+}
+expect {
+    0|0|a|0|BINARY|1
+    1|-1||0|BINARY|0
+}
+
+test pragma-index-xinfo-equals-syntax {
+    CREATE TABLE t1(a, b, c);
+    CREATE INDEX idx1 ON t1(a);
+    PRAGMA index_xinfo=idx1;
+}
+expect {
+    0|0|a|0|BINARY|1
+    1|-1||0|BINARY|0
+}
+
+test pragma-index-xinfo-multi-column {
+    CREATE TABLE t1(a, b, c);
+    CREATE UNIQUE INDEX idx1 ON t1(b, c);
+    PRAGMA index_xinfo('idx1');
+}
+expect {
+    0|1|b|0|BINARY|1
+    1|2|c|0|BINARY|1
+    2|-1||0|BINARY|0
+}
+
+test pragma-index-xinfo-desc-column {
+    CREATE TABLE t1(a, b, c);
+    CREATE INDEX idx1 ON t1(a DESC, b);
+    PRAGMA index_xinfo('idx1');
+}
+expect {
+    0|0|a|1|BINARY|1
+    1|1|b|0|BINARY|1
+    2|-1||0|BINARY|0
+}
+
+test pragma-index-xinfo-collation {
+    CREATE TABLE t1(a, b COLLATE NOCASE, c);
+    CREATE INDEX idx1 ON t1(b);
+    PRAGMA index_xinfo('idx1');
+}
+expect {
+    0|1|b|0|NOCASE|1
+    1|-1||0|BINARY|0
+}
+
+test pragma-index-xinfo-autoindex {
+    CREATE TABLE t1(a PRIMARY KEY, b, c);
+    PRAGMA index_xinfo('sqlite_autoindex_t1_1');
+}
+expect {
+    0|0|a|0|BINARY|1
+    1|-1||0|BINARY|0
+}
+
+test pragma-index-xinfo-nonexistent {
+    PRAGMA index_xinfo('nonexistent');
+}
+expect {
+}
+
+test pragma-index-xinfo-function-syntax {
+    CREATE TABLE t1(a, b, c);
+    CREATE INDEX idx1 ON t1(a);
+    SELECT * FROM pragma_index_xinfo('idx1');
+}
+expect {
+    0|0|a|0|BINARY|1
+    1|-1||0|BINARY|0
+}

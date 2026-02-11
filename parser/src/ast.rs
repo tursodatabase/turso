@@ -1566,6 +1566,8 @@ pub enum PragmaName {
     TempStore,
     /// returns information about the columns of an index
     IndexInfo,
+    /// returns extended information about the columns of an index
+    IndexXinfo,
     /// returns the list of indexes for a table
     IndexList,
     /// returns information about all tables and views

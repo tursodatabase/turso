@@ -97,6 +97,10 @@ pub fn pragma_for(pragma: &PragmaName) -> Pragma {
             PragmaFlags::NeedSchema | PragmaFlags::Result1 | PragmaFlags::SchemaOpt,
             &["seqno", "cid", "name"],
         ),
+        IndexXinfo => Pragma::new(
+            PragmaFlags::NeedSchema | PragmaFlags::Result1 | PragmaFlags::SchemaOpt,
+            &["seqno", "cid", "name", "desc", "coll", "key"],
+        ),
         IndexList => Pragma::new(
             PragmaFlags::NeedSchema | PragmaFlags::Result1 | PragmaFlags::SchemaOpt,
             &["seq", "name", "unique", "origin", "partial"],
