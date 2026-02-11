@@ -1,0 +1,42 @@
+# Tests for WAL read lock handling after ROLLBACK
+# See: https://github.com/tursodatabase/turso/issues/5176
+
+# Use :temp: database for WAL support (file-based)
+@database :temp:
+
+# This test verifies data is properly rolled back.
+# A write transaction is started, data inserted, then rolled back.
+@backend rust
+@skip-if mvcc "WAL checkpoint not implemented for mvcc"
+test rollback-releases-read-lock-for-checkpoint {
+    CREATE TABLE t(x);
+    INSERT INTO t VALUES(1);
+    BEGIN;
+    INSERT INTO t VALUES(2);
+    ROLLBACK;
+    SELECT * FROM t;
+}
+expect {
+    1
+}
+
+# This test verifies that ROLLBACK properly releases the WAL read lock.
+# PRAGMA wal_checkpoint(TRUNCATE) returns 3 columns:
+#   1st: busy flag (0 = success, 1 = busy/blocked)
+#   2nd: number of frames in WAL
+#   3rd: number of frames checkpointed
+# If the read lock from the rolled-back transaction is leaked,
+# TRUNCATE checkpoint will fail with busy=1 because TRUNCATE requires no readers.
+@backend rust
+@skip-if mvcc "WAL checkpoint not implemented for mvcc"
+test rollback-checkpoint-not-busy {
+    CREATE TABLE t(x);
+    INSERT INTO t VALUES(1);
+    BEGIN;
+    INSERT INTO t VALUES(2);
+    ROLLBACK;
+    PRAGMA wal_checkpoint(TRUNCATE);
+}
+expect pattern {
+    0\|\d+\|\d+
+}
