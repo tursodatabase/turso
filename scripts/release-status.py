@@ -121,7 +121,6 @@ def categorize_issues(open_issues):
     high_priority = []
     bugs = []
     features = []
-    other = []
     for issue in open_issues:
         labels = {lbl["name"] for lbl in issue["labels"]}
         if "high priority" in labels:
@@ -131,18 +130,17 @@ def categorize_issues(open_issues):
         elif "enhancement" in labels or "feature" in labels:
             features.append(issue)
         else:
-            other.append(issue)
-    return high_priority, bugs, features, other
+            bugs.append(issue)
+    return high_priority, bugs, features
 
 
-def build_category_messages(high_priority, bugs, features, other,
+def build_category_messages(high_priority, bugs, features,
                             closed_issues, show_closed, linked_prs):
     categories = []
     groups = [
         (high_priority, ":rotating_light: *High Priority"),
         (bugs, ":bug: *Bugs"),
         (features, ":sparkles: *Features/Enhancements"),
-        (other, ":clipboard: *Other"),
     ]
     for items, label in groups:
         if items:
@@ -187,7 +185,7 @@ def main():
     open_issues = [i for i in open_issues if "pull_request" not in i]
     closed_issues = [i for i in closed_issues if "pull_request" not in i]
 
-    high_priority, bugs, features, other = categorize_issues(open_issues)
+    high_priority, bugs, features = categorize_issues(open_issues)
 
     # Fetch linked PRs for all open issues
     all_issue_numbers = [i["number"] for i in open_issues]
@@ -231,7 +229,7 @@ def main():
     header = "\n".join(header_lines)
 
     categories = build_category_messages(
-        high_priority, bugs, features, other,
+        high_priority, bugs, features,
         closed_issues, args.closed, linked_prs
     )
 
