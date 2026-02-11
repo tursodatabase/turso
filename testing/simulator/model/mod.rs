@@ -14,38 +14,225 @@ use sql_generation::model::{
         transaction::{Begin, Commit, Rollback},
         update::{SetValue, Update},
     },
-    table::{Index, JoinTable, JoinType, SimValue, Table, TableContext},
+    table::{Column, ColumnType, Index, JoinTable, JoinType, SimValue, Table, TableContext},
 };
+use turso_core::Value;
 use turso_parser::ast::Distinctness;
 
 use crate::runner::env::TransactionMode;
 use crate::{generation::Shadow, runner::env::ShadowTablesMut};
+use std::collections::{HashMap, HashSet};
 
-/// Validate UNIQUE constraints for rows being inserted
-fn validate_unique_insert(
+fn integer_pk_index(columns: &[Column]) -> Option<usize> {
+    columns
+        .iter()
+        .position(|c| matches!(c.column_type, ColumnType::Integer) && c.is_primary_key())
+}
+
+fn ensure_row_width(table_name: &str, columns: &[Column], row: &[SimValue]) -> anyhow::Result<()> {
+    if row.len() != columns.len() {
+        return Err(anyhow::anyhow!(
+            "INSERT VALUES row width {} does not match table '{}' column width {}",
+            row.len(),
+            table_name,
+            columns.len()
+        ));
+    }
+    Ok(())
+}
+
+fn check_unique_row(
     table_name: &str,
-    columns: &[sql_generation::model::table::Column],
+    columns: &[Column],
+    rows: &[Vec<SimValue>],
+    candidate_row: &[SimValue],
+    except_row: Option<usize>,
+) -> anyhow::Result<()> {
+    ensure_row_width(table_name, columns, candidate_row)?;
+
+    for (col_idx, col) in columns.iter().enumerate() {
+        if !col.has_unique_or_pk() {
+            continue;
+        }
+
+        if candidate_row[col_idx].0 == turso_core::Value::Null {
+            continue;
+        }
+
+        let conflict = rows
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| except_row != Some(*i))
+            .any(|(_, r)| r[col_idx] == candidate_row[col_idx]);
+        if conflict {
+            return Err(anyhow::anyhow!(
+                "UNIQUE constraint violation: column '{}' in table '{}'",
+                col.name,
+                table_name
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn check_unique_batch(
+    table_name: &str,
+    columns: &[Column],
     existing_rows: &[Vec<SimValue>],
     new_rows: &[Vec<SimValue>],
 ) -> anyhow::Result<()> {
     for (row_idx, row) in new_rows.iter().enumerate() {
+        ensure_row_width(table_name, columns, row)?;
+
         for (col_idx, col) in columns.iter().enumerate() {
-            if col.has_unique_constraint() && row[col_idx].0 != turso_core::Value::Null {
-                let duplicate = existing_rows
-                    .iter()
-                    .chain(new_rows[..row_idx].iter())
-                    .any(|existing| existing[col_idx] == row[col_idx]);
-                if duplicate {
-                    return Err(anyhow::anyhow!(
-                        "UNIQUE constraint violation: column '{}' in table '{}'",
-                        col.name,
-                        table_name
-                    ));
-                }
+            if !col.has_unique_or_pk() {
+                continue;
+            }
+            if row[col_idx].0 == Value::Null {
+                continue;
+            }
+            let duplicate = existing_rows
+                .iter()
+                .chain(new_rows[..row_idx].iter())
+                .any(|existing| existing[col_idx] == row[col_idx]);
+            if duplicate {
+                return Err(anyhow::anyhow!(
+                    "UNIQUE constraint violation: column '{}' in table '{}'",
+                    col.name,
+                    table_name
+                ));
             }
         }
     }
     Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct RowidAllocator {
+    used: HashSet<i64>,
+    next: i64,
+}
+
+impl RowidAllocator {
+    fn new(existing_rows: &[Vec<SimValue>], pk_idx: usize) -> Self {
+        let mut used = HashSet::new();
+        let mut max_rowid = 0i64;
+        for r in existing_rows {
+            assert!(
+                pk_idx < r.len(),
+                "row width invariant violated: pk_idx={}, row_len={}",
+                pk_idx,
+                r.len()
+            );
+            if let Value::Integer(i) = r[pk_idx].0 {
+                used.insert(i);
+                max_rowid = max_rowid.max(i);
+            }
+        }
+        let next = if max_rowid > 0 {
+            max_rowid.saturating_add(1)
+        } else {
+            1
+        };
+        Self { used, next }
+    }
+
+    fn observe(&mut self, v: i64) {
+        self.used.insert(v);
+        if v >= self.next {
+            self.next = v.saturating_add(1);
+        }
+    }
+
+    fn alloc(&mut self) -> i64 {
+        let mut tries = 0u32;
+        while self.used.contains(&self.next) {
+            self.next = self.next.saturating_add(1);
+            tries += 1;
+            assert!(
+                tries < 1_000_000,
+                "rowid allocator failed to find a free rowid"
+            );
+        }
+        let v = self.next;
+        self.used.insert(v);
+        self.next = self.next.saturating_add(1);
+        v
+    }
+}
+
+fn normalize_integer_pk_row(
+    table_name: &str,
+    columns: &[Column],
+    pk_idx: usize,
+    alloc: &mut RowidAllocator,
+    row: &[SimValue],
+) -> anyhow::Result<Vec<SimValue>> {
+    ensure_row_width(table_name, columns, row)?;
+    let mut out = row.to_vec();
+    match out[pk_idx].0 {
+        Value::Null => {
+            let new_id = alloc.alloc();
+            out[pk_idx] = SimValue(Value::Integer(new_id));
+        }
+        Value::Integer(i) => {
+            alloc.observe(i);
+        }
+        _ => {
+            return Err(anyhow::anyhow!(
+                "datatype mismatch: table '{}' INTEGER PRIMARY KEY column '{}' must be an integer",
+                table_name,
+                columns[pk_idx].name
+            ));
+        }
+    }
+    Ok(out)
+}
+
+fn validate_integer_pk_row_non_null(
+    table_name: &str,
+    columns: &[Column],
+    pk_idx: usize,
+    row: &[SimValue],
+) -> anyhow::Result<()> {
+    ensure_row_width(table_name, columns, row)?;
+    match row[pk_idx].0 {
+        Value::Integer(_) => Ok(()),
+        Value::Null => Err(anyhow::anyhow!(
+            "datatype mismatch: table '{}' INTEGER PRIMARY KEY column '{}' cannot be NULL",
+            table_name,
+            columns[pk_idx].name
+        )),
+        _ => Err(anyhow::anyhow!(
+            "datatype mismatch: table '{}' INTEGER PRIMARY KEY column '{}' must be an integer",
+            table_name,
+            columns[pk_idx].name
+        )),
+    }
+}
+
+fn prepare_insert_rows(
+    table_name: &str,
+    columns: &[Column],
+    existing_rows: &[Vec<SimValue>],
+    input_rows: &[Vec<SimValue>],
+) -> anyhow::Result<Vec<Vec<SimValue>>> {
+    let mut new_rows = input_rows.to_vec();
+
+    if let Some(pk_idx) = integer_pk_index(columns) {
+        let mut alloc = RowidAllocator::new(existing_rows, pk_idx);
+        new_rows = new_rows
+            .iter()
+            .map(|r| normalize_integer_pk_row(table_name, columns, pk_idx, &mut alloc, r))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+    } else {
+        for r in &new_rows {
+            ensure_row_width(table_name, columns, r)?;
+        }
+    }
+
+    check_unique_batch(table_name, columns, existing_rows, &new_rows)?;
+    Ok(new_rows)
 }
 
 pub mod interactions;
@@ -400,30 +587,219 @@ impl Shadow for Insert {
 
     //FIXME this doesn't handle type affinity
     fn shadow(&self, tables: &mut ShadowTablesMut) -> Self::Result {
-        let (table_name, rows) = match self {
-            Insert::Values { table, values } => (table.clone(), values.clone()),
-            Insert::Select { table, select } => (table.clone(), select.shadow(tables)?),
-        };
+        match self {
+            Insert::Select { table, select } => {
+                let table_name = table.clone();
+                let raw_rows = select.shadow(tables)?;
 
-        let sim_table = tables
-            .iter()
-            .find(|t| t.name == table_name)
-            .ok_or_else(|| anyhow::anyhow!("Table {} does not exist", table_name))?;
+                let table_pos = tables
+                    .iter()
+                    .position(|t| t.name == table_name)
+                    .ok_or_else(|| anyhow::anyhow!("Table {} does not exist", table_name))?;
 
-        validate_unique_insert(&table_name, &sim_table.columns, &sim_table.rows, &rows)?;
+                let columns = tables[table_pos].columns.clone();
+                let rows =
+                    prepare_insert_rows(&table_name, &columns, &tables[table_pos].rows, &raw_rows)?;
 
-        for row in &rows {
-            tables.record_insert(table_name.clone(), row.clone());
+                for row in &rows {
+                    tables.record_insert(table_name.clone(), row.clone());
+                }
+                tables[table_pos].rows.extend(rows);
+                Ok(vec![])
+            }
+            Insert::Values {
+                table,
+                values,
+                on_conflict,
+            } => {
+                let table_name = table.clone();
+
+                let table_pos = tables
+                    .iter()
+                    .position(|t| t.name == table_name)
+                    .ok_or_else(|| anyhow::anyhow!("Table {} does not exist", table_name))?;
+
+                let columns = tables[table_pos].columns.clone();
+
+                match on_conflict {
+                    None => {
+                        let new_rows = prepare_insert_rows(
+                            &table_name,
+                            &columns,
+                            &tables[table_pos].rows,
+                            values,
+                        )?;
+
+                        for row in &new_rows {
+                            tables.record_insert(table_name.clone(), row.clone());
+                        }
+                        tables[table_pos].rows.extend(new_rows);
+                        Ok(vec![])
+                    }
+                    Some(on_conflict) => {
+                        let target_col_idx = columns
+                            .iter()
+                            .position(|c| c.name == on_conflict.target_column)
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "ON CONFLICT target column '{}' does not exist in table '{}'",
+                                    on_conflict.target_column,
+                                    table_name
+                                )
+                            })?;
+                        if !columns[target_col_idx].has_unique_or_pk() {
+                            return Err(anyhow::anyhow!(
+                                "ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint"
+                            ));
+                        }
+
+                        let assignments = &on_conflict.assignments;
+                        if assignments.is_empty() {
+                            return Err(anyhow::anyhow!(
+                                "ON CONFLICT DO UPDATE must have at least one assignment"
+                            ));
+                        }
+
+                        let col_idx_map: HashMap<String, usize> = columns
+                            .iter()
+                            .enumerate()
+                            .map(|(i, c)| (c.name.clone(), i))
+                            .collect();
+
+                        let pk_idx_opt = integer_pk_index(&columns);
+                        let mut staged_rows = tables[table_pos].rows.clone();
+                        let mut alloc_opt =
+                            pk_idx_opt.map(|pk_idx| RowidAllocator::new(&staged_rows, pk_idx));
+
+                        enum StagedOp {
+                            Insert(Vec<SimValue>),
+                            Update {
+                                old_row: Vec<SimValue>,
+                                new_row: Vec<SimValue>,
+                            },
+                        }
+                        let mut staged_ops: Vec<StagedOp> = Vec::new();
+
+                        for raw_row in values.iter() {
+                            ensure_row_width(&table_name, &columns, raw_row)?;
+
+                            let excluded_row = if let (Some(pk_idx), Some(alloc)) =
+                                (pk_idx_opt, alloc_opt.as_mut())
+                            {
+                                normalize_integer_pk_row(
+                                    &table_name,
+                                    &columns,
+                                    pk_idx,
+                                    alloc,
+                                    raw_row,
+                                )?
+                            } else {
+                                raw_row.clone()
+                            };
+
+                            let target_val = &excluded_row[target_col_idx];
+
+                            let conflict_idx = if target_val.0 == turso_core::Value::Null {
+                                None
+                            } else {
+                                let mut found = None;
+                                for (i, r) in staged_rows.iter().enumerate() {
+                                    if r[target_col_idx] == *target_val {
+                                        if found.is_some() {
+                                            return Err(anyhow::anyhow!(
+                                                "UNIQUE constraint invariant violated: multiple rows match ON CONFLICT target column '{}' in table '{}'",
+                                                on_conflict.target_column,
+                                                table_name
+                                            ));
+                                        }
+                                        found = Some(i);
+                                    }
+                                }
+                                found
+                            };
+
+                            match conflict_idx {
+                                None => {
+                                    check_unique_row(
+                                        &table_name,
+                                        &columns,
+                                        &staged_rows,
+                                        &excluded_row,
+                                        None,
+                                    )?;
+                                    staged_rows.push(excluded_row.clone());
+                                    staged_ops.push(StagedOp::Insert(excluded_row));
+                                }
+                                Some(conflict_idx) => {
+                                    let old_row = staged_rows[conflict_idx].clone();
+                                    let mut new_row = old_row.clone();
+
+                                    for a in assignments {
+                                        let dst_idx = *col_idx_map.get(&a.column).ok_or_else(|| {
+                                            anyhow::anyhow!(
+                                                "ON CONFLICT assignment column '{}' does not exist in table '{}'",
+                                                a.column,
+                                                table_name
+                                            )
+                                        })?;
+                                        let src_idx = *col_idx_map.get(&a.excluded_column).ok_or_else(
+                                            || {
+                                                anyhow::anyhow!(
+                                                    "excluded column '{}' does not exist in table '{}'",
+                                                    a.excluded_column,
+                                                    table_name
+                                                )
+                                            },
+                                        )?;
+                                        new_row[dst_idx] = excluded_row[src_idx].clone();
+                                    }
+
+                                    if let (Some(pk_idx), Some(alloc)) =
+                                        (pk_idx_opt, alloc_opt.as_mut())
+                                    {
+                                        validate_integer_pk_row_non_null(
+                                            &table_name,
+                                            &columns,
+                                            pk_idx,
+                                            &new_row,
+                                        )?;
+                                        if let Value::Integer(i) = new_row[pk_idx].0 {
+                                            alloc.observe(i);
+                                        }
+                                    }
+
+                                    check_unique_row(
+                                        &table_name,
+                                        &columns,
+                                        &staged_rows,
+                                        &new_row,
+                                        Some(conflict_idx),
+                                    )?;
+
+                                    staged_rows[conflict_idx] = new_row.clone();
+                                    staged_ops.push(StagedOp::Update { old_row, new_row });
+                                }
+                            }
+                        }
+
+                        tables[table_pos].rows = staged_rows;
+                        for op in staged_ops {
+                            match op {
+                                StagedOp::Insert(row) => {
+                                    tables.record_insert(table_name.clone(), row);
+                                }
+                                StagedOp::Update {
+                                    old_row, new_row, ..
+                                } => {
+                                    tables.record_update(table_name.clone(), old_row, new_row);
+                                }
+                            }
+                        }
+                        Ok(vec![])
+                    }
+                }
+            }
         }
-
-        tables
-            .iter_mut()
-            .find(|t| t.name == table_name)
-            .unwrap()
-            .rows
-            .extend(rows);
-
-        Ok(vec![])
     }
 }
 
@@ -674,12 +1050,18 @@ impl Shadow for Update {
             (updates, columns)
         };
 
+        if let Some(pk_idx) = integer_pk_index(&columns) {
+            for (_, _, new_row) in &updates {
+                validate_integer_pk_row_non_null(&self.table, &columns, pk_idx, new_row)?;
+            }
+        }
+
         let updated_row_indices: std::collections::HashSet<usize> =
             updates.iter().map(|(idx, _, _)| *idx).collect();
 
         if let Some(table) = tables.iter().find(|t| t.name == self.table) {
             for (col_idx, col) in columns.iter().enumerate() {
-                if !col.has_unique_constraint() {
+                if !col.has_unique_or_pk() {
                     continue;
                 }
                 let new_values: Vec<_> = updates
@@ -718,8 +1100,7 @@ impl Shadow for Update {
 
         // Record the operations for transaction tracking
         for (_, old_row, new_row) in &updates {
-            tables.record_delete(self.table.clone(), old_row.clone());
-            tables.record_insert(self.table.clone(), new_row.clone());
+            tables.record_update(self.table.clone(), old_row.clone(), new_row.clone());
         }
 
         // Second pass: apply the updates

@@ -3189,6 +3189,19 @@ fn emit_update_insns<'a>(
 
             program.preassign_label_to_next_insn(no_rowid_conflict_label);
         }
+
+        if has_user_provided_rowid {
+            if let Some(label) = check_rowid_not_exists_label {
+                // Important: the cursor was repositioned in the previous conflict checks,
+                // so if we didn't conflict above, we need to re-seek to the row under update,
+                // so that the old index row images (see below) read from the correct row.
+                program.emit_insn(Insn::NotExists {
+                    cursor: target_table_cursor_id,
+                    rowid_reg: beg,
+                    target_pc: label,
+                });
+            }
+        }
     }
 
     // Evaluate STRICT type checks and CHECK constraints before any index mutations.

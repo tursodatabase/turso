@@ -532,3 +532,46 @@ expect {
     Alice|SF|new
 }
 
+test upsert-unique-update-rowid-change {
+    CREATE TABLE t (
+        id INTEGER PRIMARY KEY,
+        a TEXT,
+        b TEXT UNIQUE,
+        u1 INTEGER UNIQUE,
+        u2 TEXT UNIQUE
+    );
+    INSERT INTO t VALUES (1,'old_a','old_b',10,'old_u2');
+    INSERT INTO t VALUES (2,'a2','b2',20,'u2b');
+
+    -- Conflict on u1, then update the rowid alias (id)
+    INSERT INTO t VALUES (3,'new_a','ignored_b',10,'ignored_u2')
+      ON CONFLICT(u1) DO UPDATE SET id = excluded.id, a = excluded.a;
+
+    -- Old rowid must be gone.
+    SELECT id FROM t ORDER BY id;
+    SELECT id,a,b,u1,u2 FROM t ORDER BY id;
+}
+expect {
+    2
+    3
+    2|a2|b2|20|u2b
+    3|new_a|old_b|10|old_u2
+}
+
+test upsert-unique-update-rowid-change-preserves-unique {
+    CREATE TABLE t (
+        id INTEGER PRIMARY KEY,
+        a TEXT,
+        b TEXT UNIQUE,
+        u1 INTEGER UNIQUE,
+        u2 TEXT UNIQUE
+    );
+    INSERT INTO t VALUES (1,'old_a','old_b',10,'old_u2');
+    INSERT INTO t VALUES (2,'a2','b2',20,'u2b');
+    INSERT INTO t VALUES (3,'new_a','ignored_b',10,'ignored_u2')
+      ON CONFLICT(u1) DO UPDATE SET id = excluded.id, a = excluded.a;
+
+    INSERT INTO t VALUES (4,'x','old_b',30,'u2c');
+}
+expect error {
+}

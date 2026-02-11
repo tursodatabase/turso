@@ -35,6 +35,9 @@ pub struct Opts {
 pub struct TableOpts {
     #[garde(dive)]
     pub large_table: LargeTableOpts,
+    #[garde(range(min = 0.0, max = 1.0))]
+    #[serde(alias = "rowid_style_prob")]
+    pub rowid_alias_prob: f64,
     /// Range of numbers of columns to generate
     #[garde(custom(range_struct_min(1)))]
     pub column_range: Range<u32>,
@@ -44,6 +47,7 @@ impl Default for TableOpts {
     fn default() -> Self {
         Self {
             large_table: Default::default(),
+            rowid_alias_prob: 0.05,
             // Up to 10 columns
             column_range: 1..11,
         }
@@ -176,12 +180,14 @@ pub struct JoinWeight {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Validate)]
-#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields, default)]
 pub struct InsertOpts {
     #[garde(skip)]
     pub min_rows: NonZeroU32,
     #[garde(skip)]
     pub max_rows: NonZeroU32,
+    #[garde(range(min = 0.0, max = 1.0))]
+    pub upsert_prob: f64,
 }
 
 impl Default for InsertOpts {
@@ -189,6 +195,7 @@ impl Default for InsertOpts {
         Self {
             min_rows: NonZero::new(1).unwrap(),
             max_rows: NonZero::new(10).unwrap(),
+            upsert_prob: 0.15,
         }
     }
 }

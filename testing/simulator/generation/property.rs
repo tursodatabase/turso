@@ -163,9 +163,10 @@ impl Property {
                         .unwrap();
                     let query = Query::arbitrary_from(rng, ctx, query_distr);
                     match &query {
-                        Query::Insert(Insert::Values { table: t, values })
-                            if *t == table_name
-                                && values.iter().any(|v| predicate.test(v, table)) =>
+                        Query::Insert(Insert::Values {
+                            table: t, values, ..
+                        }) if *t == table_name
+                            && values.iter().any(|v| predicate.test(v, table)) =>
                         {
                             // A row that holds for the predicate will not be inserted.
                             None
@@ -464,7 +465,12 @@ impl Property {
                 select,
                 interactive,
             } => {
-                let (table, values) = if let Insert::Values { table, values } = insert {
+                let (table, values) = if let Insert::Values {
+                    table,
+                    values,
+                    on_conflict: None,
+                } = insert
+                {
                     (table, values)
                 } else {
                     unreachable!(
@@ -1296,6 +1302,7 @@ fn property_insert_values_select<R: rand::Rng + ?Sized>(
     let insert_query = Query::Insert(Insert::Values {
         table: table.name.clone(),
         values: rows,
+        on_conflict: None,
     });
 
     // Choose if we want queries to be executed in an interactive transaction

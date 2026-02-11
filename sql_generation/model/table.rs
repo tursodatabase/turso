@@ -59,9 +59,9 @@ impl Table {
         }
     }
 
-    /// Returns true if any column in this table has a UNIQUE constraint.
+    /// Returns true if any column has UNIQUE or PRIMARY KEY.
     pub fn has_any_unique_column(&self) -> bool {
-        self.columns.iter().any(|c| c.has_unique_constraint())
+        self.columns.iter().any(|c| c.has_unique_or_pk())
     }
 }
 
@@ -88,11 +88,21 @@ impl PartialEq for Column {
 impl Eq for Column {}
 
 impl Column {
-    /// Returns true if this column has a UNIQUE constraint.
-    pub fn has_unique_constraint(&self) -> bool {
+    /// True if this column participates in a UNIQUE or PRIMARY KEY constraint.
+    pub fn has_unique_or_pk(&self) -> bool {
+        self.constraints.iter().any(|c| {
+            matches!(
+                c,
+                ColumnConstraint::Unique(_) | ColumnConstraint::PrimaryKey { .. }
+            )
+        })
+    }
+
+    #[inline]
+    pub fn is_primary_key(&self) -> bool {
         self.constraints
             .iter()
-            .any(|c| matches!(c, ColumnConstraint::Unique(_)))
+            .any(|c| matches!(c, ColumnConstraint::PrimaryKey { .. }))
     }
 }
 

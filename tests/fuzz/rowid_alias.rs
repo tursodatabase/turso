@@ -158,6 +158,7 @@ pub fn rowid_alias_differential_fuzz() {
                     if let Insert::Values {
                         table: table_name,
                         values,
+                        ..
                     } = &insert
                     {
                         for table in &mut context.tables {
