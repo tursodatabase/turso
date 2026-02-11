@@ -1367,6 +1367,19 @@ pub fn translate_drop_type(
         bail_parse_error!("no such type: {normalized_name}");
     }
 
+    // Check if any table uses this type
+    for (_, table) in resolver.schema.tables.iter() {
+        for col in table.columns() {
+            if normalize_ident(&col.ty_str) == normalized_name {
+                bail_parse_error!(
+                    "cannot drop type {normalized_name}: used by column {} in table {}",
+                    col.name.as_deref().unwrap_or("?"),
+                    table.get_name()
+                );
+            }
+        }
+    }
+
     // Open cursor to sqlite_schema table
     let schema_table = resolver.schema.get_btree_table(SQLITE_TABLEID).unwrap();
     let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(schema_table));

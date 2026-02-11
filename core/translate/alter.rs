@@ -744,6 +744,10 @@ pub fn translate_alter_table(
                     && !ty.eq_ignore_ascii_case("TEXT")
                     && !ty.eq_ignore_ascii_case("BLOB")
                     && !ty.eq_ignore_ascii_case("ANY")
+                    && resolver
+                        .schema
+                        .get_type_def(&normalize_ident(ty))
+                        .is_none()
                 {
                     return Err(LimboError::ParseError(format!(
                         "unknown datatype for {table_name}.{new_column_name}: \"{ty}\""
