@@ -1492,6 +1492,20 @@ fn analyze_binary_term_for_index(
     let lhs_mask = table_mask_from_expr(&constraining_expr, table_references, subqueries)
         .unwrap_or_else(|_| TableMask::new());
 
+    // Cannot use index seek if the constraining expression references the same table
+    // being scanned, since the expression value varies per row and cannot be evaluated
+    // before the scan (e.g. TYPEOF(b) NOT BETWEEN a AND a where both columns are from
+    // the same table).
+    if let Some(table_pos) = table_references
+        .joined_tables()
+        .iter()
+        .position(|t| t.internal_id == table_id)
+    {
+        if lhs_mask.contains_table(table_pos) {
+            return None;
+        }
+    }
+
     // Compute the affinity for the constraining expression
     let affinity = if let Some(ast_op) = operator.as_ast_operator() {
         if ast_op.is_comparison() && table_col_pos.is_some() {
