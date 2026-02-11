@@ -3478,15 +3478,21 @@ fn is_begin_visible(txs: &SkipMap<TxID, Transaction>, tx: &Transaction, rv: &Row
                 #[cfg(feature = "mvcc_raw_test")]
                 TransactionState::Preparing(_) => false,
                 #[cfg(not(feature = "mvcc_raw_test"))]
-                TransactionState::Preparing(_) => unreachable!("Preparing: TxIDs are replaced with Timestamps before any yield point"),
+                TransactionState::Preparing(_) => unreachable!(
+                    "Preparing: TxIDs are replaced with Timestamps before any yield point"
+                ),
                 #[cfg(feature = "mvcc_raw_test")]
                 TransactionState::Aborted => false,
                 #[cfg(not(feature = "mvcc_raw_test"))]
-                TransactionState::Aborted => unreachable!("Aborted: rollback clears TxIDs from version fields synchronously"),
+                TransactionState::Aborted => {
+                    unreachable!("Aborted: rollback clears TxIDs from version fields synchronously")
+                }
                 #[cfg(feature = "mvcc_raw_test")]
                 TransactionState::Terminated => false,
                 #[cfg(not(feature = "mvcc_raw_test"))]
-                TransactionState::Terminated => unreachable!("Terminated: rollback clears TxIDs from version fields synchronously"),
+                TransactionState::Terminated => unreachable!(
+                    "Terminated: rollback clears TxIDs from version fields synchronously"
+                ),
             };
             tracing::trace!(
                 "is_begin_visible: tx={tx}, tb={tb} rv = {:?}-{:?} visible = {visible}",
@@ -3529,15 +3535,21 @@ fn is_end_visible(
                 #[cfg(feature = "mvcc_raw_test")]
                 TransactionState::Preparing(_) => false,
                 #[cfg(not(feature = "mvcc_raw_test"))]
-                TransactionState::Preparing(_) => unreachable!("Preparing: TxIDs are replaced with Timestamps before any yield point"),
+                TransactionState::Preparing(_) => unreachable!(
+                    "Preparing: TxIDs are replaced with Timestamps before any yield point"
+                ),
                 #[cfg(feature = "mvcc_raw_test")]
                 TransactionState::Aborted => false,
                 #[cfg(not(feature = "mvcc_raw_test"))]
-                TransactionState::Aborted => unreachable!("Aborted: rollback clears end TxIDs from version fields synchronously"),
+                TransactionState::Aborted => unreachable!(
+                    "Aborted: rollback clears end TxIDs from version fields synchronously"
+                ),
                 #[cfg(feature = "mvcc_raw_test")]
                 TransactionState::Terminated => false,
                 #[cfg(not(feature = "mvcc_raw_test"))]
-                TransactionState::Terminated => unreachable!("Terminated: rollback clears end TxIDs from version fields synchronously"),
+                TransactionState::Terminated => unreachable!(
+                    "Terminated: rollback clears end TxIDs from version fields synchronously"
+                ),
             };
             tracing::trace!(
                 "is_end_visible: tx={current_tx}, te={other_tx} rv = {:?}-{:?}  visible = {visible}",
