@@ -3460,36 +3460,13 @@ fn is_begin_visible(txs: &SkipMap<TxID, Transaction>, tx: &Transaction, rv: &Row
             let visible = match tb.state.load() {
                 TransactionState::Active => tx.tx_id == tb.tx_id && rv.end.is_none(),
                 TransactionState::Committed(committed_ts) => tx.begin_ts >= committed_ts,
-                // These three states are unreachable through the normal database execution path
-                // (conn.execute → VDBE → commit/rollback) in the current single-threaded
-                // cooperative model:
-                //
-                // - Preparing: CommitState::Initial sets Preparing and immediately (via Continue,
-                //   no yield) enters CommitState::Commit which replaces all TxIDs with Timestamps
-                //   in version fields before any yield point. If validation fails, rollback clears
-                //   TxIDs synchronously.
-                // - Aborted/Terminated: rollback_tx sets Aborted, then clears all TxIDs from
-                //   version fields (rollback_row_version), then sets Terminated — all synchronously
-                //   with no yields.
-                //
-                // If multi-threaded execution is ever added, these branches must be revisited.
-                // For serializable isolation, Preparing would need speculative reads + commit
-                // dependencies (Hekaton paper Section 2.5/2.7).
-                #[cfg(feature = "mvcc_raw_test")]
-                TransactionState::Preparing(_) => false,
-                #[cfg(not(feature = "mvcc_raw_test"))]
+                // Hekaton paper Section 2.5/2.7
                 TransactionState::Preparing(_) => unreachable!(
                     "Preparing: TxIDs are replaced with Timestamps before any yield point"
                 ),
-                #[cfg(feature = "mvcc_raw_test")]
-                TransactionState::Aborted => false,
-                #[cfg(not(feature = "mvcc_raw_test"))]
                 TransactionState::Aborted => {
                     unreachable!("Aborted: rollback clears TxIDs from version fields synchronously")
                 }
-                #[cfg(feature = "mvcc_raw_test")]
-                TransactionState::Terminated => false,
-                #[cfg(not(feature = "mvcc_raw_test"))]
                 TransactionState::Terminated => unreachable!(
                     "Terminated: rollback clears TxIDs from version fields synchronously"
                 ),
@@ -3523,30 +3500,12 @@ fn is_end_visible(
                 // Source: https://avi.im/blag/2023/hekaton-paper-typo/
                 TransactionState::Active => current_tx.tx_id != other_tx.tx_id,
                 TransactionState::Committed(committed_ts) => current_tx.begin_ts < committed_ts,
-                // These three states are unreachable through the normal database execution path
-                // (see is_begin_visible comment for full explanation).
-                //
-                // NOTE: Aborted returning false here disagrees with Hekaton paper Table 2, which
-                // says "V is visible" when TE aborted (the deletion didn't happen, so the version
-                // is still alive — should return true). This is currently harmless because the
-                // branch is unreachable in normal execution (rollback_tx clears end fields before
-                // state becomes Aborted). But if multi-threaded execution is ever added, this
-                // MUST be changed to return true.
-                #[cfg(feature = "mvcc_raw_test")]
-                TransactionState::Preparing(_) => false,
-                #[cfg(not(feature = "mvcc_raw_test"))]
                 TransactionState::Preparing(_) => unreachable!(
                     "Preparing: TxIDs are replaced with Timestamps before any yield point"
                 ),
-                #[cfg(feature = "mvcc_raw_test")]
-                TransactionState::Aborted => false,
-                #[cfg(not(feature = "mvcc_raw_test"))]
                 TransactionState::Aborted => unreachable!(
                     "Aborted: rollback clears end TxIDs from version fields synchronously"
                 ),
-                #[cfg(feature = "mvcc_raw_test")]
-                TransactionState::Terminated => false,
-                #[cfg(not(feature = "mvcc_raw_test"))]
                 TransactionState::Terminated => unreachable!(
                     "Terminated: rollback clears end TxIDs from version fields synchronously"
                 ),
