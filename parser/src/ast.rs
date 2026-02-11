@@ -1187,12 +1187,14 @@ pub struct TypeOperator {
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct CreateTypeBody {
+    /// type parameter names, e.g. ["precision", "scale"] for decimal(precision, scale)
+    pub params: Vec<String>,
     /// base storage type: "text", "integer", "real", "blob"
     pub base: String,
-    /// encode function name (called on write)
-    pub encode: Option<String>,
-    /// decode function name (called on read)
-    pub decode: Option<String>,
+    /// encode expression (called on write), uses `value` placeholder for input
+    pub encode: Option<Box<Expr>>,
+    /// decode expression (called on read), uses `value` placeholder for input
+    pub decode: Option<Box<Expr>>,
     /// operator-to-function mappings
     pub operators: Vec<TypeOperator>,
     /// default expression for columns of this type

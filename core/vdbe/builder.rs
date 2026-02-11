@@ -170,6 +170,10 @@ pub struct ProgramBuilder {
     /// Temporary cursor overrides maps table internal IDs to cursor IDs that should be used instead of the normal resolution.
     /// This allows for things like hash build to use a separate cursor for iterating the same table.
     cursor_overrides: HashMap<usize, CursorID>,
+    /// Maps identifier names to registers for custom type encode/decode expressions.
+    /// When set, `Expr::Id("value")` resolves to the register holding the input value,
+    /// and type parameter names resolve to registers holding their concrete values.
+    pub id_register_overrides: HashMap<String, usize>,
     /// Hash join build signatures keyed by hash table id.
     hash_build_signatures: HashMap<usize, HashBuildSignature>,
     /// Hash tables to keep open across subplans (e.g. materialization).
@@ -415,6 +419,7 @@ impl ProgramBuilder {
             resolve_type: ResolveType::Abort,
             trigger_conflict_override: None,
             cursor_overrides: HashMap::default(),
+            id_register_overrides: HashMap::default(),
             hash_build_signatures: HashMap::default(),
             hash_tables_to_keep_open: HashSet::default(),
             subquery_result_regs: HashMap::default(),

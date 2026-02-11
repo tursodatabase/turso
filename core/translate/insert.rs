@@ -1,6 +1,5 @@
 use crate::{
     error::{SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE},
-    function::FuncCtx,
     schema::{self, BTreeTable, ColDef, Column, Index, IndexColumn, ResolvedFkRef, Schema, Table},
     sync::Arc,
     translate::{
@@ -1773,21 +1772,23 @@ pub struct AutoincMeta {
     table_name_reg: usize,
 }
 
-pub const ROWID_COLUMN: Column = Column::new(
-    None,          // name
-    String::new(), // type string
-    None,          // default
-    None,          // generated
-    schema::Type::Integer,
-    None,
-    ColDef {
-        primary_key: true,
-        rowid_alias: true,
-        notnull: true,
-        hidden: false,
-        unique: false,
-    },
-);
+pub static ROWID_COLUMN: std::sync::LazyLock<Column> = std::sync::LazyLock::new(|| {
+    Column::new(
+        None,          // name
+        String::new(), // type string
+        None,          // default
+        None,          // generated
+        schema::Type::Integer,
+        None,
+        ColDef {
+            primary_key: true,
+            rowid_alias: true,
+            notnull: true,
+            hidden: false,
+            unique: false,
+        },
+    )
+});
 
 /// Represents how a table should be populated during an INSERT.
 #[derive(Debug)]
@@ -3532,9 +3533,9 @@ pub fn emit_parent_side_fk_decrement_on_insert(
     Ok(())
 }
 
-/// Emit encode function calls for columns with custom types.
-/// For each column that has a custom type with an encode function,
-/// emit a Function instruction that transforms the value in-place.
+/// Emit encode expressions for columns with custom types.
+/// For each column that has a custom type with an encode expression,
+/// evaluates the expression with `value` bound to the column register.
 fn emit_custom_type_encode(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
@@ -3548,12 +3549,9 @@ fn emit_custom_type_encode(
         let Some(type_def) = resolver.schema.get_type_def(type_name) else {
             continue;
         };
-        let Some(ref encode_fn) = type_def.encode else {
+        let Some(ref encode_expr) = type_def.encode else {
             continue;
         };
-        let func = resolver.resolve_function(encode_fn, 1).ok_or_else(|| {
-            crate::LimboError::InternalError(format!("encode function not found: {encode_fn}"))
-        })?;
 
         // Skip NULL values: jump over encode if NULL
         let skip_label = program.allocate_label();
@@ -3562,22 +3560,15 @@ fn emit_custom_type_encode(
             target_pc: skip_label,
         });
 
-        // Emit encode function call: read from register, write back to same register
-        let arg_reg = program.alloc_register();
-        program.emit_insn(Insn::Copy {
-            src_reg: col_mapping.register,
-            dst_reg: arg_reg,
-            extra_amount: 0,
-        });
-        program.emit_insn(Insn::Function {
-            constant_mask: 0,
-            start_reg: arg_reg,
-            dest: col_mapping.register,
-            func: FuncCtx {
-                func,
-                arg_count: 1,
-            },
-        });
+        crate::translate::expr::emit_type_expr(
+            program,
+            encode_expr,
+            col_mapping.register,
+            col_mapping.register,
+            col_mapping.column,
+            type_def,
+            resolver,
+        )?;
 
         program.resolve_label(skip_label, program.offset());
     }

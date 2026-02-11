@@ -303,13 +303,7 @@ pub fn translate_inner(
             if_not_exists,
             type_name,
             body,
-        } => schema::translate_create_type(
-            &type_name,
-            &body,
-            if_not_exists,
-            resolver,
-            program,
-        )?,
+        } => schema::translate_create_type(&type_name, &body, if_not_exists, resolver, program)?,
         ast::Stmt::DropType {
             if_exists,
             type_name,

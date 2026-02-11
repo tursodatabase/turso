@@ -1,15 +1,15 @@
 use crate::ast::{
     check::ColumnCount, AlterTable, AlterTableBody, As, Cmd, ColumnConstraint, ColumnDefinition,
-    CommonTableExpr, CompoundOperator, CompoundSelect, CreateTableBody, CreateVirtualTable,
-    DeferSubclause, Distinctness, Expr, ForeignKeyClause, FrameBound, FrameClause, FrameExclude,
-    FrameMode, FromClause, FunctionTail, GroupBy, Indexed, IndexedColumn, InitDeferredPred,
-    InsertBody, JoinConstraint, JoinOperator, JoinType, JoinedSelectTable, LikeOperator, Limit,
-    Literal, Materialized, Name, NamedColumnConstraint, NamedTableConstraint, NullsOrder,
-    OneSelect, Operator, Over, PragmaBody, PragmaValue, QualifiedName, RefAct, RefArg, ResolveType,
-    ResultColumn, Select, SelectBody, SelectTable, Set, SortOrder, SortedColumn, Stmt,
-    TableConstraint, TableOptions, TransactionType, TriggerCmd, TriggerEvent, TriggerTime, Type,
-    TypeOperator, TypeSize, UnaryOperator, Update, Upsert, UpsertDo, UpsertIndex, Window,
-    WindowDef, With, CreateTypeBody,
+    CommonTableExpr, CompoundOperator, CompoundSelect, CreateTableBody, CreateTypeBody,
+    CreateVirtualTable, DeferSubclause, Distinctness, Expr, ForeignKeyClause, FrameBound,
+    FrameClause, FrameExclude, FrameMode, FromClause, FunctionTail, GroupBy, Indexed,
+    IndexedColumn, InitDeferredPred, InsertBody, JoinConstraint, JoinOperator, JoinType,
+    JoinedSelectTable, LikeOperator, Limit, Literal, Materialized, Name, NamedColumnConstraint,
+    NamedTableConstraint, NullsOrder, OneSelect, Operator, Over, PragmaBody, PragmaValue,
+    QualifiedName, RefAct, RefArg, ResolveType, ResultColumn, Select, SelectBody, SelectTable, Set,
+    SortOrder, SortedColumn, Stmt, TableConstraint, TableOptions, TransactionType, TriggerCmd,
+    TriggerEvent, TriggerTime, Type, TypeOperator, TypeSize, UnaryOperator, Update, Upsert,
+    UpsertDo, UpsertIndex, Window, WindowDef, With,
 };
 use crate::error::Error;
 use crate::lexer::{Lexer, Token};
@@ -4022,9 +4022,10 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Parse `CREATE TYPE [IF NOT EXISTS] name BASE base_type
-    ///     [ENCODE encode_fn]
-    ///     [DECODE decode_fn]
+    /// Parse `CREATE TYPE [IF NOT EXISTS] name[(param, ...)] BASE base_type
+    ///     [ENCODE expr]
+    ///     [DECODE expr]
+    ///     [DEFAULT expr]
     ///     [OPERATOR 'op' (right_type) -> func_name]*`
     fn parse_create_type(&mut self) -> Result<Stmt> {
         eat_assert!(self, TK_TYPE);
@@ -4037,15 +4038,37 @@ impl<'a> Parser<'a> {
             _ => return Err(Error::ParseError("expected type name".to_owned())),
         };
 
+        // Parse optional parameter list: (param1, param2, ...)
+        let mut params = Vec::new();
+        if let Some(tok) = self.peek()? {
+            if tok.token_type == TK_LP {
+                eat_assert!(self, TK_LP);
+                loop {
+                    let param_tok = self.eat()?;
+                    match param_tok {
+                        Some(t) if t.token_type == TK_ID => {
+                            params.push(from_bytes(t.as_bytes()));
+                        }
+                        _ => return Err(Error::ParseError("expected parameter name".to_owned())),
+                    }
+                    match self.peek()? {
+                        Some(tok) if tok.token_type == TK_COMMA => {
+                            eat_assert!(self, TK_COMMA);
+                        }
+                        _ => break,
+                    }
+                }
+                eat_expect!(self, TK_RP);
+            }
+        }
+
         // Parse BASE keyword + base type
         let base_tok = self.eat()?;
         match base_tok {
             Some(tok) if tok.token_type == TK_ID => {
                 let kw = from_bytes_as_str(tok.as_bytes());
                 if !kw.eq_ignore_ascii_case("BASE") {
-                    return Err(Error::ParseError(format!(
-                        "expected BASE, got {kw}"
-                    )));
+                    return Err(Error::ParseError(format!("expected BASE, got {kw}")));
                 }
             }
             _ => return Err(Error::ParseError("expected BASE keyword".to_owned())),
@@ -4080,27 +4103,13 @@ impl<'a> Parser<'a> {
                     match kw.as_str() {
                         "ENCODE" => {
                             eat_assert!(self, TK_ID);
-                            let fn_tok = self.eat()?;
-                            encode = Some(match fn_tok {
-                                Some(t) if t.token_type == TK_ID => from_bytes(t.as_bytes()),
-                                _ => {
-                                    return Err(Error::ParseError(
-                                        "expected function name after ENCODE".to_owned(),
-                                    ))
-                                }
-                            });
+                            let expr = self.parse_expr(0)?;
+                            encode = Some(expr);
                         }
                         "DECODE" => {
                             eat_assert!(self, TK_ID);
-                            let fn_tok = self.eat()?;
-                            decode = Some(match fn_tok {
-                                Some(t) if t.token_type == TK_ID => from_bytes(t.as_bytes()),
-                                _ => {
-                                    return Err(Error::ParseError(
-                                        "expected function name after DECODE".to_owned(),
-                                    ))
-                                }
-                            });
+                            let expr = self.parse_expr(0)?;
+                            decode = Some(expr);
                         }
                         "OPERATOR" => {
                             eat_assert!(self, TK_ID);
@@ -4159,6 +4168,7 @@ impl<'a> Parser<'a> {
             if_not_exists,
             type_name,
             body: CreateTypeBody {
+                params,
                 base,
                 encode,
                 decode,

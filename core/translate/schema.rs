@@ -178,9 +178,7 @@ fn validate(
                         b"INT" | b"INTEGER" | b"REAL" | b"TEXT" | b"BLOB" | b"ANY" => true,
                         _ => false,
                     });
-                    if !is_builtin
-                        && resolver.schema.get_type_def(&col_type.name).is_none()
-                    {
+                    if !is_builtin && resolver.schema.get_type_def(&col_type.name).is_none() {
                         bail_parse_error!(
                             "unknown datatype for {}.{}: \"{}\"",
                             table_name,
@@ -1289,7 +1287,16 @@ pub fn translate_create_type(
     }
 
     // Reconstruct the SQL string (without IF NOT EXISTS)
-    let mut sql = format!("CREATE TYPE {} BASE {}", normalized_name, body.base);
+    let mut sql = if body.params.is_empty() {
+        format!("CREATE TYPE {} BASE {}", normalized_name, body.base)
+    } else {
+        format!(
+            "CREATE TYPE {}({}) BASE {}",
+            normalized_name,
+            body.params.join(", "),
+            body.base
+        )
+    };
     if let Some(ref encode) = body.encode {
         sql.push_str(&format!(" ENCODE {encode}"));
     }

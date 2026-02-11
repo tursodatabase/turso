@@ -616,29 +616,14 @@ pub fn translate_condition_expr(
                     crate::LimboError::InternalError(format!("function not found: {func_name}"))
                 })?;
                 let arg_reg = program.alloc_registers(2);
-                translate_expr(
-                    program,
-                    Some(referenced_tables),
-                    e1,
-                    arg_reg,
-                    resolver,
-                )?;
-                translate_expr(
-                    program,
-                    Some(referenced_tables),
-                    e2,
-                    arg_reg + 1,
-                    resolver,
-                )?;
+                translate_expr(program, Some(referenced_tables), e1, arg_reg, resolver)?;
+                translate_expr(program, Some(referenced_tables), e2, arg_reg + 1, resolver)?;
                 let result_reg = program.alloc_register();
                 program.emit_insn(Insn::Function {
                     constant_mask: 0,
                     start_reg: arg_reg,
                     dest: result_reg,
-                    func: crate::function::FuncCtx {
-                        func,
-                        arg_count: 2,
-                    },
+                    func: crate::function::FuncCtx { func, arg_count: 2 },
                 });
                 emit_cond_jump(program, condition_metadata, result_reg);
             } else {
@@ -1121,10 +1106,7 @@ pub fn translate_expr(
                     constant_mask: 0,
                     start_reg: arg_reg,
                     dest: target_register,
-                    func: crate::function::FuncCtx {
-                        func,
-                        arg_count: 2,
-                    },
+                    func: crate::function::FuncCtx { func, arg_count: 2 },
                 });
                 return Ok(target_register);
             }
@@ -1240,27 +1222,12 @@ pub fn translate_expr(
             // Check if casting to a custom type
             if let Some(ref tn) = type_name {
                 if let Some(type_def) = resolver.schema.get_type_def(&tn.name) {
-                    if let Some(ref encode_fn) = type_def.encode {
-                        let func = resolver.resolve_function(encode_fn, 1).ok_or_else(|| {
-                            crate::LimboError::InternalError(format!(
-                                "encode function not found: {encode_fn}"
-                            ))
-                        })?;
-                        let arg_reg = program.alloc_register();
-                        program.emit_insn(Insn::Copy {
-                            src_reg: target_register,
-                            dst_reg: arg_reg,
-                            extra_amount: 0,
-                        });
-                        program.emit_insn(Insn::Function {
-                            constant_mask: 0,
-                            start_reg: arg_reg,
-                            dest: target_register,
-                            func: crate::function::FuncCtx {
-                                func,
-                                arg_count: 1,
-                            },
-                        });
+                    if let Some(ref encode_expr) = type_def.encode {
+                        program
+                            .id_register_overrides
+                            .insert("value".to_string(), target_register);
+                        translate_expr(program, None, encode_expr, target_register, resolver)?;
+                        program.id_register_overrides.clear();
                     }
                     return Ok(target_register);
                 }
@@ -2621,6 +2588,15 @@ pub fn translate_expr(
             }
         }
         ast::Expr::Id(id) => {
+            // Check for custom type expression overrides (e.g. `value` placeholder)
+            if let Some(&reg) = program.id_register_overrides.get(id.as_str()) {
+                program.emit_insn(Insn::Copy {
+                    src_reg: reg,
+                    dst_reg: target_register,
+                    extra_amount: 0,
+                });
+                return Ok(target_register);
+            }
             // Treat double-quoted identifiers as string literals (SQLite compatibility)
             program.emit_insn(Insn::String8 {
                 value: id.as_str().to_string(),
@@ -2819,33 +2795,21 @@ pub fn translate_expr(
 
                         // Decode custom type columns
                         if let Some(type_def) = resolver.schema.get_type_def(&column.ty_str) {
-                            if let Some(ref decode_fn) = type_def.decode {
-                                let func =
-                                    resolver.resolve_function(decode_fn, 1).ok_or_else(|| {
-                                        crate::LimboError::InternalError(format!(
-                                            "decode function not found: {decode_fn}"
-                                        ))
-                                    })?;
-                                let arg_reg = program.alloc_register();
+                            if let Some(ref decode_expr) = type_def.decode {
                                 let skip_label = program.allocate_label();
                                 program.emit_insn(Insn::IsNull {
                                     reg: target_register,
                                     target_pc: skip_label,
                                 });
-                                program.emit_insn(Insn::Copy {
-                                    src_reg: target_register,
-                                    dst_reg: arg_reg,
-                                    extra_amount: 0,
-                                });
-                                program.emit_insn(Insn::Function {
-                                    constant_mask: 0,
-                                    start_reg: arg_reg,
-                                    dest: target_register,
-                                    func: crate::function::FuncCtx {
-                                        func,
-                                        arg_count: 1,
-                                    },
-                                });
+                                emit_type_expr(
+                                    program,
+                                    decode_expr,
+                                    target_register,
+                                    target_register,
+                                    column,
+                                    type_def,
+                                    resolver,
+                                )?;
                                 program.resolve_label(skip_label, program.offset());
                             }
                         }
@@ -6094,4 +6058,50 @@ fn find_custom_type_operator(
     }
 
     None
+}
+
+/// Emit bytecode for a custom type encode/decode expression.
+/// Sets up `value` to reference `value_reg`, and type parameter overrides
+/// from `column.ty_params` matched against `type_def.params`.
+/// The expression result is written to `dest_reg`.
+pub(crate) fn emit_type_expr(
+    program: &mut ProgramBuilder,
+    expr: &turso_parser::ast::Expr,
+    value_reg: usize,
+    dest_reg: usize,
+    column: &crate::schema::Column,
+    type_def: &crate::schema::TypeDef,
+    resolver: &Resolver,
+) -> Result<usize> {
+    // Set up value override
+    program
+        .id_register_overrides
+        .insert("value".to_string(), value_reg);
+
+    // Set up type parameter overrides
+    for (i, param_name) in type_def.params.iter().enumerate() {
+        if let Some(param_expr) = column.ty_params.get(i) {
+            let reg = program.alloc_register();
+            translate_expr(program, None, param_expr, reg, resolver)?;
+            program
+                .id_register_overrides
+                .insert(param_name.clone(), reg);
+        }
+    }
+
+    // Translate the expression, disabling constant optimization since
+    // the `value` placeholder refers to a register that changes per row.
+    let result = translate_expr_no_constant_opt(
+        program,
+        None,
+        expr,
+        dest_reg,
+        resolver,
+        NoConstantOptReason::RegisterReuse,
+    );
+
+    // Clean up overrides
+    program.id_register_overrides.clear();
+
+    result
 }
