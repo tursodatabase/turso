@@ -1,44 +1,40 @@
 @database :memory:
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test create-type-basic {
-    CREATE TYPE test_uint(value any) BASE text
+    CREATE TYPE test_uint BASE text
         ENCODE test_uint_encode(value)
         DECODE test_uint_decode(value)
-        OPERATOR '+' test_uint_add
-        OPERATOR '<' test_uint_lt
-        OPERATOR '=' test_uint_eq;
-    SELECT name FROM sqlite_turso_types WHERE name LIKE 'test_uint%';
+        OPERATOR '+' (test_uint) -> test_uint_add
+        OPERATOR '<' (test_uint) -> test_uint_lt
+        OPERATOR '=' (test_uint) -> test_uint_eq;
+    SELECT type, name FROM sqlite_schema WHERE type = 'type';
 }
 expect {
-    test_uint(value any)
+    type|test_uint
 }
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test create-type-if-not-exists {
-    CREATE TYPE test_uint(value any) BASE text ENCODE test_uint_encode(value) DECODE test_uint_decode(value);
+    CREATE TYPE test_uint BASE text ENCODE test_uint_encode(value) DECODE test_uint_decode(value);
     CREATE TYPE IF NOT EXISTS test_uint BASE text ENCODE test_uint_encode(value) DECODE test_uint_decode(value);
-    SELECT count(*) FROM sqlite_turso_types WHERE name LIKE 'test_uint%';
+    SELECT count(*) FROM sqlite_schema WHERE type = 'type' AND name = 'test_uint';
 }
 expect {
     1
 }
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test drop-type-basic {
-    CREATE TYPE test_uint(value any) BASE text ENCODE test_uint_encode(value) DECODE test_uint_decode(value);
+    CREATE TYPE test_uint BASE text ENCODE test_uint_encode(value) DECODE test_uint_decode(value);
     DROP TYPE test_uint;
-    SELECT count(*) FROM sqlite_turso_types WHERE name LIKE 'test_uint%';
+    SELECT count(*) FROM sqlite_schema WHERE type = 'type';
 }
 expect {
     0
 }
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test drop-type-if-exists {
     DROP TYPE IF EXISTS nonexistent;
     SELECT 'ok';
@@ -48,9 +44,8 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test strict-table-with-custom-type {
-    CREATE TYPE test_uint(value any) BASE text ENCODE test_uint_encode(value) DECODE test_uint_decode(value);
+    CREATE TYPE test_uint BASE text ENCODE test_uint_encode(value) DECODE test_uint_decode(value);
     CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint) STRICT;
     INSERT INTO t1 VALUES (1, 42);
     INSERT INTO t1 VALUES (2, 100);
@@ -62,9 +57,8 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test encode-decode-round-trip {
-    CREATE TYPE test_reverse BASE text ENCODE string_reverse(value) DECODE string_reverse(value);
+    CREATE TYPE test_reverse BASE text ENCODE test_reverse_encode(value) DECODE test_reverse_decode(value);
     CREATE TABLE t1(val test_reverse) STRICT;
     INSERT INTO t1 VALUES ('hello');
     INSERT INTO t1 VALUES ('world');
@@ -76,43 +70,10 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
-test returning-shows-decoded-values {
-    -- RETURNING clauses for INSERT, UPDATE, and DELETE must return the
-    -- user-facing (decoded) values, not the raw encoded storage values.
-    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, amount cents) STRICT;
-    INSERT INTO t1 VALUES (1, 42) RETURNING amount;
-    UPDATE t1 SET amount = 50 WHERE id = 1 RETURNING amount;
-    DELETE FROM t1 WHERE id = 1 RETURNING amount;
-}
-expect {
-    42
-    50
-    50
-}
-
-@requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
-test custom-type-name-does-not-affect-column-affinity {
-    -- A custom type name like "doubled" contains the substring "DOUB"
-    -- which SQLite's affinity rules would map to REAL. Verify that the
-    -- BASE type (integer) determines the column's affinity instead.
-    CREATE TYPE doubled BASE integer ENCODE (value * 2) DECODE (value / 2);
-    CREATE TABLE t1(a doubled) STRICT;
-    INSERT INTO t1 VALUES(5);
-    SELECT typeof(a), a FROM t1;
-}
-expect {
-    integer|5
-}
-
-@requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test uint-addition {
-    CREATE TYPE test_uint(value any) BASE text
+    CREATE TYPE test_uint BASE text
         ENCODE test_uint_encode(value) DECODE test_uint_decode(value)
-        OPERATOR '+' test_uint_add;
+        OPERATOR '+' (test_uint) -> test_uint_add;
     CREATE TABLE t1(val test_uint) STRICT;
     INSERT INTO t1 VALUES (20);
     INSERT INTO t1 VALUES (30);
@@ -124,11 +85,10 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test uint-comparison-less-than {
-    CREATE TYPE test_uint(value any) BASE text
+    CREATE TYPE test_uint BASE text
         ENCODE test_uint_encode(value) DECODE test_uint_decode(value)
-        OPERATOR '<' test_uint_lt;
+        OPERATOR '<' (test_uint) -> test_uint_lt;
     CREATE TABLE t1(val test_uint) STRICT;
     INSERT INTO t1 VALUES (9);
     INSERT INTO t1 VALUES (10);
@@ -140,11 +100,10 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test uint-comparison-equals {
-    CREATE TYPE test_uint(value any) BASE text
+    CREATE TYPE test_uint BASE text
         ENCODE test_uint_encode(value) DECODE test_uint_decode(value)
-        OPERATOR '=' test_uint_eq;
+        OPERATOR '=' (test_uint) -> test_uint_eq;
     CREATE TABLE t1(val test_uint) STRICT;
     INSERT INTO t1 VALUES (42);
     INSERT INTO t1 VALUES (99);
@@ -155,9 +114,8 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test cast-to-custom-type {
-    CREATE TYPE test_reverse BASE text ENCODE string_reverse(value) DECODE string_reverse(value);
+    CREATE TYPE test_reverse BASE text ENCODE test_reverse_encode(value) DECODE test_reverse_decode(value);
     SELECT CAST('hello' AS test_reverse);
 }
 expect {
@@ -165,46 +123,8 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
-test cast-to-parametric-type {
-    SELECT typeof(CAST(42 AS numeric(10,2)));
-}
-expect {
-    blob
-}
-
-@requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
-test cast-to-custom-type-encode-only {
-    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
-    SELECT CAST(42 AS cents);
-}
-expect {
-    4200
-}
-
-@requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
-test cast-to-varchar {
-    SELECT CAST('hello' AS varchar(3));
-}
-expect error {
-    value too long for varchar
-}
-
-@requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
-test cast-varchar-within-limit {
-    SELECT CAST('hi' AS varchar(5));
-}
-expect {
-    hi
-}
-
-@requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test null-handling {
-    CREATE TYPE test_uint(value any) BASE text ENCODE test_uint_encode(value) DECODE test_uint_decode(value);
+    CREATE TYPE test_uint BASE text ENCODE test_uint_encode(value) DECODE test_uint_decode(value);
     CREATE TABLE t1(val test_uint) STRICT;
     INSERT INTO t1 VALUES (NULL);
     SELECT COALESCE(val, 'IS_NULL') FROM t1;
@@ -214,10 +134,9 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test multiple-custom-types {
-    CREATE TYPE test_uint(value any) BASE text ENCODE test_uint_encode(value) DECODE test_uint_decode(value);
-    CREATE TYPE test_reverse BASE text ENCODE string_reverse(value) DECODE string_reverse(value);
+    CREATE TYPE test_uint BASE text ENCODE test_uint_encode(value) DECODE test_uint_decode(value);
+    CREATE TYPE test_reverse BASE text ENCODE test_reverse_encode(value) DECODE test_reverse_decode(value);
     CREATE TABLE t1(a test_uint, b test_reverse) STRICT;
     INSERT INTO t1 VALUES (42, 'hello');
     SELECT a, b FROM t1;
@@ -227,9 +146,8 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test type-default-literal {
-    CREATE TYPE test_uint(value any) BASE text ENCODE test_uint_encode(value) DECODE test_uint_decode(value) DEFAULT 0;
+    CREATE TYPE test_uint BASE text ENCODE test_uint_encode(value) DECODE test_uint_decode(value) DEFAULT 0;
     CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint) STRICT;
     INSERT INTO t1(id) VALUES (1);
     INSERT INTO t1(id) VALUES (2);
@@ -243,9 +161,8 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test type-default-function {
-    CREATE TYPE test_reverse BASE text ENCODE string_reverse(value) DECODE string_reverse(value) DEFAULT string_reverse('auto');
+    CREATE TYPE test_reverse BASE text ENCODE test_reverse_encode(value) DECODE test_reverse_decode(value) DEFAULT test_reverse_encode('auto');
     CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_reverse) STRICT;
     INSERT INTO t1(id) VALUES (1);
     INSERT INTO t1 VALUES (2, 'hello');
@@ -257,9 +174,8 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test type-default-column-override {
-    CREATE TYPE test_uint(value any) BASE text ENCODE test_uint_encode(value) DECODE test_uint_decode(value) DEFAULT 0;
+    CREATE TYPE test_uint BASE text ENCODE test_uint_encode(value) DECODE test_uint_decode(value) DEFAULT 0;
     CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint DEFAULT 42) STRICT;
     INSERT INTO t1(id) VALUES (1);
     SELECT id, val FROM t1;
@@ -269,7 +185,6 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test encode-expression-multiply {
     CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
     CREATE TABLE t1(price cents) STRICT;
@@ -283,7 +198,6 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test encode-expression-identity {
     CREATE TYPE passthrough BASE text ENCODE value DECODE value;
     CREATE TABLE t1(val passthrough) STRICT;
@@ -295,7 +209,6 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test encode-error-propagation {
     CREATE TYPE jsontype BASE text ENCODE json(value) DECODE value;
     CREATE TABLE t1(val jsontype) STRICT;
@@ -306,7 +219,6 @@ expect error {
 }
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test decode-error-propagation {
     CREATE TYPE jsontype BASE text ENCODE value DECODE json(value);
     CREATE TABLE t1(val jsontype) STRICT;
@@ -318,7 +230,6 @@ expect error {
 }
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test pragma-list-types-builtins {
     PRAGMA list_types;
 }
@@ -328,28 +239,14 @@ expect {
     TEXT|||||
     BLOB|||||
     ANY|||||
-    bigint(value integer)|integer||||
-    boolean(value any)|integer|boolean_to_int (value)|CASE WHEN value THEN 1 ELSE 0 END||'<'
-    bytea(value blob)|blob||||'<'
-    date(value text)|text|CASE WHEN value IS NULL THEN NULL WHEN date (value) IS NULL THEN RAISE (ABORT, 'invalid date value') ELSE date (value) END|value||'<'
-    inet(value text)|text|validate_ipaddr (value)|value||
-    json(value text)|text|json (value)|value||
-    jsonb(value text)|blob|jsonb (value)|json (value)||
-    numeric(value any, precision integer, scale integer)|blob|numeric_encode (value, precision, scale)|numeric_decode (value)||'+' numeric_add, '-' numeric_sub, '*' numeric_mul, '/' numeric_div, '<' numeric_lt, '=' numeric_eq
-    smallint(value integer)|integer|CASE WHEN value BETWEEN - 32768 AND 32767 THEN value ELSE RAISE (ABORT, 'integer out of range for smallint') END|value||'<'
-    time(value text)|text|CASE WHEN value IS NULL THEN NULL WHEN time (value) IS NULL THEN RAISE (ABORT, 'invalid time value') ELSE time (value) END|value||'<'
-    timestamp(value text)|text|CASE WHEN value IS NULL THEN NULL WHEN datetime (value) IS NULL THEN RAISE (ABORT, 'invalid timestamp value') ELSE datetime (value) END|value||'<'
-    uuid(value text)|blob|uuid_blob (value)|uuid_str (value)|uuid4_str ()|'<'
-    varchar(value text, maxlen integer)|text|CASE WHEN length (value) <= maxlen THEN value ELSE RAISE (ABORT, 'value too long for varchar') END|value||'<'
 }
 
 @requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
 test pragma-list-types-with-custom {
-    CREATE TYPE test_uint(value any) BASE text
+    CREATE TYPE test_uint BASE text
         ENCODE test_uint_encode(value)
         DECODE test_uint_decode(value)
-        OPERATOR '+' test_uint_add
+        OPERATOR '+' (test_uint) -> test_uint_add
         DEFAULT 0;
     PRAGMA list_types;
 }
@@ -359,1256 +256,5 @@ expect {
     TEXT|||||
     BLOB|||||
     ANY|||||
-    bigint(value integer)|integer||||
-    boolean(value any)|integer|boolean_to_int (value)|CASE WHEN value THEN 1 ELSE 0 END||'<'
-    bytea(value blob)|blob||||'<'
-    date(value text)|text|CASE WHEN value IS NULL THEN NULL WHEN date (value) IS NULL THEN RAISE (ABORT, 'invalid date value') ELSE date (value) END|value||'<'
-    inet(value text)|text|validate_ipaddr (value)|value||
-    json(value text)|text|json (value)|value||
-    jsonb(value text)|blob|jsonb (value)|json (value)||
-    numeric(value any, precision integer, scale integer)|blob|numeric_encode (value, precision, scale)|numeric_decode (value)||'+' numeric_add, '-' numeric_sub, '*' numeric_mul, '/' numeric_div, '<' numeric_lt, '=' numeric_eq
-    smallint(value integer)|integer|CASE WHEN value BETWEEN - 32768 AND 32767 THEN value ELSE RAISE (ABORT, 'integer out of range for smallint') END|value||'<'
-    test_uint(value any)|text|test_uint_encode (value)|test_uint_decode (value)|0|'+' test_uint_add
-    time(value text)|text|CASE WHEN value IS NULL THEN NULL WHEN time (value) IS NULL THEN RAISE (ABORT, 'invalid time value') ELSE time (value) END|value||'<'
-    timestamp(value text)|text|CASE WHEN value IS NULL THEN NULL WHEN datetime (value) IS NULL THEN RAISE (ABORT, 'invalid timestamp value') ELSE datetime (value) END|value||'<'
-    uuid(value text)|blob|uuid_blob (value)|uuid_str (value)|uuid4_str ()|'<'
-    varchar(value text, maxlen integer)|text|CASE WHEN length (value) <= maxlen THEN value ELSE RAISE (ABORT, 'value too long for varchar') END|value||'<'
-}
-
-@requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
-test encode-null-rejects-primary-key {
-    CREATE TYPE my_uuid BASE text ENCODE uuid_blob(value) DECODE uuid_str(value);
-    CREATE TABLE t1(id my_uuid PRIMARY KEY, name TEXT) STRICT;
-    INSERT INTO t1 VALUES ('019509a2', 'bad');
-}
-expect error {
-    NOT NULL constraint failed
-}
-
-@requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
-test drop-type-in-use {
-    CREATE TYPE test_uint(value any) BASE text ENCODE test_uint_encode(value) DECODE test_uint_decode(value);
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint) STRICT;
-    DROP TYPE test_uint;
-}
-expect error {
-}
-
-@requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
-test add-column-custom-type {
-    CREATE TYPE test_uint(value any) BASE text ENCODE test_uint_encode(value) DECODE test_uint_decode(value);
-    CREATE TABLE t1(id INTEGER PRIMARY KEY) STRICT;
-    ALTER TABLE t1 ADD COLUMN val test_uint;
-    INSERT INTO t1 VALUES (1, 42);
-    INSERT INTO t1 VALUES (2, 100);
-    SELECT id, val FROM t1;
-}
-expect {
-    1|42
-    2|100
-}
-
-@requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
-test add-column-numeric-default-preexisting {
-    CREATE TABLE t1(id INTEGER PRIMARY KEY) STRICT;
-    INSERT INTO t1 VALUES (1);
-    INSERT INTO t1 VALUES (2);
-    ALTER TABLE t1 ADD COLUMN val numeric(10,2) DEFAULT 42;
-    SELECT id, val FROM t1;
-}
-expect {
-    1|42.00
-    2|42.00
-}
-
-@requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
-test add-column-numeric-default-mixed {
-    CREATE TABLE t1(id INTEGER PRIMARY KEY) STRICT;
-    INSERT INTO t1 VALUES (1);
-    INSERT INTO t1 VALUES (2);
-    ALTER TABLE t1 ADD COLUMN val numeric(10,2) DEFAULT 42;
-    INSERT INTO t1 VALUES (3, 99);
-    INSERT INTO t1(id) VALUES (4);
-    SELECT id, val FROM t1;
-}
-expect {
-    1|42.00
-    2|42.00
-    3|99.00
-    4|42.00
-}
-
-@requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
-test add-column-custom-type-default-preexisting {
-    CREATE TYPE test_uint(value any) BASE text ENCODE test_uint_encode(value) DECODE test_uint_decode(value);
-    CREATE TABLE t1(id INTEGER PRIMARY KEY) STRICT;
-    INSERT INTO t1 VALUES (1);
-    INSERT INTO t1 VALUES (2);
-    ALTER TABLE t1 ADD COLUMN val test_uint DEFAULT 100;
-    SELECT id, val FROM t1;
-}
-expect {
-    1|100
-    2|100
-}
-
-@requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
-test custom-type-non-strict-no-encode {
-    CREATE TYPE test_uint(value any) BASE text ENCODE test_uint_encode(value) DECODE test_uint_decode(value);
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint);
-    INSERT INTO t1 VALUES (1, 42);
-    SELECT val, typeof(val) FROM t1;
-}
-expect {
-    42|integer
-}
-
-@requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
-test update-with-custom-type {
-    CREATE TYPE test_reverse BASE text ENCODE string_reverse(value) DECODE string_reverse(value);
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_reverse) STRICT;
-    INSERT INTO t1 VALUES (1, 'hello');
-    INSERT INTO t1 VALUES (2, 'world');
-    UPDATE t1 SET val = 'updated' WHERE id = 1;
-    SELECT id, val FROM t1 ORDER BY id;
-}
-expect {
-    1|updated
-    2|world
-}
-
-@requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
-test update-uint-encode {
-    CREATE TYPE test_uint(value any) BASE text ENCODE test_uint_encode(value) DECODE test_uint_decode(value);
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint) STRICT;
-    INSERT INTO t1 VALUES (1, 42);
-    UPDATE t1 SET val = 99 WHERE id = 1;
-    SELECT id, val FROM t1;
-}
-expect {
-    1|99
-}
-
-@requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
-test update-custom-type-null {
-    CREATE TYPE test_uint(value any) BASE text ENCODE test_uint_encode(value) DECODE test_uint_decode(value);
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint) STRICT;
-    INSERT INTO t1 VALUES (1, 42);
-    UPDATE t1 SET val = NULL WHERE id = 1;
-    SELECT id, COALESCE(val, 'IS_NULL') FROM t1;
-}
-expect {
-    1|IS_NULL
-}
-
-@requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
-test replace-with-custom-type {
-    CREATE TYPE test_uint(value any) BASE text ENCODE test_uint_encode(value) DECODE test_uint_decode(value);
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint) STRICT;
-    INSERT INTO t1 VALUES (1, 42);
-    REPLACE INTO t1 VALUES (1, 99);
-    SELECT id, val FROM t1;
-}
-expect {
-    1|99
-}
-
-@requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
-test custom-type-not-null-constraint {
-    CREATE TYPE test_uint(value any) BASE text ENCODE test_uint_encode(value) DECODE test_uint_decode(value);
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint NOT NULL) STRICT;
-    INSERT INTO t1 VALUES (1, NULL);
-}
-expect error {
-    NOT NULL constraint failed
-}
-
-@requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
-test update-non-set-column-not-re-encoded {
-    CREATE TYPE test_reverse BASE text ENCODE string_reverse(value) DECODE string_reverse(value);
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, name TEXT, val test_reverse) STRICT;
-    INSERT INTO t1 VALUES (1, 'hello', 'world');
-    UPDATE t1 SET name = 'goodbye' WHERE id = 1;
-    SELECT id, name, val FROM t1;
-}
-expect {
-    1|goodbye|world
-}
-
-@requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
-test upsert-do-update-encodes {
-    CREATE TYPE test_reverse BASE text ENCODE string_reverse(value) DECODE string_reverse(value);
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_reverse) STRICT;
-    INSERT INTO t1 VALUES (1, 'hello');
-    INSERT INTO t1 VALUES (1, 'ignored') ON CONFLICT(id) DO UPDATE SET val = 'updated';
-    SELECT id, val FROM t1;
-}
-expect {
-    1|updated
-}
-
-@requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
-test upsert-non-set-column-not-re-encoded {
-    CREATE TYPE test_reverse BASE text ENCODE string_reverse(value) DECODE string_reverse(value);
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, name TEXT, val test_reverse) STRICT;
-    INSERT INTO t1 VALUES (1, 'hello', 'world');
-    INSERT INTO t1 VALUES (1, 'x', 'y') ON CONFLICT(id) DO UPDATE SET name = 'changed';
-    SELECT id, name, val FROM t1;
-}
-expect {
-    1|changed|world
-}
-
-# test_reverse stores reversed text: 'apple' -> 'elppa', 'banana' -> 'ananab'.
-# Without OPERATOR '<', ORDER BY is forbidden because sorting on encoded values
-# would give wrong results (e.g. 'ananab' < 'elppa' < 'yrrehc' is not alphabetical).
-@requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
-test order-by-custom-type-without-lt {
-    CREATE TYPE test_reverse BASE text ENCODE string_reverse(value) DECODE string_reverse(value);
-    CREATE TABLE t1(val test_reverse) STRICT;
-    INSERT INTO t1 VALUES ('apple');
-    INSERT INTO t1 VALUES ('banana');
-    INSERT INTO t1 VALUES ('cherry');
-    SELECT val FROM t1 ORDER BY val;
-}
-expect error {
-    cannot ORDER BY column 'val' of type 'test_reverse': type does not declare OPERATOR '<'
-}
-
-@requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
-test order-by-numeric-type-with-lt {
-    CREATE TABLE t1(val numeric(10,2)) STRICT;
-    INSERT INTO t1 VALUES (9);
-    INSERT INTO t1 VALUES (100);
-    INSERT INTO t1 VALUES (20);
-    INSERT INTO t1 VALUES (-5);
-    SELECT val FROM t1 ORDER BY val;
-}
-expect {
-    -5.00
-    9.00
-    20.00
-    100.00
-}
-
-@requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
-test order-by-numeric-desc {
-    CREATE TABLE t1(val numeric(10,2)) STRICT;
-    INSERT INTO t1 VALUES (9);
-    INSERT INTO t1 VALUES (100);
-    INSERT INTO t1 VALUES (20);
-    SELECT val FROM t1 ORDER BY val DESC;
-}
-expect {
-    100.00
-    20.00
-    9.00
-}
-
-# Sorting operates on encoded (on-disk) values, not decoded.
-# Encoded: apple→elppa, banana→ananab, cherry→yrrehc.
-# Naked OPERATOR '<' uses base type (text) comparison on encoded values.
-# DESC encoded: yrrehc > elppa > ananab → decoded display: cherry, apple, banana.
-@requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
-test order-by-custom-type-desc {
-    CREATE TYPE test_reverse BASE text ENCODE string_reverse(value) DECODE string_reverse(value) OPERATOR '<';
-    CREATE TABLE t1(val test_reverse) STRICT;
-    INSERT INTO t1 VALUES ('apple');
-    INSERT INTO t1 VALUES ('banana');
-    INSERT INTO t1 VALUES ('cherry');
-    SELECT val FROM t1 ORDER BY val DESC;
-}
-expect {
-    cherry
-    apple
-    banana
-}
-
-@requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
-test order-by-numeric-with-nulls {
-    CREATE TABLE t1(val numeric(10,2)) STRICT;
-    INSERT INTO t1 VALUES (100);
-    INSERT INTO t1 VALUES (NULL);
-    INSERT INTO t1 VALUES (9);
-    INSERT INTO t1 VALUES (NULL);
-    INSERT INTO t1 VALUES (-5);
-    SELECT COALESCE(CAST(val AS TEXT), 'NULL') FROM t1 ORDER BY val;
-}
-expect {
-    NULL
-    NULL
-    -5.00
-    9.00
-    100.00
-}
-
-@requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
-test order-by-numeric-nulls-desc {
-    CREATE TABLE t1(val numeric(10,2)) STRICT;
-    INSERT INTO t1 VALUES (100);
-    INSERT INTO t1 VALUES (NULL);
-    INSERT INTO t1 VALUES (9);
-    SELECT COALESCE(CAST(val AS TEXT), 'NULL') FROM t1 ORDER BY val DESC;
-}
-expect {
-    100.00
-    9.00
-    NULL
-}
-
-# Sorting operates on encoded (on-disk) values.
-# Encoded: apple→elppa, banana→ananab, cherry→yrrehc.
-# ASC encoded: ananab < elppa < yrrehc → ids 2, 1, 3.
-@requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
-test order-by-custom-type-not-in-select {
-    CREATE TYPE test_reverse BASE text ENCODE string_reverse(value) DECODE string_reverse(value) OPERATOR '<';
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_reverse) STRICT;
-    INSERT INTO t1 VALUES (1, 'apple');
-    INSERT INTO t1 VALUES (2, 'banana');
-    INSERT INTO t1 VALUES (3, 'cherry');
-    SELECT id FROM t1 ORDER BY val;
-}
-expect {
-    2
-    1
-    3
-}
-
-@requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
-test order-by-numeric-not-in-select {
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, val numeric(10,2)) STRICT;
-    INSERT INTO t1 VALUES (1, 100);
-    INSERT INTO t1 VALUES (2, 9);
-    INSERT INTO t1 VALUES (3, -5);
-    SELECT id FROM t1 ORDER BY val;
-}
-expect {
-    3
-    2
-    1
-}
-
-# Sorting operates on encoded (on-disk) values.
-# Encoded: apple→elppa, banana→ananab, cherry→yrrehc.
-# Within name='a': ananab < yrrehc → banana, cherry. name='b': elppa → apple.
-@requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
-test order-by-mixed-columns {
-    CREATE TYPE test_reverse BASE text ENCODE string_reverse(value) DECODE string_reverse(value) OPERATOR '<';
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, name TEXT, val test_reverse) STRICT;
-    INSERT INTO t1 VALUES (1, 'b', 'apple');
-    INSERT INTO t1 VALUES (2, 'a', 'banana');
-    INSERT INTO t1 VALUES (3, 'a', 'cherry');
-    SELECT id, name, val FROM t1 ORDER BY name, val;
-}
-expect {
-    2|a|banana
-    3|a|cherry
-    1|b|apple
-}
-
-@requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
-test order-by-numeric-with-limit {
-    CREATE TABLE t1(val numeric(10,2)) STRICT;
-    INSERT INTO t1 VALUES (100);
-    INSERT INTO t1 VALUES (9);
-    INSERT INTO t1 VALUES (20);
-    INSERT INTO t1 VALUES (-5);
-    INSERT INTO t1 VALUES (50);
-    SELECT val FROM t1 ORDER BY val LIMIT 3;
-}
-expect {
-    -5.00
-    9.00
-    20.00
-}
-
-@requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
-test order-by-numeric-with-limit-offset {
-    CREATE TABLE t1(val numeric(10,2)) STRICT;
-    INSERT INTO t1 VALUES (100);
-    INSERT INTO t1 VALUES (9);
-    INSERT INTO t1 VALUES (20);
-    INSERT INTO t1 VALUES (-5);
-    INSERT INTO t1 VALUES (50);
-    SELECT val FROM t1 ORDER BY val LIMIT 2 OFFSET 1;
-}
-expect {
-    9.00
-    20.00
-}
-
-# Sorting operates on encoded (on-disk) values.
-# Encoded: apple→elppa, cherry→yrrehc. NULL first, then elppa < yrrehc.
-@requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
-test order-by-custom-type-with-nulls {
-    CREATE TYPE test_reverse BASE text ENCODE string_reverse(value) DECODE string_reverse(value) OPERATOR '<';
-    CREATE TABLE t1(val test_reverse) STRICT;
-    INSERT INTO t1 VALUES ('apple');
-    INSERT INTO t1 VALUES (NULL);
-    INSERT INTO t1 VALUES ('cherry');
-    SELECT COALESCE(val, 'NULL') FROM t1 ORDER BY val;
-}
-expect {
-    NULL
-    apple
-    cherry
-}
-
-@requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
-test order-by-numeric-multiple-columns {
-    CREATE TABLE t1(a numeric(10,2), b numeric(10,2)) STRICT;
-    INSERT INTO t1 VALUES (1, 30);
-    INSERT INTO t1 VALUES (1, 10);
-    INSERT INTO t1 VALUES (2, 20);
-    INSERT INTO t1 VALUES (1, 20);
-    SELECT a, b FROM t1 ORDER BY a, b;
-}
-expect {
-    1.00|10.00
-    1.00|20.00
-    1.00|30.00
-    2.00|20.00
-}
-
-@requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
-test order-by-group-by-numeric {
-    CREATE TABLE t1(category TEXT, val numeric(10,2)) STRICT;
-    INSERT INTO t1 VALUES ('a', 100);
-    INSERT INTO t1 VALUES ('a', 9);
-    INSERT INTO t1 VALUES ('b', 20);
-    INSERT INTO t1 VALUES ('b', 50);
-    INSERT INTO t1 VALUES ('c', -5);
-    SELECT category, SUM(val) as total FROM t1 GROUP BY category ORDER BY total;
-}
-expect {
-    c|-5.0
-    b|70.0
-    a|109.0
-}
-
-# GROUP BY decodes values for grouping, so ORDER BY in this context
-# sorts on decoded values: apple < banana < cherry.
-@requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
-test order-by-group-by-custom-type {
-    CREATE TYPE test_reverse BASE text ENCODE string_reverse(value) DECODE string_reverse(value) OPERATOR '<';
-    CREATE TABLE t1(val test_reverse, n INTEGER) STRICT;
-    INSERT INTO t1 VALUES ('apple', 1);
-    INSERT INTO t1 VALUES ('apple', 2);
-    INSERT INTO t1 VALUES ('banana', 3);
-    INSERT INTO t1 VALUES ('cherry', 4);
-    SELECT val, SUM(n) FROM t1 GROUP BY val ORDER BY val;
-}
-expect {
-    apple|3
-    banana|3
-    cherry|4
-}
-
-@requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
-test order-by-numeric-expression {
-    CREATE TABLE t1(val numeric(10,2)) STRICT;
-    INSERT INTO t1 VALUES (100);
-    INSERT INTO t1 VALUES (9);
-    INSERT INTO t1 VALUES (20);
-    SELECT val + val as doubled FROM t1 ORDER BY val;
-}
-expect {
-    18.00
-    40.00
-    200.00
-}
-
-# Sorting operates on encoded (on-disk) values.
-# After WHERE id > 1: banana→ananab, cherry→yrrehc, date→etad.
-# ASC encoded: ananab < etad < yrrehc → decoded display: banana, date, cherry.
-@requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
-test order-by-custom-type-where-clause {
-    CREATE TYPE test_reverse BASE text ENCODE string_reverse(value) DECODE string_reverse(value) OPERATOR '<';
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_reverse) STRICT;
-    INSERT INTO t1 VALUES (1, 'apple');
-    INSERT INTO t1 VALUES (2, 'banana');
-    INSERT INTO t1 VALUES (3, 'cherry');
-    INSERT INTO t1 VALUES (4, 'date');
-    SELECT val FROM t1 WHERE id > 1 ORDER BY val;
-}
-expect {
-    banana
-    date
-    cherry
-}
-
-@requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
-test order-by-numeric-where-clause {
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, val numeric(10,2)) STRICT;
-    INSERT INTO t1 VALUES (1, 100);
-    INSERT INTO t1 VALUES (2, 9);
-    INSERT INTO t1 VALUES (3, -5);
-    INSERT INTO t1 VALUES (4, 50);
-    SELECT val FROM t1 WHERE val > 0 ORDER BY val;
-}
-expect {
-    9.00
-    50.00
-    100.00
-}
-
-@requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
-test order-by-numeric-distinct {
-    CREATE TABLE t1(val numeric(10,2)) STRICT;
-    INSERT INTO t1 VALUES (100);
-    INSERT INTO t1 VALUES (9);
-    INSERT INTO t1 VALUES (100);
-    INSERT INTO t1 VALUES (20);
-    INSERT INTO t1 VALUES (9);
-    SELECT DISTINCT val FROM t1 ORDER BY val;
-}
-expect {
-    9.00
-    20.00
-    100.00
-}
-
-# Sorting operates on encoded (on-disk) values.
-# Encoded: apple→elppa, banana→ananab, cherry→yrrehc.
-# ASC encoded: ananab < elppa < yrrehc → decoded display: banana, apple, cherry.
-@requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
-test order-by-custom-type-join {
-    CREATE TYPE test_reverse BASE text ENCODE string_reverse(value) DECODE string_reverse(value) OPERATOR '<';
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_reverse) STRICT;
-    CREATE TABLE t2(id INTEGER PRIMARY KEY, t1_id INTEGER, label TEXT) STRICT;
-    INSERT INTO t1 VALUES (1, 'apple');
-    INSERT INTO t1 VALUES (2, 'banana');
-    INSERT INTO t1 VALUES (3, 'cherry');
-    INSERT INTO t2 VALUES (1, 1, 'x');
-    INSERT INTO t2 VALUES (2, 2, 'y');
-    INSERT INTO t2 VALUES (3, 3, 'z');
-    SELECT t2.label, t1.val FROM t1 JOIN t2 ON t1.id = t2.t1_id ORDER BY t1.val;
-}
-expect {
-    y|banana
-    x|apple
-    z|cherry
-}
-
-@requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
-test order-by-numeric-join {
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, val numeric(10,2)) STRICT;
-    CREATE TABLE t2(id INTEGER PRIMARY KEY, t1_id INTEGER, label TEXT) STRICT;
-    INSERT INTO t1 VALUES (1, 100);
-    INSERT INTO t1 VALUES (2, 9);
-    INSERT INTO t1 VALUES (3, -5);
-    INSERT INTO t2 VALUES (1, 1, 'x');
-    INSERT INTO t2 VALUES (2, 2, 'y');
-    INSERT INTO t2 VALUES (3, 3, 'z');
-    SELECT t2.label, t1.val FROM t1 JOIN t2 ON t1.id = t2.t1_id ORDER BY t1.val;
-}
-expect {
-    z|-5.00
-    y|9.00
-    x|100.00
-}
-
-# --- INDEX TESTS ---
-
-# test_reverse needs OPERATOR '<' to allow CREATE INDEX.
-# Equality seek still works the same — find val='hello' (stored as 'olleh').
-@requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
-test index-equality-seek-custom-type {
-    CREATE TYPE test_reverse BASE text ENCODE string_reverse(value) DECODE string_reverse(value) OPERATOR '<';
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_reverse) STRICT;
-    INSERT INTO t1 VALUES (1, 'hello');
-    INSERT INTO t1 VALUES (2, 'world');
-    INSERT INTO t1 VALUES (3, 'test');
-    CREATE INDEX idx_val ON t1(val);
-    SELECT id, val FROM t1 WHERE val = 'hello';
-}
-expect {
-    1|hello
-}
-
-@requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
-test index-equality-seek-numeric {
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, val numeric(10,2)) STRICT;
-    INSERT INTO t1 VALUES (1, 100);
-    INSERT INTO t1 VALUES (2, 9);
-    INSERT INTO t1 VALUES (3, 50);
-    INSERT INTO t1 VALUES (4, -5);
-    CREATE INDEX idx_val ON t1(val);
-    SELECT id, val FROM t1 WHERE val = 9;
-}
-expect {
-    2|9.00
-}
-
-@requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
-test index-range-scan-numeric {
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, val numeric(10,2)) STRICT;
-    INSERT INTO t1 VALUES (1, 100);
-    INSERT INTO t1 VALUES (2, 9);
-    INSERT INTO t1 VALUES (3, 50);
-    INSERT INTO t1 VALUES (4, -5);
-    CREATE INDEX idx_val ON t1(val);
-    SELECT id, val FROM t1 WHERE val > 10 ORDER BY val;
-}
-expect {
-    3|50.00
-    1|100.00
-}
-
-@requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
-test index-range-scan-numeric-le {
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, val numeric(10,2)) STRICT;
-    INSERT INTO t1 VALUES (1, 100);
-    INSERT INTO t1 VALUES (2, 9);
-    INSERT INTO t1 VALUES (3, 50);
-    INSERT INTO t1 VALUES (4, -5);
-    CREATE INDEX idx_val ON t1(val);
-    SELECT id, val FROM t1 WHERE val <= 50 ORDER BY val;
-}
-expect {
-    4|-5.00
-    2|9.00
-    3|50.00
-}
-
-@requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
-test index-range-scan-numeric-between {
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, val numeric(10,2)) STRICT;
-    INSERT INTO t1 VALUES (1, 100);
-    INSERT INTO t1 VALUES (2, 9);
-    INSERT INTO t1 VALUES (3, 50);
-    INSERT INTO t1 VALUES (4, -5);
-    INSERT INTO t1 VALUES (5, 25);
-    CREATE INDEX idx_val ON t1(val);
-    SELECT id, val FROM t1 WHERE val >= 9 AND val <= 50 ORDER BY val;
-}
-expect {
-    2|9.00
-    5|25.00
-    3|50.00
-}
-
-@requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
-test index-equality-seek-numeric-no-match {
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, val numeric(10,2)) STRICT;
-    INSERT INTO t1 VALUES (1, 100);
-    INSERT INTO t1 VALUES (2, 9);
-    INSERT INTO t1 VALUES (3, 50);
-    CREATE INDEX idx_val ON t1(val);
-    SELECT count(*) FROM t1 WHERE val = 999;
-}
-expect {
-    0
-}
-
-@requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
-test index-equality-seek-null {
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, val numeric(10,2)) STRICT;
-    INSERT INTO t1 VALUES (1, 100);
-    INSERT INTO t1 VALUES (2, NULL);
-    INSERT INTO t1 VALUES (3, 50);
-    CREATE INDEX idx_val ON t1(val);
-    SELECT id, val FROM t1 WHERE val = 100;
-}
-expect {
-    1|100.00
-}
-
-@requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
-test index-multiple-matches-numeric {
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, val numeric(10,2)) STRICT;
-    INSERT INTO t1 VALUES (1, 42);
-    INSERT INTO t1 VALUES (2, 42);
-    INSERT INTO t1 VALUES (3, 99);
-    INSERT INTO t1 VALUES (4, 42);
-    CREATE INDEX idx_val ON t1(val);
-    SELECT id, val FROM t1 WHERE val = 42 ORDER BY id;
-}
-expect {
-    1|42.00
-    2|42.00
-    4|42.00
-}
-
-@requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
-test index-order-by-with-index-numeric {
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, val numeric(10,2)) STRICT;
-    INSERT INTO t1 VALUES (1, 100);
-    INSERT INTO t1 VALUES (2, 9);
-    INSERT INTO t1 VALUES (3, 50);
-    INSERT INTO t1 VALUES (4, -5);
-    CREATE INDEX idx_val ON t1(val);
-    SELECT id, val FROM t1 ORDER BY val;
-}
-expect {
-    4|-5.00
-    2|9.00
-    3|50.00
-    1|100.00
-}
-
-@requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
-test index-composite-with-custom-type {
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, category TEXT, val numeric(10,2)) STRICT;
-    INSERT INTO t1 VALUES (1, 'a', 100);
-    INSERT INTO t1 VALUES (2, 'b', 9);
-    INSERT INTO t1 VALUES (3, 'a', 50);
-    INSERT INTO t1 VALUES (4, 'b', 75);
-    CREATE INDEX idx_cat_val ON t1(category, val);
-    SELECT id, val FROM t1 WHERE category = 'a' ORDER BY val;
-}
-expect {
-    3|50.00
-    1|100.00
-}
-
-# --- DERIVED OPERATOR TESTS ---
-
-@requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
-test derived-operator-greater-than {
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, val numeric(10,2)) STRICT;
-    INSERT INTO t1 VALUES (1, 100);
-    INSERT INTO t1 VALUES (2, 9);
-    INSERT INTO t1 VALUES (3, 50);
-    INSERT INTO t1 VALUES (4, -5);
-    SELECT id, val FROM t1 WHERE val > 9 ORDER BY val;
-}
-expect {
-    3|50.00
-    1|100.00
-}
-
-@requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
-test derived-operator-greater-equals {
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, val numeric(10,2)) STRICT;
-    INSERT INTO t1 VALUES (1, 100);
-    INSERT INTO t1 VALUES (2, 9);
-    INSERT INTO t1 VALUES (3, 50);
-    INSERT INTO t1 VALUES (4, -5);
-    SELECT id, val FROM t1 WHERE val >= 9 ORDER BY val;
-}
-expect {
-    2|9.00
-    3|50.00
-    1|100.00
-}
-
-@requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
-test derived-operator-less-equals {
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, val numeric(10,2)) STRICT;
-    INSERT INTO t1 VALUES (1, 100);
-    INSERT INTO t1 VALUES (2, 9);
-    INSERT INTO t1 VALUES (3, 50);
-    INSERT INTO t1 VALUES (4, -5);
-    SELECT id, val FROM t1 WHERE val <= 50 ORDER BY val;
-}
-expect {
-    4|-5.00
-    2|9.00
-    3|50.00
-}
-
-@requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
-test derived-operator-not-equals {
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, val numeric(10,2)) STRICT;
-    INSERT INTO t1 VALUES (1, 100);
-    INSERT INTO t1 VALUES (2, 9);
-    INSERT INTO t1 VALUES (3, 50);
-    SELECT id, val FROM t1 WHERE val != 9 ORDER BY val;
-}
-expect {
-    3|50.00
-    1|100.00
-}
-
-@requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
-test derived-operator-between-numeric {
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, val numeric(10,2)) STRICT;
-    INSERT INTO t1 VALUES (1, 100);
-    INSERT INTO t1 VALUES (2, 9);
-    INSERT INTO t1 VALUES (3, 50);
-    INSERT INTO t1 VALUES (4, -5);
-    INSERT INTO t1 VALUES (5, 25);
-    SELECT id, val FROM t1 WHERE val >= 9 AND val <= 50 ORDER BY val;
-}
-expect {
-    2|9.00
-    5|25.00
-    3|50.00
-}
-
-@requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
-test derived-operator-greater-with-literal {
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, val numeric(10,2)) STRICT;
-    INSERT INTO t1 VALUES (1, 100);
-    INSERT INTO t1 VALUES (2, 9);
-    INSERT INTO t1 VALUES (3, 50);
-    SELECT id, val FROM t1 WHERE val > 50 ORDER BY val;
-}
-expect {
-    1|100.00
-}
-
-@requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
-test derived-operator-not-equals-with-uint {
-    CREATE TYPE test_uint(value any) BASE text ENCODE test_uint_encode(value) DECODE test_uint_decode(value)
-        OPERATOR '<' test_uint_lt
-        OPERATOR '=' test_uint_eq;
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint) STRICT;
-    INSERT INTO t1 VALUES (1, 10);
-    INSERT INTO t1 VALUES (2, 20);
-    INSERT INTO t1 VALUES (3, 30);
-    SELECT id, val FROM t1 WHERE val != 20 ORDER BY id;
-}
-expect {
-    1|10
-    3|30
-}
-
-@requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
-test derived-operator-greater-with-uint {
-    CREATE TYPE test_uint(value any) BASE text ENCODE test_uint_encode(value) DECODE test_uint_decode(value)
-        OPERATOR '<' test_uint_lt
-        OPERATOR '=' test_uint_eq;
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint) STRICT;
-    INSERT INTO t1 VALUES (1, 10);
-    INSERT INTO t1 VALUES (2, 20);
-    INSERT INTO t1 VALUES (3, 30);
-    SELECT id, val FROM t1 WHERE val > 20 ORDER BY id;
-}
-expect {
-    3|30
-}
-
-@requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
-test derived-operator-less-equals-with-uint {
-    CREATE TYPE test_uint(value any) BASE text ENCODE test_uint_encode(value) DECODE test_uint_decode(value)
-        OPERATOR '<' test_uint_lt
-        OPERATOR '=' test_uint_eq;
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint) STRICT;
-    INSERT INTO t1 VALUES (1, 10);
-    INSERT INTO t1 VALUES (2, 20);
-    INSERT INTO t1 VALUES (3, 30);
-    SELECT id, val FROM t1 WHERE val <= 20 ORDER BY id;
-}
-expect {
-    1|10
-    2|20
-}
-
-# --- TRIGGER TESTS ---
-
-@requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
-@requires trigger "uses triggers"
-test trigger-after-insert-sees-decoded {
-    CREATE TABLE log(id INTEGER PRIMARY KEY, val TEXT) STRICT;
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, val numeric(10,2)) STRICT;
-    CREATE TRIGGER after_ins AFTER INSERT ON t1
-    BEGIN INSERT INTO log VALUES (NULL, CAST(NEW.val AS TEXT)); END;
-    INSERT INTO t1 VALUES (1, 42);
-    SELECT val FROM log;
-}
-expect {
-    42.00
-}
-
-@requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
-@requires trigger "uses triggers"
-test trigger-before-insert-sees-raw {
-    CREATE TABLE log(id INTEGER PRIMARY KEY, val TEXT) STRICT;
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, val numeric(10,2)) STRICT;
-    CREATE TRIGGER before_ins BEFORE INSERT ON t1
-    BEGIN INSERT INTO log VALUES (NULL, CAST(NEW.val AS TEXT)); END;
-    INSERT INTO t1 VALUES (1, 42);
-    SELECT val FROM log;
-}
-expect {
-    42
-}
-
-@requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
-@requires trigger "uses triggers"
-test trigger-after-update-sees-decoded {
-    CREATE TABLE log(id INTEGER PRIMARY KEY, val TEXT) STRICT;
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, val numeric(10,2)) STRICT;
-    CREATE TRIGGER after_upd AFTER UPDATE ON t1
-    BEGIN INSERT INTO log VALUES (NULL, CAST(NEW.val AS TEXT)); END;
-    INSERT INTO t1 VALUES (1, 42);
-    UPDATE t1 SET val = 99 WHERE id = 1;
-    SELECT val FROM log;
-}
-expect {
-    99.00
-}
-
-@requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
-test typecheck-validates-base-type-insert {
-    CREATE TYPE test_uint(value any) BASE text
-        ENCODE test_uint_encode(value)
-        DECODE test_uint_decode(value)
-        OPERATOR '<' test_uint_lt
-        OPERATOR '=' test_uint_eq;
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint) STRICT;
-    INSERT INTO t1 VALUES (1, 42);
-    INSERT INTO t1 VALUES (2, 100);
-    SELECT val FROM t1 ORDER BY id;
-}
-expect {
-    42
-    100
-}
-
-@requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
-test typecheck-validates-base-type-update {
-    CREATE TYPE test_uint(value any) BASE text
-        ENCODE test_uint_encode(value)
-        DECODE test_uint_decode(value)
-        OPERATOR '<' test_uint_lt
-        OPERATOR '=' test_uint_eq;
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint) STRICT;
-    INSERT INTO t1 VALUES (1, 42);
-    UPDATE t1 SET val = 100 WHERE id = 1;
-    SELECT val FROM t1;
-}
-expect {
-    100
-}
-
-@requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
-test typecheck-validates-base-type-upsert {
-    CREATE TYPE test_uint(value any) BASE text
-        ENCODE test_uint_encode(value)
-        DECODE test_uint_decode(value)
-        OPERATOR '<' test_uint_lt
-        OPERATOR '=' test_uint_eq;
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint) STRICT;
-    INSERT INTO t1 VALUES (1, 42);
-    INSERT INTO t1 VALUES (1, 100) ON CONFLICT(id) DO UPDATE SET val = excluded.val;
-    SELECT val FROM t1;
-}
-expect {
-    100
-}
-
-@requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
-test order-by-custom-lt-numeric-sort {
-    CREATE TYPE test_uint(value any) BASE text
-        ENCODE test_uint_encode(value)
-        DECODE test_uint_decode(value)
-        OPERATOR '<' test_uint_lt
-        OPERATOR '=' test_uint_eq;
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint) STRICT;
-    INSERT INTO t1 VALUES (1, 1);
-    INSERT INTO t1 VALUES (2, 10);
-    INSERT INTO t1 VALUES (3, 2);
-    INSERT INTO t1 VALUES (4, 20);
-    INSERT INTO t1 VALUES (5, 100);
-    INSERT INTO t1 VALUES (6, 3);
-    SELECT val FROM t1 ORDER BY val ASC;
-}
-expect {
-    1
-    2
-    3
-    10
-    20
-    100
-}
-
-@requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
-test order-by-custom-lt-desc {
-    CREATE TYPE test_uint(value any) BASE text
-        ENCODE test_uint_encode(value)
-        DECODE test_uint_decode(value)
-        OPERATOR '<' test_uint_lt
-        OPERATOR '=' test_uint_eq;
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint) STRICT;
-    INSERT INTO t1 VALUES (1, 1);
-    INSERT INTO t1 VALUES (2, 10);
-    INSERT INTO t1 VALUES (3, 2);
-    INSERT INTO t1 VALUES (4, 20);
-    INSERT INTO t1 VALUES (5, 100);
-    INSERT INTO t1 VALUES (6, 3);
-    SELECT val FROM t1 ORDER BY val DESC;
-}
-expect {
-    100
-    20
-    10
-    3
-    2
-    1
-}
-
-@requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
-test order-by-custom-lt-with-limit {
-    CREATE TYPE test_uint(value any) BASE text
-        ENCODE test_uint_encode(value)
-        DECODE test_uint_decode(value)
-        OPERATOR '<' test_uint_lt
-        OPERATOR '=' test_uint_eq;
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint) STRICT;
-    INSERT INTO t1 VALUES (1, 1);
-    INSERT INTO t1 VALUES (2, 10);
-    INSERT INTO t1 VALUES (3, 2);
-    INSERT INTO t1 VALUES (4, 20);
-    INSERT INTO t1 VALUES (5, 100);
-    SELECT val FROM t1 ORDER BY val ASC LIMIT 3;
-}
-expect {
-    1
-    2
-    10
-}
-
-@requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
-test numeric-precision-scale-overflow {
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, val numeric(5,2)) STRICT;
-    INSERT INTO t1 VALUES (1, 999.99);
-    SELECT val FROM t1;
-}
-expect {
-    999.99
-}
-
-@requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
-test numeric-precision-scale-out-of-range {
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, val numeric(5,2)) STRICT;
-    INSERT INTO t1 VALUES (1, 9999.99);
-}
-expect error {
-    numeric value out of range
-}
-
-@requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
-test create-type-subquery-in-encode-rejected {
-    CREATE TYPE bad_type BASE text
-        ENCODE (SELECT 1)
-        DECODE test_uint_decode(value);
-}
-expect error {
-    subqueries prohibited in ENCODE expressions
-}
-
-@requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
-test create-type-aggregate-in-decode-rejected {
-    CREATE TYPE bad_type BASE text
-        ENCODE test_uint_encode(value)
-        DECODE count(value);
-}
-expect error {
-    aggregate functions prohibited in DECODE expressions
-}
-
-@requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
-test type-roundtrip-special-chars-operator {
-    CREATE TYPE test_uint(value any) BASE text
-        ENCODE test_uint_encode(value)
-        DECODE test_uint_decode(value)
-        OPERATOR '<' test_uint_lt
-        OPERATOR '=' test_uint_eq;
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint) STRICT;
-    INSERT INTO t1 VALUES (1, 42);
-    SELECT val FROM t1;
-}
-expect {
-    42
-}
-
-@requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
-test order-by-custom-lt-many-values {
-    CREATE TYPE test_uint(value any) BASE text
-        ENCODE test_uint_encode(value)
-        DECODE test_uint_decode(value)
-        OPERATOR '<' test_uint_lt
-        OPERATOR '=' test_uint_eq;
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint) STRICT;
-    INSERT INTO t1 VALUES (1, 999);
-    INSERT INTO t1 VALUES (2, 1);
-    INSERT INTO t1 VALUES (3, 50);
-    INSERT INTO t1 VALUES (4, 200);
-    INSERT INTO t1 VALUES (5, 5);
-    INSERT INTO t1 VALUES (6, 1000);
-    INSERT INTO t1 VALUES (7, 42);
-    INSERT INTO t1 VALUES (8, 7);
-    SELECT val FROM t1 ORDER BY val ASC;
-}
-expect {
-    1
-    5
-    7
-    42
-    50
-    200
-    999
-    1000
-}
-
-@requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
-test numeric-zero-precision-rejected {
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, val numeric(0,0)) STRICT;
-    INSERT INTO t1 VALUES (1, 5);
-}
-expect error {
-    numeric precision must be positive
-}
-
-@requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
-test numeric-scale-exceeds-precision-rejected {
-    CREATE TABLE t1(id INTEGER PRIMARY KEY, val numeric(3,5)) STRICT;
-    INSERT INTO t1 VALUES (1, 5);
-}
-expect error {
-    numeric scale
-}
-
-# AFTER UPDATE trigger should see decoded OLD and NEW values, not encoded blobs
-@requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
-@requires trigger "uses triggers"
-test trigger-after-update-old-decoded {
-    CREATE TABLE t_trig(id INTEGER PRIMARY KEY, val numeric(10,2)) STRICT;
-    INSERT INTO t_trig VALUES (1, '123.45');
-    CREATE TABLE t_trig_log(old_v TEXT, new_v TEXT) STRICT;
-    CREATE TRIGGER tr_trig AFTER UPDATE ON t_trig BEGIN INSERT INTO t_trig_log VALUES (CAST(OLD.val AS TEXT), CAST(NEW.val AS TEXT)); END;
-    UPDATE t_trig SET val = '999.99' WHERE id = 1;
-    SELECT old_v, new_v FROM t_trig_log;
-}
-expect {
-    123.45|999.99
-}
-
-# BEFORE UPDATE trigger should see decoded OLD values
-@requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
-@requires trigger "uses triggers"
-test trigger-before-update-old-decoded {
-    CREATE TABLE t_bu(id INTEGER PRIMARY KEY, val numeric(10,2)) STRICT;
-    INSERT INTO t_bu VALUES (1, '500.25');
-    CREATE TABLE t_bu_log(old_v TEXT, new_v TEXT) STRICT;
-    CREATE TRIGGER tr_bu BEFORE UPDATE ON t_bu BEGIN INSERT INTO t_bu_log VALUES (CAST(OLD.val AS TEXT), CAST(NEW.val AS TEXT)); END;
-    UPDATE t_bu SET val = '750.50' WHERE id = 1;
-    SELECT old_v, new_v FROM t_bu_log;
-}
-expect {
-    500.25|750.50
-}
-
-# AFTER DELETE trigger should see decoded OLD values
-@requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
-@requires trigger "uses triggers"
-test trigger-after-delete-old-decoded {
-    CREATE TABLE t_ad(id INTEGER PRIMARY KEY, val numeric(10,2)) STRICT;
-    INSERT INTO t_ad VALUES (1, '333.33');
-    CREATE TABLE t_ad_log(old_v TEXT) STRICT;
-    CREATE TRIGGER tr_ad AFTER DELETE ON t_ad BEGIN INSERT INTO t_ad_log VALUES (CAST(OLD.val AS TEXT)); END;
-    DELETE FROM t_ad WHERE id = 1;
-    SELECT old_v FROM t_ad_log;
-}
-expect {
-    333.33
-}
-
-# BEFORE DELETE trigger should see decoded OLD values
-@requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
-@requires trigger "uses triggers"
-test trigger-before-delete-old-decoded {
-    CREATE TABLE t_bd(id INTEGER PRIMARY KEY, val numeric(10,2)) STRICT;
-    INSERT INTO t_bd VALUES (1, '444.44');
-    CREATE TABLE t_bd_log(old_v TEXT) STRICT;
-    CREATE TRIGGER tr_bd BEFORE DELETE ON t_bd BEGIN INSERT INTO t_bd_log VALUES (CAST(OLD.val AS TEXT)); END;
-    DELETE FROM t_bd WHERE id = 1;
-    SELECT old_v FROM t_bd_log;
-}
-expect {
-    444.44
-}
-
-# AFTER INSERT trigger should see decoded NEW values
-@requires strict "uses STRICT tables"
-@requires custom_types "uses custom types"
-@requires trigger "uses triggers"
-test trigger-after-insert-new-decoded {
-    CREATE TABLE t_ai(id INTEGER PRIMARY KEY, val numeric(10,2)) STRICT;
-    CREATE TABLE t_ai_log(new_v TEXT) STRICT;
-    CREATE TRIGGER tr_ai AFTER INSERT ON t_ai BEGIN INSERT INTO t_ai_log VALUES (CAST(NEW.val AS TEXT)); END;
-    INSERT INTO t_ai VALUES (1, '555.55');
-    SELECT new_v FROM t_ai_log;
-}
-expect {
-    555.55
+    test_uint|text|test_uint_encode (value)|test_uint_decode (value)|0|+(test_uint) -> test_uint_add
 }

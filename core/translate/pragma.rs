@@ -494,6 +494,7 @@ fn update_pragma(
             connection.set_sync_type(sync_type);
             Ok(TransactionMode::None)
         }
+        PragmaName::ListTypes => unreachable!("list_types cannot be set"),
         PragmaName::TempStore => {
             use crate::TempStore;
             // Try to parse as a string first (default, file, memory)
@@ -1218,6 +1219,62 @@ fn query_pragma(
             program.emit_result_row(register, 1);
             program.add_pragma_result_column(pragma.to_string());
             Ok(TransactionMode::None)
+        }
+        PragmaName::ListTypes => {
+            let base_reg = register;
+            program.alloc_registers(5); // 6 total (1 already allocated)
+
+            // Built-in types: NULL parent, encode, decode, default, operators
+            for builtin in &["INTEGER", "REAL", "TEXT", "BLOB", "ANY"] {
+                program.emit_string8(builtin.to_string(), base_reg);
+                program.emit_null(base_reg + 1, None);
+                program.emit_null(base_reg + 2, None);
+                program.emit_null(base_reg + 3, None);
+                program.emit_null(base_reg + 4, None);
+                program.emit_null(base_reg + 5, None);
+                program.emit_result_row(base_reg, 6);
+            }
+
+            // Custom types from the type registry
+            let mut type_names: Vec<_> = schema.type_registry.keys().collect();
+            type_names.sort();
+            for type_name in type_names {
+                let type_def = &schema.type_registry[type_name];
+                program.emit_string8(type_def.name.clone(), base_reg);
+                program.emit_string8(type_def.base.clone(), base_reg + 1);
+                if let Some(ref expr) = type_def.encode {
+                    program.emit_string8(expr.to_string(), base_reg + 2);
+                } else {
+                    program.emit_null(base_reg + 2, None);
+                }
+                if let Some(ref expr) = type_def.decode {
+                    program.emit_string8(expr.to_string(), base_reg + 3);
+                } else {
+                    program.emit_null(base_reg + 3, None);
+                }
+                if let Some(ref expr) = type_def.default {
+                    program.emit_string8(expr.to_string(), base_reg + 4);
+                } else {
+                    program.emit_null(base_reg + 4, None);
+                }
+                if type_def.operators.is_empty() {
+                    program.emit_null(base_reg + 5, None);
+                } else {
+                    let ops: Vec<String> = type_def
+                        .operators
+                        .iter()
+                        .map(|op| format!("{}({}) -> {}", op.op, op.right_type, op.func_name))
+                        .collect();
+                    program.emit_string8(ops.join(", "), base_reg + 5);
+                }
+                program.emit_result_row(base_reg, 6);
+            }
+
+            let pragma_meta = pragma_for(&pragma);
+            for col_name in pragma_meta.columns.iter() {
+                program.add_pragma_result_column(col_name.to_string());
+            }
+            Ok((program, TransactionMode::None))
         }
     }
 }
