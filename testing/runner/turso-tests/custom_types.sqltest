@@ -268,3 +268,26 @@ test encode-null-rejects-primary-key {
 expect error {
     NOT NULL constraint failed
 }
+
+@requires strict "uses STRICT tables"
+test drop-type-in-use {
+    CREATE TYPE test_uint BASE text ENCODE test_uint_encode(value) DECODE test_uint_decode(value);
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint) STRICT;
+    DROP TYPE test_uint;
+}
+expect error {
+}
+
+@requires strict "uses STRICT tables"
+test add-column-custom-type {
+    CREATE TYPE test_uint BASE text ENCODE test_uint_encode(value) DECODE test_uint_decode(value);
+    CREATE TABLE t1(id INTEGER PRIMARY KEY) STRICT;
+    ALTER TABLE t1 ADD COLUMN val test_uint;
+    INSERT INTO t1 VALUES (1, 42);
+    INSERT INTO t1 VALUES (2, 100);
+    SELECT id, val FROM t1;
+}
+expect {
+    1|42
+    2|100
+}

@@ -4,6 +4,13 @@ Welcome to the Turso manual pages. These pages provide detailed documentation fo
 
 ## Available Manuals
 
+### custom-types - Custom Types for STRICT Tables
+Define user-defined types with custom encode/decode logic, operator overloads, and defaults for STRICT tables.
+
+```
+.manual custom-types
+```
+
 ### cdc - Change Data Capture
 Track and capture all data changes made to your database tables for replication, syncing, and reactive applications.
 
