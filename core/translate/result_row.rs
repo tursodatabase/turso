@@ -38,13 +38,16 @@ pub fn emit_select_result(
 
     let start_reg = reg_result_cols_start;
 
-    // For EXISTS subqueries, we only need to determine whether any row exists, not its
-    // column values. The result is simply writing `1` to the result register. Evaluating
-    // the actual result columns would be wasted CPU cycles.
+    // For EXISTS subqueries, we usually only need to determine whether any row exists, not
+    // the row's column values. The result is simply writing `1` to the result register.
+    //
+    // Important: SELECT DISTINCT deduplication reads the result registers as its key. So for
+    // EXISTS(SELECT DISTINCT ...), we must still evaluate the result expressions; otherwise the
+    // dedup key is uninitialized and EXISTS can incorrectly evaluate to false.
     let skip_column_eval = matches!(
         plan.query_destination,
         QueryDestination::ExistsSubqueryResult { .. }
-    );
+    ) && !matches!(plan.distinctness, Distinctness::Distinct { .. });
 
     // For compound selects (UNION, UNION ALL, etc.), multiple subselects may share the same
     // result column registers. If constants are moved to the init section, they can be
