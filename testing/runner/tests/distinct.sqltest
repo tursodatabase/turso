@@ -195,3 +195,25 @@ test distinct-agg-simple-count {
 expect {
     3
 }
+
+# Regression: EXISTS over DISTINCT+OFFSET must return true when rows remain.
+test distinct-exists-with-offset {
+    CREATE TABLE distinct_exists (a REAL UNIQUE, b INTEGER);
+    INSERT INTO distinct_exists VALUES (1.1, 10), (2.2, 20), (3.3, 30);
+    SELECT COUNT(*) FROM (
+        SELECT DISTINCT a
+        FROM distinct_exists
+        ORDER BY a
+        LIMIT 99 OFFSET 1
+    );
+    SELECT EXISTS(
+        SELECT DISTINCT a
+        FROM distinct_exists
+        ORDER BY a
+        LIMIT 99 OFFSET 1
+    );
+}
+expect {
+    2
+    1
+}
