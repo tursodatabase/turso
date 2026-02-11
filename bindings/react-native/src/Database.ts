@@ -5,6 +5,7 @@
  * Constructor determines whether to use local-only or sync mode based on config.
  */
 
+import { AsyncLock } from './AsyncLock';
 import { Statement } from './Statement';
 import type {
   NativeDatabase,
@@ -76,6 +77,7 @@ export class Database {
   private _isSync = false;
   private _connected = false;
   private _closed = false;
+  private _execLock: AsyncLock;
   private _extraIo?: () => Promise<void>;
   private _ioContext?: {
     authToken?: string | (() => string | Promise<string> | null);
@@ -90,6 +92,7 @@ export class Database {
   constructor(opts: DatabaseOpts) {
     this._opts = opts;
     this._isSync = isSyncConfig(opts);
+    this._execLock = new AsyncLock();
   }
 
   /**
@@ -223,7 +226,7 @@ export class Database {
     }
 
     const nativeStmt = this._connection.prepareSingle(sql);
-    return new Statement(nativeStmt, this._connection!, this._extraIo);
+    return new Statement(nativeStmt, this._connection!, this._execLock, this._extraIo);
   }
 
   /**
@@ -238,27 +241,32 @@ export class Database {
       throw new Error('No connection available');
     }
 
-    // Use prepareFirst to handle multiple statements
-    let remaining = sql.trim();
+    await this._execLock.acquire();
+    try {
+      // Use prepareFirst to handle multiple statements
+      let remaining = sql.trim();
 
-    while (remaining.length > 0) {
-      const result = this._connection.prepareFirst(remaining);
+      while (remaining.length > 0) {
+        const result = this._connection.prepareFirst(remaining);
 
-      if (!result) {
-        break; // No more statements (C++ returns null when nothing to parse)
+        if (!result) {
+          break; // No more statements (C++ returns null when nothing to parse)
+        }
+
+        // Wrap in Statement to get IO handling (no lock — we already hold it)
+        const stmt = new Statement(result.statement, this._connection!, null, this._extraIo);
+        try {
+          // Execute - will handle IO if needed
+          await stmt.rawRun();
+        } finally {
+          stmt.finalize();
+        }
+
+        // Move to next statement
+        remaining = sql.substring(result.tailIdx).trim();
       }
-
-      // Wrap in Statement to get IO handling
-      const stmt = new Statement(result.statement, this._connection!, this._extraIo);
-      try {
-        // Execute - will handle IO if needed
-        await stmt.run();
-      } finally {
-        stmt.finalize();
-      }
-
-      // Move to next statement
-      remaining = sql.substring(result.tailIdx).trim();
+    } finally {
+      this._execLock.release();
     }
   }
 
