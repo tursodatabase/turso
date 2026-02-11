@@ -1,0 +1,43 @@
+@database :memory:
+
+# Regression test: NOT BETWEEN with self-referencing expressions must not
+# be optimized into multi-index union seeks, because the seek key depends
+# on the current row and cannot be evaluated before scanning.
+
+test not-between-self-ref-group-by {
+    CREATE TABLE t1 (a INTEGER PRIMARY KEY, b INTEGER, c INTEGER);
+    INSERT INTO t1 VALUES (1, 10, 100), (2, 20, 200), (3, NULL, 300), (4, 40, 400);
+    SELECT c, AVG(b) FROM t1 WHERE TYPEOF(b) NOT BETWEEN a AND a GROUP BY a, b, c;
+}
+expect {
+    100|10.0
+    200|20.0
+    300|
+    400|40.0
+}
+expect @js {
+    100|10
+    200|20
+    300|
+    400|40
+}
+
+test not-between-self-ref-no-group-by {
+    CREATE TABLE t2 (a INTEGER PRIMARY KEY, b INTEGER, c INTEGER);
+    INSERT INTO t2 VALUES (1, 10, 100), (2, 20, 200), (3, NULL, 300), (4, 40, 400);
+    SELECT * FROM t2 WHERE TYPEOF(b) NOT BETWEEN a AND a;
+}
+expect {
+    1|10|100
+    2|20|200
+    3||300
+    4|40|400
+}
+
+test between-self-ref-group-by {
+    CREATE TABLE t3 (a INTEGER PRIMARY KEY, b INTEGER, c INTEGER);
+    INSERT INTO t3 VALUES (1, 10, 100), (2, 20, 200), (3, NULL, 300), (4, 40, 400);
+    SELECT c, AVG(b) FROM t3 WHERE TYPEOF(b) BETWEEN a AND a GROUP BY a, b, c;
+}
+expect {
+}
