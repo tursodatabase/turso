@@ -124,7 +124,7 @@ impl RowidAllocator {
                 pk_idx,
                 r.len()
             );
-            if let Value::Integer(i) = r[pk_idx].0 {
+            if let Some(i) = r[pk_idx].0.as_int() {
                 used.insert(i);
                 max_rowid = max_rowid.max(i);
             }
@@ -170,21 +170,17 @@ fn normalize_integer_pk_row(
 ) -> anyhow::Result<Vec<SimValue>> {
     ensure_row_width(table_name, columns, row)?;
     let mut out = row.to_vec();
-    match out[pk_idx].0 {
-        Value::Null => {
-            let new_id = alloc.alloc();
-            out[pk_idx] = SimValue(Value::Integer(new_id));
-        }
-        Value::Integer(i) => {
-            alloc.observe(i);
-        }
-        _ => {
-            return Err(anyhow::anyhow!(
-                "datatype mismatch: table '{}' INTEGER PRIMARY KEY column '{}' must be an integer",
-                table_name,
-                columns[pk_idx].name
-            ));
-        }
+    if out[pk_idx].0 == Value::Null {
+        let new_id = alloc.alloc();
+        out[pk_idx] = SimValue(Value::from_i64(new_id));
+    } else if let Some(i) = out[pk_idx].0.as_int() {
+        alloc.observe(i);
+    } else {
+        return Err(anyhow::anyhow!(
+            "datatype mismatch: table '{}' INTEGER PRIMARY KEY column '{}' must be an integer",
+            table_name,
+            columns[pk_idx].name
+        ));
     }
     Ok(out)
 }
@@ -196,18 +192,20 @@ fn validate_integer_pk_row_non_null(
     row: &[SimValue],
 ) -> anyhow::Result<()> {
     ensure_row_width(table_name, columns, row)?;
-    match row[pk_idx].0 {
-        Value::Integer(_) => Ok(()),
-        Value::Null => Err(anyhow::anyhow!(
+    if row[pk_idx].0.as_int().is_some() {
+        Ok(())
+    } else if row[pk_idx].0 == Value::Null {
+        Err(anyhow::anyhow!(
             "datatype mismatch: table '{}' INTEGER PRIMARY KEY column '{}' cannot be NULL",
             table_name,
             columns[pk_idx].name
-        )),
-        _ => Err(anyhow::anyhow!(
+        ))
+    } else {
+        Err(anyhow::anyhow!(
             "datatype mismatch: table '{}' INTEGER PRIMARY KEY column '{}' must be an integer",
             table_name,
             columns[pk_idx].name
-        )),
+        ))
     }
 }
 
@@ -763,7 +761,7 @@ impl Shadow for Insert {
                                             pk_idx,
                                             &new_row,
                                         )?;
-                                        if let Value::Integer(i) = new_row[pk_idx].0 {
+                                        if let Some(i) = new_row[pk_idx].0.as_int() {
                                             alloc.observe(i);
                                         }
                                     }
