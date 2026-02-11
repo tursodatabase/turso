@@ -1808,3 +1808,38 @@ expect {
     426601719749026560|integer
 }
 
+# Regression: INSERT OR REPLACE with UNIQUE index must not corrupt
+# neighboring index entries. The IdxInsert after conflict resolution must
+# re-seek the cursor (USE_SEEK must be disabled when the conflict path
+# includes IdxDelete, which repositions the cursor). See issue #5131.
+test insert-or-replace-unique-index-no-corruption {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a TEXT UNIQUE);
+    INSERT INTO t SELECT value, 'a'||value FROM generate_series(1, 134);
+    INSERT OR REPLACE INTO t VALUES(9999, 'a134');
+    PRAGMA integrity_check;
+}
+expect {
+    ok
+}
+
+test insert-or-replace-unique-index-no-corruption-2 {
+    CREATE TABLE t(a, b, c);
+    CREATE UNIQUE INDEX idx ON t(a, b);
+    INSERT INTO t SELECT value, value, value FROM generate_series(1, 135);
+    INSERT OR REPLACE INTO t VALUES (50, 50, 999);
+    SELECT count(*) FROM t WHERE a = 50 AND b = 50;
+}
+expect {
+    1
+}
+
+test insert-or-replace-data-correctness {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a TEXT UNIQUE);
+    INSERT INTO t SELECT value, 'a'||value FROM generate_series(1, 134);
+    INSERT OR REPLACE INTO t VALUES(9999, 'a134');
+    SELECT id, a FROM t WHERE a = 'a133';
+}
+expect {
+    133|a133
+}
+

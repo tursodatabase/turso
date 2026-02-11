@@ -1,13 +1,16 @@
 ---
 source: modifications.sqltest
-expression: "UPDATE products\n    SET price = price * 1.10, quantity = quantity - 10\n    WHERE category = 'Electronics';"
+expression: |-
+  UPDATE products
+      SET price = price * 1.10, quantity = quantity - 10
+      WHERE category = 'Electronics';
 info:
   statement_type: UPDATE
   tables:
-    - products
+  - products
   setup_blocks:
-    - schema
-  database: ":memory:"
+  - schema
+  database: ':memory:'
 ---
 QUERY PLAN
 
@@ -16,7 +19,7 @@ BYTECODE
 addr  opcode            p1  p2  p3  p4              p5  comment
    0  Init               0  31   0                   0  Start at 31
    1  OpenWrite          0   2   0                   0  root=2; iDb=0
-   2  OpenWrite          1   8   0                   0  root=8; iDb=0
+   2  OpenWrite          1  11   0                   0  root=11; iDb=0
    3  String8            0   1   0  Electronics      0  r[1]='Electronics'
    4  SeekGE             1  30   1                   0  key=[1..1]
    5    IdxGT            1  30   1                   0  key=[1..1]
@@ -45,7 +48,7 @@ addr  opcode            p1  p2  p3  p4              p5  comment
   28    Insert           0  17   2  products         0  intkey=r[2] data=r[17]
   29  Next               1   5   0                   0
   30  Halt               0   0   0                   0
-  31  Transaction        0   2   9                   0  iDb=0 tx_mode=Write
+  31  Transaction        0   2  10                   0  iDb=0 tx_mode=Write
   32  Real               0   9   0  1.1              0  r[9]=1.1
   33  Integer           10  11   0                   0  r[11]=10
   34  Goto               0   1   0                   0

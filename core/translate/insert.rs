@@ -589,7 +589,11 @@ pub fn translate_insert(
         affinity_str: Some(affinity_str),
     });
 
-    if has_upsert {
+    // Emit deferred index inserts for cases where preflight only checked constraints
+    // but didn't insert. This covers UPSERT and non-REPLACE conflict types (ABORT/FAIL/
+    // IGNORE/ROLLBACK). REPLACE inserts eagerly in the preflight phase because it needs
+    // to delete-then-insert per index.
+    if has_upsert || !on_replace {
         emit_commit_phase(&mut program, resolver, &insertion, &ctx)?;
     }
 
@@ -2177,9 +2181,9 @@ fn emit_index_uniqueness_check(
             preflight,
         )?;
     } else {
-        // Non-unique index: in UPSERT mode we postpone writes to commit phase.
-        if preflight.upsert_actions.is_empty() {
-            // eager insert for non-unique, no UPSERT
+        // Non-unique index: insert eagerly only for REPLACE (which doesn't use commit phase).
+        // For UPSERT and ABORT/FAIL/IGNORE/ROLLBACK, defer to commit phase.
+        if preflight.on_replace {
             let record_reg = program.alloc_register();
             program.emit_insn(Insn::MakeRecord {
                 start_reg: to_u16(idx_start_reg),
@@ -2275,7 +2279,7 @@ fn emit_unique_index_check(
         // continue preflight with next constraint
         program.preassign_label_to_next_insn(next_check);
     } else {
-        // No UPSERT fast-path: probe and immediately insert
+        // No UPSERT: probe for conflicts.
         let ok = program.allocate_label();
         program.emit_insn(Insn::NoConflict {
             cursor_id: idx_cursor_id,
@@ -2284,6 +2288,7 @@ fn emit_unique_index_check(
             num_regs: num_cols,
         });
         if preflight.on_replace {
+            // REPLACE: delete conflicting row immediately, then insert eagerly.
             program.emit_insn(Insn::IdxRowId {
                 cursor_id: idx_cursor_id,
                 dest: ctx.conflict_rowid_reg,
@@ -2297,7 +2302,7 @@ fn emit_unique_index_check(
             )?;
             program.emit_insn(Insn::Goto { target_pc: ok });
         } else {
-            // Unique violation without ON CONFLICT clause -> error
+            // ABORT/FAIL/IGNORE/ROLLBACK: halt on conflict.
             program.emit_insn(Insn::Halt {
                 err_code: SQLITE_CONSTRAINT_UNIQUE,
                 description: format_unique_violation_desc(ctx.table.name.as_str(), index),
@@ -2305,25 +2310,28 @@ fn emit_unique_index_check(
         }
         program.preassign_label_to_next_insn(ok);
 
-        // In the non-UPSERT case, we insert the index
-        let record_reg = program.alloc_register();
-        program.emit_insn(Insn::MakeRecord {
-            start_reg: to_u16(idx_start_reg),
-            count: to_u16(num_cols + 1),
-            dest_reg: to_u16(record_reg),
-            index_name: Some(index.name.clone()),
-            affinity_str: None,
-        });
-        program.emit_insn(Insn::IdxInsert {
-            cursor_id: idx_cursor_id,
-            record_reg,
-            unpacked_start: Some(idx_start_reg),
-            unpacked_count: Some((num_cols + 1) as u16),
-            // USE_SEEK: cursor was positioned by NoConflict above, skip redundant seek.
-            // Note: If record contains NULLs, NoConflict skips the seek entirely, so
-            // op_idx_insert must check for NULLs and fall back to seeking if found.
-            flags: IdxInsertFlags::new().nchange(true).use_seek(true),
-        });
+        if preflight.on_replace {
+            // REPLACE: insert index entry eagerly (right after delete).
+            // IdxDelete repositions the cursor, so we must NOT use USE_SEEK.
+            let record_reg = program.alloc_register();
+            program.emit_insn(Insn::MakeRecord {
+                start_reg: to_u16(idx_start_reg),
+                count: to_u16(num_cols + 1),
+                dest_reg: to_u16(record_reg),
+                index_name: Some(index.name.clone()),
+                affinity_str: None,
+            });
+            program.emit_insn(Insn::IdxInsert {
+                cursor_id: idx_cursor_id,
+                record_reg,
+                unpacked_start: Some(idx_start_reg),
+                unpacked_count: Some((num_cols + 1) as u16),
+                flags: IdxInsertFlags::new().nchange(true),
+            });
+        }
+        // For non-REPLACE cases (ABORT/FAIL/IGNORE/ROLLBACK), index inserts are
+        // deferred to the commit phase after all constraint checks pass.
+        // This prevents stale index entries when a later constraint check fails.
     }
     Ok(())
 }

@@ -1,14 +1,18 @@
 ---
 source: modifications.sqltest
-expression: "DELETE FROM orders\n    WHERE user_id IN (\n        SELECT id FROM users WHERE status = 'inactive'\n    );"
+expression: |-
+  DELETE FROM orders
+      WHERE user_id IN (
+          SELECT id FROM users WHERE status = 'inactive'
+      );
 info:
   statement_type: DELETE
   tables:
-    - orders
-    - users
+  - orders
+  - users
   setup_blocks:
-    - schema
-  database: ":memory:"
+  - schema
+  database: ':memory:'
 ---
 QUERY PLAN
 `--SCAN users
@@ -27,8 +31,8 @@ addr  opcode          p1  p2  p3  p4                  p5  comment
    9    IdxInsert      0   5   0                       8  key=r[5]
   10  Next             1   5   0                       0
   11  OpenWrite        2   5   0                       0  root=5; iDb=0
-  12  OpenWrite        3   9   0                       0  root=9; iDb=0
-  13  OpenWrite        4  10   0                       0  root=10; iDb=0
+  12  OpenWrite        3  12   0                       0  root=12; iDb=0
+  13  OpenWrite        4  13   0                       0  root=13; iDb=0
   14  Rewind           3  40   0                       0  Rewind index idx_orders_user_id
   15    DeferredSeek   3   2   0                       0
   16    Integer        0   6   0                       0  r[6]=0
@@ -56,6 +60,6 @@ addr  opcode          p1  p2  p3  p4                  p5  comment
   38    Delete         3   0   0  idx_orders_user_id   0
   39  Next             3  15   0                       0
   40  Halt             0   0   0                       0
-  41  Transaction      0   2   9                       0  iDb=0 tx_mode=Write
+  41  Transaction      0   2  10                       0  iDb=0 tx_mode=Write
   42  String8          0   4   0  inactive             0  r[4]='inactive'
   43  Goto             0   1   0                       0

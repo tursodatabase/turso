@@ -53,6 +53,14 @@ setup schema {
         archived_at TEXT
     );
 
+    -- Multi-unique table for constraint check ordering snapshots
+    CREATE TABLE items (
+        id INTEGER PRIMARY KEY,
+        sku TEXT UNIQUE NOT NULL,
+        barcode TEXT UNIQUE NOT NULL,
+        name TEXT
+    );
+
     -- Create indexes for query optimization
     CREATE INDEX idx_products_category ON products(category);
     CREATE INDEX idx_orders_user_id ON orders(user_id);
@@ -136,4 +144,38 @@ snapshot insert-or-replace {
 snapshot insert-or-ignore {
     INSERT OR IGNORE INTO users (id, email, name, status)
     VALUES (1, 'jane@example.com', 'Jane Doe', 'active');
+}
+
+# Multi-unique index snapshots: verify that all constraint checks (NoConflict)
+# run before any index writes (IdxInsert) for non-REPLACE conflict modes.
+# REPLACE is different: it deletes-then-inserts eagerly per index.
+
+@setup schema
+snapshot insert-or-ignore-multi-unique {
+    INSERT OR IGNORE INTO items (id, sku, barcode, name)
+    VALUES (1, 'SKU-001', 'BC-001', 'Widget');
+}
+
+@setup schema
+snapshot insert-or-abort-multi-unique {
+    INSERT OR ABORT INTO items (id, sku, barcode, name)
+    VALUES (1, 'SKU-001', 'BC-001', 'Widget');
+}
+
+@setup schema
+snapshot insert-or-fail-multi-unique {
+    INSERT OR FAIL INTO items (id, sku, barcode, name)
+    VALUES (1, 'SKU-001', 'BC-001', 'Widget');
+}
+
+@setup schema
+snapshot insert-or-rollback-multi-unique {
+    INSERT OR ROLLBACK INTO items (id, sku, barcode, name)
+    VALUES (1, 'SKU-001', 'BC-001', 'Widget');
+}
+
+@setup schema
+snapshot insert-or-replace-multi-unique {
+    INSERT OR REPLACE INTO items (id, sku, barcode, name)
+    VALUES (1, 'SKU-001', 'BC-001', 'Widget');
 }

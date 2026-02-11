@@ -1,11 +1,13 @@
 ---
 source: modifications.sqltest
-expression: "INSERT OR REPLACE INTO users (id, email, name, status)\n    VALUES (1, 'john@example.com', 'John Doe', 'active');"
+expression: |-
+  INSERT OR REPLACE INTO users (id, email, name, status)
+      VALUES (1, 'john@example.com', 'John Doe', 'active');
 info:
   statement_type: INSERT
   setup_blocks:
-    - schema
-  database: ":memory:"
+  - schema
+  database: ':memory:'
 ---
 QUERY PLAN
 
@@ -46,7 +48,7 @@ addr  opcode         p1  p2  p3  p4                p5  comment
   31  Delete          1   0   0  users              0
   32  Goto            0  33   0                     0
   33  MakeRecord     10   2  14                     0  r[14]=mkrec(r[10..11]); for sqlite_autoindex_users_1
-  34  IdxInsert       0  14  10                     6  key=r[14]
+  34  IdxInsert       0  14  10                     2  key=r[14]
   35  HaltIfNull   1299   0   4  users.email        0
   36  HaltIfNull   1299   0   5  users.name         0
   37  MakeRecord      3   4   7                     0  r[7]=mkrec(r[3..6])
@@ -54,5 +56,5 @@ addr  opcode         p1  p2  p3  p4                p5  comment
   39  Goto            0  40   0                     0
   40  Goto            0  41   0                     0
   41  Halt            0   0   0                     0
-  42  Transaction     0   2   9                     0  iDb=0 tx_mode=Write
+  42  Transaction     0   2  10                     0  iDb=0 tx_mode=Write
   43  Goto            0   1   0                     0
