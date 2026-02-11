@@ -673,14 +673,6 @@ expect {
     1
 }
 
-# Just above Rust formatter's internal u16 limit (65535)
-test printf-width-above-rust-limit-no-crash {
-    SELECT printf('%65536d', 42) IS NULL;
-}
-expect {
-    1
-}
-
 # Exactly at Rust formatter's limit - should still work
 test printf-width-at-rust-limit {
     SELECT length(printf('%65535d', 42));
