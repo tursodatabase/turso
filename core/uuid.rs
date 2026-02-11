@@ -87,8 +87,8 @@ fn uuid7(&self, args: &[Value]) -> Value {
 
 #[scalar(name = "uuid7_timestamp_ms")]
 fn uuid7_ts(args: &[Value]) -> Value {
-    match args[0].value_type() {
-        ValueType::Blob => {
+    match args.first().map(|a| a.value_type()) {
+        Some(ValueType::Blob) => {
             let Some(blob) = &args[0].to_blob() else {
                 return Value::null();
             };
@@ -98,7 +98,7 @@ fn uuid7_ts(args: &[Value]) -> Value {
             let unix = uuid_to_unix(uuid.as_bytes());
             Value::from_integer(unix as i64)
         }
-        ValueType::Text => {
+        Some(ValueType::Text) => {
             let Some(text) = args[0].to_text() else {
                 return Value::null();
             };
@@ -114,7 +114,7 @@ fn uuid7_ts(args: &[Value]) -> Value {
 
 #[scalar(name = "uuid_str")]
 fn uuid_str(args: &[Value]) -> Value {
-    let Some(blob) = args[0].to_blob() else {
+    let Some(blob) = args.first().and_then(|a| a.to_blob()) else {
         return Value::null();
     };
     let parsed = uuid::Uuid::from_slice(blob.as_slice())
@@ -128,7 +128,7 @@ fn uuid_str(args: &[Value]) -> Value {
 
 #[scalar(name = "uuid_blob")]
 fn uuid_blob(&self, args: &[Value]) -> Value {
-    let Some(text) = args[0].to_text() else {
+    let Some(text) = args.first().and_then(|a| a.to_text()) else {
         return Value::null();
     };
     match uuid::Uuid::parse_str(text) {
