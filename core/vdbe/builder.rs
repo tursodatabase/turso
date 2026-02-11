@@ -619,11 +619,14 @@ impl ProgramBuilder {
         self.insns.push((insn, self.insns.len()));
     }
 
-    /// Emit an instruction that is guaranteed not to be in any constant span.
-    /// This ensures the instruction won't be hoisted when emit_constant_insns is called.
+    /// Emit an instruction that should not start or extend a constant span on its own.
+    /// If a parent constant span is already open, the instruction is emitted normally
+    /// within that span (the parent's `is_constant` classification takes precedence).
     #[instrument(skip(self), level = Level::DEBUG)]
     pub fn emit_no_constant_insn(&mut self, insn: Insn) {
-        self.constant_span_end_all();
+        if !self.constant_span_is_open() {
+            self.constant_span_end_all();
+        }
         self.emit_insn(insn);
     }
 

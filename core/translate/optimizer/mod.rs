@@ -1919,7 +1919,8 @@ impl Optimizable for ast::Expr {
             }
             Expr::RowId { .. } => true,
             Expr::InList { lhs, rhs, .. } => {
-                lhs.is_nonnull(tables) && rhs.is_empty() || rhs.iter().all(|v| v.is_nonnull(tables))
+                lhs.is_nonnull(tables)
+                    && (rhs.is_empty() || rhs.iter().all(|v| v.is_nonnull(tables)))
             }
             Expr::InSelect { .. } => false,
             Expr::InTable { .. } => false,
@@ -1995,8 +1996,8 @@ impl Optimizable for ast::Expr {
             Expr::Column { .. } => false,
             Expr::RowId { .. } => false,
             Expr::InList { lhs, rhs, .. } => {
-                lhs.is_constant(resolver) && rhs.is_empty()
-                    || rhs.iter().all(|v| v.is_constant(resolver))
+                lhs.is_constant(resolver)
+                    && (rhs.is_empty() || rhs.iter().all(|v| v.is_constant(resolver)))
             }
             Expr::InSelect { .. } => {
                 false // might be constant, too annoying to check subqueries etc. implement later
@@ -2525,5 +2526,80 @@ pub trait TakeOwnership {
 impl TakeOwnership for ast::Expr {
     fn take_ownership(&mut self) -> Self {
         std::mem::replace(self, ast::Expr::Literal(ast::Literal::Null))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Optimizable;
+    use crate::translate::emitter::Resolver;
+    use crate::{schema::Schema, SymbolTable};
+    use turso_parser::ast::{self, Expr, FunctionTail, Name, TableInternalId};
+
+    fn empty_resolver<'a>(schema: &'a Schema, syms: &'a SymbolTable) -> Resolver<'a> {
+        Resolver::new(schema, syms)
+    }
+
+    fn no_tail() -> FunctionTail {
+        FunctionTail {
+            filter_clause: None,
+            over_clause: None,
+        }
+    }
+
+    fn fn_call(name: &str, args: Vec<Expr>) -> Expr {
+        Expr::FunctionCall {
+            name: Name::exact(name.to_string()),
+            distinctness: None,
+            args: args.into_iter().map(Box::new).collect(),
+            order_by: vec![],
+            filter_over: no_tail(),
+        }
+    }
+
+    #[test]
+    fn constant_classifier_for_coalesce_with_in_list() {
+        let schema = Schema::new();
+        let syms = SymbolTable::new();
+        let resolver = empty_resolver(&schema, &syms);
+
+        let expr = fn_call(
+            "coalesce",
+            vec![
+                fn_call(
+                    "length",
+                    vec![Expr::Literal(ast::Literal::String("a".into()))],
+                ),
+                Expr::InList {
+                    lhs: Box::new(fn_call(
+                        "hex",
+                        vec![Expr::Literal(ast::Literal::Blob("01".into()))],
+                    )),
+                    not: false,
+                    rhs: vec![Box::new(Expr::Literal(ast::Literal::Blob("02".into())))],
+                },
+            ],
+        );
+
+        assert!(expr.is_constant(&resolver));
+    }
+
+    #[test]
+    fn constant_classifier_for_quote_of_column() {
+        let schema = Schema::new();
+        let syms = SymbolTable::new();
+        let resolver = empty_resolver(&schema, &syms);
+
+        let expr = fn_call(
+            "quote",
+            vec![Expr::Column {
+                database: None,
+                table: TableInternalId::default(),
+                column: 0,
+                is_rowid_alias: false,
+            }],
+        );
+
+        assert!(!expr.is_constant(&resolver));
     }
 }
