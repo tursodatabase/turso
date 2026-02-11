@@ -165,9 +165,10 @@ pub struct TypeOperatorDef {
 #[derive(Debug, Clone)]
 pub struct TypeDef {
     pub name: String,
+    pub params: Vec<String>,
     pub base: String,
-    pub encode: Option<String>,
-    pub decode: Option<String>,
+    pub encode: Option<Box<turso_parser::ast::Expr>>,
+    pub decode: Option<Box<turso_parser::ast::Expr>>,
     pub operators: Vec<TypeOperatorDef>,
     pub default: Option<Box<turso_parser::ast::Expr>>,
 }
@@ -1246,6 +1247,7 @@ impl Schema {
 
                 let type_def = TypeDef {
                     name: type_name.clone(),
+                    params: body.params.clone(),
                     base: body.base.clone(),
                     encode: body.encode.clone(),
                     decode: body.decode.clone(),
@@ -2206,6 +2208,18 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                     .map(|ast::Type { name, .. }| name)
                     .unwrap_or_default();
 
+                let ty_params: Vec<Box<Expr>> = match col_type {
+                    Some(ast::Type {
+                        size: Some(ast::TypeSize::MaxSize(ref expr)),
+                        ..
+                    }) => vec![expr.clone()],
+                    Some(ast::Type {
+                        size: Some(ast::TypeSize::TypeSize(ref e1, ref e2)),
+                        ..
+                    }) => vec![e1.clone(), e2.clone()],
+                    _ => Vec::new(),
+                };
+
                 let mut typename_exactly_integer = false;
                 let ty = match col_type {
                     Some(data_type) => {
@@ -2360,7 +2374,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                     primary_key = true;
                 }
 
-                cols.push(Column::new(
+                let mut col = Column::new(
                     Some(normalize_ident(&name)),
                     ty_str,
                     default,
@@ -2376,7 +2390,9 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                         unique,
                         hidden: false,
                     },
-                ));
+                );
+                col.ty_params = ty_params;
+                cols.push(col);
             }
 
             if options.contains_without_rowid() {
@@ -2610,6 +2626,7 @@ impl ResolvedFkRef {
 pub struct Column {
     pub name: Option<String>,
     pub ty_str: String,
+    pub ty_params: Vec<Box<Expr>>,
     pub default: Option<Box<Expr>>,
     pub generated: Option<Box<Expr>>,
     raw: u16,
@@ -2672,7 +2689,7 @@ impl Column {
         )
     }
     #[inline]
-    pub const fn new(
+    pub fn new(
         name: Option<String>,
         ty_str: String,
         default: Option<Box<Expr>>,
@@ -2704,6 +2721,7 @@ impl Column {
         Self {
             name,
             ty_str,
+            ty_params: Vec::new(),
             default,
             generated,
             raw,

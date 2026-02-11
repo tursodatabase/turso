@@ -5664,7 +5664,7 @@ pub fn op_function(
                 let val = &state.registers[*start_reg];
                 let result = match val.get_value() {
                     Value::Null => Value::Null,
-                    Value::Integer(i) => {
+                    Value::Numeric(Numeric::Integer(i)) => {
                         if *i < 0 {
                             return Err(LimboError::InternalError(
                                 "test_uint_encode: negative value".to_string(),
@@ -5672,13 +5672,13 @@ pub fn op_function(
                         }
                         Value::build_text(i.to_string())
                     }
-                    Value::Float(f) => {
+                    Value::Numeric(Numeric::Float(f)) => {
                         if *f < 0.0 || f.fract() != 0.0 {
                             return Err(LimboError::InternalError(
                                 "test_uint_encode: not a non-negative integer".to_string(),
                             ));
                         }
-                        Value::build_text((*f as u64).to_string())
+                        Value::build_text((f64::from(*f) as u64).to_string())
                     }
                     Value::Text(t) => {
                         let s = t.to_string();
@@ -5752,7 +5752,7 @@ pub fn op_function(
                             ScalarFunc::TestUintEq => a == b,
                             _ => unreachable!(),
                         };
-                        Value::Integer(if cmp { 1 } else { 0 })
+                        Value::from_i64(if cmp { 1 } else { 0 })
                     }
                     _ => Value::Null,
                 };
@@ -11471,7 +11471,7 @@ fn try_float_to_integer_affinity(value: &mut Value, fl: f64) -> bool {
 fn parse_test_uint(reg: &Register) -> Result<Option<u64>> {
     match reg.get_value() {
         Value::Null => Ok(None),
-        Value::Integer(i) => {
+        Value::Numeric(Numeric::Integer(i)) => {
             if *i < 0 {
                 Err(LimboError::InternalError(
                     "test_uint: negative value".to_string(),
@@ -11482,9 +11482,9 @@ fn parse_test_uint(reg: &Register) -> Result<Option<u64>> {
         }
         Value::Text(t) => {
             let s = t.to_string();
-            let v = s.parse::<u64>().map_err(|_| {
-                LimboError::InternalError(format!("test_uint: invalid uint: {s}"))
-            })?;
+            let v = s
+                .parse::<u64>()
+                .map_err(|_| LimboError::InternalError(format!("test_uint: invalid uint: {s}")))?;
             Ok(Some(v))
         }
         _ => Err(LimboError::InternalError(

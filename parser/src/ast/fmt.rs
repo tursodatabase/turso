@@ -716,18 +716,29 @@ impl ToTokens for Stmt {
                     s.append(TK_EXISTS, None)?;
                 }
                 s.append(TK_ID, Some(type_name))?;
+                // Parameters
+                if !body.params.is_empty() {
+                    s.append(TK_LP, None)?;
+                    for (i, param) in body.params.iter().enumerate() {
+                        if i > 0 {
+                            s.append(TK_COMMA, None)?;
+                        }
+                        s.append(TK_ID, Some(param))?;
+                    }
+                    s.append(TK_RP, None)?;
+                }
                 // BASE
                 s.append(TK_ID, Some("BASE"))?;
                 s.append(TK_ID, Some(&body.base))?;
                 // ENCODE
                 if let Some(ref encode) = body.encode {
                     s.append(TK_ID, Some("ENCODE"))?;
-                    s.append(TK_ID, Some(encode))?;
+                    encode.to_tokens(s, context)?;
                 }
                 // DECODE
                 if let Some(ref decode) = body.decode {
                     s.append(TK_ID, Some("DECODE"))?;
-                    s.append(TK_ID, Some(decode))?;
+                    decode.to_tokens(s, context)?;
                 }
                 // DEFAULT
                 if let Some(ref default) = body.default {
