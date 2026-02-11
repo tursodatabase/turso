@@ -1205,3 +1205,119 @@ expect {
     2|22
     3|
 }
+
+# ============================================================
+# RIGHT JOIN: SELECT * column ordering
+# ============================================================
+# These tests verify that SELECT * produces columns in the
+# original FROM-clause order (left table first, right table second),
+# even though RIGHT JOIN is internally rewritten as LEFT JOIN by
+# swapping the tables.
+
+test right-join-select-star-column-order {
+    CREATE TABLE t1(a, b);
+    CREATE TABLE t2(x, y);
+    INSERT INTO t1 VALUES (1, 'one'), (2, 'two'), (3, 'three');
+    INSERT INTO t2 VALUES (2, 'TWO'), (3, 'THREE'), (4, 'FOUR');
+    SELECT * FROM t1 RIGHT JOIN t2 ON t1.a = t2.x ORDER BY t2.x;
+}
+expect {
+    2|two|2|TWO
+    3|three|3|THREE
+    ||4|FOUR
+}
+
+test right-join-select-star-no-matches {
+    CREATE TABLE t1(a, b);
+    CREATE TABLE t2(x, y);
+    INSERT INTO t1 VALUES (10, 'ten'), (20, 'twenty');
+    INSERT INTO t2 VALUES (1, 'ONE'), (2, 'TWO');
+    SELECT * FROM t1 RIGHT JOIN t2 ON t1.a = t2.x ORDER BY t2.x;
+}
+expect {
+    ||1|ONE
+    ||2|TWO
+}
+
+test right-join-select-star-all-match {
+    CREATE TABLE t1(a, b);
+    CREATE TABLE t2(x, y);
+    INSERT INTO t1 VALUES (1, 'one'), (2, 'two');
+    INSERT INTO t2 VALUES (1, 'ONE'), (2, 'TWO');
+    SELECT * FROM t1 RIGHT JOIN t2 ON t1.a = t2.x ORDER BY t2.x;
+}
+expect {
+    1|one|1|ONE
+    2|two|2|TWO
+}
+
+test right-join-select-star-empty-left {
+    CREATE TABLE t1(a, b);
+    CREATE TABLE t2(x, y);
+    INSERT INTO t2 VALUES (1, 'ONE'), (2, 'TWO');
+    SELECT * FROM t1 RIGHT JOIN t2 ON t1.a = t2.x ORDER BY t2.x;
+}
+expect {
+    ||1|ONE
+    ||2|TWO
+}
+
+test right-join-select-star-many-columns {
+    CREATE TABLE t1(a, b, c);
+    CREATE TABLE t2(x, y, z);
+    INSERT INTO t1 VALUES (1, 'b1', 'c1'), (2, 'b2', 'c2');
+    INSERT INTO t2 VALUES (2, 'y2', 'z2'), (3, 'y3', 'z3');
+    SELECT * FROM t1 RIGHT JOIN t2 ON t1.a = t2.x ORDER BY t2.x;
+}
+expect {
+    2|b2|c2|2|y2|z2
+    |||3|y3|z3
+}
+
+test right-join-select-star-duplicate-keys {
+    CREATE TABLE t1(a, b);
+    CREATE TABLE t2(x, y);
+    INSERT INTO t1 VALUES (1, 'a1'), (1, 'a2');
+    INSERT INTO t2 VALUES (1, 'X'), (2, 'Y');
+    SELECT * FROM t1 RIGHT JOIN t2 ON t1.a = t2.x ORDER BY t2.x, t1.b;
+}
+expect {
+    1|a1|1|X
+    1|a2|1|X
+    ||2|Y
+}
+
+test right-join-table-star {
+    CREATE TABLE t1(a, b);
+    CREATE TABLE t2(x, y);
+    INSERT INTO t1 VALUES (1, 'one'), (2, 'two');
+    INSERT INTO t2 VALUES (2, 'TWO'), (3, 'THREE');
+    SELECT t1.*, t2.* FROM t1 RIGHT JOIN t2 ON t1.a = t2.x ORDER BY t2.x;
+}
+expect {
+    2|two|2|TWO
+    ||3|THREE
+}
+
+test right-join-select-star-with-where {
+    CREATE TABLE t1(a, b);
+    CREATE TABLE t2(x, y);
+    INSERT INTO t1 VALUES (1, 'one'), (2, 'two'), (3, 'three');
+    INSERT INTO t2 VALUES (1, 'ONE'), (2, 'TWO'), (3, 'THREE'), (4, 'FOUR');
+    SELECT * FROM t1 RIGHT JOIN t2 ON t1.a = t2.x WHERE t2.x > 2 ORDER BY t2.x;
+}
+expect {
+    3|three|3|THREE
+    ||4|FOUR
+}
+
+test right-join-select-star-with-aggregate {
+    CREATE TABLE t1(a, b);
+    CREATE TABLE t2(x, y);
+    INSERT INTO t1 VALUES (1, 'one'), (2, 'two');
+    INSERT INTO t2 VALUES (2, 'TWO'), (3, 'THREE'), (4, 'FOUR');
+    SELECT count(*), count(t1.a), count(t2.x) FROM t1 RIGHT JOIN t2 ON t1.a = t2.x;
+}
+expect {
+    3|1|3
+}
