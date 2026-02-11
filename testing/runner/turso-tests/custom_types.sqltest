@@ -228,3 +228,33 @@ test decode-error-propagation {
 expect error {
     malformed JSON
 }
+
+@requires strict "uses STRICT tables"
+test pragma-list-types-builtins {
+    PRAGMA list_types;
+}
+expect {
+    INTEGER|||||
+    REAL|||||
+    TEXT|||||
+    BLOB|||||
+    ANY|||||
+}
+
+@requires strict "uses STRICT tables"
+test pragma-list-types-with-custom {
+    CREATE TYPE test_uint BASE text
+        ENCODE test_uint_encode(value)
+        DECODE test_uint_decode(value)
+        OPERATOR '+' (test_uint) -> test_uint_add
+        DEFAULT 0;
+    PRAGMA list_types;
+}
+expect {
+    INTEGER|||||
+    REAL|||||
+    TEXT|||||
+    BLOB|||||
+    ANY|||||
+    test_uint|text|test_uint_encode (value)|test_uint_decode (value)|0|+(test_uint) -> test_uint_add
+}
