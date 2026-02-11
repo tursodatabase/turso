@@ -281,7 +281,6 @@ expect error {
     error in table t_check2 after drop column: no such column: b
 }
 
-@requires strict "uses STRICT tables"
 test strict-alter-add-column-invalid-varchar {
     CREATE TABLE t(a INTEGER) STRICT;
     ALTER TABLE t ADD COLUMN b VARCHAR(100);
@@ -289,7 +288,6 @@ test strict-alter-add-column-invalid-varchar {
 expect error {
 }
 
-@requires strict "uses STRICT tables"
 test strict-alter-add-column-invalid-datetime {
     CREATE TABLE t(a INTEGER) STRICT;
     ALTER TABLE t ADD COLUMN b DATETIME;
@@ -297,7 +295,6 @@ test strict-alter-add-column-invalid-datetime {
 expect error {
 }
 
-@requires strict "uses STRICT tables"
 test strict-alter-add-column-no-type {
     CREATE TABLE t(a INTEGER) STRICT;
     ALTER TABLE t ADD COLUMN b;
@@ -305,7 +302,6 @@ test strict-alter-add-column-no-type {
 expect error {
 }
 
-@requires strict "uses STRICT tables"
 test strict-alter-add-column-integer {
     CREATE TABLE t(a INTEGER) STRICT;
     ALTER TABLE t ADD COLUMN b INTEGER;
@@ -316,7 +312,6 @@ expect {
     1|42
 }
 
-@requires strict "uses STRICT tables"
 test strict-alter-add-column-text {
     CREATE TABLE t(a INTEGER) STRICT;
     ALTER TABLE t ADD COLUMN b TEXT;
@@ -327,7 +322,6 @@ expect {
     1|hello
 }
 
-@requires strict "uses STRICT tables"
 test strict-alter-add-column-any {
     CREATE TABLE t(a INTEGER) STRICT;
     ALTER TABLE t ADD COLUMN b ANY;

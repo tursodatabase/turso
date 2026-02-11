@@ -1271,13 +1271,8 @@ async fn test_once_not_cleared_on_reset_with_coroutine() {
 }
 
 #[tokio::test]
-async fn test_experimental_strict_tables() {
-    // Test that STRICT tables work when the experimental flag is enabled
-    let db = Builder::new_local(":memory:")
-        .experimental_strict(true)
-        .build()
-        .await
-        .unwrap();
+async fn test_strict_tables() {
+    let db = Builder::new_local(":memory:").build().await.unwrap();
     let conn = db.connect().unwrap();
 
     // Create a STRICT table
@@ -1298,24 +1293,6 @@ async fn test_experimental_strict_tables() {
     let row = rows.next().await.unwrap().unwrap();
     assert_eq!(row.get::<i64>(0).unwrap(), 1);
     assert_eq!(row.get::<String>(1).unwrap(), "Alice");
-}
-
-#[tokio::test]
-async fn test_strict_tables_without_experimental_flag() {
-    // Test that STRICT tables fail without the experimental flag
-    let db = Builder::new_local(":memory:").build().await.unwrap();
-    let conn = db.connect().unwrap();
-
-    // Attempt to create a STRICT table should fail
-    let result = conn
-        .execute(
-            "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT) STRICT",
-            (),
-        )
-        .await;
-
-    // Verify the error message mentions experimental feature
-    assert!(matches!(result, Err(Error::Error(_))));
 }
 
 // Helper to collect all integer values from a single-column query.

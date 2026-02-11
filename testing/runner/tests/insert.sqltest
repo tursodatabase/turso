@@ -25,7 +25,6 @@ expect {
     4
 }
 
-@requires strict "uses STRICT tables"
 test strict-basic-creation {
     CREATE TABLE test1 (id INTEGER, name TEXT, price REAL) STRICT;
     INSERT INTO test1 VALUES(1, 'item1', 10.5);
@@ -48,7 +47,6 @@ expect {
 }
 
 # Reproducer for https://github.com/tursodatabase/turso/issues/2822
-@requires strict "uses STRICT tables"
 test strict-type-case-insensitivity {
     CREATE TABLE test1 (id integer, name text, price real) STRICT;
     INSERT INTO test1 VALUES(1, 'item1', 10.5);
@@ -58,21 +56,18 @@ expect {
     1|item1|10.5
 }
 
-@requires strict "uses STRICT tables"
 test strict-require-datatype {
     CREATE TABLE test2 (id INTEGER, name) STRICT;
 }
 expect error {
 }
 
-@requires strict "uses STRICT tables"
 test strict-valid-datatypes {
     CREATE TABLE test2 (id INTEGER, value DATETIME) STRICT;
 }
 expect error {
 }
 
-@requires strict "uses STRICT tables"
 test strict-type-enforcement {
     CREATE TABLE test3 (id INTEGER, name TEXT, price REAL) STRICT;
     INSERT INTO test3 VALUES(1, 'item1', 'not-a-number');
@@ -80,7 +75,6 @@ test strict-type-enforcement {
 expect error {
 }
 
-@requires strict "uses STRICT tables"
 test strict-type-coercion {
     CREATE TABLE test4 (id INTEGER, name TEXT, price REAL) STRICT;
     INSERT INTO test4 VALUES(1, 'item1', '10.5');
@@ -90,7 +84,6 @@ expect {
     real|10.5
 }
 
-@requires strict "uses STRICT tables"
 test strict-any-flexibility {
     CREATE TABLE test5 (id INTEGER, data ANY) STRICT;
     INSERT INTO test5 VALUES(1, 100);
@@ -104,7 +97,6 @@ expect {
     3|real
 }
 
-@requires strict "uses STRICT tables"
 test strict-any-preservation {
     CREATE TABLE test6 (id INTEGER, code ANY) STRICT;
     INSERT INTO test6 VALUES(1, '000123');
@@ -114,7 +106,6 @@ expect {
     text|000123
 }
 
-@requires strict "uses STRICT tables"
 test strict-int-vs-integer-pk {
     CREATE TABLE test8 (id INT PRIMARY KEY, name TEXT) STRICT
     INSERT INTO test8 VALUES(NULL, 'test');
@@ -122,7 +113,6 @@ test strict-int-vs-integer-pk {
 expect error {
 }
 
-@requires strict "uses STRICT tables"
 test strict-integer-pk-behavior {
     CREATE TABLE test9 (id INTEGER PRIMARY KEY, name TEXT) STRICT;
     INSERT INTO test9 VALUES(NULL, 'test');
@@ -132,7 +122,6 @@ expect {
     1|test
 }
 
-@requires strict "uses STRICT tables"
 test strict-mixed-inserts {
     CREATE TABLE test11 (
     id INTEGER PRIMARY KEY,
@@ -150,7 +139,6 @@ expect {
     2|item2|20.75|10|integer
 }
 
-@requires strict "uses STRICT tables"
 test strict-update-basic {
     CREATE TABLE test1 (id INTEGER, name TEXT, price REAL) STRICT;
     INSERT INTO test1 VALUES(1, 'item1', 10.5);
@@ -161,7 +149,6 @@ expect {
     1|item1|15.75
 }
 
-@requires strict "uses STRICT tables"
 test strict-update-type-enforcement {
     CREATE TABLE test2 (id INTEGER, name TEXT, price REAL) STRICT;
     INSERT INTO test2 VALUES(1, 'item1', 10.5);
@@ -170,7 +157,6 @@ test strict-update-type-enforcement {
 expect error {
 }
 
-@requires strict "uses STRICT tables"
 test strict-update-type-coercion {
     CREATE TABLE test3 (id INTEGER, name TEXT, price REAL) STRICT;
     INSERT INTO test3 VALUES(1, 'item1', 10.5);
@@ -181,7 +167,6 @@ expect {
     1|real|15.75
 }
 
-@requires strict "uses STRICT tables"
 test strict-update-any-flexibility {
     CREATE TABLE test4 (id INTEGER, data ANY) STRICT;
     INSERT INTO test4 VALUES(1, 100);
@@ -195,7 +180,6 @@ expect {
     2|real|3.14
 }
 
-@requires strict "uses STRICT tables"
 test strict-update-any-preservation {
     CREATE TABLE test5 (id INTEGER, code ANY) STRICT;
     INSERT INTO test5 VALUES(1, 'text');
@@ -206,7 +190,6 @@ expect {
     text|000123
 }
 
-@requires strict "uses STRICT tables"
 test strict-update-not-null-constraint {
     CREATE TABLE test7 (id INTEGER, name TEXT NOT NULL) STRICT;
     INSERT INTO test7 VALUES(1, 'name');
@@ -216,7 +199,6 @@ expect error {
 }
 
 # Uncomment following test case when unique constraint is added
-@requires strict "uses STRICT tables"
 test strict-update-pk-constraint {
     CREATE TABLE test8 (id INTEGER PRIMARY KEY, name TEXT) STRICT;
     INSERT INTO test8 VALUES(1, 'name1');
@@ -226,7 +208,6 @@ test strict-update-pk-constraint {
 expect error {
 }
 
-@requires strict "uses STRICT tables"
 test strict-update-multiple-columns {
     CREATE TABLE test9 (id INTEGER, name TEXT, price REAL, quantity INT) STRICT;
     INSERT INTO test9 VALUES(1, 'item1', 10.5, 5);
@@ -237,7 +218,6 @@ expect {
     1|updated|20.75|10
 }
 
-@requires strict "uses STRICT tables"
 test strict-update-where-clause {
     CREATE TABLE test10 (id INTEGER, category TEXT, price REAL) STRICT;
     INSERT INTO test10 VALUES(1, 'A', 10);
@@ -251,8 +231,12 @@ expect {
     2|40.0
     3|30.0
 }
+expect @js {
+    1|20
+    2|40
+    3|30
+}
 
-@requires strict "uses STRICT tables"
 test strict-update-expression {
     CREATE TABLE test11 (id INTEGER, name TEXT, price REAL, discount REAL) STRICT;
     INSERT INTO test11 VALUES(1, 'item1', 100, 0.1);
@@ -262,8 +246,10 @@ test strict-update-expression {
 expect {
     1|90.0
 }
+expect @js {
+    1|90
+}
 
-@requires strict "uses STRICT tables"
 test strict-text-float-to-integer-basic {
     CREATE TABLE t(a INTEGER) STRICT;
     INSERT INTO t VALUES('42.0');
@@ -273,7 +259,6 @@ expect {
     42|integer
 }
 
-@requires strict "uses STRICT tables"
 test strict-text-float-to-integer-zero {
     CREATE TABLE t(a INTEGER) STRICT;
     INSERT INTO t VALUES('0.0');
@@ -283,7 +268,6 @@ expect {
     0|integer
 }
 
-@requires strict "uses STRICT tables"
 test strict-text-float-to-integer-negative {
     CREATE TABLE t(a INTEGER) STRICT;
     INSERT INTO t VALUES('-5.0');
@@ -293,7 +277,6 @@ expect {
     -5|integer
 }
 
-@requires strict "uses STRICT tables"
 test strict-text-float-to-integer-scientific {
     CREATE TABLE t(a INTEGER) STRICT;
     INSERT INTO t VALUES('1e2');
@@ -303,7 +286,6 @@ expect {
     100|integer
 }
 
-@requires strict "uses STRICT tables"
 test strict-text-float-to-integer-fractional-error {
     CREATE TABLE t(a INTEGER) STRICT;
     INSERT INTO t VALUES('1.5');
@@ -311,7 +293,6 @@ test strict-text-float-to-integer-fractional-error {
 expect error {
 }
 
-@requires strict "uses STRICT tables"
 test strict-text-integer-to-real-basic {
     CREATE TABLE t(a REAL) STRICT;
     INSERT INTO t VALUES('42');
@@ -320,8 +301,10 @@ test strict-text-integer-to-real-basic {
 expect {
     42.0|real
 }
+expect @js {
+    42|real
+}
 
-@requires strict "uses STRICT tables"
 test strict-text-integer-to-real-negative {
     CREATE TABLE t(a REAL) STRICT;
     INSERT INTO t VALUES('-7');
@@ -330,8 +313,10 @@ test strict-text-integer-to-real-negative {
 expect {
     -7.0|real
 }
+expect @js {
+    -7|real
+}
 
-@requires strict "uses STRICT tables"
 test strict-text-integer-to-real-zero {
     CREATE TABLE t(a REAL) STRICT;
     INSERT INTO t VALUES('0');
@@ -340,8 +325,10 @@ test strict-text-integer-to-real-zero {
 expect {
     0.0|real
 }
+expect @js {
+    0|real
+}
 
-@requires strict "uses STRICT tables"
 test strict-text-float-to-real {
     CREATE TABLE t(a REAL) STRICT;
     INSERT INTO t VALUES('3.14');
@@ -351,7 +338,6 @@ expect {
     3.14|real
 }
 
-@requires strict "uses STRICT tables"
 test strict-text-string-to-real-error {
     CREATE TABLE t(a REAL) STRICT;
     INSERT INTO t VALUES('hello');

@@ -134,7 +134,6 @@ pub(crate) mod thread;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct DatabaseOpts {
     pub enable_views: bool,
-    pub enable_strict: bool,
     pub enable_encryption: bool,
     pub enable_index_method: bool,
     pub enable_autovacuum: bool,
@@ -156,11 +155,6 @@ impl DatabaseOpts {
 
     pub fn with_views(mut self, enable: bool) -> Self {
         self.enable_views = enable;
-        self
-    }
-
-    pub fn with_strict(mut self, enable: bool) -> Self {
-        self.enable_strict = enable;
         self
     }
 
@@ -1471,10 +1465,6 @@ impl Database {
 
     pub fn experimental_index_method_enabled(&self) -> bool {
         self.opts.enable_index_method
-    }
-
-    pub fn experimental_strict_enabled(&self) -> bool {
-        self.opts.enable_strict
     }
 
     pub fn experimental_triggers_enabled(&self) -> bool {
