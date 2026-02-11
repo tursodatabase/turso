@@ -1659,10 +1659,10 @@ pub fn op_type_check(
                 {
                     if value_type == ValueType::Float {
                         if let Register::Value(value) = reg {
-                            if let Value::Float(f) = *value {
-                                let i = f as i64;
-                                if (i as f64) == f {
-                                    *value = Value::Integer(i);
+                            if let Value::Numeric(Numeric::Float(f)) = *value {
+                                let i = f64::from(f) as i64;
+                                if (i as f64) == f64::from(f) {
+                                    *value = Value::from_i64(i);
                                 } else {
                                     bail_constraint_error!(
                                         "cannot store {} value in {} column {}.{} ({})",
@@ -11232,8 +11232,8 @@ fn apply_affinity_char(target: &mut Register, affinity: Affinity) -> bool {
                     }
                     if let Ok(num) = checked_cast_text_to_numeric(s, false) {
                         match num {
-                            Value::Integer(i) => {
-                                *value = Value::Float(i as f64);
+                            Value::Numeric(Numeric::Integer(i)) => {
+                                *value = Value::from_f64(i as f64);
                             }
                             other => {
                                 *value = other;

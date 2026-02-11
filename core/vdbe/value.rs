@@ -924,15 +924,15 @@ impl Value {
     }
 
     pub fn exec_subtract(&self, rhs: &Value) -> Value {
-        (|| (Numeric::from_value(self)?.checked_sub(Numeric::from_value(rhs)?)))().into()
+        (|| Numeric::from_value(self)?.checked_sub(Numeric::from_value(rhs)?))().into()
     }
 
     pub fn exec_multiply(&self, rhs: &Value) -> Value {
-        (|| (Numeric::from_value(self)?.checked_mul(Numeric::from_value(rhs)?)))().into()
+        (|| Numeric::from_value(self)?.checked_mul(Numeric::from_value(rhs)?))().into()
     }
 
     pub fn exec_divide(&self, rhs: &Value) -> Value {
-        (|| (Numeric::from_value(self)?.checked_div(Numeric::from_value(rhs)?)))().into()
+        (|| Numeric::from_value(self)?.checked_div(Numeric::from_value(rhs)?))().into()
     }
 
     pub fn exec_bit_and(&self, rhs: &Value) -> Value {
