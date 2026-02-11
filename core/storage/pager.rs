@@ -645,6 +645,28 @@ impl PageInner {
         }
         println!("--------------");
     }
+
+    /// Convert a logical cell index to a physical index by subtracting
+    /// overflow cells that appear before the target index.
+    ///
+    /// Logical indices treat overflow cells as if they were physically present
+    /// in the page. Physical indices only count cells actually stored on the page.
+    ///
+    /// For example, if we have:
+    /// - 10 physical cells on the page (cell_count = 10)
+    /// - 1 overflow cell at logical index 5
+    ///
+    /// Then logical index 7 maps to physical index 6, because one overflow cell
+    /// (at index 5) comes before index 7.
+    #[inline]
+    pub fn logical_to_physical_idx(&self, logical_idx: usize) -> usize {
+        let overflow_before = self
+            .overflow_cells
+            .iter()
+            .filter(|oc| oc.index < logical_idx)
+            .count();
+        logical_idx - overflow_before
+    }
 }
 
 /// Type alias for backward compatibility - PageContent is now PageInner
