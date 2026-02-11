@@ -148,6 +148,29 @@ export interface DatabaseOpts {
   timeout?: number
   fileMustExist?: boolean
   tracing?: string
+  /** Experimental features to enable */
+  experimental?: Array<string>
+  /** Optional encryption configuration for local database encryption */
+  encryption?: EncryptionOpts
+}
+
+/** Supported encryption ciphers for local database encryption. */
+export declare const enum EncryptionCipher {
+  Aes128Gcm = 0,
+  Aes256Gcm = 1,
+  Aegis256 = 2,
+  Aegis256x2 = 3,
+  Aegis128l = 4,
+  Aegis128x2 = 5,
+  Aegis128x4 = 6
+}
+
+/** Encryption configuration for local database encryption. */
+export interface EncryptionOpts {
+  /** The cipher to use for encryption */
+  cipher: EncryptionCipher
+  /** The hex-encoded encryption key */
+  hexkey: string
 }
 export declare class GeneratorHolder {
   resumeSync(error?: string | undefined | null): GeneratorResponse
@@ -251,7 +274,13 @@ export interface SyncEngineOpts {
   useTransform: boolean
   protocolVersion?: SyncEngineProtocolVersion
   bootstrapIfEmpty: boolean
-  remoteEncryption?: string
+  /** Encryption cipher for the Turso Cloud database. */
+  remoteEncryptionCipher?: string
+  /**
+   * Base64-encoded encryption key for the Turso Cloud database.
+   * Must match the key used when creating the encrypted database.
+   */
+  remoteEncryptionKey?: string
   partialSyncOpts?: JsPartialSyncOpts
 }
 

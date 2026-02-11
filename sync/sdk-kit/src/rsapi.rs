@@ -168,7 +168,11 @@ fn persistent_io(partial: bool) -> Result<Arc<dyn IO>, turso_sync_engine::errors
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = partial;
+        if partial {
+            return Err(turso_sync_engine::errors::Error::DatabaseSyncEngineError(
+                "partial sync is not supported for this platform at the moment".to_string(),
+            ));
+        }
         Ok(Arc::new(turso_core::PlatformIO::new().map_err(|e| {
             turso_sync_engine::errors::Error::DatabaseSyncEngineError(format!(
                 "Failed to create platform IO: {e}"
