@@ -799,7 +799,7 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
         let index_rows = mvcc_store
             .index_rows
             .get(&table_id)
-            .expect("expected index {table_id:?}");
+            .unwrap_or_else(|| panic!("expected index {table_id:?}"));
         let index_rows = index_rows.value();
 
         // Use range to efficiently find all entries that match the prefix.
