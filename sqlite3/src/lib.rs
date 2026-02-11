@@ -794,9 +794,38 @@ pub unsafe extern "C" fn sqlite3_changes(db: *mut sqlite3) -> ffi::c_int {
     sqlite3_changes64(db) as ffi::c_int
 }
 
+/// Determine if a prepared statement is read-only.
+///
+/// Returns non-zero (true) if the prepared statement makes no direct changes
+/// to the content of the database file. Transaction control statements
+/// such as BEGIN, COMMIT, ROLLBACK, SAVEPOINT, and RELEASE cause this function
+/// to return true, since the statements themselves do not actually modify
+/// the database file. INSERT, UPDATE, DELETE, CREATE INDEX, etc. return false.
 #[no_mangle]
-pub unsafe extern "C" fn sqlite3_stmt_readonly(_stmt: *mut sqlite3_stmt) -> ffi::c_int {
-    stub!();
+pub unsafe extern "C" fn sqlite3_stmt_readonly(stmt: *mut sqlite3_stmt) -> ffi::c_int {
+    if stmt.is_null() {
+        return 1; // SQLite returns true for NULL pointer
+    }
+    let stmt = &*stmt;
+    if stmt.stmt.is_readonly() {
+        1
+    } else {
+        0
+    }
+}
+
+/// Determine if a prepared statement is an EXPLAIN statement.
+///
+/// Returns 0 if the statement is an ordinary statement or a NULL pointer.
+/// Returns 1 if the statement is an EXPLAIN statement.
+/// Returns 2 if the statement is an EXPLAIN QUERY PLAN statement.
+#[no_mangle]
+pub unsafe extern "C" fn sqlite3_stmt_isexplain(stmt: *mut sqlite3_stmt) -> ffi::c_int {
+    if stmt.is_null() {
+        return 0; // SQLite returns 0 for NULL pointer (ordinary statement)
+    }
+    let stmt = &*stmt;
+    stmt.stmt.is_explain()
 }
 
 #[no_mangle]

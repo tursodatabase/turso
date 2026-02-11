@@ -1,4 +1,5 @@
 mod common;
+mod differential_capi;
 mod functions;
 mod fuzz_transaction;
 mod index_method;
