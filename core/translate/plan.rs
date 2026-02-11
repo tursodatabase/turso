@@ -632,8 +632,19 @@ pub enum IterationDirection {
     Backwards,
 }
 
-pub fn select_star(tables: &[JoinedTable], out_columns: &mut Vec<ResultSetColumn>) {
-    for table in tables.iter() {
+pub fn select_star(
+    tables: &[JoinedTable],
+    out_columns: &mut Vec<ResultSetColumn>,
+    right_join_swapped: bool,
+) {
+    // When tables were swapped for a RIGHT JOIN rewrite, iterate in reverse
+    // so that the output column order matches the original FROM clause order.
+    let table_iter: Vec<&JoinedTable> = if right_join_swapped {
+        tables.iter().rev().collect()
+    } else {
+        tables.iter().collect()
+    };
+    for table in table_iter {
         out_columns.extend(
             table
                 .columns()
@@ -793,6 +804,10 @@ pub struct TableReferences {
     joined_tables: Vec<JoinedTable>,
     /// Tables from outer scopes that are referenced in this query scope.
     outer_query_refs: Vec<OuterQueryReference>,
+    /// When a RIGHT JOIN is rewritten as LEFT JOIN by swapping the two tables,
+    /// this flag is set so that `select_star` can emit columns in the original
+    /// (pre-swap) order, preserving the user-visible column ordering.
+    right_join_swapped: bool,
 }
 
 impl TableReferences {
@@ -808,17 +823,29 @@ impl TableReferences {
         Self {
             joined_tables,
             outer_query_refs,
+            right_join_swapped: false,
         }
     }
     pub fn new_empty() -> Self {
         Self {
             joined_tables: Vec::new(),
             outer_query_refs: Vec::new(),
+            right_join_swapped: false,
         }
     }
 
     pub fn is_empty(&self) -> bool {
         self.joined_tables.is_empty() && self.outer_query_refs.is_empty()
+    }
+
+    /// Mark that the first two joined tables were swapped to rewrite a RIGHT JOIN as LEFT JOIN.
+    pub fn set_right_join_swapped(&mut self) {
+        self.right_join_swapped = true;
+    }
+
+    /// Whether the first two joined tables were swapped for a RIGHT JOIN rewrite.
+    pub fn right_join_swapped(&self) -> bool {
+        self.right_join_swapped
     }
 
     /// Add a new [JoinedTable] to the query plan.

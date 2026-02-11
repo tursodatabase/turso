@@ -1672,6 +1672,7 @@ fn parse_join(
                     );
                 }
                 table_references.joined_tables_mut().swap(len - 2, len - 1);
+                table_references.set_right_join_swapped();
                 // The outer flag goes on the table that was originally on the left
                 // (now in the rightmost position after swap), this is correct because
                 // JoinInfo.outer marks the table whose columns become NULL on miss.

@@ -10825,7 +10825,8 @@ fn advance_unmatched_scan(
     loop {
         match hash_table.next_unmatched() {
             Some(entry) => {
-                registers[dest_reg] = Register::Value(Value::Integer(entry.rowid));
+                registers[dest_reg] =
+                    Register::Value(Value::Numeric(Numeric::Integer(entry.rowid)));
                 write_hash_payload_to_registers(registers, entry, payload_dest_reg, num_payload);
                 *pc += 1;
                 return Ok(InsnFunctionStepResult::Step);
