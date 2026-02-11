@@ -1,4 +1,5 @@
 mod common;
+mod conflict_resolution;
 mod functions;
 mod fuzz_transaction;
 mod index_method;
