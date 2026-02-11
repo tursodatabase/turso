@@ -1115,6 +1115,7 @@ fn new_tx(tx_id: TxID, begin_ts: u64, state: TransactionState) -> Transaction {
 }
 
 #[test]
+#[cfg_attr(not(feature = "mvcc_raw_test"), ignore)]
 fn test_snapshot_isolation_tx_visible1() {
     let txs: SkipMap<TxID, Transaction> = SkipMap::from_iter([
         (1, new_tx(1, 1, TransactionState::Committed(2))),
