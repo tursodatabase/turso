@@ -1333,6 +1333,11 @@ pub fn op_rewind(
         insn
     );
     assert!(pc_if_empty.is_offset());
+    // Clear any bloom filter associated with this cursor so stale filter data
+    // does not incorrectly reject valid matches in subsequent iterations.
+    if let Some(filter) = state.get_bloom_filter_mut(*cursor_id) {
+        filter.clear();
+    }
     let is_empty = {
         let cursor = state.get_cursor(*cursor_id);
         match cursor {

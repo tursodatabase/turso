@@ -1166,6 +1166,12 @@ impl ProgramBuilder {
         self.nested_level -= 1;
     }
 
+    /// Returns true if we are inside a nested subquery context.
+    #[inline]
+    pub fn is_nested(&self) -> bool {
+        self.nested_level > 0
+    }
+
     /// Initialize the program with basic setup and return initial metadata and labels
     pub fn prologue(&mut self) {
         if self.is_subprogram {
