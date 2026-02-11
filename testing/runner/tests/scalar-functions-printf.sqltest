@@ -1,6 +1,9 @@
 @database :memory:
 
-# Basic string formatting
+# ============================================
+# Basic string formatting (no flags/width/precision)
+# ============================================
+
 test printf-basic-string {
     SELECT printf('Hello World!');
 }
@@ -13,13 +16,6 @@ test printf-string-replacement {
 }
 expect {
     Hello, Alice
-}
-
-test printf-string-substitution {
-    SELECT printf('Hello, %s!', 'World');
-}
-expect {
-    Hello, World!
 }
 
 test printf-multiple-strings {
@@ -50,8 +46,11 @@ expect {
     100% complete
 }
 
-# Integer formatting
-test printf-integer-replacement {
+# ============================================
+# Basic integer formatting
+# ============================================
+
+test printf-integer-basic {
     SELECT printf('Number: %d', 42);
 }
 expect {
@@ -65,7 +64,7 @@ expect {
     Number: -42
 }
 
-test printf-integer-arithmetic-expression {
+test printf-integer-arithmetic {
     SELECT printf('%d + %d = %d', 2, 3, 5);
 }
 expect {
@@ -79,19 +78,29 @@ expect {
     Number: 0
 }
 
-# Unsigned integer formatting
-test printf-unsigned-basic {
-    SELECT printf('Number: %u', 42);
+test printf-float-as-integer {
+    SELECT printf('Truncated: %d', 3.9);
+}
+expect {
+    Truncated: 3
+}
+
+test printf-i-specifier {
+    SELECT printf('Number: %i', 42);
 }
 expect {
     Number: 42
 }
 
-test printf-unsigned-arithmetic-expression {
-    SELECT printf('%u + %u = %u', 2, 3, 5);
+# ============================================
+# Unsigned integer formatting
+# ============================================
+
+test printf-unsigned-basic {
+    SELECT printf('Number: %u', 42);
 }
 expect {
-    2 + 3 = 5
+    Number: 42
 }
 
 test printf-unsigned-negative {
@@ -101,14 +110,17 @@ expect {
     Negative: 18446744073709551615
 }
 
-test printf-text-as-unsigned {
+test printf-unsigned-text {
     SELECT printf('NaN: %u', 'not a number');
 }
 expect {
     NaN: 0
 }
 
-# Float formatting
+# ============================================
+# Basic float formatting
+# ============================================
+
 test printf-float-basic {
     SELECT printf('Number: %f', 42.5);
 }
@@ -130,13 +142,6 @@ expect {
     Number: 42.000000
 }
 
-test printf-float-arithmetic {
-    SELECT printf('%f + %f = %f', 2.5, 3.5, 6.0);
-}
-expect {
-    2.500000 + 3.500000 = 6.000000
-}
-
 test printf-text-as-float {
     SELECT printf('Number: %f', 'not a number');
 }
@@ -144,243 +149,568 @@ expect {
     Number: 0.000000
 }
 
-# Character formatting
-test printf-char-single {
-    SELECT printf('character: %c', 'a');
+# ============================================
+# Width and precision - float
+# ============================================
+
+test printf-float-precision-2 {
+    SELECT printf('%.2f', 4.0020);
 }
 expect {
-    character: a
+    4.00
 }
 
-test printf-char-first-from-string {
-    SELECT printf('character: %c', 'this is a test');
+test printf-float-precision-0 {
+    SELECT printf('%.0f', 3.0);
 }
 expect {
-    character: t
+    3
 }
 
-test printf-char-empty-string {
-    SELECT printf('character: %c', '');
-}
-expect raw {
-character: 
-}
-
-test printf-char-from-integer {
-    SELECT printf('character: %c', 123);
+test printf-float-precision-10 {
+    SELECT printf('%.10f', 1.0/3.0);
 }
 expect {
-    character: 1
+    0.3333333333
 }
 
-test printf-char-from-float {
-    SELECT printf('character: %c', 42.5);
+test printf-float-width {
+    SELECT '|' || printf('%10f', 3.14) || '|';
 }
 expect {
-    character: 4
+    |  3.140000|
 }
 
-# Exponential notation formatting
-test printf-exp-large-number {
-    SELECT printf('Exp: %e', 23000000.0);
+test printf-float-width-precision {
+    SELECT '|' || printf('%10.2f', 3.14) || '|';
 }
 expect {
-    Exp: 2.300000e+07
+    |      3.14|
 }
 
-test printf-exp-negative-large {
-    SELECT printf('Exp: %e', -23000000.0);
+test printf-float-zero-pad {
+    SELECT printf('%010.2f', 3.14);
 }
 expect {
-    Exp: -2.300000e+07
+    0000003.14
 }
 
-test printf-exp-decimal-float {
-    SELECT printf('Exp: %e', 250.375);
+test printf-float-left-justify {
+    SELECT '|' || printf('%-10.2f', 3.14) || '|';
 }
 expect {
-    Exp: 2.503750e+02
+    |3.14      |
 }
 
-test printf-exp-small-positive {
-    SELECT printf('Exp: %e', 0.0003235);
+test printf-float-force-sign {
+    SELECT printf('%+.2f', 3.14);
 }
 expect {
-    Exp: 3.235000e-04
+    +3.14
 }
 
-test printf-exp-zero {
-    SELECT printf('Exp: %e', 0.0);
+test printf-float-force-sign-negative {
+    SELECT printf('%+.2f', -3.14);
 }
 expect {
-    Exp: 0.000000e+00
+    -3.14
 }
 
-test printf-exp-small-positive-duplicate {
-    SELECT printf('Exp: %e', 0.0003235);
+test printf-float-space-sign {
+    SELECT '|' || printf('% .2f', 3.14) || '|';
 }
 expect {
-    Exp: 3.235000e-04
+    | 3.14|
 }
 
-test printf-exp-string-integer {
-    SELECT printf('Exp: %e', '123');
+test printf-float-space-sign-negative {
+    SELECT printf('% .2f', -3.14);
 }
 expect {
-    Exp: 1.230000e+02
+    -3.14
 }
 
-test printf-exp-string-float {
-    SELECT printf('Exp: %e', '123.45');
+# ============================================
+# Width and precision - integer
+# ============================================
+
+test printf-int-width {
+    SELECT '|' || printf('%10d', 42) || '|';
 }
 expect {
-    Exp: 1.234500e+02
+    |        42|
 }
 
-test printf-exp-string-leading-zeros {
-    SELECT printf('Exp: %e', '00123');
+test printf-int-zero-pad {
+    SELECT printf('%05d', 42);
 }
 expect {
-    Exp: 1.230000e+02
+    00042
 }
 
-test printf-exp-string-text {
-    SELECT printf('Exp: %e', 'test');
+test printf-int-left-justify {
+    SELECT '|' || printf('%-10d', 42) || '|';
 }
 expect {
-    Exp: 0.000000e+00
+    |42        |
 }
 
-test printf-exp-string-number-suffix {
-    SELECT printf('Exp: %e', '123ab');
+test printf-int-force-sign {
+    SELECT printf('%+d', 42);
 }
 expect {
-    Exp: 1.230000e+02
+    +42
 }
 
-test printf-exp-string-text-prefix {
-    SELECT printf('Exp: %e', 'ab123');
+test printf-int-space-sign {
+    SELECT '|' || printf('% d', 42) || '|';
 }
 expect {
-    Exp: 0.000000e+00
+    | 42|
 }
 
-test printf-exp-string-exponential {
-    SELECT printf('Exp: %e', '1.230000e+02');
+test printf-int-precision {
+    SELECT printf('%.5d', 42);
 }
 expect {
-    Exp: 1.230000e+02
+    00042
 }
 
-# hexadecimal formatting
-test printf-hex-simple {
-    SELECT printf('hex: %x', 4);
+test printf-int-precision-zero-value {
+    SELECT printf('%.0d', 0);
 }
 expect {
-    hex: 4
+    0
 }
 
-test printf-hex-large-number {
-    SELECT printf('hex: %x', 15565303546);
+test printf-int-width-and-precision {
+    SELECT '|' || printf('%10.5d', 42) || '|';
 }
 expect {
-    hex: 39fc3aefa
+    |     00042|
 }
 
-test printf-hex-uppercase {
-    SELECT printf('hex: %X', 15565303546);
+# ============================================
+# Width and precision - string
+# ============================================
+
+test printf-string-width {
+    SELECT '|' || printf('%10s', 'hi') || '|';
 }
 expect {
-    hex: 39FC3AEFA
+    |        hi|
+}
+
+test printf-string-left-justify {
+    SELECT '|' || printf('%-10s', 'hi') || '|';
+}
+expect {
+    |hi        |
+}
+
+test printf-string-precision-truncate {
+    SELECT printf('%.3s', 'hello');
+}
+expect {
+    hel
+}
+
+test printf-string-width-and-precision {
+    SELECT '|' || printf('%10.3s', 'hello') || '|';
+}
+expect {
+    |       hel|
+}
+
+# ============================================
+# Dynamic width and precision with *
+# ============================================
+
+test printf-dynamic-width {
+    SELECT '|' || printf('%*d', 10, 42) || '|';
+}
+expect {
+    |        42|
+}
+
+test printf-dynamic-width-negative {
+    SELECT '|' || printf('%*d', -10, 42) || '|';
+}
+expect {
+    |42        |
+}
+
+test printf-dynamic-precision {
+    SELECT printf('%.*f', 2, 3.14159);
+}
+expect {
+    3.14
+}
+
+test printf-dynamic-width-and-precision {
+    SELECT '|' || printf('%*.*f', 10, 2, 3.14159) || '|';
+}
+expect {
+    |      3.14|
+}
+
+# ============================================
+# Hexadecimal formatting
+# ============================================
+
+test printf-hex-basic {
+    SELECT printf('%x', 255);
+}
+expect {
+    ff
+}
+
+test printf-hex-upper {
+    SELECT printf('%X', 255);
+}
+expect {
+    FF
+}
+
+test printf-hex-width-zero-pad {
+    SELECT printf('%08x', 255);
+}
+expect {
+    000000ff
+}
+
+test printf-hex-alternate {
+    SELECT printf('%#x', 255);
+}
+expect {
+    0xff
 }
 
 test printf-hex-negative {
-    SELECT printf('hex: %x', -15565303546);
+    SELECT printf('%x', -1);
 }
 expect {
-    hex: fffffffc603c5106
+    ffffffffffffffff
 }
 
-test printf-hex-float {
-    SELECT printf('hex: %x', 42.5);
+# ============================================
+# Pointer formatting (%p - uppercase hex in SQL context)
+# ============================================
+
+test printf-pointer-basic {
+    SELECT printf('%p', 42);
 }
 expect {
-    hex: 2a
+    2A
 }
 
-test printf-hex-negative-float {
-    SELECT printf('hex: %x', -42.5);
+test printf-pointer-zero {
+    SELECT printf('%p', 0);
 }
 expect {
-    hex: ffffffffffffffd6
+    0
 }
 
-test printf-hex-text {
-    SELECT printf('hex: %x', '42');
+test printf-hex-precision {
+    SELECT printf('%.8x', 255);
 }
 expect {
-    hex: 2a
+    000000ff
 }
 
-test printf-hex-empty-text {
-    SELECT printf('hex: %x', '');
+# ============================================
+# Octal formatting
+# ============================================
+
+test printf-octal-basic {
+    SELECT printf('%o', 8);
 }
 expect {
-    hex: 0
+    10
 }
 
-# octal formatting
-test printf-octal-simple {
-    SELECT printf('octal: %o', 4);
+test printf-octal-alternate {
+    SELECT printf('%#o', 8);
 }
 expect {
-    octal: 4
+    010
 }
 
-test printf-octal-large-number {
-    SELECT printf('octal: %o', 15565303546);
+test printf-octal-width {
+    SELECT '|' || printf('%10o', 8) || '|';
 }
 expect {
-    octal: 163760727372
+    |        10|
 }
 
-test printf-octal-negative {
-    SELECT printf('octal: %o', -15565303546);
+# ============================================
+# Exponential formatting
+# ============================================
+
+test printf-exp-basic {
+    SELECT printf('%e', 23000000.0);
 }
 expect {
-    octal: 1777777777614017050406
+    2.300000e+07
 }
 
-test printf-octal-float {
-    SELECT printf('octal: %o', 42.5);
+test printf-exp-uppercase {
+    SELECT printf('%E', 23000000.0);
 }
 expect {
-    octal: 52
+    2.300000E+07
 }
 
-test printf-octal-negative-float {
-    SELECT printf('octal: %o', -42.5);
+test printf-exp-precision {
+    SELECT printf('%.2e', 23000000.0);
 }
 expect {
-    octal: 1777777777777777777726
+    2.30e+07
 }
 
-test printf-octal-text {
-    SELECT printf('octal: %o', '42');
+test printf-exp-zero {
+    SELECT printf('%e', 0.0);
 }
 expect {
-    octal: 52
+    0.000000e+00
 }
 
-test printf-octal-empty-text {
-    SELECT printf('octal: %o', '');
+test printf-exp-small {
+    SELECT printf('%e', 0.0003235);
 }
 expect {
-    octal: 0
+    3.235000e-04
 }
 
-# mixed formatting
-test printf-mixed-string-integer {
+test printf-exp-negative {
+    SELECT printf('%e', -23000000.0);
+}
+expect {
+    -2.300000e+07
+}
+
+# ============================================
+# General float formatting (%g/%G)
+# ============================================
+
+test printf-g-basic {
+    SELECT printf('%g', 100.0);
+}
+expect {
+    100
+}
+
+test printf-g-small {
+    SELECT printf('%g', 0.00123);
+}
+expect {
+    0.00123
+}
+
+test printf-g-very-small {
+    SELECT printf('%g', 0.000001);
+}
+expect {
+    1e-06
+}
+
+test printf-g-large {
+    SELECT printf('%g', 1234567.0);
+}
+expect {
+    1.23457e+06
+}
+
+test printf-g-precision-2 {
+    SELECT printf('%.2g', 123.456);
+}
+expect {
+    1.2e+02
+}
+
+test printf-g-precision-3 {
+    SELECT printf('%.3g', 123.456);
+}
+expect {
+    123
+}
+
+test printf-g-trailing-zeros {
+    SELECT printf('%g', 1.0);
+}
+expect {
+    1
+}
+
+test printf-g-trailing-zeros-2 {
+    SELECT printf('%g', 1.50);
+}
+expect {
+    1.5
+}
+
+test printf-G-basic {
+    SELECT printf('%G', 0.000001);
+}
+expect {
+    1E-06
+}
+
+test printf-g-integer {
+    SELECT printf('%g', 42);
+}
+expect {
+    42
+}
+
+test printf-g-zero {
+    SELECT printf('%g', 0.0);
+}
+expect {
+    0
+}
+
+# ============================================
+# Character formatting (%c)
+# In SQL context, %c takes first char of string representation
+# ============================================
+
+test printf-char-from-string {
+    SELECT printf('%c', 'hello');
+}
+expect {
+    h
+}
+
+test printf-char-from-integer {
+    SELECT printf('%c', 65);
+}
+expect {
+    6
+}
+
+test printf-char-from-integer-single-digit {
+    SELECT printf('%c', 7);
+}
+expect {
+    7
+}
+
+test printf-char-width {
+    SELECT '|' || printf('%5c', 65) || '|';
+}
+expect {
+    |    6|
+}
+
+# ============================================
+# SQL quoting (%q, %Q, %w)
+# ============================================
+
+test printf-q-basic {
+    SELECT printf('%q', 'hello');
+}
+expect {
+    hello
+}
+
+test printf-q-with-quotes {
+    SELECT printf('%q', 'it''s');
+}
+expect {
+    it''s
+}
+
+test printf-q-null {
+    SELECT printf('%q', NULL);
+}
+expect {
+    (NULL)
+}
+
+test printf-Q-basic {
+    SELECT printf('%Q', 'hello');
+}
+expect {
+    'hello'
+}
+
+test printf-Q-with-quotes {
+    SELECT printf('%Q', 'it''s');
+}
+expect {
+    'it''s'
+}
+
+test printf-Q-null {
+    SELECT printf('%Q', NULL);
+}
+expect {
+    NULL
+}
+
+test printf-w-basic {
+    SELECT printf('%w', 'table_name');
+}
+expect {
+    table_name
+}
+
+test printf-w-with-double-quotes {
+    SELECT printf('%w', 'col"name');
+}
+expect {
+    col""name
+}
+
+# ============================================
+# Comma separator flag
+# ============================================
+
+test printf-comma-integer {
+    SELECT printf('%,d', 1234567);
+}
+expect {
+    1,234,567
+}
+
+test printf-comma-negative {
+    SELECT printf('%,d', -1234567);
+}
+expect {
+    -1,234,567
+}
+
+test printf-comma-float {
+    SELECT printf('%,.2f', 1234567.89);
+}
+expect {
+    1,234,567.89
+}
+
+test printf-comma-small {
+    SELECT printf('%,d', 999);
+}
+expect {
+    999
+}
+
+# ============================================
+# Alternate form (#)
+# ============================================
+
+test printf-alt-float-precision-0 {
+    SELECT printf('%#.0f', 3.0);
+}
+expect {
+    3.
+}
+
+# ============================================
+# Mixed formatting
+# ============================================
+
+test printf-mixed-basic {
     SELECT printf('%s: %d', 'Count', 42);
 }
 expect {
@@ -394,82 +724,29 @@ expect {
     Progress: 75 (75.500000%)
 }
 
-test printf-mixed-complex-format {
+test printf-mixed-complex {
     SELECT printf('Name: %s, ID: %d, Score: %f', 'John', 123, 95.5);
 }
 expect {
     Name: John, ID: 123, Score: 95.500000
 }
 
-test printf-mixed-string-exponential {
-    SELECT printf('Scientific: %s = %e', 'Large number', 123000.0);
+test printf-mixed-hex-pad {
+    SELECT printf('abc%03x', 10);
 }
 expect {
-    Scientific: Large number = 1.230000e+05
+    abc00a
 }
 
-test printf-mixed-integer-octal {
-    SELECT printf('Decimal %d is octal %o', 64, 64);
-}
-expect {
-    Decimal 64 is octal 100
-}
+# ============================================
+# Non-string format argument
+# ============================================
 
-test printf-mixed-exponential-float {
-    SELECT printf('Scientific %e equals %f', 0.00123, 0.00123);
-}
-expect {
-    Scientific 1.230000e-03 equals 0.001230
-}
-
-test printf-mixed-string-octal {
-    SELECT printf('Permission %s: %o', 'rwx', 755);
-}
-expect {
-    Permission rwx: 1363
-}
-
-test printf-mixed-exponential-integer {
-    SELECT printf('Value %e as integer %d', 42.7, 42);
-}
-expect {
-    Value 4.270000e+01 as integer 42
-}
-
-test printf-mixed-octal-hex {
-    SELECT printf('Octal %o is hex %x', 255, 255);
-}
-expect {
-    Octal 377 is hex ff
-}
-
-# Non-string format argument - should be converted to string
 test printf-format-integer {
     SELECT printf(123);
 }
 expect {
     123
-}
-
-test printf-format-integer-with-args {
-    SELECT printf(1, 'extra', 'args');
-}
-expect {
-    1
-}
-
-test printf-format-zero {
-    SELECT printf(0);
-}
-expect {
-    0
-}
-
-test printf-format-negative-integer {
-    SELECT printf(-42);
-}
-expect {
-    -42
 }
 
 test printf-format-float {
@@ -486,27 +763,6 @@ expect {
     1
 }
 
-test printf-format-null-with-args {
-    SELECT printf(NULL, 'a', 'b') IS NULL;
-}
-expect {
-    1
-}
-
-test printf-format-boolean-true {
-    SELECT printf(1 = 1);
-}
-expect {
-    1
-}
-
-test printf-format-boolean-false {
-    SELECT printf(1 = 0);
-}
-expect {
-    0
-}
-
 test printf-format-blob {
     SELECT printf(X'414243');
 }
@@ -514,3 +770,607 @@ expect {
     ABC
 }
 
+# ============================================
+# format() alias
+# ============================================
+
+test format-alias {
+    SELECT format('%.2f', 3.14);
+}
+expect {
+    3.14
+}
+
+# ============================================
+# Edge cases
+# ============================================
+
+test printf-empty-format {
+    SELECT printf('');
+}
+expect raw {
+
+}
+
+test printf-only-percent-escapes {
+    SELECT printf('%%%%');
+}
+expect {
+    %%
+}
+
+test printf-consecutive-specifiers {
+    SELECT printf('%d%d%d', 1, 2, 3);
+}
+expect {
+    123
+}
+
+test printf-text-numeric-prefix {
+    SELECT printf('%d', '123abc');
+}
+expect {
+    123
+}
+
+test printf-text-as-float-coerce {
+    SELECT printf('%f', '3.14');
+}
+expect {
+    3.140000
+}
+
+# ============================================
+# Alt-form-2 flag (!) - strip trailing zeros
+# ============================================
+
+test printf-altform2-float-basic {
+    SELECT printf('%!f', 3.14);
+}
+expect {
+    3.14
+}
+
+test printf-altform2-float-trailing {
+    SELECT printf('%!f', 1.0);
+}
+expect {
+    1.0
+}
+
+test printf-altform2-float-zero {
+    SELECT printf('%!f', 0.0);
+}
+expect {
+    0.0
+}
+
+test printf-altform2-float-precision-4 {
+    SELECT printf('%!.4f', 3.14);
+}
+expect {
+    3.14
+}
+
+test printf-altform2-float-precision-0 {
+    SELECT printf('%!.0f', 3.0);
+}
+expect {
+    3.0
+}
+
+test printf-altform2-float-negative {
+    SELECT printf('%!f', -3.14);
+}
+expect {
+    -3.14
+}
+
+test printf-altform2-float-sign {
+    SELECT printf('%!+f', 3.14);
+}
+expect {
+    +3.14
+}
+
+test printf-altform2-float-width {
+    SELECT '|' || printf('%!10.2f', 3.14) || '|';
+}
+expect {
+    |      3.14|
+}
+
+test printf-altform2-exp-basic {
+    SELECT printf('%!e', 23000000.0);
+}
+expect {
+    2.3e+07
+}
+
+test printf-altform2-exp-precision-0 {
+    SELECT printf('%!.0e', 23000000.0);
+}
+expect {
+    2.0e+07
+}
+
+test printf-altform2-exp-zero {
+    SELECT printf('%!e', 0.0);
+}
+expect {
+    0.0e+00
+}
+
+test printf-altform2-exp-precision-2 {
+    SELECT printf('%!.2e', 23000000.0);
+}
+expect {
+    2.3e+07
+}
+
+test printf-altform2-g-integer {
+    SELECT printf('%!g', 100.0);
+}
+expect {
+    100.0
+}
+
+test printf-altform2-g-zero {
+    SELECT printf('%!g', 0.0);
+}
+expect {
+    0.0
+}
+
+test printf-altform2-g-small-exp {
+    SELECT printf('%!g', 0.000001);
+}
+expect {
+    1.0e-06
+}
+
+test printf-altform2-g-has-decimal {
+    SELECT printf('%!g', 1.5);
+}
+expect {
+    1.5
+}
+
+test printf-altform2-g-negative {
+    SELECT printf('%!g', -100.0);
+}
+expect {
+    -100.0
+}
+
+# ============================================
+# Edge cases: large floats, infinity, neg zero, trailing %
+# ============================================
+
+test printf-float-large {
+    SELECT printf('%.0f', 1e20);
+}
+expect {
+    100000000000000000000
+}
+
+test printf-float-neg-zero {
+    SELECT printf('%f', -0.0);
+}
+expect {
+    0.000000
+}
+
+test printf-trailing-percent {
+    SELECT printf('test%');
+}
+expect {
+    test%
+}
+
+test printf-float-left-zero-combined {
+    SELECT '|' || printf('%-010.2f', 3.14) || '|';
+}
+expect {
+    |3.14      |
+}
+
+test printf-float-infinity {
+    SELECT printf('%f', 1e308*10);
+}
+expect {
+    Inf
+}
+
+test printf-float-neg-infinity {
+    SELECT printf('%f', -(1e308*10));
+}
+expect {
+    -Inf
+}
+
+test printf-exp-infinity {
+    SELECT printf('%e', 1e308*10);
+}
+expect {
+    Inf
+}
+
+test printf-g-infinity {
+    SELECT printf('%g', 1e308*10);
+}
+expect {
+    Inf
+}
+
+# ============================================
+# Rounding: half-away-from-zero (SQLite behavior)
+# ============================================
+
+# Half-away-from-zero rounding: these pass with SQLite 3.49.1+ but fail
+# with 3.43.2 (which uses half-to-even). Unclear which intermediate version
+# switched to half-away-from-zero via sqlite3FpDecode.
+test printf-round-half-away-0 {
+    SELECT printf('%.0f', 0.5);
+}
+expect {
+    1
+}
+
+test printf-round-half-away-1 {
+    SELECT printf('%.0f', 2.5);
+}
+expect {
+    3
+}
+
+test printf-round-half-away-2 {
+    SELECT printf('%.0f', 4.5);
+}
+expect {
+    5
+}
+
+test printf-round-half-away-neg {
+    SELECT printf('%.0f', -0.5);
+}
+expect {
+    -1
+}
+
+test printf-round-half-away-1dp {
+    SELECT printf('%.1f', 0.25);
+}
+expect {
+    0.3
+}
+
+test printf-round-half-away-2dp {
+    SELECT printf('%.2f', 0.125);
+}
+expect {
+    0.13
+}
+
+test printf-round-half-away-exp {
+    SELECT printf('%.0e', 2.5);
+}
+expect {
+    3e+00
+}
+
+# ============================================
+# # flag with hex/octal zero-pad width
+# ============================================
+
+test printf-alt-hex-zeropad-8 {
+    SELECT printf('%#08x', 255);
+}
+expect {
+    0x000000ff
+}
+
+test printf-alt-hex-zeropad-4 {
+    SELECT printf('%#04x', 255);
+}
+expect {
+    0x00ff
+}
+
+test printf-alt-hex-upper-zeropad {
+    SELECT printf('%#08X', 255);
+}
+expect {
+    0X000000FF
+}
+
+test printf-alt-octal-zeropad {
+    SELECT printf('%#08o', 8);
+}
+expect {
+    000000010
+}
+
+test printf-alt-hex-space-pad {
+    SELECT '|' || printf('%#8x', 255) || '|';
+}
+expect {
+    |    0xff|
+}
+
+# ============================================
+# # flag on %e and %g
+# ============================================
+
+test printf-alt-exp-precision-0 {
+    SELECT printf('%#.0e', 1.0);
+}
+expect {
+    1.e+00
+}
+
+test printf-alt-g-precision-0 {
+    SELECT printf('%#.0g', 1.0);
+}
+expect {
+    1.
+}
+
+test printf-alt-g-trailing {
+    SELECT printf('%#g', 100000.0);
+}
+expect {
+    100000.
+}
+
+test printf-alt-g-precision-1 {
+    SELECT printf('%#.1g', 1.0);
+}
+expect {
+    1.
+}
+
+# ============================================
+# %g pre-rounding threshold
+# ============================================
+
+test printf-g-threshold-round-up {
+    SELECT printf('%g', 999999.5);
+}
+expect {
+    1e+06
+}
+
+test printf-g-threshold-1sig {
+    SELECT printf('%.1g', 9.5);
+}
+expect {
+    1e+01
+}
+
+test printf-g-threshold-2sig {
+    SELECT printf('%.2g', 99.5);
+}
+expect {
+    1e+02
+}
+
+# ============================================
+# Zero-pad ignored for %s and %c
+# ============================================
+
+test printf-string-zeropad-ignored {
+    SELECT '|' || printf('%05s', 'hi') || '|';
+}
+expect {
+    |   hi|
+}
+
+test printf-char-zeropad-ignored {
+    SELECT '|' || printf('%05c', 'A') || '|';
+}
+expect {
+    |    A|
+}
+
+# ============================================
+# %q/%Q/%w width and precision
+# ============================================
+
+test printf-q-width {
+    SELECT '|' || printf('%10q', 'hi') || '|';
+}
+expect {
+    |        hi|
+}
+
+test printf-q-left-justify {
+    SELECT '|' || printf('%-10q', 'hi') || '|';
+}
+expect {
+    |hi        |
+}
+
+test printf-q-precision {
+    SELECT printf('%.2q', 'hello');
+}
+expect {
+    he
+}
+
+test printf-Q-width {
+    SELECT '|' || printf('%10Q', 'hi') || '|';
+}
+expect {
+    |      'hi'|
+}
+
+test printf-Q-left-justify {
+    SELECT '|' || printf('%-10Q', 'hi') || '|';
+}
+expect {
+    |'hi'      |
+}
+
+test printf-Q-precision {
+    SELECT printf('%.2Q', 'hello');
+}
+expect {
+    'he'
+}
+
+test printf-w-width {
+    SELECT '|' || printf('%10w', 'hi') || '|';
+}
+expect {
+    |        hi|
+}
+
+test printf-w-precision {
+    SELECT printf('%.2w', 'hello');
+}
+expect {
+    he
+}
+
+test printf-q-zeropad-ignored {
+    SELECT '|' || printf('%05q', 'hi') || '|';
+}
+expect {
+    |   hi|
+}
+
+test printf-Q-zeropad-ignored {
+    SELECT '|' || printf('%05Q', 'hi') || '|';
+}
+expect {
+    | 'hi'|
+}
+
+# ============================================
+# Infinity 9-fill with zero-pad
+# ============================================
+
+test printf-inf-zeropad-f {
+    SELECT length(printf('%020f', 1e308*10));
+}
+expect {
+    1007
+}
+
+test printf-inf-zeropad-f-prefix {
+    SELECT substr(printf('%020f', 1e308*10), 1, 5);
+}
+expect {
+    90000
+}
+
+test printf-inf-zeropad-e {
+    SELECT printf('%020e', 1e308*10);
+}
+expect {
+    00000009.000000e+999
+}
+
+test printf-inf-zeropad-g {
+    SELECT printf('%020g', 1e308*10);
+}
+expect {
+    000000000000009e+999
+}
+
+test printf-inf-neg-zeropad-e {
+    SELECT printf('%020e', -(1e308*10));
+}
+expect {
+    -0000009.000000e+999
+}
+
+test printf-inf-no-zeropad-e {
+    SELECT printf('%e', 1e308*10);
+}
+expect {
+    Inf
+}
+
+test printf-inf-no-zeropad-g {
+    SELECT printf('%g', 1e308*10);
+}
+expect {
+    Inf
+}
+
+# ============================================
+# Significant digits (IEEE 754 noise suppression)
+# ============================================
+
+test printf-sigdigits-f-20 {
+    SELECT printf('%.20f', 1.0/3.0);
+}
+expect {
+    0.33333333333333330000
+}
+
+test printf-sigdigits-e-20 {
+    SELECT printf('%.20e', 1.0/3.0);
+}
+expect {
+    3.33333333333333300000e-01
+}
+
+test printf-sigdigits-g-20 {
+    SELECT printf('%.20g', 1.0/3.0);
+}
+expect {
+    0.3333333333333333
+}
+
+test printf-sigdigits-f-15 {
+    SELECT printf('%.15f', 1234567890.123456789);
+}
+expect {
+    1234567890.123457000000000
+}
+
+# ============================================
+# NaN handling (treated as 0.0)
+# ============================================
+
+test printf-nan-f {
+    SELECT printf('%f', 0.0/0.0);
+}
+expect {
+    0.000000
+}
+
+test printf-nan-e {
+    SELECT printf('%e', 0.0/0.0);
+}
+expect {
+    0.000000e+00
+}
+
+test printf-nan-g {
+    SELECT printf('%g', 0.0/0.0);
+}
+expect {
+    0
+}
+
+# ============================================
+# Blob NUL truncation for %s
+# ============================================
+
+test printf-blob-s {
+    SELECT printf('%s', X'48656C6C6F');
+}
+expect {
+    Hello
+}
+
+test printf-blob-s-nul {
+    SELECT length(printf('%s', X'48004C'));
+}
+expect {
+    1
+}

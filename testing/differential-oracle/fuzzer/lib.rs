@@ -4,6 +4,7 @@
 
 pub mod memory;
 pub mod oracle;
+pub mod printf_gen;
 pub mod runner;
 pub mod schema;
 
