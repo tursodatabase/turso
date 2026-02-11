@@ -1,0 +1,67 @@
+@database :memory:
+
+# SUM/TOTAL of blob values should convert blob bytes to text (interpreting raw
+# bytes as characters) then parse the leading numeric portion as a number.
+# Blobs with non-UTF-8 bytes must still parse the leading digits correctly,
+# matching SQLite behavior.
+
+test total-blob-ascii-digit-prefix {
+    CREATE TABLE t1 (a INTEGER PRIMARY KEY, b BLOB);
+    INSERT INTO t1 VALUES (1, X'3941');
+    SELECT TOTAL(b) FROM t1;
+}
+expect {
+    9.0
+}
+expect @js {
+    9
+}
+
+test total-blob-non-utf8-with-leading-digit {
+    CREATE TABLE t2 (a INTEGER PRIMARY KEY, b BLOB);
+    INSERT INTO t2 VALUES (1, X'395E459F');
+    SELECT TOTAL(b) FROM t2;
+}
+expect {
+    9.0
+}
+expect @js {
+    9
+}
+
+test total-blob-long-non-utf8-with-leading-digit {
+    CREATE TABLE t3 (a INTEGER PRIMARY KEY, b BLOB);
+    INSERT INTO t3 VALUES (1, X'395E459FF9CE1328346F9BF1CDD0604D');
+    SELECT TOTAL(b) FROM t3;
+}
+expect {
+    9.0
+}
+expect @js {
+    9
+}
+
+test total-blob-no-leading-digit {
+    CREATE TABLE t4 (a INTEGER PRIMARY KEY, b BLOB);
+    INSERT INTO t4 VALUES (1, X'4655');
+    SELECT TOTAL(b) FROM t4;
+}
+expect {
+    0.0
+}
+expect @js {
+    0
+}
+
+test sum-blob-non-utf8-with-leading-digit {
+    CREATE TABLE t5 (a INTEGER PRIMARY KEY, b BLOB);
+    INSERT INTO t5 VALUES (1, X'399F4142');
+    INSERT INTO t5 VALUES (2, X'3339');
+    SELECT typeof(SUM(b)), SUM(b) FROM t5;
+}
+expect {
+    real|48.0
+}
+expect @js {
+    real|48
+}

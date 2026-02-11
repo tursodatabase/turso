@@ -412,7 +412,13 @@ impl Parser {
                 self.advance();
                 Ok(ast::SkipCondition::Mvcc)
             }
-            Some(token) => Err(self.error(format!("expected skip condition (mvcc), got {token}"))),
+            Some(Token::Sqlite) => {
+                self.advance();
+                Ok(ast::SkipCondition::Sqlite)
+            }
+            Some(token) => Err(self.error(format!(
+                "expected skip condition (mvcc, sqlite), got {token}"
+            ))),
             None => Err(self.error("expected skip condition, got EOF".to_string())),
         }
     }
@@ -892,6 +898,30 @@ expect {
     }
 
     #[test]
+    fn test_parse_skip_if_sqlite() {
+        let input = r#"
+@database :memory:
+
+@skip-if sqlite "sqlite has different error message"
+test sqlite-error {
+    SELECT 1;
+}
+expect {
+    1
+}
+"#;
+
+        let file = parse(input).unwrap();
+        assert_eq!(
+            file.tests[0].modifiers.skip,
+            Some(ast::Skip {
+                reason: "sqlite has different error message".to_string(),
+                condition: Some(ast::SkipCondition::Sqlite),
+            })
+        );
+    }
+
+    #[test]
     fn test_parse_expect_raw() {
         // Using explicit string to control whitespace precisely
         // The content "  hello  " has 2 leading and 2 trailing spaces
@@ -1063,6 +1093,31 @@ expect {
         // All tests should have no per-test skip
         assert!(file.tests[0].modifiers.skip.is_none());
         assert!(file.tests[1].modifiers.skip.is_none());
+    }
+
+    #[test]
+    fn test_parse_global_skip_if_sqlite() {
+        let input = r#"
+@database :memory:
+@skip-file-if sqlite "sqlite backend not supported"
+
+test select-1 {
+    SELECT 1;
+}
+expect {
+    1
+}
+"#;
+
+        let file = parse(input).unwrap();
+        assert_eq!(
+            file.global_skip,
+            Some(ast::Skip {
+                reason: "sqlite backend not supported".to_string(),
+                condition: Some(ast::SkipCondition::Sqlite),
+            })
+        );
+        assert!(file.tests[0].modifiers.skip.is_none());
     }
 
     #[test]

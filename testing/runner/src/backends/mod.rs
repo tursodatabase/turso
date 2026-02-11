@@ -82,6 +82,11 @@ pub trait SqlBackend: Send + Sync {
     /// Return the set of capabilities this backend supports
     fn capabilities(&self) -> HashSet<Capability>;
 
+    /// Whether this backend is the sqlite CLI backend
+    fn is_sqlite(&self) -> bool {
+        false
+    }
+
     /// Whether this backend supports snapshot tests (EXPLAIN output comparison).
     /// Returns false by default; only the Rust backend enables this.
     fn supports_snapshots(&self) -> bool {

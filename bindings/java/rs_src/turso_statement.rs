@@ -104,11 +104,11 @@ fn row_to_obj_array<'local>(
     for (i, value) in row.get_values().enumerate() {
         let obj = match value {
             turso_core::Value::Null => JObject::null(),
-            turso_core::Value::Integer(i) => {
+            turso_core::Value::Numeric(turso_core::Numeric::Integer(i)) => {
                 env.new_object("java/lang/Long", "(J)V", &[JValue::Long(*i)])?
             }
-            turso_core::Value::Float(f) => {
-                env.new_object("java/lang/Double", "(D)V", &[JValue::Double(*f)])?
+            turso_core::Value::Numeric(turso_core::Numeric::Float(f)) => {
+                env.new_object("java/lang/Double", "(D)V", &[JValue::Double(f64::from(*f))])?
             }
             turso_core::Value::Text(s) => env.new_string(s.as_str())?.into(),
             turso_core::Value::Blob(b) => env.byte_array_from_slice(b.as_slice())?.into(),
@@ -181,7 +181,7 @@ pub extern "system" fn Java_tech_turso_core_TursoStatement_bindLong<'local>(
 
     stmt.stmt.bind_at(
         NonZero::new(position as usize).unwrap(),
-        Value::Integer(value),
+        Value::from_i64(value),
     );
     SQLITE_OK
 }
@@ -204,7 +204,7 @@ pub extern "system" fn Java_tech_turso_core_TursoStatement_bindDouble<'local>(
 
     stmt.stmt.bind_at(
         NonZero::new(position as usize).unwrap(),
-        Value::Float(value),
+        Value::from_f64(value),
     );
     SQLITE_OK
 }

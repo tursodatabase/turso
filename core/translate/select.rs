@@ -715,13 +715,38 @@ fn add_vtab_predicates_to_where_clause(
         )?;
     }
     for expr in vtab_predicates.drain(..) {
+        // Virtual table argument predicates (e.g. the 't2' in pragma_table_info('t2'))
+        // must be associated with the virtual table's outer join context if the table is
+        // the RHS of a LEFT JOIN. Otherwise the optimizer may incorrectly simplify the
+        // LEFT JOIN into an INNER JOIN, breaking NULL row emission for unmatched rows.
+        let from_outer_join = vtab_predicate_table_id(&expr).and_then(|table_id| {
+            plan.table_references
+                .find_joined_table_by_internal_id(table_id)
+                .and_then(|t| {
+                    t.join_info
+                        .as_ref()
+                        .and_then(|ji| ji.outer.then_some(table_id))
+                })
+        });
         plan.where_clause.push(WhereTerm {
             expr,
-            from_outer_join: None,
+            from_outer_join,
             consumed: false,
         });
     }
     Ok(())
+}
+
+/// Extract the table internal_id from a virtual table argument predicate.
+/// These are always of the form `Column { table, .. } = literal` or `IsNull(Column { table, .. })`.
+fn vtab_predicate_table_id(expr: &Expr) -> Option<ast::TableInternalId> {
+    match expr {
+        Expr::Binary(lhs, _, _) | Expr::IsNull(lhs) => match lhs.as_ref() {
+            Expr::Column { table, .. } => Some(*table),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 /// Replaces a column number in an ORDER BY or GROUP BY expression with a copy of the column expression.
@@ -785,6 +810,8 @@ fn count_required_cursors_for_simple_select(plan: &SelectPlan) -> usize {
             }
             Operation::IndexMethodQuery(_) => 1,
             Operation::HashJoin(_) => 2,
+            // One table cursor + one cursor per index branch
+            Operation::MultiIndexScan(multi_idx) => 1 + multi_idx.branches.len(),
         } + if let Table::FromClauseSubquery(from_clause_subquery) = &t.table {
             count_required_cursors_for_simple_or_compound_select(&from_clause_subquery.plan)
         } else {
@@ -828,6 +855,8 @@ fn estimate_num_instructions_for_simple_select(select: &SelectPlan) -> usize {
             Operation::Search(_) => 15,
             Operation::IndexMethodQuery(_) => 15,
             Operation::HashJoin(_) => 20,
+            // Multi-index scan: scan overhead per branch + deduplication + final rowid fetch
+            Operation::MultiIndexScan(multi_idx) => 15 * multi_idx.branches.len() + 10,
         } + if let Table::FromClauseSubquery(from_clause_subquery) = &t.table {
             10 + estimate_num_instructions_for_simple_or_compound_select(&from_clause_subquery.plan)
         } else {
@@ -871,6 +900,8 @@ fn estimate_num_labels_for_simple_select(select: &SelectPlan) -> usize {
             Operation::Search(_) => 3,
             Operation::IndexMethodQuery(_) => 3,
             Operation::HashJoin(_) => 3,
+            // Multi-index scan needs extra labels for each branch + rowset loop
+            Operation::MultiIndexScan(multi_idx) => 3 + multi_idx.branches.len() * 2,
         } + if let Table::FromClauseSubquery(from_clause_subquery) = &t.table {
             3 + estimate_num_labels_for_simple_or_compound_select(&from_clause_subquery.plan)
         } else {

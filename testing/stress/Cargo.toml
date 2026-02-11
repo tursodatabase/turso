@@ -22,10 +22,8 @@ path = "main.rs"
 
 [features]
 default = []
-antithesis = ["turso/antithesis", "dep:antithesis_sdk", "antithesis_sdk?/full"]
 
 [dependencies]
-antithesis_sdk = { workspace = true, optional = true }
 clap = { workspace = true, features = ["derive"] }
 hex = { workspace = true }
 indicatif = { workspace = true }
@@ -36,6 +34,9 @@ tracing-appender = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter", "json"] }
 turso = { workspace = true }
 rusqlite = { workspace = true }
+
+[target.'cfg(antithesis)'.dependencies]
+antithesis_sdk = { workspace = true, features = ["full"] }
 
 [target.'cfg(shuttle)'.dependencies]
 shuttle = { workspace = true }

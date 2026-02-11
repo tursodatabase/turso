@@ -107,7 +107,7 @@ pub fn vector_distance_cos(args: &[Register]) -> Result<Value> {
     let x = parse_vector(value_0, None)?;
     let y = parse_vector(value_1, None)?;
     let dist = operations::distance_cos::vector_distance_cos(&x, &y)?;
-    Ok(Value::Float(dist))
+    Ok(Value::from_f64(dist))
 }
 
 pub fn vector_distance_l2(args: &[Register]) -> Result<Value> {
@@ -122,7 +122,7 @@ pub fn vector_distance_l2(args: &[Register]) -> Result<Value> {
     let x = parse_vector(value_0, None)?;
     let y = parse_vector(value_1, None)?;
     let dist = operations::distance_l2::vector_distance_l2(&x, &y)?;
-    Ok(Value::Float(dist))
+    Ok(Value::from_f64(dist))
 }
 
 pub fn vector_distance_jaccard(args: &[Register]) -> Result<Value> {
@@ -137,7 +137,7 @@ pub fn vector_distance_jaccard(args: &[Register]) -> Result<Value> {
     let x = parse_vector(value_0, None)?;
     let y = parse_vector(value_1, None)?;
     let dist = operations::jaccard::vector_distance_jaccard(&x, &y)?;
-    Ok(Value::Float(dist))
+    Ok(Value::from_f64(dist))
 }
 
 pub fn vector_distance_dot(args: &[Register]) -> Result<Value> {
@@ -152,7 +152,7 @@ pub fn vector_distance_dot(args: &[Register]) -> Result<Value> {
     let x = parse_vector(value_0, None)?;
     let y = parse_vector(value_1, None)?;
     let dist = operations::distance_dot::vector_distance_dot(&x, &y)?;
-    Ok(Value::Float(dist))
+    Ok(Value::from_f64(dist))
 }
 
 pub fn vector_concat(args: &[Register]) -> Result<Value> {

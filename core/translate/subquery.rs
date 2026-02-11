@@ -14,7 +14,7 @@ use crate::{
         optimizer::optimize_select_plan,
         plan::{
             ColumnUsedMask, JoinOrderMember, NonFromClauseSubquery, OuterQueryReference, Plan,
-            SubqueryPosition, SubqueryState, TableReferences, WhereTerm,
+            SetOperation, SubqueryPosition, SubqueryState, TableReferences, WhereTerm,
         },
         select::prepare_select_plan,
     },
@@ -249,6 +249,8 @@ fn plan_subqueries_with_outer_query_access<'a>(
                 identifier: t.identifier.clone(),
                 internal_id: t.internal_id,
                 col_used_mask: ColumnUsedMask::default(),
+                cte_select: None,
+                cte_explicit_columns: vec![],
             })
             .chain(
                 referenced_tables
@@ -259,6 +261,8 @@ fn plan_subqueries_with_outer_query_access<'a>(
                         identifier: t.identifier.clone(),
                         internal_id: t.internal_id,
                         col_used_mask: ColumnUsedMask::default(),
+                        cte_select: t.cte_select.clone(),
+                        cte_explicit_columns: t.cte_explicit_columns.clone(),
                     }),
             )
             .collect::<Vec<_>>()
@@ -499,7 +503,7 @@ fn get_subquery_parser<'a>(
 
                 plan.query_destination = QueryDestination::EphemeralIndex {
                     cursor_id,
-                    index: ephemeral_index.clone(),
+                    index: ephemeral_index,
                     is_delete: false,
                 };
 
@@ -742,6 +746,27 @@ pub fn emit_from_clause_subqueries(
                             )
                         };
                     format!("HASH JOIN {table_name}")
+                }
+                Operation::MultiIndexScan(multi_idx) => {
+                    let index_names: Vec<&str> = multi_idx
+                        .branches
+                        .iter()
+                        .map(|b| {
+                            b.index
+                                .as_ref()
+                                .map(|i| i.name.as_str())
+                                .unwrap_or("PRIMARY KEY")
+                        })
+                        .collect();
+                    format!(
+                        "MULTI-INDEX {} {} ({})",
+                        match multi_idx.set_op {
+                            SetOperation::Union => "OR",
+                            SetOperation::Intersection => "AND",
+                        },
+                        table_reference.identifier,
+                        index_names.join(", ")
+                    )
                 }
             }
         );

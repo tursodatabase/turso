@@ -263,6 +263,102 @@ expect {
     1|90.0
 }
 
+@requires strict "uses STRICT tables"
+test strict-text-float-to-integer-basic {
+    CREATE TABLE t(a INTEGER) STRICT;
+    INSERT INTO t VALUES('42.0');
+    SELECT a, typeof(a) FROM t;
+}
+expect {
+    42|integer
+}
+
+@requires strict "uses STRICT tables"
+test strict-text-float-to-integer-zero {
+    CREATE TABLE t(a INTEGER) STRICT;
+    INSERT INTO t VALUES('0.0');
+    SELECT a, typeof(a) FROM t;
+}
+expect {
+    0|integer
+}
+
+@requires strict "uses STRICT tables"
+test strict-text-float-to-integer-negative {
+    CREATE TABLE t(a INTEGER) STRICT;
+    INSERT INTO t VALUES('-5.0');
+    SELECT a, typeof(a) FROM t;
+}
+expect {
+    -5|integer
+}
+
+@requires strict "uses STRICT tables"
+test strict-text-float-to-integer-scientific {
+    CREATE TABLE t(a INTEGER) STRICT;
+    INSERT INTO t VALUES('1e2');
+    SELECT a, typeof(a) FROM t;
+}
+expect {
+    100|integer
+}
+
+@requires strict "uses STRICT tables"
+test strict-text-float-to-integer-fractional-error {
+    CREATE TABLE t(a INTEGER) STRICT;
+    INSERT INTO t VALUES('1.5');
+}
+expect error {
+}
+
+@requires strict "uses STRICT tables"
+test strict-text-integer-to-real-basic {
+    CREATE TABLE t(a REAL) STRICT;
+    INSERT INTO t VALUES('42');
+    SELECT a, typeof(a) FROM t;
+}
+expect {
+    42.0|real
+}
+
+@requires strict "uses STRICT tables"
+test strict-text-integer-to-real-negative {
+    CREATE TABLE t(a REAL) STRICT;
+    INSERT INTO t VALUES('-7');
+    SELECT a, typeof(a) FROM t;
+}
+expect {
+    -7.0|real
+}
+
+@requires strict "uses STRICT tables"
+test strict-text-integer-to-real-zero {
+    CREATE TABLE t(a REAL) STRICT;
+    INSERT INTO t VALUES('0');
+    SELECT a, typeof(a) FROM t;
+}
+expect {
+    0.0|real
+}
+
+@requires strict "uses STRICT tables"
+test strict-text-float-to-real {
+    CREATE TABLE t(a REAL) STRICT;
+    INSERT INTO t VALUES('3.14');
+    SELECT a, typeof(a) FROM t;
+}
+expect {
+    3.14|real
+}
+
+@requires strict "uses STRICT tables"
+test strict-text-string-to-real-error {
+    CREATE TABLE t(a REAL) STRICT;
+    INSERT INTO t VALUES('hello');
+}
+expect error {
+}
+
 test duplicate-set {
     CREATE TABLE t (x, y);
     INSERT INTO t VALUES(1, 'A');
@@ -1651,5 +1747,64 @@ expect {
     1|x
     2|y
     3|z
+}
+
+# Tests for float-to-integer conversion on INTEGER PRIMARY KEY columns
+# SQLite requires values to be STRICTLY between i64::MIN and i64::MAX
+
+# i64::MIN as float literal should fail (boundary value excluded)
+test insert-integer-pk-i64-min-float-error {
+    CREATE TABLE t (a INTEGER PRIMARY KEY);
+    INSERT INTO t VALUES (-9223372036854775808.0);
+}
+expect error {
+}
+
+# i64::MAX as float literal should fail (boundary value excluded)
+test insert-integer-pk-i64-max-float-error {
+    CREATE TABLE t (a INTEGER PRIMARY KEY);
+    INSERT INTO t VALUES (9223372036854775807.0);
+}
+expect error {
+}
+
+# Values strictly inside i64 range should work
+test insert-integer-pk-large-float-ok {
+    CREATE TABLE t (a INTEGER PRIMARY KEY);
+    INSERT INTO t VALUES (426601719749026560.0);
+    SELECT a, typeof(a) FROM t;
+}
+expect {
+    426601719749026560|integer
+}
+
+# Negative large float inside range should work
+test insert-integer-pk-large-negative-float-ok {
+    CREATE TABLE t (a INTEGER PRIMARY KEY);
+    INSERT INTO t VALUES (-426601719749026560.0);
+    SELECT a, typeof(a) FROM t;
+}
+expect {
+    -426601719749026560|integer
+}
+
+# Float near i64::MIN boundary (but inside) should work
+test insert-integer-pk-near-min-float-ok {
+    CREATE TABLE t (a INTEGER PRIMARY KEY);
+    INSERT INTO t VALUES (-9223372036854774784.0);
+    SELECT a, typeof(a) FROM t;
+}
+expect {
+    -9223372036854774784|integer
+}
+
+# Computed overflow that produces valid float should work
+test insert-integer-pk-computed-overflow-ok {
+    CREATE TABLE t (a INTEGER PRIMARY KEY);
+    INSERT INTO t VALUES (5949738080128696532 * 2434505998659733097 % -586451354473716618);
+    SELECT a, typeof(a) FROM t;
+}
+expect {
+    426601719749026560|integer
 }
 

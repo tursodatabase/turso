@@ -162,7 +162,7 @@ pub(crate) fn open_table_cursor(connection: &Connection, table: &str) -> Result<
             "table {table} not found",
         )));
     };
-    let cursor = BTreeCursor::new_table(pager, table.get_root_page(), table.columns().len());
+    let cursor = BTreeCursor::new_table(pager, table.get_root_page()?, table.columns().len());
     Ok(cursor)
 }
 

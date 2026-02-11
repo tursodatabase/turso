@@ -64,8 +64,8 @@ fn record<const N: usize>(values: [Value; N]) -> Vec<u8> {
         .into_iter()
         .map(|x| match x {
             Value::Null => turso_core::Value::Null,
-            Value::Integer(x) => turso_core::Value::Integer(x),
-            Value::Real(x) => turso_core::Value::Float(x),
+            Value::Integer(x) => turso_core::Value::from_i64(x),
+            Value::Real(x) => turso_core::Value::from_f64(x),
             Value::Text(x) => turso_core::Value::Text(turso_core::types::Text::new(x)),
             Value::Blob(x) => turso_core::Value::Blob(x),
         })

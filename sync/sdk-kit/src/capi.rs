@@ -642,7 +642,7 @@ mod tests {
                 panic!("unexpected");
             }
 
-            assert_eq!(collected, vec![turso_core::Value::Integer(2),]);
+            assert_eq!(collected, vec![turso_core::Value::from_i64(2),]);
 
             turso_statement_deinit(statement);
             turso_connection_deinit(connection);

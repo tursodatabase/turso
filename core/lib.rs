@@ -23,6 +23,7 @@ pub mod mvcc;
 mod parameters;
 mod pragma;
 mod pseudo;
+mod regexp;
 pub mod schema;
 #[cfg(feature = "series")]
 mod series;
@@ -87,6 +88,8 @@ pub use io::{
     Buffer, Completion, CompletionType, File, GroupCompletion, MemoryIO, OpenFlags, PlatformIO,
     SyscallIO, WriteCompletion, IO,
 };
+pub use numeric::nonnan::NonNan;
+pub use numeric::Numeric;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use schema::Schema;
 pub use statement::Statement;
@@ -458,7 +461,7 @@ impl Database {
             path: path.into(),
             wal_path: wal_path.into(),
             schema: Arc::new(Mutex::new(Arc::new(Schema::new()))),
-            _shared_page_cache: shared_page_cache.clone(),
+            _shared_page_cache: shared_page_cache,
             shared_wal,
             db_file,
             builtin_syms: parking_lot::RwLock::new(syms),
@@ -1210,6 +1213,7 @@ impl Database {
             is_mvcc_bootstrap_connection: AtomicBool::new(is_mvcc_bootstrap_connection),
             fk_pragma: AtomicBool::new(false),
             fk_deferred_violations: AtomicIsize::new(0),
+            check_constraints_pragma: AtomicBool::new(false),
             vtab_txn_states: RwLock::new(HashSet::default()),
         });
         self.n_connections
@@ -1350,7 +1354,7 @@ impl Database {
             pager_wal,
             self.io.clone(),
             PageCache::default(),
-            buffer_pool.clone(),
+            buffer_pool,
             self.init_lock.clone(),
             self.init_page_1.clone(),
         )?;

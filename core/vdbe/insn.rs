@@ -13,7 +13,7 @@ pub fn to_u16(v: usize) -> u16 {
 use super::{execute, AggFunc, BranchOffset, CursorID, FuncCtx, InsnFunction, PageIdx};
 use crate::sync::RwLock;
 use crate::{
-    schema::{BTreeTable, Column, Index},
+    schema::{BTreeTable, CheckConstraint, Column, Index},
     storage::{pager::CreateBTreeFlags, wal::CheckpointMode},
     translate::{collate::CollationSeq, emitter::TransactionMode},
     types::KeyInfo,
@@ -1325,6 +1325,7 @@ pub enum Insn {
     AddColumn {
         table: String,
         column: Box<Column>,
+        check_constraints: Vec<CheckConstraint>,
     },
     AlterColumn {
         table: String,

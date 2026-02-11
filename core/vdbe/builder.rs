@@ -405,7 +405,7 @@ impl ProgramBuilder {
 
     /// Set the set of hash tables to keep open across subplans.
     pub fn set_hash_tables_to_keep_open(&mut self, tables: &HashSet<usize>) {
-        self.hash_tables_to_keep_open = tables.clone();
+        self.hash_tables_to_keep_open.clone_from(tables);
     }
 
     /// Reset the set of hash tables to keep open.
@@ -1046,6 +1046,7 @@ impl ProgramBuilder {
                 Insn::VNext { pc_if_next, .. } => resolve(pc_if_next, "VNext")?,
                 Insn::VFilter { pc_if_empty, .. } => resolve(pc_if_empty, "VFilter")?,
                 Insn::RowSetRead { pc_if_empty, .. } => resolve(pc_if_empty, "RowSetRead")?,
+                Insn::RowSetTest { pc_if_found, .. } => resolve(pc_if_found, "RowSetTest")?,
                 Insn::NoConflict { target_pc, .. } => resolve(target_pc, "NoConflict")?,
                 Insn::Found { target_pc, .. } => resolve(target_pc, "Found")?,
                 Insn::NotFound { target_pc, .. } => resolve(target_pc, "NotFound")?,
@@ -1325,11 +1326,7 @@ impl ProgramBuilder {
             };
 
             Some(match literal {
-                ast::Literal::Numeric(s) => match Numeric::from(s) {
-                    Numeric::Null => Value::Null,
-                    Numeric::Integer(v) => Value::Integer(v),
-                    Numeric::Float(v) => Value::Float(v.into()),
-                },
+                ast::Literal::Numeric(s) => Value::Numeric(Numeric::from(s)),
                 ast::Literal::Null => Value::Null,
                 ast::Literal::String(s) => Value::Text(sanitize_string(s).into()),
                 ast::Literal::Blob(s) => Value::Blob(

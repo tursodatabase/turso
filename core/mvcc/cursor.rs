@@ -1028,7 +1028,9 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
                     };
                     if index_info.has_rowid {
                         match sortable_key.key.last_value() {
-                            Some(Ok(crate::types::ValueRef::Integer(rowid))) => Some(rowid),
+                            Some(Ok(crate::types::ValueRef::Numeric(
+                                crate::numeric::Numeric::Integer(rowid),
+                            ))) => Some(rowid),
                             _ => {
                                 crate::bail_parse_error!("Failed to parse rowid from index record")
                             }
@@ -1254,17 +1256,17 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
         // Check if the cursor is currently positioned at a B-tree row that matches
         // the row we're inserting. This indicates we're updating a B-tree-resident row
         // that doesn't yet have an MVCC version.
-        let was_btree_resident = match &self.current_pos {
+        let (in_btree, was_btree_resident) = match &self.current_pos {
             CursorPosition::Loaded {
                 row_id: current_row_id,
                 in_btree,
-            } => *in_btree && *current_row_id == row.id,
-            _ => false,
+            } => (*in_btree, *in_btree && *current_row_id == row.id),
+            _ => (false, false),
         };
 
         self.current_pos = CursorPosition::Loaded {
             row_id: row.id.clone(),
-            in_btree: false,
+            in_btree,
         };
         let maybe_index_id = match &self.mv_cursor_type {
             MvccCursorType::Index(_) => Some(self.table_id),
@@ -1349,7 +1351,7 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
         if self.state.is_none() {
             self.invalidate_record();
             let int_key = match key {
-                Value::Integer(i) => i,
+                Value::Numeric(crate::numeric::Numeric::Integer(i)) => i,
                 _ => unreachable!("btree tables are indexed by integers!"),
             };
             let inclusive = true;
@@ -1426,7 +1428,7 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
         if found {
             // Found in B-tree, but need to verify it's not shadowed by MVCC tombstone
             let int_key = match key {
-                Value::Integer(i) => *i,
+                Value::Numeric(crate::numeric::Numeric::Integer(i)) => *i,
                 _ => unreachable!("btree tables are indexed by integers!"),
             };
             let row_key = RowKey::Int(int_key);

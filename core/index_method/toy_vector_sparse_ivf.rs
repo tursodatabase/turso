@@ -5,6 +5,7 @@ use std::{
 
 use turso_parser::ast::{self, SortOrder};
 
+use crate::numeric::Numeric;
 use crate::{
     index_method::{
         open_index_cursor, open_table_cursor, parse_patterns, IndexMethod, IndexMethodAttachment,
@@ -163,22 +164,22 @@ fn parse_stat_row(record: Option<&ImmutableRecord>) -> Result<ComponentStat> {
             "stats index corrupted: expected row".to_string(),
         ));
     };
-    let ValueRef::Integer(position) = record.get_value(0)? else {
+    let ValueRef::Numeric(Numeric::Integer(position)) = record.get_value(0)? else {
         return Err(LimboError::Corrupt(
             "stats index corrupted: expected integer".to_string(),
         ));
     };
-    let ValueRef::Integer(cnt) = record.get_value(1)? else {
+    let ValueRef::Numeric(Numeric::Integer(cnt)) = record.get_value(1)? else {
         return Err(LimboError::Corrupt(
             "stats index corrupted: expected integer".to_string(),
         ));
     };
-    let ValueRef::Float(min) = record.get_value(2)? else {
+    let ValueRef::Numeric(Numeric::Float(min)) = record.get_value(2)? else {
         return Err(LimboError::Corrupt(
             "stats index corrupted: expected float".to_string(),
         ));
     };
-    let ValueRef::Float(max) = record.get_value(3)? else {
+    let ValueRef::Numeric(Numeric::Float(max)) = record.get_value(3)? else {
         return Err(LimboError::Corrupt(
             "stats index corrupted: expected float".to_string(),
         ));
@@ -186,8 +187,8 @@ fn parse_stat_row(record: Option<&ImmutableRecord>) -> Result<ComponentStat> {
     Ok(ComponentStat {
         position: position as u32,
         cnt,
-        min,
-        max,
+        min: f64::from(min),
+        max: f64::from(max),
     })
 }
 #[derive(Debug)]
@@ -203,24 +204,24 @@ fn parse_inverted_index_row(record: Option<&ImmutableRecord>) -> Result<Componen
             "inverted index corrupted: expected row".to_string(),
         ));
     };
-    let ValueRef::Integer(position) = record.get_value(0)? else {
+    let ValueRef::Numeric(Numeric::Integer(position)) = record.get_value(0)? else {
         return Err(LimboError::Corrupt(
             "inverted index corrupted: expected integer".to_string(),
         ));
     };
-    let ValueRef::Float(sum) = record.get_value(1)? else {
+    let ValueRef::Numeric(Numeric::Float(sum)) = record.get_value(1)? else {
         return Err(LimboError::Corrupt(
             "inverted index corrupted: expected float".to_string(),
         ));
     };
-    let ValueRef::Integer(rowid) = record.get_value(2)? else {
+    let ValueRef::Numeric(Numeric::Integer(rowid)) = record.get_value(2)? else {
         return Err(LimboError::Corrupt(
             "inverted index corrupted: expected integer".to_string(),
         ));
     };
     Ok(ComponentRow {
         position: position as u32,
-        sum,
+        sum: f64::from(sum),
         rowid,
     })
 }
@@ -356,11 +357,11 @@ impl VectorSparseInvertedIndexMethodCursor {
         let inverted_index_btree = format!("{}_inverted_index", configuration.index_name);
         let stats_btree = format!("{}_stats", configuration.index_name);
         let delta = match configuration.parameters.get("delta") {
-            Some(&Value::Float(delta)) => delta,
+            Some(&Value::Numeric(Numeric::Float(delta))) => f64::from(delta),
             _ => 0.0,
         };
         let scan_portion = match configuration.parameters.get("scan_portion") {
-            Some(&Value::Float(scan_portion)) => scan_portion,
+            Some(&Value::Numeric(Numeric::Float(scan_portion))) => f64::from(scan_portion),
             _ => 1.0,
         };
         let scan_order = match configuration.parameters.get("scan_order") {
@@ -548,9 +549,9 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                     let position = v.as_f32_sparse().idx[*idx];
                     let key = ImmutableRecord::from_values(
                         &[
-                            Value::Integer(position as i64),
-                            Value::Float(*sum),
-                            Value::Integer(*rowid),
+                            Value::from_i64(position as i64),
+                            Value::from_f64(*sum),
+                            Value::from_i64(*rowid),
                         ],
                         3,
                     );
@@ -612,7 +613,7 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                         ));
                     };
                     let position = v.as_f32_sparse().idx[*idx];
-                    let key = ImmutableRecord::from_values(&[Value::Integer(position as i64)], 1);
+                    let key = ImmutableRecord::from_values(&[Value::from_i64(position as i64)], 1);
                     self.insert_state = VectorSparseInvertedIndexInsertState::SeekStats {
                         vector: vector.take(),
                         sum: *sum,
@@ -662,10 +663,10 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                             );
                             let key = ImmutableRecord::from_values(
                                 &[
-                                    Value::Integer(position as i64),
-                                    Value::Integer(1),
-                                    Value::Float(value),
-                                    Value::Float(value),
+                                    Value::from_i64(position as i64),
+                                    Value::from_i64(1),
+                                    Value::from_f64(value),
+                                    Value::from_f64(value),
                                 ],
                                 4,
                             );
@@ -703,10 +704,10 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                     );
                     let key = ImmutableRecord::from_values(
                         &[
-                            Value::Integer(position as i64),
-                            Value::Integer(component.cnt + 1),
-                            Value::Float(value.min(component.min)),
-                            Value::Float(value.max(component.max)),
+                            Value::from_i64(position as i64),
+                            Value::from_i64(component.cnt + 1),
+                            Value::from_f64(value.min(component.min)),
+                            Value::from_f64(value.max(component.max)),
                         ],
                         4,
                     );
@@ -800,9 +801,9 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                     let position = v.as_f32_sparse().idx[*idx];
                     let key = ImmutableRecord::from_values(
                         &[
-                            Value::Integer(position as i64),
-                            Value::Float(*sum),
-                            Value::Integer(*rowid),
+                            Value::from_i64(position as i64),
+                            Value::from_f64(*sum),
+                            Value::from_i64(*rowid),
                         ],
                         3,
                     );
@@ -897,7 +898,7 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                         ));
                     };
                     let position = v.as_f32_sparse().idx[*idx];
-                    let key = ImmutableRecord::from_values(&[Value::Integer(position as i64)], 1);
+                    let key = ImmutableRecord::from_values(&[Value::from_i64(position as i64)], 1);
                     self.delete_state = VectorSparseInvertedIndexDeleteState::SeekStats {
                         vector: vector.take(),
                         sum: *sum,
@@ -960,10 +961,10 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                     );
                     let key = ImmutableRecord::from_values(
                         &[
-                            Value::Integer(position as i64),
-                            Value::Integer(component.cnt - 1),
-                            Value::Float(component.min),
-                            Value::Float(component.max),
+                            Value::from_i64(position as i64),
+                            Value::from_i64(component.cnt - 1),
+                            Value::from_f64(component.min),
+                            Value::from_f64(component.max),
                         ],
                         4,
                     );
@@ -1114,7 +1115,7 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                         };
                         let position = v.as_f32_sparse().idx[*idx];
                         *key = Some(ImmutableRecord::from_values(
-                            &[Value::Integer(position as i64)],
+                            &[Value::from_i64(position as i64)],
                             1,
                         ));
                     }
@@ -1259,7 +1260,7 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                             ));
                         };
                         *key = Some(ImmutableRecord::from_values(
-                            &[Value::Integer(c.position as i64)],
+                            &[Value::from_i64(c.position as i64)],
                             1,
                         ));
                         *component = Some(c.position);
@@ -1335,7 +1336,7 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                                 "current must be present in Read state".to_string(),
                             ));
                         };
-                        current.sort();
+                        current.sort_unstable();
 
                         self.search_state = VectorSparseInvertedIndexSearchState::EvaluateSeek {
                             sum: *sum,
@@ -1390,7 +1391,7 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                                 "current must be present in Next state".to_string(),
                             ));
                         };
-                        current.sort();
+                        current.sort_unstable();
 
                         self.search_state = VectorSparseInvertedIndexSearchState::EvaluateSeek {
                             sum: *sum,
@@ -1558,7 +1559,7 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                 "search_result must not be empty when query_column is called".to_string(),
             ));
         };
-        Ok(IOResult::Done(Value::Float(result.1)))
+        Ok(IOResult::Done(Value::from_f64(result.1)))
     }
 
     fn query_next(&mut self) -> Result<IOResult<bool>> {

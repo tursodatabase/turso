@@ -235,9 +235,9 @@ class Database {
   }
 
   async io() {
-    // we do not spin this.db.ioLoopAsync() 
-    // because all IO we use in JS SDK (MemoryIO, PlatformIO) are synchronous 
-    // so this call will only degrade performance for no reason
+    // For WASM browser builds, ioStep awaits a promise that resolves when
+    // the OPFS Worker completes the I/O (via IONotifier in wasm-common).
+    // For in-memory / Node.js builds, ioStep is a no-op since I/O is synchronous.
     await this.ioStep();
   }
 }
@@ -493,9 +493,6 @@ class Statement {
   }
 
   async io() {
-    // we do not spin this.db.ioLoopAsync() 
-    // because all IO we use in JS SDK (MemoryIO, PlatformIO) are synchronous 
-    // so this call will only degrade performance for no reason
     await this.ioStep();
   }
 

@@ -1,6 +1,7 @@
 pub mod check;
 pub mod fmt;
 
+use crate::lexer::is_keyword;
 use strum_macros::{EnumIter, EnumString};
 
 /// `?` or `$` Prepared statement arg placeholder(s)
@@ -936,10 +937,25 @@ pub struct GroupBy {
 }
 
 /// identifier or string or `CROSS` or `FULL` or `INNER` or `LEFT` or `NATURAL` or `OUTER` or `RIGHT`.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// Two Names are equal if they refer to the same identifier, regardless of
+/// quoting style (e.g. `ABORT` and `"ABORT"` are the same identifier).
+#[derive(Clone, Debug, Eq)]
 pub struct Name {
     quote: Option<char>,
     value: String,
+}
+
+impl PartialEq for Name {
+    fn eq(&self, other: &Self) -> bool {
+        self.value == other.value
+    }
+}
+
+impl std::hash::Hash for Name {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.value.hash(state);
+    }
 }
 
 #[cfg(feature = "serde")]
@@ -1042,7 +1058,7 @@ impl Name {
         }
         let value = self.value.as_bytes();
         let safe_char = |&c: &u8| c.is_ascii_alphanumeric() || c == b'_';
-        if !value.is_empty() && value.iter().all(safe_char) {
+        if !value.is_empty() && value.iter().all(safe_char) && !is_keyword(value) {
             self.value.clone()
         } else {
             format!("\"{}\"", self.value.replace("\"", "\"\""))
@@ -1517,6 +1533,8 @@ pub enum PragmaName {
     /// Use F_FULLFSYNC instead of fsync on macOS (only supported on macOS)
     #[cfg(target_vendor = "apple")]
     Fullfsync,
+    /// Enable or disable CHECK constraint enforcement
+    IgnoreCheckConstraints,
     /// Run integrity check on the database file
     IntegrityCheck,
     /// `journal_mode` pragma

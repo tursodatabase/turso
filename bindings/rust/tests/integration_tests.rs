@@ -1269,3 +1269,197 @@ async fn test_once_not_cleared_on_reset_with_coroutine() {
         "Second execution should return 1, not Null. Bug: state.once not cleared in reset()"
     );
 }
+
+#[tokio::test]
+async fn test_experimental_strict_tables() {
+    // Test that STRICT tables work when the experimental flag is enabled
+    let db = Builder::new_local(":memory:")
+        .experimental_strict(true)
+        .build()
+        .await
+        .unwrap();
+    let conn = db.connect().unwrap();
+
+    // Create a STRICT table
+    conn.execute(
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT) STRICT",
+        (),
+    )
+    .await
+    .unwrap();
+
+    // Insert valid data
+    conn.execute("INSERT INTO users VALUES (1, 'Alice')", ())
+        .await
+        .unwrap();
+
+    // Query the data
+    let mut rows = conn.query("SELECT id, name FROM users", ()).await.unwrap();
+    let row = rows.next().await.unwrap().unwrap();
+    assert_eq!(row.get::<i64>(0).unwrap(), 1);
+    assert_eq!(row.get::<String>(1).unwrap(), "Alice");
+}
+
+#[tokio::test]
+async fn test_strict_tables_without_experimental_flag() {
+    // Test that STRICT tables fail without the experimental flag
+    let db = Builder::new_local(":memory:").build().await.unwrap();
+    let conn = db.connect().unwrap();
+
+    // Attempt to create a STRICT table should fail
+    let result = conn
+        .execute(
+            "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT) STRICT",
+            (),
+        )
+        .await;
+
+    // Verify the error message mentions experimental feature
+    assert!(matches!(result, Err(Error::Error(_))));
+}
+
+// Helper to collect all integer values from a single-column query.
+async fn collect_ids(conn: &turso::Connection, sql: &str) -> Vec<i64> {
+    let mut rows = conn.query(sql, ()).await.unwrap();
+    let mut ids = Vec::new();
+    while let Some(row) = rows.next().await.unwrap() {
+        let id: i64 = row.get(0).unwrap();
+        ids.push(id);
+    }
+    ids
+}
+
+#[tokio::test]
+async fn test_check_on_conflict_fail() {
+    // FAIL: error on the violating statement, transaction stays active.
+    // Prior inserts within the transaction are preserved and can be committed.
+    let db = Builder::new_local(":memory:").build().await.unwrap();
+    let conn = db.connect().unwrap();
+
+    conn.execute(
+        "CREATE TABLE t(id INTEGER PRIMARY KEY, value INTEGER CHECK(value > 0))",
+        (),
+    )
+    .await
+    .unwrap();
+    conn.execute("BEGIN", ()).await.unwrap();
+    conn.execute("INSERT INTO t VALUES(1, 10)", ())
+        .await
+        .unwrap();
+
+    // This should fail but keep the transaction active
+    let err = conn
+        .execute("INSERT OR FAIL INTO t VALUES(2, -5)", ())
+        .await;
+    assert!(
+        err.is_err(),
+        "INSERT OR FAIL should error on CHECK violation"
+    );
+
+    // Transaction is still active — commit it
+    conn.execute("COMMIT", ()).await.unwrap();
+
+    // Row 1 should have survived
+    let ids = collect_ids(&conn, "SELECT id FROM t ORDER BY id").await;
+    assert_eq!(ids, vec![1]);
+}
+
+#[tokio::test]
+async fn test_check_on_conflict_abort() {
+    // ABORT (default): error on the violating statement, transaction stays active.
+    let db = Builder::new_local(":memory:").build().await.unwrap();
+    let conn = db.connect().unwrap();
+
+    conn.execute(
+        "CREATE TABLE t(id INTEGER PRIMARY KEY, value INTEGER CHECK(value > 0))",
+        (),
+    )
+    .await
+    .unwrap();
+    conn.execute("BEGIN", ()).await.unwrap();
+    conn.execute("INSERT INTO t VALUES(1, 10)", ())
+        .await
+        .unwrap();
+
+    let err = conn
+        .execute("INSERT OR ABORT INTO t VALUES(2, -5)", ())
+        .await;
+    assert!(
+        err.is_err(),
+        "INSERT OR ABORT should error on CHECK violation"
+    );
+
+    conn.execute("COMMIT", ()).await.unwrap();
+
+    let ids = collect_ids(&conn, "SELECT id FROM t ORDER BY id").await;
+    assert_eq!(ids, vec![1]);
+}
+
+#[tokio::test]
+async fn test_check_on_conflict_rollback() {
+    // ROLLBACK: rolls back the entire transaction.
+    // Prior inserts within the transaction are lost, but committed rows survive.
+    let db = Builder::new_local(":memory:").build().await.unwrap();
+    let conn = db.connect().unwrap();
+
+    conn.execute(
+        "CREATE TABLE t(id INTEGER PRIMARY KEY, value INTEGER CHECK(value > 0))",
+        (),
+    )
+    .await
+    .unwrap();
+    // Commit row 1 outside the transaction
+    conn.execute("INSERT INTO t VALUES(1, 10)", ())
+        .await
+        .unwrap();
+
+    conn.execute("BEGIN", ()).await.unwrap();
+    conn.execute("INSERT INTO t VALUES(2, 20)", ())
+        .await
+        .unwrap();
+
+    // This should fail AND roll back the transaction
+    let err = conn
+        .execute("INSERT OR ROLLBACK INTO t VALUES(3, -5)", ())
+        .await;
+    assert!(
+        err.is_err(),
+        "INSERT OR ROLLBACK should error on CHECK violation"
+    );
+
+    // Transaction was rolled back — row 2 is lost, row 1 survives
+    let ids = collect_ids(&conn, "SELECT id FROM t ORDER BY id").await;
+    assert_eq!(ids, vec![1]);
+}
+
+#[tokio::test]
+async fn test_check_on_conflict_replace() {
+    // REPLACE: for CHECK constraints, behaves like ABORT.
+    // Error, transaction stays active.
+    let db = Builder::new_local(":memory:").build().await.unwrap();
+    let conn = db.connect().unwrap();
+
+    conn.execute(
+        "CREATE TABLE t(id INTEGER PRIMARY KEY, value INTEGER CHECK(value > 0))",
+        (),
+    )
+    .await
+    .unwrap();
+    conn.execute("BEGIN", ()).await.unwrap();
+    conn.execute("INSERT INTO t VALUES(1, 10)", ())
+        .await
+        .unwrap();
+
+    let err = conn
+        .execute("INSERT OR REPLACE INTO t VALUES(1, -5)", ())
+        .await;
+    assert!(
+        err.is_err(),
+        "INSERT OR REPLACE should error on CHECK violation"
+    );
+
+    conn.execute("COMMIT", ()).await.unwrap();
+
+    let ids = collect_ids(&conn, "SELECT id FROM t ORDER BY id").await;
+    assert_eq!(ids, vec![1]);
+}

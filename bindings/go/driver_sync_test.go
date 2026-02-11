@@ -170,12 +170,29 @@ func NewTursoServer() (*TursoServer, error) {
 			host:    "",
 			server:  server,
 		}
+		// Wait for server to become ready, with timeout and process health check.
+		deadline := time.Now().Add(30 * time.Second)
+		exitCh := make(chan error, 1)
+		go func() {
+			_, err := server.Wait()
+			exitCh <- err
+		}()
 		for {
-			_, err := http.Get(turso.userUrl)
+			select {
+			case exitErr := <-exitCh:
+				return nil, fmt.Errorf("server process exited before becoming ready: %v", exitErr)
+			default:
+			}
+			if time.Now().After(deadline) {
+				server.Kill()
+				return nil, fmt.Errorf("timed out waiting for server to become ready on port %d", port)
+			}
+			resp, err := http.Get(turso.userUrl)
 			if err == nil {
+				resp.Body.Close()
 				break
 			}
-			time.Sleep(1 * time.Millisecond)
+			time.Sleep(10 * time.Millisecond)
 		}
 		return turso, nil
 	} else {

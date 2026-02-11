@@ -23,7 +23,7 @@ use sql_generation::{
     },
 };
 use strum::IntoEnumIterator;
-use turso_core::{LimboError, types};
+use turso_core::{LimboError, Numeric, types};
 use turso_parser::ast::{self, Distinctness};
 
 use crate::{
@@ -1827,8 +1827,8 @@ fn print_row(row: &[SimValue]) -> String {
     row.iter()
         .map(|v| match &v.0 {
             types::Value::Null => "NULL".to_string(),
-            types::Value::Integer(i) => i.to_string(),
-            types::Value::Float(f) => f.to_string(),
+            types::Value::Numeric(Numeric::Integer(i)) => i.to_string(),
+            types::Value::Numeric(Numeric::Float(f)) => f.to_string(),
             types::Value::Text(t) => t.to_string(),
             types::Value::Blob(b) => format!(
                 "X'{}'",

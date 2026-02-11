@@ -1574,7 +1574,7 @@ fn test_freelist_trunk_page_reuse(db: TempDatabase) {
         .pragma_query("freelist_count")
         .expect("freelist_count should work");
     let freelist_count_after_drop = match &freelist_after_drop[0][0] {
-        turso_core::Value::Integer(n) => *n,
+        turso_core::Value::Numeric(turso_core::Numeric::Integer(n)) => *n,
         _ => panic!("Expected integer from freelist_count"),
     };
     assert_eq!(
@@ -1603,7 +1603,7 @@ fn test_freelist_trunk_page_reuse(db: TempDatabase) {
         .pragma_query("freelist_count")
         .expect("freelist_count should work");
     let freelist_count_after_create = match &freelist_after_create[0][0] {
-        turso_core::Value::Integer(n) => *n,
+        turso_core::Value::Numeric(turso_core::Numeric::Integer(n)) => *n,
         _ => panic!("Expected integer from freelist_count"),
     };
 

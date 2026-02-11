@@ -106,14 +106,14 @@ fn slow_path_time_with_tz(bencher: Bencher) {
 #[divan::bench]
 fn julian_day_float_input(bencher: Bencher) {
     // Float julian day value
-    let args = [Value::Float(2460512.5)];
+    let args = [Value::from_f64(2460512.5)];
     bencher.bench_local(|| black_box(exec_date(black_box(&args))));
 }
 
 #[divan::bench]
 fn julian_day_integer_input(bencher: Bencher) {
     // Integer julian day value
-    let args = [Value::Integer(2460513)];
+    let args = [Value::from_i64(2460513)];
     bencher.bench_local(|| black_box(exec_date(black_box(&args))));
 }
 
@@ -261,21 +261,21 @@ fn modifier_weekday(bencher: Bencher) {
 #[divan::bench]
 fn modifier_unixepoch(bencher: Bencher) {
     // unixepoch modifier for numeric input
-    let args = [Value::Integer(1721577045), Value::build_text("unixepoch")];
+    let args = [Value::from_i64(1721577045), Value::build_text("unixepoch")];
     bencher.bench_local(|| black_box(exec_datetime_full(black_box(&args))));
 }
 
 #[divan::bench]
 fn modifier_auto_unixepoch(bencher: Bencher) {
     // auto modifier detecting unix epoch
-    let args = [Value::Integer(1721577045), Value::build_text("auto")];
+    let args = [Value::from_i64(1721577045), Value::build_text("auto")];
     bencher.bench_local(|| black_box(exec_datetime_full(black_box(&args))));
 }
 
 #[divan::bench]
 fn modifier_auto_julianday(bencher: Bencher) {
     // auto modifier detecting julian day
-    let args = [Value::Float(2460512.5), Value::build_text("auto")];
+    let args = [Value::from_f64(2460512.5), Value::build_text("auto")];
     bencher.bench_local(|| black_box(exec_datetime_full(black_box(&args))));
 }
 

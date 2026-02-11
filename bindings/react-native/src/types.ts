@@ -25,7 +25,7 @@ export interface NativeDatabase {
  */
 export interface NativeConnection {
   prepareSingle(sql: string): NativeStatement;
-  prepareFirst(sql: string): { statement: NativeStatement | null; tailIdx: number };
+  prepareFirst(sql: string): { statement: NativeStatement; tailIdx: number } | null;
   lastInsertRowid(): number;
   getAutocommit(): boolean;
   setBusyTimeout(timeoutMs: number): void;
@@ -169,6 +169,32 @@ export enum TursoType {
 }
 
 // ============================================================================
+// Tracing / Logging Types
+// ============================================================================
+
+/**
+ * Log level for Turso tracing
+ */
+export type TursoTracingLevel = 'error' | 'warn' | 'info' | 'debug' | 'trace';
+
+/**
+ * A single log entry emitted by the Turso engine
+ */
+export interface TursoLog {
+  message: string;
+  target: string;
+  file: string;
+  timestamp: number;
+  line: number;
+  level: TursoTracingLevel;
+}
+
+/**
+ * Logger callback function
+ */
+export type TursoLoggerFn = (log: TursoLog) => void;
+
+// ============================================================================
 // Sync Operation Result Types
 // ============================================================================
 
@@ -281,11 +307,6 @@ export interface DatabaseOpts {
   longPollTimeoutMs?: number;
 
   /**
-   * Optional parameter to enable internal logging for the database
-   */
-  tracing?: 'error' | 'warn' | 'info' | 'debug' | 'trace';
-
-  /**
    * Bootstrap database if empty; if set - client will be able to connect
    * to fresh db only when network is online
    */
@@ -362,7 +383,7 @@ export interface TursoProxy {
   newDatabase(path: string, config?: any): NativeDatabase;
   newSyncDatabase(dbConfig: any, syncConfig: any): NativeSyncDatabase;
   version(): string;
-  setup(options: { logLevel?: string }): void;
+  setup(options: { logLevel?: string; logger?: TursoLoggerFn }): void;
   fsReadFile(path: string): ArrayBuffer | null;
   fsWriteFile(path: string, data: ArrayBuffer): void;
 }

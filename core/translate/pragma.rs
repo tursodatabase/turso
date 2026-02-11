@@ -22,7 +22,7 @@ use crate::translate::schema::translate_create_table;
 use crate::util::{normalize_ident, parse_signed_number, parse_string, IOExt as _};
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
 use crate::vdbe::insn::{Cookie, Insn};
-use crate::{bail_parse_error, CaptureDataChangesMode, LimboError, Value};
+use crate::{bail_parse_error, CaptureDataChangesMode, LimboError, Numeric, Value};
 use std::str::FromStr;
 use strum::IntoEnumIterator;
 
@@ -125,8 +125,8 @@ fn update_pragma(
         PragmaName::ApplicationId => {
             let data = parse_signed_number(&value)?;
             let app_id_value = match data {
-                Value::Integer(i) => i as i32,
-                Value::Float(f) => f as i32,
+                Value::Numeric(Numeric::Integer(i)) => i as i32,
+                Value::Numeric(Numeric::Float(f)) => f64::from(f) as i32,
                 _ => bail_parse_error!("expected integer, got {:?}", data),
             };
 
@@ -141,8 +141,8 @@ fn update_pragma(
         PragmaName::BusyTimeout => {
             let data = parse_signed_number(&value)?;
             let busy_timeout_ms = match data {
-                Value::Integer(i) => i as i32,
-                Value::Float(f) => f as i32,
+                Value::Numeric(Numeric::Integer(i)) => i as i32,
+                Value::Numeric(Numeric::Float(f)) => f64::from(f) as i32,
                 _ => bail_parse_error!("expected integer, got {:?}", data),
             };
             let busy_timeout_ms = busy_timeout_ms.max(0);
@@ -151,8 +151,8 @@ fn update_pragma(
         }
         PragmaName::CacheSize => {
             let cache_size = match parse_signed_number(&value)? {
-                Value::Integer(size) => size,
-                Value::Float(size) => size as i64,
+                Value::Numeric(Numeric::Integer(size)) => size,
+                Value::Numeric(Numeric::Float(size)) => f64::from(size) as i64,
                 _ => bail_parse_error!("Invalid value for cache size pragma"),
             };
             update_cache_size(cache_size, pager, connection)?;
@@ -206,8 +206,8 @@ fn update_pragma(
         PragmaName::MaxPageCount => {
             let data = parse_signed_number(&value)?;
             let max_page_count_value = match data {
-                Value::Integer(i) => i as usize,
-                Value::Float(f) => f as usize,
+                Value::Numeric(Numeric::Integer(i)) => i as usize,
+                Value::Numeric(Numeric::Float(f)) => f64::from(f) as usize,
                 _ => unreachable!(),
             };
 
@@ -224,8 +224,8 @@ fn update_pragma(
         PragmaName::UserVersion => {
             let data = parse_signed_number(&value)?;
             let version_value = match data {
-                Value::Integer(i) => i as i32,
-                Value::Float(f) => f as i32,
+                Value::Numeric(Numeric::Integer(i)) => i as i32,
+                Value::Numeric(Numeric::Float(f)) => f64::from(f) as i32,
                 _ => unreachable!(),
             };
 
@@ -257,8 +257,8 @@ fn update_pragma(
         }
         PragmaName::PageSize => {
             let page_size = match parse_signed_number(&value)? {
-                Value::Integer(size) => size,
-                Value::Float(size) => size as i64,
+                Value::Numeric(Numeric::Integer(size)) => size,
+                Value::Numeric(Numeric::Float(size)) => f64::from(size) as i64,
                 _ => bail_parse_error!("Invalid value for page size pragma"),
             };
             update_page_size(connection, page_size as u32)?;
@@ -430,7 +430,7 @@ fn update_pragma(
         }
         PragmaName::MvccCheckpointThreshold => {
             let threshold = match parse_signed_number(&value)? {
-                Value::Integer(size) if size >= -1 => size,
+                Value::Numeric(Numeric::Integer(size)) if size >= -1 => size,
                 _ => bail_parse_error!(
                     "mvcc_checkpoint_threshold must be -1, 0, or a positive integer"
                 ),
@@ -442,6 +442,11 @@ fn update_pragma(
         PragmaName::ForeignKeys => {
             let enabled = parse_pragma_enabled(&value);
             connection.set_foreign_keys_enabled(enabled);
+            Ok((program, TransactionMode::None))
+        }
+        PragmaName::IgnoreCheckConstraints => {
+            let enabled = parse_pragma_enabled(&value);
+            connection.set_check_constraints_ignored(enabled);
             Ok((program, TransactionMode::None))
         }
         #[cfg(target_vendor = "apple")]
@@ -857,6 +862,14 @@ fn query_pragma(
             let enabled = connection.foreign_keys_enabled();
             let register = program.alloc_register();
             program.emit_int(enabled as i64, register);
+            program.emit_result_row(register, 1);
+            program.add_pragma_result_column(pragma.to_string());
+            Ok((program, TransactionMode::None))
+        }
+        PragmaName::IgnoreCheckConstraints => {
+            let ignored = connection.check_constraints_ignored();
+            let register = program.alloc_register();
+            program.emit_int(ignored as i64, register);
             program.emit_result_row(register, 1);
             program.add_pragma_result_column(pragma.to_string());
             Ok((program, TransactionMode::None))

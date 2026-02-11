@@ -1,16 +1,28 @@
 ---
 source: subqueries.sqltest
-expression: "WITH order_totals AS (\n        SELECT customer_id, sum(total_amount) AS total\n        FROM orders\n        GROUP BY customer_id\n    )\n    SELECT\n        c.name,\n        ot.total,\n        (SELECT avg(total) FROM order_totals) AS avg_total\n    FROM customers c\n    JOIN order_totals ot ON ot.customer_id = c.id\n    WHERE ot.total > (SELECT avg(total) FROM order_totals);"
+expression: |-
+  WITH order_totals AS (
+          SELECT customer_id, sum(total_amount) AS total
+          FROM orders
+          GROUP BY customer_id
+      )
+      SELECT
+          c.name,
+          ot.total,
+          (SELECT avg(total) FROM order_totals) AS avg_total
+      FROM customers c
+      JOIN order_totals ot ON ot.customer_id = c.id
+      WHERE ot.total > (SELECT avg(total) FROM order_totals);
 info:
   statement_type: WITH (CTE)
   tables:
-    - customers
-    - order_totals
-    - orders
-    - ot.customer_id
+  - customers
+  - order_totals
+  - orders
+  - ot.customer_id
   setup_blocks:
-    - schema
-  database: ":memory:"
+  - schema
+  database: ':memory:'
 ---
 QUERY PLAN
 |--SCAN order_totals
@@ -85,12 +97,12 @@ addr  opcode                                       p1   p2   p3  p4            p
   59                    Integer                     0   27    0                 0  r[27]=0; clear group by abort flag
   60                    Null                        0   28    0                 0  r[28]=NULL; initialize group by comparison registers to NULL
   61                    Gosub                      34   91    0                 0  ; go to clear accumulator subroutine
-  62                    OpenRead                    0    4    0  k(4,B,B,B,B)   0  table=orders, root=4, iDb=0
-  63                    OpenRead                    2    9    0  k(2,B)         0  index=idx_orders_customer, root=9, iDb=0
-  64                    Rewind                      1   80    0                 0  Rewind index idx_orders_customer
-  65                      DeferredSeek              1    0    0                 0
-  66                      Column                    0    1   32                 0  r[32]=orders.customer_id
-  67                      Column                    0    3   33                 0  r[33]=orders.total_amount
+  62                    OpenRead                    2    4    0  k(4,B,B,B,B)   0  table=orders, root=4, iDb=0
+  63                    OpenRead                    3    9    0  k(2,B)         0  index=idx_orders_customer, root=9, iDb=0
+  64                    Rewind                      3   80    0                 0  Rewind index idx_orders_customer
+  65                      DeferredSeek              3    2    0                 0
+  66                      Column                    2    1   32                 0  r[32]=orders.customer_id
+  67                      Column                    2    3   33                 0  r[33]=orders.total_amount
   68                      RealAffinity             33    0    0                 0
   69                      Compare                  28   32    1  k(1, Binary)   0  r[28..28]==r[32..32]
   70                      Jump                     71   75   71                 0  ; start new group if comparison is not equal
@@ -100,9 +112,9 @@ addr  opcode                                       p1   p2   p3  p4            p
   74                      Gosub                    34   91    0                 0  ; goto clear accumulator subroutine
   75                      AggStep                   0   33   30  sum            0  accum=r[30] step(r[33])
   76                      If                       26   78    0                 0  if r[26] goto 78; don't emit group columns if continuing existing group
-  77                      Column                    0    1   29                 0  r[29]=orders.customer_id
+  77                      Column                    2    1   29                 0  r[29]=orders.customer_id
   78                      Integer                   1   26    0                 0  r[26]=1; indicate data in accumulator
-  79                    Next                        1   65    0                 0
+  79                    Next                        3   65    0                 0
   80                    Gosub                      25   84    0                 0  ; emit row for final group
   81                    Goto                        0   94    0                 0  ; group by finished
   82                    Integer                     1   27    0                 0  r[27]=1
@@ -135,12 +147,12 @@ addr  opcode                                       p1   p2   p3  p4            p
  109          Integer                               0   44    0                 0  r[44]=0; clear group by abort flag
  110          Null                                  0   45    0                 0  r[45]=NULL; initialize group by comparison registers to NULL
  111          Gosub                                51  141    0                 0  ; go to clear accumulator subroutine
- 112          OpenRead                              3    4    0  k(4,B,B,B,B)   0  table=orders, root=4, iDb=0
- 113          OpenRead                              4    9    0  k(2,B)         0  index=idx_orders_customer, root=9, iDb=0
- 114          Rewind                                4  130    0                 0  Rewind index idx_orders_customer
- 115            DeferredSeek                        4    3    0                 0
- 116            Column                              3    1   49                 0  r[49]=orders.customer_id
- 117            Column                              3    3   50                 0  r[50]=orders.total_amount
+ 112          OpenRead                              4    4    0  k(4,B,B,B,B)   0  table=orders, root=4, iDb=0
+ 113          OpenRead                              5    9    0  k(2,B)         0  index=idx_orders_customer, root=9, iDb=0
+ 114          Rewind                                5  130    0                 0  Rewind index idx_orders_customer
+ 115            DeferredSeek                        5    4    0                 0
+ 116            Column                              4    1   49                 0  r[49]=orders.customer_id
+ 117            Column                              4    3   50                 0  r[50]=orders.total_amount
  118            RealAffinity                       50    0    0                 0
  119            Compare                            45   49    1  k(1, Binary)   0  r[45..45]==r[49..49]
  120            Jump                              121  125  121                 0  ; start new group if comparison is not equal
@@ -150,9 +162,9 @@ addr  opcode                                       p1   p2   p3  p4            p
  124            Gosub                              51  141    0                 0  ; goto clear accumulator subroutine
  125            AggStep                             0   50   47  sum            0  accum=r[47] step(r[50])
  126            If                                 43  128    0                 0  if r[43] goto 128; don't emit group columns if continuing existing group
- 127            Column                              3    1   46                 0  r[46]=orders.customer_id
+ 127            Column                              4    1   46                 0  r[46]=orders.customer_id
  128            Integer                             1   43    0                 0  r[43]=1; indicate data in accumulator
- 129          Next                                  4  115    0                 0
+ 129          Next                                  5  115    0                 0
  130          Gosub                                42  134    0                 0  ; emit row for final group
  131          Goto                                  0  144    0                 0  ; group by finished
  132          Integer                               1   44    0                 0  r[44]=1
@@ -168,15 +180,15 @@ addr  opcode                                       p1   p2   p3  p4            p
  142    Integer                                     0   43    0                 0  r[43]=0
  143  Return                                       51    0    0                 0
  144  EndCoroutine                                 39    0    0                 0
- 145  OpenRead                                      5    6    0  k(4,B,B,B,B)   0  table=customers, root=6, iDb=0
+ 145  OpenRead                                      6    6    0  k(4,B,B,B,B)   0  table=customers, root=6, iDb=0
  146  InitCoroutine                                39    0  108                 0
  147    Yield                                      39  158    0                 0
  148    Copy                                       41   56    0                 0  r[56]=r[41]
  149    Copy                                        1   57    0                 0  r[57]=r[1]
  150    Le                                         56   57  157  Binary         0  if r[56]<=r[57] goto 157
  151    Copy                                       40   58    0                 0  r[58]=r[40]
- 152    SeekRowid                                   5   58  157                 0  if (r[58]!=cursor 5 for table customers.rowid) goto 157
- 153    Column                                      5    1   52                 0  r[52]=customers.name
+ 152    SeekRowid                                   6   58  157                 0  if (r[58]!=cursor 6 for table customers.rowid) goto 157
+ 153    Column                                      6    1   52                 0  r[52]=customers.name
  154    Copy                                       41   53    0                 0  r[53]=r[41]
  155    Copy                                        2   54    0                 0  r[54]=r[2]
  156    ResultRow                                  52    3    0                 0  output=r[52..54]

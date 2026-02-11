@@ -645,8 +645,7 @@ impl SortedChunk {
             let Ok((buf, bytes_read)) = res else {
                 return None;
             };
-            let read_buf_ref = buf.clone();
-            let read_buf = read_buf_ref.as_slice();
+            let read_buf = buf.as_slice();
 
             let bytes_read = bytes_read as usize;
             if bytes_read == 0 {
@@ -989,7 +988,7 @@ mod tests {
 
             let mut initial_records = Vec::with_capacity(num_records as usize);
             for i in (0..num_records).rev() {
-                let mut values = vec![Value::Integer(i)];
+                let mut values = vec![Value::from_i64(i)];
                 values.append(&mut generate_values(&mut rng, &value_types));
                 let record = ImmutableRecord::from_values(&values, values.len());
 
@@ -1007,7 +1006,7 @@ mod tests {
             for i in 0..num_records {
                 assert!(sorter.has_more());
                 let record = sorter.record().unwrap();
-                assert_eq!(record.get_values().unwrap()[0], ValueRef::Integer(i));
+                assert_eq!(record.get_values().unwrap()[0], ValueRef::from_i64(i));
                 // Check that the record remained unchanged after sorting.
                 assert_eq!(record, &initial_records[(num_records - i - 1) as usize]);
 
@@ -1039,11 +1038,11 @@ mod tests {
         let mut values = Vec::with_capacity(value_types.len());
         for value_type in value_types {
             let value = match value_type {
-                ValueType::Integer => Value::Integer(rng.next_u64() as i64),
+                ValueType::Integer => Value::from_i64(rng.next_u64() as i64),
                 ValueType::Float => {
                     let numerator = rng.next_u64() as f64;
                     let denominator = rng.next_u64() as f64;
-                    Value::Float(numerator / denominator)
+                    Value::from_f64(numerator / denominator)
                 }
                 ValueType::Blob => {
                     let mut blob = Vec::with_capacity((rng.next_u64() % 2047 + 1) as usize);

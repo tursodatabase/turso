@@ -207,7 +207,7 @@ impl DatabaseWalSession {
                 "unexpected columns count for PRAGMA page_size query".to_string(),
             ));
         }
-        let turso_core::Value::Integer(page_size) = row[0] else {
+        let turso_core::Value::Numeric(turso_core::Numeric::Integer(page_size)) = row[0] else {
             return Err(Error::DatabaseTapeError(
                 "unexpected column type for PRAGMA page_size query".to_string(),
             ));
@@ -427,7 +427,7 @@ impl DatabaseChangesIterator {
         query_stmt.reset();
         query_stmt.bind_at(
             1.try_into().unwrap(),
-            turso_core::Value::Integer(change_id_filter),
+            turso_core::Value::from_i64(change_id_filter),
         );
 
         while let Some(row) = run_stmt_once(coro, query_stmt).await? {
@@ -566,7 +566,7 @@ impl DatabaseReplaySession {
                             let mut columns = Vec::with_capacity(columns_cnt);
                             for value in updates.iter().take(columns_cnt) {
                                 columns.push(match value {
-                                    turso_core::Value::Integer(x @ (1 | 0)) => *x > 0,
+                                    turso_core::Value::Numeric(turso_core::Numeric::Integer(x @ (1 | 0))) => *x > 0,
                                     _ => panic!("unexpected 'changes' binary record first-half component: {value:?}")
                                 });
                             }
@@ -853,20 +853,20 @@ mod tests {
             rows,
             vec![
                 vec![
-                    turso_core::Value::Integer(1),
-                    turso_core::Value::Integer(-1)
+                    turso_core::Value::from_i64(1),
+                    turso_core::Value::from_i64(-1)
                 ],
                 vec![
-                    turso_core::Value::Integer(2),
-                    turso_core::Value::Integer(-2)
+                    turso_core::Value::from_i64(2),
+                    turso_core::Value::from_i64(-2)
                 ],
                 vec![
-                    turso_core::Value::Integer(10),
-                    turso_core::Value::Integer(1)
+                    turso_core::Value::from_i64(10),
+                    turso_core::Value::from_i64(1)
                 ],
                 vec![
-                    turso_core::Value::Integer(20),
-                    turso_core::Value::Integer(2)
+                    turso_core::Value::from_i64(20),
+                    turso_core::Value::from_i64(2)
                 ]
             ]
         );
@@ -932,15 +932,21 @@ mod tests {
             rows,
             vec![
                 vec![
-                    turso_core::Value::Integer(1),
-                    turso_core::Value::Integer(-1)
+                    turso_core::Value::from_i64(1),
+                    turso_core::Value::from_i64(-1)
                 ],
                 vec![
-                    turso_core::Value::Integer(2),
-                    turso_core::Value::Integer(-2)
+                    turso_core::Value::from_i64(2),
+                    turso_core::Value::from_i64(-2)
                 ],
-                vec![turso_core::Value::Integer(3), turso_core::Value::Integer(1)],
-                vec![turso_core::Value::Integer(4), turso_core::Value::Integer(2)]
+                vec![
+                    turso_core::Value::from_i64(3),
+                    turso_core::Value::from_i64(1)
+                ],
+                vec![
+                    turso_core::Value::from_i64(4),
+                    turso_core::Value::from_i64(2)
+                ]
             ]
         );
     }
@@ -1001,7 +1007,7 @@ mod tests {
         assert_eq!(
             rows,
             vec![vec![
-                turso_core::Value::Integer(1),
+                turso_core::Value::from_i64(1),
                 turso_core::Value::Text(turso_core::types::Text::new("b"))
             ]]
         );
@@ -1073,9 +1079,9 @@ mod tests {
                 assert_eq!(
                     rows,
                     vec![vec![
-                        turso_core::Value::Integer(1),
+                        turso_core::Value::from_i64(1),
                         turso_core::Value::Text(turso_core::types::Text::new("a")),
-                        turso_core::Value::Integer(10),
+                        turso_core::Value::from_i64(10),
                     ]]
                 );
 
@@ -1087,9 +1093,9 @@ mod tests {
                 assert_eq!(
                     rows,
                     vec![vec![
-                        turso_core::Value::Integer(1),
+                        turso_core::Value::from_i64(1),
                         turso_core::Value::Text(turso_core::types::Text::new("b")),
-                        turso_core::Value::Integer(20),
+                        turso_core::Value::from_i64(20),
                     ]]
                 );
                 let mut rows = Vec::new();
@@ -1112,7 +1118,7 @@ mod tests {
                             turso_core::Value::Text(turso_core::types::Text::new(
                                 "sqlite_sequence"
                             )),
-                            turso_core::Value::Integer(2),
+                            turso_core::Value::from_i64(2),
                             turso_core::Value::Text(turso_core::types::Text::new(
                                 "CREATE TABLE sqlite_sequence(name,seq)"
                             )),
@@ -1121,7 +1127,7 @@ mod tests {
                             turso_core::Value::Text(turso_core::types::Text::new("table")),
                             turso_core::Value::Text(turso_core::types::Text::new("t")),
                             turso_core::Value::Text(turso_core::types::Text::new("t")),
-                            turso_core::Value::Integer(4),
+                            turso_core::Value::from_i64(4),
                             turso_core::Value::Text(turso_core::types::Text::new(
                                 "CREATE TABLE t (x TEXT PRIMARY KEY, y)"
                             )),
@@ -1130,7 +1136,7 @@ mod tests {
                             turso_core::Value::Text(turso_core::types::Text::new("table")),
                             turso_core::Value::Text(turso_core::types::Text::new("q")),
                             turso_core::Value::Text(turso_core::types::Text::new("q")),
-                            turso_core::Value::Integer(6),
+                            turso_core::Value::from_i64(6),
                             turso_core::Value::Text(turso_core::types::Text::new(
                                 "CREATE TABLE q (x TEXT PRIMARY KEY, y)"
                             )),
@@ -1205,7 +1211,7 @@ mod tests {
                             turso_core::Value::Text(turso_core::types::Text::new("table")),
                             turso_core::Value::Text(turso_core::types::Text::new("t")),
                             turso_core::Value::Text(turso_core::types::Text::new("t")),
-                            turso_core::Value::Integer(4),
+                            turso_core::Value::from_i64(4),
                             turso_core::Value::Text(turso_core::types::Text::new(
                                 "CREATE TABLE t (x TEXT PRIMARY KEY, y)"
                             )),
@@ -1214,7 +1220,7 @@ mod tests {
                             turso_core::Value::Text(turso_core::types::Text::new("index")),
                             turso_core::Value::Text(turso_core::types::Text::new("t_idx")),
                             turso_core::Value::Text(turso_core::types::Text::new("t")),
-                            turso_core::Value::Integer(6),
+                            turso_core::Value::from_i64(6),
                             turso_core::Value::Text(turso_core::types::Text::new(
                                 "CREATE INDEX IF NOT EXISTS t_idx ON t (y)"
                             )),
@@ -1289,7 +1295,7 @@ mod tests {
                         turso_core::Value::Text(turso_core::types::Text::new("table")),
                         turso_core::Value::Text(turso_core::types::Text::new("t")),
                         turso_core::Value::Text(turso_core::types::Text::new("t")),
-                        turso_core::Value::Integer(4),
+                        turso_core::Value::from_i64(4),
                         turso_core::Value::Text(turso_core::types::Text::new(
                             "CREATE TABLE t (x TEXT PRIMARY KEY, z)"
                         )),
@@ -1386,8 +1392,8 @@ mod tests {
                     rows,
                     vec![vec![
                         turso_core::Value::Text(turso_core::types::Text::new("turso")),
-                        turso_core::Value::Integer(10),
-                        turso_core::Value::Integer(20),
+                        turso_core::Value::from_i64(10),
+                        turso_core::Value::from_i64(20),
                     ]]
                 );
                 crate::Result::Ok(())

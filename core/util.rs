@@ -1123,7 +1123,7 @@ pub fn checked_cast_text_to_numeric(text: &str, lossless: bool) -> std::result::
 
     match kind {
         ValueType::Integer => match text.parse::<i64>() {
-            Ok(i) => Ok(Value::Integer(i)),
+            Ok(i) => Ok(Value::from_i64(i)),
             Err(e) => {
                 if matches!(
                     e.kind(),
@@ -1133,13 +1133,15 @@ pub fn checked_cast_text_to_numeric(text: &str, lossless: bool) -> std::result::
                     // we have to match sqlite exactly here, so we match sqlite3AtoF
                     let value = text.parse::<f64>().unwrap_or_default();
                     let factor = 10f64.powi(15 - value.abs().log10().ceil() as i32);
-                    Ok(Value::Float((value * factor).round() / factor))
+                    Ok(Value::from_f64((value * factor).round() / factor))
                 } else {
                     Err(())
                 }
             }
         },
-        ValueType::Float => Ok(text.parse::<f64>().map_or(Value::Float(0.0), Value::Float)),
+        ValueType::Float => Ok(text
+            .parse::<f64>()
+            .map_or(Value::from_f64(0.0), Value::from_f64)),
         _ => unreachable!(),
     }
 }
@@ -1200,20 +1202,35 @@ fn parse_numeric_str(text: &str) -> Result<(ValueType, &str), ()> {
     ))
 }
 
-// Check if float can be losslessly converted to 51-bit integer
+// Check if float can be converted to integer for INTEGER PRIMARY KEY columns.
+// SQLite uses sqlite3VdbeIntegerAffinity which requires:
+// 1. The float must round-trip correctly (float -> int -> float gives same value)
+// 2. The integer must be strictly between i64::MIN and i64::MAX (exclusive)
+//
+// This matches SQLite's check: ix > SMALLEST_INT64 && ix < LARGEST_INT64
 pub fn cast_real_to_integer(float: f64) -> std::result::Result<i64, ()> {
+    // Must be finite and a whole number (no fractional part)
     if !float.is_finite() || float.trunc() != float {
         return Err(());
     }
 
-    let limit = (1i64 << 51) as f64;
-    let truncated = float.trunc();
+    // Convert to i64, clamping to i64 range if necessary
+    // Note: Rust's f64 as i64 saturates to i64::MIN/MAX for out-of-range values
+    let int_val = float as i64;
 
-    if truncated.abs() >= limit {
+    // SQLite requires the value to be STRICTLY between i64::MIN and i64::MAX
+    // (i.e., ix > SMALLEST_INT64 && ix < LARGEST_INT64)
+    if int_val == i64::MIN || int_val == i64::MAX {
         return Err(());
     }
 
-    Ok(truncated as i64)
+    // Verify round-trip: converting back to f64 must give the same value
+    // This matches SQLite's check: pMem->u.r == ix
+    if (int_val as f64) != float {
+        return Err(());
+    }
+
+    Ok(int_val)
 }
 
 // we don't need to verify the numeric literal here, as it is already verified by the parser
@@ -1227,17 +1244,17 @@ pub fn parse_numeric_literal(text: &str) -> Result<Value> {
 
     if text.starts_with("0x") || text.starts_with("0X") {
         let value = u64::from_str_radix(&text[2..], 16)? as i64;
-        return Ok(Value::Integer(value));
+        return Ok(Value::from_i64(value));
     } else if text.starts_with("-0x") || text.starts_with("-0X") {
         let value = u64::from_str_radix(&text[3..], 16)? as i64;
         if value == i64::MIN {
             return Err(LimboError::IntegerOverflow);
         }
-        return Ok(Value::Integer(-value));
+        return Ok(Value::from_i64(-value));
     }
 
     if let Ok(int_value) = text.parse::<i64>() {
-        return Ok(Value::Integer(int_value));
+        return Ok(Value::from_i64(int_value));
     }
 
     let Some(StrToF64::Fractional(float) | StrToF64::Decimal(float)) =
@@ -1245,7 +1262,7 @@ pub fn parse_numeric_literal(text: &str) -> Result<Value> {
     else {
         unreachable!();
     };
-    Ok(Value::Float(float.into()))
+    Ok(Value::Numeric(crate::numeric::Numeric::Float(float)))
 }
 
 pub fn parse_signed_number(expr: &Expr) -> Result<Value> {
@@ -1283,7 +1300,7 @@ pub fn parse_pragma_bool(expr: &Expr) -> Result<bool> {
     const TRUE_VALUES: &[&str] = &["yes", "true", "on"];
     const FALSE_VALUES: &[&str] = &["no", "false", "off"];
     if let Ok(number) = parse_signed_number(expr) {
-        if let Value::Integer(x @ (0 | 1)) = number {
+        if let Value::Numeric(crate::numeric::Numeric::Integer(x @ (0 | 1))) = number {
             return Ok(x != 0);
         }
     } else if let Expr::Name(name) = expr {
@@ -1384,7 +1401,7 @@ pub fn extract_view_columns(
                         normalize_ident(qualified_name.name.as_str())
                     };
                     tables.push(ViewTable {
-                        name: table_name.clone(),
+                        name: table_name,
                         alias: alias.as_ref().map(|a| match a {
                             ast::As::As(name) => normalize_ident(name.as_str()),
                             ast::As::Elided(name) => normalize_ident(name.as_str()),
@@ -1580,6 +1597,83 @@ pub fn rewrite_fk_parent_cols_if_self_ref(
     }
 }
 
+/// Returns true if the expression tree references a column whose normalized
+/// name equals `col_name_normalized`.
+pub fn check_expr_references_column(expr: &ast::Expr, col_name_normalized: &str) -> bool {
+    let mut found = false;
+    // The closure is infallible, so walk_expr cannot fail.
+    let _ = walk_expr(expr, &mut |e| {
+        if found {
+            return Ok(WalkControl::SkipChildren);
+        }
+        match e {
+            ast::Expr::Id(name) | ast::Expr::Name(name) => {
+                if normalize_ident(name.as_str()) == col_name_normalized {
+                    found = true;
+                    return Ok(WalkControl::SkipChildren);
+                }
+            }
+            ast::Expr::Qualified(_, col) | ast::Expr::DoublyQualified(_, _, col) => {
+                if normalize_ident(col.as_str()) == col_name_normalized {
+                    found = true;
+                    return Ok(WalkControl::SkipChildren);
+                }
+            }
+            _ => {}
+        }
+        Ok(WalkControl::Continue)
+    });
+    found
+}
+
+/// Rewrite column name references in a CHECK constraint expression.
+/// Replaces `Id(old)` and `Name(old)` with `Id(new)`, and updates the
+/// column name in `Qualified(tbl, old)` references.
+pub fn rewrite_check_expr_column_refs(expr: &mut ast::Expr, from: &str, to: &str) {
+    let from_normalized = normalize_ident(from);
+    // The closure is infallible, so walk_expr_mut cannot fail.
+    let _ = walk_expr_mut(
+        expr,
+        &mut |e: &mut ast::Expr| -> crate::Result<WalkControl> {
+            match e {
+                ast::Expr::Id(ref name) | ast::Expr::Name(ref name)
+                    if normalize_ident(name.as_str()) == from_normalized =>
+                {
+                    *e = ast::Expr::Id(ast::Name::exact(to.to_owned()));
+                }
+                ast::Expr::Qualified(ref tbl, ref col_name)
+                    if normalize_ident(col_name.as_str()) == from_normalized =>
+                {
+                    let tbl = tbl.clone();
+                    *e = ast::Expr::Qualified(tbl, ast::Name::exact(to.to_owned()));
+                }
+                _ => {}
+            }
+            Ok(WalkControl::Continue)
+        },
+    );
+}
+
+/// Rewrite table-qualified column references in a CHECK constraint expression,
+/// replacing the table name from `from` to `to`. For example, `t1.a > 0` becomes
+/// `t2.a > 0` when renaming t1 to t2. This matches SQLite 3.49.1+ behavior which
+/// rewrites qualified refs during ALTER TABLE RENAME instead of rejecting them.
+pub fn rewrite_check_expr_table_refs(expr: &mut ast::Expr, from: &str, to: &str) {
+    let from_normalized = normalize_ident(from);
+    let _ = walk_expr_mut(
+        expr,
+        &mut |e: &mut ast::Expr| -> crate::Result<WalkControl> {
+            if let ast::Expr::Qualified(ref tbl, ref col) = *e {
+                if normalize_ident(tbl.as_str()) == from_normalized {
+                    let col = col.clone();
+                    *e = ast::Expr::Qualified(ast::Name::exact(to.to_owned()), col);
+                }
+            }
+            Ok(WalkControl::Continue)
+        },
+    );
+}
+
 /// Update a column-level REFERENCES <tbl>(col,...) constraint
 pub fn rewrite_column_references_if_needed(
     col: &mut ast::ColumnDefinition,
@@ -1588,12 +1682,14 @@ pub fn rewrite_column_references_if_needed(
     to: &str,
 ) {
     for cc in &mut col.constraints {
-        if let ast::NamedColumnConstraint {
-            constraint: ast::ColumnConstraint::ForeignKey { clause, .. },
-            ..
-        } = cc
-        {
-            rewrite_fk_parent_cols_if_self_ref(clause, table, from, to);
+        match &mut cc.constraint {
+            ast::ColumnConstraint::ForeignKey { clause, .. } => {
+                rewrite_fk_parent_cols_if_self_ref(clause, table, from, to);
+            }
+            ast::ColumnConstraint::Check(expr) => {
+                rewrite_check_expr_column_refs(expr, from, to);
+            }
+            _ => {}
         }
     }
 }
@@ -2250,41 +2346,41 @@ pub mod tests {
     fn test_text_to_integer() {
         assert_eq!(
             checked_cast_text_to_numeric("1", false).unwrap(),
-            Value::Integer(1)
+            Value::from_i64(1)
         );
         assert_eq!(
             checked_cast_text_to_numeric("-1", false).unwrap(),
-            Value::Integer(-1)
+            Value::from_i64(-1)
         );
         assert_eq!(
             checked_cast_text_to_numeric("1823400-00000", false).unwrap(),
-            Value::Integer(1823400)
+            Value::from_i64(1823400)
         );
         assert_eq!(
             checked_cast_text_to_numeric("-10000000", false).unwrap(),
-            Value::Integer(-10000000)
+            Value::from_i64(-10000000)
         );
         assert_eq!(
             checked_cast_text_to_numeric("123xxx", false).unwrap(),
-            Value::Integer(123)
+            Value::from_i64(123)
         );
         assert_eq!(
             checked_cast_text_to_numeric("9223372036854775807", false).unwrap(),
-            Value::Integer(i64::MAX)
+            Value::from_i64(i64::MAX)
         );
         // Overflow becomes Float (different from cast_text_to_integer which returned 0)
         assert_eq!(
             checked_cast_text_to_numeric("9223372036854775808", false).unwrap(),
-            Value::Float(9.22337203685478e18)
+            Value::from_f64(9.22337203685478e18)
         );
         assert_eq!(
             checked_cast_text_to_numeric("-9223372036854775808", false).unwrap(),
-            Value::Integer(i64::MIN)
+            Value::from_i64(i64::MIN)
         );
         // Overflow becomes Float (different from cast_text_to_integer which returned 0)
         assert_eq!(
             checked_cast_text_to_numeric("-9223372036854775809", false).unwrap(),
-            Value::Float(-9.22337203685478e18)
+            Value::from_f64(-9.22337203685478e18)
         );
         assert!(checked_cast_text_to_numeric("-", false).is_err());
     }
@@ -2293,115 +2389,115 @@ pub mod tests {
     fn test_text_to_real() {
         assert_eq!(
             checked_cast_text_to_numeric("1", false).unwrap(),
-            Value::Integer(1)
+            Value::from_i64(1)
         );
         assert_eq!(
             checked_cast_text_to_numeric("-1", false).unwrap(),
-            Value::Integer(-1)
+            Value::from_i64(-1)
         );
         assert_eq!(
             checked_cast_text_to_numeric("1.0", false).unwrap(),
-            Value::Float(1.0)
+            Value::from_f64(1.0)
         );
         assert_eq!(
             checked_cast_text_to_numeric("-1.0", false).unwrap(),
-            Value::Float(-1.0)
+            Value::from_f64(-1.0)
         );
         assert_eq!(
             checked_cast_text_to_numeric("1e10", false).unwrap(),
-            Value::Float(1e10)
+            Value::from_f64(1e10)
         );
         assert_eq!(
             checked_cast_text_to_numeric("-1e10", false).unwrap(),
-            Value::Float(-1e10)
+            Value::from_f64(-1e10)
         );
         assert_eq!(
             checked_cast_text_to_numeric("1e-10", false).unwrap(),
-            Value::Float(1e-10)
+            Value::from_f64(1e-10)
         );
         assert_eq!(
             checked_cast_text_to_numeric("-1e-10", false).unwrap(),
-            Value::Float(-1e-10)
+            Value::from_f64(-1e-10)
         );
         assert_eq!(
             checked_cast_text_to_numeric("1.123e10", false).unwrap(),
-            Value::Float(1.123e10)
+            Value::from_f64(1.123e10)
         );
         assert_eq!(
             checked_cast_text_to_numeric("-1.123e10", false).unwrap(),
-            Value::Float(-1.123e10)
+            Value::from_f64(-1.123e10)
         );
         assert_eq!(
             checked_cast_text_to_numeric("1.123e-10", false).unwrap(),
-            Value::Float(1.123e-10)
+            Value::from_f64(1.123e-10)
         );
         assert_eq!(
             checked_cast_text_to_numeric("-1.123-e-10", false).unwrap(),
-            Value::Float(-1.123)
+            Value::from_f64(-1.123)
         );
         assert_eq!(
             checked_cast_text_to_numeric("1-282584294928", false).unwrap(),
-            Value::Integer(1)
+            Value::from_i64(1)
         );
         assert_eq!(
             checked_cast_text_to_numeric("1.7976931348623157e309", false).unwrap(),
-            Value::Float(f64::INFINITY),
+            Value::from_f64(f64::INFINITY),
         );
         assert_eq!(
             checked_cast_text_to_numeric("-1.7976931348623157e308", false).unwrap(),
-            Value::Float(f64::MIN),
+            Value::from_f64(f64::MIN),
         );
         assert_eq!(
             checked_cast_text_to_numeric("-1.7976931348623157e309", false).unwrap(),
-            Value::Float(f64::NEG_INFINITY),
+            Value::from_f64(f64::NEG_INFINITY),
         );
         assert_eq!(
             checked_cast_text_to_numeric("1E", false).unwrap(),
-            Value::Float(1.0)
+            Value::from_f64(1.0)
         );
         assert_eq!(
             checked_cast_text_to_numeric("1EE", false).unwrap(),
-            Value::Float(1.0)
+            Value::from_f64(1.0)
         );
         assert_eq!(
             checked_cast_text_to_numeric("-1E", false).unwrap(),
-            Value::Float(-1.0)
+            Value::from_f64(-1.0)
         );
         assert_eq!(
             checked_cast_text_to_numeric("1.", false).unwrap(),
-            Value::Float(1.0)
+            Value::from_f64(1.0)
         );
         assert_eq!(
             checked_cast_text_to_numeric("-1.", false).unwrap(),
-            Value::Float(-1.0)
+            Value::from_f64(-1.0)
         );
         assert_eq!(
             checked_cast_text_to_numeric("1.23E", false).unwrap(),
-            Value::Float(1.23)
+            Value::from_f64(1.23)
         );
         assert_eq!(
             checked_cast_text_to_numeric(".1.23E-", false).unwrap(),
-            Value::Float(0.1)
+            Value::from_f64(0.1)
         );
         assert_eq!(
             checked_cast_text_to_numeric("0", false).unwrap(),
-            Value::Integer(0)
+            Value::from_i64(0)
         );
         assert_eq!(
             checked_cast_text_to_numeric("-0", false).unwrap(),
-            Value::Integer(0)
+            Value::from_i64(0)
         );
         assert_eq!(
             checked_cast_text_to_numeric("-0", false).unwrap(),
-            Value::Integer(0)
+            Value::from_i64(0)
         );
         assert_eq!(
             checked_cast_text_to_numeric("-0.0", false).unwrap(),
-            Value::Float(0.0)
+            Value::from_f64(0.0)
         );
         assert_eq!(
             checked_cast_text_to_numeric("0.0", false).unwrap(),
-            Value::Float(0.0)
+            Value::from_f64(0.0)
         );
         assert!(checked_cast_text_to_numeric("-", false).is_err());
     }
@@ -2410,152 +2506,152 @@ pub mod tests {
     fn test_text_to_numeric() {
         assert_eq!(
             checked_cast_text_to_numeric("1", false).unwrap(),
-            Value::Integer(1)
+            Value::from_i64(1)
         );
         assert_eq!(
             checked_cast_text_to_numeric("-1", false).unwrap(),
-            Value::Integer(-1)
+            Value::from_i64(-1)
         );
         assert_eq!(
             checked_cast_text_to_numeric("1823400-00000", false).unwrap(),
-            Value::Integer(1823400)
+            Value::from_i64(1823400)
         );
         assert_eq!(
             checked_cast_text_to_numeric("-10000000", false).unwrap(),
-            Value::Integer(-10000000)
+            Value::from_i64(-10000000)
         );
         assert_eq!(
             checked_cast_text_to_numeric("123xxx", false).unwrap(),
-            Value::Integer(123)
+            Value::from_i64(123)
         );
         assert_eq!(
             checked_cast_text_to_numeric("9223372036854775807", false).unwrap(),
-            Value::Integer(i64::MAX)
+            Value::from_i64(i64::MAX)
         );
         assert_eq!(
             checked_cast_text_to_numeric("9223372036854775808", false).unwrap(),
-            Value::Float(9.22337203685478e18)
+            Value::from_f64(9.22337203685478e18)
         ); // Exceeds i64, becomes float
         assert_eq!(
             checked_cast_text_to_numeric("-9223372036854775808", false).unwrap(),
-            Value::Integer(i64::MIN)
+            Value::from_i64(i64::MIN)
         );
         assert_eq!(
             checked_cast_text_to_numeric("-9223372036854775809", false).unwrap(),
-            Value::Float(-9.22337203685478e18)
+            Value::from_f64(-9.22337203685478e18)
         ); // Exceeds i64, becomes float
 
         assert_eq!(
             checked_cast_text_to_numeric("1.0", false).unwrap(),
-            Value::Float(1.0)
+            Value::from_f64(1.0)
         );
         assert_eq!(
             checked_cast_text_to_numeric("-1.0", false).unwrap(),
-            Value::Float(-1.0)
+            Value::from_f64(-1.0)
         );
         assert_eq!(
             checked_cast_text_to_numeric("1e10", false).unwrap(),
-            Value::Float(1e10)
+            Value::from_f64(1e10)
         );
         assert_eq!(
             checked_cast_text_to_numeric("-1e10", false).unwrap(),
-            Value::Float(-1e10)
+            Value::from_f64(-1e10)
         );
         assert_eq!(
             checked_cast_text_to_numeric("1e-10", false).unwrap(),
-            Value::Float(1e-10)
+            Value::from_f64(1e-10)
         );
         assert_eq!(
             checked_cast_text_to_numeric("-1e-10", false).unwrap(),
-            Value::Float(-1e-10)
+            Value::from_f64(-1e-10)
         );
         assert_eq!(
             checked_cast_text_to_numeric("1.123e10", false).unwrap(),
-            Value::Float(1.123e10)
+            Value::from_f64(1.123e10)
         );
         assert_eq!(
             checked_cast_text_to_numeric("-1.123e10", false).unwrap(),
-            Value::Float(-1.123e10)
+            Value::from_f64(-1.123e10)
         );
         assert_eq!(
             checked_cast_text_to_numeric("1.123e-10", false).unwrap(),
-            Value::Float(1.123e-10)
+            Value::from_f64(1.123e-10)
         );
         assert_eq!(
             checked_cast_text_to_numeric("-1.123-e-10", false).unwrap(),
-            Value::Float(-1.123)
+            Value::from_f64(-1.123)
         );
         assert_eq!(
             checked_cast_text_to_numeric("1-282584294928", false).unwrap(),
-            Value::Integer(1)
+            Value::from_i64(1)
         );
         assert!(checked_cast_text_to_numeric("xxx", false).is_err());
         assert_eq!(
             checked_cast_text_to_numeric("1.7976931348623157e309", false).unwrap(),
-            Value::Float(f64::INFINITY)
+            Value::from_f64(f64::INFINITY)
         );
         assert_eq!(
             checked_cast_text_to_numeric("-1.7976931348623157e308", false).unwrap(),
-            Value::Float(f64::MIN)
+            Value::from_f64(f64::MIN)
         );
         assert_eq!(
             checked_cast_text_to_numeric("-1.7976931348623157e309", false).unwrap(),
-            Value::Float(f64::NEG_INFINITY)
+            Value::from_f64(f64::NEG_INFINITY)
         );
 
         assert_eq!(
             checked_cast_text_to_numeric("1E", false).unwrap(),
-            Value::Float(1.0)
+            Value::from_f64(1.0)
         );
         assert_eq!(
             checked_cast_text_to_numeric("1EE", false).unwrap(),
-            Value::Float(1.0)
+            Value::from_f64(1.0)
         );
         assert_eq!(
             checked_cast_text_to_numeric("-1E", false).unwrap(),
-            Value::Float(-1.0)
+            Value::from_f64(-1.0)
         );
         assert_eq!(
             checked_cast_text_to_numeric("1.", false).unwrap(),
-            Value::Float(1.0)
+            Value::from_f64(1.0)
         );
         assert_eq!(
             checked_cast_text_to_numeric("-1.", false).unwrap(),
-            Value::Float(-1.0)
+            Value::from_f64(-1.0)
         );
         assert_eq!(
             checked_cast_text_to_numeric("1.23E", false).unwrap(),
-            Value::Float(1.23)
+            Value::from_f64(1.23)
         );
         assert_eq!(
             checked_cast_text_to_numeric("1.23E-", false).unwrap(),
-            Value::Float(1.23)
+            Value::from_f64(1.23)
         );
 
         assert_eq!(
             checked_cast_text_to_numeric("0", false).unwrap(),
-            Value::Integer(0)
+            Value::from_i64(0)
         );
         assert_eq!(
             checked_cast_text_to_numeric("-0", false).unwrap(),
-            Value::Integer(0)
+            Value::from_i64(0)
         );
         assert_eq!(
             checked_cast_text_to_numeric("-0.0", false).unwrap(),
-            Value::Float(0.0)
+            Value::from_f64(0.0)
         );
         assert_eq!(
             checked_cast_text_to_numeric("0.0", false).unwrap(),
-            Value::Float(0.0)
+            Value::from_f64(0.0)
         );
         assert!(checked_cast_text_to_numeric("-", false).is_err());
         assert_eq!(
             checked_cast_text_to_numeric("-e", false).unwrap(),
-            Value::Float(0.0)
+            Value::from_f64(0.0)
         );
         assert_eq!(
             checked_cast_text_to_numeric("-E", false).unwrap(),
-            Value::Float(0.0)
+            Value::from_f64(0.0)
         );
     }
 
@@ -2746,32 +2842,32 @@ pub mod tests {
     fn test_parse_numeric_literal_hex() {
         assert_eq!(
             parse_numeric_literal("0x1234").unwrap(),
-            Value::Integer(4660)
+            Value::from_i64(4660)
         );
         assert_eq!(
             parse_numeric_literal("0xFFFFFFFF").unwrap(),
-            Value::Integer(4294967295)
+            Value::from_i64(4294967295)
         );
         assert_eq!(
             parse_numeric_literal("0x7FFFFFFF").unwrap(),
-            Value::Integer(2147483647)
+            Value::from_i64(2147483647)
         );
         assert_eq!(
             parse_numeric_literal("0x7FFFFFFFFFFFFFFF").unwrap(),
-            Value::Integer(9223372036854775807)
+            Value::from_i64(9223372036854775807)
         );
         assert_eq!(
             parse_numeric_literal("0xFFFFFFFFFFFFFFFF").unwrap(),
-            Value::Integer(-1)
+            Value::from_i64(-1)
         );
         assert_eq!(
             parse_numeric_literal("0x8000000000000000").unwrap(),
-            Value::Integer(-9223372036854775808)
+            Value::from_i64(-9223372036854775808)
         );
 
         assert_eq!(
             parse_numeric_literal("-0x1234").unwrap(),
-            Value::Integer(-4660)
+            Value::from_i64(-4660)
         );
         // too big hex
         assert!(parse_numeric_literal("-0x8000000000000000").is_err());
@@ -2779,10 +2875,10 @@ pub mod tests {
 
     #[test]
     fn test_parse_numeric_literal_integer() {
-        assert_eq!(parse_numeric_literal("123").unwrap(), Value::Integer(123));
+        assert_eq!(parse_numeric_literal("123").unwrap(), Value::from_i64(123));
         assert_eq!(
             parse_numeric_literal("9_223_372_036_854_775_807").unwrap(),
-            Value::Integer(9223372036854775807)
+            Value::from_i64(9223372036854775807)
         );
     }
 
@@ -2790,29 +2886,38 @@ pub mod tests {
     fn test_parse_numeric_literal_float() {
         assert_eq!(
             parse_numeric_literal("123.456").unwrap(),
-            Value::Float(123.456)
+            Value::from_f64(123.456)
         );
-        assert_eq!(parse_numeric_literal(".123").unwrap(), Value::Float(0.123));
+        assert_eq!(
+            parse_numeric_literal(".123").unwrap(),
+            Value::from_f64(0.123)
+        );
         assert_eq!(
             parse_numeric_literal("1.23e10").unwrap(),
-            Value::Float(1.23e10)
+            Value::from_f64(1.23e10)
         );
-        assert_eq!(parse_numeric_literal("1e-10").unwrap(), Value::Float(1e-10));
+        assert_eq!(
+            parse_numeric_literal("1e-10").unwrap(),
+            Value::from_f64(1e-10)
+        );
         assert_eq!(
             parse_numeric_literal("1.23E+10").unwrap(),
-            Value::Float(1.23e10)
+            Value::from_f64(1.23e10)
         );
-        assert_eq!(parse_numeric_literal("1.1_1").unwrap(), Value::Float(1.11));
+        assert_eq!(
+            parse_numeric_literal("1.1_1").unwrap(),
+            Value::from_f64(1.11)
+        );
 
         // > i64::MAX, convert to float
         assert_eq!(
             parse_numeric_literal("9223372036854775808").unwrap(),
-            Value::Float(9.223_372_036_854_776e18)
+            Value::from_f64(9.223_372_036_854_776e18)
         );
         // < i64::MIN, convert to float
         assert_eq!(
             parse_numeric_literal("-9223372036854775809").unwrap(),
-            Value::Float(-9.223_372_036_854_776e18)
+            Value::from_f64(-9.223_372_036_854_776e18)
         );
     }
 
@@ -2857,41 +2962,55 @@ pub mod tests {
 
     #[test]
     fn test_checked_cast_text_to_numeric_lossless_property() {
-        use Value::*;
         assert_eq!(checked_cast_text_to_numeric("1.xx", true), Err(()));
         assert_eq!(checked_cast_text_to_numeric("abc", true), Err(()));
         assert_eq!(checked_cast_text_to_numeric("--5", true), Err(()));
         assert_eq!(checked_cast_text_to_numeric("12.34.56", true), Err(()));
         assert_eq!(checked_cast_text_to_numeric("", true), Err(()));
         assert_eq!(checked_cast_text_to_numeric(" ", true), Err(()));
-        assert_eq!(checked_cast_text_to_numeric("0", true), Ok(Integer(0)));
-        assert_eq!(checked_cast_text_to_numeric("42", true), Ok(Integer(42)));
-        assert_eq!(checked_cast_text_to_numeric("-42", true), Ok(Integer(-42)));
+        assert_eq!(
+            checked_cast_text_to_numeric("0", true),
+            Ok(Value::from_i64(0))
+        );
+        assert_eq!(
+            checked_cast_text_to_numeric("42", true),
+            Ok(Value::from_i64(42))
+        );
+        assert_eq!(
+            checked_cast_text_to_numeric("-42", true),
+            Ok(Value::from_i64(-42))
+        );
         assert_eq!(
             checked_cast_text_to_numeric("999999999999", true),
-            Ok(Integer(999_999_999_999))
+            Ok(Value::from_i64(999_999_999_999))
         );
-        assert_eq!(checked_cast_text_to_numeric("1.0", true), Ok(Float(1.0)));
+        assert_eq!(
+            checked_cast_text_to_numeric("1.0", true),
+            Ok(Value::from_f64(1.0))
+        );
         assert_eq!(
             checked_cast_text_to_numeric("-3.22", true),
-            Ok(Float(-3.22))
+            Ok(Value::from_f64(-3.22))
         );
         assert_eq!(
             checked_cast_text_to_numeric("0.001", true),
-            Ok(Float(0.001))
+            Ok(Value::from_f64(0.001))
         );
-        assert_eq!(checked_cast_text_to_numeric("2e3", true), Ok(Float(2000.0)));
+        assert_eq!(
+            checked_cast_text_to_numeric("2e3", true),
+            Ok(Value::from_f64(2000.0))
+        );
         assert_eq!(
             checked_cast_text_to_numeric("-5.5e-2", true),
-            Ok(Float(-0.055))
+            Ok(Value::from_f64(-0.055))
         );
         assert_eq!(
             checked_cast_text_to_numeric(" 123 ", true),
-            Ok(Integer(123))
+            Ok(Value::from_i64(123))
         );
         assert_eq!(
             checked_cast_text_to_numeric("\t-3.22\n", true),
-            Ok(Float(-3.22))
+            Ok(Value::from_f64(-3.22))
         );
     }
 
@@ -2916,11 +3035,42 @@ pub mod tests {
 
     #[test]
     fn test_cast_real_to_integer_limits() {
+        // Values that are exactly representable in f64 and strictly within i64 range
         let max_exact = ((1i64 << 51) - 1) as f64;
         assert_eq!(cast_real_to_integer(max_exact), Ok((1i64 << 51) - 1));
         assert_eq!(cast_real_to_integer(-max_exact), Ok(-((1i64 << 51) - 1)));
 
-        assert_eq!(cast_real_to_integer((1i64 << 51) as f64), Err(()));
+        // Values beyond 2^51 are valid if they round-trip correctly and are strictly within bounds
+        assert_eq!(cast_real_to_integer((1i64 << 51) as f64), Ok(1i64 << 51));
+        assert_eq!(cast_real_to_integer((1i64 << 52) as f64), Ok(1i64 << 52));
+
+        // 2^62 round-trips correctly and is strictly between i64::MIN and i64::MAX
+        assert_eq!(cast_real_to_integer((1i64 << 62) as f64), Ok(1i64 << 62));
+
+        // The original bug's value: 426601719749026560 should work
+        assert_eq!(
+            cast_real_to_integer(426601719749026560.0),
+            Ok(426601719749026560)
+        );
+
+        // SQLite rejects boundary values: i64::MIN and i64::MAX exactly
+        // (ix > SMALLEST_INT64 && ix < LARGEST_INT64 requires STRICT inequality)
         assert_eq!(cast_real_to_integer(i64::MIN as f64), Err(()));
+        assert_eq!(cast_real_to_integer(i64::MAX as f64), Err(()));
+
+        // Values at or beyond i64::MAX + 1 (2^63) should fail
+        assert_eq!(cast_real_to_integer(9223372036854775808.0), Err(()));
+
+        // Values below i64::MIN should fail
+        assert_eq!(cast_real_to_integer(-9223372036854777856.0), Err(()));
+
+        // Non-whole numbers should fail
+        assert_eq!(cast_real_to_integer(1.5), Err(()));
+        assert_eq!(cast_real_to_integer(-1.5), Err(()));
+
+        // Non-finite values should fail
+        assert_eq!(cast_real_to_integer(f64::INFINITY), Err(()));
+        assert_eq!(cast_real_to_integer(f64::NEG_INFINITY), Err(()));
+        assert_eq!(cast_real_to_integer(f64::NAN), Err(()));
     }
 }

@@ -11,6 +11,7 @@ pub use crate::json::ops::{
     jsonb_replace,
 };
 use crate::json::path::{json_path, JsonPath, PathElement};
+use crate::numeric::Numeric;
 use crate::types::{AsValueRef, Text, TextSubtype, Value, ValueType};
 use crate::{bail_constraint_error, bail_parse_error, LimboError, ValueRef};
 pub use cache::JsonCacheCell;
@@ -177,7 +178,8 @@ pub fn convert_ref_dbtype_to_jsonb(val: ValueRef<'_>, strict: Conv) -> crate::Re
         ValueRef::Null => Ok(Jsonb::from_raw_data(
             JsonbHeader::make_null().into_bytes().as_bytes(),
         )),
-        ValueRef::Float(float) => {
+        ValueRef::Numeric(Numeric::Float(float)) => {
+            let float: f64 = float.into();
             // Handle infinity for JSON compatibility with SQLite (#4196)
             if float.is_infinite() {
                 let json_str = if float.is_sign_negative() {
@@ -193,7 +195,7 @@ pub fn convert_ref_dbtype_to_jsonb(val: ValueRef<'_>, strict: Conv) -> crate::Re
                     .map_err(|_| LimboError::ParseError("malformed JSON".to_string()))
             }
         }
-        ValueRef::Integer(int) => Jsonb::from_str(&int.to_string())
+        ValueRef::Numeric(Numeric::Integer(int)) => Jsonb::from_str(&int.to_string())
             .map_err(|_| LimboError::ParseError("malformed JSON".to_string())),
     }
 }
@@ -258,7 +260,7 @@ pub fn json_array_length(
 
     if path.is_none() {
         let len = json.array_len()?;
-        return Ok(Value::Integer(len as i64));
+        return Ok(Value::from_i64(len as i64));
     }
 
     let path = json_path_from_db_value(path.expect("We already checked none"), true)?;
@@ -267,7 +269,7 @@ pub fn json_array_length(
         let mut op = SearchOperation::new(json.len() / 2);
         let _ = json.operate_on_path(&path, &mut op);
         if let Ok(len) = op.result().array_len() {
-            return Ok(Value::Integer(len as i64));
+            return Ok(Value::from_i64(len as i64));
         }
     }
     Ok(Value::Null)
@@ -584,24 +586,24 @@ pub fn json_string_to_db_type(
                     };
                     Ok(Value::Text(Text::json(simplified.to_string())))
                 }
-                Ok(float_val) => Ok(Value::Float(float_val)),
+                Ok(float_val) => Ok(Value::from_f64(float_val)),
                 Err(_) => Err(LimboError::Constraint("malformed JSON".to_string())),
             }
         }
         ElementType::INT | ElementType::INT5 => {
             let result = i64::from_str(&json_string);
             if let Ok(int) = result {
-                Ok(Value::Integer(int))
+                Ok(Value::from_i64(int))
             } else {
                 let res = f64::from_str(&json_string);
                 match res {
-                    Ok(num) => Ok(Value::Float(num)),
+                    Ok(num) => Ok(Value::from_f64(num)),
                     Err(_) => Err(LimboError::Constraint("malformed JSON".to_string())),
                 }
             }
         }
-        ElementType::TRUE => Ok(Value::Integer(1)),
-        ElementType::FALSE => Ok(Value::Integer(0)),
+        ElementType::TRUE => Ok(Value::from_i64(1)),
+        ElementType::FALSE => Ok(Value::from_i64(0)),
         ElementType::NULL => Ok(Value::Null),
         _ => unreachable!(),
     }
@@ -666,16 +668,16 @@ fn json_path_from_db_value<'a>(
                 }
             }
             ValueRef::Null => return Ok(None),
-            ValueRef::Integer(i) => JsonPath {
+            ValueRef::Numeric(Numeric::Integer(i)) => JsonPath {
                 elements: vec![
                     PathElement::Root(),
                     PathElement::ArrayLocator(Some(i as i32)),
                 ],
             },
-            ValueRef::Float(f) => JsonPath {
+            ValueRef::Numeric(Numeric::Float(f)) => JsonPath {
                 elements: vec![
                     PathElement::Root(),
-                    PathElement::Key(Cow::Owned(f.to_string()), false),
+                    PathElement::Key(Cow::Owned(f64::from(f).to_string()), false),
                 ],
             },
             _ => crate::bail_constraint_error!("JSON path error near: {:?}", path.to_string()),
@@ -688,11 +690,11 @@ fn json_path_from_db_value<'a>(
 pub fn json_error_position(json: impl AsValueRef) -> crate::Result<Value> {
     match json.as_value_ref() {
         ValueRef::Text(t) => match Jsonb::from_str(t.as_str()) {
-            Ok(_) => Ok(Value::Integer(0)),
+            Ok(_) => Ok(Value::from_i64(0)),
             Err(JsonError::Message { location, .. }) => {
                 if let Some(loc) = location {
                     let one_indexed = loc + 1;
-                    Ok(Value::Integer(one_indexed as i64))
+                    Ok(Value::from_i64(one_indexed as i64))
                 } else {
                     Err(crate::error::LimboError::InternalError(
                         "failed to determine json error position".into(),
@@ -704,7 +706,7 @@ pub fn json_error_position(json: impl AsValueRef) -> crate::Result<Value> {
             bail_parse_error!("Unsupported")
         }
         ValueRef::Null => Ok(Value::Null),
-        _ => Ok(Value::Integer(0)),
+        _ => Ok(Value::from_i64(0)),
     }
 }
 
@@ -791,16 +793,16 @@ where
     json_string_to_db_type(json, ElementType::OBJECT, OutputVariant::Binary)
 }
 
-/// Tries to convert the value to jsonb. Returns Value::Integer(1) if it the conversion
-/// succeeded, and Value::Integer(0) if it didn't.
+/// Tries to convert the value to jsonb. Returns Value::from_i64(1) if the conversion
+/// succeeded, and Value::from_i64(0) if it didn't.
 pub fn is_json_valid(json_value: impl AsValueRef) -> Value {
     let json_value = json_value.as_value_ref();
     if matches!(json_value, ValueRef::Null) {
         return Value::Null;
     }
     convert_dbtype_to_jsonb(json_value, Conv::Strict)
-        .map(|_| Value::Integer(1))
-        .unwrap_or(Value::Integer(0))
+        .map(|_| Value::from_i64(1))
+        .unwrap_or_else(|_| Value::from_i64(0))
 }
 
 pub fn json_quote(value: impl AsValueRef) -> crate::Result<Value> {
@@ -831,8 +833,7 @@ pub fn json_quote(value: impl AsValueRef) -> crate::Result<Value> {
             Ok(Value::build_text(escaped_value))
         }
         // Numbers are unquoted in json
-        ValueRef::Integer(int) => Ok(Value::Integer(int)),
-        ValueRef::Float(float) => Ok(Value::Float(float)),
+        ValueRef::Numeric(n @ (Numeric::Integer(_) | Numeric::Float(_))) => Ok(Value::Numeric(n)),
         ValueRef::Blob(_) => crate::bail_constraint_error!("JSON cannot hold BLOB values"),
         ValueRef::Null => Ok(Value::build_text("null")),
     }
@@ -841,6 +842,7 @@ pub fn json_quote(value: impl AsValueRef) -> crate::Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::numeric::Numeric;
     use crate::types::Value;
 
     #[test]
@@ -963,7 +965,7 @@ mod tests {
     fn test_json_array_simple() {
         let text = Value::build_text("value1");
         let json = Value::Text(Text::json("\"value2\"".to_string()));
-        let input = [text, json, Value::Integer(1), Value::Float(1.1)];
+        let input = [text, json, Value::from_i64(1), Value::from_f64(1.1)];
 
         let result = json_array(&input).unwrap();
         if let Value::Text(res) = result {
@@ -976,9 +978,9 @@ mod tests {
 
     #[test]
     fn test_json_array_with_infinity() {
-        let infinity = Value::Float(f64::INFINITY);
-        let neg_infinity = Value::Float(f64::NEG_INFINITY);
-        let input = [Value::Integer(1), infinity, neg_infinity];
+        let infinity = Value::from_f64(f64::INFINITY);
+        let neg_infinity = Value::from_f64(f64::NEG_INFINITY);
+        let input = [Value::from_i64(1), infinity, neg_infinity];
 
         let result = json_array(&input).unwrap();
         if let Value::Text(res) = result {
@@ -991,7 +993,7 @@ mod tests {
 
     #[test]
     fn test_json_object_with_infinity() {
-        let infinity = Value::Float(f64::INFINITY);
+        let infinity = Value::from_f64(f64::INFINITY);
         let key = Value::build_text("k");
         let input = [key, infinity];
 
@@ -1006,7 +1008,7 @@ mod tests {
 
     #[test]
     fn test_json_object_with_negative_infinity() {
-        let neg_infinity = Value::Float(f64::NEG_INFINITY);
+        let neg_infinity = Value::from_f64(f64::NEG_INFINITY);
         let key = Value::build_text("k");
         let input = [key, neg_infinity];
 
@@ -1021,7 +1023,7 @@ mod tests {
 
     #[test]
     fn test_json_with_infinity() {
-        let infinity = Value::Float(f64::INFINITY);
+        let infinity = Value::from_f64(f64::INFINITY);
         let result = get_json(&infinity, None).unwrap();
         if let Value::Text(res) = result {
             assert_eq!(res.as_str(), "9e999");
@@ -1033,7 +1035,7 @@ mod tests {
 
     #[test]
     fn test_json_with_negative_infinity() {
-        let neg_infinity = Value::Float(f64::NEG_INFINITY);
+        let neg_infinity = Value::from_f64(f64::NEG_INFINITY);
         let result = get_json(&neg_infinity, None).unwrap();
         if let Value::Text(res) = result {
             assert_eq!(res.as_str(), "-9e999");
@@ -1075,10 +1077,10 @@ mod tests {
         let input = Value::build_text("[1,2,3,4]");
         let json_cache = JsonCacheCell::new();
         let result = json_array_length(&input, None, &json_cache).unwrap();
-        if let Value::Integer(res) = result {
+        if let Value::Numeric(Numeric::Integer(res)) = result {
             assert_eq!(res, 4);
         } else {
-            panic!("Expected Value::Integer");
+            panic!("Expected Value::Numeric(Numeric::Integer)");
         }
     }
 
@@ -1087,10 +1089,10 @@ mod tests {
         let input = Value::build_text("[]");
         let json_cache = JsonCacheCell::new();
         let result = json_array_length(&input, None, &json_cache).unwrap();
-        if let Value::Integer(res) = result {
+        if let Value::Numeric(Numeric::Integer(res)) = result {
             assert_eq!(res, 0);
         } else {
-            panic!("Expected Value::Integer");
+            panic!("Expected Value::Numeric(Numeric::Integer)");
         }
     }
 
@@ -1099,10 +1101,10 @@ mod tests {
         let input = Value::build_text("[1,2,3,4]");
         let json_cache = JsonCacheCell::new();
         let result = json_array_length(&input, Some(&Value::build_text("$")), &json_cache).unwrap();
-        if let Value::Integer(res) = result {
+        if let Value::Numeric(Numeric::Integer(res)) = result {
             assert_eq!(res, 4);
         } else {
-            panic!("Expected Value::Integer");
+            panic!("Expected Value::Numeric(Numeric::Integer)");
         }
     }
 
@@ -1111,10 +1113,10 @@ mod tests {
         let input = Value::build_text("{one: [1,2,3,4]}");
         let json_cache = JsonCacheCell::new();
         let result = json_array_length(&input, None, &json_cache).unwrap();
-        if let Value::Integer(res) = result {
+        if let Value::Numeric(Numeric::Integer(res)) = result {
             assert_eq!(res, 0);
         } else {
-            panic!("Expected Value::Integer");
+            panic!("Expected Value::Numeric(Numeric::Integer)");
         }
     }
 
@@ -1124,10 +1126,10 @@ mod tests {
         let json_cache = JsonCacheCell::new();
         let result =
             json_array_length(&input, Some(&Value::build_text("$.one")), &json_cache).unwrap();
-        if let Value::Integer(res) = result {
+        if let Value::Numeric(Numeric::Integer(res)) = result {
             assert_eq!(res, 4);
         } else {
-            panic!("Expected Value::Integer");
+            panic!("Expected Value::Numeric(Numeric::Integer)");
         }
     }
 
@@ -1137,10 +1139,10 @@ mod tests {
         let json_cache = JsonCacheCell::new();
         let result =
             json_array_length(&input, Some(&Value::build_text("$[0]")), &json_cache).unwrap();
-        if let Value::Integer(res) = result {
+        if let Value::Numeric(Numeric::Integer(res)) = result {
             assert_eq!(res, 4);
         } else {
-            panic!("Expected Value::Integer");
+            panic!("Expected Value::Numeric(Numeric::Integer)");
         }
     }
 
@@ -1150,10 +1152,10 @@ mod tests {
         let json_cache = JsonCacheCell::new();
         let result =
             json_array_length(&input, Some(&Value::build_text("$[2]")), &json_cache).unwrap();
-        if let Value::Integer(res) = result {
+        if let Value::Numeric(Numeric::Integer(res)) = result {
             assert_eq!(res, 0);
         } else {
-            panic!("Expected Value::Integer");
+            panic!("Expected Value::Numeric(Numeric::Integer)");
         }
     }
 
@@ -1173,10 +1175,10 @@ mod tests {
         let wrapped = get_json(&input, None).unwrap();
         let result = json_array_length(&wrapped, None, &json_cache).unwrap();
 
-        if let Value::Integer(res) = result {
+        if let Value::Numeric(Numeric::Integer(res)) = result {
             assert_eq!(res, 3);
         } else {
-            panic!("Expected Value::Integer");
+            panic!("Expected Value::Numeric(Numeric::Integer)");
         }
     }
 
@@ -1210,7 +1212,7 @@ mod tests {
         let json_cache = JsonCacheCell::new();
         let result = json_extract(
             Value::build_text("{\"a\":2}"),
-            &[Value::Float(1.1)],
+            &[Value::from_f64(1.1)],
             &json_cache,
         );
 
@@ -1224,28 +1226,28 @@ mod tests {
     fn test_json_error_position_no_error() {
         let input = Value::build_text("[1,2,3]");
         let result = json_error_position(&input).unwrap();
-        assert_eq!(result, Value::Integer(0));
+        assert_eq!(result, Value::from_i64(0));
     }
 
     #[test]
     fn test_json_error_position_no_error_more() {
         let input = Value::build_text(r#"{"a":55,"b":72 , }"#);
         let result = json_error_position(&input).unwrap();
-        assert_eq!(result, Value::Integer(0));
+        assert_eq!(result, Value::from_i64(0));
     }
 
     #[test]
     fn test_json_error_position_object() {
         let input = Value::build_text(r#"{"a":55,"b":72,,}"#);
         let result = json_error_position(&input).unwrap();
-        assert_eq!(result, Value::Integer(16));
+        assert_eq!(result, Value::from_i64(16));
     }
 
     #[test]
     fn test_json_error_position_array() {
         let input = Value::build_text(r#"["a",55,"b",72,,]"#);
         let result = json_error_position(&input).unwrap();
-        assert_eq!(result, Value::Integer(16));
+        assert_eq!(result, Value::from_i64(16));
     }
 
     #[test]
@@ -1257,16 +1259,16 @@ mod tests {
 
     #[test]
     fn test_json_error_position_integer() {
-        let input = Value::Integer(5);
+        let input = Value::from_i64(5);
         let result = json_error_position(&input).unwrap();
-        assert_eq!(result, Value::Integer(0));
+        assert_eq!(result, Value::from_i64(0));
     }
 
     #[test]
     fn test_json_error_position_float() {
-        let input = Value::Float(-5.5);
+        let input = Value::from_f64(-5.5);
         let result = json_error_position(&input).unwrap();
-        assert_eq!(result, Value::Integer(0));
+        assert_eq!(result, Value::from_i64(0));
     }
 
     #[test]
@@ -1289,9 +1291,9 @@ mod tests {
         let json_key = Value::build_text("json_key");
         let json_value = Value::Text(Text::json(r#"{"json":"value","number":1}"#.to_string()));
         let integer_key = Value::build_text("integer_key");
-        let integer_value = Value::Integer(1);
+        let integer_value = Value::from_i64(1);
         let float_key = Value::build_text("float_key");
-        let float_value = Value::Float(1.1);
+        let float_value = Value::from_f64(1.1);
         let null_key = Value::build_text("null_key");
         let null_value = Value::Null;
 
@@ -1388,7 +1390,7 @@ mod tests {
 
     #[test]
     fn test_json_object_non_text_key() {
-        let key = Value::Integer(1);
+        let key = Value::from_i64(1);
         let value = Value::build_text("value");
         let input = [key, value];
 
@@ -1498,13 +1500,13 @@ mod tests {
 
     #[test]
     fn test_json_path_from_db_value_integer_strict() {
-        let path = Value::Integer(3);
+        let path = Value::from_i64(3);
         assert!(json_path_from_db_value(&path, true).is_err());
     }
 
     #[test]
     fn test_json_path_from_db_value_integer_non_strict() {
-        let path = Value::Integer(3);
+        let path = Value::from_i64(3);
 
         let result = json_path_from_db_value(&path, false);
         assert!(result.is_ok());
@@ -1543,14 +1545,14 @@ mod tests {
 
     #[test]
     fn test_json_path_from_db_value_float_strict() {
-        let path = Value::Float(1.23);
+        let path = Value::from_f64(1.23);
 
         assert!(json_path_from_db_value(&path, true).is_err());
     }
 
     #[test]
     fn test_json_path_from_db_value_float_non_strict() {
-        let path = Value::Float(1.23);
+        let path = Value::from_f64(1.23);
 
         let result = json_path_from_db_value(&path, false);
         assert!(result.is_ok());
@@ -1646,7 +1648,7 @@ mod tests {
             &[
                 Value::build_text("{}"),
                 Value::build_text("$.some_array[0]"),
-                Value::Integer(123),
+                Value::from_i64(123),
             ],
             &json_cache,
         );
@@ -1666,7 +1668,7 @@ mod tests {
             &[
                 Value::build_text("[123]"),
                 Value::build_text("$[1]"),
-                Value::Integer(456),
+                Value::from_i64(456),
             ],
             &json_cache,
         );
@@ -1683,7 +1685,7 @@ mod tests {
             &[
                 Value::build_text("[123]"),
                 Value::build_text("$[200]"),
-                Value::Integer(456),
+                Value::from_i64(456),
             ],
             &json_cache,
         );
@@ -1700,7 +1702,7 @@ mod tests {
             &[
                 Value::build_text("[123]"),
                 Value::build_text("$[0]"),
-                Value::Integer(456),
+                Value::from_i64(456),
             ],
             &json_cache,
         );
@@ -1714,7 +1716,7 @@ mod tests {
     fn test_json_set_null_path() {
         let json_cache = JsonCacheCell::new();
         let result = json_set(
-            &[Value::build_text("{}"), Value::Null, Value::Integer(456)],
+            &[Value::build_text("{}"), Value::Null, Value::from_i64(456)],
             &json_cache,
         );
 
@@ -1730,9 +1732,9 @@ mod tests {
             &[
                 Value::build_text("[123]"),
                 Value::build_text("$[0]"),
-                Value::Integer(456),
+                Value::from_i64(456),
                 Value::build_text("$[1]"),
-                Value::Integer(789),
+                Value::from_i64(789),
             ],
             &json_cache,
         );
@@ -1749,7 +1751,7 @@ mod tests {
             &[
                 Value::build_text("{}"),
                 Value::build_text("$.object[0].field"),
-                Value::Integer(123),
+                Value::from_i64(123),
             ],
             &json_cache,
         );
@@ -1769,7 +1771,7 @@ mod tests {
             &[
                 Value::build_text("{}"),
                 Value::build_text("$.object[0][0]"),
-                Value::Integer(123),
+                Value::from_i64(123),
             ],
             &json_cache,
         );

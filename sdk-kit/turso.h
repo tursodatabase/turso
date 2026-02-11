@@ -270,7 +270,10 @@ int64_t turso_statement_row_value_int(const turso_statement_t *self, size_t inde
  */
 double turso_statement_row_value_double(const turso_statement_t *self, size_t index);
 
-/** Return named argument position in a statement */
+/** Return named argument position in a statement
+    Return positive integer with 1-indexed position if named parameter was found
+    Return -1 if parameter was not found
+*/
 int64_t turso_statement_named_position(
     const turso_statement_t *self,
     /* zero-terminated C string */

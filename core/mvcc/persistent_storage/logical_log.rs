@@ -202,7 +202,6 @@ impl LogicalLog {
         // 5. Write to disk
         let buffer = Arc::new(Buffer::new(buffer));
         let c = Completion::new_write({
-            let buffer = buffer.clone();
             let buffer_len = buffer.len();
             move |res: Result<i32, CompletionError>| {
                 let Ok(bytes_written) = res else {
@@ -676,14 +675,14 @@ mod tests {
             let conn = db.connect();
             let pager = conn.pager.load().clone();
             let mvcc_store = db.get_mvcc_store();
-            let tx_id = mvcc_store.begin_tx(pager.clone()).unwrap();
+            let tx_id = mvcc_store.begin_tx(pager).unwrap();
             // insert table id -2 into sqlite_schema table (table_id -1)
             let data = ImmutableRecord::from_values(
                 &[
                     Value::Text(Text::new("table")), // type
                     Value::Text(Text::new("test")),  // name
                     Value::Text(Text::new("test")),  // tbl_name
-                    Value::Integer(-2),              // rootpage
+                    Value::from_i64(-2),             // rootpage
                     Value::Text(Text::new(
                         "CREATE TABLE test(id INTEGER PRIMARY KEY, data TEXT)",
                     )), // sql
@@ -703,7 +702,7 @@ mod tests {
             // now insert a row into table -2
             let row = generate_simple_string_row((-2).into(), 1, "foo");
             mvcc_store.insert(tx_id, row).unwrap();
-            commit_tx(mvcc_store.clone(), &conn, tx_id).unwrap();
+            commit_tx(mvcc_store, &conn, tx_id).unwrap();
         }
 
         // Restart the database to trigger recovery
@@ -713,7 +712,7 @@ mod tests {
         let conn = db.connect();
         let pager = conn.pager.load().clone();
         let mvcc_store = db.get_mvcc_store();
-        let tx = mvcc_store.begin_tx(pager.clone()).unwrap();
+        let tx = mvcc_store.begin_tx(pager).unwrap();
         let row = mvcc_store
             .read(tx, RowID::new((-2).into(), RowKey::Int(1)))
             .unwrap()
@@ -750,7 +749,7 @@ mod tests {
                     Value::Text(Text::new("table")), // type
                     Value::Text(Text::new("test")),  // name
                     Value::Text(Text::new("test")),  // tbl_name
-                    Value::Integer(-2),              // rootpage
+                    Value::from_i64(-2),             // rootpage
                     Value::Text(Text::new(
                         "CREATE TABLE test(id INTEGER PRIMARY KEY, data TEXT)",
                     )), // sql
@@ -859,7 +858,7 @@ mod tests {
                     Value::Text(Text::new("table")), // type
                     Value::Text(Text::new("test")),  // name
                     Value::Text(Text::new("test")),  // tbl_name
-                    Value::Integer(-2),              // rootpage
+                    Value::from_i64(-2),             // rootpage
                     Value::Text(Text::new(
                         "CREATE TABLE test(id INTEGER PRIMARY KEY, data TEXT)",
                     )), // sql
@@ -923,7 +922,7 @@ mod tests {
         }
 
         // Check rowids that were deleted
-        let tx = mvcc_store.begin_tx(pager.clone()).unwrap();
+        let tx = mvcc_store.begin_tx(pager).unwrap();
         for present_rowid in non_present_rowids {
             let row = mvcc_store.read(tx, present_rowid.clone()).unwrap();
             assert!(
@@ -976,7 +975,7 @@ mod tests {
         let index_info = Arc::new(IndexInfo::new_from_index(index));
 
         // Verify table rows can be read
-        let tx = mvcc_store.begin_tx(pager.clone()).unwrap();
+        let tx = mvcc_store.begin_tx(pager).unwrap();
         for (row_id, expected_data) in [(1, "foo"), (2, "bar"), (3, "baz")] {
             let row = mvcc_store
                 .read(tx, RowID::new((-2).into(), RowKey::Int(row_id)))
@@ -1000,7 +999,7 @@ mod tests {
             let key_record = ImmutableRecord::from_values(
                 &[
                     Value::Text(Text::new(data_value.to_string())),
-                    Value::Integer(row_id),
+                    Value::from_i64(row_id),
                 ],
                 2,
             );
@@ -1034,7 +1033,8 @@ mod tests {
                 panic!("First index column should be text");
             };
             assert_eq!(index_data.as_str(), data_value, "Index data should match");
-            let ValueRef::Integer(index_rowid_val) = values[1] else {
+            let ValueRef::Numeric(crate::numeric::Numeric::Integer(index_rowid_val)) = values[1]
+            else {
                 panic!("Second index column should be integer (rowid)");
             };
             assert_eq!(index_rowid_val, row_id, "Index rowid should match");

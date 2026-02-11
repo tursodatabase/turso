@@ -261,3 +261,80 @@ expect {
     20|2
 }
 
+test drop-column-removes-check-constraint {
+    CREATE TABLE t_check (a INTEGER PRIMARY KEY, b REAL CHECK (b BETWEEN 0.0 AND 1000.0), c INTEGER NOT NULL);
+    INSERT INTO t_check VALUES (1, 500.0, 42);
+    ALTER TABLE t_check DROP COLUMN b;
+    INSERT INTO t_check VALUES (2, 99);
+    SELECT * FROM t_check;
+}
+expect {
+    1|42
+    2|99
+}
+
+test fail-drop-column-table-level-check-constraint {
+    CREATE TABLE t_check2 (a INTEGER PRIMARY KEY, b INTEGER, c TEXT, CHECK (b > 0));
+    ALTER TABLE t_check2 DROP COLUMN b;
+}
+expect error {
+    error in table t_check2 after drop column: no such column: b
+}
+
+@requires strict "uses STRICT tables"
+test strict-alter-add-column-invalid-varchar {
+    CREATE TABLE t(a INTEGER) STRICT;
+    ALTER TABLE t ADD COLUMN b VARCHAR(100);
+}
+expect error {
+}
+
+@requires strict "uses STRICT tables"
+test strict-alter-add-column-invalid-datetime {
+    CREATE TABLE t(a INTEGER) STRICT;
+    ALTER TABLE t ADD COLUMN b DATETIME;
+}
+expect error {
+}
+
+@requires strict "uses STRICT tables"
+test strict-alter-add-column-no-type {
+    CREATE TABLE t(a INTEGER) STRICT;
+    ALTER TABLE t ADD COLUMN b;
+}
+expect error {
+}
+
+@requires strict "uses STRICT tables"
+test strict-alter-add-column-integer {
+    CREATE TABLE t(a INTEGER) STRICT;
+    ALTER TABLE t ADD COLUMN b INTEGER;
+    INSERT INTO t VALUES(1, 42);
+    SELECT a, b FROM t;
+}
+expect {
+    1|42
+}
+
+@requires strict "uses STRICT tables"
+test strict-alter-add-column-text {
+    CREATE TABLE t(a INTEGER) STRICT;
+    ALTER TABLE t ADD COLUMN b TEXT;
+    INSERT INTO t VALUES(1, 'hello');
+    SELECT a, b FROM t;
+}
+expect {
+    1|hello
+}
+
+@requires strict "uses STRICT tables"
+test strict-alter-add-column-any {
+    CREATE TABLE t(a INTEGER) STRICT;
+    ALTER TABLE t ADD COLUMN b ANY;
+    INSERT INTO t VALUES(1, 3.14);
+    SELECT a, b FROM t;
+}
+expect {
+    1|3.14
+}
+

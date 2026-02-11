@@ -41,7 +41,7 @@ fn test_deferred_transaction_restart(tmp_db: TempDatabase) {
     let mut stmt = conn1.query("SELECT COUNT(*) FROM test").unwrap().unwrap();
     if let StepResult::Row = stmt.step().unwrap() {
         let row = stmt.row().unwrap();
-        assert_eq!(*row.get::<&Value>(0).unwrap(), Value::Integer(2));
+        assert_eq!(*row.get::<&Value>(0).unwrap(), Value::from_i64(2));
     }
 }
 
@@ -70,7 +70,7 @@ fn test_deferred_transaction_no_restart(tmp_db: TempDatabase) {
     let mut stmt = conn2.query("SELECT COUNT(*) FROM test").unwrap().unwrap();
     if let StepResult::Row = stmt.step().unwrap() {
         let row = stmt.row().unwrap();
-        assert_eq!(*row.get::<&Value>(0).unwrap(), Value::Integer(0));
+        assert_eq!(*row.get::<&Value>(0).unwrap(), Value::from_i64(0));
     }
 
     conn1
@@ -101,7 +101,7 @@ fn test_deferred_transaction_no_restart(tmp_db: TempDatabase) {
     let mut stmt = conn1.query("SELECT COUNT(*) FROM test").unwrap().unwrap();
     if let StepResult::Row = stmt.step().unwrap() {
         let row = stmt.row().unwrap();
-        assert_eq!(*row.get::<&Value>(0).unwrap(), Value::Integer(2));
+        assert_eq!(*row.get::<&Value>(0).unwrap(), Value::from_i64(2));
     }
 }
 
@@ -121,7 +121,7 @@ fn test_txn_error_doesnt_rollback_txn(tmp_db: TempDatabase) -> Result<()> {
     let mut stmt = conn.query("select sum(x) from t")?.unwrap();
     if let StepResult::Row = stmt.step()? {
         let row = stmt.row().unwrap();
-        assert_eq!(*row.get::<&Value>(0).unwrap(), Value::Integer(2));
+        assert_eq!(*row.get::<&Value>(0).unwrap(), Value::from_i64(2));
     }
 
     Ok(())
@@ -144,7 +144,7 @@ fn test_transaction_visibility(tmp_db: TempDatabase) {
 
     let mut stmt = conn2.query("SELECT COUNT(*) FROM test").unwrap().unwrap();
     stmt.run_with_row_callback(|row| {
-        assert_eq!(*row.get::<&Value>(0).unwrap(), Value::Integer(1));
+        assert_eq!(*row.get::<&Value>(0).unwrap(), Value::from_i64(1));
         Ok(())
     })
     .unwrap();
@@ -155,7 +155,7 @@ fn test_transaction_visibility(tmp_db: TempDatabase) {
 
     let mut stmt = conn2.query("SELECT COUNT(*) FROM test2").unwrap().unwrap();
     stmt.run_with_row_callback(|row| {
-        assert_eq!(*row.get::<&Value>(0).unwrap(), Value::Integer(0));
+        assert_eq!(*row.get::<&Value>(0).unwrap(), Value::from_i64(0));
         Ok(())
     })
     .unwrap();
@@ -192,9 +192,9 @@ fn test_constraint_error_aborts_only_stmt_not_entire_transaction(tmp_db: TempDat
     assert_eq!(
         rows,
         vec![
-            vec![Value::Integer(1)],
-            vec![Value::Integer(2)],
-            vec![Value::Integer(4)]
+            vec![Value::from_i64(1)],
+            vec![Value::from_i64(2)],
+            vec![Value::from_i64(4)]
         ]
     );
 }
@@ -226,7 +226,7 @@ fn test_deferred_fk_violation_rollback_in_autocommit(tmp_db: TempDatabase) {
     // Verify that the child table is empty (the insert was rolled back)
     let stmt = conn.query("SELECT COUNT(*) FROM child").unwrap().unwrap();
     let row = helper_read_single_row(stmt);
-    assert_eq!(row, vec![Value::Integer(0)]);
+    assert_eq!(row, vec![Value::from_i64(0)]);
 }
 
 #[turso_macros::test(mvcc)]
@@ -285,7 +285,7 @@ fn test_mvcc_transactions_deferred(tmp_db: TempDatabase) {
     let mut stmt = conn1.query("SELECT COUNT(*) FROM test").unwrap().unwrap();
     if let StepResult::Row = stmt.step().unwrap() {
         let row = stmt.row().unwrap();
-        assert_eq!(*row.get::<&Value>(0).unwrap(), Value::Integer(2));
+        assert_eq!(*row.get::<&Value>(0).unwrap(), Value::from_i64(2));
     }
 }
 
@@ -306,7 +306,7 @@ fn test_mvcc_insert_select_basic(tmp_db: TempDatabase) {
         .unwrap()
         .unwrap();
     let row = helper_read_single_row(stmt);
-    assert_eq!(row, vec![Value::Integer(1), Value::build_text("first")]);
+    assert_eq!(row, vec![Value::from_i64(1), Value::build_text("first")]);
 }
 
 #[turso_macros::test(mvcc)]
@@ -368,8 +368,8 @@ fn test_mvcc_concurrent_insert_basic() {
     assert_eq!(
         rows,
         vec![
-            vec![Value::Integer(1), Value::build_text("first")],
-            vec![Value::Integer(2), Value::build_text("second")],
+            vec![Value::from_i64(1), Value::build_text("first")],
+            vec![Value::from_i64(2), Value::build_text("second")],
         ]
     );
 }
@@ -534,7 +534,7 @@ fn test_mvcc_checkpoint_works() {
     // Build expected results
     let expected: Vec<Vec<Value>> = expected_rows
         .into_iter()
-        .map(|(id, value)| vec![Value::Integer(id as i64), Value::build_text(value)])
+        .map(|(id, value)| vec![Value::from_i64(id as i64), Value::build_text(value)])
         .collect();
 
     assert_eq!(rows, expected);
@@ -641,7 +641,7 @@ fn test_mvcc_recovery_of_both_checkpointed_and_noncheckpointed_tables_works() {
 
     let expected1: Vec<Vec<Value>> = expected_rows1
         .into_iter()
-        .map(|(id, value)| vec![Value::Integer(id as i64), Value::Integer(value as i64)])
+        .map(|(id, value)| vec![Value::from_i64(id as i64), Value::from_i64(value as i64)])
         .collect();
 
     assert_eq!(rows, expected1);
@@ -654,7 +654,7 @@ fn test_mvcc_recovery_of_both_checkpointed_and_noncheckpointed_tables_works() {
 
     let expected2: Vec<Vec<Value>> = expected_rows2
         .into_iter()
-        .map(|(id, value)| vec![Value::Integer(id as i64), Value::Integer(value as i64)])
+        .map(|(id, value)| vec![Value::from_i64(id as i64), Value::from_i64(value as i64)])
         .collect();
 
     assert_eq!(rows, expected2);
@@ -690,7 +690,7 @@ fn test_non_mvcc_to_mvcc() {
     let rows = helper_read_all_rows(stmt);
 
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0][0], Value::Integer(1));
+    assert_eq!(rows[0][0], Value::from_i64(1));
     assert_eq!(rows[0][1], Value::Text("hello".into()));
 }
 
@@ -719,7 +719,7 @@ fn verify_table_contents(conn: &Arc<Connection>, expected: Vec<i64>) {
     let rows = helper_read_all_rows(stmt);
     let expected_values: Vec<Vec<Value>> = expected
         .into_iter()
-        .map(|x| vec![Value::Integer(x)])
+        .map(|x| vec![Value::from_i64(x)])
         .collect();
     assert_eq!(rows, expected_values);
 }
@@ -758,9 +758,9 @@ fn test_mvcc_recovery_with_index_and_deletes() {
     assert_eq!(
         rows,
         vec![
-            vec![Value::Integer(1)],
-            vec![Value::Integer(3)],
-            vec![Value::Integer(5)],
+            vec![Value::from_i64(1)],
+            vec![Value::from_i64(3)],
+            vec![Value::from_i64(5)],
         ]
     );
 }
@@ -1197,7 +1197,7 @@ fn test_mvcc_dual_seek_interleaved_rows() {
     assert_eq!(rows.len(), 10);
     for (i, row) in rows.iter().enumerate() {
         let expected_x = (i + 1) as i64;
-        assert_eq!(row[0], Value::Integer(expected_x));
+        assert_eq!(row[0], Value::from_i64(expected_x));
         let expected_source = if expected_x % 2 == 1 { "btree" } else { "mvcc" };
         assert_eq!(
             row[1],
@@ -1273,10 +1273,10 @@ fn test_mvcc_dual_seek_index_basic() {
     assert_eq!(
         rows,
         vec![
-            vec![Value::Integer(4)],
-            vec![Value::Integer(5)],
-            vec![Value::Integer(6)],
-            vec![Value::Integer(7)],
+            vec![Value::from_i64(4)],
+            vec![Value::from_i64(5)],
+            vec![Value::from_i64(6)],
+            vec![Value::from_i64(7)],
         ]
     );
 }
@@ -1334,11 +1334,11 @@ fn test_mvcc_dual_seek_with_update() {
     assert_eq!(
         rows,
         vec![
-            vec![Value::Integer(1), Value::build_text("original_1")],
-            vec![Value::Integer(2), Value::build_text("original_2")],
-            vec![Value::Integer(3), Value::build_text("updated_3")],
-            vec![Value::Integer(4), Value::build_text("original_4")],
-            vec![Value::Integer(5), Value::build_text("original_5")],
+            vec![Value::from_i64(1), Value::build_text("original_1")],
+            vec![Value::from_i64(2), Value::build_text("original_2")],
+            vec![Value::from_i64(3), Value::build_text("updated_3")],
+            vec![Value::from_i64(4), Value::build_text("original_4")],
+            vec![Value::from_i64(5), Value::build_text("original_5")],
         ]
     );
 }
@@ -1392,10 +1392,10 @@ fn test_mvcc_dual_seek_with_delete() {
     assert_eq!(
         rows,
         vec![
-            vec![Value::Integer(1)],
-            vec![Value::Integer(2)],
-            vec![Value::Integer(4)],
-            vec![Value::Integer(5)],
+            vec![Value::from_i64(1)],
+            vec![Value::from_i64(2)],
+            vec![Value::from_i64(4)],
+            vec![Value::from_i64(5)],
         ]
     );
 }
@@ -1436,10 +1436,10 @@ fn test_mvcc_dual_seek_range_operations() {
     assert_eq!(
         rows,
         vec![
-            vec![Value::Integer(3)],
-            vec![Value::Integer(4)],
-            vec![Value::Integer(5)],
-            vec![Value::Integer(6)],
+            vec![Value::from_i64(3)],
+            vec![Value::from_i64(4)],
+            vec![Value::from_i64(5)],
+            vec![Value::from_i64(6)],
         ]
     );
 
@@ -1451,9 +1451,9 @@ fn test_mvcc_dual_seek_range_operations() {
     assert_eq!(
         rows,
         vec![
-            vec![Value::Integer(1)],
-            vec![Value::Integer(2)],
-            vec![Value::Integer(3)],
+            vec![Value::from_i64(1)],
+            vec![Value::from_i64(2)],
+            vec![Value::from_i64(3)],
         ]
     );
 
@@ -1465,9 +1465,9 @@ fn test_mvcc_dual_seek_range_operations() {
     assert_eq!(
         rows,
         vec![
-            vec![Value::Integer(3)],
-            vec![Value::Integer(4)],
-            vec![Value::Integer(5)],
+            vec![Value::from_i64(3)],
+            vec![Value::from_i64(4)],
+            vec![Value::from_i64(5)],
         ]
     );
 }
@@ -1599,7 +1599,7 @@ fn test_wal_savepoint_rollback_on_constraint_violation() {
 
     let stmt = conn.query("SELECT COUNT(*) FROM t").unwrap().unwrap();
     let row = helper_read_single_row(stmt);
-    assert_eq!(row[0], Value::Integer(1001));
+    assert_eq!(row[0], Value::from_i64(1001));
 }
 
 #[turso_macros::test]
@@ -1623,9 +1623,9 @@ fn test_insert_or_fail_keeps_prior_changes(tmp_db: TempDatabase) {
     assert_eq!(
         rows,
         vec![
-            vec![Value::Integer(1)],
-            vec![Value::Integer(2)],
-            vec![Value::Integer(3)], // This row should exist due to FAIL semantics
+            vec![Value::from_i64(1)],
+            vec![Value::from_i64(2)],
+            vec![Value::from_i64(3)], // This row should exist due to FAIL semantics
         ]
     );
 }
@@ -1651,8 +1651,8 @@ fn test_insert_or_abort_rolls_back_statement(tmp_db: TempDatabase) {
     assert_eq!(
         rows,
         vec![
-            vec![Value::Integer(1)],
-            vec![Value::Integer(2)],
+            vec![Value::from_i64(1)],
+            vec![Value::from_i64(2)],
             // Row 3 should NOT be here due to ABORT semantics
         ]
     );
@@ -1681,7 +1681,7 @@ fn test_insert_or_rollback_rolls_back_transaction(tmp_db: TempDatabase) {
     assert_eq!(
         rows,
         vec![
-            vec![Value::Integer(1)], // Only the original row should remain
+            vec![Value::from_i64(1)], // Only the original row should remain
         ]
     );
 
@@ -1794,8 +1794,8 @@ fn test_update_or_fail_keeps_prior_changes(tmp_db: TempDatabase) {
     assert_eq!(
         rows,
         vec![
-            vec![Value::Integer(1), Value::Integer(10)],
-            vec![Value::Integer(2), Value::Integer(20)],
+            vec![Value::from_i64(1), Value::from_i64(10)],
+            vec![Value::from_i64(2), Value::from_i64(20)],
         ]
     );
 }
@@ -1823,8 +1823,8 @@ fn test_update_or_abort_rolls_back_statement(tmp_db: TempDatabase) {
     assert_eq!(
         rows,
         vec![
-            vec![Value::Integer(1), Value::Integer(10)],
-            vec![Value::Integer(2), Value::Integer(20)],
+            vec![Value::from_i64(1), Value::from_i64(10)],
+            vec![Value::from_i64(2), Value::from_i64(20)],
         ]
     );
 }
@@ -1856,9 +1856,9 @@ fn test_update_or_rollback_rolls_back_transaction(tmp_db: TempDatabase) {
     assert_eq!(
         rows,
         vec![
-            vec![Value::Integer(1), Value::Integer(10)], // Rolled back
-            vec![Value::Integer(2), Value::Integer(20)], // Unchanged
-            vec![Value::Integer(3), Value::Integer(30)], // Unchanged
+            vec![Value::from_i64(1), Value::from_i64(10)], // Rolled back
+            vec![Value::from_i64(2), Value::from_i64(20)], // Unchanged
+            vec![Value::from_i64(3), Value::from_i64(30)], // Unchanged
         ]
     );
 
@@ -1889,8 +1889,8 @@ fn test_update_or_rollback_in_autocommit(tmp_db: TempDatabase) {
     assert_eq!(
         rows,
         vec![
-            vec![Value::Integer(1), Value::Integer(10)],
-            vec![Value::Integer(2), Value::Integer(20)],
+            vec![Value::from_i64(1), Value::from_i64(10)],
+            vec![Value::from_i64(2), Value::from_i64(20)],
         ]
     );
 }

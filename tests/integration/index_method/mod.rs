@@ -13,7 +13,7 @@ use turso_core::{
     schema::IndexColumn,
     types::IOResult,
     vector::{self, vector_types::VectorType},
-    Register, Result, Value,
+    Numeric, Register, Result, Value,
 };
 use turso_parser::ast::SortOrder;
 
@@ -136,7 +136,7 @@ fn test_vector_sparse_ivf_insert_query(tmp_db: TempDatabase) {
 
         let values = [
             Register::Value(sparse_vector(vector_str)),
-            Register::Value(Value::Integer((i + 1) as i64)),
+            Register::Value(Value::from_i64((i + 1) as i64)),
         ];
         run(&tmp_db, || cursor.insert(&values)).unwrap();
         conn.execute(format!(
@@ -159,9 +159,9 @@ fn test_vector_sparse_ivf_insert_query(tmp_db: TempDatabase) {
         run(&tmp_db, || cursor.open_read(&conn)).unwrap();
 
         let values = [
-            Register::Value(Value::Integer(0)),
+            Register::Value(Value::from_i64(0)),
             Register::Value(sparse_vector(vector)),
-            Register::Value(Value::Integer(5)),
+            Register::Value(Value::from_i64(5)),
         ];
         assert!(run(&tmp_db, || cursor.query_start(&values)).unwrap());
 
@@ -222,16 +222,16 @@ fn test_vector_sparse_ivf_update(tmp_db: TempDatabase) {
     let v1 = sparse_vector(v1_str);
     let insert0_values = [
         Register::Value(v0.clone()),
-        Register::Value(Value::Integer(1)),
+        Register::Value(Value::from_i64(1)),
     ];
     let insert1_values = [
         Register::Value(v1.clone()),
-        Register::Value(Value::Integer(1)),
+        Register::Value(Value::from_i64(1)),
     ];
     let query_values = [
-        Register::Value(Value::Integer(0)),
+        Register::Value(Value::from_i64(0)),
         Register::Value(q.clone()),
-        Register::Value(Value::Integer(1)),
+        Register::Value(Value::from_i64(1)),
     ];
     run(&tmp_db, || writer.insert(&insert0_values)).unwrap();
     conn.execute(format!(
@@ -526,7 +526,7 @@ fn test_fts_insert_query(tmp_db: TempDatabase) {
         let values = [
             Register::Value(Value::Text(turso_core::types::Text::from(title))),
             Register::Value(Value::Text(turso_core::types::Text::from(body))),
-            Register::Value(Value::Integer(id)),
+            Register::Value(Value::from_i64(id)),
         ];
         run(&tmp_db, || cursor.insert(&values)).unwrap();
         // Flush FTS data before executing SQL (which auto-commits the transaction)
@@ -545,9 +545,9 @@ fn test_fts_insert_query(tmp_db: TempDatabase) {
 
         // Pattern 0 = fts_score pattern with ORDER BY DESC LIMIT
         let values = [
-            Register::Value(Value::Integer(0)), // pattern index
+            Register::Value(Value::from_i64(0)), // pattern index
             Register::Value(Value::Text(turso_core::types::Text::from("Rust"))),
-            Register::Value(Value::Integer(10)), // limit
+            Register::Value(Value::from_i64(10)), // limit
         ];
         assert!(run(&tmp_db, || cursor.query_start(&values)).unwrap());
 
@@ -556,8 +556,8 @@ fn test_fts_insert_query(tmp_db: TempDatabase) {
         loop {
             let rowid = run(&tmp_db, || cursor.query_rowid()).unwrap().unwrap();
             let score = run(&tmp_db, || cursor.query_column(0)).unwrap();
-            if let Value::Float(s) = score {
-                results.push((rowid, s));
+            if let Value::Numeric(Numeric::Float(s)) = score {
+                results.push((rowid, f64::from(s)));
             }
             if !run(&tmp_db, || cursor.query_next()).unwrap() {
                 break;
@@ -578,9 +578,9 @@ fn test_fts_insert_query(tmp_db: TempDatabase) {
         run(&tmp_db, || cursor.open_read(&conn)).unwrap();
 
         let values = [
-            Register::Value(Value::Integer(0)),
+            Register::Value(Value::from_i64(0)),
             Register::Value(Value::Text(turso_core::types::Text::from("Python"))),
-            Register::Value(Value::Integer(10)),
+            Register::Value(Value::from_i64(10)),
         ];
         assert!(run(&tmp_db, || cursor.query_start(&values)).unwrap());
 

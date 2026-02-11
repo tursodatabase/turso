@@ -121,7 +121,7 @@ export class Database {
 
     const dbConfig = {
       path: this._opts.path,
-      async_io: true, // Always use async IO in React Native
+      async_io: false, // use blocking IO for local database
     };
 
     // Create native database (path normalization happens in C++ JSI layer)
@@ -153,7 +153,7 @@ export class Database {
     // Build dbConfig (path normalization happens in C++ JSI layer)
     const dbConfig = {
       path: this._opts.path,
-      async_io: true, // Always use async IO in React Native
+      async_io: true, // use async IO for synced database as we have network IO loop externally from the turso core
     };
 
     // Calculate reserved bytes from cipher
@@ -223,8 +223,7 @@ export class Database {
     }
 
     const nativeStmt = this._connection.prepareSingle(sql);
-    // Pass extraIo callback for partial sync support
-    return new Statement(nativeStmt, this._extraIo);
+    return new Statement(nativeStmt, this._connection!, this._extraIo);
   }
 
   /**
@@ -245,12 +244,12 @@ export class Database {
     while (remaining.length > 0) {
       const result = this._connection.prepareFirst(remaining);
 
-      if (!result.statement) {
-        break; // No more statements
+      if (!result) {
+        break; // No more statements (C++ returns null when nothing to parse)
       }
 
       // Wrap in Statement to get IO handling
-      const stmt = new Statement(result.statement, this._extraIo);
+      const stmt = new Statement(result.statement, this._connection!, this._extraIo);
       try {
         // Execute - will handle IO if needed
         await stmt.run();

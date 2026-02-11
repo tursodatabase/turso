@@ -3,6 +3,7 @@
 
 use crate::sync::Arc;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use std::borrow::Cow;
 use std::num::NonZeroUsize;
 
 use tracing::{instrument, Level};
@@ -25,9 +26,13 @@ use super::plan::{
 };
 use super::select::emit_simple_count;
 use super::subquery::emit_from_clause_subqueries;
-use crate::error::{SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE};
+use crate::error::{
+    SQLITE_CONSTRAINT_CHECK, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE,
+};
 use crate::function::Func;
-use crate::schema::{BTreeTable, Column, Index, IndexColumn, Schema, Table, ROWID_SENTINEL};
+use crate::schema::{
+    BTreeTable, CheckConstraint, Column, Index, IndexColumn, Schema, Table, ROWID_SENTINEL,
+};
 use crate::translate::compound_select::emit_program_for_compound_select;
 use crate::translate::expr::{
     bind_and_rewrite_expr, emit_returning_results, rewrite_between_expr,
@@ -52,7 +57,9 @@ use crate::translate::trigger_exec::{
 };
 use crate::translate::values::emit_values;
 use crate::translate::window::{emit_window_results, init_window, WindowMetadata};
-use crate::util::{exprs_are_equivalent, normalize_ident, parse_numeric_literal};
+use crate::util::{
+    check_expr_references_column, exprs_are_equivalent, normalize_ident, parse_numeric_literal,
+};
 use crate::vdbe::affinity::Affinity;
 use crate::vdbe::builder::{CursorKey, CursorType, ProgramBuilder};
 use crate::vdbe::insn::{
@@ -101,7 +108,7 @@ pub struct Resolver<'a> {
     pub schema: &'a Schema,
     pub symbol_table: &'a SymbolTable,
     pub expr_to_reg_cache_enabled: bool,
-    pub expr_to_reg_cache: Vec<(std::borrow::Cow<'a, ast::Expr>, usize)>,
+    pub expr_to_reg_cache: Vec<(Cow<'a, ast::Expr>, usize)>,
 }
 
 impl<'a> Resolver<'a> {
@@ -120,7 +127,7 @@ impl<'a> Resolver<'a> {
             None => self
                 .symbol_table
                 .resolve_function(func_name, arg_count)
-                .map(|arg| Func::External(arg.clone())),
+                .map(Func::External),
         }
     }
 
@@ -588,6 +595,7 @@ fn emit_materialized_build_inputs(
             is_strict: false,
             unique_sets: vec![],
             foreign_keys: vec![],
+            check_constraints: vec![],
         });
         let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(ephemeral_table.clone()));
 
@@ -1689,10 +1697,15 @@ fn emit_delete_insns<'a>(
             } => program.resolve_cursor_id(&CursorKey::index(internal_id, index.clone())),
         },
         Operation::IndexMethodQuery(_) => {
-            panic!("access through IndexMethod is not supported for delete statements")
+            return Err(crate::LimboError::InternalError(
+                "IndexMethod access is not supported for DELETE statements".to_string(),
+            ));
         }
         Operation::HashJoin(_) => {
             unreachable!("access through HashJoin is not supported for delete statements")
+        }
+        Operation::MultiIndexScan(_) => {
+            unreachable!("access through MultiIndexScan is not supported for delete statements")
         }
     };
     let btree_table = unsafe { &*table_reference }.btree();
@@ -2385,7 +2398,7 @@ fn emit_program_for_update(
         &mut t_ctx,
         &plan.table_references,
         &join_order,
-        mode.clone(),
+        mode,
     )?;
 
     program.preassign_label_to_next_insn(after_main_loop_label);
@@ -2678,10 +2691,15 @@ fn emit_update_insns<'a>(
             ),
         },
         Operation::IndexMethodQuery(_) => {
-            panic!("access through IndexMethod is not supported for update operations")
+            return Err(crate::LimboError::InternalError(
+                "IndexMethod access is not supported for UPDATE operations".to_string(),
+            ));
         }
         Operation::HashJoin(_) => {
             unreachable!("access through HashJoin is not supported for update operations")
+        }
+        Operation::MultiIndexScan(_) => {
+            unreachable!("access through MultiIndexScan is not supported for update operations")
         }
     };
 
@@ -3173,6 +3191,78 @@ fn emit_update_insns<'a>(
         }
     }
 
+    // Evaluate STRICT type checks and CHECK constraints before any index mutations.
+    // This ensures that if a constraint fails, indexes remain consistent.
+    if let Some(btree_table) = target_table.table.btree() {
+        if btree_table.is_strict {
+            program.emit_insn(Insn::TypeCheck {
+                start_reg: start,
+                count: col_len,
+                check_generated: true,
+                table_reference: Arc::clone(&btree_table),
+            });
+        }
+
+        if !btree_table.check_constraints.is_empty() {
+            // SQLite only evaluates CHECK constraints that reference at least one
+            // column in the SET clause. Build a set of updated column names to filter.
+            let mut updated_col_names: HashSet<String> = set_clauses
+                .iter()
+                .filter_map(|(col_idx, _)| {
+                    btree_table
+                        .columns
+                        .get(*col_idx)
+                        .and_then(|c| c.name.as_deref())
+                        .map(normalize_ident)
+                })
+                .collect();
+
+            // If the rowid is being updated (either directly via ROWID_SENTINEL or
+            // through a rowid alias column), also include the rowid pseudo-column
+            // names so that CHECK(rowid > 0) etc. are properly triggered.
+            let rowid_updated = set_clauses.iter().any(|(idx, _)| *idx == ROWID_SENTINEL)
+                || btree_table.columns.iter().enumerate().any(|(i, c)| {
+                    c.is_rowid_alias() && set_clauses.iter().any(|(idx, _)| *idx == i)
+                });
+            if rowid_updated {
+                for name in ROWID_STRS {
+                    updated_col_names.insert(name.to_string());
+                }
+            }
+
+            let relevant_checks: Vec<CheckConstraint> = btree_table
+                .check_constraints
+                .iter()
+                .filter(|cc| check_expr_references_columns(&cc.expr, &updated_col_names))
+                .cloned()
+                .collect();
+
+            emit_check_constraints(
+                program,
+                &relevant_checks,
+                &mut t_ctx.resolver,
+                &btree_table.name,
+                rowid_set_clause_reg.unwrap_or(beg),
+                btree_table
+                    .columns
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(idx, col)| {
+                        col.name.as_deref().map(|n| {
+                            if col.is_rowid_alias() {
+                                (n, rowid_set_clause_reg.unwrap_or(beg))
+                            } else {
+                                (n, start + idx)
+                            }
+                        })
+                    }),
+                connection,
+                or_conflict,
+                skip_row_label,
+            )?;
+        }
+    }
+
     for (index, (idx_cursor_id, record_reg)) in indexes_to_update.iter().zip(index_cursors) {
         // We need to know whether or not the OLD values satisfied the predicate on the
         // partial index, so we can know whether or not to delete the old index entry,
@@ -3480,18 +3570,7 @@ fn emit_update_insns<'a>(
         }
     }
 
-    if let Some(btree_table) = target_table.table.btree() {
-        if btree_table.is_strict {
-            program.emit_insn(Insn::TypeCheck {
-                start_reg: start,
-                count: col_len,
-                check_generated: true,
-                table_reference: Arc::clone(&btree_table),
-            });
-        }
-        // Note: Affinity for non-STRICT tables is applied earlier,
-        // right after emit_update_column_values, before index operations.
-
+    if target_table.table.btree().is_some() {
         if has_user_provided_rowid {
             let record_label = program.allocate_label();
             let target_reg = rowid_set_clause_reg.unwrap();
@@ -3661,8 +3740,10 @@ fn emit_update_insns<'a>(
 
         // If we are updating the rowid, we cannot rely on overwrite on the
         // Insert instruction to update the cell. We need to first delete the current cell
-        // and later insert the updated record
-        if not_exists_check_required {
+        // and later insert the updated record.
+        // In MVCC mode, we also need DELETE+INSERT to properly version the row (Hekaton model).
+        let needs_delete = not_exists_check_required || connection.mvcc_enabled();
+        if needs_delete {
             program.emit_insn(Insn::Delete {
                 cursor_id: target_table_cursor_id,
                 table_name: table_name.to_string(),
@@ -3890,7 +3971,7 @@ pub fn prepare_cdc_if_necessary(
     let Some(turso_cdc_table) = schema.get_table(cdc_table) else {
         crate::bail_parse_error!("no such table: {}", cdc_table);
     };
-    let Some(cdc_btree) = turso_cdc_table.btree().clone() else {
+    let Some(cdc_btree) = turso_cdc_table.btree() else {
         crate::bail_parse_error!("no such table: {}", cdc_table);
     };
     let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(cdc_btree.clone()));
@@ -4100,16 +4181,16 @@ fn init_limit(
         if let Some(expr) = limit {
             match expr.as_ref() {
                 Expr::Literal(Literal::Numeric(n)) => match parse_numeric_literal(n)? {
-                    crate::types::Value::Integer(value) => {
+                    crate::types::Value::Numeric(crate::Numeric::Integer(value)) => {
                         program.add_comment(program.offset(), "LIMIT counter");
                         program.emit_insn(Insn::Integer {
                             value,
                             dest: limit_ctx.reg_limit,
                         });
                     }
-                    crate::types::Value::Float(value) => {
+                    crate::types::Value::Numeric(crate::Numeric::Float(value)) => {
                         program.emit_insn(Insn::Real {
-                            value,
+                            value: value.into(),
                             dest: limit_ctx.reg_limit,
                         });
                         program.add_comment(program.offset(), "LIMIT counter");
@@ -4135,15 +4216,15 @@ fn init_limit(
             t_ctx.reg_offset = Some(offset_reg);
             match expr.as_ref() {
                 Expr::Literal(Literal::Numeric(n)) => match parse_numeric_literal(n)? {
-                    crate::types::Value::Integer(value) => {
+                    crate::types::Value::Numeric(crate::Numeric::Integer(value)) => {
                         program.emit_insn(Insn::Integer {
                             value,
                             dest: offset_reg,
                         });
                     }
-                    crate::types::Value::Float(value) => {
+                    crate::types::Value::Numeric(crate::Numeric::Float(value)) => {
                         program.emit_insn(Insn::Real {
-                            value,
+                            value: value.into(),
                             dest: offset_reg,
                         });
                         program.emit_insn(Insn::MustBeInt { reg: offset_reg });
@@ -4308,4 +4389,151 @@ fn emit_index_column_value_new_image(
         });
     }
     Ok(())
+}
+
+/// Emit bytecode for evaluating CHECK constraints.
+/// Assumes the resolver cache is already populated with column-to-register mappings.
+fn emit_check_constraint_bytecode(
+    program: &mut ProgramBuilder,
+    check_constraints: &[CheckConstraint],
+    resolver: &mut Resolver,
+    or_conflict: ResolveType,
+    skip_row_label: BranchOffset,
+) -> Result<()> {
+    for check_constraint in check_constraints {
+        let expr_result_reg = program.alloc_register();
+
+        let mut rewritten_expr = check_constraint.expr.clone();
+        rewrite_between_expr(&mut rewritten_expr);
+
+        translate_expr_no_constant_opt(
+            program,
+            None,
+            &rewritten_expr,
+            expr_result_reg,
+            resolver,
+            NoConstantOptReason::RegisterReuse,
+        )?;
+
+        // CHECK constraint passes if the result is NULL or non-zero (truthy)
+        let constraint_passed_label = program.allocate_label();
+
+        // NULL means unknown, which passes CHECK constraints in SQLite
+        program.emit_insn(Insn::IsNull {
+            reg: expr_result_reg,
+            target_pc: constraint_passed_label,
+        });
+
+        program.emit_insn(Insn::If {
+            reg: expr_result_reg,
+            target_pc: constraint_passed_label,
+            jump_if_null: false,
+        });
+
+        let constraint_name = match &check_constraint.name {
+            Some(name) => name.clone(),
+            None => format!("{}", check_constraint.expr),
+        };
+
+        match or_conflict {
+            ResolveType::Ignore => {
+                program.emit_insn(Insn::Goto {
+                    target_pc: skip_row_label,
+                });
+            }
+            // In SQLite, REPLACE does not apply to CHECK constraints — it aborts,
+            // same as Abort/Fail/Rollback.
+            ResolveType::Abort
+            | ResolveType::Fail
+            | ResolveType::Rollback
+            | ResolveType::Replace => {
+                program.emit_insn(Insn::Halt {
+                    err_code: SQLITE_CONSTRAINT_CHECK,
+                    description: constraint_name.to_string(),
+                });
+            }
+        }
+
+        program.preassign_label_to_next_insn(constraint_passed_label);
+    }
+    Ok(())
+}
+
+/// Returns true if the CHECK constraint expression references any column whose
+/// normalized name is in `column_names`. This is used during UPDATE to skip
+/// CHECK constraints that only reference columns not in the SET clause, matching
+/// SQLite's optimization behavior.
+fn check_expr_references_columns(expr: &ast::Expr, column_names: &HashSet<String>) -> bool {
+    column_names
+        .iter()
+        .any(|name| check_expr_references_column(expr, name))
+}
+
+/// Emit CHECK constraint evaluation with resolver cache setup and teardown.
+/// Takes column-to-register mappings as an iterator to avoid heap allocation.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_check_constraints<'a>(
+    program: &mut ProgramBuilder,
+    check_constraints: &[CheckConstraint],
+    resolver: &mut Resolver,
+    table_name: &str,
+    rowid_reg: usize,
+    column_mappings: impl Iterator<Item = (&'a str, usize)>,
+    connection: &Arc<Connection>,
+    or_conflict: ResolveType,
+    skip_row_label: BranchOffset,
+) -> Result<()> {
+    if connection.check_constraints_ignored() || check_constraints.is_empty() {
+        return Ok(());
+    }
+
+    let initial_cache_size = resolver.expr_to_reg_cache.len();
+
+    // Map rowid aliases to the actual rowid register.
+    // We cache both unqualified (Expr::Id) and qualified (Expr::Qualified) forms
+    // so that CHECK expressions like `CHECK(rowid > 0)` and `CHECK(t.rowid > 0)` both resolve.
+    for rowid_name in ROWID_STRS {
+        let rowid_expr = ast::Expr::Id(ast::Name::exact(rowid_name.to_string()));
+        resolver
+            .expr_to_reg_cache
+            .push((Cow::Owned(rowid_expr), rowid_reg));
+        let qualified_expr = ast::Expr::Qualified(
+            ast::Name::exact(table_name.to_string()),
+            ast::Name::exact(rowid_name.to_string()),
+        );
+        resolver
+            .expr_to_reg_cache
+            .push((Cow::Owned(qualified_expr), rowid_reg));
+    }
+
+    // Map each column to its register (both unqualified and qualified forms).
+    for (col_name, register) in column_mappings {
+        let column_expr = ast::Expr::Id(ast::Name::exact(col_name.to_string()));
+        resolver
+            .expr_to_reg_cache
+            .push((Cow::Owned(column_expr), register));
+        let qualified_expr = ast::Expr::Qualified(
+            ast::Name::exact(table_name.to_string()),
+            ast::Name::exact(col_name.to_string()),
+        );
+        resolver
+            .expr_to_reg_cache
+            .push((Cow::Owned(qualified_expr), register));
+    }
+
+    resolver.enable_expr_to_reg_cache();
+
+    let result = emit_check_constraint_bytecode(
+        program,
+        check_constraints,
+        resolver,
+        or_conflict,
+        skip_row_label,
+    );
+
+    // Always restore resolver state, even on error.
+    resolver.expr_to_reg_cache.truncate(initial_cache_size);
+    resolver.expr_to_reg_cache_enabled = false;
+
+    result
 }

@@ -51,8 +51,7 @@ pub fn translate_analyze(
                     .collect()
             } else if let Some(table) = resolver.schema.get_btree_table(&normalized) {
                 vec![(
-                    table.clone(),
-                    None, // analyze the whole table and its indexes
+                    table, None, // analyze the whole table and its indexes
                 )]
             } else {
                 // Try to find an index by this name.
@@ -71,7 +70,7 @@ pub fn translate_analyze(
                 let Some((table, index)) = found else {
                     bail_parse_error!("no such table or index: {}", target.name);
                 };
-                vec![(table.clone(), Some(index))]
+                vec![(table, Some(index))]
             }
         }
         None => resolver
@@ -138,8 +137,7 @@ pub fn translate_analyze(
         sqlite_stat1_source = RegisterOrLiteral::Register(table_root_reg);
 
         let table = resolver.schema.get_btree_table(SQLITE_TABLEID).unwrap();
-        let sqlite_schema_cursor_id =
-            program.alloc_cursor_id(CursorType::BTreeTable(table.clone()));
+        let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table));
         program.emit_insn(Insn::OpenWrite {
             cursor_id: sqlite_schema_cursor_id,
             root_page: 1i64.into(),
@@ -177,7 +175,7 @@ pub fn translate_analyze(
 
     // Count the number of rows in the target table(s), and insert into sqlite_stat1.
     let sqlite_stat1 = sqlite_stat1_btreetable;
-    let stat_cursor = program.alloc_cursor_id(CursorType::BTreeTable(sqlite_stat1.clone()));
+    let stat_cursor = program.alloc_cursor_id(CursorType::BTreeTable(sqlite_stat1));
     program.emit_insn(Insn::OpenWrite {
         cursor_id: stat_cursor,
         root_page: sqlite_stat1_source,

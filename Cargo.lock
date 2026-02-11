@@ -94,17 +94,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "allo-isolate"
-version = "0.1.27"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "449e356a4864c017286dbbec0e12767ea07efba29e3b7d984194c2a7ff3c4550"
-dependencies = [
- "anyhow",
- "atomic",
- "backtrace",
-]
-
-[[package]]
 name = "allocator-api2"
 version = "0.2.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -117,24 +106,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "09a645c34bad5551ed4b2496536985efdc4373b097c0e57abf2eb14774538278"
 dependencies = [
  "rand 0.9.2",
-]
-
-[[package]]
-name = "android_log-sys"
-version = "0.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "84521a3cf562bc62942e294181d9eef17eb38ceb8c68677bc49f144e4c3d4f8d"
-
-[[package]]
-name = "android_logger"
-version = "0.13.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c494134f746c14dc653a35a4ea5aca24ac368529da5370ecf41fe0341c35772f"
-dependencies = [
- "android_log-sys",
- "env_logger 0.10.2",
- "log",
- "once_cell",
 ]
 
 [[package]]
@@ -314,12 +285,6 @@ dependencies = [
  "quote",
  "syn 2.0.100",
 ]
-
-[[package]]
-name = "atomic"
-version = "0.5.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c59bdb34bc650a32731b31bd8f0829cc15d24a708ee31559e0bb34f2bc320cba"
 
 [[package]]
 name = "atomic-waker"
@@ -592,12 +557,6 @@ dependencies = [
  "regex-automata 0.4.13",
  "serde",
 ]
-
-[[package]]
-name = "build-target"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "832133bbabbbaa9fbdba793456a2827627a7d2b8fb96032fa1e7666d7895832b"
 
 [[package]]
 name = "built"
@@ -1072,16 +1031,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "console_error_panic_hook"
-version = "0.1.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a06aeb73f470f66dcdbf7223caeebb85984942f22f1adb2a088cf9668146bbbc"
-dependencies = [
- "cfg-if",
- "wasm-bindgen",
-]
-
-[[package]]
 name = "constant_time_eq"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1132,12 +1081,12 @@ checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
 name = "core_tester"
-version = "0.5.0-pre.7"
+version = "0.5.0-pre.9"
 dependencies = [
  "anyhow",
  "assert_cmd",
  "ctor 0.5.0",
- "env_logger 0.11.7",
+ "env_logger",
  "log",
  "rand 0.9.2",
  "rand_chacha 0.9.0",
@@ -1479,25 +1428,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "dart-sys"
-version = "4.1.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "57967e4b200d767d091b961d6ab42cc7d0cc14fe9e052e75d0d3cf9eb732d895"
-dependencies = [
- "cc",
-]
-
-[[package]]
-name = "dashmap"
-version = "4.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e77a43b28d0668df09411cb0bc9a8c2adc40f9a048afe863e05fd43251e8e39c"
-dependencies = [
- "cfg-if",
- "num_cpus",
-]
-
-[[package]]
 name = "data-encoding"
 version = "2.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1510,17 +1440,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bef552e6f588e446098f6ba40d89ac146c8c7b64aade83c051ee00bb5d2bc18d"
 dependencies = [
  "uuid",
-]
-
-[[package]]
-name = "delegate-attr"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "51aac4c99b2e6775164b412ea33ae8441b2fde2dbf05a20bc0052a63d08c475b"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.100",
 ]
 
 [[package]]
@@ -1599,7 +1518,7 @@ checksum = "56254986775e3233ffa9c4d7d3faaf6d36a2c09d30b20687e9f88bc8bafc16c8"
 
 [[package]]
 name = "differential-fuzzer"
-version = "0.5.0-pre.7"
+version = "0.5.0-pre.9"
 dependencies = [
  "anyhow",
  "clap",
@@ -1817,16 +1736,6 @@ dependencies = [
 
 [[package]]
 name = "env_logger"
-version = "0.10.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4cd405aab171cb85d6735e5c8d9db038c17d3ca007a4d2c25f337935c3d90580"
-dependencies = [
- "log",
- "regex",
-]
-
-[[package]]
-name = "env_logger"
 version = "0.11.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3716d7a920fb4fac5d84e9d4bce8ceb321e9414b4409da61b07b75c1e3d0697"
@@ -1987,48 +1896,6 @@ checksum = "11faaf5a5236997af9848be0bef4db95824b1d534ebc64d0f0c6cf3e67bd38dc"
 dependencies = [
  "crc32fast",
  "miniz_oxide",
-]
-
-[[package]]
-name = "flutter_rust_bridge"
-version = "2.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ff1d2ad18166cead8c1b92b1c00e64aacc32e6ebd1ac95f77089c276c9c6bd8c"
-dependencies = [
- "allo-isolate",
- "android_logger",
- "anyhow",
- "build-target",
- "bytemuck",
- "byteorder",
- "console_error_panic_hook",
- "dart-sys",
- "delegate-attr",
- "flutter_rust_bridge_macros",
- "futures",
- "js-sys",
- "lazy_static",
- "log",
- "oslog",
- "portable-atomic",
- "threadpool",
- "tokio",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "web-sys",
-]
-
-[[package]]
-name = "flutter_rust_bridge_macros"
-version = "2.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "36cf75fba54902e67db5eef4a520df1c9f604db6f71f106fbc012477e2d81542"
-dependencies = [
- "hex",
- "md-5",
- "proc-macro2",
- "quote",
- "syn 2.0.100",
 ]
 
 [[package]]
@@ -3099,7 +2966,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_completion"
-version = "0.5.0-pre.7"
+version = "0.5.0-pre.9"
 dependencies = [
  "mimalloc",
  "turso_ext",
@@ -3107,7 +2974,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_crypto"
-version = "0.5.0-pre.7"
+version = "0.5.0-pre.9"
 dependencies = [
  "blake3",
  "data-encoding",
@@ -3120,7 +2987,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_csv"
-version = "0.5.0-pre.7"
+version = "0.5.0-pre.9"
 dependencies = [
  "csv",
  "mimalloc",
@@ -3130,7 +2997,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_fuzzy"
-version = "0.5.0-pre.7"
+version = "0.5.0-pre.9"
 dependencies = [
  "mimalloc",
  "turso_ext",
@@ -3138,7 +3005,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_ipaddr"
-version = "0.5.0-pre.7"
+version = "0.5.0-pre.9"
 dependencies = [
  "ipnetwork",
  "mimalloc",
@@ -3147,7 +3014,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_percentile"
-version = "0.5.0-pre.7"
+version = "0.5.0-pre.9"
 dependencies = [
  "mimalloc",
  "turso_ext",
@@ -3155,7 +3022,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_regexp"
-version = "0.5.0-pre.7"
+version = "0.5.0-pre.9"
 dependencies = [
  "mimalloc",
  "regex",
@@ -3164,7 +3031,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_sim"
-version = "0.5.0-pre.7"
+version = "0.5.0-pre.9"
 dependencies = [
  "anyhow",
  "bitflags 2.9.4",
@@ -3201,7 +3068,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_sqlite_test_ext"
-version = "0.5.0-pre.7"
+version = "0.5.0-pre.9"
 dependencies = [
  "cc",
 ]
@@ -3348,16 +3215,6 @@ name = "matchit"
 version = "0.7.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0e7465ac9959cc2b1404e8e2367b43684a6d13790fe23056cc8c6c5a6b7bcb94"
-
-[[package]]
-name = "md-5"
-version = "0.10.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d89e7ee0cfbedfc4da3340218492196241d89eefb6dab27de5df917a6d2e78cf"
-dependencies = [
- "cfg-if",
- "digest",
-]
 
 [[package]]
 name = "md5"
@@ -3798,17 +3655,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
 
 [[package]]
-name = "oslog"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8343ce955f18e7e68c0207dd0ea776ec453035685395ababd2ea651c569728b3"
-dependencies = [
- "cc",
- "dashmap",
- "log",
-]
-
-[[package]]
 name = "ownedbytes"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4240,7 +4086,7 @@ dependencies = [
 
 [[package]]
 name = "py-turso"
-version = "0.5.0-pre.7"
+version = "0.5.0-pre.9"
 dependencies = [
  "anyhow",
  "pyo3",
@@ -5277,7 +5123,7 @@ checksum = "d372029cb5195f9ab4e4b9aef550787dce78b124fcaee8d82519925defcd6f0d"
 
 [[package]]
 name = "sql_gen_prop"
-version = "0.5.0-pre.7"
+version = "0.5.0-pre.9"
 dependencies = [
  "anarchist-readable-name-generator-lib",
  "proptest",
@@ -5287,7 +5133,7 @@ dependencies = [
 
 [[package]]
 name = "sql_generation"
-version = "0.5.0-pre.7"
+version = "0.5.0-pre.9"
 dependencies = [
  "anarchist-readable-name-generator-lib",
  "anyhow",
@@ -5723,7 +5569,7 @@ version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e7f46083d221181166e5b6f6b1e5f1d499f3a76888826e6cb1d057554157cd0f"
 dependencies = [
- "env_logger 0.11.7",
+ "env_logger",
  "test-log-macros",
  "tracing-subscriber",
 ]
@@ -5829,15 +5675,6 @@ checksum = "8b9ef9bad013ada3808854ceac7b46812a6465ba368859a37e2100283d2d719c"
 dependencies = [
  "cfg-if",
  "once_cell",
-]
-
-[[package]]
-name = "threadpool"
-version = "1.8.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d050e60b33d41c19108b32cea32164033a9013fe3b46cbd4457559bfbf77afaa"
-dependencies = [
- "num_cpus",
 ]
 
 [[package]]
@@ -6228,7 +6065,7 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "turso"
-version = "0.5.0-pre.7"
+version = "0.5.0-pre.9"
 dependencies = [
  "anyhow",
  "bytes",
@@ -6252,7 +6089,7 @@ dependencies = [
 
 [[package]]
 name = "turso-dbhash"
-version = "0.5.0-pre.7"
+version = "0.5.0-pre.9"
 dependencies = [
  "clap",
  "hex",
@@ -6263,14 +6100,14 @@ dependencies = [
 
 [[package]]
 name = "turso-dotnet"
-version = "0.5.0-pre.7"
+version = "0.5.0-pre.9"
 dependencies = [
  "turso_core",
 ]
 
 [[package]]
 name = "turso-java"
-version = "0.5.0-pre.7"
+version = "0.5.0-pre.9"
 dependencies = [
  "jni",
  "thiserror 2.0.16",
@@ -6279,7 +6116,7 @@ dependencies = [
 
 [[package]]
 name = "turso_cli"
-version = "0.5.0-pre.7"
+version = "0.5.0-pre.9"
 dependencies = [
  "anyhow",
  "bytes",
@@ -6290,7 +6127,7 @@ dependencies = [
  "csv",
  "ctrlc",
  "dirs 5.0.1",
- "env_logger 0.11.7",
+ "env_logger",
  "include_dir",
  "itertools 0.14.0",
  "libc",
@@ -6320,7 +6157,7 @@ dependencies = [
 
 [[package]]
 name = "turso_core"
-version = "0.5.0-pre.7"
+version = "0.5.0-pre.9"
 dependencies = [
  "aegis",
  "aes",
@@ -6339,7 +6176,7 @@ dependencies = [
  "criterion",
  "crossbeam-skiplist",
  "either",
- "env_logger 0.11.7",
+ "env_logger",
  "fallible-iterator",
  "fastbloom",
  "hex",
@@ -6393,16 +6230,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "turso_dart"
-version = "0.5.0-pre.7"
-dependencies = [
- "flutter_rust_bridge",
- "turso_core",
-]
-
-[[package]]
 name = "turso_ext"
-version = "0.5.0-pre.7"
+version = "0.5.0-pre.9"
 dependencies = [
  "chrono",
  "getrandom 0.3.2",
@@ -6411,9 +6240,9 @@ dependencies = [
 
 [[package]]
 name = "turso_ext_tests"
-version = "0.5.0-pre.7"
+version = "0.5.0-pre.9"
 dependencies = [
- "env_logger 0.11.7",
+ "env_logger",
  "lazy_static",
  "log",
  "mimalloc",
@@ -6422,7 +6251,7 @@ dependencies = [
 
 [[package]]
 name = "turso_macros"
-version = "0.5.0-pre.7"
+version = "0.5.0-pre.9"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -6431,7 +6260,7 @@ dependencies = [
 
 [[package]]
 name = "turso_node"
-version = "0.5.0-pre.7"
+version = "0.5.0-pre.9"
 dependencies = [
  "chrono",
  "napi",
@@ -6444,7 +6273,7 @@ dependencies = [
 
 [[package]]
 name = "turso_parser"
-version = "0.5.0-pre.7"
+version = "0.5.0-pre.9"
 dependencies = [
  "bitflags 2.9.4",
  "codspeed-criterion-compat",
@@ -6462,10 +6291,10 @@ dependencies = [
 
 [[package]]
 name = "turso_sdk_kit"
-version = "0.5.0-pre.7"
+version = "0.5.0-pre.9"
 dependencies = [
  "bindgen",
- "env_logger 0.11.7",
+ "env_logger",
  "parking_lot",
  "tempfile",
  "tracing",
@@ -6477,7 +6306,7 @@ dependencies = [
 
 [[package]]
 name = "turso_sdk_kit_macros"
-version = "0.5.0-pre.7"
+version = "0.5.0-pre.9"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -6486,9 +6315,9 @@ dependencies = [
 
 [[package]]
 name = "turso_sqlite3"
-version = "0.5.0-pre.7"
+version = "0.5.0-pre.9"
 dependencies = [
- "env_logger 0.11.7",
+ "env_logger",
  "libc",
  "tempfile",
  "tracing",
@@ -6499,7 +6328,7 @@ dependencies = [
 
 [[package]]
 name = "turso_stress"
-version = "0.5.0-pre.7"
+version = "0.5.0-pre.9"
 dependencies = [
  "antithesis_sdk",
  "clap",
@@ -6517,7 +6346,7 @@ dependencies = [
 
 [[package]]
 name = "turso_sync_engine"
-version = "0.5.0-pre.7"
+version = "0.5.0-pre.9"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -6544,7 +6373,7 @@ dependencies = [
 
 [[package]]
 name = "turso_sync_js"
-version = "0.5.0-pre.7"
+version = "0.5.0-pre.9"
 dependencies = [
  "genawaiter",
  "napi",
@@ -6559,10 +6388,10 @@ dependencies = [
 
 [[package]]
 name = "turso_sync_sdk_kit"
-version = "0.5.0-pre.7"
+version = "0.5.0-pre.9"
 dependencies = [
  "bindgen",
- "env_logger 0.11.7",
+ "env_logger",
  "genawaiter",
  "parking_lot",
  "tracing",
@@ -6576,7 +6405,7 @@ dependencies = [
 
 [[package]]
 name = "turso_whopper"
-version = "0.5.0-pre.7"
+version = "0.5.0-pre.9"
 dependencies = [
  "anyhow",
  "clap",

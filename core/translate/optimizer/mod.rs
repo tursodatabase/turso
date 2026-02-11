@@ -44,8 +44,9 @@ use turso_parser::ast::{self, Expr, SortOrder, TriggerEvent};
 use super::{
     emitter::Resolver,
     plan::{
-        DeletePlan, GroupBy, IterationDirection, JoinOrderMember, JoinedTable, Operation, Plan,
-        Search, SeekDef, SeekKey, SelectPlan, TableReferences, UpdatePlan, WhereTerm,
+        DeletePlan, GroupBy, IterationDirection, JoinOrderMember, JoinedTable, MultiIndexBranch,
+        MultiIndexScanOp, Operation, Plan, Search, SeekDef, SeekKey, SelectPlan, TableReferences,
+        UpdatePlan, WhereTerm,
     },
     planner::TableMask,
 };
@@ -668,6 +669,7 @@ fn add_ephemeral_table_to_update_plan(
         is_strict: false,
         unique_sets: vec![],
         foreign_keys: vec![],
+        check_constraints: vec![],
     });
 
     let temp_cursor_id = program.alloc_cursor_id_keyed(
@@ -707,6 +709,8 @@ fn add_ephemeral_table_to_update_plan(
                 internal_id: table.internal_id,
                 table: table.table.clone(),
                 col_used_mask: table.col_used_mask.clone(),
+                cte_select: None,
+                cte_explicit_columns: vec![],
             });
     }
 
@@ -1139,7 +1143,7 @@ fn optimize_table_access(
     }
 
     let Some(best_join_order_result) = compute_best_join_order(
-        table_references.joined_tables_mut(),
+        table_references.joined_tables(),
         maybe_order_target.as_ref(),
         &constraints_per_table,
         &base_table_rows,
@@ -1149,6 +1153,9 @@ fn optimize_table_access(
         &index_method_candidates,
         params,
         &schema.analyze_stats,
+        available_indexes,
+        table_references,
+        schema,
     )?
     else {
         return Ok(None);
@@ -1568,6 +1575,46 @@ fn optimize_table_access(
                 table_references.joined_tables_mut()[table_idx].op =
                     Operation::IndexMethodQuery(query.clone());
             }
+            AccessMethodParams::MultiIndexScan {
+                branches,
+                where_term_idx,
+                set_op,
+                additional_consumed_terms,
+            } => {
+                // Mark the primary WHERE clause term as consumed
+                where_clause[*where_term_idx].consumed = true;
+                // For intersection, also mark additional consumed terms
+                for term_idx in additional_consumed_terms.iter() {
+                    where_clause[*term_idx].consumed = true;
+                }
+
+                // Build the MultiIndexScanOp from the branch parameters
+                let mut multi_idx_branches: Vec<MultiIndexBranch> = Vec::new();
+                for branch in branches.iter() {
+                    // Build seek_def from constraint_refs using the branch's own constraint
+                    // (not constraints_per_table, since the branch constraint was created separately)
+                    let seek_def = build_seek_def_from_constraints(
+                        &[branch.constraint.clone()],
+                        &branch.constraint_refs,
+                        IterationDirection::Forwards, // Multi-index always scans forward
+                        where_clause,
+                        Some(table_references),
+                    )?;
+                    multi_idx_branches.push(MultiIndexBranch {
+                        index: branch.index.clone(),
+                        seek_def,
+                        estimated_rows: branch.estimated_rows,
+                    });
+                }
+
+                table_references.joined_tables_mut()[table_idx].op =
+                    Operation::MultiIndexScan(MultiIndexScanOp {
+                        branches: multi_idx_branches,
+                        where_term_idx: *where_term_idx,
+                        set_op: *set_op,
+                        additional_consumed_terms: additional_consumed_terms.clone(),
+                    });
+            }
         }
     }
 
@@ -1932,9 +1979,10 @@ impl Optimizable for ast::Expr {
             }
             Expr::Cast { expr, .. } => expr.is_constant(resolver),
             Expr::Collate(expr, _) => expr.is_constant(resolver),
-            Expr::DoublyQualified(_, _, _) => {
-                panic!("DoublyQualified should have been rewritten as Column")
-            }
+            // Not constant. Normally rewritten to Expr::Column by the optimizer,
+            // but CHECK constraints bypass the rewrite pass and legitimately
+            // contain DoublyQualified nodes.
+            Expr::DoublyQualified(_, _, _) => false,
             Expr::Exists(_) => false,
             Expr::FunctionCall { args, name, .. } => {
                 let Some(func) = resolver.resolve_function(name.as_str(), args.len()) else {
@@ -1968,9 +2016,10 @@ impl Optimizable for ast::Expr {
             Expr::Name(_) => false,
             Expr::NotNull(expr) => expr.is_constant(resolver),
             Expr::Parenthesized(exprs) => exprs.iter().all(|expr| expr.is_constant(resolver)),
-            Expr::Qualified(_, _) => {
-                panic!("Qualified should have been rewritten as Column")
-            }
+            // Not constant. Normally rewritten to Expr::Column by the optimizer,
+            // but CHECK constraints bypass the rewrite pass and legitimately
+            // contain Qualified nodes.
+            Expr::Qualified(_, _) => false,
             Expr::Raise(_, expr) => expr.as_ref().is_none_or(|expr| expr.is_constant(resolver)),
             Expr::Subquery(_) => false,
             Expr::Unary(_, expr) => expr.is_constant(resolver),
@@ -2005,10 +2054,9 @@ impl Optimizable for ast::Expr {
                     // which extracts leading numeric prefixes (e.g., '9S' -> 9, 'abc' -> 0)
                     let without_quotes = s.trim_matches('\'');
                     let numeric = Numeric::from(without_quotes);
-                    match numeric.try_into_bool() {
-                        Some(true) => Ok(Some(AlwaysTrueOrFalse::AlwaysTrue)),
-                        Some(false) => Ok(Some(AlwaysTrueOrFalse::AlwaysFalse)),
-                        None => Ok(None),
+                    match numeric.to_bool() {
+                        true => Ok(Some(AlwaysTrueOrFalse::AlwaysTrue)),
+                        false => Ok(Some(AlwaysTrueOrFalse::AlwaysFalse)),
                     }
                 }
                 _ => Ok(None),

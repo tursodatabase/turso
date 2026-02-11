@@ -114,6 +114,8 @@ pub struct Connection {
     /// Whether pragma foreign_keys=ON for this connection
     pub(super) fk_pragma: AtomicBool,
     pub(crate) fk_deferred_violations: AtomicIsize,
+    /// Whether pragma ignore_check_constraints=ON for this connection
+    pub(super) check_constraints_pragma: AtomicBool,
     /// Track when each virtual table instance is currently in transaction.
     pub(crate) vtab_txn_states: RwLock<HashSet<u64>>,
 }
@@ -179,7 +181,7 @@ impl Connection {
 
     pub fn start_trigger_compilation(&self, trigger: Arc<Trigger>) {
         tracing::debug!("Starting trigger compilation: {}", trigger.name);
-        self.compiling_triggers.write().push(trigger.clone());
+        self.compiling_triggers.write().push(trigger);
     }
 
     pub fn end_trigger_compilation(&self) {
@@ -202,7 +204,7 @@ impl Connection {
 
     pub fn start_trigger_execution(&self, trigger: Arc<Trigger>) {
         tracing::debug!("Starting trigger execution: {}", trigger.name);
-        self.executing_triggers.write().push(trigger.clone());
+        self.executing_triggers.write().push(trigger);
     }
 
     pub fn end_trigger_execution(&self) {
@@ -571,7 +573,7 @@ impl Connection {
             mode,
             input,
         )?;
-        let stmt = Statement::new(program, pager.clone(), mode);
+        let stmt = Statement::new(program, pager, mode);
         Ok(Some((stmt, parser.offset())))
     }
 
@@ -605,7 +607,7 @@ impl Connection {
             opts.vfs.as_ref(),
             flags,
             db_opts,
-            encryption_opts.clone(),
+            encryption_opts,
         )?;
         if let Some(modeof) = opts.modeof {
             let perms = std::fs::metadata(modeof)?;
@@ -649,6 +651,16 @@ impl Connection {
     pub fn foreign_keys_enabled(&self) -> bool {
         self.fk_pragma.load(Ordering::Acquire)
     }
+
+    pub fn set_check_constraints_ignored(&self, ignore: bool) {
+        self.check_constraints_pragma
+            .store(ignore, Ordering::Release);
+    }
+
+    pub fn check_constraints_ignored(&self) -> bool {
+        self.check_constraints_pragma.load(Ordering::Acquire)
+    }
+
     pub(crate) fn clear_deferred_foreign_key_violations(&self) -> isize {
         self.fk_deferred_violations.swap(0, Ordering::Release)
     }
@@ -1581,7 +1593,7 @@ impl Connection {
 
     pub fn set_encryption_key(&self, key: EncryptionKey) -> Result<()> {
         tracing::trace!("setting encryption key for connection");
-        *self.encryption_key.write() = Some(key.clone());
+        *self.encryption_key.write() = Some(key);
         self.set_encryption_context()
     }
 

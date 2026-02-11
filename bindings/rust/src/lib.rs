@@ -138,6 +138,7 @@ pub struct Builder {
     enable_encryption: bool,
     enable_triggers: bool,
     enable_attach: bool,
+    enable_strict: bool,
     vfs: Option<String>,
     encryption_opts: Option<turso_sdk_kit::rsapi::EncryptionOpts>,
 }
@@ -150,6 +151,7 @@ impl Builder {
             enable_encryption: false,
             enable_triggers: false,
             enable_attach: false,
+            enable_strict: false,
             vfs: None,
             encryption_opts: None,
         }
@@ -175,6 +177,11 @@ impl Builder {
         self
     }
 
+    pub fn experimental_strict(mut self, strict_enabled: bool) -> Self {
+        self.enable_strict = strict_enabled;
+        self
+    }
+
     pub fn with_io(mut self, vfs: String) -> Self {
         self.vfs = Some(vfs);
         self
@@ -189,6 +196,9 @@ impl Builder {
         }
         if self.enable_attach {
             features.push("attach");
+        }
+        if self.enable_strict {
+            features.push("strict");
         }
         if features.is_empty() {
             return None;

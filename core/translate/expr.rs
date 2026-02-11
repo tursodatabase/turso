@@ -28,7 +28,7 @@ use crate::vdbe::{
     insn::{CmpInsFlags, Insn},
     BranchOffset,
 };
-use crate::{turso_assert, Result, Value};
+use crate::{turso_assert, Numeric, Result, Value};
 
 use super::collate::CollationSeq;
 
@@ -2810,15 +2810,15 @@ pub fn translate_expr(
             (UnaryOperator::Negative, ast::Expr::Literal(ast::Literal::Numeric(numeric_value))) => {
                 let numeric_value = "-".to_owned() + numeric_value;
                 match parse_numeric_literal(&numeric_value)? {
-                    Value::Integer(int_value) => {
+                    Value::Numeric(Numeric::Integer(int_value)) => {
                         program.emit_insn(Insn::Integer {
                             value: int_value,
                             dest: target_register,
                         });
                     }
-                    Value::Float(real_value) => {
+                    Value::Numeric(Numeric::Float(real_value)) => {
                         program.emit_insn(Insn::Real {
-                            value: real_value,
+                            value: real_value.into(),
                             dest: target_register,
                         });
                     }
@@ -2846,15 +2846,15 @@ pub fn translate_expr(
             }
             (UnaryOperator::BitwiseNot, ast::Expr::Literal(ast::Literal::Numeric(num_val))) => {
                 match parse_numeric_literal(num_val)? {
-                    Value::Integer(int_value) => {
+                    Value::Numeric(Numeric::Integer(int_value)) => {
                         program.emit_insn(Insn::Integer {
                             value: !int_value,
                             dest: target_register,
                         });
                     }
-                    Value::Float(real_value) => {
+                    Value::Numeric(Numeric::Float(real_value)) => {
                         program.emit_insn(Insn::Integer {
-                            value: !(real_value as i64),
+                            value: !(f64::from(real_value) as i64),
                             dest: target_register,
                         });
                     }
@@ -3628,7 +3628,26 @@ fn translate_like_base(
         ast::LikeOperator::Match => {
             crate::bail_parse_error!("MATCH requires the 'fts' feature to be enabled")
         }
-        ast::LikeOperator::Regexp => crate::bail_parse_error!("REGEXP in LIKE is not supported"),
+        ast::LikeOperator::Regexp => {
+            if escape.is_some() {
+                crate::bail_parse_error!("wrong number of arguments to function regexp()");
+            }
+            let func = resolver.resolve_function("regexp", 2);
+            let Some(func) = func else {
+                crate::bail_parse_error!("no such function: regexp");
+            };
+            let arg_count = 2;
+            let start_reg = program.alloc_registers(arg_count);
+            // regexp(pattern, haystack) — pattern is rhs, haystack is lhs
+            translate_expr(program, referenced_tables, rhs, start_reg, resolver)?;
+            translate_expr(program, referenced_tables, lhs, start_reg + 1, resolver)?;
+            program.emit_insn(Insn::Function {
+                constant_mask: 0,
+                start_reg,
+                dest: target_register,
+                func: FuncCtx { func, arg_count },
+            });
+        }
     }
 
     Ok(target_register)
@@ -3774,7 +3793,7 @@ pub fn unwrap_parens_owned(expr: ast::Expr) -> Result<(ast::Expr, usize)> {
         ast::Expr::Parenthesized(mut exprs) => match exprs.len() {
             1 => {
                 paren_count += 1;
-                let (expr, count) = unwrap_parens_owned(*exprs.pop().unwrap().clone())?;
+                let (expr, count) = unwrap_parens_owned(*exprs.pop().unwrap())?;
                 paren_count += count;
                 Ok((expr, paren_count))
             }
@@ -4194,12 +4213,14 @@ pub fn bind_and_rewrite_expr<'a>(
                             .as_ref()
                             .is_some_and(|name| name.eq_ignore_ascii_case(&normalized_id))
                     });
-                    if let Some(row_id_expr) = parse_row_id(&normalized_id, tbl_id, || false)? {
-                        *expr = row_id_expr;
-
-                        return Ok(WalkControl::Continue);
-                    }
+                    // User-defined columns take precedence over rowid aliases
+                    // (oid, rowid, _rowid_). Only fall back to parse_row_id()
+                    // when no matching user column exists.
                     let Some(col_idx) = col_idx else {
+                        if let Some(row_id_expr) = parse_row_id(&normalized_id, tbl_id, || false)? {
+                            *expr = row_id_expr;
+                            return Ok(WalkControl::Continue);
+                        }
                         crate::bail_parse_error!("no such column: {}", normalized_id);
                     };
                     let col = tbl.columns().get(col_idx).unwrap();
@@ -4661,15 +4682,15 @@ pub fn emit_literal(
     match literal {
         ast::Literal::Numeric(val) => {
             match parse_numeric_literal(val)? {
-                Value::Integer(int_value) => {
+                Value::Numeric(Numeric::Integer(int_value)) => {
                     program.emit_insn(Insn::Integer {
                         value: int_value,
                         dest: target_register,
                     });
                 }
-                Value::Float(real_value) => {
+                Value::Numeric(Numeric::Float(real_value)) => {
                     program.emit_insn(Insn::Real {
-                        value: real_value,
+                        value: real_value.into(),
                         dest: target_register,
                     });
                 }
@@ -5069,7 +5090,9 @@ pub fn expr_vector_size(expr: &Expr) -> Result<usize> {
         Expr::Parenthesized(exprs) => exprs.len(),
         Expr::Qualified(..) => 1,
         Expr::Raise(..) => crate::bail_parse_error!("RAISE is not supported"),
-        Expr::Subquery(_) => todo!(),
+        Expr::Subquery(_) => {
+            crate::bail_parse_error!("Scalar subquery is not supported in this context")
+        }
         Expr::Unary(unary_operator, expr) => {
             let evs_expr = expr_vector_size(expr)?;
             if evs_expr != 1 {

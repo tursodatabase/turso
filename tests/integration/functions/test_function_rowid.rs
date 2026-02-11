@@ -15,7 +15,7 @@ fn test_last_insert_rowid_basic(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let mut select_query = conn.query("SELECT last_insert_rowid()")?;
     if let Some(ref mut rows) = select_query {
         rows.run_with_row_callback(|row| {
-            if let turso_core::Value::Integer(id) = row.get_value(0) {
+            if let turso_core::Value::Numeric(turso_core::Numeric::Integer(id)) = row.get_value(0) {
                 assert_eq!(*id, 1, "First insert should have rowid 1");
             }
             Ok(())
@@ -30,7 +30,9 @@ fn test_last_insert_rowid_basic(tmp_db: TempDatabase) -> anyhow::Result<()> {
     match conn.query("SELECT last_insert_rowid()") {
         Ok(Some(ref mut rows)) => {
             rows.run_with_row_callback(|row| {
-                if let turso_core::Value::Integer(id) = row.get_value(0) {
+                if let turso_core::Value::Numeric(turso_core::Numeric::Integer(id)) =
+                    row.get_value(0)
+                {
                     last_id = *id;
                 }
                 Ok(())
@@ -58,7 +60,7 @@ fn test_integer_primary_key(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let mut rowids = Vec::new();
     let mut select_query = conn.query("SELECT * FROM test_rowid")?.unwrap();
     select_query.run_with_row_callback(|row| {
-        if let turso_core::Value::Integer(id) = row.get_value(0) {
+        if let turso_core::Value::Numeric(turso_core::Numeric::Integer(id)) = row.get_value(0) {
             rowids.push(*id);
         }
         Ok(())

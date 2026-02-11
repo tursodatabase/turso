@@ -347,3 +347,44 @@ pub fn translate_inner(
 
     Ok(program)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::io::MemoryIO;
+    use crate::Database;
+
+    /// Verify that REGEXP produces the correct error when no regexp function is registered.
+    #[test]
+    fn test_regexp_no_function_registered() {
+        let io = Arc::new(MemoryIO::new());
+        let db = Database::open_file(io, ":memory:").unwrap();
+        let conn = db.connect().unwrap();
+        let schema = db.schema.lock().clone();
+        let pager = conn.pager.load().clone();
+
+        // Use an empty SymbolTable so regexp() is not available.
+        let empty_syms = SymbolTable::new();
+        let mut parser = turso_parser::parser::Parser::new(b"SELECT 'x' REGEXP 'y'");
+        let cmd = parser.next().unwrap().unwrap();
+        let stmt = match cmd {
+            ast::Cmd::Stmt(s) => s,
+            _ => panic!("expected statement"),
+        };
+
+        let result = translate(
+            &schema,
+            stmt,
+            pager,
+            conn,
+            &empty_syms,
+            QueryMode::Normal,
+            "",
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("no such function: regexp"),
+            "expected 'no such function: regexp', got: {err}"
+        );
+    }
+}

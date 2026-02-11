@@ -20,11 +20,14 @@ use crate::types::{
     ImmutableRecord, IndexInfo, SeekResult, Text,
 };
 use crate::util::{
-    normalize_ident, rewrite_column_references_if_needed, rewrite_fk_parent_cols_if_self_ref,
+    normalize_ident, rewrite_check_expr_column_refs, rewrite_check_expr_table_refs,
+    rewrite_column_references_if_needed, rewrite_fk_parent_cols_if_self_ref,
     rewrite_fk_parent_table_if_needed, rewrite_inline_col_fk_target_if_needed,
     trim_ascii_whitespace,
 };
-use crate::vdbe::affinity::{apply_numeric_affinity, try_for_float, Affinity, ParsedNumber};
+use crate::vdbe::affinity::{
+    apply_numeric_affinity, try_for_float, Affinity, NumericParseResult, ParsedNumber,
+};
 use crate::vdbe::hash_table::{HashEntry, HashTable, HashTableConfig, DEFAULT_MEM_BUDGET};
 use crate::vdbe::insn::InsertFlags;
 use crate::vdbe::value::ComparisonOp;
@@ -38,7 +41,8 @@ use crate::vector::{
 };
 use crate::{
     error::{
-        LimboError, SQLITE_CONSTRAINT, SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY,
+        LimboError, SQLITE_CONSTRAINT, SQLITE_CONSTRAINT_CHECK, SQLITE_CONSTRAINT_NOTNULL,
+        SQLITE_CONSTRAINT_PRIMARYKEY,
     },
     ext::ExtValue,
     function::{AggFunc, ExtFunc, MathFunc, MathFuncArity, ScalarFunc, VectorFunc},
@@ -376,11 +380,11 @@ pub fn op_checkpoint(
         } = pager.io.block(|| ckpt_sm.step(&()))?;
         // https://sqlite.org/pragma.html#pragma_wal_checkpoint
         // 1st col: 1 (checkpoint SQLITE_BUSY) or 0 (not busy).
-        state.registers[*dest] = Register::Value(Value::Integer(0));
+        state.registers[*dest] = Register::Value(Value::from_i64(0));
         // 2nd col: # modified pages written to wal file
-        state.registers[*dest + 1] = Register::Value(Value::Integer(wal_max_frame as i64));
+        state.registers[*dest + 1] = Register::Value(Value::from_i64(wal_max_frame as i64));
         // 3rd col: # pages moved to db after checkpoint
-        state.registers[*dest + 2] = Register::Value(Value::Integer(wal_total_backfilled as i64));
+        state.registers[*dest + 2] = Register::Value(Value::from_i64(wal_total_backfilled as i64));
 
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
@@ -398,12 +402,12 @@ pub fn op_checkpoint(
         })) => {
             // https://sqlite.org/pragma.html#pragma_wal_checkpoint
             // 1st col: 1 (checkpoint SQLITE_BUSY) or 0 (not busy).
-            state.registers[*dest] = Register::Value(Value::Integer(0));
+            state.registers[*dest] = Register::Value(Value::from_i64(0));
             // 2nd col: # modified pages written to wal file
-            state.registers[*dest + 1] = Register::Value(Value::Integer(wal_max_frame as i64));
+            state.registers[*dest + 1] = Register::Value(Value::from_i64(wal_max_frame as i64));
             // 3rd col: # pages moved to db after checkpoint
             state.registers[*dest + 2] =
-                Register::Value(Value::Integer(wal_total_backfilled as i64));
+                Register::Value(Value::from_i64(wal_total_backfilled as i64));
 
             state.pc += 1;
             Ok(InsnFunctionStepResult::Step)
@@ -412,7 +416,7 @@ pub fn op_checkpoint(
         Err(err) => {
             tracing::error!("PRAGMA wal_checkpoint failed: {err:?}");
             program.connection.pager.load().clear_checkpoint_state();
-            state.registers[*dest] = Register::Value(Value::Integer(1));
+            state.registers[*dest] = Register::Value(Value::from_i64(1));
             state.pc += 1;
             Ok(InsnFunctionStepResult::Step)
         }
@@ -442,17 +446,13 @@ pub fn op_null(
 }
 
 pub fn op_null_row(
-    program: &Program,
+    _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(NullRow { cursor_id }, insn);
-    {
-        let cursor = must_be_btree_cursor!(*cursor_id, program.cursor_ref, state, "NullRow");
-        let cursor = cursor.as_btree_mut();
-        cursor.set_null_flag(true);
-    }
+    state.get_cursor(*cursor_id).set_null_flag(true);
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -574,11 +574,11 @@ pub fn op_if_pos(
     let reg = *reg;
     let target_pc = *target_pc;
     match state.registers[reg].get_value() {
-        Value::Integer(n) if *n > 0 => {
+        Value::Numeric(Numeric::Integer(n)) if *n > 0 => {
             state.pc = target_pc.as_offset_int();
-            state.registers[reg] = Register::Value(Value::Integer(*n - *decrement_by as i64));
+            state.registers[reg] = Register::Value(Value::from_i64(*n - *decrement_by as i64));
         }
-        Value::Integer(_) => {
+        Value::Numeric(Numeric::Integer(_)) => {
             state.pc += 1;
         }
         _ => {
@@ -719,7 +719,9 @@ pub fn op_comparison(
     let rhs_value = state.registers[rhs].get_value();
 
     // Fast path for integers
-    if matches!(lhs_value, Value::Integer(_)) && matches!(rhs_value, Value::Integer(_)) {
+    if matches!(lhs_value, Value::Numeric(Numeric::Integer(_)))
+        && matches!(rhs_value, Value::Numeric(Numeric::Integer(_)))
+    {
         if op.compare(lhs_value, rhs_value, collation) {
             state.pc = target_pc.as_offset_int();
         } else {
@@ -936,7 +938,7 @@ pub fn op_open_read(
             let mv_cursor = crate::incremental::cursor::MaterializedViewCursor::new(
                 cursor,
                 view_mutex.clone(),
-                pager.clone(),
+                pager,
                 tx_state,
             )?;
 
@@ -948,7 +950,7 @@ pub fn op_open_read(
         CursorType::BTreeTable(_) => {
             // Regular table
             let btree_cursor = Box::new(BTreeCursor::new_table(
-                pager.clone(),
+                pager,
                 maybe_transform_root_page_to_positive(mv_store.as_ref(), *root_page),
                 num_columns,
             ));
@@ -960,7 +962,7 @@ pub fn op_open_read(
         }
         CursorType::BTreeIndex(index) => {
             let btree_cursor = Box::new(BTreeCursor::new_index(
-                pager.clone(),
+                pager,
                 *root_page,
                 index.as_ref(),
                 num_columns,
@@ -1047,7 +1049,7 @@ pub fn op_vcreate(
     let table =
         crate::VirtualTable::table(Some(&table_name), &module_name, args, &conn.syms.read())?;
     {
-        conn.syms.write().vtabs.insert(table_name, table.clone());
+        conn.syms.write().vtabs.insert(table_name, table);
     }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -1652,7 +1654,29 @@ pub fn op_type_check(
             let _applied = apply_affinity_char(reg, col_affinity);
             let value_type = reg.get_value().value_type();
             match_ignore_ascii_case!(match ty_bytes {
-                b"INTEGER" | b"INT" if value_type == ValueType::Integer => {}
+                b"INTEGER" | b"INT"
+                    if value_type == ValueType::Integer || value_type == ValueType::Float =>
+                {
+                    if value_type == ValueType::Float {
+                        if let Register::Value(value) = reg {
+                            if let Value::Float(f) = *value {
+                                let i = f as i64;
+                                if (i as f64) == f {
+                                    *value = Value::Integer(i);
+                                } else {
+                                    bail_constraint_error!(
+                                        "cannot store {} value in {} column {}.{} ({})",
+                                        value_type,
+                                        ty_str,
+                                        &table_reference.name,
+                                        col.name.as_deref().unwrap_or(""),
+                                        SQLITE_CONSTRAINT
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
                 b"REAL" if value_type == ValueType::Float => {}
                 b"BLOB" if value_type == ValueType::Blob => {}
                 b"TEXT" if value_type == ValueType::Text => {}
@@ -1730,7 +1754,7 @@ pub fn op_mem_max(
     let src_int = extract_int_value(src_val);
 
     if dest_int < src_int {
-        state.registers[*dest_reg] = Register::Value(Value::Integer(src_int));
+        state.registers[*dest_reg] = Register::Value(Value::from_i64(src_int));
     }
 
     state.pc += 1;
@@ -1879,6 +1903,9 @@ pub fn halt(
         0 => None,
         SQLITE_CONSTRAINT_PRIMARYKEY => Some(LimboError::Constraint(format!(
             "UNIQUE constraint failed: {description} (19)"
+        ))),
+        SQLITE_CONSTRAINT_CHECK => Some(LimboError::Constraint(format!(
+            "CHECK constraint failed: {description} (19)"
         ))),
         SQLITE_CONSTRAINT_NOTNULL => Some(LimboError::Constraint(format!(
             "NOT NULL constraint failed: {description} (19)"
@@ -2529,7 +2556,7 @@ pub fn op_gosub(
     if !target_pc.is_offset() {
         crate::bail_corrupt_error!("Unresolved label: {target_pc:?}");
     }
-    state.registers[*return_reg] = Register::Value(Value::Integer((state.pc + 1) as i64));
+    state.registers[*return_reg] = Register::Value(Value::from_i64((state.pc + 1) as i64));
     state.pc = target_pc.as_offset_int();
     Ok(InsnFunctionStepResult::Step)
 }
@@ -2547,7 +2574,7 @@ pub fn op_return(
         },
         insn
     );
-    if let Value::Integer(pc) = state.registers[*return_reg].get_value() {
+    if let Value::Numeric(Numeric::Integer(pc)) = state.registers[*return_reg].get_value() {
         let pc: u32 = (*pc)
             .try_into()
             .unwrap_or_else(|_| panic!("Return register is negative: {pc}"));
@@ -2570,7 +2597,7 @@ pub fn op_integer(
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(Integer { value, dest }, insn);
-    state.registers[*dest] = Register::Value(Value::Integer(*value));
+    state.registers[*dest] = Register::Value(Value::from_i64(*value));
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -2615,7 +2642,7 @@ pub fn op_program(
                 // Extract register values from params (which contain register indices encoded as negative integers)
                 // and bind them to the subprogram's parameters
                 for (param_idx, param_value) in params.iter().enumerate() {
-                    if let Value::Integer(reg_idx) = param_value {
+                    if let Value::Numeric(Numeric::Integer(reg_idx)) = param_value {
                         let reg_idx = *reg_idx as usize;
                         if reg_idx < state.registers.len() {
                             let value = state.registers[reg_idx].get_value().clone();
@@ -2689,7 +2716,7 @@ pub fn op_real(
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(Real { value, dest }, insn);
-    state.registers[*dest] = Register::Value(Value::Float(*value));
+    state.registers[*dest] = Register::Value(Value::from_f64(*value));
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -2701,8 +2728,8 @@ pub fn op_real_affinity(
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(RealAffinity { register }, insn);
-    if let Value::Integer(i) = &state.registers[*register].get_value() {
-        state.registers[*register] = Register::Value(Value::Float(*i as f64));
+    if let Value::Numeric(Numeric::Integer(i)) = &state.registers[*register].get_value() {
+        state.registers[*register] = Register::Value(Value::from_f64(*i as f64));
     };
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -2807,7 +2834,7 @@ pub fn op_row_id(
                                 .last_value()
                                 .expect("record should have a last value");
                             match rowid {
-                                Ok(ValueRef::Integer(rowid)) => rowid,
+                                Ok(ValueRef::Numeric(Numeric::Integer(rowid))) => rowid,
                                 _ => unreachable!(),
                             }
                         }
@@ -2911,7 +2938,7 @@ pub fn op_idx_row_id(
         _ => panic!("unexpected cursor type"),
     };
     state.registers[*dest] = match rowid {
-        Some(rowid) => Register::Value(Value::Integer(rowid)),
+        Some(rowid) => Register::Value(Value::from_i64(rowid)),
         None => Register::Value(Value::Null),
     };
     state.pc += 1;
@@ -2942,7 +2969,7 @@ pub fn op_seek_rowid(
         let (pc, did_seek) = match cursor {
             Cursor::MaterializedView(mv_cursor) => {
                 let rowid = match state.registers[*src_reg].get_value() {
-                    Value::Integer(rowid) => Some(*rowid),
+                    Value::Numeric(Numeric::Integer(rowid)) => Some(*rowid),
                     Value::Null => None,
                     _ => None,
                 };
@@ -2963,7 +2990,7 @@ pub fn op_seek_rowid(
             }
             Cursor::BTree(btree_cursor) => {
                 let rowid = match state.registers[*src_reg].get_value() {
-                    Value::Integer(rowid) => Some(*rowid),
+                    Value::Numeric(Numeric::Integer(rowid)) => Some(*rowid),
                     Value::Null => None,
                     // For non-integer values try to apply affinity and convert them to integer.
                     other => {
@@ -2971,8 +2998,8 @@ pub fn op_seek_rowid(
                         let converted = apply_affinity_char(&mut temp_reg, Affinity::Numeric);
                         if converted {
                             match temp_reg.get_value() {
-                                Value::Integer(i) => Some(*i),
-                                Value::Float(f) => Some(*f as i64),
+                                Value::Numeric(Numeric::Integer(i)) => Some(*i),
+                                Value::Numeric(Numeric::Float(f)) => Some(f64::from(*f) as i64),
                                 _ => None,
                             }
                         } else {
@@ -3225,15 +3252,15 @@ pub fn seek_internal(
                         true // Non-text values don't need conversion
                     };
                     let int_key = extract_int_value(&temp_value);
-                    let lost_precision =
-                        !conversion_successful || !matches!(temp_value, Value::Integer(_));
+                    let lost_precision = !conversion_successful
+                        || !matches!(temp_value, Value::Numeric(Numeric::Integer(_)));
                     let actual_op = if lost_precision {
                         match &temp_value {
-                            Value::Float(f) => {
+                            Value::Numeric(Numeric::Float(f)) => {
                                 let int_key_as_float = int_key as f64;
-                                let c = if int_key_as_float > *f {
+                                let c = if int_key_as_float > f64::from(*f) {
                                     1
-                                } else if int_key_as_float < *f {
+                                } else if int_key_as_float < f64::from(*f) {
                                     -1
                                 } else {
                                     0
@@ -3687,9 +3714,9 @@ pub fn op_decr_jump_zero(
         crate::bail_corrupt_error!("Unresolved label: {target_pc:?}");
     }
     match state.registers[*reg].get_value() {
-        Value::Integer(n) => {
+        Value::Numeric(Numeric::Integer(n)) => {
             let n = n - 1;
-            state.registers[*reg] = Register::Value(Value::Integer(n));
+            state.registers[*reg] = Register::Value(Value::from_i64(n));
             if n == 0 {
                 state.pc = target_pc.as_offset_int();
             } else {
@@ -3710,7 +3737,7 @@ fn apply_kbn_step(acc: &mut Value, r: f64, state: &mut SumAggState) {
         (r - t) + s
     };
     state.r_err += correction;
-    *acc = Value::Float(t);
+    *acc = Value::from_f64(t);
 }
 
 // Add a (possibly large) integer to the running sum.
@@ -3740,22 +3767,22 @@ fn apply_kbn_step_int(acc: &mut Value, i: i64, state: &mut SumAggState) {
 /// - JsonGroupArray/JsonbGroupArray: [Blob([])]
 fn init_agg_payload(func: &AggFunc, payload: &mut Vec<Value>) -> Result<()> {
     match func {
-        AggFunc::Count | AggFunc::Count0 => payload.push(Value::Integer(0)),
+        AggFunc::Count | AggFunc::Count0 => payload.push(Value::from_i64(0)),
         AggFunc::Sum | AggFunc::Total => {
             let acc = if matches!(func, AggFunc::Total) {
-                Value::Float(0.0)
+                Value::from_f64(0.0)
             } else {
                 Value::Null
             };
             payload.push(acc);
-            payload.push(Value::Float(0.0));
-            payload.push(Value::Integer(0));
-            payload.push(Value::Integer(0));
+            payload.push(Value::from_f64(0.0));
+            payload.push(Value::from_i64(0));
+            payload.push(Value::from_i64(0));
         }
         AggFunc::Avg => {
-            payload.push(Value::Float(0.0));
-            payload.push(Value::Float(0.0));
-            payload.push(Value::Integer(0));
+            payload.push(Value::from_f64(0.0));
+            payload.push(Value::from_f64(0.0));
+            payload.push(Value::from_i64(0));
         }
         AggFunc::Min | AggFunc::Max => payload.push(Value::Null),
         AggFunc::GroupConcat | AggFunc::StringAgg => {
@@ -3816,7 +3843,7 @@ fn update_agg_payload(
             // (would indicate a bug in query translation, but matches SQLite behavior of counting).
             if !matches!(arg, Value::Null) {
                 // invariant as per init_agg_payload: payload[0] is always an integer
-                let Value::Integer(i) = &mut payload[0] else {
+                let Value::Numeric(Numeric::Integer(i)) = &mut payload[0] else {
                     return Err(LimboError::InternalError(
                         "Count: payload is not an integer".to_string(),
                     ));
@@ -3826,7 +3853,7 @@ fn update_agg_payload(
         }
         AggFunc::Count0 => {
             // invariant as per init_agg_payload: payload[0] is always an integer
-            let Value::Integer(i) = &mut payload[0] else {
+            let Value::Numeric(Numeric::Integer(i)) = &mut payload[0] else {
                 return Err(LimboError::InternalError(
                     "Count0: payload is not an integer".to_string(),
                 ));
@@ -3843,33 +3870,26 @@ fn update_agg_payload(
                     "Avg: payload too short".to_string(),
                 ));
             };
-            let Value::Float(r_err) = r_err_val else {
-                return Err(LimboError::InternalError(
-                    "Avg: payload[1] is not a float".to_string(),
-                ));
-            };
-            let Value::Integer(count) = count_val else {
+            let r_err = r_err_val.as_float();
+            let Value::Numeric(Numeric::Integer(count)) = count_val else {
                 return Err(LimboError::InternalError(
                     "Avg: payload[2] is not an integer".to_string(),
                 ));
             };
             let val = match arg {
-                Value::Integer(i) => i as f64,
-                Value::Float(f) => f,
-                Value::Text(t) => match try_for_float(t.as_str()).1 {
+                Value::Numeric(Numeric::Integer(i)) => i as f64,
+                Value::Numeric(Numeric::Float(f)) => f64::from(f),
+                Value::Text(t) => match try_for_float(t.as_str().as_bytes()).1 {
                     ParsedNumber::Integer(i) => i as f64,
                     ParsedNumber::Float(f) => f,
                     ParsedNumber::None => 0.0,
                 },
-                Value::Blob(b) => match std::str::from_utf8(&b) {
-                    Ok(s) => match try_for_float(s).1 {
-                        ParsedNumber::Integer(i) => i as f64,
-                        ParsedNumber::Float(f) => f,
-                        ParsedNumber::None => 0.0,
-                    },
-                    Err(_) => 0.0,
+                Value::Blob(b) => match try_for_float(&b).1 {
+                    ParsedNumber::Integer(i) => i as f64,
+                    ParsedNumber::Float(f) => f,
+                    ParsedNumber::None => 0.0,
                 },
-                Value::Null => unreachable!(),
+                _ => unreachable!(),
             };
             // Use Kahan-Babuška-Neumaier compensation for better floating-point precision
             let s = sum_val.as_float();
@@ -3879,8 +3899,8 @@ fn update_agg_payload(
             } else {
                 (val - t) + s
             };
-            *r_err += correction;
-            *sum_val = Value::Float(t);
+            *r_err_val = Value::from_f64(r_err + correction);
+            *sum_val = Value::from_f64(t);
             *count = count.checked_add(1).ok_or(LimboError::IntegerOverflow)?;
         }
         AggFunc::Sum | AggFunc::Total => {
@@ -3891,38 +3911,34 @@ fn update_agg_payload(
                     "Sum/Total: payload too short".to_string(),
                 ));
             };
-            let Value::Float(r_err) = r_err_val else {
-                return Err(LimboError::InternalError(
-                    "Sum/Total: payload[1] is not a float".to_string(),
-                ));
-            };
-            let Value::Integer(approx_i) = approx_val else {
+            let r_err_f = r_err_val.as_float();
+            let Value::Numeric(Numeric::Integer(approx_i)) = approx_val else {
                 return Err(LimboError::InternalError(
                     "Sum/Total: payload[2] is not an integer".to_string(),
                 ));
             };
-            let Value::Integer(ovrfl_i) = ovrfl_val else {
+            let Value::Numeric(Numeric::Integer(ovrfl_i)) = ovrfl_val else {
                 return Err(LimboError::InternalError(
                     "Sum/Total: payload[3] is not an integer".to_string(),
                 ));
             };
             let mut sum_state = SumAggState {
-                r_err: *r_err,
+                r_err: r_err_f,
                 approx: *approx_i != 0,
                 ovrfl: *ovrfl_i != 0,
             };
             match arg {
                 Value::Null => {}
-                Value::Integer(i) => match acc {
+                Value::Numeric(Numeric::Integer(i)) => match acc {
                     Value::Null => {
-                        *acc = Value::Integer(i);
+                        *acc = Value::from_i64(i);
                     }
-                    Value::Integer(acc_i) => match acc_i.checked_add(i) {
+                    Value::Numeric(Numeric::Integer(acc_i)) => match acc_i.checked_add(i) {
                         Some(sum) => *acc_i = sum,
                         None => {
                             if matches!(func, AggFunc::Total) {
                                 let acc_f = *acc_i as f64;
-                                *acc = Value::Float(acc_f);
+                                *acc = Value::from_f64(acc_f);
                                 sum_state.approx = true;
                                 sum_state.ovrfl = true;
                                 apply_kbn_step_int(acc, i, &mut sum_state);
@@ -3931,41 +3947,37 @@ fn update_agg_payload(
                             }
                         }
                     },
-                    Value::Float(_) => {
+                    Value::Numeric(Numeric::Float(_)) => {
                         apply_kbn_step_int(acc, i, &mut sum_state);
                     }
                     _ => unreachable!("Sum/Total accumulator initialized to Null/Integer/Float"),
                 },
-                Value::Float(f) => match acc {
+                Value::Numeric(Numeric::Float(f)) => match acc {
                     Value::Null => {
-                        *acc = Value::Float(f);
+                        *acc = Value::Numeric(Numeric::Float(f));
                         sum_state.approx = true;
                     }
-                    Value::Integer(i) => {
-                        *acc = Value::Float(*i as f64);
+                    Value::Numeric(Numeric::Integer(i)) => {
+                        *acc = Value::from_f64(*i as f64);
                         sum_state.approx = true;
-                        apply_kbn_step(acc, f, &mut sum_state);
+                        apply_kbn_step(acc, f64::from(f), &mut sum_state);
                     }
-                    Value::Float(_) => {
+                    Value::Numeric(Numeric::Float(_)) => {
                         sum_state.approx = true;
-                        apply_kbn_step(acc, f, &mut sum_state);
+                        apply_kbn_step(acc, f64::from(f), &mut sum_state);
                     }
                     _ => unreachable!("Sum/Total accumulator initialized to Null/Integer/Float"),
                 },
                 Value::Text(t) => {
-                    let (_, parsed_number) = try_for_float(t.as_str());
-                    handle_text_sum(acc, &mut sum_state, parsed_number);
+                    let (parse_result, parsed_number) = try_for_float(t.as_str().as_bytes());
+                    handle_text_sum(acc, &mut sum_state, parsed_number, parse_result);
                 }
                 Value::Blob(b) => {
-                    if let Ok(s) = std::str::from_utf8(&b) {
-                        let (_, parsed_number) = try_for_float(s);
-                        handle_text_sum(acc, &mut sum_state, parsed_number);
-                    } else {
-                        handle_text_sum(acc, &mut sum_state, ParsedNumber::None);
-                    }
+                    let (parse_result, parsed_number) = try_for_float(&b);
+                    handle_text_sum(acc, &mut sum_state, parsed_number, parse_result);
                 }
             }
-            *r_err = sum_state.r_err;
+            *r_err_val = Value::from_f64(sum_state.r_err);
             *approx_i = sum_state.approx as i64;
             *ovrfl_i = sum_state.ovrfl as i64;
         }
@@ -4078,7 +4090,7 @@ fn finalize_agg_payload(func: &AggFunc, payload: &[Value]) -> Result<Value> {
                 Value::Null
             } else {
                 // Apply KBN compensation before dividing
-                Value::Float((sum + r_err) / count as f64)
+                Value::from_f64((sum + r_err) / count as f64)
             }
         }
         AggFunc::Sum => {
@@ -4089,13 +4101,13 @@ fn finalize_agg_payload(func: &AggFunc, payload: &[Value]) -> Result<Value> {
             match acc {
                 Value::Null => {
                     if approx {
-                        Value::Float(0.0)
+                        Value::from_f64(0.0)
                     } else {
                         Value::Null
                     }
                 }
-                Value::Integer(i) if !approx && !ovrfl => Value::Integer(*i),
-                _ => Value::Float(acc.as_float() + r_err),
+                Value::Numeric(Numeric::Integer(i)) if !approx && !ovrfl => Value::from_i64(*i),
+                _ => Value::from_f64(acc.as_float() + r_err),
             }
         }
         AggFunc::Total => {
@@ -4103,9 +4115,9 @@ fn finalize_agg_payload(func: &AggFunc, payload: &[Value]) -> Result<Value> {
             let acc = &payload[0];
             let r_err = payload[1].as_float();
             match acc {
-                Value::Null => Value::Float(0.0),
-                Value::Integer(i) => Value::Float(*i as f64 + r_err),
-                Value::Float(f) => Value::Float(*f + r_err),
+                Value::Null => Value::from_f64(0.0),
+                Value::Numeric(Numeric::Integer(i)) => Value::from_f64(*i as f64 + r_err),
+                Value::Numeric(Numeric::Float(f)) => Value::from_f64(f64::from(*f) + r_err),
                 _ => unreachable!("Total accumulator initialized to Null/Integer/Float"),
             }
         }
@@ -4277,10 +4289,10 @@ pub fn op_agg_final(
             // When the set is empty, return appropriate default
             match func {
                 AggFunc::Total => {
-                    state.registers[dest_reg] = Register::Value(Value::Float(0.0));
+                    state.registers[dest_reg] = Register::Value(Value::from_f64(0.0));
                 }
                 AggFunc::Count | AggFunc::Count0 => {
-                    state.registers[dest_reg] = Register::Value(Value::Integer(0));
+                    state.registers[dest_reg] = Register::Value(Value::from_i64(0));
                 }
                 _ => {}
             }
@@ -4547,7 +4559,7 @@ pub fn op_rowset_add(
 
     let value = state.registers[*value_reg].get_value();
     let rowid = match value {
-        Value::Integer(i) => *i,
+        Value::Numeric(Numeric::Integer(i)) => *i,
         _ => {
             return Err(LimboError::InternalError(
                 "RowSetAdd: P2 must be an integer".to_string(),
@@ -4588,7 +4600,7 @@ pub fn op_rowset_read(
             if rowset.is_empty() {
                 state.pc = pc_if_empty.as_offset_int();
             } else if let Some(smallest) = rowset.smallest() {
-                state.registers[*dest_reg] = Register::Value(Value::Integer(smallest));
+                state.registers[*dest_reg] = Register::Value(Value::from_i64(smallest));
                 state.pc += 1;
             } else {
                 state.pc = pc_if_empty.as_offset_int();
@@ -4635,7 +4647,7 @@ pub fn op_rowset_test(
 
     let value = state.registers[*value_reg].get_value();
     let rowid = match value {
-        Value::Integer(i) => *i,
+        Value::Numeric(Numeric::Integer(i)) => *i,
         _ => {
             return Err(LimboError::InternalError(
                 "RowSetTest: P3 must be an integer".to_string(),
@@ -4909,8 +4921,8 @@ pub fn op_function(
                 let indent = match indent {
                     Some(value) => match value.get_value() {
                         Value::Text(text) => text.as_str(),
-                        Value::Integer(val) => &val.to_string(),
-                        Value::Float(val) => &val.to_string(),
+                        Value::Numeric(Numeric::Integer(val)) => &val.to_string(),
+                        Value::Numeric(Numeric::Float(val)) => &f64::from(*val).to_string(),
                         Value::Blob(val) => &String::from_utf8_lossy(val),
                         _ => "    ",
                     },
@@ -4976,7 +4988,7 @@ pub fn op_function(
             ScalarFunc::Changes => {
                 let res = &program.connection.last_change;
                 let changes = res.load(Ordering::SeqCst);
-                state.registers[*dest] = Register::Value(Value::Integer(changes));
+                state.registers[*dest] = Register::Value(Value::from_i64(changes));
             }
             ScalarFunc::Char => {
                 let reg_values = &state.registers[*start_reg..*start_reg + arg_count];
@@ -5028,7 +5040,7 @@ pub fn op_function(
                     };
 
                     let matches = Value::exec_glob(&pattern_cow, &match_cow)?;
-                    state.registers[*dest] = Register::Value(Value::Integer(matches as i64));
+                    state.registers[*dest] = Register::Value(Value::from_i64(matches as i64));
                 }
             }
             ScalarFunc::IfNull => {}
@@ -5041,7 +5053,7 @@ pub fn op_function(
             }
             ScalarFunc::LastInsertRowid => {
                 state.registers[*dest] =
-                    Register::Value(Value::Integer(program.connection.last_insert_rowid()));
+                    Register::Value(Value::from_i64(program.connection.last_insert_rowid()));
             }
             ScalarFunc::Like => {
                 let pattern_reg = &state.registers[*start_reg];
@@ -5107,7 +5119,7 @@ pub fn op_function(
 
                         // 4. Execute Like
                         let matches = Value::exec_like(&pattern_cow, &match_cow, escape_char)?;
-                        state.registers[*dest] = Register::Value(Value::Integer(matches as i64));
+                        state.registers[*dest] = Register::Value(Value::from_i64(matches as i64));
                     }
                 }
             }
@@ -5273,7 +5285,7 @@ pub fn op_function(
             ScalarFunc::TotalChanges => {
                 let res = &program.connection.total_changes;
                 let total_changes = res.load(Ordering::SeqCst);
-                state.registers[*dest] = Register::Value(Value::Integer(total_changes));
+                state.registers[*dest] = Register::Value(Value::from_i64(total_changes));
             }
             ScalarFunc::DateTime => {
                 let values =
@@ -5529,7 +5541,7 @@ pub fn op_function(
                 // Returns a blob containing the serialized StatAccum
                 assert!(arg_count >= 1);
                 let n_col = match state.registers[*start_reg].get_value() {
-                    Value::Integer(n) => *n as usize,
+                    Value::Numeric(Numeric::Integer(n)) => *n as usize,
                     _ => 0,
                 };
                 let accum = StatAccum::new(n_col);
@@ -5542,7 +5554,7 @@ pub fn op_function(
                 assert!(arg_count >= 2);
                 let accum_blob = state.registers[*start_reg].get_value();
                 let i_chng = match state.registers[*start_reg + 1].get_value() {
-                    Value::Integer(n) => *n as usize,
+                    Value::Numeric(Numeric::Integer(n)) => *n as usize,
                     _ => 0,
                 };
                 let result = match accum_blob {
@@ -5666,7 +5678,7 @@ pub fn op_function(
         crate::function::Func::Math(math_func) => match math_func.arity() {
             MathFuncArity::Nullary => match math_func {
                 MathFunc::Pi => {
-                    state.registers[*dest] = Register::Value(Value::Float(std::f64::consts::PI));
+                    state.registers[*dest] = Register::Value(Value::from_f64(std::f64::consts::PI));
                 }
                 _ => {
                     unreachable!("Unexpected mathematical Nullary function {:?}", math_func);
@@ -5724,7 +5736,8 @@ pub fn op_function(
             };
             let tbl_name = tbl_name.to_string();
 
-            let Value::Integer(root_page) = &state.registers[*start_reg + 3].get_value().clone()
+            let Value::Numeric(Numeric::Integer(root_page)) =
+                &state.registers[*start_reg + 3].get_value().clone()
             else {
                 panic!("sqlite_schema.root_page should be INTEGER")
             };
@@ -5773,7 +5786,10 @@ pub fn op_function(
                         let ast::Cmd::Stmt(stmt) =
                             parser.next().expect("parser should have next item")?
                         else {
-                            todo!()
+                            return Err(LimboError::InternalError(
+                                "Unexpected command during ALTER TABLE RENAME processing"
+                                    .to_string(),
+                            ));
                         };
 
                         match stmt {
@@ -5821,7 +5837,10 @@ pub fn op_function(
                                     options,
                                 } = body
                                 else {
-                                    todo!()
+                                    return Err(LimboError::InternalError(
+                                        "CREATE TABLE AS SELECT schemas cannot be altered"
+                                            .to_string(),
+                                    ));
                                 };
 
                                 let mut any_change = false;
@@ -5844,6 +5863,35 @@ pub fn op_function(
                                         &rename_from,
                                         original_rename_to.as_str(),
                                     );
+                                }
+
+                                // Rewrite table-qualified refs in CHECK constraints
+                                // (e.g. t1.a > 0 → t2.a > 0)
+                                if this_table == rename_from {
+                                    for c in &mut constraints {
+                                        if let ast::TableConstraint::Check(ref mut expr) =
+                                            c.constraint
+                                        {
+                                            rewrite_check_expr_table_refs(
+                                                expr,
+                                                &rename_from,
+                                                &rename_to,
+                                            );
+                                        }
+                                    }
+                                    for col in &mut columns {
+                                        for cc in &mut col.constraints {
+                                            if let ast::ColumnConstraint::Check(ref mut expr) =
+                                                cc.constraint
+                                            {
+                                                rewrite_check_expr_table_refs(
+                                                    expr,
+                                                    &rename_from,
+                                                    &rename_to,
+                                                );
+                                            }
+                                        }
+                                    }
                                 }
 
                                 if this_table == rename_from {
@@ -5952,7 +6000,10 @@ pub fn op_function(
                         let ast::Cmd::Stmt(stmt) =
                             parser.next().expect("parser should have next item")?
                         else {
-                            todo!()
+                            return Err(LimboError::InternalError(
+                                "Unexpected command during ALTER TABLE RENAME COLUMN processing"
+                                    .to_string(),
+                            ));
                         };
 
                         match stmt {
@@ -6009,7 +6060,10 @@ pub fn op_function(
                                     options,
                                 } = body
                                 else {
-                                    todo!()
+                                    return Err(LimboError::InternalError(
+                                        "CREATE TABLE AS SELECT schemas cannot be altered"
+                                            .to_string(),
+                                    ));
                                 };
 
                                 let normalized_tbl_name = normalize_ident(tbl_name.name.as_str());
@@ -6093,17 +6147,23 @@ pub fn op_function(
                                                     column_def.col_name.as_str(),
                                                 );
                                             }
-                                            _ => {}
+                                            ast::TableConstraint::Check(ref mut expr) => {
+                                                rewrite_check_expr_column_refs(
+                                                    expr,
+                                                    &rename_from,
+                                                    column_def.col_name.as_str(),
+                                                );
+                                            }
                                         }
+                                    }
 
-                                        for col in &mut columns {
-                                            rewrite_column_references_if_needed(
-                                                col,
-                                                &normalized_tbl_name,
-                                                &rename_from,
-                                                column_def.col_name.as_str(),
-                                            );
-                                        }
+                                    for col in &mut columns {
+                                        rewrite_column_references_if_needed(
+                                            col,
+                                            &normalized_tbl_name,
+                                            &rename_from,
+                                            column_def.col_name.as_str(),
+                                        );
                                     }
                                 } else {
                                     // This is a different table, check if it has FKs referencing the renamed column
@@ -6182,7 +6242,7 @@ pub fn op_function(
             state.registers[*dest] = Register::Value(r#type.clone());
             state.registers[*dest + 1] = Register::Value(Value::Text(Text::from(new_name)));
             state.registers[*dest + 2] = Register::Value(Value::Text(Text::from(new_tbl_name)));
-            state.registers[*dest + 3] = Register::Value(Value::Integer(*root_page));
+            state.registers[*dest + 3] = Register::Value(Value::from_i64(*root_page));
 
             if let Some(new_sql) = new_sql {
                 state.registers[*dest + 4] = Register::Value(Value::Text(Text::from(new_sql)));
@@ -6198,7 +6258,7 @@ pub fn op_function(
             match fts_func {
                 FtsFunc::Score => {
                     // Without an FTS index match, return 0.0 as a default score
-                    state.registers[*dest] = Register::Value(Value::Float(0.0));
+                    state.registers[*dest] = Register::Value(Value::from_f64(0.0));
                 }
                 FtsFunc::Match => {
                     // fts_match(col1, col2, ..., query): returns 1 if any column matches query
@@ -6214,7 +6274,7 @@ pub fn op_function(
                     let query = state.registers[*start_reg + num_text_cols].get_value();
 
                     if matches!(query, Value::Null) {
-                        state.registers[*dest] = Register::Value(Value::Integer(0));
+                        state.registers[*dest] = Register::Value(Value::from_i64(0));
                     } else {
                         let query_str = query.to_string();
 
@@ -6233,7 +6293,7 @@ pub fn op_function(
 
                         let matches =
                             crate::index_method::fts::fts_match(&combined_text, &query_str);
-                        state.registers[*dest] = Register::Value(Value::Integer(matches.into()));
+                        state.registers[*dest] = Register::Value(Value::from_i64(matches.into()));
                     }
                 }
                 FtsFunc::Highlight => {
@@ -6315,7 +6375,7 @@ pub fn op_sequence(
         .expect("cursor_id should be valid");
     let seq_num = *cursor_seq;
     *cursor_seq += 1;
-    state.registers[*target_reg] = Register::Value(Value::Integer(seq_num));
+    state.registers[*target_reg] = Register::Value(Value::from_i64(seq_num));
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -6364,7 +6424,7 @@ pub fn op_init_coroutine(
     );
     assert!(jump_on_definition.is_offset());
     let start_offset = start_offset.as_offset_int();
-    state.registers[*yield_reg] = Register::Value(Value::Integer(start_offset as i64));
+    state.registers[*yield_reg] = Register::Value(Value::from_i64(start_offset as i64));
     state.ended_coroutine.retain(|n| *n != *yield_reg as u32);
     let jump_on_definition = jump_on_definition.as_offset_int();
     state.pc = if jump_on_definition == 0 {
@@ -6383,7 +6443,7 @@ pub fn op_end_coroutine(
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(EndCoroutine { yield_reg }, insn);
 
-    if let Value::Integer(pc) = state.registers[*yield_reg].get_value() {
+    if let Value::Numeric(Numeric::Integer(pc)) = state.registers[*yield_reg].get_value() {
         state.ended_coroutine.push(*yield_reg as u32);
         let pc: u32 = (*pc)
             .try_into()
@@ -6408,7 +6468,7 @@ pub fn op_yield(
         },
         insn
     );
-    if let Value::Integer(pc) = state.registers[*yield_reg].get_value() {
+    if let Value::Numeric(Numeric::Integer(pc)) = state.registers[*yield_reg].get_value() {
         if state.ended_coroutine.contains(&(*yield_reg as u32)) {
             state.pc = end_offset.as_offset_int();
         } else {
@@ -6418,7 +6478,7 @@ pub fn op_yield(
             // swap the program counter with the value in the yield register
             // this is the mechanism that allows jumping back and forth between the coroutine and the caller
             (state.pc, state.registers[*yield_reg]) =
-                (pc, Register::Value(Value::Integer((state.pc + 1) as i64)));
+                (pc, Register::Value(Value::from_i64((state.pc + 1) as i64)));
         }
     } else {
         unreachable!(
@@ -6491,7 +6551,7 @@ pub fn op_insert(
 
                 // Get the key we're going to insert
                 let insert_key = match &state.registers[*key_reg].get_value() {
-                    Value::Integer(i) => *i,
+                    Value::Numeric(Numeric::Integer(i)) => *i,
                     _ => {
                         // If key is not an integer, we can't check - assume no old record
                         state.op_insert_state.old_record = None;
@@ -6521,7 +6581,7 @@ pub fn op_insert(
                                 if let Some(table) = schema.get_table(table_name) {
                                     for (i, col) in table.columns().iter().enumerate() {
                                         if col.is_rowid_alias() && i < values.len() {
-                                            values[i] = Value::Integer(key);
+                                            values[i] = Value::from_i64(key);
                                         }
                                     }
                                 }
@@ -6566,7 +6626,7 @@ pub fn op_insert(
             }
             OpInsertSubState::Insert => {
                 let key = match &state.registers[*key_reg].get_value() {
-                    Value::Integer(i) => *i,
+                    Value::Numeric(Numeric::Integer(i)) => *i,
                     _ => unreachable!("expected integer key"),
                 };
                 let record = match &state.registers[*record_reg] {
@@ -6636,7 +6696,7 @@ pub fn op_insert(
 
                 let (key, values) = {
                     let key = match &state.registers[*key_reg].get_value() {
-                        Value::Integer(i) => *i,
+                        Value::Numeric(Numeric::Integer(i)) => *i,
                         _ => unreachable!("expected integer key"),
                     };
 
@@ -6660,7 +6720,7 @@ pub fn op_insert(
                     if let Some(table) = schema.get_table(table_name) {
                         for (i, col) in table.columns().iter().enumerate() {
                             if col.is_rowid_alias() && i < new_values.len() {
-                                new_values[i] = Value::Integer(key);
+                                new_values[i] = Value::from_i64(key);
                             }
                         }
                     }
@@ -6711,7 +6771,7 @@ pub fn op_int_64(
         },
         insn
     );
-    state.registers[*out_reg] = Register::Value(Value::Integer(*value));
+    state.registers[*out_reg] = Register::Value(Value::from_i64(*value));
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -6772,7 +6832,7 @@ pub fn op_delete(
                         if let Some(table) = schema.get_table(table_name) {
                             for (i, col) in table.columns().iter().enumerate() {
                                 if col.is_rowid_alias() && i < values.len() {
-                                    values[i] = Value::Integer(key);
+                                    values[i] = Value::from_i64(key);
                                 }
                             }
                         }
@@ -7192,11 +7252,11 @@ fn new_rowid_inner(
                                 mvcc_cursor.end_new_rowid();
                                 // mvcc allocator for table ws initialized, we can set result inmediatly
                                 state.registers[*rowid_reg] =
-                                    Register::Value(Value::Integer(new_rowid));
+                                    Register::Value(Value::from_i64(new_rowid));
                                 // FIXME: we probably will need to remove sqlite_sequence from MVCC.
                                 if *prev_largest_reg > 0 {
                                     state.registers[*prev_largest_reg] =
-                                        Register::Value(Value::Integer(prev_rowid.unwrap_or(0)));
+                                        Register::Value(Value::from_i64(prev_rowid.unwrap_or(0)));
                                 }
                                 // we still need to leave cursor pointing to the end, but we
                                 state.op_new_rowid_state = OpNewRowidState::SeekingToLast {
@@ -7268,13 +7328,13 @@ fn new_rowid_inner(
 
                 if *prev_largest_reg > 0 {
                     state.registers[*prev_largest_reg] =
-                        Register::Value(Value::Integer(current_max.unwrap_or(0)));
+                        Register::Value(Value::from_i64(current_max.unwrap_or(0)));
                 }
 
                 match current_max {
                     Some(rowid) if rowid < MAX_ROWID => {
                         // Can use sequential
-                        state.registers[*rowid_reg] = Register::Value(Value::Integer(rowid + 1));
+                        state.registers[*rowid_reg] = Register::Value(Value::from_i64(rowid + 1));
                         tracing::trace!("new_rowid={}", rowid + 1);
                         state.op_new_rowid_state = OpNewRowidState::GoNext;
                         continue;
@@ -7287,7 +7347,7 @@ fn new_rowid_inner(
                     None => {
                         // Empty table
                         tracing::trace!("new_rowid=1");
-                        state.registers[*rowid_reg] = Register::Value(Value::Integer(1));
+                        state.registers[*rowid_reg] = Register::Value(Value::from_i64(1));
                         state.op_new_rowid_state = OpNewRowidState::GoNext;
                         continue;
                     }
@@ -7327,7 +7387,7 @@ fn new_rowid_inner(
 
                 if !exists {
                     // Found unused rowid!
-                    state.registers[*rowid_reg] = Register::Value(Value::Integer(candidate));
+                    state.registers[*rowid_reg] = Register::Value(Value::from_i64(candidate));
                     state.op_new_rowid_state = OpNewRowidState::Start;
                     state.pc += 1;
 
@@ -7378,15 +7438,17 @@ pub fn op_must_be_int(
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(MustBeInt { reg }, insn);
     match &state.registers[*reg].get_value() {
-        Value::Integer(_) => {}
-        Value::Float(f) => match cast_real_to_integer(*f) {
-            Ok(i) => state.registers[*reg] = Register::Value(Value::Integer(i)),
+        Value::Numeric(Numeric::Integer(_)) => {}
+        Value::Numeric(Numeric::Float(f)) => match cast_real_to_integer(f64::from(*f)) {
+            Ok(i) => state.registers[*reg] = Register::Value(Value::from_i64(i)),
             Err(_) => bail_constraint_error!("datatype mismatch"),
         },
         Value::Text(text) => match checked_cast_text_to_numeric(text.as_str(), true) {
-            Ok(Value::Integer(i)) => state.registers[*reg] = Register::Value(Value::Integer(i)),
-            Ok(Value::Float(f)) => match cast_real_to_integer(f) {
-                Ok(i) => state.registers[*reg] = Register::Value(Value::Integer(i)),
+            Ok(Value::Numeric(Numeric::Integer(i))) => {
+                state.registers[*reg] = Register::Value(Value::from_i64(i))
+            }
+            Ok(Value::Numeric(Numeric::Float(f))) => match cast_real_to_integer(f64::from(f)) {
+                Ok(i) => state.registers[*reg] = Register::Value(Value::from_i64(i)),
                 Err(_) => bail_constraint_error!("datatype mismatch"),
             },
             _ => bail_constraint_error!("datatype mismatch"),
@@ -7546,7 +7608,7 @@ pub fn op_offset_limit(
         insn
     );
     let limit_val = match state.registers[*limit_reg].get_value() {
-        Value::Integer(val) => val,
+        Value::Numeric(Numeric::Integer(val)) => val,
         _ => {
             return Err(LimboError::InternalError(
                 "OffsetLimit: the value in limit_reg is not an integer".into(),
@@ -7554,8 +7616,8 @@ pub fn op_offset_limit(
         }
     };
     let offset_val = match state.registers[*offset_reg].get_value() {
-        Value::Integer(val) if *val < 0 => 0,
-        Value::Integer(val) if *val >= 0 => *val,
+        Value::Numeric(Numeric::Integer(val)) if *val < 0 => 0,
+        Value::Numeric(Numeric::Integer(val)) if *val >= 0 => *val,
         _ => {
             return Err(LimboError::InternalError(
                 "OffsetLimit: the value in offset_reg is not an integer".into(),
@@ -7565,9 +7627,9 @@ pub fn op_offset_limit(
 
     let offset_limit_sum = limit_val.overflowing_add(offset_val);
     if *limit_val <= 0 || offset_limit_sum.1 {
-        state.registers[*combined_reg] = Register::Value(Value::Integer(-1));
+        state.registers[*combined_reg] = Register::Value(Value::from_i64(-1));
     } else {
-        state.registers[*combined_reg] = Register::Value(Value::Integer(offset_limit_sum.0));
+        state.registers[*combined_reg] = Register::Value(Value::from_i64(offset_limit_sum.0));
     }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -7614,7 +7676,7 @@ pub fn op_open_write(
     let root_page = match root_page {
         RegisterOrLiteral::Literal(lit) => *lit,
         RegisterOrLiteral::Register(reg) => match &state.registers[*reg].get_value() {
-            Value::Integer(val) => *val,
+            Value::Numeric(Numeric::Integer(val)) => *val,
             _ => {
                 return Err(LimboError::InternalError(
                     "OpenWrite: the value in root_page is not an integer".into(),
@@ -7681,7 +7743,7 @@ pub fn op_open_write(
         if let Some(index) = maybe_index {
             let num_columns = index.columns.len();
             let btree_cursor = Box::new(BTreeCursor::new_index(
-                pager.clone(),
+                pager,
                 maybe_transform_root_page_to_positive(mv_store.as_ref(), root_page),
                 index.as_ref(),
                 num_columns,
@@ -7703,7 +7765,7 @@ pub fn op_open_write(
             };
 
             let btree_cursor = Box::new(BTreeCursor::new_table(
-                pager.clone(),
+                pager,
                 maybe_transform_root_page_to_positive(mv_store.as_ref(), root_page),
                 num_columns,
             ));
@@ -7760,13 +7822,13 @@ pub fn op_create_btree(
 
     if let Some(mv_store) = mv_store.as_ref() {
         let root_page = mv_store.get_next_table_id();
-        state.registers[*root] = Register::Value(Value::Integer(root_page));
+        state.registers[*root] = Register::Value(Value::from_i64(root_page));
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
     }
     // FIXME: handle page cache is full
     let root_page = return_if_io!(pager.btree_create(flags));
-    state.registers[*root] = Register::Value(Value::Integer(root_page as i64));
+    state.registers[*root] = Register::Value(Value::from_i64(root_page as i64));
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -7943,7 +8005,7 @@ pub fn op_destroy(
             OpDestroyState::DestroyBtree(ref mut cursor) => {
                 let maybe_former_root_page = return_if_io!(cursor.write().btree_destroy());
                 state.registers[*former_root_reg] =
-                    Register::Value(Value::Integer(maybe_former_root_page.unwrap_or(0) as i64));
+                    Register::Value(Value::from_i64(maybe_former_root_page.unwrap_or(0) as i64));
                 state.op_destroy_state = OpDestroyState::CreateCursor;
                 state.pc += 1;
                 return Ok(InsnFunctionStepResult::Step);
@@ -7972,9 +8034,15 @@ pub fn op_reset_sorter(
             return_if_io!(cursor.clear_btree());
         }
         CursorType::Sorter => {
-            unimplemented!("ResetSorter is not supported for sorter cursors yet")
+            return Err(LimboError::InternalError(
+                "ResetSorter is not supported for sorter cursors".to_string(),
+            ));
         }
-        _ => panic!("ResetSorter is not supported for {cursor_type:?}"),
+        _ => {
+            return Err(LimboError::InternalError(format!(
+                "ResetSorter is not supported for {cursor_type:?}"
+            )));
+        }
     }
 
     state.pc += 1;
@@ -7989,7 +8057,9 @@ pub fn op_drop_table(
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(DropTable { db, table_name, .. }, insn);
     if *db > 0 {
-        todo!("temp databases not implemented yet");
+        return Err(LimboError::InternalError(
+            "Temporary databases are not implemented".to_string(),
+        ));
     }
     let conn = program.connection.clone();
     let is_mvcc = conn.mv_store().is_some();
@@ -8118,7 +8188,7 @@ pub fn op_coll_seq(
 
     // If P1 is not zero, initialize that register to 0
     if let Some(reg_idx) = reg {
-        state.registers[*reg_idx] = Register::Value(Value::Integer(0));
+        state.registers[*reg_idx] = Register::Value(Value::from_i64(0));
     }
 
     state.pc += 1;
@@ -8144,7 +8214,7 @@ pub fn op_page_count(
         Ok(IOResult::Done(v)) => v.into(),
         Ok(IOResult::IO(io)) => return Ok(InsnFunctionStepResult::IO(io)),
     };
-    state.registers[*dest] = Register::Value(Value::Integer(count));
+    state.registers[*dest] = Register::Value(Value::from_i64(count));
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -8313,7 +8383,7 @@ pub fn op_read_cookie(
         Ok(IOResult::IO(io)) => return Ok(InsnFunctionStepResult::IO(io)),
     };
 
-    state.registers[*dest] = Register::Value(Value::Integer(cookie_value));
+    state.registers[*dest] = Register::Value(Value::from_i64(cookie_value));
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -8424,14 +8494,14 @@ pub fn op_add_imm(
     };
 
     let int_val = match current_value {
-        Value::Integer(i) => i + value,
-        Value::Float(f) => (*f as i64) + value,
+        Value::Numeric(Numeric::Integer(i)) => i + value,
+        Value::Numeric(Numeric::Float(f)) => (f64::from(*f) as i64) + value,
         Value::Text(s) => s.as_str().parse::<i64>().unwrap_or(0) + value,
         Value::Blob(_) => *value, // BLOB becomes the added value
         Value::Null => *value,    // NULL becomes the added value
     };
 
-    state.registers[*register] = Register::Value(Value::Integer(int_val));
+    state.registers[*register] = Register::Value(Value::from_i64(int_val));
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -8458,7 +8528,7 @@ pub fn op_zero_or_null(
     if state.registers[*rg1].is_null() || state.registers[*rg2].is_null() {
         state.registers[*dest] = Register::Value(Value::Null)
     } else {
-        state.registers[*dest] = Register::Value(Value::Integer(0));
+        state.registers[*dest] = Register::Value(Value::from_i64(0));
     }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -8497,7 +8567,7 @@ pub fn op_is_true(
     );
     let value = state.registers[*reg].get_value();
     // Use Numeric::try_into_bool which handles the conversion of text/blob to numbers
-    let final_result = match Numeric::from(value).try_into_bool() {
+    let final_result = match Numeric::from_value(value).map(|val| val.to_bool()) {
         // For NULL, store null_value directly (no inversion)
         None => {
             if *null_value {
@@ -8516,7 +8586,7 @@ pub fn op_is_true(
             }
         }
     };
-    state.registers[*dest] = Register::Value(Value::Integer(final_result));
+    state.registers[*dest] = Register::Value(Value::from_i64(final_result));
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -8682,7 +8752,7 @@ pub fn op_open_ephemeral(
                 None,
                 db_file_io,
                 PageCache::default(),
-                buffer_pool.clone(),
+                buffer_pool,
                 Arc::new(Mutex::new(())),
                 ephemeral_init_page_1,
             )?);
@@ -8851,7 +8921,7 @@ pub fn op_open_dup(
     match cursor_type {
         CursorType::BTreeTable(table) => {
             let cursor = Box::new(BTreeCursor::new_table(
-                pager.clone(),
+                pager,
                 maybe_transform_root_page_to_positive(mv_store.as_ref(), root_page),
                 table.columns.len(),
             ));
@@ -8884,9 +8954,15 @@ pub fn op_open_dup(
             // In principle, we could implement OpenDup for BTreeIndex,
             // but doing so now would create dead code since we have no use case,
             // and it wouldn't be possible to test it.
-            unimplemented!("OpenDup is not supported for BTreeIndex yet")
+            return Err(LimboError::InternalError(
+                "OpenDup is not supported for BTreeIndex".to_string(),
+            ));
         }
-        _ => panic!("OpenDup is not supported for {cursor_type:?}"),
+        _ => {
+            return Err(LimboError::InternalError(format!(
+                "OpenDup is not supported for {cursor_type:?}"
+            )));
+        }
     }
 
     state.pc += 1;
@@ -9034,7 +9110,7 @@ pub fn op_count(
         return_if_io!(cursor.count())
     };
 
-    state.registers[*target_reg] = Register::Value(Value::Integer(count as i64));
+    state.registers[*target_reg] = Register::Value(Value::from_i64(count as i64));
 
     // For optimized COUNT(*) queries, the count represents rows that would be read
     // SQLite tracks this differently (as pages read), but for consistency we track as rows
@@ -9933,7 +10009,7 @@ pub fn op_integrity_check(
                             // For INTEGER PRIMARY KEY columns, the value in the record is NULL
                             // but the actual value is the rowid
                             let value = if table.rowid_alias_column_pos == Some(pos) {
-                                Value::Integer(*rowid)
+                                Value::from_i64(*rowid)
                             } else if pos >= row_values.len() {
                                 // Columns added via ALTER TABLE ADD COLUMN: existing rows
                                 // don't have values for these columns. Use the column's
@@ -9947,7 +10023,7 @@ pub fn op_integrity_check(
                             };
                             key_values.push(value);
                         }
-                        key_values.push(Value::Integer(*rowid));
+                        key_values.push(Value::from_i64(*rowid));
 
                         // Transition to searching - the actual seek happens in SearchingIndex
                         let idx = *current_index_idx;
@@ -10134,11 +10210,11 @@ pub fn op_rename_table(
 
     let conn = program.connection.clone();
 
-    conn.with_schema_mut(|schema| {
+    conn.with_schema_mut(|schema| -> crate::Result<()> {
         if let Some(mut indexes) = schema.indexes.remove(&normalized_from) {
             indexes.iter_mut().for_each(|index| {
                 let index = Arc::make_mut(index);
-                index.table_name = normalized_to.to_owned();
+                normalized_to.clone_into(&mut index.table_name);
             });
 
             schema.indexes.insert(normalized_to.to_owned(), indexes);
@@ -10155,14 +10231,23 @@ pub fn op_rename_table(
                 for fk_arc in &mut btree.foreign_keys {
                     let fk = Arc::make_mut(fk_arc);
                     if normalize_ident(&fk.parent_table) == normalized_from {
-                        fk.parent_table = normalized_to.clone();
+                        fk.parent_table.clone_from(&normalized_to);
                     }
                 }
 
-                btree.name = normalized_to.to_owned();
+                // Rewrite table-qualified refs in CHECK constraints
+                for check in &mut btree.check_constraints {
+                    rewrite_check_expr_table_refs(
+                        &mut check.expr,
+                        &normalized_from,
+                        &normalized_to,
+                    );
+                }
+
+                normalized_to.clone_into(&mut btree.name);
             }
             Table::Virtual(vtab) => {
-                Arc::make_mut(vtab).name = normalized_to.clone();
+                Arc::make_mut(vtab).name.clone_from(&normalized_to);
             }
             _ => panic!("only btree and virtual tables can be renamed"),
         }
@@ -10179,12 +10264,14 @@ pub fn op_rename_table(
                 for fk_arc in &mut child_btree.foreign_keys {
                     if normalize_ident(&fk_arc.parent_table) == normalized_from {
                         let fk = Arc::make_mut(fk_arc);
-                        fk.parent_table = normalized_to.clone();
+                        fk.parent_table.clone_from(&normalized_to);
                     }
                 }
             }
         }
-    });
+
+        Ok(())
+    })?;
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -10236,7 +10323,14 @@ pub fn op_drop_column(
         };
 
         let btree = Arc::make_mut(btree);
-        btree.columns.remove(*column_index)
+        btree.columns.remove(*column_index);
+        // Remove column-level CHECK constraints for the dropped column
+        let col_name = column_name.clone();
+        btree.check_constraints.retain(|c| {
+            c.column
+                .as_ref()
+                .is_none_or(|col| normalize_ident(col) != normalize_ident(&col_name))
+        });
     });
 
     {
@@ -10294,24 +10388,33 @@ pub fn op_add_column(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
-    load_insn!(AddColumn { table, column }, insn);
+    load_insn!(
+        AddColumn {
+            table,
+            column,
+            check_constraints
+        },
+        insn
+    );
 
     let conn = program.connection.clone();
 
     conn.with_schema_mut(|schema| {
-        let table = schema
+        let table_ref = schema
             .tables
             .get_mut(table)
             .expect("table being altered should be in schema");
 
-        let table = Arc::make_mut(table);
+        let table_ref = Arc::make_mut(table_ref);
 
-        let Table::BTree(btree) = table else {
+        let crate::schema::Table::BTree(btree) = table_ref else {
             panic!("only btree tables can have columns added");
         };
 
         let btree = Arc::make_mut(btree);
-        btree.columns.push((**column).clone())
+        btree.columns.push((**column).clone());
+        // Update CHECK constraints to include any constraints from the new column
+        btree.check_constraints.clone_from(check_constraints);
     });
 
     state.pc += 1;
@@ -10378,7 +10481,7 @@ pub fn op_alter_column(
                     if ic.name.eq_ignore_ascii_case(
                         col.name.as_ref().expect("btree column should be named"),
                     ) {
-                        ic.name = new_name.clone();
+                        ic.name.clone_from(&new_name);
                     }
                 }
             }
@@ -10392,7 +10495,18 @@ pub fn op_alter_column(
         // Keep primary_key_columns consistent (names may change on rename)
         for (pk_name, _ord) in &mut btree.primary_key_columns {
             if pk_name.eq_ignore_ascii_case(&old_column_name) {
-                *pk_name = new_name.clone();
+                pk_name.clone_from(&new_name);
+            }
+        }
+
+        // Update CHECK constraint expressions to reference the new column name
+        let old_col_normalized = normalize_ident(&old_column_name);
+        for check in &mut btree.check_constraints {
+            rewrite_check_expr_column_refs(&mut check.expr, &old_col_normalized, &new_name);
+            if let Some(ref mut col) = check.column {
+                if col.eq_ignore_ascii_case(&old_column_name) {
+                    col.clone_from(&new_name);
+                }
             }
         }
 
@@ -10402,20 +10516,20 @@ pub fn op_alter_column(
             btree.columns[*column_index].set_rowid_alias(new_column.is_rowid_alias());
         }
 
-        // Update this table’s OWN foreign keys
+        // Update this table's OWN foreign keys
         for fk_arc in &mut btree.foreign_keys {
             let fk = Arc::make_mut(fk_arc);
             // child side: rename child column if it matches
             for cc in &mut fk.child_columns {
                 if cc.eq_ignore_ascii_case(&old_column_name) {
-                    *cc = new_name.clone();
+                    cc.clone_from(&new_name);
                 }
             }
             // parent side: if self-referencing, rename parent column too
             if normalize_ident(&fk.parent_table) == normalized_table_name {
                 for pc in &mut fk.parent_columns {
                     if pc.eq_ignore_ascii_case(&old_column_name) {
-                        *pc = new_name.clone();
+                        pc.clone_from(&new_name);
                     }
                 }
             }
@@ -10435,7 +10549,7 @@ pub fn op_alter_column(
                     let fk = Arc::make_mut(fk_arc);
                     for pc in &mut fk.parent_columns {
                         if pc.eq_ignore_ascii_case(&old_column_name) {
-                            *pc = new_name.clone();
+                            pc.clone_from(&new_name);
                         }
                     }
                 }
@@ -10477,10 +10591,10 @@ pub fn op_if_neg(
     load_insn!(IfNeg { reg, target_pc }, insn);
 
     match &state.registers[*reg] {
-        Register::Value(Value::Integer(i)) if *i < 0 => {
+        Register::Value(Value::Numeric(Numeric::Integer(i))) if *i < 0 => {
             state.pc = target_pc.as_offset_int();
         }
-        Register::Value(Value::Float(f)) if *f < 0.0 => {
+        Register::Value(Value::Numeric(Numeric::Float(f))) if f64::from(*f) < 0.0 => {
             state.pc = target_pc.as_offset_int();
         }
         Register::Value(Value::Null) => {
@@ -10494,33 +10608,60 @@ pub fn op_if_neg(
     Ok(InsnFunctionStepResult::Step)
 }
 
-fn handle_text_sum(acc: &mut Value, sum_state: &mut SumAggState, parsed_number: ParsedNumber) {
+fn handle_text_sum(
+    acc: &mut Value,
+    sum_state: &mut SumAggState,
+    parsed_number: ParsedNumber,
+    parse_result: NumericParseResult,
+) {
+    // SQLite treats text that only partially parses as numeric (ValidPrefixOnly)
+    // as approximate, so SUM returns real instead of integer.
+    let is_approx = matches!(parse_result, NumericParseResult::ValidPrefixOnly);
     match parsed_number {
-        ParsedNumber::Integer(i) => match acc {
-            Value::Null => {
-                *acc = Value::Integer(i);
-            }
-            Value::Integer(acc_i) => match acc_i.checked_add(i) {
-                Some(sum) => *acc = Value::Integer(sum),
-                None => {
-                    let acc_f = *acc_i as f64;
-                    *acc = Value::Float(acc_f);
-                    sum_state.approx = true;
-                    sum_state.ovrfl = true;
-                    apply_kbn_step_int(acc, i, sum_state);
+        ParsedNumber::Integer(i) => {
+            if is_approx {
+                sum_state.approx = true;
+                match acc {
+                    Value::Null => {
+                        *acc = Value::from_f64(i as f64);
+                    }
+                    Value::Numeric(Numeric::Integer(acc_i)) => {
+                        *acc = Value::from_f64(*acc_i as f64);
+                        apply_kbn_step_int(acc, i, sum_state);
+                    }
+                    Value::Numeric(Numeric::Float(_)) => {
+                        apply_kbn_step_int(acc, i, sum_state);
+                    }
+                    _ => unreachable!(),
                 }
-            },
-            Value::Float(_) => {
-                apply_kbn_step_int(acc, i, sum_state);
+            } else {
+                match acc {
+                    Value::Null => {
+                        *acc = Value::from_i64(i);
+                    }
+                    Value::Numeric(Numeric::Integer(acc_i)) => match acc_i.checked_add(i) {
+                        Some(sum) => *acc = Value::from_i64(sum),
+                        None => {
+                            let acc_f = *acc_i as f64;
+                            *acc = Value::from_f64(acc_f);
+                            sum_state.approx = true;
+                            sum_state.ovrfl = true;
+                            apply_kbn_step_int(acc, i, sum_state);
+                        }
+                    },
+                    Value::Numeric(Numeric::Float(_)) => {
+                        apply_kbn_step_int(acc, i, sum_state);
+                    }
+                    _ => unreachable!(),
+                }
             }
-            _ => unreachable!(),
-        },
+        }
         ParsedNumber::Float(f) => {
             if !sum_state.approx {
-                if let Value::Integer(current_sum) = *acc {
-                    *acc = Value::Float(current_sum as f64);
+                if let Value::Numeric(Numeric::Integer(current_sum)) = *acc {
+                    *acc = Value::from_f64(current_sum as f64);
                 } else if matches!(*acc, Value::Null) {
-                    *acc = Value::Float(0.0);
+                    *acc = Value::from_f64(0.0);
                 }
                 sum_state.approx = true;
             }
@@ -10528,10 +10669,10 @@ fn handle_text_sum(acc: &mut Value, sum_state: &mut SumAggState, parsed_number: 
         }
         ParsedNumber::None => {
             if !sum_state.approx {
-                if let Value::Integer(current_sum) = *acc {
-                    *acc = Value::Float(current_sum as f64);
+                if let Value::Numeric(Numeric::Integer(current_sum)) = *acc {
+                    *acc = Value::from_f64(current_sum as f64);
                 } else if matches!(*acc, Value::Null) {
-                    *acc = Value::Float(0.0);
+                    *acc = Value::from_f64(0.0);
                 }
                 sum_state.approx = true;
             }
@@ -10902,7 +11043,7 @@ pub fn op_hash_probe(
         // Probe the loaded partition
         match hash_table.probe_partition(partition_idx, &probe_keys) {
             Some(entry) => {
-                state.registers[dest_reg] = Register::Value(Value::Integer(entry.rowid));
+                state.registers[dest_reg] = Register::Value(Value::from_i64(entry.rowid));
                 write_hash_payload_to_registers(
                     &mut state.registers,
                     entry,
@@ -10921,7 +11062,7 @@ pub fn op_hash_probe(
         // Non-spilled hash table, use normal probe
         match hash_table.probe(probe_keys) {
             Some(entry) => {
-                state.registers[dest_reg] = Register::Value(Value::Integer(entry.rowid));
+                state.registers[dest_reg] = Register::Value(Value::from_i64(entry.rowid));
                 write_hash_payload_to_registers(
                     &mut state.registers,
                     entry,
@@ -10961,7 +11102,7 @@ pub fn op_hash_next(
     })?;
     match hash_table.next_match() {
         Some(entry) => {
-            state.registers[*dest_reg] = Register::Value(Value::Integer(entry.rowid));
+            state.registers[*dest_reg] = Register::Value(Value::from_i64(entry.rowid));
             write_hash_payload_to_registers(
                 &mut state.registers,
                 entry,
@@ -11025,17 +11166,17 @@ fn apply_affinity_char(target: &mut Register, affinity: Affinity) -> bool {
             }
 
             Affinity::Integer | Affinity::Numeric => {
-                if matches!(value, Value::Integer(_)) {
+                if matches!(value, Value::Numeric(Numeric::Integer(_))) {
                     return true;
                 }
-                if !matches!(value, Value::Text(_) | Value::Float(_)) {
+                if !matches!(value, Value::Text(_) | Value::Numeric(Numeric::Float(_))) {
                     return true;
                 }
 
-                if let Value::Float(fl) = *value {
+                if let Value::Numeric(Numeric::Float(fl)) = *value {
                     // For floats, try to convert to integer if it's exact
                     // This is similar to sqlite3VdbeIntegerAffinity
-                    return try_float_to_integer_affinity(value, fl);
+                    return try_float_to_integer_affinity(value, f64::from(fl));
                 }
 
                 if let Value::Text(t) = value {
@@ -11048,24 +11189,24 @@ fn apply_affinity_char(target: &mut Register, affinity: Affinity) -> bool {
 
                     // For affinity conversion, only convert strings that are entirely numeric
                     let num = if let Ok(i) = text.parse::<i64>() {
-                        Value::Integer(i)
+                        Value::from_i64(i)
                     } else if let Ok(f) = text.parse::<f64>() {
-                        Value::Float(f)
+                        Value::from_f64(f)
                     } else {
                         return false;
                     };
 
                     match num {
-                        Value::Integer(i) => {
-                            *value = Value::Integer(i);
+                        Value::Numeric(Numeric::Integer(i)) => {
+                            *value = Value::from_i64(i);
                             return true;
                         }
-                        Value::Float(fl) => {
+                        Value::Numeric(Numeric::Float(fl)) => {
                             // For Numeric affinity, try to convert float to int if exact
                             if affinity == Affinity::Numeric {
-                                return try_float_to_integer_affinity(value, fl);
+                                return try_float_to_integer_affinity(value, f64::from(fl));
                             } else {
-                                *value = Value::Float(fl);
+                                *value = Value::Numeric(Numeric::Float(fl));
                                 return true;
                             }
                         }
@@ -11080,8 +11221,8 @@ fn apply_affinity_char(target: &mut Register, affinity: Affinity) -> bool {
             }
 
             Affinity::Real => {
-                if let Value::Integer(i) = *value {
-                    *value = Value::Float(i as f64);
+                if let Value::Numeric(Numeric::Integer(i)) = *value {
+                    *value = Value::from_f64(i as f64);
                     return true;
                 }
                 if let Value::Text(t) = value {
@@ -11090,7 +11231,14 @@ fn apply_affinity_char(target: &mut Register, affinity: Affinity) -> bool {
                         return false;
                     }
                     if let Ok(num) = checked_cast_text_to_numeric(s, false) {
-                        *value = num;
+                        match num {
+                            Value::Integer(i) => {
+                                *value = Value::Float(i as f64);
+                            }
+                            other => {
+                                *value = other;
+                            }
+                        }
                         return true;
                     } else {
                         return false;
@@ -11110,14 +11258,14 @@ fn try_float_to_integer_affinity(value: &mut Value, fl: f64) -> bool {
         // Additional check: ensure round-trip conversion is exact
         // and value is within safe bounds (similar to SQLite's checks)
         if (int_val as f64) == fl && int_val > i64::MIN + 1 && int_val < i64::MAX - 1 {
-            *value = Value::Integer(int_val);
+            *value = Value::from_i64(int_val);
             return true;
         }
     }
 
     // If we can't convert to exact integer, keep as float for Numeric affinity
     // but return false to indicate the conversion wasn't "complete"
-    *value = Value::Float(fl);
+    *value = Value::from_f64(fl);
     false
 }
 
@@ -11137,8 +11285,9 @@ fn execute_turso_version(version_integer: i64) -> String {
 pub fn extract_int_value<V: AsValueRef>(value: V) -> i64 {
     let value = value.as_value_ref();
     match value {
-        ValueRef::Integer(i) => i,
-        ValueRef::Float(f) => {
+        ValueRef::Numeric(Numeric::Integer(i)) => i,
+        ValueRef::Numeric(Numeric::Float(f)) => {
+            let f = f64::from(f);
             // Use sqlite3RealToI64 equivalent
             if f < -9223372036854774784.0 {
                 i64::MIN
@@ -11186,7 +11335,7 @@ pub fn op_max_pgcnt(
         return_if_io!(pager.set_max_page_count(*new_max as u32))
     };
 
-    state.registers[*dest] = Register::Value(Value::Integer(result_value.into()));
+    state.registers[*dest] = Register::Value(Value::from_i64(result_value.into()));
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -11517,7 +11666,7 @@ where
     rows.first()
         .and_then(|row| row.first())
         .and_then(|v| match v {
-            Value::Integer(i) => T::try_from(*i).ok(),
+            Value::Numeric(Numeric::Integer(i)) => T::try_from(*i).ok(),
             _ => None,
         })
         .ok_or_else(|| {
@@ -12307,7 +12456,7 @@ mod tests {
             apply_affinity_char(&mut register, Affinity::Integer);
 
             match register {
-                Register::Value(Value::Integer(i)) => {
+                Register::Value(Value::Numeric(Numeric::Integer(i))) => {
                     assert_eq!(
                         i, expected_int,
                         "String '{input}' should convert to {expected_int}, got {i}"
@@ -12340,7 +12489,7 @@ mod tests {
                         "String '{input}' should have {expected_len} characters",
                     );
                 }
-                Register::Value(Value::Integer(_)) => {
+                Register::Value(Value::Numeric(Numeric::Integer(_))) => {
                     panic!("String '{input}' should NOT be converted to integer");
                 }
                 other => panic!("Unexpected value type: {other:?}"),
@@ -12353,7 +12502,7 @@ mod tests {
         let mut payload = Vec::new();
         init_agg_payload(&AggFunc::Count, &mut payload).unwrap();
         assert_eq!(payload.len(), 1);
-        assert_eq!(payload[0], Value::Integer(0));
+        assert_eq!(payload[0], Value::from_i64(0));
     }
 
     #[test]
@@ -12362,9 +12511,9 @@ mod tests {
         init_agg_payload(&AggFunc::Sum, &mut payload).unwrap();
         assert_eq!(payload.len(), 4);
         assert_eq!(payload[0], Value::Null); // acc
-        assert_eq!(payload[1], Value::Float(0.0)); // r_err
-        assert_eq!(payload[2], Value::Integer(0)); // approx
-        assert_eq!(payload[3], Value::Integer(0)); // ovrfl
+        assert_eq!(payload[1], Value::from_f64(0.0)); // r_err
+        assert_eq!(payload[2], Value::from_i64(0)); // approx
+        assert_eq!(payload[3], Value::from_i64(0)); // ovrfl
     }
 
     #[test]
@@ -12372,14 +12521,14 @@ mod tests {
         let mut payload = Vec::new();
         init_agg_payload(&AggFunc::Avg, &mut payload).unwrap();
         assert_eq!(payload.len(), 3);
-        assert_eq!(payload[0], Value::Float(0.0)); // sum
-        assert_eq!(payload[1], Value::Float(0.0)); // r_err
-        assert_eq!(payload[2], Value::Integer(0)); // count
+        assert_eq!(payload[0], Value::from_f64(0.0)); // sum
+        assert_eq!(payload[1], Value::from_f64(0.0)); // r_err
+        assert_eq!(payload[2], Value::from_i64(0)); // count
     }
 
     #[test]
     fn test_update_count_skips_null() {
-        let mut payload = vec![Value::Integer(5)];
+        let mut payload = vec![Value::from_i64(5)];
         update_agg_payload(
             &AggFunc::Count,
             Value::Null,
@@ -12388,59 +12537,59 @@ mod tests {
             CollationSeq::Binary,
         )
         .unwrap();
-        assert_eq!(payload[0], Value::Integer(5)); // unchanged
+        assert_eq!(payload[0], Value::from_i64(5)); // unchanged
     }
 
     #[test]
     fn test_update_count_increments() {
-        let mut payload = vec![Value::Integer(5)];
+        let mut payload = vec![Value::from_i64(5)];
         update_agg_payload(
             &AggFunc::Count,
-            Value::Integer(42),
+            Value::from_i64(42),
             None,
             &mut payload,
             CollationSeq::Binary,
         )
         .unwrap();
-        assert_eq!(payload[0], Value::Integer(6));
+        assert_eq!(payload[0], Value::from_i64(6));
     }
 
     #[test]
     fn test_update_sum_integers() {
         let mut payload = vec![
             Value::Null,
-            Value::Float(0.0),
-            Value::Integer(0),
-            Value::Integer(0),
+            Value::from_f64(0.0),
+            Value::from_i64(0),
+            Value::from_i64(0),
         ];
         update_agg_payload(
             &AggFunc::Sum,
-            Value::Integer(10),
+            Value::from_i64(10),
             None,
             &mut payload,
             CollationSeq::Binary,
         )
         .unwrap();
-        assert_eq!(payload[0], Value::Integer(10));
+        assert_eq!(payload[0], Value::from_i64(10));
 
         update_agg_payload(
             &AggFunc::Sum,
-            Value::Integer(5),
+            Value::from_i64(5),
             None,
             &mut payload,
             CollationSeq::Binary,
         )
         .unwrap();
-        assert_eq!(payload[0], Value::Integer(15));
+        assert_eq!(payload[0], Value::from_i64(15));
     }
 
     #[test]
     fn test_update_sum_null_is_skipped() {
         let mut payload = vec![
-            Value::Integer(10),
-            Value::Float(0.0),
-            Value::Integer(0),
-            Value::Integer(0),
+            Value::from_i64(10),
+            Value::from_f64(0.0),
+            Value::from_i64(0),
+            Value::from_i64(0),
         ];
         update_agg_payload(
             &AggFunc::Sum,
@@ -12450,7 +12599,7 @@ mod tests {
             CollationSeq::Binary,
         )
         .unwrap();
-        assert_eq!(payload[0], Value::Integer(10)); // unchanged
+        assert_eq!(payload[0], Value::from_i64(10)); // unchanged
     }
 
     #[test]
@@ -12459,83 +12608,95 @@ mod tests {
         // First value sets the min/max
         update_agg_payload(
             &AggFunc::Min,
-            Value::Integer(5),
+            Value::from_i64(5),
             None,
             &mut payload,
             CollationSeq::Binary,
         )
         .unwrap();
-        assert_eq!(payload[0], Value::Integer(5));
+        assert_eq!(payload[0], Value::from_i64(5));
 
         // Smaller value updates min
         update_agg_payload(
             &AggFunc::Min,
-            Value::Integer(3),
+            Value::from_i64(3),
             None,
             &mut payload,
             CollationSeq::Binary,
         )
         .unwrap();
-        assert_eq!(payload[0], Value::Integer(3));
+        assert_eq!(payload[0], Value::from_i64(3));
 
         // Larger value doesn't update min
         update_agg_payload(
             &AggFunc::Min,
-            Value::Integer(10),
+            Value::from_i64(10),
             None,
             &mut payload,
             CollationSeq::Binary,
         )
         .unwrap();
-        assert_eq!(payload[0], Value::Integer(3));
+        assert_eq!(payload[0], Value::from_i64(3));
     }
 
     #[test]
     fn test_update_avg() {
         // Payload: [sum, r_err, count]
-        let mut payload = vec![Value::Float(0.0), Value::Float(0.0), Value::Integer(0)];
+        let mut payload = vec![
+            Value::from_f64(0.0),
+            Value::from_f64(0.0),
+            Value::from_i64(0),
+        ];
         update_agg_payload(
             &AggFunc::Avg,
-            Value::Integer(10),
+            Value::from_i64(10),
             None,
             &mut payload,
             CollationSeq::Binary,
         )
         .unwrap();
-        assert_eq!(payload[0], Value::Float(10.0));
-        assert_eq!(payload[2], Value::Integer(1));
+        assert_eq!(payload[0], Value::from_f64(10.0));
+        assert_eq!(payload[2], Value::from_i64(1));
 
         update_agg_payload(
             &AggFunc::Avg,
-            Value::Integer(20),
+            Value::from_i64(20),
             None,
             &mut payload,
             CollationSeq::Binary,
         )
         .unwrap();
-        assert_eq!(payload[0], Value::Float(30.0));
-        assert_eq!(payload[2], Value::Integer(2));
+        assert_eq!(payload[0], Value::from_f64(30.0));
+        assert_eq!(payload[2], Value::from_i64(2));
     }
 
     #[test]
     fn test_finalize_count() {
-        let payload = vec![Value::Integer(42)];
+        let payload = vec![Value::from_i64(42)];
         let result = finalize_agg_payload(&AggFunc::Count, &payload).unwrap();
-        assert_eq!(result, Value::Integer(42));
+        assert_eq!(result, Value::from_i64(42));
     }
 
     #[test]
     fn test_finalize_avg() {
         // Payload: [sum, r_err, count]
-        let payload = vec![Value::Float(30.0), Value::Float(0.0), Value::Integer(3)];
+        let payload = vec![
+            Value::from_f64(30.0),
+            Value::from_f64(0.0),
+            Value::from_i64(3),
+        ];
         let result = finalize_agg_payload(&AggFunc::Avg, &payload).unwrap();
-        assert_eq!(result, Value::Float(10.0));
+        assert_eq!(result, Value::from_f64(10.0));
     }
 
     #[test]
     fn test_finalize_avg_empty() {
         // Payload: [sum, r_err, count]
-        let payload = vec![Value::Float(0.0), Value::Float(0.0), Value::Integer(0)];
+        let payload = vec![
+            Value::from_f64(0.0),
+            Value::from_f64(0.0),
+            Value::from_i64(0),
+        ];
         let result = finalize_agg_payload(&AggFunc::Avg, &payload).unwrap();
         assert_eq!(result, Value::Null);
     }

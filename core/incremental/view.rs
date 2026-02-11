@@ -1,6 +1,7 @@
 use super::compiler::{DbspCircuit, DbspCompiler, DeltaSet};
 use super::dbsp::Delta;
 use super::operator::ComputationTracker;
+use crate::numeric::Numeric;
 use crate::schema::{BTreeTable, Schema};
 use crate::storage::btree::CursorTrait;
 use crate::sync::Arc;
@@ -461,7 +462,7 @@ impl IncrementalView {
         // Skip CTEs - they're not real tables
         if !cte_names.contains(table_name) {
             if let Some(table) = schema.get_btree_table(table_name) {
-                table_map.insert(table_name.to_string(), table.clone());
+                table_map.insert(table_name.to_string(), table);
                 qualified_names.insert(table_name.to_string(), qualified_name);
 
                 // Store the alias mapping if there is an alias
@@ -1359,7 +1360,7 @@ impl IncrementalView {
         if let Some((idx, _)) = self.referenced_tables[table_idx].get_rowid_alias_column() {
             // The rowid is the value at the rowid alias column index
             let rowid = match all_values.get(idx) {
-                Some(Value::Integer(id)) => *id,
+                Some(Value::Numeric(Numeric::Integer(id))) => *id,
                 _ => return None, // Invalid rowid
             };
             // All values are table columns (no separate rowid was selected)
@@ -1367,7 +1368,7 @@ impl IncrementalView {
         } else {
             // The last value is the explicitly selected rowid
             let rowid = match all_values.last() {
-                Some(Value::Integer(id)) => *id,
+                Some(Value::Numeric(Numeric::Integer(id))) => *id,
                 _ => return None, // Invalid rowid
             };
             // Get all values except the rowid
@@ -1435,6 +1436,7 @@ mod tests {
             is_strict: false,
             unique_sets: vec![],
             foreign_keys: vec![],
+            check_constraints: vec![],
             has_autoincrement: false,
         };
 
@@ -1478,6 +1480,7 @@ mod tests {
             is_strict: false,
             has_autoincrement: false,
             foreign_keys: vec![],
+            check_constraints: vec![],
             unique_sets: vec![],
         };
 
@@ -1517,6 +1520,7 @@ mod tests {
             is_strict: false,
             has_autoincrement: false,
             foreign_keys: vec![],
+            check_constraints: vec![],
             unique_sets: vec![],
         };
 
@@ -1550,6 +1554,7 @@ mod tests {
             is_strict: false,
             has_autoincrement: false,
             foreign_keys: vec![],
+            check_constraints: vec![],
             unique_sets: vec![],
         };
 
@@ -2169,7 +2174,7 @@ mod tests {
             select.clone(),
             tables,
             aliases,
-            qualified_names.clone(),
+            qualified_names,
             table_conditions,
             extract_view_columns(&select, &schema).unwrap(),
             &schema,
@@ -2217,7 +2222,7 @@ mod tests {
             select.clone(),
             tables,
             aliases,
-            qualified_names.clone(),
+            qualified_names,
             table_conditions,
             extract_view_columns(&select, &schema).unwrap(),
             &schema,
@@ -2520,7 +2525,7 @@ mod tests {
         // Get the orders table twice (simulating what would happen with CTEs)
         let orders_table = schema.get_btree_table("orders").unwrap();
 
-        let referenced_tables = vec![orders_table.clone(), orders_table.clone()];
+        let referenced_tables = vec![orders_table.clone(), orders_table];
 
         // Create a SELECT that would have conflicting WHERE conditions
         let select = parse_select(

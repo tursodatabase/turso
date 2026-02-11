@@ -73,11 +73,8 @@ def null(res):
 def test_regexp():
     turso = TestTursoShell(test_data)
     extension_path = "./target/debug/liblimbo_regexp"
-    # before extension loads, assert no function
-    turso.run_test_fn(
-        "SELECT regexp('a.c', 'abc');",
-        lambda res: "Parse error: no such function" in res,
-    )
+    # regexp() is a built-in, verify it works before loading the extension
+    turso.run_test_fn("SELECT regexp('a.c', 'abc');", true)
     turso.run_test_fn(f".load {extension_path}", null)
     console.info(f"Extension {extension_path} loaded successfully.")
     turso.run_test_fn("SELECT regexp('a.c', 'abc');", true)

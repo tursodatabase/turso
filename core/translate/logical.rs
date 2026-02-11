@@ -8,6 +8,7 @@
 //! The main entry point is `LogicalPlanBuilder` which constructs logical plans
 //! from SQL AST nodes.
 use crate::function::AggFunc;
+use crate::numeric::Numeric;
 use crate::schema::{Schema, Type};
 use crate::sync::Arc;
 use crate::types::Value;
@@ -609,7 +610,7 @@ impl<'a> LogicalPlanBuilder<'a> {
                 let table_schema = self.get_table_schema(&table_name, table_alias.as_deref())?;
                 Ok(LogicalPlan::TableScan(TableScan {
                     table_name,
-                    alias: table_alias.clone(),
+                    alias: table_alias,
                     schema: table_schema,
                     projection: None,
                 }))
@@ -1180,7 +1181,10 @@ impl<'a> LogicalPlanBuilder<'a> {
             .into_iter()
             .map(|expr| {
                 // Check for positional reference (integer literal)
-                if let LogicalExpr::Literal(crate::types::Value::Integer(pos)) = &expr {
+                if let LogicalExpr::Literal(crate::types::Value::Numeric(
+                    crate::Numeric::Integer(pos),
+                )) = &expr
+                {
                     // SQLite uses 1-based indexing
                     if *pos > 0 && (*pos as usize) <= select_exprs.len() {
                         return select_exprs[(*pos as usize) - 1].clone();
@@ -1906,21 +1910,21 @@ impl<'a> LogicalPlanBuilder<'a> {
     fn build_literal(lit: &ast::Literal) -> Result<Value> {
         match lit {
             ast::Literal::Null => Ok(Value::Null),
-            ast::Literal::True => Ok(Value::Integer(1)),
-            ast::Literal::False => Ok(Value::Integer(0)),
+            ast::Literal::True => Ok(Value::from_i64(1)),
+            ast::Literal::False => Ok(Value::from_i64(0)),
             ast::Literal::Keyword(k) => {
                 let k_bytes = k.as_bytes();
                 match_ignore_ascii_case!(match k_bytes {
-                    b"true" => Ok(Value::Integer(1)),  // SQLite uses int for bool
-                    b"false" => Ok(Value::Integer(0)), // SQLite uses int for bool
+                    b"true" => Ok(Value::from_i64(1)),  // SQLite uses int for bool
+                    b"false" => Ok(Value::from_i64(0)), // SQLite uses int for bool
                     _ => Ok(Value::Text(k.clone().into())),
                 })
             }
             ast::Literal::Numeric(s) => {
                 if let Ok(i) = s.parse::<i64>() {
-                    Ok(Value::Integer(i))
+                    Ok(Value::from_i64(i))
                 } else if let Ok(f) = s.parse::<f64>() {
-                    Ok(Value::Float(f))
+                    Ok(Value::from_f64(f))
                 } else {
                     Ok(Value::Text(s.clone().into()))
                 }
@@ -2318,8 +2322,8 @@ impl<'a> LogicalPlanBuilder<'a> {
                     Ok(Type::Text)
                 }
             }
-            LogicalExpr::Literal(Value::Integer(_)) => Ok(Type::Integer),
-            LogicalExpr::Literal(Value::Float(_)) => Ok(Type::Real),
+            LogicalExpr::Literal(Value::Numeric(Numeric::Integer(_))) => Ok(Type::Integer),
+            LogicalExpr::Literal(Value::Numeric(Numeric::Float(_))) => Ok(Type::Real),
             LogicalExpr::Literal(Value::Text(_)) => Ok(Type::Text),
             LogicalExpr::Literal(Value::Null) => Ok(Type::Null),
             LogicalExpr::Literal(Value::Blob(_)) => Ok(Type::Blob),
@@ -2414,6 +2418,7 @@ mod tests {
             root_page: 2,
             primary_key_columns: vec![("id".to_string(), turso_parser::ast::SortOrder::Asc)],
             foreign_keys: vec![],
+            check_constraints: vec![],
             columns: vec![
                 SchemaColumn::new(
                     Some("id".to_string()),
@@ -2491,6 +2496,7 @@ mod tests {
             has_autoincrement: false,
             unique_sets: vec![],
             foreign_keys: vec![],
+            check_constraints: vec![],
         };
         schema
             .add_btree_table(Arc::new(orders_table))
@@ -2537,6 +2543,7 @@ mod tests {
             has_autoincrement: false,
             unique_sets: vec![],
             foreign_keys: vec![],
+            check_constraints: vec![],
         };
         schema
             .add_btree_table(Arc::new(products_table))
@@ -3267,21 +3274,24 @@ mod tests {
 
                 assert!(matches!(
                     proj.exprs[0],
-                    LogicalExpr::Literal(Value::Integer(25))
+                    LogicalExpr::Literal(Value::Numeric(Numeric::Integer(25)))
                 ));
 
                 match &proj.exprs[1] {
                     LogicalExpr::BinaryExpr { left, op, right } => {
                         assert_eq!(*op, BinaryOperator::Divide);
                         assert!(matches!(&**left, LogicalExpr::Column(_)));
-                        assert!(matches!(&**right, LogicalExpr::Literal(Value::Integer(3))));
+                        assert!(matches!(
+                            &**right,
+                            LogicalExpr::Literal(Value::Numeric(Numeric::Integer(3)))
+                        ));
                     }
                     _ => panic!("Expected BinaryExpr for (MAX(id) / 3)"),
                 }
 
                 assert!(matches!(
                     proj.exprs[2],
-                    LogicalExpr::Literal(Value::Integer(39))
+                    LogicalExpr::Literal(Value::Numeric(Numeric::Integer(39)))
                 ));
 
                 match &*proj.input {
@@ -3328,7 +3338,7 @@ mod tests {
                         }
                         assert!(matches!(
                             &**right,
-                            LogicalExpr::Literal(Value::Integer(225))
+                            LogicalExpr::Literal(Value::Numeric(Numeric::Integer(225)))
                         ));
                     }
                     _ => panic!("Expected BinaryExpr for (COUNT(*) - 225)"),
@@ -3336,7 +3346,7 @@ mod tests {
 
                 assert!(matches!(
                     proj.exprs[1],
-                    LogicalExpr::Literal(Value::Integer(30))
+                    LogicalExpr::Literal(Value::Numeric(Numeric::Integer(30)))
                 ));
 
                 match &proj.exprs[2] {
@@ -3621,7 +3631,7 @@ mod tests {
                                         match (&**left, &**right) {
                                             (LogicalExpr::Column(col), LogicalExpr::Literal(val)) => {
                                                 assert_eq!(col.name, "age", "Should reference age column");
-                                                assert_eq!(*val, Value::Integer(2), "Should add 2");
+                                                assert_eq!(*val, Value::from_i64(2), "Should add 2");
                                             }
                                             _ => panic!("Expected age + 2"),
                                         }
@@ -4054,7 +4064,7 @@ mod tests {
 
     #[test]
     fn test_strip_alias_literal() {
-        let expr = LogicalExpr::Literal(Value::Integer(42));
+        let expr = LogicalExpr::Literal(Value::from_i64(42));
         let stripped = strip_alias(&expr);
         assert_eq!(stripped, &expr);
     }
@@ -4065,8 +4075,8 @@ mod tests {
             fun: "substr".to_string(),
             args: vec![
                 LogicalExpr::Column(Column::new("name")),
-                LogicalExpr::Literal(Value::Integer(1)),
-                LogicalExpr::Literal(Value::Integer(4)),
+                LogicalExpr::Literal(Value::from_i64(1)),
+                LogicalExpr::Literal(Value::from_i64(4)),
             ],
         };
         let stripped = strip_alias(&expr);
@@ -4101,8 +4111,8 @@ mod tests {
             fun: "substr".to_string(),
             args: vec![
                 LogicalExpr::Column(Column::new("orderdate")),
-                LogicalExpr::Literal(Value::Integer(1)),
-                LogicalExpr::Literal(Value::Integer(4)),
+                LogicalExpr::Literal(Value::from_i64(1)),
+                LogicalExpr::Literal(Value::from_i64(4)),
             ],
         };
 
@@ -4124,7 +4134,7 @@ mod tests {
         let expr = LogicalExpr::BinaryExpr {
             left: Box::new(LogicalExpr::Column(Column::new("a"))),
             op: BinaryOperator::Add,
-            right: Box::new(LogicalExpr::Literal(Value::Integer(1))),
+            right: Box::new(LogicalExpr::Literal(Value::from_i64(1))),
         };
         let stripped = strip_alias(&expr);
         assert_eq!(stripped, &expr);
@@ -4149,8 +4159,8 @@ mod tests {
             fun: "substr".to_string(),
             args: vec![
                 LogicalExpr::Column(Column::new("b")),
-                LogicalExpr::Literal(Value::Integer(1)),
-                LogicalExpr::Literal(Value::Integer(4)),
+                LogicalExpr::Literal(Value::from_i64(1)),
+                LogicalExpr::Literal(Value::from_i64(4)),
             ],
         };
 
@@ -4164,7 +4174,7 @@ mod tests {
         };
 
         let select_exprs = [aliased1, aliased2];
-        let group_exprs = [expr1.clone(), expr2.clone()];
+        let group_exprs = [expr1, expr2];
 
         // Verify that stripping aliases allows matching
         for (select_expr, group_expr) in select_exprs.iter().zip(group_exprs.iter()) {

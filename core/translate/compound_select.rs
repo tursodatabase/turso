@@ -120,7 +120,7 @@ pub fn emit_program_for_compound_select(
     // This is inefficient, but emit_compound_select() takes ownership of 'plan' and we
     // must set the result columns to the leftmost subselect's result columns to be compatible
     // with SQLite.
-    program.result_columns = left[0].0.result_columns.clone();
+    program.result_columns.clone_from(&left[0].0.result_columns);
 
     // These must also be set because we make the decision to start a transaction based on whether
     // any tables are actually touched by the query. Previously this only used the rightmost subselect's
@@ -131,9 +131,7 @@ pub fn emit_program_for_compound_select(
             .table_references
             .extend(plan.table_references.clone());
     }
-    program
-        .table_references
-        .extend(right_plan.table_references.clone());
+    program.table_references.extend(right_plan.table_references);
 
     emit_compound_select(
         program,
@@ -242,7 +240,7 @@ fn emit_compound_select(
                 let dedupe_index = match right_most.query_destination {
                     QueryDestination::EphemeralIndex {
                         cursor_id, index, ..
-                    } => (cursor_id, index.clone()),
+                    } => (cursor_id, index),
                     _ => {
                         new_dedupe_index = true;
                         create_dedupe_index(program, &plan, &right_most, schema)?
@@ -480,7 +478,7 @@ fn create_dedupe_index(
         cursor_id,
         is_table: false,
     });
-    Ok((cursor_id, dedupe_index.clone()))
+    Ok((cursor_id, dedupe_index))
 }
 
 /// Emits the bytecode for reading deduplicated rows from the ephemeral index created for

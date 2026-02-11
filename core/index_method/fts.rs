@@ -696,7 +696,7 @@ impl HybridBTreeDirectory {
         let seek_key = ImmutableRecord::from_values(
             &[
                 Value::Text(Text::new(path_str.clone())),
-                Value::Integer(uncached_start as i64),
+                Value::from_i64(uncached_start as i64),
                 Value::Blob(vec![]),
             ],
             Self::CHUNK_LEN,
@@ -780,7 +780,7 @@ impl HybridBTreeDirectory {
                 _ => None,
             });
             let found_chunk = record.get_value_opt(1).and_then(|v| match v {
-                crate::types::ValueRef::Integer(i) => Some(i),
+                crate::types::ValueRef::Numeric(crate::numeric::Numeric::Integer(i)) => Some(i),
                 _ => None,
             });
             let bytes = record.get_value_opt(2).and_then(|v| match v {
@@ -1942,7 +1942,7 @@ impl FtsCursor {
                     let seek_key = ImmutableRecord::from_values(
                         &[
                             Value::Text(Text::new(path_str.clone())),
-                            Value::Integer(0),
+                            Value::from_i64(0),
                             Value::Blob(vec![]),
                         ],
                         3,
@@ -2127,7 +2127,7 @@ impl FtsCursor {
                     let record = ImmutableRecord::from_values(
                         &[
                             Value::Text(Text::new(path_str.clone())),
-                            Value::Integer(actual_chunk_idx as i64),
+                            Value::from_i64(actual_chunk_idx as i64),
                             Value::Blob(chunk_data.to_vec()),
                         ],
                         3,
@@ -2212,7 +2212,7 @@ impl FtsCursor {
                     let seek_key = ImmutableRecord::from_values(
                         &[
                             Value::Text(Text::new(path_str)),
-                            Value::Integer(0),
+                            Value::from_i64(0),
                             Value::Blob(vec![]),
                         ],
                         3,
@@ -2673,7 +2673,9 @@ impl IndexMethodCursor for FtsCursor {
                             _ => None,
                         });
                         let chunk_no = record.get_value_opt(1).and_then(|v| match v {
-                            crate::types::ValueRef::Integer(i) => Some(i),
+                            crate::types::ValueRef::Numeric(crate::numeric::Numeric::Integer(
+                                i,
+                            )) => Some(i),
                             _ => None,
                         });
                         // Get blob size for estimation (we don't read the full blob)
@@ -2915,7 +2917,7 @@ impl IndexMethodCursor for FtsCursor {
             LimboError::InternalError("FTS insert requires at least rowid".into())
         })?;
         let rowid = match rowid_reg {
-            Register::Value(Value::Integer(i)) => *i,
+            Register::Value(Value::Numeric(crate::numeric::Numeric::Integer(i))) => *i,
             _ => {
                 return Err(LimboError::InternalError(
                     "FTS rowid must be integer".into(),
@@ -2963,7 +2965,7 @@ impl IndexMethodCursor for FtsCursor {
             LimboError::InternalError("FTS delete requires at least rowid".into())
         })?;
         let rowid = match rowid_reg {
-            Register::Value(Value::Integer(i)) => *i,
+            Register::Value(Value::Numeric(crate::numeric::Numeric::Integer(i))) => *i,
             _ => {
                 return Err(LimboError::InternalError(
                     "FTS rowid must be integer".into(),
@@ -3000,7 +3002,7 @@ impl IndexMethodCursor for FtsCursor {
 
         // values[0] = pattern index
         let pattern_idx = match &values[0] {
-            Register::Value(Value::Integer(i)) => *i,
+            Register::Value(Value::Numeric(crate::numeric::Numeric::Integer(i))) => *i,
             _ => FTS_PATTERN_SCORE,
         };
         self.current_pattern = pattern_idx;
@@ -3026,7 +3028,9 @@ impl IndexMethodCursor for FtsCursor {
             | FTS_PATTERN_COMBINED_ORDERED_LIMIT => {
                 if values.len() > 2 {
                     match &values[2] {
-                        Register::Value(Value::Integer(i)) => *i as usize,
+                        Register::Value(Value::Numeric(crate::numeric::Numeric::Integer(i))) => {
+                            *i as usize
+                        }
                         _ => {
                             tracing::debug!(
                                 "FTS query_start: LIMIT value is not an integer, using default 10"
@@ -3138,7 +3142,7 @@ impl IndexMethodCursor for FtsCursor {
         match self.current_pattern {
             FTS_PATTERN_MATCH | FTS_PATTERN_MATCH_LIMIT => {
                 // For fts_match patterns, return 1 (true) - indicates this row matches
-                Ok(IOResult::Done(Value::Integer(1)))
+                Ok(IOResult::Done(Value::from_i64(1)))
             }
             FTS_PATTERN_SCORE
             | FTS_PATTERN_COMBINED
@@ -3147,12 +3151,12 @@ impl IndexMethodCursor for FtsCursor {
             | FTS_PATTERN_COMBINED_ORDERED_LIMIT => {
                 // For fts_score and combined patterns, return the actual score
                 let (score, _, _) = self.current_hits[self.hit_pos];
-                Ok(IOResult::Done(Value::Float(score as f64)))
+                Ok(IOResult::Done(Value::from_f64(score as f64)))
             }
             _ => {
                 // Unknown pattern - return score as default
                 let (score, _, _) = self.current_hits[self.hit_pos];
-                Ok(IOResult::Done(Value::Float(score as f64)))
+                Ok(IOResult::Done(Value::from_f64(score as f64)))
             }
         }
     }

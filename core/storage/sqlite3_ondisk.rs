@@ -53,6 +53,7 @@ use super::wal::TursoRwLock;
 use crate::error::LimboError;
 use crate::fast_lock::SpinLock;
 use crate::io::{Buffer, Completion, FileSyncType, ReadComplete};
+use crate::numeric::Numeric;
 use crate::storage::btree::{payload_overflow_threshold_max, payload_overflow_threshold_min};
 use crate::storage::buffer_pool::BufferPool;
 use crate::storage::database::{DatabaseStorage, EncryptionOrChecksum};
@@ -577,7 +578,7 @@ pub fn begin_read_page(
         } else {
             buf
         };
-        finish_read_page(page_idx, buffer, page.clone());
+        finish_read_page(page_idx, buffer, page);
         None
     });
     let c = Completion::new_read(buf, complete);
@@ -915,14 +916,17 @@ pub fn read_value<'a>(buf: &'a [u8], serial_type: SerialType) -> Result<(ValueRe
             let val = *buf
                 .first()
                 .ok_or_else(|| LimboError::Corrupt("Invalid UInt8 value".into()))?;
-            Ok((ValueRef::Integer(val as i8 as i64), 1))
+            Ok((ValueRef::Numeric(Numeric::Integer(val as i8 as i64)), 1))
         }
         SerialTypeKind::I16 => {
             let bytes: &[u8; 2] = buf
                 .get(..2)
                 .and_then(|s| s.try_into().ok())
                 .ok_or_else(|| LimboError::Corrupt("Invalid BEInt16 value".into()))?;
-            Ok((ValueRef::Integer(i16::from_be_bytes(*bytes) as i64), 2))
+            Ok((
+                ValueRef::Numeric(Numeric::Integer(i16::from_be_bytes(*bytes) as i64)),
+                2,
+            ))
         }
         SerialTypeKind::I24 => {
             let bytes: &[u8; 3] = buf
@@ -931,9 +935,12 @@ pub fn read_value<'a>(buf: &'a [u8], serial_type: SerialType) -> Result<(ValueRe
                 .ok_or_else(|| LimboError::Corrupt("Invalid BEInt24 value".into()))?;
             let sign_extension = (bytes[0] as i8 >> 7) as u8;
             Ok((
-                ValueRef::Integer(
-                    i32::from_be_bytes([sign_extension, bytes[0], bytes[1], bytes[2]]) as i64,
-                ),
+                ValueRef::Numeric(Numeric::Integer(i32::from_be_bytes([
+                    sign_extension,
+                    bytes[0],
+                    bytes[1],
+                    bytes[2],
+                ]) as i64)),
                 3,
             ))
         }
@@ -942,7 +949,10 @@ pub fn read_value<'a>(buf: &'a [u8], serial_type: SerialType) -> Result<(ValueRe
                 .get(..4)
                 .and_then(|s| s.try_into().ok())
                 .ok_or_else(|| LimboError::Corrupt("Invalid BEInt32 value".into()))?;
-            Ok((ValueRef::Integer(i32::from_be_bytes(*bytes) as i64), 4))
+            Ok((
+                ValueRef::Numeric(Numeric::Integer(i32::from_be_bytes(*bytes) as i64)),
+                4,
+            ))
         }
         SerialTypeKind::I48 => {
             let bytes: &[u8; 6] = buf
@@ -951,7 +961,7 @@ pub fn read_value<'a>(buf: &'a [u8], serial_type: SerialType) -> Result<(ValueRe
                 .ok_or_else(|| LimboError::Corrupt("Invalid BEInt48 value".into()))?;
             let sign_extension = (bytes[0] as i8 >> 7) as u8;
             Ok((
-                ValueRef::Integer(i64::from_be_bytes([
+                ValueRef::Numeric(Numeric::Integer(i64::from_be_bytes([
                     sign_extension,
                     sign_extension,
                     bytes[0],
@@ -960,7 +970,7 @@ pub fn read_value<'a>(buf: &'a [u8], serial_type: SerialType) -> Result<(ValueRe
                     bytes[3],
                     bytes[4],
                     bytes[5],
-                ])),
+                ]))),
                 6,
             ))
         }
@@ -969,17 +979,20 @@ pub fn read_value<'a>(buf: &'a [u8], serial_type: SerialType) -> Result<(ValueRe
                 .get(..8)
                 .and_then(|s| s.try_into().ok())
                 .ok_or_else(|| LimboError::Corrupt("Invalid BEInt64 value".into()))?;
-            Ok((ValueRef::Integer(i64::from_be_bytes(*bytes)), 8))
+            Ok((
+                ValueRef::Numeric(Numeric::Integer(i64::from_be_bytes(*bytes))),
+                8,
+            ))
         }
         SerialTypeKind::F64 => {
             let bytes: &[u8; 8] = buf
                 .get(..8)
                 .and_then(|s| s.try_into().ok())
                 .ok_or_else(|| LimboError::Corrupt("Invalid BEFloat64 value".into()))?;
-            Ok((ValueRef::Float(f64::from_be_bytes(*bytes)), 8))
+            Ok((ValueRef::from_f64(f64::from_be_bytes(*bytes)), 8))
         }
-        SerialTypeKind::ConstInt0 => Ok((ValueRef::Integer(0), 0)),
-        SerialTypeKind::ConstInt1 => Ok((ValueRef::Integer(1), 0)),
+        SerialTypeKind::ConstInt0 => Ok((ValueRef::Numeric(Numeric::Integer(0)), 0)),
+        SerialTypeKind::ConstInt1 => Ok((ValueRef::Numeric(Numeric::Integer(1)), 0)),
         SerialTypeKind::Blob => {
             let content_size = serial_type.size();
             let data = buf
@@ -1016,14 +1029,14 @@ pub fn read_value_serial_type<'a>(
             if buf.is_empty() {
                 crate::bail_corrupt_error!("Invalid 1-byte int");
             }
-            Ok((ValueRef::Integer(buf[0] as i8 as i64), 1))
+            Ok((ValueRef::Numeric(Numeric::Integer(buf[0] as i8 as i64)), 1))
         }
         2 => {
             if buf.len() < 2 {
                 crate::bail_corrupt_error!("Invalid 2-byte int");
             }
             Ok((
-                ValueRef::Integer(i16::from_be_bytes([buf[0], buf[1]]) as i64),
+                ValueRef::Numeric(Numeric::Integer(i16::from_be_bytes([buf[0], buf[1]]) as i64)),
                 2,
             ))
         }
@@ -1033,9 +1046,12 @@ pub fn read_value_serial_type<'a>(
             }
             let sign_extension = if buf[0] <= 0x7F { 0 } else { 0xFF };
             Ok((
-                ValueRef::Integer(
-                    i32::from_be_bytes([sign_extension, buf[0], buf[1], buf[2]]) as i64
-                ),
+                ValueRef::Numeric(Numeric::Integer(i32::from_be_bytes([
+                    sign_extension,
+                    buf[0],
+                    buf[1],
+                    buf[2],
+                ]) as i64)),
                 3,
             ))
         }
@@ -1044,7 +1060,9 @@ pub fn read_value_serial_type<'a>(
                 crate::bail_corrupt_error!("Invalid 4-byte int");
             }
             Ok((
-                ValueRef::Integer(i32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as i64),
+                ValueRef::Numeric(Numeric::Integer(i32::from_be_bytes([
+                    buf[0], buf[1], buf[2], buf[3],
+                ]) as i64)),
                 4,
             ))
         }
@@ -1054,7 +1072,7 @@ pub fn read_value_serial_type<'a>(
             }
             let sign_extension = if buf[0] <= 0x7F { 0 } else { 0xFF };
             Ok((
-                ValueRef::Integer(i64::from_be_bytes([
+                ValueRef::Numeric(Numeric::Integer(i64::from_be_bytes([
                     sign_extension,
                     sign_extension,
                     buf[0],
@@ -1063,7 +1081,7 @@ pub fn read_value_serial_type<'a>(
                     buf[3],
                     buf[4],
                     buf[5],
-                ])),
+                ]))),
                 6,
             ))
         }
@@ -1072,9 +1090,9 @@ pub fn read_value_serial_type<'a>(
                 crate::bail_corrupt_error!("Invalid 8-byte int");
             }
             Ok((
-                ValueRef::Integer(i64::from_be_bytes([
+                ValueRef::Numeric(Numeric::Integer(i64::from_be_bytes([
                     buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
-                ])),
+                ]))),
                 8,
             ))
         }
@@ -1083,14 +1101,14 @@ pub fn read_value_serial_type<'a>(
                 crate::bail_corrupt_error!("Invalid 8-byte float");
             }
             Ok((
-                ValueRef::Float(f64::from_be_bytes([
+                ValueRef::from_f64(f64::from_be_bytes([
                     buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
                 ])),
                 8,
             ))
         }
-        8 => Ok((ValueRef::Integer(0), 0)),
-        9 => Ok((ValueRef::Integer(1), 0)),
+        8 => Ok((ValueRef::Numeric(Numeric::Integer(0)), 0)),
+        9 => Ok((ValueRef::Numeric(Numeric::Integer(1)), 0)),
         n if n >= 12 => match n % 2 {
             0 => {
                 // Blob
@@ -1318,7 +1336,7 @@ pub fn build_shared_wal(
     let reader = Arc::new(StreamingWalReader::new(
         file.clone(),
         wal_file_shared.clone(),
-        header.clone(),
+        header,
         size,
     ));
 
@@ -1684,7 +1702,9 @@ pub fn begin_read_wal_frame<F: File + ?Sized>(
                             tracing::error!(
                                 "Failed to decrypt WAL frame data for page_idx={page_idx}: {e}"
                             );
-                            original_complete(Err(CompletionError::DecryptionError { page_idx }))
+                            let err = CompletionError::DecryptionError { page_idx };
+                            original_complete(Err(err));
+                            Some(err)
                         }
                     }
                 });
@@ -1711,7 +1731,8 @@ pub fn begin_read_wal_frame<F: File + ?Sized>(
                             tracing::error!(
                                 "Failed to verify checksum for page_id={page_idx}: {e}"
                             );
-                            original_c(Err(e))
+                            original_c(Err(e));
+                            Some(e)
                         }
                     }
                 });
@@ -1812,7 +1833,7 @@ pub fn begin_write_wal_header<F: File + ?Sized>(io: &F, header: &WalHeader) -> R
     };
     #[allow(clippy::arc_with_non_send_sync)]
     let c = Completion::new_write(write_complete);
-    let c = io.pwrite(0, buffer.clone(), c.clone())?;
+    let c = io.pwrite(0, buffer, c)?;
     Ok(c)
 }
 
@@ -1908,31 +1929,31 @@ mod tests {
 
     #[rstest]
     #[case(&[], SerialType::null(), Value::Null)]
-    #[case(&[255], SerialType::i8(), Value::Integer(-1))]
-    #[case(&[0x12, 0x34], SerialType::i16(), Value::Integer(0x1234))]
-    #[case(&[0xFE], SerialType::i8(), Value::Integer(-2))]
-    #[case(&[0x12, 0x34, 0x56], SerialType::i24(), Value::Integer(0x123456))]
-    #[case(&[0x12, 0x34, 0x56, 0x78], SerialType::i32(), Value::Integer(0x12345678))]
-    #[case(&[0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC], SerialType::i48(), Value::Integer(0x123456789ABC))]
-    #[case(&[0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xFF], SerialType::i64(), Value::Integer(0x123456789ABCDEFF))]
-    #[case(&[0x40, 0x09, 0x21, 0xFB, 0x54, 0x44, 0x2D, 0x18], SerialType::f64(), Value::Float(std::f64::consts::PI))]
-    #[case(&[1, 2], SerialType::const_int0(), Value::Integer(0))]
-    #[case(&[65, 66], SerialType::const_int1(), Value::Integer(1))]
+    #[case(&[255], SerialType::i8(), Value::from_i64(-1))]
+    #[case(&[0x12, 0x34], SerialType::i16(), Value::from_i64(0x1234))]
+    #[case(&[0xFE], SerialType::i8(), Value::from_i64(-2))]
+    #[case(&[0x12, 0x34, 0x56], SerialType::i24(), Value::from_i64(0x123456))]
+    #[case(&[0x12, 0x34, 0x56, 0x78], SerialType::i32(), Value::from_i64(0x12345678))]
+    #[case(&[0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC], SerialType::i48(), Value::from_i64(0x123456789ABC))]
+    #[case(&[0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xFF], SerialType::i64(), Value::from_i64(0x123456789ABCDEFF))]
+    #[case(&[0x40, 0x09, 0x21, 0xFB, 0x54, 0x44, 0x2D, 0x18], SerialType::f64(), Value::from_f64(std::f64::consts::PI))]
+    #[case(&[1, 2], SerialType::const_int0(), Value::from_i64(0))]
+    #[case(&[65, 66], SerialType::const_int1(), Value::from_i64(1))]
     #[case(&[1, 2, 3], SerialType::blob(3), Value::Blob(vec![1, 2, 3]))]
     #[case(&[], SerialType::blob(0), Value::Blob(vec![]))] // empty blob
     #[case(&[65, 66, 67], SerialType::text(3), Value::build_text("ABC"))]
-    #[case(&[0x80], SerialType::i8(), Value::Integer(-128))]
-    #[case(&[0x80, 0], SerialType::i16(), Value::Integer(-32768))]
-    #[case(&[0x80, 0, 0], SerialType::i24(), Value::Integer(-8388608))]
-    #[case(&[0x80, 0, 0, 0], SerialType::i32(), Value::Integer(-2147483648))]
-    #[case(&[0x80, 0, 0, 0, 0, 0], SerialType::i48(), Value::Integer(-140737488355328))]
-    #[case(&[0x80, 0, 0, 0, 0, 0, 0, 0], SerialType::i64(), Value::Integer(-9223372036854775808))]
-    #[case(&[0x7f], SerialType::i8(), Value::Integer(127))]
-    #[case(&[0x7f, 0xff], SerialType::i16(), Value::Integer(32767))]
-    #[case(&[0x7f, 0xff, 0xff], SerialType::i24(), Value::Integer(8388607))]
-    #[case(&[0x7f, 0xff, 0xff, 0xff], SerialType::i32(), Value::Integer(2147483647))]
-    #[case(&[0x7f, 0xff, 0xff, 0xff, 0xff, 0xff], SerialType::i48(), Value::Integer(140737488355327))]
-    #[case(&[0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff], SerialType::i64(), Value::Integer(9223372036854775807))]
+    #[case(&[0x80], SerialType::i8(), Value::from_i64(-128))]
+    #[case(&[0x80, 0], SerialType::i16(), Value::from_i64(-32768))]
+    #[case(&[0x80, 0, 0], SerialType::i24(), Value::from_i64(-8388608))]
+    #[case(&[0x80, 0, 0, 0], SerialType::i32(), Value::from_i64(-2147483648))]
+    #[case(&[0x80, 0, 0, 0, 0, 0], SerialType::i48(), Value::from_i64(-140737488355328))]
+    #[case(&[0x80, 0, 0, 0, 0, 0, 0, 0], SerialType::i64(), Value::from_i64(-9223372036854775808))]
+    #[case(&[0x7f], SerialType::i8(), Value::from_i64(127))]
+    #[case(&[0x7f, 0xff], SerialType::i16(), Value::from_i64(32767))]
+    #[case(&[0x7f, 0xff, 0xff], SerialType::i24(), Value::from_i64(8388607))]
+    #[case(&[0x7f, 0xff, 0xff, 0xff], SerialType::i32(), Value::from_i64(2147483647))]
+    #[case(&[0x7f, 0xff, 0xff, 0xff, 0xff, 0xff], SerialType::i48(), Value::from_i64(140737488355327))]
+    #[case(&[0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff], SerialType::i64(), Value::from_i64(9223372036854775807))]
     fn test_read_value(
         #[case] buf: &[u8],
         #[case] serial_type: SerialType,

@@ -31,12 +31,12 @@ impl From<Value> for CoreValue {
     fn from(value: Value) -> CoreValue {
         match value {
             Value::Null => CoreValue::Null,
-            Value::Integer(v) => CoreValue::Integer(v),
+            Value::Integer(v) => CoreValue::from_i64(v),
             Value::Real(v) => {
                 if v.is_nan() {
                     CoreValue::Null
                 } else {
-                    CoreValue::Float(v)
+                    CoreValue::from_f64(v)
                 }
             }
             Value::Text(v) => CoreValue::from_text(v),
@@ -458,7 +458,7 @@ fn execute_scalar_func(call: ScalarFuncCall) {
         }
         ScalarFuncCall::MathPi => {
             // pi() has no inputs, just returns a constant - nothing to fuzz
-            let _ = CoreValue::Float(std::f64::consts::PI);
+            let _ = CoreValue::from_f64(std::f64::consts::PI);
         }
         // JSON functions
         ScalarFuncCall::JsonArray(mut vals) => {

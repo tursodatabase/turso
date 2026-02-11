@@ -124,7 +124,7 @@ pub fn translate_create_index(
                 table_name: tbl.name.clone(),
                 index_name: idx_name.clone(),
                 columns: columns.clone(),
-                parameters: parameters.clone(),
+                parameters,
             })?);
         }
     }
@@ -716,9 +716,8 @@ pub fn resolve_index_method_parameters(
         let value = match *value {
             Expr::Literal(literal) => match literal {
                 ast::Literal::Numeric(s) => match Numeric::from(s) {
-                    Numeric::Null => crate::Value::Null,
-                    Numeric::Integer(v) => crate::Value::Integer(v),
-                    Numeric::Float(v) => crate::Value::Float(v.into()),
+                    Numeric::Integer(v) => crate::Value::Numeric(Numeric::Integer(v)),
+                    Numeric::Float(v) => crate::Value::Numeric(Numeric::Float(v)),
                 },
                 ast::Literal::Null => crate::Value::Null,
                 ast::Literal::String(s) => crate::Value::Text(s.into()),
@@ -800,7 +799,7 @@ pub fn translate_drop_index(
     program.emit_null(null_reg, None);
 
     // String8; r[3] = 'some idx name'
-    let index_name_reg = program.emit_string8_new_reg(idx_name.to_string());
+    let index_name_reg = program.emit_string8_new_reg(idx_name);
     // String8; r[4] = 'index'
     let index_str_reg = program.emit_string8_new_reg("index".to_string());
 

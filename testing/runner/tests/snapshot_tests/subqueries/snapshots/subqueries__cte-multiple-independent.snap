@@ -1,18 +1,37 @@
 ---
 source: subqueries.sqltest
-expression: "WITH\n    expensive_products AS (\n        SELECT id, name, price\n        FROM products\n        WHERE price > 500\n    ),\n    large_orders AS (\n        SELECT id, customer_id, total_amount\n        FROM orders\n        WHERE total_amount > 1000\n    ),\n    vip_customers AS (\n        SELECT id, name\n        FROM customers\n        WHERE id IN (SELECT customer_id FROM large_orders)\n    )\n    SELECT v.name, l.total_amount\n    FROM vip_customers v\n    JOIN large_orders l ON l.customer_id = v.id;"
+expression: |-
+  WITH
+      expensive_products AS (
+          SELECT id, name, price
+          FROM products
+          WHERE price > 500
+      ),
+      large_orders AS (
+          SELECT id, customer_id, total_amount
+          FROM orders
+          WHERE total_amount > 1000
+      ),
+      vip_customers AS (
+          SELECT id, name
+          FROM customers
+          WHERE id IN (SELECT customer_id FROM large_orders)
+      )
+      SELECT v.name, l.total_amount
+      FROM vip_customers v
+      JOIN large_orders l ON l.customer_id = v.id;
 info:
   statement_type: WITH (CTE)
   tables:
-    - customers
-    - l.customer_id
-    - large_orders
-    - orders
-    - products
-    - vip_customers
+  - customers
+  - l.customer_id
+  - large_orders
+  - orders
+  - products
+  - vip_customers
   setup_blocks:
-    - schema
-  database: ":memory:"
+  - schema
+  database: ':memory:'
 ---
 QUERY PLAN
 |--SCAN vip_customers AS v
@@ -44,7 +63,7 @@ addr  opcode             p1  p2  p3  p4            p5  comment
   17  InitCoroutine       2   0   5                 0
   18    Yield             2  23   0                 0
   19    Copy              4   9   0                 0  r[9]=r[4]
-  20    MakeRecord        9   1  10                 0  r[10]=mkrec(r[9..9]); for ephemeral_index_where_sub_t10
+  20    MakeRecord        9   1  10                 0  r[10]=mkrec(r[9..9]); for ephemeral_index_where_sub_t11
   21    IdxInsert         1  10   0                 8  key=r[10]
   22  Goto                0  18   0                 0
   23  OpenRead            3   6   0  k(4,B,B,B,B)   0  table=customers, root=6, iDb=0
@@ -54,8 +73,8 @@ addr  opcode             p1  p2  p3  p4            p5  comment
   27    Affinity         14   1   0                 0  r[14..15] = D
   28    NotFound          1  30  14                 0  if not found goto 30
   29    Goto              0  36   0                 0
-  30    Rewind            1  38   0                 0  Rewind  ephemeral_index_where_sub_t10
-  31      Column          1   0  15                 0  r[15]=ephemeral_index_where_sub_t10.customer_id
+  30    Rewind            1  38   0                 0  Rewind  ephemeral_index_where_sub_t11
+  31      Column          1   0  15                 0  r[15]=ephemeral_index_where_sub_t11.customer_id
   32      Ne             14  15  34  Binary         0  if r[14]!=r[15] goto 34
   33      Goto            0  40   0                 0
   34    Next              1  31   0                 0

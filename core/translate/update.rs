@@ -249,7 +249,7 @@ pub fn prepare_update_plan(
         .filter_map(|(i, col)| col.name.as_ref().map(|name| (name.to_lowercase(), i)))
         .collect();
 
-    let mut set_clauses = Vec::with_capacity(body.sets.len());
+    let mut set_clauses: Vec<(usize, Box<Expr>)> = Vec::with_capacity(body.sets.len());
 
     // Process each SET assignment and map column names to expressions
     // e.g the statement `SET x = 1, y = 2, z = 3` has 3 set assigments
@@ -292,14 +292,14 @@ pub fn prepare_update_plan(
                         {
                             // Use the rowid alias column index
                             match set_clauses.iter_mut().find(|(i, _)| i == &idx) {
-                                Some((_, existing_expr)) => *existing_expr = expr.clone(),
+                                Some((_, existing_expr)) => existing_expr.clone_from(expr),
                                 None => set_clauses.push((idx, expr.clone())),
                             }
                             idx
                         } else {
                             // No rowid alias, use sentinel value for actual rowid
                             match set_clauses.iter_mut().find(|(i, _)| *i == ROWID_SENTINEL) {
-                                Some((_, existing_expr)) => *existing_expr = expr.clone(),
+                                Some((_, existing_expr)) => existing_expr.clone_from(expr),
                                 None => set_clauses.push((ROWID_SENTINEL, expr.clone())),
                             }
                             ROWID_SENTINEL
@@ -310,7 +310,7 @@ pub fn prepare_update_plan(
                 }
             };
             match set_clauses.iter_mut().find(|(idx, _)| *idx == col_index) {
-                Some((_, existing_expr)) => *existing_expr = expr.clone(),
+                Some((_, existing_expr)) => existing_expr.clone_from(expr),
                 None => set_clauses.push((col_index, expr.clone())),
             }
         }
