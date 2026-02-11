@@ -16,6 +16,7 @@ expect {
     main|t1|table|2|0|0
 }
 
+@skip-if mvcc "views not yet supported for mvcc"
 test pragma-table-list-view {
     CREATE TABLE t1(a, b, c);
     CREATE VIEW v1 AS SELECT a, b FROM t1;
@@ -40,6 +41,7 @@ test pragma-table-list-nonexistent {
 expect {
 }
 
+@skip-if mvcc "views not yet supported for mvcc"
 test pragma-table-list-all-user-tables {
     CREATE TABLE t1(a, b, c);
     CREATE TABLE t2(x INTEGER, y TEXT);
