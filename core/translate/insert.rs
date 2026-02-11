@@ -2322,7 +2322,11 @@ fn emit_unique_index_check(
             // USE_SEEK: cursor was positioned by NoConflict above, skip redundant seek.
             // Note: If record contains NULLs, NoConflict skips the seek entirely, so
             // op_idx_insert must check for NULLs and fall back to seeking if found.
-            flags: IdxInsertFlags::new().nchange(true).use_seek(true),
+            // IMPORTANT: When on_replace is true, the conflict resolution path includes
+            // IdxDelete which repositions the cursor, so we must NOT skip the seek.
+            flags: IdxInsertFlags::new()
+                .nchange(true)
+                .use_seek(!preflight.on_replace),
         });
     }
     Ok(())
