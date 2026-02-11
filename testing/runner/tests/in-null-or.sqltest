@@ -1,0 +1,80 @@
+@database :memory:
+
+# Regression tests for IN/NOT IN with NULL in list combined with OR.
+# When IN/NOT IN evaluates to NULL (due to NULL in the list and no match),
+# the OR right-hand side must still be evaluated.
+
+setup in_null_or {
+    CREATE TABLE t1 (a INTEGER PRIMARY KEY, b INTEGER);
+    INSERT INTO t1 VALUES(1, 1);
+    INSERT INTO t1 VALUES(2, 0);
+    INSERT INTO t1 VALUES(3, NULL);
+}
+
+@setup in_null_or
+test in-null-or-truthy {
+    SELECT a FROM t1 WHERE 5 IN (NULL, 3) OR b ORDER BY a;
+}
+expect {
+    1
+}
+
+@setup in_null_or
+test in-null-or-falsy {
+    SELECT a FROM t1 WHERE 5 IN (NULL, 3) OR 0;
+}
+expect {
+}
+
+@setup in_null_or
+test not-in-null-or-truthy {
+    SELECT a FROM t1 WHERE 5 NOT IN (NULL, 3) OR b ORDER BY a;
+}
+expect {
+    1
+}
+
+@setup in_null_or
+test in-null-or-column-multiple-rows {
+    SELECT a FROM t1 WHERE 5 IN (NULL, 3) OR a > 1 ORDER BY a;
+}
+expect {
+    2
+    3
+}
+
+@setup in_null_or
+test in-null-or-subquery {
+    SELECT a FROM t1 WHERE 5 IN (NULL, 3) OR (SELECT 1) ORDER BY a;
+}
+expect {
+    1
+    2
+    3
+}
+
+@setup in_null_or
+test in-null-or-with-offset {
+    SELECT a FROM t1 WHERE 5 IN (NULL, 3) OR 1 ORDER BY a LIMIT 10 OFFSET 2;
+}
+expect {
+    3
+}
+
+@setup in_null_or
+test in-match-or-null {
+    SELECT a FROM t1 WHERE 3 IN (NULL, 3) OR b ORDER BY a;
+}
+expect {
+    1
+    2
+    3
+}
+
+@setup in_null_or
+test in-null-column-or {
+    SELECT a FROM t1 WHERE a IN (NULL, 99) OR b ORDER BY a;
+}
+expect {
+    1
+}
