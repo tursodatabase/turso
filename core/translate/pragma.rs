@@ -74,7 +74,8 @@ pub fn translate_pragma(
         None => query_pragma(pragma, resolver, None, pager, connection, program)?,
         Some(ast::PragmaBody::Equals(value) | ast::PragmaBody::Call(value)) => match pragma {
             // These pragmas take a parameter but are queries, not setters
-            PragmaName::TableInfo
+            PragmaName::TableList
+            | PragmaName::TableInfo
             | PragmaName::TableXinfo
             | PragmaName::IntegrityCheck
             | PragmaName::QuickCheck => {
@@ -372,6 +373,7 @@ fn update_pragma(
             Ok((program, TransactionMode::Write))
         }
         PragmaName::DatabaseList => unreachable!("database_list cannot be set"),
+        PragmaName::TableList => unreachable!("table_list cannot be set"),
         PragmaName::QueryOnly => query_pragma(
             PragmaName::QueryOnly,
             resolver,
@@ -635,6 +637,89 @@ fn query_pragma(
             program.emit_result_row(register, 1);
             program.add_pragma_result_column(pragma.to_string());
             Ok((program, TransactionMode::Read))
+        }
+        PragmaName::TableList => {
+            let name = match value {
+                Some(ast::Expr::Name(name)) => Some(normalize_ident(name.as_str())),
+                _ => None,
+            };
+
+            let base_reg = register;
+            // 6 columns: schema, name, type, ncol, wr, strict
+            program.alloc_registers(5);
+
+            let emit_table_row = |program: &mut ProgramBuilder,
+                                  name: &str,
+                                  obj_type: &str,
+                                  ncol: usize,
+                                  wr: bool,
+                                  strict: bool| {
+                program.emit_string8("main".to_string(), base_reg);
+                program.emit_string8(name.to_string(), base_reg + 1);
+                program.emit_string8(obj_type.to_string(), base_reg + 2);
+                program.emit_int(ncol as i64, base_reg + 3);
+                program.emit_int(wr as i64, base_reg + 4);
+                program.emit_int(strict as i64, base_reg + 5);
+                program.emit_result_row(base_reg, 6);
+            };
+
+            if let Some(name) = name {
+                // Specific table/view lookup
+                if let Some(table) = schema.get_table(&name) {
+                    let (wr, strict) = match table.btree() {
+                        Some(bt) => (!bt.has_rowid, bt.is_strict),
+                        None => (false, false),
+                    };
+                    emit_table_row(
+                        &mut program,
+                        table.get_name(),
+                        "table",
+                        table.columns().len(),
+                        wr,
+                        strict,
+                    );
+                } else if let Some(view) = schema.get_view(&name) {
+                    emit_table_row(
+                        &mut program,
+                        &view.name,
+                        "view",
+                        view.columns.len(),
+                        false,
+                        false,
+                    );
+                }
+            } else {
+                // List all tables and views (only BTree tables, not built-in virtual tables)
+                for table in schema.tables.values() {
+                    let Some(bt) = table.btree() else {
+                        continue;
+                    };
+                    emit_table_row(
+                        &mut program,
+                        &bt.name,
+                        "table",
+                        bt.columns.len(),
+                        !bt.has_rowid,
+                        bt.is_strict,
+                    );
+                }
+                for view in schema.views.values() {
+                    emit_table_row(
+                        &mut program,
+                        &view.name,
+                        "view",
+                        view.columns.len(),
+                        false,
+                        false,
+                    );
+                }
+            }
+
+            let pragma_meta = pragma_for(&pragma);
+            for col_name in pragma_meta.columns.iter() {
+                program.add_pragma_result_column(col_name.to_string());
+            }
+            Ok((program, TransactionMode::None))
         }
         PragmaName::TableInfo => {
             let name = match value {
