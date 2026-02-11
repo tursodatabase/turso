@@ -1514,6 +1514,8 @@ pub enum PragmaName {
     FreelistCount,
     /// Enable or disable foreign key constraint enforcement
     ForeignKeys,
+    /// List all SQL functions known to the database connection
+    FunctionList,
     /// Use F_FULLFSYNC instead of fsync on macOS (only supported on macOS)
     #[cfg(target_vendor = "apple")]
     Fullfsync,

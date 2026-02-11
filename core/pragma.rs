@@ -155,6 +155,10 @@ pub fn pragma_for(pragma: &PragmaName) -> Pragma {
             PragmaFlags::NoColumns1 | PragmaFlags::Result0,
             &["foreign_keys"],
         ),
+        FunctionList => Pragma::new(
+            PragmaFlags::Result0,
+            &["name", "builtin", "type", "enc", "narg", "flags"],
+        ),
         PragmaName::CacheSpill => Pragma::new(
             PragmaFlags::NoColumns1 | PragmaFlags::Result0,
             &["cache_spill"],

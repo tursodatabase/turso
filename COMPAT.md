@@ -155,7 +155,7 @@ Turso aims to be fully compatible with SQLite, with opt-in features not supporte
 | PRAGMA freelist_count            | ✅ Yes        |                                              |
 | PRAGMA full_column_names         | Not Needed | deprecated in SQLite                         |
 | PRAGMA fullsync                  | ❌ No         |                                              |
-| PRAGMA function_list             | ❌ No         |                                              |
+| PRAGMA function_list             | ✅ Yes        |                                              |
 | PRAGMA hard_heap_limit           | ❌ No         |                                              |
 | PRAGMA ignore_check_constraints  | ❌ No         |                                              |
 | PRAGMA incremental_vacuum        | ❌ No         |                                              |
