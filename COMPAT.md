@@ -160,9 +160,9 @@ Turso aims to be fully compatible with SQLite, with opt-in features not supporte
 | PRAGMA hard_heap_limit           | ❌ No         |                                              |
 | PRAGMA ignore_check_constraints  | ✅ Yes        |                                              |
 | PRAGMA incremental_vacuum        | ❌ No         |                                              |
-| PRAGMA index_info                | ❌ No         |                                              |
-| PRAGMA index_list                | ❌ No         |                                              |
-| PRAGMA index_xinfo               | ❌ No         |                                              |
+| PRAGMA index_info                | ✅ Yes        |                                              |
+| PRAGMA index_list                | ✅ Yes        |                                              |
+| PRAGMA index_xinfo               | ✅ Yes        |                                              |
 | PRAGMA integrity_check           | ✅ Yes        |                                              |
 | PRAGMA journal_mode              | ✅ Yes        |                                              |
 | PRAGMA journal_size_limit        | ❌ No         |                                              |
@@ -190,7 +190,7 @@ Turso aims to be fully compatible with SQLite, with opt-in features not supporte
 | PRAGMA stats                     | ❌ No         | Used for testing in SQLite                   |
 | PRAGMA synchronous               | 🚧 Partial    | `OFF` and `FULL` supported                   |
 | PRAGMA table_info                | ✅ Yes        |                                              |
-| PRAGMA table_list                | ❌ No         |                                              |
+| PRAGMA table_list                | ✅ Yes        |                                              |
 | PRAGMA table_xinfo               | ✅ Yes        |                                              |
 | PRAGMA temp_store                | ✅ Yes        |                                              |
 | PRAGMA temp_store_directory      | Not Needed | deprecated in SQLite                         |

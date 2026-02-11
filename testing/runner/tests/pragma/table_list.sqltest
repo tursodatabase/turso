@@ -1,0 +1,70 @@
+@database :memory:
+
+test pragma-table-list-single-table {
+    CREATE TABLE t1(a, b, c);
+    PRAGMA table_list('t1');
+}
+expect {
+    main|t1|table|3|0|0
+}
+
+test pragma-table-list-equals-syntax {
+    CREATE TABLE t1(x INTEGER, y TEXT);
+    PRAGMA table_list=t1;
+}
+expect {
+    main|t1|table|2|0|0
+}
+
+@skip-if mvcc "views not yet supported for mvcc"
+test pragma-table-list-view {
+    CREATE TABLE t1(a, b, c);
+    CREATE VIEW v1 AS SELECT a, b FROM t1;
+    PRAGMA table_list('v1');
+}
+expect {
+    main|v1|view|2|0|0
+}
+
+@requires strict "uses STRICT tables"
+test pragma-table-list-strict {
+    CREATE TABLE strict_t(a INTEGER, b TEXT) STRICT;
+    PRAGMA table_list('strict_t');
+}
+expect {
+    main|strict_t|table|2|0|1
+}
+
+test pragma-table-list-nonexistent {
+    PRAGMA table_list('does_not_exist');
+}
+expect {
+}
+
+@skip-if mvcc "views not yet supported for mvcc"
+test pragma-table-list-all-user-tables {
+    CREATE TABLE t1(a, b, c);
+    CREATE TABLE t2(x INTEGER, y TEXT);
+    CREATE VIEW v1 AS SELECT a, b FROM t1;
+    SELECT schema, name, type, ncol, wr, strict FROM pragma_table_list WHERE name NOT LIKE 'sqlite_%' ORDER BY name;
+}
+expect {
+    main|t1|table|3|0|0
+    main|t2|table|2|0|0
+    main|v1|view|2|0|0
+}
+
+test pragma-table-list-includes-sqlite-schema {
+    SELECT schema, name, type, ncol, wr, strict FROM pragma_table_list WHERE name = 'sqlite_schema';
+}
+expect {
+    main|sqlite_schema|table|5|0|0
+}
+
+test pragma-table-list-function-syntax {
+    CREATE TABLE t1(a, b, c);
+    SELECT * FROM pragma_table_list('t1');
+}
+expect {
+    main|t1|table|3|0|0
+}

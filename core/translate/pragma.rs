@@ -74,7 +74,11 @@ pub fn translate_pragma(
         None => query_pragma(pragma, resolver, None, pager, connection, program)?,
         Some(ast::PragmaBody::Equals(value) | ast::PragmaBody::Call(value)) => match pragma {
             // These pragmas take a parameter but are queries, not setters
-            PragmaName::TableInfo
+            PragmaName::IndexInfo
+            | PragmaName::IndexXinfo
+            | PragmaName::IndexList
+            | PragmaName::TableList
+            | PragmaName::TableInfo
             | PragmaName::TableXinfo
             | PragmaName::IntegrityCheck
             | PragmaName::QuickCheck => {
@@ -372,6 +376,10 @@ fn update_pragma(
             Ok((program, TransactionMode::Write))
         }
         PragmaName::DatabaseList => unreachable!("database_list cannot be set"),
+        PragmaName::IndexInfo => unreachable!("index_info cannot be set"),
+        PragmaName::IndexXinfo => unreachable!("index_xinfo cannot be set"),
+        PragmaName::IndexList => unreachable!("index_list cannot be set"),
+        PragmaName::TableList => unreachable!("table_list cannot be set"),
         PragmaName::QueryOnly => query_pragma(
             PragmaName::QueryOnly,
             resolver,
@@ -635,6 +643,232 @@ fn query_pragma(
             program.emit_result_row(register, 1);
             program.add_pragma_result_column(pragma.to_string());
             Ok((program, TransactionMode::Read))
+        }
+        PragmaName::IndexInfo => {
+            let index_name = match value {
+                Some(ast::Expr::Name(name)) => Some(normalize_ident(name.as_str())),
+                _ => None,
+            };
+
+            let base_reg = register;
+            // 3 columns: seqno, cid, name
+            program.alloc_registers(2);
+
+            if let Some(index_name) = index_name {
+                let index = schema
+                    .indexes
+                    .values()
+                    .flatten()
+                    .find(|idx| idx.name.eq_ignore_ascii_case(&index_name));
+
+                if let Some(index) = index {
+                    for (seqno, col) in index.columns.iter().enumerate() {
+                        program.emit_int(seqno as i64, base_reg);
+                        program.emit_int(col.pos_in_table as i64, base_reg + 1);
+                        program.emit_string8(col.name.clone(), base_reg + 2);
+                        program.emit_result_row(base_reg, 3);
+                    }
+                }
+            }
+
+            let pragma_meta = pragma_for(&pragma);
+            for col_name in pragma_meta.columns.iter() {
+                program.add_pragma_result_column(col_name.to_string());
+            }
+            Ok((program, TransactionMode::None))
+        }
+        PragmaName::IndexXinfo => {
+            let index_name = match value {
+                Some(ast::Expr::Name(name)) => Some(normalize_ident(name.as_str())),
+                _ => None,
+            };
+
+            let base_reg = register;
+            // 6 columns: seqno, cid, name, desc, coll, key
+            program.alloc_registers(5);
+
+            if let Some(index_name) = index_name {
+                let index = schema
+                    .indexes
+                    .values()
+                    .flatten()
+                    .find(|idx| idx.name.eq_ignore_ascii_case(&index_name));
+
+                if let Some(index) = index {
+                    for (seqno, col) in index.columns.iter().enumerate() {
+                        let desc = matches!(col.order, ast::SortOrder::Desc);
+                        let coll = col
+                            .collation
+                            .map(|c| c.to_string().to_uppercase())
+                            .unwrap_or_else(|| "BINARY".to_string());
+
+                        program.emit_int(seqno as i64, base_reg);
+                        program.emit_int(col.pos_in_table as i64, base_reg + 1);
+                        program.emit_string8(col.name.clone(), base_reg + 2);
+                        program.emit_int(desc as i64, base_reg + 3);
+                        program.emit_string8(coll, base_reg + 4);
+                        program.emit_int(1, base_reg + 5); // key column
+                        program.emit_result_row(base_reg, 6);
+                    }
+
+                    // Emit trailing rowid row if the index has one
+                    if index.has_rowid {
+                        let seqno = index.columns.len();
+                        program.emit_int(seqno as i64, base_reg);
+                        program.emit_int(-1, base_reg + 1);
+                        program.emit_string8(String::new(), base_reg + 2);
+                        program.emit_int(0, base_reg + 3);
+                        program.emit_string8("BINARY".to_string(), base_reg + 4);
+                        program.emit_int(0, base_reg + 5); // not a key column
+                        program.emit_result_row(base_reg, 6);
+                    }
+                }
+            }
+
+            let pragma_meta = pragma_for(&pragma);
+            for col_name in pragma_meta.columns.iter() {
+                program.add_pragma_result_column(col_name.to_string());
+            }
+            Ok((program, TransactionMode::None))
+        }
+        PragmaName::IndexList => {
+            let table_name = match value {
+                Some(ast::Expr::Name(name)) => Some(normalize_ident(name.as_str())),
+                _ => None,
+            };
+
+            let base_reg = register;
+            // 5 columns: seq, name, unique, origin, partial
+            program.alloc_registers(4);
+
+            if let Some(table_name) = table_name {
+                if let Some(table) = schema.get_table(&table_name) {
+                    let pk_cols: Vec<String> = table
+                        .btree()
+                        .map(|bt| {
+                            bt.primary_key_columns
+                                .iter()
+                                .map(|(name, _)| name.clone())
+                                .collect()
+                        })
+                        .unwrap_or_default();
+
+                    for (seq, index) in schema.get_indices(&table_name).enumerate() {
+                        let origin = if index.name.starts_with("sqlite_autoindex_") {
+                            let idx_cols: Vec<&str> =
+                                index.columns.iter().map(|c| c.name.as_str()).collect();
+                            if idx_cols.len() == pk_cols.len()
+                                && idx_cols
+                                    .iter()
+                                    .zip(pk_cols.iter())
+                                    .all(|(a, b)| a.eq_ignore_ascii_case(b))
+                            {
+                                "pk"
+                            } else {
+                                "u"
+                            }
+                        } else {
+                            "c"
+                        };
+
+                        program.emit_int(seq as i64, base_reg);
+                        program.emit_string8(index.name.clone(), base_reg + 1);
+                        program.emit_int(index.unique as i64, base_reg + 2);
+                        program.emit_string8(origin.to_string(), base_reg + 3);
+                        program.emit_int(index.where_clause.is_some() as i64, base_reg + 4);
+                        program.emit_result_row(base_reg, 5);
+                    }
+                }
+            }
+
+            let pragma_meta = pragma_for(&pragma);
+            for col_name in pragma_meta.columns.iter() {
+                program.add_pragma_result_column(col_name.to_string());
+            }
+            Ok((program, TransactionMode::None))
+        }
+        PragmaName::TableList => {
+            let name = match value {
+                Some(ast::Expr::Name(name)) => Some(normalize_ident(name.as_str())),
+                _ => None,
+            };
+
+            let base_reg = register;
+            // 6 columns: schema, name, type, ncol, wr, strict
+            program.alloc_registers(5);
+
+            let emit_table_row = |program: &mut ProgramBuilder,
+                                  name: &str,
+                                  obj_type: &str,
+                                  ncol: usize,
+                                  wr: bool,
+                                  strict: bool| {
+                program.emit_string8("main".to_string(), base_reg);
+                program.emit_string8(name.to_string(), base_reg + 1);
+                program.emit_string8(obj_type.to_string(), base_reg + 2);
+                program.emit_int(ncol as i64, base_reg + 3);
+                program.emit_int(wr as i64, base_reg + 4);
+                program.emit_int(strict as i64, base_reg + 5);
+                program.emit_result_row(base_reg, 6);
+            };
+
+            if let Some(name) = name {
+                // Specific table/view lookup
+                if let Some(table) = schema.get_table(&name) {
+                    let (wr, strict) = match table.btree() {
+                        Some(bt) => (!bt.has_rowid, bt.is_strict),
+                        None => (false, false),
+                    };
+                    emit_table_row(
+                        &mut program,
+                        table.get_name(),
+                        "table",
+                        table.columns().len(),
+                        wr,
+                        strict,
+                    );
+                } else if let Some(view) = schema.get_view(&name) {
+                    emit_table_row(
+                        &mut program,
+                        &view.name,
+                        "view",
+                        view.columns.len(),
+                        false,
+                        false,
+                    );
+                }
+            } else {
+                // List all tables and views (only BTree tables, not built-in virtual tables)
+                for table in schema.tables.values() {
+                    let Some(bt) = table.btree() else {
+                        continue;
+                    };
+                    emit_table_row(
+                        &mut program,
+                        &bt.name,
+                        "table",
+                        bt.columns.len(),
+                        !bt.has_rowid,
+                        bt.is_strict,
+                    );
+                }
+                for view in schema.views.values() {
+                    emit_table_row(
+                        &mut program,
+                        &view.name,
+                        "view",
+                        view.columns.len(),
+                        false,
+                        false,
+                    );
+                }
+            }
+
+            let pragma_meta = pragma_for(&pragma);
+            for col_name in pragma_meta.columns.iter() {
+                program.add_pragma_result_column(col_name.to_string());
+            }
+            Ok((program, TransactionMode::None))
         }
         PragmaName::TableInfo => {
             let name = match value {
