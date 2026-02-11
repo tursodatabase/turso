@@ -1756,6 +1756,33 @@ fn emit_delete_insns<'a>(
     // Get the index that is being used to iterate the deletion loop, if there is one.
     let iteration_index = unsafe { &*table_reference }.op.index();
 
+    // Capture iteration index key values BEFORE deleting the main table row,
+    // since the main table cursor will be invalidated after deletion.
+    let iteration_idx_delete_ctx = if let Some(index) = iteration_index {
+        let iteration_index_cursor =
+            program.resolve_cursor_id(&CursorKey::index(internal_id, index.clone()));
+        let num_regs = index.columns.len() + 1;
+        let start_reg = program.alloc_registers(num_regs);
+        for (reg_offset, column_index) in index.columns.iter().enumerate() {
+            emit_index_column_value_old_image(
+                program,
+                &t_ctx.resolver,
+                table_references,
+                connection,
+                main_table_cursor_id,
+                column_index,
+                start_reg + reg_offset,
+            )?;
+        }
+        program.emit_insn(Insn::RowId {
+            cursor_id: main_table_cursor_id,
+            dest: start_reg + num_regs - 1,
+        });
+        Some((iteration_index_cursor, start_reg, num_regs, index))
+    } else {
+        None
+    };
+
     emit_delete_row_common(
         connection,
         program,
@@ -1770,14 +1797,14 @@ fn emit_delete_insns<'a>(
         Some(cursor_id), // Use the cursor_id from the operation for virtual tables
     )?;
 
-    // Delete from the iteration index after deleting from the main table
-    if let Some(index) = iteration_index {
-        let iteration_index_cursor =
-            program.resolve_cursor_id(&CursorKey::index(internal_id, index.clone()));
-        program.emit_insn(Insn::Delete {
+    // Delete from the iteration index after deleting from the main table,
+    // using the key values captured above.
+    if let Some((iteration_index_cursor, start_reg, num_regs, index)) = iteration_idx_delete_ctx {
+        program.emit_insn(Insn::IdxDelete {
+            start_reg,
+            num_regs,
             cursor_id: iteration_index_cursor,
-            table_name: index.name.clone(),
-            is_part_of_update: false,
+            raise_error_if_no_matching_entry: index.where_clause.is_none(),
         });
     }
     if let Some(limit_ctx) = t_ctx.limit_ctx {
