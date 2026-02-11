@@ -482,10 +482,7 @@ fn gen_insert_upsert_values<R: Rng + ?Sized, C: GenerationContext>(
     // Pick an id that does not currently exist.
     let mut ids: Vec<i64> = existing_rows
         .iter()
-        .filter_map(|r| match r[pk_idx].0 {
-            turso_core::Value::Integer(i) => Some(i),
-            _ => None,
-        })
+        .filter_map(|r| r[pk_idx].0.as_int())
         .collect();
     ids.sort_unstable();
     ids.dedup();
@@ -515,7 +512,7 @@ fn gen_insert_upsert_values<R: Rng + ?Sized, C: GenerationContext>(
     let mut tries = 0;
     while existing_rows
         .iter()
-        .any(|r| matches!(r[pk_idx].0, turso_core::Value::Integer(i) if i == new_id))
+        .any(|r| r[pk_idx].0.as_int().is_some_and(|i| i == new_id))
     {
         new_id = new_id.saturating_add(1);
         tries += 1;
