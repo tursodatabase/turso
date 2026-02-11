@@ -39,6 +39,12 @@ fn get_exponential_formatted_str(number: &f64, uppercase: bool) -> crate::Result
     }
 }
 
+// Maximum width/precision for printf to prevent Rust formatter panics.
+// Rust's std::fmt uses u16 internally for width, so max is 65535.
+// SQLite uses SQLITE_PRINTF_MAX_WIDTH (default 1000000) as its limit,
+// but we must use the Rust limit to avoid panics.
+const MAX_PRINTF_WIDTH: usize = 65535;
+
 // TODO: Support %!.3s. flags: - + 0 ! ,
 #[inline(always)]
 pub fn exec_printf(values: &[Register]) -> crate::Result<Value> {
@@ -106,8 +112,8 @@ pub fn exec_printf(values: &[Register]) -> crate::Result<Value> {
         }
         if !width_str.is_empty() {
             match width_str.parse::<i32>() {
-                Ok(w) => width = Some(w as usize),
-                Err(_) => return Ok(Value::Null),
+                Ok(w) if (w as usize) <= MAX_PRINTF_WIDTH => width = Some(w as usize),
+                _ => return Ok(Value::Null),
             }
         }
 
@@ -126,8 +132,8 @@ pub fn exec_printf(values: &[Register]) -> crate::Result<Value> {
                 Some(0)
             } else {
                 match precision_str.parse::<i32>() {
-                    Ok(p) => Some(p as usize),
-                    Err(_) => return Ok(Value::Null),
+                    Ok(p) if (p as usize) <= MAX_PRINTF_WIDTH => Some(p as usize),
+                    _ => return Ok(Value::Null),
                 }
             };
         }
