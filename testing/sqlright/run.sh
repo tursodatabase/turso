@@ -41,8 +41,9 @@ export AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1
 export AFL_SKIP_CPUFREQ=1
 export AFL_MAP_SIZE=2097152
 export AFL_OLD_FORKSERVER=1
+export AFL_HANG_TMOUT=30000  # 30 seconds - only mark truly stuck queries as hangs
 
-AFL_CMD="$AFL"
+AFL_CMD="$AFL -t 5000"  # 5 second timeout for slow SQL queries
 # Enable all experimental features to maximize attack surface
 AFL_TARGET="-- $TURSODB -q -m list --experimental-views --experimental-strict --experimental-triggers --experimental-index-method --experimental-autovacuum --experimental-attach"
 
