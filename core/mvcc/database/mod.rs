@@ -3466,9 +3466,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                             // Not a checkpointed table; must not have a root page in mapping
                             if let Some(entry) = self.table_id_to_rootpage.get(&table_id) {
                                 if let Some(value) = *entry.value() {
-                                    panic!(
-                                        "Logical log contains an insertion of a sqlite_schema record that has both a negative root page and a positive root page: {root_page} & {value}"
-                                    );
+                                    panic!("Logical log contains an insertion of a sqlite_schema record that has both a negative root page and a positive root page: {root_page} & {value}");
                                 }
                             }
                             self.insert_table_id_to_rootpage(table_id, None);
@@ -3476,28 +3474,16 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                             // A checkpointed table; sqlite_schema root page value must match the in-memory mapping
                             let table_id = self.get_table_id_from_root_page(root_page);
                             let Some(entry) = self.table_id_to_rootpage.get(&table_id) else {
-                                panic!(
-                                    "Logical log contains root page reference {root_page} that does not exist in the table_id_to_rootpage map"
-                                );
+                                panic!("Logical log contains root page reference {root_page} that does not exist in the table_id_to_rootpage map");
                             };
                             let Some(value) = *entry.value() else {
-                                panic!(
-                                    "Logical log contains root page reference {root_page} that does not have a root page in the table_id_to_rootpage map"
-                                );
+                                panic!("Logical log contains root page reference {root_page} that does not have a root page in the table_id_to_rootpage map");
                             };
-                            assert!(
-                                value == root_page as u64,
-                                "Logical log contains root page reference {root_page} that does not match the root page in the table_id_to_rootpage map({value})"
-                            );
+                            assert!(value == root_page as u64, "Logical log contains root page reference {root_page} that does not match the root page in the table_id_to_rootpage map({value})");
                         }
                     } else {
                         // Other table row version inserts; table id must exist in mapping (otherwise there's a row version insert to an unknown table)
-                        assert!(
-                            self.table_id_to_rootpage.get(&rowid.table_id).is_some(),
-                            "Logical log contains a row version insert with a table id {} that does not exist in the table_id_to_rootpage map: {:?}",
-                            rowid.table_id,
-                            self.table_id_to_rootpage.iter().collect::<Vec<_>>()
-                        );
+                        assert!(self.table_id_to_rootpage.get(&rowid.table_id).is_some(), "Logical log contains a row version insert with a table id {} that does not exist in the table_id_to_rootpage map: {:?}", rowid.table_id, self.table_id_to_rootpage.iter().collect::<Vec<_>>());
                     }
                     self.insert(tx_id, row)?;
                     // Make sure the newly parsed schema change record gets populated into the in-memory schema object.
@@ -3509,11 +3495,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                     }
                 }
                 StreamingResult::DeleteTableRow { row, rowid } => {
-                    turso_assert!(
-                        self.table_id_to_rootpage.get(&rowid.table_id).is_some(),
-                        "Logical log contains a row version delete with a table id that does not exist in the table_id_to_rootpage map: {}",
-                        rowid.table_id
-                    );
+                    turso_assert!(self.table_id_to_rootpage.get(&rowid.table_id).is_some(), "Logical log contains a row version delete with a table id that does not exist in the table_id_to_rootpage map: {}", rowid.table_id);
                     self.insert_tombstone_to_table(tx_id, rowid, row)?;
                 }
                 StreamingResult::InsertIndexRow { row, rowid } => {
