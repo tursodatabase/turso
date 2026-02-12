@@ -68,8 +68,6 @@ pub struct Opts {
     pub readonly: bool,
     #[clap(long, help = "Enable experimental views feature")]
     pub experimental_views: bool,
-    #[clap(long, help = "Enable experimental strict schema mode")]
-    pub experimental_strict: bool,
     #[clap(short = 't', long, help = "specify output file for log traces")]
     pub tracing_output: Option<String>,
     #[clap(long, help = "Start MCP server instead of interactive shell")]
@@ -206,7 +204,6 @@ impl Limbo {
 
         let db_opts = turso_core::DatabaseOpts::new()
             .with_views(opts.experimental_views)
-            .with_strict(opts.experimental_strict)
             .with_encryption(opts.experimental_encryption)
             .with_index_method(opts.experimental_index_method)
             .with_autovacuum(opts.experimental_autovacuum)

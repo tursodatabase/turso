@@ -198,7 +198,6 @@ expect error {
 }
 
 # STRICT tables with CHECK constraints
-@requires strict "uses STRICT tables"
 test check_constraint_strict_table_basic {
     CREATE TABLE employees (
         id INTEGER PRIMARY KEY,
@@ -213,7 +212,6 @@ expect {
     2|30
 }
 
-@requires strict "uses STRICT tables"  
 test check_constraint_strict_type_violation {
     CREATE TABLE employees (
         id INTEGER PRIMARY KEY,
@@ -224,7 +222,6 @@ test check_constraint_strict_type_violation {
 expect error {
 }
 
-@requires strict "uses STRICT tables"
 test check_constraint_strict_numeric_string_coercion {
     CREATE TABLE employees (
         id INTEGER PRIMARY KEY,
@@ -238,7 +235,6 @@ expect {
     1|25|integer
 }
 
-@requires strict "uses STRICT tables"
 test check_constraint_strict_check_violation_after_coercion {
     CREATE TABLE employees (
         id INTEGER PRIMARY KEY,

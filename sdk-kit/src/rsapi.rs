@@ -623,7 +623,7 @@ impl TursoDatabase {
                             opts = match features {
                                 "views" => opts.with_views(true),
                                 "index_method" => opts.with_index_method(true),
-                                "strict" => opts.with_strict(true),
+                                "strict" => opts, // strict is always enabled, kept for backwards compatibility
                                 "autovacuum" => opts.with_autovacuum(true),
                                 "triggers" => opts.with_triggers(true),
                                 "encryption" => opts.with_encryption(true),
