@@ -45,6 +45,10 @@ struct Args {
     #[arg(short = 'g', long, default_value = "sql-gen", value_enum)]
     generator: GeneratorKind,
 
+    /// Write a coverage report to simulator-output/coverage.txt.
+    #[arg(long)]
+    coverage: bool,
+
     /// Use full hierarchical tree in the coverage report instead of simplified flat view.
     #[arg(long)]
     full_tree: bool,
@@ -103,6 +107,7 @@ fn run_single(args: &Args) -> Result<()> {
         verbose: args.verbose,
         keep_files: args.keep_files,
         generator: args.generator,
+        coverage: args.coverage,
         tree_mode: if args.full_tree {
             TreeMode::Full
         } else {
