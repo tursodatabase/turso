@@ -1245,7 +1245,12 @@ fn query_pragma(
             type_names.sort();
             for type_name in type_names {
                 let type_def = &schema.type_registry[type_name];
-                program.emit_string8(type_def.name.clone(), base_reg);
+                let display_name = if type_def.params.is_empty() {
+                    type_def.name.clone()
+                } else {
+                    format!("{}({})", type_def.name, type_def.params.join(", "))
+                };
+                program.emit_string8(display_name, base_reg);
                 program.emit_string8(type_def.base.clone(), base_reg + 1);
                 if let Some(ref expr) = type_def.encode {
                     program.emit_string8(expr.to_string(), base_reg + 2);
