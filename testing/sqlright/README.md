@@ -48,7 +48,7 @@ This clones SQLRight at a pinned commit, applies patches (MAP_SIZE increase for 
 ### Build instrumented tursodb
 
 ```bash
-cargo afl build --bin tursodb
+cargo afl build --profile fuzzing --bin tursodb
 ```
 
 ## Running
@@ -157,7 +157,46 @@ output/
 └── secondary_3/
 ```
 
+### Multi-core fixes applied
+
+**File contention fix (critical):** Each fuzzer instance gets its own isolated working directory to prevent deadlock on `map_id_triggered.txt`. The SQLite port of SQLRight was missing per-core file logic that MySQL/PostgreSQL versions have.
+
+**Crash handling fix (critical):** `AFL_SKIP_CRASHES=1` prevents AFL from spending hours on deterministic fuzzing of inputs that reliably crash. Without this, the fuzzer gets stuck exploring crash variations instead of discovering new bugs.
+
+**Timeout tuning:** 5-second execution timeout (`-t 5000`) and 30-second hang threshold (`AFL_HANG_TMOUT=30000`) allow slow SQL queries (large joins, complex aggregations) to complete instead of being marked as hangs.
+
+### Recommended core counts
+
+- **1 core:** Simplest, no coordination overhead, good baseline
+- **4-8 cores:** Good balance for most machines
+- **16-32 cores:** Diminishing returns, ensure adequate I/O bandwidth
+- **64+ cores:** Only on high-end systems with fast storage
+
+Performance scales sub-linearly due to queue sync overhead and corpus sharing.
+
 ## Monitoring
+
+### Real-time status (recommended)
+
+```bash
+./whatsup.sh [OUTPUT_DIR]
+```
+
+Shows per-instance stats (alive/dead, execs, coverage, crashes, hangs) plus aggregate summary. Default output dir: `/tmp/sqlright_test`
+
+Example output:
+```
+>>> primary          alive=yes  0d 0h 10m  cycles=0  execs=2078  eps=5.2  cov=3.41%  crashes=4  hangs=0
+>>> secondary_2      alive=yes  0d 0h 10m  cycles=0  execs=1523  eps=4.8  cov=3.40%  crashes=2  hangs=0
+
+Summary:
+  Fuzzers alive  : 8
+  Total execs    : 12453
+  Total crashes  : 15
+  Max coverage   : 3.41%
+```
+
+### Manual inspection
 
 ```bash
 cat /tmp/sqlright_test/primary/fuzzer_stats
@@ -224,6 +263,9 @@ testing/sqlright/
 | `AFL_OLD_FORKSERVER` | `1` | SQLRight uses AFL's old fork server protocol |
 | `AFL_MAP_SIZE` | `2097152` | Turso has ~1.1M coverage guards → needs 2^21 map |
 | `AFL_SKIP_CPUFREQ` | `1` | Skip CPU governor check |
+| `AFL_SKIP_CRASHES` | `1` | Skip inputs that crash during calibration (prevents infinite crash loop) |
+| `AFL_HANG_TMOUT` | `30000` | 30-second hang threshold (allows slow queries to complete) |
+| `AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES` | `1` | Continue if crashes directory is missing |
 
 ## Troubleshooting
 
@@ -235,3 +277,24 @@ testing/sqlright/
 | Coverage profdata version mismatch | Use `rustup component add llvm-tools-preview`, not system llvm |
 | Resume says "no previous run" | Output dir must have `primary/queue/` subdirectory |
 | 0 oracle violations after long run | Try TLP oracle (broadest seed compatibility) or INDEX oracle |
+| **Multi-core fuzzing stuck/frozen** | See below ⬇️ |
+
+### Multi-core specific issues
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| All instances frozen at low execs, ~9% CPU | File contention deadlock on `map_id_triggered.txt` | **Fixed in latest version** - per-instance working directories |
+| Many "hangs" detected, slow progress | Timeout too aggressive for slow SQL | **Fixed in latest version** - 5s timeout + 30s hang threshold |
+| Queue explodes (4000+ items), stuck at low test case numbers | AFL fuzzing crashing inputs indefinitely | **Fixed in latest version** - `AFL_SKIP_CRASHES=1` enabled |
+| High CPU but `execs_per_sec: 0.00` | Calibration in progress (normal) | Wait for "All test cases processed" |
+| `execs_since_crash: 0` on all instances | Target has bugs that crash during fuzzing | Expected - crashes are saved, fuzzing continues |
+| Resume picks up old crashes/hangs | Leftover state from previous runs | Delete output dir before fresh start: `rm -rf /tmp/sqlright_test` |
+
+### Performance expectations
+
+- **Calibration time:** 2-5 minutes for 2500 seeds (depends on core count)
+- **Normal execs/sec:** 5-50 per instance (SQL fuzzing is slow compared to binary fuzzing)
+- **Queue growth:** Normal, especially early in fuzzing (new coverage paths discovered)
+- **Crashes found:** If target has bugs, expect crashes within first hour
+
+Use `./whatsup.sh` to monitor progress and diagnose issues.
