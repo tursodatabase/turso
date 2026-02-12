@@ -1,0 +1,185 @@
+@database :memory:
+
+test savepoint-basic-release {
+    CREATE TABLE t(x);
+    SAVEPOINT sp1;
+    INSERT INTO t VALUES (1);
+    RELEASE SAVEPOINT sp1;
+    SELECT x FROM t;
+}
+expect {
+    1
+}
+
+test savepoint-release-inside-begin-does-not-commit {
+    CREATE TABLE t(x);
+    BEGIN;
+    SAVEPOINT sp1;
+    INSERT INTO t VALUES (1);
+    RELEASE sp1;
+    ROLLBACK;
+    SELECT x FROM t;
+}
+expect {
+}
+
+test savepoint-nested-release-outer {
+    CREATE TABLE t(x);
+    SAVEPOINT outer_sp;
+    INSERT INTO t VALUES (1);
+    SAVEPOINT inner_sp;
+    INSERT INTO t VALUES (2);
+    RELEASE outer_sp;
+    SELECT x FROM t ORDER BY x;
+}
+expect {
+    1
+    2
+}
+
+test savepoint-duplicate-name-shadowing {
+    CREATE TABLE t(x);
+    SAVEPOINT sp;
+    INSERT INTO t VALUES (1);
+    SAVEPOINT sp;
+    INSERT INTO t VALUES (2);
+    ROLLBACK TO sp;
+    INSERT INTO t VALUES (3);
+    RELEASE sp;
+    RELEASE sp;
+    SELECT x FROM t ORDER BY x;
+}
+expect {
+    1
+    3
+}
+
+test savepoint-rollback-to-preserves-savepoint {
+    CREATE TABLE t(x);
+    SAVEPOINT sp;
+    INSERT INTO t VALUES (1);
+    ROLLBACK TO SAVEPOINT sp;
+    INSERT INTO t VALUES (2);
+    RELEASE sp;
+    SELECT x FROM t ORDER BY x;
+}
+expect {
+    2
+}
+
+test savepoint-release-missing-errors {
+    SAVEPOINT sp;
+    RELEASE missing;
+}
+expect error {
+}
+
+test savepoint-rollback-missing-errors {
+    SAVEPOINT sp;
+    ROLLBACK TO missing;
+}
+expect error {
+}
+
+test savepoint-rollback-to-can-be-repeated {
+    CREATE TABLE t(x);
+    SAVEPOINT sp;
+    INSERT INTO t VALUES (1);
+    ROLLBACK TO sp;
+    INSERT INTO t VALUES (2);
+    ROLLBACK TO sp;
+    INSERT INTO t VALUES (3);
+    RELEASE sp;
+    SELECT x FROM t;
+}
+expect {
+    3
+}
+
+test savepoint-case-insensitive-name-resolution {
+    CREATE TABLE t(x);
+    SAVEPOINT SpCase;
+    INSERT INTO t VALUES (1);
+    ROLLBACK TO spcase;
+    INSERT INTO t VALUES (2);
+    RELEASE SPCASE;
+    SELECT x FROM t;
+}
+expect {
+    2
+}
+
+test savepoint-release-outer-removes-inner {
+    CREATE TABLE t(x);
+    SAVEPOINT outer;
+    INSERT INTO t VALUES (1);
+    SAVEPOINT inner;
+    INSERT INTO t VALUES (2);
+    RELEASE outer;
+    ROLLBACK TO inner;
+}
+expect error {
+    no such savepoint
+}
+
+test savepoint-rollback-to-top-level-then-release {
+    CREATE TABLE t(x);
+    SAVEPOINT root;
+    INSERT INTO t VALUES (1);
+    ROLLBACK TO root;
+    RELEASE root;
+    SELECT x FROM t;
+}
+expect {
+}
+
+test savepoint-rollback-undoes-mixed-dml {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v, tag);
+    INSERT INTO t VALUES (1, 10, 'a');
+    INSERT INTO t VALUES (2, 20, 'b');
+    INSERT INTO t VALUES (3, 30, 'c');
+    SAVEPOINT sp;
+    UPDATE t SET v = v + 1 WHERE id IN (1, 2);
+    DELETE FROM t WHERE id = 3;
+    INSERT INTO t VALUES (4, 40, 'd');
+    ROLLBACK TO sp;
+    RELEASE sp;
+    SELECT id, v, tag FROM t ORDER BY id;
+}
+expect {
+    1|10|a
+    2|20|b
+    3|30|c
+}
+
+test savepoint-interleaved-duplicate-names {
+    CREATE TABLE t(x);
+    SAVEPOINT a;
+    INSERT INTO t VALUES (1);
+    SAVEPOINT b;
+    INSERT INTO t VALUES (2);
+    SAVEPOINT a;
+    INSERT INTO t VALUES (3);
+    RELEASE a;
+    ROLLBACK TO b;
+    RELEASE b;
+    RELEASE a;
+    SELECT x FROM t ORDER BY x;
+}
+expect {
+    1
+}
+
+test savepoint-release-without-active-savepoint-errors {
+    RELEASE SAVEPOINT missing;
+}
+expect error {
+    no such savepoint
+}
+
+test savepoint-rollback-to-without-active-savepoint-errors {
+    ROLLBACK TO SAVEPOINT missing;
+}
+expect error {
+    no such savepoint
+}
