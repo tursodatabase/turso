@@ -11,7 +11,7 @@ use crate::{
 pub fn translate_savepoint(mut program: ProgramBuilder, name: Name) -> Result<ProgramBuilder> {
     program.emit_insn(Insn::Savepoint {
         op: SavepointOp::Begin,
-        name: name.as_str().to_string(),
+        name: name.as_str().to_ascii_lowercase(),
     });
     Ok(program)
 }
@@ -19,7 +19,7 @@ pub fn translate_savepoint(mut program: ProgramBuilder, name: Name) -> Result<Pr
 pub fn translate_release(mut program: ProgramBuilder, name: Name) -> Result<ProgramBuilder> {
     program.emit_insn(Insn::Savepoint {
         op: SavepointOp::Release,
-        name: name.as_str().to_string(),
+        name: name.as_str().to_ascii_lowercase(),
     });
     Ok(program)
 }
@@ -32,7 +32,7 @@ pub fn translate_rollback(
     if let Some(savepoint_name) = savepoint_name {
         program.emit_insn(Insn::Savepoint {
             op: SavepointOp::RollbackTo,
-            name: savepoint_name.as_str().to_string(),
+            name: savepoint_name.as_str().to_ascii_lowercase(),
         });
     } else {
         program.emit_insn(Insn::AutoCommit {
