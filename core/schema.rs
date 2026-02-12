@@ -320,11 +320,11 @@ fn bootstrap_builtin_types(registry: &mut HashMap<String, Arc<TypeDef>>) {
         "CREATE TYPE json BASE text ENCODE json(value) DECODE value",
         #[cfg(feature = "json")]
         "CREATE TYPE jsonb BASE blob ENCODE jsonb(value) DECODE json(value)",
-        "CREATE TYPE varchar(maxlen) BASE text ENCODE check_text_maxlen(value, maxlen) DECODE value",
+        "CREATE TYPE varchar(maxlen) BASE text ENCODE CASE WHEN length(value) <= maxlen THEN value ELSE RAISE(ABORT, 'value too long for varchar') END DECODE value",
         "CREATE TYPE date BASE text ENCODE date(value) DECODE value",
         "CREATE TYPE time BASE text ENCODE time(value) DECODE value",
         "CREATE TYPE timestamp BASE text ENCODE datetime(value) DECODE value",
-        "CREATE TYPE smallint BASE integer ENCODE check_int_range(value, -32768, 32767) DECODE value",
+        "CREATE TYPE smallint BASE integer ENCODE CASE WHEN value BETWEEN -32768 AND 32767 THEN value ELSE RAISE(ABORT, 'integer out of range for smallint') END DECODE value",
         "CREATE TYPE bigint BASE integer",
         "CREATE TYPE inet BASE text ENCODE validate_ipaddr(value) DECODE value",
         "CREATE TYPE bytea BASE blob",

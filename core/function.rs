@@ -481,8 +481,6 @@ pub enum ScalarFunc {
     // Built-in type support functions
     BooleanToInt,
     IntToBoolean,
-    CheckTextMaxlen,
-    CheckIntRange,
     ValidateIpAddr,
     // Numeric type functions
     NumericEncode,
@@ -574,8 +572,6 @@ impl Deterministic for ScalarFunc {
             | ScalarFunc::TestReverseDecode => true,
             ScalarFunc::BooleanToInt
             | ScalarFunc::IntToBoolean
-            | ScalarFunc::CheckTextMaxlen
-            | ScalarFunc::CheckIntRange
             | ScalarFunc::ValidateIpAddr
             | ScalarFunc::NumericEncode
             | ScalarFunc::NumericDecode
@@ -668,8 +664,6 @@ impl Display for ScalarFunc {
             Self::TestReverseDecode => "test_reverse_decode",
             Self::BooleanToInt => "boolean_to_int",
             Self::IntToBoolean => "int_to_boolean",
-            Self::CheckTextMaxlen => "check_text_maxlen",
-            Self::CheckIntRange => "check_int_range",
             Self::ValidateIpAddr => "validate_ipaddr",
             Self::NumericEncode => "numeric_encode",
             Self::NumericDecode => "numeric_decode",
@@ -788,14 +782,13 @@ impl ScalarFunc {
             | Self::IntToBoolean
             | Self::ValidateIpAddr
             | Self::NumericDecode => &[1],
-            Self::CheckTextMaxlen
-            | Self::NumericAdd
+            Self::NumericAdd
             | Self::NumericSub
             | Self::NumericMul
             | Self::NumericDiv
             | Self::NumericLt
             | Self::NumericEq => &[2],
-            Self::CheckIntRange | Self::NumericEncode => &[3],
+            Self::NumericEncode => &[3],
         }
     }
 
@@ -1296,8 +1289,6 @@ impl Func {
             // Built-in type support functions
             "boolean_to_int" => Ok(Self::Scalar(ScalarFunc::BooleanToInt)),
             "int_to_boolean" => Ok(Self::Scalar(ScalarFunc::IntToBoolean)),
-            "check_text_maxlen" => Ok(Self::Scalar(ScalarFunc::CheckTextMaxlen)),
-            "check_int_range" => Ok(Self::Scalar(ScalarFunc::CheckIntRange)),
             "validate_ipaddr" => Ok(Self::Scalar(ScalarFunc::ValidateIpAddr)),
             "numeric_encode" => Ok(Self::Scalar(ScalarFunc::NumericEncode)),
             "numeric_decode" => Ok(Self::Scalar(ScalarFunc::NumericDecode)),

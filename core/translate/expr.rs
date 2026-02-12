@@ -2378,8 +2378,6 @@ pub fn translate_expr(
                         | ScalarFunc::TestReverseDecode
                         | ScalarFunc::BooleanToInt
                         | ScalarFunc::IntToBoolean
-                        | ScalarFunc::CheckTextMaxlen
-                        | ScalarFunc::CheckIntRange
                         | ScalarFunc::ValidateIpAddr
                         | ScalarFunc::NumericEncode
                         | ScalarFunc::NumericDecode
@@ -6102,12 +6100,17 @@ pub(crate) fn emit_type_expr(
         }
     }
 
+    // Rewrite BETWEEN expressions before translation (the optimizer
+    // normally does this, but type expressions bypass the optimizer).
+    let mut rewritten = expr.clone();
+    rewrite_between_expr(&mut rewritten);
+
     // Translate the expression, disabling constant optimization since
     // the `value` placeholder refers to a register that changes per row.
     let result = translate_expr_no_constant_opt(
         program,
         None,
-        expr,
+        &rewritten,
         dest_reg,
         resolver,
         NoConstantOptReason::RegisterReuse,

@@ -157,6 +157,54 @@ SELECT id, val FROM t1;
 -- 1|otua
 ```
 
+## Validation with CASE/RAISE
+
+Use `CASE ... ELSE RAISE(ABORT, ...)` in the ENCODE expression to validate values and reject invalid input with a clear error message:
+
+```sql
+CREATE TYPE positive_int BASE integer
+    ENCODE CASE WHEN value > 0 THEN value
+                ELSE RAISE(ABORT, 'value must be positive') END
+    DECODE value;
+
+CREATE TABLE t1(val positive_int) STRICT;
+INSERT INTO t1 VALUES (42);   -- OK
+INSERT INTO t1 VALUES (-1);   -- Error: value must be positive
+```
+
+This pattern is how built-in types like `varchar` and `smallint` enforce their constraints:
+
+```sql
+-- varchar checks length against the maxlen parameter
+CREATE TYPE varchar(maxlen) BASE text
+    ENCODE CASE WHEN length(value) <= maxlen THEN value
+                ELSE RAISE(ABORT, 'value too long for varchar') END
+    DECODE value;
+
+-- smallint checks the integer range
+CREATE TYPE smallint BASE integer
+    ENCODE CASE WHEN value BETWEEN -32768 AND 32767 THEN value
+                ELSE RAISE(ABORT, 'integer out of range for smallint') END
+    DECODE value;
+```
+
+## Parametric Types
+
+Types can declare parameters that are substituted into ENCODE/DECODE expressions. Parameters are specified in parentheses after the type name:
+
+```sql
+CREATE TYPE varchar(maxlen) BASE text
+    ENCODE CASE WHEN length(value) <= maxlen THEN value
+                ELSE RAISE(ABORT, 'value too long for varchar') END
+    DECODE value;
+
+CREATE TABLE t1(name varchar(10)) STRICT;
+INSERT INTO t1 VALUES ('hello');      -- OK (length 5 <= 10)
+INSERT INTO t1 VALUES ('toolongname'); -- Error: value too long for varchar
+```
+
+When a column is declared as `varchar(10)`, the parameter `maxlen` is replaced with `10` in the ENCODE expression.
+
 ## Encode Validation
 
 Encoding runs **before** constraint checks (NOT NULL, type affinity). If an encode function returns NULL for a NOT NULL or PRIMARY KEY column, the insert is rejected:
@@ -211,12 +259,12 @@ PRAGMA list_types;
 -- uint      | text   | test_uint_encode(...) | test_uint_decode(...) | 0       | +(uint) -> test_uint_add
 ```
 
-### sqlite_schema
+### sqlite_turso_types
 
-Custom types are stored as rows in `sqlite_schema` with `type = 'type'`:
+All types (built-in and user-defined) are available through the `sqlite_turso_types` virtual table:
 
 ```sql
-SELECT name FROM sqlite_schema WHERE type = 'type';
+SELECT name, sql FROM sqlite_turso_types;
 ```
 
 ## Using with ALTER TABLE

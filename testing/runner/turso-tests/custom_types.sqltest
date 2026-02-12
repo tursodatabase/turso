@@ -247,11 +247,11 @@ expect {
     json|text|json (value)|value||
     jsonb|blob|jsonb (value)|json (value)||
     numeric(precision, scale)|blob|numeric_encode (value, precision, scale)|numeric_decode (value)||+(numeric) -> numeric_add, -(numeric) -> numeric_sub, *(numeric) -> numeric_mul, /(numeric) -> numeric_div, <(numeric) -> numeric_lt, =(numeric) -> numeric_eq
-    smallint|integer|check_int_range (value, - 32768, 32767)|value||
+    smallint|integer|CASE WHEN value BETWEEN - 32768 AND 32767 THEN value ELSE RAISE (ABORT, 'integer out of range for smallint') END|value||
     time|text|time (value)|value||
     timestamp|text|datetime (value)|value||
     uuid|blob|uuid_blob (value)|uuid_str (value)|uuid4_str ()|
-    varchar(maxlen)|text|check_text_maxlen (value, maxlen)|value||
+    varchar(maxlen)|text|CASE WHEN length (value) <= maxlen THEN value ELSE RAISE (ABORT, 'value too long for varchar') END|value||
 }
 
 @requires strict "uses STRICT tables"
@@ -277,12 +277,12 @@ expect {
     json|text|json (value)|value||
     jsonb|blob|jsonb (value)|json (value)||
     numeric(precision, scale)|blob|numeric_encode (value, precision, scale)|numeric_decode (value)||+(numeric) -> numeric_add, -(numeric) -> numeric_sub, *(numeric) -> numeric_mul, /(numeric) -> numeric_div, <(numeric) -> numeric_lt, =(numeric) -> numeric_eq
-    smallint|integer|check_int_range (value, - 32768, 32767)|value||
+    smallint|integer|CASE WHEN value BETWEEN - 32768 AND 32767 THEN value ELSE RAISE (ABORT, 'integer out of range for smallint') END|value||
     test_uint|text|test_uint_encode (value)|test_uint_decode (value)|0|+(test_uint) -> test_uint_add
     time|text|time (value)|value||
     timestamp|text|datetime (value)|value||
     uuid|blob|uuid_blob (value)|uuid_str (value)|uuid4_str ()|
-    varchar(maxlen)|text|check_text_maxlen (value, maxlen)|value||
+    varchar(maxlen)|text|CASE WHEN length (value) <= maxlen THEN value ELSE RAISE (ABORT, 'value too long for varchar') END|value||
 }
 
 @requires strict "uses STRICT tables"
