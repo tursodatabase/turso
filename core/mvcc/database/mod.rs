@@ -1350,7 +1350,9 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
 
                 if log_record.row_versions.is_empty() {
                     // Nothing to do, just end commit.
-                    self.commit_coordinator.pager_commit_lock.unlock();
+                    if mvcc_store.is_exclusive_tx(&self.tx_id) {
+                        self.commit_coordinator.pager_commit_lock.unlock();
+                    }
                     self.state = CommitState::CommitEnd { end_ts: *end_ts };
                 } else {
                     // We might need to serialize log writes
