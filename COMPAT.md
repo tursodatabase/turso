@@ -231,7 +231,7 @@ Feature support of [sqlite expr syntax](https://www.sqlite.org/lang_expr.html).
 | (NOT) EXISTS (SELECT...)   | ✅ Yes      |                                          |
 | x <operator> (SELECT...))   | 🚧 Partial  | Only scalar subqueries supported, i.e. not (x,y) = (SELECT...)
 | CASE WHEN THEN ELSE END   | ✅ Yes     |                                          |
-| RAISE                     | ❌ No      |                                          |
+| RAISE                     | 🚧 Partial | `RAISE('msg')` and `RAISE(ABORT, 'msg')` also work outside triggers. `RAISE(FAIL)` is not yet supported (requires statement savepoints). |
 
 ### SQL functions
 
