@@ -1,62 +1,75 @@
 use divan::{black_box, Bencher};
-use turso_core::numeric::{format_float, str_to_f64, str_to_i64, Numeric};
+#[cfg(feature = "nanosecond-bench")]
+use turso_core::numeric::str_to_i64;
+use turso_core::numeric::{format_float, str_to_f64, Numeric};
 use turso_core::types::Value;
 
 // =============================================================================
 // str_to_i64 Benchmarks - Integer String Parsing
 // =============================================================================
 
+#[cfg(feature = "nanosecond-bench")]
 #[divan::bench]
 fn str_to_i64_simple_positive(bencher: Bencher) {
     bencher.bench_local(|| black_box(str_to_i64(black_box("12345"))));
 }
 
+#[cfg(feature = "nanosecond-bench")]
 #[divan::bench]
 fn str_to_i64_simple_negative(bencher: Bencher) {
     bencher.bench_local(|| black_box(str_to_i64(black_box("-12345"))));
 }
 
+#[cfg(feature = "nanosecond-bench")]
 #[divan::bench]
 fn str_to_i64_with_plus_sign(bencher: Bencher) {
     bencher.bench_local(|| black_box(str_to_i64(black_box("+12345"))));
 }
 
+#[cfg(feature = "nanosecond-bench")]
 #[divan::bench]
 fn str_to_i64_max_value(bencher: Bencher) {
     bencher.bench_local(|| black_box(str_to_i64(black_box("9223372036854775807"))));
 }
 
+#[cfg(feature = "nanosecond-bench")]
 #[divan::bench]
 fn str_to_i64_min_value(bencher: Bencher) {
     bencher.bench_local(|| black_box(str_to_i64(black_box("-9223372036854775808"))));
 }
 
+#[cfg(feature = "nanosecond-bench")]
 #[divan::bench]
 fn str_to_i64_overflow(bencher: Bencher) {
     // Should return i64::MAX
     bencher.bench_local(|| black_box(str_to_i64(black_box("99999999999999999999999"))));
 }
 
+#[cfg(feature = "nanosecond-bench")]
 #[divan::bench]
 fn str_to_i64_with_whitespace(bencher: Bencher) {
     bencher.bench_local(|| black_box(str_to_i64(black_box("  12345  "))));
 }
 
+#[cfg(feature = "nanosecond-bench")]
 #[divan::bench]
 fn str_to_i64_zero(bencher: Bencher) {
     bencher.bench_local(|| black_box(str_to_i64(black_box("0"))));
 }
 
+#[cfg(feature = "nanosecond-bench")]
 #[divan::bench]
 fn str_to_i64_empty(bencher: Bencher) {
     bencher.bench_local(|| black_box(str_to_i64(black_box(""))));
 }
 
+#[cfg(feature = "nanosecond-bench")]
 #[divan::bench]
 fn str_to_i64_non_numeric(bencher: Bencher) {
     bencher.bench_local(|| black_box(str_to_i64(black_box("abc"))));
 }
 
+#[cfg(feature = "nanosecond-bench")]
 #[divan::bench]
 fn str_to_i64_mixed_content(bencher: Bencher) {
     // Should parse leading digits
@@ -178,6 +191,7 @@ fn format_float_scientific_needed(bencher: Bencher) {
     bencher.bench_local(|| black_box(format_float(black_box(9.93e-322))));
 }
 
+#[cfg(feature = "nanosecond-bench")]
 #[divan::bench]
 fn format_float_nan(bencher: Bencher) {
     bencher.bench_local(|| black_box(format_float(black_box(f64::NAN))));
@@ -203,12 +217,14 @@ fn format_float_precision_edge(bencher: Bencher) {
 // Numeric Type Conversion Benchmarks
 // =============================================================================
 
+#[cfg(feature = "nanosecond-bench")]
 #[divan::bench]
 fn numeric_from_integer_value(bencher: Bencher) {
     let value = Value::from_i64(12345);
     bencher.bench_local(|| black_box(Numeric::from_value(black_box(&value))));
 }
 
+#[cfg(feature = "nanosecond-bench")]
 #[divan::bench]
 fn numeric_from_float_value(bencher: Bencher) {
     let value = Value::from_f64(123.456);
@@ -233,6 +249,7 @@ fn numeric_from_text_scientific(bencher: Bencher) {
     bencher.bench_local(|| black_box(Numeric::from_value(black_box(&value))));
 }
 
+#[cfg(feature = "nanosecond-bench")]
 #[divan::bench]
 fn numeric_from_null(bencher: Bencher) {
     let value = Value::Null;
@@ -254,6 +271,7 @@ fn numeric_from_string_ref(bencher: Bencher) {
 // Numeric Arithmetic Benchmarks
 // =============================================================================
 
+#[cfg(feature = "nanosecond-bench")]
 #[divan::bench]
 fn numeric_add_integers(bencher: Bencher) {
     let a = Numeric::Integer(1000);
@@ -261,6 +279,7 @@ fn numeric_add_integers(bencher: Bencher) {
     bencher.bench_local(|| black_box(black_box(a).checked_add(black_box(b))));
 }
 
+#[cfg(feature = "nanosecond-bench")]
 #[divan::bench]
 fn numeric_add_floats(bencher: Bencher) {
     let a = Numeric::from("100.5");
@@ -268,6 +287,7 @@ fn numeric_add_floats(bencher: Bencher) {
     bencher.bench_local(|| black_box(black_box(a).checked_add(black_box(b))));
 }
 
+#[cfg(feature = "nanosecond-bench")]
 #[divan::bench]
 fn numeric_add_mixed(bencher: Bencher) {
     let a = Numeric::Integer(100);
@@ -275,6 +295,7 @@ fn numeric_add_mixed(bencher: Bencher) {
     bencher.bench_local(|| black_box(black_box(a).checked_add(black_box(b))));
 }
 
+#[cfg(feature = "nanosecond-bench")]
 #[divan::bench]
 fn numeric_sub_integers(bencher: Bencher) {
     let a = Numeric::Integer(2000);
@@ -282,6 +303,7 @@ fn numeric_sub_integers(bencher: Bencher) {
     bencher.bench_local(|| black_box(black_box(a).checked_sub(black_box(b))));
 }
 
+#[cfg(feature = "nanosecond-bench")]
 #[divan::bench]
 fn numeric_mul_integers(bencher: Bencher) {
     let a = Numeric::Integer(100);
@@ -289,6 +311,7 @@ fn numeric_mul_integers(bencher: Bencher) {
     bencher.bench_local(|| black_box(black_box(a).checked_mul(black_box(b))));
 }
 
+#[cfg(feature = "nanosecond-bench")]
 #[divan::bench]
 fn numeric_div_integers(bencher: Bencher) {
     let a = Numeric::Integer(1000);
@@ -296,12 +319,14 @@ fn numeric_div_integers(bencher: Bencher) {
     bencher.bench_local(|| black_box(black_box(a).checked_div(black_box(b))));
 }
 
+#[cfg(feature = "nanosecond-bench")]
 #[divan::bench]
 fn numeric_neg_integer(bencher: Bencher) {
     let a = Numeric::Integer(12345);
     bencher.bench_local(|| black_box(-black_box(a)));
 }
 
+#[cfg(feature = "nanosecond-bench")]
 #[divan::bench]
 fn numeric_add_overflow(bencher: Bencher) {
     // Should overflow to float
@@ -314,12 +339,14 @@ fn numeric_add_overflow(bencher: Bencher) {
 // Numeric Strict Conversion Benchmarks
 // =============================================================================
 
+#[cfg(feature = "nanosecond-bench")]
 #[divan::bench]
 fn numeric_strict_from_integer(bencher: Bencher) {
     let value = Value::from_i64(12345);
     bencher.bench_local(|| black_box(Numeric::from_value_strict(black_box(&value))));
 }
 
+#[cfg(feature = "nanosecond-bench")]
 #[divan::bench]
 fn numeric_strict_from_float(bencher: Bencher) {
     let value = Value::from_f64(123.456);
@@ -339,6 +366,7 @@ fn numeric_strict_from_text_invalid_prefix(bencher: Bencher) {
     bencher.bench_local(|| black_box(Numeric::from_value_strict(black_box(&value))));
 }
 
+#[cfg(feature = "nanosecond-bench")]
 #[divan::bench]
 fn numeric_strict_from_blob(bencher: Bencher) {
     // Blob is always Null in strict mode

@@ -5,6 +5,7 @@ use turso_core::types::Value;
 // LIKE Pattern Matching Benchmarks
 // =============================================================================
 
+#[cfg(feature = "nanosecond-bench")]
 #[divan::bench]
 fn like_simple_exact_match(bencher: Bencher) {
     bencher.bench_local(|| {
@@ -17,6 +18,7 @@ fn like_simple_exact_match(bencher: Bencher) {
     });
 }
 
+#[cfg(feature = "nanosecond-bench")]
 #[divan::bench]
 fn like_simple_no_match(bencher: Bencher) {
     bencher.bench_local(|| {
@@ -29,6 +31,7 @@ fn like_simple_no_match(bencher: Bencher) {
     });
 }
 
+#[cfg(feature = "nanosecond-bench")]
 #[divan::bench]
 fn like_percent_prefix(bencher: Bencher) {
     // Pattern: %world - matches anything ending with "world"
@@ -42,6 +45,7 @@ fn like_percent_prefix(bencher: Bencher) {
     });
 }
 
+#[cfg(feature = "nanosecond-bench")]
 #[divan::bench]
 fn like_percent_suffix(bencher: Bencher) {
     // Pattern: hello% - matches anything starting with "hello"
@@ -133,6 +137,7 @@ fn like_escape_underscore(bencher: Bencher) {
     });
 }
 
+#[cfg(feature = "nanosecond-bench")]
 #[divan::bench]
 fn like_case_insensitive(bencher: Bencher) {
     // LIKE is case-insensitive by default
@@ -146,6 +151,7 @@ fn like_case_insensitive(bencher: Bencher) {
     });
 }
 
+#[cfg(feature = "nanosecond-bench")]
 #[divan::bench]
 fn like_long_pattern(bencher: Bencher) {
     let pattern = "The quick brown fox %";
@@ -160,6 +166,7 @@ fn like_long_pattern(bencher: Bencher) {
     });
 }
 
+#[cfg(feature = "nanosecond-bench")]
 #[divan::bench]
 fn like_long_text_short_pattern(bencher: Bencher) {
     let pattern = "%dog";
@@ -193,16 +200,19 @@ fn like_many_percent_wildcards(bencher: Bencher) {
 // GLOB Pattern Matching Benchmarks
 // =============================================================================
 
+#[cfg(feature = "nanosecond-bench")]
 #[divan::bench]
 fn glob_simple_exact_match(bencher: Bencher) {
     bencher.bench_local(|| black_box(Value::exec_glob(black_box("hello"), black_box("hello"))));
 }
 
+#[cfg(feature = "nanosecond-bench")]
 #[divan::bench]
 fn glob_simple_no_match(bencher: Bencher) {
     bencher.bench_local(|| black_box(Value::exec_glob(black_box("hello"), black_box("world"))));
 }
 
+#[cfg(feature = "nanosecond-bench")]
 #[divan::bench]
 fn glob_star_prefix(bencher: Bencher) {
     // Pattern: *world - matches anything ending with "world"
@@ -214,6 +224,7 @@ fn glob_star_prefix(bencher: Bencher) {
     });
 }
 
+#[cfg(feature = "nanosecond-bench")]
 #[divan::bench]
 fn glob_star_suffix(bencher: Bencher) {
     // Pattern: hello* - matches anything starting with "hello"
@@ -288,6 +299,7 @@ fn glob_file_path_pattern(bencher: Bencher) {
     });
 }
 
+#[cfg(feature = "nanosecond-bench")]
 #[divan::bench]
 fn glob_long_pattern(bencher: Bencher) {
     let pattern = "The quick brown fox *";
@@ -307,6 +319,7 @@ fn glob_many_star_wildcards(bencher: Bencher) {
 // GLOB with Cache Benchmarks
 // =============================================================================
 
+#[cfg(feature = "nanosecond-bench")]
 #[divan::bench]
 fn glob_with_cache_first_call(bencher: Bencher) {
     bencher.bench_local(|| {
@@ -317,6 +330,7 @@ fn glob_with_cache_first_call(bencher: Bencher) {
     });
 }
 
+#[cfg(feature = "nanosecond-bench")]
 #[divan::bench]
 fn glob_with_cache_cached_hit(bencher: Bencher) {
     // Warm up the cache
@@ -342,6 +356,7 @@ fn glob_complex_pattern_cached(bencher: Bencher) {
 // Edge Cases and Special Patterns
 // =============================================================================
 
+#[cfg(feature = "nanosecond-bench")]
 #[divan::bench]
 fn like_empty_pattern(bencher: Bencher) {
     bencher.bench_local(|| {
@@ -349,6 +364,7 @@ fn like_empty_pattern(bencher: Bencher) {
     });
 }
 
+#[cfg(feature = "nanosecond-bench")]
 #[divan::bench]
 fn like_only_percent(bencher: Bencher) {
     // % matches everything
@@ -362,6 +378,7 @@ fn like_only_percent(bencher: Bencher) {
     });
 }
 
+#[cfg(feature = "nanosecond-bench")]
 #[divan::bench]
 fn glob_only_star(bencher: Bencher) {
     // * matches everything
@@ -373,6 +390,7 @@ fn glob_only_star(bencher: Bencher) {
     });
 }
 
+#[cfg(feature = "nanosecond-bench")]
 #[divan::bench]
 fn like_special_regex_chars(bencher: Bencher) {
     // Pattern with characters that are special in regex (checking for regression/bugs)
@@ -392,6 +410,7 @@ fn glob_bracket_special_cases(bencher: Bencher) {
     bencher.bench_local(|| black_box(Value::exec_glob(black_box("a[]]b"), black_box("a]b"))));
 }
 
+#[cfg(feature = "nanosecond-bench")]
 #[divan::bench]
 fn like_unicode_pattern(bencher: Bencher) {
     bencher.bench_local(|| {
@@ -404,6 +423,7 @@ fn like_unicode_pattern(bencher: Bencher) {
     });
 }
 
+#[cfg(feature = "nanosecond-bench")]
 #[divan::bench]
 fn glob_unicode_pattern(bencher: Bencher) {
     bencher.bench_local(|| {
