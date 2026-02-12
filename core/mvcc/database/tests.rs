@@ -2858,6 +2858,9 @@ fn new_tx(tx_id: TxID, begin_ts: u64, state: TransactionState) -> Transaction {
         header: RwLock::new(DatabaseHeader::default()),
         savepoint_stack: RwLock::new(Vec::new()),
         pager_commit_lock_held: AtomicBool::new(false),
+        commit_dep_counter: AtomicU64::new(0),
+        abort_now: AtomicBool::new(false),
+        commit_dep_set: Mutex::new(Vec::new()),
     }
 }
 
@@ -2872,6 +2875,8 @@ fn test_snapshot_isolation_tx_visible1() {
         (5, new_tx(5, 5, TransactionState::Preparing(8))),
         (6, new_tx(6, 6, TransactionState::Committed(10))),
         (7, new_tx(7, 7, TransactionState::Active)),
+        // tx 8 with Preparing(3): current_tx (begin_ts=4) can speculatively read
+        (8, new_tx(8, 1, TransactionState::Preparing(3))),
     ]);
 
     let current_tx = new_tx(4, 4, TransactionState::Preparing(7));
@@ -2919,8 +2924,19 @@ fn test_snapshot_isolation_tx_visible1() {
         Some(TxTimestampOrID::TxID(3))
     ));
 
-    // begin invisible: transaction preparing
+    // begin invisible: transaction preparing with end_ts(8) > begin_ts(4)
+    // Speculative read condition (begin_ts >= end_ts) is false: 4 >= 8 is false
     assert!(!rv_visible(Some(TxTimestampOrID::TxID(5)), None));
+
+    // begin VISIBLE via speculative read: tx 8 is Preparing(3), begin_ts(4) >= end_ts(3)
+    // Hekaton Table 1: speculatively read and register commit dependency
+    assert!(rv_visible(Some(TxTimestampOrID::TxID(8)), None));
+    // Verify dependency was registered via register-and-report protocol
+    assert_eq!(
+        current_tx.commit_dep_counter.load(Ordering::Acquire),
+        1,
+        "speculative read should register a commit dependency"
+    );
 
     // begin invisible: transaction committed with ts > current_tx.begin_ts
     assert!(!rv_visible(Some(TxTimestampOrID::TxID(6)), None));
@@ -2957,6 +2973,167 @@ fn test_snapshot_isolation_tx_visible1() {
     ));
 
     assert!(!rv_visible(None, None));
+}
+
+/// Test Hekaton register-and-report: speculative read increments CommitDepCounter
+/// and adds to CommitDepSet.
+#[test]
+fn test_commit_dependency_speculative_read() {
+    let txs: SkipMap<TxID, Transaction> =
+        SkipMap::from_iter([(1, new_tx(1, 1, TransactionState::Preparing(5)))]);
+
+    // Reader with begin_ts=10 > end_ts=5 → speculative read → dependency
+    let reader = new_tx(2, 10, TransactionState::Active);
+
+    let rv = RowVersion {
+        id: 0,
+        begin: Some(TxTimestampOrID::TxID(1)),
+        end: None,
+        row: generate_simple_string_row((-2).into(), 1, "test"),
+        btree_resident: false,
+    };
+
+    assert_eq!(reader.commit_dep_counter.load(Ordering::Acquire), 0);
+
+    // Speculative read: begin_ts(10) >= end_ts(5) → visible, dependency registered
+    assert!(rv.is_visible_to(&reader, &txs));
+    assert_eq!(reader.commit_dep_counter.load(Ordering::Acquire), 1);
+
+    // Verify tx 1's CommitDepSet contains reader's tx_id
+    let dep_set = txs.get(&1).unwrap();
+    assert_eq!(*dep_set.value().commit_dep_set.lock(), vec![2]);
+}
+
+/// Test cascade abort: when depended-on tx aborts, it sets AbortNow on dependents
+/// and decrements their CommitDepCounter.
+#[test]
+fn test_commit_dependency_cascade_abort() {
+    let txs: SkipMap<TxID, Transaction> =
+        SkipMap::from_iter([(1, new_tx(1, 1, TransactionState::Preparing(5)))]);
+
+    let reader = new_tx(2, 10, TransactionState::Active);
+
+    let rv = RowVersion {
+        id: 0,
+        begin: Some(TxTimestampOrID::TxID(1)),
+        end: None,
+        row: generate_simple_string_row((-2).into(), 1, "test"),
+        btree_resident: false,
+    };
+
+    // Speculative read registers dependency
+    assert!(rv.is_visible_to(&reader, &txs));
+    assert_eq!(reader.commit_dep_counter.load(Ordering::Acquire), 1);
+    assert!(!reader.abort_now.load(Ordering::Acquire));
+
+    // Simulate tx 1 aborting and cascading to dependents
+    let tx1 = txs.get(&1).unwrap();
+    let tx1 = tx1.value();
+    tx1.state.store(TransactionState::Aborted);
+
+    // Add reader to txs so cascade can find it
+    txs.insert(2, reader);
+
+    let dependents = std::mem::take(&mut *tx1.commit_dep_set.lock());
+    for dep_tx_id in dependents {
+        if let Some(dep_tx_entry) = txs.get(&dep_tx_id) {
+            let dep_tx = dep_tx_entry.value();
+            dep_tx.abort_now.store(true, Ordering::Release);
+            dep_tx.commit_dep_counter.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+
+    let reader = txs.get(&2).unwrap();
+    let reader = reader.value();
+    assert!(reader.abort_now.load(Ordering::Acquire));
+    assert_eq!(reader.commit_dep_counter.load(Ordering::Acquire), 0);
+}
+
+/// Test that registering a dependency on an already-committed tx is a no-op.
+#[test]
+fn test_commit_dependency_already_committed() {
+    let txs: SkipMap<TxID, Transaction> =
+        SkipMap::from_iter([(1, new_tx(1, 1, TransactionState::Committed(5)))]);
+
+    let reader = new_tx(2, 10, TransactionState::Active);
+
+    register_commit_dependency(&txs, &reader, 1);
+
+    assert_eq!(reader.commit_dep_counter.load(Ordering::Acquire), 0);
+    assert!(!reader.abort_now.load(Ordering::Acquire));
+}
+
+/// Test that registering a dependency on an already-aborted tx sets AbortNow.
+#[test]
+fn test_commit_dependency_already_aborted() {
+    let txs: SkipMap<TxID, Transaction> =
+        SkipMap::from_iter([(1, new_tx(1, 1, TransactionState::Aborted))]);
+
+    let reader = new_tx(2, 10, TransactionState::Active);
+
+    register_commit_dependency(&txs, &reader, 1);
+
+    assert_eq!(reader.commit_dep_counter.load(Ordering::Acquire), 0);
+    assert!(reader.abort_now.load(Ordering::Acquire));
+}
+
+/// Test speculative ignore in is_end_visible registers dependency.
+#[test]
+fn test_commit_dependency_speculative_ignore() {
+    let txs: SkipMap<TxID, Transaction> = SkipMap::from_iter([
+        (1, new_tx(1, 1, TransactionState::Committed(2))),
+        (3, new_tx(3, 3, TransactionState::Preparing(5))),
+    ]);
+
+    // Reader with begin_ts=10 > end_ts=5: will speculatively ignore (treat as deleted)
+    let reader = new_tx(4, 10, TransactionState::Active);
+
+    let rv = RowVersion {
+        id: 0,
+        begin: Some(TxTimestampOrID::Timestamp(2)),
+        end: Some(TxTimestampOrID::TxID(3)),
+        row: generate_simple_string_row((-2).into(), 1, "test"),
+        btree_resident: false,
+    };
+
+    // is_end_visible: Preparing(5), begin_ts(10) < 5 = false → deletion visible
+    // is_begin_visible: Timestamp(2), 10 >= 2 = true
+    // Combined: true && false = false (row not visible because it was deleted)
+    assert!(!rv.is_visible_to(&reader, &txs));
+    assert_eq!(
+        reader.commit_dep_counter.load(Ordering::Acquire),
+        1,
+        "speculative ignore should register a commit dependency"
+    );
+}
+
+/// Test that multiple speculative reads from the same preparing tx increment
+/// CommitDepCounter each time.
+#[test]
+fn test_commit_dependency_multiple_reads() {
+    let txs: SkipMap<TxID, Transaction> =
+        SkipMap::from_iter([(1, new_tx(1, 1, TransactionState::Preparing(5)))]);
+
+    let reader = new_tx(2, 10, TransactionState::Active);
+
+    let make_rv = |row_id: i64| RowVersion {
+        id: row_id as u64,
+        begin: Some(TxTimestampOrID::TxID(1)),
+        end: None,
+        row: generate_simple_string_row((-2).into(), row_id, "test"),
+        btree_resident: false,
+    };
+
+    // Read 3 rows from the same preparing tx
+    assert!(make_rv(1).is_visible_to(&reader, &txs));
+    assert!(make_rv(2).is_visible_to(&reader, &txs));
+    assert!(make_rv(3).is_visible_to(&reader, &txs));
+
+    assert_eq!(reader.commit_dep_counter.load(Ordering::Acquire), 3);
+
+    // tx 1's CommitDepSet has 3 entries for reader
+    let dep_set = txs.get(&1).unwrap();
+    assert_eq!(dep_set.value().commit_dep_set.lock().len(), 3);
 }
 
 /// What this test checks: Startup recovery reconciles WAL/log artifacts into one consistent MVCC state and replay boundary.
@@ -3316,6 +3493,9 @@ fn transaction_display() {
         header: RwLock::new(DatabaseHeader::default()),
         savepoint_stack: RwLock::new(Vec::new()),
         pager_commit_lock_held: AtomicBool::new(false),
+        commit_dep_counter: AtomicU64::new(0),
+        abort_now: AtomicBool::new(false),
+        commit_dep_set: Mutex::new(Vec::new()),
     };
 
     let expected = "{ state: Preparing(20250915), id: 42, begin_ts: 20250914, write_set: [RowID { table_id: MVTableId(-2), row_id: Int(11) }, RowID { table_id: MVTableId(-2), row_id: Int(13) }], read_set: [RowID { table_id: MVTableId(-2), row_id: Int(17) }, RowID { table_id: MVTableId(-2), row_id: Int(19) }] }";
