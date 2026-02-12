@@ -27,7 +27,7 @@ done
 
 BUILD_DIR="$SCRIPT_DIR/build"
 AFL="$BUILD_DIR/afl-fuzz"
-TURSODB="$LIMBO_ROOT/target/debug/tursodb"
+TURSODB="$LIMBO_ROOT/target/fuzzing/tursodb"
 SEEDS_DIR="$SCRIPT_DIR/seeds"
 RESULTS_DIR="$SCRIPT_DIR/results"
 
@@ -40,7 +40,7 @@ fi
 
 if [ ! -x "$TURSODB" ]; then
     echo "Error: tursodb not found at $TURSODB"
-    echo "Build it first: cargo afl build --bin tursodb"
+    echo "Build it first: cargo afl build --profile fuzzing --bin tursodb"
     exit 1
 fi
 
@@ -73,7 +73,7 @@ if [ "$RESUME" = false ]; then
 
     # Extract seeds from sqltest corpus
     echo "Extracting seeds from sqltest corpus..."
-    cargo run --manifest-path "$LIMBO_ROOT/Cargo.toml" --bin test-runner -- \
+    cargo run --manifest-path "$LIMBO_ROOT/Cargo.toml" --profile fuzzing --bin test-runner -- \
         extract-sql "$LIMBO_ROOT/testing/runner/tests/" \
         --output-dir "$SEEDS_DIR"
     echo "Seeds: $(ls "$SEEDS_DIR" | wc -l) files"
@@ -90,12 +90,8 @@ echo "Binary:   $TURSODB"
 echo "Resume:   $RESUME"
 echo ""
 
-# Set up working directory with init_lib and pragma
-WORK_DIR=$(mktemp -d /tmp/sqlright_work_XXXXXX)
-cp -r "$BUILD_DIR/init_lib" "$WORK_DIR/"
-cp "$BUILD_DIR/pragma" "$WORK_DIR/"
-touch "$WORK_DIR/map_id_triggered.txt"
-cd "$WORK_DIR"
+# Set up base working directory
+BASE_WORK_DIR=$(mktemp -d /tmp/sqlright_work_XXXXXX)
 
 PIDS=()
 cleanup() {
@@ -126,22 +122,38 @@ cleanup() {
     done
     echo "  TOTAL: execs=$total_execs crashes=$total_crashes hangs=$total_hangs"
 
-    rm -rf "$WORK_DIR"
+    rm -rf "$BASE_WORK_DIR"
     echo "Done."
 }
 trap cleanup INT TERM EXIT
 
-# Launch primary instance
-$AFL_CMD -M primary -i "$INPUT_FLAG" -o "$OUTPUT" -c 0 -O "$ORACLE" -m none $AFL_TARGET &
+echo "Fix: Each instance has its own working directory to avoid file contention"
+echo ""
+
+# Helper function to create per-instance working directory
+setup_work_dir() {
+    local instance_name=$1
+    local work_dir="$BASE_WORK_DIR/$instance_name"
+    mkdir -p "$work_dir"
+    cp -r "$BUILD_DIR/init_lib" "$work_dir/"
+    cp "$BUILD_DIR/pragma" "$work_dir/"
+    touch "$work_dir/map_id_triggered.txt"
+    echo "$work_dir"
+}
+
+# Launch primary instance with its own working directory
+PRIMARY_WORK_DIR=$(setup_work_dir "primary")
+(cd "$PRIMARY_WORK_DIR" && $AFL_CMD -M primary -i "$INPUT_FLAG" -o "$OUTPUT" -c 0 -O "$ORACLE" -m none $AFL_TARGET) &
 PIDS+=($!)
-echo "  primary (PID $!) started"
+echo "  primary (PID $!) started in $PRIMARY_WORK_DIR"
 
 if [ "$CORES" -gt 1 ]; then
     sleep 2
     for i in $(seq 2 "$CORES"); do
-        $AFL_CMD -S "secondary_$i" -i "$INPUT_FLAG" -o "$OUTPUT" -c 0 -O "$ORACLE" -m none $AFL_TARGET &
+        SEC_WORK_DIR=$(setup_work_dir "secondary_$i")
+        (cd "$SEC_WORK_DIR" && $AFL_CMD -S "secondary_$i" -i "$INPUT_FLAG" -o "$OUTPUT" -c 0 -O "$ORACLE" -m none $AFL_TARGET) &
         PIDS+=($!)
-        echo "  secondary_$i (PID $!) started"
+        echo "  secondary_$i (PID $!) started in $SEC_WORK_DIR"
     done
 fi
 
