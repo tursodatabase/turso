@@ -183,10 +183,7 @@ fn validate(
                 if !is_builtin {
                     let is_custom = resolver.schema.get_type_def(type_name).is_some();
                     if is_custom && !is_strict {
-                        bail_parse_error!(
-                            "custom type \"{}\" requires a STRICT table",
-                            type_name
-                        );
+                        bail_parse_error!("custom type \"{}\" requires a STRICT table", type_name);
                     }
                     if is_strict && !is_custom {
                         bail_parse_error!(
@@ -1370,11 +1367,17 @@ pub fn translate_drop_type(
     let normalized_name = normalize_ident(type_name);
 
     // Check if type exists
-    if resolver.schema.get_type_def(&normalized_name).is_none() {
+    let type_def = resolver.schema.get_type_def(&normalized_name);
+    if type_def.is_none() {
         if if_exists {
             return Ok(program);
         }
         bail_parse_error!("no such type: {normalized_name}");
+    }
+
+    // Check if built-in type
+    if type_def.unwrap().is_builtin {
+        bail_parse_error!("cannot drop built-in type: {normalized_name}");
     }
 
     // Check if any table uses this type

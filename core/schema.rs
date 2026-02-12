@@ -172,6 +172,7 @@ pub struct TypeDef {
     pub decode: Option<Box<turso_parser::ast::Expr>>,
     pub operators: Vec<TypeOperatorDef>,
     pub default: Option<Box<turso_parser::ast::Expr>>,
+    pub is_builtin: bool,
 }
 
 /// Accumulators for schema loading - kept separate to avoid moving through state variants
@@ -307,6 +308,71 @@ impl Default for Schema {
     }
 }
 
+fn bootstrap_builtin_types(registry: &mut HashMap<String, Arc<TypeDef>>) {
+    use turso_parser::ast::{Cmd, Stmt};
+    use turso_parser::parser::Parser;
+
+    let type_sqls: &[&str] = &[
+        #[cfg(feature = "uuid")]
+        "CREATE TYPE uuid BASE blob ENCODE uuid_blob(value) DECODE uuid_str(value) DEFAULT uuid4_str()",
+        "CREATE TYPE boolean BASE integer ENCODE boolean_to_int(value) DECODE int_to_boolean(value)",
+        #[cfg(feature = "json")]
+        "CREATE TYPE json BASE text ENCODE json(value) DECODE value",
+        #[cfg(feature = "json")]
+        "CREATE TYPE jsonb BASE blob ENCODE jsonb(value) DECODE json(value)",
+        "CREATE TYPE varchar(maxlen) BASE text ENCODE check_text_maxlen(value, maxlen) DECODE value",
+        "CREATE TYPE date BASE text ENCODE date(value) DECODE value",
+        "CREATE TYPE time BASE text ENCODE time(value) DECODE value",
+        "CREATE TYPE timestamp BASE text ENCODE datetime(value) DECODE value",
+        "CREATE TYPE smallint BASE integer ENCODE check_int_range(value, -32768, 32767) DECODE value",
+        "CREATE TYPE bigint BASE integer",
+        "CREATE TYPE inet BASE text ENCODE validate_ipaddr(value) DECODE value",
+        "CREATE TYPE bytea BASE blob",
+    ];
+
+    for sql in type_sqls {
+        let mut parser = Parser::new(sql.as_bytes());
+        let Ok(Some(Cmd::Stmt(Stmt::CreateType {
+            type_name, body, ..
+        }))) = parser.next_cmd()
+        else {
+            panic!("Failed to parse built-in type SQL: {sql}");
+        };
+
+        let type_def = TypeDef {
+            name: type_name.clone(),
+            params: body.params.clone(),
+            base: body.base.clone(),
+            encode: body.encode.clone(),
+            decode: body.decode.clone(),
+            operators: body
+                .operators
+                .iter()
+                .map(|op| TypeOperatorDef {
+                    op: op.op.clone(),
+                    right_type: op.right_type.clone(),
+                    func_name: op.func_name.clone(),
+                })
+                .collect(),
+            default: body.default.clone(),
+            is_builtin: true,
+        };
+        registry.insert(type_name.to_lowercase(), Arc::new(type_def));
+    }
+
+    // Register aliases
+    let aliases: &[(&str, &str)] = &[
+        ("bool", "boolean"),
+        ("int2", "smallint"),
+        ("int8", "bigint"),
+    ];
+    for (alias, target) in aliases {
+        if let Some(type_def) = registry.get(*target).cloned() {
+            registry.insert(alias.to_string(), type_def);
+        }
+    }
+}
+
 impl Schema {
     pub fn new() -> Self {
         let mut tables: HashMap<String, Arc<Table>> = HashMap::default();
@@ -344,7 +410,11 @@ impl Schema {
             table_to_materialized_views,
             incompatible_views,
             dropped_root_pages: HashSet::default(),
-            type_registry: HashMap::default(),
+            type_registry: {
+                let mut registry = HashMap::default();
+                bootstrap_builtin_types(&mut registry);
+                registry
+            },
         }
     }
 
@@ -1284,6 +1354,7 @@ impl Schema {
                         })
                         .collect(),
                     default: body.default.clone(),
+                    is_builtin: false,
                 };
                 self.type_registry
                     .insert(type_name.to_lowercase(), Arc::new(type_def));

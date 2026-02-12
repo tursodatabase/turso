@@ -1235,8 +1235,13 @@ fn query_pragma(
                 program.emit_result_row(base_reg, 6);
             }
 
-            // Custom types from the type registry
-            let mut type_names: Vec<_> = schema.type_registry.keys().collect();
+            // Custom types from the type registry (skip aliases where key != canonical name)
+            let mut type_names: Vec<_> = schema
+                .type_registry
+                .iter()
+                .filter(|(key, td)| *key == &td.name.to_lowercase())
+                .map(|(key, _)| key)
+                .collect();
             type_names.sort();
             for type_name in type_names {
                 let type_def = &schema.type_registry[type_name];

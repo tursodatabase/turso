@@ -6055,6 +6055,136 @@ pub fn op_function(
                 };
                 state.registers[*dest] = Register::Value(result);
             }
+            ScalarFunc::BooleanToInt => {
+                assert!(arg_count == 1);
+                let val = &state.registers[*start_reg];
+                let result = match val.get_value() {
+                    Value::Null => Value::Null,
+                    Value::Numeric(Numeric::Integer(i)) => match *i {
+                        0 => Value::from_i64(0),
+                        1 => Value::from_i64(1),
+                        _ => {
+                            return Err(LimboError::Constraint(format!(
+                                "invalid input for type boolean: \"{i}\""
+                            )));
+                        }
+                    },
+                    Value::Text(t) => {
+                        let v = &t.value;
+                        match v.to_ascii_lowercase().as_str() {
+                            "true" | "t" | "yes" | "on" | "1" => Value::from_i64(1),
+                            "false" | "f" | "no" | "off" | "0" => Value::from_i64(0),
+                            _ => {
+                                return Err(LimboError::Constraint(format!(
+                                    "invalid input for type boolean: \"{v}\""
+                                )));
+                            }
+                        }
+                    }
+                    other => {
+                        return Err(LimboError::Constraint(format!(
+                            "invalid input for type boolean: \"{other}\""
+                        )));
+                    }
+                };
+                state.registers[*dest] = Register::Value(result);
+            }
+            ScalarFunc::IntToBoolean => {
+                assert!(arg_count == 1);
+                let val = &state.registers[*start_reg];
+                let result = match val.get_value() {
+                    Value::Null => Value::Null,
+                    Value::Numeric(Numeric::Integer(0)) => Value::build_text("false".to_string()),
+                    _ => Value::build_text("true".to_string()),
+                };
+                state.registers[*dest] = Register::Value(result);
+            }
+            ScalarFunc::CheckTextMaxlen => {
+                assert!(arg_count == 2);
+                let val = &state.registers[*start_reg];
+                let maxlen_reg = &state.registers[*start_reg + 1];
+                let result = match val.get_value() {
+                    Value::Null => Value::Null,
+                    Value::Text(t) => {
+                        let maxlen = match maxlen_reg.get_value() {
+                            Value::Numeric(Numeric::Integer(i)) => *i,
+                            _ => {
+                                return Err(LimboError::Constraint(
+                                    "check_text_maxlen: maxlen must be an integer".to_string(),
+                                ));
+                            }
+                        };
+                        let len = t.value.chars().count() as i64;
+                        if len > maxlen {
+                            return Err(LimboError::Constraint(format!(
+                                "value too long for type varchar({maxlen})"
+                            )));
+                        }
+                        val.get_value().clone()
+                    }
+                    other => other.clone(),
+                };
+                state.registers[*dest] = Register::Value(result);
+            }
+            ScalarFunc::CheckIntRange => {
+                assert!(arg_count == 3);
+                let val = &state.registers[*start_reg];
+                let min_reg = &state.registers[*start_reg + 1];
+                let max_reg = &state.registers[*start_reg + 2];
+                let result = match val.get_value() {
+                    Value::Null => Value::Null,
+                    Value::Numeric(Numeric::Integer(v)) => {
+                        let min = match min_reg.get_value() {
+                            Value::Numeric(Numeric::Integer(i)) => *i,
+                            _ => {
+                                return Err(LimboError::Constraint(
+                                    "check_int_range: min must be an integer".to_string(),
+                                ));
+                            }
+                        };
+                        let max = match max_reg.get_value() {
+                            Value::Numeric(Numeric::Integer(i)) => *i,
+                            _ => {
+                                return Err(LimboError::Constraint(
+                                    "check_int_range: max must be an integer".to_string(),
+                                ));
+                            }
+                        };
+                        if *v < min || *v > max {
+                            return Err(LimboError::Constraint(format!(
+                                "integer out of range for type smallint: {v}"
+                            )));
+                        }
+                        val.get_value().clone()
+                    }
+                    other => {
+                        return Err(LimboError::Constraint(format!(
+                            "invalid input for integer type: \"{other}\""
+                        )));
+                    }
+                };
+                state.registers[*dest] = Register::Value(result);
+            }
+            ScalarFunc::ValidateIpAddr => {
+                assert!(arg_count == 1);
+                let val = &state.registers[*start_reg];
+                let result = match val.get_value() {
+                    Value::Null => Value::Null,
+                    Value::Text(t) => {
+                        let v = &t.value;
+                        v.parse::<std::net::IpAddr>().map_err(|_| {
+                            LimboError::Constraint(format!("invalid input for type inet: \"{v}\""))
+                        })?;
+                        val.get_value().clone()
+                    }
+                    other => {
+                        return Err(LimboError::Constraint(format!(
+                            "invalid input for type inet: \"{other}\""
+                        )));
+                    }
+                };
+                state.registers[*dest] = Register::Value(result);
+            }
         },
         crate::function::Func::Vector(vector_func) => {
             let args = &state.registers[*start_reg..*start_reg + arg_count];

@@ -2375,7 +2375,12 @@ pub fn translate_expr(
                         | ScalarFunc::TestUintLt
                         | ScalarFunc::TestUintEq
                         | ScalarFunc::TestReverseEncode
-                        | ScalarFunc::TestReverseDecode => translate_function(
+                        | ScalarFunc::TestReverseDecode
+                        | ScalarFunc::BooleanToInt
+                        | ScalarFunc::IntToBoolean
+                        | ScalarFunc::CheckTextMaxlen
+                        | ScalarFunc::CheckIntRange
+                        | ScalarFunc::ValidateIpAddr => translate_function(
                             program,
                             args,
                             referenced_tables,
