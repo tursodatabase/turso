@@ -246,6 +246,7 @@ expect {
     inet|text|validate_ipaddr (value)|value||
     json|text|json (value)|value||
     jsonb|blob|jsonb (value)|json (value)||
+    numeric(precision, scale)|blob|numeric_encode (value, precision, scale)|numeric_decode (value)||+(numeric) -> numeric_add, -(numeric) -> numeric_sub, *(numeric) -> numeric_mul, /(numeric) -> numeric_div, <(numeric) -> numeric_lt, =(numeric) -> numeric_eq
     smallint|integer|check_int_range (value, - 32768, 32767)|value||
     time|text|time (value)|value||
     timestamp|text|datetime (value)|value||
@@ -275,6 +276,7 @@ expect {
     inet|text|validate_ipaddr (value)|value||
     json|text|json (value)|value||
     jsonb|blob|jsonb (value)|json (value)||
+    numeric(precision, scale)|blob|numeric_encode (value, precision, scale)|numeric_decode (value)||+(numeric) -> numeric_add, -(numeric) -> numeric_sub, *(numeric) -> numeric_mul, /(numeric) -> numeric_div, <(numeric) -> numeric_lt, =(numeric) -> numeric_eq
     smallint|integer|check_int_range (value, - 32768, 32767)|value||
     test_uint|text|test_uint_encode (value)|test_uint_decode (value)|0|+(test_uint) -> test_uint_add
     time|text|time (value)|value||
