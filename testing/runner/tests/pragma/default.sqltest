@@ -247,3 +247,32 @@ test pragma-temp-store-set-file {
 expect {
 		1
 }
+
+test pragma-function-list-has-abs {
+    SELECT name, builtin, type, enc, narg, flags FROM pragma_function_list WHERE name = 'abs';
+}
+expect {
+    abs|1|s|utf8|1|2099200
+}
+
+test pragma-function-list-has-count {
+    SELECT name, builtin, type, narg FROM pragma_function_list WHERE name = 'count' ORDER BY narg;
+}
+expect {
+    count|1|w|0
+    count|1|w|1
+}
+
+test pragma-function-list-scalar {
+    SELECT name, builtin, type, enc, narg, flags FROM pragma_function_list WHERE name = 'upper';
+}
+expect {
+    upper|1|s|utf8|1|2099200
+}
+
+test pragma-function-list-aggregate {
+    SELECT name, type, narg FROM pragma_function_list WHERE name = 'avg';
+}
+expect {
+    avg|w|1
+}

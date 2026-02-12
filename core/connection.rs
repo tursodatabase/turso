@@ -1583,6 +1583,23 @@ impl Connection {
         self.syms.read().vtab_modules.keys().cloned().collect()
     }
 
+    /// Returns external (extension) functions: (name, is_aggregate, argc)
+    pub fn get_syms_functions(&self) -> Vec<(String, bool, i32)> {
+        self.syms
+            .read()
+            .functions
+            .values()
+            .map(|f| {
+                let is_agg = matches!(f.func, function::ExtFunc::Aggregate { .. });
+                let argc = match &f.func {
+                    function::ExtFunc::Aggregate { argc, .. } => *argc as i32,
+                    function::ExtFunc::Scalar(_) => -1,
+                };
+                (f.name.clone(), is_agg, argc)
+            })
+            .collect()
+    }
+
     pub(crate) fn syms_generation(&self) -> u64 {
         self.syms_generation.load(Ordering::SeqCst)
     }

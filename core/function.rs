@@ -1,6 +1,7 @@
 use crate::sync::Arc;
 use std::fmt;
 use std::fmt::{Debug, Display};
+use strum::IntoEnumIterator;
 use turso_ext::{FinalizeFunction, InitAggFunction, ScalarFunction, StepFunction};
 
 use crate::LimboError;
@@ -79,7 +80,7 @@ impl Display for ExternalFunc {
 }
 
 #[cfg(feature = "json")]
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, strum::EnumIter)]
 pub enum JsonFunc {
     Json,
     Jsonb,
@@ -154,7 +155,31 @@ impl Display for JsonFunc {
     }
 }
 
-#[derive(Debug, Clone)]
+#[cfg(feature = "json")]
+impl JsonFunc {
+    /// Returns true for operator-style entries that should not appear in PRAGMA function_list.
+    pub fn is_internal(&self) -> bool {
+        matches!(self, Self::JsonArrowExtract | Self::JsonArrowShiftExtract)
+    }
+
+    pub fn arities(&self) -> &'static [i32] {
+        match self {
+            Self::Json
+            | Self::Jsonb
+            | Self::JsonQuote
+            | Self::JsonErrorPosition
+            | Self::JsonValid => &[1],
+            Self::JsonPatch | Self::JsonbPatch => &[2],
+            Self::JsonArrayLength | Self::JsonType => &[1, 2],
+            // Operators — filtered out, arity doesn't matter
+            Self::JsonArrowExtract | Self::JsonArrowShiftExtract => &[2],
+            // Variable-arg
+            _ => &[-1],
+        }
+    }
+}
+
+#[derive(Debug, Clone, strum::EnumIter)]
 pub enum VectorFunc {
     Vector,
     Vector32,
@@ -194,9 +219,27 @@ impl Display for VectorFunc {
     }
 }
 
+impl VectorFunc {
+    pub fn arities(&self) -> &'static [i32] {
+        match self {
+            Self::Vector
+            | Self::Vector32
+            | Self::Vector32Sparse
+            | Self::Vector64
+            | Self::VectorExtract => &[1],
+            Self::VectorDistanceCos
+            | Self::VectorDistanceL2
+            | Self::VectorDistanceJaccard
+            | Self::VectorDistanceDot => &[2],
+            Self::VectorSlice => &[3],
+            Self::VectorConcat => &[-1],
+        }
+    }
+}
+
 /// Full-text search functions
 #[cfg(all(feature = "fts", not(target_family = "wasm")))]
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, strum::EnumIter)]
 pub enum FtsFunc {
     /// fts_score(col1, col2, ..., query): computes FTS relevance score
     /// When used with an FTS index, the optimizer routes through the index method
@@ -214,6 +257,14 @@ impl FtsFunc {
     pub fn is_deterministic(&self) -> bool {
         true
     }
+
+    pub fn arities(&self) -> &'static [i32] {
+        match self {
+            Self::Highlight => &[4],
+            // Score and Match take variable columns + query
+            Self::Score | Self::Match => &[-1],
+        }
+    }
 }
 
 #[cfg(all(feature = "fts", not(target_family = "wasm")))]
@@ -228,7 +279,7 @@ impl Display for FtsFunc {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, strum::EnumIter)]
 pub enum AggFunc {
     Avg,
     Count,
@@ -247,6 +298,7 @@ pub enum AggFunc {
     JsonbGroupObject,
     #[cfg(feature = "json")]
     JsonGroupObject,
+    #[strum(disabled)]
     External(Arc<ExtFunc>),
 }
 
@@ -298,6 +350,27 @@ impl AggFunc {
         }
     }
 
+    /// Returns all valid arities for this aggregate function.
+    /// Most aggregates have a single arity, but group_concat accepts 1 or 2 args.
+    pub fn arities(&self) -> &'static [i32] {
+        match self {
+            Self::Avg => &[1],
+            Self::Count0 => &[0],
+            Self::Count => &[1],
+            Self::GroupConcat => &[1, 2],
+            Self::Max => &[1],
+            Self::Min => &[1],
+            Self::StringAgg => &[2],
+            Self::Sum => &[1],
+            Self::Total => &[1],
+            #[cfg(feature = "json")]
+            Self::JsonGroupArray | Self::JsonbGroupArray => &[1],
+            #[cfg(feature = "json")]
+            Self::JsonGroupObject | Self::JsonbGroupObject => &[2],
+            Self::External(_) => &[-1],
+        }
+    }
+
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Avg => "avg",
@@ -322,7 +395,7 @@ impl AggFunc {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, strum::EnumIter)]
 pub enum ScalarFunc {
     Cast,
     Changes,
@@ -470,7 +543,7 @@ impl Display for ScalarFunc {
             Self::IfNull => "ifnull",
             Self::Iif => "iif",
             Self::Instr => "instr",
-            Self::Like => "like(2)",
+            Self::Like => "like",
             Self::Abs => "abs",
             Self::Upper => "upper",
             Self::Lower => "lower",
@@ -527,7 +600,95 @@ impl Display for ScalarFunc {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+impl ScalarFunc {
+    /// Returns true for internal functions that should not appear in PRAGMA function_list.
+    pub fn is_internal(&self) -> bool {
+        matches!(
+            self,
+            Self::Cast
+                | Self::StatInit
+                | Self::StatPush
+                | Self::StatGet
+                | Self::Attach
+                | Self::Detach
+                | Self::TableColumnsJsonArray
+                | Self::BinRecordJsonObject
+        )
+    }
+
+    /// Returns the valid arities for this function.
+    /// Each value becomes a separate row in PRAGMA function_list.
+    /// -1 means truly variable arguments (e.g. coalesce, printf).
+    pub fn arities(&self) -> &'static [i32] {
+        match self {
+            // 0-arg
+            Self::Changes
+            | Self::LastInsertRowid
+            | Self::Random
+            | Self::SqliteVersion
+            | Self::TursoVersion
+            | Self::SqliteSourceId
+            | Self::TotalChanges => &[0],
+            // 1-arg
+            Self::Abs
+            | Self::Hex
+            | Self::Length
+            | Self::Lower
+            | Self::OctetLength
+            | Self::Quote
+            | Self::RandomBlob
+            | Self::Sign
+            | Self::Soundex
+            | Self::Typeof
+            | Self::Unicode
+            | Self::Upper
+            | Self::ZeroBlob
+            | Self::Likely
+            | Self::Unlikely => &[1],
+            // 2-arg
+            Self::Glob
+            | Self::Instr
+            | Self::Nullif
+            | Self::IfNull
+            | Self::Likelihood
+            | Self::TimeDiff => &[2],
+            // 3-arg
+            Self::Iif | Self::Replace => &[3],
+            // Multi-arity (one row per valid arity)
+            Self::Like => &[2, 3],
+            Self::Trim | Self::LTrim | Self::RTrim | Self::Round | Self::Unhex => &[1, 2],
+            Self::Substr | Self::Substring => &[2, 3],
+            // Truly variable-arg
+            Self::Char
+            | Self::Coalesce
+            | Self::Concat
+            | Self::ConcatWs
+            | Self::Date
+            | Self::Time
+            | Self::DateTime
+            | Self::UnixEpoch
+            | Self::JulianDay
+            | Self::StrfTime
+            | Self::Printf => &[-1],
+            #[cfg(feature = "fs")]
+            #[cfg(not(target_family = "wasm"))]
+            Self::LoadExtension => &[-1],
+            // Internal functions — arity doesn't matter since they're filtered out
+            Self::Cast
+            | Self::StatInit
+            | Self::StatPush
+            | Self::StatGet
+            | Self::Attach
+            | Self::Detach
+            | Self::TableColumnsJsonArray
+            | Self::BinRecordJsonObject => &[0],
+            // Scalar max/min (multi-arg)
+            Self::Max | Self::Min => &[-1],
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, strum::EnumIter)]
 pub enum MathFunc {
     Acos,
     Acosh,
@@ -604,6 +765,15 @@ impl MathFunc {
             Self::Atan2 | Self::Mod | Self::Pow | Self::Power => MathFuncArity::Binary,
 
             Self::Log => MathFuncArity::UnaryOrBinary,
+        }
+    }
+
+    pub fn arities(&self) -> &'static [i32] {
+        match self.arity() {
+            MathFuncArity::Nullary => &[0],
+            MathFuncArity::Unary => &[1],
+            MathFuncArity::Binary => &[2],
+            MathFuncArity::UnaryOrBinary => &[1, 2],
         }
     }
 }
@@ -981,4 +1151,88 @@ impl Func {
             _ => crate::bail_parse_error!("no such function: {}", name),
         }
     }
+
+    /// Returns a list of all built-in functions for PRAGMA function_list.
+    /// Derives the list from enum iteration so it stays in sync automatically.
+    /// Functions with multiple valid arities get one row per arity.
+    pub fn builtin_function_list() -> Vec<FunctionListEntry> {
+        let mut funcs = Vec::new();
+
+        // Helper: push one entry per arity for a function
+        let mut push = |name: String, func_type: &'static str, arities: &[i32], det: bool| {
+            for &narg in arities {
+                funcs.push(FunctionListEntry {
+                    name: name.clone(),
+                    func_type,
+                    narg,
+                    deterministic: det,
+                });
+            }
+        };
+
+        // Scalar functions (filter out internal-only variants)
+        for f in ScalarFunc::iter() {
+            if f.is_internal() {
+                continue;
+            }
+            push(f.to_string(), "s", f.arities(), f.is_deterministic());
+        }
+
+        // Aggregate functions (External is #[strum(disabled)], skipped automatically).
+        // SQLite reports built-in aggregates as "w" (window-capable) since they
+        // can all be used with OVER clauses.
+        for f in AggFunc::iter() {
+            push(f.to_string(), "w", f.arities(), f.is_deterministic());
+        }
+
+        // Math functions (all scalar)
+        for f in MathFunc::iter() {
+            push(f.to_string(), "s", f.arities(), f.is_deterministic());
+        }
+
+        // Vector functions (all scalar)
+        for f in VectorFunc::iter() {
+            push(f.to_string(), "s", f.arities(), f.is_deterministic());
+        }
+
+        // JSON functions (feature-gated, filter out operator-style entries)
+        #[cfg(feature = "json")]
+        for f in JsonFunc::iter() {
+            if f.is_internal() {
+                continue;
+            }
+            push(f.to_string(), "s", f.arities(), f.is_deterministic());
+        }
+
+        // FTS functions (feature-gated)
+        #[cfg(all(feature = "fts", not(target_family = "wasm")))]
+        for f in FtsFunc::iter() {
+            push(f.to_string(), "s", f.arities(), f.is_deterministic());
+        }
+
+        // Aliases: functions callable under multiple names.
+        // These are additional names that resolve_function() accepts
+        // but that map to existing enum variants.
+        funcs.push(FunctionListEntry {
+            name: "format".into(),
+            func_type: "s",
+            narg: -1,
+            deterministic: true,
+        });
+        funcs.push(FunctionListEntry {
+            name: "if".into(),
+            func_type: "s",
+            narg: 3,
+            deterministic: true,
+        });
+
+        funcs
+    }
+}
+
+pub struct FunctionListEntry {
+    pub name: String,
+    pub func_type: &'static str, // "s" = scalar, "a" = aggregate, "w" = window
+    pub narg: i32,               // -1 = variable
+    pub deterministic: bool,
 }

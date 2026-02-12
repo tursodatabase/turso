@@ -107,7 +107,7 @@ simulator covers and tests.
 | PRAGMA freelist_count            | No         |                                                  |
 | PRAGMA full_column_names         | Not Needed | deprecated in SQLite                             |
 | PRAGMA fullsync                  | No         |                                                  |
-| PRAGMA function_list             | No         |                                                  |
+| PRAGMA function_list             | Yes        |                                                  |
 | PRAGMA hard_heap_limit           | No         |                                                  |
 | PRAGMA ignore_check_constraints  | No         |                                                  |
 | PRAGMA incremental_vacuum        | No         |                                                  |

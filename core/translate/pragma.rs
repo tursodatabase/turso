@@ -10,6 +10,7 @@ use turso_parser::ast::{PragmaName, QualifiedName};
 use super::integrity_check::{
     translate_integrity_check, translate_quick_check, MAX_INTEGRITY_CHECK_ERRORS,
 };
+use crate::function::Func;
 use crate::pragma::pragma_for;
 use crate::schema::Schema;
 use crate::storage::encryption::{CipherMode, EncryptionKey};
@@ -497,6 +498,14 @@ fn update_pragma(
             connection.set_temp_store(temp_store);
             Ok((program, TransactionMode::None))
         }
+        PragmaName::FunctionList => query_pragma(
+            PragmaName::FunctionList,
+            resolver,
+            Some(value),
+            pager,
+            connection,
+            program,
+        ),
     }
 }
 
@@ -623,6 +632,49 @@ fn query_pragma(
             }
 
             program.add_pragma_result_column(pragma.to_string());
+            Ok((program, TransactionMode::None))
+        }
+        PragmaName::FunctionList => {
+            // 6 columns: name, builtin, type, enc, narg, flags
+            let base_reg = register;
+            program.alloc_registers(5);
+
+            const SQLITE_DETERMINISTIC: i64 = 0x800;
+            const SQLITE_INNOCUOUS: i64 = 0x200000;
+
+            // Built-in functions
+            for entry in Func::builtin_function_list() {
+                let mut flags: i64 = 0;
+                if entry.deterministic {
+                    flags |= SQLITE_DETERMINISTIC;
+                }
+                flags |= SQLITE_INNOCUOUS;
+
+                program.emit_string8(entry.name, base_reg);
+                program.emit_int(1, base_reg + 1); // builtin = 1
+                program.emit_string8(entry.func_type.to_string(), base_reg + 2);
+                program.emit_string8("utf8".to_string(), base_reg + 3);
+                program.emit_int(entry.narg as i64, base_reg + 4);
+                program.emit_int(flags, base_reg + 5);
+                program.emit_result_row(base_reg, 6);
+            }
+
+            // External (extension) functions
+            for (name, is_agg, argc) in connection.get_syms_functions() {
+                let func_type = if is_agg { "a" } else { "s" };
+                program.emit_string8(name, base_reg);
+                program.emit_int(0, base_reg + 1); // builtin = 0
+                program.emit_string8(func_type.to_string(), base_reg + 2);
+                program.emit_string8("utf8".to_string(), base_reg + 3);
+                program.emit_int(argc as i64, base_reg + 4);
+                program.emit_int(0, base_reg + 5); // flags = 0 for extensions
+                program.emit_result_row(base_reg, 6);
+            }
+
+            let pragma_meta = pragma_for(&pragma);
+            for col_name in pragma_meta.columns.iter() {
+                program.add_pragma_result_column(col_name.to_string());
+            }
             Ok((program, TransactionMode::None))
         }
         PragmaName::PageCount => {
