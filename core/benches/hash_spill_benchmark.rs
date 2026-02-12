@@ -12,7 +12,7 @@ use std::sync::Arc;
 use turso_core::types::Value;
 use turso_core::vdbe::hash_table::{HashTable, HashTableConfig};
 use turso_core::vdbe::CollationSeq;
-use turso_core::{IOResult, MemoryIO};
+use turso_core::{IOResult, MemoryIO, Numeric};
 
 #[cfg(not(target_family = "wasm"))]
 #[global_allocator]
@@ -36,7 +36,7 @@ fn create_hash_table(mem_budget: usize) -> HashTable {
 fn insert_integer_entries(ht: &mut HashTable, count: usize) {
     for i in 0..count {
         let key = vec![Value::from_i64(i as i64)];
-        let _ = ht.insert(key, i as i64, vec![]);
+        let _ = ht.insert(key, i as i64, vec![], None);
     }
 }
 
@@ -46,7 +46,7 @@ fn insert_entries_with_text_payload(ht: &mut HashTable, count: usize, text_size:
     for i in 0..count {
         let key = vec![Value::from_i64(i as i64)];
         let payload = vec![Value::Text(payload_text.clone().into())];
-        let _ = ht.insert(key, i as i64, payload);
+        let _ = ht.insert(key, i as i64, payload, None);
     }
 }
 
@@ -54,7 +54,7 @@ fn insert_entries_with_text_payload(ht: &mut HashTable, count: usize, text_size:
 fn insert_text_key_entries(ht: &mut HashTable, count: usize) {
     for i in 0..count {
         let key = vec![Value::Text(format!("key_{i}").into())];
-        let _ = ht.insert(key, i as i64, vec![]);
+        let _ = ht.insert(key, i as i64, vec![], None);
     }
 }
 
@@ -73,7 +73,7 @@ fn bench_build_tight_budget(c: &mut Criterion) {
                 b.iter(|| {
                     let mut ht = create_hash_table(32 * 1024);
                     insert_integer_entries(&mut ht, count);
-                    let _ = ht.finalize_build();
+                    let _ = ht.finalize_build(None);
                     black_box(ht.has_spilled())
                 });
             },
@@ -87,7 +87,7 @@ fn bench_build_tight_budget(c: &mut Criterion) {
                 b.iter(|| {
                     let mut ht = create_hash_table(32 * 1024);
                     insert_entries_with_text_payload(&mut ht, count, 100);
-                    let _ = ht.finalize_build();
+                    let _ = ht.finalize_build(None);
                     black_box(ht.has_spilled())
                 });
             },
@@ -112,7 +112,7 @@ fn bench_build_relaxed_budget(c: &mut Criterion) {
                 b.iter(|| {
                     let mut ht = create_hash_table(256 * 1024);
                     insert_integer_entries(&mut ht, count);
-                    let _ = ht.finalize_build();
+                    let _ = ht.finalize_build(None);
                     black_box(ht.has_spilled())
                 });
             },
@@ -126,7 +126,7 @@ fn bench_build_relaxed_budget(c: &mut Criterion) {
                 b.iter(|| {
                     let mut ht = create_hash_table(256 * 1024);
                     insert_entries_with_text_payload(&mut ht, count, 100);
-                    let _ = ht.finalize_build();
+                    let _ = ht.finalize_build(None);
                     black_box(ht.has_spilled())
                 });
             },
@@ -151,24 +151,24 @@ fn bench_build_and_probe(c: &mut Criterion) {
                     // Build phase
                     let mut ht = create_hash_table(32 * 1024);
                     insert_integer_entries(&mut ht, count);
-                    let _ = ht.finalize_build();
+                    let _ = ht.finalize_build(None);
 
                     // Probe phase - look up every key
                     let mut found = 0;
                     for i in 0..count {
-                        let key = vec![Value::Integer(i as i64)];
+                        let key = vec![Value::Numeric(Numeric::Integer(i as i64))];
                         if ht.has_spilled() {
                             let partition_idx = ht.partition_for_keys(&key);
                             if !ht.is_partition_loaded(partition_idx) {
                                 while let Ok(IOResult::IO(_)) =
-                                    ht.load_spilled_partition(partition_idx)
+                                    ht.load_spilled_partition(partition_idx, None)
                                 {
                                 }
                             }
-                            if ht.probe_partition(partition_idx, &key).is_some() {
+                            if ht.probe_partition(partition_idx, &key, None).is_some() {
                                 found += 1;
                             }
-                        } else if ht.probe(key).is_some() {
+                        } else if ht.probe(key, None).is_some() {
                             found += 1;
                         }
                     }
@@ -185,24 +185,24 @@ fn bench_build_and_probe(c: &mut Criterion) {
                     // Build phase
                     let mut ht = create_hash_table(256 * 1024);
                     insert_integer_entries(&mut ht, count);
-                    let _ = ht.finalize_build();
+                    let _ = ht.finalize_build(None);
 
                     // Probe phase
                     let mut found = 0;
                     for i in 0..count {
-                        let key = vec![Value::Integer(i as i64)];
+                        let key = vec![Value::from_i64(i as i64)];
                         if ht.has_spilled() {
                             let partition_idx = ht.partition_for_keys(&key);
                             if !ht.is_partition_loaded(partition_idx) {
                                 while let Ok(IOResult::IO(_)) =
-                                    ht.load_spilled_partition(partition_idx)
+                                    ht.load_spilled_partition(partition_idx, None)
                                 {
                                 }
                             }
-                            if ht.probe_partition(partition_idx, &key).is_some() {
+                            if ht.probe_partition(partition_idx, &key, None).is_some() {
                                 found += 1;
                             }
-                        } else if ht.probe(key).is_some() {
+                        } else if ht.probe(key, None).is_some() {
                             found += 1;
                         }
                     }
@@ -239,7 +239,7 @@ fn bench_text_key_hashing(c: &mut Criterion) {
                     };
                     let mut ht = HashTable::new(config, io);
                     insert_text_key_entries(&mut ht, count);
-                    let _ = ht.finalize_build();
+                    let _ = ht.finalize_build(None);
                     black_box(ht.has_spilled())
                 });
             },
@@ -262,7 +262,7 @@ fn bench_text_key_hashing(c: &mut Criterion) {
                     };
                     let mut ht = HashTable::new(config, io);
                     insert_text_key_entries(&mut ht, count);
-                    let _ = ht.finalize_build();
+                    let _ = ht.finalize_build(None);
                     black_box(ht.has_spilled())
                 });
             },
@@ -287,7 +287,7 @@ fn bench_large_payload_spill(c: &mut Criterion) {
                 b.iter(|| {
                     let mut ht = create_hash_table(32 * 1024); // Tight budget to force spilling
                     insert_entries_with_text_payload(&mut ht, count, payload_size);
-                    let _ = ht.finalize_build();
+                    let _ = ht.finalize_build(None);
                     black_box(ht.has_spilled())
                 });
             },
