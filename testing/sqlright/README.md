@@ -2,7 +2,7 @@
 
 Coverage-guided SQL fuzzer using [SQLRight](https://github.com/PSU-Security-Universe/sqlright) to find logical correctness bugs in Turso.
 
-SQLRight uses SQL-aware mutations and oracle-based bug detection (NOREC, TLP) to test that query results are correct — not just that they don't crash.
+SQLRight uses SQL-aware mutations and oracle-based bug detection (NOREC, TLP, INDEX) to test that query results are correct — not just that they don't crash.
 
 ## Setup
 
@@ -34,10 +34,12 @@ cargo afl build --bin tursodb
 ### Quick run
 
 ```bash
-./run.sh                     # single core
-./run.sh --cores 4           # 4 parallel instances
-./run.sh --resume            # resume previous session
-./run.sh --cores 4 --resume  # resume with 4 cores
+./run.sh                              # single core, NOREC oracle
+./run.sh --oracle TLP                 # TLP oracle (broader seed compatibility)
+./run.sh --oracle INDEX               # INDEX oracle (optimizer bugs)
+./run.sh --cores 4                    # 4 parallel instances
+./run.sh --resume                     # resume previous session
+./run.sh --cores 4 --oracle TLP --resume
 ```
 
 ### Production run
@@ -48,6 +50,9 @@ cargo afl build --bin tursodb
 
 # TLP oracle, run forever:
 ./run_production.sh --oracle TLP --cores 2
+
+# INDEX oracle (catches optimizer bugs around index usage):
+./run_production.sh --oracle INDEX --cores 2
 
 # Resume most recent NOREC run:
 ./run_production.sh --oracle NOREC --cores 4 --resume
@@ -63,6 +68,21 @@ Production runs are saved to `results/run_{ORACLE}_{TIMESTAMP}/` and print per-i
 
 Generates `coverage_report/summary.txt`, `coverage_report/html/index.html`, and `coverage_report/coverage.lcov`.
 
+## Experimental Features
+
+All experimental Turso features are enabled during fuzzing to maximize attack surface:
+
+| Feature | Flag | Why |
+|---------|------|-----|
+| Views | `--experimental-views` | Materialized view correctness |
+| Strict tables | `--experimental-strict` | Type enforcement edge cases |
+| Triggers | `--experimental-triggers` | Trigger execution correctness |
+| Index methods | `--experimental-index-method` | Custom index optimizer bugs |
+| Autovacuum | `--experimental-autovacuum` | Page management under vacuum |
+| Attach | `--experimental-attach` | Multi-database query correctness |
+
+These are enabled automatically by `run.sh` and `run_production.sh`.
+
 ## Seed Corpus
 
 Seeds are automatically extracted from Turso's `.sqltest` test suite at the start of each fresh (non-resume) fuzzing run:
@@ -74,6 +94,27 @@ cargo run --bin test-runner -- extract-sql testing/runner/tests/ --output-dir se
 This produces ~3,000 self-contained SQL files covering CTEs, joins, window functions, aggregations, triggers, JSON, and more. Each file includes resolved `@setup` SQL prepended to the test SQL.
 
 Files using `:default:` databases, tests with `@skip`, and tests with `.dbconfig` dot-commands are excluded (not self-contained).
+
+## Oracles
+
+SQLRight supports 6 oracles for detecting different classes of bugs:
+
+| Oracle | What it tests | Best for |
+|--------|---------------|----------|
+| **NOREC** | Rewrites `SELECT COUNT(*) FROM t WHERE expr` to disable optimizations, compares counts | Optimizer correctness |
+| **TLP** | Splits `WHERE` into TRUE/FALSE/NULL partitions, verifies union equals original | General WHERE clause bugs |
+| **INDEX** | Runs queries with and without `CREATE INDEX`, compares results | Index scan vs table scan mismatches |
+| **ROWID** | Compares results using rowid-based access patterns | Rowid handling bugs |
+| **LIKELY** | Adds `LIKELY()`/`UNLIKELY()` hints, compares results | Hint-related optimizer bugs |
+| **OPT** | Toggles various optimizer flags, compares results | Optimizer pass correctness |
+
+### Oracle selection guidance
+
+- **NOREC**: Requires seeds matching `SELECT COUNT(*) FROM t WHERE expr` — only ~1% of auto-extracted seeds qualify. Best when combined with SQLRight's init_lib seeds.
+- **TLP**: Works with any `SELECT ... WHERE ...` query — broadest seed compatibility. Good default choice.
+- **INDEX**: Works when seeds contain `CREATE INDEX` — ~13% of extracted seeds qualify. Catches index-related optimizer bugs.
+
+Oracle violations are reported as AFL "crashes" — `unique_crashes` is the number of distinct correctness bugs.
 
 ## Multi-Core Fuzzing
 
@@ -119,21 +160,16 @@ tursodb (instrumented with PCGUARD coverage)
     │
     ├── Executes SQL from stdin
     ├── Reports coverage via shared memory bitmap
+    ├── All experimental features enabled
     │
     ▼
 afl-fuzz compares results
     ├── NOREC: optimized vs unoptimized query → same results?
     ├── TLP: partitioned WHERE clauses → same combined results?
+    ├── INDEX: with index vs without index → same results?
     ├── New coverage → save to queue
     └── Oracle mismatch → save as "crash" (correctness bug)
 ```
-
-## Oracles
-
-- **NOREC** (Non-optimizing Reference Engine Construction): rewrites queries to disable optimizations, compares results
-- **TLP** (Ternary Logic Partitioning): splits `WHERE` into `TRUE/FALSE/NULL` partitions, verifies union equals original
-
-Oracle violations are reported as AFL "crashes" — `unique_crashes` is the number of distinct correctness bugs.
 
 ## Resuming
 
@@ -174,3 +210,4 @@ testing/sqlright/
 | `bitmap_cvg: 0.00%` | MAP_SIZE mismatch — re-run `setup.sh` |
 | Coverage profdata version mismatch | Use `rustup component add llvm-tools-preview`, not system llvm |
 | Resume says "no previous run" | Output dir must have `primary/queue/` subdirectory |
+| 0 oracle violations after long run | Try TLP oracle (broadest seed compatibility) or INDEX oracle |

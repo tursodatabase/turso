@@ -1,18 +1,20 @@
 #!/bin/bash
 # SQLRight fuzzer for Turso - Quick run script.
-# Usage: ./run.sh [--cores N] [--resume]
+# Usage: ./run.sh [--cores N] [--oracle NOREC|TLP|INDEX] [--resume]
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 LIMBO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 CORES=1
+ORACLE=NOREC
 RESUME=false
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --cores) CORES="$2"; shift 2 ;;
+        --oracle) ORACLE="$2"; shift 2 ;;
         --resume) RESUME=true; shift ;;
-        *) echo "Unknown option: $1"; echo "Usage: $0 [--cores N] [--resume]"; exit 1 ;;
+        *) echo "Unknown option: $1"; echo "Usage: $0 [--cores N] [--oracle NOREC|TLP|INDEX] [--resume]"; exit 1 ;;
     esac
 done
 
@@ -41,7 +43,8 @@ export AFL_MAP_SIZE=2097152
 export AFL_OLD_FORKSERVER=1
 
 AFL_CMD="$AFL"
-AFL_TARGET="-- $TURSODB -q -m list"
+# Enable all experimental features to maximize attack surface
+AFL_TARGET="-- $TURSODB -q -m list --experimental-views --experimental-strict --experimental-triggers --experimental-index-method --experimental-autovacuum --experimental-attach"
 
 if [ "$RESUME" = true ] && [ -d "$OUTPUT/primary/queue" ]; then
     echo "Resuming from $OUTPUT..."
@@ -80,22 +83,23 @@ cleanup() {
 }
 trap "cleanup; rm -rf $WORK_DIR" INT TERM
 
+echo "=== Fuzzing with $CORES core(s), oracle=$ORACLE ==="
+
 # Launch primary instance
-$AFL_CMD -M primary -i "$INPUT_FLAG" -o "$OUTPUT" -c 0 -O NOREC -m none $AFL_TARGET &
+$AFL_CMD -M primary -i "$INPUT_FLAG" -o "$OUTPUT" -c 0 -O "$ORACLE" -m none $AFL_TARGET &
 PIDS+=($!)
 echo "  primary (PID $!) started"
 
 if [ "$CORES" -gt 1 ]; then
     sleep 2
     for i in $(seq 2 "$CORES"); do
-        $AFL_CMD -S "secondary_$i" -i "$INPUT_FLAG" -o "$OUTPUT" -c 0 -O NOREC -m none $AFL_TARGET &
+        $AFL_CMD -S "secondary_$i" -i "$INPUT_FLAG" -o "$OUTPUT" -c 0 -O "$ORACLE" -m none $AFL_TARGET &
         PIDS+=($!)
         echo "  secondary_$i (PID $!) started"
     done
 fi
 
 echo ""
-echo "=== Fuzzing with $CORES core(s) ==="
 echo "Output: $OUTPUT"
 echo "Stats:  cat $OUTPUT/primary/fuzzer_stats"
 echo "Stop:   Ctrl+C"
