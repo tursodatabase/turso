@@ -868,6 +868,13 @@ fn extract_sql(paths: Vec<PathBuf>, output_dir: PathBuf) -> ExitCode {
                 sql.push('\n');
             }
 
+            // Normalize: remove leading whitespace from each line (SQLRight parser is sensitive to indentation)
+            let sql = sql.lines()
+                .map(|line| line.trim_start())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let sql = if sql.ends_with('\n') { sql } else { sql + "\n" };
+
             let seed_name = format!("{}-{}.sql", basename, sanitize_name(&test.name));
             let seed_path = output_dir.join(&seed_name);
             if let Err(e) = std::fs::write(&seed_path, &sql) {
@@ -902,6 +909,13 @@ fn extract_sql(paths: Vec<PathBuf>, output_dir: PathBuf) -> ExitCode {
             if !sql.ends_with('\n') {
                 sql.push('\n');
             }
+
+            // Normalize: remove leading whitespace from each line (SQLRight parser is sensitive to indentation)
+            let sql = sql.lines()
+                .map(|line| line.trim_start())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let sql = if sql.ends_with('\n') { sql } else { sql + "\n" };
 
             let seed_name = format!("{}-{}.sql", basename, sanitize_name(&snap.name));
             let seed_path = output_dir.join(&seed_name);
