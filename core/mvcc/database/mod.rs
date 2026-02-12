@@ -451,6 +451,16 @@ pub struct Transaction {
     savepoint_stack: RwLock<Vec<Savepoint>>,
     /// True when this transaction currently holds the serialized logical-log commit lock.
     pager_commit_lock_held: AtomicBool,
+    /// Number of unresolved commit dependencies (must reach 0 before commit).
+    /// Hekaton Section 2.7: "A transaction cannot commit until this counter is zero."
+    commit_dep_counter: AtomicU64,
+    /// Flag: a depended-on transaction aborted; this transaction must abort too.
+    /// Hekaton Section 2.7: "AbortNow that other transactions can set to tell T to abort."
+    abort_now: AtomicBool,
+    /// Transaction IDs that depend on this transaction (notified on commit/abort).
+    /// Hekaton Section 2.7: "CommitDepSet, that stores transaction IDs of the
+    /// transactions that depend on T."
+    commit_dep_set: Mutex<Vec<TxID>>,
 }
 
 impl Transaction {
@@ -464,6 +474,9 @@ impl Transaction {
             header: RwLock::new(header),
             savepoint_stack: RwLock::new(Vec::new()),
             pager_commit_lock_held: AtomicBool::new(false),
+            commit_dep_counter: AtomicU64::new(0),
+            abort_now: AtomicBool::new(false),
+            commit_dep_set: Mutex::new(Vec::new()),
         }
     }
 
@@ -823,6 +836,12 @@ pub enum CommitState<Clock: LogicalClock> {
     Commit {
         end_ts: u64,
     },
+    /// Wait for unresolved commit dependencies before postprocessing.
+    /// Hekaton Section 3.2: "If T passes validation, it must wait for outstanding
+    /// commit dependencies to be resolved."
+    WaitForDependencies {
+        end_ts: u64,
+    },
     BeginCommitLogicalLog {
         end_ts: u64,
         log_record: LogRecord,
@@ -1157,79 +1176,17 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 tx.state.store(TransactionState::Preparing(end_ts));
                 tracing::trace!("prepare_tx(tx_id={}, end_ts={})", self.tx_id, end_ts);
 
-                /* TODO: The code we have here is sufficient for snapshot isolation.
-                ** In order to implement serializability, we need the following steps:
-                **
-                ** 1. Validate if all read versions are still visible by inspecting the read_set
-                ** 2. Validate if there are no phantoms by walking the scans from scan_set (which we don't even have yet)
-                **    - a phantom is a version that became visible in the middle of our transaction,
-                **      but wasn't taken into account during one of the scans from the scan_set
-                ** 3. Wait for commit dependencies, which we don't even track yet...
-                **    Excerpt from what's a commit dependency and how it's tracked in the original paper:
-                **    """
-                        A transaction T1 has a commit dependency on another transaction
-                        T2, if T1 is allowed to commit only if T2 commits. If T2 aborts,
-                        T1 must also abort, so cascading aborts are possible. T1 acquires a
-                        commit dependency either by speculatively reading or speculatively ignoring a version,
-                        instead of waiting for T2 to commit.
-                        We implement commit dependencies by a register-and-report
-                        approach: T1 registers its dependency with T2 and T2 informs T1
-                        when it has committed or aborted. Each transaction T contains a
-                        counter, CommitDepCounter, that counts how many unresolved
-                        commit dependencies it still has. A transaction cannot commit
-                        until this counter is zero. In addition, T has a Boolean variable
-                        AbortNow that other transactions can set to tell T to abort. Each
-                        transaction T also has a set, CommitDepSet, that stores transaction IDs
-                        of the transactions that depend on T.
-                        To take a commit dependency on a transaction T2, T1 increments
-                        its CommitDepCounter and adds its transaction ID to T2’s CommitDepSet.
-                        When T2 has committed, it locates each transaction in
-                        its CommitDepSet and decrements their CommitDepCounter. If
-                        T2 aborted, it tells the dependent transactions to also abort by
-                        setting their AbortNow flags. If a dependent transaction is not
-                        found, this means that it has already aborted.
-                        Note that a transaction with commit dependencies may not have to
-                        wait at all - the dependencies may have been resolved before it is
-                        ready to commit. Commit dependencies consolidate all waits into
-                        a single wait and postpone the wait to just before commit.
-                        Some transactions may have to wait before commit.
-                        Waiting raises a concern of deadlocks.
-                        However, deadlocks cannot occur because an older transaction never
-                        waits on a younger transaction. In
-                        a wait-for graph the direction of edges would always be from a
-                        younger transaction (higher end timestamp) to an older transaction
-                        (lower end timestamp) so cycles are impossible.
-                    """
-                **  If you're wondering when a speculative read happens, here you go:
-                **  Case 1: speculative read of TB:
-                    """
-                        If transaction TB is in the Preparing state, it has acquired an end
-                        timestamp TS which will be V’s begin timestamp if TB commits.
-                        A safe approach in this situation would be to have transaction T
-                        wait until transaction TB commits. However, we want to avoid all
-                        blocking during normal processing so instead we continue with
-                        the visibility test and, if the test returns true, allow T to
-                        speculatively read V. Transaction T acquires a commit dependency on
-                        TB, restricting the serialization order of the two transactions. That
-                        is, T is allowed to commit only if TB commits.
-                    """
-                **  Case 2: speculative ignore of TE:
-                    """
-                        If TE’s state is Preparing, it has an end timestamp TS that will become
-                        the end timestamp of V if TE does commit. If TS is greater than the read
-                        time RT, it is obvious that V will be visible if TE commits. If TE
-                        aborts, V will still be visible, because any transaction that updates
-                        V after TE has aborted will obtain an end timestamp greater than
-                        TS. If TS is less than RT, we have a more complicated situation:
-                        if TE commits, V will not be visible to T but if TE aborts, it will
-                        be visible. We could handle this by forcing T to wait until TE
-                        commits or aborts but we want to avoid all blocking during normal processing.
-                        Instead we allow T to speculatively ignore V and
-                        proceed with its processing. Transaction T acquires a commit
-                        dependency (see Section 2.7) on TE, that is, T is allowed to commit
-                        only if TE commits.
-                    """
-                */
+                /* NOTE: Commit dependencies (Hekaton Section 2.7) are implemented via
+                 ** the register-and-report protocol:
+                 ** - Speculative reads/ignores call register_commit_dependency, which
+                 **   increments CommitDepCounter and adds to CommitDepSet.
+                 ** - WaitForDependencies checks AbortNow and waits for counter == 0.
+                 ** - CommitEnd / rollback_tx drain CommitDepSet, notifying dependents.
+                 **
+                 ** TODO: For full serializability (beyond snapshot isolation), we still need:
+                 ** 1. Validate if all read versions are still visible by inspecting the read_set
+                 ** 2. Validate if there are no phantoms by walking the scans from scan_set
+                 */
                 tracing::trace!("commit_tx(tx_id={})", self.tx_id);
                 self.write_set
                     .extend(tx.write_set.iter().map(|v| v.value().clone()));
@@ -1272,7 +1229,38 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     }
                 }
 
-                // Now update timestamps
+                // Validation passed. Wait for commit dependencies before postprocessing.
+                // Hekaton Section 3.2: validation → wait for deps → logging.
+                // Placing the wait BEFORE timestamp updates is critical: if AbortNow is
+                // detected, we haven't converted any TxID→Timestamp yet, so rollback_tx
+                // works correctly (it matches on TxID(self.tx_id)).
+                self.state = CommitState::WaitForDependencies { end_ts: *end_ts };
+                return Ok(TransitionResult::Continue);
+            }
+            CommitState::WaitForDependencies { end_ts } => {
+                let tx = mvcc_store
+                    .txs
+                    .get(&self.tx_id)
+                    .ok_or(LimboError::TxTerminated)?;
+                let tx = tx.value();
+
+                // Hekaton Section 3.2: "T can proceed to the postprocessing phase
+                // if either its CommitDepCounter is zero or its AbortNow flag is set."
+                if tx.abort_now.load(Ordering::Acquire) {
+                    return Err(LimboError::CommitDependencyAborted);
+                }
+
+                // Hekaton Section 2.7: "A transaction cannot commit until this
+                // counter is zero." Deadlock impossible: edges always go from higher
+                // end_ts to lower end_ts, so the wait graph is acyclic.
+                if tx.commit_dep_counter.load(Ordering::Acquire) > 0 {
+                    return Ok(TransitionResult::Io(IOCompletions::Single(
+                        Completion::new_yield(),
+                    )));
+                }
+
+                // All dependencies resolved — proceed with timestamp updates
+                // (Hekaton Section 3.3: Postprocessing).
                 let mut log_record = LogRecord::new(*end_ts);
                 for id in &self.write_set {
                     if let Some(row_versions) = mvcc_store.rows.get(id) {
@@ -1320,25 +1308,21 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                             for row_version in row_versions.iter_mut() {
                                 if let Some(TxTimestampOrID::TxID(id)) = row_version.begin {
                                     if id == self.tx_id {
-                                        // New version is valid STARTING FROM committing transaction's end timestamp
-                                        // See diagram on page 299: https://www.cs.cmu.edu/~15721-f24/papers/Hekaton.pdf
                                         row_version.begin =
                                             Some(TxTimestampOrID::Timestamp(*end_ts));
                                         mvcc_store.insert_version_raw(
                                             &mut log_record.row_versions,
                                             row_version.clone(),
-                                        ); // FIXME: optimize cloning out
+                                        );
                                     }
                                 }
                                 if let Some(TxTimestampOrID::TxID(id)) = row_version.end {
                                     if id == self.tx_id {
-                                        // Old version is valid UNTIL committing transaction's end timestamp
-                                        // See diagram on page 299: https://www.cs.cmu.edu/~15721-f24/papers/Hekaton.pdf
                                         row_version.end = Some(TxTimestampOrID::Timestamp(*end_ts));
                                         mvcc_store.insert_version_raw(
                                             &mut log_record.row_versions,
                                             row_version.clone(),
-                                        ); // FIXME: optimize cloning out
+                                        );
                                     }
                                 }
                             }
@@ -1354,7 +1338,6 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     }
                     self.state = CommitState::CommitEnd { end_ts: *end_ts };
                 } else {
-                    // We might need to serialize log writes
                     self.state = CommitState::BeginCommitLogicalLog {
                         end_ts: *end_ts,
                         log_record,
@@ -1457,7 +1440,22 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 tx_unlocked
                     .state
                     .store(TransactionState::Committed(*end_ts));
+
+                // Hekaton Section 3.3: "The transaction then processes all outgoing
+                // commit dependencies listed in its CommitDepSet. If it committed, it
+                // decrements the target transaction's CommitDepCounter."
+                let dependents = std::mem::take(&mut *tx_unlocked.commit_dep_set.lock());
+                for dep_tx_id in dependents {
+                    if let Some(dep_tx_entry) = mvcc_store.txs.get(&dep_tx_id) {
+                        dep_tx_entry
+                            .value()
+                            .commit_dep_counter
+                            .fetch_sub(1, Ordering::AcqRel);
+                    }
+                }
+
                 mvcc_store.unlock_commit_lock_if_held(tx_unlocked);
+
                 mvcc_store
                     .global_header
                     .write()
@@ -3071,6 +3069,17 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         tracing::trace!("abort(tx_id={})", tx_id);
         self.unlock_commit_lock_if_held(tx);
 
+        // Hekaton Section 3.3: "If it aborted, it forces the dependent transactions
+        // to also abort by setting their AbortNow flags."
+        let dependents = std::mem::take(&mut *tx.commit_dep_set.lock());
+        for dep_tx_id in dependents {
+            if let Some(dep_tx_entry) = self.txs.get(&dep_tx_id) {
+                let dep_tx = dep_tx_entry.value();
+                dep_tx.abort_now.store(true, Ordering::Release);
+                dep_tx.commit_dep_counter.fetch_sub(1, Ordering::AcqRel);
+            }
+        }
+
         if self.is_exclusive_tx(&tx_id) {
             self.release_exclusive_tx(&tx_id);
         }
@@ -4600,17 +4609,79 @@ impl RowVersion {
     }
 }
 
+/// Hekaton Section 2.7 — register-and-report protocol:
+/// "To take a commit dependency on a transaction T2, T1 increments its
+/// CommitDepCounter and adds its transaction ID to T2's CommitDepSet."
+///
+/// The lock on `commit_dep_set` serializes with the drain in commit/abort
+/// resolution, preventing the race where we push an entry after the drain.
+fn register_commit_dependency(
+    txs: &SkipMap<TxID, Transaction>,
+    dependent_tx: &Transaction,
+    depended_on_tx_id: TxID,
+) {
+    let depended_on = txs
+        .get(&depended_on_tx_id)
+        .expect("depended-on transaction should exist in txs map");
+    let depended_on = depended_on.value();
+
+    // Hold lock while checking state to serialize with the drain in
+    // commit/abort postprocessing.
+    let mut dep_set = depended_on.commit_dep_set.lock();
+    match depended_on.state.load() {
+        TransactionState::Preparing(_) | TransactionState::Active => {
+            dep_set.push(dependent_tx.tx_id);
+            drop(dep_set);
+            dependent_tx
+                .commit_dep_counter
+                .fetch_add(1, Ordering::AcqRel);
+            tracing::trace!(
+                "register_commit_dependency: tx {} depends on tx {}",
+                dependent_tx.tx_id,
+                depended_on_tx_id
+            );
+        }
+        TransactionState::Committed(_) => {
+            // Already committed — dependency trivially resolved.
+        }
+        TransactionState::Aborted | TransactionState::Terminated => {
+            // Already aborted — cascade abort to dependent.
+            drop(dep_set);
+            dependent_tx.abort_now.store(true, Ordering::Release);
+            tracing::trace!(
+                "register_commit_dependency: tx {} must abort (dep tx {} aborted)",
+                dependent_tx.tx_id,
+                depended_on_tx_id
+            );
+        }
+    }
+}
+
 fn is_begin_visible(txs: &SkipMap<TxID, Transaction>, tx: &Transaction, rv: &RowVersion) -> bool {
     match rv.begin {
         Some(TxTimestampOrID::Timestamp(rv_begin_ts)) => tx.begin_ts >= rv_begin_ts,
         Some(TxTimestampOrID::TxID(rv_begin)) => {
-            let tb = txs
-                .get(&rv_begin)
-                .unwrap_or_else(|| panic!("transaction {rv_begin:?} should exist in txs map"));
-            let tb = tb.value();
+            let Some(tb_entry) = txs.get(&rv_begin) else {
+                // Transaction was removed from the map after converting its TxID refs
+                // to Timestamps. The begin field should have been updated but we still
+                // see the stale TxID. Conservative: not visible.
+                return false;
+            };
+            let tb = tb_entry.value();
             let visible = match tb.state.load() {
                 TransactionState::Active => tx.tx_id == tb.tx_id && rv.end.is_none(),
-                TransactionState::Preparing(_) => false, // NOTICE: makes sense for snapshot isolation, not so much for serializable!
+                TransactionState::Preparing(end_ts) => {
+                    // Hekaton Table 1 / Section 2.5: speculative read of TB.
+                    // If begin_ts >= end_ts, the version would be visible once TB
+                    // commits. Speculatively return true and register a dependency.
+                    // Fixes partial commit visibility (Bug #8).
+                    if tx.begin_ts >= end_ts && tx.tx_id != tb.tx_id {
+                        register_commit_dependency(txs, tx, rv_begin);
+                        true
+                    } else {
+                        false
+                    }
+                }
                 TransactionState::Committed(committed_ts) => tx.begin_ts >= committed_ts,
                 TransactionState::Aborted => false,
                 TransactionState::Terminated => {
@@ -4639,17 +4710,27 @@ fn is_end_visible(
     match row_version.end {
         Some(TxTimestampOrID::Timestamp(rv_end_ts)) => current_tx.begin_ts < rv_end_ts,
         Some(TxTimestampOrID::TxID(rv_end)) => {
-            let other_tx = txs
-                .get(&rv_end)
-                .unwrap_or_else(|| panic!("Transaction {rv_end} not found"));
-            let other_tx = other_tx.value();
+            let Some(other_tx_entry) = txs.get(&rv_end) else {
+                // Transaction was removed after converting its TxID refs to Timestamps.
+                // The end field should have been updated. Conservative: visible (row not deleted).
+                return true;
+            };
+            let other_tx = other_tx_entry.value();
             let visible = match other_tx.state.load() {
                 // V's sharp mind discovered an issue with the hekaton paper which basically states that a
                 // transaction can see a row version if the end is a TXId only if it isn't the same transaction.
                 // Source: https://avi.im/blag/2023/hekaton-paper-typo/
                 TransactionState::Active => current_tx.tx_id != other_tx.tx_id,
-                // Table 2 (Hekaton): If TS > RT, V is visible. If TS < RT, T speculatively ignores V.
-                TransactionState::Preparing(end_ts) => current_tx.begin_ts < end_ts,
+                // Hekaton Table 2: speculative ignore of TE. If end_ts <= begin_ts,
+                // we speculatively ignore V (treat deletion as committed). Register a
+                // dependency in case TE aborts (then V should have been visible).
+                TransactionState::Preparing(end_ts) => {
+                    let visible = current_tx.begin_ts < end_ts;
+                    if !visible && current_tx.tx_id != other_tx.tx_id {
+                        register_commit_dependency(txs, current_tx, rv_end);
+                    }
+                    visible
+                }
                 TransactionState::Committed(committed_ts) => current_tx.begin_ts < committed_ts,
                 TransactionState::Aborted => true,
                 // Table 2 (Hekaton): Reread V's End field. In this codebase Terminated is only
@@ -4672,6 +4753,10 @@ impl<Clock: LogicalClock> Debug for CommitState<Clock> {
         match self {
             Self::Initial => write!(f, "Initial"),
             Self::Commit { end_ts } => f.debug_struct("Commit").field("end_ts", end_ts).finish(),
+            Self::WaitForDependencies { end_ts } => f
+                .debug_struct("WaitForDependencies")
+                .field("end_ts", end_ts)
+                .finish(),
             Self::BeginCommitLogicalLog { end_ts, log_record } => f
                 .debug_struct("BeginCommitLogicalLog")
                 .field("end_ts", end_ts)
