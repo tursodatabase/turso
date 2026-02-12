@@ -130,12 +130,18 @@ pub fn compute_order_target(
             // it contains all the necessary columns required for the ORDER BY, and the GROUP BY columns are now in the correct order.
             // First, however, we need to make sure the GROUP BY sorter's column sort directions match the ORDER BY requirements.
             assert!(group_by.exprs.len() >= order_by.len());
+            let sort_order = group_by
+                .sort_order
+                .as_mut()
+                .expect("GROUP BY should have a sort order before optimization is run");
             for (i, (_, order_by_dir)) in order_by.iter().enumerate() {
-                group_by
-                    .sort_order
-                    .as_mut()
-                    .expect("GROUP BY should have a sort order before optimization is run")[i] =
-                    *order_by_dir;
+                sort_order[i] = *order_by_dir;
+            }
+            // The sort_by_key above reordered group_by.exprs but not sort_order,
+            // so remaining positions may have stale values. GROUP BY columns not
+            // in ORDER BY should default to ASC (matching SQLite's tie-breaking).
+            for s in &mut sort_order[order_by.len()..] {
+                *s = SortOrder::Asc;
             }
             // Now we can remove the ORDER BY from the query.
             order_by.clear();

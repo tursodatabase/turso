@@ -238,3 +238,33 @@ expect {
     Y|70
     X|30
 }
+
+# Regression: GROUP BY with more columns than ORDER BY DESC + LIMIT/OFFSET
+# When the optimizer reorders GROUP BY exprs to put ORDER BY columns first,
+# the sort_order for remaining GROUP BY columns (not in ORDER BY) must
+# default to ASC. Previously they kept stale values from the pre-reorder
+# sort_order, causing incorrect tie-breaking within equal ORDER BY groups.
+test groupby_desc_tiebreak_extra_columns {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT);
+    INSERT INTO t VALUES (1, 'x'), (2, 'x'), (3, 'x'), (4, 'y'), (5, 'z');
+    SELECT a, GROUP_CONCAT(a) FROM t GROUP BY a, b ORDER BY b DESC;
+}
+expect {
+    5|5
+    4|4
+    1|1
+    2|2
+    3|3
+}
+
+test groupby_desc_tiebreak_extra_columns_limit_offset {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT);
+    INSERT INTO t VALUES (1, 'x'), (2, 'x'), (3, 'x'), (4, 'y'), (5, 'z');
+    SELECT a, GROUP_CONCAT(a) FROM t GROUP BY a, b ORDER BY b DESC LIMIT 4 OFFSET 1;
+}
+expect {
+    4|4
+    1|1
+    2|2
+    3|3
+}

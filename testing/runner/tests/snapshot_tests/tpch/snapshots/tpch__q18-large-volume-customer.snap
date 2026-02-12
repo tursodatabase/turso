@@ -92,7 +92,7 @@ addr  opcode                           p1   p2  p3  p4                          
   38            Integer                 0    3   0                                                 0  r[3]=0
   39          Return                   11    0   0                                                 0
   40          Null                      0   35   0                                                 0  r[35]=NULL
-  41          SorterOpen                3    6   0  k(5,-B,B,B,B,-B)                               0  cursor=3
+  41          SorterOpen                3    6   0  k(5,-B,B,B,B,B)                                0  cursor=3
   42          Integer                   0   24   0                                                 0  r[24]=0; clear group by abort flag
   43          Null                      0   25  29                                                 0  r[25..29]=NULL; initialize group by comparison registers to NULL
   44          Gosub                    43  125   0                                                 0  ; go to clear accumulator subroutine
