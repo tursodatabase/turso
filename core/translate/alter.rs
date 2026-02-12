@@ -337,6 +337,7 @@ fn emit_add_column_check_validation(
         program.emit_insn(Insn::Halt {
             err_code: SQLITE_CONSTRAINT_CHECK,
             description: name,
+            on_error: None,
         });
 
         program.preassign_label_to_next_insn(check_passed_label);
@@ -896,6 +897,7 @@ pub fn translate_alter_table(
                 program.emit_insn(Insn::Halt {
                     err_code: 1,
                     description: error_message.to_string(),
+                    on_error: None,
                 });
 
                 program.resolve_label(skip_error_label, program.offset());

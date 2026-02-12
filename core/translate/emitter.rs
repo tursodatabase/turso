@@ -2283,6 +2283,7 @@ fn emit_delete_insns_when_triggers_present(
                     &trigger_ctx,
                     connection,
                     database_id,
+                    skip_not_found_label,
                 )?;
             }
         }
@@ -2355,6 +2356,7 @@ fn emit_delete_insns_when_triggers_present(
                     &trigger_ctx_after,
                     connection,
                     database_id,
+                    skip_not_found_label,
                 )?;
             }
         }
@@ -3002,6 +3004,9 @@ fn emit_update_insns<'a>(
         None
     };
 
+    // Label for RAISE(IGNORE) to skip the current row during UPDATE triggers
+    let trigger_ignore_jump_label = program.allocate_label();
+
     if not_exists_check_required {
         program.emit_insn(Insn::NotExists {
             cursor: target_table_cursor_id,
@@ -3150,6 +3155,7 @@ fn emit_update_insns<'a>(
                     &trigger_ctx,
                     connection,
                     update_database_id,
+                    trigger_ignore_jump_label,
                 )?;
             }
 
@@ -3413,6 +3419,7 @@ fn emit_update_insns<'a>(
                     program.emit_insn(Insn::Halt {
                         err_code: SQLITE_CONSTRAINT_UNIQUE,
                         description: column_names,
+                        on_error: None,
                     });
                 }
                 _ => unreachable!("Only IGNORE, FAIL, and ROLLBACK should reach preflight check"),
@@ -3469,6 +3476,7 @@ fn emit_update_insns<'a>(
                     program.emit_insn(Insn::Halt {
                         err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
                         description,
+                        on_error: None,
                     });
                 }
                 _ => unreachable!("Only IGNORE, FAIL, and ROLLBACK should reach preflight check"),
@@ -3849,6 +3857,7 @@ fn emit_update_insns<'a>(
                     program.emit_insn(Insn::Halt {
                         err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
                         description: column_names,
+                        on_error: None,
                     });
                 }
             }
@@ -3975,6 +3984,7 @@ fn emit_update_insns<'a>(
                     program.emit_insn(Insn::Halt {
                         err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
                         description,
+                        on_error: None,
                     });
                 }
             }
@@ -4142,6 +4152,9 @@ fn emit_update_insns<'a>(
                         )
                     };
 
+                // RAISE(IGNORE) in an AFTER trigger should only abort the trigger body,
+                // not skip post-row work (RETURNING, CDC).
+                let after_trigger_done = program.allocate_label();
                 for trigger in relevant_triggers {
                     fire_trigger(
                         program,
@@ -4150,8 +4163,10 @@ fn emit_update_insns<'a>(
                         &trigger_ctx_after,
                         connection,
                         update_database_id,
+                        after_trigger_done,
                     )?;
                 }
+                program.preassign_label_to_next_insn(after_trigger_done);
             }
         }
 
@@ -4266,6 +4281,7 @@ fn emit_update_insns<'a>(
     if let Some(label) = check_rowid_not_exists_label {
         program.preassign_label_to_next_insn(label);
     }
+    program.preassign_label_to_next_insn(trigger_ignore_jump_label);
 
     t_ctx.resolver.register_affinities.clear();
     Ok(())
@@ -5098,6 +5114,7 @@ fn emit_check_constraint_bytecode(
                 program.emit_insn(Insn::Halt {
                     err_code: SQLITE_CONSTRAINT_CHECK,
                     description: constraint_name.to_string(),
+                    on_error: None,
                 });
             }
         }

@@ -503,6 +503,7 @@ pub fn translate_insert(
                 &trigger_ctx,
                 connection,
                 database_id,
+                ctx.loop_labels.row_done,
             )?;
         }
     }
@@ -756,6 +757,10 @@ pub fn translate_insert(
         } else {
             TriggerContext::new(btree_table.clone(), Some(new_registers_after), None)
         };
+        // RAISE(IGNORE) in an AFTER trigger should only abort the trigger body,
+        // not skip post-row work (FK counters, autoincrement, CDC, RETURNING).
+        // Use a label that falls through to the next instruction after the trigger loop.
+        let after_trigger_done = program.allocate_label();
         for trigger in relevant_after_triggers {
             fire_trigger(
                 program,
@@ -764,8 +769,10 @@ pub fn translate_insert(
                 &trigger_ctx_after,
                 connection,
                 database_id,
+                after_trigger_done,
             )?;
         }
+        program.preassign_label_to_next_insn(after_trigger_done);
     }
 
     if has_fks {
@@ -1124,6 +1131,7 @@ fn emit_rowid_generation(
         program.emit_insn(Insn::Halt {
             err_code: crate::error::SQLITE_FULL,
             description: "database or disk is full".to_string(),
+            on_error: None,
         });
 
         program.preassign_label_to_next_insn(no_overflow_label);
@@ -2214,6 +2222,7 @@ fn emit_pk_uniqueness_check(
         program.emit_insn(Insn::Halt {
             err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
             description,
+            on_error: None,
         });
     }
     program.preassign_label_to_next_insn(make_record_label);
@@ -2375,6 +2384,7 @@ fn emit_unique_index_check(
         program.emit_insn(Insn::Halt {
             err_code: SQLITE_CONSTRAINT_UNIQUE,
             description: format_unique_violation_desc(ctx.table.name.as_str(), index),
+            on_error: None,
         });
 
         // continue preflight with next constraint
@@ -2407,6 +2417,7 @@ fn emit_unique_index_check(
             program.emit_insn(Insn::Halt {
                 err_code: SQLITE_CONSTRAINT_UNIQUE,
                 description: format_unique_violation_desc(ctx.table.name.as_str(), index),
+                on_error: None,
             });
         }
         program.preassign_label_to_next_insn(ok);
