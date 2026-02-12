@@ -1078,6 +1078,10 @@ impl ColumnUsedMask {
             };
             let overflow_idx = (index - Self::INLINE_BITS) / 64;
             let bit = (index - Self::INLINE_BITS) % 64;
+            // The overflow vector must be long enough to contain the target index
+            if overflow_idx >= overflow.len() {
+                return false;
+            }
             overflow.iter().enumerate().all(|(i, &w)| {
                 if i == overflow_idx {
                     w == (1 << bit)
