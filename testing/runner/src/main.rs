@@ -843,6 +843,12 @@ fn extract_sql(paths: Vec<PathBuf>, output_dir: PathBuf) -> ExitCode {
                 }
             }
 
+            // Skip negative tests (expect error) — these are invalid SQL by design
+            if matches!(test.expectations.default, test_runner::Expectation::Error(_)) {
+                tests_skipped += 1;
+                continue;
+            }
+
             // Resolve setup SQL
             let setup_sql = resolve_setup_sql(&file, &test.modifiers);
 
@@ -871,7 +877,7 @@ fn extract_sql(paths: Vec<PathBuf>, output_dir: PathBuf) -> ExitCode {
             seeds_written += 1;
         }
 
-        // Process snapshot blocks
+        // Process snapshot blocks (EXPLAIN tests — no error expectations)
         for snap in &file.snapshots {
             if let Some(skip) = &snap.modifiers.skip {
                 if skip.condition.is_none() {
