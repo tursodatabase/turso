@@ -2531,7 +2531,7 @@ mod hashtests {
         let _ = ht.finalize_build(None);
 
         // Probe for key1
-        let result = ht.probe(key1.clone(), None);
+        let result = ht.probe(key1, None);
         assert!(result.is_some());
         let entry1 = result.unwrap();
         assert_eq!(entry1.key_values[0].as_ref(), ValueRef::from_i64(1));
@@ -2604,7 +2604,7 @@ mod hashtests {
         let _ = ht.finalize_build(None);
 
         // Probe should return first match
-        let result = ht.probe(key.clone(), None);
+        let result = ht.probe(key, None);
         assert!(result.is_some());
         assert_eq!(result.unwrap().rowid, 1000);
 
@@ -3224,7 +3224,7 @@ mod hashtests {
             Value::from_f64(1000.50),
         ];
         let _ = ht
-            .insert(key1.clone(), 100, payload1.clone(), None)
+            .insert(key1.clone(), 100, payload1, None)
             .unwrap();
 
         let key2 = vec![Value::from_i64(2)];
@@ -3234,7 +3234,7 @@ mod hashtests {
             Value::from_f64(2000.75),
         ];
         let _ = ht
-            .insert(key2.clone(), 200, payload2.clone(), None)
+            .insert(key2.clone(), 200, payload2, None)
             .unwrap();
 
         let _ = ht.finalize_build(None);
