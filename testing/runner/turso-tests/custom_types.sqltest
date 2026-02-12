@@ -250,7 +250,7 @@ expect {
     time|text|time (value)|value||
     timestamp|text|datetime (value)|value||
     uuid|blob|uuid_blob (value)|uuid_str (value)|uuid4_str ()|
-    varchar|text|check_text_maxlen (value, maxlen)|value||
+    varchar(maxlen)|text|check_text_maxlen (value, maxlen)|value||
 }
 
 @requires strict "uses STRICT tables"
@@ -280,7 +280,7 @@ expect {
     time|text|time (value)|value||
     timestamp|text|datetime (value)|value||
     uuid|blob|uuid_blob (value)|uuid_str (value)|uuid4_str ()|
-    varchar|text|check_text_maxlen (value, maxlen)|value||
+    varchar(maxlen)|text|check_text_maxlen (value, maxlen)|value||
 }
 
 @requires strict "uses STRICT tables"
