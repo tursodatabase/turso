@@ -83,7 +83,7 @@ use crate::{
     util::{cast_real_to_integer, checked_cast_text_to_numeric, parse_schema_rows},
     vdbe::{
         builder::CursorType,
-        insn::{IdxInsertFlags, Insn},
+        insn::{IdxInsertFlags, Insn, SavepointOp},
     },
 };
 
@@ -2623,6 +2623,89 @@ pub fn op_auto_commit(
     }
 
     res
+}
+
+pub fn op_savepoint(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(Savepoint { op, name }, insn);
+    let conn = program.connection.clone();
+    let mv_store = conn.mv_store();
+
+    match *op {
+        SavepointOp::Begin => {
+            let starts_transaction = conn.auto_commit.load(Ordering::SeqCst);
+            if starts_transaction {
+                conn.auto_commit.store(false, Ordering::SeqCst);
+            }
+
+            if let Some(mv_store) = mv_store.as_ref() {
+                let tx_id = if let Some(tx_id) = conn.get_mv_tx_id() {
+                    tx_id
+                } else {
+                    let tx_id = mv_store.begin_tx(pager.clone())?;
+                    conn.set_mv_tx(Some((tx_id, TransactionMode::Read)));
+                    if matches!(conn.get_tx_state(), TransactionState::None) {
+                        conn.set_tx_state(TransactionState::Read);
+                    }
+                    tx_id
+                };
+                mv_store.begin_named_savepoint(tx_id, name.clone(), starts_transaction);
+            } else {
+                pager.open_subjournal()?;
+                let db_size = return_if_io!(pager.with_header(|header| header.database_size.get()));
+                pager.open_named_savepoint(name.clone(), db_size, starts_transaction)?;
+            }
+
+            state.pc += 1;
+            Ok(InsnFunctionStepResult::Step)
+        }
+        SavepointOp::Release => {
+            let release_result = if let Some(mv_store) = mv_store.as_ref() {
+                match conn.get_mv_tx_id() {
+                    Some(tx_id) => mv_store.release_named_savepoint(tx_id, name)?,
+                    None => None,
+                }
+            } else {
+                pager.release_named_savepoint(name)?
+            };
+
+            let Some(commits_transaction) = release_result else {
+                return Err(LimboError::TxError(format!("no such savepoint: {name}")));
+            };
+
+            if commits_transaction {
+                let auto_commit = Insn::AutoCommit {
+                    auto_commit: true,
+                    rollback: false,
+                };
+                return op_auto_commit(program, state, &auto_commit, pager);
+            }
+
+            state.pc += 1;
+            Ok(InsnFunctionStepResult::Step)
+        }
+        SavepointOp::RollbackTo => {
+            let found = if let Some(mv_store) = mv_store.as_ref() {
+                match conn.get_mv_tx_id() {
+                    Some(tx_id) => mv_store.rollback_to_named_savepoint(tx_id, name)?,
+                    None => false,
+                }
+            } else {
+                pager.rollback_to_named_savepoint(name)?
+            };
+
+            if !found {
+                return Err(LimboError::TxError(format!("no such savepoint: {name}")));
+            }
+
+            state.pc += 1;
+            Ok(InsnFunctionStepResult::Step)
+        }
+    }
 }
 
 fn check_deferred_fk_on_commit(conn: &Connection) -> Result<()> {
