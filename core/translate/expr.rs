@@ -2380,7 +2380,15 @@ pub fn translate_expr(
                         | ScalarFunc::IntToBoolean
                         | ScalarFunc::CheckTextMaxlen
                         | ScalarFunc::CheckIntRange
-                        | ScalarFunc::ValidateIpAddr => translate_function(
+                        | ScalarFunc::ValidateIpAddr
+                        | ScalarFunc::NumericEncode
+                        | ScalarFunc::NumericDecode
+                        | ScalarFunc::NumericAdd
+                        | ScalarFunc::NumericSub
+                        | ScalarFunc::NumericMul
+                        | ScalarFunc::NumericDiv
+                        | ScalarFunc::NumericLt
+                        | ScalarFunc::NumericEq => translate_function(
                             program,
                             args,
                             referenced_tables,

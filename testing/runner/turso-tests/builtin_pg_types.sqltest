@@ -244,3 +244,134 @@ test create-if-not-exists-builtin-ok {
 expect {
     ok
 }
+
+@requires strict "uses STRICT tables"
+test numeric-insert-select {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val numeric(10,2)) STRICT;
+    INSERT INTO t1 VALUES (1, '123.45');
+    INSERT INTO t1 VALUES (2, '0.99');
+    INSERT INTO t1 VALUES (3, '-42.10');
+    SELECT id, val FROM t1;
+}
+expect {
+    1|123.45
+    2|0.99
+    3|-42.10
+}
+
+@requires strict "uses STRICT tables"
+test numeric-insert-integer {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val numeric(5,2)) STRICT;
+    INSERT INTO t1 VALUES (1, 42);
+    INSERT INTO t1 VALUES (2, 0);
+    SELECT id, val FROM t1;
+}
+expect {
+    1|42.00
+    2|0.00
+}
+
+@requires strict "uses STRICT tables"
+test numeric-precision-overflow {
+    CREATE TABLE t1(val numeric(5,2)) STRICT;
+    INSERT INTO t1 VALUES ('12345.67');
+}
+expect error {
+}
+
+@requires strict "uses STRICT tables"
+test numeric-null {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val numeric(10,2)) STRICT;
+    INSERT INTO t1 VALUES (1, NULL);
+    SELECT id, COALESCE(val, 'IS_NULL') FROM t1;
+}
+expect {
+    1|IS_NULL
+}
+
+@requires strict "uses STRICT tables"
+test numeric-addition {
+    CREATE TABLE t1(val numeric(10,2)) STRICT;
+    INSERT INTO t1 VALUES ('100.50');
+    INSERT INTO t1 VALUES ('200.25');
+    SELECT val + val FROM t1;
+}
+expect {
+    201.00
+    400.50
+}
+
+@requires strict "uses STRICT tables"
+test numeric-subtraction {
+    CREATE TABLE t1(val numeric(10,2)) STRICT;
+    INSERT INTO t1 VALUES ('100.50');
+    SELECT val - val FROM t1;
+}
+expect {
+    0.00
+}
+
+@requires strict "uses STRICT tables"
+test numeric-multiplication {
+    CREATE TABLE t1(val numeric(10,2)) STRICT;
+    INSERT INTO t1 VALUES ('3.00');
+    INSERT INTO t1 VALUES ('7.50');
+    SELECT val * val FROM t1;
+}
+expect {
+    9.0000
+    56.2500
+}
+
+@requires strict "uses STRICT tables"
+test numeric-division {
+    CREATE TABLE t1(val numeric(10,2)) STRICT;
+    INSERT INTO t1 VALUES ('10.00');
+    SELECT val / val FROM t1;
+}
+expect {
+    1
+}
+
+@requires strict "uses STRICT tables"
+test numeric-less-than {
+    CREATE TABLE t1(val numeric(10,2)) STRICT;
+    INSERT INTO t1 VALUES ('1.00');
+    INSERT INTO t1 VALUES ('2.00');
+    INSERT INTO t1 VALUES ('3.00');
+    SELECT val FROM t1 WHERE val < '2.50';
+}
+expect {
+    1.00
+    2.00
+}
+
+@requires strict "uses STRICT tables"
+test numeric-equals {
+    CREATE TABLE t1(val numeric(10,2)) STRICT;
+    INSERT INTO t1 VALUES ('1.00');
+    INSERT INTO t1 VALUES ('2.00');
+    INSERT INTO t1 VALUES ('3.00');
+    SELECT val FROM t1 WHERE val = '2.00';
+}
+expect {
+    2.00
+}
+
+@requires strict "uses STRICT tables"
+test numeric-large-precision {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val numeric(100,10)) STRICT;
+    INSERT INTO t1 VALUES (1, '123456789012345678901234567890.1234567890');
+    SELECT id, val FROM t1;
+}
+expect {
+    1|123456789012345678901234567890.1234567890
+}
+
+@requires strict "uses STRICT tables"
+test numeric-invalid-input {
+    CREATE TABLE t1(val numeric(10,2)) STRICT;
+    INSERT INTO t1 VALUES ('not-a-number');
+}
+expect error {
+}

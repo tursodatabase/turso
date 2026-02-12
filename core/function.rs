@@ -484,6 +484,15 @@ pub enum ScalarFunc {
     CheckTextMaxlen,
     CheckIntRange,
     ValidateIpAddr,
+    // Numeric type functions
+    NumericEncode,
+    NumericDecode,
+    NumericAdd,
+    NumericSub,
+    NumericMul,
+    NumericDiv,
+    NumericLt,
+    NumericEq,
 }
 
 impl Deterministic for ScalarFunc {
@@ -567,7 +576,15 @@ impl Deterministic for ScalarFunc {
             | ScalarFunc::IntToBoolean
             | ScalarFunc::CheckTextMaxlen
             | ScalarFunc::CheckIntRange
-            | ScalarFunc::ValidateIpAddr => true,
+            | ScalarFunc::ValidateIpAddr
+            | ScalarFunc::NumericEncode
+            | ScalarFunc::NumericDecode
+            | ScalarFunc::NumericAdd
+            | ScalarFunc::NumericSub
+            | ScalarFunc::NumericMul
+            | ScalarFunc::NumericDiv
+            | ScalarFunc::NumericLt
+            | ScalarFunc::NumericEq => true,
         }
     }
 }
@@ -654,6 +671,14 @@ impl Display for ScalarFunc {
             Self::CheckTextMaxlen => "check_text_maxlen",
             Self::CheckIntRange => "check_int_range",
             Self::ValidateIpAddr => "validate_ipaddr",
+            Self::NumericEncode => "numeric_encode",
+            Self::NumericDecode => "numeric_decode",
+            Self::NumericAdd => "numeric_add",
+            Self::NumericSub => "numeric_sub",
+            Self::NumericMul => "numeric_mul",
+            Self::NumericDiv => "numeric_div",
+            Self::NumericLt => "numeric_lt",
+            Self::NumericEq => "numeric_eq",
         };
         write!(f, "{str}")
     }
@@ -759,9 +784,18 @@ impl ScalarFunc {
             | Self::TestUintLt
             | Self::TestUintEq => &[2],
             // Built-in type functions
-            Self::BooleanToInt | Self::IntToBoolean | Self::ValidateIpAddr => &[1],
-            Self::CheckTextMaxlen => &[2],
-            Self::CheckIntRange => &[3],
+            Self::BooleanToInt
+            | Self::IntToBoolean
+            | Self::ValidateIpAddr
+            | Self::NumericDecode => &[1],
+            Self::CheckTextMaxlen
+            | Self::NumericAdd
+            | Self::NumericSub
+            | Self::NumericMul
+            | Self::NumericDiv
+            | Self::NumericLt
+            | Self::NumericEq => &[2],
+            Self::CheckIntRange | Self::NumericEncode => &[3],
         }
     }
 
@@ -1265,6 +1299,14 @@ impl Func {
             "check_text_maxlen" => Ok(Self::Scalar(ScalarFunc::CheckTextMaxlen)),
             "check_int_range" => Ok(Self::Scalar(ScalarFunc::CheckIntRange)),
             "validate_ipaddr" => Ok(Self::Scalar(ScalarFunc::ValidateIpAddr)),
+            "numeric_encode" => Ok(Self::Scalar(ScalarFunc::NumericEncode)),
+            "numeric_decode" => Ok(Self::Scalar(ScalarFunc::NumericDecode)),
+            "numeric_add" => Ok(Self::Scalar(ScalarFunc::NumericAdd)),
+            "numeric_sub" => Ok(Self::Scalar(ScalarFunc::NumericSub)),
+            "numeric_mul" => Ok(Self::Scalar(ScalarFunc::NumericMul)),
+            "numeric_div" => Ok(Self::Scalar(ScalarFunc::NumericDiv)),
+            "numeric_lt" => Ok(Self::Scalar(ScalarFunc::NumericLt)),
+            "numeric_eq" => Ok(Self::Scalar(ScalarFunc::NumericEq)),
             _ => crate::bail_parse_error!("no such function: {}", name),
         }
     }

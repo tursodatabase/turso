@@ -328,6 +328,7 @@ fn bootstrap_builtin_types(registry: &mut HashMap<String, Arc<TypeDef>>) {
         "CREATE TYPE bigint BASE integer",
         "CREATE TYPE inet BASE text ENCODE validate_ipaddr(value) DECODE value",
         "CREATE TYPE bytea BASE blob",
+        "CREATE TYPE numeric(precision, scale) BASE blob ENCODE numeric_encode(value, precision, scale) DECODE numeric_decode(value) OPERATOR '+' (numeric) -> numeric_add OPERATOR '-' (numeric) -> numeric_sub OPERATOR '*' (numeric) -> numeric_mul OPERATOR '/' (numeric) -> numeric_div OPERATOR '<' (numeric) -> numeric_lt OPERATOR '=' (numeric) -> numeric_eq",
     ];
 
     for sql in type_sqls {

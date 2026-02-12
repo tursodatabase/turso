@@ -146,6 +146,23 @@ macro_rules! return_if_io {
 pub type InsnFunction =
     fn(&Program, &mut ProgramState, &Insn, &Arc<Pager>) -> Result<InsnFunctionStepResult>;
 
+/// Parse a Value (text, int, float, or blob) into a BigDecimal.
+fn value_to_bigdecimal(val: &Value) -> Result<bigdecimal::BigDecimal> {
+    use bigdecimal::BigDecimal;
+    use std::str::FromStr;
+    match val {
+        Value::Numeric(Numeric::Integer(i)) => Ok(BigDecimal::from(*i)),
+        Value::Numeric(Numeric::Float(f)) => BigDecimal::from_str(&f.to_string())
+            .map_err(|_| LimboError::Constraint(format!("invalid numeric value: {f}"))),
+        Value::Text(t) => BigDecimal::from_str(&t.value)
+            .map_err(|_| LimboError::Constraint(format!("invalid numeric value: \"{}\"", t.value))),
+        Value::Blob(b) => crate::numeric::decimal::blob_to_bigdecimal(b),
+        _ => Err(LimboError::Constraint(format!(
+            "cannot convert to numeric: \"{val}\""
+        ))),
+    }
+}
+
 /// Compare two values using the specified collation for text values.
 /// Non-text values are compared using their natural ordering.
 fn compare_with_collation(
@@ -6181,6 +6198,125 @@ pub fn op_function(
                         return Err(LimboError::Constraint(format!(
                             "invalid input for type inet: \"{other}\""
                         )));
+                    }
+                };
+                state.registers[*dest] = Register::Value(result);
+            }
+            ScalarFunc::NumericEncode => {
+                assert!(arg_count == 3);
+                let val = &state.registers[*start_reg];
+                let precision_reg = &state.registers[*start_reg + 1];
+                let scale_reg = &state.registers[*start_reg + 2];
+                let result = match val.get_value() {
+                    Value::Null => Value::Null,
+                    other => {
+                        use crate::numeric::decimal::{
+                            bigdecimal_to_blob, validate_precision_scale,
+                        };
+                        use bigdecimal::BigDecimal;
+                        use std::str::FromStr;
+
+                        let precision = match precision_reg.get_value() {
+                            Value::Numeric(Numeric::Integer(i)) => *i,
+                            _ => {
+                                return Err(LimboError::Constraint(
+                                    "numeric_encode: precision must be an integer".to_string(),
+                                ));
+                            }
+                        };
+                        let scale = match scale_reg.get_value() {
+                            Value::Numeric(Numeric::Integer(i)) => *i,
+                            _ => {
+                                return Err(LimboError::Constraint(
+                                    "numeric_encode: scale must be an integer".to_string(),
+                                ));
+                            }
+                        };
+                        let text = match other {
+                            Value::Numeric(Numeric::Integer(i)) => i.to_string(),
+                            Value::Numeric(Numeric::Float(f)) => f.to_string(),
+                            Value::Text(t) => t.value.to_string(),
+                            _ => {
+                                return Err(LimboError::Constraint(format!(
+                                    "invalid input for type numeric: \"{other}\""
+                                )));
+                            }
+                        };
+                        let bd = BigDecimal::from_str(&text).map_err(|_| {
+                            LimboError::Constraint(format!(
+                                "invalid input for type numeric: \"{text}\""
+                            ))
+                        })?;
+                        let validated = validate_precision_scale(&bd, precision, scale)?;
+                        Value::from_blob(bigdecimal_to_blob(&validated))
+                    }
+                };
+                state.registers[*dest] = Register::Value(result);
+            }
+            ScalarFunc::NumericDecode => {
+                assert!(arg_count == 1);
+                let val = &state.registers[*start_reg];
+                let result = match val.get_value() {
+                    Value::Null => Value::Null,
+                    Value::Blob(b) => {
+                        let bd = crate::numeric::decimal::blob_to_bigdecimal(b)?;
+                        Value::build_text(crate::numeric::decimal::format_numeric(&bd))
+                    }
+                    other => {
+                        return Err(LimboError::Constraint(format!(
+                            "numeric_decode: expected blob, got \"{other}\""
+                        )));
+                    }
+                };
+                state.registers[*dest] = Register::Value(result);
+            }
+            ScalarFunc::NumericAdd
+            | ScalarFunc::NumericSub
+            | ScalarFunc::NumericMul
+            | ScalarFunc::NumericDiv => {
+                assert!(arg_count == 2);
+                let lhs_val = state.registers[*start_reg].get_value().clone();
+                let rhs_val = state.registers[*start_reg + 1].get_value().clone();
+                let result = match (&lhs_val, &rhs_val) {
+                    (Value::Null, _) | (_, Value::Null) => Value::Null,
+                    _ => {
+                        let a = value_to_bigdecimal(&lhs_val)?;
+                        let b = value_to_bigdecimal(&rhs_val)?;
+                        let res = match scalar_func {
+                            ScalarFunc::NumericAdd => a + b,
+                            ScalarFunc::NumericSub => a - b,
+                            ScalarFunc::NumericMul => a * b,
+                            ScalarFunc::NumericDiv => {
+                                use bigdecimal::Zero;
+                                if b.is_zero() {
+                                    return Err(LimboError::Constraint(
+                                        "division by zero".to_string(),
+                                    ));
+                                }
+                                a / b
+                            }
+                            _ => unreachable!(),
+                        };
+                        Value::build_text(crate::numeric::decimal::format_numeric(&res))
+                    }
+                };
+                state.registers[*dest] = Register::Value(result);
+            }
+            ScalarFunc::NumericLt | ScalarFunc::NumericEq => {
+                assert!(arg_count == 2);
+                let lhs_val = state.registers[*start_reg].get_value().clone();
+                let rhs_val = state.registers[*start_reg + 1].get_value().clone();
+                let result = match (&lhs_val, &rhs_val) {
+                    (Value::Null, _) | (_, Value::Null) => Value::Null,
+                    _ => {
+                        let a = value_to_bigdecimal(&lhs_val)?;
+                        let b = value_to_bigdecimal(&rhs_val)?;
+                        let cmp_result = match scalar_func {
+                            ScalarFunc::NumericLt => a < b,
+                            ScalarFunc::NumericEq => a == b,
+                            _ => unreachable!(),
+                        };
+                        Value::from_i64(cmp_result as i64)
                     }
                 };
                 state.registers[*dest] = Register::Value(result);

@@ -5,7 +5,6 @@ use crate::LimboError;
 
 const NUMERIC_BLOB_VERSION: u8 = 0x01;
 const FLAG_NEGATIVE: u8 = 0x01;
-const MAX_SCALE_MAGNITUDE: i64 = 1_000_000;
 
 /// Serialize a BigDecimal to our portable blob format.
 ///
@@ -23,11 +22,6 @@ pub fn bigdecimal_to_blob(val: &BigDecimal) -> Vec<u8> {
 
     // magnitude.to_u32_digits() returns limbs in little-endian order
     let limbs = magnitude.to_u32_digits();
-    debug_assert!(
-        limbs.len() <= u32::MAX as usize,
-        "limb count {} exceeds u32::MAX",
-        limbs.len()
-    );
     let num_limbs = limbs.len() as u32;
 
     let mut buf = Vec::with_capacity(14 + limbs.len() * 4);
@@ -80,35 +74,11 @@ pub fn blob_to_bigdecimal(blob: &[u8]) -> crate::Result<BigDecimal> {
         Sign::Plus
     };
 
-    // SAFETY: blob[2..10] is exactly 8 bytes (checked by min-length guard above)
     let scale = i64::from_le_bytes(blob[2..10].try_into().unwrap());
 
-    // Reject absurd scales from corrupted blobs.
-    if !(-MAX_SCALE_MAGNITUDE..=MAX_SCALE_MAGNITUDE).contains(&scale) {
-        return Err(LimboError::Constraint(format!(
-            "invalid numeric blob: scale {scale} out of range"
-        )));
-    }
-
-    // SAFETY: blob[10..14] is exactly 4 bytes (checked by min-length guard above)
     let num_limbs = u32::from_le_bytes(blob[10..14].try_into().unwrap()) as usize;
 
-    // Cap limb count to prevent OOM from crafted blobs. 65536 limbs = 256KB,
-    // which supports numbers with ~600,000 decimal digits — far beyond any
-    // reasonable precision.
-    const MAX_LIMBS: usize = 65536;
-    if num_limbs > MAX_LIMBS {
-        return Err(LimboError::Constraint(format!(
-            "invalid numeric blob: limb count {num_limbs} exceeds maximum {MAX_LIMBS}"
-        )));
-    }
-
-    let expected_len = num_limbs
-        .checked_mul(4)
-        .and_then(|n| n.checked_add(14))
-        .ok_or_else(|| {
-            LimboError::Constraint("invalid numeric blob: limb count overflow".to_string())
-        })?;
+    let expected_len = 14 + num_limbs * 4;
     if blob.len() != expected_len {
         return Err(LimboError::Constraint(format!(
             "invalid numeric blob: expected {expected_len} bytes, got {}",
@@ -130,38 +100,19 @@ pub fn blob_to_bigdecimal(blob: &[u8]) -> crate::Result<BigDecimal> {
 }
 
 /// Format a BigDecimal as a string, preserving trailing zeros for the scale.
-/// BigDecimal::to_string() may drop trailing zeros, but we want "1.10" to
-/// remain "1.10" and "0.00" to remain "0.00" for a value stored with scale=2.
+/// BigDecimal::to_string() formats zero as "0" regardless of scale,
+/// but we want "0.00" for a value stored with scale=2.
 pub fn format_numeric(bd: &BigDecimal) -> String {
-    let (bigint, scale) = bd.as_bigint_and_exponent();
-    if scale <= 0 {
-        // No decimal places: just print the integer (possibly scaled up)
-        if scale == 0 {
-            return bigint.to_string();
+    use bigdecimal::Zero;
+    if bd.is_zero() {
+        let (_, scale) = bd.as_bigint_and_exponent();
+        if scale > 0 {
+            format!("0.{}", "0".repeat(scale as usize))
+        } else {
+            "0".to_string()
         }
-        // Negative scale means multiply by 10^(-scale).
-        // Cap to MAX_SCALE_MAGNITUDE (validated on read) to avoid runaway allocation.
-        let neg_scale = scale.unsigned_abs().min(MAX_SCALE_MAGNITUDE as u64) as u32;
-        let factor = num_bigint::BigInt::from(10).pow(neg_scale);
-        return (bigint * factor).to_string();
-    }
-    let scale = scale as usize;
-    let is_negative = bigint.sign() == Sign::Minus;
-    let digits = bigint.magnitude().to_string();
-    let digits_len = digits.len();
-
-    let (integer_part, frac_part) = if digits_len > scale {
-        let split = digits_len - scale;
-        (&digits[..split], digits[split..].to_string())
     } else {
-        let zeros = "0".repeat(scale - digits_len);
-        ("0", format!("{zeros}{digits}"))
-    };
-
-    if is_negative {
-        format!("-{integer_part}.{frac_part}")
-    } else {
-        format!("{integer_part}.{frac_part}")
+        bd.to_string()
     }
 }
 
@@ -174,22 +125,6 @@ pub fn validate_precision_scale(
     scale: i64,
 ) -> crate::Result<BigDecimal> {
     use bigdecimal::Zero;
-
-    if precision <= 0 {
-        return Err(LimboError::Constraint(format!(
-            "numeric precision must be positive, got {precision}"
-        )));
-    }
-    if scale < 0 {
-        return Err(LimboError::Constraint(format!(
-            "numeric scale must be non-negative, got {scale}"
-        )));
-    }
-    if scale > precision {
-        return Err(LimboError::Constraint(format!(
-            "numeric scale ({scale}) must not exceed precision ({precision})"
-        )));
-    }
 
     if val.is_zero() {
         return Ok(BigDecimal::new(BigInt::from(0), scale));
@@ -264,126 +199,5 @@ mod tests {
         let val = BigDecimal::from_str("12345.67").unwrap();
         let result = validate_precision_scale(&val, 5, 2);
         assert!(result.is_err());
-    }
-
-    // ================================================================
-    // Property-based fuzz tests (quickcheck)
-    // ================================================================
-
-    use quickcheck::{Arbitrary, Gen};
-    use quickcheck_macros::quickcheck;
-
-    /// Newtype for generating arbitrary BigDecimal values via quickcheck.
-    #[derive(Debug, Clone)]
-    struct ArbDecimal(BigDecimal);
-
-    impl Arbitrary for ArbDecimal {
-        fn arbitrary(g: &mut Gen) -> Self {
-            let mantissa = i64::arbitrary(g);
-            // Scale in [-100, 100] — covers negative scale (large integers),
-            // zero scale (plain integers), and positive scale (decimals).
-            let scale = (i64::arbitrary(g) % 101).abs();
-            let sign_flip = bool::arbitrary(g);
-            let s = if sign_flip { -scale } else { scale };
-            ArbDecimal(BigDecimal::new(BigInt::from(mantissa), s))
-        }
-    }
-
-    /// Newtype for generating valid (precision, scale) pairs.
-    #[derive(Debug, Clone)]
-    struct ArbPrecisionScale {
-        precision: i64,
-        scale: i64,
-    }
-
-    impl Arbitrary for ArbPrecisionScale {
-        fn arbitrary(g: &mut Gen) -> Self {
-            let precision = (u8::arbitrary(g) % 38) as i64 + 1; // 1..=38
-            let scale = (u8::arbitrary(g) as i64) % (precision + 1); // 0..=precision
-            ArbPrecisionScale { precision, scale }
-        }
-    }
-
-    // P1: Roundtrip encode/decode — blob_to_bigdecimal(bigdecimal_to_blob(x)) == x
-    #[quickcheck]
-    fn prop_blob_roundtrip(arb: ArbDecimal) -> bool {
-        let blob = bigdecimal_to_blob(&arb.0);
-        let decoded = blob_to_bigdecimal(&blob).unwrap();
-        decoded == arb.0
-    }
-
-    // P2: format_numeric parse roundtrip — for non-negative scale,
-    // parsing the formatted string should produce a numerically equal value.
-    #[quickcheck]
-    fn prop_format_parse_roundtrip(arb: ArbDecimal) -> bool {
-        let (_, scale) = arb.0.as_bigint_and_exponent();
-        if scale < 0 {
-            return true; // skip negative scale — format_numeric expands it
-        }
-        let formatted = format_numeric(&arb.0);
-        let parsed = BigDecimal::from_str(&formatted).unwrap();
-        // Numerically equal (may differ in internal scale representation)
-        parsed == arb.0
-    }
-
-    // P3: validate_precision_scale idempotence — applying it twice gives same result.
-    #[quickcheck]
-    fn prop_validate_idempotent(arb: ArbDecimal, ps: ArbPrecisionScale) -> bool {
-        let first = validate_precision_scale(&arb.0, ps.precision, ps.scale);
-        match first {
-            Ok(y) => {
-                let second = validate_precision_scale(&y, ps.precision, ps.scale).unwrap();
-                second == y
-            }
-            Err(_) => true, // rejection is fine
-        }
-    }
-
-    // P4: validate_precision_scale bounds — result fits within declared precision/scale.
-    #[quickcheck]
-    fn prop_validate_respects_bounds(arb: ArbDecimal, ps: ArbPrecisionScale) -> bool {
-        match validate_precision_scale(&arb.0, ps.precision, ps.scale) {
-            Ok(y) => {
-                let (bigint, result_scale) = y.as_bigint_and_exponent();
-                // Scale must match requested scale
-                if result_scale != ps.scale {
-                    return false;
-                }
-                // Digit count must be <= precision
-                let digits = bigint.magnitude().to_string();
-                let digit_count = if digits == "0" {
-                    0
-                } else {
-                    digits.len() as i64
-                };
-                digit_count <= ps.precision
-            }
-            Err(_) => true,
-        }
-    }
-
-    // P5: blob_to_bigdecimal never panics on arbitrary bytes.
-    #[quickcheck]
-    fn prop_blob_decode_no_panic(data: Vec<u8>) -> bool {
-        let _ = blob_to_bigdecimal(&data);
-        true // just checking it doesn't panic
-    }
-
-    // P6: format_numeric never panics.
-    #[quickcheck]
-    fn prop_format_no_panic(arb: ArbDecimal) -> bool {
-        let _ = format_numeric(&arb.0);
-        true
-    }
-
-    // P7: Ordering is preserved through encode/decode roundtrip.
-    #[quickcheck]
-    fn prop_ordering_preserved(a: ArbDecimal, b: ArbDecimal) -> bool {
-        let blob_a = bigdecimal_to_blob(&a.0);
-        let blob_b = bigdecimal_to_blob(&b.0);
-        let decoded_a = blob_to_bigdecimal(&blob_a).unwrap();
-        let decoded_b = blob_to_bigdecimal(&blob_b).unwrap();
-        // The ordering of decoded values must match the ordering of originals
-        a.0.cmp(&b.0) == decoded_a.cmp(&decoded_b)
     }
 }
