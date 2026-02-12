@@ -139,6 +139,10 @@ pub use vdbe::{
 /// Database index for the main database (always 0 in SQLite).
 pub const MAIN_DB_ID: usize = 0;
 
+#[cfg(feature = "cli_only")]
+pub mod dbpage;
+mod turso_types_vtab;
+
 /// Database index for the temp database (always 1 in SQLite).
 pub const TEMP_DB_ID: usize = 1;
 

@@ -66,6 +66,19 @@ impl VirtualTable {
         Arc::new(vtab)
     }
 
+    fn turso_types_virtual_table() -> Arc<VirtualTable> {
+        let table = crate::turso_types_vtab::TursoTypesTable::new();
+        let vtab = VirtualTable {
+            name: table.name(),
+            columns: Self::resolve_columns(table.sql())
+                .expect("sqlite_turso_types schema resolution should not fail"),
+            kind: VTabKind::TableValuedFunction,
+            vtab_type: VirtualTableType::Internal(Arc::new(RwLock::new(table))),
+            vtab_id: 0,
+        };
+        Arc::new(vtab)
+    }
+
     pub(crate) fn builtin_functions() -> Vec<Arc<VirtualTable>> {
         let mut vtables: Vec<Arc<VirtualTable>> = PragmaVirtualTable::functions()
             .into_iter()
@@ -90,6 +103,8 @@ impl VirtualTable {
 
         #[cfg(feature = "cli_only")]
         vtables.push(Self::btree_dump_virtual_table());
+
+        vtables.push(Self::turso_types_virtual_table());
 
         vtables
     }
