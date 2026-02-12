@@ -74,8 +74,14 @@ impl Stmt {
     /// Returns true if this statement contains any SELECT with LIMIT but no ORDER BY,
     /// including in subqueries within expressions.
     pub fn has_unordered_limit(&self) -> bool {
+        self.unordered_limit_reason().is_some()
+    }
+
+    /// Returns a reason code when this statement contains a potentially
+    /// non-deterministic LIMIT query.
+    pub fn unordered_limit_reason(&self) -> Option<&'static str> {
         match self {
-            Stmt::Select(s) => s.has_unordered_limit(),
+            Stmt::Select(s) => s.unordered_limit_reason(),
             Stmt::Insert(_)
             | Stmt::Update(_)
             | Stmt::Delete(_)
@@ -95,7 +101,7 @@ impl Stmt {
             | Stmt::Reindex
             | Stmt::Analyze
             | Stmt::Savepoint(_)
-            | Stmt::Release(_) => false,
+            | Stmt::Release(_) => None,
         }
     }
 }
@@ -110,94 +116,126 @@ impl SelectStmt {
     ///   (for example `ORDER BY ZEROBLOB(10)`), which leaves row ordering undefined
     ///   among ties.
     pub fn has_unordered_limit(&self) -> bool {
+        self.unordered_limit_reason().is_some()
+    }
+
+    /// Returns a reason code when this SELECT contains a potentially
+    /// non-deterministic LIMIT query.
+    pub fn unordered_limit_reason(&self) -> Option<&'static str> {
         if self.limit.is_some() {
             if self.order_by.is_empty() {
-                return true;
+                return Some("limit_without_order_by");
+            }
+            if self
+                .order_by
+                .iter()
+                .any(|item| item.expr.contains_scalar_subquery())
+            {
+                return Some("limit_order_by_scalar_subquery");
             }
             if self
                 .order_by
                 .iter()
                 .all(|item| !item.expr.contains_column_ref())
             {
-                return true;
+                return Some("limit_constant_order_by");
             }
         }
         // Check subqueries in SELECT columns
         for col in &self.columns {
-            if col.expr.has_unordered_limit() {
-                return true;
+            if let Some(reason) = col.expr.unordered_limit_reason() {
+                return Some(reason);
             }
         }
         // Check JOIN ON conditions
         for join in &self.joins {
             if let Some(JoinConstraint::On(expr)) = &join.constraint {
-                if expr.has_unordered_limit() {
-                    return true;
+                if let Some(reason) = expr.unordered_limit_reason() {
+                    return Some(reason);
                 }
             }
         }
         // Check WHERE clause
         if let Some(w) = &self.where_clause {
-            if w.has_unordered_limit() {
-                return true;
+            if let Some(reason) = w.unordered_limit_reason() {
+                return Some(reason);
             }
         }
         // Check GROUP BY / HAVING
         if let Some(gb) = &self.group_by {
             for expr in &gb.exprs {
-                if expr.has_unordered_limit() {
-                    return true;
+                if let Some(reason) = expr.unordered_limit_reason() {
+                    return Some(reason);
                 }
             }
             if let Some(h) = &gb.having {
-                if h.has_unordered_limit() {
-                    return true;
+                if let Some(reason) = h.unordered_limit_reason() {
+                    return Some(reason);
                 }
             }
         }
         // Check ORDER BY expressions
         for item in &self.order_by {
-            if item.expr.has_unordered_limit() {
-                return true;
+            if let Some(reason) = item.expr.unordered_limit_reason() {
+                return Some(reason);
             }
         }
-        false
+        None
     }
 }
 
 impl Expr {
     /// Returns true if this expression contains any subquery with LIMIT but no ORDER BY.
     pub fn has_unordered_limit(&self) -> bool {
+        self.unordered_limit_reason().is_some()
+    }
+
+    /// Returns a reason code when this expression contains a potentially
+    /// non-deterministic LIMIT query in a nested subquery.
+    pub fn unordered_limit_reason(&self) -> Option<&'static str> {
         match self {
-            Expr::Subquery(s) => s.has_unordered_limit(),
-            Expr::InSubquery(i) => i.expr.has_unordered_limit() || i.subquery.has_unordered_limit(),
-            Expr::Exists(e) => e.subquery.has_unordered_limit(),
-            Expr::BinaryOp(b) => b.left.has_unordered_limit() || b.right.has_unordered_limit(),
-            Expr::UnaryOp(u) => u.operand.has_unordered_limit(),
-            Expr::FunctionCall(fc) => fc.args.iter().any(|a| a.has_unordered_limit()),
-            Expr::Case(c) => {
-                c.operand.as_ref().is_some_and(|o| o.has_unordered_limit())
-                    || c.when_clauses
-                        .iter()
-                        .any(|(w, t)| w.has_unordered_limit() || t.has_unordered_limit())
-                    || c.else_clause
+            Expr::Subquery(s) => s.unordered_limit_reason(),
+            Expr::InSubquery(i) => i
+                .expr
+                .unordered_limit_reason()
+                .or_else(|| i.subquery.unordered_limit_reason()),
+            Expr::Exists(e) => e.subquery.unordered_limit_reason(),
+            Expr::BinaryOp(b) => b
+                .left
+                .unordered_limit_reason()
+                .or_else(|| b.right.unordered_limit_reason()),
+            Expr::UnaryOp(u) => u.operand.unordered_limit_reason(),
+            Expr::FunctionCall(fc) => fc.args.iter().find_map(|a| a.unordered_limit_reason()),
+            Expr::Case(c) => c
+                .operand
+                .as_ref()
+                .and_then(|o| o.unordered_limit_reason())
+                .or_else(|| {
+                    c.when_clauses.iter().find_map(|(w, t)| {
+                        w.unordered_limit_reason()
+                            .or_else(|| t.unordered_limit_reason())
+                    })
+                })
+                .or_else(|| {
+                    c.else_clause
                         .as_ref()
-                        .is_some_and(|e| e.has_unordered_limit())
-            }
-            Expr::Cast(c) => c.expr.has_unordered_limit(),
-            Expr::Between(b) => {
-                b.expr.has_unordered_limit()
-                    || b.low.has_unordered_limit()
-                    || b.high.has_unordered_limit()
-            }
-            Expr::InList(i) => {
-                i.expr.has_unordered_limit() || i.list.iter().any(|e| e.has_unordered_limit())
-            }
-            Expr::IsNull(i) => i.expr.has_unordered_limit(),
-            Expr::Parenthesized(e) => e.has_unordered_limit(),
-            Expr::ColumnRef(_) | Expr::Literal(_) => false,
+                        .and_then(|e| e.unordered_limit_reason())
+                }),
+            Expr::Cast(c) => c.expr.unordered_limit_reason(),
+            Expr::Between(b) => b
+                .expr
+                .unordered_limit_reason()
+                .or_else(|| b.low.unordered_limit_reason())
+                .or_else(|| b.high.unordered_limit_reason()),
+            Expr::InList(i) => i
+                .expr
+                .unordered_limit_reason()
+                .or_else(|| i.list.iter().find_map(|e| e.unordered_limit_reason())),
+            Expr::IsNull(i) => i.expr.unordered_limit_reason(),
+            Expr::Parenthesized(e) => e.unordered_limit_reason(),
+            Expr::ColumnRef(_) | Expr::Literal(_) => None,
             // Stubs: never instantiated
-            Expr::WindowFunction(_) | Expr::Collate(_) | Expr::Raise(_) => false,
+            Expr::WindowFunction(_) | Expr::Collate(_) | Expr::Raise(_) => None,
         }
     }
 }
@@ -279,6 +317,46 @@ impl Expr {
             }
             Expr::Subquery(_) | Expr::InSubquery(_) | Expr::Exists(_) => false,
             Expr::Literal(_) => false,
+            // Stubs: never instantiated
+            Expr::WindowFunction(_) | Expr::Collate(_) | Expr::Raise(_) => false,
+        }
+    }
+
+    /// Returns true if this expression tree contains a scalar subquery node.
+    ///
+    /// Note that this intentionally excludes EXISTS/IN-subquery forms.
+    pub fn contains_scalar_subquery(&self) -> bool {
+        match self {
+            Expr::Subquery(_) => true,
+            Expr::FunctionCall(fc) => fc.args.iter().any(|a| a.contains_scalar_subquery()),
+            Expr::BinaryOp(b) => {
+                b.left.contains_scalar_subquery() || b.right.contains_scalar_subquery()
+            }
+            Expr::UnaryOp(u) => u.operand.contains_scalar_subquery(),
+            Expr::Cast(c) => c.expr.contains_scalar_subquery(),
+            Expr::Between(b) => {
+                b.expr.contains_scalar_subquery()
+                    || b.low.contains_scalar_subquery()
+                    || b.high.contains_scalar_subquery()
+            }
+            Expr::InList(i) => {
+                i.expr.contains_scalar_subquery()
+                    || i.list.iter().any(|e| e.contains_scalar_subquery())
+            }
+            Expr::IsNull(i) => i.expr.contains_scalar_subquery(),
+            Expr::Parenthesized(e) => e.contains_scalar_subquery(),
+            Expr::Case(c) => {
+                c.operand
+                    .as_ref()
+                    .is_some_and(|o| o.contains_scalar_subquery())
+                    || c.when_clauses
+                        .iter()
+                        .any(|(w, t)| w.contains_scalar_subquery() || t.contains_scalar_subquery())
+                    || c.else_clause
+                        .as_ref()
+                        .is_some_and(|e| e.contains_scalar_subquery())
+            }
+            Expr::ColumnRef(_) | Expr::Literal(_) | Expr::InSubquery(_) | Expr::Exists(_) => false,
             // Stubs: never instantiated
             Expr::WindowFunction(_) | Expr::Collate(_) | Expr::Raise(_) => false,
         }
@@ -1695,5 +1773,92 @@ mod tests {
         };
 
         assert!(!select.has_unordered_limit());
+    }
+
+    #[test]
+    fn test_unordered_limit_reason_for_scalar_subquery_order_by() {
+        let select = SelectStmt {
+            distinct: false,
+            columns: vec![SelectColumn {
+                expr: Expr::ColumnRef(ColumnRef {
+                    table: None,
+                    column: "id".to_string(),
+                }),
+                alias: None,
+            }],
+            from: Some(FromClause {
+                table: "t".to_string(),
+                alias: None,
+            }),
+            joins: vec![],
+            where_clause: None,
+            group_by: None,
+            order_by: vec![OrderByItem {
+                expr: Expr::BinaryOp(Box::new(BinaryOpExpr {
+                    left: Expr::ColumnRef(ColumnRef {
+                        table: None,
+                        column: "id".to_string(),
+                    }),
+                    op: BinOp::Or,
+                    right: Expr::Subquery(Box::new(SelectStmt {
+                        distinct: false,
+                        columns: vec![SelectColumn {
+                            expr: Expr::Literal(Literal::Integer(1)),
+                            alias: None,
+                        }],
+                        from: None,
+                        joins: vec![],
+                        where_clause: None,
+                        group_by: None,
+                        order_by: vec![],
+                        limit: Some(1),
+                        offset: None,
+                    })),
+                })),
+                direction: OrderDirection::Desc,
+                nulls: None,
+            }],
+            limit: Some(1),
+            offset: None,
+        };
+
+        assert!(select.has_unordered_limit());
+        assert_eq!(
+            select.unordered_limit_reason(),
+            Some("limit_order_by_scalar_subquery")
+        );
+    }
+
+    #[test]
+    fn test_unordered_limit_reason_for_constant_order_by() {
+        let select = SelectStmt {
+            distinct: false,
+            columns: vec![SelectColumn {
+                expr: Expr::ColumnRef(ColumnRef {
+                    table: None,
+                    column: "id".to_string(),
+                }),
+                alias: None,
+            }],
+            from: Some(FromClause {
+                table: "t".to_string(),
+                alias: None,
+            }),
+            joins: vec![],
+            where_clause: None,
+            group_by: None,
+            order_by: vec![OrderByItem {
+                expr: Expr::Literal(Literal::Integer(1)),
+                direction: OrderDirection::Asc,
+                nulls: None,
+            }],
+            limit: Some(1),
+            offset: None,
+        };
+
+        assert_eq!(
+            select.unordered_limit_reason(),
+            Some("limit_constant_order_by")
+        );
     }
 }

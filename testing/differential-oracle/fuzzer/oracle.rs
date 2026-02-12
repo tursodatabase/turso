@@ -5,6 +5,10 @@
 //! results against SQLite.
 
 use std::sync::Arc;
+use std::{
+    collections::hash_map::DefaultHasher,
+    hash::{Hash, Hasher},
+};
 
 use anyhow::Result;
 use sql_gen_prop::SqlValue;
@@ -96,9 +100,13 @@ impl Oracle for DifferentialOracle {
                     // since the chosen rows are not stable across engines. Return a warning instead
                     // of failure.
                     if has_unordered_limit {
-                        return OracleResult::Warning(format!(
-                            "Row set mismatch for non-deterministic LIMIT query (results may vary due to undefined row selection/order):\n  SQL: {stmt}\n  Only in Turso: {:?}\n  Only in SQLite: {:?}",
-                            diff.only_in_first, diff.only_in_second
+                        return OracleResult::Warning(format_nondet_limit_warning(
+                            stmt,
+                            "row_set_mismatch",
+                            turso_rows.len(),
+                            sqlite_rows.len(),
+                            diff.only_in_first.len(),
+                            diff.only_in_second.len(),
                         ));
                     }
                     return OracleResult::Fail(format!(
@@ -125,9 +133,13 @@ impl Oracle for DifferentialOracle {
                 if rows.is_empty() {
                     OracleResult::Pass
                 } else if has_unordered_limit {
-                    OracleResult::Warning(format!(
-                        "Turso returned {} rows but SQLite returned no rows for non-deterministic LIMIT query (results may vary due to undefined row selection/order):\n  SQL: {stmt}",
-                        rows.len()
+                    OracleResult::Warning(format_nondet_limit_warning(
+                        stmt,
+                        "rows_vs_ok",
+                        rows.len(),
+                        0,
+                        rows.len(),
+                        0,
                     ))
                 } else {
                     OracleResult::Fail(format!(
@@ -140,9 +152,13 @@ impl Oracle for DifferentialOracle {
                 if rows.is_empty() {
                     OracleResult::Pass
                 } else if has_unordered_limit {
-                    OracleResult::Warning(format!(
-                        "SQLite returned {} rows but Turso returned no rows for non-deterministic LIMIT query (results may vary due to undefined row selection/order):\n  SQL: {stmt}",
-                        rows.len()
+                    OracleResult::Warning(format_nondet_limit_warning(
+                        stmt,
+                        "ok_vs_rows",
+                        0,
+                        rows.len(),
+                        0,
+                        rows.len(),
                     ))
                 } else {
                     OracleResult::Fail(format!(
@@ -153,6 +169,43 @@ impl Oracle for DifferentialOracle {
             }
         }
     }
+}
+
+fn sql_hash(sql: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    sql.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn short_sql(sql: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    for (i, ch) in sql.chars().enumerate() {
+        if i >= max_chars {
+            out.push_str("...");
+            break;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+fn format_nondet_limit_warning(
+    stmt: &GeneratedStatement,
+    kind: &str,
+    turso_rows: usize,
+    sqlite_rows: usize,
+    only_in_turso: usize,
+    only_in_sqlite: usize,
+) -> String {
+    let reason = stmt
+        .unordered_limit_reason
+        .as_deref()
+        .unwrap_or("unordered_limit");
+    format!(
+        "NONDET_LIMIT_WARNING reason={reason} kind={kind} sql_hash={:016x} turso_rows={turso_rows} sqlite_rows={sqlite_rows} only_in_turso={only_in_turso} only_in_sqlite={only_in_sqlite}\n  SQL(prefix): {}",
+        sql_hash(&stmt.sql),
+        short_sql(&stmt.sql, 240),
+    )
 }
 
 impl DifferentialOracle {
@@ -294,5 +347,30 @@ mod tests {
         assert!(OracleResult::Fail("test".into()).is_fail());
         assert!(!OracleResult::Fail("test".into()).is_pass());
         assert!(!OracleResult::Fail("test".into()).is_warning());
+    }
+
+    #[test]
+    fn test_nondet_warning_is_structured_and_reasoned() {
+        let stmt = GeneratedStatement {
+            sql: "SELECT 1 LIMIT 1".to_string(),
+            is_ddl: false,
+            has_unordered_limit: true,
+            unordered_limit_reason: Some("limit_order_by_scalar_subquery".to_string()),
+        };
+        let turso = QueryResult::Rows(vec![Row(vec![SqlValue::Integer(1)])]);
+        let sqlite = QueryResult::Rows(vec![Row(vec![SqlValue::Integer(2)])]);
+
+        let oracle = DifferentialOracle;
+        let res = oracle.check(&stmt, &turso, &sqlite);
+        match res {
+            OracleResult::Warning(msg) => {
+                assert!(msg.contains("NONDET_LIMIT_WARNING"));
+                assert!(msg.contains("reason=limit_order_by_scalar_subquery"));
+                assert!(msg.contains("kind=row_set_mismatch"));
+                assert!(msg.contains("sql_hash="));
+                assert!(msg.contains("SQL(prefix): SELECT 1 LIMIT 1"));
+            }
+            other => panic!("expected warning, got {other:?}"),
+        }
     }
 }
