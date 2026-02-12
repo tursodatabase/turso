@@ -51,6 +51,10 @@ stress-go/stress-go
 bisected.sql
 *.log
 
+# LLVM coverage profiles
+*.profraw
+*.profdata
+
 *.db-log
 settings.local.json
 .claude/agents/
