@@ -109,6 +109,9 @@ await db.transaction(async () => {
   // Commits on success, rolls back on error
 });
 ```
+## License
+
+This project is licensed under the [MIT license](https://github.com/tursodatabase/turso/blob/main/LICENSE.md).
 
 ## Links
 
