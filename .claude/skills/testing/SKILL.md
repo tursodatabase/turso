@@ -27,6 +27,9 @@ make test-single TEST=select.test
 # SQL test runner
 make -C testing/runner run-cli
 
+# OR
+cargo run -p test-runner -- run <test-file or directory>
+
 # Rust unit/integration tests (full workspace)
 cargo test
 ```
