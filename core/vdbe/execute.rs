@@ -1704,7 +1704,9 @@ pub fn op_type_check(
                 b"BLOB" if value_type == ValueType::Blob => {}
                 b"TEXT" if value_type == ValueType::Text => {}
                 b"ANY" => {}
-                // Custom types: skip type check here, encode function will validate
+                // Custom types: the encode function (which runs before TypeCheck)
+                // has already validated and converted the value. Unknown types cannot
+                // reach here because CREATE TABLE rejects them for STRICT tables.
                 _ => {}
             });
             Ok(())
@@ -5677,7 +5679,7 @@ pub fn op_function(
                 state.registers[*dest] = Register::Value(result);
             }
             ScalarFunc::TestUintEncode => {
-                assert!(arg_count == 1);
+                debug_assert!(arg_count == 1);
                 let val = &state.registers[*start_reg];
                 let result = match val.get_value() {
                     Value::Null => Value::Null,
@@ -5715,7 +5717,7 @@ pub fn op_function(
                 state.registers[*dest] = Register::Value(result);
             }
             ScalarFunc::TestUintDecode => {
-                assert!(arg_count == 1);
+                debug_assert!(arg_count == 1);
                 let val = &state.registers[*start_reg];
                 let result = match val.get_value() {
                     Value::Null => Value::Null,
@@ -5727,7 +5729,7 @@ pub fn op_function(
             | ScalarFunc::TestUintSub
             | ScalarFunc::TestUintMul
             | ScalarFunc::TestUintDiv => {
-                assert!(arg_count == 2);
+                debug_assert!(arg_count == 2);
                 let a = parse_test_uint(&state.registers[*start_reg])?;
                 let b = parse_test_uint(&state.registers[*start_reg + 1])?;
                 let result = match (a, b) {
@@ -5759,7 +5761,7 @@ pub fn op_function(
                 state.registers[*dest] = Register::Value(result);
             }
             ScalarFunc::TestUintLt | ScalarFunc::TestUintEq => {
-                assert!(arg_count == 2);
+                debug_assert!(arg_count == 2);
                 let a = parse_test_uint(&state.registers[*start_reg])?;
                 let b = parse_test_uint(&state.registers[*start_reg + 1])?;
                 let result = match (a, b) {
@@ -5776,7 +5778,7 @@ pub fn op_function(
                 state.registers[*dest] = Register::Value(result);
             }
             ScalarFunc::TestReverseEncode | ScalarFunc::TestReverseDecode => {
-                assert!(arg_count == 1);
+                debug_assert!(arg_count == 1);
                 let val = &state.registers[*start_reg];
                 let result = match val.get_value() {
                     Value::Null => Value::Null,
@@ -5793,7 +5795,7 @@ pub fn op_function(
                 state.registers[*dest] = Register::Value(result);
             }
             ScalarFunc::BooleanToInt => {
-                assert!(arg_count == 1);
+                debug_assert!(arg_count == 1);
                 let val = &state.registers[*start_reg];
                 let result = match val.get_value() {
                     Value::Null => Value::Null,
@@ -5827,7 +5829,7 @@ pub fn op_function(
                 state.registers[*dest] = Register::Value(result);
             }
             ScalarFunc::IntToBoolean => {
-                assert!(arg_count == 1);
+                debug_assert!(arg_count == 1);
                 let val = &state.registers[*start_reg];
                 let result = match val.get_value() {
                     Value::Null => Value::Null,
@@ -5837,7 +5839,7 @@ pub fn op_function(
                 state.registers[*dest] = Register::Value(result);
             }
             ScalarFunc::ValidateIpAddr => {
-                assert!(arg_count == 1);
+                debug_assert!(arg_count == 1);
                 let val = &state.registers[*start_reg];
                 let result = match val.get_value() {
                     Value::Null => Value::Null,
@@ -5857,7 +5859,7 @@ pub fn op_function(
                 state.registers[*dest] = Register::Value(result);
             }
             ScalarFunc::NumericEncode => {
-                assert!(arg_count == 3);
+                debug_assert!(arg_count == 3);
                 let val = &state.registers[*start_reg];
                 let precision_reg = &state.registers[*start_reg + 1];
                 let scale_reg = &state.registers[*start_reg + 2];
@@ -5908,7 +5910,7 @@ pub fn op_function(
                 state.registers[*dest] = Register::Value(result);
             }
             ScalarFunc::NumericDecode => {
-                assert!(arg_count == 1);
+                debug_assert!(arg_count == 1);
                 let val = &state.registers[*start_reg];
                 let result = match val.get_value() {
                     Value::Null => Value::Null,
@@ -5928,7 +5930,7 @@ pub fn op_function(
             | ScalarFunc::NumericSub
             | ScalarFunc::NumericMul
             | ScalarFunc::NumericDiv => {
-                assert!(arg_count == 2);
+                debug_assert!(arg_count == 2);
                 let lhs_val = state.registers[*start_reg].get_value().clone();
                 let rhs_val = state.registers[*start_reg + 1].get_value().clone();
                 let result = match (&lhs_val, &rhs_val) {
@@ -5957,7 +5959,7 @@ pub fn op_function(
                 state.registers[*dest] = Register::Value(result);
             }
             ScalarFunc::NumericLt | ScalarFunc::NumericEq => {
-                assert!(arg_count == 2);
+                debug_assert!(arg_count == 2);
                 let lhs_val = state.registers[*start_reg].get_value().clone();
                 let rhs_val = state.registers[*start_reg + 1].get_value().clone();
                 let result = match (&lhs_val, &rhs_val) {

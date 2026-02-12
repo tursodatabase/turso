@@ -90,33 +90,7 @@ impl TursoTypesCursor {
                 } else {
                     format!("{}({})", td.name, td.params.join(", "))
                 };
-                // Reconstruct the CREATE TYPE SQL
-                let mut sql = if td.params.is_empty() {
-                    format!("CREATE TYPE {} BASE {}", td.name, td.base)
-                } else {
-                    format!(
-                        "CREATE TYPE {}({}) BASE {}",
-                        td.name,
-                        td.params.join(", "),
-                        td.base
-                    )
-                };
-                if let Some(ref encode) = td.encode {
-                    sql.push_str(&format!(" ENCODE {encode}"));
-                }
-                if let Some(ref decode) = td.decode {
-                    sql.push_str(&format!(" DECODE {decode}"));
-                }
-                if let Some(ref default) = td.default {
-                    sql.push_str(&format!(" DEFAULT {default}"));
-                }
-                for op in &td.operators {
-                    sql.push_str(&format!(
-                        " OPERATOR '{}' ({}) -> {}",
-                        op.op, op.right_type, op.func_name
-                    ));
-                }
-                self.entries.push((display_name, sql));
+                self.entries.push((display_name, td.to_sql()));
             }
         });
     }
