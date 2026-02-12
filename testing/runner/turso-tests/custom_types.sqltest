@@ -385,3 +385,39 @@ test custom-type-not-null-constraint {
 expect error {
     NOT NULL constraint failed
 }
+
+@requires strict "uses STRICT tables"
+test update-non-set-column-not-re-encoded {
+    CREATE TYPE test_reverse BASE text ENCODE test_reverse_encode(value) DECODE test_reverse_decode(value);
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, name TEXT, val test_reverse) STRICT;
+    INSERT INTO t1 VALUES (1, 'hello', 'world');
+    UPDATE t1 SET name = 'goodbye' WHERE id = 1;
+    SELECT id, name, val FROM t1;
+}
+expect {
+    1|goodbye|world
+}
+
+@requires strict "uses STRICT tables"
+test upsert-do-update-encodes {
+    CREATE TYPE test_reverse BASE text ENCODE test_reverse_encode(value) DECODE test_reverse_decode(value);
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_reverse) STRICT;
+    INSERT INTO t1 VALUES (1, 'hello');
+    INSERT INTO t1 VALUES (1, 'ignored') ON CONFLICT(id) DO UPDATE SET val = 'updated';
+    SELECT id, val FROM t1;
+}
+expect {
+    1|updated
+}
+
+@requires strict "uses STRICT tables"
+test upsert-non-set-column-not-re-encoded {
+    CREATE TYPE test_reverse BASE text ENCODE test_reverse_encode(value) DECODE test_reverse_decode(value);
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, name TEXT, val test_reverse) STRICT;
+    INSERT INTO t1 VALUES (1, 'hello', 'world');
+    INSERT INTO t1 VALUES (1, 'x', 'y') ON CONFLICT(id) DO UPDATE SET name = 'changed';
+    SELECT id, name, val FROM t1;
+}
+expect {
+    1|changed|world
+}

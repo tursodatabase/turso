@@ -3405,5 +3405,6 @@ fn emit_custom_type_encode(
         resolver,
         &columns,
         insertion.first_col_register(),
+        None, // INSERT: encode all columns
     )
 }
