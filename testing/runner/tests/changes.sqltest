@@ -60,6 +60,18 @@ expect {
 }
 
 @skip-if mvcc "changes not supported in MVCC mode"
+test changes-delete-doesnt-track-indexes {
+    create table t (a int);
+    create index idx on t(a);
+    insert into t values (1), (2);
+    delete from t where a < 3;
+    select changes();
+}
+expect {
+    2
+}
+
+@skip-if mvcc "changes not supported in MVCC mode"
 test changes-on-delete {
     create table temp (t1 integer, primary key (t1));
     insert into temp values (1), (2), (3), (4), (5);
