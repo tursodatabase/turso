@@ -470,6 +470,12 @@ pub enum ScalarFunc {
     TestUintEq,
     TestReverseEncode,
     TestReverseDecode,
+    // Built-in type support functions
+    BooleanToInt,
+    IntToBoolean,
+    CheckTextMaxlen,
+    CheckIntRange,
+    ValidateIpAddr,
 }
 
 impl Deterministic for ScalarFunc {
@@ -547,6 +553,11 @@ impl Deterministic for ScalarFunc {
             | ScalarFunc::TestUintEq
             | ScalarFunc::TestReverseEncode
             | ScalarFunc::TestReverseDecode => true,
+            ScalarFunc::BooleanToInt
+            | ScalarFunc::IntToBoolean
+            | ScalarFunc::CheckTextMaxlen
+            | ScalarFunc::CheckIntRange
+            | ScalarFunc::ValidateIpAddr => true,
         }
     }
 }
@@ -626,6 +637,11 @@ impl Display for ScalarFunc {
             Self::TestUintEq => "test_uint_eq",
             Self::TestReverseEncode => "test_reverse_encode",
             Self::TestReverseDecode => "test_reverse_decode",
+            Self::BooleanToInt => "boolean_to_int",
+            Self::IntToBoolean => "int_to_boolean",
+            Self::CheckTextMaxlen => "check_text_maxlen",
+            Self::CheckIntRange => "check_int_range",
+            Self::ValidateIpAddr => "validate_ipaddr",
         };
         write!(f, "{str}")
     }
@@ -726,6 +742,10 @@ impl ScalarFunc {
             | Self::TestUintDiv
             | Self::TestUintLt
             | Self::TestUintEq => &[2],
+            // Built-in type functions
+            Self::BooleanToInt | Self::IntToBoolean | Self::ValidateIpAddr => &[1],
+            Self::CheckTextMaxlen => &[2],
+            Self::CheckIntRange => &[3],
         }
     }
 }
@@ -1201,6 +1221,12 @@ impl Func {
             "test_uint_eq" => Ok(Self::Scalar(ScalarFunc::TestUintEq)),
             "test_reverse_encode" => Ok(Self::Scalar(ScalarFunc::TestReverseEncode)),
             "test_reverse_decode" => Ok(Self::Scalar(ScalarFunc::TestReverseDecode)),
+            // Built-in type support functions
+            "boolean_to_int" => Ok(Self::Scalar(ScalarFunc::BooleanToInt)),
+            "int_to_boolean" => Ok(Self::Scalar(ScalarFunc::IntToBoolean)),
+            "check_text_maxlen" => Ok(Self::Scalar(ScalarFunc::CheckTextMaxlen)),
+            "check_int_range" => Ok(Self::Scalar(ScalarFunc::CheckIntRange)),
+            "validate_ipaddr" => Ok(Self::Scalar(ScalarFunc::ValidateIpAddr)),
             _ => crate::bail_parse_error!("no such function: {}", name),
         }
     }

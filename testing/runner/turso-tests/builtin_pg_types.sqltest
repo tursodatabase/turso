@@ -1,0 +1,246 @@
+@database :memory:
+
+@requires strict "uses STRICT tables"
+test boolean-insert-text {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val boolean) STRICT;
+    INSERT INTO t1 VALUES (1, 'true');
+    INSERT INTO t1 VALUES (2, 'false');
+    INSERT INTO t1 VALUES (3, 't');
+    INSERT INTO t1 VALUES (4, 'f');
+    INSERT INTO t1 VALUES (5, 'yes');
+    INSERT INTO t1 VALUES (6, 'no');
+    SELECT id, val FROM t1;
+}
+expect {
+    1|true
+    2|false
+    3|true
+    4|false
+    5|true
+    6|false
+}
+
+@requires strict "uses STRICT tables"
+test boolean-insert-int {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val boolean) STRICT;
+    INSERT INTO t1 VALUES (1, 1);
+    INSERT INTO t1 VALUES (2, 0);
+    SELECT id, val FROM t1;
+}
+expect {
+    1|true
+    2|false
+}
+
+@requires strict "uses STRICT tables"
+test boolean-alias-bool {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val bool) STRICT;
+    INSERT INTO t1 VALUES (1, 'on');
+    INSERT INTO t1 VALUES (2, 'off');
+    SELECT id, val FROM t1;
+}
+expect {
+    1|true
+    2|false
+}
+
+@requires strict "uses STRICT tables"
+test boolean-invalid {
+    CREATE TABLE t1(val boolean) STRICT;
+    INSERT INTO t1 VALUES ('maybe');
+}
+expect error {
+}
+
+@requires strict "uses STRICT tables"
+test boolean-null {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val boolean) STRICT;
+    INSERT INTO t1 VALUES (1, NULL);
+    SELECT id, COALESCE(val, 'IS_NULL') FROM t1;
+}
+expect {
+    1|IS_NULL
+}
+
+@requires strict "uses STRICT tables"
+test varchar-valid {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, name varchar(10)) STRICT;
+    INSERT INTO t1 VALUES (1, 'hello');
+    INSERT INTO t1 VALUES (2, 'world12345');
+    SELECT id, name FROM t1;
+}
+expect {
+    1|hello
+    2|world12345
+}
+
+@requires strict "uses STRICT tables"
+test varchar-too-long {
+    CREATE TABLE t1(name varchar(3)) STRICT;
+    INSERT INTO t1 VALUES ('toolong');
+}
+expect error {
+}
+
+@requires strict "uses STRICT tables"
+test varchar-null {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, name varchar(5)) STRICT;
+    INSERT INTO t1 VALUES (1, NULL);
+    SELECT id, COALESCE(name, 'IS_NULL') FROM t1;
+}
+expect {
+    1|IS_NULL
+}
+
+@requires strict "uses STRICT tables"
+test date-valid {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, d date) STRICT;
+    INSERT INTO t1 VALUES (1, '2024-01-15');
+    SELECT id, d FROM t1;
+}
+expect {
+    1|2024-01-15
+}
+
+@requires strict "uses STRICT tables"
+test time-valid {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, t time) STRICT;
+    INSERT INTO t1 VALUES (1, '14:30:00');
+    SELECT id, t FROM t1;
+}
+expect {
+    1|14:30:00
+}
+
+@requires strict "uses STRICT tables"
+test timestamp-valid {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, ts timestamp) STRICT;
+    INSERT INTO t1 VALUES (1, '2024-01-15 14:30:00');
+    SELECT id, ts FROM t1;
+}
+expect {
+    1|2024-01-15 14:30:00
+}
+
+@requires strict "uses STRICT tables"
+test smallint-valid {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val smallint) STRICT;
+    INSERT INTO t1 VALUES (1, 32767);
+    INSERT INTO t1 VALUES (2, -32768);
+    INSERT INTO t1 VALUES (3, 0);
+    SELECT id, val FROM t1;
+}
+expect {
+    1|32767
+    2|-32768
+    3|0
+}
+
+@requires strict "uses STRICT tables"
+test smallint-overflow {
+    CREATE TABLE t1(val smallint) STRICT;
+    INSERT INTO t1 VALUES (32768);
+}
+expect error {
+}
+
+@requires strict "uses STRICT tables"
+test smallint-underflow {
+    CREATE TABLE t1(val smallint) STRICT;
+    INSERT INTO t1 VALUES (-32769);
+}
+expect error {
+}
+
+@requires strict "uses STRICT tables"
+test smallint-alias-int2 {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val int2) STRICT;
+    INSERT INTO t1 VALUES (1, 100);
+    SELECT id, val FROM t1;
+}
+expect {
+    1|100
+}
+
+@requires strict "uses STRICT tables"
+test bigint-valid {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val bigint) STRICT;
+    INSERT INTO t1 VALUES (1, 9223372036854775807);
+    SELECT id, val FROM t1;
+}
+expect {
+    1|9223372036854775807
+}
+
+@requires strict "uses STRICT tables"
+test bigint-alias-int8 {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val int8) STRICT;
+    INSERT INTO t1 VALUES (1, 42);
+    SELECT id, val FROM t1;
+}
+expect {
+    1|42
+}
+
+@requires strict "uses STRICT tables"
+test inet-valid-ipv4 {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, addr inet) STRICT;
+    INSERT INTO t1 VALUES (1, '192.168.1.1');
+    INSERT INTO t1 VALUES (2, '10.0.0.1');
+    SELECT id, addr FROM t1;
+}
+expect {
+    1|192.168.1.1
+    2|10.0.0.1
+}
+
+@requires strict "uses STRICT tables"
+test inet-valid-ipv6 {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, addr inet) STRICT;
+    INSERT INTO t1 VALUES (1, '::1');
+    SELECT id, addr FROM t1;
+}
+expect {
+    1|::1
+}
+
+@requires strict "uses STRICT tables"
+test inet-invalid {
+    CREATE TABLE t1(addr inet) STRICT;
+    INSERT INTO t1 VALUES ('not-an-ip');
+}
+expect error {
+}
+
+@requires strict "uses STRICT tables"
+test bytea-valid {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, data bytea) STRICT;
+    INSERT INTO t1 VALUES (1, x'DEADBEEF');
+    SELECT id, hex(data) FROM t1;
+}
+expect {
+    1|DEADBEEF
+}
+
+@requires strict "uses STRICT tables"
+test drop-builtin-type-fails {
+    DROP TYPE boolean;
+}
+expect error {
+}
+
+@requires strict "uses STRICT tables"
+test create-conflicting-type-fails {
+    CREATE TYPE boolean BASE text;
+}
+expect error {
+}
+
+@requires strict "uses STRICT tables"
+test create-if-not-exists-builtin-ok {
+    CREATE TYPE IF NOT EXISTS boolean BASE integer;
+    SELECT 'ok';
+}
+expect {
+    ok
+}
