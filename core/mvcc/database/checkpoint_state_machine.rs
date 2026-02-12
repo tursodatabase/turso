@@ -388,11 +388,15 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                                     sqlite_schema_rowid,
                                 });
                             } else {
-                                panic!("Unexpected modify operation on existing index with root page {root_page}");
+                                panic!(
+                                    "Unexpected modify operation on existing index with root page {root_page}"
+                                );
                             }
                         } else if type_str.as_str() == "table" {
                             // This is a table schema change (existing logic)
-                            tracing::trace!("table schema change with root page {root_page}, is_delete={is_delete}");
+                            tracing::trace!(
+                                "table schema change with root page {root_page}, is_delete={is_delete}"
+                            );
                             if is_delete {
                                 if root_page < 0 {
                                     // Table was never checkpointed - derive table_id directly from root_page.
@@ -720,7 +724,10 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                             let known_root_page = known_root_page
                                 .value()
                                 .expect("Table ID does not have a root page");
-                            assert_eq!(known_root_page, root_page, "MV store root page does not match root page in the sqlite_schema record: {known_root_page} != {root_page}");
+                            assert_eq!(
+                                known_root_page, root_page,
+                                "MV store root page does not match root page in the sqlite_schema record: {known_root_page} != {root_page}"
+                            );
                             let cursor = if let Some(cursor) = self.cursors.get(&known_root_page) {
                                 cursor.clone()
                             } else {
@@ -745,7 +752,10 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                                 Some(created_root_page as u64),
                             );
                             // Index struct should already be stored in index_id_to_index from collect_committed_versions
-                            assert!(self.index_id_to_index.contains_key(&index_id), "Index struct for index_id {index_id} must be stored before creating btree");
+                            assert!(
+                                self.index_id_to_index.contains_key(&index_id),
+                                "Index struct for index_id {index_id} must be stored before creating btree"
+                            );
                         }
                         SpecialWrite::BTreeDestroyIndex {
                             index_id,

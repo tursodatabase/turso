@@ -12,7 +12,7 @@ use crate::storage::btree::{
 use crate::storage::database::DatabaseFile;
 use crate::storage::journal_mode;
 use crate::storage::page_cache::PageCache;
-use crate::storage::pager::{default_page1, CreateBTreeFlags, PageRef};
+use crate::storage::pager::{default_page1, CreateBTreeFlags, PageRef, SavepointResult};
 use crate::storage::sqlite3_ondisk::{DatabaseHeader, PageSize, RawVersion};
 use crate::translate::collate::CollationSeq;
 use crate::types::{
@@ -2547,9 +2547,6 @@ pub fn op_savepoint(
     match *op {
         SavepointOp::Begin => {
             let starts_transaction = conn.auto_commit.load(Ordering::SeqCst);
-            if starts_transaction {
-                conn.auto_commit.store(false, Ordering::SeqCst);
-            }
 
             if let Some(mv_store) = mv_store.as_ref() {
                 let tx_id = if let Some(tx_id) = conn.get_mv_tx_id() {
@@ -2569,6 +2566,10 @@ pub fn op_savepoint(
                 pager.open_named_savepoint(name.clone(), db_size, starts_transaction)?;
             }
 
+            if starts_transaction {
+                conn.auto_commit.store(false, Ordering::SeqCst);
+            }
+
             state.pc += 1;
             Ok(InsnFunctionStepResult::Step)
         }
@@ -2576,22 +2577,26 @@ pub fn op_savepoint(
             let release_result = if let Some(mv_store) = mv_store.as_ref() {
                 match conn.get_mv_tx_id() {
                     Some(tx_id) => mv_store.release_named_savepoint(tx_id, name)?,
-                    None => None,
+                    None => SavepointResult::NotFound,
                 }
             } else {
                 pager.release_named_savepoint(name)?
             };
-
-            let Some(commits_transaction) = release_result else {
-                return Err(LimboError::TxError(format!("no such savepoint: {name}")));
-            };
-
-            if commits_transaction {
-                let auto_commit = Insn::AutoCommit {
-                    auto_commit: true,
-                    rollback: false,
-                };
-                return op_auto_commit(program, state, &auto_commit, pager);
+            match release_result {
+                SavepointResult::NotFound => {
+                    return Err(LimboError::TxError(format!("no such savepoint: {name}")));
+                }
+                SavepointResult::Release => {
+                    // Savepoint released successfully, just continue
+                }
+                SavepointResult::Commit => {
+                    // This means that releasing the savepoint caused the transaction to commit, so we need to auto-commit here.
+                    let auto_commit = Insn::AutoCommit {
+                        auto_commit: true,
+                        rollback: false,
+                    };
+                    return op_auto_commit(program, state, &auto_commit, pager);
+                }
             }
 
             state.pc += 1;
@@ -3440,7 +3445,9 @@ pub fn seek_internal(
                                     .as_btree_mut();
                                 let record = match &registers[*record_reg] {
                                     Register::Record(ref record) => record,
-                                    _ => unreachable!("op_seek: record_reg should be a Record register when OpSeekKey::IndexKeyFromRegister is used"),
+                                    _ => unreachable!(
+                                        "op_seek: record_reg should be a Record register when OpSeekKey::IndexKeyFromRegister is used"
+                                    ),
                                 };
                                 (cursor, record)
                             };
@@ -5490,7 +5497,7 @@ pub fn op_function(
                             None => {
                                 return Err(LimboError::InvalidArgument(format!(
                                     "table_columns_json_array: table {table} doesn't exists"
-                                )))
+                                )));
                             }
                         }
                     };
@@ -6650,7 +6657,10 @@ pub fn op_insert(
                     continue;
                 }
 
-                turso_assert!(!flag.has(InsertFlags::REQUIRE_SEEK), "to capture old record accurately, we must be located at the correct position in the table");
+                turso_assert!(
+                    !flag.has(InsertFlags::REQUIRE_SEEK),
+                    "to capture old record accurately, we must be located at the correct position in the table"
+                );
 
                 // Get the key we're going to insert
                 let insert_key = match &state.registers[*key_reg].get_value() {
@@ -8413,7 +8423,7 @@ pub fn op_populate_materialized_views(
                 _ => {
                     return Err(LimboError::InternalError(
                         "Expected BTree cursor for materialized view".into(),
-                    ))
+                    ));
                 }
             };
 
@@ -8447,7 +8457,7 @@ pub fn op_populate_materialized_views(
                 _ => {
                     return Err(LimboError::InternalError(
                         "Expected BTree cursor for materialized view population".into(),
-                    ))
+                    ));
                 }
             };
 
@@ -8528,13 +8538,21 @@ pub fn op_set_cookie(
                 Cookie::SchemaVersion => {
                     // we update transaction state to indicate that the schema has changed
                     match program.connection.get_tx_state() {
-                    TransactionState::Write { .. } => {
-                        program.connection.set_tx_state(TransactionState::Write { schema_did_change: true });
-                    },
-                    TransactionState::Read => unreachable!("invalid transaction state for SetCookie: TransactionState::Read, should be write"),
-                    TransactionState::None => unreachable!("invalid transaction state for SetCookie: TransactionState::None, should be write"),
-                    TransactionState::PendingUpgrade { .. } => unreachable!("invalid transaction state for SetCookie: TransactionState::PendingUpgrade, should be write"),
-                }
+                        TransactionState::Write { .. } => {
+                            program.connection.set_tx_state(TransactionState::Write {
+                                schema_did_change: true,
+                            });
+                        }
+                        TransactionState::Read => unreachable!(
+                            "invalid transaction state for SetCookie: TransactionState::Read, should be write"
+                        ),
+                        TransactionState::None => unreachable!(
+                            "invalid transaction state for SetCookie: TransactionState::None, should be write"
+                        ),
+                        TransactionState::PendingUpgrade { .. } => unreachable!(
+                            "invalid transaction state for SetCookie: TransactionState::PendingUpgrade, should be write"
+                        ),
+                    }
                     program
                         .connection
                         .with_schema_mut(|schema| schema.schema_version = *value as u32);
@@ -9468,7 +9486,10 @@ pub fn op_integrity_check(
                         auto_vacuum_mode,
                         crate::storage::pager::AutoVacuumMode::None
                     ) {
-                        tracing::debug!("Integrity check: auto-vacuum mode detected ({:?}). Scanning for pointer-map pages.", auto_vacuum_mode);
+                        tracing::debug!(
+                            "Integrity check: auto-vacuum mode detected ({:?}). Scanning for pointer-map pages.",
+                            auto_vacuum_mode
+                        );
                         let page_size = pager.get_page_size_unchecked().get() as usize;
 
                         for page_number in 2..=integrity_check_state.db_size {
@@ -9476,7 +9497,10 @@ pub fn op_integrity_check(
                                 page_number as u32,
                                 page_size,
                             ) {
-                                tracing::debug!("Integrity check: Found and marking pointer-map page as visited: page_id={}", page_number);
+                                tracing::debug!(
+                                    "Integrity check: Found and marking pointer-map page as visited: page_id={}",
+                                    page_number
+                                );
 
                                 integrity_check_state.start(
                                     page_number as i64,
@@ -12563,7 +12587,9 @@ mod tests {
                     );
                 }
                 other => {
-                    panic!("String '{input}' should be converted to integer {expected_int}, got {other:?}");
+                    panic!(
+                        "String '{input}' should be converted to integer {expected_int}, got {other:?}"
+                    );
                 }
             }
         }
