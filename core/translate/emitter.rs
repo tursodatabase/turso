@@ -3572,13 +3572,16 @@ fn emit_update_insns<'a>(
     // This ensures that if a constraint fails, indexes remain consistent.
     if let Some(btree_table) = target_table.table.btree() {
         if btree_table.is_strict {
-            // Encode values for columns with custom types before TypeCheck,
-            // so that constraints are validated on the encoded result.
+            // Encode only SET clause columns. Non-SET columns were read from disk
+            // and are already encoded; re-encoding them would corrupt data.
+            let set_col_indices: std::collections::HashSet<usize> =
+                set_clauses.iter().map(|(idx, _)| *idx).collect();
             crate::translate::expr::emit_custom_type_encode_columns(
                 program,
                 &t_ctx.resolver,
                 &btree_table.columns,
                 start,
+                Some(&set_col_indices),
             )?;
 
             program.emit_insn(Insn::TypeCheck {

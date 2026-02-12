@@ -507,6 +507,18 @@ pub fn emit_upsert(
 
     if let Some(bt) = table.btree() {
         if bt.is_strict {
+            // Encode only SET clause columns. Non-SET columns were copied from
+            // the current row and are already encoded.
+            let set_col_indices: std::collections::HashSet<usize> =
+                set_pairs.iter().map(|(idx, _)| *idx).collect();
+            crate::translate::expr::emit_custom_type_encode_columns(
+                program,
+                resolver,
+                &bt.columns,
+                new_start,
+                Some(&set_col_indices),
+            )?;
+
             program.emit_insn(Insn::TypeCheck {
                 start_reg: new_start,
                 count: num_cols,

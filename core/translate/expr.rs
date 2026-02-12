@@ -6132,15 +6132,25 @@ pub(crate) fn emit_type_expr(
     result
 }
 
-/// Emit encode expressions for all columns with custom types in a contiguous register range.
-/// Used by both INSERT and UPDATE paths to encode values before TypeCheck.
+/// Emit encode expressions for columns with custom types in a contiguous register range.
+/// Used by INSERT, UPDATE, and UPSERT paths to encode values before TypeCheck.
+///
+/// If `only_columns` is `Some`, only encode columns whose index is in the set.
+/// This is needed for UPDATE/UPSERT where non-SET columns are already encoded
+/// (read from disk), and re-encoding them would corrupt data.
 pub(crate) fn emit_custom_type_encode_columns(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
     columns: &[crate::schema::Column],
     start_reg: usize,
+    only_columns: Option<&std::collections::HashSet<usize>>,
 ) -> Result<()> {
     for (i, col) in columns.iter().enumerate() {
+        if let Some(filter) = only_columns {
+            if !filter.contains(&i) {
+                continue;
+            }
+        }
         let type_name = &col.ty_str;
         if type_name.is_empty() {
             continue;
