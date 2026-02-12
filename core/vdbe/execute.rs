@@ -42,8 +42,8 @@ use crate::vector::{
 };
 use crate::{
     error::{
-        LimboError, SQLITE_CONSTRAINT, SQLITE_CONSTRAINT_CHECK, SQLITE_CONSTRAINT_NOTNULL,
-        SQLITE_CONSTRAINT_PRIMARYKEY,
+        LimboError, SQLITE_CONSTRAINT, SQLITE_CONSTRAINT_CHECK, SQLITE_CONSTRAINT_FOREIGNKEY,
+        SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY,
     },
     ext::ExtValue,
     function::{AggFunc, ExtFunc, MathFunc, MathFuncArity, ScalarFunc, VectorFunc},
@@ -1933,6 +1933,9 @@ pub fn halt(
         SQLITE_CONSTRAINT_UNIQUE => Some(LimboError::Constraint(format!(
             "UNIQUE constraint failed: {description} (19)"
         ))),
+        SQLITE_CONSTRAINT_FOREIGNKEY => Some(LimboError::ForeignKeyConstraint(
+            description.to_string(),
+        )),
         _ => Some(LimboError::Constraint(format!(
             "undocumented halt error code {description}"
         ))),
