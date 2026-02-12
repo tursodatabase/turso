@@ -45,6 +45,7 @@ fn upper_integer(bencher: Bencher) {
 // Length Functions
 // =============================================================================
 
+#[cfg(feature = "nanosecond-bench")]
 #[divan::bench]
 fn length_short_text(bencher: Bencher) {
     let value = Value::build_text("hello");
@@ -75,18 +76,21 @@ fn length_float(bencher: Bencher) {
     bencher.bench_local(|| black_box(black_box(&value).exec_length()));
 }
 
+#[cfg(feature = "nanosecond-bench")]
 #[divan::bench]
 fn length_blob(bencher: Bencher) {
     let value = Value::Blob(vec![0u8; 100]);
     bencher.bench_local(|| black_box(black_box(&value).exec_length()));
 }
 
+#[cfg(feature = "nanosecond-bench")]
 #[divan::bench]
 fn octet_length_text(bencher: Bencher) {
     let value = Value::build_text("héllo wörld");
     bencher.bench_local(|| black_box(black_box(&value).exec_octet_length()));
 }
 
+#[cfg(feature = "nanosecond-bench")]
 #[divan::bench]
 fn octet_length_unicode(bencher: Bencher) {
     let value = Value::build_text("你好世界");
@@ -235,6 +239,7 @@ fn instr_not_found(bencher: Bencher) {
     bencher.bench_local(|| black_box(black_box(&value).exec_instr(black_box(&pattern))));
 }
 
+#[cfg(feature = "nanosecond-bench")]
 #[divan::bench]
 fn instr_blob(bencher: Bencher) {
     let value = Value::Blob(vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
@@ -316,6 +321,7 @@ fn quote_blob(bencher: Bencher) {
     bencher.bench_local(|| black_box(black_box(&value).exec_quote()));
 }
 
+#[cfg(feature = "nanosecond-bench")]
 #[divan::bench]
 fn quote_null(bencher: Bencher) {
     let value = Value::Null;
@@ -338,6 +344,7 @@ fn soundex_complex(bencher: Bencher) {
     bencher.bench_local(|| black_box(black_box(&value).exec_soundex()));
 }
 
+#[cfg(feature = "nanosecond-bench")]
 #[divan::bench]
 fn soundex_non_ascii(bencher: Bencher) {
     let value = Value::build_text("闪电五连鞭");
@@ -348,30 +355,35 @@ fn soundex_non_ascii(bencher: Bencher) {
 // Type Functions
 // =============================================================================
 
+#[cfg(feature = "nanosecond-bench")]
 #[divan::bench]
 fn typeof_integer(bencher: Bencher) {
     let value = Value::from_i64(12345);
     bencher.bench_local(|| black_box(black_box(&value).exec_typeof()));
 }
 
+#[cfg(feature = "nanosecond-bench")]
 #[divan::bench]
 fn typeof_float(bencher: Bencher) {
     let value = Value::from_f64(123.456);
     bencher.bench_local(|| black_box(black_box(&value).exec_typeof()));
 }
 
+#[cfg(feature = "nanosecond-bench")]
 #[divan::bench]
 fn typeof_text(bencher: Bencher) {
     let value = Value::build_text("hello");
     bencher.bench_local(|| black_box(black_box(&value).exec_typeof()));
 }
 
+#[cfg(feature = "nanosecond-bench")]
 #[divan::bench]
 fn typeof_blob(bencher: Bencher) {
     let value = Value::Blob(vec![1, 2, 3]);
     bencher.bench_local(|| black_box(black_box(&value).exec_typeof()));
 }
 
+#[cfg(feature = "nanosecond-bench")]
 #[divan::bench]
 fn typeof_null(bencher: Bencher) {
     let value = Value::Null;
@@ -479,18 +491,21 @@ fn unicode_cjk(bencher: Bencher) {
 // Numeric Functions
 // =============================================================================
 
+#[cfg(feature = "nanosecond-bench")]
 #[divan::bench]
 fn abs_positive_integer(bencher: Bencher) {
     let value = Value::from_i64(12345);
     bencher.bench_local(|| black_box(black_box(&value).exec_abs()));
 }
 
+#[cfg(feature = "nanosecond-bench")]
 #[divan::bench]
 fn abs_negative_integer(bencher: Bencher) {
     let value = Value::from_i64(-12345);
     bencher.bench_local(|| black_box(black_box(&value).exec_abs()));
 }
 
+#[cfg(feature = "nanosecond-bench")]
 #[divan::bench]
 fn abs_float(bencher: Bencher) {
     let value = Value::from_f64(-123.456);
@@ -503,24 +518,28 @@ fn abs_text_numeric(bencher: Bencher) {
     bencher.bench_local(|| black_box(black_box(&value).exec_abs()));
 }
 
+#[cfg(feature = "nanosecond-bench")]
 #[divan::bench]
 fn sign_positive(bencher: Bencher) {
     let value = Value::from_i64(42);
     bencher.bench_local(|| black_box(black_box(&value).exec_sign()));
 }
 
+#[cfg(feature = "nanosecond-bench")]
 #[divan::bench]
 fn sign_negative(bencher: Bencher) {
     let value = Value::from_i64(-42);
     bencher.bench_local(|| black_box(black_box(&value).exec_sign()));
 }
 
+#[cfg(feature = "nanosecond-bench")]
 #[divan::bench]
 fn sign_zero(bencher: Bencher) {
     let value = Value::from_i64(0);
     bencher.bench_local(|| black_box(black_box(&value).exec_sign()));
 }
 
+#[cfg(feature = "nanosecond-bench")]
 #[divan::bench]
 fn sign_float(bencher: Bencher) {
     let value = Value::from_f64(-42.5);
@@ -531,6 +550,7 @@ fn sign_float(bencher: Bencher) {
 // Round Function
 // =============================================================================
 
+#[cfg(feature = "nanosecond-bench")]
 #[divan::bench]
 fn round_no_precision(bencher: Bencher) {
     let value = Value::from_f64(123.456);
@@ -579,6 +599,7 @@ fn log_arbitrary_base(bencher: Bencher) {
 // Arithmetic Operations
 // =============================================================================
 
+#[cfg(feature = "nanosecond-bench")]
 #[divan::bench]
 fn add_integers(bencher: Bencher) {
     let a = Value::from_i64(1000);
@@ -586,6 +607,7 @@ fn add_integers(bencher: Bencher) {
     bencher.bench_local(|| black_box(black_box(&a).exec_add(black_box(&b))));
 }
 
+#[cfg(feature = "nanosecond-bench")]
 #[divan::bench]
 fn add_floats(bencher: Bencher) {
     let a = Value::from_f64(100.5);
@@ -593,6 +615,7 @@ fn add_floats(bencher: Bencher) {
     bencher.bench_local(|| black_box(black_box(&a).exec_add(black_box(&b))));
 }
 
+#[cfg(feature = "nanosecond-bench")]
 #[divan::bench]
 fn add_mixed(bencher: Bencher) {
     let a = Value::from_i64(100);
@@ -600,6 +623,7 @@ fn add_mixed(bencher: Bencher) {
     bencher.bench_local(|| black_box(black_box(&a).exec_add(black_box(&b))));
 }
 
+#[cfg(feature = "nanosecond-bench")]
 #[divan::bench]
 fn subtract_integers(bencher: Bencher) {
     let a = Value::from_i64(2000);
@@ -607,6 +631,7 @@ fn subtract_integers(bencher: Bencher) {
     bencher.bench_local(|| black_box(black_box(&a).exec_subtract(black_box(&b))));
 }
 
+#[cfg(feature = "nanosecond-bench")]
 #[divan::bench]
 fn multiply_integers(bencher: Bencher) {
     let a = Value::from_i64(100);
@@ -614,6 +639,7 @@ fn multiply_integers(bencher: Bencher) {
     bencher.bench_local(|| black_box(black_box(&a).exec_multiply(black_box(&b))));
 }
 
+#[cfg(feature = "nanosecond-bench")]
 #[divan::bench]
 fn divide_integers(bencher: Bencher) {
     let a = Value::from_i64(1000);
@@ -621,6 +647,7 @@ fn divide_integers(bencher: Bencher) {
     bencher.bench_local(|| black_box(black_box(&a).exec_divide(black_box(&b))));
 }
 
+#[cfg(feature = "nanosecond-bench")]
 #[divan::bench]
 fn remainder_integers(bencher: Bencher) {
     let a = Value::from_i64(17);
@@ -632,6 +659,7 @@ fn remainder_integers(bencher: Bencher) {
 // Bitwise Operations
 // =============================================================================
 
+#[cfg(feature = "nanosecond-bench")]
 #[divan::bench]
 fn bit_and(bencher: Bencher) {
     let a = Value::from_i64(0b11110000);
@@ -639,6 +667,7 @@ fn bit_and(bencher: Bencher) {
     bencher.bench_local(|| black_box(black_box(&a).exec_bit_and(black_box(&b))));
 }
 
+#[cfg(feature = "nanosecond-bench")]
 #[divan::bench]
 fn bit_or(bencher: Bencher) {
     let a = Value::from_i64(0b11110000);
@@ -646,12 +675,14 @@ fn bit_or(bencher: Bencher) {
     bencher.bench_local(|| black_box(black_box(&a).exec_bit_or(black_box(&b))));
 }
 
+#[cfg(feature = "nanosecond-bench")]
 #[divan::bench]
 fn bit_not(bencher: Bencher) {
     let a = Value::from_i64(0b11110000);
     bencher.bench_local(|| black_box(black_box(&a).exec_bit_not()));
 }
 
+#[cfg(feature = "nanosecond-bench")]
 #[divan::bench]
 fn shift_left(bencher: Bencher) {
     let a = Value::from_i64(1);
@@ -659,6 +690,7 @@ fn shift_left(bencher: Bencher) {
     bencher.bench_local(|| black_box(black_box(&a).exec_shift_left(black_box(&b))));
 }
 
+#[cfg(feature = "nanosecond-bench")]
 #[divan::bench]
 fn shift_right(bencher: Bencher) {
     let a = Value::from_i64(256);
@@ -670,18 +702,21 @@ fn shift_right(bencher: Bencher) {
 // Boolean Operations
 // =============================================================================
 
+#[cfg(feature = "nanosecond-bench")]
 #[divan::bench]
 fn boolean_not_true(bencher: Bencher) {
     let value = Value::from_i64(1);
     bencher.bench_local(|| black_box(black_box(&value).exec_boolean_not()));
 }
 
+#[cfg(feature = "nanosecond-bench")]
 #[divan::bench]
 fn boolean_not_false(bencher: Bencher) {
     let value = Value::from_i64(0);
     bencher.bench_local(|| black_box(black_box(&value).exec_boolean_not()));
 }
 
+#[cfg(feature = "nanosecond-bench")]
 #[divan::bench]
 fn and_true_true(bencher: Bencher) {
     let a = Value::from_i64(1);
@@ -689,6 +724,7 @@ fn and_true_true(bencher: Bencher) {
     bencher.bench_local(|| black_box(black_box(&a).exec_and(black_box(&b))));
 }
 
+#[cfg(feature = "nanosecond-bench")]
 #[divan::bench]
 fn and_true_false(bencher: Bencher) {
     let a = Value::from_i64(1);
@@ -696,6 +732,7 @@ fn and_true_false(bencher: Bencher) {
     bencher.bench_local(|| black_box(black_box(&a).exec_and(black_box(&b))));
 }
 
+#[cfg(feature = "nanosecond-bench")]
 #[divan::bench]
 fn or_false_false(bencher: Bencher) {
     let a = Value::from_i64(0);
@@ -703,6 +740,7 @@ fn or_false_false(bencher: Bencher) {
     bencher.bench_local(|| black_box(black_box(&a).exec_or(black_box(&b))));
 }
 
+#[cfg(feature = "nanosecond-bench")]
 #[divan::bench]
 fn or_true_false(bencher: Bencher) {
     let a = Value::from_i64(1);
@@ -783,6 +821,7 @@ fn char_multiple(bencher: Bencher) {
 // Min/Max Functions
 // =============================================================================
 
+#[cfg(feature = "nanosecond-bench")]
 #[divan::bench]
 fn min_integers(bencher: Bencher) {
     let values = [
@@ -795,6 +834,7 @@ fn min_integers(bencher: Bencher) {
     bencher.bench_local(|| black_box(Value::exec_min(black_box(values.iter()))));
 }
 
+#[cfg(feature = "nanosecond-bench")]
 #[divan::bench]
 fn max_integers(bencher: Bencher) {
     let values = [
@@ -831,6 +871,7 @@ fn max_strings(bencher: Bencher) {
 // Nullif Function
 // =============================================================================
 
+#[cfg(feature = "nanosecond-bench")]
 #[divan::bench]
 fn nullif_equal(bencher: Bencher) {
     let a = Value::from_i64(42);
@@ -838,6 +879,7 @@ fn nullif_equal(bencher: Bencher) {
     bencher.bench_local(|| black_box(black_box(&a).exec_nullif(black_box(&b))));
 }
 
+#[cfg(feature = "nanosecond-bench")]
 #[divan::bench]
 fn nullif_not_equal(bencher: Bencher) {
     let a = Value::from_i64(42);
@@ -845,6 +887,7 @@ fn nullif_not_equal(bencher: Bencher) {
     bencher.bench_local(|| black_box(black_box(&a).exec_nullif(black_box(&b))));
 }
 
+#[cfg(feature = "nanosecond-bench")]
 #[divan::bench]
 fn nullif_strings(bencher: Bencher) {
     let a = Value::build_text("hello");
@@ -878,24 +921,28 @@ fn zeroblob_large(bencher: Bencher) {
 // If/Conditional Function
 // =============================================================================
 
+#[cfg(feature = "nanosecond-bench")]
 #[divan::bench]
 fn exec_if_true(bencher: Bencher) {
     let value = Value::from_i64(1);
     bencher.bench_local(|| black_box(black_box(&value).exec_if(false, false)));
 }
 
+#[cfg(feature = "nanosecond-bench")]
 #[divan::bench]
 fn exec_if_false(bencher: Bencher) {
     let value = Value::from_i64(0);
     bencher.bench_local(|| black_box(black_box(&value).exec_if(false, false)));
 }
 
+#[cfg(feature = "nanosecond-bench")]
 #[divan::bench]
 fn exec_if_null(bencher: Bencher) {
     let value = Value::Null;
     bencher.bench_local(|| black_box(black_box(&value).exec_if(true, false)));
 }
 
+#[cfg(feature = "nanosecond-bench")]
 #[divan::bench]
 fn exec_if_not(bencher: Bencher) {
     let value = Value::from_i64(1);
@@ -906,6 +953,7 @@ fn exec_if_not(bencher: Bencher) {
 // LIKE Pattern
 // =============================================================================
 
+#[cfg(feature = "nanosecond-bench")]
 #[divan::bench]
 fn construct_like_exact(bencher: Bencher) {
     bencher.bench_local(|| {
@@ -958,6 +1006,7 @@ fn construct_like_complex(bencher: Bencher) {
 // Random Functions
 // =============================================================================
 
+#[cfg(feature = "nanosecond-bench")]
 #[divan::bench]
 fn exec_random(bencher: Bencher) {
     bencher.bench_local(|| black_box(Value::exec_random(|| 42)));
