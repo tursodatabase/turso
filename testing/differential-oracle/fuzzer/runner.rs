@@ -45,6 +45,8 @@ pub struct SimConfig {
     pub keep_files: bool,
     /// Which SQL generator backend to use.
     pub generator: GeneratorKind,
+    /// Whether to write a coverage report.
+    pub coverage: bool,
     /// Coverage report tree mode.
     pub tree_mode: TreeMode,
 }
@@ -59,6 +61,7 @@ impl Default for SimConfig {
             verbose: false,
             keep_files: false,
             generator: GeneratorKind::default(),
+            coverage: false,
             tree_mode: TreeMode::default(),
         }
     }
@@ -261,9 +264,11 @@ impl Fuzzer {
         if let Err(e) = self.write_sql_file(&executed_sql) {
             tracing::warn!("Failed to write test.sql: {e}");
         }
-        if let Some(cov) = coverage {
-            if let Err(e) = self.write_coverage_report(&cov) {
-                tracing::warn!("Failed to write coverage report: {e}");
+        if self.config.coverage {
+            if let Some(cov) = coverage {
+                if let Err(e) = self.write_coverage_report(&cov) {
+                    tracing::warn!("Failed to write coverage report: {e}");
+                }
             }
         }
         stats.print_table(&self.config);
@@ -547,6 +552,7 @@ mod tests {
             verbose: false,
             keep_files: false,
             generator: GeneratorKind::default(),
+            coverage: false,
             tree_mode: TreeMode::default(),
         };
         let sim = Fuzzer::new(config);
