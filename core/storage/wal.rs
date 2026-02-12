@@ -1019,9 +1019,7 @@ impl WalFile {
                 || cksm2 != last_checksum
                 || ckpt_seq2 != checkpoint_seq
             {
-                tracing::debug!(
-                    "begin_read_tx: shared data changed ({shared_max}, {nbackfills}, {last_checksum:?}, {checkpoint_seq}) != ({mx2}, {nb2}, {cksm2:?}, {ckpt_seq2}), retrying"
-                );
+                tracing::debug!("begin_read_tx: shared data changed ({shared_max}, {nbackfills}, {last_checksum:?}, {checkpoint_seq}) != ({mx2}, {nb2}, {cksm2:?}, {ckpt_seq2}), retrying");
                 self.with_shared(|shared| shared.read_locks[0].unlock());
                 return TryBeginReadResult::Retry;
             }
@@ -2315,9 +2313,7 @@ impl WalFile {
                     } = mode
                     {
                         if max_frame > upper_bound {
-                            tracing::info!(
-                                "abort checkpoint because latest frame in WAL is greater than upper_bound in TRUNCATE mode: {max_frame} != {upper_bound}"
-                            );
+                            tracing::info!("abort checkpoint because latest frame in WAL is greater than upper_bound in TRUNCATE mode: {max_frame} != {upper_bound}");
                             return Err(LimboError::Busy);
                         }
                     }
@@ -2337,9 +2333,7 @@ impl WalFile {
                         let oc = self.ongoing_checkpoint.read();
                         (oc.min_frame, oc.max_frame)
                     };
-                    tracing::debug!(
-                        "checkpoint_inner::Start: min_frame={oc_min_frame}, max_frame={oc_max_frame}"
-                    );
+                    tracing::debug!("checkpoint_inner::Start: min_frame={oc_min_frame}, max_frame={oc_max_frame}");
                     let to_checkpoint = self.with_shared(|shared| {
                         let frame_cache = shared.frame_cache.lock();
                         let mut list = Vec::with_capacity(
@@ -2503,9 +2497,7 @@ impl WalFile {
                         let wal_checkpoint_backfilled =
                             wal_total_backfilled.saturating_sub(ongoing_chkpt.min_frame - 1);
 
-                        tracing::debug!(
-                            "checkpoint: wal_max_frame={wal_max_frame}, wal_total_backfilled={wal_total_backfilled}, wal_checkpoint_backfilled={wal_checkpoint_backfilled}"
-                        );
+                        tracing::debug!("checkpoint: wal_max_frame={wal_max_frame}, wal_total_backfilled={wal_total_backfilled}, wal_checkpoint_backfilled={wal_checkpoint_backfilled}");
 
                         CheckpointResult::new(wal_max_frame, wal_total_backfilled, wal_checkpoint_backfilled)
                     });
@@ -2658,9 +2650,7 @@ impl WalFile {
     pub fn try_restart_log_before_write(&self) -> Result<()> {
         let max_frame_read_lock_index = self.max_frame_read_lock_index.load(Ordering::Acquire);
         if max_frame_read_lock_index != 0 {
-            tracing::debug!(
-                "try_restart_log_before_write: max_frame_read_lock_index={max_frame_read_lock_index}, writer use WAL - can't restart the log"
-            );
+            tracing::debug!("try_restart_log_before_write: max_frame_read_lock_index={max_frame_read_lock_index}, writer use WAL - can't restart the log");
             return Ok(());
         }
         let (max_frame, nbackfills) = self.with_shared(|s| {
@@ -2670,9 +2660,7 @@ impl WalFile {
             )
         });
         if nbackfills == 0 {
-            tracing::debug!(
-                "try_restart_log_before_write: nbackfills={nbackfills}, nothing were backfilled - can't restart the log"
-            );
+            tracing::debug!("try_restart_log_before_write: nbackfills={nbackfills}, nothing were backfilled - can't restart the log");
             return Ok(());
         }
         turso_assert!(

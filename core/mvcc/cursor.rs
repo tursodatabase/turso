@@ -1317,9 +1317,7 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
             // The btree cursor must be correctly positioned and cannot cause IO to happen
             // because in order to get here, we must have read it already in the VDBE.
             let IOResult::Done(Some(record)) = self.record()? else {
-                crate::bail_corrupt_error!(
-                    "Btree cursor should have a record when deleting a row that only exists in the btree"
-                );
+                crate::bail_corrupt_error!("Btree cursor should have a record when deleting a row that only exists in the btree");
             };
             // All operations below clone values so we can clone it here to circumvent the borrow checker
             let record = record.clone();

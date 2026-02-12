@@ -431,9 +431,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                             }
                         } else if type_str.as_str() == "table" {
                             // This is a table schema change (existing logic)
-                            tracing::trace!(
-                                "table schema change with root page {root_page}, is_delete={is_delete}"
-                            );
+                            tracing::trace!("table schema change with root page {root_page}, is_delete={is_delete}");
                             if is_delete {
                                 if root_page < 0 {
                                     // Table was never checkpointed - derive table_id directly from root_page.
