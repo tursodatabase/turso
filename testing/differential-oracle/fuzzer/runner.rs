@@ -23,9 +23,10 @@ use turso_core::Database;
 
 use crate::generate::{GeneratorKind, PropTestBackend, SqlGenBackend, SqlGenerator};
 use crate::memory::{MemorySimIO, SimIO};
-use crate::oracle::{OracleResult, check_differential};
+use crate::oracle::{DifferentialOracle, OracleResult, QueryResult, check_differential};
 use crate::schema::SchemaIntrospector;
 pub use sql_gen::TreeMode;
+use sql_gen_prop::SqlValue;
 
 /// Configuration for the simulator.
 #[derive(Debug, Clone)]
@@ -407,8 +408,65 @@ impl Fuzzer {
             }
         }
 
+        self.run_integrity_check(stats, executed_sql)?;
+
         *coverage_out = generator.take_coverage();
 
+        Ok(())
+    }
+
+    /// Run `PRAGMA integrity_check` on both databases and fail if either reports corruption.
+    fn run_integrity_check(
+        &self,
+        stats: &mut SimStats,
+        executed_sql: &mut Vec<String>,
+    ) -> Result<()> {
+        tracing::info!("Running integrity check on both databases...");
+
+        let sql = "PRAGMA integrity_check";
+        executed_sql.push(sql.to_string());
+
+        let turso_result = DifferentialOracle::execute_turso(&self.turso_conn, sql);
+        let sqlite_result = DifferentialOracle::execute_sqlite(&self.sqlite_conn, sql);
+
+        let check_ok = |result: &QueryResult, db_name: &str| -> Result<()> {
+            match result {
+                QueryResult::Rows(rows) if rows.len() == 1 && rows[0].0.len() == 1 => {
+                    if let SqlValue::Text(ref text) = rows[0].0[0] {
+                        if text == "ok" {
+                            return Ok(());
+                        }
+                    }
+                    bail!("{db_name} integrity check failed: {:?}", rows);
+                }
+                QueryResult::Rows(rows) => {
+                    // Multiple rows means multiple integrity errors
+                    bail!("{db_name} integrity check failed: {:?}", rows);
+                }
+                QueryResult::Error(e) => {
+                    bail!("{db_name} integrity check errored: {e}");
+                }
+                QueryResult::Ok => {
+                    bail!("{db_name} integrity check returned no results");
+                }
+            }
+        };
+
+        if let Err(e) = check_ok(&turso_result, "Turso") {
+            stats.oracle_failures += 1;
+            executed_sql.push(format!("-- FAILED: {sql} ({e})"));
+            tracing::error!("{e}");
+            return Err(e);
+        }
+
+        if let Err(e) = check_ok(&sqlite_result, "SQLite") {
+            stats.oracle_failures += 1;
+            executed_sql.push(format!("-- FAILED: {sql} ({e})"));
+            tracing::error!("{e}");
+            return Err(e);
+        }
+
+        tracing::info!("Integrity check passed on both databases");
         Ok(())
     }
 
