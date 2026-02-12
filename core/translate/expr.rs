@@ -434,9 +434,12 @@ pub fn translate_condition_expr(
             )?;
         }
         ast::Expr::Binary(lhs, ast::Operator::Or, rhs) => {
-            // In a binary OR, never jump to the parent 'jump_target_when_false' label on the first condition, because
-            // the second condition CAN also be true. Instead we instruct the child expression to jump to a local
-            // false label.
+            // In a binary OR, never jump to the parent 'jump_target_when_false' or
+            // 'jump_target_when_null' label on the first condition, because the second
+            // condition CAN also be true. Instead we instruct the child expression to
+            // jump to a local false label so the right side of OR gets evaluated.
+            // This is critical for cases like `x IN (NULL, 3) OR b` where the left side
+            // evaluates to NULL — we must still evaluate the right side.
             let jump_target_when_false = program.allocate_label();
             translate_condition_expr(
                 program,
@@ -445,6 +448,7 @@ pub fn translate_condition_expr(
                 ConditionMetadata {
                     jump_if_condition_is_true: true,
                     jump_target_when_false,
+                    jump_target_when_null: jump_target_when_false,
                     ..condition_metadata
                 },
                 resolver,
