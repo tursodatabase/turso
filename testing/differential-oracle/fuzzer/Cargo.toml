@@ -10,6 +10,10 @@ repository.workspace = true
 name = "differential_fuzzer"
 path = "main.rs"
 
+[[bin]]
+name = "printf_fuzzer"
+path = "printf_fuzzer.rs"
+
 [lib]
 path = "lib.rs"
 

@@ -267,7 +267,7 @@ Feature support of [sqlite expr syntax](https://www.sqlite.org/lang_expr.html).
 | min(X,Y,...)                 | ✅ Yes     |                                                      |
 | nullif(X,Y)                  | ✅ Yes     |                                                      |
 | octet_length(X)              | ✅ Yes     |                                                      |
-| printf(FORMAT,...)           | ✅ Yes     | Still need support additional modifiers              |
+| printf(FORMAT,...)           | ✅ Yes     |                                                      |
 | quote(X)                     | ✅ Yes     |                                                      |
 | random()                     | ✅ Yes     |                                                      |
 | randomblob(N)                | ✅ Yes     |                                                      |
