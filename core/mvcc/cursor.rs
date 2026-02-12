@@ -385,16 +385,9 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
         }
 
         self.creating_new_rowid = true;
-        let res = if allocator.is_uninitialized() {
-            NextRowidResult::Uninitialized
-        } else if let Some((next_rowid, prev_max_rowid)) = allocator.get_next_rowid() {
-            NextRowidResult::Next {
-                new_rowid: next_rowid,
-                prev_rowid: prev_max_rowid,
-            }
-        } else {
-            NextRowidResult::FindRandom
-        };
+        // Always derive from current visible max rowid to preserve SQLite semantics
+        // across savepoint rollbacks and failed statements.
+        let res = NextRowidResult::Uninitialized;
         Ok(IOResult::Done(res))
     }
 
@@ -1324,7 +1317,9 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
             // The btree cursor must be correctly positioned and cannot cause IO to happen
             // because in order to get here, we must have read it already in the VDBE.
             let IOResult::Done(Some(record)) = self.record()? else {
-                crate::bail_corrupt_error!("Btree cursor should have a record when deleting a row that only exists in the btree");
+                crate::bail_corrupt_error!(
+                    "Btree cursor should have a record when deleting a row that only exists in the btree"
+                );
             };
             // All operations below clone values so we can clone it here to circumvent the borrow checker
             let record = record.clone();

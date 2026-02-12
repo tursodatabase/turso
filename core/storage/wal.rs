@@ -976,7 +976,14 @@ impl WalFile {
                     shared.transaction_count.load(Ordering::Acquire),
                 )
             });
-        tracing::debug!("try_begin_read_tx: shared_max={}, nbackfills={}, last_checksum={:?}, checkpoint_seq={:?}, transaction_count={}", shared_max, nbackfills, last_checksum, checkpoint_seq, transaction_count);
+        tracing::debug!(
+            "try_begin_read_tx: shared_max={}, nbackfills={}, last_checksum={:?}, checkpoint_seq={:?}, transaction_count={}",
+            shared_max,
+            nbackfills,
+            last_checksum,
+            checkpoint_seq,
+            transaction_count
+        );
 
         // Check if database changed since this connection's last read transaction.
         // If it has, the connection will invalidate its page cache.
@@ -1012,7 +1019,9 @@ impl WalFile {
                 || cksm2 != last_checksum
                 || ckpt_seq2 != checkpoint_seq
             {
-                tracing::debug!("begin_read_tx: shared data changed ({shared_max}, {nbackfills}, {last_checksum:?}, {checkpoint_seq}) != ({mx2}, {nb2}, {cksm2:?}, {ckpt_seq2}), retrying");
+                tracing::debug!(
+                    "begin_read_tx: shared data changed ({shared_max}, {nbackfills}, {last_checksum:?}, {checkpoint_seq}) != ({mx2}, {nb2}, {cksm2:?}, {ckpt_seq2}), retrying"
+                );
                 self.with_shared(|shared| shared.read_locks[0].unlock());
                 return TryBeginReadResult::Retry;
             }
@@ -2254,8 +2263,6 @@ impl WalFile {
         if slot != NO_LOCK_HELD {
             self.with_shared(|shared| shared.read_locks[slot].unlock());
         }
-        self.max_frame_read_lock_index
-            .store(NO_LOCK_HELD, Ordering::Release);
         self.ongoing_checkpoint.write().reset();
         self.syncing.store(false, Ordering::Release);
     }
@@ -2308,7 +2315,9 @@ impl WalFile {
                     } = mode
                     {
                         if max_frame > upper_bound {
-                            tracing::info!("abort checkpoint because latest frame in WAL is greater than upper_bound in TRUNCATE mode: {max_frame} != {upper_bound}");
+                            tracing::info!(
+                                "abort checkpoint because latest frame in WAL is greater than upper_bound in TRUNCATE mode: {max_frame} != {upper_bound}"
+                            );
                             return Err(LimboError::Busy);
                         }
                     }
@@ -2328,7 +2337,9 @@ impl WalFile {
                         let oc = self.ongoing_checkpoint.read();
                         (oc.min_frame, oc.max_frame)
                     };
-                    tracing::debug!("checkpoint_inner::Start: min_frame={oc_min_frame}, max_frame={oc_max_frame}");
+                    tracing::debug!(
+                        "checkpoint_inner::Start: min_frame={oc_min_frame}, max_frame={oc_max_frame}"
+                    );
                     let to_checkpoint = self.with_shared(|shared| {
                         let frame_cache = shared.frame_cache.lock();
                         let mut list = Vec::with_capacity(
@@ -2647,7 +2658,9 @@ impl WalFile {
     pub fn try_restart_log_before_write(&self) -> Result<()> {
         let max_frame_read_lock_index = self.max_frame_read_lock_index.load(Ordering::Acquire);
         if max_frame_read_lock_index != 0 {
-            tracing::debug!("try_restart_log_before_write: max_frame_read_lock_index={max_frame_read_lock_index}, writer use WAL - can't restart the log");
+            tracing::debug!(
+                "try_restart_log_before_write: max_frame_read_lock_index={max_frame_read_lock_index}, writer use WAL - can't restart the log"
+            );
             return Ok(());
         }
         let (max_frame, nbackfills) = self.with_shared(|s| {
@@ -2657,7 +2670,9 @@ impl WalFile {
             )
         });
         if nbackfills == 0 {
-            tracing::debug!("try_restart_log_before_write: nbackfills={nbackfills}, nothing were backfilled - can't restart the log");
+            tracing::debug!(
+                "try_restart_log_before_write: nbackfills={nbackfills}, nothing were backfilled - can't restart the log"
+            );
             return Ok(());
         }
         turso_assert!(
@@ -2665,7 +2680,9 @@ impl WalFile {
             "backfills can't be more than max_frame"
         );
         if max_frame != nbackfills {
-            tracing::debug!("try_restart_log_before_write: max_frame={max_frame}, nbackfills={nbackfills}, not everything is backfilled to the DB file - can't restart the log");
+            tracing::debug!(
+                "try_restart_log_before_write: max_frame={max_frame}, nbackfills={nbackfills}, not everything is backfilled to the DB file - can't restart the log"
+            );
             return Ok(());
         }
         let read_lock_0 = self.with_shared(|s| s.read_locks[0].upgrade());

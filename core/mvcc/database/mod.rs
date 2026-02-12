@@ -9,6 +9,7 @@ use crate::storage::btree::BTreeCursor;
 use crate::storage::btree::BTreeKey;
 use crate::storage::btree::CursorTrait;
 use crate::storage::btree::CursorValidState;
+use crate::storage::pager::SavepointResult;
 use crate::storage::sqlite3_ondisk::DatabaseHeader;
 use crate::storage::wal::{CheckpointMode, CheckpointResult, TursoRwLock};
 use crate::sync::atomic::{AtomicBool, AtomicI64};
@@ -358,8 +359,18 @@ pub enum TxTimestampOrID {
 
 /// Tracks versions created/modified during a savepoint for rollback.
 /// Used for statement-level savepoints in interactive transactions.
-#[derive(Default, Debug)]
+#[derive(Debug)]
+enum SavepointKind {
+    Statement,
+    Named {
+        name: String,
+        starts_transaction: bool,
+    },
+}
+
+#[derive(Debug)]
 pub struct Savepoint {
+    kind: SavepointKind,
     /// Versions CREATED during this savepoint (insert operations).
     /// On rollback: these versions are removed from their chains.
     created_table_versions: Vec<(RowID, u64)>,
@@ -371,6 +382,42 @@ pub struct Savepoint {
     /// RowIDs that were NEWLY added to write_set by this savepoint.
     /// On rollback: only these should be removed from write_set.
     newly_added_to_write_set: Vec<RowID>,
+}
+
+impl Savepoint {
+    fn statement() -> Self {
+        Self {
+            kind: SavepointKind::Statement,
+            created_table_versions: Vec::new(),
+            created_index_versions: Vec::new(),
+            deleted_table_versions: Vec::new(),
+            deleted_index_versions: Vec::new(),
+        }
+    }
+
+    fn named(name: String, starts_transaction: bool) -> Self {
+        Self {
+            kind: SavepointKind::Named {
+                name,
+                starts_transaction,
+            },
+            created_table_versions: Vec::new(),
+            created_index_versions: Vec::new(),
+            deleted_table_versions: Vec::new(),
+            deleted_index_versions: Vec::new(),
+        }
+    }
+
+    fn merge_from(&mut self, mut other: Savepoint) {
+        self.created_table_versions
+            .append(&mut other.created_table_versions);
+        self.created_index_versions
+            .append(&mut other.created_index_versions);
+        self.deleted_table_versions
+            .append(&mut other.deleted_table_versions);
+        self.deleted_index_versions
+            .append(&mut other.deleted_index_versions);
+    }
 }
 
 /// Transaction
@@ -429,19 +476,113 @@ impl Transaction {
     fn begin_savepoint(&self) {
         let depth = self.savepoint_stack.read().len();
         tracing::debug!("begin_savepoint(tx_id={}, depth={})", self.tx_id, depth);
-        self.savepoint_stack.write().push(Savepoint::default());
+        self.savepoint_stack.write().push(Savepoint::statement());
+    }
+
+    fn begin_named_savepoint(&self, name: String, starts_transaction: bool) {
+        let depth = self.savepoint_stack.read().len();
+        tracing::debug!(
+            "begin_named_savepoint(tx_id={}, depth={}, name={})",
+            self.tx_id,
+            depth,
+            name
+        );
+        self.savepoint_stack
+            .write()
+            .push(Savepoint::named(name, starts_transaction));
     }
 
     /// Release the newest savepoint (statement completed successfully).
     fn release_savepoint(&self) {
         let depth = self.savepoint_stack.read().len();
         tracing::debug!("release_savepoint(tx_id={}, depth={})", self.tx_id, depth);
-        self.savepoint_stack.write().pop();
+        let mut savepoints = self.savepoint_stack.write();
+        if !matches!(
+            savepoints.last().map(|savepoint| &savepoint.kind),
+            Some(SavepointKind::Statement)
+        ) {
+            return;
+        }
+        let savepoint = savepoints.pop().expect("savepoint must exist");
+        if let Some(parent) = savepoints.last_mut() {
+            parent.merge_from(savepoint);
+        }
     }
 
-    /// Pop and return the newest savepoint for rollback.
-    fn pop_savepoint(&self) -> Option<Savepoint> {
-        self.savepoint_stack.write().pop()
+    fn pop_statement_savepoint(&self) -> Option<Savepoint> {
+        let mut savepoints = self.savepoint_stack.write();
+        if !matches!(
+            savepoints.last().map(|savepoint| &savepoint.kind),
+            Some(SavepointKind::Statement)
+        ) {
+            return None;
+        }
+        savepoints.pop()
+    }
+
+    fn release_named_savepoint(&self, name: &str) -> SavepointResult {
+        let mut savepoints = self.savepoint_stack.write();
+        let Some(target_idx) = savepoints.iter().rposition(|savepoint| {
+            matches!(
+                savepoint.kind,
+                SavepointKind::Named {
+                    name: ref savepoint_name,
+                    ..
+                } if savepoint_name == name
+            )
+        }) else {
+            return SavepointResult::NotFound;
+        };
+
+        let commits_transaction = if matches!(
+            savepoints[target_idx].kind,
+            SavepointKind::Named {
+                starts_transaction: true,
+                ..
+            }
+        ) && target_idx == 0
+        {
+            SavepointResult::Commit
+        } else {
+            SavepointResult::Release
+        };
+
+        let drained: Vec<Savepoint> = savepoints.drain(target_idx..).collect();
+        if let Some(parent) = savepoints.last_mut() {
+            for savepoint in drained {
+                parent.merge_from(savepoint);
+            }
+        }
+        commits_transaction
+    }
+
+    fn rollback_to_named_savepoint(&self, name: &str) -> Option<Vec<Savepoint>> {
+        let mut savepoints = self.savepoint_stack.write();
+        let target_idx = savepoints.iter().rposition(|savepoint| {
+            matches!(
+                savepoint.kind,
+                SavepointKind::Named {
+                    name: ref savepoint_name,
+                    ..
+                } if savepoint_name == name
+            )
+        })?;
+
+        let target_name = match &savepoints[target_idx].kind {
+            SavepointKind::Named { name, .. } => name.clone(),
+            SavepointKind::Statement => unreachable!("target idx points to named savepoint"),
+        };
+        let starts_transaction = matches!(
+            savepoints[target_idx].kind,
+            SavepointKind::Named {
+                starts_transaction: true,
+                ..
+            }
+        );
+
+        let drained: Vec<Savepoint> = savepoints.drain(target_idx..).collect();
+        savepoints.push(Savepoint::named(target_name, starts_transaction));
+        Some(drained)
     }
 
     /// Record a version that was created during the current savepoint.
@@ -1064,10 +1205,71 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 let tx = tx.value();
 
                 for id in &self.write_set {
-                    if id.row_id.is_int_key() {
-                        self.check_rowid_for_conflicts(id, *end_ts, tx, mvcc_store)?;
-                    } else {
-                        self.check_index_for_conflicts(id, *end_ts, tx, mvcc_store)?;
+                    // TODO: check for conflicts with indices, check for uniqueness too.
+                    if !id.row_id.is_int_key() {
+                        continue;
+                    }
+
+                    let row_versions = mvcc_store.rows.get(id);
+                    if row_versions.is_none() {
+                        continue;
+                    }
+
+                    let row_versions = row_versions.unwrap();
+                    let row_versions = row_versions.value();
+                    let row_versions = row_versions.read();
+
+                    // Check for conflicts - iterate in reverse for faster early termination
+                    for version in row_versions.iter().rev() {
+                        // Skip deleted versions
+                        if version.end.is_some() {
+                            continue;
+                        }
+
+                        match version.begin {
+                            Some(TxTimestampOrID::TxID(other_tx_id)) => {
+                                // Skip our own version
+                                if other_tx_id == self.tx_id {
+                                    continue;
+                                }
+                                // Another transaction's uncommitted version - check their state
+                                let other_tx = mvcc_store.txs.get(&other_tx_id);
+                                if let Some(other_tx) = other_tx {
+                                    let other_tx = other_tx.value();
+                                    match other_tx.state.load() {
+                                        // Other tx already committed = conflict
+                                        TransactionState::Committed(_) => {
+                                            return Err(LimboError::WriteWriteConflict);
+                                        }
+                                        // Both preparing - compare end_ts (lower wins)
+                                        TransactionState::Preparing(other_end_ts) => {
+                                            if other_end_ts < *end_ts {
+                                                // Other tx has lower end_ts, they win
+                                                return Err(LimboError::WriteWriteConflict);
+                                            }
+                                            // We have lower end_ts, we win - they'll abort when they validate
+                                        }
+                                        // Other tx still active - we're already Preparing so we're ahead
+                                        // They'll see us in Preparing/Committed when they try to commit
+                                        TransactionState::Active => {}
+                                        // Other tx aborted - no conflict
+                                        TransactionState::Aborted
+                                        | TransactionState::Terminated => {}
+                                    }
+                                }
+                            }
+                            Some(TxTimestampOrID::Timestamp(begin_ts)) => {
+                                // Committed version - check if it was inserted after we started
+                                if begin_ts >= tx.begin_ts {
+                                    // Duplicate! A version was committed after we started
+                                    return Err(LimboError::WriteWriteConflict);
+                                }
+                                turso_assert!(false, "there is another row insterted and not updated/deleted from before");
+                            }
+                            None => {
+                                // Invalid version
+                            }
+                        }
                     }
                 }
 
@@ -1148,6 +1350,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
 
                 if log_record.row_versions.is_empty() {
                     // Nothing to do, just end commit.
+                    self.commit_coordinator.pager_commit_lock.unlock();
                     self.state = CommitState::CommitEnd { end_ts: *end_ts };
                 } else {
                     // We might need to serialize log writes
@@ -2011,7 +2214,9 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             }
             None => {
                 tx.record_created_table_version(id.clone(), version_id);
+                let table_id = id.table_id;
                 self.insert_version(id, row_version);
+                self.invalidate_rowid_allocator(table_id);
             }
         }
         Ok(())
@@ -2234,7 +2439,8 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                             .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
                         let tx = tx.value();
                         tx.insert_to_write_set(id.clone());
-                        tx.record_deleted_table_version(id, version_id);
+                        tx.record_deleted_table_version(id.clone(), version_id);
+                        self.invalidate_rowid_allocator(id.table_id);
                         return Ok(true);
                     }
                 }
@@ -2656,6 +2862,20 @@ impl<Clock: LogicalClock> MvStore<Clock> {
 
         let header = self.get_new_transaction_database_header(&pager);
 
+        if let Some(existing_tx_id) = maybe_existing_tx_id {
+            let tx = self
+                .txs
+                .get(&existing_tx_id)
+                .ok_or_else(|| LimboError::NoSuchTransactionID(existing_tx_id.to_string()))?;
+            *tx.value().header.write() = header;
+            tracing::trace!(
+                "begin_exclusive_tx(tx_id={}) - upgraded existing transaction",
+                tx_id
+            );
+            tracing::debug!("begin_exclusive_tx: tx_id={} succeeded", tx_id);
+            return Ok(tx_id);
+        }
+
         let tx = Transaction::new(tx_id, begin_ts, header);
         tx.pager_commit_lock_held.store(true, Ordering::Release);
         tracing::trace!(
@@ -2835,9 +3055,16 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             self.release_exclusive_tx(&tx_id);
         }
 
+        let mut touched_table_ids = BTreeSet::new();
         for rowid in &tx.write_set {
             let rowid = rowid.value();
             self.rollback_rowid(tx_id, rowid);
+            if rowid.row_id.is_int_key() {
+                touched_table_ids.insert(rowid.table_id);
+            }
+        }
+        for table_id in touched_table_ids {
+            self.invalidate_rowid_allocator(table_id);
         }
 
         if connection.schema.read().schema_version > connection.db.schema.lock().schema_version {
@@ -2901,6 +3128,13 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         tx.value().begin_savepoint();
     }
 
+    pub fn begin_named_savepoint(&self, tx_id: TxID, name: String, starts_transaction: bool) {
+        let tx = self.txs.get(&tx_id).unwrap_or_else(|| {
+            panic!("Transaction {tx_id} not found while beginning named savepoint")
+        });
+        tx.value().begin_named_savepoint(name, starts_transaction);
+    }
+
     /// Release the newest savepoint for the transaction.
     /// This should be called when a statement completes successfully.
     /// Silently returns if the transaction doesn't exist (e.g., already committed).
@@ -2911,6 +3145,15 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         // If transaction doesn't exist, it was already committed - nothing to release
     }
 
+    /// Releases a named savepoint and nested savepoints above it.
+    pub fn release_named_savepoint(&self, tx_id: TxID, name: &str) -> Result<SavepointResult> {
+        let tx = self
+            .txs
+            .get(&tx_id)
+            .unwrap_or_else(|| panic!("Transaction {tx_id} not found while releasing savepoint"));
+        Ok(tx.value().release_named_savepoint(name))
+    }
+
     /// Rolls back a savepoint within a transaction.
     /// Returns true if a savepoint was rolled back, false if no savepoint was active.
     pub fn rollback_first_savepoint(&self, tx_id: u64) -> Result<bool> {
@@ -2919,124 +3162,10 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         });
 
         let tx = tx.value();
-        let savepoint = tx.pop_savepoint();
+        let savepoint = tx.pop_statement_savepoint();
 
         if let Some(savepoint) = savepoint {
-            tracing::debug!("rollback_savepoint(tx_id={}, created_table={}, created_index={}, deleted_table={}, deleted_index={})",
-                tx_id,
-                savepoint.created_table_versions.len(),
-                savepoint.created_index_versions.len(),
-                savepoint.deleted_table_versions.len(),
-                savepoint.deleted_index_versions.len());
-
-            // Collect table rowids affected by this savepoint for write set cleanup.
-            let mut affected_table_rowids: BTreeSet<RowID> = BTreeSet::new();
-
-            // Remove created table versions
-            for (rowid, version_id) in &savepoint.created_table_versions {
-                if let Some(entry) = self.rows.get(rowid) {
-                    let mut versions = entry.value().write();
-                    versions.retain(|rv| rv.id != *version_id);
-                    tracing::debug!("rollback_savepoint: removed table version(table_id={}, row_id={}, version_id={})",
-                        rowid.table_id, rowid.row_id, version_id);
-                }
-                affected_table_rowids.insert(rowid.clone());
-            }
-
-            // Remove created index versions
-            for ((table_id, key), version_id) in &savepoint.created_index_versions {
-                if let Some(index) = self.index_rows.get(table_id) {
-                    if let Some(entry) = index.value().get(key) {
-                        let mut versions = entry.value().write();
-                        versions.retain(|rv| rv.id != *version_id);
-                        tracing::debug!(
-                            "rollback_savepoint: removed index version(table_id={}, version_id={})",
-                            table_id,
-                            version_id
-                        );
-                    }
-                }
-            }
-
-            // Restore deleted table versions (clear end timestamp)
-            for (rowid, version_id) in &savepoint.deleted_table_versions {
-                if let Some(entry) = self.rows.get(rowid) {
-                    let mut versions = entry.value().write();
-                    for rv in versions.iter_mut() {
-                        if rv.id == *version_id {
-                            rv.end = None;
-                            tracing::debug!("rollback_savepoint: restored table version(table_id={}, row_id={}, version_id={})",
-                                rowid.table_id, rowid.row_id, version_id);
-                            break;
-                        }
-                    }
-                }
-                affected_table_rowids.insert(rowid.clone());
-            }
-
-            // Restore deleted index versions
-            for ((table_id, key), version_id) in &savepoint.deleted_index_versions {
-                if let Some(index) = self.index_rows.get(table_id) {
-                    if let Some(entry) = index.value().get(key) {
-                        let mut versions = entry.value().write();
-                        for rv in versions.iter_mut() {
-                            if rv.id == *version_id {
-                                rv.end = None;
-                                tracing::debug!("rollback_savepoint: restored index version(table_id={}, version_id={})",
-                                    table_id, version_id);
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Clean up write set: remove rowids that no longer have any
-            // version belonging to this transaction. Without this, commit
-            // validation would find stale write set entries pointing to
-            // pre-existing committed versions and panic.
-            for rowid in &affected_table_rowids {
-                let has_tx_version = if let Some(entry) = self.rows.get(rowid) {
-                    let versions = entry.value().read();
-                    versions.iter().any(|rv| {
-                        matches!(rv.begin, Some(TxTimestampOrID::TxID(id)) if id == tx_id)
-                            || matches!(rv.end, Some(TxTimestampOrID::TxID(id)) if id == tx_id)
-                    })
-                } else {
-                    false
-                };
-                if !has_tx_version {
-                    tx.write_set.remove(rowid);
-                }
-            }
-
-            // Same cleanup for index rowids that were newly added by this savepoint.
-            for rowid in &savepoint.newly_added_to_write_set {
-                if rowid.row_id.is_int_key() {
-                    // Table rowids are already handled above via affected_table_rowids.
-                    continue;
-                }
-                let RowKey::Record(ref record) = rowid.row_id else {
-                    unreachable!()
-                };
-                let has_tx_version = if let Some(index) = self.index_rows.get(&rowid.table_id) {
-                    if let Some(entry) = index.value().get(record) {
-                        let versions = entry.value().read();
-                        versions.iter().any(|rv| {
-                            matches!(rv.begin, Some(TxTimestampOrID::TxID(id)) if id == tx_id)
-                                || matches!(rv.end, Some(TxTimestampOrID::TxID(id)) if id == tx_id)
-                        })
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                };
-                if !has_tx_version {
-                    tx.write_set.remove(rowid);
-                }
-            }
-
+            self.rollback_savepoint_changes(tx_id, savepoint);
             Ok(true)
         } else {
             tracing::debug!(
@@ -3044,6 +3173,148 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 tx_id
             );
             Ok(false)
+        }
+    }
+
+    pub fn rollback_to_named_savepoint(&self, tx_id: TxID, name: &str) -> Result<bool> {
+        let tx = self.txs.get(&tx_id).unwrap_or_else(|| {
+            panic!("Transaction {tx_id} not found while rolling back named savepoint")
+        });
+        let Some(drained_savepoints) = tx.value().rollback_to_named_savepoint(name) else {
+            return Ok(false);
+        };
+
+        for savepoint in drained_savepoints.into_iter().rev() {
+            self.rollback_savepoint_changes(tx_id, savepoint);
+        }
+
+        Ok(true)
+    }
+
+    fn rollback_savepoint_changes(&self, tx_id: TxID, savepoint: Savepoint) {
+        tracing::debug!(
+            "rollback_savepoint(tx_id={}, created_table={}, created_index={}, deleted_table={}, deleted_index={})",
+            tx_id,
+            savepoint.created_table_versions.len(),
+            savepoint.created_index_versions.len(),
+            savepoint.deleted_table_versions.len(),
+            savepoint.deleted_index_versions.len()
+        );
+
+        let mut touched_table_rowids = BTreeSet::new();
+
+        for (rowid, version_id) in savepoint.created_table_versions {
+            touched_table_rowids.insert(rowid.clone());
+            if let Some(entry) = self.rows.get(&rowid) {
+                let mut versions = entry.value().write();
+                versions.retain(|rv| rv.id != version_id);
+                tracing::debug!(
+                    "rollback_savepoint: removed table version(table_id={}, row_id={}, version_id={})",
+                    rowid.table_id,
+                    rowid.row_id,
+                    version_id
+                );
+            }
+        }
+
+        for ((table_id, key), version_id) in savepoint.created_index_versions {
+            if let Some(index) = self.index_rows.get(&table_id) {
+                if let Some(entry) = index.value().get(&key) {
+                    let mut versions = entry.value().write();
+                    versions.retain(|rv| rv.id != version_id);
+                    tracing::debug!(
+                        "rollback_savepoint: removed index version(table_id={}, version_id={})",
+                        table_id,
+                        version_id
+                    );
+                }
+            }
+        }
+
+        for (rowid, version_id) in savepoint.deleted_table_versions {
+            touched_table_rowids.insert(rowid.clone());
+            if let Some(entry) = self.rows.get(&rowid) {
+                let mut versions = entry.value().write();
+                for rv in versions.iter_mut() {
+                    if rv.id == version_id {
+                        rv.end = None;
+                        tracing::debug!(
+                            "rollback_savepoint: restored table version(table_id={}, row_id={}, version_id={})",
+                            rowid.table_id,
+                            rowid.row_id,
+                            version_id
+                        );
+                        break;
+                    }
+                }
+            }
+        }
+
+        for ((table_id, key), version_id) in savepoint.deleted_index_versions {
+            if let Some(index) = self.index_rows.get(&table_id) {
+                if let Some(entry) = index.value().get(&key) {
+                    let mut versions = entry.value().write();
+                    for rv in versions.iter_mut() {
+                        if rv.id == version_id {
+                            rv.end = None;
+                            tracing::debug!(
+                                "rollback_savepoint: restored index version(table_id={}, version_id={})",
+                                table_id,
+                                version_id
+                            );
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        self.remove_rolled_back_rows_from_write_set(tx_id, touched_table_rowids.clone());
+        self.invalidate_rowid_allocators_for_rows(&touched_table_rowids);
+    }
+
+    fn row_has_uncommitted_version_for_tx(&self, rowid: &RowID, tx_id: TxID) -> bool {
+        let Some(entry) = self.rows.get(rowid) else {
+            return false;
+        };
+        let versions = entry.value().read();
+        versions.iter().any(|rv| {
+            rv.begin == Some(TxTimestampOrID::TxID(tx_id))
+                || rv.end == Some(TxTimestampOrID::TxID(tx_id))
+        })
+    }
+
+    fn remove_rolled_back_rows_from_write_set(&self, tx_id: TxID, rowids: BTreeSet<RowID>) {
+        if rowids.is_empty() {
+            return;
+        }
+        let Some(tx) = self.txs.get(&tx_id) else {
+            return;
+        };
+        let tx = tx.value();
+        for rowid in rowids {
+            if self.row_has_uncommitted_version_for_tx(&rowid, tx_id) {
+                continue;
+            }
+            tx.write_set.remove(&rowid);
+        }
+    }
+
+    fn invalidate_rowid_allocators_for_rows(&self, rowids: &BTreeSet<RowID>) {
+        let mut table_ids = BTreeSet::new();
+        for rowid in rowids {
+            if rowid.row_id.is_int_key() {
+                table_ids.insert(rowid.table_id);
+            }
+        }
+        for table_id in table_ids {
+            self.invalidate_rowid_allocator(table_id);
+        }
+    }
+
+    fn invalidate_rowid_allocator(&self, table_id: MVTableId) {
+        if let Some(allocator) = self.table_id_to_last_rowid.read().get(&table_id) {
+            allocator.invalidate();
         }
     }
 
@@ -4153,6 +4424,10 @@ impl RowidAllocator {
         self.initialized.store(true, Ordering::SeqCst);
     }
 
+    pub fn invalidate(&self) {
+        self.initialized.store(false, Ordering::SeqCst);
+    }
+
     pub fn lock(&self) -> bool {
         self.lock.write()
     }
@@ -4266,7 +4541,9 @@ fn is_begin_visible(txs: &SkipMap<TxID, Transaction>, tx: &Transaction, rv: &Row
                 TransactionState::Committed(committed_ts) => tx.begin_ts >= committed_ts,
                 TransactionState::Aborted => false,
                 TransactionState::Terminated => {
-                    tracing::debug!("TODO: should reread rv's end field - it should have updated the timestamp in the row version by now");
+                    tracing::debug!(
+                        "TODO: should reread rv's end field - it should have updated the timestamp in the row version by now"
+                    );
                     false
                 }
             };

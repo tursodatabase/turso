@@ -425,10 +425,15 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                                 // Index schema row update (e.g. ALTER TABLE RENAME COLUMN propagates
                                 // to index SQL). No B-tree creation needed; the row itself is written
                                 // to sqlite_schema below. See: test_checkpoint_allows_index_schema_update_after_rename_column.
+                                panic!(
+                                    "Unexpected modify operation on existing index with root page {root_page}"
+                                );
                             }
                         } else if type_str.as_str() == "table" {
                             // This is a table schema change (existing logic)
-                            tracing::trace!("table schema change with root page {root_page}, is_delete={is_delete}");
+                            tracing::trace!(
+                                "table schema change with root page {root_page}, is_delete={is_delete}"
+                            );
                             if is_delete {
                                 if root_page < 0 {
                                     // Table was never checkpointed - derive table_id directly from root_page.
