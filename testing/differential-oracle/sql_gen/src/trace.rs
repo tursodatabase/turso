@@ -13,7 +13,9 @@ use strum::IntoEnumIterator;
 /// This enum also includes variants for SQL features that are not yet
 /// implemented in the generator. These show up as "not hit" in coverage
 /// reports, making gaps visible.
-#[derive(Clone, Copy, Debug, Hash, Eq, PartialEq, strum::EnumIter, strum::Display)]
+#[derive(
+    Clone, Copy, Debug, Hash, Eq, PartialEq, Ord, PartialOrd, strum::EnumIter, strum::Display,
+)]
 pub enum Origin {
     Root,
     Select,
@@ -157,17 +159,21 @@ impl Coverage {
 
     /// Record that a scope was entered at the given origin path.
     pub fn record_scope(&mut self, path: &OriginPath) {
-        self.by_origin.entry(path.clone()).or_default();
+        if !self.by_origin.contains_key(path) {
+            self.by_origin.insert(path.clone(), HashMap::default());
+        }
     }
 
     /// Record an expression at the given origin path.
     pub fn record_expr(&mut self, path: &OriginPath, kind: ExprKind) {
-        *self
-            .by_origin
-            .entry(path.clone())
-            .or_default()
-            .entry(kind)
-            .or_default() += 1;
+        // Fast path: the scope was already registered by record_scope, so
+        // get_mut succeeds without cloning the path key.
+        if let Some(counts) = self.by_origin.get_mut(path) {
+            *counts.entry(kind).or_default() += 1;
+        } else {
+            self.by_origin
+                .insert(path.clone(), HashMap::from([(kind, 1)]));
+        }
     }
 
     /// Record a statement.
@@ -197,14 +203,14 @@ impl Coverage {
     }
 
     /// Generate a coverage report.
-    pub fn report(&self) -> CoverageReport {
+    pub fn report(&self) -> CoverageReport<'_> {
         self.report_with_mode(TreeMode::default())
     }
 
     /// Generate a coverage report with a specific tree rendering mode.
-    pub fn report_with_mode(&self, tree_mode: TreeMode) -> CoverageReport {
+    pub fn report_with_mode(&self, tree_mode: TreeMode) -> CoverageReport<'_> {
         CoverageReport {
-            coverage: self.clone(),
+            coverage: self,
             tree_mode,
         }
     }
@@ -227,7 +233,7 @@ impl Coverage {
 #[derive(Debug, Default)]
 struct CoverageTreeNode {
     expr_counts: HashMap<ExprKind, usize>,
-    children: BTreeMap<String, CoverageTreeNode>,
+    children: BTreeMap<Origin, CoverageTreeNode>,
 }
 
 impl CoverageTreeNode {
@@ -256,9 +262,8 @@ impl CoverageTreeNode {
         if let Some(origin) = name {
             entered.insert(origin);
         }
-        for (child_name, child) in &self.children {
-            let child_origin = Origin::iter().find(|o| o.to_string() == *child_name);
-            child.collect_entered_origins(child_origin, entered);
+        for (child_origin, child) in &self.children {
+            child.collect_entered_origins(Some(*child_origin), entered);
         }
     }
 
@@ -282,7 +287,7 @@ impl CoverageTreeNode {
         f: &mut fmt::Formatter<'_>,
         prefix: &str,
         is_last: bool,
-        name: &str,
+        name: Origin,
     ) -> fmt::Result {
         let connector = if is_last { "└── " } else { "├── " };
         let subtotal = self.subtree_exprs();
@@ -305,9 +310,9 @@ impl CoverageTreeNode {
         }
 
         let children: Vec<_> = self.children.iter().collect();
-        for (i, (child_name, child)) in children.iter().enumerate() {
+        for (i, (child_origin, child)) in children.iter().enumerate() {
             let child_is_last = i == children.len() - 1;
-            child.fmt_tree(f, &child_prefix, child_is_last, child_name)?;
+            child.fmt_tree(f, &child_prefix, child_is_last, **child_origin)?;
         }
 
         Ok(())
@@ -322,7 +327,7 @@ fn build_coverage_tree(
 
     for (path, expr_counts) in by_origin {
         // Skip Root (implicit)
-        let segments: Vec<String> = path.0.iter().skip(1).map(|o| o.to_string()).collect();
+        let segments = &path.0[1..];
         let mut node = &mut root;
 
         if segments.is_empty() {
@@ -330,8 +335,8 @@ fn build_coverage_tree(
                 *node.expr_counts.entry(*kind).or_default() += count;
             }
         } else {
-            for (i, seg) in segments.iter().enumerate() {
-                node = node.children.entry(seg.clone()).or_default();
+            for (i, origin) in segments.iter().enumerate() {
+                node = node.children.entry(*origin).or_default();
                 if i == segments.len() - 1 {
                     for (kind, count) in expr_counts {
                         *node.expr_counts.entry(*kind).or_default() += count;
@@ -355,9 +360,9 @@ fn fmt_coverage_tree(root: &CoverageTreeNode, f: &mut fmt::Formatter<'_>) -> fmt
         }
     }
     let children: Vec<_> = root.children.iter().collect();
-    for (i, (name, child)) in children.iter().enumerate() {
+    for (i, (origin, child)) in children.iter().enumerate() {
         let is_last = i == children.len() - 1;
-        child.fmt_tree(f, "", is_last, name)?;
+        child.fmt_tree(f, "", is_last, **origin)?;
     }
     Ok(())
 }
@@ -365,12 +370,12 @@ fn fmt_coverage_tree(root: &CoverageTreeNode, f: &mut fmt::Formatter<'_>) -> fmt
 /// A coverage report. All statistics are computed on-the-fly from the
 /// underlying `Coverage` data rather than stored.
 #[derive(Debug)]
-pub struct CoverageReport {
-    coverage: Coverage,
+pub struct CoverageReport<'a> {
+    coverage: &'a Coverage,
     tree_mode: TreeMode,
 }
 
-impl CoverageReport {
+impl CoverageReport<'_> {
     pub fn total_exprs(&self) -> usize {
         self.coverage.total_exprs()
     }
@@ -439,7 +444,7 @@ impl CoverageReport {
     }
 }
 
-impl fmt::Display for CoverageReport {
+impl fmt::Display for CoverageReport<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let total_exprs = self.total_exprs();
         let total_stmts = self.total_stmts();
@@ -539,9 +544,8 @@ impl fmt::Display for CoverageReport {
                             *entry.entry(kind).or_default() += count;
                         }
                     }
-                    for (child_name, child) in &node.children {
-                        let child_origin = Origin::iter().find(|o| o.to_string() == *child_name);
-                        collect_origins(child_origin, child, acc);
+                    for (child_origin, child) in &node.children {
+                        collect_origins(Some(*child_origin), child, acc);
                     }
                 }
                 collect_origins(Some(Origin::Root), &tree_root, &mut origin_exprs);
