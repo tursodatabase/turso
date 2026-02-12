@@ -8,17 +8,17 @@ test create-type-basic {
         OPERATOR '+' (test_uint) -> test_uint_add
         OPERATOR '<' (test_uint) -> test_uint_lt
         OPERATOR '=' (test_uint) -> test_uint_eq;
-    SELECT type, name FROM sqlite_schema WHERE type = 'type';
+    SELECT name FROM sqlite_turso_types WHERE name = 'test_uint';
 }
 expect {
-    type|test_uint
+    test_uint
 }
 
 @requires strict "uses STRICT tables"
 test create-type-if-not-exists {
     CREATE TYPE test_uint BASE text ENCODE test_uint_encode(value) DECODE test_uint_decode(value);
     CREATE TYPE IF NOT EXISTS test_uint BASE text ENCODE test_uint_encode(value) DECODE test_uint_decode(value);
-    SELECT count(*) FROM sqlite_schema WHERE type = 'type' AND name = 'test_uint';
+    SELECT count(*) FROM sqlite_turso_types WHERE name = 'test_uint';
 }
 expect {
     1
@@ -28,7 +28,7 @@ expect {
 test drop-type-basic {
     CREATE TYPE test_uint BASE text ENCODE test_uint_encode(value) DECODE test_uint_decode(value);
     DROP TYPE test_uint;
-    SELECT count(*) FROM sqlite_schema WHERE type = 'type';
+    SELECT count(*) FROM sqlite_turso_types;
 }
 expect {
     0
