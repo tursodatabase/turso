@@ -3,6 +3,7 @@ pub mod grammar_generator;
 pub mod journal_mode;
 pub mod orderby_collation;
 pub mod rowid_alias;
+pub mod savepoint;
 pub mod subquery;
 pub mod test_join_optimizer;
 
