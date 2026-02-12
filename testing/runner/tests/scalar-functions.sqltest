@@ -1391,6 +1391,15 @@ expect {
     12.34
 }
 
+# Regression from differential fuzzer seed 17161292163153366865:
+# QUOTE(REAL) must use SQLite's canonical float text format.
+test quote-float-scientific-format {
+    SELECT quote(CAST('2.042747795102219097e+05' AS REAL))
+}
+expect {
+    2.042747795102219097e+05
+}
+
 # Regression: QUOTE() should return TEXT type for floats, not REAL
 test quote-float-typeof {
     SELECT typeof(quote(12.34))

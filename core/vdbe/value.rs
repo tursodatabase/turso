@@ -1,6 +1,6 @@
 use crate::{
     function::MathFunc,
-    numeric::{format_float, NullableInteger, Numeric},
+    numeric::{format_float, format_float_for_quote, NullableInteger, Numeric},
     translate::collate::CollationSeq,
     types::{compare_immutable_single, AsValueRef, SeekOp},
     vdbe::affinity::Affinity,
@@ -332,7 +332,10 @@ impl Value {
         use std::fmt::Write;
         match self {
             Value::Null => Value::build_text("NULL"),
-            Value::Numeric(_) => Value::build_text(self.to_string()),
+            Value::Numeric(Numeric::Integer(i)) => Value::build_text(i.to_string()),
+            Value::Numeric(Numeric::Float(f)) => {
+                Value::build_text(format_float_for_quote(f64::from(*f)))
+            }
             Value::Blob(b) => {
                 // SQLite returns X'hexdigits' for blobs
                 let mut quoted = String::with_capacity(3 + b.len() * 2);
@@ -1829,6 +1832,14 @@ mod tests {
 
         let input = Value::build_text("hello''world");
         let expected = Value::build_text("'hello''''world'");
+        assert_eq!(input.exec_quote(), expected);
+
+        let input = Value::from_f64(
+            crate::numeric::str_to_f64("2.042747795102219097e+05")
+                .map(f64::from)
+                .unwrap(),
+        );
+        let expected = Value::build_text("2.042747795102219097e+05");
         assert_eq!(input.exec_quote(), expected);
     }
 

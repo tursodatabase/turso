@@ -716,17 +716,26 @@ pub fn str_to_f64(input: impl AsRef<str>) -> Option<StrToF64> {
     })
 }
 
-pub fn format_float(v: f64) -> String {
+enum FloatParts {
+    Special(String),
+    Normal {
+        negative: bool,
+        digits: Vec<u8>,
+        exp: i32,
+    },
+}
+
+fn decompose_float(v: f64, precision: usize) -> FloatParts {
     if v.is_nan() {
-        return "".to_string();
+        return FloatParts::Special("".to_string());
     }
 
     if v.is_infinite() {
-        return if v.is_sign_negative() { "-Inf" } else { "Inf" }.to_string();
+        return FloatParts::Special(if v.is_sign_negative() { "-Inf" } else { "Inf" }.to_string());
     }
 
     if v == 0.0 {
-        return "0.0".to_string();
+        return FloatParts::Special("0.0".to_string());
     }
 
     let negative = v < 0.0;
@@ -761,12 +770,7 @@ pub fn format_float(v: f64) -> String {
         }
     }
 
-    let v = u64::from(d);
-
-    let mut digits = v.to_string().into_bytes();
-
-    let precision = 15;
-
+    let mut digits = u64::from(d).to_string().into_bytes();
     let mut decimal_pos = digits.len() as i32 + exp;
 
     'out: {
@@ -793,43 +797,83 @@ pub fn format_float(v: f64) -> String {
         digits.pop();
     }
 
-    let exp = decimal_pos - 1;
+    FloatParts::Normal {
+        negative,
+        digits,
+        exp: decimal_pos - 1,
+    }
+}
 
-    if (-4..=14).contains(&exp) {
-        format!(
-            "{}{}.{}{}",
-            if negative { "-" } else { Default::default() },
-            if decimal_pos > 0 {
-                let zeroes = (decimal_pos - digits.len() as i32).max(0) as usize;
-                let digits = digits
-                    .get(0..(decimal_pos.min(digits.len() as i32) as usize))
-                    .unwrap();
-                (unsafe { str::from_utf8_unchecked(digits) }).to_owned() + &"0".repeat(zeroes)
-            } else {
-                "0".to_string()
-            },
-            "0".repeat(decimal_pos.min(0).unsigned_abs() as usize),
-            digits
-                .get((decimal_pos.max(0) as usize)..)
-                .filter(|v| !v.is_empty())
-                .map(|v| unsafe { str::from_utf8_unchecked(v) })
-                .unwrap_or("0")
-        )
-    } else {
-        format!(
-            "{}{}.{}e{}{:0width$}",
-            if negative { "-" } else { "" },
-            digits.first().cloned().unwrap_or(b'0') as char,
-            digits
+fn format_float_scientific(v: f64, precision: usize) -> String {
+    match decompose_float(v, precision) {
+        FloatParts::Special(s) => s,
+        FloatParts::Normal {
+            negative,
+            digits,
+            exp,
+        } => {
+            let first = digits.first().cloned().unwrap_or(b'0') as char;
+            let rest = digits
                 .get(1..)
                 .filter(|v| !v.is_empty())
                 .map(|v| unsafe { str::from_utf8_unchecked(v) })
-                .unwrap_or("0"),
-            if exp.is_positive() { "+" } else { "-" },
-            exp.abs(),
-            width = if exp > 100 { 3 } else { 2 }
-        )
+                .unwrap_or("0");
+            format!(
+                "{}{}.{}e{}{:0width$}",
+                if negative { "-" } else { "" },
+                first,
+                rest,
+                if exp.is_positive() { "+" } else { "-" },
+                exp.abs(),
+                width = if exp.abs() > 99 { 3 } else { 2 }
+            )
+        }
     }
+}
+
+pub fn format_float(v: f64) -> String {
+    match decompose_float(v, 15) {
+        FloatParts::Special(s) => s,
+        FloatParts::Normal {
+            negative,
+            digits,
+            exp,
+        } => {
+            let decimal_pos = exp + 1;
+            if (-4..=14).contains(&exp) {
+                format!(
+                    "{}{}.{}{}",
+                    if negative { "-" } else { Default::default() },
+                    if decimal_pos > 0 {
+                        let zeroes = (decimal_pos - digits.len() as i32).max(0) as usize;
+                        let digits = digits
+                            .get(0..(decimal_pos.min(digits.len() as i32) as usize))
+                            .unwrap();
+                        (unsafe { str::from_utf8_unchecked(digits) }).to_owned()
+                            + &"0".repeat(zeroes)
+                    } else {
+                        "0".to_string()
+                    },
+                    "0".repeat(decimal_pos.min(0).unsigned_abs() as usize),
+                    digits
+                        .get((decimal_pos.max(0) as usize)..)
+                        .filter(|v| !v.is_empty())
+                        .map(|v| unsafe { str::from_utf8_unchecked(v) })
+                        .unwrap_or("0")
+                )
+            } else {
+                format_float_scientific(v, 15)
+            }
+        }
+    }
+}
+
+pub fn format_float_for_quote(v: f64) -> String {
+    let default = format_float(v);
+    if str_to_f64(&default).map(f64::from) == Some(v) {
+        return default;
+    }
+    format_float_scientific(v, 19)
 }
 
 #[test]
