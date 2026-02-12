@@ -384,6 +384,7 @@ impl Fuzzer {
                 OracleResult::Warning(reason) => {
                     stats.statements_executed += 1;
                     stats.warnings += 1;
+                    push_warning_comments(executed_sql, i, &reason);
                     executed_sql.push(stmt.sql.clone());
                     tracing::warn!("Oracle warning at statement {i}: {reason}");
                 }
@@ -529,6 +530,14 @@ impl Fuzzer {
     }
 }
 
+fn push_warning_comments(executed_sql: &mut Vec<String>, stmt_idx: usize, reason: &str) {
+    for (line_idx, line) in reason.lines().enumerate() {
+        executed_sql.push(format!(
+            "-- WARNING stmt={stmt_idx} line={line_idx}: {line}"
+        ));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -557,5 +566,13 @@ mod tests {
         };
         let sim = Fuzzer::new(config);
         assert!(sim.is_ok());
+    }
+
+    #[test]
+    fn test_push_warning_comments_multiline() {
+        let mut out = Vec::new();
+        push_warning_comments(&mut out, 465, "first\nsecond");
+        assert_eq!(out[0], "-- WARNING stmt=465 line=0: first");
+        assert_eq!(out[1], "-- WARNING stmt=465 line=1: second");
     }
 }

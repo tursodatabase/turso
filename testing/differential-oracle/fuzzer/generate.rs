@@ -14,6 +14,7 @@ pub struct GeneratedStatement {
     pub sql: String,
     pub is_ddl: bool,
     pub has_unordered_limit: bool,
+    pub unordered_limit_reason: Option<String>,
 }
 
 impl std::fmt::Display for GeneratedStatement {
@@ -84,10 +85,12 @@ impl SqlGenerator for SqlGenBackend {
         let sql = stmt.to_string();
         let is_ddl = StmtKind::from(&stmt).is_ddl();
         let has_unordered_limit = stmt.has_unordered_limit();
+        let unordered_limit_reason = stmt.unordered_limit_reason().map(str::to_string);
         Ok(GeneratedStatement {
             sql,
             is_ddl,
             has_unordered_limit,
+            unordered_limit_reason,
         })
     }
 
@@ -139,6 +142,7 @@ impl SqlGenerator for PropTestBackend {
             sql,
             is_ddl,
             has_unordered_limit,
+            unordered_limit_reason: None,
         })
     }
 }
