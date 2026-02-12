@@ -325,3 +325,63 @@ test custom-type-requires-strict {
 }
 expect error {
 }
+
+@requires strict "uses STRICT tables"
+test update-with-custom-type {
+    CREATE TYPE test_reverse BASE text ENCODE test_reverse_encode(value) DECODE test_reverse_decode(value);
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_reverse) STRICT;
+    INSERT INTO t1 VALUES (1, 'hello');
+    INSERT INTO t1 VALUES (2, 'world');
+    UPDATE t1 SET val = 'updated' WHERE id = 1;
+    SELECT id, val FROM t1 ORDER BY id;
+}
+expect {
+    1|updated
+    2|world
+}
+
+@requires strict "uses STRICT tables"
+test update-uint-encode {
+    CREATE TYPE test_uint BASE text ENCODE test_uint_encode(value) DECODE test_uint_decode(value);
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint) STRICT;
+    INSERT INTO t1 VALUES (1, 42);
+    UPDATE t1 SET val = 99 WHERE id = 1;
+    SELECT id, val FROM t1;
+}
+expect {
+    1|99
+}
+
+@requires strict "uses STRICT tables"
+test update-custom-type-null {
+    CREATE TYPE test_uint BASE text ENCODE test_uint_encode(value) DECODE test_uint_decode(value);
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint) STRICT;
+    INSERT INTO t1 VALUES (1, 42);
+    UPDATE t1 SET val = NULL WHERE id = 1;
+    SELECT id, COALESCE(val, 'IS_NULL') FROM t1;
+}
+expect {
+    1|IS_NULL
+}
+
+@requires strict "uses STRICT tables"
+test replace-with-custom-type {
+    CREATE TYPE test_uint BASE text ENCODE test_uint_encode(value) DECODE test_uint_decode(value);
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint) STRICT;
+    INSERT INTO t1 VALUES (1, 42);
+    REPLACE INTO t1 VALUES (1, 99);
+    SELECT id, val FROM t1;
+}
+expect {
+    1|99
+}
+
+@requires strict "uses STRICT tables"
+test custom-type-not-null-constraint {
+    CREATE TYPE test_uint BASE text ENCODE test_uint_encode(value) DECODE test_uint_decode(value);
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint NOT NULL) STRICT;
+    INSERT INTO t1 VALUES (1, NULL);
+}
+expect error {
+    NOT NULL constraint failed
+}

@@ -3572,6 +3572,15 @@ fn emit_update_insns<'a>(
     // This ensures that if a constraint fails, indexes remain consistent.
     if let Some(btree_table) = target_table.table.btree() {
         if btree_table.is_strict {
+            // Encode values for columns with custom types before TypeCheck,
+            // so that constraints are validated on the encoded result.
+            crate::translate::expr::emit_custom_type_encode_columns(
+                program,
+                &t_ctx.resolver,
+                &btree_table.columns,
+                start,
+            )?;
+
             program.emit_insn(Insn::TypeCheck {
                 start_reg: start,
                 count: col_len,

@@ -1291,32 +1291,9 @@ pub fn translate_create_type(
         bail_parse_error!("type {normalized_name} already exists");
     }
 
-    // Reconstruct the SQL string (without IF NOT EXISTS)
-    let mut sql = if body.params.is_empty() {
-        format!("CREATE TYPE {} BASE {}", normalized_name, body.base)
-    } else {
-        format!(
-            "CREATE TYPE {}({}) BASE {}",
-            normalized_name,
-            body.params.join(", "),
-            body.base
-        )
-    };
-    if let Some(ref encode) = body.encode {
-        sql.push_str(&format!(" ENCODE {encode}"));
-    }
-    if let Some(ref decode) = body.decode {
-        sql.push_str(&format!(" DECODE {decode}"));
-    }
-    if let Some(ref default) = body.default {
-        sql.push_str(&format!(" DEFAULT {default}"));
-    }
-    for op in &body.operators {
-        sql.push_str(&format!(
-            " OPERATOR '{}' ({}) -> {}",
-            op.op, op.right_type, op.func_name
-        ));
-    }
+    // Reconstruct the SQL string (without IF NOT EXISTS) using TypeDef::to_sql()
+    let type_def = crate::schema::TypeDef::from_create_type(&normalized_name, body, false);
+    let sql = type_def.to_sql();
 
     // Ensure sqlite_turso_types table exists (lazy creation)
     let types_table: Arc<BTreeTable>;

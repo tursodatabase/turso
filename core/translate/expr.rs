@@ -6046,24 +6046,34 @@ fn find_custom_type_operator(
     let lhs_type = expr_custom_type_name(e1, referenced_tables, resolver);
     let rhs_type = expr_custom_type_name(e2, referenced_tables, resolver);
 
-    // Try to find operator on lhs type first
+    // Try to find operator on lhs type first.
+    // Operator definitions are: "when my type is on the left and right_type is on the right,
+    // call func_name(lhs, rhs)".
     if let Some(ref lhs_ty) = lhs_type {
-        let type_def = resolver.schema.get_type_def(lhs_ty)?;
-        let rhs_ty = rhs_type.as_deref().unwrap_or(lhs_ty);
-        for op_def in &type_def.operators {
-            if op_def.op == op_str && op_def.right_type.to_lowercase() == rhs_ty.to_lowercase() {
-                return Some(op_def.func_name.clone());
+        if let Some(type_def) = resolver.schema.get_type_def(lhs_ty) {
+            let rhs_ty = rhs_type.as_deref().unwrap_or(lhs_ty);
+            for op_def in &type_def.operators {
+                if op_def.op == op_str && op_def.right_type.to_lowercase() == rhs_ty.to_lowercase()
+                {
+                    return Some(op_def.func_name.clone());
+                }
             }
         }
     }
 
-    // Try rhs type
+    // Try rhs type: check if rhs type has an operator for (rhs_type OP rhs_type).
+    // This handles cases like `literal OP custom_type` where the literal has no type
+    // but we want to use the custom type's self-operator.
     if let Some(ref rhs_ty) = rhs_type {
-        let type_def = resolver.schema.get_type_def(rhs_ty)?;
-        let lhs_ty = lhs_type.as_deref().unwrap_or(rhs_ty);
-        for op_def in &type_def.operators {
-            if op_def.op == op_str && op_def.right_type.to_lowercase() == lhs_ty.to_lowercase() {
-                return Some(op_def.func_name.clone());
+        if lhs_type.is_none() {
+            if let Some(type_def) = resolver.schema.get_type_def(rhs_ty) {
+                for op_def in &type_def.operators {
+                    if op_def.op == op_str
+                        && op_def.right_type.to_lowercase() == rhs_ty.to_lowercase()
+                    {
+                        return Some(op_def.func_name.clone());
+                    }
+                }
             }
         }
     }
@@ -6120,4 +6130,40 @@ pub(crate) fn emit_type_expr(
     program.id_register_overrides.clear();
 
     result
+}
+
+/// Emit encode expressions for all columns with custom types in a contiguous register range.
+/// Used by both INSERT and UPDATE paths to encode values before TypeCheck.
+pub(crate) fn emit_custom_type_encode_columns(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    columns: &[crate::schema::Column],
+    start_reg: usize,
+) -> Result<()> {
+    for (i, col) in columns.iter().enumerate() {
+        let type_name = &col.ty_str;
+        if type_name.is_empty() {
+            continue;
+        }
+        let Some(type_def) = resolver.schema.get_type_def(type_name) else {
+            continue;
+        };
+        let Some(ref encode_expr) = type_def.encode else {
+            continue;
+        };
+
+        let reg = start_reg + i;
+
+        // Skip NULL values: jump over encode if NULL
+        let skip_label = program.allocate_label();
+        program.emit_insn(crate::vdbe::insn::Insn::IsNull {
+            reg,
+            target_pc: skip_label,
+        });
+
+        emit_type_expr(program, encode_expr, reg, reg, col, type_def, resolver)?;
+
+        program.resolve_label(skip_label, program.offset());
+    }
+    Ok(())
 }

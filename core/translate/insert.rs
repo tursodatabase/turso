@@ -3543,36 +3543,15 @@ fn emit_custom_type_encode(
     resolver: &Resolver,
     insertion: &Insertion,
 ) -> Result<()> {
-    for col_mapping in &insertion.col_mappings {
-        let type_name = &col_mapping.column.ty_str;
-        if type_name.is_empty() {
-            continue;
-        }
-        let Some(type_def) = resolver.schema.get_type_def(type_name) else {
-            continue;
-        };
-        let Some(ref encode_expr) = type_def.encode else {
-            continue;
-        };
-
-        // Skip NULL values: jump over encode if NULL
-        let skip_label = program.allocate_label();
-        program.emit_insn(Insn::IsNull {
-            reg: col_mapping.register,
-            target_pc: skip_label,
-        });
-
-        crate::translate::expr::emit_type_expr(
-            program,
-            encode_expr,
-            col_mapping.register,
-            col_mapping.register,
-            col_mapping.column,
-            type_def,
-            resolver,
-        )?;
-
-        program.resolve_label(skip_label, program.offset());
-    }
-    Ok(())
+    let columns: Vec<_> = insertion
+        .col_mappings
+        .iter()
+        .map(|m| m.column.clone())
+        .collect();
+    crate::translate::expr::emit_custom_type_encode_columns(
+        program,
+        resolver,
+        &columns,
+        insertion.first_col_register(),
+    )
 }

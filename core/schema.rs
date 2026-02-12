@@ -140,7 +140,7 @@ use std::collections::VecDeque;
 use std::ops::Deref;
 use tracing::trace;
 use turso_parser::ast::{
-    self, ColumnDefinition, Expr, InitDeferredPred, Literal, Name, RefAct, SortOrder,
+    self, ColumnDefinition, Expr, InitDeferredPred, Literal, Name, RefAct, SortOrder, TypeOperator,
 };
 use turso_parser::{
     ast::{Cmd, CreateTableBody, ResultColumn, Stmt},
@@ -154,14 +154,6 @@ pub const TURSO_TYPES_TABLE_NAME: &str = "__turso_internal_types";
 pub const DBSP_TABLE_PREFIX: &str = "__turso_internal_dbsp_state_v";
 pub const TURSO_INTERNAL_PREFIX: &str = "__turso_internal_";
 
-/// Operator-to-function mapping in a custom type definition
-#[derive(Debug, Clone)]
-pub struct TypeOperatorDef {
-    pub op: String,
-    pub right_type: String,
-    pub func_name: String,
-}
-
 /// Custom type definition, loaded from sqlite_turso_types
 #[derive(Debug, Clone)]
 pub struct TypeDef {
@@ -170,9 +162,59 @@ pub struct TypeDef {
     pub base: String,
     pub encode: Option<Box<turso_parser::ast::Expr>>,
     pub decode: Option<Box<turso_parser::ast::Expr>>,
-    pub operators: Vec<TypeOperatorDef>,
+    pub operators: Vec<TypeOperator>,
     pub default: Option<Box<turso_parser::ast::Expr>>,
     pub is_builtin: bool,
+}
+
+impl TypeDef {
+    /// Construct a TypeDef from a parsed CREATE TYPE statement.
+    pub fn from_create_type(
+        type_name: &str,
+        body: &turso_parser::ast::CreateTypeBody,
+        is_builtin: bool,
+    ) -> Self {
+        Self {
+            name: type_name.to_string(),
+            params: body.params.clone(),
+            base: body.base.clone(),
+            encode: body.encode.clone(),
+            decode: body.decode.clone(),
+            operators: body.operators.clone(),
+            default: body.default.clone(),
+            is_builtin,
+        }
+    }
+
+    /// Reconstruct the CREATE TYPE SQL string from this definition.
+    pub fn to_sql(&self) -> String {
+        let mut sql = if self.params.is_empty() {
+            format!("CREATE TYPE {} BASE {}", self.name, self.base)
+        } else {
+            format!(
+                "CREATE TYPE {}({}) BASE {}",
+                self.name,
+                self.params.join(", "),
+                self.base
+            )
+        };
+        if let Some(ref encode) = self.encode {
+            sql.push_str(&format!(" ENCODE {encode}"));
+        }
+        if let Some(ref decode) = self.decode {
+            sql.push_str(&format!(" DECODE {decode}"));
+        }
+        if let Some(ref default) = self.default {
+            sql.push_str(&format!(" DEFAULT {default}"));
+        }
+        for op in &self.operators {
+            sql.push_str(&format!(
+                " OPERATOR '{}' ({}) -> {}",
+                op.op, op.right_type, op.func_name
+            ));
+        }
+        sql
+    }
 }
 
 /// Accumulators for schema loading - kept separate to avoid moving through state variants
@@ -340,24 +382,7 @@ fn bootstrap_builtin_types(registry: &mut HashMap<String, Arc<TypeDef>>) {
             panic!("Failed to parse built-in type SQL: {sql}");
         };
 
-        let type_def = TypeDef {
-            name: type_name.clone(),
-            params: body.params.clone(),
-            base: body.base.clone(),
-            encode: body.encode.clone(),
-            decode: body.decode.clone(),
-            operators: body
-                .operators
-                .iter()
-                .map(|op| TypeOperatorDef {
-                    op: op.op.clone(),
-                    right_type: op.right_type.clone(),
-                    func_name: op.func_name.clone(),
-                })
-                .collect(),
-            default: body.default.clone(),
-            is_builtin: true,
-        };
+        let type_def = TypeDef::from_create_type(&type_name, &body, true);
         registry.insert(type_name.to_lowercase(), Arc::new(type_def));
     }
 
@@ -442,24 +467,7 @@ impl Schema {
             )));
         };
 
-        let type_def = TypeDef {
-            name: type_name.clone(),
-            params: body.params.clone(),
-            base: body.base.clone(),
-            encode: body.encode.clone(),
-            decode: body.decode.clone(),
-            operators: body
-                .operators
-                .iter()
-                .map(|op| TypeOperatorDef {
-                    op: op.op.clone(),
-                    right_type: op.right_type.clone(),
-                    func_name: op.func_name.clone(),
-                })
-                .collect(),
-            default: body.default.clone(),
-            is_builtin: false,
-        };
+        let type_def = TypeDef::from_create_type(&type_name, &body, false);
         self.type_registry
             .insert(type_name.to_lowercase(), Arc::new(type_def));
         Ok(())

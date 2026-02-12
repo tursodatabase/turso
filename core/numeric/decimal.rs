@@ -78,7 +78,12 @@ pub fn blob_to_bigdecimal(blob: &[u8]) -> crate::Result<BigDecimal> {
 
     let num_limbs = u32::from_le_bytes(blob[10..14].try_into().unwrap()) as usize;
 
-    let expected_len = 14 + num_limbs * 4;
+    let expected_len = num_limbs
+        .checked_mul(4)
+        .and_then(|n| n.checked_add(14))
+        .ok_or_else(|| {
+            LimboError::Constraint("invalid numeric blob: limb count overflow".to_string())
+        })?;
     if blob.len() != expected_len {
         return Err(LimboError::Constraint(format!(
             "invalid numeric blob: expected {expected_len} bytes, got {}",
@@ -100,19 +105,36 @@ pub fn blob_to_bigdecimal(blob: &[u8]) -> crate::Result<BigDecimal> {
 }
 
 /// Format a BigDecimal as a string, preserving trailing zeros for the scale.
-/// BigDecimal::to_string() formats zero as "0" regardless of scale,
-/// but we want "0.00" for a value stored with scale=2.
+/// BigDecimal::to_string() may drop trailing zeros, but we want "1.10" to
+/// remain "1.10" and "0.00" to remain "0.00" for a value stored with scale=2.
 pub fn format_numeric(bd: &BigDecimal) -> String {
-    use bigdecimal::Zero;
-    if bd.is_zero() {
-        let (_, scale) = bd.as_bigint_and_exponent();
-        if scale > 0 {
-            format!("0.{}", "0".repeat(scale as usize))
-        } else {
-            "0".to_string()
+    let (bigint, scale) = bd.as_bigint_and_exponent();
+    if scale <= 0 {
+        // No decimal places: just print the integer (possibly scaled up)
+        if scale == 0 {
+            return bigint.to_string();
         }
+        // Negative scale means multiply by 10^(-scale)
+        let factor = num_bigint::BigInt::from(10).pow((-scale) as u32);
+        return (bigint * factor).to_string();
+    }
+    let scale = scale as usize;
+    let is_negative = bigint.sign() == Sign::Minus;
+    let digits = bigint.magnitude().to_string();
+    let digits_len = digits.len();
+
+    let (integer_part, frac_part) = if digits_len > scale {
+        let split = digits_len - scale;
+        (&digits[..split], digits[split..].to_string())
     } else {
-        bd.to_string()
+        let zeros = "0".repeat(scale - digits_len);
+        ("0", format!("{zeros}{digits}"))
+    };
+
+    if is_negative {
+        format!("-{integer_part}.{frac_part}")
+    } else {
+        format!("{integer_part}.{frac_part}")
     }
 }
 
