@@ -1117,7 +1117,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     }
                     Err(err) => {
                         // Auto-checkpoint errors should not surface to the committed statement.
-                        tracing::info!("MVCC auto-checkpoint failed: {err}");
+                        tracing::debug!("MVCC auto-checkpoint failed: {err}");
                         self.finalize(mvcc_store)?;
                         return Ok(TransitionResult::Done(()));
                     }
