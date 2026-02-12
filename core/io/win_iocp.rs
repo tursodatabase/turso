@@ -673,7 +673,7 @@ impl WindowsFile {
         }
 
         unsafe {
-            if io_function(overlapped_ptr) != FALSE || GetLastError() != ERROR_IO_PENDING {
+            if io_function(overlapped_ptr) == FALSE && GetLastError() != ERROR_IO_PENDING {
                 let io_packet = Arc::from_raw(overlapped_ptr as *mut IoOverlappedPacket);
                 let _ = self.parent_io.forget_io_packet(io_packet);
                 return Err(get_generic_limboerror_from_last_os_err());
@@ -950,7 +950,7 @@ mod tests {
 
         assert_eq!(
             get_generic_limboerror_from_os_err(5).to_string(),
-            String::from("Internal error: Windows Error: Access is denied.\r\n")
+            String::from("Internal error: Windows Error: [5]Access is denied.\r\n")
         );
     }
 
