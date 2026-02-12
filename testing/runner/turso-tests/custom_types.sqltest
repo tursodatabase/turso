@@ -28,7 +28,7 @@ expect {
 test drop-type-basic {
     CREATE TYPE test_uint BASE text ENCODE test_uint_encode(value) DECODE test_uint_decode(value);
     DROP TYPE test_uint;
-    SELECT count(*) FROM sqlite_turso_types;
+    SELECT count(*) FROM sqlite_turso_types WHERE name = 'test_uint';
 }
 expect {
     0
