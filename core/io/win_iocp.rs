@@ -47,8 +47,14 @@ use crate::{Clock, Completion, File, LimboError, OpenFlags, Result, IO};
 use smallvec::SmallVec;
 use std::collections::{HashMap, VecDeque};
 use std::error::Error;
+use std::ffi::OsString;
+use std::os::windows::ffi::OsStringExt;
 use std::ptr::NonNull;
 use windows_sys::core::BOOL;
+use windows_sys::Win32::System::Diagnostics::Debug::{
+    FormatMessageW, FORMAT_MESSAGE_ALLOCATE_BUFFER, FORMAT_MESSAGE_FROM_SYSTEM,
+    FORMAT_MESSAGE_IGNORE_INSERTS,
+};
 
 use std::{io, mem, ptr};
 use tracing::{debug, instrument, trace, warn, Level};
@@ -56,8 +62,8 @@ use tracing::{debug, instrument, trace, warn, Level};
 use super::FileSyncType;
 use crate::io::completions::CompletionInner;
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, ERROR_IO_PENDING, ERROR_OPERATION_ABORTED, FALSE, GENERIC_READ,
-    GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE, TRUE, WAIT_TIMEOUT,
+    CloseHandle, GetLastError, LocalFree, ERROR_IO_PENDING, ERROR_OPERATION_ABORTED, FALSE,
+    GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE, TRUE, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FileEndOfFileInfo, FlushFileBuffers, GetFileSizeEx, LockFileEx, ReadFile,
@@ -135,6 +141,49 @@ fn get_limboerror_from_os_err(err: u32) -> LimboError {
 
     let error = std::io::Error::from_raw_os_error(error_code);
     error.into()
+}
+
+#[inline]
+fn get_generic_limboerror_from_last_os_err() -> LimboError {
+    get_generic_limboerror_from_os_err(unsafe { GetLastError() })
+}
+
+#[inline]
+fn get_generic_limboerror_from_os_err(err: u32) -> LimboError {
+    let mut buffer: *mut u16 = ptr::null_mut();
+    unsafe {
+        let size = FormatMessageW(
+            FORMAT_MESSAGE_ALLOCATE_BUFFER
+                | FORMAT_MESSAGE_FROM_SYSTEM
+                | FORMAT_MESSAGE_IGNORE_INSERTS,
+            ptr::null(),
+            err,
+            0,
+            (&raw mut buffer).cast(),
+            0,
+            ptr::null(),
+        );
+
+        if buffer.is_null() || size == 0 {
+            return LimboError::InternalError(format!("Windows Error: [{}]", err));
+        }
+
+        let Ok(size) = size.try_into() else {
+            LocalFree(buffer.cast());
+            return LimboError::InternalError(format!("Windows Error: [{}]", err));
+        };
+
+        let buffer_slice = std::slice::from_raw_parts(buffer, size);
+        let string = OsString::from_wide(buffer_slice);
+
+        LocalFree(buffer.cast());
+
+        let Ok(string) = string.into_string() else {
+            return LimboError::InternalError(format!("Windows Error: [{}]", err));
+        };
+
+        LimboError::InternalError(format!("Windows Error: [{err}]{string}"))
+    }
 }
 
 #[inline]
@@ -228,7 +277,7 @@ impl IO for WindowsIOCP {
             );
 
             if file_handle == INVALID_HANDLE_VALUE {
-                return Err(get_limboerror_from_last_os_err());
+                return Err(get_generic_limboerror_from_last_os_err());
             };
 
             let windows_file = Arc::new(WindowsFile {
@@ -240,7 +289,7 @@ impl IO for WindowsIOCP {
             let result = CreateIoCompletionPort(file_handle, self.instance.iocp_queue_handle, 0, 0);
 
             if result.is_null() {
-                return Err(get_limboerror_from_last_os_err());
+                return Err(get_generic_limboerror_from_last_os_err());
             };
 
             if std::env::var(common::ENV_DISABLE_FILE_LOCK).is_err()
@@ -298,7 +347,9 @@ impl IO for WindowsIOCP {
         trace!("I/O Step..");
 
         match self.instance.process_packet_from_iocp() {
-            Err(GetIOCPPacketError::SystemError(code)) => Err(get_limboerror_from_os_err(code)),
+            Err(GetIOCPPacketError::SystemError(code)) => {
+                Err(get_generic_limboerror_from_os_err(code))
+            }
             Err(GetIOCPPacketError::Aborted)
             | Err(GetIOCPPacketError::Empty)
             | Err(GetIOCPPacketError::InvalidIO)
@@ -625,7 +676,7 @@ impl WindowsFile {
             if io_function(overlapped_ptr) != FALSE || GetLastError() != ERROR_IO_PENDING {
                 let io_packet = Arc::from_raw(overlapped_ptr as *mut IoOverlappedPacket);
                 let _ = self.parent_io.forget_io_packet(io_packet);
-                return Err(get_limboerror_from_last_os_err());
+                return Err(get_generic_limboerror_from_last_os_err());
             }
         }
         Ok(completion)
@@ -750,7 +801,7 @@ impl File for WindowsFile {
 
         unsafe {
             if FlushFileBuffers(self.file_handle) == FALSE {
-                return Err(get_limboerror_from_last_os_err());
+                return Err(get_generic_limboerror_from_last_os_err());
             }
         };
         completion.complete(0);
@@ -780,7 +831,7 @@ impl File for WindowsFile {
                                                               // the struct size will not exceed u32
             ) == FALSE
             {
-                return Err(get_limboerror_from_last_os_err());
+                return Err(get_generic_limboerror_from_last_os_err());
             }
         }
         completion.complete(0);
@@ -792,7 +843,7 @@ impl File for WindowsFile {
 
         unsafe {
             if GetFileSizeEx(self.file_handle, &raw mut filesize) == FALSE {
-                return Err(get_limboerror_from_last_os_err());
+                return Err(get_generic_limboerror_from_last_os_err());
             }
         }
 
@@ -817,13 +868,68 @@ impl Drop for WindowsFile {
 
 #[cfg(test)]
 mod tests {
-    use crate::io::{common, win_iocp::get_limboerror_from_os_err};
+    use std::sync::Arc;
+
+    use crate::{
+        io::{
+            common,
+            win_iocp::{get_generic_limboerror_from_os_err, get_limboerror_from_os_err},
+            TempFile,
+        },
+        Buffer, Completion, IO,
+    };
 
     use super::WindowsIOCP;
 
     #[test]
     fn test_multiple_processes_cannot_open_file() {
         common::tests::test_multiple_processes_cannot_open_file(WindowsIOCP::new);
+    }
+
+    #[test]
+    fn test_file_read_write() {
+        let iocp: Arc<dyn IO> = Arc::new(WindowsIOCP::new().unwrap());
+        let file = TempFile::new(&iocp).unwrap();
+
+        const WRITE: &[u8] = b"ABCD";
+
+        let mut vec = vec![];
+        for n in 0..150 {
+            let comp = Completion::new_write(|res| {
+                assert_eq!(res, Ok(4));
+            });
+            let buffer = Arc::new(Buffer::new_temporary(WRITE.len()));
+
+            buffer.as_mut_slice().copy_from_slice(WRITE);
+
+            let ret = file.pwrite(n * WRITE.len() as u64, buffer, comp).unwrap();
+            vec.push(ret);
+        }
+        vec.into_iter().for_each(|c| {
+            iocp.wait_for_completion(c.clone()).unwrap();
+            if c.failed() {
+                panic!();
+            }
+        });
+        let mut vec = vec![];
+
+        for n in 0..150 {
+            let buffer = Arc::new(Buffer::new_temporary(WRITE.len()));
+
+            let comp = Completion::new_read(buffer, |res| {
+                assert_eq!(res.clone().unwrap().1, 4);
+                res.err()
+            });
+
+            let ret = file.pread(n * WRITE.len() as u64, comp).unwrap();
+            vec.push(ret);
+        }
+        vec.iter().for_each(|c| {
+            iocp.wait_for_completion(c.clone()).unwrap();
+        });
+        vec.iter().any(|c| c.failed()).then(|| panic!());
+
+        assert_eq!(file.size().unwrap(), 150 * WRITE.iter().len() as u64);
     }
 
     #[test]
@@ -841,5 +947,25 @@ mod tests {
             get_limboerror_from_os_err(15818).to_string(),
             String::from("I/O error: uncategorized error")
         );
+
+        assert_eq!(
+            get_generic_limboerror_from_os_err(5).to_string(),
+            String::from("Internal error: Windows Error: Access is denied.\r\n")
+        );
+    }
+
+    #[test]
+    fn test_proper_drop() {
+        let write = b"Abcd";
+        let iocp: Arc<dyn IO> = Arc::new(WindowsIOCP::new().unwrap());
+        let file = TempFile::new(&iocp).unwrap();
+        let comp = Completion::new_write(|_| {});
+        let buffer = Arc::new(Buffer::new_temporary(write.len()));
+
+        buffer.as_mut_slice().copy_from_slice(write);
+
+        let _ = file.pwrite(0, buffer, comp).unwrap();
+        drop(iocp);
+        drop(file);
     }
 }
