@@ -1,10 +1,116 @@
+//! =============================================================================
+//! Antithesis Assertion Macros
+//! =============================================================================
+//!
+//! These macros define correctness properties for [Antithesis](https://antithesis.com/)
+//! autonomous testing. They wrap the [Antithesis SDK](https://docs.rs/antithesis_sdk)
+//! assertion macros and double as standard Rust assertions, giving us a single assertion
+//! layer that works both in normal builds and under Antithesis fuzzing.
+//!
+//! ## The `antithesis` feature flag
+//!
+//! All macros compile to different code depending on whether `--features antithesis`
+//! is enabled:
+//!
+//! - **Without** the feature: macros behave like their `std` counterparts (`assert!`,
+//!   `debug_assert!`, `unreachable!`, etc.), or are no-ops for observational macros.
+//! - **With** the feature: macros additionally report to the Antithesis SDK. On failure,
+//!   "always" assertions print an error to stderr and call `std::process::exit(0)` instead
+//!   of panicking. This clean exit lets Antithesis properly process the property violation.
+//!
+//! ## Five categories of assertions
+//!
+//! 1. **Condition assertions** ([`turso_assert!`], [`turso_debug_assert!`])
+//!    Drop-in replacements for `assert!`/`debug_assert!` that also report to Antithesis.
+//!
+//! 2. **Sometimes assertions** ([`turso_assert_sometimes!`],
+//!    [`turso_assert_sometimes_greater_than!`], [`turso_assert_sometimes_less_than!`],
+//!    [`turso_assert_sometimes_greater_than_or_equal!`],
+//!    [`turso_assert_sometimes_less_than_or_equal!`])
+//!    Observational only — never panic. Tell Antithesis "this condition should be true at
+//!    least once across all test runs." Useful for verifying the fuzzer explores both sides
+//!    of a branch.
+//!
+//! 3. **Boolean guidance** ([`turso_assert_some!`], [`turso_assert_all!`])
+//!    Multi-condition assertions that provide better guidance to the Antithesis fuzzer.
+//!    `some` = at least one condition must be true (OR), `all` = every condition must be true (AND).
+//!    Panics on failure (or exit(0) with antithesis feature).
+//!
+//! 4. **Reachability assertions** ([`turso_assert_reachable!`],
+//!    [`turso_assert_unreachable!`], [`turso_soft_unreachable!`])
+//!    Verify whether code paths are or aren't hit during testing.
+//!
+//! 5. **Comparison assertions** ([`turso_assert_eq!`], [`turso_assert_ne!`],
+//!    [`turso_assert_greater_than!`], [`turso_assert_greater_than_or_equal!`],
+//!    [`turso_assert_less_than!`], [`turso_assert_less_than_or_equal!`])
+//!    Typed comparison assertions that provide richer information to Antithesis than a
+//!    plain `turso_assert!(a > b)`.
+//!
+//! ## Note: fuzzer guidance temporarily disabled
+//!
+//! The Antithesis SDK provides specialized `numeric_guidance_helper!` and
+//! `boolean_guidance_helper!` macros that give the fuzzer detailed numeric/boolean
+//! values to guide exploration. These were previously used by comparison and boolean
+//! macros but are currently disabled (replaced with plain `assert_always_or_unreachable!`
+//! / `assert_sometimes!`) while Antithesis investigates an issue.
+//!
+//! The macros still work correctly as assertions — they just don't give the fuzzer
+//! as much detail to work with. Guidance will be restored when the issue is resolved.
+//!
+//! ## Quick reference
+//!
+//! | Macro | Antithesis SDK | Panics? | Notes |
+//! |-------|---------------|---------|-------|
+//! | `turso_assert!` | `assert_always_or_unreachable!` | Yes (exit(0) w/ feature) | Drop-in for `assert!` |
+//! | `turso_debug_assert!` | `assert_always_or_unreachable!` | Debug only (exit(0) w/ feature) | Drop-in for `debug_assert!` |
+//! | `turso_assert_sometimes!` | `assert_sometimes!` | Never | Observational only |
+//! | `turso_assert_some!` | `assert_always_or_unreachable!` | Yes (exit(0) w/ feature) | OR of named conditions |
+//! | `turso_assert_all!` | `assert_always_or_unreachable!` | Yes (exit(0) w/ feature) | AND of named conditions |
+//! | `turso_assert_reachable!` | *(no-op)* | Never | Pending better SQL generation |
+//! | `turso_assert_unreachable!` | `assert_unreachable!` | Yes (exit(0) w/ feature) | Hard unreachable |
+//! | `turso_soft_unreachable!` | `assert_unreachable!` | Never | Soft signal, no-op w/o feature |
+//! | `turso_assert_eq!` | `assert_always_or_unreachable!` | Yes (exit(0) w/ feature) | Drop-in for `assert_eq!` |
+//! | `turso_assert_ne!` | `assert_always_or_unreachable!` | Yes (exit(0) w/ feature) | Drop-in for `assert_ne!` |
+//! | `turso_assert_greater_than!` | `assert_always_or_unreachable!` | Yes (exit(0) w/ feature) | `left > right` |
+//! | `turso_assert_greater_than_or_equal!` | `assert_always_or_unreachable!` | Yes (exit(0) w/ feature) | `left >= right` |
+//! | `turso_assert_less_than!` | `assert_always_or_unreachable!` | Yes (exit(0) w/ feature) | `left < right` |
+//! | `turso_assert_less_than_or_equal!` | `assert_always_or_unreachable!` | Yes (exit(0) w/ feature) | `left <= right` |
+//! | `turso_assert_sometimes_greater_than!` | `assert_sometimes!` | Never | Observational `left > right` |
+//! | `turso_assert_sometimes_less_than!` | `assert_sometimes!` | Never | Observational `left < right` |
+//! | `turso_assert_sometimes_greater_than_or_equal!` | `assert_sometimes!` | Never | Observational `left >= right` |
+//! | `turso_assert_sometimes_less_than_or_equal!` | `assert_sometimes!` | Never | Observational `left <= right` |
+
 extern crate proc_macro;
 mod atomic_enum;
 mod ext;
 mod test;
 
+// Import assertion proc macro implementations
+mod assert;
+
+use assert::{
+    comparison_auto_message, details_format_args, details_json, expr_to_lit_str,
+    BooleanGuidanceInput, ComparisonAssertInput, ConditionAssertInput, MessageAssertInput,
+};
 use proc_macro::{token_stream::IntoIter, Group, TokenStream, TokenTree};
+use quote::quote;
 use std::collections::HashMap;
+use syn::{parse_macro_input, LitStr};
+
+/// Generate a runtime check that panics if `ANTITHESIS_OUTPUT_DIR` is not set.
+/// Uses `std::sync::Once` so the actual env var lookup only happens once per call site.
+fn antithesis_env_check() -> proc_macro2::TokenStream {
+    quote! {
+        {
+            static __TURSO_ANTITHESIS_ENV_CHECK: std::sync::Once = std::sync::Once::new();
+            __TURSO_ANTITHESIS_ENV_CHECK.call_once(|| {
+                if std::env::var_os("ANTITHESIS_OUTPUT_DIR").is_none() {
+                    panic!("Do not use --cfg antithesis unless running on Antithesis.");
+                }
+            });
+        }
+    }
+}
 
 /// A procedural macro that derives a `Description` trait for enums.
 /// This macro extracts documentation comments (specified with `/// Description...`) for enum variants
@@ -524,4 +630,972 @@ pub fn derive_atomic_enum(input: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn test(args: TokenStream, input: TokenStream) -> TokenStream {
     test::test_macro_attribute(args, input)
+}
+
+/// Controls the `#[cfg(not(antithesis))]` fallback in "always" comparison macros.
+#[allow(clippy::enum_variant_names)]
+enum ComparisonFallback {
+    /// `assert!(left OP right, fmt_args)` — for gt, gte, lt, lte
+    AssertOp,
+    /// `assert_eq!(left, right, fmt_args)`
+    AssertEq,
+    /// `assert_ne!(left, right, fmt_args)`
+    AssertNe,
+}
+
+enum ConditionAssertKind {
+    Assert,
+    DebugAssert,
+}
+
+enum BooleanCombinator {
+    Some,
+    All,
+}
+
+fn emit_condition_assert(
+    file_path: &str,
+    input: ConditionAssertInput,
+    kind: ConditionAssertKind,
+) -> proc_macro2::TokenStream {
+    let cond = &input.condition;
+    let msg = input
+        .message
+        .clone()
+        .unwrap_or_else(|| expr_to_lit_str(cond));
+    let prefixed = prefix_message(file_path, &msg);
+    let details = details_json(&input.details);
+
+    let (assert_call, exit_msg) = if let Some(fmt_args) = &input.format_args {
+        let assert_call = match kind {
+            ConditionAssertKind::Assert => quote! { assert!(__turso_cond, #msg, #fmt_args); },
+            ConditionAssertKind::DebugAssert => {
+                quote! { debug_assert!(__turso_cond, #msg, #fmt_args); }
+            }
+        };
+        (
+            assert_call,
+            quote! {
+                eprint!("[antithesis] assertion failed: ");
+                eprintln!(#msg, #fmt_args);
+                eprintln!("exiting with code 0 because antithesis already captured this failure");
+            },
+        )
+    } else {
+        let fmt_args = details_format_args(&msg, &input.details);
+        let assert_call = match kind {
+            ConditionAssertKind::Assert => quote! { assert!(__turso_cond, #fmt_args); },
+            ConditionAssertKind::DebugAssert => {
+                quote! { debug_assert!(__turso_cond, #fmt_args); }
+            }
+        };
+        (
+            assert_call,
+            quote! {
+                eprint!("[antithesis] assertion failed: ");
+                eprintln!(#fmt_args);
+                eprintln!("exiting with code 0 because antithesis already captured this failure");
+            },
+        )
+    };
+
+    let env_check = antithesis_env_check();
+    quote! {
+        {
+            let __turso_cond = #cond;
+            #[cfg(antithesis)]
+            {
+                #env_check
+                antithesis_sdk::assert_always_or_unreachable!(__turso_cond, #prefixed, #details);
+                if !__turso_cond {
+                    #exit_msg
+                    std::process::exit(0);
+                }
+            }
+            #[cfg(not(antithesis))]
+            { #assert_call }
+        }
+    }
+}
+
+fn emit_boolean_guidance(
+    file_path: &str,
+    input: BooleanGuidanceInput,
+    combinator: BooleanCombinator,
+) -> proc_macro2::TokenStream {
+    let prefixed = prefix_message(file_path, &input.message);
+    let details = details_json(&input.details);
+
+    let conds: Vec<_> = input.conditions.iter().map(|c| &c.condition).collect();
+
+    // Build the combined condition using separate quote! arms to avoid
+    // multi-character punct interpolation issues with `||` and `&&`.
+    let combined_cond = match combinator {
+        BooleanCombinator::Some => {
+            if conds.is_empty() {
+                quote! { false }
+            } else {
+                let mut iter = conds.iter();
+                let first = iter.next().unwrap();
+                let mut combined = quote! { #first };
+                for c in iter {
+                    combined = quote! { #combined || #c };
+                }
+                combined
+            }
+        }
+        BooleanCombinator::All => {
+            if conds.is_empty() {
+                quote! { true }
+            } else {
+                let mut iter = conds.iter();
+                let first = iter.next().unwrap();
+                let mut combined = quote! { #first };
+                for c in iter {
+                    combined = quote! { #combined && #c };
+                }
+                combined
+            }
+        }
+    };
+
+    let fmt_args = details_format_args(&input.message, &input.details);
+    let env_check = antithesis_env_check();
+    quote! {
+        {
+            let __turso_cond = #combined_cond;
+            #[cfg(antithesis)]
+            {
+                #env_check
+                antithesis_sdk::assert_always_or_unreachable!(__turso_cond, #prefixed, #details);
+                if !__turso_cond {
+                    eprint!("[antithesis] assertion failed: ");
+                    eprintln!(#fmt_args);
+                    eprintln!("exiting with code 0 because antithesis already captured this failure");
+                    std::process::exit(0);
+                }
+            }
+            #[cfg(not(antithesis))]
+            { assert!(__turso_cond, #fmt_args); }
+        }
+    }
+}
+
+fn emit_always_comparison(
+    file_path: &str,
+    input: ComparisonAssertInput,
+    op_str: &str,
+    fallback: ComparisonFallback,
+) -> proc_macro2::TokenStream {
+    let op_tokens: proc_macro2::TokenStream = op_str.parse().unwrap();
+    let left = &input.left;
+    let right = &input.right;
+    let msg = input
+        .message
+        .clone()
+        .unwrap_or_else(|| comparison_auto_message(left, right, op_str));
+    let prefixed = prefix_message(file_path, &msg);
+    let details = details_json(&input.details);
+    let fmt_args = details_format_args(&msg, &input.details);
+
+    let fallback_assert = match fallback {
+        ComparisonFallback::AssertOp => {
+            quote! { assert!(__turso_left #op_tokens __turso_right, #fmt_args); }
+        }
+        ComparisonFallback::AssertEq => {
+            quote! { assert_eq!(__turso_left, __turso_right, #fmt_args); }
+        }
+        ComparisonFallback::AssertNe => {
+            quote! { assert_ne!(__turso_left, __turso_right, #fmt_args); }
+        }
+    };
+
+    let env_check = antithesis_env_check();
+    quote! {
+        {
+            let ref __turso_left = #left;
+            let ref __turso_right = #right;
+            #[cfg(antithesis)]
+            {
+                #env_check
+                antithesis_sdk::assert_always_or_unreachable!(__turso_left #op_tokens __turso_right, #prefixed, #details);
+                if !(__turso_left #op_tokens __turso_right) {
+                    eprint!("[antithesis] assertion failed: ");
+                    eprintln!(#fmt_args);
+                    eprintln!("exiting with code 0 because antithesis already captured this failure");
+                    std::process::exit(0);
+                }
+            }
+            #[cfg(not(antithesis))]
+            { #fallback_assert }
+        }
+    }
+}
+
+fn emit_sometimes_comparison(
+    file_path: &str,
+    input: ComparisonAssertInput,
+    op_str: &str,
+) -> proc_macro2::TokenStream {
+    let op_tokens: proc_macro2::TokenStream = op_str.parse().unwrap();
+    let left = &input.left;
+    let right = &input.right;
+    let msg = input
+        .message
+        .clone()
+        .unwrap_or_else(|| comparison_auto_message(left, right, op_str));
+    let prefixed = prefix_message(file_path, &msg);
+    let details = details_json(&input.details);
+
+    let env_check = antithesis_env_check();
+    quote! {
+        {
+            let ref __turso_left = #left;
+            let ref __turso_right = #right;
+            #[cfg(antithesis)]
+            {
+                #env_check
+                antithesis_sdk::assert_sometimes!(__turso_left #op_tokens __turso_right, #prefixed, #details);
+            }
+            #[cfg(not(antithesis))]
+            {
+                let _ = (__turso_left, __turso_right);
+            }
+        }
+    }
+}
+
+/// Drop-in replacement for [`assert!`] that additionally reports to the
+/// [Antithesis SDK](https://docs.rs/antithesis_sdk) when compiled with
+/// `--features antithesis`.
+///
+/// Maps to `antithesis_sdk::assert_always_or_unreachable!` — the condition must be
+/// true every time this line is reached, but it is OK if the line is never reached.
+///
+/// # Behavior
+///
+/// - **Without `antithesis` feature**: behaves exactly like [`assert!`] (panics on failure).
+/// - **With `antithesis` feature**: reports the property to Antithesis via
+///   `assert_always_or_unreachable!`. On failure, prints the error to stderr and calls
+///   `std::process::exit(0)` instead of panicking. The clean exit lets Antithesis properly
+///   process the property violation. The normal `assert!` is skipped in this path.
+///
+/// # Parameters
+///
+/// - `condition` — boolean expression to check.
+/// - `"message"` *(optional)* — human-readable description.
+///   Auto-generated from the   condition expression if omitted.
+/// - `{ "key": value, ... }` *(optional)* — structured details forwarded to Antithesis
+///   as JSON and included in the panic/exit message.
+///
+/// # Usage
+///
+/// ```ignore
+/// turso_assert!(condition);
+/// turso_assert!(condition, "message");
+/// turso_assert!(condition, "message", { "key": value });
+/// ```
+///
+/// # Examples
+///
+/// ```ignore
+/// // Simple condition (auto-generates message from expression)
+/// turso_assert_less_than_or_equal!(value, PageSize::MAX as usize);
+///
+/// // With explicit message
+/// turso_assert_greater_than!(page_idx, 0, "page index must be positive");
+///
+/// // With structured details for Antithesis
+/// turso_assert_greater_than_or_equal!(
+///     available_space, required_space,
+///     "not enough space on page",
+///     { "available": available_space, "required": required_space }
+/// );
+/// ```
+///
+/// # When to use
+///
+/// Use `turso_assert!` anywhere you would use `assert!`. It is the default choice for
+/// invariants that must always hold. Prefer [`turso_debug_assert!`] for expensive checks
+/// that should only run in debug builds.
+#[proc_macro]
+pub fn turso_assert(input: TokenStream) -> TokenStream {
+    let file_path = get_caller_file(&input);
+    let input = parse_macro_input!(input as ConditionAssertInput);
+    emit_condition_assert(&file_path, input, ConditionAssertKind::Assert).into()
+}
+
+/// Drop-in replacement for [`debug_assert!`] that additionally reports to the
+/// [Antithesis SDK](https://docs.rs/antithesis_sdk) when compiled with
+/// `--features antithesis`.
+///
+/// Maps to `antithesis_sdk::assert_always_or_unreachable!`.
+///
+/// # Behavior
+///
+/// - **Without `antithesis` feature**: behaves exactly like [`debug_assert!`] — panics
+///   on failure in debug builds, compiled out in release builds.
+/// - **With `antithesis` feature**: reports the property to Antithesis via
+///   `assert_always_or_unreachable!`. On failure, prints the error to stderr and calls
+///   `std::process::exit(0)` instead of panicking. The clean exit lets Antithesis properly
+///   process the property violation. The normal `debug_assert!` is skipped in this path.
+///
+/// # Parameters
+///
+/// Same as [`turso_assert!`]:
+/// - `condition` — boolean expression to check.
+/// - `"message"` *(optional)* — human-readable description.
+/// - `{ "key": value, ... }` *(optional)* — structured details for Antithesis.
+///
+/// # Usage
+///
+/// ```ignore
+/// turso_debug_assert!(condition);
+/// turso_debug_assert!(condition, "message");
+/// turso_debug_assert!(condition, "message", { "key": value });
+/// ```
+///
+/// # Examples
+///
+/// ```ignore
+/// turso_debug_assert!(value <= PageSize::MAX as usize);
+/// turso_debug_assert!(matches!(self.page_type(), Ok(PageType::TableInterior)));
+/// ```
+///
+/// # When to use
+///
+/// Use `turso_debug_assert!` for invariant checks that are too expensive for release
+/// builds (e.g., scanning a list to verify sorted order).
+#[proc_macro]
+pub fn turso_debug_assert(input: TokenStream) -> TokenStream {
+    let file_path = get_caller_file(&input);
+    let input = parse_macro_input!(input as ConditionAssertInput);
+    emit_condition_assert(&file_path, input, ConditionAssertKind::DebugAssert).into()
+}
+
+/// Observational assertion: tells Antithesis that a condition should be true
+/// **at least once** across all test runs. Never panics.
+///
+/// Maps to `antithesis_sdk::assert_sometimes!`.
+///
+/// # Behavior
+///
+/// - **Without `antithesis` feature**: evaluates the condition expression (preserving any
+///   side effects) but discards the result. Effectively a no-op.
+/// - **With `antithesis` feature**: reports to Antithesis via `assert_sometimes!`.
+///   Antithesis will flag it if the condition is *never* true across the entire test
+///   campaign, indicating the fuzzer failed to explore that state.
+///
+/// This macro **never panics or exits** — it is purely observational.
+///
+/// # Parameters
+///
+/// - `condition` — boolean expression to observe.
+/// - `"message"` *(optional)* — human-readable description.
+/// - `{ "key": value, ... }` *(optional)* — structured details for Antithesis.
+///
+/// # Usage
+///
+/// ```ignore
+/// turso_assert_sometimes!(condition);
+/// turso_assert_sometimes!(condition, "message");
+/// turso_assert_sometimes!(condition, "message", { "key": value });
+/// ```
+///
+/// # When to use
+///
+/// Use `turso_assert_sometimes!` to verify the fuzzer explores both branches of a
+/// condition. For example, if a cache can be either hit or miss, place a
+/// `turso_assert_sometimes!` on each branch to ensure Antithesis tests both paths.
+#[proc_macro]
+pub fn turso_assert_sometimes(input: TokenStream) -> TokenStream {
+    let file_path = get_caller_file(&input);
+    let input = parse_macro_input!(input as ConditionAssertInput);
+    let cond = &input.condition;
+    let msg = input
+        .message
+        .clone()
+        .unwrap_or_else(|| expr_to_lit_str(cond));
+    let prefixed = prefix_message(&file_path, &msg);
+    let details = details_json(&input.details);
+
+    let env_check = antithesis_env_check();
+    quote! {
+        {
+            let __turso_cond = #cond;
+            #[cfg(antithesis)]
+            {
+                #env_check
+                antithesis_sdk::assert_sometimes!(__turso_cond, #prefixed, #details);
+            }
+            #[cfg(not(antithesis))]
+            {
+                let _ = __turso_cond;
+            }
+        }
+    }
+    .into()
+}
+
+/// Asserts that **at least one** of multiple named conditions is true whenever this
+/// line is reached (logical OR). All conditions are evaluated.
+///
+/// # Behavior
+///
+/// - **Without `antithesis` feature**: panics if none of the conditions are true (like `assert!`).
+/// - **With `antithesis` feature**: reports the property to Antithesis via
+///   `assert_always_or_unreachable!`. On failure, prints the error to stderr and calls
+///   `std::process::exit(0)` instead of panicking.
+///
+/// # Parameters
+///
+/// - `{name: condition, ...}` — named boolean conditions in curly braces. Names are
+///   labels for Antithesis reporting.
+/// - `"message"` — human-readable description (required).
+/// - `{ "key": value, ... }` *(optional)* — structured details for Antithesis.
+///
+/// # Usage
+///
+/// ```ignore
+/// turso_assert_some!(
+///     {is_leaf: page.is_leaf(), is_interior: page.is_interior()},
+///     "page must be either leaf or interior"
+/// );
+///
+/// turso_assert_some!(
+///     {has_data: !row.is_empty(), has_rowid: row.rowid().is_some()},
+///     "row must have data or a rowid",
+///     { "table": table_name }
+/// );
+/// ```
+///
+/// # When to use
+///
+/// Use whenever a condition has a logical OR.
+#[proc_macro]
+pub fn turso_assert_some(input: TokenStream) -> TokenStream {
+    let file_path = get_caller_file(&input);
+    let input = parse_macro_input!(input as BooleanGuidanceInput);
+    emit_boolean_guidance(&file_path, input, BooleanCombinator::Some).into()
+}
+
+/// Asserts that **all** named conditions are true whenever this line is reached
+/// (logical AND).
+///
+/// # Behavior
+///
+/// - **Without `antithesis` feature**: panics if any condition is false (like `assert!`).
+/// - **With `antithesis` feature**: reports the property to Antithesis via
+///   `assert_always_or_unreachable!`. On failure, prints the error to stderr and calls
+///   `std::process::exit(0)` instead of panicking.
+///
+/// # Parameters
+///
+/// - `{name: condition, ...}` — named boolean conditions in curly braces.
+/// - `"message"` — human-readable description (required).
+/// - `{ "key": value, ... }` *(optional)* — structured details for Antithesis.
+///
+/// # Usage
+///
+/// ```ignore
+/// turso_assert_all!(
+///     {valid_size: page_size > 0, within_bounds: offset < page_size},
+///     "page header fields must all be valid"
+/// );
+///
+/// // With structured details
+/// turso_assert_all!(
+///     {has_header: header.is_some(), correct_magic: magic == EXPECTED_MAGIC},
+///     "database file must be well-formed",
+///     { "magic": magic }
+/// );
+/// ```
+///
+/// # When to use
+///
+/// Use whenever a condition has a logical AND.
+#[proc_macro]
+pub fn turso_assert_all(input: TokenStream) -> TokenStream {
+    let file_path = get_caller_file(&input);
+    let input = parse_macro_input!(input as BooleanGuidanceInput);
+    emit_boolean_guidance(&file_path, input, BooleanCombinator::All).into()
+}
+
+/// Asserts that a code path is reached **at least once** during Antithesis testing.
+///
+/// # Behavior
+///
+/// **Currently a no-op in all builds.** This macro is disabled pending better SQL
+/// generation in `turso-stress`. When enabled, it will tell Antithesis that this code
+/// path should be exercised at least once across the entire test campaign.
+///
+/// # Parameters
+///
+/// - `"message"` — human-readable description of the code path.
+///
+/// # Usage
+///
+/// ```ignore
+/// turso_assert_reachable!("opcode: Init");
+/// ```
+///
+/// # Examples
+///
+/// ```ignore
+/// turso_assert_reachable!("opcode: Add");
+/// turso_assert_reachable!("checkpoint");
+/// ```
+///
+/// # When to use
+///
+/// Place at code paths that should be exercised by the fuzzer.
+//TODO enable this when turso-stress has better SQL generation
+#[proc_macro]
+pub fn turso_assert_reachable(_input: TokenStream) -> TokenStream {
+    quote! {
+        {
+        }
+    }
+    .into()
+}
+
+/// Asserts that a code path is **never** reached. This is a hard assertion — it will
+/// terminate the program if the path is executed.
+///
+/// Maps to `antithesis_sdk::assert_unreachable!`.
+///
+/// # Behavior
+///
+/// - **Without `antithesis` feature**: calls [`unreachable!`] (panics with the message).
+/// - **With `antithesis` feature**: reports to Antithesis via `assert_unreachable!`,
+///   prints the error, then calls `exit(0)`.
+///
+/// # Parameters
+///
+/// - `"message"` — human-readable description of why this path is unreachable (required).
+/// - `{ "key": value, ... }` *(optional)* — structured details for Antithesis and the
+///   panic/exit message.
+///
+/// # Usage
+///
+/// ```ignore
+/// turso_assert_unreachable!("message");
+/// turso_assert_unreachable!("message", { "key": value });
+/// ```
+///
+/// # When to use
+///
+/// Use for code paths that represent logic errors — places that should genuinely never
+/// execute. For paths that are unexpected but not impossible (e.g., fallback branches
+/// that indicate a likely bug but shouldn't panic), prefer [`turso_soft_unreachable!`] instead.
+#[proc_macro]
+pub fn turso_assert_unreachable(input: TokenStream) -> TokenStream {
+    let file_path = get_caller_file(&input);
+    let input = parse_macro_input!(input as MessageAssertInput);
+    let msg = &input.message;
+    let prefixed = prefix_message(&file_path, msg);
+    let details = details_json(&input.details);
+    let fmt_args = details_format_args(msg, &input.details);
+
+    let env_check = antithesis_env_check();
+    quote! {
+        {
+            #[cfg(antithesis)]
+            {
+                #env_check
+                antithesis_sdk::assert_unreachable!(#prefixed, #details);
+                eprint!("[antithesis] unreachable assertion reached: ");
+                eprintln!(#fmt_args);
+                eprintln!("exiting with code 0 because antithesis already captured this failure");
+                std::process::exit(0);
+            }
+            #[cfg(not(antithesis))]
+            { unreachable!(#fmt_args) }
+        }
+    }
+    .into()
+}
+
+/// Soft unreachable: signals to Antithesis that this code path should never be reached,
+/// but does **not** panic or exit. Without the `antithesis` feature, this is a no-op.
+///
+/// # Behavior
+///
+/// - **Without `antithesis` feature**: complete no-op — no evaluation, no side effects.
+/// - **With `antithesis` feature**: reports to Antithesis, then execution continues normally.
+///
+/// This is the key difference from [`turso_assert_unreachable!`]: soft_unreachable only
+/// *reports* to Antithesis, while the hard version terminates the process.
+///
+/// # Parameters
+///
+/// - `"message"` — human-readable description (required).
+/// - `{ "key": value, ... }` *(optional)* — structured details for Antithesis.
+///
+/// # Usage
+///
+/// ```ignore
+/// turso_soft_unreachable!("message");
+/// turso_soft_unreachable!("message", { "key": value });
+/// ```
+///
+/// # Examples
+///
+/// ```ignore
+/// // In the pager, marking unexpected-but-recoverable states
+/// turso_soft_unreachable!("wal_state() called on database without WAL");
+/// turso_soft_unreachable!(
+///     "Cannot set ptrmap entry for header/ptrmap page or invalid page",
+///     { "page": db_page_no_to_update }
+/// );
+/// ```
+///
+/// # When to use
+///
+/// Use for code paths that are unexpected but not impossible — places where you want
+/// Antithesis to flag the issue but don't want to crash the program, for example in error
+/// handling paths and fallback branches that indicate a likely bug but should degrade
+/// gracefully in production.
+#[proc_macro]
+pub fn turso_soft_unreachable(input: TokenStream) -> TokenStream {
+    let file_path = get_caller_file(&input);
+    let input = parse_macro_input!(input as MessageAssertInput);
+    let prefixed = prefix_message(&file_path, &input.message);
+    let details = details_json(&input.details);
+
+    let env_check = antithesis_env_check();
+    quote! {
+        {
+            #[cfg(antithesis)]
+            {
+                #env_check
+                antithesis_sdk::assert_unreachable!(#prefixed, #details);
+            }
+        }
+    }
+    .into()
+}
+
+/// Asserts that `left > right`, providing richer comparison information to Antithesis
+/// than a plain `turso_assert!(a > b)`.
+///
+/// # Behavior
+///
+/// - **Without `antithesis` feature**: behaves like `assert!(left > right, ...)`.
+/// - **With `antithesis` feature**: reports to Antithesis, then on failure prints the
+///   error and calls `std::process::exit(0)`.
+///
+/// # Parameters
+///
+/// - `left` — left-hand operand.
+/// - `right` — right-hand operand.
+/// - `"message"` *(optional)* — auto-generated as `"left > right"` if omitted.
+/// - `{ "key": value, ... }` *(optional)* — structured details.
+///
+/// # Usage
+///
+/// ```ignore
+/// turso_assert_greater_than!(left, right);
+/// turso_assert_greater_than!(left, right, "message");
+/// turso_assert_greater_than!(left, right, "message", { "key": value });
+/// ```
+///
+/// # Examples
+///
+/// ```ignore
+/// turso_assert_greater_than!(page_idx, 0);
+/// turso_assert_greater_than!(
+///     root_page_num, 0,
+///     "Largest root page number cannot be 0"
+/// );
+/// ```
+#[proc_macro]
+pub fn turso_assert_greater_than(input: TokenStream) -> TokenStream {
+    let file_path = get_caller_file(&input);
+    let input = parse_macro_input!(input as ComparisonAssertInput);
+    emit_always_comparison(&file_path, input, ">", ComparisonFallback::AssertOp).into()
+}
+
+/// Asserts that `left >= right`, providing richer comparison information to Antithesis
+/// than a plain `turso_assert!(a >= b)`.
+///
+/// Maps to `antithesis_sdk::assert_always_or_unreachable!` with `left >= right`.
+///
+/// # Behavior
+///
+/// - **Without `antithesis` feature**: behaves like `assert!(left >= right, ...)`.
+/// - **With `antithesis` feature**: reports to Antithesis, then on failure prints the
+///   error and calls `std::process::exit(0)`.
+///
+/// # Parameters
+///
+/// - `left`, `right` — operands to compare.
+/// - `"message"` *(optional)* — auto-generated as `"left >= right"` if omitted.
+/// - `{ "key": value, ... }` *(optional)* — structured details.
+///
+/// # Usage
+///
+/// ```ignore
+/// turso_assert_greater_than_or_equal!(left, right);
+/// turso_assert_greater_than_or_equal!(left, right, "message");
+/// turso_assert_greater_than_or_equal!(left, right, "message", { "key": value });
+/// ```
+#[proc_macro]
+pub fn turso_assert_greater_than_or_equal(input: TokenStream) -> TokenStream {
+    let file_path = get_caller_file(&input);
+    let input = parse_macro_input!(input as ComparisonAssertInput);
+    emit_always_comparison(&file_path, input, ">=", ComparisonFallback::AssertOp).into()
+}
+
+/// Asserts that `left < right`, providing richer comparison information to Antithesis
+/// than a plain `turso_assert!(a < b)`.
+///
+/// # Behavior
+///
+/// - **Without `antithesis` feature**: behaves like `assert!(left < right, ...)`.
+/// - **With `antithesis` feature**: reports to Antithesis, then on failure prints the
+///   error and calls `std::process::exit(0)`.
+///
+/// # Parameters
+///
+/// - `left`, `right` — operands to compare.
+/// - `"message"` *(optional)* — auto-generated as `"left < right"` if omitted.
+/// - `{ "key": value, ... }` *(optional)* — structured details.
+///
+/// # Usage
+///
+/// ```ignore
+/// turso_assert_less_than!(left, right);
+/// turso_assert_less_than!(left, right, "message");
+/// turso_assert_less_than!(left, right, "message", { "key": value });
+/// ```
+#[proc_macro]
+pub fn turso_assert_less_than(input: TokenStream) -> TokenStream {
+    let file_path = get_caller_file(&input);
+    let input = parse_macro_input!(input as ComparisonAssertInput);
+    emit_always_comparison(&file_path, input, "<", ComparisonFallback::AssertOp).into()
+}
+
+/// Asserts that `left <= right`, providing richer comparison information to Antithesis
+/// than a plain `turso_assert!(a <= b)`.
+///
+/// # Behavior
+///
+/// - **Without `antithesis` feature**: behaves like `assert!(left <= right, ...)`.
+/// - **With `antithesis` feature**: reports to Antithesis, then on failure prints the
+///   error and calls `std::process::exit(0)`.
+///
+/// # Parameters
+///
+/// - `left`, `right` — operands to compare.
+/// - `"message"` *(optional)* — auto-generated as `"left <= right"` if omitted.
+/// - `{ "key": value, ... }` *(optional)* — structured details.
+///
+/// # Usage
+///
+/// ```ignore
+/// turso_assert_less_than_or_equal!(left, right);
+/// turso_assert_less_than_or_equal!(left, right, "message");
+/// turso_assert_less_than_or_equal!(left, right, "message", { "key": value });
+/// ```
+#[proc_macro]
+pub fn turso_assert_less_than_or_equal(input: TokenStream) -> TokenStream {
+    let file_path = get_caller_file(&input);
+    let input = parse_macro_input!(input as ComparisonAssertInput);
+    emit_always_comparison(&file_path, input, "<=", ComparisonFallback::AssertOp).into()
+}
+
+/// Drop-in replacement for [`assert_eq!`] that additionally reports to the
+/// [Antithesis SDK](https://docs.rs/antithesis_sdk) in Antithesis builds (`--cfg=antithesis`).
+///
+/// # Behavior
+///
+/// - **Without `antithesis` feature**: behaves exactly like [`assert_eq!`].
+/// - **With `antithesis` feature**: reports to Antithesis, then on failure prints the
+///   error and calls `std::process::exit(0)`.
+///
+/// # Parameters
+///
+/// - `left`, `right` — values to compare for equality.
+/// - `"message"` *(optional)* — auto-generated as `"left == right"` if omitted.
+/// - `{ "key": value, ... }` *(optional)* — structured details.
+///
+/// # Usage
+///
+/// ```ignore
+/// turso_assert_eq!(left, right);
+/// turso_assert_eq!(left, right, "message");
+/// turso_assert_eq!(left, right, "message", { "key": value });
+/// ```
+///
+/// # Examples
+///
+/// ```ignore
+/// turso_assert_eq!(QueryMode::new(&cmd), mode);
+/// turso_assert_eq!(joined_tables.len(), 1, "expected only one joined table");
+/// ```
+#[proc_macro]
+pub fn turso_assert_eq(input: TokenStream) -> TokenStream {
+    let file_path = get_caller_file(&input);
+    let input = parse_macro_input!(input as ComparisonAssertInput);
+    emit_always_comparison(&file_path, input, "==", ComparisonFallback::AssertEq).into()
+}
+
+/// Drop-in replacement for [`assert_ne!`] that additionally reports to the
+/// [Antithesis SDK](https://docs.rs/antithesis_sdk) in Antithesis builds (`--cfg=antithesis`).
+///
+/// # Behavior
+///
+/// - **Without `antithesis` feature**: behaves exactly like [`assert_ne!`].
+/// - **With `antithesis` feature**: reports to Antithesis, then on failure prints the
+///   error and calls `std::process::exit(0)`.
+///
+/// # Parameters
+///
+/// - `left`, `right` — values to compare for inequality.
+/// - `"message"` *(optional)* — auto-generated as `"left != right"` if omitted.
+/// - `{ "key": value, ... }` *(optional)* — structured details.
+///
+/// # Usage
+///
+/// ```ignore
+/// turso_assert_ne!(left, right);
+/// turso_assert_ne!(left, right, "message");
+/// turso_assert_ne!(left, right, "message", { "key": value });
+/// ```
+#[proc_macro]
+pub fn turso_assert_ne(input: TokenStream) -> TokenStream {
+    let file_path = get_caller_file(&input);
+    let input = parse_macro_input!(input as ComparisonAssertInput);
+    emit_always_comparison(&file_path, input, "!=", ComparisonFallback::AssertNe).into()
+}
+
+/// Observational assertion: tells Antithesis that `left > right` should be true
+/// **at least once** across all test runs. Never panics.
+///
+/// # Behavior
+///
+/// - **Without `antithesis` feature**: evaluates both operands, then discards the result. No-op.
+/// - **With `antithesis` feature**: reports the failure to Antithesis, then continues execution.
+///
+/// # Parameters
+///
+/// - `left`, `right` — operands to compare.
+/// - `"message"` *(optional)* — auto-generated as `"left > right"` if omitted.
+/// - `{ "key": value, ... }` *(optional)* — structured details.
+///
+/// # Usage
+///
+/// ```ignore
+/// turso_assert_sometimes_greater_than!(left, right);
+/// turso_assert_sometimes_greater_than!(left, right, "message");
+/// turso_assert_sometimes_greater_than!(left, right, "message", { "key": value });
+/// ```
+///
+/// # When to use
+///
+/// Use to verify the fuzzer explores states where one value exceeds another. For example,
+/// ensuring the WAL sometimes grows beyond a certain threshold.
+#[proc_macro]
+pub fn turso_assert_sometimes_greater_than(input: TokenStream) -> TokenStream {
+    let file_path = get_caller_file(&input);
+    let input = parse_macro_input!(input as ComparisonAssertInput);
+    emit_sometimes_comparison(&file_path, input, ">").into()
+}
+
+/// Observational assertion: tells Antithesis that `left < right` should be true
+/// **at least once** across all test runs. Never panics.
+///
+/// # Behavior
+///
+/// - **Without `antithesis` feature**: evaluates both operands, then discards the result. No-op.
+/// - **With `antithesis` feature**: reports to Antithesis via `assert_sometimes!`.
+///
+/// # Parameters
+///
+/// - `left`, `right` — operands to compare.
+/// - `"message"` *(optional)* — auto-generated as `"left < right"` if omitted.
+/// - `{ "key": value, ... }` *(optional)* — structured details.
+///
+/// # Usage
+///
+/// ```ignore
+/// turso_assert_sometimes_less_than!(left, right);
+/// turso_assert_sometimes_less_than!(left, right, "message");
+/// turso_assert_sometimes_less_than!(left, right, "message", { "key": value });
+/// ```
+#[proc_macro]
+pub fn turso_assert_sometimes_less_than(input: TokenStream) -> TokenStream {
+    let file_path = get_caller_file(&input);
+    let input = parse_macro_input!(input as ComparisonAssertInput);
+    emit_sometimes_comparison(&file_path, input, "<").into()
+}
+
+/// Observational assertion: tells Antithesis that `left >= right` should be true
+/// **at least once** across all test runs. Never panics.
+///
+/// # Behavior
+///
+/// - **Without `antithesis` feature**: evaluates both operands, then discards the result. No-op.
+/// - **With `antithesis` feature**: reports to Antithesis via `assert_sometimes!`.
+///
+/// # Parameters
+///
+/// - `left`, `right` — operands to compare.
+/// - `"message"` *(optional)* — auto-generated as `"left >= right"` if omitted.
+/// - `{ "key": value, ... }` *(optional)* — structured details.
+///
+/// # Usage
+///
+/// ```ignore
+/// turso_assert_sometimes_greater_than_or_equal!(left, right);
+/// turso_assert_sometimes_greater_than_or_equal!(left, right, "message");
+/// turso_assert_sometimes_greater_than_or_equal!(left, right, "message", { "key": value });
+/// ```
+#[proc_macro]
+pub fn turso_assert_sometimes_greater_than_or_equal(input: TokenStream) -> TokenStream {
+    let file_path = get_caller_file(&input);
+    let input = parse_macro_input!(input as ComparisonAssertInput);
+    emit_sometimes_comparison(&file_path, input, ">=").into()
+}
+
+/// Observational assertion: tells Antithesis that `left <= right` should be true
+/// **at least once** across all test runs. Never panics.
+///
+/// # Behavior
+///
+/// - **Without `antithesis` feature**: evaluates both operands, then discards the result. No-op.
+/// - **With `antithesis` feature**: reports to Antithesis via `assert_sometimes!`.
+///
+/// # Parameters
+///
+/// - `left`, `right` — operands to compare.
+/// - `"message"` *(optional)* — auto-generated as `"left <= right"` if omitted.
+/// - `{ "key": value, ... }` *(optional)* — structured details.
+///
+/// # Usage
+///
+/// ```ignore
+/// turso_assert_sometimes_less_than_or_equal!(left, right);
+/// turso_assert_sometimes_less_than_or_equal!(left, right, "message");
+/// turso_assert_sometimes_less_than_or_equal!(left, right, "message", { "key": value });
+/// ```
+#[proc_macro]
+pub fn turso_assert_sometimes_less_than_or_equal(input: TokenStream) -> TokenStream {
+    let file_path = get_caller_file(&input);
+    let input = parse_macro_input!(input as ComparisonAssertInput);
+    emit_sometimes_comparison(&file_path, input, "<=").into()
+}
+
+fn get_caller_file(input: &TokenStream) -> String {
+    let mut iter = input.clone().into_iter();
+    if let Some(first_token) = iter.next() {
+        first_token.span().start().file()
+    } else {
+        "unknown".to_string()
+    }
+}
+
+fn prefix_message(file_path: &str, msg: &LitStr) -> LitStr {
+    LitStr::new(&format!("[{}] {}", file_path, msg.value()), msg.span())
 }

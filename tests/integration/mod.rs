@@ -1,3 +1,4 @@
+mod assert_details;
 mod common;
 mod conflict_resolution;
 mod functions;

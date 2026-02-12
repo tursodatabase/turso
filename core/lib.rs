@@ -113,6 +113,25 @@ pub use storage::{
 };
 use tracing::{instrument, Level};
 use turso_macros::{match_ignore_ascii_case, AtomicEnum};
+
+pub use turso_macros::turso_assert;
+pub use turso_macros::turso_assert_all;
+pub use turso_macros::turso_assert_eq;
+pub use turso_macros::turso_assert_greater_than;
+pub use turso_macros::turso_assert_greater_than_or_equal;
+pub use turso_macros::turso_assert_less_than;
+pub use turso_macros::turso_assert_less_than_or_equal;
+pub use turso_macros::turso_assert_ne;
+pub use turso_macros::turso_assert_reachable;
+pub use turso_macros::turso_assert_some;
+pub use turso_macros::turso_assert_sometimes;
+pub use turso_macros::turso_assert_sometimes_greater_than;
+pub use turso_macros::turso_assert_sometimes_greater_than_or_equal;
+pub use turso_macros::turso_assert_sometimes_less_than;
+pub use turso_macros::turso_assert_sometimes_less_than_or_equal;
+pub use turso_macros::turso_assert_unreachable;
+pub use turso_macros::turso_debug_assert;
+pub use turso_macros::turso_soft_unreachable;
 use turso_parser::{ast, ast::Cmd, parser::Parser};
 pub use types::IOResult;
 pub use types::Value;
