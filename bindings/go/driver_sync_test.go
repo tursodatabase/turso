@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"math/rand"
+	"net"
 	"net/http"
 	"os"
 	"path"
@@ -149,52 +150,35 @@ type TursoServer struct {
 	server  *os.Process
 }
 
+// getFreePort asks the OS for a free port by binding to port 0.
+func getFreePort() (int, error) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return 0, err
+	}
+	port := l.Addr().(*net.TCPAddr).Port
+	l.Close()
+	return port, nil
+}
+
 func NewTursoServer() (*TursoServer, error) {
 	if localSyncServer, ok := os.LookupEnv("LOCAL_SYNC_SERVER"); ok {
-		port := 10_000 + rand.Intn(65536-10_000)
-		server, err := os.StartProcess(
-			localSyncServer,
-			[]string{localSyncServer, "--sync-server", fmt.Sprintf("0.0.0.0:%v", port)},
-			&os.ProcAttr{Files: []*os.File{
-				os.Stdin,
-				os.Stdout,
-				os.Stderr,
-			}},
-		)
-		if err != nil {
-			return nil, err
-		}
-		turso := &TursoServer{
-			userUrl: fmt.Sprintf("http://localhost:%v", port),
-			DbUrl:   fmt.Sprintf("http://localhost:%v", port),
-			host:    "",
-			server:  server,
-		}
-		// Wait for server to become ready, with timeout and process health check.
-		deadline := time.Now().Add(30 * time.Second)
-		exitCh := make(chan error, 1)
-		go func() {
-			_, err := server.Wait()
-			exitCh <- err
-		}()
-		for {
-			select {
-			case exitErr := <-exitCh:
-				return nil, fmt.Errorf("server process exited before becoming ready: %v", exitErr)
-			default:
+		const maxRetries = 5
+		var lastErr error
+		for attempt := 0; attempt < maxRetries; attempt++ {
+			port, err := getFreePort()
+			if err != nil {
+				lastErr = err
+				continue
 			}
-			if time.Now().After(deadline) {
-				server.Kill()
-				return nil, fmt.Errorf("timed out waiting for server to become ready on port %d", port)
+			turso, err := startLocalServer(localSyncServer, port)
+			if err != nil {
+				lastErr = err
+				continue
 			}
-			resp, err := http.Get(turso.userUrl)
-			if err == nil {
-				resp.Body.Close()
-				break
-			}
-			time.Sleep(10 * time.Millisecond)
+			return turso, nil
 		}
-		return turso, nil
+		return nil, fmt.Errorf("failed to start server after %d attempts: %v", maxRetries, lastErr)
 	} else {
 		name := randomString()
 		err := handleResponse(http.Post(fmt.Sprintf("%v/v1/tenants/%v", AdminUrl, name), "application/json", nil))
@@ -217,6 +201,52 @@ func NewTursoServer() (*TursoServer, error) {
 		}
 		return turso, nil
 	}
+}
+
+func startLocalServer(localSyncServer string, port int) (*TursoServer, error) {
+	server, err := os.StartProcess(
+		localSyncServer,
+		[]string{localSyncServer, "--sync-server", fmt.Sprintf("0.0.0.0:%v", port)},
+		&os.ProcAttr{Files: []*os.File{
+			os.Stdin,
+			os.Stdout,
+			os.Stderr,
+		}},
+	)
+	if err != nil {
+		return nil, err
+	}
+	turso := &TursoServer{
+		userUrl: fmt.Sprintf("http://localhost:%v", port),
+		DbUrl:   fmt.Sprintf("http://localhost:%v", port),
+		host:    "",
+		server:  server,
+	}
+	// Wait for server to become ready, with timeout and process health check.
+	deadline := time.Now().Add(30 * time.Second)
+	exitCh := make(chan error, 1)
+	go func() {
+		_, err := server.Wait()
+		exitCh <- err
+	}()
+	for {
+		select {
+		case exitErr := <-exitCh:
+			return nil, fmt.Errorf("server process exited before becoming ready: %v", exitErr)
+		default:
+		}
+		if time.Now().After(deadline) {
+			server.Kill()
+			return nil, fmt.Errorf("timed out waiting for server to become ready on port %d", port)
+		}
+		resp, err := http.Get(turso.userUrl)
+		if err == nil {
+			resp.Body.Close()
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return turso, nil
 }
 
 func (s *TursoServer) Close() {
