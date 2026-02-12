@@ -3223,9 +3223,7 @@ mod hashtests {
             Value::from_i64(30),
             Value::from_f64(1000.50),
         ];
-        let _ = ht
-            .insert(key1.clone(), 100, payload1, None)
-            .unwrap();
+        let _ = ht.insert(key1.clone(), 100, payload1, None).unwrap();
 
         let key2 = vec![Value::from_i64(2)];
         let payload2 = vec![
@@ -3233,9 +3231,7 @@ mod hashtests {
             Value::from_i64(25),
             Value::from_f64(2000.75),
         ];
-        let _ = ht
-            .insert(key2.clone(), 200, payload2, None)
-            .unwrap();
+        let _ = ht.insert(key2.clone(), 200, payload2, None).unwrap();
 
         let _ = ht.finalize_build(None);
 
