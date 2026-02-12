@@ -3,6 +3,24 @@
 # Usage: ./setup.sh [--force]
 set -e
 
+# Check platform
+if [ "$(uname)" = "Darwin" ]; then
+    echo "❌ ERROR: SQLRight is not supported on macOS"
+    echo ""
+    echo "SQLRight requires Linux-specific AFL components that are incompatible with macOS."
+    echo ""
+    echo "Options:"
+    echo "  1. Use Docker:"
+    echo "     docker pull steveleungsly/sqlright_sqlite:version1.2"
+    echo ""
+    echo "  2. Use a Linux VM (UTM, Parallels, VMware, etc.)"
+    echo ""
+    echo "  3. Use WSL2 on Windows"
+    echo ""
+    echo "See README.md for more details."
+    exit 1
+fi
+
 FORCE=false
 [ "$1" = "--force" ] && FORCE=true
 

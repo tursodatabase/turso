@@ -6,7 +6,29 @@ SQLRight uses SQL-aware mutations and oracle-based bug detection (NOREC, TLP, IN
 
 ## Setup
 
-### Prerequisites
+### Platform Support
+
+**SQLRight is designed for Linux (Ubuntu 20.04).**
+
+- **Linux**: Native support, follow instructions below
+- **macOS**: **Not supported** - use Docker or Linux VM (see below)
+- **Windows**: Use WSL2 or Docker
+
+#### macOS Users
+
+SQLRight uses AFL which has extensive Linux-specific dependencies. To run on macOS:
+
+1. **Docker (Recommended)**: Use SQLRight's official Docker image
+   ```bash
+   docker pull steveleungsly/sqlright_sqlite:version1.2
+   # Adapt for Turso (requires custom Dockerfile)
+   ```
+
+2. **Linux VM**: Run in a Linux VM (UTM, Parallels, VMware, etc.)
+
+Partial macOS compatibility patches are included (`patches/0002-*.patch`, `0003-*.patch`) but native builds require extensive additional AFL/macOS type fixes.
+
+### Prerequisites (Linux)
 
 ```bash
 sudo apt-get install -y build-essential bison flex libreadline-dev zlib1g-dev
@@ -184,7 +206,9 @@ testing/sqlright/
 ├── run_production.sh     # production fuzzing script
 ├── collect_coverage.sh   # coverage report generation
 ├── patches/              # git patches applied to SQLRight
-│   └── 0001-turso-increase-map-size-and-fix-gcc13.patch
+│   ├── 0001-turso-increase-map-size-and-fix-gcc13.patch
+│   ├── 0002-turso-fix-macos-bison-compatibility.patch (macOS only, incomplete)
+│   └── 0003-turso-fix-macos-compilation-errors.patch (macOS only, incomplete)
 ├── README.md             # this file
 ├── .gitignore
 ├── build/                # [gitignored] SQLRight clone + compiled binaries
