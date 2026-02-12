@@ -451,6 +451,31 @@ impl Connection {
             existing_views,
             self.experimental_triggers_enabled(),
         )?;
+
+        // Load custom types from sqlite_turso_types if the table exists
+        if fresh
+            .tables
+            .contains_key(crate::schema::TURSO_TYPES_TABLE_NAME)
+        {
+            // Temporarily install the schema so we can prepare a query against it
+            self.with_schema_mut(|schema| {
+                *schema = fresh.clone();
+            });
+            let mut type_stmt = self.prepare(format!(
+                "SELECT name, sql FROM {}",
+                crate::schema::TURSO_TYPES_TABLE_NAME
+            ))?;
+            let mut type_rows: Vec<String> = Vec::new();
+            type_stmt.run_with_row_callback(|row| {
+                let sql = row.get::<&str>(1)?.to_string();
+                type_rows.push(sql);
+                Ok(())
+            })?;
+            for sql in &type_rows {
+                fresh.add_type_from_sql(sql)?;
+            }
+        }
+
         // Best-effort load stats if sqlite_stat1 is present and DB is initialized.
         refresh_analyze_stats(self);
 

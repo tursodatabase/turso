@@ -5,7 +5,7 @@ use crate::ext::VTabImpl;
 use crate::function::Func;
 use crate::schema::{
     create_table, BTreeTable, ColDef, Column, SchemaObjectType, Table, Type,
-    RESERVED_TABLE_PREFIXES, SQLITE_SEQUENCE_TABLE_NAME,
+    RESERVED_TABLE_PREFIXES, SQLITE_SEQUENCE_TABLE_NAME, TURSO_TYPES_TABLE_NAME,
 };
 use crate::stats::STATS_TABLE;
 use crate::storage::pager::CreateBTreeFlags;
@@ -21,7 +21,7 @@ use crate::util::normalize_ident;
 use crate::util::PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX;
 use crate::vdbe::builder::CursorType;
 use crate::vdbe::insn::{
-    to_u16, {CmpInsFlags, Cookie, InsertFlags, Insn},
+    to_u16, {CmpInsFlags, Cookie, InsertFlags, Insn, RegisterOrLiteral},
 };
 use crate::Connection;
 use crate::{bail_parse_error, CaptureDataChangesExt, Result};
@@ -458,7 +458,6 @@ pub enum SchemaEntryType {
     Index,
     View,
     Trigger,
-    Type,
 }
 
 impl SchemaEntryType {
@@ -468,7 +467,6 @@ impl SchemaEntryType {
             SchemaEntryType::Index => "index",
             SchemaEntryType::View => "view",
             SchemaEntryType::Trigger => "trigger",
-            SchemaEntryType::Type => "type",
         }
     }
 }
@@ -1320,33 +1318,90 @@ pub fn translate_create_type(
         ));
     }
 
-    // Open cursor to sqlite_schema table
-    let table = resolver.schema.get_btree_table(SQLITE_TABLEID).unwrap();
-    let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(table));
+    // Ensure sqlite_turso_types table exists (lazy creation)
+    let types_table: Arc<BTreeTable>;
+    let types_root_page: RegisterOrLiteral<i64>;
+
+    if let Some(existing) = resolver.schema.get_btree_table(TURSO_TYPES_TABLE_NAME) {
+        types_table = existing.clone();
+        types_root_page = RegisterOrLiteral::Literal(existing.root_page);
+    } else {
+        // Create the sqlite_turso_types btree
+        let table_root_reg = program.alloc_register();
+        program.emit_insn(Insn::CreateBtree {
+            db: 0,
+            root: table_root_reg,
+            flags: CreateBTreeFlags::new_table(),
+        });
+        let create_sql =
+            format!("CREATE TABLE {TURSO_TYPES_TABLE_NAME}(name TEXT PRIMARY KEY, sql TEXT)");
+        types_table = Arc::new(BTreeTable::from_sql(&create_sql, 0)?);
+        types_root_page = RegisterOrLiteral::Register(table_root_reg);
+
+        // Register it in sqlite_schema so it persists
+        let schema_table = resolver.schema.get_btree_table(SQLITE_TABLEID).unwrap();
+        let schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(schema_table));
+        program.emit_insn(Insn::OpenWrite {
+            cursor_id: schema_cursor_id,
+            root_page: 1i64.into(),
+            db: 0,
+        });
+        emit_schema_entry(
+            &mut program,
+            resolver,
+            schema_cursor_id,
+            None,
+            SchemaEntryType::Table,
+            TURSO_TYPES_TABLE_NAME,
+            TURSO_TYPES_TABLE_NAME,
+            table_root_reg,
+            Some(create_sql),
+        )?;
+
+        // Parse schema to register the new table in-memory
+        program.emit_insn(Insn::ParseSchema {
+            db: schema_cursor_id,
+            where_clause: Some(format!(
+                "tbl_name = '{TURSO_TYPES_TABLE_NAME}' AND type != 'trigger'"
+            )),
+        });
+    }
+
+    // Open sqlite_turso_types for writing
+    let types_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(types_table));
     program.emit_insn(Insn::OpenWrite {
-        cursor_id: sqlite_schema_cursor_id,
-        root_page: 1i64.into(),
+        cursor_id: types_cursor_id,
+        root_page: types_root_page,
         db: 0,
     });
 
-    // Add the type entry to sqlite_schema (rootpage=0, no btree)
-    emit_schema_entry(
-        &mut program,
-        resolver,
-        sqlite_schema_cursor_id,
-        None,
-        SchemaEntryType::Type,
-        &normalized_name,
-        &normalized_name,
-        0,
-        Some(sql),
-    )?;
-
-    // Parse schema to load the new type into the in-memory registry
-    program.emit_insn(Insn::ParseSchema {
-        db: sqlite_schema_cursor_id,
-        where_clause: Some(format!("type = 'type' AND name = '{normalized_name}'")),
+    // Insert (name, sql) record
+    let rowid_reg = program.alloc_register();
+    program.emit_insn(Insn::NewRowid {
+        cursor: types_cursor_id,
+        rowid_reg,
+        prev_largest_reg: 0,
     });
+    let name_reg = program.emit_string8_new_reg(normalized_name);
+    program.emit_string8_new_reg(sql.clone());
+    let record_reg = program.alloc_register();
+    program.emit_insn(Insn::MakeRecord {
+        start_reg: to_u16(name_reg),
+        count: to_u16(2),
+        dest_reg: to_u16(record_reg),
+        index_name: None,
+        affinity_str: None,
+    });
+    program.emit_insn(Insn::Insert {
+        cursor: types_cursor_id,
+        key_reg: rowid_reg,
+        record_reg,
+        flag: InsertFlags::new(),
+        table_name: TURSO_TYPES_TABLE_NAME.to_string(),
+    });
+
+    // Add the type to the in-memory registry
+    program.emit_insn(Insn::AddType { db: 0, sql });
 
     program.emit_insn(Insn::SetCookie {
         db: 0,
@@ -1393,23 +1448,20 @@ pub fn translate_drop_type(
         }
     }
 
-    // Open cursor to sqlite_schema table
-    let schema_table = resolver.schema.get_btree_table(SQLITE_TABLEID).unwrap();
-    let sqlite_schema_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(schema_table));
+    // Open cursor to sqlite_turso_types table
+    let types_table = resolver
+        .schema
+        .get_btree_table(TURSO_TYPES_TABLE_NAME)
+        .ok_or_else(|| crate::LimboError::ParseError(format!("no such type: {normalized_name}")))?;
+    let types_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(types_table.clone()));
     program.emit_insn(Insn::OpenWrite {
-        cursor_id: sqlite_schema_cursor_id,
-        root_page: 1i64.into(),
+        cursor_id: types_cursor_id,
+        root_page: types_table.root_page.into(),
         db: 0,
     });
 
-    // Search for matching row: type='type' AND name=type_name
-    let type_reg = program.alloc_register();
+    // Search for matching row: name=type_name (col 0)
     let name_reg = program.alloc_register();
-
-    program.emit_insn(Insn::String8 {
-        dest: type_reg,
-        value: "type".to_string(),
-    });
     program.emit_insn(Insn::String8 {
         dest: name_reg,
         value: normalized_name.clone(),
@@ -1419,31 +1471,20 @@ pub fn translate_drop_type(
     let loop_start_label = program.allocate_label();
 
     program.emit_insn(Insn::Rewind {
-        cursor_id: sqlite_schema_cursor_id,
+        cursor_id: types_cursor_id,
         pc_if_empty: end_loop_label,
     });
     program.preassign_label_to_next_insn(loop_start_label);
 
-    // Read type (col 0) and name (col 1)
+    // Read name (col 0)
     let col0_reg = program.alloc_register();
-    let col1_reg = program.alloc_register();
-
-    program.emit_column_or_rowid(sqlite_schema_cursor_id, 0, col0_reg);
-    program.emit_column_or_rowid(sqlite_schema_cursor_id, 1, col1_reg);
+    program.emit_column_or_rowid(types_cursor_id, 0, col0_reg);
 
     let skip_delete_label = program.allocate_label();
 
-    // Check type='type'
-    program.emit_insn(Insn::Ne {
-        lhs: col0_reg,
-        rhs: type_reg,
-        target_pc: skip_delete_label,
-        flags: CmpInsFlags::default(),
-        collation: program.curr_collation(),
-    });
     // Check name=type_name
     program.emit_insn(Insn::Ne {
-        lhs: col1_reg,
+        lhs: col0_reg,
         rhs: name_reg,
         target_pc: skip_delete_label,
         flags: CmpInsFlags::default(),
@@ -1452,15 +1493,15 @@ pub fn translate_drop_type(
 
     // Delete matching row
     program.emit_insn(Insn::Delete {
-        cursor_id: sqlite_schema_cursor_id,
-        table_name: "sqlite_schema".to_string(),
+        cursor_id: types_cursor_id,
+        table_name: TURSO_TYPES_TABLE_NAME.to_string(),
         is_part_of_update: false,
     });
 
     program.resolve_label(skip_delete_label, program.offset());
 
     program.emit_insn(Insn::Next {
-        cursor_id: sqlite_schema_cursor_id,
+        cursor_id: types_cursor_id,
         pc_if_next: loop_start_label,
     });
 

@@ -426,6 +426,44 @@ impl Schema {
         self.type_registry.remove(&type_name.to_lowercase());
     }
 
+    /// Parse a CREATE TYPE SQL string and add the type to the in-memory registry.
+    pub fn add_type_from_sql(&mut self, sql: &str) -> crate::Result<()> {
+        use turso_parser::ast::{Cmd, Stmt};
+        use turso_parser::parser::Parser;
+
+        let mut parser = Parser::new(sql.as_bytes());
+        let Ok(Some(Cmd::Stmt(Stmt::CreateType {
+            type_name, body, ..
+        }))) = parser.next_cmd()
+        else {
+            return Err(crate::LimboError::ParseError(format!(
+                "invalid type sql: {sql}"
+            )));
+        };
+
+        let type_def = TypeDef {
+            name: type_name.clone(),
+            params: body.params.clone(),
+            base: body.base.clone(),
+            encode: body.encode.clone(),
+            decode: body.decode.clone(),
+            operators: body
+                .operators
+                .iter()
+                .map(|op| TypeOperatorDef {
+                    op: op.op.clone(),
+                    right_type: op.right_type.clone(),
+                    func_name: op.func_name.clone(),
+                })
+                .collect(),
+            default: body.default.clone(),
+            is_builtin: false,
+        };
+        self.type_registry
+            .insert(type_name.to_lowercase(), Arc::new(type_def));
+        Ok(())
+    }
+
     pub fn is_unique_idx_name(&self, name: &str) -> bool {
         !self
             .indexes
@@ -1321,44 +1359,7 @@ impl Schema {
                     tbl_name.name.as_str(),
                 )?;
             }
-            "type" => {
-                use turso_parser::ast::{Cmd, Stmt};
-                use turso_parser::parser::Parser;
-
-                let sql = maybe_sql.expect("sql should be present for type");
-                let mut parser = Parser::new(sql.as_bytes());
-                let Ok(Some(Cmd::Stmt(Stmt::CreateType {
-                    if_not_exists: _,
-                    type_name,
-                    body,
-                }))) = parser.next_cmd()
-                else {
-                    return Err(crate::LimboError::ParseError(format!(
-                        "invalid type sql: {sql}"
-                    )));
-                };
-
-                let type_def = TypeDef {
-                    name: type_name.clone(),
-                    params: body.params.clone(),
-                    base: body.base.clone(),
-                    encode: body.encode.clone(),
-                    decode: body.decode.clone(),
-                    operators: body
-                        .operators
-                        .iter()
-                        .map(|op| TypeOperatorDef {
-                            op: op.op.clone(),
-                            right_type: op.right_type.clone(),
-                            func_name: op.func_name.clone(),
-                        })
-                        .collect(),
-                    default: body.default.clone(),
-                    is_builtin: false,
-                };
-                self.type_registry
-                    .insert(type_name.to_lowercase(), Arc::new(type_def));
-            }
+            // Types are stored in sqlite_turso_types, not sqlite_schema
             _ => {}
         };
 

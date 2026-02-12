@@ -8762,6 +8762,22 @@ pub fn op_drop_type(
     Ok(InsnFunctionStepResult::Step)
 }
 
+pub fn op_add_type(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(AddType { db, sql }, insn);
+    if *db > 0 {
+        todo!("temp databases not implemented yet");
+    }
+    let conn = program.connection.clone();
+    conn.with_schema_mut(|schema| schema.add_type_from_sql(sql))?;
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
 pub fn op_drop_trigger(
     program: &Program,
     state: &mut ProgramState,

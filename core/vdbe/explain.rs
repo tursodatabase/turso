@@ -1485,6 +1485,15 @@ pub fn insn_to_row(
                 0,
                 format!("DROP TYPE {type_name}"),
             ),
+            Insn::AddType { db, sql } => (
+                "AddType",
+                *db as i64,
+                0,
+                0,
+                Value::build_text(sql.clone()),
+                0,
+                "ADD TYPE".to_string(),
+            ),
             Insn::DropView { db, view_name } => (
                 "DropView",
                 *db as i64,
