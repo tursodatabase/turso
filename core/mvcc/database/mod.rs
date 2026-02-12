@@ -3459,13 +3459,17 @@ fn is_begin_visible(txs: &SkipMap<TxID, Transaction>, tx: &Transaction, rv: &Row
             let tb = tb.value();
             let visible = match tb.state.load() {
                 TransactionState::Active => tx.tx_id == tb.tx_id && rv.end.is_none(),
-                TransactionState::Preparing(_) => false, // NOTICE: makes sense for snapshot isolation, not so much for serializable!
                 TransactionState::Committed(committed_ts) => tx.begin_ts >= committed_ts,
-                TransactionState::Aborted => false,
-                TransactionState::Terminated => {
-                    tracing::debug!("TODO: should reread rv's end field - it should have updated the timestamp in the row version by now");
-                    false
+                // Hekaton paper Section 2.5/2.7
+                TransactionState::Preparing(_) => unreachable!(
+                    "Preparing: TxIDs are replaced with Timestamps before any yield point"
+                ),
+                TransactionState::Aborted => {
+                    unreachable!("Aborted: rollback clears TxIDs from version fields synchronously")
                 }
+                TransactionState::Terminated => unreachable!(
+                    "Terminated: rollback clears TxIDs from version fields synchronously"
+                ),
             };
             tracing::trace!(
                 "is_begin_visible: tx={tx}, tb={tb} rv = {:?}-{:?} visible = {visible}",
@@ -3495,13 +3499,16 @@ fn is_end_visible(
                 // transaction can see a row version if the end is a TXId only if it isn't the same transaction.
                 // Source: https://avi.im/blag/2023/hekaton-paper-typo/
                 TransactionState::Active => current_tx.tx_id != other_tx.tx_id,
-                TransactionState::Preparing(_) => false, // NOTICE: makes sense for snapshot isolation, not so much for serializable!
                 TransactionState::Committed(committed_ts) => current_tx.begin_ts < committed_ts,
-                TransactionState::Aborted => false,
-                TransactionState::Terminated => {
-                    tracing::debug!("TODO: should reread rv's end field - it should have updated the timestamp in the row version by now");
-                    false
-                }
+                TransactionState::Preparing(_) => unreachable!(
+                    "Preparing: TxIDs are replaced with Timestamps before any yield point"
+                ),
+                TransactionState::Aborted => unreachable!(
+                    "Aborted: rollback clears end TxIDs from version fields synchronously"
+                ),
+                TransactionState::Terminated => unreachable!(
+                    "Terminated: rollback clears end TxIDs from version fields synchronously"
+                ),
             };
             tracing::trace!(
                 "is_end_visible: tx={current_tx}, te={other_tx} rv = {:?}-{:?}  visible = {visible}",
