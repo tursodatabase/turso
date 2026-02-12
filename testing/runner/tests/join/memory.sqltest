@@ -369,6 +369,31 @@ expect {
     2|2.0
 }
 
+# regression test: hash table destroyed by HashClose but not rebuilt due to Once
+# in correlated subqueries with hash joins
+test correlated-subquery-hash-join-reuse {
+    CREATE TABLE outer_loop (id INTEGER PRIMARY KEY);
+    CREATE TABLE build_table (id INTEGER PRIMARY KEY, key INTEGER);
+    CREATE TABLE probe_table (id INTEGER PRIMARY KEY, key INTEGER);
+    INSERT INTO outer_loop VALUES (1), (2), (3);
+    INSERT INTO build_table VALUES (1, 1), (2, 2), (3, 3), (4, 4), (5, 5);
+    INSERT INTO probe_table VALUES (1, 3), (2, 4), (3, 5), (4, 6), (5, 7);
+    ANALYZE;
+    SELECT o.id AS outer_id,
+        (SELECT COUNT(*)
+         FROM build_table b
+         JOIN probe_table p ON b.key = p.key
+         WHERE o.id IS NOT NULL
+        ) AS matches
+    FROM outer_loop o
+    ORDER BY o.id;
+}
+expect {
+    1|3
+    2|3
+    3|3
+}
+
 @skip-if sqlite "sqlite supports full outer joins"
 test full-outer-join {
 	create table t(a);

@@ -2479,17 +2479,23 @@ pub fn close_loop(
     // This must happen at the very end because hash join probe loops may be nested
     // inside outer loops that re-enter them. Hash tables used by materialization
     // subplans can be kept open and are skipped here.
-    for join in join_order.iter() {
-        let table_index = join.original_idx;
-        let table = &tables.joined_tables()[table_index];
-        if let Operation::HashJoin(hash_join_op) = &table.op {
-            let build_table = &tables.joined_tables()[hash_join_op.build_table_idx];
-            let hash_table_reg: usize = build_table.internal_id.into();
-            if !program.should_keep_hash_table_open(hash_table_reg) {
-                program.emit_insn(Insn::HashClose {
-                    hash_table_id: hash_table_reg,
-                });
-                program.clear_hash_build_signature(hash_table_reg);
+    //
+    // When inside a nested subquery (correlated or non-correlated), skip HashClose
+    // because the hash build is protected by Once and must persist across subquery
+    // re-invocations. The hash table will be cleaned up by ProgramState::reset().
+    if !program.is_nested() {
+        for join in join_order.iter() {
+            let table_index = join.original_idx;
+            let table = &tables.joined_tables()[table_index];
+            if let Operation::HashJoin(hash_join_op) = &table.op {
+                let build_table = &tables.joined_tables()[hash_join_op.build_table_idx];
+                let hash_table_reg: usize = build_table.internal_id.into();
+                if !program.should_keep_hash_table_open(hash_table_reg) {
+                    program.emit_insn(Insn::HashClose {
+                        hash_table_id: hash_table_reg,
+                    });
+                    program.clear_hash_build_signature(hash_table_reg);
+                }
             }
         }
     }
