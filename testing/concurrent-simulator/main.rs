@@ -173,6 +173,8 @@ fn build_opts(args: &Args, seed: u64) -> anyhow::Result<WhopperOpts> {
             (10, Box::new(CreateSimpleTableWorkload)),
             (20, Box::new(SimpleSelectWorkload)),
             (20, Box::new(SimpleInsertWorkload)),
+            (15, Box::new(UpdateWorkload)),
+            (15, Box::new(DeleteWorkload)),
             // Index workloads
             (2, Box::new(CreateIndexWorkload)),
             (2, Box::new(DropIndexWorkload)),
