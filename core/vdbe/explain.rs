@@ -1,4 +1,4 @@
-use turso_parser::ast::SortOrder;
+use turso_parser::ast::{ResolveType, SortOrder};
 
 use crate::vdbe::{builder::CursorType, insn::RegisterOrLiteral};
 
@@ -655,15 +655,26 @@ pub fn insn_to_row(
             Insn::Halt {
                 err_code,
                 description,
-            } => (
-                "Halt",
-                *err_code as i64,
-                0,
-                0,
-                Value::build_text(description.clone()),
-                0,
-                "".to_string(),
-            ),
+                on_error,
+            } => {
+                let p2 = match on_error {
+                    Some(ResolveType::Rollback) => 1,
+                    Some(ResolveType::Abort) => 2,
+                    Some(ResolveType::Fail) => 3,
+                    Some(ResolveType::Ignore) => 4,
+                    Some(ResolveType::Replace) => 5,
+                    None => 0,
+                };
+                (
+                    "Halt",
+                    *err_code as i64,
+                    p2,
+                    0,
+                    Value::build_text(description.clone()),
+                    0,
+                    "".to_string(),
+                )
+            }
             Insn::HaltIfNull {
                 err_code,
                 target_reg,
@@ -730,17 +741,19 @@ pub fn insn_to_row(
             ),
             Insn::Program {
                 params,
+                ignore_jump_target,
                 ..
             } => (
                 "Program",
-                // First register that contains a param
+                // P1: first register that contains a param
                 params.first().map(|v| match v {
                     crate::types::Value::Numeric(crate::numeric::Numeric::Integer(i)) if *i < 0 => -i - 1,
                     _ => 0,
                 }).unwrap_or(0),
-                // Number of registers that contain params
+                // P2: ignore jump target (for RAISE(IGNORE))
+                ignore_jump_target.as_debug_int() as i64,
+                // P3: number of registers that contain params
                 params.len() as i64,
-                0,
                 Value::build_text(program.sql.clone()),
                 0,
                 format!("subprogram={}", program.sql),
