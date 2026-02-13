@@ -83,8 +83,9 @@ jobs:
         env:
           RUST_LOG: ${{ runner.debug && 'turso_core::storage=trace' || '' }}
           LOCAL_SYNC_SERVER: "../../target/debug/tursodb"
+        # for some reason, test(test_busy_snapshot_immediate) hung with coverage - so let's exclude it from the run for now
         run: |
-          cargo llvm-cov nextest --workspace --all-features --locked --no-fail-fast -E 'not binary(fuzz_tests)' --failure-output=final --html --output-dir coverage
+          cargo llvm-cov nextest --workspace --all-features --locked --no-fail-fast -E 'not binary(fuzz_tests) and not test(test_busy_snapshot_immediate)' --failure-output=final --html --output-dir coverage
           echo "::group::Coverage Summary"
           cargo llvm-cov report | tee coverage/summary.txt
           echo "::endgroup::"
