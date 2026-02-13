@@ -1,14 +1,21 @@
 ---
 source: subqueries.sqltest
-expression: "SELECT id, name, price\n    FROM products\n    WHERE category_id IN (\n        SELECT id\n        FROM categories\n        WHERE name LIKE '%Electronics%'\n    );"
+expression: |-
+  SELECT id, name, price
+      FROM products
+      WHERE category_id IN (
+          SELECT id
+          FROM categories
+          WHERE name LIKE '%Electronics%'
+      );
 info:
   statement_type: SELECT
   tables:
-    - categories
-    - products
+  - categories
+  - products
   setup_blocks:
-    - schema
-  database: ":memory:"
+  - schema
+  database: ':memory:'
 ---
 QUERY PLAN
 |--SCAN categories
@@ -33,7 +40,7 @@ addr  opcode          p1  p2  p3  p4              p5  comment
   14    Integer        0   9   0                   0  r[9]=0
   15    Column         2   2  10                   0  r[10]=products.category_id
   16    IsNull        10  20   0                   0  if (r[10]==NULL) goto 20
-  17    Affinity      10   1   0                   0  r[10..11] = D
+  17    Affinity      10   1   0                   0  r[10..11] = C
   18    NotFound       0  20  10                   0  if not found goto 20
   19    Goto           0  26   0                   0
   20    Rewind         0  28   0                   0  Rewind  ephemeral_index_where_sub_t2

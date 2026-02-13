@@ -1,14 +1,17 @@
 ---
 source: indexes.sqltest
-expression: "SELECT id, sku, name\n    FROM products\n    WHERE id IN (SELECT product_id FROM inventory WHERE warehouse_id = 1);"
+expression: |-
+  SELECT id, sku, name
+      FROM products
+      WHERE id IN (SELECT product_id FROM inventory WHERE warehouse_id = 1);
 info:
   statement_type: SELECT
   tables:
-    - inventory
-    - products
+  - inventory
+  - products
   setup_blocks:
-    - schema
-  database: ":memory:"
+  - schema
+  database: ':memory:'
 ---
 QUERY PLAN
 |--SEARCH inventory USING INDEX idx_inventory_covering
@@ -31,7 +34,7 @@ addr  opcode         p1  p2  p3  p4                  p5  comment
   12  Rewind          2  35   0                       0  Rewind table products
   13    Integer       0   7   0                       0  r[7]=0
   14    RowId         2   8   0                       0  r[8]=products.rowid
-  15    Affinity      8   1   0                       0  r[8..9] = D
+  15    Affinity      8   1   0                       0  r[8..9] = C
   16    NotFound      0  18   8                       0  if not found goto 18
   17    Goto          0  24   0                       0
   18    Rewind        0  26   0                       0  Rewind  ephemeral_index_where_sub_t2

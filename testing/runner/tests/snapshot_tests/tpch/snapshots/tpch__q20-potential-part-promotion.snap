@@ -101,7 +101,7 @@ addr  opcode           p1   p2  p3  p4                                     p5  c
   39    Return          8    0   1                                          0
   40    Integer         0   27   0                                          0  r[27]=0
   41    Column          3    0  28                                          0  r[28]=partsupp.ps_partkey
-  42    Affinity       28    1   0                                          0  r[28..29] = D
+  42    Affinity       28    1   0                                          0  r[28..29] = C
   43    NotFound        0   45  28                                          0  if not found goto 45
   44    Goto            0   51   0                                          0
   45    Rewind          0   53   0                                          0  Rewind  ephemeral_index_where_sub_t5
@@ -129,7 +129,7 @@ addr  opcode           p1   p2  p3  p4                                     p5  c
   67  Rewind            6   94   0                                          0  Rewind table supplier
   68    Integer         0   37   0                                          0  r[37]=0
   69    RowId           6   38   0                                          0  r[38]=supplier.rowid
-  70    Affinity       38    1   0                                          0  r[38..39] = D
+  70    Affinity       38    1   0                                          0  r[38..39] = C
   71    NotFound        1   73  38                                          0  if not found goto 73
   72    Goto            0   79   0                                          0
   73    Rewind          1   81   0                                          0  Rewind  ephemeral_index_where_sub_t3
