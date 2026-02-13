@@ -43,6 +43,7 @@ export AFL_MAP_SIZE=2097152
 export AFL_OLD_FORKSERVER=1
 export AFL_HANG_TMOUT=30000  # 30 seconds - only mark truly stuck queries as hangs
 export AFL_SKIP_CRASHES=1    # Skip inputs that crash, don't fuzz them indefinitely
+export AFL_NO_AFFINITY=1     # Disable automatic CPU binding to prevent race condition
 
 AFL_CMD="$AFL -t 5000"  # 5 second timeout for slow SQL queries
 # Enable all experimental features to maximize attack surface
