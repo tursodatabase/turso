@@ -2,6 +2,7 @@
 
 import sqlite3
 import hashlib
+import logging
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 from datetime import datetime
@@ -24,9 +25,10 @@ class Database:
         return self._conn
 
     def init_database(self, schema_path: Path):
-        """Initialize database from schema file."""
+        """Initialize database from schema file, with migration for existing databases."""
         if self.db_path.exists():
-            return  # Database already exists
+            self._migrate_if_needed()
+            return
 
         with open(schema_path, 'r') as f:
             schema_sql = f.read()
@@ -34,6 +36,71 @@ class Database:
         conn = self.get_connection()
         conn.executescript(schema_sql)
         conn.commit()
+
+    def _migrate_if_needed(self):
+        """Run migrations for existing databases."""
+        conn = self.get_connection()
+
+        # Check what tables exist to detect partial migration state
+        cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        tables = {row[0] for row in cursor.fetchall()}
+
+        # Handle partial migration: crashes_new exists but crashes doesn't
+        if 'crashes_new' in tables and 'crashes' not in tables:
+            logger = logging.getLogger(__name__)
+            logger.info("Completing interrupted migration")
+            conn.executescript("""
+                DROP VIEW IF EXISTS v_crashes_with_bugs;
+                DROP VIEW IF EXISTS v_bug_summary;
+                DROP VIEW IF EXISTS v_session_stats;
+                ALTER TABLE crashes_new RENAME TO crashes;
+                CREATE INDEX IF NOT EXISTS idx_crashes_content_hash ON crashes(content_hash);
+                CREATE INDEX IF NOT EXISTS idx_crashes_signal ON crashes(signal_number);
+            """)
+            logger.info("Migration recovery complete")
+            return
+
+        if 'crashes' not in tables:
+            return  # No crashes table at all, fresh DB will be created
+
+        # Check if finding_type column exists on crashes table
+        cursor = conn.execute("PRAGMA table_info(crashes)")
+        columns = {row[1] for row in cursor.fetchall()}
+
+        if 'finding_type' not in columns:
+            logger = logging.getLogger(__name__)
+            logger.info("Migrating database: adding finding_type column")
+            # SQLite can't alter UNIQUE constraints, so recreate the table
+            # Views reference crashes and block ALTER TABLE RENAME, so drop them first
+            conn.executescript("""
+                DROP TABLE IF EXISTS crashes_new;
+                DROP VIEW IF EXISTS v_crashes_with_bugs;
+                DROP VIEW IF EXISTS v_bug_summary;
+                DROP VIEW IF EXISTS v_session_stats;
+
+                CREATE TABLE crashes_new (
+                    crash_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    content_hash TEXT NOT NULL,
+                    signal_number INTEGER,
+                    finding_type TEXT NOT NULL DEFAULT 'crash',
+                    sql_content TEXT NOT NULL,
+                    first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    instance_count INTEGER DEFAULT 1,
+                    UNIQUE(content_hash, signal_number, finding_type)
+                );
+
+                INSERT INTO crashes_new (crash_id, content_hash, signal_number, finding_type, sql_content, first_seen, last_seen, instance_count)
+                SELECT crash_id, content_hash, signal_number, 'crash', sql_content, first_seen, last_seen, instance_count
+                FROM crashes;
+
+                DROP TABLE crashes;
+                ALTER TABLE crashes_new RENAME TO crashes;
+
+                CREATE INDEX IF NOT EXISTS idx_crashes_content_hash ON crashes(content_hash);
+                CREATE INDEX IF NOT EXISTS idx_crashes_signal ON crashes(signal_number);
+            """)
+            logger.info("Migration complete")
 
     def close(self):
         """Close database connection."""
@@ -93,15 +160,16 @@ class Database:
         )
         return {row[0] for row in cursor.fetchall()}
 
-    def find_or_create_crash(self, sql_content: str, signal_number: Optional[int]) -> int:
+    def find_or_create_crash(self, sql_content: str, signal_number: Optional[int],
+                             finding_type: str = 'crash') -> int:
         """Find existing crash by content hash or create new one. Returns crash_id."""
         content_hash = hashlib.md5(sql_content.encode('utf-8')).hexdigest()
         conn = self.get_connection()
 
         # Try to find existing crash
         cursor = conn.execute(
-            "SELECT crash_id FROM crashes WHERE content_hash = ? AND signal_number IS ?",
-            (content_hash, signal_number)
+            "SELECT crash_id FROM crashes WHERE content_hash = ? AND signal_number IS ? AND finding_type = ?",
+            (content_hash, signal_number, finding_type)
         )
         row = cursor.fetchone()
 
@@ -123,11 +191,11 @@ class Database:
             # Create new crash
             cursor = conn.execute(
                 """
-                INSERT INTO crashes (content_hash, signal_number, sql_content)
-                VALUES (?, ?, ?)
+                INSERT INTO crashes (content_hash, signal_number, finding_type, sql_content)
+                VALUES (?, ?, ?, ?)
                 RETURNING crash_id
                 """,
-                (content_hash, signal_number, sql_content)
+                (content_hash, signal_number, finding_type, sql_content)
             )
             crash_id = cursor.fetchone()[0]
             conn.commit()
@@ -172,7 +240,7 @@ class Database:
         conn = self.get_connection()
         cursor = conn.execute(
             """
-            SELECT c.crash_id, c.sql_content, c.signal_number
+            SELECT c.crash_id, c.sql_content, c.signal_number, c.finding_type
             FROM crashes c
             LEFT JOIN crash_tests ct ON c.crash_id = ct.crash_id
             WHERE ct.test_id IS NULL
@@ -242,6 +310,7 @@ class Database:
             SELECT
                 c.crash_id,
                 c.content_hash,
+                c.finding_type,
                 c.instance_count,
                 ct.classification AS turso_classification,
                 sc.bug_category,

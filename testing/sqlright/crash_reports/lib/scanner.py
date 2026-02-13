@@ -1,7 +1,7 @@
-"""O(n) crash file scanner with checkpointing."""
+"""O(n) crash/hang file scanner with checkpointing."""
 
 from pathlib import Path
-from typing import List, Set, Optional
+from typing import List, Set, Optional, Tuple
 import logging
 
 from .parser import AFLCrashParser
@@ -9,56 +9,64 @@ from .parser import AFLCrashParser
 logger = logging.getLogger(__name__)
 
 
-def find_crash_directories(base_path: Path) -> List[Path]:
+def find_afl_directories(base_path: Path) -> List[Tuple[Path, str]]:
     """
-    Find all crash directories under base_path.
+    Find all crash and hang directories under base_path.
 
     Searches for directories matching:
-    - {base_path}/*/crashes/
-    - {base_path}/crashes/ (if exists)
+    - {base_path}/*/crashes/  and  {base_path}/*/hangs/
+    - {base_path}/crashes/    and  {base_path}/hangs/
 
-    Returns sorted list of crash directories.
+    Returns sorted list of (directory, finding_type) tuples.
     """
-    crash_dirs = []
+    afl_dirs = []
 
-    # Check for direct crashes/ subdirectory
-    direct_crash_dir = base_path / "crashes"
-    if direct_crash_dir.exists() and direct_crash_dir.is_dir():
-        crash_dirs.append(direct_crash_dir)
+    for subdir_name, finding_type in [("crashes", "crash"), ("hangs", "hang")]:
+        # Check for direct subdirectory
+        direct_dir = base_path / subdir_name
+        if direct_dir.exists() and direct_dir.is_dir():
+            afl_dirs.append((direct_dir, finding_type))
 
-    # Check for instance-level crashes (e.g., primary/crashes, secondary_*/crashes)
-    for item in base_path.iterdir():
-        if item.is_dir():
-            crash_subdir = item / "crashes"
-            if crash_subdir.exists() and crash_subdir.is_dir():
-                crash_dirs.append(crash_subdir)
+        # Check for instance-level dirs (e.g., primary/crashes, secondary_*/hangs)
+        for item in base_path.iterdir():
+            if item.is_dir():
+                sub = item / subdir_name
+                if sub.exists() and sub.is_dir():
+                    afl_dirs.append((sub, finding_type))
 
-    return sorted(crash_dirs)
+    return sorted(afl_dirs, key=lambda x: x[0])
 
 
-def find_all_crash_files(crash_dir: Path) -> List[Path]:
+def find_crash_directories(base_path: Path) -> List[Path]:
     """
-    Find all crash files in a directory.
-
-    Returns sorted list of crash files (by modification time).
-    Only includes files matching AFL crash format.
+    Find all crash directories under base_path. Kept for backward compatibility.
     """
-    if not crash_dir.exists():
-        logger.warning(f"Crash directory does not exist: {crash_dir}")
+    return [d for d, _ in find_afl_directories(base_path)]
+
+
+def find_all_afl_files(afl_dir: Path) -> List[Path]:
+    """
+    Find all AFL crash/hang files in a directory.
+
+    Returns sorted list of files (by modification time).
+    Only includes files matching AFL filename format.
+    """
+    if not afl_dir.exists():
+        logger.warning(f"Directory does not exist: {afl_dir}")
         return []
 
-    crash_files = []
-    for file_path in crash_dir.iterdir():
-        if file_path.is_file() and AFLCrashParser.is_crash_file(file_path.name):
-            crash_files.append(file_path)
+    afl_files = []
+    for file_path in afl_dir.iterdir():
+        if file_path.is_file() and AFLCrashParser.is_afl_file(file_path.name):
+            afl_files.append(file_path)
 
     # Sort by modification time for checkpoint-based processing
-    return sorted(crash_files, key=lambda f: f.stat().st_mtime)
+    return sorted(afl_files, key=lambda f: f.stat().st_mtime)
 
 
-def get_unprocessed_crashes(session_path: Path, session_id: int, db, checkpoint: Optional[dict]) -> List[Path]:
+def get_unprocessed_crashes(session_path: Path, session_id: int, db, checkpoint: Optional[dict]) -> List[Tuple[Path, str]]:
     """
-    Get list of crash files that haven't been processed yet.
+    Get list of crash/hang files that haven't been processed yet.
 
     Uses checkpoint to skip files older than last processed file (O(n) efficiency).
     Double-checks against database to ensure idempotency.
@@ -70,43 +78,44 @@ def get_unprocessed_crashes(session_path: Path, session_id: int, db, checkpoint:
         checkpoint: Checkpoint dict from database (or None)
 
     Returns:
-        List of unprocessed crash files, sorted by mtime
+        List of (file_path, finding_type) tuples for unprocessed files, sorted by mtime
     """
-    # Find all crash directories under session path
-    crash_dirs = find_crash_directories(session_path)
-    logger.info(f"Found {len(crash_dirs)} crash directories in {session_path}")
+    # Find all AFL directories under session path
+    afl_dirs = find_afl_directories(session_path)
+    logger.info(f"Found {len(afl_dirs)} AFL directories in {session_path}")
 
-    # Collect all crash files
-    all_crashes = []
-    for crash_dir in crash_dirs:
-        crashes = find_all_crash_files(crash_dir)
-        all_crashes.extend(crashes)
+    # Collect all files with their finding type
+    all_files = []  # (path, finding_type)
+    for afl_dir, finding_type in afl_dirs:
+        files = find_all_afl_files(afl_dir)
+        for f in files:
+            all_files.append((f, finding_type))
 
-    logger.info(f"Found {len(all_crashes)} total crash files")
+    logger.info(f"Found {len(all_files)} total AFL files (crashes + hangs)")
 
     # Filter based on checkpoint (O(n) optimization)
     if checkpoint and checkpoint['last_file_mtime']:
         last_mtime = checkpoint['last_file_mtime']
-        new_files = [f for f in all_crashes if f.stat().st_mtime > last_mtime]
+        new_files = [(f, ft) for f, ft in all_files if f.stat().st_mtime > last_mtime]
         logger.info(f"Checkpoint filter: {len(new_files)} files newer than checkpoint")
     else:
-        new_files = all_crashes
+        new_files = all_files
         logger.info("No checkpoint - processing all files")
 
     # Double-check against database (ensures idempotency even if checkpoint was lost)
     processed_paths = db.get_processed_file_paths(session_id)
-    unprocessed = [f for f in new_files if str(f) not in processed_paths]
+    unprocessed = [(f, ft) for f, ft in new_files if str(f) not in processed_paths]
 
     logger.info(f"Final unprocessed count: {len(unprocessed)}")
 
-    return sorted(unprocessed, key=lambda f: f.stat().st_mtime)
+    return sorted(unprocessed, key=lambda x: x[0].stat().st_mtime)
 
 
 def scan_session(session_path: Path, db, batch_size: int = 100) -> dict:
     """
-    Scan a fuzzing session for crashes and add to database.
+    Scan a fuzzing session for crashes/hangs and add to database.
 
-    Processes crashes in batches with checkpoint updates for incremental processing.
+    Processes files in batches with checkpoint updates for incremental processing.
 
     Args:
         session_path: Path to fuzzing session directory
@@ -116,8 +125,6 @@ def scan_session(session_path: Path, db, batch_size: int = 100) -> dict:
     Returns:
         Dict with statistics: files_processed, crashes_added, skipped
     """
-    from .parser import parse_crash_filename
-
     stats = {
         'files_processed': 0,
         'crashes_added': 0,
@@ -131,14 +138,14 @@ def scan_session(session_path: Path, db, batch_size: int = 100) -> dict:
     # Get checkpoint
     checkpoint = db.get_checkpoint(session_id)
 
-    # Find unprocessed crashes
+    # Find unprocessed files (crashes and hangs)
     unprocessed = get_unprocessed_crashes(session_path, session_id, db, checkpoint)
 
     if not unprocessed:
-        logger.info("No new crashes to process")
+        logger.info("No new crashes/hangs to process")
         return stats
 
-    logger.info(f"Processing {len(unprocessed)} crashes in batches of {batch_size}")
+    logger.info(f"Processing {len(unprocessed)} files in batches of {batch_size}")
 
     # Process in batches
     for i in range(0, len(unprocessed), batch_size):
@@ -152,7 +159,7 @@ def scan_session(session_path: Path, db, batch_size: int = 100) -> dict:
 
         # Update checkpoint after each batch
         if batch:
-            last_file = batch[-1]
+            last_file = batch[-1][0]
             last_mtime = last_file.stat().st_mtime
             db.update_checkpoint(session_id, str(last_file), last_mtime, batch_stats['processed'])
             logger.info(f"Checkpoint updated: {batch_stats['processed']} files processed")
@@ -163,9 +170,14 @@ def scan_session(session_path: Path, db, batch_size: int = 100) -> dict:
     return stats
 
 
-def process_batch(batch: List[Path], session_id: int, db) -> dict:
+def process_batch(batch: List[Tuple[Path, str]], session_id: int, db) -> dict:
     """
-    Process a batch of crash files.
+    Process a batch of crash/hang files.
+
+    Args:
+        batch: List of (file_path, finding_type) tuples
+        session_id: Database session ID
+        db: Database instance
 
     Returns dict with processed, crashes_added, skipped, errors counts.
     """
@@ -178,7 +190,7 @@ def process_batch(batch: List[Path], session_id: int, db) -> dict:
         'errors': 0
     }
 
-    for file_path in batch:
+    for file_path, finding_type in batch:
         try:
             # Check if file still exists (may have been deleted)
             if not file_path.exists():
@@ -186,7 +198,7 @@ def process_batch(batch: List[Path], session_id: int, db) -> dict:
                 stats['skipped'] += 1
                 continue
 
-            # Read crash content
+            # Read content
             try:
                 with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
                     sql_content = f.read()
@@ -197,7 +209,7 @@ def process_batch(batch: List[Path], session_id: int, db) -> dict:
 
             # Skip empty files
             if not sql_content.strip():
-                logger.warning(f"Empty crash file: {file_path}")
+                logger.warning(f"Empty file: {file_path}")
                 stats['skipped'] += 1
                 continue
 
@@ -205,7 +217,7 @@ def process_batch(batch: List[Path], session_id: int, db) -> dict:
             metadata = parse_crash_filename(file_path)
 
             # Find or create crash
-            crash_id = db.find_or_create_crash(sql_content, metadata['signal_number'])
+            crash_id = db.find_or_create_crash(sql_content, metadata['signal_number'], finding_type)
 
             # Add crash instance
             db.add_crash_instance(
