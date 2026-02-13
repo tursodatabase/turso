@@ -8,25 +8,11 @@ SQLRight uses SQL-aware mutations and oracle-based bug detection (NOREC, TLP, IN
 
 ### Platform Support
 
-**SQLRight is designed for Linux (Ubuntu 20.04).**
+**SQLRight requires Linux (Ubuntu 20.04 or later).**
 
 - **Linux**: Native support, follow instructions below
-- **macOS**: **Not supported** - use Docker or Linux VM (see below)
-- **Windows**: Use WSL2 or Docker
-
-#### macOS Users
-
-SQLRight uses AFL which has extensive Linux-specific dependencies. To run on macOS:
-
-1. **Docker (Recommended)**: Use SQLRight's official Docker image
-   ```bash
-   docker pull steveleungsly/sqlright_sqlite:version1.2
-   # Adapt for Turso (requires custom Dockerfile)
-   ```
-
-2. **Linux VM**: Run in a Linux VM (UTM, Parallels, VMware, etc.)
-
-Partial macOS compatibility patches are included (`patches/0002-*.patch`, `0003-*.patch`) but native builds require extensive additional AFL/macOS type fixes.
+- **macOS**: Not supported - use Docker with Linux container or Linux VM
+- **Windows**: Use WSL2
 
 ### Prerequisites (Linux)
 
@@ -89,6 +75,30 @@ Production runs are saved to `results/run_{ORACLE}_{TIMESTAMP}/` and print per-i
 ```
 
 Generates `coverage_report/summary.txt`, `coverage_report/html/index.html`, and `coverage_report/coverage.lcov`.
+
+### Crash analysis
+
+```bash
+cd crash_reports
+./collect_crashes.py /tmp/sqlright_test
+```
+
+Collects crashes from AFL instances, deduplicates by content hash, and tests against both tursodb and SQLite:
+- Deduplication: 78 crash files → 12 unique crashes
+- Classification: PANIC, CRASH, PARSE_ERROR, SUCCESS
+- Differential testing: Identifies oracle bugs (incorrect results vs SQLite)
+- Idempotent: Re-running only processes new crashes
+
+Query crashes:
+
+```bash
+./query_crashes.py list                          # all crashes
+./query_crashes.py bugs                          # real bugs only
+./query_crashes.py export <crash_id> output.sql  # export specific crash
+./query_crashes.py stats                         # summary statistics
+```
+
+Results stored in `crash_reports/crashes.db` with processing history for reproducibility. See `crash_reports/README.md` for full documentation.
 
 ## Experimental Features
 
@@ -159,8 +169,6 @@ output/
 
 ### Multi-core fixes applied
 
-**CPU affinity race fix (critical):** `AFL_NO_AFFINITY=1` disables AFL's automatic CPU binding which has a race condition when many instances start simultaneously. Multiple instances would bind to the same cores, causing severe contention. This reduced 64-core initialization from 15-20 minutes to ~2 minutes and increased CPU utilization from ~100% to ~2000%.
-
 **File contention fix (critical):** Each fuzzer instance gets its own isolated working directory to prevent deadlock on `map_id_triggered.txt`. The SQLite port of SQLRight was missing per-core file logic that MySQL/PostgreSQL versions have.
 
 **Crash handling fix (critical):** `AFL_SKIP_CRASHES=1` prevents AFL from spending hours on deterministic fuzzing of inputs that reliably crash. Without this, the fuzzer gets stuck exploring crash variations instead of discovering new bugs.
@@ -172,7 +180,7 @@ output/
 - **1 core:** Simplest, no coordination overhead, good baseline
 - **4-8 cores:** Good balance for most machines
 - **16-32 cores:** Diminishing returns, ensure adequate I/O bandwidth
-- **64+ cores:** Only on high-end systems with fast storage
+- **63 cores (max):** Maximum supported on high-end systems with fast storage
 
 Performance scales sub-linearly due to queue sync overhead and corpus sharing.
 
@@ -181,22 +189,33 @@ Performance scales sub-linearly due to queue sync overhead and corpus sharing.
 ### Real-time status (recommended)
 
 ```bash
-./whatsup.sh [OUTPUT_DIR]
+./whatsup.sh [OUTPUT_DIR] [--verbose]
 ```
 
-Shows per-instance stats (alive/dead, execs, coverage, crashes, hangs) plus aggregate summary. Default output dir: `/tmp/sqlright_test`
+Compact monitoring view suitable for `watch`. Default output dir: `/tmp/sqlright_test`
 
 Example output:
 ```
->>> primary          alive=yes  0d 0h 10m  cycles=0  execs=2078  eps=5.2  cov=3.41%  crashes=4  hangs=0
->>> secondary_2      alive=yes  0d 0h 10m  cycles=0  execs=1523  eps=4.8  cov=3.40%  crashes=2  hangs=0
+=== SQLRight Fuzzer Monitor ===
+Output: /tmp/sqlright_test
 
-Summary:
-  Fuzzers alive  : 8
-  Total execs    : 12453
-  Total crashes  : 15
-  Max coverage   : 3.41%
+SUMMARY: 63 instances | 12453 execs | 15 crashes | 320 eps | 3.41% cov
+
+⚠️  2 instances with execs_since_crash=0 (crashing on every exec)
+
+Stuck instances: 3 (showing first 5)
+  secondary_15: execs=2 eps=0.00 crashes=2
+  secondary_26: execs=1 eps=0.00 crashes=1
+  secondary_31: execs=3 eps=0.00 crashes=2
+
+Total crash files: 15
+
+Run with --verbose for detailed crash analysis
 ```
+
+Use `watch -n5 ./whatsup.sh` for live monitoring. Add `--verbose` flag for detailed per-instance crash distribution and source analysis.
+
+During calibration (before fuzzer_stats exists), shows initialization progress: AFL processes running, last test execution time, seed processing status, and CPU usage.
 
 ### Manual inspection
 
@@ -246,10 +265,16 @@ testing/sqlright/
 ├── run.sh                # quick fuzzing script
 ├── run_production.sh     # production fuzzing script
 ├── collect_coverage.sh   # coverage report generation
+├── whatsup.sh            # real-time fuzzer monitoring
+├── check_affinity.sh     # CPU affinity verification
 ├── patches/              # git patches applied to SQLRight
-│   ├── 0001-turso-increase-map-size-and-fix-gcc13.patch
-│   ├── 0002-turso-fix-macos-bison-compatibility.patch (macOS only, incomplete)
-│   └── 0003-turso-fix-macos-compilation-errors.patch (macOS only, incomplete)
+│   └── 0001-turso-increase-map-size-and-fix-gcc13.patch
+├── crash_reports/        # crash analysis and deduplication
+│   ├── collect_crashes.py   # crash collection and testing
+│   ├── query_crashes.py     # crash database queries
+│   ├── schema.sql           # database schema
+│   ├── lib/                 # analysis modules
+│   └── README.md            # crash analysis documentation
 ├── README.md             # this file
 ├── .gitignore
 ├── build/                # [gitignored] SQLRight clone + compiled binaries
@@ -268,7 +293,7 @@ testing/sqlright/
 | `AFL_SKIP_CRASHES` | `1` | Skip inputs that crash during calibration (prevents infinite crash loop) |
 | `AFL_HANG_TMOUT` | `30000` | 30-second hang threshold (allows slow queries to complete) |
 | `AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES` | `1` | Continue if crashes directory is missing |
-| `AFL_NO_AFFINITY` | `1` | Disable automatic CPU binding (prevents race condition in multi-core startup) |
+| `AFL_NO_AFFINITY` | `1` | Disable automatic CPU binding |
 
 ## Troubleshooting
 
@@ -286,7 +311,6 @@ testing/sqlright/
 
 | Symptom | Cause | Fix |
 |---------|-------|-----|
-| Very slow initialization (15+ min), low CPU usage (~100%) | CPU affinity race - multiple instances bind to same cores | **Fixed in latest version** - `AFL_NO_AFFINITY=1` enabled |
 | All instances frozen at low execs, ~9% CPU | File contention deadlock on `map_id_triggered.txt` | **Fixed in latest version** - per-instance working directories |
 | Many "hangs" detected, slow progress | Timeout too aggressive for slow SQL | **Fixed in latest version** - 5s timeout + 30s hang threshold |
 | Queue explodes (4000+ items), stuck at low test case numbers | AFL fuzzing crashing inputs indefinitely | **Fixed in latest version** - `AFL_SKIP_CRASHES=1` enabled |
@@ -300,7 +324,7 @@ testing/sqlright/
   - 1 core: <1 minute
   - 2-4 cores: 1-2 minutes
   - 8 cores: 2-3 minutes
-  - 64 cores: 2-4 minutes (with AFL_NO_AFFINITY=1)
+  - 63 cores: 2-4 minutes
 - **Normal execs/sec:** 5-50 per instance (SQL fuzzing is slow compared to binary fuzzing)
 - **Queue growth:** Normal, especially early in fuzzing (new coverage paths discovered)
 - **Crashes found:** If target has bugs, expect crashes within first hour
