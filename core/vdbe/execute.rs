@@ -2024,7 +2024,6 @@ pub fn halt(
                 .swap(0, Ordering::AcqRel);
             if deferred_violations > 0 {
                 vtab_rollback_all(&program.connection)?;
-                program.connection.auto_commit.store(true, Ordering::SeqCst);
                 if let Some(mv_store) = mv_store.as_ref() {
                     if let Some(tx_id) = program.connection.get_mv_tx_id() {
                         mv_store.rollback_tx(tx_id, pager.clone(), &program.connection);
@@ -2602,6 +2601,16 @@ pub fn op_auto_commit(
         .commit_txn(pager.clone(), state, mv_store.as_ref(), requested_rollback)
         .map(Into::into);
 
+    if mv_store.is_none()
+        && matches!(
+            res,
+            Ok(InsnFunctionStepResult::Step | InsnFunctionStepResult::Done)
+        )
+        && (is_rollback_req || is_commit_req)
+    {
+        pager.clear_savepoints()?;
+    }
+
     // Clear deferred FK counters only after FINAL success of COMMIT/ROLLBACK.
     if fk_on
         && matches!(
@@ -2638,6 +2647,7 @@ pub fn op_savepoint(
     match *op {
         SavepointOp::Begin => {
             let starts_transaction = conn.auto_commit.load(Ordering::SeqCst);
+            let deferred_fk_violations = conn.get_deferred_foreign_key_violations();
 
             if let Some(mv_store) = mv_store.as_ref() {
                 let tx_id = if let Some(tx_id) = conn.get_mv_tx_id() {
@@ -2650,11 +2660,21 @@ pub fn op_savepoint(
                     }
                     tx_id
                 };
-                mv_store.begin_named_savepoint(tx_id, name.clone(), starts_transaction);
+                mv_store.begin_named_savepoint(
+                    tx_id,
+                    name.clone(),
+                    starts_transaction,
+                    deferred_fk_violations,
+                );
             } else {
                 pager.open_subjournal()?;
                 let db_size = return_if_io!(pager.with_header(|header| header.database_size.get()));
-                pager.open_named_savepoint(name.clone(), db_size, starts_transaction)?;
+                pager.open_named_savepoint(
+                    name.clone(),
+                    db_size,
+                    starts_transaction,
+                    deferred_fk_violations,
+                )?;
             }
 
             if starts_transaction {
@@ -2694,18 +2714,20 @@ pub fn op_savepoint(
             Ok(InsnFunctionStepResult::Step)
         }
         SavepointOp::RollbackTo => {
-            let found = if let Some(mv_store) = mv_store.as_ref() {
+            let deferred_fk_snapshot = if let Some(mv_store) = mv_store.as_ref() {
                 match conn.get_mv_tx_id() {
                     Some(tx_id) => mv_store.rollback_to_named_savepoint(tx_id, name)?,
-                    None => false,
+                    None => None,
                 }
             } else {
                 pager.rollback_to_named_savepoint(name)?
             };
 
-            if !found {
+            let Some(deferred_fk_snapshot) = deferred_fk_snapshot else {
                 return Err(LimboError::TxError(format!("no such savepoint: {name}")));
-            }
+            };
+            conn.fk_deferred_violations
+                .store(deferred_fk_snapshot, Ordering::SeqCst);
 
             state.pc += 1;
             Ok(InsnFunctionStepResult::Step)
@@ -7520,7 +7542,7 @@ fn new_rowid_inner(
                         let use_cached_allocator = matches!(
                             program.connection.get_mv_tx(),
                             Some((_, TransactionMode::Concurrent))
-                        ) || program.connection.get_auto_commit();
+                        );
                         match return_if_io!(mvcc_cursor.start_new_rowid(use_cached_allocator)) {
                             NextRowidResult::Uninitialized => {
                                 // we need to find last to initialize it

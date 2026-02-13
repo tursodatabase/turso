@@ -17,7 +17,7 @@ use crate::storage::{
     wal::{CheckpointResult, RollbackTo, Wal, IOV_MAX},
 };
 use crate::sync::atomic::{
-    AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering,
+    AtomicBool, AtomicIsize, AtomicU16, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering,
 };
 use crate::sync::Arc;
 use crate::sync::{Mutex, RwLock};
@@ -1157,6 +1157,7 @@ struct SavepointSnapshot {
     db_size: u32,
     wal_max_frame: u64,
     wal_checksum: (u32, u32),
+    deferred_fk_violations: isize,
 }
 
 struct Savepoint {
@@ -1176,6 +1177,8 @@ struct Savepoint {
     wal_max_frame: AtomicU64,
     /// WAL checksum at the start of the savepoint.
     wal_checksum: RwLock<(u32, u32)>,
+    /// Deferred FK counter value at the start of this savepoint.
+    deferred_fk_violations: AtomicIsize,
 }
 
 impl Savepoint {
@@ -1185,6 +1188,7 @@ impl Savepoint {
         db_size: u32,
         wal_max_frame: u64,
         wal_checksum: (u32, u32),
+        deferred_fk_violations: isize,
     ) -> Self {
         Self {
             kind,
@@ -1194,6 +1198,7 @@ impl Savepoint {
             db_size: AtomicU32::new(db_size),
             wal_max_frame: AtomicU64::new(wal_max_frame),
             wal_checksum: RwLock::new(wal_checksum),
+            deferred_fk_violations: AtomicIsize::new(deferred_fk_violations),
         }
     }
 
@@ -1224,6 +1229,7 @@ impl Savepoint {
             db_size: self.db_size.load(Ordering::Acquire),
             wal_max_frame: self.wal_max_frame.load(Ordering::Acquire),
             wal_checksum: *self.wal_checksum.read(),
+            deferred_fk_violations: self.deferred_fk_violations.load(Ordering::Acquire),
         }
     }
 
@@ -1236,6 +1242,7 @@ impl Savepoint {
             db_size: AtomicU32::new(snapshot.db_size),
             wal_max_frame: AtomicU64::new(snapshot.wal_max_frame),
             wal_checksum: RwLock::new(snapshot.wal_checksum),
+            deferred_fk_violations: AtomicIsize::new(snapshot.deferred_fk_violations),
         }
     }
 }
@@ -1668,7 +1675,7 @@ impl Pager {
     }
 
     pub fn open_savepoint(&self, db_size: u32) -> Result<()> {
-        self.open_savepoint_with_kind(SavepointKind::Statement, db_size)
+        self.open_savepoint_with_kind(SavepointKind::Statement, db_size, 0)
     }
 
     /// Release i.e. commit the current savepoint. This basically just means removing it.
@@ -1699,6 +1706,7 @@ impl Pager {
         name: String,
         db_size: u32,
         starts_transaction: bool,
+        deferred_fk_violations: isize,
     ) -> Result<()> {
         self.open_savepoint_with_kind(
             SavepointKind::Named {
@@ -1706,6 +1714,7 @@ impl Pager {
                 starts_transaction,
             },
             db_size,
+            deferred_fk_violations,
         )
     }
 
@@ -1736,6 +1745,11 @@ impl Pager {
         } else {
             SavepointResult::Release
         };
+        if matches!(result, SavepointResult::Commit) {
+            // Defer mutation until transaction commit succeeds. If commit fails
+            // (e.g. deferred FK violation), savepoints must remain intact.
+            return Ok(result);
+        }
         let journal_end_offset = savepoints
             .last()
             .map(|savepoint| savepoint.write_offset())
@@ -1793,8 +1807,8 @@ impl Pager {
 
     /// Rollback to the newest matching named savepoint while keeping the named savepoint active.
     ///
-    /// Returns true if a matching savepoint was found and rolled back.
-    pub fn rollback_to_named_savepoint(&self, name: &str) -> Result<bool> {
+    /// Returns deferred FK counter snapshot for the rolled-back savepoint.
+    pub fn rollback_to_named_savepoint(&self, name: &str) -> Result<Option<isize>> {
         let target = {
             let savepoints = self.savepoints.read();
             let Some(target_idx) = savepoints.iter().rposition(|savepoint| {
@@ -1806,7 +1820,7 @@ impl Pager {
                     } if savepoint_name == name
                 )
             }) else {
-                return Ok(false);
+                return Ok(None);
             };
             let journal_end_offset = savepoints
                 .last()
@@ -1822,16 +1836,22 @@ impl Pager {
         self.rollback_to_snapshot(&target.1, target.2)?;
 
         let mut savepoints = self.savepoints.write();
+        let deferred_fk_violations = target.1.deferred_fk_violations;
         savepoints.truncate(target.0);
         if let Some(parent) = savepoints.last() {
             parent.set_write_offset(target.1.start_offset);
         }
         savepoints.push(Savepoint::from_snapshot(target.1));
 
-        Ok(true)
+        Ok(Some(deferred_fk_violations))
     }
 
-    fn open_savepoint_with_kind(&self, kind: SavepointKind, db_size: u32) -> Result<()> {
+    fn open_savepoint_with_kind(
+        &self,
+        kind: SavepointKind,
+        db_size: u32,
+        deferred_fk_violations: isize,
+    ) -> Result<()> {
         let subjournal_offset = self
             .savepoints
             .read()
@@ -1849,6 +1869,7 @@ impl Pager {
             db_size,
             wal_max_frame,
             wal_checksum,
+            deferred_fk_violations,
         );
         self.savepoints.write().push(savepoint);
         Ok(())
@@ -2509,6 +2530,7 @@ impl Pager {
         }
         let Some(wal) = self.wal.as_ref() else {
             // TODO: Unsure what the semantics of "end_tx" is for in-memory databases, ephemeral tables and ephemeral indexes.
+            self.clear_savepoints()?;
             return Ok(IOResult::Done(()));
         };
 
@@ -2543,6 +2565,7 @@ impl Pager {
                             self.cleanup_after_auto_checkpoint_failure();
                         }
                     }
+                    self.clear_savepoints()?;
                     return Ok(IOResult::Done(()));
                 }
                 _ => {
@@ -2570,6 +2593,7 @@ impl Pager {
 
                     if self.commit_info.read().state != CommitState::AutoCheckpoint {
                         complete_commit();
+                        self.clear_savepoints()?;
                         return Ok(IOResult::Done(()));
                     }
                 }
@@ -2585,16 +2609,18 @@ impl Pager {
         }
         let Some(wal) = self.wal.as_ref() else {
             // TODO: Unsure what the semantics of "end_tx" is for in-memory databases, ephemeral tables and ephemeral indexes.
+            self.clear_savepoints()
+                .expect("in practice, clear_savepoints() should never fail as it uses memory IO");
             return;
         };
+        self.clear_savepoints()
+            .expect("in practice, clear_savepoints() should never fail as it uses memory IO");
         let (is_write, schema_did_change) = match connection.get_tx_state() {
             TransactionState::Write { schema_did_change } => (true, schema_did_change),
             _ => (false, false),
         };
         tracing::trace!("rollback_tx(schema_did_change={})", schema_did_change);
         if is_write {
-            self.clear_savepoints()
-                .expect("in practice, clear_savepoints() should never fail as it uses memory IO");
             // IMPORTANT: rollback() must be called BEFORE end_write_tx() releases the write_lock.
             // Otherwise, another thread could commit new frames to frame_cache between
             // end_write_tx() and rollback(), and rollback() would incorrectly remove them.

@@ -371,6 +371,7 @@ enum SavepointKind {
 #[derive(Debug)]
 pub struct Savepoint {
     kind: SavepointKind,
+    deferred_fk_violations: isize,
     /// Versions CREATED during this savepoint (insert operations).
     /// On rollback: these versions are removed from their chains.
     created_table_versions: Vec<(RowID, u64)>,
@@ -388,6 +389,7 @@ impl Savepoint {
     fn statement() -> Self {
         Self {
             kind: SavepointKind::Statement,
+            deferred_fk_violations: 0,
             created_table_versions: Vec::new(),
             created_index_versions: Vec::new(),
             deleted_table_versions: Vec::new(),
@@ -395,12 +397,13 @@ impl Savepoint {
         }
     }
 
-    fn named(name: String, starts_transaction: bool) -> Self {
+    fn named(name: String, starts_transaction: bool, deferred_fk_violations: isize) -> Self {
         Self {
             kind: SavepointKind::Named {
                 name,
                 starts_transaction,
             },
+            deferred_fk_violations,
             created_table_versions: Vec::new(),
             created_index_versions: Vec::new(),
             deleted_table_versions: Vec::new(),
@@ -479,7 +482,12 @@ impl Transaction {
         self.savepoint_stack.write().push(Savepoint::statement());
     }
 
-    fn begin_named_savepoint(&self, name: String, starts_transaction: bool) {
+    fn begin_named_savepoint(
+        &self,
+        name: String,
+        starts_transaction: bool,
+        deferred_fk_violations: isize,
+    ) {
         let depth = self.savepoint_stack.read().len();
         tracing::debug!(
             "begin_named_savepoint(tx_id={}, depth={}, name={})",
@@ -487,9 +495,11 @@ impl Transaction {
             depth,
             name
         );
-        self.savepoint_stack
-            .write()
-            .push(Savepoint::named(name, starts_transaction));
+        self.savepoint_stack.write().push(Savepoint::named(
+            name,
+            starts_transaction,
+            deferred_fk_violations,
+        ));
     }
 
     /// Release the newest savepoint (statement completed successfully).
@@ -546,6 +556,11 @@ impl Transaction {
         } else {
             SavepointResult::Release
         };
+        if matches!(commits_transaction, SavepointResult::Commit) {
+            // Defer mutation until transaction commit succeeds. If commit fails
+            // (e.g. deferred FK violation), savepoints must remain intact.
+            return commits_transaction;
+        }
 
         let drained: Vec<Savepoint> = savepoints.drain(target_idx..).collect();
         if let Some(parent) = savepoints.last_mut() {
@@ -556,7 +571,7 @@ impl Transaction {
         commits_transaction
     }
 
-    fn rollback_to_named_savepoint(&self, name: &str) -> Option<Vec<Savepoint>> {
+    fn rollback_to_named_savepoint(&self, name: &str) -> Option<(Vec<Savepoint>, isize)> {
         let mut savepoints = self.savepoint_stack.write();
         let target_idx = savepoints.iter().rposition(|savepoint| {
             matches!(
@@ -579,10 +594,15 @@ impl Transaction {
                 ..
             }
         );
+        let deferred_fk_violations = savepoints[target_idx].deferred_fk_violations;
 
         let drained: Vec<Savepoint> = savepoints.drain(target_idx..).collect();
-        savepoints.push(Savepoint::named(target_name, starts_transaction));
-        Some(drained)
+        savepoints.push(Savepoint::named(
+            target_name,
+            starts_transaction,
+            deferred_fk_violations,
+        ));
+        Some((drained, deferred_fk_violations))
     }
 
     /// Record a version that was created during the current savepoint.
@@ -3130,11 +3150,18 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         tx.value().begin_savepoint();
     }
 
-    pub fn begin_named_savepoint(&self, tx_id: TxID, name: String, starts_transaction: bool) {
+    pub fn begin_named_savepoint(
+        &self,
+        tx_id: TxID,
+        name: String,
+        starts_transaction: bool,
+        deferred_fk_violations: isize,
+    ) {
         let tx = self.txs.get(&tx_id).unwrap_or_else(|| {
             panic!("Transaction {tx_id} not found while beginning named savepoint")
         });
-        tx.value().begin_named_savepoint(name, starts_transaction);
+        tx.value()
+            .begin_named_savepoint(name, starts_transaction, deferred_fk_violations);
     }
 
     /// Release the newest savepoint for the transaction.
@@ -3178,19 +3205,21 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         }
     }
 
-    pub fn rollback_to_named_savepoint(&self, tx_id: TxID, name: &str) -> Result<bool> {
+    pub fn rollback_to_named_savepoint(&self, tx_id: TxID, name: &str) -> Result<Option<isize>> {
         let tx = self.txs.get(&tx_id).unwrap_or_else(|| {
             panic!("Transaction {tx_id} not found while rolling back named savepoint")
         });
-        let Some(drained_savepoints) = tx.value().rollback_to_named_savepoint(name) else {
-            return Ok(false);
+        let Some((drained_savepoints, deferred_fk_violations)) =
+            tx.value().rollback_to_named_savepoint(name)
+        else {
+            return Ok(None);
         };
 
         for savepoint in drained_savepoints.into_iter().rev() {
             self.rollback_savepoint_changes(tx_id, savepoint);
         }
 
-        Ok(true)
+        Ok(Some(deferred_fk_violations))
     }
 
     fn rollback_savepoint_changes(&self, tx_id: TxID, savepoint: Savepoint) {
