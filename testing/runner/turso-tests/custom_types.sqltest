@@ -619,3 +619,133 @@ expect {
     1.00|30.00
     2.00|20.00
 }
+
+@requires strict "uses STRICT tables"
+test order-by-group-by-numeric {
+    CREATE TABLE t1(category TEXT, val numeric(10,2)) STRICT;
+    INSERT INTO t1 VALUES ('a', 100);
+    INSERT INTO t1 VALUES ('a', 9);
+    INSERT INTO t1 VALUES ('b', 20);
+    INSERT INTO t1 VALUES ('b', 50);
+    INSERT INTO t1 VALUES ('c', -5);
+    SELECT category, SUM(val) as total FROM t1 GROUP BY category ORDER BY total;
+}
+expect {
+    c|-5.0
+    b|70.0
+    a|109.0
+}
+
+@requires strict "uses STRICT tables"
+test order-by-group-by-custom-type {
+    CREATE TYPE test_reverse BASE text ENCODE test_reverse_encode(value) DECODE test_reverse_decode(value);
+    CREATE TABLE t1(val test_reverse, n INTEGER) STRICT;
+    INSERT INTO t1 VALUES ('apple', 1);
+    INSERT INTO t1 VALUES ('apple', 2);
+    INSERT INTO t1 VALUES ('banana', 3);
+    INSERT INTO t1 VALUES ('cherry', 4);
+    SELECT val, SUM(n) FROM t1 GROUP BY val ORDER BY val;
+}
+expect {
+    apple|3
+    banana|3
+    cherry|4
+}
+
+@requires strict "uses STRICT tables"
+test order-by-numeric-expression {
+    CREATE TABLE t1(val numeric(10,2)) STRICT;
+    INSERT INTO t1 VALUES (100);
+    INSERT INTO t1 VALUES (9);
+    INSERT INTO t1 VALUES (20);
+    SELECT val + val as doubled FROM t1 ORDER BY val;
+}
+expect {
+    18.00
+    40.00
+    200.00
+}
+
+@requires strict "uses STRICT tables"
+test order-by-custom-type-where-clause {
+    CREATE TYPE test_reverse BASE text ENCODE test_reverse_encode(value) DECODE test_reverse_decode(value);
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_reverse) STRICT;
+    INSERT INTO t1 VALUES (1, 'apple');
+    INSERT INTO t1 VALUES (2, 'banana');
+    INSERT INTO t1 VALUES (3, 'cherry');
+    INSERT INTO t1 VALUES (4, 'date');
+    SELECT val FROM t1 WHERE id > 1 ORDER BY val;
+}
+expect {
+    banana
+    date
+    cherry
+}
+
+@requires strict "uses STRICT tables"
+test order-by-numeric-where-clause {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val numeric(10,2)) STRICT;
+    INSERT INTO t1 VALUES (1, 100);
+    INSERT INTO t1 VALUES (2, 9);
+    INSERT INTO t1 VALUES (3, -5);
+    INSERT INTO t1 VALUES (4, 50);
+    SELECT val FROM t1 WHERE val > 0 ORDER BY val;
+}
+expect {
+    9.00
+    50.00
+    100.00
+}
+
+@requires strict "uses STRICT tables"
+test order-by-numeric-distinct {
+    CREATE TABLE t1(val numeric(10,2)) STRICT;
+    INSERT INTO t1 VALUES (100);
+    INSERT INTO t1 VALUES (9);
+    INSERT INTO t1 VALUES (100);
+    INSERT INTO t1 VALUES (20);
+    INSERT INTO t1 VALUES (9);
+    SELECT DISTINCT val FROM t1 ORDER BY val;
+}
+expect {
+    9.00
+    20.00
+    100.00
+}
+
+@requires strict "uses STRICT tables"
+test order-by-custom-type-join {
+    CREATE TYPE test_reverse BASE text ENCODE test_reverse_encode(value) DECODE test_reverse_decode(value);
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_reverse) STRICT;
+    CREATE TABLE t2(id INTEGER PRIMARY KEY, t1_id INTEGER, label TEXT) STRICT;
+    INSERT INTO t1 VALUES (1, 'apple');
+    INSERT INTO t1 VALUES (2, 'banana');
+    INSERT INTO t1 VALUES (3, 'cherry');
+    INSERT INTO t2 VALUES (1, 1, 'x');
+    INSERT INTO t2 VALUES (2, 2, 'y');
+    INSERT INTO t2 VALUES (3, 3, 'z');
+    SELECT t2.label, t1.val FROM t1 JOIN t2 ON t1.id = t2.t1_id ORDER BY t1.val;
+}
+expect {
+    y|banana
+    x|apple
+    z|cherry
+}
+
+@requires strict "uses STRICT tables"
+test order-by-numeric-join {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val numeric(10,2)) STRICT;
+    CREATE TABLE t2(id INTEGER PRIMARY KEY, t1_id INTEGER, label TEXT) STRICT;
+    INSERT INTO t1 VALUES (1, 100);
+    INSERT INTO t1 VALUES (2, 9);
+    INSERT INTO t1 VALUES (3, -5);
+    INSERT INTO t2 VALUES (1, 1, 'x');
+    INSERT INTO t2 VALUES (2, 2, 'y');
+    INSERT INTO t2 VALUES (3, 3, 'z');
+    SELECT t2.label, t1.val FROM t1 JOIN t2 ON t1.id = t2.t1_id ORDER BY t1.val;
+}
+expect {
+    z|-5.00
+    y|9.00
+    x|100.00
+}
