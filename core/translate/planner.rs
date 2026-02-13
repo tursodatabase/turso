@@ -1165,18 +1165,6 @@ pub fn parse_from(
                     cte.tbl_name.as_str()
                 );
             }
-            if table_references
-                .outer_query_refs()
-                .iter()
-                .any(|t| t.identifier == cte_name_normalized)
-            {
-                crate::bail_parse_error!(
-                    "CTE name {} conflicts with WITH table name {}",
-                    cte.tbl_name.as_str(),
-                    cte_name_normalized
-                );
-            }
-
             // Collect table names referenced in this CTE's FROM clause.
             let mut referenced_tables = Vec::new();
             collect_from_clause_table_refs(&cte.select, &mut referenced_tables);
