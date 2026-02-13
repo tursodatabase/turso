@@ -159,6 +159,8 @@ output/
 
 ### Multi-core fixes applied
 
+**CPU affinity race fix (critical):** `AFL_NO_AFFINITY=1` disables AFL's automatic CPU binding which has a race condition when many instances start simultaneously. Multiple instances would bind to the same cores, causing severe contention. This reduced 64-core initialization from 15-20 minutes to ~2 minutes and increased CPU utilization from ~100% to ~2000%.
+
 **File contention fix (critical):** Each fuzzer instance gets its own isolated working directory to prevent deadlock on `map_id_triggered.txt`. The SQLite port of SQLRight was missing per-core file logic that MySQL/PostgreSQL versions have.
 
 **Crash handling fix (critical):** `AFL_SKIP_CRASHES=1` prevents AFL from spending hours on deterministic fuzzing of inputs that reliably crash. Without this, the fuzzer gets stuck exploring crash variations instead of discovering new bugs.
@@ -266,6 +268,7 @@ testing/sqlright/
 | `AFL_SKIP_CRASHES` | `1` | Skip inputs that crash during calibration (prevents infinite crash loop) |
 | `AFL_HANG_TMOUT` | `30000` | 30-second hang threshold (allows slow queries to complete) |
 | `AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES` | `1` | Continue if crashes directory is missing |
+| `AFL_NO_AFFINITY` | `1` | Disable automatic CPU binding (prevents race condition in multi-core startup) |
 
 ## Troubleshooting
 
@@ -283,6 +286,7 @@ testing/sqlright/
 
 | Symptom | Cause | Fix |
 |---------|-------|-----|
+| Very slow initialization (15+ min), low CPU usage (~100%) | CPU affinity race - multiple instances bind to same cores | **Fixed in latest version** - `AFL_NO_AFFINITY=1` enabled |
 | All instances frozen at low execs, ~9% CPU | File contention deadlock on `map_id_triggered.txt` | **Fixed in latest version** - per-instance working directories |
 | Many "hangs" detected, slow progress | Timeout too aggressive for slow SQL | **Fixed in latest version** - 5s timeout + 30s hang threshold |
 | Queue explodes (4000+ items), stuck at low test case numbers | AFL fuzzing crashing inputs indefinitely | **Fixed in latest version** - `AFL_SKIP_CRASHES=1` enabled |
@@ -292,7 +296,11 @@ testing/sqlright/
 
 ### Performance expectations
 
-- **Calibration time:** 2-5 minutes for 2500 seeds (depends on core count)
+- **Calibration time:** Scales with core count due to coordination overhead:
+  - 1 core: <1 minute
+  - 2-4 cores: 1-2 minutes
+  - 8 cores: 2-3 minutes
+  - 64 cores: 2-4 minutes (with AFL_NO_AFFINITY=1)
 - **Normal execs/sec:** 5-50 per instance (SQL fuzzing is slow compared to binary fuzzing)
 - **Queue growth:** Normal, especially early in fuzzing (new coverage paths discovered)
 - **Crashes found:** If target has bugs, expect crashes within first hour
