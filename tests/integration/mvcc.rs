@@ -98,3 +98,76 @@ fn test_newrowid_mvcc_concurrent(tmp_db: TempDatabase) -> anyhow::Result<()> {
     eprintln!("Test disabled - would need BEGIN CONCURRENT for proper concurrent testing");
     Ok(())
 }
+
+/// Regression test: statement-level rollback (from FK constraint violation)
+/// must clean up tx.write_set so that commit validation doesn't find stale
+/// entries pointing to pre-existing committed versions and panic with
+/// "there is another row insterted and not updated/deleted from before".
+#[turso_macros::test]
+fn test_stmt_rollback_cleans_write_set(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let _ = env_logger::try_init();
+
+    // Enable MVCC — this test is MVCC-specific (uses BEGIN CONCURRENT)
+    let conn = tmp_db.connect_limbo();
+    conn.pragma_update("journal_mode", "'experimental_mvcc'")?;
+
+    // Setup: parent/child tables with FK constraint
+    conn.execute("PRAGMA foreign_keys = ON")?;
+    conn.execute("CREATE TABLE parent(id INTEGER PRIMARY KEY)")?;
+    conn.execute(
+        "CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent(id))",
+    )?;
+    conn.execute("INSERT INTO parent VALUES (1)")?;
+    conn.execute("INSERT INTO child VALUES (1, 1)")?;
+
+    // Open a concurrent transaction on a second connection
+    let conn2 = tmp_db.connect_limbo();
+    conn2.execute("PRAGMA foreign_keys = ON")?;
+    conn2.execute("BEGIN CONCURRENT")?;
+
+    // DELETE from parent fails due to FK constraint. This triggers
+    // statement-level rollback which undoes the MVCC version changes,
+    // but before the fix, rollback_first_savepoint didn't clean up
+    // tx.write_set — leaving stale entries.
+    let result = conn2.execute("DELETE FROM parent WHERE id = 1");
+    assert!(result.is_err(), "DELETE should fail due to FK constraint");
+
+    // COMMIT should succeed. Before the fix this panicked at commit
+    // validation because the stale write_set entry pointed to a
+    // pre-existing committed version.
+    conn2.execute("COMMIT")?;
+
+    Ok(())
+}
+
+/// Same as test_stmt_rollback_cleans_write_set but with an index on the
+/// child table, exercising the index version rollback path as well.
+#[turso_macros::test]
+fn test_stmt_rollback_cleans_write_set_with_index(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let _ = env_logger::try_init();
+
+    let conn = tmp_db.connect_limbo();
+    conn.pragma_update("journal_mode", "'experimental_mvcc'")?;
+
+    conn.execute("PRAGMA foreign_keys = ON")?;
+    conn.execute("CREATE TABLE parent(id INTEGER PRIMARY KEY)")?;
+    conn.execute(
+        "CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent(id))",
+    )?;
+    conn.execute("CREATE INDEX idx_child_parent ON child(parent_id)")?;
+    conn.execute("INSERT INTO parent VALUES (1)")?;
+    conn.execute("INSERT INTO child VALUES (1, 1)")?;
+
+    let conn2 = tmp_db.connect_limbo();
+    conn2.execute("PRAGMA foreign_keys = ON")?;
+    conn2.execute("BEGIN CONCURRENT")?;
+
+    // DELETE from parent fails due to FK constraint. With an index on
+    // child(parent_id), the rollback must also undo index version changes.
+    let result = conn2.execute("DELETE FROM parent WHERE id = 1");
+    assert!(result.is_err(), "DELETE should fail due to FK constraint");
+
+    conn2.execute("COMMIT")?;
+
+    Ok(())
+}
