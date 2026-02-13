@@ -25,9 +25,18 @@ use super::{
     result_row::{emit_offset, emit_result_row_and_limit},
 };
 
+/// Returns true if the given function name has a known sort comparator
+/// implementation in the VDBE sorter. Functions not in this list will
+/// produce wrong ORDER BY results, so they should be treated as if the
+/// type has no `<` operator (sort on encoded blobs instead).
+fn has_known_sort_comparator(func_name: &str) -> bool {
+    matches!(func_name, "numeric_lt" | "test_uint_lt")
+}
+
 /// For an ORDER BY expression that is a column reference to a custom type,
-/// returns the `<` operator function name if the type has one, or None.
-/// Returns None for non-column expressions or columns without custom types.
+/// returns the `<` operator function name if the type has one AND the function
+/// has a known sort comparator. Returns None otherwise, which causes the
+/// sorter to use encoded blob ordering instead of silently wrong results.
 fn custom_type_lt_func(
     expr: &ast::Expr,
     referenced_tables: &TableReferences,
@@ -46,6 +55,7 @@ fn custom_type_lt_func(
             .operators
             .iter()
             .find(|op| op.op == "<")
+            .filter(|op| has_known_sort_comparator(&op.func_name))
             .map(|op| op.func_name.clone())
     } else {
         None
@@ -78,7 +88,9 @@ fn result_column_custom_type_info<'a>(
 }
 
 /// Returns true if the expression is a column reference to a custom type
-/// (with encode/decode) that does NOT have a `<` operator.
+/// (with encode/decode) that does NOT have a `<` operator with a known
+/// sort comparator. This includes types with no `<` operator at all, and
+/// types whose `<` function is not recognized by the sorter.
 fn is_custom_type_without_lt(
     expr: &ast::Expr,
     referenced_tables: &TableReferences,
@@ -94,7 +106,11 @@ fn is_custom_type_without_lt(
             if let Some(col) = table.get_column_at(*column) {
                 if let Some(type_def) = schema.get_type_def(&col.ty_str) {
                     if type_def.decode.is_some() {
-                        return !type_def.operators.iter().any(|op| op.op == "<");
+                        // No `<` operator, or `<` operator with unknown comparator
+                        return !type_def
+                            .operators
+                            .iter()
+                            .any(|op| op.op == "<" && has_known_sort_comparator(&op.func_name));
                     }
                 }
             }

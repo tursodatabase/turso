@@ -143,6 +143,17 @@ macro_rules! return_if_io {
     };
 }
 
+macro_rules! check_arg_count {
+    ($actual:expr, $expected:expr) => {
+        if $actual != $expected {
+            return Err(LimboError::InternalError(format!(
+                "expected {} argument(s), got {}",
+                $expected, $actual
+            )));
+        }
+    };
+}
+
 pub type InsnFunction =
     fn(&Program, &mut ProgramState, &Insn, &Arc<Pager>) -> Result<InsnFunctionStepResult>;
 
@@ -6026,7 +6037,7 @@ pub fn op_function(
                     Register::Value(Value::from_i64(if auto_commit { 1 } else { 0 }));
             }
             ScalarFunc::TestUintEncode => {
-                debug_assert!(arg_count == 1);
+                check_arg_count!(arg_count, 1);
                 let val = &state.registers[*start_reg];
                 let result = match val.get_value() {
                     Value::Null => Value::Null,
@@ -6064,7 +6075,7 @@ pub fn op_function(
                 state.registers[*dest] = Register::Value(result);
             }
             ScalarFunc::TestUintDecode => {
-                debug_assert!(arg_count == 1);
+                check_arg_count!(arg_count, 1);
                 let val = &state.registers[*start_reg];
                 let result = match val.get_value() {
                     Value::Null => Value::Null,
@@ -6076,7 +6087,7 @@ pub fn op_function(
             | ScalarFunc::TestUintSub
             | ScalarFunc::TestUintMul
             | ScalarFunc::TestUintDiv => {
-                debug_assert!(arg_count == 2);
+                check_arg_count!(arg_count, 2);
                 let a = parse_test_uint(&state.registers[*start_reg])?;
                 let b = parse_test_uint(&state.registers[*start_reg + 1])?;
                 let result = match (a, b) {
@@ -6108,7 +6119,7 @@ pub fn op_function(
                 state.registers[*dest] = Register::Value(result);
             }
             ScalarFunc::TestUintLt | ScalarFunc::TestUintEq => {
-                debug_assert!(arg_count == 2);
+                check_arg_count!(arg_count, 2);
                 let a = parse_test_uint(&state.registers[*start_reg])?;
                 let b = parse_test_uint(&state.registers[*start_reg + 1])?;
                 let result = match (a, b) {
@@ -6125,7 +6136,7 @@ pub fn op_function(
                 state.registers[*dest] = Register::Value(result);
             }
             ScalarFunc::TestReverseEncode | ScalarFunc::TestReverseDecode => {
-                debug_assert!(arg_count == 1);
+                check_arg_count!(arg_count, 1);
                 let val = &state.registers[*start_reg];
                 let result = match val.get_value() {
                     Value::Null => Value::Null,
@@ -6142,7 +6153,7 @@ pub fn op_function(
                 state.registers[*dest] = Register::Value(result);
             }
             ScalarFunc::BooleanToInt => {
-                debug_assert!(arg_count == 1);
+                check_arg_count!(arg_count, 1);
                 let val = &state.registers[*start_reg];
                 let result = match val.get_value() {
                     Value::Null => Value::Null,
@@ -6176,7 +6187,7 @@ pub fn op_function(
                 state.registers[*dest] = Register::Value(result);
             }
             ScalarFunc::IntToBoolean => {
-                debug_assert!(arg_count == 1);
+                check_arg_count!(arg_count, 1);
                 let val = &state.registers[*start_reg];
                 let result = match val.get_value() {
                     Value::Null => Value::Null,
@@ -6186,7 +6197,7 @@ pub fn op_function(
                 state.registers[*dest] = Register::Value(result);
             }
             ScalarFunc::ValidateIpAddr => {
-                debug_assert!(arg_count == 1);
+                check_arg_count!(arg_count, 1);
                 let val = &state.registers[*start_reg];
                 let result = match val.get_value() {
                     Value::Null => Value::Null,
@@ -6206,7 +6217,7 @@ pub fn op_function(
                 state.registers[*dest] = Register::Value(result);
             }
             ScalarFunc::NumericEncode => {
-                debug_assert!(arg_count == 3);
+                check_arg_count!(arg_count, 3);
                 let val = &state.registers[*start_reg];
                 let precision_reg = &state.registers[*start_reg + 1];
                 let scale_reg = &state.registers[*start_reg + 2];
@@ -6257,7 +6268,7 @@ pub fn op_function(
                 state.registers[*dest] = Register::Value(result);
             }
             ScalarFunc::NumericDecode => {
-                debug_assert!(arg_count == 1);
+                check_arg_count!(arg_count, 1);
                 let val = &state.registers[*start_reg];
                 let result = match val.get_value() {
                     Value::Null => Value::Null,
@@ -6277,7 +6288,7 @@ pub fn op_function(
             | ScalarFunc::NumericSub
             | ScalarFunc::NumericMul
             | ScalarFunc::NumericDiv => {
-                debug_assert!(arg_count == 2);
+                check_arg_count!(arg_count, 2);
                 let lhs_val = state.registers[*start_reg].get_value().clone();
                 let rhs_val = state.registers[*start_reg + 1].get_value().clone();
                 let result = match (&lhs_val, &rhs_val) {
@@ -6306,7 +6317,7 @@ pub fn op_function(
                 state.registers[*dest] = Register::Value(result);
             }
             ScalarFunc::NumericLt | ScalarFunc::NumericEq => {
-                debug_assert!(arg_count == 2);
+                check_arg_count!(arg_count, 2);
                 let lhs_val = state.registers[*start_reg].get_value().clone();
                 let rhs_val = state.registers[*start_reg + 1].get_value().clone();
                 let result = match (&lhs_val, &rhs_val) {

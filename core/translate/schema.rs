@@ -1274,6 +1274,45 @@ pub fn translate_drop_table(
     Ok(())
 }
 
+/// Validate an encode or decode expression for safety.
+/// Rejects subqueries, aggregates, and window functions.
+fn validate_type_expr(expr: &ast::Expr, kind: &str, resolver: &Resolver) -> Result<()> {
+    walk_expr(expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
+        match e {
+            ast::Expr::Subquery(_) | ast::Expr::Exists(_) | ast::Expr::InSelect { .. } => {
+                bail_parse_error!("subqueries prohibited in {kind} expressions");
+            }
+            ast::Expr::FunctionCall {
+                name,
+                args,
+                filter_over,
+                ..
+            } => {
+                if filter_over.over_clause.is_some() {
+                    bail_parse_error!("window functions prohibited in {kind} expressions");
+                }
+                if let Some(func) = resolver.resolve_function(name.as_str(), args.len()) {
+                    if matches!(func, Func::Agg(..)) {
+                        bail_parse_error!(
+                            "aggregate functions prohibited in {kind} expressions: {}",
+                            name.as_str()
+                        );
+                    }
+                }
+            }
+            ast::Expr::FunctionCallStar { name, .. } => {
+                bail_parse_error!(
+                    "aggregate functions prohibited in {kind} expressions: {}",
+                    name.as_str()
+                );
+            }
+            _ => {}
+        }
+        Ok(WalkControl::Continue)
+    })?;
+    Ok(())
+}
+
 pub fn translate_create_type(
     type_name: &str,
     body: &ast::CreateTypeBody,
@@ -1289,6 +1328,14 @@ pub fn translate_create_type(
             return Ok(program);
         }
         bail_parse_error!("type {normalized_name} already exists");
+    }
+
+    // Validate encode/decode expressions for safety
+    if let Some(ref encode) = body.encode {
+        validate_type_expr(encode, "ENCODE", resolver)?;
+    }
+    if let Some(ref decode) = body.decode {
+        validate_type_expr(decode, "DECODE", resolver)?;
     }
 
     // Reconstruct the SQL string (without IF NOT EXISTS) using TypeDef::to_sql()

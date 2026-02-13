@@ -154,6 +154,27 @@ pub const TURSO_TYPES_TABLE_NAME: &str = "__turso_internal_types";
 pub const DBSP_TABLE_PREFIX: &str = "__turso_internal_dbsp_state_v";
 pub const TURSO_INTERNAL_PREFIX: &str = "__turso_internal_";
 
+/// Quote a SQL identifier with double quotes if it needs quoting.
+/// Quotes when the name contains non-alphanumeric characters (except underscore),
+/// starts with a digit, or is empty. Simple names like "test_uint" are left unquoted.
+fn quote_ident(name: &str) -> String {
+    let needs_quoting = name.is_empty()
+        || name.as_bytes()[0].is_ascii_digit()
+        || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
+    if needs_quoting {
+        let escaped = name.replace('"', "\"\"");
+        format!("\"{escaped}\"")
+    } else {
+        name.to_string()
+    }
+}
+
+/// Escape a string literal for SQL single-quote context.
+/// The value goes inside the surrounding quotes already present in the format string.
+fn quote_string_literal(s: &str) -> String {
+    s.replace('\'', "''")
+}
+
 /// Custom type definition, loaded from sqlite_turso_types
 #[derive(Debug, Clone)]
 pub struct TypeDef {
@@ -189,13 +210,18 @@ impl TypeDef {
     /// Reconstruct the CREATE TYPE SQL string from this definition.
     pub fn to_sql(&self) -> String {
         let mut sql = if self.params.is_empty() {
-            format!("CREATE TYPE {} BASE {}", self.name, self.base)
+            format!(
+                "CREATE TYPE {} BASE {}",
+                quote_ident(&self.name),
+                quote_ident(&self.base)
+            )
         } else {
+            let params: Vec<String> = self.params.iter().map(|p| quote_ident(p)).collect();
             format!(
                 "CREATE TYPE {}({}) BASE {}",
-                self.name,
-                self.params.join(", "),
-                self.base
+                quote_ident(&self.name),
+                params.join(", "),
+                quote_ident(&self.base)
             )
         };
         if let Some(ref encode) = self.encode {
@@ -210,7 +236,9 @@ impl TypeDef {
         for op in &self.operators {
             sql.push_str(&format!(
                 " OPERATOR '{}' ({}) -> {}",
-                op.op, op.right_type, op.func_name
+                quote_string_literal(&op.op),
+                quote_ident(&op.right_type),
+                quote_ident(&op.func_name)
             ));
         }
         sql

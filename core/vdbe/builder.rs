@@ -1504,6 +1504,9 @@ impl ProgramBuilder {
                 .get(column)
                 .expect("column index out of bounds");
             if column_def.is_rowid_alias() {
+                // Consume the suppress_column_default flag so it doesn't
+                // leak to the next column (emit_column normally consumes it).
+                self.suppress_column_default = false;
                 self.emit_insn(Insn::RowId {
                     cursor_id,
                     dest: out,
