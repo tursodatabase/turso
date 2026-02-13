@@ -1733,9 +1733,26 @@ pub fn op_type_check(
                 b"TEXT" if value_type == ValueType::Text => {}
                 b"ANY" => {}
                 // Custom types: the encode function (which runs before TypeCheck)
-                // has already validated and converted the value. Unknown types cannot
-                // reach here because CREATE TABLE rejects them for STRICT tables.
-                _ => {}
+                // has already validated and converted the value to the base type.
+                // Verify the result is a valid STRICT type as a defense-in-depth check.
+                _ => {
+                    match value_type {
+                        ValueType::Integer
+                        | ValueType::Float
+                        | ValueType::Text
+                        | ValueType::Blob => {}
+                        _ => {
+                            bail_constraint_error!(
+                                "cannot store {} value in {} column {}.{} ({})",
+                                value_type,
+                                ty_str,
+                                &table_reference.name,
+                                col.name.as_deref().unwrap_or(""),
+                                SQLITE_CONSTRAINT
+                            );
+                        }
+                    }
+                }
             });
             Ok(())
         })?;

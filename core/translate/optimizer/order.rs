@@ -1,4 +1,5 @@
 use crate::{
+    schema::Schema,
     translate::{
         collate::{get_collseq_from_expr, CollationSeq},
         optimizer::access_method::AccessMethodParams,
@@ -172,6 +173,7 @@ pub fn plan_satisfies_order_target(
     access_methods_arena: &[AccessMethod],
     joined_tables: &[JoinedTable],
     order_target: &OrderTarget,
+    schema: &Schema,
 ) -> bool {
     let mut target_col_idx = 0;
     let num_cols_in_order_target = order_target.0.len();
@@ -244,6 +246,17 @@ pub fn plan_satisfies_order_target(
                         };
                         if !column_matches {
                             break;
+                        }
+
+                        // Custom type columns store encoded blobs. The B-tree's
+                        // blob ordering (memcmp) doesn't match the custom type's
+                        // semantic ordering, so the index can't satisfy ORDER BY.
+                        if let ColumnTarget::Column(col_no) = &target_col.target {
+                            if let Some(col) = table_ref.table.columns().get(*col_no) {
+                                if schema.get_type_def(&col.ty_str).is_some() {
+                                    break;
+                                }
+                            }
                         }
 
                         // If ORDER BY collation doesn't match index collation, this index can't satisfy the ordering

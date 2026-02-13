@@ -1194,6 +1194,7 @@ fn optimize_table_access(
             &access_methods_arena,
             table_references.joined_tables_mut(),
             order_target,
+            schema,
         );
         if satisfies_order_target {
             match order_target.1 {
