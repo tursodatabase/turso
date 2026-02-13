@@ -1547,6 +1547,7 @@ fn optimize_table_access(
                 mem_budget,
                 materialize_build_input,
                 use_bloom_filter,
+                join_type,
             } => {
                 // Mark WHERE clause terms as consumed since we're using hash join
                 for join_key in join_keys.iter() {
@@ -1561,6 +1562,7 @@ fn optimize_table_access(
                         mem_budget: *mem_budget,
                         materialize_build_input: *materialize_build_input,
                         use_bloom_filter: *use_bloom_filter,
+                        join_type: *join_type,
                     });
             }
             AccessMethodParams::IndexMethod {

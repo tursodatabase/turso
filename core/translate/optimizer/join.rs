@@ -21,8 +21,8 @@ use crate::{
             order::plan_satisfies_order_target,
         },
         plan::{
-            HashJoinKey, JoinOrderMember, JoinedTable, NonFromClauseSubquery, TableReferences,
-            WhereTerm,
+            HashJoinKey, HashJoinType, JoinOrderMember, JoinedTable, NonFromClauseSubquery,
+            TableReferences, WhereTerm,
         },
         planner::TableMask,
     },
@@ -689,7 +689,17 @@ pub fn join_lhs_and_rhs<'a>(
                             );
                         }
                     }
-                    if hash_join_allowed && hash_join_method.cost < best_access_method.cost {
+                    // FULL OUTER JOIN requires hash join for unmatched build scanning
+                    let is_full_outer = matches!(
+                        &hash_join_method.params,
+                        AccessMethodParams::HashJoin {
+                            join_type: HashJoinType::FullOuter,
+                            ..
+                        }
+                    );
+                    if hash_join_allowed
+                        && (is_full_outer || hash_join_method.cost < best_access_method.cost)
+                    {
                         best_access_method = hash_join_method;
                     }
                 }
@@ -725,6 +735,29 @@ pub fn join_lhs_and_rhs<'a>(
                 // Track index_method estimated_rows for output cardinality
                 index_method_estimated_rows = Some(cost_estimate.estimated_rows);
             }
+        }
+    }
+
+    // FULL OUTER requires hash join for unmatched build scanning. Error if the
+    // optimizer couldn't select one (no equi-join, USING clause, chaining, etc.).
+    if lhs.is_some() {
+        let is_full_outer = rhs_table_reference
+            .join_info
+            .as_ref()
+            .is_some_and(|ji| ji.full_outer);
+        if is_full_outer
+            && !matches!(
+                best_access_method.params,
+                AccessMethodParams::HashJoin {
+                    join_type: HashJoinType::FullOuter,
+                    ..
+                }
+            )
+        {
+            // This ordering doesn't support FULL OUTER (no equi-join or
+            // chaining issue). Return Ok(None) so the DP/greedy planner can
+            // try other orderings — the naive left-to-right plan may work.
+            return Ok(None);
         }
     }
 
@@ -1311,9 +1344,40 @@ pub fn compute_best_join_order<'a>(
                 best_ordered_plan
             },
         })),
-        None => Err(LimboError::PlanningError(
-            "No valid query plan found".to_string(),
-        )),
+        None => {
+            // If any table uses FULL OUTER JOIN, produce a specific error
+            // explaining why no plan was found.
+            let has_full_outer = joined_tables
+                .iter()
+                .any(|t| t.join_info.as_ref().is_some_and(|ji| ji.full_outer));
+            if has_full_outer {
+                // Distinguish chaining from missing equi-join.
+                let build_is_outer = joined_tables.iter().any(|t| {
+                    let is_full = t.join_info.as_ref().is_some_and(|ji| ji.full_outer);
+                    if !is_full {
+                        return false;
+                    }
+                    // Check if any earlier table (potential build) has outer/full_outer.
+                    joined_tables.iter().any(|other| {
+                        !std::ptr::eq(t, other)
+                            && other
+                                .join_info
+                                .as_ref()
+                                .is_some_and(|ji| ji.outer || ji.full_outer)
+                    })
+                });
+                let msg = if build_is_outer {
+                    "FULL OUTER JOIN chaining is not yet supported"
+                } else {
+                    "FULL OUTER JOIN requires an equality condition in the ON clause"
+                };
+                Err(LimboError::ParseError(msg.to_string()))
+            } else {
+                Err(LimboError::PlanningError(
+                    "No valid query plan found".to_string(),
+                ))
+            }
+        }
     }
 }
 
@@ -2032,6 +2096,7 @@ mod tests {
                 t2,
                 Some(JoinInfo {
                     outer: false,
+                    full_outer: false,
                     using: vec![],
                 }),
                 table_id_counter.next(),
@@ -2155,6 +2220,7 @@ mod tests {
                 table_customers,
                 Some(JoinInfo {
                     outer: false,
+                    full_outer: false,
                     using: vec![],
                 }),
                 table_id_counter.next(),
@@ -2163,6 +2229,7 @@ mod tests {
                 table_order_items,
                 Some(JoinInfo {
                     outer: false,
+                    full_outer: false,
                     using: vec![],
                 }),
                 table_id_counter.next(),
@@ -2365,6 +2432,7 @@ mod tests {
                 t2,
                 Some(JoinInfo {
                     outer: false,
+                    full_outer: false,
                     using: vec![],
                 }),
                 table_id_counter.next(),
@@ -2373,6 +2441,7 @@ mod tests {
                 t3,
                 Some(JoinInfo {
                     outer: false,
+                    full_outer: false,
                     using: vec![],
                 }),
                 table_id_counter.next(),
@@ -2488,6 +2557,7 @@ mod tests {
                     t.clone(),
                     Some(JoinInfo {
                         outer: false,
+                        full_outer: false,
                         using: vec![],
                     }),
                     table_id_counter.next(),
@@ -2497,6 +2567,7 @@ mod tests {
                 fact_table,
                 Some(JoinInfo {
                     outer: false,
+                    full_outer: false,
                     using: vec![],
                 }),
                 table_id_counter.next(),
@@ -3225,6 +3296,7 @@ mod tests {
                 t2,
                 Some(JoinInfo {
                     outer: false,
+                    full_outer: false,
                     using: vec![],
                 }),
                 table_id_counter.next(),
