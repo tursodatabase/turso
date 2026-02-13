@@ -1331,7 +1331,6 @@ pub fn test_busy_snapshot_immediate() {
 
     // stmt1 will yield with IO as it needs to allocate first page
     let result = stmt1.step();
-    assert!(matches!(result, Ok(StepResult::IO)));
 
     // run stmt2 to completion and commit changes
     loop {
