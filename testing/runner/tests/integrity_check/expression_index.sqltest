@@ -1,0 +1,60 @@
+@database :memory:
+
+@skip-file-if mvcc "not supported in MVCC mode"
+
+# Test integrity_check with expression indexes.
+# Expression indexes use computed values rather than direct column references.
+# Previously, this caused a panic because expression index columns have
+# pos_in_table = usize::MAX as a sentinel value indicating they're not
+# direct column references.
+
+test integrity-check-expression-index {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER);
+    CREATE INDEX idx ON t(a + 1);
+    INSERT INTO t VALUES (1, 10), (2, 20), (3, 30);
+    PRAGMA integrity_check;
+}
+expect {
+    ok
+}
+
+test integrity-check-expression-index-empty-table {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER);
+    CREATE INDEX idx ON t(a * 2);
+    PRAGMA integrity_check;
+}
+expect {
+    ok
+}
+
+test integrity-check-multiple-expression-indexes {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b TEXT);
+    CREATE INDEX idx1 ON t(a + 1);
+    CREATE INDEX idx2 ON t(length(b));
+    INSERT INTO t VALUES (1, 5, 'hello'), (2, 10, 'world');
+    PRAGMA integrity_check;
+}
+expect {
+    ok
+}
+
+test integrity-check-mixed-column-and-expression-index {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b TEXT);
+    CREATE INDEX idx_regular ON t(a);
+    CREATE INDEX idx_expr ON t(a + 1);
+    INSERT INTO t VALUES (1, 100, 'test');
+    PRAGMA integrity_check;
+}
+expect {
+    ok
+}
+
+test quick-check-expression-index {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER);
+    CREATE INDEX idx ON t(a + 1);
+    INSERT INTO t VALUES (1, 1);
+    PRAGMA quick_check;
+}
+expect {
+    ok
+}
