@@ -18,6 +18,7 @@ pub use cache::JsonCacheCell;
 use jsonb::{ElementType, Jsonb, JsonbHeader, PathOperationMode, SearchOperation, SetOperation};
 use std::borrow::Cow;
 use std::str::FromStr;
+use rustix::path::Arg;
 
 #[derive(Debug, Clone, Copy)]
 pub enum Conv {
@@ -156,6 +157,9 @@ pub fn convert_ref_dbtype_to_jsonb(val: ValueRef<'_>, strict: Conv) -> crate::Re
                         if total_expected != slice.len() {
                             parse_as_json_text(slice, strict)?
                         } else {
+                            if header.is_scalar() {
+                                return Err(LimboError::ParseError("malformed JSON".to_string()));
+                            }
                             let jsonb = Jsonb::from_raw_data(slice);
                             let is_valid_json = if payload_size <= 7 {
                                 jsonb.is_valid()
