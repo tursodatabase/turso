@@ -276,15 +276,17 @@ def run_extended_checks(db_path, timeout):
                 # Prefix: all prior columns must be equal (NULL-safe via IS)
                 prefix_eq = ' AND '.join(
                     f"_p{j} IS {quote_ident(cols[j]['name'])}"
+                    f"{' COLLATE ' + cols[j]['collation'] if cols[j]['collation'] != 'BINARY' else ''}"
                     for j in range(i)
                 )
                 qc = quote_ident(c['name'])
+                collate = f" COLLATE {c['collation']}" if c['collation'] != 'BINARY' else ""
                 if not c['desc']:
                     # ASC: violation when prev is non-NULL but curr is NULL or prev > curr
-                    cond = f"(_p{i} IS NOT NULL AND ({qc} IS NULL OR _p{i} > {qc}))"
+                    cond = f"(_p{i} IS NOT NULL AND ({qc} IS NULL OR _p{i} > {qc}{collate}))"
                 else:
                     # DESC: violation when curr is non-NULL but prev is NULL or prev < curr
-                    cond = f"({qc} IS NOT NULL AND (_p{i} IS NULL OR _p{i} < {qc}))"
+                    cond = f"({qc} IS NOT NULL AND (_p{i} IS NULL OR _p{i} < {qc}{collate}))"
                 if prefix_eq:
                     cond = f"({prefix_eq} AND {cond})"
                 conditions.append(cond)
