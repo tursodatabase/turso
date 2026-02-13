@@ -2792,7 +2792,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                     tracing::debug!("rollback_savepoint: removed table version(table_id={}, row_id={}, version_id={})",
                         rowid.table_id, rowid.row_id, version_id);
                 }
-                affected_table_rowids.insert(rowid);
+                affected_table_rowids.insert(rowid.clone());
             }
 
             // Remove created index versions
@@ -2823,7 +2823,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                         }
                     }
                 }
-                affected_table_rowids.insert(rowid);
+                affected_table_rowids.insert(rowid.clone());
             }
 
             // Restore deleted index versions
@@ -2843,7 +2843,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 }
             }
 
-            // Clean up write set: remove table rowids that no longer have any
+            // Clean up write set: remove rowids that no longer have any
             // version belonging to this transaction. Without this, commit
             // validation would find stale write set entries pointing to
             // pre-existing committed versions and panic.
@@ -2861,14 +2861,32 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                     tx.write_set.remove(rowid);
                 }
             }
-            // Remove from write_set only the rowids that were NEWLY added by this savepoint
+
+            // Same cleanup for index rowids that were newly added by this savepoint.
             for rowid in &savepoint.newly_added_to_write_set {
-                tx.write_set.remove(rowid);
-                tracing::debug!(
-                    "rollback_savepoint: removed from write_set(table_id={}, row_id={})",
-                    rowid.table_id,
-                    rowid.row_id
-                );
+                if rowid.row_id.is_int_key() {
+                    // Table rowids are already handled above via affected_table_rowids.
+                    continue;
+                }
+                let RowKey::Record(ref record) = rowid.row_id else {
+                    unreachable!()
+                };
+                let has_tx_version = if let Some(index) = self.index_rows.get(&rowid.table_id) {
+                    if let Some(entry) = index.value().get(record) {
+                        let versions = entry.value().read();
+                        versions.iter().any(|rv| {
+                            matches!(rv.begin, Some(TxTimestampOrID::TxID(id)) if id == tx_id)
+                                || matches!(rv.end, Some(TxTimestampOrID::TxID(id)) if id == tx_id)
+                        })
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+                if !has_tx_version {
+                    tx.write_set.remove(rowid);
+                }
             }
 
             Ok(true)
