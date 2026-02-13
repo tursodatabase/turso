@@ -183,3 +183,48 @@ test savepoint-rollback-to-without-active-savepoint-errors {
 expect error {
     no such savepoint
 }
+
+test savepoint-cleared-after-commit {
+    SAVEPOINT s;
+    COMMIT;
+    RELEASE s;
+}
+expect error {
+    no such savepoint
+}
+
+test savepoint-cleared-after-rollback {
+    SAVEPOINT s;
+    ROLLBACK;
+    RELEASE s;
+}
+expect error {
+    no such savepoint
+}
+
+test savepoint-rollback-to-restores-deferred-fk-counter {
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(pid INTEGER REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+    SAVEPOINT s;
+    INSERT INTO c VALUES (1);
+    ROLLBACK TO s;
+    RELEASE s;
+    SELECT count(*) FROM c;
+}
+expect {
+    0
+}
+
+test savepoint-not-reusable-after-transaction-boundary {
+    CREATE TABLE t(x);
+    SAVEPOINT s;
+    INSERT INTO t VALUES (1);
+    COMMIT;
+    BEGIN;
+    INSERT INTO t VALUES (2);
+    ROLLBACK TO s;
+}
+expect error {
+    no such savepoint
+}
