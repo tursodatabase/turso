@@ -1811,7 +1811,7 @@ impl Pager {
             let journal_end_offset = savepoints
                 .last()
                 .map(|savepoint| savepoint.write_offset())
-                .unwrap_or(savepoints[target_idx].write_offset());
+                .unwrap_or_else(|| savepoints[target_idx].write_offset());
             (
                 target_idx,
                 savepoints[target_idx].snapshot(),
