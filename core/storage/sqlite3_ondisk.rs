@@ -1235,18 +1235,21 @@ pub fn read_varint(buf: &[u8]) -> Result<(u64, usize)> {
     }
 }
 
-// This is a branchless function to compute the length of a varint encoding for a given u64 value.
+/// Compute the length of a varint encoding for a given u64 value.
+///
+/// SQLite varint: bytes 1-8 each carry 7 payload bits (56 total).
+/// The optional 9th byte carries a full 8 bits (no continuation bit),
+/// giving 64 bits total.  So values needing >56 bits always take 9 bytes.
 #[inline(always)]
 pub fn varint_len(value: u64) -> usize {
-    // Number of bits required to represent value.
-    // leading_zeros returns the count of leading zero bits; subtract from 64.
-    let bits = 64 - value.leading_zeros() as usize;
-
-    // Each varint byte stores 7 bits of payload.
-    // (bits + 6) / 7 is the ceiling of bits / 7.
-    let len = bits.div_ceil(7);
-
-    len.max(1)
+    if value <= 0x7f {
+        1
+    } else if value > (1u64 << 56) - 1 {
+        9
+    } else {
+        let bits = 64 - value.leading_zeros() as usize;
+        bits.div_ceil(7)
+    }
 }
 
 pub fn write_varint(buf: &mut [u8], value: u64) -> usize {
@@ -2151,5 +2154,12 @@ mod tests {
         let frame_cache = guard.frame_cache.lock();
         assert_eq!(frame_cache.get(&1), Some(&vec![1u64]));
         assert!(frame_cache.get(&2).is_none());
+    }
+
+    #[quickcheck_macros::quickcheck]
+    fn varint_len_matches_write_varint(value: u64) -> bool {
+        let mut buf = [0u8; 9];
+        let written = write_varint(&mut buf, value);
+        varint_len(value) == written
     }
 }
