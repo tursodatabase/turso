@@ -655,7 +655,7 @@ pub fn group_by_process_single_group(
                     t_ctx
                         .resolver
                         .expr_to_reg_cache
-                        .push((std::borrow::Cow::Borrowed(expr), next_reg));
+                        .push((std::borrow::Cow::Borrowed(expr), next_reg, false));
                     next_reg += 1;
                 }
             }
@@ -681,7 +681,7 @@ pub fn group_by_process_single_group(
                 t_ctx
                     .resolver
                     .expr_to_reg_cache
-                    .push((std::borrow::Cow::Borrowed(expr), dest_reg));
+                    .push((std::borrow::Cow::Borrowed(expr), dest_reg, false));
             }
         }
     }
@@ -807,6 +807,7 @@ pub fn group_by_emit_row_phase<'a>(
         t_ctx.resolver.expr_to_reg_cache.push((
             std::borrow::Cow::Borrowed(&agg.original_expr),
             agg_result_reg,
+            false,
         ));
     }
 

@@ -37,7 +37,7 @@ fn has_known_sort_comparator(func_name: &str) -> bool {
 /// returns the `<` operator function name if the type has one AND the function
 /// has a known sort comparator. Returns None otherwise, which causes the
 /// sorter to use encoded blob ordering instead of silently wrong results.
-fn custom_type_lt_func(
+pub(crate) fn custom_type_lt_func(
     expr: &ast::Expr,
     referenced_tables: &TableReferences,
     schema: &Schema,

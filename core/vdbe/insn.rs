@@ -794,6 +794,8 @@ pub enum Insn {
         col: usize,
         delimiter: usize,
         func: AggFunc,
+        /// Optional custom type comparator function name for MIN/MAX aggregates.
+        comparator_func_name: Option<String>,
     },
 
     AggFinal {

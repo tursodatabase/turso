@@ -861,12 +861,50 @@ pub fn translate_expr(
         None
     };
 
-    if let Some(reg) = resolver.resolve_cached_expr_reg(expr) {
+    if let Some((reg, needs_decode)) = resolver.resolve_cached_expr_reg(expr) {
         program.emit_insn(Insn::Copy {
             src_reg: reg,
             dst_reg: target_register,
             extra_amount: 0,
         });
+        // Hash join payloads store raw encoded values; apply DECODE for custom
+        // type columns so the result set contains human-readable text.
+        if needs_decode && !program.suppress_custom_type_decode {
+            if let ast::Expr::Column {
+                table: table_ref_id,
+                column,
+                ..
+            } = expr
+            {
+                if let Some(referenced_tables) = referenced_tables {
+                    if let Some((_, table)) =
+                        referenced_tables.find_table_by_internal_id(*table_ref_id)
+                    {
+                        if let Some(col) = table.get_column_at(*column) {
+                            if let Some(type_def) = resolver.schema.get_type_def(&col.ty_str) {
+                                if let Some(ref decode_expr) = type_def.decode {
+                                    let skip_label = program.allocate_label();
+                                    program.emit_insn(Insn::IsNull {
+                                        reg: target_register,
+                                        target_pc: skip_label,
+                                    });
+                                    emit_type_expr(
+                                        program,
+                                        decode_expr,
+                                        target_register,
+                                        target_register,
+                                        col,
+                                        type_def,
+                                        resolver,
+                                    )?;
+                                    program.resolve_label(skip_label, program.offset());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
         if let Some(span) = constant_span {
             program.constant_span_end(span);
         }
@@ -5869,7 +5907,7 @@ pub(crate) fn emit_returning_results<'a>(
     let cache_len = resolver.expr_to_reg_cache.len();
     resolver
         .expr_to_reg_cache
-        .push((std::borrow::Cow::Owned(expr), rowid_reg));
+        .push((std::borrow::Cow::Owned(expr), rowid_reg, false));
     for (i, column) in table.columns().iter().enumerate() {
         let reg = if column.is_rowid_alias() {
             rowid_reg
@@ -5884,7 +5922,7 @@ pub(crate) fn emit_returning_results<'a>(
         };
         resolver
             .expr_to_reg_cache
-            .push((std::borrow::Cow::Owned(expr), reg));
+            .push((std::borrow::Cow::Owned(expr), reg, false));
     }
 
     let result_start_reg = program.alloc_registers(result_columns.len());

@@ -1114,7 +1114,7 @@ fn emit_multi_index_scan_loop(
     t_ctx
         .resolver
         .expr_to_reg_cache
-        .push((Cow::Owned(rowid_expr), rowid_reg));
+        .push((Cow::Owned(rowid_expr), rowid_reg, false));
 
     program.preassign_label_to_next_insn(skip_label);
 
@@ -1643,11 +1643,11 @@ pub fn open_loop(
                     t_ctx
                         .resolver
                         .expr_to_reg_cache
-                        .push((Cow::Owned(rowid_expr), match_reg));
+                        .push((Cow::Owned(rowid_expr), match_reg, false));
                 }
                 if let Some(payload_reg) = payload_dest_reg {
                     for (i, payload) in payload_columns.iter().enumerate() {
-                        let (payload_table_id, expr) = match payload {
+                        let (payload_table_id, expr, is_column) = match payload {
                             MaterializedColumnRef::Column {
                                 table_id,
                                 column_idx,
@@ -1660,6 +1660,7 @@ pub fn open_loop(
                                     column: *column_idx,
                                     is_rowid_alias: *is_rowid_alias,
                                 },
+                                true,
                             ),
                             MaterializedColumnRef::RowId { table_id } => (
                                 *table_id,
@@ -1667,15 +1668,18 @@ pub fn open_loop(
                                     database: None,
                                     table: *table_id,
                                 },
+                                false,
                             ),
                         };
                         if live_table_ids.contains(&payload_table_id) {
                             continue;
                         }
+                        // Payload columns contain raw encoded values; mark them
+                        // for decode so custom type DECODE is applied when read.
                         t_ctx
                             .resolver
                             .expr_to_reg_cache
-                            .push((Cow::Owned(expr), payload_reg + i));
+                            .push((Cow::Owned(expr), payload_reg + i, is_column));
                     }
                 } else if payload_info.allow_seek && !build_table_is_live {
                     // When payload doesn't contain all needed columns, SeekRowid to the build table.

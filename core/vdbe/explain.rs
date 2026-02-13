@@ -1011,6 +1011,7 @@ pub fn insn_to_row(
                 acc_reg,
                 delimiter: _,
                 col,
+                comparator_func_name: _,
             } => (
                 "AggStep",
                 0,

@@ -541,6 +541,7 @@ pub fn init_window<'a>(
         t_ctx.resolver.expr_to_reg_cache.push((
             std::borrow::Cow::Borrowed(&func.original_expr),
             reg_acc_result_start + i,
+            false,
         ));
     }
 
@@ -555,7 +556,7 @@ pub fn init_window<'a>(
         t_ctx
             .resolver
             .expr_to_reg_cache
-            .push((std::borrow::Cow::Borrowed(expr), reg_col_start + i));
+            .push((std::borrow::Cow::Borrowed(expr), reg_col_start + i, false));
     }
 
     t_ctx.meta_window = Some(WindowMetadata {

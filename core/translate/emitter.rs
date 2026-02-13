@@ -118,7 +118,10 @@ pub struct Resolver<'a> {
     attached_databases: &'a RwLock<DatabaseCatalog>,
     pub symbol_table: &'a SymbolTable,
     pub expr_to_reg_cache_enabled: bool,
-    pub expr_to_reg_cache: Vec<(Cow<'a, ast::Expr>, usize)>,
+    /// Cache entries: (expression, register, needs_custom_type_decode).
+    /// The `needs_custom_type_decode` flag is true for hash-join payload registers
+    /// that contain raw encoded values and need DECODE applied when read.
+    pub expr_to_reg_cache: Vec<(Cow<'a, ast::Expr>, usize, bool)>,
     /// Maps register indices to column affinities for expression index evaluation.
     /// Populated temporarily during UPDATE new-image expression index key computation,
     /// where column references have been rewritten to Expr::Register and comparison
@@ -179,17 +182,18 @@ impl<'a> Resolver<'a> {
         self.expr_to_reg_cache_enabled = true;
     }
 
-    /// Returns the register for a previously translated expression, if caching is enabled.
+    /// Returns the register and decode flag for a previously translated expression.
     ///
     /// We scan from newest to oldest so later translations win when equivalent
     /// expressions are seen multiple times in the same translation pass.
-    pub fn resolve_cached_expr_reg(&self, expr: &ast::Expr) -> Option<usize> {
+    /// Returns `(register, needs_custom_type_decode)`.
+    pub fn resolve_cached_expr_reg(&self, expr: &ast::Expr) -> Option<(usize, bool)> {
         if self.expr_to_reg_cache_enabled {
             self.expr_to_reg_cache
                 .iter()
                 .rev()
-                .find(|(e, _)| exprs_are_equivalent(expr, e))
-                .map(|(_, reg)| *reg)
+                .find(|(e, _, _)| exprs_are_equivalent(expr, e))
+                .map(|(_, reg, needs_decode)| (*reg, *needs_decode))
         } else {
             None
         }
@@ -5252,14 +5256,14 @@ pub(crate) fn emit_check_constraints<'a>(
         let rowid_expr = ast::Expr::Id(ast::Name::exact(rowid_name.to_string()));
         resolver
             .expr_to_reg_cache
-            .push((Cow::Owned(rowid_expr), rowid_reg));
+            .push((Cow::Owned(rowid_expr), rowid_reg, false));
         let qualified_expr = ast::Expr::Qualified(
             ast::Name::exact(table_name.to_string()),
             ast::Name::exact(rowid_name.to_string()),
         );
         resolver
             .expr_to_reg_cache
-            .push((Cow::Owned(qualified_expr), rowid_reg));
+            .push((Cow::Owned(qualified_expr), rowid_reg, false));
     }
 
     // Map each column to its register (both unqualified and qualified forms).
@@ -5267,14 +5271,14 @@ pub(crate) fn emit_check_constraints<'a>(
         let column_expr = ast::Expr::Id(ast::Name::exact(col_name.to_string()));
         resolver
             .expr_to_reg_cache
-            .push((Cow::Owned(column_expr), register));
+            .push((Cow::Owned(column_expr), register, false));
         let qualified_expr = ast::Expr::Qualified(
             ast::Name::exact(table_name.to_string()),
             ast::Name::exact(col_name.to_string()),
         );
         resolver
             .expr_to_reg_cache
-            .push((Cow::Owned(qualified_expr), register));
+            .push((Cow::Owned(qualified_expr), register, false));
     }
 
     if let Some(joined_table) = referenced_tables.and_then(|tables| tables.joined_tables().first())
