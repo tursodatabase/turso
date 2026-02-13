@@ -1287,3 +1287,85 @@ test numeric-precision-scale-out-of-range {
 expect error {
     numeric value out of range
 }
+
+@requires strict "uses STRICT tables"
+test create-type-subquery-in-encode-rejected {
+    CREATE TYPE bad_type BASE text
+        ENCODE (SELECT 1)
+        DECODE test_uint_decode(value);
+}
+expect error {
+    subqueries prohibited in ENCODE expressions
+}
+
+@requires strict "uses STRICT tables"
+test create-type-aggregate-in-decode-rejected {
+    CREATE TYPE bad_type BASE text
+        ENCODE test_uint_encode(value)
+        DECODE count(value);
+}
+expect error {
+    aggregate functions prohibited in DECODE expressions
+}
+
+@requires strict "uses STRICT tables"
+test type-roundtrip-special-chars-operator {
+    CREATE TYPE test_uint BASE text
+        ENCODE test_uint_encode(value)
+        DECODE test_uint_decode(value)
+        OPERATOR '<' (test_uint) -> test_uint_lt
+        OPERATOR '=' (test_uint) -> test_uint_eq;
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint) STRICT;
+    INSERT INTO t1 VALUES (1, 42);
+    SELECT val FROM t1;
+}
+expect {
+    42
+}
+
+@requires strict "uses STRICT tables"
+test order-by-custom-lt-many-values {
+    CREATE TYPE test_uint BASE text
+        ENCODE test_uint_encode(value)
+        DECODE test_uint_decode(value)
+        OPERATOR '<' (test_uint) -> test_uint_lt
+        OPERATOR '=' (test_uint) -> test_uint_eq;
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint) STRICT;
+    INSERT INTO t1 VALUES (1, 999);
+    INSERT INTO t1 VALUES (2, 1);
+    INSERT INTO t1 VALUES (3, 50);
+    INSERT INTO t1 VALUES (4, 200);
+    INSERT INTO t1 VALUES (5, 5);
+    INSERT INTO t1 VALUES (6, 1000);
+    INSERT INTO t1 VALUES (7, 42);
+    INSERT INTO t1 VALUES (8, 7);
+    SELECT val FROM t1 ORDER BY val ASC;
+}
+expect {
+    1
+    5
+    7
+    42
+    50
+    200
+    999
+    1000
+}
+
+@requires strict "uses STRICT tables"
+test numeric-zero-precision-rejected {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val numeric(0,0)) STRICT;
+    INSERT INTO t1 VALUES (1, 5);
+}
+expect error {
+    numeric precision must be positive
+}
+
+@requires strict "uses STRICT tables"
+test numeric-scale-exceeds-precision-rejected {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val numeric(3,5)) STRICT;
+    INSERT INTO t1 VALUES (1, 5);
+}
+expect error {
+    numeric scale
+}
