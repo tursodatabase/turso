@@ -1466,6 +1466,14 @@ fn analyze_binary_term_for_index(
         },
     };
 
+    // Normalize operator direction so it matches the constrained table column.
+    // Example: `1 > t.b` constrains `t.b < 1`.
+    let operator = if side == BinaryExprSide::Lhs {
+        opposite_cmp_op(operator)
+    } else {
+        operator
+    };
+
     // Find the best index for this constraint
     let (best_index, constraint_refs) =
         find_best_index_for_constraint(table_col_pos, operator, indexes, rowid_alias_column);
