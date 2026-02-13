@@ -86,9 +86,9 @@ echo "=== Fuzzing with $CORES core(s), oracle=$ORACLE ==="
 echo "Fix: Each instance has its own working directory to avoid file contention"
 echo ""
 
-# Limit cores to avoid using CPU 0 (reserved for system) and leave safety margin
-RESERVED_CORES=2  # Reserve CPU 0 for system + 1 extra for safety
-MAX_CORES=62
+# Limit cores to avoid using CPU 0 (reserved for system)
+RESERVED_CORES=1  # Reserve CPU 0 for system interrupts
+MAX_CORES=63
 AVAILABLE_CORES=$(($(nproc) - RESERVED_CORES))
 if [ "$AVAILABLE_CORES" -gt "$MAX_CORES" ]; then
     AVAILABLE_CORES=$MAX_CORES
