@@ -6385,12 +6385,13 @@ pub(crate) fn emit_trigger_decode_registers(
     columns: &[crate::schema::Column],
     source_regs: &dyn Fn(usize) -> usize,
     rowid_reg: usize,
+    is_strict: bool,
 ) -> Result<Vec<usize>> {
     columns
         .iter()
         .enumerate()
         .map(|(i, col)| -> Result<usize> {
-            let type_def = resolver.schema.get_type_def_unchecked(&col.ty_str);
+            let type_def = resolver.schema.get_type_def(&col.ty_str, is_strict);
             if let Some(type_def) = type_def {
                 if let Some(ref decode_expr) = type_def.decode {
                     let src = source_regs(i);

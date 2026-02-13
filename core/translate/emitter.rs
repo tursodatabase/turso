@@ -4223,6 +4223,7 @@ fn emit_update_insns<'a>(
                     &btree_table.columns,
                     &|i| start + i,
                     new_rowid_reg,
+                    btree_table.is_strict,
                 )?;
 
                 // Use preserved OLD registers from BEFORE trigger
