@@ -1350,6 +1350,10 @@ fn test_meta_recovery_case_2_no_wal_replay_above_metadata_boundary() {
 /// What this test checks: Missing/corrupt metadata with logical-log frames and no WAL causes fail-closed startup.
 /// Why this matters: Without metadata boundary recovery cannot choose replay/discard safely.
 #[test]
+#[cfg_attr(
+    feature = "checksum",
+    ignore = "byte-level tamper caught by checksum layer"
+)]
 fn test_meta_recovery_case_3_no_wal_log_frames_without_valid_metadata_fails_closed() {
     let mut db = MvccTestDbNoConn::new_with_random_db();
     let db_path = db.path.as_ref().unwrap().clone();
@@ -1431,6 +1435,10 @@ fn test_meta_recovery_case_4_committed_wal_reconcile_before_metadata_boundary_re
 /// What this test checks: Committed WAL with missing metadata row fails closed.
 /// Why this matters: Recovery cannot infer authoritative replay boundary from WAL bytes alone.
 #[test]
+#[cfg_attr(
+    feature = "checksum",
+    ignore = "byte-level tamper caught by checksum layer"
+)]
 fn test_meta_recovery_case_5_committed_wal_missing_metadata_fails_closed() {
     let mut db = MvccTestDbNoConn::new_with_random_db();
     let db_path = db.path.as_ref().unwrap().clone();
@@ -1496,7 +1504,7 @@ fn test_meta_recovery_case_6_committed_wal_corrupt_metadata_fails_closed() {
         manager.clear();
     }
     let io = Arc::new(PlatformIO::new().unwrap());
-    if Database::open_file(io.clone(), &db_path).is_ok_and(|db2| db2.connect().is_ok()) {
+    if Database::open_file(io, &db_path).is_ok_and(|db2| db2.connect().is_ok()) {
         panic!("expected connect to fail closed")
     }
 }
@@ -1527,7 +1535,7 @@ fn test_meta_recovery_case_7_metadata_table_shape_violation_fails_closed() {
         manager.clear();
     }
     let io = Arc::new(PlatformIO::new().unwrap());
-    if Database::open_file(io.clone(), &db_path).is_ok_and(|db2| db2.connect().is_ok()) {
+    if Database::open_file(io, &db_path).is_ok_and(|db2| db2.connect().is_ok()) {
         panic!("expected connect to fail closed")
     }
 }
@@ -1535,6 +1543,10 @@ fn test_meta_recovery_case_7_metadata_table_shape_violation_fails_closed() {
 /// What this test checks: Downward tamper of `persistent_tx_ts_max` is detected as corruption.
 /// Why this matters: Tamper can force duplicate replay and violate correctness.
 #[test]
+#[cfg_attr(
+    feature = "checksum",
+    ignore = "byte-level tamper caught by checksum layer"
+)]
 fn test_meta_recovery_case_8_metadata_row_tampered_downward_fails_closed() {
     let mut db = MvccTestDbNoConn::new_with_random_db();
     let db_path = db.path.as_ref().unwrap().clone();
@@ -1572,6 +1584,10 @@ fn test_meta_recovery_case_8_metadata_row_tampered_downward_fails_closed() {
 /// What this test checks: Deletion of metadata row is detected and rejected.
 /// Why this matters: Missing boundary metadata makes replay decision ambiguous.
 #[test]
+#[cfg_attr(
+    feature = "checksum",
+    ignore = "byte-level tamper caught by checksum layer"
+)]
 fn test_meta_recovery_case_9_metadata_row_deleted_fails_closed() {
     let mut db = MvccTestDbNoConn::new_with_random_db();
     let db_path = db.path.as_ref().unwrap().clone();
@@ -1721,6 +1737,10 @@ fn test_meta_checkpoint_case_11_auto_checkpoint_failure_after_commit_remains_rec
 /// What this test checks: Replay gate uses metadata boundary and never applies frames at or below it.
 /// Why this matters: This enforces exactly-once effects at the DB-file apply boundary.
 #[test]
+#[cfg_attr(
+    feature = "checksum",
+    ignore = "byte-level tamper caught by checksum layer"
+)]
 fn test_meta_recovery_case_12_replay_gate_skips_at_or_below_metadata_boundary() {
     let mut db = MvccTestDbNoConn::new_with_random_db();
     let db_path = db.path.as_ref().unwrap().clone();
