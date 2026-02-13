@@ -4,7 +4,7 @@ use turso_parser::ast::{self, SortOrder};
 
 use crate::{
     emit_explain,
-    schema::{Index, IndexColumn, PseudoCursorType},
+    schema::{Index, IndexColumn, PseudoCursorType, Schema},
     translate::{
         collate::{get_collseq_from_expr, CollationSeq},
         group_by::is_orderby_agg_or_const,
@@ -24,6 +24,84 @@ use super::{
     plan::{Distinctness, ResultSetColumn, SelectPlan, TableReferences},
     result_row::{emit_offset, emit_result_row_and_limit},
 };
+
+/// For an ORDER BY expression that is a column reference to a custom type,
+/// returns the `<` operator function name if the type has one, or None.
+/// Returns None for non-column expressions or columns without custom types.
+fn custom_type_lt_func(
+    expr: &ast::Expr,
+    referenced_tables: &TableReferences,
+    schema: &Schema,
+) -> Option<String> {
+    if let ast::Expr::Column {
+        table: table_ref_id,
+        column,
+        ..
+    } = expr
+    {
+        let (_, table) = referenced_tables.find_table_by_internal_id(*table_ref_id)?;
+        let col = table.get_column_at(*column)?;
+        let type_def = schema.get_type_def(&col.ty_str)?;
+        type_def
+            .operators
+            .iter()
+            .find(|op| op.op == "<")
+            .map(|op| op.func_name.clone())
+    } else {
+        None
+    }
+}
+
+/// For a result column expression that is a column reference to a custom type,
+/// returns the column definition and type definition.
+fn result_column_custom_type_info<'a>(
+    expr: &ast::Expr,
+    referenced_tables: &'a TableReferences,
+    schema: &'a Schema,
+) -> Option<(
+    &'a crate::schema::Column,
+    std::sync::Arc<crate::schema::TypeDef>,
+)> {
+    if let ast::Expr::Column {
+        table: table_ref_id,
+        column,
+        ..
+    } = expr
+    {
+        let (_, table) = referenced_tables.find_table_by_internal_id(*table_ref_id)?;
+        let col = table.get_column_at(*column)?;
+        let type_def = schema.get_type_def(&col.ty_str)?.clone();
+        Some((col, type_def))
+    } else {
+        None
+    }
+}
+
+/// Returns true if the expression is a column reference to a custom type
+/// (with encode/decode) that does NOT have a `<` operator.
+fn is_custom_type_without_lt(
+    expr: &ast::Expr,
+    referenced_tables: &TableReferences,
+    schema: &Schema,
+) -> bool {
+    if let ast::Expr::Column {
+        table: table_ref_id,
+        column,
+        ..
+    } = expr
+    {
+        if let Some((_, table)) = referenced_tables.find_table_by_internal_id(*table_ref_id) {
+            if let Some(col) = table.get_column_at(*column) {
+                if let Some(type_def) = schema.get_type_def(&col.ty_str) {
+                    if type_def.decode.is_some() {
+                        return !type_def.operators.iter().any(|op| op.op == "<");
+                    }
+                }
+            }
+        }
+    }
+    false
+}
 
 // Metadata for handling ORDER BY operations
 #[derive(Debug)]
@@ -147,9 +225,17 @@ pub fn init_order_by(
             })
             .collect::<Result<Vec<_>>>()?;
 
+        // Resolve custom type comparators for ORDER BY columns.
+        // For types with a `<` operator, the comparator is used for correct sort ordering.
+        let mut comparator_func_names: Vec<Option<String>> = order_by
+            .iter()
+            .map(|(expr, _)| custom_type_lt_func(expr, referenced_tables, t_ctx.resolver.schema))
+            .collect();
+
         if has_sequence {
-            // sequence column: ascending with BINARY collation
+            // sequence column: ascending with BINARY collation, no comparator
             order_and_collations.push((SortOrder::Asc, Some(CollationSeq::default())));
+            comparator_func_names.push(None);
         }
 
         let key_len = order_and_collations.len();
@@ -158,6 +244,7 @@ pub fn init_order_by(
             cursor_id: sort_cursor,
             columns: key_len,
             order_and_collations,
+            comparator_func_names,
         });
     }
     Ok(())
@@ -233,7 +320,7 @@ pub fn emit_order_by(
     // We emit the columns in SELECT order, not sorter order (sorter always has the sort keys first).
     // This is tracked in sort_metadata.remappings.
     let start_reg = t_ctx.reg_result_cols_start.unwrap();
-    for i in 0..result_columns.len() {
+    for (i, rc) in result_columns.iter().enumerate() {
         let reg = start_reg + i;
         let remapping = remappings
             .get(i)
@@ -241,6 +328,36 @@ pub fn emit_order_by(
 
         let column_idx = remapping.orderby_sorter_idx;
         program.emit_column_or_rowid(cursor_id, column_idx, reg);
+
+        // For deduplicated columns that were stored encoded (because decode was suppressed
+        // for the sort key), we need to decode the value for display.
+        if remapping.deduplicated {
+            if let Some((col, type_def)) = result_column_custom_type_info(
+                &rc.expr,
+                &plan.table_references,
+                t_ctx.resolver.schema,
+            ) {
+                if type_def.decode.is_some() && !type_def.operators.iter().any(|op| op.op == "<") {
+                    if let Some(ref decode_expr) = type_def.decode {
+                        let skip_label = program.allocate_label();
+                        program.emit_insn(Insn::IsNull {
+                            reg,
+                            target_pc: skip_label,
+                        });
+                        super::expr::emit_type_expr(
+                            program,
+                            decode_expr,
+                            reg,
+                            reg,
+                            col,
+                            &type_def,
+                            &t_ctx.resolver,
+                        )?;
+                        program.resolve_label(skip_label, program.offset());
+                    }
+                }
+            }
+        }
     }
 
     emit_result_row_and_limit(
@@ -315,7 +432,13 @@ pub fn order_by_sorter_insert(
                 extra_amount: 0,
             });
         } else {
-            // Not an aggregate, translate normally
+            // For custom type columns without a `<` operator, suppress decode so the
+            // sorter sorts on the encoded (on-disk) values. Types WITH a `<` operator
+            // are decoded normally and use a custom comparator in the sorter.
+            let suppress = is_custom_type_without_lt(expr, &plan.table_references, resolver.schema);
+            if suppress {
+                program.suppress_custom_type_decode = true;
+            }
             translate_expr(
                 program,
                 Some(&plan.table_references),
@@ -323,6 +446,9 @@ pub fn order_by_sorter_insert(
                 key_reg,
                 resolver,
             )?;
+            if suppress {
+                program.suppress_custom_type_decode = false;
+            }
         }
     }
 

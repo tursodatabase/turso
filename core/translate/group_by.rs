@@ -156,6 +156,7 @@ pub fn init_group_by<'a>(
             cursor_id: sort_cursor,
             columns: column_count,
             order_and_collations,
+            comparator_func_names: vec![],
         });
         emit_explain!(program, false, "USE SORTER FOR GROUP BY".to_owned());
         let pseudo_cursor = group_by_create_pseudo_table(program, column_count);

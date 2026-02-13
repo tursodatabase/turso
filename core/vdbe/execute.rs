@@ -163,6 +163,34 @@ fn value_to_bigdecimal(val: &Value) -> Result<bigdecimal::BigDecimal> {
     }
 }
 
+/// Create a sort comparator closure from a custom type `<` operator function name.
+/// Returns None if the function name is not recognized as a comparator.
+fn make_sort_comparator(func_name: &str) -> Option<crate::vdbe::sorter::SortComparator> {
+    use crate::types::ValueRef;
+    use std::cmp::Ordering;
+    match func_name {
+        "numeric_lt" => Some(std::sync::Arc::new(
+            |a: &ValueRef, b: &ValueRef| -> Ordering {
+                match (a, b) {
+                    (ValueRef::Null, ValueRef::Null) => Ordering::Equal,
+                    (ValueRef::Null, _) => Ordering::Less,
+                    (_, ValueRef::Null) => Ordering::Greater,
+                    _ => {
+                        // Decode from ValueRef to Value for value_to_bigdecimal
+                        let a_val = a.to_owned();
+                        let b_val = b.to_owned();
+                        match (value_to_bigdecimal(&a_val), value_to_bigdecimal(&b_val)) {
+                            (Ok(a_dec), Ok(b_dec)) => a_dec.cmp(&b_dec),
+                            _ => a.partial_cmp(b).unwrap_or(Ordering::Equal),
+                        }
+                    }
+                }
+            },
+        )),
+        _ => None,
+    }
+}
+
 /// Compare two values using the specified collation for text values.
 /// Non-text values are compared using their natural ordering.
 fn compare_with_collation(
@@ -4660,6 +4688,7 @@ pub fn op_sorter_open(
             cursor_id,
             columns: _,
             order_and_collations,
+            comparator_func_names,
         },
         insn
     );
@@ -4683,10 +4712,15 @@ pub fn op_sorter_open(
         .iter()
         .map(|(ord, coll)| (*ord, coll.unwrap_or_default()))
         .unzip();
+    let comparators = comparator_func_names
+        .iter()
+        .map(|name| name.as_deref().and_then(make_sort_comparator))
+        .collect();
     let temp_store = program.connection.get_temp_store();
     let cursor = Sorter::new(
         &order,
         collations,
+        comparators,
         max_buffer_size_bytes,
         page_size,
         pager.io.clone(),

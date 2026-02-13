@@ -2804,24 +2804,27 @@ pub fn translate_expr(
                         };
                         maybe_apply_affinity(column.ty(), target_register, program);
 
-                        // Decode custom type columns
-                        if let Some(type_def) = resolver.schema.get_type_def(&column.ty_str) {
-                            if let Some(ref decode_expr) = type_def.decode {
-                                let skip_label = program.allocate_label();
-                                program.emit_insn(Insn::IsNull {
-                                    reg: target_register,
-                                    target_pc: skip_label,
-                                });
-                                emit_type_expr(
-                                    program,
-                                    decode_expr,
-                                    target_register,
-                                    target_register,
-                                    column,
-                                    type_def,
-                                    resolver,
-                                )?;
-                                program.resolve_label(skip_label, program.offset());
+                        // Decode custom type columns (skipped when building ORDER BY sort keys
+                        // for types without a `<` operator, so the sorter sorts on encoded values)
+                        if !program.suppress_custom_type_decode {
+                            if let Some(type_def) = resolver.schema.get_type_def(&column.ty_str) {
+                                if let Some(ref decode_expr) = type_def.decode {
+                                    let skip_label = program.allocate_label();
+                                    program.emit_insn(Insn::IsNull {
+                                        reg: target_register,
+                                        target_pc: skip_label,
+                                    });
+                                    emit_type_expr(
+                                        program,
+                                        decode_expr,
+                                        target_register,
+                                        target_register,
+                                        column,
+                                        type_def,
+                                        resolver,
+                                    )?;
+                                    program.resolve_label(skip_label, program.offset());
+                                }
                             }
                         }
                     }

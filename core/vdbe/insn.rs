@@ -816,6 +816,9 @@ pub enum Insn {
         columns: usize,      // P2
         /// Combined order and collation per column (keeps Insn small, and order+collations are always the same length).
         order_and_collations: Vec<(SortOrder, Option<CollationSeq>)>,
+        /// Per-column custom type comparator function names for ORDER BY sorting.
+        /// When present, the comparator is used instead of standard value comparison.
+        comparator_func_names: Vec<Option<String>>,
     },
 
     /// Insert a row into the sorter.

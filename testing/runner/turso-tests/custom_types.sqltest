@@ -421,3 +421,201 @@ test upsert-non-set-column-not-re-encoded {
 expect {
     1|changed|world
 }
+
+@requires strict "uses STRICT tables"
+test order-by-custom-type-without-lt {
+    CREATE TYPE test_reverse BASE text ENCODE test_reverse_encode(value) DECODE test_reverse_decode(value);
+    CREATE TABLE t1(val test_reverse) STRICT;
+    INSERT INTO t1 VALUES ('apple');
+    INSERT INTO t1 VALUES ('banana');
+    INSERT INTO t1 VALUES ('cherry');
+    SELECT val FROM t1 ORDER BY val;
+}
+expect {
+    banana
+    apple
+    cherry
+}
+
+@requires strict "uses STRICT tables"
+test order-by-numeric-type-with-lt {
+    CREATE TABLE t1(val numeric(10,2)) STRICT;
+    INSERT INTO t1 VALUES (9);
+    INSERT INTO t1 VALUES (100);
+    INSERT INTO t1 VALUES (20);
+    INSERT INTO t1 VALUES (-5);
+    SELECT val FROM t1 ORDER BY val;
+}
+expect {
+    -5.00
+    9.00
+    20.00
+    100.00
+}
+
+@requires strict "uses STRICT tables"
+test order-by-numeric-desc {
+    CREATE TABLE t1(val numeric(10,2)) STRICT;
+    INSERT INTO t1 VALUES (9);
+    INSERT INTO t1 VALUES (100);
+    INSERT INTO t1 VALUES (20);
+    SELECT val FROM t1 ORDER BY val DESC;
+}
+expect {
+    100.00
+    20.00
+    9.00
+}
+
+@requires strict "uses STRICT tables"
+test order-by-custom-type-desc {
+    CREATE TYPE test_reverse BASE text ENCODE test_reverse_encode(value) DECODE test_reverse_decode(value);
+    CREATE TABLE t1(val test_reverse) STRICT;
+    INSERT INTO t1 VALUES ('apple');
+    INSERT INTO t1 VALUES ('banana');
+    INSERT INTO t1 VALUES ('cherry');
+    SELECT val FROM t1 ORDER BY val DESC;
+}
+expect {
+    cherry
+    apple
+    banana
+}
+
+@requires strict "uses STRICT tables"
+test order-by-numeric-with-nulls {
+    CREATE TABLE t1(val numeric(10,2)) STRICT;
+    INSERT INTO t1 VALUES (100);
+    INSERT INTO t1 VALUES (NULL);
+    INSERT INTO t1 VALUES (9);
+    INSERT INTO t1 VALUES (NULL);
+    INSERT INTO t1 VALUES (-5);
+    SELECT COALESCE(CAST(val AS TEXT), 'NULL') FROM t1 ORDER BY val;
+}
+expect {
+    NULL
+    NULL
+    -5.00
+    9.00
+    100.00
+}
+
+@requires strict "uses STRICT tables"
+test order-by-numeric-nulls-desc {
+    CREATE TABLE t1(val numeric(10,2)) STRICT;
+    INSERT INTO t1 VALUES (100);
+    INSERT INTO t1 VALUES (NULL);
+    INSERT INTO t1 VALUES (9);
+    SELECT COALESCE(CAST(val AS TEXT), 'NULL') FROM t1 ORDER BY val DESC;
+}
+expect {
+    100.00
+    9.00
+    NULL
+}
+
+@requires strict "uses STRICT tables"
+test order-by-custom-type-not-in-select {
+    CREATE TYPE test_reverse BASE text ENCODE test_reverse_encode(value) DECODE test_reverse_decode(value);
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_reverse) STRICT;
+    INSERT INTO t1 VALUES (1, 'apple');
+    INSERT INTO t1 VALUES (2, 'banana');
+    INSERT INTO t1 VALUES (3, 'cherry');
+    SELECT id FROM t1 ORDER BY val;
+}
+expect {
+    2
+    1
+    3
+}
+
+@requires strict "uses STRICT tables"
+test order-by-numeric-not-in-select {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val numeric(10,2)) STRICT;
+    INSERT INTO t1 VALUES (1, 100);
+    INSERT INTO t1 VALUES (2, 9);
+    INSERT INTO t1 VALUES (3, -5);
+    SELECT id FROM t1 ORDER BY val;
+}
+expect {
+    3
+    2
+    1
+}
+
+@requires strict "uses STRICT tables"
+test order-by-mixed-columns {
+    CREATE TYPE test_reverse BASE text ENCODE test_reverse_encode(value) DECODE test_reverse_decode(value);
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, name TEXT, val test_reverse) STRICT;
+    INSERT INTO t1 VALUES (1, 'b', 'apple');
+    INSERT INTO t1 VALUES (2, 'a', 'banana');
+    INSERT INTO t1 VALUES (3, 'a', 'cherry');
+    SELECT id, name, val FROM t1 ORDER BY name, val;
+}
+expect {
+    2|a|banana
+    3|a|cherry
+    1|b|apple
+}
+
+@requires strict "uses STRICT tables"
+test order-by-numeric-with-limit {
+    CREATE TABLE t1(val numeric(10,2)) STRICT;
+    INSERT INTO t1 VALUES (100);
+    INSERT INTO t1 VALUES (9);
+    INSERT INTO t1 VALUES (20);
+    INSERT INTO t1 VALUES (-5);
+    INSERT INTO t1 VALUES (50);
+    SELECT val FROM t1 ORDER BY val LIMIT 3;
+}
+expect {
+    -5.00
+    9.00
+    20.00
+}
+
+@requires strict "uses STRICT tables"
+test order-by-numeric-with-limit-offset {
+    CREATE TABLE t1(val numeric(10,2)) STRICT;
+    INSERT INTO t1 VALUES (100);
+    INSERT INTO t1 VALUES (9);
+    INSERT INTO t1 VALUES (20);
+    INSERT INTO t1 VALUES (-5);
+    INSERT INTO t1 VALUES (50);
+    SELECT val FROM t1 ORDER BY val LIMIT 2 OFFSET 1;
+}
+expect {
+    9.00
+    20.00
+}
+
+@requires strict "uses STRICT tables"
+test order-by-custom-type-with-nulls {
+    CREATE TYPE test_reverse BASE text ENCODE test_reverse_encode(value) DECODE test_reverse_decode(value);
+    CREATE TABLE t1(val test_reverse) STRICT;
+    INSERT INTO t1 VALUES ('apple');
+    INSERT INTO t1 VALUES (NULL);
+    INSERT INTO t1 VALUES ('cherry');
+    SELECT COALESCE(val, 'NULL') FROM t1 ORDER BY val;
+}
+expect {
+    NULL
+    apple
+    cherry
+}
+
+@requires strict "uses STRICT tables"
+test order-by-numeric-multiple-columns {
+    CREATE TABLE t1(a numeric(10,2), b numeric(10,2)) STRICT;
+    INSERT INTO t1 VALUES (1, 30);
+    INSERT INTO t1 VALUES (1, 10);
+    INSERT INTO t1 VALUES (2, 20);
+    INSERT INTO t1 VALUES (1, 20);
+    SELECT a, b FROM t1 ORDER BY a, b;
+}
+expect {
+    1.00|10.00
+    1.00|20.00
+    1.00|30.00
+    2.00|20.00
+}

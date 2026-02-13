@@ -1042,6 +1042,7 @@ pub fn insn_to_row(
                 cursor_id,
                 columns,
                 order_and_collations,
+                ..
             } => {
                 let to_print: Vec<String> = order_and_collations
                     .iter()
