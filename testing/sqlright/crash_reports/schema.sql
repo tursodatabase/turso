@@ -140,6 +140,7 @@ CREATE TABLE IF NOT EXISTS integrity_checks (
     turso_exit_code INTEGER,
     turso_stderr TEXT,
     integrity_output TEXT,
+    extended_output TEXT,
     passed BOOLEAN NOT NULL,
     checked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );

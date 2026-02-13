@@ -100,6 +100,33 @@ Query crashes:
 
 Results stored in `crash_reports/crashes.db` with processing history for reproducibility. See `crash_reports/README.md` for full documentation.
 
+### Integrity checking
+
+Validates that databases written by tursodb are structurally correct by replaying AFL inputs through tursodb, then checking the resulting database with SQLite:
+
+```bash
+# Basic: run PRAGMA integrity_check on tursodb-written databases
+python3 check_integrity.py --output-dir /tmp/sqlright_test --every 10 -v
+
+# Extended: also check page count vs file size, index ordering, and round-trip consistency
+python3 check_integrity.py --output-dir /tmp/sqlright_test --every 10 --extended -v
+
+# Query failures
+python3 crash_reports/query_crashes.py integrity --fails
+```
+
+**Basic check** (`PRAGMA integrity_check`): validates B-tree structure, page connectivity, index entry counts, and orphaned pages.
+
+**Extended checks** (`--extended`):
+
+| Check | What it catches |
+|-------|----------------|
+| Page count vs file size | Truncated/extended files where header page count doesn't match actual file size |
+| Index ordering | Index entries ordered correctly by raw bytes but wrong by collation (exercises query engine comparator, not B-tree checker) |
+| Round-trip consistency | Table scan vs index scan returning different rows (corrupt index pointers affecting query results) |
+
+Extended checks use Python's `sqlite3` module for safe schema discovery (handles special characters in names), filter out partial and expression indexes, use `EXCEPT` for memory-efficient set comparison (works with WITHOUT ROWID tables), and run per-index for error isolation.
+
 ### Error handling and false positives
 
 Early fuzzing runs revealed a critical issue with tursodb CLI error handling that caused a 67% false positive rate in crash reports. The CLI was writing all errors (parse errors, runtime errors, constraint violations) to stdout with exit code 0, causing the crash analysis system to classify errors as SUCCESS. The solution was to align tursodb's error handling with SQLite3's standard behavior: all errors now go to stderr with exit code 1, while successful query results go to stdout with exit code 0. This change ensures the fuzzer correctly distinguishes between genuine bugs (crashes, panics, incorrect results) and expected error cases (malformed SQL, constraint violations), eliminating false positives and enabling accurate bug detection.
@@ -271,6 +298,7 @@ testing/sqlright/
 ├── collect_coverage.sh   # coverage report generation
 ├── whatsup.sh            # real-time fuzzer monitoring
 ├── check_affinity.sh     # CPU affinity verification
+├── check_integrity.py    # integrity validation of tursodb-written databases
 ├── patches/              # git patches applied to SQLRight
 │   └── 0001-turso-increase-map-size-and-fix-gcc13.patch
 ├── crash_reports/        # crash analysis and deduplication

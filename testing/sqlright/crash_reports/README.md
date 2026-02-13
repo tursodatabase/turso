@@ -151,12 +151,14 @@ Results are compared to identify bugs:
 - `fuzzing_sessions` - Fuzzing runs
 - `crash_tests` - Tursodb test results
 - `differential_tests` - Differential testing results (SQLite comparison)
+- `integrity_checks` - PRAGMA integrity_check + extended validation results
 - `processing_checkpoints` - Idempotency tracking
 
 **Views**:
 - `v_crashes_with_bugs` - Crashes with bug information
 - `v_bug_summary` - Bug category statistics
 - `v_session_stats` - Per-session statistics
+- `v_integrity_failures` - Integrity check failures
 
 ## Directory Structure
 

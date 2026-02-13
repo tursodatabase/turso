@@ -273,6 +273,7 @@ class Database:
                 turso_exit_code INTEGER,
                 turso_stderr TEXT,
                 integrity_output TEXT,
+                extended_output TEXT,
                 passed BOOLEAN NOT NULL,
                 checked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
@@ -281,6 +282,12 @@ class Database:
             CREATE VIEW IF NOT EXISTS v_integrity_failures AS
             SELECT * FROM integrity_checks WHERE passed = 0;
         """)
+        # Migration for databases created before extended checks were added
+        try:
+            conn.execute("ALTER TABLE integrity_checks ADD COLUMN extended_output TEXT")
+        except sqlite3.OperationalError as e:
+            if 'duplicate column' not in str(e).lower():
+                raise
         conn.commit()
 
     def is_integrity_checked(self, source_file: str) -> bool:
@@ -295,18 +302,19 @@ class Database:
     def add_integrity_check(self, source_type: str, source_instance: str,
                             source_file: str, sql_content: str,
                             turso_exit_code: Optional[int], turso_stderr: Optional[str],
-                            integrity_output: Optional[str], passed: bool):
+                            integrity_output: Optional[str], passed: bool,
+                            extended_output: Optional[str] = None):
         """Record an integrity check result. Idempotent via UNIQUE on source_file."""
         conn = self.get_connection()
         conn.execute(
             """
             INSERT OR IGNORE INTO integrity_checks
             (source_type, source_instance, source_file, sql_content,
-             turso_exit_code, turso_stderr, integrity_output, passed)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+             turso_exit_code, turso_stderr, integrity_output, extended_output, passed)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (source_type, source_instance, source_file, sql_content,
-             turso_exit_code, turso_stderr, integrity_output, passed)
+             turso_exit_code, turso_stderr, integrity_output, extended_output, passed)
         )
         conn.commit()
 
@@ -346,7 +354,7 @@ class Database:
             """
             SELECT check_id, source_type, source_instance, source_file,
                    sql_content, turso_exit_code, turso_stderr,
-                   integrity_output, checked_at
+                   integrity_output, extended_output, checked_at
             FROM integrity_checks
             WHERE passed = 0
             ORDER BY checked_at
