@@ -157,6 +157,58 @@ def cmd_export(db: Database, crash_id: int, output_file: str):
     print(f"  Size:           {len(crash['sql_content'])} bytes")
 
 
+def cmd_integrity(db: Database, show_fails: bool = False):
+    """Show integrity check results."""
+    db.ensure_integrity_schema()
+    stats = db.get_integrity_stats()
+
+    total = stats.get('total_checked', 0)
+    passed = stats.get('passed', 0)
+    failed = stats.get('failed', 0)
+
+    print("\n" + "="*60)
+    print("INTEGRITY CHECK RESULTS")
+    print("="*60)
+
+    print(f"\nOverall: {total} checked, {passed} passed, {failed} failed")
+
+    by_type = stats.get('by_source_type', {})
+    if by_type:
+        print(f"\nBy source type:")
+        for stype, counts in sorted(by_type.items()):
+            fail_str = f" ({counts['failed']} failed)" if counts['failed'] else ""
+            print(f"  {stype:10s} {counts['count']:5d} checked{fail_str}")
+
+    if show_fails:
+        failures = db.get_integrity_failures()
+        if not failures:
+            print("\nNo failures found.")
+        else:
+            print(f"\n{'='*60}")
+            print(f"FAILURES ({len(failures)})")
+            print("="*60)
+
+            for f in failures:
+                print(f"\n--- {f['source_file']} ---")
+                print(f"  Type:       {f['source_type']}")
+                print(f"  Instance:   {f['source_instance']}")
+                print(f"  Turso exit: {f['turso_exit_code']}")
+                if f['turso_stderr']:
+                    stderr_preview = f['turso_stderr'][:200]
+                    if len(f['turso_stderr']) > 200:
+                        stderr_preview += "..."
+                    print(f"  Turso err:  {stderr_preview}")
+                print(f"  Integrity:  {f['integrity_output'][:200]}")
+                print(f"\n  SQL ({len(f['sql_content'])} bytes):")
+                print("-" * 40)
+                print(f['sql_content'][:1000])
+                if len(f['sql_content']) > 1000:
+                    print("... (truncated)")
+                print("-" * 40)
+
+    print()
+
+
 def cmd_list(db: Database, classification: str = None, limit: int = 50):
     """List crashes with optional filtering."""
     conn = db.get_connection()
@@ -215,6 +267,8 @@ Commands:
   export <id> <file> Export crash SQL to file
   list               List all crashes
   list --class=PANIC List crashes by classification
+  integrity          Show integrity check summary
+  integrity --fails  Show integrity check failures with SQL
 
 Examples:
   %(prog)s stats
@@ -222,12 +276,13 @@ Examples:
   %(prog)s show 42
   %(prog)s export 42 crash_42.sql
   %(prog)s list --class PANIC
+  %(prog)s integrity --fails
         """
     )
 
     parser.add_argument(
         'command',
-        choices=['stats', 'bugs', 'show', 'export', 'list'],
+        choices=['stats', 'bugs', 'show', 'export', 'list', 'integrity'],
         help='Command to execute'
     )
 
@@ -257,6 +312,12 @@ Examples:
         default=50,
         metavar='N',
         help='Limit number of results (default: 50)'
+    )
+
+    parser.add_argument(
+        '--fails',
+        action='store_true',
+        help='Show failure details (for integrity command)'
     )
 
     args = parser.parse_args()
@@ -294,6 +355,9 @@ Examples:
 
         elif args.command == 'list':
             cmd_list(db, args.classification, args.limit)
+
+        elif args.command == 'integrity':
+            cmd_integrity(db, args.fails)
 
     except ValueError as e:
         print(f"Error: {e}")

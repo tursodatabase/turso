@@ -129,3 +129,23 @@ SELECT
 FROM fuzzing_sessions fs
 LEFT JOIN crash_instances ci ON fs.session_id = ci.session_id
 GROUP BY fs.session_id;
+
+-- Integrity check results (validates tursodb-written databases with SQLite's PRAGMA integrity_check)
+CREATE TABLE IF NOT EXISTS integrity_checks (
+    check_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_type TEXT NOT NULL CHECK(source_type IN ('queue', 'crash', 'hang')),
+    source_instance TEXT NOT NULL,
+    source_file TEXT NOT NULL UNIQUE,
+    sql_content TEXT NOT NULL,
+    turso_exit_code INTEGER,
+    turso_stderr TEXT,
+    integrity_output TEXT,
+    passed BOOLEAN NOT NULL,
+    checked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_integrity_checks_passed ON integrity_checks(passed);
+CREATE INDEX IF NOT EXISTS idx_integrity_checks_source_type ON integrity_checks(source_type);
+
+CREATE VIEW IF NOT EXISTS v_integrity_failures AS
+SELECT * FROM integrity_checks WHERE passed = 0;

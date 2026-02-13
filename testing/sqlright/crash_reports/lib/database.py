@@ -255,6 +255,105 @@ class Database:
         )
         return [dict(row) for row in cursor.fetchall()]
 
+    # --- Integrity check methods ---
+
+    def ensure_integrity_schema(self):
+        """Create integrity_checks table/indexes/view if they don't exist.
+
+        Needed for databases created before this feature was added.
+        """
+        conn = self.get_connection()
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS integrity_checks (
+                check_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_type TEXT NOT NULL CHECK(source_type IN ('queue', 'crash', 'hang')),
+                source_instance TEXT NOT NULL,
+                source_file TEXT NOT NULL UNIQUE,
+                sql_content TEXT NOT NULL,
+                turso_exit_code INTEGER,
+                turso_stderr TEXT,
+                integrity_output TEXT,
+                passed BOOLEAN NOT NULL,
+                checked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_integrity_checks_passed ON integrity_checks(passed);
+            CREATE INDEX IF NOT EXISTS idx_integrity_checks_source_type ON integrity_checks(source_type);
+            CREATE VIEW IF NOT EXISTS v_integrity_failures AS
+            SELECT * FROM integrity_checks WHERE passed = 0;
+        """)
+        conn.commit()
+
+    def is_integrity_checked(self, source_file: str) -> bool:
+        """Check if a file has already been integrity-checked."""
+        conn = self.get_connection()
+        cursor = conn.execute(
+            "SELECT 1 FROM integrity_checks WHERE source_file = ?",
+            (source_file,)
+        )
+        return cursor.fetchone() is not None
+
+    def add_integrity_check(self, source_type: str, source_instance: str,
+                            source_file: str, sql_content: str,
+                            turso_exit_code: Optional[int], turso_stderr: Optional[str],
+                            integrity_output: Optional[str], passed: bool):
+        """Record an integrity check result. Idempotent via UNIQUE on source_file."""
+        conn = self.get_connection()
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO integrity_checks
+            (source_type, source_instance, source_file, sql_content,
+             turso_exit_code, turso_stderr, integrity_output, passed)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (source_type, source_instance, source_file, sql_content,
+             turso_exit_code, turso_stderr, integrity_output, passed)
+        )
+        conn.commit()
+
+    def get_integrity_stats(self) -> Dict[str, Any]:
+        """Get integrity check statistics."""
+        conn = self.get_connection()
+        cursor = conn.execute(
+            """
+            SELECT
+                COUNT(*) AS total_checked,
+                SUM(CASE WHEN passed THEN 1 ELSE 0 END) AS passed,
+                SUM(CASE WHEN NOT passed THEN 1 ELSE 0 END) AS failed
+            FROM integrity_checks
+            """
+        )
+        stats = dict(cursor.fetchone())
+
+        cursor = conn.execute(
+            """
+            SELECT source_type, COUNT(*) AS count,
+                   SUM(CASE WHEN NOT passed THEN 1 ELSE 0 END) AS failed
+            FROM integrity_checks
+            GROUP BY source_type
+            """
+        )
+        stats['by_source_type'] = {
+            row['source_type']: {'count': row['count'], 'failed': row['failed']}
+            for row in cursor.fetchall()
+        }
+
+        return stats
+
+    def get_integrity_failures(self) -> List[Dict[str, Any]]:
+        """Get all integrity check failures."""
+        conn = self.get_connection()
+        cursor = conn.execute(
+            """
+            SELECT check_id, source_type, source_instance, source_file,
+                   sql_content, turso_exit_code, turso_stderr,
+                   integrity_output, checked_at
+            FROM integrity_checks
+            WHERE passed = 0
+            ORDER BY checked_at
+            """
+        )
+        return [dict(row) for row in cursor.fetchall()]
+
     def get_stats(self) -> Dict[str, Any]:
         """Get database statistics."""
         conn = self.get_connection()
