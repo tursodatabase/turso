@@ -119,7 +119,7 @@ pub const DEFAULT_LOG_CHECKPOINT_THRESHOLD: i64 = 4120 * 1000;
 
 const LOG_MAGIC: u32 = 0x4C4D4C32; // "LML2" in LE
 const LOG_VERSION: u8 = 2;
-pub(crate) const LOG_HDR_SIZE: usize = 56;
+pub const LOG_HDR_SIZE: usize = 56;
 const LOG_HDR_RESERVED_START: usize = 8;
 const LOG_HDR_CRC_START: usize = 52;
 const LOG_HDR_RESERVED_SIZE: usize = LOG_HDR_CRC_START - LOG_HDR_RESERVED_START;
@@ -241,9 +241,6 @@ impl LogHeader {
 pub struct LogicalLog {
     pub file: Arc<dyn File>,
     pub offset: u64,
-    /// Size at which we start performing a checkpoint on the logical log.
-    /// Set to -1 to disable automatic checkpointing.
-    checkpoint_threshold: i64,
     write_buf: Vec<u8>,
     header: Option<LogHeader>,
 }
@@ -253,7 +250,6 @@ impl LogicalLog {
         Self {
             file,
             offset: 0,
-            checkpoint_threshold: DEFAULT_LOG_CHECKPOINT_THRESHOLD,
             write_buf: Vec::new(),
             header: None,
         }
@@ -424,21 +420,6 @@ impl LogicalLog {
         let c = self.file.truncate(LOG_HDR_SIZE as u64, completion)?;
         self.offset = LOG_HDR_SIZE as u64;
         Ok(c)
-    }
-
-    pub fn should_checkpoint(&self) -> bool {
-        if self.checkpoint_threshold < 0 {
-            return false;
-        }
-        self.offset >= self.checkpoint_threshold as u64
-    }
-
-    pub fn set_checkpoint_threshold(&mut self, threshold: i64) {
-        self.checkpoint_threshold = threshold;
-    }
-
-    pub fn checkpoint_threshold(&self) -> i64 {
-        self.checkpoint_threshold
     }
 }
 
