@@ -547,7 +547,7 @@ pub fn translate_insert(
             start_reg: insertion.first_col_register(),
             count: insertion.col_mappings.len(),
             check_generated: true,
-            table_reference: Arc::clone(ctx.table),
+            table_reference: BTreeTable::type_check_table_ref(ctx.table, resolver.schema),
         });
     } else {
         // For non-STRICT tables, apply column affinity to the values.
@@ -738,9 +738,9 @@ pub fn translate_insert(
         let new_registers_after: Vec<usize> = insertion
             .col_mappings
             .iter()
-            .map(|col_mapping| {
+            .map(|col_mapping| -> Result<usize> {
                 if col_mapping.column.is_rowid_alias() {
-                    return insertion.key_register();
+                    return Ok(insertion.key_register());
                 }
                 let type_def = resolver.schema.get_type_def(&col_mapping.column.ty_str);
                 if let Some(type_def) = type_def {
@@ -764,16 +764,15 @@ pub fn translate_insert(
                             col_mapping.column,
                             type_def,
                             resolver,
-                        )
-                        .expect("decode should succeed");
+                        )?;
                         program.resolve_label(skip_label, program.offset());
-                        return decoded_reg;
+                        return Ok(decoded_reg);
                     }
                 }
-                col_mapping.register
+                Ok(col_mapping.register)
             })
-            .chain(std::iter::once(insertion.key_register()))
-            .collect();
+            .chain(std::iter::once(Ok(insertion.key_register())))
+            .collect::<Result<Vec<usize>>>()?;
         // Determine the conflict resolution to propagate to AFTER triggers (same logic as BEFORE)
         let trigger_ctx_after = if let Some(override_conflict) = program.trigger_conflict_override {
             TriggerContext::new_with_override_conflict(

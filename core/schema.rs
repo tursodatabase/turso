@@ -1896,6 +1896,27 @@ pub struct BTreeTable {
 }
 
 impl BTreeTable {
+    /// Create a table reference for TypeCheck where custom type columns have
+    /// their `ty_str` replaced with the base type name. This ensures TypeCheck
+    /// validates the encoded value against the correct base type (e.g., BLOB)
+    /// rather than accepting any STRICT type via the wildcard arm.
+    pub fn type_check_table_ref(table: &Arc<BTreeTable>, schema: &Schema) -> Arc<BTreeTable> {
+        let has_custom = table
+            .columns
+            .iter()
+            .any(|c| schema.get_type_def(&c.ty_str).is_some());
+        if !has_custom {
+            return Arc::clone(table);
+        }
+        let mut modified = (**table).clone();
+        for col in &mut modified.columns {
+            if let Some(type_def) = schema.get_type_def(&col.ty_str) {
+                col.ty_str = type_def.base.to_uppercase();
+            }
+        }
+        Arc::new(modified)
+    }
+
     pub fn get_rowid_alias_column(&self) -> Option<(usize, &Column)> {
         self.columns
             .iter()

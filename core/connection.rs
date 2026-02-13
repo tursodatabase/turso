@@ -452,7 +452,9 @@ impl Connection {
             self.experimental_triggers_enabled(),
         )?;
 
-        // Load custom types from sqlite_turso_types if the table exists
+        // Load custom types from __turso_internal_types if the table exists.
+        // Type loading errors are non-fatal: we log warnings and continue with
+        // whatever types loaded successfully, ensuring the schema is always installed.
         if fresh
             .tables
             .contains_key(crate::schema::TURSO_TYPES_TABLE_NAME)
@@ -461,18 +463,24 @@ impl Connection {
             self.with_schema_mut(|schema| {
                 *schema = fresh.clone();
             });
-            let mut type_stmt = self.prepare(format!(
-                "SELECT name, sql FROM {}",
-                crate::schema::TURSO_TYPES_TABLE_NAME
-            ))?;
-            let mut type_rows: Vec<String> = Vec::new();
-            type_stmt.run_with_row_callback(|row| {
-                let sql = row.get::<&str>(1)?.to_string();
-                type_rows.push(sql);
+            let load_result: Result<()> = (|| {
+                let mut type_stmt = self.prepare(format!(
+                    "SELECT name, sql FROM {}",
+                    crate::schema::TURSO_TYPES_TABLE_NAME
+                ))?;
+                let mut type_rows: Vec<String> = Vec::new();
+                type_stmt.run_with_row_callback(|row| {
+                    let sql = row.get::<&str>(1)?.to_string();
+                    type_rows.push(sql);
+                    Ok(())
+                })?;
+                for sql in &type_rows {
+                    fresh.add_type_from_sql(sql)?;
+                }
                 Ok(())
-            })?;
-            for sql in &type_rows {
-                fresh.add_type_from_sql(sql)?;
+            })();
+            if let Err(e) = load_result {
+                tracing::warn!("Failed to load custom types: {}", e);
             }
         }
 

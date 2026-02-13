@@ -439,16 +439,17 @@ pub fn order_by_sorter_insert(
             if suppress {
                 program.suppress_custom_type_decode = true;
             }
-            translate_expr(
+            let result = translate_expr(
                 program,
                 Some(&plan.table_references),
                 expr,
                 key_reg,
                 resolver,
-            )?;
+            );
             if suppress {
                 program.suppress_custom_type_decode = false;
             }
+            result?;
         }
     }
 

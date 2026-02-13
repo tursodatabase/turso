@@ -187,6 +187,33 @@ fn make_sort_comparator(func_name: &str) -> Option<crate::vdbe::sorter::SortComp
                 }
             },
         )),
+        "test_uint_lt" => Some(std::sync::Arc::new(
+            |a: &ValueRef, b: &ValueRef| -> Ordering {
+                fn to_u64(v: &ValueRef) -> Option<u64> {
+                    match v {
+                        ValueRef::Null => None,
+                        ValueRef::Numeric(Numeric::Integer(i)) => {
+                            if *i >= 0 {
+                                Some(*i as u64)
+                            } else {
+                                None
+                            }
+                        }
+                        ValueRef::Text(t) => t.to_string().parse::<u64>().ok(),
+                        _ => None,
+                    }
+                }
+                match (a, b) {
+                    (ValueRef::Null, ValueRef::Null) => Ordering::Equal,
+                    (ValueRef::Null, _) => Ordering::Less,
+                    (_, ValueRef::Null) => Ordering::Greater,
+                    _ => match (to_u64(a), to_u64(b)) {
+                        (Some(a), Some(b)) => a.cmp(&b),
+                        _ => a.partial_cmp(b).unwrap_or(Ordering::Equal),
+                    },
+                }
+            },
+        )),
         _ => None,
     }
 }
@@ -1721,26 +1748,15 @@ pub fn op_type_check(
             let ty_bytes = ty_str.as_bytes();
             match_ignore_ascii_case!(match ty_bytes {
                 b"ANY" => {}
-                // Custom types: the encode function (which runs before TypeCheck)
-                // has already validated and converted the value to the base type.
-                // Verify the result is a valid STRICT type as a defense-in-depth check.
                 _ => {
-                    match value_type {
-                        ValueType::Integer
-                        | ValueType::Float
-                        | ValueType::Text
-                        | ValueType::Blob => {}
-                        _ => {
-                            bail_constraint_error!(
-                                "cannot store {} value in {} column {}.{} ({})",
-                                value_type,
-                                ty_str,
-                                &table_reference.name,
-                                col.name.as_deref().unwrap_or(""),
-                                SQLITE_CONSTRAINT
-                            );
-                        }
-                    }
+                    bail_constraint_error!(
+                        "cannot store {} value in {} column {}.{} ({})",
+                        value_type,
+                        ty_str,
+                        &table_reference.name,
+                        col.name.as_deref().unwrap_or(""),
+                        SQLITE_CONSTRAINT
+                    );
                 }
             });
             Ok(())

@@ -3588,7 +3588,10 @@ fn emit_update_insns<'a>(
                 start_reg: start,
                 count: col_len,
                 check_generated: true,
-                table_reference: Arc::clone(&btree_table),
+                table_reference: BTreeTable::type_check_table_ref(
+                    &btree_table,
+                    t_ctx.resolver.schema,
+                ),
             });
         }
 
@@ -4212,7 +4215,7 @@ fn emit_update_insns<'a>(
                 // so AFTER triggers see user-facing values, not encoded blobs.
                 let columns = btree_table.columns.clone();
                 let new_registers_after: Vec<usize> = (0..col_len)
-                    .map(|i| {
+                    .map(|i| -> Result<usize> {
                         let col = &columns[i];
                         let type_def = t_ctx.resolver.schema.get_type_def(&col.ty_str);
                         if let Some(type_def) = type_def {
@@ -4236,16 +4239,15 @@ fn emit_update_insns<'a>(
                                     col,
                                     type_def,
                                     &t_ctx.resolver,
-                                )
-                                .expect("decode should succeed");
+                                )?;
                                 program.resolve_label(skip_label, program.offset());
-                                return decoded_reg;
+                                return Ok(decoded_reg);
                             }
                         }
-                        start + i
+                        Ok(start + i)
                     })
-                    .chain(std::iter::once(new_rowid_reg))
-                    .collect();
+                    .chain(std::iter::once(Ok(new_rowid_reg)))
+                    .collect::<Result<Vec<usize>>>()?;
 
                 // Use preserved OLD registers from BEFORE trigger
                 let old_registers_after = preserved_old_registers;

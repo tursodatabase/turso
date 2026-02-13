@@ -5,7 +5,7 @@ use std::sync::Arc;
 use turso_parser::ast::{self, TriggerEvent, TriggerTime, Upsert};
 
 use crate::error::SQLITE_CONSTRAINT_PRIMARYKEY;
-use crate::schema::{IndexColumn, ROWID_SENTINEL};
+use crate::schema::{BTreeTable, IndexColumn, ROWID_SENTINEL};
 use crate::translate::emitter::{emit_check_constraints, UpdateRowSource};
 use crate::translate::expr::{rewrite_between_expr, walk_expr, WalkControl};
 use crate::translate::fkeys::{
@@ -523,7 +523,7 @@ pub fn emit_upsert(
                 start_reg: new_start,
                 count: num_cols,
                 check_generated: true,
-                table_reference: Arc::clone(&bt),
+                table_reference: BTreeTable::type_check_table_ref(&bt, resolver.schema),
             });
         } else {
             // For non-STRICT tables, apply column affinity to the values.
