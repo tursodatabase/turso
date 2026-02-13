@@ -32,6 +32,7 @@ pub struct SimulatorIO {
     fault_config: IOFaultConfig,
     /// Simulated time in microseconds, incremented on each step
     time: AtomicU64,
+    pending: PendingQueue,
 }
 
 impl SimulatorIO {
@@ -44,6 +45,7 @@ impl SimulatorIO {
             rng: Mutex::new(rng),
             fault_config,
             time: AtomicU64::new(0),
+            pending: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -130,7 +132,11 @@ impl IO for SimulatorIO {
             }
         }
 
-        let file = Arc::new(SimulatorFile::new(path, self.file_sizes.clone()));
+        let file = Arc::new(SimulatorFile::new(
+            path,
+            self.file_sizes.clone(),
+            self.pending.clone(),
+        ));
 
         let mut files = self.files.lock().unwrap();
         files.push((path.to_string(), file.clone()));
@@ -149,6 +155,13 @@ impl IO for SimulatorIO {
     }
 
     fn step(&self) -> Result<()> {
+        // Complete any pending IO operations
+        let mut pending = self.pending.lock().unwrap();
+        for pc in pending.drain(..) {
+            pc.completion.complete(pc.result);
+        }
+        drop(pending);
+
         // Advance simulated time by 1ms per step
         self.time.fetch_add(1000, Ordering::Relaxed);
 
@@ -190,11 +203,6 @@ impl IO for SimulatorIO {
         Ok(())
     }
 
-    fn wait_for_completion(&self, _completion: Completion) -> Result<()> {
-        // No-op - completions are already completed immediately in the file operations
-        Ok(())
-    }
-
     fn generate_random_number(&self) -> i64 {
         let mut rng = self.rng.lock().unwrap();
         rng.next_u64() as i64
@@ -206,6 +214,12 @@ impl IO for SimulatorIO {
     }
 }
 
+struct PendingCompletion {
+    completion: Completion,
+    result: i32,
+}
+type PendingQueue = Arc<Mutex<Vec<PendingCompletion>>>;
+
 const MAX_FILE_SIZE: usize = 1 << 33; // 8 GiB
 pub(crate) const FILE_SIZE_SOFT_LIMIT: u64 = 6 * (1 << 30); // 6 GiB (75% of MAX_FILE_SIZE)
 
@@ -215,10 +229,15 @@ struct SimulatorFile {
     file_sizes: Arc<Mutex<HashMap<String, u64>>>,
     path: String,
     _file: StdFile,
+    pending: PendingQueue,
 }
 
 impl SimulatorFile {
-    fn new(file_path: &str, file_sizes: Arc<Mutex<HashMap<String, u64>>>) -> Self {
+    fn new(
+        file_path: &str,
+        file_sizes: Arc<Mutex<HashMap<String, u64>>>,
+        pending: PendingQueue,
+    ) -> Self {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -248,6 +267,7 @@ impl SimulatorFile {
             file_sizes,
             path: file_path.to_string(),
             _file: file,
+            pending,
         }
     }
 }
@@ -266,13 +286,17 @@ impl File for SimulatorFile {
         let buffer = read_completion.buf_arc();
         let len = buffer.len();
 
-        if pos + len <= MAX_FILE_SIZE {
+        let result = if pos + len <= MAX_FILE_SIZE {
             let mmap = self.mmap.lock().unwrap();
             buffer.as_mut_slice().copy_from_slice(&mmap[pos..pos + len]);
-            c.complete(len as i32);
+            len as i32
         } else {
-            c.complete(0);
-        }
+            0
+        };
+        self.pending.lock().unwrap().push(PendingCompletion {
+            completion: c.clone(),
+            result,
+        });
         Ok(c)
     }
 
@@ -285,7 +309,7 @@ impl File for SimulatorFile {
         let pos = pos as usize;
         let len = buffer.len();
 
-        if pos + len <= MAX_FILE_SIZE {
+        let result = if pos + len <= MAX_FILE_SIZE {
             let mut mmap = self.mmap.lock().unwrap();
             mmap[pos..pos + len].copy_from_slice(buffer.as_slice());
             let mut size = self.size.lock().unwrap();
@@ -296,10 +320,14 @@ impl File for SimulatorFile {
                     sizes.insert(self.path.clone(), *size as u64);
                 }
             }
-            c.complete(len as i32);
+            len as i32
         } else {
-            c.complete(0);
-        }
+            0
+        };
+        self.pending.lock().unwrap().push(PendingCompletion {
+            completion: c.clone(),
+            result,
+        });
         Ok(c)
     }
 
@@ -339,13 +367,19 @@ impl File for SimulatorFile {
             }
         }
 
-        c.complete(total_written as i32);
+        self.pending.lock().unwrap().push(PendingCompletion {
+            completion: c.clone(),
+            result: total_written as i32,
+        });
         Ok(c)
     }
 
     fn sync(&self, c: Completion, _sync_type: turso_core::io::FileSyncType) -> Result<Completion> {
         // No-op for memory files
-        c.complete(0);
+        self.pending.lock().unwrap().push(PendingCompletion {
+            completion: c.clone(),
+            result: 0,
+        });
         Ok(c)
     }
 
@@ -354,7 +388,10 @@ impl File for SimulatorFile {
         *size = len as usize;
         let mut sizes = self.file_sizes.lock().unwrap();
         sizes.insert(self.path.clone(), len);
-        c.complete(0);
+        self.pending.lock().unwrap().push(PendingCompletion {
+            completion: c.clone(),
+            result: 0,
+        });
         Ok(c)
     }
 

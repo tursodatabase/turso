@@ -29,6 +29,7 @@ pub struct TempDatabaseBuilder {
     flags: Option<turso_core::OpenFlags>,
     init_sql: Option<String>,
     enable_mvcc: bool,
+    io_uring: bool,
 }
 
 struct TestIo {
@@ -103,6 +104,7 @@ impl TempDatabaseBuilder {
             flags: None,
             init_sql: None,
             enable_mvcc: false,
+            io_uring: false,
         }
     }
 
@@ -148,6 +150,11 @@ impl TempDatabaseBuilder {
         self
     }
 
+    pub fn with_io_uring(mut self, enable: bool) -> Self {
+        self.io_uring = enable;
+        self
+    }
+
     pub fn build(self) -> TempDatabase {
         let opts = self
             .opts
@@ -175,9 +182,22 @@ impl TempDatabaseBuilder {
             connection.execute(init_sql, ()).unwrap();
         }
 
-        let io = Arc::new(TestIo {
-            io: Arc::new(turso_core::PlatformIO::new().unwrap()),
-        });
+        let io = if !self.io_uring {
+            Arc::new(TestIo {
+                io: Arc::new(turso_core::PlatformIO::new().unwrap()),
+            })
+        } else {
+            #[cfg(not(all(target_os = "linux", feature = "io_uring")))]
+            {
+                panic!("io_uring feature must be enable for testing with UringIO")
+            }
+            #[cfg(all(target_os = "linux", feature = "io_uring"))]
+            {
+                Arc::new(TestIo {
+                    io: Arc::new(turso_core::UringIO::new().unwrap()),
+                })
+            }
+        };
         let db = Database::open_file_with_flags(
             io.clone(),
             db_path.to_str().unwrap(),

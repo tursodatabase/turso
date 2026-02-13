@@ -1313,6 +1313,7 @@ pub fn test_reopen_database_wal_restart() {
     }
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 /// Test for a bug found by whopper
 /// It is slightly fragile and can be removed if it will be unclear how to maintain it
@@ -1323,7 +1324,10 @@ pub fn test_busy_snapshot_immediate() {
     let db_path = tempfile::NamedTempFile::new().unwrap();
     let (_file, db_path) = db_path.keep().unwrap();
     tracing::info!("path: {:?}", db_path);
-    let tmp_db = TempDatabase::builder().with_db_path(&db_path).build();
+    let tmp_db = TempDatabase::builder()
+        .with_db_path(&db_path)
+        .with_io_uring(true)
+        .build();
     let conn1 = tmp_db.connect_limbo();
     let conn2 = tmp_db.connect_limbo();
     let mut stmt1 = conn1.prepare("CREATE TABLE t1(x)").unwrap();
@@ -1335,6 +1339,7 @@ pub fn test_busy_snapshot_immediate() {
 
     // run stmt2 to completion and commit changes
     loop {
+        tmp_db.io.step().unwrap();
         let result = stmt2.step();
         match result {
             Ok(StepResult::IO) => continue,
