@@ -1148,3 +1148,142 @@ test trigger-after-update-sees-decoded {
 expect {
     99.00
 }
+
+@requires strict "uses STRICT tables"
+test typecheck-validates-base-type-insert {
+    CREATE TYPE test_uint BASE text
+        ENCODE test_uint_encode(value)
+        DECODE test_uint_decode(value)
+        OPERATOR '<' (test_uint) -> test_uint_lt
+        OPERATOR '=' (test_uint) -> test_uint_eq;
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint) STRICT;
+    INSERT INTO t1 VALUES (1, 42);
+    INSERT INTO t1 VALUES (2, 100);
+    SELECT val FROM t1 ORDER BY id;
+}
+expect {
+    42
+    100
+}
+
+@requires strict "uses STRICT tables"
+test typecheck-validates-base-type-update {
+    CREATE TYPE test_uint BASE text
+        ENCODE test_uint_encode(value)
+        DECODE test_uint_decode(value)
+        OPERATOR '<' (test_uint) -> test_uint_lt
+        OPERATOR '=' (test_uint) -> test_uint_eq;
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint) STRICT;
+    INSERT INTO t1 VALUES (1, 42);
+    UPDATE t1 SET val = 100 WHERE id = 1;
+    SELECT val FROM t1;
+}
+expect {
+    100
+}
+
+@requires strict "uses STRICT tables"
+test typecheck-validates-base-type-upsert {
+    CREATE TYPE test_uint BASE text
+        ENCODE test_uint_encode(value)
+        DECODE test_uint_decode(value)
+        OPERATOR '<' (test_uint) -> test_uint_lt
+        OPERATOR '=' (test_uint) -> test_uint_eq;
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint) STRICT;
+    INSERT INTO t1 VALUES (1, 42);
+    INSERT INTO t1 VALUES (1, 100) ON CONFLICT(id) DO UPDATE SET val = excluded.val;
+    SELECT val FROM t1;
+}
+expect {
+    100
+}
+
+@requires strict "uses STRICT tables"
+test order-by-custom-lt-numeric-sort {
+    CREATE TYPE test_uint BASE text
+        ENCODE test_uint_encode(value)
+        DECODE test_uint_decode(value)
+        OPERATOR '<' (test_uint) -> test_uint_lt
+        OPERATOR '=' (test_uint) -> test_uint_eq;
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint) STRICT;
+    INSERT INTO t1 VALUES (1, 1);
+    INSERT INTO t1 VALUES (2, 10);
+    INSERT INTO t1 VALUES (3, 2);
+    INSERT INTO t1 VALUES (4, 20);
+    INSERT INTO t1 VALUES (5, 100);
+    INSERT INTO t1 VALUES (6, 3);
+    SELECT val FROM t1 ORDER BY val ASC;
+}
+expect {
+    1
+    2
+    3
+    10
+    20
+    100
+}
+
+@requires strict "uses STRICT tables"
+test order-by-custom-lt-desc {
+    CREATE TYPE test_uint BASE text
+        ENCODE test_uint_encode(value)
+        DECODE test_uint_decode(value)
+        OPERATOR '<' (test_uint) -> test_uint_lt
+        OPERATOR '=' (test_uint) -> test_uint_eq;
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint) STRICT;
+    INSERT INTO t1 VALUES (1, 1);
+    INSERT INTO t1 VALUES (2, 10);
+    INSERT INTO t1 VALUES (3, 2);
+    INSERT INTO t1 VALUES (4, 20);
+    INSERT INTO t1 VALUES (5, 100);
+    INSERT INTO t1 VALUES (6, 3);
+    SELECT val FROM t1 ORDER BY val DESC;
+}
+expect {
+    100
+    20
+    10
+    3
+    2
+    1
+}
+
+@requires strict "uses STRICT tables"
+test order-by-custom-lt-with-limit {
+    CREATE TYPE test_uint BASE text
+        ENCODE test_uint_encode(value)
+        DECODE test_uint_decode(value)
+        OPERATOR '<' (test_uint) -> test_uint_lt
+        OPERATOR '=' (test_uint) -> test_uint_eq;
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val test_uint) STRICT;
+    INSERT INTO t1 VALUES (1, 1);
+    INSERT INTO t1 VALUES (2, 10);
+    INSERT INTO t1 VALUES (3, 2);
+    INSERT INTO t1 VALUES (4, 20);
+    INSERT INTO t1 VALUES (5, 100);
+    SELECT val FROM t1 ORDER BY val ASC LIMIT 3;
+}
+expect {
+    1
+    2
+    10
+}
+
+@requires strict "uses STRICT tables"
+test numeric-precision-scale-overflow {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val numeric(5,2)) STRICT;
+    INSERT INTO t1 VALUES (1, 999.99);
+    SELECT val FROM t1;
+}
+expect {
+    999.99
+}
+
+@requires strict "uses STRICT tables"
+test numeric-precision-scale-out-of-range {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val numeric(5,2)) STRICT;
+    INSERT INTO t1 VALUES (1, 9999.99);
+}
+expect error {
+    numeric value out of range
+}

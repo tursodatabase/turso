@@ -109,6 +109,9 @@ impl InternalVirtualTableCursor for TursoTypesCursor {
     }
 
     fn column(&self, column: usize) -> Result<Value> {
+        if self.index >= self.entries.len() {
+            return Ok(Value::Null);
+        }
         let (ref name, ref sql) = self.entries[self.index];
         match column {
             0 => Ok(Value::from_text(name.clone())),

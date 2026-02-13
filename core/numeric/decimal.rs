@@ -148,6 +148,22 @@ pub fn validate_precision_scale(
 ) -> crate::Result<BigDecimal> {
     use bigdecimal::Zero;
 
+    if precision <= 0 {
+        return Err(LimboError::Constraint(format!(
+            "numeric precision must be positive, got {precision}"
+        )));
+    }
+    if scale < 0 {
+        return Err(LimboError::Constraint(format!(
+            "numeric scale must be non-negative, got {scale}"
+        )));
+    }
+    if scale > precision {
+        return Err(LimboError::Constraint(format!(
+            "numeric scale ({scale}) must not exceed precision ({precision})"
+        )));
+    }
+
     if val.is_zero() {
         return Ok(BigDecimal::new(BigInt::from(0), scale));
     }
