@@ -1711,14 +1711,6 @@ impl Pager {
 
     /// Releases the newest matching named savepoint and all nested savepoints opened after it.
     pub fn release_named_savepoint(&self, name: &str) -> Result<SavepointResult> {
-        let subjournal_size = {
-            let subjournal = self.subjournal.read();
-            let Some(subjournal) = subjournal.as_ref() else {
-                return Ok(SavepointResult::NotFound);
-            };
-            subjournal.size()?
-        };
-
         let mut savepoints = self.savepoints.write();
         let Some(target_idx) = savepoints.iter().rposition(|savepoint| {
             matches!(
@@ -1744,11 +1736,15 @@ impl Pager {
         } else {
             SavepointResult::Release
         };
+        let journal_end_offset = savepoints
+            .last()
+            .map(|savepoint| savepoint.write_offset())
+            .unwrap_or(0);
 
         savepoints.truncate(target_idx);
 
         if let Some(parent) = savepoints.last() {
-            parent.set_write_offset(subjournal_size);
+            parent.set_write_offset(journal_end_offset);
         } else {
             let subjournal = self.subjournal.read();
             let Some(subjournal) = subjournal.as_ref() else {
@@ -1783,9 +1779,10 @@ impl Pager {
             return Ok(false);
         }
         let savepoint = savepoints.pop().expect("savepoint must exist");
+        let journal_end_offset = savepoint.write_offset();
         let savepoint = savepoint.snapshot();
 
-        self.rollback_to_snapshot(&savepoint)?;
+        self.rollback_to_snapshot(&savepoint, journal_end_offset)?;
 
         if let Some(parent) = savepoints.last() {
             parent.set_write_offset(savepoint.start_offset);
@@ -1811,10 +1808,18 @@ impl Pager {
             }) else {
                 return Ok(false);
             };
-            (target_idx, savepoints[target_idx].snapshot())
+            let journal_end_offset = savepoints
+                .last()
+                .map(|savepoint| savepoint.write_offset())
+                .unwrap_or(savepoints[target_idx].write_offset());
+            (
+                target_idx,
+                savepoints[target_idx].snapshot(),
+                journal_end_offset,
+            )
         };
 
-        self.rollback_to_snapshot(&target.1)?;
+        self.rollback_to_snapshot(&target.1, target.2)?;
 
         let mut savepoints = self.savepoints.write();
         savepoints.truncate(target.0);
@@ -1827,11 +1832,12 @@ impl Pager {
     }
 
     fn open_savepoint_with_kind(&self, kind: SavepointKind, db_size: u32) -> Result<()> {
-        let subjournal_offset = {
-            let subjournal = self.subjournal.read();
-            let subjournal = subjournal.as_ref().expect("subjournal must be opened");
-            subjournal.size()?
-        };
+        let subjournal_offset = self
+            .savepoints
+            .read()
+            .last()
+            .map(|savepoint| savepoint.write_offset())
+            .unwrap_or(0);
         let (wal_max_frame, wal_checksum) = if let Some(wal) = &self.wal {
             (wal.get_max_frame(), wal.get_last_checksum())
         } else {
@@ -1848,14 +1854,17 @@ impl Pager {
         Ok(())
     }
 
-    fn rollback_to_snapshot(&self, savepoint: &SavepointSnapshot) -> Result<()> {
+    fn rollback_to_snapshot(
+        &self,
+        savepoint: &SavepointSnapshot,
+        journal_end_offset: u64,
+    ) -> Result<()> {
         let subjournal = self.subjournal.read();
         let Some(subjournal) = subjournal.as_ref() else {
             return Ok(());
         };
 
         let journal_start_offset = savepoint.start_offset;
-        let journal_end_offset = subjournal.size()?;
         let db_size = savepoint.db_size;
 
         let mut rollback_bitset = RoaringBitmap::new();
