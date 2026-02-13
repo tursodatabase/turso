@@ -10,16 +10,17 @@ CREATE TABLE IF NOT EXISTS fuzzing_sessions (
     crash_count INTEGER DEFAULT 0
 );
 
--- Unique crashes (deduplicated by content hash + signal)
+-- Unique crashes (deduplicated by content hash + signal + finding type)
 CREATE TABLE IF NOT EXISTS crashes (
     crash_id INTEGER PRIMARY KEY AUTOINCREMENT,
     content_hash TEXT NOT NULL,
     signal_number INTEGER,
+    finding_type TEXT NOT NULL DEFAULT 'crash',
     sql_content TEXT NOT NULL,
     first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     instance_count INTEGER DEFAULT 1,
-    UNIQUE(content_hash, signal_number)
+    UNIQUE(content_hash, signal_number, finding_type)
 );
 
 CREATE INDEX IF NOT EXISTS idx_crashes_content_hash ON crashes(content_hash);
@@ -97,6 +98,7 @@ SELECT
     c.crash_id,
     c.content_hash,
     c.signal_number,
+    c.finding_type,
     c.instance_count,
     c.first_seen,
     ct.classification AS turso_classification,
