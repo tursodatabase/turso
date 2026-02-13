@@ -100,6 +100,10 @@ Query crashes:
 
 Results stored in `crash_reports/crashes.db` with processing history for reproducibility. See `crash_reports/README.md` for full documentation.
 
+### Error handling and false positives
+
+Early fuzzing runs revealed a critical issue with tursodb CLI error handling that caused a 67% false positive rate in crash reports. The CLI was writing all errors (parse errors, runtime errors, constraint violations) to stdout with exit code 0, causing the crash analysis system to classify errors as SUCCESS. The solution was to align tursodb's error handling with SQLite3's standard behavior: all errors now go to stderr with exit code 1, while successful query results go to stdout with exit code 0. This change ensures the fuzzer correctly distinguishes between genuine bugs (crashes, panics, incorrect results) and expected error cases (malformed SQL, constraint violations), eliminating false positives and enabling accurate bug detection.
+
 ## Experimental Features
 
 All experimental Turso features are enabled during fuzzing to maximize attack surface:
