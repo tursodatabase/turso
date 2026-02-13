@@ -105,19 +105,13 @@ Results stored in `crash_reports/crashes.db` with processing history for reprodu
 Validates that databases written by tursodb are structurally correct by replaying AFL inputs through tursodb, then checking the resulting database with SQLite:
 
 ```bash
-# Basic: run PRAGMA integrity_check on tursodb-written databases
 python3 check_integrity.py --output-dir /tmp/sqlright_test --every 10 -v
-
-# Extended: also check page count vs file size, index ordering, and round-trip consistency
-python3 check_integrity.py --output-dir /tmp/sqlright_test --every 10 --extended -v
 
 # Query failures
 python3 crash_reports/query_crashes.py integrity --fails
 ```
 
-**Basic check** (`PRAGMA integrity_check`): validates B-tree structure, page connectivity, index entry counts, and orphaned pages.
-
-**Extended checks** (`--extended`):
+Each database is validated with `PRAGMA integrity_check` (B-tree structure, page connectivity, index entry counts, orphaned pages) followed by extended checks:
 
 | Check | What it catches |
 |-------|----------------|

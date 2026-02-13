@@ -385,13 +385,13 @@ def run_extended_checks(db_path, timeout):
     return results
 
 
-def check_one(tursodb_path: Path, sql_path: Path, timeout: int, extended: bool = False):
+def check_one(tursodb_path: Path, sql_path: Path, timeout: int):
     """Run one integrity check.
 
     1. Create a unique temp DB file
     2. Run tursodb with file-backed DB, piping in the SQL
     3. Run sqlite3 PRAGMA integrity_check on the result
-    4. Optionally run extended checks (page size, index ordering, round-trip)
+    4. Run extended checks (page size, index ordering, round-trip)
     5. Clean up temp files
 
     Returns dict with turso_exit_code, turso_stderr, integrity_output,
@@ -457,8 +457,8 @@ def check_one(tursodb_path: Path, sql_path: Path, timeout: int, extended: bool =
             result['integrity_output'] = f'ERROR: {e}'
             result['passed'] = False
 
-        # Run extended checks if basic check passed and --extended is on
-        if extended and result['passed']:
+        # Run extended checks if basic check passed
+        if result['passed']:
             ext_results = run_extended_checks(tmp_db, timeout)
             ext_lines = []
             for check_name, check_passed, detail in ext_results:
@@ -493,7 +493,6 @@ Examples:
   %(prog)s --timeout 10              # 10s timeout per execution
   %(prog)s --tursodb-path /path      # Custom tursodb binary
   %(prog)s --db crashes.db           # Custom DB path
-  %(prog)s --extended                 # Run extended integrity checks
   %(prog)s -v                        # Verbose logging
         """
     )
@@ -530,11 +529,6 @@ Examples:
         type=Path,
         metavar='PATH',
         help='Path to database file (default: crash_reports/crashes.db)'
-    )
-    parser.add_argument(
-        '--extended',
-        action='store_true',
-        help='Run extended checks (page size, index ordering, round-trip consistency)'
     )
     parser.add_argument(
         '-v', '--verbose',
@@ -618,7 +612,7 @@ Examples:
                 continue
 
             # Run integrity check
-            result = check_one(tursodb_path, sql_path, args.timeout, extended=args.extended)
+            result = check_one(tursodb_path, sql_path, args.timeout)
 
             # Store result
             db.add_integrity_check(
