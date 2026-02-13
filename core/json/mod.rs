@@ -16,9 +16,9 @@ use crate::types::{AsValueRef, Text, TextSubtype, Value, ValueType};
 use crate::{bail_constraint_error, bail_parse_error, LimboError, ValueRef};
 pub use cache::JsonCacheCell;
 use jsonb::{ElementType, Jsonb, JsonbHeader, PathOperationMode, SearchOperation, SetOperation};
+use rustix::path::Arg;
 use std::borrow::Cow;
 use std::str::FromStr;
-use rustix::path::Arg;
 
 #[derive(Debug, Clone, Copy)]
 pub enum Conv {
@@ -157,7 +157,7 @@ pub fn convert_ref_dbtype_to_jsonb(val: ValueRef<'_>, strict: Conv) -> crate::Re
                         if total_expected != slice.len() {
                             parse_as_json_text(slice, strict)?
                         } else {
-                            if header.is_scalar() {
+                            if header.is_scalar()? {
                                 return Err(LimboError::ParseError("malformed JSON".to_string()));
                             }
                             let jsonb = Jsonb::from_raw_data(slice);

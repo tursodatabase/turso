@@ -878,15 +878,15 @@ impl JsonbHeader {
         }
     }
 
-    pub fn is_scalar(&self) -> bool {
-        !matches!(
+    pub fn is_scalar(&self) -> Result<bool> {
+        Ok(!matches!(
             self.element_type(),
             ElementType::ARRAY
                 | ElementType::OBJECT
                 | ElementType::RESERVED1
                 | ElementType::RESERVED2
                 | ElementType::RESERVED3
-        )
+        ))
     }
 
     fn get_size_bytes(slice: &[u8], start: usize, count: usize) -> Result<&[u8]> {

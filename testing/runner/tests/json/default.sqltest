@@ -2901,3 +2901,35 @@ expect {
     null
 }
 
+# Regression: json_valid() must return 0 for UTF-8 BLOB data that is not valid JSON syntax.
+test json_valid_blob_utf8_non_json_word {
+    SELECT json_valid(x'696e76616c6964');
+}
+expect {
+    0
+}
+
+test json_valid_blob_utf8_non_json_word_with_whitespace {
+    SELECT json_valid(x'2020696e76616c69642020');
+}
+expect {
+    0
+}
+
+# Regression: invalid JSON BLOB must not bypass CHECK(json_valid(...)).
+test json_valid_blob_check_constraint_rejects_invalid_blob {
+    CREATE TABLE json_valid_guard_1(data BLOB CHECK(json_valid(data)));
+    INSERT INTO json_valid_guard_1 VALUES (x'696e76616c6964');
+}
+expect error {
+    CHECK constraint failed
+}
+
+test json_valid_blob_check_constraint_ignore_does_not_insert {
+    CREATE TABLE json_valid_guard_2(data BLOB CHECK(json_valid(data)));
+    INSERT OR IGNORE INTO json_valid_guard_2 VALUES (x'696e76616c6964');
+    SELECT count(*) FROM json_valid_guard_2;
+}
+expect {
+    0
+}
