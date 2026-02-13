@@ -1,15 +1,26 @@
 ---
 source: subqueries.sqltest
-expression: "WITH filtered_products AS (\n        SELECT p.id, p.name, p.price\n        FROM products p\n        WHERE p.category_id IN (\n            SELECT id FROM categories WHERE parent_id IS NULL\n        )\n    )\n    SELECT fp.name, fp.price\n    FROM filtered_products fp\n    WHERE fp.price > 100\n    ORDER BY fp.price DESC;"
+expression: |-
+  WITH filtered_products AS (
+          SELECT p.id, p.name, p.price
+          FROM products p
+          WHERE p.category_id IN (
+              SELECT id FROM categories WHERE parent_id IS NULL
+          )
+      )
+      SELECT fp.name, fp.price
+      FROM filtered_products fp
+      WHERE fp.price > 100
+      ORDER BY fp.price DESC;
 info:
   statement_type: WITH (CTE)
   tables:
-    - categories
-    - filtered_products
-    - products
+  - categories
+  - filtered_products
+  - products
   setup_blocks:
-    - schema
-  database: ":memory:"
+  - schema
+  database: ':memory:'
 ---
 QUERY PLAN
 |--SCAN filtered_products AS fp
@@ -22,28 +33,28 @@ addr  opcode           p1  p2  p3  p4              p5  comment
    0  Init              0  57   0                   0  Start at 57
    1  InitCoroutine     1  39   2                   0
    2  Once             12   0   0                   0  goto 12
-   3  OpenEphemeral     1   0   0                   0  cursor=1 is_table=false
-   4  OpenRead          2   3   0  k(3,B,B,B)       0  table=categories, root=3, iDb=0
-   5  Rewind            2  12   0                   0  Rewind table categories
-   6    Column          2   2   3                   0  r[3]=categories.parent_id
+   3  OpenEphemeral     0   0   0                   0  cursor=0 is_table=false
+   4  OpenRead          1   3   0  k(3,B,B,B)       0  table=categories, root=3, iDb=0
+   5  Rewind            1  12   0                   0  Rewind table categories
+   6    Column          1   2   3                   0  r[3]=categories.parent_id
    7    NotNull         3  11   0                   0  r[3]!=NULL -> goto 11
-   8    RowId           2   2   0                   0  r[2]=categories.rowid
-   9    MakeRecord      2   1   4                   0  r[4]=mkrec(r[2..2]); for ephemeral_index_where_sub_t6
-  10    IdxInsert       1   4   0                   8  key=r[4]
-  11  Next              2   6   0                   0
-  12  OpenRead          3   2   0  k(5,B,B,B,B,B)   0  table=products, root=2, iDb=0
-  13  Rewind            3  38   0                   0  Rewind table products
+   8    RowId           1   2   0                   0  r[2]=categories.rowid
+   9    MakeRecord      2   1   4                   0  r[4]=mkrec(r[2..2]); for ephemeral_index_where_sub_t2
+  10    IdxInsert       0   4   0                   8  key=r[4]
+  11  Next              1   6   0                   0
+  12  OpenRead          2   2   0  k(5,B,B,B,B,B)   0  table=products, root=2, iDb=0
+  13  Rewind            2  38   0                   0  Rewind table products
   14    Integer         0   8   0                   0  r[8]=0
-  15    Column          3   2   9                   0  r[9]=products.category_id
+  15    Column          2   2   9                   0  r[9]=products.category_id
   16    IsNull          9  20   0                   0  if (r[9]==NULL) goto 20
   17    Affinity        9   1   0                   0  r[9..10] = D
-  18    NotFound        1  20   9                   0  if not found goto 20
+  18    NotFound        0  20   9                   0  if not found goto 20
   19    Goto            0  26   0                   0
-  20    Rewind          1  28   0                   0  Rewind  ephemeral_index_where_sub_t6
-  21      Column        1   0  10                   0  r[10]=ephemeral_index_where_sub_t6.id
+  20    Rewind          0  28   0                   0  Rewind  ephemeral_index_where_sub_t2
+  21      Column        0   0  10                   0  r[10]=ephemeral_index_where_sub_t2.id
   22      Ne            9  10  24  Binary           0  if r[9]!=r[10] goto 24
   23      Goto          0  30   0                   0
-  24    Next            1  21   0                   0
+  24    Next            0  21   0                   0
   25    Goto            0  28   0                   0
   26    Integer         1   8   0                   0  r[8]=1
   27    Goto            0  31   0                   0
@@ -51,14 +62,14 @@ addr  opcode           p1  p2  p3  p4              p5  comment
   29    Goto            0  31   0                   0
   30    Null            0   8   0                   0  r[8]=NULL
   31    IfNot           8  37   1                   0  if !r[8] goto 37
-  32    RowId           3   5   0                   0  r[5]=products.rowid
-  33    Column          3   1   6                   0  r[6]=products.name
-  34    Column          3   3   7                   0  r[7]=products.price
+  32    RowId           2   5   0                   0  r[5]=products.rowid
+  33    Column          2   1   6                   0  r[6]=products.name
+  34    Column          2   3   7                   0  r[7]=products.price
   35    RealAffinity    7   0   0                   0
   36    Yield           1   0   0                   0
-  37  Next              3  14   0                   0
+  37  Next              2  14   0                   0
   38  EndCoroutine      1   0   0                   0
-  39  SorterOpen        4   1   0  k(1,-B)          0  cursor=4
+  39  SorterOpen        3   1   0  k(1,-B)          0  cursor=3
   40  InitCoroutine     1   0   2                   0
   41    Yield           1  49   0                   0
   42    Copy            7  15   0                   0  r[15]=r[7]
@@ -66,15 +77,15 @@ addr  opcode           p1  p2  p3  p4              p5  comment
   44    Copy            7  17   0                   0  r[17]=r[7]
   45    Copy            6  18   0                   0  r[18]=r[6]
   46    MakeRecord     17   2  13                   0  r[13]=mkrec(r[17..18])
-  47    SorterInsert    4  13   0  0                0  key=r[13]
+  47    SorterInsert    3  13   0  0                0  key=r[13]
   48  Goto              0  41   0                   0
-  49  OpenPseudo        5  13   2                   0  2 columns in r[13]
-  50  SorterSort        4  56   0                   0
-  51    SorterData      4  13   5                   0  r[13]=data
-  52    Column          5   1  11                   0  r[11]=pseudo.column 1
-  53    Column          5   0  12                   0  r[12]=pseudo.column 0
+  49  OpenPseudo        4  13   2                   0  2 columns in r[13]
+  50  SorterSort        3  56   0                   0
+  51    SorterData      3  13   4                   0  r[13]=data
+  52    Column          4   1  11                   0  r[11]=pseudo.column 1
+  53    Column          4   0  12                   0  r[12]=pseudo.column 0
   54    ResultRow      11   2   0                   0  output=r[11..12]
-  55  SorterNext        4  51   0                   0
+  55  SorterNext        3  51   0                   0
   56  Halt              0   0   0                   0
   57  Transaction       0   1  11                   0  iDb=0 tx_mode=Read
   58  Integer         100  16   0                   0  r[16]=100

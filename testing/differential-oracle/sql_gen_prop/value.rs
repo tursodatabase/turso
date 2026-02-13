@@ -122,6 +122,19 @@ impl Hash for SqlValue {
     }
 }
 
+impl SqlValue {
+    /// Returns the data type of this value.
+    pub fn data_type(&self) -> DataType {
+        match self {
+            SqlValue::Integer(_) => DataType::Integer,
+            SqlValue::Real(_) => DataType::Real,
+            SqlValue::Text(_) => DataType::Text,
+            SqlValue::Blob(_) => DataType::Blob,
+            SqlValue::Null => DataType::Null,
+        }
+    }
+}
+
 impl fmt::Display for SqlValue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

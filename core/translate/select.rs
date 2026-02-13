@@ -222,11 +222,21 @@ fn prepare_one_select_plan(
             }
 
             // Parse the FROM clause into a vec of TableReferences. Fold all the join conditions expressions into the WHERE clause.
+            let preplan_ctes_for_non_from_subqueries = with.is_some()
+                && select_has_non_from_subqueries(
+                    &columns,
+                    where_clause.as_deref(),
+                    group_by.as_ref(),
+                    &window_clause,
+                    &order_by,
+                    limit.as_ref(),
+                );
             parse_from(
                 from,
                 resolver,
                 program,
                 with,
+                preplan_ctes_for_non_from_subqueries,
                 &mut where_predicates,
                 &mut vtab_predicates,
                 &mut table_references,
@@ -869,6 +879,202 @@ fn estimate_num_instructions_for_simple_select(select: &SelectPlan) -> usize {
     let condition_instructions = select.where_clause.len() * 3;
 
     20 + table_instructions + group_by_instructions + order_by_instructions + condition_instructions
+}
+
+fn push_function_tail_exprs<'a>(stack: &mut Vec<&'a Expr>, tail: &'a ast::FunctionTail) {
+    if let Some(filter_expr) = tail.filter_clause.as_deref() {
+        stack.push(filter_expr);
+    }
+
+    let Some(ast::Over::Window(window)) = tail.over_clause.as_ref() else {
+        return;
+    };
+
+    if let Some(frame_clause) = window.frame_clause.as_ref() {
+        if let ast::FrameBound::Following(expr) | ast::FrameBound::Preceding(expr) =
+            &frame_clause.start
+        {
+            stack.push(expr.as_ref());
+        }
+        if let Some(ast::FrameBound::Following(expr) | ast::FrameBound::Preceding(expr)) =
+            frame_clause.end.as_ref()
+        {
+            stack.push(expr.as_ref());
+        }
+    }
+
+    for sorted in window.order_by.iter().rev() {
+        stack.push(sorted.expr.as_ref());
+    }
+    for part_expr in window.partition_by.iter().rev() {
+        stack.push(part_expr.as_ref());
+    }
+}
+
+fn expr_contains_subquery(expr: &Expr) -> bool {
+    // Iterative traversal avoids stack overflows on deeply nested expression trees
+    // such as very large left-associative AND chains.
+    let mut stack = vec![expr];
+    while let Some(node) = stack.pop() {
+        match node {
+            Expr::Subquery(_) | Expr::InSelect { .. } | Expr::Exists(_) => return true,
+            Expr::Between {
+                lhs, start, end, ..
+            } => {
+                stack.push(lhs.as_ref());
+                stack.push(start.as_ref());
+                stack.push(end.as_ref());
+            }
+            Expr::Binary(lhs, _, rhs) => {
+                stack.push(rhs.as_ref());
+                stack.push(lhs.as_ref());
+            }
+            Expr::Case {
+                base,
+                when_then_pairs,
+                else_expr,
+            } => {
+                if let Some(expr) = else_expr.as_deref() {
+                    stack.push(expr);
+                }
+                for (when_expr, then_expr) in when_then_pairs.iter().rev() {
+                    stack.push(then_expr.as_ref());
+                    stack.push(when_expr.as_ref());
+                }
+                if let Some(base_expr) = base.as_deref() {
+                    stack.push(base_expr);
+                }
+            }
+            Expr::Cast { expr, .. }
+            | Expr::Collate(expr, _)
+            | Expr::IsNull(expr)
+            | Expr::NotNull(expr)
+            | Expr::Unary(_, expr) => {
+                stack.push(expr.as_ref());
+            }
+            Expr::FunctionCall {
+                args,
+                order_by,
+                filter_over,
+                ..
+            } => {
+                push_function_tail_exprs(&mut stack, filter_over);
+                for sorted in order_by.iter().rev() {
+                    stack.push(sorted.expr.as_ref());
+                }
+                for arg in args.iter().rev() {
+                    stack.push(arg.as_ref());
+                }
+            }
+            Expr::FunctionCallStar { filter_over, .. } => {
+                push_function_tail_exprs(&mut stack, filter_over);
+            }
+            Expr::InList { lhs, rhs, .. } => {
+                for item in rhs.iter().rev() {
+                    stack.push(item.as_ref());
+                }
+                stack.push(lhs.as_ref());
+            }
+            Expr::InTable { lhs, args, .. } => {
+                for arg in args.iter().rev() {
+                    stack.push(arg.as_ref());
+                }
+                stack.push(lhs.as_ref());
+            }
+            Expr::Like {
+                lhs, rhs, escape, ..
+            } => {
+                if let Some(escape_expr) = escape.as_deref() {
+                    stack.push(escape_expr);
+                }
+                stack.push(rhs.as_ref());
+                stack.push(lhs.as_ref());
+            }
+            Expr::Parenthesized(exprs) => {
+                for expr in exprs.iter().rev() {
+                    stack.push(expr.as_ref());
+                }
+            }
+            Expr::Raise(_, raise_expr) => {
+                if let Some(expr) = raise_expr.as_deref() {
+                    stack.push(expr);
+                }
+            }
+            Expr::SubqueryResult { lhs, .. } => {
+                if let Some(expr) = lhs.as_deref() {
+                    stack.push(expr);
+                }
+            }
+            Expr::Column { .. }
+            | Expr::DoublyQualified(_, _, _)
+            | Expr::Id(_)
+            | Expr::Literal(_)
+            | Expr::Name(_)
+            | Expr::Qualified(_, _)
+            | Expr::Register(_)
+            | Expr::RowId { .. }
+            | Expr::Variable(_) => {}
+        }
+    }
+    false
+}
+
+fn select_has_non_from_subqueries(
+    columns: &[ResultColumn],
+    where_clause: Option<&Expr>,
+    group_by: Option<&ast::GroupBy>,
+    window_clause: &[ast::WindowDef],
+    order_by: &[ast::SortedColumn],
+    limit: Option<&ast::Limit>,
+) -> bool {
+    if columns.iter().any(|column| match column {
+        ResultColumn::Expr(expr, _) => expr_contains_subquery(expr),
+        ResultColumn::Star | ResultColumn::TableStar(_) => false,
+    }) {
+        return true;
+    }
+
+    if where_clause.is_some_and(expr_contains_subquery) {
+        return true;
+    }
+
+    if let Some(group_by) = group_by {
+        if group_by.exprs.iter().any(|e| expr_contains_subquery(e))
+            || group_by
+                .having
+                .as_deref()
+                .is_some_and(expr_contains_subquery)
+        {
+            return true;
+        }
+    }
+
+    if window_clause.iter().any(|w| {
+        w.window
+            .partition_by
+            .iter()
+            .any(|e| expr_contains_subquery(e))
+            || w.window
+                .order_by
+                .iter()
+                .any(|s| expr_contains_subquery(&s.expr))
+    }) {
+        return true;
+    }
+
+    if order_by.iter().any(|s| expr_contains_subquery(&s.expr)) {
+        return true;
+    }
+
+    if let Some(limit) = limit {
+        if expr_contains_subquery(&limit.expr)
+            || limit.offset.as_deref().is_some_and(expr_contains_subquery)
+        {
+            return true;
+        }
+    }
+
+    false
 }
 
 /// Estimate number of labels for a Plan (either Select or CompoundSelect)

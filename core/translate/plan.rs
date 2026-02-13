@@ -727,6 +727,9 @@ pub struct OuterQueryReference {
     pub cte_select: Option<ast::Select>,
     /// Explicit column names from WITH t(a, b) AS (...) syntax.
     pub cte_explicit_columns: Vec<String>,
+    /// CTE ID if this is a CTE reference. Used to track CTE reference counts
+    /// for materialization decisions.
+    pub cte_id: Option<usize>,
 }
 
 impl OuterQueryReference {
@@ -1348,12 +1351,14 @@ impl JoinedTable {
             )?);
         }
 
-        let table = Table::FromClauseSubquery(FromClauseSubquery {
+        let table = Table::FromClauseSubquery(Arc::new(FromClauseSubquery {
             name: identifier.clone(),
             plan: Box::new(Plan::Select(plan)),
             columns,
             result_columns_start_reg: None,
-        });
+            cte_id: None,
+            materialize_hint: false,
+        }));
         Ok(Self {
             op: Operation::default_scan_for(&table),
             table,
@@ -1369,12 +1374,17 @@ impl JoinedTable {
 
     /// Creates a new TableReference for a subquery from a Plan (either SelectPlan or CompoundSelect).
     /// If `explicit_columns` is provided, those names override the derived column names from the SELECT.
+    /// If `cte_id` is provided, this subquery is a CTE reference that can share materialized data.
+    /// If `materialize_hint` is true, the CTE was declared with AS MATERIALIZED and should always
+    /// be materialized regardless of reference count.
     pub fn new_subquery_from_plan(
         identifier: String,
         plan: Plan,
         join_info: Option<JoinInfo>,
         internal_id: TableInternalId,
         explicit_columns: Option<&[String]>,
+        cte_id: Option<usize>,
+        materialize_hint: bool,
     ) -> Result<Self> {
         // Get result columns and table references from the plan
         let (result_columns, table_references) = match &plan {
@@ -1437,12 +1447,17 @@ impl JoinedTable {
             )?);
         }
 
-        let table = Table::FromClauseSubquery(FromClauseSubquery {
+        // materialize_hint is set true for explicit WITH ... AS MATERIALIZED hint.
+        // Multi-reference CTEs are also detected at emission time via reference counting,
+        // and they may be materialized regardless of explicit keyword usage.
+        let table = Table::FromClauseSubquery(Arc::new(FromClauseSubquery {
             name: identifier.clone(),
             plan: Box::new(plan),
             columns,
             result_columns_start_reg: None,
-        });
+            cte_id,
+            materialize_hint,
+        }));
         Ok(Self {
             op: Operation::default_scan_for(&table),
             table,
@@ -1865,7 +1880,7 @@ pub enum Scan {
         /// The order of expressions matches the argument order expected by the virtual table.
         constraints: Vec<Expr>,
     },
-    /// A scan of a subquery in the `FROM` clause.
+    /// A scan of a subquery in the `FROM` clause (using coroutines).
     Subquery,
 }
 
@@ -2184,7 +2199,7 @@ fn eval_at_for_plan(
 }
 
 /// Returns true if a plan (including compound SELECTs) references outer-scope tables.
-fn plan_is_correlated(plan: &Plan) -> bool {
+pub fn plan_is_correlated(plan: &Plan) -> bool {
     match plan {
         Plan::Select(select_plan) => select_plan.is_correlated(),
         Plan::CompoundSelect {

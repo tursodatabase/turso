@@ -12,6 +12,15 @@ use crate::profile::StatementProfile;
 use crate::schema::{ColumnDef, Schema, TableRef};
 use crate::value::SqlValue;
 
+/// Type alias for the parts of a SELECT body: (columns, where_clause, order_by, limit, offset).
+type SelectBodyParts = (
+    Vec<Expression>,
+    Option<Expression>,
+    Vec<OrderByItem>,
+    Option<u32>,
+    Option<u32>,
+);
+
 // =============================================================================
 // ORDER BY TYPES
 // =============================================================================
@@ -86,6 +95,8 @@ pub struct SelectProfile {
     pub offset_range: RangeInclusive<u32>,
     /// Expression profile for SELECT expressions.
     pub expression_profile: ExpressionProfile,
+    /// Profile for CTE (WITH clause) generation.
+    pub cte_profile: crate::cte::CteProfile,
 }
 
 impl Default for SelectProfile {
@@ -100,6 +111,7 @@ impl Default for SelectProfile {
             limit_range: 1..=1000,
             offset_range: 0..=100,
             expression_profile: ExpressionProfile::default(),
+            cte_profile: crate::cte::CteProfile::default(),
         }
     }
 }
@@ -117,6 +129,7 @@ impl SelectProfile {
             limit_range: 1..=100,
             offset_range: 0..=10,
             expression_profile: self.expression_profile.simple(),
+            cte_profile: crate::cte::CteProfile::default().disabled(),
         }
     }
 
@@ -132,6 +145,7 @@ impl SelectProfile {
             limit_range: 1..=10000,
             offset_range: 0..=1000,
             expression_profile: self.expression_profile.function_heavy(),
+            cte_profile: self.cte_profile,
         }
     }
 
@@ -188,11 +202,19 @@ impl SelectProfile {
         self.expression_profile = profile;
         self
     }
+
+    /// Builder method to set CTE profile.
+    pub fn with_cte_profile(mut self, profile: crate::cte::CteProfile) -> Self {
+        self.cte_profile = profile;
+        self
+    }
 }
 
-/// A SELECT statement.
+/// A SELECT statement, optionally with a WITH (CTE) clause.
 #[derive(Debug, Clone)]
 pub struct SelectStatement {
+    /// Optional WITH clause (CTEs).
+    pub with_clause: Option<crate::cte::WithClause>,
     pub table: String,
     /// The columns/expressions in the SELECT list. Empty means SELECT *.
     pub columns: Vec<Expression>,
@@ -214,6 +236,10 @@ impl SelectStatement {
 
 impl fmt::Display for SelectStatement {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(with) = &self.with_clause {
+            write!(f, "{with} ")?;
+        }
+
         write!(f, "SELECT ")?;
 
         if self.columns.is_empty() {
@@ -274,6 +300,7 @@ pub fn select_single_column_for_table(
     )
         .prop_map(
             move |(columns, where_clause, order_by, limit, offset)| SelectStatement {
+                with_clause: None, // No CTEs in subqueries
                 table: table_name.clone(),
                 columns,
                 where_clause,
@@ -285,17 +312,16 @@ pub fn select_single_column_for_table(
         .boxed()
 }
 
-/// Generate a SELECT statement for a table with profile.
-pub fn select_for_table(
-    table: &TableRef,
+/// Generate the body of a SELECT statement (columns, where, order by, limit, offset).
+/// This is a helper that generates all parts except the WITH clause and FROM source.
+fn select_body_for_source(
+    source: &TableRef,
     schema: &Schema,
     profile: &StatementProfile,
-) -> BoxedStrategy<SelectStatement> {
-    let table_name = table.name.clone();
-    let col_names: Vec<String> = table.columns.iter().map(|c| c.name.clone()).collect();
+) -> BoxedStrategy<SelectBodyParts> {
+    let col_names: Vec<String> = source.columns.iter().map(|c| c.name.clone()).collect();
     let functions = builtin_functions();
 
-    // Extract profile values from the SelectProfile
     let select_profile = profile.select_profile();
     let expression_max_depth = select_profile.expression_max_depth;
     let allow_aggregates = select_profile.allow_aggregates;
@@ -306,20 +332,14 @@ pub fn select_for_table(
     let limit_range = select_profile.limit_range.clone();
     let offset_range = select_profile.offset_range.clone();
 
-    // Build expression context for generating expressions
-    // Use the profile's expression settings to preserve subquery depth tracking
     let ctx = ExpressionContext::new(functions, schema.clone())
-        .with_columns(table.columns.clone())
+        .with_columns(source.columns.clone())
         .with_max_depth(expression_max_depth)
         .with_aggregates(allow_aggregates)
         .with_profile(profile.generation.expression.base.clone());
 
-    // Generate either SELECT * or a list of expressions
     let columns_strategy = proptest::strategy::Union::new_weighted(vec![
-        (
-            select_star_weight,
-            Just(vec![]).boxed(), // SELECT *
-        ),
+        (select_star_weight, Just(vec![]).boxed()),
         (
             expression_list_weight,
             proptest::collection::vec(crate::expression::expression(&ctx), expression_count_range)
@@ -335,21 +355,68 @@ pub fn select_for_table(
 
     (
         columns_strategy,
-        optional_where_clause(table, schema, profile),
-        order_by_for_table(table, schema, profile),
+        optional_where_clause(source, schema, profile),
+        order_by_for_table(source, schema, profile),
         proptest::option::of(limit_range),
         proptest::option::of(offset_range),
     )
-        .prop_map(
-            move |(columns, where_clause, order_by, limit, offset)| SelectStatement {
-                table: table_name.clone(),
+        .prop_map(|(columns, where_clause, order_by, limit, offset)| {
+            (
                 columns,
                 where_clause,
                 order_by,
                 limit,
-                offset: if limit.is_some() { offset } else { None },
-            },
-        )
+                if limit.is_some() { offset } else { None },
+            )
+        })
+        .boxed()
+}
+
+/// Generate a SELECT statement for a table with profile.
+pub fn select_for_table(
+    table: &TableRef,
+    schema: &Schema,
+    profile: &StatementProfile,
+) -> BoxedStrategy<SelectStatement> {
+    let schema_clone = schema.clone();
+    let profile_clone = profile.clone();
+    let table_clone = table.clone();
+
+    // First generate the optional WITH clause
+    crate::cte::optional_with_clause(&schema_clone, &profile_clone)
+        .prop_flat_map(move |with_clause| {
+            let schema = schema_clone.clone();
+            let profile = profile_clone.clone();
+            let original_table = table_clone.clone();
+
+            // Build list of available sources: original table + any CTEs
+            let mut sources: Vec<TableRef> = vec![original_table];
+            if let Some(ref with) = with_clause {
+                for cte in &with.ctes {
+                    sources.push(std::rc::Rc::new(cte.as_table()));
+                }
+            }
+
+            let with_for_closure = with_clause;
+
+            // Pick a source to query from (could be original table or a CTE)
+            proptest::sample::select(sources).prop_flat_map(move |source| {
+                let with_clause = with_for_closure.clone();
+                let source_name = source.name.clone();
+
+                select_body_for_source(&source, &schema, &profile).prop_map(
+                    move |(columns, where_clause, order_by, limit, offset)| SelectStatement {
+                        with_clause: with_clause.clone(),
+                        table: source_name.clone(),
+                        columns,
+                        where_clause,
+                        order_by,
+                        limit,
+                        offset,
+                    },
+                )
+            })
+        })
         .boxed()
 }
 
@@ -553,6 +620,7 @@ mod tests {
     #[test]
     fn test_select_display() {
         let stmt = SelectStatement {
+            with_clause: None,
             table: "users".to_string(),
             columns: vec![
                 Expression::Column("id".to_string()),
@@ -578,6 +646,7 @@ mod tests {
     #[test]
     fn test_select_with_function() {
         let stmt = SelectStatement {
+            with_clause: None,
             table: "users".to_string(),
             columns: vec![
                 Expression::Column("id".to_string()),
@@ -611,8 +680,10 @@ mod tests {
             }
         ) {
             let sql = stmt.to_string();
-            proptest::prop_assert!(sql.starts_with("SELECT"));
-            proptest::prop_assert!(sql.contains("FROM test"));
+            // SQL can start with WITH (CTE) or SELECT
+            proptest::prop_assert!(sql.starts_with("SELECT") || sql.starts_with("WITH "));
+            // SQL must have a FROM clause (could be FROM test or FROM cte_*)
+            proptest::prop_assert!(sql.contains(" FROM "));
         }
     }
 

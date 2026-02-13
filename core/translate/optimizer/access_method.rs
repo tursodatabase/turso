@@ -13,12 +13,13 @@ use crate::translate::optimizer::constraints::{
 use crate::translate::optimizer::cost::RowCountEstimate;
 use crate::translate::optimizer::cost_params::CostModelParams;
 use crate::translate::plan::{
-    HashJoinKey, NonFromClauseSubquery, SetOperation, SubqueryState, TableReferences, WhereTerm,
+    plan_is_correlated, HashJoinKey, NonFromClauseSubquery, SetOperation, SubqueryState,
+    TableReferences, WhereTerm,
 };
 use crate::util::exprs_are_equivalent;
 use crate::vdbe::hash_table::DEFAULT_MEM_BUDGET;
 use crate::{
-    schema::{Index, Table},
+    schema::{FromClauseSubquery, Index, IndexColumn, Table},
     translate::plan::{IndexMethodQuery, IterationDirection, JoinOrderMember, JoinedTable},
     vtab::VirtualTable,
     LimboError, Result,
@@ -73,7 +74,17 @@ pub enum AccessMethodParams {
         /// describing how each constraint will be used.
         constraint_usages: Vec<ConstraintUsage>,
     },
+    /// Coroutine-based subquery (re-executed for each outer row)
     Subquery,
+    /// Materialized subquery with an ephemeral index for seeking.
+    /// The subquery results are materialized once into an ephemeral index,
+    /// which can then be seeked using join conditions.
+    MaterializedSubquery {
+        /// The ephemeral index to build and seek into.
+        index: Arc<Index>,
+        /// The constraint references used for seeking.
+        constraint_refs: Vec<RangeConstraintRef>,
+    },
     HashJoin {
         /// The table to build the hash table from.
         build_table_idx: usize,
@@ -218,18 +229,15 @@ pub fn find_best_access_method_for_join_order(
             base_row_count,
             params,
         ),
-        Table::FromClauseSubquery(_) => Ok(Some(AccessMethod {
-            cost: estimate_cost_for_scan_or_seek(
-                None,
-                &[],
-                &[],
-                input_cardinality,
-                base_row_count,
-                false,
-                params,
-            ),
-            params: AccessMethodParams::Subquery,
-        })),
+        Table::FromClauseSubquery(subquery) => find_best_access_method_for_subquery(
+            rhs_table,
+            subquery,
+            rhs_constraints,
+            join_order,
+            input_cardinality,
+            base_row_count,
+            params,
+        ),
     }
 }
 
@@ -960,4 +968,225 @@ fn expr_is_simple_column_from_table(expr: &ast::Expr, table_id: TableInternalId)
         expr,
         ast::Expr::Column { table, .. } | ast::Expr::RowId { table, .. } if *table == table_id
     )
+}
+
+/// Find the best access method for a FROM clause subquery.
+///
+/// For subqueries not in the first join position (which would be scanned multiple times),
+/// we try to create an ephemeral index on columns used in equality join conditions.
+/// This allows seeking into the materialized subquery results instead of scanning.
+fn find_best_access_method_for_subquery(
+    rhs_table: &JoinedTable,
+    subquery: &FromClauseSubquery,
+    rhs_constraints: &TableConstraints,
+    join_order: &[JoinOrderMember],
+    input_cardinality: f64,
+    base_row_count: RowCountEstimate,
+    params: &CostModelParams,
+) -> Result<Option<AccessMethod>> {
+    use super::constraints::ConstraintRef;
+
+    // Correlated subqueries (referencing outer tables) cannot be materialized once -
+    // they must re-execute for each outer row. Use coroutine for these.
+    // This check must come first because correlated CTEs should NOT share materialized data.
+    if plan_is_correlated(&subquery.plan) {
+        return Ok(Some(AccessMethod {
+            cost: estimate_cost_for_scan_or_seek(
+                None,
+                &[],
+                &[],
+                input_cardinality,
+                base_row_count,
+                false,
+                params,
+            ),
+            params: AccessMethodParams::Subquery,
+        }));
+    }
+
+    // If this is the first/only table in the join and materialization is not requested, use coroutine.
+    // Note: materialize_hint is set for explicit WITH MATERIALIZED hints.
+    // Multi-reference CTE materialization decisions are handled at emission time via reference counting.
+    let is_leftmost = join_order.len() <= 1;
+    if is_leftmost && !subquery.materialize_hint {
+        return Ok(Some(AccessMethod {
+            cost: estimate_cost_for_scan_or_seek(
+                None,
+                &[],
+                &[],
+                input_cardinality,
+                base_row_count,
+                false,
+                params,
+            ),
+            params: AccessMethodParams::Subquery,
+        }));
+    }
+
+    // Find usable equality constraints on subquery columns.
+    // We need to build constraint refs from the raw constraints, similar to how
+    // ephemeral index building works for regular tables.
+    // Filter to usable constraints that target a table column and are equality ops.
+    let usable: Vec<(usize, &Constraint)> = rhs_constraints
+        .constraints
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| {
+            c.usable
+                && c.table_col_pos.is_some()
+                && c.operator.as_ast_operator() == Some(ast::Operator::Equals)
+        })
+        .collect();
+
+    if usable.is_empty() {
+        // No usable equality constraints - fall back to coroutine
+        return Ok(Some(AccessMethod {
+            cost: estimate_cost_for_scan_or_seek(
+                None,
+                &[],
+                &[],
+                input_cardinality,
+                base_row_count,
+                false,
+                params,
+            ),
+            params: AccessMethodParams::Subquery,
+        }));
+    }
+
+    // Build a mapping from table_col_pos to index_col_pos.
+    // Multiple constraints on the same column should share the same index_col_pos.
+    let mut unique_col_positions: Vec<usize> = usable
+        .iter()
+        .map(|(_, c)| c.table_col_pos.expect("table_col_pos was Some above"))
+        .collect();
+    unique_col_positions.sort_unstable();
+    unique_col_positions.dedup();
+
+    // Map each usable constraint to a ConstraintRef
+    let mut temp_constraint_refs: Vec<ConstraintRef> = usable
+        .iter()
+        .map(|(orig_idx, c)| {
+            let table_col_pos = c.table_col_pos.expect("table_col_pos was Some above");
+            let index_col_pos = unique_col_positions
+                .binary_search(&table_col_pos)
+                .expect("table_col_pos must exist in unique_col_positions");
+            ConstraintRef {
+                constraint_vec_pos: *orig_idx,
+                index_col_pos,
+                sort_order: SortOrder::Asc,
+            }
+        })
+        .collect();
+
+    temp_constraint_refs.sort_by_key(|x| x.index_col_pos);
+
+    // Filter to only constraints that can be used given the current join order
+    let usable_constraint_refs = usable_constraints_for_join_order(
+        &rhs_constraints.constraints,
+        &temp_constraint_refs,
+        join_order,
+    );
+
+    if usable_constraint_refs.is_empty() {
+        // No usable constraints after join order filtering - fall back to coroutine
+        return Ok(Some(AccessMethod {
+            cost: estimate_cost_for_scan_or_seek(
+                None,
+                &[],
+                &[],
+                input_cardinality,
+                base_row_count,
+                false,
+                params,
+            ),
+            params: AccessMethodParams::Subquery,
+        }));
+    }
+
+    // Build index columns: key columns first (from constraints), then all remaining columns.
+    // Key columns are used for seeking, remaining columns are needed to read full result data.
+    let mut index_columns: Vec<IndexColumn> = Vec::new();
+    let mut seen_col_positions = std::collections::HashSet::new();
+
+    // First, add key columns from constraints (for seeking)
+    for cref in usable_constraint_refs.iter() {
+        let col_pos = cref.table_col_pos.unwrap();
+        if seen_col_positions.contains(&col_pos) {
+            continue;
+        }
+        seen_col_positions.insert(col_pos);
+
+        if let Some(column) = subquery.columns.get(col_pos) {
+            index_columns.push(IndexColumn {
+                name: column.name.clone().unwrap_or_default(),
+                order: SortOrder::Asc,
+                pos_in_table: col_pos,
+                collation: column.collation_opt(),
+                default: column.default.clone(),
+                expr: None,
+            });
+        }
+    }
+
+    if index_columns.is_empty() {
+        // Couldn't build index columns - fall back to coroutine
+        return Ok(Some(AccessMethod {
+            cost: estimate_cost_for_scan_or_seek(
+                None,
+                &[],
+                &[],
+                input_cardinality,
+                base_row_count,
+                false,
+                params,
+            ),
+            params: AccessMethodParams::Subquery,
+        }));
+    }
+
+    // Then add all remaining columns (needed for reading full result data)
+    for (col_pos, column) in subquery.columns.iter().enumerate() {
+        if seen_col_positions.contains(&col_pos) {
+            continue;
+        }
+        index_columns.push(IndexColumn {
+            name: column.name.clone().unwrap_or_default(),
+            order: SortOrder::Asc,
+            pos_in_table: col_pos,
+            collation: column.collation_opt(),
+            default: column.default.clone(),
+            expr: None,
+        });
+    }
+
+    // Create the ephemeral index definition
+    // has_rowid: true ensures each row gets a unique rowid appended to the key,
+    // allowing duplicate column values (e.g., two rows with identical a,b,c,d values
+    // will have different keys due to different rowids).
+    let ephemeral_index = Arc::new(Index {
+        name: format!("ephemeral_subquery_{}", rhs_table.internal_id),
+        columns: index_columns,
+        unique: false,
+        ephemeral: true,
+        table_name: subquery.name.clone(),
+        root_page: 0,
+        where_clause: None,
+        has_rowid: true,
+        index_method: None,
+    });
+
+    // Estimate cost: materialization (one scan of subquery) + index seeks
+    // This is much cheaper than nested loop (input_cardinality * subquery_size)
+    let materialization_cost = *base_row_count; // RowCountEstimate implements Deref to f64
+    let seek_cost = input_cardinality * params.cpu_cost_per_seek;
+    let total_cost = Cost(materialization_cost + seek_cost);
+
+    Ok(Some(AccessMethod {
+        cost: total_cost,
+        params: AccessMethodParams::MaterializedSubquery {
+            index: ephemeral_index,
+            constraint_refs: usable_constraint_refs,
+        },
+    }))
 }

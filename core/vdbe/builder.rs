@@ -167,6 +167,15 @@ pub struct ProgramBuilder {
     /// Maps table internal_id to result_columns_start_reg for FROM clause subqueries.
     /// Used when nested subqueries need to reference columns from outer query subqueries.
     subquery_result_regs: HashMap<TableInternalId, usize>,
+    /// Counter for CTE identity tracking. Each CTE definition gets a unique ID
+    /// so that multiple references to the same CTE can share materialized data.
+    next_cte_id: usize,
+    /// Registry of materialized CTEs, keyed by cte_id.
+    /// Used to share materialized data across multiple CTE references via OpenDup.
+    materialized_ctes: HashMap<usize, MaterializedCteInfo>,
+    /// Global count of references to each CTE across the entire query.
+    /// Used to determine whether a CTE should be materialized (multi-ref) or use coroutine (single-ref).
+    cte_reference_counts: HashMap<usize, usize>,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -191,6 +200,19 @@ pub struct HashBuildSignature {
     pub materialized_input_cursor: Option<CursorID>,
     /// RowidOnly vs KeyPayload
     pub materialized_mode: Option<MaterializedBuildInputModeTag>,
+}
+
+/// Information about a materialized CTE, used for sharing data across multiple references.
+#[derive(Debug, Clone)]
+pub struct MaterializedCteInfo {
+    /// The ephemeral table cursor holding materialized CTE data.
+    pub cursor_id: CursorID,
+    /// The table definition, needed for allocating dup cursors with the same CursorType.
+    pub table: Arc<BTreeTable>,
+    /// Start register for reading result columns.
+    pub result_columns_start_reg: usize,
+    /// Number of result columns.
+    pub num_columns: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -376,6 +398,9 @@ impl ProgramBuilder {
             hash_build_signatures: HashMap::default(),
             hash_tables_to_keep_open: HashSet::default(),
             subquery_result_regs: HashMap::default(),
+            next_cte_id: 0,
+            materialized_ctes: HashMap::default(),
+            cte_reference_counts: HashMap::default(),
         }
     }
 
@@ -386,6 +411,37 @@ impl ProgramBuilder {
             .checked_add(1)
             .expect("hash table id overflow");
         id
+    }
+
+    /// Allocate a unique CTE identity. Each CTE definition in a query gets a unique ID
+    /// so that multiple references to the same CTE can share materialized data via OpenDup.
+    pub fn alloc_cte_id(&mut self) -> usize {
+        let id = self.next_cte_id;
+        self.next_cte_id += 1;
+        id
+    }
+
+    /// Check if a CTE has already been materialized.
+    /// Returns the materialization info if the CTE cursor can be shared via OpenDup.
+    pub fn get_materialized_cte(&self, cte_id: usize) -> Option<&MaterializedCteInfo> {
+        self.materialized_ctes.get(&cte_id)
+    }
+
+    /// Register a materialized CTE so that subsequent references can share it via OpenDup.
+    pub fn register_materialized_cte(&mut self, cte_id: usize, info: MaterializedCteInfo) {
+        self.materialized_ctes.insert(cte_id, info);
+    }
+
+    /// Increment the global reference count for a CTE.
+    /// Called during planning when a CTE reference is created.
+    pub fn increment_cte_reference(&mut self, cte_id: usize) {
+        *self.cte_reference_counts.entry(cte_id).or_insert(0) += 1;
+    }
+
+    /// Get the global reference count for a CTE.
+    /// Used during emission to decide whether to materialize (multi-ref) or use coroutine (single-ref).
+    pub fn get_cte_reference_count(&self, cte_id: usize) -> usize {
+        self.cte_reference_counts.get(&cte_id).copied().unwrap_or(0)
     }
 
     pub fn set_resolve_type(&mut self, resolve_type: ResolveType) {
@@ -1114,13 +1170,18 @@ impl ProgramBuilder {
     /// Hence: currently we first try to resolve a table cursor, and if that fails,
     /// we resolve an index cursor via this method.
     pub fn resolve_any_index_cursor_id_for_table(&self, table_ref_id: TableInternalId) -> CursorID {
-        self.cursor_ref
-            .iter()
-            .position(|(k, _)| {
-                k.as_ref()
-                    .is_some_and(|k| k.table_reference_id == table_ref_id && k.index.is_some())
-            })
+        self.resolve_any_index_cursor_id_for_table_safe(table_ref_id)
             .unwrap_or_else(|| panic!("No index cursor found for table {table_ref_id}"))
+    }
+
+    pub fn resolve_any_index_cursor_id_for_table_safe(
+        &self,
+        table_ref_id: TableInternalId,
+    ) -> Option<CursorID> {
+        self.cursor_ref.iter().position(|(k, _)| {
+            k.as_ref()
+                .is_some_and(|k| k.table_reference_id == table_ref_id && k.index.is_some())
+        })
     }
 
     /// Resolve the [Index] that a given cursor is associated with.

@@ -1800,9 +1800,18 @@ pub fn op_next(
         let cursor = state.get_cursor(*cursor_id);
         match cursor {
             Cursor::BTree(btree_cursor) => {
+                // If cursor is in NullRow state, don't advance - just return empty.
+                // This matches SQLite's OP_Next behavior: btreeNext() returns
+                // SQLITE_DONE when eState==CURSOR_INVALID (NullRow calls
+                // sqlite3BtreeClearCursor which sets CURSOR_INVALID).
+                let is_null_row = btree_cursor.get_null_flag();
                 btree_cursor.set_null_flag(false);
-                return_if_io!(btree_cursor.next());
-                btree_cursor.is_empty()
+                if is_null_row {
+                    true // is_empty = true
+                } else {
+                    return_if_io!(btree_cursor.next());
+                    btree_cursor.is_empty()
+                }
             }
             Cursor::MaterializedView(mv_cursor) => {
                 let has_more = return_if_io!(mv_cursor.next());
@@ -1852,10 +1861,16 @@ pub fn op_prev(
     let is_empty = {
         let cursor = must_be_btree_cursor!(*cursor_id, program.cursor_ref, state, "Prev");
         let cursor = cursor.as_btree_mut();
+        // If cursor is in NullRow state, don't advance - just return empty.
+        // This matches SQLite's OP_Prev behavior which checks nullRow first.
+        let is_null_row = cursor.get_null_flag();
         cursor.set_null_flag(false);
-        return_if_io!(cursor.prev());
-
-        cursor.is_empty()
+        if is_null_row {
+            true // is_empty = true
+        } else {
+            return_if_io!(cursor.prev());
+            cursor.is_empty()
+        }
     };
     if !is_empty {
         // Increment metrics for row read
@@ -8956,9 +8971,6 @@ pub fn op_open_dup(
                 .replace(Cursor::new_btree(cursor));
         }
         CursorType::BTreeIndex(_) => {
-            // In principle, we could implement OpenDup for BTreeIndex,
-            // but doing so now would create dead code since we have no use case,
-            // and it wouldn't be possible to test it.
             return Err(LimboError::InternalError(
                 "OpenDup is not supported for BTreeIndex".to_string(),
             ));

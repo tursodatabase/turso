@@ -1518,7 +1518,9 @@ impl Clone for Schema {
                 }
                 Table::FromClauseSubquery(from_clause_subquery) => (
                     name.clone(),
-                    Arc::new(Table::FromClauseSubquery(from_clause_subquery.clone())),
+                    Arc::new(Table::FromClauseSubquery(Arc::new(
+                        (**from_clause_subquery).clone(),
+                    ))),
                 ),
             })
             .collect();
@@ -1578,7 +1580,7 @@ impl Clone for Schema {
 pub enum Table {
     BTree(Arc<BTreeTable>),
     Virtual(Arc<VirtualTable>),
-    FromClauseSubquery(FromClauseSubquery),
+    FromClauseSubquery(Arc<FromClauseSubquery>),
 }
 
 impl Table {
@@ -1938,6 +1940,16 @@ pub struct FromClauseSubquery {
     /// The start register for the result columns of the derived table;
     /// must be set before data is read from it.
     pub result_columns_start_reg: Option<usize>,
+    /// CTE identity for sharing materialized data across multiple references.
+    /// None means this is a regular inline subquery (not from a CTE).
+    /// Some(id) means this references a CTE with the given identity.
+    /// Multiple references to the same CTE will have the same cte_id.
+    pub cte_id: Option<usize>,
+    /// If true, this subquery has an explicit hint to materialize itself into an ephemeral table
+    /// (not emitted as a coroutine). This is set for CTEs to enable sharing
+    /// materialized data across multiple references via OpenDup,
+    /// and also via WITH .., AS MATERIALIZED.
+    pub materialize_hint: bool,
 }
 
 pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> Result<BTreeTable> {
