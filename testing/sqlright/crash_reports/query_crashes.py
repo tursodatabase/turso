@@ -199,6 +199,10 @@ def cmd_integrity(db: Database, show_fails: bool = False):
                         stderr_preview += "..."
                     print(f"  Turso err:  {stderr_preview}")
                 print(f"  Integrity:  {f['integrity_output'][:200]}")
+                if f.get('extended_output'):
+                    print(f"  Extended:")
+                    for line in f['extended_output'].split('\n'):
+                        print(f"    {line}")
                 print(f"\n  SQL ({len(f['sql_content'])} bytes):")
                 print("-" * 40)
                 print(f['sql_content'][:1000])

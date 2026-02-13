@@ -105,10 +105,11 @@ Results stored in `crash_reports/crashes.db` with processing history for reprodu
 Validates that databases written by tursodb are structurally correct by replaying AFL inputs through tursodb, then checking the resulting database with SQLite:
 
 ```bash
+cd crash_reports
 python3 check_integrity.py --output-dir /tmp/sqlright_test --every 10 -v
 
 # Query failures
-python3 crash_reports/query_crashes.py integrity --fails
+python3 query_crashes.py integrity --fails
 ```
 
 Each database is validated with `PRAGMA integrity_check` (B-tree structure, page connectivity, index entry counts, orphaned pages) followed by extended checks:
@@ -292,11 +293,11 @@ testing/sqlright/
 ├── collect_coverage.sh   # coverage report generation
 ├── whatsup.sh            # real-time fuzzer monitoring
 ├── check_affinity.sh     # CPU affinity verification
-├── check_integrity.py    # integrity validation of tursodb-written databases
 ├── patches/              # git patches applied to SQLRight
 │   └── 0001-turso-increase-map-size-and-fix-gcc13.patch
 ├── crash_reports/        # crash analysis and deduplication
 │   ├── collect_crashes.py   # crash collection and testing
+│   ├── check_integrity.py   # integrity validation of tursodb-written databases
 │   ├── query_crashes.py     # crash database queries
 │   ├── schema.sql           # database schema
 │   ├── lib/                 # analysis modules

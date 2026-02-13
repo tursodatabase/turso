@@ -18,8 +18,8 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-# Add crash_reports/lib to path
-sys.path.insert(0, str(Path(__file__).parent / "crash_reports"))
+# Add lib to path
+sys.path.insert(0, str(Path(__file__).parent))
 
 from lib.database import Database
 
@@ -528,7 +528,7 @@ Examples:
         '--db',
         type=Path,
         metavar='PATH',
-        help='Path to database file (default: crash_reports/crashes.db)'
+        help='Path to database file (default: ./crashes.db)'
     )
     parser.add_argument(
         '-v', '--verbose',
@@ -584,8 +584,8 @@ Examples:
     print(f"\nChecking {len(files)} items...")
 
     # Open database
-    db_path = args.db or Path(__file__).parent / "crash_reports" / "crashes.db"
-    schema_path = Path(__file__).parent / "crash_reports" / "schema.sql"
+    db_path = args.db or Path(__file__).parent / "crashes.db"
+    schema_path = Path(__file__).parent / "schema.sql"
 
     db = Database(db_path)
     try:

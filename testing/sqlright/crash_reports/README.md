@@ -167,6 +167,7 @@ crash_reports/
 ├── crashes.db              # SQLite database (auto-created)
 ├── schema.sql              # Database schema
 ├── collect_crashes.py      # Main collection script
+├── check_integrity.py      # Integrity validation of tursodb-written databases
 ├── query_crashes.py        # Query interface
 ├── lib/
 │   ├── __init__.py
