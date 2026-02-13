@@ -5,6 +5,7 @@ use crate::LimboError;
 
 const NUMERIC_BLOB_VERSION: u8 = 0x01;
 const FLAG_NEGATIVE: u8 = 0x01;
+const MAX_SCALE_MAGNITUDE: i64 = 1_000_000;
 
 /// Serialize a BigDecimal to our portable blob format.
 ///
@@ -22,6 +23,11 @@ pub fn bigdecimal_to_blob(val: &BigDecimal) -> Vec<u8> {
 
     // magnitude.to_u32_digits() returns limbs in little-endian order
     let limbs = magnitude.to_u32_digits();
+    debug_assert!(
+        limbs.len() <= u32::MAX as usize,
+        "limb count {} exceeds u32::MAX",
+        limbs.len()
+    );
     let num_limbs = limbs.len() as u32;
 
     let mut buf = Vec::with_capacity(14 + limbs.len() * 4);
@@ -77,9 +83,7 @@ pub fn blob_to_bigdecimal(blob: &[u8]) -> crate::Result<BigDecimal> {
     // SAFETY: blob[2..10] is exactly 8 bytes (checked by min-length guard above)
     let scale = i64::from_le_bytes(blob[2..10].try_into().unwrap());
 
-    // Reject absurd scales from corrupted blobs. A scale magnitude beyond 1_000_000
-    // would produce numbers with millions of digits, causing DoS.
-    const MAX_SCALE_MAGNITUDE: i64 = 1_000_000;
+    // Reject absurd scales from corrupted blobs.
     if !(-MAX_SCALE_MAGNITUDE..=MAX_SCALE_MAGNITUDE).contains(&scale) {
         return Err(LimboError::Constraint(format!(
             "invalid numeric blob: scale {scale} out of range"
@@ -136,8 +140,8 @@ pub fn format_numeric(bd: &BigDecimal) -> String {
             return bigint.to_string();
         }
         // Negative scale means multiply by 10^(-scale).
-        // Cap to u32::MAX to avoid overflow on (-scale) cast.
-        let neg_scale = scale.unsigned_abs().min(u32::MAX as u64) as u32;
+        // Cap to MAX_SCALE_MAGNITUDE (validated on read) to avoid runaway allocation.
+        let neg_scale = scale.unsigned_abs().min(MAX_SCALE_MAGNITUDE as u64) as u32;
         let factor = num_bigint::BigInt::from(10).pow(neg_scale);
         return (bigint * factor).to_string();
     }

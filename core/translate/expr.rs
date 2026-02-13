@@ -6278,37 +6278,94 @@ pub(crate) fn emit_type_expr(
         .id_register_overrides
         .insert("value".to_string(), value_reg);
 
-    // Set up type parameter overrides
-    for (i, param_name) in type_def.params.iter().enumerate() {
-        if let Some(param_expr) = column.ty_params.get(i) {
-            let reg = program.alloc_register();
-            translate_expr(program, None, param_expr, reg, resolver)?;
-            program
-                .id_register_overrides
-                .insert(param_name.clone(), reg);
+    // Set up type parameter overrides. Capture the result so we can
+    // clean up overrides even if param translation fails.
+    let param_result: Result<()> = (|| {
+        for (i, param_name) in type_def.params.iter().enumerate() {
+            if let Some(param_expr) = column.ty_params.get(i) {
+                let reg = program.alloc_register();
+                translate_expr(program, None, param_expr, reg, resolver)?;
+                program
+                    .id_register_overrides
+                    .insert(param_name.clone(), reg);
+            }
         }
-    }
+        Ok(())
+    })();
 
-    // Rewrite BETWEEN expressions before translation (the optimizer
-    // normally does this, but type expressions bypass the optimizer).
-    let mut rewritten = expr.clone();
-    rewrite_between_expr(&mut rewritten);
+    // Translate body expression only if param setup succeeded
+    let result = param_result.and_then(|()| {
+        // Rewrite BETWEEN expressions before translation (the optimizer
+        // normally does this, but type expressions bypass the optimizer).
+        let mut rewritten = expr.clone();
+        rewrite_between_expr(&mut rewritten);
 
-    // Translate the expression, disabling constant optimization since
-    // the `value` placeholder refers to a register that changes per row.
-    let result = translate_expr_no_constant_opt(
-        program,
-        None,
-        &rewritten,
-        dest_reg,
-        resolver,
-        NoConstantOptReason::RegisterReuse,
-    );
+        // Translate the expression, disabling constant optimization since
+        // the `value` placeholder refers to a register that changes per row.
+        translate_expr_no_constant_opt(
+            program,
+            None,
+            &rewritten,
+            dest_reg,
+            resolver,
+            NoConstantOptReason::RegisterReuse,
+        )
+    });
 
-    // Clean up overrides
+    // Always clean up overrides, even on error
     program.id_register_overrides.clear();
 
     result
+}
+
+/// Decode custom type columns for AFTER trigger NEW registers.
+///
+/// For each column with a custom type decode expression, copies the encoded register
+/// to a new register and emits the decode expression. NULL values are skipped.
+/// Returns a Vec of registers: one per column (decoded or original) plus the rowid at the end.
+pub(crate) fn emit_trigger_decode_registers(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    columns: &[crate::schema::Column],
+    source_regs: &dyn Fn(usize) -> usize,
+    rowid_reg: usize,
+) -> Result<Vec<usize>> {
+    columns
+        .iter()
+        .enumerate()
+        .map(|(i, col)| -> Result<usize> {
+            let type_def = resolver.schema.get_type_def(&col.ty_str);
+            if let Some(type_def) = type_def {
+                if let Some(ref decode_expr) = type_def.decode {
+                    let src = source_regs(i);
+                    let decoded_reg = program.alloc_register();
+                    program.emit_insn(Insn::Copy {
+                        src_reg: src,
+                        dst_reg: decoded_reg,
+                        extra_amount: 0,
+                    });
+                    let skip_label = program.allocate_label();
+                    program.emit_insn(Insn::IsNull {
+                        reg: decoded_reg,
+                        target_pc: skip_label,
+                    });
+                    emit_type_expr(
+                        program,
+                        decode_expr,
+                        decoded_reg,
+                        decoded_reg,
+                        col,
+                        type_def,
+                        resolver,
+                    )?;
+                    program.resolve_label(skip_label, program.offset());
+                    return Ok(decoded_reg);
+                }
+            }
+            Ok(source_regs(i))
+        })
+        .chain(std::iter::once(Ok(rowid_reg)))
+        .collect::<Result<Vec<usize>>>()
 }
 
 /// Emit encode expressions for columns with custom types in a contiguous register range.

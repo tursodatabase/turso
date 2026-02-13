@@ -4213,41 +4213,13 @@ fn emit_update_insns<'a>(
                 let new_rowid_reg = rowid_set_clause_reg.unwrap_or(beg);
                 // For custom type columns, decode the encoded register values
                 // so AFTER triggers see user-facing values, not encoded blobs.
-                let columns = btree_table.columns.clone();
-                let new_registers_after: Vec<usize> = (0..col_len)
-                    .map(|i| -> Result<usize> {
-                        let col = &columns[i];
-                        let type_def = t_ctx.resolver.schema.get_type_def(&col.ty_str);
-                        if let Some(type_def) = type_def {
-                            if let Some(ref decode_expr) = type_def.decode {
-                                let decoded_reg = program.alloc_register();
-                                program.emit_insn(Insn::Copy {
-                                    src_reg: start + i,
-                                    dst_reg: decoded_reg,
-                                    extra_amount: 0,
-                                });
-                                let skip_label = program.allocate_label();
-                                program.emit_insn(Insn::IsNull {
-                                    reg: decoded_reg,
-                                    target_pc: skip_label,
-                                });
-                                crate::translate::expr::emit_type_expr(
-                                    program,
-                                    decode_expr,
-                                    decoded_reg,
-                                    decoded_reg,
-                                    col,
-                                    type_def,
-                                    &t_ctx.resolver,
-                                )?;
-                                program.resolve_label(skip_label, program.offset());
-                                return Ok(decoded_reg);
-                            }
-                        }
-                        Ok(start + i)
-                    })
-                    .chain(std::iter::once(Ok(new_rowid_reg)))
-                    .collect::<Result<Vec<usize>>>()?;
+                let new_registers_after = crate::translate::expr::emit_trigger_decode_registers(
+                    program,
+                    &t_ctx.resolver,
+                    &btree_table.columns,
+                    &|i| start + i,
+                    new_rowid_reg,
+                )?;
 
                 // Use preserved OLD registers from BEFORE trigger
                 let old_registers_after = preserved_old_registers;

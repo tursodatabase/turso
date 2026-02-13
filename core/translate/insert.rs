@@ -735,44 +735,26 @@ pub fn translate_insert(
         // Build NEW registers for AFTER triggers. For custom type columns,
         // the register values are encoded blobs at this point. Copy and
         // decode them so triggers see user-facing values.
-        let new_registers_after: Vec<usize> = insertion
+        let columns: Vec<crate::schema::Column> = insertion
             .col_mappings
             .iter()
-            .map(|col_mapping| -> Result<usize> {
-                if col_mapping.column.is_rowid_alias() {
-                    return Ok(insertion.key_register());
+            .map(|cm| cm.column.clone())
+            .collect();
+        let col_mappings_ref = &insertion.col_mappings;
+        let key_reg = insertion.key_register();
+        let new_registers_after = super::expr::emit_trigger_decode_registers(
+            &mut program,
+            resolver,
+            &columns,
+            &|i| {
+                if col_mappings_ref[i].column.is_rowid_alias() {
+                    key_reg
+                } else {
+                    col_mappings_ref[i].register
                 }
-                let type_def = resolver.schema.get_type_def(&col_mapping.column.ty_str);
-                if let Some(type_def) = type_def {
-                    if let Some(ref decode_expr) = type_def.decode {
-                        let decoded_reg = program.alloc_register();
-                        program.emit_insn(Insn::Copy {
-                            src_reg: col_mapping.register,
-                            dst_reg: decoded_reg,
-                            extra_amount: 0,
-                        });
-                        let skip_label = program.allocate_label();
-                        program.emit_insn(Insn::IsNull {
-                            reg: decoded_reg,
-                            target_pc: skip_label,
-                        });
-                        super::expr::emit_type_expr(
-                            &mut program,
-                            decode_expr,
-                            decoded_reg,
-                            decoded_reg,
-                            col_mapping.column,
-                            type_def,
-                            resolver,
-                        )?;
-                        program.resolve_label(skip_label, program.offset());
-                        return Ok(decoded_reg);
-                    }
-                }
-                Ok(col_mapping.register)
-            })
-            .chain(std::iter::once(Ok(insertion.key_register())))
-            .collect::<Result<Vec<usize>>>()?;
+            },
+            key_reg,
+        )?;
         // Determine the conflict resolution to propagate to AFTER triggers (same logic as BEFORE)
         let trigger_ctx_after = if let Some(override_conflict) = program.trigger_conflict_override {
             TriggerContext::new_with_override_conflict(

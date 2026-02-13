@@ -160,7 +160,8 @@ pub const TURSO_INTERNAL_PREFIX: &str = "__turso_internal_";
 fn quote_ident(name: &str) -> String {
     let needs_quoting = name.is_empty()
         || name.as_bytes()[0].is_ascii_digit()
-        || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
+        || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        || turso_parser::lexer::is_keyword(name.as_bytes());
     if needs_quoting {
         let escaped = name.replace('"', "\"\"");
         format!("\"{escaped}\"")
