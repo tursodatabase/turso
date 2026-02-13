@@ -1,0 +1,39 @@
+@database :memory:
+
+# Regression for comparison coercion in:
+#   HEX(real_column) <= real_column
+#
+# SQLite evaluates this predicate as false for all rows below.
+# A buggy implementation may treat one positive REAL row as true and delete it.
+test compare-hex-real-le-delete-regression {
+    CREATE TABLE t_hex_real_cmp (x REAL);
+    INSERT INTO t_hex_real_cmp VALUES
+        (1.0),
+        (195747.892099415),
+        (-1.0),
+        (-534660.229716574);
+
+    SELECT x, HEX(x) <= x
+    FROM t_hex_real_cmp
+    ORDER BY x DESC;
+
+    DELETE FROM t_hex_real_cmp
+    WHERE HEX(x) <= x;
+
+    SELECT COUNT(*)
+    FROM t_hex_real_cmp;
+}
+expect {
+    195747.892099415|0
+    1.0|0
+    -1.0|0
+    -534660.229716574|0
+    4
+}
+expect @js {
+    195747.892099415|0
+    1|0
+    -1|0
+    -534660.229716574|0
+    4
+}

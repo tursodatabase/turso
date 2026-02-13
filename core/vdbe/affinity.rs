@@ -568,6 +568,13 @@ pub fn apply_numeric_affinity(val: ValueRef, try_for_int: bool) -> Option<ValueR
         }
         NumericParseResult::HasDecimalOrExp => {
             if let Some(float_val) = parsed_value.as_float() {
+                // Failed parses can occasionally surface as NaN. Treat those as
+                // non-convertible so we keep the original text value instead of
+                // coercing to NULL during comparison affinity conversion.
+                if float_val.is_nan() {
+                    return None;
+                }
+
                 let res = ValueRef::from_f64(float_val);
                 // If try_for_int is true, try to convert float to int if exact
                 if try_for_int {
@@ -630,6 +637,15 @@ mod tests {
         let val = Value::Text("0".into());
         let res = apply_numeric_affinity(val.as_value_ref(), false);
         assert_eq!(res, Some(ValueRef::Numeric(Numeric::Integer(0))));
+    }
+
+    #[test]
+    fn test_apply_numeric_affinity_nan_like_parse_keeps_text() {
+        // Regression: this text can parse into a NaN float in the numeric-affinity
+        // path. We must not coerce it to NULL.
+        let val = Value::Text("3139353734372E383932303939343135".into());
+        let res = apply_numeric_affinity(val.as_value_ref(), false);
+        assert!(res.is_none());
     }
 
     #[test]
