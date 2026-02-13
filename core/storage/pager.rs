@@ -2609,18 +2609,16 @@ impl Pager {
         }
         let Some(wal) = self.wal.as_ref() else {
             // TODO: Unsure what the semantics of "end_tx" is for in-memory databases, ephemeral tables and ephemeral indexes.
-            self.clear_savepoints()
-                .expect("in practice, clear_savepoints() should never fail as it uses memory IO");
             return;
         };
-        self.clear_savepoints()
-            .expect("in practice, clear_savepoints() should never fail as it uses memory IO");
         let (is_write, schema_did_change) = match connection.get_tx_state() {
             TransactionState::Write { schema_did_change } => (true, schema_did_change),
             _ => (false, false),
         };
         tracing::trace!("rollback_tx(schema_did_change={})", schema_did_change);
         if is_write {
+            self.clear_savepoints()
+                .expect("in practice, clear_savepoints() should never fail as it uses memory IO");
             // IMPORTANT: rollback() must be called BEFORE end_write_tx() releases the write_lock.
             // Otherwise, another thread could commit new frames to frame_cache between
             // end_write_tx() and rollback(), and rollback() would incorrectly remove them.
