@@ -95,7 +95,7 @@ jobs:
           RUST_LOG: ${{ runner.debug && 'turso_core::storage=trace' || '' }}
           LOCAL_SYNC_SERVER: "../../target/debug/tursodb"
         run: cargo nextest run --workspace --all-features --locked --no-fail-fast -E 'not binary(fuzz_tests)' --failure-output=final
-        timeout-minutes: ${{ matrix.os == 'windows-latest' && 60 || 20 }}
+        timeout-minutes: 20
       - name: Test integrity_check corruption and short reads (no checksum feature because it interferes with the test)
         run: cargo nextest run -p core_tester --locked --no-fail-fast -E 'test(integrity_check) | test(short_read)' --failure-output=final
         timeout-minutes: 5
